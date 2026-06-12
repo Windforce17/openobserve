@@ -27,18 +27,145 @@ use config::{
     },
 };
 use tantivy::{
-    DocId, Score, Searcher,
+    DocId, Score, SegmentOrdinal, SegmentReader, Searcher, Term,
     aggregation::{
         AggregationCollector, Key,
         agg_req::{Aggregation, AggregationVariants, Aggregations},
         agg_result::{AggregationResult, BucketEntries, BucketResult},
         bucket::{HistogramAggregation, HistogramBounds, TermsAggregation},
     },
-    collector::{Count, TopDocs},
+    collector::{Collector, Count, SegmentCollector, TopDocs},
     query::Query,
+    schema::IndexRecordOption,
 };
 
 use crate::service::search::index::IndexCondition;
+
+/// Collector that computes a `count(*)` histogram over a `_timestamp`-SORTED segment without
+/// reading the timestamp of every matched document. It precomputes, per segment (once),
+/// the doc-id ranges that map to each time bucket via a binary search on the sorted
+/// `_timestamp` fast field, then in `collect()` only assigns each matched doc to a bucket by
+/// an integer compare (no per-doc fast-field decode). Handles both ascending and descending
+/// (OpenObserve compaction sorts `_timestamp DESC`) layouts.
+///
+/// IMPORTANT: this is only correct when the segment is physically sorted by `_timestamp`.
+/// The caller must guarantee that (compacted files); otherwise use `HistogramCollector`.
+struct SortedHistogramCollector {
+    field: String,
+    min_value: i64,
+    bucket_width: u64,
+    num_buckets: usize,
+}
+
+struct SortedHistogramSegment {
+    /// ascending (doc_start, bucket) transitions; bucket == usize::MAX means "outside range".
+    transitions: Vec<(DocId, usize)>,
+    counts: Vec<u64>,
+    cur: usize,
+}
+
+impl Collector for SortedHistogramCollector {
+    type Fruit = Vec<u64>;
+    type Child = SortedHistogramSegment;
+
+    fn for_segment(
+        &self,
+        _ord: SegmentOrdinal,
+        reader: &SegmentReader,
+    ) -> tantivy::Result<Self::Child> {
+        let num_buckets = self.num_buckets;
+        let max_doc = reader.max_doc();
+        if max_doc == 0 || num_buckets == 0 {
+            return Ok(SortedHistogramSegment {
+                transitions: vec![(0, usize::MAX)],
+                counts: vec![0u64; num_buckets],
+                cur: 0,
+            });
+        }
+        let col = reader.fast_fields().i64(&self.field)?;
+        let at = |d: DocId| -> i64 { col.first(d).unwrap_or(i64::MAX) };
+        let width = self.bucket_width as i64;
+        let edge = |k: usize| -> i64 { self.min_value + (k as i64) * width };
+        let ascending = at(0) <= at(max_doc - 1);
+
+        // boundary doc-id for each bucket edge k (k in 0..=num_buckets)
+        let mut bd = vec![0u32; num_buckets + 1];
+        for (k, b) in bd.iter_mut().enumerate() {
+            let e = edge(k);
+            let (mut lo, mut hi) = (0u32, max_doc);
+            if ascending {
+                // first doc with at(d) >= e  (column increasing)
+                while lo < hi {
+                    let mid = lo + (hi - lo) / 2;
+                    if at(mid) < e { lo = mid + 1 } else { hi = mid }
+                }
+            } else {
+                // first doc with at(d) < e   (column decreasing)
+                while lo < hi {
+                    let mid = lo + (hi - lo) / 2;
+                    if at(mid) >= e { lo = mid + 1 } else { hi = mid }
+                }
+            }
+            *b = lo;
+        }
+
+        // build ascending (doc_start, bucket) transitions; collect() advances a cursor over them
+        let mut transitions: Vec<(DocId, usize)> = Vec::with_capacity(num_buckets + 2);
+        transitions.push((0, usize::MAX));
+        if ascending {
+            for k in 0..num_buckets {
+                transitions.push((bd[k], k)); // docs [bd[k], bd[k+1]) -> bucket k
+            }
+            transitions.push((bd[num_buckets], usize::MAX));
+        } else {
+            for b in (0..num_buckets).rev() {
+                transitions.push((bd[b + 1], b)); // docs [bd[b+1], bd[b]) -> bucket b
+            }
+            transitions.push((bd[0], usize::MAX));
+        }
+
+        Ok(SortedHistogramSegment {
+            transitions,
+            counts: vec![0u64; num_buckets],
+            cur: 0,
+        })
+    }
+
+    fn requires_scoring(&self) -> bool {
+        false
+    }
+
+    fn merge_fruits(&self, fruits: Vec<Vec<u64>>) -> tantivy::Result<Vec<u64>> {
+        let mut acc = vec![0u64; self.num_buckets];
+        for f in fruits {
+            for (i, v) in f.iter().enumerate() {
+                if i < acc.len() {
+                    acc[i] += *v;
+                }
+            }
+        }
+        Ok(acc)
+    }
+}
+
+impl SegmentCollector for SortedHistogramSegment {
+    type Fruit = Vec<u64>;
+
+    fn collect(&mut self, doc: DocId, _score: Score) {
+        // collect() is called in ascending doc-id order within a segment, so the cursor is monotonic
+        while self.cur + 1 < self.transitions.len() && doc >= self.transitions[self.cur + 1].0 {
+            self.cur += 1;
+        }
+        let b = self.transitions[self.cur].1;
+        if b != usize::MAX {
+            self.counts[b] += 1;
+        }
+    }
+
+    fn harvest(self) -> Vec<u64> {
+        self.counts
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum TantivyResult {
@@ -158,6 +285,106 @@ impl TantivyResult {
         )?;
 
         Ok(Self::Histogram(res))
+    }
+
+    /// Same result as `handle_simple_histogram`, but for a `_timestamp`-SORTED segment it avoids
+    /// reading the timestamp of every matched doc: it binary-searches the sorted `_timestamp`
+    /// fast field to map each time bucket to a doc-id range, then only counts matched docs per
+    /// range. Only correct on sorted (compacted) segments.
+    pub fn handle_simple_histogram_sorted(
+        searcher: &Searcher,
+        query: Box<dyn Query>,
+        min_value: i64,
+        bucket_width: u64,
+        num_buckets: usize,
+    ) -> anyhow::Result<Self> {
+        let res = searcher.search(
+            &query,
+            &SortedHistogramCollector {
+                field: TIMESTAMP_COL_NAME.to_string(),
+                min_value,
+                bucket_width,
+                num_buckets,
+            },
+        )?;
+        Ok(Self::Histogram(res))
+    }
+
+    /// SimpleHistogram via skip-list RANK on a _timestamp-SORTED segment, for a single-term
+    /// filter (service_name=X) or no filter. Computes per-bucket counts as differences of
+    /// postings ranks at the bucket doc-id boundaries -- no per-matched-doc iteration.
+    /// `term_field` = Some((field, value)) for the filter, or None to count all docs.
+    pub fn handle_simple_histogram_rank(
+        searcher: &Searcher,
+        term_field: Option<(String, String)>,
+        min_value: i64,
+        bucket_width: u64,
+        num_buckets: usize,
+    ) -> anyhow::Result<Self> {
+        let mut counts = vec![0u64; num_buckets];
+        if num_buckets == 0 {
+            return Ok(Self::Histogram(counts));
+        }
+        let seg = searcher.segment_reader(0);
+        let max_doc = seg.max_doc();
+        if max_doc == 0 {
+            return Ok(Self::Histogram(counts));
+        }
+        let col = seg.fast_fields().i64(TIMESTAMP_COL_NAME)?;
+        let at = |d: u32| -> i64 { col.first(d).unwrap_or(i64::MAX) };
+        let width = bucket_width as i64;
+        let ascending = at(0) <= at(max_doc - 1);
+
+        // boundary doc-id for each bucket edge k (0..=num_buckets)
+        let mut bd = vec![0u32; num_buckets + 1];
+        let mut lo_start = 0u32; // ascending boundaries are monotonic -> gallop the lower bound
+        for k in 0..=num_buckets {
+            let e = min_value + (k as i64) * width;
+            let (mut lo, mut hi) = (if ascending { lo_start } else { 0 }, max_doc);
+            if ascending {
+                while lo < hi { let mid = lo + (hi - lo) / 2; if at(mid) < e { lo = mid + 1 } else { hi = mid } }
+                lo_start = lo;
+            } else {
+                while lo < hi { let mid = lo + (hi - lo) / 2; if at(mid) >= e { lo = mid + 1 } else { hi = mid } }
+            }
+            bd[k] = lo;
+        }
+
+        match term_field {
+            None => {
+                for b in 0..num_buckets {
+                    counts[b] = if ascending { (bd[b + 1] - bd[b]) as u64 } else { (bd[b] - bd[b + 1]) as u64 };
+                }
+            }
+            Some((field_name, value)) => {
+                let field = match searcher.schema().get_field(&field_name) {
+                    Ok(f) => f,
+                    Err(_) => return Ok(Self::Histogram(counts)),
+                };
+                let term = Term::from_field_text(field, &value);
+                let inv = seg.inverted_index(field)?;
+                let mut bp = match inv.read_block_postings(&term, IndexRecordOption::Basic)? {
+                    Some(bp) => bp,
+                    None => return Ok(Self::Histogram(counts)), // term absent -> all zero
+                };
+                // rank() requires non-decreasing targets (forward-only skip). Call in doc-ascending order.
+                let mut ranks = vec![0u32; num_buckets + 1];
+                if ascending {
+                    for k in 0..=num_buckets { ranks[k] = bp.rank(bd[k]); }
+                } else {
+                    // DESC: bd is non-increasing in k; call in k descending so doc-edges increase
+                    for k in (0..=num_buckets).rev() { ranks[k] = bp.rank(bd[k]); }
+                }
+                for b in 0..num_buckets {
+                    counts[b] = if ascending {
+                        (ranks[b + 1] - ranks[b]) as u64
+                    } else {
+                        (ranks[b] - ranks[b + 1]) as u64
+                    };
+                }
+            }
+        }
+        Ok(Self::Histogram(counts))
     }
 
     pub fn handle_simple_multi_histogram(

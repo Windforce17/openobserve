@@ -1313,6 +1313,18 @@ pub struct Common {
     )]
     pub inverted_index_count_optimizer_enabled: bool,
     #[env_config(
+        name = "ZO_INVERTED_INDEX_HISTOGRAM_SORTED_OPTIMIZER",
+        default = false,
+        help = "For SimpleHistogram (count(*) per time-bucket, optionally filtered), use a boundary search on the sorted _timestamp fast field instead of scanning every matched doc. Only correct when the segment is _timestamp-sorted (compacted files); falls back to the scan collector otherwise."
+    )]
+    pub inverted_index_histogram_sorted_optimizer: bool,
+    #[env_config(
+        name = "ZO_INVERTED_INDEX_HISTOGRAM_RANK",
+        default = false,
+        help = "SimpleHistogram via skip-list rank (count(*) per bucket = postings-rank differences at bucket boundaries) on _timestamp-sorted segments; no per-matched-doc iteration. Single-term/no-filter only; falls back otherwise."
+    )]
+    pub inverted_index_histogram_rank: bool,
+    #[env_config(
         name = "ZO_QUERY_ON_STREAM_SELECTION",
         default = true,
         help = "Toggle search to be trigger based on button click event."

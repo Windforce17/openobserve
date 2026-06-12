@@ -503,6 +503,24 @@ async fn search_tantivy_index(
 
     // search the index
     let trace_id_clone = trace_id.to_string();
+    // opt-in: on _timestamp-sorted (compacted) segments, compute SimpleHistogram via a boundary
+    // search on the sorted _timestamp fast field instead of scanning every matched doc.
+    let use_sorted_histogram = get_config()
+        .common
+        .inverted_index_histogram_sorted_optimizer;
+    // rank path: eligible only for a single-term equality filter or no filter
+    let use_rank_histogram = get_config().common.inverted_index_histogram_rank;
+    let rank_term: Option<Option<(String, String)>> = if use_rank_histogram {
+        match condition.conditions.as_slice() {
+            [crate::service::search::index::Condition::All()] => Some(None),
+            [crate::service::search::index::Condition::Equal(f, v)] => {
+                Some(Some((f.clone(), v.clone())))
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
     let res = tokio::task::spawn_blocking(move || match idx_optimize_rule {
         None => TantivyResult::handle_matched_docs(&searcher, query),
         Some(IndexOptimizeMode::SimpleSelect(limit, ascend)) => {
@@ -517,13 +535,31 @@ async fn search_tantivy_index(
                 log::warn!("[trace_id {trace_id_clone}] search->tantivy: _timestamp not index in tantivy file: {ttv_file_name}");
                 return Ok(TantivyResult::Histogram(vec![]));
             }
-            TantivyResult::handle_simple_histogram(
-                &searcher,
-                query,
-                min_value,
-                bucket_width,
-                num_buckets,
-            )
+            if let Some(tf) = rank_term {
+                TantivyResult::handle_simple_histogram_rank(
+                    &searcher,
+                    tf,
+                    min_value,
+                    bucket_width,
+                    num_buckets,
+                )
+            } else if use_sorted_histogram {
+                TantivyResult::handle_simple_histogram_sorted(
+                    &searcher,
+                    query,
+                    min_value,
+                    bucket_width,
+                    num_buckets,
+                )
+            } else {
+                TantivyResult::handle_simple_histogram(
+                    &searcher,
+                    query,
+                    min_value,
+                    bucket_width,
+                    num_buckets,
+                )
+            }
         }
         Some(IndexOptimizeMode::SimpleMultiHistogram(
             min_value,
