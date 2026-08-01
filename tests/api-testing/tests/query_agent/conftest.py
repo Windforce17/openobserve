@@ -87,7 +87,7 @@ def load_all_queries():
 def _verify_fts_content(sql, hits, qid):
     """Verify match_all results: every returned hit contains the search terms.
 
-    Tantivy full-text search tokenizes and indexes text fields.  When the
+    The FTS index tokenizes and indexes text fields.  When the
     DataFusion access plan is bypassed (e.g. after an upgrade), match_all
     can silently return wrong results — rows that don't contain the search
     terms at all.  This check catches that.
@@ -145,7 +145,7 @@ def run_query(client, query, *, skip_fts_count=False):
       and run explicit content assertions.
 
     When *skip_fts_count* is True, full_text_search row_count is skipped
-    (Tantivy FTS not available pre-flush).
+    (FTS index not available pre-flush).
     """
     qid = query["id"]
     size = 500
@@ -169,10 +169,10 @@ def run_query(client, query, *, skip_fts_count=False):
     def _validate(hits):
         """Run every assertion for this query against *hits*; raise on mismatch."""
         # Verify match_all results actually contain the search terms.
-        # After a DataFusion upgrade, the Tantivy access plan can be bypassed
+        # After a DataFusion upgrade, the index access plan can be bypassed
         # silently — this content check catches wrong results that row-count
         # comparisons alone would miss.
-        # Only run post-flush when Tantivy indexes are expected to exist.
+        # Only run post-flush when FTS indexes are expected to exist.
         if not skip_fts_count:
             _verify_fts_content(sql, hits, qid)
 

@@ -34,12 +34,13 @@ use tokio::sync::mpsc;
 
 use crate::service::db;
 
+pub mod bloom;
 pub mod deleted;
 pub mod dump;
-pub mod flatten;
 pub mod incremental;
 pub mod merge;
 pub mod retention;
+pub mod segments_sweep;
 pub mod stats;
 pub mod worker;
 
@@ -270,15 +271,39 @@ pub async fn run_generate_downsampling_job() -> Result<(), anyhow::Error> {
 /// compactor merging
 pub async fn run_merge(job_tx: mpsc::Sender<worker::MergeJob>) -> Result<(), anyhow::Error> {
     let cfg = get_config();
-    let jobs = infra_file_list::get_pending_jobs(
-        &LOCAL_NODE.uuid,
+    // Claim only what this node's merge workers can start soon: even with
+    // heartbeats running from claim time (below), a worker-sized batch keeps
+    // a slow node from hoarding jobs a healthy node could run. Oldest-first
+    // claiming (get_pending_jobs) spreads a hot stream's hour-jobs across
+    // the whole fleet.
+    let claim_limit = std::cmp::min(
         cfg.compact.batch_size,
-        cfg.compact.fast_mode,
-    )
-    .await?;
+        std::cmp::max(cfg.limit.file_merge_thread_num as i64, 1),
+    );
+    let jobs =
+        infra_file_list::get_pending_jobs(&LOCAL_NODE.uuid, claim_limit, cfg.compact.fast_mode)
+            .await?;
     if jobs.is_empty() {
         return Ok(());
     }
+
+    // Heartbeat-from-claim: every claimed job gets its lease heartbeat NOW,
+    // before any dispatch work. The guard is handed through the scheduler
+    // channel inside MergeJob, so one continuous heartbeat covers the job
+    // from CLAIM through the worker's COMMIT — a job parked in the
+    // capacity-1 channel behind a long merge stays fresh instead of being
+    // re-pended by check_running_jobs and double-merged by another node
+    // (2026-07-30 audit). Guards of jobs that are released or done below
+    // drop with this map at the end of the function.
+    //
+    // ttl: 1/4 of job_run_timeout — the timeout covers the whole job, and
+    // refreshing at 1/2 could still cross the threshold under scheduling
+    // delay, so 1/4 keeps a safety margin.
+    let ttl = std::cmp::max(60, cfg.compact.job_run_timeout / 4) as u64;
+    let mut leases: std::collections::HashMap<i64, worker::JobLeaseGuard> = jobs
+        .iter()
+        .map(|job| (job.id, worker::JobLeaseGuard::spawn(job.id, ttl)))
+        .collect();
 
     let now = config::utils::time::now();
     let data_lifecycle_end = now - Duration::try_days(cfg.compact.data_retention_days).unwrap();
@@ -337,12 +362,22 @@ pub async fn run_merge(job_tx: mpsc::Sender<worker::MergeJob>) -> Result<(), any
             }
         }
         // collect the merge jobs
+        let Some(lease) = leases.remove(&job.id) else {
+            // a duplicate id from the claim query would have consumed its
+            // lease guard already — never run the same job twice
+            log::error!(
+                "[COMPACTOR] claimed job {} appeared twice, skipping the duplicate",
+                job.id
+            );
+            continue;
+        };
         merge_jobs.push(worker::MergeJob {
             org_id,
             stream_type,
             stream_name,
             job_id: job.id,
             offset: job.offsets,
+            lease,
         });
     }
 
@@ -360,31 +395,10 @@ pub async fn run_merge(job_tx: mpsc::Sender<worker::MergeJob>) -> Result<(), any
         }
     }
 
-    // create a thread to keep updating the job status
-    //
-    // Update job status (updated_at) to prevent pickup by another node
-    // convert job_timeout from secs to micros, and check 1/4 of job_timeout
-    // why 1/4 of job_run_timeout?
-    // because the timeout is for the entire job, we need to update the job status
-    // before it timeout, using 1/2 might still risk a timeout, so we use 1/4 for safety
-    let ttl = std::cmp::max(60, cfg.compact.job_run_timeout / 4) as u64;
-    let job_ids = merge_jobs.iter().map(|job| job.job_id).collect::<Vec<_>>();
-    let (_tx, mut rx) = mpsc::channel::<()>(1);
-    tokio::task::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = tokio::time::sleep(tokio::time::Duration::from_secs(ttl)) => {}
-                _ = rx.recv() => {
-                    log::debug!("[COMPACTOR] update_running_jobs done");
-                    return;
-                }
-            }
-            if let Err(e) = infra_file_list::update_running_jobs(&job_ids).await {
-                log::error!("[COMPACTOR] update_job_status failed: {e}");
-            }
-        }
-    });
-
+    // Hand each job (with its lease guard inside) to the scheduler. The old
+    // batch-level heartbeat that lived only until this loop finished is gone:
+    // the per-job guards spawned at claim time above cover the whole
+    // claim-to-commit window.
     for job in merge_jobs {
         if let Err(e) = job_tx.send(job.clone()).await {
             log::error!(
@@ -393,6 +407,14 @@ pub async fn run_merge(job_tx: mpsc::Sender<worker::MergeJob>) -> Result<(), any
                 job.stream_type,
                 job.stream_name,
             );
+            // the job never reached a worker (scheduler shut down): release
+            // the claim right away instead of letting the lease time out
+            if let Err(e) = infra_file_list::set_job_pending(&[job.job_id], 0, None).await {
+                log::error!(
+                    "[COMPACTOR] set_job_pending for undispatched job {} failed: {e}",
+                    job.job_id,
+                );
+            }
         }
     }
 
@@ -473,4 +495,55 @@ pub(crate) fn is_past_hour(offset: i64) -> bool {
                 .num_microseconds()
                 .unwrap()
                 * 3
+}
+
+/// Shared harness for the compact tests that exercise the process-global
+/// sqlite file_list tables (`worker` heartbeat lifetime, `merge` commit
+/// fencing): they claim/re-pend jobs table-wide, so tests across BOTH
+/// modules must serialize on ONE lock, and rows are namespaced per run.
+#[cfg(test)]
+pub(crate) mod jobs_test_support {
+    /// Serializes every test touching `file_list_jobs` in this crate.
+    pub(crate) static FILE_LIST_JOBS_TEST_LOCK: tokio::sync::Mutex<()> =
+        tokio::sync::Mutex::const_new(());
+
+    /// Create the real file_list tables (idempotent) and take the lock.
+    pub(crate) async fn setup() -> tokio::sync::MutexGuard<'static, ()> {
+        let guard = FILE_LIST_JOBS_TEST_LOCK.lock().await;
+        std::fs::create_dir_all(&config::get_config().common.data_db_dir)
+            .expect("create data_db_dir for tests");
+        infra::file_list::create_table()
+            .await
+            .expect("create file_list tables");
+        // add_job's ON CONFLICT needs the unique (stream, offsets) index
+        infra::file_list::create_table_index()
+            .await
+            .expect("create file_list indexes");
+        guard
+    }
+
+    /// Test modules OUTSIDE this lock write to the same sqlite file through
+    /// other connections (sea-orm, RO pools), so a write can still hit
+    /// SQLITE_BUSY_SNAPSHOT ("database is locked") despite the RW mutex.
+    /// Bounded retry on exactly that error; anything else panics with the
+    /// operation name.
+    pub(crate) async fn retry_busy<T, E, F, Fut>(op_name: &str, mut op: F) -> T
+    where
+        E: std::fmt::Display,
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T, E>>,
+    {
+        const TRIES: usize = 20;
+        for attempt in 1..=TRIES {
+            match op().await {
+                Ok(v) => return v,
+                Err(e) if e.to_string().contains("database is locked") && attempt < TRIES => {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(50 * attempt as u64))
+                        .await;
+                }
+                Err(e) => panic!("{op_name} failed: {e}"),
+            }
+        }
+        unreachable!("retry_busy returns or panics inside the loop");
+    }
 }

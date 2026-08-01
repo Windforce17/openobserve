@@ -1,8 +1,8 @@
-"""Phase 2 — Post-Flush Parquet + Tantivy: run all queries after flush.
+"""Phase 2 — Post-Flush storage + the .vix index: run all queries after flush.
 
 A module-scoped fixture triggers the flush between the memtable phase
 (test_1_memtable) and this phase. FTS queries (match_all) should now
-return expected row counts because Tantivy indexes exist alongside
+return expected row counts because FTS indexes exist alongside
 Parquet files.
 """
 
@@ -30,7 +30,7 @@ def post_flush(ingest_query_agent_data):
 
     resp = client.put("node/flush", prefix="")
     if resp.status_code == 200:
-        logging.info("Flush succeeded — Parquet + Tantivy indexes generated")
+        logging.info("Flush succeeded — storage + the .vix index indexes generated")
     elif resp.status_code == 404:
         logging.info("Flush not applicable (local mode or non-ingester node)")
     else:
@@ -38,7 +38,7 @@ def post_flush(ingest_query_agent_data):
 
     time.sleep(2)
 
-    # Re-poll until all data is searchable via Parquet + Tantivy
+    # Re-poll until all data is searchable via storage + the .vix index
     def _data_searchable():
         now = datetime.now(UTC)
         end_us = int(now.timestamp() * 1_000_000)
@@ -62,7 +62,7 @@ def post_flush(ingest_query_agent_data):
                msg=f"{STREAM} data not searchable after flush")
     logging.info("Post-flush: data searchable")
 
-    # Tantivy readiness: Parquet files may be searchable before Tantivy
+    # the FTS index readiness: Parquet files may be searchable before the FTS index
     # indexes are built (ZO_MAX_FILE_RETENTION_TIME defaults to 600s).
     # Run a match_all query to confirm FTS is actually working.
     # 120s timeout accounts for the default 600s retention time;
@@ -91,15 +91,15 @@ def post_flush(ingest_query_agent_data):
         return "warehouse" in log_val
 
     wait_until(_fts_ready, timeout=120, interval=2.0,
-               msg=f"Tantivy FTS not ready for {STREAM} after flush")
-    logging.info("Post-flush: Tantivy FTS ready")
+               msg=f"FTS index not ready for {STREAM} after flush")
+    logging.info("Post-flush: FTS index ready")
 
 
 # ── Query helpers ────────────────────────────────────────────────────────
 def _make_test(cat, queries):
     @pytest.mark.parametrize("query", queries, ids=[q["id"] for q in queries])
     def _test(client, post_flush, query):
-        # Post-flush: Tantivy available — assert full row counts including FTS
+        # Post-flush: the FTS index available — assert full row counts including FTS
         run_query(client, query, skip_fts_count=False)
     return _test
 
@@ -109,5 +109,5 @@ _CATEGORIES = load_all_queries()
 for _cat, _queries in sorted(_CATEGORIES.items()):
     _fn = _make_test(_cat, _queries)
     _fn.__name__ = f"test_parquet_{_cat}"
-    _fn.__doc__ = f"Post-flush: run {_cat} queries against Parquet + Tantivy"
+    _fn.__doc__ = f"Post-flush: run {_cat} queries against storage + the .vix index"
     globals()[_fn.__name__] = _fn

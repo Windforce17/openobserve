@@ -625,7 +625,8 @@ async fn write_file_list(
                         id: 0,
                         account: v.account.clone(),
                         file: v.key.clone(),
-                        index_file: v.meta.index_size > 0,
+                        // always false: no file has a sibling index object
+                        index_file: false,
                         flattened: v.meta.flattened,
                     })
                     .collect::<Vec<_>>();

@@ -88,12 +88,6 @@ pub async fn remote_write(
     let mut schema_evolved: HashMap<String, bool> = HashMap::new();
     let mut stream_partitioning_map: HashMap<String, Vec<StreamPartition>> = HashMap::new();
 
-    // Start get user defined schema
-    let mut user_defined_schema_map: HashMap<String, Option<HashSet<String>>> = HashMap::new();
-    let mut streams_need_original_map: HashMap<String, bool> = HashMap::new();
-    let mut streams_need_all_values_map: HashMap<String, bool> = HashMap::new();
-    // End get user defined schema
-
     // associated pipeline
     let mut stream_executable_pipelines: HashMap<String, Vec<ExecutablePipeline>> = HashMap::new();
     let mut stream_pipeline_inputs: HashMap<String, Vec<(json::Value, i64)>> = HashMap::new();
@@ -193,7 +187,6 @@ pub async fn remote_write(
     }
 
     let mut preload_pipeline_time = 0u128;
-    let mut preload_uds_time = 0u128;
     let mut preload_schema_time = 0u128;
     let mut preload_alerts_time = 0u128;
 
@@ -218,17 +211,6 @@ pub async fn remote_write(
             }
         }
         preload_pipeline_time = t.elapsed().as_micros();
-
-        // Preload UDS
-        let t = std::time::Instant::now();
-        crate::service::ingestion::get_uds_and_original_data_streams(
-            &streams,
-            &mut user_defined_schema_map,
-            &mut streams_need_original_map,
-            &mut streams_need_all_values_map,
-        )
-        .await;
-        preload_uds_time = t.elapsed().as_micros();
 
         // Preload schemas
         let t = std::time::Instant::now();
@@ -338,7 +320,6 @@ pub async fn remote_write(
                 value,
                 timestamp,
                 &stream_executable_pipelines,
-                &user_defined_schema_map,
                 &mut stream_pipeline_inputs,
                 &mut json_data_by_stream,
             );
@@ -400,7 +381,6 @@ pub async fn remote_write(
                         value,
                         timestamp,
                         &stream_executable_pipelines,
-                        &user_defined_schema_map,
                         &mut stream_pipeline_inputs,
                         &mut json_data_by_stream,
                     );
@@ -419,11 +399,10 @@ pub async fn remote_write(
 
         log::info!(
             "[remote_write] org: {org_id}, parse timeseries took: {parse_timeseries_ms} ms, streams: {} (events: {event_count}, samples: {sample_count}) | \
-            preload_total={:.1}ms (pipeline={:.1}ms, uds={:.1}ms, schema={:.1}ms, alerts={:.1}ms), sample_proc={:.1}ms, other={:.1}ms",
+            preload_total={:.1}ms (pipeline={:.1}ms, schema={:.1}ms, alerts={:.1}ms), sample_proc={:.1}ms, other={:.1}ms",
             unique_metrics.len(),
             total_preload_time as f64 / 1000.0,
             preload_pipeline_time as f64 / 1000.0,
-            preload_uds_time as f64 / 1000.0,
             preload_schema_time as f64 / 1000.0,
             preload_alerts_time as f64 / 1000.0,
             sample_processing_time as f64 / 1000.0,
@@ -481,17 +460,10 @@ pub async fn remote_write(
                         }
                         for (idx, mut res) in stream_pl_results {
                             // get json object
-                            let mut local_val = match res.take() {
+                            let local_val = match res.take() {
                                 json::Value::Object(v) => v,
                                 _ => unreachable!(),
                             };
-
-                            if let Some(Some(fields)) =
-                                user_defined_schema_map.get(&destination_stream)
-                            {
-                                local_val =
-                                    crate::service::ingestion::refactor_map(local_val, fields);
-                            }
 
                             // buffer to downstream processing directly
                             json_data_by_stream
@@ -506,14 +478,10 @@ pub async fn remote_write(
 
         if !has_user_pipeline && !json_data_by_stream.contains_key(stream_name) {
             for (mut value, timestamp) in records.into_iter().zip(timestamps) {
-                let mut local_val = match value.take() {
+                let local_val = match value.take() {
                     json::Value::Object(val) => val,
                     _ => unreachable!(),
                 };
-
-                if let Some(Some(fields)) = user_defined_schema_map.get(stream_name) {
-                    local_val = crate::service::ingestion::refactor_map(local_val, fields);
-                }
 
                 json_data_by_stream
                     .entry(stream_name.clone())
@@ -1173,14 +1141,13 @@ pub fn try_into_metric_name(selector: &parser::VectorSelector) -> Option<String>
 /// Per-stream buffer of records ready for the write path, keyed by stream name.
 type JsonDataByStream = HashMap<String, Vec<(json::Map<String, json::Value>, i64)>>;
 
-/// Routes one metric record either into its stream's pipeline input buffer or, with UDS
-/// trimming applied, directly into the per-stream write buffer.
+/// Routes one metric record either into its stream's pipeline input buffer or
+/// directly into the per-stream write buffer.
 fn buffer_metric_record(
     metric_name: &str,
     mut value: json::Value,
     timestamp: i64,
     stream_executable_pipelines: &HashMap<String, Vec<ExecutablePipeline>>,
-    user_defined_schema_map: &HashMap<String, Option<HashSet<String>>>,
     stream_pipeline_inputs: &mut HashMap<String, Vec<(json::Value, i64)>>,
     json_data_by_stream: &mut JsonDataByStream,
 ) {
@@ -1195,14 +1162,10 @@ fn buffer_metric_record(
             .push((value, timestamp));
     } else {
         // get json object
-        let mut local_val = match value.take() {
+        let local_val = match value.take() {
             json::Value::Object(val) => val,
             _ => unreachable!(),
         };
-
-        if let Some(Some(fields)) = user_defined_schema_map.get(metric_name) {
-            local_val = crate::service::ingestion::refactor_map(local_val, fields);
-        }
 
         // buffer to downstream processing directly
         json_data_by_stream

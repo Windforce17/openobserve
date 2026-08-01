@@ -32,15 +32,14 @@ use datafusion::{
 use o2_enterprise::enterprise::search::datafusion::distributed_plan::metadata_count_exec::MetadataCountExec;
 
 use crate::{
-    datafusion::plan::tantivy_optimize_exec::TantivyOptimizeExec, index::IndexCondition,
-    types::QueryParams,
+    datafusion::plan::index_optimize_exec::IndexOptimizeExec, types::QueryParams, vix::MultiResult,
 };
 
 pub fn aggregate_optimize_rewrite(
     query: Arc<QueryParams>,
     metadata_count_file_list: Vec<FileKey>,
-    tantivy_file_list: Vec<FileKey>,
-    index_condition: Option<IndexCondition>,
+    index_file_list: Vec<FileKey>,
+    index_result: Option<MultiResult>,
     index_optimize_mode: Option<IndexOptimizeMode>,
     physical_plan: Arc<dyn ExecutionPlan>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -48,14 +47,14 @@ pub fn aggregate_optimize_rewrite(
         total.saturating_add(file.meta.records.max(0))
     });
     let metadata_files = metadata_count_file_list.len();
-    if metadata_records == 0 && tantivy_file_list.is_empty() {
+    if metadata_records == 0 && (index_file_list.is_empty() || index_result.is_none()) {
         return Ok(physical_plan);
     }
 
     let mut visitor = AggregateOptimizeRewriter::new(
         query,
-        tantivy_file_list,
-        index_condition,
+        index_file_list,
+        index_result,
         index_optimize_mode,
         metadata_records,
         metadata_files,
@@ -66,7 +65,9 @@ pub fn aggregate_optimize_rewrite(
 pub struct AggregateOptimizeRewriter {
     query: Arc<QueryParams>,
     file_list: Vec<FileKey>,
-    index_condition: Option<IndexCondition>,
+    /// The index result precomputed by the eager vix_search in `flight.rs`,
+    /// covering exactly `file_list`.
+    index_result: Option<MultiResult>,
     index_optimize_mode: Option<IndexOptimizeMode>,
     #[allow(unused)]
     metadata_records: i64,
@@ -78,7 +79,7 @@ impl AggregateOptimizeRewriter {
     pub fn new(
         query: Arc<QueryParams>,
         file_list: Vec<FileKey>,
-        index_condition: Option<IndexCondition>,
+        index_result: Option<MultiResult>,
         index_optimize_mode: Option<IndexOptimizeMode>,
         metadata_records: i64,
         metadata_files: usize,
@@ -86,22 +87,24 @@ impl AggregateOptimizeRewriter {
         Self {
             query,
             file_list,
-            index_condition,
+            index_result,
             index_optimize_mode,
             metadata_records,
             metadata_files,
         }
     }
 
-    fn tantivy_exec(&mut self, schema: SchemaRef) -> Arc<dyn ExecutionPlan> {
-        Arc::new(TantivyOptimizeExec::new(
+    fn index_optimize_exec(&mut self, schema: SchemaRef) -> Arc<dyn ExecutionPlan> {
+        Arc::new(IndexOptimizeExec::new(
             self.query.clone(),
             schema,
             std::mem::take(&mut self.file_list),
-            std::mem::take(&mut self.index_condition),
+            self.index_result
+                .take()
+                .expect("index result should exist when index files are present"),
             self.index_optimize_mode
                 .clone()
-                .expect("index optimize mode should exist when tantivy files are present"),
+                .expect("index optimize mode should exist when index files are present"),
         ))
     }
 
@@ -122,8 +125,8 @@ impl AggregateOptimizeRewriter {
             inputs.push(self.metadata_count_exec(schema.clone())?);
         }
 
-        if !self.file_list.is_empty() {
-            inputs.push(self.tantivy_exec(schema));
+        if !self.file_list.is_empty() && self.index_result.is_some() {
+            inputs.push(self.index_optimize_exec(schema));
         }
 
         Ok(inputs)
@@ -210,7 +213,7 @@ mod tests {
 
     #[cfg(feature = "enterprise")]
     #[test]
-    fn test_aggregate_optimize_rewrite_combines_metadata_and_tantivy_inputs() -> Result<()> {
+    fn test_aggregate_optimize_rewrite_combines_metadata_and_index_inputs() -> Result<()> {
         let plan = partial_count_exec()?;
         let metadata_files = vec![FileKey {
             meta: FileMeta {
@@ -224,7 +227,7 @@ mod tests {
             query_params(),
             metadata_files,
             vec![FileKey::default()],
-            None,
+            Some(MultiResult::Count(7)),
             Some(IndexOptimizeMode::SimpleCount),
             plan,
         )?;
@@ -236,18 +239,18 @@ mod tests {
         assert_eq!(inputs.len(), 3);
         assert_eq!(inputs[0].name(), "AggregateExec");
         assert_eq!(inputs[1].name(), "MetadataCountExec");
-        assert_eq!(inputs[2].name(), "TantivyOptimizeExec");
+        assert_eq!(inputs[2].name(), "IndexOptimizeExec");
 
         Ok(())
     }
 
     #[test]
-    fn test_aggregate_optimize_rewrite_tantivy_only() -> Result<()> {
+    fn test_aggregate_optimize_rewrite_index_only() -> Result<()> {
         let rewritten = aggregate_optimize_rewrite(
             query_params(),
             vec![],
             vec![FileKey::default()],
-            None,
+            Some(MultiResult::Count(7)),
             Some(IndexOptimizeMode::SimpleCount),
             partial_count_exec()?,
         )?;
@@ -258,8 +261,30 @@ mod tests {
         let inputs = union.inputs();
         assert_eq!(inputs.len(), 2);
         assert_eq!(inputs[0].name(), "AggregateExec");
-        assert_eq!(inputs[1].name(), "TantivyOptimizeExec");
+        assert_eq!(inputs[1].name(), "IndexOptimizeExec");
 
+        Ok(())
+    }
+
+    /// Without a precomputed index result there is nothing for the exec to
+    /// serve: the plan stays unchanged (the files were moved to the scan
+    /// branch by the eager evaluation in flight.rs).
+    #[test]
+    fn test_aggregate_optimize_rewrite_without_result_is_a_no_op() -> Result<()> {
+        let plan = partial_count_exec()?;
+        let rewritten = aggregate_optimize_rewrite(
+            query_params(),
+            vec![],
+            vec![FileKey::default()],
+            None,
+            Some(IndexOptimizeMode::SimpleCount),
+            Arc::clone(&plan),
+        )?;
+        assert!(
+            rewritten.downcast_ref::<UnionExec>().is_none(),
+            "no index result -> no IndexOptimizeExec union"
+        );
+        assert_eq!(rewritten.name(), "AggregateExec");
         Ok(())
     }
 }

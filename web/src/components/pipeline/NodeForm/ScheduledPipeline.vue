@@ -1302,8 +1302,6 @@ const isSyncingStreamFromQuery = ref(false);
 const aiChatInputContext = ref("");
 const aiChatAppendMode = ref(true);
 
-const userDefinedFields = ref<any[]>([]);
-
 // ─── Field value streaming & duration percentiles ────────────────────
 
 const {
@@ -2064,7 +2062,6 @@ const getStreamFields = () => {
     getStream(selectedStreamName.value, selectedStreamType.value, true)
       .then(async (stream: any) => {
         streamFields.value = [];
-        userDefinedFields.value = [];
         const ftsKeys: string[] = stream.settings?.full_text_search_keys || [];
         const timestampColumn: string = store.state.zoConfig.timestamp_column;
         stream.schema?.forEach((field: any) => {
@@ -2074,11 +2071,6 @@ const getStreamFields = () => {
             isSchemaField: true,
             showValues: field.name !== timestampColumn,
             ftsKey: ftsKeys.includes(field.name),
-          });
-        });
-        stream.uds_schema?.forEach((field: any) => {
-          userDefinedFields.value.push({
-            ...field,
           });
         });
 
@@ -2684,31 +2676,8 @@ const getContext = async () => {
         };
       });
 
-      //if uds is enabled we need to push the timestamp and all fields name in the schema
-      const hasTimestampColumn = userDefinedFields.value.some(
-        (field: any) => field.name === store.state.zoConfig.timestamp_column,
-      );
-      const hasAllFieldsName = userDefinedFields.value.some(
-        (field: any) => field.name === store.state.zoConfig.all_fields_name,
-      );
-      if (userDefinedFields.value.length > 0) {
-        if (!hasTimestampColumn) {
-          userDefinedFields.value.push({
-            name: store.state.zoConfig.timestamp_column,
-            type: "Int64",
-          });
-        }
-        if (!hasAllFieldsName) {
-          userDefinedFields.value.push({
-            name: store.state.zoConfig.all_fields_name,
-            type: "Utf8",
-          });
-        }
-      }
-
       payload["stream_name"] = selectedStreamName.value;
-      payload["schema_"] =
-        userDefinedFields.value.length > 0 ? userDefinedFields.value : schema;
+      payload["schema_"] = schema;
 
       resolve(payload);
     } catch (error) {

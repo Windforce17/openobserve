@@ -78,7 +78,7 @@ pub mod streaming;
 pub mod super_cluster;
 pub mod work_group;
 
-pub use ::search::{bloom_pruner, datafusion, index, inspector, sql, tantivy, utils};
+pub use ::search::{bloom_pruner, datafusion, index, inspector, sql, utils, vix};
 pub use searcher::Searcher;
 
 /// The result of search in cluster

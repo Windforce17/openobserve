@@ -637,6 +637,21 @@ pub static COMPACT_PENDING_JOBS: Lazy<IntGaugeVec> = Lazy::new(|| {
     )
     .expect("Metric created")
 });
+pub static COMPACT_DROPPED_ZERO_TS_ROWS: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "compact_dropped_zero_ts_rows",
+            "Rows with a degenerate (zero/negative) _timestamp dropped by core-file cleansing \
+             at compaction merge or WAL move."
+                .to_owned()
+                + HELP_SUFFIX,
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &["organization", "stream_type", "stream"],
+    )
+    .expect("Metric created")
+});
 
 // stream stats aggregation metrics
 pub static STREAM_STATS_SCAN_DURATION: Lazy<HistogramVec> = Lazy::new(|| {
@@ -1373,12 +1388,12 @@ pub static QUERY_AGGREGATION_CACHE_ITEMS: Lazy<IntGaugeVec> = Lazy::new(|| {
     .expect("Metric created")
 });
 
-// metrics for tantivy result cache
-pub static TANTIVY_RESULT_CACHE_MEMORY_USAGE: Lazy<IntGaugeVec> = Lazy::new(|| {
+// metrics for the vix reader cache (parsed .vix readers on queriers)
+pub static VIX_READER_CACHE_ENTRIES: Lazy<IntGaugeVec> = Lazy::new(|| {
     IntGaugeVec::new(
         Opts::new(
-            "tantivy_result_cache_memory_usage",
-            "Total memory usage (bytes) of tantivy result cache",
+            "vix_reader_cache_entries",
+            "Number of parsed .vix readers held by the reader cache",
         )
         .namespace(NAMESPACE)
         .const_labels(create_const_labels()),
@@ -1387,11 +1402,11 @@ pub static TANTIVY_RESULT_CACHE_MEMORY_USAGE: Lazy<IntGaugeVec> = Lazy::new(|| {
     .expect("Metric created")
 });
 
-pub static TANTIVY_RESULT_CACHE_GC_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
-    IntCounterVec::new(
+pub static VIX_READER_CACHE_MEMORY_BYTES: Lazy<IntGaugeVec> = Lazy::new(|| {
+    IntGaugeVec::new(
         Opts::new(
-            "tantivy_result_cache_gc_total",
-            "Total number of GC of tantivy result cache",
+            "vix_reader_cache_memory_bytes",
+            "Total memory usage (bytes) of the vix reader cache (ZO_VIX_READER_CACHE_MAX_SIZE)",
         )
         .namespace(NAMESPACE)
         .const_labels(create_const_labels()),
@@ -1400,11 +1415,11 @@ pub static TANTIVY_RESULT_CACHE_GC_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     .expect("Metric created")
 });
 
-pub static TANTIVY_RESULT_CACHE_REQUESTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+pub static VIX_READER_CACHE_HITS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     IntCounterVec::new(
         Opts::new(
-            "tantivy_result_cache_requests_total",
-            "Total number of search of tantivy result cache",
+            "vix_reader_cache_hits_total",
+            "Total number of vix reader cache hits",
         )
         .namespace(NAMESPACE)
         .const_labels(create_const_labels()),
@@ -1413,11 +1428,92 @@ pub static TANTIVY_RESULT_CACHE_REQUESTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(
     .expect("Metric created")
 });
 
-pub static TANTIVY_RESULT_CACHE_HITS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+pub static VIX_READER_CACHE_MISSES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     IntCounterVec::new(
         Opts::new(
-            "tantivy_result_cache_hits_total",
-            "Total number of hit of tantivy result cache",
+            "vix_reader_cache_misses_total",
+            "Total number of vix reader cache misses",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &[],
+    )
+    .expect("Metric created")
+});
+
+// metrics for .vix range fetches (label `path`: `search` = index evaluation
+// through the cache ladder, `scan` = the DataFusion docs scan)
+pub static VIX_FETCH_COUNT_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "vix_fetch_count_total",
+            "Total number of .vix range fetches issued",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &["path"],
+    )
+    .expect("Metric created")
+});
+
+pub static VIX_FETCH_BYTES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "vix_fetch_bytes_total",
+            "Total bytes fetched by .vix range fetches",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &["path"],
+    )
+    .expect("Metric created")
+});
+
+// metrics for the vix per-file result cache
+pub static VIX_RESULT_CACHE_MEMORY_USAGE: Lazy<IntGaugeVec> = Lazy::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            "vix_result_cache_memory_usage",
+            "Total memory usage (bytes) of the vix per-file result cache",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &[],
+    )
+    .expect("Metric created")
+});
+
+pub static VIX_RESULT_CACHE_GC_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "vix_result_cache_gc_total",
+            "Total number of GC of the vix per-file result cache",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &[],
+    )
+    .expect("Metric created")
+});
+
+pub static VIX_RESULT_CACHE_REQUESTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "vix_result_cache_requests_total",
+            "Total number of search of the vix per-file result cache",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &[],
+    )
+    .expect("Metric created")
+});
+
+pub static VIX_RESULT_CACHE_HITS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "vix_result_cache_hits_total",
+            "Total number of hit of the vix per-file result cache",
         )
         .namespace(NAMESPACE)
         .const_labels(create_const_labels()),
@@ -1985,6 +2081,9 @@ fn register_metrics(registry: &Registry) {
     registry
         .register(Box::new(COMPACT_PENDING_JOBS.clone()))
         .expect("Metric registered");
+    registry
+        .register(Box::new(COMPACT_DROPPED_ZERO_TS_ROWS.clone()))
+        .expect("Metric registered");
 
     // bloom filter prune metrics
     registry
@@ -2189,18 +2288,38 @@ fn register_metrics(registry: &Registry) {
         .register(Box::new(QUERY_AGGREGATION_CACHE_BYTES.clone()))
         .expect("Metric registered");
 
-    // metrics for tantivy result cache
+    // metrics for the vix reader cache + range fetches
     registry
-        .register(Box::new(TANTIVY_RESULT_CACHE_MEMORY_USAGE.clone()))
+        .register(Box::new(VIX_READER_CACHE_ENTRIES.clone()))
         .expect("Metric registered");
     registry
-        .register(Box::new(TANTIVY_RESULT_CACHE_GC_TOTAL.clone()))
+        .register(Box::new(VIX_READER_CACHE_MEMORY_BYTES.clone()))
         .expect("Metric registered");
     registry
-        .register(Box::new(TANTIVY_RESULT_CACHE_REQUESTS_TOTAL.clone()))
+        .register(Box::new(VIX_READER_CACHE_HITS_TOTAL.clone()))
         .expect("Metric registered");
     registry
-        .register(Box::new(TANTIVY_RESULT_CACHE_HITS_TOTAL.clone()))
+        .register(Box::new(VIX_READER_CACHE_MISSES_TOTAL.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(VIX_FETCH_COUNT_TOTAL.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(VIX_FETCH_BYTES_TOTAL.clone()))
+        .expect("Metric registered");
+
+    // metrics for the vix per-file result cache
+    registry
+        .register(Box::new(VIX_RESULT_CACHE_MEMORY_USAGE.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(VIX_RESULT_CACHE_GC_TOTAL.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(VIX_RESULT_CACHE_REQUESTS_TOTAL.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(VIX_RESULT_CACHE_HITS_TOTAL.clone()))
         .expect("Metric registered");
 
     // metrics for generic bytes cache
@@ -2486,6 +2605,7 @@ mod tests {
         let _ = COMPACT_MERGED_FILES.clone();
         let _ = COMPACT_MERGED_BYTES.clone();
         let _ = COMPACT_PENDING_JOBS.clone();
+        let _ = COMPACT_DROPPED_ZERO_TS_ROWS.clone();
         let _ = STREAM_STATS_SCAN_DURATION.clone();
         let _ = STREAM_STATS_SCAN_TOTAL.clone();
         let _ = STREAM_STATS_SCAN_ERRORS_TOTAL.clone();
@@ -2572,11 +2692,17 @@ mod tests {
     }
 
     #[test]
-    fn test_statics_tantivy_and_tokio() {
-        let _ = TANTIVY_RESULT_CACHE_MEMORY_USAGE.clone();
-        let _ = TANTIVY_RESULT_CACHE_GC_TOTAL.clone();
-        let _ = TANTIVY_RESULT_CACHE_REQUESTS_TOTAL.clone();
-        let _ = TANTIVY_RESULT_CACHE_HITS_TOTAL.clone();
+    fn test_statics_vix_and_tokio() {
+        let _ = VIX_READER_CACHE_ENTRIES.clone();
+        let _ = VIX_READER_CACHE_MEMORY_BYTES.clone();
+        let _ = VIX_READER_CACHE_HITS_TOTAL.clone();
+        let _ = VIX_READER_CACHE_MISSES_TOTAL.clone();
+        let _ = VIX_FETCH_COUNT_TOTAL.clone();
+        let _ = VIX_FETCH_BYTES_TOTAL.clone();
+        let _ = VIX_RESULT_CACHE_MEMORY_USAGE.clone();
+        let _ = VIX_RESULT_CACHE_GC_TOTAL.clone();
+        let _ = VIX_RESULT_CACHE_REQUESTS_TOTAL.clone();
+        let _ = VIX_RESULT_CACHE_HITS_TOTAL.clone();
         let _ = BYTES_CACHE_MEMORY_SIZE.clone();
         let _ = BYTES_CACHE_ENTRY_COUNT.clone();
         let _ = BYTES_CACHE_GC_TIME.clone();

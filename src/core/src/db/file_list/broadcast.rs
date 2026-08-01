@@ -319,6 +319,7 @@ mod tests {
                 deleted: false,
                 selection: None,
                 row_group_size: None,
+                selection_exact: false,
             },
             FileKey {
                 id: 2,
@@ -328,6 +329,7 @@ mod tests {
                 deleted: true,
                 selection: None,
                 row_group_size: None,
+                selection_exact: false,
             },
         ];
 
@@ -358,6 +360,7 @@ mod tests {
                 deleted: false,
                 selection: None,
                 row_group_size: None,
+                selection_exact: false,
             });
 
             assert_eq!(queue.len(), initial_len + 1);
@@ -383,6 +386,7 @@ mod tests {
             deleted,
             selection: None,
             row_group_size: None,
+            selection_exact: false,
         }
     }
 

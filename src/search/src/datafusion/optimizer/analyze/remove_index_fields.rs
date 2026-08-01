@@ -13,7 +13,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use config::{ALL_VALUES_COL_NAME, ORIGINAL_DATA_COL_NAME};
+use config::ORIGINAL_DATA_COL_NAME;
 use datafusion::{
     common::{
         Result,
@@ -24,21 +24,20 @@ use datafusion::{
     optimizer::AnalyzerRule,
 };
 
-/// Optimization rule that remove index fields from table scan
+/// Optimization rule that removes the internal `_original` column from table
+/// scan projections when the query didn't explicitly select it
 ///
 /// Note: should apply before push down filter rule
 #[derive(Default, Debug)]
 pub struct RemoveIndexFieldsRule {
     need_original_field: bool,
-    need_all_values_field: bool,
 }
 
 impl RemoveIndexFieldsRule {
     #[allow(missing_docs)]
-    pub fn new(need_original_field: bool, need_all_values_field: bool) -> Self {
+    pub fn new(need_original_field: bool) -> Self {
         Self {
             need_original_field,
-            need_all_values_field,
         }
     }
 }
@@ -49,24 +48,19 @@ impl AnalyzerRule for RemoveIndexFieldsRule {
     }
 
     fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
-        let plan = plan.rewrite(&mut RemoveIndexFields::new(
-            self.need_original_field,
-            self.need_all_values_field,
-        ))?;
+        let plan = plan.rewrite(&mut RemoveIndexFields::new(self.need_original_field))?;
         Ok(plan.data)
     }
 }
 
 struct RemoveIndexFields {
     need_original_field: bool,
-    need_all_values_field: bool,
 }
 
 impl RemoveIndexFields {
-    pub fn new(need_original_field: bool, need_all_values_field: bool) -> Self {
+    pub fn new(need_original_field: bool) -> Self {
         Self {
             need_original_field,
-            need_all_values_field,
         }
     }
 }
@@ -80,35 +74,21 @@ impl TreeNodeRewriter for RemoveIndexFields {
                 if matches!(&*projection.input, LogicalPlan::Filter(_)) {
                     let schema = projection.input.schema();
 
-                    // check if the table has original_data & _all_values field
+                    // check if the table has the _original field
                     let has_original_data =
                         schema.index_of_column_by_name(None, ORIGINAL_DATA_COL_NAME);
-                    let has_all_values = schema.index_of_column_by_name(None, ALL_VALUES_COL_NAME);
-                    if (self.need_original_field || has_original_data.is_none())
-                        && has_all_values.is_none()
-                    {
+                    if self.need_original_field || has_original_data.is_none() {
                         return Ok(Transformed::no(node));
                     }
 
                     let mut new_projection = projection.clone();
-                    if !self.need_original_field && has_original_data.is_some() {
-                        new_projection.expr.retain(|expr| {
-                            if let Expr::Column(column) = expr {
-                                column.name() != ORIGINAL_DATA_COL_NAME
-                            } else {
-                                true
-                            }
-                        });
-                    }
-                    if !self.need_all_values_field && has_all_values.is_some() {
-                        new_projection.expr.retain(|expr| {
-                            if let Expr::Column(column) = expr {
-                                column.name() != ALL_VALUES_COL_NAME
-                            } else {
-                                true
-                            }
-                        });
-                    }
+                    new_projection.expr.retain(|expr| {
+                        if let Expr::Column(column) = expr {
+                            column.name() != ORIGINAL_DATA_COL_NAME
+                        } else {
+                            true
+                        }
+                    });
                     let projection =
                         Projection::try_new(new_projection.expr, projection.input.clone())?;
                     Ok(Transformed::yes(LogicalPlan::Projection(projection)))
@@ -141,7 +121,6 @@ mod tests {
             Field::new("name", DataType::Utf8, false),
             Field::new("_timestamp", DataType::Int64, false),
             Field::new("_original_data", DataType::Utf8, false),
-            Field::new("_all_values", DataType::Utf8, false),
         ]);
         let test = table_scan(Some("test"), &schema, None)?.build()?;
         Ok(test)
@@ -151,13 +130,9 @@ mod tests {
         plan: LogicalPlan,
         expected: &str,
         need_original_field: bool,
-        need_all_values_field: bool,
     ) -> Result<()> {
         assert_analyzer_plan_eq(
-            Arc::new(RemoveIndexFieldsRule::new(
-                need_original_field,
-                need_all_values_field,
-            )),
+            Arc::new(RemoveIndexFieldsRule::new(need_original_field)),
             plan,
             expected,
         )
@@ -186,7 +161,7 @@ mod tests {
         let plan = LogicalPlanBuilder::from(table_scan).build()?;
 
         let expected = "TableScan: test";
-        assert_analyzer_plan_equal(plan, expected, false, false)
+        assert_analyzer_plan_equal(plan, expected, false)
     }
 
     #[test]
@@ -197,18 +172,7 @@ mod tests {
             .build()?;
 
         let expected = "Projection: test.id\n  TableScan: test";
-        assert_analyzer_plan_equal(plan, expected, false, false)
-    }
-
-    #[test]
-    fn test_remove_index_fields_table_scan_with_projection_all_values() -> Result<()> {
-        let table_scan = test_table()?;
-        let plan = LogicalPlanBuilder::from(table_scan)
-            .project(vec![col("id"), col("_all_values")])?
-            .build()?;
-
-        let expected = "Projection: test.id, test._all_values\n  TableScan: test";
-        assert_analyzer_plan_equal(plan, expected, false, true)
+        assert_analyzer_plan_equal(plan, expected, false)
     }
 
     #[test]
@@ -220,7 +184,7 @@ mod tests {
             .build()?;
 
         let expected = "Projection: test.id\n  Filter: test.id > Int32(1)\n    TableScan: test";
-        assert_analyzer_plan_equal(plan, expected, false, false)
+        assert_analyzer_plan_equal(plan, expected, false)
     }
 
     #[test]
@@ -232,18 +196,6 @@ mod tests {
             .build()?;
 
         let expected = "Projection: test.id, test._original_data\n  Filter: test.id > Int32(1)\n    TableScan: test";
-        assert_analyzer_plan_equal(plan, expected, true, false)
-    }
-
-    #[test]
-    fn test_remove_index_fields_table_scan_with_need_all_values_field() -> Result<()> {
-        let table_scan = test_table()?;
-        let plan = LogicalPlanBuilder::from(table_scan)
-            .filter(col("id").gt(lit(1)))?
-            .project(vec![col("id"), col("_all_values")])?
-            .build()?;
-
-        let expected = "Projection: test.id, test._all_values\n  Filter: test.id > Int32(1)\n    TableScan: test";
-        assert_analyzer_plan_equal(plan, expected, false, true)
+        assert_analyzer_plan_equal(plan, expected, true)
     }
 }

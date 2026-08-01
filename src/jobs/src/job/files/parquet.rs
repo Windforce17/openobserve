@@ -23,7 +23,7 @@ use arrow_schema::Schema;
 use bytes::Bytes;
 use chrono::{Duration, Utc};
 use config::{
-    FxIndexMap, cluster, get_config,
+    FileFormat, FxIndexMap, cluster, get_config,
     meta::{
         search::StorageType,
         stream::{FileKey, FileMeta, StreamType},
@@ -39,8 +39,8 @@ use config::{
 use hashbrown::HashSet;
 use infra::{
     schema::{
-        SchemaCache, get_stream_setting_bloom_filter_fields, get_stream_setting_fts_fields,
-        get_stream_setting_index_fields,
+        get_stream_setting_bloom_filter_fields, get_stream_setting_column_store_fields,
+        get_stream_setting_fts_fields,
     },
     storage,
 };
@@ -51,7 +51,7 @@ use tokio::{
 };
 #[cfg(feature = "enterprise")]
 use {
-    config::{FileFormat, cluster::LOCAL_NODE, utils::parquet::get_recordbatch_reader_from_bytes},
+    config::{cluster::LOCAL_NODE, utils::parquet::get_recordbatch_reader_from_bytes},
     o2_enterprise::enterprise::{
         common::config::get_config as get_enterprise_config,
         service_streams::{
@@ -67,16 +67,17 @@ use crate::{
     common::infra::wal,
     service::{
         db,
-        schema::generate_schema_for_defined_schema_fields,
         search::datafusion::{
             exec::TableBuilder,
             merge::{self, MergeParquetResult},
         },
-        tantivy::create_tantivy_index,
     },
 };
 
 static PROCESSING_FILES: Lazy<RwLock<HashSet<String>>> = Lazy::new(|| RwLock::new(HashSet::new()));
+/// Set by [`run_final_move`]: retention/size defer gates yield so the
+/// shutdown pass takes EVERY WAL file regardless of age.
+static FINAL_MOVE_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub async fn run() -> Result<(), anyhow::Error> {
     // add the pending delete files to processing set
@@ -100,8 +101,35 @@ pub async fn run() -> Result<(), anyhow::Error> {
                         break;
                     }
                     Some((prefix, files)) => {
-                        if let Err(e) = move_files(thread_id, &prefix, files).await {
-                            log::error!("[INGESTER:JOB] Error moving parquet files to remote: {e}");
+                        // Run the batch in its own task: a panic inside
+                        // move_files must not kill this worker (the pool is
+                        // never respawned — dead workers wedge the capacity-1
+                        // dispatch channel and silently stop the whole mover),
+                        // and the batch's PROCESSING_FILES claims must be
+                        // released or those files are skipped by every later
+                        // scan while still counting as pending.
+                        let claimed: Vec<String> = files.iter().map(|f| f.key.clone()).collect();
+                        match tokio::spawn(
+                            async move { move_files(thread_id, &prefix, files).await },
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => {
+                                log::error!(
+                                    "[INGESTER:JOB] Error moving parquet files to remote: {e}"
+                                );
+                            }
+                            Err(e) => {
+                                log::error!(
+                                    "[INGESTER:JOB:{thread_id}] move_files panicked ({e}), releasing {} claimed files",
+                                    claimed.len()
+                                );
+                                let mut processing = PROCESSING_FILES.write().await;
+                                for key in claimed.iter() {
+                                    processing.remove(key);
+                                }
+                            }
                         }
                     }
                 }
@@ -193,7 +221,12 @@ async fn scan_pending_delete_files() -> Result<(), anyhow::Error> {
     let start = std::time::Instant::now();
     let cfg = get_config();
 
-    let wal_dir = Path::new(&cfg.common.data_wal_dir).canonicalize().unwrap();
+    // never unwrap in the scan path: this runs every pass on the mover's
+    // only loop, and one transient fs error (EIO on a busy PVC) as a panic
+    // kills the mover for the rest of the pod's life, silently
+    let wal_dir = Path::new(&cfg.common.data_wal_dir)
+        .canonicalize()
+        .map_err(|e| anyhow::anyhow!("canonicalize wal dir failed: {e}"))?;
     let pending_delete_files = db::file_list::local::get_pending_delete().await;
     let files_num = pending_delete_files.len();
     for file_key in pending_delete_files {
@@ -234,13 +267,84 @@ async fn scan_pending_delete_files() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+/// .26 shutdown final-move: after `ingester::flush_all()` the fresh WAL
+/// parquet only exists locally — upload it before the process exits so HPA
+/// scale-in never strands data on the released PVC (the OSS twin of the
+/// enterprise drain; /node/drain_status does not exist in OSS builds).
+/// Runs scan+move passes until the WAL is empty or `deadline` elapses.
+pub async fn run_final_move(deadline: std::time::Duration) -> Result<(), anyhow::Error> {
+    let start = std::time::Instant::now();
+    let cfg = get_config();
+    let wal_pattern = Path::new(&cfg.common.data_wal_dir).join("files/");
+    let workers = cfg.limit.file_move_thread_num.max(1);
+    log::info!(
+        "[INGESTER:SHUTDOWN] final move starting: deadline {}s, {} workers",
+        deadline.as_secs(),
+        workers
+    );
+    // The normal move loop is dead by now; its PROCESSING_FILES claims are
+    // stale and would make every scan dispatch nothing while the pending
+    // count still sees the files — a tight spin to the deadline (observed
+    // in the backlog smoke).
+    PROCESSING_FILES.write().await.clear();
+    FINAL_MOVE_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
+    loop {
+        let pending = config::utils::file::scan_files(&wal_pattern, "parquet", None)
+            .map(|files| files.len())
+            .unwrap_or(0);
+        if pending == 0 {
+            log::info!("[INGESTER:SHUTDOWN] final move complete, WAL empty");
+            return Ok(());
+        }
+        if start.elapsed() >= deadline {
+            log::warn!(
+                "[INGESTER:SHUTDOWN] final move deadline hit with {pending} WAL files left \
+                 (they replay + upload on this ordinal's next mount)"
+            );
+            return Ok(());
+        }
+        log::info!(
+            "[INGESTER:SHUTDOWN] final move pass: {pending} WAL files pending, {}s left",
+            (deadline - start.elapsed()).as_secs()
+        );
+        let (tx, rx) = tokio::sync::mpsc::channel::<(String, Vec<FileKey>)>(1);
+        let rx = Arc::new(Mutex::new(rx));
+        let mut handles = Vec::with_capacity(workers);
+        for thread_id in 0..workers {
+            let rx = rx.clone();
+            handles.push(tokio::spawn(async move {
+                while let Some((prefix, files)) = {
+                    let ret = rx.lock().await.recv().await;
+                    ret
+                } {
+                    if let Err(e) = move_files(thread_id, &prefix, files).await {
+                        log::error!("[INGESTER:SHUTDOWN] move error: {e}");
+                    }
+                }
+            }));
+        }
+        if let Err(e) = scan_wal_files(tx).await {
+            log::error!("[INGESTER:SHUTDOWN] scan error: {e}");
+        }
+        for handle in handles {
+            let _ = handle.await;
+        }
+        // files that errored keep their claim — drop claims so the next
+        // pass retries instead of spinning past them
+        PROCESSING_FILES.write().await.clear();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
 async fn scan_wal_files(
     worker_tx: tokio::sync::mpsc::Sender<(String, Vec<FileKey>)>,
 ) -> Result<(), anyhow::Error> {
     let start = std::time::Instant::now();
     let cfg = get_config();
 
-    let wal_dir = Path::new(&cfg.common.data_wal_dir).canonicalize().unwrap();
+    let wal_dir = Path::new(&cfg.common.data_wal_dir)
+        .canonicalize()
+        .map_err(|e| anyhow::anyhow!("canonicalize wal dir failed: {e}"))?;
     let pattern = wal_dir.join("files/");
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<String>>(1);
@@ -270,11 +374,22 @@ async fn scan_wal_files(
                         log::error!("[INGESTER:JOB] Error prepare parquet files: {e}");
                     }
                     Ok(files) => {
+                        // A single hot prefix would otherwise serialize on one
+                        // worker: split each prefix's list into per-worker
+                        // chunks so a large WAL backlog converts on all cores.
+                        // Chunks are disjoint, so PROCESSING_FILES stays safe;
+                        // only chunk-tail batches may come out undersized.
+                        let workers = get_config().limit.file_move_thread_num.max(1);
                         for (prefix, files) in files.into_iter() {
-                            if let Err(e) = worker_tx.send((prefix, files)).await {
-                                log::error!(
-                                    "[INGESTER:JOB] Error sending parquet files to move: {e}"
-                                );
+                            let chunk = files.len().div_ceil(workers).max(1);
+                            for part in files.chunks(chunk) {
+                                if let Err(e) =
+                                    worker_tx.send((prefix.clone(), part.to_vec())).await
+                                {
+                                    log::error!(
+                                        "[INGESTER:JOB] Error sending parquet files to move: {e}"
+                                    );
+                                }
                             }
                         }
                     }
@@ -296,7 +411,9 @@ async fn prepare_files(
     files: Vec<String>,
 ) -> Result<FxIndexMap<String, Vec<FileKey>>, anyhow::Error> {
     let cfg = get_config();
-    let wal_dir = Path::new(&cfg.common.data_wal_dir).canonicalize().unwrap();
+    let wal_dir = Path::new(&cfg.common.data_wal_dir)
+        .canonicalize()
+        .map_err(|e| anyhow::anyhow!("canonicalize wal dir failed: {e}"))?;
 
     // do partition by partition key
     let mut partition_files_with_size: FxIndexMap<String, Vec<FileKey>> = FxIndexMap::default();
@@ -314,7 +431,13 @@ async fn prepare_files(
                     continue;
                 }
             };
-            file.to_str().unwrap().replace('\\', "/")
+            match file.to_str() {
+                Some(v) => v.replace('\\', "/"),
+                None => {
+                    log::warn!("[INGESTER:JOB] skip non-utf8 wal file path: {file:?}");
+                    continue;
+                }
+            }
         };
         // check if the file is processing
         if PROCESSING_FILES.read().await.contains(&file_key) {
@@ -338,10 +461,20 @@ async fn prepare_files(
             }
             continue;
         }
-        let prefix = file_key[..file_key.rfind('/').unwrap()].to_string();
+        // a key that doesn't match the expected layout must be skipped, not
+        // panicked on — this loop feeds the mover's only dispatch path
+        let Some(slash_pos) = file_key.rfind('/') else {
+            log::warn!("[INGESTER:JOB] skip wal file with unexpected key layout: {file_key}");
+            continue;
+        };
+        let prefix = file_key[..slash_pos].to_string();
         // remove thread_id from prefix
         // eg: files/default/logs/olympics/0/2023/08/21/08/8b8a5451bbe1c44b/
         let mut columns = prefix.split('/').collect::<Vec<&str>>();
+        if columns.len() <= 4 {
+            log::warn!("[INGESTER:JOB] skip wal file with unexpected key layout: {file_key}");
+            continue;
+        }
         columns.remove(4);
         let prefix = columns.join("/");
         let partition = partition_files_with_size.entry(prefix).or_default();
@@ -357,6 +490,27 @@ async fn prepare_files(
     }
 
     Ok(partition_files_with_size)
+}
+
+/// Claim-leak audit finding: `move_files` returning `Err` mid-cleanup used to
+/// strand the batch's remaining PROCESSING_FILES claims — the worker's
+/// containment releases claims only when the task PANICS, not on an `Err`
+/// return, so every unprocessed file stayed claimed forever: skipped by all
+/// later scans while still counting as pending. Any early `Err` out of the
+/// per-file cleanup loop must first release the claims of every file in the
+/// batch whose claim is not `settled`. Settled means ownership already moved
+/// on: released after a confirmed disk delete, or handed to the
+/// pending-delete list — pending-delete files keep their claim by design
+/// (their rows are in the uploaded merge; releasing them would let the
+/// scanner re-merge them as duplicates, and `scan_pending_delete_files`
+/// releases them after the disk delete).
+async fn release_unsettled_claims(batch: &[FileKey], settled: &HashSet<String>) {
+    let mut processing = PROCESSING_FILES.write().await;
+    for file in batch {
+        if !settled.contains(&file.key) {
+            processing.remove(&file.key);
+        }
+    }
 }
 
 async fn move_files(
@@ -436,13 +590,6 @@ async fn move_files(
     if stream_settings.data_retention > 0 {
         stream_data_retention_days = stream_settings.data_retention;
     }
-    let num_uds_fields = stream_settings.defined_schema_fields.len();
-
-    let stream_fields_num = if num_uds_fields > 0 {
-        num_uds_fields
-    } else {
-        stream_fields_num
-    };
     if stream_data_retention_days > 0 {
         let date =
             config::utils::time::now() - Duration::try_days(stream_data_retention_days).unwrap();
@@ -482,8 +629,7 @@ async fn move_files(
             cfg.limit.max_file_size_on_disk as i64,
             cfg.compact.max_file_size as i64,
         )
-        && (cfg.limit.file_move_fields_limit == 0
-            || stream_fields_num < cfg.limit.file_move_fields_limit)
+        && !FINAL_MOVE_MODE.load(std::sync::atomic::Ordering::Relaxed)
     {
         let mut has_expired_files = false;
         // not enough files to upload, check if some files are too old
@@ -521,25 +667,18 @@ async fn move_files(
         // yield to other tasks
         tokio::task::yield_now().await;
         // merge file and get the big file key
-        let (account, new_file_name, new_file_meta, new_file_list) = match merge_files(
-            thread_id,
-            latest_schema.clone(),
-            &wal_dir,
-            &files_with_size,
-            num_uds_fields,
-        )
-        .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                log::error!("[INGESTER:JOB] merge files failed: {e}");
-                // need release all the files
-                for file in files_with_size.iter() {
-                    PROCESSING_FILES.write().await.remove(&file.key);
+        let (account, new_file_name, new_file_meta, new_file_list) =
+            match merge_files(thread_id, latest_schema.clone(), &wal_dir, &files_with_size).await {
+                Ok(v) => v,
+                Err(e) => {
+                    log::error!("[INGESTER:JOB] merge files failed: {e}");
+                    // need release all the files
+                    for file in files_with_size.iter() {
+                        PROCESSING_FILES.write().await.remove(&file.key);
+                    }
+                    return Ok(());
                 }
-                return Ok(());
-            }
-        };
+            };
         if new_file_name.is_empty() {
             if new_file_list.is_empty() {
                 // no file need to merge
@@ -576,6 +715,13 @@ async fn move_files(
         .await;
 
         // check if allowed to delete the file
+        //
+        // Claim tracking through this loop: every file in `files_with_size`
+        // still holds a PROCESSING_FILES claim unless recorded in
+        // `settled_claims`; an early `Err` below must go through
+        // `release_unsettled_claims` (claim-leak audit finding) instead of a
+        // bare `?`.
+        let mut settled_claims: HashSet<String> = HashSet::with_capacity(new_file_list.len());
         for file in new_file_list.iter() {
             let file_key = &file.key;
             let can_delete = if wal::lock_files_exists(file_key) {
@@ -590,10 +736,18 @@ async fn move_files(
                         "[INGESTER:JOB:{thread_id}] Failed to add pending delete file: {file_key}, {e}",
                     );
                 }
+                // the claim stays with the pending-delete machinery (rows are
+                // already in the uploaded merge) — never released on error
+                settled_claims.insert(file_key.clone());
                 false
             } else {
-                db::file_list::local::add_removing(file_key).await?;
-                true
+                match db::file_list::local::add_removing(file_key).await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        release_unsettled_claims(&files_with_size, &settled_claims).await;
+                        return Err(e.into());
+                    }
+                }
             };
 
             if can_delete {
@@ -617,10 +771,12 @@ async fn move_files(
                                 "[INGESTER:JOB:{thread_id}] Failed to add pending delete file: {file_key}, {e}",
                             );
                         }
+                        settled_claims.insert(file_key.clone());
                     }
                     Ok(_) => {
                         // remove the file from processing set
                         PROCESSING_FILES.write().await.remove(file_key);
+                        settled_claims.insert(file_key.clone());
                         // deleted successfully then update metrics
                         metrics::INGEST_WAL_USED_BYTES
                             .with_label_values(&[org_id.as_str(), stream_type.as_str()])
@@ -629,7 +785,10 @@ async fn move_files(
                 }
 
                 // remove the file from removing set
-                db::file_list::local::remove_removing(file_key).await?;
+                if let Err(e) = db::file_list::local::remove_removing(file_key).await {
+                    release_unsettled_claims(&files_with_size, &settled_claims).await;
+                    return Err(e.into());
+                }
             }
 
             // metrics
@@ -653,7 +812,6 @@ async fn merge_files(
     latest_schema: Arc<Schema>,
     wal_dir: &Path,
     files_with_size: &[FileKey],
-    num_uds_fields: usize,
 ) -> Result<(String, String, FileMeta, Vec<FileKey>), anyhow::Error> {
     if files_with_size.is_empty() {
         return Ok((
@@ -668,11 +826,6 @@ async fn merge_files(
     let mut new_file_size: i64 = 0;
     let mut new_compressed_file_size = 0;
     let mut new_file_list = Vec::new();
-    let stream_fields_num = if num_uds_fields > 0 {
-        num_uds_fields
-    } else {
-        latest_schema.fields().len()
-    };
     let max_file_size = std::cmp::min(
         cfg.limit.max_file_size_on_disk as i64,
         cfg.compact.max_file_size as i64,
@@ -680,9 +833,7 @@ async fn merge_files(
     for file in files_with_size.iter() {
         if new_file_size > 0
             && (new_file_size + file.meta.original_size > max_file_size
-                || new_compressed_file_size + file.meta.compressed_size > max_file_size
-                || (cfg.limit.file_move_fields_limit > 0
-                    && stream_fields_num >= cfg.limit.file_move_fields_limit))
+                || new_compressed_file_size + file.meta.compressed_size > max_file_size)
         {
             break;
         }
@@ -733,31 +884,10 @@ async fn merge_files(
     let stream_settings = infra::schema::unwrap_stream_settings(&latest_schema);
     let bloom_filter_fields = get_stream_setting_bloom_filter_fields(&stream_settings);
     let full_text_search_fields = get_stream_setting_fts_fields(&stream_settings);
-    let index_fields = get_stream_setting_index_fields(&stream_settings);
-    let (defined_schema_fields, need_original, index_original_data, index_all_values) =
-        match stream_settings {
-            Some(s) => (
-                s.defined_schema_fields,
-                s.store_original_data,
-                s.index_original_data,
-                s.index_all_values,
-            ),
-            None => (Vec::new(), false, false, false),
-        };
-    let latest_schema = if !defined_schema_fields.is_empty() {
-        let latest_schema = SchemaCache::new(latest_schema.as_ref().clone());
-        let latest_schema = generate_schema_for_defined_schema_fields(
-            stream_type,
-            &latest_schema,
-            &defined_schema_fields,
-            need_original,
-            index_original_data,
-            index_all_values,
-        );
-        latest_schema.schema().clone()
-    } else {
-        latest_schema.clone()
-    };
+    let column_store_fields = stream_settings
+        .as_ref()
+        .map(get_stream_setting_column_store_fields)
+        .unwrap_or_default();
 
     // we shouldn't use the latest schema, because there are too many fields, we need read schema
     // from files only get the fields what we need
@@ -781,45 +911,134 @@ async fn merge_files(
         work_group: None,
         target_partitions: 0,
     };
+    let input_original_bytes: usize = new_file_list
+        .iter()
+        .map(|f| f.meta.original_size.max(0) as usize)
+        .sum();
     let tables = TableBuilder::new()
         .sorted_by_time(true)
         .build(session, new_file_list, schema.clone())
         .await?;
 
     let start = std::time::Instant::now();
-    let merge_result = merge::merge_parquet_files(
-        stream_type,
-        &stream_name,
-        schema,
-        tables,
-        &bloom_filter_fields,
-        new_file_meta,
-        true,
-    )
-    .await;
+    // v2 core files: logs/traces always merge into ONE .vix object carrying
+    // the records and the inverted index — no parquet data file and no
+    // sibling index. Every other stream type keeps the flat columnar path.
+    let use_core_file = matches!(stream_type, StreamType::Logs | StreamType::Traces);
+    type SpooledOutput = Option<crate::service::vix::core_writer::VixOutput>;
+    let merge_result: Result<(Vec<u8>, SpooledOutput, FileMeta, FileFormat), anyhow::Error> =
+        if use_core_file {
+            let store_original = stream_settings
+                .as_ref()
+                .is_some_and(|settings| settings.store_original_data);
+            let bloom_filter_fields = get_stream_setting_bloom_filter_fields(&stream_settings);
+            crate::service::vix::core_writer::write_core_file_from_tables(
+            &trace_id,
+            schema,
+            tables,
+            &full_text_search_fields,
+            &column_store_fields,
+            &bloom_filter_fields,
+            store_original,
+            input_original_bytes,
+        )
+        .await
+        .and_then(|result| {
+            let mut file_meta = new_file_meta;
+            // Cleansing backstop: the core-file build DROPS rows whose
+            // `_timestamp` is degenerate (<= 0 or null). The logs-ingest
+            // canonicalization mints none, so this fires only for WAL files
+            // written before it — a poisoned-but-mixed WAL batch now moves
+            // cleanly (rows dropped, counted, ONE loud WARN) instead of
+            // wedging on the writer's finish guard forever.
+            if result.dropped_rows > 0 {
+                metrics::COMPACT_DROPPED_ZERO_TS_ROWS
+                    .with_label_values(&[&org_id, stream_type.as_str(), &stream_name])
+                    .inc_by(result.dropped_rows);
+                if result.stats.row_count == 0 {
+                    // All-poison WAL input set: unlike the compactor (whose
+                    // commit flow supports "inputs deleted, no output"), the
+                    // move path has no clean drop-without-upload flow — the
+                    // WAL delete is tied to a successful upload+file_list
+                    // add, and the dormant empty-key arm leaks
+                    // PROCESSING_FILES entries. Fail with a distinct error;
+                    // the WAL files stay for ops repair (same bucket as the
+                    // .9 residual).
+                    return Err(anyhow::anyhow!(
+                        "[INGESTER:JOB:{thread_id}] {org_id}/{stream_type}/{stream_name}: every \
+                         row of the WAL input files carries a degenerate _timestamp <= 0 ({} \
+                         rows dropped by cleansing); refusing to move an all-poison batch — \
+                         repair or remove the WAL files",
+                        result.dropped_rows
+                    ));
+                }
+                log::warn!(
+                    "[INGESTER:JOB:{thread_id}] {org_id}/{stream_type}/{stream_name}: dropped {} \
+                     rows with a degenerate _timestamp <= 0 during the WAL move (backstop; \
+                     ingest canonicalization mints none)",
+                    result.dropped_rows,
+                );
+                // the folded WAL metas counted the dropped rows; align
+                // records so the meta fold below sees agreement
+                file_meta.records -= result.dropped_rows as i64;
+            }
+            // sizes + the authoritative records/min_ts/max_ts from the DATA
+            // the writer stored — never from the input WAL files' footer
+            // metadata, which has been observed degenerate (min_ts/max_ts =
+            // 0 while the rows carry normal timestamps; one zeroed input
+            // pins the folded min_ts to 0 in file_list, breaking time-range
+            // pruning for the file forever). A meta that is STILL degenerate
+            // errors: the move job must fail loudly rather than publish a
+            // row that poisons pruning.
+            let compressed_len = result
+                .output
+                .as_ref()
+                .map(|o| o.len() as usize)
+                .unwrap_or(result.data.len());
+            crate::service::vix::core_writer::apply_core_stats_to_meta(
+                &mut file_meta,
+                compressed_len,
+                &result.stats,
+                &format!("[INGESTER:JOB:{thread_id}] {org_id}/{stream_type}/{stream_name}"),
+            )?;
+            Ok((result.data, result.output, file_meta, FileFormat::Vix))
+        })
+        } else {
+            merge::merge_parquet_files(
+                stream_type,
+                &stream_name,
+                schema,
+                tables,
+                &bloom_filter_fields,
+                new_file_meta,
+                true,
+            )
+            .await
+            .map_err(anyhow::Error::from)
+            .map(|result| match result {
+                MergeParquetResult::Single {
+                    buf,
+                    file_meta,
+                    file_format,
+                } => (buf, None, file_meta, file_format),
+                MergeParquetResult::Multiple { .. } => {
+                    // ingester should not support multiple files, it will be handled in compactor
+                    // mode
+                    panic!("[INGESTER:JOB] merge_parquet_files error: multiple files");
+                }
+            })
+        };
 
     // clear session data
     crate::service::search::datafusion::storage::file_list::clear(&trace_id);
 
-    let buf = match merge_result {
+    let (buf, spooled_output, new_file_meta, file_format) = match merge_result {
         Ok(v) => v,
         Err(e) => {
             log::error!(
-                "[INGESTER:JOB:{thread_id}] merge_parquet_files error for stream: {org_id}/{stream_type}/{stream_name}, files: {retain_file_list:?}, err: {e}"
+                "[INGESTER:JOB:{thread_id}] merge files error for stream: {org_id}/{stream_type}/{stream_name}, files: {retain_file_list:?}, err: {e}"
             );
-            return Err(e.into());
-        }
-    };
-
-    let (buf, mut new_file_meta, file_format) = match buf {
-        MergeParquetResult::Single {
-            buf,
-            file_meta,
-            file_format,
-        } => (buf, file_meta, file_format),
-        MergeParquetResult::Multiple { .. } => {
-            // ingester should not support multiple files, it will be handled in compactor mode
-            panic!("[INGESTER:JOB] merge_parquet_files error: multiple files");
+            return Err(e);
         }
     };
 
@@ -843,18 +1062,26 @@ async fn merge_files(
         start.elapsed().as_millis(),
     );
 
-    // upload file
-    let buf = Bytes::from(buf);
-    if cfg.cache_latest_files.enabled
-        && cfg.cache_latest_files.cache_parquet
-        && cfg.cache_latest_files.download_from_node
-    {
-        infra::cache::file_data::disk::set(&new_file_key, buf.clone()).await?;
-        log::debug!("merge_files {new_file_key} file_data::disk::set success");
-    }
-
+    // upload file — spooled outputs stream from disk (batched moves grow
+    // toward the byte cap; the buffered container + its clone was an OOM
+    // vector), in-memory outputs keep the buffered path
     let account = storage::get_account(&org_id, &new_file_key).unwrap_or_default();
-    storage::put(&account, &new_file_key, buf.clone()).await?;
+    let buf = Bytes::from(buf);
+    match spooled_output.as_ref().and_then(|o| o.spool_path()) {
+        Some(spool) => {
+            storage::put_file(&account, &new_file_key, spool).await?;
+        }
+        None => {
+            if cfg.cache_latest_files.enabled
+                && cfg.cache_latest_files.cache_parquet
+                && cfg.cache_latest_files.download_from_node
+            {
+                infra::cache::file_data::disk::set(&new_file_key, buf.clone()).await?;
+                log::debug!("merge_files {new_file_key} file_data::disk::set success");
+            }
+            storage::put(&account, &new_file_key, buf.clone()).await?;
+        }
+    }
 
     // Enterprise: Extract service metadata during data processing
     // This runs BEFORE indexing checks to ensure all stream types are discovered
@@ -870,6 +1097,10 @@ async fn merge_files(
             && service_streams_config.node_matches_processing_node(&LOCAL_NODE)
             && org_id != config::META_ORG_ID
             && valid_stream_type
+            // Core .vix files physically store only _timestamp/column-store
+            // fields/_source; the columnar service-field extraction below
+            // reads flattened columns, which core files do not materialize.
+            && file_format != FileFormat::Vix
         {
             // Get stream count for this type (cached, 5-min TTL — counts rarely change).
             let stream_count =
@@ -921,39 +1152,9 @@ async fn merge_files(
         }
     }
 
-    // skip index generation if not enabled or not supported by stream type
-    if !cfg.common.inverted_index_enabled || !stream_type.support_index() {
-        return Ok((account, new_file_key, new_file_meta, retain_file_list));
-    }
-
-    // skip index generation if no fields to index
-    let latest_schema_fields = latest_schema
-        .fields()
-        .iter()
-        .map(|f| f.name())
-        .collect::<HashSet<_>>();
-    let need_index = full_text_search_fields
-        .iter()
-        .chain(index_fields.iter())
-        .any(|f| latest_schema_fields.contains(f));
-    if !need_index {
-        log::debug!("skip index generation for stream: {org_id}/{stream_type}/{stream_name}");
-        return Ok((account, new_file_key, new_file_meta, retain_file_list));
-    }
-
-    let index_size = create_tantivy_index(
-        "INGESTER",
-        &org_id,
-        &new_file_key,
-        &full_text_search_fields,
-        &index_fields,
-        latest_schema.clone(), // Use stream schema to include all configured fields
-        buf,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("generate_tantivy_index_on_ingester error: {e}"))?;
-    new_file_meta.index_size = index_size as i64;
-
+    // core files embed their inverted index (index_size already set from the
+    // writer stats); flat outputs (metrics + internal streams) get none —
+    // the v1 sidecar builder was removed
     Ok((account, new_file_key, new_file_meta, retain_file_list))
 }
 
@@ -1154,5 +1355,47 @@ mod tests {
         assert_eq!(stream_type, StreamType::Metrics);
         assert_eq!(stream_name, "cpu_usage");
         assert_eq!(prefix_date, "2024-01-15");
+    }
+
+    /// Claim-leak audit finding: an `Err` out of move_files' cleanup loop
+    /// must release exactly the batch's unsettled PROCESSING_FILES claims —
+    /// settled ones (pending-delete-owned) stay. Keys are namespaced so the
+    /// shared static never collides with other tests in this binary.
+    #[tokio::test]
+    async fn test_release_unsettled_claims_keeps_settled_and_releases_the_rest() {
+        let keys: Vec<String> = (1..=3)
+            .map(|i| format!("files/claim-test/logs/s/0/2026/07/31/00/{i}.parquet"))
+            .collect();
+        let batch: Vec<FileKey> = keys
+            .iter()
+            .map(|k| FileKey::new(0, "".to_string(), k.clone(), FileMeta::default(), false))
+            .collect();
+        {
+            let mut processing = PROCESSING_FILES.write().await;
+            for k in &keys {
+                processing.insert(k.clone());
+            }
+        }
+        // keys[0] was handed to the pending-delete list: its claim must stay
+        let mut settled = HashSet::new();
+        settled.insert(keys[0].clone());
+
+        release_unsettled_claims(&batch, &settled).await;
+
+        {
+            let processing = PROCESSING_FILES.read().await;
+            assert!(
+                processing.contains(&keys[0]),
+                "settled claim must not be released"
+            );
+            for k in &keys[1..] {
+                assert!(
+                    !processing.contains(k),
+                    "unsettled claim {k} must be released"
+                );
+            }
+        }
+        // remove the surviving namespaced claim so no other test sees it
+        PROCESSING_FILES.write().await.remove(&keys[0]);
     }
 }

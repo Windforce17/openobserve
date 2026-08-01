@@ -57,13 +57,21 @@ pub async fn incr_pending_file(
     min_ts: i64,
 ) {
     let cfg = get_config();
+    // `Some(vec![])` (an empty cluster view — e.g. this node just deregistered
+    // during shutdown, or the coordinator cache is momentarily empty) must
+    // clamp to 1: it is a DIVISOR below, and a 0 panicked the job runtime
+    // (observed live on a combined node draining its last move jobs at
+    // SIGTERM — Phase C2).
     let ingester_num = get_cached_online_ingester_nodes()
         .await
         .map(|nodes| nodes.len())
-        .unwrap_or(1);
+        .unwrap_or(1)
+        .max(1);
     // must wait for at least 3 times of needed files
     let threshold =
-        (cfg.compact.max_file_size / cfg.limit.max_file_size_in_memory / ingester_num).max(1) * 3;
+        (cfg.compact.max_file_size / cfg.limit.max_file_size_in_memory.max(1) / ingester_num)
+            .max(1)
+            * 3;
 
     let hour = min_ts - min_ts % hour_micros(1);
     let key = format!("{org_id}/{stream_type}/{stream_name}");

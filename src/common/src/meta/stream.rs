@@ -35,8 +35,6 @@ pub struct Stream {
     pub stream_type: StreamType,
     pub stats: StreamStats,
     pub schema: Vec<StreamField>,
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    pub uds_schema: Vec<StreamField>,
     pub settings: StreamSettings,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metrics_meta: Option<Metadata>,
@@ -181,7 +179,6 @@ mod tests {
                 name: "field1".to_string(),
                 r#type: "string".to_string(),
             }],
-            uds_schema: vec![],
             settings: StreamSettings::default(),
             metrics_meta: None,
             total_fields: 1,
@@ -249,28 +246,6 @@ mod tests {
         assert_eq!(delete_fields.fields.len(), 2);
         assert_eq!(delete_fields.fields[0], "field1");
         assert_eq!(delete_fields.fields[1], "field2");
-    }
-
-    #[test]
-    fn test_stream_with_uds_schema() {
-        let stream = Stream {
-            name: "test_stream".to_string(),
-            storage_type: "local".to_string(),
-            stream_type: StreamType::Logs,
-            stats: StreamStats::default(),
-            schema: vec![],
-            uds_schema: vec![StreamField {
-                name: "uds_field".to_string(),
-                r#type: "string".to_string(),
-            }],
-            settings: StreamSettings::default(),
-            metrics_meta: None,
-            total_fields: 1,
-            pattern_associations: vec![],
-            is_derived: None,
-        };
-
-        assert!(stream.uds_schema.len() == 1);
     }
 
     #[test]

@@ -185,7 +185,7 @@ impl RemoteScanExec {
             .index_info
             .index_optimize_mode
             .clone()
-            .map(|x| x.into())
+            .and_then(|x| IndexOptimizeMode::try_from(x).ok())
     }
 }
 

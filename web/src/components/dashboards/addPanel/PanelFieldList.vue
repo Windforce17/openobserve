@@ -922,52 +922,14 @@ const flattenGroupedFields = computed(() => {
       groupName: group.name,
     });
 
-    if (
-      group.settings.hasOwnProperty("defined_schema_fields") &&
-      group.settings.defined_schema_fields.length > 0
-    ) {
+    group.schema.forEach((field: any) => {
       flattenedFields.push({
-        name: store.state.zoConfig?.timestamp_column,
-        type: "Int64",
+        ...field,
         stream: group.name,
         streamAlias: group.stream_alias,
         isGroup: false,
       });
-
-      for (const field of group.schema) {
-        if (
-          store.state.zoConfig.user_defined_schemas_enabled &&
-          group.settings.hasOwnProperty("defined_schema_fields") &&
-          group.settings.defined_schema_fields.length > 0
-        ) {
-          if (group.settings.defined_schema_fields.includes(field.name)) {
-            flattenedFields.push({
-              ...field,
-              stream: group.name,
-              streamAlias: group.stream_alias,
-              isGroup: false,
-            });
-          }
-        }
-      }
-
-      flattenedFields.push({
-        name: store.state.zoConfig?.all_fields_name,
-        type: "Utf8",
-        stream: group.name,
-        streamAlias: group.stream_alias,
-        isGroup: false,
-      });
-    } else {
-      group.schema.forEach((field: any) => {
-        flattenedFields.push({
-          ...field,
-          stream: group.name,
-          streamAlias: group.stream_alias,
-          isGroup: false,
-        });
-      });
-    }
+    });
   });
 
   // Field names can legitimately repeat across stream groups (joins,

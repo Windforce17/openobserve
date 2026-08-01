@@ -348,12 +348,38 @@ pub async fn get_file_id_lists(
         let end = config::utils::time::now_micros();
         time_range = (start, end);
     }
-    let file_id_list = crate::service::file_list::query_ids(
+    // segment-WAL mode: candidates MUST be read BEFORE the file_list
+    // snapshot (segments_scan dup/gap ordering rules)
+    let (seg_candidates, seg_shortfall) =
+        crate::service::search::grpc::segments_scan::list_candidates(
+            org_id,
+            stream_type,
+            &stream_name,
+            time_range,
+        )
+        .await?;
+    if let Some(sf) = seg_shortfall {
+        // super-cluster follower has no partial channel of its own here; the
+        // shortfall is logged loudly (the cluster leader still reports its
+        // own partial state). Non-fatal by design — see segments_scan.
+        log::warn!("[trace_id {trace_id}] [SEGMENT:SCAN] {}", sf.message());
+    }
+    let mut file_id_list = crate::service::file_list::query_ids(
         trace_id,
         org_id,
         stream_type,
         &stream_name,
         time_range,
+    )
+    .await?;
+    // append the candidates the snapshot's l0_ provenance does not cover
+    crate::service::search::grpc::segments_scan::append_surviving(
+        trace_id,
+        org_id,
+        stream_type,
+        &stream_name,
+        seg_candidates,
+        &mut file_id_list,
     )
     .await?;
     Ok(file_id_list)

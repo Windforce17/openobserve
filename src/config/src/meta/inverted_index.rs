@@ -18,7 +18,7 @@ use proto::cluster_rpc;
 pub const UNKNOWN_NAME: &str = "__o2__unknown__field__";
 
 /// Maximum number of GROUP BY fields supported by [`IndexOptimizeMode::SimpleTopN`].
-/// Four 32-bit term ordinals pack into one u128 key in the tantivy collector.
+/// Four 32-bit group ordinals pack into one u128 key in the collector.
 pub const MAX_SIMPLE_TOPN_FIELDS: usize = 4;
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -115,16 +115,22 @@ impl std::fmt::Display for IndexOptimizeMode {
     }
 }
 
-impl From<cluster_rpc::IdxOptimizeMode> for IndexOptimizeMode {
-    fn from(cluster_rpc_mode: cluster_rpc::IdxOptimizeMode) -> Self {
+impl TryFrom<cluster_rpc::IdxOptimizeMode> for IndexOptimizeMode {
+    type Error = String;
+
+    /// Fallible on purpose: the proto oneof arrives over the wire, and a
+    /// request without the `mode` field set (malformed or from an
+    /// incompatible peer) must surface as an invalid-argument error to that
+    /// peer — never panic the receiving process.
+    fn try_from(cluster_rpc_mode: cluster_rpc::IdxOptimizeMode) -> Result<Self, Self::Error> {
         match cluster_rpc_mode.mode {
-            Some(cluster_rpc::idx_optimize_mode::Mode::SimpleTopn(select)) => {
-                IndexOptimizeMode::SimpleTopN(select.fields, select.limit as usize, select.asc)
-            }
-            Some(cluster_rpc::idx_optimize_mode::Mode::SimpleDistinct(select)) => {
-                IndexOptimizeMode::SimpleDistinct(select.field, select.limit as usize, select.asc)
-            }
-            None => panic!("Invalid IndexOptimizeMode"),
+            Some(cluster_rpc::idx_optimize_mode::Mode::SimpleTopn(select)) => Ok(
+                IndexOptimizeMode::SimpleTopN(select.fields, select.limit as usize, select.asc),
+            ),
+            Some(cluster_rpc::idx_optimize_mode::Mode::SimpleDistinct(select)) => Ok(
+                IndexOptimizeMode::SimpleDistinct(select.field, select.limit as usize, select.asc),
+            ),
+            None => Err("IdxOptimizeMode oneof `mode` is not set".to_string()),
         }
     }
 }
@@ -354,7 +360,7 @@ mod tests {
         ];
 
         for (cluster_rpc_mode, expected) in test_cases {
-            let result: IndexOptimizeMode = cluster_rpc_mode.into();
+            let result = IndexOptimizeMode::try_from(cluster_rpc_mode).unwrap();
             assert_eq!(result, expected);
         }
     }
@@ -432,17 +438,18 @@ mod tests {
 
         for original_mode in test_modes {
             let cluster_rpc_mode: cluster_rpc::IdxOptimizeMode = original_mode.clone().into();
-            let converted_back: IndexOptimizeMode = cluster_rpc_mode.into();
+            let converted_back = IndexOptimizeMode::try_from(cluster_rpc_mode).unwrap();
             assert_eq!(original_mode, converted_back);
         }
     }
 
     #[test]
-    #[should_panic(expected = "Invalid IndexOptimizeMode")]
-    fn test_invalid_cluster_rpc_mode_panics() {
-        // Test that converting from an invalid cluster_rpc mode panics
+    fn test_invalid_cluster_rpc_mode_is_an_error_not_a_panic() {
+        // a wire request without the oneof set must be a decode ERROR the
+        // caller maps to invalid-argument, never a process panic
         let invalid_mode = cluster_rpc::IdxOptimizeMode { mode: None };
-        let _: IndexOptimizeMode = invalid_mode.into();
+        let err = IndexOptimizeMode::try_from(invalid_mode).unwrap_err();
+        assert!(err.contains("oneof"), "{err}");
     }
 
     #[test]
@@ -475,7 +482,7 @@ mod tests {
             assert!(cluster_rpc_mode.mode.is_some());
 
             // Test round-trip conversion
-            let converted_back: IndexOptimizeMode = cluster_rpc_mode.into();
+            let converted_back = IndexOptimizeMode::try_from(cluster_rpc_mode).unwrap();
             assert_eq!(mode, converted_back);
         }
     }

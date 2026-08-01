@@ -149,8 +149,7 @@ export const DEFAULT_LOGS_CONFIG = {
     pageType: "logs" as const, // 'logs' or 'stream'
     regions: [] as any[],
     clusters: [] as any[],
-    useUserDefinedSchemas: "user_defined_schema",
-    hasUserDefinedSchemas: false,
+    useUserDefinedSchemas: "all_fields",
     selectedTraceStream: "",
     showSearchScheduler: false,
     toggleFunction: false, // DEPRECATED use showTransformEditor instead
@@ -187,7 +186,6 @@ export const DEFAULT_LOGS_CONFIG = {
       functions: [] as any[],
       streamType: "logs",
       interestingFieldList: [] as string[],
-      userDefinedSchema: [] as any[],
       expandGroupRows: {} as any,
       expandGroupRowsFieldCount: {} as any,
       filteredField: [] as any[],

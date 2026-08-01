@@ -50,8 +50,9 @@ pub async fn handle_request(
         }
     };
 
+    let mut responses = Vec::with_capacity(streams_data.len());
     for (stream_name, records) in streams_data {
-        super::ingest::ingest(
+        let response = match super::ingest::ingest(
             thread_id,
             org_id,
             &stream_name,
@@ -61,19 +62,60 @@ pub async fn handle_request(
             false,
         )
         .await
-        .map_err(|e| {
-            // we do not want to log trial period expired errors
-            if !matches!(e, infra::errors::Error::TrialPeriodExpired) {
-                log::error!("[Loki] Stream {stream_name} ingestion failed for org {org_id}: {e}");
+        {
+            Ok(response) => response,
+            // A stream that errors before its write does not short-circuit
+            // the rest: it becomes a coded per-stream response and the worst
+            // code wins in the aggregate. Flattening it into a LokiError
+            // erased the error kind, so backpressure (ResourceError) answered
+            // 500 instead of the retryable 503.
+            Err(e) => {
+                // we do not want to log trial period expired errors
+                if !matches!(e, infra::errors::Error::TrialPeriodExpired) {
+                    log::error!(
+                        "[Loki] Stream {stream_name} ingestion failed for org {org_id}: {e}"
+                    );
+                }
+                let code = match &e {
+                    infra::errors::Error::ResourceError(_) => 503,
+                    infra::errors::Error::TrialPeriodExpired => 429,
+                    _ => 500,
+                };
+                IngestionResponse {
+                    code,
+                    status: vec![],
+                    error: Some(format!("stream {stream_name} ingestion failed: {e}")),
+                }
             }
-            LokiError::from(anyhow::anyhow!(
-                "Stream {} ingestion failed: {:?}",
-                stream_name,
-                e
-            ))
-        })?;
+        };
+        responses.push(response);
     }
-    Ok(IngestionResponse::new(200, vec![]))
+    Ok(aggregate_stream_responses(responses))
+}
+
+/// Fold the per-stream ingest responses into one Loki reply. The worst code
+/// wins: a stream whose durable write failed reports 500/503 on its
+/// `IngestionResponse`, and collapsing that into an unconditional 200 acked
+/// lost records — the Loki shipper (promtail, Grafana Agent) only retries on
+/// a 5xx. Per-stream statuses are kept and every stream error is named.
+fn aggregate_stream_responses(responses: Vec<IngestionResponse>) -> IngestionResponse {
+    let mut code: u16 = 200;
+    let mut status = Vec::new();
+    let mut errors = Vec::new();
+    for response in responses {
+        if response.code > code {
+            code = response.code;
+        }
+        status.extend(response.status);
+        if let Some(error) = response.error {
+            errors.push(error);
+        }
+    }
+    IngestionResponse {
+        code,
+        status,
+        error: (!errors.is_empty()).then(|| errors.join("; ")),
+    }
 }
 
 fn validate_and_process_json_request(
@@ -270,6 +312,51 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+    use crate::common::meta::ingestion::StreamStatus;
+
+    fn stream_response(code: u16, name: &str, error: Option<&str>) -> IngestionResponse {
+        IngestionResponse {
+            code,
+            status: vec![StreamStatus::new(name)],
+            error: error.map(|e| e.to_string()),
+        }
+    }
+
+    /// A failed durable write must reach the Loki client: the worst
+    /// per-stream code wins, it is never collapsed into a 200 ack.
+    #[test]
+    fn test_aggregate_stream_responses_propagates_the_worst_code() {
+        // all good: 200, no error
+        let res = aggregate_stream_responses(vec![
+            stream_response(200, "a", None),
+            stream_response(200, "b", None),
+        ]);
+        assert_eq!(res.code, 200);
+        assert!(res.error.is_none());
+        assert_eq!(res.status.len(), 2);
+
+        // one stream lost its records to backpressure: 503 + the error named
+        let res = aggregate_stream_responses(vec![
+            stream_response(200, "a", None),
+            stream_response(503, "b", Some("stream [b]: 4 record(s) not written")),
+        ]);
+        assert_eq!(res.code, 503);
+        assert!(res.error.unwrap().contains("not written"));
+
+        // every failing stream is named, not just the first
+        let res = aggregate_stream_responses(vec![
+            stream_response(500, "a", Some("stream [a]: disk full")),
+            stream_response(503, "b", Some("stream [b]: memtable is full")),
+        ]);
+        assert_eq!(res.code, 503);
+        let error = res.error.unwrap();
+        assert!(error.contains("[a]") && error.contains("[b]"), "{error}");
+
+        // no streams at all is still a clean 200 (validated earlier)
+        let res = aggregate_stream_responses(vec![]);
+        assert_eq!(res.code, 200);
+        assert!(res.error.is_none());
+    }
 
     #[test]
     fn test_determine_service_stream_name() {

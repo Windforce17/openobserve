@@ -23,7 +23,7 @@ use sqlparser::{
     parser::Parser,
 };
 
-use super::{RE_HISTOGRAM, visitor::histogram_interval::generate_histogram_interval};
+use super::{RE_HISTOGRAM, visitor::histogram_interval::resolve_histogram_interval};
 
 pub fn handle_histogram(
     origin_sql: &mut String,
@@ -47,12 +47,11 @@ pub fn handle_histogram(
         None => return,
     };
 
-    let interval = if histogram_interval > 0 {
-        format!("{histogram_interval} second")
-    } else {
-        args.get(1)
-            .map_or_else(|| generate_histogram_interval(q_time_range), |value| *value)
-            .to_string()
+    // an explicit interval in the SQL wins unless the request presets one;
+    // both fallbacks go through the single shared 1-arg resolution
+    let interval = match args.get(1) {
+        Some(value) if histogram_interval <= 0 => (*value).to_string(),
+        _ => resolve_histogram_interval(q_time_range, histogram_interval),
     };
     let field = args.first().unwrap_or(&"_timestamp");
 
@@ -64,11 +63,26 @@ pub fn handle_histogram(
 
 /// Converts an original query to a histogram query
 /// Extracts WHERE clause and builds histogram query with provided stream name
+///
+/// The generated SQL carries an EXPLICIT `histogram(_timestamp, '<interval>')`
+/// argument, resolved ONCE from the full request `time_range` (and the
+/// request's preset `histogram_interval`, seconds, when non-zero) via the
+/// single shared 1-arg resolution the histogram UDF itself uses
+/// ([`resolve_histogram_interval`]). The streaming layer partitions the
+/// window and re-plans this SQL per sub-range: a 1-arg auto-interval would
+/// be re-derived from each partition's narrower range and could produce
+/// inconsistent bucket widths across partitions, while the explicit
+/// interval keeps every partition on the full-range width and stabilizes
+/// result-cache keys. The `zo_sql_key`/`zo_sql_breakdown`/`zo_sql_num`
+/// aliases and the overall response shape are a UI contract and stay
+/// unchanged.
 pub fn convert_to_histogram_query(
     original_query: &str,
     stream_names: &[String],
     is_multi_stream_search: bool,
     breakdown_field: Option<&str>,
+    time_range: (i64, i64),
+    histogram_interval: i64,
 ) -> Result<String, Error> {
     let (is_eligible, is_sub_query) =
         is_eligible_for_histogram(original_query, is_multi_stream_search)
@@ -84,10 +98,20 @@ pub fn convert_to_histogram_query(
     let statements = Parser::parse_sql(&PostgreSqlDialect {}, original_query)
         .map_err(|e| anyhow::anyhow!("Failed to parse SQL query: {}", e))?;
 
+    // resolve the bucket interval once, from the FULL request range — the
+    // exact value a 1-arg histogram(_timestamp) would auto-derive
+    let interval = resolve_histogram_interval(time_range, histogram_interval);
+
     let histogram_query = if is_multi_stream_search {
-        multi_stream_histogram_query(&statements, stream_names)?
+        multi_stream_histogram_query(&statements, stream_names, &interval)?
     } else {
-        single_stream_histogram_query(&statements, stream_names, is_sub_query, breakdown_field)?
+        single_stream_histogram_query(
+            &statements,
+            stream_names,
+            is_sub_query,
+            breakdown_field,
+            &interval,
+        )?
     };
 
     Ok(histogram_query)
@@ -98,6 +122,7 @@ fn single_stream_histogram_query(
     stream_names: &[String],
     is_sub_query: bool,
     breakdown_field: Option<&str>,
+    interval: &str,
 ) -> Result<String, Error> {
     let statement = statements
         .first()
@@ -115,11 +140,11 @@ fn single_stream_histogram_query(
             // identifier quoting and cannot be used as a SQL injection vector.
             let safe_field = field.replace('"', "\"\"");
             format!(
-                "SELECT histogram(_timestamp) AS zo_sql_key, \"{safe_field}\" AS zo_sql_breakdown, count(*) AS zo_sql_num FROM \"{stream_name}\""
+                "SELECT histogram(_timestamp, '{interval}') AS zo_sql_key, \"{safe_field}\" AS zo_sql_breakdown, count(*) AS zo_sql_num FROM \"{stream_name}\""
             )
         }
         None => format!(
-            "SELECT histogram(_timestamp) AS zo_sql_key, count(*) AS zo_sql_num FROM \"{stream_name}\""
+            "SELECT histogram(_timestamp, '{interval}') AS zo_sql_key, count(*) AS zo_sql_num FROM \"{stream_name}\""
         ),
     };
 
@@ -174,6 +199,7 @@ pub async fn resolve_histogram_breakdown_field(
 fn multi_stream_histogram_query(
     statements: &[Statement],
     stream_names: &[String],
+    interval: &str,
 ) -> Result<String, Error> {
     if statements.is_empty() || stream_names.is_empty() {
         return Err(Error::ErrorCode(ErrorCodes::SearchSQLNotValid(
@@ -181,11 +207,12 @@ fn multi_stream_histogram_query(
         )));
     }
 
-    // Build individual histogram queries for each stream
+    // Build individual histogram queries for each stream — one shared
+    // explicit interval so every stream's buckets align in the UNION
     let mut histogram_queries = Vec::new();
     for stream_name in stream_names {
         let mut query = format!(
-            "SELECT histogram(_timestamp) AS zo_sql_key, count(*) AS zo_sql_num FROM \"{stream_name}\"",
+            "SELECT histogram(_timestamp, '{interval}') AS zo_sql_key, count(*) AS zo_sql_num FROM \"{stream_name}\"",
         );
 
         query.push_str(" GROUP BY zo_sql_key");
@@ -238,7 +265,19 @@ pub fn histogram_bucket_start(timestamp_us: i64, interval_us: i64) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        super::visitor::histogram_interval::{
+            HistogramIntervalVisitor, convert_histogram_interval_to_seconds,
+            generate_histogram_interval, validate_and_adjust_histogram_interval,
+        },
+        *,
+    };
+
+    /// A 3-hour request window: the auto-interval tier for it is "1 minute".
+    const RANGE_3H: (i64, i64) = (
+        1_640_995_200_000_000,
+        1_640_995_200_000_000 + 3 * 3600 * 1_000_000,
+    );
 
     #[test]
     fn test_handle_histogram() {
@@ -255,9 +294,10 @@ mod tests {
         let original_query = "SELECT * FROM \"logs\" WHERE status = 500";
         let stream_names = vec!["logs".to_string()];
         let result =
-            convert_to_histogram_query(original_query, &stream_names, false, None).unwrap();
+            convert_to_histogram_query(original_query, &stream_names, false, None, RANGE_3H, 0)
+                .unwrap();
 
-        let expected = "SELECT histogram(_timestamp) AS zo_sql_key, count(*) AS zo_sql_num FROM \"logs\" WHERE status = 500 GROUP BY zo_sql_key ORDER BY zo_sql_key DESC";
+        let expected = "SELECT histogram(_timestamp, '1 minute') AS zo_sql_key, count(*) AS zo_sql_num FROM \"logs\" WHERE status = 500 GROUP BY zo_sql_key ORDER BY zo_sql_key DESC";
         assert_eq!(result, expected);
     }
 
@@ -266,9 +306,10 @@ mod tests {
         let original_query = "SELECT * FROM \"logs\"";
         let stream_names = vec!["logs".to_string()];
         let result =
-            convert_to_histogram_query(original_query, &stream_names, false, None).unwrap();
+            convert_to_histogram_query(original_query, &stream_names, false, None, RANGE_3H, 0)
+                .unwrap();
 
-        let expected = "SELECT histogram(_timestamp) AS zo_sql_key, count(*) AS zo_sql_num FROM \"logs\" GROUP BY zo_sql_key ORDER BY zo_sql_key DESC";
+        let expected = "SELECT histogram(_timestamp, '1 minute') AS zo_sql_key, count(*) AS zo_sql_num FROM \"logs\" GROUP BY zo_sql_key ORDER BY zo_sql_key DESC";
         assert_eq!(result, expected);
     }
 
@@ -277,9 +318,10 @@ mod tests {
         let original_query = "SELECT * FROM \"api_logs\" WHERE status >= 400 AND level = 'error' AND user_id IS NOT NULL";
         let stream_names = vec!["api_logs".to_string()];
         let result =
-            convert_to_histogram_query(original_query, &stream_names, false, None).unwrap();
+            convert_to_histogram_query(original_query, &stream_names, false, None, RANGE_3H, 0)
+                .unwrap();
 
-        let expected = "SELECT histogram(_timestamp) AS zo_sql_key, count(*) AS zo_sql_num FROM \"api_logs\" WHERE status >= 400 AND level = 'error' AND user_id IS NOT NULL GROUP BY zo_sql_key ORDER BY zo_sql_key DESC";
+        let expected = "SELECT histogram(_timestamp, '1 minute') AS zo_sql_key, count(*) AS zo_sql_num FROM \"api_logs\" WHERE status >= 400 AND level = 'error' AND user_id IS NOT NULL GROUP BY zo_sql_key ORDER BY zo_sql_key DESC";
         assert_eq!(result, expected);
     }
 
@@ -288,9 +330,10 @@ mod tests {
         let original_query = "SELECT * FROM \"api_logs\" GROUP BY level";
         let stream_names = vec!["api_logs".to_string()];
         let result =
-            convert_to_histogram_query(original_query, &stream_names, false, None).unwrap();
+            convert_to_histogram_query(original_query, &stream_names, false, None, RANGE_3H, 0)
+                .unwrap();
 
-        let expected = "SELECT histogram(_timestamp) AS zo_sql_key, count(*) AS zo_sql_num FROM \"api_logs\" GROUP BY zo_sql_key ORDER BY zo_sql_key DESC";
+        let expected = "SELECT histogram(_timestamp, '1 minute') AS zo_sql_key, count(*) AS zo_sql_num FROM \"api_logs\" GROUP BY zo_sql_key ORDER BY zo_sql_key DESC";
         assert_eq!(result, expected);
     }
 
@@ -298,9 +341,11 @@ mod tests {
     fn test_multi_stream_histogram_query_basic() {
         let original_query = "SELECT * FROM default UNION ALL SELECT * FROM default_enrich";
         let stream_names = vec!["default".to_string(), "default_enrich".to_string()];
-        let result = convert_to_histogram_query(original_query, &stream_names, true, None).unwrap();
+        let result =
+            convert_to_histogram_query(original_query, &stream_names, true, None, RANGE_3H, 0)
+                .unwrap();
 
-        let expected = "WITH multistream_histogram AS (SELECT histogram(_timestamp) AS zo_sql_key, count(*) AS zo_sql_num FROM \"default\" GROUP BY zo_sql_key UNION ALL SELECT histogram(_timestamp) AS zo_sql_key, count(*) AS zo_sql_num FROM \"default_enrich\" GROUP BY zo_sql_key) SELECT zo_sql_key, sum(zo_sql_num) AS zo_sql_num FROM multistream_histogram GROUP BY zo_sql_key ORDER BY zo_sql_key";
+        let expected = "WITH multistream_histogram AS (SELECT histogram(_timestamp, '1 minute') AS zo_sql_key, count(*) AS zo_sql_num FROM \"default\" GROUP BY zo_sql_key UNION ALL SELECT histogram(_timestamp, '1 minute') AS zo_sql_key, count(*) AS zo_sql_num FROM \"default_enrich\" GROUP BY zo_sql_key) SELECT zo_sql_key, sum(zo_sql_num) AS zo_sql_num FROM multistream_histogram GROUP BY zo_sql_key ORDER BY zo_sql_key";
         assert_eq!(result, expected);
     }
 
@@ -308,11 +353,17 @@ mod tests {
     fn test_convert_query_with_breakdown_field() {
         let original_query = "SELECT * FROM \"logs\" WHERE status = 500";
         let stream_names = vec!["logs".to_string()];
-        let result =
-            convert_to_histogram_query(original_query, &stream_names, false, Some("severity"))
-                .unwrap();
+        let result = convert_to_histogram_query(
+            original_query,
+            &stream_names,
+            false,
+            Some("severity"),
+            RANGE_3H,
+            0,
+        )
+        .unwrap();
 
-        let expected = "SELECT histogram(_timestamp) AS zo_sql_key, \"severity\" AS zo_sql_breakdown, count(*) AS zo_sql_num FROM \"logs\" WHERE status = 500 GROUP BY zo_sql_key, zo_sql_breakdown ORDER BY zo_sql_key DESC";
+        let expected = "SELECT histogram(_timestamp, '1 minute') AS zo_sql_key, \"severity\" AS zo_sql_breakdown, count(*) AS zo_sql_num FROM \"logs\" WHERE status = 500 GROUP BY zo_sql_key, zo_sql_breakdown ORDER BY zo_sql_key DESC";
         assert_eq!(result, expected);
     }
 
@@ -437,11 +488,17 @@ mod tests {
         // breakdown field present, no WHERE clause in original query
         let original_query = "SELECT * FROM \"logs\"";
         let stream_names = vec!["logs".to_string()];
-        let result =
-            convert_to_histogram_query(original_query, &stream_names, false, Some("level"))
-                .unwrap();
+        let result = convert_to_histogram_query(
+            original_query,
+            &stream_names,
+            false,
+            Some("level"),
+            RANGE_3H,
+            0,
+        )
+        .unwrap();
 
-        let expected = "SELECT histogram(_timestamp) AS zo_sql_key, \"level\" AS zo_sql_breakdown, count(*) AS zo_sql_num FROM \"logs\" GROUP BY zo_sql_key, zo_sql_breakdown ORDER BY zo_sql_key DESC";
+        let expected = "SELECT histogram(_timestamp, '1 minute') AS zo_sql_key, \"level\" AS zo_sql_breakdown, count(*) AS zo_sql_num FROM \"logs\" GROUP BY zo_sql_key, zo_sql_breakdown ORDER BY zo_sql_key DESC";
         assert_eq!(result, expected);
     }
 
@@ -450,11 +507,17 @@ mod tests {
         // breakdown field + WHERE clause are both preserved
         let original_query = "SELECT * FROM \"api_logs\" WHERE status >= 400 AND level = 'error'";
         let stream_names = vec!["api_logs".to_string()];
-        let result =
-            convert_to_histogram_query(original_query, &stream_names, false, Some("severity"))
-                .unwrap();
+        let result = convert_to_histogram_query(
+            original_query,
+            &stream_names,
+            false,
+            Some("severity"),
+            RANGE_3H,
+            0,
+        )
+        .unwrap();
 
-        let expected = "SELECT histogram(_timestamp) AS zo_sql_key, \"severity\" AS zo_sql_breakdown, count(*) AS zo_sql_num FROM \"api_logs\" WHERE status >= 400 AND level = 'error' GROUP BY zo_sql_key, zo_sql_breakdown ORDER BY zo_sql_key DESC";
+        let expected = "SELECT histogram(_timestamp, '1 minute') AS zo_sql_key, \"severity\" AS zo_sql_breakdown, count(*) AS zo_sql_num FROM \"api_logs\" WHERE status >= 400 AND level = 'error' GROUP BY zo_sql_key, zo_sql_breakdown ORDER BY zo_sql_key DESC";
         assert_eq!(result, expected);
     }
 
@@ -464,7 +527,8 @@ mod tests {
         let original_query = "SELECT * FROM \"logs\" WHERE level = 'info'";
         let stream_names = vec!["logs".to_string()];
         let result =
-            convert_to_histogram_query(original_query, &stream_names, false, None).unwrap();
+            convert_to_histogram_query(original_query, &stream_names, false, None, RANGE_3H, 0)
+                .unwrap();
 
         // Must NOT contain zo_sql_breakdown
         assert!(!result.contains("zo_sql_breakdown"));
@@ -476,9 +540,15 @@ mod tests {
         // When breakdown_field is Some, GROUP BY must list both zo_sql_key and zo_sql_breakdown
         let original_query = "SELECT * FROM \"logs\"";
         let stream_names = vec!["logs".to_string()];
-        let result =
-            convert_to_histogram_query(original_query, &stream_names, false, Some("severity"))
-                .unwrap();
+        let result = convert_to_histogram_query(
+            original_query,
+            &stream_names,
+            false,
+            Some("severity"),
+            RANGE_3H,
+            0,
+        )
+        .unwrap();
 
         assert!(result.contains("GROUP BY zo_sql_key, zo_sql_breakdown"));
     }
@@ -488,9 +558,15 @@ mod tests {
         // The SELECT list must contain the aliased breakdown column
         let original_query = "SELECT * FROM \"logs\"";
         let stream_names = vec!["logs".to_string()];
-        let result =
-            convert_to_histogram_query(original_query, &stream_names, false, Some("severity"))
-                .unwrap();
+        let result = convert_to_histogram_query(
+            original_query,
+            &stream_names,
+            false,
+            Some("severity"),
+            RANGE_3H,
+            0,
+        )
+        .unwrap();
 
         assert!(result.contains("\"severity\" AS zo_sql_breakdown"));
     }
@@ -499,7 +575,8 @@ mod tests {
     fn test_convert_query_with_cte_not_eligible() {
         let original_query = "WITH cte AS (SELECT * FROM logs) SELECT * FROM cte";
         let stream_names = vec!["logs".to_string()];
-        let result = convert_to_histogram_query(original_query, &stream_names, false, None);
+        let result =
+            convert_to_histogram_query(original_query, &stream_names, false, None, RANGE_3H, 0);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -512,7 +589,8 @@ mod tests {
     fn test_convert_query_with_limit_not_eligible() {
         let original_query = "SELECT * FROM \"logs\" LIMIT 100";
         let stream_names = vec!["logs".to_string()];
-        let result = convert_to_histogram_query(original_query, &stream_names, false, None);
+        let result =
+            convert_to_histogram_query(original_query, &stream_names, false, None, RANGE_3H, 0);
         assert!(result.is_err());
     }
 
@@ -520,7 +598,8 @@ mod tests {
     fn test_convert_query_with_distinct_not_eligible() {
         let original_query = "SELECT DISTINCT level FROM \"logs\"";
         let stream_names = vec!["logs".to_string()];
-        let result = convert_to_histogram_query(original_query, &stream_names, false, None);
+        let result =
+            convert_to_histogram_query(original_query, &stream_names, false, None, RANGE_3H, 0);
         assert!(result.is_err());
     }
 
@@ -528,7 +607,7 @@ mod tests {
     fn test_multi_stream_histogram_empty_statements_returns_error() {
         let statements: Vec<Statement> = vec![];
         let stream_names = vec!["logs".to_string()];
-        let result = multi_stream_histogram_query(&statements, &stream_names);
+        let result = multi_stream_histogram_query(&statements, &stream_names, "1 minute");
         assert!(result.is_err());
     }
 
@@ -537,7 +616,7 @@ mod tests {
         let sql = "SELECT * FROM logs";
         let statements = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap();
         let stream_names: Vec<String> = vec![];
-        let result = multi_stream_histogram_query(&statements, &stream_names);
+        let result = multi_stream_histogram_query(&statements, &stream_names, "1 minute");
         assert!(result.is_err());
     }
 
@@ -546,11 +625,142 @@ mod tests {
         // breakdown field containing a double-quote is escaped in the output
         let original_query = "SELECT * FROM \"logs\"";
         let stream_names = vec!["logs".to_string()];
-        let result =
-            convert_to_histogram_query(original_query, &stream_names, false, Some("bad\"field"))
-                .unwrap();
+        let result = convert_to_histogram_query(
+            original_query,
+            &stream_names,
+            false,
+            Some("bad\"field"),
+            RANGE_3H,
+            0,
+        )
+        .unwrap();
         // The double-quote inside the field name must be escaped as "" inside the identifier
         assert!(result.contains("\"bad\"\"field\""));
+    }
+
+    /// The generated SQL must carry EXACTLY the interval the histogram UDF
+    /// auto-derives for the same full request range (single shared formula:
+    /// [`resolve_histogram_interval`] feeds both the generator and the
+    /// RewriteHistogram 1-arg resolution), across auto-interval tiers; a
+    /// preset request `histogram_interval` (seconds) wins over the auto tier.
+    #[test]
+    fn test_generated_interval_matches_udf_auto_interval() {
+        let start = 1_640_995_200_000_000i64;
+        let minute = 60 * 1_000_000i64;
+        let windows = [
+            (10 * minute, "10 second"),
+            (40 * minute, "15 second"),
+            (90 * minute, "30 second"),
+            (3 * 60 * minute, "1 minute"),
+            (8 * 60 * minute, "1 hour"),
+            (70 * 24 * 60 * minute, "1 day"),
+        ];
+        for (window, expected_interval) in windows {
+            let range = (start, start + window);
+            assert_eq!(generate_histogram_interval(range), expected_interval);
+            let sql = convert_to_histogram_query(
+                "SELECT * FROM \"logs\"",
+                &["logs".to_string()],
+                false,
+                None,
+                range,
+                0,
+            )
+            .unwrap();
+            assert!(
+                sql.contains(&format!("histogram(_timestamp, '{expected_interval}')")),
+                "window {window}: generated SQL must carry the UDF auto interval \
+                 '{expected_interval}': {sql}"
+            );
+        }
+
+        // a preset request interval (seconds) wins over the auto tier
+        let sql = convert_to_histogram_query(
+            "SELECT * FROM \"logs\"",
+            &["logs".to_string()],
+            false,
+            Some("level"),
+            RANGE_3H,
+            300,
+        )
+        .unwrap();
+        assert!(
+            sql.contains("histogram(_timestamp, '300 second')"),
+            "preset interval must win: {sql}"
+        );
+    }
+
+    /// The streaming layer re-plans the generated SQL once per partition
+    /// sub-range. With the explicit interval resolved from the FULL range,
+    /// every partition derives the same bucket width — even partitions
+    /// narrow enough that a 1-arg auto-interval would have derived a
+    /// different (finer) tier.
+    #[test]
+    fn test_partition_subranges_share_bucket_width() {
+        let (start, end) = RANGE_3H; // full request range: auto tier "1 minute"
+        let sql = convert_to_histogram_query(
+            "SELECT * FROM \"logs\"",
+            &["logs".to_string()],
+            false,
+            None,
+            (start, end),
+            0,
+        )
+        .unwrap();
+
+        let full_width_secs = {
+            let secs =
+                convert_histogram_interval_to_seconds(generate_histogram_interval((start, end)))
+                    .unwrap();
+            validate_and_adjust_histogram_interval(secs, (start, end))
+        };
+        assert_eq!(full_width_secs, 60);
+
+        // partitions of very different spans: 2 minutes, 15 minutes, full
+        let minute = 60 * 1_000_000i64;
+        let partitions = [
+            (start, start + 2 * minute),
+            (start + 2 * minute, start + 17 * minute),
+            (start, end),
+        ];
+        for partition_range in partitions {
+            // each partition parses the SAME generated SQL with its own
+            // (narrower) time range — the Sql::new path
+            let mut statement = sqlparser::parser::Parser::parse_sql(&PostgreSqlDialect {}, &sql)
+                .unwrap()
+                .pop()
+                .unwrap();
+            let mut visitor = HistogramIntervalVisitor::new(partition_range);
+            let _ = sqlparser::ast::VisitMut::visit(&mut statement, &mut visitor);
+            assert_eq!(
+                visitor.interval,
+                Some(full_width_secs),
+                "partition {partition_range:?} must keep the full-range bucket width"
+            );
+
+            // counterfactual: the old 1-arg form would re-derive from the
+            // partition range and drift to a finer tier on short partitions
+            let one_arg = "SELECT histogram(_timestamp) AS zo_sql_key, count(*) AS zo_sql_num \
+                           FROM \"logs\" GROUP BY zo_sql_key ORDER BY zo_sql_key DESC";
+            let mut statement =
+                sqlparser::parser::Parser::parse_sql(&PostgreSqlDialect {}, one_arg)
+                    .unwrap()
+                    .pop()
+                    .unwrap();
+            let mut visitor = HistogramIntervalVisitor::new(partition_range);
+            let _ = sqlparser::ast::VisitMut::visit(&mut statement, &mut visitor);
+            let auto_secs =
+                convert_histogram_interval_to_seconds(generate_histogram_interval(partition_range))
+                    .unwrap();
+            assert_eq!(
+                visitor.interval,
+                Some(validate_and_adjust_histogram_interval(
+                    auto_secs,
+                    partition_range
+                )),
+                "1-arg form derives from the partition range"
+            );
+        }
     }
 
     #[test]
@@ -562,7 +772,9 @@ mod tests {
         let sql = "SELECT * FROM logs WHERE level = 'error'";
         let statements = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap();
         let stream_names = vec!["logs".to_string()];
-        let result = single_stream_histogram_query(&statements, &stream_names, true, None).unwrap();
+        let result =
+            single_stream_histogram_query(&statements, &stream_names, true, None, "1 minute")
+                .unwrap();
         // WHERE clause must be absent when is_sub_query is true
         assert!(!result.contains("WHERE"), "expected no WHERE: {result}");
     }

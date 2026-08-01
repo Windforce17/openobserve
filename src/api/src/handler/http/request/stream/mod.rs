@@ -96,24 +96,6 @@ pub async fn schema(
         )
             .into_response();
     };
-    if !schema.settings.defined_schema_fields.is_empty() {
-        let mut schema_fields = schema
-            .schema
-            .iter()
-            .map(|f| (&f.name, f))
-            .collect::<HashMap<_, _>>();
-        // internal columns are implicit in the UDS even when not persisted
-        let internal_columns = schema.settings.uds_internal_columns();
-        schema.uds_schema = schema
-            .settings
-            .defined_schema_fields
-            .iter()
-            .chain(internal_columns.iter())
-            .filter_map(|f| schema_fields.remove(f))
-            .cloned()
-            .collect::<Vec<_>>();
-    }
-
     // filter by keyword
     if let Some(keyword) = query.get("keyword")
         && !keyword.is_empty()
@@ -1031,7 +1013,6 @@ mod tests {
                 ..Default::default()
             },
             schema: vec![],
-            uds_schema: vec![],
             settings: Default::default(),
             metrics_meta: None,
             total_fields: 0,

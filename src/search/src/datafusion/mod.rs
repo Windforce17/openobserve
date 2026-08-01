@@ -24,10 +24,13 @@ pub mod peak_memory_pool;
 pub mod plan;
 pub mod plan_metrics;
 pub mod planner;
+pub mod source_synthesis;
 pub mod storage;
 pub mod table_provider;
 pub mod udaf;
 pub mod udf;
+pub mod vix_format;
+pub mod vortex_support;
 
 #[derive(PartialEq, Debug)]
 pub enum MemoryPoolType {

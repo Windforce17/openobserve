@@ -15,14 +15,18 @@
 
 use std::{ops::ControlFlow, sync::Arc};
 
-use config::{meta::sql::OrderBy, utils::sql::AGGREGATE_UDF_LIST};
+use config::{
+    ID_COL_NAME, ORIGINAL_DATA_COL_NAME, TIMESTAMP_COL_NAME, meta::sql::OrderBy,
+    utils::sql::AGGREGATE_UDF_LIST,
+};
 use datafusion::common::TableReference;
 use hashbrown::{HashMap, HashSet};
 use infra::schema::SchemaCache;
 use sqlparser::ast::{
-    Expr, GroupByExpr, OrderByKind, Query, SelectItem, SetExpr, Value, ValueWithSpan, VisitMut,
-    VisitorMut,
+    Expr, GroupByExpr, Ident, OrderByKind, Query, SelectItem, SetExpr, Value, ValueWithSpan,
+    VisitMut, VisitorMut,
 };
+use vortex_index::SOURCE_COL_NAME;
 
 use crate::{sql::visitor::utils::FieldNameVisitor, utils::trim_quotes};
 
@@ -38,6 +42,13 @@ pub struct ColumnVisitor<'a> {
     pub is_wildcard: bool,
     pub is_distinct: bool,
     pub has_agg_function: bool,
+    /// Bare identifiers referenced in a WHERE clause that resolve to NO
+    /// stream schema field (and are not internal columns). In SQL a WHERE
+    /// clause cannot reference SELECT aliases, so for plain single-stream
+    /// statements these are definitively unknown fields — `Sql::new` turns
+    /// them into a deterministic "field not found" error instead of letting
+    /// DataFusion fail later against whatever the plan schema happens to be.
+    pub where_unresolved_fields: HashSet<String>,
 }
 
 impl<'a> ColumnVisitor<'a> {
@@ -53,7 +64,41 @@ impl<'a> ColumnVisitor<'a> {
             is_wildcard: false,
             is_distinct: false,
             has_agg_function: false,
+            where_unresolved_fields: HashSet::new(),
         }
+    }
+
+    /// Record `ident` as a referenced column of every stream whose schema
+    /// carries it. Mirrors DataFusion's identifier normalization: an exact
+    /// match first; when the identifier is UNQUOTED and misses, its
+    /// lowercase form (which is what DataFusion will actually look up).
+    /// Returns the resolved field name, if any schema matched.
+    fn resolve_column(&mut self, ident: &sqlparser::ast::Ident) -> Option<String> {
+        let mut resolved = None;
+        for (name, schema) in self.schemas.iter() {
+            if schema.contains_field(&ident.value) {
+                self.columns
+                    .entry(name.clone())
+                    .or_default()
+                    .insert(ident.value.clone());
+                resolved = Some(ident.value.clone());
+            }
+        }
+        if resolved.is_none() && ident.quote_style.is_none() {
+            let lower = ident.value.to_lowercase();
+            if lower != ident.value {
+                for (name, schema) in self.schemas.iter() {
+                    if schema.contains_field(&lower) {
+                        self.columns
+                            .entry(name.clone())
+                            .or_default()
+                            .insert(lower.clone());
+                        resolved = Some(lower.clone());
+                    }
+                }
+            }
+        }
+        resolved
     }
 }
 
@@ -63,31 +108,13 @@ impl VisitorMut for ColumnVisitor<'_> {
     fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
         match expr {
             Expr::Identifier(ident) => {
-                let field_name = ident.value.clone();
-                for (name, schema) in self.schemas.iter() {
-                    if schema.contains_field(&field_name) {
-                        self.columns
-                            .entry(name.clone())
-                            .or_default()
-                            .insert(field_name.clone());
-                    }
-                }
+                let ident = ident.clone();
+                self.resolve_column(&ident);
             }
             Expr::CompoundIdentifier(idents) => {
-                let name = idents
-                    .iter()
-                    .map(|ident| ident.value.clone())
-                    .collect::<Vec<_>>();
-                let field_name = name.last().unwrap().clone();
                 // check if table_name is in schemas, otherwise the table_name maybe is a alias
-                for (name, schema) in self.schemas.iter() {
-                    if schema.contains_field(&field_name) {
-                        self.columns
-                            .entry(name.clone())
-                            .or_default()
-                            .insert(field_name.clone());
-                    }
-                }
+                let ident = idents.last().unwrap().clone();
+                self.resolve_column(&ident);
             }
             Expr::Function(f)
                 if AGGREGATE_UDF_LIST
@@ -146,6 +173,29 @@ impl VisitorMut for ColumnVisitor<'_> {
             if select.distinct.is_some() {
                 self.is_distinct = true;
             }
+            // WHERE-clause identifiers that no stream schema resolves
+            // (exact match, or the lowercase form DataFusion would look up
+            // for an unquoted identifier). Internal columns are exempt.
+            if let Some(selection) = select.selection.as_mut() {
+                let mut where_idents = WhereIdentVisitor::default();
+                let _ = selection.visit(&mut where_idents);
+                for ident in where_idents.idents {
+                    if is_internal_column(&ident.value) {
+                        continue;
+                    }
+                    let resolves =
+                        self.schemas
+                            .values()
+                            .any(|schema| schema.contains_field(&ident.value))
+                            || (ident.quote_style.is_none()
+                                && self.schemas.values().any(|schema| {
+                                    schema.contains_field(&ident.value.to_lowercase())
+                                }));
+                    if !resolves {
+                        self.where_unresolved_fields.insert(ident.value);
+                    }
+                }
+            }
         } else if let sqlparser::ast::SetExpr::SetOperation { left, right, .. } =
             query.body.as_mut()
             && (has_wildcard(left) || has_wildcard(right))
@@ -176,6 +226,35 @@ impl VisitorMut for ColumnVisitor<'_> {
         }
         if has_limit && self.offset.is_none() {
             self.offset = Some(0);
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// Internal columns a query may reference without them being registry
+/// fields.
+fn is_internal_column(name: &str) -> bool {
+    name == TIMESTAMP_COL_NAME
+        || name == ID_COL_NAME
+        || name == ORIGINAL_DATA_COL_NAME
+        || name == SOURCE_COL_NAME
+}
+
+/// Collects the bare identifiers of a WHERE clause (quote style preserved).
+/// Compound identifiers are deliberately skipped: after the dotted-fields
+/// rewrite they are table-qualified references whose resolution DataFusion
+/// owns.
+#[derive(Default)]
+struct WhereIdentVisitor {
+    idents: Vec<Ident>,
+}
+
+impl VisitorMut for WhereIdentVisitor {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
+        if let Expr::Identifier(ident) = expr {
+            self.idents.push(ident.clone());
         }
         ControlFlow::Continue(())
     }
@@ -258,6 +337,100 @@ mod tests {
 
         // Should extract limit
         assert_eq!(column_visitor.limit, Some(1000));
+    }
+
+    fn visit(sql: &str, schema_fields: &[(&str, DataType)]) -> ColumnVisitorResult {
+        // PostgreSqlDialect matches Sql::new (quote-style semantics matter here)
+        let mut statement =
+            sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::PostgreSqlDialect {}, sql)
+                .unwrap()
+                .pop()
+                .unwrap();
+        let schema = Schema::new(
+            schema_fields
+                .iter()
+                .map(|(name, data_type)| Arc::new(Field::new(*name, data_type.clone(), true)))
+                .collect::<Vec<_>>(),
+        );
+        let mut schemas = HashMap::new();
+        schemas.insert(
+            TableReference::from("t"),
+            Arc::new(SchemaCache::new(schema)),
+        );
+        let mut visitor = ColumnVisitor::new(&schemas);
+        let _ = statement.visit(&mut visitor);
+        ColumnVisitorResult {
+            columns: visitor
+                .columns
+                .get(&TableReference::from("t"))
+                .cloned()
+                .unwrap_or_default(),
+            where_unresolved: visitor.where_unresolved_fields,
+        }
+    }
+
+    struct ColumnVisitorResult {
+        columns: HashSet<String>,
+        where_unresolved: HashSet<String>,
+    }
+
+    /// WHERE identifiers that no schema field resolves are reported for the
+    /// deterministic "field not found" error; resolvable, internal, and
+    /// non-WHERE identifiers are not.
+    #[test]
+    fn test_where_unresolved_fields() {
+        let fields = [
+            ("level", DataType::Utf8),
+            ("k8s.container.name", DataType::Utf8),
+        ];
+
+        // unknown WHERE field is reported; the known one is not
+        let r = visit(
+            r#"SELECT * FROM t WHERE "k8s.container.name" = 'x' AND missing_field = 'y'"#,
+            &fields,
+        );
+        assert_eq!(
+            r.where_unresolved,
+            HashSet::from(["missing_field".to_string()])
+        );
+        assert!(r.columns.contains("k8s.container.name"));
+
+        // internal columns are exempt even though no registry carries them
+        let r = visit(
+            "SELECT * FROM t WHERE _timestamp > 1 AND _o2_id > 0",
+            &fields,
+        );
+        assert!(r.where_unresolved.is_empty());
+
+        // SELECT/ORDER BY identifiers (e.g. aliases) are never validated —
+        // only the WHERE clause is definitive
+        let r = visit(
+            "SELECT level AS lvl FROM t WHERE level = 'info' ORDER BY lvl",
+            &fields,
+        );
+        assert!(r.where_unresolved.is_empty());
+
+        // function arguments inside WHERE are identifiers too
+        let r = visit("SELECT * FROM t WHERE str_match(nope, 'x')", &fields);
+        assert_eq!(r.where_unresolved, HashSet::from(["nope".to_string()]));
+    }
+
+    /// Identifier-case handling mirrors DataFusion: an UNQUOTED identifier
+    /// falls back to its lowercase form (which is what DataFusion looks
+    /// up), and the resolved lowercase name joins `columns` so the plan
+    /// schema can bind it; a QUOTED identifier stays exact.
+    #[test]
+    fn test_where_field_case_normalization() {
+        let fields = [("level", DataType::Utf8)];
+
+        // unquoted mixed case resolves via the lowercase form
+        let r = visit("SELECT * FROM t WHERE Level = 'x'", &fields);
+        assert!(r.where_unresolved.is_empty());
+        assert!(r.columns.contains("level"));
+
+        // quoted mixed case is exact — unresolved
+        let r = visit(r#"SELECT * FROM t WHERE "Level" = 'x'"#, &fields);
+        assert_eq!(r.where_unresolved, HashSet::from(["Level".to_string()]));
     }
 
     #[test]

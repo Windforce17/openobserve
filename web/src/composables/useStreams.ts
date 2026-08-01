@@ -376,11 +376,7 @@ const useStreams = () => {
   function removeSchemaFields(streamData: any) {
     if (streamData.schema) {
       streamData.schema = streamData.schema.filter((field: any) => {
-        return (
-          field.name != "_o2_id" &&
-          field.name != "_original" &&
-          field.name != "_all_values"
-        );
+        return field.name != "_o2_id" && field.name != "_original";
       });
     }
     return streamData;
@@ -626,19 +622,24 @@ const useStreams = () => {
   }
 
   const getUpdatedSettings = (previousSettings: any, currentSettings: any) => {
+    // bloom_filter_fields is intentionally NOT diffed: blooms are retired as
+    // a user-facing index type (core .vix term index supersedes them). Stored
+    // bloom fields on legacy streams are left untouched by settings saves.
     const attributesToCompare: Array<string> = [
       "fields",
       "partition_keys",
-      "index_fields",
       "full_text_search_keys",
-      "bloom_filter_fields",
-      "defined_schema_fields",
+      "column_store_fields",
       "extended_retention_days",
       "pattern_associations",
     ];
 
     let updatedSettings: any = {};
     updatedSettings = { ...currentSettings };
+    // Strip any stale bloom value a caller may still pass: the update API
+    // expects {add, remove} shapes and blooms must never be modified from
+    // the UI anymore.
+    delete updatedSettings.bloom_filter_fields;
 
     attributesToCompare.forEach((attribute) => {
       const previousArray =

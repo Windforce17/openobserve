@@ -172,12 +172,10 @@ describe("useDashboardPanel", () => {
     expect(panel.dashboardPanelData.layout.vrlFunctionToggle).toBe(false);
   });
 
-  it("uses user defined schema when enabled", () => {
+  it("always uses the full stream field list (user defined schemas removed)", () => {
     const panel = useDashboardPanelData("dashboard-panel-test-4");
 
-    panel.dashboardPanelData.meta.stream.userDefinedSchema = [{ name: "field_1" }];
-    panel.dashboardPanelData.meta.stream.selectedStreamFields = [{ name: "fallback" }];
-    panel.dashboardPanelData.meta.stream.useUserDefinedSchemas = "user_defined_schema";
+    panel.dashboardPanelData.meta.stream.selectedStreamFields = [{ name: "field_1" }];
 
     expect(panel.selectedStreamFieldsBasedOnUserDefinedSchema.value).toEqual([
       { name: "field_1" },

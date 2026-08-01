@@ -610,6 +610,7 @@ async fn generate_dump(
         deleted: false,
         selection: None,
         row_group_size: None,
+        selection_exact: false,
     };
 
     Ok(Some(dump_file))

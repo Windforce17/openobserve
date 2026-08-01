@@ -27,10 +27,34 @@ use prost::Message;
 use proto::loki_rpc;
 
 use crate::{
-    common::meta::loki::{LokiError, LokiPushRequest},
+    common::meta::{
+        ingestion::IngestionResponse,
+        loki::{LokiError, LokiPushRequest},
+    },
     handler::http::request::{CONTENT_TYPE_JSON, CONTENT_TYPE_PROTO},
     service::{ingestion::get_thread_id, logs},
 };
+
+/// Render the aggregated ingest result with the code the ingest layer
+/// reported: 204 for success (the Loki push contract), the real 500/503
+/// otherwise. Mapping every `Ok` to 204 acked batches whose durable write
+/// failed — Loki shippers (promtail, Grafana Agent) only retry on a 5xx.
+fn loki_response(v: IngestionResponse) -> Response {
+    // a code we cannot render is not an ack
+    let status = StatusCode::from_u16(v.code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    if status.is_success() {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+    let error = v
+        .error
+        .unwrap_or_else(|| "error while writing log data".to_string());
+    (
+        status,
+        [(axum::http::header::CONTENT_TYPE, "text/plain")],
+        error,
+    )
+        .into_response()
+}
 
 #[utoipa::path(
     post,
@@ -115,7 +139,18 @@ pub async fn loki_push(Path(org_id): Path<String>, headers: HeaderMap, body: Byt
     };
 
     let mut resp = match logs::loki::handle_request(thread_id, &org_id, request, user_email).await {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        // the ingest layer's code reaches the wire: a failed durable write
+        // reports 500/503 on the IngestionResponse and must not become a 204
+        Ok(v) => {
+            if v.code >= 300 {
+                log::error!(
+                    "[Loki] write failed for org '{org_id}': code {}: {}",
+                    v.code,
+                    v.error.as_deref().unwrap_or("unknown error")
+                );
+            }
+            loki_response(v)
+        }
         Err(e) => {
             log::error!("[Loki] Processing error for org '{org_id}': {e:?}");
             e.into_response()
@@ -184,6 +219,37 @@ mod tests {
 
     fn create_valid_loki_json() -> &'static str {
         r#"{"streams":[{"stream":{"service":"test"},"values":[["1701432000000000000","Test message"]]}]}"#
+    }
+
+    fn ingestion(code: u16, error: Option<&str>) -> IngestionResponse {
+        IngestionResponse {
+            code,
+            status: vec![],
+            error: error.map(|e| e.to_string()),
+        }
+    }
+
+    /// The ingest layer's code reaches the wire: a failed durable write used
+    /// to be collapsed into an unconditional 204 and promtail dropped the
+    /// batch.
+    #[test]
+    fn test_loki_write_failure_is_not_acked_with_204() {
+        let resp = loki_response(ingestion(503, Some("stream [a]: 4 record(s) not written")));
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let resp = loki_response(ingestion(500, Some("stream [a]: disk full")));
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        // an out-of-range code must never degrade into an ack
+        let resp = loki_response(ingestion(0, None));
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// A durable write keeps the Loki push contract: 204 No Content.
+    #[test]
+    fn test_loki_success_is_204() {
+        let resp = loki_response(ingestion(200, None));
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     }
 
     #[tokio::test]

@@ -116,13 +116,9 @@ pub async fn set_stream_is_llm(
     if is_llm_stream {
         // Provision Gen-AI semantic-convention columns for the stream. Always merge
         // gen_ai_* fields into the Arrow schema so they are available at ingestion
-        // time, even for streams that only have legacy llm_* fields or for non-UDS
-        // streams. Legacy llm_* columns are left as-is so historical data still reads
-        // cleanly.
-        ensure_gen_ai_fields_in_schema_inner(org_id, stream_name, stream_type, false).await?;
-
-        // Add to defined_schema_fields only when UDS is already enabled
-        append_gen_ai_fields_to_defined_schema_fields(&mut settings.defined_schema_fields);
+        // time, even for streams that only have legacy llm_* fields. Legacy llm_*
+        // columns are left as-is so historical data still reads cleanly.
+        ensure_gen_ai_fields_in_schema(org_id, stream_name, stream_type).await?;
     }
 
     let mut metadata = std::collections::HashMap::with_capacity(1);
@@ -133,9 +129,8 @@ pub async fn set_stream_is_llm(
 /// Ensure gen_ai_* schema fields are present in a stream's Arrow schema.
 ///
 /// This adds any missing gen_ai_* fields from [`GEN_AI_SCHEMA_FIELDS`] into the
-/// stream's Arrow schema so they are available at ingestion time. For streams
-/// with User-Defined Schema already enabled, it also appends those fields to
-/// `defined_schema_fields`; non-UDS streams are left non-UDS.
+/// stream's Arrow schema so they are available at ingestion time (the `.vix`
+/// all-fields index picks them up like any other string field).
 ///
 /// Handles the case where a stream was already marked as an LLM stream but has
 /// only legacy `llm_*` fields — calling this ensures the newer `gen_ai_*`
@@ -144,15 +139,6 @@ pub async fn ensure_gen_ai_fields_in_schema(
     org_id: &str,
     stream_name: &str,
     stream_type: StreamType,
-) -> Result<(), anyhow::Error> {
-    ensure_gen_ai_fields_in_schema_inner(org_id, stream_name, stream_type, true).await
-}
-
-async fn ensure_gen_ai_fields_in_schema_inner(
-    org_id: &str,
-    stream_name: &str,
-    stream_type: StreamType,
-    update_defined_schema_fields: bool,
 ) -> Result<(), anyhow::Error> {
     let schema_cache = infra::schema::get_cache(org_id, stream_name, stream_type).await?;
     let missing_fields: Vec<Field> = GEN_AI_SCHEMA_FIELDS
@@ -165,47 +151,7 @@ async fn ensure_gen_ai_fields_in_schema_inner(
         let gen_ai_schema = Schema::new(missing_fields);
         merge(org_id, stream_name, stream_type, &gen_ai_schema, None).await?;
     }
-    if update_defined_schema_fields {
-        ensure_gen_ai_fields_in_defined_schema_fields(org_id, stream_name, stream_type).await?;
-    }
     Ok(())
-}
-
-async fn ensure_gen_ai_fields_in_defined_schema_fields(
-    org_id: &str,
-    stream_name: &str,
-    stream_type: StreamType,
-) -> Result<(), anyhow::Error> {
-    let mut settings = infra::schema::get_settings(org_id, stream_name, stream_type)
-        .await
-        .unwrap_or_default();
-    if append_gen_ai_fields_to_defined_schema_fields(&mut settings.defined_schema_fields) {
-        let mut metadata = std::collections::HashMap::with_capacity(1);
-        metadata.insert("settings".to_string(), json::to_string(&settings).unwrap());
-        update_setting(org_id, stream_name, stream_type, metadata).await?;
-    }
-    Ok(())
-}
-
-fn append_gen_ai_fields_to_defined_schema_fields(defined_schema_fields: &mut Vec<String>) -> bool {
-    if defined_schema_fields.is_empty() {
-        return false;
-    }
-
-    let mut updated = false;
-    for field in GEN_AI_SCHEMA_FIELDS.iter() {
-        if !defined_schema_fields
-            .iter()
-            .any(|name| name == field.name())
-        {
-            defined_schema_fields.push(field.name().to_string());
-            updated = true;
-        }
-    }
-    if updated {
-        defined_schema_fields.sort();
-    }
-    updated
 }
 
 /// Arrow schema fields provisioned on streams marked as LLM streams.
@@ -560,7 +506,7 @@ pub async fn watch() -> Result<(), anyhow::Error> {
                 }
                 let latest_schema = latest_schema.pop().unwrap();
                 let settings = unwrap_stream_settings(&latest_schema).unwrap_or_default();
-                if (settings.store_original_data || settings.index_original_data)
+                if settings.store_original_data
                     && let dashmap::Entry::Vacant(entry) =
                         STREAM_RECORD_ID_GENERATOR.entry(item_key.to_string())
                 {
@@ -748,7 +694,7 @@ pub async fn cache() -> Result<(), anyhow::Error> {
         }
         let latest_schema = latest_schema.last().unwrap();
         let settings = unwrap_stream_settings(latest_schema).unwrap_or_default();
-        if (settings.store_original_data || settings.index_original_data)
+        if settings.store_original_data
             && let dashmap::Entry::Vacant(entry) =
                 STREAM_RECORD_ID_GENERATOR.entry(item_key.to_string())
         {
@@ -1212,42 +1158,5 @@ mod tests {
         let schemas = vec![schema_with_end_dt(5000), schema_with_end_dt(9000)];
         // query end_dt = 5000 → 5000 is NOT < 5000 → check next: 5000 < 9000 → returns 1
         assert_eq!(filter_schema_version_id(&schemas, 0, 5000), Some(1));
-    }
-
-    #[test]
-    fn test_append_gen_ai_fields_to_defined_schema_fields_skips_non_uds_streams() {
-        let mut fields = Vec::new();
-
-        let updated = append_gen_ai_fields_to_defined_schema_fields(&mut fields);
-
-        assert!(!updated);
-        assert!(fields.is_empty());
-    }
-
-    #[test]
-    fn test_append_gen_ai_fields_to_defined_schema_fields_adds_missing_cache_fields() {
-        let mut fields = vec![
-            "trace_id".to_string(),
-            "gen_ai_usage_input_tokens".to_string(),
-        ];
-
-        let updated = append_gen_ai_fields_to_defined_schema_fields(&mut fields);
-
-        assert!(updated);
-        assert!(fields.contains(&"trace_id".to_string()));
-        assert!(fields.contains(&"gen_ai_usage_cache_read_input_tokens".to_string()));
-        assert!(fields.contains(&"gen_ai_usage_cache_creation_input_tokens".to_string()));
-        assert!(fields.contains(&"gen_ai_usage_cost_net_cache_impact".to_string()));
-    }
-
-    #[test]
-    fn test_append_gen_ai_fields_to_defined_schema_fields_is_idempotent() {
-        let mut fields = vec!["trace_id".to_string()];
-
-        assert!(append_gen_ai_fields_to_defined_schema_fields(&mut fields));
-        let len_after_first_append = fields.len();
-
-        assert!(!append_gen_ai_fields_to_defined_schema_fields(&mut fields));
-        assert_eq!(fields.len(), len_after_first_append);
     }
 }

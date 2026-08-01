@@ -1,0 +1,36 @@
+[package]
+name = "vortex_index"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = ["gxhash"]
+gxhash = ["dep:gxhash"]
+
+[dependencies]
+anyhow.workspace = true
+arrow.workspace = true
+arrow-schema.workspace = true
+bitpacking.workspace = true
+bytes.workspace = true
+futures.workspace = true
+gxhash = { version = "3.5", optional = true }
+hashbrown.workspace = true
+itertools.workspace = true
+itoa = "1.0"
+levenshtein_automata.workspace = true
+log.workspace = true
+ryu = "1.0"
+serde.workspace = true
+serde_json.workspace = true
+tantivy-fst.workspace = true
+puffin.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+vortex.workspace = true
+
+[dev-dependencies]
+rand.workspace = true

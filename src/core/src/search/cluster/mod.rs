@@ -31,6 +31,9 @@ pub fn handle_table_response(
         .fields()
         .iter()
         .map(|f| f.name().to_string())
+        // the row-store star's `_source` column is exploded into the hits
+        // before this point and never surfaces as a response column
+        .filter(|name| name != vortex_index::SOURCE_COL_NAME)
         .collect::<Vec<_>>();
     let mut table = Vec::with_capacity(sources.len());
     for row in &sources {

@@ -268,47 +268,22 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
                     </div>
                   </div>
                   <div class="flex justify-between items-center w-full">
-                    <div class="flex items-center">
-                      <div class="app-tabs-container">
-                        <OToggleGroup
-                          v-if="isSchemaUDSEnabled"
-                          data-test="schema-fields-tabs"
-                          :model-value="activeTab"
-                          @update:model-value="updateActiveTab"
-                        >
-                          <OToggleGroupItem
-                            v-if="hasUserDefinedSchema"
-                            value="schemaFields"
-                            size="sm"
-                          >
-                            <template #icon-left
-                              ><OIcon name="verified-user" size="sm"
-                            /></template>
-                            User Defined Schema ({{
-                              indexData.defined_schema_fields.length
-                            }})
-                          </OToggleGroupItem>
-                          <OToggleGroupItem value="allFields" size="sm">
-                            <template #icon-left
-                              ><OIcon name="format-list-bulleted" size="sm"
-                            /></template>
-                            {{ computedSchemaFieldsName }} ({{
-                              indexData.schema.length
-                            }})
-                          </OToggleGroupItem>
-                        </OToggleGroup>
+                    <!-- Every string field carries the automatic term index;
+                         only full-text / column-store are user choices. -->
+                    <div class="flex flex-col gap-0.5">
+                      <div
+                        data-test="schema-term-index-hint"
+                        class="flex items-center gap-1 text-xs text-text-secondary"
+                      >
+                        <OIcon name="info" size="sm" />
+                        <span>{{ t("logStream.termIndexHint") }}</span>
                       </div>
-
-                      <div v-if="hasUserDefinedSchema" class="ml-2 flex items-center">
-                        <OIcon
-                          name="info"
-                          size="sm"
-                          class="text-status-warning-text cursor-pointer"
-                        />
-                        <OTooltip
-                          side="right"
-                          content="Other fields show only the schema fields that existed before the stream was configured to use a user-defined schema."
-                        />
+                      <div
+                        data-test="schema-column-store-hint"
+                        class="flex items-center gap-1 text-xs text-text-secondary"
+                      >
+                        <OIcon name="info" size="sm" />
+                        <span>{{ t("logStream.columnStoreHint") }}</span>
                       </div>
                     </div>
 
@@ -321,14 +296,13 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
                         :placeholder="t('search.searchField')"
                       />
                       <OButton
-                        v-if="isSchemaUDSEnabled"
                         data-test="schema-add-fields-title"
                         :disabled="isDialogOpen"
                         variant="outline"
                         size="icon-sm"
                         class="my-2"
                         @click.stop="openDialog"
-                        title="Add Field(s)"
+                        :title="t('logStream.addFields')"
                         icon-left="add"
                       />
                     </div>
@@ -422,23 +396,13 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
                           </span>
                         </div>
                       </template>
-                      <template #cell-settings="{ row }">
-                        <template v-if="row.isUserDefined">
-                          <OIcon name="person" size="xs" />
-                          <OIcon name="schema" size="xs" />
-                        </template>
-                      </template>
                       <template #cell-type="{ row }">
                         <OTag type="fieldType" :value="row.type" />
                       </template>
                       <template #cell-index_type="{ row }">
                         <div
                           v-if="
-                            !(
-                              row.name ==
-                                store.state.zoConfig.timestamp_column ||
-                              row.name == allFieldsName
-                            )
+                            row.name != store.state.zoConfig.timestamp_column
                           "
                           class="flex items-center gap-1"
                         >
@@ -559,7 +523,12 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
                       </div>
 
                       <div v-if="showStoreOriginalDataToggle" class="flex items-center justify-between px-3 py-2.5 text-compact">
-                        <span>Store Original Data</span>
+                        <div class="flex flex-col">
+                          <span>{{ t("logStream.storeOriginalData") }}</span>
+                          <span class="text-xs text-text-secondary">{{
+                            t("logStream.storeOriginalDataHint")
+                          }}</span>
+                        </div>
                         <OSwitch
                           data-test="log-stream-store-original-data-toggle-btn"
                           v-model="storeOriginalData"
@@ -677,36 +646,6 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
                       >
                       <OButton
                         v-if="
-                          isSchemaUDSEnabled &&
-                          activeMainTab == 'schemaSettings'
-                        "
-                        data-test="schema-add-field-button"
-                        variant="outline"
-                        size="sm-action"
-                        :disabled="
-                          !selectedFields.length || hasUDSFieldInSelection
-                        "
-                        @click="updateDefinedSchemaFields"
-                      >
-                        <span
-                          class="flex items-center justify-start gap-1 mr-1"
-                        >
-                          <OIcon name="verified-user" size="sm" />
-                          <OIcon name="format-list-bulleted" size="sm" />
-                        </span>
-                        {{
-                          activeTab === "schemaFields"
-                            ? t("logStream.removeSchemaField")
-                            : t("logStream.addSchemaField")
-                        }}
-                        <OTooltip
-                          v-if="hasUDSFieldInSelection"
-                          :content="t('logStream.udsFieldAlreadyInSchema')"
-                          side="top"
-                        />
-                      </OButton>
-                      <OButton
-                        v-if="
                           activeMainTab != 'configuration' &&
                           activeMainTab != 'crossLinking'
                         "
@@ -810,13 +749,6 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     @update:cancel="confirmDeleteDatesDialog = false"
     v-model="confirmDeleteDatesDialog"
   />
-  <PerformanceFieldsDialog
-    v-model="confirmAddPerformanceFieldsDialog"
-    :missing-fields="missingPerformanceFields"
-    @add-fields="addPerformanceFields"
-    @skip="skipPerformanceFields"
-    @remove-field="removeFieldFromList"
-  />
 </template>
 
 <script lang="ts">
@@ -852,8 +784,6 @@ import ConfirmDialog from "@/components/ConfirmDialog.vue";
 import useStreams from "@/composables/useStreams";
 import { useRouter } from "vue-router";
 import StreamFieldsInputs from "@/components/logstream/StreamFieldInputs.vue";
-import OToggleGroup from "@/lib/core/ToggleGroup/OToggleGroup.vue";
-import OToggleGroupItem from "@/lib/core/ToggleGroup/OToggleGroupItem.vue";
 import OButton from "@/lib/core/Button/OButton.vue";
 import OTag from "@/lib/core/Badge/OTag.vue";
 import OTable from "@/lib/core/Table/OTable.vue";
@@ -865,7 +795,6 @@ import DateTime from "@/components/DateTime.vue";
 
 import AssociatedRegexPatterns from "./AssociatedRegexPatterns.vue";
 import ODrawer from "@/lib/overlay/Drawer/ODrawer.vue";
-import PerformanceFieldsDialog from "./PerformanceFieldsDialog.vue";
 import OSpinner from "@/lib/feedback/Spinner/OSpinner.vue";
 import OInput from "@/lib/forms/Input/OInput.vue";
 import OSearchInput from "@/lib/forms/SearchInput/OSearchInput.vue";
@@ -888,7 +817,6 @@ const defaultValue: any = () => {
     schema: [],
     stats: {},
     defaultFts: false,
-    defined_schema_fields: [],
   };
 };
 
@@ -911,14 +839,11 @@ export default defineComponent({
     OTab,
     ConfirmDialog,
     StreamFieldsInputs,
-    OToggleGroup,
-    OToggleGroupItem,
     OTable,
     OTag,
     DateTime,
     AssociatedRegexPatterns,
     ODrawer,
-    PerformanceFieldsDialog,
     CrossLinkManager,
     OButton,
     OIcon,
@@ -954,9 +879,6 @@ export default defineComponent({
     const flattenLevel = ref(null);
     const confirmQueryModeChangeDialog = ref(false);
     const confirmDeleteDatesDialog = ref(false);
-    const confirmAddPerformanceFieldsDialog = ref(false);
-    const missingPerformanceFields = ref([]);
-    const pendingSelectedFields = ref([]);
     const formDirtyFlag = ref(false);
     const loadingState = ref(true);
     const rowsPerPage = ref(20);
@@ -1036,7 +958,7 @@ export default defineComponent({
 
     const filteredSchemaData = computed(() => {
       const rows = indexData.value.schema || [];
-      if (!filterField.value && activeTab.value !== "schemaFields") return rows;
+      if (!filterField.value) return rows;
 
       const searchTerm = filterField.value?.toLowerCase() || "";
       const labelToValueMap: Record<string, string> = {};
@@ -1045,11 +967,6 @@ export default defineComponent({
       });
 
       return rows.filter((row: any) => {
-        if (activeTab.value === "schemaFields") {
-          if (!indexData.value.defined_schema_fields.includes(row.name))
-            return false;
-        }
-        if (!searchTerm) return true;
         if (row.name.toLowerCase().includes(searchTerm)) return true;
         return (row.index_type || []).some(
           (t: string) =>
@@ -1063,9 +980,7 @@ export default defineComponent({
       get: () => selectedFields.value.map((f: any) => f.name),
       set: (ids: string[]) => {
         const filteredIds = ids.filter(
-          (id) =>
-            id !== store.state.zoConfig.timestamp_column &&
-            id !== allFieldsName.value,
+          (id) => id !== store.state.zoConfig.timestamp_column,
         );
         selectedFields.value = (indexData.value.schema || []).filter(
           (row: any) => filteredIds.includes(row.name),
@@ -1073,14 +988,13 @@ export default defineComponent({
       },
     });
 
-    // The _timestamp and allFields rows are never part of the selection (they
-    // are filtered out below). Tell the table they are non-selectable so the
-    // header "Select All" toggle only considers real rows — otherwise it can
-    // never reach a fully-selected state and stays stuck in select-only mode,
-    // breaking deselect-all.
+    // The _timestamp row is never part of the selection (it is filtered out
+    // below). Tell the table it is non-selectable so the header "Select All"
+    // toggle only considers real rows — otherwise it can never reach a
+    // fully-selected state and stays stuck in select-only mode, breaking
+    // deselect-all.
     const isSchemaRowSelectable = (row: any) =>
-      row.name !== store.state.zoConfig.timestamp_column &&
-      row.name !== allFieldsName.value;
+      row.name !== store.state.zoConfig.timestamp_column;
 
     const handleSchemaSelectedIdsUpdate = (ids: string[]) => {
       selectedSchemaIds.value = ids;
@@ -1088,9 +1002,7 @@ export default defineComponent({
 
     const handleSchemaSelectionChange = (rows: any[]) => {
       selectedFields.value = rows.filter(
-        (row: any) =>
-          row.name !== store.state.zoConfig.timestamp_column &&
-          row.name !== allFieldsName.value,
+        (row: any) => row.name !== store.state.zoConfig.timestamp_column,
       );
     };
 
@@ -1107,41 +1019,6 @@ export default defineComponent({
       selectedDateFields.value = rows;
     };
 
-    const hasUserDefinedSchema = computed(() => {
-      return !!indexData.value.defined_schema_fields?.length;
-    });
-
-    const hasUDSFieldInSelection = computed(() => {
-      return (
-        activeTab.value === "allFields" &&
-        selectedFields.value.some((field: any) => field.isUserDefined)
-      );
-    });
-
-    const allFieldsName = computed(() => {
-      return store.state.zoConfig.all_fields_name;
-    });
-    //here we are setting the active tab based on the user defined schema
-    //1. if there is UDS then it should be schemaFields
-    //2. if there is no UDS then it should be allFields
-    const activeTab = ref(
-      hasUserDefinedSchema.value ? "schemaFields" : "allFields",
-    );
-
-    const tabs = computed(() => [
-      {
-        value: "schemaFields",
-        label: `User Defined Schema (${indexData.value.defined_schema_fields.length})`,
-        disabled: !hasUserDefinedSchema.value,
-        hide: !hasUserDefinedSchema.value,
-      },
-      {
-        value: "allFields",
-        label: `${computedSchemaFieldsName} (${indexData.value.schema.length})`,
-        disabled: false,
-        hide: false,
-      },
-    ]);
     const mainTabs = computed(() => [
       {
         value: "schemaSettings",
@@ -1154,21 +1031,43 @@ export default defineComponent({
         disabled: false,
       },
     ]);
-    // here we are setting the schema field name always be "All Fields"
-    const computedSchemaFieldsName =  "All Fields";
-
+    // Per-field user-configurable index types. Every string field carries the
+    // automatic term index (exact match); these are the opt-in extras.
     const streamIndexType = [
-      { label: "Full text search", value: "fullTextSearchKey" },
-      { label: "Secondary index", value: "secondaryIndexKey" },
-      { label: "Bloom filter", value: "bloomFilterKey" },
-      { label: "KeyValue partition", value: "keyPartition" },
-      { label: "Prefix partition", value: "prefixPartition" },
+      {
+        label: t("logStream.indexTypeFullTextSearch"),
+        value: "fullTextSearchKey",
+      },
+      { label: t("logStream.indexTypeColumnStore"), value: "columnStoreKey" },
+      {
+        label: t("logStream.indexTypeKeyValuePartition"),
+        value: "keyPartition",
+      },
+      {
+        label: t("logStream.indexTypePrefixPartition"),
+        value: "prefixPartition",
+      },
 
-      { label: "Hash partition (8 Buckets)", value: "hashPartition_8" },
-      { label: "Hash partition (16 Buckets)", value: "hashPartition_16" },
-      { label: "Hash partition (32 Buckets)", value: "hashPartition_32" },
-      { label: "Hash partition (64 Buckets)", value: "hashPartition_64" },
-      { label: "Hash partition (128 Buckets)", value: "hashPartition_128" },
+      {
+        label: t("logStream.indexTypeHashPartition", { buckets: 8 }),
+        value: "hashPartition_8",
+      },
+      {
+        label: t("logStream.indexTypeHashPartition", { buckets: 16 }),
+        value: "hashPartition_16",
+      },
+      {
+        label: t("logStream.indexTypeHashPartition", { buckets: 32 }),
+        value: "hashPartition_32",
+      },
+      {
+        label: t("logStream.indexTypeHashPartition", { buckets: 64 }),
+        value: "hashPartition_64",
+      },
+      {
+        label: t("logStream.indexTypeHashPartition", { buckets: 128 }),
+        value: "hashPartition_128",
+      },
     ];
     const { getStream, getUpdatedSettings } = useStreams();
 
@@ -1182,36 +1081,6 @@ export default defineComponent({
 
     const showStoreOriginalDataToggle = computed(() => {
       return modelValue.stream_type !== "traces";
-    });
-    //here we added a watcher to
-    //1. if user defined schema is enabled then we need to show the schema fields tab and also need to make sure that it would be the active tab
-    //2. if user defined schema is disabled then we need to show the all fields tab and also need to make sure that it would be the active tab
-    watch(hasUserDefinedSchema, (newVal) => {
-      if (newVal) {
-        activeTab.value = "schemaFields";
-      } else {
-        activeTab.value = "allFields";
-      }
-    });
-
-    // Watch activeTab and update resultTotal accordingly
-    // This ensures resultTotal is always in sync with the active tab
-    // If selected tab is schemaFields we will show the uds length otherwise we will show the actual schema length
-    watch(
-      activeTab,
-      (newTab) => {
-        if (newTab === "schemaFields") {
-          resultTotal.value =
-            indexData.value.defined_schema_fields?.length || 0;
-        } else {
-          resultTotal.value = indexData.value.schema?.length || 0;
-        }
-      },
-      { immediate: true },
-    );
-
-    const isSchemaUDSEnabled = computed(() => {
-      return store.state.zoConfig.user_defined_schemas_enabled;
     });
 
     const markFormDirty = () => {
@@ -1268,18 +1137,16 @@ export default defineComponent({
       }
 
       if (
-        settings.index_fields.length > 0 &&
-        settings.index_fields.includes(property.name)
+        settings.column_store_fields?.length > 0 &&
+        settings.column_store_fields.includes(property.name)
       ) {
-        fieldIndices.push("secondaryIndexKey");
+        fieldIndices.push("columnStoreKey");
       }
 
-      if (
-        settings.bloom_filter_fields.length > 0 &&
-        settings.bloom_filter_fields.includes(property.name)
-      ) {
-        fieldIndices.push("bloomFilterKey");
-      }
+      // Bloom filters are retired for logs/traces (the core-file term index
+      // supersedes them): stored bloom_filter_fields are no longer surfaced
+      // as an index type, and saves never touch them (kept for parquet-era
+      // data and legacy ZO_CORE_FILE_ENABLED=false writes).
 
       property["delete"] = false;
 
@@ -1331,14 +1198,6 @@ export default defineComponent({
         );
       if (!streamResponse.schema?.length) {
         streamResponse.schema = [];
-        if (streamResponse.settings.defined_schema_fields?.length)
-          streamResponse.settings.defined_schema_fields.forEach((field) => {
-            streamResponse.schema.push({
-              name: field,
-              delete: false,
-              index_type: [],
-            });
-          });
       }
       if (Array.isArray(streamResponse.settings.extended_retention_days)) {
         redBtnRows.value = [];
@@ -1389,9 +1248,6 @@ export default defineComponent({
         "YYYY-MM-DDTHH:mm:ss:SS",
       );
 
-      indexData.value.defined_schema_fields =
-        streamResponse.settings.defined_schema_fields || [];
-
       // Populate stream-level cross-links
       streamCrossLinks.value = streamResponse.settings?.cross_links || [];
 
@@ -1425,23 +1281,6 @@ export default defineComponent({
 
         fieldIndices.length = 0;
       }
-
-      indexData.value.defined_schema_fields.forEach((field) => {
-        if (!schemaMapping.has(field)) {
-          const property = {
-            name: field,
-            delete: false,
-            index_type: [],
-          };
-
-          fieldIndices = getFieldIndices(property, streamResponse.settings);
-
-          property.index_type = [...fieldIndices];
-
-          fieldIndices.length = 0;
-          indexData.value.schema.push(property);
-        }
-      });
     };
 
     const getSchema = async () => {
@@ -1453,14 +1292,8 @@ export default defineComponent({
 
       await getStream(indexData.value.name, indexData.value.stream_type, true)
         .then((streamResponse) => {
-          streamResponse = updateStreamResponse(streamResponse);
           setSchema(streamResponse);
-          if (activeTab.value === "schemaFields") {
-            resultTotal.value =
-              streamResponse.settings?.defined_schema_fields?.length;
-          } else {
-            resultTotal.value = streamResponse.schema?.length;
-          }
+          resultTotal.value = streamResponse.schema?.length || 0;
           loadingState.value = false;
           dismiss();
         })
@@ -1476,8 +1309,8 @@ export default defineComponent({
       // settings. handleSubmit() reveals the inline row errors (which are the
       // user-facing feedback — no toast needed) and an invalid row blocks the
       // save instead of silently pushing an invalid name (e.g. "user!id") into
-      // defined_schema_fields. Empty when the dialog is closed, so a normal
-      // settings save is unaffected.
+      // the new fields. Empty when the dialog is closed, so a normal settings
+      // save is unaffected.
       if (newSchemaFields.value.length > 0) {
         await newSchemaFieldsForm.handleSubmit();
         if (!newSchemaFieldsForm.state.isValid) {
@@ -1490,10 +1323,8 @@ export default defineComponent({
       let settings = {
         fields: [], // only used for add new fields
         partition_keys: [],
-        index_fields: [],
         full_text_search_keys: [],
-        bloom_filter_fields: [],
-        defined_schema_fields: [...indexData.value.defined_schema_fields],
+        column_store_fields: [],
         extended_retention_days: [...indexData.value.extended_retention_days],
         pattern_associations: [...patternAssociations.value],
       };
@@ -1537,14 +1368,8 @@ export default defineComponent({
           };
         }),
       );
-      const newSchemaFieldNameSet = new Set(
-        newSchemaFields.value.map((field) =>
-          field.name.trim().toLowerCase().replace(/ /g, "_").replace(/-/g, "_"),
-        ),
-      );
-      // Push unique and normalized field names to settings.defined_schema_fields
+      // Push unique and normalized new fields to settings.fields
       settings.fields.push(...newSchemaFieldSet);
-      settings.defined_schema_fields.push(...newSchemaFieldNameSet);
       redDaysList.value.forEach((field) => {
         settings.extended_retention_days.push({
           start: field.start,
@@ -1568,8 +1393,8 @@ export default defineComponent({
             settings.full_text_search_keys.push(property.name);
           }
 
-          if (index === "secondaryIndexKey") {
-            settings.index_fields.push(property.name);
+          if (index === "columnStoreKey") {
+            settings.column_store_fields.push(property.name);
           }
 
           if (property.level && index === "keyPartition") {
@@ -1616,9 +1441,6 @@ export default defineComponent({
             }
           }
 
-          if (index === "bloomFilterKey") {
-            settings.bloom_filter_fields.push(property.name);
-          }
         });
       }
       if (added_part_keys.length > 0) {
@@ -1696,8 +1518,8 @@ export default defineComponent({
             true,
           ).then((streamResponse) => {
             formDirtyFlag.value = false;
-            streamResponse = updateStreamResponse(streamResponse);
             setSchema(streamResponse);
+            resultTotal.value = streamResponse.schema?.length || 0;
             loadingState.value = false;
             isDialogOpen.value = false;
             toast({
@@ -1796,18 +1618,10 @@ export default defineComponent({
         option.value.includes("hashPartition")
       )
         return true;
-      //handle if fulltextsearchkey or secondaryindexkey is selected by env then we need to disable the option
+      //handle if fulltextsearchkey is selected by env then we need to disable the option
       if (
         store.state.zoConfig.default_fts_keys.includes(schema.name) &&
         option.value.includes("fullTextSearchKey")
-      ) {
-        return true;
-      }
-      if (
-        store.state.zoConfig.default_secondary_index_fields.includes(
-          schema.name,
-        ) &&
-        option.value.includes("secondaryIndexKey")
       ) {
         return true;
       }
@@ -1830,49 +1644,23 @@ export default defineComponent({
         const row = rows[i];
         let match = false;
 
-        if (fieldType === "schemaFields") {
-          if (indexData.value.defined_schema_fields.includes(row.name)) {
-            // If no search field given, include directly
-            if (!searchTerm) {
-              match = true;
-            } else {
-              // Match by name
-              if (row.name.toLowerCase().includes(searchTerm)) {
-                match = true;
-              }
-              // Match by index_type (convert search label to value)
-              else if (
-                row.index_type.some((t) => {
-                  // check if search is label
-                  return (
-                    t.toLowerCase().includes(searchTerm) || // direct match with stored value
-                    labelToValueMap[searchTerm] === t // label ? value match
-                  );
-                })
-              ) {
-                match = true;
-              }
-            }
-          }
+        if (!searchTerm) {
+          match = true;
         } else {
-          if (!searchTerm) {
+          // Match by name
+          if (row.name.toLowerCase().includes(searchTerm)) {
             match = true;
-          } else {
-            // Match by name
-            if (row.name.toLowerCase().includes(searchTerm)) {
-              match = true;
-            }
-            // Match by index_type
-            else if (
-              row.index_type.some((t) => {
-                return (
-                  t.toLowerCase().includes(searchTerm) ||
-                  labelToValueMap[searchTerm] === t
-                );
-              })
-            ) {
-              match = true;
-            }
+          }
+          // Match by index_type
+          else if (
+            row.index_type.some((t) => {
+              return (
+                t.toLowerCase().includes(searchTerm) ||
+                labelToValueMap[searchTerm] === t
+              );
+            })
+          ) {
+            match = true;
           }
         }
 
@@ -1892,13 +1680,6 @@ export default defineComponent({
         sortable: true,
         size: COL.name,
         meta: { align: "left", autoWidth: true },
-      },
-      {
-        id: "settings",
-        accessorFn: (row: any) => (row.isUserDefined ? 0 : 1),
-        sortable: true,
-        size: COL.method,
-        meta: { align: "left" },
       },
       {
         id: "type",
@@ -1962,252 +1743,8 @@ export default defineComponent({
       }
     };
 
-    const updateActiveTab = (tab) => {
-      activeTab.value = tab;
-      if (tab === "schemaFields") {
-        resultTotal.value = indexData.value.defined_schema_fields.length;
-      } else {
-        resultTotal.value = indexData.value.schema.length;
-      }
-    };
-
     const updateActiveMainTab = (tab) => {
       activeMainTab.value = tab;
-    };
-
-    // Function to get missing FTS and Secondary Index fields
-    const getMissingPerformanceFields = (selectedFieldsSet) => {
-      const missingFields = [];
-      const currentSchema = indexData.value.schema;
-      const currentSchemaFieldNames = new Set(
-        currentSchema.map((field) => field.name),
-      );
-
-      // Get FTS fields from settings
-      const ftsFieldsFromSettings = new Set();
-      currentSchema.forEach((field) => {
-        if (field.index_type?.includes("fullTextSearchKey")) {
-          ftsFieldsFromSettings.add(field.name);
-        }
-      });
-
-      // Get Secondary Index fields from settings
-      const secondaryIndexFieldsFromSettings = new Set();
-      currentSchema.forEach((field) => {
-        if (field.index_type?.includes("secondaryIndexKey")) {
-          secondaryIndexFieldsFromSettings.add(field.name);
-        }
-      });
-
-      // Get default FTS keys from BE config (only if they exist in schema)
-      // iterate over all the be default fts keys and check if they pressent in currentschemafieldnames if they are there
-      // we should add them to ftsfields from settings
-      const defaultFtsKeys = store.state.zoConfig.default_fts_keys || [];
-      defaultFtsKeys.forEach((key) => {
-        if (currentSchemaFieldNames.has(key)) {
-          ftsFieldsFromSettings.add(key);
-        }
-      });
-
-      // Get default Secondary Index keys from BE config (only if they exist in schema)
-      // iterate over all the be default secondary keys and check if they pressent in currentschemafieldnames if they are there
-      // we should add them to secondarykeys from settings
-      const defaultSecondaryIndexKeys =
-        store.state.zoConfig.default_secondary_index_fields || [];
-      defaultSecondaryIndexKeys.forEach((key) => {
-        if (currentSchemaFieldNames.has(key)) {
-          secondaryIndexFieldsFromSettings.add(key);
-        }
-      });
-
-      // Check which FTS fields are missing from selected fields
-      ftsFieldsFromSettings.forEach((field) => {
-        if (!selectedFieldsSet.has(field)) {
-          missingFields.push({
-            name: field,
-            type: "Full Text Search",
-          });
-        }
-      });
-
-      // Check which Secondary Index fields are missing from selected fields
-      secondaryIndexFieldsFromSettings.forEach((field) => {
-        if (!selectedFieldsSet.has(field)) {
-          missingFields.push({
-            name: field,
-            type: "Secondary Index",
-          });
-        }
-      });
-
-      return missingFields;
-    };
-
-    // Function to handle Add fields click on performance fields dialog
-    const addPerformanceFields = () => {
-      confirmAddPerformanceFieldsDialog.value = false;
-
-      // Add missing performance fields to the selected fields
-      const combinedFieldsSet = new Set([
-        ...pendingSelectedFields.value,
-        ...missingPerformanceFields.value.map((f) => f.name),
-      ]);
-
-      // Proceed with adding fields
-      proceedWithAddingFields(combinedFieldsSet);
-
-      // Clear temporary variables
-      missingPerformanceFields.value = [];
-      pendingSelectedFields.value = [];
-    };
-
-    // Function to handle Cancel/No click on performance fields dialog
-    const skipPerformanceFields = () => {
-      confirmAddPerformanceFieldsDialog.value = false;
-
-      // Proceed without adding missing performance fields
-      proceedWithAddingFields(new Set(pendingSelectedFields.value));
-
-      // Clear temporary variables
-      missingPerformanceFields.value = [];
-      pendingSelectedFields.value = [];
-    };
-
-    // Function to remove a specific field from the missing fields list
-    const removeFieldFromList = (
-      type: "fts" | "secondaryIndex",
-      fieldName: string,
-    ) => {
-      // Remove from missingPerformanceFields
-      missingPerformanceFields.value = missingPerformanceFields.value.filter(
-        (field) => field.name !== fieldName,
-      );
-
-      // If no more fields left, close the dialog and proceed
-      if (missingPerformanceFields.value.length === 0) {
-        confirmAddPerformanceFieldsDialog.value = false;
-        proceedWithAddingFields(new Set(pendingSelectedFields.value));
-        pendingSelectedFields.value = [];
-      }
-    };
-
-    // Function to proceed with adding fields
-    const proceedWithAddingFields = (selectedFieldsSet) => {
-      markFormDirty();
-
-      if (selectedFieldsSet.has(allFieldsName.value))
-        selectedFieldsSet.delete(allFieldsName.value);
-
-      if (selectedFieldsSet.has(store.state.zoConfig.timestamp_column))
-        selectedFieldsSet.delete(store.state.zoConfig.timestamp_column);
-
-      indexData.value.defined_schema_fields = [
-        ...new Set([
-          ...indexData.value.defined_schema_fields,
-          ...selectedFieldsSet,
-        ]),
-      ];
-
-      selectedFields.value = [];
-    };
-
-    const updateDefinedSchemaFields = () => {
-      const selectedFieldsSet = new Set(
-        selectedFields.value.map((field) => field.name),
-      );
-
-      //  Check max limit when adding fields
-      //  We need to check store.state.zoConfig.user_defined_schema_max_fields this config value before adding to UDS
-      //  Because it should not exceed this value
-      if (activeTab.value !== "schemaFields") {
-        const maxFieldsLength =
-          store.state.zoConfig?.user_defined_schema_max_fields;
-        const currentDefinedSchemaLength =
-          indexData.value.defined_schema_fields.length;
-        const newSchemaFieldLength =
-          currentDefinedSchemaLength + selectedFieldsSet.size;
-
-        if (maxFieldsLength && newSchemaFieldLength > maxFieldsLength) {
-          toast({
-            variant: "error",
-            message: `Cannot add fields. Maximum allowed fields in User Defined Schema is ${maxFieldsLength}. Current: ${currentDefinedSchemaLength}, Attempting to add: ${selectedFieldsSet.size}`,
-          });
-          selectedFields.value = [];
-          return;
-        }
-
-        // Check if UDS is being enabled for the first time (no existing defined_schema_fields)
-        // and if there are any missing FTS or Secondary Index fields
-        if (currentDefinedSchemaLength === 0) {
-          const missing = getMissingPerformanceFields(selectedFieldsSet);
-
-          if (missing.length > 0) {
-            // Store the pending fields and missing fields
-            pendingSelectedFields.value = Array.from(selectedFieldsSet);
-            missingPerformanceFields.value = missing;
-
-            // Show the confirmation dialog
-            confirmAddPerformanceFieldsDialog.value = true;
-            return; // Don't proceed yet, wait for user response
-          }
-        }
-      }
-
-      markFormDirty();
-
-      if (selectedFieldsSet.has(allFieldsName.value))
-        selectedFieldsSet.delete(allFieldsName.value);
-
-      if (selectedFieldsSet.has(store.state.zoConfig.timestamp_column))
-        selectedFieldsSet.delete(store.state.zoConfig.timestamp_column);
-
-      if (activeTab.value === "schemaFields") {
-        indexData.value.defined_schema_fields =
-          indexData.value.defined_schema_fields.filter(
-            (field) => !selectedFieldsSet.has(field),
-          );
-
-        if (!indexData.value.defined_schema_fields.length) {
-          activeTab.value = "allFields";
-        }
-      } else {
-        indexData.value.defined_schema_fields = [
-          ...new Set([
-            ...indexData.value.defined_schema_fields,
-            ...selectedFieldsSet,
-          ]),
-        ];
-      }
-
-      selectedFields.value = [];
-    };
-
-    const updateStreamResponse = (streamResponse) => {
-      if (streamResponse.settings.hasOwnProperty("defined_schema_fields")) {
-        const userDefinedSchema = streamResponse.settings.defined_schema_fields;
-
-        // Map through the schema and add `isUserDefined` field
-        const updatedSchema = streamResponse.schema.map((field) => ({
-          ...field,
-          isUserDefined: userDefinedSchema.includes(field.name), // Mark true if in userDefinedSchema
-        }));
-
-        // Find fields in userDefinedSchema that are not in the schema
-        const additionalFields = userDefinedSchema
-          .filter(
-            (name) =>
-              !streamResponse.schema.some((field) => field.name === name),
-          )
-          .map((name) => ({
-            name,
-            isUserDefined: true,
-            // Optionally, add default values for other properties (e.g., type, index_type, etc.)
-          }));
-        // Combine the updated schema with additional fields
-        streamResponse.schema = [...updatedSchema, ...additionalFields];
-      }
-      updateResultTotal(streamResponse);
-      return streamResponse;
     };
 
     const closeDialog = () => {
@@ -2228,14 +1765,6 @@ export default defineComponent({
           },
         ],
       });
-    };
-    const updateResultTotal = (streamResponse) => {
-      if (activeTab.value === "schemaFields") {
-        resultTotal.value =
-          streamResponse.settings?.defined_schema_fields?.length;
-      } else {
-        resultTotal.value = streamResponse.schema?.length;
-      }
     };
     // Date only: this column shows a retention window, not an instant.
     const convertUnixToDateFormat = (unixMicroseconds: any) =>
@@ -2408,28 +1937,19 @@ export default defineComponent({
     };
 
     //this is used to compute the index_type value based on the env
-    //so instead of directly showing the value of the index_type we will add the values of fulltextsearchkey and secondaryindexkey if it is set by the env
-    //and if it is not set by the env then we will not add the values of fulltextsearchkey and secondaryindexkey becuase those will be already there and we don't want to show them twice
+    //so instead of directly showing the value of the index_type we will add the value of fulltextsearchkey if it is set by the env
+    //and if it is not set by the env then we will not add the value of fulltextsearchkey becuase it will be already there and we don't want to show it twice
     const computedIndexType = (props) => {
       return computed(() => {
         let keysToBeDisplayed = props.row.index_type || [];
         // return the actual index_type value from the row
-        //merge env fts and secondary index keys
-        //check for the props.row.name is in the env fts and secondary index keys
+        //merge env fts keys
+        //check for the props.row.name is in the env fts keys
         if (
           store.state.zoConfig.default_fts_keys.indexOf(props.row.name) > -1
         ) {
           keysToBeDisplayed = [
             ...new Set([...keysToBeDisplayed, "fullTextSearchKey"]),
-          ];
-        }
-        if (
-          store.state.zoConfig.default_secondary_index_fields.indexOf(
-            props.row.name,
-          ) > -1
-        ) {
-          keysToBeDisplayed = [
-            ...new Set([...keysToBeDisplayed, "secondaryIndexKey"]),
           ];
         }
         return keysToBeDisplayed || [];
@@ -2443,13 +1963,6 @@ export default defineComponent({
       if (
         store.state.zoConfig.default_fts_keys.indexOf(name) > -1 &&
         option.value == "fullTextSearchKey"
-      ) {
-        return true;
-      }
-      if (
-        store.state.zoConfig.default_secondary_index_fields.indexOf(name) >
-          -1 &&
-        option.value == "secondaryIndexKey"
       ) {
         return true;
       }
@@ -2491,14 +2004,6 @@ export default defineComponent({
         value.includes("fullTextSearchKey")
       ) {
         filteredValue = value.filter((item) => item !== "fullTextSearchKey");
-      }
-      if (
-        store.state.zoConfig.default_secondary_index_fields.indexOf(
-          props.row.name,
-        ) > -1 &&
-        value.includes("secondaryIndexKey")
-      ) {
-        filteredValue = value.filter((item) => item !== "secondaryIndexKey");
       }
       return filteredValue;
     };
@@ -2549,14 +2054,6 @@ export default defineComponent({
       formatSizeFromMB,
       confirmQueryModeChangeDialog,
       confirmDeleteDatesDialog,
-      confirmAddPerformanceFieldsDialog,
-      missingPerformanceFields,
-      pendingSelectedFields,
-      getMissingPerformanceFields,
-      addPerformanceFields,
-      skipPerformanceFields,
-      removeFieldFromList,
-      proceedWithAddingFields,
       deleteFields,
       markFormDirty,
       formDirtyFlag,
@@ -2571,16 +2068,7 @@ export default defineComponent({
       newSchemaFieldsForm,
       onAddFieldsKeyup,
       scrollToAddFields,
-      tabs,
-      activeTab,
-      updateActiveTab,
-      hasUserDefinedSchema,
-      hasUDSFieldInSelection,
-      isSchemaUDSEnabled,
-      updateDefinedSchemaFields,
       selectedFields,
-      allFieldsName,
-      updateStreamResponse,
       isDialogOpen,
       closeDialog,
       resultTotal,
@@ -2624,7 +2112,6 @@ export default defineComponent({
       setSchema,
       formatDate,
       convertUnixToDateFormat,
-      computedSchemaFieldsName,
       groupPatternAssociationsByField,
       ungroupPatternAssociations,
       computedIndexType,
@@ -2694,8 +2181,9 @@ export default defineComponent({
   padding-left: 0.5rem !important;
 }
 
-.indexDetailsContainer :deep(th:nth-child(5)),
-.indexDetailsContainer :deep(td:nth-child(5)) {
+/* Index-type column (selection checkbox, name, type, index_type, …) */
+.indexDetailsContainer :deep(th:nth-child(4)),
+.indexDetailsContainer :deep(td:nth-child(4)) {
   min-width: 15rem;
   width: 15rem;
   max-width: 15rem;

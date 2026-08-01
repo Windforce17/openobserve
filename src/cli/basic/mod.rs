@@ -19,6 +19,4 @@ mod gc;
 mod http;
 mod load;
 mod query_optimiser;
-mod stream;
 mod test;
-mod ttv;

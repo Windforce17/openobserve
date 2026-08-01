@@ -303,23 +303,6 @@ SELECT min_ts, max_ts, records, original_size, compressed_size, index_size, bloo
         Ok(!ret.unwrap().is_empty())
     }
 
-    async fn update_flattened(&self, file: &str, flattened: bool) -> Result<()> {
-        let client = CLIENT_RW.clone();
-        let client = client.lock().await;
-        let (stream_key, date_key, file_name) =
-            parse_file_key_columns(file).map_err(|e| Error::Message(e.to_string()))?;
-        sqlx::query(
-            r#"UPDATE file_list SET flattened = $1 WHERE stream = $2 AND date = $3 AND file = $4;"#,
-        )
-        .bind(flattened)
-        .bind(stream_key)
-        .bind(date_key)
-        .bind(file_name)
-        .execute(&*client)
-        .await?;
-        Ok(())
-    }
-
     async fn update_compressed_size(&self, file: &str, size: i64) -> Result<()> {
         let client = CLIENT_RW.clone();
         let client = client.lock().await;
@@ -397,40 +380,25 @@ SELECT min_ts, max_ts, records, original_size, compressed_size, index_size, bloo
         stream_name: &str,
         _time_level: PartitionTimeLevel,
         time_range: (i64, i64),
-        flattened: Option<bool>,
     ) -> Result<Vec<FileKey>> {
         let stream_key = format!("{org_id}/{stream_type}/{stream_name}");
 
         let pool = CLIENT_RO.clone();
-        let ret = if let Some(flattened) = flattened {
-            sqlx::query_as::<_, super::FileRecord>(
-                r#"
-SELECT id, account, stream, date, file, deleted, min_ts, max_ts, records, original_size, compressed_size, index_size, bloom_ver, flattened
-    FROM file_list
-    WHERE stream = $1 AND flattened = $2 LIMIT 1000;
-                "#,
-            )
-            .bind(stream_key)
-            .bind(flattened)
-            .fetch_all(&pool)
-            .await
-        } else {
-            let (time_start, time_end) = time_range;
-            let max_ts_upper_bound = super::calculate_max_ts_upper_bound(time_end, stream_type);
-            sqlx::query_as::<_, super::FileRecord>(
-                r#"
+        let (time_start, time_end) = time_range;
+        let max_ts_upper_bound = super::calculate_max_ts_upper_bound(time_end, stream_type);
+        let ret = sqlx::query_as::<_, super::FileRecord>(
+            r#"
 SELECT id, account, stream, date, file, min_ts, max_ts, records, original_size, compressed_size, index_size, bloom_ver, flattened
     FROM file_list
     WHERE stream = $1 AND max_ts >= $2 AND max_ts <= $3 AND min_ts <= $4;
                 "#,
-            )
-            .bind(stream_key)
-            .bind(time_start)
-            .bind(max_ts_upper_bound)
-            .bind(time_end)
-            .fetch_all(&pool)
-            .await
-        };
+        )
+        .bind(stream_key)
+        .bind(time_start)
+        .bind(max_ts_upper_bound)
+        .bind(time_end)
+        .fetch_all(&pool)
+        .await;
         Ok(ret?.iter().map(|r| r.into()).collect())
     }
 
@@ -440,6 +408,7 @@ SELECT id, account, stream, date, file, min_ts, max_ts, records, original_size, 
         stream_type: StreamType,
         stream_name: &str,
         date_range: (String, String),
+        include_oversize: bool,
     ) -> Result<Vec<FileKey>> {
         let (date_start, date_end) = date_range;
         if date_start.is_empty() && date_end.is_empty() {
@@ -448,7 +417,11 @@ SELECT id, account, stream, date, file, min_ts, max_ts, records, original_size, 
         let stream_key = format!("{org_id}/{stream_type}/{stream_name}");
 
         let cfg = get_config();
-        let max_size = cfg.compact.max_file_size as i64 * 95 / 100;
+        let max_size = if include_oversize {
+            i64::MAX
+        } else {
+            cfg.compact.max_file_size as i64 * 95 / 100
+        };
         let pool = CLIENT_RO.clone();
         let ret = sqlx::query_as::<_, super::FileRecord>(
                 r#"
@@ -521,7 +494,7 @@ SELECT id, account, stream, date, file, min_ts, max_ts, records, original_size, 
 
         let pool = CLIENT_RO.clone();
         let sql = r#"
-SELECT id, account, stream, date, file, records, index_size FROM file_list WHERE stream = $1 AND date = $2 AND index_size > 0 AND bloom_ver = 0;
+SELECT id, account, stream, date, file, records, index_size, compressed_size FROM file_list WHERE stream = $1 AND date = $2 AND index_size > 0 AND bloom_ver = 0;
                 "#;
         let ret = sqlx::query_as::<_, super::FileRecord>(sql)
             .bind(stream_key)
@@ -529,6 +502,23 @@ SELECT id, account, stream, date, file, records, index_size FROM file_list WHERE
             .fetch_all(&pool)
             .await;
         Ok(ret?.iter().map(|r| r.into()).collect())
+    }
+
+    async fn query_bloom_pending_buckets(
+        &self,
+        before_date: &str,
+        limit: i64,
+    ) -> Result<Vec<(String, String)>> {
+        let pool = CLIENT_RO.clone();
+        let sql = r#"
+SELECT stream, date FROM file_list WHERE index_size > 0 AND bloom_ver = 0 AND date < $1 GROUP BY stream, date ORDER BY date DESC LIMIT $2;
+                "#;
+        let ret: Vec<(String, String)> = sqlx::query_as::<_, (String, String)>(sql)
+            .bind(before_date)
+            .bind(limit)
+            .fetch_all(&pool)
+            .await?;
+        Ok(ret)
     }
 
     async fn query_by_ids(
@@ -1018,13 +1008,20 @@ DO UPDATE SET
         let client = CLIENT_RW.clone();
         let client = client.lock().await;
         let mut tx = client.begin().await?;
+        // A DONE row for this (stream, hour) must not block the insert —
+        // see the postgres impl: an incremental round completes WITHOUT
+        // sealing the hour, so a closed hour needs a fresh run. Pending and
+        // running rows are left alone.
         match sqlx::query(
-            "INSERT INTO file_list_jobs (org, stream, offsets, status, node, started_at, updated_at) VALUES ($1, $2, $3, $4, '', 0, 0);",
+            "INSERT INTO file_list_jobs (org, stream, offsets, status, node, started_at, updated_at) VALUES ($1, $2, $3, $4, '', 0, 0) \
+             ON CONFLICT (stream, offsets) DO UPDATE SET status = $4, node = '', started_at = 0 \
+             WHERE file_list_jobs.status = $5;",
         )
         .bind(org_id)
         .bind(&stream_key)
         .bind(offset)
         .bind(super::FileListJobStatus::Pending)
+        .bind(super::FileListJobStatus::Done)
         .execute(&mut *tx)
         .await
         {
@@ -1089,17 +1086,18 @@ DO UPDATE SET
         let client = client.lock().await;
         let mut tx = client.begin().await?;
 
-        // get pending jobs group by stream and order by num desc
+        // Claim the OLDEST pending jobs regardless of stream. The old
+        // normal-mode claim (GROUP BY stream, max(id), ORDER BY count) took
+        // ONE job per stream per pull and NEWEST first — a single hot stream
+        // (traces) fed the fleet one hour-job per pull cycle while a backlog's
+        // old hours starved behind fresh ones. Hour-jobs of one stream are
+        // independent (distinct hour partitions; single-node already runs
+        // several concurrently), so cross-node fan-out is safe; the advisory
+        // lock still serializes claiming itself.
         let sql = if fast_mode {
             r#"SELECT stream, id, 0 as num FROM file_list_jobs WHERE status = $1 ORDER BY offsets DESC LIMIT $2;"#
         } else {
-            r#"
-SELECT stream, max(id) as id, COUNT(*) AS num
-    FROM file_list_jobs
-    WHERE status = $1
-    GROUP BY stream
-    ORDER BY num DESC
-    LIMIT $2;"#
+            r#"SELECT stream, id, 0 as num FROM file_list_jobs WHERE status = $1 ORDER BY id ASC LIMIT $2;"#
         };
         let ret = match sqlx::query_as::<_, super::MergeJobPendingRecord>(sql)
             .bind(super::FileListJobStatus::Pending)
@@ -1241,6 +1239,21 @@ SELECT stream, max(id) as id, COUNT(*) AS num
             .execute(&*client)
             .await?;
         Ok(())
+    }
+
+    async fn confirm_job_ownership(&self, id: i64, node: &str) -> Result<bool> {
+        let client = CLIENT_RW.clone();
+        let client = client.lock().await;
+        let ret = sqlx::query(
+            r#"UPDATE file_list_jobs SET updated_at = $1 WHERE id = $2 AND node = $3 AND status = $4;"#,
+        )
+        .bind(now_micros())
+        .bind(id)
+        .bind(node)
+        .bind(super::FileListJobStatus::Running)
+        .execute(&*client)
+        .await?;
+        Ok(ret.rows_affected() > 0)
     }
 
     async fn check_running_jobs(&self, before_date: i64) -> Result<()> {
@@ -1527,15 +1540,11 @@ WHERE org = $1 AND account = $2;"#;
         // the backing S3 objects. A bare DELETE would orphan those files in object
         // store. (Normal per-stream deletion already routes files here; this is the
         // catch-all for rows whose stream schema is already gone.)
-        sqlx::query(
-            r#"INSERT INTO file_list_deleted (account, org, stream, date, file, index_file, flattened, created_at)
-               SELECT account, org, stream, date, file, index_file, flattened, $2
-               FROM file_list WHERE org = $1;"#,
-        )
-        .bind(org_id)
-        .bind(created_at)
-        .execute(&mut *tx)
-        .await?;
+        sqlx::query(super::MOVE_FILE_LIST_TO_DELETED_SQL)
+            .bind(org_id)
+            .bind(created_at)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("DELETE FROM file_list WHERE org = $1;")
             .bind(org_id)
             .execute(&mut *tx)
@@ -1565,15 +1574,13 @@ impl SqliteFileList {
         file: &str,
         meta: &FileMeta,
     ) -> Result<i64> {
+        super::validate_file_meta_for_add(file, meta)?;
         let now_ts = now_micros();
         let (stream_key, date_key, file_name) =
             parse_file_key_columns(file).map_err(|e| Error::Message(e.to_string()))?;
         let org_id = stream_key[..stream_key.find('/').unwrap()].to_string();
         let client = CLIENT_RW.clone();
         let client = client.lock().await;
-        if meta.min_ts == 0 || meta.max_ts == 0 {
-            log::warn!("[SQLITE] min_ts or max_ts is 0 for file: {file}");
-        }
         match  sqlx::query(
             format!(r#"
 INSERT INTO {table} (id, account, org, stream, date, file, deleted, min_ts, max_ts, records, original_size, compressed_size, index_size, bloom_ver, flattened, updated_at)
@@ -1613,55 +1620,19 @@ INSERT INTO {table} (id, account, org, stream, date, file, deleted, min_ts, max_
             return Ok(());
         }
 
+        // pre-SQL gate: see `prepare_batch_add` — one bad add fails the
+        // whole batch before the writer lock or any statement
+        let add_rows = super::prepare_batch_add(files)?;
+
         let client = CLIENT_RW.clone();
         let client = client.lock().await;
         let mut tx = client.begin().await?;
 
-        let add_items = files.iter().filter(|f| !f.deleted).collect::<Vec<_>>();
-        if !add_items.is_empty() {
-            let chunks = add_items.chunks(100);
-            for files in chunks {
-                let now_ts = now_micros();
-                let mut query_builder: QueryBuilder<Sqlite> = QueryBuilder::new(
-                format!("INSERT INTO {table} (id, account, org, stream, date, file, deleted, min_ts, max_ts, records, original_size, compressed_size, index_size, bloom_ver, flattened, updated_at)").as_str(),
-                );
-                query_builder.push_values(files, |mut b, item| {
-                    let id = if item.id > 0 { Some(item.id) } else { None };
-                    let Ok((stream_key, date_key, file_name)) = parse_file_key_columns(&item.key)
-                    else {
-                        log::error!("[SQLITE] parse file key failed for file: {}", item.key);
-                        return;
-                    };
-                    let org_id = stream_key[..stream_key.find('/').unwrap()].to_string();
-                    if item.meta.min_ts == 0 || item.meta.max_ts == 0 {
-                        log::warn!("[SQLITE] min_ts or max_ts is 0 for file: {}", item.key);
-                        return;
-                    }
-                    b.push_bind(id)
-                        .push_bind(&item.account)
-                        .push_bind(org_id)
-                        .push_bind(stream_key)
-                        .push_bind(date_key)
-                        .push_bind(file_name)
-                        .push_bind(false)
-                        .push_bind(item.meta.min_ts)
-                        .push_bind(item.meta.max_ts)
-                        .push_bind(item.meta.records)
-                        .push_bind(item.meta.original_size)
-                        .push_bind(item.meta.compressed_size)
-                        .push_bind(item.meta.index_size)
-                        .push_bind(item.meta.bloom_ver)
-                        .push_bind(item.meta.flattened)
-                        .push_bind(now_ts);
-                });
-                query_builder.push(" ON CONFLICT(id) DO NOTHING");
-                if let Err(e) = query_builder.build().execute(&mut *tx).await {
-                    if let Err(e) = tx.rollback().await {
-                        log::error!("[SQLITE] rollback {table} batch process for add error: {e}");
-                    }
-                    return Err(e.into());
-                }
+        if let Err(e) = batch_add_with_tx(&mut tx, table, &add_rows).await {
+            if let Err(e) = tx.rollback().await {
+                log::error!("[SQLITE] rollback {table} batch process for add error: {e}");
             }
+            return Err(e);
         }
 
         // sort by file id and key to reduce locked table range
@@ -1730,6 +1701,51 @@ INSERT INTO {table} (id, account, org, stream, date, file, deleted, min_ts, max_
 
         Ok(())
     }
+}
+
+/// Add-side of the batch transaction, shared by `inner_batch_process` and
+/// `wal_segments::mark_built_with_files` so the INSERT stays single-source:
+/// chunked VALUES insert of pre-validated rows (`prepare_batch_add`) inside
+/// the caller's open transaction. Takes NO lock — the caller must already
+/// hold `CLIENT_RW` (the single writer) — and owns commit/rollback.
+/// `ON CONFLICT(id)` only tolerates id collisions; a duplicate
+/// `(stream, date, file)` errors and fails the caller's whole transaction.
+pub(crate) async fn batch_add_with_tx(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    table: &str,
+    rows: &[super::BatchAddRow<'_>],
+) -> Result<()> {
+    for chunk in rows.chunks(100) {
+        let now_ts = now_micros();
+        let mut query_builder: QueryBuilder<Sqlite> = QueryBuilder::new(
+            format!("INSERT INTO {table} (id, account, org, stream, date, file, deleted, min_ts, max_ts, records, original_size, compressed_size, index_size, bloom_ver, flattened, updated_at)").as_str(),
+        );
+        query_builder.push_values(
+            chunk,
+            |mut b, (item, org_id, stream_key, date_key, file_name)| {
+                let id = if item.id > 0 { Some(item.id) } else { None };
+                b.push_bind(id)
+                    .push_bind(&item.account)
+                    .push_bind(org_id)
+                    .push_bind(stream_key)
+                    .push_bind(date_key)
+                    .push_bind(file_name)
+                    .push_bind(false)
+                    .push_bind(item.meta.min_ts)
+                    .push_bind(item.meta.max_ts)
+                    .push_bind(item.meta.records)
+                    .push_bind(item.meta.original_size)
+                    .push_bind(item.meta.compressed_size)
+                    .push_bind(item.meta.index_size)
+                    .push_bind(item.meta.bloom_ver)
+                    .push_bind(item.meta.flattened)
+                    .push_bind(now_ts);
+            },
+        );
+        query_builder.push(" ON CONFLICT(id) DO NOTHING");
+        query_builder.build().execute(&mut **tx).await?;
+    }
+    Ok(())
 }
 
 pub async fn create_table() -> Result<()> {
@@ -1928,7 +1944,7 @@ CREATE TABLE IF NOT EXISTS file_list_dump_stats
     add_column(&client, "file_list", column, data_type).await?;
     add_column(&client, "file_list_history", column, data_type).await?;
 
-    // create column bloom_ver for bloom filter pruning above tantivy
+    // create column bloom_ver for bloom filter pruning above the inverted index
     let column = "bloom_ver";
     let data_type = "BIGINT default 0 not null";
     add_column(&client, "file_list", column, data_type).await?;
@@ -2123,13 +2139,16 @@ mod tests {
             id: 0,
             selection: None,
             row_group_size: None,
+            selection_exact: false,
         }
     }
 
     #[tokio::test]
     async fn test_sqlite_file_list_new() {
         let sqlite_file_list = SqliteFileList::new();
-        assert!(!std::ptr::eq(&sqlite_file_list, &SqliteFileList::new()));
+        // zero-sized structs share addresses in release builds — pointer
+        // identity is meaningless; constructing it at all is the test
+        let _ = &sqlite_file_list;
     }
 
     #[tokio::test]
@@ -2242,6 +2261,45 @@ mod tests {
         let exists_after = sqlite_list.contains(file_key).await;
         assert!(exists_after.is_ok());
         assert!(!exists_after.unwrap());
+    }
+
+    /// `add_job` must resurrect a DONE row for the same (stream, hour) and
+    /// leave PENDING/RUNNING rows untouched. Regression: an hour whose job
+    /// ran while the hour was still OPEN completes without sealing it, and
+    /// `ON CONFLICT DO NOTHING` then stranded the closed hour at thousands
+    /// of files until the row aged out (prod 2026-07-30).
+    #[tokio::test]
+    #[ignore = "Requires test SQLite database setup"]
+    async fn test_add_job_resurrects_done_rows_sqlite() {
+        let list = SqliteFileList::new();
+        let (org, st, stream, offset) = (
+            "test_org",
+            StreamType::Logs,
+            "resurrect_test",
+            1785384000000000i64,
+        );
+
+        let first = list.add_job(org, st, stream, offset).await.unwrap();
+        assert!(first > 0, "first add_job must create the row");
+
+        // a pending row is left alone (same id, still claimable once)
+        let again = list.add_job(org, st, stream, offset).await.unwrap();
+        assert_eq!(
+            again, first,
+            "add_job must not duplicate the (stream, hour) row"
+        );
+
+        // complete it, as an incremental round does WITHOUT sealing the hour
+        list.set_job_done(&[first]).await.unwrap();
+
+        // the closed hour is re-queued: the same row returns to Pending
+        let resurrected = list.add_job(org, st, stream, offset).await.unwrap();
+        assert_eq!(resurrected, first, "resurrection reuses the row");
+        let claimed = list.get_pending_jobs("test_node", 10, false).await.unwrap();
+        assert!(
+            claimed.iter().any(|j| j.id == first),
+            "a resurrected job must be claimable again"
+        );
     }
 
     #[tokio::test]
@@ -2467,7 +2525,6 @@ mod tests {
                 "sqlite_query_stream",
                 PartitionTimeLevel::Daily,
                 time_range,
-                None,
             )
             .await;
 
@@ -2664,5 +2721,344 @@ mod tests {
         // Conversion to FileMeta must carry the value through.
         let meta = FileMeta::from(&rec);
         assert_eq!(meta.bloom_ver, bv);
+    }
+
+    /// The bloom pending queue matches `bloom_ver = 0` STRICTLY: the
+    /// UNBUILDABLE stamp (-2) — like NO_BLOOM (-1) — takes a poison file out
+    /// of the queue after one attempt, while the pruner (`bloom_ver <= 0`)
+    /// keeps the file un-pruned so queries stay correct.
+    #[tokio::test]
+    async fn test_bloom_pending_queue_excludes_unbuildable_stamp() {
+        let pool = fresh_in_memory_pool().await;
+        create_legacy_file_list_table(&pool).await;
+        crate::db::sqlite::add_column(&pool, "file_list", "bloom_ver", "BIGINT default 0 not null")
+            .await
+            .unwrap();
+
+        for (file, bloom_ver) in [
+            ("pending.parquet", 0i64),
+            ("no_bloom.parquet", -1),
+            ("unbuildable.parquet", -2),
+            ("built.parquet", 1_715_000_000_000_000),
+        ] {
+            sqlx::query(
+                r#"INSERT INTO file_list
+                    (account, org, stream, date, file, deleted, flattened,
+                     min_ts, max_ts, records, original_size, compressed_size,
+                     index_size, bloom_ver, updated_at)
+                   VALUES ('a', 'o', 'o/logs/s', '2026/08/01/00', ?, false, false,
+                           1, 2, 3, 4, 5, 6, ?, 7);"#,
+            )
+            .bind(file)
+            .bind(bloom_ver)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        // the exact predicate query_for_bloom / query_bloom_pending_buckets use
+        let pending: Vec<(String,)> = sqlx::query_as(
+            r#"SELECT file FROM file_list
+               WHERE stream = 'o/logs/s' AND date = '2026/08/01/00'
+                 AND index_size > 0 AND bloom_ver = 0;"#,
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            pending,
+            vec![("pending.parquet".to_string(),)],
+            "only bloom_ver = 0 stays in the queue; -2 is retried never, not forever"
+        );
+
+        // and the pruner-side predicate still keeps the poison file visible
+        let unpruned: Vec<(String,)> = sqlx::query_as(
+            r#"SELECT file FROM file_list
+               WHERE stream = 'o/logs/s' AND bloom_ver <= 0 ORDER BY file;"#,
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(unpruned.len(), 3, "0, -1 and -2 all stay un-pruned");
+    }
+
+    // ── delete_by_org row move ───────────────────────────────────────────────
+    //
+    // `file_list` has no `index_file` column; the move statement writes a
+    // constant false (no file has a sibling index object). Regression test:
+    // an earlier revision selected a non-existent column and blew up at
+    // runtime, breaking org cleanup for every file type — keep the statement
+    // pinned to the real schema.
+
+    #[tokio::test]
+    async fn test_move_file_list_to_deleted_writes_index_file_false() {
+        let pool = fresh_in_memory_pool().await;
+        // current-shape tables (subset of create_table used by the statement)
+        sqlx::query(
+            r#"
+            CREATE TABLE file_list (
+                id              INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                account         VARCHAR DEFAULT '' NOT NULL,
+                org             VARCHAR NOT NULL,
+                stream          VARCHAR NOT NULL,
+                date            VARCHAR NOT NULL,
+                file            VARCHAR NOT NULL,
+                deleted         BOOLEAN DEFAULT false NOT NULL,
+                flattened       BOOLEAN DEFAULT false NOT NULL,
+                min_ts          BIGINT NOT NULL,
+                max_ts          BIGINT NOT NULL,
+                records         BIGINT NOT NULL,
+                original_size   BIGINT NOT NULL,
+                compressed_size BIGINT NOT NULL,
+                index_size      BIGINT DEFAULT 0 NOT NULL,
+                bloom_ver       BIGINT DEFAULT 0 NOT NULL,
+                updated_at      BIGINT DEFAULT 0 NOT NULL
+            );
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            CREATE TABLE file_list_deleted (
+                id         INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                account    VARCHAR NOT NULL,
+                org        VARCHAR NOT NULL,
+                stream     VARCHAR NOT NULL,
+                date       VARCHAR NOT NULL,
+                file       VARCHAR NOT NULL,
+                index_file BOOLEAN DEFAULT false NOT NULL,
+                flattened  BOOLEAN DEFAULT false NOT NULL,
+                created_at BIGINT NOT NULL
+            );
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // a core .vix (index embedded, index_size > 0) and a parquet
+        for (file, index_size) in [("1.vix", 100_i64), ("2.parquet", 0)] {
+            sqlx::query(
+                r#"INSERT INTO file_list (account, org, stream, date, file, min_ts, max_ts, records, original_size, compressed_size, index_size)
+                   VALUES ('acc', 'org1', 'org1/logs/s1', '2024/02/16/16', $1, 1, 2, 10, 1000, 100, $2);"#,
+            )
+            .bind(file)
+            .bind(index_size)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        sqlx::query(super::super::MOVE_FILE_LIST_TO_DELETED_SQL)
+            .bind("org1")
+            .bind(123_456_789_i64)
+            .execute(&pool)
+            .await
+            .expect("move statement must be valid against the file_list schema");
+
+        let rows: Vec<(String, bool, i64)> = sqlx::query_as(
+            "SELECT file, index_file, created_at FROM file_list_deleted ORDER BY file;",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("1.vix".to_string(), false, 123_456_789),
+                ("2.parquet".to_string(), false, 123_456_789),
+            ],
+            "index_file is a constant false for every file"
+        );
+    }
+
+    // ── confirm_job_ownership: the merge-commit fence ────────────────────────
+    //
+    // Runs against the process-global sqlite pools (same setup as the
+    // `infra::wal_segments` tests): serialize on a module lock, create the
+    // real tables once, and namespace rows by a per-run unique stream so
+    // other modules sharing the sqlite file are never touched.
+
+    static JOBS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    async fn jobs_setup() -> tokio::sync::MutexGuard<'static, ()> {
+        let guard = JOBS_TEST_LOCK.lock().await;
+        std::fs::create_dir_all(&get_config().common.data_db_dir)
+            .expect("create data_db_dir for tests");
+        create_table().await.expect("create file_list tables");
+        // the unique (stream, offsets) index is what add_job's ON CONFLICT
+        // clause resolves against
+        create_table_index()
+            .await
+            .expect("create file_list indexes");
+        guard
+    }
+
+    async fn raw_job_row(id: i64) -> (i64, String, i64) {
+        let client = CLIENT_RW.clone();
+        let client = client.lock().await;
+        sqlx::query_as::<_, (i64, String, i64)>(
+            "SELECT status, node, updated_at FROM file_list_jobs WHERE id = $1;",
+        )
+        .bind(id)
+        .fetch_one(&*client)
+        .await
+        .unwrap_or_else(|e| panic!("raw job row {id} failed: {e}"))
+    }
+
+    async fn raw_set_job(id: i64, status: i64, node: &str, updated_at: i64) {
+        let client = CLIENT_RW.clone();
+        let client = client.lock().await;
+        sqlx::query(
+            "UPDATE file_list_jobs SET status = $1, node = $2, updated_at = $3 WHERE id = $4;",
+        )
+        .bind(status)
+        .bind(node)
+        .bind(updated_at)
+        .bind(id)
+        .execute(&*client)
+        .await
+        .unwrap_or_else(|e| panic!("raw set job {id} failed: {e}"));
+    }
+
+    /// The fence must hit EXACTLY the (id, node, Running) row: the owner's
+    /// conditional update refreshes `updated_at` and reports true; a stolen
+    /// lease (other node), a re-pended row, and a done row all report false
+    /// and leave `updated_at` untouched.
+    #[tokio::test]
+    async fn test_confirm_job_ownership_fences_on_node_and_status() {
+        let _guard = jobs_setup().await;
+        let list = SqliteFileList::new();
+        let stream = format!("fence_own_{}", now_micros());
+        let id = list
+            .add_job(
+                "fence_org",
+                StreamType::Logs,
+                &stream,
+                1_785_384_000_000_000,
+            )
+            .await
+            .unwrap();
+        assert!(id > 0);
+        const T0: i64 = 1_700_000_000_000_000;
+
+        // claimed by node-a (Running), heartbeat aged to T0
+        raw_set_job(id, 1, "fence-node-a", T0).await;
+        assert!(
+            list.confirm_job_ownership(id, "fence-node-a")
+                .await
+                .unwrap(),
+            "the running owner must pass the fence"
+        );
+        let (status, node, updated_at) = raw_job_row(id).await;
+        assert_eq!((status, node.as_str()), (1, "fence-node-a"));
+        assert!(updated_at > T0, "a passed fence must refresh updated_at");
+
+        // lease stolen: node-b owns the Running row now
+        raw_set_job(id, 1, "fence-node-b", T0).await;
+        assert!(
+            !list
+                .confirm_job_ownership(id, "fence-node-a")
+                .await
+                .unwrap(),
+            "a stolen lease must fail the fence"
+        );
+        let (_, _, updated_at) = raw_job_row(id).await;
+        assert_eq!(updated_at, T0, "a failed fence must not touch the row");
+
+        // re-pended (check_running_jobs timed it out), node still recorded
+        raw_set_job(id, 0, "fence-node-a", T0).await;
+        assert!(
+            !list
+                .confirm_job_ownership(id, "fence-node-a")
+                .await
+                .unwrap(),
+            "a re-pended job must fail the fence even for the old owner"
+        );
+
+        // done row: never confirmable
+        raw_set_job(id, 2, "fence-node-a", T0).await;
+        assert!(
+            !list
+                .confirm_job_ownership(id, "fence-node-a")
+                .await
+                .unwrap(),
+            "a done job must fail the fence"
+        );
+
+        // an id that does not exist is simply not owned
+        assert!(
+            !list
+                .confirm_job_ownership(i64::MAX - 1, "fence-node-a")
+                .await
+                .unwrap()
+        );
+
+        // cleanup: leave no stray pending/running rows behind
+        list.set_job_done(&[id]).await.unwrap();
+    }
+
+    /// End-to-end interplay with the lease machinery: a fresh fence keeps
+    /// working across heartbeats, and once `check_running_jobs` re-pends a
+    /// stale row the old owner can never fence again — even after another
+    /// node re-claims it.
+    #[tokio::test]
+    async fn test_confirm_job_ownership_after_timeout_and_reclaim() {
+        let _guard = jobs_setup().await;
+        let list = SqliteFileList::new();
+        let stream = format!("fence_reclaim_{}", now_micros());
+        let id = list
+            .add_job(
+                "fence_org",
+                StreamType::Logs,
+                &stream,
+                1_785_387_600_000_000,
+            )
+            .await
+            .unwrap();
+        const T0: i64 = 1_700_000_000_000_000;
+        raw_set_job(id, 1, "fence-node-a", T0).await;
+
+        // heartbeat then fence: both refresh, fence still true
+        list.update_running_jobs(&[id]).await.unwrap();
+        assert!(
+            list.confirm_job_ownership(id, "fence-node-a")
+                .await
+                .unwrap()
+        );
+
+        // age the row out and let the janitor re-pend it
+        raw_set_job(id, 1, "fence-node-a", T0).await;
+        list.check_running_jobs(T0 + 1).await.unwrap();
+        let (status, ..) = raw_job_row(id).await;
+        assert_eq!(status, 0, "stale running row must be re-pended");
+        assert!(
+            !list
+                .confirm_job_ownership(id, "fence-node-a")
+                .await
+                .unwrap(),
+            "the old owner must not fence a re-pended job"
+        );
+
+        // node-b re-claims (as get_pending_jobs would)
+        raw_set_job(id, 1, "fence-node-b", now_micros()).await;
+        assert!(
+            !list
+                .confirm_job_ownership(id, "fence-node-a")
+                .await
+                .unwrap(),
+            "the old owner must not fence a re-claimed job"
+        );
+        assert!(
+            list.confirm_job_ownership(id, "fence-node-b")
+                .await
+                .unwrap(),
+            "the new owner must pass the fence"
+        );
+
+        // cleanup: leave no stray pending/running rows behind
+        list.set_job_done(&[id]).await.unwrap();
     }
 }

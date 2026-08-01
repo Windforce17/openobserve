@@ -582,7 +582,6 @@ export class StreamsPage {
                 index_fields: [],
                 full_text_search_keys: [],
                 bloom_filter_fields: [],
-                defined_schema_fields: [],
                 data_retention: 14
             }
         };

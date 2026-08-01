@@ -17,7 +17,6 @@ enterprise = [
 ]
 cloud = ["enterprise", "openobserve-core/cloud"]
 vectorscan = ["openobserve-core/vectorscan"]
-vortex = ["openobserve-core/vortex"]
 
 [dependencies]
 openobserve-api-common.workspace = true

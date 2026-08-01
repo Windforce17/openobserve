@@ -211,9 +211,8 @@ async fn put_multipart(account: &str, file: &str, data: bytes::Bytes) -> Result<
     Ok(())
 }
 
-pub async fn put_with_compliance(account: &str, file: &str, data: bytes::Bytes) -> Result<()> {
-    let cfg = get_config();
-    let attrs = match cfg.s3.provider.as_str() {
+fn compliance_attributes() -> Attributes {
+    match get_config().s3.provider.as_str() {
         "aws" | "s3" => Attributes::from_iter([(
             Attribute::StorageClass,
             AttributeValue::from("STANDARD_IA".to_string()),
@@ -227,7 +226,72 @@ pub async fn put_with_compliance(account: &str, file: &str, data: bytes::Bytes) 
             AttributeValue::from("Cool".to_string()),
         )]),
         _ => Attributes::new(),
+    }
+}
+
+/// Stream a LOCAL file to object storage without materializing it in
+/// memory: bounded multipart (16 MiB chunks, at most 4 in flight). The
+/// compactor's spooled merge outputs (multi-GB `.vix` containers) upload
+/// through this — the whole-object [`put`] would hold the container in RAM.
+pub async fn put_file(account: &str, file: &str, local_path: &std::path::Path) -> Result<()> {
+    put_file_opts(account, file, local_path, PutMultipartOptions::default()).await
+}
+
+/// [`put_file`] with the compliance storage-class attributes.
+pub async fn put_file_with_compliance(
+    account: &str,
+    file: &str,
+    local_path: &std::path::Path,
+) -> Result<()> {
+    let opts = PutMultipartOptions {
+        attributes: compliance_attributes(),
+        ..Default::default()
     };
+    put_file_opts(account, file, local_path, opts).await
+}
+
+async fn put_file_opts(
+    account: &str,
+    file: &str,
+    local_path: &std::path::Path,
+    opts: PutMultipartOptions,
+) -> Result<()> {
+    use tokio::io::AsyncReadExt;
+    const CHUNK: usize = 16 * 1024 * 1024;
+    let path = Path::from(file);
+    let upload = MULTI_ACCOUNTS
+        .put_multipart_opts(account, &path, opts)
+        .await?;
+    let mut write = WriteMultipart::new_with_chunk_size(upload, CHUNK);
+    let mut reader =
+        tokio::fs::File::open(local_path)
+            .await
+            .map_err(|e| object_store::Error::Generic {
+                store: "put_file",
+                source: format!("open local file {local_path:?}: {e}").into(),
+            })?;
+    let mut buf = vec![0u8; CHUNK];
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .await
+            .map_err(|e| object_store::Error::Generic {
+                store: "put_file",
+                source: format!("read local file {local_path:?}: {e}").into(),
+            })?;
+        if n == 0 {
+            break;
+        }
+        write.wait_for_capacity(4).await?;
+        write.write(&buf[..n]);
+    }
+    write.finish().await?;
+    Ok(())
+}
+
+pub async fn put_with_compliance(account: &str, file: &str, data: bytes::Bytes) -> Result<()> {
+    let cfg = get_config();
+    let attrs = compliance_attributes();
     let multi_part_upload_size = cfg.s3.multi_part_upload_size;
     if multi_part_upload_size > 0 && multi_part_upload_size < bytes_size_in_mb(&data) as usize {
         let opts = PutMultipartOptions {

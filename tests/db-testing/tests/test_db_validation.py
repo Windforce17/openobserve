@@ -84,12 +84,12 @@ class TestDataIngestion:
             assert total >= 10, f"Expected at least 10 records, got {total}"
 
 
-class TestTantivyIndexing:
-    """Test Tantivy index creation and validation."""
+class TestVixIndexing:
+    """Test .vix index creation and validation."""
 
-    def test_tantivy_indexes_updated(self, ingest_test_data, db_cursor, test_org):
+    def test_vix_indexes_updated(self, ingest_test_data, db_cursor, test_org):
         """
-        Test that Tantivy indexes are updated with non-zero index_size.
+        Test that .vix indexes are updated with non-zero index_size.
 
         This test:
         1. Ingests data with 'log' field (full text search enabled by default)
@@ -97,7 +97,7 @@ class TestTantivyIndexing:
         3. Validates that all files have non-zero index_size
         4. Validates that total records in file_list matches ingested count
         """
-        stream_name = "ttv_test"
+        stream_name = "vix_test"
         num_records = 50
 
         # Ingest test data with 'log' field for full text search indexing
@@ -119,7 +119,7 @@ class TestTantivyIndexing:
         print(f"Ingested {num_records} records to stream '{stream_name}'")
 
         # Wait for file persistence and index creation
-        print("Waiting 20 seconds for file persistence and Tantivy indexing...")
+        print("Waiting 20 seconds for file persistence and .vix indexing...")
         time.sleep(20)
 
         # Query file_list table for the stream

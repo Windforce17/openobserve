@@ -15,6 +15,7 @@
 
 use config::{
     cluster::LOCAL_NODE,
+    get_config,
     meta::stream::{ALL_STREAM_TYPES, StreamType},
     metrics,
     utils::time::{HourFormat, day_micros, get_ymdh_from_micros, now_micros},
@@ -163,14 +164,21 @@ pub async fn update_stats_from_file_list_for_stream(
     let mut stats =
         infra_file_list::stats_by_date_range(org_id, stream_type, stream_name, date_range.clone())
             .await?;
-    let dump_stats = infra_file_list::query_dump_stats_by_date_range(
-        org_id,
-        stream_type,
-        stream_name,
-        date_range.clone(),
-    )
-    .await?;
-    stats.merge(&dump_stats);
+    // The file_list_dump feature moves file_list rows into dump files and
+    // tracks their stats in `file_list_dump_stats`. When the feature is
+    // disabled, no dump stats exist and — on Postgres — the table is not
+    // even created (its DDL is gated on the same flag), so the stats path
+    // must not query it.
+    if get_config().compact.file_list_dump_enabled {
+        let dump_stats = infra_file_list::query_dump_stats_by_date_range(
+            org_id,
+            stream_type,
+            stream_name,
+            date_range.clone(),
+        )
+        .await?;
+        stats.merge(&dump_stats);
+    }
     infra_file_list::set_stream_stats(org_id, stream_type, stream_name, &stats, is_recent).await?;
 
     Ok(())

@@ -22,7 +22,7 @@ publish = false
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
-default = []
+default = ["mimalloc"]
 enterprise = [
     "openobserve-api/enterprise",
     "openobserve-core/enterprise",
@@ -37,12 +37,6 @@ cloud = [
     "openobserve-api/cloud",
     "openobserve-core/cloud",
     "openobserve-jobs/cloud",
-]
-vortex = [
-    "config/vortex",
-    "openobserve-api/vortex",
-    "openobserve-core/vortex",
-    "openobserve-jobs/vortex",
 ]
 mimalloc = ["dep:mimalloc"]
 jemalloc = ["dep:tikv-jemallocator"]
@@ -164,6 +158,7 @@ rustls-native-certs.workspace = true
 webpki-roots.workspace = true
 sea-orm.workspace = true
 segment.workspace = true
+segment_wal.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha256.workspace = true
@@ -210,9 +205,6 @@ wal.workspace = true
 report_server.workspace = true
 chromiumoxide.workspace = true
 lettre.workspace = true
-tantivy.workspace = true
-tantivy-fst.workspace = true
-tantivy_utils.workspace = true
 zip.workspace = true
 futures-util.workspace = true
 tokio-stream.workspace = true
@@ -249,11 +241,13 @@ members = [
     "src/config",
     "src/infra",
     "src/ingester",
+    "src/segment_wal",
     "src/wal",
     "src/proto",
     "src/report_server",
     "src/flight",
-    "src/tantivy_utils",
+    "src/puffin",
+    "src/vortex_index",
     "src/web",
 ]
 resolver = "2"
@@ -267,11 +261,12 @@ license = "AGPL-3.0"
 config = { path = "src/config" }
 infra = { path = "src/infra" }
 ingester = { path = "src/ingester" }
+segment_wal = { path = "src/segment_wal" }
 wal = { path = "src/wal" }
 proto = { path = "src/proto" }
 report_server = { path = "src/report_server" }
 flight = { path = "src/flight" }
-tantivy_utils = { path = "src/tantivy_utils" }
+puffin = { path = "src/puffin" }
 web = { path = "src/web" }
 openobserve-core = { path = "src/core" }
 common = { path = "src/common" }
@@ -288,8 +283,9 @@ o2_dex = { path = "src/enterprise/o2_dex" }
 o2_enterprise = { path = "src/enterprise/o2_enterprise", default-features = false }
 o2_openfga = { path = "src/enterprise/o2_openfga" }
 o2_ratelimit = { path = "src/enterprise/o2_ratelimit" }
-vortex = { path = "src/enterprise/vortex" }
-vortex-datafusion = { path = "src/enterprise/vortex-datafusion" }
+vortex = { version = "0.79", features = ["tokio", "object_store"] }
+vortex-datafusion = { version = "0.79" }
+vortex_index = { path = "src/vortex_index" }
 aes-siv = "0.7.0"
 ahash = { version = "0.8", features = ["serde"] }
 axum = { version = "0.8", features = ["macros", "multipart", "tracing"] }
@@ -378,7 +374,10 @@ dashmap = { version = "6.1", features = ["serde"] }
 datafusion = "54"
 datafusion-proto = "54"
 datafusion-functions-aggregate-common = "54"
-datafusion-functions-json = { git = "https://github.com/openobserve/datafusion-functions-json", rev = "0df53d710425cc91cf109e77a050bbe1e374e4fe" }
+# Local checkout of the openobserve fork at rev 0df53d710425cc91cf109e77a050bbe1e374e4fe
+# plus the negative-number fix (json_get_int/json_get_float errored on
+# `Peek::Minus`, extracting every negative value stored in `_source` as NULL).
+datafusion-functions-json = { path = "../datafusion-functions-json" }
 expect-test = "1.4"
 arrow = { version = "58", features = ["ipc_compression", "prettyprint"] }
 arrow-flight = "58"
@@ -493,6 +492,8 @@ svix-ksuid = { version = "0.8", features = ["serde"] }
 sysinfo = "0.38"
 tantivy = { version = "0.26", features = ["quickwit"] }
 tantivy-fst = "0.5"
+bitpacking = "0.9"
+levenshtein_automata = "0.2"
 tempfile = "3"
 thiserror = "2.0"
 tiktoken-rs = "0.9.1"

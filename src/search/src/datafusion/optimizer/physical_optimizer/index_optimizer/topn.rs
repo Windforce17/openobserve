@@ -21,8 +21,9 @@ use datafusion::{
         Result,
         tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor},
     },
+    physical_expr::split_conjunction,
     physical_plan::{
-        ExecutionPlan, aggregates::AggregateExec, projection::ProjectionExec,
+        ExecutionPlan, aggregates::AggregateExec, filter::FilterExec, projection::ProjectionExec,
         sorts::sort_preserving_merge::SortPreservingMergeExec,
     },
 };
@@ -30,7 +31,7 @@ use hashbrown::HashSet;
 
 use crate::datafusion::optimizer::physical_optimizer::{
     index_optimizer::utils::is_complex_plan,
-    utils::{get_column_name, is_column, is_count_rows_aggregate},
+    utils::{get_column_name, is_column, is_count_rows_aggregate, is_only_timestamp_filter},
 };
 
 #[rustfmt::skip]
@@ -51,9 +52,25 @@ use crate::datafusion::optimizer::physical_optimizer::{
 ///                   FilterExec: _timestamp@0 >= 175256100000000 AND _timestamp@0 < 17525610000000000, projection=[kubernetes_namespace_name@1]
 ///                     CooperativeExec
 ///                       NewEmptyExec: name="default", projection=["_timestamp", "kubernetes_namespace_name"]
-pub fn is_simple_topn(plan: Arc<dyn ExecutionPlan>, index_fields: HashSet<String>) -> Option<IndexOptimizeMode> {
-    let mut visitor = SimpleTopnVisitor::new(index_fields);
+///
+/// Field eligibility: group fields must be in `index_fields` (the stream's
+/// column-store fields, servable per file from the docs columns under any
+/// condition). A **single** group field may instead come from
+/// `unfiltered_index_fields` (term-indexed string fields) — those are served
+/// from the term dictionary alone, which is only possible when the query has
+/// no condition, so any non-`_timestamp` filter in the plan disqualifies them.
+pub fn is_simple_topn(
+    plan: Arc<dyn ExecutionPlan>,
+    index_fields: HashSet<String>,
+    unfiltered_index_fields: HashSet<String>,
+) -> Option<IndexOptimizeMode> {
+    let mut visitor = SimpleTopnVisitor::new(index_fields, unfiltered_index_fields);
     let _ = plan.visit(&mut visitor);
+    // dictionary-only fields require an unfiltered query: every filter in
+    // the plan must be a bare `_timestamp` range
+    if visitor.requires_no_filter && visitor.has_non_ts_filter {
+        return None;
+    }
     match visitor.simple_topn {
         Some((fields, fetch, ascend)) if !fields.is_empty() => {
             Some(IndexOptimizeMode::SimpleTopN(fields, fetch, ascend))
@@ -65,17 +82,26 @@ pub fn is_simple_topn(plan: Arc<dyn ExecutionPlan>, index_fields: HashSet<String
 struct SimpleTopnVisitor {
     pub simple_topn: Option<(Vec<String>, usize, bool)>,
     index_fields: HashSet<String>,
+    unfiltered_index_fields: HashSet<String>,
     secondary_sort_columns: Vec<String>,
     projection_len: Option<usize>,
+    /// the group field is dictionary-only eligible (not column-store): the
+    /// query must carry no condition
+    requires_no_filter: bool,
+    /// the plan contains a filter beyond the `_timestamp` range
+    has_non_ts_filter: bool,
 }
 
 impl SimpleTopnVisitor {
-    pub fn new(index_fields: HashSet<String>) -> Self {
+    pub fn new(index_fields: HashSet<String>, unfiltered_index_fields: HashSet<String>) -> Self {
         Self {
             simple_topn: None,
             index_fields,
+            unfiltered_index_fields,
             secondary_sort_columns: Vec::new(),
             projection_len: None,
+            requires_no_filter: false,
+            has_non_ts_filter: false,
         }
     }
 
@@ -152,17 +178,34 @@ impl<'n> TreeNodeVisitor<'n> for SimpleTopnVisitor {
                 return self.reject();
             }
 
-            // all group by fields must be index fields
+            // all group by fields must be eligible: column-store fields
+            // always; a single group field may be dictionary-only
+            // (term-indexed) — validated post-visit against the filters
             let mut fields = Vec::with_capacity(group_len);
             for (group_expr, _) in aggregate.group_expr().expr().iter() {
                 let column_name = get_column_name(group_expr);
-                if !is_column(group_expr) || !self.index_fields.contains(column_name) {
+                if !is_column(group_expr) {
                     return self.reject();
+                }
+                if !self.index_fields.contains(column_name) {
+                    if group_len == 1 && self.unfiltered_index_fields.contains(column_name) {
+                        self.requires_no_filter = true;
+                    } else {
+                        return self.reject();
+                    }
                 }
                 fields.push(column_name.to_string());
             }
             if let Some(simple_topn) = &mut self.simple_topn {
                 simple_topn.0 = fields;
+            }
+        } else if let Some(filter) = node.downcast_ref::<FilterExec>() {
+            // filters are visited below the aggregates: record whether any
+            // predicate goes beyond the `_timestamp` range (the final
+            // eligibility check runs after the walk)
+            let exprs = split_conjunction(filter.predicate());
+            if !is_only_timestamp_filter(&exprs) {
+                self.has_non_ts_filter = true;
             }
         } else if is_complex_plan(node) {
             return self.reject();
@@ -317,7 +360,7 @@ mod tests {
             let index_fields = HashSet::from(["name".to_string(), "id".to_string()]);
             assert_eq!(
                 expected,
-                is_simple_topn(physical_plan, index_fields),
+                is_simple_topn(physical_plan, index_fields, HashSet::new()),
                 "Failed for SQL: {}",
                 sql
             );
@@ -443,7 +486,7 @@ mod tests {
             ]);
             assert_eq!(
                 expected,
-                is_simple_topn(physical_plan, index_fields),
+                is_simple_topn(physical_plan, index_fields, HashSet::new()),
                 "Failed for SQL: {}",
                 sql
             );
@@ -506,7 +549,7 @@ mod tests {
             let index_fields = HashSet::from(["hostname".to_string()]);
             assert_eq!(
                 expected,
-                is_simple_topn(physical_plan, index_fields),
+                is_simple_topn(physical_plan, index_fields, HashSet::new()),
                 "Failed for SQL: {}",
                 sql
             );
@@ -570,7 +613,7 @@ mod tests {
             let index_fields = HashSet::from(["category".to_string()]);
             assert_eq!(
                 expected,
-                is_simple_topn(physical_plan, index_fields),
+                is_simple_topn(physical_plan, index_fields, HashSet::new()),
                 "Failed for SQL: {}",
                 sql
             );
@@ -628,9 +671,88 @@ mod tests {
             let index_fields = HashSet::from(["service".to_string()]);
             assert_eq!(
                 expected,
-                is_simple_topn(physical_plan, index_fields),
+                is_simple_topn(physical_plan, index_fields, HashSet::new()),
                 "Failed for SQL: {}",
                 sql
+            );
+        }
+    }
+
+    /// Pilot fix B: a single term-indexed (non-column-store) group field is
+    /// eligible only when the query's sole filter is the `_timestamp` range;
+    /// multi-field TopN stays column-store-only.
+    #[tokio::test]
+    async fn test_is_simple_topn_unfiltered_term_field() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("status", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(StringArray::from(vec!["openobserve"])),
+                Arc::new(StringArray::from(vec!["success"])),
+            ],
+        )
+        .unwrap();
+        let ctx = SessionContext::new();
+        let provider = MemTable::try_new(schema, vec![vec![batch.clone()], vec![batch]]).unwrap();
+        ctx.register_table("t", Arc::new(provider)).unwrap();
+        ctx.register_udf(match_all_udf::MATCH_ALL_UDF.clone());
+
+        // `status` is column-store, `name` only term-indexed
+        let cases = vec![
+            // no filter: the term field is eligible
+            (
+                "select name, count(*) as cnt from t group by name order by cnt desc limit 10",
+                Some(IndexOptimizeMode::SimpleTopN(
+                    vec!["name".to_string()],
+                    10,
+                    false,
+                )),
+            ),
+            // a bare `_timestamp` range still counts as unfiltered
+            (
+                "select name, count(*) as cnt from t where _timestamp >= 1 and _timestamp < 100 group by name order by cnt desc limit 10",
+                Some(IndexOptimizeMode::SimpleTopN(
+                    vec!["name".to_string()],
+                    10,
+                    false,
+                )),
+            ),
+            // a real condition disqualifies the term-only field ...
+            (
+                "select name, count(*) as cnt from t where match_all('error') group by name order by cnt desc limit 10",
+                None,
+            ),
+            // ... but not a column-store field (existing behavior)
+            (
+                "select status, count(*) as cnt from t where match_all('error') group by status order by cnt desc limit 10",
+                Some(IndexOptimizeMode::SimpleTopN(
+                    vec!["status".to_string()],
+                    10,
+                    false,
+                )),
+            ),
+            // multi-field TopN never uses the term-only eligibility
+            (
+                "select name, status, count(*) as cnt from t group by name, status order by cnt desc limit 10",
+                None,
+            ),
+        ];
+
+        for (sql, expected) in cases {
+            let plan = ctx.state().create_logical_plan(sql).await.unwrap();
+            let physical_plan = ctx.state().create_physical_plan(&plan).await.unwrap();
+
+            let index_fields = HashSet::from(["status".to_string()]);
+            let unfiltered_index_fields = HashSet::from(["name".to_string()]);
+            assert_eq!(
+                expected,
+                is_simple_topn(physical_plan, index_fields, unfiltered_index_fields),
+                "Failed for SQL: {sql}"
             );
         }
     }
@@ -638,7 +760,7 @@ mod tests {
     #[test]
     fn test_simple_topn_visitor_initial_state() {
         let fields = HashSet::from(["service".to_string()]);
-        let visitor = SimpleTopnVisitor::new(fields.clone());
+        let visitor = SimpleTopnVisitor::new(fields.clone(), HashSet::new());
         assert!(visitor.simple_topn.is_none());
         assert!(visitor.secondary_sort_columns.is_empty());
         assert!(visitor.projection_len.is_none());
@@ -648,7 +770,7 @@ mod tests {
     #[test]
     fn test_simple_topn_visitor_empty_index_fields() {
         let fields: HashSet<String> = HashSet::new();
-        let visitor = SimpleTopnVisitor::new(fields.clone());
+        let visitor = SimpleTopnVisitor::new(fields.clone(), HashSet::new());
         assert!(visitor.simple_topn.is_none());
         assert!(visitor.secondary_sort_columns.is_empty());
         assert!(visitor.index_fields.is_empty());
@@ -657,7 +779,7 @@ mod tests {
     #[test]
     fn test_simple_topn_visitor_multiple_index_fields() {
         let fields = HashSet::from(["service".to_string(), "host".to_string(), "pod".to_string()]);
-        let visitor = SimpleTopnVisitor::new(fields.clone());
+        let visitor = SimpleTopnVisitor::new(fields.clone(), HashSet::new());
         assert_eq!(visitor.index_fields.len(), 3);
         assert!(visitor.index_fields.contains("service"));
         assert!(visitor.index_fields.contains("host"));

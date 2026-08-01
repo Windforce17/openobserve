@@ -513,7 +513,8 @@ pub async fn update_incident_metadata(
 /// Open (non-resolved) incidents ordered by most recent first (by created_at)
 ///
 /// # Examples
-/// ```
+/// ```rust,ignore
+/// // Illustrative fragment (`now`/`org_id` are call-site values).
 /// // Hierarchical upgrade: Find incidents created in last 5 minutes
 /// let threshold = now - (5 * 60 * 1_000_000);
 /// let candidates = find_open_incidents_filtered(org_id, Some(threshold), Some(100)).await?;

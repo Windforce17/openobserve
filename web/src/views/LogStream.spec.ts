@@ -278,16 +278,6 @@ describe("LogStream Component", () => {
     });
   });
 
-  describe("Computed Properties", () => {
-    it("should check if schema UDS is enabled", () => {
-      store.state.zoConfig.user_defined_schemas_enabled = true;
-      expect(wrapper.vm.isSchemaUDSEnabled).toBe(true);
-
-      store.state.zoConfig.user_defined_schemas_enabled = false;
-      expect(wrapper.vm.isSchemaUDSEnabled).toBe(false);
-    });
-  });
-
   describe("API Interactions", () => {
     it("should call getPaginatedStreams on component mount", async () => {
       await flushPromises();
@@ -697,12 +687,10 @@ describe("LogStream Component", () => {
   });
 
   describe("Add Stream Dialog", () => {
-    it("should respect UDS configuration", () => {
-      store.state.zoConfig.user_defined_schemas_enabled = true;
-      expect(wrapper.vm.isSchemaUDSEnabled).toBe(true);
-
-      store.state.zoConfig.user_defined_schemas_enabled = false;
-      expect(wrapper.vm.isSchemaUDSEnabled).toBe(false);
+    it("always shows the add-stream button", () => {
+      expect(
+        wrapper.find('[data-test="log-stream-add-stream-btn"]').exists(),
+      ).toBe(true);
     });
   });
 

@@ -23,7 +23,7 @@ use chrono::Utc;
 #[cfg(feature = "cloud")]
 use config::meta::self_reporting::usage::is_reserved_self_reporting_stream;
 use config::{
-    ALL_VALUES_COL_NAME, ID_COL_NAME, ORIGINAL_DATA_COL_NAME, TIMESTAMP_COL_NAME,
+    ID_COL_NAME, ORIGINAL_DATA_COL_NAME, TIMESTAMP_COL_NAME,
     meta::{
         self_reporting::usage::UsageType,
         stream::{StreamParams, StreamType},
@@ -73,14 +73,39 @@ struct FinalizeRecordContext<'a> {
     flatten_level: u32,
     min_ts: i64,
     max_ts: i64,
-    index_all_max_value_length: usize,
-    user_defined_schema_map: &'a HashMap<String, Option<HashSet<String>>>,
     streams_need_original_map: &'a HashMap<String, bool>,
-    streams_need_all_values_map: &'a HashMap<String, bool>,
     need_usage_report: bool,
     log_ingestion_errors: bool,
     stream_status: &'a mut StreamStatus,
     json_data_by_stream: &'a mut LogDataByStream,
+    /// `Some` for the bulk shape: a record rejected before the write claims a
+    /// bulk item here, so the response still carries one item per action
+    pre_write_bulk: &'a mut Option<BulkResponse>,
+}
+
+/// Claim a bulk item for a record rejected BEFORE the write. The ES bulk
+/// contract is one response item per action: counting the rejection only on
+/// the aggregate status left the items array short and `errors: false`, so
+/// positional clients (Filebeat/Logstash) never saw the loss.
+fn pre_write_bulk_item(
+    pre_write_bulk: &mut Option<BulkResponse>,
+    stream_name: &str,
+    doc_id: Option<String>,
+    err_type: &str,
+    error: &str,
+) {
+    if let Some(bulk) = pre_write_bulk.as_mut() {
+        bulk.errors = true;
+        super::bulk::add_record_status(
+            stream_name.to_string(),
+            doc_id,
+            "".to_string(),
+            None,
+            bulk,
+            Some(err_type.to_string()),
+            Some(error.to_string()),
+        );
+    }
 }
 
 pub async fn ingest(
@@ -131,8 +156,6 @@ pub async fn ingest(
     let min_ts = now - cfg.limit.ingest_allowed_upto_micro;
     let max_ts = now + cfg.limit.ingest_allowed_in_future_micro;
 
-    let index_all_max_value_length = cfg.limit.index_all_max_value_length;
-
     let mut derived_streams = HashSet::new();
     if is_derived {
         derived_streams.insert(stream_name.to_string());
@@ -154,21 +177,17 @@ pub async fn ingest(
         }
     }
 
-    // Start get user defined schema
-    let mut user_defined_schema_map: HashMap<String, Option<HashSet<String>>> = HashMap::new();
+    // Start get streams that store the original record
     let mut streams_need_original_map: HashMap<String, bool> = HashMap::new();
-    let mut streams_need_all_values_map: HashMap<String, bool> = HashMap::new();
-    crate::service::ingestion::get_uds_and_original_data_streams(
+    crate::service::ingestion::get_original_data_streams(
         &stream_params,
-        &mut user_defined_schema_map,
         &mut streams_need_original_map,
-        &mut streams_need_all_values_map,
     )
     .await;
     // with pipeline, we need to store original if any of the destinations requires original
     let store_original_when_pipeline_exists =
         !executable_pipelines.is_empty() && streams_need_original_map.values().any(|val| *val);
-    // End get user defined schema
+    // End get streams that store the original record
 
     let flatten_level = get_flatten_level(org_id, &stream_name, stream_type).await;
 
@@ -234,6 +253,15 @@ pub async fn ingest(
     };
 
     let mut stream_status = StreamStatus::new(&stream_name);
+    // bulk items for records rejected BEFORE the write (flatten failure, bad
+    // timestamp, a pipeline batch error): the ES bulk contract is one item
+    // per action, so these must claim items too — None for every other shape
+    let mut pre_write_bulk: Option<BulkResponse> =
+        (usage_type == UsageType::Bulk).then(|| BulkResponse {
+            took: 0,
+            errors: false,
+            items: vec![],
+        });
     let mut json_data_by_stream: LogDataByStream = HashMap::new();
     let mut size_by_stream = HashMap::new();
     for ret in data.iter() {
@@ -289,14 +317,12 @@ pub async fn ingest(
                 flatten_level,
                 min_ts,
                 max_ts,
-                index_all_max_value_length,
-                user_defined_schema_map: &user_defined_schema_map,
                 streams_need_original_map: &streams_need_original_map,
-                streams_need_all_values_map: &streams_need_all_values_map,
                 need_usage_report,
                 log_ingestion_errors,
                 stream_status: &mut stream_status,
                 json_data_by_stream: &mut json_data_by_stream,
+                pre_write_bulk: &mut pre_write_bulk,
             },
         ) {
             continue;
@@ -350,6 +376,18 @@ pub async fn ingest(
                     );
                     stream_status.status.failed += records_count as u32;
                     stream_status.status.error = format!("Pipeline batch execution error: {e}");
+                    // the whole batch was rejected before the write: every
+                    // record claims its bulk item so none vanishes silently
+                    let error = format!("Pipeline batch execution error: {e}");
+                    for _ in 0..records_count {
+                        pre_write_bulk_item(
+                            &mut pre_write_bulk,
+                            &stream_name,
+                            None,
+                            super::bulk::PIPELINE_EXEC_FAILED,
+                            &error,
+                        );
+                    }
                     metrics::INGEST_ERRORS
                         .with_label_values(&[
                             org_id,
@@ -371,14 +409,11 @@ pub async fn ingest(
                             derived_streams.insert(destination_stream.clone());
                         }
 
-                        if !user_defined_schema_map.contains_key(&destination_stream) {
-                            // a new dynamically created stream. need to check the two maps
-                            // again
-                            crate::service::ingestion::get_uds_and_original_data_streams(
+                        if !streams_need_original_map.contains_key(&destination_stream) {
+                            // a new dynamically created stream. need to check the map again
+                            crate::service::ingestion::get_original_data_streams(
                                 &[stream_params],
-                                &mut user_defined_schema_map,
                                 &mut streams_need_original_map,
-                                &mut streams_need_all_values_map,
                             )
                             .await;
                         }
@@ -403,7 +438,6 @@ pub async fn ingest(
                                 }
                             };
 
-                            // we calculate the size BEFORE applying uds
                             let original_size = estimate_json_bytes(&res);
 
                             // get json object
@@ -411,13 +445,6 @@ pub async fn ingest(
                                 json::Value::Object(val) => val,
                                 _ => unreachable!(),
                             };
-
-                            if let Some(Some(fields)) =
-                                user_defined_schema_map.get(&destination_stream)
-                            {
-                                local_val =
-                                    crate::service::ingestion::refactor_map(local_val, fields);
-                            }
 
                             // usize::MAX used as a flag when pipeline is applied with
                             // ResultArray vrl
@@ -441,34 +468,6 @@ pub async fn ingest(
                                 local_val.insert(
                                     ID_COL_NAME.to_string(),
                                     json::Value::String(record_id.to_string()),
-                                );
-                            }
-
-                            // add `_all_values` if required by StreamSettings
-                            if streams_need_all_values_map
-                                .get(&destination_stream)
-                                .is_some_and(|v| *v)
-                            {
-                                let mut values = Vec::with_capacity(local_val.len());
-                                for (k, value) in local_val.iter() {
-                                    if ![
-                                        TIMESTAMP_COL_NAME,
-                                        ID_COL_NAME,
-                                        ORIGINAL_DATA_COL_NAME,
-                                        ALL_VALUES_COL_NAME,
-                                    ]
-                                    .contains(&k.as_str())
-                                        && (index_all_max_value_length == 0
-                                            || value.as_str().is_none_or(|s| {
-                                                s.len() <= index_all_max_value_length
-                                            }))
-                                    {
-                                        values.push(value.to_string());
-                                    }
-                                }
-                                local_val.insert(
-                                    ALL_VALUES_COL_NAME.to_string(),
-                                    json::Value::String(values.join(" ")),
                                 );
                             }
 
@@ -528,34 +527,29 @@ pub async fn ingest(
                         flatten_level,
                         min_ts,
                         max_ts,
-                        index_all_max_value_length,
-                        user_defined_schema_map: &user_defined_schema_map,
                         streams_need_original_map: &streams_need_original_map,
-                        streams_need_all_values_map: &streams_need_all_values_map,
                         need_usage_report,
                         log_ingestion_errors,
                         stream_status: &mut stream_status,
                         json_data_by_stream: &mut json_data_by_stream,
+                        pre_write_bulk: &mut pre_write_bulk,
                     },
                 );
             }
         }
     }
 
-    // if no data, fast return
+    // if no data is left to write, fast return — but never silently: every
+    // record may already have been counted failed (bad timestamps, records
+    // that would not flatten, a pipeline batch failure...)
     if json_data_by_stream.is_empty() {
-        return Ok(IngestionResponse::new(
-            http::StatusCode::OK.into(),
-            vec![stream_status],
-        ));
+        return Ok(empty_buffer_response(stream_status, pre_write_bulk.take()));
     }
 
     // drop memory-intensive variables
     drop(streams_need_original_map);
-    drop(streams_need_all_values_map);
     drop(executable_pipelines);
     drop(original_options);
-    drop(user_defined_schema_map);
 
     #[cfg(feature = "vectorscan")]
     {
@@ -576,13 +570,21 @@ pub async fn ingest(
         }
     }
 
-    let (metric_rpt_status_code, response_body) = {
+    #[allow(clippy::type_complexity)]
+    let (metric_rpt_status_code, response_body, response_code, response_error): (
+        &str,
+        StreamStatus,
+        u16,
+        Option<String>,
+    ) = {
         let mut status = if usage_type == UsageType::Bulk {
-            IngestionStatus::Bulk(BulkResponse {
+            // seeded with the items of records rejected before the write, so
+            // the response still carries one item per action
+            IngestionStatus::Bulk(pre_write_bulk.take().unwrap_or(BulkResponse {
                 took: 0,
                 errors: false,
                 items: vec![],
-            })
+            }))
         } else {
             IngestionStatus::Record(stream_status.status.clone())
         };
@@ -606,13 +608,7 @@ pub async fn ingest(
                 stream_status.items = items.items;
             }
         };
-        match write_result {
-            Ok(()) => ("200", stream_status),
-            Err(e) => {
-                log::error!("Error while writing logs: {e}");
-                ("500", stream_status)
-            }
-        }
+        build_ingestion_response(stream_status, write_result)
     };
 
     // update ingestion metrics
@@ -642,15 +638,79 @@ pub async fn ingest(
             .inc();
     }
 
-    Ok(IngestionResponse::new(
-        http::StatusCode::OK.into(),
-        vec![response_body],
-    ))
+    Ok(IngestionResponse {
+        code: response_code,
+        status: vec![response_body],
+        error: response_error,
+    })
 }
 
-/// Finalize a log record (flatten, resolve timestamp, apply UDS, add
-/// `_original` / `_all_values` if configured) and push it into
-/// `json_data_by_stream`.
+/// The response for a request none of whose records reached the write
+/// buffer. An empty buffer is not automatically a clean 200: when records
+/// were counted failed before buffering (bad timestamps, records that would
+/// not flatten, a pipeline batch failure), the accumulated failure state is
+/// reported on the response `error`. The code stays 200 — these records were
+/// rejected as data, resending the same bytes cannot help.
+fn empty_buffer_response(
+    mut stream_status: StreamStatus,
+    pre_write_bulk: Option<BulkResponse>,
+) -> IngestionResponse {
+    // the bulk shape carries its rejections as ITEMS too — one per action —
+    // so a caller that walks the items array never sees it short
+    if let Some(bulk) = pre_write_bulk {
+        stream_status.items = bulk.items;
+    }
+    let error = (stream_status.status.failed > 0).then(|| stream_status.status.error.clone());
+    IngestionResponse {
+        code: http::StatusCode::OK.into(),
+        status: vec![stream_status],
+        error,
+    }
+}
+
+/// Turn an accounted ingest into its response: the metric status label, the
+/// per-stream status, the response code and the error message.
+///
+/// A stream whose durable write failed is NEVER a 2xx — the records are not
+/// stored and the caller that acks must resend them. The one exception is a
+/// pure PERMANENT rejection (e.g. every failing stream is being deleted):
+/// the code stays 200 because retrying cannot help, but the error still says
+/// what was dropped and why. `write_logs_by_stream` has already moved the
+/// failed counts out of `successful` into `failed`, so the body reports the
+/// loss too.
+fn build_ingestion_response(
+    stream_status: StreamStatus,
+    write_result: Result<Vec<super::StreamWriteFailure>>,
+) -> (&'static str, StreamStatus, u16, Option<String>) {
+    match write_result {
+        Ok(failures) if failures.is_empty() => {
+            ("200", stream_status, http::StatusCode::OK.as_u16(), None)
+        }
+        Ok(failures) => {
+            let error = super::write_failure_message(&failures);
+            log::error!("Error while writing logs: {error}");
+            let code = super::write_failure_status_code(&failures);
+            let metric = if (200..300).contains(&code) {
+                "200"
+            } else {
+                "500"
+            };
+            (metric, stream_status, code, Some(error))
+        }
+        Err(e) => {
+            log::error!("Error while writing logs: {e}");
+            let code = if matches!(e, Error::ResourceError(_)) {
+                http::StatusCode::SERVICE_UNAVAILABLE.as_u16()
+            } else {
+                http::StatusCode::INTERNAL_SERVER_ERROR.as_u16()
+            };
+            ("500", stream_status, code, Some(e.to_string()))
+        }
+    }
+}
+
+/// Finalize a log record (flatten, resolve timestamp, add `_original` /
+/// `_o2_id` if configured) and push it into `json_data_by_stream`.
 ///
 /// Returns `true` on success, `false` when the record should be skipped
 /// (the caller should `continue`).
@@ -664,6 +724,13 @@ fn finalize_and_buffer_record(
         Err(e) => {
             ctx.stream_status.status.failed += 1;
             ctx.stream_status.status.error = e.to_string();
+            pre_write_bulk_item(
+                ctx.pre_write_bulk,
+                ctx.stream_name,
+                None,
+                super::bulk::TRANSFORM_FAILED,
+                &e.to_string(),
+            );
             log::error!("Record flattening error: {e}");
             return false;
         }
@@ -673,6 +740,17 @@ fn finalize_and_buffer_record(
         Err(e) => {
             ctx.stream_status.status.failed += 1;
             ctx.stream_status.status.error = e.to_string();
+            // the flattened record is still here: keep its doc id on the item
+            let doc_id = res
+                .as_object()
+                .and_then(|record| super::record_doc_id(record).ok().flatten());
+            pre_write_bulk_item(
+                ctx.pre_write_bulk,
+                ctx.stream_name,
+                doc_id,
+                super::bulk::TS_PARSE_FAILED,
+                &e.to_string(),
+            );
             metrics::INGEST_ERRORS
                 .with_label_values(&[
                     ctx.org_id,
@@ -689,12 +767,16 @@ fn finalize_and_buffer_record(
         json::Value::Object(val) => val,
         _ => {
             ctx.stream_status.status.failed += 1;
+            pre_write_bulk_item(
+                ctx.pre_write_bulk,
+                ctx.stream_name,
+                None,
+                super::bulk::DOC_NOT_AN_OBJECT,
+                "the record is not a JSON object",
+            );
             return false;
         }
     };
-    if let Some(Some(fields)) = ctx.user_defined_schema_map.get(ctx.stream_name) {
-        local_val = crate::service::ingestion::refactor_map(local_val, fields);
-    }
     if ctx
         .streams_need_original_map
         .get(ctx.stream_name)
@@ -710,33 +792,6 @@ fn finalize_and_buffer_record(
         local_val.insert(
             ID_COL_NAME.to_string(),
             json::Value::String(record_id.to_string()),
-        );
-    }
-    if ctx
-        .streams_need_all_values_map
-        .get(ctx.stream_name)
-        .is_some_and(|v| *v)
-    {
-        let mut values = Vec::with_capacity(local_val.len());
-        for (k, value) in local_val.iter() {
-            if ![
-                TIMESTAMP_COL_NAME,
-                ID_COL_NAME,
-                ORIGINAL_DATA_COL_NAME,
-                ALL_VALUES_COL_NAME,
-            ]
-            .contains(&k.as_str())
-                && (ctx.index_all_max_value_length == 0
-                    || value
-                        .as_str()
-                        .is_none_or(|s| s.len() <= ctx.index_all_max_value_length))
-            {
-                values.push(value.to_string());
-            }
-        }
-        local_val.insert(
-            ALL_VALUES_COL_NAME.to_string(),
-            json::Value::String(values.join(" ")),
         );
     }
     match ctx.json_data_by_stream.get_mut(ctx.stream_name) {
@@ -1184,10 +1239,192 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        decode_and_decompress_to_string, decode_and_decompress_to_vec,
-        deserialize_aws_record_from_vec, extract_resource_id_from_amazon_resource_number,
-        get_size_of_var_int_header, get_tuple_from_open_telemetry_key_value, handle_timestamp,
+        build_ingestion_response, decode_and_decompress_to_string, decode_and_decompress_to_vec,
+        deserialize_aws_record_from_vec, empty_buffer_response,
+        extract_resource_id_from_amazon_resource_number, get_size_of_var_int_header,
+        get_tuple_from_open_telemetry_key_value, handle_timestamp, pre_write_bulk_item,
     };
+    use crate::{
+        common::meta::ingestion::{BulkResponse, StreamStatus},
+        service::logs::StreamWriteFailure,
+    };
+
+    fn stream_status(name: &str, successful: u32, failed: u32) -> StreamStatus {
+        let mut status = StreamStatus::new(name);
+        status.status.successful = successful;
+        status.status.failed = failed;
+        status
+    }
+
+    /// A durable write acks with 200 and the successful count.
+    #[test]
+    fn test_ingestion_response_success() {
+        let (metric, body, code, error) =
+            build_ingestion_response(stream_status("logs", 3, 0), Ok(vec![]));
+        assert_eq!(metric, "200");
+        assert_eq!(code, 200);
+        assert!(error.is_none());
+        assert_eq!(body.status.successful, 3);
+        assert_eq!(body.status.failed, 0);
+    }
+
+    /// A failed write is reported as a non-2xx AND as failed records: the
+    /// shipper must not delete its copy. Records counted successful before
+    /// the write is what made this a 200 with `successful: N`.
+    #[test]
+    fn test_ingestion_response_write_failure_is_not_2xx() {
+        let failures = vec![StreamWriteFailure {
+            stream_name: "logs".to_string(),
+            records: 3,
+            error: infra::errors::Error::IngestionError("wal write failed".to_string()),
+            permanent_rejection: false,
+        }];
+        // write_logs_by_stream has moved the 3 records into `failed`
+        let (metric, body, code, error) =
+            build_ingestion_response(stream_status("logs", 0, 3), Ok(failures));
+
+        assert_eq!(metric, "500");
+        assert_eq!(code, 500);
+        assert!(!(200..300).contains(&code));
+        assert_eq!(body.status.successful, 0);
+        assert_eq!(body.status.failed, 3);
+        let error = error.expect("a write failure must report an error");
+        assert!(error.contains("logs"), "{error}");
+        assert!(error.contains("wal write failed"), "{error}");
+    }
+
+    /// Backpressure is retryable: 503, so the client backs off and resends.
+    #[test]
+    fn test_ingestion_response_backpressure_is_503() {
+        let failures = vec![StreamWriteFailure {
+            stream_name: "logs".to_string(),
+            records: 5,
+            error: infra::errors::Error::ResourceError("memtable is full".to_string()),
+            permanent_rejection: false,
+        }];
+        let (_, _, code, _) = build_ingestion_response(stream_status("logs", 0, 5), Ok(failures));
+        assert_eq!(code, 503);
+
+        let (_, _, code, error) = build_ingestion_response(
+            stream_status("logs", 0, 5),
+            Err(infra::errors::Error::ResourceError(
+                "memtable is full".to_string(),
+            )),
+        );
+        assert_eq!(code, 503);
+        assert!(error.is_some());
+    }
+
+    /// Multi-stream requests report every failing stream, not just the first.
+    #[test]
+    fn test_ingestion_response_reports_every_failed_stream() {
+        let failures = vec![
+            StreamWriteFailure {
+                stream_name: "logs_a".to_string(),
+                records: 2,
+                error: infra::errors::Error::IngestionError("disk full".to_string()),
+                permanent_rejection: false,
+            },
+            StreamWriteFailure {
+                stream_name: "logs_b".to_string(),
+                records: 4,
+                error: infra::errors::Error::IngestionError("disk full".to_string()),
+                permanent_rejection: false,
+            },
+        ];
+        let (_, body, code, error) =
+            build_ingestion_response(stream_status("logs_a", 0, 6), Ok(failures));
+        assert_eq!(code, 500);
+        assert_eq!(body.status.failed, 6);
+        let error = error.unwrap();
+        assert!(
+            error.contains("logs_a") && error.contains("logs_b"),
+            "{error}"
+        );
+    }
+
+    /// A pure PERMANENT rejection (the stream is being deleted) keeps the
+    /// request 200 — retrying cannot help — but the body must say what was
+    /// dropped and why, never `error: null`.
+    #[test]
+    fn test_ingestion_response_permanent_rejection_is_200_with_report() {
+        let failures = vec![StreamWriteFailure {
+            stream_name: "logs".to_string(),
+            records: 3,
+            error: infra::errors::Error::IngestionError(
+                "stream [logs] is being deleted".to_string(),
+            ),
+            permanent_rejection: true,
+        }];
+        let (metric, body, code, error) =
+            build_ingestion_response(stream_status("logs", 0, 3), Ok(failures));
+        assert_eq!(metric, "200");
+        assert_eq!(code, 200);
+        assert_eq!(body.status.failed, 3);
+        let error = error.expect("a dropped stream must be reported");
+        assert!(error.contains("being deleted"), "{error}");
+    }
+
+    /// The empty-buffer fast return must not turn an all-failed request into
+    /// a silent 200/error:null: the accumulated failure state is reported.
+    #[test]
+    fn test_empty_buffer_response_reports_accumulated_failures() {
+        // every record failed before buffering
+        let mut status = stream_status("logs", 0, 4);
+        status.status.error = "Too old data, only last 5 hours data can be ingested".to_string();
+        let res = empty_buffer_response(status, None);
+        assert_eq!(res.code, 200, "data rejections are permanent: stay 200");
+        let error = res.error.expect("an all-failed request must report why");
+        assert!(error.contains("Too old data"), "{error}");
+        assert_eq!(res.status[0].status.failed, 4);
+
+        // a genuinely empty request stays a clean 200
+        let res = empty_buffer_response(stream_status("logs", 0, 0), None);
+        assert_eq!(res.code, 200);
+        assert!(res.error.is_none());
+    }
+
+    /// The bulk shape reports pre-write rejections as ITEMS: an all-rejected
+    /// bulk request used to answer 200/errors:false with an EMPTY items
+    /// array, so positional clients never saw the loss.
+    #[test]
+    fn test_empty_buffer_response_carries_bulk_items() {
+        let mut status = stream_status("logs", 0, 2);
+        status.status.error = "Too old data".to_string();
+
+        let mut pre_write_bulk = Some(BulkResponse {
+            took: 0,
+            errors: false,
+            items: vec![],
+        });
+        pre_write_bulk_item(
+            &mut pre_write_bulk,
+            "logs",
+            Some("doc1".to_string()),
+            crate::service::logs::bulk::TS_PARSE_FAILED,
+            "Too old data",
+        );
+        pre_write_bulk_item(
+            &mut pre_write_bulk,
+            "logs",
+            None,
+            crate::service::logs::bulk::TRANSFORM_FAILED,
+            "flatten failed",
+        );
+        assert!(pre_write_bulk.as_ref().unwrap().errors);
+
+        let res = empty_buffer_response(status, pre_write_bulk);
+        assert_eq!(res.code, 200);
+        assert_eq!(
+            res.status[0].items.len(),
+            2,
+            "one item per rejected action, none swallowed"
+        );
+        let first = res.status[0].items[0].values().next().unwrap();
+        assert_eq!(first._id, "doc1");
+        let err = first.error.as_ref().expect("the rejection is on the item");
+        assert_eq!(err.err_type, crate::service::logs::bulk::TS_PARSE_FAILED);
+    }
 
     #[test]
     fn test_handle_timestamp_valid_in_range() {

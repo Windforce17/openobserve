@@ -18,7 +18,7 @@ use std::{
     io::{BufRead, BufReader},
 };
 
-use axum::body::Bytes;
+use axum::{body::Bytes, http::StatusCode};
 #[cfg(feature = "cloud")]
 use config::meta::self_reporting::usage::is_reserved_self_reporting_stream;
 use config::{
@@ -48,13 +48,29 @@ pub const TRANSFORM_FAILED: &str = "document_failed_transform";
 pub const TS_PARSE_FAILED: &str = "timestamp_parsing_failed";
 pub const SCHEMA_CONFORMANCE_FAILED: &str = "schema_conformance_failed";
 pub const PIPELINE_EXEC_FAILED: &str = "pipeline_execution_failed";
+/// the durable write itself failed — the records are NOT stored
+pub const WRITE_FAILED: &str = "write_failed";
+pub const DOC_ID_INVALID: &str = "invalid_document_id";
+pub const DOC_NOT_AN_OBJECT: &str = "document_not_an_object";
+pub const MALFORMED_LINE: &str = "malformed_json_line";
+/// a line arrived where an action line (create/index/update) was expected —
+/// e.g. the document of a malformed action line, or an unsupported action
+pub const INVALID_ACTION_LINE: &str = "invalid_action_line";
+pub const STREAM_DELETING: &str = "stream_being_deleted";
+
+/// The outcome of parsing a bulk NDJSON body: the records to write, grouped
+/// by stream, plus the last action seen (used when a whole stream fails).
+struct BulkParsedBody {
+    streams_data: HashMap<String, Vec<json::Value>>,
+    action: String,
+}
 
 pub async fn ingest(
     thread_id: usize,
     org_id: &str,
     body: Bytes,
     user: crate::common::meta::ingestion::IngestUser,
-) -> Result<BulkResponse> {
+) -> Result<(BulkResponse, u16)> {
     let start = std::time::Instant::now();
 
     // check system resource
@@ -73,6 +89,125 @@ pub async fn ingest(
     let max_ts = now + cfg.limit.ingest_allowed_in_future_micro;
 
     let log_ingestion_errors = ingestion_log_enabled().await;
+    let BulkParsedBody {
+        streams_data,
+        action,
+    } = parse_bulk_body(
+        org_id,
+        body.as_ref(),
+        (min_ts, max_ts),
+        log_ingestion_errors,
+        &mut bulk_res,
+    )
+    .await?;
+
+    // process data by stream. A stream that fails does not short-circuit the
+    // rest: every stream is attempted and the worst status is returned.
+    let mut status_code = StatusCode::OK.as_u16();
+    for (stream_name, records) in streams_data {
+        match super::ingest::ingest(
+            thread_id,
+            org_id,
+            &stream_name,
+            IngestionRequest::JsonValues(IngestionValueType::Bulk, records),
+            user.clone(),
+            None,
+            false,
+        )
+        .await
+        {
+            Ok(v) => {
+                // A non-2xx means records of this stream were not written:
+                // the per-item errors below carry the detail, and the code
+                // propagates so the shipper does not delete its copy.
+                if v.code > status_code {
+                    status_code = v.code;
+                }
+                for status in v.status {
+                    bulk_res.items.extend(status.items);
+                }
+            }
+            Err(e) => {
+                log::error!("[LOGS:BULK] stream {org_id}/logs/{stream_name}: Ingestion error: {e}");
+                if matches!(e, infra::errors::Error::ResourceError(_)) {
+                    status_code = status_code.max(StatusCode::SERVICE_UNAVAILABLE.as_u16());
+                } else {
+                    status_code = status_code.max(StatusCode::INTERNAL_SERVER_ERROR.as_u16());
+                }
+                metrics::INGEST_ERRORS
+                    .with_label_values(&[
+                        org_id,
+                        StreamType::Logs.as_str(),
+                        &stream_name,
+                        TRANSFORM_FAILED,
+                    ])
+                    .inc();
+                add_record_status(
+                    stream_name.to_string(),
+                    None,
+                    action.to_string(),
+                    None,
+                    &mut bulk_res,
+                    Some(PIPELINE_EXEC_FAILED.to_string()),
+                    Some(e.to_string()),
+                );
+            }
+        }
+    }
+
+    // `errors` is the ES-level "some item failed" flag: recompute it from the
+    // items, the per-stream responses carry their own failures.
+    bulk_res.errors = bulk_res.errors
+        || bulk_res
+            .items
+            .iter()
+            .any(|item| item.values().any(|res| res.error.is_some()));
+
+    // metric + data usage
+    let metric_status_code = if status_code > 299 || bulk_res.errors {
+        "500"
+    } else {
+        "200"
+    };
+    let took_time = start.elapsed().as_secs_f64();
+    metrics::HTTP_RESPONSE_TIME
+        .with_label_values(&[
+            "/api/org/ingest/logs/_bulk",
+            metric_status_code,
+            org_id,
+            StreamType::Logs.as_str(),
+            "",
+            "",
+        ])
+        .observe(took_time);
+    metrics::HTTP_INCOMING_REQUESTS
+        .with_label_values(&[
+            "/api/org/ingest/logs/_bulk",
+            metric_status_code,
+            org_id,
+            StreamType::Logs.as_str(),
+            "",
+            "",
+        ])
+        .inc();
+    Ok((bulk_res, status_code))
+}
+
+/// Parse an NDJSON bulk body into per-stream records.
+///
+/// Elasticsearch bulk semantics — which this endpoint advertises — are
+/// per-line: a line that is not valid JSON, or a data line that is not an
+/// object, fails on its own and is recorded in `bulk_res.items`. It must
+/// never discard the records already accumulated from earlier lines, and it
+/// must never unwind the request.
+async fn parse_bulk_body(
+    org_id: &str,
+    body: &[u8],
+    (min_ts, max_ts): (i64, i64),
+    log_ingestion_errors: bool,
+    bulk_res: &mut BulkResponse,
+) -> Result<BulkParsedBody> {
+    let cfg = get_config();
     let mut action = String::new();
     let mut stream_name = String::new();
     let mut doc_id: Option<String> = None;
@@ -83,7 +218,7 @@ pub async fn ingest(
     let mut next_line_is_data = false;
     // Read lines as bytes to handle potential invalid UTF-8 characters
     let mut line_buffer = Vec::new();
-    let mut reader = BufReader::new(body.as_ref());
+    let mut reader = BufReader::new(body);
     loop {
         line_buffer.clear();
         let bytes_read = reader.read_until(b'\n', &mut line_buffer)?;
@@ -102,13 +237,71 @@ pub async fn ingest(
         // Use from_utf8_lossy to handle potential invalid UTF-8 characters
         // Invalid UTF-8 sequences will be replaced with the replacement character (�)
         let line_str = String::from_utf8_lossy(&line_buffer);
-        let mut value: json::Value = json::from_slice(line_str.as_bytes())?;
+        let mut value: json::Value = match json::from_slice(line_str.as_bytes()) {
+            Ok(value) => value,
+            Err(e) => {
+                // Per-line failure: propagating here would discard every
+                // record accumulated before this line. Resync to expecting an
+                // action line.
+                let err_msg = format!("malformed json line: {e}");
+                log::warn!("[LOGS:BULK] {err_msg}");
+                metrics::INGEST_ERRORS
+                    .with_label_values(&[
+                        org_id,
+                        StreamType::Logs.as_str(),
+                        &stream_name,
+                        MALFORMED_LINE,
+                    ])
+                    .inc();
+                log_failed_record(log_ingestion_errors, &line_str, MALFORMED_LINE);
+                bulk_res.errors = true;
+                add_record_status(
+                    stream_name.to_string(),
+                    doc_id.clone(),
+                    action.to_string(),
+                    Some(json::Value::String(line_str.to_string())),
+                    bulk_res,
+                    Some(MALFORMED_LINE.to_string()),
+                    Some(err_msg),
+                );
+                next_line_is_data = false;
+                continue;
+            }
+        };
 
         if !next_line_is_data {
             // check bulk operate
             let Some((line_action, line_stream_name, line_doc_id)) =
                 super::parse_bulk_index(&value)
             else {
+                // Not an action line where one was expected. This is how the
+                // resync after a malformed action line sees that action's
+                // DATA line: skipping silently here dropped that document
+                // with no item at all. Every line is either indexed or
+                // reported — never swallowed.
+                let err_msg =
+                    "expected an action line with create/index/update; the line was not indexed"
+                        .to_string();
+                log::warn!("[LOGS:BULK] {err_msg}: {line_str}");
+                metrics::INGEST_ERRORS
+                    .with_label_values(&[
+                        org_id,
+                        StreamType::Logs.as_str(),
+                        &stream_name,
+                        INVALID_ACTION_LINE,
+                    ])
+                    .inc();
+                log_failed_record(log_ingestion_errors, &line_str, INVALID_ACTION_LINE);
+                bulk_res.errors = true;
+                add_record_status(
+                    stream_name.to_string(),
+                    doc_id.clone(),
+                    action.to_string(),
+                    Some(value),
+                    bulk_res,
+                    Some(INVALID_ACTION_LINE.to_string()),
+                    Some(err_msg),
+                );
                 continue;
             };
             if line_action != action {
@@ -197,12 +390,39 @@ pub async fn ingest(
             // get json object
             let mut local_val = match value.take() {
                 json::Value::Object(v) => v,
-                _ => unreachable!(),
+                // valid JSON, but not a document: the line fails on its own
+                other => {
+                    let err_msg = format!("bulk data line is not a json object: {other}");
+                    log::warn!("[LOGS:BULK] {err_msg}");
+                    metrics::INGEST_ERRORS
+                        .with_label_values(&[
+                            org_id,
+                            StreamType::Logs.as_str(),
+                            &stream_name,
+                            DOC_NOT_AN_OBJECT,
+                        ])
+                        .inc();
+                    log_failed_record(log_ingestion_errors, &other, DOC_NOT_AN_OBJECT);
+                    bulk_res.errors = true;
+                    add_record_status(
+                        stream_name.to_string(),
+                        doc_id.clone(),
+                        action.to_string(),
+                        Some(other),
+                        bulk_res,
+                        Some(DOC_NOT_AN_OBJECT.to_string()),
+                        Some(err_msg),
+                    );
+                    continue;
+                }
             };
 
             // set _id
             if let Some(doc_id) = &doc_id {
-                local_val.insert("_id".to_string(), json::Value::String(doc_id.to_string()));
+                local_val.insert(
+                    super::DOC_ID_COL_NAME.to_string(),
+                    json::Value::String(doc_id.to_string()),
+                );
             }
 
             // check _timestamp
@@ -225,7 +445,7 @@ pub async fn ingest(
                             doc_id.clone(),
                             action.to_string(),
                             Some(value),
-                            &mut bulk_res,
+                            bulk_res,
                             Some(TS_PARSE_FAILED.to_string()),
                             Some(TS_PARSE_FAILED.to_string()),
                         );
@@ -257,7 +477,7 @@ pub async fn ingest(
                     doc_id.clone(),
                     action.to_string(),
                     Some(value),
-                    &mut bulk_res,
+                    bulk_res,
                     Some(TS_PARSE_FAILED.to_string()),
                     failure_reason,
                 );
@@ -281,72 +501,10 @@ pub async fn ingest(
         tokio::task::coop::consume_budget().await;
     }
 
-    // process data by stream
-    for (stream_name, records) in streams_data {
-        match super::ingest::ingest(
-            thread_id,
-            org_id,
-            &stream_name,
-            IngestionRequest::JsonValues(IngestionValueType::Bulk, records),
-            user.clone(),
-            None,
-            false,
-        )
-        .await
-        {
-            Ok(v) => {
-                for status in v.status {
-                    bulk_res.items.extend(status.items);
-                }
-            }
-            Err(e) => {
-                log::error!("[LOGS:BULK] stream {org_id}/logs/{stream_name}: Ingestion error: {e}");
-                bulk_res.errors = true;
-                metrics::INGEST_ERRORS
-                    .with_label_values(&[
-                        org_id,
-                        StreamType::Logs.as_str(),
-                        &stream_name,
-                        TRANSFORM_FAILED,
-                    ])
-                    .inc();
-                add_record_status(
-                    stream_name.to_string(),
-                    None,
-                    action.to_string(),
-                    None,
-                    &mut bulk_res,
-                    Some(PIPELINE_EXEC_FAILED.to_string()),
-                    Some(PIPELINE_EXEC_FAILED.to_string()),
-                );
-            }
-        }
-    }
-
-    // metric + data usage
-    let status_code = if bulk_res.errors { "500" } else { "200" };
-    let took_time = start.elapsed().as_secs_f64();
-    metrics::HTTP_RESPONSE_TIME
-        .with_label_values(&[
-            "/api/org/ingest/logs/_bulk",
-            status_code,
-            org_id,
-            StreamType::Logs.as_str(),
-            "",
-            "",
-        ])
-        .observe(took_time);
-    metrics::HTTP_INCOMING_REQUESTS
-        .with_label_values(&[
-            "/api/org/ingest/logs/_bulk",
-            status_code,
-            org_id,
-            StreamType::Logs.as_str(),
-            "",
-            "",
-        ])
-        .inc();
-    Ok(bulk_res)
+    Ok(BulkParsedBody {
+        streams_data,
+        action,
+    })
 }
 
 pub fn add_record_status(
@@ -409,6 +567,204 @@ mod tests {
     use super::*;
     use crate::common::meta::ingestion::IngestUser;
 
+    /// A wide ingestion window, so these tests exercise line handling only.
+    const ANY_TIME: (i64, i64) = (0, i64::MAX);
+
+    fn item_errors(bulk_res: &BulkResponse) -> Vec<&BulkResponseError> {
+        bulk_res
+            .items
+            .iter()
+            .flat_map(|item| item.values())
+            .filter_map(|res| res.error.as_ref())
+            .collect()
+    }
+
+    /// ES bulk semantics are per-line: a malformed NDJSON line fails on its
+    /// own. Propagating the parse error discarded every record accumulated
+    /// before it — a single bad line silently dropped the whole batch.
+    #[tokio::test]
+    async fn test_malformed_line_fails_alone() {
+        let body = concat!(
+            r#"{"index": {"_index": "stream_a", "_id": "1"}}"#,
+            "\n",
+            r#"{"message": "first"}"#,
+            "\n",
+            "{not json at all",
+            "\n",
+            r#"{"index": {"_index": "stream_a", "_id": "2"}}"#,
+            "\n",
+            r#"{"message": "second"}"#,
+            "\n",
+        );
+        let mut bulk_res = BulkResponse::default();
+        let parsed = parse_bulk_body("test_org", body.as_bytes(), ANY_TIME, false, &mut bulk_res)
+            .await
+            .expect("a malformed line must not fail the request");
+
+        // the records around the bad line are kept
+        let records = parsed.streams_data.get("stream_a").expect("stream_a");
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["message"], "first");
+        assert_eq!(records[1]["message"], "second");
+
+        // and the bad line is reported
+        let errors = item_errors(&bulk_res);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].err_type, MALFORMED_LINE);
+    }
+
+    /// After a malformed ACTION line the parser resyncs to "expect action" —
+    /// the document line that belonged to that action must be REPORTED, not
+    /// silently swallowed: it lands on `INVALID_ACTION_LINE` and the records
+    /// around the pair are untouched.
+    #[tokio::test]
+    async fn test_resync_after_malformed_action_reports_the_swallowed_line() {
+        let body = concat!(
+            r#"{"index": {"_index": "stream_a", "_id": "1"}}"#,
+            "\n",
+            r#"{"message": "first"}"#,
+            "\n",
+            "{malformed action line",
+            "\n",
+            r#"{"message": "swallowed doc"}"#,
+            "\n",
+            r#"{"index": {"_index": "stream_a", "_id": "2"}}"#,
+            "\n",
+            r#"{"message": "second"}"#,
+            "\n",
+        );
+        let mut bulk_res = BulkResponse::default();
+        let parsed = parse_bulk_body("test_org", body.as_bytes(), ANY_TIME, false, &mut bulk_res)
+            .await
+            .expect("a malformed action line must not fail the request");
+
+        // the records around the malformed pair are kept
+        let records = parsed.streams_data.get("stream_a").expect("stream_a");
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["message"], "first");
+        assert_eq!(records[1]["message"], "second");
+
+        // BOTH lines of the malformed pair are reported: the action line and
+        // the document line it dragged down
+        let errors = item_errors(&bulk_res);
+        assert_eq!(errors.len(), 2, "no line is swallowed without an item");
+        assert_eq!(errors[0].err_type, MALFORMED_LINE);
+        assert_eq!(errors[1].err_type, INVALID_ACTION_LINE);
+        assert!(bulk_res.errors);
+    }
+
+    /// An unsupported action (e.g. `delete`) where an action line is expected
+    /// is reported instead of silently ignored, and does not consume the
+    /// following line.
+    #[tokio::test]
+    async fn test_unsupported_action_line_is_reported() {
+        let body = concat!(
+            r#"{"delete": {"_index": "stream_a", "_id": "1"}}"#,
+            "\n",
+            r#"{"index": {"_index": "stream_a", "_id": "2"}}"#,
+            "\n",
+            r#"{"message": "kept"}"#,
+            "\n",
+        );
+        let mut bulk_res = BulkResponse::default();
+        let parsed = parse_bulk_body("test_org", body.as_bytes(), ANY_TIME, false, &mut bulk_res)
+            .await
+            .expect("an unsupported action must not fail the request");
+
+        let records = parsed.streams_data.get("stream_a").expect("stream_a");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["message"], "kept");
+
+        let errors = item_errors(&bulk_res);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].err_type, INVALID_ACTION_LINE);
+    }
+
+    /// A valid-JSON data line that is not an object used to hit
+    /// `unreachable!()` and unwind the whole request.
+    #[tokio::test]
+    async fn test_non_object_data_line_fails_alone() {
+        let body = concat!(
+            r#"{"index": {"_index": "stream_a", "_id": "1"}}"#,
+            "\n",
+            "[1, 2, 3]",
+            "\n",
+            r#"{"index": {"_index": "stream_a", "_id": "2"}}"#,
+            "\n",
+            r#"{"message": "kept"}"#,
+            "\n",
+        );
+        let mut bulk_res = BulkResponse::default();
+        let parsed = parse_bulk_body("test_org", body.as_bytes(), ANY_TIME, false, &mut bulk_res)
+            .await
+            .expect("a non-object data line must not fail the request");
+
+        let records = parsed.streams_data.get("stream_a").expect("stream_a");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["message"], "kept");
+
+        let errors = item_errors(&bulk_res);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].err_type, DOC_NOT_AN_OBJECT);
+    }
+
+    /// A numeric `_id` — in the action metadata or in the document itself —
+    /// must not panic. The action-level one is simply not a doc id; the
+    /// document-level one is rejected per-record downstream
+    /// (`logs::tests::test_record_doc_id_non_string_is_an_error`).
+    #[tokio::test]
+    async fn test_numeric_doc_id_does_not_panic() {
+        let body = concat!(
+            r#"{"index": {"_index": "stream_a", "_id": 42}}"#,
+            "\n",
+            r#"{"message": "no doc id"}"#,
+            "\n",
+            r#"{"index": {"_index": "stream_a"}}"#,
+            "\n",
+            r#"{"message": "numeric id", "_id": 7}"#,
+            "\n",
+        );
+        let mut bulk_res = BulkResponse::default();
+        let parsed = parse_bulk_body("test_org", body.as_bytes(), ANY_TIME, false, &mut bulk_res)
+            .await
+            .expect("a numeric _id must not fail the request");
+
+        let records = parsed.streams_data.get("stream_a").expect("stream_a");
+        assert_eq!(records.len(), 2);
+        // the non-string action `_id` is dropped, not copied onto the record
+        assert!(records[0].get(super::super::DOC_ID_COL_NAME).is_none());
+        assert_eq!(records[1][super::super::DOC_ID_COL_NAME], 7);
+    }
+
+    /// Every well-formed line still lands in its stream.
+    #[tokio::test]
+    async fn test_parse_bulk_body_groups_by_stream() {
+        let body = concat!(
+            r#"{"index": {"_index": "stream_a"}}"#,
+            "\n",
+            r#"{"message": "a1"}"#,
+            "\n",
+            r#"{"create": {"_index": "stream_b", "_id": "b1"}}"#,
+            "\n",
+            r#"{"message": "b1"}"#,
+            "\n",
+        );
+        let mut bulk_res = BulkResponse::default();
+        let parsed = parse_bulk_body("test_org", body.as_bytes(), ANY_TIME, false, &mut bulk_res)
+            .await
+            .unwrap();
+
+        assert_eq!(parsed.streams_data.len(), 2);
+        assert_eq!(parsed.streams_data["stream_a"].len(), 1);
+        assert_eq!(parsed.streams_data["stream_b"].len(), 1);
+        // the doc id of the action line is copied onto the record
+        assert_eq!(
+            parsed.streams_data["stream_b"][0][super::super::DOC_ID_COL_NAME],
+            "b1"
+        );
+        assert!(item_errors(&bulk_res).is_empty());
+    }
+
     #[test]
     fn test_add_record_status() {
         let mut bulk_res = BulkResponse {
@@ -446,7 +802,7 @@ mod tests {
         // The test should either succeed or fail with a specific error
         // (likely related to missing database connections or configuration)
         match result {
-            Ok(response) => {
+            Ok((response, _code)) => {
                 // If successful, verify basic response structure
                 // The response should have items if the configuration allows it
                 if !get_config().common.bulk_api_response_errors_only {

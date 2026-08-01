@@ -642,18 +642,20 @@ describe("AddStream", () => {
       expect(payload.settings.partition_keys).toEqual([]);
     });
 
-    it("maps FTS / secondary / bloom index types", async () => {
+    it("maps FTS / column store index types (bloom retired)", async () => {
       const wrapper = mountComp();
       await flushPromises();
       const rows = [
         { name: "log_field", type: "", index_type: ["fullTextSearchKey"] },
-        { name: "user_id", type: "", index_type: ["secondaryIndexKey"] },
+        { name: "user_id", type: "", index_type: ["columnStoreKey"] },
+        // bloom filters are retired as an index type for logs/traces — a
+        // stale value must not map into the payload
         { name: "session_id", type: "", index_type: ["bloomFilterKey"] },
       ];
       const payload = (wrapper.vm as any).getStreamPayload(14, rows);
       expect(payload.settings.full_text_search_keys).toContain("log_field");
-      expect(payload.settings.index_fields).toContain("user_id");
-      expect(payload.settings.bloom_filter_fields).toContain("session_id");
+      expect(payload.settings.column_store_fields).toContain("user_id");
+      expect(payload.settings.bloom_filter_fields).toEqual([]);
     });
 
     it("normalizes field names (lowercase, spaces/dashes → underscores)", async () => {
@@ -688,14 +690,14 @@ describe("AddStream", () => {
       });
     });
 
-    it("adds defined_schema_fields when UDS is enabled", async () => {
-      const customStore = makeStore({ user_defined_schemas_enabled: true });
-      const wrapper = mountComp(customStore);
+    it("does not include removed settings keys (defined_schema_fields / index_fields)", async () => {
+      const wrapper = mountComp();
       await flushPromises();
       const payload = (wrapper.vm as any).getStreamPayload(14, [
         { name: "my_field", type: "", index_type: [] },
       ]);
-      expect(payload.settings.defined_schema_fields).toContain("my_field");
+      expect(payload.settings).not.toHaveProperty("defined_schema_fields");
+      expect(payload.settings).not.toHaveProperty("index_fields");
     });
 
     it("sets data_retention when retention is shown", async () => {

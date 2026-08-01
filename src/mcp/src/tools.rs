@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Ok, Result};
-use config::tantivy::tokenizer::{CollectType, O2_TOKENIZER, o2_tokenizer_build};
+use config::text_tokenizer::{CollectType, O2_TOKENIZER, o2_tokenizer_build};
 use serde::Deserialize;
 use tantivy::{
     Index, IndexWriter, TantivyDocument,

@@ -55,17 +55,26 @@ pub async fn set(account: &str, key: &str, meta: Option<FileMeta>, deleted: bool
 
     // write into file_list storage
     // retry 5 times
+    let mut last_err = None;
     for _ in 0..5 {
         match progress(account, key, meta.as_ref(), deleted).await {
             Ok(id) => {
                 file_data.id = id;
+                last_err = None;
                 break;
             }
             Err(e) => {
                 log::error!("[FILE_LIST] Error saving file to storage, retrying: {e}");
+                last_err = Some(e);
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
             }
         }
+    }
+    // callers gate destructive follow-ups (deleting the WAL source file) on
+    // this result — swallowing a registration failure turns a DB outage into
+    // uploaded-but-unregistered objects whose rows never exist: silent loss
+    if let Some(e) = last_err {
+        return Err(e);
     }
 
     let cfg = config::get_config();
@@ -84,6 +93,7 @@ async fn progress(account: &str, key: &str, data: Option<&FileMeta>, delete: boo
     if delete {
         if let Err(e) = infra::file_list::remove(key).await {
             log::error!("service:db:file_list: delete {key}, remove error: {e}");
+            return Err(e);
         }
     } else if let Some(data) = data {
         match infra::file_list::add(account, key, data).await {
@@ -92,6 +102,7 @@ async fn progress(account: &str, key: &str, data: Option<&FileMeta>, delete: boo
             }
             Err(e) => {
                 log::error!("service:db:file_list: add {key}, add error: {e}");
+                return Err(e);
             }
         }
         // update stream stats realtime

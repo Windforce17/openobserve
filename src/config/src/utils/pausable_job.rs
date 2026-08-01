@@ -26,7 +26,7 @@ pub const PAUSE_SLEEP_DURATION: u64 = 60;
 /// 3. If not paused, it sleeps for the interval and executes the job logic
 ///
 /// # Syntax
-/// ```rust
+/// ```text
 /// spawn_pausable_job!(
 ///     "job_name",
 ///     interval_expression,
@@ -48,8 +48,11 @@ pub const PAUSE_SLEEP_DURATION: u64 = 60;
 /// ```
 ///
 /// # Examples
-/// ```rust
-/// use config::utils::pausable_job::spawn_pausable_job;
+/// ```rust,ignore
+/// // Illustrative only: gc()/update_metrics()/run_compaction() are not real
+/// // functions, and the exported macro lives at the crate root
+/// // (config::spawn_pausable_job).
+/// use config::spawn_pausable_job;
 /// use config::get_config;
 ///
 /// // Basic usage (sleep before, pause when <= 0)

@@ -171,6 +171,16 @@ pub async fn merge_parquet_files(
             .await?
         }
         FileFormat::Vortex => write_vortex(schema, rx, read_task).await?,
+        // unreachable: `vix` is not a valid ZO_FILE_FORMAT (normalized away
+        // at config load). Core .vix files are written by
+        // openobserve-core's vix::core_writer, not by this merge.
+        FileFormat::Vix => {
+            return Err(DataFusionError::NotImplemented(
+                "merge_parquet_files cannot write core .vix files; the core-file write path \
+                 lives in vix::core_writer"
+                    .to_string(),
+            ));
+        }
     };
 
     log::debug!(
@@ -245,17 +255,7 @@ async fn write_vortex(
     rx: tokio::sync::mpsc::Receiver<RecordBatch>,
     read_task: tokio::task::JoinHandle<Result<()>>,
 ) -> Result<Vec<u8>> {
-    #[cfg(all(feature = "enterprise", feature = "vortex"))]
-    {
-        o2_enterprise::enterprise::search::vortex::write_vortex(schema, rx, read_task).await
-    }
-    #[cfg(not(all(feature = "enterprise", feature = "vortex")))]
-    {
-        let _ = (schema, rx, read_task);
-        Err(DataFusionError::Execution(
-            "Vortex file format requires enterprise and vortex features".to_string(),
-        ))
-    }
+    crate::datafusion::vortex_support::write_vortex(schema, rx, read_task).await
 }
 
 pub fn append_metadata(

@@ -24,11 +24,12 @@ use infra::errors::Result;
 use super::{datafusion::exec::TableBuilder, index::IndexCondition};
 
 pub mod flight;
+pub mod segments_scan;
 pub mod storage;
 pub mod wal;
 pub use ::search::{file_cache::calc_target_partitions, types::QueryParams};
 
-pub use super::tantivy::cache as tantivy_result_cache;
+pub use super::vix::cache as index_result_cache;
 
 pub type SearchTable = Result<(Vec<Arc<dyn TableProvider>>, ScanStats, HashSet<u64>)>;
 

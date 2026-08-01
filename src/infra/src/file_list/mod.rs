@@ -22,7 +22,7 @@ use config::{
         meta_store::MetaStore,
         stream::{FileKey, FileListDeleted, FileMeta, PartitionTimeLevel, StreamStats, StreamType},
     },
-    utils::time::second_micros,
+    utils::{parquet::parse_file_key_columns, time::second_micros},
 };
 
 use crate::errors::{Error, Result};
@@ -67,7 +67,6 @@ pub trait FileList: Sync + Send + 'static {
     async fn batch_remove_deleted(&self, files: &[FileKey]) -> Result<()>;
     async fn get(&self, file: &str) -> Result<FileMeta>;
     async fn contains(&self, file: &str) -> Result<bool>;
-    async fn update_flattened(&self, file: &str, flattened: bool) -> Result<()>;
     async fn update_compressed_size(&self, file: &str, size: i64) -> Result<()>;
     /// Bulk-set `bloom_ver` for the given file_list ids. Used by the
     /// post-merge bloom builder (enterprise `bloom::compact`).
@@ -93,7 +92,6 @@ pub trait FileList: Sync + Send + 'static {
         stream_name: &str,
         time_level: PartitionTimeLevel,
         time_range: (i64, i64),
-        flattened: Option<bool>,
     ) -> Result<Vec<FileKey>>;
     async fn query_for_merge(
         &self,
@@ -101,6 +99,7 @@ pub trait FileList: Sync + Send + 'static {
         stream_type: StreamType,
         stream_name: &str,
         date_range: (String, String),
+        include_oversize: bool,
     ) -> Result<Vec<FileKey>>;
     async fn query_for_dump(
         &self,
@@ -118,6 +117,16 @@ pub trait FileList: Sync + Send + 'static {
         stream_name: &str,
         date: &str,
     ) -> Result<Vec<FileKey>>;
+    /// Distinct `(stream, date)` buckets that still contain bloom-pending
+    /// files (`index_size > 0 AND bloom_ver = 0`), newest CLOSED hours
+    /// first — the bloom builder's discovery queue. `before_date` excludes
+    /// the still-open hour: its buckets re-pend on every fresh file and
+    /// would starve the whole backlog out of the batch.
+    async fn query_bloom_pending_buckets(
+        &self,
+        before_date: &str,
+        limit: i64,
+    ) -> Result<Vec<(String, String)>>;
     async fn query_by_ids(
         &self,
         ids: &[i64],
@@ -208,6 +217,7 @@ pub trait FileList: Sync + Send + 'static {
     -> Result<u64>;
     async fn set_job_done(&self, ids: &[i64]) -> Result<()>;
     async fn update_running_jobs(&self, ids: &[i64]) -> Result<()>;
+    async fn confirm_job_ownership(&self, id: i64, node: &str) -> Result<bool>;
     async fn check_running_jobs(&self, before_date: i64) -> Result<()>;
     async fn clean_done_jobs(&self, before_date: i64) -> Result<()>;
     async fn get_pending_dump_jobs(
@@ -307,11 +317,6 @@ pub async fn contains(file: &str) -> Result<bool> {
 }
 
 #[inline]
-pub async fn update_flattened(file: &str, flattened: bool) -> Result<()> {
-    CLIENT.update_flattened(file, flattened).await
-}
-
-#[inline]
 pub async fn update_bloom_ver(ids: &[i64], bloom_ver: i64) -> Result<()> {
     if ids.is_empty() {
         return Ok(());
@@ -351,18 +356,10 @@ pub async fn query(
     stream_name: &str,
     time_level: PartitionTimeLevel,
     time_range: (i64, i64),
-    flattened: Option<bool>,
 ) -> Result<Vec<FileKey>> {
     validate_time_range(time_range)?;
     CLIENT
-        .query(
-            org_id,
-            stream_type,
-            stream_name,
-            time_level,
-            time_range,
-            flattened,
-        )
+        .query(org_id, stream_type, stream_name, time_level, time_range)
         .await
 }
 
@@ -373,9 +370,16 @@ pub async fn query_for_merge(
     stream_type: StreamType,
     stream_name: &str,
     date_range: (String, String),
+    include_oversize: bool,
 ) -> Result<Vec<FileKey>> {
     CLIENT
-        .query_for_merge(org_id, stream_type, stream_name, date_range)
+        .query_for_merge(
+            org_id,
+            stream_type,
+            stream_name,
+            date_range,
+            include_oversize,
+        )
         .await
 }
 
@@ -410,6 +414,14 @@ pub async fn query_for_bloom(
     CLIENT
         .query_for_bloom(org_id, stream_type, stream_name, date)
         .await
+}
+
+/// See [`FileList::query_bloom_pending_buckets`].
+pub async fn query_bloom_pending_buckets(
+    before_date: &str,
+    limit: i64,
+) -> Result<Vec<(String, String)>> {
+    CLIENT.query_bloom_pending_buckets(before_date, limit).await
 }
 
 #[inline]
@@ -602,6 +614,18 @@ pub async fn update_running_jobs(ids: &[i64]) -> Result<()> {
     CLIENT.update_running_jobs(ids).await
 }
 
+/// Commit fence for merge jobs (2026-07-30 audit): refresh `updated_at` of
+/// ONE job with a single conditional UPDATE — `WHERE id = $job AND node =
+/// $node AND status = Running` — and report whether the row was hit.
+/// `false` means the lease was lost (the job timed out and was re-pended,
+/// and possibly re-claimed by another node): the caller must DISCARD its
+/// merge result instead of committing it, or two nodes double-commit the
+/// same inputs (permanent duplicate rows).
+#[inline]
+pub async fn confirm_job_ownership(id: i64, node: &str) -> Result<bool> {
+    CLIENT.confirm_job_ownership(id, node).await
+}
+
 #[inline]
 pub async fn check_running_jobs(before_date: i64) -> Result<()> {
     CLIENT.check_running_jobs(before_date).await
@@ -644,6 +668,23 @@ pub async fn query_dump_stats_by_date_range(
         .await
 }
 
+/// Moves all of an org's `file_list` rows into `file_list_deleted` (used by
+/// `delete_by_org` in both backends — the SQL is identical, `$N` binds work
+/// for postgres and sqlite alike).
+///
+/// `index_file` is always false: core `.vix` files embed their index in the
+/// data object, so no file has a separate sibling index object to GC.
+pub(crate) const MOVE_FILE_LIST_TO_DELETED_SQL: &str = r#"INSERT INTO file_list_deleted (account, org, stream, date, file, index_file, flattened, created_at)
+       SELECT account, org, stream, date, file, false, flattened, $2
+       FROM file_list WHERE org = $1;"#;
+
+/// Returns `(sum(original_size), sum(index_size))` for one org+account.
+///
+/// NOTE(accounting): these are two INDEPENDENT figures — never add them. The
+/// stored footprint is `sum(compressed_size)` (not returned here); for core
+/// `.vix` files `index_size` is a subset of `compressed_size` (the index is
+/// embedded in the data object), so any `x + index_size` total double-counts.
+/// Currently has no in-tree callers; kept for external/cloud consumers.
 #[inline]
 pub async fn org_stats_by_account(org_id: &str, account: &str) -> Result<(i64, i64)> {
     CLIENT.org_stats_by_account(org_id, account).await
@@ -680,6 +721,53 @@ fn validate_time_range(time_range: (i64, i64)) -> Result<()> {
         return Err(Error::Message("[file_list] invalid time range".to_string()));
     }
     Ok(())
+}
+
+/// Reject a file_list ADD whose `FileMeta` is degenerate before any SQL is
+/// built: a non-empty file with `min_ts`/`max_ts` ≤ 0 (or an inverted range)
+/// poisons time-range pruning forever, and the live regression showed such a
+/// row wedging the compactor's commit loop. The writer-side guards
+/// (`VixWriter::finish`, `apply_core_stats_to_meta`) make this unreachable
+/// from healthy producers, so hitting it is a bug — surfaced as
+/// [`Error::InvalidFileMeta`], which retry loops classify as deterministic
+/// (see [`Error::is_deterministic_db_error`]). Empty files (`records == 0`)
+/// legitimately carry a `(0, 0)` range.
+#[inline]
+pub(crate) fn validate_file_meta_for_add(key: &str, meta: &FileMeta) -> Result<()> {
+    if meta.records > 0 && (meta.min_ts <= 0 || meta.max_ts <= 0 || meta.min_ts > meta.max_ts) {
+        return Err(Error::InvalidFileMeta(format!(
+            "degenerate time range [{}, {}] for a {}-record file: {key}",
+            meta.min_ts, meta.max_ts, meta.records,
+        )));
+    }
+    Ok(())
+}
+
+/// One validated, parsed add-side row of a batch insert:
+/// `(file, org, stream, date, file_name)`.
+pub(crate) type BatchAddRow<'a> = (&'a FileKey, String, String, String, String);
+
+/// The shared pre-SQL gate of every batch add — both backends'
+/// `inner_batch_process` and `wal_segments::mark_built_with_files`: validate
+/// EVERY non-deleted item's meta and parse its key before any statement is
+/// built. One bad row must fail the whole batch instead of being skipped (a
+/// skip would commit sibling deletes while dropping the add — silent data
+/// loss), and a total parse keeps the VALUES builder from emitting empty
+/// `()` tuples (the live "syntax error at or near )" regression).
+pub(crate) fn prepare_batch_add(files: &[FileKey]) -> Result<Vec<BatchAddRow<'_>>> {
+    let mut rows = Vec::with_capacity(files.len());
+    for item in files.iter().filter(|v| !v.deleted) {
+        validate_file_meta_for_add(&item.key, &item.meta)?;
+        let (stream_key, date_key, file_name) = parse_file_key_columns(&item.key).map_err(|e| {
+            Error::InvalidFileMeta(format!("parse file key {:?} failed: {e}", item.key))
+        })?;
+        let org_end = stream_key.find('/').ok_or_else(|| {
+            Error::InvalidFileMeta(format!("file key {:?} has no org segment", item.key))
+        })?;
+        let org_id = stream_key[..org_end].to_string();
+        rows.push((item, org_id, stream_key, date_key, file_name));
+    }
+    Ok(rows)
 }
 
 pub fn calculate_max_ts_upper_bound(time_end: i64, stream_type: StreamType) -> i64 {
@@ -753,6 +841,7 @@ impl From<&FileRecord> for FileKey {
             deleted: r.deleted,
             selection: None,
             row_group_size: None,
+            selection_exact: false,
         }
     }
 }
@@ -919,6 +1008,54 @@ mod tests {
         assert!(parse_stream_key("org/logs/stream/extra").is_none());
     }
 
+    // ── validate_file_meta_for_add ────────────────────────────────────────────
+
+    /// The pre-SQL gate of the live regression: a non-empty file whose meta
+    /// carries a degenerate time range must be rejected as a DETERMINISTIC
+    /// error before any statement is built (the old in-builder skip emitted
+    /// empty `()` VALUES tuples — "syntax error at or near )" — and would
+    /// otherwise have deleted merge inputs while dropping the output row).
+    #[test]
+    fn test_validate_file_meta_for_add() {
+        let key = "files/default/logs/default/2026/07/24/10/7486616.vix";
+        let healthy = FileMeta {
+            min_ts: 1_700_000_000_000_000,
+            max_ts: 1_700_000_400_000_000,
+            records: 10,
+            original_size: 1024,
+            ..Default::default()
+        };
+        assert!(validate_file_meta_for_add(key, &healthy).is_ok());
+
+        // empty files legitimately carry a (0, 0) range
+        let empty = FileMeta::default();
+        assert!(validate_file_meta_for_add(key, &empty).is_ok());
+
+        // zero min / zero max / negative / inverted: all rejected, and the
+        // error classifies as deterministic (retry loops bail immediately)
+        for (min_ts, max_ts) in [
+            (0, 1_700_000_400_000_000),
+            (1_700_000_000_000_000, 0),
+            (-1, 1_700_000_400_000_000),
+            (1_700_000_400_000_000, 1_700_000_000_000_000),
+        ] {
+            let meta = FileMeta {
+                min_ts,
+                max_ts,
+                records: 10,
+                ..Default::default()
+            };
+            let err = validate_file_meta_for_add(key, &meta)
+                .expect_err(&format!("[{min_ts}, {max_ts}] must be rejected"));
+            assert!(
+                matches!(err, Error::InvalidFileMeta(_)),
+                "expected InvalidFileMeta, got: {err:?}"
+            );
+            assert!(err.is_deterministic_db_error());
+            assert!(err.to_string().contains(key), "error names the file: {err}");
+        }
+    }
+
     // ── FileListJobStatus::from(i64) ──────────────────────────────────────────
 
     #[test]
@@ -1053,7 +1190,7 @@ mod tests {
             updated_at: 0,
         };
         // Conversion yields meta.bloom_ver == 0 too, which is the "no .bf" sentinel
-        // that downstream search code uses to fall back to the original tantivy path.
+        // that downstream search code uses to fall back to the non-bloom path.
         let meta = FileMeta::from(&record);
         assert_eq!(meta.bloom_ver, 0);
     }

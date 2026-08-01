@@ -160,17 +160,33 @@ const addRow = () => form.pushFieldValue(props.formFieldName, makeStreamFieldRow
 const removeRow = (index: number) =>
   form.removeFieldValue(props.formFieldName, index);
 
+// Per-field user-configurable index types. Every string field carries the
+// automatic term index (exact match); these are the opt-in extras.
 const streamIndexType = [
-  { label: "Full text search", value: "fullTextSearchKey" },
-  { label: "Secondary index", value: "secondaryIndexKey" },
-  { label: "Bloom filter", value: "bloomFilterKey" },
-  { label: "KeyValue partition", value: "keyPartition" },
-  { label: "Prefix partition", value: "prefixPartition" },
-  { label: "Hash partition (8 Buckets)", value: "hashPartition_8" },
-  { label: "Hash partition (16 Buckets)", value: "hashPartition_16" },
-  { label: "Hash partition (32 Buckets)", value: "hashPartition_32" },
-  { label: "Hash partition (64 Buckets)", value: "hashPartition_64" },
-  { label: "Hash partition (128 Buckets)", value: "hashPartition_128" },
+  { label: t("logStream.indexTypeFullTextSearch"), value: "fullTextSearchKey" },
+  { label: t("logStream.indexTypeColumnStore"), value: "columnStoreKey" },
+  { label: t("logStream.indexTypeKeyValuePartition"), value: "keyPartition" },
+  { label: t("logStream.indexTypePrefixPartition"), value: "prefixPartition" },
+  {
+    label: t("logStream.indexTypeHashPartition", { buckets: 8 }),
+    value: "hashPartition_8",
+  },
+  {
+    label: t("logStream.indexTypeHashPartition", { buckets: 16 }),
+    value: "hashPartition_16",
+  },
+  {
+    label: t("logStream.indexTypeHashPartition", { buckets: 32 }),
+    value: "hashPartition_32",
+  },
+  {
+    label: t("logStream.indexTypeHashPartition", { buckets: 64 }),
+    value: "hashPartition_64",
+  },
+  {
+    label: t("logStream.indexTypeHashPartition", { buckets: 128 }),
+    value: "hashPartition_128",
+  },
 ];
 
 const dataTypes = [

@@ -281,20 +281,19 @@ describe("useStreams Composable", () => {
 
   // Test 16-20: Schema and Data Manipulation
   describe("Schema and Data Manipulation", () => {
-    it("should remove schema fields (_o2_id, _original, _all_values)", () => {
+    it("should remove schema fields (_o2_id, _original)", () => {
       const streamData = {
         name: "test",
         schema: [
           { name: "field1", type: "string" },
           { name: "_o2_id", type: "string" },
           { name: "_original", type: "string" },
-          { name: "_all_values", type: "string" },
           { name: "field2", type: "number" }
         ]
       };
-      
+
       const result = streamsInstance.removeSchemaFields(streamData);
-      
+
       expect(result.schema).toHaveLength(2);
       expect(result.schema.map((f: any) => f.name)).toEqual(["field1", "field2"]);
     });
@@ -495,30 +494,33 @@ describe("useStreams Composable", () => {
       const previousSettings = {
         fields: ["field1", "field2"],
         partition_keys: [{ field: "pk1", disabled: false }],
-        index_fields: ["index1"],
+        column_store_fields: ["col1"],
         full_text_search_keys: ["fts1"],
         bloom_filter_fields: ["bloom1"],
-        defined_schema_fields: ["schema1"],
         extended_retention_days: [{ days: 30 }],
         pattern_associations: [{ field: "f1", pattern_id: "p1", policy: "pol1", apply_at: "ingest" }]
       };
-      
+
       const currentSettings = {
         fields: ["field1", "field3"],
         partition_keys: [{ field: "pk2", disabled: false }],
-        index_fields: ["index1", "index2"],
+        column_store_fields: ["col1", "col2"],
         full_text_search_keys: ["fts2"],
         bloom_filter_fields: ["bloom2"],
-        defined_schema_fields: ["schema2"],
         extended_retention_days: [{ days: 60 }],
         pattern_associations: [{ field: "f2", pattern_id: "p2", policy: "pol2", apply_at: "query" }]
       };
-      
+
       const result = streamsInstance.getUpdatedSettings(previousSettings, currentSettings);
-      
+
       expect(result.fields.add).toEqual(["field3"]);
       expect(result.fields.remove).toEqual(["field2"]);
-      expect(result.index_fields.add).toEqual(["index2"]);
+      expect(result.column_store_fields.add).toEqual(["col2"]);
+      expect(result).not.toHaveProperty("index_fields");
+      expect(result).not.toHaveProperty("defined_schema_fields");
+      // blooms are retired as a user-facing index type: never diffed, and a
+      // stale caller-provided value must not leak into the update payload
+      expect(result).not.toHaveProperty("bloom_filter_fields");
     });
 
     it("should handle empty settings in getUpdatedSettings", () => {

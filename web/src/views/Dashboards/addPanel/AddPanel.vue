@@ -1621,7 +1621,7 @@ export default defineComponent({
           const schema = await getStream(stream, streamType, true);
 
           payload["stream_name"] = stream;
-          payload["schema"] = schema.uds_schema || schema.schema || [];
+          payload["schema"] = schema.schema || [];
 
           resolve(payload);
         } catch (error) {

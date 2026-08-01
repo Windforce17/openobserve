@@ -32,9 +32,8 @@ export default {
           settings: {
             partition_keys: {},
             full_text_search_keys: [],
-            index_fields: [],
+            column_store_fields: [],
             bloom_filter_fields: [],
-            defined_schema_fields: [],
             data_retention: 45,
           },
         },

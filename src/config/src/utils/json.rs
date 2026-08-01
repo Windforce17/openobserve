@@ -97,7 +97,7 @@ pub fn estimate_json_bytes(val: &Value) -> usize {
             // {?} extra 2
             size += 2;
             for (k, v) in map {
-                if k == crate::ORIGINAL_DATA_COL_NAME || k == crate::ALL_VALUES_COL_NAME {
+                if k == crate::ORIGINAL_DATA_COL_NAME {
                     continue;
                 }
                 // "key":?, extra 4 bytes
@@ -558,11 +558,10 @@ mod tests {
 
     #[test]
     fn test_estimate_json_bytes_skips_special_cols() {
-        use crate::{ALL_VALUES_COL_NAME, ORIGINAL_DATA_COL_NAME};
-        // Object fields named _original and _all_values should be skipped
+        use crate::ORIGINAL_DATA_COL_NAME;
+        // Object fields named _original should be skipped
         let with_special = json!({
             ORIGINAL_DATA_COL_NAME: "ignored_value",
-            ALL_VALUES_COL_NAME: "also_ignored",
             "normal": "kept"
         });
         let without_special = json!({"normal": "kept"});

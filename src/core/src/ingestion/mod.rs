@@ -14,8 +14,7 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
-    io::Write,
+    collections::{BTreeMap, HashMap},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -24,7 +23,7 @@ use std::{
 
 use chrono::{Duration, TimeZone, Utc};
 use config::{
-    SIZE_IN_MB, TIMESTAMP_COL_NAME,
+    SIZE_IN_MB,
     cluster::{LOCAL_NODE, LOCAL_NODE_ID},
     ider::SnowflakeIdGenerator,
     meta::{
@@ -65,6 +64,7 @@ use crate::{
 
 pub mod grpc;
 pub mod ingestion_service;
+mod segment_mode;
 
 pub use openobserve_vrl::compile_vrl_function;
 
@@ -408,19 +408,55 @@ pub async fn write_file(
         .fold((0, 0), |(acc_records, acc_size), (records, size)| {
             (acc_records + records, acc_size + size)
         });
-    if let Err(e) = writer.write_batch(entries, fsync).await {
+    if config::get_config().common.ingest_segment_mode {
+        // S3-first ingest (DESIGN-SEGMENT-WAL.md): the same arrow conversion
+        // as the legacy writer, but the batches go to the in-process segment
+        // buffer the flusher ships, instead of the memtable/WAL. Errors —
+        // including the buffer-full ResourceError that becomes a 503 —
+        // propagate to the caller that acks.
+        let stream_type = segment_mode::stream_type_from_writer_key(&writer.get_key_str())?;
+        segment_mode::append_entries(
+            segment_wal::global_buffer(),
+            org_id,
+            stream_type,
+            stream_name,
+            &entries,
+        )?;
+    } else if let Err(e) = writer.write_batch(entries, fsync).await {
         log::error!(
             "ingestion write file for stream {}/{} error: {}",
             writer.get_key_str(),
             stream_name,
             e
         );
-        return Err(Error::IngestionError(e.to_string()));
+        // preserve the error KIND (exactly like the segment branch above):
+        // flattening everything into IngestionError erased backpressure, so
+        // `write_failure_status_code` could never map it to a retryable 503
+        // and clients treated memtable/queue-full as a permanent 500
+        return Err(map_ingester_write_error(e));
     }
 
     req_stats.size += entries_size as f64 / SIZE_IN_MB;
     req_stats.records += entries_records as i64;
     Ok(req_stats)
+}
+
+/// Map a legacy-writer error to the infra error kind the ack path switches
+/// on: resource exhaustion — memtable overflow, a full WAL write queue, the
+/// memory/disk circuit breakers — becomes [`Error::ResourceError`], which
+/// `write_failure_status_code` (and every HTTP error mapper) turns into a
+/// retryable 503. Everything else stays [`Error::IngestionError`] (500).
+fn map_ingester_write_error(e: ingester::errors::Error) -> Error {
+    use ingester::errors::Error as IngesterError;
+    match &e {
+        IngesterError::MemoryTableOverflowError {}
+        | IngesterError::MemoryCircuitBreakerError {}
+        | IngesterError::DiskCircuitBreakerError {}
+        | IngesterError::WalError {
+            source: wal::Error::WriteQueueFull { .. },
+        } => Error::ResourceError(e.to_string()),
+        _ => Error::IngestionError(e.to_string()),
+    }
 }
 
 pub async fn check_ingestion_allowed(
@@ -550,14 +586,14 @@ pub fn get_val_with_type_retained(val: &Value) -> Value {
     }
 }
 
-pub async fn get_uds_and_original_data_streams(
+/// Fill `streams_need_original` with whether each stream stores the raw
+/// `_original` record (per its `store_original_data` setting).
+pub async fn get_original_data_streams(
     streams: &[StreamParams],
-    user_defined_schema_map: &mut HashMap<String, Option<HashSet<String>>>,
     streams_need_original: &mut HashMap<String, bool>,
-    streams_need_all_values: &mut HashMap<String, bool>,
 ) {
     for stream in streams {
-        if user_defined_schema_map.contains_key(stream.stream_name.as_str()) {
+        if streams_need_original.contains_key(stream.stream_name.as_str()) {
             continue;
         }
         let stream_settings =
@@ -566,22 +602,8 @@ pub async fn get_uds_and_original_data_streams(
                 .unwrap_or_default();
         streams_need_original.insert(
             stream.stream_name.to_string(),
-            stream_settings.store_original_data || stream_settings.index_original_data,
+            stream_settings.store_original_data,
         );
-        streams_need_all_values.insert(
-            stream.stream_name.to_string(),
-            stream_settings.index_all_values,
-        );
-
-        if !stream_settings.defined_schema_fields.is_empty() {
-            let mut fields = HashSet::<_>::from_iter(stream_settings.defined_schema_fields);
-            if !fields.contains(TIMESTAMP_COL_NAME) {
-                fields.insert(TIMESTAMP_COL_NAME.to_string());
-            }
-            user_defined_schema_map.insert(stream.stream_name.to_string(), Some(fields));
-        } else {
-            user_defined_schema_map.insert(stream.stream_name.to_string(), None);
-        }
     }
 }
 
@@ -607,41 +629,6 @@ pub fn create_log_ingestion_req(
             "Ingestion type not yet supported".to_string(),
         )),
     }
-}
-
-pub fn refactor_map(
-    original_map: Map<String, Value>,
-    defined_schema_keys: &HashSet<String>,
-) -> Map<String, Value> {
-    let mut new_map = Map::with_capacity(defined_schema_keys.len() + 2);
-    let mut non_schema_map = Vec::with_capacity(1024); // 1KB
-
-    let mut has_elements = false;
-    non_schema_map.write_all(b"{").unwrap();
-    for (key, value) in original_map {
-        if defined_schema_keys.contains(&key) {
-            new_map.insert(key, value);
-        } else {
-            if has_elements {
-                non_schema_map.write_all(b",").unwrap();
-            } else {
-                has_elements = true;
-            }
-            serde_json::to_writer(&mut non_schema_map, &key).unwrap();
-            non_schema_map.write_all(b":").unwrap();
-            serde_json::to_writer(&mut non_schema_map, &pickup_string_value(value)).unwrap();
-        }
-    }
-    non_schema_map.write_all(b"}").unwrap();
-
-    if has_elements {
-        new_map.insert(
-            config::get_config().common.column_all.to_string(),
-            Value::String(String::from_utf8(non_schema_map).unwrap()),
-        );
-    }
-
-    new_map
 }
 
 #[cfg(test)]
@@ -726,292 +713,6 @@ mod tests {
                 StreamPartition::new("country"),
                 StreamPartition::new("sport")
             ]
-        );
-    }
-
-    #[test]
-    fn test_refactor_map() {
-        let mut original_map = Map::new();
-        original_map.insert(
-            "event_log_appid".to_string(),
-            Value::String("app1".to_string()),
-        );
-        original_map.insert(
-            "event_log_service".to_string(),
-            Value::String("service1".to_string()),
-        );
-        original_map.insert(
-            "log".to_string(),
-            Value::String("this is Hello".to_string()),
-        );
-        original_map.insert(
-            "message".to_string(),
-            Value::String("this is datafusion".to_string()),
-        );
-        original_map.insert(
-            "user".to_string(),
-            Value::String("user@example.com".to_string()),
-        );
-        original_map.insert(
-            "event_zarr".to_string(),
-            Value::String("[{\"field1\":\"val1\"}]".to_string()),
-        );
-
-        let defined_schema_keys: HashSet<String> = ["log", "message", "user"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-
-        let result = refactor_map(original_map, &defined_schema_keys);
-
-        // Schema keys should be preserved as-is
-        assert_eq!(
-            result.get("log").unwrap(),
-            &Value::String("this is Hello".to_string())
-        );
-        assert_eq!(
-            result.get("message").unwrap(),
-            &Value::String("this is datafusion".to_string())
-        );
-        assert_eq!(
-            result.get("user").unwrap(),
-            &Value::String("user@example.com".to_string())
-        );
-
-        // Non-schema keys should be packed into the _all column as valid JSON
-        let column_all = config::get_config().common.column_all.to_string();
-        let all_value = result.get(&column_all).unwrap().as_str().unwrap();
-        let all_parsed: Map<String, Value> = serde_json::from_str(all_value).unwrap();
-        assert_eq!(
-            all_parsed.get("event_log_appid").unwrap(),
-            &Value::String("app1".to_string())
-        );
-        assert_eq!(
-            all_parsed.get("event_log_service").unwrap(),
-            &Value::String("service1".to_string())
-        );
-        assert_eq!(
-            all_parsed.get("event_zarr").unwrap(),
-            &Value::String("[{\"field1\":\"val1\"}]".to_string())
-        );
-
-        // Should not contain schema keys in _all
-        assert!(all_parsed.get("log").is_none());
-        assert!(all_parsed.get("message").is_none());
-        assert!(all_parsed.get("user").is_none());
-    }
-
-    #[test]
-    fn test_refactor_map_empty_input() {
-        let original_map = Map::new();
-        let defined_schema_keys: HashSet<String> = ["log"].iter().map(|s| s.to_string()).collect();
-
-        let result = refactor_map(original_map, &defined_schema_keys);
-
-        assert!(result.is_empty());
-        let column_all = config::get_config().common.column_all.to_string();
-        assert!(result.get(&column_all).is_none());
-    }
-
-    #[test]
-    fn test_refactor_map_all_keys_in_schema() {
-        let mut original_map = Map::new();
-        original_map.insert("log".to_string(), Value::String("hello".to_string()));
-        original_map.insert("message".to_string(), Value::String("world".to_string()));
-
-        let defined_schema_keys: HashSet<String> =
-            ["log", "message"].iter().map(|s| s.to_string()).collect();
-
-        let result = refactor_map(original_map, &defined_schema_keys);
-
-        assert_eq!(result.len(), 2);
-        assert_eq!(
-            result.get("log").unwrap(),
-            &Value::String("hello".to_string())
-        );
-        assert_eq!(
-            result.get("message").unwrap(),
-            &Value::String("world".to_string())
-        );
-        // No _all column when all keys are in schema
-        let column_all = config::get_config().common.column_all.to_string();
-        assert!(result.get(&column_all).is_none());
-    }
-
-    #[test]
-    fn test_refactor_map_no_keys_in_schema() {
-        let mut original_map = Map::new();
-        original_map.insert("extra1".to_string(), Value::String("val1".to_string()));
-        original_map.insert("extra2".to_string(), Value::String("val2".to_string()));
-
-        let defined_schema_keys: HashSet<String> =
-            ["log", "message"].iter().map(|s| s.to_string()).collect();
-
-        let result = refactor_map(original_map, &defined_schema_keys);
-
-        // No schema keys present, so only _all
-        assert!(result.get("log").is_none());
-        assert!(result.get("message").is_none());
-        let column_all = config::get_config().common.column_all.to_string();
-        let all_value = result.get(&column_all).unwrap().as_str().unwrap();
-        let all_parsed: Map<String, Value> = serde_json::from_str(all_value).unwrap();
-        assert_eq!(
-            all_parsed.get("extra1").unwrap(),
-            &Value::String("val1".to_string())
-        );
-        assert_eq!(
-            all_parsed.get("extra2").unwrap(),
-            &Value::String("val2".to_string())
-        );
-    }
-
-    #[test]
-    fn test_refactor_map_non_string_value_types() {
-        let mut original_map = Map::new();
-        original_map.insert("schema_key".to_string(), Value::String("kept".to_string()));
-        original_map.insert(
-            "num_val".to_string(),
-            Value::Number(serde_json::Number::from(42)),
-        );
-        original_map.insert("bool_val".to_string(), Value::Bool(true));
-        original_map.insert("null_val".to_string(), Value::Null);
-        original_map.insert(
-            "array_val".to_string(),
-            Value::Array(vec![
-                Value::String("a".to_string()),
-                Value::Number(1.into()),
-            ]),
-        );
-        original_map.insert(
-            "obj_val".to_string(),
-            Value::Object({
-                let mut m = Map::new();
-                m.insert("nested".to_string(), Value::String("inner".to_string()));
-                m
-            }),
-        );
-
-        let defined_schema_keys: HashSet<String> =
-            ["schema_key"].iter().map(|s| s.to_string()).collect();
-
-        let result = refactor_map(original_map, &defined_schema_keys);
-
-        assert_eq!(
-            result.get("schema_key").unwrap(),
-            &Value::String("kept".to_string())
-        );
-
-        let column_all = config::get_config().common.column_all.to_string();
-        let all_value = result.get(&column_all).unwrap().as_str().unwrap();
-        let all_parsed: Map<String, Value> = serde_json::from_str(all_value).unwrap();
-
-        // pickup_string_value converts all types to strings
-        assert_eq!(
-            all_parsed.get("num_val").unwrap(),
-            &Value::String("42".to_string())
-        );
-        assert_eq!(
-            all_parsed.get("bool_val").unwrap(),
-            &Value::String("true".to_string())
-        );
-        assert_eq!(
-            all_parsed.get("null_val").unwrap(),
-            &Value::String("null".to_string())
-        );
-        // Array and Object go through val.to_string() -> serde_json compact format
-        assert_eq!(
-            all_parsed.get("array_val").unwrap(),
-            &Value::String("[\"a\",1]".to_string())
-        );
-        assert_eq!(
-            all_parsed.get("obj_val").unwrap(),
-            &Value::String("{\"nested\":\"inner\"}".to_string())
-        );
-    }
-
-    #[test]
-    fn test_refactor_map_special_chars_in_values() {
-        let mut original_map = Map::new();
-        original_map.insert(
-            "backslash".to_string(),
-            Value::String("path\\to\\file".to_string()),
-        );
-        original_map.insert(
-            "newline".to_string(),
-            Value::String("line1\nline2".to_string()),
-        );
-        original_map.insert("tab".to_string(), Value::String("col1\tcol2".to_string()));
-        original_map.insert(
-            "quotes".to_string(),
-            Value::String(r#"say "hello""#.to_string()),
-        );
-        original_map.insert("mixed".to_string(), Value::String("a\"b\\c\nd".to_string()));
-
-        let defined_schema_keys: HashSet<String> = HashSet::new();
-
-        let result = refactor_map(original_map, &defined_schema_keys);
-
-        let column_all = config::get_config().common.column_all.to_string();
-        let all_value = result.get(&column_all).unwrap().as_str().unwrap();
-        // Must be valid JSON
-        let all_parsed: Map<String, Value> = serde_json::from_str(all_value).unwrap();
-        assert_eq!(
-            all_parsed.get("backslash").unwrap(),
-            &Value::String("path\\to\\file".to_string())
-        );
-        assert_eq!(
-            all_parsed.get("newline").unwrap(),
-            &Value::String("line1\nline2".to_string())
-        );
-        assert_eq!(
-            all_parsed.get("tab").unwrap(),
-            &Value::String("col1\tcol2".to_string())
-        );
-        assert_eq!(
-            all_parsed.get("quotes").unwrap(),
-            &Value::String(r#"say "hello""#.to_string())
-        );
-        assert_eq!(
-            all_parsed.get("mixed").unwrap(),
-            &Value::String("a\"b\\c\nd".to_string())
-        );
-    }
-
-    #[test]
-    fn test_refactor_map_special_chars_in_keys() {
-        let mut original_map = Map::new();
-        original_map.insert(
-            "key\"with\"quotes".to_string(),
-            Value::String("val1".to_string()),
-        );
-        original_map.insert(
-            "key\\with\\backslash".to_string(),
-            Value::String("val2".to_string()),
-        );
-        original_map.insert(
-            "key\nwith\nnewline".to_string(),
-            Value::String("val3".to_string()),
-        );
-
-        let defined_schema_keys: HashSet<String> = HashSet::new();
-
-        let result = refactor_map(original_map, &defined_schema_keys);
-
-        let column_all = config::get_config().common.column_all.to_string();
-        let all_value = result.get(&column_all).unwrap().as_str().unwrap();
-        // Must be valid JSON despite special chars in keys
-        let all_parsed: Map<String, Value> = serde_json::from_str(all_value).unwrap();
-        assert_eq!(
-            all_parsed.get("key\"with\"quotes").unwrap(),
-            &Value::String("val1".to_string())
-        );
-        assert_eq!(
-            all_parsed.get("key\\with\\backslash").unwrap(),
-            &Value::String("val2".to_string())
-        );
-        assert_eq!(
-            all_parsed.get("key\nwith\nnewline").unwrap(),
-            &Value::String("val3".to_string())
         );
     }
 
@@ -1183,5 +884,69 @@ mod tests {
         let data = bytes::Bytes::from("{}");
         let result = create_log_ingestion_req(99, data);
         assert!(result.is_err());
+    }
+
+    /// The legacy write path must PRESERVE the writer's error kind:
+    /// flattening every failure into `IngestionError` made
+    /// `write_failure_status_code`'s `ResourceError` arm unreachable, so
+    /// genuine backpressure (memtable overflow, WAL queue full, circuit
+    /// breakers) surfaced as a permanent-looking 500 that OTLP/HTTP
+    /// shippers do NOT retry — dropping the records on the floor.
+    #[test]
+    fn test_map_ingester_write_error_backpressure_survives_to_503() {
+        use crate::logs::{StreamWriteFailure, write_failure_status_code};
+
+        let backpressure = [
+            ingester::errors::Error::MemoryTableOverflowError {},
+            ingester::errors::Error::MemoryCircuitBreakerError {},
+            ingester::errors::Error::DiskCircuitBreakerError {},
+            ingester::errors::Error::WalError {
+                source: wal::Error::WriteQueueFull { idx: 3 },
+            },
+        ];
+        for e in backpressure {
+            let detail = e.to_string();
+            let mapped = map_ingester_write_error(e);
+            assert!(
+                matches!(&mapped, Error::ResourceError(m) if m.contains(&detail)),
+                "backpressure must map to ResourceError, got {mapped:?}"
+            );
+            let failures = [StreamWriteFailure {
+                stream_name: "default".to_string(),
+                records: 1,
+                error: mapped,
+                permanent_rejection: false,
+            }];
+            assert_eq!(
+                write_failure_status_code(&failures),
+                503,
+                "backpressure must ack as a retryable 503"
+            );
+        }
+
+        // everything else keeps the 500-shaped kind — including WAL errors
+        // that are NOT the queue-full form
+        for e in [
+            ingester::errors::Error::NotImplemented,
+            ingester::errors::Error::WalError {
+                source: wal::Error::ChecksumMismatch {
+                    expected: 1,
+                    actual: 2,
+                },
+            },
+        ] {
+            let mapped = map_ingester_write_error(e);
+            assert!(
+                matches!(&mapped, Error::IngestionError(_)),
+                "non-backpressure must stay IngestionError, got {mapped:?}"
+            );
+            let failures = [StreamWriteFailure {
+                stream_name: "default".to_string(),
+                records: 1,
+                error: mapped,
+                permanent_rejection: false,
+            }];
+            assert_eq!(write_failure_status_code(&failures), 500);
+        }
     }
 }

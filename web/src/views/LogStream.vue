@@ -26,7 +26,6 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
     >
           <template #actions>
             <OButton
-              v-if="isSchemaUDSEnabled"
               data-test="log-stream-add-stream-btn"
               variant="primary"
               size="sm-action"
@@ -499,10 +498,6 @@ export default defineComponent({
       }
     });
 
-    const isSchemaUDSEnabled = computed(() => {
-      return store.state.zoConfig.user_defined_schemas_enabled;
-    });
-
     // As filter data don't gets called when search input is cleared.
     // So calling onChangeStreamFilter to filter again
     // watch(
@@ -864,14 +859,12 @@ export default defineComponent({
           descriptionKey: "emptyState.noStreams.actionDesc",
         },
       ];
-      if (isSchemaUDSEnabled.value) {
-        actions.push({
-          id: "create",
-          icon: "add",
-          titleKey: "emptyState.noStreams.createAction",
-          descriptionKey: "emptyState.noStreams.createActionDesc",
-        });
-      }
+      actions.push({
+        id: "create",
+        icon: "add",
+        titleKey: "emptyState.noStreams.createAction",
+        descriptionKey: "emptyState.noStreams.createActionDesc",
+      });
       return actions;
     });
 
@@ -957,7 +950,6 @@ export default defineComponent({
       onPaginationChange,
       onSortChange,
       showIndexSchemaDialog,
-      isSchemaUDSEnabled,
       filterQuery,
       getImageURL,
       verifyOrganizationStatus,

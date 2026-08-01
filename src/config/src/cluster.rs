@@ -65,6 +65,36 @@ pub fn load_role_group() -> RoleGroup {
     RoleGroup::from(get_config().common.node_role_group.as_str())
 }
 
+/// Number of co-located CPU-heavy roles on THIS node — ingester (WAL→storage
+/// move build), querier (index-eval fan-out + DataFusion) and compactor
+/// (index merge). Each of those defaults a large CPU thread pool sized to the
+/// whole machine; when several run in one process the pools stack and
+/// oversubscribe the cores. Runtime consumers (`merge_threads`,
+/// `build_encode_threads`) divide their pool by this count so the co-located
+/// pools sum to roughly the core count instead of a multiple of it.
+///
+/// Returns `1` in LOCAL_MODE (single-node pools stay full — behavior
+/// unchanged) and `1` on a dedicated single-role node, so only genuinely
+/// combined cluster nodes scale down. `Role::All` counts as all three.
+/// Measured on the C2 combined node: dividing the CPU-bound pools cut query
+/// p99 ~29% with unchanged ingest throughput (see WORKLOG PHASE C2).
+pub fn cpu_role_divisor() -> usize {
+    if get_config().common.local_mode {
+        return 1;
+    }
+    let mut n = 0;
+    if LOCAL_NODE.is_ingester() {
+        n += 1;
+    }
+    if LOCAL_NODE.is_querier() {
+        n += 1;
+    }
+    if LOCAL_NODE.is_compactor() {
+        n += 1;
+    }
+    n.max(1)
+}
+
 pub fn get_local_http_addr() -> String {
     format!(
         "{}://{}:{}",

@@ -355,7 +355,7 @@ pub async fn save_enrichment_data_to_db(
 /// ## Usage Examples
 ///
 /// **From search context (enrich_exec.rs):**
-/// ```rust
+/// ```rust,ignore
 /// // Pass db_stats.end_time + 1 to include data up to and including the last complete upload
 /// // (+1 because search end_time is exclusive)
 /// let end_time = db_stats.end_time + 1;
@@ -363,7 +363,7 @@ pub async fn save_enrichment_data_to_db(
 /// ```
 ///
 /// **From storage/caching context:**
-/// ```rust
+/// ```rust,ignore
 /// // Pass None to fetch all data (when not in search context)
 /// get_enrichment_data_from_db(org_id, name, None).await
 /// ```

@@ -41,7 +41,8 @@ use sqlparser::{ast::VisitMut, dialect::PostgreSqlDialect, parser::Parser};
 use crate::sql::{
     rewriter::{
         add_o2_id::AddO2IdVisitor, add_timestamp::AddTimestampVisitor,
-        match_all_raw::MatchAllRawVisitor, remove_dashboard_placeholder::RemoveDashboardAllVisitor,
+        dotted_fields::rewrite_dotted_fields, match_all_raw::MatchAllRawVisitor,
+        remove_dashboard_placeholder::RemoveDashboardAllVisitor,
         track_total_hits::TrackTotalHitsVisitor,
     },
     schema::{generate_schema_fields, generate_select_star_schema, has_original_column},
@@ -155,11 +156,42 @@ impl Sql {
         // 4. rewrite match_all_raw and match_all_raw_ignore_case to match_all
         let mut match_all_raw_visitor = MatchAllRawVisitor::new();
         let _ = statement.visit(&mut match_all_raw_visitor);
+
+        // 4b. resolve unquoted dotted field references (`http.status` ->
+        // `"http.status"`) against the stream schemas, so the collectors
+        // below and DataFusion see one identifier instead of table.column
+        rewrite_dotted_fields(&mut statement, &total_schemas);
         //********************Change the sql end*********************************//
+
+        // the statement's complexity gates row-store star expansion and
+        // identifier validation below (rewrites past this point never
+        // change complexity)
+        let is_complex = is_complex_query_stmt(&statement);
 
         // 5. get column name, alias, group by, order by
         let mut column_visitor = ColumnVisitor::new(&total_schemas);
         let _ = statement.visit(&mut column_visitor);
+
+        // 5b. deterministic identifier validation (plain single-stream
+        // statements): a WHERE field is validated against the stream's
+        // LATEST schema (the union view — never a time-range-selected
+        // version), and the error carries a STABLE message instead of
+        // enumerating whatever field list the plan schema happens to hold.
+        if !is_complex
+            && stream_names.len() == 1
+            && !column_visitor.where_unresolved_fields.is_empty()
+        {
+            let mut missing = column_visitor
+                .where_unresolved_fields
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            missing.sort_unstable();
+            return Err(Error::ErrorCode(ErrorCodes::SearchFieldNotFound(format!(
+                "{}. Field not found in stream schema.",
+                missing.join(", ")
+            ))));
+        }
 
         let columns = column_visitor.columns.clone();
         let aliases = column_visitor
@@ -219,6 +251,10 @@ impl Sql {
                 cfg.limit.quick_mode_num_fields,
                 &search_event_type,
                 match_visitor.has_match_all,
+                stream_type,
+                // row-store-driven star: plain single-stream statements
+                // only — joins/subqueries/CTEs keep the registry expansion
+                !is_complex && stream_names.len() == 1,
             );
         } else {
             for (stream, schema) in total_schemas.iter() {
@@ -257,7 +293,7 @@ impl Sql {
 
         //********************Change the sql start*********************************//
         // 11. add _timestamp and _o2_id if need
-        if !is_complex_query_stmt(&statement) {
+        if !is_complex {
             let mut add_timestamp_visitor = AddTimestampVisitor::new();
             let _ = statement.visit(&mut add_timestamp_visitor);
             if o2_id_is_needed(&used_schemas, &search_event_type) {
@@ -269,8 +305,6 @@ impl Sql {
 
         // 13. replace the Utf8 to Utf8View type
         let final_schemas = finalize_schemas(&used_schemas);
-
-        let is_complex = is_complex_query_stmt(&statement);
 
         Ok(Sql {
             sql: statement.to_string(),
@@ -350,8 +384,7 @@ fn o2_id_is_needed(
     !matches!(search_event_type, Some(SearchEventType::DerivedStream))
         && schemas.values().any(|schema| {
             let stream_setting = unwrap_stream_settings(schema.schema());
-            stream_setting
-                .is_some_and(|setting| setting.store_original_data || setting.index_original_data)
+            stream_setting.is_some_and(|setting| setting.store_original_data)
         })
 }
 
@@ -462,5 +495,116 @@ mod tests {
         let query = SearchQuery::default();
         let result = parse_sampling_config(&query, None, (0, 0), false);
         assert!(result.is_none());
+    }
+
+    fn star_query(sql: &str) -> SearchQuery {
+        SearchQuery {
+            sql: sql.to_string(),
+            from: 0,
+            size: 100,
+            ..Default::default()
+        }
+    }
+
+    /// End-to-end `Sql::new` proof of the row-store star: with a WIDE
+    /// registry (5k+ fields), the plan schema of a plain `SELECT *` stays
+    /// the fixed physical set (`_timestamp` + referenced fields +
+    /// `_source`) — planning cost flat in the registry width — while the
+    /// same statement wrapped in a CTE keeps the registry expansion.
+    #[tokio::test]
+    async fn test_sql_new_star_schema_is_registry_width_independent() {
+        let org = "row_store_star_test";
+        infra::db_init().await.unwrap();
+        let mut fields = vec![
+            Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+            Field::new("k8s.container.name", DataType::Utf8, true),
+            Field::new("level", DataType::Utf8, true),
+        ];
+        for i in 0..5000 {
+            fields.push(Field::new(
+                format!("attr.field.{i:05}"),
+                DataType::Utf8,
+                true,
+            ));
+        }
+        infra::schema::merge(
+            org,
+            "wide",
+            StreamType::Logs,
+            &Schema::new(fields),
+            Some(1752660674351000),
+        )
+        .await
+        .unwrap();
+
+        let query = star_query(r#"SELECT * FROM "wide" WHERE "k8s.container.name" = 'x' LIMIT 10"#);
+        let sql = Sql::new(&query, org, StreamType::Logs, None).await.unwrap();
+        let schema = sql
+            .schemas
+            .get(&TableReference::bare("wide"))
+            .expect("stream schema");
+        let names: Vec<&str> = schema
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        // finalize_schemas sorts by name: _source, _timestamp, referenced
+        assert_eq!(names, vec!["_source", "_timestamp", "k8s.container.name"]);
+
+        // complex statements (CTE) keep the registry expansion
+        let query = star_query(
+            r#"WITH f AS (SELECT * FROM "wide" WHERE "k8s.container.name" = 'x') SELECT * FROM f"#,
+        );
+        let sql = Sql::new(&query, org, StreamType::Logs, None).await.unwrap();
+        let schema = sql
+            .schemas
+            .get(&TableReference::bare("wide"))
+            .expect("stream schema");
+        assert!(schema.schema().fields().len() > 400);
+        assert!(!schema.contains_field(vortex_index::SOURCE_COL_NAME));
+    }
+
+    /// Deterministic identifier validation: an unknown WHERE field fails at
+    /// parse time against the LATEST schema with a STABLE message — never
+    /// DataFusion's "Valid fields are ..." enumeration of whatever plan
+    /// schema a node happened to hold.
+    #[tokio::test]
+    async fn test_sql_new_unknown_where_field_fails_deterministically() {
+        let org = "star_validation_test";
+        infra::db_init().await.unwrap();
+        infra::schema::merge(
+            org,
+            "logs",
+            StreamType::Logs,
+            &Schema::new(vec![
+                Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+                Field::new("level", DataType::Utf8, true),
+            ]),
+            Some(1752660674351000),
+        )
+        .await
+        .unwrap();
+
+        let query = star_query(r#"SELECT * FROM "logs" WHERE "k8s.container.name" = 'x' LIMIT 10"#);
+        let mut messages = Vec::new();
+        for _ in 0..3 {
+            let err = Sql::new(&query, org, StreamType::Logs, None)
+                .await
+                .expect_err("unknown WHERE field must fail");
+            messages.push(err.to_string());
+        }
+        assert!(
+            messages[0].contains("k8s.container.name. Field not found in stream schema."),
+            "unexpected message: {}",
+            messages[0]
+        );
+        // identical across repeated identical queries
+        assert_eq!(messages[0], messages[1]);
+        assert_eq!(messages[1], messages[2]);
+
+        // known fields (and internal columns) still parse
+        let query = star_query(r#"SELECT * FROM "logs" WHERE level = 'x' AND _timestamp > 1"#);
+        assert!(Sql::new(&query, org, StreamType::Logs, None).await.is_ok());
     }
 }

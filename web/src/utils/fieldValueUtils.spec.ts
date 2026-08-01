@@ -17,7 +17,6 @@ describe("EXCLUDED_FIELDS", () => {
 
   it("contains OO internal fields", () => {
     expect(EXCLUDED_FIELDS.has("_stream")).toBe(true);
-    expect(EXCLUDED_FIELDS.has("_all")).toBe(true);
   });
 
   it("contains free-text fields", () => {
@@ -85,7 +84,6 @@ describe("extractValuesFromHits", () => {
       _id: "abc",
       __id: "abc",
       _stream: "logs",
-      _all: "all",
       log: "some log",
       message: "some msg",
       msg: "short",

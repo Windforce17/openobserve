@@ -15,7 +15,9 @@
 
 use serde_json::value::{Map, Value};
 
-const KEY_SEPARATOR: &str = "_";
+/// Nested-key separator: nested objects flatten to dotted paths
+/// (`{"http":{"status":..}}` -> `http.status`, DESIGN §15.5).
+const KEY_SEPARATOR_DOT: &str = ".";
 const TOKEN_NUMBER: &str = "$serde_json::private::Number";
 
 #[inline]
@@ -24,6 +26,10 @@ pub fn flatten(to_flatten: Value) -> Result<Value, anyhow::Error> {
 }
 
 /// Flattens the provided JSON object (`current`).
+///
+/// Flattened keys keep literal `.` characters (dotted paths such as OTLP's
+/// `service.name` stay dotted; nested objects flatten with a `.` separator —
+/// the core-file behavior). All other illegal characters are sanitized.
 ///
 /// It will return an error if flattening the object would make two keys to be
 /// the same, overwriting a value. It will also return an error if the JSON
@@ -117,7 +123,7 @@ fn flatten_object(
         } else {
             format_key(&mut k);
             if depth > 0 {
-                format!("{parent_key}{KEY_SEPARATOR}{k}")
+                format!("{parent_key}{KEY_SEPARATOR_DOT}{k}")
             } else {
                 k
             }
@@ -140,19 +146,23 @@ fn flatten_array(
     if current.is_empty() {
         return Ok(());
     }
-    // for (i, obj) in current.iter().enumerate() {
-    //     let parent_key = format!("{}{}{}", parent_key, KEY_SEPARATOR, i);
-    //     flatten_value(obj, parent_key, depth + 1, flattened)?;
-    // }
     let v = Value::String(Value::Array(current.to_vec()).to_string());
     flatten_value(v, parent_key.to_string(), max_level, depth, flattened)?;
     Ok(())
 }
 
-/// We need every character in the key to be lowercase alphanumeric or
-/// underscore
+/// We need every character in the key to be lowercase alphanumeric,
+/// underscore or a literal `.` (dotted field names are first-class in
+/// core files).
 pub fn format_key(key: &mut String) {
-    if check_key(key) {
+    format_key_with(key, true)
+}
+
+/// [`format_key`] with an explicit dot policy. `keep_dots = false` is the
+/// historical underscore behavior (`a.b` -> `a_b`), kept only for
+/// [`format_label_name`] (Prometheus label naming).
+fn format_key_with(key: &mut String, keep_dots: bool) {
+    if check_key_with(key, keep_dots) {
         return;
     }
 
@@ -166,6 +176,7 @@ pub fn format_key(key: &mut String) {
             } else if !bytes[i].is_ascii_lowercase()
                 && !bytes[i].is_ascii_digit()
                 && bytes[i] != b'_'
+                && !(keep_dots && bytes[i] == b'.')
             {
                 bytes[i] = b'_';
             }
@@ -173,7 +184,7 @@ pub fn format_key(key: &mut String) {
             *key = key
                 .chars()
                 .map(|c| {
-                    if c.is_lowercase() || c.is_numeric() {
+                    if c.is_lowercase() || c.is_numeric() || (keep_dots && c == '.') {
                         c
                     } else if c.is_uppercase() {
                         c.to_lowercase().next().unwrap()
@@ -188,15 +199,50 @@ pub fn format_key(key: &mut String) {
     }
 }
 
+/// Metrics label names never keep dots (Prometheus label naming) — the one
+/// remaining user of the underscore key mode.
 pub fn format_label_name(label_name: &str) -> String {
     let mut key = label_name.to_string();
-    format_key(&mut key);
+    format_key_with(&mut key, false);
     key
 }
 
+/// Reserved alias pairs `(dotted, canonical)` resolved after flattening.
+///
+/// Producers emit ECS-style dotted trace context — either literal body keys
+/// (`"trace.id"`) or nested objects (`{"trace":{"id":..}}`, which flattening
+/// turns into `trace.id`) — splitting the SAME identifier across two field
+/// names. For exactly these pairs the underscore form is canonical (it is
+/// what the OTLP log path mints from the protocol fields); every other field
+/// keeps the dotted canon. Future reserved aliases are one line here.
+pub const RESERVED_FIELD_ALIASES: [(&str, &str); 2] =
+    [("trace.id", "trace_id"), ("span.id", "span_id")];
+
+/// Canonicalize the [`RESERVED_FIELD_ALIASES`] on a flattened record: rename
+/// the dotted key to its canonical underscore key when the latter is absent;
+/// when both are present drop the dotted key — the canonical key wins
+/// regardless of value equality. Records without the dotted keys are
+/// untouched. Applied by the logs ingest funnel (`write_logs`) AFTER
+/// flattening; traces ingest already uses the protocol fields and metrics
+/// are left alone.
+pub fn canonicalize_reserved_aliases(record: &mut Map<String, Value>) {
+    for (dotted, canonical) in RESERVED_FIELD_ALIASES {
+        if let Some(value) = record.remove(dotted)
+            && !record.contains_key(canonical)
+        {
+            record.insert(canonical.to_string(), value);
+        }
+    }
+}
+
+#[inline]
 fn check_key(key: &str) -> bool {
+    check_key_with(key, true)
+}
+
+fn check_key_with(key: &str, keep_dots: bool) -> bool {
     key.chars()
-        .all(|c| c.is_lowercase() || c.is_numeric() || c == '_')
+        .all(|c| c.is_lowercase() || c.is_numeric() || c == '_' || (keep_dots && c == '.'))
 }
 
 #[cfg(test)]
@@ -207,27 +253,39 @@ mod tests {
 
     #[test]
     fn test_check_key_lowercase() {
-        assert!(check_key("hello"));
+        assert!(check_key_with("hello", false));
     }
 
     #[test]
     fn test_check_key_numeric() {
-        assert!(check_key("123"));
+        assert!(check_key_with("123", false));
     }
 
     #[test]
     fn test_check_key_underscore() {
-        assert!(check_key("my_key"));
+        assert!(check_key_with("my_key", false));
     }
 
     #[test]
     fn test_check_key_mixed_case() {
-        assert!(!check_key("Hello_World"));
+        assert!(!check_key_with("Hello_World", false));
     }
 
     #[test]
     fn test_check_key_special_characters() {
-        assert!(!check_key("key!"));
+        assert!(!check_key_with("key!", false));
+    }
+
+    #[test]
+    fn test_check_key_dots_follow_the_mode() {
+        // label mode: a dot is an illegal character
+        assert!(!check_key_with("service.name", false));
+        // key mode: dots are first-class
+        assert!(check_key_with("service.name", true));
+        assert!(check_key("service.name"));
+        // other illegal characters still fail in both modes
+        assert!(!check_key_with("service.Name", true));
+        assert!(!check_key_with("service name", true));
     }
 
     #[test]
@@ -251,7 +309,7 @@ mod tests {
         assert_eq!(
             flatten(obj).unwrap(),
             json!({
-                format!("s{KEY_SEPARATOR}a"): "[1,2.0,\"b\",null,true]",
+                format!("s{KEY_SEPARATOR_DOT}a"): "[1,2.0,\"b\",null,true]",
             })
         );
     }
@@ -261,7 +319,7 @@ mod tests {
         let obj = json!({"key": "value", "nested_key": {"key": "value"}});
         assert_eq!(
             flatten(obj).unwrap(),
-            json!({"key": "value", "nested_key_key": "value"}),
+            json!({"key": "value", "nested_key.key": "value"}),
         );
     }
 
@@ -270,7 +328,7 @@ mod tests {
         let obj = json!({"key": "value", "nested_key": {"key1": "value1", "key2": "value2"}});
         assert_eq!(
             flatten(obj).unwrap(),
-            json!({"key": "value", "nested_key_key1": "value1", "nested_key_key2": "value2"}),
+            json!({"key": "value", "nested_key.key1": "value1", "nested_key.key2": "value2"}),
         );
     }
 
@@ -332,32 +390,32 @@ mod tests {
         let obj = json!({"key": {"key2": {}, "key3": [[], {}, {"k": {}, "q": []}]}});
         assert_eq!(
             flatten(obj).unwrap(),
-            json!({"key_key3": "[[],{},{\"k\":{},\"q\":[]}]"})
+            json!({"key.key3": "[[],{},{\"k\":{},\"q\":[]}]"})
         );
     }
 
     #[test]
     fn nested_object_with_empty_array_and_string() {
         let obj = json!({"key": {"key2": [], "key3": "a"}});
-        assert_eq!(flatten(obj).unwrap(), json!({"key_key3": "a"}));
+        assert_eq!(flatten(obj).unwrap(), json!({"key.key3": "a"}));
     }
 
     #[test]
     fn nested_object_with_empty_object_and_string() {
         let obj = json!({"key": {"key2": {}, "key3": "a"}});
-        assert_eq!(flatten(obj).unwrap(), json!({"key_key3": "a"}));
+        assert_eq!(flatten(obj).unwrap(), json!({"key.key3": "a"}));
     }
 
     #[test]
     fn empty_string_as_key() {
         let obj = json!({"key": {"": "a"}});
-        assert_eq!(flatten(obj).unwrap(), json!({"key_": "a"}));
+        assert_eq!(flatten(obj).unwrap(), json!({"key.": "a"}));
     }
 
     #[test]
     fn empty_string_as_key_multiple_times() {
         let obj = json!({"key": {"": {"": {"": "a"}}}});
-        assert_eq!(flatten(obj).unwrap(), json!({"key___": "a"}));
+        assert_eq!(flatten(obj).unwrap(), json!({"key...": "a"}));
     }
 
     /// Flattening only makes sense for objects. Passing something else must
@@ -390,15 +448,17 @@ mod tests {
         let data = [
             (
                 json!({"key": "value", "nested_key": {"key": "value", "foo": "bar"}}),
-                json!({"key": "value", "nested_key_key": "value", "nested_key_foo": "bar"}),
+                json!({"key": "value", "nested_key.key": "value", "nested_key.foo": "bar"}),
             ),
             (
                 json!({"key+bar": "value", "@nested_key": {"#key": "value", "&Foo": "Bar"}}),
-                json!({"key_bar": "value", "_nested_key__key": "value", "_nested_key__foo": "Bar"}),
+                json!({"key_bar": "value", "_nested_key._key": "value", "_nested_key._foo": "Bar"}),
             ),
             (
                 json!({"a": {"A.1": [1, [3, 4], 5], "A_2": 6}}),
-                json!({"a_a_1": "[1,[3,4],5]", "a_a_2": 6}),
+                // dots are kept (label names are the only underscore mode,
+                // covered by test_format_key_dot_modes)
+                json!({"a.a.1": "[1,[3,4],5]", "a.a_2": 6}),
             ),
         ];
         for (input, expected) in data.into_iter() {
@@ -436,10 +496,10 @@ mod tests {
         assert_eq!(output["firstname"], "John");
         assert_eq!(output["lastname"], "Doe");
         assert_eq!(output["age"], 25);
-        assert_eq!(output["address_streetaddress"], "123 Main St");
-        assert_eq!(output["address_city"], "Anytown");
-        assert_eq!(output["address_state"], "CA");
-        assert_eq!(output["address_postalcode"], "12345");
+        assert_eq!(output["address.streetaddress"], "123 Main St");
+        assert_eq!(output["address.city"], "Anytown");
+        assert_eq!(output["address.state"], "CA");
+        assert_eq!(output["address.postalcode"], "12345");
 
         // Parse and compare phonenumbers JSON to handle key ordering
         let phonenumbers_str = output["phonenumbers"].as_str().unwrap();
@@ -522,13 +582,13 @@ mod tests {
             "firstname": "John",
             "lastname": "Doe",
             "age": 25,
-            "info_address_streetaddress": "123 Main St",
-            "info_address_city": "Anytown",
-            "info_address_state": "CA",
-            "info_address_postalcode": "12345",
-            "info_address_phonenumbers_number": "555-555-1234",
-            "info_address_phonenumbers_type": "home",
-            "info_phonenumbers": "[{\"number\":\"555-555-1234\",\"type\":\"home\"},{\"number\":\"555-555-5678\",\"type\":\"work\"}]"
+            "info.address.streetaddress": "123 Main St",
+            "info.address.city": "Anytown",
+            "info.address.state": "CA",
+            "info.address.postalcode": "12345",
+            "info.address.phonenumbers.number": "555-555-1234",
+            "info.address.phonenumbers.type": "home",
+            "info.phonenumbers": "[{\"number\":\"555-555-1234\",\"type\":\"home\"},{\"number\":\"555-555-5678\",\"type\":\"work\"}]"
         });
         let expected_output_level1 = json!({
             "firstname": "John",
@@ -540,31 +600,31 @@ mod tests {
             "firstname": "John",
             "lastname": "Doe",
             "age": 25,
-            "info_address": "{\"city\":\"Anytown\",\"phoneNumbers\":{\"number\":\"555-555-1234\",\"type\":\"home\"},\"postalCode\":\"12345\",\"state\":\"CA\",\"streetAddress\":\"123 Main St\"}",
-            "info_phonenumbers": "[{\"number\":\"555-555-1234\",\"type\":\"home\"},{\"number\":\"555-555-5678\",\"type\":\"work\"}]"
+            "info.address": "{\"city\":\"Anytown\",\"phoneNumbers\":{\"number\":\"555-555-1234\",\"type\":\"home\"},\"postalCode\":\"12345\",\"state\":\"CA\",\"streetAddress\":\"123 Main St\"}",
+            "info.phonenumbers": "[{\"number\":\"555-555-1234\",\"type\":\"home\"},{\"number\":\"555-555-5678\",\"type\":\"work\"}]"
         });
         let expected_output_level3 = json!({
             "firstname": "John",
             "lastname": "Doe",
             "age": 25,
-            "info_address_streetaddress": "123 Main St",
-            "info_address_city": "Anytown",
-            "info_address_state": "CA",
-            "info_address_postalcode": "12345",
-            "info_address_phonenumbers": "{\"number\":\"555-555-1234\",\"type\":\"home\"}",
-            "info_phonenumbers": "[{\"number\":\"555-555-1234\",\"type\":\"home\"},{\"number\":\"555-555-5678\",\"type\":\"work\"}]"
+            "info.address.streetaddress": "123 Main St",
+            "info.address.city": "Anytown",
+            "info.address.state": "CA",
+            "info.address.postalcode": "12345",
+            "info.address.phonenumbers": "{\"number\":\"555-555-1234\",\"type\":\"home\"}",
+            "info.phonenumbers": "[{\"number\":\"555-555-1234\",\"type\":\"home\"},{\"number\":\"555-555-5678\",\"type\":\"work\"}]"
         });
         let expected_output_level4 = json!({
             "firstname": "John",
             "lastname": "Doe",
             "age": 25,
-            "info_address_streetaddress": "123 Main St",
-            "info_address_city": "Anytown",
-            "info_address_state": "CA",
-            "info_address_postalcode": "12345",
-            "info_address_phonenumbers_number": "555-555-1234",
-            "info_address_phonenumbers_type": "home",
-            "info_phonenumbers": "[{\"number\":\"555-555-1234\",\"type\":\"home\"},{\"number\":\"555-555-5678\",\"type\":\"work\"}]"
+            "info.address.streetaddress": "123 Main St",
+            "info.address.city": "Anytown",
+            "info.address.state": "CA",
+            "info.address.postalcode": "12345",
+            "info.address.phonenumbers.number": "555-555-1234",
+            "info.address.phonenumbers.type": "home",
+            "info.phonenumbers": "[{\"number\":\"555-555-1234\",\"type\":\"home\"},{\"number\":\"555-555-5678\",\"type\":\"work\"}]"
         });
 
         let output = flatten_with_level(input.clone(), 0).unwrap();
@@ -608,7 +668,9 @@ mod tests {
             "helloworld",
             "uppercase",
             "hello_world_123_",
-            "test_key_here",
+            // dots are kept (the underscore mode exists only for label
+            // names, covered by test_format_key_dot_modes)
+            "test.key_here",
             "mixed_case_123___",
             "camelcasetest",
             "hello__",
@@ -632,8 +694,117 @@ mod tests {
     fn test_format_label_name() {
         assert_eq!(format_label_name("HelloWorld"), "helloworld");
         assert_eq!(format_label_name("already_fine"), "already_fine");
+        // label names are always dot-free (Prometheus label naming)
         assert_eq!(format_label_name("test.key"), "test_key");
         assert_eq!(format_label_name("UPPER_CASE"), "upper_case");
         assert_eq!(format_label_name(""), "");
+    }
+
+    #[test]
+    fn test_format_key_dot_modes() {
+        // (input, label mode, key mode) — dots survive only in the key
+        // mode; all other sanitization matches in both modes
+        let cases = [
+            ("service.name", "service_name", "service.name"),
+            ("k8s.Pod.Name", "k8s_pod_name", "k8s.pod.name"),
+            ("with space.dot", "with_space_dot", "with_space.dot"),
+            // non-ascii replacement path
+            ("café.Là", "café_là", "café.là"),
+            ("hello世界.x", "hello___x", "hello__.x"),
+        ];
+        for (input, label, key_mode) in cases {
+            let mut key = input.to_string();
+            format_key_with(&mut key, false);
+            assert_eq!(key, label, "label mode for {input:?}");
+
+            let mut key = input.to_string();
+            format_key_with(&mut key, true);
+            assert_eq!(key, key_mode, "key mode for {input:?}");
+        }
+    }
+
+    #[test]
+    fn test_flatten_keeps_dots() {
+        let input = json!({
+            "service.name": "api",
+            "outer": {"inner.leaf": 1},
+            "Plain": true,
+        });
+
+        // dots survive, nested objects flatten to dotted paths, and all
+        // other sanitization is unchanged
+        assert_eq!(
+            flatten(input).unwrap(),
+            json!({"service.name": "api", "outer.inner.leaf": 1, "plain": true})
+        );
+    }
+
+    /// Flatten, then canonicalize the reserved aliases — the exact two-step
+    /// sequence the logs ingest funnel runs on every record.
+    fn flatten_and_canonicalize(input: serde_json::Value) -> serde_json::Value {
+        let mut record = match flatten(input).unwrap() {
+            Value::Object(map) => map,
+            _ => unreachable!("flatten always returns an object"),
+        };
+        canonicalize_reserved_aliases(&mut record);
+        Value::Object(record)
+    }
+
+    #[test]
+    fn test_canonicalize_reserved_aliases_literal_dotted() {
+        // literal dotted body keys are renamed to the canonical fields
+        let input = json!({"log": "a", "trace.id": "t1", "span.id": "s1"});
+        assert_eq!(
+            flatten_and_canonicalize(input),
+            json!({"log": "a", "trace_id": "t1", "span_id": "s1"})
+        );
+    }
+
+    #[test]
+    fn test_canonicalize_reserved_aliases_nested_object() {
+        // nested trace context flattens to the dotted keys, which are then
+        // renamed; sibling paths under the same object keep the dotted canon
+        let input = json!({
+            "log": "a",
+            "trace": {"id": "t1", "flags": 1},
+            "span": {"id": "s1"},
+        });
+        assert_eq!(
+            flatten_and_canonicalize(input),
+            json!({"log": "a", "trace_id": "t1", "trace.flags": 1, "span_id": "s1"})
+        );
+    }
+
+    #[test]
+    fn test_canonicalize_reserved_aliases_both_present_underscore_wins() {
+        // when both forms are present the dotted key is dropped, regardless
+        // of value equality (literal and nested shapes behave the same)
+        for input in [
+            json!({"trace.id": "loser", "trace_id": "winner", "span.id": "loser", "span_id": "winner"}),
+            json!({"trace": {"id": "loser"}, "trace_id": "winner", "span": {"id": "loser"}, "span_id": "winner"}),
+        ] {
+            assert_eq!(
+                flatten_and_canonicalize(input),
+                json!({"trace_id": "winner", "span_id": "winner"})
+            );
+        }
+    }
+
+    #[test]
+    fn test_canonicalize_reserved_aliases_only_underscore_is_noop() {
+        let input = json!({"log": "a", "trace_id": "t1", "span_id": "s1"});
+        assert_eq!(
+            flatten_and_canonicalize(input.clone()),
+            input,
+            "canonical-only records must pass through unchanged"
+        );
+    }
+
+    #[test]
+    fn test_canonicalize_reserved_aliases_neither_is_noop() {
+        // no reserved keys at all — including other dotted fields, which keep
+        // the dotted canon untouched
+        let input = json!({"log": "a", "service.name": "api", "trace.flags": 1});
+        assert_eq!(flatten_and_canonicalize(input.clone()), input);
     }
 }

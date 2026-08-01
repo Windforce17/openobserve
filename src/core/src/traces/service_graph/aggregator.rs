@@ -89,13 +89,20 @@ pub async fn write_sql_aggregated_edges(
         ingestion_type: Some(cluster_rpc::IngestionType::Json as i32),
         metadata: None,
     };
-    crate::service::ingestion::ingestion_service::ingest(req)
+    let reply = crate::service::ingestion::ingestion_service::ingest(req)
         .await
-        .map(|_| ())
         .map_err(|e| anyhow::anyhow!("{e}"))
         .inspect_err(|e| {
             log::error!("[ServiceGraph] Failed to write SQL-aggregated edges: {e}");
         })?;
+    // the reply's status_code is the write's truth: the ingester answers
+    // 503/500 when the durable write failed or was refused, and treating that
+    // as success dropped the edges while logging a success line
+    if !(200..300).contains(&reply.status_code) {
+        let e = anyhow::anyhow!("ingester answered {}: {}", reply.status_code, reply.message);
+        log::error!("[ServiceGraph] Failed to write SQL-aggregated edges: {e}");
+        return Err(e);
+    }
 
     log::info!("[ServiceGraph] Wrote {record_count} SQL-aggregated edge summaries for {org_id}");
     Ok(())

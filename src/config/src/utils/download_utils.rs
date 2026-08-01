@@ -98,10 +98,32 @@ mod tests {
 
     #[tokio::test]
     async fn test_is_digest_different_url_detection() {
-        // Test that HTTP URL is detected
-        let http_url = "https://openobserve.ai/img/logo/logo_horizontal.svg";
-        let result = is_digest_different("/nonexistent/file.txt", http_url).await;
+        // Serve a canned sha256 body over a loopback socket so the HTTP branch
+        // of is_digest_different is exercised without external network access.
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf).await; // consume the request
+            let body = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+        });
+
+        let url = format!("http://{addr}/file.sha256");
+        let result = is_digest_different("/nonexistent/file.txt", &url).await;
         assert!(result.is_ok());
+        // Local file doesn't exist (empty digest), so digests must differ.
+        assert!(result.unwrap());
     }
 
     #[test]

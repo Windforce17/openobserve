@@ -927,10 +927,7 @@ export default defineComponent({
           streamType,
         );
         const schema = res.data;
-        const fieldsArray =
-          schema.uds_schema && schema.uds_schema.length > 0
-            ? schema.uds_schema
-            : schema.schema || schema.fields || [];
+        const fieldsArray = schema.schema || schema.fields || [];
         allStreamFields.value = fieldsArray.map((f: any) => f.name).sort();
         numericStreamFields.value = fieldsArray
           .filter((f: any) => {

@@ -40,8 +40,9 @@ use infra::{
     dist_lock, file_list as infra_file_list,
     runtime::DATAFUSION_RUNTIME,
     schema::{
-        SchemaCache, get_partition_time_level, get_stream_setting_bloom_filter_fields,
-        get_stream_setting_fts_fields, get_stream_setting_index_fields, unwrap_stream_created_at,
+        get_partition_time_level, get_stream_setting_bloom_filter_fields,
+        get_stream_setting_column_store_fields, get_stream_setting_fts_fields,
+        unwrap_stream_created_at,
     },
     storage,
 };
@@ -51,16 +52,15 @@ use tokio::{
     sync::{Semaphore, mpsc},
     task::JoinHandle,
 };
+use vortex_index::VixOutput;
 
 use super::worker::{MergeBatch, MergeSender};
 use crate::service::{
     db, file_list,
-    schema::generate_schema_for_defined_schema_fields,
     search::datafusion::{
         exec::TableBuilder,
         merge::{self, MergeParquetResult},
     },
-    tantivy::create_tantivy_index,
 };
 
 /// Generate merging job by stream
@@ -409,10 +409,20 @@ pub async fn merge_by_stream(
             offset_time.format("%Y/%m/%d/%H").to_string(),
         )
     };
-    let files =
-        file_list::query_for_merge(org_id, stream_type, stream_name, &date_start, &date_end)
-            .await
-            .map_err(|e| anyhow::anyhow!("query file list failed: {e}"))?;
+    // Non-incremental (closed-hour) jobs fetch full-size files too: they
+    // are excluded from merge grouping below, but the healing probe must
+    // see them — a corrupt ~max_file_size output is otherwise unreachable
+    // by any merge forever (prod 2026-07-29).
+    let files = file_list::query_for_merge(
+        org_id,
+        stream_type,
+        stream_name,
+        &date_start,
+        &date_end,
+        !is_incremental,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("query file list failed: {e}"))?;
 
     log::debug!(
         "[COMPACTOR] merge_by_stream [{org_id}/{stream_type}/{stream_name}] date range: [{date_start},{date_end}], files: {}",
@@ -439,39 +449,76 @@ pub async fn merge_by_stream(
     // use multiple threads to merge
     let semaphore = std::sync::Arc::new(Semaphore::new(cfg.limit.file_merge_thread_num));
     let mut tasks = Vec::with_capacity(partition_files_with_size.len());
-    for (prefix, mut files_with_size) in partition_files_with_size.into_iter() {
+    for (prefix, files_with_size) in partition_files_with_size.into_iter() {
         let org_id = org_id.to_string();
         let stream_name = stream_name.to_string();
         let permit = semaphore.clone().acquire_owned().await.unwrap();
         let worker_tx = worker_tx.clone();
         let task: JoinHandle<Result<Vec<i64>, anyhow::Error>> = tokio::task::spawn(async move {
             let cfg = get_config();
-            // sort by file size
             let job_strategy = MergeStrategy::from(&cfg.compact.strategy);
-            match job_strategy {
-                MergeStrategy::FileSize => {
-                    files_with_size.sort_by_key(|k| k.meta.original_size);
-                }
-                MergeStrategy::FileTime => {
-                    files_with_size.sort_by_key(|k| k.meta.min_ts);
-                }
-                MergeStrategy::TimeRange => {
-                    files_with_size = sort_by_time_range(files_with_size);
+
+            // core files (.vix) and flat data files (parquet/vortex) never
+            // merge together — their write paths differ entirely — so a merge
+            // group must be same-kind. Split the candidates by kind; each
+            // kind sorts and groups independently.
+            // Full-size files never join a merge group; feeding them into
+            // the grouping loop would poison it (its singleton-replace
+            // logic drops neighbors). Split them out first — core-file
+            // oversize entries remain HEALING PROBE candidates below.
+            let oversize_cutoff = cfg.compact.max_file_size as i64 * 95 / 100;
+            let (oversize_files, files_with_size): (Vec<FileKey>, Vec<FileKey>) = files_with_size
+                .into_iter()
+                .partition(|f| f.meta.original_size > oversize_cutoff);
+            let (mut core_files, mut flat_files): (Vec<FileKey>, Vec<FileKey>) = files_with_size
+                .into_iter()
+                .partition(|f| f.key.ends_with(config::FILE_EXT_VIX));
+            // sort by file size
+            for files in [&mut flat_files, &mut core_files] {
+                match job_strategy {
+                    MergeStrategy::FileSize => {
+                        files.sort_by_key(|k| k.meta.original_size);
+                    }
+                    MergeStrategy::FileTime => {
+                        files.sort_by_key(|k| k.meta.min_ts);
+                    }
+                    MergeStrategy::TimeRange => {
+                        *files = sort_by_time_range(std::mem::take(files));
+                    }
                 }
             }
 
+            // downsampling applies to metrics only, which are never core files
             #[cfg(feature = "enterprise")]
             let skip_group_files = stream_type == StreamType::Metrics
+                && !flat_files.is_empty()
                 && get_largest_downsampling_rule(
                     &stream_name,
-                    files_with_size.iter().map(|f| f.meta.max_ts).max().unwrap(),
+                    flat_files.iter().map(|f| f.meta.max_ts).max().unwrap(),
                 )
                 .is_some();
 
             #[cfg(not(feature = "enterprise"))]
             let skip_group_files = false;
 
-            if files_with_size.len() <= 1 && !skip_group_files {
+            // A partition holding exactly ONE core file can never form a
+            // >= 2 merge group, so a file with outdated index capabilities
+            // (fts-tainted partial field, missing numeric value terms,
+            // missing configured docs columns) would keep them forever —
+            // only a rebuild heals it. Such files are probed cheaply below
+            // (container metadata / fields table over ranged reads; a
+            // current file stays a NO-OP with no docs download and no
+            // file_list change) and enqueued as a single-file healing batch
+            // when outdated. Skipped in incremental rounds: the hour is
+            // still open, more files are coming, and the hour-end pass
+            // probes once.
+            let single_core_heal_candidate = core_files.len() == 1 && !is_incremental;
+
+            if flat_files.len() <= 1
+                && core_files.len() <= 1
+                && !skip_group_files
+                && !single_core_heal_candidate
+            {
                 return Ok(vec![]);
             }
 
@@ -484,58 +531,95 @@ pub async fn merge_by_stream(
                     stream_type,
                     stream_name: stream_name.clone(),
                     prefix: prefix.clone(),
-                    files: files_with_size.clone(),
+                    files: flat_files.clone(),
                 });
             } else {
-                let mut new_file_list = Vec::new();
-                let mut new_file_size = 0;
-                for file in files_with_size.iter() {
-                    if new_file_size + file.meta.original_size > cfg.compact.max_file_size as i64
-                        || (cfg.compact.max_group_files > 0
-                            && new_file_list.len() >= cfg.compact.max_group_files)
-                    {
-                        if new_file_list.len() <= 1 {
-                            if job_strategy == MergeStrategy::FileSize {
-                                break;
-                            }
-                            new_file_list.clear();
-                            new_file_size = file.meta.original_size;
-                            new_file_list.push(file.clone());
-                            continue; // replace previous file with current file
-                        }
+                group_files_into_batches(
+                    &mut batch_groups,
+                    &flat_files,
+                    &org_id,
+                    stream_type,
+                    &stream_name,
+                    &prefix,
+                    is_incremental,
+                    &job_strategy,
+                );
+            }
+            group_files_into_batches(
+                &mut batch_groups,
+                &core_files,
+                &org_id,
+                stream_type,
+                &stream_name,
+                &prefix,
+                is_incremental,
+                &job_strategy,
+            );
+
+            // Healing probe candidates: the lone file of a single-file
+            // partition, PLUS every core file batching left out (a file at
+            // ~max_file_size never joins a >= 2 group, so a defective one —
+            // e.g. an unreadable dictionary — would otherwise stay broken
+            // forever). Probes are container-metadata cheap and run only in
+            // non-incremental rounds.
+            let mut heal_candidates: Vec<&FileKey> = Vec::new();
+            if single_core_heal_candidate {
+                heal_candidates.push(&core_files[0]);
+            } else if !is_incremental {
+                let batched: std::collections::HashSet<&str> = batch_groups
+                    .iter()
+                    .flat_map(|b| b.files.iter().map(|f| f.key.as_str()))
+                    .collect();
+                heal_candidates.extend(
+                    core_files
+                        .iter()
+                        .filter(|f| !batched.contains(f.key.as_str())),
+                );
+            }
+            if !is_incremental {
+                heal_candidates.extend(
+                    oversize_files
+                        .iter()
+                        .filter(|f| f.key.ends_with(config::FILE_EXT_VIX)),
+                );
+            }
+            for candidate in heal_candidates {
+                match single_core_file_heal_reason(&org_id, stream_type, &stream_name, candidate)
+                    .await
+                {
+                    Ok(Some(reason)) => {
+                        log::info!(
+                            "[COMPACTOR] {org_id}/{stream_type}/{stream_name}: single-file \
+                             healing rebuild of {}: {reason}",
+                            candidate.key,
+                        );
                         batch_groups.push(MergeBatch {
                             batch_id: batch_groups.len(),
                             org_id: org_id.clone(),
                             stream_type,
                             stream_name: stream_name.clone(),
                             prefix: prefix.clone(),
-                            files: new_file_list.clone(),
+                            files: vec![candidate.clone()],
                         });
-                        new_file_size = 0;
-                        new_file_list.clear();
                     }
-                    new_file_size += file.meta.original_size;
-                    new_file_list.push(file.clone());
+                    // current file: the no-op path — no batch, no docs IO
+                    Ok(None) => {}
+                    Err(e) => {
+                        // Healing is best-effort: failing the job here would
+                        // retry a possibly deterministic probe failure
+                        // forever and wedge the stream's compaction. The
+                        // WARN is the ops signal to re-run the sweep.
+                        log::warn!(
+                            "[COMPACTOR] {org_id}/{stream_type}/{stream_name}: single-file \
+                             healing probe of {} failed (leaving the file as is): {e:#}",
+                            candidate.key,
+                        );
+                    }
                 }
-                // The trailing batch is always below max_file_size (the loop flushes a group
-                // only when adding the next file would exceed it). In incremental mode we do
-                // NOT seal this remainder: more files will arrive in the still-open hour, and
-                // sealing now would force re-merging it later (write amplification). Carry it
-                // to the next round; the scheduled hour-end pass seals whatever is left.
-                if new_file_list.len() > 1 && !is_incremental {
-                    batch_groups.push(MergeBatch {
-                        batch_id: batch_groups.len(),
-                        org_id: org_id.clone(),
-                        stream_type,
-                        stream_name: stream_name.clone(),
-                        prefix: prefix.clone(),
-                        files: new_file_list.clone(),
-                    });
-                }
+            }
 
-                if batch_groups.is_empty() {
-                    return Ok(vec![]); // no files need to merge
-                }
+            if batch_groups.is_empty() {
+                return Ok(vec![]); // no files need to merge
             }
 
             // send to worker
@@ -554,10 +638,11 @@ pub async fn merge_by_stream(
             }
 
             let mut last_error = None;
+            let mut lease_lost = false;
             let mut check_guard = HashSet::with_capacity(batch_groups.len());
             let mut orphan_blooms = Vec::new();
             for ret in worker_results {
-                let (batch_id, new_files) = match ret {
+                let (batch_id, new_files, merged_files) = match ret {
                     Ok(v) => v,
                     Err(e) => {
                         log::error!("[COMPACTOR] merge files failed: {e}");
@@ -574,34 +659,107 @@ pub async fn merge_by_stream(
                 }
                 check_guard.insert(batch_id);
 
-                // delete small files keys & write big files keys, use transaction
-                let delete_file_list = batch_groups.get(batch_id).unwrap().files.as_slice();
-                let mut events = Vec::with_capacity(new_files.len() + delete_file_list.len());
-                for new_file in new_files {
-                    if !new_file.key.is_empty() {
-                        events.push(new_file);
-                    }
-                }
+                let Some(batch) = batch_groups.get(batch_id) else {
+                    log::error!(
+                        "[COMPACTOR] merge result for stream: [{org_id}/{stream_type}/{stream_name}] carries unknown batch_id: {batch_id}"
+                    );
+                    last_error = Some(anyhow::anyhow!("merge result batch_id {batch_id} unknown"));
+                    continue;
+                };
 
-                for file in delete_file_list {
-                    events.push(FileKey {
-                        deleted: true,
-                        selection: None,
-                        row_group_size: None,
-                        ..file.clone()
-                    });
-                }
-                events.sort_by(|a, b| a.key.cmp(&b.key));
-
-                // write file list to storage
-                if let Err(e) = write_file_list(&org_id, stream_type, &events).await {
-                    log::error!("[COMPACTOR] write file list failed: {e}");
-                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                // once the job lease is gone every remaining batch of this
+                // job must be discarded too — log each so the uploaded
+                // orphans are traceable, then let the re-claimer own them
+                if lease_lost {
+                    log::warn!(
+                        "[COMPACTOR] job {job_id} lease lost: discarding merged output of batch {batch_id} for [{org_id}/{stream_type}/{stream_name}] (orphaned uploads: {:?})",
+                        new_files.iter().map(|f| f.key.as_str()).collect::<Vec<_>>(),
+                    );
                     continue;
                 }
 
+                // Delete EXACTLY the inputs whose rows made it into the
+                // merged output. The batch may be a superset: size-mismatch
+                // downloads are skipped, the size budget can cut a batch
+                // short, and a group can shrink below two survivors —
+                // deleting the whole batch in those cases threw away live
+                // rows (2026-07-30 audit). Skipped files stay in the
+                // file_list untouched and merge on a later cycle.
+                if merged_files.len() < batch.files.len() {
+                    let merged_keys: HashSet<&str> =
+                        merged_files.iter().map(|f| f.key.as_str()).collect();
+                    let skipped = batch
+                        .files
+                        .iter()
+                        .map(|f| f.key.as_str())
+                        .filter(|k| !merged_keys.contains(k))
+                        .collect::<Vec<_>>();
+                    log::warn!(
+                        "[COMPACTOR] merge batch {batch_id} for [{org_id}/{stream_type}/{stream_name}] merged {}/{} files; keeping the {} unmerged files live for a later cycle: {skipped:?}",
+                        merged_files.len(),
+                        batch.files.len(),
+                        skipped.len(),
+                    );
+                }
+
+                // delete small files keys & write big files keys, use transaction
+                let events = build_commit_events(new_files, &merged_files);
+                if events.is_empty() {
+                    // nothing merged and nothing to delete (e.g. too few
+                    // healthy survivors): release the batch with NO
+                    // file_list writes at all
+                    log::info!(
+                        "[COMPACTOR] merge batch {batch_id} for [{org_id}/{stream_type}/{stream_name}] produced no output and consumed no inputs; releasing it with no file_list changes"
+                    );
+                    continue;
+                }
+
+                // write file list to storage. A failed commit FAILS the job
+                // (recorded in last_error): the merged output was uploaded
+                // but the inputs stay live in file_list, so the job must
+                // return to pending and re-merge — silently continuing used
+                // to mark the job done and re-merge the same inputs every
+                // cycle forever.
+                //
+                // The commit is FENCED on current job ownership (a single
+                // conditional UPDATE on file_list_jobs): if the lease was
+                // lost — re-pended after a heartbeat gap and possibly
+                // re-claimed by another node — writing would double-commit
+                // the same inputs with the new owner (permanent duplicate
+                // rows), so the whole result is discarded instead and only
+                // the uploaded objects are orphaned.
+                match commit_batch_if_owner(job_id, &LOCAL_NODE.uuid, &org_id, stream_type, &events)
+                    .await
+                {
+                    Ok(FencedCommit::Committed) => {}
+                    Ok(FencedCommit::LeaseLost) => {
+                        log::error!(
+                            "[COMPACTOR] job {job_id} for [{org_id}/{stream_type}/{stream_name}] lost its lease before commit: DISCARDING batch {batch_id} and every remaining batch of this job; the current lease holder re-merges the hour (orphaned uploads: {:?})",
+                            events
+                                .iter()
+                                .filter(|f| !f.deleted)
+                                .map(|f| f.key.as_str())
+                                .collect::<Vec<_>>(),
+                        );
+                        last_error = Some(anyhow::anyhow!("job {job_id} lease lost before commit"));
+                        lease_lost = true;
+                        continue;
+                    }
+                    // fence query or file_list write failed: nothing proven
+                    // lost, so later batches still fence for themselves —
+                    // but the job must fail and re-run
+                    Err(e) => {
+                        log::error!(
+                            "[COMPACTOR] job {job_id} for [{org_id}/{stream_type}/{stream_name}] commit of batch {batch_id} failed: {e}"
+                        );
+                        last_error = Some(e);
+                        continue;
+                    }
+                }
+
                 // collect orphan blooms after writing file list successfully
-                for file in delete_file_list {
+                // — only the files actually deleted release their blooms
+                for file in merged_files.iter() {
                     if file.meta.bloom_ver > 0 {
                         orphan_blooms.push(file.meta.bloom_ver);
                     }
@@ -616,15 +774,48 @@ pub async fn merge_by_stream(
         tasks.push(task);
     }
 
-    // collect bloom files which need to be clean
+    // Collect EVERY partition task before acting on any error: the old
+    // `task.await??` loop returned on the first failure while sibling tasks
+    // kept running detached — their commits could then race the re-claimer
+    // of the re-pended job. join_all guarantees no task is still running
+    // when this function returns (and the per-batch commit fence above
+    // covers the re-claim race itself).
+    let task_results = futures::future::join_all(tasks).await;
     let mut orphan_blooms = Vec::new();
-    for task in tasks {
-        orphan_blooms.extend(task.await??);
+    let mut first_error: Option<anyhow::Error> = None;
+    for task_result in task_results {
+        match task_result {
+            Ok(Ok(blooms)) => orphan_blooms.extend(blooms),
+            Ok(Err(e)) => {
+                log::error!(
+                    "[COMPACTOR] merge_by_stream [{org_id}/{stream_type}/{stream_name}] partition task failed: {e}"
+                );
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
+            Err(e) => {
+                log::error!(
+                    "[COMPACTOR] merge_by_stream [{org_id}/{stream_type}/{stream_name}] partition task panicked or was cancelled: {e}"
+                );
+                if first_error.is_none() {
+                    first_error = Some(e.into());
+                }
+            }
+        }
+    }
+    if let Some(e) = first_error {
+        return Err(e);
     }
 
     let _ = (is_incremental, orphan_blooms);
 
-    // update job status
+    // An INCREMENTAL round leaves the hour unsealed (its below-budget
+    // remainder is carried forward), but the job still COMPLETES and
+    // leaves the claim queue — keeping it pending would park a
+    // never-finishing job at the head of the newest-first claim order and
+    // starve every older hour. Re-queueing the closed hour is `add_job`'s
+    // job: it resurrects the done row (see `add_job`).
     if let Err(e) = infra_file_list::set_job_done(&[job_id]).await {
         log::error!("[COMPACTOR] set_job_done failed: {e}");
     }
@@ -638,6 +829,70 @@ pub async fn merge_by_stream(
     Ok(())
 }
 
+/// Cut `files` (already sorted by the job strategy) into merge batches
+/// bounded by `compact.max_file_size` / `compact.max_group_files`, appending
+/// them to `batch_groups`. In incremental mode the below-budget trailing
+/// remainder is carried to the next round instead of being sealed (see
+/// `merge_by_stream`). Lists of one file produce no batch.
+#[allow(clippy::too_many_arguments)]
+fn group_files_into_batches(
+    batch_groups: &mut Vec<MergeBatch>,
+    files: &[FileKey],
+    org_id: &str,
+    stream_type: StreamType,
+    stream_name: &str,
+    prefix: &str,
+    is_incremental: bool,
+    job_strategy: &MergeStrategy,
+) {
+    let cfg = get_config();
+    let mut new_file_list = Vec::new();
+    let mut new_file_size = 0;
+    for file in files.iter() {
+        if new_file_size + file.meta.original_size > cfg.compact.max_file_size as i64
+            || (cfg.compact.max_group_files > 0
+                && new_file_list.len() >= cfg.compact.max_group_files)
+        {
+            if new_file_list.len() <= 1 {
+                if *job_strategy == MergeStrategy::FileSize {
+                    break;
+                }
+                new_file_list.clear();
+                new_file_size = file.meta.original_size;
+                new_file_list.push(file.clone());
+                continue; // replace previous file with current file
+            }
+            batch_groups.push(MergeBatch {
+                batch_id: batch_groups.len(),
+                org_id: org_id.to_string(),
+                stream_type,
+                stream_name: stream_name.to_string(),
+                prefix: prefix.to_string(),
+                files: new_file_list.clone(),
+            });
+            new_file_size = 0;
+            new_file_list.clear();
+        }
+        new_file_size += file.meta.original_size;
+        new_file_list.push(file.clone());
+    }
+    // The trailing batch is always below max_file_size (the loop flushes a group
+    // only when adding the next file would exceed it). In incremental mode we do
+    // NOT seal this remainder: more files will arrive in the still-open hour, and
+    // sealing now would force re-merging it later (write amplification). Carry it
+    // to the next round; the scheduled hour-end pass seals whatever is left.
+    if new_file_list.len() > 1 && !is_incremental {
+        batch_groups.push(MergeBatch {
+            batch_id: batch_groups.len(),
+            org_id: org_id.to_string(),
+            stream_type,
+            stream_name: stream_name.to_string(),
+            prefix: prefix.to_string(),
+            files: new_file_list.clone(),
+        });
+    }
+}
+
 // merge small files into big file, upload to storage, returns the big file key and merged files
 // params:
 // - thread_id: the id of the thread
@@ -647,8 +902,10 @@ pub async fn merge_by_stream(
 // - prefix: the prefix of the files
 // - files_with_size: the files to merge
 // returns:
-// - new_files: the files that are merged
-// - retain_file_list: the files that are not merged
+// - new_files: the merged output files
+// - retain_file_list: EXACTLY the input files whose rows made it into new_files — the only files
+//   the caller may delete. Inputs left out (size-budget cut, size-mismatch skip, dropped-invalid,
+//   lone survivor) are NOT in it: they stay live in the file_list and retry later.
 pub async fn merge_files(
     thread_id: usize,
     org_id: &str,
@@ -658,6 +915,22 @@ pub async fn merge_files(
     files_with_size: &[FileKey],
 ) -> Result<(Vec<FileKey>, Vec<FileKey>), anyhow::Error> {
     let start = std::time::Instant::now();
+
+    // batch selection groups same-kind files only (see merge_by_stream); a
+    // mixed group would corrupt whichever writer ran, so reject it loudly
+    let is_core_group = files_with_size
+        .first()
+        .is_some_and(|f| f.key.ends_with(config::FILE_EXT_VIX));
+    if files_with_size
+        .iter()
+        .any(|f| f.key.ends_with(config::FILE_EXT_VIX) != is_core_group)
+    {
+        return Err(anyhow::anyhow!(
+            "merge_files got a mixed core/flat file group: {:?}",
+            files_with_size.iter().map(|f| &f.key).collect::<Vec<_>>()
+        ));
+    }
+
     #[cfg(feature = "enterprise")]
     let is_match_downsampling_rule = get_largest_downsampling_rule(
         stream_name,
@@ -668,7 +941,13 @@ pub async fn merge_files(
     #[cfg(not(feature = "enterprise"))]
     let is_match_downsampling_rule = false;
 
-    if files_with_size.len() <= 1 && !is_match_downsampling_rule {
+    // A single-file CORE batch is a deliberate healing rebuild
+    // (merge_by_stream's capability probe enqueues it): let it through the
+    // >= 2 guards and the size budget — the rebuilt output replaces the
+    // input at roughly its own size, so the group-size cap does not apply.
+    let is_single_core_heal = is_core_group && files_with_size.len() == 1;
+
+    if files_with_size.len() <= 1 && !is_match_downsampling_rule && !is_single_core_heal {
         return Ok((Vec::new(), Vec::new()));
     }
 
@@ -681,6 +960,7 @@ pub async fn merge_files(
             || new_compressed_file_size + file.meta.compressed_size
                 > cfg.compact.max_file_size as i64)
             && !is_match_downsampling_rule
+            && !is_single_core_heal
         {
             break;
         }
@@ -696,11 +976,9 @@ pub async fn merge_files(
             .inc_by(file.meta.original_size as u64);
     }
     // no files need to merge
-    if new_file_list.len() <= 1 && !is_match_downsampling_rule {
+    if new_file_list.len() <= 1 && !is_match_downsampling_rule && !is_single_core_heal {
         return Ok((Vec::new(), Vec::new()));
     }
-
-    let retain_file_list = new_file_list.clone();
 
     // cache parquet files
     let deleted_files = cache_remote_files(&new_file_list).await?;
@@ -712,9 +990,23 @@ pub async fn merge_files(
     if !deleted_files.is_empty() {
         new_file_list.retain(|f| !deleted_files.contains(&f.key));
     }
-    if new_file_list.len() <= 1 && !is_match_downsampling_rule {
-        return Ok((Vec::new(), retain_file_list));
+    // (a heal whose only file was dropped as invalid has nothing left to
+    // rebuild — cache_remote_files already removed it from the file_list)
+    if new_file_list.len() <= 1
+        && !is_match_downsampling_rule
+        && !(is_single_core_heal && new_file_list.len() == 1)
+    {
+        // Not enough healthy inputs left to merge: return an EMPTY merged
+        // set so the caller releases the batch with no file_list writes.
+        // Returning the batch here used to commit a PURE DELETION of every
+        // input — including the healthy survivor — with no replacement
+        // output (permanent loss, 2026-07-30 audit).
+        return Ok((Vec::new(), Vec::new()));
     }
+
+    // From here on new_file_list is EXACTLY the input set the merge
+    // consumes; the snapshot is what the caller may delete after commit.
+    let retain_file_list = new_file_list.clone();
 
     // get time range and stats for these files in a single iteration
     let (min_ts, max_ts, total_records, new_file_size) = new_file_list.iter().fold(
@@ -749,32 +1041,37 @@ pub async fn merge_files(
     let stream_settings = infra::schema::unwrap_stream_settings(&latest_schema);
     let bloom_filter_fields = get_stream_setting_bloom_filter_fields(&stream_settings);
     let full_text_search_fields = get_stream_setting_fts_fields(&stream_settings);
-    let index_fields = get_stream_setting_index_fields(&stream_settings);
-    let (defined_schema_fields, need_original, index_original_data, index_all_values, storage_type) =
-        match stream_settings {
-            Some(s) => (
-                s.defined_schema_fields,
-                s.store_original_data,
-                s.index_original_data,
-                s.index_all_values,
-                s.storage_type,
-            ),
-            None => (Vec::new(), false, false, false, StorageType::Normal),
-        };
-    let latest_schema = if !defined_schema_fields.is_empty() {
-        let latest_schema = SchemaCache::new(latest_schema);
-        let latest_schema = generate_schema_for_defined_schema_fields(
+    let column_store_fields = stream_settings
+        .as_ref()
+        .map(get_stream_setting_column_store_fields)
+        .unwrap_or_default();
+    let storage_type = stream_settings
+        .map(|s| s.storage_type)
+        .unwrap_or(StorageType::Normal);
+    let latest_schema = Arc::new(latest_schema);
+
+    // core files: k-way merge by _timestamp without DataFusion, index
+    // rebuilt from _source with the current settings
+    if is_core_group {
+        return merge_core_group(
+            thread_id,
+            org_id,
             stream_type,
-            &latest_schema,
-            &defined_schema_fields,
-            need_original,
-            index_original_data,
-            index_all_values,
-        );
-        latest_schema.schema().clone()
-    } else {
-        Arc::new(latest_schema)
-    };
+            stream_name,
+            prefix,
+            new_file_list,
+            retain_file_list,
+            new_file_meta,
+            latest_schema,
+            full_text_search_fields,
+            column_store_fields,
+            bloom_filter_fields,
+            storage_type,
+            is_single_core_heal,
+            start,
+        )
+        .await;
+    }
 
     // read schema from parquet file and group files by schema
     let mut schemas = HashMap::new();
@@ -864,24 +1161,11 @@ pub async fn merge_files(
         }
     };
 
-    let latest_schema_fields = latest_schema
-        .fields()
-        .iter()
-        .map(|f| f.name())
-        .collect::<HashSet<_>>();
-    let need_index = full_text_search_fields
-        .iter()
-        .chain(index_fields.iter())
-        .any(|f| latest_schema_fields.contains(f));
-    if !need_index {
-        log::debug!("skip index generation for stream: {org_id}/{stream_type}/{stream_name}");
-    }
-
     let mut new_files = Vec::new();
     match buf {
         MergeParquetResult::Single {
             buf,
-            file_meta: mut new_file_meta,
+            file_meta: new_file_meta,
             file_format,
         } => {
             if new_file_meta.compressed_size == 0 {
@@ -912,25 +1196,17 @@ pub async fn merge_files(
 
             // TODO: check how compliance will interact with org storage
             let account = storage::get_account(org_id, &new_file_key).unwrap_or_default();
-            if cfg.s3.feature_force_infrequent_access && storage_type.is_compliance() {
-                storage::put_with_compliance(&account, &new_file_key, buf.clone()).await?;
-            } else {
-                storage::put(&account, &new_file_key, buf.clone()).await?;
-            }
+            put_merged_output(
+                &account,
+                &new_file_key,
+                buf.clone(),
+                cfg.s3.feature_force_infrequent_access && storage_type.is_compliance(),
+            )
+            .await?;
 
-            if cfg.common.inverted_index_enabled && stream_type.support_index() && need_index {
-                generate_inverted_index(
-                    org_id,
-                    &new_file_key,
-                    &full_text_search_fields,
-                    &index_fields,
-                    &retain_file_list,
-                    &mut new_file_meta,
-                    latest_schema.clone(),
-                    buf,
-                )
-                .await?;
-            }
+            // legacy flat outputs (metrics + pre-core logs/traces parquet)
+            // get no inverted index: the v1 sidecar builder was removed, and
+            // index-less files are answered by the scan path
             new_files.push(FileKey::new(0, account, new_file_key, new_file_meta, false));
         }
         MergeParquetResult::Multiple {
@@ -962,25 +1238,13 @@ pub async fn merge_files(
 
                 // TODO: check how compliance will interact with org storage
                 let account = storage::get_account(org_id, &new_file_key).unwrap_or_default();
-                if cfg.s3.feature_force_infrequent_access && storage_type.is_compliance() {
-                    storage::put_with_compliance(&account, &new_file_key, buf.clone()).await?;
-                } else {
-                    storage::put(&account, &new_file_key, buf.clone()).await?;
-                }
-
-                if cfg.common.inverted_index_enabled && stream_type.support_index() && need_index {
-                    generate_inverted_index(
-                        org_id,
-                        &new_file_key,
-                        &full_text_search_fields,
-                        &index_fields,
-                        &retain_file_list,
-                        &mut new_file_meta,
-                        latest_schema.clone(),
-                        buf,
-                    )
-                    .await?;
-                }
+                put_merged_output(
+                    &account,
+                    &new_file_key,
+                    buf.clone(),
+                    cfg.s3.feature_force_infrequent_access && storage_type.is_compliance(),
+                )
+                .await?;
 
                 new_files.push(FileKey::new(0, account, new_file_key, new_file_meta, false));
             }
@@ -1001,35 +1265,433 @@ pub async fn merge_files(
     Ok((new_files, retain_file_list))
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn generate_inverted_index(
-    org_id: &str,
+/// Upload one merged object with a bounded retry (3 attempts, doubling
+/// backoff): a transient object-store failure must not throw away a
+/// multi-second merge — the whole merge would otherwise re-run from scratch.
+async fn put_merged_output(
+    account: &str,
     new_file_key: &str,
-    fts_fields: &[String],
-    index_fields: &[String],
-    retain_file_list: &[FileKey],
-    new_file_meta: &mut FileMeta,
-    latest_schema: Arc<Schema>,
     buf: Bytes,
+    compliance: bool,
 ) -> Result<(), anyhow::Error> {
-    let index_size = create_tantivy_index(
-        "COMPACTOR",
-        org_id,
-        new_file_key,
-        fts_fields,
-        index_fields,
-        latest_schema, // Use stream schema to include all configured fields
-        buf,
-    )
-    .await
-    .map_err(|e| {
-        anyhow::anyhow!(
-            "create_tantivy_index_on_compactor for file: {new_file_key}, error: {e}, need delete files: {retain_file_list:?}",
-        )
-    })?;
-    new_file_meta.index_size = index_size as i64;
+    const MAX_ATTEMPTS: usize = 3;
+    let mut backoff = tokio::time::Duration::from_millis(500);
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 1..=MAX_ATTEMPTS {
+        let ret = if compliance {
+            storage::put_with_compliance(account, new_file_key, buf.clone()).await
+        } else {
+            storage::put(account, new_file_key, buf.clone()).await
+        };
+        match ret {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                log::warn!(
+                    "[COMPACTOR] upload of merged file {new_file_key} failed (attempt {attempt}/{MAX_ATTEMPTS}): {e}",
+                );
+                last_err = Some(e.into());
+                if attempt < MAX_ATTEMPTS {
+                    tokio::time::sleep(backoff).await;
+                    backoff *= 2;
+                }
+            }
+        }
+    }
+    Err(last_err.expect("at least one upload attempt ran"))
+}
 
-    Ok(())
+/// [`put_merged_output`] for a SPOOLED merge output: stream the local file
+/// to object storage (bounded multipart, no in-memory copy of the object)
+/// with the same bounded retry. The spool persists across attempts, so a
+/// retry re-streams from disk instead of re-running the merge.
+async fn put_merged_output_file(
+    account: &str,
+    new_file_key: &str,
+    spool: &std::path::Path,
+    compliance: bool,
+) -> Result<(), anyhow::Error> {
+    const MAX_ATTEMPTS: usize = 3;
+    let mut backoff = tokio::time::Duration::from_millis(500);
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 1..=MAX_ATTEMPTS {
+        let ret = if compliance {
+            storage::put_file_with_compliance(account, new_file_key, spool).await
+        } else {
+            storage::put_file(account, new_file_key, spool).await
+        };
+        match ret {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                log::warn!(
+                    "[COMPACTOR] streaming upload of merged file {new_file_key} failed (attempt {attempt}/{MAX_ATTEMPTS}): {e}",
+                );
+                last_err = Some(e.into());
+                if attempt < MAX_ATTEMPTS {
+                    tokio::time::sleep(backoff).await;
+                    backoff *= 2;
+                }
+            }
+        }
+    }
+    Err(last_err.expect("at least one upload attempt ran"))
+}
+
+/// Merge one same-kind group of core `.vix` files into a single core
+/// file and upload it. The inputs come through the same disk-cache ladder as
+/// parquet compaction; the CPU-bound k-way merge + index rebuild
+/// (`vix::core_writer::merge_core_files`) runs on a blocking thread.
+///
+/// `force_rebuild` (single-file healing batches) always takes the
+/// `_source` rebuild: the index-merge fast path could only DEMOTE a field
+/// carried without value terms (capability intersection) instead of
+/// restoring it, while the rebuild is the one path that lands every
+/// current capability — fts tokens, numeric value terms, cs columns
+/// (derived when missing), zone table, cleansed rows.
+#[allow(clippy::too_many_arguments)]
+async fn merge_core_group(
+    thread_id: usize,
+    org_id: &str,
+    stream_type: StreamType,
+    stream_name: &str,
+    prefix: &str,
+    new_file_list: Vec<FileKey>,
+    retain_file_list: Vec<FileKey>,
+    mut new_file_meta: FileMeta,
+    latest_schema: Arc<Schema>,
+    full_text_search_fields: Vec<String>,
+    column_store_fields: Vec<String>,
+    bloom_filter_fields: Vec<String>,
+    storage_type: StorageType,
+    force_rebuild: bool,
+    start: std::time::Instant,
+) -> Result<(Vec<FileKey>, Vec<FileKey>), anyhow::Error> {
+    let cfg = get_config();
+
+    // The merge reads its inputs by RANGE through the cache ladder
+    // (memory/disk cache first — cache_remote_files just filled the disk
+    // cache — with transparent remote fallback if the cache evicts a file
+    // mid-merge): input files are never materialized whole in memory. The
+    // ranged source is the healing probe's, fetch-metered under `compact`;
+    // for `.vix` files `compressed_size` is the exact object size.
+    let handle = tokio::runtime::Handle::current();
+    let inputs: Vec<crate::service::vix::core_writer::MergeInput> = new_file_list
+        .iter()
+        .map(|file| {
+            let source: Arc<dyn vortex_index::VixRangeSource> = Arc::new(HealProbeRangeSource {
+                account: file.account.clone(),
+                location: object_store::path::Path::from(file.key.as_str()),
+                size: file.meta.compressed_size as u64,
+                handle: handle.clone(),
+            });
+            (file.key.clone(), source)
+        })
+        .collect();
+
+    let result = tokio::task::spawn_blocking(move || {
+        if force_rebuild {
+            crate::service::vix::core_writer::merge_core_files_rebuild(
+                &inputs,
+                &latest_schema,
+                &full_text_search_fields,
+                &column_store_fields,
+                &bloom_filter_fields,
+            )
+        } else {
+            crate::service::vix::core_writer::merge_core_files(
+                &inputs,
+                &latest_schema,
+                &full_text_search_fields,
+                &column_store_fields,
+                &bloom_filter_fields,
+            )
+        }
+    })
+    .await??;
+
+    // Compaction-time cleansing: the merge DROPS stored rows whose
+    // `_timestamp` is degenerate (<= 0) — pre-guard-era files hide such
+    // rows behind healthy-looking file_list metadata, so only a data read
+    // (i.e. a merge) can find them, and without cleansing every merge
+    // touching one fails the writer's finish guard forever. ONE loud WARN +
+    // counter per merge output.
+    if result.dropped_rows > 0 {
+        metrics::COMPACT_DROPPED_ZERO_TS_ROWS
+            .with_label_values(&[org_id, stream_type.as_str(), stream_name])
+            .inc_by(result.dropped_rows);
+        if result.stats.row_count == 0 {
+            // Every input row was poison: there is nothing to write. Commit
+            // the merge as "inputs deleted, no output file" — the caller's
+            // event loop pushes only the input deletes (empty new_files is
+            // the supported shape: keys are filtered on emptiness), and
+            // batch_process handles a delete-only batch (the adds INSERT is
+            // skipped entirely), moving the inputs to file_list_deleted for
+            // GC. Uploading the zero-row file instead would publish a
+            // useless object with a records=0 meta.
+            log::warn!(
+                "[COMPACTOR:WORKER:{thread_id}] {org_id}/{stream_type}/{stream_name}: every row \
+                 of {} input core files under {prefix} carries a degenerate _timestamp <= 0 \
+                 ({} rows dropped by cleansing); deleting the inputs with no merged output",
+                retain_file_list.len(),
+                result.dropped_rows,
+            );
+            return Ok((Vec::new(), retain_file_list));
+        }
+        log::warn!(
+            "[COMPACTOR:WORKER:{thread_id}] {org_id}/{stream_type}/{stream_name}: dropped {} \
+             rows with a degenerate _timestamp <= 0 while merging {} core files under {prefix} \
+             (pre-guard stored data cleansed at compaction)",
+            result.dropped_rows,
+            retain_file_list.len(),
+        );
+        // the folded input metas counted the dropped rows; align records so
+        // the meta fold below sees agreement (its WARN stays an anomaly
+        // signal for genuine meta-vs-data divergence)
+        new_file_meta.records -= result.dropped_rows as i64;
+    }
+
+    // sizes + the authoritative records/min_ts/max_ts from the DATA the
+    // merge wrote, not from the inputs' file_list rows — inputs with
+    // degenerate ranges (min_ts = 0 from the historical WAL-meta bug) would
+    // otherwise poison the merged row, while re-deriving here heals them at
+    // compaction. A meta that is STILL degenerate errors here: failing the
+    // merge (the job returns to pending) beats committing a row that
+    // poisons pruning and wedges the file_list write.
+    crate::service::vix::core_writer::apply_core_stats_to_meta(
+        &mut new_file_meta,
+        result.output.len() as usize,
+        &result.stats,
+        &format!("[COMPACTOR:WORKER:{thread_id}] {prefix}"),
+    )?;
+    if new_file_meta.compressed_size == 0 {
+        return Err(anyhow::anyhow!(
+            "merge_core_files error: compressed_size is 0"
+        ));
+    }
+
+    let id = ider::generate_file_name();
+    let new_file_key = format!("{prefix}/{id}{}", FileFormat::Vix.extension());
+    log::info!(
+        "[COMPACTOR:WORKER:{thread_id}] merged {} core files into a new file: {new_file_key}, original_size: {}, compressed_size: {}, index_merge: {}, took: {} ms",
+        retain_file_list.len(),
+        new_file_meta.original_size,
+        new_file_meta.compressed_size,
+        result.used_index_merge,
+        start.elapsed().as_millis(),
+    );
+
+    // Upload to storage (the core file is the data file: cache_parquet
+    // gates the local-cache copy, exactly like a merged parquet object).
+    // Production merges SPOOL the container to the data volume — the
+    // upload streams from the spool file and the merged multi-GB object
+    // never resides in RAM; the spool deletes when `result.output` drops.
+    let account = storage::get_account(org_id, &new_file_key).unwrap_or_default();
+    let compliance = cfg.s3.feature_force_infrequent_access && storage_type.is_compliance();
+    let cache_locally = cfg.cache_latest_files.enabled
+        && cfg.cache_latest_files.cache_parquet
+        && cfg.cache_latest_files.download_from_node;
+    match &result.output {
+        VixOutput::Bytes(_) => {
+            let buf = Bytes::from(result.output.to_bytes()?);
+            if cache_locally {
+                infra::cache::file_data::disk::set(&new_file_key, buf.clone()).await?;
+                log::debug!("merge_files {new_file_key} file_data::disk::set success");
+            }
+            put_merged_output(&account, &new_file_key, buf, compliance).await?;
+        }
+        VixOutput::Spooled { .. } => {
+            let spool = result
+                .output
+                .spool_path()
+                .expect("spooled output has a path");
+            if cache_locally {
+                let buf = Bytes::from(tokio::fs::read(spool).await?);
+                infra::cache::file_data::disk::set(&new_file_key, buf).await?;
+                log::debug!("merge_files {new_file_key} file_data::disk::set success");
+            }
+            put_merged_output_file(&account, &new_file_key, spool, compliance).await?;
+        }
+    }
+    drop(result.output);
+
+    // no sibling index: the inverted index lives inside the core file
+    Ok((
+        vec![FileKey::new(0, account, new_file_key, new_file_meta, false)],
+        retain_file_list,
+    ))
+}
+
+/// One stored `.vix` object opened by byte ranges through the compactor's
+/// cache ladder (`infra::cache::storage::get_range`: memory/disk cache
+/// first, then the remote store) — the healing probe's IO. `vortex_index`
+/// polls fetch futures on its own single-thread executor (no tokio
+/// reactor), so the real IO runs on the captured tokio handle and hands the
+/// result back over a oneshot channel; every fetch is bounded by
+/// `ZO_VIX_FETCH_TIMEOUT` and ticks the `vix_fetch_*` metrics under the
+/// `compact` label.
+pub(crate) struct HealProbeRangeSource {
+    pub(crate) account: String,
+    pub(crate) location: object_store::path::Path,
+    pub(crate) size: u64,
+    pub(crate) handle: tokio::runtime::Handle,
+}
+
+impl vortex_index::VixRangeSource for HealProbeRangeSource {
+    fn len(&self) -> u64 {
+        self.size
+    }
+
+    fn fetch(
+        &self,
+        range: std::ops::Range<u64>,
+    ) -> futures::future::BoxFuture<'static, anyhow::Result<Bytes>> {
+        use futures::FutureExt;
+        let account = self.account.clone();
+        let location = self.location.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.handle.spawn(async move {
+            let fut = infra::cache::storage::get_range(&account, &location, range);
+            let timeout_secs = get_config().limit.vix_fetch_timeout;
+            let result = if timeout_secs > 0 {
+                match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), fut).await
+                {
+                    Ok(result) => result.map_err(anyhow::Error::from),
+                    Err(_) => Err(anyhow::anyhow!(
+                        "vix range fetch timed out after {timeout_secs}s (ZO_VIX_FETCH_TIMEOUT)"
+                    )),
+                }
+            } else {
+                fut.await.map_err(anyhow::Error::from)
+            };
+            if let Ok(bytes) = &result {
+                metrics::VIX_FETCH_COUNT_TOTAL
+                    .with_label_values(&["compact"])
+                    .inc();
+                metrics::VIX_FETCH_BYTES_TOTAL
+                    .with_label_values(&["compact"])
+                    .inc_by(bytes.len() as u64);
+            }
+            // the receiver may be gone (probe abandoned); nothing to do then
+            let _ = tx.send(result);
+        });
+        async move {
+            rx.await
+                .map_err(|_| anyhow::anyhow!("range fetch task was cancelled"))?
+        }
+        .boxed()
+    }
+
+    fn describe(&self) -> String {
+        self.location.to_string()
+    }
+}
+
+/// Decide whether the single core file of a partition needs the healing
+/// rebuild: open it over ranged reads and classify it against the stream's
+/// CURRENT schema and settings (`core_writer::classify_core_file` — the
+/// same capability checks the merge paths enforce; the same settings
+/// resolution `merge_files` uses). `Ok(Some(reason))` enqueues the
+/// single-file batch; `Ok(None)` is the no-op path — the file is current,
+/// nothing is downloaded beyond container metadata, the job completes with
+/// no file_list change.
+async fn single_core_file_heal_reason(
+    org_id: &str,
+    stream_type: StreamType,
+    stream_name: &str,
+    file: &FileKey,
+) -> Result<Option<String>, anyhow::Error> {
+    use crate::service::vix::core_writer::{CoreFileStatus, classify_core_file};
+
+    let latest_schema = infra::schema::get(org_id, stream_name, stream_type).await?;
+    let stream_settings = infra::schema::unwrap_stream_settings(&latest_schema);
+    let bloom_filter_fields = get_stream_setting_bloom_filter_fields(&stream_settings);
+    let full_text_search_fields = get_stream_setting_fts_fields(&stream_settings);
+    let column_store_fields = stream_settings
+        .as_ref()
+        .map(get_stream_setting_column_store_fields)
+        .unwrap_or_default();
+
+    let source: Arc<dyn vortex_index::VixRangeSource> = Arc::new(HealProbeRangeSource {
+        account: file.account.clone(),
+        location: object_store::path::Path::from(file.key.as_str()),
+        // a .vix FileMeta's compressed_size is the exact object size
+        size: file.meta.compressed_size as u64,
+        handle: tokio::runtime::Handle::current(),
+    });
+    let key = file.key.clone();
+    let status = tokio::task::spawn_blocking(move || {
+        classify_core_file(
+            &key,
+            source,
+            &latest_schema,
+            &full_text_search_fields,
+            &column_store_fields,
+            &bloom_filter_fields,
+        )
+    })
+    .await??;
+    Ok(match status {
+        CoreFileStatus::Current => None,
+        CoreFileStatus::NeedsRebuild(reason) => Some(reason),
+    })
+}
+
+/// Build the file_list commit events for one merged batch: adds for the
+/// non-empty new files plus deletes for EXACTLY the inputs whose rows made
+/// it into the merged output. Batch inputs that were skipped (size-mismatch
+/// downloads, size-budget cuts, lone survivors) must not be passed in
+/// `merged_files` — they stay live and retry on a later cycle. An empty
+/// result means the batch is released with no file_list writes at all.
+fn build_commit_events(new_files: Vec<FileKey>, merged_files: &[FileKey]) -> Vec<FileKey> {
+    let mut events = Vec::with_capacity(new_files.len() + merged_files.len());
+    for new_file in new_files {
+        if !new_file.key.is_empty() {
+            events.push(new_file);
+        }
+    }
+    for file in merged_files {
+        events.push(FileKey {
+            deleted: true,
+            selection: None,
+            row_group_size: None,
+            ..file.clone()
+        });
+    }
+    events.sort_by(|a, b| a.key.cmp(&b.key));
+    events
+}
+
+/// Outcome of one fenced batch commit.
+enum FencedCommit {
+    /// ownership confirmed, events written
+    Committed,
+    /// the fence hit zero rows: the job is not (node, Running) anymore —
+    /// nothing was written and the caller must discard the merge result
+    LeaseLost,
+}
+
+/// Commit one merged batch's file_list events ONLY while `node` still owns
+/// the RUNNING job row (defense in depth for the heartbeat lease,
+/// 2026-07-30 audit): a single conditional UPDATE on file_list_jobs decides
+/// it. `Err` means the fence query or the write failed — with the fence
+/// query failed nothing was written; with the write failed ownership WAS
+/// confirmed and the normal fail-the-job retry path applies.
+async fn commit_batch_if_owner(
+    job_id: i64,
+    node: &str,
+    org_id: &str,
+    stream_type: StreamType,
+    events: &[FileKey],
+) -> Result<FencedCommit, anyhow::Error> {
+    let owned = infra_file_list::confirm_job_ownership(job_id, node)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!("confirm_job_ownership for job {job_id} failed (commit discarded): {e}")
+        })?;
+    if !owned {
+        return Ok(FencedCommit::LeaseLost);
+    }
+    write_file_list(org_id, stream_type, events).await?;
+    Ok(FencedCommit::Committed)
 }
 
 async fn write_file_list(
@@ -1048,29 +1710,66 @@ async fn write_file_list(
             id: 0,
             account: v.account.clone(),
             file: v.key.clone(),
-            index_file: v.meta.index_size > 0,
+            // always false: no file has a sibling index object
+            index_file: false,
             flattened: v.meta.flattened,
         })
         .collect::<Vec<_>>();
 
-    // set to db
-    // retry 5 times
+    // Commit to the DB with BOUNDED retries and doubling backoff. A
+    // DETERMINISTIC error (SQL syntax error, our own meta validation —
+    // `Error::is_deterministic_db_error`) bails immediately: retrying can
+    // never succeed, and the old blind 1s loop kept whole worker pools
+    // wedged re-running the same failing statement. On exhaustion (or bail)
+    // the caller fails the merge job, which returns to pending via the job
+    // system instead of spinning the worker.
+    const MAX_ATTEMPTS: usize = 5;
     let cfg = get_config();
     let mut success = false;
     let mut mark_deleted_done = false;
+    let mut last_error: Option<infra::errors::Error> = None;
+    let mut backoff = tokio::time::Duration::from_secs(1);
     let created_at = config::utils::time::now_micros();
-    for _ in 0..5 {
-        if !mark_deleted_done && let Err(e) = infra::file_list::batch_process(events).await {
-            log::error!("[COMPACTOR] batch_process to db failed, retrying: {e}");
-            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-            continue;
+    for attempt in 1..=MAX_ATTEMPTS {
+        if attempt > 1 {
+            tokio::time::sleep(backoff).await;
+            backoff *= 2;
         }
-        mark_deleted_done = true;
+        if !mark_deleted_done {
+            if let Err(e) = infra::file_list::batch_process(events).await {
+                let deterministic = e.is_deterministic_db_error();
+                log::error!(
+                    "[COMPACTOR] batch_process to db failed (attempt {attempt}/{MAX_ATTEMPTS}{}): {e}",
+                    if deterministic {
+                        ", deterministic — not retrying"
+                    } else {
+                        ""
+                    },
+                );
+                last_error = Some(e);
+                if deterministic {
+                    break;
+                }
+                continue;
+            }
+            mark_deleted_done = true;
+        }
         if !del_items.is_empty()
             && let Err(e) = infra_file_list::batch_add_deleted(org_id, created_at, &del_items).await
         {
-            log::error!("[COMPACTOR] batch_add_deleted to db failed, retrying: {e}");
-            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            let deterministic = e.is_deterministic_db_error();
+            log::error!(
+                "[COMPACTOR] batch_add_deleted to db failed (attempt {attempt}/{MAX_ATTEMPTS}{}): {e}",
+                if deterministic {
+                    ", deterministic — not retrying"
+                } else {
+                    ""
+                },
+            );
+            last_error = Some(e);
+            if deterministic {
+                break;
+            }
             continue;
         }
         success = true;
@@ -1099,7 +1798,10 @@ async fn write_file_list(
             }
         }
     } else {
-        return Err(anyhow::anyhow!("batch_write to db failed"));
+        return Err(anyhow::anyhow!(
+            "file_list batch write to db failed: {}",
+            last_error.map_or_else(|| "unknown error".to_string(), |e| e.to_string()),
+        ));
     }
 
     Ok(())
@@ -1240,6 +1942,7 @@ mod tests {
             deleted: false,
             selection: None,
             row_group_size: None,
+            selection_exact: false,
         }
     }
 
@@ -1733,5 +2436,229 @@ mod tests {
         // Both files must appear; overlap.parquet goes to a new group.
         let keys: Vec<&str> = result.iter().map(|f| f.key.as_str()).collect();
         assert!(keys.contains(&"overlap.parquet"));
+    }
+
+    // ── FIX-B (2026-07-30 audit): deletion-set exactness ─────────────────────
+
+    /// A batch where one file was skipped (size-mismatch download, size
+    /// budget cut, ...) must delete ONLY the files that made it into the
+    /// merged output; the skipped file gets no delete event.
+    #[test]
+    fn test_build_commit_events_deletes_only_merged_files() {
+        let batch = [
+            create_file_key("files/o/logs/s/2026/01/01/00/a.parquet", 1000, 2000, 1024),
+            create_file_key("files/o/logs/s/2026/01/01/00/b.parquet", 2000, 3000, 1024),
+            create_file_key(
+                "files/o/logs/s/2026/01/01/00/skip.parquet",
+                3000,
+                4000,
+                1024,
+            ),
+        ];
+        // merge consumed a + b, skipped skip.parquet
+        let merged = &batch[..2];
+        let new_file = create_file_key(
+            "files/o/logs/s/2026/01/01/00/merged.parquet",
+            1000,
+            3000,
+            2048,
+        );
+        let events = build_commit_events(vec![new_file.clone()], merged);
+
+        assert_eq!(events.len(), 3, "one add + exactly two deletes");
+        let adds = events
+            .iter()
+            .filter(|e| !e.deleted)
+            .map(|e| e.key.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(adds, vec![new_file.key.as_str()]);
+        let deletes = events
+            .iter()
+            .filter(|e| e.deleted)
+            .map(|e| e.key.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            deletes,
+            vec![
+                "files/o/logs/s/2026/01/01/00/a.parquet",
+                "files/o/logs/s/2026/01/01/00/b.parquet",
+            ]
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.key == "files/o/logs/s/2026/01/01/00/skip.parquet"),
+            "the skipped file must stay live — no event at all"
+        );
+    }
+
+    /// The <=1-survivor case: `merge_files` returns empty new_files AND an
+    /// empty merged set, so the batch releases with NO file_list writes —
+    /// no events means `write_file_list` is never reached.
+    #[test]
+    fn test_build_commit_events_survivor_release_writes_nothing() {
+        let events = build_commit_events(Vec::new(), &[]);
+        assert!(
+            events.is_empty(),
+            "a released batch must produce zero file_list events"
+        );
+    }
+
+    /// Empty-keyed new files are filtered (the all-poison cleanse path
+    /// commits inputs-deleted with no output); the deletes must survive.
+    #[test]
+    fn test_build_commit_events_pure_deletion_keeps_deletes_only() {
+        let merged = vec![create_file_key(
+            "files/o/logs/s/2026/01/01/00/poison.parquet",
+            1000,
+            2000,
+            1024,
+        )];
+        let events = build_commit_events(Vec::new(), &merged);
+        assert_eq!(events.len(), 1);
+        assert!(events[0].deleted);
+        assert_eq!(events[0].key, "files/o/logs/s/2026/01/01/00/poison.parquet");
+    }
+
+    // ── FIX-A (2026-07-30 audit): commit fencing ─────────────────────────────
+
+    fn commit_test_file(org: &str, stream: &str, name: &str) -> FileKey {
+        create_file_key(
+            &format!("files/{org}/logs/{stream}/2026/01/01/00/{name}.parquet"),
+            1_700_000_000_000_000,
+            1_700_000_001_000_000,
+            1024,
+        )
+    }
+
+    /// Steal the lease mid-merge => ZERO file_list writes from the loser.
+    /// Claim as node-a, commit one fenced batch (lands), let the lease time
+    /// out and node-b re-claim, then node-a's late commit must be fully
+    /// discarded: no add row, no file_list_deleted row. Sqlite-backed
+    /// through the real job API.
+    #[tokio::test]
+    async fn test_commit_fencing_loser_writes_nothing() {
+        use crate::compact::jobs_test_support::retry_busy;
+        let _guard = crate::compact::jobs_test_support::setup().await;
+        let run = config::utils::time::now_micros();
+        let org = format!("fenceorg{run}");
+        let stream = format!("fencestream{run}");
+        let job_id = retry_busy("add_job", || {
+            infra_file_list::add_job(&org, StreamType::Logs, &stream, run)
+        })
+        .await;
+
+        // claim for node-a (table-wide claim: keep ours, restore strangers)
+        let claimed = retry_busy("claim", || {
+            infra_file_list::get_pending_jobs("fence-node-a", 10_000, false)
+        })
+        .await;
+        assert!(claimed.iter().any(|j| j.id == job_id));
+        let strangers = claimed
+            .iter()
+            .map(|j| j.id)
+            .filter(|id| *id != job_id)
+            .collect::<Vec<_>>();
+        if !strangers.is_empty() {
+            retry_busy("restore stranger jobs", || {
+                infra_file_list::set_job_pending(&strangers, 0, None)
+            })
+            .await;
+        }
+
+        // the running owner's fenced commit lands: one add + one delete
+        let old_a = commit_test_file(&org, &stream, "old_a");
+        let new_a = commit_test_file(&org, &stream, "new_a");
+        let events_a = build_commit_events(vec![new_a.clone()], std::slice::from_ref(&old_a));
+        let outcome = retry_busy("owner commit", || {
+            commit_batch_if_owner(job_id, "fence-node-a", &org, StreamType::Logs, &events_a)
+        })
+        .await;
+        match outcome {
+            FencedCommit::Committed => {}
+            FencedCommit::LeaseLost => panic!("the running owner must pass the fence"),
+        }
+        assert!(
+            infra::file_list::contains(&new_a.key)
+                .await
+                .expect("contains"),
+            "the owner's add must land"
+        );
+
+        // the lease times out; node-b re-claims the re-pended job
+        let past_everything = config::utils::time::now_micros() + 1;
+        retry_busy("time the lease out", || {
+            infra::file_list::check_running_jobs(past_everything)
+        })
+        .await;
+        let reclaimed = retry_busy("re-claim", || {
+            infra_file_list::get_pending_jobs("fence-node-b", 10_000, false)
+        })
+        .await;
+        assert!(
+            reclaimed.iter().any(|j| j.id == job_id),
+            "node-b must have re-claimed the job"
+        );
+        let strangers = reclaimed
+            .iter()
+            .map(|j| j.id)
+            .filter(|id| *id != job_id)
+            .collect::<Vec<_>>();
+        if !strangers.is_empty() {
+            retry_busy("restore stranger jobs", || {
+                infra_file_list::set_job_pending(&strangers, 0, None)
+            })
+            .await;
+        }
+
+        // node-a finishes its merge late: the fenced commit must DISCARD —
+        // zero file_list writes from the loser
+        let old_b = commit_test_file(&org, &stream, "old_b");
+        let new_b = commit_test_file(&org, &stream, "new_b");
+        let events_b = build_commit_events(vec![new_b.clone()], std::slice::from_ref(&old_b));
+        let outcome = retry_busy("loser commit attempt", || {
+            commit_batch_if_owner(job_id, "fence-node-a", &org, StreamType::Logs, &events_b)
+        })
+        .await;
+        match outcome {
+            FencedCommit::LeaseLost => {}
+            FencedCommit::Committed => panic!("a stolen lease must not commit"),
+        }
+        assert!(
+            !infra::file_list::contains(&new_b.key)
+                .await
+                .expect("contains"),
+            "the loser's add must NOT land"
+        );
+        let deleted_rows = infra::file_list::list_deleted()
+            .await
+            .expect("list_deleted");
+        assert!(
+            !deleted_rows.iter().any(|d| d.file == old_b.key),
+            "the loser's delete must NOT land"
+        );
+
+        // the new owner still commits fine
+        let outcome = retry_busy("winner commit", || {
+            commit_batch_if_owner(job_id, "fence-node-b", &org, StreamType::Logs, &events_b)
+        })
+        .await;
+        match outcome {
+            FencedCommit::Committed => {}
+            FencedCommit::LeaseLost => panic!("the current owner must pass the fence"),
+        }
+        assert!(
+            infra::file_list::contains(&new_b.key)
+                .await
+                .expect("contains"),
+            "the winner's add must land"
+        );
+
+        // cleanup
+        let done_ids = [job_id];
+        retry_busy("cleanup set_job_done", || {
+            infra_file_list::set_job_done(&done_ids)
+        })
+        .await;
     }
 }

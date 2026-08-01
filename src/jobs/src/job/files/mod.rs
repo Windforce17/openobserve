@@ -28,14 +28,63 @@ pub async fn run() -> Result<(), anyhow::Error> {
         return Ok(()); // not an ingester, no need to init job
     }
 
-    // load pending delete files to memory cache
-    crate::service::db::file_list::local::load_pending_delete().await?;
+    // The mover must not start before the pending-delete claims are loaded
+    // (already-registered files would be re-moved as duplicates), but a
+    // transient local-db error must not silently disable the mover for the
+    // pod's life either (`?` here used to do exactly that): retry loudly.
+    let mut attempt = 0u32;
+    loop {
+        match crate::service::db::file_list::local::load_pending_delete().await {
+            Ok(_) => break,
+            Err(e) => {
+                attempt += 1;
+                log::error!(
+                    "[INGESTER:JOB] load_pending_delete failed (attempt {attempt}), mover start delayed 30s: {e}"
+                );
+                tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+                if is_offline() {
+                    return Ok(());
+                }
+            }
+        }
+    }
 
-    tokio::task::spawn(parquet::run());
-    tokio::task::spawn(broadcast::run());
+    spawn_supervised("job::files::parquet", parquet::run);
+    spawn_supervised("job::files::broadcast", broadcast::run);
     tokio::task::spawn(clean_empty_dirs());
 
     Ok(())
+}
+
+/// Keep a background loop alive: the mover and broadcast loops are the only
+/// path WAL data takes to object storage, and a single unwind used to kill
+/// them silently while the pod stayed Ready (2026-07-30: multi-hundred-file
+/// WAL backlogs). Restart on error or panic; stop cleanly when offline.
+fn spawn_supervised<F, Fut>(name: &'static str, f: F)
+where
+    F: Fn() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<(), anyhow::Error>> + Send + 'static,
+{
+    tokio::task::spawn(async move {
+        loop {
+            match tokio::task::spawn(f()).await {
+                Ok(Ok(())) => {
+                    log::info!("[INGESTER:JOB] {name} exited cleanly");
+                    break;
+                }
+                Ok(Err(e)) => {
+                    log::error!("[INGESTER:JOB] {name} exited with error, restarting in 5s: {e}");
+                }
+                Err(e) => {
+                    log::error!("[INGESTER:JOB] {name} panicked, restarting in 5s: {e}");
+                }
+            }
+            if is_offline() {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        }
+    });
 }
 
 async fn clean_empty_dirs() -> Result<(), anyhow::Error> {

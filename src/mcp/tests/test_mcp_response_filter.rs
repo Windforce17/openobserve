@@ -195,17 +195,14 @@ fn streams_fixture() -> String {
             "settings": {
                 "partition_keys": {"level": {"field_name": "level", "types": "value"}},
                 "full_text_search_keys": ["log", "message"],
-                "index_fields": ["trace_id", "span_id"],
+                "column_store_fields": ["trace_id", "span_id"],
                 "bloom_filter_fields": ["trace_id"],
                 "distinct_value_fields": ["level", "service"],
                 "data_retention": 30,
                 "max_query_range": 0,
                 "store_original_data": false,
                 "approx_partition": false,
-                "index_updated_at": 1704067200,
                 "extended_retention_days": [7, 14, 30],
-                "index_original_data": false,
-                "index_all_values": false,
                 "enable_distinct_fields": true,
                 "enable_log_patterns_extraction": i % 2 == 0,
                 "is_llm_stream": false

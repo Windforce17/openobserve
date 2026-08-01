@@ -45,7 +45,6 @@ static INITIALIZED_ORGS: Lazy<DashSet<String>> = Lazy::new(DashSet::new);
 /// - Uses lock-free per-org tracking to ensure initialization happens only once per restart
 /// - Auto-generates field list from TriggerData struct via reflection
 /// - Creates schema directly without ingesting sample data
-/// - Does NOT manipulate defined_schema_fields (no UDS filtering for system streams)
 /// - Never blocks ingestion even if initialization fails
 pub async fn ensure_triggers_stream_initialized(org_id: &str) -> Result<()> {
     let cfg = get_config();

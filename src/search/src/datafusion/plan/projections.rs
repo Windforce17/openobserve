@@ -370,6 +370,12 @@ impl<'n> TreeNodeVisitor<'n> for ResultSchemaExtractor {
                 for expr in &proj.expr {
                     // we first add the name of this in fields
                     let name = get_col_name(expr);
+                    // the row-store star's `_source` column is internal: it
+                    // is exploded into the hits at the response layer and
+                    // never surfaces as a result column
+                    if name == vortex_index::SOURCE_COL_NAME && matches!(expr, Expr::Column(_)) {
+                        continue;
+                    }
                     temp.push(name);
                     // Then we process the cases where the timestamp field or
                     // histogram is present or aliased
@@ -799,7 +805,7 @@ mod tests {
             ]
         );
 
-        let sql = r#"select * FROM default 
+        let sql = r#"select * FROM default
         WHERE CAST(array_element(regexp_match(log, 'took: ([0-9]+) ms'), 1) AS INTEGER) > 500"#;
         let parsed = get_sql(sql).await;
         let extractor = get_result_schema(parsed, false, false).await.unwrap();
@@ -807,21 +813,11 @@ mod tests {
         assert_eq!(extractor.ts_hist_alias, None);
         assert_eq!(extractor.timestamp_alias, Some("_timestamp".to_string()));
         assert!(extractor.group_by.is_empty());
-        assert_eq!(
-            extractor.projections,
-            vec![
-                "_timestamp",
-                "code",
-                "floatvalue",
-                "k8s_container_name",
-                "k8s_container_restart_count",
-                "k8s_namespace_name",
-                "k8s_node_name",
-                "k8s_pod_name",
-                "k8s_pod_uid",
-                "log"
-            ]
-        );
+        // row-store-driven star (DESIGN §5): the plan projects only
+        // `_timestamp` + the referenced fields (+ the internal `_source`,
+        // which is exploded into the hits and filtered from the result
+        // schema) — never the registry field list
+        assert_eq!(extractor.projections, vec!["_timestamp", "log"]);
     }
 
     #[tokio::test]

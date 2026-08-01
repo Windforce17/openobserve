@@ -33,7 +33,6 @@ interface Options {
 
 const SYSTEM_FIELDS = new Set([
   "_timestamp",
-  "_all",
   "_stream",
 ]);
 

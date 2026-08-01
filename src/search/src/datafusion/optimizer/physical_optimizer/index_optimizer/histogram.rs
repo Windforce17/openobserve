@@ -43,7 +43,28 @@ use crate::datafusion::optimizer::physical_optimizer::{
 /// histogram() with a timezone rewrites to date_bin over `_timestamp@0 + offset`; the
 /// extracted mode then carries the offset and its bucket edges live in local wall-clock space.
 /// condition: group by histogram(_timestamp), only count(*)
+///
+/// Matching contract (pinned by the follower-fidelity tests below against the
+/// EXACT UI-generated SQL `SELECT histogram(_timestamp) AS zo_sql_key,
+/// count(*) AS zo_sql_num FROM "stream" GROUP BY zo_sql_key ORDER BY
+/// zo_sql_key DESC`):
+/// - a 1-arg `histogram(_timestamp)` is ALREADY resolved by the time this
+///   visitor runs: the RewriteHistogram logical rule turns it into a
+///   date_bin with a concrete interval literal (the request's preset
+///   `histogram_interval` seconds — the streaming path pre-computes it from
+///   the full query range — or `generate_histogram_interval`), and constant
+///   folding reduces the cast to a `Literal(IntervalMonthDayNano)`. The
+///   visitor reads the bucket width FROM THE PLAN, so it always equals what
+///   the histogram() UDF produces for the same range — never recompute it.
+/// - ORDER BY (any direction) and LIMIT are irrelevant: they sit above the
+///   final aggregate on the leader, while the follower receives (and this
+///   visitor matches) the partial-aggregate sub-plan below the
+///   RemoteScanExec split.
+/// - output aliases (`zo_sql_*` or anything else) are irrelevant: matching
+///   is on the group/aggregate expressions.
+///
 /// example plan:
+/// ```text
 /// ProjectionExec: expr=[histogram(default._timestamp)@0 as histogram(default._timestamp), count(Int64(1))@1 as cnt]
 ///   AggregateExec: mode=FinalPartitioned, gby=[histogram(default._timestamp)@0 as histogram(default._timestamp)], aggr=[count(Int64(1))]
 ///     CoalesceBatchesExec: target_batch_size=8192
@@ -53,6 +74,7 @@ use crate::datafusion::optimizer::physical_optimizer::{
 ///             FilterExec: _timestamp@0 >= 17296550822151 AND _timestamp@0 < 172965508891538700
 ///               CooperativeExec
 ///                 NewEmptyExec: name="default", projection=["_timestamp"],
+/// ```
 pub fn is_simple_histogram(plan: Arc<dyn ExecutionPlan>, time_range: (i64, i64)) -> Option<IndexOptimizeMode> {
     let mut visitor = SimpleHistogramVisitor::new(time_range);
     let _ = plan.visit(&mut visitor);
@@ -190,13 +212,31 @@ fn get_timestamp_offset(expr: &Arc<dyn PhysicalExpr>) -> Option<i64> {
 /// select histogram(_timestamp) as ts, level as zo_sql_breakdown, count(*) as cnt
 ///   from table where match_all() group by ts, zo_sql_breakdown;
 /// condition: group by histogram(_timestamp) AND a secondary index field, only count(*)
+///
+/// The same matching contract as [`is_simple_histogram`] applies (resolved
+/// interval literal, order/limit/alias irrelevance) — pinned against the
+/// EXACT UI-generated breakdown SQL `SELECT histogram(_timestamp) AS
+/// zo_sql_key, "<field>" AS zo_sql_breakdown, count(*) AS zo_sql_num FROM
+/// "stream" GROUP BY zo_sql_key, zo_sql_breakdown ORDER BY zo_sql_key DESC`,
+/// including dotted quoted breakdown fields (`"kubernetes.namespace.name"`).
+/// ELIGIBILITY: `index_fields` here is the stream's `column_store_fields`
+/// (DESIGN §6/§15.6) — the collector reads the breakdown values from the
+/// per-file docs column, so a breakdown field that is not column-stored MUST
+/// refuse (return None) and the query takes the DataFusion branch. This is
+/// the live `severity` case: the UI auto-picks a breakdown field from the
+/// schema by name priority, with no regard to column-store eligibility, and
+/// such queries full-scan by design until the field is added to the
+/// stream's `column_store_fields`.
+///
 /// example plan:
+/// ```text
 /// ProjectionExec: expr=[histogram(_timestamp)@0 as ts, level@1 as level, count(Int64(1))@2 as cnt]
 ///   AggregateExec: mode=FinalPartitioned, gby=[histogram(_timestamp)@0 as ts, level@1 as level], aggr=[count(Int64(1))]
 ///     CoalesceBatchesExec: target_batch_size=8192
 ///       RepartitionExec: partitioning=Hash([histogram(_timestamp)@0, level@1], 12), input_partitions=12
 ///         AggregateExec: mode=Partial, gby=[date_bin(...) as ts, level@1 as level], aggr=[count(Int64(1))]
 ///           ...
+/// ```
 pub fn is_simple_multi_histogram(
     plan: Arc<dyn ExecutionPlan>,
     time_range: (i64, i64),
@@ -500,6 +540,358 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Follower-fidelity tests against the EXACT UI-generated histogram SQL
+    // (src/search/src/sql/histogram.rs::single_stream_histogram_query),
+    // planned through the production pipeline: RewriteHistogram +
+    // AddSortAndLimit, RemoteScanRule leader/follower split, flight proto
+    // roundtrip, FollowerIndexOptimizerRule (see
+    // super::test_harness::follower_extracted_mode).
+    //
+    // Written failing-first for the live "UI streaming histogram bypasses
+    // the fast paths" incident; they PASS against the current detectors,
+    // proving the 1-arg auto-interval form, ORDER BY zo_sql_key DESC and
+    // the zo_sql_* aliases do NOT break matching, and that the breakdown
+    // shape maps to SimpleMultiHistogram (dotted quoted fields included)
+    // whenever the breakdown field is column-stored. The live bypass is the
+    // eligibility refusal pinned by
+    // test_ui_breakdown_field_not_column_stored_refuses: the UI auto-picked
+    // `severity`, which is not in the stream's column_store_fields.
+    // ------------------------------------------------------------------
+
+    use crate::{
+        datafusion::optimizer::physical_optimizer::index_optimizer::test_harness::follower_extracted_mode,
+        sql::visitor::histogram_interval::{
+            convert_histogram_interval_to_seconds, generate_histogram_interval,
+            validate_and_adjust_histogram_interval,
+        },
+    };
+
+    /// date_bin's origin (`2001-01-01T00:00:00` UTC) in microseconds — the
+    /// bucket edges the histogram() UDF produces are `origin + k * width`.
+    const DATE_BIN_ORIGIN_US: i64 = 978_307_200_000_000;
+
+    /// The schema every UI-shape test plans against.
+    fn ui_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("level", DataType::Utf8, true),
+            Field::new("severity", DataType::Utf8, true),
+            Field::new("kubernetes.namespace.name", DataType::Utf8, true),
+        ]))
+    }
+
+    /// The EXACT SQL the UI histogram generates, via the real generator. The
+    /// generator now resolves the interval from the full request range and
+    /// emits it explicitly; the aliases and shape stay the UI contract.
+    fn ui_histogram_sql(breakdown_field: Option<&str>, time_range: (i64, i64)) -> String {
+        let sql = crate::sql::histogram::convert_to_histogram_query(
+            "SELECT * FROM \"t\"",
+            &["t".to_string()],
+            false,
+            breakdown_field,
+            time_range,
+            0,
+        )
+        .unwrap();
+        // pin the generated shape this suite is contractually testing
+        let interval = generate_histogram_interval(time_range);
+        match breakdown_field {
+            None => assert_eq!(
+                sql,
+                format!(
+                    "SELECT histogram(_timestamp, '{interval}') AS zo_sql_key, count(*) AS \
+                     zo_sql_num FROM \"t\" GROUP BY zo_sql_key ORDER BY zo_sql_key DESC"
+                )
+            ),
+            Some(field) => assert_eq!(
+                sql,
+                format!(
+                    "SELECT histogram(_timestamp, '{interval}') AS zo_sql_key, \"{field}\" AS \
+                     zo_sql_breakdown, count(*) AS zo_sql_num FROM \"t\" GROUP BY zo_sql_key, \
+                     zo_sql_breakdown ORDER BY zo_sql_key DESC"
+                )
+            ),
+        }
+        sql
+    }
+
+    /// The pre-explicit-interval UI shape: a 1-arg `histogram(_timestamp)`.
+    /// Still a public SQL feature (dashboards / custom SQL) — the detectors
+    /// must keep matching it.
+    fn one_arg_histogram_sql(breakdown_field: Option<&str>) -> String {
+        match breakdown_field {
+            None => "SELECT histogram(_timestamp) AS zo_sql_key, count(*) AS zo_sql_num FROM \
+                     \"t\" GROUP BY zo_sql_key ORDER BY zo_sql_key DESC"
+                .to_string(),
+            Some(field) => format!(
+                "SELECT histogram(_timestamp) AS zo_sql_key, \"{field}\" AS zo_sql_breakdown, \
+                 count(*) AS zo_sql_num FROM \"t\" GROUP BY zo_sql_key, zo_sql_breakdown ORDER \
+                 BY zo_sql_key DESC"
+            ),
+        }
+    }
+
+    /// The bucket width (µs) production resolves for a 1-arg
+    /// `histogram(_timestamp)` over `time_range` — the exact formula chain
+    /// the streaming path presets (`HistogramIntervalVisitor`:
+    /// generate_histogram_interval → seconds → validate_and_adjust) and
+    /// RewriteHistogram's own auto fallback reduce to.
+    fn expected_auto_width_micros(time_range: (i64, i64)) -> u64 {
+        let interval = generate_histogram_interval(time_range);
+        let secs = convert_histogram_interval_to_seconds(interval).unwrap();
+        let secs = validate_and_adjust_histogram_interval(secs, time_range);
+        (secs * 1_000_000) as u64
+    }
+
+    /// Assert the extracted plain-histogram params serve the histogram()
+    /// UDF's buckets exactly: the width equals the production auto-interval,
+    /// `min_value` is a real date_bin bucket edge (origin-aligned — a
+    /// misaligned edge would land counts in wrong buckets), and
+    /// `[min_value, min_value + num_buckets * width)` is the smallest such
+    /// cover of the query range.
+    fn assert_simple_histogram_params(
+        mode: &IndexOptimizeMode,
+        time_range: (i64, i64),
+        expected_width: u64,
+        context: &str,
+    ) {
+        let IndexOptimizeMode::SimpleHistogram(min_value, width, num_buckets, ts_offset) = mode
+        else {
+            panic!("{context}: expected SimpleHistogram, got {mode:?}");
+        };
+        let (start, end) = time_range;
+        assert_eq!(*width, expected_width, "{context}: bucket width");
+        assert_eq!(*ts_offset, 0, "{context}: ts_offset");
+        let width = *width as i64;
+        assert_eq!(
+            (min_value - DATE_BIN_ORIGIN_US).rem_euclid(width),
+            0,
+            "{context}: min_value {min_value} is not a date_bin bucket edge"
+        );
+        assert!(
+            *min_value <= start && start - min_value < width,
+            "{context}: min_value {min_value} does not floor start {start} to its bucket"
+        );
+        let covered = min_value + (*num_buckets as i64) * width;
+        assert!(
+            covered >= end && covered - width < end,
+            "{context}: {num_buckets} buckets from {min_value} do not tightly cover end {end}"
+        );
+    }
+
+    /// The two exact UI shapes, across window sizes exercising different
+    /// auto-interval steps, in BOTH SQL forms (the generated
+    /// explicit-interval form and the still-public 1-arg auto form) and BOTH
+    /// production configurations: the streaming path (histogram_interval
+    /// preset from the full range) and the plain `_search` path
+    /// (auto-resolved inside RewriteHistogram). The extracted bucket width
+    /// must equal the UDF's auto-interval for the same range in every
+    /// combination.
+    #[tokio::test]
+    async fn test_follower_extracts_exact_ui_histogram_sql_across_windows() {
+        let start_time = 1_757_401_694_060_000i64; // deliberately bucket-misaligned
+        let minute = 60 * 1_000_000i64;
+        // (window, expected auto interval) — one window per tier of
+        // generate_histogram_interval that the UI realistically produces
+        let windows = [
+            (10 * minute, "10 second"),
+            (40 * minute, "15 second"),
+            (90 * minute, "30 second"),
+            (3 * 60 * minute, "1 minute"),
+            (8 * 60 * minute, "1 hour"),
+            (22 * 24 * 60 * minute, "3 hour"),
+            (29 * 24 * 60 * minute, "6 hour"),
+            (70 * 24 * 60 * minute, "1 day"),
+        ];
+
+        let index_fields = HashSet::from(["level".to_string()]);
+
+        for (window, expected_interval) in windows {
+            let time_range = (start_time, start_time + window);
+            assert_eq!(
+                generate_histogram_interval(time_range),
+                expected_interval,
+                "window {window} should exercise the {expected_interval} tier"
+            );
+            let width = expected_auto_width_micros(time_range);
+            let preset_secs = (width / 1_000_000) as i64;
+
+            let plain_sqls = [
+                ("generated", ui_histogram_sql(None, time_range)),
+                ("one-arg", one_arg_histogram_sql(None)),
+            ];
+            let breakdown_sqls = [
+                ("generated", ui_histogram_sql(Some("level"), time_range)),
+                ("one-arg", one_arg_histogram_sql(Some("level"))),
+            ];
+
+            // streaming (preset) and plain `_search` (auto) configurations
+            for (config_name, preset) in [("streaming-preset", preset_secs), ("auto", 0)] {
+                for (form, plain_sql) in &plain_sqls {
+                    let context = format!("plain/{form}/{config_name}/{expected_interval}");
+                    let mode = follower_extracted_mode(
+                        plain_sql,
+                        ui_schema(),
+                        time_range,
+                        preset,
+                        index_fields.clone(),
+                    )
+                    .await
+                    .unwrap_or_else(|| panic!("{context}: no mode extracted"));
+                    assert_simple_histogram_params(&mode, time_range, width, &context);
+                }
+
+                for (form, breakdown_sql) in &breakdown_sqls {
+                    let context = format!("breakdown/{form}/{config_name}/{expected_interval}");
+                    let mode = follower_extracted_mode(
+                        breakdown_sql,
+                        ui_schema(),
+                        time_range,
+                        preset,
+                        index_fields.clone(),
+                    )
+                    .await
+                    .unwrap_or_else(|| panic!("{context}: no mode extracted"));
+                    let IndexOptimizeMode::SimpleMultiHistogram(
+                        min_value,
+                        max_value,
+                        got_width,
+                        ts_offset,
+                        field,
+                    ) = &mode
+                    else {
+                        panic!("{context}: expected SimpleMultiHistogram, got {mode:?}");
+                    };
+                    assert_eq!(*got_width, width, "{context}: bucket width");
+                    assert_eq!(*ts_offset, 0, "{context}: ts_offset");
+                    assert_eq!(field, "level", "{context}: breakdown field");
+                    assert_eq!(*max_value, time_range.1, "{context}: max_value");
+                    assert_eq!(
+                        (min_value - DATE_BIN_ORIGIN_US).rem_euclid(width as i64),
+                        0,
+                        "{context}: min_value {min_value} is not a date_bin bucket edge"
+                    );
+                    assert!(
+                        *min_value <= time_range.0 && time_range.0 - min_value < width as i64,
+                        "{context}: min_value {min_value} does not floor start"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A dotted quoted breakdown field — the live `column_store_fields`
+    /// shape (`"kubernetes.namespace.name"`) — maps to SimpleMultiHistogram
+    /// carrying the dotted name verbatim.
+    #[tokio::test]
+    async fn test_follower_extracts_ui_breakdown_with_dotted_quoted_field() {
+        let start_time = 1_757_401_694_060_000i64;
+        let time_range = (start_time, start_time + 3 * 3600 * 1_000_000);
+        let expected = Some(IndexOptimizeMode::SimpleMultiHistogram(
+            1_757_401_680_000_000,
+            time_range.1,
+            60_000_000,
+            0,
+            "kubernetes.namespace.name".to_string(),
+        ));
+        for sql in [
+            ui_histogram_sql(Some("kubernetes.namespace.name"), time_range),
+            one_arg_histogram_sql(Some("kubernetes.namespace.name")),
+        ] {
+            let mode = follower_extracted_mode(
+                &sql,
+                ui_schema(),
+                time_range,
+                60,
+                HashSet::from(["kubernetes.namespace.name".to_string()]),
+            )
+            .await;
+            assert_eq!(mode, expected, "sql: {sql}");
+        }
+    }
+
+    /// The live root cause of the "UI streaming histogram bypasses the fast
+    /// paths" incident: the UI auto-picks a breakdown field by schema-name
+    /// priority (`severity` on the dev stream) with no regard to
+    /// column-store eligibility. A breakdown field outside the stream's
+    /// `column_store_fields` MUST refuse — the collector reads the
+    /// breakdown from the docs column, which no file carries for such a
+    /// field — and the query takes the DataFusion branch.
+    #[tokio::test]
+    async fn test_ui_breakdown_field_not_column_stored_refuses() {
+        let start_time = 1_757_401_694_060_000i64;
+        let time_range = (start_time, start_time + 3 * 3600 * 1_000_000);
+        let sql = ui_histogram_sql(Some("severity"), time_range);
+        // the stream's column_store_fields (the live dev set) lack `severity`
+        let column_store_fields =
+            HashSet::from(["kubernetes.namespace.name".to_string(), "level".to_string()]);
+        let mode =
+            follower_extracted_mode(&sql, ui_schema(), time_range, 60, column_store_fields).await;
+        assert_eq!(mode, None);
+    }
+
+    /// ORDER BY direction and output aliases are irrelevant to matching:
+    /// the sort sits above the leader's final aggregate while the follower
+    /// matches the shipped partial-aggregate sub-plan.
+    #[tokio::test]
+    async fn test_follower_histogram_order_and_alias_variants() {
+        let start_time = 1_757_401_694_060_000i64;
+        let time_range = (start_time, start_time + 3 * 3600 * 1_000_000);
+        let expected = Some(IndexOptimizeMode::SimpleHistogram(
+            1_757_401_680_000_000,
+            60_000_000,
+            181,
+            0,
+        ));
+        let cases = [
+            // the exact UI shape (DESC)
+            "SELECT histogram(_timestamp) AS zo_sql_key, count(*) AS zo_sql_num FROM \"t\" GROUP \
+             BY zo_sql_key ORDER BY zo_sql_key DESC",
+            // ASC
+            "SELECT histogram(_timestamp) AS zo_sql_key, count(*) AS zo_sql_num FROM \"t\" GROUP \
+             BY zo_sql_key ORDER BY zo_sql_key",
+            // no ORDER BY
+            "SELECT histogram(_timestamp) AS zo_sql_key, count(*) AS zo_sql_num FROM \"t\" GROUP \
+             BY zo_sql_key",
+            // different aliases, explicit interval equal to the preset
+            "SELECT histogram(_timestamp, '1 minute') AS ts, count(*) AS cnt FROM \"t\" GROUP BY \
+             ts ORDER BY ts DESC",
+        ];
+        for sql in cases {
+            let mode =
+                follower_extracted_mode(sql, ui_schema(), time_range, 60, HashSet::new()).await;
+            assert_eq!(mode, expected, "sql: {sql}");
+        }
+
+        // breakdown variants: DESC (the UI shape) and no ORDER BY agree
+        let expected_multi = Some(IndexOptimizeMode::SimpleMultiHistogram(
+            1_757_401_680_000_000,
+            time_range.1,
+            60_000_000,
+            0,
+            "level".to_string(),
+        ));
+        let multi_cases = [
+            "SELECT histogram(_timestamp) AS zo_sql_key, \"level\" AS zo_sql_breakdown, count(*) \
+             AS zo_sql_num FROM \"t\" GROUP BY zo_sql_key, zo_sql_breakdown ORDER BY zo_sql_key \
+             DESC",
+            "SELECT histogram(_timestamp) AS zo_sql_key, \"level\" AS zo_sql_breakdown, count(*) \
+             AS zo_sql_num FROM \"t\" GROUP BY zo_sql_key, zo_sql_breakdown",
+        ];
+        for sql in multi_cases {
+            let mode = follower_extracted_mode(
+                sql,
+                ui_schema(),
+                time_range,
+                60,
+                HashSet::from(["level".to_string()]),
+            )
+            .await;
+            assert_eq!(mode, expected_multi, "sql: {sql}");
+        }
     }
 
     #[test]

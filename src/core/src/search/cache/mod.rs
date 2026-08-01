@@ -72,7 +72,10 @@ pub mod multi;
 pub mod result_utils;
 
 // Define cache version
-const CACHE_VERSION: &str = "v3";
+// v4: row-store-driven `SELECT *` — star hits are materialized from each
+// record's `_source` (full per-record field sets); v3 entries may hold
+// registry-truncated star hits and must not be served.
+const CACHE_VERSION: &str = "v4";
 
 #[tracing::instrument(name = "service:search:cacher:search", skip_all)]
 #[allow(clippy::too_many_arguments)]

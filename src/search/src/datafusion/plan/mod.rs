@@ -15,7 +15,7 @@
 
 pub mod deduplication;
 pub mod deduplication_exec;
+pub mod index_optimize_exec;
 pub mod projections;
 #[cfg(feature = "vectorscan")]
 pub mod regex_projections;
-pub mod tantivy_optimize_exec;

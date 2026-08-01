@@ -51,9 +51,9 @@ fn create_cli_app() -> Command {
         .subcommands(&[
             Command::new("reset")
                 .about("reset openobserve data")
-                .arg(arg!("component", 'c', "component", "reset data of the component: root, user, alert, dashboard, function, stream-stats, file-list-jobs, index-updated-at", true))
-                .arg(arg!("time", 't', "time", "timestamp in microseconds, used by file-list-jobs (default: 0) and index-updated-at (default: stream min data date)"))
-                .arg(arg!("stream", 's', "stream", "stream key org/stream_type/stream_name, used by file-list-jobs and index-updated-at (default: all streams)")),
+                .arg(arg!("component", 'c', "component", "reset data of the component: root, user, alert, dashboard, function, stream-stats, file-list-jobs", true))
+                .arg(arg!("time", 't', "time", "timestamp in microseconds, used by file-list-jobs (default: 0)"))
+                .arg(arg!("stream", 's', "stream", "stream key org/stream_type/stream_name, used by file-list-jobs (default: all streams)")),
             Command::new("import")
                 .about("import openobserve data").args(dataArgs()),
             Command::new("export")
@@ -158,10 +158,6 @@ fn create_cli_app() -> Command {
             Command::new("bloom-inspect").about("dump fields + file names of a `.bf` file").args([
                 arg!("file", 'f', "file", "path to a `.bf` file (e.g. data/.../bloom/.../{ver}.bf)", true),
             ]),
-            Command::new("ttv-inspect").about("dump properties + contents of a `.ttv` (tantivy index) file").args([
-                arg!("file", 'f', "file", "path to a `.ttv` file (e.g. data/.../index/.../{id}.ttv)", true),
-                arg!("raw", 'r', "raw", "also print the raw tantivy meta.json", false).action(ArgAction::SetTrue),
-            ]),
         ])
 }
 
@@ -208,17 +204,6 @@ pub async fn cli() -> Result<bool, anyhow::Error> {
         super::bloom::inspect(file).await?;
         return Ok(true);
     }
-    if name == "ttv-inspect" {
-        // Pure local-file inspection: parses the puffin footer + embedded
-        // tantivy meta.json. No object-store or DB needed.
-        let file = command
-            .get_one::<String>("file")
-            .ok_or_else(|| anyhow::anyhow!("please set --file"))?;
-        let raw = command.get_flag("raw");
-        super::ttv::inspect(file, raw)?;
-        return Ok(true);
-    }
-
     // init infra, create data dir & tables
     let cfg = config::get_config();
     match name.as_str() {
@@ -340,16 +325,6 @@ pub async fn cli() -> Result<bool, anyhow::Error> {
                         "reset {rows} file_list_jobs to pending (offsets >= {time}, stream: {})",
                         stream.unwrap_or("*")
                     );
-                }
-                "index-updated-at" => {
-                    let time = command
-                        .get_one::<String>("time")
-                        .map(|s| s.parse::<i64>().unwrap_or(0));
-                    let stream = command
-                        .get_one::<String>("stream")
-                        .map(|s| s.as_str())
-                        .unwrap_or("");
-                    super::stream::reset_index_updated_at(stream, time).await?;
                 }
                 _ => {
                     return Err(anyhow::anyhow!(
@@ -999,54 +974,6 @@ mod tests {
             sub_sub_matches.get_one::<String>("group_size").unwrap(),
             "5"
         );
-    }
-
-    #[test]
-    fn test_reset_index_updated_at_component_parsing() {
-        let app = create_test_app();
-        let matches = app
-            .try_get_matches_from([
-                "openobserve",
-                "reset",
-                "--component",
-                "index-updated-at",
-                "--stream",
-                "default/logs/test",
-                "--time",
-                "1700000000000000",
-            ])
-            .unwrap();
-        let (name, sub_matches) = matches.subcommand().unwrap();
-        assert_eq!(name, "reset");
-        assert_eq!(
-            sub_matches.get_one::<String>("component").unwrap(),
-            "index-updated-at"
-        );
-        assert_eq!(
-            sub_matches.get_one::<String>("stream").unwrap(),
-            "default/logs/test"
-        );
-        assert_eq!(
-            sub_matches.get_one::<String>("time").unwrap(),
-            "1700000000000000"
-        );
-    }
-
-    #[test]
-    fn test_reset_index_updated_at_component_defaults() {
-        let app = create_test_app();
-        let matches = app
-            .try_get_matches_from(["openobserve", "reset", "--component", "index-updated-at"])
-            .unwrap();
-        let (name, sub_matches) = matches.subcommand().unwrap();
-        assert_eq!(name, "reset");
-        assert_eq!(
-            sub_matches.get_one::<String>("component").unwrap(),
-            "index-updated-at"
-        );
-        // stream and time are unset: all streams, use min date
-        assert!(sub_matches.get_one::<String>("stream").is_none());
-        assert!(sub_matches.get_one::<String>("time").is_none());
     }
 
     #[test]

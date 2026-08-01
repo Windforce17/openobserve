@@ -16,10 +16,10 @@
 use std::{ops::Range, sync::Arc};
 
 use arrow::buffer::BooleanBuffer;
-use arrow_schema::{DataType, SchemaRef};
+use arrow_schema::SchemaRef;
 use config::{FileFormat, TIMESTAMP_COL_NAME, meta::stream::FileSelection};
 use datafusion::{
-    common::{DataFusionError, Result, project_schema, stats::Precision},
+    common::{DataFusionError, Result, stats::Precision},
     datasource::{listing::PartitionedFile, physical_plan::parquet::ParquetAccessPlan},
     logical_expr::Operator,
     parquet::arrow::arrow_reader::RowSelection,
@@ -32,16 +32,17 @@ use datafusion::{
     },
     scalar::ScalarValue,
 };
-use hashbrown::HashMap;
 #[cfg(feature = "enterprise")]
 use o2_enterprise::enterprise::search::sampling::execution::generate_row_group_access_plan;
-#[cfg(all(feature = "enterprise", feature = "vortex"))]
-use o2_enterprise::enterprise::search::vortex::generate_vortex_access_plan;
 
-use crate::{datafusion::storage, index::IndexCondition};
+use crate::{
+    datafusion::{
+        storage, vix_format::VixScanSelection, vortex_support::generate_vortex_access_plan,
+    },
+    index::IndexCondition,
+};
 
-/// Row group size used by writers before the `row_group_size` puffin property
-/// existed. Any .ttv file without the property was produced with this value.
+/// Fallback row-group size when a file's scan selection carries none.
 const LEGACY_ROW_GROUP_SIZE: usize = 1024 * 1024;
 
 /// Attach the access plan for this file as a typed [`PartitionedFile`] extension.
@@ -49,6 +50,7 @@ pub fn generate_access_plan(file: &mut PartitionedFile) {
     let Some(storage::file_list::ScanSelection {
         selection,
         row_group_size,
+        exact: _,
     }) = storage::file_list::get_scan_selection(file.path().as_ref())
     else {
         return;
@@ -82,7 +84,6 @@ pub fn generate_access_plan(file: &mut PartitionedFile) {
             #[cfg(not(feature = "enterprise"))]
             FileSelection::RowGroups(_) => {}
         },
-        #[cfg(all(feature = "enterprise", feature = "vortex"))]
         FileFormat::Vortex => match selection {
             FileSelection::Rows(row_ids) => {
                 if let Some(access_plan) = generate_vortex_access_plan(&row_ids) {
@@ -92,8 +93,19 @@ pub fn generate_access_plan(file: &mut PartitionedFile) {
             // row-group sampling is parquet only; vortex falls back to a full scan
             FileSelection::RowGroups(_) => {}
         },
-        #[cfg(not(all(feature = "enterprise", feature = "vortex")))]
-        FileFormat::Vortex => {}
+        // Core .vix files: the inverted-index bitmap is applied as a row
+        // selection on the docs-blob scan. The bitmap is aligned to the file
+        // itself (vix_search guards row_count == records), so no row-group
+        // mapping (and no LEGACY_ROW_GROUP_SIZE fallback) is involved.
+        FileFormat::Vix => match selection {
+            FileSelection::Rows(row_ids) => {
+                if row_ids.count_set_bits() < row_ids.len() {
+                    file.extensions.insert(VixScanSelection { row_ids });
+                }
+            }
+            // row-group sampling is parquet only; core files run a full scan
+            FileSelection::RowGroups(_) => {}
+        },
     }
 }
 
@@ -207,30 +219,55 @@ fn parquet_file_layout(
     Some((num_rows, row_group_size))
 }
 
-pub fn apply_projection(
-    schema: &SchemaRef,
-    diff_rules: &HashMap<String, DataType>,
-    projection: Option<&Vec<usize>>,
-    memory_exec: Arc<dyn ExecutionPlan>,
+/// Adapt a RAW memtable scan to the PLAN schema, per streamed batch:
+/// - a plan field present in the raw input becomes a column reference (cast when the types differ,
+///   e.g. Utf8 -> Utf8View),
+/// - `_source` is SYNTHESIZED from the raw input's own columns ([`SynthesizeSourceExpr`]; cast to
+///   the plan's type when it is not Utf8) — lazily, so a star query pays for one batch at a time
+///   instead of the memtable's whole JSON image (eager synthesis OOMKilled prod ingesters,
+///   2026-07-30),
+/// - a plan field absent from the raw input becomes a typed NULL literal.
+///
+/// `plan_indices` selects WHICH plan-schema fields the output carries (in
+/// the given order) — the caller passes the union of the requested
+/// projection and the filter columns.
+pub fn adapt_memtable_projection(
+    plan_schema: &SchemaRef,
+    plan_indices: &[usize],
+    raw_input: Arc<dyn ExecutionPlan>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
-    if diff_rules.is_empty() {
-        return Ok(memory_exec);
-    }
-    let projected_schema = project_schema(schema, projection)?;
-    let mut exprs: Vec<(Arc<dyn PhysicalExpr>, String)> =
-        Vec::with_capacity(projected_schema.fields().len());
-    for (idx, field) in projected_schema.fields().iter().enumerate() {
+    use crate::datafusion::source_synthesis::SynthesizeSourceExpr;
+
+    let raw_schema = raw_input.schema();
+    let mut exprs: Vec<(Arc<dyn PhysicalExpr>, String)> = Vec::with_capacity(plan_indices.len());
+    for &plan_idx in plan_indices {
+        let field = plan_schema.field(plan_idx);
         let name = field.name().to_string();
-        let col = Arc::new(datafusion::physical_expr::expressions::Column::new(
-            &name, idx,
-        ));
-        if let Some(data_type) = diff_rules.get(&name) {
-            exprs.push((Arc::new(CastExpr::new(col, data_type.clone(), None)), name));
+        let base: Arc<dyn PhysicalExpr> = if let Ok(raw_idx) = raw_schema.index_of(&name) {
+            Arc::new(datafusion::physical_expr::expressions::Column::new(
+                &name, raw_idx,
+            ))
+        } else if name == vortex_index::SOURCE_COL_NAME {
+            Arc::new(SynthesizeSourceExpr::from_file_schema(raw_schema.as_ref()))
         } else {
-            exprs.push((col, name));
-        }
+            let scalar = datafusion::scalar::ScalarValue::try_from(field.data_type())?;
+            exprs.push((
+                Arc::new(datafusion::physical_expr::expressions::Literal::new(scalar)),
+                name,
+            ));
+            continue;
+        };
+        // match the plan's type exactly — the synthesized column is Utf8 and
+        // raw columns may predate a type evolution; an uncast mismatch breaks
+        // IPC encoding ("Missing variadic count for Utf8View column")
+        let expr = if base.data_type(raw_schema.as_ref())? == *field.data_type() {
+            base
+        } else {
+            Arc::new(CastExpr::new(base, field.data_type().clone(), None))
+        };
+        exprs.push((expr, name));
     }
-    Ok(Arc::new(ProjectionExec::try_new(exprs, memory_exec)?))
+    Ok(Arc::new(ProjectionExec::try_new(exprs, raw_input)?))
 }
 
 pub fn apply_combined_filter(
@@ -408,19 +445,6 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_projection_empty_diff_rules_returns_input() {
-        use hashbrown::HashMap;
-
-        let exec = make_exec();
-        let schema = exec.schema();
-        let diff_rules: HashMap<String, DataType> = HashMap::new();
-        let result = apply_projection(&schema, &diff_rules, None, exec.clone());
-        assert!(result.is_ok());
-        let plan = result.unwrap();
-        assert_eq!(plan.name(), "EmptyExec");
-    }
-
-    #[test]
     fn test_apply_combined_filter_timestamp_only_wraps_filter() {
         use arrow_schema::{Field, Schema};
         let schema = Arc::new(Schema::new(vec![
@@ -434,20 +458,5 @@ mod tests {
         let result = apply_combined_filter(None, Some((1000, 2000)), &schema_ref, &[], exec, None);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().name(), "FilterExec");
-    }
-
-    #[test]
-    fn test_apply_projection_with_diff_rules_produces_projection() {
-        use arrow_schema::{Field, Schema};
-        use hashbrown::HashMap;
-        let schema = Arc::new(Schema::new(vec![Field::new("col", DataType::Utf8, false)]));
-        let exec = Arc::new(datafusion::physical_plan::empty::EmptyExec::new(
-            schema.clone(),
-        )) as Arc<dyn ExecutionPlan>;
-        let mut diff_rules: HashMap<String, DataType> = HashMap::new();
-        diff_rules.insert("col".to_string(), DataType::LargeUtf8);
-        let result = apply_projection(&schema, &diff_rules, None, exec);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().name(), "ProjectionExec");
     }
 }

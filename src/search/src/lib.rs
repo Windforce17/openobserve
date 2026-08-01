@@ -22,9 +22,9 @@ pub mod file_cache;
 pub mod index;
 pub mod inspector;
 pub mod sql;
-pub mod tantivy;
 pub mod types;
 pub mod utils;
+pub mod vix;
 
 use config::meta::{
     search::{Response, ScanStats},

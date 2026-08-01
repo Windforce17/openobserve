@@ -19,8 +19,9 @@ use ::datafusion::{
     common::tree_node::TreeNode, datasource::TableProvider, physical_plan::ExecutionPlan,
     prelude::SessionContext,
 };
-use arrow_schema::Schema;
+use arrow_schema::{DataType, Schema};
 use config::{
+    ID_COL_NAME, ORIGINAL_DATA_COL_NAME, TIMESTAMP_COL_NAME,
     cluster::LOCAL_NODE,
     datafusion::request::FlightSearchRequest,
     get_config,
@@ -43,9 +44,8 @@ use hashbrown::{HashMap, HashSet};
 use infra::{
     errors::{Error, ErrorCodes},
     schema::{
-        get_stream_setting_bloom_filter_fields, get_stream_setting_fts_fields,
-        get_stream_setting_index_fields, get_stream_setting_index_updated_at_for_fields,
-        unwrap_stream_created_at, unwrap_stream_settings,
+        get_stream_setting_bloom_filter_fields, get_stream_setting_column_store_fields,
+        get_stream_setting_fts_fields, unwrap_stream_settings,
     },
 };
 use itertools::Itertools;
@@ -70,9 +70,10 @@ use crate::service::{
             table_provider::{enrich_table::EnrichTable, uniontable::NewUnionTable},
         },
         grpc::QueryParams,
-        index::IndexCondition,
+        index::{Condition, IndexCondition, numeric_kind_of},
         inspector::{SearchInspectorFieldsBuilder, search_inspector_fields},
         match_file,
+        vix::MultiResult,
     },
 };
 
@@ -154,15 +155,61 @@ pub async fn search(
         .await
         .unwrap_or(arrow_schema::Schema::empty());
     let stream_settings = unwrap_stream_settings(&db_schema);
-    let stream_created_at = unwrap_stream_created_at(&db_schema);
     let fst_fields = get_stream_setting_fts_fields(&stream_settings)
         .into_iter()
         .filter(|v| latest_schema_map.contains_key(v))
         .collect_vec();
-    let index_fields = get_stream_setting_index_fields(&stream_settings)
+    // the vix index term-indexes every string field's raw values and every
+    // numeric/bool field's canonical value forms: filter/condition
+    // extraction (IndexRule) is eligible for all of them (minus the internal
+    // columns), carrying the registry type so the rule can gate predicate
+    // shapes per type (string fields keep every shape; numeric/bool fields
+    // serve =/!=/IN/IS NOT NULL with value-normalized literals). Even for
+    // files written before numeric value terms existed, eligibility alone
+    // pays: the per-file capability probe classifies files without the key
+    // as Absent (eliminated — no IO) and files with it as FtsOnly (skip +
+    // filter-back) instead of bypassing the index entirely. Float16 is
+    // excluded: ingest never produces it and the filter-back literal
+    // reconstruction does not support it.
+    let index_fields: HashMap<String, DataType> = latest_schema
+        .fields()
+        .iter()
+        .filter(|f| {
+            matches!(
+                f.data_type(),
+                DataType::Utf8
+                    | DataType::LargeUtf8
+                    | DataType::Utf8View
+                    | DataType::Boolean
+                    | DataType::Int8
+                    | DataType::Int16
+                    | DataType::Int32
+                    | DataType::Int64
+                    | DataType::UInt8
+                    | DataType::UInt16
+                    | DataType::UInt32
+                    | DataType::UInt64
+                    | DataType::Float32
+                    | DataType::Float64
+            ) && f.name() != TIMESTAMP_COL_NAME
+                && f.name() != ID_COL_NAME
+                && f.name() != ORIGINAL_DATA_COL_NAME
+                // a row-store star plan carries the `_source` column itself;
+                // it is a raw record image, never a term-indexed field
+                && f.name() != vortex_index::SOURCE_COL_NAME
+        })
+        .map(|f| (f.name().clone(), f.data_type().clone()))
+        .collect();
+    // fast-path eligibility (DESIGN §15.6): the index-only aggregation fast
+    // paths may only touch non-`_timestamp` fields that are configured in the
+    // stream's `column_store_fields` setting
+    let column_store_fields: HashSet<String> = stream_settings
+        .as_ref()
+        .map(get_stream_setting_column_store_fields)
+        .unwrap_or_default()
         .into_iter()
         .filter(|v| latest_schema_map.contains_key(v))
-        .collect_vec();
+        .collect();
     let bloom_indexed_fields = get_stream_setting_bloom_filter_fields(&stream_settings)
         .into_iter()
         .filter(|v| latest_schema_map.contains_key(v))
@@ -184,10 +231,20 @@ pub async fn search(
     let mut scan_stats = ScanStats::new();
     let file_stats_cache = ctx.runtime_env().cache_manager.get_file_statistic_cache();
 
-    // optimize physical plan, current for tantivy index optimize
+    // optimize physical plan, currently for the vix index optimize
     let index_optimize_mode = req.index_info.index_optimize_mode.clone();
     let index_condition_ref = Arc::new(Mutex::new(None));
-    let index_optimizer_rule_ref = Arc::new(Mutex::new(index_optimize_mode.map(Into::into)));
+    // a malformed request (oneof mode not set) is the PEER's error: reject
+    // it instead of panicking the process
+    let index_optimize_mode = index_optimize_mode
+        .map(IndexOptimizeMode::try_from)
+        .transpose()
+        .map_err(|e| {
+            Error::ErrorCode(ErrorCodes::SearchSQLNotValid(format!(
+                "invalid index optimize mode in flight request: {e}"
+            )))
+        })?;
+    let index_optimizer_rule_ref = Arc::new(Mutex::new(index_optimize_mode));
     let mut physical_plan = optimizer_physical_plan(
         physical_plan,
         &ctx,
@@ -195,26 +252,25 @@ pub async fn search(
         (req.search_info.start_time, req.search_info.end_time),
         fst_fields.clone(),
         index_fields,
+        column_store_fields.clone(),
         index_condition_ref.clone(),
         index_optimizer_rule_ref.clone(),
     )?;
     let index_condition = { index_condition_ref.lock().clone() };
     let idx_optimize_rule = { index_optimizer_rule_ref.lock().clone() };
-    let use_metadata_count = can_use_metadata_count(&idx_optimize_rule, index_condition.as_ref());
-
-    // the index cutoff only depends on the fields the query actually reads from the index
-    // and we don't check the FTS fields here on purpose
-    let index_updated_at = {
-        let index_used_fields = idx_optimize_rule
-            .as_ref()
-            .map(|rule| rule.referenced_fields())
-            .unwrap_or_default();
-        get_stream_setting_index_updated_at_for_fields(
-            &stream_settings,
-            stream_created_at,
-            &index_used_fields,
-        )
+    // A WHERE-less aggregation (histogram/count over everything) derives no
+    // index condition, so the index fast path never engaged and every file
+    // was scanned (23s current-hour histograms over thousands of small
+    // files). The eval handles Condition::All natively — all-match bitmap,
+    // zone-fold, per-file result cache — so synthesize it whenever an
+    // optimize rule exists without a condition.
+    let index_condition = match (index_condition, &idx_optimize_rule) {
+        (None, Some(_)) => Some(IndexCondition {
+            conditions: vec![Condition::All()],
+        }),
+        (condition, _) => condition,
     };
+    let use_metadata_count = can_use_metadata_count(&idx_optimize_rule, index_condition.as_ref());
 
     let query_params = Arc::new(QueryParams {
         trace_id: trace_id.to_string(),
@@ -235,10 +291,19 @@ pub async fn search(
         query_params.use_inverted_index
     );
 
+    // Negative ids in the ticket are segment-WAL pseudo-files (a leader
+    // running ZO_INGEST_SEGMENT_MODE); they resolve against wal_segments,
+    // not file_list. Split UNCONDITIONALLY — gating this on the local flag
+    // would silently drop assigned segments during a mixed-flag rollout.
+    let (parquet_file_ids, segment_ids) =
+        super::segments_scan::split_pseudo_ids(&req.search_info.file_id_list);
+
     // search in object storage
     let mut metadata_count_file_list = Vec::new();
-    let mut tantivy_file_list = Vec::new();
-    if !req.search_info.file_id_list.is_empty() {
+    let mut index_file_list = Vec::new();
+    // the precomputed aggregate fast-path result over index_file_list
+    let mut index_result: Option<MultiResult> = None;
+    if !parquet_file_ids.is_empty() {
         let (mut file_list, file_list_took) = get_file_list_by_ids(
             &trace_id,
             &org_id,
@@ -246,7 +311,7 @@ pub async fn search(
             &stream_name,
             Some(query_params.time_range),
             &search_partition_keys,
-            &req.search_info.file_id_list,
+            &parquet_file_ids,
         )
         .await?;
         log::info!(
@@ -281,29 +346,81 @@ pub async fn search(
             file_list = scan_files;
         }
 
-        let tantivy_optimize_start = std::time::Instant::now();
+        let index_optimize_start = std::time::Instant::now();
         let mut storage_idx_optimize_rule = idx_optimize_rule.clone();
-        (tantivy_file_list, file_list) = handle_tantivy_optimize(
+        (index_file_list, file_list) = handle_index_optimize(
             &mut storage_idx_optimize_rule, // pass by mutable reference
             file_list,
-            index_updated_at,
             query_params.time_range,
+            &column_store_fields,
         )
         .await?;
+
+        // Evaluate the aggregate fast path EAGERLY over the index files.
+        // vix_search leaves every file it could NOT answer (missing docs
+        // column, partial fields, IO errors after one retry, per-file
+        // skipped conditions) in the list: those move to the DataFusion
+        // scan branch below, where storage::search re-applies the filter —
+        // per-file degradation instead of failing the whole query. Every
+        // file is answered exactly once (index result XOR scan), so partial
+        // aggregates remain impossible; IndexOptimizeExec later just adapts
+        // this precomputed result.
+        if !index_file_list.is_empty() {
+            match idx_optimize_rule.clone() {
+                Some(agg_mode) => {
+                    let all_index_files = index_file_list.clone();
+                    let (_idx_took, _add_filter_back, result) = super::storage::vix_search(
+                        query_params.clone(),
+                        &mut index_file_list,
+                        index_condition.clone(),
+                        Some(agg_mode),
+                    )
+                    .await?;
+                    if !index_file_list.is_empty() {
+                        log::warn!(
+                            "[trace_id {trace_id}] flight->search: {} of {} index files could not be answered by the aggregate fast path, moving them to the scan branch",
+                            index_file_list.len(),
+                            all_index_files.len(),
+                        );
+                        let unanswered: HashSet<String> =
+                            index_file_list.iter().map(|f| f.key.clone()).collect();
+                        file_list.append(&mut index_file_list);
+                        // keep only the ANSWERED files on the index side
+                        // (plan display + scan stats)
+                        index_file_list = all_index_files
+                            .into_iter()
+                            .filter(|f| !unanswered.contains(&f.key))
+                            .collect();
+                    } else {
+                        index_file_list = all_index_files;
+                    }
+                    index_result = Some(result);
+                }
+                None => {
+                    // defensive: routing produced index files without a mode
+                    // — scan them all instead
+                    log::warn!(
+                        "[trace_id {trace_id}] flight->search: index files routed without an optimize mode, moving {} files to the scan branch",
+                        index_file_list.len(),
+                    );
+                    file_list.append(&mut index_file_list);
+                }
+            }
+        }
         log::info!(
             "{}",
             search_inspector_fields(
                 format!(
-                    "[trace_id {trace_id}] flight->search: handle tantivy optimize, tantivy files: {}, datafusion files: {}",
-                    tantivy_file_list.len(),
+                    "[trace_id {trace_id}] flight->search: handle index optimize, index files answered: {}, datafusion files: {}",
+                    index_file_list.len(),
                     file_list.len()
                 ),
                 SearchInspectorFieldsBuilder::new()
                     .trace_id(trace_id.to_string())
                     .node_name(LOCAL_NODE.name.clone())
-                    .component("flight:do_get::search handle tantivy optimize".to_string())
+                    .component("flight:do_get::search handle index optimize".to_string())
                     .search_role("follower".to_string())
-                    .duration(tantivy_optimize_start.elapsed().as_millis() as usize)
+                    .duration(index_optimize_start.elapsed().as_millis() as usize)
                     .build()
             )
         );
@@ -358,6 +475,48 @@ pub async fn search(
                     .component("flight:do_get::search storage search".to_string())
                     .search_role("follower".to_string())
                     .duration(storage_search_start.elapsed().as_millis() as usize)
+                    .build()
+            )
+        );
+        tables.extend(tbls);
+        scan_stats.add(&stats);
+    }
+
+    // scan assigned segment-WAL objects (negative ticket ids). Errors MUST
+    // fail the query: a silently missing segment is silent partial data.
+    if !segment_ids.is_empty() {
+        let segments_scan_start = std::time::Instant::now();
+        let (tbls, stats) = match super::segments_scan::search(
+            query_params.clone(),
+            latest_schema.clone(),
+            &segment_ids,
+            empty_exec.sorted_by_time(),
+            index_condition.clone(),
+            fst_fields.clone(),
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                // clear session data registered by the storage branch above
+                super::super::datafusion::storage::file_list::clear(&trace_id);
+                log::error!("[trace_id {trace_id}] flight->search: search segments error: {e}");
+                return Err(e);
+            }
+        };
+        log::info!(
+            "{}",
+            search_inspector_fields(
+                format!(
+                    "[trace_id {trace_id}] flight->search: segments scan completed, {} segments",
+                    segment_ids.len()
+                ),
+                SearchInspectorFieldsBuilder::new()
+                    .trace_id(trace_id.to_string())
+                    .node_name(LOCAL_NODE.name.clone())
+                    .component("flight:do_get::search segments scan".to_string())
+                    .search_role("follower".to_string())
+                    .duration(segments_scan_start.elapsed().as_millis() as usize)
                     .build()
             )
         );
@@ -506,8 +665,8 @@ pub async fn search(
         &mut scan_stats,
         query_params.clone(),
         metadata_count_file_list,
-        tantivy_file_list,
-        index_condition,
+        index_file_list,
+        index_result,
         idx_optimize_rule,
     )?;
 
@@ -539,8 +698,8 @@ fn apply_pushdowns_and_optimizations(
     scan_stats: &mut ScanStats,
     query_params: Arc<QueryParams>,
     metadata_count_file_list: Vec<FileKey>,
-    tantivy_file_list: Vec<FileKey>,
-    index_condition: Option<IndexCondition>,
+    index_file_list: Vec<FileKey>,
+    index_result: Option<MultiResult>,
     idx_optimize_rule: Option<IndexOptimizeMode>,
 ) -> Result<Arc<dyn ExecutionPlan>, Error> {
     let cfg = get_config();
@@ -552,6 +711,19 @@ fn apply_pushdowns_and_optimizations(
             log::error!("[trace_id {trace_id}] flight->search: pushdown filter error: {e}");
             e
         })?;
+    // Numeric conjuncts under a FilterExec push into the vix scans below
+    // it. This MUST run while the filter is still ADJACENT to the scan:
+    // ProjectionPushdown may insert a ProjectionExec in between, and the
+    // injection deliberately refuses to cross projections (they can
+    // rename columns). vortex prunes chunks by per-chunk stats, ranged
+    // sources skip the fetches, provably-disjoint files skip entirely via
+    // footer stats. Conservative-only — the filter re-applies everything.
+    physical_plan = search::datafusion::vix_format::inject_vix_numeric_bounds(physical_plan)
+        .map_err(|e| {
+            log::error!("[trace_id {trace_id}] flight->search: vix numeric pushdown error: {e}");
+            e
+        })?;
+
     let limit_pushdown = LimitPushdown::new();
     physical_plan = limit_pushdown
         .optimize(physical_plan, ctx.state().config_options())
@@ -575,15 +747,15 @@ fn apply_pushdowns_and_optimizations(
         })?;
     }
 
-    if !metadata_count_file_list.is_empty() || !tantivy_file_list.is_empty() {
+    if !metadata_count_file_list.is_empty() || !index_file_list.is_empty() {
         let index_optimize_start = std::time::Instant::now();
         scan_stats.add(&collect_stats(&metadata_count_file_list));
-        scan_stats.add(&collect_stats(&tantivy_file_list));
+        scan_stats.add(&collect_stats(&index_file_list));
         physical_plan = aggregate_optimize_rewrite(
             query_params.clone(),
             metadata_count_file_list,
-            tantivy_file_list,
-            index_condition,
+            index_file_list,
+            index_result,
             idx_optimize_rule,
             physical_plan,
         )?;
@@ -614,6 +786,12 @@ fn can_use_metadata_count(
         && index_condition.is_some_and(IndexCondition::is_condition_all)
 }
 
+/// `index_fields` feeds filter/condition extraction (`IndexRule`) and covers
+/// every term-indexed field with its registry type (strings plus
+/// numeric/bool), while `column_store_fields` is the fast-path eligibility
+/// set (DESIGN §15.6): the index-only aggregation fast paths
+/// (`FollowerIndexOptimizerRule`) may only touch non-`_timestamp` fields
+/// that are in the stream's `column_store_fields` setting.
 #[allow(clippy::too_many_arguments)]
 fn optimizer_physical_plan(
     plan: Arc<dyn ExecutionPlan>,
@@ -621,12 +799,28 @@ fn optimizer_physical_plan(
     schema: &Schema,
     time_range: (i64, i64),
     fst_fields: Vec<String>,
-    index_fields: Vec<String>,
+    index_fields: HashMap<String, DataType>,
+    column_store_fields: HashSet<String>,
     index_condition_ref: Arc<Mutex<Option<IndexCondition>>>,
     index_optimizer_rule_ref: Arc<Mutex<Option<IndexOptimizeMode>>>,
 ) -> Result<Arc<dyn ExecutionPlan>, Error> {
-    let index_fields: HashSet<String> = index_fields.iter().cloned().collect();
-    let index_rule = IndexRule::new(index_fields.clone(), index_condition_ref.clone());
+    // pilot fix B: term-indexed STRING fields (everything except the fts
+    // fields, whose values are token-indexed only) are additionally eligible
+    // for single-field TopN/Distinct when the query has no condition —
+    // served from the term dictionary alone, per-file capability check as
+    // backstop. Numeric/bool fields are deliberately EXCLUDED: their
+    // dictionary holds canonical int/float text forms (`38` vs `38.0` are
+    // distinct terms for one numeric value, and tagged numeric terms are not
+    // string values), so dictionary counts cannot reproduce the scan's typed
+    // grouping — those queries keep the docs-column / scan paths.
+    let unfiltered_index_fields: HashSet<String> = index_fields
+        .iter()
+        .filter(|(field, data_type)| {
+            numeric_kind_of(data_type).is_none() && !fst_fields.contains(*field)
+        })
+        .map(|(field, _)| field.clone())
+        .collect();
+    let index_rule = IndexRule::new(index_fields, index_condition_ref.clone());
     let original_plan = Arc::clone(&plan);
     let plan = index_rule.optimize(plan, ctx.state().config_options())?;
 
@@ -643,7 +837,8 @@ fn optimizer_physical_plan(
     {
         let index_optimizer_rule = FollowerIndexOptimizerRule::new(
             time_range,
-            index_fields.clone(),
+            column_store_fields,
+            unfiltered_index_fields,
             index_optimizer_rule_ref.clone(),
         );
         let _ = index_optimizer_rule.optimize(original_plan, ctx.state().config_options())?;
@@ -731,11 +926,11 @@ fn split_metadata_count_files(
         .partition(|file| file.meta.min_ts >= time_range.0 && file.meta.max_ts < time_range.1)
 }
 
-async fn handle_tantivy_optimize(
+async fn handle_index_optimize(
     idx_optimize_rule: &mut Option<IndexOptimizeMode>,
     file_list: Vec<FileKey>,
-    index_updated_at: i64,
     time_range: (i64, i64),
+    column_store_fields: &HashSet<String>,
 ) -> Result<(Vec<FileKey>, Vec<FileKey>), Error> {
     // early return if not simple count, histogram or topn
     if !matches!(
@@ -749,56 +944,59 @@ async fn handle_tantivy_optimize(
         return Ok((vec![], file_list));
     }
 
-    let index_updated_at = update_index_updated_at(idx_optimize_rule, index_updated_at).await;
+    // pilot fix B: a TopN/Distinct over a field that is NOT column-stored
+    // can only be served index-only — from the term dictionary of core
+    // files lying fully inside the query range. Partial-range files go to
+    // the DataFusion branch, which is always correct.
+    let needs_dict_only = match idx_optimize_rule {
+        Some(IndexOptimizeMode::SimpleTopN(fields, ..)) => fields
+            .iter()
+            .any(|field| !column_store_fields.contains(field)),
+        Some(IndexOptimizeMode::SimpleDistinct(field, ..)) => !column_store_fields.contains(field),
+        _ => false,
+    };
 
     // TODO: support IndexOptimizeMode::SimpleDistinct for add timestamp
-    // filter to tantivy search
-    let time_range = if matches!(
-        idx_optimize_rule,
-        Some(IndexOptimizeMode::SimpleDistinct(..))
-    ) {
+    // filter to vix search
+    let time_range = if needs_dict_only
+        || matches!(
+            idx_optimize_rule,
+            Some(IndexOptimizeMode::SimpleDistinct(..))
+        ) {
         Some(time_range)
     } else {
         None
     };
-    let (tantivy_files, datafusion_files) =
-        split_file_list_by_time_range(file_list, index_updated_at, time_range);
+    let (index_files, datafusion_files) = split_file_list_by_time_range(file_list, time_range);
     // set optimize rule to None, because datafusion should not use it
     *idx_optimize_rule = None;
 
-    Ok((tantivy_files, datafusion_files))
+    Ok((index_files, datafusion_files))
 }
 
-/// update index_updated_at if needed
-async fn update_index_updated_at(
-    idx_optimize_rule: &Option<IndexOptimizeMode>,
-    index_updated_at: i64,
-) -> i64 {
-    let ttv_timestamp_updated_at = db::metas::tantivy_index::get_ttv_timestamp_updated_at().await;
-    let index_updated_at = index_updated_at.max(ttv_timestamp_updated_at);
-
-    if matches!(
-        idx_optimize_rule,
-        Some(IndexOptimizeMode::SimpleTopN(..)) | Some(IndexOptimizeMode::SimpleMultiHistogram(..))
-    ) {
-        let ttv_secondary_index_updated_at =
-            db::metas::tantivy_index::get_ttv_secondary_index_updated_at().await;
-        return index_updated_at.max(ttv_secondary_index_updated_at);
-    }
-
-    index_updated_at
-}
-
+/// Index-branch eligibility: a core `.vix` file (the data file IS the
+/// index), with an index (`index_size > 0`), and — when `time_range` is set —
+/// lying fully inside `[start, end)` (`max_ts < end`, matching the per-file
+/// `file_in_range` check of the vix evaluation). Everything else takes the
+/// DataFusion branch.
+///
+/// There is deliberately NO settings-freshness gate here (the legacy
+/// `index_updated_at` settings stamp was removed entirely): whether an
+/// individual file can serve a query is decided per file by the capability
+/// probes (fields table / key-term probe for terms, `missing_docs_column` /
+/// `docs_column_available` for the aggregate fast paths). A global stamp
+/// would disable the index for the ENTIRE existing dataset on any settings
+/// change (observed live when adding `column_store_fields`), while the
+/// per-file probes already route incapable files to the DataFusion branch.
 fn split_file_list_by_time_range(
     file_list: Vec<FileKey>,
-    index_updated_at: i64,
     time_range: Option<(i64, i64)>,
 ) -> (Vec<FileKey>, Vec<FileKey>) {
     file_list.into_iter().partition(|file| {
-        file.meta.min_ts >= index_updated_at
+        config::FileFormat::from_extension(&file.key) == Some(config::FileFormat::Vix)
             && file.meta.index_size > 0
             && time_range
-                .is_none_or(|(start, end)| file.meta.min_ts >= start && file.meta.max_ts <= end)
+                .is_none_or(|(start, end)| file.meta.min_ts >= start && file.meta.max_ts < end)
     })
 }
 
@@ -834,8 +1032,9 @@ mod tests {
         index::Condition,
     };
 
-    fn make_file(min_ts: i64, max_ts: i64, index_size: i64) -> FileKey {
+    fn make_file(key: &str, min_ts: i64, max_ts: i64, index_size: i64) -> FileKey {
         FileKey {
+            key: key.to_string(),
             meta: FileMeta {
                 min_ts,
                 max_ts,
@@ -849,43 +1048,125 @@ mod tests {
         }
     }
 
+    fn core_file(min_ts: i64, max_ts: i64, index_size: i64) -> FileKey {
+        make_file(
+            &format!("files/default/logs/s/2024/02/16/16/{min_ts}_{max_ts}.vix"),
+            min_ts,
+            max_ts,
+            index_size,
+        )
+    }
+
     #[test]
     fn test_split_file_list_empty() {
-        let (tantivy, datafusion) = split_file_list_by_time_range(vec![], 0, None);
-        assert!(tantivy.is_empty());
+        let (index_files, datafusion) = split_file_list_by_time_range(vec![], None);
+        assert!(index_files.is_empty());
         assert!(datafusion.is_empty());
     }
 
     #[test]
-    fn test_split_file_list_all_tantivy() {
-        let files = vec![make_file(100, 200, 512), make_file(300, 400, 1024)];
-        let (tantivy, datafusion) = split_file_list_by_time_range(files, 0, None);
-        assert_eq!(tantivy.len(), 2);
+    fn test_split_file_list_all_index() {
+        let files = vec![core_file(100, 200, 512), core_file(300, 400, 1024)];
+        let (index_files, datafusion) = split_file_list_by_time_range(files, None);
+        assert_eq!(index_files.len(), 2);
         assert!(datafusion.is_empty());
     }
 
     #[test]
     fn test_split_file_list_no_index_goes_to_datafusion() {
-        let files = vec![make_file(100, 200, 0)]; // index_size == 0
-        let (tantivy, datafusion) = split_file_list_by_time_range(files, 0, None);
-        assert!(tantivy.is_empty());
+        let files = vec![core_file(100, 200, 0)]; // index_size == 0
+        let (index_files, datafusion) = split_file_list_by_time_range(files, None);
+        assert!(index_files.is_empty());
         assert_eq!(datafusion.len(), 1);
     }
 
+    /// Only core `.vix` files are index-eligible: parquet/vortex files never
+    /// take the index branch, no matter their index_size or creation time.
     #[test]
-    fn test_split_file_list_before_index_updated_at() {
-        let files = vec![make_file(100, 200, 512)];
-        let (tantivy, datafusion) = split_file_list_by_time_range(files, 500, None);
-        assert!(tantivy.is_empty());
-        assert_eq!(datafusion.len(), 1);
+    fn test_split_file_list_non_core_files_go_to_datafusion() {
+        // a snowflake-named parquet file with a nonzero index_size
+        let id = 1_700_000_000_001i64 << 22;
+        let files = vec![
+            make_file(
+                &format!("files/default/logs/quickstart1/2024/02/16/16/{id}.parquet"),
+                100,
+                200,
+                512,
+            ),
+            make_file("files/default/logs/s/1.vortex", 100, 200, 512),
+            core_file(100, 200, 512),
+        ];
+        let (index_files, datafusion) = split_file_list_by_time_range(files, None);
+        assert_eq!(index_files.len(), 1);
+        assert!(index_files[0].key.ends_with(".vix"));
+        assert_eq!(datafusion.len(), 2);
+    }
+
+    /// Pilot fix B routing: with a `time_range`, only files fully inside
+    /// `[start, end)` (strict end, matching the per-file `file_in_range`
+    /// check) take the index branch.
+    #[test]
+    fn test_split_file_list_strict_range() {
+        let file = |key: &str, min_ts: i64, max_ts: i64| FileKey {
+            key: key.to_string(),
+            meta: FileMeta {
+                min_ts,
+                max_ts,
+                index_size: 512,
+                records: 10,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let files = vec![
+            file("files/default/logs/s/a.vix", 100, 150), // core, fully in range
+            file("files/default/logs/s/b.parquet", 100, 150), // legacy (index-less)
+            file("files/default/logs/s/c.vix", 100, 200), // core, max_ts == end (out)
+            file("files/default/logs/s/d.vix", 50, 150),  // core, starts before range
+        ];
+        let (index_files, datafusion) = split_file_list_by_time_range(files, Some((100, 200)));
+        assert_eq!(index_files.len(), 1);
+        assert!(index_files[0].key.ends_with("a.vix"));
+        assert_eq!(datafusion.len(), 3);
+    }
+
+    /// There is no settings-stamp gate: files created before a settings
+    /// change (e.g. a `column_store_fields` addition) stay index-eligible —
+    /// per-file capability probes route incapable files to the scan branch.
+    /// Regression for the live incident where a settings PUT disabled the
+    /// index for the entire pre-existing dataset.
+    #[test]
+    fn test_split_file_list_ignores_settings_age() {
+        let old_ms = 1_600_000_000_000i64;
+        let files = vec![
+            make_file(
+                &format!("files/default/logs/s/2024/02/16/16/{}.vix", old_ms << 22),
+                100,
+                200,
+                512,
+            ),
+            // generate_file_name form (snowflake + 4 hex chars)
+            make_file(
+                &format!(
+                    "files/default/logs/s/2024/02/16/16/{}a3f2.vix",
+                    old_ms << 22
+                ),
+                100,
+                200,
+                512,
+            ),
+        ];
+        let (index_files, datafusion) = split_file_list_by_time_range(files, None);
+        assert_eq!(index_files.len(), 2);
+        assert!(datafusion.is_empty());
     }
 
     #[test]
     fn test_split_file_list_for_metadata_count_only_full_range_files() {
         let files = vec![
-            make_file(100, 199, 0), // fully in [100, 200)
-            make_file(99, 150, 0),  // overlaps the start boundary
-            make_file(150, 200, 0), // touches the exclusive end boundary
+            core_file(100, 199, 0), // fully in [100, 200)
+            core_file(99, 150, 0),  // overlaps the start boundary
+            core_file(150, 200, 0), // touches the exclusive end boundary
         ];
 
         let (metadata, scan) = split_metadata_count_files(files, (100, 200));
@@ -908,7 +1189,7 @@ mod tests {
 
     #[test]
     fn test_collect_stats_aggregates() {
-        let files = vec![make_file(0, 100, 10), make_file(100, 200, 20)];
+        let files = vec![core_file(0, 100, 10), core_file(100, 200, 20)];
         let stats = collect_stats(&files);
         assert_eq!(stats.files, 2);
         assert_eq!(stats.records, 20); // 10 + 10
@@ -918,7 +1199,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_optimizer_physical_plan_detects_histogram_with_index_filter() {
+    async fn test_optimizer_physical_plan_histogram_with_index_filter() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("_timestamp", DataType::Int64, false),
             Field::new("kubernetes_namespace_name", DataType::Utf8, false),
@@ -962,7 +1243,8 @@ mod tests {
             &schema,
             (start_time, end_time),
             vec![],
-            vec!["kubernetes_namespace_name".to_string()],
+            HashMap::from([("kubernetes_namespace_name".to_string(), DataType::Utf8)]),
+            HashSet::new(),
             index_condition_ref.clone(),
             index_optimizer_rule_ref.clone(),
         )
@@ -977,9 +1259,110 @@ mod tests {
                 )],
             })
         );
-        assert!(matches!(
+        // SimpleHistogram reads only `_timestamp`, so it stays eligible even
+        // with an empty column_store_fields set: the histogram fast path
+        // engages on top of the extracted index condition.
+        assert_eq!(
             index_optimizer_rule_ref.lock().clone(),
-            Some(IndexOptimizeMode::SimpleHistogram(..))
-        ));
+            Some(IndexOptimizeMode::SimpleHistogram(
+                1757401680000000,
+                60000000,
+                16,
+                0
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_optimizer_physical_plan_multi_histogram_column_store_eligibility() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("level", DataType::Utf8, false),
+            Field::new("kubernetes_namespace_name", DataType::Utf8, false),
+        ]));
+        let start_time = 1757401694060000;
+        let end_time = 1757402594060000;
+        let state = SessionStateBuilder::new()
+            .with_config(SessionConfig::new().with_target_partitions(12))
+            .with_runtime_env(Arc::new(RuntimeEnvBuilder::new().build().unwrap()))
+            .with_default_features()
+            .with_optimizer_rule(Arc::new(RewriteHistogram::new(
+                start_time, end_time, 60, None,
+            )))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        let provider = NewEmptyTable::new("default", schema.clone());
+        ctx.register_table("default", Arc::new(provider)).unwrap();
+        ctx.register_udf(histogram_udf::HISTOGRAM_UDF.clone());
+
+        let logical_plan = ctx
+            .state()
+            .create_logical_plan(
+                "SELECT histogram(_timestamp) as ts, level, count(*) as cnt \
+                 FROM default \
+                 WHERE kubernetes_namespace_name = 'ziox' \
+                 GROUP BY ts, level ORDER BY ts",
+            )
+            .await
+            .unwrap();
+
+        // the breakdown field drives fast-path eligibility (DESIGN §15.6):
+        // SimpleMultiHistogram only engages when `level` is in the stream's
+        // column_store_fields
+        let cases = vec![
+            (HashSet::new(), None),
+            (
+                HashSet::from(["level".to_string()]),
+                Some(IndexOptimizeMode::SimpleMultiHistogram(
+                    1757401680000000,
+                    1757402594060000,
+                    60000000,
+                    0,
+                    "level".to_string(),
+                )),
+            ),
+        ];
+        for (column_store_fields, expected) in cases {
+            let physical_plan = ctx
+                .state()
+                .create_physical_plan(&logical_plan)
+                .await
+                .unwrap();
+            let index_condition_ref = Arc::new(Mutex::new(None));
+            let index_optimizer_rule_ref = Arc::new(Mutex::new(None));
+
+            let _plan = optimizer_physical_plan(
+                physical_plan,
+                &ctx,
+                &schema,
+                (start_time, end_time),
+                vec![],
+                HashMap::from([
+                    ("kubernetes_namespace_name".to_string(), DataType::Utf8),
+                    ("level".to_string(), DataType::Utf8),
+                ]),
+                column_store_fields.clone(),
+                index_condition_ref.clone(),
+                index_optimizer_rule_ref.clone(),
+            )
+            .unwrap();
+
+            // the filter is extracted into the index condition either way
+            assert_eq!(
+                index_condition_ref.lock().clone(),
+                Some(IndexCondition {
+                    conditions: vec![Condition::Equal(
+                        "kubernetes_namespace_name".to_string(),
+                        "ziox".to_string(),
+                    )],
+                }),
+                "index condition mismatch for column_store_fields: {column_store_fields:?}"
+            );
+            assert_eq!(
+                index_optimizer_rule_ref.lock().clone(),
+                expected,
+                "optimize mode mismatch for column_store_fields: {column_store_fields:?}"
+            );
+        }
     }
 }

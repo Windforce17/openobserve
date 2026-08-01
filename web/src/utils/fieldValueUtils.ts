@@ -26,7 +26,6 @@ export const EXCLUDED_FIELDS = new Set([
   "timestamp",
   "@timestamp",
   "_stream",
-  "_all",
   "body",
   "log",
   "message",

@@ -32,6 +32,7 @@ pub mod scheduler;
 pub mod schema;
 pub mod storage;
 pub mod table;
+pub mod wal_segments;
 
 pub async fn get_db_schema_version() -> Result<u64, anyhow::Error> {
     let db = db::get_db().await;
@@ -63,6 +64,7 @@ pub async fn db_init() -> Result<(), anyhow::Error> {
     db::init().await?;
     file_list::create_table().await?;
     file_list::create_table_index().await?;
+    wal_segments::create_table().await?;
     pipeline::init().await?;
     queue::init().await?;
     scheduler::init().await?;
@@ -95,6 +97,12 @@ pub async fn init() -> Result<(), anyhow::Error> {
     if config::cluster::LOCAL_NODE.is_ingester() || config::cluster::LOCAL_NODE.is_querier() {
         file_list::LOCAL_CACHE.create_table_index().await?;
     }
+    // wal_segments must exist on EVERY boot path: db_init() is gated on the
+    // DB schema version, so an existing deployment that flips
+    // ZO_INGEST_SEGMENT_MODE never runs it — the flusher then wedges on
+    // registration until the buffer cap 503s all ingest (dev canary,
+    // 2026-07-31). CREATE IF NOT EXISTS is idempotent and cheap.
+    wal_segments::create_table().await?;
     file_list::local_cache_gc().await?;
     if cfg.common.meta_store == "postgres" {
         file_list::postgres::spawn_maintenance_task().await?;

@@ -74,7 +74,7 @@ pub const SIZE_IN_MB: f64 = 1024.0 * 1024.0;
 pub const GRPC_HTTP2_STREAM_WINDOW_SIZE: u32 = 8 * 1024 * 1024; // 8 MB
 pub const GRPC_HTTP2_CONNECTION_WINDOW_SIZE: u32 = 16 * 1024 * 1024; // 16 MB
 pub const SIZE_IN_GB: f64 = 1024.0 * 1024.0 * 1024.0;
-// The current value is recorded in each tantivy index file (puffin `row_group_size`
+// The current value is recorded in each `.vix` core file (puffin `row_group_size`
 // property) so it can be changed safely without breaking row_id → row_group mapping
 // for older files.
 pub const PARQUET_MAX_ROW_GROUP_SIZE: usize = 128 * 1024;
@@ -95,10 +95,7 @@ pub const FILE_EXT_JSON: &str = ".json";
 pub const FILE_EXT_ARROW: &str = ".arrow";
 pub const FILE_EXT_PARQUET: &str = ".parquet";
 pub const FILE_EXT_VORTEX: &str = ".vortex";
-pub const FILE_EXT_PUFFIN: &str = ".puffin";
-pub const FILE_EXT_TANTIVY: &str = ".ttv";
-
-pub const INDEX_FIELD_NAME_FOR_ALL: &str = "_all";
+pub const FILE_EXT_VIX: &str = ".vix";
 
 pub const QUERY_WITH_NO_LIMIT: i64 = -999;
 
@@ -110,17 +107,6 @@ pub const TIMESTAMP_COL_NAME: &str = "_timestamp";
 // Used for storing and querying unflattened original data
 pub const ID_COL_NAME: &str = "_o2_id";
 pub const ORIGINAL_DATA_COL_NAME: &str = "_original";
-pub const ALL_VALUES_COL_NAME: &str = "_all_values";
-
-/// Internal columns are implicitly part of every user-defined schema:
-/// never persisted in `defined_schema_fields` and exempt from the UDS limit.
-pub fn is_uds_internal_column(name: &str) -> bool {
-    name == TIMESTAMP_COL_NAME
-        || name == ID_COL_NAME
-        || name == ORIGINAL_DATA_COL_NAME
-        || name == ALL_VALUES_COL_NAME
-        || name == get_config().common.column_all
-}
 
 pub const MESSAGE_COL_NAME: &str = "message";
 pub const STREAM_NAME_LABEL: &str = "o2_stream_name";
@@ -150,35 +136,6 @@ pub static SQL_FULL_TEXT_SEARCH_FIELDS: Lazy<Vec<String>> = Lazy::new(|| {
         default_fields.iter().map(|s| s.to_string()),
         cfg.common
             .feature_fulltext_extra_fields
-            .split(',')
-            .filter_map(|s| {
-                let s = s.trim();
-                if s.is_empty() {
-                    None
-                } else {
-                    Some(s.to_string())
-                }
-            }),
-    )
-    .collect::<Vec<_>>();
-    fields.sort();
-    fields.dedup();
-    fields
-});
-
-const _DEFAULT_SQL_SECONDARY_INDEX_SEARCH_FIELDS: [&str; 3] =
-    ["trace_id", "service_name", "operation_name"];
-pub static SQL_SECONDARY_INDEX_SEARCH_FIELDS: Lazy<Vec<String>> = Lazy::new(|| {
-    let cfg = get_config();
-    let default_fields: &[&str] = if cfg.common.feature_default_index_fields_enabled {
-        &_DEFAULT_SQL_SECONDARY_INDEX_SEARCH_FIELDS
-    } else {
-        &[]
-    };
-    let mut fields = chain(
-        default_fields.iter().map(|s| s.to_string()),
-        cfg.common
-            .feature_secondary_index_extra_fields
             .split(',')
             .filter_map(|s| {
                 let s = s.trim();
@@ -553,6 +510,11 @@ pub enum FileFormat {
     #[default]
     Parquet,
     Vortex,
+    /// Core-file format: one `.vix` puffin container carrying the
+    /// records (`docs` blob) *and* the inverted index (`dict`/`terms`) — the
+    /// stream data file itself, not a sibling index. The unconditional
+    /// format of logs/traces; never a valid value for `ZO_FILE_FORMAT`.
+    Vix,
 }
 
 impl std::fmt::Display for FileFormat {
@@ -560,6 +522,7 @@ impl std::fmt::Display for FileFormat {
         match self {
             Self::Parquet => write!(f, "parquet"),
             Self::Vortex => write!(f, "vortex"),
+            Self::Vix => write!(f, "vix"),
         }
     }
 }
@@ -571,6 +534,7 @@ impl std::str::FromStr for FileFormat {
         match s.to_lowercase().as_str() {
             "parquet" => Ok(Self::Parquet),
             "vortex" => Ok(Self::Vortex),
+            "vix" => Ok(Self::Vix),
             _ => Err(anyhow::anyhow!("Invalid file format: {}", s)),
         }
     }
@@ -589,6 +553,7 @@ impl FileFormat {
         match self {
             Self::Parquet => FILE_EXT_PARQUET,
             Self::Vortex => FILE_EXT_VORTEX,
+            Self::Vix => FILE_EXT_VIX,
         }
     }
 
@@ -597,6 +562,8 @@ impl FileFormat {
             Some(Self::Parquet)
         } else if path.ends_with(FILE_EXT_VORTEX) {
             Some(Self::Vortex)
+        } else if path.ends_with(FILE_EXT_VIX) {
+            Some(Self::Vix)
         } else {
             None
         }
@@ -990,14 +957,11 @@ pub struct Common {
     pub data_cache_dir: String,
     #[env_config(name = "ZO_DATA_TMP_DIR", default = "")] // ./data/openobserve/tmp/
     pub data_tmp_dir: String,
-    // TODO: should rename to column_all
-    #[env_config(name = "ZO_CONCATENATED_SCHEMA_FIELD_NAME", default = "_all")]
-    pub column_all: String,
     #[env_config(
         name = "ZO_FILE_FORMAT",
         parse,
         default = "parquet",
-        help = "File format for data storage: parquet or vortex"
+        help = "Flat columnar file format (parquet or vortex) for streams NOT stored as core .vix files, i.e. metrics (compactor output; ingester metrics always parquet) and internal streams. Logs/traces are always core .vix files and ignore this. 'vix' is not a valid value (normalized to parquet)"
     )]
     pub file_format: FileFormat,
     #[env_config(name = "ZO_PARQUET_COMPRESSION", default = "zstd")]
@@ -1019,17 +983,15 @@ pub struct Common {
     #[env_config(
         name = "ZO_FEATURE_DEFAULT_INDEX_FIELDS_ENABLED",
         default = true,
-        help = "When false, the built-in default fields for full text search, secondary index and distinct values are disabled; only the fields from the *_EXTRA_FIELDS ENVs and per-stream settings are used"
+        help = "When false, the built-in default fields for full text search and distinct values are disabled; only the fields from the *_EXTRA_FIELDS ENVs and per-stream settings are used"
     )]
     pub feature_default_index_fields_enabled: bool,
     #[env_config(name = "ZO_FEATURE_FULLTEXT_EXTRA_FIELDS", default = "")]
     pub feature_fulltext_extra_fields: String,
-    #[env_config(name = "ZO_FEATURE_INDEX_EXTRA_FIELDS", default = "")]
-    pub feature_secondary_index_extra_fields: String,
     #[env_config(
         name = "ZO_FEATURE_BLOOM_FILTER_EXTRA_FIELDS",
         default = "",
-        help = "Comma-separated fields to build bloom filter on for all streams, replaces the deprecated ZO_BLOOM_FILTER_DEFAULT_FIELDS"
+        help = "Comma-separated fields to build bloom filter on for all streams (unioned with each stream's bloom_filter_fields setting). Core .vix files carry per-file value blooms assembled into group .bf files by the compactor; parquet-era paths keep their column blooms. Replaces the deprecated ZO_BLOOM_FILTER_DEFAULT_FIELDS"
     )]
     pub feature_bloom_filter_extra_fields: String,
     #[env_config(name = "ZO_FEATURE_DISTINCT_EXTRA_FIELDS", default = "")]
@@ -1136,12 +1098,16 @@ pub struct Common {
     pub default_theme_dark_mode_color: String,
     #[env_config(name = "ZO_METRICS_DEDUP_ENABLED", default = true)]
     pub metrics_dedup_enabled: bool,
-    #[env_config(name = "ZO_BLOOM_FILTER_ENABLED", default = true)]
+    #[env_config(
+        name = "ZO_BLOOM_FILTER_ENABLED",
+        default = true,
+        help = "Use bloom filters when searching parquet files (legacy data and WAL). Core .vix files carry their own term index and are unaffected"
+    )]
     pub bloom_filter_enabled: bool,
     #[env_config(
         name = "ZO_BLOOM_FILTER_PARQUET_ENABLED",
         default = false,
-        help = "Enable bloom filter for parquet files"
+        help = "Write per-column bloom filters into parquet files (WAL and non-core streams such as metrics). Not applicable to core .vix files"
     )]
     pub bloom_filter_parquet_enabled: bool,
     #[deprecated(
@@ -1151,29 +1117,63 @@ pub struct Common {
     #[env_config(name = "ZO_BLOOM_FILTER_DEFAULT_FIELDS", default = "")]
     pub bloom_filter_default_fields: String,
     #[env_config(
-        name = "ZO_BLOOM_FILTER_FPP",
-        default = 0.01,
-        help = "Target false-positive probability for the bloom filter layer. Smaller = fewer false survivors but larger `.bf` files (sizes the SBBF block count). Must be in (0, 1); out-of-range falls back to 0.01."
-    )]
-    pub bloom_filter_fpp: f64,
-    #[env_config(
-        name = "ZO_BLOOM_FILTER_MAX_FILES_PER_BF",
-        default = 256,
-        help = "Max number of files packed into one `.bf` (transposed bloom layout). A bigger value means fewer `.bf` reads per query but more compactor memory at build time (≈ files × per-file-SBBF). One hour bucket is split into ceil(files / this) `.bf` files."
-    )]
-    pub bloom_filter_max_files_per_bf: usize,
-    #[env_config(
         name = "ZO_SEARCH_AROUND_DEFAULT_FIELDS",
         default = "",
         help = "Comma separated list of fields to use for search around"
     )]
     pub search_around_default_fields: String,
-    #[env_config(name = "ZO_WAL_FSYNC_DISABLED", default = true)]
+    #[env_config(
+        name = "ZO_WAL_FSYNC_DISABLED",
+        default = true,
+        help = "Skip fsync on WAL appends. Kept on by default because the logs and traces ingest paths pass it straight through as the per-request fsync flag, so turning fsync on costs one fsync per ingest request, taken while holding the per-writer WAL lock. Exposure while on: acked rows that only exist in the WAL survive a process crash (the bytes are in the page cache) but not a power loss or kernel panic, until the memtable behind them is persisted -- worst case ZO_MAX_FILE_RETENTION_TIME (rotation) plus ZO_MEM_PERSIST_INTERVAL. This knob does NOT weaken the persist chain: wal rotation, shutdown, the .par files, the .lock file and their directories are fsynced unconditionally, so a parquet file that exists is always durable and a deleted wal file was always replaced by one."
+    )]
     pub wal_fsync_disabled: bool,
+    #[env_config(
+        name = "ZO_INGEST_SEGMENT_MODE",
+        default = false,
+        help = "S3-first ingest: buffer rows in memory and ship one multi-stream segment object per node per flush interval instead of the local memtable/WAL/mover pipeline (DESIGN-SEGMENT-WAL.md). Ack-on-append: a node crash may lose up to one flush interval of acked data. Enable only after every node in the fleet runs a segment-aware build — older followers silently ignore leader-assigned segments."
+    )]
+    pub ingest_segment_mode: bool,
+    #[env_config(
+        name = "ZO_SEGMENT_FLUSH_INTERVAL_MS",
+        default = 1000,
+        help = "Segment WAL: max time rows wait in the node buffer before the segment object is shipped"
+    )]
+    pub segment_flush_interval_ms: u64,
+    #[env_config(
+        name = "ZO_SEGMENT_FLUSH_SIZE_MB",
+        default = 64,
+        help = "Segment WAL: buffered arrow bytes that trigger an early segment flush"
+    )]
+    pub segment_flush_size_mb: usize,
+    #[env_config(
+        name = "ZO_SEGMENT_BUFFER_MAX_MB",
+        default = 512,
+        help = "Segment WAL: hard cap on buffered bytes; appends beyond it are rejected with 503 (honest backpressure while object storage is slow or down). Sized to absorb object-store hiccups at full inbound — the 128MB initial default browned out prod ingest (2026-07-31)."
+    )]
+    pub segment_buffer_max_mb: usize,
+    #[env_config(
+        name = "ZO_SEGMENT_RETAIN_SECS",
+        default = 3600,
+        help = "Segment WAL: how long built segments stay queryable/deletable-after before the sweeper removes them"
+    )]
+    pub segment_retain_secs: u64,
+    #[env_config(
+        name = "ZO_SEGMENT_BUILD_BATCH",
+        default = 16,
+        help = "Segment WAL: max segments one builder claim processes into L0 files"
+    )]
+    pub segment_build_batch: usize,
+    #[env_config(
+        name = "ZO_SEGMENT_BUILD_LEASE_SECS",
+        default = 120,
+        help = "Segment WAL: builder lease; a claim whose heartbeat is older than this is re-claimable"
+    )]
+    pub segment_build_lease_secs: u64,
     #[env_config(
         name = "ZO_WAL_WRITE_QUEUE_ENABLED",
         default = false,
-        help = "Enable write queue for WAL"
+        help = "Route WAL writes through a per-writer queue. The ingest request still waits for its own write to complete -- the consumer reports the write's outcome back before the request is acked -- so this smooths bursts across requests without weakening ack truth: an enqueue is never acked as a durable write, and a consumer failure surfaces as the request's error instead of a log line."
     )]
     pub wal_write_queue_enabled: bool,
     #[env_config(
@@ -1327,17 +1327,124 @@ pub struct Common {
     )]
     pub inverted_index_enabled: bool,
     #[env_config(
-        name = "ZO_INVERTED_INDEX_RESULT_CACHE_ENABLED",
+        name = "ZO_VIX_RG_TERM_BYTES",
+        default = 8388608,
+        help = "Raw term bytes per row group in .vix index files (one FST per row group)."
+    )]
+    pub vix_rg_term_bytes: usize,
+    #[env_config(
+        name = "ZO_WAL_NARROW_SCHEMA",
         default = false,
-        help = "Toggle tantivy result cache."
+        help = "Ingest batches carry only the fields present in the data (plus _timestamp) \
+                instead of the full stream schema: WAL arrow-IPC bytes, memtable footprint \
+                and persist width all scale with the data, not the stream-schema union. The \
+                memtable/persist/search/replay paths adapt heterogeneous batch schemas \
+                natively; this flag exists as the rollout/rollback lever."
+    )]
+    pub wal_narrow_schema: bool,
+    #[env_config(
+        name = "ZO_VIX_FULL_SCAN_RANGED_MIN_BYTES",
+        default = 268435456,
+        help = "Core-file full scans (no index row selection) switch to chunk-granular \
+                ranged reads when the object is at least this many bytes, instead of \
+                buffering the whole compressed blob in RAM (and reserving it from the \
+                DataFusion pool). 0 keeps whole-object gets for all sizes."
+    )]
+    pub vix_full_scan_ranged_min_bytes: usize,
+    #[env_config(
+        name = "ZO_VIX_EVAL_BAIL_BYTES",
+        default = 536870912,
+        help = "Give up an index-optimizer evaluation when its PROJECTED total fetch volume \
+                (bytes fetched so far / files evaluated × files total, sampled after 32 files) \
+                exceeds this many bytes, handing the remaining files to the columnar scan with \
+                the filter added back. Low-selectivity conditions cost more through the index \
+                than through the scan. 0 disables the bail-out."
+    )]
+    pub vix_eval_bail_bytes: usize,
+    /// Move-job builds whose input WAL original bytes meet this spool the
+    /// finished .vix container to `<wal>/vix_spool` and upload from the
+    /// path instead of holding the whole container (plus its upload clone)
+    /// in memory. 0 disables spooling.
+    #[env_config(name = "ZO_VIX_MOVE_SPOOL_MIN_BYTES", default = 268435456)]
+    pub vix_move_spool_min_bytes: usize,
+    /// Threads decoding ONE file's chunks during a full (non-selected)
+    /// vix scan; 0 = single-threaded (the default — cross-file concurrency
+    /// usually saturates cores first, raise for few-big-files scans).
+    #[env_config(name = "ZO_VIX_SCAN_DECODE_THREADS", default = 0)]
+    pub vix_scan_decode_threads: usize,
+    #[env_config(
+        name = "ZO_VIX_POSTINGS_CHUNK_BYTES",
+        default = 131072,
+        help = "Target chunk size for the postings column in .vix index files."
+    )]
+    pub vix_postings_chunk_bytes: usize,
+    #[env_config(
+        name = "ZO_VIX_BLOOM_FPP",
+        default = 0.001,
+        help = "False-positive probability of per-file value blooms in .vix files (needle \
+                queries probe hundreds of files; each false positive costs a dictionary walk)."
+    )]
+    pub vix_bloom_fpp: f64,
+    #[env_config(
+        name = "ZO_VIX_MAX_RAW_TERM_LENGTH",
+        default = 65532,
+        help = "Raw (non-full-text) values longer than this are not term-indexed (field becomes \
+                partial). Full-text fields tokenize regardless of value length."
+    )]
+    pub vix_max_raw_term_len: usize,
+    #[env_config(
+        name = "ZO_VIX_DOCS_CHUNK_BYTES",
+        default = 4194304,
+        help = "Uncompressed-byte budget of one docs-blob chunk in core .vix files — the \
+                decompression unit of a matched-row point read. Rows per chunk are \
+                clamp(budget / avg_row_bytes, 1024, 65536), so the effective chunk can \
+                exceed the budget for very wide rows. 0 = the 4 MiB default."
+    )]
+    pub vix_docs_chunk_bytes: usize,
+    #[env_config(
+        name = "ZO_VIX_READ_MODE",
+        default = "ranged",
+        help = "How queries read .vix containers from object storage: 'ranged' (default) \
+                fetches only the puffin footer, the term dictionary and the postings/docs \
+                chunks a query touches via range GETs — cold index evaluation stops \
+                downloading whole objects (whole-file background caching for the scan path \
+                still applies); 'cached' downloads the whole object through the file cache \
+                ladder before evaluating, as before."
+    )]
+    pub vix_read_mode: String,
+    #[env_config(
+        name = "ZO_VIX_MERGE_THREAD_NUM",
+        default = 0,
+        help = "Threads used by one core-file compaction merge (input decode + the \
+                range-partitioned term-dictionary merge). 0 = the machine's available \
+                parallelism. Each compact worker merge spawns its own set, so lower this \
+                when many ZO_COMPACT_WORKER_NUM workers merge concurrently."
+    )]
+    pub vix_merge_thread_num: usize,
+    #[env_config(
+        name = "ZO_VIX_BUILD_THREAD_NUM",
+        default = 0,
+        help = "Threads used to ENCODE one single-file core build on the WAL→storage \
+                move job (the `docs` + index blob compression pipeline). 0 = auto: the \
+                machine's available parallelism on a DEDICATED ingester (spare cores, no \
+                query/compaction competition), else 1 (a combined ingester+querier/compactor \
+                node keeps the build single-threaded so it never competes with the query \
+                fan-out or compaction merge — the freed cores serve query tail latency). \
+                The move job already builds separate files in parallel across \
+                ZO_FILE_MOVE_THREAD_NUM workers; raise this only when files are few and \
+                large so the across-file pool is underused. Term accumulation stays \
+                single-core per file (measured non-dominant vs the across-file pool; see \
+                WORKLOG PHASE C2)."
+    )]
+    pub vix_build_thread_num: usize,
+    #[env_config(
+        name = "ZO_INVERTED_INDEX_RESULT_CACHE_ENABLED",
+        default = true,
+        help = "Toggle the vix per-file index result cache. Safe by construction: keys are \
+                structural (condition hash + optimize-rule params + file key), files are \
+                immutable, and only files fully inside the query range are served."
     )]
     pub inverted_index_result_cache_enabled: bool,
-    #[env_config(
-        name = "ZO_INVERTED_INDEX_OLD_FORMAT",
-        default = false,
-        help = "Use old format for inverted index, it will generate same stream name for index."
-    )]
-    pub inverted_index_old_format: bool,
     #[env_config(
         name = "ZO_INVERTED_INDEX_COUNT_OPTIMIZER_ENABLED",
         default = true,
@@ -1372,8 +1479,6 @@ pub struct Common {
     pub format_stream_name_to_lower: bool,
     #[env_config(name = "ZO_BULK_RESPONSE_INCLUDE_ERRORS_ONLY", default = false)]
     pub bulk_api_response_errors_only: bool,
-    #[env_config(name = "ZO_ALLOW_USER_DEFINED_SCHEMAS", default = false)]
-    pub allow_user_defined_schemas: bool,
     #[env_config(
         name = "ZO_MEM_TABLE_STREAMS",
         default = "",
@@ -1508,8 +1613,8 @@ pub struct Common {
     pub env_watcher_interval: u64,
     #[env_config(
         name = "ZO_LOG_PAGE_DEFAULT_FIELD_LIST",
-        default = "uds",
-        help = "Which fields to show by default in logs search page. Valid values - all,uds,interesting"
+        default = "all",
+        help = "Which fields to show by default in logs search page. Valid values - all,interesting"
     )]
     pub log_page_default_field_list: String,
     #[env_config(
@@ -1562,28 +1667,6 @@ pub struct Limit {
     // MB, per data file size limit in memory
     #[env_config(name = "ZO_MAX_FILE_SIZE_IN_MEMORY", default = 512)]
     pub max_file_size_in_memory: usize,
-    #[deprecated(
-        since = "0.14.1",
-        note = "Please use `ZO_SCHEMA_MAX_FIELDS_TO_ENABLE_UDS` instead. This ENV is subject to be removed soon"
-    )]
-    #[env_config(
-        name = "ZO_UDSCHEMA_MAX_FIELDS",
-        default = 0,
-        help = "Exceeding this limit will auto enable user-defined schema"
-    )]
-    pub udschema_max_fields: usize,
-    #[env_config(
-        name = "ZO_SCHEMA_MAX_FIELDS_TO_ENABLE_UDS",
-        default = 1000,
-        help = "Exceeding this limit will auto enable user-defined schema"
-    )]
-    pub schema_max_fields_to_enable_uds: usize,
-    #[env_config(
-        name = "ZO_USER_DEFINED_SCHEMA_MAX_FIELDS",
-        default = 1000,
-        help = "Maximum number of fields allowed in user-defined schema"
-    )]
-    pub user_defined_schema_max_fields: usize,
     // MB, total data size of memtable in memory
     #[env_config(name = "ZO_MEM_TABLE_MAX_SIZE", default = 0)]
     pub mem_table_max_size: usize,
@@ -1604,10 +1687,16 @@ pub struct Limit {
     #[env_config(name = "ZO_FILE_PUSH_LIMIT", default = 0)] // files
     pub file_push_limit: usize,
     // over this limit will skip merging on ingester
-    #[env_config(name = "ZO_FILE_MOVE_FIELDS_LIMIT", default = 2000)]
-    pub file_move_fields_limit: usize,
     #[env_config(name = "ZO_FILE_MOVE_THREAD_NUM", default = 0)]
     pub file_move_thread_num: usize,
+    #[env_config(
+        name = "ZO_SHUTDOWN_MOVE_DEADLINE",
+        default = 480,
+        help = "Ingester shutdown: after the memtable flush, keep moving WAL parquet to \
+                object storage for up to this many seconds so scale-in never strands data \
+                on the released volume (OSS twin of the enterprise drain). 0 disables."
+    )]
+    pub shutdown_move_deadline: u64,
     #[env_config(name = "ZO_FILE_MERGE_THREAD_NUM", default = 0)]
     pub file_merge_thread_num: usize,
     #[env_config(name = "ZO_MEM_DUMP_THREAD_NUM", default = 0)]
@@ -1618,6 +1707,23 @@ pub struct Limit {
     pub usage_reporting_thread_num: usize,
     #[env_config(name = "ZO_QUERY_THREAD_NUM", default = 0)]
     pub query_thread_num: usize,
+    #[env_config(
+        name = "ZO_VIX_SEARCH_CONCURRENCY",
+        default = 0,
+        help = "Number of .vix index files evaluated in parallel per query. Per-file work is \
+                dominated by small IO waits, so this may exceed the core count. 0 = 4x CPU \
+                cores, capped at 64."
+    )]
+    pub vix_search_concurrency: usize,
+    #[env_config(
+        name = "ZO_VIX_FETCH_TIMEOUT",
+        default = 30, // seconds
+        help = "Timeout in seconds for one .vix range fetch (footer/dictionary/postings/docs \
+                chunk). A hung object-store connection becomes an error the per-file \
+                retry/degradation path handles instead of stalling the query. 0 disables the \
+                timeout."
+    )]
+    pub vix_fetch_timeout: u64,
     #[env_config(name = "ZO_FILE_DOWNLOAD_THREAD_NUM", default = 0)]
     pub file_download_thread_num: usize,
     #[env_config(name = "ZO_FILE_DOWNLOAD_MIN_RECORDS", default = 100)]
@@ -1931,22 +2037,41 @@ pub struct Limit {
     pub short_url_retention_days: i64,
     #[env_config(
         name = "ZO_INVERTED_INDEX_RESULT_CACHE_MAX_ENTRIES",
-        default = 10000,
+        default = 100000,
         help = "Maximum number of entries in the inverted index result cache. Higher values increase memory usage but may improve query performance."
     )]
     pub inverted_index_result_cache_max_entries: usize,
     #[env_config(
         name = "ZO_INVERTED_INDEX_RESULT_CACHE_MAX_ENTRY_SIZE",
-        default = 20480, // bytes, default is 20KB
+        default = 524288, // bytes, 512KB: a RowIds bitmap for a 4M-row file fits
         help = "Maximum size of a single entry in the inverted index result cache. Higher values increase memory usage but may improve query performance."
     )]
     pub inverted_index_result_cache_max_entry_size: usize,
+    #[env_config(
+        name = "ZO_INVERTED_INDEX_RESULT_CACHE_MAX_SIZE",
+        default = 0, // MB; 0 = 256MB. Hard byte budget across all entries.
+        help = "Maximum total memory in MB for the vix per-file result cache. Entries are \
+                evicted oldest-first once the budget is exceeded, so the entry-count and \
+                per-entry limits can be generous without risking unbounded memory."
+    )]
+    pub inverted_index_result_cache_max_size: usize,
     #[env_config(
         name = "ZO_INVERTED_INDEX_FOOTER_CACHE_MAX_SIZE",
         default = 0, // MB, default is 5% of total memory
         help = "Maximum memory size in MB for the footer cache. Higher values allow caching more file footers but increase memory usage."
     )]
     pub inverted_index_footer_cache_max_size: usize,
+    #[env_config(
+        name = "ZO_VIX_READER_CACHE_MAX_SIZE",
+        default = 0, // MB, default is 10% of total memory (no upper clamp)
+        help = "Maximum memory size in MB for the cache of parsed .vix readers (footer + \
+                properties + term-dictionary FSTs) on queriers. Unset (0) defaults to 10% of \
+                total memory with NO upper clamp — hosts serving many files should raise it \
+                further (dictionaries dominate; hot queries do zero dictionary IO only while \
+                their readers fit). Falls back to ZO_INVERTED_INDEX_FOOTER_CACHE_MAX_SIZE when \
+                that legacy knob is set explicitly and this one is not."
+    )]
+    pub vix_reader_cache_max_size: usize,
     #[env_config(
         name = "ZO_BLOOM_FOOTER_CACHE_MAX_SIZE",
         default = 0, // MB, default is 1% of total memory, clamped to [32, 256] MB
@@ -1977,12 +2102,6 @@ pub struct Limit {
         help = "Maximum length of a token in the inverted index."
     )]
     pub inverted_index_max_token_length: usize,
-    #[env_config(
-        name = "ZO_INDEX_ALL_MAX_VALUE_LENGTH",
-        default = 0,
-        help = "Maximum length of a value in the index all feature."
-    )]
-    pub index_all_max_value_length: usize,
     #[env_config(
         name = "ZO_DEFAULT_MAX_QUERY_RANGE_DAYS",
         default = 0,
@@ -2061,6 +2180,25 @@ pub struct Compact {
     pub data_retention_interval: u64,
     #[env_config(name = "ZO_COMPACT_OLD_DATA_INTERVAL", default = 3600)] // seconds
     pub old_data_interval: u64,
+    #[env_config(
+        name = "ZO_COMPACT_BLOOM_BUILD_INTERVAL",
+        default = 600,
+        help = "Seconds between group .bf bloom-builder passes on the compactor (0 disables)."
+    )]
+    pub bloom_build_interval: u64,
+    #[env_config(
+        name = "ZO_COMPACT_BLOOM_BUILD_BATCH",
+        default = 300,
+        help = "Max pending (stream, hour) buckets one bloom-builder pass drains."
+    )]
+    pub bloom_build_batch: i64,
+    #[env_config(
+        name = "ZO_COMPACT_BLOOM_BUILD_FALLBACK_BUDGET",
+        default = 128,
+        help = "Max dictionary-stream backfills (blob-less old files) per builder pass; \
+                leftovers stay queued and form later .bf chunks."
+    )]
+    pub bloom_build_fallback_budget: i64,
     #[env_config(name = "ZO_COMPACT_STRATEGY", default = "file_time")]
     // file_size, file_time, time_range
     pub strategy: String,
@@ -2130,24 +2268,15 @@ pub struct Compact {
         help = "Comma-separated list of hours (0-23) when retention can run. Empty means run at all hours. Example: 5,6,8"
     )]
     pub retention_allowed_hours: String,
-    #[env_config(
-        name = "ZO_COMPACT_TANTIVY_BUILDER_THREAD_NUM",
-        default = 2,
-        help = "Per-file concurrent row_group workers for tantivy index generation during compaction. less than or equal to 1 disables (single-threaded)"
-    )]
-    pub tantivy_builder_thread_num: usize,
 }
 
 #[derive(Serialize, EnvConfig, Default)]
 pub struct CacheLatestFiles {
     #[env_config(name = "ZO_CACHE_LATEST_FILES_ENABLED", default = false)]
     pub enabled: bool,
-    // cache parquet files
+    // cache data files (parquet / core .vix)
     #[env_config(name = "ZO_CACHE_LATEST_FILES_PARQUET", default = true)]
     pub cache_parquet: bool,
-    // cache index(tantivy) files
-    #[env_config(name = "ZO_CACHE_LATEST_FILES_INDEX", default = true)]
-    pub cache_index: bool,
     #[env_config(name = "ZO_CACHE_LATEST_FILES_DELETE_MERGE_FILES", default = false)]
     pub delete_merge_files: bool,
     #[env_config(name = "ZO_CACHE_LATEST_FILES_DOWNLOAD_FROM_NODE", default = false)]
@@ -2348,7 +2477,14 @@ pub struct S3 {
     pub bucket_prefix: String,
     #[env_config(name = "ZO_S3_CONNECT_TIMEOUT", default = 10)] // seconds
     pub connect_timeout: u64,
-    #[env_config(name = "ZO_S3_REQUEST_TIMEOUT", default = 3600)] // seconds
+    #[env_config(
+        name = "ZO_S3_REQUEST_TIMEOUT",
+        default = 3600, // seconds
+        help = "Object-store request timeout in seconds. The 3600s default suits large \
+                uploads/downloads; on QUERIERS a stalled ranged read would otherwise pin a \
+                query for the full hour — 60-120s is recommended there (the .vix range \
+                fetches are additionally bounded by ZO_VIX_FETCH_TIMEOUT)."
+    )]
     pub request_timeout: u64,
     #[env_config(name = "ZO_S3_FEATURE_FORCE_HOSTED_STYLE", default = false)]
     pub feature_force_hosted_style: bool,
@@ -2800,6 +2936,12 @@ fn check_limit_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
             cfg.limit.query_thread_num = cpu_num * 4;
         }
     }
+    // per-file vix index evaluation is a handful of small IO waits plus
+    // microseconds of CPU: overlap well beyond the core count by default
+    if cfg.limit.vix_search_concurrency == 0 {
+        cfg.limit.vix_search_concurrency = (cpu_num * 4).min(64);
+    }
+    cfg.limit.vix_search_concurrency = max(1, cfg.limit.vix_search_concurrency);
 
     if cfg.limit.file_download_thread_num == 0 {
         cfg.limit.file_download_thread_num = std::cmp::max(1, cpu_num / 2);
@@ -2809,9 +2951,43 @@ fn check_limit_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
         cfg.limit.file_download_priority_queue_thread_num = std::cmp::max(1, cpu_num / 2);
     }
 
-    // HACK for move_file_thread_num equal to CPU core
+    // Co-located CPU-heavy role count (ingester + querier + compactor) — the
+    // roles whose large default pools stack on a combined node. Parsed from
+    // the node-role STRING because cluster::LOCAL_NODE is not yet initialized
+    // while this Config is still being built (LOCAL_NODE depends on it); same
+    // parse the later checks use. 1 in local mode / for a dedicated node.
+    let cpu_role_div = if cfg.common.local_mode {
+        1
+    } else {
+        let roles: Vec<cluster::Role> = cfg
+            .common
+            .node_role
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect();
+        let all = roles.contains(&cluster::Role::All);
+        let mut n = 0;
+        if all || roles.contains(&cluster::Role::Ingester) {
+            n += 1;
+        }
+        if all || roles.contains(&cluster::Role::Querier) {
+            n += 1;
+        }
+        if all || roles.contains(&cluster::Role::Compactor) {
+            n += 1;
+        }
+        max(1, n)
+    };
+    // The WAL→storage move build pool. On a DEDICATED ingester keep it at the
+    // full core count; on a COMBINED node divide by the co-located heavy-role
+    // count so the move build, query fan-out and compaction merge pools sum to
+    // ~cores instead of stacking. Measured (C2): scaling this 8→2 on a combined
+    // node cut query p99 ~29% with unchanged ingest throughput (the move job is
+    // not the ingest bottleneck). The IO-bound ZO_VIX_SEARCH_CONCURRENCY is
+    // deliberately NOT scaled (measured: scaling it added no benefit and risks
+    // starving the per-query fan-out on slow object storage).
     if cfg.limit.file_move_thread_num == 0 {
-        cfg.limit.file_move_thread_num = cpu_num;
+        cfg.limit.file_move_thread_num = max(1, cpu_num / cpu_role_div);
     }
     // HACK for file_merge_thread_num equal to CPU core
     if cfg.limit.file_merge_thread_num == 0 {
@@ -2872,12 +3048,6 @@ fn check_limit_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
     }
     if cfg.limit.query_querier_timeout == 0 {
         cfg.limit.query_querier_timeout = cfg.limit.query_timeout;
-    }
-
-    // check for uds
-    #[allow(deprecated)]
-    if cfg.limit.udschema_max_fields > 0 {
-        cfg.limit.schema_max_fields_to_enable_uds = cfg.limit.udschema_max_fields;
     }
 
     // migrate deprecated *_file_retention ENVs to *_query_retention for backward compatibility
@@ -2959,6 +3129,47 @@ fn check_common_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
     // check search job retention
     if cfg.limit.search_job_retention == 0 {
         return Err(anyhow::anyhow!("search job retention is set to zero"));
+    }
+
+    // segment-WAL knobs (DESIGN-SEGMENT-WAL.md): the flusher, builder, and
+    // sweeper run whenever their node roles do, so these bounds must hold
+    // regardless of ZO_INGEST_SEGMENT_MODE
+    if cfg.common.segment_flush_interval_ms < 50 {
+        return Err(anyhow::anyhow!(
+            "ZO_SEGMENT_FLUSH_INTERVAL_MS must be at least 50, got {}",
+            cfg.common.segment_flush_interval_ms
+        ));
+    }
+    if cfg.common.segment_flush_size_mb < 1 {
+        return Err(anyhow::anyhow!(
+            "ZO_SEGMENT_FLUSH_SIZE_MB must be at least 1, got {}",
+            cfg.common.segment_flush_size_mb
+        ));
+    }
+    if cfg.common.segment_buffer_max_mb < 2 * cfg.common.segment_flush_size_mb {
+        return Err(anyhow::anyhow!(
+            "ZO_SEGMENT_BUFFER_MAX_MB must be at least 2x ZO_SEGMENT_FLUSH_SIZE_MB ({}), got {}",
+            2 * cfg.common.segment_flush_size_mb,
+            cfg.common.segment_buffer_max_mb
+        ));
+    }
+    if cfg.common.segment_build_batch < 1 {
+        return Err(anyhow::anyhow!(
+            "ZO_SEGMENT_BUILD_BATCH must be at least 1, got {}",
+            cfg.common.segment_build_batch
+        ));
+    }
+    if cfg.common.segment_build_lease_secs < 30 {
+        return Err(anyhow::anyhow!(
+            "ZO_SEGMENT_BUILD_LEASE_SECS must be at least 30, got {}",
+            cfg.common.segment_build_lease_secs
+        ));
+    }
+    if cfg.common.segment_retain_secs < 60 {
+        return Err(anyhow::anyhow!(
+            "ZO_SEGMENT_RETAIN_SECS must be at least 60, got {}",
+            cfg.common.segment_retain_secs
+        ));
     }
 
     if (cfg.common.tracing_enabled || cfg.common.tracing_search_enabled)
@@ -3099,15 +3310,6 @@ fn check_common_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
         }
     }
 
-    // check bloom filter fpp: must be a probability in (0, 1)
-    if cfg.common.bloom_filter_fpp <= 0.0 || cfg.common.bloom_filter_fpp >= 1.0 {
-        log::warn!(
-            "ZO_BLOOM_FILTER_FPP={} is out of range (0, 1); falling back to default 0.01",
-            cfg.common.bloom_filter_fpp
-        );
-        cfg.common.bloom_filter_fpp = 0.01;
-    }
-
     // check for join match one
     if cfg.common.feature_join_match_one_enabled && cfg.common.feature_join_right_side_max_rows == 0
     {
@@ -3138,24 +3340,28 @@ fn check_common_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
     cfg.common.log_page_default_field_list = cfg.common.log_page_default_field_list.to_lowercase();
     if !matches!(
         cfg.common.log_page_default_field_list.as_str(),
-        "uds" | "all" | "interesting"
+        "all" | "interesting"
     ) {
-        cfg.common.log_page_default_field_list = "uds".to_string();
+        // legacy value "uds" (and anything unknown) now maps to all fields
+        cfg.common.log_page_default_field_list = "all".to_string();
     }
 
     Ok(())
 }
 
-#[cfg(not(feature = "enterprise"))]
+// Vortex data files are supported in all builds; nothing to normalize.
+// `ZO_FILE_FORMAT` only selects the flat columnar data format
+// (parquet/vortex); logs/traces are always core `.vix` files, so `vix`
+// is normalized away here.
 fn check_file_format_config(cfg: &mut Config) {
-    if cfg.common.file_format != FileFormat::Parquet {
-        log::warn!("ZO_FILE_FORMAT is only supported in enterprise builds; using parquet");
+    if cfg.common.file_format == FileFormat::Vix {
+        log::warn!(
+            "ZO_FILE_FORMAT=vix is not a valid data-file format (logs/traces are always core \
+             .vix files); falling back to parquet"
+        );
         cfg.common.file_format = FileFormat::Parquet;
     }
 }
-
-#[cfg(feature = "enterprise")]
-fn check_file_format_config(_cfg: &mut Config) {}
 
 fn check_grpc_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
     if cfg.grpc.tls_enabled
@@ -3337,6 +3543,22 @@ fn check_memory_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
         cfg.limit.query_default_limit = 1000;
     }
 
+    // The vix reader cache defaults to 10% of RAM with NO upper clamp (parsed
+    // dictionaries are the working set of every hot query — an artificial cap
+    // silently degrades hosts serving many files). Resolve it BEFORE the
+    // legacy footer knob is defaulted so "legacy knob set, new knob unset"
+    // still honors the operator's explicit value.
+    if cfg.limit.vix_reader_cache_max_size == 0 {
+        if cfg.limit.inverted_index_footer_cache_max_size > 0 {
+            // compat: fall back to the explicitly-set legacy footer knob (MB)
+            cfg.limit.vix_reader_cache_max_size =
+                cfg.limit.inverted_index_footer_cache_max_size * (SIZE_IN_MB as usize);
+        } else {
+            cfg.limit.vix_reader_cache_max_size = (cfg.limit.mem_total as f64 * 0.10) as usize;
+        }
+    } else {
+        cfg.limit.vix_reader_cache_max_size *= SIZE_IN_MB as usize;
+    }
     if cfg.limit.inverted_index_footer_cache_max_size == 0 {
         cfg.limit.inverted_index_footer_cache_max_size =
             ((cfg.limit.mem_total as f64 / SIZE_IN_MB * 0.05) as usize).clamp(100, 1024)
@@ -3346,9 +3568,9 @@ fn check_memory_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
     }
     if cfg.limit.bloom_footer_cache_max_size == 0 {
         // 1% of total mem, clamped to [32, 256] MB. Bloom footers are an
-        // order of magnitude smaller than tantivy footers (footer payload
-        // ≈ 24 B per file × 3 fields + per-field header ≈ 7.5 KB per
-        // `.bf`), so the cache holds 4-32 K entries at this size.
+        // order of magnitude smaller than inverted-index footers (footer
+        // payload ≈ 24 B per file × 3 fields + per-field header ≈ 7.5 KB
+        // per `.bf`), so the cache holds 4-32 K entries at this size.
         cfg.limit.bloom_footer_cache_max_size =
             ((cfg.limit.mem_total as f64 / SIZE_IN_MB * 0.01) as usize).clamp(32, 256)
                 * (SIZE_IN_MB as usize);
@@ -3728,11 +3950,24 @@ fn check_nats_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
 }
 
 fn check_inverted_index_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
+    cfg.common.vix_read_mode = cfg.common.vix_read_mode.trim().to_lowercase();
+    if cfg.common.vix_read_mode.is_empty() {
+        cfg.common.vix_read_mode = "ranged".to_string();
+    }
+    if !matches!(cfg.common.vix_read_mode.as_str(), "cached" | "ranged") {
+        return Err(anyhow::anyhow!(
+            "ZO_VIX_READ_MODE must be 'cached' or 'ranged', got {:?}",
+            cfg.common.vix_read_mode
+        ));
+    }
     if cfg.limit.inverted_index_result_cache_max_entries == 0 {
-        cfg.limit.inverted_index_result_cache_max_entries = 10000;
+        cfg.limit.inverted_index_result_cache_max_entries = 100000;
     }
     if cfg.limit.inverted_index_result_cache_max_entry_size == 0 {
-        cfg.limit.inverted_index_result_cache_max_entry_size = 20480;
+        cfg.limit.inverted_index_result_cache_max_entry_size = 524288;
+    }
+    if cfg.limit.inverted_index_result_cache_max_size == 0 {
+        cfg.limit.inverted_index_result_cache_max_size = 256; // MB
     }
     if cfg.limit.inverted_index_skip_threshold == 0 {
         cfg.limit.inverted_index_skip_threshold = 35;
@@ -3915,6 +4150,7 @@ mod tests {
     fn test_file_format_display() {
         assert_eq!(FileFormat::Parquet.to_string(), "parquet");
         assert_eq!(FileFormat::Vortex.to_string(), "vortex");
+        assert_eq!(FileFormat::Vix.to_string(), "vix");
     }
 
     #[test]
@@ -3929,6 +4165,7 @@ mod tests {
         );
         assert_eq!("vortex".parse::<FileFormat>().unwrap(), FileFormat::Vortex);
         assert_eq!("VORTEX".parse::<FileFormat>().unwrap(), FileFormat::Vortex);
+        assert_eq!("vix".parse::<FileFormat>().unwrap(), FileFormat::Vix);
         assert!("unknown".parse::<FileFormat>().is_err());
     }
 
@@ -3936,6 +4173,7 @@ mod tests {
     fn test_file_format_extension() {
         assert_eq!(FileFormat::Parquet.extension(), ".parquet");
         assert_eq!(FileFormat::Vortex.extension(), ".vortex");
+        assert_eq!(FileFormat::Vix.extension(), ".vix");
     }
 
     #[test]
@@ -3966,6 +4204,12 @@ mod tests {
         );
         assert_eq!(FileFormat::from_extension("data.json"), None);
         assert_eq!(FileFormat::from_extension(""), None);
+        // core files dispatch as their own format — they must never fall
+        // into a parquet default
+        assert_eq!(
+            FileFormat::from_extension("files/default/logs/s1/2026/07/21/00/1.vix"),
+            Some(FileFormat::Vix)
+        );
         // full path
         assert_eq!(
             FileFormat::from_extension("/some/path/file.parquet"),
@@ -3974,25 +4218,28 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(feature = "enterprise"))]
-    fn test_non_enterprise_file_format_forces_parquet() {
-        let mut cfg = Config::default();
-        cfg.common.file_format = FileFormat::Vortex;
-
-        check_file_format_config(&mut cfg);
-
-        assert_eq!(cfg.common.file_format, FileFormat::Parquet);
-    }
-
-    #[test]
-    #[cfg(feature = "enterprise")]
-    fn test_enterprise_file_format_preserves_configured_value() {
+    fn test_file_format_preserves_configured_value() {
+        // Vortex data files are supported in all builds; the configured
+        // format is never normalized away.
         let mut cfg = Config::default();
         cfg.common.file_format = FileFormat::Vortex;
 
         check_file_format_config(&mut cfg);
 
         assert_eq!(cfg.common.file_format, FileFormat::Vortex);
+    }
+
+    #[test]
+    fn test_file_format_vix_is_not_a_valid_configured_format() {
+        // `vix` parses (needed for internal plumbing) but is normalized away
+        // as a ZO_FILE_FORMAT value: logs/traces are always core files, not
+        // selected by the flat-data-format switch.
+        let mut cfg = Config::default();
+        cfg.common.file_format = FileFormat::Vix;
+
+        check_file_format_config(&mut cfg);
+
+        assert_eq!(cfg.common.file_format, FileFormat::Parquet);
     }
 
     #[test]
@@ -4170,16 +4417,86 @@ mod tests {
     }
 
     #[test]
+    fn test_check_limit_config_vix_search_concurrency() {
+        // default (0) resolves to 4x cpu cores, capped at 64
+        let mut cfg = Config::default();
+        cfg.limit.vix_search_concurrency = 0;
+        check_limit_config(&mut cfg).unwrap();
+        assert_eq!(
+            cfg.limit.vix_search_concurrency,
+            (cfg.limit.cpu_num * 4).min(64)
+        );
+        // explicit values are respected (floored at 1)
+        let mut cfg = Config::default();
+        cfg.limit.vix_search_concurrency = 7;
+        check_limit_config(&mut cfg).unwrap();
+        assert_eq!(cfg.limit.vix_search_concurrency, 7);
+    }
+
+    #[test]
+    fn test_check_limit_config_file_move_role_scaling() {
+        // dedicated ingester (cluster mode): full core count (no co-located
+        // heavy roles to share cores with)
+        let mut cfg = Config::default();
+        cfg.common.local_mode = false;
+        cfg.common.node_role = "ingester".to_string();
+        cfg.limit.file_move_thread_num = 0;
+        check_limit_config(&mut cfg).unwrap();
+        assert_eq!(cfg.limit.file_move_thread_num, cfg.limit.cpu_num);
+
+        // combined ingester+querier+compactor: divided by 3 so the move,
+        // query and merge pools sum to ~cores instead of stacking
+        let mut cfg = Config::default();
+        cfg.common.local_mode = false;
+        cfg.common.node_role = "ingester,querier,compactor".to_string();
+        cfg.limit.file_move_thread_num = 0;
+        check_limit_config(&mut cfg).unwrap();
+        assert_eq!(
+            cfg.limit.file_move_thread_num,
+            std::cmp::max(1, cfg.limit.cpu_num / 3)
+        );
+
+        // Role::All in cluster mode counts as all three heavy roles
+        let mut cfg = Config::default();
+        cfg.common.local_mode = false;
+        cfg.common.node_role = "all".to_string();
+        cfg.limit.file_move_thread_num = 0;
+        check_limit_config(&mut cfg).unwrap();
+        assert_eq!(
+            cfg.limit.file_move_thread_num,
+            std::cmp::max(1, cfg.limit.cpu_num / 3)
+        );
+
+        // LOCAL_MODE: full core count — single-node behavior unchanged
+        let mut cfg = Config::default();
+        cfg.common.local_mode = true;
+        cfg.common.node_role = "all".to_string();
+        cfg.limit.file_move_thread_num = 0;
+        check_limit_config(&mut cfg).unwrap();
+        assert_eq!(cfg.limit.file_move_thread_num, cfg.limit.cpu_num);
+
+        // explicit value always respected
+        let mut cfg = Config::default();
+        cfg.common.local_mode = false;
+        cfg.common.node_role = "ingester,querier,compactor".to_string();
+        cfg.limit.file_move_thread_num = 5;
+        check_limit_config(&mut cfg).unwrap();
+        assert_eq!(cfg.limit.file_move_thread_num, 5);
+    }
+
+    #[test]
     fn test_check_inverted_index_config_defaults() {
         let mut cfg = Config::default();
         cfg.limit.inverted_index_result_cache_max_entries = 0;
         cfg.limit.inverted_index_result_cache_max_entry_size = 0;
+        cfg.limit.inverted_index_result_cache_max_size = 0;
         cfg.limit.inverted_index_skip_threshold = 0;
         cfg.limit.inverted_index_min_token_length = 0;
         cfg.limit.inverted_index_max_token_length = 0;
         check_inverted_index_config(&mut cfg).unwrap();
-        assert_eq!(cfg.limit.inverted_index_result_cache_max_entries, 10000);
-        assert_eq!(cfg.limit.inverted_index_result_cache_max_entry_size, 20480);
+        assert_eq!(cfg.limit.inverted_index_result_cache_max_entries, 100000);
+        assert_eq!(cfg.limit.inverted_index_result_cache_max_entry_size, 524288);
+        assert_eq!(cfg.limit.inverted_index_result_cache_max_size, 256);
         assert_eq!(cfg.limit.inverted_index_skip_threshold, 35);
         assert_eq!(cfg.limit.inverted_index_min_token_length, 2);
         assert_eq!(cfg.limit.inverted_index_max_token_length, 64);
@@ -4388,6 +4705,54 @@ mod tests {
         cfg.common.feature_bloom_filter_extra_fields = "trace_id".to_string();
         check_common_config(&mut cfg).unwrap();
         assert_eq!(cfg.common.feature_bloom_filter_extra_fields, "trace_id");
+    }
+
+    #[test]
+    fn test_check_common_config_segment_knobs() {
+        // defaults must pass
+        let mut cfg = Config::init().unwrap();
+        check_common_config(&mut cfg).unwrap();
+
+        // each knob's floor is enforced with the env var named in the error
+        for (set, env) in [
+            (
+                (|c: &mut Config| c.common.segment_flush_interval_ms = 49) as fn(&mut Config),
+                "ZO_SEGMENT_FLUSH_INTERVAL_MS",
+            ),
+            (
+                |c: &mut Config| c.common.segment_flush_size_mb = 0,
+                "ZO_SEGMENT_FLUSH_SIZE_MB",
+            ),
+            (
+                |c: &mut Config| c.common.segment_buffer_max_mb = 63,
+                "ZO_SEGMENT_BUFFER_MAX_MB",
+            ),
+            (
+                |c: &mut Config| c.common.segment_build_batch = 0,
+                "ZO_SEGMENT_BUILD_BATCH",
+            ),
+            (
+                |c: &mut Config| c.common.segment_build_lease_secs = 29,
+                "ZO_SEGMENT_BUILD_LEASE_SECS",
+            ),
+            (
+                |c: &mut Config| c.common.segment_retain_secs = 59,
+                "ZO_SEGMENT_RETAIN_SECS",
+            ),
+        ] {
+            let mut cfg = Config::init().unwrap();
+            set(&mut cfg);
+            let err = check_common_config(&mut cfg).unwrap_err().to_string();
+            assert!(err.contains(env), "expected {env} in error: {err}");
+        }
+
+        // the buffer cap floor scales with the flush size
+        let mut cfg = Config::init().unwrap();
+        cfg.common.segment_flush_size_mb = 32;
+        cfg.common.segment_buffer_max_mb = 64;
+        check_common_config(&mut cfg).unwrap();
+        cfg.common.segment_buffer_max_mb = 63;
+        assert!(check_common_config(&mut cfg).is_err());
     }
 
     #[test]

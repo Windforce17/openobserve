@@ -26,7 +26,7 @@ pub mod metrics;
 pub mod prebuilt_loader;
 pub mod router;
 pub mod stats;
-pub mod tantivy;
+pub mod text_tokenizer;
 pub mod utils;
 
 pub use config::*;

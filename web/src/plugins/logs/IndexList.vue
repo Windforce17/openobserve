@@ -166,18 +166,14 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
         <template #after-list="bottomProps">
           <GroupedFieldListPagination
             data-test-prefix="logs-page"
-            :show-schema-toggle="showUserDefinedSchemaToggle"
             :show-quick-mode="searchObj.meta.quickMode"
-            :use-user-defined-schemas="searchObj.meta.useUserDefinedSchemas"
             :show-only-interesting-fields="showOnlyInterestingFields"
-            :schema-toggle-options="userDefinedSchemaBtnGroupOption"
             :interesting-fields-toggle-options="selectedFieldsBtnGroupOption"
             :current-page="bottomProps.currentPage"
             :pages-number="bottomProps.totalPages"
             :is-first-page="bottomProps.isFirstPage"
             :is-last-page="bottomProps.isLastPage"
             :total-fields-count="totalFieldsCount"
-            @toggle-schema="toggleSchema"
             @toggle-interesting-fields="toggleInterestingFields"
             @first-page="bottomProps.firstPage()"
             @last-page="bottomProps.lastPage()"
@@ -419,19 +415,6 @@ export default defineComponent({
       () => store.state.zoConfig?.show_fts_field_values ?? false,
     );
 
-    const userDefinedSchemaBtnGroupOption = ref([
-      {
-        label: "",
-        value: "user_defined_schema",
-        slot: "user_defined_slot",
-      },
-      {
-        label: "",
-        value: "all_fields",
-        slot: "all_fields_slot",
-      },
-    ]);
-
     const selectedFieldsBtnGroupOption = [
       {
         label: "",
@@ -508,13 +491,6 @@ export default defineComponent({
       saveLogsStream(store.state.selectedOrganization.identifier, []);
       await getStreamList(true);
     };
-
-    const showUserDefinedSchemaToggle = computed(() => {
-      return (
-        store.state.zoConfig.user_defined_schemas_enabled &&
-        searchObj.meta.hasUserDefinedSchemas
-      );
-    });
 
     const streamList = computed(() => {
       return searchObj.data.stream.streamLists;
@@ -715,29 +691,12 @@ export default defineComponent({
       () => searchObj.meta.quickMode,
       (isActive) => {
         if (isActive) {
-          // check if its present in the array dont add it again
-          if (
-            !userDefinedSchemaBtnGroupOption.value.some(
-              (option) => option.value === "interesting_fields",
-            )
-          ) {
-            userDefinedSchemaBtnGroupOption.value.push({
-              label: "",
-              value: "interesting_fields",
-              slot: "interesting_fields_slot",
-            });
-          }
           setDefaultFieldTab();
         } else {
-          userDefinedSchemaBtnGroupOption.value =
-            userDefinedSchemaBtnGroupOption.value.filter(
-              (option) => option.value !== "interesting_fields",
-            );
-
           if (searchObj.meta.useUserDefinedSchemas === "interesting_fields") {
             // As we are changing the tab reset the pagination
             if (pagination.value) resetPagination();
-            searchObj.meta.useUserDefinedSchemas = "user_defined_schema";
+            searchObj.meta.useUserDefinedSchemas = "all_fields";
           }
 
           if (showOnlyInterestingFields.value)
@@ -760,11 +719,8 @@ export default defineComponent({
     // );
 
     watch(
-      () => [
-        showUserDefinedSchemaToggle.value,
-        searchObj.meta.useUserDefinedSchemas,
-      ],
-      (isActive) => {
+      () => searchObj.meta.useUserDefinedSchemas,
+      () => {
         showOnlyInterestingFields.value =
           searchObj.meta.useUserDefinedSchemas === "interesting_fields";
       },
@@ -772,15 +728,6 @@ export default defineComponent({
         immediate: true,
       },
     );
-
-    /**
-     * Added this watcher to set default field tab when user defined schema toggle is changed
-     * As when user selects stream defineSchema flag is set and there is no any event to identify that
-     * so we are using this watcher to set default field tab as per the stream settings
-     */
-    watch(showUserDefinedSchemaToggle, () => {
-      setDefaultFieldTab();
-    });
 
     // Reset to page 1 whenever the field search term changes so the user
     // always sees results from the beginning of the filtered list.
@@ -817,13 +764,13 @@ export default defineComponent({
     const selectedStream = ref("");
 
     // if interesting field is enabled, then set default tab as interesting fields
-    // otherwise set default tab as user defined schema
+    // otherwise set default tab as all fields
     function setDefaultFieldTab() {
       if (store.state.zoConfig.log_page_default_field_list === "uds") {
         // reset pagination only if tab has changed
-        if (searchObj.meta.useUserDefinedSchemas !== "user_defined_schema")
+        if (searchObj.meta.useUserDefinedSchemas !== "all_fields")
           resetPagination();
-        searchObj.meta.useUserDefinedSchemas = "user_defined_schema";
+        searchObj.meta.useUserDefinedSchemas = "all_fields";
         showOnlyInterestingFields.value = false;
       } else {
         // reset pagination only if tab has changed
@@ -1542,11 +1489,6 @@ export default defineComponent({
     };
 
     const addInterestingFieldToSelectedStreamFields = (field: any) => {
-      const defaultFields = [
-        store.state.zoConfig?.timestamp_column,
-        store.state.zoConfig?.all_fields_name,
-      ];
-
       let expandKeys = Object.keys(searchObj.data.stream.expandGroupRows);
 
       let index = 0;
@@ -1585,25 +1527,6 @@ export default defineComponent({
         ] + 1;
     };
 
-    const toggleSchema = async (newValue: string) => {
-      // Update the schema type with the new value from the toggle
-      searchObj.meta.useUserDefinedSchemas = newValue;
-
-      // Reset pagination to page 1 before resetting fields
-      resetPagination();
-
-      const isInterestingFields =
-        searchObj.meta.useUserDefinedSchemas === "interesting_fields";
-
-      if (isInterestingFields) {
-        showOnlyInterestingFields.value = true;
-      } else {
-        showOnlyInterestingFields.value = false;
-      }
-
-      await resetFields();
-    };
-
     const toggleInterestingFields = (newValue: boolean) => {
       // Update the interesting fields toggle with the new value
       showOnlyInterestingFields.value = newValue;
@@ -1618,15 +1541,6 @@ export default defineComponent({
         !searchObj.data.stream.expandGroupRows[group];
       // Reset to page 1 so the table recalculates page count from the new row total
       pagination.value = { ...pagination.value, page: 1 };
-    };
-
-    const hasUserDefinedSchemas = () => {
-      return searchObj.data.stream.selectedStream.some((stream: any) => {
-        store.state.zoConfig.user_defined_schemas_enabled &&
-          searchObj.meta.useUserDefinedSchemas == "user_defined_schema" &&
-          stream.settings.hasOwnProperty("defined_schema_fields") &&
-          (stream.settings?.defined_schema_fields?.slice() || []) > 0;
-      });
     };
 
     const sortedStreamFields = () => {
@@ -2022,11 +1936,9 @@ export default defineComponent({
       onStreamChange,
       addToInterestingFieldList,
       extractFields,
-      userDefinedSchemaBtnGroupOption,
       selectedFieldsBtnGroupOption,
       pagination,
       onPaginationUpdate,
-      toggleSchema,
       toggleInterestingFields,
       fieldListRef,
       streamSelect,
@@ -2068,7 +1980,6 @@ export default defineComponent({
       handleSearchResponse,
       handleSearchReset,
       showOnlyInterestingFields,
-      showUserDefinedSchemaToggle,
       // Additional functions exposed for testing
       resetFields,
       sendSearchMessage,
@@ -2080,7 +1991,6 @@ export default defineComponent({
       getValuesPartition,
       streamList,
       quickPickStreams,
-      hasUserDefinedSchemas,
       setPage,
       resetPagination,
       removeFieldFromWhereAST,

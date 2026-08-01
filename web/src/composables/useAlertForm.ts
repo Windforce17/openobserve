@@ -722,24 +722,6 @@ export function useAlertForm(props: AlertFormProps, emit: AlertFormEmit) {
       }));
     }
 
-    if (
-      streamsData?.settings?.defined_schema_fields &&
-      Array.isArray(streamsData.settings.defined_schema_fields) &&
-      streamsData.settings.defined_schema_fields.length > 0
-    ) {
-      const definedFields = streamsData.settings.defined_schema_fields;
-      const timestampColumn =
-        store.state.zoConfig?.timestamp_column || "_timestamp";
-      const allFieldsName = store.state.zoConfig?.all_fields_name;
-
-      streamCols = streamCols.filter((col: any) => {
-        if (col.value === timestampColumn || col.value === allFieldsName) {
-          return true;
-        }
-        return definedFields.includes(col.value);
-      });
-    }
-
     originalStreamFields.value = [...streamCols];
     filteredColumns.value = [...streamCols];
 

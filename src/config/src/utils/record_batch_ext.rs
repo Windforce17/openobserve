@@ -914,14 +914,7 @@ pub fn convert_json_to_record_batch(
     let records_len = data.len();
     let num_fields = schema.fields().len();
 
-    // Pre-allocate builders for all fields in schema
-    let mut builders: Vec<Box<dyn ArrayBuilder>> = schema
-        .fields()
-        .iter()
-        .map(|f| make_builder(f.data_type(), records_len))
-        .collect();
-
-    // Create field name to index mapping (amortize lookup cost)
+    // Field name -> schema index (amortize lookup cost)
     let field_indices: HashMap<&str, usize> = schema
         .fields()
         .iter()
@@ -929,44 +922,170 @@ pub fn convert_json_to_record_batch(
         .map(|(idx, f)| (f.name().as_str(), idx))
         .collect();
 
-    // Cache data types for faster access
-    let data_types: Vec<&DataType> = schema.fields().iter().map(|f| f.data_type()).collect();
-
-    // Single-pass traversal with bitmap for present fields
+    // PASS 1: find the schema fields this data actually carries. Stream
+    // schemas grow to thousands of union fields while any one batch carries
+    // a few dozen, so everything O(schema_width x rows) — builders, per-row
+    // null appends, per-row bitmaps — is the ingest hot path. Only present
+    // fields get builders and per-row work; every absent field becomes one
+    // SHARED null column at assembly.
+    let mut slot_of_field: Vec<usize> = vec![usize::MAX; num_fields];
+    let mut slots: Vec<usize> = Vec::new(); // builder slot -> schema index
     for record in data.iter() {
-        let obj = match record.as_object() {
-            Some(obj) => obj,
-            None => {
-                return Err(ArrowError::SchemaError("Expected JSON object".to_string()));
-            }
-        };
-
-        // Use bitmap to track present fields (more efficient than HashSet)
-        let mut field_present = vec![false; num_fields];
-
-        // Process all fields present in this record
-        for (key, value) in obj.iter() {
-            if let Some(&idx) = field_indices.get(key.as_str()) {
-                field_present[idx] = true;
-                append_value_optimized(&mut builders[idx], data_types[idx], value)?;
-            }
-        }
-
-        // Append null for missing fields (using bitmap check)
-        for (idx, &is_present) in field_present.iter().enumerate() {
-            if !is_present {
-                append_null_optimized(&mut builders[idx], data_types[idx]);
+        let obj = record
+            .as_object()
+            .ok_or_else(|| ArrowError::SchemaError("Expected JSON object".to_string()))?;
+        for key in obj.keys() {
+            if let Some(&idx) = field_indices.get(key.as_str())
+                && slot_of_field[idx] == usize::MAX
+            {
+                slot_of_field[idx] = slots.len();
+                slots.push(idx);
             }
         }
     }
 
-    // Build final RecordBatch
+    let mut builders: Vec<Box<dyn ArrayBuilder>> = slots
+        .iter()
+        .map(|&idx| make_builder(schema.field(idx).data_type(), records_len))
+        .collect();
+    let data_types: Vec<&DataType> = slots
+        .iter()
+        .map(|&idx| schema.field(idx).data_type())
+        .collect();
+
+    // PASS 2: append values per row; nulls only for the batch-present
+    // fields the row lacks (row_seen is reused, not reallocated per row).
+    let mut row_seen = vec![false; slots.len()];
+    for record in data.iter() {
+        let obj = record
+            .as_object()
+            .expect("validated as JSON objects in pass 1");
+        row_seen.fill(false);
+        for (key, value) in obj.iter() {
+            if let Some(&idx) = field_indices.get(key.as_str()) {
+                let slot = slot_of_field[idx];
+                row_seen[slot] = true;
+                append_value_optimized(&mut builders[slot], data_types[slot], value)?;
+            }
+        }
+        for (slot, seen) in row_seen.iter().enumerate() {
+            if !seen {
+                append_null_optimized(&mut builders[slot], data_types[slot]);
+            }
+        }
+    }
+
+    // Assemble in schema order: present fields from their builders, absent
+    // fields as null columns SHARED per data type — one allocation per
+    // (type, len), Arc-cloned across every absent column of that type.
+    let built: Vec<ArrayRef> = builders
+        .into_iter()
+        .map(|mut builder| builder.finish())
+        .collect();
+    let mut null_cache: HashMap<&DataType, ArrayRef> = HashMap::new();
+    let mut cols: Vec<ArrayRef> = Vec::with_capacity(num_fields);
+    for (idx, field) in schema.fields().iter().enumerate() {
+        let slot = slot_of_field[idx];
+        if slot != usize::MAX {
+            cols.push(Arc::clone(&built[slot]));
+        } else {
+            let col = null_cache
+                .entry(field.data_type())
+                .or_insert_with(|| new_null_array(field.data_type(), records_len));
+            cols.push(Arc::clone(col));
+        }
+    }
+
+    RecordBatch::try_new(schema.clone(), cols)
+}
+
+/// [`convert_json_to_record_batch`]'s narrow twin: the returned batch's
+/// schema is the PROJECTION of `schema` onto the fields this data actually
+/// carries (stream-schema field order and types; `_timestamp` always kept
+/// when the stream schema has it). Wide union schemas stop being paid per
+/// batch: WAL arrow-IPC bytes, memtable footprint and downstream reads all
+/// scale with the data, not the stream. The full-width variant stays for
+/// callers that need schema-stable output (enrichment tables).
+pub fn convert_json_to_record_batch_present(
+    schema: &Arc<Schema>,
+    data: &[Arc<serde_json::Value>],
+) -> Result<RecordBatch, ArrowError> {
+    let num_fields = schema.fields().len();
+
+    let field_indices: HashMap<&str, usize> = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(idx, f)| (f.name().as_str(), idx))
+        .collect();
+
+    // present schema indices, in stream-schema order
+    let mut present = vec![false; num_fields];
+    if let Some(&ts_idx) = field_indices.get(TIMESTAMP_COL_NAME) {
+        present[ts_idx] = true; // batch identity column, always kept
+    }
+    for record in data.iter() {
+        let obj = record
+            .as_object()
+            .ok_or_else(|| ArrowError::SchemaError("Expected JSON object".to_string()))?;
+        for key in obj.keys() {
+            if let Some(&idx) = field_indices.get(key.as_str()) {
+                present[idx] = true;
+            }
+        }
+    }
+    let narrow_fields: Vec<usize> = (0..num_fields).filter(|&i| present[i]).collect();
+    let narrow_schema = Arc::new(Schema::new(
+        narrow_fields
+            .iter()
+            .map(|&i| schema.field(i).clone())
+            .collect::<Vec<_>>(),
+    ));
+    if data.is_empty() {
+        return Ok(RecordBatch::new_empty(narrow_schema));
+    }
+
+    let records_len = data.len();
+    let mut slot_of_field: Vec<usize> = vec![usize::MAX; num_fields];
+    for (slot, &idx) in narrow_fields.iter().enumerate() {
+        slot_of_field[idx] = slot;
+    }
+    let mut builders: Vec<Box<dyn ArrayBuilder>> = narrow_fields
+        .iter()
+        .map(|&idx| make_builder(schema.field(idx).data_type(), records_len))
+        .collect();
+    let data_types: Vec<&DataType> = narrow_fields
+        .iter()
+        .map(|&idx| schema.field(idx).data_type())
+        .collect();
+
+    let mut row_seen = vec![false; narrow_fields.len()];
+    for record in data.iter() {
+        let obj = record
+            .as_object()
+            .expect("validated as JSON objects in pass 1");
+        row_seen.fill(false);
+        for (key, value) in obj.iter() {
+            if let Some(&idx) = field_indices.get(key.as_str()) {
+                let slot = slot_of_field[idx];
+                if slot != usize::MAX {
+                    row_seen[slot] = true;
+                    append_value_optimized(&mut builders[slot], data_types[slot], value)?;
+                }
+            }
+        }
+        for (slot, seen) in row_seen.iter().enumerate() {
+            if !seen {
+                append_null_optimized(&mut builders[slot], data_types[slot]);
+            }
+        }
+    }
+
     let cols: Vec<ArrayRef> = builders
         .into_iter()
         .map(|mut builder| builder.finish())
         .collect();
-
-    RecordBatch::try_new(schema.clone(), cols)
+    RecordBatch::try_new(narrow_schema, cols)
 }
 
 /// Fast append value with zero-copy optimization and inline type conversion
@@ -2257,6 +2376,126 @@ mod test {
         let data = vec![Arc::new(serde_json::json!([1, 2, 3]))];
         let result = convert_json_to_record_batch(&schema, &data);
         assert!(result.is_err());
+    }
+
+    /// The narrow twin returns a projected schema: only present fields (in
+    /// stream-schema order), `_timestamp` always kept, values identical to
+    /// the full-width conversion's present columns.
+    #[test]
+    fn test_convert_json_present_projects_schema() {
+        let mut fields = vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("b_str", DataType::Utf8, true),
+            Field::new("a_int", DataType::Int64, true),
+        ];
+        for i in 0..500 {
+            fields.push(Field::new(format!("absent_{i}"), DataType::Utf8, true));
+        }
+        let schema = Arc::new(Schema::new(fields));
+        let data = vec![
+            Arc::new(serde_json::json!({"_timestamp": 1, "a_int": 10})),
+            Arc::new(serde_json::json!({"_timestamp": 2, "b_str": "x", "a_int": 20})),
+        ];
+        let narrow = convert_json_to_record_batch_present(&schema, &data).unwrap();
+        // projection keeps stream-schema order: _timestamp, b_str, a_int
+        assert_eq!(
+            narrow
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect::<Vec<_>>(),
+            vec!["_timestamp", "b_str", "a_int"]
+        );
+        assert_eq!(narrow.num_rows(), 2);
+        let wide = convert_json_to_record_batch(&schema, &data).unwrap();
+        for name in ["_timestamp", "b_str", "a_int"] {
+            assert_eq!(
+                narrow.column_by_name(name).unwrap(),
+                wide.column_by_name(name).unwrap(),
+                "column {name} must match the full conversion"
+            );
+        }
+        // a row lacking non-nullable _timestamp errors — same contract as
+        // the full-width conversion (production canonicalization mints it)
+        let data2 = vec![Arc::new(serde_json::json!({"b_str": "y"}))];
+        assert!(convert_json_to_record_batch_present(&schema, &data2).is_err());
+        assert!(convert_json_to_record_batch(&schema, &data2).is_err());
+        // empty data: empty narrow batch, just _timestamp
+        let narrow3 = convert_json_to_record_batch_present(&schema, &[]).unwrap();
+        assert_eq!(narrow3.num_rows(), 0);
+        assert_eq!(narrow3.schema().fields().len(), 1);
+    }
+
+    /// Wide union schema, narrow data — the prod ingest shape (thousands of
+    /// schema fields, dozens present per batch). Present fields keep their
+    /// values and per-row nulls; absent fields come back as all-null columns
+    /// that SHARE one buffer per data type instead of allocating per column.
+    #[test]
+    fn test_convert_json_wide_schema_only_builds_present_fields() {
+        let mut fields = vec![
+            Field::new("present_str", DataType::Utf8, true),
+            Field::new("present_int", DataType::Int64, true),
+            Field::new("sparse_str", DataType::Utf8, true),
+        ];
+        for i in 0..2000 {
+            fields.push(Field::new(
+                format!("absent_{i}"),
+                if i % 3 == 0 {
+                    DataType::Int64
+                } else {
+                    DataType::Utf8
+                },
+                true,
+            ));
+        }
+        let schema = Arc::new(Schema::new(fields));
+        let data = vec![
+            Arc::new(serde_json::json!({"present_str": "a", "present_int": 1, "sparse_str": "x"})),
+            Arc::new(serde_json::json!({"present_str": "b", "present_int": 2})),
+            Arc::new(serde_json::json!({"present_str": "c", "present_int": 3, "ignored_key": "z"})),
+        ];
+        let batch = convert_json_to_record_batch(&schema, &data).unwrap();
+        assert_eq!(batch.num_rows(), 3);
+        assert_eq!(batch.num_columns(), 2003);
+
+        let strs = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(
+            strs.iter().collect::<Vec<_>>(),
+            vec![Some("a"), Some("b"), Some("c")]
+        );
+        let ints = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(ints.values(), &[1, 2, 3]);
+        // sparse field: value where present, null where absent
+        let sparse = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(
+            sparse.iter().collect::<Vec<_>>(),
+            vec![Some("x"), None, None]
+        );
+
+        // absent columns are fully null and shared per type
+        let absent_a = batch.column_by_name("absent_1").unwrap();
+        let absent_b = batch.column_by_name("absent_2").unwrap();
+        assert_eq!(absent_a.null_count(), 3);
+        assert!(
+            Arc::ptr_eq(absent_a, absent_b),
+            "same-type absent columns must share one null array"
+        );
+        let absent_int = batch.column_by_name("absent_0").unwrap();
+        assert_eq!(absent_int.data_type(), &DataType::Int64);
+        assert_eq!(absent_int.null_count(), 3);
     }
 
     #[test]

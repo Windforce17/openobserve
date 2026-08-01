@@ -48,6 +48,73 @@ use crate::errors::OpenDirSnafu;
 
 pub(crate) type ReadRecordBatchEntry = (Arc<Schema>, Vec<Arc<entry::RecordBatchEntry>>);
 
+/// Crash-safety primitives shared by the local persist chain.
+///
+/// Turning a memtable into a queryable parquet file is
+/// `.par write -> .lock write -> .wal delete -> .par rename -> .lock delete`
+/// (`immutable::commit_staged_files`). Every step destroys the record the
+/// previous step relied on, so each one must be on stable storage before the
+/// next runs: otherwise a power loss can leave a deleted WAL file next to a
+/// parquet file that never reached the disk.
+pub(crate) mod durability {
+    use std::{
+        io,
+        path::{Path, PathBuf},
+    };
+
+    use tokio::{
+        fs::{File, OpenOptions},
+        io::AsyncWriteExt,
+    };
+
+    /// Write `data` to `path`, returning only once the bytes are on stable
+    /// storage. `tokio::fs::File` buffers writes and its `Drop` neither flushes
+    /// nor syncs, so both calls are required.
+    ///
+    /// NOT atomic: `open(O_CREAT|O_TRUNC)` survives a crash on its own, so
+    /// `path` can be observed empty or partial until the fsync lands. Callers
+    /// whose readers treat the file's *existence* as a fact (the .lock files)
+    /// must use [`write_file_atomic_durable`] instead.
+    pub(crate) async fn write_file_durable(path: &Path, data: &[u8]) -> io::Result<()> {
+        let mut f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)
+            .await?;
+        f.write_all(data).await?;
+        f.flush().await?;
+        f.sync_all().await
+    }
+
+    /// Write `data` so that `path` existing implies its content is complete
+    /// and durable: the bytes are written and fsynced under a `.tmp` sibling
+    /// name first, then renamed over `path`. rename(2) is atomic, so a crash
+    /// at any point leaves either the old state or the full new content at
+    /// `path`, never a truncated one. The rename itself is only durable once
+    /// the caller fsyncs the parent directory; until then the worst case is
+    /// that `path` reverts to its previous state, which is still all-or-none.
+    pub(crate) async fn write_file_atomic_durable(path: &Path, data: &[u8]) -> io::Result<()> {
+        let mut tmp_name = path.as_os_str().to_owned();
+        tmp_name.push(".tmp");
+        let tmp_path = PathBuf::from(tmp_name);
+        write_file_durable(&tmp_path, data).await?;
+        tokio::fs::rename(&tmp_path, path).await
+    }
+
+    /// fsync a directory so entries created or renamed inside it survive a
+    /// power loss: syncing a file makes its contents durable, not the link that
+    /// names it.
+    pub(crate) async fn fsync_dir(dir: &Path) -> io::Result<()> {
+        // POSIX only: Windows cannot open a directory as a file and has no
+        // equivalent call, so the guarantee is degraded there, not faked.
+        if cfg!(not(unix)) {
+            return Ok(());
+        }
+        File::open(dir).await?.sync_all().await
+    }
+}
+
 pub static WAL_PARQUET_METADATA: Lazy<RwAHashMap<String, config::meta::stream::FileMeta>> =
     Lazy::new(Default::default);
 
@@ -59,6 +126,19 @@ pub enum WriterSignal {
     Rotate,
     Close,
 }
+
+/// One message on a writer's queue: the signal, its payload, the per-request
+/// fsync flag, and -- for `Produce` sent from `write_batch` in queue mode --
+/// the channel that carries the write's real outcome back to the ingest
+/// request. Without it an enqueue would be indistinguishable from a durable
+/// write and consumer failures could only be logged, so the ack the client
+/// gets would be a lie.
+pub(crate) type WriterQueueItem = (
+    WriterSignal,
+    ProcessedBatch,
+    bool,
+    Option<tokio::sync::oneshot::Sender<errors::Result<()>>>,
+);
 
 /// Pre-processed write batch ready for IO operations
 ///
@@ -208,6 +288,86 @@ pub fn is_wal_file(file: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("oo-ingester-lib-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn test_write_file_durable_writes_and_truncates() {
+        let dir = test_dir("durable-write");
+        let path = dir.join("a.lock");
+        durability::write_file_durable(&path, b"first-and-longer")
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"first-and-longer");
+        // a retry rewrites the same file: no leftover tail from the longer body
+        durability::write_file_durable(&path, b"second")
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_write_file_durable_propagates_error() {
+        let dir = test_dir("durable-write-err");
+        let path = dir.join("missing").join("a.lock");
+        let err = durability::write_file_durable(&path, b"x")
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_write_file_atomic_durable_leaves_no_tmp_and_overwrites() {
+        let dir = test_dir("atomic-write");
+        let path = dir.join("a.lock");
+        durability::write_file_atomic_durable(&path, b"first-and-longer")
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"first-and-longer");
+        // the temp name must not survive a successful write
+        assert!(!dir.join("a.lock.tmp").exists());
+        // a retry replaces the whole file, no leftover tail
+        durability::write_file_atomic_durable(&path, b"second")
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_write_file_atomic_durable_failure_leaves_target_absent() {
+        let dir = test_dir("atomic-write-err");
+        let path = dir.join("missing").join("a.lock");
+        let err = durability::write_file_atomic_durable(&path, b"x")
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        // the crash-window property: a failed write never publishes the name
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_fsync_dir_existing_and_missing() {
+        let dir = test_dir("fsync-dir");
+        assert!(durability::fsync_dir(&dir).await.is_ok());
+        let missing = dir.join("nope");
+        let err = durability::fsync_dir(&missing).await;
+        if cfg!(unix) {
+            assert_eq!(err.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+        } else {
+            assert!(err.is_ok());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn test_is_wal_file_wal_file() {

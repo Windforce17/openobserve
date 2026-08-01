@@ -788,10 +788,10 @@ describe("FieldList", () => {
     });
   });
 
-  // ── User Defined Schemas ────────────────────────────────────────────
+  // ── Grouped stream fields ────────────────────────────────────────────
 
-  describe("User Defined Schemas", () => {
-    it("should render timestamp and all-fields for defined schemas", async () => {
+  describe("Grouped stream fields", () => {
+    it("renders every schema field of a stream group", async () => {
       const mock = defaultMockReturn();
       mock.dashboardPanelData.meta.streamFields.groupedFields = [
         {
@@ -801,9 +801,7 @@ describe("FieldList", () => {
             { name: "field_a", type: "Utf8" },
             { name: "field_b", type: "Int64" },
           ],
-          settings: {
-            defined_schema_fields: ["field_a"],
-          },
+          settings: {},
         },
       ];
       mockReturn = mock;
@@ -811,18 +809,15 @@ describe("FieldList", () => {
       wrapper = mountComponent();
       await flushPromises();
 
-      // _timestamp and _all should be rendered along with defined schema fields
-      const timestampRow = wrapper.find(
-        '[data-test="o-field-list-row-_timestamp"]',
-      );
-      const allRow = wrapper.find('[data-test="o-field-list-row-_all"]');
       const fieldARow = wrapper.find(
         '[data-test="o-field-list-row-field_a"]',
       );
+      const fieldBRow = wrapper.find(
+        '[data-test="o-field-list-row-field_b"]',
+      );
 
-      expect(timestampRow.exists()).toBe(true);
-      expect(allRow.exists()).toBe(true);
       expect(fieldARow.exists()).toBe(true);
+      expect(fieldBRow.exists()).toBe(true);
     });
   });
   // ── PromQL query on a stream change ──────────────────────────────────

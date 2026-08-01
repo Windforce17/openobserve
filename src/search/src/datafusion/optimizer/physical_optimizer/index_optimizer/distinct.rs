@@ -50,9 +50,25 @@ use crate::datafusion::optimizer::physical_optimizer::{
 ///                 FilterExec: _timestamp@0 >= 17296550822151 AND _timestamp@0 < 172965508891538700, projection=[kubernetes_namespace_name@1]
 ///                   CooperativeExec
 ///                     NewEmptyExec: name="default", projection=["_timestamp", "kubernetes_namespace_name"]
-pub fn is_simple_distinct(plan: Arc<dyn ExecutionPlan>, index_fields: HashSet<String>) -> Option<IndexOptimizeMode> {
-    let mut visitor = SimpleDistinctVisitor::new(index_fields);
+///
+/// Field eligibility: the group field must be in `index_fields` (the stream's
+/// column-store fields, servable per file from the docs columns under any
+/// condition), or in `unfiltered_index_fields` (term-indexed string fields,
+/// served from the term dictionary alone) — the latter only when the query's
+/// sole filter is the `_timestamp` range, so the str_match-filtered variant
+/// stays column-store-only.
+pub fn is_simple_distinct(
+    plan: Arc<dyn ExecutionPlan>,
+    index_fields: HashSet<String>,
+    unfiltered_index_fields: HashSet<String>,
+) -> Option<IndexOptimizeMode> {
+    let mut visitor = SimpleDistinctVisitor::new(index_fields, unfiltered_index_fields);
     let _ = plan.visit(&mut visitor);
+    // dictionary-only fields require an unfiltered query: every filter in
+    // the plan must be a bare `_timestamp` range
+    if visitor.requires_no_filter && visitor.has_non_ts_filter {
+        return None;
+    }
     if let Some((field, fetch, ascend)) = visitor.simple_distinct {
             Some(IndexOptimizeMode::SimpleDistinct(
                     field,
@@ -67,13 +83,22 @@ pub fn is_simple_distinct(plan: Arc<dyn ExecutionPlan>, index_fields: HashSet<St
 struct SimpleDistinctVisitor {
     pub simple_distinct: Option<(String, usize, bool)>,
     pub index_fields: HashSet<String>,
+    unfiltered_index_fields: HashSet<String>,
+    /// the group field is dictionary-only eligible (not column-store): the
+    /// query must carry no condition
+    requires_no_filter: bool,
+    /// the plan contains a filter beyond the `_timestamp` range
+    has_non_ts_filter: bool,
 }
 
 impl SimpleDistinctVisitor {
-    pub fn new(index_fields: HashSet<String>) -> Self {
+    pub fn new(index_fields: HashSet<String>, unfiltered_index_fields: HashSet<String>) -> Self {
         Self {
             simple_distinct: None,
             index_fields,
+            unfiltered_index_fields,
+            requires_no_filter: false,
+            has_non_ts_filter: false,
         }
     }
 }
@@ -107,7 +132,15 @@ impl<'n> TreeNodeVisitor<'n> for SimpleDistinctVisitor {
                 && let Some((group_expr, _)) = aggregate.group_expr().expr().first()
             {
                 let column_name = get_column_name(group_expr);
-                if is_column(group_expr) && self.index_fields.contains(column_name) {
+                let column_store = self.index_fields.contains(column_name);
+                if is_column(group_expr)
+                    && (column_store || self.unfiltered_index_fields.contains(column_name))
+                {
+                    if !column_store {
+                        // dictionary-only field: validated post-visit
+                        // against the plan's filters
+                        self.requires_no_filter = true;
+                    }
                     // Update the simple_distinct with the correct field name
                     if let Some(simple_distinct) = &mut self.simple_distinct {
                         self.simple_distinct = Some((
@@ -144,6 +177,9 @@ impl<'n> TreeNodeVisitor<'n> for SimpleDistinctVisitor {
                 && let Some(column_name) = is_simple_str_match(exprs[0])
                 && self.index_fields.contains(&column_name)
             {
+                // a real condition: dictionary-only group fields are out
+                // (checked post-visit)
+                self.has_non_ts_filter = true;
                 return Ok(TreeNodeRecursion::Continue);
             }
             // If projection doesn't have exactly 2 expressions, stop visiting
@@ -247,14 +283,90 @@ mod tests {
             let physical_plan = ctx.state().create_physical_plan(&plan).await.unwrap();
 
             let index_fields = HashSet::from(["name".to_string(), "id".to_string()]);
-            assert_eq!(expected, is_simple_distinct(physical_plan, index_fields));
+            assert_eq!(
+                expected,
+                is_simple_distinct(physical_plan, index_fields, HashSet::new())
+            );
+        }
+    }
+
+    /// Pilot fix B: term-indexed (non-column-store) fields are eligible only
+    /// when the query's sole filter is the `_timestamp` range.
+    #[tokio::test]
+    async fn test_is_simple_distinct_unfiltered_term_field() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("status", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(StringArray::from(vec!["openobserve"])),
+                Arc::new(StringArray::from(vec!["success"])),
+            ],
+        )
+        .unwrap();
+        let ctx = SessionContext::new();
+        let provider = MemTable::try_new(schema, vec![vec![batch.clone()], vec![batch]]).unwrap();
+        ctx.register_table("t", Arc::new(provider)).unwrap();
+        ctx.register_udf(str_match_udf::STR_MATCH_UDF.clone());
+
+        // `status` is column-store, `name` only term-indexed
+        let cases = vec![
+            // no filter at all: the term field is eligible
+            (
+                "select distinct name from t order by name limit 10",
+                Some(IndexOptimizeMode::SimpleDistinct(
+                    "name".to_string(),
+                    10,
+                    true,
+                )),
+            ),
+            // a bare `_timestamp` range still counts as unfiltered
+            (
+                "select name from t where _timestamp >= 1 and _timestamp < 100 group by name order by name asc limit 10",
+                Some(IndexOptimizeMode::SimpleDistinct(
+                    "name".to_string(),
+                    10,
+                    true,
+                )),
+            ),
+            // a real condition disqualifies the term-only field ...
+            (
+                "select name from t where str_match(name, 'a') and _timestamp >= 1 and _timestamp < 100 group by name order by name asc limit 10",
+                None,
+            ),
+            // ... but not a column-store field (existing behavior)
+            (
+                "select status from t where str_match(status, 'a') and _timestamp >= 1 and _timestamp < 100 group by status order by status asc limit 10",
+                Some(IndexOptimizeMode::SimpleDistinct(
+                    "status".to_string(),
+                    10,
+                    true,
+                )),
+            ),
+        ];
+
+        for (sql, expected) in cases {
+            let plan = ctx.state().create_logical_plan(sql).await.unwrap();
+            let physical_plan = ctx.state().create_physical_plan(&plan).await.unwrap();
+
+            let index_fields = HashSet::from(["status".to_string()]);
+            let unfiltered_index_fields = HashSet::from(["name".to_string()]);
+            assert_eq!(
+                expected,
+                is_simple_distinct(physical_plan, index_fields, unfiltered_index_fields),
+                "Failed for SQL: {sql}"
+            );
         }
     }
 
     #[test]
     fn test_simple_distinct_visitor_initial_state() {
         let fields = HashSet::from(["col".to_string()]);
-        let visitor = SimpleDistinctVisitor::new(fields.clone());
+        let visitor = SimpleDistinctVisitor::new(fields.clone(), HashSet::new());
         assert!(visitor.simple_distinct.is_none());
         assert_eq!(visitor.index_fields, fields);
     }
@@ -262,7 +374,7 @@ mod tests {
     #[test]
     fn test_simple_distinct_visitor_empty_fields() {
         let fields: HashSet<String> = HashSet::new();
-        let visitor = SimpleDistinctVisitor::new(fields);
+        let visitor = SimpleDistinctVisitor::new(fields, HashSet::new());
         assert!(visitor.simple_distinct.is_none());
         assert!(visitor.index_fields.is_empty());
     }
@@ -278,6 +390,6 @@ mod tests {
         let plan: Arc<dyn datafusion::physical_plan::ExecutionPlan> =
             Arc::new(EmptyExec::new(schema));
         let index_fields = HashSet::from(["a".to_string()]);
-        assert!(is_simple_distinct(plan, index_fields).is_none());
+        assert!(is_simple_distinct(plan, index_fields, HashSet::new()).is_none());
     }
 }

@@ -32,7 +32,7 @@ use config::{
 use hashbrown::HashSet;
 use infra::runtime::WAL_RUNTIME;
 use snafu::ResultExt;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{RwLock, mpsc, oneshot};
 use wal::{Writer as WalWriter, build_file_path};
 
 use crate::{
@@ -61,7 +61,7 @@ pub struct Writer {
     memtable: Arc<RwLock<MemTable>>,
     next_seq: AtomicU64,
     created_at: AtomicI64,
-    write_queue: Arc<mpsc::Sender<(WriterSignal, crate::ProcessedBatch, bool)>>,
+    write_queue: Arc<mpsc::Sender<crate::WriterQueueItem>>,
 }
 
 // check total memtable size
@@ -249,7 +249,12 @@ pub async fn check_ttl() -> Result<()> {
         for r in w.values() {
             if let Err(e) = r
                 .write_queue
-                .send((WriterSignal::Rotate, crate::ProcessedBatch::empty(), false))
+                .send((
+                    WriterSignal::Rotate,
+                    crate::ProcessedBatch::empty(),
+                    false,
+                    None,
+                ))
                 .await
             {
                 log::error!("[INGESTER:MEM:{}] writer queue rotate error: {e}", r.idx);
@@ -344,23 +349,47 @@ impl Writer {
 
     async fn consume_loop(
         writer: Arc<Writer>,
-        mut rx: mpsc::Receiver<(WriterSignal, crate::ProcessedBatch, bool)>,
+        mut rx: mpsc::Receiver<crate::WriterQueueItem>,
         idx: usize,
     ) {
         let mut total: usize = 0;
         loop {
             match rx.recv().await {
                 None => break,
-                Some((sign, batch, fsync)) => match sign {
+                Some((sign, batch, fsync, ack)) => match sign {
                     WriterSignal::Close => break,
                     WriterSignal::Rotate => {
-                        if let Err(e) = writer.rotate(0, 0).await {
+                        let ret = writer.rotate(0, 0).await;
+                        if let Err(e) = &ret {
                             log::error!("[INGESTER:MEM:{idx}] writer rotate error: {e}");
+                        }
+                        if let Some(ack) = ack {
+                            let _ = ack.send(ret);
                         }
                     }
                     WriterSignal::Produce => {
-                        if let Err(e) = writer.consume_processed(batch, fsync).await {
-                            log::error!("[INGESTER:MEM:{idx}] writer consume batch error: {e}");
+                        // the outcome belongs to whoever acks the client: with
+                        // an ack channel the error travels back to write_batch
+                        // (and from there to the ingest response); only a
+                        // caller that vanished leaves logging as the fallback
+                        let ret = writer.consume_processed(batch, fsync).await;
+                        match ack {
+                            Some(ack) => {
+                                if let Err(ret) = ack.send(ret)
+                                    && let Err(e) = ret
+                                {
+                                    log::error!(
+                                        "[INGESTER:MEM:{idx}] writer consume batch error (ack receiver dropped): {e}"
+                                    );
+                                }
+                            }
+                            None => {
+                                if let Err(e) = ret {
+                                    log::error!(
+                                        "[INGESTER:MEM:{idx}] writer consume batch error: {e}"
+                                    );
+                                }
+                            }
                         }
                     }
                 },
@@ -410,11 +439,20 @@ impl Writer {
             return self.consume_processed(processed_batch, fsync).await;
         }
 
-        if cfg.common.wal_write_queue_full_reject {
-            if let Err(e) =
-                self.write_queue
-                    .try_send((WriterSignal::Produce, processed_batch, fsync))
-            {
+        self.enqueue_and_wait(processed_batch, fsync).await
+    }
+
+    /// Queue-mode write: hand the batch to the consumer and wait for the
+    /// write's real outcome. Returning at enqueue would silently downgrade the
+    /// ack-after-durable-write invariant to ack-after-enqueue -- the client
+    /// would get a 200 for a batch a consumer failure then only logged. The
+    /// queue still smooths bursts across requests; each request just does not
+    /// count as done until its own write is.
+    async fn enqueue_and_wait(&self, batch: crate::ProcessedBatch, fsync: bool) -> Result<()> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        let item = (WriterSignal::Produce, batch, fsync, Some(ack_tx));
+        if get_config().common.wal_write_queue_full_reject {
+            if let Err(e) = self.write_queue.try_send(item) {
                 log::error!(
                     "[INGESTER:MEM:{}] write queue full, reject write: {}",
                     self.idx,
@@ -425,13 +463,28 @@ impl Writer {
                 });
             }
         } else {
-            self.write_queue
-                .send((WriterSignal::Produce, processed_batch, fsync))
-                .await
-                .context(TokioMpscSendEntriesSnafu)?;
+            self.write_queue.send(item).await.map_err(|e| {
+                Error::ExternalError {
+                    source: Box::new(std::io::Error::other(format!(
+                        "[INGESTER:MEM:{}] writer queue send failed, the write was not performed: {e}",
+                        self.idx
+                    ))),
+                }
+            })?;
         }
-
-        Ok(())
+        match ack_rx.await {
+            Ok(ret) => ret,
+            // the consumer dropped the ack without reporting (panic or
+            // shutdown mid-write): the write may or may not have happened, so
+            // it must not be acked as success
+            Err(_) => Err(Error::ExternalError {
+                source: Box::new(std::io::Error::other(format!(
+                    "[INGESTER:MEM:{}] writer queue dropped the write before reporting completion, \
+                     the write may not be durable",
+                    self.idx
+                ))),
+            }),
+        }
     }
 
     fn preprocess_batch(&self, mut entries: Vec<Entry>) -> Result<crate::ProcessedBatch> {
@@ -593,7 +646,14 @@ impl Writer {
             None,
         )
         .context(WalSnafu)?;
-        wal.sync().context(WalSnafu)?; // sync wal before rotation
+        // the rotated file is the only durable record of the memtable rotated
+        // with it until the persist chain replaces it with parquet, so it is
+        // fsynced here whatever ZO_WAL_FSYNC_DISABLED says. The fsync runs on
+        // a blocking thread: the wal lock stays held (nothing appends
+        // meanwhile, the swap still happens strictly after the bytes are
+        // durable), but the async worker parks on an await instead of
+        // stalling in the syscall for the whole flush.
+        sync_wal_off_thread(&mut wal).await?;
         let old_wal = std::mem::replace(&mut *wal, new_wal);
         drop(wal);
 
@@ -626,7 +686,12 @@ impl Writer {
         // wait for all messages to be processed
         if let Err(e) = self
             .write_queue
-            .send((WriterSignal::Close, crate::ProcessedBatch::empty(), true))
+            .send((
+                WriterSignal::Close,
+                crate::ProcessedBatch::empty(),
+                true,
+                None,
+            ))
             .await
         {
             log::error!("[INGESTER:MEM:{}] close writer error: {}", self.idx, e);
@@ -634,9 +699,10 @@ impl Writer {
         self.write_queue.closed().await;
         log::info!("[INGESTER:MEM:{}] writer queue closed", self.idx);
 
-        // rotation wal
+        // rotation wal: same as rotate(), the memtable handed to IMMUTABLES
+        // below is only recoverable from this file until it is persisted
         let mut wal = self.wal.write().await;
-        wal.sync().context(WalSnafu)?;
+        sync_wal_off_thread(&mut wal).await?;
         let path = wal.path().clone();
         drop(wal);
 
@@ -687,6 +753,25 @@ impl Writer {
     }
 }
 
+/// Durable-sync a wal file without stalling the async worker: the buffered
+/// bytes are flushed inline (cheap, page-cache only), then the blocking
+/// `fsync` runs on the blocking pool via a cloned handle to the same open
+/// file. The caller MUST keep holding the wal write lock across the await --
+/// that is what guarantees no byte is appended between the flush and the
+/// fsync, so the durability point is exactly where an inline `sync_all` would
+/// put it. On failure the writer stays marked unsynced and nothing was
+/// swapped, so a retry repeats the whole step.
+async fn sync_wal_off_thread(wal: &mut WalWriter) -> Result<()> {
+    let wal_file = wal.sync_all_split().context(WalSnafu)?;
+    let path = wal.path().clone();
+    tokio::task::spawn_blocking(move || wal_file.sync_all())
+        .await
+        .context(TokioJoinSnafu)?
+        .context(WriteFileSnafu { path })?;
+    wal.confirm_synced();
+    Ok(())
+}
+
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub(crate) struct WriterKey {
     pub(crate) org_id: Arc<str>,
@@ -726,6 +811,116 @@ impl MemorySize for WriterKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("oo-ingester-writer-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn test_sync_wal_off_thread_makes_the_bytes_durable() {
+        let dir = test_dir("sync-durable");
+        let path = dir.join("1.wal");
+        let p: &std::path::Path = path.as_path();
+        let (mut wal, _) = WalWriter::new(p, 0, 4096, None).unwrap();
+        wal.write(b"rotating soon").unwrap();
+
+        sync_wal_off_thread(&mut wal).await.unwrap();
+        let (written, _) = wal.size();
+        assert!(std::fs::metadata(&path).unwrap().len() >= written as u64);
+
+        // repeatable, and the writer keeps accepting writes afterwards
+        wal.write(b"more").unwrap();
+        sync_wal_off_thread(&mut wal).await.unwrap();
+
+        drop(wal);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_sync_wal_off_thread_runs_the_fsync_on_the_blocking_pool() {
+        // single async worker, single blocking thread: if the fsync ran inline
+        // on the worker the first poll below would complete it; queued behind
+        // an occupied blocking pool it must come back Pending instead
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let dir = test_dir("sync-off-thread");
+            let path = dir.join("2.wal");
+            let p: &std::path::Path = path.as_path();
+            let (mut wal, _) = WalWriter::new(p, 0, 4096, None).unwrap();
+            wal.write(b"rotating soon").unwrap();
+
+            // occupy the only blocking thread until released
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let blocker = tokio::task::spawn_blocking(move || {
+                release_rx.recv().unwrap();
+            });
+
+            {
+                let mut sync_fut = std::pin::pin!(sync_wal_off_thread(&mut wal));
+                let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+                assert!(
+                    std::future::Future::poll(sync_fut.as_mut(), &mut cx).is_pending(),
+                    "the fsync completed on the async worker: it is not running on the blocking pool"
+                );
+
+                release_tx.send(()).unwrap();
+                blocker.await.unwrap();
+                sync_fut.await.unwrap();
+            }
+
+            drop(wal);
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_and_wait_reports_the_consumer_result() {
+        let writer = Writer::new(0, WriterKey::new_replay("queue-ack-org", "logs"));
+        let wal_path = writer.wal.read().await.path().clone();
+
+        // the ack arrives only after the consumer ran the write; an empty
+        // batch completes with Ok, and that Ok travels back to the caller
+        writer
+            .enqueue_and_wait(crate::ProcessedBatch::empty(), false)
+            .await
+            .unwrap();
+
+        let _ = std::fs::remove_file(&wal_path);
+    }
+
+    #[tokio::test]
+    async fn test_enqueue_and_wait_errors_when_the_queue_is_gone() {
+        let writer = Writer::new(0, WriterKey::new_replay("queue-ack-closed", "logs"));
+        let wal_path = writer.wal.read().await.path().clone();
+
+        // shut the consumer down, then try to enqueue: the caller must get an
+        // error, never a silent Ok for a write nobody performed
+        writer
+            .write_queue
+            .send((
+                WriterSignal::Close,
+                crate::ProcessedBatch::empty(),
+                false,
+                None,
+            ))
+            .await
+            .unwrap();
+        writer.write_queue.closed().await;
+
+        let err = writer
+            .enqueue_and_wait(crate::ProcessedBatch::empty(), false)
+            .await;
+        assert!(err.is_err());
+
+        let _ = std::fs::remove_file(&wal_path);
+    }
 
     #[test]
     fn test_writer_key_new_replay_sets_fields() {

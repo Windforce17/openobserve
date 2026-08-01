@@ -1339,6 +1339,14 @@ pub async fn create_service_account_if_not_exists(email: &str) -> Result<(), any
     Ok(())
 }
 
+/// Serializes every test in this crate that reads or writes the shared
+/// users / org_users / organizations sqlite tables. The set_up() below CLEARS
+/// those tables, so any test in another module touching them concurrently
+/// (e.g. db::user::tests::test_user) hits FOREIGN KEY failures when its org
+/// row is deleted mid-test. Hold the guard for the WHOLE test body.
+#[cfg(test)]
+pub(crate) static USER_TABLES_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[cfg(test)]
 mod tests {
     use config::meta::user::{UserRole, UserType};
@@ -1346,13 +1354,9 @@ mod tests {
         db::{self as infra_db, ORM_CLIENT, connect_to_orm},
         table as infra_table,
     };
-    use tokio::sync::Mutex;
 
     use super::*;
     use crate::common::{infra::config::USERS, meta::user::get_default_user_role};
-
-    // Mutex to ensure test setup is serialized to prevent race conditions
-    static TEST_SETUP_LOCK: tokio::sync::OnceCell<Mutex<()>> = tokio::sync::OnceCell::const_new();
 
     #[test]
     fn test_redact_token_normal() {
@@ -1414,12 +1418,13 @@ mod tests {
         assert_eq!(org.name, "org2");
     }
 
-    async fn set_up() {
-        // Acquire lock to serialize database setup across concurrent tests
-        let lock = TEST_SETUP_LOCK
-            .get_or_init(|| async { Mutex::new(()) })
-            .await;
-        let _guard = lock.lock().await;
+    // Serialize the WHOLE test (setup + body), not just the setup: every test
+    // here clears and re-seeds the shared users/org_users/organizations tables,
+    // so a set_up() running while another test body is in flight deletes the
+    // org row out from under it (FK constraint failures). Callers must bind the
+    // returned guard for the full test: `let _guard = set_up().await;`
+    async fn set_up() -> tokio::sync::MutexGuard<'static, ()> {
+        let guard = super::USER_TABLES_TEST_LOCK.lock().await;
 
         let _ = ORM_CLIENT.get_or_init(connect_to_orm).await;
         // clear the table here as previous tests could have written to it
@@ -1433,9 +1438,15 @@ mod tests {
             .await
             .expect("Failed to create dummy organization");
 
-        // Clear global caches to ensure test isolation
+        // Clear global caches to ensure test isolation (ORGANIZATIONS too:
+        // a stale service-level entry would make check_and_create_org skip
+        // re-inserting the org row this suite just deleted above).
         USERS.clear();
         ORG_USERS.clear();
+        crate::common::infra::config::ORGANIZATIONS
+            .write()
+            .await
+            .clear();
 
         USERS.insert(
             "admin@zo.dev".to_string(),
@@ -1480,29 +1491,30 @@ mod tests {
                 password_ext: Some("root_password_ext_hash".to_string()),
             },
         );
+        guard
     }
 
     #[tokio::test]
     async fn test_list_users() {
-        set_up().await;
+        let _guard = set_up().await;
         assert!(list_users("", "dummy", None, None, false).await.is_ok())
     }
 
     #[tokio::test]
     async fn test_root_user_exists() {
-        set_up().await;
+        let _guard = set_up().await;
         assert!(!root_user_exists().await);
     }
 
     #[tokio::test]
     async fn test_get_user() {
-        set_up().await;
+        let _guard = set_up().await;
         assert!(get_user(Some("dummy"), "admin@zo.dev").await.is_some())
     }
 
     #[tokio::test]
     async fn test_post_user() {
-        set_up().await;
+        let _guard = set_up().await;
 
         let resp = post_user(
             "dummy",
@@ -1526,7 +1538,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_user() {
-        set_up().await;
+        let _guard = set_up().await;
 
         let resp = update_user(
             "dummy",
@@ -1592,7 +1604,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_new_user() {
-        set_up().await;
+        let _guard = set_up().await;
 
         let db_user = DBUser {
             email: "newuser@example.com".to_string(),
@@ -1641,7 +1653,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_user() {
-        set_up().await;
+        let _guard = set_up().await;
 
         let resp = delete_user("nonexistent@example.com").await;
         assert!(resp.is_ok());
@@ -1652,7 +1664,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_root_user_exists_edge_cases() {
-        set_up().await;
+        let _guard = set_up().await;
 
         let exists = root_user_exists().await;
         assert!(!exists);
@@ -1680,7 +1692,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_root_user_if_not_exists() {
-        set_up().await;
+        let _guard = set_up().await;
 
         let user_req = UserRequest {
             email: "root@example.com".to_string(),
@@ -1724,7 +1736,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_post_user_validation() {
-        set_up().await;
+        let _guard = set_up().await;
 
         let invalid_email_req = UserRequest {
             email: "invalid-email".to_string(),
@@ -1783,7 +1795,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_user_validation() {
-        set_up().await;
+        let _guard = set_up().await;
 
         let resp = update_user(
             "dummy",
@@ -1828,7 +1840,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_add_user_to_org_validation() {
-        set_up().await;
+        let _guard = set_up().await;
 
         let resp = add_user_to_org(
             "dummy",

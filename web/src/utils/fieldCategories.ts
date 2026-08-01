@@ -340,13 +340,10 @@ export function applyFieldGrouping(
 export function shouldApplyFieldGrouping(opts: {
   semanticIndex: SemanticIndex | null;
   streamCount: number;
-  udsActive: boolean;
-  udsFieldLimit: number;
   totalSchemaFieldCount: number;
 }): boolean {
   if (!opts.semanticIndex) return false;
   if (opts.streamCount !== 1) return false;
-  if (opts.udsActive) return true;
   return true;
 }
 

@@ -112,10 +112,6 @@ pub enum Error {
     TokioMpscSendError {
         source: tokio::sync::mpsc::error::SendError<PathBuf>,
     },
-    TokioMpscSendEntriesError {
-        source:
-            tokio::sync::mpsc::error::SendError<(crate::WriterSignal, crate::ProcessedBatch, bool)>,
-    },
     #[snafu(display("MemoryTableOverflowError"))]
     MemoryTableOverflowError {},
     #[snafu(display("MemoryCircuitBreakerError"))]

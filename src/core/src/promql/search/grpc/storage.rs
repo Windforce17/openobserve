@@ -32,7 +32,7 @@ use datafusion::{
 use hashbrown::{HashMap, HashSet};
 use infra::{
     cache::file_data,
-    schema::{get_partition_time_level, get_stream_setting_index_fields, unwrap_stream_settings},
+    schema::{get_partition_time_level, get_schema_index_fields, unwrap_stream_settings},
 };
 use itertools::Itertools;
 use promql_parser::label::{MatchOp, Matchers};
@@ -45,7 +45,7 @@ use crate::service::{
         datafusion::exec::register_metrics_table,
         grpc::{
             QueryParams,
-            storage::{cache_files, calc_target_partitions, tantivy_search},
+            storage::{cache_files, calc_target_partitions, vix_search},
         },
         index::{Condition, IndexCondition},
         match_source,
@@ -85,11 +85,11 @@ pub(crate) async fn create_context(
         return Ok(None);
     }
 
-    // get index fields
+    // the vix index term-indexes every string field: index eligibility is the
+    // set of string fields in the stream schema (minus the internal columns)
     let stream_settings = unwrap_stream_settings(&schema);
-    let index_fields = get_stream_setting_index_fields(&stream_settings)
+    let index_fields = get_schema_index_fields(&schema)
         .into_iter()
-        .filter(|field| schema.field_with_name(field).is_ok())
         .collect::<HashSet<_>>();
 
     // get partition time level
@@ -220,23 +220,23 @@ pub(crate) async fn create_context(
         use_inverted_index: true,
     });
 
-    // search tantivy index
+    // search vix inverted index
     let mut idx_took = 0;
     let mut is_add_filter_back = true;
     let (index_condition, is_full_convert) =
         convert_matchers_to_index_condition(&matchers, &schema, &index_fields)?;
     if !index_condition.conditions.is_empty() && cfg.common.inverted_index_enabled {
         (idx_took, is_add_filter_back,..) =
-            tantivy_search(query.clone(), &mut files, Some(index_condition), None)
+            vix_search(query.clone(), &mut files, Some(index_condition), None)
                 .await
                 .map_err(|e| {
                     log::error!(
-                        "[trace_id {trace_id}] promql->search->storage: filter file list by tantivy index error: {e}"
+                        "[trace_id {trace_id}] promql->search->storage: filter file list by vix index error: {e}"
                     );
                     DataFusionError::Execution(e.to_string())
                 })?;
         log::info!(
-            "[trace_id {trace_id}] promql->search->storage: filter file list by tantivy index took: {idx_took} ms, is_add_filter_back: {is_add_filter_back}, is_full_convert: {is_full_convert}",
+            "[trace_id {trace_id}] promql->search->storage: filter file list by vix index took: {idx_took} ms, is_add_filter_back: {is_add_filter_back}, is_full_convert: {is_full_convert}",
         );
     }
     scan_stats.idx_took = idx_took as i64;

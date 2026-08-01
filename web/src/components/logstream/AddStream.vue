@@ -209,10 +209,6 @@ watch(
   },
 );
 
-const isSchemaUDSEnabled = computed(() => {
-  return store.state.zoConfig.user_defined_schemas_enabled;
-});
-
 const filteredStreamTypes = computed(() => {
   //here we can filter out based on isInPipeline prop
   //but for testing purpose we are returning all streamTypes
@@ -295,20 +291,18 @@ const getStreamPayload = (dataRetentionDays: number, rows: any[]) => {
     fields: any[];
     settings: {
       partition_keys: any[];
-      index_fields: any[];
       full_text_search_keys: any[];
+      column_store_fields: any[];
       bloom_filter_fields: any[];
       data_retention?: number;
-      defined_schema_fields: any[];
     }
   } = {
     fields: [],
     settings: {
       partition_keys: [],
-      index_fields: [],
       full_text_search_keys: [],
+      column_store_fields: [],
       bloom_filter_fields: [],
-      defined_schema_fields: [],
     }
   };
 
@@ -341,8 +335,8 @@ const getStreamPayload = (dataRetentionDays: number, rows: any[]) => {
         stream.settings.full_text_search_keys.push(field.name);
       }
 
-      if (index === "secondaryIndexKey") {
-        stream.settings.index_fields.push(field.name);
+      if (index === "columnStoreKey") {
+        stream.settings.column_store_fields.push(field.name);
       }
 
       if (index === "keyPartition") {
@@ -367,15 +361,7 @@ const getStreamPayload = (dataRetentionDays: number, rows: any[]) => {
           },
         });
       }
-
-      if (index === "bloomFilterKey") {
-        stream.settings.bloom_filter_fields.push(field.name);
-      }
     });
-
-    if (isSchemaUDSEnabled.value) {
-      stream.settings.defined_schema_fields.push(field.name);
-    }
   });
 
   return stream;

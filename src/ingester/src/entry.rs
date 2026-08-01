@@ -23,7 +23,9 @@ use arrow_schema::Schema;
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use config::{
     stats::MemorySize,
-    utils::record_batch_ext::{RecordBatchExt, convert_json_to_record_batch},
+    utils::record_batch_ext::{
+        RecordBatchExt, convert_json_to_record_batch, convert_json_to_record_batch_present,
+    },
 };
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
@@ -221,8 +223,17 @@ impl Entry {
         stream_type: Arc<str>,
         schema: Arc<Schema>,
     ) -> Result<Arc<RecordBatchEntry>> {
-        let batch =
-            convert_json_to_record_batch(&schema, &self.data).context(ArrowJsonEncodeSnafu)?;
+        // Narrow mode: the batch schema is the projection onto present
+        // fields — WAL/memtable/persist width scales with the data. Every
+        // downstream path handles per-batch schemas (partition unions them,
+        // persist adapts + drops all-null columns, search adapt_batch pads,
+        // replay round-trips the embedded IPC schema).
+        let batch = if config::get_config().common.wal_narrow_schema {
+            convert_json_to_record_batch_present(&schema, &self.data)
+                .context(ArrowJsonEncodeSnafu)?
+        } else {
+            convert_json_to_record_batch(&schema, &self.data).context(ArrowJsonEncodeSnafu)?
+        };
 
         let arrow_size = batch.size();
         Ok(RecordBatchEntry::new(
@@ -281,56 +292,90 @@ fn pop_time_range(
     min_field: Option<&str>,
     max_field: Option<&str>,
 ) -> (i64, i64) {
-    let mut min_ts = 0;
+    // Honest min fold: a genuine 0 (or negative) stored value must SHOW in
+    // the range instead of being treated as the "unset" sentinel — the old
+    // `min_ts == 0 ⇒ replace` fold reported the smallest NONZERO value, so a
+    // batch carrying a corrupt `_timestamp = 0` row got a healthy-looking
+    // WAL meta while the persisted DATA still held the 0 (the live shape:
+    // meta [t1, t2] vs written data [0, t2]). `(0, 0)` still means "no
+    // derivable range" (empty/all-null column).
+    let mut min_ts: Option<i64> = None;
     let mut max_ts = 0;
     let time_field = config::TIMESTAMP_COL_NAME.to_string();
     let min_field = min_field.unwrap_or(time_field.as_str());
     let max_field = max_field.unwrap_or(time_field.as_str());
     if min_field == max_field {
-        let Some(col) = batch.column_by_name(min_field) else {
+        let Some(col) = time_column_as_i64(batch, min_field) else {
             return (0, 0);
         };
-        let Some(col) = col.as_any().downcast_ref::<Int64Array>() else {
-            return (0, 0);
-        };
-        for v in col.values() {
-            if min_ts == 0 || min_ts > *v {
-                min_ts = *v;
+        // iterate with validity: a NULL slot must not read as 0 and pin the
+        // batch's min_ts to 0 (one zeroed batch poisons the whole persisted
+        // file's range in file_list)
+        for v in col.iter().flatten() {
+            if min_ts.is_none_or(|min| min > v) {
+                min_ts = Some(v);
             }
-            if max_ts < *v {
-                max_ts = *v;
+            if max_ts < v {
+                max_ts = v;
             }
         }
-        return (min_ts, max_ts);
+        return (min_ts.unwrap_or(0), max_ts);
     }
 
     // min_ts
-    let Some(col) = batch.column_by_name(min_field) else {
+    let Some(col) = time_column_as_i64(batch, min_field) else {
         return (0, 0);
     };
-    let Some(col) = col.as_any().downcast_ref::<Int64Array>() else {
-        return (0, 0);
-    };
-    for v in col.values() {
-        if min_ts == 0 || min_ts > *v {
-            min_ts = *v;
+    for v in col.iter().flatten() {
+        if min_ts.is_none_or(|min| min > v) {
+            min_ts = Some(v);
         }
     }
 
     // max_ts
-    let Some(col) = batch.column_by_name(max_field) else {
+    let Some(col) = time_column_as_i64(batch, max_field) else {
         return (0, 0);
     };
-    let Some(col) = col.as_any().downcast_ref::<Int64Array>() else {
-        return (0, 0);
-    };
-    for v in col.values() {
-        if max_ts < *v {
-            max_ts = *v;
+    for v in col.iter().flatten() {
+        if max_ts < v {
+            max_ts = v;
         }
     }
 
-    (min_ts, max_ts)
+    (min_ts.unwrap_or(0), max_ts)
+}
+
+/// The named timestamp column as `Int64`, casting when the batch stores it
+/// under another type (arrow-IPC replayed entries and schema drift have
+/// produced non-`Int64` timestamp columns; the old silent `(0, 0)` on a
+/// failed downcast is exactly what wrote min_ts/max_ts = 0 into file_list).
+/// `None` — with a WARN — only when the column is missing or genuinely
+/// uncastable.
+fn time_column_as_i64(batch: &RecordBatch, name: &str) -> Option<Int64Array> {
+    let Some(col) = batch.column_by_name(name) else {
+        if batch.num_rows() > 0 {
+            log::warn!(
+                "time range of a {}-row batch is unknown: no {name:?} column",
+                batch.num_rows()
+            );
+        }
+        return None;
+    };
+    if let Some(col) = col.as_any().downcast_ref::<Int64Array>() {
+        return Some(col.clone());
+    }
+    match arrow::compute::cast(col, &arrow_schema::DataType::Int64) {
+        Ok(cast) => cast.as_any().downcast_ref::<Int64Array>().cloned(),
+        Err(e) => {
+            log::warn!(
+                "time range of a {}-row batch is unknown: {name:?} column of type {:?} does not \
+                 cast to Int64: {e}",
+                batch.num_rows(),
+                col.data_type()
+            );
+            None
+        }
+    }
 }
 
 #[derive(Default)]
@@ -671,5 +716,85 @@ mod tests {
         let (min_ts, max_ts) = pop_time_range(&batch, Some("ts_min"), Some("ts_max"));
         assert_eq!(min_ts, 0);
         assert_eq!(max_ts, 0);
+    }
+
+    /// Regression for the live file_list min_ts/max_ts = 0 rows: the range
+    /// derivation must survive NULL slots (validity-aware — a null must not
+    /// read as 0 and pin min_ts) and non-Int64 timestamp columns (cast, not
+    /// a silent `(0, 0)`).
+    #[test]
+    fn test_pop_time_range_null_and_typed_columns() {
+        use arrow_schema::{DataType, Field};
+
+        // NULL slots are skipped, not read as 0
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            config::TIMESTAMP_COL_NAME,
+            DataType::Int64,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![
+                Some(500),
+                None,
+                Some(300),
+                None,
+            ]))],
+        )
+        .unwrap();
+        assert_eq!(pop_time_range(&batch, None, None), (300, 500));
+
+        // a non-Int64 timestamp column casts instead of degrading to (0, 0)
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            config::TIMESTAMP_COL_NAME,
+            DataType::UInt64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(arrow::array::UInt64Array::from(vec![
+                42u64, 7u64, 99u64,
+            ]))],
+        )
+        .unwrap();
+        assert_eq!(pop_time_range(&batch, None, None), (7, 99));
+
+        // a truly uncastable column still degrades to the explicit unknown
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            config::TIMESTAMP_COL_NAME,
+            DataType::Binary,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(arrow::array::BinaryArray::from_vec(vec![b"x"]))],
+        )
+        .unwrap();
+        assert_eq!(pop_time_range(&batch, None, None), (0, 0));
+    }
+
+    /// A genuine stored `_timestamp = 0` must SHOW in the entry's range: the
+    /// old fold used 0 as the "unset" sentinel and reported the smallest
+    /// NONZERO value, hiding the corrupt row behind a healthy-looking WAL
+    /// meta (live shape: meta [t1, t2] while the written data was [0, t2]).
+    #[test]
+    fn test_pop_time_range_zero_value_is_not_hidden() {
+        use arrow_schema::{DataType, Field};
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            config::TIMESTAMP_COL_NAME,
+            DataType::Int64,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![
+                Some(500),
+                Some(0),
+                Some(300),
+            ]))],
+        )
+        .unwrap();
+        assert_eq!(pop_time_range(&batch, None, None), (0, 500));
     }
 }

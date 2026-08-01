@@ -241,16 +241,10 @@ const useDashboardPanelData = (pageKey: string = "dashboard") => {
     },
   );
 
+  // Kept under its historical name (used across the addPanel components);
+  // user-defined schemas no longer exist, so this is always the full stream
+  // field list.
   const selectedStreamFieldsBasedOnUserDefinedSchema = computed(() => {
-    if (
-      store.state.zoConfig.user_defined_schemas_enabled &&
-      dashboardPanelData.meta.stream.userDefinedSchema.length > 0 &&
-      dashboardPanelData.meta.stream.useUserDefinedSchemas ==
-        "user_defined_schema"
-    ) {
-      return dashboardPanelData.meta.stream.userDefinedSchema ?? [];
-    }
-
     return dashboardPanelData.meta.stream.selectedStreamFields ?? [];
   });
 

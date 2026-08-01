@@ -201,12 +201,9 @@ export const getDefaultDashboardPanelData: any = (store: any) => ({
     dateTime: { start_time: "", end_time: "" },
     filterValue: <any>[],
     stream: {
-      hasUserDefinedSchemas: false,
       interestingFieldList: [],
-      userDefinedSchema: [],
       vrlFunctionFieldList: [],
       selectedStreamFields: [],
-      useUserDefinedSchemas: "user_defined_schema",
       customQueryFields: [],
       functions: [],
       streamResults: <any>[],

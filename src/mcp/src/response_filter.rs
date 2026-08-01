@@ -617,8 +617,7 @@ mod tests {
                         "bloom_filter_fields": [],
                         "data_retention": 30,
                         "max_query_range": 0,
-                        "flatten_level": 0,
-                        "defined_schema_fields": []
+                        "flatten_level": 0
                     },
                     "total_fields": 4,
                     "storage_type": "local"
@@ -644,8 +643,7 @@ mod tests {
                         "bloom_filter_fields": [],
                         "data_retention": 15,
                         "max_query_range": 0,
-                        "flatten_level": 0,
-                        "defined_schema_fields": []
+                        "flatten_level": 0
                     },
                     "total_fields": 3,
                     "storage_type": "local"

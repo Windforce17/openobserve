@@ -52,7 +52,6 @@ pub async fn query(
         stream_name,
         time_level,
         (time_min, time_max),
-        None,
     )
     .await?;
     let dumped_files = file_list_dump::query(
@@ -86,12 +85,14 @@ pub async fn query_for_merge(
     stream_name: &str,
     date_start: &str,
     date_end: &str,
+    include_oversize: bool,
 ) -> Result<Vec<FileKey>> {
     let files = infra_file_list::query_for_merge(
         org_id,
         stream_type,
         stream_name,
         (date_start.to_string(), date_end.to_string()),
+        include_oversize,
     )
     .await?;
     // we don't need to query from dump here, because
@@ -358,6 +359,7 @@ mod tests {
             deleted: false,
             selection: None,
             row_group_size: None,
+            selection_exact: false,
         }
     }
 

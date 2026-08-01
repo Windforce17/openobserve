@@ -81,14 +81,14 @@ def _replace_re_match(sql: str) -> str:
 def _replace_match_all(sql: str) -> str:
     """Replace match_all('term') with DuckDB LIKE conditions.
 
-    Tantivy tokenizes the term and matches each token independently
+    The FTS index tokenizes the term and matches each token independently
     across all indexed text fields.  We emulate this with per-word LIKE
     conditions on the log field (the primary FTS field in test data).
 
     Single word:  match_all('warehouse') → log LIKE '%warehouse%'
     Multi-word:   match_all('ACK batch') → (log LIKE '%ACK%' AND log LIKE '%batch%')
 
-    Note: This is an approximation — Tantivy's actual tokenization may
+    Note: This is an approximation — the index's actual tokenization may
     differ from whitespace splitting (stemming, stop words, case folding).
     The per-token content assertion in the test runner provides a
     correctness backstop that is independent of this oracle.
@@ -298,7 +298,7 @@ _SKIP_SQLLOGICTEST = {
     "Q052",  # ROW_NUMBER tie-breaking with 5 records/query
     "Q058",  # Self-join pairings non-deterministic across engines
     "Q072",  # FULL OUTER JOIN histogram: NULL handling differs
-    "Q080",  # FTS match_all + histogram: DuckDB LIKE != OO Tantivy
+    "Q080",  # FTS match_all + histogram: DuckDB LIKE != OO FTS tokens
     "Q104",  # ORDER BY + LIMIT + OFFSET tie with 5 records/query
     "Q111",  # ROW_NUMBER ties in pagination
     "Q117",  # STRING_AGG ordering differs between engines

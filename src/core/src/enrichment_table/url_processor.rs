@@ -1922,30 +1922,30 @@ async fn save_enrichment_batch(
 mod tests {
     use super::*;
 
+    // NOTE: all sends on the global URL_JOB_SENDER live in this ONE test. The
+    // LazyLock spawns the consumer task on whichever tokio test runtime first
+    // touches the static; when that runtime shuts down the receiver is dropped
+    // and the channel is closed for the rest of the process, so separate
+    // #[tokio::test] functions sending on it fail depending on scheduling
+    // order. Keeping every send inside a single runtime makes this
+    // deterministic — do not split these cases into their own tests.
     #[tokio::test]
     async fn test_mpsc_trigger() {
+        // basic trigger
         let result = trigger_url_job_processing("test_org".to_string(), "test_table".to_string());
         assert!(result.is_ok());
-    }
 
-    #[tokio::test]
-    async fn test_mpsc_trigger_multiple_times() {
-        // Multiple triggers for the same org/table should all succeed
+        // multiple triggers for distinct org/table should all succeed
         for i in 0..5 {
             let result = trigger_url_job_processing(format!("org_{}", i), format!("table_{}", i));
             assert!(result.is_ok(), "trigger {} should succeed", i);
         }
-    }
 
-    #[tokio::test]
-    async fn test_mpsc_trigger_empty_strings() {
-        // Empty strings are valid identifiers for the channel
+        // empty strings are valid identifiers for the channel
         let result = trigger_url_job_processing("".to_string(), "".to_string());
         assert!(result.is_ok());
-    }
 
-    #[tokio::test]
-    async fn test_mpsc_trigger_unicode_org_id() {
+        // unicode identifiers
         let result = trigger_url_job_processing("org_测试".to_string(), "table_データ".to_string());
         assert!(result.is_ok());
     }

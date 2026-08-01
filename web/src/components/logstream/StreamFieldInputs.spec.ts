@@ -334,23 +334,24 @@ describe("StreamFieldInputs (form-mode)", () => {
   });
 
   describe("Constants", () => {
-    it("exposes the streamIndexType array (10 options)", async () => {
+    it("exposes the streamIndexType array (9 options, bloom retired)", async () => {
       const wrapper = makeHarness([]);
       await flushPromises();
       const streamIndexType = childVm(wrapper).streamIndexType;
-      expect(streamIndexType).toHaveLength(10);
-      expect(streamIndexType[0]).toEqual({
-        label: "Full text search",
-        value: "fullTextSearchKey",
-      });
-      expect(streamIndexType[1]).toEqual({
-        label: "Secondary index",
-        value: "secondaryIndexKey",
-      });
-      expect(streamIndexType[2]).toEqual({
-        label: "Bloom filter",
-        value: "bloomFilterKey",
-      });
+      expect(streamIndexType).toHaveLength(9);
+      expect(streamIndexType.map((o: any) => o.value)).toEqual([
+        "fullTextSearchKey",
+        "columnStoreKey",
+        "keyPartition",
+        "prefixPartition",
+        "hashPartition_8",
+        "hashPartition_16",
+        "hashPartition_32",
+        "hashPartition_64",
+        "hashPartition_128",
+      ]);
+      expect(streamIndexType[0].label).toBe("Full text search");
+      expect(streamIndexType[1].label).toBe("Column store");
     });
 
     it("exposes the dataTypes array (5 options)", async () => {
@@ -444,13 +445,13 @@ describe("StreamFieldInputs (form-mode)", () => {
       const schema = { index_type: ["hashPartition_8"] };
       expect(disable(schema, { value: "fullTextSearchKey" })).toBe(false);
       expect(disable(schema, { value: "secondaryIndexKey" })).toBe(false);
-      expect(disable(schema, { value: "bloomFilterKey" })).toBe(false);
+      expect(disable(schema, { value: "columnStoreKey" })).toBe(false);
     });
 
     it("disables other hash variants + partition types with a complex selection", async () => {
       await setup();
       const complexSchema = {
-        index_type: ["hashPartition_8", "fullTextSearchKey", "bloomFilterKey"],
+        index_type: ["hashPartition_8", "fullTextSearchKey", "columnStoreKey"],
       };
       expect(disable(complexSchema, { value: "hashPartition_16" })).toBe(true);
       expect(disable(complexSchema, { value: "hashPartition_8" })).toBe(false);

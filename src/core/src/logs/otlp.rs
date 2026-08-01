@@ -22,7 +22,7 @@ use axum::{
 use bytes::BytesMut;
 use chrono::{Duration, Utc};
 use config::{
-    ALL_VALUES_COL_NAME, ID_COL_NAME, ORIGINAL_DATA_COL_NAME, TIMESTAMP_COL_NAME, get_config,
+    ID_COL_NAME, ORIGINAL_DATA_COL_NAME, TIMESTAMP_COL_NAME, get_config,
     meta::{
         otlp::OtlpRequestType,
         self_reporting::usage::UsageType,
@@ -35,7 +35,6 @@ use config::{
     },
 };
 use infra::{errors::Result, schema::get_flatten_level};
-use itertools::Itertools;
 use opentelemetry::trace::{SpanId, TraceId};
 use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsPartialSuccess, ExportLogsServiceRequest, ExportLogsServiceResponse,
@@ -46,7 +45,7 @@ use super::{bulk::TS_PARSE_FAILED, ingestion_log_enabled, log_failed_record};
 use crate::{
     common::meta::{
         http::{CONTENT_TYPE_JSON, CONTENT_TYPE_PROTO},
-        ingestion::{IngestionStatus, StreamStatus},
+        ingestion::{IngestionStatus, RecordStatus, StreamStatus},
     },
     service::{
         format_stream_name,
@@ -83,8 +82,6 @@ pub async fn handle_request(
     let max_ts =
         (Utc::now() + Duration::hours(cfg.limit.ingest_allowed_in_future)).timestamp_micros();
 
-    let index_all_max_value_length = cfg.limit.index_all_max_value_length;
-
     let stream_param = StreamParams::new(org_id, &stream_name, StreamType::Logs);
     // Start retrieve associated pipeline and construct pipeline components
     let executable_pipelines =
@@ -102,22 +99,18 @@ pub async fn handle_request(
         }
     }
 
-    // Start get user defined schema
-    let mut user_defined_schema_map: HashMap<String, Option<HashSet<String>>> = HashMap::new();
+    // Start get streams that store the original record
     let mut streams_need_original_map: HashMap<String, bool> = HashMap::new();
-    let mut streams_need_all_values_map: HashMap<String, bool> = HashMap::new();
-    crate::service::ingestion::get_uds_and_original_data_streams(
+    crate::service::ingestion::get_original_data_streams(
         &stream_params,
-        &mut user_defined_schema_map,
         &mut streams_need_original_map,
-        &mut streams_need_all_values_map,
     )
     .await;
 
     // with pipeline, we need to store original if any of the destinations requires original
     let store_original_when_pipeline_exists =
         !executable_pipelines.is_empty() && streams_need_original_map.values().any(|val| *val);
-    // End get user defined schema
+    // End get streams that store the original record
 
     let mut stream_status = StreamStatus::new(&stream_name);
     let mut json_data_by_stream = HashMap::new();
@@ -267,10 +260,6 @@ pub async fn handle_request(
                         _ => unreachable!(),
                     };
 
-                    if let Some(Some(fields)) = user_defined_schema_map.get(&stream_name) {
-                        local_val = crate::service::ingestion::refactor_map(local_val, fields);
-                    }
-
                     // add `_original` and '_record_id` if required by StreamSettings
                     if streams_need_original_map
                         .get(&stream_name)
@@ -286,31 +275,6 @@ pub async fn handle_request(
                         );
 
                         local_val.insert(ID_COL_NAME.to_string(), record_id.to_string().into());
-                    }
-
-                    // add `_all_values` if required by StreamSettings
-                    if streams_need_all_values_map
-                        .get(&stream_name)
-                        .is_some_and(|v| *v)
-                    {
-                        let values = local_val
-                            .iter()
-                            .filter(|(k, v)| {
-                                ![
-                                    TIMESTAMP_COL_NAME,
-                                    ID_COL_NAME,
-                                    ORIGINAL_DATA_COL_NAME,
-                                    ALL_VALUES_COL_NAME,
-                                ]
-                                .contains(&k.as_str())
-                                    && (index_all_max_value_length == 0
-                                        || v.as_str()
-                                            .is_none_or(|s| s.len() <= index_all_max_value_length))
-                            })
-                            .map(|(_, v)| v)
-                            .join(" ");
-                        local_val
-                            .insert(ALL_VALUES_COL_NAME.to_string(), json::Value::String(values));
                     }
 
                     let (ts_data, fn_num) = json_data_by_stream
@@ -358,13 +322,11 @@ pub async fn handle_request(
                             derived_streams.insert(destination_stream.clone());
                         }
 
-                        if !user_defined_schema_map.contains_key(&destination_stream) {
-                            // a new dynamically created stream. need to check the two maps again
-                            crate::service::ingestion::get_uds_and_original_data_streams(
+                        if !streams_need_original_map.contains_key(&destination_stream) {
+                            // a new dynamically created stream. need to check the map again
+                            crate::service::ingestion::get_original_data_streams(
                                 &[stream_params],
-                                &mut user_defined_schema_map,
                                 &mut streams_need_original_map,
-                                &mut streams_need_all_values_map,
                             )
                             .await;
                         }
@@ -376,13 +338,6 @@ pub async fn handle_request(
                                 json::Value::Object(v) => v,
                                 _ => unreachable!(),
                             };
-
-                            if let Some(Some(fields)) =
-                                user_defined_schema_map.get(&destination_stream)
-                            {
-                                local_val =
-                                    crate::service::ingestion::refactor_map(local_val, fields);
-                            }
 
                             // add `_original` and '_record_id` if required by StreamSettings
                             if idx != usize::MAX
@@ -403,33 +358,6 @@ pub async fn handle_request(
                                 );
                                 local_val
                                     .insert(ID_COL_NAME.to_string(), record_id.to_string().into());
-                            }
-
-                            // add `_all_values` if required by StreamSettings
-                            if streams_need_all_values_map
-                                .get(&destination_stream)
-                                .copied()
-                                .unwrap_or_default()
-                            {
-                                let values = local_val
-                                    .iter()
-                                    .filter(|(k, v)| {
-                                        ![
-                                            TIMESTAMP_COL_NAME,
-                                            ID_COL_NAME,
-                                            ORIGINAL_DATA_COL_NAME,
-                                            ALL_VALUES_COL_NAME,
-                                        ]
-                                        .contains(&k.as_str())
-                                            && (index_all_max_value_length == 0
-                                                || v.as_str().is_none_or(|s| {
-                                                    s.len() <= index_all_max_value_length
-                                                }))
-                                    })
-                                    .map(|(_, v)| v)
-                                    .join(" ");
-
-                                local_val.insert(ALL_VALUES_COL_NAME.to_string(), values.into());
                             }
 
                             let size: &mut usize = size_by_stream
@@ -466,10 +394,6 @@ pub async fn handle_request(
                     _ => unreachable!(),
                 };
 
-                if let Some(Some(fields)) = user_defined_schema_map.get(&stream_name) {
-                    local_val = crate::service::ingestion::refactor_map(local_val, fields);
-                }
-
                 if streams_need_original_map
                     .get(&stream_name)
                     .is_some_and(|v| *v)
@@ -486,31 +410,6 @@ pub async fn handle_request(
                     local_val.insert(ID_COL_NAME.to_string(), record_id.to_string().into());
                 }
 
-                if streams_need_all_values_map
-                    .get(&stream_name)
-                    .copied()
-                    .unwrap_or_default()
-                {
-                    let values = local_val
-                        .iter()
-                        .filter(|(k, v)| {
-                            ![
-                                TIMESTAMP_COL_NAME,
-                                ID_COL_NAME,
-                                ORIGINAL_DATA_COL_NAME,
-                                ALL_VALUES_COL_NAME,
-                            ]
-                            .contains(&k.as_str())
-                                && (index_all_max_value_length == 0
-                                    || v.as_str()
-                                        .is_none_or(|s| s.len() <= index_all_max_value_length))
-                        })
-                        .map(|(_, v)| v)
-                        .join(" ");
-
-                    local_val.insert(ALL_VALUES_COL_NAME.to_string(), values.into());
-                }
-
                 let (ts_data, fn_num) = json_data_by_stream
                     .entry(stream_name.clone())
                     .or_insert((Vec::new(), None));
@@ -524,16 +423,10 @@ pub async fn handle_request(
     drop(executable_pipelines);
     drop(original_options);
     drop(timestamps);
-    drop(user_defined_schema_map);
     drop(streams_need_original_map);
 
-    // Update partial success
-    if stream_status.status.failed > 0 {
-        res.partial_success = Some(ExportLogsPartialSuccess {
-            rejected_log_records: stream_status.status.failed as i64,
-            error_message: stream_status.status.error.clone(),
-        });
-    }
+    // Update partial success (pre-write rejections; recomputed after the write)
+    res.partial_success = partial_success(&stream_status.status);
 
     let (content_type, endpoint) = match req_type {
         OtlpRequestType::HttpJson => (CONTENT_TYPE_JSON, "/api/otlp/v1/logs"),
@@ -554,7 +447,7 @@ pub async fn handle_request(
     }
 
     let mut status = IngestionStatus::Record(stream_status.status);
-    let (metric_rpt_status_code, response_body) = match super::write_logs_by_stream(
+    let write_result = super::write_logs_by_stream(
         thread_id,
         org_id,
         user_email,
@@ -565,28 +458,42 @@ pub async fn handle_request(
         size_by_stream,
         derived_streams,
     )
-    .await
-    {
-        Ok(()) => {
-            let mut out = BytesMut::with_capacity(res.encoded_len());
-            res.encode(&mut out).expect("Out of memory");
-            ("200", out)
+    .await;
+    stream_status.status = match status {
+        IngestionStatus::Record(status) => status,
+        IngestionStatus::Bulk(_) => unreachable!("otlp logs ingest with a record status"),
+    };
+
+    // The rejected count is only real once the writes have been accounted:
+    // records counted successful before the durable write reported
+    // `rejected_log_records: 0` for a batch that was entirely lost, and the
+    // collector dropped it.
+    res.partial_success = partial_success(&stream_status.status);
+
+    let (metric_rpt_status_code, status_code) = match &write_result {
+        Ok(failures) if failures.is_empty() => ("200", StatusCode::OK),
+        Ok(failures) => {
+            let error = super::write_failure_message(failures);
+            log::error!("Error while writing logs: {error}");
+            let code = StatusCode::from_u16(super::write_failure_status_code(failures))
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            // the metric follows the real code: a pure permanent rejection
+            // (every failing stream is being deleted) answers 200 and must
+            // not count as a 500
+            (if code.is_success() { "200" } else { "500" }, code)
         }
         Err(e) => {
             log::error!("Error while writing logs: {e}");
-            stream_status.status = match status {
-                IngestionStatus::Record(status) => status,
-                IngestionStatus::Bulk(_) => unreachable!(),
+            let code = if matches!(e, infra::errors::Error::ResourceError(_)) {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
             };
-            res.partial_success = Some(ExportLogsPartialSuccess {
-                rejected_log_records: stream_status.status.failed as i64,
-                error_message: stream_status.status.error,
-            });
-            let mut out = BytesMut::with_capacity(res.encoded_len());
-            res.encode(&mut out).expect("Out of memory");
-            ("500", out)
+            ("500", code)
         }
     };
+    let mut response_body = BytesMut::with_capacity(res.encoded_len());
+    res.encode(&mut response_body).expect("Out of memory");
 
     // metric + data usage
     let took_time = start.elapsed().as_secs_f64();
@@ -605,12 +512,23 @@ pub async fn handle_request(
         .with_label_values(&label_values)
         .inc();
 
+    // A lost write must not be acked with 2xx — the collector's retry queue is
+    // the only remaining copy of these records.
     Ok((
-        StatusCode::OK,
+        status_code,
         [(header::CONTENT_TYPE, content_type)],
         response_body.freeze(),
     )
         .into_response())
+}
+
+/// The OTLP partial-success report for an accounted ingest status: the
+/// rejected count is the real number of records that were not stored.
+fn partial_success(status: &RecordStatus) -> Option<ExportLogsPartialSuccess> {
+    (status.failed > 0).then(|| ExportLogsPartialSuccess {
+        rejected_log_records: status.failed as i64,
+        error_message: status.error.clone(),
+    })
 }
 
 #[cfg(test)]
@@ -625,7 +543,44 @@ mod tests {
         logs::v1::{LogRecord, ResourceLogs, ScopeLogs},
     };
 
-    use crate::service::logs::otlp::handle_request;
+    use super::partial_success;
+    use crate::{common::meta::ingestion::RecordStatus, service::logs::otlp::handle_request};
+
+    /// `rejected_log_records` must be the real number of records that were
+    /// not stored. Counting records successful before the durable write made
+    /// a fully lost batch report `rejected: 0`, and the collector dropped it.
+    #[test]
+    fn test_partial_success_reports_the_real_rejected_count() {
+        // a batch of 5 whose write failed: all 5 are rejected
+        let status = RecordStatus {
+            successful: 0,
+            failed: 5,
+            error: "wal write failed: no space left".to_string(),
+        };
+        let partial = partial_success(&status).expect("a lost batch is a partial success");
+        assert_eq!(partial.rejected_log_records, 5);
+        assert!(partial.error_message.contains("no space left"));
+
+        // a partially rejected batch reports only the rejected records
+        let status = RecordStatus {
+            successful: 3,
+            failed: 2,
+            error: "Too old data".to_string(),
+        };
+        assert_eq!(
+            partial_success(&status).unwrap().rejected_log_records,
+            2,
+            "rejected must not include the stored records"
+        );
+
+        // everything stored: no partial success at all
+        let status = RecordStatus {
+            successful: 4,
+            failed: 0,
+            error: String::new(),
+        };
+        assert!(partial_success(&status).is_none());
+    }
 
     #[tokio::test]
     async fn test_handle_logs_request() {

@@ -439,6 +439,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_user() {
+        // The users tests (crate::users::tests::set_up) CLEAR the shared
+        // users/org_users/organizations tables; hold the crate-wide lock for
+        // the whole test or the "dummy" org row can vanish mid-test (FK
+        // constraint failures on org_users inserts).
+        let _guard = crate::users::USER_TABLES_TEST_LOCK.lock().await;
+
         infra_db::create_table().await.unwrap();
         infra_table::create_user_tables().await.unwrap();
         organization::check_and_create_org_without_ofga("dummy")

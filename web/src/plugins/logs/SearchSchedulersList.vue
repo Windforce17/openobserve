@@ -715,7 +715,7 @@ export default defineComponent({
         refresh,
         sql_mode: "true",
         query,
-        defined_schemas: "user_defined_schema",
+        defined_schemas: "all_fields",
         org_identifier: row.org_id,
         quick_mode: "false",
         show_histogram: "false",

@@ -321,12 +321,18 @@ pub async fn search_http2_stream(
             None
         };
 
-        // Convert the original query to a histogram query
+        // Convert the original query to a histogram query. The interval is
+        // resolved HERE, once, from the full request range (or the request's
+        // preset histogram_interval) and emitted explicitly — the streaming
+        // partitions re-plan this SQL over narrower sub-ranges and must all
+        // share the full-range bucket width.
         match crate::service::search::sql::histogram::convert_to_histogram_query(
             &req.query.sql,
             &stream_names,
             is_multi_stream_search,
             histogram_breakdown_field.as_deref(),
+            (req.query.start_time, req.query.end_time),
+            req.query.histogram_interval,
         ) {
             Ok(histogram_query) => {
                 req.query.sql = histogram_query;

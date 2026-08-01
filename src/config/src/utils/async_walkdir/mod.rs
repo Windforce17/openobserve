@@ -27,7 +27,7 @@
 //! Recursively traverse a directory:
 //!
 //! ```
-//! use async_walkdir::WalkDir;
+//! use config::utils::async_walkdir::WalkDir;
 //! use futures::{StreamExt, executor::block_on};
 //!
 //! block_on(async {
@@ -48,7 +48,7 @@
 //! Do not recurse through directories whose name starts with '.':
 //!
 //! ```
-//! use async_walkdir::{Filtering, WalkDir};
+//! use config::utils::async_walkdir::{Filtering, WalkDir};
 //! use futures::{StreamExt, executor::block_on};
 //!
 //! block_on(async {

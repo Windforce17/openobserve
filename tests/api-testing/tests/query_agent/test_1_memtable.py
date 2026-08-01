@@ -1,7 +1,7 @@
-"""Phase 1 — Memtable: run all queries BEFORE flush (no Tantivy FTS).
+"""Phase 1 — Memtable: run all queries BEFORE flush (no FTS index).
 
 FTS queries (full_text_search) are expected to return 0 rows because
-Tantivy indexes are only generated alongside Parquet files.
+FTS indexes are only generated alongside Parquet files.
 """
 
 import pytest
@@ -12,7 +12,7 @@ from tests.query_agent.conftest import load_all_queries, run_query
 def _make_test(cat, queries):
     @pytest.mark.parametrize("query", queries, ids=[q["id"] for q in queries])
     def _test(client, ingest_query_agent_data, query):
-        # Pre-flush: Tantivy FTS not available — skip row_count for FTS queries
+        # Pre-flush: FTS index not available — skip row_count for FTS queries
         run_query(client, query, skip_fts_count=True)
     return _test
 

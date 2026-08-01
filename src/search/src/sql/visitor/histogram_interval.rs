@@ -89,6 +89,22 @@ macro_rules! intervals {
     (@unit m) => { chrono::Duration::minutes };
 }
 
+/// The interval a 1-arg `histogram(_timestamp)` resolves to for a request:
+/// the preset `histogram_interval` seconds when set (`> 0`), otherwise the
+/// auto interval derived from the query time range. This is THE single
+/// shared resolution — SQL generation ([`super::super::histogram::handle_histogram`],
+/// [`super::super::histogram::convert_to_histogram_query`]) and the logical
+/// rewrite (`RewriteHistogram`) all delegate here, so every layer derives
+/// the same bucket width for the same request; a drifting copy of this
+/// formula would land counts in wrong buckets.
+pub fn resolve_histogram_interval(q_time_range: (i64, i64), histogram_interval: i64) -> String {
+    if histogram_interval > 0 {
+        format!("{histogram_interval} second")
+    } else {
+        generate_histogram_interval(q_time_range).to_string()
+    }
+}
+
 pub fn generate_histogram_interval(time_range: (i64, i64)) -> &'static str {
     let (start, end) = time_range;
     if (start, end).eq(&(0, 0)) {

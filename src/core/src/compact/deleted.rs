@@ -13,10 +13,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use config::{
-    meta::stream::{FileKey, FileMeta},
-    utils::inverted_index::to_tantivy_name,
-};
+use config::meta::stream::{FileKey, FileMeta};
 use infra::{file_list as infra_file_list, storage};
 
 // Batch size for deleting files from file_list_deleted table
@@ -43,64 +40,6 @@ pub async fn delete(org_id: &str, time_max: i64) -> Result<i64, anyhow::Error> {
             .collect::<Vec<_>>(),
     )
     .await
-    {
-        // maybe the file already deleted, so we just skip the `not found` error
-        if !e.to_string().to_lowercase().contains("not found") {
-            log::error!("[COMPACTOR] delete files from storage failed: {e}");
-            return Err(e.into());
-        }
-    }
-
-    // delete related inverted index puffin files
-    let inverted_index_files = files
-        .iter()
-        .filter_map(|file| {
-            if file.index_file {
-                to_tantivy_name(&file.file).map(|f| (file.account.to_string(), f))
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>();
-    if !inverted_index_files.is_empty()
-        && let Err(e) = storage::del(
-            inverted_index_files
-                .iter()
-                .map(|file| (file.0.as_str(), file.1.as_str()))
-                .collect::<Vec<_>>(),
-        )
-        .await
-    {
-        // maybe the file already deleted or there's not related index files,
-        // so we just skip the `not found` error
-        if !e.to_string().to_lowercase().contains("not found") {
-            log::error!("[COMPACTOR] delete files from storage failed: {e}");
-            return Err(e.into());
-        }
-    }
-
-    // delete flattened files from storage
-    let flattened_files = files
-        .iter()
-        .filter_map(|file| {
-            if file.flattened {
-                Some((
-                    file.account.to_string(),
-                    super::flatten::generate_flatten_file_key(&file.file),
-                ))
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>();
-    if !flattened_files.is_empty()
-        && let Err(e) = storage::del(
-            flattened_files
-                .iter()
-                .map(|file| (file.0.as_str(), file.1.as_str()))
-                .collect::<Vec<_>>(),
-        )
-        .await
     {
         // maybe the file already deleted, so we just skip the `not found` error
         if !e.to_string().to_lowercase().contains("not found") {

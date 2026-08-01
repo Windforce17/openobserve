@@ -93,7 +93,7 @@ pub fn record_batch_to_file_record(rb: RecordBatch) -> Vec<FileRecord> {
     // bloom_ver is OPTIONAL on read — dump parquets written before the
     // bloom-filter pruning layer was added don't have this column.
     // Missing → 0 (the "no .bf" sentinel), so search for those legacy
-    // rows falls through to the original tantivy path.
+    // rows falls through to the non-bloom path.
     let bloom_ver_col = rb
         .column_by_name("bloom_ver")
         .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
@@ -344,7 +344,6 @@ async fn query_inner(
         &dump_stream_name,
         PartitionTimeLevel::Hourly,
         range,
-        None,
     )
     .await?;
     if dump_files.is_empty() {
@@ -810,7 +809,7 @@ mod tests {
 
     /// A dump parquet written before the bloom-filter pruning layer was
     /// added has no `bloom_ver` column. The reader must tolerate that and
-    /// default the field to 0 so search just falls back to tantivy for
+    /// default the field to 0 so search just takes the non-bloom path for
     /// those legacy rows instead of panicking.
     #[test]
     fn test_legacy_dump_without_bloom_ver_column_reads_with_zero() {

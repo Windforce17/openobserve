@@ -83,7 +83,6 @@ const store = createStore({
       show_stream_stats_doc_num: true,
       data_retention_days: true,
       extended_data_retention_days: 45,
-      user_defined_schemas_enabled: true,
       super_cluster_enabled: false,
       query_on_stream_selection: false,
       query_values_default_num: 10,
@@ -111,8 +110,6 @@ const store = createStore({
         },
       ],
       timestamp_column: "_timestamp",
-      all_fields_name: "_all",
-      default_secondary_index_fields: ["level"],
       default_quick_mode_fields: [],
     },
     organizationData: {

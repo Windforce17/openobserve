@@ -37,7 +37,8 @@ use proto::cluster_rpc::SearchQuery;
 use vector_enrichment::TableRegistry;
 
 use crate::service::search::{
-    SearchResult, cluster::flight, sql::Sql, utils::is_default_query_limit_exceeded,
+    SearchResult, cluster::flight, datafusion::source_synthesis::expand_star_source_hits, sql::Sql,
+    utils::is_default_query_limit_exceeded,
 };
 
 #[tracing::instrument(name = "service:search:cluster", skip_all)]
@@ -99,6 +100,13 @@ pub async fn search(
         if is_default_query_limit_exceeded(json_rows.len(), &sql) {
             json_rows.truncate(default_query_limit);
         }
+
+        // Row-store-driven star (DESIGN §5): a `SELECT *` plan projects the
+        // record's `_source` instead of enumerating registry fields —
+        // materialize each hit from its own record here (physical columns
+        // win on overlap), BEFORE any VRL function sees the rows. Rows
+        // without a `_source` key pass through untouched.
+        expand_star_source_hits(&mut json_rows);
 
         let mut sources: Vec<json::Value> = if query_fn.is_empty() {
             json_rows

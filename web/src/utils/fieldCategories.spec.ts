@@ -229,12 +229,10 @@ describe("shouldApplyFieldGrouping", () => {
   const base = {
     semanticIndex: index,
     streamCount: 1,
-    udsActive: false,
-    udsFieldLimit: 0,
     totalSchemaFieldCount: 10,
   };
 
-  it("returns true for single stream with semantic index and no UDS", () => {
+  it("returns true for single stream with semantic index", () => {
     expect(shouldApplyFieldGrouping(base)).toBe(true);
   });
 
@@ -247,15 +245,7 @@ describe("shouldApplyFieldGrouping", () => {
     expect(shouldApplyFieldGrouping({ ...base, streamCount: 3 })).toBe(false);
   });
 
-  it("returns true when UDS is active regardless of field count", () => {
-    expect(shouldApplyFieldGrouping({ ...base, udsActive: true, udsFieldLimit: 5, totalSchemaFieldCount: 100 })).toBe(true);
-  });
-
-  it("returns true when UDS limit set and field count is within limit", () => {
-    expect(shouldApplyFieldGrouping({ ...base, udsFieldLimit: 20, totalSchemaFieldCount: 15 })).toBe(true);
-  });
-
-  it("returns true when UDS limit set and field count exceeds limit (grouping no longer suppressed)", () => {
-    expect(shouldApplyFieldGrouping({ ...base, udsFieldLimit: 10, totalSchemaFieldCount: 50 })).toBe(true);
+  it("returns true regardless of field count", () => {
+    expect(shouldApplyFieldGrouping({ ...base, totalSchemaFieldCount: 100 })).toBe(true);
   });
 });

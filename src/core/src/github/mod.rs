@@ -19,7 +19,8 @@
 //! It includes caching, retry logic, and error handling.
 //!
 //! ## Usage Example
-//! ```no_run
+//! ```rust,ignore
+//! // Illustrative only (`Pattern` is a caller-defined type).
 //! use crate::service::github::GitHubDataService;
 //!
 //! let service = GitHubDataService::new();

@@ -1,0 +1,683 @@
+// Copyright 2026 OpenObserve Inc.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+//! Index merge for core-file compaction: build a merged `dict`/`terms` pair
+//! straight from the inputs' term dictionaries instead of re-deriving every
+//! term from `_source` (see [`crate::VixWriter::merge_input_indexes`]).
+//!
+//! The compactor's row merge assigns every input row a new doc id; a
+//! [`DocIdMap`] captures that assignment per input. The merge then:
+//!
+//! - streams each input's composite terms in key order (its row-group FSTs), re-suffixing every
+//!   value term with the field's id in the *output* field table. Field ids are assigned by sorted
+//!   field name in every core file, so remapping preserves per-input key order — a strictness guard
+//!   catches the pathological exceptions (tokens whose bytes collide with the id suffix across the
+//!   `\x00` separator) and the caller falls back to a full rebuild. Terms of fields with no output
+//!   id (e.g. a field the merged docs store under a non-string type) are dropped and reported so
+//!   the writer can mark them `partial` — exactly what a rebuild would do;
+//! - k-way merges the remapped streams; equal keys union their postings with doc ids mapped through
+//!   the [`DocIdMap`]s. `doc_count` is the plain sum (doc-id spaces are disjoint). A term present
+//!   in every merged row is dense-elided (empty blob) against the *merged* row count; an input's
+//!   dense-elided postings are expanded through its map. When every contributing input maps by
+//!   constant offset the remapped lists concatenate in offset order without sorting (and a single
+//!   contributor at offset 0 reuses its encoded blob byte-for-byte); table maps decode, remap,
+//!   sort, and verify distinctness;
+//! - runs the merge across `threads` workers by partitioning the key space into suffix-independent
+//!   ranges ([`partition_bounds`]) that each produce one [`crate::writer::TermSink`] run; the runs
+//!   concatenate into the final blobs with their row-group ordinals rebased
+//!   ([`crate::writer::write_index_blobs`]).
+
+use std::collections::BTreeSet;
+
+use arrow::array::LargeBinaryArray;
+use tantivy_fst::{IntoStreamer, Streamer};
+
+use crate::{
+    container::{RowSelection, column_binary, column_u64, scan_blob},
+    error::{Result, VixError},
+    postings,
+    query::{KEY_FIELD_ID, split_key, write_composite},
+    reader::VixReader,
+};
+
+/// How one merge input's doc ids translate to the merged file's doc ids.
+///
+/// Produced by the compactor's `_timestamp` row merge: when the inputs'
+/// time ranges do not interleave, every input occupies one contiguous run of
+/// the output and its map is a constant [`DocIdMap::Offset`]; otherwise the
+/// full permutation is spelled out as a [`DocIdMap::Table`] (`table[old_id]
+/// = new_id`).
+#[derive(Debug, Clone)]
+pub enum DocIdMap {
+    /// `new_id = old_id + offset` — the input's rows form one contiguous run.
+    Offset(u32),
+    /// `new_id = table[old_id]`; the table length must equal the input's row
+    /// count and the mapping must be injective across all inputs.
+    Table(Vec<u32>),
+}
+
+/// The whole `terms` table of one input, decoded once up front: postings
+/// stay in their encoded (delta + bitpacked) form as binary-array slices.
+struct TermTable {
+    doc_counts: Vec<u32>,
+    postings: Vec<LargeBinaryArray>,
+    /// First global ordinal of each `postings` batch.
+    batch_starts: Vec<u64>,
+}
+
+impl TermTable {
+    fn load(reader: &VixReader) -> Result<Self> {
+        let term_count = reader.term_count();
+        let mut table = TermTable {
+            doc_counts: Vec::with_capacity(term_count as usize),
+            postings: Vec::new(),
+            batch_starts: Vec::new(),
+        };
+        if term_count == 0 {
+            return Ok(table);
+        }
+        let blob = reader
+            .terms_blob_handle()
+            .ok_or_else(|| VixError::Malformed("missing terms blob".to_string()))?;
+        let row_count = reader.row_count();
+        for batch in scan_blob(blob, Some(&["doc_count", "postings"]), RowSelection::All)? {
+            let doc_counts = column_u64(&batch, "doc_count")?;
+            for &doc_count in &doc_counts {
+                if doc_count > row_count {
+                    return Err(VixError::Malformed(format!(
+                        "doc_count {doc_count} exceeds row_count {row_count}"
+                    )));
+                }
+                table.doc_counts.push(doc_count as u32);
+            }
+            table
+                .batch_starts
+                .push(table.doc_counts.len() as u64 - doc_counts.len() as u64);
+            table.postings.push(column_binary(&batch, "postings")?);
+        }
+        if table.doc_counts.len() as u64 != term_count {
+            return Err(VixError::Malformed(format!(
+                "terms table has {} rows, expected {term_count}",
+                table.doc_counts.len()
+            )));
+        }
+        Ok(table)
+    }
+
+    fn doc_count(&self, ordinal: u64) -> u32 {
+        self.doc_counts[ordinal as usize]
+    }
+
+    fn postings_blob(&self, ordinal: u64) -> &[u8] {
+        let batch = self
+            .batch_starts
+            .partition_point(|&start| start <= ordinal)
+            .saturating_sub(1);
+        self.postings[batch].value((ordinal - self.batch_starts[batch]) as usize)
+    }
+}
+
+/// One input's term stream over one key range (`[lower, upper)` on the raw
+/// composite keys; `None` = unbounded), with keys remapped into the output
+/// id space and guarded to stay strictly ascending.
+struct RemappedTermStream<'r> {
+    reader: &'r VixReader,
+    rg_index: usize,
+    stream: Option<tantivy_fst::map::Stream<'r>>,
+    lower: Option<&'r [u8]>,
+    upper: Option<&'r [u8]>,
+    /// `old field id -> Some(output field id)`; `None` = the field has no
+    /// output id and its value terms are dropped.
+    field_map: Vec<Option<u16>>,
+    /// `old field id -> field name` (dropped-field reporting).
+    field_names: Vec<String>,
+    cur_key: Vec<u8>,
+    prev_key: Vec<u8>,
+    cur_ordinal: u64,
+    started: bool,
+    /// Old field ids that had at least one value term dropped.
+    dropped: BTreeSet<u16>,
+}
+
+impl<'r> RemappedTermStream<'r> {
+    fn new(
+        reader: &'r VixReader,
+        out_field_ids: &std::collections::HashMap<String, u16>,
+        lower: Option<&'r [u8]>,
+        upper: Option<&'r [u8]>,
+    ) -> Result<Self> {
+        let entries = reader.field_entries();
+        let mut field_map = Vec::with_capacity(entries.len());
+        let mut field_names = Vec::with_capacity(entries.len());
+        for entry in entries {
+            field_map.push(out_field_ids.get(&entry.name).copied());
+            field_names.push(entry.name.clone());
+        }
+        Ok(Self {
+            reader,
+            rg_index: 0,
+            stream: None,
+            lower,
+            upper,
+            field_map,
+            field_names,
+            cur_key: Vec::new(),
+            prev_key: Vec::new(),
+            cur_ordinal: 0,
+            started: false,
+            dropped: BTreeSet::new(),
+        })
+    }
+
+    /// Advance to the next surviving term. `Ok(false)` = exhausted. After
+    /// `Ok(true)`, `cur_key`/`cur_ordinal` describe the term.
+    fn advance(&mut self) -> Result<bool> {
+        loop {
+            if self.stream.is_none() {
+                // next row group intersecting [lower, upper)
+                loop {
+                    let Some(rg) = self.reader.term_row_groups().get(self.rg_index) else {
+                        return Ok(false);
+                    };
+                    if let Some(upper) = self.upper
+                        && rg.term_min.as_slice() >= upper
+                    {
+                        // row groups are sorted: everything later is past
+                        // the range too
+                        return Ok(false);
+                    }
+                    if let Some(lower) = self.lower
+                        && rg.term_max.as_slice() < lower
+                    {
+                        self.rg_index += 1;
+                        continue;
+                    }
+                    break;
+                }
+                // loads the row-group FST on first touch (compaction inputs
+                // are in-memory blobs: a pure decode, no fetch)
+                let mut range = self.reader.rg_fst(self.rg_index)?.range();
+                if let Some(lower) = self.lower {
+                    range = range.ge(lower);
+                }
+                if let Some(upper) = self.upper {
+                    range = range.lt(upper);
+                }
+                self.stream = Some(range.into_stream());
+            }
+            let first_ordinal = self.reader.term_row_groups()[self.rg_index].first_ordinal;
+            let stream = self.stream.as_mut().expect("stream set above");
+            let Some((key, local)) = stream.next() else {
+                self.stream = None;
+                self.rg_index += 1;
+                continue;
+            };
+            let Some((token, field_id)) = split_key(key) else {
+                return Err(VixError::Malformed(format!(
+                    "dictionary key too short to carry a field-id prefix: {key:?}"
+                )));
+            };
+            std::mem::swap(&mut self.cur_key, &mut self.prev_key);
+            if field_id == KEY_FIELD_ID {
+                // key terms carry the reserved marker in every file
+                self.cur_key.clear();
+                self.cur_key.extend_from_slice(key);
+            } else {
+                let mapped = self.field_map.get(field_id as usize).copied().flatten();
+                let Some(new_id) = mapped else {
+                    // no output field id: the term is dropped (the caller
+                    // marks the field partial, like a rebuild would)
+                    self.dropped.insert(field_id);
+                    std::mem::swap(&mut self.cur_key, &mut self.prev_key);
+                    continue;
+                };
+                write_composite(&mut self.cur_key, token, new_id);
+            }
+            if self.started && self.cur_key <= self.prev_key {
+                // field-id remapping is order-preserving for real-world keys
+                // (ids are assigned by sorted field name everywhere), but a
+                // remap that reorders ids could still reorder keys — bail
+                // out so the caller falls back to a rebuild
+                return Err(VixError::Malformed(
+                    "remapped term stream is not strictly ascending; the merged dictionary \
+                     cannot be built from the inputs"
+                        .to_string(),
+                ));
+            }
+            self.started = true;
+            self.cur_ordinal = first_ordinal + local;
+            return Ok(true);
+        }
+    }
+
+    /// Names of the fields that had value terms dropped.
+    fn dropped_field_names(&self) -> impl Iterator<Item = &str> {
+        self.dropped
+            .iter()
+            .filter_map(|&id| self.field_names.get(id as usize).map(String::as_str))
+    }
+}
+
+/// The merged index of [`merge_indexes`].
+pub(crate) struct MergedIndexResult {
+    /// `(dict, terms)` blob bytes; `None` when the inputs carry no terms.
+    pub blobs: Option<(Vec<u8>, Vec<u8>)>,
+    pub term_count: u64,
+    /// Per-file value-bloom hashes for the MERGED file (collected by the
+    /// k-way workers over the deduplicated output terms).
+    pub bloom: crate::bloom::BloomHashAcc,
+    /// Fields whose value terms were dropped for lack of an output field id.
+    pub dropped: BTreeSet<String>,
+}
+
+/// Merge the inputs' term dictionaries into the final `dict`/`terms` blobs.
+///
+/// The key space is partitioned into up to `threads` disjoint ranges (bounds
+/// sampled from the inputs' row-group `term_min`s — see
+/// [`partition_bounds`]); each range k-way merges independently on its own
+/// thread into its own [`TermSink`], and the sinks' parts are stitched into
+/// the blobs ([`write_index_blobs`] rebases the row-group ordinals). `threads
+/// == 0` uses the machine's available parallelism.
+pub(crate) fn merge_indexes(
+    inputs: &[&VixReader],
+    doc_maps: &[DocIdMap],
+    out_field_ids: &std::collections::HashMap<String, u16>,
+    bloom_field_names: &[String],
+    total_rows: u64,
+    postings_chunk_bytes: usize,
+    rg_term_bytes: usize,
+    cell_min_bytes: usize,
+    threads: usize,
+) -> Result<MergedIndexResult> {
+    debug_assert_eq!(inputs.len(), doc_maps.len());
+    let threads = if threads == 0 {
+        std::thread::available_parallelism().map_or(1, |n| n.get())
+    } else {
+        threads
+    };
+
+    let started = std::time::Instant::now();
+    let tables: Vec<TermTable> = if threads > 1 && inputs.len() > 1 {
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = inputs
+                .iter()
+                .map(|reader| scope.spawn(move || TermTable::load(reader)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("term-table load panicked"))
+                .collect::<Result<_>>()
+        })?
+    } else {
+        inputs
+            .iter()
+            .map(|reader| TermTable::load(reader))
+            .collect::<Result<_>>()?
+    };
+    log::debug!(
+        "vix merge: loaded {} term tables in {:?}",
+        tables.len(),
+        started.elapsed()
+    );
+
+    // Over-partition (4 ranges per thread) and let `threads` workers pull
+    // ranges off a shared cursor: the sampled bounds only approximate work
+    // quantiles, so static one-range-per-thread assignment loses half its
+    // speedup to skew.
+    let started = std::time::Instant::now();
+    let bounds = partition_bounds(inputs, threads.saturating_mul(4));
+    type KeyRange<'b> = (Option<&'b [u8]>, Option<&'b [u8]>);
+    let mut ranges: Vec<KeyRange<'_>> = Vec::with_capacity(bounds.len() + 1);
+    {
+        let mut lower: Option<&[u8]> = None;
+        for bound in &bounds {
+            ranges.push((lower, Some(bound.as_slice())));
+            lower = Some(bound.as_slice());
+        }
+        ranges.push((lower, None));
+    }
+    type RangeOutput = (crate::writer::TermSinkParts, BTreeSet<String>);
+    let outputs: Vec<RangeOutput> = if ranges.len() > 1 {
+        use std::sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let next = AtomicUsize::new(0);
+        let slots: Vec<Mutex<Option<Result<RangeOutput>>>> =
+            (0..ranges.len()).map(|_| Mutex::new(None)).collect();
+        std::thread::scope(|scope| {
+            for _ in 0..threads.min(ranges.len()) {
+                scope.spawn(|| {
+                    loop {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(&(lower, upper)) = ranges.get(index) else {
+                            break;
+                        };
+                        let result = merge_term_range(
+                            inputs,
+                            &tables,
+                            doc_maps,
+                            out_field_ids,
+                            bloom_field_names,
+                            total_rows,
+                            postings_chunk_bytes,
+                            rg_term_bytes,
+                            cell_min_bytes,
+                            lower,
+                            upper,
+                        );
+                        let failed = result.is_err();
+                        *slots[index].lock().expect("range slot poisoned") = Some(result);
+                        if failed {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        // Surface the first error (in range order). A `None` slot can only
+        // remain when every worker stopped on an error before reaching it.
+        let mut outputs = Vec::with_capacity(slots.len());
+        let mut first_error = None;
+        for slot in slots {
+            match slot.into_inner().expect("range slot poisoned") {
+                Some(Ok(output)) => outputs.push(output),
+                Some(Err(e)) => {
+                    first_error.get_or_insert(e);
+                }
+                None => {}
+            }
+        }
+        if let Some(e) = first_error {
+            return Err(e);
+        }
+        outputs
+    } else {
+        vec![merge_term_range(
+            inputs,
+            &tables,
+            doc_maps,
+            out_field_ids,
+            bloom_field_names,
+            total_rows,
+            postings_chunk_bytes,
+            rg_term_bytes,
+            cell_min_bytes,
+            None,
+            None,
+        )?]
+    };
+    let merged_at = started.elapsed();
+
+    let mut parts = Vec::with_capacity(outputs.len());
+    let mut dropped = BTreeSet::new();
+    for (part, part_dropped) in outputs {
+        parts.push(part);
+        dropped.extend(part_dropped);
+    }
+    let (blobs, term_count, bloom) = crate::writer::write_index_blobs(parts, threads)?;
+    log::debug!(
+        "vix merge: k-way term merge ({} ranges) {merged_at:?}, dict/terms encode {:?} \
+         ({term_count} terms)",
+        ranges.len(),
+        started.elapsed() - merged_at,
+    );
+    Ok(MergedIndexResult {
+        blobs,
+        bloom,
+        term_count,
+        dropped,
+    })
+}
+
+/// Key-range split points for the parallel merge: NONE under the
+/// field-major (v2) key layout — the retired sampler is UNSOUND there.
+///
+/// It sampled inputs' row-group `term_min`s parsed under the v1 byte form
+/// and used the raw byte strings as range bounds. That was safe for
+/// v1-shaped keys (`{token}\x00{fid}`): a bound's comparison against a key
+/// is decided on the token BEFORE the fid suffix, so a key fell on the same
+/// side under its original and remapped field id. Field-major keys invert
+/// that: `{fid u16 BE}{token}` sorts by INPUT field id FIRST, and every
+/// input has its own fid table — one raw-byte bound cuts different inputs
+/// at DIFFERENT FIELDS, so after the per-input remap to output ids the
+/// per-range sinks no longer cover disjoint ascending output ranges and the
+/// concatenated dictionary carries OVERLAPPING row groups (prod corruption
+/// 2026-07-29: "row groups N and N+1 overlap or are unsorted" on 1GB
+/// second-pass merge outputs, whenever a v2 term_min happened to parse
+/// under the v1 form). A valid v2 sampler must express bounds in the
+/// OUTPUT key space and translate them per input (ENGINE-BACKLOG item 9);
+/// until then every merge runs single-range, and
+/// [`crate::writer::write_index_blobs`] hard-rejects out-of-order parts as
+/// the structural backstop.
+fn partition_bounds(_inputs: &[&VixReader], _threads: usize) -> Vec<Vec<u8>> {
+    Vec::new()
+}
+
+/// K-way merge one key range of the inputs' remapped term streams into a
+/// fresh [`TermSink`]. Postings blobs are final: dense terms (`doc_count ==
+/// total_rows`) are elided to the empty blob. Also returns the names of the
+/// fields whose value terms were dropped for lack of an output field id.
+#[allow(clippy::too_many_arguments)]
+fn merge_term_range(
+    inputs: &[&VixReader],
+    tables: &[TermTable],
+    doc_maps: &[DocIdMap],
+    out_field_ids: &std::collections::HashMap<String, u16>,
+    bloom_field_names: &[String],
+    total_rows: u64,
+    postings_chunk_bytes: usize,
+    rg_term_bytes: usize,
+    cell_min_bytes: usize,
+    lower: Option<&[u8]>,
+    upper: Option<&[u8]>,
+) -> Result<(crate::writer::TermSinkParts, BTreeSet<String>)> {
+    let bloom_pairs: Vec<(u16, String)> = bloom_field_names
+        .iter()
+        .filter_map(|n| out_field_ids.get(n).map(|id| (*id, n.clone())))
+        .collect();
+    // The fast path splits input keys and rebuilds them under the output
+    // field ids; the remap is order-preserving (ids are assigned by sorted
+    // field name everywhere), backstopped by the strictly-ascending check
+    // in RemappedTermStream::advance.
+    let mut sink =
+        crate::writer::TermSink::new(postings_chunk_bytes, rg_term_bytes, cell_min_bytes)
+            .with_bloom(crate::bloom::BloomHashAcc::from_pairs(bloom_pairs));
+    let mut streams: Vec<RemappedTermStream<'_>> = inputs
+        .iter()
+        .map(|reader| RemappedTermStream::new(reader, out_field_ids, lower, upper))
+        .collect::<Result<_>>()?;
+    let mut alive: Vec<bool> = Vec::with_capacity(streams.len());
+    for stream in &mut streams {
+        alive.push(stream.advance()?);
+    }
+
+    let mut key: Vec<u8> = Vec::new();
+    let mut contributors: Vec<usize> = Vec::new();
+    let mut ids: Vec<u32> = Vec::new();
+    let mut blob: Vec<u8> = Vec::new();
+    loop {
+        // smallest current key across the live streams (k is small: a linear
+        // scan beats a heap's per-term allocations)
+        contributors.clear();
+        for (index, stream) in streams.iter().enumerate() {
+            if !alive[index] {
+                continue;
+            }
+            if contributors.is_empty() {
+                contributors.push(index);
+                continue;
+            }
+            match stream.cur_key.cmp(&streams[contributors[0]].cur_key) {
+                std::cmp::Ordering::Less => {
+                    contributors.clear();
+                    contributors.push(index);
+                }
+                std::cmp::Ordering::Equal => contributors.push(index),
+                std::cmp::Ordering::Greater => {}
+            }
+        }
+        if contributors.is_empty() {
+            break;
+        }
+        key.clear();
+        key.extend_from_slice(&streams[contributors[0]].cur_key);
+
+        let mut doc_count = 0u64;
+        for &index in &contributors {
+            doc_count += u64::from(tables[index].doc_count(streams[index].cur_ordinal));
+        }
+        if doc_count > total_rows {
+            return Err(VixError::Malformed(format!(
+                "merged doc_count {doc_count} exceeds the merged row count {total_rows} \
+                 (doc-id maps overlap?)"
+            )));
+        }
+
+        blob.clear();
+        if doc_count == total_rows && total_rows > 0 {
+            // dense in the merged file: elide (re-checked against the merged
+            // row count, independent of the inputs' density)
+        } else {
+            merge_postings(
+                &streams,
+                tables,
+                inputs,
+                doc_maps,
+                &contributors,
+                doc_count,
+                &mut ids,
+                &mut blob,
+            )?;
+        }
+        sink.push(&key, doc_count as u32, &blob)?;
+
+        for &index in &contributors {
+            alive[index] = streams[index].advance()?;
+        }
+    }
+
+    let mut dropped = BTreeSet::new();
+    for stream in &streams {
+        dropped.extend(stream.dropped_field_names().map(str::to_string));
+    }
+    Ok((sink.into_parts()?, dropped))
+}
+
+/// Union the contributors' postings into `blob` (encoded), remapping doc ids
+/// through the inputs' [`DocIdMap`]s.
+#[allow(clippy::too_many_arguments)]
+fn merge_postings(
+    streams: &[RemappedTermStream<'_>],
+    tables: &[TermTable],
+    inputs: &[&VixReader],
+    doc_maps: &[DocIdMap],
+    contributors: &[usize],
+    doc_count: u64,
+    ids: &mut Vec<u32>,
+    blob: &mut Vec<u8>,
+) -> Result<()> {
+    // single contributor at offset 0: the encoded blob is valid verbatim
+    if let [index] = contributors
+        && let DocIdMap::Offset(0) = doc_maps[*index]
+    {
+        let encoded = tables[*index].postings_blob(streams[*index].cur_ordinal);
+        if !encoded.is_empty() {
+            blob.extend_from_slice(encoded);
+            return Ok(());
+        }
+        // dense-elided in the input: fall through and expand it
+    }
+
+    let all_offsets = contributors
+        .iter()
+        .all(|&index| matches!(doc_maps[index], DocIdMap::Offset(_)));
+    let mut order: Vec<usize> = contributors.to_vec();
+    if all_offsets {
+        // disjoint contiguous runs: appending in offset order keeps the
+        // merged list ascending with no sort
+        order.sort_unstable_by_key(|&index| match doc_maps[index] {
+            DocIdMap::Offset(offset) => offset,
+            DocIdMap::Table(_) => unreachable!("all_offsets checked above"),
+        });
+    }
+
+    ids.clear();
+    ids.reserve(doc_count as usize);
+    for &index in &order {
+        let input_rows = inputs[index].row_count();
+        let input_doc_count = tables[index].doc_count(streams[index].cur_ordinal);
+        let encoded = tables[index].postings_blob(streams[index].cur_ordinal);
+        match (&doc_maps[index], encoded.is_empty() && input_doc_count > 0) {
+            (DocIdMap::Offset(offset), true) => {
+                // dense in the input: ids are 0..row_count
+                check_input_dense(input_doc_count, input_rows)?;
+                ids.extend(*offset..*offset + input_rows as u32);
+            }
+            (DocIdMap::Table(table), true) => {
+                check_input_dense(input_doc_count, input_rows)?;
+                ids.extend_from_slice(table);
+            }
+            (DocIdMap::Offset(offset), false) => {
+                postings::decode_each(encoded, input_doc_count as usize, |doc| {
+                    if u64::from(doc) >= input_rows {
+                        return Err(doc_out_of_range(doc, input_rows));
+                    }
+                    ids.push(doc + *offset);
+                    Ok(())
+                })?;
+            }
+            (DocIdMap::Table(table), false) => {
+                postings::decode_each(encoded, input_doc_count as usize, |doc| {
+                    if u64::from(doc) >= input_rows {
+                        return Err(doc_out_of_range(doc, input_rows));
+                    }
+                    ids.push(table[doc as usize]);
+                    Ok(())
+                })?;
+            }
+        }
+    }
+    if !all_offsets {
+        // a permutation from a time-ordered interleave is not monotonic per
+        // input: sort, then prove distinctness (injective maps guarantee it;
+        // a duplicate means the maps were wrong)
+        ids.sort_unstable();
+        if ids.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(VixError::Malformed(
+                "merged postings contain a duplicate doc id (doc-id maps overlap)".to_string(),
+            ));
+        }
+    }
+    *blob = postings::encode(ids)?;
+    Ok(())
+}
+
+fn check_input_dense(doc_count: u32, input_rows: u64) -> Result<()> {
+    if u64::from(doc_count) != input_rows {
+        return Err(VixError::Malformed(format!(
+            "empty postings blob for a term with doc_count {doc_count} != row_count \
+             {input_rows} (not dense-elided, so corrupt)"
+        )));
+    }
+    Ok(())
+}
+
+fn doc_out_of_range(doc: u32, input_rows: u64) -> VixError {
+    VixError::Malformed(format!(
+        "postings doc id {doc} out of range (row_count {input_rows})"
+    ))
+}

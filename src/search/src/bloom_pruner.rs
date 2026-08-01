@@ -15,7 +15,7 @@
 
 //! Search-side bloom prune layer — transposed (block-major) read.
 //!
-//! Given a candidate `Vec<FileKey>` and the query's tantivy `IndexCondition`,
+//! Given a candidate `Vec<FileKey>` and the query's `IndexCondition`,
 //! this module pulls the bloom-decidable predicates out of it
 //! ([`collect_decidable`]) and then:
 //!
@@ -84,7 +84,7 @@ enum FetchError {
 
 /// Outer concurrency cap on `.bf` buckets processed in parallel.
 ///
-/// Mirrors the tantivy search path (`storage.rs`): use the same
+/// Mirrors the index search path (`storage.rs`): use the same
 /// `query_thread_num` knob (defaults to `cpu_num * 4` in cluster mode,
 /// `cpu_num` in local). No hardcoded constant — large multi-day
 /// trace_id lookups need to fan out far beyond 32 buckets.
@@ -119,7 +119,7 @@ pub async fn prune(
     let mut without_bloom: Vec<FileKey> = Vec::new();
     let mut with_bloom: Vec<FileKey> = Vec::with_capacity(files.len());
     for f in files {
-        if f.meta.bloom_ver == 0 {
+        if f.meta.bloom_ver <= 0 {
             without_bloom.push(f);
         } else {
             with_bloom.push(f);
@@ -130,7 +130,7 @@ pub async fn prune(
             "[trace_id {trace_id}] search->bloom: stream {org_id}/{stream_type}/{stream_name}, \
              all {total_input} files have bloom_ver=0 — no `.bf` covers any of them. \
              Likely causes: compactor hasn't built `.bf` for this hour yet, or these files \
-             produced no blooms (target field not in tantivy schema at build time, or \
+             produced no blooms (target field not indexed at build time, or \
              index_size=0). Falling through, no pruning applied."
         );
         return without_bloom;
@@ -358,7 +358,7 @@ async fn run_group(
         log::warn!(
             "[trace_id {trace_id}] search->bloom: group `{path}`: no rows resolved — \
              footer fields=[{}], requested=[{}]. Likely cause: stream \
-             `bloom_filter_fields ∩ index_fields` at build time differed from the queried \
+             `bloom_filter_fields` at build time differed from the queried \
              field. Keeping all files in this group.",
             footer_fields.join(", "),
             requested_fields.join(", "),
@@ -474,8 +474,9 @@ fn footer_shortfall(suffix: &[u8], total: u64) -> Option<u64> {
 /// that fold cleanly become bloom checks, the rest are silently skipped (the
 /// affected files pass the bloom step untouched).
 ///
-/// `bloom_indexed_fields` is the stream's `bloom_filter_fields ∩ index_fields`
-/// — passing an unrelated field would just waste IO on guaranteed misses.
+/// `bloom_indexed_fields` is the stream's `bloom_filter_fields` (restricted to
+/// fields present in the schema) — passing an unrelated field would just waste
+/// IO on guaranteed misses.
 fn collect_decidable(
     cond: &IndexCondition,
     bloom_indexed_fields: &HashSet<String>,

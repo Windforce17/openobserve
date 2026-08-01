@@ -16,10 +16,11 @@
 use std::io::prelude::*;
 
 use axum::{
-    Extension,
+    Extension, Json,
     body::Bytes,
     extract::{Multipart, Path},
-    response::Response,
+    http::StatusCode,
+    response::{IntoResponse, Response},
 };
 use config::utils::json;
 use flate2::read::ZlibDecoder;
@@ -30,7 +31,7 @@ use crate::{
     common::{
         meta::{
             http::HttpResponse as MetaHttpResponse,
-            ingestion::{IngestUser, IngestionRequest},
+            ingestion::{IngestUser, IngestionRequest, IngestionResponse},
             middleware_data::RumExtraData,
         },
         utils::auth::UserEmail,
@@ -38,6 +39,42 @@ use crate::{
     handler::http::extractors::Headers,
     service::logs,
 };
+
+/// Render an ingest result with the HTTP status the ingest layer reported —
+/// the same mapping as the sibling logs handler's `ingest_response`.
+///
+/// A stream whose durable write failed reports 500/503 and MUST NOT be
+/// answered with a 2xx: the RUM SDK retries on 5xx, and an unconditional 200
+/// acked batches that were never stored.
+fn ingest_response(v: IngestionResponse) -> Response {
+    match StatusCode::from_u16(v.code) {
+        Ok(status) if status.is_success() => MetaHttpResponse::json(v),
+        Ok(status) => (status, Json(v)).into_response(),
+        // a code we cannot render is not an ack
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(v)).into_response(),
+    }
+}
+
+/// The response for an ingest that errored before any write was attempted —
+/// the same mapping as the sibling logs handler's Err arm. Backpressure
+/// (`ResourceError`, e.g. the memtable is full at admission control) is a
+/// retryable 503: answering 400 told the RUM SDK the batch was malformed and
+/// it dropped the data permanently. Everything else stays a 400.
+fn ingest_error_response(e: infra::errors::Error) -> Response {
+    // we do not want to log trial period expired errors
+    if !matches!(e, infra::errors::Error::TrialPeriodExpired) {
+        log::error!("Error processing RUM request: {e}");
+    }
+    if matches!(e, infra::errors::Error::ResourceError(_)) {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(MetaHttpResponse::error(StatusCode::SERVICE_UNAVAILABLE, e)),
+        )
+            .into_response()
+    } else {
+        MetaHttpResponse::bad_request(e)
+    }
+}
 
 pub const RUM_LOG_STREAM: &str = "_rumlog";
 pub const RUM_SESSION_REPLAY_STREAM: &str = "_sessionreplay";
@@ -146,8 +183,8 @@ pub async fn data(
     )
     .await
     {
-        Ok(v) => MetaHttpResponse::json(v),
-        Err(e) => MetaHttpResponse::bad_request(e),
+        Ok(v) => ingest_response(v),
+        Err(e) => ingest_error_response(e),
     }
 }
 
@@ -197,8 +234,8 @@ pub async fn log(
     )
     .await
     {
-        Ok(v) => MetaHttpResponse::json(v),
-        Err(e) => MetaHttpResponse::bad_request(e),
+        Ok(v) => ingest_response(v),
+        Err(e) => ingest_error_response(e),
     }
 }
 
@@ -308,14 +345,77 @@ pub async fn sessionreplay(
     )
     .await
     {
-        Ok(v) => MetaHttpResponse::json(v),
-        Err(e) => MetaHttpResponse::bad_request(e),
+        Ok(v) => ingest_response(v),
+        Err(e) => ingest_error_response(e),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::meta::ingestion::{RecordStatus, StreamStatus};
+
+    fn ingestion(code: u16) -> IngestionResponse {
+        IngestionResponse {
+            code,
+            status: vec![StreamStatus {
+                name: RUM_DATA_STREAM.to_string(),
+                status: RecordStatus {
+                    successful: 0,
+                    failed: 3,
+                    error: "wal write failed".to_string(),
+                },
+                items: vec![],
+            }],
+            error: Some("stream [_rumdata]: 3 record(s) not written".to_string()),
+        }
+    }
+
+    /// The ingest layer's code reaches the wire on every RUM endpoint: a
+    /// failed durable write answered 200 acked lost batches.
+    #[test]
+    fn test_rum_write_failure_is_not_acked_with_2xx() {
+        assert_eq!(
+            ingest_response(ingestion(500)).status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            ingest_response(ingestion(503)).status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn test_rum_successful_ingestion_is_200() {
+        let mut ok = ingestion(200);
+        ok.error = None;
+        assert_eq!(ingest_response(ok).status(), StatusCode::OK);
+    }
+
+    /// Admission-control backpressure surfaces as Err before any write: it is
+    /// retryable and must answer 503 — a 400 tells the RUM SDK the batch was
+    /// malformed and it drops the data permanently. Other errors stay 400.
+    #[test]
+    fn test_rum_backpressure_error_is_503_not_400() {
+        let resp = ingest_error_response(infra::errors::Error::ResourceError(
+            "memtable is full".to_string(),
+        ));
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let resp = ingest_error_response(infra::errors::Error::IngestionError(
+            "invalid json".to_string(),
+        ));
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// An out-of-range code must never degrade into a 2xx ack.
+    #[test]
+    fn test_rum_invalid_code_is_not_a_2xx_ack() {
+        assert_eq!(
+            ingest_response(ingestion(0)).status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
 
     #[test]
     fn test_rum_stream_constants() {

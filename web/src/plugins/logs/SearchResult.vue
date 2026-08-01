@@ -608,11 +608,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
           hasHistogramSelection ? histogramSelectionRange : undefined
         "
         :baseFilter="searchObj.data.editorValue"
-        :streamFields="
-          searchObj.data.stream.userDefinedSchema?.length > 0
-            ? searchObj.data.stream.userDefinedSchema
-            : searchObj.data.stream.selectedStreamFields
-        "
+        :streamFields="searchObj.data.stream.selectedStreamFields"
         :logSamples="searchObj.data.queryResults.hits"
         analysisType="volume"
         :availableAnalysisTypes="['volume']"

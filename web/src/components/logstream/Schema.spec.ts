@@ -137,7 +137,7 @@ describe("Schema Component Tests", () => {
       storage_type: "s3",
       stats: { doc_time_min: 0, doc_time_max: 0, doc_num: 0, file_num: 0, storage_size: 0, compressed_size: 0 },
       schema: [{ name: "_timestamp", type: "Int64" }],
-      settings: { partition_time_level: "hourly", partition_keys: {}, full_text_search_keys: [], index_fields: [], bloom_filter_fields: [], data_retention: 30, max_query_range: 0, store_original_data: false, approx_partition: false, defined_schema_fields: [], extended_retention_days: [] },
+      settings: { partition_time_level: "hourly", partition_keys: {}, full_text_search_keys: [], column_store_fields: [], bloom_filter_fields: [], data_retention: 30, max_query_range: 0, store_original_data: false, approx_partition: false, extended_retention_days: [] },
       pattern_associations: [],
     });
   });
@@ -165,13 +165,12 @@ describe("Schema Component Tests", () => {
           partition_time_level: "hourly",
           partition_keys: {},
           full_text_search_keys: ["message"],
-          index_fields: [],
+          column_store_fields: [],
           bloom_filter_fields: [],
           data_retention: 30,
           max_query_range: 0,
           store_original_data: false,
           approx_partition: false,
-          defined_schema_fields: [],
           extended_retention_days: [],
         },
         pattern_associations: [],
@@ -199,13 +198,12 @@ describe("Schema Component Tests", () => {
               partition_time_level: "hourly",
               partition_keys: {},
               full_text_search_keys: ["message"],
-              index_fields: [],
+              column_store_fields: [],
               bloom_filter_fields: [],
               data_retention: 30,
               max_query_range: 0,
               store_original_data: false,
               approx_partition: false,
-              defined_schema_fields: [],
               extended_retention_days: [],
               pattern_associations: [],
             },
@@ -243,20 +241,6 @@ describe("Schema Component Tests", () => {
       wrapper.vm.changePagination(newPagination);
 
       expect(wrapper.vm.selectedPerPage).toBe(50);
-    });
-
-    // Test 4: updateActiveTab function
-    it("should update active tab and result total", () => {
-      wrapper.vm.indexData.defined_schema_fields = ["field1"];
-      wrapper.vm.indexData.schema = [{ name: "field1" }, { name: "field2" }];
-      
-      wrapper.vm.updateActiveTab("schemaFields");
-      expect(wrapper.vm.activeTab).toBe("schemaFields");
-      expect(wrapper.vm.resultTotal).toBe(1);
-      
-      wrapper.vm.updateActiveTab("allFields");
-      expect(wrapper.vm.activeTab).toBe("allFields");
-      expect(wrapper.vm.resultTotal).toBe(2);
     });
 
     // Test 5: updateActiveMainTab function
@@ -297,17 +281,6 @@ describe("Schema Component Tests", () => {
       expect(wrapper.vm.newSchemaFields).toEqual([]);
     });
 
-    // Test 8: hasUserDefinedSchema computed property
-    it("should compute hasUserDefinedSchema correctly", () => {
-      // Initially false
-      expect(wrapper.vm.hasUserDefinedSchema).toBe(false);
-      
-      // Set defined schema fields
-      wrapper.vm.indexData.defined_schema_fields = ["field1"];
-      expect(wrapper.vm.hasUserDefinedSchema).toBe(true);
-    });
-
-
     // Test 10: showDataRetention computed property  
     it("should compute showDataRetention correctly", async () => {
       expect(wrapper.vm.showDataRetention).toBe(true);
@@ -318,7 +291,7 @@ describe("Schema Component Tests", () => {
           modelValue: {
             name: "test-stream",
             stream_type: "enrichment_tables",
-            settings: { defined_schema_fields: [] }
+            settings: {}
           },
         },
         global: {
@@ -339,14 +312,13 @@ describe("Schema Component Tests", () => {
       const property = { name: "message" };
       const settings = {
         full_text_search_keys: ["message"],
-        index_fields: [],
+        column_store_fields: [],
         bloom_filter_fields: [],
         partition_keys: {},
       };
       
       // Mock store properties that are used in getFieldIndices
       wrapper.vm.store.state.zoConfig.default_fts_keys = wrapper.vm.store.state.zoConfig.default_fts_keys || [];
-      wrapper.vm.store.state.zoConfig.default_secondary_index_fields = wrapper.vm.store.state.zoConfig.default_secondary_index_fields || [];
       
       const indices = wrapper.vm.getFieldIndices(property, settings);
       expect(indices).toContain("fullTextSearchKey");
@@ -354,40 +326,41 @@ describe("Schema Component Tests", () => {
     });
 
 
-    // Test 14: getFieldIndices function with secondary index
-    it("should get correct field indices for secondary index", () => {
+    // Test 14: getFieldIndices function with column store
+    it("should get correct field indices for column store", () => {
       const property = { name: "status" };
       const settings = {
         full_text_search_keys: [],
-        index_fields: ["status"],
+        column_store_fields: ["status"],
         bloom_filter_fields: [],
         partition_keys: {},
       };
-      
+
       // Mock store properties that are used in getFieldIndices
       wrapper.vm.store.state.zoConfig.default_fts_keys = wrapper.vm.store.state.zoConfig.default_fts_keys || [];
-      wrapper.vm.store.state.zoConfig.default_secondary_index_fields = wrapper.vm.store.state.zoConfig.default_secondary_index_fields || [];
-      
+
       const indices = wrapper.vm.getFieldIndices(property, settings);
-      expect(indices).toContain("secondaryIndexKey");
+      expect(indices).toContain("columnStoreKey");
+      expect(property.index_type).toContain("columnStoreKey");
     });
 
-    // Test 15: getFieldIndices function with bloom filter
-    it("should get correct field indices for bloom filter", () => {
+    // Test 15: bloom filters are retired — stored bloom_filter_fields no
+    // longer surface as an index type on the field
+    it("should not surface retired bloom filter fields as an index type", () => {
       const property = { name: "userId" };
       const settings = {
         full_text_search_keys: [],
-        index_fields: [],
+        column_store_fields: [],
         bloom_filter_fields: ["userId"],
         partition_keys: {},
       };
-      
+
       // Mock store properties that are used in getFieldIndices
       wrapper.vm.store.state.zoConfig.default_fts_keys = wrapper.vm.store.state.zoConfig.default_fts_keys || [];
-      wrapper.vm.store.state.zoConfig.default_secondary_index_fields = wrapper.vm.store.state.zoConfig.default_secondary_index_fields || [];
-      
+
       const indices = wrapper.vm.getFieldIndices(property, settings);
-      expect(indices).toContain("bloomFilterKey");
+      expect(indices).not.toContain("bloomFilterKey");
+      expect(indices).toEqual([]);
     });
 
     // Test 16: getFieldIndices function with key partition
@@ -395,7 +368,7 @@ describe("Schema Component Tests", () => {
       const property = { name: "region" };
       const settings = {
         full_text_search_keys: [],
-        index_fields: [],
+        column_store_fields: [],
         bloom_filter_fields: [],
         partition_keys: {
           level1: { field: "region", types: "value", disabled: false }
@@ -404,7 +377,6 @@ describe("Schema Component Tests", () => {
       
       // Mock store properties that are used in getFieldIndices
       wrapper.vm.store.state.zoConfig.default_fts_keys = wrapper.vm.store.state.zoConfig.default_fts_keys || [];
-      wrapper.vm.store.state.zoConfig.default_secondary_index_fields = wrapper.vm.store.state.zoConfig.default_secondary_index_fields || [];
       
       const indices = wrapper.vm.getFieldIndices(property, settings);
       expect(indices).toContain("keyPartition");
@@ -416,7 +388,7 @@ describe("Schema Component Tests", () => {
       const property = { name: "customerId" };
       const settings = {
         full_text_search_keys: [],
-        index_fields: [],
+        column_store_fields: [],
         bloom_filter_fields: [],
         partition_keys: {
           level1: { field: "customerId", types: { hash: 16 }, disabled: false }
@@ -425,65 +397,9 @@ describe("Schema Component Tests", () => {
       
       // Mock store properties that are used in getFieldIndices
       wrapper.vm.store.state.zoConfig.default_fts_keys = wrapper.vm.store.state.zoConfig.default_fts_keys || [];
-      wrapper.vm.store.state.zoConfig.default_secondary_index_fields = wrapper.vm.store.state.zoConfig.default_secondary_index_fields || [];
       
       const indices = wrapper.vm.getFieldIndices(property, settings);
       expect(indices).toContain("hashPartition_16");
-    });
-
-    // Test 18: updateDefinedSchemaFields function - removing fields
-    it("should update defined schema fields when removing", () => {
-      wrapper.vm.indexData.defined_schema_fields = ["field1", "field2", "field3"];
-      wrapper.vm.selectedFields = [{ name: "field2" }];
-      wrapper.vm.activeTab = "schemaFields";
-      
-      wrapper.vm.updateDefinedSchemaFields();
-      
-      expect(wrapper.vm.indexData.defined_schema_fields).toEqual(["field1", "field3"]);
-      expect(wrapper.vm.selectedFields).toEqual([]);
-      expect(wrapper.vm.formDirtyFlag).toBe(true);
-    });
-
-    // Test 19: updateDefinedSchemaFields function - adding fields
-    it("should update defined schema fields when adding", () => {
-      wrapper.vm.indexData.defined_schema_fields = ["field1"];
-      wrapper.vm.selectedFields = [{ name: "field2" }];
-      wrapper.vm.activeTab = "allFields";
-      
-      wrapper.vm.updateDefinedSchemaFields();
-      
-      expect(wrapper.vm.indexData.defined_schema_fields).toContain("field1");
-      expect(wrapper.vm.indexData.defined_schema_fields).toContain("field2");
-    });
-
-    // Test 20: updateDefinedSchemaFields function - switch tab when empty
-    it("should switch to allFields when schema fields becomes empty", () => {
-      wrapper.vm.indexData.defined_schema_fields = ["field1"];
-      wrapper.vm.selectedFields = [{ name: "field1" }];
-      wrapper.vm.activeTab = "schemaFields";
-      
-      wrapper.vm.updateDefinedSchemaFields();
-      
-      expect(wrapper.vm.indexData.defined_schema_fields).toEqual([]);
-      expect(wrapper.vm.activeTab).toBe("allFields");
-    });
-
-    // Test 21: updateStreamResponse function
-    it("should update stream response with user defined flags", () => {
-      const streamResponse = {
-        settings: {
-          defined_schema_fields: ["field1"]
-        },
-        schema: [
-          { name: "field1", type: "string" },
-          { name: "field2", type: "number" }
-        ]
-      };
-      
-      const result = wrapper.vm.updateStreamResponse(streamResponse);
-      
-      expect(result.schema[0].isUserDefined).toBe(true);
-      expect(result.schema[1].isUserDefined).toBe(false);
     });
 
     // Test 22: formatDate function
@@ -640,28 +556,6 @@ describe("Schema Component Tests", () => {
       expect(result).toHaveLength(3);
     });
 
-    // Test 35: computedSchemaFieldsName computed property
-    it("should compute schema fields name correctly", () => {
-      // Without user defined schema
-      expect(wrapper.vm.computedSchemaFieldsName).toBe("All Fields");
-      
-      // With user defined schema
-      wrapper.vm.indexData.defined_schema_fields = ["field1"];
-      expect(wrapper.vm.computedSchemaFieldsName).toBe("All Fields");
-    });
-
-    // Test 36: tabs computed property
-    it("should compute tabs correctly", () => {
-      wrapper.vm.indexData.defined_schema_fields = ["field1"];
-      wrapper.vm.indexData.schema = [{ name: "field1" }, { name: "field2" }];
-      
-      const tabs = wrapper.vm.tabs;
-      expect(tabs[0].value).toBe("schemaFields");
-      expect(tabs[1].value).toBe("allFields");
-      expect(tabs[0].label).toContain("User Defined Schema (1)");
-      expect(tabs[1].label).toContain("All Fields (2)");
-    });
-
     // Test 37: mainTabs computed property
     it("should compute main tabs correctly", () => {
       const mainTabs = wrapper.vm.mainTabs;
@@ -671,15 +565,35 @@ describe("Schema Component Tests", () => {
       expect(mainTabs[1].label).toBe("Extended Retention");
     });
 
-    // Test 38: isSchemaUDSEnabled computed property
-    it("should compute UDS enabled correctly", () => {
-      expect(wrapper.vm.isSchemaUDSEnabled).toBe(true);
+    // New-architecture checks: Column store replaces Secondary index in the
+    // per-field index options (bloom filter retired — the core-file term
+    // index supersedes it), and the term-index hint explains the automatic
+    // exact-match indexing of string fields.
+    it("should expose the new streamIndexType options (column store replaces secondary index, no bloom)", () => {
+      const values = wrapper.vm.streamIndexType.map((o: any) => o.value);
+      expect(values).toEqual([
+        "fullTextSearchKey",
+        "columnStoreKey",
+        "keyPartition",
+        "prefixPartition",
+        "hashPartition_8",
+        "hashPartition_16",
+        "hashPartition_32",
+        "hashPartition_64",
+        "hashPartition_128",
+      ]);
+      const columnStore = wrapper.vm.streamIndexType.find(
+        (o: any) => o.value === "columnStoreKey",
+      );
+      expect(columnStore.label).toBe("Column store");
     });
 
-    // Test 39: allFieldsName computed property
-    it("should compute all fields name correctly", () => {
-      // The allFieldsName is a computed property that depends on store state
-      expect(wrapper.vm.allFieldsName).toBe("_all");
+    it("should render the term-index hint (all string fields auto-indexed)", () => {
+      const hint = wrapper.find('[data-test="schema-term-index-hint"]');
+      expect(hint.exists()).toBe(true);
+      expect(hint.text()).toContain(
+        "All string fields are indexed for exact match automatically.",
+      );
     });
 
     // Test 40: showStoreOriginalDataToggle computed property
@@ -692,7 +606,7 @@ describe("Schema Component Tests", () => {
           modelValue: {
             name: "test-stream",
             stream_type: "traces",
-            settings: { defined_schema_fields: [] }
+            settings: {}
           },
         },
         global: {
@@ -744,17 +658,16 @@ describe("Schema Component Tests", () => {
       expect(wrapper.vm.patternAssociations.field1[0].apply_at).toBe("new");
     });
 
-    it("should handle filter field function with schema fields", () => {
-      wrapper.vm.indexData.defined_schema_fields = ["field1", "field2"];
-      
+    it("should ignore the tab suffix after @ in filterFieldFn", () => {
       const rows = [
-        { name: "field1" },
-        { name: "field2" },
-        { name: "field3" }
+        { name: "field1", index_type: [] },
+        { name: "field2", index_type: [] },
+        { name: "field3", index_type: [] },
       ];
-      
+
+      // The part after "@" (former tab name) is ignored — matching is by name.
       const result = wrapper.vm.filterFieldFn(rows, "field@schemaFields");
-      expect(result.length).toBe(2);
+      expect(result.length).toBe(3);
     });
 
     it("should handle empty date value in dateChangeValue", () => {
@@ -767,16 +680,6 @@ describe("Schema Component Tests", () => {
     it("should handle scroll when element doesn't exist", () => {
       vi.spyOn(document, "getElementById").mockReturnValue(null);
       expect(() => wrapper.vm.scrollToAddFields()).not.toThrow();
-    });
-
-    it("should handle empty stream response in updateStreamResponse", () => {
-      const streamResponse = {
-        settings: {},
-        schema: []
-      };
-      
-      const result = wrapper.vm.updateStreamResponse(streamResponse);
-      expect(result.schema).toEqual([]);
     });
 
     it("should handle partition key conflicts in disableOptions", () => {
@@ -795,14 +698,15 @@ describe("Schema Component Tests", () => {
 
     it("should not disable non-conflicting options", () => {
       const schema = { index_type: ["fullTextSearchKey"] };
-      const bloomOption = { value: "bloomFilterKey" };
+      const columnStoreOption = { value: "columnStoreKey" };
 
-      expect(wrapper.vm.disableOptions(schema, bloomOption)).toBe(false);
+      expect(wrapper.vm.disableOptions(schema, columnStoreOption)).toBe(false);
     });
   });
 
-  // Performance Fields Popup Tests
-  describe("Performance Fields Popup Tests", () => {
+  // Main tab switching tests (the Performance Fields / UDS popup was removed
+  // with the new indexing architecture).
+  describe("Main Tab Switching Tests", () => {
     beforeEach(async () => {
       mockGetStream.mockResolvedValue({
         name: "test-stream",
@@ -818,7 +722,7 @@ describe("Schema Component Tests", () => {
         },
         schema: [
           { name: "user_id", type: "Utf8", index_type: ["fullTextSearchKey"] },
-          { name: "log_level", type: "Utf8", index_type: ["secondaryIndexKey"] },
+          { name: "log_level", type: "Utf8", index_type: ["columnStoreKey"] },
           { name: "message", type: "Utf8", index_type: ["fullTextSearchKey"] },
           { name: "timestamp", type: "Int64", index_type: [] },
         ],
@@ -826,13 +730,12 @@ describe("Schema Component Tests", () => {
           partition_time_level: "hourly",
           partition_keys: {},
           full_text_search_keys: ["user_id", "message"],
-          index_fields: ["log_level"],
+          column_store_fields: ["log_level"],
           bloom_filter_fields: [],
           data_retention: 30,
           max_query_range: 0,
           store_original_data: false,
           approx_partition: false,
-          defined_schema_fields: [],
           extended_retention_days: [],
         },
         pattern_associations: [],
@@ -860,7 +763,7 @@ describe("Schema Component Tests", () => {
               {
                 name: "log_level",
                 type: "Utf8",
-                index_type: ["secondaryIndexKey"],
+                index_type: ["columnStoreKey"],
               },
               {
                 name: "message",
@@ -877,13 +780,12 @@ describe("Schema Component Tests", () => {
               partition_time_level: "hourly",
               partition_keys: {},
               full_text_search_keys: ["user_id", "message"],
-              index_fields: ["log_level"],
+              column_store_fields: ["log_level"],
               bloom_filter_fields: [],
               data_retention: 30,
               max_query_range: 0,
               store_original_data: false,
               approx_partition: false,
-              defined_schema_fields: [],
               extended_retention_days: [],
               pattern_associations: []
             },
@@ -898,8 +800,6 @@ describe("Schema Component Tests", () => {
                 zoConfig: {
                   ...store.state.zoConfig,
                   default_fts_keys: ["user_id"],
-                  default_secondary_index_fields: ["log_level"],
-                  user_defined_schema_max_fields: 100,
                 }
               }
             },
@@ -911,195 +811,6 @@ describe("Schema Component Tests", () => {
       await flushPromises();
     });
 
-    // Test 1: getMissingPerformanceFields should detect missing FTS fields
-    it("should detect missing FTS fields", () => {
-      const selectedFieldsSet = new Set(["timestamp"]); // Not selecting FTS fields
-      const missing = wrapper.vm.getMissingPerformanceFields(selectedFieldsSet);
-
-      expect(missing.length).toBeGreaterThan(0);
-      const ftsFields = missing.filter(f => f.type === "Full Text Search");
-      expect(ftsFields.length).toBeGreaterThan(0);
-      expect(ftsFields.some(f => f.name === "user_id" || f.name === "message")).toBe(true);
-    });
-
-    // Test 2: getMissingPerformanceFields should detect missing Secondary Index fields
-    it("should detect missing Secondary Index fields", () => {
-      const selectedFieldsSet = new Set(["timestamp"]); // Not selecting secondary index fields
-      const missing = wrapper.vm.getMissingPerformanceFields(selectedFieldsSet);
-
-      expect(missing.length).toBeGreaterThan(0);
-      const secondaryIndexFields = missing.filter(f => f.type === "Secondary Index");
-      expect(secondaryIndexFields.length).toBeGreaterThan(0);
-      expect(secondaryIndexFields.some(f => f.name === "log_level")).toBe(true);
-    });
-
-    // Test 3: getMissingPerformanceFields should not detect fields already selected
-    it("should not detect fields already selected by user", () => {
-      const selectedFieldsSet = new Set(["user_id", "message", "log_level", "timestamp"]);
-      const missing = wrapper.vm.getMissingPerformanceFields(selectedFieldsSet);
-
-      expect(missing.length).toBe(0);
-    });
-
-    // Test 4: getMissingPerformanceFields should detect default FTS keys from config
-    it("should detect default FTS keys from backend config", () => {
-      // user_id is in default_fts_keys
-      const selectedFieldsSet = new Set(["message", "timestamp"]); // Not including user_id
-      const missing = wrapper.vm.getMissingPerformanceFields(selectedFieldsSet);
-
-      const ftsFields = missing.filter(f => f.type === "Full Text Search");
-      expect(ftsFields.some(f => f.name === "user_id")).toBe(true);
-    });
-
-    // Test 5: getMissingPerformanceFields should detect default secondary index keys from config
-    it("should detect default secondary index keys from backend config", () => {
-      // log_level is in default_secondary_index_fields
-      const selectedFieldsSet = new Set(["user_id", "timestamp"]); // Not including log_level
-      const missing = wrapper.vm.getMissingPerformanceFields(selectedFieldsSet);
-
-      const secondaryIndexFields = missing.filter(f => f.type === "Secondary Index");
-      expect(secondaryIndexFields.some(f => f.name === "log_level")).toBe(true);
-    });
-
-    // Test 6: updateDefinedSchemaFields should show popup when UDS is enabled first time with missing fields
-    it("should show performance fields popup when enabling UDS for first time", () => {
-      wrapper.vm.indexData.defined_schema_fields = []; // First time enabling UDS
-      wrapper.vm.selectedFields = [{ name: "timestamp" }];
-      wrapper.vm.activeTab = "allFields";
-
-      wrapper.vm.updateDefinedSchemaFields();
-
-      expect(wrapper.vm.confirmAddPerformanceFieldsDialog).toBe(true);
-      expect(wrapper.vm.missingPerformanceFields.length).toBeGreaterThan(0);
-      expect(wrapper.vm.pendingSelectedFields).toEqual(["timestamp"]);
-    });
-
-    // Test 7: updateDefinedSchemaFields should not show popup when all performance fields are selected
-    it("should not show popup when all performance fields are already selected", () => {
-      wrapper.vm.indexData.defined_schema_fields = []; // First time enabling UDS
-      wrapper.vm.selectedFields = [
-        { name: "user_id" },
-        { name: "message" },
-        { name: "log_level" },
-        { name: "timestamp" }
-      ];
-      wrapper.vm.activeTab = "allFields";
-
-      wrapper.vm.updateDefinedSchemaFields();
-
-      expect(wrapper.vm.confirmAddPerformanceFieldsDialog).toBe(false);
-      expect(wrapper.vm.indexData.defined_schema_fields).toContain("user_id");
-      expect(wrapper.vm.indexData.defined_schema_fields).toContain("message");
-    });
-
-    // Test 8: updateDefinedSchemaFields should not show popup when UDS already has fields
-    it("should not show popup when UDS already has existing fields", () => {
-      wrapper.vm.indexData.defined_schema_fields = ["existing_field"]; // Already has fields
-      wrapper.vm.selectedFields = [{ name: "timestamp" }];
-      wrapper.vm.activeTab = "allFields";
-
-      wrapper.vm.updateDefinedSchemaFields();
-
-      expect(wrapper.vm.confirmAddPerformanceFieldsDialog).toBe(false);
-      expect(wrapper.vm.indexData.defined_schema_fields).toContain("existing_field");
-      expect(wrapper.vm.indexData.defined_schema_fields).toContain("timestamp");
-    });
-
-    // Test 9: addPerformanceFields should add missing fields when user clicks OK
-    it("should add missing performance fields when user clicks OK", () => {
-      wrapper.vm.pendingSelectedFields = ["timestamp"];
-      wrapper.vm.missingPerformanceFields = [
-        { name: "user_id", type: "Full Text Search" },
-        { name: "log_level", type: "Secondary Index" }
-      ];
-
-      wrapper.vm.addPerformanceFields();
-
-      expect(wrapper.vm.confirmAddPerformanceFieldsDialog).toBe(false);
-      expect(wrapper.vm.indexData.defined_schema_fields).toContain("timestamp");
-      expect(wrapper.vm.indexData.defined_schema_fields).toContain("user_id");
-      expect(wrapper.vm.indexData.defined_schema_fields).toContain("log_level");
-      expect(wrapper.vm.missingPerformanceFields).toEqual([]);
-      expect(wrapper.vm.pendingSelectedFields).toEqual([]);
-    });
-
-    // Test 10: skipPerformanceFields should not add missing fields when user clicks Skip
-    it("should not add missing performance fields when user clicks Skip", () => {
-      wrapper.vm.pendingSelectedFields = ["timestamp"];
-      wrapper.vm.missingPerformanceFields = [
-        { name: "user_id", type: "Full Text Search" },
-        { name: "log_level", type: "Secondary Index" }
-      ];
-
-      wrapper.vm.skipPerformanceFields();
-
-      expect(wrapper.vm.confirmAddPerformanceFieldsDialog).toBe(false);
-      expect(wrapper.vm.indexData.defined_schema_fields).toContain("timestamp");
-      expect(wrapper.vm.indexData.defined_schema_fields).not.toContain("user_id");
-      expect(wrapper.vm.indexData.defined_schema_fields).not.toContain("log_level");
-      expect(wrapper.vm.missingPerformanceFields).toEqual([]);
-      expect(wrapper.vm.pendingSelectedFields).toEqual([]);
-    });
-
-    // Test 11: Removed test for missingPerformanceFieldsByType
-    // This computed property is now internal to PerformanceFieldsDialog component
-    // The grouping functionality is still tested through the dialog component's behavior
-
-    // Test 12: proceedWithAddingFields should filter out timestamp and allFields
-    it("should filter out timestamp and _all fields when adding", () => {
-      const selectedFieldsSet = new Set(["user_id", "_all", "_timestamp"]);
-      wrapper.vm.store.state.zoConfig.timestamp_column = "_timestamp";
-
-      wrapper.vm.proceedWithAddingFields(selectedFieldsSet);
-
-      expect(wrapper.vm.indexData.defined_schema_fields).toContain("user_id");
-      expect(wrapper.vm.indexData.defined_schema_fields).not.toContain("_all");
-      expect(wrapper.vm.indexData.defined_schema_fields).not.toContain("_timestamp");
-    });
-
-    // Test 13: proceedWithAddingFields should mark form as dirty
-    it("should mark form as dirty when adding fields", () => {
-      wrapper.vm.formDirtyFlag = false;
-      const selectedFieldsSet = new Set(["user_id"]);
-
-      wrapper.vm.proceedWithAddingFields(selectedFieldsSet);
-
-      expect(wrapper.vm.formDirtyFlag).toBe(true);
-    });
-
-    // Test 14: getMissingPerformanceFields should only include fields that exist in schema
-    it("should only include backend default fields that exist in current schema", () => {
-      // Add a field to default config that doesn't exist in schema
-      wrapper.vm.store.state.zoConfig.default_fts_keys = ["user_id", "nonexistent_field"];
-
-      const selectedFieldsSet = new Set(["timestamp"]);
-      const missing = wrapper.vm.getMissingPerformanceFields(selectedFieldsSet);
-
-      const ftsFields = missing.filter(f => f.type === "Full Text Search");
-      expect(ftsFields.some(f => f.name === "user_id")).toBe(true);
-      expect(ftsFields.some(f => f.name === "nonexistent_field")).toBe(false);
-    });
-
-    // Test 15: updateDefinedSchemaFields should respect max field limit
-    it("should show error when exceeding max field limit", () => {
-      mockToast.mockClear();
-      wrapper.vm.store.state.zoConfig.user_defined_schema_max_fields = 5;
-      wrapper.vm.indexData.defined_schema_fields = ["f1", "f2", "f3", "f4"];
-      wrapper.vm.selectedFields = [{ name: "f5" }, { name: "f6" }]; // Would exceed limit
-      wrapper.vm.activeTab = "allFields";
-
-      wrapper.vm.updateDefinedSchemaFields();
-
-      expect(mockToast).toHaveBeenCalledWith(
-        expect.objectContaining({
-          variant: "error",
-          message: expect.stringContaining("Maximum allowed fields"),
-        })
-      );
-      expect(wrapper.vm.selectedFields).toEqual([]);
-    });
-
-    // Test 16: updateActiveMainTab for new tabs (Configuration, Cross-Linking)
     it("should update activeMainTab to 'configuration'", () => {
       wrapper.vm.updateActiveMainTab("configuration");
       expect(wrapper.vm.activeMainTab).toBe("configuration");
@@ -1140,13 +851,12 @@ describe("Schema Component Tests", () => {
           partition_time_level: "hourly",
           partition_keys: {},
           full_text_search_keys: [],
-          index_fields: [],
+          column_store_fields: [],
           bloom_filter_fields: [],
           data_retention: 30,
           max_query_range: 0,
           store_original_data: false,
           approx_partition: false,
-          defined_schema_fields: [],
           extended_retention_days: [],
         },
         pattern_associations: [],
@@ -1171,13 +881,12 @@ describe("Schema Component Tests", () => {
               partition_time_level: "hourly",
               partition_keys: {},
               full_text_search_keys: [],
-              index_fields: [],
+              column_store_fields: [],
               bloom_filter_fields: [],
               data_retention: 30,
               max_query_range: 0,
               store_original_data: false,
               approx_partition: false,
-              defined_schema_fields: [],
               extended_retention_days: [],
               pattern_associations: [],
             },
@@ -1239,13 +948,12 @@ describe("Schema Component Tests", () => {
         schema: [{ name: "_timestamp", type: "Int64" }],
         settings: {
           full_text_search_keys: [],
-          index_fields: [],
+          column_store_fields: [],
           bloom_filter_fields: [],
           data_retention: 30,
           max_query_range: 0,
           store_original_data: false,
           approx_partition: false,
-          defined_schema_fields: [],
           extended_retention_days: [],
         },
         pattern_associations: [],
@@ -1267,13 +975,12 @@ describe("Schema Component Tests", () => {
             schema: [{ name: "_timestamp", type: "Int64" }],
             settings: {
               full_text_search_keys: [],
-              index_fields: [],
+              column_store_fields: [],
               bloom_filter_fields: [],
               data_retention: 30,
               max_query_range: 0,
               store_original_data: false,
               approx_partition: false,
-              defined_schema_fields: [],
               extended_retention_days: [],
               pattern_associations: [],
             },
@@ -1330,7 +1037,7 @@ describe("Schema Component Tests", () => {
             storage_type: "s3",
             stats: { doc_time_min: 0, doc_time_max: 0, doc_num: 0, file_num: 0, storage_size: 0, compressed_size: 0 },
             schema: [{ name: "_timestamp", type: "Int64" }],
-            settings: { full_text_search_keys: [], index_fields: [], bloom_filter_fields: [], data_retention: 30, max_query_range: 0, store_original_data: false, approx_partition: false, defined_schema_fields: [], extended_retention_days: [], pattern_associations: [] },
+            settings: { full_text_search_keys: [], column_store_fields: [], bloom_filter_fields: [], data_retention: 30, max_query_range: 0, store_original_data: false, approx_partition: false, extended_retention_days: [], pattern_associations: [] },
           },
         },
         global: { provide: { store }, plugins: [i18n], stubs: { ODrawer: ODrawerStub } },
@@ -1372,13 +1079,12 @@ describe("Schema Component Tests", () => {
           partition_time_level: "hourly",
           partition_keys: {},
           full_text_search_keys: [],
-          index_fields: [],
+          column_store_fields: [],
           bloom_filter_fields: [],
           data_retention: 30,
           max_query_range: 0,
           store_original_data: false,
           approx_partition: false,
-          defined_schema_fields: [],
           extended_retention_days: [],
           pattern_associations: [],
         },
@@ -1474,21 +1180,21 @@ describe("Schema Component Tests", () => {
       expect(w.vm.patternAssociationDialog.show).toBe(false);
     });
 
-    it("should hide schema content and show loading placeholder when indexData.schema is falsy", async () => {
-      // Override the default mock to return null schema so the loading
-      // placeholder is rendered instead of the full schema content.
+    it("should normalize a null schema response to an empty schema after load", async () => {
+      // The new setSchema keeps no UDS state: a missing/empty schema simply
+      // becomes []. The "Wait while loading..." placeholder therefore only
+      // shows while the stream fetch is still in flight.
       mockGetStream.mockResolvedValue({
         name: "loading-stream",
         stream_type: "logs",
         storage_type: "s3",
         schema: null,
-        stats: {},
+        stats: { doc_time_min: 0, doc_time_max: 0, doc_num: 0, file_num: 0, storage_size: 0, compressed_size: 0 },
         settings: {
           full_text_search_keys: [],
-          index_fields: [],
+          column_store_fields: [],
           bloom_filter_fields: [],
           data_retention: 30,
-          defined_schema_fields: [],
           extended_retention_days: [],
         },
         pattern_associations: [],
@@ -1504,10 +1210,17 @@ describe("Schema Component Tests", () => {
           stubs: { ODrawer: ODrawerStub },
         },
       });
-      await flushPromises();
+      // Before the stream fetch resolves, indexData.schema is null → placeholder.
       const drawer = lw.findComponent(ODrawerStub);
       expect(drawer.exists()).toBe(true);
       expect(drawer.text()).toContain("Wait while loading");
+
+      await flushPromises();
+
+      // After load the null schema is normalized to [] and the content renders.
+      expect(lw.vm.indexData.schema).toEqual([]);
+      expect(lw.vm.resultTotal).toBe(0);
+      expect(drawer.text()).not.toContain("Wait while loading");
       lw.unmount();
     });
 
@@ -1548,7 +1261,7 @@ describe("Schema Component Tests", () => {
           partition_time_level: "hourly",
           partition_keys: {},
           full_text_search_keys: [],
-          index_fields: [],
+          column_store_fields: [],
           bloom_filter_fields: [],
           data_retention: 30,
           max_query_range: 24,
@@ -1556,7 +1269,6 @@ describe("Schema Component Tests", () => {
           store_original_data: false,
           approx_partition: false,
           enable_distinct_fields: false,
-          defined_schema_fields: [],
           extended_retention_days: [],
         },
         pattern_associations: [],
@@ -1582,13 +1294,12 @@ describe("Schema Component Tests", () => {
             ],
             settings: {
               full_text_search_keys: [],
-              index_fields: [],
+              column_store_fields: [],
               bloom_filter_fields: [],
               data_retention: 30,
               max_query_range: 24,
               store_original_data: false,
               approx_partition: false,
-              defined_schema_fields: [],
               extended_retention_days: [],
               pattern_associations: [],
             },
@@ -1715,13 +1426,12 @@ describe("Schema Component Tests", () => {
         schema: [{ name: "_timestamp", type: "Int64" }],
         settings: {
           full_text_search_keys: [],
-          index_fields: [],
+          column_store_fields: [],
           bloom_filter_fields: [],
           data_retention: 30,
           max_query_range: 0,
           store_original_data: false,
           approx_partition: false,
-          defined_schema_fields: [],
           extended_retention_days: [
             { start: 1703505000, end: 1703591400 },
           ],
@@ -1745,13 +1455,12 @@ describe("Schema Component Tests", () => {
             schema: [{ name: "_timestamp", type: "Int64" }],
             settings: {
               full_text_search_keys: [],
-              index_fields: [],
+              column_store_fields: [],
               bloom_filter_fields: [],
               data_retention: 30,
               max_query_range: 0,
               store_original_data: false,
               approx_partition: false,
-              defined_schema_fields: [],
               extended_retention_days: [
                 { start: 1703505000, end: 1703591400 },
               ],
@@ -1861,13 +1570,12 @@ describe("Schema Component Tests", () => {
         ],
         settings: {
           full_text_search_keys: ["message"],
-          index_fields: [],
+          column_store_fields: [],
           bloom_filter_fields: [],
           data_retention: 30,
           max_query_range: 0,
           store_original_data: false,
           approx_partition: false,
-          defined_schema_fields: [],
           extended_retention_days: [],
         },
         pattern_associations: [],
@@ -1893,13 +1601,12 @@ describe("Schema Component Tests", () => {
             ],
             settings: {
               full_text_search_keys: ["message"],
-              index_fields: [],
+              column_store_fields: [],
               bloom_filter_fields: [],
               data_retention: 30,
               max_query_range: 0,
               store_original_data: false,
               approx_partition: false,
-              defined_schema_fields: [],
               extended_retention_days: [],
               pattern_associations: [],
             },
@@ -1917,15 +1624,15 @@ describe("Schema Component Tests", () => {
     it("should enforce max index types (cap at 2)", () => {
       const result = wrapper.vm.enforceMaxIndexTypes([
         "fullTextSearchKey",
-        "secondaryIndexKey",
-        "bloomFilterKey",
+        "columnStoreKey",
+        "keyPartition",
       ]);
-      expect(result).toEqual(["secondaryIndexKey", "bloomFilterKey"]);
+      expect(result).toEqual(["columnStoreKey", "keyPartition"]);
     });
 
     it("should enforce max index types (no cap when 2 or fewer)", () => {
-      const result = wrapper.vm.enforceMaxIndexTypes(["fullTextSearchKey", "bloomFilterKey"]);
-      expect(result).toEqual(["fullTextSearchKey", "bloomFilterKey"]);
+      const result = wrapper.vm.enforceMaxIndexTypes(["fullTextSearchKey", "columnStoreKey"]);
+      expect(result).toEqual(["fullTextSearchKey", "columnStoreKey"]);
     });
 
     it("should enforce max index types (return non-array as-is)", () => {
@@ -1996,39 +1703,8 @@ describe("Schema Component Tests", () => {
       expect(wrapper.vm.newSchemaFields).toEqual([]);
     });
 
-    it("should remove a field from the missing performance fields list", () => {
-      wrapper.vm.missingPerformanceFields = [
-        { name: "field1", type: "Full Text Search" },
-        { name: "field2", type: "Secondary Index" },
-      ];
-      wrapper.vm.pendingSelectedFields = ["field3"];
-
-      wrapper.vm.removeFieldFromList("fts", "field1");
-
-      expect(wrapper.vm.missingPerformanceFields).toEqual([
-        { name: "field2", type: "Secondary Index" },
-      ]);
-      // Should not close dialog since there's still one missing field
-      expect(wrapper.vm.confirmAddPerformanceFieldsDialog).toBe(false);
-    });
-
-    it("should close dialog when last missing performance field is removed", () => {
-      wrapper.vm.confirmAddPerformanceFieldsDialog = true;
-      wrapper.vm.missingPerformanceFields = [
-        { name: "field1", type: "Full Text Search" },
-      ];
-      wrapper.vm.pendingSelectedFields = ["field3"];
-
-      wrapper.vm.removeFieldFromList("fts", "field1");
-
-      expect(wrapper.vm.confirmAddPerformanceFieldsDialog).toBe(false);
-      expect(wrapper.vm.missingPerformanceFields).toEqual([]);
-      expect(wrapper.vm.pendingSelectedFields).toEqual([]);
-    });
-
-    it("should check if option is present in default env config", () => {
+    it("should check if option is present in default env config (fullTextSearchKey only)", () => {
       wrapper.vm.store.state.zoConfig.default_fts_keys = ["message"];
-      wrapper.vm.store.state.zoConfig.default_secondary_index_fields = ["status"];
 
       expect(
         wrapper.vm.checkIfOptionPresentInDefaultEnv("message", {
@@ -2037,12 +1713,13 @@ describe("Schema Component Tests", () => {
       ).toBe(true);
       expect(
         wrapper.vm.checkIfOptionPresentInDefaultEnv("status", {
-          value: "secondaryIndexKey",
+          value: "fullTextSearchKey",
         }),
-      ).toBe(true);
+      ).toBe(false);
+      // Column store has no env defaults, so it is never env-provided.
       expect(
         wrapper.vm.checkIfOptionPresentInDefaultEnv("message", {
-          value: "secondaryIndexKey",
+          value: "columnStoreKey",
         }),
       ).toBe(false);
     });
@@ -2069,8 +1746,7 @@ describe("Schema Component Tests", () => {
       expect(result[0].name).toBe("message");
     });
 
-    it("should filter filterFieldFn with schema fields filter type", () => {
-      wrapper.vm.indexData.defined_schema_fields = ["message"];
+    it("should filter filterFieldFn by name when a tab suffix is present", () => {
       const rows = wrapper.vm.indexData.schema;
       const result = wrapper.vm.filterFieldFn(rows, "message@schemaFields");
       expect(result.length).toBe(1);
@@ -2089,23 +1765,12 @@ describe("Schema Component Tests", () => {
       expect(names.length).toBe(3);
     });
 
-    it("should compute hasUDSFieldInSelection", async () => {
-      wrapper.vm.activeTab = "allFields";
-      wrapper.vm.selectedFields = [{ name: "message", isUserDefined: true }];
-      await wrapper.vm.$nextTick();
-      expect(wrapper.vm.hasUDSFieldInSelection).toBe(true);
-
-      wrapper.vm.selectedFields = [{ name: "message", isUserDefined: false }];
-      await wrapper.vm.$nextTick();
-      expect(wrapper.vm.hasUDSFieldInSelection).toBe(false);
-    });
-
     it("should handle handleSchemaSelectedIdsUpdate", () => {
       wrapper.vm.handleSchemaSelectedIdsUpdate(["message"]);
       expect(wrapper.vm.selectedFields.map((f: any) => f.name)).toContain("message");
     });
 
-    it("should handle handleSchemaSelectionChange", () => {
+    it("should handle handleSchemaSelectionChange (only the timestamp column is excluded)", () => {
       wrapper.vm.handleSchemaSelectionChange([
         { name: "_timestamp" },
         { name: "message" },
@@ -2113,7 +1778,8 @@ describe("Schema Component Tests", () => {
       ]);
       const names = wrapper.vm.selectedFields.map((f: any) => f.name);
       expect(names).not.toContain("_timestamp");
-      expect(names).not.toContain("_all");
+      // _all is a regular selectable row now (no special-casing anymore).
+      expect(names).toContain("_all");
       expect(names).toContain("message");
     });
 
@@ -2121,16 +1787,6 @@ describe("Schema Component Tests", () => {
       const rows = [{ index: 0, start: "01-01-2024", end: "02-01-2024" }];
       wrapper.vm.handleDateSelectionChange(rows);
       expect(wrapper.vm.selectedDateFields).toEqual(rows);
-    });
-
-    it("should get missing performance fields (concurrent with secondaryIndex and FTS)", () => {
-      // "message" has fullTextSearchKey, so it should appear in missing if not selected
-      const selectedFieldsSet = new Set(["_timestamp"]);
-      const missing = wrapper.vm.getMissingPerformanceFields(selectedFieldsSet);
-
-      const ftsMissing = missing.filter((f: any) => f.type === "Full Text Search");
-      expect(ftsMissing.length).toBeGreaterThan(0);
-      expect(ftsMissing.some((f: any) => f.name === "message")).toBe(true);
     });
   });
 
@@ -2157,13 +1813,12 @@ describe("Schema Component Tests", () => {
         ],
         settings: {
           full_text_search_keys: ["message"],
-          index_fields: [],
+          column_store_fields: [],
           bloom_filter_fields: [],
           data_retention: 30,
           max_query_range: 0,
           store_original_data: false,
           approx_partition: false,
-          defined_schema_fields: [],
           extended_retention_days: [],
         },
         pattern_associations: [],
@@ -2188,13 +1843,12 @@ describe("Schema Component Tests", () => {
             ],
             settings: {
               full_text_search_keys: ["message"],
-              index_fields: [],
+              column_store_fields: [],
               bloom_filter_fields: [],
               data_retention: 30,
               max_query_range: 0,
               store_original_data: false,
               approx_partition: false,
-              defined_schema_fields: [],
               extended_retention_days: [],
               pattern_associations: [],
             },
@@ -2216,6 +1870,34 @@ describe("Schema Component Tests", () => {
       await flushPromises();
 
       expect(mockUpdateSettings).toHaveBeenCalled();
+    });
+
+    it("should not include defined_schema_fields or index_fields in the save payload", async () => {
+      mockUpdateSettings.mockClear();
+      mockUpdateSettings.mockResolvedValue({ data: { code: 200 } });
+
+      await wrapper.vm.onSubmit();
+      await flushPromises();
+
+      expect(mockUpdateSettings).toHaveBeenCalled();
+      const payload = mockUpdateSettings.mock.calls[0][3];
+      expect(payload).not.toHaveProperty("defined_schema_fields");
+      expect(payload).not.toHaveProperty("index_fields");
+      expect(payload).toHaveProperty("column_store_fields");
+    });
+
+    it("should push fields with columnStoreKey into settings.column_store_fields on save", async () => {
+      const row = wrapper.vm.indexData.schema.find((f: any) => f.name === "message");
+      row.index_type = ["columnStoreKey"];
+      mockUpdateSettings.mockClear();
+      mockUpdateSettings.mockResolvedValue({ data: { code: 200 } });
+
+      await wrapper.vm.onSubmit();
+      await flushPromises();
+
+      const payload = mockUpdateSettings.mock.calls[0][3];
+      expect(payload.column_store_fields).toContain("message");
+      expect(payload.full_text_search_keys).not.toContain("message");
     });
 
     it("should handle updateSettings error in onSubmit", async () => {
@@ -2329,13 +2011,12 @@ describe("Schema Component Tests", () => {
         ],
         settings: {
           full_text_search_keys: [],
-          index_fields: [],
+          column_store_fields: [],
           bloom_filter_fields: [],
           data_retention: 30,
           max_query_range: 0,
           store_original_data: true,
           approx_partition: false,
-          defined_schema_fields: [],
           extended_retention_days: [],
         },
         pattern_associations: [],
@@ -2360,13 +2041,12 @@ describe("Schema Component Tests", () => {
             ],
             settings: {
               full_text_search_keys: [],
-              index_fields: [],
+              column_store_fields: [],
               bloom_filter_fields: [],
               data_retention: 30,
               max_query_range: 0,
               store_original_data: true,
               approx_partition: false,
-              defined_schema_fields: [],
               extended_retention_days: [],
               pattern_associations: [],
             },
@@ -2400,14 +2080,6 @@ describe("Schema Component Tests", () => {
     it("should hide storeOriginalData toggle for traces", () => {
       expect(w.vm.showStoreOriginalDataToggle).toBe(false);
     });
-
-    it("should compute hasUDSFieldInSelection for allFields tab", async () => {
-      w.vm.activeTab = "allFields";
-      w.vm.selectedFields = [{ name: "span_id", isUserDefined: true }];
-      await w.vm.$nextTick();
-
-      expect(w.vm.hasUDSFieldInSelection).toBe(true);
-    });
   });
 
   // ==========================================
@@ -2423,13 +2095,12 @@ describe("Schema Component Tests", () => {
         schema: [{ name: "_timestamp", type: "Int64" }, { name: "message", type: "Utf8" }],
         settings: {
           full_text_search_keys: [],
-          index_fields: [],
+          column_store_fields: [],
           bloom_filter_fields: [],
           data_retention: 30,
           max_query_range: 0,
           store_original_data: false,
           approx_partition: false,
-          defined_schema_fields: [],
           extended_retention_days: [],
         },
         pattern_associations: [],
@@ -2444,13 +2115,12 @@ describe("Schema Component Tests", () => {
             schema: [{ name: "_timestamp", type: "Int64" }, { name: "message", type: "Utf8" }],
             settings: {
               full_text_search_keys: [],
-              index_fields: [],
+              column_store_fields: [],
               bloom_filter_fields: [],
               data_retention: 30,
               max_query_range: 0,
               store_original_data: false,
               approx_partition: false,
-              defined_schema_fields: [],
               extended_retention_days: [],
               pattern_associations: [],
             },
@@ -2467,62 +2137,7 @@ describe("Schema Component Tests", () => {
       w.unmount();
     });
 
-    it("should update schema with defined_schema_fields not already in schema", async () => {
-      mockGetStream.mockResolvedValue({
-        name: "extra-uds-stream",
-        stream_type: "logs",
-        storage_type: "s3",
-        stats: { doc_time_min: 0, doc_time_max: 0, doc_num: 0, file_num: 0, storage_size: 0, compressed_size: 0 },
-        schema: [{ name: "_timestamp", type: "Int64" }],
-        settings: {
-          full_text_search_keys: [],
-          index_fields: [],
-          bloom_filter_fields: [],
-          data_retention: 30,
-          max_query_range: 0,
-          store_original_data: false,
-          approx_partition: false,
-          defined_schema_fields: ["extra_field"],
-          extended_retention_days: [],
-        },
-        pattern_associations: [],
-      });
-      const w = mount(LogStream, {
-        props: {
-          modelValue: {
-            name: "extra-uds-stream",
-            stream_type: "logs",
-            storage_type: "s3",
-            stats: { doc_time_min: 0, doc_time_max: 0, doc_num: 0, file_num: 0, storage_size: 0, compressed_size: 0 },
-            schema: [{ name: "_timestamp", type: "Int64" }],
-            settings: {
-              full_text_search_keys: [],
-              index_fields: [],
-              bloom_filter_fields: [],
-              data_retention: 30,
-              max_query_range: 0,
-              store_original_data: false,
-              approx_partition: false,
-              defined_schema_fields: ["extra_field"],
-              extended_retention_days: [],
-              pattern_associations: [],
-            },
-          },
-        },
-        global: {
-          provide: { store },
-          plugins: [i18n],
-          stubs: { ODrawer: ODrawerStub },
-        },
-      });
-      await flushPromises();
-      // "extra_field" should be added to schema
-      const fieldNames = w.vm.indexData.schema.map((f: any) => f.name);
-      expect(fieldNames).toContain("extra_field");
-      w.unmount();
-    });
-
-    it("should handle streamResponse.schema being empty with defined_schema_fields", async () => {
+    it("should keep an empty streamResponse.schema empty (no UDS field injection)", async () => {
       mockGetStream.mockResolvedValue({
         name: "empty-schema-stream",
         stream_type: "logs",
@@ -2531,13 +2146,12 @@ describe("Schema Component Tests", () => {
         schema: [],
         settings: {
           full_text_search_keys: [],
-          index_fields: [],
+          column_store_fields: [],
           bloom_filter_fields: [],
           data_retention: 30,
           max_query_range: 0,
           store_original_data: false,
           approx_partition: false,
-          defined_schema_fields: ["field1"],
           extended_retention_days: [],
         },
         pattern_associations: [],
@@ -2552,13 +2166,12 @@ describe("Schema Component Tests", () => {
             schema: [],
             settings: {
               full_text_search_keys: [],
-              index_fields: [],
+              column_store_fields: [],
               bloom_filter_fields: [],
               data_retention: 30,
               max_query_range: 0,
               store_original_data: false,
               approx_partition: false,
-              defined_schema_fields: ["field1"],
               extended_retention_days: [],
               pattern_associations: [],
             },
@@ -2571,10 +2184,10 @@ describe("Schema Component Tests", () => {
         },
       });
       await flushPromises();
-      // field1 from defined_schema_fields should be in schema
-      const fieldNames = w.vm.indexData.schema.map((f: any) => f.name);
-      expect(fieldNames).toContain("field1");
-      // No _timestamp in original schema (it was empty array)
+      // defined_schema_fields is gone from the architecture: nothing is injected
+      // into an empty schema, and resultTotal is always the schema length.
+      expect(w.vm.indexData.schema).toEqual([]);
+      expect(w.vm.resultTotal).toBe(0);
       w.unmount();
     });
   });
@@ -2596,13 +2209,12 @@ describe("Schema Component Tests", () => {
         ],
         settings: {
           full_text_search_keys: [],
-          index_fields: [],
+          column_store_fields: [],
           bloom_filter_fields: [],
           data_retention: 30,
           max_query_range: 0,
           store_original_data: false,
           approx_partition: false,
-          defined_schema_fields: [],
           extended_retention_days: [],
         },
         pattern_associations: [],
@@ -2621,13 +2233,12 @@ describe("Schema Component Tests", () => {
             ],
             settings: {
               full_text_search_keys: [],
-              index_fields: [],
+              column_store_fields: [],
               bloom_filter_fields: [],
               data_retention: 30,
               max_query_range: 0,
               store_original_data: false,
               approx_partition: false,
-              defined_schema_fields: [],
               extended_retention_days: [],
               pattern_associations: [],
             },
@@ -2694,13 +2305,12 @@ describe("Schema Component Tests", () => {
         schema: [{ name: "_timestamp", type: "Int64" }],
         settings: {
           full_text_search_keys: [],
-          index_fields: [],
+          column_store_fields: [],
           bloom_filter_fields: [],
           data_retention: 30,
           max_query_range: 0,
           store_original_data: false,
           approx_partition: false,
-          defined_schema_fields: [],
           extended_retention_days: [],
           cross_links: [],
         },
@@ -2716,13 +2326,12 @@ describe("Schema Component Tests", () => {
             schema: [{ name: "_timestamp", type: "Int64" }],
             settings: {
               full_text_search_keys: [],
-              index_fields: [],
+              column_store_fields: [],
               bloom_filter_fields: [],
               data_retention: 30,
               max_query_range: 0,
               store_original_data: false,
               approx_partition: false,
-              defined_schema_fields: [],
               extended_retention_days: [],
               cross_links: [],
               pattern_associations: [],
@@ -2770,7 +2379,6 @@ describe("Schema Component Tests", () => {
   describe("updateIndexType (exercises filterValueBasedOnEnv)", () => {
     beforeEach(async () => {
       store.state.zoConfig.default_fts_keys = ["message"];
-      store.state.zoConfig.default_secondary_index_fields = ["status"];
       mockGetStream.mockResolvedValue({
         name: "update-idx-stream",
         stream_type: "logs",
@@ -2779,18 +2387,17 @@ describe("Schema Component Tests", () => {
         schema: [
           { name: "_timestamp", type: "Int64", index_type: [] },
           { name: "message", type: "Utf8", index_type: ["fullTextSearchKey"] },
-          { name: "status", type: "Utf8", index_type: ["secondaryIndexKey"] },
+          { name: "status", type: "Utf8", index_type: ["columnStoreKey"] },
           { name: "level", type: "Utf8", index_type: [] },
         ],
         settings: {
           full_text_search_keys: ["message"],
-          index_fields: ["status"],
+          column_store_fields: ["status"],
           bloom_filter_fields: [],
           data_retention: 30,
           max_query_range: 0,
           store_original_data: false,
           approx_partition: false,
-          defined_schema_fields: [],
           extended_retention_days: [],
         },
         pattern_associations: [],
@@ -2805,18 +2412,17 @@ describe("Schema Component Tests", () => {
             schema: [
               { name: "_timestamp", type: "Int64", index_type: [] },
               { name: "message", type: "Utf8", index_type: ["fullTextSearchKey"] },
-              { name: "status", type: "Utf8", index_type: ["secondaryIndexKey"] },
+              { name: "status", type: "Utf8", index_type: ["columnStoreKey"] },
               { name: "level", type: "Utf8", index_type: [] },
             ],
             settings: {
               full_text_search_keys: ["message"],
-              index_fields: ["status"],
+              column_store_fields: ["status"],
               bloom_filter_fields: [],
               data_retention: 30,
               max_query_range: 0,
               store_original_data: false,
               approx_partition: false,
-              defined_schema_fields: [],
               extended_retention_days: [],
               pattern_associations: [],
             },
@@ -2837,12 +2443,12 @@ describe("Schema Component Tests", () => {
 
       wrapper.vm.updateIndexType(
         { row },
-        ["fullTextSearchKey", "bloomFilterKey"],
+        ["fullTextSearchKey", "columnStoreKey"],
       );
 
-      // row.index_type should be updated (fullTextSearchKey + bloomFilterKey)
+      // row.index_type should be updated (fullTextSearchKey + columnStoreKey)
       expect(row.index_type).toContain("fullTextSearchKey");
-      expect(row.index_type).toContain("bloomFilterKey");
+      expect(row.index_type).toContain("columnStoreKey");
       expect(wrapper.vm.formDirtyFlag).toBe(true);
     });
 
@@ -2853,27 +2459,28 @@ describe("Schema Component Tests", () => {
       // "message" is in default_fts_keys — fullTextSearchKey should be filtered
       wrapper.vm.updateIndexType(
         { row },
-        ["fullTextSearchKey", "secondaryIndexKey"],
+        ["fullTextSearchKey", "columnStoreKey"],
       );
 
       // fullTextSearchKey is env-default, should be filtered out
       expect(row.index_type).not.toContain("fullTextSearchKey");
-      // secondaryIndexKey is not an env-default for message, should remain
-      expect(row.index_type).toContain("secondaryIndexKey");
+      // columnStoreKey is not an env-default for message, should remain
+      expect(row.index_type).toContain("columnStoreKey");
     });
 
-    it("should filter out env-default secondary index key when updating status field", () => {
+    it("should keep columnStoreKey when updating status field (column store has no env defaults)", () => {
       const row = wrapper.vm.indexData.schema.find((f: any) => f.name === "status");
       expect(row).toBeDefined();
 
-      // "status" is in default_secondary_index_fields — secondaryIndexKey should be filtered
+      // Column store keys are never env-enforced, and "status" is not in
+      // default_fts_keys, so nothing gets filtered out.
       wrapper.vm.updateIndexType(
         { row },
-        ["fullTextSearchKey", "secondaryIndexKey"],
+        ["fullTextSearchKey", "columnStoreKey"],
       );
 
       expect(row.index_type).toContain("fullTextSearchKey");
-      expect(row.index_type).not.toContain("secondaryIndexKey");
+      expect(row.index_type).toContain("columnStoreKey");
     });
 
     it("should handle empty index_type update (clear all)", () => {
@@ -2897,17 +2504,16 @@ describe("Schema Component Tests", () => {
         stats: {},
         settings: {
           full_text_search_keys: [],
-          index_fields: [],
+          column_store_fields: [],
           bloom_filter_fields: [],
           data_retention: 30,
-          defined_schema_fields: [],
           extended_retention_days: [],
         },
         pattern_associations: [],
       });
       const w = mount(LogStream, {
         props: {
-          modelValue: { name: "empty-name", schema: [], stats: {}, settings: { defined_schema_fields: [] } },
+          modelValue: { name: "empty-name", schema: [], stats: {}, settings: {} },
         },
         global: {
           provide: { store },
@@ -2934,13 +2540,12 @@ describe("Schema Component Tests", () => {
         schema: [{ name: "_timestamp", type: "Int64" }],
         settings: {
           full_text_search_keys: [],
-          index_fields: [],
+          column_store_fields: [],
           bloom_filter_fields: [],
           data_retention: 30,
           max_query_range: 0,
           store_original_data: false,
           approx_partition: false,
-          defined_schema_fields: [],
           extended_retention_days: [],
         },
         pattern_associations: [],
@@ -2955,13 +2560,12 @@ describe("Schema Component Tests", () => {
             schema: [{ name: "_timestamp", type: "Int64" }],
             settings: {
               full_text_search_keys: [],
-              index_fields: [],
+              column_store_fields: [],
               bloom_filter_fields: [],
               data_retention: 30,
               max_query_range: 0,
               store_original_data: false,
               approx_partition: false,
-              defined_schema_fields: [],
               extended_retention_days: [],
               pattern_associations: [],
             },
@@ -3013,13 +2617,12 @@ describe("Schema Component Tests", () => {
         schema: [{ name: "_timestamp", type: "Int64" }],
         settings: {
           full_text_search_keys: [],
-          index_fields: [],
+          column_store_fields: [],
           bloom_filter_fields: [],
           data_retention: 30,
           max_query_range: 0,
           store_original_data: false,
           approx_partition: false,
-          defined_schema_fields: [],
           extended_retention_days: [],
         },
         pattern_associations: [
@@ -3036,13 +2639,12 @@ describe("Schema Component Tests", () => {
             schema: [{ name: "_timestamp", type: "Int64" }],
             settings: {
               full_text_search_keys: [],
-              index_fields: [],
+              column_store_fields: [],
               bloom_filter_fields: [],
               data_retention: 30,
               max_query_range: 0,
               store_original_data: false,
               approx_partition: false,
-              defined_schema_fields: [],
               extended_retention_days: [],
               pattern_associations: [
                 { field: "field1", pattern_name: "p1", pattern_id: "id1", policy: "replace", apply_at: "ingestion" },
@@ -3090,109 +2692,6 @@ describe("Schema Component Tests", () => {
   });
 
   // ==========================================
-  // Phase 2 tests — updateDefinedSchemaFields timestamp/allFields delete paths
-  // ==========================================
-  describe("updateDefinedSchemaFields delete paths", () => {
-    beforeEach(async () => {
-      store.state.zoConfig.timestamp_column = "_timestamp";
-      store.state.zoConfig.all_fields_name = "_all";
-      mockGetStream.mockResolvedValue({
-        name: "delete-paths-stream",
-        stream_type: "logs",
-        storage_type: "s3",
-        stats: { doc_time_min: 0, doc_time_max: 0, doc_num: 0, file_num: 0, storage_size: 0, compressed_size: 0 },
-        schema: [
-          { name: "_timestamp", type: "Int64" },
-          { name: "_all", type: "Utf8" },
-          { name: "message", type: "Utf8" },
-        ],
-        settings: {
-          full_text_search_keys: [],
-          index_fields: [],
-          bloom_filter_fields: [],
-          data_retention: 30,
-          max_query_range: 0,
-          store_original_data: false,
-          approx_partition: false,
-          defined_schema_fields: [],
-          extended_retention_days: [],
-        },
-        pattern_associations: [],
-      });
-      wrapper = mount(LogStream, {
-        props: {
-          modelValue: {
-            name: "delete-paths-stream",
-            stream_type: "logs",
-            storage_type: "s3",
-            stats: { doc_time_min: 0, doc_time_max: 0, doc_num: 0, file_num: 0, storage_size: 0, compressed_size: 0 },
-            schema: [
-              { name: "_timestamp", type: "Int64" },
-              { name: "_all", type: "Utf8" },
-              { name: "message", type: "Utf8" },
-            ],
-            settings: {
-              full_text_search_keys: [],
-              index_fields: [],
-              bloom_filter_fields: [],
-              data_retention: 30,
-              max_query_range: 0,
-              store_original_data: false,
-              approx_partition: false,
-              defined_schema_fields: [],
-              extended_retention_days: [],
-              pattern_associations: [],
-            },
-          },
-        },
-        global: {
-          provide: { store },
-          plugins: [i18n],
-          stubs: { ODrawer: ODrawerStub },
-        },
-      });
-      await flushPromises();
-    });
-
-    it("should delete timestamp_column and allFieldsName from selectedFieldsSet", () => {
-      // Include _timestamp and _all in selected fields to exercise the
-      // delete paths at lines 2357-2361 in updateDefinedSchemaFields
-      wrapper.vm.selectedFields = [
-        { name: "_timestamp" },
-        { name: "_all" },
-        { name: "message" },
-      ];
-      wrapper.vm.activeTab = "allFields";
-
-      wrapper.vm.updateDefinedSchemaFields();
-
-      // _timestamp and _all should be filtered from defined_schema_fields
-      expect(wrapper.vm.indexData.defined_schema_fields).not.toContain("_timestamp");
-      expect(wrapper.vm.indexData.defined_schema_fields).not.toContain("_all");
-      expect(wrapper.vm.indexData.defined_schema_fields).toContain("message");
-    });
-
-    it("should call updateResultTotal with activeTab as schemaFields", () => {
-      // updateResultTotal is internal (not exported from setup).
-      // Test the behavior indirectly by calling updateStreamResponse
-      // with activeTab set to "schemaFields" — this exercises
-      // the resultTotal = defined_schema_fields.length branch
-      wrapper.vm.activeTab = "schemaFields";
-      wrapper.vm.indexData.defined_schema_fields = ["field1", "field2"];
-
-      const mockResponse = {
-        settings: { defined_schema_fields: ["field1", "field2"] },
-        schema: [{ name: "field1" }, { name: "field2" }, { name: "field3" }],
-      };
-
-      wrapper.vm.updateStreamResponse(mockResponse);
-
-      // activeTab is "schemaFields", so resultTotal should be defined_schema_fields length
-      expect(wrapper.vm.resultTotal).toBe(2);
-    });
-  });
-
-  // ==========================================
   // Phase 2 tests — deleteFields error branch (res.data.code != 200)
   // ==========================================
   describe("deleteFields non-200 response", () => {
@@ -3205,13 +2704,12 @@ describe("Schema Component Tests", () => {
         schema: [{ name: "_timestamp", type: "Int64" }, { name: "field_to_delete", type: "Utf8" }],
         settings: {
           full_text_search_keys: [],
-          index_fields: [],
+          column_store_fields: [],
           bloom_filter_fields: [],
           data_retention: 30,
           max_query_range: 0,
           store_original_data: false,
           approx_partition: false,
-          defined_schema_fields: [],
           extended_retention_days: [],
         },
         pattern_associations: [],
@@ -3226,13 +2724,12 @@ describe("Schema Component Tests", () => {
             schema: [{ name: "_timestamp", type: "Int64" }, { name: "field_to_delete", type: "Utf8" }],
             settings: {
               full_text_search_keys: [],
-              index_fields: [],
+              column_store_fields: [],
               bloom_filter_fields: [],
               data_retention: 30,
               max_query_range: 0,
               store_original_data: false,
               approx_partition: false,
-              defined_schema_fields: [],
               extended_retention_days: [],
               pattern_associations: [],
             },
@@ -3283,8 +2780,8 @@ describe("Schema Component Tests", () => {
       // @update:model-value="(val) => updateIndexType({ row }, enforceMaxIndexTypes(val))"
       const capped = wrapper.vm.enforceMaxIndexTypes([
         "fullTextSearchKey",
-        "secondaryIndexKey",
-        "bloomFilterKey",
+        "columnStoreKey",
+        "keyPartition",
       ]);
       expect(capped.length).toBe(2);
 
@@ -3307,13 +2804,12 @@ describe("Schema Component Tests", () => {
         schema: [{ name: "_timestamp", type: "Int64" }],
         settings: {
           full_text_search_keys: [],
-          index_fields: [],
+          column_store_fields: [],
           bloom_filter_fields: [],
           data_retention: 30,
           max_query_range: 0,
           store_original_data: false,
           approx_partition: false,
-          defined_schema_fields: [],
           extended_retention_days: [],
         },
         pattern_associations: [],
@@ -3328,13 +2824,12 @@ describe("Schema Component Tests", () => {
             schema: [{ name: "_timestamp", type: "Int64" }],
             settings: {
               full_text_search_keys: [],
-              index_fields: [],
+              column_store_fields: [],
               bloom_filter_fields: [],
               data_retention: 30,
               max_query_range: 0,
               store_original_data: false,
               approx_partition: false,
-              defined_schema_fields: [],
               extended_retention_days: [],
               pattern_associations: [],
             },
@@ -3376,17 +2871,16 @@ describe("Schema Component Tests", () => {
         schema: [
           { name: "_timestamp", type: "Int64", index_type: [] },
           { name: "message", type: "Utf8", index_type: ["fullTextSearchKey"] },
-          { name: "status", type: "Utf8", index_type: ["secondaryIndexKey"] },
+          { name: "status", type: "Utf8", index_type: ["columnStoreKey"] },
         ],
         settings: {
           full_text_search_keys: ["message"],
-          index_fields: ["status"],
+          column_store_fields: ["status"],
           bloom_filter_fields: [],
           data_retention: 30,
           max_query_range: 0,
           store_original_data: false,
           approx_partition: false,
-          defined_schema_fields: [],
           extended_retention_days: [],
         },
         pattern_associations: [],
@@ -3401,17 +2895,16 @@ describe("Schema Component Tests", () => {
             schema: [
               { name: "_timestamp", type: "Int64", index_type: [] },
               { name: "message", type: "Utf8", index_type: ["fullTextSearchKey"] },
-              { name: "status", type: "Utf8", index_type: ["secondaryIndexKey"] },
+              { name: "status", type: "Utf8", index_type: ["columnStoreKey"] },
             ],
             settings: {
               full_text_search_keys: ["message"],
-              index_fields: ["status"],
+              column_store_fields: ["status"],
               bloom_filter_fields: [],
               data_retention: 30,
               max_query_range: 0,
               store_original_data: false,
               approx_partition: false,
-              defined_schema_fields: [],
               extended_retention_days: [],
               pattern_associations: [],
             },
@@ -3444,21 +2937,18 @@ describe("Schema Component Tests", () => {
       expect(result[0].name).toBe("message");
     });
 
-    it("should match by index_type value in schemaFields tab", () => {
-      // Exercise the schemaFields index_type matching path (lines 2036-2045)
-      wrapper.vm.indexData.defined_schema_fields = ["message", "status"];
+    it("should match by columnStoreKey index_type value", () => {
+      // "status" carries columnStoreKey (derived from settings.column_store_fields);
+      // the part after "@" is ignored by filterFieldFn.
       const rows = wrapper.vm.indexData.schema;
 
-      // Search for "secondaryIndexKey" in schemaFields tab
-      // "status" has secondaryIndexKey and is in defined_schema_fields
-      const result = wrapper.vm.filterFieldFn(rows, "secondaryIndexKey@schemaFields");
+      const result = wrapper.vm.filterFieldFn(rows, "columnStoreKey@whatever");
 
       expect(result.length).toBe(1);
       expect(result[0].name).toBe("status");
     });
 
     it("should match by index_type label (label->value map) in schemaFields tab", () => {
-      wrapper.vm.indexData.defined_schema_fields = ["message"];
       const rows = wrapper.vm.indexData.schema;
 
       const result = wrapper.vm.filterFieldFn(rows, "full text search@schemaFields");
@@ -3467,15 +2957,13 @@ describe("Schema Component Tests", () => {
       expect(result[0].name).toBe("message");
     });
 
-    it("should return all schemaFields when search term is empty", () => {
-      // Exercises line 2029: filterFieldFn with empty search in schemaFields tab
-      wrapper.vm.indexData.defined_schema_fields = ["message", "status"];
+    it("should return all rows when the search term is empty", () => {
       const rows = wrapper.vm.indexData.schema;
 
       const result = wrapper.vm.filterFieldFn(rows, "@schemaFields");
 
-      expect(result.length).toBe(2);
-      expect(result.map((r: any) => r.name).sort()).toEqual(["message", "status"]);
+      expect(result.length).toBe(3);
+      expect(result.map((r: any) => r.name).sort()).toEqual(["_timestamp", "message", "status"]);
     });
   });
 
@@ -3511,13 +2999,12 @@ describe("Schema Component Tests", () => {
         schema: [{ name: "_timestamp", type: "Int64" }],
         settings: {
           full_text_search_keys: [],
-          index_fields: [],
+          column_store_fields: [],
           bloom_filter_fields: [],
           data_retention: 30,
           max_query_range: 0,
           store_original_data: false,
           approx_partition: false,
-          defined_schema_fields: [],
           extended_retention_days: [],
           partition_keys: {},
         },
@@ -3533,13 +3020,12 @@ describe("Schema Component Tests", () => {
             schema: [{ name: "_timestamp", type: "Int64" }],
             settings: {
               full_text_search_keys: [],
-              index_fields: [],
+              column_store_fields: [],
               bloom_filter_fields: [],
               data_retention: 30,
               max_query_range: 0,
               store_original_data: false,
               approx_partition: false,
-              defined_schema_fields: [],
               extended_retention_days: [],
               partition_keys: {},
               pattern_associations: [],

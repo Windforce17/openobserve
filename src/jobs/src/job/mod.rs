@@ -40,7 +40,8 @@ mod compactor;
 pub mod config_watcher;
 mod file_list_dump;
 pub(crate) mod files;
-mod flatten_compactor;
+/// .26 shutdown final-move — main.rs calls this after `ingester::flush_all`.
+pub use files::parquet::run_final_move;
 #[cfg(feature = "enterprise")]
 mod incidents;
 pub mod metrics;
@@ -52,6 +53,7 @@ pub(crate) mod pipeline;
 mod pipeline_error_cleanup;
 mod promql;
 mod promql_self_consume;
+mod segments;
 #[cfg(feature = "enterprise")]
 mod service_graph;
 mod session_cleanup;
@@ -381,11 +383,6 @@ pub async fn init() -> Result<(), anyhow::Error> {
         .await
         .expect("db version set failed");
 
-    // check tantivy _timestamp update time
-    _ = db::metas::tantivy_index::get_ttv_timestamp_updated_at().await;
-    // check tantivy secondary index update time
-    _ = db::metas::tantivy_index::get_ttv_secondary_index_updated_at().await;
-
     // Auth auditing should be done by router also
     #[cfg(feature = "enterprise")]
     if self_reporting::run_audit_publish().is_none() {
@@ -614,9 +611,36 @@ pub async fn init() -> Result<(), anyhow::Error> {
     }
 
     tokio::task::spawn(files::run());
+    // segment-WAL (DESIGN-SEGMENT-WAL.md): the flusher is the only path
+    // segment-mode ingest takes to object storage, and the L0 builder turns
+    // any node's uploaded segments into per-(stream, hour) L0 files. Both
+    // live HERE, not in main.rs, so every embedding of job::init() (the
+    // binary AND the e2e harness) gets them. The legacy ingester jobs above
+    // keep running — they drain any pre-flip WAL and are harmless once no
+    // new WAL is written.
+    //
+    // Deliberately NOT gated on ingest_segment_mode — only the ingest seam
+    // is. A flag-off rollback must keep building already-uploaded segments
+    // (or they strand unqueryable forever), and a hot flip ON must find the
+    // flusher already running (or acked appends pile up in a buffer nothing
+    // drains). Both are near-free when idle: the flusher ticks against an
+    // empty buffer, the builder claims from an empty table.
+    // The FLUSHER is ingest-local by definition (it drains this node's own
+    // in-memory buffer). The BUILDER is not: claims are leased in the
+    // shared table, so any node can build any node's segments. Running it
+    // on compactors too roughly triples fleet build throughput — build rate
+    // must exceed segment production with margin or the backlog grows
+    // (prod, 2026-07-31: ~25 segments/min/ingester capacity vs ~12-25/min
+    // produced was too thin), and compactors are the nodes with spare CPU
+    // and no ingest latency to protect.
+    if LOCAL_NODE.is_ingester() {
+        spawn_supervised_segment_flusher();
+    }
+    if LOCAL_NODE.is_ingester() || LOCAL_NODE.is_compactor() {
+        segments::run();
+    }
     tokio::task::spawn(stats::run());
     tokio::task::spawn(compactor::run());
-    tokio::task::spawn(flatten_compactor::run());
     #[cfg(feature = "enterprise")]
     tokio::task::spawn(service_graph::run());
     #[cfg(feature = "enterprise")]
@@ -1024,4 +1048,36 @@ pub async fn init_deferred() -> Result<(), anyhow::Error> {
         .expect("Dashboard id->org cache failed");
 
     Ok(())
+}
+
+/// Keep the segment-WAL flusher alive for the process's life: it is the only
+/// path segment-mode data takes to object storage, so a single unwind must
+/// never kill it silently (same supervision contract as the WAL mover in
+/// [`files`]). Restart on error or panic with a 5s delay; stop cleanly when
+/// the node goes offline (`run_flusher` exits Ok after a final drain).
+fn spawn_supervised_segment_flusher() {
+    tokio::task::spawn(async move {
+        loop {
+            match tokio::task::spawn(segment_wal::run_flusher()).await {
+                Ok(Ok(())) => {
+                    log::info!("[INGESTER:JOB] segment_wal::flusher exited cleanly");
+                    break;
+                }
+                Ok(Err(e)) => {
+                    log::error!(
+                        "[INGESTER:JOB] segment_wal::flusher exited with error, restarting in 5s: {e:#}"
+                    );
+                }
+                Err(e) => {
+                    log::error!(
+                        "[INGESTER:JOB] segment_wal::flusher panicked, restarting in 5s: {e}"
+                    );
+                }
+            }
+            if config::cluster::is_offline() {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        }
+    });
 }

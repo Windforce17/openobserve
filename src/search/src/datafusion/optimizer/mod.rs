@@ -15,7 +15,7 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use config::{ALL_VALUES_COL_NAME, ORIGINAL_DATA_COL_NAME, datafusion::request::Request};
+use config::{ORIGINAL_DATA_COL_NAME, datafusion::request::Request};
 use datafusion::{
     common::Result,
     optimizer::{
@@ -39,7 +39,10 @@ use datafusion::{
     sql::TableReference,
 };
 use hashbrown::HashSet;
-use infra::schema::get_stream_setting_index_fields;
+use infra::schema::{
+    SchemaCache, get_stream_setting_column_store_fields, get_stream_setting_fts_fields,
+    unwrap_stream_settings,
+};
 #[cfg(feature = "enterprise")]
 use {
     crate::datafusion::optimizer::context::generate_streaming_agg_rules,
@@ -78,9 +81,6 @@ pub fn generate_analyzer_rules(sql: &Sql) -> Vec<Arc<dyn AnalyzerRule + Send + S
         sql.columns
             .iter()
             .any(|(_, columns)| columns.contains(ORIGINAL_DATA_COL_NAME)),
-        sql.columns
-            .iter()
-            .any(|(_, columns)| columns.contains(ALL_VALUES_COL_NAME)),
     ))]
 }
 
@@ -197,27 +197,76 @@ pub fn generate_physical_optimizer_rules(
     }
 
     // should after remote scan
+    // fast-path eligibility (DESIGN §15.6): the index-only aggregation fast
+    // paths may only touch non-`_timestamp` fields that are configured in the
+    // stream's `column_store_fields` setting — plus, for unfiltered
+    // single-field TopN/Distinct, any term-indexed string field (pilot fix
+    // B: served from the term dictionary alone, per-file capability check
+    // as backstop)
     let mut index_fields: HashMap<TableReference, HashSet<String>> = HashMap::new();
+    let mut unfiltered_index_fields: HashMap<TableReference, HashSet<String>> = HashMap::new();
     for (stream_name, schema) in sql.schemas.iter() {
-        let stream_settings = infra::schema::unwrap_stream_settings(schema.schema());
-        let idx_fields = get_stream_setting_index_fields(&stream_settings);
-        let idx_fields = idx_fields
-            .into_iter()
-            .filter_map(|index_field| {
-                if schema.contains_field(&index_field) {
-                    Some(index_field)
-                } else {
-                    None
-                }
-            })
-            .collect::<HashSet<_>>();
-        index_fields.insert(stream_name.clone(), idx_fields);
+        index_fields.insert(stream_name.clone(), stream_column_store_fields(schema));
+        unfiltered_index_fields.insert(stream_name.clone(), stream_term_index_fields(schema));
     }
-    rules.push(Arc::new(LeaderIndexOptimizerRule::new(index_fields)) as _);
+    rules.push(Arc::new(LeaderIndexOptimizerRule::new(
+        index_fields,
+        unfiltered_index_fields,
+    )) as _);
 
     rules.push(Arc::new(LimitPushdown::new()) as _);
 
     rules
+}
+
+/// Fast-path field eligibility set for a stream (DESIGN §15.6): the stream's
+/// configured `column_store_fields` (read from the schema `settings`
+/// metadata), filtered to fields present in the schema. Empty when the stream
+/// has no settings, which keeps the index-only fast paths that reference
+/// non-`_timestamp` fields disabled.
+fn stream_column_store_fields(schema: &SchemaCache) -> HashSet<String> {
+    let Some(settings) = unwrap_stream_settings(schema.schema()) else {
+        return HashSet::new();
+    };
+    get_stream_setting_column_store_fields(&settings)
+        .into_iter()
+        .filter(|f| schema.contains_field(f))
+        .collect()
+}
+
+/// Fields additionally eligible for the index-only TopN/Distinct fast paths
+/// when the query has no condition (pilot fix B): every string field of the
+/// schema except the internal columns and the fts fields — fts values are
+/// token-indexed only, never whole values, so their dictionaries cannot
+/// answer per-value counts. The per-file `field_value_counts` capability
+/// check is the correctness backstop.
+fn stream_term_index_fields(schema: &SchemaCache) -> HashSet<String> {
+    let settings = unwrap_stream_settings(schema.schema());
+    let fts_fields = get_stream_setting_fts_fields(&settings);
+    schema
+        .schema()
+        .fields()
+        .iter()
+        .filter(|f| {
+            matches!(
+                f.data_type(),
+                arrow_schema::DataType::Utf8
+                    | arrow_schema::DataType::LargeUtf8
+                    | arrow_schema::DataType::Utf8View
+            )
+        })
+        .map(|f| f.name())
+        .filter(|name| {
+            name.as_str() != config::TIMESTAMP_COL_NAME
+                && name.as_str() != config::ID_COL_NAME
+                && name.as_str() != ORIGINAL_DATA_COL_NAME
+                // the row-store star plan schema carries the raw `_source`
+                // column — an internal record image, never a queryable field
+                && name.as_str() != vortex_index::SOURCE_COL_NAME
+                && !fts_fields.contains(name)
+        })
+        .cloned()
+        .collect()
 }
 
 // create physical plan
@@ -230,4 +279,70 @@ pub async fn create_physical_plan(
     let plan = ctx.state().create_logical_plan(sql).await?;
     let physical_plan = ctx.state().create_physical_plan(&plan).await?;
     optimize_distribute_analyze(physical_plan)
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow_schema::{DataType, Field, Schema};
+
+    use super::*;
+
+    #[test]
+    fn test_stream_column_store_fields_reads_settings_metadata() {
+        let metadata = HashMap::from([(
+            "settings".to_string(),
+            r#"{"column_store_fields":["service","level"]}"#.to_string(),
+        )]);
+        let schema = Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("service", DataType::Utf8, false),
+            Field::new("log", DataType::Utf8, false),
+        ])
+        .with_metadata(metadata);
+
+        let fields = stream_column_store_fields(&SchemaCache::new(schema));
+
+        // `level` is configured but absent from the schema, so it is filtered
+        // out; `log` is in the schema but not configured
+        assert_eq!(fields, HashSet::from(["service".to_string()]));
+    }
+
+    #[test]
+    fn test_stream_column_store_fields_without_settings_is_empty() {
+        let schema = Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("service", DataType::Utf8, false),
+        ]);
+
+        assert!(stream_column_store_fields(&SchemaCache::new(schema)).is_empty());
+    }
+
+    #[test]
+    fn test_stream_term_index_fields_excludes_fts_numeric_and_internals() {
+        let metadata = HashMap::from([(
+            "settings".to_string(),
+            r#"{"full_text_search_keys":["note"],"column_store_fields":["service"]}"#.to_string(),
+        )]);
+        let schema = Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("_o2_id", DataType::Utf8, false),
+            Field::new("service", DataType::Utf8, false),
+            Field::new("level", DataType::Utf8, false),
+            Field::new("note", DataType::Utf8, false),
+            Field::new("code", DataType::Int64, false),
+        ])
+        .with_metadata(metadata);
+
+        let fields = stream_term_index_fields(&SchemaCache::new(schema));
+
+        // plain string fields are dictionary-eligible (column-store or not)
+        assert!(fields.contains("service"));
+        assert!(fields.contains("level"));
+        // fts fields hold tokens only; numeric and internal columns have no
+        // value terms
+        assert!(!fields.contains("note"));
+        assert!(!fields.contains("code"));
+        assert!(!fields.contains("_timestamp"));
+        assert!(!fields.contains("_o2_id"));
+    }
 }

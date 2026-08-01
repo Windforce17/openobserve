@@ -14,9 +14,8 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::{
-    fs::{File, create_dir_all},
-    io::{BufRead, BufReader},
-    path::PathBuf,
+    fs::create_dir_all,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
@@ -34,11 +33,12 @@ use snafu::ResultExt;
 use crate::{entry::RecordBatchEntry, errors::*, immutable, memtable, writer::WriterKey};
 
 // check uncompleted parquet files
-// the wal file process have 4 steps:
-// 1. write the memory file into disk with .par file extension
-// 2. create a lock file with those file names
+// the wal file process have 5 steps, all fsynced in the order documented on
+// immutable::commit_staged_files:
+// 1. write the memory file into disk with .par file extension, fsync file and dir
+// 2. create a lock file with those file names, fsync file and dir
 // 3. delete the wal file
-// 4. rename the .par files to .parquet
+// 4. rename the .par files to .parquet, fsync the dirs
 // 5. delete the lock file
 //
 // so, there are some cases that the process is not completed:
@@ -50,6 +50,14 @@ use crate::{entry::RecordBatchEntry, errors::*, immutable, memtable, writer::Wri
 //    files actually wrote to disk completely, need to continue step 4 and 5
 // 4. the process is killed before step 5, so there are some .parquet files and have lock file, the
 //    files actually wrote to disk completely, need to continue step 5
+//
+// the lock file is written to a temp name, fsynced and renamed into place
+// (write_file_atomic_durable), so a lock that exists under its final name is
+// complete: it is proof that every .par file it names is complete. A
+// zero-length or unparseable lock can only be the in-place write of an older
+// binary crashing mid-write -- it proves nothing and is treated as absent.
+// Recovery replays the same ordering: promote and fsync first, delete the wal
+// file only then, and drop the lock last.
 pub(crate) async fn check_uncompleted_parquet_files() -> Result<()> {
     let cfg = config::get_config();
     // 1. get all .lock files
@@ -59,41 +67,20 @@ pub(crate) async fn check_uncompleted_parquet_files() -> Result<()> {
         path: wal_dir.clone(),
     })?;
     log::info!("Scanning lock files from {wal_dir:?}");
-    let lock_files = wal_scan_files(wal_dir, "lock").await.unwrap_or_default();
+    let lock_files = wal_scan_files(&wal_dir, "lock").await.unwrap_or_default();
     log::info!("Found {} lock files", lock_files.len());
 
-    // 2. check if there is a .wal file with same name, delete it and rename the .par to .parquet
+    // 2. finish the persist each lock file describes
     for lock_file in lock_files.iter() {
         log::warn!("found uncompleted wal file: {lock_file:?}");
-        let wal_file = lock_file.with_extension("wal");
-        if wal_file.exists() {
-            // delete the .wal file
-            log::warn!("delete processed wal file: {wal_file:?}");
-            std::fs::remove_file(&wal_file).context(DeleteFileSnafu { path: wal_file })?;
-        }
-        // read all the .par files
-        let mut file = File::open(lock_file).context(OpenFileSnafu { path: lock_file })?;
-        let mut par_files = Vec::new();
-        for line in BufReader::new(&mut file).lines() {
-            let line = line.context(ReadFileSnafu { path: lock_file })?;
-            par_files.push(line);
-        }
-        // rename the .par file to .parquet
-        for par_file in par_files.iter() {
-            let par_file = PathBuf::from(par_file);
-            let parquet_file = par_file.with_extension("parquet");
-            log::warn!("rename par file: {par_file:?} to parquet");
-            if par_file.exists() {
-                std::fs::rename(&par_file, &parquet_file)
-                    .context(RenameFileSnafu { path: par_file })?;
-            }
-        }
-        // delete the .lock file
-        log::warn!("delete lock file: {lock_file:?}");
-        std::fs::remove_file(lock_file).context(DeleteFileSnafu {
-            path: lock_file.clone(),
-        })?;
+        finish_locked_persist(lock_file).await?;
     }
+
+    // 3. sweep staging leftovers of the atomic lock write: a crash between
+    // writing <n>.lock.tmp and renaming it over <n>.lock leaves the temp file
+    // behind. It never became a lock, so it promoted nothing -- the wal it
+    // belonged to replays normally -- but it must not accumulate.
+    cleanup_stale_lock_tmp_files(&wal_dir).await?;
 
     // 4. delete all the .par files
     let parquet_dir = PathBuf::from(&cfg.common.data_wal_dir).join("files");
@@ -109,6 +96,142 @@ pub(crate) async fn check_uncompleted_parquet_files() -> Result<()> {
 
     log::info!("Check uncompleted parquet files done");
 
+    Ok(())
+}
+
+// finish steps 3, 4 and 5 for one lock file, in the order that keeps a crash
+// during recovery recoverable: promote the .par files and fsync their dirs,
+// only then delete the .wal file that could still replay them, and delete the
+// lock file last so a crash before it just re-runs these same idempotent steps
+async fn finish_locked_persist(lock_file: &Path) -> Result<()> {
+    let bytes = std::fs::read(lock_file).context(OpenFileSnafu { path: lock_file })?;
+    // a lock is complete by construction (temp write + atomic rename), so an
+    // empty or unparseable one is a partial in-place write from an older
+    // binary crashing between create and fsync. It commits nothing: treat it
+    // as absent -- drop the bogus lock, keep the wal for replay, and let the
+    // stray-.par sweep collect whatever files it may have named.
+    let content = String::from_utf8(bytes).unwrap_or_default();
+    let par_files: Vec<PathBuf> = content
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(PathBuf::from)
+        .collect();
+    let parseable = !par_files.is_empty()
+        && par_files
+            .iter()
+            .all(|p| p.extension().is_some_and(|ext| ext == "par"));
+    if !parseable {
+        log::error!(
+            "lock file {lock_file:?} is empty or unparseable ({} bytes), treating it as absent: \
+             the wal file is kept and will be replayed",
+            content.len()
+        );
+        return remove_file_tolerant(lock_file);
+    }
+
+    // classify every file before touching any: promoting only part of a lock
+    // whose other files are gone would leave the surviving rows both promoted
+    // and replayable
+    let mut to_rename: Vec<&PathBuf> = Vec::new();
+    let mut lost: Vec<&PathBuf> = Vec::new();
+    for par_file in par_files.iter() {
+        if par_file.is_file() {
+            to_rename.push(par_file);
+        } else if !par_file.with_extension("parquet").is_file() {
+            lost.push(par_file);
+        }
+        // else: already promoted by the crashed attempt or an earlier recovery
+    }
+
+    let wal_file = lock_file.with_extension("wal");
+    if !lost.is_empty() {
+        for par_file in lost.iter() {
+            log::error!("lock file {lock_file:?} refers to a missing file: {par_file:?}");
+        }
+        if wal_file.is_file() {
+            // the wal is the ONLY remaining copy of those rows: it must never
+            // be deleted here. Promote nothing -- replay re-creates all of
+            // this wal's data and the boot sweep removes the leftover .par
+            // files -- and drop the lock so the replay scan picks the wal up.
+            log::error!(
+                "keeping wal file {wal_file:?} for replay: {} of {} locked files are missing",
+                lost.len(),
+                par_files.len()
+            );
+            return remove_file_tolerant(lock_file);
+        }
+        // no wal left to replay: promote what survived and say what did not.
+        // If the mover uploaded the missing files before the crash the data is
+        // in object storage; otherwise it is lost, and failing the boot would
+        // not bring it back.
+        log::error!(
+            "wal file {wal_file:?} is already deleted and {} of {} locked files are missing: \
+             promoting the survivors; the missing ones are either already uploaded or lost",
+            lost.len(),
+            par_files.len()
+        );
+    }
+
+    let mut dirs: Vec<&Path> = Vec::with_capacity(par_files.len());
+    for par_file in to_rename {
+        let parquet_file = par_file.with_extension("parquet");
+        log::warn!("rename par file: {par_file:?} to parquet");
+        std::fs::rename(par_file, &parquet_file).context(RenameFileSnafu { path: par_file })?;
+    }
+    // fsync the directory of every named file, not just the renamed ones: the
+    // crashed attempt may have promoted a file without reaching its own dir
+    // fsync, and that promotion must be durable before the wal goes
+    for par_file in par_files.iter() {
+        if let Some(parent) = par_file.parent()
+            && !dirs.contains(&parent)
+        {
+            dirs.push(parent);
+        }
+    }
+    for dir in dirs {
+        if let Err(e) = crate::durability::fsync_dir(dir).await
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(Error::OpenDirError {
+                source: e,
+                path: dir.to_path_buf(),
+            });
+        }
+    }
+
+    log::warn!("delete processed wal file: {wal_file:?}");
+    remove_file_tolerant(&wal_file)?;
+
+    log::warn!("delete lock file: {lock_file:?}");
+    remove_file_tolerant(lock_file)
+}
+
+// remove a file, treating already-gone as done: recovery steps re-run after a
+// crash and must converge on files a previous pass already deleted
+fn remove_file_tolerant(path: &Path) -> Result<()> {
+    if let Err(e) = std::fs::remove_file(path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(Error::DeleteFileError {
+            source: e,
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
+// delete stray <n>.lock.tmp files under the wal dir: staging leftovers of the
+// atomic lock write whose rename never happened. Anything else with a .tmp
+// extension is left alone.
+async fn cleanup_stale_lock_tmp_files(wal_dir: &Path) -> Result<()> {
+    let tmp_files = wal_scan_files(wal_dir, "tmp").await.unwrap_or_default();
+    for tmp_file in tmp_files.iter() {
+        if !tmp_file.to_string_lossy().ends_with(".lock.tmp") {
+            continue;
+        }
+        log::warn!("delete stale lock tmp file: {tmp_file:?}");
+        remove_file_tolerant(tmp_file)?;
+    }
     Ok(())
 }
 
@@ -326,4 +449,225 @@ pub async fn collect_wal_parquet_metrics() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("oo-ingester-wal-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_lock(lock_file: &Path, par_files: &[PathBuf]) {
+        let body = par_files
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(lock_file, body).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_finish_locked_persist_promotes_before_deleting_wal() {
+        let dir = test_dir("recover");
+        let par_dir = dir.join("files/org/logs/s/0/h1");
+        std::fs::create_dir_all(&par_dir).unwrap();
+        let par = par_dir.join("a.par");
+        std::fs::write(&par, b"parquet-bytes").unwrap();
+        let wal = dir.join("1.wal");
+        std::fs::write(&wal, b"wal").unwrap();
+        let lock = dir.join("1.lock");
+        write_lock(&lock, std::slice::from_ref(&par));
+
+        finish_locked_persist(&lock).await.unwrap();
+
+        assert_eq!(
+            std::fs::read(par.with_extension("parquet")).unwrap(),
+            b"parquet-bytes"
+        );
+        assert!(!par.exists());
+        assert!(!wal.exists());
+        assert!(!lock.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_finish_locked_persist_tolerates_already_done_steps() {
+        let dir = test_dir("recover-partial");
+        let par_dir = dir.join("files/org/logs/s/0/h1");
+        std::fs::create_dir_all(&par_dir).unwrap();
+        // crashed after step 4: the .parquet is there, the .wal is already gone
+        let par = par_dir.join("a.par");
+        let parquet = par.with_extension("parquet");
+        std::fs::write(&parquet, b"parquet-bytes").unwrap();
+        let lock = dir.join("2.lock");
+        write_lock(&lock, std::slice::from_ref(&par));
+
+        finish_locked_persist(&lock).await.unwrap();
+
+        assert_eq!(std::fs::read(&parquet).unwrap(), b"parquet-bytes");
+        assert_eq!(std::fs::read_dir(&par_dir).unwrap().count(), 1);
+        assert!(!lock.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_finish_locked_persist_blank_lock_keeps_the_wal() {
+        let dir = test_dir("recover-blank");
+        let lock = dir.join("3.lock");
+        std::fs::write(&lock, b"\n\n").unwrap();
+        let wal = dir.join("3.wal");
+        std::fs::write(&wal, b"wal").unwrap();
+
+        finish_locked_persist(&lock).await.unwrap();
+
+        // a lock without a single named file proves nothing: it is a partial
+        // write, so the wal survives for replay and only the lock goes
+        assert!(wal.exists());
+        assert!(!lock.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_finish_locked_persist_empty_lock_keeps_the_wal() {
+        let dir = test_dir("recover-empty-lock");
+        // the F1 crash window: open(O_CREAT|O_TRUNC) survived, the content did
+        // not -- the lock exists with zero bytes
+        let lock = dir.join("4.lock");
+        std::fs::write(&lock, b"").unwrap();
+        let wal = dir.join("4.wal");
+        std::fs::write(&wal, b"wal").unwrap();
+
+        finish_locked_persist(&lock).await.unwrap();
+
+        assert!(wal.exists());
+        assert!(!lock.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_finish_locked_persist_truncated_lock_keeps_the_wal() {
+        let dir = test_dir("recover-truncated-lock");
+        let par_dir = dir.join("files/org/logs/s/0/h1");
+        std::fs::create_dir_all(&par_dir).unwrap();
+        let par = par_dir.join("a.par");
+        std::fs::write(&par, b"parquet-bytes").unwrap();
+        // a partial flush cut the second path mid-way: the line does not name
+        // a .par file, so the whole lock is untrustworthy
+        let lock = dir.join("5.lock");
+        std::fs::write(
+            &lock,
+            format!("{}\n{}", par.display(), par_dir.join("b.pa").display()),
+        )
+        .unwrap();
+        let wal = dir.join("5.wal");
+        std::fs::write(&wal, b"wal").unwrap();
+
+        finish_locked_persist(&lock).await.unwrap();
+
+        assert!(wal.exists());
+        assert!(!lock.exists());
+        // nothing was promoted off an untrusted lock; the replay owns the data
+        // and the boot sweep collects the stray .par
+        assert!(par.exists());
+        assert!(!par.with_extension("parquet").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_finish_locked_persist_non_utf8_lock_keeps_the_wal() {
+        let dir = test_dir("recover-binary-lock");
+        let lock = dir.join("6.lock");
+        std::fs::write(&lock, [0xff, 0xfe, 0x00, 0x41]).unwrap();
+        let wal = dir.join("6.wal");
+        std::fs::write(&wal, b"wal").unwrap();
+
+        finish_locked_persist(&lock).await.unwrap();
+
+        assert!(wal.exists());
+        assert!(!lock.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_finish_locked_persist_keeps_wal_when_a_locked_file_is_lost() {
+        let dir = test_dir("recover-lost-file");
+        let par_dir = dir.join("files/org/logs/s/0/h1");
+        std::fs::create_dir_all(&par_dir).unwrap();
+        let par_a = par_dir.join("a.par");
+        std::fs::write(&par_a, b"parquet-bytes").unwrap();
+        // b has neither .par nor .parquet left: the wal is the only copy
+        let par_b = par_dir.join("b.par");
+        let lock = dir.join("7.lock");
+        write_lock(&lock, &[par_a.clone(), par_b.clone()]);
+        let wal = dir.join("7.wal");
+        std::fs::write(&wal, b"wal").unwrap();
+
+        finish_locked_persist(&lock).await.unwrap();
+
+        // the wal survives for replay, and no file of this lock was promoted:
+        // replay re-creates them all, a promoted survivor would be a duplicate
+        assert!(wal.exists());
+        assert!(!lock.exists());
+        assert!(par_a.exists());
+        assert!(!par_a.with_extension("parquet").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_finish_locked_persist_promotes_survivors_when_wal_is_gone() {
+        let dir = test_dir("recover-lost-no-wal");
+        let par_dir = dir.join("files/org/logs/s/0/h1");
+        std::fs::create_dir_all(&par_dir).unwrap();
+        let par_a = par_dir.join("a.par");
+        std::fs::write(&par_a, b"parquet-bytes").unwrap();
+        // b is gone (mover uploaded and reaped it, or it is lost) and so is
+        // the wal: promoting a is the only way to keep its rows queryable
+        let par_b = par_dir.join("b.par");
+        let lock = dir.join("8.lock");
+        write_lock(&lock, &[par_a.clone(), par_b.clone()]);
+
+        finish_locked_persist(&lock).await.unwrap();
+
+        assert_eq!(
+            std::fs::read(par_a.with_extension("parquet")).unwrap(),
+            b"parquet-bytes"
+        );
+        assert!(!par_a.exists());
+        assert!(!lock.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_stale_lock_tmp_files_only_touches_lock_tmps() {
+        let dir = test_dir("cleanup-lock-tmp");
+        let sub = dir.join("0/org/logs");
+        std::fs::create_dir_all(&sub).unwrap();
+        let stale = sub.join("9.lock.tmp");
+        std::fs::write(&stale, b"partial").unwrap();
+        let unrelated = sub.join("other.tmp");
+        std::fs::write(&unrelated, b"keep").unwrap();
+        let lock = sub.join("9.lock");
+        std::fs::write(&lock, b"files/a.par").unwrap();
+
+        cleanup_stale_lock_tmp_files(&dir).await.unwrap();
+
+        assert!(!stale.exists());
+        assert!(unrelated.exists());
+        assert!(lock.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

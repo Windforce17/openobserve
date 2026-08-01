@@ -25,6 +25,8 @@ use super::{ACCOUNT_SEPARATOR, TRACE_ID_SEPARATOR};
 
 #[derive(Clone)]
 pub struct ScanSelection {
+    /// see [`config::meta::stream::FileKey::selection_exact`]
+    pub exact: bool,
     pub selection: FileSelection,
     pub row_group_size: Option<u32>,
 }
@@ -68,6 +70,7 @@ pub async fn set(trace_id: &str, schema_key: &str, format: &str, files: Vec<File
             scan_selections.insert(
                 file.key,
                 ScanSelection {
+                    exact: file.selection_exact,
                     selection,
                     row_group_size: file.row_group_size,
                 },
@@ -102,6 +105,18 @@ pub fn clear(trace_id: &str) {
     }
     w.shrink_to_fit();
     drop(w);
+}
+
+/// Whether `file_key` carries an EXACT index selection: its rows already
+/// satisfy the whole index condition, so the scan needs no re-applied filter
+/// for this file.
+pub fn has_exact_scan_selection(file_key: &str) -> bool {
+    let Some((trace_id, filename)) = file_key.split_once("/$$/") else {
+        return false;
+    };
+    let r = SCAN_SELECTIONS.read();
+    r.get(trace_id)
+        .is_some_and(|data| data.get(filename).is_some_and(|s| s.exact))
 }
 
 pub fn get_scan_selection(file_key: &str) -> Option<ScanSelection> {

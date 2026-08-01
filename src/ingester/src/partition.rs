@@ -29,7 +29,6 @@ use config::{
 };
 use hashbrown::HashSet;
 use snafu::ResultExt;
-use tokio::{fs::OpenOptions, io::AsyncWriteExt};
 
 use crate::{
     ReadRecordBatchEntry,
@@ -190,13 +189,10 @@ impl Partition {
                     records: file_meta.records as usize,
                 };
                 // write into parquet buf
-                let bloom_filter_fields =
-                    if self.schema.fields().len() >= cfg.limit.file_move_fields_limit {
-                        let settings = infra::schema::unwrap_stream_settings(self.schema.as_ref());
-                        infra::schema::get_stream_setting_bloom_filter_fields(&settings)
-                    } else {
-                        vec![]
-                    };
+                let bloom_filter_fields = {
+                    let settings = infra::schema::unwrap_stream_settings(self.schema.as_ref());
+                    infra::schema::get_stream_setting_bloom_filter_fields(&settings)
+                };
                 let batches = data
                     .iter()
                     .map(|r| {
@@ -241,17 +237,14 @@ impl Partition {
                 path.set_extension("par");
                 create_dir_all(path.parent().unwrap())
                     .context(CreateFileSnafu { path: path.clone() })?;
-                let mut f = OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(true)
-                    .open(&path)
-                    .await
-                    .context(CreateFileSnafu { path: path.clone() })?;
-                f.write_all(&buf_parquet)
+                // step 1 of the persist chain: the .par bytes must be on stable
+                // storage before the .lock file that promotes them is written,
+                // because the .wal is deleted on the strength of that lock. The
+                // directory entry is fsynced by `immutable::commit_staged_files`
+                // once every file of this memtable is written.
+                crate::durability::write_file_durable(&path, &buf_parquet)
                     .await
                     .context(WriteFileSnafu { path: path.clone() })?;
-                drop(f);
 
                 // set parquet metadata cache
                 let mut file_key = path.clone();

@@ -557,8 +557,6 @@ pub async fn list(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Once;
-
     use bytes::Bytes;
     use sea_orm::{DatabaseBackend, DbErr, MockDatabase, MockExecResult};
     use serde_json::json;
@@ -682,10 +680,10 @@ mod tests {
         // Test update
         let result = Entity::update_many()
             .col_expr(Column::Org, Expr::value(&rule.org))
-            .col_expr(Column::RuleType, Expr::value(&rule.rule_type.unwrap()))
-            .col_expr(Column::UserRole, Expr::value(&rule.user_role.unwrap()))
+            .col_expr(Column::RuleType, Expr::value(rule.rule_type.unwrap()))
+            .col_expr(Column::UserRole, Expr::value(rule.user_role.unwrap()))
             .col_expr(Column::Threshold, Expr::value(rule.threshold))
-            .filter(Column::RuleId.eq(&rule.rule_id.unwrap()))
+            .filter(Column::RuleId.eq(rule.rule_id.unwrap()))
             .exec(&db)
             .await;
 
@@ -735,31 +733,22 @@ mod tests {
 
     #[test]
     fn test_ratelimit_rule_type() {
+        // The real conversion is `From<&str>` (TryFrom is only the infallible
+        // blanket impl), so test it directly.
         assert!(matches!(
-            RatelimitRuleType::try_from("exact"),
-            Ok(RatelimitRuleType::Exact)
+            RatelimitRuleType::from("exact"),
+            RatelimitRuleType::Exact
         ));
         assert!(matches!(
-            RatelimitRuleType::try_from("regex"),
-            Ok(RatelimitRuleType::Regex)
+            RatelimitRuleType::from("regex"),
+            RatelimitRuleType::Regex
         ));
         assert_eq!(
-            RatelimitRuleType::try_from("invalid").unwrap().to_string(),
+            RatelimitRuleType::from("invalid").to_string(),
             RatelimitRuleType::Exact.to_string()
         );
         assert_eq!(RatelimitRuleType::Exact.to_string(), "exact");
         assert_eq!(RatelimitRuleType::Regex.to_string(), "regex");
-    }
-
-    static INIT: Once = Once::new();
-
-    async fn setup_test_db(mock_db: sea_orm::DatabaseConnection) {
-        INIT.call_once(|| {
-            // Initialize ORM_CLIENT only once
-            ORM_CLIENT
-                .set(mock_db)
-                .expect("Failed to set mock database");
-        });
     }
 
     #[tokio::test]
@@ -776,12 +765,11 @@ mod tests {
             ..Default::default()
         }];
 
-        // Create mock database
-        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
-
-        // Setup test database
-        setup_test_db(db).await;
-
+        // add_batch validates rule ids before issuing any query, so it works
+        // against whatever connection ORM_CLIENT holds (the shared global must
+        // NOT be overridden with a mock here: other tests in this binary
+        // initialize it with the real local db, and poisoning it with a mock
+        // breaks every test scheduled after this one).
         let result = add_batch(rules).await;
         assert!(result.is_err());
         assert!(

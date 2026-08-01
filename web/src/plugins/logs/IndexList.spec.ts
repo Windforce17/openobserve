@@ -358,16 +358,6 @@ describe("Index List", async () => {
     );
   });
 
-  it("toggleSchema sets loadingStream and calls extractFields", async () => {
-    wrapper.vm.searchObj.loadingStream = false;
-    await wrapper.vm.toggleSchema();
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    await flushPromises();
-    expect(wrapper.vm.searchObj.loadingStream).toBe(false);
-    // extractFields might not be called directly in toggleSchema, so skip this assertion
-    // expect(mockExtractFields).toHaveBeenCalled();
-  });
-
   it("filterFieldFn filters rows by name and avoids duplicates", async () => {
     // Spy on filterFieldFn
     const filterFieldFnSpy = vi.spyOn(wrapper.vm, "filterFieldFn");
@@ -1062,24 +1052,6 @@ describe("Index List", async () => {
   });
 
   describe("Additional computed properties tests", () => {
-    it("should compute showUserDefinedSchemaToggle correctly when enabled", async () => {
-      wrapper.vm.store.state.zoConfig = {
-        ...wrapper.vm.store.state.zoConfig,
-        user_defined_schemas_enabled: true,
-      };
-      wrapper.vm.searchObj.meta.hasUserDefinedSchemas = true;
-      await wrapper.vm.$nextTick();
-
-      expect(wrapper.vm.showUserDefinedSchemaToggle).toBe(true);
-    });
-
-    it("should compute showUserDefinedSchemaToggle correctly when disabled", async () => {
-      wrapper.vm.store.state.zoConfig.user_defined_schemas_enabled = false;
-      wrapper.vm.searchObj.meta.hasUserDefinedSchemas = true;
-
-      expect(wrapper.vm.showUserDefinedSchemaToggle).toBe(false);
-    });
-
     it.skip("should compute streamList correctly", async () => {
       const mockStreamList = [
         { name: "stream1", type: "logs" },
@@ -1415,16 +1387,6 @@ describe("Index List", async () => {
       "value",
       "include",
     );
-  });
-
-  it("toggleSchema sets loadingStream and calls extractFields", async () => {
-    wrapper.vm.searchObj.loadingStream = false;
-    await wrapper.vm.toggleSchema();
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    await flushPromises();
-    expect(wrapper.vm.searchObj.loadingStream).toBe(false);
-    // extractFields might not be called directly in toggleSchema, so skip this assertion
-    // expect(mockExtractFields).toHaveBeenCalled();
   });
 
   it("filterFieldFn filters rows by name and avoids duplicates", async () => {
@@ -2175,24 +2137,6 @@ describe("Index List", async () => {
   });
 
   describe("Additional computed properties tests", () => {
-    it("should compute showUserDefinedSchemaToggle correctly when enabled", async () => {
-      wrapper.vm.store.state.zoConfig = {
-        ...wrapper.vm.store.state.zoConfig,
-        user_defined_schemas_enabled: true,
-      };
-      wrapper.vm.searchObj.meta.hasUserDefinedSchemas = true;
-      await wrapper.vm.$nextTick();
-
-      expect(wrapper.vm.showUserDefinedSchemaToggle).toBe(true);
-    });
-
-    it("should compute showUserDefinedSchemaToggle correctly when disabled", async () => {
-      wrapper.vm.store.state.zoConfig.user_defined_schemas_enabled = false;
-      wrapper.vm.searchObj.meta.hasUserDefinedSchemas = true;
-
-      expect(wrapper.vm.showUserDefinedSchemaToggle).toBe(false);
-    });
-
     it.skip("should compute streamList correctly", async () => {
       const mockStreamList = [
         { name: "stream1", type: "logs" },

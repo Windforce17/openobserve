@@ -38,6 +38,7 @@ pub async fn file_list(
         stream_name,
         hour,
         hour,
+        false,
     )
     .await?;
     println!("get files: {}", file_list.len());
@@ -149,6 +150,7 @@ mod tests {
             deleted: false,
             selection: None,
             row_group_size: None,
+            selection_exact: false,
         }
     }
 

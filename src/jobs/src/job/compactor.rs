@@ -32,6 +32,15 @@ pub async fn run() -> Result<(), anyhow::Error> {
     }
 
     let cfg = get_config();
+
+    // Segment-WAL sweeper (DESIGN-SEGMENT-WAL.md): retires built segment
+    // objects and their wal_segments rows. Deliberately not gated on
+    // compact.enabled — storage reclamation must continue even when merge
+    // compaction is turned off — nor on ingest_segment_mode: a flag-off
+    // rollback must keep retiring already-built segments, and an idle sweep
+    // over an empty table is near-free.
+    compact::segments_sweep::spawn();
+
     if !cfg.compact.enabled {
         return Ok(());
     }
@@ -55,6 +64,18 @@ pub async fn run() -> Result<(), anyhow::Error> {
         }
     });
 
+    // One-shot boot pass for the historical sweep: the pausable job sleeps a
+    // FULL old_data_interval (1h) before its first run, so every compactor
+    // restart used to push the old-data sweep out by an hour — repeated rolls
+    // starved it indefinitely and stranded pre-watermark hours. The short
+    // delay lets the node ring settle so stream ownership is stable.
+    tokio::task::spawn(async move {
+        tokio::time::sleep(tokio::time::Duration::from_secs(120)).await;
+        log::info!("[COMPACTOR::JOB] boot pass: generate merge job for old data");
+        if let Err(e) = compact::run_generate_job(CompactionJobType::Historical).await {
+            log::error!("[COMPACTOR::JOB] boot old-data generate error: {e}");
+        }
+    });
     spawn_pausable_job!(
         "run_generate_old_data_job",
         get_config().compact.old_data_interval.saturating_add(1),
@@ -65,6 +86,19 @@ pub async fn run() -> Result<(), anyhow::Error> {
             }
         }
     );
+
+    if get_config().compact.bloom_build_interval > 0 {
+        spawn_pausable_job!(
+            "run_bloom_build",
+            get_config().compact.bloom_build_interval,
+            {
+                log::debug!("[COMPACTOR::JOB] Running group .bf bloom builder");
+                if let Err(e) = compact::bloom::run().await {
+                    log::error!("[COMPACTOR::JOB] bloom builder error: {e}");
+                }
+            }
+        );
+    }
 
     #[cfg(feature = "enterprise")]
     spawn_pausable_job!(

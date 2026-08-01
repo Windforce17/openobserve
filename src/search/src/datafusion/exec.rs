@@ -43,17 +43,13 @@ use datafusion::{
     },
     logical_expr::AggregateUDF,
     optimizer::{AnalyzerRule, OptimizerRule},
-    physical_expr_adapter::DefaultPhysicalExprAdapterFactory,
     physical_optimizer::PhysicalOptimizerRule,
     prelude::{SessionContext, col},
 };
 #[cfg(feature = "enterprise")]
 use o2_enterprise::enterprise::search::WorkGroup;
-#[cfg(all(feature = "enterprise", feature = "vortex"))]
-use {
-    vortex::{VortexSessionDefault, io::session::RuntimeSessionExt, session::VortexSession},
-    vortex_datafusion::VortexFormat,
-};
+use vortex::{VortexSessionDefault, io::session::RuntimeSessionExt, session::VortexSession};
+use vortex_datafusion::VortexFormat;
 
 use super::{
     peak_memory_pool::PeakMemoryPool, planner::extension_planner::OpenobserveQueryPlanner,
@@ -61,8 +57,10 @@ use super::{
 };
 use crate::{
     datafusion::{
+        source_synthesis::SourceSynthesizingExprAdapterFactory,
         storage::file_statistics_cache,
         table_provider::{listing_adapter::ListingTableAdapter, uniontable::NewUnionTable},
+        vix_format::VixCoreFormat,
     },
     index::IndexCondition,
 };
@@ -437,29 +435,25 @@ impl TableBuilder {
 
         // Group files by format
         let mut parquet_files = Vec::new();
-        #[cfg(all(feature = "enterprise", feature = "vortex"))]
         let mut vortex_files = Vec::new();
+        let mut vix_files = Vec::new();
 
         for file in files {
             match FileFormat::from_extension(&file.key) {
-                #[cfg(all(feature = "enterprise", feature = "vortex"))]
                 Some(FileFormat::Vortex) => vortex_files.push(file),
+                // A core .vix data file is a puffin container (docs blob +
+                // embedded index), scanned through VixCoreFormat.
+                Some(FileFormat::Vix) => vix_files.push(file),
                 _ => parquet_files.push(file), // Default to parquet
             }
         }
 
-        #[cfg(all(feature = "enterprise", feature = "vortex"))]
         log::info!(
-            "[trace_id: {}] parquet_files numbers: {}, vortex_files numbers: {}",
+            "[trace_id: {}] parquet_files numbers: {}, vortex_files numbers: {}, vix_files numbers: {}",
             session.id,
             parquet_files.len(),
-            vortex_files.len()
-        );
-        #[cfg(not(all(feature = "enterprise", feature = "vortex")))]
-        log::info!(
-            "[trace_id: {}] parquet_files numbers: {}",
-            session.id,
-            parquet_files.len()
+            vortex_files.len(),
+            vix_files.len()
         );
 
         // Build table providers for each format
@@ -478,7 +472,6 @@ impl TableBuilder {
             tables.push(table);
         }
 
-        #[cfg(all(feature = "enterprise", feature = "vortex"))]
         if !vortex_files.is_empty() {
             let table = self
                 .build_table_for_format(
@@ -486,6 +479,19 @@ impl TableBuilder {
                     vortex_files,
                     schema.clone(),
                     FileFormat::Vortex,
+                    target_partitions,
+                )
+                .await?;
+            tables.push(table);
+        }
+
+        if !vix_files.is_empty() {
+            let table = self
+                .build_table_for_format(
+                    session.clone(),
+                    vix_files,
+                    schema.clone(),
+                    FileFormat::Vix,
                     target_partitions,
                 )
                 .await?;
@@ -506,17 +512,14 @@ impl TableBuilder {
         // Configure listing options with the appropriate file format
         let file_format: Arc<dyn DataFusionFileFormat> = match format {
             FileFormat::Parquet => Arc::new(ParquetFormat::default()),
-            #[cfg(all(feature = "enterprise", feature = "vortex"))]
             FileFormat::Vortex => {
                 let vortex_session = VortexSession::default().with_tokio();
                 Arc::new(VortexFormat::new(vortex_session))
             }
-            #[cfg(not(all(feature = "enterprise", feature = "vortex")))]
-            FileFormat::Vortex => {
-                return Err(DataFusionError::Execution(
-                    "Vortex file format requires enterprise and vortex features".to_string(),
-                ));
-            }
+            // Core files: logical stream schema over the docs blob, with
+            // non-physical columns extracted from `_source`. The query time
+            // range is pushed into each file's vortex scan.
+            FileFormat::Vix => Arc::new(VixCoreFormat::new(self.timestamp_filter)),
         };
 
         let mut listing_options = ListingOptions::new(file_format)
@@ -524,7 +527,12 @@ impl TableBuilder {
             .with_collect_stat(true);
 
         if self.sorted_by_time {
-            // specify sort columns for parquet file
+            // Every format stores its rows ORDER BY _timestamp DESC, so
+            // declare that per-file sort order. Core .vix files supply exact
+            // `_timestamp` min/max statistics from `VixCoreFormat::infer_stats`
+            // (parquet/vortex from their own footers), so
+            // `split_file_groups_by_statistics` can order the file groups to
+            // uphold the declared ordering and the SortExec is elided.
             listing_options = listing_options
                 .with_file_sort_order(vec![vec![col(TIMESTAMP_COL_NAME).sort(false, false)]]);
         }
@@ -574,7 +582,11 @@ impl TableBuilder {
             schema
         };
         config = config.with_schema(schema);
-        config = config.with_expr_adapter_factory(Arc::new(DefaultPhysicalExprAdapterFactory {}));
+        // the default adapter plus `_source` synthesis: a star-projected
+        // `_source` column missing from a parquet file (WAL parquet,
+        // pre-migration storage parquet) is synthesized per row from the
+        // file's own columns instead of null-filled (DESIGN §5)
+        config = config.with_expr_adapter_factory(Arc::new(SourceSynthesizingExprAdapterFactory));
         let mut table = ListingTableAdapter::try_new(
             config,
             session.id.clone(),
@@ -856,6 +868,7 @@ mod tests {
                 id: 1,
                 selection: None,
                 row_group_size: None,
+                selection_exact: false,
             }];
 
             let result = register_metrics_table(&session, schema, "test_table", files).await;
@@ -896,6 +909,7 @@ mod tests {
                 id: 1,
                 selection: None,
                 row_group_size: None,
+                selection_exact: false,
             }];
 
             let builder = TableBuilder::new().sorted_by_time(true);

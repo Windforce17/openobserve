@@ -37,7 +37,7 @@ use infra::{
 use itertools::Itertools;
 use tracing::Instrument;
 
-pub use crate::service::search::tantivy::tantivy_search;
+pub use crate::service::search::vix::vix_search;
 use crate::service::{
     file_list,
     search::{
@@ -84,7 +84,14 @@ pub async fn search(
 
     let mut idx_took = 0;
     let mut is_add_filter_back = false;
-    if *use_inverted_index && !index_condition.as_ref().unwrap().is_condition_all() {
+    // index_condition is None when the filter has nothing index-extractable
+    // (use_inverted_index is false then) — never unwrap it unconditionally:
+    // a None here panicked the whole storage partition and the query
+    // silently degraded to WAL-only results.
+    let condition_all = index_condition
+        .as_ref()
+        .is_some_and(IndexCondition::is_condition_all);
+    if *use_inverted_index && !condition_all {
         // check bloom filter first
         let (bloom_took, ok) = check_bloom_filter(
             query.clone(),
@@ -115,9 +122,18 @@ pub async fn search(
                 )
             );
         }
+    }
 
-        // check tantivy index
-        (idx_took, is_add_filter_back, ..) = tantivy_search(
+    // The vix index also answers the no-filter SimpleSelect (bare
+    // `SELECT * ORDER BY _timestamp LIMIT n`, condition ALL): its exact
+    // `_timestamp` candidates prune the file list to the global top-N and
+    // narrow the winners to row selections (file-level early termination +
+    // row-level late materialization). Every other condition-ALL shape has
+    // nothing for the index to answer, and bloom above always needs real
+    // terms.
+    if vix_search_applicable(*use_inverted_index, condition_all, &idx_optimize_rule) {
+        // check vix inverted index
+        (idx_took, is_add_filter_back, ..) = vix_search(
             query.clone(),
             &mut files,
             index_condition.clone(),
@@ -129,7 +145,7 @@ pub async fn search(
             "{}",
             search_inspector_fields(
                 format!(
-                    "[trace_id {trace_id}] search->tantivy: stream {org_id}/{stream_type}/{stream_name}, inverted index reduced file_list num to {} in {idx_took} ms",
+                    "[trace_id {trace_id}] search->vix: stream {org_id}/{stream_type}/{stream_name}, inverted index reduced file_list num to {} in {idx_took} ms",
                     files.len(),
                 ),
                 SearchInspectorFieldsBuilder::new()
@@ -298,6 +314,19 @@ pub async fn search(
     Ok((tables, scan_stats, HashSet::new()))
 }
 
+/// Whether the vix index step runs for this query shape: any real (non-ALL)
+/// condition, or a condition-ALL SimpleSelect — the one optimize mode that
+/// works without terms, ranking rows purely by `_timestamp`.
+fn vix_search_applicable(
+    use_inverted_index: bool,
+    condition_all: bool,
+    idx_optimize_rule: &Option<IndexOptimizeMode>,
+) -> bool {
+    use_inverted_index
+        && (!condition_all
+            || matches!(idx_optimize_rule, Some(IndexOptimizeMode::SimpleSelect(..))))
+}
+
 /// Check bloom filter for the file list
 #[tracing::instrument(name = "service:search:grpc:storage:check_bloom_filter", skip_all)]
 pub async fn check_bloom_filter(
@@ -343,4 +372,29 @@ pub async fn check_bloom_filter(
         .observe(elapsed.as_secs_f64());
 
     Ok((elapsed.as_millis() as usize, true))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_vix_search_applicable() {
+        let select = Some(IndexOptimizeMode::SimpleSelect(51, false));
+        let count = Some(IndexOptimizeMode::SimpleCount);
+
+        // real condition: always applicable, whatever the rule
+        assert!(vix_search_applicable(true, false, &None));
+        assert!(vix_search_applicable(true, false, &count));
+        assert!(vix_search_applicable(true, false, &select));
+
+        // condition ALL: only SimpleSelect has index work to do
+        assert!(vix_search_applicable(true, true, &select));
+        assert!(!vix_search_applicable(true, true, &None));
+        assert!(!vix_search_applicable(true, true, &count));
+
+        // inverted index off: never applicable
+        assert!(!vix_search_applicable(false, false, &select));
+        assert!(!vix_search_applicable(false, true, &select));
+    }
 }

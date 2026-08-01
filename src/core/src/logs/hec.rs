@@ -17,7 +17,7 @@ use std::io::{BufRead, BufReader};
 use axum::body::Bytes;
 use config::{get_config, meta::stream::StreamType, utils::json};
 use hashbrown::HashMap;
-use infra::errors::Result;
+use infra::errors::{Error, Result};
 use serde::Deserialize;
 
 use crate::{
@@ -35,6 +35,23 @@ struct HecEntry {
     event: json::Value,
 }
 
+/// Map an ingestion error to a HEC status.
+///
+/// A Splunk forwarder treats 4xx as PERMANENT and drops the batch, so every
+/// retryable condition must be 5xx. `retryable` marks the call sites where
+/// the rejection is a server-side condition (backpressure, non-ingester node,
+/// org quota) rather than malformed client data.
+fn hec_error_status(e: &Error, retryable: bool) -> HecStatus {
+    let code = match e {
+        // the forwarder should back off, not drop
+        Error::TrialPeriodExpired => 429,
+        Error::ResourceError(_) => 503,
+        _ if retryable => 503,
+        _ => 400,
+    };
+    HecStatus::Custom(e.to_string(), code)
+}
+
 pub async fn ingest(
     thread_id: usize,
     org_id: &str,
@@ -42,11 +59,8 @@ pub async fn ingest(
     user_email: &str,
 ) -> Result<HecResponse> {
     // check system resource
-    if check_ingestion_allowed(org_id, StreamType::Logs, None)
-        .await
-        .is_err()
-    {
-        return Ok(HecStatus::InvalidIndex.into());
+    if let Err(e) = check_ingestion_allowed(org_id, StreamType::Logs, None).await {
+        return Ok(hec_error_status(&e, true).into());
     }
 
     let cfg = get_config();
@@ -102,9 +116,12 @@ pub async fn ingest(
         streams.entry(index).or_default().push(data);
     }
 
+    // Every index is attempted; the worst status wins. A partial failure is
+    // still a failure — the forwarder holds the only other copy of the batch.
+    let mut failure: Option<HecResponse> = None;
     for (stream, entries) in streams {
         let in_req = IngestionRequest::JsonValues(IngestionValueType::Hec, entries);
-        if let Err(e) = super::ingest::ingest(
+        let status = match super::ingest::ingest(
             thread_id,
             org_id,
             &stream,
@@ -115,8 +132,25 @@ pub async fn ingest(
         )
         .await
         {
-            return Ok(HecStatus::Custom(e.to_string(), 400).into());
+            // a non-2xx means the records of this index were NOT stored
+            Ok(res) if res.code > 299 => HecStatus::Custom(
+                res.error
+                    .unwrap_or_else(|| format!("failed to ingest into index '{stream}'")),
+                res.code,
+            ),
+            Ok(_) => continue,
+            Err(e) => {
+                log::error!("[LOGS:HEC] index {org_id}/{stream}: ingestion error: {e}");
+                hec_error_status(&e, false)
+            }
+        };
+        let res: HecResponse = status.into();
+        if failure.as_ref().is_none_or(|worst| res.code > worst.code) {
+            failure = Some(res);
         }
+    }
+    if let Some(res) = failure {
+        return Ok(res);
     }
 
     Ok(HecStatus::Success.into())
@@ -125,6 +159,40 @@ pub async fn ingest(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Splunk forwarders treat 4xx as PERMANENT and drop the batch, so
+    /// backpressure from `check_ingestion_allowed` must be a 503 — it used to
+    /// be reported as `InvalidIndex` (400) and the events were lost.
+    #[test]
+    fn test_backpressure_is_503_not_400() {
+        let res: HecResponse =
+            hec_error_status(&Error::ResourceError("memtable is full".to_string()), true).into();
+        assert_eq!(res.code, 503);
+        assert!(res.text.contains("memtable is full"));
+
+        // the whole `check_ingestion_allowed` family is server-side: a
+        // non-ingester node or a blocked org must not read as permanent
+        let res: HecResponse =
+            hec_error_status(&Error::IngestionError("not an ingester".to_string()), true).into();
+        assert_eq!(res.code, 503);
+
+        // an expired trial is a back-off, not a drop
+        let res: HecResponse = hec_error_status(&Error::TrialPeriodExpired, true).into();
+        assert_eq!(res.code, 429);
+
+        // a client-side rejection stays a 400
+        let res: HecResponse = hec_error_status(
+            &Error::IngestionError("Stream name is empty".to_string()),
+            false,
+        )
+        .into();
+        assert_eq!(res.code, 400);
+
+        // ... but backpressure is 503 even on the non-retryable call site
+        let res: HecResponse =
+            hec_error_status(&Error::ResourceError("disk is full".to_string()), false).into();
+        assert_eq!(res.code, 503);
+    }
 
     #[tokio::test]
     async fn test_ingest_invalid_json() {

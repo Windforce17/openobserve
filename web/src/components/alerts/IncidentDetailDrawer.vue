@@ -1485,12 +1485,7 @@ export default defineComponent({
         const schema = schemaResponse.data;
 
         // Step 2: Extract schema fields (like logs page does)
-        // CRITICAL FIX: Use uds_schema (user-defined schema) if available!
-        // The logs page shows uds_schema fields in the left pane, NOT all schema fields
-        // uds_schema is the curated list of fields the user cares about
-        const schemaFieldsArray = (schema.uds_schema && schema.uds_schema.length > 0)
-          ? schema.uds_schema
-          : (schema.schema || schema.fields || []);
+        const schemaFieldsArray = schema.schema || schema.fields || [];
         const schemaFields = new Set(schemaFieldsArray.map((f: any) => f.name));
 
         // Step 3: Get semantic groups to resolve dimension names to field patterns

@@ -9,17 +9,12 @@ publish = false
 default = []
 enterprise = ["dep:o2_enterprise"]
 vectorscan = ["dep:o2_enterprise", "o2_enterprise/vectorscan"]
-vortex = [
-    "dep:vortex",
-    "dep:vortex-datafusion",
-    "config/vortex",
-    "o2_enterprise?/vortex",
-]
 
 [dependencies]
 anyhow.workspace = true
 arrow.workspace = true
 arrow-flight.workspace = true
+arrow-json.workspace = true
 arrow-schema.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
@@ -34,6 +29,7 @@ flight.workspace = true
 futures.workspace = true
 futures-util.workspace = true
 hashbrown.workspace = true
+hashlink.workspace = true
 infra.workspace = true
 itertools.workspace = true
 log.workspace = true
@@ -54,8 +50,6 @@ regex-syntax.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlparser.workspace = true
-tantivy.workspace = true
-tantivy_utils.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
@@ -65,6 +59,7 @@ tracing-opentelemetry.workspace = true
 url.workspace = true
 utoipa.workspace = true
 vector-enrichment.workspace = true
-vortex = { workspace = true, optional = true }
-vortex-datafusion = { workspace = true, optional = true }
+vortex = { workspace = true }
+vortex-datafusion = { workspace = true }
+vortex_index.workspace = true
 vrl.workspace = true

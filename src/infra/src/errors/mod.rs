@@ -75,6 +75,8 @@ pub enum Error {
     NatsKJetstreamConsumerStreamError(#[from] NatsError<jetstream::consumer::StreamErrorKind>),
     #[error("Error# {0}")]
     Message(String),
+    #[error("InvalidFileMeta# {0}")]
+    InvalidFileMeta(String),
     #[error("DuplicateName# {0}")]
     DuplicateName(String),
     #[error("ReadOnly# {0}")]
@@ -100,6 +102,44 @@ pub enum Error {
 }
 
 unsafe impl Send for Error {}
+
+impl Error {
+    /// Whether this error is DETERMINISTIC for a database write: retrying the
+    /// same statement can never succeed, so retry loops must bail immediately
+    /// instead of spinning (a live compactor wedged for hours retrying a SQL
+    /// syntax error every second). Deterministic:
+    ///
+    /// - [`Error::InvalidFileMeta`] — our own pre-SQL validation (degenerate meta / unparseable
+    ///   file key); the same input fails the same way forever,
+    /// - SQLSTATE classes that depend only on the statement itself: `42` (syntax error or access
+    ///   rule violation), `22` (data exception), `23` (integrity constraint violation), `0A`
+    ///   (feature not supported),
+    /// - sqlx decode/type mismatches (`ColumnNotFound`, `ColumnDecode`, `Decode`, `TypeNotFound`,
+    ///   `ColumnIndexOutOfBounds`) — schema/statement bugs, not transient states.
+    ///
+    /// Everything else (connection loss, pool timeouts, serialization
+    /// failures `40xxx`, lock timeouts `55xxx`, resource classes `53xxx`, io
+    /// errors) stays retryable.
+    pub fn is_deterministic_db_error(&self) -> bool {
+        match self {
+            Error::InvalidFileMeta(_) => true,
+            Error::SqlxError(e) => match e {
+                sqlx::Error::Database(db) => db.code().is_some_and(|code| {
+                    ["42", "22", "23", "0A"]
+                        .iter()
+                        .any(|class| code.starts_with(class))
+                }),
+                sqlx::Error::ColumnNotFound(_)
+                | sqlx::Error::ColumnDecode { .. }
+                | sqlx::Error::ColumnIndexOutOfBounds { .. }
+                | sqlx::Error::Decode(_)
+                | sqlx::Error::TypeNotFound { .. } => true,
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+}
 
 #[derive(ThisError, Debug)]
 #[error("cannot parse \"{value}\" as {ty}")]
@@ -400,6 +440,87 @@ pub enum JwtError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Minimal [`sqlx::error::DatabaseError`] carrying only a SQLSTATE code —
+    /// the retry classifier's input shape.
+    #[derive(Debug)]
+    struct FakeDbError(&'static str);
+
+    impl std::fmt::Display for FakeDbError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "fake database error (SQLSTATE {})", self.0)
+        }
+    }
+
+    impl std::error::Error for FakeDbError {}
+
+    impl sqlx::error::DatabaseError for FakeDbError {
+        fn message(&self) -> &str {
+            "fake database error"
+        }
+
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            Some(std::borrow::Cow::Borrowed(self.0))
+        }
+
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+
+    fn sqlstate_error(code: &'static str) -> Error {
+        Error::SqlxError(sqlx::Error::Database(Box::new(FakeDbError(code))))
+    }
+
+    /// The deterministic-vs-retryable split the compactor's file_list commit
+    /// retry loop bails on: statement-shaped failures (syntax errors, data
+    /// exceptions, constraint violations, our own meta validation) can never
+    /// succeed on retry; transient states (serialization failures, lock/pool
+    /// timeouts, connection loss) must keep retrying.
+    #[test]
+    fn test_is_deterministic_db_error() {
+        // the live regression: `VALUES ()` -> "syntax error at or near )" (42601)
+        assert!(sqlstate_error("42601").is_deterministic_db_error());
+        // data exception / integrity violation / unsupported feature
+        assert!(sqlstate_error("22012").is_deterministic_db_error());
+        assert!(sqlstate_error("23505").is_deterministic_db_error());
+        assert!(sqlstate_error("0A000").is_deterministic_db_error());
+        // our pre-SQL meta validation
+        assert!(Error::InvalidFileMeta("min_ts is 0".to_string()).is_deterministic_db_error());
+        // decode/type mismatches are statement bugs
+        assert!(
+            Error::SqlxError(sqlx::Error::ColumnNotFound("min_ts".to_string()))
+                .is_deterministic_db_error()
+        );
+
+        // transient: serialization failure / deadlock / lock timeout /
+        // insufficient resources / connection & pool states
+        assert!(!sqlstate_error("40001").is_deterministic_db_error());
+        assert!(!sqlstate_error("40P01").is_deterministic_db_error());
+        assert!(!sqlstate_error("55P03").is_deterministic_db_error());
+        assert!(!sqlstate_error("53300").is_deterministic_db_error());
+        assert!(!Error::SqlxError(sqlx::Error::PoolTimedOut).is_deterministic_db_error());
+        assert!(!Error::SqlxError(sqlx::Error::PoolClosed).is_deterministic_db_error());
+        // a database error WITHOUT a code cannot be proven deterministic
+        assert!(
+            !Error::SqlxError(sqlx::Error::Protocol("connection reset".to_string()))
+                .is_deterministic_db_error()
+        );
+        // unrelated variants stay retryable by default
+        assert!(!Error::Message("anything".to_string()).is_deterministic_db_error());
+    }
 
     #[test]
     fn test_error() {

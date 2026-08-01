@@ -20,29 +20,21 @@ use std::{
 
 use anyhow::Result;
 use config::{
-    ALL_VALUES_COL_NAME, ID_COL_NAME, ORIGINAL_DATA_COL_NAME, SQL_FULL_TEXT_SEARCH_FIELDS,
-    SQL_SECONDARY_INDEX_SEARCH_FIELDS, TIMESTAMP_COL_NAME,
     cluster::LOCAL_NODE_ID,
     get_config,
     ider::SnowflakeIdGenerator,
-    is_uds_internal_column,
     meta::{
-        promql::{
-            BUCKET_LABEL, EXEMPLARS_LABEL, HASH_LABEL, METADATA_LABEL, NAME_LABEL, QUANTILE_LABEL,
-            VALUE_LABEL,
-        },
-        stream::StreamType,
+        promql::METADATA_LABEL,
+        stream::{StreamSettings, StreamType},
     },
     metrics,
     utils::{
-        json,
         schema::{infer_json_schema_from_map, schema_eq},
         schema_ext::SchemaExt,
         time::now_micros,
     },
 };
 use datafusion::arrow::datatypes::{Field, Schema};
-use hashbrown::HashSet;
 use infra::schema::{
     STREAM_RECORD_ID_GENERATOR, STREAM_SCHEMAS_LATEST, STREAM_SETTINGS, SchemaCache,
     unwrap_stream_settings,
@@ -131,29 +123,6 @@ pub async fn check_for_schema(
         let (is_schema_changed, field_datatype_delta) =
             get_schema_changes(schema, &inferred_schema);
         if !is_schema_changed {
-            // check defined_schema_fields
-            let stream_setting = unwrap_stream_settings(schema.schema());
-            let (defined_schema_fields, need_original, index_original_data, index_all_values) =
-                match stream_setting {
-                    Some(s) => (
-                        s.defined_schema_fields,
-                        s.store_original_data,
-                        s.index_original_data,
-                        s.index_all_values,
-                    ),
-                    None => (Vec::new(), false, false, false),
-                };
-            if !defined_schema_fields.is_empty() {
-                let schema = generate_schema_for_defined_schema_fields(
-                    stream_type,
-                    schema,
-                    &defined_schema_fields,
-                    need_original,
-                    index_original_data,
-                    index_all_values,
-                );
-                stream_schema_map.insert(stream_name.to_string(), schema);
-            }
             return Ok((
                 SchemaEvolution {
                     is_schema_changed: false,
@@ -233,6 +202,35 @@ pub async fn get_merged_schema(
     ))
 }
 
+/// Column-store defaults for a brand-new TRACE stream (DESIGN §10):
+/// - `duration` — range filters, latency histograms and percentiles need a native numeric column,
+/// - `service_name` / `operation_name` — index-only TopN fast paths for the service/operation
+///   breakdowns every tracing UI opens with,
+/// - `span_status` — error-rate breakdowns.
+pub const DEFAULT_TRACE_COLUMN_STORE_FIELDS: [&str; 4] =
+    ["duration", "service_name", "operation_name", "span_status"];
+
+/// The stream settings a NEW stream is born with when the user has not
+/// configured any (the first-ingest path — a stream created through the
+/// settings API keeps exactly what the user posted).
+///
+/// Only TRACE streams get defaults today: `column_store_fields` =
+/// [`DEFAULT_TRACE_COLUMN_STORE_FIELDS`]. Every file of a new stream is
+/// written under these settings, and per-file capability probes handle
+/// routing — no settings freshness bookkeeping is needed.
+pub fn default_stream_settings_for_new_stream(stream_type: StreamType) -> Option<StreamSettings> {
+    match stream_type {
+        StreamType::Traces => Some(StreamSettings {
+            column_store_fields: DEFAULT_TRACE_COLUMN_STORE_FIELDS
+                .iter()
+                .map(|field| field.to_string())
+                .collect(),
+            ..Default::default()
+        }),
+        _ => None,
+    }
+}
+
 // handle_diff_schema is a slow path, it acquires a lock to update schema
 // steps:
 // 1. get schema from db, if schema is empty, set schema and return
@@ -271,12 +269,25 @@ pub(crate) async fn handle_diff_schema(
     }
     drop(read_cache);
 
+    // settings a brand-new stream starts with (None for most stream types)
+    let new_stream_settings = if is_new {
+        default_stream_settings_for_new_stream(stream_type)
+    } else {
+        None
+    };
+    let new_stream_settings_json = new_stream_settings
+        .as_ref()
+        .map(|settings| config::utils::json::to_string(settings).unwrap());
+
     // first update thread cache
     if is_new {
-        let mut metadata = HashMap::with_capacity(1);
+        let mut metadata = HashMap::with_capacity(2);
         metadata.insert("created_at".to_string(), record_ts.to_string());
         if is_derived {
             metadata.insert("is_derived".to_string(), "true".to_string());
+        }
+        if let Some(settings) = new_stream_settings_json.as_ref() {
+            metadata.insert("settings".to_string(), settings.clone());
         }
         stream_schema_map.insert(
             stream_name.to_string(),
@@ -289,9 +300,14 @@ pub(crate) async fn handle_diff_schema(
     let mut ret: Option<_> = None;
     // retry x times for update schema
     while retries < cfg.limit.meta_transaction_retries {
-        let schema_for_merge = if is_derived {
-            let mut metadata = HashMap::with_capacity(1);
-            metadata.insert("is_derived".to_string(), "true".to_string());
+        let schema_for_merge = if is_derived || new_stream_settings_json.is_some() {
+            let mut metadata = HashMap::with_capacity(2);
+            if is_derived {
+                metadata.insert("is_derived".to_string(), "true".to_string());
+            }
+            if let Some(settings) = new_stream_settings_json.as_ref() {
+                metadata.insert("settings".to_string(), settings.clone());
+            }
             &inferred_schema.clone().with_metadata(metadata)
         } else {
             inferred_schema
@@ -328,7 +344,7 @@ pub(crate) async fn handle_diff_schema(
         );
         return Err(e);
     }
-    let Some((mut final_schema, field_datatype_delta)) = ret else {
+    let Some((final_schema, field_datatype_delta)) = ret else {
         return Ok(None);
     };
 
@@ -341,111 +357,14 @@ pub(crate) async fn handle_diff_schema(
         .await;
     }
 
-    // check defined_schema_fields
-    let mut stream_setting = unwrap_stream_settings(&final_schema).unwrap_or_default();
-    let mut defined_schema_fields = stream_setting.defined_schema_fields.clone();
-
-    // Automatically enable User-defined schema when
-    // 1. allow_user_defined_schemas is enabled
-    // 2. log ingestion
-    // 3. user defined schema is not already enabled
-    // 4. final schema fields count exceeds schema_max_fields_to_enable_uds
-    // Internal columns are implicit in the UDS: never persisted and never
-    // occupy slots in the field list (see is_uds_internal_column).
-    if cfg.common.allow_user_defined_schemas
-        && cfg.limit.schema_max_fields_to_enable_uds > 0
-        && stream_type.support_uds()
-        && defined_schema_fields.is_empty()
-        && final_schema.fields().len() > cfg.limit.schema_max_fields_to_enable_uds
-    {
-        let mut uds_fields = HashSet::with_capacity(cfg.limit.schema_max_fields_to_enable_uds);
-
-        // Fields that must survive auto-enable
-        let mut keep_fields =
-            check_schema_for_defined_schema_fields(stream_type, &final_schema, vec![]);
-        // add FTS fields (default SQL FTS fields)
-        for field in SQL_FULL_TEXT_SEARCH_FIELDS.iter() {
-            keep_fields.insert(field.to_string());
-        }
-        // add secondary index fields (default SQL secondary index fields)
-        for field in SQL_SECONDARY_INDEX_SEARCH_FIELDS.iter() {
-            keep_fields.insert(field.to_string());
-        }
-        // add user-configured FTS fields
-        for field in stream_setting.full_text_search_keys.iter() {
-            keep_fields.insert(field.to_string());
-        }
-        // add user-configured index fields
-        for field in stream_setting.index_fields.iter() {
-            keep_fields.insert(field.to_string());
-        }
-
-        // Add keep fields first
-        for field in keep_fields {
-            if !is_uds_internal_column(&field) && final_schema.field_with_name(&field).is_ok() {
-                uds_fields.insert(field);
-            }
-        }
-
-        // Add fields from current schema if available
-        if let Some(stream_schema) = stream_schema_map.get(stream_name) {
-            for field in stream_schema.schema().fields() {
-                let field = field.name();
-                if is_uds_internal_column(field) {
-                    continue;
-                }
-                if uds_fields.insert(field.to_string())
-                    && uds_fields.len() >= cfg.limit.schema_max_fields_to_enable_uds
-                {
-                    break;
-                }
-            }
-        }
-
-        // Add remaining fields from final schema
-        if uds_fields.len() < cfg.limit.schema_max_fields_to_enable_uds {
-            for field in final_schema.fields() {
-                let field = field.name();
-                if is_uds_internal_column(field) {
-                    continue;
-                }
-                if uds_fields.insert(field.to_string())
-                    && uds_fields.len() >= cfg.limit.schema_max_fields_to_enable_uds
-                {
-                    break;
-                }
-            }
-        }
-
-        defined_schema_fields = uds_fields.into_iter().collect::<Vec<_>>();
-        stream_setting.defined_schema_fields = defined_schema_fields.clone();
-        final_schema.metadata.insert(
-            "settings".to_string(),
-            json::to_string(&stream_setting).unwrap(),
-        );
-
-        // save the new settings
-        if let Err(e) = super::stream::save_stream_settings(
-            org_id,
-            stream_name,
-            stream_type,
-            stream_setting.clone(),
-        )
-        .await
-        {
-            log::error!("save_stream_settings [{org_id}/{stream_type}/{stream_name}] error: {e}");
-        }
-    }
+    let stream_setting = unwrap_stream_settings(&final_schema).unwrap_or_default();
 
     // update node cache
     let final_schema = SchemaCache::new(final_schema);
     let mut w = STREAM_SCHEMAS_LATEST.write().await;
     w.insert(cache_key.clone(), final_schema.clone());
     drop(w);
-    let need_original = stream_setting.store_original_data;
-    let index_original_data = stream_setting.index_original_data;
-    let index_all_values = stream_setting.index_all_values;
-    if (need_original || index_original_data)
+    if stream_setting.store_original_data
         && let dashmap::Entry::Vacant(entry) = STREAM_RECORD_ID_GENERATOR.entry(cache_key.clone())
     {
         entry.insert(SnowflakeIdGenerator::new(
@@ -458,14 +377,6 @@ pub(crate) async fn handle_diff_schema(
     drop(w);
 
     // update thread cache
-    let final_schema = generate_schema_for_defined_schema_fields(
-        stream_type,
-        &final_schema,
-        &defined_schema_fields,
-        need_original,
-        index_original_data,
-        index_all_values,
-    );
     stream_schema_map.insert(stream_name.to_string(), final_schema);
 
     log::debug!(
@@ -479,107 +390,9 @@ pub(crate) async fn handle_diff_schema(
     }))
 }
 
-// Generate filtered schema for UDS (User Defined Schema)
-// if defined_schema_fields is not empty, and schema fields greater than defined_schema_fields + 10,
-// then we will use defined_schema_fields
-pub fn generate_schema_for_defined_schema_fields(
-    stream_type: StreamType,
-    schema: &SchemaCache,
-    fields: &[String],
-    need_original: bool,
-    index_original_data: bool,
-    index_all_values: bool,
-) -> SchemaCache {
-    if fields.is_empty() || schema.fields_map().len() < fields.len() + 10 {
-        return schema.clone();
-    }
-
-    let cfg = get_config();
-    let mut fields =
-        check_schema_for_defined_schema_fields(stream_type, schema.schema(), fields.to_vec());
-    fields.insert(TIMESTAMP_COL_NAME.to_string());
-    fields.insert(cfg.common.column_all.to_string());
-    if need_original || index_original_data {
-        fields.insert(ID_COL_NAME.to_string());
-        fields.insert(ORIGINAL_DATA_COL_NAME.to_string());
-    }
-    if index_all_values {
-        fields.insert(ALL_VALUES_COL_NAME.to_string());
-    }
-
-    let mut new_fields = Vec::with_capacity(fields.len());
-    for field in fields {
-        if let Some(f) = schema.fields_map().get(&field) {
-            new_fields.push(schema.schema().fields()[*f].clone());
-        }
-    }
-
-    // sort the fields by name to make sure the order is consistent
-    new_fields.sort_by(|a, b| a.name().cmp(b.name()));
-
-    SchemaCache::new(Schema::new_with_metadata(
-        new_fields,
-        schema.schema().metadata().clone(),
-    ))
-}
-
-pub fn check_schema_for_defined_schema_fields(
-    stream_type: StreamType,
-    schema: &Schema,
-    fields: Vec<String>,
-) -> HashSet<String> {
-    let mut fields: HashSet<String> = fields.into_iter().collect();
-    match stream_type {
-        StreamType::Logs => {}
-        StreamType::Metrics => {
-            fields.insert(NAME_LABEL.to_string());
-            fields.insert(HASH_LABEL.to_string());
-            fields.insert(BUCKET_LABEL.to_string());
-            fields.insert(QUANTILE_LABEL.to_string());
-            fields.insert(EXEMPLARS_LABEL.to_string());
-            fields.insert(VALUE_LABEL.to_string());
-            fields.insert("trace_id".to_string());
-            fields.insert("span_id".to_string());
-        }
-        StreamType::Traces => {
-            fields.insert("service_name".to_string());
-            fields.insert("operation_name".to_string());
-            fields.insert("trace_id".to_string());
-            fields.insert("span_id".to_string());
-            fields.insert("span_kind".to_string());
-            fields.insert("span_status".to_string());
-            fields.insert("reference_parent_span_id".to_string());
-            fields.insert("reference_parent_trace_id".to_string());
-            fields.insert("reference_ref_type".to_string());
-            fields.insert("start_time".to_string());
-            fields.insert("end_time".to_string());
-            fields.insert("duration".to_string());
-            fields.insert("events".to_string());
-            // Automatically include all OTEL Gen-AI and LLM evaluation fields from the schema
-            for field in schema.fields() {
-                let name = field.name();
-                if name.starts_with("gen_ai_")
-                    || name.starts_with("llm_")
-                    || name == "user_id"
-                    || name == "session_id"
-                {
-                    fields.insert(name.to_string());
-                }
-            }
-        }
-        _ => {}
-    }
-    fields
-}
-
 pub fn get_schema_changes(schema: &SchemaCache, inferred_schema: &Schema) -> (bool, Vec<Field>) {
     let mut is_schema_changed = false;
     let mut field_datatype_delta: Vec<Field> = vec![];
-
-    let stream_setting = unwrap_stream_settings(schema.schema());
-    let defined_schema_fields = stream_setting
-        .map(|s| s.defined_schema_fields)
-        .unwrap_or_default();
 
     for item in inferred_schema.fields.iter() {
         let item_name = item.name();
@@ -590,9 +403,6 @@ pub fn get_schema_changes(schema: &SchemaCache, inferred_schema: &Schema) -> (bo
                 is_schema_changed = true;
             }
             Some(idx) => {
-                if !defined_schema_fields.is_empty() && !defined_schema_fields.contains(item_name) {
-                    continue;
-                }
                 let existing_field: Arc<Field> = schema.schema().fields()[*idx].clone();
                 if existing_field.data_type() != item_data_type {
                     if infra::schema::is_widening_conversion(
@@ -658,103 +468,10 @@ pub async fn stream_schema_exists(
 mod tests {
     use std::str::FromStr;
 
+    use config::utils::json;
     use datafusion::arrow::datatypes::DataType;
 
     use super::*;
-
-    #[test]
-    fn test_generate_schema_for_defined_schema_fields_includes_internal_columns() {
-        // internal columns must be part of the effective schema even when they
-        // are not persisted in defined_schema_fields
-        let mut fields = vec![
-            Field::new(TIMESTAMP_COL_NAME, DataType::Int64, true),
-            Field::new(
-                get_config().common.column_all.as_str(),
-                DataType::Utf8,
-                true,
-            ),
-            Field::new(ID_COL_NAME, DataType::Utf8, true),
-            Field::new(ORIGINAL_DATA_COL_NAME, DataType::Utf8, true),
-            Field::new(ALL_VALUES_COL_NAME, DataType::Utf8, true),
-        ];
-        for i in 0..15 {
-            fields.push(Field::new(format!("field{i}"), DataType::Utf8, true));
-        }
-        let schema = SchemaCache::new(Schema::new(fields));
-        let defined_fields = vec!["field0".to_string(), "field1".to_string()];
-
-        let result = generate_schema_for_defined_schema_fields(
-            StreamType::Logs,
-            &schema,
-            &defined_fields,
-            true,
-            false,
-            true,
-        );
-        let names: Vec<_> = result
-            .schema()
-            .fields()
-            .iter()
-            .map(|f| f.name().to_string())
-            .collect();
-        assert!(names.contains(&TIMESTAMP_COL_NAME.to_string()));
-        assert!(names.contains(&get_config().common.column_all));
-        assert!(names.contains(&ID_COL_NAME.to_string()));
-        assert!(names.contains(&ORIGINAL_DATA_COL_NAME.to_string()));
-        assert!(names.contains(&ALL_VALUES_COL_NAME.to_string()));
-        assert!(names.contains(&"field0".to_string()));
-        assert!(names.contains(&"field1".to_string()));
-        assert!(!names.contains(&"field2".to_string()));
-    }
-
-    #[test]
-    fn test_check_schema_for_defined_schema_fields_logs() {
-        let schema = Schema::new(vec![] as Vec<Field>);
-        let input = vec!["level".to_string(), "message".to_string()];
-        let result = check_schema_for_defined_schema_fields(StreamType::Logs, &schema, input);
-        assert!(result.contains("level"));
-        assert!(result.contains("message"));
-    }
-
-    #[test]
-    fn test_check_schema_for_defined_schema_fields_metrics_adds_labels() {
-        let schema = Schema::new(vec![] as Vec<Field>);
-        let input = vec!["custom_field".to_string()];
-        let result =
-            check_schema_for_defined_schema_fields(StreamType::Metrics, &schema, input.clone());
-        // Metrics should include the special labels
-        assert!(result.contains(NAME_LABEL));
-        assert!(result.contains(HASH_LABEL));
-        assert!(result.contains(VALUE_LABEL));
-        assert!(result.contains("custom_field"));
-        assert!(result.contains("trace_id"));
-    }
-
-    #[test]
-    fn test_check_schema_for_defined_schema_fields_traces_adds_trace_fields() {
-        let schema = Schema::new(vec![] as Vec<Field>);
-        let input = vec!["my_field".to_string()];
-        let result = check_schema_for_defined_schema_fields(StreamType::Traces, &schema, input);
-        assert!(result.contains("trace_id"));
-        assert!(result.contains("span_id"));
-        assert!(result.contains("service_name"));
-        assert!(result.contains("duration"));
-        assert!(result.contains("my_field"));
-    }
-
-    #[test]
-    fn test_check_schema_for_defined_schema_fields_traces_includes_gen_ai_fields() {
-        let schema = Schema::new(vec![
-            Field::new("gen_ai_prompt", DataType::Utf8, true),
-            Field::new("llm_model", DataType::Utf8, true),
-            Field::new("other_field", DataType::Utf8, true),
-        ]);
-        let result = check_schema_for_defined_schema_fields(StreamType::Traces, &schema, vec![]);
-        assert!(result.contains("gen_ai_prompt"));
-        assert!(result.contains("llm_model"));
-        // "other_field" has no gen_ai_ or llm_ prefix → not auto-included
-        assert!(!result.contains("other_field"));
-    }
 
     #[tokio::test]
     async fn test_check_for_schema() {
@@ -804,5 +521,52 @@ mod tests {
         let stream_type = StreamType::Logs;
         let value_iter = record_val.into_iter();
         infer_json_schema_from_map("test", stream_type, value_iter).unwrap();
+    }
+
+    /// New TRACE streams are born with the column-store defaults; every
+    /// other stream type starts with no injected settings (DESIGN §10).
+    #[test]
+    fn test_default_stream_settings_for_new_trace_streams() {
+        let settings = default_stream_settings_for_new_stream(StreamType::Traces)
+            .expect("trace streams get default settings");
+        assert_eq!(
+            settings.column_store_fields,
+            vec!["duration", "service_name", "operation_name", "span_status"]
+        );
+        // nothing else deviates from the defaults
+        let expected = StreamSettings {
+            column_store_fields: settings.column_store_fields.clone(),
+            ..Default::default()
+        };
+        assert_eq!(
+            config::utils::json::to_string(&settings).unwrap(),
+            config::utils::json::to_string(&expected).unwrap()
+        );
+
+        for stream_type in [
+            StreamType::Logs,
+            StreamType::Metrics,
+            StreamType::EnrichmentTables,
+            StreamType::Metadata,
+            StreamType::Index,
+        ] {
+            assert!(
+                default_stream_settings_for_new_stream(stream_type).is_none(),
+                "{stream_type} must not get default settings"
+            );
+        }
+
+        // the settings survive the schema-metadata round trip the
+        // first-ingest path writes
+        let metadata = HashMap::from([(
+            "settings".to_string(),
+            config::utils::json::to_string(&settings).unwrap(),
+        )]);
+        let schema = Schema::empty().with_metadata(metadata);
+        let unwrapped = unwrap_stream_settings(&schema).unwrap();
+        assert_eq!(
+            unwrapped.column_store_fields,
+            vec!["duration", "service_name", "operation_name", "span_status"]
+        );
     }
 }

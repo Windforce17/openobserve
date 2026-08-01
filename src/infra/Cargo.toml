@@ -9,6 +9,7 @@ default = []
 cloud = []
 
 [dependencies]
+vortex_index = { path = "../vortex_index" }
 anyhow.workspace = true
 arc-swap.workspace = true
 arrow.workspace = true

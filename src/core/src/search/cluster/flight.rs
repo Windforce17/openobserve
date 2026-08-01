@@ -96,7 +96,7 @@ pub async fn search(trace_id: &str, sql: Arc<Sql>, mut req: Request) -> Result<S
     }
 
     // 1. get file id list
-    let file_id_list = get_file_id_lists(
+    let (file_id_list, segment_shortfalls) = get_file_id_lists(
         trace_id,
         &sql.org_id,
         sql.stream_type,
@@ -350,11 +350,21 @@ pub async fn search(trace_id: &str, sql: Arc<Sql>, mut req: Request) -> Result<S
     drop(_lock);
 
     // 9. get data from datafusion
-    let (data, mut scan_stats, partial_err): (Vec<RecordBatch>, ScanStats, String) = match task {
+    let (data, mut scan_stats, mut partial_err): (Vec<RecordBatch>, ScanStats, String) = match task
+    {
         Ok(Ok(data)) => Ok(data),
         Ok(Err(err)) => Err(err),
         Err(err) => Err(err),
     }?;
+    // a skipped-segment shortfall makes the response partial: the user is
+    // TOLD the oldest unbuilt data is missing rather than seeing a failed
+    // query (backlog outage, 2026-07-31) or a silently short count
+    for msg in segment_shortfalls {
+        if !partial_err.is_empty() {
+            partial_err.push_str(" \n ");
+        }
+        partial_err.push_str(&msg);
+    }
 
     log::info!(
         "[trace_id {trace_id}] flight->search: search finished, {}",
@@ -667,8 +677,11 @@ pub async fn get_file_id_lists(
     stream_type: StreamType,
     stream_names: &[TableReference],
     mut time_range: (i64, i64),
-) -> Result<HashMap<TableReference, Vec<FileId>>> {
+) -> Result<(HashMap<TableReference, Vec<FileId>>, Vec<String>)> {
     let mut file_lists = HashMap::with_capacity(stream_names.len());
+    // segment-WAL backlog shortfalls: reported through the standard partial
+    // channel instead of failing the query (2026-07-31 outage)
+    let mut shortfalls: Vec<String> = Vec::new();
     for stream in stream_names {
         let name = stream.stream_name();
         let stream_type = stream.get_stream_type(stream_type);
@@ -680,13 +693,38 @@ pub async fn get_file_id_lists(
             let end = now_micros();
             time_range = (start, end);
         }
+        // segment-WAL mode: candidates MUST be read BEFORE the file_list
+        // snapshot — a segment observed Built here has its L0 rows visible
+        // to the snapshot below (segments_scan dup/gap ordering rules)
+        let (seg_candidates, seg_shortfall) =
+            crate::service::search::grpc::segments_scan::list_candidates(
+                org_id,
+                stream_type,
+                &name,
+                time_range,
+            )
+            .await?;
+        if let Some(sf) = seg_shortfall {
+            shortfalls.push(sf.message());
+        }
         // get file list
-        let file_id_list =
+        let mut file_id_list =
             crate::service::file_list::query_ids(trace_id, org_id, stream_type, &name, time_range)
                 .await?;
+        // append the candidates that the snapshot's l0_ provenance does not
+        // already cover, as negative-id pseudo files
+        crate::service::search::grpc::segments_scan::append_surviving(
+            trace_id,
+            org_id,
+            stream_type,
+            &name,
+            seg_candidates,
+            &mut file_id_list,
+        )
+        .await?;
         file_lists.insert(stream.clone(), file_id_list);
     }
-    Ok(file_lists)
+    Ok((file_lists, shortfalls))
 }
 
 #[cfg(test)]

@@ -18,7 +18,7 @@ use std::{
     sync::{Arc, LazyLock as Lazy},
 };
 
-use config::tantivy::tokenizer::o2_collect_search_tokens;
+use config::text_tokenizer::o2_collect_search_tokens;
 use datafusion::{
     arrow::{
         array::{ArrayRef, BooleanArray},

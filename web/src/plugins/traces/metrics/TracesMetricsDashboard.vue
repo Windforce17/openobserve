@@ -159,15 +159,10 @@ const originalTimeRangeBeforeSelection = ref<TimeRange | null>(null);
 const rangeFiltersVersion = ref(0);
 
 // Stream fields for dimension selector
-// Priority: props > userDefinedSchema > selectedStreamFields
+// Priority: props > selectedStreamFields
 const streamFields = computed(() => {
   if (props.streamFields) {
     return props.streamFields;
-  }
-
-  // Prefer user-defined schema if available
-  if (searchObj.data.stream.userDefinedSchema?.length > 0) {
-    return searchObj.data.stream.userDefinedSchema;
   }
 
   return searchObj.data.stream.selectedStreamFields || [];

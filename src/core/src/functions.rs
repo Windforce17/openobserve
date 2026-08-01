@@ -598,12 +598,13 @@ mod tests {
         let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
         let body: TestVRLResponse = serde_json::from_slice(&body_bytes).unwrap();
 
-        // Validate transformed events
+        // Validate transformed events (v2 flattening joins nested objects
+        // with `.`; the legacy `_` join is the flag-off behavior)
         assert_eq!(body.results.len(), 1);
         assert_eq!(body.results[0].message, "");
         assert_eq!(
             body.results[0].event,
-            json! {{"nested_key":42,"new_field":"new_value"}}
+            json! {{"nested.key":42,"new_field":"new_value"}}
         );
     }
 

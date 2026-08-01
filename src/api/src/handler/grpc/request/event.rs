@@ -16,10 +16,7 @@
 use std::ops::Range;
 
 use anyhow::Result;
-use config::{
-    cluster::LOCAL_NODE, get_config, meta::stream::FileKey, metrics,
-    utils::inverted_index::to_tantivy_name,
-};
+use config::{cluster::LOCAL_NODE, get_config, meta::stream::FileKey, metrics};
 use infra::cache::file_data::{CacheType, TRACE_ID_FOR_CACHE_LATEST_FILE, disk};
 use opentelemetry::global;
 use proto::cluster_rpc::{
@@ -75,27 +72,14 @@ impl Event for Eventer {
                 ) {
                     continue;
                 }
-                // cache parquet
+                // cache the data file (a core .vix file embeds its index,
+                // so the one object is all there is to download)
                 if cfg.cache_latest_files.cache_parquet {
                     files_to_download.push((
                         item.id,
                         item.account.clone(),
                         item.key.clone(),
                         item.meta.compressed_size,
-                        item.meta.max_ts,
-                    ));
-                }
-
-                // cache index for the parquet
-                if cfg.cache_latest_files.cache_index
-                    && item.meta.index_size > 0
-                    && let Some(ttv_file) = to_tantivy_name(&item.key)
-                {
-                    files_to_download.push((
-                        item.id,
-                        item.account.clone(),
-                        ttv_file,
-                        item.meta.index_size,
                         item.meta.max_ts,
                     ));
                 }
@@ -157,32 +141,13 @@ impl Event for Eventer {
             }
 
             // delete merge files
-            if cfg.cache_latest_files.delete_merge_files {
-                if cfg.cache_latest_files.cache_parquet {
-                    let del_items = req
-                        .items
-                        .iter()
-                        .filter_map(|v| if v.deleted { Some(v.key.clone()) } else { None })
-                        .collect::<Vec<_>>();
-                    infra::cache::file_data::delete::add(del_items);
-                }
-                if cfg.cache_latest_files.cache_index {
-                    let del_items = req
-                        .items
-                        .iter()
-                        .filter_map(|v| {
-                            if v.deleted {
-                                match v.meta.as_ref() {
-                                    Some(m) if m.index_size > 0 => to_tantivy_name(&v.key),
-                                    _ => None,
-                                }
-                            } else {
-                                None
-                            }
-                        })
-                        .collect::<Vec<_>>();
-                    infra::cache::file_data::delete::add(del_items);
-                }
+            if cfg.cache_latest_files.delete_merge_files && cfg.cache_latest_files.cache_parquet {
+                let del_items = req
+                    .items
+                    .iter()
+                    .filter_map(|v| if v.deleted { Some(v.key.clone()) } else { None })
+                    .collect::<Vec<_>>();
+                infra::cache::file_data::delete::add(del_items);
             }
         }
 
@@ -462,31 +427,6 @@ mod tests {
         let empty_response = EmptyResponse {};
         // EmptyResponse is a unit struct, so its size is 0
         assert_eq!(std::mem::size_of_val(&empty_response), 0);
-    }
-
-    #[test]
-    fn test_convert_parquet_to_tantivy_filename() {
-        // Test parquet to tantivy filename conversion
-        let parquet_file =
-            "files/default/logs/quickstart1/2024/02/16/16/7164299619311026293.parquet";
-        let tantivy_file = to_tantivy_name(parquet_file);
-
-        // The conversion should return Some for valid parquet files
-        assert!(tantivy_file.is_some());
-        assert_eq!(
-            tantivy_file.unwrap(),
-            "files/default/index/quickstart1_logs/2024/02/16/16/7164299619311026293.ttv"
-        );
-
-        // Test with non-parquet file
-        let non_parquet_file = "test/file.txt";
-        let tantivy_result = to_tantivy_name(non_parquet_file);
-        assert!(tantivy_result.is_none());
-
-        // Test with invalid path format
-        let invalid_path = "test/file.parquet";
-        let invalid_result = to_tantivy_name(invalid_path);
-        assert!(invalid_result.is_none());
     }
 
     #[test]

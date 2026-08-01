@@ -55,10 +55,16 @@ use crate::datafusion::{
 /// this is used for optimizer that do not need global information
 /// NOTE: use this optimizer in follower only when all filter
 /// can be extract to index condition(except _timestamp filter)
+///
+/// `index_fields` is the stream's `column_store_fields`;
+/// `unfiltered_index_fields` are the term-indexed string fields additionally
+/// eligible for single-field TopN/Distinct when the query has no condition
+/// (served from the term dictionary alone — pilot fix B).
 #[derive(Debug)]
 pub struct FollowerIndexOptimizerRule {
     time_range: (i64, i64),
     index_fields: HashSet<String>,
+    unfiltered_index_fields: HashSet<String>,
     index_optimizer_mode: Arc<Mutex<Option<IndexOptimizeMode>>>,
 }
 
@@ -66,11 +72,13 @@ impl FollowerIndexOptimizerRule {
     pub fn new(
         time_range: (i64, i64),
         index_fields: HashSet<String>,
+        unfiltered_index_fields: HashSet<String>,
         index_optimizer_mode: Arc<Mutex<Option<IndexOptimizeMode>>>,
     ) -> Self {
         Self {
             time_range,
             index_fields,
+            unfiltered_index_fields,
             index_optimizer_mode,
         }
     }
@@ -89,6 +97,7 @@ impl PhysicalOptimizerRule for FollowerIndexOptimizerRule {
         let mut rewriter = FollowerIndexOptimizer::new(
             self.time_range,
             self.index_fields.clone(),
+            self.unfiltered_index_fields.clone(),
             self.index_optimizer_mode.clone(),
         );
         let plan = plan.rewrite(&mut rewriter)?.data;
@@ -107,6 +116,7 @@ impl PhysicalOptimizerRule for FollowerIndexOptimizerRule {
 struct FollowerIndexOptimizer {
     time_range: (i64, i64),
     index_fields: HashSet<String>,
+    unfiltered_index_fields: HashSet<String>,
     index_optimizer_mode: Arc<Mutex<Option<IndexOptimizeMode>>>,
 }
 
@@ -114,11 +124,13 @@ impl FollowerIndexOptimizer {
     pub fn new(
         time_range: (i64, i64),
         index_fields: HashSet<String>,
+        unfiltered_index_fields: HashSet<String>,
         index_optimizer_mode: Arc<Mutex<Option<IndexOptimizeMode>>>,
     ) -> Self {
         Self {
             time_range,
             index_fields,
+            unfiltered_index_fields,
             index_optimizer_mode,
         }
     }
@@ -141,14 +153,18 @@ impl TreeNodeRewriter for FollowerIndexOptimizer {
 
             // check if the query is simple topn or simple distinct
             if config::cluster::LOCAL_NODE.is_single_node() {
-                if let Some(index_optimize_mode) =
-                    is_simple_topn(Arc::clone(&plan), self.index_fields.clone())
-                {
+                if let Some(index_optimize_mode) = is_simple_topn(
+                    Arc::clone(&plan),
+                    self.index_fields.clone(),
+                    self.unfiltered_index_fields.clone(),
+                ) {
                     *self.index_optimizer_mode.lock() = Some(index_optimize_mode);
                     return Ok(Transformed::new(plan, true, TreeNodeRecursion::Stop));
-                } else if let Some(index_optimize_mode) =
-                    is_simple_distinct(Arc::clone(&plan), self.index_fields.clone())
-                {
+                } else if let Some(index_optimize_mode) = is_simple_distinct(
+                    Arc::clone(&plan),
+                    self.index_fields.clone(),
+                    self.unfiltered_index_fields.clone(),
+                ) {
                     *self.index_optimizer_mode.lock() = Some(index_optimize_mode);
                     return Ok(Transformed::new(plan, true, TreeNodeRecursion::Stop));
                 }
@@ -185,14 +201,26 @@ impl TreeNodeRewriter for FollowerIndexOptimizer {
 /// this use in query leader to generate [`IndexOptimizeMode`]
 /// this is used for optimizer that need global information
 /// like order and limit
+///
+/// `index_fields` maps each table to its `column_store_fields`;
+/// `unfiltered_index_fields` to the term-indexed string fields additionally
+/// eligible for single-field TopN/Distinct when the query has no condition
+/// (pilot fix B).
 #[derive(Default, Debug)]
 pub struct LeaderIndexOptimizerRule {
     index_fields: HashMap<TableReference, HashSet<String>>,
+    unfiltered_index_fields: HashMap<TableReference, HashSet<String>>,
 }
 
 impl LeaderIndexOptimizerRule {
-    pub fn new(index_fields: HashMap<TableReference, HashSet<String>>) -> Self {
-        Self { index_fields }
+    pub fn new(
+        index_fields: HashMap<TableReference, HashSet<String>>,
+        unfiltered_index_fields: HashMap<TableReference, HashSet<String>>,
+    ) -> Self {
+        Self {
+            index_fields,
+            unfiltered_index_fields,
+        }
     }
 }
 
@@ -206,7 +234,10 @@ impl PhysicalOptimizerRule for LeaderIndexOptimizerRule {
             return Ok(plan);
         }
 
-        let mut rewriter = LeaderIndexOptimizer::new(self.index_fields.clone());
+        let mut rewriter = LeaderIndexOptimizer::new(
+            self.index_fields.clone(),
+            self.unfiltered_index_fields.clone(),
+        );
         let plan = plan.rewrite(&mut rewriter)?.data;
         Ok(plan)
     }
@@ -222,11 +253,18 @@ impl PhysicalOptimizerRule for LeaderIndexOptimizerRule {
 
 struct LeaderIndexOptimizer {
     index_fields: HashMap<TableReference, HashSet<String>>,
+    unfiltered_index_fields: HashMap<TableReference, HashSet<String>>,
 }
 
 impl LeaderIndexOptimizer {
-    pub fn new(index_fields: HashMap<TableReference, HashSet<String>>) -> Self {
-        Self { index_fields }
+    pub fn new(
+        index_fields: HashMap<TableReference, HashSet<String>>,
+        unfiltered_index_fields: HashMap<TableReference, HashSet<String>>,
+    ) -> Self {
+        Self {
+            index_fields,
+            unfiltered_index_fields,
+        }
     }
 }
 
@@ -250,18 +288,27 @@ impl TreeNodeRewriter for LeaderIndexOptimizer {
                 .get(&table_name)
                 .cloned()
                 .unwrap_or(HashSet::new());
+            let unfiltered_index_fields = self
+                .unfiltered_index_fields
+                .get(&table_name)
+                .cloned()
+                .unwrap_or(HashSet::new());
 
             // check if the query is simple topn or simple distinct
-            if let Some(index_optimize_mode) =
-                is_simple_topn(Arc::clone(&plan), index_fields.clone())
-            {
+            if let Some(index_optimize_mode) = is_simple_topn(
+                Arc::clone(&plan),
+                index_fields.clone(),
+                unfiltered_index_fields.clone(),
+            ) {
                 // Check for SimpleTopN
                 let mut rewriter = IndexOptimizerRewrite::new(index_optimize_mode);
                 let plan = plan.rewrite(&mut rewriter)?.data;
                 return Ok(Transformed::new(plan, true, TreeNodeRecursion::Stop));
-            } else if let Some(index_optimize_mode) =
-                is_simple_distinct(Arc::clone(&plan), index_fields.clone())
-            {
+            } else if let Some(index_optimize_mode) = is_simple_distinct(
+                Arc::clone(&plan),
+                index_fields.clone(),
+                unfiltered_index_fields.clone(),
+            ) {
                 // Check for SimpleDistinct
                 let mut rewriter = IndexOptimizerRewrite::new(index_optimize_mode);
                 let plan = plan.rewrite(&mut rewriter)?.data;
@@ -325,6 +372,123 @@ impl<'n> TreeNodeVisitor<'n> for TableNameVisitor {
         } else {
             Ok(TreeNodeRecursion::Continue)
         }
+    }
+}
+
+/// Follower-fidelity extraction harness for the aggregation fast-path
+/// detectors, shared by the detector unit tests and the vix end-to-end
+/// differential tests.
+///
+/// It reproduces the production pipeline end to end: the LEADER plans `sql`
+/// with the production custom logical rules that shape aggregate plans
+/// ([`RewriteHistogram`] — resolving a 1-arg `histogram(_timestamp)` to a
+/// concrete `date_bin` interval literal exactly like production: the preset
+/// seconds when the request carries `histogram_interval` (the streaming
+/// path pre-computes it from the FULL query range), the
+/// `generate_histogram_interval` auto formula otherwise — and
+/// [`AddSortAndLimitRule`], which production appends for default-limit
+/// queries) plus the [`RemoteScanRule`] leader/follower split; the
+/// RemoteScanExec child (the exact sub-plan the leader ships) is then
+/// roundtripped through the flight proto codec (what flight.rs `do_get`
+/// deserializes) and [`FollowerIndexOptimizerRule`] runs over the received
+/// plan with the stream's `column_store_fields`, exactly like
+/// `optimizer_physical_plan` on a querier.
+#[cfg(test)]
+pub(crate) mod test_harness {
+    use std::sync::Arc;
+
+    use arrow_schema::Schema;
+    use config::meta::inverted_index::IndexOptimizeMode;
+    use datafusion::{
+        execution::{SessionStateBuilder, runtime_env::RuntimeEnvBuilder},
+        physical_optimizer::PhysicalOptimizerRule,
+        physical_plan::ExecutionPlan,
+        prelude::{SessionConfig, SessionContext},
+        sql::TableReference,
+    };
+    use datafusion_proto::bytes::{
+        physical_plan_from_bytes_with_extension_codec, physical_plan_to_bytes_with_extension_codec,
+    };
+    use hashbrown::HashSet;
+    use parking_lot::Mutex;
+
+    use super::{FollowerIndexOptimizerRule, utils::tests::get_remote_scan};
+    use crate::datafusion::{
+        distributed_plan::codec::get_physical_extension_codec,
+        optimizer::{
+            logical_optimizer::{
+                add_sort_and_limit::AddSortAndLimitRule, rewrite_histogram::RewriteHistogram,
+            },
+            physical_optimizer::remote_scan::RemoteScanRule,
+        },
+        table_provider::empty_table::NewEmptyTable,
+        udf::histogram_udf,
+    };
+
+    /// Number of rows `AddSortAndLimitRule` is created with: production uses
+    /// `query_default_limit + 5` when the request has no explicit LIMIT
+    /// (the UI histogram request carries `size: -1`).
+    const DEFAULT_LIMIT: usize = 1005;
+
+    /// Plans `sql` against table `"t"` with the given schema and returns the
+    /// [`IndexOptimizeMode`] a follower extracts from the shipped sub-plan.
+    ///
+    /// `preset_interval_secs` mirrors `query.histogram_interval`: pass the
+    /// streaming path's pre-computed seconds, or 0 for the plain `_search`
+    /// auto-interval resolution inside [`RewriteHistogram`].
+    pub async fn follower_extracted_mode(
+        sql: &str,
+        schema: Arc<Schema>,
+        time_range: (i64, i64),
+        preset_interval_secs: i64,
+        column_store_fields: HashSet<String>,
+    ) -> Option<IndexOptimizeMode> {
+        let mut file_id_lists = hashbrown::HashMap::new();
+        file_id_lists.insert(TableReference::from("t"), vec![]);
+
+        let state = SessionStateBuilder::new()
+            .with_config(SessionConfig::new().with_target_partitions(12))
+            .with_runtime_env(Arc::new(RuntimeEnvBuilder::new().build().unwrap()))
+            .with_default_features()
+            .with_optimizer_rule(Arc::new(RewriteHistogram::new(
+                time_range.0,
+                time_range.1,
+                preset_interval_secs,
+                None,
+            )))
+            .with_optimizer_rule(Arc::new(AddSortAndLimitRule::new(DEFAULT_LIMIT, 0)))
+            .with_physical_optimizer_rule(Arc::new(RemoteScanRule::new_test(file_id_lists, false)))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        let provider = NewEmptyTable::new("t", Arc::clone(&schema)).with_partitions(12);
+        ctx.register_table("t", Arc::new(provider)).unwrap();
+        ctx.register_udf(histogram_udf::HISTOGRAM_UDF.clone());
+
+        let plan = ctx.state().create_logical_plan(sql).await.unwrap();
+        let physical_plan = ctx.state().create_physical_plan(&plan).await.unwrap();
+
+        // the sub-plan the leader ships to followers
+        let remote_scans = get_remote_scan(physical_plan);
+        assert_eq!(remote_scans.len(), 1, "expected one RemoteScanExec: {sql}");
+        let shipped = Arc::clone(remote_scans[0].children()[0]);
+
+        // proto roundtrip: exactly what flight.rs do_get receives
+        let codec = get_physical_extension_codec();
+        let bytes = physical_plan_to_bytes_with_extension_codec(shipped, &codec).unwrap();
+        let follower_plan =
+            physical_plan_from_bytes_with_extension_codec(&bytes, &ctx.task_ctx(), &codec).unwrap();
+
+        let mode = Arc::new(Mutex::new(None));
+        let rule = FollowerIndexOptimizerRule::new(
+            time_range,
+            column_store_fields,
+            HashSet::new(),
+            mode.clone(),
+        );
+        let _ = rule
+            .optimize(follower_plan, ctx.state().config_options())
+            .unwrap();
+        mode.lock().clone()
     }
 }
 
@@ -412,6 +576,7 @@ mod tests {
             .with_physical_optimizer_rule(Arc::new(FollowerIndexOptimizerRule::new(
                 (0, 0),
                 HashSet::new(),
+                HashSet::new(),
                 index_optimizer_mode.clone(),
             )))
             .with_default_features()
@@ -443,6 +608,7 @@ mod tests {
             .with_runtime_env(Arc::new(RuntimeEnvBuilder::new().build().unwrap()))
             .with_physical_optimizer_rule(Arc::new(FollowerIndexOptimizerRule::new(
                 (0, 0),
+                HashSet::new(),
                 HashSet::new(),
                 index_optimizer_mode.clone(),
             )))
@@ -483,7 +649,10 @@ mod tests {
             .with_config(SessionConfig::new().with_target_partitions(12))
             .with_runtime_env(Arc::new(RuntimeEnvBuilder::new().build().unwrap()))
             .with_physical_optimizer_rule(Arc::new(remote_scan_rule))
-            .with_physical_optimizer_rule(Arc::new(LeaderIndexOptimizerRule::new(index_fields)))
+            .with_physical_optimizer_rule(Arc::new(LeaderIndexOptimizerRule::new(
+                index_fields,
+                HashMap::new(),
+            )))
             .with_default_features()
             .build();
         let ctx = SessionContext::new_with_state(state);
@@ -503,6 +672,44 @@ mod tests {
                 false
             ))
         )
+    }
+
+    #[tokio::test]
+    async fn test_leader_rule_topn_requires_column_store_field() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("id", DataType::Utf8, false),
+        ]));
+        // `name` is not in the stream's column_store_fields (the per-table
+        // set is empty), so the group field is not fast-path eligible
+        let mut index_fields: HashMap<TableReference, HashSet<String>> = HashMap::new();
+        index_fields.insert(TableReference::from("t"), HashSet::new());
+
+        let mut file_id_lists = hashbrown::HashMap::new();
+        file_id_lists.insert(TableReference::from("t"), vec![]);
+        let remote_scan_rule = RemoteScanRule::new_test(file_id_lists, false);
+
+        let state = SessionStateBuilder::new()
+            .with_config(SessionConfig::new().with_target_partitions(12))
+            .with_runtime_env(Arc::new(RuntimeEnvBuilder::new().build().unwrap()))
+            .with_physical_optimizer_rule(Arc::new(remote_scan_rule))
+            .with_physical_optimizer_rule(Arc::new(LeaderIndexOptimizerRule::new(
+                index_fields,
+                HashMap::new(),
+            )))
+            .with_default_features()
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        let provider = NewEmptyTable::new("t", schema.clone()).with_partitions(12);
+        ctx.register_table("t", Arc::new(provider)).unwrap();
+
+        let sql = "select name, count(*) as cnt from t group by name order by cnt desc limit 10";
+        let plan = ctx.state().create_logical_plan(sql).await.unwrap();
+        let plan = ctx.state().create_physical_plan(&plan).await.unwrap();
+
+        let remote_scan = get_remote_scan(plan);
+        assert_eq!(remote_scan[0].index_optimize_mode(), None);
     }
 
     #[tokio::test]
@@ -526,7 +733,10 @@ mod tests {
             .with_config(SessionConfig::new().with_target_partitions(12))
             .with_runtime_env(Arc::new(RuntimeEnvBuilder::new().build().unwrap()))
             .with_physical_optimizer_rule(Arc::new(remote_scan_rule))
-            .with_physical_optimizer_rule(Arc::new(LeaderIndexOptimizerRule::new(index_fields)))
+            .with_physical_optimizer_rule(Arc::new(LeaderIndexOptimizerRule::new(
+                index_fields,
+                HashMap::new(),
+            )))
             .with_default_features()
             .build();
         let ctx = SessionContext::new_with_state(state);
@@ -570,7 +780,10 @@ mod tests {
             .with_config(SessionConfig::new().with_target_partitions(12))
             .with_runtime_env(Arc::new(RuntimeEnvBuilder::new().build().unwrap()))
             .with_physical_optimizer_rule(Arc::new(remote_scan_rule))
-            .with_physical_optimizer_rule(Arc::new(LeaderIndexOptimizerRule::new(index_fields)))
+            .with_physical_optimizer_rule(Arc::new(LeaderIndexOptimizerRule::new(
+                index_fields,
+                HashMap::new(),
+            )))
             .with_default_features()
             .build();
         let ctx = SessionContext::new_with_state(state);

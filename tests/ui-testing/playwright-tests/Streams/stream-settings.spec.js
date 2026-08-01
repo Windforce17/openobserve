@@ -22,40 +22,12 @@ test.describe("Stream Index Type Configuration Tests", () => {
         }
     });
 
-    test("should check FTS and secondary index options are available", {
-        tag: ['@streams', '@indexType', '@streamDetail', '@smoke', '@all']
-    }, async ({ page }) => {
-        testLogger.info('Testing FTS and secondary index options availability');
-        await pm.streamsPage.searchStream("e2e_automate");
-        await pm.streamsPage.expectStreamExistsExact("e2e_automate");
-
-        await pm.streamsPage.openStreamDetail("e2e_automate");
-        await pm.streamsPage.searchForField("job");
-
-        const availableOptions = await pm.streamsPage.verifyIndexTypeOptions();
-        expect(availableOptions.length).toBeGreaterThan(0);
-        testLogger.info('Index type options verified', { optionCount: availableOptions.length });
-    });
-
-    test("should show validation error when selecting both index types", {
-        tag: ['@streams', '@indexType', '@validation', '@all']
-    }, async ({ page }) => {
-        testLogger.info('Testing validation error when selecting both index types');
-        await pm.streamsPage.searchStream("e2e_automate");
-        await pm.streamsPage.expectStreamExistsExact("e2e_automate");
-
-        await pm.streamsPage.openStreamDetail("e2e_automate");
-        await pm.streamsPage.searchForField("level");
-
-        // Select both index types (this should cause validation error)
-        await pm.streamsPage.selectFullTextSearch();
-        await pm.streamsPage.selectSecondaryIndex();
-        await pm.streamsPage.clickUpdateSettingsButton();
-
-        // STRICT ASSERTION: Verify validation error appears
-        await pm.streamsPage.expectValidationErrorVisible();
-        testLogger.info('Validation error correctly displayed');
-    });
+    // DELETED (2026-07-21 test triage): "should check FTS and secondary index
+    // options are available" and "should show validation error when selecting
+    // both index types" — the Secondary index type was removed in the vix
+    // re-architecture (no secondaryIndexKey option in the UI anymore), so both
+    // flows are dead. FTS-option availability stays covered by the @bug-7671
+    // test in RegressionSet/Streams/streams-regression.spec.js.
 
     // SKIPPED: product regression on alpha's deployed Stream Detail drawer.
     // Clicking the "Extended Retention" tab collapses the entire drawer content

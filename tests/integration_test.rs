@@ -94,6 +94,20 @@ mod tests {
             env::set_var("ZO_LOCAL_MODE", "true");
             env::set_var("ZO_MAX_FILE_SIZE_ON_DISK", "1");
             env::set_var("ZO_FILE_PUSH_INTERVAL", "1");
+            // Move WAL files to storage quickly so tests exercise the
+            // storage + .vix index path instead of only the WAL path.
+            env::set_var("ZO_MAX_FILE_RETENTION_TIME", "1");
+            // Under ZO_INGEST_SEGMENT_MODE (set by the caller, not here)
+            // acks are ack-on-append and visibility waits for the next
+            // segment flush: run the flusher at the validation floor so the
+            // suite's ingest->query gaps comfortably cover the lag without a
+            // per-request sync knob (removed 2026-07-31 — one segment per
+            // request is a pathological file shape). Inert when segment mode
+            // is off.
+            env::set_var("ZO_SEGMENT_FLUSH_INTERVAL_MS", "50");
+            // The alert-destination tests use a dummy loopback host; the SSRF
+            // guard must not reject it in this trusted test environment.
+            env::set_var("ZO_SSRF_ALLOW_LOOPBACK", "true");
             env::set_var("ZO_PAYLOAD_LIMIT", "209715200");
             env::set_var("ZO_JSON_LIMIT", "209715200");
             env::set_var("ZO_RESULT_CACHE_ENABLED", "false");
@@ -122,6 +136,58 @@ mod tests {
     }
 
     /// Make a test request and return the response
+    /// Segment-mode acks are ack-on-append: read-after-ingest visibility
+    /// waits for the next segment flush (harness floor 50ms), so strictly
+    /// back-to-back ingest->search assertions poll briefly instead of
+    /// assuming memtable-instant reads. Legacy mode satisfies `is_ready` on
+    /// the first attempt, making the loop free. Returns the LAST response
+    /// either way — the caller's assertion still runs (and prints it) on
+    /// timeout.
+    async fn search_json_eventually(
+        app: &Router,
+        org: &str,
+        headers: &HeaderMap,
+        body_str: &str,
+        is_ready: impl Fn(&serde_json::Value) -> bool,
+    ) -> serde_json::Value {
+        let mut last = serde_json::Value::Null;
+        for _ in 0..50 {
+            let (status, body) = make_request(
+                app,
+                Method::POST,
+                &format!("/api/{org}/_search"),
+                Some(headers.clone()),
+                Some(body_str.to_string()),
+            )
+            .await;
+            assert!(
+                status.is_success(),
+                "search failed: {}",
+                String::from_utf8_lossy(&body)
+            );
+            last = serde_json::from_slice(&body).expect("search response must be JSON");
+            if is_ready(&last) {
+                return last;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        }
+        last
+    }
+
+    /// The compactor commit fence (heartbeat-from-claim, 2026-07-31)
+    /// refuses to commit a job this node does not OWN — tests invoking
+    /// merge_by_stream directly must claim exactly like run_merge does.
+    async fn claim_job_for_merge(job_id: i64) {
+        let claimed =
+            infra::file_list::get_pending_jobs(&config::cluster::LOCAL_NODE.uuid, 20, true)
+                .await
+                .unwrap();
+        assert!(
+            claimed.iter().any(|j| j.id == job_id),
+            "job {job_id} must be claimable by this node: {claimed:?}"
+        );
+    }
+
     async fn make_request(
         app: &Router,
         method: Method,
@@ -346,6 +412,7 @@ mod tests {
         // ingest
         e2e_post_json().await;
         e2e_post_multi().await;
+        e2e_trace_context_canonicalization().await;
         e2e_post_trace().await;
         e2e_post_metrics().await;
         e2e_post_hec().await;
@@ -469,6 +536,15 @@ mod tests {
         test_backfill_job_get_nonexistent().await;
         test_backfill_job_delete_by_pipeline().await;
         test_backfill_job_enable_disable().await;
+
+        // vix index end-to-end (self-contained stream; runs last so its
+        // ingest/flush timing cannot shift the window-sensitive scheduler
+        // tests above)
+        e2e_vix_index_search().await;
+
+        // single-file healing compaction (self-contained stream; after the
+        // vix step for the same window-timing reason)
+        e2e_single_file_healing_compaction().await;
 
         // others
         e2e_health_check().await;
@@ -669,6 +745,138 @@ mod tests {
         assert!(status.is_success());
     }
 
+    /// Ingest-path proof of the reserved trace-context canonicalization
+    /// (`flatten::canonicalize_reserved_aliases`, applied in the write_logs
+    /// funnel): a record carrying NESTED trace context (`{"trace":{"id":..}}`
+    /// — the shape collector-side OTTL misses) plus a literal dotted span
+    /// alias stores the canonical `trace_id`/`span_id` and no dotted
+    /// `trace.id`/`span.id`; when both forms arrive, the canonical field
+    /// wins; unrelated dotted fields keep the dotted canon.
+    async fn e2e_trace_context_canonicalization() {
+        let auth = setup();
+        let app = init_test_router();
+        let headers = auth_headers(auth);
+
+        let now = Utc::now().timestamp_micros();
+        let records = serde_json::json!([
+            {
+                "_timestamp": now,
+                "log": "canon nested",
+                "trace": {"id": "tid-nested-1"},
+                "span.id": "sid-literal-1",
+                "service.name": "canon-svc",
+            },
+            {
+                "_timestamp": now - 1_000,
+                "log": "canon conflict",
+                "trace.id": "loser",
+                "trace_id": "winner",
+            },
+        ]);
+        let (status, body) = make_request(
+            &app,
+            Method::POST,
+            &format!("/api/{}/{}/_json", "e2e", "trace_ctx_canon"),
+            Some(headers.clone()),
+            Some(records.to_string()),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "trace_ctx_canon ingest failed: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        // The stream schema is inferred from the canonicalized records
+        // (canonicalization runs before check_for_schema), so it must know
+        // the canonical fields and never the dotted aliases.
+        let (status, body) = make_request(
+            &app,
+            Method::GET,
+            &format!("/api/{}/streams/{}/schema", "e2e", "trace_ctx_canon"),
+            Some(headers.clone()),
+            None,
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "trace_ctx_canon schema fetch failed: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let stream: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let fields: Vec<&str> = stream["schema"]
+            .as_array()
+            .expect("stream schema must be an array")
+            .iter()
+            .map(|f| f["name"].as_str().unwrap())
+            .collect();
+        for canonical in ["trace_id", "span_id", "service.name"] {
+            assert!(
+                fields.contains(&canonical),
+                "schema must contain {canonical:?}: {fields:?}"
+            );
+        }
+        for dotted in ["trace.id", "span.id"] {
+            assert!(
+                !fields.contains(&dotted),
+                "schema must not learn the dotted alias {dotted:?}: {fields:?}"
+            );
+        }
+
+        // The stored records: hits carry only the canonical fields.
+        let body_str = serde_json::json!({
+            "query": {
+                "sql": "select * from trace_ctx_canon",
+                "from": 0,
+                "size": 10,
+                "start_time": now - 3_600_000_000i64,
+                "end_time": now + 3_600_000_000i64,
+            }
+        })
+        .to_string();
+        let res = search_json_eventually(&app, "e2e", &headers, &body_str, |r| {
+            r["hits"].as_array().map(|h| h.len()) == Some(2)
+        })
+        .await;
+        let hits = res["hits"].as_array().cloned().unwrap_or_default();
+        assert_eq!(hits.len(), 2, "expected both canon records: {res}");
+        for hit in &hits {
+            let obj = hit.as_object().unwrap();
+            assert!(
+                !obj.contains_key("trace.id") && !obj.contains_key("span.id"),
+                "stored record must not carry a dotted trace-context field: {hit}"
+            );
+            match obj.get("log").and_then(|v| v.as_str()) {
+                Some("canon nested") => {
+                    assert_eq!(
+                        obj.get("trace_id").and_then(|v| v.as_str()),
+                        Some("tid-nested-1"),
+                        "{hit}"
+                    );
+                    assert_eq!(
+                        obj.get("span_id").and_then(|v| v.as_str()),
+                        Some("sid-literal-1"),
+                        "{hit}"
+                    );
+                    assert_eq!(
+                        obj.get("service.name").and_then(|v| v.as_str()),
+                        Some("canon-svc"),
+                        "{hit}"
+                    );
+                }
+                Some("canon conflict") => {
+                    // both forms arrived: the canonical field wins
+                    assert_eq!(
+                        obj.get("trace_id").and_then(|v| v.as_str()),
+                        Some("winner"),
+                        "{hit}"
+                    );
+                }
+                other => panic!("unexpected hit log value {other:?}: {hit}"),
+            }
+        }
+    }
+
     async fn e2e_get_stream() {
         let auth = setup();
         let app = init_test_router();
@@ -854,6 +1062,950 @@ mod tests {
         )
         .await;
         assert!(status.is_success());
+    }
+
+    /// Recursively collect files under `dir` whose path ends with `ext` and
+    /// contains `needle`.
+    fn find_files_with_ext(dir: &std::path::Path, ext: &str, needle: &str, out: &mut Vec<String>) {
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    find_files_with_ext(&path, ext, needle, out);
+                } else if let Some(p) = path.to_str()
+                    && p.ends_with(ext)
+                    && p.contains(needle)
+                {
+                    out.push(p.to_string());
+                }
+            }
+        }
+    }
+
+    /// End-to-end check of the `.vix` index + core files: ingest a
+    /// dedicated stream, wait for the WAL→storage move job
+    /// (ZO_FILE_PUSH_INTERVAL=1) to write the core `.vix` object
+    /// (logs/traces are always core files: records + index in ONE object,
+    /// no parquet data file and no sibling index), then verify that term
+    /// (equality on a non-FTS field), full-text (match_all), and count
+    /// queries return the expected rows through the core-file scan path.
+    /// A second stream (vixtest_dotted) checks the dotted-field roundtrip:
+    /// nested ingest keeps `.` in field names, unquoted `http.status`
+    /// resolves to the field, and hits materialize it from `_source`.
+    async fn e2e_vix_index_search() {
+        let auth = setup();
+        let app = init_test_router();
+        let headers = auth_headers(auth);
+
+        // 10 records: 3 "error" rows carry a unique token in `log` (a default
+        // FTS field), 7 "info" rows do not.
+        let now = Utc::now().timestamp_micros();
+        let mut records = Vec::new();
+        for i in 0..10i64 {
+            let (level, log) = if i < 3 {
+                ("error", format!("request failed vixsmoketoken42 case {i}"))
+            } else {
+                ("info", format!("request ok case {i}"))
+            };
+            let mut record = serde_json::json!({
+                "_timestamp": now - i * 1_000,
+                "level": level,
+                "service": format!("svc-{}", i % 2),
+                "log": log,
+            });
+            if level == "error" {
+                // only error rows carry err_code: the 7 info rows leave it
+                // absent, which the index must treat as NULL (no key term)
+                record["err_code"] = serde_json::json!("E42");
+            }
+            records.push(record);
+        }
+        let body_str = serde_json::to_string(&records).unwrap();
+        let (status, body) = make_request(
+            &app,
+            Method::POST,
+            &format!("/api/{}/{}/_json", "e2e", "vixtest"),
+            Some(headers.clone()),
+            Some(body_str),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "vixtest ingest failed: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        // Push the memtable to WAL, then wait for the move job to build the
+        // index. The .vix object appearing in the local object store proves
+        // the write path ran and the data is served from storage.
+        flush_memtable().await;
+        let mut vix_files = Vec::new();
+        for _ in 0..60 {
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            vix_files.clear();
+            find_files_with_ext(
+                std::path::Path::new("./data"),
+                ".vix",
+                "vixtest",
+                &mut vix_files,
+            );
+            if !vix_files.is_empty() {
+                break;
+            }
+        }
+        assert!(
+            !vix_files.is_empty(),
+            "no .vix index file was created for stream vixtest within 30s"
+        );
+
+        let start_time = now - 3_600_000_000i64;
+        let end_time = now + 3_600_000_000i64;
+        let run_query = |sql: &str| {
+            let body_str = serde_json::json!({
+                "query": {
+                    "sql": sql,
+                    "from": 0,
+                    "size": 100,
+                    "start_time": start_time,
+                    "end_time": end_time
+                }
+            })
+            .to_string();
+            let headers = headers.clone();
+            let app = &app;
+            async move {
+                let (status, body) = make_request(
+                    app,
+                    Method::POST,
+                    &format!("/api/{}/_search", "e2e"),
+                    Some(headers),
+                    Some(body_str),
+                )
+                .await;
+                assert!(
+                    status.is_success(),
+                    "search failed: {}",
+                    String::from_utf8_lossy(&body)
+                );
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+            }
+        };
+
+        // Term index: equality on a plain string field (not FTS-listed).
+        let res = run_query("select * from vixtest where level = 'error'").await;
+        assert_eq!(
+            res["hits"].as_array().map(|h| h.len()),
+            Some(3),
+            "equality on term-indexed field returned wrong rows: {res}"
+        );
+
+        // Full-text index: match_all over tokenized FTS fields.
+        let res = run_query("select * from vixtest where match_all('vixsmoketoken42')").await;
+        assert_eq!(
+            res["hits"].as_array().map(|h| h.len()),
+            Some(3),
+            "match_all returned wrong rows: {res}"
+        );
+
+        // Count fast path (SimpleCount over the index).
+        let res = run_query("select count(*) as cnt from vixtest where level = 'info'").await;
+        let cnt = res["hits"][0]["cnt"].as_i64().or_else(|| {
+            res["hits"][0]["cnt"]
+                .as_str()
+                .and_then(|s| s.parse::<i64>().ok())
+        });
+        assert_eq!(cnt, Some(7), "count query returned wrong value: {res}");
+
+        // IS NULL rides the key-term index (Condition::IsNull = exact
+        // complement of KeyExists): rows where err_code is absent are the 7
+        // info rows. Covers the SimpleCount shape...
+        let res = run_query("select count(*) as cnt from vixtest where err_code is null").await;
+        let cnt = res["hits"][0]["cnt"].as_i64().or_else(|| {
+            res["hits"][0]["cnt"]
+                .as_str()
+                .and_then(|s| s.parse::<i64>().ok())
+        });
+        assert_eq!(cnt, Some(7), "IS NULL count returned wrong value: {res}");
+
+        // ...the SimpleSelect (star + ORDER BY _timestamp + LIMIT) shape...
+        let res = run_query(
+            "select * from vixtest where err_code is null order by _timestamp desc limit 5",
+        )
+        .await;
+        let hits = res["hits"].as_array().cloned().unwrap_or_default();
+        assert_eq!(hits.len(), 5, "IS NULL select returned wrong rows: {res}");
+        for hit in &hits {
+            assert!(
+                hit.get("err_code").is_none_or(|v| v.is_null()),
+                "IS NULL select returned a row with err_code set: {hit}"
+            );
+        }
+
+        // ...and the complement stays exact.
+        let res = run_query("select count(*) as cnt from vixtest where err_code is not null").await;
+        let cnt = res["hits"][0]["cnt"].as_i64().or_else(|| {
+            res["hits"][0]["cnt"]
+                .as_str()
+                .and_then(|s| s.parse::<i64>().ok())
+        });
+        assert_eq!(
+            cnt,
+            Some(3),
+            "IS NOT NULL count returned wrong value: {res}"
+        );
+
+        // Histogram fast path (SimpleHistogram over the index), in the shape
+        // the UI issues it: histogram(_timestamp) + count(*) grouped by the
+        // bucket. Bucket counts must sum to the 3 first-batch error rows.
+        let res = run_query(
+            "select histogram(_timestamp, '30 second') as zo_sql_key, count(*) as zo_sql_num \
+             from vixtest where level = 'error' group by zo_sql_key order by zo_sql_key",
+        )
+        .await;
+        let hits = res["hits"].as_array().cloned().unwrap_or_default();
+        let total: i64 = hits
+            .iter()
+            .map(|hit| {
+                hit["zo_sql_num"]
+                    .as_i64()
+                    .or_else(|| {
+                        hit["zo_sql_num"]
+                            .as_str()
+                            .and_then(|s| s.parse::<i64>().ok())
+                    })
+                    .unwrap_or_default()
+            })
+            .sum();
+        assert_eq!(
+            total, 3,
+            "first-batch histogram bucket counts must sum to the 3 error rows: {res}"
+        );
+
+        // -----------------------------------------------------------------
+        // core-file shape: exactly ONE object per file unit. Everything
+        // in the vixtest storage prefix is a `.vix` core file (no parquet /
+        // vortex data files) and there is NO sibling index object.
+        // -----------------------------------------------------------------
+        let mut stream_objects = Vec::new();
+        find_files_with_ext(
+            std::path::Path::new("./data/openobserve/stream/files/e2e/logs/vixtest"),
+            "",
+            "",
+            &mut stream_objects,
+        );
+        assert!(
+            !stream_objects.is_empty(),
+            "no storage objects found for stream vixtest"
+        );
+        for object in &stream_objects {
+            assert!(
+                object.ends_with(".vix"),
+                "vixtest must be stored as core .vix objects only, found: {object}"
+            );
+        }
+        let mut sibling_indexes = Vec::new();
+        find_files_with_ext(
+            std::path::Path::new("./data/openobserve/stream/files/e2e/index"),
+            "",
+            "vixtest",
+            &mut sibling_indexes,
+        );
+        assert!(
+            sibling_indexes.is_empty(),
+            "core files must not have sibling index objects, found: {sibling_indexes:?}"
+        );
+
+        // -----------------------------------------------------------------
+        // Dotted-field roundtrip on a second stream: nested ingest keeps `.`
+        // in flattened field names; equality on the dotted field works both
+        // quoted and unquoted; hits carry the dotted field from `_source`.
+        // -----------------------------------------------------------------
+        let mut records = Vec::new();
+        for i in 0..4i64 {
+            let status = if i < 2 { "500" } else { "200" };
+            records.push(serde_json::json!({
+                "_timestamp": now - i * 1_000,
+                "log": format!("nested case {i}"),
+                "http": { "status": status },
+            }));
+        }
+        // a record without the `http` key: its flattened record carries no
+        // `http.status` path, so the key-existence term skips it (IS NOT NULL)
+        records.push(serde_json::json!({
+            "_timestamp": now - 4_000,
+            "log": "nested case 4 no http",
+        }));
+        let body_str = serde_json::to_string(&records).unwrap();
+        let (status, body) = make_request(
+            &app,
+            Method::POST,
+            &format!("/api/{}/{}/_json", "e2e", "vixtest_dotted"),
+            Some(headers.clone()),
+            Some(body_str),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "vixtest_dotted ingest failed: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        flush_memtable().await;
+        let mut v2_files = Vec::new();
+        for _ in 0..60 {
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            v2_files.clear();
+            find_files_with_ext(
+                std::path::Path::new("./data/openobserve/stream/files/e2e/logs/vixtest_dotted"),
+                ".vix",
+                "",
+                &mut v2_files,
+            );
+            if !v2_files.is_empty() {
+                break;
+            }
+        }
+        assert!(
+            !v2_files.is_empty(),
+            "no core .vix file was created for stream vixtest_dotted within 60s"
+        );
+
+        for sql in [
+            // quoted dotted identifier works natively
+            "select * from vixtest_dotted where \"http.status\" = '500'",
+            // unquoted dotted identifier resolves to the field (§15.5)
+            "select * from vixtest_dotted where http.status = '500'",
+        ] {
+            let res = run_query(sql).await;
+            let hits = res["hits"].as_array().cloned().unwrap_or_default();
+            assert_eq!(
+                hits.len(),
+                2,
+                "dotted-field query {sql:?} wrong rows: {res}"
+            );
+            for hit in &hits {
+                assert_eq!(
+                    hit["http.status"].as_str(),
+                    Some("500"),
+                    "hit is missing the dotted field extracted from _source: {hit}"
+                );
+                assert!(
+                    hit["log"]
+                        .as_str()
+                        .is_some_and(|log| log.starts_with("nested case")),
+                    "hit is missing the log field: {hit}"
+                );
+            }
+        }
+
+        // IS NOT NULL answers from the core-file key-existence terms
+        // (VixQuery::KeyExists): 4 of the 5 records carry the `http.status`
+        // path, the no-http record does not.
+        for sql in [
+            "select count(*) as cnt from vixtest_dotted where \"http.status\" is not null",
+            "select count(*) as cnt from vixtest_dotted where http.status is not null",
+        ] {
+            let res = run_query(sql).await;
+            let cnt = res["hits"][0]["cnt"].as_i64().or_else(|| {
+                res["hits"][0]["cnt"]
+                    .as_str()
+                    .and_then(|s| s.parse::<i64>().ok())
+            });
+            assert_eq!(
+                cnt,
+                Some(4),
+                "IS NOT NULL query {sql:?} returned wrong count: {res}"
+            );
+        }
+
+        // and the second stream also stores exactly one object per file unit
+        let mut v2_objects = Vec::new();
+        find_files_with_ext(
+            std::path::Path::new("./data/openobserve/stream/files/e2e/logs/vixtest_dotted"),
+            "",
+            "",
+            &mut v2_objects,
+        );
+        for object in &v2_objects {
+            assert!(
+                object.ends_with(".vix"),
+                "vixtest_dotted must be stored as core .vix objects only, found: {object}"
+            );
+        }
+        let mut v2_siblings = Vec::new();
+        find_files_with_ext(
+            std::path::Path::new("./data/openobserve/stream/files/e2e/index"),
+            "",
+            "vixtest_dotted",
+            &mut v2_siblings,
+        );
+        assert!(
+            v2_siblings.is_empty(),
+            "core files must not have sibling index objects, found: {v2_siblings:?}"
+        );
+
+        // -----------------------------------------------------------------
+        // Aggregation fast paths (P3b): add "service" to column_store_fields,
+        // ingest a second batch (its files carry the service docs column and
+        // serve the fast paths), then assert CORRECT results for a
+        // TopN-shaped and a histogram-shaped query. Correctness is the
+        // assertion — fast path or fallback are both acceptable (first-batch
+        // files lack the service docs column, and the per-file capability
+        // probe routes them to the DataFusion branch).
+        // -----------------------------------------------------------------
+        let body_str = r#"{"column_store_fields":{"add":["service"],"remove":[]}}"#;
+        let (status, body) = make_request(
+            &app,
+            Method::PUT,
+            &format!("/api/{}/streams/{}/settings", "e2e", "vixtest"),
+            Some(headers.clone()),
+            Some(body_str.to_string()),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "vixtest settings update failed: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        // second batch: 8 records newer than the settings change.
+        // service totals across BOTH batches: svc-0 = 5+2 = 7, svc-2 = 6,
+        // svc-1 = 5; level "error" totals: 3 + 2 = 5.
+        let now2 = Utc::now().timestamp_micros();
+        let mut records = Vec::new();
+        for i in 0..8i64 {
+            let service = if i < 6 { "svc-2" } else { "svc-0" };
+            let level = if i < 2 { "error" } else { "info" };
+            records.push(serde_json::json!({
+                "_timestamp": now2 + i * 1_000,
+                "level": level,
+                "service": service,
+                "log": format!("second batch case {i}"),
+            }));
+        }
+        let body_str = serde_json::to_string(&records).unwrap();
+        let (status, body) = make_request(
+            &app,
+            Method::POST,
+            &format!("/api/{}/{}/_json", "e2e", "vixtest"),
+            Some(headers.clone()),
+            Some(body_str),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "vixtest second ingest failed: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        // count only the vixtest stream directory (vixtest_dotted is a sibling)
+        let vixtest_dir = std::path::Path::new("./data/openobserve/stream/files/e2e/logs/vixtest");
+        let mut batch2_files = Vec::new();
+        find_files_with_ext(vixtest_dir, ".vix", "", &mut batch2_files);
+        let prev_vix_files = batch2_files.len();
+        flush_memtable().await;
+        for _ in 0..60 {
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            batch2_files.clear();
+            find_files_with_ext(vixtest_dir, ".vix", "", &mut batch2_files);
+            if batch2_files.len() > prev_vix_files {
+                break;
+            }
+        }
+        assert!(
+            batch2_files.len() > prev_vix_files,
+            "no new .vix file appeared for the second vixtest ingest within 60s"
+        );
+
+        // TopN-shaped query: group by the column-store field, order by count.
+        // Retry briefly: the freshly moved file needs its file_list row.
+        let topn_sql = "select service, count(*) as cnt from vixtest group by service order by cnt desc limit 10";
+        let expected_topn: Vec<(&str, i64)> = vec![("svc-0", 7), ("svc-2", 6), ("svc-1", 5)];
+        let mut got_topn: Vec<(String, i64)> = Vec::new();
+        for _ in 0..15 {
+            let res = run_query(topn_sql).await;
+            got_topn = res["hits"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .map(|hit| {
+                    (
+                        hit["service"].as_str().unwrap_or_default().to_string(),
+                        hit["cnt"]
+                            .as_i64()
+                            .or_else(|| hit["cnt"].as_str().and_then(|s| s.parse::<i64>().ok()))
+                            .unwrap_or_default(),
+                    )
+                })
+                .collect();
+            if got_topn.len() == expected_topn.len()
+                && got_topn
+                    .iter()
+                    .zip(expected_topn.iter())
+                    .all(|(g, e)| g.0 == e.0 && g.1 == e.1)
+            {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        }
+        assert_eq!(
+            got_topn
+                .iter()
+                .map(|(s, c)| (s.as_str(), *c))
+                .collect::<Vec<_>>(),
+            expected_topn,
+            "topn query returned wrong groups/counts"
+        );
+
+        // Unfiltered TopN/Distinct over `level` — a term-indexed field that
+        // is NOT column-stored (pilot fix B: served from the term dictionary
+        // alone on index-eligible files, scan fallback elsewhere; correctness
+        // is the assertion). Totals across both batches: info 13, error 5.
+        let res = run_query(
+            "select level, count(*) as cnt from vixtest group by level order by cnt desc limit 10",
+        )
+        .await;
+        let got: Vec<(String, i64)> = res["hits"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|hit| {
+                (
+                    hit["level"].as_str().unwrap_or_default().to_string(),
+                    hit["cnt"]
+                        .as_i64()
+                        .or_else(|| hit["cnt"].as_str().and_then(|s| s.parse::<i64>().ok()))
+                        .unwrap_or_default(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got.iter()
+                .map(|(s, c)| (s.as_str(), *c))
+                .collect::<Vec<_>>(),
+            vec![("info", 13), ("error", 5)],
+            "term-only topn query returned wrong groups/counts: {res}"
+        );
+        let res = run_query("select distinct level from vixtest order by level asc limit 10").await;
+        let values: Vec<String> = res["hits"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|hit| hit["level"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(
+            values,
+            vec!["error", "info"],
+            "term-only distinct query returned wrong values: {res}"
+        );
+
+        // Histogram-shaped query with a term filter: bucket counts over the
+        // filtered rows must sum to the exact number of error records.
+        let histogram_sql = "select histogram(_timestamp, '30 second') as zo_sql_key, count(*) as zo_sql_num \
+             from vixtest where level = 'error' group by zo_sql_key order by zo_sql_key";
+        let res = run_query(histogram_sql).await;
+        let hits = res["hits"].as_array().cloned().unwrap_or_default();
+        assert!(
+            !hits.is_empty(),
+            "histogram query returned no buckets: {res}"
+        );
+        let total: i64 = hits
+            .iter()
+            .map(|hit| {
+                hit["zo_sql_num"]
+                    .as_i64()
+                    .or_else(|| {
+                        hit["zo_sql_num"]
+                            .as_str()
+                            .and_then(|s| s.parse::<i64>().ok())
+                    })
+                    .unwrap_or_default()
+            })
+            .sum();
+        assert_eq!(
+            total, 5,
+            "histogram bucket counts must sum to the 5 error rows: {res}"
+        );
+        for hit in &hits {
+            assert!(
+                !hit["zo_sql_key"].is_null(),
+                "histogram bucket key missing: {hit}"
+            );
+        }
+
+        // Distinct-shaped queries (SimpleDistinct): values from BOTH batches
+        // (svc-1 exists only in the first batch, which serves it through the
+        // scan fallback; svc-2 only in the second, served from the index).
+        let res =
+            run_query("select distinct service from vixtest order by service asc limit 10").await;
+        let values: Vec<String> = res["hits"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|hit| hit["service"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(
+            values,
+            vec!["svc-0", "svc-1", "svc-2"],
+            "distinct asc query returned wrong values: {res}"
+        );
+        let res =
+            run_query("select distinct service from vixtest order by service desc limit 2").await;
+        let values: Vec<String> = res["hits"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|hit| hit["service"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(
+            values,
+            vec!["svc-2", "svc-1"],
+            "distinct desc/limit query returned wrong values: {res}"
+        );
+
+        // SimpleSelect-shaped queries (ORDER BY _timestamp DESC LIMIT n):
+        // the bare shape returns the 5 newest rows overall...
+        let res = run_query("select * from vixtest order by _timestamp desc limit 5").await;
+        let logs: Vec<String> = res["hits"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|hit| hit["log"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(
+            logs,
+            (3..8i64)
+                .rev()
+                .map(|i| format!("second batch case {i}"))
+                .collect::<Vec<_>>(),
+            "select+sort+limit query returned wrong rows: {res}"
+        );
+        // ...and the filtered shape drives the vix SimpleSelect fast path
+        // (per-file candidates + global top-N merge across files from both
+        // batches: 2 error rows in the second batch, 3 in the first).
+        let res = run_query(
+            "select * from vixtest where level = 'error' order by _timestamp desc limit 5",
+        )
+        .await;
+        let logs: Vec<String> = res["hits"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|hit| hit["log"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(
+            logs,
+            vec![
+                "second batch case 1".to_string(),
+                "second batch case 0".to_string(),
+                "request failed vixsmoketoken42 case 0".to_string(),
+                "request failed vixsmoketoken42 case 1".to_string(),
+                "request failed vixsmoketoken42 case 2".to_string(),
+            ],
+            "filtered select+sort+limit query returned wrong rows: {res}"
+        );
+    }
+
+    /// Single-file healing rebuild through the REAL compaction job flow
+    /// (`merge_by_stream` + the merge worker + the file_list commit): a
+    /// settled hour partition holding exactly ONE core file — a shape merge
+    /// grouping could never touch — is probed against the current stream
+    /// settings. A CURRENT file is a NO-OP (job completes, file untouched,
+    /// nothing written); after a `column_store_fields` settings change the
+    /// file is REBUILT through the normal merge commit (input replaced by
+    /// one healed output, query results identical); a further job over the
+    /// healed file is a no-op again (healing converges).
+    async fn e2e_single_file_healing_compaction() {
+        use chrono::TimeZone;
+        use config::utils::time::hour_micros;
+        use openobserve::service::compact::{merge::merge_by_stream, worker::MergeWorker};
+
+        let auth = setup();
+        let app = init_test_router();
+        let headers = auth_headers(auth);
+
+        // One batch into a fresh stream, anchored mid-hour TWO hours ago:
+        // the hour is settled (non-incremental) and its partition ends up
+        // with exactly one .vix file.
+        let now = Utc::now().timestamp_micros();
+        let two_hours_ago = now - 2 * hour_micros(1);
+        let anchor = two_hours_ago - (two_hours_ago % hour_micros(1)) + hour_micros(1) / 2;
+        let mut records = Vec::new();
+        for i in 0..6i64 {
+            let (level, log) = if i < 2 {
+                ("error", format!("healme healtoken77 case {i}"))
+            } else {
+                ("info", format!("healme ok case {i}"))
+            };
+            records.push(serde_json::json!({
+                "_timestamp": anchor + i * 1_000,
+                "level": level,
+                "service": format!("svc-{}", i % 2),
+                "log": log,
+            }));
+        }
+        let body_str = serde_json::to_string(&records).unwrap();
+        let (status, body) = make_request(
+            &app,
+            Method::POST,
+            &format!("/api/{}/{}/_json", "e2e", "healtest"),
+            Some(headers.clone()),
+            Some(body_str),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "healtest ingest failed: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        flush_memtable().await;
+        let healtest_dir =
+            std::path::Path::new("./data/openobserve/stream/files/e2e/logs/healtest");
+        let mut disk_objects = Vec::new();
+        for _ in 0..60 {
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            disk_objects.clear();
+            find_files_with_ext(healtest_dir, ".vix", "", &mut disk_objects);
+            if !disk_objects.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(
+            disk_objects.len(),
+            1,
+            "healtest must settle to exactly ONE .vix file, got {disk_objects:?}"
+        );
+
+        // the compactor's view of the hour partition
+        let hour = Utc
+            .timestamp_nanos(anchor * 1000)
+            .format("%Y/%m/%d/%H")
+            .to_string();
+        let query_partition = || async {
+            openobserve::service::file_list::query_for_merge(
+                "e2e",
+                StreamType::Logs,
+                "healtest",
+                &hour,
+                &hour,
+                false,
+            )
+            .await
+            .unwrap()
+        };
+        let mut before = Vec::new();
+        for _ in 0..30 {
+            before = query_partition().await;
+            if !before.is_empty() {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        }
+        assert_eq!(
+            before.len(),
+            1,
+            "file_list must hold exactly the one healtest file"
+        );
+        let original_key = before[0].key.clone();
+
+        // query battery (deterministic order); snapshots must be identical
+        // across the heal
+        let start_time = anchor - 3_600_000_000i64;
+        let end_time = now + 3_600_000_000i64;
+        let queries = [
+            "select * from healtest where match_all('healtoken77') order by _timestamp desc",
+            "select * from healtest where level = 'error' order by _timestamp desc",
+            "select service, count(*) as cnt from healtest group by service order by service asc",
+        ];
+        let snapshot = || {
+            let headers = headers.clone();
+            let app = &app;
+            async move {
+                let mut out = Vec::new();
+                for sql in queries {
+                    let body_str = serde_json::json!({
+                        "query": {
+                            "sql": sql,
+                            "from": 0,
+                            "size": 100,
+                            "start_time": start_time,
+                            "end_time": end_time
+                        }
+                    })
+                    .to_string();
+                    let (status, body) = make_request(
+                        app,
+                        Method::POST,
+                        &format!("/api/{}/_search", "e2e"),
+                        Some(headers.clone()),
+                        Some(body_str),
+                    )
+                    .await;
+                    assert!(
+                        status.is_success(),
+                        "search failed: {}",
+                        String::from_utf8_lossy(&body)
+                    );
+                    let res = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+                    out.push(res["hits"].clone());
+                }
+                out
+            }
+        };
+        let baseline = snapshot().await;
+        assert_eq!(
+            baseline[0].as_array().map(|h| h.len()),
+            Some(2),
+            "match_all baseline: {baseline:?}"
+        );
+        assert_eq!(
+            baseline[1].as_array().map(|h| h.len()),
+            Some(2),
+            "equality baseline: {baseline:?}"
+        );
+        assert_eq!(
+            baseline[2].as_array().map(|h| h.len()),
+            Some(2),
+            "group-by baseline: {baseline:?}"
+        );
+
+        let mut worker = MergeWorker::new(1);
+        worker.run().unwrap();
+        let offset = anchor - (anchor % hour_micros(1));
+
+        // ---- Leg A: a CURRENT single file is a NO-OP --------------------
+        let job_id = infra::file_list::add_job("e2e", StreamType::Logs, "healtest", offset)
+            .await
+            .unwrap();
+        claim_job_for_merge(job_id).await;
+        merge_by_stream(
+            worker.tx(),
+            "e2e",
+            StreamType::Logs,
+            "healtest",
+            job_id,
+            offset,
+        )
+        .await
+        .unwrap();
+        let after_noop = query_partition().await;
+        assert_eq!(after_noop.len(), 1, "no-op leg: still one file");
+        assert_eq!(
+            after_noop[0].key, original_key,
+            "a current single file must stay untouched (same key)"
+        );
+        disk_objects.clear();
+        find_files_with_ext(healtest_dir, ".vix", "", &mut disk_objects);
+        assert_eq!(
+            disk_objects.len(),
+            1,
+            "the no-op must not write any object: {disk_objects:?}"
+        );
+
+        // ---- Leg B: settings gain a cs field -> healing rebuild ---------
+        let body_str = r#"{"column_store_fields":{"add":["service"],"remove":[]}}"#;
+        let (status, body) = make_request(
+            &app,
+            Method::PUT,
+            &format!("/api/{}/streams/{}/settings", "e2e", "healtest"),
+            Some(headers.clone()),
+            Some(body_str.to_string()),
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "healtest settings update failed: {}",
+            String::from_utf8_lossy(&body)
+        );
+        // wait until the compactor's own settings read sees the new field
+        let mut settings_visible = false;
+        for _ in 0..60 {
+            let latest_schema = infra::schema::get("e2e", "healtest", StreamType::Logs)
+                .await
+                .unwrap();
+            let settings = infra::schema::unwrap_stream_settings(&latest_schema);
+            if settings.is_some_and(|s| s.column_store_fields.iter().any(|f| f == "service")) {
+                settings_visible = true;
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        }
+        assert!(
+            settings_visible,
+            "column_store_fields change never reached the schema cache"
+        );
+
+        let job_id = infra::file_list::add_job("e2e", StreamType::Logs, "healtest", offset)
+            .await
+            .unwrap();
+        claim_job_for_merge(job_id).await;
+        merge_by_stream(
+            worker.tx(),
+            "e2e",
+            StreamType::Logs,
+            "healtest",
+            job_id,
+            offset,
+        )
+        .await
+        .unwrap();
+        let after_heal = query_partition().await;
+        assert_eq!(
+            after_heal.len(),
+            1,
+            "healing must land exactly one output file"
+        );
+        let healed_key = after_heal[0].key.clone();
+        assert_ne!(
+            healed_key, original_key,
+            "the healing rebuild must REPLACE the input file"
+        );
+        assert_eq!(after_heal[0].meta.records, 6, "all rows preserved");
+        disk_objects.clear();
+        find_files_with_ext(healtest_dir, ".vix", "", &mut disk_objects);
+        assert!(
+            disk_objects
+                .iter()
+                .any(|p| p.ends_with(healed_key.rsplit('/').next().unwrap_or_default())),
+            "the healed object must exist in storage: {disk_objects:?}"
+        );
+
+        // identical results over the healed file
+        let after = snapshot().await;
+        assert_eq!(
+            baseline, after,
+            "query results must be identical across the heal"
+        );
+
+        // ---- Leg C: healing converges — the healed file is a no-op ------
+        let job_id = infra::file_list::add_job("e2e", StreamType::Logs, "healtest", offset)
+            .await
+            .unwrap();
+        claim_job_for_merge(job_id).await;
+        merge_by_stream(
+            worker.tx(),
+            "e2e",
+            StreamType::Logs,
+            "healtest",
+            job_id,
+            offset,
+        )
+        .await
+        .unwrap();
+        let after_second = query_partition().await;
+        assert_eq!(after_second.len(), 1, "converged leg: still one file");
+        assert_eq!(
+            after_second[0].key, healed_key,
+            "the healed file must classify current (no rebuild loop)"
+        );
     }
 
     async fn e2e_list_users() {
@@ -1510,7 +2662,7 @@ mod tests {
             }"#;
         let app = init_test_router();
         let headers = auth_headers(auth);
-        let (status, _body) = make_request(
+        let (status, body) = make_request(
             &app,
             Method::POST,
             &format!("/api/{}/alerts/destinations", "e2e"),
@@ -1518,7 +2670,11 @@ mod tests {
             Some(body_str.to_string()),
         )
         .await;
-        assert!(status.is_success());
+        assert!(
+            status.is_success(),
+            "post alert destination failed: {}",
+            String::from_utf8_lossy(&body)
+        );
     }
 
     async fn e2e_get_alert_destination() {

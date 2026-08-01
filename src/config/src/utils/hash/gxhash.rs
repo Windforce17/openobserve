@@ -42,8 +42,8 @@ impl Sum64 for GxHash {
 
 /// Hash arbitrary bytes — same algorithm as [`GxHash::sum64`] but
 /// without forcing a `&str` round-trip. Used by callers that hold raw
-/// `&[u8]` (e.g. SBBF point checks where the value comes from a
-/// tantivy term dictionary and isn't necessarily valid UTF-8).
+/// `&[u8]` (e.g. SBBF point checks where the value comes from an
+/// index term dictionary and isn't necessarily valid UTF-8).
 pub fn sum64_bytes(bytes: &[u8]) -> u64 {
     #[cfg(feature = "gxhash")]
     let n = gxhash::gxhash64(bytes, 0);

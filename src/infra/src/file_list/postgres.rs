@@ -379,25 +379,6 @@ SELECT min_ts, max_ts, records, original_size, compressed_size, index_size, bloo
         Ok(!ret.unwrap().is_empty())
     }
 
-    async fn update_flattened(&self, file: &str, flattened: bool) -> Result<()> {
-        let pool = CLIENT.clone();
-        let (stream_key, date_key, file_name) =
-            parse_file_key_columns(file).map_err(|e| Error::Message(e.to_string()))?;
-        DB_QUERY_NUMS
-            .with_label_values(&["update", "file_list"])
-            .inc();
-        sqlx::query(
-            r#"UPDATE file_list SET flattened = $1 WHERE stream = $2 AND date = $3 AND file = $4;"#,
-        )
-        .bind(flattened)
-        .bind(stream_key)
-        .bind(date_key)
-        .bind(file_name)
-        .execute(&pool)
-        .await?;
-        Ok(())
-    }
-
     async fn update_compressed_size(&self, file: &str, size: i64) -> Result<()> {
         let pool = CLIENT.clone();
         let (stream_key, date_key, file_name) =
@@ -475,7 +456,6 @@ SELECT min_ts, max_ts, records, original_size, compressed_size, index_size, bloo
         stream_name: &str,
         _time_level: PartitionTimeLevel,
         time_range: (i64, i64),
-        flattened: Option<bool>,
     ) -> Result<Vec<FileKey>> {
         let start = std::time::Instant::now();
         let stream_key = format!("{org_id}/{stream_type}/{stream_name}");
@@ -484,18 +464,7 @@ SELECT min_ts, max_ts, records, original_size, compressed_size, index_size, bloo
         DB_QUERY_NUMS
             .with_label_values(&["query", "file_list"])
             .inc();
-        let ret = if let Some(flattened) = flattened {
-            sqlx::query_as::<_, super::FileRecord>(
-                r#"
-SELECT id, account, stream, date, file, deleted, min_ts, max_ts, records, original_size, compressed_size, index_size, bloom_ver, flattened
-    FROM file_list
-    WHERE stream = $1 AND flattened = $2 LIMIT 1000;
-                "#
-                )
-                .bind(stream_key)
-                .bind(flattened)
-                .fetch_all(&pool).await
-        } else {
+        let ret = {
             let (time_start, time_end) = time_range;
             let max_ts_upper_bound = super::calculate_max_ts_upper_bound(time_end, stream_type);
             let (date_from, date_to) = derive_date_range(time_start, time_end);
@@ -528,6 +497,7 @@ SELECT id, account, stream, date, file, min_ts, max_ts, records, original_size, 
         stream_type: StreamType,
         stream_name: &str,
         date_range: (String, String),
+        include_oversize: bool,
     ) -> Result<Vec<FileKey>> {
         let start = std::time::Instant::now();
         let (date_start, date_end) = date_range;
@@ -542,7 +512,14 @@ SELECT id, account, stream, date, file, min_ts, max_ts, records, original_size, 
             .inc();
 
         let cfg = get_config();
-        let max_size = cfg.compact.max_file_size as i64 * 95 / 100;
+        // include_oversize widens the fetch to full-size files so the
+        // caller's healing probe can see them (they are still excluded
+        // from merge grouping by the caller — see merge_by_stream)
+        let max_size = if include_oversize {
+            i64::MAX
+        } else {
+            cfg.compact.max_file_size as i64 * 95 / 100
+        };
         let sql = r#"
 SELECT id, account, stream, date, file, min_ts, max_ts, records, original_size, compressed_size, index_size, bloom_ver, flattened
     FROM file_list
@@ -641,7 +618,7 @@ SELECT id, account, stream, date, file, min_ts, max_ts, records, original_size, 
             .inc();
 
         let sql = r#"
-SELECT id, account, stream, date, file, records, index_size FROM file_list WHERE stream = $1 AND date = $2 AND index_size > 0 AND bloom_ver = 0;
+SELECT id, account, stream, date, file, records, index_size, compressed_size FROM file_list WHERE stream = $1 AND date = $2 AND index_size > 0 AND bloom_ver = 0;
                 "#;
         let ret = sqlx::query_as::<_, super::FileRecord>(sql)
             .bind(stream_key)
@@ -653,6 +630,30 @@ SELECT id, account, stream, date, file, records, index_size FROM file_list WHERE
             .with_label_values(&["query_for_bloom", "file_list"])
             .observe(time);
         Ok(ret?.iter().map(|r| r.into()).collect())
+    }
+
+    async fn query_bloom_pending_buckets(
+        &self,
+        before_date: &str,
+        limit: i64,
+    ) -> Result<Vec<(String, String)>> {
+        let start = std::time::Instant::now();
+        let pool = CLIENT_RO.clone();
+        DB_QUERY_NUMS
+            .with_label_values(&["query_bloom_pending_buckets", "file_list"])
+            .inc();
+        let sql = r#"
+SELECT stream, date FROM file_list WHERE index_size > 0 AND bloom_ver = 0 AND date < $1 GROUP BY stream, date ORDER BY date DESC LIMIT $2;
+                "#;
+        let ret: Vec<(String, String)> = sqlx::query_as::<_, (String, String)>(sql)
+            .bind(before_date)
+            .bind(limit)
+            .fetch_all(&pool)
+            .await?;
+        DB_QUERY_TIME
+            .with_label_values(&["query_bloom_pending_buckets", "file_list"])
+            .observe(start.elapsed().as_secs_f64());
+        Ok(ret)
     }
 
     async fn query_by_ids(
@@ -1307,12 +1308,24 @@ DO UPDATE SET
         match
             sqlx
                 ::query(
-                    "INSERT INTO file_list_jobs (org, stream, offsets, status, node, started_at, updated_at) VALUES ($1, $2, $3, $4, '', 0, 0) ON CONFLICT DO NOTHING;"
+                    // A DONE row for this (stream, hour) must NOT block the
+                    // insert: an hour whose job ran while the hour was still
+                    // OPEN completed WITHOUT sealing it (incremental rounds
+                    // carry their remainder), so the closed hour needs a fresh
+                    // run. DO NOTHING stranded such hours at ~1250 files until
+                    // the row aged out via job_clean_wait_time (prod
+                    // 2026-07-30: 15-20x query file fan-out). Resurrect the
+                    // row to Pending instead; PENDING and RUNNING rows are
+                    // left alone (a worker may hold the latter).
+                    "INSERT INTO file_list_jobs (org, stream, offsets, status, node, started_at, updated_at) VALUES ($1, $2, $3, $4, '', 0, 0) \
+                     ON CONFLICT (stream, offsets) DO UPDATE SET status = $4, node = '', started_at = 0 \
+                     WHERE file_list_jobs.status = $5;"
                 )
                 .bind(org_id)
                 .bind(&stream_key)
                 .bind(offset)
                 .bind(super::FileListJobStatus::Pending)
+                .bind(super::FileListJobStatus::Done)
                 .execute(&mut *tx).await
         {
             Err(sqlx::Error::Database(e)) => if !e.is_unique_violation() {
@@ -1404,17 +1417,18 @@ DO UPDATE SET
             .with_label_values(&["select", "file_list_jobs"])
             .inc();
 
-        // get pending jobs group by stream and order by num desc
+        // Claim the OLDEST pending jobs regardless of stream. The old
+        // normal-mode claim (GROUP BY stream, max(id), ORDER BY count) took
+        // ONE job per stream per pull and NEWEST first — a single hot stream
+        // (traces) fed the fleet one hour-job per pull cycle while a backlog's
+        // old hours starved behind fresh ones. Hour-jobs of one stream are
+        // independent (distinct hour partitions; single-node already runs
+        // several concurrently), so cross-node fan-out is safe; the advisory
+        // lock still serializes claiming itself.
         let sql = if fast_mode {
             r#"SELECT stream, id, 0::BIGINT AS num FROM file_list_jobs WHERE status = $1 ORDER BY offsets DESC LIMIT $2;"#
         } else {
-            r#"
-    SELECT stream, max(id) as id, COUNT(*)::BIGINT AS num
-        FROM file_list_jobs
-        WHERE status = $1
-        GROUP BY stream
-        ORDER BY num DESC
-        LIMIT $2;"#
+            r#"SELECT stream, id, 0::BIGINT AS num FROM file_list_jobs WHERE status = $1 ORDER BY id ASC LIMIT $2;"#
         };
         let ret = match sqlx::query_as::<_, super::MergeJobPendingRecord>(sql)
             .bind(super::FileListJobStatus::Pending)
@@ -1568,6 +1582,23 @@ DO UPDATE SET
             .execute(&pool)
             .await?;
         Ok(())
+    }
+
+    async fn confirm_job_ownership(&self, id: i64, node: &str) -> Result<bool> {
+        let pool = CLIENT.clone();
+        DB_QUERY_NUMS
+            .with_label_values(&["update", "file_list_jobs"])
+            .inc();
+        let ret = sqlx::query(
+            r#"UPDATE file_list_jobs SET updated_at = $1 WHERE id = $2 AND node = $3 AND status = $4;"#,
+        )
+        .bind(config::utils::time::now_micros())
+        .bind(id)
+        .bind(node)
+        .bind(super::FileListJobStatus::Running)
+        .execute(&pool)
+        .await?;
+        Ok(ret.rows_affected() > 0)
     }
 
     async fn check_running_jobs(&self, before_date: i64) -> Result<()> {
@@ -1920,15 +1951,11 @@ WHERE org = $1 AND account = $2;"#;
         DB_QUERY_NUMS
             .with_label_values(&["insert", "file_list_deleted"])
             .inc();
-        sqlx::query(
-            r#"INSERT INTO file_list_deleted (account, org, stream, date, file, index_file, flattened, created_at)
-               SELECT account, org, stream, date, file, index_file, flattened, $2
-               FROM file_list WHERE org = $1;"#,
-        )
-        .bind(org_id)
-        .bind(created_at)
-        .execute(&mut *tx)
-        .await?;
+        sqlx::query(super::MOVE_FILE_LIST_TO_DELETED_SQL)
+            .bind(org_id)
+            .bind(created_at)
+            .execute(&mut *tx)
+            .await?;
         DB_QUERY_NUMS
             .with_label_values(&["delete", "file_list"])
             .inc();
@@ -1949,6 +1976,7 @@ impl PostgresFileList {
         file: &str,
         meta: &FileMeta,
     ) -> Result<i64> {
+        super::validate_file_meta_for_add(file, meta)?;
         let now_ts = now_micros();
         let pool = CLIENT.clone();
         let (stream_key, date_key, file_name) =
@@ -2003,66 +2031,20 @@ INSERT INTO {table} (account, org, stream, date, file, deleted, min_ts, max_ts, 
             return Ok(());
         }
 
-        let pool = CLIENT.clone();
+        // pre-SQL gate: see `prepare_batch_add` — one bad add fails the
+        // whole batch before any statement (or partition DDL) runs
+        let add_rows = super::prepare_batch_add(files)?;
 
-        // Ensure partitions exist for all distinct date keys before batch INSERT
-        let add_items = files.iter().filter(|v| !v.deleted).collect::<Vec<_>>();
-        if !add_items.is_empty() {
-            let mut date_keys = HashSet::new();
-            for item in &add_items {
-                if let Ok((_, date_key, _)) = parse_file_key_columns(&item.key) {
-                    date_keys.insert(date_key);
-                }
-            }
-            for date_key in date_keys.iter() {
-                ensure_file_list_partition(&pool, table, date_key).await?;
-            }
-        }
+        let pool = CLIENT.clone();
+        ensure_batch_add_partitions(&pool, table, &add_rows).await?;
 
         let mut tx = pool.begin().await?;
 
-        if !add_items.is_empty() {
-            let chunks = add_items.chunks(100);
-            for files in chunks {
-                let now_ts = now_micros();
-                let mut query_builder: QueryBuilder<Postgres> = QueryBuilder::new(
-                format!("INSERT INTO {table} (account, org, stream, date, file, deleted, min_ts, max_ts, records, original_size, compressed_size, index_size, bloom_ver, flattened, updated_at)").as_str()
-                );
-                query_builder.push_values(files, |mut b, item| {
-                    let Ok((stream_key, date_key, file_name)) = parse_file_key_columns(&item.key)
-                    else {
-                        log::error!("[POSTGRES] parse file key failed for file: {}", item.key);
-                        return;
-                    };
-                    let org_id = stream_key[..stream_key.find('/').unwrap()].to_string();
-                    if item.meta.min_ts == 0 || item.meta.max_ts == 0 {
-                        log::warn!("[POSTGRES] min_ts or max_ts is 0 for file: {}", item.key);
-                        return;
-                    }
-                    b.push_bind(&item.account)
-                        .push_bind(org_id)
-                        .push_bind(stream_key)
-                        .push_bind(date_key)
-                        .push_bind(file_name)
-                        .push_bind(false)
-                        .push_bind(item.meta.min_ts)
-                        .push_bind(item.meta.max_ts)
-                        .push_bind(item.meta.records)
-                        .push_bind(item.meta.original_size)
-                        .push_bind(item.meta.compressed_size)
-                        .push_bind(item.meta.index_size)
-                        .push_bind(item.meta.bloom_ver)
-                        .push_bind(item.meta.flattened)
-                        .push_bind(now_ts);
-                });
-                DB_QUERY_NUMS.with_label_values(&["insert", table]).inc();
-                if let Err(e) = query_builder.build().execute(&mut *tx).await {
-                    if let Err(e) = tx.rollback().await {
-                        log::error!("[POSTGRES] rollback {table} batch process for add error: {e}");
-                    }
-                    return Err(e.into());
-                }
+        if let Err(e) = batch_add_with_tx(&mut tx, table, &add_rows).await {
+            if let Err(e) = tx.rollback().await {
+                log::error!("[POSTGRES] rollback {table} batch process for add error: {e}");
             }
+            return Err(e);
         }
 
         // sort by file id and key to reduce locked table range
@@ -2144,6 +2126,67 @@ INSERT INTO {table} (account, org, stream, date, file, deleted, min_ts, max_ts, 
 
         Ok(())
     }
+}
+
+/// Ensure a partition exists for every date key in `rows`. MUST run before
+/// the batch transaction opens: partition DDL takes the parent-table lock,
+/// which must not be held for the transaction's life.
+pub(crate) async fn ensure_batch_add_partitions(
+    pool: &sqlx::Pool<Postgres>,
+    table: &str,
+    rows: &[super::BatchAddRow<'_>],
+) -> Result<()> {
+    let mut date_keys = HashSet::new();
+    for (_, _, _, date_key, _) in rows {
+        date_keys.insert(date_key.as_str());
+    }
+    for date_key in date_keys {
+        ensure_file_list_partition(pool, table, date_key).await?;
+    }
+    Ok(())
+}
+
+/// Add-side of the batch transaction, shared by `inner_batch_process` and
+/// `wal_segments::mark_built_with_files` so the INSERT stays single-source:
+/// chunked VALUES insert of pre-validated rows (`prepare_batch_add`) inside
+/// the caller's open transaction. The caller owns commit/rollback, and must
+/// have called [`ensure_batch_add_partitions`] BEFORE opening it. No
+/// conflict clause: a duplicate `(stream, date, file)` errors and fails the
+/// caller's whole transaction.
+pub(crate) async fn batch_add_with_tx(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    table: &str,
+    rows: &[super::BatchAddRow<'_>],
+) -> Result<()> {
+    for chunk in rows.chunks(100) {
+        let now_ts = now_micros();
+        let mut query_builder: QueryBuilder<Postgres> = QueryBuilder::new(
+            format!("INSERT INTO {table} (account, org, stream, date, file, deleted, min_ts, max_ts, records, original_size, compressed_size, index_size, bloom_ver, flattened, updated_at)").as_str()
+        );
+        query_builder.push_values(
+            chunk,
+            |mut b, (item, org_id, stream_key, date_key, file_name)| {
+                b.push_bind(&item.account)
+                    .push_bind(org_id)
+                    .push_bind(stream_key)
+                    .push_bind(date_key)
+                    .push_bind(file_name)
+                    .push_bind(false)
+                    .push_bind(item.meta.min_ts)
+                    .push_bind(item.meta.max_ts)
+                    .push_bind(item.meta.records)
+                    .push_bind(item.meta.original_size)
+                    .push_bind(item.meta.compressed_size)
+                    .push_bind(item.meta.index_size)
+                    .push_bind(item.meta.bloom_ver)
+                    .push_bind(item.meta.flattened)
+                    .push_bind(now_ts);
+            },
+        );
+        DB_QUERY_NUMS.with_label_values(&["insert", table]).inc();
+        query_builder.build().execute(&mut **tx).await?;
+    }
+    Ok(())
 }
 
 /// Derive date range for partition pruning from microsecond timestamps.
@@ -3631,6 +3674,7 @@ mod tests {
             id: 0,
             selection: None,
             row_group_size: None,
+            selection_exact: false,
         }
     }
 
@@ -3651,7 +3695,9 @@ mod tests {
     #[tokio::test]
     async fn test_postgres_file_list_new() {
         let postgres_file_list = PostgresFileList::new();
-        assert!(!std::ptr::eq(&postgres_file_list, &PostgresFileList::new()));
+        // zero-sized structs share addresses in release builds — pointer
+        // identity is meaningless; constructing it at all is the test
+        let _ = &postgres_file_list;
     }
 
     #[tokio::test]
@@ -3938,24 +3984,6 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "Requires test PostgreSQL database setup"]
-    async fn test_update_flattened() {
-        let pool = setup_test_db().await;
-        cleanup_test_data(&pool).await;
-
-        let postgres_list = PostgresFileList::new();
-        let meta = create_test_file_meta();
-        let file_key = "test_org/test_stream/logs/2021/01/01/pg_flatten_test.parquet";
-
-        // Add file first
-        let _ = postgres_list.add("test_account", file_key, &meta).await;
-
-        // Update flattened status
-        let _result = postgres_list.update_flattened(file_key, true).await;
-        // assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    #[ignore = "Requires test PostgreSQL database setup"]
     async fn test_update_compressed_size() {
         let pool = setup_test_db().await;
         cleanup_test_data(&pool).await;
@@ -4093,6 +4121,57 @@ mod tests {
             .inner_batch_process("file_list", &empty_files)
             .await;
         assert!(result.is_ok());
+    }
+
+    /// The malformed-SQL regression at the builder level: a degenerate add
+    /// item must reject the WHOLE batch — deterministically, before any SQL
+    /// or DB connection — never be skipped inside `push_values` (the skip
+    /// emitted an empty `()` VALUES tuple: "syntax error at or near )", and
+    /// with valid SQL it would have deleted the merge inputs while dropping
+    /// the output row). These run without a database: the rejection happens
+    /// before the pool is touched.
+    #[tokio::test]
+    async fn test_inner_batch_process_rejects_degenerate_add_before_sql() {
+        let postgres_list = PostgresFileList::new();
+
+        // the live shape: the merge output row with min_ts = 0
+        let mut poisoned = create_test_file_key(
+            "acc",
+            "files/default/logs/default/2026/07/24/10/7486616.vix",
+            false,
+        );
+        poisoned.meta.min_ts = 0;
+
+        let err = postgres_list
+            .inner_batch_process("file_list", std::slice::from_ref(&poisoned))
+            .await
+            .expect_err("degenerate meta must fail the batch");
+        assert!(
+            matches!(err, Error::InvalidFileMeta(_)),
+            "expected InvalidFileMeta, got: {err:?}"
+        );
+        assert!(err.is_deterministic_db_error());
+
+        // a healthy sibling does not rescue the batch: all-or-nothing
+        let healthy = create_test_file_key(
+            "acc",
+            "files/default/logs/default/2026/07/24/10/7486617.vix",
+            false,
+        );
+        let err = postgres_list
+            .inner_batch_process("file_list", &[healthy, poisoned])
+            .await
+            .expect_err("a mixed batch must fail as a whole");
+        assert!(matches!(err, Error::InvalidFileMeta(_)));
+
+        // an unparseable add key is equally deterministic
+        let bad_key = create_test_file_key("acc", "not-a-file-key", false);
+        let err = postgres_list
+            .inner_batch_process("file_list", &[bad_key])
+            .await
+            .expect_err("unparseable key must fail the batch");
+        assert!(matches!(err, Error::InvalidFileMeta(_)));
+        assert!(err.is_deterministic_db_error());
     }
 
     #[tokio::test]
@@ -4431,7 +4510,6 @@ mod tests {
                 "pg_query_stream",
                 PartitionTimeLevel::Daily,
                 time_range,
-                None,
             )
             .await;
 

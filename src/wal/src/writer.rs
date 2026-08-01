@@ -186,6 +186,55 @@ impl Writer {
         Ok(())
     }
 
+    /// Flush and put the file on stable storage, ignoring
+    /// `ZO_WAL_FSYNC_DISABLED`.
+    ///
+    /// That knob trades durability for throughput on the append path, where it
+    /// costs one fsync per ingest request. This call is for the points where
+    /// the file stops receiving writes -- rotation and shutdown -- and is about
+    /// to become the only durable record of a memtable that the persist chain
+    /// will delete it for. It runs at most once per wal file, so the knob has
+    /// nothing to save here.
+    pub fn sync_all(&mut self) -> Result<()> {
+        self.f.flush().context(FileSyncSnafu {
+            path: self.path.clone(),
+        })?;
+        self.f.get_ref().sync_all().context(FileSyncSnafu {
+            path: self.path.clone(),
+        })?;
+        self.synced = true;
+        Ok(())
+    }
+
+    /// First half of [`Writer::sync_all`] split for async callers: flush the
+    /// buffered bytes to the OS (cheap) and hand back an independent handle to
+    /// the same open file, so the caller can run the blocking `sync_all(2)` on
+    /// a blocking thread instead of stalling an async worker for the whole
+    /// flush. The durability point does not move as long as the caller keeps
+    /// the writer locked until the fsync returns: nothing can append between
+    /// the flush and the fsync, so the synced handle covers every byte ever
+    /// written.
+    ///
+    /// The writer still counts as unsynced until the caller confirms the fsync
+    /// with [`Writer::confirm_synced`]; skipping the confirmation only costs a
+    /// redundant sync later, never a lost one.
+    pub fn sync_all_split(&mut self) -> Result<File> {
+        self.f.flush().context(FileSyncSnafu {
+            path: self.path.clone(),
+        })?;
+        self.f.get_ref().try_clone().context(FileSyncSnafu {
+            path: self.path.clone(),
+        })
+    }
+
+    /// Second half of [`Writer::sync_all_split`]: record that the fsync on the
+    /// handle it returned completed successfully. Only call after the fsync
+    /// actually returned Ok, and only while the writer has stayed locked since
+    /// the split.
+    pub fn confirm_synced(&mut self) {
+        self.synced = true;
+    }
+
     pub fn close(&mut self) -> Result<()> {
         self.sync()
     }
@@ -340,6 +389,57 @@ mod tests {
         writer.sync().unwrap();
         let pos_after = writer.current_position().unwrap();
         assert!(pos_after > pos_before);
+    }
+
+    #[test]
+    fn test_writer_sync_all_flushes_regardless_of_the_fsync_knob() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sync_all.wal");
+        let p: &std::path::Path = path.as_path();
+        let (mut writer, _) = Writer::new(p, 0, 4096, None).unwrap();
+        writer.write(b"durable entry").unwrap();
+        assert!(!writer.synced);
+
+        writer.sync_all().unwrap();
+        assert!(writer.synced);
+        let (written, _) = writer.size();
+        assert!(std::fs::metadata(&path).unwrap().len() >= written as u64);
+
+        // repeat calls stay correct, and the buffered sync becomes a no-op
+        writer.sync_all().unwrap();
+        writer.sync().unwrap();
+        assert!(writer.synced);
+    }
+
+    #[test]
+    fn test_writer_sync_all_split_hands_the_fsync_to_another_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sync_split.wal");
+        let p: &std::path::Path = path.as_path();
+        let (mut writer, _) = Writer::new(p, 0, 4096, None).unwrap();
+        writer.write(b"durable entry").unwrap();
+        assert!(!writer.synced);
+
+        // the split flushes the buffer and returns a handle that a different
+        // thread can fsync -- the mechanism rotation uses to keep the fsync
+        // off the async worker
+        let handle = writer.sync_all_split().unwrap();
+        assert!(!writer.synced); // not synced until the fsync is confirmed
+        std::thread::spawn(move || handle.sync_all().unwrap())
+            .join()
+            .unwrap();
+        writer.confirm_synced();
+        assert!(writer.synced);
+
+        // the flush half already ran: everything written is visible in the file
+        let (written, _) = writer.size();
+        assert!(std::fs::metadata(&path).unwrap().len() >= written as u64);
+
+        // the writer keeps working after the split
+        writer.write(b"more").unwrap();
+        assert!(!writer.synced);
+        writer.sync_all().unwrap();
+        assert!(writer.synced);
     }
 
     #[test]

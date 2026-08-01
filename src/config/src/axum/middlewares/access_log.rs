@@ -98,6 +98,8 @@ where
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
         let start = Instant::now();
+        // health probes hit /healthz every few seconds; logging them is pure noise
+        let skip = req.uri().path() == "/healthz";
         let timestamp = Local::now()
             .format("[%d/%b/%YT%H:%M:%S%.3f %z]")
             .to_string();
@@ -171,6 +173,7 @@ where
             user_agent,
             request_headers,
             format: self.format.clone(),
+            skip,
         }
     }
 }
@@ -191,6 +194,7 @@ pin_project! {
         user_agent: String,
         request_headers: Vec<(String, String)>,
         format: String,
+        skip: bool,
     }
 }
 
@@ -205,6 +209,9 @@ where
 
         match this.inner.poll(cx) {
             Poll::Ready(result) => {
+                if *this.skip {
+                    return Poll::Ready(result);
+                }
                 let duration = this.start.elapsed();
                 let response_time_secs = duration.as_secs_f64();
                 let response_time_micros = duration.as_micros();

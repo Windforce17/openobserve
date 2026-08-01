@@ -37,7 +37,7 @@ use datafusion::{
 
 use crate::{
     datafusion::udf::histogram_udf::HISTOGRAM_UDF_NAME,
-    sql::visitor::histogram_interval::generate_histogram_interval,
+    sql::visitor::histogram_interval::resolve_histogram_interval,
 };
 
 /// Optimization rule that rewrite histogram to date_bin()
@@ -183,12 +183,13 @@ impl TreeNodeRewriter for HistogramToDatebin {
                     let new_func = Arc::new(ScalarUDF::from(DateBinFunc::new()));
                     // construct interval (date_bin arg #1)
                     let arg1 = if args.len() == 1 {
-                        let interval = if self.histogram_interval > 0 {
-                            format!("{} second", self.histogram_interval)
-                        } else {
-                            generate_histogram_interval((self.start_time, self.end_time))
-                                .to_string()
-                        };
+                        // the single shared 1-arg resolution: preset seconds
+                        // when the request carries histogram_interval, the
+                        // auto formula over the query range otherwise
+                        let interval = resolve_histogram_interval(
+                            (self.start_time, self.end_time),
+                            self.histogram_interval,
+                        );
                         cast(
                             Expr::Literal(ScalarValue::from(interval), None),
                             DataType::Interval(IntervalUnit::MonthDayNano),

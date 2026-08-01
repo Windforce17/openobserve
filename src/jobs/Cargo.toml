@@ -18,7 +18,6 @@ enterprise = [
 ]
 cloud = ["enterprise", "o2_enterprise/cloud", "openobserve-core/cloud"]
 vectorscan = ["openobserve-core/vectorscan"]
-vortex = ["openobserve-core/vortex"]
 
 [dependencies]
 openobserve-core.workspace = true
@@ -42,6 +41,7 @@ proto.workspace = true
 regex.workspace = true
 report_server.workspace = true
 reqwest.workspace = true
+segment_wal.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tonic.workspace = true

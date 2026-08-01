@@ -51,7 +51,8 @@ enum CacheStrategy {
 
 enum FileType {
     Parquet,
-    Ttv,
+    /// Puffin container — the envelope of `.vix` core files.
+    Puffin,
     Vortex,
 }
 
@@ -201,6 +202,16 @@ pub async fn download(
     }
 }
 
+/// Whether a storage key names a file_list-tracked stream data file (so a
+/// size mismatch must be reconciled against the file_list tables).
+///
+/// `.parquet`/`.vortex`/`.vix` are all data files — a core `.vix` IS the
+/// tracked stream file (its index is embedded; no sibling index objects
+/// exist).
+fn is_file_list_tracked_data_file(file: &str) -> bool {
+    file.ends_with(".parquet") || file.ends_with(".vortex") || file.ends_with(".vix")
+}
+
 async fn validate_file(bytes: &[u8], ftype: FileType) -> Result<(), anyhow::Error> {
     match ftype {
         FileType::Parquet => {
@@ -208,7 +219,7 @@ async fn validate_file(bytes: &[u8], ftype: FileType) -> Result<(), anyhow::Erro
             let mut reader = parquet::file::metadata::ParquetMetaDataReader::new();
             reader.try_parse(&b)?;
         }
-        FileType::Ttv => {
+        FileType::Puffin => {
             if bytes.len() < 12 {
                 return Err(anyhow::anyhow!("invalid puffin file"));
             }
@@ -299,19 +310,19 @@ async fn download_from_storage(
                 // so we check if the footer is valid. If it is, then the db entry is invalid
                 // and we reset it. If footer is invalid, the store has a corrupted file
                 // so we mark it as deleted, and return error.
-                // data files (parquet/vortex) are tracked in file_list, ttv index files are not
-                let is_data_file = file.ends_with(".parquet") || file.ends_with(".vortex");
+                let is_data_file = is_file_list_tracked_data_file(file);
                 let valid_parquet = file.ends_with(".parquet")
                     && validate_file(&data_bytes, FileType::Parquet).await.is_ok();
                 let valid_vortex = file.ends_with(".vortex")
                     && validate_file(&data_bytes, FileType::Vortex).await.is_ok();
-                let valid_ttv = file.ends_with(".ttv")
-                    && validate_file(&data_bytes, FileType::Ttv).await.is_ok();
-                if valid_parquet || valid_vortex || valid_ttv {
+                // core .vix data files are puffin containers
+                let valid_vix = file.ends_with(".vix")
+                    && validate_file(&data_bytes, FileType::Puffin).await.is_ok();
+                if valid_parquet || valid_vortex || valid_vix {
                     log::warn!(
                         "download file {file} found size mismatch, remote : {expected_blob_size}, db: {size}, correcting db as valid file",
                     );
-                    // only update for data files, not ttv files
+                    // only reconcile file_list-tracked data files
                     if is_data_file {
                         crate::file_list::update_compressed_size(file, data_len as i64).await?;
                         crate::file_list::LOCAL_CACHE
@@ -323,7 +334,7 @@ async fn download_from_storage(
                     log::warn!(
                         "download file {file} found corrupt file, remote: {expected_blob_size}, db: {size}, deleting entry from file_list "
                     );
-                    // only update for data files, not ttv files
+                    // only reconcile file_list-tracked data files
                     if is_data_file {
                         crate::file_list::remove(file).await?;
                         crate::file_list::LOCAL_CACHE.remove(file).await?;
@@ -508,6 +519,28 @@ fn get_file_time(file: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_is_file_list_tracked_data_file() {
+        // flat data files: always tracked
+        assert!(is_file_list_tracked_data_file(
+            "files/default/logs/b/2025/04/08/06/1.parquet"
+        ));
+        assert!(is_file_list_tracked_data_file(
+            "files/default/logs/b/2025/04/08/06/1.vortex"
+        ));
+        // v2 core files: a .vix IS the tracked stream file
+        assert!(is_file_list_tracked_data_file(
+            "files/default/logs/b/2025/04/08/06/1.vix"
+        ));
+        assert!(is_file_list_tracked_data_file(
+            "files/default/traces/b/2025/04/08/06/1.vix"
+        ));
+        // anything else is not
+        assert!(!is_file_list_tracked_data_file(
+            "files/default/logs/b/2025/04/08/06/1.json"
+        ));
+    }
 
     #[test]
     fn test_file_data_lru_cache_miss() {

@@ -330,6 +330,14 @@ pub async fn clear() -> Result<(), errors::Error> {
         .await
         .map_err(|e| Error::DbError(DbError::SeaORMError(e.to_string())))?;
 
+    // Keep the in-memory cache coherent with the table, like remove() and
+    // batch_remove() do — a stale entry here makes get() report an org that no
+    // longer exists (e.g. check_and_create_org then skips re-creating it).
+    {
+        let mut cache = CACHE.write().await;
+        cache.clear();
+    }
+
     Ok(())
 }
 

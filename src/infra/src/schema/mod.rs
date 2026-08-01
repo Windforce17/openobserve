@@ -21,17 +21,12 @@ use std::{
 use arc_swap::ArcSwap;
 use chrono::Utc;
 use config::{
-    ALL_VALUES_COL_NAME, BLOOM_FILTER_DEFAULT_FIELDS, ORIGINAL_DATA_COL_NAME, RwAHashMap,
-    RwHashMap, RwHashSet, SQL_FULL_TEXT_SEARCH_FIELDS, SQL_SECONDARY_INDEX_SEARCH_FIELDS,
-    get_config,
+    BLOOM_FILTER_DEFAULT_FIELDS, ID_COL_NAME, ORIGINAL_DATA_COL_NAME, RwAHashMap, RwHashMap,
+    RwHashSet, SQL_FULL_TEXT_SEARCH_FIELDS, TIMESTAMP_COL_NAME, get_config,
     ider::SnowflakeIdGenerator,
     meta::stream::{PartitionTimeLevel, StreamSettings, StreamType},
     stats::MemorySize,
-    utils::{
-        json,
-        schema_ext::SchemaExt,
-        time::{BASE_TIME, now_micros},
-    },
+    utils::{json, schema_ext::SchemaExt, time::now_micros},
 };
 use datafusion::arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
 use serde::Serialize;
@@ -342,25 +337,12 @@ pub fn get_partition_time_level(stream_type: StreamType) -> PartitionTimeLevel {
     }
 }
 
-pub fn get_stream_setting_defined_schema_fields(settings: &Option<StreamSettings>) -> Vec<String> {
-    settings
-        .as_ref()
-        .map(|settings| settings.defined_schema_fields.clone())
-        .unwrap_or_default()
-}
-
 pub fn get_stream_setting_fts_fields(settings: &Option<StreamSettings>) -> Vec<String> {
     let default_fields = SQL_FULL_TEXT_SEARCH_FIELDS.clone();
     match settings {
         Some(settings) => {
             let mut fields = settings.full_text_search_keys.clone();
             fields.extend(default_fields);
-            if settings.index_original_data {
-                fields.push(ORIGINAL_DATA_COL_NAME.to_string());
-            }
-            if settings.index_all_values {
-                fields.push(ALL_VALUES_COL_NAME.to_string());
-            }
             fields.sort();
             fields.dedup();
             fields
@@ -369,23 +351,30 @@ pub fn get_stream_setting_fts_fields(settings: &Option<StreamSettings>) -> Vec<S
     }
 }
 
-pub fn get_stream_setting_index_fields(settings: &Option<StreamSettings>) -> Vec<String> {
-    // Bloom filter is built on top of the secondary index, so every bloom
-    // field must also be a secondary-index field. Fold the default bloom
-    // fields into the index defaults here; the per-stream configured bloom
-    // fields are unioned in the `Some` branch below (defensive for settings
-    // persisted before bloom fields were merged into index_fields on update).
-    let mut default_fields = SQL_SECONDARY_INDEX_SEARCH_FIELDS.clone();
-    default_fields.extend(BLOOM_FILTER_DEFAULT_FIELDS.clone());
-    let mut fields = match settings {
-        Some(settings) => {
-            let mut fields = settings.index_fields.clone();
-            fields.extend(default_fields);
-            fields.extend(settings.bloom_filter_fields.clone());
-            fields
-        }
-        None => default_fields,
-    };
+/// String-family fields in `schema` that the `.vix` all-fields index
+/// term-indexes: every Utf8/LargeUtf8/Utf8View column except the internal
+/// `_timestamp`/`_o2_id`/`_original` columns.
+pub fn get_schema_index_fields(schema: &Schema) -> Vec<String> {
+    schema
+        .fields()
+        .iter()
+        .filter(|f| {
+            matches!(
+                f.data_type(),
+                DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+            ) && f.name() != TIMESTAMP_COL_NAME
+                && f.name() != ID_COL_NAME
+                && f.name() != ORIGINAL_DATA_COL_NAME
+        })
+        .map(|f| f.name().clone())
+        .collect()
+}
+
+/// Column-store (secondary index) fields configured on the stream.
+/// No default fields are unioned in — this is exactly the per-stream
+/// configured list, deduped and sorted.
+pub fn get_stream_setting_column_store_fields(settings: &StreamSettings) -> Vec<String> {
+    let mut fields = settings.column_store_fields.clone();
     fields.sort();
     fields.dedup();
     fields
@@ -403,42 +392,6 @@ pub fn get_stream_setting_bloom_filter_fields(settings: &Option<StreamSettings>)
         }
         None => default_fields,
     }
-}
-
-pub fn get_stream_setting_index_updated_at_for_fields(
-    settings: &Option<StreamSettings>,
-    created_at: Option<i64>,
-    fields: &[String],
-) -> i64 {
-    if fields.is_empty() {
-        return 0;
-    }
-    let created_at = match created_at {
-        Some(created_at) => created_at,
-        None => {
-            log::warn!("created_at not found in schema metadata");
-            Utc::now().timestamp_micros()
-        }
-    };
-    let default_updated_at = match settings {
-        Some(settings) if settings.index_updated_at > 0 => settings.index_updated_at,
-        _ => created_at,
-    };
-    fields
-        .iter()
-        .map(|f| {
-            if SQL_SECONDARY_INDEX_SEARCH_FIELDS.contains(f) {
-                BASE_TIME.timestamp_micros()
-            } else {
-                settings
-                    .as_ref()
-                    .and_then(|s| s.index_fields_updated_at.get(f))
-                    .copied()
-                    .unwrap_or(default_updated_at)
-            }
-        })
-        .max()
-        .unwrap_or(default_updated_at)
 }
 
 pub async fn merge(
@@ -669,11 +622,7 @@ pub async fn delete_fields(
                 })
                 .collect::<Vec<_>>();
 
-            let mut settings = unwrap_stream_settings(&latest_schema).unwrap_or_default();
-
-            settings
-                .defined_schema_fields
-                .retain(|f| !deleted_fields.contains(f));
+            let settings = unwrap_stream_settings(&latest_schema).unwrap_or_default();
 
             new_metadata.insert("settings".to_string(), json::to_string(&settings).unwrap());
             let new_schema = vec![Schema::new_with_metadata(fields, new_metadata)];
@@ -1048,32 +997,15 @@ mod tests {
     }
 
     #[test]
-    fn test_get_stream_setting_defined_schema_fields() {
-        // Test with None
-        let fields = get_stream_setting_defined_schema_fields(&None);
-        assert!(fields.is_empty());
-
-        // Test with Some settings
-        let mut settings = StreamSettings::default();
-        settings.defined_schema_fields = vec!["field1".to_string(), "field2".to_string()];
-        let fields = get_stream_setting_defined_schema_fields(&Some(settings));
-        assert_eq!(fields.len(), 2);
-        assert!(fields.contains(&"field1".to_string()));
-        assert!(fields.contains(&"field2".to_string()));
-    }
-
-    #[test]
     fn test_get_stream_setting_fts_fields_with_settings() {
         // Test with custom FTS fields
         let mut settings = StreamSettings::default();
         settings.full_text_search_keys = vec!["custom_field".to_string()];
-        settings.index_original_data = true;
-        settings.index_all_values = true;
 
         let fields = get_stream_setting_fts_fields(&Some(settings));
         assert!(fields.contains(&"custom_field".to_string()));
-        assert!(fields.contains(&ORIGINAL_DATA_COL_NAME.to_string()));
-        assert!(fields.contains(&ALL_VALUES_COL_NAME.to_string()));
+        // internal columns are never injected anymore
+        assert!(!fields.contains(&ORIGINAL_DATA_COL_NAME.to_string()));
 
         // Verify no duplicates
         let unique_count = fields.iter().collect::<hashbrown::HashSet<_>>().len();
@@ -1081,21 +1013,20 @@ mod tests {
     }
 
     #[test]
-    fn test_get_stream_setting_index_fields() {
-        // Test with None
-        let fields = get_stream_setting_index_fields(&None);
-        assert!(!fields.is_empty()); // Should have default fields
-
-        // Test with custom index fields
-        let mut settings = StreamSettings::default();
-        settings.index_fields = vec!["index_field1".to_string(), "index_field2".to_string()];
-        let fields = get_stream_setting_index_fields(&Some(settings));
-        assert!(fields.contains(&"index_field1".to_string()));
-        assert!(fields.contains(&"index_field2".to_string()));
-
-        // Verify no duplicates
-        let unique_count = fields.iter().collect::<hashbrown::HashSet<_>>().len();
-        assert_eq!(unique_count, fields.len());
+    fn test_get_schema_index_fields() {
+        let schema = Schema::new(vec![
+            Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+            Field::new(ID_COL_NAME, DataType::Utf8, true),
+            Field::new(ORIGINAL_DATA_COL_NAME, DataType::Utf8, true),
+            Field::new("service_name", DataType::Utf8, true),
+            Field::new("message", DataType::Utf8View, true),
+            Field::new("code", DataType::Int64, true),
+        ]);
+        let fields = get_schema_index_fields(&schema);
+        assert_eq!(
+            fields,
+            vec!["service_name".to_string(), "message".to_string()]
+        );
     }
 
     #[test]
@@ -1114,69 +1045,6 @@ mod tests {
         // Verify no duplicates
         let unique_count = fields.iter().collect::<hashbrown::HashSet<_>>().len();
         assert_eq!(unique_count, fields.len());
-    }
-
-    #[test]
-    fn test_get_stream_setting_index_updated_at_for_fields() {
-        let base_time = BASE_TIME.timestamp_micros();
-        let created_at = 1_700_000_000_000_000;
-        let mut settings = StreamSettings::default();
-        settings.index_updated_at = 1_750_000_000_000_000;
-        settings
-            .index_fields_updated_at
-            .insert("user_id".to_string(), 1_760_000_000_000_000);
-        let settings = Some(settings);
-
-        // no referenced fields -> no cutoff
-        let fields = Vec::new();
-        let result =
-            get_stream_setting_index_updated_at_for_fields(&settings, Some(created_at), &fields);
-        assert_eq!(result, 0);
-
-        // a field with its own entry uses it
-        let fields = vec!["user_id".to_string()];
-        let result =
-            get_stream_setting_index_updated_at_for_fields(&settings, Some(created_at), &fields);
-        assert_eq!(result, 1_760_000_000_000_000);
-
-        // a field without an entry falls back to the stream-level value
-        let fields = vec!["level".to_string()];
-        let result =
-            get_stream_setting_index_updated_at_for_fields(&settings, Some(created_at), &fields);
-        assert_eq!(result, 1_750_000_000_000_000);
-
-        // multiple fields use the max
-        let fields = vec!["user_id".to_string(), "level".to_string()];
-        let result =
-            get_stream_setting_index_updated_at_for_fields(&settings, Some(created_at), &fields);
-        assert_eq!(result, 1_760_000_000_000_000);
-
-        // None settings falls back to created_at
-        let fields = vec!["user_id".to_string()];
-        let result =
-            get_stream_setting_index_updated_at_for_fields(&None, Some(created_at), &fields);
-        assert_eq!(result, created_at);
-
-        // default-enabled index fields always resolve to BASE_TIME, even with an entry
-        let mut settings = settings.unwrap();
-        settings
-            .index_fields_updated_at
-            .insert("trace_id".to_string(), 1_760_000_000_000_000);
-        let settings = Some(settings);
-        let fields = vec!["trace_id".to_string()];
-        let result =
-            get_stream_setting_index_updated_at_for_fields(&settings, Some(created_at), &fields);
-        assert_eq!(result, base_time);
-        let fields = vec!["service_name".to_string()];
-        let result =
-            get_stream_setting_index_updated_at_for_fields(&None, Some(created_at), &fields);
-        assert_eq!(result, base_time);
-
-        // a default field combined with a configured field still uses the max
-        let fields = vec!["trace_id".to_string(), "user_id".to_string()];
-        let result =
-            get_stream_setting_index_updated_at_for_fields(&settings, Some(created_at), &fields);
-        assert_eq!(result, 1_760_000_000_000_000);
     }
 
     #[test]

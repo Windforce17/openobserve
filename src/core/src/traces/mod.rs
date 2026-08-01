@@ -85,10 +85,13 @@ use crate::{
 
 const SERVICE_NAME: &str = "service.name";
 const SERVICE: &str = "service";
+const TRACE_ID_COL_NAME: &str = "trace_id";
+/// ingest-error label for a span whose `trace_id` is missing or not a string
+const TRACE_ID_INVALID: &str = "invalid_trace_id";
 const PARENT_SPAN_ID: &str = "reference.parent_span_id";
 const PARENT_TRACE_ID: &str = "reference.parent_trace_id";
 const REF_TYPE: &str = "reference.ref_type";
-const RESERVED_SPAN_FIELDS: [&str; 16] = [
+const RESERVED_SPAN_FIELDS: [&str; 17] = [
     "trace_id",
     "span_id",
     "flags",
@@ -105,6 +108,10 @@ const RESERVED_SPAN_FIELDS: [&str; 16] = [
     "events",
     "links",
     TIMESTAMP_COL_NAME,
+    // the serialized-record column of core `.vix` files: a span attribute
+    // with this name would be silently lost by the move job's `_source`
+    // synthesis, so it takes the usual `attr_` prefix instead
+    vortex_index::SOURCE_COL_NAME,
 ];
 // ref https://opentelemetry.io/docs/specs/otel/trace/api/#retrieving-the-traceid-and-spanid
 const SPAN_ID_BYTES_COUNT: usize = 8;
@@ -414,20 +421,6 @@ pub async fn handle_otlp_request(
     let mut stream_pipeline_inputs = Vec::new();
     // End pipeline params construction
 
-    // Start get user defined schema
-    let mut user_defined_schema_map: HashMap<String, Option<HashSet<String>>> =
-        HashMap::with_capacity(1);
-    let mut streams_need_original_map: HashMap<String, bool> = HashMap::with_capacity(1);
-    let mut streams_need_all_values_map: HashMap<String, bool> = HashMap::with_capacity(1);
-    crate::service::ingestion::get_uds_and_original_data_streams(
-        std::slice::from_ref(&stream_param),
-        &mut user_defined_schema_map,
-        &mut streams_need_original_map,
-        &mut streams_need_all_values_map,
-    )
-    .await;
-    // End get user defined schema
-
     let mut service_name: String = traces_stream_name.to_string();
     let res_spans = request.resource_spans;
     let mut json_data_by_stream = HashMap::new();
@@ -673,7 +666,6 @@ pub async fn handle_otlp_request(
                 } else if !finalize_and_buffer_trace_span(
                     value,
                     org_id,
-                    &user_defined_schema_map,
                     &traces_stream_name,
                     &gen_ai_agent_mapping_config,
                     &mut partial_success,
@@ -798,12 +790,6 @@ pub async fn handle_otlp_request(
                                 &mut agent_observations,
                             );
 
-                            if let Some(Some(fields)) =
-                                user_defined_schema_map.get(&stream_params.stream_name.to_string())
-                            {
-                                record_val =
-                                    crate::service::ingestion::refactor_map(record_val, fields);
-                            }
                             restore_canonical_agent_fields(&mut record_val, canonical_agent_fields);
 
                             log::debug!(
@@ -849,7 +835,6 @@ pub async fn handle_otlp_request(
                 let _ = finalize_and_buffer_trace_span(
                     value.clone(),
                     org_id,
-                    &user_defined_schema_map,
                     &traces_stream_name,
                     &gen_ai_agent_mapping_config,
                     &mut partial_success,
@@ -870,16 +855,14 @@ pub async fn handle_otlp_request(
         (started_at, &start),
         json_data_by_stream,
         &user.to_email(),
+        &mut partial_success,
     )
     .await
     {
         log::error!("Error while writing traces: {e}");
-        // Check if this is a schema validation error (InvalidData)
-        let status_code = if e.kind() == std::io::ErrorKind::InvalidData {
-            http::StatusCode::BAD_REQUEST
-        } else {
-            http::StatusCode::INTERNAL_SERVER_ERROR
-        };
+        // 400 for schema-validation errors, 503 for backpressure (retryable),
+        // 500 otherwise — see write_error_status
+        let status_code = write_error_status(&e);
         return Ok((
             status_code,
             [(ERROR_HEADER, format!("error while writing trace data: {e}"))],
@@ -923,15 +906,14 @@ pub async fn handle_otlp_request(
     format_response(partial_success, req_type)
 }
 
-/// Finalize a trace span (flatten, normalize LLM field types, apply UDS)
-/// and push it into `json_data_by_stream`.
+/// Finalize a trace span (flatten, normalize LLM field types) and push it
+/// into `json_data_by_stream`.
 ///
 /// Returns `true` on success, `false` when the span should be skipped.
 #[allow(clippy::too_many_arguments)]
 fn finalize_and_buffer_trace_span(
     mut value: json::Value,
     org_id: &str,
-    user_defined_schema_map: &HashMap<String, Option<HashSet<String>>>,
     traces_stream_name: &str,
     gen_ai_agent_mapping_config: &GenAiAgentMappingConfig,
     partial_success: &mut ExportTracePartialSuccess,
@@ -969,9 +951,6 @@ fn finalize_and_buffer_trace_span(
         gen_ai_agent_mapping_config,
         agent_observations,
     );
-    if let Some(Some(fields)) = user_defined_schema_map.get(traces_stream_name) {
-        record_val = crate::service::ingestion::refactor_map(record_val, fields);
-    }
     restore_canonical_agent_fields(&mut record_val, canonical_agent_fields);
     let (ts_data, _) = json_data_by_stream
         .entry(traces_stream_name.to_string())
@@ -1163,16 +1142,14 @@ pub async fn ingest_json(
         (started_at, &start),
         json_data_by_stream,
         &user.to_email(),
+        &mut partial_success,
     )
     .await
     {
         log::error!("Error while writing traces: {e}");
-        // Check if this is a schema validation error (InvalidData)
-        let status_code = if e.kind() == std::io::ErrorKind::InvalidData {
-            http::StatusCode::BAD_REQUEST
-        } else {
-            http::StatusCode::INTERNAL_SERVER_ERROR
-        };
+        // 400 for schema-validation errors, 503 for backpressure (retryable),
+        // 500 otherwise — see write_error_status
+        let status_code = write_error_status(&e);
         return Ok((
             status_code,
             [(ERROR_HEADER, format!("error while writing trace data: {e}"))],
@@ -1263,11 +1240,34 @@ fn format_response(
     }
 }
 
+/// The HTTP status for a failed trace write: schema-validation errors are the
+/// caller's fault (400); backpressure — carried as the [`infra::errors::Error`]
+/// source that `write_traces` preserves — is retryable (503, which the gRPC
+/// handler maps to UNAVAILABLE so collectors back off and retry); anything
+/// else is a 500. Never a 2xx: the spans were not stored.
+fn write_error_status(e: &std::io::Error) -> http::StatusCode {
+    if e.kind() == std::io::ErrorKind::InvalidData {
+        return http::StatusCode::BAD_REQUEST;
+    }
+    let backpressure = e.get_ref().is_some_and(|source| {
+        matches!(
+            source.downcast_ref::<infra::errors::Error>(),
+            Some(infra::errors::Error::ResourceError(_))
+        )
+    });
+    if backpressure {
+        http::StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        http::StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
+
 async fn write_traces_by_stream(
     org_id: &str,
     time_stats: (i64, &Instant),
     json_data_by_stream: HashMap<String, O2IngestJsonData>,
     user_email: &str,
+    partial_success: &mut ExportTracePartialSuccess,
 ) -> Result<(), Error> {
     for (traces_stream_name, (json_data, fn_num)) in json_data_by_stream {
         // for cloud, we want to sent event when user creates a new stream
@@ -1292,12 +1292,13 @@ async fn write_traces_by_stream(
             .await;
         }
 
-        let mut req_stats = match write_traces(org_id, &traces_stream_name, json_data).await {
-            Ok(v) => v,
-            Err(e) => {
-                return Err(e);
-            }
-        };
+        let mut req_stats =
+            match write_traces(org_id, &traces_stream_name, json_data, partial_success).await {
+                Ok(v) => v,
+                Err(e) => {
+                    return Err(e);
+                }
+            };
         let time = time_stats.1.elapsed().as_secs_f64();
         req_stats.response_time = time;
         req_stats.user_email = if user_email.is_empty() {
@@ -1320,10 +1321,24 @@ async fn write_traces_by_stream(
     Ok(())
 }
 
+/// The `trace_id` of a span record. It is user-supplied on the json ingest
+/// path and a pipeline can re-type it, so a non-string form is a per-span
+/// error — never a panic that unwinds the whole request.
+fn record_trace_id(record: &json::Map<String, json::Value>) -> Result<String, String> {
+    match record.get(TRACE_ID_COL_NAME) {
+        Some(json::Value::String(trace_id)) => Ok(trace_id.to_owned()),
+        None => Err(format!("missing {TRACE_ID_COL_NAME}")),
+        Some(other) => Err(format!(
+            "invalid {TRACE_ID_COL_NAME}: expected a string, got {other}"
+        )),
+    }
+}
+
 async fn write_traces(
     org_id: &str,
     stream_name: &str,
     json_data: Vec<(i64, json::Map<String, json::Value>)>,
+    partial_success: &mut ExportTracePartialSuccess,
 ) -> Result<RequestStats, Error> {
     let cfg = get_config();
     // get schema and stream settings
@@ -1402,6 +1417,26 @@ async fn write_traces(
 
     // Start write data
     for (timestamp, record_val) in json_data {
+        // `trace_id` is user-supplied on the json ingest path and a pipeline
+        // can re-type it: a non-string form rejects that span alone, it never
+        // unwinds the request.
+        let trace_id = match record_trace_id(&record_val) {
+            Ok(trace_id) => trace_id,
+            Err(reason) => {
+                log::warn!("[TRACES] {org_id}/{stream_name}: span rejected: {reason}");
+                metrics::INGEST_ERRORS
+                    .with_label_values(&[
+                        org_id,
+                        StreamType::Traces.as_str(),
+                        stream_name,
+                        TRACE_ID_INVALID,
+                    ])
+                    .inc();
+                partial_success.rejected_spans += 1;
+                continue;
+            }
+        };
+
         // get service_name
         let service_name = record_val
             .get("service_name")
@@ -1430,12 +1465,6 @@ async fn write_traces(
         }
 
         // build trace metadata
-        let trace_id = record_val
-            .get("trace_id")
-            .unwrap()
-            .as_str()
-            .unwrap()
-            .to_string();
         trace_index_values.push(MetadataItem::TraceListIndexer(TraceListItem {
             _timestamp: timestamp,
             stream_name: stream_name.to_string(),
@@ -1512,7 +1541,12 @@ async fn write_traces(
     .await
     .map_err(|e| {
         log::error!("Error while writing traces: {e}");
-        std::io::Error::other(e.to_string())
+        // keep the infra error as the SOURCE (not a string): the callers
+        // downcast it to tell retryable backpressure (ResourceError -> 503)
+        // from a permanent write failure (500). Erasing the kind here made
+        // every trace backpressure surface as INTERNAL, which OTLP
+        // collectors do not retry.
+        std::io::Error::other(e)
     })?;
 
     // send distinct_values
@@ -1571,7 +1605,66 @@ mod tests {
     use config::utils::json::json;
     use opentelemetry_proto::tonic::trace::v1::{Status, status::StatusCode};
 
+    use super::record_trace_id;
     use crate::service::ingestion::grpc::get_val_for_attr;
+
+    /// The write-failure status keeps the error KIND: backpressure (the
+    /// preserved infra ResourceError source) is a retryable 503 — which the
+    /// gRPC handler maps to UNAVAILABLE so collectors retry — schema
+    /// validation stays 400, anything else 500.
+    #[test]
+    fn test_write_error_status_keeps_backpressure_retryable() {
+        let backpressure = std::io::Error::other(infra::errors::Error::ResourceError(
+            "memtable is full".to_string(),
+        ));
+        assert_eq!(
+            super::write_error_status(&backpressure),
+            http::StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        let invalid = std::io::Error::new(std::io::ErrorKind::InvalidData, "bad schema");
+        assert_eq!(
+            super::write_error_status(&invalid),
+            http::StatusCode::BAD_REQUEST
+        );
+
+        let other = std::io::Error::other(infra::errors::Error::IngestionError(
+            "disk full".to_string(),
+        ));
+        assert_eq!(
+            super::write_error_status(&other),
+            http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        // a string-erased error (no typed source) stays 500: the status must
+        // never guess backpressure from message text
+        let stringly = std::io::Error::other("memtable is full".to_string());
+        assert_eq!(
+            super::write_error_status(&stringly),
+            http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    /// `trace_id` is user-supplied on the json ingest path: a numeric or null
+    /// form used to hit `.as_str().unwrap()` and unwind the whole request,
+    /// losing every span in the batch. It is now a per-span rejection.
+    #[test]
+    fn test_record_trace_id_non_string_is_an_error() {
+        let record = |v: config::utils::json::Value| match json!({ "trace_id": v }) {
+            config::utils::json::Value::Object(map) => map,
+            _ => unreachable!(),
+        };
+
+        assert_eq!(
+            record_trace_id(&record(json!("abc123"))),
+            Ok("abc123".to_string())
+        );
+        assert!(record_trace_id(&record(json!(42))).is_err());
+        assert!(record_trace_id(&record(json!(null))).is_err());
+        assert!(record_trace_id(&record(json!({"a": 1}))).is_err());
+        // a span with no trace_id at all is rejected too, not panicked on
+        assert!(record_trace_id(&config::utils::json::Map::new()).is_err());
+    }
 
     #[test]
     fn test_get_val_for_attr() {
@@ -1885,8 +1978,11 @@ mod tests {
     #[test]
     fn test_reserved_span_fields() {
         let reserved_span_fields = &super::RESERVED_SPAN_FIELDS;
-        assert_eq!(reserved_span_fields.len(), 16);
+        assert_eq!(reserved_span_fields.len(), 17);
         assert!(reserved_span_fields.contains(&"_timestamp"));
+        // the core-file serialized-record column: a user span attribute
+        // named `_source` gets the attr_ prefix instead of colliding
+        assert!(reserved_span_fields.contains(&"_source"));
         assert!(reserved_span_fields.contains(&"duration"));
         assert!(reserved_span_fields.contains(&"start_time"));
         assert!(reserved_span_fields.contains(&"end_time"));
@@ -2296,11 +2392,18 @@ mod tests {
 
         use config::utils::json;
 
+        // v2 flattening keeps dots: `service.version` and `service_version`
+        // are DISTINCT fields now, so there is no collision to avoid
         let mut service_att_map: HashMap<String, json::Value> = HashMap::new();
         service_att_map.insert("service.version".to_string(), json!("1.0.0"));
-
         let key = super::span_attribute_key("service_version".to_string(), &service_att_map);
+        assert_eq!(key, "service_version");
 
+        // keys that still normalize to the same field keep the guard
+        // (`-` degrades to `_` in every mode)
+        let mut service_att_map: HashMap<String, json::Value> = HashMap::new();
+        service_att_map.insert("service-version".to_string(), json!("1.0.0"));
+        let key = super::span_attribute_key("service_version".to_string(), &service_att_map);
         assert_eq!(key, "attr_service_version");
     }
 

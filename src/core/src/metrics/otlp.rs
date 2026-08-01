@@ -13,11 +13,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::{
-    collections::{HashMap, HashSet},
-    io::Error,
-    sync::Arc,
-};
+use std::{collections::HashMap, io::Error, sync::Arc};
 
 use axum::{
     Json, http,
@@ -162,12 +158,6 @@ pub async fn handle_otlp_request(
     let mut metric_schema_map: HashMap<String, SchemaCache> = HashMap::new();
     let mut stream_partitioning_map: HashMap<String, Vec<StreamPartition>> = HashMap::new();
 
-    // Start get user defined schema
-    let mut user_defined_schema_map: HashMap<String, Option<HashSet<String>>> = HashMap::new();
-    let mut streams_need_original_map: HashMap<String, bool> = HashMap::new();
-    let mut streams_need_all_values_map: HashMap<String, bool> = HashMap::new();
-    // End get user defined schema
-
     // associated pipeline
     let mut stream_executable_pipelines: HashMap<String, Vec<ExecutablePipeline>> = HashMap::new();
     let mut stream_pipeline_inputs: HashMap<String, Vec<json::Value>> = HashMap::new();
@@ -275,15 +265,6 @@ pub async fn handle_otlp_request(
                 .await;
                 // End get stream alert
 
-                // get user defined schema
-                crate::service::ingestion::get_uds_and_original_data_streams(
-                    std::slice::from_ref(&stream_param),
-                    &mut user_defined_schema_map,
-                    &mut streams_need_original_map,
-                    &mut streams_need_all_values_map,
-                )
-                .await;
-
                 // update schema metadata
                 if !schema_exists.has_metrics_metadata {
                     if !prom_meta.contains_key(METADATA_LABEL) {
@@ -350,14 +331,6 @@ pub async fn handle_otlp_request(
                         )
                         .await;
                         // End get stream alert
-
-                        crate::service::ingestion::get_uds_and_original_data_streams(
-                            std::slice::from_ref(&stream_param),
-                            &mut user_defined_schema_map,
-                            &mut streams_need_original_map,
-                            &mut streams_need_all_values_map,
-                        )
-                        .await;
                     }
 
                     // get stream pipeline -- for the stream this record actually lands in, which
@@ -389,15 +362,10 @@ pub async fn handle_otlp_request(
                             .push(rec);
                     } else {
                         // get json object
-                        let mut local_val = match rec.take() {
+                        let local_val = match rec.take() {
                             json::Value::Object(val) => val,
                             _ => unreachable!(),
                         };
-
-                        if let Some(Some(fields)) = user_defined_schema_map.get(&local_metric_name)
-                        {
-                            local_val = crate::service::ingestion::refactor_map(local_val, fields);
-                        }
 
                         json_data_by_stream
                             .entry(local_metric_name.clone())
@@ -464,17 +432,10 @@ pub async fn handle_otlp_request(
                         }
                         for (_, mut res) in stream_pl_results {
                             // get json object
-                            let mut local_val = match res.take() {
+                            let local_val = match res.take() {
                                 json::Value::Object(v) => v,
                                 _ => unreachable!(),
                             };
-
-                            if let Some(Some(fields)) =
-                                user_defined_schema_map.get(&destination_stream)
-                            {
-                                local_val =
-                                    crate::service::ingestion::refactor_map(local_val, fields);
-                            }
 
                             // buffer to downstream processing directly
                             json_data_by_stream
@@ -489,14 +450,10 @@ pub async fn handle_otlp_request(
 
         if !has_user_pipeline && !json_data_by_stream.contains_key(stream_name) {
             for mut rec in pipeline_inputs {
-                let mut local_val = match rec.take() {
+                let local_val = match rec.take() {
                     json::Value::Object(val) => val,
                     _ => unreachable!(),
                 };
-
-                if let Some(Some(fields)) = user_defined_schema_map.get(stream_name) {
-                    local_val = crate::service::ingestion::refactor_map(local_val, fields);
-                }
 
                 json_data_by_stream
                     .entry(stream_name.clone())

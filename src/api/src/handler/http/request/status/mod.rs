@@ -26,8 +26,7 @@ use axum_extra::extract::{
     cookie::{Cookie, SameSite},
 };
 use config::{
-    Config, META_ORG_ID, QUICK_MODEL_FIELDS, SQL_FULL_TEXT_SEARCH_FIELDS,
-    SQL_SECONDARY_INDEX_SEARCH_FIELDS, TIMESTAMP_COL_NAME,
+    Config, META_ORG_ID, QUICK_MODEL_FIELDS, SQL_FULL_TEXT_SEARCH_FIELDS, TIMESTAMP_COL_NAME,
     cluster::LOCAL_NODE,
     get_config, get_instance_id,
     meta::{
@@ -88,7 +87,7 @@ use crate::{
         db,
         search::{
             datafusion::{storage::file_statistics_cache, udf::DEFAULT_FUNCTIONS},
-            grpc::tantivy_result_cache,
+            grpc::index_result_cache,
         },
     },
 };
@@ -96,7 +95,8 @@ use crate::{
 /// Macro to conditionally select a value based on the "enterprise" feature flag.
 ///
 /// # Usage
-/// ```rust
+/// ```rust,ignore
+/// // Illustrative only — the macro is module-local (not #[macro_export]).
 /// let value = enterprise_value!(default_expr, enterprise_expr);
 /// ```
 ///
@@ -146,7 +146,6 @@ struct ConfigResponse<'a> {
     build_date: String,
     build_type: String,
     default_fts_keys: Vec<String>,
-    default_secondary_index_fields: Vec<String>,
     default_quick_mode_fields: Vec<String>,
     telemetry_enabled: bool,
     default_functions: Vec<ZoFunction<'a>>,
@@ -173,9 +172,6 @@ struct ConfigResponse<'a> {
     custom_hide_self_logo: bool,
     meta_org: String,
     quick_mode_enabled: bool,
-    user_defined_schemas_enabled: bool,
-    user_defined_schema_max_fields: usize,
-    all_fields_name: String,
     usage_enabled: bool,
     usage_publish_interval: i64,
     ingestion_url: String,
@@ -417,10 +413,6 @@ pub async fn zo_config() -> impl IntoResponse {
             .iter()
             .map(|s| s.to_string())
             .collect(),
-        default_secondary_index_fields: SQL_SECONDARY_INDEX_SEARCH_FIELDS
-            .iter()
-            .map(|s| s.to_string())
-            .collect(),
         default_quick_mode_fields: QUICK_MODEL_FIELDS.to_vec(),
         default_functions: DEFAULT_FUNCTIONS.to_vec(),
         sql_reserved_keywords: config::meta::sql::sql_reserved_keywords().to_vec(),
@@ -446,9 +438,6 @@ pub async fn zo_config() -> impl IntoResponse {
         rum: Rum::from_cfg(cfg.clone()),
         meta_org: META_ORG_ID.to_string(),
         quick_mode_enabled: cfg.limit.quick_mode_enabled,
-        user_defined_schemas_enabled: cfg.common.allow_user_defined_schemas,
-        user_defined_schema_max_fields: cfg.limit.user_defined_schema_max_fields,
-        all_fields_name: cfg.common.column_all.to_string(),
         usage_enabled,
         usage_publish_interval,
         ingestion_url: cfg.common.ingestion_url.to_string(),
@@ -597,8 +586,8 @@ pub async fn cache_status() -> impl IntoResponse {
     stats.insert(
         "INVERTED_INDEX",
         json::json!({"result_cache": {
-            "file_num": tantivy_result_cache::GLOBAL_CACHE.len(),
-            "mem_size": tantivy_result_cache::GLOBAL_CACHE.memory_size()
+            "file_num": index_result_cache::GLOBAL_CACHE.len(),
+            "mem_size": index_result_cache::GLOBAL_CACHE.memory_size()
         }}),
     );
 

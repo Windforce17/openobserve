@@ -62,7 +62,7 @@ def post_flush_vortex(ingest_query_agent_data):  # noqa: ARG001
                msg=f"{STREAM} data not searchable after flush")
     logging.info("Post-flush vortex: data searchable")
 
-    # Tantivy readiness: vortex files may be searchable before Tantivy
+    # the FTS index readiness: vortex files may be searchable before the FTS index
     # indexes are built.  Run a match_all query to confirm FTS is ready.
     _poll_end_us = int(datetime.now(UTC).timestamp() * 1_000_000)
     _poll_start_us = int((datetime.now(UTC) - timedelta(weeks=4)).timestamp() * 1_000_000)
@@ -86,8 +86,8 @@ def post_flush_vortex(ingest_query_agent_data):  # noqa: ARG001
         return "warehouse" in log_val
 
     wait_until(_fts_ready, timeout=120, interval=2.0,
-               msg=f"Tantivy FTS not ready for {STREAM} after flush")
-    logging.info("Post-flush vortex: Tantivy FTS ready")
+               msg=f"FTS index not ready for {STREAM} after flush")
+    logging.info("Post-flush vortex: FTS index ready")
 
 
 class TestVortexJoin:

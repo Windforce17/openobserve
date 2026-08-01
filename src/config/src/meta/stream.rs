@@ -143,13 +143,6 @@ impl StreamType {
         )
     }
 
-    pub fn support_uds(&self) -> bool {
-        matches!(
-            *self,
-            StreamType::Logs | StreamType::Metrics | StreamType::Traces
-        )
-    }
-
     pub fn as_str(&self) -> &'static str {
         match self {
             StreamType::Logs => "logs",
@@ -275,8 +268,8 @@ impl MemorySize for RemoteStreamParams {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FileSelection {
-    /// Row ids matched by the tantivy index, as a per-row bitmap of length
-    /// `num_rows` (one bit per parquet row).
+    /// Row ids matched by the inverted index, as a per-row bitmap of
+    /// length `num_rows` (one bit per row).
     Rows(Arc<BooleanBuffer>),
     /// Row group ids selected by row-group-level sampling.
     RowGroups(Arc<Vec<u32>>),
@@ -291,6 +284,11 @@ pub struct FileKey {
     pub deleted: bool,
     pub selection: Option<FileSelection>,
     pub row_group_size: Option<u32>,
+    /// The attached selection is the EXACT answer of the whole index
+    /// condition for this file (no condition was skipped): its rows need no
+    /// re-applied filter. A partial selection (some condition skipped) is a
+    /// superset the re-applied filter narrows.
+    pub selection_exact: bool,
 }
 
 impl FileKey {
@@ -303,6 +301,7 @@ impl FileKey {
             deleted,
             selection: None,
             row_group_size: None,
+            selection_exact: false,
         }
     }
 
@@ -315,6 +314,7 @@ impl FileKey {
             deleted: false,
             selection: None,
             row_group_size: None,
+            selection_exact: false,
         }
     }
 
@@ -324,6 +324,16 @@ impl FileKey {
     }
 }
 
+/// Sizes of one stream data file.
+///
+/// Storage-accounting rule (core-file architecture): `compressed_size` is the
+/// FULL size of the stream data object. For core `.vix` files the inverted
+/// index (dict/terms blobs) lives INSIDE that object, so `index_size` is a
+/// SUBSET of `compressed_size` — informational ("of which index"), never an
+/// addend. Total storage = sum(compressed_size); do NOT add `index_size` on
+/// top. For legacy parquet files with a sibling index object, `index_size` is
+/// the sibling's size and totals undercount by it — accepted (only new data
+/// matters).
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FileMeta {
     pub min_ts: i64, // microseconds
@@ -373,6 +383,9 @@ pub struct FileListDeleted {
     pub id: i64,
     pub account: String,
     pub file: String,
+    /// Always false: core `.vix` files embed their index in the data object,
+    /// so no file has a separate sibling index object to delete. The column
+    /// survives in the `file_list_deleted` table schema only.
     pub index_file: bool,
     pub flattened: bool,
 }
@@ -450,6 +463,19 @@ impl From<&String> for MergeStrategy {
     }
 }
 
+/// Aggregated per-stream statistics.
+///
+/// Accounting rule (core-file architecture): the three sizes are INDEPENDENT
+/// figures, never added together —
+/// - `storage_size`   = sum of original (uncompressed) bytes ingested;
+/// - `compressed_size` = sum of stored object bytes = the stream's total storage footprint;
+/// - `index_size`     = informational "of which index": for core `.vix` files the dict/terms index
+///   is embedded in the data object, so this is a subset of `compressed_size` (for legacy parquet
+///   it was a separate sibling object, not counted in `compressed_size` — totals undercount by that
+///   sibling; accepted, only new data matters).
+///
+/// Consumers (org summary, UI columns, usage metering) must report each
+/// field separately and must NOT compute `compressed_size + index_size`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct StreamStats {
     pub created_at: i64,
@@ -686,6 +712,7 @@ impl From<&cluster_rpc::FileKey> for FileKey {
             deleted: req.deleted,
             selection: None,
             row_group_size: None,
+            selection_exact: false,
         }
     }
 }
@@ -764,15 +791,13 @@ pub struct UpdateStreamSettings {
     #[serde(default)]
     pub full_text_search_keys: UpdateSettingsWrapper<String>,
     #[serde(default)]
-    pub index_fields: UpdateSettingsWrapper<String>,
+    pub column_store_fields: UpdateSettingsWrapper<String>,
     #[serde(default)]
     pub bloom_filter_fields: UpdateSettingsWrapper<String>,
     #[serde(skip_serializing_if = "Option::None", default)]
     pub data_retention: Option<i64>,
     #[serde(skip_serializing_if = "Option::None", default)]
     pub flatten_level: Option<i64>,
-    #[serde(default)]
-    pub defined_schema_fields: UpdateSettingsWrapper<String>,
     #[serde(default)]
     pub distinct_value_fields: UpdateSettingsWrapper<String>,
     #[serde(default)]
@@ -783,10 +808,6 @@ pub struct UpdateStreamSettings {
     pub approx_partition: Option<bool>,
     #[serde(default)]
     pub extended_retention_days: UpdateSettingsWrapper<TimeRange>,
-    #[serde(default)]
-    pub index_original_data: Option<bool>,
-    #[serde(default)]
-    pub index_all_values: Option<bool>,
     #[serde(default)]
     pub pattern_associations: UpdateSettingsWrapper<PatternAssociation>,
     #[serde(default)]
@@ -944,11 +965,9 @@ pub struct StreamSettings {
     #[serde(default)]
     pub full_text_search_keys: Vec<String>,
     #[serde(default)]
-    pub index_fields: Vec<String>,
+    pub column_store_fields: Vec<String>,
     #[serde(default)]
     pub bloom_filter_fields: Vec<String>,
-    #[serde(default)]
-    pub defined_schema_fields: Vec<String>,
     #[serde(default)]
     pub storage_type: StorageType,
     #[serde(default)]
@@ -964,10 +983,6 @@ pub struct StreamSettings {
     #[serde(default)]
     pub approx_partition: bool,
     #[serde(default)]
-    pub index_original_data: bool,
-    #[serde(default)]
-    pub index_all_values: bool,
-    #[serde(default)]
     pub enable_distinct_fields: bool,
     #[serde(default)]
     pub enable_log_patterns_extraction: bool,
@@ -977,10 +992,6 @@ pub struct StreamSettings {
     pub distinct_value_fields: Vec<DistinctField>,
     #[serde(default)]
     pub cross_links: Vec<CrossLink>,
-    #[serde(default)]
-    pub index_updated_at: i64,
-    #[serde(default)]
-    pub index_fields_updated_at: HashMap<String, i64>,
 }
 
 impl Default for StreamSettings {
@@ -988,45 +999,21 @@ impl Default for StreamSettings {
         Self {
             partition_keys: Vec::new(),
             full_text_search_keys: Vec::new(),
-            index_fields: Vec::new(),
+            column_store_fields: Vec::new(),
             bloom_filter_fields: Vec::new(),
             data_retention: 0,
             flatten_level: None,
-            defined_schema_fields: Vec::new(),
             max_query_range: 0,
             store_original_data: false,
             approx_partition: false,
             distinct_value_fields: Vec::new(),
-            index_updated_at: 0,
-            index_fields_updated_at: Default::default(),
             extended_retention_days: Vec::new(),
-            index_original_data: false,
-            index_all_values: false,
             enable_distinct_fields: true,
             enable_log_patterns_extraction: false,
             is_llm_stream: false,
             cross_links: Vec::new(),
             storage_type: StorageType::Normal,
         }
-    }
-}
-
-impl StreamSettings {
-    /// Internal columns implicitly included in the user-defined schema for a
-    /// stream with these settings.
-    pub fn uds_internal_columns(&self) -> Vec<String> {
-        let mut columns = vec![
-            crate::TIMESTAMP_COL_NAME.to_string(),
-            get_config().common.column_all.to_string(),
-        ];
-        if self.store_original_data || self.index_original_data {
-            columns.push(crate::ID_COL_NAME.to_string());
-            columns.push(crate::ORIGINAL_DATA_COL_NAME.to_string());
-        }
-        if self.index_all_values {
-            columns.push(crate::ALL_VALUES_COL_NAME.to_string());
-        }
-        columns
     }
 }
 
@@ -1042,36 +1029,20 @@ impl Serialize for StreamSettings {
         }
         state.serialize_field("partition_keys", &part_keys)?;
         state.serialize_field("full_text_search_keys", &self.full_text_search_keys)?;
-        state.serialize_field("index_fields", &self.index_fields)?;
+        state.serialize_field("column_store_fields", &self.column_store_fields)?;
         state.serialize_field("bloom_filter_fields", &self.bloom_filter_fields)?;
         state.serialize_field("distinct_value_fields", &self.distinct_value_fields)?;
         state.serialize_field("data_retention", &self.data_retention)?;
         state.serialize_field("max_query_range", &self.max_query_range)?;
         state.serialize_field("store_original_data", &self.store_original_data)?;
         state.serialize_field("approx_partition", &self.approx_partition)?;
-        state.serialize_field("index_updated_at", &self.index_updated_at)?;
-        if !self.index_fields_updated_at.is_empty() {
-            state.serialize_field("index_fields_updated_at", &self.index_fields_updated_at)?;
-        } else {
-            state.skip_field("index_fields_updated_at")?;
-        }
         state.serialize_field("extended_retention_days", &self.extended_retention_days)?;
-        state.serialize_field("index_original_data", &self.index_original_data)?;
-        state.serialize_field("index_all_values", &self.index_all_values)?;
         state.serialize_field("enable_distinct_fields", &self.enable_distinct_fields)?;
         state.serialize_field(
             "enable_log_patterns_extraction",
             &self.enable_log_patterns_extraction,
         )?;
 
-        if !self.defined_schema_fields.is_empty() {
-            let mut fields = self.defined_schema_fields.clone();
-            fields.sort_unstable();
-            fields.dedup();
-            state.serialize_field("defined_schema_fields", &fields)?;
-        } else {
-            state.skip_field("defined_schema_fields")?;
-        }
         match self.flatten_level.as_ref() {
             Some(flatten_level) => {
                 state.serialize_field("flatten_level", flatten_level)?;
@@ -1123,12 +1094,16 @@ impl From<&str> for StreamSettings {
             }
         }
 
-        let mut index_fields = Vec::new();
-        let fields = settings.get("index_fields");
+        // NOTE: legacy keys `index_fields`, `defined_schema_fields`,
+        // `index_original_data` and `index_all_values` may still be present in
+        // stored settings JSON; they are intentionally ignored since the `.vix`
+        // all-fields index made them obsolete.
+        let mut column_store_fields = Vec::new();
+        let fields = settings.get("column_store_fields");
         if let Some(value) = fields {
             let v: Vec<_> = value.as_array().unwrap().iter().collect();
             for item in v {
-                index_fields.push(item.as_str().unwrap().to_string())
+                column_store_fields.push(item.as_str().unwrap().to_string())
             }
         }
 
@@ -1150,20 +1125,6 @@ impl From<&str> for StreamSettings {
         if let Some(v) = settings.get("max_query_range") {
             max_query_range = v.as_i64().unwrap();
         };
-
-        let mut defined_schema_fields = Vec::<String>::new();
-        if let Some(value) = settings.get("defined_schema_fields") {
-            let mut fields = value
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|item| item.as_str().unwrap().to_string())
-                .collect::<Vec<_>>();
-
-            fields.sort_unstable();
-            fields.dedup();
-            defined_schema_fields = fields;
-        }
 
         let flatten_level = settings.get("flatten_level").and_then(Value::as_i64);
 
@@ -1190,23 +1151,6 @@ impl From<&str> for StreamSettings {
             }
         }
 
-        let index_updated_at = settings
-            .get("index_updated_at")
-            .and_then(Value::as_i64)
-            .unwrap_or_default();
-
-        let mut index_fields_updated_at = HashMap::new();
-        if let Some(value) = settings
-            .get("index_fields_updated_at")
-            .and_then(Value::as_object)
-        {
-            for (k, v) in value {
-                if let Some(ts) = v.as_i64() {
-                    index_fields_updated_at.insert(k.clone(), ts);
-                }
-            }
-        }
-
         let mut extended_retention_days = vec![];
         if let Some(values) = settings
             .get("extended_retention_days")
@@ -1222,15 +1166,6 @@ impl From<&str> for StreamSettings {
             }
         }
 
-        let index_original_data = settings
-            .get("index_original_data")
-            .and_then(Value::as_bool)
-            .unwrap_or_default();
-
-        let index_all_values = settings
-            .get("index_all_values")
-            .and_then(Value::as_bool)
-            .unwrap_or_default();
         let enable_distinct_fields = settings
             .get("enable_distinct_fields")
             .and_then(Value::as_bool)
@@ -1259,20 +1194,15 @@ impl From<&str> for StreamSettings {
         Self {
             partition_keys,
             full_text_search_keys,
-            index_fields,
+            column_store_fields,
             bloom_filter_fields,
             data_retention,
             max_query_range,
             flatten_level,
-            defined_schema_fields,
             store_original_data,
             approx_partition,
             distinct_value_fields,
-            index_updated_at,
-            index_fields_updated_at,
             extended_retention_days,
-            index_original_data,
-            index_all_values,
             enable_distinct_fields,
             enable_log_patterns_extraction,
             is_llm_stream,
@@ -1287,16 +1217,10 @@ impl MemorySize for StreamSettings {
         std::mem::size_of::<StreamSettings>()
             + self.partition_keys.mem_size()
             + self.full_text_search_keys.mem_size()
-            + self.index_fields.mem_size()
+            + self.column_store_fields.mem_size()
             + self.bloom_filter_fields.mem_size()
-            + self.defined_schema_fields.mem_size()
             + self.distinct_value_fields.mem_size()
             + self.extended_retention_days.mem_size()
-            + self
-                .index_fields_updated_at
-                .iter()
-                .map(|(k, v)| k.mem_size() + v.mem_size())
-                .sum::<usize>()
     }
 }
 
@@ -1427,50 +1351,85 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_uds_internal_columns() {
-        let mut settings = StreamSettings::default();
-        let columns = settings.uds_internal_columns();
-        assert!(columns.contains(&crate::TIMESTAMP_COL_NAME.to_string()));
-        assert!(columns.contains(&get_config().common.column_all));
-        assert!(!columns.contains(&crate::ID_COL_NAME.to_string()));
-        assert!(!columns.contains(&crate::ALL_VALUES_COL_NAME.to_string()));
+    fn test_stream_settings_column_store_fields_legacy_payload() {
+        // old settings payload without the key deserializes to an empty vec
+        let settings = StreamSettings::from(r#"{"data_retention": 30}"#);
+        assert_eq!(settings.data_retention, 30);
+        assert!(settings.column_store_fields.is_empty());
 
-        settings.store_original_data = true;
-        settings.index_all_values = true;
-        let columns = settings.uds_internal_columns();
-        assert!(columns.contains(&crate::ID_COL_NAME.to_string()));
-        assert!(columns.contains(&crate::ORIGINAL_DATA_COL_NAME.to_string()));
-        assert!(columns.contains(&crate::ALL_VALUES_COL_NAME.to_string()));
-
-        for column in settings.uds_internal_columns() {
-            assert!(crate::is_uds_internal_column(&column));
-        }
-        assert!(!crate::is_uds_internal_column("my_field"));
+        // the derived serde Deserialize path defaults to an empty vec as well
+        let settings: StreamSettings = json::from_str("{}").unwrap();
+        assert!(settings.column_store_fields.is_empty());
     }
 
     #[test]
-    fn test_stream_settings_index_fields_updated_at() {
-        // legacy payload without the map deserializes to an empty map
-        let settings = StreamSettings::from(r#"{"index_updated_at": 100}"#);
-        assert_eq!(settings.index_updated_at, 100);
-        assert!(settings.index_fields_updated_at.is_empty());
+    fn test_stream_settings_removed_legacy_keys_are_ignored() {
+        // Old stored settings JSON may still carry keys for concepts removed by
+        // the `.vix` all-fields index (UDS, secondary index list, `_all_values`
+        // materialization, index_original_data, the index_updated_at /
+        // index_fields_updated_at freshness stamps). They must parse fine and
+        // be silently dropped.
+        let payload = r#"{
+            "partition_keys": {"L0": "kubernetes_namespace_name"},
+            "full_text_search_keys": ["log"],
+            "index_fields": ["trace_id", "service_name"],
+            "bloom_filter_fields": ["trace_id"],
+            "defined_schema_fields": ["log", "message", "kubernetes_namespace_name"],
+            "index_original_data": true,
+            "index_all_values": true,
+            "store_original_data": true,
+            "data_retention": 30,
+            "index_updated_at": 100,
+            "index_fields_updated_at": {"trace_id": 200}
+        }"#;
+        let settings = StreamSettings::from(payload);
+        // still-supported keys are read
+        assert_eq!(settings.partition_keys.len(), 1);
+        assert_eq!(settings.full_text_search_keys, vec!["log".to_string()]);
+        assert_eq!(settings.bloom_filter_fields, vec!["trace_id".to_string()]);
+        assert!(settings.store_original_data);
+        assert_eq!(settings.data_retention, 30);
+        // removed keys are ignored and never re-serialized
+        let reserialized = json::to_string(&settings).unwrap();
+        assert!(!reserialized.contains("defined_schema_fields"));
+        assert!(!reserialized.contains("\"index_fields\""));
+        assert!(!reserialized.contains("index_original_data"));
+        assert!(!reserialized.contains("index_all_values"));
+        assert!(!reserialized.contains("index_updated_at"));
+        assert!(!reserialized.contains("index_fields_updated_at"));
 
-        // the map survives a serialize -> parse round trip
-        let mut settings = StreamSettings::default();
-        settings.index_updated_at = 100;
-        settings
-            .index_fields_updated_at
-            .insert("trace_id".to_string(), 200);
+        // the derived serde Deserialize path also tolerates the legacy keys
+        // (unknown fields are ignored by default)
+        let settings: StreamSettings = json::from_str(
+            r#"{
+                "index_fields": ["a"],
+                "defined_schema_fields": ["b"],
+                "index_original_data": true,
+                "index_all_values": true,
+                "index_updated_at": 100,
+                "index_fields_updated_at": {"a": 200}
+            }"#,
+        )
+        .unwrap();
+        assert!(settings.column_store_fields.is_empty());
+    }
+
+    #[test]
+    fn test_stream_settings_column_store_fields_roundtrip() {
+        // values survive a serialize -> parse round trip
+        let settings = StreamSettings {
+            column_store_fields: vec!["service_name".to_string(), "trace_id".to_string()],
+            ..Default::default()
+        };
         let payload = json::to_string(&settings).unwrap();
+        // the key is always emitted, like index_fields
+        assert!(payload.contains("column_store_fields"));
         let parsed = StreamSettings::from(payload.as_str());
-        assert_eq!(
-            parsed.index_fields_updated_at,
-            settings.index_fields_updated_at
-        );
+        assert_eq!(parsed.column_store_fields, settings.column_store_fields);
 
-        // an empty map is skipped during serialization
+        // an empty list is still emitted (always-serialize, like index_fields)
         let payload = json::to_string(&StreamSettings::default()).unwrap();
-        assert!(!payload.contains("index_fields_updated_at"));
+        assert!(payload.contains("column_store_fields"));
     }
 
     #[tokio::test]
@@ -1761,18 +1720,6 @@ mod tests {
         assert!(!StreamType::Filelist.support_index());
         assert!(!StreamType::ServiceGraph.support_index());
         assert!(!StreamType::Index.support_index());
-    }
-
-    #[test]
-    fn test_stream_type_support_uds() {
-        assert!(StreamType::Logs.support_uds());
-        assert!(StreamType::Metrics.support_uds());
-        assert!(StreamType::Traces.support_uds());
-        assert!(!StreamType::EnrichmentTables.support_uds());
-        assert!(!StreamType::Filelist.support_uds());
-        assert!(!StreamType::Metadata.support_uds());
-        assert!(!StreamType::Index.support_uds());
-        assert!(!StreamType::ServiceGraph.support_uds());
     }
 
     #[test]

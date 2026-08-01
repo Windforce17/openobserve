@@ -4,7 +4,7 @@ FTS is enabled per-field via:
     PUT /api/{org}/streams/{stream}/settings?type=logs
     body: {"full_text_search_keys": {"add": ["field_name"]}}
 
-After enabling FTS and flushing, OO builds a Tantivy index. Queries use
+After enabling FTS and flushing, OO builds a FTS index. Queries use
 match_all('keyword') or match_all_raw('keyword') via SQL.
 
 Enterprise CI only — do not add to OSS api-testing.yml.
@@ -59,7 +59,7 @@ def _wait_for_fts(client, stream: str, keyword: str, *, timeout: float = 120.0) 
     """Wait until match_all(keyword) returns at least one hit in *stream*.
 
     Raises pytest.skip if the server returns 400 for match_all — this means
-    FTS/Tantivy is not compiled in or not configured, not a transient failure.
+    the FTS index is not compiled in or not configured, not a transient failure.
     """
     def _ready():
         resp = client.post(

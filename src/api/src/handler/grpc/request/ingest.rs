@@ -30,6 +30,37 @@ use crate::{
     service::ingestion::create_log_ingestion_req,
 };
 
+/// Build the internal reply from the ingest outcome: the ingest layer's real
+/// code and error reach the caller. Collapsing every `Ok` into
+/// `status_code: 200` acked internal batches (pipeline destinations, service
+/// graph edges) whose durable write had failed with 500/503, and the sender
+/// dropped its only copy.
+fn ingestion_reply(resp: Result<(u16, Option<String>)>) -> IngestionResponse {
+    match resp {
+        Ok((code, error)) => IngestionResponse {
+            status_code: code.into(),
+            message: error.unwrap_or_else(|| {
+                if (200..300).contains(&code) {
+                    "OK".to_string()
+                } else {
+                    format!("ingestion failed with code {code}")
+                }
+            }),
+        },
+        Err(err) => IngestionResponse {
+            // admission-control backpressure surfaces as Err before any
+            // write: it is retryable and must reach the internal caller as
+            // 503, not a permanent-looking 500
+            status_code: if matches!(err, Error::ResourceError(_)) {
+                503
+            } else {
+                500
+            },
+            message: err.to_string(),
+        },
+    }
+}
+
 #[derive(Default)]
 pub struct Ingester;
 
@@ -57,7 +88,10 @@ impl Ingest for Ingester {
 
         let internal_user = IngestUser::SystemJob(SystemJobType::InternalGrpc);
 
-        let resp = match stream_type {
+        // Every arm resolves to the (status code, error) the reply carries:
+        // a 500/503 from a failed durable write must reach the internal
+        // caller so it retries instead of dropping the batch.
+        let resp: Result<(u16, Option<String>)> = match stream_type {
             StreamType::Logs => {
                 let log_ingestion_type = req.ingestion_type.unwrap_or_default();
                 let data = bytes::Bytes::from(in_data.data);
@@ -73,7 +107,7 @@ impl Ingest for Ingester {
                         is_derived,
                     )
                     .await
-                    .map_or_else(Err, |_| Ok(())),
+                    .map(|res| (res.code, res.error)),
                 }
             }
             StreamType::Metrics => {
@@ -93,10 +127,23 @@ impl Ingest for Ingester {
                     )))
                 } else {
                     let data = bytes::Bytes::from(in_data.data);
+                    // the response's embedded code is the write's truth: a
+                    // 503 (backpressure) or 500 acked as 200 would make the
+                    // internal sender drop its only copy of the batch
                     crate::service::metrics::json::ingest(&org_id, stream_name, data, internal_user)
                         .await
-                        .map(|_| ()) // we don't care about success response
-                        .map_err(|e| Error::IngestionError(format!("error in ingesting metrics {e}")))
+                        .map(|res| (res.code, res.error))
+                        // the metrics path errors as anyhow: recover the infra
+                        // kind so backpressure stays retryable through the reply
+                        .map_err(|e| match e.downcast::<Error>() {
+                            Ok(err @ Error::ResourceError(_)) => err,
+                            Ok(err) => {
+                                Error::IngestionError(format!("error in ingesting metrics {err}"))
+                            }
+                            Err(e) => {
+                                Error::IngestionError(format!("error in ingesting metrics {e}"))
+                            }
+                        })
                 }
             }
             StreamType::Traces => {
@@ -114,7 +161,19 @@ impl Ingest for Ingester {
                     // internal ingestion does not require email id
                     crate::service::traces::ingest_json(&org_id, data, OtlpRequestType::Grpc, &stream_name, internal_user)
                         .await
-                        .map(|_| ()) // we don't care about success response
+                        // the response's status is the write's truth (503
+                        // backpressure / 500 write failure, which must not be
+                        // acked as 200); the error detail rides the header the
+                        // traces path sets on failure
+                        .map(|res| {
+                            let code = res.status().as_u16();
+                            let error = res
+                                .headers()
+                                .get(crate::common::meta::http::ERROR_HEADER)
+                                .and_then(|v| v.to_str().ok())
+                                .map(|v| v.to_string());
+                            (code, error)
+                        })
                         .map_err(|e| Error::IngestionError(format!("error in ingesting traces {e}")))
                 }
             }
@@ -160,7 +219,7 @@ impl Ingest for Ingester {
                                 "Internal gPRC ingestion service errors saving enrichment data: http code {status}"
                             )))
                         } else {
-                            Ok(())
+                            Ok((200, None))
                         }
                     }
                 }
@@ -181,7 +240,7 @@ impl Ingest for Ingester {
                         is_derived,
                     )
                     .await
-                    .map_or_else(Err, |_| Ok(())),
+                    .map(|res| (res.code, res.error)),
                 }
             }
             _ => Err(Error::IngestionError(
@@ -190,24 +249,16 @@ impl Ingest for Ingester {
             )),
         };
 
-        let reply = match resp {
-            Ok(_) => IngestionResponse {
-                status_code: 200,
-                message: "OK".to_string(),
-            },
-            Err(err) => IngestionResponse {
-                status_code: 500,
-                message: err.to_string(),
-            },
-        };
+        let reply = ingestion_reply(resp);
 
         // metrics
         let time = start.elapsed().as_secs_f64();
+        let code = reply.status_code.to_string();
         metrics::GRPC_RESPONSE_TIME
-            .with_label_values(&["/ingest/inner", "200", "", "", "", ""])
+            .with_label_values(&["/ingest/inner", &code, "", "", "", ""])
             .observe(time);
         metrics::GRPC_INCOMING_REQUESTS
-            .with_label_values(&["/ingest/inner", "200", "", "", "", ""])
+            .with_label_values(&["/ingest/inner", &code, "", "", "", ""])
             .inc();
 
         Ok(Response::new(reply))
@@ -228,6 +279,45 @@ mod tests {
         let ingester = Ingester;
         // Ingester is a unit struct, so its size is 0
         assert_eq!(std::mem::size_of_val(&ingester), 0);
+    }
+
+    /// The ingest layer's code reaches the internal reply: a failed durable
+    /// write (`Ok` with code 500/503) used to be collapsed into
+    /// `status_code: 200` and the sender dropped its only copy of the batch.
+    #[test]
+    fn test_ingestion_reply_propagates_the_ingest_code() {
+        let reply = ingestion_reply(Ok((200, None)));
+        assert_eq!(reply.status_code, 200);
+        assert_eq!(reply.message, "OK");
+
+        let reply = ingestion_reply(Ok((
+            503,
+            Some("stream [logs]: 4 record(s) not written: memtable is full".to_string()),
+        )));
+        assert_eq!(reply.status_code, 503);
+        assert!(reply.message.contains("memtable is full"));
+
+        let reply = ingestion_reply(Ok((
+            500,
+            Some("stream [logs]: 4 record(s) not written: disk full".to_string()),
+        )));
+        assert_eq!(reply.status_code, 500);
+        assert!(reply.message.contains("disk full"));
+
+        // a non-2xx with no message still carries the code and never reads OK
+        let reply = ingestion_reply(Ok((500, None)));
+        assert_eq!(reply.status_code, 500);
+        assert_ne!(reply.message, "OK");
+
+        let reply = ingestion_reply(Err(Error::IngestionError("boom".to_string())));
+        assert_eq!(reply.status_code, 500);
+        assert!(reply.message.contains("boom"));
+
+        // admission-control backpressure (Err before any write) stays
+        // retryable: 503, never a permanent-looking 500
+        let reply = ingestion_reply(Err(Error::ResourceError("memtable is full".to_string())));
+        assert_eq!(reply.status_code, 503);
+        assert!(reply.message.contains("memtable is full"));
     }
 
     #[test]

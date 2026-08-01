@@ -37,7 +37,7 @@ use crate::{
             http::HttpResponse as MetaHttpResponse,
             ingestion::{
                 GCPIngestionRequest, HecResponse, HecStatus, IngestUser, IngestionRequest,
-                KinesisFHIngestionResponse, KinesisFHRequest,
+                IngestionResponse, KinesisFHIngestionResponse, KinesisFHRequest,
             },
         },
         utils::auth::UserEmail,
@@ -51,6 +51,24 @@ use crate::{
         logs::{self, otlp::handle_request},
     },
 };
+
+/// Render an ingest result with the HTTP status the ingest layer reported.
+///
+/// A stream whose durable write failed reports 500/503 and MUST NOT be
+/// answered with a 2xx — every shipper commits its read position (and deletes
+/// its copy) on a 2xx.
+fn ingest_response<T: serde::Serialize>(code: u16, body: T) -> Response {
+    match StatusCode::from_u16(code) {
+        Ok(status) if status.is_success() => MetaHttpResponse::json(body),
+        Ok(status) => (status, Json(body)).into_response(),
+        // a code we cannot render is not an ack
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response(),
+    }
+}
+
+fn ingestion_response(v: IngestionResponse) -> Response {
+    ingest_response(v.code, v)
+}
 
 /// _bulk ES compatible ingestion API
 #[utoipa::path(
@@ -106,7 +124,7 @@ pub async fn bulk(
     )
     .await
     {
-        Ok(v) => MetaHttpResponse::json(v),
+        Ok((v, code)) => ingest_response(code, v),
         Err(e) => {
             // we do not want to log trial period expired errors
             if !matches!(e, infra::errors::Error::TrialPeriodExpired) {
@@ -191,10 +209,7 @@ pub async fn multi(
     )
     .await
     {
-        Ok(v) => match v.code {
-            503 => (StatusCode::SERVICE_UNAVAILABLE, Json(v)).into_response(),
-            _ => MetaHttpResponse::json(v),
-        },
+        Ok(v) => ingestion_response(v),
         Err(e) => {
             // we do not want to log trial period expired errors
             if !matches!(e, infra::errors::Error::TrialPeriodExpired) {
@@ -279,10 +294,7 @@ pub async fn json(
     )
     .await
     {
-        Ok(v) => match v.code {
-            503 => (StatusCode::SERVICE_UNAVAILABLE, Json(v)).into_response(),
-            _ => MetaHttpResponse::json(v),
-        },
+        Ok(v) => ingestion_response(v),
         Err(e) => {
             // we do not want to log trial period expired errors
             if !matches!(e, infra::errors::Error::TrialPeriodExpired) {
@@ -365,11 +377,19 @@ pub async fn handle_kinesis_request(
     )
     .await
     {
-        Ok(_) => MetaHttpResponse::json(KinesisFHIngestionResponse {
-            request_id,
-            timestamp: request_time,
-            error_message: None,
-        }),
+        // Firehose retries a non-200 and deletes the batch on 200: a failed
+        // write must never be acked here.
+        Ok(v) => ingest_response(
+            v.code,
+            KinesisFHIngestionResponse {
+                request_id,
+                timestamp: request_time,
+                error_message: (v.code > 299).then(|| {
+                    v.error
+                        .unwrap_or_else(|| "error while writing log data".to_string())
+                }),
+            },
+        ),
         Err(e) => {
             // we do not want to log trial period expired errors
             if !matches!(e, infra::errors::Error::TrialPeriodExpired) {
@@ -428,7 +448,7 @@ pub async fn handle_gcp_request(
     )
     .await
     {
-        Ok(v) => MetaHttpResponse::json(v),
+        Ok(v) => ingestion_response(v),
         Err(e) => {
             // we do not want to log trial period expired errors
             if !matches!(e, infra::errors::Error::TrialPeriodExpired) {
@@ -614,28 +634,88 @@ pub async fn hec(
     let process_time = get_process_time();
 
     let mut resp = match logs::hec::ingest(thread_id, &org_id, body, user_email).await {
-        Ok(v) => {
-            if v.code > 299 {
-                (StatusCode::BAD_REQUEST, Json(v)).into_response()
-            } else {
-                MetaHttpResponse::json(v)
-            }
-        }
+        // The HEC status carries its own code: backpressure and failed writes
+        // are 5xx, and forcing them to 400 here made the forwarder drop the
+        // batch as a permanent error.
+        Ok(v) => ingest_response(v.code, v),
         Err(e) => {
             // we do not want to log trial period expired errors
             if !matches!(e, infra::errors::Error::TrialPeriodExpired) {
                 log::error!("Error processing request {org_id}/_hec: {e}");
             }
-            let res = HecResponse::from(HecStatus::Custom(e.to_string(), 400));
-            if matches!(e, infra::errors::Error::ResourceError(_)) {
-                (StatusCode::SERVICE_UNAVAILABLE, Json(res)).into_response()
+            let code = if matches!(e, infra::errors::Error::ResourceError(_)) {
+                StatusCode::SERVICE_UNAVAILABLE
             } else {
-                (StatusCode::BAD_REQUEST, Json(res)).into_response()
-            }
+                StatusCode::BAD_REQUEST
+            };
+            let res = HecResponse::from(HecStatus::Custom(e.to_string(), code.as_u16()));
+            (code, Json(res)).into_response()
         }
     };
 
     insert_process_time_header(process_time, resp.headers_mut());
 
     resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::meta::ingestion::{RecordStatus, StreamStatus};
+
+    fn failed_ingestion(code: u16) -> IngestionResponse {
+        IngestionResponse {
+            code,
+            status: vec![StreamStatus {
+                name: "logs".to_string(),
+                status: RecordStatus {
+                    successful: 0,
+                    failed: 3,
+                    error: "wal write failed".to_string(),
+                },
+                items: vec![],
+            }],
+            error: Some("stream [logs]: 3 record(s) not written".to_string()),
+        }
+    }
+
+    /// The ingest layer's code reaches the wire. A failed write answered 200
+    /// made shippers commit their offset and the records were gone.
+    #[test]
+    fn test_write_failure_is_not_acked_with_2xx() {
+        assert_eq!(
+            ingestion_response(failed_ingestion(500)).status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            ingestion_response(failed_ingestion(503)).status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn test_successful_ingestion_is_200() {
+        let mut ok = failed_ingestion(200);
+        ok.error = None;
+        assert_eq!(ingestion_response(ok).status(), StatusCode::OK);
+    }
+
+    /// The HEC and bulk shapes go through the same mapping: the HEC status
+    /// used to be forced to 400, which Splunk forwarders treat as a permanent
+    /// drop.
+    #[test]
+    fn test_hec_backpressure_maps_to_503() {
+        let res = HecResponse::from(HecStatus::Custom("memtable is full".to_string(), 503));
+        assert_eq!(
+            ingest_response(res.code, res).status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    /// An out-of-range code must never degrade into a 2xx ack.
+    #[test]
+    fn test_invalid_code_is_not_a_2xx_ack() {
+        let res = ingest_response(0, HecResponse::from(HecStatus::Success));
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
 }

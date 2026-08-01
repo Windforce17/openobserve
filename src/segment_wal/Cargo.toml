@@ -1,0 +1,21 @@
+[package]
+name = "segment_wal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+arrow.workspace = true
+arrow-schema.workspace = true
+bytes.workspace = true
+config.workspace = true
+crc32fast = "1.2.0"
+hashbrown.workspace = true
+infra.workspace = true
+log.workspace = true
+tokio.workspace = true
+zstd.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

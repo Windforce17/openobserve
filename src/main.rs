@@ -282,6 +282,27 @@ async fn main() -> Result<(), anyhow::Error> {
             _ = metadata::close().await;
             // flush WAL cache to disk
             _ = ingester::flush_all().await;
+            // segment-WAL (DESIGN-SEGMENT-WAL.md): the AUTHORITATIVE last
+            // ship. The flusher's own offline drain races the HTTP/gRPC
+            // shutdown grace, which keeps acking appends after it — this
+            // block only runs once both servers have stopped, so nothing can
+            // append after this flush. Deliberately unconditional (no
+            // ingest_segment_mode gate): a hot flag flip must not skip it,
+            // and it no-ops on an empty buffer.
+            if let Err(e) = segment_wal::flush_now().await {
+                log::error!(
+                    "[SEGMENT:FLUSH] shutdown flush failed, buffered segment frames are NOT durable: {e:#}"
+                );
+            }
+            // .26: upload the freshly-flushed WAL parquet to object storage
+            // before exit — scale-in must not strand data on the PVC
+            let shutdown_move = config::get_config().limit.shutdown_move_deadline;
+            if shutdown_move > 0 && config::cluster::LOCAL_NODE.is_ingester() {
+                _ = openobserve_jobs::job::run_final_move(std::time::Duration::from_secs(
+                    shutdown_move,
+                ))
+                .await;
+            }
             // flush compact offset cache to disk disk
             _ = db::compact::files::sync_cache_to_db().await;
             // flush db
@@ -1471,40 +1492,25 @@ mod tests {
 
     use super::*;
 
+    // setup_logs() and enable_tracing() both try to install the process-global
+    // tracing dispatcher, so they must run in ONE test with a fixed order:
+    // as separate #[test]s the loser of the install race panics ("a global
+    // default trace dispatcher has already been set") depending on scheduling.
     #[test]
     fn test_setup_logs() {
+        // Must be first in this test: asserts the install succeeds (panics on
+        // error inside .init()), so nothing may set the dispatcher before it.
         let _guard = setup_logs();
 
-        // Just verify that the guard is valid and the logs setup doesn't panic
-    }
-
-    #[test]
-    fn test_enable_tracing_error_handling() {
-        // Test that enable_tracing handles configuration errors gracefully
-        // This test verifies the function exists and can be called
-        // In a real environment, tracing setup might fail due to network issues
-
-        // We can't easily test the actual tracing setup without mocking external services
-        // But we can ensure the function signature and basic error handling work
+        // enable_tracing() is expected to fail now that a dispatcher is set
+        // (and may also fail on missing config / network); we only verify it
+        // can be called and errors are surfaced as Result / expected panics.
         let result = std::panic::catch_unwind(|| {
-            // Just verify the function can be called
             let rt = Runtime::new().unwrap();
             rt.block_on(async {
-                // This might fail in test environment due to missing config
-                // but that's expected and we're testing error handling
                 let _ = enable_tracing();
             });
         });
-
-        // The test should pass regardless of whether enable_tracing() succeeds or fails
-        // In test environments, it may fail due to:
-        // 1. Global subscriber already set by another test (when running in parallel)
-        // 2. Missing configuration
-        // 3. Network issues
-        // We're testing that it doesn't panic unexpectedly beyond expected tracing setup issues
-        // Don't assert result.is_ok() because parallel tests will fail due to global subscriber
-        // conflicts (expected in test environment when tests run in parallel)
-        // The important thing is that we can call the function without unexpected panics
         let _ = result;
     }
 

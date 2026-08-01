@@ -78,12 +78,12 @@ pub mod sourcemaps;
 pub mod stream;
 pub mod stream_utils;
 pub mod synthetics;
-pub mod tantivy;
 pub mod tls;
 pub mod traces;
 #[cfg(feature = "cloud")]
 pub mod trial_quota;
 pub mod users;
+pub mod vix;
 #[cfg(feature = "enterprise")]
 pub mod workflows;
 
