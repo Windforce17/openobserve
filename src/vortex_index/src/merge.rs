@@ -42,7 +42,6 @@
 use std::collections::BTreeSet;
 
 use arrow::array::LargeBinaryArray;
-use tantivy_fst::{IntoStreamer, Streamer};
 
 use crate::{
     container::{RowSelection, column_binary, column_u64, scan_blob},
@@ -134,8 +133,17 @@ impl TermTable {
 /// id space and guarded to stay strictly ascending.
 struct RemappedTermStream<'r> {
     reader: &'r VixReader,
-    rg_index: usize,
-    stream: Option<tantivy_fst::map::Stream<'r>>,
+    /// The whole dictionary blocks region (compaction inputs are in-memory
+    /// blobs — this is a zero-copy clone, one per stream).
+    blocks: bytes::Bytes,
+    /// Current block id and the decode offset/prev-key state within it
+    /// (an incremental [`crate::dict_blocks::BlockIter`] cannot borrow
+    /// `blocks` inside self, so the iterator state is inlined).
+    block_id: usize,
+    block_pos: usize,
+    block_started: bool,
+    raw_key: Vec<u8>,
+    block_ordinal_pos: u64,
     lower: Option<&'r [u8]>,
     upper: Option<&'r [u8]>,
     /// `old field id -> Some(output field id)`; `None` = the field has no
@@ -165,10 +173,25 @@ impl<'r> RemappedTermStream<'r> {
             field_map.push(out_field_ids.get(&entry.name).copied());
             field_names.push(entry.name.clone());
         }
+        let (start_block, blocks) = if reader.term_count() == 0 {
+            // a zero-term input has no dictionary blobs at all: an
+            // exhausted stream, not an error
+            (usize::MAX, bytes::Bytes::new())
+        } else {
+            let start = match lower {
+                Some(lower) => reader.dict_index()?.predecessor_block(lower)?.unwrap_or(0),
+                None => 0,
+            };
+            (start, reader.dict_blocks_all_for_merge()?)
+        };
         Ok(Self {
             reader,
-            rg_index: 0,
-            stream: None,
+            blocks,
+            block_id: start_block,
+            block_pos: 0,
+            block_started: false,
+            raw_key: Vec::new(),
+            block_ordinal_pos: 0,
             lower,
             upper,
             field_map,
@@ -181,49 +204,84 @@ impl<'r> RemappedTermStream<'r> {
         })
     }
 
+    /// Decode the next raw key of the current block into `self.raw_key`.
+    /// `Ok(false)` = block exhausted.
+    fn next_raw_key(&mut self) -> Result<bool> {
+        let index = self.reader.dict_index()?;
+        let range = index.block_range(self.block_id, self.blocks.len() as u64);
+        let block = &self.blocks[range.start as usize..range.end as usize];
+        if !self.block_started {
+            self.block_started = true;
+            self.block_pos = 0;
+            self.block_ordinal_pos = 0;
+            if block.is_empty() {
+                return Ok(false);
+            }
+            let len = u16::from_le_bytes(
+                block
+                    .get(0..2)
+                    .ok_or_else(|| VixError::Malformed("dict block header truncated".to_string()))?
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            self.raw_key.clear();
+            self.raw_key
+                .extend_from_slice(block.get(2..2 + len).ok_or_else(|| {
+                    VixError::Malformed("dict block first key truncated".to_string())
+                })?);
+            self.block_pos = 2 + len;
+            return Ok(true);
+        }
+        if self.block_pos >= block.len() {
+            return Ok(false);
+        }
+        let (shared, suffix_len) =
+            crate::dict_blocks::read_two_varints(block, &mut self.block_pos)?;
+        if shared > self.raw_key.len() {
+            return Err(VixError::Malformed(
+                "dict block shared prefix exceeds previous key".to_string(),
+            ));
+        }
+        let suffix = block
+            .get(self.block_pos..self.block_pos + suffix_len)
+            .ok_or_else(|| VixError::Malformed("dict block suffix truncated".to_string()))?;
+        self.block_pos += suffix_len;
+        self.raw_key.truncate(shared);
+        self.raw_key.extend_from_slice(suffix);
+        self.block_ordinal_pos += 1;
+        Ok(true)
+    }
+
     /// Advance to the next surviving term. `Ok(false)` = exhausted. After
     /// `Ok(true)`, `cur_key`/`cur_ordinal` describe the term.
     fn advance(&mut self) -> Result<bool> {
         loop {
-            if self.stream.is_none() {
-                // next row group intersecting [lower, upper)
-                loop {
-                    let Some(rg) = self.reader.term_row_groups().get(self.rg_index) else {
-                        return Ok(false);
-                    };
-                    if let Some(upper) = self.upper
-                        && rg.term_min.as_slice() >= upper
-                    {
-                        // row groups are sorted: everything later is past
-                        // the range too
-                        return Ok(false);
-                    }
-                    if let Some(lower) = self.lower
-                        && rg.term_max.as_slice() < lower
-                    {
-                        self.rg_index += 1;
-                        continue;
-                    }
-                    break;
-                }
-                // loads the row-group FST on first touch (compaction inputs
-                // are in-memory blobs: a pure decode, no fetch)
-                let mut range = self.reader.rg_fst(self.rg_index)?.range();
-                if let Some(lower) = self.lower {
-                    range = range.ge(lower);
-                }
-                if let Some(upper) = self.upper {
-                    range = range.lt(upper);
-                }
-                self.stream = Some(range.into_stream());
+            if self.reader.term_count() == 0 {
+                return Ok(false);
             }
-            let first_ordinal = self.reader.term_row_groups()[self.rg_index].first_ordinal;
-            let stream = self.stream.as_mut().expect("stream set above");
-            let Some((key, local)) = stream.next() else {
-                self.stream = None;
-                self.rg_index += 1;
+            let dict_index = self.reader.dict_index()?;
+            if self.block_id >= dict_index.block_count() {
+                return Ok(false);
+            }
+            if !self.next_raw_key()? {
+                self.block_id += 1;
+                self.block_started = false;
                 continue;
-            };
+            }
+            // range bounds on the RAW key space
+            if let Some(lower) = self.lower
+                && self.raw_key.as_slice() < lower
+            {
+                continue;
+            }
+            if let Some(upper) = self.upper
+                && self.raw_key.as_slice() >= upper
+            {
+                return Ok(false);
+            }
+            let first_ordinal = dict_index.meta(self.block_id).1;
+            let local = self.block_ordinal_pos;
+            let key: &[u8] = &self.raw_key;
             let Some((token, field_id)) = split_key(key) else {
                 return Err(VixError::Malformed(format!(
                     "dictionary key too short to carry a field-id prefix: {key:?}"
@@ -272,8 +330,8 @@ impl<'r> RemappedTermStream<'r> {
 
 /// The merged index of [`merge_indexes`].
 pub(crate) struct MergedIndexResult {
-    /// `(dict, terms)` blob bytes; `None` when the inputs carry no terms.
-    pub blobs: Option<(Vec<u8>, Vec<u8>)>,
+    /// The index blob bytes; `None` when the inputs carry no terms.
+    pub blobs: Option<crate::writer::IndexBlobs>,
     pub term_count: u64,
     /// Per-file value-bloom hashes for the MERGED file (collected by the
     /// k-way workers over the deduplicated output terms).
@@ -290,6 +348,7 @@ pub(crate) struct MergedIndexResult {
 /// thread into its own [`TermSink`], and the sinks' parts are stitched into
 /// the blobs ([`write_index_blobs`] rebases the row-group ordinals). `threads
 /// == 0` uses the machine's available parallelism.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn merge_indexes(
     inputs: &[&VixReader],
     doc_maps: &[DocIdMap],
@@ -297,8 +356,7 @@ pub(crate) fn merge_indexes(
     bloom_field_names: &[String],
     total_rows: u64,
     postings_chunk_bytes: usize,
-    rg_term_bytes: usize,
-    cell_min_bytes: usize,
+    plist_min_docs: u32,
     threads: usize,
 ) -> Result<MergedIndexResult> {
     debug_assert_eq!(inputs.len(), doc_maps.len());
@@ -374,8 +432,7 @@ pub(crate) fn merge_indexes(
                             bloom_field_names,
                             total_rows,
                             postings_chunk_bytes,
-                            rg_term_bytes,
-                            cell_min_bytes,
+                            plist_min_docs,
                             lower,
                             upper,
                         );
@@ -414,8 +471,7 @@ pub(crate) fn merge_indexes(
             bloom_field_names,
             total_rows,
             postings_chunk_bytes,
-            rg_term_bytes,
-            cell_min_bytes,
+            plist_min_docs,
             None,
             None,
         )?]
@@ -468,9 +524,12 @@ fn partition_bounds(_inputs: &[&VixReader], _threads: usize) -> Vec<Vec<u8>> {
 }
 
 /// K-way merge one key range of the inputs' remapped term streams into a
-/// fresh [`TermSink`]. Postings blobs are final: dense terms (`doc_count ==
-/// total_rows`) are elided to the empty blob. Also returns the names of the
-/// fields whose value terms were dropped for lack of an output field id.
+/// fresh [`TermSink`]. Postings cells are final: dense terms (`doc_count ==
+/// total_rows`) are elided to the empty cell — taking precedence over the
+/// plist threshold — and terms at/above `plist_min_docs` go out-of-row into
+/// the sink's plist region as [`postings::encode_record`] bytes. Also
+/// returns the names of the fields whose value terms were dropped for lack
+/// of an output field id.
 #[allow(clippy::too_many_arguments)]
 fn merge_term_range(
     inputs: &[&VixReader],
@@ -480,8 +539,7 @@ fn merge_term_range(
     bloom_field_names: &[String],
     total_rows: u64,
     postings_chunk_bytes: usize,
-    rg_term_bytes: usize,
-    cell_min_bytes: usize,
+    plist_min_docs: u32,
     lower: Option<&[u8]>,
     upper: Option<&[u8]>,
 ) -> Result<(crate::writer::TermSinkParts, BTreeSet<String>)> {
@@ -493,9 +551,9 @@ fn merge_term_range(
     // field ids; the remap is order-preserving (ids are assigned by sorted
     // field name everywhere), backstopped by the strictly-ascending check
     // in RemappedTermStream::advance.
-    let mut sink =
-        crate::writer::TermSink::new(postings_chunk_bytes, rg_term_bytes, cell_min_bytes)
-            .with_bloom(crate::bloom::BloomHashAcc::from_pairs(bloom_pairs));
+    let mut sink = crate::writer::TermSink::new(postings_chunk_bytes)
+        .with_bloom(crate::bloom::BloomHashAcc::from_pairs(bloom_pairs))
+        .with_plist_min_docs(plist_min_docs);
     let mut streams: Vec<RemappedTermStream<'_>> = inputs
         .iter()
         .map(|reader| RemappedTermStream::new(reader, out_field_ids, lower, upper))
@@ -550,8 +608,12 @@ fn merge_term_range(
         blob.clear();
         if doc_count == total_rows && total_rows > 0 {
             // dense in the merged file: elide (re-checked against the merged
-            // row count, independent of the inputs' density)
+            // row count, independent of the inputs' density) — takes
+            // precedence over the plist threshold, a dense term is never a
+            // pointer cell
+            sink.push(&key, doc_count as u32, &blob)?;
         } else {
+            let as_record = sink.plist_eligible(doc_count);
             merge_postings(
                 &streams,
                 tables,
@@ -559,11 +621,16 @@ fn merge_term_range(
                 doc_maps,
                 &contributors,
                 doc_count,
+                as_record,
                 &mut ids,
                 &mut blob,
             )?;
+            if as_record {
+                sink.push_plist(&key, doc_count as u32, &blob)?;
+            } else {
+                sink.push(&key, doc_count as u32, &blob)?;
+            }
         }
-        sink.push(&key, doc_count as u32, &blob)?;
 
         for &index in &contributors {
             alive[index] = streams[index].advance()?;
@@ -577,8 +644,10 @@ fn merge_term_range(
     Ok((sink.into_parts()?, dropped))
 }
 
-/// Union the contributors' postings into `blob` (encoded), remapping doc ids
-/// through the inputs' [`DocIdMap`]s.
+/// Union the contributors' postings into `blob`, remapping doc ids through
+/// the inputs' [`DocIdMap`]s. `as_record = false` encodes the plain inline
+/// [`postings::encode`] blob; `true` produces the out-of-row
+/// [`postings::encode_record`] bytes (skip table + blob) instead.
 #[allow(clippy::too_many_arguments)]
 fn merge_postings(
     streams: &[RemappedTermStream<'_>],
@@ -587,17 +656,35 @@ fn merge_postings(
     doc_maps: &[DocIdMap],
     contributors: &[usize],
     doc_count: u64,
+    as_record: bool,
     ids: &mut Vec<u32>,
     blob: &mut Vec<u8>,
 ) -> Result<()> {
-    // single contributor at offset 0: the encoded blob is valid verbatim
+    // single contributor at offset 0: the cell's bytes are valid verbatim
+    // when input and output agree on the representation — inline blob for an
+    // inline output, resolved RECORD bytes (self-contained skip table +
+    // blob, doc ids unchanged) for a record output. A representation
+    // mismatch (inline input above the output threshold, or pointer input
+    // below it) falls through to the decode + re-encode path.
     if let [index] = contributors
         && let DocIdMap::Offset(0) = doc_maps[*index]
     {
+        let input_doc_count = u64::from(tables[*index].doc_count(streams[*index].cur_ordinal));
         let encoded = tables[*index].postings_blob(streams[*index].cur_ordinal);
         if !encoded.is_empty() {
-            blob.extend_from_slice(encoded);
-            return Ok(());
+            let input_pointer = inputs[*index].plist_pointer_cell(input_doc_count, encoded);
+            match (as_record, input_pointer) {
+                (false, false) => {
+                    blob.extend_from_slice(encoded);
+                    return Ok(());
+                }
+                (true, true) => {
+                    let record = inputs[*index].plist_record_bytes(encoded)?;
+                    blob.extend_from_slice(&record);
+                    return Ok(());
+                }
+                _ => {} // representation mismatch: decode below
+            }
         }
         // dense-elided in the input: fall through and expand it
     }
@@ -621,6 +708,15 @@ fn merge_postings(
         let input_rows = inputs[index].row_count();
         let input_doc_count = tables[index].doc_count(streams[index].cur_ordinal);
         let encoded = tables[index].postings_blob(streams[index].cur_ordinal);
+        // out-of-row postings in the INPUT: resolve the pointer cell through
+        // the input's plist blob and decode the record's blob region
+        let record;
+        let encoded = if inputs[index].plist_pointer_cell(u64::from(input_doc_count), encoded) {
+            record = inputs[index].plist_record_bytes(encoded)?;
+            postings::record_blob(&record)?
+        } else {
+            encoded
+        };
         match (&doc_maps[index], encoded.is_empty() && input_doc_count > 0) {
             (DocIdMap::Offset(offset), true) => {
                 // dense in the input: ids are 0..row_count
@@ -662,7 +758,11 @@ fn merge_postings(
             ));
         }
     }
-    *blob = postings::encode(ids)?;
+    *blob = if as_record {
+        postings::encode_record(ids)?
+    } else {
+        postings::encode(ids)?
+    };
     Ok(())
 }
 

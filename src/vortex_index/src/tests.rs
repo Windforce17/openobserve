@@ -209,7 +209,10 @@ fn roundtrip_metadata_and_fields() {
     let reader = build_dataset(dataset_options());
     assert_eq!(reader.row_count(), 10);
     assert_eq!(reader.row_group_size(), 128);
-    assert_eq!(reader.term_row_group_count(), 1);
+    // block dictionary: blocks never span fields — the 10-doc dataset's
+    // key space (code/level/log/svc value fields + the key-term cluster)
+    // yields one block per field group
+    assert_eq!(reader.term_row_group_count(), 5);
     // Field ids follow the sorted value-indexed field names — numeric fields
     // included (their canonical value terms carry the id): code=0, level=1,
     // log=2, svc=3.
@@ -581,7 +584,6 @@ fn multi_row_group_scans() {
     let mut writer = VixWriter::new(
         &schema,
         VixWriterOptions {
-            rg_term_bytes: 1024,
             ..Default::default()
         },
         false,
@@ -1051,7 +1053,12 @@ fn unknown_blob_types_are_ignored() {
         vec![
             // an unknown blob FIRST, so recognition cannot rely on order
             ("some-future-blob-v9", "future", b"opaque bytes".to_vec()),
-            ("o2-vix-dict-v1", "dict", blob_bytes(container.dict)),
+            ("o2-vix-dict-v2", "dict", blob_bytes(container.dict)),
+            (
+                "o2-vix-dictblocks-v1",
+                "dict_blocks",
+                blob_bytes(container.dict_blocks),
+            ),
             ("o2-vix-terms-v1", "terms", blob_bytes(container.terms)),
             ("o2-vix-docs-v1", "docs", blob_bytes(container.docs)),
         ],
@@ -1305,7 +1312,7 @@ fn container_properties_match_spec() {
     assert_eq!(props["row_count"], "10");
     assert_eq!(props["row_group_size"], "128");
     assert_eq!(props["tokenizer"], "o2-v2");
-    assert_eq!(props["dict_layout"], "cells");
+    assert_eq!(props["dict_layout"], "blocks");
     assert_eq!(props["partial_fields"], "[]");
     assert!(props["term_count"].parse::<u64>().unwrap() > 0);
 
@@ -1344,7 +1351,8 @@ fn container_properties_match_spec() {
         blobs,
         vec![
             ("o2-vix-docs-v1", "docs"),
-            ("o2-vix-dict-v1", "dict"),
+            ("o2-vix-dict-v2", "dict"),
+            ("o2-vix-dictblocks-v1", "dict_blocks"),
             ("o2-vix-terms-v1", "terms"),
         ]
     );
@@ -2114,6 +2122,7 @@ fn scale_200k_docs_dense_elision() {
         let size = range.end - range.start;
         match blob.properties["blob_tag"].as_str() {
             "dict" => dict_size = size,
+            "dict_blocks" => dict_size += size,
             "terms" => terms_size = size,
             "docs" => docs_size = size,
             other => panic!("unexpected blob {other:?}"),
@@ -2537,7 +2546,10 @@ fn repack_with_properties(
     };
     let mut blobs: Vec<(&'static str, &'static str, Vec<u8>)> = Vec::new();
     if let Some(dict) = blob_bytes(container.dict) {
-        blobs.push(("o2-vix-dict-v1", "dict", dict));
+        blobs.push(("o2-vix-dict-v2", "dict", dict));
+    }
+    if let Some(BlobHandle::Mem(blocks)) = container.dict_blocks {
+        blobs.push(("o2-vix-dictblocks-v1", "dict_blocks", blocks.to_vec()));
     }
     if let Some(terms) = blob_bytes(container.terms) {
         blobs.push(("o2-vix-terms-v1", "terms", terms));
@@ -3056,7 +3068,6 @@ fn field_value_counts_dense_elision_and_multi_rg() {
     .unwrap();
     // a tiny row-group budget forces the dictionary across several groups
     let opts = VixWriterOptions {
-        rg_term_bytes: 8,
         ..Default::default()
     };
     let mut writer = VixWriter::new(&schema, opts, false);
@@ -3646,7 +3657,6 @@ mod ranged {
         ]));
         let opts = VixWriterOptions {
             column_store_field_names: vec!["level".to_string()],
-            rg_term_bytes: 256 * 1024,
             row_group_size: 8192,
             // Pin docs chunks to the pre-Fix-B scale of this file (~8k rows
             // of ~250 arrow bytes): the budgets below assert F2's ranged-IO
@@ -4202,134 +4212,6 @@ mod ranged {
         crate::VixDocs::open_ranged(Arc::clone(&source) as Arc<dyn VixRangeSource>)
             .expect("docs must open even when the dictionary is unreadable");
     }
-
-    /// Files written BEFORE lazy dict loading packed the whole `fst` column
-    /// into ONE huge chunk (`compressed_strategy` repartitions by rows with
-    /// no byte bound; the `dict_layout` property is absent). Readers must
-    /// answer them identically: the open stays directory-only (the three
-    /// small columns live in their own chunks even there), and the first
-    /// FST touch simply decodes the one big chunk — correct, just not
-    /// cell-granular until compaction rewrites the file.
-    #[test]
-    fn ranged_reads_pre_lazy_dict_layout() {
-        use crate::container::{
-            BLOB_TAG_DICT, BLOB_TAG_DOCS, BLOB_TAG_TERMS, BLOB_TYPE_DICT, BLOB_TYPE_DOCS,
-            BLOB_TYPE_TERMS, BlobHandle, PROP_DICT_LAYOUT, RowSelection, build_container,
-            compressed_strategy, parse_container, scan_blob, write_vortex_blob,
-        };
-
-        // dict_layout (chunking) is orthogonal to the key layout: fabricate
-        // the pre-lazy chunking from the shared fixture, keeping its
-        // key_layout property (absent key_layout is a hard open error)
-        let data = build_large_core_file();
-        let container = parse_container(&data).unwrap();
-        // decode the (per-cell) dict rows and re-encode them the pre-lazy
-        // way: one pushed batch through the default pipeline
-        let dict_handle = container.dict.expect("fixture has terms");
-        let batches = scan_blob(&dict_handle, None, RowSelection::All).unwrap();
-        let schema = batches[0].schema();
-        let one_batch = arrow::compute::concat_batches(&schema, &batches).unwrap();
-        let old_dict = write_vortex_blob(&schema, &[one_batch], compressed_strategy(0), 0).unwrap();
-        let mem_bytes = |handle: Option<BlobHandle>| match handle {
-            Some(BlobHandle::Mem(bytes)) => bytes.to_vec(),
-            other => panic!("expected an in-memory blob, got {other:?}"),
-        };
-        // pre-lazy files carry no dict_layout property
-        let properties: Vec<(String, String)> = container
-            .properties
-            .iter()
-            .filter(|(key, _)| key.as_str() != PROP_DICT_LAYOUT)
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect();
-        let old_data = Bytes::from(
-            build_container(
-                properties,
-                vec![
-                    (BLOB_TYPE_DICT, BLOB_TAG_DICT, old_dict),
-                    (BLOB_TYPE_TERMS, BLOB_TAG_TERMS, mem_bytes(container.terms)),
-                    (BLOB_TYPE_DOCS, BLOB_TAG_DOCS, mem_bytes(container.docs)),
-                ],
-            )
-            .unwrap(),
-        );
-
-        let reference = VixReader::open(data).unwrap();
-        let source = CountingSource::new(old_data);
-        let old_reader =
-            VixReader::open_ranged(Arc::clone(&source) as Arc<dyn VixRangeSource>).unwrap();
-        // the directory columns are separate small chunks even in the old
-        // layout: the open must not pull the fst column
-        assert!(
-            source.bytes() < 512 * 1024,
-            "old-layout open fetched {} bytes (must be directory-only)",
-            source.bytes()
-        );
-        assert_eq!(old_reader.term_count(), reference.term_count());
-        assert_eq!(
-            old_reader.term_row_group_count(),
-            reference.term_row_group_count()
-        );
-
-        // exact-term parity (hits and misses), count parity, prefix parity,
-        // per-value counts parity — the whole FST surface over the old layout.
-        // Retention stays per requested cell (never widen-to-all: a legacy
-        // 40 MB dictionary would otherwise pin itself resident and thrash
-        // the reader cache), so memory grows per touched row group only.
-        let mut last_memory = old_reader.memory_size();
-        for needle in ["svc_000000", "svc_054321", "svc_099999", "svc_absent"] {
-            let query = VixQuery::Exact {
-                field: "svc".to_string(),
-                token: needle.as_bytes().to_vec(),
-            };
-            assert_eq!(
-                old_reader
-                    .eval(&query)
-                    .unwrap()
-                    .set_indices()
-                    .collect::<Vec<_>>(),
-                reference
-                    .eval(&query)
-                    .unwrap()
-                    .set_indices()
-                    .collect::<Vec<_>>(),
-                "exact({needle}) parity"
-            );
-            assert_eq!(
-                old_reader.count(&query).unwrap(),
-                reference.count(&query).unwrap()
-            );
-            assert!(
-                old_reader.memory_size() >= last_memory,
-                "resident cells only accumulate"
-            );
-            last_memory = old_reader.memory_size();
-        }
-        // strictly fewer resident FST bytes than a fully loaded reader:
-        // the probes touched a few of the many row groups. (An any-field
-        // Contains walks every cell — under field-major keys a
-        // keys_with_prefix("") walk would only touch the key-term range.)
-        let _ = reference
-            .eval(&VixQuery::Contains {
-                field: None,
-                needle: b"absent-needle".to_vec(),
-                case_insensitive: false,
-            })
-            .unwrap(); // fully load reference
-        assert!(
-            old_reader.memory_size() < reference.memory_size(),
-            "legacy files must not retain every decoded cell ({} vs {})",
-            old_reader.memory_size(),
-            reference.memory_size()
-        );
-        assert_eq!(
-            old_reader.keys_with_prefix("sv").unwrap(),
-            reference.keys_with_prefix("sv").unwrap()
-        );
-        assert_eq!(
-            old_reader.field_value_counts("level").unwrap(),
-            reference.field_value_counts("level").unwrap()
-        );
-    }
 }
 
 /// AND evaluation short-circuits: a leaf that matches no term proves the
@@ -4767,6 +4649,208 @@ fn bench_real_vix_file() {
     }
 }
 
+/// Stage-2 plist WRITER ([`VixWriterOptions::postings_plist_min_docs`]):
+/// terms at/above the threshold store their postings out-of-row in the
+/// `plist` blob behind a 12-byte pointer cell; dense elision keeps
+/// precedence; `0` (default) is byte-identical to the pre-plist writer.
+mod plist {
+    use super::*;
+    use crate::query::KEY_FIELD_ID;
+
+    /// Every term of the file via the public enumeration (pointer cells
+    /// resolved through the plist blob, dense terms expanded).
+    fn all_terms(reader: &VixReader) -> Vec<(Vec<u8>, u64, Vec<u32>)> {
+        let mut out = Vec::new();
+        reader
+            .for_each_term(&mut |key, doc_count, ids| {
+                out.push((key.to_vec(), doc_count, ids.to_vec()));
+                Ok(())
+            })
+            .unwrap();
+        out
+    }
+
+    fn plist_options(min_docs: u32) -> VixWriterOptions {
+        VixWriterOptions {
+            postings_plist_min_docs: min_docs,
+            ..dataset_options()
+        }
+    }
+
+    /// Round-trip at threshold 4 over the 10-doc dataset: terms at/above 4
+    /// docs live out-of-row (12-byte pointer cells into the `plist` blob),
+    /// terms below stay inline exactly as before, dense terms stay elided,
+    /// the property persists, and the term walk resolves everything back to
+    /// the plist-less baseline's stream.
+    #[test]
+    fn plist_roundtrip_above_and_below_threshold() {
+        let baseline = build_dataset(dataset_options());
+        let bytes = build_dataset_bytes(plist_options(4));
+
+        // container: capability property + plist blob present
+        let meta = puffin::reader::parse_puffin_footer_from_bytes(&bytes).unwrap();
+        assert_eq!(meta.properties["plist_min_docs"], "4");
+        assert!(
+            meta.blobs
+                .iter()
+                .any(|blob| blob.blob_type == "o2-vix-plist-v1"
+                    && blob.properties["blob_tag"] == "plist"),
+            "plist blob missing from the container"
+        );
+
+        let reader = VixReader::open(Bytes::from(bytes)).unwrap();
+        assert_eq!(reader.plist_min_docs(), 4);
+
+        // cell shapes — pointer (exactly 12 bytes) at/above the threshold:
+        // the `level` key term covers 9 docs, svc="api" covers 4
+        let svc_id = reader.field_id("svc").unwrap();
+        let level_id = reader.field_id("level").unwrap();
+        assert_eq!(
+            reader.debug_postings_len(b"level", KEY_FIELD_ID).unwrap(),
+            Some(12)
+        );
+        assert_eq!(reader.debug_postings_len(b"api", svc_id).unwrap(), Some(12));
+        // inline below it (level="error" covers 3 docs), byte-length-equal
+        // to the baseline's inline cell
+        assert_eq!(
+            reader.debug_postings_len(b"error", level_id).unwrap(),
+            baseline.debug_postings_len(b"error", level_id).unwrap()
+        );
+        // dense-elided terms keep the EMPTY cell even above the threshold
+        assert_eq!(
+            reader.debug_postings_len(b"svc", KEY_FIELD_ID).unwrap(),
+            Some(0)
+        );
+
+        // the full walk (pointer resolution included) matches the baseline
+        let terms = all_terms(&reader);
+        assert_eq!(terms, all_terms(&baseline));
+        // sanity: some walked term really crossed the threshold un-densely
+        assert!(
+            terms
+                .iter()
+                .any(|(_, doc_count, ids)| *doc_count >= 4 && (ids.len() as u64) < 10)
+        );
+    }
+
+    /// Stage 3: the QUERY paths resolve pointer cells — `eval`
+    /// (postings_union under every leaf/compound) and `count` answer
+    /// identically over the plist build and the plist-less baseline, across
+    /// pointer, inline, dense, and mixed shapes.
+    #[test]
+    fn plist_pointer_cells_answer_queries() {
+        let baseline = build_dataset(dataset_options());
+        let plist = build_dataset(plist_options(4));
+
+        let queries = [
+            // pointer cell (svc="api": 4 docs at threshold 4)
+            VixQuery::Exact {
+                field: "svc".to_string(),
+                token: b"api".to_vec(),
+            },
+            // pointer via the key-exists path (`level` key term: 9 docs)
+            VixQuery::KeyExists {
+                path: "level".to_string(),
+            },
+            // multi-ordinal union: pointer + inline in one decode loop
+            VixQuery::Or(vec![
+                VixQuery::Exact {
+                    field: "svc".to_string(),
+                    token: b"api".to_vec(),
+                },
+                VixQuery::Exact {
+                    field: "level".to_string(),
+                    token: b"error".to_vec(),
+                },
+            ]),
+            // compound over pointer cells
+            VixQuery::And(vec![
+                VixQuery::KeyExists {
+                    path: "level".to_string(),
+                },
+                VixQuery::Exact {
+                    field: "svc".to_string(),
+                    token: b"api".to_vec(),
+                },
+            ]),
+            VixQuery::Not(Box::new(VixQuery::Exact {
+                field: "svc".to_string(),
+                token: b"api".to_vec(),
+            })),
+        ];
+        for query in &queries {
+            assert_eq!(
+                plist.eval(query).unwrap().set_indices().collect::<Vec<_>>(),
+                baseline
+                    .eval(query)
+                    .unwrap()
+                    .set_indices()
+                    .collect::<Vec<_>>(),
+                "eval mismatch for {query:?}"
+            );
+            assert_eq!(
+                plist.count(query).unwrap(),
+                baseline.count(query).unwrap(),
+                "count mismatch for {query:?}"
+            );
+        }
+    }
+
+    /// Dense-elision precedence: with threshold 1 EVERY non-dense term
+    /// becomes a pointer cell, yet a term present in every row keeps its
+    /// empty cell — never a pointer — and the reader keeps synthesizing it
+    /// from `doc_count` alone.
+    #[test]
+    fn plist_dense_elision_takes_precedence() {
+        let reader = build_dataset(plist_options(1));
+        // svc and code are non-null in all 10 docs: dense key terms
+        assert_eq!(
+            reader.debug_postings_len(b"svc", KEY_FIELD_ID).unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            reader.debug_postings_len(b"code", KEY_FIELD_ID).unwrap(),
+            Some(0)
+        );
+        // while a single-doc term goes out-of-row at threshold 1
+        let code_id = reader.field_id("code").unwrap();
+        assert_eq!(
+            reader
+                .debug_postings_len(&crate::numeric_value_token("1"), code_id)
+                .unwrap(),
+            Some(12)
+        );
+        // the walk still expands dense terms and resolves every pointer
+        assert_eq!(
+            all_terms(&reader),
+            all_terms(&build_dataset(dataset_options()))
+        );
+    }
+
+    /// Feature off (`postings_plist_min_docs: 0`): no plist blob, no
+    /// property, and the whole container is byte-identical to a build where
+    /// the option was never set (the field's default).
+    #[test]
+    fn plist_disabled_is_byte_identical() {
+        let default_bytes = build_dataset_bytes(dataset_options());
+        let off_bytes = build_dataset_bytes(plist_options(0));
+        assert!(
+            default_bytes == off_bytes,
+            "plist_min_docs = 0 must not change a single output byte \
+             ({} vs {} bytes)",
+            default_bytes.len(),
+            off_bytes.len()
+        );
+        let meta = puffin::reader::parse_puffin_footer_from_bytes(&off_bytes).unwrap();
+        assert!(!meta.properties.contains_key("plist_min_docs"));
+        assert!(
+            meta.blobs
+                .iter()
+                .all(|blob| blob.properties["blob_tag"] != "plist")
+        );
+    }
+}
+
 /// Compaction index merge ([`VixWriter::merge_input_indexes`] +
 /// [`crate::merge`]): the merged dictionary must be indistinguishable from
 /// one built directly over the merged rows.
@@ -4871,6 +4955,175 @@ mod index_merge {
         let mut writer = VixWriter::new(schema, opts.clone(), false);
         writer.push_batch_with_source(batch, source, None).unwrap();
         VixReader::open(Bytes::from(writer.finish().unwrap())).unwrap()
+    }
+
+    /// Merge-path plist emission: plist-less inputs merged by a writer with
+    /// `postings_plist_min_docs` set produce pointer cells whose resolved
+    /// postings match the plist-less merge exactly — dense re-check
+    /// included (a merged-dense term stays the empty cell, never a
+    /// pointer).
+    #[test]
+    fn merged_index_emits_plist_pointer_cells() {
+        let (schema, opts, batches, sources) = equivalence_inputs();
+        let readers: Vec<VixReader> = batches
+            .iter()
+            .zip(&sources)
+            .map(|(batch, source)| build_input(&schema, &opts, batch, source))
+            .collect();
+        let refs: Vec<&VixReader> = readers.iter().collect();
+        let sizes: Vec<usize> = batches.iter().map(RecordBatch::num_rows).collect();
+        let doc_maps = vec![
+            DocIdMap::Offset(0),
+            DocIdMap::Offset(sizes[0] as u32),
+            DocIdMap::Offset((sizes[0] + sizes[1]) as u32),
+        ];
+        let concat_order: Vec<(usize, usize)> = (0..3)
+            .flat_map(|input| (0..sizes[input]).map(move |row| (input, row)))
+            .collect();
+        let merged_batch = interleave_batches(&schema, &batches, &concat_order);
+        let merged_source = interleave_strings(&sources.iter().collect::<Vec<_>>(), &concat_order);
+
+        let build_merged = |plist_min_docs: u32| -> Vec<u8> {
+            let mut merged = VixWriter::new(
+                &schema,
+                VixWriterOptions {
+                    postings_plist_min_docs: plist_min_docs,
+                    ..opts.clone()
+                },
+                false,
+            );
+            merged.merge_input_indexes(&refs, &doc_maps, 1).unwrap();
+            merged
+                .push_docs_rows_unindexed(
+                    &timestamps_of(&merged_batch),
+                    &cs_columns_of(&merged_batch, &["svc", "code"]),
+                    &merged_source,
+                    None,
+                )
+                .unwrap();
+            merged.finish().unwrap()
+        };
+
+        let baseline = VixReader::open(Bytes::from(build_merged(0))).unwrap();
+        let plist_bytes = build_merged(2);
+        let meta = puffin::reader::parse_puffin_footer_from_bytes(&plist_bytes).unwrap();
+        assert_eq!(meta.properties["plist_min_docs"], "2");
+        assert!(
+            meta.blobs
+                .iter()
+                .any(|blob| blob.properties["blob_tag"] == "plist"),
+            "merged container must carry the plist blob"
+        );
+        let plist_reader = VixReader::open(Bytes::from(plist_bytes)).unwrap();
+
+        // the whole resolved term stream matches the plist-less merge
+        assert_eq!(all_terms(&plist_reader), all_terms(&baseline));
+        // a spanning term became a pointer cell (`level` key term: 6 of 8
+        // rows), the merged-dense one stayed empty (`svc` key term: 8 of 8)
+        assert_eq!(
+            plist_reader
+                .debug_postings_len(b"level", KEY_FIELD_ID)
+                .unwrap(),
+            Some(12)
+        );
+        assert_eq!(
+            plist_reader
+                .debug_postings_len(b"svc", KEY_FIELD_ID)
+                .unwrap(),
+            Some(0)
+        );
+    }
+
+    /// Stage 3: plist-capable INPUTS are resolved by the dictionary merge —
+    /// pointer cells decode through the input's plist blob (record bytes
+    /// reused verbatim when the single-contributor representation matches)
+    /// — so merging plist inputs yields EXACTLY the term stream of merging
+    /// the same rows from plist-less inputs, for both a plist-less output
+    /// (pointer -> inline) and a thresholded output (pointer -> record).
+    /// One mixed set also runs: plain + capable inputs in one merge.
+    #[test]
+    fn merged_index_resolves_plist_inputs() {
+        let (schema, opts, batches, sources) = equivalence_inputs();
+        let plist_opts = VixWriterOptions {
+            postings_plist_min_docs: 2,
+            ..opts.clone()
+        };
+        let plain: Vec<VixReader> = batches
+            .iter()
+            .zip(&sources)
+            .map(|(batch, source)| build_input(&schema, &opts, batch, source))
+            .collect();
+        let capable: Vec<VixReader> = batches
+            .iter()
+            .zip(&sources)
+            .map(|(batch, source)| build_input(&schema, &plist_opts, batch, source))
+            .collect();
+        let mixed: Vec<&VixReader> = vec![&plain[0], &capable[1], &capable[2]];
+        let sizes: Vec<usize> = batches.iter().map(RecordBatch::num_rows).collect();
+        let doc_maps = vec![
+            DocIdMap::Offset(0),
+            DocIdMap::Offset(sizes[0] as u32),
+            DocIdMap::Offset((sizes[0] + sizes[1]) as u32),
+        ];
+        let concat_order: Vec<(usize, usize)> = (0..3)
+            .flat_map(|input| (0..sizes[input]).map(move |row| (input, row)))
+            .collect();
+        let merged_batch = interleave_batches(&schema, &batches, &concat_order);
+        let merged_source = interleave_strings(&sources.iter().collect::<Vec<_>>(), &concat_order);
+
+        // the pre-flight accepts plist-capable inputs now
+        let writer = VixWriter::new(&schema, opts.clone(), false);
+        assert!(
+            writer
+                .check_merge_inputs(&capable.iter().collect::<Vec<_>>())
+                .is_ok(),
+            "stage 3 resolves input pointer cells; the pre-flight must not reject them"
+        );
+
+        let merge = |inputs: &[&VixReader], out_threshold: u32| -> Vec<u8> {
+            let mut merged = VixWriter::new(
+                &schema,
+                VixWriterOptions {
+                    postings_plist_min_docs: out_threshold,
+                    ..opts.clone()
+                },
+                false,
+            );
+            merged.merge_input_indexes(inputs, &doc_maps, 1).unwrap();
+            merged
+                .push_docs_rows_unindexed(
+                    &timestamps_of(&merged_batch),
+                    &cs_columns_of(&merged_batch, &["svc", "code"]),
+                    &merged_source,
+                    None,
+                )
+                .unwrap();
+            merged.finish().unwrap()
+        };
+
+        for out_threshold in [0u32, 2] {
+            let baseline = VixReader::open(Bytes::from(merge(
+                &plain.iter().collect::<Vec<_>>(),
+                out_threshold,
+            )))
+            .unwrap();
+            let from_capable = VixReader::open(Bytes::from(merge(
+                &capable.iter().collect::<Vec<_>>(),
+                out_threshold,
+            )))
+            .unwrap();
+            let from_mixed = VixReader::open(Bytes::from(merge(&mixed, out_threshold))).unwrap();
+            assert_eq!(
+                all_terms(&from_capable),
+                all_terms(&baseline),
+                "plist inputs, output threshold {out_threshold}"
+            );
+            assert_eq!(
+                all_terms(&from_mixed),
+                all_terms(&baseline),
+                "mixed inputs, output threshold {out_threshold}"
+            );
+        }
     }
 
     /// The core equivalence: merged-index files answer identically to a
@@ -6093,15 +6346,16 @@ mod review_query_eval {
     /// row group roughly per term).
     #[test]
     fn review_prefix_and_exact_across_row_group_boundaries() {
-        let values: Vec<String> = (0..40).map(|i| format!("k{i:02}")).collect();
+        // ~300-byte values: 40 of them exceed several 4KB block targets,
+        // so matches genuinely span dictionary block boundaries
+        let values: Vec<String> = (0..40)
+            .map(|i| format!("k{i:02}{}", "x".repeat(300)))
+            .collect();
         let schema = Arc::new(Schema::new(vec![
             Field::new("_timestamp", DataType::Int64, false),
             Field::new("svc", DataType::Utf8, true),
         ]));
-        let opts = VixWriterOptions {
-            rg_term_bytes: 1, // one row group per term
-            ..Default::default()
-        };
+        let opts = VixWriterOptions::default();
         let mut writer = VixWriter::new(&schema, opts, false);
         let ts: Vec<i64> = (0..40).map(|i| 1000 - i as i64).collect();
         let svc: Vec<Option<&str>> = values.iter().map(|v| Some(v.as_str())).collect();
@@ -6122,8 +6376,8 @@ mod review_query_eval {
             .unwrap();
         let reader = VixReader::open(Bytes::from(writer.finish().unwrap())).unwrap();
         assert!(
-            reader.term_row_group_count() > 10,
-            "the tiny budget must force many row groups, got {}",
+            reader.term_row_group_count() >= 3,
+            "the fat values must force several dictionary blocks, got {}",
             reader.term_row_group_count()
         );
 
@@ -7305,7 +7559,6 @@ fn file_blooms_survive_index_merge() {
 fn small_cell_dataset_options() -> VixWriterOptions {
     VixWriterOptions {
         // tiny: the 10-doc dataset still cuts several field-aligned cells
-        cell_min_bytes: 16,
         ..dataset_options()
     }
 }

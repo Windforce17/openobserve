@@ -293,6 +293,148 @@ pub(super) fn simple_histogram(
     Ok(counts)
 }
 
+/// [`simple_histogram`] for a single dense out-of-row term, WITHOUT the
+/// bitmap: each zone chunk's matched count is a skip-table rank diff
+/// (`rank(chunk_end) - rank(chunk_start)`), single-bucket chunks fold that
+/// count directly, and only bucket/window-straddling chunks decode their
+/// touched groups (then their matched rows' `_timestamp`s). Correct
+/// regardless of global `_timestamp` order — the fold relies only on
+/// per-chunk bounds, exactly like the bitmap fold.
+///
+/// `window` is the query's `[start_time, end_time)` and must be clamped
+/// EXPLICITLY: the grid's last bucket can overshoot the window (ceil
+/// sizing), and the bitmap path clamps via the time-range AND — a
+/// grid-drop-only ranked path would overcount the overshoot region
+/// (caught by the dual-build equality test). Callers must have a zone
+/// table (`reader.zone_chunks()` is Some).
+pub(super) fn ranked_simple_histogram(
+    reader: &VixReader,
+    cursor: &vortex_index::PlistCursor,
+    min_value: i64,
+    bucket_width: u64,
+    num_buckets: usize,
+    ts_offset: i64,
+    window: (i64, i64),
+) -> anyhow::Result<Vec<u64>> {
+    let mut counts = vec![0u64; num_buckets];
+    if num_buckets == 0 || cursor.doc_count() == 0 {
+        return Ok(counts);
+    }
+    let width = i64::try_from(bucket_width.max(1))
+        .map_err(|_| anyhow::anyhow!("histogram bucket width overflows i64: {bucket_width}"))?;
+    let origin = min_value - ts_offset;
+    let (win_start, win_end) = window;
+    let chunks = reader
+        .zone_chunks()
+        .ok_or_else(|| anyhow::anyhow!("ranked histogram requires a zone table"))?;
+
+    let mut boundary_rows: Vec<u64> = Vec::new();
+    // consecutive chunks share a boundary: one rank per boundary, not two
+    let mut rank_at_start = cursor.rank(0)?;
+    for chunk in chunks {
+        let start = u32::try_from(chunk.row_offset)
+            .map_err(|_| anyhow::anyhow!("chunk row offset overflows u32"))?;
+        let end = u32::try_from(chunk.row_offset + chunk.row_count)
+            .map_err(|_| anyhow::anyhow!("chunk row end overflows u32"))?;
+        let rank_at_end = cursor.rank(end)?;
+        let matched = rank_at_end - rank_at_start;
+        rank_at_start = rank_at_end;
+        if matched == 0 {
+            continue;
+        }
+        // window first (inclusive chunk bounds vs half-open window)
+        if chunk.ts_max < win_start || chunk.ts_min >= win_end {
+            continue; // whole chunk outside the query window
+        }
+        let fully_in_window = chunk.ts_min >= win_start && chunk.ts_max < win_end;
+        if fully_in_window {
+            match chunk_single_bucket(chunk.ts_min, chunk.ts_max, origin, width, num_buckets) {
+                Some(Some(bucket)) => {
+                    counts[bucket] += matched;
+                    continue;
+                }
+                Some(None) => continue, // whole chunk outside the grid
+                None => {}              // straddles bucket edges: decode below
+            }
+        }
+        // bucket-straddling or window-straddling: decode the chunk's rows
+        cursor.for_each_in_range(start, end, |row| {
+            boundary_rows.push(u64::from(row));
+            Ok(())
+        })?;
+    }
+    if !boundary_rows.is_empty() {
+        let timestamps = read_timestamps(reader, Some(&boundary_rows))?;
+        for i in 0..timestamps.len() {
+            if timestamps.is_valid(i) {
+                let ts = timestamps.value(i);
+                if ts < win_start || ts >= win_end {
+                    continue; // outside the query window (grid may overshoot)
+                }
+            }
+            accumulate_bucket(&mut counts, &timestamps, i, origin, width, num_buckets);
+        }
+    }
+    Ok(counts)
+}
+
+/// Windowed count for a single dense out-of-row term, without the bitmap:
+/// chunks fully inside `[start_time, end_time)` contribute a rank diff,
+/// disjoint chunks contribute nothing, and window-straddling chunks decode
+/// their touched groups + those rows' `_timestamp`s. The exact equivalent of
+/// `(condition bitmap & timestamp_range).count_set_bits()`.
+pub(super) fn ranked_count_in_window(
+    reader: &VixReader,
+    cursor: &vortex_index::PlistCursor,
+    start_time: i64,
+    end_time: i64,
+) -> anyhow::Result<u64> {
+    if cursor.doc_count() == 0 || start_time >= end_time {
+        return Ok(0);
+    }
+    let chunks = reader
+        .zone_chunks()
+        .ok_or_else(|| anyhow::anyhow!("ranked count requires a zone table"))?;
+    let mut count = 0u64;
+    let mut boundary_rows: Vec<u64> = Vec::new();
+    let mut rank_at_start = cursor.rank(0)?;
+    for chunk in chunks {
+        let start = u32::try_from(chunk.row_offset)
+            .map_err(|_| anyhow::anyhow!("chunk row offset overflows u32"))?;
+        let end = u32::try_from(chunk.row_offset + chunk.row_count)
+            .map_err(|_| anyhow::anyhow!("chunk row end overflows u32"))?;
+        let rank_at_end = cursor.rank(end)?;
+        let matched = rank_at_end - rank_at_start;
+        rank_at_start = rank_at_end;
+        if matched == 0 {
+            continue;
+        }
+        // inclusive chunk bounds vs [start_time, end_time)
+        if chunk.ts_min >= start_time && chunk.ts_max < end_time {
+            count += matched;
+        } else if chunk.ts_max < start_time || chunk.ts_min >= end_time {
+            // disjoint
+        } else {
+            cursor.for_each_in_range(start, end, |row| {
+                boundary_rows.push(u64::from(row));
+                Ok(())
+            })?;
+        }
+    }
+    if !boundary_rows.is_empty() {
+        let timestamps = read_timestamps(reader, Some(&boundary_rows))?;
+        for i in 0..timestamps.len() {
+            if timestamps.is_valid(i) {
+                let ts = timestamps.value(i);
+                if ts >= start_time && ts < end_time {
+                    count += 1;
+                }
+            }
+        }
+    }
+    Ok(count)
+}
+
 /// Add row `i` of `timestamps` to its histogram bucket (the exact per-row
 /// rule shared by the decode path and the zone-map boundary decode): drop
 /// nulls, drop `ts < origin`, drop buckets `>= num_buckets`.
@@ -734,6 +876,77 @@ pub(super) fn unfiltered_top_n(
         truncate_top_k(&mut top, k, ascend);
     }
     Ok(Some(top))
+}
+
+/// FILTERED single-field SimpleTopN served from the term dictionary +
+/// postings: per raw string value of `field`, the count of its documents
+/// inside `bitmap` (this file's condition∧time row set). This is the fast
+/// serve for files that predate the field's `column_store_fields` entry —
+/// the whole pre-setting history — replacing the MissingColumn scan
+/// fallback with one SIMD postings pass over the field. `Ok(None)` under
+/// exactly [`unfiltered_top_n`]'s eligibility contract.
+pub(super) fn filtered_top_n(
+    reader: &VixReader,
+    bitmap: &BooleanBuffer,
+    field: &str,
+    limit: usize,
+    ascend: bool,
+) -> anyhow::Result<Option<TopNGroups>> {
+    let Some(counts) = reader.field_value_counts_filtered(field, bitmap)? else {
+        return Ok(None);
+    };
+    let mut top: TopNGroups = counts
+        .into_iter()
+        .filter(|(_, count)| *count > 0)
+        .map(|(value, count)| (vec![String::from_utf8_lossy(&value).into_owned()], count))
+        .collect();
+    let (k, max_groups) = top_n_overfetch(1, limit);
+    if top.len() > max_groups {
+        log::debug!(
+            "search->vix: filtered dict topn file has {} distinct groups > max groups \
+             {max_groups}, keeping top {k}, the merged top-n is approximate",
+            top.len(),
+        );
+        truncate_top_k(&mut top, k, ascend);
+    }
+    Ok(Some(top))
+}
+
+/// FILTERED SimpleDistinct twin of [`filtered_top_n`]: the field's values
+/// with at least one document inside `bitmap`, in ascending byte order, so
+/// the first/last `limit` are the answer. `Ok(None)` exactly like
+/// [`unfiltered_top_n`].
+pub(super) fn filtered_distinct(
+    reader: &VixReader,
+    bitmap: &BooleanBuffer,
+    field: &str,
+    limit: usize,
+    ascend: bool,
+) -> anyhow::Result<Option<HashSet<String>>> {
+    let Some(counts) = reader.field_value_counts_filtered(field, bitmap)? else {
+        return Ok(None);
+    };
+    let hit_values: Vec<&Vec<u8>> = counts
+        .iter()
+        .filter(|(_, count)| *count > 0)
+        .map(|(value, _)| value)
+        .collect();
+    let take = limit.min(hit_values.len());
+    let selected: HashSet<String> = if ascend {
+        hit_values
+            .iter()
+            .take(take)
+            .map(|value| String::from_utf8_lossy(value).into_owned())
+            .collect()
+    } else {
+        hit_values
+            .iter()
+            .rev()
+            .take(take)
+            .map(|value| String::from_utf8_lossy(value).into_owned())
+            .collect()
+    };
+    Ok(Some(selected))
 }
 
 /// Unfiltered full-range SimpleDistinct served straight from the term

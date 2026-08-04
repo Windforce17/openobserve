@@ -3,13 +3,17 @@
 Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
 (deleted 2026-07-29; full history in git). Keep THIS file current.
 
-## Shipped state (both envs, v0.93.0-vix-20260729.40, prefix obs-20260729/)
+## Shipped state (both envs, v0.93.0-vix-20260803.63, prefix obs-20260803/,
+## db obs20260803 — BLOCK-DICT CUTOVER 2026-08-03, old prefix orphaned)
 
-- Field-major (v2) dictionaries ARE the format: keys `{fid u16 BE}{token}`,
-  1MiB field-aligned cells, per-field probe/walk ranges, match_all =
-  per-fts-field seeks. v1 files readable per file (key_layout property,
-  absent = v1; unknown values hard-error). Bloom keys PINNED to v1 byte
-  form forever. Mixed-layout merges rebuild (= upgrade path). No env knobs.
+- THE BLOCK DICTIONARY is the only readable dict layout (18-RESOLVED
+  below: ~4KB prefix-compressed key blocks + resident restart index;
+  pre-block files hard-error; FST deleted). Keys stay field-major
+  `{fid u16 BE}{token}`; match_all = per-fts-field seeks; bloom keys
+  PINNED to v1 byte form forever. plist stages 1-4 in the binary, writer
+  dark (ZO_VIX_PLIST_MIN_DOCS=0; enable 8192 compactor-first next).
+  Fetch gate ZO_VIX_FETCH_CONCURRENCY=16, point-block fetch_many.
+  Segment-scan budget counts only plan-needed columns (#20).
 - Narrow WAL schemas (present fields only), spooled big move uploads
   (≥ZO_VIX_MOVE_SPOOL_MIN_BYTES=256MiB → <wal>/vix_spool), shutdown WAL
   drain (ZO_SHUTDOWN_MOVE_DEADLINE), ZO_FILE_MOVE_FIELDS_LIMIT deleted.
@@ -262,9 +266,15 @@ note: always quote matched-count + files context with timings.
 3. Cacheable bailed-scan results (bail is rare post-field-major; low prio).
 4. Hour-job splitting across nodes (only extreme backlogs; low prio).
 5. Dotted service.name residue in otel logs pipeline (collector transform).
-6. RESOLVED 2026-08-01: vix-arch pushed to the owner's fork
-   https://github.com/Windforce17/openobserve (branch vix-arch); push
-   after every merge is now part of the ship procedure.
+6. Fork publishing = anonymous squash chain to Windforce17/openobserve
+   branch vix-arch (remote `windforce`; author/committer `anonymous
+   <anonymous@users.noreply.github.com>`, commit-tree on top of the
+   previous chain head, fast-forward push, NEVER identity/session
+   links). Chain head 4bfc6434d4 published; NEXT commit (tree ==
+   ea5b1fef9a: block dict + fetch gate + #19 + #20) is built on local
+   branch `fork-published` awaiting push — ambient gh credential has
+   no write access to the fork (owner's Windforce17 token required):
+   `git push windforce fork-published:vix-arch`.
 7. Watch: ingester-4 OOMKilled 2x 2026-07-28 21:34Z (boot+burst, self-
    healed) — recurrence means explicit ZO_MEM_TABLE_MAX_SIZE.
 8. Vortex capability review findings → see VORTEX-REVIEW.md (2026-07-29).
@@ -496,12 +506,37 @@ climbing); [SEGMENT:FLUSH] bufferfull (should stay 0); ingester WAL files
     absent. Also #16(a) CLOSED: all-rows histogram scan=12GB is
     accounting only — actual data fetches 0.00GB (zone-fold works);
     scan_size for index-answered files attributes compressed file size.
-    #15 stage 1 LANDED (dark, 2026-08-01 evening): plist record codec
-    (skip table: u32 first_doc_id + u32 blob_offset per 8 delta-blocks),
-    rank_at() property-tested vs naive on every boundary shape, and the
-    container plumbing (BLOB_TAG_PLIST / o2-vix-plist-v1 /
-    PROP_PLIST_MIN_DOCS parse). Remaining stages, with the discovered
-    integration map:
+    #15 stages 1-3 LANDED (dark, 2026-08-02, ships in .61): stage 1 =
+    record codec + rank_at() (property-tested); stage 2 = writer behind
+    ZO_VIX_PLIST_MIN_DOCS (0=off; pointer cells [u64 off][u32 len],
+    dense-elision precedence, multi-sink offset rebase, merge emission);
+    stage 3 = postings_union + for_each_term + dictionary-merge INPUTS
+    all resolve pointer cells (representation-aware single-contributor
+    verbatim fast path: inline->inline, record->record). ENABLEMENT
+    ORDER: read+consumer support on every pod FIRST (.62 carries all
+    four stages), then flip ZO_VIX_PLIST_MIN_DOCS — compactor first,
+    START AT 8192 (>= ~4096 guarantees every out-of-row record has a
+    non-degenerate skip table; owner ratified the threshold design
+    over all-out-of-row 2026-08-02: inline locality wins for the Zipf
+    tail — needles keep one-read postings; universal pointers would
+    add a dependent fetch per needle per file and ~16B/term overhead
+    on millions of rare terms while not shrinking the FST at all).
+    STAGE 4 LANDED (2026-08-02, commit 60c5445b0c): cuts+ranks
+    consumers — postings::for_each_in_range (skip-table jump-in,
+    bounded group decode, property-tested), PlistCursor
+    { rank, for_each_in_range }, collect::ranked_simple_histogram +
+    ranked_count_in_window (per-chunk rank diffs; single-bucket
+    in-window chunks fold; only bucket/window-straddling chunks
+    decode; NO global _timestamp order assumed — correct on merged
+    concatenations). CAUGHT IN TESTING: the grid's last bucket can
+    overshoot end_time (ceil sizing) — the ranked path must clamp to
+    the query window explicitly, matching the bitmap path's
+    time-range AND (dual-build equality test, 1751-vs-980 overcount).
+    Remaining: stage-4b ranged-mode SUB-record reads (skip-table head
+    fetch + one group per rank, so ranged readers fetch KBs per cut
+    instead of the whole record) — pairs with #18(b) fts dict
+    bucketing for the cold path. Original stage map (integration
+    anchors) below:
     - WRITER: VixWriterOptions.postings_plist_min_docs (default 0=off);
       TermSink push must receive IDS not blobs (writer emit at
       writer.rs:~1570 has them; merge emit at merge.rs:561/566 has them
@@ -523,3 +558,346 @@ climbing); [SEGMENT:FLUSH] bufferfull (should stay 0); ingester WAL files
     - ROLLOUT DISCIPLINE: read support ships fleet-wide FIRST (dark),
       writer enables after (compactor merge outputs are where broad
       terms live), exactly like the v1->v2 key-layout migration.
+
+19. LEGACY-WAL RESTART REPLAY DOUBLE-PERSIST (P1, PRE-EXISTING — found
+    2026-08-02 during .61 verification, NOT a .61 regression: .60
+    reproduces byte-for-byte). Repro (deterministic): legacy mode
+    (ZO_INGEST_SEGMENT_MODE off), ingest 1M rows (retention 15s), let
+    moves settle, count = exactly 1,000,000; SIGTERM (clean: "final
+    move complete, WAL empty" logged); restart the SAME data dir; count
+    = 1,136,000 (+13.6%). One raw WAL segment survives shutdown and
+    boot replay re-ingests it wholesale — rows already moved to .vix
+    get persisted AGAIN as new files (file_list sum(records) confirms
+    meta-level duplication; not a query bug). The final move moves WAL
+    parquet but the raw segment is not truncated / no replay
+    safe-point offset is persisted at shutdown. Exposure: prod
+    ingesters run SEGMENT mode (since .55) — but legacy is THE
+    ROLLBACK PATH, so any segment-mode rollback + ingester restart
+    silently duplicates until fixed. Also hits any legacy-mode
+    deployment (dev tools, benches). Fix direction: persist the replay
+    safe-point (moved-through offset) in the shutdown barrier after
+    the final move, or truncate/rotate the raw segment once the move
+    completes; boot replay must skip fully-moved segments. Verify with
+    the 3-step repro above + a kill -9 variant (replay after crash
+    must still dedup or re-move only unmoved tail). SEGMENT-MODE
+    CONTROL (ran 2026-08-02, .61 binary): ingest 1M -> clean kill ->
+    restart -> total stays EXACTLY 1,000,000 — segment mode is IMMUNE
+    (ack-after-upload + builder idempotence). Prod's live path is
+    safe; fix before any segment-mode rollback.
+
+20. SEGMENT-SCAN BUDGET COUNTED DEAD COLUMNS (P0 at prod trace volume,
+    FIXED in .63 — found 2026-08-03 during the .62 cutover verify, but
+    PRE-EXISTING since segment enablement). Prod traces ingest ~120k
+    spans/s; the ~15s live tail (builder fully caught up, oldest
+    unbuilt segment 14s) decodes to >512MB of WHOLE-WIDTH batches, so
+    ANY unconditioned query touching "now" (count(*), the traces UI
+    default) hard-errored on the per-query scan budget — while the
+    plan would only ever read `_timestamp`. Sealed-window queries and
+    conditioned needles were fine (#13's row prune). Fix: project each
+    kept batch to (plan projection ∪ condition fields ∪ _timestamp)
+    BEFORE budget accounting (project_batch_to_needed). Subtlety: IPC
+    stream decode slices all columns of a batch from ONE message-body
+    buffer — `project` alone aliases it and the whole frame stays
+    resident, so batches that shed columns are DETACHED with a `take`
+    gather copy (only kept columns materialize; count(*) kept bytes
+    become 8B/row). Zero-column projections preserve num_rows (arrow
+    row_count option) for pure count plans. SECOND SUBTLETY (segment
+    e2e caught it): a plan that reads `_source` (star selects) gets
+    batches WHOLE — `_source` is synthesized from every stored column
+    when the batch doesn't materialize it (segment frames never do);
+    projecting hollowed star hits to bare `{_timestamp}`. Verified on
+    prod post-.63: traces live-5m count serves.
+    .64-.66 FOLLOW-THROUGH (owner hit the error again in the UI —
+    star ORDER BY _timestamp DESC LIMIT reads _source, whole rows,
+    537MB tail): (a) top-n trim — running n-th-newest _timestamp
+    threshold (monotone; ties kept; superset semantics) trims batches
+    whose surviving rows are KNOWN matches (new PrunedBatch::
+    Exact/Whole/Dropped; Whole batches never trim and never feed the
+    threshold); (b) THE LIMIT RIDES IndexOptimizeMode::SimpleSelect —
+    empty_exec.limit() is None for the UI shape (DataFusion keeps
+    fetch above the sort); live logs caught .64's trim never engaging
+    (0 skipped, 258k kept records). Plumbed from the rule, DESC only;
+    (c) wave-parallel fetch+decode (DECODE_WAVE=4) — segments are
+    MIXED-STREAM, so even logs queries sequentially decoded the
+    trace-heavy tail: measured flat 1.5-2.5s/querier under EVERY
+    live-window query, ~0.5s after; (d) segment skip: once the
+    threshold locks, segments with max_ts below it skip fetch/decode
+    — gate is None-or-Condition::All (WHERE-less plans carry
+    Some(ALL), live logs showed 0 skips until .66); (e) segment
+    scan_size now = post-trim held bytes (batch-capacity summing
+    double-counted the shared IPC body: 269GB claimed for a 15s
+    tail). PROD BATTERY (60m window, median-of-3, cache off, 100-min-
+    old all-L0 prefix vs o2's long-compacted history): ui_star_live
+    obs 1629ms vs o2 2978ms (was ERROR — now WINS); count 1342/326;
+    histogram 1213/321; svc_agg 1098/512; needle 1104/989; match_all
+    883/501; logs_star 884/143; logs_token 775/147. Remaining obs gap
+    = all-L0 sealed side (no deep merges/blooms yet — heals as
+    compaction seals) + whole-tail decode on no-limit classes.
+    Residual BY DESIGN: non-_timestamp ORDER BY star over the live
+    tail genuinely needs the bytes (budget error text now says
+    narrow/filter/fewer columns). FUTURE LEVERS: frame-level stream
+    skip inside decode_segment (skip IPC parse of other streams'
+    frames; zstd is one stream so bytes still decompress), DECODE_
+    WAVE tuning, L0 file-list planning cost.
+    .66 FINALS (same battery, prefix 3h old, compactor caught up to
+    first-gen merges): ui_star_live obs 650ms vs o2 2756 (4.2x WIN,
+    was ERROR at start of day); count 996/375; histogram 877/342;
+    svc_agg 943/255; needle 1249/759 (was 3038/677 pre-compaction —
+    heals); duration_cnt 2005/1672; match_all 991/655; logs_star
+    796/106; logs_token 716/115. Skip evidence: 4 segments loaded /
+    14-32 skipped per querier, tail scan 177-235ms (was 1.5-2.5s).
+    Residual structure: o2 answers its memtable tail in-memory (~0)
+    while obs decodes the S3 tail (~200-500ms floor), and the sealed
+    side is first-generation merges (deep merges + blooms still
+    building). ALSO SHIPPED IN .66 (correctness): the top-n heap
+    clamps to the query window — frames keep on FRAME-level overlap,
+    so rows newer than end_time (always present live) inflated the
+    threshold and historical-window star+limit queries silently lost
+    live-tail rows; heap observes start<=ts<end only, mask keeps the
+    closed-range superset (segment e2e caught it; .65 in prod had the
+    unclamped trim for ~1h — window shapes at risk only during that
+    hour).
+
+21. INDEXED-FILTER + GROUP-BY-ATTRIBUTE 10x GAP (found 2026-08-03,
+    owner query: SELECT "code.function", count(*) FROM default WHERE
+    service_name='llm-router' GROUP BY "code.function" ORDER BY c
+    DESC LIMIT 100 — obs 12.1s vs o2 1.2s). The index worked
+    (condition pushed, planning instant); 17s sat in DataFusion
+    because code.function was NOT in column_store_fields — the
+    group-by extracted _source JSON per matching row, and llm-router
+    is the biggest service. L1 FIX APPLIED (config, prod+dev
+    2026-08-03 ~20:1xZ): column_store_fields += code.function via
+    settings PUT ({"column_store_fields":{"add":[...]}} — the flat
+    list form 422s). New files store it typed immediately; HISTORY
+    MIGRATES ONLY AS COMPACTOR MERGES REWRITE FILES (writer resolves
+    cs set at write time) — expect parity with o2 as the window
+    turns over. L2 (planned, structural win): IndexOptimizeMode::
+    SimpleTopNTerms — recognize GROUP BY <single indexed field> +
+    COUNT(*) + exact-term filter + ORDER BY count DESC LIMIT n; per
+    file walk the group field's contiguous dictionary block range,
+    popcount each term's postings against the filter bitmap, return
+    the term->count map; leader merges maps, takes top-n. Answers
+    entirely from the index (no docs columns), est. 200-500ms fleet-
+    wide; with plist enabled, rank-seek the fat terms instead of
+    decoding. Beats o2 structurally (they still read the column).
+    WATCH: any other hot group-by attribute has the same L1 gap —
+    add to cs on sight (each cs field costs one typed column per
+    file). Bad-case battery: o2-ch-benchmark/prod-bench/badcases.py, baselines in
+    o2-ch-benchmark/prod-bench/BASELINES.md (append-only, outside this repo).
+    L2 SHIPPED as .67 (2026-08-03 ~21:3xZ, both envs): filtered
+    single-field TopN/Distinct served from the term dictionary —
+    field_value_counts_filtered = same eligibility + unfiltered-
+    doc-count reconciliation as the unfiltered variant, then per
+    value postings ∩ condition bitmap (one SIMD pass over the
+    field's postings); recognizers now emit the rule for a single
+    term-indexed group field WITH a condition (requires_no_filter
+    apparatus deleted); per-file ineligibility still falls back via
+    MissingColumn; MultiHistogram unchanged; partial-range files now
+    serve exactly (postings∩time-bitmap) instead of falling back.
+    MEASURED (owner query, 60m, mostly pre-cs-setting files): obs
+    12,147ms -> 1,235ms median (warm 1.1-1.4s; first post-roll run
+    6.8s cold), o2 770ms warm; rule engages
+    (SimpleTopN(["code.function"],100,false) in follower logs); all
+    12 non-null groups EXACTLY equal to the generic-path dual-build
+    (forced via an extra aggregate), ordering matches o2 1:1.
+    OPEN SEMANTICS (pre-existing, decide with owner then align):
+    the NULL group — generic/DataFusion and o2 count rows lacking
+    the field as a group (48.4M here); ALL index fast paths (incl.
+    the long-shipped unfiltered ones) omit it; entangled with "":
+    the dictionary counts empty-string values as a real group
+    (24,293, currently rendered as a keyless hit) while the row
+    store folds "" into null. Cheap exact fix if wanted: null_count
+    = |bitmap| - Σ_{v!=""} counts, fold "" in, emit a null group.
+    SEPARATE: obs counts ~13% above o2 uniformly across groups and
+    paths at the same window = dual-write ingest-volume asymmetry
+    (o2 drops?) — needs an ingest-parity audit, not a query fix.
+
+22. LIVE-WINDOW COST REDUCTION, next wave (2026-08-04, owner-directed
+    "reduce live file numbers"; measurements in o2-ch-benchmark/prod-bench/BASELINES.md):
+    SHIPPED CONFIG: ZO_FILE_MERGE_THREAD_NUM prod 4→8 / dev 1→4
+    (closed-hour seal was one job on one half-idle pod, bulge ~1-2h;
+    prod PRs #359/#360, dev #208/#209) + ZO_VIX_PLIST_MIN_DOCS=8192
+    compactor-only (writer was dark — owner caught it; readers fleet-
+    wide since .62). FACTS ESTABLISHED: open-hour incremental merging
+    is ALREADY ON (incremental.rs, threshold ≈9 files/node; the
+    ZO_COMPACT_PENDING_FILES_TRIGGER docstring is STALE — no such
+    knob exists); late old-_timestamp arrivals are safe (add_job
+    re-triggers done hours; incremental counts late files); the open
+    hour holds ~300 near-target files continuously, so the steady-
+    state bulge should be only the remainder + late data — the 968-
+    file reading was likely roll churn (bulgewatch measuring).
+    ENGINE IDEAS (build after measurements):
+    (a) STREAMING SEGMENT DECODE — scan currently zstd::decode_all's
+        the whole payload per segment (that's why DECODE_WAVE
+        multiplies memory, owner asked); the format is one zstd
+        stream of per-frame-CRC'd frames → stream S3 body → zstd
+        Decoder → IPC frame-by-frame → prune/project/trim → drop.
+        Peak ≈ one frame; DECODE_WAVE can then scale to cores.
+        Replaces the plan to merely bump the constant to 8.
+    (b) TWO-LANE MERGE CLAIMING — workers claim oldest-first
+        (backlog bias), so the query-hot newest closed hour waits
+        behind any backlog; reserve one lane per compactor for the
+        newest closed hour.
+    (c) L0 BLOOMS AT SEGMENT BUILD — raw L0s (last ~10min) lack
+        blooms until first merge; builder writes them ~free.
+    Expected end-state: live-60m file count ≈ open-hour parts (~300,
+    bloomed) + ~100 L0s + short tail; needle live → ~150-250ms.
+
+18-RESOLVED (2026-08-03): THE BLOCK DICTIONARY SHIPPED AS THE FORMAT
+    (owner: "fuck v3, build as v2, no legacy" — commits 699f03c24d +
+    followups; pre-block .vix files hard-error at open; PROD DEPLOY OF
+    THIS REQUIRES A DATA RESET, use the prefix-flip procedure).
+    Layout: ~4KB prefix-compressed key blocks (never spanning fields) +
+    resident index (16B/block meta + restart-compressed first keys,
+    predecessor binary search); ordinals implicit; FST deleted
+    (tantivy-fst retained only for regex/fuzzy automata run over
+    decoded keys); exact lookup = index + ONE block.
+    MEASURED (same box, same protocol, all caches off, page cache
+    dropped; dataset 109.7M rows/202 files — HARDER than the old-dict
+    run's 100M/55 files, and #19 struck the bench driver again: the
+    compact restart replayed WAL, +9.7M dup rows, so values are not
+    cross-comparable but perf is conservative):
+    - count-full  cold  3,154ms (old dict 192,400ms -> 61x; demand
+      ~130MB vs 23.4GB -> ~180x less), warm 75ms (o2: 166/78ms on
+      450 small files — same band cold, parity warm)
+    - hist-full   cold 167ms / warm 130ms (o2 424/366 — 2.5x better)
+    - hist-straddle 126/112ms (o2 243/247)
+    - and-control cold 220ms / warm 168ms (was 2,757ms gated,
+      10,707ms pre-gate)
+    - needle trace_id cold 24ms / warm 13ms (bloomed)
+    - PER-FILE STRUCTURAL PROOF (identical 1.7GB/24.19M-term file
+      class, in-memory): cold TokenAnyField 682ms (FST) -> 1.39ms
+      (blocks) = 491x; warm 0.66ms -> 0.75ms (unchanged); open
+      2.6ms -> 1.5ms (footer-only); 76 FSTs -> 145,444 blocks.
+    - ingest rate unchanged (25.6k vs 27.1k rec/s, run variance).
+    Remaining related items: (a) fetch gate LANDED (e8fb2f4111);
+    prod S3 gate sizing note stands. (b) point-block get_ranges
+    coalescing LANDED (01e625c261) — correctness-verified; NEUTRAL on
+    the local box (3.6s vs 3.15s, noise — as the ladder audit
+    predicted), it is an S3-round-trip lever. (c) COUNT-FULL COLD
+    CEILING ANALYSIS (2026-08-03, after measuring a paged-index
+    prototype dead-end): cold-full is INDEX-LOAD bound — ~1MB
+    fk+meta per 450MB file, ~200MB aggregate at 100M-row scale;
+    paging the index LOSES to bulk at these sizes on BOTH backends
+    (locally 1 sequential MB beats ~300 point probes; on S3 one GET
+    beats 300). Real levers, diminishing returns: (i) meta
+    delta-varint (16B/block -> ~5B) + fk tightening ≈ 2x index
+    shrink -> cold ~1.6s-class; (ii) full compaction convergence
+    (bench compactor STALLED at 202 x ~450MB files for 2h — second
+    merge generation never triggered at ZO_COMPACT_MAX_FILE_SIZE=
+    4096; investigate the job generator's re-merge criteria);
+    (iii) operationally, prod's persistent disk cache makes this a
+    once-per-NEW-file cost (~1MB) — 3s-class fully-cold counts are
+    a bench-box artifact, not a prod steady state. (d) #19 fix is
+    URGENT-adjacent: it contaminated two bench datasets this week.
+
+18-HISTORY (superseded analysis, kept one cycle for the record):
+    COLD TOKEN/NEEDLE QUERIES (rewritten
+    2026-08-02 after full attribution; supersedes three earlier
+    partial narratives from the same day: "superlinear decode" WRONG
+    — decode is linear SIMD ~27ms/16M ids; "FST dict storm is the
+    491s" WRONG — the dict phase is idx_took=33s of the 486s cold
+    query; both corrections measured, not argued).
+
+    MEASURED ANATOMY of the cold cliff (100M/55 merged files, caches
+    off, page cache dropped, `count(*) WHERE match_all('failed')`,
+    82.4M hits):
+    - took=486.5s, took_detail: idx_took=33s, search_took=453s.
+    - The 453s is the DATAFUSION SCAN BRANCH: 50 of 55 files fell
+      back because concurrent dictionary cell fetches (27 field-seeks
+      x 55 files, 18.83 GB demanded in 1504 fetches) contended
+      through the cache ladder until single fetches hit the 30s
+      ZO_VIX_FETCH_TIMEOUT -> retry -> fallback -> those files were
+      SCANNED (scan_size 218 GB attributed). A slow 12MB index fetch
+      converts into a 2GB/file data scan ON THE SAME CONTENDED DISK
+      — catastrophic economics, and the .60 eval-bail never sees it
+      (the timeout path bypasses the bail comparison).
+    - Warm truth: count-full 30ms (doc_count-served, zero postings),
+      warm histogram 76ms (SIMD decode of all 82M ids included) —
+      the index format is NOT the warm bottleneck at this scale.
+    - Per-file dict truth (probe_dict_shape_of_bench_file, one 1.7GB
+      merged file, 1.92M rows): 24.18M unique terms, 76 row-group
+      FSTs (ZO_VIX_RG_TERM_BYTES=8MB default), cold in-memory
+      TokenAnyField count 682ms, warm 0.66ms. FST lookups are fast;
+      match_all costs one seek PER indexed/fts field (obs has no
+      `_all` shadow field by design).
+    - Fresh-file needle variant (564 un-bloomed files, trace_id
+      equality): 1765 fetches / 3.24 GB / 27.2s cold — same
+      fetch-demand mechanism, needle flavor; blooms fix it
+      completely once built (5ms), but logs-type streams have NO
+      default bloom fields (set bloom_filter_fields explicitly;
+      bloom_ver=-1 "not applicable" rows need a reset to 0 after
+      adding fields) and blooms only exist post-compactor.
+
+    LEVERS, re-ranked by the attribution:
+    a) LANDED (commit e8fb2f4111, 2026-08-03): global fetch gate
+       ZO_VIX_FETCH_CONCURRENCY (default 16) acquired BEFORE the
+       ZO_VIX_FETCH_TIMEOUT window opens — queue wait can no longer
+       manufacture timeouts, so the timeout->scan fallback only fires
+       on real hangs. Re-benchmarked same data, default 30s timeout:
+       cold count-full 486.5s -> 192.4s (zero fallbacks/timeouts),
+       two-token AND cold 10.7s -> 2.76s, counts byte-identical,
+       warm unchanged. The residual 192s cold = 23.4GB dict-cell
+       demand at ~122MB/s effective ladder throughput -> (b)+(c)
+       below are the remaining cold levers. (A deeper form — folding
+       real-hang fallback into eval-bail economics — stays open but
+       is no longer the cliff.)
+    b) LADDER AUDIT DONE (2026-08-03): the ladder is NOT slow —
+       raw-hardware floor for the same pattern (24GB, 12MB random
+       reads, 16 threads, cold page cache) measured 146MB/s = 164s
+       vs the ladder's 192s for 23.4GB (~15-20% overhead, fine).
+       The bench box's cloud volume IS the cold bottleneck; my
+       "2GB/s NVMe" assumption was wrong. Consequences: (i) on this
+       box the ONLY remaining cold lever is DEMAND reduction (fewer
+       bytes per dict lookup — the rg-quantum trade, parked by
+       owner); (ii) on PROD (S3 backend) aggregate GET throughput
+       scales with concurrency — ZO_VIX_FETCH_CONCURRENCY=16 is
+       sized for disk backends; consider 32-64 on S3 queriers when
+       .62 rolls (the gate exists to stop timeout-manufacture, not
+       to throttle S3). Coalescing per-field cell fetches into one
+       ranged multi-get per file remains worthwhile (fewer
+       round-trips on S3) but is latency-, not bandwidth-, bound
+       work.
+       O2 BASELINE ON THE SAME PROTOCOL (2026-08-03, its 100M/450
+       files, same box/disk, caches off, page cache dropped):
+       count-full cold 166ms/warm 78ms; hist-full 424/366ms;
+       and-control 119/80ms. Cold exact-token demand is KBs/file
+       (tantivy two-tier dict: block index + one block per lookup)
+       vs our whole-rg FST loads -> ~1000x demand gap; the parked
+       rg-quantum change (8x) cannot close it (owner paused it;
+       probe test reverted). WE WIN ALL WARM CLASSES on the same
+       protocol (counts 3x, hist-full 5.6x, hist-straddle 5x).
+       => THE structural cold lever: a BLOCK-INDEXED EXACT-LOOKUP
+       dictionary tier (resident/cacheable block index; one ~KB
+       block read per exact lookup; FST kept for prefix/regex/fuzzy)
+       — design target: cold exact-token ~= warm, 166ms-class here.
+       Value caveat: o2 counts differ (80.27M vs 82.36M; AND class
+       diverges more) — fts field-set + tokenizer differences, so
+       cross-system values are indicative only.
+    c) TOKEN-HASH SIDECAR — REJECTED BY OWNER 2026-08-03 ("we have
+       a lot of terms and hash will be big"): the earlier ~2-4MB/file
+       sizing used FRESH-file term counts; the measured merged file
+       has 24.18M unique terms -> ~12B/term = ~290MB/file (~17% of
+       file size). Dead. REPLACEMENT lever: shrink the dict fetch
+       QUANTUM — dict cells are field-aligned and a point lookup
+       touches one row group, but ZO_VIX_RG_TERM_BYTES=8MB means
+       every field-seek drags ~8MB. Smaller rgs cut per-lookup
+       demand proportionally (trade: more FSTs, less prefix-sharing,
+       more directory entries — MEASURE with the 20M isolation file
+       at 8MB vs 1MB before recompacting anything).
+    d) BLOOM-AT-INGEST for equality-indexed fields (fresh/unsealed
+       hours currently pay the needle storm until the compactor
+       blooms them; compact-disabled deployments never get blooms).
+    PLIST CONTEXT (#15, all four stages in tree): ranks beat the
+    bitmap 2.6x (histogram) / ~36x (windowed count, 1.15ms vs
+    41.6ms) per file at 16M-doc terms and remove the per-eval bitmap
+    allocation; writer costs zero ingest rate. It is the
+    postings-side complement to (c)'s dictionary-side fix, and the
+    prerequisite for rank-seek intersections. System-level today its
+    delta is small because warm decode was already ~76ms — its value
+    grows with per-file postings size and QPS.
+    Bench-harness note kept: the July harness runs both obs archs
+    with ZO_COMPACT_ENABLED=false — env-symmetric, effect-asymmetric
+    (o2-old builds its full index at ingest; obs blooms are
+    compactor-deferred). Enable compaction for obs or ship (d)
+    before comparing needle classes.

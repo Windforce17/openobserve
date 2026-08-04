@@ -77,15 +77,15 @@ use arrow::{
 };
 use bytes::Bytes;
 use levenshtein_automata::{Distance, LevenshteinAutomatonBuilder};
-use tantivy_fst::{Automaton, IntoStreamer, Map, Regex, Streamer};
+use tantivy_fst::{Automaton, Regex};
 
 use crate::{
     container::{
-        BlobHandle, FIELD_TYPE_CS, FIELD_TYPE_FTS, FIELD_TYPE_TERM, FieldEntry, PROP_FIELDS,
-        PROP_PARTIAL_FIELDS, PROP_ROW_COUNT, PROP_ROW_GROUP_SIZE, PROP_TERM_COUNT, PROP_TOKENIZER,
-        PROP_ZONE_MAP, RowSelection, VixContainer, ZoneEntry, blob_arrow_schema, column_binary,
-        column_u64, parse_container, parse_container_ranged, require_supported_format, scan_blob,
-        scan_blob_dict_column,
+        BlobHandle, DICT_LAYOUT_BLOCKS, FIELD_TYPE_CS, FIELD_TYPE_FTS, FIELD_TYPE_TERM, FieldEntry,
+        PROP_DICT_LAYOUT, PROP_FIELDS, PROP_PARTIAL_FIELDS, PROP_PLIST_MIN_DOCS, PROP_ROW_COUNT,
+        PROP_ROW_GROUP_SIZE, PROP_TERM_COUNT, PROP_TOKENIZER, PROP_ZONE_MAP, RowSelection,
+        VixContainer, ZoneEntry, blob_arrow_schema, column_binary, column_u64, parse_container,
+        parse_container_ranged, require_supported_format, scan_blob, scan_blob_dict_column,
     },
     error::{Result, VixError},
     numeric::is_numeric_value_token,
@@ -115,6 +115,51 @@ pub struct DocsDictChunk {
     pub values: ArrowArrayRef,
 }
 
+/// A dense term's out-of-row postings opened for rank-based consumption:
+/// windowed counts and chunk-bounded walks without materializing a bitmap.
+/// Obtained via [`VixReader::single_term_plist_cursor`].
+pub struct PlistCursor {
+    record: Bytes,
+    doc_count: u64,
+}
+
+impl PlistCursor {
+    /// Total ids in the list (the term's `doc_count`).
+    pub fn doc_count(&self) -> u64 {
+        self.doc_count
+    }
+
+    /// How many ids are strictly below `target` — the postings rank at a
+    /// row cut. Decodes at most one skip group plus the tail.
+    pub fn rank(&self, target: u32) -> anyhow::Result<u64> {
+        Ok(postings::rank_at(
+            &self.record,
+            self.doc_count as usize,
+            target,
+        )?)
+    }
+
+    /// Every id in `[start, end)`, ascending — decodes only the touched
+    /// skip groups.
+    pub fn for_each_in_range(
+        &self,
+        start: u32,
+        end: u32,
+        mut on_doc: impl FnMut(u32) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        Ok(postings::for_each_in_range(
+            &self.record,
+            self.doc_count as usize,
+            start,
+            end,
+            |doc| {
+                on_doc(doc).map_err(VixError::Callback)?;
+                Ok(())
+            },
+        )?)
+    }
+}
+
 /// One physical `_timestamp` chunk's zone-map entry of the `docs` blob: the
 /// chunk's row range `[row_offset, row_offset + row_count)` and its inclusive
 /// `_timestamp` bounds `[ts_min, ts_max]`. The histogram/count/timestamp-range
@@ -132,20 +177,6 @@ pub struct ZoneChunk {
     pub ts_min: i64,
     /// Largest `_timestamp` in the chunk (inclusive).
     pub ts_max: i64,
-}
-
-/// One dictionary row group. The directory triple loads at open; the FST
-/// cell loads lazily on first use (see [`VixReader::rg_fst`]).
-pub(crate) struct RgEntry {
-    pub(crate) first_ordinal: u64,
-    /// Number of terms in this row group, derived from the directory
-    /// (`next.first_ordinal - first_ordinal`; file `term_count` for the
-    /// last group). The lazily loaded FST must match it exactly.
-    pub(crate) term_count: u64,
-    pub(crate) term_min: Vec<u8>,
-    pub(crate) term_max: Vec<u8>,
-    /// The row-group FST, point-read from the `dict` blob on first touch.
-    fst: OnceLock<Map<Vec<u8>>>,
 }
 
 /// Reader over one `.vix` core file — held fully in memory
@@ -170,7 +201,18 @@ pub struct VixReader {
     /// a mismatch forces the rebuild, which re-tokenizes to the current
     /// [`crate::o2_tokenize`]).
     tokenizer: Option<String>,
-    row_groups: Vec<RgEntry>,
+    /// The parsed dictionary block index (see [`crate::dict_blocks`]),
+    /// fetched + parsed on first dictionary touch and resident for the
+    /// reader's lifetime.
+    dict_index: OnceLock<crate::dict_blocks::DictIndex>,
+    /// The dictionary BLOCKS region handle (raw concatenated blocks).
+    dict_blocks_blob: Option<BlobHandle>,
+    /// Recently fetched dictionary blocks (ranged readers): block id ->
+    /// bytes, FIFO-bounded. In-memory readers slice for free and bypass it.
+    block_cache: std::sync::Mutex<(
+        std::collections::HashMap<usize, Bytes>,
+        std::collections::VecDeque<usize>,
+    )>,
     /// The `dict` blob, kept for lazy FST-cell point reads (`None` when the
     /// file has no terms).
     dict_blob: Option<BlobHandle>,
@@ -179,6 +221,17 @@ pub struct VixReader {
     /// The per-file value-bloom blob (`None` on files written before the
     /// capability existed).
     bloom_blob: Option<BlobHandle>,
+    /// The out-of-row postings region (`plist` blob): raw concatenated
+    /// `encode_record` bytes, pointer-addressed. `None` when the file
+    /// carries no pointer cells' bytes (pre-plist file, feature off, or no
+    /// term crossed the threshold).
+    plist_blob: Option<BlobHandle>,
+    /// The `plist_min_docs` property: `> 0` ⇒ a non-dense term with
+    /// `doc_count >= plist_min_docs` has a POINTER CELL (`[u64 LE offset]
+    /// [u32 LE len]` into the plist blob) instead of an inline postings
+    /// blob — the ONLY pointer-vs-inline discriminator, cell bytes are
+    /// never sniffed. `0` ⇒ every cell is inline (pre-plist file).
+    plist_min_docs: u32,
     /// Arrow schema of the `docs` blob, loaded eagerly on in-memory readers
     /// and on first docs access on ranged readers.
     docs_schema: OnceLock<SchemaRef>,
@@ -186,7 +239,7 @@ pub struct VixReader {
     base_memory: usize,
     /// Bytes of lazily loaded FST cells currently resident (grows
     /// monotonically; loaded cells stay for the reader's lifetime).
-    fst_loaded_bytes: AtomicUsize,
+    dict_loaded_bytes: AtomicUsize,
     /// Per-chunk `_timestamp` zone table of the `docs` blob (`zone_map`
     /// property), in scan-iteration order with derived row offsets. `None`
     /// when the file carries no zone table (written before it landed, or a
@@ -251,6 +304,20 @@ impl VixReader {
             .collect();
         let tokenizer = properties.get(PROP_TOKENIZER).cloned();
         let zone_map = parse_zone_map(properties.get(PROP_ZONE_MAP).map(String::as_str), row_count);
+        // Out-of-row postings capability: the property present ⇒ pointer
+        // cells may exist and `doc_count >= plist_min_docs` selects them;
+        // absent ⇒ every cell is inline. The blob itself may legitimately
+        // be absent even with the property set (no term crossed the
+        // threshold), so its existence is checked only when a pointer cell
+        // is actually resolved.
+        let plist_min_docs: u32 = match properties.get(PROP_PLIST_MIN_DOCS) {
+            None => 0,
+            Some(raw) => raw.parse().map_err(|_| {
+                VixError::Malformed(format!(
+                    "property {PROP_PLIST_MIN_DOCS:?} is not an integer: {raw:?}"
+                ))
+            })?,
+        };
 
         // Entries typed `term` or `fts` own their positional field id
         // (their value terms / tokens carry it as the composite fid prefix).
@@ -279,42 +346,34 @@ impl VixReader {
             }
         }
 
-        let mut row_groups = Vec::new();
         let mut approx_memory = 1024usize;
         let mut dict_blob = None;
+        let mut dict_blocks_blob = None;
         if term_count > 0 {
-            // Load only the small DIRECTORY columns (KBs even for GB-scale
-            // files); the multi-MB `fst` cells are point-read lazily when an
-            // operation first touches their row group.
-            let dict = container
-                .dict
-                .ok_or_else(|| VixError::Malformed("missing dict blob".to_string()))?;
+            // The dictionary is the BLOCK layout — the only readable layout.
+            // Monolithic-FST files were retired without read support
+            // (ENGINE-BACKLOG #18): absent/foreign layouts hard-error here.
+            match properties.get(PROP_DICT_LAYOUT).map(String::as_str) {
+                Some(DICT_LAYOUT_BLOCKS) => {}
+                other => {
+                    return Err(VixError::Malformed(format!(
+                        "unsupported dict layout {other:?}: this reader only supports                          {DICT_LAYOUT_BLOCKS:?} (pre-block dictionaries were retired)",
+                    )));
+                }
+            }
+            dict_blob = Some(
+                container
+                    .dict
+                    .ok_or_else(|| VixError::Malformed("missing dict blob".to_string()))?,
+            );
+            dict_blocks_blob = Some(
+                container
+                    .dict_blocks
+                    .ok_or_else(|| VixError::Malformed("missing dict_blocks blob".to_string()))?,
+            );
             if container.terms.is_none() {
                 return Err(VixError::Malformed("missing terms blob".to_string()));
             }
-            for batch in scan_blob(
-                &dict,
-                Some(&["first_ordinal", "term_min", "term_max"]),
-                RowSelection::All,
-            )? {
-                let first_ordinals = column_u64(&batch, "first_ordinal")?;
-                let term_mins = column_binary(&batch, "term_min")?;
-                let term_maxs = column_binary(&batch, "term_max")?;
-                for (row, &first_ordinal) in first_ordinals.iter().enumerate() {
-                    let term_min = term_mins.value(row).to_vec();
-                    let term_max = term_maxs.value(row).to_vec();
-                    approx_memory += term_min.len() + term_max.len() + 192;
-                    row_groups.push(RgEntry {
-                        first_ordinal,
-                        term_count: 0, // filled by validate_row_groups
-                        term_min,
-                        term_max,
-                        fst: OnceLock::new(),
-                    });
-                }
-            }
-            validate_row_groups(&mut row_groups, term_count)?;
-            dict_blob = Some(dict);
         }
         approx_memory += fields
             .iter()
@@ -339,14 +398,21 @@ impl VixReader {
             partial_fields,
             fts_fields,
             tokenizer,
-            row_groups,
+            dict_index: OnceLock::new(),
+            dict_blocks_blob,
+            block_cache: std::sync::Mutex::new((
+                std::collections::HashMap::new(),
+                std::collections::VecDeque::new(),
+            )),
             dict_blob,
             terms_blob: container.terms,
             docs_blob,
             bloom_blob: container.bloom,
+            plist_blob: container.plist,
+            plist_min_docs,
             docs_schema: OnceLock::new(),
             base_memory: approx_memory,
-            fst_loaded_bytes: AtomicUsize::new(0),
+            dict_loaded_bytes: AtomicUsize::new(0),
             zone_map,
         };
         if eager_docs_schema {
@@ -380,7 +446,10 @@ impl VixReader {
     /// Number of dictionary (term) row groups. Mostly useful for tests and
     /// diagnostics.
     pub fn term_row_group_count(&self) -> usize {
-        self.row_groups.len()
+        if self.term_count == 0 {
+            return 0;
+        }
+        self.dict_index().map(|i| i.block_count()).unwrap_or(0)
     }
 
     /// The field id of a field whose **raw whole values** are term-indexed
@@ -433,113 +502,102 @@ impl VixReader {
         Ok(self.count_inner(query)?)
     }
 
-    /// Batch-load every FST cell the leaves of `query` will touch — ONE
-    /// dict point read per evaluation instead of one per leaf. Matters for
-    /// compound ANDs on ranged readers (fewer fetch round trips), and on
-    /// pre-lazy-layout files (whole-column fst chunk) it keeps the whole
-    /// evaluation at a single decode of that chunk.
+    /// Warm the dictionary for `query`: parse the index (one fetch) and
+    /// pull the blocks its POINT leaves resolve to into the block cache.
+    /// Range/pattern leaves fetch on demand during their walks.
     fn prefetch_query_fsts(&self, query: &VixQuery) -> Result<()> {
-        if self.row_groups.is_empty() {
+        if self.term_count == 0 {
             return Ok(());
         }
+        let index = self.dict_index()?;
         let mut needed: Vec<usize> = Vec::new();
-        self.collect_query_rg_needs(query, &mut needed);
-        self.ensure_rg_fsts(&needed)
+        self.collect_query_block_needs(query, index, &mut needed)?;
+        needed.sort_unstable();
+        needed.dedup();
+        // ranged readers batch every MISSING block into one fetch_many
+        // round trip (the ladder/S3 issue one request); in-memory readers
+        // slice for free through dict_block
+        if let Some(BlobHandle::Ranged(ranged)) = self.dict_blocks_blob.as_ref() {
+            let blob_len = self.dict_blocks_len()?;
+            let missing: Vec<usize> = {
+                let cache = self.block_cache.lock().expect("poisoned");
+                needed
+                    .iter()
+                    .copied()
+                    .filter(|b| !cache.0.contains_key(b))
+                    .collect()
+            };
+            if missing.len() > 1 {
+                let ranges: Vec<std::ops::Range<u64>> = missing
+                    .iter()
+                    .map(|&b| {
+                        let r = index.block_range(b, blob_len);
+                        ranged.range.start + r.start..ranged.range.start + r.end
+                    })
+                    .collect();
+                let fetched = crate::source::block_fetch_many(ranged.source.as_ref(), ranges)?;
+                let mut cache = self.block_cache.lock().expect("poisoned");
+                for (b, bytes) in missing.into_iter().zip(fetched) {
+                    if cache.0.insert(b, bytes.clone()).is_none() {
+                        cache.1.push_back(b);
+                        self.dict_loaded_bytes
+                            .fetch_add(bytes.len(), Ordering::Relaxed);
+                    }
+                }
+                return Ok(());
+            }
+        }
+        for b in needed {
+            self.dict_block(b)?;
+        }
+        Ok(())
     }
 
-    /// The row-group indices a query's leaves resolve through, computed from
-    /// the directory alone (no FST access). Unknown fields contribute
-    /// nothing — their leaves error (or match nothing) during evaluation as
-    /// before.
-    fn collect_query_rg_needs(&self, query: &VixQuery, out: &mut Vec<usize>) {
+    /// The dictionary blocks a query's POINT leaves resolve to, computed
+    /// from the resident index alone (no block reads). Unknown fields
+    /// contribute nothing; range/pattern leaves are omitted — their walks
+    /// fetch on demand.
+    fn collect_query_block_needs(
+        &self,
+        query: &VixQuery,
+        index: &crate::dict_blocks::DictIndex,
+        out: &mut Vec<usize>,
+    ) -> Result<()> {
         match query {
             VixQuery::All | VixQuery::Nothing => {}
             VixQuery::And(subs) | VixQuery::Or(subs) => {
                 for sub in subs {
-                    self.collect_query_rg_needs(sub, out);
+                    self.collect_query_block_needs(sub, index, out)?;
                 }
             }
-            VixQuery::Not(sub) => self.collect_query_rg_needs(sub, out),
+            VixQuery::Not(sub) => self.collect_query_block_needs(sub, index, out)?,
             VixQuery::Exact { field, token } => {
                 if let Some(field_id) = self.field_id(field)
-                    && let Some(index) = self.rg_index_for_key(&self.composite(token, field_id))
+                    && let Some(b) = index.predecessor_block(&self.composite(token, field_id))?
                 {
-                    out.push(index);
+                    out.push(b);
                 }
             }
             VixQuery::KeyExists { path } => {
-                if let Some(index) =
-                    self.rg_index_for_key(&self.composite(path.as_bytes(), KEY_FIELD_ID))
+                if let Some(b) =
+                    index.predecessor_block(&self.composite(path.as_bytes(), KEY_FIELD_ID))?
                 {
-                    out.push(index);
+                    out.push(b);
                 }
             }
-            // field-major: one point probe per indexed field — the
-            // directory prunes each to at most one cell
             VixQuery::TokenAnyField { token } => {
                 for &fid in &self.indexed_field_ids {
-                    if let Some(index) = self.rg_index_for_key(&self.composite(token, fid)) {
-                        out.push(index);
+                    if let Some(b) = index.predecessor_block(&self.composite(token, fid))? {
+                        out.push(b);
                     }
                 }
             }
-            VixQuery::Prefix { field, prefix } => {
-                let fids: Vec<u16> = match field.as_deref().and_then(|f| self.field_id(f)) {
-                    Some(fid) => vec![fid],
-                    None => self.indexed_field_ids.clone(),
-                };
-                for fid in fids {
-                    let (lower, upper) = Self::v2_prefix_range(fid, prefix);
-                    self.rg_indices_for_range(&lower, Some((&upper, false)), out);
-                }
-            }
-            VixQuery::Contains { field, .. } | VixQuery::Regex { field, .. } => {
-                match field.as_deref().and_then(|f| self.field_id(f)) {
-                    // a known field: only that field's cells
-                    Some(fid) => {
-                        let (lower, upper) = Self::v2_field_range(fid);
-                        self.rg_indices_for_range(&lower, Some((&upper, false)), out);
-                    }
-                    None => out.extend(0..self.row_groups.len()),
-                }
-            }
-            VixQuery::Fuzzy { .. } => {
-                out.extend(0..self.row_groups.len());
-            }
+            VixQuery::Prefix { .. }
+            | VixQuery::Contains { .. }
+            | VixQuery::Regex { .. }
+            | VixQuery::Fuzzy { .. } => {}
         }
-    }
-
-    /// The row group an exact key would live in per the directory, `None`
-    /// when the directory proves the key absent.
-    fn rg_index_for_key(&self, key: &[u8]) -> Option<usize> {
-        let after = self
-            .row_groups
-            .partition_point(|rg| rg.term_min.as_slice() <= key);
-        let index = after.checked_sub(1)?;
-        (self.row_groups.get(index)?.term_max.as_slice() >= key).then_some(index)
-    }
-
-    /// The row groups whose `[term_min, term_max]` intersects
-    /// `[lower, upper]`/`[lower, upper)` (the same pruning
-    /// [`Self::scan_key_range`] applies).
-    fn rg_indices_for_range(
-        &self,
-        lower: &[u8],
-        upper: Option<(&[u8], bool)>,
-        out: &mut Vec<usize>,
-    ) {
-        for (index, rg) in self.row_groups.iter().enumerate() {
-            if rg.term_max.as_slice() < lower {
-                continue;
-            }
-            if let Some((bound, inclusive)) = upper {
-                let min = rg.term_min.as_slice();
-                if (inclusive && min > bound) || (!inclusive && min >= bound) {
-                    break;
-                }
-            }
-            out.push(index);
-        }
+        Ok(())
     }
 
     /// Bitmap of documents whose `_timestamp` lies in `[min_micros, max_micros)`
@@ -569,97 +627,122 @@ impl VixReader {
         Ok(self.docs_schema_inner()?)
     }
 
-    /// Rough resident size of the parsed reader in bytes. GROWS as row-group
-    /// FSTs load lazily (loaded cells stay resident for the reader's
-    /// lifetime) — external caches should re-read it when re-touching an
-    /// entry.
+    /// Rough resident size of the parsed reader in bytes. GROWS as the
+    /// dictionary index parses and blocks cache lazily — external caches
+    /// should re-read it when re-touching an entry.
     pub fn memory_size(&self) -> usize {
-        self.base_memory + self.fst_loaded_bytes.load(Ordering::Relaxed)
+        self.base_memory + self.dict_loaded_bytes.load(Ordering::Relaxed)
     }
 
-    /// Load (in one batched point-read) the FST cells of the given row-group
-    /// indices that are not yet resident. Loaded cells are cached on the
-    /// reader; concurrent loads of the same cell race benignly (first
-    /// writer wins, sizes are counted once).
-    ///
-    /// Retention is strictly per requested cell — deliberately ALSO on files
-    /// without per-cell dict chunks (pre-lazy layout: the whole `fst` column
-    /// is one chunk, so any load decodes it whole). Retaining every decoded
-    /// cell there would balloon each touched reader to its full dictionary
-    /// (~40 MB on 200M-benchmark files; 1057 of them can never fit any sane
-    /// reader-cache budget → permanent LRU thrash, measured 27 GB re-fetched
-    /// per HOT query). Per-cell retention keeps readers proportional to what
-    /// queries touch; the query-level prefetch already batches one
-    /// evaluation's needs into a single decode of that chunk, and old files
-    /// get per-cell chunks at their next compaction.
-    pub(crate) fn ensure_rg_fsts(&self, indices: &[usize]) -> Result<()> {
-        let mut missing: Vec<usize> = indices
-            .iter()
-            .copied()
-            .filter(|&index| {
-                self.row_groups
-                    .get(index)
-                    .is_some_and(|rg| rg.fst.get().is_none())
-            })
-            .collect();
-        missing.sort_unstable();
-        missing.dedup();
-        if missing.is_empty() {
-            return Ok(());
+    /// The parsed dictionary block index, fetching + parsing it on first
+    /// touch (whole `dict` blob — low single-digit MBs even on merged
+    /// files; resident for the reader's lifetime).
+    pub(crate) fn dict_index(&self) -> Result<&crate::dict_blocks::DictIndex> {
+        if let Some(index) = self.dict_index.get() {
+            return Ok(index);
         }
-        let dict_blob = self
+        let blob = self
             .dict_blob
             .as_ref()
             .ok_or_else(|| VixError::Malformed("missing dict blob".to_string()))?;
-        let rows: Vec<u64> = missing.iter().map(|&index| index as u64).collect();
-        let batches = scan_blob(dict_blob, Some(&["fst"]), RowSelection::Indices(rows))?;
-        let mut requested = missing.iter().copied();
-        for batch in &batches {
-            let fsts = column_binary(batch, "fst")?;
-            for row in 0..fsts.len() {
-                let rg_index = requested.next().ok_or_else(|| {
-                    VixError::Malformed(
-                        "dict fst point read returned more rows than requested".to_string(),
-                    )
-                })?;
-                let rg = &self.row_groups[rg_index];
-                if rg.fst.get().is_some() {
-                    continue; // lost a benign race to a concurrent load
-                }
-                let raw = fsts.value(row).to_vec();
-                let raw_len = raw.len();
-                let fst = Map::from_bytes(raw)
-                    .map_err(|e| VixError::Malformed(format!("row-group fst: {e}")))?;
-                if fst.len() as u64 != rg.term_count {
-                    return Err(VixError::Malformed(format!(
-                        "row group {rg_index} fst holds {} keys, the directory says {}",
-                        fst.len(),
-                        rg.term_count
-                    )));
-                }
-                if rg.fst.set(fst).is_ok() {
-                    self.fst_loaded_bytes
-                        .fetch_add(raw_len + 64, Ordering::Relaxed);
-                }
+        let bytes = match blob {
+            BlobHandle::Mem(bytes) => bytes.clone(),
+            BlobHandle::Ranged(ranged) => {
+                crate::source::block_fetch(ranged.source.as_ref(), ranged.range.clone())?
             }
+        };
+        let parsed = crate::dict_blocks::DictIndex::parse(&bytes)?;
+        // structural cross-checks against the file's own term count
+        let blocks = parsed.block_count();
+        if blocks == 0 && self.term_count > 0 {
+            return Err(VixError::Malformed(format!(
+                "dict index holds no blocks for {} terms",
+                self.term_count
+            )));
         }
-        if requested.next().is_some() {
-            return Err(VixError::Malformed(
-                "dict fst point read returned fewer rows than requested".to_string(),
-            ));
+        let mut prev_ord = None;
+        for b in 0..blocks {
+            let (_, first_ordinal) = parsed.meta(b);
+            if first_ordinal >= self.term_count.max(1)
+                || prev_ord.is_some_and(|p| first_ordinal <= p) && b > 0
+            {
+                return Err(VixError::Malformed(format!(
+                    "dict index block {b} first_ordinal {first_ordinal} out of order                      (term_count {})",
+                    self.term_count
+                )));
+            }
+            prev_ord = Some(first_ordinal);
         }
-        Ok(())
+        let size = bytes.len();
+        if self.dict_index.set(parsed).is_ok() {
+            self.dict_loaded_bytes
+                .fetch_add(size + 64, Ordering::Relaxed);
+        }
+        Ok(self.dict_index.get().expect("set just above"))
     }
 
-    /// The FST of one row group, loading it first when needed.
-    pub(crate) fn rg_fst(&self, index: usize) -> Result<&Map<Vec<u8>>> {
-        if self.row_groups[index].fst.get().is_none() {
-            self.ensure_rg_fsts(&[index])?;
+    /// Total byte length of the dictionary blocks region.
+    fn dict_blocks_len(&self) -> Result<u64> {
+        Ok(match self.dict_blocks_blob.as_ref() {
+            Some(BlobHandle::Mem(bytes)) => bytes.len() as u64,
+            Some(BlobHandle::Ranged(ranged)) => ranged.len(),
+            None => 0,
+        })
+    }
+
+    /// Bytes of dictionary block `b` — zero-copy slice on in-memory
+    /// readers, cache-aware range fetch on ranged readers.
+    fn dict_block(&self, b: usize) -> Result<Bytes> {
+        let index = self.dict_index()?;
+        let range = index.block_range(b, self.dict_blocks_len()?);
+        match self.dict_blocks_blob.as_ref() {
+            Some(BlobHandle::Mem(bytes)) => {
+                Ok(bytes.slice(range.start as usize..range.end as usize))
+            }
+            Some(BlobHandle::Ranged(ranged)) => {
+                const BLOCK_CACHE_CAP: usize = 1024;
+                if let Some(hit) = self.block_cache.lock().expect("poisoned").0.get(&b) {
+                    return Ok(hit.clone());
+                }
+                let bytes = crate::source::block_fetch(
+                    ranged.source.as_ref(),
+                    ranged.range.start + range.start..ranged.range.start + range.end,
+                )?;
+                let mut cache = self.block_cache.lock().expect("poisoned");
+                if cache.0.insert(b, bytes.clone()).is_none() {
+                    cache.1.push_back(b);
+                    self.dict_loaded_bytes
+                        .fetch_add(bytes.len(), Ordering::Relaxed);
+                    while cache.1.len() > BLOCK_CACHE_CAP {
+                        if let Some(evict) = cache.1.pop_front()
+                            && let Some(old) = cache.0.remove(&evict)
+                        {
+                            self.dict_loaded_bytes
+                                .fetch_sub(old.len(), Ordering::Relaxed);
+                        }
+                    }
+                }
+                Ok(bytes)
+            }
+            None => Err(VixError::Malformed("missing dict_blocks blob".to_string())),
         }
-        Ok(self.row_groups[index]
-            .fst
-            .get()
-            .expect("ensured just above"))
+    }
+
+    /// The WHOLE dictionary blocks region — full-walk paths (term
+    /// enumeration, merges, unscoped scans) read it in one fetch instead of
+    /// per-block round trips.
+    pub(crate) fn dict_blocks_all_for_merge(&self) -> Result<Bytes> {
+        self.dict_blocks_all()
+    }
+
+    fn dict_blocks_all(&self) -> Result<Bytes> {
+        match self.dict_blocks_blob.as_ref() {
+            Some(BlobHandle::Mem(bytes)) => Ok(bytes.clone()),
+            Some(BlobHandle::Ranged(ranged)) => {
+                crate::source::block_fetch(ranged.source.as_ref(), ranged.range.clone())
+            }
+            None => Err(VixError::Malformed("missing dict_blocks blob".to_string())),
+        }
     }
 
     /// The raw `tokenizer` file property (merge compatibility checks).
@@ -672,11 +755,6 @@ impl VixReader {
         &self.fields
     }
 
-    /// The dictionary row groups (compaction index merge).
-    pub(crate) fn term_row_groups(&self) -> &[RgEntry] {
-        &self.row_groups
-    }
-
     /// The `terms` blob handle, when the file has any terms.
     pub(crate) fn terms_blob_handle(&self) -> Option<&BlobHandle> {
         self.terms_blob.as_ref()
@@ -685,6 +763,114 @@ impl VixReader {
     /// Number of composite terms in the file (`term_count` property).
     pub fn term_count(&self) -> u64 {
         self.term_count
+    }
+
+    /// The `plist_min_docs` property: `> 0` ⇒ the file is plist-capable and
+    /// a non-dense term with `doc_count >=` this threshold stores a
+    /// 12-byte pointer cell instead of inline postings; `0` ⇒ every cell is
+    /// inline (pre-plist file).
+    pub(crate) fn plist_min_docs(&self) -> u32 {
+        self.plist_min_docs
+    }
+
+    /// Whether a terms-table cell is an out-of-row POINTER CELL: the file is
+    /// plist-capable, the term's `doc_count` is at/above the threshold, and
+    /// the cell is non-empty (dense elision keeps the empty cell even above
+    /// the threshold). The ONLY pointer-vs-inline discriminator — cell bytes
+    /// are never sniffed.
+    pub(crate) fn plist_pointer_cell(&self, doc_count: u64, cell: &[u8]) -> bool {
+        self.plist_min_docs > 0 && doc_count >= u64::from(self.plist_min_docs) && !cell.is_empty()
+    }
+
+    /// Open a [`PlistCursor`] when `query` is a single-term leaf whose
+    /// postings live out-of-row: the rank-based consumers (windowed counts,
+    /// histograms) then read the skip table + touched groups instead of
+    /// decoding the whole dense list into a bitmap. `None` whenever the
+    /// preconditions fail — compound query, no/many matching terms, inline
+    /// or dense-elided cell, plist-incapable file — and the caller falls
+    /// back to the bitmap path.
+    pub fn single_term_plist_cursor(
+        &self,
+        query: &VixQuery,
+    ) -> anyhow::Result<Option<PlistCursor>> {
+        if self.plist_min_docs == 0 || self.term_count == 0 {
+            return Ok(None);
+        }
+        let ordinals = match query {
+            VixQuery::All
+            | VixQuery::Nothing
+            | VixQuery::And(_)
+            | VixQuery::Or(_)
+            | VixQuery::Not(_) => return Ok(None),
+            leaf => {
+                self.prefetch_query_fsts(leaf)?;
+                self.collect_ordinals(leaf)?
+            }
+        };
+        let [ordinal] = ordinals[..] else {
+            return Ok(None);
+        };
+        let terms_blob = self
+            .terms_blob
+            .as_ref()
+            .ok_or_else(|| VixError::Malformed("missing terms blob".to_string()))?;
+        let batches = scan_blob(
+            terms_blob,
+            Some(&["doc_count", "postings"]),
+            RowSelection::Indices(vec![ordinal]),
+        )?;
+        for batch in &batches {
+            let doc_counts = column_u64(batch, "doc_count")?;
+            let postings = column_binary(batch, "postings")?;
+            if batch.num_rows() > 0 {
+                let doc_count = doc_counts[0];
+                let cell = postings.value(0);
+                if doc_count > self.row_count {
+                    return Err(VixError::Malformed(format!(
+                        "doc_count {doc_count} exceeds row_count {}",
+                        self.row_count
+                    ))
+                    .into());
+                }
+                if !self.plist_pointer_cell(doc_count, cell) {
+                    return Ok(None);
+                }
+                let record = self.plist_record_bytes(cell)?;
+                return Ok(Some(PlistCursor { record, doc_count }));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Resolve one out-of-row postings POINTER CELL (`[u64 LE offset]
+    /// [u32 LE len]`) to the [`postings::encode_record`] bytes it addresses
+    /// inside the `plist` blob. The caller has already selected the cell by
+    /// `doc_count >= plist_min_docs` — never by its bytes — so a wrong
+    /// length or an out-of-bounds window here is file corruption. In-memory
+    /// blobs slice for free; ranged blobs fetch exactly the record window.
+    pub(crate) fn plist_record_bytes(&self, cell: &[u8]) -> Result<Bytes> {
+        let (offset, len) = postings::decode_pointer_cell(cell)?;
+        let len = u64::from(len);
+        let handle = self.plist_blob.as_ref().ok_or_else(|| {
+            VixError::Malformed("postings pointer cell in a file without a plist blob".to_string())
+        })?;
+        let blob_len = match handle {
+            BlobHandle::Mem(bytes) => bytes.len() as u64,
+            BlobHandle::Ranged(ranged) => ranged.len(),
+        };
+        let end = offset.checked_add(len).filter(|&end| end <= blob_len);
+        let Some(end) = end else {
+            return Err(VixError::Malformed(format!(
+                "plist pointer {offset}+{len} out of bounds ({blob_len}-byte plist blob)"
+            )));
+        };
+        match handle {
+            BlobHandle::Mem(bytes) => Ok(bytes.slice(offset as usize..end as usize)),
+            BlobHandle::Ranged(ranged) => crate::source::block_fetch(
+                ranged.source.as_ref(),
+                ranged.range.start + offset..ranged.range.start + end,
+            ),
+        }
     }
 
     /// Whether this file carries a per-file value-bloom blob.
@@ -740,9 +926,10 @@ impl VixReader {
         if self.term_count == 0 {
             return Ok(());
         }
-        let terms_blob = self.terms_blob.as_ref().ok_or_else(|| {
-            unbuildable(VixError::Malformed("missing terms blob".to_string()))
-        })?;
+        let terms_blob = self
+            .terms_blob
+            .as_ref()
+            .ok_or_else(|| unbuildable(VixError::Malformed("missing terms blob".to_string())))?;
         // The `terms` rows are written in global ordinal order, and streaming
         // the row-group FSTs in directory order yields keys in exactly that
         // order — zip the two streams.
@@ -761,12 +948,16 @@ impl VixReader {
         let (mut batch_index, mut row_index) = (0usize, 0usize);
         let mut ids: Vec<u32> = Vec::new();
         let mut seen = 0u64;
-        // a full-dictionary walk touches every FST: batch-load the missing
-        // cells in one point-read scan
-        self.ensure_rg_fsts(&(0..self.row_groups.len()).collect::<Vec<_>>())?;
-        for index in 0..self.row_groups.len() {
-            let mut stream = self.rg_fst(index)?.stream();
-            while let Some((key, _)) = stream.next() {
+        // a full-dictionary walk: one fetch of the whole blocks region,
+        // then a straight in-memory decode in ordinal order
+        let dict_index = self.dict_index()?;
+        let all = self.dict_blocks_all()?;
+        let blob_len = all.len() as u64;
+        for b in 0..dict_index.block_count() {
+            let range = dict_index.block_range(b, blob_len);
+            let mut iter =
+                crate::dict_blocks::BlockIter::new(&all[range.start as usize..range.end as usize]);
+            while let Some(key) = iter.next()? {
                 while batch_index < columns.len() && row_index >= columns[batch_index].0.len() {
                     batch_index += 1;
                     row_index = 0;
@@ -799,6 +990,23 @@ impl VixReader {
                         ))));
                     }
                     ids.extend(0..self.row_count as u32);
+                } else if self.plist_min_docs > 0 && doc_count >= u64::from(self.plist_min_docs) {
+                    // out-of-row postings: the threshold — never the cell
+                    // bytes — says this non-empty cell is a pointer; resolve
+                    // it through the plist blob and decode the record's blob
+                    // region (stage-2 minimal resolution; the query paths
+                    // learn pointer cells in stage 3)
+                    let record = self.plist_record_bytes(blob)?;
+                    ids.reserve(doc_count as usize);
+                    postings::decode_each(
+                        postings::record_blob(&record).map_err(unbuildable)?,
+                        doc_count as usize,
+                        |doc| {
+                            ids.push(doc);
+                            Ok(())
+                        },
+                    )
+                    .map_err(unbuildable)?;
                 } else {
                     ids.reserve(doc_count as usize);
                     // the postings blob is already resident: decode failures
@@ -961,7 +1169,145 @@ impl VixReader {
         Ok(self.field_value_counts_inner(field)?)
     }
 
+    /// Filtered variant of [`VixReader::field_value_counts`]: per raw string
+    /// value of `field`, the number of its documents whose bit is set in
+    /// `filter` (a row bitmap of length `row_count`). Zero-hit values are
+    /// omitted. Eligibility is IDENTICAL to the unfiltered variant — same
+    /// pre-checks and the same doc-count reconciliation against the key
+    /// term — because both depend on the dictionary holding EVERY document's
+    /// value; `Ok(None)` when this file cannot prove that. Cost is one
+    /// decode of the field's postings (SIMD, ≈ the field's row count in
+    /// ids) — the fast serve for group-bys over files that predate the
+    /// field's `column_store_fields` entry.
+    pub fn field_value_counts_filtered(
+        &self,
+        field: &str,
+        filter: &BooleanBuffer,
+    ) -> anyhow::Result<Option<FieldValueCounts>> {
+        Ok(self.field_value_counts_filtered_inner(field, filter)?)
+    }
+
     fn field_value_counts_inner(&self, field: &str) -> Result<Option<FieldValueCounts>> {
+        let Some((values, ordinals, field_docs)) = self.field_string_value_terms(field)? else {
+            return Ok(None);
+        };
+        if values.is_empty() {
+            // no value terms at all: exact iff no doc carries the field
+            // (e.g. the field is stored under a non-string type here)
+            return Ok((field_docs == 0).then(Vec::new));
+        }
+        let counts = self.read_doc_counts(&ordinals)?;
+        // each doc has at most one raw value per field, so exact counts sum
+        // to the key-term doc count; a shortfall means values the dictionary
+        // lacks (values of another stored type, empty strings in pre-fix
+        // files, ...) — empty-string terms written by current writers are
+        // ordinary dictionary entries and reconcile like any other value
+        if counts.iter().sum::<u64>() != field_docs {
+            return Ok(None);
+        }
+        Ok(Some(values.into_iter().zip(counts).collect()))
+    }
+
+    fn field_value_counts_filtered_inner(
+        &self,
+        field: &str,
+        filter: &BooleanBuffer,
+    ) -> Result<Option<FieldValueCounts>> {
+        if filter.len() as u64 != self.row_count {
+            return Err(VixError::Malformed(format!(
+                "filter bitmap length {} != row_count {}",
+                filter.len(),
+                self.row_count
+            )));
+        }
+        let Some((values, ordinals, field_docs)) = self.field_string_value_terms(field)? else {
+            return Ok(None);
+        };
+        if values.is_empty() {
+            return Ok((field_docs == 0).then(Vec::new));
+        }
+        let terms_blob = self
+            .terms_blob
+            .as_ref()
+            .ok_or_else(|| VixError::Malformed("missing terms blob".to_string()))?;
+        let batches = scan_blob(
+            terms_blob,
+            Some(&["doc_count", "postings"]),
+            RowSelection::Indices(ordinals),
+        )?;
+        let mut unfiltered_sum = 0u64;
+        let mut filtered: Vec<u64> = Vec::with_capacity(values.len());
+        for batch in &batches {
+            let doc_counts = column_u64(batch, "doc_count")?;
+            let postings = column_binary(batch, "postings")?;
+            for (row, &doc_count) in doc_counts.iter().enumerate() {
+                if doc_count > self.row_count {
+                    return Err(VixError::Malformed(format!(
+                        "doc_count {doc_count} exceeds row_count {}",
+                        self.row_count
+                    )));
+                }
+                unfiltered_sum += doc_count;
+                let blob = postings.value(row);
+                if blob.is_empty() && doc_count > 0 {
+                    if doc_count == self.row_count {
+                        // dense elision: the term is in every doc
+                        filtered.push(filter.count_set_bits() as u64);
+                        continue;
+                    }
+                    return Err(VixError::Malformed(format!(
+                        "empty postings blob for a term with doc_count {doc_count} != \
+                         row_count {} (not dense-elided, so corrupt)",
+                        self.row_count
+                    )));
+                }
+                let record;
+                let blob = if self.plist_pointer_cell(doc_count, blob) {
+                    record = self.plist_record_bytes(blob)?;
+                    postings::record_blob(&record)?
+                } else {
+                    blob
+                };
+                let mut hits = 0u64;
+                postings::decode_each(blob, doc_count as usize, |doc| {
+                    if u64::from(doc) >= self.row_count {
+                        return Err(VixError::Malformed(format!(
+                            "postings doc id {doc} out of range (row_count {})",
+                            self.row_count
+                        )));
+                    }
+                    if filter.value(doc as usize) {
+                        hits += 1;
+                    }
+                    Ok(())
+                })?;
+                filtered.push(hits);
+            }
+        }
+        if filtered.len() != values.len() {
+            return Err(VixError::Malformed(format!(
+                "terms scan returned {} rows for {} requested ordinals",
+                filtered.len(),
+                values.len()
+            )));
+        }
+        // the exactness precondition reconciles on UNFILTERED counts (the
+        // filtered sum legitimately falls short of field_docs)
+        if unfiltered_sum != field_docs {
+            return Ok(None);
+        }
+        Ok(Some(values.into_iter().zip(filtered).collect()))
+    }
+
+    /// Shared front half of the value-count paths: eligibility pre-checks +
+    /// the field's raw STRING value terms `(values, ordinals, field_docs)`,
+    /// both vecs ascending and parallel. `Ok(None)` when the dictionary
+    /// cannot enumerate the field's values exactly (partial / fts-marked).
+    #[allow(clippy::type_complexity)]
+    fn field_string_value_terms(
+        &self,
+        field: &str,
+    ) -> Result<Option<(Vec<Vec<u8>>, Vec<u64>, u64)>> {
         // skipped values at build time: the dictionary misses documents
         if self.partial_fields.contains(field) {
             return Ok(None);
@@ -981,17 +1327,15 @@ impl VixReader {
             None => 0,
         };
         let Some(field_id) = self.field_id(field) else {
-            // no value terms at all: exact iff no doc carries the field
-            // (e.g. the field is stored under a non-string type here)
-            return Ok((field_docs == 0).then(Vec::new));
+            return Ok(Some((Vec::new(), Vec::new(), field_docs)));
         };
 
-        // walk every row group's FST, keeping keys with this field's suffix;
-        // row groups and FST streams are ascending, so values and ordinals
-        // come out sorted (and unique — one term per distinct value).
-        // TAGGED numeric/bool value terms are not string values: they are
-        // excluded here, and their doc counts then surface as a
-        // reconciliation shortfall below — a field with number-stored rows
+        // walk the field's contiguous dictionary range, keeping raw string
+        // value terms; blocks stream ascending, so values and ordinals come
+        // out sorted (and unique — one term per distinct value). TAGGED
+        // numeric/bool value terms are not string values: they are excluded
+        // here, and their doc counts then surface as a reconciliation
+        // shortfall in the callers — a field with number-stored rows
         // correctly refuses the exact-counts fast path (mixed-type grouping
         // must go through the scan's typed projection).
         let mut values: Vec<Vec<u8>> = Vec::new();
@@ -1006,20 +1350,7 @@ impl VixReader {
                 ordinals.push(ordinal);
             }
         })?;
-        let counts = if ordinals.is_empty() {
-            Vec::new()
-        } else {
-            self.read_doc_counts(&ordinals)?
-        };
-        // each doc has at most one raw value per field, so exact counts sum
-        // to the key-term doc count; a shortfall means values the dictionary
-        // lacks (values of another stored type, empty strings in pre-fix
-        // files, ...) — empty-string terms written by current writers are
-        // ordinary dictionary entries and reconcile like any other value
-        if counts.iter().sum::<u64>() != field_docs {
-            return Ok(None);
-        }
-        Ok(Some(values.into_iter().zip(counts).collect()))
+        Ok(Some((values, ordinals, field_docs)))
     }
 
     fn read_source_inner(&self, rows: &[u64]) -> Result<StringArray> {
@@ -1433,64 +1764,51 @@ impl VixReader {
     /// directory prunes to at most ONE row group, whose FST is loaded on
     /// first touch.
     fn lookup_exact(&self, key: &[u8]) -> Result<Option<u64>> {
-        let after = self
-            .row_groups
-            .partition_point(|rg| rg.term_min.as_slice() <= key);
-        let Some(index) = after.checked_sub(1) else {
-            return Ok(None);
-        };
-        let Some(rg) = self.row_groups.get(index) else {
-            return Ok(None);
-        };
-        if rg.term_max.as_slice() < key {
+        if self.term_count == 0 {
             return Ok(None);
         }
-        Ok(self
-            .rg_fst(index)?
-            .get(key)
-            .map(|local| rg.first_ordinal + local))
+        let index = self.dict_index()?;
+        let Some(b) = index.predecessor_block(key)? else {
+            return Ok(None);
+        };
+        let block = self.dict_block(b)?;
+        Ok(crate::dict_blocks::block_find_exact(&block, key)?
+            .map(|pos| index.meta(b).1 + pos as u64))
     }
 
-    /// Stream all keys in `[lower, upper]`/`[lower, upper)` over the row
-    /// groups whose `[term_min, term_max]` intersects the range. The
-    /// directory prunes first, then the intersecting FSTs load in one
-    /// batched point read (narrow ranges — token/prefix probes — touch a
-    /// single row group).
+    /// Stream all keys in `[lower, upper]`/`[lower, upper)` in order:
+    /// predecessor-seek the start block, then walk forward block by block
+    /// until a key passes the upper bound (narrow probes touch one block).
     fn scan_key_range(
         &self,
         lower: &[u8],
         upper: Option<(&[u8], bool)>,
         mut on_key: impl FnMut(&[u8], u64),
     ) -> Result<()> {
-        let mut touched: Vec<usize> = Vec::new();
-        for (index, rg) in self.row_groups.iter().enumerate() {
-            if rg.term_max.as_slice() < lower {
-                continue;
-            }
-            if let Some((bound, inclusive)) = upper {
-                let min = rg.term_min.as_slice();
-                // Row groups are sorted: once one starts past the upper
-                // bound, all later ones do too.
-                if (inclusive && min > bound) || (!inclusive && min >= bound) {
-                    break;
-                }
-            }
-            touched.push(index);
+        if self.term_count == 0 {
+            return Ok(());
         }
-        self.ensure_rg_fsts(&touched)?;
-        for index in touched {
-            let rg = &self.row_groups[index];
-            let mut range = self.rg_fst(index)?.range().ge(lower);
-            if let Some((bound, inclusive)) = upper {
-                range = if inclusive {
-                    range.le(bound)
-                } else {
-                    range.lt(bound)
-                };
-            }
-            let mut stream = range.into_stream();
-            while let Some((key, local)) = stream.next() {
-                on_key(key, rg.first_ordinal + local);
+        let index = self.dict_index()?;
+        let start = index.predecessor_block(lower)?.unwrap_or(0);
+        for b in start..index.block_count() {
+            let block = self.dict_block(b)?;
+            let first_ordinal = index.meta(b).1;
+            let mut past = false;
+            crate::dict_blocks::block_scan(&block, |pos, key| {
+                if key < lower {
+                    return true;
+                }
+                if let Some((bound, inclusive)) = upper
+                    && ((inclusive && key > bound) || (!inclusive && key >= bound))
+                {
+                    past = true;
+                    return false;
+                }
+                on_key(key, first_ordinal + pos as u64);
+                true
+            })?;
+            if past {
+                break;
             }
         }
         Ok(())
@@ -1527,18 +1845,26 @@ impl VixReader {
             return Ok(ordinals);
         }
         let mut ordinals = Vec::new();
-        self.ensure_rg_fsts(&(0..self.row_groups.len()).collect::<Vec<_>>())?;
-        for (index, rg) in self.row_groups.iter().enumerate() {
-            let mut stream = self.rg_fst(index)?.stream();
-            while let Some((key, local)) = stream.next() {
+        if self.term_count == 0 {
+            return Ok(ordinals);
+        }
+        let index = self.dict_index()?;
+        let all = self.dict_blocks_all()?;
+        let blob_len = all.len() as u64;
+        for b in 0..index.block_count() {
+            let range = index.block_range(b, blob_len);
+            let block = &all[range.start as usize..range.end as usize];
+            let first_ordinal = index.meta(b).1;
+            crate::dict_blocks::block_scan(block, |pos, key| {
                 if let Some((token, field_id)) = split_key(key)
                     && field_id != KEY_FIELD_ID
                     && !is_numeric_value_token(token)
                     && matches(token)
                 {
-                    ordinals.push(rg.first_ordinal + local);
+                    ordinals.push(first_ordinal + pos as u64);
                 }
-            }
+                true
+            })?;
         }
         Ok(ordinals)
     }
@@ -1604,6 +1930,16 @@ impl VixReader {
                     // The union is already all-ones; skip further decodes.
                     continue;
                 }
+                // out-of-row postings: resolve the pointer cell to its
+                // record and decode the record's blob region (the threshold
+                // — never the cell bytes — selects the pointer)
+                let record;
+                let blob = if self.plist_pointer_cell(doc_count, blob) {
+                    record = self.plist_record_bytes(blob)?;
+                    postings::record_blob(&record)?
+                } else {
+                    blob
+                };
                 postings::decode_each(blob, doc_count as usize, |doc| {
                     if u64::from(doc) >= self.row_count {
                         return Err(VixError::Malformed(format!(
@@ -1754,11 +2090,20 @@ impl VixReader {
     /// The workhorse of extraction-parity assertions.
     pub(crate) fn debug_all_terms(&self) -> Result<Vec<DebugTerm>> {
         let mut out = Vec::new();
-        self.ensure_rg_fsts(&(0..self.row_groups.len()).collect::<Vec<_>>())?;
-        for (index, rg) in self.row_groups.iter().enumerate() {
-            let mut stream = self.rg_fst(index)?.stream();
-            while let Some((key, local)) = stream.next() {
-                out.push((key.to_vec(), rg.first_ordinal + local));
+        if self.term_count > 0 {
+            let index = self.dict_index()?;
+            let all = self.dict_blocks_all()?;
+            let blob_len = all.len() as u64;
+            for b in 0..index.block_count() {
+                let range = index.block_range(b, blob_len);
+                let first_ordinal = index.meta(b).1;
+                crate::dict_blocks::block_scan(
+                    &all[range.start as usize..range.end as usize],
+                    |pos, key| {
+                        out.push((key.to_vec(), first_ordinal + pos as u64));
+                        true
+                    },
+                )?;
             }
         }
         out.sort_by_key(|(_, ordinal)| *ordinal);
@@ -1909,48 +2254,6 @@ fn parse_zone_map(raw: Option<&str>, row_count: u64) -> Option<Vec<ZoneChunk>> {
 /// Validate the row-group directory — sorted, non-overlapping, contiguous
 /// ordinal coverage of `0..term_count` — and derive each group's term count
 /// from the consecutive `first_ordinal`s (the FSTs are not loaded here; each
-/// cell is checked against its derived count when it lazily loads).
-fn validate_row_groups(row_groups: &mut [RgEntry], term_count: u64) -> Result<()> {
-    if row_groups.is_empty() {
-        if term_count > 0 {
-            return Err(VixError::Malformed(format!(
-                "dictionary has no row groups but term_count is {term_count}"
-            )));
-        }
-        return Ok(());
-    }
-    for index in 0..row_groups.len() {
-        let first_ordinal = row_groups[index].first_ordinal;
-        if index == 0 && first_ordinal != 0 {
-            return Err(VixError::Malformed(format!(
-                "row group 0 starts at ordinal {first_ordinal}, expected 0"
-            )));
-        }
-        let next_ordinal = match row_groups.get(index + 1) {
-            Some(next) => next.first_ordinal,
-            None => term_count,
-        };
-        if next_ordinal <= first_ordinal {
-            return Err(VixError::Malformed(format!(
-                "row group {index} covers ordinals {first_ordinal}..{next_ordinal} (empty or \
-                 unsorted directory)"
-            )));
-        }
-        row_groups[index].term_count = next_ordinal - first_ordinal;
-        if row_groups[index].term_min > row_groups[index].term_max {
-            return Err(VixError::Malformed(format!(
-                "row group {index} has term_min > term_max"
-            )));
-        }
-        if index > 0 && row_groups[index - 1].term_max >= row_groups[index].term_min {
-            return Err(VixError::Malformed(format!(
-                "row groups {} and {index} overlap or are unsorted",
-                index - 1
-            )));
-        }
-    }
-    Ok(())
-}
 
 /// Smallest byte string strictly greater than every string with `prefix`;
 /// `None` when unbounded (empty or all-`0xFF` prefix).

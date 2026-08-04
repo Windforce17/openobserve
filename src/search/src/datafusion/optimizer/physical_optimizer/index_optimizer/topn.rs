@@ -21,9 +21,8 @@ use datafusion::{
         Result,
         tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor},
     },
-    physical_expr::split_conjunction,
     physical_plan::{
-        ExecutionPlan, aggregates::AggregateExec, filter::FilterExec, projection::ProjectionExec,
+        ExecutionPlan, aggregates::AggregateExec, projection::ProjectionExec,
         sorts::sort_preserving_merge::SortPreservingMergeExec,
     },
 };
@@ -31,7 +30,7 @@ use hashbrown::HashSet;
 
 use crate::datafusion::optimizer::physical_optimizer::{
     index_optimizer::utils::is_complex_plan,
-    utils::{get_column_name, is_column, is_count_rows_aggregate, is_only_timestamp_filter},
+    utils::{get_column_name, is_column, is_count_rows_aggregate},
 };
 
 #[rustfmt::skip]
@@ -56,9 +55,11 @@ use crate::datafusion::optimizer::physical_optimizer::{
 /// Field eligibility: group fields must be in `index_fields` (the stream's
 /// column-store fields, servable per file from the docs columns under any
 /// condition). A **single** group field may instead come from
-/// `unfiltered_index_fields` (term-indexed string fields) — those are served
-/// from the term dictionary alone, which is only possible when the query has
-/// no condition, so any non-`_timestamp` filter in the plan disqualifies them.
+/// `unfiltered_index_fields` (term-indexed string fields) — served from the
+/// term dictionary: whole-field value counts when the query is unfiltered,
+/// per-value postings∩bitmap counts when it carries a condition. Per-file
+/// ineligibility (fts-marked, partial, type drift) falls back to the scan
+/// at execution, so the rule is safe to emit for both shapes.
 pub fn is_simple_topn(
     plan: Arc<dyn ExecutionPlan>,
     index_fields: HashSet<String>,
@@ -66,11 +67,6 @@ pub fn is_simple_topn(
 ) -> Option<IndexOptimizeMode> {
     let mut visitor = SimpleTopnVisitor::new(index_fields, unfiltered_index_fields);
     let _ = plan.visit(&mut visitor);
-    // dictionary-only fields require an unfiltered query: every filter in
-    // the plan must be a bare `_timestamp` range
-    if visitor.requires_no_filter && visitor.has_non_ts_filter {
-        return None;
-    }
     match visitor.simple_topn {
         Some((fields, fetch, ascend)) if !fields.is_empty() => {
             Some(IndexOptimizeMode::SimpleTopN(fields, fetch, ascend))
@@ -85,11 +81,6 @@ struct SimpleTopnVisitor {
     unfiltered_index_fields: HashSet<String>,
     secondary_sort_columns: Vec<String>,
     projection_len: Option<usize>,
-    /// the group field is dictionary-only eligible (not column-store): the
-    /// query must carry no condition
-    requires_no_filter: bool,
-    /// the plan contains a filter beyond the `_timestamp` range
-    has_non_ts_filter: bool,
 }
 
 impl SimpleTopnVisitor {
@@ -100,8 +91,6 @@ impl SimpleTopnVisitor {
             unfiltered_index_fields,
             secondary_sort_columns: Vec::new(),
             projection_len: None,
-            requires_no_filter: false,
-            has_non_ts_filter: false,
         }
     }
 
@@ -180,32 +169,23 @@ impl<'n> TreeNodeVisitor<'n> for SimpleTopnVisitor {
 
             // all group by fields must be eligible: column-store fields
             // always; a single group field may be dictionary-only
-            // (term-indexed) — validated post-visit against the filters
+            // (term-indexed) — the execution serves it from value counts
+            // when unfiltered and postings∩bitmap when conditioned
             let mut fields = Vec::with_capacity(group_len);
             for (group_expr, _) in aggregate.group_expr().expr().iter() {
                 let column_name = get_column_name(group_expr);
                 if !is_column(group_expr) {
                     return self.reject();
                 }
-                if !self.index_fields.contains(column_name) {
-                    if group_len == 1 && self.unfiltered_index_fields.contains(column_name) {
-                        self.requires_no_filter = true;
-                    } else {
-                        return self.reject();
-                    }
+                if !self.index_fields.contains(column_name)
+                    && !(group_len == 1 && self.unfiltered_index_fields.contains(column_name))
+                {
+                    return self.reject();
                 }
                 fields.push(column_name.to_string());
             }
             if let Some(simple_topn) = &mut self.simple_topn {
                 simple_topn.0 = fields;
-            }
-        } else if let Some(filter) = node.downcast_ref::<FilterExec>() {
-            // filters are visited below the aggregates: record whether any
-            // predicate goes beyond the `_timestamp` range (the final
-            // eligibility check runs after the walk)
-            let exprs = split_conjunction(filter.predicate());
-            if !is_only_timestamp_filter(&exprs) {
-                self.has_non_ts_filter = true;
             }
         } else if is_complex_plan(node) {
             return self.reject();
@@ -678,9 +658,11 @@ mod tests {
         }
     }
 
-    /// Pilot fix B: a single term-indexed (non-column-store) group field is
-    /// eligible only when the query's sole filter is the `_timestamp` range;
-    /// multi-field TopN stays column-store-only.
+    /// A single term-indexed (non-column-store) group field is eligible
+    /// with OR without a condition — unfiltered queries serve from value
+    /// counts, conditioned ones from per-value postings∩bitmap (the
+    /// pre-column_store_fields history path). Multi-field TopN stays
+    /// column-store-only.
     #[tokio::test]
     async fn test_is_simple_topn_unfiltered_term_field() {
         let schema = Arc::new(Schema::new(vec![
@@ -722,12 +704,17 @@ mod tests {
                     false,
                 )),
             ),
-            // a real condition disqualifies the term-only field ...
+            // a real condition keeps the term-only field eligible: the
+            // execution intersects each value's postings with the bitmap
             (
                 "select name, count(*) as cnt from t where match_all('error') group by name order by cnt desc limit 10",
-                None,
+                Some(IndexOptimizeMode::SimpleTopN(
+                    vec!["name".to_string()],
+                    10,
+                    false,
+                )),
             ),
-            // ... but not a column-store field (existing behavior)
+            // a column-store field under a condition (existing behavior)
             (
                 "select status, count(*) as cnt from t where match_all('error') group by status order by cnt desc limit 10",
                 Some(IndexOptimizeMode::SimpleTopN(

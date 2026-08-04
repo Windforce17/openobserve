@@ -1171,6 +1171,12 @@ pub struct Common {
     )]
     pub segment_build_lease_secs: u64,
     #[env_config(
+        name = "ZO_SEGMENT_SCAN_DECODE_WAVE",
+        default = 8,
+        help = "Segment WAL: segments fetched+decoded concurrently per live-tail query. Decode streams frame-by-frame (peak ~ one frame per slot), so this trades tail-scan latency against per-query CPU share on the querier."
+    )]
+    pub segment_scan_decode_wave: usize,
+    #[env_config(
         name = "ZO_WAL_WRITE_QUEUE_ENABLED",
         default = false,
         help = "Route WAL writes through a per-writer queue. The ingest request still waits for its own write to complete -- the consumer reports the write's outcome back before the request is acked -- so this smooths bursts across requests without weakening ack truth: an enqueue is never acked as a durable write, and a consumer failure surfaces as the request's error instead of a log line."
@@ -1327,12 +1333,6 @@ pub struct Common {
     )]
     pub inverted_index_enabled: bool,
     #[env_config(
-        name = "ZO_VIX_RG_TERM_BYTES",
-        default = 8388608,
-        help = "Raw term bytes per row group in .vix index files (one FST per row group)."
-    )]
-    pub vix_rg_term_bytes: usize,
-    #[env_config(
         name = "ZO_WAL_NARROW_SCHEMA",
         default = false,
         help = "Ingest batches carry only the fields present in the data (plus _timestamp) \
@@ -1385,6 +1385,23 @@ pub struct Common {
                 queries probe hundreds of files; each false positive costs a dictionary walk)."
     )]
     pub vix_bloom_fpp: f64,
+    #[env_config(
+        name = "ZO_VIX_FETCH_CONCURRENCY",
+        default = 16,
+        help = "Global cap on in-flight .vix range fetches per process. Queue wait does NOT \
+                count toward ZO_VIX_FETCH_TIMEOUT — the timeout bounds only the active fetch, \
+                so wide eval fan-out cannot manufacture spurious timeouts (whose fallback \
+                converts index-answerable queries into full scans). 0 = uncapped."
+    )]
+    pub vix_fetch_concurrency: usize,
+    #[env_config(
+        name = "ZO_VIX_PLIST_MIN_DOCS",
+        default = 0,
+        help = "Terms with at least this many matching docs store postings out-of-row with a \
+                skip table (rank-based eval skips decoding dense lists). 0 = off. Enable ONLY \
+                after every reader in the fleet ships pointer-cell support (#15 rollout)."
+    )]
+    pub vix_plist_min_docs: usize,
     #[env_config(
         name = "ZO_VIX_MAX_RAW_TERM_LENGTH",
         default = 65532,

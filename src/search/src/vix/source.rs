@@ -88,9 +88,29 @@ fn vix_fetch_timeout() -> Option<Duration> {
     (secs > 0).then(|| Duration::from_secs(secs))
 }
 
-/// Run `fut` on `handle` bounded by `ZO_VIX_FETCH_TIMEOUT`, tick the fetch
-/// metrics, and return an executor-agnostic future for its result (a oneshot
-/// receiver works on any executor).
+/// Global in-flight fetch gate (`ZO_VIX_FETCH_CONCURRENCY`). Wide eval
+/// fan-out (eval_concurrency defaults to 4x cores) used to put dozens of
+/// multi-MB dictionary fetches on the device at once; each fetch's WALL
+/// time then included queuing behind the others, ZO_VIX_FETCH_TIMEOUT
+/// fired on healthy IO, and the per-file fallback converted an
+/// index-answerable query into a full scan (measured: 50/55 files fell
+/// back, 453s of a 486s cold count — ENGINE-BACKLOG #18). The permit is
+/// acquired BEFORE the timeout window opens, so queue wait can never
+/// manufacture a timeout; the timeout bounds only the active fetch.
+fn fetch_gate() -> Option<&'static tokio::sync::Semaphore> {
+    use std::sync::OnceLock;
+    static GATE: OnceLock<Option<tokio::sync::Semaphore>> = OnceLock::new();
+    GATE.get_or_init(|| {
+        let permits = config::get_config().common.vix_fetch_concurrency;
+        (permits > 0).then(|| tokio::sync::Semaphore::new(permits))
+    })
+    .as_ref()
+}
+
+/// Run `fut` on `handle` gated by `ZO_VIX_FETCH_CONCURRENCY` and bounded by
+/// `ZO_VIX_FETCH_TIMEOUT` (active fetch only — queue wait is untimed), tick
+/// the fetch metrics, and return an executor-agnostic future for its result
+/// (a oneshot receiver works on any executor).
 fn spawn_fetch(
     handle: &Handle,
     metric_path: &'static str,
@@ -99,6 +119,14 @@ fn spawn_fetch(
 ) -> BoxFuture<'static, anyhow::Result<Bytes>> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     handle.spawn(async move {
+        let _permit = match fetch_gate() {
+            Some(gate) => match gate.acquire().await {
+                Ok(permit) => Some(permit),
+                // the gate is never closed; treat a close as uncapped
+                Err(_) => None,
+            },
+            None => None,
+        };
         let result = match vix_fetch_timeout() {
             Some(timeout) => match tokio::time::timeout(timeout, fut).await {
                 Ok(result) => result,
@@ -122,6 +150,55 @@ fn spawn_fetch(
             }
         }
         // The receiver may be gone (scan aborted); nothing to do then.
+        let _ = tx.send(result);
+    });
+    async move {
+        rx.await
+            .map_err(|_| anyhow::anyhow!("range fetch task was cancelled"))?
+    }
+    .boxed()
+}
+
+/// [`spawn_fetch`] for a batched multi-range request: one gate permit, one
+/// timeout window, metrics/stats tick once per contained range.
+fn spawn_fetch_many(
+    handle: &Handle,
+    metric_path: &'static str,
+    stats: Option<Arc<FetchStats>>,
+    fut: impl Future<Output = anyhow::Result<Vec<Bytes>>> + Send + 'static,
+) -> BoxFuture<'static, anyhow::Result<Vec<Bytes>>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    handle.spawn(async move {
+        let _permit = match fetch_gate() {
+            Some(gate) => match gate.acquire().await {
+                Ok(permit) => Some(permit),
+                Err(_) => None,
+            },
+            None => None,
+        };
+        let result = match vix_fetch_timeout() {
+            Some(timeout) => match tokio::time::timeout(timeout, fut).await {
+                Ok(result) => result,
+                Err(_) => Err(anyhow::anyhow!(
+                    "vix range fetch timed out after {}s (ZO_VIX_FETCH_TIMEOUT)",
+                    timeout.as_secs()
+                )),
+            },
+            None => fut.await,
+        };
+        if let Ok(all) = &result {
+            let bytes: u64 = all.iter().map(|b| b.len() as u64).sum();
+            config::metrics::VIX_FETCH_COUNT_TOTAL
+                .with_label_values(&[metric_path])
+                .inc_by(all.len() as u64);
+            config::metrics::VIX_FETCH_BYTES_TOTAL
+                .with_label_values(&[metric_path])
+                .inc_by(bytes);
+            if let Some(stats) = &stats {
+                stats.fetches.fetch_add(all.len() as u64, Ordering::Relaxed);
+                stats.bytes.fetch_add(bytes, Ordering::Relaxed);
+            }
+        }
         let _ = tx.send(result);
     });
     async move {
@@ -173,6 +250,19 @@ impl VixRangeSource for LadderRangeSource {
         let location = self.location.clone();
         spawn_fetch(&self.handle, "search", self.stats.clone(), async move {
             infra::cache::storage::get_range(&account, &location, range)
+                .await
+                .map_err(anyhow::Error::from)
+        })
+    }
+
+    fn fetch_many(
+        &self,
+        ranges: Vec<Range<u64>>,
+    ) -> BoxFuture<'static, anyhow::Result<Vec<Bytes>>> {
+        let account = self.account.clone();
+        let location = self.location.clone();
+        spawn_fetch_many(&self.handle, "search", self.stats.clone(), async move {
+            infra::cache::storage::get_ranges(&account, &location, &ranges)
                 .await
                 .map_err(anyhow::Error::from)
         })

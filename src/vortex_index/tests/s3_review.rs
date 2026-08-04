@@ -127,7 +127,6 @@ fn build_multi_rg_file() -> Bytes {
     let opts = VixWriterOptions {
         // ~26-byte terms with a 4 KiB row-group budget: ~150 terms per row
         // group, >100 row groups
-        rg_term_bytes: 4096,
         ..Default::default()
     };
     let mut writer = VixWriter::new(&schema, opts, false);
@@ -159,18 +158,18 @@ fn s3_review_open_is_directory_only_and_fsts_load_lazily() {
 
     let source = CountingSource::new(data.clone());
     let reader = VixReader::open_ranged(Arc::clone(&source) as Arc<dyn VixRangeSource>).unwrap();
-    assert!(
-        reader.term_row_group_count() > 20,
-        "fixture must span many row groups, got {}",
-        reader.term_row_group_count()
-    );
+    // open is FOOTER-ONLY: the dictionary index parses lazily on the first
+    // dictionary touch, blocks fetch per lookup
     let open_fetches = source.fetch_count();
     let open_bytes = source.byte_count();
-    // the dict holds 20k ~26-byte terms (>500 KiB raw FST bytes); the
-    // directory is a fraction of it. Tail (64 KiB) dominates open bytes.
     assert!(
         open_bytes < 64 * 1024 + 96 * 1024,
-        "open must fetch the tail + a small directory, not the whole dict: {open_bytes} bytes"
+        "open must fetch only the tail window: {open_bytes} bytes"
+    );
+    assert!(
+        reader.term_row_group_count() > 20,
+        "fixture must span many dictionary blocks, got {}",
+        reader.term_row_group_count()
     );
     let open_memory = reader.memory_size();
     source.take_log();

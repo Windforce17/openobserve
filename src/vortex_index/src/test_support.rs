@@ -19,9 +19,10 @@
 use bytes::Bytes;
 
 use crate::container::{
-    BLOB_TAG_DICT, BLOB_TAG_DOCS, BLOB_TAG_TERMS, BLOB_TYPE_DICT, BLOB_TYPE_DOCS, BLOB_TYPE_TERMS,
-    BlobHandle, FIELD_TYPE_FTS, FIELD_TYPE_TERM, FieldEntry, PROP_FIELDS, PROP_PARTIAL_FIELDS,
-    PROP_TOKENIZER, PROP_ZONE_MAP, build_container, parse_container,
+    BLOB_TAG_DICT, BLOB_TAG_DICT_BLOCKS, BLOB_TAG_DOCS, BLOB_TAG_TERMS, BLOB_TYPE_DICT,
+    BLOB_TYPE_DICT_BLOCKS, BLOB_TYPE_DOCS, BLOB_TYPE_TERMS, BlobHandle, FIELD_TYPE_FTS,
+    FIELD_TYPE_TERM, FieldEntry, PROP_FIELDS, PROP_PARTIAL_FIELDS, PROP_TOKENIZER, PROP_ZONE_MAP,
+    build_container, parse_container,
 };
 
 /// Re-pack a `.vix` file with its `zone_map` property removed — simulates a
@@ -45,6 +46,9 @@ pub fn strip_zone_map_property(data: &[u8]) -> anyhow::Result<Vec<u8>> {
     let mut blobs: Vec<(&'static str, &'static str, Vec<u8>)> = Vec::new();
     if let Some(dict) = blob_bytes(container.dict) {
         blobs.push((BLOB_TYPE_DICT, BLOB_TAG_DICT, dict));
+    }
+    if let Some(BlobHandle::Mem(blocks)) = container.dict_blocks {
+        blobs.push((BLOB_TYPE_DICT_BLOCKS, BLOB_TAG_DICT_BLOCKS, blocks.to_vec()));
     }
     if let Some(terms) = blob_bytes(container.terms) {
         blobs.push((BLOB_TYPE_TERMS, BLOB_TAG_TERMS, terms));
@@ -104,6 +108,9 @@ pub fn repack_with_tokenizer_property(data: &[u8], tokenizer: &str) -> anyhow::R
     let mut blobs: Vec<(&'static str, &'static str, Vec<u8>)> = Vec::new();
     if let Some(dict) = blob_bytes(container.dict) {
         blobs.push((BLOB_TYPE_DICT, BLOB_TAG_DICT, dict));
+    }
+    if let Some(BlobHandle::Mem(blocks)) = container.dict_blocks {
+        blobs.push((BLOB_TYPE_DICT_BLOCKS, BLOB_TAG_DICT_BLOCKS, blocks.to_vec()));
     }
     if let Some(terms) = blob_bytes(container.terms) {
         blobs.push((BLOB_TYPE_TERMS, BLOB_TAG_TERMS, terms));
@@ -168,6 +175,9 @@ pub fn repack_dropping_field_term_capability(data: &[u8], field: &str) -> anyhow
     if let Some(dict) = blob_bytes(container.dict) {
         blobs.push((BLOB_TYPE_DICT, BLOB_TAG_DICT, dict));
     }
+    if let Some(BlobHandle::Mem(blocks)) = container.dict_blocks {
+        blobs.push((BLOB_TYPE_DICT_BLOCKS, BLOB_TAG_DICT_BLOCKS, blocks.to_vec()));
+    }
     if let Some(terms) = blob_bytes(container.terms) {
         blobs.push((BLOB_TYPE_TERMS, BLOB_TAG_TERMS, terms));
     }
@@ -207,6 +217,9 @@ pub fn repack_with_partial_fields(data: &[u8], partial_fields: &[&str]) -> anyho
     let mut blobs: Vec<(&'static str, &'static str, Vec<u8>)> = Vec::new();
     if let Some(dict) = blob_bytes(container.dict) {
         blobs.push((BLOB_TYPE_DICT, BLOB_TAG_DICT, dict));
+    }
+    if let Some(BlobHandle::Mem(blocks)) = container.dict_blocks {
+        blobs.push((BLOB_TYPE_DICT_BLOCKS, BLOB_TAG_DICT_BLOCKS, blocks.to_vec()));
     }
     if let Some(terms) = blob_bytes(container.terms) {
         blobs.push((BLOB_TYPE_TERMS, BLOB_TAG_TERMS, terms));

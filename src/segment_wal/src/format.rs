@@ -146,6 +146,42 @@ fn write_len_prefixed(buf: &mut Vec<u8>, bytes: &[u8], what: &str) -> Result<(),
 /// a hard error naming the failure — segments are atomic, there is no
 /// recoverable tail.
 pub fn decode_segment(bytes: &[u8]) -> Result<(SegmentHeader, Vec<SegmentFrame>), anyhow::Error> {
+    let mut frames = Vec::new();
+    let header = decode_segment_filtered(bytes, |_| true, |frame| {
+        frames.push(frame);
+        Ok(())
+    })?;
+    Ok((header, frames))
+}
+
+/// A data frame's identity and bounds, decoded BEFORE its IPC body is
+/// interpreted — the filter input of [`decode_segment_filtered`].
+#[derive(Debug, Clone)]
+pub struct FrameInfo {
+    pub org: String,
+    pub stream_type: StreamType,
+    pub stream: String,
+    pub min_ts: i64,
+    pub max_ts: i64,
+    pub rows: u32,
+}
+
+/// Streaming decode: the payload decompresses INCREMENTALLY (one zstd
+/// stream) and each data frame's identity goes to `want`; only when it
+/// returns true is the frame's IPC body parsed into a batch and handed to
+/// `on_frame`. Peak memory ≈ the largest single frame (+ the zstd window)
+/// instead of the whole decompressed payload — unwanted frames' bytes are
+/// decompressed through and CRC-checked but never IPC-parsed.
+///
+/// Integrity semantics are IDENTICAL to [`decode_segment`] (which is built
+/// on this): every frame's crc32 is verified whether wanted or not, and any
+/// inconsistency is a hard error naming the segment and frame index —
+/// segments are small and written atomically, there is no recoverable tail.
+pub fn decode_segment_filtered(
+    bytes: &[u8],
+    mut want: impl FnMut(&FrameInfo) -> bool,
+    mut on_frame: impl FnMut(SegmentFrame) -> Result<(), anyhow::Error>,
+) -> Result<SegmentHeader, anyhow::Error> {
     let mut r = Reader::new(bytes);
     let magic = r
         .take(4, "magic")
@@ -187,31 +223,32 @@ pub fn decode_segment(bytes: &[u8]) -> Result<(SegmentHeader, Vec<SegmentFrame>)
     };
     let seg = format!("{}/{:020}", header.node_uuid, header.seq);
 
-    let payload = zstd::decode_all(&bytes[r.pos..])
-        .map_err(|e| anyhow!("segment {seg}: zstd decompress failed: {e}"))?;
-
-    let mut frames = Vec::new();
-    let mut r = Reader::new(&payload);
+    let decoder = zstd::stream::read::Decoder::new(&bytes[r.pos..])
+        .map_err(|e| anyhow!("segment {seg}: zstd decoder open failed: {e}"))?;
+    let mut fr = FrameStream::new(decoder);
     let mut idx = 0usize;
     loop {
-        let frame_start = r.pos;
-        let frame_type = r
-            .read_u8("frame type")
-            .map_err(|e| anyhow!("segment {seg}: frame {idx}: {e}"))?;
+        fr.begin_frame();
+        let frame_type = match fr
+            .read_u8_or_eof("frame type")
+            .map_err(|e| anyhow!("segment {seg}: frame {idx}: {e}"))?
+        {
+            Some(t) => t,
+            None => bail!("segment {seg}: frame {idx}: truncated before end frame"),
+        };
         match frame_type {
             FRAME_TYPE_END => {
-                if r.remaining() > 0 {
-                    bail!(
-                        "segment {seg}: {} trailing bytes after end frame (frame {idx})",
-                        r.remaining()
-                    );
+                if !fr
+                    .at_eof()
+                    .map_err(|e| anyhow!("segment {seg}: frame {idx}: {e}"))?
+                {
+                    bail!("segment {seg}: trailing bytes after end frame (frame {idx})");
                 }
-                return Ok((header, frames));
+                return Ok(header);
             }
             FRAME_TYPE_DATA => {
-                let frame = decode_data_frame(&mut r, frame_start)
+                decode_data_frame_streamed(&mut fr, &mut want, &mut on_frame)
                     .map_err(|e| anyhow!("segment {seg}: frame {idx}: {e:#}"))?;
-                frames.push(frame);
                 idx += 1;
             }
             other => {
@@ -221,42 +258,192 @@ pub fn decode_segment(bytes: &[u8]) -> Result<(SegmentHeader, Vec<SegmentFrame>)
     }
 }
 
-fn decode_data_frame(
-    r: &mut Reader<'_>,
-    frame_start: usize,
-) -> Result<SegmentFrame, anyhow::Error> {
-    let org_len = r.read_u16("org length")? as usize;
-    let org_bytes = r.take(org_len, "org")?;
-    let stream_type_len = r.read_u16("stream_type length")? as usize;
-    let stream_type_bytes = r.take(stream_type_len, "stream_type")?;
-    let stream_len = r.read_u16("stream length")? as usize;
-    let stream_bytes = r.take(stream_len, "stream")?;
-    let min_ts = r.read_i64("min_ts")?;
-    let max_ts = r.read_i64("max_ts")?;
-    let rows = r.read_u32("rows")?;
-    let ipc_len = r.read_u32("ipc length")? as usize;
-    let ipc_bytes = r.take(ipc_len, "ipc payload")?;
-    let crc_stored = r.read_u32("crc32")?;
+/// Sanity cap on a single frame's IPC body; the writer cuts segments far
+/// below this, so anything bigger is corruption, not data.
+const MAX_FRAME_IPC_LEN: usize = 1 << 31;
 
-    // verify the crc before interpreting any of the guarded bytes
-    let crc_computed = crc32fast::hash(&r.buf[frame_start..r.pos - 4]);
+fn decode_data_frame_streamed(
+    fr: &mut FrameStream<impl std::io::Read>,
+    want: &mut impl FnMut(&FrameInfo) -> bool,
+    on_frame: &mut impl FnMut(SegmentFrame) -> Result<(), anyhow::Error>,
+) -> Result<(), anyhow::Error> {
+    let org_len = fr.read_u16("org length")? as usize;
+    let org = fr.read_str(org_len, "org")?;
+    let stream_type_len = fr.read_u16("stream_type length")? as usize;
+    let stream_type_str = fr.read_str(stream_type_len, "stream_type")?;
+    let stream_len = fr.read_u16("stream length")? as usize;
+    let stream = fr.read_str(stream_len, "stream")?;
+    let min_ts = fr.read_i64("min_ts")?;
+    let max_ts = fr.read_i64("max_ts")?;
+    let rows = fr.read_u32("rows")?;
+    let ipc_len = fr.read_u32("ipc length")? as usize;
+    if ipc_len > MAX_FRAME_IPC_LEN {
+        bail!("ipc length {ipc_len} exceeds the {MAX_FRAME_IPC_LEN} frame cap (corrupt length)");
+    }
+    // NOT From<&str>: that silently falls back to Logs on unknown input,
+    // which would misfile another stream type's rows.
+    let stream_type = parse_stream_type(&stream_type_str)
+        .ok_or_else(|| anyhow!("unknown stream type {stream_type_str:?}"))?;
+    let info = FrameInfo {
+        org,
+        stream_type,
+        stream,
+        min_ts,
+        max_ts,
+        rows,
+    };
+    let wanted = want(&info);
+
+    // the IPC body streams into the frame buffer either way — the crc32
+    // guards every frame, wanted or not
+    let ipc_range = fr.read_exact_buffered(ipc_len, "ipc payload")?;
+    let crc_stored = fr.read_u32_unbuffered("crc32")?;
+    let crc_computed = crc32fast::hash(fr.frame_bytes());
     if crc_stored != crc_computed {
         bail!("crc32 mismatch: stored {crc_stored:#010x}, computed {crc_computed:#010x}");
     }
+    if !wanted {
+        return Ok(());
+    }
 
-    let org = std::str::from_utf8(org_bytes)
-        .map_err(|e| anyhow!("org is not utf-8: {e}"))?
-        .to_string();
-    let stream_type_str = std::str::from_utf8(stream_type_bytes)
-        .map_err(|e| anyhow!("stream_type is not utf-8: {e}"))?;
-    // NOT From<&str>: that silently falls back to Logs on unknown input,
-    // which would misfile another stream type's rows.
-    let stream_type = parse_stream_type(stream_type_str)
-        .ok_or_else(|| anyhow!("unknown stream type {stream_type_str:?}"))?;
-    let stream = std::str::from_utf8(stream_bytes)
-        .map_err(|e| anyhow!("stream is not utf-8: {e}"))?
-        .to_string();
+    let ipc_bytes = &fr.buf()[ipc_range];
+    let batch = parse_frame_batch(&info, ipc_bytes)?;
+    if batch.num_rows() as u64 != u64::from(info.rows) {
+        bail!(
+            "stream {}/{}/{}: row count mismatch: frame declares {} rows, ipc decoded {}",
+            info.org,
+            info.stream_type,
+            info.stream,
+            info.rows,
+            batch.num_rows()
+        );
+    }
+    on_frame(SegmentFrame {
+        org: info.org,
+        stream_type: info.stream_type,
+        stream: info.stream,
+        min_ts: info.min_ts,
+        max_ts: info.max_ts,
+        batch,
+    })
+}
 
+/// Pull-reader over the decompressing stream that keeps the CURRENT frame's
+/// bytes in a reusable buffer for the trailing crc32 check. `begin_frame`
+/// resets the buffer; the stored crc itself is read UNbuffered (it is not
+/// covered by the hash).
+struct FrameStream<R: std::io::Read> {
+    src: R,
+    buf: Vec<u8>,
+}
+
+impl<R: std::io::Read> FrameStream<R> {
+    fn new(src: R) -> Self {
+        Self {
+            src,
+            buf: Vec::new(),
+        }
+    }
+
+    fn begin_frame(&mut self) {
+        self.buf.clear();
+    }
+
+    fn buf(&self) -> &[u8] {
+        &self.buf
+    }
+
+    /// Every byte of the current frame read so far (type tag through ipc).
+    fn frame_bytes(&self) -> &[u8] {
+        &self.buf
+    }
+
+    fn read_exact_buffered(
+        &mut self,
+        n: usize,
+        what: &str,
+    ) -> Result<std::ops::Range<usize>, anyhow::Error> {
+        let start = self.buf.len();
+        self.buf.resize(start + n, 0);
+        self.src
+            .read_exact(&mut self.buf[start..])
+            .map_err(|e| anyhow!("truncated reading {what}: {e}"))?;
+        Ok(start..start + n)
+    }
+
+    fn read_array_buffered<const N: usize>(
+        &mut self,
+        what: &str,
+    ) -> Result<[u8; N], anyhow::Error> {
+        let range = self.read_exact_buffered(N, what)?;
+        let mut out = [0u8; N];
+        out.copy_from_slice(&self.buf[range]);
+        Ok(out)
+    }
+
+    /// Reads one byte into the frame buffer; clean EOF before it is `None`.
+    fn read_u8_or_eof(&mut self, what: &str) -> Result<Option<u8>, anyhow::Error> {
+        let mut byte = [0u8; 1];
+        let mut read = 0usize;
+        while read < 1 {
+            match self.src.read(&mut byte[read..]) {
+                Ok(0) if read == 0 => return Ok(None),
+                Ok(0) => bail!("truncated reading {what}: unexpected eof"),
+                Ok(n) => read += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => bail!("truncated reading {what}: {e}"),
+            }
+        }
+        self.buf.push(byte[0]);
+        Ok(Some(byte[0]))
+    }
+
+    fn read_u16(&mut self, what: &str) -> Result<u16, anyhow::Error> {
+        Ok(u16::from_le_bytes(self.read_array_buffered(what)?))
+    }
+
+    fn read_u32(&mut self, what: &str) -> Result<u32, anyhow::Error> {
+        Ok(u32::from_le_bytes(self.read_array_buffered(what)?))
+    }
+
+    fn read_i64(&mut self, what: &str) -> Result<i64, anyhow::Error> {
+        Ok(i64::from_le_bytes(self.read_array_buffered(what)?))
+    }
+
+    fn read_str(&mut self, n: usize, what: &str) -> Result<String, anyhow::Error> {
+        let range = self.read_exact_buffered(n, what)?;
+        std::str::from_utf8(&self.buf[range])
+            .map(|s| s.to_string())
+            .map_err(|e| anyhow!("{what} is not utf-8: {e}"))
+    }
+
+    /// The stored crc is NOT part of the hashed bytes: read it outside the
+    /// frame buffer.
+    fn read_u32_unbuffered(&mut self, what: &str) -> Result<u32, anyhow::Error> {
+        let mut out = [0u8; 4];
+        self.src
+            .read_exact(&mut out)
+            .map_err(|e| anyhow!("truncated reading {what}: {e}"))?;
+        Ok(u32::from_le_bytes(out))
+    }
+
+    /// True when the source is exhausted (the end frame must be last).
+    fn at_eof(&mut self) -> Result<bool, anyhow::Error> {
+        let mut probe = [0u8; 1];
+        loop {
+            match self.src.read(&mut probe) {
+                Ok(0) => return Ok(true),
+                Ok(_) => return Ok(false),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => bail!("probing for trailing bytes: {e}"),
+            }
+        }
+    }
+}
+
+/// IPC-parse one wanted frame's body (identity in `info` for error text).
+fn parse_frame_batch(info: &FrameInfo, ipc_bytes: &[u8]) -> Result<RecordBatch, anyhow::Error> {
+    let (org, stream_type, stream) = (&info.org, info.stream_type, &info.stream);
     let reader = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(ipc_bytes), None)
         .with_context(|| {
         format!("stream {org}/{stream_type}/{stream}: arrow ipc open failed")
@@ -267,27 +454,12 @@ fn decode_data_frame(
         .with_context(|| format!("stream {org}/{stream_type}/{stream}: arrow ipc decode failed"))?;
     // the encoder writes exactly one batch per frame, but merge defensively;
     // batches from one ipc stream share one schema, so concat is safe here
-    let batch = match batches.len() {
+    Ok(match batches.len() {
         0 => RecordBatch::new_empty(schema),
         1 => batches.swap_remove(0),
         _ => arrow::compute::concat_batches(&schema, batches.iter()).with_context(|| {
             format!("stream {org}/{stream_type}/{stream}: arrow ipc concat failed")
         })?,
-    };
-    if batch.num_rows() as u64 != u64::from(rows) {
-        bail!(
-            "stream {org}/{stream_type}/{stream}: row count mismatch: frame declares {rows} rows, ipc decoded {}",
-            batch.num_rows()
-        );
-    }
-
-    Ok(SegmentFrame {
-        org,
-        stream_type,
-        stream,
-        min_ts,
-        max_ts,
-        batch,
     })
 }
 
@@ -604,8 +776,11 @@ mod tests {
         encoded.truncate(encoded.len() - 5);
         let err = decode_segment(&encoded).unwrap_err();
         let msg = format!("{err:#}");
+        // streaming decode surfaces outer truncation wherever the read
+        // stalls (mid-frame or at the decoder); either way it is a hard
+        // error that names the segment
         assert!(
-            msg.contains("zstd decompress failed"),
+            msg.contains("truncated") || msg.contains("zstd"),
             "unexpected error: {msg}"
         );
         assert!(msg.contains(&h.node_uuid), "unexpected error: {msg}");
@@ -766,5 +941,85 @@ mod tests {
         }
         assert_eq!(parse_stream_type("Logs"), None);
         assert_eq!(parse_stream_type(""), None);
+    }
+
+    /// The filtered streaming decode: unwanted frames are skipped without
+    /// IPC parsing but still crc-verified; wanted frames come out identical
+    /// to the collect-everything path (which is built on it).
+    #[test]
+    fn filtered_decode_skips_unwanted_and_verifies_all_crcs() {
+        let h = header();
+        let frames = vec![
+            frame("org1", StreamType::Traces, "default", 10, 20, batch_i64("v", &[1, 2, 3])),
+            frame("org1", StreamType::Logs, "default", 10, 20, batch_i64("v", &[4, 5])),
+            frame("org1", StreamType::Traces, "other", 30, 40, batch_i64("v", &[6])),
+        ];
+        let encoded = encode_segment(&h, &frames).unwrap();
+
+        // want only traces/default: exactly one frame surfaces, identical
+        // to the full decode's copy of it
+        let mut seen: Vec<SegmentFrame> = Vec::new();
+        let mut inspected = 0usize;
+        let header_out = decode_segment_filtered(
+            &encoded,
+            |info| {
+                inspected += 1;
+                info.stream_type == StreamType::Traces && info.stream == "default"
+            },
+            |f| {
+                seen.push(f);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(header_out, h);
+        assert_eq!(inspected, 3, "every frame's identity is offered");
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].stream, "default");
+        assert_eq!(seen[0].batch.num_rows(), 3);
+        let (_, full) = decode_segment(&encoded).unwrap();
+        assert_eq!(full[0].batch, seen[0].batch);
+
+        // corrupt a byte inside the SECOND (unwanted) frame's region: the
+        // filtered decode must still fail — every frame is crc-guarded.
+        // Corrupting compressed bytes may also break zstd itself; either
+        // way it must be a hard error.
+        let mut broken = encoded.clone();
+        let mid = broken.len() / 2;
+        broken[mid] ^= 0x55;
+        let res = decode_segment_filtered(&broken, |_| false, |_| Ok(()));
+        assert!(res.is_err(), "corruption anywhere must fail the decode");
+
+        // want-nothing over a clean segment: header parses, no frames, no error
+        let mut none = 0usize;
+        decode_segment_filtered(&encoded, |_| false, |_| {
+            none += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(none, 0);
+    }
+
+    /// The frame identity offered to the filter carries the bounds the scan
+    /// prunes on, before any IPC work.
+    #[test]
+    fn filtered_decode_offers_bounds_before_parsing() {
+        let h = header();
+        let encoded = encode_segment(
+            &h,
+            &[frame("orgX", StreamType::Logs, "s1", 111, 222, batch_i64("v", &[7, 8]))],
+        )
+        .unwrap();
+        let mut infos: Vec<(String, i64, i64, u32)> = Vec::new();
+        decode_segment_filtered(
+            &encoded,
+            |info| {
+                infos.push((info.stream.clone(), info.min_ts, info.max_ts, info.rows));
+                false
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(infos, vec![("s1".to_string(), 111, 222, 2)]);
     }
 }

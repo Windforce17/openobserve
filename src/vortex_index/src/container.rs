@@ -99,7 +99,12 @@ pub(crate) const BLOB_TAG_PLIST: &str = "plist";
 /// Puffin blob type id of the dictionary blob. Type ids are free-form
 /// strings in the puffin footer; a blob is recognized by (tag, type id) and
 /// everything else is skipped.
-pub(crate) const BLOB_TYPE_DICT: &str = "o2-vix-dict-v1";
+pub(crate) const BLOB_TYPE_DICT: &str = "o2-vix-dict-v2";
+/// Blob tag of the dictionary BLOCKS region: raw concatenated
+/// prefix-compressed key blocks, addressed by the `dict` blob's index
+/// (deliberately NOT a Vortex file — readers range-fetch single blocks).
+pub(crate) const BLOB_TAG_DICT_BLOCKS: &str = "dict_blocks";
+pub(crate) const BLOB_TYPE_DICT_BLOCKS: &str = "o2-vix-dictblocks-v1";
 /// Blob type id of the terms blob.
 pub(crate) const BLOB_TYPE_TERMS: &str = "o2-vix-terms-v1";
 /// Blob type id of the docs blob.
@@ -135,6 +140,13 @@ pub(crate) const PROP_PLIST_MIN_DOCS: &str = "plist_min_docs";
 /// (measured on the 200M benchmark).
 pub(crate) const PROP_DICT_LAYOUT: &str = "dict_layout";
 pub(crate) const DICT_LAYOUT_CELLS: &str = "cells";
+/// THE dictionary layout: the `dict` blob is a [`crate::dict_blocks`] block
+/// INDEX (restart-compressed first keys + per-block meta) and the
+/// `dict_blocks` blob holds the prefix-compressed key blocks it addresses.
+/// Files declaring any other layout (or none) are unreadable — the
+/// monolithic-FST layouts were retired without read support (owner call,
+/// 2026-08-03; ENGINE-BACKLOG #18).
+pub(crate) const DICT_LAYOUT_BLOCKS: &str = "blocks";
 /// Composite-KEY layout of the `dict` blob (orthogonal to
 /// [`PROP_DICT_LAYOUT`], which describes chunking). Exactly
 /// [`KEY_LAYOUT_FID_V2`] — field-major `{fid}{token}` keys
@@ -251,6 +263,8 @@ impl std::fmt::Debug for BlobHandle {
 pub(crate) struct VixContainer {
     pub properties: BTreeMap<String, String>,
     pub dict: Option<BlobHandle>,
+    /// The dictionary blocks region (paired with `dict`, the block index).
+    pub dict_blocks: Option<BlobHandle>,
     pub terms: Option<BlobHandle>,
     pub docs: Option<BlobHandle>,
     /// Per-file value blooms for configured needle fields (may be absent).
@@ -271,6 +285,7 @@ fn container_from_meta(
     mut slice: impl FnMut(std::ops::Range<u64>) -> BlobHandle,
 ) -> Result<VixContainer> {
     let mut dict = None;
+    let mut dict_blocks = None;
     let mut terms = None;
     let mut docs = None;
     let mut bloom = None;
@@ -286,6 +301,7 @@ fn container_from_meta(
         let tag = blob.properties.get("blob_tag").map(String::as_str);
         let target = match (tag, blob.blob_type.as_str()) {
             (Some(BLOB_TAG_DICT), BLOB_TYPE_DICT) => &mut dict,
+            (Some(BLOB_TAG_DICT_BLOCKS), BLOB_TYPE_DICT_BLOCKS) => &mut dict_blocks,
             (Some(BLOB_TAG_TERMS), BLOB_TYPE_TERMS) => &mut terms,
             (Some(BLOB_TAG_DOCS), BLOB_TYPE_DOCS) => &mut docs,
             (Some(BLOB_TAG_BLOOM), BLOB_TYPE_BLOOM) => &mut bloom,
@@ -298,6 +314,7 @@ fn container_from_meta(
     Ok(VixContainer {
         properties: meta.properties,
         dict,
+        dict_blocks,
         terms,
         docs,
         bloom,

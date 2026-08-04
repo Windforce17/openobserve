@@ -75,6 +75,28 @@ use crate::{
 };
 
 static PROCESSING_FILES: Lazy<RwLock<HashSet<String>>> = Lazy::new(|| RwLock::new(HashSet::new()));
+/// Normal-mover batches currently INSIDE `move_files`. The mover's worker
+/// tasks are detached and keep finishing their in-flight batch through
+/// shutdown; `run_final_move` used to blindly clear PROCESSING_FILES while
+/// such a batch was mid-upload — its files were still on disk, now
+/// unclaimed, and the shutdown scan re-moved (and RE-REGISTERED) them:
+/// +13.6% duplicate rows per clean shutdown (ENGINE-BACKLOG #19). The
+/// final move now drains this counter before touching any claims.
+static MOVES_IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// RAII in-flight marker (panic-safe: dropping decrements).
+struct MoveInFlight;
+impl MoveInFlight {
+    fn new() -> Self {
+        MOVES_IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        MoveInFlight
+    }
+}
+impl Drop for MoveInFlight {
+    fn drop(&mut self) {
+        MOVES_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
 /// Set by [`run_final_move`]: retention/size defer gates yield so the
 /// shutdown pass takes EVERY WAL file regardless of age.
 static FINAL_MOVE_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -109,6 +131,7 @@ pub async fn run() -> Result<(), anyhow::Error> {
                         // released or those files are skipped by every later
                         // scan while still counting as pending.
                         let claimed: Vec<String> = files.iter().map(|f| f.key.clone()).collect();
+                        let _in_flight = MoveInFlight::new();
                         match tokio::spawn(
                             async move { move_files(thread_id, &prefix, files).await },
                         )
@@ -216,6 +239,28 @@ pub async fn run() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+/// Shutdown-path companion of [`scan_pending_delete_files`]: physically
+/// delete every pending-delete file no query still locks, then CLAIM
+/// whatever survives in [`PROCESSING_FILES`] so the final-move scan can
+/// never re-move (and re-register) an already-uploaded file.
+async fn drain_and_reclaim_pending_deletes() {
+    if let Err(e) = scan_pending_delete_files().await {
+        log::error!("[INGESTER:SHUTDOWN] pending-delete drain error: {e}");
+    }
+    let remaining = db::file_list::local::get_pending_delete().await;
+    if remaining.is_empty() {
+        return;
+    }
+    log::warn!(
+        "[INGESTER:SHUTDOWN] {} uploaded files still await local deletion;          claiming them so the final move cannot re-register their rows",
+        remaining.len()
+    );
+    let mut processing = PROCESSING_FILES.write().await;
+    for file_key in remaining {
+        processing.insert(file_key);
+    }
+}
+
 // check if the file is still in pending delete
 async fn scan_pending_delete_files() -> Result<(), anyhow::Error> {
     let start = std::time::Instant::now();
@@ -286,7 +331,37 @@ pub async fn run_final_move(deadline: std::time::Duration) -> Result<(), anyhow:
     // stale and would make every scan dispatch nothing while the pending
     // count still sees the files — a tight spin to the deadline (observed
     // in the backlog smoke).
+    // The detached mover workers may still be finishing an in-flight batch:
+    // clearing their live claims re-exposes files whose upload is already
+    // registered. Wait for the drain (bounded by a slice of the deadline).
+    let drain_deadline = std::time::Instant::now()
+        + deadline
+            .div_f32(4.0)
+            .min(std::time::Duration::from_secs(60));
+    loop {
+        let in_flight = MOVES_IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst);
+        if in_flight == 0 {
+            break;
+        }
+        if std::time::Instant::now() >= drain_deadline {
+            log::warn!(
+                "[INGESTER:SHUTDOWN] {in_flight} mover batches still in flight at the drain                  deadline; their claims may be cleared and their files re-checked"
+            );
+            break;
+        }
+        log::info!(
+            "[INGESTER:SHUTDOWN] waiting for {in_flight} in-flight mover batches before              touching claims"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
     PROCESSING_FILES.write().await.clear();
+    // Files on the durable pending-delete list are ALREADY uploaded and
+    // registered — their claims are the only thing standing between the
+    // shutdown scan and a RE-MOVE that registers their rows again
+    // (measured: +13.6% duplicate rows per clean shutdown, ENGINE-BACKLOG
+    // #19). The clear above dropped those claims: delete what no query
+    // still locks, and re-claim whatever remains so no pass re-moves it.
+    drain_and_reclaim_pending_deletes().await;
     FINAL_MOVE_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
     loop {
         let pending = config::utils::file::scan_files(&wal_pattern, "parquet", None)
@@ -332,6 +407,9 @@ pub async fn run_final_move(deadline: std::time::Duration) -> Result<(), anyhow:
         // files that errored keep their claim — drop claims so the next
         // pass retries instead of spinning past them
         PROCESSING_FILES.write().await.clear();
+        // ...but never the pending-delete claims (see above): every clear
+        // must restore them or a later pass re-moves uploaded files
+        drain_and_reclaim_pending_deletes().await;
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 }

@@ -55,6 +55,7 @@
 
 pub mod bloom;
 mod container;
+mod dict_blocks;
 mod docs;
 mod error;
 mod merge;
@@ -79,13 +80,13 @@ pub use numeric::{
     canonical_number_text, canonical_u64_text, is_numeric_value_token, numeric_value_token,
 };
 pub use query::VixQuery;
-pub use reader::{DocsDictChunk, FieldValueCounts, TermVisitor, VixReader, ZoneChunk};
+pub use reader::{DocsDictChunk, FieldValueCounts, PlistCursor, TermVisitor, VixReader, ZoneChunk};
 pub use source::{BytesRangeSource, VixRangeSource};
 pub use tokenizer::o2_tokenize;
 pub use writer::{
-    DEFAULT_CELL_MIN_BYTES, DEFAULT_DOCS_CHUNK_BYTES, ID_COL_NAME, ORIGINAL_DATA_COL_NAME,
-    SOURCE_COL_NAME, SOURCE_RENAMED_COL_NAME, TIMESTAMP_COL_NAME, VixWriter, VixWriterOptions,
-    VixWriterStats, is_value_indexed_type,
+    DEFAULT_DOCS_CHUNK_BYTES, ID_COL_NAME, ORIGINAL_DATA_COL_NAME, SOURCE_COL_NAME,
+    SOURCE_RENAMED_COL_NAME, TIMESTAMP_COL_NAME, VixWriter, VixWriterOptions, VixWriterStats,
+    is_value_indexed_type,
 };
 
 #[cfg(test)]

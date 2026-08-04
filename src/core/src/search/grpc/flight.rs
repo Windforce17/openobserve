@@ -486,11 +486,22 @@ pub async fn search(
     // fail the query: a silently missing segment is silent partial data.
     if !segment_ids.is_empty() {
         let segments_scan_start = std::time::Instant::now();
+        // The plan's LIMIT rides on the SimpleSelect optimizer rule, not the
+        // scan node (DataFusion keeps the fetch above the sort, so
+        // empty_exec.limit() is None for the UI's ORDER BY _timestamp DESC
+        // LIMIT n shape). DESC only — an ascending scan reads from the
+        // sealed end and top-n-newest trimming does not apply.
+        let segment_limit = match &idx_optimize_rule {
+            Some(IndexOptimizeMode::SimpleSelect(n, false)) if *n > 0 => Some(*n),
+            _ => empty_exec.limit(),
+        };
         let (tbls, stats) = match super::segments_scan::search(
             query_params.clone(),
             latest_schema.clone(),
+            empty_exec.schema().clone(),
             &segment_ids,
             empty_exec.sorted_by_time(),
+            segment_limit,
             index_condition.clone(),
             fst_fields.clone(),
         )

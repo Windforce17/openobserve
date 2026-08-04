@@ -380,6 +380,154 @@ pub fn rank_at(record: &[u8], doc_count: usize, target: u32) -> Result<u64> {
     Ok(rank)
 }
 
+/// Invoke `on_doc` for every id of the record in `[start, end)`, in
+/// ascending order. Jumps in via the skip table (like [`rank_at`]) and stops
+/// at the first id `>= end` — a chunk-bounded decode touches only the block
+/// groups overlapping the range instead of the whole list.
+pub fn for_each_in_range(
+    record: &[u8],
+    doc_count: usize,
+    start: u32,
+    end: u32,
+    mut on_doc: impl FnMut(u32) -> Result<()>,
+) -> Result<()> {
+    if start >= end || doc_count == 0 {
+        return Ok(());
+    }
+    let entries = record_entries(record)?;
+    let table = record
+        .get(4..4 + entries * 8)
+        .ok_or_else(|| truncated("plist skip table"))?;
+    let blob = &record[4 + entries * 8..];
+    let full_blocks = doc_count / BLOCK_LEN;
+
+    let entry_first =
+        |k: usize| -> u32 { u32::from_le_bytes(table[k * 8..k * 8 + 4].try_into().unwrap()) };
+    let entry_offset = |k: usize| -> usize {
+        u32::from_le_bytes(table[k * 8 + 4..k * 8 + 8].try_into().unwrap()) as usize
+    };
+
+    // last group whose first id is < start; None = begin at the very front
+    // (group 0 or the tail-only list)
+    let mut group = None;
+    if entries > 0 {
+        let (mut lo, mut hi) = (0usize, entries);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if entry_first(mid) < start {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo > 0 {
+            group = Some(lo - 1);
+        }
+    }
+
+    let packer = BitPacker4x::new();
+    let mut deltas = [0u32; BLOCK_LEN];
+    let (first_block, mut pos, mut prev, mut seeded, group_first) = match group {
+        Some(g) => (
+            g * SKIP_STRIDE,
+            entry_offset(g),
+            0u32,
+            g == 0,
+            entry_first(g),
+        ),
+        None => (0, 0, 0u32, true, 0),
+    };
+    for _ in first_block..full_blocks {
+        let num_bits = *blob.get(pos).ok_or_else(|| truncated("block bit width"))?;
+        pos += 1;
+        if num_bits > 32 {
+            return Err(VixError::Malformed(format!(
+                "postings block bit width {num_bits} exceeds 32"
+            )));
+        }
+        if num_bits == 0 {
+            deltas.fill(0);
+        } else {
+            let packed_len = num_bits as usize * BLOCK_LEN / 8;
+            let packed = blob
+                .get(pos..pos + packed_len)
+                .ok_or_else(|| truncated("bitpacked block"))?;
+            packer.decompress(packed, &mut deltas, num_bits);
+            pos += packed_len;
+        }
+        for (i, &delta) in deltas.iter().enumerate() {
+            if !seeded && i == 0 {
+                // jump-in seeding: the group's first id is absolute in the
+                // skip table; its stored delta is relative to the previous
+                // group's last id, which a jump never decodes
+                prev = group_first;
+                seeded = true;
+            } else {
+                prev = advance(prev, delta)?;
+            }
+            if prev >= end {
+                return Ok(());
+            }
+            if prev >= start {
+                on_doc(prev)?;
+            }
+        }
+    }
+    // vint tail
+    for _ in 0..doc_count % BLOCK_LEN {
+        let (delta, used) = read_vint(blob.get(pos..).unwrap_or_default())?;
+        pos += used;
+        if !seeded {
+            // tail-only list reached via a jump cannot happen (entries == 0
+            // implies group == None which seeds at the front), but keep the
+            // invariant explicit
+            prev = group_first;
+            seeded = true;
+        } else {
+            prev = advance(prev, delta)?;
+        }
+        if prev >= end {
+            return Ok(());
+        }
+        if prev >= start {
+            on_doc(prev)?;
+        }
+    }
+    Ok(())
+}
+
+/// Byte length of an out-of-row postings POINTER CELL: `[u64 LE offset]
+/// [u32 LE len]` addressing an [`encode_record`] region inside the `plist`
+/// blob. A terms-table cell is a pointer cell exactly when the term's
+/// `doc_count` is at/above the file's persisted `plist_min_docs` threshold
+/// AND the cell is non-empty (dense elision keeps the empty cell even above
+/// the threshold) — readers select by that predicate, never by cell bytes.
+pub(crate) const POINTER_CELL_LEN: usize = 12;
+
+/// Encode a pointer cell (see [`POINTER_CELL_LEN`]).
+pub(crate) fn encode_pointer_cell(offset: u64, len: u32) -> [u8; POINTER_CELL_LEN] {
+    let mut cell = [0u8; POINTER_CELL_LEN];
+    cell[..8].copy_from_slice(&offset.to_le_bytes());
+    cell[8..].copy_from_slice(&len.to_le_bytes());
+    cell
+}
+
+/// Decode a pointer cell into `(offset, len)`. Errors unless the cell is
+/// exactly [`POINTER_CELL_LEN`] bytes — the caller has already decided the
+/// cell is a pointer (by the doc-count threshold), so any other length is
+/// corruption.
+pub(crate) fn decode_pointer_cell(cell: &[u8]) -> Result<(u64, u32)> {
+    if cell.len() != POINTER_CELL_LEN {
+        return Err(VixError::Malformed(format!(
+            "postings pointer cell is {} bytes, expected {POINTER_CELL_LEN}",
+            cell.len()
+        )));
+    }
+    let offset = u64::from_le_bytes(cell[..8].try_into().expect("sized slice"));
+    let len = u32::from_le_bytes(cell[8..].try_into().expect("sized slice"));
+    Ok((offset, len))
+}
+
 #[cfg(test)]
 mod tests {
     /// The record codec: `record_blob` recovers the exact [`encode`]d blob,
@@ -446,6 +594,74 @@ mod tests {
                     let naive = ids.iter().filter(|&&id| id < target).count() as u64;
                     let got = rank_at(&record, ids.len(), target).unwrap();
                     assert_eq!(got, naive, "n={n} dense={dense} target={target}");
+                }
+            }
+        }
+    }
+
+    /// [`for_each_in_range`] agrees with a naive filter for every range
+    /// shape: empty, single-id, group-aligned, group-spanning, tail-crossing,
+    /// full-list, and beyond-the-ids ranges — on the same list shapes the
+    /// rank property test covers.
+    #[test]
+    fn test_record_range_walk_matches_naive_everywhere() {
+        let mut state = 0x9E3779B97F4A7C15u64;
+        let mut next = move |bound: u32| -> u32 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % u64::from(bound.max(1))) as u32
+        };
+        let shapes: Vec<usize> = vec![
+            0,
+            1,
+            5,
+            127,
+            128,
+            129,
+            1023,
+            1024,
+            1025,
+            128 * super::SKIP_STRIDE,
+            128 * super::SKIP_STRIDE + 1,
+            128 * super::SKIP_STRIDE * 3 + 77,
+        ];
+        for n in shapes {
+            for dense in [true, false] {
+                let mut ids = Vec::with_capacity(n);
+                let mut cur = 0u32;
+                for _ in 0..n {
+                    cur += 1 + if dense { next(3) } else { next(50_000) };
+                    ids.push(cur);
+                }
+                let record = encode_record(&ids).unwrap();
+                let max = ids.last().copied().unwrap_or(0);
+                // boundary-heavy cut set: group edges +-1, ends, overshoots
+                let mut cuts: Vec<u32> = vec![0, 1, max, max.saturating_add(1), u32::MAX];
+                for g in (0..ids.len()).step_by(super::SKIP_STRIDE * BLOCK_LEN) {
+                    let id = ids[g];
+                    cuts.extend([id.saturating_sub(1), id, id + 1]);
+                }
+                for _ in 0..30 {
+                    cuts.push(next(max + 1000));
+                }
+                cuts.sort_unstable();
+                cuts.dedup();
+                for (i, &start) in cuts.iter().enumerate() {
+                    for &end in &cuts[i..] {
+                        let naive: Vec<u32> = ids
+                            .iter()
+                            .copied()
+                            .filter(|&id| id >= start && id < end)
+                            .collect();
+                        let mut got = Vec::new();
+                        for_each_in_range(&record, ids.len(), start, end, |id| {
+                            got.push(id);
+                            Ok(())
+                        })
+                        .unwrap();
+                        assert_eq!(got, naive, "n={n} dense={dense} range=[{start},{end})");
+                    }
                 }
             }
         }

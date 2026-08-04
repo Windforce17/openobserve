@@ -109,11 +109,70 @@ pub trait VixRangeSource: Send + Sync + 'static {
     /// Fetch exactly the bytes of `range` (end-exclusive, within `0..len()`).
     fn fetch(&self, range: Range<u64>) -> BoxFuture<'static, anyhow::Result<Bytes>>;
 
+    /// Fetch several ranges in ONE round trip where the backend supports it
+    /// (the cache ladder / S3 issue one batched request). The default chains
+    /// [`VixRangeSource::fetch`] sequentially — correct everywhere, batched
+    /// nowhere. Results are positional.
+    fn fetch_many(
+        &self,
+        ranges: Vec<Range<u64>>,
+    ) -> BoxFuture<'static, anyhow::Result<Vec<Bytes>>> {
+        let futs: Vec<_> = ranges.into_iter().map(|r| self.fetch(r)).collect();
+        Box::pin(async move {
+            let mut out = Vec::with_capacity(futs.len());
+            for fut in futs {
+                out.push(fut.await?);
+            }
+            Ok(out)
+        })
+    }
+
     /// A short description of the object (e.g. its storage path), used in
     /// error messages.
     fn describe(&self) -> String {
         "<vix range source>".to_string()
     }
+}
+
+/// Block the current thread on one `fetch_many` and validate every returned
+/// length (see [`block_fetch`]; same blocking-thread contract).
+pub(crate) fn block_fetch_many(
+    source: &dyn VixRangeSource,
+    ranges: Vec<Range<u64>>,
+) -> Result<Vec<Bytes>> {
+    for range in &ranges {
+        if range.start > range.end || range.end > source.len() {
+            return Err(VixError::Malformed(format!(
+                "range {}..{} out of bounds for {} ({} bytes)",
+                range.start,
+                range.end,
+                source.describe(),
+                source.len()
+            )));
+        }
+    }
+    let expected: Vec<usize> = ranges.iter().map(|r| (r.end - r.start) as usize).collect();
+    let all = futures::executor::block_on(source.fetch_many(ranges)).map_err(|e| {
+        VixError::Malformed(format!("batched fetch of {}: {e:#}", source.describe()))
+    })?;
+    if all.len() != expected.len() {
+        return Err(VixError::Malformed(format!(
+            "batched fetch of {} returned {} ranges, expected {}",
+            source.describe(),
+            all.len(),
+            expected.len()
+        )));
+    }
+    for (bytes, expected) in all.iter().zip(&expected) {
+        if bytes.len() != *expected {
+            return Err(VixError::Malformed(format!(
+                "batched fetch of {} returned {} bytes for a {expected}-byte range",
+                source.describe(),
+                bytes.len()
+            )));
+        }
+    }
+    Ok(all)
 }
 
 /// Block the current thread on one `fetch` and validate the returned length.

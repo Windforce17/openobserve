@@ -54,9 +54,9 @@ use crate::datafusion::optimizer::physical_optimizer::{
 /// Field eligibility: the group field must be in `index_fields` (the stream's
 /// column-store fields, servable per file from the docs columns under any
 /// condition), or in `unfiltered_index_fields` (term-indexed string fields,
-/// served from the term dictionary alone) — the latter only when the query's
-/// sole filter is the `_timestamp` range, so the str_match-filtered variant
-/// stays column-store-only.
+/// served from the term dictionary — whole-field values when unfiltered,
+/// per-value postings∩bitmap when the str_match filter applies; per-file
+/// ineligibility falls back to the scan at execution).
 pub fn is_simple_distinct(
     plan: Arc<dyn ExecutionPlan>,
     index_fields: HashSet<String>,
@@ -64,11 +64,6 @@ pub fn is_simple_distinct(
 ) -> Option<IndexOptimizeMode> {
     let mut visitor = SimpleDistinctVisitor::new(index_fields, unfiltered_index_fields);
     let _ = plan.visit(&mut visitor);
-    // dictionary-only fields require an unfiltered query: every filter in
-    // the plan must be a bare `_timestamp` range
-    if visitor.requires_no_filter && visitor.has_non_ts_filter {
-        return None;
-    }
     if let Some((field, fetch, ascend)) = visitor.simple_distinct {
             Some(IndexOptimizeMode::SimpleDistinct(
                     field,
@@ -84,11 +79,6 @@ struct SimpleDistinctVisitor {
     pub simple_distinct: Option<(String, usize, bool)>,
     pub index_fields: HashSet<String>,
     unfiltered_index_fields: HashSet<String>,
-    /// the group field is dictionary-only eligible (not column-store): the
-    /// query must carry no condition
-    requires_no_filter: bool,
-    /// the plan contains a filter beyond the `_timestamp` range
-    has_non_ts_filter: bool,
 }
 
 impl SimpleDistinctVisitor {
@@ -97,8 +87,6 @@ impl SimpleDistinctVisitor {
             simple_distinct: None,
             index_fields,
             unfiltered_index_fields,
-            requires_no_filter: false,
-            has_non_ts_filter: false,
         }
     }
 }
@@ -136,11 +124,6 @@ impl<'n> TreeNodeVisitor<'n> for SimpleDistinctVisitor {
                 if is_column(group_expr)
                     && (column_store || self.unfiltered_index_fields.contains(column_name))
                 {
-                    if !column_store {
-                        // dictionary-only field: validated post-visit
-                        // against the plan's filters
-                        self.requires_no_filter = true;
-                    }
                     // Update the simple_distinct with the correct field name
                     if let Some(simple_distinct) = &mut self.simple_distinct {
                         self.simple_distinct = Some((
@@ -177,9 +160,8 @@ impl<'n> TreeNodeVisitor<'n> for SimpleDistinctVisitor {
                 && let Some(column_name) = is_simple_str_match(exprs[0])
                 && self.index_fields.contains(&column_name)
             {
-                // a real condition: dictionary-only group fields are out
-                // (checked post-visit)
-                self.has_non_ts_filter = true;
+                // a real condition: dictionary-only group fields serve via
+                // the filtered postings∩bitmap path at execution
                 return Ok(TreeNodeRecursion::Continue);
             }
             // If projection doesn't have exactly 2 expressions, stop visiting
@@ -333,12 +315,23 @@ mod tests {
                     true,
                 )),
             ),
-            // a real condition disqualifies the term-only field ...
+            // a str_match on a NON-column-store column still rejects (the
+            // filter-column gate, unrelated to group-field eligibility)
             (
                 "select name from t where str_match(name, 'a') and _timestamp >= 1 and _timestamp < 100 group by name order by name asc limit 10",
                 None,
             ),
-            // ... but not a column-store field (existing behavior)
+            // a column-store-filtered query grouping a term-only field is
+            // eligible: execution serves it via postings∩bitmap
+            (
+                "select name from t where str_match(status, 'a') and _timestamp >= 1 and _timestamp < 100 group by name order by name asc limit 10",
+                Some(IndexOptimizeMode::SimpleDistinct(
+                    "name".to_string(),
+                    10,
+                    true,
+                )),
+            ),
+            // a column-store group field under a condition (existing behavior)
             (
                 "select status from t where str_match(status, 'a') and _timestamp >= 1 and _timestamp < 100 group by status order by status asc limit 10",
                 Some(IndexOptimizeMode::SimpleDistinct(

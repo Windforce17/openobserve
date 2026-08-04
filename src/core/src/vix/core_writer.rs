@@ -196,13 +196,16 @@ fn core_writer_options(
             .cloned()
             .collect(),
         column_store_field_names: column_store_fields,
-        rg_term_bytes: cfg.common.vix_rg_term_bytes,
         postings_chunk_bytes: cfg.common.vix_postings_chunk_bytes,
         max_raw_term_len: cfg.common.vix_max_raw_term_len,
         row_group_size: PARQUET_MAX_ROW_GROUP_SIZE,
         docs_chunk_bytes: cfg.common.vix_docs_chunk_bytes,
         min_token_len: cfg.limit.inverted_index_min_token_length,
         max_token_len: cfg.limit.inverted_index_max_token_length,
+        // #15 rollout discipline: default 0 keeps the out-of-row postings
+        // writer dark; flip ZO_VIX_PLIST_MIN_DOCS only after the release
+        // carrying pointer-cell read support is on EVERY pod.
+        postings_plist_min_docs: cfg.common.vix_plist_min_docs as u32,
         // Single-file build (move job): parallelize the `docs`/index blob
         // encode across cores when spare parallelism exists. The compaction
         // merge overrides this with merge_threads() in build_merge_plan.
@@ -216,9 +219,6 @@ fn core_writer_options(
         term_spill_dir: None,
         term_spill_bytes: 0,
         output_spool_dir: None,
-        // 1MiB field-aligned dictionary cells: per-field probes touch KBs
-        // instead of whole 8MiB cells
-        cell_min_bytes: vortex_index::DEFAULT_CELL_MIN_BYTES,
     }
 }
 
@@ -5113,9 +5113,13 @@ mod tests {
             *byte = 0xAB;
         }
         let corrupt = bytes::Bytes::from(corrupt);
+        // open is footer-only under the block dictionary: corruption in the
+        // dict blob surfaces at the first DICTIONARY touch, not at open —
+        // and the merge maps that error to the rebuild fallback below
+        let opened = VixReader::open(corrupt.clone()).unwrap();
         assert!(
-            VixReader::open(corrupt.clone()).is_err(),
-            "corruption did not break the index open"
+            opened.for_each_term(&mut |_k, _d, _i| Ok(())).is_err(),
+            "corruption did not break the dictionary read"
         );
         assert!(VixDocs::open(corrupt.clone()).is_ok());
 

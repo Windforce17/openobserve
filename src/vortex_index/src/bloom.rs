@@ -542,8 +542,9 @@ mod tests {
     /// row count (the corrupt shape the walk must reject).
     fn repack_with_row_count(data: &[u8], row_count: u64) -> Vec<u8> {
         use crate::container::{
-            BLOB_TAG_DICT, BLOB_TAG_DOCS, BLOB_TAG_TERMS, BLOB_TYPE_DICT, BLOB_TYPE_DOCS,
-            BLOB_TYPE_TERMS, BlobHandle, PROP_ROW_COUNT, build_container, parse_container,
+            BLOB_TAG_DICT, BLOB_TAG_DICT_BLOCKS, BLOB_TAG_DOCS, BLOB_TAG_TERMS, BLOB_TYPE_DICT,
+            BLOB_TYPE_DICT_BLOCKS, BLOB_TYPE_DOCS, BLOB_TYPE_TERMS, BlobHandle, PROP_ROW_COUNT,
+            build_container, parse_container,
         };
 
         let data = bytes::Bytes::copy_from_slice(data);
@@ -567,6 +568,9 @@ mod tests {
         let mut blobs: Vec<(&'static str, &'static str, Vec<u8>)> = Vec::new();
         if let Some(dict) = mem(container.dict) {
             blobs.push((BLOB_TYPE_DICT, BLOB_TAG_DICT, dict));
+        }
+        if let Some(blocks) = mem(container.dict_blocks) {
+            blobs.push((BLOB_TYPE_DICT_BLOCKS, BLOB_TAG_DICT_BLOCKS, blocks));
         }
         if let Some(terms) = mem(container.terms) {
             blobs.push((BLOB_TYPE_TERMS, BLOB_TAG_TERMS, terms));
@@ -707,9 +711,9 @@ mod tests {
     #[test]
     fn unbuildable_marks_corrupt_bytes_never_fetch_failures() {
         use crate::container::{
-            BLOB_TAG_BLOOM, BLOB_TAG_DICT, BLOB_TAG_DOCS, BLOB_TAG_TERMS, BLOB_TYPE_BLOOM,
-            BLOB_TYPE_DICT, BLOB_TYPE_DOCS, BLOB_TYPE_TERMS, BlobHandle, build_container,
-            parse_container,
+            BLOB_TAG_BLOOM, BLOB_TAG_DICT, BLOB_TAG_DICT_BLOCKS, BLOB_TAG_DOCS, BLOB_TAG_TERMS,
+            BLOB_TYPE_BLOOM, BLOB_TYPE_DICT, BLOB_TYPE_DICT_BLOCKS, BLOB_TYPE_DOCS,
+            BLOB_TYPE_TERMS, BlobHandle, build_container, parse_container,
         };
 
         // a real file with a real bloom blob...
@@ -727,8 +731,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let source =
-            arrow::array::StringArray::from_iter_values(["{\"trace_id\":\"trace-a\"}"]);
+        let source = arrow::array::StringArray::from_iter_values(["{\"trace_id\":\"trace-a\"}"]);
         let mut writer = crate::VixWriter::new(
             &schema,
             crate::VixWriterOptions {
@@ -737,7 +740,9 @@ mod tests {
             },
             false,
         );
-        writer.push_batch_with_source(&batch, &source, None).unwrap();
+        writer
+            .push_batch_with_source(&batch, &source, None)
+            .unwrap();
         let data = bytes::Bytes::from(writer.finish().unwrap());
 
         // ...repacked with the bloom blob's bytes replaced by garbage
@@ -756,6 +761,9 @@ mod tests {
         let mut blobs: Vec<(&'static str, &'static str, Vec<u8>)> = Vec::new();
         if let Some(dict) = mem(container.dict) {
             blobs.push((BLOB_TYPE_DICT, BLOB_TAG_DICT, dict));
+        }
+        if let Some(blocks) = mem(container.dict_blocks) {
+            blobs.push((BLOB_TYPE_DICT_BLOCKS, BLOB_TAG_DICT_BLOCKS, blocks));
         }
         if let Some(terms) = mem(container.terms) {
             blobs.push((BLOB_TYPE_TERMS, BLOB_TAG_TERMS, terms));
@@ -786,10 +794,8 @@ mod tests {
                 range: std::ops::Range<u64>,
             ) -> futures::future::BoxFuture<'static, anyhow::Result<bytes::Bytes>> {
                 use futures::FutureExt;
-                futures::future::ready(Err(anyhow::anyhow!(
-                    "connection reset fetching {range:?}"
-                )))
-                .boxed()
+                futures::future::ready(Err(anyhow::anyhow!("connection reset fetching {range:?}")))
+                    .boxed()
             }
         }
         let dead: std::sync::Arc<dyn crate::VixRangeSource> = std::sync::Arc::new(DeadSource {
@@ -830,9 +836,10 @@ mod tests {
         )
         .unwrap();
         let source = arrow::array::StringArray::from_iter_values(["{}", "{}"]);
-        let mut writer =
-            crate::VixWriter::new(&schema, crate::VixWriterOptions::default(), false);
-        writer.push_batch_with_source(&batch, &source, None).unwrap();
+        let mut writer = crate::VixWriter::new(&schema, crate::VixWriterOptions::default(), false);
+        writer
+            .push_batch_with_source(&batch, &source, None)
+            .unwrap();
         let reader = crate::VixReader::open(bytes::Bytes::from(writer.finish().unwrap())).unwrap();
 
         let pairs: Vec<(u16, String)> = reader
@@ -865,7 +872,10 @@ mod tests {
         let blooms = acc.build_checked(DEFAULT_FILE_BLOOM_FPP).unwrap();
         assert_eq!(blooms.len(), 1);
         assert_eq!(blooms[0].n_items, 2);
-        assert!(probe(&blooms[0], b""), "the empty value must probe as a hit");
+        assert!(
+            probe(&blooms[0], b""),
+            "the empty value must probe as a hit"
+        );
         assert!(probe(&blooms[0], b"a"));
     }
 

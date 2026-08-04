@@ -788,6 +788,14 @@ async fn search_vix_index(
     let task_trace_id = trace_id.to_string();
     // the rule moves into the eval task; keep a copy for the result-cache put
     let idx_optimize_rule_for_cache = idx_optimize_rule.clone();
+    // A straddling file's final result depends on the window clamp, so its
+    // result-cache key shifts with every dashboard refresh and the file's
+    // dense postings re-decode each time. The CONDITION bitmap is
+    // time-independent: cache it under the clamp-free no-rule key (the same
+    // key a covered-file no-rule query stores its bitmap under — identical
+    // semantics) and let the eval AND the cheap timestamp clamp per query.
+    let bitmap_cache_key = (cfg.common.inverted_index_result_cache_enabled && !file_in_range)
+        .then(|| generate_cache_key(&condition, &None, parquet_file, None));
     let raw = tokio::task::spawn_blocking(move || -> anyhow::Result<RawVixResult> {
         let reader = reader_input.open()?;
         evaluate_vix_index(
@@ -797,6 +805,7 @@ async fn search_vix_index(
             idx_optimize_rule,
             (start_time, end_time),
             file_in_range,
+            bitmap_cache_key,
         )
     })
     .await??;
@@ -925,6 +934,7 @@ fn evaluate_vix_index(
     idx_optimize_rule: Option<IndexOptimizeMode>,
     time_range: (i64, i64),
     file_in_range: bool,
+    bitmap_cache_key: Option<String>,
 ) -> anyhow::Result<RawVixResult> {
     let (start_time, end_time) = time_range;
 
@@ -950,43 +960,93 @@ fn evaluate_vix_index(
     // value counts first, docs column second, `_source` extraction last —
     // so such a file never needs docs columns (and is never skipped).
     // Multi-field TopN stays on the docs-column path.
-    let index_only_field = match idx_optimize_rule.as_ref() {
+    let single_group_field = match idx_optimize_rule.as_ref() {
         Some(IndexOptimizeMode::SimpleTopN(fields, ..)) if fields.len() == 1 => {
             Some(fields[0].clone())
         }
         Some(IndexOptimizeMode::SimpleDistinct(field, ..)) => Some(field.clone()),
         _ => None,
-    }
-    .filter(|_| condition.is_condition_all() && file_in_range);
+    };
+    let index_only_field = single_group_field
+        .clone()
+        .filter(|_| condition.is_condition_all() && file_in_range);
 
     // every non-`_timestamp` docs column a fast path reads must exist in
-    // this file; files predating the setting fall back to a scan
+    // this file; files predating the setting fall back to a scan — EXCEPT a
+    // single-field TopN/Distinct group field, which the arms below can serve
+    // from the term dictionary (filtered via postings when a condition
+    // applies), so its absence as a docs column is not disqualifying
     if let Some(rule) = idx_optimize_rule.as_ref()
         && index_only_field.is_none()
         && let Some(field) = collect::missing_docs_column(reader, rule)?
+        && single_group_field.as_deref() != Some(field.as_str())
     {
         return Ok(RawVixResult::MissingColumn { field });
     }
+
+    let row_group_size = u32::try_from(reader.row_group_size())
+        .ok()
+        .filter(|v| *v > 0);
 
     // the per-row match bitmap; every mode but the pure count fast path
     // needs it. AND with `_timestamp in [start_time, end_time)` when the
     // file is only partially inside the query range (inclusive start,
     // exclusive end — the query layer's time-range convention).
+    //
+    // The pre-clamp condition bitmap is time-independent; for straddling
+    // files it is memoized under `bitmap_cache_key` so a sliding window
+    // re-clamps a cached bitmap instead of re-decoding dense postings. The
+    // skipped-condition flag stays out of the entry: `has_skipped` derives
+    // from the condition alone, so every hit under the same key shares it.
     let eval_bitmap = |reader: &VixReader| -> anyhow::Result<BooleanBuffer> {
-        let mut bitmap = reader.eval(&query)?;
+        let cached: Option<BooleanBuffer> = bitmap_cache_key.as_deref().and_then(|key| {
+            match vix_result_cache::GLOBAL_CACHE.get(key, None) {
+                Some(VixSearchResult::RowIdsSelection { row_ids, .. })
+                    if row_ids.len() == reader.row_count() as usize =>
+                {
+                    Some((*row_ids).clone())
+                }
+                Some(VixSearchResult::NoMatch) => {
+                    Some(BooleanBuffer::new_unset(reader.row_count() as usize))
+                }
+                _ => None,
+            }
+        });
+        let mut bitmap = match cached {
+            Some(bitmap) => bitmap,
+            None => {
+                let bitmap = reader.eval(&query)?;
+                if let Some(key) = bitmap_cache_key.as_deref() {
+                    let entry = CacheEntry::RowIds(Arc::new(bitmap.clone()), row_group_size);
+                    if entry.get_memory_size()
+                        < get_config()
+                            .limit
+                            .inverted_index_result_cache_max_entry_size
+                    {
+                        vix_result_cache::GLOBAL_CACHE.put(key.to_string(), entry);
+                    }
+                }
+                bitmap
+            }
+        };
         if !file_in_range {
             bitmap = &bitmap & &reader.timestamp_range(start_time, end_time)?;
         }
         Ok(bitmap)
     };
-    let row_group_size = u32::try_from(reader.row_group_size())
-        .ok()
-        .filter(|v| *v > 0);
 
     match idx_optimize_rule {
         Some(IndexOptimizeMode::SimpleCount) => {
             let count = if file_in_range {
                 reader.count(&query)?
+            } else if !has_skipped
+                && reader.zone_chunks().is_some()
+                && let Some(cursor) = reader.single_term_plist_cursor(&query)?
+            {
+                // dense out-of-row term on a window-straddling file: rank
+                // diffs per zone chunk instead of decoding the whole list
+                // into a bitmap (stage 4 of the plist design)
+                collect::ranked_count_in_window(reader, &cursor, start_time, end_time)?
             } else {
                 eval_bitmap(reader)?.count_set_bits() as u64
             };
@@ -1009,6 +1069,29 @@ fn evaluate_vix_index(
             num_buckets,
             ts_offset,
         )) => {
+            // dense out-of-row term with a zone table: per-chunk rank diffs
+            // fold straight into buckets, only bucket-straddling chunks
+            // decode (stage 4 of the plist design). The grid IS the query
+            // window, so out-of-window rows drop identically to the
+            // time-clamped bitmap path.
+            if !has_skipped
+                && reader.zone_chunks().is_some()
+                && let Some(cursor) = reader.single_term_plist_cursor(&query)?
+            {
+                let histogram = collect::ranked_simple_histogram(
+                    reader,
+                    &cursor,
+                    min_value,
+                    bucket_width,
+                    num_buckets,
+                    ts_offset,
+                    (start_time, end_time),
+                )?;
+                return Ok(RawVixResult::Histogram {
+                    histogram,
+                    has_skipped,
+                });
+            }
             let bitmap = eval_bitmap(reader)?;
             let histogram = collect::simple_histogram(
                 reader,
@@ -1064,6 +1147,25 @@ fn evaluate_vix_index(
                 // the docs column serves it below
             }
             let bitmap = eval_bitmap(reader)?;
+            // conditioned single-field TopN on a file without the group
+            // field's docs column: serve from the term dictionary — per
+            // value, count its postings inside the condition bitmap (the
+            // pre-column_store_fields history's fast path)
+            if fields.len() == 1 && !collect::docs_column_available(reader, &fields[0])? {
+                if let Some(groups) =
+                    collect::filtered_top_n(reader, &bitmap, &fields[0], limit, ascend)?
+                {
+                    return Ok(RawVixResult::TopN {
+                        groups,
+                        has_skipped,
+                    });
+                }
+                // dictionary cannot prove exact per-value counts here and
+                // the docs column is absent: the scan path owns this file
+                return Ok(RawVixResult::MissingColumn {
+                    field: fields[0].clone(),
+                });
+            }
             let groups = collect::simple_top_n(reader, &bitmap, &fields, limit, ascend)?;
             Ok(RawVixResult::TopN {
                 groups,
@@ -1090,6 +1192,20 @@ fn evaluate_vix_index(
                 }
             }
             let bitmap = eval_bitmap(reader)?;
+            // same dictionary serve as the TopN arm for column-less files
+            if !collect::docs_column_available(reader, &field)? {
+                if let Some(values) =
+                    collect::filtered_distinct(reader, &bitmap, &field, limit, ascend)?
+                {
+                    return Ok(RawVixResult::Distinct {
+                        values,
+                        has_skipped,
+                    });
+                }
+                return Ok(RawVixResult::MissingColumn {
+                    field: field.clone(),
+                });
+            }
             let values = collect::simple_distinct(reader, &bitmap, &field, limit, ascend)?;
             Ok(RawVixResult::Distinct {
                 values,
@@ -1694,7 +1810,7 @@ mod tests {
                 Condition::Equal("level".to_string(), "info".to_string()),
             ],
         };
-        match evaluate_vix_index("t", &reader, &condition, None, (0, 1000), true).unwrap() {
+        match evaluate_vix_index("t", &reader, &condition, None, (0, 1000), true, None).unwrap() {
             RawVixResult::Bitmap {
                 bitmap,
                 has_skipped,
@@ -1715,13 +1831,13 @@ mod tests {
                 "hello world".to_string(),
             )],
         };
-        assert!(evaluate_vix_index("t", &reader, &lone, None, (0, 1000), true).is_err());
+        assert!(evaluate_vix_index("t", &reader, &lone, None, (0, 1000), true, None).is_err());
 
         // match_all over the fts tokens is unaffected by fix A
         let match_all = IndexCondition {
             conditions: vec![Condition::MatchAll("hello".to_string())],
         };
-        match evaluate_vix_index("t", &reader, &match_all, None, (0, 1000), true).unwrap() {
+        match evaluate_vix_index("t", &reader, &match_all, None, (0, 1000), true, None).unwrap() {
             RawVixResult::Bitmap {
                 bitmap,
                 has_skipped,
@@ -1732,6 +1848,507 @@ mod tests {
             }
             _ => panic!("expected a bitmap"),
         }
+    }
+
+    /// Straddle bitmap cache: a window-straddling file's CONDITION bitmap is
+    /// time-independent and memoized under the clamp-free key, so a sliding
+    /// dashboard window re-clamps a cached bitmap instead of re-decoding
+    /// postings. Rows: ts 100/99/98/97, match_all("hello") matches rows 0
+    /// (ts 100) and 2 (ts 98).
+    #[test]
+    fn test_straddle_bitmap_cache_serves_sliding_windows() {
+        use arrow::{
+            array::{Int64Array, RecordBatch, StringArray},
+            datatypes::{DataType, Field, Schema},
+        };
+        use vortex_index::{VixWriter, VixWriterOptions};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("message", DataType::Utf8, true),
+        ]));
+        let opts = VixWriterOptions {
+            fts_field_names: vec!["message".to_string()],
+            ..Default::default()
+        };
+        let mut writer = VixWriter::new(&schema, opts, false);
+        let ts = vec![100i64, 99, 98, 97];
+        let messages = vec![
+            Some("hello world"),
+            Some("goodbye world"),
+            Some("hello again"),
+            None,
+        ];
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(ts.clone())),
+                Arc::new(StringArray::from(messages)),
+            ],
+        )
+        .unwrap();
+        let sources: Vec<String> = ts
+            .iter()
+            .map(|t| format!(r#"{{"_timestamp":{t}}}"#))
+            .collect();
+        writer
+            .push_batch_with_source(&batch, &StringArray::from(sources), None)
+            .unwrap();
+        let reader = VixReader::open(bytes::Bytes::from(writer.finish().unwrap())).unwrap();
+        let condition = IndexCondition {
+            conditions: vec![Condition::MatchAll("hello".to_string())],
+        };
+        let clamped_rows = |raw: RawVixResult| match raw {
+            RawVixResult::Bitmap { bitmap, .. } => bitmap.set_indices().collect::<Vec<_>>(),
+            _ => panic!("expected a bitmap"),
+        };
+
+        // miss + populate: window [99, 1000) clamps row 2 (ts 98) away, but
+        // the CACHED bitmap must be the PRE-clamp condition bitmap [0, 2]
+        let key = "bitmap-cache-test-k1".to_string();
+        let raw = evaluate_vix_index(
+            "t",
+            &reader,
+            &condition,
+            None,
+            (99, 1000),
+            false,
+            Some(key.clone()),
+        )
+        .unwrap();
+        assert_eq!(clamped_rows(raw), vec![0], "ts 98 is outside [99,1000)");
+        match vix_result_cache::GLOBAL_CACHE.get(&key, None) {
+            Some(VixSearchResult::RowIdsSelection { row_ids, .. }) => {
+                assert_eq!(
+                    row_ids.set_indices().collect::<Vec<_>>(),
+                    vec![0, 2],
+                    "the cache must hold the PRE-clamp condition bitmap"
+                );
+            }
+            other => panic!("expected a cached RowIds bitmap, got {other:?}"),
+        }
+
+        // hit path proof by poisoning: overwrite the entry with all-rows-set;
+        // a re-eval under the same key must reflect the poisoned bitmap
+        // (clamp of all-set over [99,1000) = rows 0 and 1), proving the
+        // condition bitmap was served from the cache, not recomputed
+        vix_result_cache::GLOBAL_CACHE.put(
+            key.clone(),
+            CacheEntry::RowIds(Arc::new(arrow::buffer::BooleanBuffer::new_set(4)), None),
+        );
+        let raw = evaluate_vix_index(
+            "t",
+            &reader,
+            &condition,
+            None,
+            (99, 1000),
+            false,
+            Some(key.clone()),
+        )
+        .unwrap();
+        assert_eq!(clamped_rows(raw), vec![0, 1], "poisoned bitmap must serve");
+
+        // SimpleCount over a straddling file flows through the same cache
+        let raw = evaluate_vix_index(
+            "t",
+            &reader,
+            &condition,
+            Some(IndexOptimizeMode::SimpleCount),
+            (99, 1000),
+            false,
+            Some(key.clone()),
+        )
+        .unwrap();
+        match raw {
+            RawVixResult::Count { count, .. } => assert_eq!(count, 2, "poisoned count"),
+            _ => panic!("expected a count"),
+        }
+
+        // a NoMatch entry under the key maps to the all-zeros bitmap
+        let key_nm = "bitmap-cache-test-k2".to_string();
+        vix_result_cache::GLOBAL_CACHE.put(key_nm.clone(), CacheEntry::NoMatch);
+        let raw = evaluate_vix_index(
+            "t",
+            &reader,
+            &condition,
+            None,
+            (99, 1000),
+            false,
+            Some(key_nm),
+        )
+        .unwrap();
+        assert_eq!(clamped_rows(raw), Vec::<usize>::new());
+
+        // defensive: a cached bitmap whose length mismatches the file's row
+        // count is a MISS (recompute), never a wrong-length AND
+        let key_bad = "bitmap-cache-test-k3".to_string();
+        vix_result_cache::GLOBAL_CACHE.put(
+            key_bad.clone(),
+            CacheEntry::RowIds(Arc::new(arrow::buffer::BooleanBuffer::new_set(3)), None),
+        );
+        let raw = evaluate_vix_index(
+            "t",
+            &reader,
+            &condition,
+            None,
+            (99, 1000),
+            false,
+            Some(key_bad.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            clamped_rows(raw),
+            vec![0],
+            "mismatched entry must be recomputed"
+        );
+        match vix_result_cache::GLOBAL_CACHE.get(&key_bad, None) {
+            Some(VixSearchResult::RowIdsSelection { row_ids, .. }) => {
+                assert_eq!(row_ids.len(), 4, "recompute must overwrite the bad entry");
+            }
+            other => panic!("expected the overwritten RowIds bitmap, got {other:?}"),
+        }
+    }
+
+    /// Stage 4 (cuts+ranks): SimpleCount and SimpleHistogram over a dense
+    /// out-of-row term answer from skip-table rank diffs per zone chunk —
+    /// and must match the bitmap path EXACTLY on the same rows, across
+    /// full-range and straddling windows, coarse (chunk-folding) and fine
+    /// (bucket-straddling) grids. Multi-chunk file via tiny docs chunks;
+    /// deterministic scattered timestamps.
+    #[test]
+    fn test_ranked_consumers_match_bitmap_path() {
+        use arrow::{
+            array::{Int64Array, RecordBatch, StringArray},
+            datatypes::{DataType, Field, Schema},
+        };
+        use vortex_index::{VixWriter, VixWriterOptions};
+
+        const N: usize = 4000;
+        let mut lcg = 0xBADC0FFEE0DDF00Du64;
+        let mut next = move |bound: u64| {
+            lcg = lcg
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (lcg >> 16) % bound
+        };
+        // timestamps scattered over [10_000, 90_000), ~70% of rows carry the
+        // dense token, the rest a filler token
+        let ts: Vec<i64> = (0..N).map(|_| 10_000 + next(80_000) as i64).collect();
+        let msgs: Vec<Option<String>> = (0..N)
+            .map(|i| {
+                Some(if next(10) < 7 {
+                    format!("hello event {i}")
+                } else {
+                    format!("filler event {i}")
+                })
+            })
+            .collect();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("message", DataType::Utf8, true),
+        ]));
+        let build = |plist_min_docs: u32| -> VixReader {
+            let opts = VixWriterOptions {
+                fts_field_names: vec!["message".to_string()],
+                postings_plist_min_docs: plist_min_docs,
+                docs_chunk_bytes: 4096, // force many zone chunks
+                ..Default::default()
+            };
+            let mut writer = VixWriter::new(&schema, opts, false);
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(ts.clone())),
+                    Arc::new(StringArray::from(msgs.clone())),
+                ],
+            )
+            .unwrap();
+            let sources: Vec<String> = ts
+                .iter()
+                .map(|t| format!(r#"{{"_timestamp":{t}}}"#))
+                .collect();
+            writer
+                .push_batch_with_source(&batch, &StringArray::from(sources), None)
+                .unwrap();
+            VixReader::open(bytes::Bytes::from(writer.finish().unwrap())).unwrap()
+        };
+        let bitmap_file = build(0);
+        let plist_file = build(100);
+        assert!(
+            plist_file
+                .zone_chunks()
+                .map(|c| c.len() > 4)
+                .unwrap_or(false),
+            "test premise: the file must have several zone chunks, got {:?}",
+            plist_file.zone_chunks().map(|c| c.len())
+        );
+
+        let condition = IndexCondition {
+            conditions: vec![Condition::MatchAll("hello".to_string())],
+        };
+        // engagement proof: the plist file opens a cursor for this condition
+        {
+            let (query, has_skipped) = condition
+                .to_vix_query(
+                    "t",
+                    &|field| field_capability("t", &plist_file, field),
+                    &index_match_all_tokens,
+                )
+                .unwrap();
+            assert!(!has_skipped);
+            assert!(
+                plist_file
+                    .single_term_plist_cursor(&query)
+                    .unwrap()
+                    .is_some(),
+                "the dense token must resolve to an out-of-row cursor"
+            );
+            assert!(
+                bitmap_file
+                    .single_term_plist_cursor(&query)
+                    .unwrap()
+                    .is_none(),
+                "the plist-less file must not"
+            );
+        }
+
+        // (window, in_range) shapes: full-range and two straddles
+        let windows = [
+            ((0i64, 100_000i64), true),
+            ((25_000, 100_000), false),
+            ((33_333, 61_111), false),
+        ];
+        for (range, in_range) in windows {
+            // SimpleCount
+            let counts: Vec<u64> = [&plist_file, &bitmap_file]
+                .iter()
+                .map(|reader| {
+                    match evaluate_vix_index(
+                        "t",
+                        reader,
+                        &condition,
+                        Some(IndexOptimizeMode::SimpleCount),
+                        range,
+                        in_range,
+                        None,
+                    )
+                    .unwrap()
+                    {
+                        RawVixResult::Count { count, .. } => count,
+                        _ => panic!("expected a count"),
+                    }
+                })
+                .collect();
+            assert_eq!(counts[0], counts[1], "count mismatch at {range:?}");
+
+            // SimpleHistogram: coarse buckets (chunks fold) and fine buckets
+            // (chunks straddle edges -> boundary decode)
+            for bucket_width in [50_000u64, 1_000] {
+                let num_buckets = ((range.1 - range.0) as u64).div_ceil(bucket_width) as usize;
+                let hists: Vec<Vec<u64>> = [&plist_file, &bitmap_file]
+                    .iter()
+                    .map(|reader| {
+                        match evaluate_vix_index(
+                            "t",
+                            reader,
+                            &condition,
+                            Some(IndexOptimizeMode::SimpleHistogram(
+                                range.0,
+                                bucket_width,
+                                num_buckets,
+                                0,
+                            )),
+                            range,
+                            in_range,
+                            None,
+                        )
+                        .unwrap()
+                        {
+                            RawVixResult::Histogram { histogram, .. } => histogram,
+                            _ => panic!("expected a histogram"),
+                        }
+                    })
+                    .collect();
+                assert_eq!(
+                    hists[0], hists[1],
+                    "histogram mismatch at {range:?} width={bucket_width}"
+                );
+                // grid totals must also equal the window count
+                let total: u64 = hists[0].iter().sum();
+                let expected = ts
+                    .iter()
+                    .zip(&msgs)
+                    .filter(|(t, m)| {
+                        **t >= range.0
+                            && **t < range.1
+                            && m.as_deref().is_some_and(|m| m.contains("hello"))
+                    })
+                    .count() as u64;
+                assert_eq!(
+                    total, expected,
+                    "ground truth at {range:?} w={bucket_width}"
+                );
+            }
+        }
+    }
+
+    /// One-off dict-shape probe (set BENCH_VIX_FILE, run --ignored
+    /// --nocapture): prints the file's dictionary row-group count, indexed
+    /// field count, and times ONE cold TokenAnyField lookup + count.
+    #[test]
+    #[ignore]
+    fn probe_dict_shape_of_bench_file() {
+        use std::time::Instant;
+        let path = std::env::var("BENCH_VIX_FILE").expect("set BENCH_VIX_FILE");
+        let bytes = std::fs::read(&path).unwrap();
+        let t = Instant::now();
+        let reader = VixReader::open(bytes::Bytes::from(bytes)).unwrap();
+        eprintln!("open: {:?}", t.elapsed());
+        eprintln!(
+            "rows={} terms={} dict_row_groups={} ",
+            reader.row_count(),
+            reader.term_count(),
+            reader.term_row_group_count(),
+        );
+        let query = vortex_index::VixQuery::TokenAnyField {
+            token: b"failed".to_vec(),
+        };
+        let t = Instant::now();
+        let count = reader.count(&query).unwrap();
+        eprintln!("cold TokenAnyField count: {:?} (count={count})", t.elapsed());
+        let t = Instant::now();
+        let count2 = reader.count(&query).unwrap();
+        eprintln!("warm TokenAnyField count: {:?} (count={count2})", t.elapsed());
+    }
+
+    /// Deep-merge-scale isolation bench (run with --ignored --nocapture):
+    /// one 20M-row file, dense token in ~80% of rows — times the bitmap
+    /// eval vs the ranked histogram/count on identical data. This is the
+    /// profile where plist pays: per-file postings in the tens of millions.
+    #[test]
+    #[ignore]
+    fn bench_ranked_vs_bitmap_at_deep_merge_scale() {
+        use std::time::Instant;
+
+        use arrow::{
+            array::{Int64Array, RecordBatch, StringArray},
+            datatypes::{DataType, Field, Schema},
+        };
+        use vortex_index::{VixWriter, VixWriterOptions};
+
+        const N: usize = 20_000_000;
+        const BASE: i64 = 1_000_000_000;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("message", DataType::Utf8, true),
+        ]));
+        let opts = VixWriterOptions {
+            fts_field_names: vec!["message".to_string()],
+            postings_plist_min_docs: 8192,
+            ..Default::default()
+        };
+        let mut writer = VixWriter::new(&schema, opts, false);
+        let t_build = Instant::now();
+        // push in 1M-row batches to bound memory
+        let mut lcg = 0x5EEDCAFEF00Du64;
+        let mut next = move |bound: u64| {
+            lcg = lcg
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (lcg >> 16) % bound
+        };
+        for chunk_start in (0..N).step_by(1_000_000) {
+            let n = 1_000_000.min(N - chunk_start);
+            let ts: Vec<i64> = (0..n).map(|i| BASE + (chunk_start + i) as i64).collect();
+            let msgs: Vec<Option<String>> = (0..n)
+                .map(|_| {
+                    Some(if next(10) < 8 {
+                        "failed request".to_string()
+                    } else {
+                        "ok request".to_string()
+                    })
+                })
+                .collect();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(ts.clone())),
+                    Arc::new(StringArray::from(msgs)),
+                ],
+            )
+            .unwrap();
+            let sources: Vec<String> = ts
+                .iter()
+                .map(|t| format!(r#"{{"_timestamp":{t}}}"#))
+                .collect();
+            writer
+                .push_batch_with_source(&batch, &StringArray::from(sources), None)
+                .unwrap();
+        }
+        let reader = VixReader::open(bytes::Bytes::from(writer.finish().unwrap())).unwrap();
+        eprintln!("build: {:?} ({N} rows)", t_build.elapsed());
+        let condition = IndexCondition {
+            conditions: vec![Condition::MatchAll("failed".to_string())],
+        };
+        let (query, _) = condition
+            .to_vix_query(
+                "b",
+                &|field| field_capability("b", &reader, field),
+                &index_match_all_tokens,
+            )
+            .unwrap();
+        let cursor = reader.single_term_plist_cursor(&query).unwrap().unwrap();
+        eprintln!("dense term doc_count = {}", cursor.doc_count());
+
+        // bitmap eval (what the pre-stage-4 histogram/straddle-count paid)
+        let t = Instant::now();
+        let bitmap = reader.eval(&query).unwrap();
+        let t_eval = t.elapsed();
+        eprintln!(
+            "bitmap eval (decode {}M ids): {:?}",
+            cursor.doc_count() / 1_000_000,
+            t_eval
+        );
+
+        // bitmap histogram on top of the eval
+        let t = Instant::now();
+        let h_bitmap =
+            collect::simple_histogram(&reader, &bitmap, BASE, 1_000_000, N / 1_000_000, 0).unwrap();
+        eprintln!("bitmap histogram fold: {:?}", t.elapsed());
+
+        // ranked histogram (stage 4): no bitmap at all
+        let t = Instant::now();
+        let h_ranked = collect::ranked_simple_histogram(
+            &reader,
+            &cursor,
+            BASE,
+            1_000_000,
+            N / 1_000_000,
+            0,
+            (BASE, BASE + N as i64),
+        )
+        .unwrap();
+        let t_ranked = t.elapsed();
+        eprintln!("ranked histogram (rank diffs): {:?}", t_ranked);
+        assert_eq!(h_bitmap, h_ranked, "the two paths must agree");
+
+        // ranked windowed count (stage 4 straddle-count path)
+        let t = Instant::now();
+        let c =
+            collect::ranked_count_in_window(&reader, &cursor, BASE + N as i64 / 3, BASE + N as i64)
+                .unwrap();
+        eprintln!("ranked windowed count: {:?} (count={c})", t.elapsed());
+        let t = Instant::now();
+        let clamped = &bitmap
+            & &reader
+                .timestamp_range(BASE + N as i64 / 3, BASE + N as i64)
+                .unwrap();
+        let c2 = clamped.count_set_bits() as u64;
+        eprintln!(
+            "bitmap windowed count (excl eval): {:?} (count={c2})",
+            t.elapsed()
+        );
+        assert_eq!(c, c2);
     }
 
     /// Absent-field fix: a condition on a field NO document of the file
@@ -1747,7 +2364,8 @@ mod tests {
         assert!(!reader.key_term_exists("client_id").unwrap());
 
         let expect_empty_bitmap = |condition: IndexCondition| {
-            match evaluate_vix_index("t", &reader, &condition, None, (0, 2000), true).unwrap() {
+            match evaluate_vix_index("t", &reader, &condition, None, (0, 2000), true, None).unwrap()
+            {
                 RawVixResult::Bitmap {
                     bitmap,
                     has_skipped,
@@ -1797,6 +2415,7 @@ mod tests {
             Some(IndexOptimizeMode::SimpleSelect(51, false)),
             (0, 2000),
             true,
+            None,
         )
         .unwrap()
         {
@@ -1814,6 +2433,7 @@ mod tests {
             Some(IndexOptimizeMode::SimpleCount),
             (0, 2000),
             true,
+            None,
         )
         .unwrap()
         {
@@ -1832,7 +2452,7 @@ mod tests {
                 Box::new(Condition::Equal("level".into(), "info".into())),
             )],
         };
-        assert!(evaluate_vix_index("t", &reader, &mixed, None, (0, 2000), true).is_err());
+        assert!(evaluate_vix_index("t", &reader, &mixed, None, (0, 2000), true, None).is_err());
     }
 
     /// Build one core file whose `svc` values are term-indexed but NOT
@@ -1936,6 +2556,7 @@ mod tests {
                 Some(topn_rule.clone()),
                 full_range,
                 true,
+                None,
             )
             .unwrap()
             {
@@ -1977,7 +2598,8 @@ mod tests {
             ),
         ] {
             let rule = IndexOptimizeMode::SimpleDistinct("svc".to_string(), 2, ascend);
-            match evaluate_vix_index("t", reader, &condition, Some(rule), full_range, true).unwrap()
+            match evaluate_vix_index("t", reader, &condition, Some(rule), full_range, true, None)
+                .unwrap()
             {
                 RawVixResult::Distinct {
                     values,
@@ -1990,15 +2612,175 @@ mod tests {
             }
         }
 
-        // a file only partially inside the range cannot use the dictionary
-        // (doc_count would include out-of-range docs) and has no docs
-        // column: per-file fallback
+        // a file only partially inside the range cannot use raw doc_counts
+        // (they include out-of-range docs) — the filtered dictionary path
+        // now serves it exactly: per value, postings ∩ the time bitmap.
+        // file_a stamps ts descending from 1000: api@1000, api@999, db@998,
+        // api@997, None@996, web@995 — [996, 1200) keeps api=3, db=1.
         let narrow = (996i64, 1200i64);
-        match evaluate_vix_index("t", &reader_a, &condition, Some(topn_rule), narrow, false)
-            .unwrap()
+        match evaluate_vix_index(
+            "t",
+            &reader_a,
+            &condition,
+            Some(topn_rule),
+            narrow,
+            false,
+            None,
+        )
+        .unwrap()
         {
-            RawVixResult::MissingColumn { field } => assert_eq!(field, "svc"),
-            _ => panic!("expected MissingColumn"),
+            RawVixResult::TopN {
+                groups,
+                has_skipped,
+            } => {
+                assert!(!has_skipped);
+                let totals: std::collections::BTreeMap<String, u64> = groups
+                    .into_iter()
+                    .map(|(key, count)| (key[0].clone(), count))
+                    .collect();
+                assert_eq!(
+                    totals,
+                    std::collections::BTreeMap::from([
+                        ("api".to_string(), 3),
+                        ("db".to_string(), 1),
+                    ])
+                );
+            }
+            _ => panic!("expected TopN via the filtered dictionary path"),
+        }
+    }
+
+    /// THE prod shape (2026-08-03, backlog #21): `WHERE service = X GROUP BY
+    /// attribute ORDER BY count DESC LIMIT n` over files where the group
+    /// attribute is term-indexed but NOT column-stored (all pre-setting
+    /// history). Served from the dictionary: per value, its postings
+    /// intersected with the condition bitmap — never the docs columns,
+    /// never `_source`.
+    #[test]
+    fn test_filtered_topn_distinct_over_term_indexed_field() {
+        use arrow::{
+            array::{Int64Array, RecordBatch, StringArray},
+            datatypes::{DataType, Field, Schema},
+        };
+        use vortex_index::{VixWriter, VixWriterOptions};
+
+        let svcs = [
+            Some("api"),
+            Some("api"),
+            Some("db"),
+            Some("api"),
+            Some("api"),
+            Some("web"),
+            None,
+        ];
+        let fns = [
+            Some("handle"),
+            Some("route"),
+            Some("handle"),
+            Some("handle"),
+            None,
+            Some("render"),
+            Some("orphan"),
+        ];
+        let rows = svcs.len();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("svc", DataType::Utf8, true),
+            Field::new("code_fn", DataType::Utf8, true),
+        ]));
+        let ts: Vec<i64> = (0..rows as i64).map(|i| 1000 - i).collect();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(ts.clone())),
+                Arc::new(StringArray::from(svcs.to_vec())),
+                Arc::new(StringArray::from(fns.to_vec())),
+            ],
+        )
+        .unwrap();
+        let sources: Vec<String> = (0..rows)
+            .map(|i| {
+                let mut obj = serde_json::Map::new();
+                obj.insert("_timestamp".into(), ts[i].into());
+                if let Some(svc) = svcs[i] {
+                    obj.insert("svc".into(), svc.into());
+                }
+                if let Some(f) = fns[i] {
+                    obj.insert("code_fn".into(), f.into());
+                }
+                serde_json::Value::Object(obj).to_string()
+            })
+            .collect();
+        let mut writer = VixWriter::new(&schema, VixWriterOptions::default(), false);
+        writer
+            .push_batch_with_source(&batch, &StringArray::from(sources), None)
+            .unwrap();
+        let reader = VixReader::open(bytes::Bytes::from(writer.finish().unwrap())).unwrap();
+        assert!(!reader.has_column_store_field("code_fn"), "test premise");
+
+        let condition = IndexCondition {
+            conditions: vec![Condition::Equal("svc".into(), "api".into())],
+        };
+        let full_range = (0i64, 2000i64);
+
+        // svc=api rows (indices 0,1,3,4) carry code_fn: handle, route,
+        // handle, None -> handle=2, route=1 (the api row without code_fn
+        // forms no group; web/render, None/orphan and db's handle are
+        // filtered out)
+        match evaluate_vix_index(
+            "t",
+            &reader,
+            &condition,
+            Some(IndexOptimizeMode::SimpleTopN(
+                vec!["code_fn".to_string()],
+                10,
+                false,
+            )),
+            full_range,
+            true,
+            None,
+        )
+        .unwrap()
+        {
+            RawVixResult::TopN {
+                groups,
+                has_skipped,
+            } => {
+                assert!(!has_skipped);
+                let totals: std::collections::BTreeMap<String, u64> = groups
+                    .into_iter()
+                    .map(|(key, count)| (key[0].clone(), count))
+                    .collect();
+                assert_eq!(
+                    totals,
+                    std::collections::BTreeMap::from([
+                        ("handle".to_string(), 2),
+                        ("route".to_string(), 1),
+                    ])
+                );
+            }
+            _ => panic!("expected TopN via the filtered dictionary path"),
+        }
+
+        // Distinct under the same condition: only values with an api hit,
+        // ascending/descending ends of the value order
+        for (ascend, expected) in [
+            (true, HashSet::from(["handle".to_string()])),
+            (false, HashSet::from(["route".to_string()])),
+        ] {
+            let rule = IndexOptimizeMode::SimpleDistinct("code_fn".to_string(), 1, ascend);
+            match evaluate_vix_index("t", &reader, &condition, Some(rule), full_range, true, None)
+                .unwrap()
+            {
+                RawVixResult::Distinct {
+                    values,
+                    has_skipped,
+                } => {
+                    assert!(!has_skipped);
+                    assert_eq!(values, expected, "ascend={ascend}");
+                }
+                _ => panic!("expected Distinct via the filtered dictionary path"),
+            }
         }
     }
 
@@ -2127,6 +2909,7 @@ mod tests {
             Some(IndexOptimizeMode::SimpleSelect(3, false)),
             (0, 2000),
             true,
+            None,
         )
         .unwrap()
         {
@@ -2145,6 +2928,7 @@ mod tests {
             Some(IndexOptimizeMode::SimpleSelect(3, false)),
             (0, 999),
             false,
+            None,
         )
         .unwrap()
         {
@@ -2163,6 +2947,7 @@ mod tests {
             Some(IndexOptimizeMode::SimpleSelect(2, true)),
             (995, 2000),
             false,
+            None,
         )
         .unwrap()
         {
@@ -2568,6 +3353,7 @@ mod ranged_parity_tests {
                         rule.clone(),
                         range,
                         in_range,
+                        None,
                     );
                     let ranged = evaluate_vix_index(
                         "parity-ranged",
@@ -2576,6 +3362,7 @@ mod ranged_parity_tests {
                         rule.clone(),
                         range,
                         in_range,
+                        None,
                     );
                     let decode = evaluate_vix_index(
                         "parity-decode",
@@ -2584,6 +3371,7 @@ mod ranged_parity_tests {
                         rule.clone(),
                         range,
                         in_range,
+                        None,
                     );
                     let render = |result: &anyhow::Result<RawVixResult>| match result {
                         Ok(raw) => fingerprint(raw),
@@ -2614,7 +3402,7 @@ mod ranged_parity_tests {
         // the same dictionary ranges
         let unknown = condition(vec![Condition::Equal("unknown_field".into(), "x".into())]);
         for reader in [&mem_reader, &ranged_reader] {
-            match evaluate_vix_index("p", reader, &unknown, None, full_range, true).unwrap() {
+            match evaluate_vix_index("p", reader, &unknown, None, full_range, true, None).unwrap() {
                 RawVixResult::Bitmap {
                     bitmap,
                     has_skipped,
@@ -2631,15 +3419,23 @@ mod ranged_parity_tests {
         // (fts-only storage: tokens exist, raw whole values do not) errors
         // identically in both modes (the caller adds the filter back)
         let unservable = condition(vec![Condition::Equal("level".into(), "info".into())]);
-        let cached_err = evaluate_vix_index("p", &mem_reader, &unservable, None, full_range, true)
-            .err()
-            .expect("all-skipped condition must error")
-            .to_string();
-        let ranged_err =
-            evaluate_vix_index("p", &ranged_reader, &unservable, None, full_range, true)
+        let cached_err =
+            evaluate_vix_index("p", &mem_reader, &unservable, None, full_range, true, None)
                 .err()
                 .expect("all-skipped condition must error")
                 .to_string();
+        let ranged_err = evaluate_vix_index(
+            "p",
+            &ranged_reader,
+            &unservable,
+            None,
+            full_range,
+            true,
+            None,
+        )
+        .err()
+        .expect("all-skipped condition must error")
+        .to_string();
         assert_eq!(cached_err, ranged_err);
 
         // sanity: the battery had real matches, not a wall of empty bitmaps
@@ -2650,6 +3446,7 @@ mod ranged_parity_tests {
             None,
             full_range,
             true,
+            None,
         )
         .unwrap();
         match probe {
@@ -2760,7 +3557,8 @@ mod review_tests {
 
     fn eval_bits(reader: &VixReader, conditions: Vec<Condition>) -> (Vec<usize>, bool) {
         let condition = IndexCondition { conditions };
-        match evaluate_vix_index("review", reader, &condition, None, (0, 2000), true).unwrap() {
+        match evaluate_vix_index("review", reader, &condition, None, (0, 2000), true, None).unwrap()
+        {
             RawVixResult::Bitmap {
                 bitmap,
                 has_skipped,
@@ -3058,31 +3856,87 @@ mod review_tests {
         );
     }
 
-    /// VERIFIED (per-file layer): a FILTERED TopN/Distinct/MultiHistogram
-    /// over a file that lacks the docs column reports MissingColumn (scan
-    /// fallback) instead of producing a wrong/partial aggregate. This
-    /// per-file probe is the ONLY old/new-file routing: flight keeps every
-    /// MissingColumn/PartialFields/error file in vix_search's returned list
-    /// and moves it to the scan branch — degradation per file, never a hard
-    /// error and never a partial aggregate. (There is no global settings
-    /// stamp; see split_file_list_by_time_range.)
+    /// VERIFIED (per-file layer): filtered aggregates over a file that
+    /// lacks the docs column. Single-field TopN/Distinct now serve EXACTLY
+    /// from the term dictionary (per value, postings ∩ condition bitmap —
+    /// the pre-column_store_fields history path, backlog #21);
+    /// MultiHistogram still reports MissingColumn (scan fallback). The
+    /// MissingColumn probe remains the ONLY old/new-file routing: flight
+    /// keeps every MissingColumn/PartialFields/error file in vix_search's
+    /// returned list and moves it to the scan branch — degradation per
+    /// file, never a hard error and never a partial aggregate. (There is
+    /// no global settings stamp; see split_file_list_by_time_range.)
     #[test]
     fn review_filtered_aggregates_on_missing_docs_column_fall_back() {
         let reader = svc_file(&[Some("api"), Some("db"), Some("api")]);
         let condition = IndexCondition {
             conditions: vec![Condition::Equal("svc".into(), "api".into())],
         };
-        for rule in [
-            IndexOptimizeMode::SimpleTopN(vec!["svc".to_string()], 10, false),
-            IndexOptimizeMode::SimpleDistinct("svc".to_string(), 10, true),
-            IndexOptimizeMode::SimpleMultiHistogram(0, 2000, 100, 0, "svc".to_string()),
-        ] {
-            match evaluate_vix_index("review", &reader, &condition, Some(rule), (0, 2000), true)
-                .unwrap()
-            {
-                RawVixResult::MissingColumn { field } => assert_eq!(field, "svc"),
-                _ => panic!("expected MissingColumn"),
+        match evaluate_vix_index(
+            "review",
+            &reader,
+            &condition,
+            Some(IndexOptimizeMode::SimpleTopN(
+                vec!["svc".to_string()],
+                10,
+                false,
+            )),
+            (0, 2000),
+            true,
+            None,
+        )
+        .unwrap()
+        {
+            RawVixResult::TopN {
+                groups,
+                has_skipped,
+            } => {
+                assert!(!has_skipped);
+                assert_eq!(groups, vec![(vec!["api".to_string()], 2)]);
             }
+            _ => panic!("filtered single-field TopN must serve from the dictionary"),
+        }
+        match evaluate_vix_index(
+            "review",
+            &reader,
+            &condition,
+            Some(IndexOptimizeMode::SimpleDistinct("svc".to_string(), 10, true)),
+            (0, 2000),
+            true,
+            None,
+        )
+        .unwrap()
+        {
+            RawVixResult::Distinct {
+                values,
+                has_skipped,
+            } => {
+                assert!(!has_skipped);
+                assert_eq!(values.len(), 1);
+                assert!(values.contains("api"));
+            }
+            _ => panic!("filtered Distinct must serve from the dictionary"),
+        }
+        // MultiHistogram reads the docs column: still a per-file fallback
+        match evaluate_vix_index(
+            "review",
+            &reader,
+            &condition,
+            Some(IndexOptimizeMode::SimpleMultiHistogram(
+                0,
+                2000,
+                100,
+                0,
+                "svc".to_string(),
+            )),
+            (0, 2000),
+            true,
+            None,
+        )
+        .unwrap()
+        {
+            RawVixResult::MissingColumn { field } => assert_eq!(field, "svc"),
+            _ => panic!("expected MissingColumn"),
         }
         // unfiltered single-field TopN over the same file is served
         // index-only (dictionary), never skipped
@@ -3100,6 +3954,7 @@ mod review_tests {
             )),
             (0, 2000),
             true,
+            None,
         )
         .unwrap()
         {
@@ -3301,7 +4156,17 @@ mod review_tests {
         let condition = IndexCondition {
             conditions: vec![Condition::Equal("svc".into(), "k".into())],
         };
-        match evaluate_vix_index("review", &reader, &condition, None, (998, 1000), false).unwrap() {
+        match evaluate_vix_index(
+            "review",
+            &reader,
+            &condition,
+            None,
+            (998, 1000),
+            false,
+            None,
+        )
+        .unwrap()
+        {
             RawVixResult::Bitmap {
                 bitmap,
                 has_skipped,
@@ -3542,6 +4407,7 @@ mod ui_histogram_differential_tests {
             Some(mode.clone()),
             eval_range,
             file_in_range,
+            None,
         )
         .unwrap();
 

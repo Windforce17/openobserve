@@ -60,11 +60,16 @@
 //!   serve a Built status whose L0 file_list rows have not replicated yet, reopening the gap this
 //!   ordering closes.
 
-use std::sync::Arc;
+use std::{
+    cmp::Reverse,
+    collections::BinaryHeap,
+    sync::Arc,
+};
 
+use arrow::array::{BooleanArray, Int64Array};
 use arrow_schema::Schema;
 use config::{
-    get_config,
+    TIMESTAMP_COL_NAME, get_config,
     meta::{search::ScanStats, stream::StreamType},
     metrics,
     utils::record_batch_ext::{RecordBatchExt, concat_batches},
@@ -77,7 +82,6 @@ use infra::{
     file_list::FileId,
     wal_segments::{self, SegmentMeta},
 };
-use segment_wal::format::{SegmentFrame, decode_segment};
 
 use crate::service::search::{
     datafusion::table_provider::memtable::NewMemTable, index::IndexCondition,
@@ -348,8 +352,10 @@ pub fn split_pseudo_ids(ids: &[i64]) -> (Vec<i64>, Vec<i64>) {
 pub async fn search(
     query: Arc<super::QueryParams>,
     schema: Arc<Schema>,
+    plan_schema: Arc<Schema>,
     segment_ids: &[i64],
     sorted_by_time: bool,
+    limit: Option<usize>,
     index_condition: Option<IndexCondition>,
     fst_fields: Vec<String>,
 ) -> Result<(Vec<Arc<dyn TableProvider>>, ScanStats)> {
@@ -373,7 +379,23 @@ pub async fn search(
     // ids — a missing id is a hard error (silent partial data is the bug
     // class this path exists to prevent).
     let rows = wal_segments::get_by_ids(segment_ids).await?;
-    let metas = resolve_assigned(segment_ids, rows, &query.org_id, &query.stream_name)?;
+    let mut metas = resolve_assigned(segment_ids, rows, &query.org_id, &query.stream_name)?;
+
+    // `ORDER BY _timestamp DESC LIMIT n` scans (the UI default) only ever
+    // read the n newest matching rows — a running top-n timestamp threshold
+    // trims kept batches down to candidates. Newest-first processing locks
+    // the threshold immediately, and (for unconditioned scans) whole
+    // segments older than it skip fetch/decode entirely.
+    let mut top_n = sorted_by_time
+        .then(|| {
+            limit
+                .filter(|&n| n > 0)
+                .map(|n| TopNTimestamps::new(n, query.time_range))
+        })
+        .flatten();
+    if top_n.is_some() {
+        metas.sort_by_key(|m| Reverse(m.max_ts));
+    }
 
     let mut scan_stats = ScanStats::new();
     scan_stats.files = metas.len() as i64;
@@ -402,61 +424,160 @@ pub async fn search(
     // check memory circuit breaker before decoding anything
     ingester::check_memory_circuit_breaker().map_err(|e| Error::ResourceError(e.to_string()))?;
 
-    // Fetch + decode SEQUENTIALLY: peak memory is one decoded segment plus
-    // the kept batches (this stream's in-range rows — the data itself),
-    // never `segments x decoded-size`. The kept batches themselves are
-    // bounded by [`SEGMENT_SCAN_MAX_BYTES`].
+    // The only columns any operator can read from these batches: the
+    // projected plan schema (the downstream union table is built on it), the
+    // condition columns (the memtable provider re-applies the filter), and
+    // `_timestamp` (time pruning + sort order). Everything else is dead
+    // weight the budget must not hold — an unconditioned count over a busy
+    // live tail died at 512MB of kept bytes whose columns no operator would
+    // ever touch, while the rows it needed amounted to one u32 per batch.
+    let mut needed_columns: HashSet<String> = plan_schema
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    if let Some(condition) = index_condition.as_ref() {
+        needed_columns.extend(condition.get_schema_fields(&fst_fields));
+    }
+    needed_columns.insert(TIMESTAMP_COL_NAME.to_string());
+
+    // Fetch + decode in WAVES of decode_wave segments. Decode is STREAMING
+    // (`decode_segment_filtered`): the zstd payload decompresses frame by
+    // frame, other streams' frames skip IPC parsing entirely (segments are
+    // mixed-stream — a logs query used to pay full IPC parse of the
+    // trace-heavy tail), and each kept frame is condition-pruned and
+    // projected to plan-needed columns INSIDE the blocking stage — so a
+    // wave slot's peak is one frame plus its post-projection remnant,
+    // never a whole decoded payload. Trimming and budgeting stay
+    // sequential below (the top-n heap is shared), and the top-n segment
+    // skip re-evaluates between submissions so a threshold locked by wave
+    // 1 skips every older segment before it is ever fetched.
+    let decode_wave = get_config().common.segment_scan_decode_wave.max(1);
+    let needed_columns = Arc::new(needed_columns);
     let mut kept_batches: Vec<RecordBatch> = Vec::new();
     let mut kept_bytes: usize = 0;
-    for meta in &metas {
-        let bytes = file_data::get(SEGMENT_STORAGE_ACCOUNT, &meta.object_key, None)
-            .await
-            .map_err(|e| {
-                Error::Message(format!(
-                    "[SEGMENT:SCAN] fetch segment object {} (id {}) failed: {e}",
-                    meta.object_key, meta.id
-                ))
-            })?;
-        scan_stats.compressed_size += bytes.len() as i64;
-        let object_key = meta.object_key.clone();
-        // zstd + arrow ipc over up to a whole flush buffer — keep it off the
-        // async workers
-        let frames = tokio::task::spawn_blocking(move || decode_named(&bytes, &object_key))
-            .await
-            .map_err(|e| {
-                Error::Message(format!(
-                    "[SEGMENT:SCAN] decode task for segment object {} (id {}) did not complete: {e}",
-                    meta.object_key, meta.id
-                ))
-            })??;
-        for batch in keep_stream_frames(
-            frames,
-            &query.org_id,
-            query.stream_type,
-            &query.stream_name,
-            query.time_range,
-        ) {
-            scan_stats.records += batch.num_rows() as i64;
-            scan_stats.original_size += batch.get_array_memory_size() as i64;
-            push_within_budget(
-                &mut kept_batches,
-                &mut kept_bytes,
-                batch,
-                SEGMENT_SCAN_MAX_BYTES,
-                &query.org_id,
-                query.stream_type,
-                &query.stream_name,
-            )?;
+    let mut skipped_by_top_n: usize = 0;
+    let mut next_meta: usize = 0;
+    while next_meta < metas.len() {
+        let mut wave: Vec<&SegmentMeta> = Vec::with_capacity(decode_wave);
+        while next_meta < metas.len() && wave.len() < decode_wave {
+            let meta = &metas[next_meta];
+            next_meta += 1;
+            // Once the top-n threshold is locked, a segment whose max_ts
+            // sits below it cannot contribute a top-n row — skip the fetch
+            // and the decode outright. Gated on conditions that match every
+            // row (absent, or the WHERE-less `Condition::All` the optimizer
+            // emits): with a real condition, batches this node cannot
+            // evaluate (schema-mixed segments) pass through whole for the
+            // provider to re-filter, and those rows never feed the
+            // threshold — but they could still live in an older segment.
+            if index_condition.as_ref().is_none_or(|c| c.is_condition_all())
+                && let Some(top) = top_n.as_ref()
+                && let Some(threshold) = top.threshold()
+                && meta.max_ts < threshold
+            {
+                skipped_by_top_n += 1;
+                continue;
+            }
+            wave.push(meta);
+        }
+        if wave.is_empty() {
+            continue;
+        }
+        let decoded = futures::future::try_join_all(wave.iter().map(|meta| {
+            let org_id = query.org_id.clone();
+            let stream_type = query.stream_type;
+            let stream_name = query.stream_name.clone();
+            let time_range = query.time_range;
+            let condition = index_condition.clone();
+            let fst_fields = fst_fields.clone();
+            let needed_columns = Arc::clone(&needed_columns);
+            async move {
+                let bytes = file_data::get(SEGMENT_STORAGE_ACCOUNT, &meta.object_key, None)
+                    .await
+                    .map_err(|e| {
+                        Error::Message(format!(
+                            "[SEGMENT:SCAN] fetch segment object {} (id {}) failed: {e}",
+                            meta.object_key, meta.id
+                        ))
+                    })?;
+                let compressed_len = bytes.len();
+                let object_key = meta.object_key.clone();
+                // zstd + arrow ipc + prune/project — keep it off the async
+                // workers
+                let scanned = tokio::task::spawn_blocking(move || {
+                    scan_segment_object(
+                        &bytes,
+                        &org_id,
+                        stream_type,
+                        &stream_name,
+                        time_range,
+                        condition.as_ref(),
+                        &fst_fields,
+                        &needed_columns,
+                    )
+                    .map_err(|e| {
+                        Error::Message(format!(
+                            "[SEGMENT:SCAN] decode segment object {object_key} failed: {e:#}"
+                        ))
+                    })
+                })
+                .await
+                .map_err(|e| {
+                    Error::Message(format!(
+                        "[SEGMENT:SCAN] decode task for segment object {} (id {}) did not complete: {e}",
+                        meta.object_key, meta.id
+                    ))
+                })??;
+                Ok::<_, Error>((compressed_len, scanned))
+            }
+        }))
+        .await?;
+        for (compressed_len, scanned) in decoded {
+            scan_stats.compressed_size += compressed_len as i64;
+            scan_stats.records += scanned.rows_examined;
+            for (is_exact, batch) in scanned.kept {
+                // rows provably outside a top-n window are trimmed here
+                // (trim_batch_to_top_n — only for batches whose surviving
+                // rows are KNOWN matches; batches kept whole for downstream
+                // re-filtering never trim and never feed the threshold)
+                let batch = if is_exact {
+                    match top_n.as_mut() {
+                        Some(top) => match trim_batch_to_top_n(batch, top)? {
+                            Some(batch) => batch,
+                            None => continue,
+                        },
+                        None => batch,
+                    }
+                } else {
+                    batch
+                };
+                push_within_budget(
+                    &mut kept_batches,
+                    &mut kept_bytes,
+                    batch,
+                    SEGMENT_SCAN_MAX_BYTES,
+                    &query.org_id,
+                    query.stream_type,
+                    &query.stream_name,
+                )?;
+            }
         }
         tokio::task::coop::consume_budget().await;
     }
+    // scan_size for the segment branch = the bytes the query actually HELD
+    // after prune/project/trim (what the budget guarded). Summing decoded
+    // batch capacities double-counted the shared IPC body buffer per batch
+    // and reported hundreds of GB for a 15-second tail.
+    scan_stats.original_size = kept_bytes as i64;
 
     log::info!(
-        "[trace_id {trace_id}] segments_scan: {}/{}/{} loaded {} segments, kept {} batches, records {}, scan_size {}, took {} ms",
+        "[trace_id {trace_id}] segments_scan: {}/{}/{} loaded {} segments ({} skipped by top-n), kept {} batches, records {}, scan_size {}, took {} ms",
         query.org_id,
         query.stream_type,
         query.stream_name,
-        metas.len(),
+        metas.len() - skipped_by_top_n,
+        skipped_by_top_n,
         kept_batches.len(),
         scan_stats.records,
         scan_stats.original_size,
@@ -479,15 +600,82 @@ pub async fn search(
     Ok((tables, scan_stats))
 }
 
-/// Wrap `decode_segment` so every failure names the object involved, and
-/// drop the header (registration metadata already carries it).
-fn decode_named(bytes: &[u8], object_key: &str) -> Result<Vec<SegmentFrame>> {
-    let (_header, frames) = decode_segment(bytes).map_err(|e| {
-        Error::Message(format!(
-            "[SEGMENT:SCAN] decode segment object {object_key} failed: {e:#}"
-        ))
-    })?;
-    Ok(frames)
+/// One scanned segment object's contribution: rows examined (pre-prune, for
+/// stats) and the kept batches, each flagged `is_exact` (its surviving rows
+/// are KNOWN condition matches — see [`PrunedBatch`]) — trim-eligible
+/// downstream.
+#[derive(Debug)]
+struct ScannedSegment {
+    rows_examined: i64,
+    kept: Vec<(bool, RecordBatch)>,
+}
+
+/// Streaming scan of one segment object: decompress frame by frame, offer
+/// each frame's identity to [`frame_matches`] (other streams and
+/// out-of-range frames skip IPC parsing entirely), and run kept frames
+/// through condition prune + plan projection immediately, so peak memory is
+/// one frame plus its post-projection remnant — never the whole payload.
+#[allow(clippy::too_many_arguments)]
+fn scan_segment_object(
+    bytes: &[u8],
+    org_id: &str,
+    stream_type: StreamType,
+    stream_name: &str,
+    time_range: (i64, i64),
+    condition: Option<&IndexCondition>,
+    fst_fields: &[String],
+    needed_columns: &HashSet<String>,
+) -> anyhow::Result<ScannedSegment> {
+    let mut out = ScannedSegment {
+        rows_examined: 0,
+        kept: Vec::new(),
+    };
+    segment_wal::format::decode_segment_filtered(
+        bytes,
+        |info| frame_matches(info, org_id, stream_type, stream_name, time_range),
+        |frame| {
+            let batch = frame.batch;
+            if batch.num_rows() == 0 {
+                return Ok(());
+            }
+            out.rows_examined += batch.num_rows() as i64;
+            // rows the condition can never match must not count against the
+            // scan budget (see prune_batch_by_condition), nor columns the
+            // plan can never read (project_batch_to_needed)
+            match prune_batch_by_condition(batch, condition, fst_fields) {
+                PrunedBatch::Dropped => {}
+                PrunedBatch::Exact(batch) => {
+                    let batch = project_batch_to_needed(batch, needed_columns)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    out.kept.push((true, batch));
+                }
+                PrunedBatch::Whole(batch) => {
+                    let batch = project_batch_to_needed(batch, needed_columns)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    out.kept.push((false, batch));
+                }
+            }
+            Ok(())
+        },
+    )?;
+    Ok(out)
+}
+
+/// Frame eligibility for a query: stream identity plus the file-overlap
+/// time test (closed range, mirroring the WAL parquet skip check;
+/// `(0, 0)` means unbounded).
+fn frame_matches(
+    info: &segment_wal::format::FrameInfo,
+    org_id: &str,
+    stream_type: StreamType,
+    stream_name: &str,
+    time_range: (i64, i64),
+) -> bool {
+    let (min_ts, max_ts) = time_range;
+    info.org == org_id
+        && info.stream_type == stream_type
+        && info.stream == stream_name
+        && !((min_ts, max_ts) != (0, 0) && (info.min_ts > max_ts || info.max_ts < min_ts))
 }
 
 /// Resolve assigned segment ids against the listed rows; every id must
@@ -518,6 +706,232 @@ fn resolve_assigned(
     Ok(metas)
 }
 
+/// Outcome of pruning one decoded batch against the index condition.
+/// The distinction matters downstream: only `Exact` batches — whose
+/// surviving rows are KNOWN condition matches — may feed top-n trimming;
+/// `Whole` batches are re-filtered by the provider and must pass through
+/// untrimmed.
+enum PrunedBatch {
+    /// The condition was fully evaluated here; every surviving row matches.
+    /// (Also the no-condition case: trivially, every row "matches".)
+    Exact(RecordBatch),
+    /// The condition could not be evaluated on this batch's schema — kept
+    /// whole, the provider re-applies the filter downstream.
+    Whole(RecordBatch),
+    /// No row of this batch can match.
+    Dropped,
+}
+
+/// Prune a decoded segment batch down to the rows the query's index
+/// condition can match, BEFORE it counts against the scan budget. The
+/// budget is an OOM guard for the live backlog — without this prune a
+/// 3-row needle (`trace_id = X` over a wide range) died at 512MB of KEPT
+/// bytes purely because the stream was busy, while the rows it needed
+/// were a few KB. Conservative by construction:
+/// - a condition this batch's schema cannot evaluate (absent column, unsupported shape) => the
+///   batch is kept WHOLE;
+/// - evaluation errors keep the batch whole;
+/// - the provider downstream re-applies the condition uniformly, so pruning here only ever narrows
+///   what the budget must hold.
+fn prune_batch_by_condition(
+    batch: RecordBatch,
+    condition: Option<&IndexCondition>,
+    fst_fields: &[String],
+) -> PrunedBatch {
+    use datafusion::physical_plan::ColumnarValue;
+    let Some(condition) = condition else {
+        return PrunedBatch::Exact(batch);
+    };
+    // Schema-mixed segment batches may lack a condition column entirely —
+    // and `to_physical_expr` resolves columns with an infallible lookup
+    // (panic, not Err), so presence is checked HERE and absence keeps the
+    // batch whole (the scan re-applies the full filter downstream anyway).
+    let schema = batch.schema();
+    if condition
+        .get_schema_fields(fst_fields)
+        .iter()
+        .any(|field| schema.index_of(field).is_err())
+    {
+        return PrunedBatch::Whole(batch);
+    }
+    let expr = match condition.to_physical_expr(schema.as_ref(), fst_fields) {
+        Ok(expr) => expr,
+        Err(_) => return PrunedBatch::Whole(batch),
+    };
+    let mask = match expr.evaluate(&batch) {
+        Ok(ColumnarValue::Array(array)) => array,
+        Ok(ColumnarValue::Scalar(scalar)) => {
+            // a constant verdict: keep or drop the whole batch
+            return match scalar {
+                datafusion::scalar::ScalarValue::Boolean(Some(true)) => PrunedBatch::Exact(batch),
+                _ => PrunedBatch::Dropped,
+            };
+        }
+        Err(_) => return PrunedBatch::Whole(batch),
+    };
+    let Some(mask) = mask.as_any().downcast_ref::<BooleanArray>() else {
+        return PrunedBatch::Whole(batch);
+    };
+    match arrow::compute::filter_record_batch(&batch, mask) {
+        Ok(filtered) if filtered.num_rows() == 0 => PrunedBatch::Dropped,
+        Ok(filtered) => PrunedBatch::Exact(filtered),
+        Err(_) => PrunedBatch::Whole(batch),
+    }
+}
+
+/// Running top-n `_timestamp` tracker for `ORDER BY _timestamp DESC LIMIT n`
+/// scans (`sorted_by_time` is set exactly for that shape, and the pushed
+/// `limit` already includes any OFFSET). Once n timestamps are collected,
+/// `threshold()` is the n-th newest seen so far — monotonically
+/// non-decreasing, so any row (or whole segment) strictly older can never
+/// re-enter the final top-n.
+///
+/// WINDOW CLAMP (correctness, not optimization): frames are kept on
+/// FRAME-level time overlap, so batches carry rows outside the query
+/// window — and rows NEWER than `end` always exist on a live stream
+/// (ingest continues past the window snapshot). The heap observes ONLY
+/// rows that definitely survive the downstream time filter
+/// (`start <= ts < end`, the strict subset); an unclamped heap inflates
+/// the threshold with rows the plan will drop and trims away rows that
+/// belong in the result. The trim mask keeps the looser closed-range
+/// superset — over-keeping is safe, the provider re-filters.
+struct TopNTimestamps {
+    n: usize,
+    window: (i64, i64),
+    heap: BinaryHeap<Reverse<i64>>,
+}
+
+impl TopNTimestamps {
+    fn new(n: usize, window: (i64, i64)) -> Self {
+        Self {
+            n,
+            window,
+            heap: BinaryHeap::with_capacity(n + 1),
+        }
+    }
+
+    /// The n-th newest in-window timestamp observed, once n have been seen.
+    fn threshold(&self) -> Option<i64> {
+        (self.heap.len() >= self.n).then(|| self.heap.peek().map(|r| r.0)).flatten()
+    }
+
+    fn observe(&mut self, ts: &Int64Array) {
+        let (start, end) = self.window;
+        for v in ts.iter().flatten() {
+            if v < start || v >= end {
+                continue;
+            }
+            if self.heap.len() < self.n {
+                self.heap.push(Reverse(v));
+            } else if self.heap.peek().is_some_and(|&Reverse(min)| v > min) {
+                self.heap.pop();
+                self.heap.push(Reverse(v));
+            }
+        }
+    }
+}
+
+/// Trim a batch of KNOWN condition matches down to rows that can still be
+/// in the top-n newest of the query window (in the closed window and
+/// `_timestamp >= threshold`; ties kept — the plan's own sort+limit
+/// resolves them). Returns `None` when nothing survives. Batches without
+/// a readable `_timestamp` column pass through whole (defensive; the
+/// writer refuses timestamp-less rows).
+fn trim_batch_to_top_n(
+    batch: RecordBatch,
+    top: &mut TopNTimestamps,
+) -> Result<Option<RecordBatch>> {
+    let Ok(ts_idx) = batch.schema().index_of(TIMESTAMP_COL_NAME) else {
+        return Ok(Some(batch));
+    };
+    let Some(ts) = batch
+        .column(ts_idx)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .cloned()
+    else {
+        return Ok(Some(batch));
+    };
+    top.observe(&ts);
+    let Some(threshold) = top.threshold() else {
+        return Ok(Some(batch));
+    };
+    let (start, end) = top.window;
+    let mask = BooleanArray::from_iter(
+        ts.iter()
+            .map(|v| Some(v.is_some_and(|v| v >= start && v <= end && v >= threshold))),
+    );
+    if mask.true_count() == batch.num_rows() {
+        return Ok(Some(batch));
+    }
+    match arrow::compute::filter_record_batch(&batch, &mask) {
+        Ok(trimmed) if trimmed.num_rows() == 0 => Ok(None),
+        Ok(trimmed) => Ok(Some(trimmed)),
+        Err(e) => Err(Error::Message(format!(
+            "[SEGMENT:SCAN] trimming a segment batch to the top-{} newest rows failed: {e}",
+            top.n
+        ))),
+    }
+}
+
+/// Drop every column the query can never read, BEFORE the batch counts
+/// against the scan budget. Row counts are always preserved.
+///
+/// Two non-obvious points:
+/// - IPC stream decode slices ALL columns of a batch out of one message-body
+///   buffer, so `RecordBatch::project` alone would keep the whole decoded
+///   frame resident (and the budget accounting would lie). Batches that
+///   actually shed columns are therefore detached with a `take` gather copy
+///   — cheap, it only materializes the columns being kept.
+/// - a batch can project to ZERO columns (a pure `count(*)` plan against a
+///   frame with no surviving needed column); arrow preserves `num_rows`
+///   through empty projections, which is exactly what such plans consume.
+fn project_batch_to_needed(batch: RecordBatch, needed: &HashSet<String>) -> Result<RecordBatch> {
+    // A plan that reads `_source` consumes WHOLE rows: that column is
+    // synthesized from every stored column whenever the batch does not
+    // materialize it (segment frames never do). Projecting such batches
+    // silently hollows out star hits to bare timestamps (e2e-caught), so
+    // they are kept whole and the budget guards them at full width.
+    if needed.contains(vortex_index::SOURCE_COL_NAME) {
+        return Ok(batch);
+    }
+    let schema = batch.schema();
+    let keep: Vec<usize> = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| needed.contains(f.name().as_str()))
+        .map(|(i, _)| i)
+        .collect();
+    if keep.len() == schema.fields().len() {
+        return Ok(batch);
+    }
+    let projected = batch.project(&keep).map_err(|e| {
+        Error::Message(format!(
+            "[SEGMENT:SCAN] projecting a decoded segment batch to its needed columns failed: {e}"
+        ))
+    })?;
+    if keep.is_empty() {
+        return Ok(projected);
+    }
+    let indices = arrow::array::UInt32Array::from_iter_values(0..projected.num_rows() as u32);
+    let columns = projected
+        .columns()
+        .iter()
+        .map(|c| arrow::compute::take(c.as_ref(), &indices, None))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| {
+            Error::Message(format!(
+                "[SEGMENT:SCAN] detaching a projected segment batch from its decode buffer failed: {e}"
+            ))
+        })?;
+    RecordBatch::try_new(projected.schema(), columns).map_err(|e| {
+        Error::Message(format!(
+            "[SEGMENT:SCAN] rebuilding a projected segment batch failed: {e}"
+        ))
+    })
+}
+
 /// Fold a kept batch into the accumulator, enforcing the scan bytes budget
 /// with [`RecordBatchExt::size`] accounting. `budget` is a parameter so
 /// tests can shrink it; the public path always passes
@@ -535,7 +949,7 @@ fn push_within_budget(
     *kept_bytes = kept_bytes.saturating_add(batch.size());
     if *kept_bytes > budget {
         return Err(Error::Message(format!(
-            "[SEGMENT:SCAN] {org_id}/{stream_type}/{stream_name}: kept segment batches reach {} bytes, over the per-query scan budget {budget} — the segment builder backlog is too large to search safely",
+            "[SEGMENT:SCAN] {org_id}/{stream_type}/{stream_name}: this query needs {} bytes of not-yet-sealed live data, over the per-query scan budget {budget} — narrow the time range, add filters, or select fewer columns",
             *kept_bytes
         )));
     }
@@ -543,29 +957,6 @@ fn push_within_budget(
     Ok(())
 }
 
-/// Keep only frames of the queried stream that overlap the query time range
-/// (file-overlap semantics: closed range test, mirroring the WAL parquet
-/// skip check), dropping empty batches.
-fn keep_stream_frames(
-    frames: Vec<SegmentFrame>,
-    org_id: &str,
-    stream_type: StreamType,
-    stream_name: &str,
-    time_range: (i64, i64),
-) -> Vec<RecordBatch> {
-    let (min_ts, max_ts) = time_range;
-    frames
-        .into_iter()
-        .filter(|f| {
-            f.org == org_id
-                && f.stream_type == stream_type
-                && f.stream == stream_name
-                && !((min_ts, max_ts) != (0, 0) && (f.min_ts > max_ts || f.max_ts < min_ts))
-                && f.batch.num_rows() > 0
-        })
-        .map(|f| f.batch)
-        .collect()
-}
 
 /// Group batches by their OWN write-time schema, merge small batches within
 /// each group, and build one `NewMemTable` per group — exactly the memtable
@@ -656,9 +1047,422 @@ fn group_by_batch_schema(batches: Vec<RecordBatch>) -> HashMap<Arc<Schema>, Vec<
 #[cfg(test)]
 mod tests {
     use arrow::array::{Int64Array, StringArray};
+
+    /// THE prod failure this guards against (2026-08-01): `trace_id = X`
+    /// over a wide range hit 3 rows but died at the 512MB scan budget
+    /// because the WHOLE live backlog counted against it. The prune keeps
+    /// only rows the condition can match, so the budget sees KBs; a batch
+    /// whose schema cannot evaluate the condition stays whole; with no
+    /// condition the budget still guards full scans.
+    #[test]
+    fn test_prune_batch_by_condition_saves_needle_queries() {
+        use crate::service::search::index::Condition;
+        let schema = Arc::new(Schema::new(vec![
+            arrow_schema::Field::new("_timestamp", arrow_schema::DataType::Int64, false),
+            arrow_schema::Field::new("trace_id", arrow_schema::DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 2, 3, 4])),
+                Arc::new(StringArray::from(vec!["a", "needle", "b", "needle"])),
+            ],
+        )
+        .unwrap();
+        let mut condition = IndexCondition::new();
+        condition.add_condition(Condition::Equal(
+            "trace_id".to_string(),
+            "needle".to_string(),
+        ));
+
+        // matching rows survive as KNOWN matches, everything else pruned
+        // before budgeting
+        let PrunedBatch::Exact(pruned) = prune_batch_by_condition(batch.clone(), Some(&condition), &[])
+        else {
+            panic!("evaluated condition must yield Exact");
+        };
+        assert_eq!(pruned.num_rows(), 2);
+
+        // a condition nothing matches drops the batch entirely
+        let mut miss = IndexCondition::new();
+        miss.add_condition(Condition::Equal(
+            "trace_id".to_string(),
+            "absent-value".to_string(),
+        ));
+        assert!(matches!(
+            prune_batch_by_condition(batch.clone(), Some(&miss), &[]),
+            PrunedBatch::Dropped
+        ));
+
+        // no condition: trivially Exact (all rows "match"; full scans are
+        // still budget-guarded)
+        let PrunedBatch::Exact(whole) = prune_batch_by_condition(batch.clone(), None, &[]) else {
+            panic!("no condition must yield Exact");
+        };
+        assert_eq!(whole.num_rows(), 4);
+
+        // a schema without the column keeps the batch WHOLE (the provider
+        // re-applies the condition downstream) — and Whole, not Exact, so
+        // top-n trimming never touches it
+        let no_col_schema = Arc::new(Schema::new(vec![arrow_schema::Field::new(
+            "_timestamp",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let no_col = RecordBatch::try_new(
+            no_col_schema,
+            vec![Arc::new(Int64Array::from(vec![1i64, 2]))],
+        )
+        .unwrap();
+        let PrunedBatch::Whole(kept) = prune_batch_by_condition(no_col, Some(&condition), &[])
+        else {
+            panic!("unevaluable condition must yield Whole");
+        };
+        assert_eq!(kept.num_rows(), 2);
+    }
+
+    /// End-to-end shape: pruned batches fit a budget the unpruned stream
+    /// would blow through.
+    #[test]
+    fn test_pruned_needle_fits_a_budget_the_backlog_would_trip() {
+        use crate::service::search::index::Condition;
+        let schema = Arc::new(Schema::new(vec![
+            arrow_schema::Field::new("_timestamp", arrow_schema::DataType::Int64, false),
+            arrow_schema::Field::new("trace_id", arrow_schema::DataType::Utf8, true),
+        ]));
+        let make_batch = |needle_rows: usize| {
+            let n = 10_000usize;
+            let ts: Vec<i64> = (0..n as i64).collect();
+            let ids: Vec<String> = (0..n)
+                .map(|i| {
+                    if i < needle_rows {
+                        "needle".to_string()
+                    } else {
+                        format!("filler-{i}")
+                    }
+                })
+                .collect();
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(ts)),
+                    Arc::new(StringArray::from(ids)),
+                ],
+            )
+            .unwrap()
+        };
+        let mut condition = IndexCondition::new();
+        condition.add_condition(Condition::Equal(
+            "trace_id".to_string(),
+            "needle".to_string(),
+        ));
+        let budget = 64 * 1024; // far below one raw batch
+        let mut kept = Vec::new();
+        let mut kept_bytes = 0usize;
+        for needle_rows in [1usize, 2, 0] {
+            let batch = make_batch(needle_rows);
+            assert!(batch.get_array_memory_size() > budget, "test premise");
+            let batch = match prune_batch_by_condition(batch, Some(&condition), &[]) {
+                PrunedBatch::Exact(b) | PrunedBatch::Whole(b) => b,
+                PrunedBatch::Dropped => continue,
+            };
+            push_within_budget(
+                &mut kept,
+                &mut kept_bytes,
+                batch,
+                budget,
+                "org",
+                StreamType::Traces,
+                "default",
+            )
+            .expect("pruned needle rows must fit the budget");
+        }
+        let total_rows: usize = kept.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 3, "exactly the needle rows are kept");
+    }
+
+    /// THE prod failure this guards against (2026-08-03, .62 cutover): an
+    /// unconditioned `count(*)` touching the live tail of a 120k-spans/s
+    /// traces stream died at 512MB of kept bytes, all of them columns no
+    /// operator would ever read. Projection to the plan's needed columns
+    /// must shrink kept accounting to ~one column and preserve every row.
+    #[test]
+    fn test_project_batch_to_needed_saves_unconditioned_counts() {
+        let n = 10_000usize;
+        let schema = Arc::new(Schema::new(vec![
+            arrow_schema::Field::new("_timestamp", arrow_schema::DataType::Int64, false),
+            arrow_schema::Field::new("span_payload", arrow_schema::DataType::Utf8, true),
+            arrow_schema::Field::new("service_name", arrow_schema::DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from((0..n as i64).collect::<Vec<_>>())),
+                Arc::new(StringArray::from(
+                    (0..n).map(|i| format!("wide-filler-{i:0>64}")).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    (0..n).map(|i| format!("svc-{}", i % 7)).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        let whole_size = batch.size();
+
+        // a count(*) plan needs only _timestamp
+        let needed: HashSet<String> = ["_timestamp".to_string()].into_iter().collect();
+        let projected = project_batch_to_needed(batch.clone(), &needed).unwrap();
+        assert_eq!(projected.num_rows(), n, "projection must never drop rows");
+        assert_eq!(projected.num_columns(), 1);
+        assert!(
+            projected.size() * 4 < whole_size,
+            "projected accounting must shrink far below whole-width ({} vs {whole_size})",
+            projected.size()
+        );
+
+        // the budget the whole batch trips, the projected batch fits
+        let budget = whole_size - 1;
+        let mut kept = Vec::new();
+        let mut kept_bytes = 0usize;
+        push_within_budget(
+            &mut kept,
+            &mut kept_bytes,
+            projected,
+            budget,
+            "org",
+            StreamType::Traces,
+            "default",
+        )
+        .expect("projected count batch must fit a budget the raw tail trips");
+
+        // a plan needing every column keeps the batch untouched
+        let all: HashSet<String> = ["_timestamp", "span_payload", "service_name"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let untouched = project_batch_to_needed(batch.clone(), &all).unwrap();
+        assert_eq!(untouched.num_columns(), 3);
+
+        // a batch with NO needed column projects to zero columns, rows intact
+        // (pure row-count consumers still count correctly)
+        let unrelated: HashSet<String> = ["absent_col".to_string()].into_iter().collect();
+        let empty = project_batch_to_needed(batch.clone(), &unrelated).unwrap();
+        assert_eq!(empty.num_columns(), 0);
+        assert_eq!(empty.num_rows(), n, "row count survives an empty projection");
+
+        // a plan that reads `_source` (star selects) keeps batches WHOLE:
+        // the column is synthesized from every stored column, so dropping
+        // "unneeded" ones would hollow out the hits (e2e-caught regression)
+        let star: HashSet<String> =
+            ["_timestamp".to_string(), vortex_index::SOURCE_COL_NAME.to_string()]
+                .into_iter()
+                .collect();
+        let whole = project_batch_to_needed(batch, &star).unwrap();
+        assert_eq!(whole.num_columns(), 3, "_source plans must keep every column");
+    }
+
+    /// Batches decoded from an IPC stream slice every column out of one
+    /// message-body allocation; projection must DETACH (gather-copy) the
+    /// kept columns so dropping the batch actually frees the wide columns.
+    /// Observable here: the projected batch's accounted size is that of a
+    /// fresh, exactly-sized timestamp column — not the shared decode body.
+    #[test]
+    fn test_projection_detaches_from_ipc_decode_buffers() {
+        let n = 4_096usize;
+        let schema = Arc::new(Schema::new(vec![
+            arrow_schema::Field::new("_timestamp", arrow_schema::DataType::Int64, false),
+            arrow_schema::Field::new("payload", arrow_schema::DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from((0..n as i64).collect::<Vec<_>>())),
+                Arc::new(StringArray::from(
+                    (0..n).map(|i| format!("padding-{i:0>128}")).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        let mut ipc = Vec::new();
+        {
+            let mut w = arrow::ipc::writer::StreamWriter::try_new(&mut ipc, &schema).unwrap();
+            w.write(&batch).unwrap();
+            w.finish().unwrap();
+        }
+        let decoded = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(ipc), None)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+
+        let needed: HashSet<String> = ["_timestamp".to_string()].into_iter().collect();
+        let projected = project_batch_to_needed(decoded.clone(), &needed).unwrap();
+        assert_eq!(projected.num_rows(), n);
+        // fresh Int64 buffer: n * 8 bytes plus small constants — nowhere near
+        // the >512KB decoded payload column
+        assert!(
+            projected.size() < n * 8 * 2,
+            "projected size {} must reflect a detached, exactly-sized column",
+            projected.size()
+        );
+    }
+
+    /// THE prod failure this guards against (2026-08-03, post-.63): a star
+    /// `ORDER BY _timestamp DESC LIMIT n` over the live traces tail kept
+    /// the whole ~537MB tail (plans reading `_source` keep full rows) and
+    /// died on the budget — while the query only ever returns the n newest
+    /// rows. The running top-n threshold must (a) keep a superset of the
+    /// true top-n incl. ties, (b) never grow kept rows past the candidate
+    /// set once locked, (c) rise monotonically so old segments can be
+    /// skipped wholesale.
+    #[test]
+    fn test_top_n_trim_keeps_exactly_the_newest_candidates() {
+        let make = |ts: Vec<i64>| {
+            let schema = Arc::new(Schema::new(vec![
+                arrow_schema::Field::new("_timestamp", arrow_schema::DataType::Int64, false),
+                arrow_schema::Field::new("payload", arrow_schema::DataType::Utf8, true),
+            ]));
+            let vals: Vec<String> = ts.iter().map(|t| format!("row-{t}-{:0>128}", "")).collect();
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(Int64Array::from(ts)),
+                    Arc::new(StringArray::from(vals)),
+                ],
+            )
+            .unwrap()
+        };
+        let mut top = TopNTimestamps::new(3, (0, i64::MAX));
+
+        // newest segment first (the loop sorts metas by max_ts desc):
+        // threshold locks at the 3rd newest of the first batch
+        let b1 = trim_batch_to_top_n(make((100..110).collect()), &mut top)
+            .unwrap()
+            .expect("first batch keeps its top-3 candidates");
+        assert_eq!(top.threshold(), Some(107));
+        assert_eq!(b1.num_rows(), 3, "only ts>=107 survive: 107,108,109");
+
+        // an older batch trims to nothing and cannot lower the threshold
+        assert!(
+            trim_batch_to_top_n(make((0..50).collect()), &mut top)
+                .unwrap()
+                .is_none(),
+            "strictly older rows are all trimmed"
+        );
+        assert_eq!(top.threshold(), Some(107), "threshold never regresses");
+
+        // a straddling batch is trimmed against the POST-observe threshold:
+        // 200 enters the top-3 (now 200,109,108), so 107 falls out and only
+        // 108 (tie at the new threshold) and 200 survive
+        let b3 = trim_batch_to_top_n(make(vec![105, 107, 108, 200]), &mut top)
+            .unwrap()
+            .expect("straddling batch keeps candidates");
+        assert_eq!(b3.num_rows(), 2, "108 and 200; 107 fell out of the top-3");
+        assert_eq!(top.threshold(), Some(108), "top-3 is now 200,109,108");
+
+        // a batch without a readable _timestamp passes through whole
+        let no_ts = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![arrow_schema::Field::new(
+                "other",
+                arrow_schema::DataType::Int64,
+                false,
+            )])),
+            vec![Arc::new(Int64Array::from(vec![1i64, 2]))],
+        )
+        .unwrap();
+        assert_eq!(
+            trim_batch_to_top_n(no_ts, &mut top).unwrap().unwrap().num_rows(),
+            2
+        );
+
+        // THE window clamp (live-stream correctness): frames are kept on
+        // FRAME-level overlap, so rows NEWER than the query window ride
+        // along in the same batches. They must not feed the threshold —
+        // an inflated threshold trims away rows that belong in the result.
+        let mut clamped = TopNTimestamps::new(2, (100, 200));
+        let b = trim_batch_to_top_n(make(vec![150, 160, 500, 501, 502]), &mut clamped)
+            .unwrap()
+            .expect("in-window rows survive despite newer out-of-window rows");
+        assert_eq!(
+            clamped.threshold(),
+            Some(150),
+            "threshold from in-window rows only — 500s are outside [100,200)"
+        );
+        assert_eq!(b.num_rows(), 2, "150 and 160 kept; 500s dropped by the mask");
+        // rows older than the window never occupy heap slots either
+        let mut older = TopNTimestamps::new(2, (100, 200));
+        let ts_old = Int64Array::from(vec![10i64, 20, 150]);
+        older.observe(&ts_old);
+        assert_eq!(older.threshold(), None, "only one in-window row observed");
+    }
+
+    /// End-to-end shape of the fix: wide star batches stream oldest-last
+    /// (metas sorted newest-first), limit 10 — the kept set stays far under
+    /// a budget the untrimmed tail would blow through, and the final kept
+    /// rows are a superset of the true top-10.
+    #[test]
+    fn test_top_n_trimmed_star_fits_a_budget_the_tail_would_trip() {
+        let schema = Arc::new(Schema::new(vec![
+            arrow_schema::Field::new("_timestamp", arrow_schema::DataType::Int64, false),
+            arrow_schema::Field::new("payload", arrow_schema::DataType::Utf8, true),
+        ]));
+        let make_batch = |start: i64, n: i64| {
+            let ts: Vec<i64> = (start..start + n).collect();
+            let vals: Vec<String> = ts.iter().map(|t| format!("p-{t}-{:0>256}", "")).collect();
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(ts)),
+                    Arc::new(StringArray::from(vals)),
+                ],
+            )
+            .unwrap()
+        };
+        let budget = 128 * 1024;
+        let mut top = TopNTimestamps::new(10, (0, i64::MAX));
+        let mut kept = Vec::new();
+        let mut kept_bytes = 0usize;
+        // 20 segments x 5000 rows, newest first; untrimmed this is ~28MB
+        for seg in (0..20).rev() {
+            let batch = make_batch(seg * 5_000, 5_000);
+            assert!(batch.get_array_memory_size() > budget, "test premise");
+            let Some(batch) = trim_batch_to_top_n(batch, &mut top).unwrap() else {
+                continue;
+            };
+            push_within_budget(
+                &mut kept,
+                &mut kept_bytes,
+                batch,
+                budget,
+                "org",
+                StreamType::Traces,
+                "default",
+            )
+            .expect("trimmed star candidates must fit the budget");
+        }
+        let mut all_ts: Vec<i64> = kept
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        all_ts.sort_unstable_by(|a, b| b.cmp(a));
+        assert!(all_ts.len() >= 10, "at least the top-10 survive");
+        assert_eq!(
+            &all_ts[..10],
+            &(99_990..100_000).rev().collect::<Vec<i64>>()[..],
+            "the true 10 newest timestamps all survive trimming"
+        );
+    }
+
     use arrow_schema::{DataType, Field};
     use datafusion::{physical_plan::collect, prelude::SessionContext};
-    use segment_wal::format::{SegmentHeader, encode_segment};
+    use segment_wal::format::{SegmentFrame, SegmentHeader, encode_segment};
 
     use super::*;
 
@@ -965,6 +1769,22 @@ mod tests {
         }
     }
 
+    /// One helper for the tests below: stream-scan an encoded segment with
+    /// no condition and every column needed (identity + time + empty-drop
+    /// behavior only).
+    fn scan_all(
+        encoded: &[u8],
+        org: &str,
+        stype: StreamType,
+        stream: &str,
+        range: (i64, i64),
+        needed: &[&str],
+    ) -> ScannedSegment {
+        let needed: HashSet<String> = needed.iter().map(|s| s.to_string()).collect();
+        scan_segment_object(encoded, org, stype, stream, range, None, &[], &needed)
+            .expect("scan segment")
+    }
+
     #[test]
     fn keep_stream_frames_filters_stream_identity_time_and_empties() {
         let frames = vec![
@@ -1041,10 +1861,28 @@ mod tests {
                 ts_batch("v", &[], Some(&[])),
             ),
         ];
-        let kept = keep_stream_frames(frames, "org1", StreamType::Logs, "app1", (100, 200));
-        let rows: usize = kept.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(kept.len(), 2);
+        let header = SegmentHeader {
+            node_uuid: "node-filter".to_string(),
+            seq: 9,
+            created_at: 1_700_000_000_000_000,
+        };
+        let encoded = encode_segment(&header, &frames).expect("encode segment");
+        let scanned = scan_all(
+            &encoded,
+            "org1",
+            StreamType::Logs,
+            "app1",
+            (100, 200),
+            &["_timestamp", "v"],
+        );
+        let rows: usize = scanned.kept.iter().map(|(_, b)| b.num_rows()).sum();
+        assert_eq!(scanned.kept.len(), 2);
         assert_eq!(rows, 3);
+        assert_eq!(scanned.rows_examined, 3, "only matching frames' rows are examined");
+        assert!(
+            scanned.kept.iter().all(|(exact, _)| *exact),
+            "no condition => every kept batch is trim-eligible"
+        );
     }
 
     #[test]
@@ -1149,10 +1987,15 @@ mod tests {
             ),
         ];
         let encoded = encode_segment(&header, &frames).expect("encode segment");
-        let decoded = decode_named(&encoded, "wal_segments/node-e2e/1").expect("decode segment");
-        assert_eq!(decoded.len(), 4);
-
-        let kept = keep_stream_frames(decoded, "org1", StreamType::Logs, "app1", (0, 500));
+        let scanned = scan_all(
+            &encoded,
+            "org1",
+            StreamType::Logs,
+            "app1",
+            (0, 500),
+            &["_timestamp", "code"],
+        );
+        let kept: Vec<RecordBatch> = scanned.kept.into_iter().map(|(_, b)| b).collect();
         assert_eq!(kept.len(), 2, "foreign stream and out-of-range dropped");
 
         // plan schema: `code` evolved to Utf8 (latest schema wins)
@@ -1213,12 +2056,22 @@ mod tests {
     }
 
     #[test]
-    fn decode_named_error_names_the_object() {
-        let err = decode_named(b"definitely not a segment", "wal_segments/node-x/7").unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("wal_segments/node-x/7"),
-            "error must name the object key: {msg}"
-        );
+    fn scan_surfaces_decode_failures() {
+        // the async wrapper adds the object key; the scan itself must
+        // surface the format-level failure as a hard error
+        let needed: HashSet<String> = HashSet::new();
+        let err = scan_segment_object(
+            b"definitely not a segment",
+            "org1",
+            StreamType::Logs,
+            "app1",
+            (0, 0),
+            None,
+            &[],
+            &needed,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("bad magic"), "unexpected error: {msg}");
     }
 }

@@ -58,16 +58,16 @@ use arrow::{
     datatypes::{DataType, Field, Schema, SchemaRef},
     record_batch::RecordBatch,
 };
-use tantivy_fst::MapBuilder;
 
 use crate::{
     container::{
-        BLOB_TAG_BLOOM, BLOB_TAG_DICT, BLOB_TAG_TERMS, BLOB_TYPE_BLOOM, BLOB_TYPE_DICT,
-        BLOB_TYPE_TERMS, DICT_LAYOUT_CELLS, DocsBlobEncoder, FIELD_TYPE_CS, FIELD_TYPE_FTS,
-        FIELD_TYPE_TERM, FieldEntry, KEY_LAYOUT_FID_V2, PROP_DICT_LAYOUT, PROP_FIELDS,
-        PROP_KEY_LAYOUT, PROP_PARTIAL_FIELDS, PROP_ROW_COUNT, PROP_ROW_GROUP_SIZE, PROP_TERM_COUNT,
-        PROP_TOKENIZER, PROP_VERSION, PROP_ZONE_MAP, TOKENIZER_ID, VIX_FORMAT_VERSION, VixOutput,
-        ZoneEntry, addressable_strategy, dict_strategy, finish_streamed_container,
+        BLOB_TAG_BLOOM, BLOB_TAG_DICT, BLOB_TAG_DICT_BLOCKS, BLOB_TAG_PLIST, BLOB_TAG_TERMS,
+        BLOB_TYPE_BLOOM, BLOB_TYPE_DICT, BLOB_TYPE_DICT_BLOCKS, BLOB_TYPE_PLIST, BLOB_TYPE_TERMS,
+        DICT_LAYOUT_BLOCKS, DocsBlobEncoder, FIELD_TYPE_CS, FIELD_TYPE_FTS, FIELD_TYPE_TERM,
+        FieldEntry, KEY_LAYOUT_FID_V2, PROP_DICT_LAYOUT, PROP_FIELDS, PROP_KEY_LAYOUT,
+        PROP_PARTIAL_FIELDS, PROP_PLIST_MIN_DOCS, PROP_ROW_COUNT, PROP_ROW_GROUP_SIZE,
+        PROP_TERM_COUNT, PROP_TOKENIZER, PROP_VERSION, PROP_ZONE_MAP, TOKENIZER_ID,
+        VIX_FORMAT_VERSION, VixOutput, ZoneEntry, addressable_strategy, finish_streamed_container,
         write_vortex_blob,
     },
     error::{Result, VixError},
@@ -159,8 +159,6 @@ pub struct VixWriterOptions {
     pub bloom_field_names: Vec<String>,
     /// False-positive probability of the per-file value blooms.
     pub bloom_fpp: f64,
-    /// Raw-term-byte budget per dictionary row group (its FST).
-    pub rg_term_bytes: usize,
     /// Target byte size of one postings row block (point-read granularity).
     pub postings_chunk_bytes: usize,
     /// **Raw** (non-fts) values longer than this many bytes are skipped and
@@ -221,18 +219,23 @@ pub struct VixWriterOptions {
     /// resides in memory; uploads stream from the spool. `None` (default)
     /// keeps the container in memory, the move-job shape.
     pub output_spool_dir: Option<std::path::PathBuf>,
-    /// Dictionary cells are cut at FIELD boundaries once the open cell
-    /// carries at least this many raw term bytes — big fields get their
-    /// own cells, small fields pack together, and a probe's fid range maps
-    /// to few cells. `0` disables field-aligned cuts (the merge shape). The
-    /// `rg_term_bytes` max-size cut applies regardless.
-    pub cell_min_bytes: usize,
+    /// Doc-count threshold at/above which a term's postings are written
+    /// OUT-OF-ROW into the `plist` blob: the terms cell becomes a 12-byte
+    /// `[u64 LE offset][u32 LE len]` pointer into that blob, whose bytes
+    /// there are the [`crate::postings::encode_record`] skip-table record
+    /// (a ranged reader can rank/probe the term by fetching a few KB
+    /// instead of a multi-MB inline cell). Dense elision takes precedence:
+    /// a term in every row keeps its EMPTY cell regardless of the
+    /// threshold. The threshold is persisted as the `plist_min_docs` file
+    /// property, and readers distinguish pointer from inline cells ONLY by
+    /// `doc_count >= threshold` — never by sniffing cell bytes. `0` (the
+    /// default) disables the feature entirely: no `plist` blob, no
+    /// property, byte-identical output to pre-plist writers.
+    pub postings_plist_min_docs: u32,
 }
 
 /// Default [`VixWriterOptions::docs_chunk_bytes`]: 4 MiB.
 pub const DEFAULT_DOCS_CHUNK_BYTES: usize = 4 * 1024 * 1024;
-/// Default [`VixWriterOptions::cell_min_bytes`]: 1 MiB.
-pub const DEFAULT_CELL_MIN_BYTES: usize = 1024 * 1024;
 /// Rows-per-chunk clamp bounds of the `docs` blob (see
 /// [`VixWriterOptions::docs_chunk_bytes`]). The floor is low so the byte
 /// budget governs wide rows too; with the 4 MiB default budget it only
@@ -261,7 +264,6 @@ impl Default for VixWriterOptions {
             column_store_field_names: Vec::new(),
             bloom_field_names: Vec::new(),
             bloom_fpp: crate::bloom::DEFAULT_FILE_BLOOM_FPP,
-            rg_term_bytes: 8 * 1024 * 1024,
             postings_chunk_bytes: 128 * 1024,
             max_raw_term_len: 65532,
             row_group_size: 0,
@@ -273,7 +275,7 @@ impl Default for VixWriterOptions {
             term_spill_dir: None,
             term_spill_bytes: 0,
             output_spool_dir: None,
-            cell_min_bytes: DEFAULT_CELL_MIN_BYTES,
+            postings_plist_min_docs: 0,
         }
     }
 }
@@ -369,9 +371,9 @@ pub struct VixWriter {
 
 /// The output of [`VixWriter::merge_input_indexes`], consumed by `finish`.
 struct PrebuiltIndex {
-    /// `(dict, terms)` blob bytes; `None` when the merged inputs have no
-    /// terms at all.
-    blobs: Option<(Vec<u8>, Vec<u8>)>,
+    /// The index blob bytes; `None` when the merged inputs have no terms
+    /// at all.
+    blobs: Option<IndexBlobs>,
     term_count: u64,
     /// Per-file value-bloom hashes collected by the merge workers.
     bloom: crate::bloom::BloomHashAcc,
@@ -833,8 +835,7 @@ impl VixWriter {
             &self.opts.bloom_field_names,
             total_rows,
             self.opts.postings_chunk_bytes,
-            self.opts.rg_term_bytes,
-            self.opts.cell_min_bytes,
+            self.opts.postings_plist_min_docs,
             threads,
         )?;
         for reader in inputs {
@@ -1557,22 +1558,14 @@ impl VixWriter {
                     .iter()
                     .filter_map(|n| self.term_field_ids.get(n).map(|id| (*id, n.clone())))
                     .collect();
-                let mut sink = TermSink::new(
-                    self.opts.postings_chunk_bytes,
-                    self.opts.rg_term_bytes,
-                    self.opts.cell_min_bytes,
-                )
-                .with_bloom(crate::bloom::BloomHashAcc::from_pairs(bloom_pairs));
-                // Dense elision: a term present in every doc gets an
-                // *empty* postings blob; `doc_count == row_count` tells
-                // the reader to synthesize the all-ones bitmap.
+                let mut sink = TermSink::new(self.opts.postings_chunk_bytes)
+                    .with_bloom(crate::bloom::BloomHashAcc::from_pairs(bloom_pairs))
+                    .with_plist_min_docs(self.opts.postings_plist_min_docs);
+                // The sink owns the cell policy (see [`TermSink::push_ids`]):
+                // dense elision first (a term in every doc keeps the empty
+                // cell), then the out-of-row plist threshold, then inline.
                 let mut emit = |key: &[u8], ids: Vec<u32>| -> Result<()> {
-                    let blob = if row_count > 0 && ids.len() as u64 == row_count {
-                        Vec::new()
-                    } else {
-                        postings::encode(&ids)?
-                    };
-                    sink.push(key, ids.len() as u32, &blob)
+                    sink.push_ids(key, &ids, row_count)
                 };
                 let resident = std::mem::take(&mut self.terms);
                 self.terms_bytes = 0;
@@ -1602,10 +1595,23 @@ impl VixWriter {
         // (`_timestamp` + `_source` at minimum).
         let mut blobs: Vec<(&'static str, &'static str, Vec<u8>)> = Vec::new();
         let mut index_size = 0u64;
-        if let Some((dict_blob, terms_blob)) = index_blobs {
-            index_size = (dict_blob.len() + terms_blob.len()) as u64;
-            blobs.push((BLOB_TYPE_DICT, BLOB_TAG_DICT, dict_blob));
-            blobs.push((BLOB_TYPE_TERMS, BLOB_TAG_TERMS, terms_blob));
+        if let Some(index) = index_blobs {
+            index_size = (index.dict.len() + index.dict_blocks.len() + index.terms.len()) as u64;
+            blobs.push((BLOB_TYPE_DICT, BLOB_TAG_DICT, index.dict));
+            blobs.push((
+                BLOB_TYPE_DICT_BLOCKS,
+                BLOB_TAG_DICT_BLOCKS,
+                index.dict_blocks,
+            ));
+            blobs.push((BLOB_TYPE_TERMS, BLOB_TAG_TERMS, index.terms));
+            // The out-of-row postings region: RAW concatenated
+            // `encode_record` bytes (pointer-addressed, deliberately not a
+            // Vortex file), present only when at least one pointer cell
+            // exists. Index data, so it counts into `index_size`.
+            if let Some(plist) = index.plist {
+                index_size += plist.len() as u64;
+                blobs.push((BLOB_TYPE_PLIST, BLOB_TAG_PLIST, plist));
+            }
         }
         // Per-file value blooms (byproduct of term emission, both paths).
         // Counted into index_size: the blob is index data, and file_list's
@@ -1642,12 +1648,23 @@ impl VixWriter {
                 serde_json::to_string(&self.partial_fields)?,
             ),
             (PROP_TOKENIZER.to_string(), TOKENIZER_ID.to_string()),
-            (PROP_DICT_LAYOUT.to_string(), DICT_LAYOUT_CELLS.to_string()),
+            (PROP_DICT_LAYOUT.to_string(), DICT_LAYOUT_BLOCKS.to_string()),
             // Stamped unconditionally: readers hard-error on an absent or
             // foreign key_layout instead of silently misreading the
             // field-major dictionary (container::require_supported_format).
             (PROP_KEY_LAYOUT.to_string(), KEY_LAYOUT_FID_V2.to_string()),
         ];
+        // Plist capability marker: written IFF the feature was enabled.
+        // Present ⇒ pointer cells may exist and `doc_count >= threshold`
+        // selects them; absent ⇒ every postings cell is inline. Written
+        // even when no term crossed the threshold (no `plist` blob then) —
+        // capability, not blob presence, is what the reader dispatches on.
+        if self.opts.postings_plist_min_docs > 0 {
+            properties.push((
+                PROP_PLIST_MIN_DOCS.to_string(),
+                self.opts.postings_plist_min_docs.to_string(),
+            ));
+        }
         // Only non-empty files get a zone table (an empty file has no chunks
         // and its decode path already returns the empty result).
         if !zone_map.is_empty() {
@@ -1948,14 +1965,28 @@ fn flush_terms_batch(
 /// identical encodings.
 pub(crate) struct TermSink {
     postings_chunk_bytes: usize,
-    rg_term_bytes: usize,
     terms_schema: SchemaRef,
     term_batches: Vec<RecordBatch>,
     doc_counts: Vec<u32>,
     postings_builder: BinaryBuilder,
     block_bytes: usize,
-    row_group: Option<RowGroupBuilder>,
-    dict: DictColumns,
+    /// The open dictionary block (see [`crate::dict_blocks`]): keys cut at
+    /// [`crate::dict_blocks::BLOCK_TARGET_BYTES`] of raw key bytes and at
+    /// every field boundary, so one block never spans fields and a field
+    /// probe touches exactly its own blocks.
+    dict_block: crate::dict_blocks::BlockBuilder,
+    dict_block_first_key: Vec<u8>,
+    dict_block_first_ordinal: u64,
+    /// This sink's concatenated encoded blocks (offsets sink-local;
+    /// [`write_index_blobs`] rebases on concatenation).
+    dict_blocks: Vec<u8>,
+    /// `(first_key, sink-local blocks offset, sink-local first ordinal)`
+    /// per flushed block, in key order.
+    dict_meta: Vec<(Vec<u8>, u64, u64)>,
+    /// First/last key pushed through this sink (parallel-merge range
+    /// ordering backstop in [`write_index_blobs`]).
+    first_key: Vec<u8>,
+    last_key: Vec<u8>,
     term_count: u64,
     /// Per-file value-bloom accumulation (empty = zero-cost no-op). Both
     /// build paths stream every distinct term through [`Self::push`], so
@@ -1964,40 +1995,120 @@ pub(crate) struct TermSink {
     /// so keys are converted before hashing.
     bloom: crate::bloom::BloomHashAcc,
     bloom_key_scratch: Vec<u8>,
-    /// See [`VixWriterOptions::cell_min_bytes`].
-    cell_min_bytes: usize,
+    /// See [`VixWriterOptions::postings_plist_min_docs`]; `0` = every cell
+    /// stays inline (the historical encoding, byte-identical).
+    plist_min_docs: u32,
+    /// This sink's out-of-row postings region: concatenated
+    /// [`postings::encode_record`] bytes, addressed by the pointer cells
+    /// pushed through [`Self::push_plist`]. Offsets are SINK-LOCAL —
+    /// [`write_index_blobs`] rebases them when it concatenates multiple
+    /// sinks' regions into the single `plist` blob.
+    plist: Vec<u8>,
 }
 
 impl TermSink {
-    pub(crate) fn new(
-        postings_chunk_bytes: usize,
-        rg_term_bytes: usize,
-        cell_min_bytes: usize,
-    ) -> Self {
+    pub(crate) fn new(postings_chunk_bytes: usize) -> Self {
         let terms_schema = Arc::new(Schema::new(vec![
             Field::new("doc_count", DataType::UInt32, false),
             Field::new("postings", DataType::Binary, false),
         ]));
         Self {
             postings_chunk_bytes,
-            rg_term_bytes,
             terms_schema,
             term_batches: Vec::new(),
             doc_counts: Vec::new(),
             postings_builder: BinaryBuilder::new(),
             block_bytes: 0,
-            row_group: None,
-            dict: DictColumns::default(),
+            dict_block: crate::dict_blocks::BlockBuilder::new(),
+            dict_block_first_key: Vec::new(),
+            dict_block_first_ordinal: 0,
+            dict_blocks: Vec::new(),
+            dict_meta: Vec::new(),
+            first_key: Vec::new(),
+            last_key: Vec::new(),
             term_count: 0,
             bloom: crate::bloom::BloomHashAcc::default(),
             bloom_key_scratch: Vec::new(),
-            cell_min_bytes,
+            plist_min_docs: 0,
+            plist: Vec::new(),
         }
+    }
+
+    /// Close the open dictionary block into the sink's blocks region.
+    fn flush_dict_block(&mut self) -> Result<()> {
+        if self.dict_block.is_empty() {
+            return Ok(());
+        }
+        let offset = self.dict_blocks.len() as u64;
+        let bytes = self.dict_block.finish();
+        self.dict_blocks.extend_from_slice(&bytes);
+        self.dict_meta.push((
+            std::mem::take(&mut self.dict_block_first_key),
+            offset,
+            self.dict_block_first_ordinal,
+        ));
+        Ok(())
     }
 
     pub(crate) fn with_bloom(mut self, bloom: crate::bloom::BloomHashAcc) -> Self {
         self.bloom = bloom;
         self
+    }
+
+    /// Enable out-of-row postings at/above `min_docs` docs (see
+    /// [`VixWriterOptions::postings_plist_min_docs`]); `0` keeps every cell
+    /// inline.
+    pub(crate) fn with_plist_min_docs(mut self, min_docs: u32) -> Self {
+        self.plist_min_docs = min_docs;
+        self
+    }
+
+    /// Whether a NON-dense term with `doc_count` docs goes out-of-row.
+    /// Callers must check dense elision FIRST — a term in every row keeps
+    /// the empty cell regardless of the threshold.
+    pub(crate) fn plist_eligible(&self, doc_count: u64) -> bool {
+        self.plist_min_docs > 0 && doc_count >= u64::from(self.plist_min_docs)
+    }
+
+    /// Push one term whose postings live OUT-OF-ROW: `record` (the
+    /// [`postings::encode_record`] bytes) is appended to this sink's plist
+    /// region and the terms cell becomes the 12-byte pointer to it. Only
+    /// for terms passing [`Self::plist_eligible`], and never for
+    /// dense-elided terms (both are the caller's contract; the reader
+    /// re-derives the same decisions from `doc_count` alone).
+    pub(crate) fn push_plist(&mut self, key: &[u8], doc_count: u32, record: &[u8]) -> Result<()> {
+        debug_assert!(self.plist_eligible(u64::from(doc_count)));
+        let len = u32::try_from(record.len()).map_err(|_| {
+            VixError::Writer(format!(
+                "plist record of {} bytes overflows the pointer cell's u32 length",
+                record.len()
+            ))
+        })?;
+        let cell = postings::encode_pointer_cell(self.plist.len() as u64, len);
+        self.plist.extend_from_slice(record);
+        self.push(key, doc_count, &cell)
+    }
+
+    /// Encode and push one term straight from its sorted doc ids, applying
+    /// the cell policy in precedence order:
+    ///
+    /// 1. **dense elision** — a term present in every row (`ids.len() == row_count`) keeps the
+    ///    EMPTY cell regardless of the plist threshold (the reader synthesizes the all-ones bitmap
+    ///    from `doc_count` alone),
+    /// 2. **out-of-row** — at/above [`Self::plist_eligible`]'s threshold the
+    ///    [`postings::encode_record`] bytes go to this sink's plist region and the cell is the
+    ///    12-byte pointer,
+    /// 3. **inline** — everything else stays the plain [`postings::encode`] blob, byte-identical to
+    ///    the pre-plist encoding.
+    pub(crate) fn push_ids(&mut self, key: &[u8], ids: &[u32], row_count: u64) -> Result<()> {
+        if row_count > 0 && ids.len() as u64 == row_count {
+            return self.push(key, ids.len() as u32, &[]);
+        }
+        if self.plist_eligible(ids.len() as u64) {
+            let record = postings::encode_record(ids)?;
+            return self.push_plist(key, ids.len() as u32, &record);
+        }
+        self.push(key, ids.len() as u32, &postings::encode(ids)?)
     }
 
     pub(crate) fn push(&mut self, key: &[u8], doc_count: u32, blob: &[u8]) -> Result<()> {
@@ -2018,39 +2129,27 @@ impl TermSink {
             self.block_bytes = 0;
         }
 
-        // Field-aligned cut: close the open cell BEFORE a key that starts
-        // a new field once the cell holds >= cell_min_bytes — cells then
-        // contain whole fields (or runs of small ones), so a field probe's
-        // key range intersects few cells instead of all of them.
-        if self.cell_min_bytes > 0
-            && let Some(state) = &self.row_group
-            && state.raw_bytes >= self.cell_min_bytes
-            && key.len() >= 2
-            && state.term_max.len() >= 2
-            && key[..2] != state.term_max[..2]
-            && let Some(state) = self.row_group.take()
+        // Block cuts: at the byte target, and ALWAYS at a field boundary
+        // (the composite key's first two bytes are the field id) — a block
+        // never spans fields, so a field probe's block range is exact.
+        let field_changed =
+            key.len() >= 2 && self.last_key.len() >= 2 && key[..2] != self.last_key[..2];
+        if !self.dict_block.is_empty()
+            && (self.dict_block.raw_bytes() >= crate::dict_blocks::BLOCK_TARGET_BYTES
+                || field_changed)
         {
-            state.finish_into(&mut self.dict)?;
+            self.flush_dict_block()?;
         }
-        let rg_full = {
-            let state = self.row_group.get_or_insert_with(|| RowGroupBuilder {
-                builder: MapBuilder::memory(),
-                first_ordinal: self.term_count,
-                term_min: key.to_vec(),
-                term_max: Vec::new(),
-                next_local: 0,
-                raw_bytes: 0,
-            });
-            state.builder.insert(key, state.next_local)?;
-            state.next_local += 1;
-            state.raw_bytes += key.len();
-            state.term_max.clear();
-            state.term_max.extend_from_slice(key);
-            state.raw_bytes >= self.rg_term_bytes
-        };
-        if rg_full && let Some(state) = self.row_group.take() {
-            state.finish_into(&mut self.dict)?;
+        if self.dict_block.is_empty() {
+            self.dict_block_first_key = key.to_vec();
+            self.dict_block_first_ordinal = self.term_count;
         }
+        self.dict_block.push(key)?;
+        if self.first_key.is_empty() {
+            self.first_key = key.to_vec();
+        }
+        self.last_key.clear();
+        self.last_key.extend_from_slice(key);
         self.term_count += 1;
         Ok(())
     }
@@ -2066,14 +2165,17 @@ impl TermSink {
             &mut self.postings_builder,
             &mut self.term_batches,
         )?;
-        if let Some(state) = self.row_group.take() {
-            state.finish_into(&mut self.dict)?;
-        }
+        self.flush_dict_block()?;
         Ok(TermSinkParts {
             term_batches: self.term_batches,
-            dict: self.dict,
+            dict_blocks: self.dict_blocks,
+            dict_meta: self.dict_meta,
+            first_key: self.first_key,
+            last_key: self.last_key,
             term_count: self.term_count,
             bloom: self.bloom,
+            plist_min_docs: self.plist_min_docs,
+            plist: self.plist,
         })
     }
 }
@@ -2081,144 +2183,191 @@ impl TermSink {
 /// A closed [`TermSink`]: everything but the blob writes.
 pub(crate) struct TermSinkParts {
     term_batches: Vec<RecordBatch>,
-    dict: DictColumns,
+    /// This part's encoded dictionary blocks (offsets part-local).
+    dict_blocks: Vec<u8>,
+    /// `(first_key, part-local offset, part-local first ordinal)` per block.
+    dict_meta: Vec<(Vec<u8>, u64, u64)>,
+    first_key: Vec<u8>,
+    last_key: Vec<u8>,
     term_count: u64,
     pub(crate) bloom: crate::bloom::BloomHashAcc,
+    /// The sink's plist threshold — every part of one build carries the
+    /// same value ([`write_index_blobs`] enforces it: the rebase relies on
+    /// one uniform `doc_count` predicate to spot pointer cells).
+    plist_min_docs: u32,
+    /// The sink's out-of-row region, offsets local to this sink.
+    plist: Vec<u8>,
+}
+
+/// The encoded index blobs of one build ([`write_index_blobs`]).
+pub(crate) struct IndexBlobs {
+    /// The dictionary block INDEX (raw [`crate::dict_blocks`] index bytes,
+    /// NOT a Vortex file).
+    pub(crate) dict: Vec<u8>,
+    /// The dictionary BLOCKS region (raw concatenated encoded blocks).
+    pub(crate) dict_blocks: Vec<u8>,
+    pub(crate) terms: Vec<u8>,
+    /// The out-of-row postings region: RAW concatenated
+    /// [`postings::encode_record`] bytes, addressed by the terms table's
+    /// 12-byte pointer cells (deliberately NOT a Vortex file — readers
+    /// slice/range-fetch `[offset..offset+len]` directly). `None` when no
+    /// pointer cell exists (feature off, or no term crossed the threshold).
+    pub(crate) plist: Option<Vec<u8>>,
 }
 
 /// Write the `dict`/`terms` blobs from sink parts covering consecutive,
 /// disjoint, ascending key ranges: dictionary `first_ordinal`s are rebased
-/// by each part's global term offset, then everything is encoded exactly as
-/// a single sink would. Returns `(blobs, total term count)`; no terms at all
-/// -> `(None, 0)`.
+/// by each part's global term offset, per-part plist regions concatenate
+/// with their pointer cells' OFFSETS rebased likewise, then everything is
+/// encoded exactly as a single sink would. Returns `(blobs, total term
+/// count)`; no terms at all -> `(None, 0)`.
 #[allow(clippy::type_complexity)]
 pub(crate) fn write_index_blobs(
     parts: Vec<TermSinkParts>,
     encode_threads: usize,
-) -> Result<(Option<(Vec<u8>, Vec<u8>)>, u64, crate::bloom::BloomHashAcc)> {
+) -> Result<(Option<IndexBlobs>, u64, crate::bloom::BloomHashAcc)> {
     let terms_schema = Arc::new(Schema::new(vec![
         Field::new("doc_count", DataType::UInt32, false),
         Field::new("postings", DataType::Binary, false),
     ]));
-    let dict_schema = Arc::new(Schema::new(vec![
-        Field::new("first_ordinal", DataType::UInt64, false),
-        Field::new("term_min", DataType::Binary, false),
-        Field::new("term_max", DataType::Binary, false),
-        Field::new("fst", DataType::Binary, false),
-    ]));
     let mut term_batches: Vec<RecordBatch> = Vec::new();
-    let mut dict = DictColumns::default();
+    let mut index = crate::dict_blocks::IndexBuilder::new();
+    let mut dict_blocks: Vec<u8> = Vec::new();
     let mut term_count = 0u64;
     let mut bloom = crate::bloom::BloomHashAcc::default();
     // Structural backstop for parallel-merge partitioning bugs: parts MUST
     // cover consecutive, disjoint, ascending key ranges. Writing them
-    // unchecked produced files whose dictionary directory violates the
-    // reader's row-group validation (prod corruption 2026-07-29) — fail the
-    // merge instead, the job retries and the inputs stay intact.
-    let mut prev_last_max: Option<&[u8]> = None;
+    // unchecked produced files whose dictionary violates the reader's
+    // index validation (prod corruption 2026-07-29) — fail the merge
+    // instead, the job retries and the inputs stay intact.
+    let mut prev_last: Option<&[u8]> = None;
     for part in &parts {
-        if let (Some(prev), Some(first)) = (prev_last_max, part.dict.term_mins.first()) {
-            if first.as_slice() <= prev {
+        if let (Some(prev), false) = (prev_last, part.first_key.is_empty()) {
+            if part.first_key.as_slice() <= prev {
                 return Err(VixError::Writer(format!(
                     "merge range parts out of order: a range starts at key {:02x?} but the previous range ended at {:02x?}",
-                    &first[..first.len().min(24)],
+                    &part.first_key[..part.first_key.len().min(24)],
                     &prev[..prev.len().min(24)],
                 )));
             }
         }
-        if let Some(last) = part.dict.term_maxs.last() {
-            prev_last_max = Some(last.as_slice());
+        if !part.last_key.is_empty() {
+            prev_last = Some(part.last_key.as_slice());
         }
     }
+    // One build = one option set: the pointer-cell rebase below spots
+    // pointer cells purely by `doc_count >= plist_min_docs`, which is only
+    // sound when every part applied the same threshold.
+    let plist_min_docs = parts.first().map_or(0, |part| part.plist_min_docs);
+    if parts
+        .iter()
+        .any(|part| part.plist_min_docs != plist_min_docs)
+    {
+        return Err(VixError::Writer(
+            "internal: merge range parts disagree on plist_min_docs".to_string(),
+        ));
+    }
+    let mut plist: Vec<u8> = Vec::new();
     for mut part in parts {
         bloom.merge(std::mem::take(&mut part.bloom));
-        for first_ordinal in &mut part.dict.first_ordinals {
-            *first_ordinal += term_count;
+        // Out-of-row postings: each sink's region starts at offset 0, so
+        // every pointer cell of a part that lands AFTER already-collected
+        // plist bytes must be rebased by them. Pointer cells are identified
+        // STRUCTURALLY (doc_count >= threshold, non-empty cell) — exactly
+        // how the reader will resolve them.
+        let plist_base = plist.len() as u64;
+        if plist_base > 0 && !part.plist.is_empty() {
+            rebase_pointer_cells(&mut part.term_batches, plist_min_docs, plist_base)?;
         }
-        dict.first_ordinals.append(&mut part.dict.first_ordinals);
-        dict.term_mins.append(&mut part.dict.term_mins);
-        dict.term_maxs.append(&mut part.dict.term_maxs);
-        dict.fsts.append(&mut part.dict.fsts);
+        plist.append(&mut part.plist);
+        // rebase this part's block offsets and ordinals into the global
+        // regions, in order — the index builder sees one ascending stream
+        let blocks_base = dict_blocks.len() as u64;
+        for (first_key, offset, first_ordinal) in &part.dict_meta {
+            index.push_block(first_key, blocks_base + offset, term_count + first_ordinal)?;
+        }
+        dict_blocks.extend_from_slice(&part.dict_blocks);
         term_batches.append(&mut part.term_batches);
         term_count += part.term_count;
     }
     if term_count == 0 {
         return Ok((None, 0, bloom));
     }
-    // One pushed batch per dict row: with `dict_strategy` the `fst` column
-    // gets one chunk per row group, so a lazy reader point-reads exactly the
-    // FST cells a query touches (the directory columns are collected into
-    // whole-column chunks regardless of the push granularity).
-    let dict_batch = dict.into_record_batch(&dict_schema)?;
-    let dict_row_batches: Vec<RecordBatch> = (0..dict_batch.num_rows())
-        .map(|row| dict_batch.slice(row, 1))
-        .collect();
-    let dict_blob = write_vortex_blob(
-        &dict_schema,
-        &dict_row_batches,
-        dict_strategy(),
-        encode_threads,
-    )?;
     let terms_blob = write_vortex_blob(
         &terms_schema,
         &term_batches,
         addressable_strategy(),
         encode_threads,
     )?;
-    Ok((Some((dict_blob, terms_blob)), term_count, bloom))
+    Ok((
+        Some(IndexBlobs {
+            dict: index.finish(),
+            dict_blocks,
+            terms: terms_blob,
+            // non-empty ⇔ at least one pointer cell was pushed (a record is
+            // never zero bytes: its skip-table header alone is 4)
+            plist: (!plist.is_empty()).then_some(plist),
+        }),
+        term_count,
+        bloom,
+    ))
+}
+
+/// Rebase the pointer cells of one sink's term batches by `plist_base`
+/// bytes: a term row with `doc_count >= plist_min_docs` and a NON-EMPTY
+/// postings cell is a pointer cell (dense-elided terms stay empty even
+/// above the threshold; nothing below it is ever a pointer) — its
+/// sink-local `u64` offset moves to the concatenated `plist` blob's space.
+/// Every such cell must be exactly 12 bytes; anything else is a corrupt
+/// sink and fails the build. All other cells pass through untouched, so a
+/// build without pointer cells is byte-identical to the pre-plist output.
+fn rebase_pointer_cells(
+    batches: &mut [RecordBatch],
+    plist_min_docs: u32,
+    plist_base: u64,
+) -> Result<()> {
+    debug_assert!(plist_min_docs > 0, "a plist region requires a threshold");
+    for batch in batches.iter_mut() {
+        let doc_counts = batch
+            .column_by_name("doc_count")
+            .and_then(|column| column.as_any().downcast_ref::<UInt32Array>())
+            .ok_or_else(|| {
+                VixError::Writer("internal: terms batch lacks a u32 doc_count column".to_string())
+            })?;
+        let postings_column = batch
+            .column_by_name("postings")
+            .and_then(|column| column.as_any().downcast_ref::<BinaryArray>())
+            .ok_or_else(|| {
+                VixError::Writer("internal: terms batch lacks a binary postings column".to_string())
+            })?;
+        let mut rebased = BinaryBuilder::new();
+        for row in 0..batch.num_rows() {
+            let cell = postings_column.value(row);
+            if doc_counts.value(row) >= plist_min_docs && !cell.is_empty() {
+                let (offset, len) = postings::decode_pointer_cell(cell)
+                    .map_err(|e| VixError::Writer(format!("internal: {e}")))?;
+                let offset = offset.checked_add(plist_base).ok_or_else(|| {
+                    VixError::Writer(format!(
+                        "plist offset {offset} + base {plist_base} overflows u64"
+                    ))
+                })?;
+                rebased.append_value(postings::encode_pointer_cell(offset, len));
+            } else {
+                rebased.append_value(cell);
+            }
+        }
+        let doc_counts = Arc::clone(
+            batch
+                .column_by_name("doc_count")
+                .expect("checked just above"),
+        );
+        *batch =
+            RecordBatch::try_new(batch.schema(), vec![doc_counts, Arc::new(rebased.finish())])?;
+    }
+    Ok(())
 }
 
 /// In-progress dictionary row group.
-struct RowGroupBuilder {
-    builder: MapBuilder<Vec<u8>>,
-    first_ordinal: u64,
-    term_min: Vec<u8>,
-    term_max: Vec<u8>,
-    next_local: u64,
-    raw_bytes: usize,
-}
-
-impl RowGroupBuilder {
-    fn finish_into(self, dict: &mut DictColumns) -> Result<()> {
-        let fst = self.builder.into_inner()?;
-        dict.first_ordinals.push(self.first_ordinal);
-        dict.term_mins.push(self.term_min);
-        dict.term_maxs.push(self.term_max);
-        dict.fsts.push(fst);
-        Ok(())
-    }
-}
-
-/// Accumulated `dict` blob columns (one row per row group).
-#[derive(Default)]
-struct DictColumns {
-    first_ordinals: Vec<u64>,
-    term_mins: Vec<Vec<u8>>,
-    term_maxs: Vec<Vec<u8>>,
-    fsts: Vec<Vec<u8>>,
-}
-
-impl DictColumns {
-    fn into_record_batch(self, schema: &SchemaRef) -> Result<RecordBatch> {
-        let batch = RecordBatch::try_new(
-            Arc::clone(schema),
-            vec![
-                Arc::new(UInt64Array::from(self.first_ordinals)),
-                Arc::new(BinaryArray::from_iter_values(
-                    self.term_mins.iter().map(Vec::as_slice),
-                )),
-                Arc::new(BinaryArray::from_iter_values(
-                    self.term_maxs.iter().map(Vec::as_slice),
-                )),
-                Arc::new(BinaryArray::from_iter_values(
-                    self.fsts.iter().map(Vec::as_slice),
-                )),
-            ],
-        )?;
-        Ok(batch)
-    }
-}
-
 /// Typed view over the numeric/bool column flavors whose values emit tagged
 /// canonical terms. Narrow integers are widened losslessly on construction;
 /// floats keep their own width — the canonical text of an `f32` differs from
@@ -2346,52 +2495,203 @@ mod field_cut_tests {
     use super::*;
     use crate::query::write_composite;
 
-    /// Field-aligned cuts: once a cell holds >= cell_min_bytes, the next
-    /// FIELD starts a new cell — so one fat field cannot smear across the
-    /// small fields around it, and a probe's fid range maps to few cells.
+    /// Dictionary blocks never span a field boundary: the sink cuts the
+    /// open block at every field change (and at the byte target), so a
+    /// field probe's block range is exactly its own field's blocks.
     #[test]
-    fn cells_cut_at_field_boundaries() {
-        let mut sink = TermSink::new(1 << 20, 8 << 20, 64);
+    fn blocks_cut_at_field_boundaries() {
+        let mut sink = TermSink::new(1 << 20);
         let mut key = Vec::new();
-        // field 1: ~40 tokens x 8 bytes ≈ 400 raw bytes >> 64-byte min
         for i in 0..40 {
             write_composite(&mut key, format!("tok{i:04}").as_bytes(), 1);
             sink.push(&key, 1, &[0u8]).unwrap();
         }
-        // field 2: a couple of keys — must start in a FRESH cell
         for i in 0..2 {
             write_composite(&mut key, format!("val{i}").as_bytes(), 2);
             sink.push(&key, 1, &[0u8]).unwrap();
         }
         let parts = sink.into_parts().unwrap();
-        assert!(
-            parts.dict.term_mins.len() >= 2,
-            "expected a field-boundary cut"
-        );
-        for (min, max) in parts.dict.term_mins.iter().zip(&parts.dict.term_maxs) {
-            assert_eq!(min[..2], max[..2], "a cell must never span two fields here");
+        assert!(parts.dict_meta.len() >= 2, "expected a field-boundary cut");
+        // every block's keys stay within one field: check via first keys +
+        // a full decode of each block
+        for (i, (first_key, offset, _)) in parts.dict_meta.iter().enumerate() {
+            let end = parts
+                .dict_meta
+                .get(i + 1)
+                .map(|(_, next, _)| *next as usize)
+                .unwrap_or(parts.dict_blocks.len());
+            let block = &parts.dict_blocks[*offset as usize..end];
+            let fid = first_key[..2].to_vec();
+            crate::dict_blocks::block_scan(block, |_, k| {
+                assert_eq!(k[..2], fid[..], "a block must never span two fields");
+                true
+            })
+            .unwrap();
         }
-        let last = parts.dict.term_mins.last().unwrap();
+        let last = &parts.dict_meta.last().unwrap().0;
         assert_eq!(
             &last[..2],
             &2u16.to_be_bytes(),
-            "field 2 starts its own cell"
+            "field 2 starts its own block"
         );
     }
 
-    /// cell_min_bytes = 0 (the merge shape) keeps the old behavior: only
-    /// the max-size cut applies, fields pack into shared cells.
+    /// Ordinals are implicit and contiguous across blocks: block b's
+    /// first_ordinal equals the running key count.
     #[test]
-    fn zero_min_bytes_ignores_field_boundaries() {
-        let mut sink = TermSink::new(1 << 20, 8 << 20, 0);
+    fn block_ordinals_are_contiguous() {
+        let mut sink = TermSink::new(1 << 20);
         let mut key = Vec::new();
+        let mut total = 0u64;
         for fid in [1u16, 2, 3] {
             for i in 0..10 {
                 write_composite(&mut key, format!("t{i:02}").as_bytes(), fid);
                 sink.push(&key, 1, &[0u8]).unwrap();
+                total += 1;
             }
         }
         let parts = sink.into_parts().unwrap();
-        assert_eq!(parts.dict.term_mins.len(), 1, "no field cuts when disabled");
+        let mut running = 0u64;
+        for (i, (_, offset, first_ordinal)) in parts.dict_meta.iter().enumerate() {
+            assert_eq!(*first_ordinal, running, "block {i}");
+            let end = parts
+                .dict_meta
+                .get(i + 1)
+                .map(|(_, next, _)| *next as usize)
+                .unwrap_or(parts.dict_blocks.len());
+            let block = &parts.dict_blocks[*offset as usize..end];
+            let mut n = 0u64;
+            crate::dict_blocks::block_scan(block, |_, _| {
+                n += 1;
+                true
+            })
+            .unwrap();
+            running += n;
+        }
+        assert_eq!(running, total);
+    }
+}
+
+#[cfg(test)]
+mod plist_sink_tests {
+    use bytes::Bytes;
+
+    use super::*;
+    use crate::{
+        container::{BlobHandle, RowSelection, column_binary, column_u64, scan_blob},
+        query::write_composite,
+    };
+
+    /// Decode every term row of an encoded `terms` blob against the
+    /// concatenated plist region, resolving cells exactly as the reader
+    /// does: empty + `doc_count > 0` ⇒ dense (`0..row_count`); non-empty +
+    /// `doc_count >= threshold` ⇒ 12-byte pointer into `plist`; everything
+    /// else inline. Returns `(doc_count, ids, raw cell)` per term.
+    fn decode_terms(
+        terms: Vec<u8>,
+        plist: &[u8],
+        threshold: u32,
+        row_count: u64,
+    ) -> Vec<(u64, Vec<u32>, Vec<u8>)> {
+        let handle = BlobHandle::Mem(Bytes::from(terms));
+        let mut out = Vec::new();
+        for batch in scan_blob(&handle, Some(&["doc_count", "postings"]), RowSelection::All)
+            .expect("scan terms blob")
+        {
+            let doc_counts = column_u64(&batch, "doc_count").unwrap();
+            let cells = column_binary(&batch, "postings").unwrap();
+            for (row, &doc_count) in doc_counts.iter().enumerate() {
+                let cell = cells.value(row);
+                let mut ids = Vec::new();
+                if cell.is_empty() && doc_count > 0 {
+                    ids.extend(0..row_count as u32);
+                } else if threshold > 0 && doc_count >= u64::from(threshold) {
+                    assert_eq!(cell.len(), 12, "pointer cell must be exactly 12 bytes");
+                    let (offset, len) = postings::decode_pointer_cell(cell).unwrap();
+                    let record = &plist[offset as usize..(offset + u64::from(len)) as usize];
+                    postings::decode_each(
+                        postings::record_blob(record).unwrap(),
+                        doc_count as usize,
+                        |doc| {
+                            ids.push(doc);
+                            Ok(())
+                        },
+                    )
+                    .unwrap();
+                } else {
+                    postings::decode_each(cell, doc_count as usize, |doc| {
+                        ids.push(doc);
+                        Ok(())
+                    })
+                    .unwrap();
+                }
+                out.push((doc_count, ids, cell.to_vec()));
+            }
+        }
+        out
+    }
+
+    /// Multi-sink offset rebasing: a parallel merge produces one sink per
+    /// key range, each accumulating a plist region that starts at ITS OWN
+    /// offset 0. After [`write_index_blobs`] concatenates the parts, every
+    /// pointer cell must resolve to its record inside the single blob —
+    /// sink B's local offsets shifted by exactly sink A's region bytes,
+    /// while inline and dense-elided cells pass through untouched.
+    #[test]
+    fn multi_sink_plist_rebase_resolves_all_pointers() {
+        const THRESHOLD: u32 = 3;
+        const ROW_COUNT: u64 = 1_000;
+        let new_sink = || TermSink::new(1 << 20).with_plist_min_docs(THRESHOLD);
+        let mut expected: Vec<Vec<u32>> = Vec::new();
+        let mut push = |sink: &mut TermSink, fid: u16, token: &[u8], ids: Vec<u32>| {
+            let mut key = Vec::new();
+            write_composite(&mut key, token, fid);
+            sink.push_ids(&key, &ids, ROW_COUNT).unwrap();
+            expected.push(ids);
+        };
+
+        let bb: Vec<u32> = (0..800).step_by(2).collect(); // 400 ids
+        let b_aa: Vec<u32> = (5..905).step_by(3).collect(); // 300 ids
+        let mut sink_a = new_sink();
+        push(&mut sink_a, 1, b"aa", vec![1, 5]); // inline (2 < 3)
+        push(&mut sink_a, 1, b"bb", bb.clone()); // pointer at region offset 0
+        push(&mut sink_a, 1, b"cc", vec![3, 7, 11, 400]); // pointer, offset > 0
+        let mut sink_b = new_sink();
+        push(&mut sink_b, 2, b"aa", b_aa); // pointer at LOCAL offset 0 -> rebased
+        push(&mut sink_b, 2, b"dd", (0..ROW_COUNT as u32).collect()); // dense: empty cell
+        push(&mut sink_b, 2, b"zz", vec![9]); // inline
+
+        let (blobs, term_count, _bloom) = write_index_blobs(
+            vec![sink_a.into_parts().unwrap(), sink_b.into_parts().unwrap()],
+            0,
+        )
+        .unwrap();
+        assert_eq!(term_count, 6);
+        let IndexBlobs { terms, plist, .. } = blobs.unwrap();
+        let plist = plist.expect("pointer cells were pushed");
+
+        let decoded = decode_terms(terms, &plist, THRESHOLD, ROW_COUNT);
+        assert_eq!(decoded.len(), expected.len());
+        for (term, ((doc_count, ids, _), want)) in decoded.iter().zip(&expected).enumerate() {
+            assert_eq!(*doc_count as usize, want.len(), "term {term} doc_count");
+            assert_eq!(ids, want, "term {term} postings");
+        }
+
+        // sink B's first pointer (term 3) rebased by exactly sink A's
+        // region bytes; sink A's own offsets stayed local (term 1 at 0)
+        let sink_a_region = postings::encode_record(&bb).unwrap().len()
+            + postings::encode_record(&[3, 7, 11, 400]).unwrap().len();
+        let (offset, _) = postings::decode_pointer_cell(&decoded[1].2).unwrap();
+        assert_eq!(offset, 0, "sink A's first pointer keeps offset 0");
+        let (offset, _) = postings::decode_pointer_cell(&decoded[3].2).unwrap();
+        assert_eq!(
+            offset as usize, sink_a_region,
+            "sink B's local offset 0 must rebase by sink A's region"
+        );
+        // dense above the threshold stayed the empty cell
+        assert!(
+            decoded[4].2.is_empty(),
+            "dense term must keep its empty cell"
+        );
     }
 }
