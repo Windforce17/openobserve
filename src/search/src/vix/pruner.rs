@@ -226,6 +226,78 @@ fn group_suffix_bounds(file_groups: &[Vec<FileKey>], ascend: bool) -> Vec<i64> {
     bounds
 }
 
+/// #27 metadata pre-prune for `SimpleSelect` + condition-ALL: using
+/// file_list metadata alone (`min_ts`/`max_ts`/`records` — no opens, no
+/// fetches, runs before the index files are even cached), drop every file
+/// that provably cannot contribute to the global top-`limit`. Returns the
+/// number of files dropped.
+///
+/// Soundness: rows of a file FULLY inside the query window are all in the
+/// window — and all match under condition ALL — and all sort at-or-beyond
+/// the file's own worst bound (`min_ts` for DESC). Sorting those files
+/// best-first and prefix-summing `records` yields a bound `T` (the
+/// bound-completing file's `min_ts` for DESC) with at least `limit`
+/// in-window matching rows at-or-beyond `T`. A file whose whole range sorts
+/// strictly worse than `T` (`max_ts < T` for DESC, `min_ts > T` for ASC)
+/// cannot place a row in the top-`limit`. Every bound-contributing file
+/// survives its own test (`max_ts >= min_ts >= T`).
+pub(super) fn metadata_preprune(
+    trace_id: &str,
+    file_list_map: &mut HashMap<String, FileKey>,
+    limit: usize,
+    ascend: bool,
+    time_range: (i64, i64),
+) -> usize {
+    if limit == 0 || file_list_map.is_empty() {
+        return 0;
+    }
+    let (start_time, end_time) = time_range;
+    // (worst-sorting bound, records) of the files fully inside the window
+    let mut covered: Vec<(i64, i64)> = file_list_map
+        .values()
+        .filter(|f| f.meta.min_ts >= start_time && f.meta.max_ts < end_time && f.meta.records > 0)
+        .map(|f| {
+            if ascend {
+                (f.meta.max_ts, f.meta.records)
+            } else {
+                (f.meta.min_ts, f.meta.records)
+            }
+        })
+        .collect();
+    if ascend {
+        covered.sort_unstable();
+    } else {
+        covered.sort_unstable_by_key(|&(bound, _)| std::cmp::Reverse(bound));
+    }
+    let mut sum: i64 = 0;
+    let mut threshold: Option<i64> = None;
+    for (bound, records) in covered {
+        sum = sum.saturating_add(records);
+        if sum >= limit as i64 {
+            threshold = Some(bound);
+            break;
+        }
+    }
+    let Some(threshold) = threshold else {
+        return 0; // fully-covered files cannot guarantee `limit` rows
+    };
+    let before = file_list_map.len();
+    file_list_map.retain(|_, f| {
+        if ascend {
+            f.meta.min_ts <= threshold
+        } else {
+            f.meta.max_ts >= threshold
+        }
+    });
+    let dropped = before - file_list_map.len();
+    if dropped > 0 {
+        log::info!(
+            "[trace_id {trace_id}] search->vix: simple select metadata pre-prune dropped {dropped} of {before} files (limit {limit}, bound {threshold})",
+        );
+    }
+    dropped
+}
+
 #[cfg(test)]
 mod tests {
     use config::meta::stream::FileMeta;
@@ -435,6 +507,79 @@ mod tests {
         );
         // candidates at ts 1 and 5 sort strictly before the bound 10
         assert!(pruner.should_prune_remaining_groups("test", 0));
+    }
+
+    #[test]
+    fn test_metadata_preprune_desc_drops_time_dominated_files() {
+        // covered A (900..950, 60 rows) + B (800..880, 60 rows) guarantee
+        // 120 >= limit 100 rows at ts >= 800; C sorts entirely below
+        let mut files = build_file_map(vec![
+            with_records(create_file_key(900, 950), 60),
+            with_records(create_file_key(800, 880), 60),
+            with_records(create_file_key(100, 200), 100_000),
+        ]);
+        let dropped = metadata_preprune("test", &mut files, 100, false, (0, 1000));
+        assert_eq!(dropped, 1);
+        assert_eq!(
+            sorted_keys(&files),
+            vec!["file_800_880".to_string(), "file_900_950".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_metadata_preprune_straddling_files_never_contribute_but_survive() {
+        // D straddles the window start: its records must NOT count toward
+        // the bound, but its max_ts >= T keeps it in the list
+        let mut files = build_file_map(vec![
+            with_records(create_file_key(900, 950), 200),
+            with_records(create_file_key(-50, 850), 1_000_000),
+            with_records(create_file_key(100, 300), 10),
+        ]);
+        let dropped = metadata_preprune("test", &mut files, 100, false, (0, 1000));
+        // bound T = 900 (first covered file alone guarantees 200 >= 100):
+        // the straddler (max 850) and file_100_300 both sort below it
+        assert_eq!(dropped, 2);
+        assert_eq!(sorted_keys(&files), vec!["file_900_950".to_string()]);
+    }
+
+    #[test]
+    fn test_metadata_preprune_insufficient_guarantee_is_noop() {
+        let mut files = build_file_map(vec![
+            with_records(create_file_key(900, 950), 5),
+            with_records(create_file_key(100, 200), 5),
+        ]);
+        let dropped = metadata_preprune("test", &mut files, 100, false, (0, 1000));
+        assert_eq!(dropped, 0);
+        assert_eq!(files.len(), 2);
+    }
+
+    #[test]
+    fn test_metadata_preprune_boundary_tie_survives() {
+        // a file whose max_ts EQUALS the bound may hold winning rows
+        let mut files = build_file_map(vec![
+            with_records(create_file_key(800, 950), 100),
+            with_records(create_file_key(700, 800), 50),
+        ]);
+        let dropped = metadata_preprune("test", &mut files, 100, false, (0, 1000));
+        assert_eq!(dropped, 0, "max_ts == bound is not strictly below it");
+    }
+
+    #[test]
+    fn test_metadata_preprune_asc() {
+        let mut files = build_file_map(vec![
+            with_records(create_file_key(10, 50), 200),
+            with_records(create_file_key(60, 90), 10),
+            with_records(create_file_key(500, 900), 10),
+        ]);
+        let dropped = metadata_preprune("test", &mut files, 100, true, (0, 1000));
+        // bound T = 50: files starting after it cannot hold oldest rows
+        assert_eq!(dropped, 2);
+        assert_eq!(sorted_keys(&files), vec!["file_10_50".to_string()]);
+    }
+
+    fn with_records(mut file: FileKey, records: i64) -> FileKey {
+        file.meta.records = records;
+        file
     }
 
     #[test]

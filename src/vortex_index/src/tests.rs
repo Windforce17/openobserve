@@ -3595,6 +3595,7 @@ mod ranged {
         data: Bytes,
         fetches: AtomicUsize,
         bytes: AtomicU64,
+        batch_calls: AtomicUsize,
     }
 
     impl CountingSource {
@@ -3603,6 +3604,7 @@ mod ranged {
                 data,
                 fetches: AtomicUsize::new(0),
                 bytes: AtomicU64::new(0),
+                batch_calls: AtomicUsize::new(0),
             })
         }
 
@@ -3612,6 +3614,12 @@ mod ranged {
 
         fn bytes(&self) -> u64 {
             self.bytes.load(Ordering::SeqCst)
+        }
+
+        /// Number of `fetch_many` ROUND TRIPS (each still ticks `fetches`
+        /// once per range, like the trait's default chaining).
+        fn batch_calls(&self) -> usize {
+            self.batch_calls.load(Ordering::SeqCst)
         }
     }
 
@@ -3630,6 +3638,23 @@ mod ranged {
                 Err(anyhow::anyhow!("range {range:?} out of bounds"))
             };
             async move { out }.boxed()
+        }
+
+        fn fetch_many(
+            &self,
+            ranges: Vec<Range<u64>>,
+        ) -> BoxFuture<'static, anyhow::Result<Vec<Bytes>>> {
+            self.batch_calls.fetch_add(1, Ordering::SeqCst);
+            // same behavior as the trait default (each range ticks
+            // `fetches` via `fetch`), plus the round-trip counter above
+            let futs: Vec<_> = ranges.into_iter().map(|r| self.fetch(r)).collect();
+            Box::pin(async move {
+                let mut out = Vec::with_capacity(futs.len());
+                for fut in futs {
+                    out.push(fut.await?);
+                }
+                Ok(out)
+            })
         }
 
         fn describe(&self) -> String {
@@ -3772,6 +3797,164 @@ mod ranged {
             "fetched {} of {} bytes",
             source.bytes(),
             file_size
+        );
+    }
+
+    /// #27: a condition-ALL evaluation must not touch the dictionary at
+    /// all — the unconditioned SimpleSelect/TopN shapes were paying an
+    /// MB-class dict-index fetch per ranged file for a structure the query
+    /// never reads.
+    #[test]
+    fn ranged_all_query_needs_no_dictionary_io() {
+        let data = build_large_core_file();
+        let mem = VixReader::open(data.clone()).unwrap();
+        let source = CountingSource::new(data);
+        let ranged =
+            VixReader::open_ranged(Arc::clone(&source) as Arc<dyn VixRangeSource>).unwrap();
+        let open_fetches = source.fetches();
+        let open_bytes = source.bytes();
+
+        let expect = mem.eval(&VixQuery::All).unwrap();
+        let got = ranged.eval(&VixQuery::All).unwrap();
+        assert_eq!(got.count_set_bits(), expect.count_set_bits());
+        assert_eq!(got.count_set_bits(), 100_000);
+        assert_eq!(
+            source.fetches(),
+            open_fetches,
+            "condition-ALL eval must issue ZERO fetches beyond open"
+        );
+        assert_eq!(source.bytes(), open_bytes);
+
+        // the straddling-window clamp stays chunk-granular: the zone table
+        // is footer-resident, only boundary chunks decode their rows
+        let before = source.fetches();
+        let range = ranged.timestamp_range(1_000_100, 1_050_000).unwrap();
+        assert_eq!(
+            bits_to_set(&range),
+            bits_to_set(&mem.timestamp_range(1_000_100, 1_050_000).unwrap())
+        );
+        let clamp_fetches = source.fetches() - before;
+        assert!(
+            clamp_fetches <= 6,
+            "zone-clamped timestamp_range used {clamp_fetches} fetches"
+        );
+    }
+
+    /// #27: a field-scoped dictionary walk (the unfiltered TopN/Distinct
+    /// value enumeration) must bulk-load its block span instead of one
+    /// ~4KB round trip per block — 78 files x ~350 point reads was the
+    /// trace-list fetch storm. The 100k-distinct `svc` field spans
+    /// hundreds of blocks; the walk must stay within a few round trips.
+    #[test]
+    fn ranged_field_walk_coalesces_dict_block_fetches() {
+        let data = build_large_core_file();
+        let mem = VixReader::open(data.clone()).unwrap();
+        let source = CountingSource::new(data);
+        let ranged =
+            VixReader::open_ranged(Arc::clone(&source) as Arc<dyn VixRangeSource>).unwrap();
+
+        let expect = mem
+            .field_value_counts("svc")
+            .unwrap()
+            .expect("svc is dictionary-eligible");
+        assert_eq!(expect.len(), 100_000, "one group per distinct svc value");
+        let before = source.fetches();
+        let got = ranged
+            .field_value_counts("svc")
+            .unwrap()
+            .expect("svc is dictionary-eligible");
+        assert_eq!(got, expect);
+        let walk_fetches = source.fetches() - before;
+        assert!(
+            ranged.term_row_group_count() > 1 || walk_fetches < 40,
+            "sanity: the fixture should span many dict blocks"
+        );
+        // dict index + key-term lookup + the bulk span runs + the
+        // doc_count column chunks — NOT one round trip per block
+        assert!(
+            walk_fetches <= 48,
+            "field walk should coalesce its block span, used {walk_fetches} fetches"
+        );
+        eprintln!(
+            "[field-walk budget] fetches={walk_fetches} bytes={}",
+            source.bytes()
+        );
+    }
+
+    /// #27: a multi-term union over out-of-row (plist) postings resolves
+    /// every pointer record through ONE batched round trip instead of a
+    /// point fetch per term.
+    #[test]
+    fn ranged_plist_union_batches_record_fetches() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("svc", DataType::Utf8, true),
+        ]));
+        // big enough that the PLIST blob itself lives OUTSIDE the 64 KiB
+        // open tail — small trailing blobs are swallowed by the tail
+        // fetch, become memory-resident slices, and would never exercise
+        // the ranged batch path. 2000 fat values -> ~2000 pointer records
+        // of postings, comfortably past the tail.
+        let rows = 40_000usize;
+        let opts = VixWriterOptions {
+            postings_plist_min_docs: 8,
+            ..Default::default()
+        };
+        // rows stored newest-first, matching the storage convention
+        let ts: Vec<i64> = (0..rows as i64).map(|i| 2_000_000 - i).collect();
+        let values: Vec<String> = (0..2000).map(|v| format!("val_{v:04}")).collect();
+        let svc: Vec<&str> = (0..rows).map(|i| values[i % 2000].as_str()).collect();
+        let mut rng = StdRng::seed_from_u64(0x715A);
+        let sources: Vec<String> = (0..rows)
+            .map(|i| {
+                let pad: String = (0..16)
+                    .map(|_| format!("{:08x}", rng.random::<u32>()))
+                    .collect();
+                format!(
+                    "{{\"_timestamp\":{},\"svc\":\"{}\",\"pad\":\"{pad}\"}}",
+                    ts[i], svc[i]
+                )
+            })
+            .collect();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(ts)),
+                Arc::new(StringArray::from(svc)),
+            ],
+        )
+        .unwrap();
+        let mut writer = VixWriter::new(&schema, opts, false);
+        writer
+            .push_batch_with_source(
+                &batch,
+                &StringArray::from_iter_values(sources.iter().map(String::as_str)),
+                None,
+            )
+            .unwrap();
+        let data = Bytes::from(writer.finish().unwrap());
+        assert!(
+            data.len() > 64 * 1024,
+            "fixture must outgrow the 64 KiB open tail ({} bytes)",
+            data.len()
+        );
+
+        let mem = VixReader::open(data.clone()).unwrap();
+        let source = CountingSource::new(data);
+        let ranged =
+            VixReader::open_ranged(Arc::clone(&source) as Arc<dyn VixRangeSource>).unwrap();
+
+        // all 2000 values (20 docs each >= threshold 8) carry pointer
+        // cells; the prefix union walks them through postings_union
+        let query = prefix(Some("svc"), "val_");
+        let expect = mem.eval(&query).unwrap();
+        assert_eq!(expect.count_set_bits(), rows);
+        let before_batches = source.batch_calls();
+        let got = ranged.eval(&query).unwrap();
+        assert_eq!(bits_to_set(&got), bits_to_set(&expect));
+        assert!(
+            source.batch_calls() > before_batches,
+            "plist records must resolve through a batched round trip"
         );
     }
 

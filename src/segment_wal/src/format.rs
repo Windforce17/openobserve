@@ -147,10 +147,14 @@ fn write_len_prefixed(buf: &mut Vec<u8>, bytes: &[u8], what: &str) -> Result<(),
 /// recoverable tail.
 pub fn decode_segment(bytes: &[u8]) -> Result<(SegmentHeader, Vec<SegmentFrame>), anyhow::Error> {
     let mut frames = Vec::new();
-    let header = decode_segment_filtered(bytes, |_| true, |frame| {
-        frames.push(frame);
-        Ok(())
-    })?;
+    let header = decode_segment_filtered(
+        bytes,
+        |_| true,
+        |frame| {
+            frames.push(frame);
+            Ok(())
+        },
+    )?;
     Ok((header, frames))
 }
 
@@ -950,9 +954,30 @@ mod tests {
     fn filtered_decode_skips_unwanted_and_verifies_all_crcs() {
         let h = header();
         let frames = vec![
-            frame("org1", StreamType::Traces, "default", 10, 20, batch_i64("v", &[1, 2, 3])),
-            frame("org1", StreamType::Logs, "default", 10, 20, batch_i64("v", &[4, 5])),
-            frame("org1", StreamType::Traces, "other", 30, 40, batch_i64("v", &[6])),
+            frame(
+                "org1",
+                StreamType::Traces,
+                "default",
+                10,
+                20,
+                batch_i64("v", &[1, 2, 3]),
+            ),
+            frame(
+                "org1",
+                StreamType::Logs,
+                "default",
+                10,
+                20,
+                batch_i64("v", &[4, 5]),
+            ),
+            frame(
+                "org1",
+                StreamType::Traces,
+                "other",
+                30,
+                40,
+                batch_i64("v", &[6]),
+            ),
         ];
         let encoded = encode_segment(&h, &frames).unwrap();
 
@@ -992,10 +1017,14 @@ mod tests {
 
         // want-nothing over a clean segment: header parses, no frames, no error
         let mut none = 0usize;
-        decode_segment_filtered(&encoded, |_| false, |_| {
-            none += 1;
-            Ok(())
-        })
+        decode_segment_filtered(
+            &encoded,
+            |_| false,
+            |_| {
+                none += 1;
+                Ok(())
+            },
+        )
         .unwrap();
         assert_eq!(none, 0);
     }
@@ -1007,7 +1036,14 @@ mod tests {
         let h = header();
         let encoded = encode_segment(
             &h,
-            &[frame("orgX", StreamType::Logs, "s1", 111, 222, batch_i64("v", &[7, 8]))],
+            &[frame(
+                "orgX",
+                StreamType::Logs,
+                "s1",
+                111,
+                222,
+                batch_i64("v", &[7, 8]),
+            )],
         )
         .unwrap();
         let mut infos: Vec<(String, i64, i64, u32)> = Vec::new();

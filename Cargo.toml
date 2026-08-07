@@ -226,6 +226,9 @@ multer.workspace = true
 rcgen.workspace = true
 
 [workspace]
+# vendored path dep, deliberately NOT a member: its own test suite pins
+# upstream behavior our local patch changes (see its VENDORED.md)
+exclude = ["crates/datafusion-functions-json"]
 members = [
     "src/api",
     "src/api_management",
@@ -377,7 +380,10 @@ datafusion-functions-aggregate-common = "54"
 # Local checkout of the openobserve fork at rev 0df53d710425cc91cf109e77a050bbe1e374e4fe
 # plus the negative-number fix (json_get_int/json_get_float errored on
 # `Peek::Minus`, extracting every negative value stored in `_source` as NULL).
-datafusion-functions-json = { path = "../datafusion-functions-json" }
+# vendored (crates/datafusion-functions-json/VENDORED.md): carries a local
+# negative-number extraction patch; the [patch.crates-io] below unifies its
+# datafusion requirement onto the same git rev
+datafusion-functions-json = { path = "crates/datafusion-functions-json" }
 expect-test = "1.4"
 arrow = { version = "58", features = ["ipc_compression", "prettyprint"] }
 arrow-flight = "58"

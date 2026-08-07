@@ -132,6 +132,24 @@ pub async fn vix_search(
         .drain(..)
         .map(|f| (f.key.clone(), f))
         .collect::<HashMap<_, _>>();
+    // #27: a SimpleSelect over condition-ALL bounds its winners from
+    // file_list metadata alone — files that provably cannot reach the
+    // top-`limit` are dropped before they are cached, opened, or scanned
+    // (zero index fetches for them).
+    if let Some(IndexOptimizeMode::SimpleSelect(limit, ascend)) = &idx_optimize_mode
+        && *limit > 0
+        && index_condition
+            .as_ref()
+            .is_some_and(|condition| condition.is_condition_all())
+    {
+        pruner::metadata_preprune(
+            trace_id,
+            &mut file_list_map,
+            *limit,
+            *ascend,
+            query.time_range,
+        );
+    }
     // Only core files carry an index (the data file itself). Legacy
     // parquet/vortex files — including v1-era ones with a sibling index
     // object still in storage — are index-less: they keep the DataFusion
@@ -874,27 +892,31 @@ async fn search_vix_index(
             row_count,
             row_group_size,
         } => {
-            match guard_matched_rows(trace_id, parquet_file, candidates.len(), row_count)? {
-                Some(result) => {
-                    return match result {
-                        VixSearchResult::NoMatch => {
-                            if !cache_key.is_empty() {
-                                vix_result_cache::GLOBAL_CACHE.put(cache_key, CacheEntry::NoMatch);
-                            }
-                            Ok((key, result, false))
-                        }
-                        _ => Ok((String::new(), result, true)),
-                    };
+            if candidates.is_empty() || parquet_file.meta.records == 0 {
+                // zero matches is deterministic per (condition, file)
+                if !cache_key.is_empty() {
+                    vix_result_cache::GLOBAL_CACHE.put(cache_key, CacheEntry::NoMatch);
                 }
-                // candidates are exact by construction (no skipped conditions)
-                None => (
-                    VixSearchResult::SelectCandidates {
-                        candidates: Arc::new(candidates),
-                        row_group_size,
-                    },
-                    false,
-                ),
+                return Ok((key, VixSearchResult::NoMatch, false));
             }
+            // NO percent guard here (#27): candidates are bounded by the
+            // query limit and merged into the exact global top-N — the
+            // guard was pushing a small file's WHOLE row set to the scan
+            // branch in place of its <= limit winning rows.
+            if row_count != parquet_file.meta.records as u64 {
+                return Err(anyhow::anyhow!(
+                    "vix index row_count {row_count} does not match file records {}",
+                    parquet_file.meta.records,
+                ));
+            }
+            // candidates are exact by construction (no skipped conditions)
+            (
+                VixSearchResult::SelectCandidates {
+                    candidates: Arc::new(candidates),
+                    row_group_size,
+                },
+                false,
+            )
         }
         RawVixResult::Histogram {
             histogram,
@@ -2215,10 +2237,16 @@ mod tests {
         };
         let t = Instant::now();
         let count = reader.count(&query).unwrap();
-        eprintln!("cold TokenAnyField count: {:?} (count={count})", t.elapsed());
+        eprintln!(
+            "cold TokenAnyField count: {:?} (count={count})",
+            t.elapsed()
+        );
         let t = Instant::now();
         let count2 = reader.count(&query).unwrap();
-        eprintln!("warm TokenAnyField count: {:?} (count={count2})", t.elapsed());
+        eprintln!(
+            "warm TokenAnyField count: {:?} (count={count2})",
+            t.elapsed()
+        );
     }
 
     /// Deep-merge-scale isolation bench (run with --ignored --nocapture):
@@ -3900,7 +3928,11 @@ mod review_tests {
             "review",
             &reader,
             &condition,
-            Some(IndexOptimizeMode::SimpleDistinct("svc".to_string(), 10, true)),
+            Some(IndexOptimizeMode::SimpleDistinct(
+                "svc".to_string(),
+                10,
+                true,
+            )),
             (0, 2000),
             true,
             None,

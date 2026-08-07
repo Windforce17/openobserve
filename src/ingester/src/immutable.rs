@@ -697,17 +697,27 @@ mod tests {
 
         // fresh progress on each attempt: this exercises the filesystem
         // fallback ("target exists"), not the in-process marks
-        commit_staged_files(&FsCommitOps, &wal, std::slice::from_ref(&par), &no_progress(1))
-            .await
-            .unwrap();
+        commit_staged_files(
+            &FsCommitOps,
+            &wal,
+            std::slice::from_ref(&par),
+            &no_progress(1),
+        )
+        .await
+        .unwrap();
         assert!(parquet.is_file());
         assert!(!wal.exists());
         assert!(!wal.with_extension("lock").exists());
 
         // the wedge: every retry used to die here on remove_file(wal) NotFound
-        commit_staged_files(&FsCommitOps, &wal, std::slice::from_ref(&par), &no_progress(1))
-            .await
-            .unwrap();
+        commit_staged_files(
+            &FsCommitOps,
+            &wal,
+            std::slice::from_ref(&par),
+            &no_progress(1),
+        )
+        .await
+        .unwrap();
         assert_eq!(std::fs::read(&parquet).unwrap(), b"parquet-bytes");
         assert_eq!(std::fs::read_dir(&par_dir).unwrap().count(), 1);
         assert!(!wal.with_extension("lock").exists());
@@ -722,9 +732,14 @@ mod tests {
         std::fs::write(&wal, b"wal").unwrap();
         let par = dir.join("gone.par");
 
-        let err = commit_staged_files(&FsCommitOps, &wal, std::slice::from_ref(&par), &no_progress(1))
-            .await
-            .unwrap_err();
+        let err = commit_staged_files(
+            &FsCommitOps,
+            &wal,
+            std::slice::from_ref(&par),
+            &no_progress(1),
+        )
+        .await
+        .unwrap_err();
         // neither .par nor .parquet exists: not an already-done step
         assert!(matches!(err, crate::errors::Error::RenameFileError { .. }));
 
@@ -739,9 +754,14 @@ mod tests {
         // the stream-delete flow removed files/<org>/<stream_type>/<stream>
         let par = dir.join("files/org/logs/s/0/h1/a.par");
 
-        commit_staged_files(&FsCommitOps, &wal, std::slice::from_ref(&par), &no_progress(1))
-            .await
-            .unwrap();
+        commit_staged_files(
+            &FsCommitOps,
+            &wal,
+            std::slice::from_ref(&par),
+            &no_progress(1),
+        )
+        .await
+        .unwrap();
         assert!(!wal.exists());
         assert!(!wal.with_extension("lock").exists());
 
@@ -809,7 +829,8 @@ mod tests {
 
         async fn rename_par(&self, par_path: &Path, parquet_path: &Path) -> Result<()> {
             if par_path == self.fail_path && !self.failed.swap(true, Ordering::SeqCst) {
-                self.inner.record(format!("rename_par_fail:{}", par_path.display()));
+                self.inner
+                    .record(format!("rename_par_fail:{}", par_path.display()));
                 return Err(crate::errors::Error::RenameFileError {
                     source: io::Error::other("injected rename failure"),
                     path: par_path.to_path_buf(),

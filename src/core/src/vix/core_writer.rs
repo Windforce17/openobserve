@@ -1295,6 +1295,31 @@ fn read_timestamp_columns(
             if timestamps.null_count() > 0 {
                 return Err(anyhow::anyhow!("core file {key} has null _timestamp rows"));
             }
+            // #27 armor: the k-way merge — and the scan layer's declared
+            // per-file ordering plus its first/last-row min/max stats — is
+            // conditional on every input being internally `_timestamp`
+            // DESC. Every writer upholds it but nothing records or checks
+            // it; a violated input would silently corrupt the merged
+            // order, the derived stats, and top-N candidate selection.
+            // Reject loudly instead (same discipline as write_index_blobs
+            // hard-rejecting out-of-order parts). Degenerate rows
+            // (ts <= 0) are exempt: the merge cleanses them before order
+            // matters, mirroring the mover's backstop.
+            let mut prev: Option<(usize, i64)> = None;
+            for (row, &ts) in timestamps.values().iter().enumerate() {
+                if ts <= 0 {
+                    continue;
+                }
+                if let Some((prev_row, prev_ts)) = prev
+                    && ts > prev_ts
+                {
+                    return Err(anyhow::anyhow!(
+                        "core file {key} violates the _timestamp DESC row order at rows \
+                         {prev_row}..={row} ({prev_ts} then {ts}): refusing to merge",
+                    ));
+                }
+                prev = Some((row, ts));
+            }
             Ok(timestamps)
         })
         .collect()
@@ -2405,6 +2430,50 @@ mod tests {
         bytes::Bytes::from(
             vortex_index::test_support::finish_ignoring_timestamp_guard(writer).unwrap(),
         )
+    }
+
+    /// #27 armor: a merge input whose rows violate the `_timestamp` DESC
+    /// storage convention is rejected loudly by BOTH merge flavors — a
+    /// silent pass-through would corrupt the merged order, the
+    /// first/last-row stats the scan layer derives, and top-N selection.
+    #[tokio::test]
+    async fn merge_rejects_ascending_input() {
+        let fts = vec!["log".to_string()];
+        let make = |ts: Vec<i64>, logs: Vec<&str>| {
+            build_core_file(
+                vec![
+                    Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+                    Field::new("log", DataType::Utf8, true),
+                ],
+                vec![
+                    Arc::new(Int64Array::from(ts)),
+                    Arc::new(StringArray::from(logs)),
+                ],
+                &fts,
+                vec![],
+                None,
+            )
+        };
+        let good = make(vec![100, 50], vec!["a", "b"]);
+        let bad = make(vec![10, 60, 40], vec!["x", "y", "z"]);
+        let latest_schema = Schema::new(vec![
+            Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+            Field::new("log", DataType::Utf8, true),
+        ]);
+        let inputs = vec![("good.vix".to_string(), good), ("bad.vix".to_string(), bad)];
+        let err = merge_core_files(&as_inputs(&inputs), &latest_schema, &fts, &[], &[])
+            .expect_err("ascending input must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("violates the _timestamp DESC row order") && msg.contains("bad.vix"),
+            "unexpected error: {msg}"
+        );
+        let err = merge_core_files_rebuild(&as_inputs(&inputs), &latest_schema, &fts, &[], &[])
+            .expect_err("ascending input must be rejected by the rebuild flavor");
+        assert!(
+            format!("{err:#}").contains("violates the _timestamp DESC row order"),
+            "rebuild flavor shares the ordering armor"
+        );
     }
 
     /// (b) The compactor k-way merge over 3 synthetic core files: global

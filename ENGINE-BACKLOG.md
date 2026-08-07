@@ -267,14 +267,18 @@ note: always quote matched-count + files context with timings.
 4. Hour-job splitting across nodes (only extreme backlogs; low prio).
 5. Dotted service.name residue in otel logs pipeline (collector transform).
 6. Fork publishing = anonymous squash chain to Windforce17/openobserve
-   branch vix-arch (remote `windforce`; author/committer `anonymous
-   <anonymous@users.noreply.github.com>`, commit-tree on top of the
-   previous chain head, fast-forward push, NEVER identity/session
-   links). Chain head 4bfc6434d4 published; NEXT commit (tree ==
-   ea5b1fef9a: block dict + fetch gate + #19 + #20) is built on local
-   branch `fork-published` awaiting push — ambient gh credential has
-   no write access to the fork (owner's Windforce17 token required):
-   `git push windforce fork-published:vix-arch`.
+   branch vix-arch. REMOTE NAMING since 2026-08-07: the fork is this
+   box's ONLY git remote and it is named `origin` (the upstream
+   openobserve/openobserve remote was removed; `windforce` was renamed
+   to `origin`). NEVER push work branches to it — publishing is ONLY
+   the squash procedure: `git fetch origin vix-arch` FIRST, commit-tree
+   the current tree parented on FETCH_HEAD, author/committer `anonymous
+   <anonymous@users.noreply.github.com>`, generic feature-summary
+   message, fast-forward push only, NEVER identity/session links, never
+   force-push. Chain head df60f9091b published 2026-08-07 (== tree of
+   local c95687b221). gh on this box holds both accounts: switch with
+   `gh auth switch --user Windforce17` to push, then switch back to
+   wangzhichen-manus.
 7. Watch: ingester-4 OOMKilled 2x 2026-07-28 21:34Z (boot+burst, self-
    healed) — recurrence means explicit ZO_MEM_TABLE_MAX_SIZE.
 8. Vortex capability review findings → see VORTEX-REVIEW.md (2026-07-29).
@@ -1017,3 +1021,139 @@ exact seeks were 7-8 fetches/230-440ms each, one straggler follower ate
 ~8.5s (logs rotated before capture; consistent with serialized cold
 per-file lookups). The get_ranges coalescing lever covers this variant;
 wave-pruning does not (no limit to satisfy).
+Third specimen (dev watch capture 12:59Z, trace 019fdc4cd8d0... — this
+was the .73 work's own baseline replay): SimpleTopN(["trace_id"], 100,
+false) over 24h, leader 117.6s COLD; one follower 361 fetches/4.71MB in
+102.9s = ~285ms PER FETCH (fetch-gate/S3-client contention with the
+same query's parallel work) — fetch reduction pays twice: fewer round
+trips AND less self-contention. Warm repeats 1.2-1.6s. top_n hits
+31020 for LIMIT 100.
+
+ROOT CAUSES (code-verified 2026-08-07, .73 work):
+- SPECIMEN 1+3 WERE SimpleTopN, NOT the timestamp-ordered SimpleSelect:
+  the `top_n hits:` log text is printed only by MultiResult::TopN — the
+  trace-list GROUP BY trace_id shape. Its per-file eval enumerates the
+  ENTIRE field dictionary via scan_key_range = ONE ~4KB point fetch per
+  dict block (~350 blocks/file x 78 files = the 27k storm), serialized
+  through the 16-permit gate at S3 latency.
+- The plain ORDER BY _timestamp LIMIT shape (SimpleSelect) HAD waves +
+  pruning on paper, but partition_vix_files' time-partition transpose
+  degenerates to file_groups:1 whenever files OVERLAP in time (every
+  live window: l0_multi + hour merges) — no early stop, every file
+  evaluated; pruning only trimmed the scan afterwards. Even disjoint
+  layouts transposed into window-spanning groups that prune poorly.
+- VixQuery::All (condition-ALL) paid an MB-class dict-INDEX fetch per
+  ranged file via prefetch_query_fsts — a structure All never reads
+  (sealed replay: 33 fetches/23.91MB idx phase for zero benefit).
+- guard_matched_rows applied its percent bail to SelectCandidates:
+  a small file's <=limit exact candidates got kicked WHOLE-FILE to the
+  scan branch (sealed replay scanned 150k rows for a 10k limit).
+- Fetch-count attribution caveat (evidence discipline): fetches issued
+  through a reader memoized by an EARLIER query tick that query's
+  counters — cold runs / fresh readers are the honest measurements.
+
+FIXED IN TREE (ships as .73):
+1. scan_key_range bulk-loads its block span (resident index bounds the
+   last reachable block; missing-block runs -> ONE block_fetch_many,
+   8MB chunks, small spans published to the block cache) — 27k point
+   reads collapse to a few MB-sized round trips per file. Same batching
+   for out-of-row plist pointer records in postings_union +
+   field_value_counts_filtered (one fetch_many per file instead of one
+   fetch per term).
+2. best_first_waves replaces the transpose for SimpleSelect: files
+   sorted max_ts DESC (min_ts ASC for ascend), doubling waves 4,8,...
+   capped at target_partitions; existing suffix-bound pruner fires
+   after wave 1 in the common case. Overlap only weakens bounds, never
+   correctness; needle worst case pays O(log) sequential rounds.
+3. Metadata pre-prune (SimpleSelect + condition-ALL): fully-in-window
+   files' (min_ts, records) prefix-sum a bound T; files provably below
+   the top-N are dropped BEFORE cache/open/eval — zero index fetches
+   for them. Plus: All-queries skip the dictionary entirely
+   (prefetch_query_fsts point-leaf gate).
+4. SelectCandidates percent guard removed (candidates are limit-bounded
+   and exactly merged; row_count mismatch check kept).
+5. MERGE ARMOR: read_timestamp_columns now hard-rejects any merge input
+   violating _timestamp DESC (both merge flavors) — the DESC invariant
+   is load-bearing (declared file_sort_order, first/last-row stats,
+   candidate selection) but was unrecorded and unchecked. Writer-order
+   precondition VERIFIED for all three writer paths (L0 build, legacy
+   mover, compactor k-way merge, + WAL parquet): everything writes
+   GLOBAL per-file _timestamp DESC — the kickoff's "ascending"
+   assumption was inverted, so "arithmetic tails" are arithmetic HEADS.
+DELIBERATELY NOT DONE: time-waving SimpleTopN — count-ordered group-bys
+need every file's contribution for the merged counts to be right;
+early-stopping by time would bias counts, not just order (reply to the
+dev-watch note in specimen 3). The structural TopN lever is a follow-up:
+doc_count-heap top-k for UNFILTERED single-field TopN on string-only
+fields (stream the field's doc_count ordinal range into a k-heap, then
+resolve only the k winning keys — skips the value-enumeration walk AND
+its allocations entirely); also the FILTERED dictionary TopN still
+decodes every value's postings (fine for low-cardinality cs fallbacks,
+atrocious for trace_id-class fields) — same follow-up family.
+SHIP LOG: .73 rolled to dev 2026-08-07 ~14:30Z and was rolled back ~25
+min later (argocd-dev-ops #231) — NOT a #27 defect: the roll's
+SIGKILLed old pods exposed #28 below (query outage on ANY version).
+Evidence captured in the .73 window before the rollback: TopN
+trace-list cold 6,576ms on freshly-restarted queriers vs 117,757ms
+cold on .72 (17.9x), zero merge-armor firings fleet-wide, segment
+pipeline normal. Re-shipped as .74 = .73 + the #28 fix (dev-ops #232,
+merged after answering the review's two P1s; image digest
+sha256:68e16991dcd9..., engine commit 02a9d3bf15c5).
+DEV-VERIFIED .74 (2026-08-07 ~16:0xZ, fresh fleet 0-5% cached,
+traces/default 24h, median-of-3, log-line evidence in scratchpad
+replay/after74*):
+- TopN trace-list (GROUP BY trace_id LIMIT 100, the specimen shape):
+  per-follower vix eval 27,117 fetches/103s -> 167-236 fetches/1.1-1.6s
+  (~130x fewer round trips, ~70x faster); bytes rose 233MB->375-541MB
+  by design (bulk spans; round trips were the pathology); warm result
+  cache floor visible at 0 fetches/1ms. End-to-end 117.8s -> 8.5s on
+  the cold fleet (warms with cache population); file_num: 0 both ways.
+- SimpleSelect live 24h LIMIT 10000: metadata pre-prune "dropped 94 of
+  98 files" / "80 of 86" BEFORE any IO; file_groups 1-2 post-prune;
+  is_add_filter_back FALSE (was true) with row_nums ~10-20k exact
+  winners (was 60k-150k over-inclusion + whole-file scans); per-follower
+  vix 3-9 fetches/79-334ms (was 21-33 fetches incl. useless MB-class
+  dict-index loads). took median 907ms -> 635ms live, 1272 -> 803
+  sealed (cold 1939 -> 1087).
+- Merge armor: 0 firings fleet-wide since roll. Segment pipeline
+  normal (build batches in=17 built=17, tail seconds-deep).
+- #28 verified live: the rollback's stale registrations produced
+  "health check failed 3 times, remove it" on schedule and searches
+  recovered; a force-killed (grace 0) ingester caused ZERO failed
+  probes across 130s. (Synthetic-kill registrations cleaned via the
+  normal death path; the fix covers the roll-orphaned class.)
+Prod PR: devops-argocd-prod-ops #373 (from branch zhichen).
+BUILD NOTE: the workspace's datafusion-functions-json sibling now lives
+IN-TREE at crates/datafusion-functions-json (VENDORED.md records base
+rev 0df53d71 + the local negative-number patch) — the old external
+checkout carried that patch unpublished and did not survive the box
+move; the review_negative_numbers e2e-level test caught it.
+
+## #28 cluster health sweep never evicts nodes an observer never saw healthy (2026-08-07, dev outage during the .73 roll — FIXED in tree, ships .74)
+Symptom: after the .73 roll, every dev search failed — first 400s
+("tcp connect error ... ConnectionRefused" against a SIGKILLed old
+ingester's registration), then ~130s hangs once the dead pod's IP was
+reused (SYN blackhole). The #231 rollback to .72 did NOT fix it: the
+rollback's own SIGKILLed .73 pods left registrations the fresh .72
+fleet dialed identically (probe measured 136s hang on .72).
+Root cause (infra/src/cluster/mod.rs check_nodes_status): the failure
+counter only incremented for nodes already in NODES_HEALTH_CHECK, and
+nodes were only ADDED there by the success branch — so an observer that
+never saw the node healthy (every pod after a full-fleet roll) skipped
+it forever. Prod rolls masked it: long-lived observers had the entry.
+Graceful terminations mask it too (the node dereg-s itself); only
+hard-killed pods (probe kills, OOM, spot reclaim, grace-expiry SIGKILL
+during rolls) expose it.
+Fix (b1803460c1): entry().or_insert(0) in the failure branch — dead
+nodes evict after failed_times (3) sweeps (~node_heartbeat_ttl/2 each,
+~45-60s total) regardless of prior observations; a live-but-slow node
+self-heals via its next keep-alive Put. Regression test:
+health_sweep_evicts_nodes_never_seen_healthy.
+Verify on .74: the #231 repro — hard-kill (SIGKILL) one ingester pod,
+run any search: expect <=1 min of failures, then "health check failed 3
+times, remove it" in observer logs and searches recover.
+RESIDUAL (follow-up candidates): (a) during the ~1 min pre-eviction
+window fan-outs still dial the dead node — a short gRPC/HTTP CONNECT
+timeout + retry-elsewhere would shrink the blast radius to ms; (b) the
+NATS KV obs_nodes entry outlives the process (no lease-TTL expiry) —
+eviction is per-observer view only.

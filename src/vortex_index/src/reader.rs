@@ -505,8 +505,13 @@ impl VixReader {
     /// Warm the dictionary for `query`: parse the index (one fetch) and
     /// pull the blocks its POINT leaves resolve to into the block cache.
     /// Range/pattern leaves fetch on demand during their walks.
+    ///
+    /// A query WITHOUT point leaves skips the dictionary INDEX load too:
+    /// `All`-condition evaluations (unconditioned SimpleSelect/TopN shapes)
+    /// were paying an MB-class fetch per ranged file for a structure they
+    /// never touch (#27).
     fn prefetch_query_fsts(&self, query: &VixQuery) -> Result<()> {
-        if self.term_count == 0 {
+        if self.term_count == 0 || !Self::query_has_point_leaves(query) {
             return Ok(());
         }
         let index = self.dict_index()?;
@@ -538,11 +543,7 @@ impl VixReader {
                 let fetched = crate::source::block_fetch_many(ranged.source.as_ref(), ranges)?;
                 let mut cache = self.block_cache.lock().expect("poisoned");
                 for (b, bytes) in missing.into_iter().zip(fetched) {
-                    if cache.0.insert(b, bytes.clone()).is_none() {
-                        cache.1.push_back(b);
-                        self.dict_loaded_bytes
-                            .fetch_add(bytes.len(), Ordering::Relaxed);
-                    }
+                    self.cache_dict_block(&mut cache, b, &bytes);
                 }
                 return Ok(());
             }
@@ -551,6 +552,28 @@ impl VixReader {
             self.dict_block(b)?;
         }
         Ok(())
+    }
+
+    /// Whether a query contains any POINT leaf (`Exact` / `KeyExists` /
+    /// `TokenAnyField`) — the only leaves [`Self::prefetch_query_fsts`] can
+    /// resolve to dictionary blocks up front. Range/pattern leaves walk
+    /// (and fetch) lazily; `All`/`Nothing` never touch the dictionary.
+    fn query_has_point_leaves(query: &VixQuery) -> bool {
+        match query {
+            VixQuery::Exact { .. }
+            | VixQuery::KeyExists { .. }
+            | VixQuery::TokenAnyField { .. } => true,
+            VixQuery::And(subs) | VixQuery::Or(subs) => {
+                subs.iter().any(Self::query_has_point_leaves)
+            }
+            VixQuery::Not(sub) => Self::query_has_point_leaves(sub),
+            VixQuery::All
+            | VixQuery::Nothing
+            | VixQuery::Prefix { .. }
+            | VixQuery::Contains { .. }
+            | VixQuery::Regex { .. }
+            | VixQuery::Fuzzy { .. } => false,
+        }
     }
 
     /// The dictionary blocks a query's POINT leaves resolve to, computed
@@ -700,7 +723,6 @@ impl VixReader {
                 Ok(bytes.slice(range.start as usize..range.end as usize))
             }
             Some(BlobHandle::Ranged(ranged)) => {
-                const BLOCK_CACHE_CAP: usize = 1024;
                 if let Some(hit) = self.block_cache.lock().expect("poisoned").0.get(&b) {
                     return Ok(hit.clone());
                 }
@@ -709,22 +731,38 @@ impl VixReader {
                     ranged.range.start + range.start..ranged.range.start + range.end,
                 )?;
                 let mut cache = self.block_cache.lock().expect("poisoned");
-                if cache.0.insert(b, bytes.clone()).is_none() {
-                    cache.1.push_back(b);
-                    self.dict_loaded_bytes
-                        .fetch_add(bytes.len(), Ordering::Relaxed);
-                    while cache.1.len() > BLOCK_CACHE_CAP {
-                        if let Some(evict) = cache.1.pop_front()
-                            && let Some(old) = cache.0.remove(&evict)
-                        {
-                            self.dict_loaded_bytes
-                                .fetch_sub(old.len(), Ordering::Relaxed);
-                        }
-                    }
-                }
+                self.cache_dict_block(&mut cache, b, &bytes);
                 Ok(bytes)
             }
             None => Err(VixError::Malformed("missing dict_blocks blob".to_string())),
+        }
+    }
+
+    /// Insert one fetched dictionary block into the FIFO-bounded block
+    /// cache (caller holds the lock), accounting the reader's resident size
+    /// and evicting past the cap.
+    fn cache_dict_block(
+        &self,
+        cache: &mut (
+            std::collections::HashMap<usize, Bytes>,
+            std::collections::VecDeque<usize>,
+        ),
+        b: usize,
+        bytes: &Bytes,
+    ) {
+        const DICT_BLOCK_CACHE_CAP: usize = 1024;
+        if cache.0.insert(b, bytes.clone()).is_none() {
+            cache.1.push_back(b);
+            self.dict_loaded_bytes
+                .fetch_add(bytes.len(), Ordering::Relaxed);
+            while cache.1.len() > DICT_BLOCK_CACHE_CAP {
+                if let Some(evict) = cache.1.pop_front()
+                    && let Some(old) = cache.0.remove(&evict)
+                {
+                    self.dict_loaded_bytes
+                        .fetch_sub(old.len(), Ordering::Relaxed);
+                }
+            }
         }
     }
 
@@ -849,6 +887,23 @@ impl VixReader {
     /// length or an out-of-bounds window here is file corruption. In-memory
     /// blobs slice for free; ranged blobs fetch exactly the record window.
     pub(crate) fn plist_record_bytes(&self, cell: &[u8]) -> Result<Bytes> {
+        let (offset, end) = self.plist_pointer_window(cell)?;
+        let handle = self
+            .plist_blob
+            .as_ref()
+            .expect("plist_pointer_window checked the blob");
+        match handle {
+            BlobHandle::Mem(bytes) => Ok(bytes.slice(offset as usize..end as usize)),
+            BlobHandle::Ranged(ranged) => crate::source::block_fetch(
+                ranged.source.as_ref(),
+                ranged.range.start + offset..ranged.range.start + end,
+            ),
+        }
+    }
+
+    /// Validate one pointer cell and return its `(offset, end)` window in
+    /// the `plist` blob (shared by the single and batched resolvers).
+    fn plist_pointer_window(&self, cell: &[u8]) -> Result<(u64, u64)> {
         let (offset, len) = postings::decode_pointer_cell(cell)?;
         let len = u64::from(len);
         let handle = self.plist_blob.as_ref().ok_or_else(|| {
@@ -864,11 +919,32 @@ impl VixReader {
                 "plist pointer {offset}+{len} out of bounds ({blob_len}-byte plist blob)"
             )));
         };
+        Ok((offset, end))
+    }
+
+    /// Resolve MANY out-of-row postings pointer windows in one batched
+    /// round trip (`block_fetch_many` — the ladder/S3 issue one request)
+    /// instead of a point fetch per term: the #27 coalescing lever for
+    /// OR-heavy unions and dictionary-served filtered group-bys. Records
+    /// return positionally.
+    fn plist_records_batch(&self, windows: &[(u64, u64)]) -> Result<Vec<Bytes>> {
+        if windows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let handle = self.plist_blob.as_ref().ok_or_else(|| {
+            VixError::Malformed("postings pointer cell in a file without a plist blob".to_string())
+        })?;
         match handle {
-            BlobHandle::Mem(bytes) => Ok(bytes.slice(offset as usize..end as usize)),
-            BlobHandle::Ranged(ranged) => crate::source::block_fetch(
+            BlobHandle::Mem(bytes) => Ok(windows
+                .iter()
+                .map(|&(offset, end)| bytes.slice(offset as usize..end as usize))
+                .collect()),
+            BlobHandle::Ranged(ranged) => crate::source::block_fetch_many(
                 ranged.source.as_ref(),
-                ranged.range.start + offset..ranged.range.start + end,
+                windows
+                    .iter()
+                    .map(|&(offset, end)| ranged.range.start + offset..ranged.range.start + end)
+                    .collect(),
             ),
         }
     }
@@ -1236,7 +1312,10 @@ impl VixReader {
             RowSelection::Indices(ordinals),
         )?;
         let mut unfiltered_sum = 0u64;
-        let mut filtered: Vec<u64> = Vec::with_capacity(values.len());
+        // pass 1: validate every cell, accumulate the reconciliation sum,
+        // and collect the out-of-row pointer windows for ONE batched round
+        // trip (#27) instead of a point fetch per value term
+        let mut pointer_windows: Vec<(u64, u64)> = Vec::new();
         for batch in &batches {
             let doc_counts = column_u64(batch, "doc_count")?;
             let postings = column_binary(batch, "postings")?;
@@ -1249,24 +1328,39 @@ impl VixReader {
                 }
                 unfiltered_sum += doc_count;
                 let blob = postings.value(row);
-                if blob.is_empty() && doc_count > 0 {
-                    if doc_count == self.row_count {
-                        // dense elision: the term is in every doc
-                        filtered.push(filter.count_set_bits() as u64);
-                        continue;
-                    }
+                if blob.is_empty() && doc_count > 0 && doc_count != self.row_count {
                     return Err(VixError::Malformed(format!(
                         "empty postings blob for a term with doc_count {doc_count} != \
                          row_count {} (not dense-elided, so corrupt)",
                         self.row_count
                     )));
                 }
-                let record;
-                let blob = if self.plist_pointer_cell(doc_count, blob) {
-                    record = self.plist_record_bytes(blob)?;
-                    postings::record_blob(&record)?
+                if self.plist_pointer_cell(doc_count, blob) {
+                    pointer_windows.push(self.plist_pointer_window(blob)?);
+                }
+            }
+        }
+        let records = self.plist_records_batch(&pointer_windows)?;
+        let mut records = records.iter();
+        // pass 2: count each value's postings inside the filter, decoding
+        // inline cells and the pre-fetched records in pass-1 order
+        let mut filtered: Vec<u64> = Vec::with_capacity(values.len());
+        for batch in &batches {
+            let doc_counts = column_u64(batch, "doc_count")?;
+            let postings = column_binary(batch, "postings")?;
+            for (row, &doc_count) in doc_counts.iter().enumerate() {
+                let cell = postings.value(row);
+                if cell.is_empty() && doc_count == self.row_count && doc_count > 0 {
+                    // dense elision: the term is in every doc
+                    filtered.push(filter.count_set_bits() as u64);
+                    continue;
+                }
+                let blob = if self.plist_pointer_cell(doc_count, cell) {
+                    postings::record_blob(
+                        records.next().expect("windows collected in pass 1 order"),
+                    )?
                 } else {
-                    blob
+                    cell
                 };
                 let mut hits = 0u64;
                 postings::decode_each(blob, doc_count as usize, |doc| {
@@ -1779,6 +1873,12 @@ impl VixReader {
     /// Stream all keys in `[lower, upper]`/`[lower, upper)` in order:
     /// predecessor-seek the start block, then walk forward block by block
     /// until a key passes the upper bound (narrow probes touch one block).
+    ///
+    /// Ranged readers bulk-load the walk's whole block span up front: the
+    /// resident index bounds the last reachable block without IO, so a
+    /// field-range walk costs a few MB-sized round trips instead of one
+    /// ~4KB round trip per block — the #27 fetch storm (27k point reads
+    /// over 78 files for one unfiltered trace-list TopN) was this loop.
     fn scan_key_range(
         &self,
         lower: &[u8],
@@ -1790,8 +1890,21 @@ impl VixReader {
         }
         let index = self.dict_index()?;
         let start = index.predecessor_block(lower)?.unwrap_or(0);
+        // Last block the walk can touch: the block containing the upper
+        // bound's predecessor key — later blocks' first keys already exceed
+        // the bound. Unbounded walks may reach the final block. The walk
+        // below keeps its own past-the-bound termination; a short span only
+        // costs per-block fallback fetches, never correctness.
+        let last = match upper {
+            Some((bound, _)) => index.predecessor_block(bound)?.unwrap_or(start).max(start),
+            None => index.block_count().saturating_sub(1),
+        };
+        let span = self.load_dict_block_span(start, last)?;
         for b in start..index.block_count() {
-            let block = self.dict_block(b)?;
+            let block = match span.as_ref().and_then(|blocks| blocks.get(&b)) {
+                Some(bytes) => bytes.clone(),
+                None => self.dict_block(b)?,
+            };
             let first_ordinal = index.meta(b).1;
             let mut past = false;
             crate::dict_blocks::block_scan(&block, |pos, key| {
@@ -1812,6 +1925,80 @@ impl VixReader {
             }
         }
         Ok(())
+    }
+
+    /// Bulk-load the missing dictionary blocks of `start..=last` for one
+    /// range walk (ranged readers only; in-memory readers slice for free).
+    /// Runs of consecutive missing blocks resolve through ONE
+    /// `block_fetch_many` — adjacent ranges coalesce into MB-sized round
+    /// trips, cut at [`SPAN_FETCH_MAX_BYTES`] — and are sliced per block.
+    /// Small spans are also published to the shared block cache so repeated
+    /// walks stay warm; oversized spans stay local to this walk (they would
+    /// only churn the FIFO cap).
+    fn load_dict_block_span(
+        &self,
+        start: usize,
+        last: usize,
+    ) -> Result<Option<std::collections::HashMap<usize, Bytes>>> {
+        const SPAN_FETCH_MAX_BYTES: u64 = 8 * 1024 * 1024;
+        const SPAN_CACHE_MAX_BLOCKS: usize = 512;
+        let Some(BlobHandle::Ranged(ranged)) = self.dict_blocks_blob.as_ref() else {
+            return Ok(None);
+        };
+        if last < start {
+            return Ok(None);
+        }
+        let index = self.dict_index()?;
+        let blob_len = self.dict_blocks_len()?;
+        // runs of consecutive MISSING blocks, cut at the fetch-size cap
+        let mut runs: Vec<(std::ops::Range<usize>, std::ops::Range<u64>)> = Vec::new();
+        {
+            let cache = self.block_cache.lock().expect("poisoned");
+            for b in start..=last.min(index.block_count().saturating_sub(1)) {
+                if cache.0.contains_key(&b) {
+                    continue;
+                }
+                let range = index.block_range(b, blob_len);
+                match runs.last_mut() {
+                    Some((blocks, bytes))
+                        if blocks.end == b && range.end - bytes.start <= SPAN_FETCH_MAX_BYTES =>
+                    {
+                        blocks.end = b + 1;
+                        bytes.end = range.end;
+                    }
+                    _ => runs.push((b..b + 1, range)),
+                }
+            }
+        }
+        // nothing missing, or a single block: the plain cached read is as good
+        if runs.is_empty() || (runs.len() == 1 && runs[0].0.len() == 1) {
+            return Ok(None);
+        }
+        let ranges: Vec<std::ops::Range<u64>> = runs
+            .iter()
+            .map(|(_, bytes)| ranged.range.start + bytes.start..ranged.range.start + bytes.end)
+            .collect();
+        let fetched = crate::source::block_fetch_many(ranged.source.as_ref(), ranges)?;
+        let total_blocks: usize = runs.iter().map(|(blocks, _)| blocks.len()).sum();
+        let mut blocks_map = std::collections::HashMap::with_capacity(total_blocks);
+        for ((blocks, bytes), run) in runs.into_iter().zip(fetched) {
+            for b in blocks {
+                let range = index.block_range(b, blob_len);
+                blocks_map.insert(
+                    b,
+                    run.slice(
+                        (range.start - bytes.start) as usize..(range.end - bytes.start) as usize,
+                    ),
+                );
+            }
+        }
+        if blocks_map.len() <= SPAN_CACHE_MAX_BLOCKS {
+            let mut cache = self.block_cache.lock().expect("poisoned");
+            for (&b, bytes) in &blocks_map {
+                self.cache_dict_block(&mut cache, b, bytes);
+            }
+        }
+        Ok(Some(blocks_map))
     }
 
     /// Walk every FST key, apply `matches` to the token part (keys without a
@@ -1902,6 +2089,11 @@ impl VixReader {
         )?;
         let mut seen_rows = 0usize;
         let mut saw_dense = false;
+        // pass 1: validate every cell and collect the out-of-row pointer
+        // windows so their records resolve in ONE batched round trip
+        // instead of a point fetch per term (#27); a dense-elided term
+        // short-circuits the whole union to all-ones with zero record IO
+        let mut pointer_windows: Vec<(u64, u64)> = Vec::new();
         for batch in &batches {
             let doc_counts = column_u64(batch, "doc_count")?;
             let postings = column_binary(batch, "postings")?;
@@ -1926,19 +2118,40 @@ impl VixReader {
                         self.row_count
                     )));
                 }
-                if saw_dense {
-                    // The union is already all-ones; skip further decodes.
+                // out-of-row postings: the threshold — never the cell bytes
+                // — selects the pointer
+                if !saw_dense && self.plist_pointer_cell(doc_count, blob) {
+                    pointer_windows.push(self.plist_pointer_window(blob)?);
+                }
+            }
+            seen_rows += batch.num_rows();
+        }
+        if seen_rows != expected_rows {
+            return Err(VixError::Malformed(format!(
+                "terms point read returned {seen_rows} rows, expected {expected_rows}"
+            )));
+        }
+        if saw_dense {
+            return Ok(BooleanBuffer::new_set(len));
+        }
+        let records = self.plist_records_batch(&pointer_windows)?;
+        let mut records = records.iter();
+        // pass 2: decode inline cells and the pre-fetched records
+        for batch in &batches {
+            let doc_counts = column_u64(batch, "doc_count")?;
+            let postings = column_binary(batch, "postings")?;
+            for (row, &doc_count) in doc_counts.iter().enumerate() {
+                let cell = postings.value(row);
+                if cell.is_empty() {
+                    // doc_count == 0 (validated in pass 1): nothing to decode
                     continue;
                 }
-                // out-of-row postings: resolve the pointer cell to its
-                // record and decode the record's blob region (the threshold
-                // — never the cell bytes — selects the pointer)
-                let record;
-                let blob = if self.plist_pointer_cell(doc_count, blob) {
-                    record = self.plist_record_bytes(blob)?;
-                    postings::record_blob(&record)?
+                let blob = if self.plist_pointer_cell(doc_count, cell) {
+                    postings::record_blob(
+                        records.next().expect("windows collected in pass 1 order"),
+                    )?
                 } else {
-                    blob
+                    cell
                 };
                 postings::decode_each(blob, doc_count as usize, |doc| {
                     if u64::from(doc) >= self.row_count {
@@ -1951,15 +2164,6 @@ impl VixReader {
                     Ok(())
                 })?;
             }
-            seen_rows += batch.num_rows();
-        }
-        if seen_rows != expected_rows {
-            return Err(VixError::Malformed(format!(
-                "terms point read returned {seen_rows} rows, expected {expected_rows}"
-            )));
-        }
-        if saw_dense {
-            return Ok(BooleanBuffer::new_set(len));
         }
         Ok(builder.finish())
     }

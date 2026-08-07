@@ -426,11 +426,18 @@ pub async fn check_nodes_status(client: &reqwest::Client) -> Result<()> {
                 node.http_addr
             );
             let mut w = NODES_HEALTH_CHECK.write().await;
-            let Some(entry) = w.get_mut(&node.uuid) else {
-                // node haven't been added to the cluster yet, when the health check first succeed,
-                // it will be added to the check map
-                continue;
-            };
+            // Count failures even for nodes THIS observer never saw healthy.
+            // The old get_mut-or-continue guard made a dead node's entry
+            // UNEVICTABLE by every pod that booted after it died — after a
+            // full-fleet roll NO observer had seen the SIGKILLed old pods
+            // healthy, so their registrations lingered forever and every
+            // query fan-out kept dialing them (dev outage 2026-08-07,
+            // argocd-dev-ops #231: connect-refused 400s, then ~130s
+            // blackhole hangs once the pod IP was reused). A live node that
+            // is merely slow to serve /healthz self-heals: eviction only
+            // drops it from this observer's view, and its next keep-alive
+            // Put re-adds it.
+            let entry = w.entry(node.uuid.clone()).or_insert(0);
             *entry += 1;
             let times = *entry;
             drop(w);
@@ -691,6 +698,39 @@ mod tests {
     #[ignore]
     async fn test_list_nodes() {
         assert!(list_nodes().await.unwrap().is_empty());
+    }
+
+    /// #231 regression guard: a dead node this observer NEVER saw healthy
+    /// must still accumulate health-check failures and get evicted. The old
+    /// get_mut-or-continue guard skipped nodes absent from
+    /// NODES_HEALTH_CHECK forever — after a full-fleet roll every observer
+    /// boots after the old pods died, so stale registrations were
+    /// unevictable and every query fan-out kept dialing them.
+    #[tokio::test]
+    async fn health_sweep_evicts_nodes_never_seen_healthy() {
+        let uuid = "dead-node-never-seen-healthy-231";
+        let mut node = LOCAL_NODE.clone();
+        node.uuid = uuid.to_string();
+        node.name = "dead-node-231".to_string();
+        // a closed local port: the check fails fast with connect-refused
+        node.http_addr = "http://127.0.0.1:1".to_string();
+        node.status = NodeStatus::Online;
+        NODES.write().await.insert(uuid.to_string(), node);
+        assert!(
+            !NODES_HEALTH_CHECK.read().await.contains_key(uuid),
+            "precondition: the observer never saw this node healthy"
+        );
+
+        let client = reqwest::Client::new();
+        let failed_times = get_config().health_check.failed_times.max(1);
+        for _ in 0..failed_times {
+            check_nodes_status(&client).await.unwrap();
+        }
+        assert!(
+            !NODES.read().await.contains_key(uuid),
+            "dead node must be evicted after {failed_times} failed sweeps"
+        );
+        NODES_HEALTH_CHECK.write().await.remove(uuid);
     }
 
     #[tokio::test]

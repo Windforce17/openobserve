@@ -54,8 +54,8 @@
 //! none. The leader dedups candidates PER STREAM against that stream's own
 //! registered `l0_` ranges, so different streams cutting the same run at
 //! different byte boundaries is sound. A skipped id splits the runs around
-//! it, stays outside every range, and remains queryable as a segment. Any build/upload failure aborts the
-//! WHOLE batch before anything is registered, the segments stay leased, and
+//! it, stays outside every range, and remains queryable as a segment. Any build/upload failure
+//! aborts the WHOLE batch before anything is registered, the segments stay leased, and
 //! the expired lease retries them; the retry's identical decode set
 //! re-produces identical keys, so uploads overwrite the same objects.
 
@@ -1669,18 +1669,17 @@ mod tests {
             (8, vec![frame_of("steady")]),
         ];
         let again = chunk_run_per_stream(run);
-        let ranges =
-            |groups: &[StreamChunks]| -> Vec<(String, Vec<(i64, i64)>)> {
-                groups
-                    .iter()
-                    .map(|g| {
-                        (
-                            g.stream.clone(),
-                            g.chunks.iter().map(|c| (c.start_id, c.end_id)).collect(),
-                        )
-                    })
-                    .collect()
-            };
+        let ranges = |groups: &[StreamChunks]| -> Vec<(String, Vec<(i64, i64)>)> {
+            groups
+                .iter()
+                .map(|g| {
+                    (
+                        g.stream.clone(),
+                        g.chunks.iter().map(|c| (c.start_id, c.end_id)).collect(),
+                    )
+                })
+                .collect()
+        };
         assert_eq!(ranges(&chunked), ranges(&again));
 
         // empty run → nothing
