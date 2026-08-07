@@ -60,11 +60,7 @@
 //!   serve a Built status whose L0 file_list rows have not replicated yet, reopening the gap this
 //!   ordering closes.
 
-use std::{
-    cmp::Reverse,
-    collections::BinaryHeap,
-    sync::Arc,
-};
+use std::{cmp::Reverse, collections::BinaryHeap, sync::Arc};
 
 use arrow::array::{BooleanArray, Int64Array};
 use arrow_schema::Schema;
@@ -471,7 +467,9 @@ pub async fn search(
             // evaluate (schema-mixed segments) pass through whole for the
             // provider to re-filter, and those rows never feed the
             // threshold — but they could still live in an older segment.
-            if index_condition.as_ref().is_none_or(|c| c.is_condition_all())
+            if index_condition
+                .as_ref()
+                .is_none_or(|c| c.is_condition_all())
                 && let Some(top) = top_n.as_ref()
                 && let Some(threshold) = top.threshold()
                 && meta.max_ts < threshold
@@ -812,7 +810,9 @@ impl TopNTimestamps {
 
     /// The n-th newest in-window timestamp observed, once n have been seen.
     fn threshold(&self) -> Option<i64> {
-        (self.heap.len() >= self.n).then(|| self.heap.peek().map(|r| r.0)).flatten()
+        (self.heap.len() >= self.n)
+            .then(|| self.heap.peek().map(|r| r.0))
+            .flatten()
     }
 
     fn observe(&mut self, ts: &Int64Array) {
@@ -878,14 +878,13 @@ fn trim_batch_to_top_n(
 /// against the scan budget. Row counts are always preserved.
 ///
 /// Two non-obvious points:
-/// - IPC stream decode slices ALL columns of a batch out of one message-body
-///   buffer, so `RecordBatch::project` alone would keep the whole decoded
-///   frame resident (and the budget accounting would lie). Batches that
-///   actually shed columns are therefore detached with a `take` gather copy
-///   — cheap, it only materializes the columns being kept.
-/// - a batch can project to ZERO columns (a pure `count(*)` plan against a
-///   frame with no surviving needed column); arrow preserves `num_rows`
-///   through empty projections, which is exactly what such plans consume.
+/// - IPC stream decode slices ALL columns of a batch out of one message-body buffer, so
+///   `RecordBatch::project` alone would keep the whole decoded frame resident (and the budget
+///   accounting would lie). Batches that actually shed columns are therefore detached with a `take`
+///   gather copy — cheap, it only materializes the columns being kept.
+/// - a batch can project to ZERO columns (a pure `count(*)` plan against a frame with no surviving
+///   needed column); arrow preserves `num_rows` through empty projections, which is exactly what
+///   such plans consume.
 fn project_batch_to_needed(batch: RecordBatch, needed: &HashSet<String>) -> Result<RecordBatch> {
     // A plan that reads `_source` consumes WHOLE rows: that column is
     // synthesized from every stored column whenever the batch does not
@@ -956,7 +955,6 @@ fn push_within_budget(
     kept.push(batch);
     Ok(())
 }
-
 
 /// Group batches by their OWN write-time schema, merge small batches within
 /// each group, and build one `NewMemTable` per group — exactly the memtable
@@ -1077,7 +1075,8 @@ mod tests {
 
         // matching rows survive as KNOWN matches, everything else pruned
         // before budgeting
-        let PrunedBatch::Exact(pruned) = prune_batch_by_condition(batch.clone(), Some(&condition), &[])
+        let PrunedBatch::Exact(pruned) =
+            prune_batch_by_condition(batch.clone(), Some(&condition), &[])
         else {
             panic!("evaluated condition must yield Exact");
         };
@@ -1199,7 +1198,9 @@ mod tests {
             vec![
                 Arc::new(Int64Array::from((0..n as i64).collect::<Vec<_>>())),
                 Arc::new(StringArray::from(
-                    (0..n).map(|i| format!("wide-filler-{i:0>64}")).collect::<Vec<_>>(),
+                    (0..n)
+                        .map(|i| format!("wide-filler-{i:0>64}"))
+                        .collect::<Vec<_>>(),
                 )),
                 Arc::new(StringArray::from(
                     (0..n).map(|i| format!("svc-{}", i % 7)).collect::<Vec<_>>(),
@@ -1248,17 +1249,27 @@ mod tests {
         let unrelated: HashSet<String> = ["absent_col".to_string()].into_iter().collect();
         let empty = project_batch_to_needed(batch.clone(), &unrelated).unwrap();
         assert_eq!(empty.num_columns(), 0);
-        assert_eq!(empty.num_rows(), n, "row count survives an empty projection");
+        assert_eq!(
+            empty.num_rows(),
+            n,
+            "row count survives an empty projection"
+        );
 
         // a plan that reads `_source` (star selects) keeps batches WHOLE:
         // the column is synthesized from every stored column, so dropping
         // "unneeded" ones would hollow out the hits (e2e-caught regression)
-        let star: HashSet<String> =
-            ["_timestamp".to_string(), vortex_index::SOURCE_COL_NAME.to_string()]
-                .into_iter()
-                .collect();
+        let star: HashSet<String> = [
+            "_timestamp".to_string(),
+            vortex_index::SOURCE_COL_NAME.to_string(),
+        ]
+        .into_iter()
+        .collect();
         let whole = project_batch_to_needed(batch, &star).unwrap();
-        assert_eq!(whole.num_columns(), 3, "_source plans must keep every column");
+        assert_eq!(
+            whole.num_columns(),
+            3,
+            "_source plans must keep every column"
+        );
     }
 
     /// Batches decoded from an IPC stream slice every column out of one
@@ -1278,7 +1289,9 @@ mod tests {
             vec![
                 Arc::new(Int64Array::from((0..n as i64).collect::<Vec<_>>())),
                 Arc::new(StringArray::from(
-                    (0..n).map(|i| format!("padding-{i:0>128}")).collect::<Vec<_>>(),
+                    (0..n)
+                        .map(|i| format!("padding-{i:0>128}"))
+                        .collect::<Vec<_>>(),
                 )),
             ],
         )
@@ -1371,7 +1384,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            trim_batch_to_top_n(no_ts, &mut top).unwrap().unwrap().num_rows(),
+            trim_batch_to_top_n(no_ts, &mut top)
+                .unwrap()
+                .unwrap()
+                .num_rows(),
             2
         );
 
@@ -1388,7 +1404,11 @@ mod tests {
             Some(150),
             "threshold from in-window rows only — 500s are outside [100,200)"
         );
-        assert_eq!(b.num_rows(), 2, "150 and 160 kept; 500s dropped by the mask");
+        assert_eq!(
+            b.num_rows(),
+            2,
+            "150 and 160 kept; 500s dropped by the mask"
+        );
         // rows older than the window never occupy heap slots either
         let mut older = TopNTimestamps::new(2, (100, 200));
         let ts_old = Int64Array::from(vec![10i64, 20, 150]);
@@ -1878,7 +1898,10 @@ mod tests {
         let rows: usize = scanned.kept.iter().map(|(_, b)| b.num_rows()).sum();
         assert_eq!(scanned.kept.len(), 2);
         assert_eq!(rows, 3);
-        assert_eq!(scanned.rows_examined, 3, "only matching frames' rows are examined");
+        assert_eq!(
+            scanned.rows_examined, 3,
+            "only matching frames' rows are examined"
+        );
         assert!(
             scanned.kept.iter().all(|(exact, _)| *exact),
             "no condition => every kept batch is trim-eligible"

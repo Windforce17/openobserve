@@ -587,6 +587,21 @@ pub async fn count_unbuilt_older_than(age_secs: u64) -> Result<i64> {
     }
 }
 
+/// Claim-gate input: `(count, oldest created_at)` over the segments a
+/// [`claim_pending`] call would consider RIGHT NOW — `Pending` rows plus
+/// `Building` rows whose lease (`updated_at`) is older than
+/// `lease_timeout_secs` — using the exact claim predicate so the gate and
+/// the claim can never disagree about what is claimable. `(0, 0)` when
+/// nothing is claimable.
+pub async fn claimable_stats(lease_timeout_secs: u64) -> Result<(i64, i64)> {
+    let stale_before = now_micros().saturating_sub(secs_to_micros(lease_timeout_secs));
+    if use_postgres() {
+        postgres::claimable_stats(stale_before).await
+    } else {
+        sqlite::claimable_stats(stale_before).await
+    }
+}
+
 mod postgres {
     use config::metrics::DB_QUERY_NUMS;
 
@@ -1072,6 +1087,22 @@ LIMIT $3;"#,
             ))
         })?;
         Ok(count)
+    }
+
+    pub(super) async fn claimable_stats(stale_before: i64) -> Result<(i64, i64)> {
+        let pool = CLIENT_RO.clone();
+        DB_QUERY_NUMS.with_label_values(&["select", TABLE]).inc();
+        let row: (i64, i64) = sqlx::query_as(
+            r#"SELECT count(*), coalesce(min(created_at), 0) FROM wal_segments
+WHERE status = $1 OR (status = $2 AND updated_at < $3);"#,
+        )
+        .bind(SegmentStatus::Pending as i16)
+        .bind(SegmentStatus::Building as i16)
+        .bind(stale_before)
+        .fetch_one(&pool)
+        .await
+        .map_err(|e| Error::Message(format!("[WAL_SEGMENTS] claimable_stats: {e}")))?;
+        Ok(row)
     }
 }
 
@@ -1594,6 +1625,21 @@ LIMIT $3;"#,
             ))
         })?;
         Ok(count)
+    }
+
+    pub(super) async fn claimable_stats(stale_before: i64) -> Result<(i64, i64)> {
+        let pool = CLIENT_RO.clone();
+        let row: (i64, i64) = sqlx::query_as(
+            r#"SELECT count(*), coalesce(min(created_at), 0) FROM wal_segments
+WHERE status = $1 OR (status = $2 AND updated_at < $3);"#,
+        )
+        .bind(SegmentStatus::Pending as i16)
+        .bind(SegmentStatus::Building as i16)
+        .bind(stale_before)
+        .fetch_one(&pool)
+        .await
+        .map_err(|e| Error::Message(format!("[WAL_SEGMENTS] claimable_stats: {e}")))?;
+        Ok(row)
     }
 }
 

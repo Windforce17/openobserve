@@ -29,9 +29,9 @@
 //!   sentinel so the queue drains (the pruner treats `bloom_ver <= 0` as "no bloom", never forming
 //!   a `.bf` path);
 //! - files whose own bytes fail validation (a DETERMINISTIC failure — corrupt dictionary/terms/
-//!   bloom blob, or a checked build that refuses to publish) are stamped
-//!   [`BLOOM_VER_UNBUILDABLE`]: retrying can never succeed, so they leave the queue after one
-//!   attempt instead of spinning forever and burning the fallback budget every pass.
+//!   bloom blob, or a checked build that refuses to publish) are stamped [`BLOOM_VER_UNBUILDABLE`]:
+//!   retrying can never succeed, so they leave the queue after one attempt instead of spinning
+//!   forever and burning the fallback budget every pass.
 //!
 //! Group invariants (see `infra::bloom`): every field section shares one
 //! `num_blocks B` across its files, so files are chunked by their per-field
@@ -635,8 +635,7 @@ mod tests {
         );
 
         // ...so a healthy file in the same pass still gets the slot
-        let reader =
-            VixReader::open(bytes::Bytes::from(backfill_file(&["trace-a"]))).unwrap();
+        let reader = VixReader::open(bytes::Bytes::from(backfill_file(&["trace-a"]))).unwrap();
         let loaded = budgeted_backfill(&budget, || {
             blooms_from_dictionary(&reader, &["trace_id".to_string()], 0.001, "unit-test")
         })
@@ -646,9 +645,7 @@ mod tests {
 
         // transient failure: slot stays consumed
         let budget = AtomicI64::new(1);
-        assert!(
-            budgeted_backfill(&budget, || Err(anyhow::anyhow!("connection reset"))).is_err()
-        );
+        assert!(budgeted_backfill(&budget, || Err(anyhow::anyhow!("connection reset"))).is_err());
         assert_eq!(budget.load(Ordering::Relaxed), 0);
 
         // exhausted budget: deferred, and the walk never runs

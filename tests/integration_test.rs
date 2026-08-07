@@ -105,6 +105,12 @@ mod tests {
             // request is a pathological file shape). Inert when segment mode
             // is off.
             env::set_var("ZO_SEGMENT_FLUSH_INTERVAL_MS", "50");
+            // The suite's storage-path assertions want segments converted to
+            // L0 .vix files promptly; the production claim gate (wait for a
+            // full batch so per-stream files come out batch-sized) would
+            // idle the tiny test flows for its full wait. Inert when segment
+            // mode is off.
+            env::set_var("ZO_SEGMENT_BUILD_MAX_WAIT_SECS", "0");
             // The alert-destination tests use a dummy loopback host; the SSRF
             // guard must not reject it in this trusted test environment.
             env::set_var("ZO_SSRF_ALLOW_LOOPBACK", "true");
@@ -179,7 +185,7 @@ mod tests {
     /// merge_by_stream directly must claim exactly like run_merge does.
     async fn claim_job_for_merge(job_id: i64) {
         let claimed =
-            infra::file_list::get_pending_jobs(&config::cluster::LOCAL_NODE.uuid, 20, true)
+            infra::file_list::get_pending_jobs(&config::cluster::LOCAL_NODE.uuid, 20, true, 0)
                 .await
                 .unwrap();
         assert!(

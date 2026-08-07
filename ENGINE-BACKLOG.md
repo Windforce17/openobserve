@@ -901,3 +901,119 @@ climbing); [SEGMENT:FLUSH] bufferfull (should stay 0); ingester WAL files
     (o2-old builds its full index at ingest; obs blooms are
     compactor-deferred). Enable compaction for obs or ship (d)
     before comparing needle classes.
+
+## #23 storm-mode compaction: intra-hour merge parallelism + recovery ordering (2026-08-06)
+The .69 wrong-base incident recovery exposed two structural limits under
+backlog storms (numbers from prod, 2026-08-06 evening):
+- ONE merge job per stream-hour runs at a time: a pathological hour
+  (traces hour-14 reached 10,418 files after the freeze + L0 burst)
+  drains in SEQUENTIAL ~batches on a single worker while ~60 of 80
+  fleet worker slots idle. Batch groups within an hour are independent
+  (prefix partitions) — they could fan out across workers/nodes.
+- Claim ordering is all-or-nothing: offsets-DESC starves old re-pended
+  heal jobs behind current-hour churn (~500 metrics streams resurrect
+  every minute; dev needed a temporary fast_mode=false flip + capacity
+  to drain), while id-ASC starves the open hour. A storm needs a mixed
+  policy (e.g. reserve N slots for current-hour jobs, rest oldest-first)
+  or per-job priority.
+Context: open-hour apisix piled to 3,297 L0s (normal saw-tooth tops
+~2,200) because its single-flight incremental job cycled against
+~1 file/s production; battery vs o2 lost every per-file class 25-137x
+on file-count arithmetic alone (per-file cost nominal ~9ms, plan 0ms,
+fast paths engaged). Fix = the two items above; nothing engine-side
+regressed.
+
+## #24 per-stream L0 chunking + claim gating: small streams stop inheriting the fleet's file cadence (2026-08-07, in tree)
+Root cause of the orbit services-view regression (traces/e2b_prod_logs:
+obs 2.3-6.8s vs o2 0.2s on the unfiltered percentile agg): the L0
+builder capped sub-runs on the run's AGGREGATE decoded bytes (128MB),
+and every sub-run emits one file per stream present in it — so every
+~128MB of fleet-wide traffic emitted a sliver file for EVERY stream.
+Prod pushes ~1.3TB/hour ≈ 10.6k sub-runs/hour == e2b's observed ~10k
+files/hour (~2MB avg, o2 held 9-81/hour for the same stream+hours);
+4k files per 30m window did the rest on per-file arithmetic (engine
+per-file cost nominal — the sealed yesterday-window replay WINS vs o2
+235/651ms). Builders also claimed 1-2 segments at a time (poll beats
+production rate), so claims — and per-stream files — came out
+sliver-sized regardless of batch capacity. Fix (this tree):
+- chunk_run_per_stream: the decoded-byte cap is per STREAM inside each
+  contiguity run; every stream's chunk ranges tile the run's whole id
+  span, closing on whole-segment boundaries only (leader dedup is
+  per-stream, so streams cutting one run at different boundaries is
+  sound). Chunk boundaries stay pure functions of the decode set —
+  identical re-claims still reproduce identical keys.
+- claim gate: builders wait for a full ZO_SEGMENT_BUILD_BATCH — or
+  ZO_SEGMENT_BUILD_MAX_WAIT_SECS (default 15, 0 = legacy
+  claim-immediately) past the oldest claimable segment — before
+  claiming (claimable_stats uses the exact claim predicate; fails OPEN).
+  Rows stay queryable through the segment tail while gated, so the gate
+  costs no freshness. ZO_SEGMENT_BUILD_BATCH default 16→32; decoded
+  claim RAM ≈ batch x ZO_SEGMENT_FLUSH_SIZE_MB held through the build.
+Expected prod shape (~5 segments/s fleet): one full claim per ~6.4s →
+any stream's worst-case file rate ~560/hour (e2b 18x fewer, metrics
+1-record L0s collapse ~30x), and open-hour incremental merging keeps up
+from there (10k/hr exceeded its capacity, 560/hr does not). Residual
+lever if a stream still needs fewer: cross-claim per-stream
+accumulation (defer a stream's build until size/age) — needs persistent
+per-segment pending-stream accounting; deliberately not taken now.
+Upgrade note: a builder crash mid-batch across THIS upgrade retries
+with different (per-stream) keys; the retry overwrites l0_planned so
+the old uploaded-but-unregistered objects leak untracked in S3 —
+bounded to one in-flight batch per builder, same class as a decode-set
+change between retries (pre-existing).
+Watch: wal_segments sqlite suite flaked once alongside this work
+(claim_pending decoded updated_at as TEXT — shared-DB test race,
+pre-existing class, 6/6 clean after; prod meta is postgres).
+
+## #25 filter-back over-inclusion + #26 build-sort memory (2026-08-07 post-.72 watch)
+#25: a UI needle (`body='<full string>' AND error_type='...'`, 15m)
+index-narrows to 0 rows in ms, yet ~370-450 files/querier still went to
+the scan branch with the filter added back — files whose EVALUABLE
+subconditions already proved empty (and files skipped by per-file
+heuristics) should be statically excluded; equality on a TOKENIZED fts
+field can only be VERIFIED by decode, but an empty token-intersection
+is definitive-NO. Pre-.72 this cost 4.1s cold (the shatter multiplied
+it); post-.72 it is ~1.1s — the residual is this per-file scan-branch
+population. Candidate: per-file verdict enum {proven-empty, needs-
+verify, no-index} instead of the global is_add_filter_back + nameless
+returns.
+#26: the L0 build external sort OOMs the DataFusion pool on FAT streams
+even after ingester pool 2048→4096 (prod PRs #370-#372, retry rate
+61/20min → ~7/25min, converges but wastes work): the "~3x decoded
+input" peak estimate undershoots on wide schemas (logs/default = 1,542
+fields — row-format conversion + string buffers), and on compactors
+concurrent MERGES legitimately hold the auto pool (24G) with no
+prioritization, starving 400MB build sorts. Levers: memory-aware build
+admission (size concurrency by pool headroom), per-build dedicated
+reservation, or width-aware chunk cap (shrink BUILD_CHUNK_MAX_DECODED_
+BYTES when schema width > N). Ship state: .72 live both envs (see
+obs deployment memory / prod PRs #368-#372); the shatter itself is
+DEAD (logs/default open hour 5,506→~155 files, e2b 10k→~1.6k/hr raw
+converging to tens post-merge).
+
+## #27 top_n index path: 27k-tiny-fetch storm on wide timestamp-ordered LIMIT queries (2026-08-07, dev trace 019fdc1069ce76b1af33b1573f412ed0)
+A 24h `ORDER BY _timestamp DESC LIMIT` (trace-list shape, unconditioned,
+index_condition Some(ALL), top_n mode) on dev traces/default spent 104s
+of a 105s follower response INSIDE search->vix: `index fetches: 27117
+(232.96 MB), top_n hits: 70065, file_num: 0` over 78 merged files
+(index size 4.33GB, 76% memory-cached) — ~8.6KB per fetch at ~3.8ms
+effective each, while the actual batch decode was 32 batches x 45ms
+(~1.4s). The volume is fine; the ROUND-TRIP COUNT is the pathology.
+Hypotheses to measure (do NOT assert without instrumenting): (a) the
+top_n rank path resolves per-zone-chunk plist pointers/ts chunks with
+POINT reads that bypass the fetch-gate batching the point-block path
+got in .62; (b) no cross-FILE early-stop — newest-first waves + prune
+exist for SimpleSelect SCAN, but the index top_n path appears to
+evaluate every file in the window (70k candidate hits collected for a
+10k limit); (c) the 1024-entry block cache thrashes across 78 files'
+restart blocks at this fan-out. Levers: coalesce per-file rank reads
+(get_ranges), wave the files newest-first with limit-satisfied pruning,
+count-aware chunk skip. PROD-RELEVANT (.72 has the same path; prod
+merged files are the same 4GB shape). Repro: unconditioned 24h
+timestamp-ordered LIMIT 10000 on traces/default, cold-ish cache.
+Second specimen (same family, 12:02Z trace 019fdc1a9feb...): 24h exact
+trace_id=... lookup, 0 hits, 10.1s leader total — visible followers'
+exact seeks were 7-8 fetches/230-440ms each, one straggler follower ate
+~8.5s (logs rotated before capture; consistent with serialized cold
+per-file lookups). The get_ranges coalescing lever covers this variant;
+wave-pruning does not (no limit to satisfy).

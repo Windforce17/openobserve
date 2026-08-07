@@ -16,20 +16,25 @@
 //! Segment-WAL L0 builder (DESIGN-SEGMENT-WAL.md): turns uploaded segment
 //! objects into per-(stream, hour) L0 data files.
 //!
-//! Loop shape: claim ≤ `ZO_SEGMENT_BUILD_BATCH` pending segments (leased),
-//! start the lease heartbeat AT CLAIM TIME (the compactor heartbeat-gap
-//! lesson: a heartbeat that covers only part of the job's life lets another
-//! node re-claim mid-work), fetch + decode each object with a small bounded
-//! concurrency (a segment that fails to fetch or decode is SKIPPED and left
-//! leased — the lease expires and it retries; it never blocks the rest of
-//! the batch), split the DECODED ids into contiguous runs, and per run:
-//! group frames by stream, homogenize each stream's write-time schemas ONCE
-//! (this is the designed single place type-flips get resolved), split rows
-//! into hourly buckets, and build ONE L0 file per (run, stream, hour)
-//! through the exact same single-file build the WAL mover uses
-//! (`write_core_file_from_tables` for logs/traces `.vix`,
-//! `merge_parquet_files` for everything else) so compaction and the query
-//! path stay completely unchanged. Before the FIRST upload, the batch's
+//! Loop shape: wait until a FULL `ZO_SEGMENT_BUILD_BATCH` is claimable (or
+//! the oldest claimable segment is `ZO_SEGMENT_BUILD_MAX_WAIT_SECS` old —
+//! rows stay queryable through the segment tail while they wait, so the
+//! gate costs no freshness), claim the batch (leased), start the lease
+//! heartbeat AT CLAIM TIME (the compactor heartbeat-gap lesson: a heartbeat
+//! that covers only part of the job's life lets another node re-claim
+//! mid-work), fetch + decode each object with a small bounded concurrency
+//! (a segment that fails to fetch or decode is SKIPPED and left leased —
+//! the lease expires and it retries; it never blocks the rest of the
+//! batch), split the DECODED ids into contiguous runs, and per run: chunk
+//! each stream's frames on ITS OWN decoded bytes (`chunk_run_per_stream` —
+//! per-stream chunking is what keeps a stream's file count proportional to
+//! its own volume instead of the fleet's segment cadence), homogenize each
+//! chunk's write-time schemas ONCE (this is the designed single place
+//! type-flips get resolved), split rows into hourly buckets, and build ONE
+//! L0 file per (stream chunk, hour) through the exact same single-file
+//! build the WAL mover uses (`write_core_file_from_tables` for logs/traces
+//! `.vix`, `merge_parquet_files` for everything else) so compaction and the
+//! query path stay completely unchanged. Before the FIRST upload, the batch's
 //! deterministic keys are written to the claimed rows' `l0_planned` (fenced
 //! by the lease; a short count discards the build with nothing uploaded), so
 //! a builder crash mid-upload always leaves a durable record naming its
@@ -40,13 +45,16 @@
 //! between registration and the flip, and a lost lease rolls the
 //! registration back whole.
 //!
-//! Provenance: L0 object keys are a pure function of (decoded run ids,
-//! stream, hour) — `l0_{writer uuid|multi}_{run min id}_{run max id}_{hour
-//! index}` — and a run only ever spans CONSECUTIVE decoded ids, so every id
-//! inside a registered key range is genuinely contained in the file. The
-//! leader drops segment candidates falling inside registered `l0_` ranges;
-//! a skipped id splits the runs around it, stays outside every range, and
-//! remains queryable as a segment. Any build/upload failure aborts the
+//! Provenance: L0 object keys are a pure function of (the stream's chunk
+//! ids, stream, hour) — `l0_{writer uuid|multi}_{chunk min id}_{chunk max
+//! id}_{hour index}` — and a chunk only ever spans CONSECUTIVE decoded ids
+//! (each stream's chunk ranges tile its run's whole id span), so every id
+//! inside a registered key range is genuinely contained in the file: a
+//! covered segment either contributed its rows for that stream or carried
+//! none. The leader dedups candidates PER STREAM against that stream's own
+//! registered `l0_` ranges, so different streams cutting the same run at
+//! different byte boundaries is sound. A skipped id splits the runs around
+//! it, stays outside every range, and remains queryable as a segment. Any build/upload failure aborts the
 //! WHOLE batch before anything is registered, the segments stay leased, and
 //! the expired lease retries them; the retry's identical decode set
 //! re-produces identical keys, so uploads overwrite the same objects.
@@ -75,6 +83,7 @@ use config::{
     utils::{
         record_batch_ext::{RecordBatchExt, sort_record_batch_by_column},
         schema_ext::SchemaExt,
+        time::now_micros,
     },
 };
 use futures::StreamExt;
@@ -182,6 +191,34 @@ async fn run_loop() -> Result<(), anyhow::Error> {
         let cfg = get_config();
         let batch_size = cfg.common.segment_build_batch;
         let lease_secs = cfg.common.segment_build_lease_secs;
+        // Claim gate: a 1-2-segment claim emits a sliver L0 file for every
+        // stream it touches, so builders that poll faster than segments
+        // accumulate convert the fleet's ~1s segment cadence directly into
+        // per-stream file counts (~10k files/hour/stream in prod,
+        // 2026-08-07). Wait for a full batch — or the age cap, so
+        // low-traffic deployments still build promptly — and claims (and
+        // therefore per-stream L0 files) come out batch-sized. Rows stay
+        // queryable through the segment tail the whole time. Fails OPEN on
+        // a stats error: building sliver claims beats not building.
+        let max_wait_secs = cfg.common.segment_build_max_wait_secs;
+        if max_wait_secs > 0 {
+            match wal_segments::claimable_stats(lease_secs).await {
+                Ok((0, _)) => continue,
+                Ok((count, oldest_created_at))
+                    if (count as usize) < batch_size
+                        && now_micros().saturating_sub(oldest_created_at)
+                            < i64::try_from(max_wait_secs)
+                                .unwrap_or(i64::MAX)
+                                .saturating_mul(1_000_000) =>
+                {
+                    continue;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    log::error!("[SEGMENT:BUILD] claimable_stats failed (claiming anyway): {e}");
+                }
+            }
+        }
         let claim =
             match wal_segments::claim_pending(&LOCAL_NODE.uuid, batch_size, lease_secs).await {
                 Ok(v) => v,
@@ -296,8 +333,9 @@ impl std::fmt::Display for BatchStats {
 }
 
 /// One claimed batch end-to-end: fetch/decode (per-segment skip on failure),
-/// split the decoded ids into contiguous runs, build one L0 file per (run,
-/// stream, hour), write the batch's deterministic keys to the claimed rows'
+/// split the decoded ids into contiguous runs, chunk each run per stream on
+/// the stream's own decoded bytes, build one L0 file per (stream chunk,
+/// hour), write the batch's deterministic keys to the claimed rows'
 /// `l0_planned` (fenced; a SHORT count means the lease was lost and the
 /// build is discarded with NOTHING uploaded — an unplanned upload would be
 /// invisible to the GC forever), then upload every object, then commit
@@ -317,11 +355,13 @@ async fn process_claim(claim: &[SegmentMeta], node: &str) -> Result<BatchStats, 
 
     let meta_by_id: HashMap<i64, &SegmentMeta> = claim.iter().map(|m| (m.id, m)).collect();
 
-    // Plan every (run, stream) build first, splitting runs by DECODED arrow
-    // bytes — the compressed column `size` under-measured traces ~10x and
-    // OOM'd the pool (2026-07-31). The plans are then executed with bounded
-    // concurrency; oversized singletons run with the whole budget to
-    // themselves.
+    // Plan every (stream chunk) build first. Chunk inputs are measured in
+    // DECODED arrow bytes — the compressed column `size` under-measured
+    // traces ~10x and OOM'd the pool (2026-07-31) — and the byte cap is per
+    // STREAM (`chunk_run_per_stream`): capping the run's aggregate bytes
+    // emitted a sliver file for every stream in every ~128MB of fleet
+    // traffic. The plans are then executed with bounded concurrency;
+    // oversized singletons run with the whole budget to themselves.
     struct BuildPlan {
         key_parts: L0KeyParts,
         group: StreamGroup,
@@ -329,44 +369,37 @@ async fn process_claim(claim: &[SegmentMeta], node: &str) -> Result<BatchStats, 
     }
     let mut plans: Vec<BuildPlan> = Vec::new();
     let mut stream_keys: BTreeSet<String> = BTreeSet::new();
-    for run in split_into_decoded_runs(decoded) {
-        let run_metas = run
-            .iter()
-            .map(|(id, _)| {
-                meta_by_id
-                    .get(id)
-                    .copied()
-                    .ok_or_else(|| anyhow!("decoded segment id {id} is missing from the claim"))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let key_parts = l0_key_parts(&run_metas)?;
-
-        // group the run's frames by stream, preserving the deterministic
-        // (segment id, frame index) order inside each stream
-        let mut streams: BTreeMap<String, StreamGroup> = BTreeMap::new();
-        for (_seg_id, frames) in run {
-            for frame in frames {
-                let key = format!("{}/{}/{}", frame.org, frame.stream_type, frame.stream);
-                streams
-                    .entry(key)
-                    .or_insert_with(|| StreamGroup {
-                        org: frame.org,
-                        stream_type: frame.stream_type,
-                        stream: frame.stream,
-                        batches: Vec::new(),
+    for run in split_into_id_runs(decoded) {
+        for chunked in chunk_run_per_stream(run) {
+            let StreamChunks {
+                org,
+                stream_type,
+                stream,
+                chunks,
+            } = chunked;
+            stream_keys.insert(format!("{org}/{stream_type}/{stream}"));
+            for chunk in chunks {
+                // a run holds only DECODED ids and a chunk's range tiles a
+                // sub-span of its run, so every covered id resolves
+                let chunk_metas = (chunk.start_id..=chunk.end_id)
+                    .map(|id| {
+                        meta_by_id.get(&id).copied().ok_or_else(|| {
+                            anyhow!("chunk segment id {id} is missing from the claim")
+                        })
                     })
-                    .batches
-                    .push(frame.batch);
+                    .collect::<Result<Vec<_>, _>>()?;
+                let key_parts = l0_key_parts(&chunk_metas)?;
+                plans.push(BuildPlan {
+                    key_parts,
+                    group: StreamGroup {
+                        org: org.clone(),
+                        stream_type,
+                        stream: stream.clone(),
+                        batches: chunk.batches,
+                    },
+                    decoded_bytes: chunk.decoded_bytes,
+                });
             }
-        }
-        for (stream_key, group) in streams {
-            stream_keys.insert(stream_key);
-            let decoded_bytes = group.batches.iter().map(|b| b.size()).sum();
-            plans.push(BuildPlan {
-                key_parts: key_parts.clone(),
-                group,
-                decoded_bytes,
-            });
         }
     }
 
@@ -482,21 +515,15 @@ async fn process_claim(claim: &[SegmentMeta], node: &str) -> Result<BatchStats, 
     })
 }
 
-/// Maximal runs of CONSECUTIVE decoded segment ids, ascending. Every L0 key
-/// carries one run's exact `[min, max]` id range and the leader drops any
-/// segment candidate whose id falls inside a registered `l0_` range, so a
-/// range may only span ids whose content is IN the file — contiguity is
-/// what guarantees that. A skipped id (fetch/decode failure) or a foreign
-/// id interleaved in the claim's id space splits the runs around it, falls
-/// outside every produced range, and stays queryable as a segment.
-/// DECODED arrow bytes one run may feed into builds. The L0 sort runs
-/// inside the ingester's DataFusion pool (2048MB) and its repartition +
-/// external sort together peak at ~3x the decoded input, so runs are capped
-/// on the size that actually matters — the compressed `size` column
-/// under-measured traces ~10x and kept the OOM loop alive (2026-07-31).
-const BUILD_SUBRUN_MAX_DECODED_BYTES: usize = 128 * 1024 * 1024;
+/// DECODED arrow bytes one stream chunk may feed into its build. The L0
+/// sort runs inside the ingester's DataFusion pool (2048MB) and its
+/// repartition + external sort together peak at ~3x the decoded input, so
+/// chunks are capped on the size that actually matters — the compressed
+/// `size` column under-measured traces ~10x and kept the OOM loop alive
+/// (2026-07-31).
+const BUILD_CHUNK_MAX_DECODED_BYTES: usize = 128 * 1024 * 1024;
 
-/// A single (run, stream) build larger than this runs SERIALLY with the
+/// A single stream-chunk build larger than this runs SERIALLY with the
 /// whole pool to itself (oversized backlog segments must still build —
 /// alone, not beside two siblings).
 const BUILD_GROUP_MAX_DECODED_BYTES: usize = 160 * 1024 * 1024;
@@ -505,36 +532,149 @@ const BUILD_GROUP_MAX_DECODED_BYTES: usize = 160 * 1024 * 1024;
 /// the 2048MB pool with headroom, and multiplies drain throughput.
 const BUILD_CONCURRENCY: usize = 3;
 
-/// [`split_into_id_runs`] plus the decoded-byte cap: consecutive ids still
-/// group (exact provenance ranges per file), but a run closes as soon as
-/// adding the next segment would exceed [`BUILD_SUBRUN_MAX_DECODED_BYTES`].
-/// A single oversized segment still builds alone — nothing is ever skipped.
-/// Purely a function of the decoded ids and their decoded frame sizes, so
-/// re-claims of the same decode set reproduce identical groupings and
-/// therefore identical keys.
-fn split_into_decoded_runs(
-    decoded: Vec<(i64, Vec<SegmentFrame>)>,
-) -> Vec<Vec<(i64, Vec<SegmentFrame>)>> {
-    let mut out: Vec<Vec<(i64, Vec<SegmentFrame>)>> = Vec::new();
-    for run in split_into_id_runs(decoded) {
-        let mut current: Vec<(i64, Vec<SegmentFrame>)> = Vec::new();
-        let mut current_bytes: usize = 0;
-        for (id, frames) in run {
-            let size: usize = frames.iter().map(|f| f.batch.size()).sum();
-            if !current.is_empty()
-                && current_bytes.saturating_add(size) > BUILD_SUBRUN_MAX_DECODED_BYTES
-            {
-                out.push(std::mem::take(&mut current));
-                current_bytes = 0;
+/// One stream's identity plus its byte-capped chunks out of one contiguous
+/// decoded run.
+struct StreamChunks {
+    org: String,
+    stream_type: StreamType,
+    stream: String,
+    chunks: Vec<StreamChunk>,
+}
+
+/// A consecutive sub-range of a run's ids plus the stream's frames from
+/// exactly those segments; `[start_id, end_id]` becomes the file's
+/// provenance range.
+struct StreamChunk {
+    start_id: i64,
+    end_id: i64,
+    batches: Vec<RecordBatch>,
+    decoded_bytes: usize,
+}
+
+/// Chunk one CONTIGUOUS decoded run per stream: each stream accumulates ITS
+/// OWN frames in id order and closes a chunk (on whole-segment boundaries
+/// only) as soon as adding the next segment's frames would exceed
+/// [`BUILD_CHUNK_MAX_DECODED_BYTES`]; a single oversized segment still
+/// builds alone — nothing is ever skipped. Every stream's chunk ranges tile
+/// the run's WHOLE id span — the first chunk starts at the run's first id,
+/// each successor starts right after its predecessor closes, the last ends
+/// at the run's last id — so provenance ranges stay consecutive-and-covered
+/// (a covered segment either contributed its rows for the stream or carried
+/// none) while different streams cut the same run at different byte
+/// boundaries; segments carrying no frames for a stream extend its open
+/// chunk's range without adding bytes. Purely a function of the run's ids
+/// and per-(segment, stream) decoded frame sizes, so re-claims of the same
+/// decode set reproduce identical chunks and therefore identical keys.
+///
+/// The PER-STREAM cap is the point of this shape: capping the run's
+/// aggregate bytes (the pre-2026-08-07 behavior) closed a sub-run for every
+/// ~128MB of fleet-wide traffic and emitted one file for EVERY stream
+/// present in it, so a stream at ~1% of traffic still got ~10k sliver L0
+/// files/hour — per-file query arithmetic 10-30x'd the orbit services view
+/// until compaction caught up hours later.
+fn chunk_run_per_stream(run: Vec<(i64, Vec<SegmentFrame>)>) -> Vec<StreamChunks> {
+    let Some(run_first) = run.first().map(|(id, _)| *id) else {
+        return Vec::new();
+    };
+    let run_last = run.last().map(|(id, _)| *id).unwrap_or(run_first);
+
+    struct Accum {
+        org: String,
+        stream_type: StreamType,
+        stream: String,
+        done: Vec<StreamChunk>,
+        open_start: i64,
+        open_batches: Vec<RecordBatch>,
+        open_bytes: usize,
+    }
+    // BTreeMap keeps the emitted stream order deterministic
+    let mut accums: BTreeMap<String, Accum> = BTreeMap::new();
+
+    for (id, frames) in run {
+        // group THIS segment's frames per stream first (preserving frame
+        // order), so the close/open decision sees the segment's whole
+        // contribution at once — chunks close on segment boundaries only
+        let mut seg_order: Vec<String> = Vec::new();
+        let mut seg_groups: HashMap<String, (Vec<SegmentFrame>, usize)> = HashMap::new();
+        for frame in frames {
+            let key = format!("{}/{}/{}", frame.org, frame.stream_type, frame.stream);
+            let bytes = frame.batch.size();
+            match seg_groups.get_mut(&key) {
+                Some((group_frames, group_bytes)) => {
+                    group_frames.push(frame);
+                    *group_bytes = group_bytes.saturating_add(bytes);
+                }
+                None => {
+                    seg_order.push(key.clone());
+                    seg_groups.insert(key, (vec![frame], bytes));
+                }
             }
-            current_bytes = current_bytes.saturating_add(size);
-            current.push((id, frames));
         }
-        if !current.is_empty() {
-            out.push(current);
+        for key in seg_order {
+            let Some((group_frames, group_bytes)) = seg_groups.remove(&key) else {
+                continue;
+            };
+            let first = &group_frames[0];
+            let acc = accums.entry(key).or_insert_with(|| Accum {
+                org: first.org.clone(),
+                stream_type: first.stream_type,
+                stream: first.stream.clone(),
+                done: Vec::new(),
+                open_start: run_first,
+                open_batches: Vec::new(),
+                open_bytes: 0,
+            });
+            if acc.open_bytes > 0
+                && acc.open_bytes.saturating_add(group_bytes) > BUILD_CHUNK_MAX_DECODED_BYTES
+            {
+                acc.done.push(StreamChunk {
+                    start_id: acc.open_start,
+                    // ids inside a run are consecutive, so the previous
+                    // segment is exactly id - 1
+                    end_id: id - 1,
+                    batches: std::mem::take(&mut acc.open_batches),
+                    decoded_bytes: std::mem::replace(&mut acc.open_bytes, 0),
+                });
+                acc.open_start = id;
+            }
+            acc.open_batches
+                .extend(group_frames.into_iter().map(|f| f.batch));
+            acc.open_bytes = acc.open_bytes.saturating_add(group_bytes);
         }
     }
-    out
+
+    accums
+        .into_values()
+        .map(|acc| {
+            let Accum {
+                org,
+                stream_type,
+                stream,
+                mut done,
+                open_start,
+                open_batches,
+                open_bytes,
+            } = acc;
+            // the open chunk is never empty here: an accumulator only exists
+            // once frames arrived, and every close is immediately followed
+            // by an extend
+            if !open_batches.is_empty() {
+                done.push(StreamChunk {
+                    start_id: open_start,
+                    end_id: run_last,
+                    batches: open_batches,
+                    decoded_bytes: open_bytes,
+                });
+            }
+            StreamChunks {
+                org,
+                stream_type,
+                stream,
+                chunks: done,
+            }
+        })
+        .filter(|s| !s.chunks.is_empty())
+        .collect()
 }
 
 fn split_into_id_runs<T>(mut decoded: Vec<(i64, T)>) -> Vec<Vec<(i64, T)>> {
@@ -675,11 +815,11 @@ fn validate_stream_identity(org: &str, stream: &str) -> Result<(), anyhow::Error
     Ok(())
 }
 
-/// The run-constant parts of every L0 key: writer uuid (or `multi`) and the
-/// min/max DECODED segment id of one contiguous run (never the claim's —
-/// a claim-derived range would falsely cover skipped or foreign ids). Pure
-/// function of the run's members, so a re-claim that decodes the same set
-/// reproduces identical keys.
+/// The chunk-constant parts of every L0 key: writer uuid (or `multi`) and
+/// the min/max DECODED segment id of one contiguous stream chunk (never the
+/// claim's — a claim-derived range would falsely cover skipped or foreign
+/// ids). Pure function of the chunk's members, so a re-claim that decodes
+/// the same set reproduces identical keys.
 #[derive(Debug, Clone, PartialEq)]
 struct L0KeyParts {
     writer_uuid: String,
@@ -1435,46 +1575,146 @@ mod tests {
     // ── contiguous runs + deterministic keys ─────────────────────────────
 
     #[test]
-    fn test_split_into_decoded_runs_caps_by_arrow_bytes() {
-        // three consecutive ids whose decoded frames are ~2/3 of the cap
-        // each: the run must close after every segment that would overflow
-        let big_rows = (BUILD_SUBRUN_MAX_DECODED_BYTES * 2 / 3) / 8; // 8 bytes per i64 row
-        let frames_of = |n: usize| {
+    fn test_chunk_run_per_stream_caps_each_stream_on_its_own_bytes() {
+        // "big" carries ~2/3 of the cap per segment; "tiny" a few rows. The
+        // aggregate crosses the cap every other segment, but ONLY the big
+        // stream may split — the tiny stream must come out as ONE chunk
+        // spanning the whole run (the sliver-file regression, 2026-08-07).
+        let big_rows = (BUILD_CHUNK_MAX_DECODED_BYTES * 2 / 3) / 8; // 8 bytes per i64 row
+        let frame_of = |stream: &str, n: usize| {
             let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
             let batch =
                 RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![7i64; n]))])
                     .unwrap();
-            vec![SegmentFrame {
+            SegmentFrame {
+                org: "o".into(),
+                stream_type: StreamType::Logs,
+                stream: stream.into(),
+                min_ts: 1,
+                max_ts: 2,
+                batch,
+            }
+        };
+        let run = vec![
+            (1, vec![frame_of("big", big_rows), frame_of("tiny", 4)]),
+            (2, vec![frame_of("big", big_rows), frame_of("tiny", 4)]),
+            (3, vec![frame_of("big", big_rows), frame_of("tiny", 4)]),
+        ];
+        let chunked = chunk_run_per_stream(run);
+        assert_eq!(chunked.len(), 2);
+
+        let big = chunked.iter().find(|s| s.stream == "big").unwrap();
+        let ranges: Vec<(i64, i64)> = big.chunks.iter().map(|c| (c.start_id, c.end_id)).collect();
+        // seg1 alone (adding seg2 would overflow its cap), then seg2, then
+        // seg3 — and the ranges tile the run without gaps
+        assert_eq!(ranges, vec![(1, 1), (2, 2), (3, 3)]);
+        assert!(big.chunks.iter().all(|c| !c.batches.is_empty()));
+
+        let tiny = chunked.iter().find(|s| s.stream == "tiny").unwrap();
+        let ranges: Vec<(i64, i64)> = tiny.chunks.iter().map(|c| (c.start_id, c.end_id)).collect();
+        assert_eq!(
+            ranges,
+            vec![(1, 3)],
+            "a small stream must not inherit its neighbors' chunk boundaries"
+        );
+        assert_eq!(tiny.chunks[0].batches.len(), 3);
+    }
+
+    #[test]
+    fn test_chunk_run_per_stream_absent_segments_extend_ranges() {
+        // stream "gappy" appears only in segments 5 and 7 of run 4..=8: its
+        // single chunk must still cover the whole run [4, 8] — covered ids
+        // without frames contribute no rows, so the wider range is sound and
+        // keeps ranges tiling the run.
+        let frame_of = |stream: &str| {
+            let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+            let batch =
+                RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![7i64; 2]))])
+                    .unwrap();
+            SegmentFrame {
+                org: "o".into(),
+                stream_type: StreamType::Logs,
+                stream: stream.into(),
+                min_ts: 1,
+                max_ts: 2,
+                batch,
+            }
+        };
+        let run = vec![
+            (4, vec![frame_of("steady")]),
+            (5, vec![frame_of("steady"), frame_of("gappy")]),
+            (6, vec![frame_of("steady")]),
+            (7, vec![frame_of("gappy")]),
+            (8, vec![frame_of("steady")]),
+        ];
+        let chunked = chunk_run_per_stream(run);
+        for group in &chunked {
+            assert_eq!(group.chunks.len(), 1);
+            assert_eq!(
+                (group.chunks[0].start_id, group.chunks[0].end_id),
+                (4, 8),
+                "stream {} must span the whole run",
+                group.stream
+            );
+        }
+        let gappy = chunked.iter().find(|s| s.stream == "gappy").unwrap();
+        assert_eq!(gappy.chunks[0].batches.len(), 2);
+
+        // determinism: the same run re-chunked reproduces identical ranges
+        let run = vec![
+            (4, vec![frame_of("steady")]),
+            (5, vec![frame_of("steady"), frame_of("gappy")]),
+            (6, vec![frame_of("steady")]),
+            (7, vec![frame_of("gappy")]),
+            (8, vec![frame_of("steady")]),
+        ];
+        let again = chunk_run_per_stream(run);
+        let ranges =
+            |groups: &[StreamChunks]| -> Vec<(String, Vec<(i64, i64)>)> {
+                groups
+                    .iter()
+                    .map(|g| {
+                        (
+                            g.stream.clone(),
+                            g.chunks.iter().map(|c| (c.start_id, c.end_id)).collect(),
+                        )
+                    })
+                    .collect()
+            };
+        assert_eq!(ranges(&chunked), ranges(&again));
+
+        // empty run → nothing
+        assert!(chunk_run_per_stream(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn test_chunk_run_per_stream_oversized_segment_builds_alone() {
+        // one segment alone over the cap must still produce a chunk (nothing
+        // is ever skipped); the next segment starts the following chunk
+        let over_rows = (BUILD_CHUNK_MAX_DECODED_BYTES + 1024) / 8;
+        let frame_of = |n: usize| {
+            let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+            let batch =
+                RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![7i64; n]))])
+                    .unwrap();
+            SegmentFrame {
                 org: "o".into(),
                 stream_type: StreamType::Logs,
                 stream: "s".into(),
                 min_ts: 1,
                 max_ts: 2,
                 batch,
-            }]
+            }
         };
-        let runs = split_into_decoded_runs(vec![
-            (1, frames_of(big_rows)),
-            (2, frames_of(big_rows)),
-            (3, frames_of(4)),
-        ]);
-        // seg1 alone (adding seg2 would overflow), then seg2+seg3 fit
-        assert_eq!(runs.len(), 2, "byte cap must split the contiguous run");
-        assert_eq!(
-            runs[0].iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-            vec![1]
-        );
-        assert_eq!(
-            runs[1].iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-            vec![2, 3]
-        );
-        // tiny frames all group into one run
-        let runs = split_into_decoded_runs(vec![
-            (10, frames_of(2)),
-            (11, frames_of(2)),
-            (12, frames_of(2)),
-        ]);
-        assert_eq!(runs.len(), 1);
+        let run = vec![(10, vec![frame_of(over_rows)]), (11, vec![frame_of(4)])];
+        let chunked = chunk_run_per_stream(run);
+        assert_eq!(chunked.len(), 1);
+        let ranges: Vec<(i64, i64)> = chunked[0]
+            .chunks
+            .iter()
+            .map(|c| (c.start_id, c.end_id))
+            .collect();
+        assert_eq!(ranges, vec![(10, 10), (11, 11)]);
     }
 
     #[test]

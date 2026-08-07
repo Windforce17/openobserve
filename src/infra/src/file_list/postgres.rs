@@ -1383,14 +1383,18 @@ DO UPDATE SET
         node: &str,
         limit: i64,
         fast_mode: bool,
+        min_offsets: i64,
     ) -> Result<Vec<super::MergeJobRecord>> {
         // quick check without the advisory lock, if there are no pending jobs we can skip the
         // locked transaction.
         let pool = CLIENT_RO.clone();
-        let has_pending = sqlx::query("SELECT id FROM file_list_jobs WHERE status = $1 LIMIT 1;")
-            .bind(super::FileListJobStatus::Pending)
-            .fetch_optional(&pool)
-            .await?;
+        let has_pending = sqlx::query(
+            "SELECT id FROM file_list_jobs WHERE status = $1 AND offsets >= $2 LIMIT 1;",
+        )
+        .bind(super::FileListJobStatus::Pending)
+        .bind(min_offsets)
+        .fetch_optional(&pool)
+        .await?;
         if has_pending.is_none() {
             return Ok(Vec::new());
         }
@@ -1426,12 +1430,13 @@ DO UPDATE SET
         // several concurrently), so cross-node fan-out is safe; the advisory
         // lock still serializes claiming itself.
         let sql = if fast_mode {
-            r#"SELECT stream, id, 0::BIGINT AS num FROM file_list_jobs WHERE status = $1 ORDER BY offsets DESC LIMIT $2;"#
+            r#"SELECT stream, id, 0::BIGINT AS num FROM file_list_jobs WHERE status = $1 AND offsets >= $2 ORDER BY offsets DESC LIMIT $3;"#
         } else {
-            r#"SELECT stream, id, 0::BIGINT AS num FROM file_list_jobs WHERE status = $1 ORDER BY id ASC LIMIT $2;"#
+            r#"SELECT stream, id, 0::BIGINT AS num FROM file_list_jobs WHERE status = $1 AND offsets >= $2 ORDER BY id ASC LIMIT $3;"#
         };
         let ret = match sqlx::query_as::<_, super::MergeJobPendingRecord>(sql)
             .bind(super::FileListJobStatus::Pending)
+            .bind(min_offsets)
             .bind(limit)
             .fetch_all(&mut *tx)
             .await

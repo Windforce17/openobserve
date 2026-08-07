@@ -102,7 +102,9 @@ pub struct JobScheduler {
 
 impl JobScheduler {
     pub fn new(num: usize, worker_tx: mpsc::Sender<(MergeSender, MergeBatch)>) -> Self {
-        let (tx, rx) = mpsc::channel::<MergeJob>(1);
+        // one in-flight job may park per scheduler slot without blocking the
+        // claimer (#23) — capacity 1 used to stall run_merge holding leases
+        let (tx, rx) = mpsc::channel::<MergeJob>(num.max(1));
         let rx = Arc::new(Mutex::new(rx));
         Self {
             num,
@@ -198,6 +200,64 @@ mod job_scheduler_tests {
     }
 
     /// Heartbeat-from-claim lifetime (2026-07-30 audit): a claimed job
+    /// The live lane's claim (#23) must see ONLY jobs at or after
+    /// `min_offsets`: an old backlog hour stays invisible to the reserved
+    /// slots while a recent hour is claimable. Sqlite-backed through the
+    /// real file_list job API.
+    #[tokio::test]
+    async fn test_get_pending_jobs_min_offsets_filters_old_hours() {
+        use crate::compact::jobs_test_support::retry_busy;
+        let _guard = crate::compact::jobs_test_support::setup().await;
+        let run = config::utils::time::now_micros();
+        let org = format!("liveorg{run}");
+        let stream = format!("livestream{run}");
+        let old_offset = run - 10 * 3_600_000_000; // 10 hours ago
+        let old_id = retry_busy("add old job", || {
+            infra::file_list::add_job(&org, StreamType::Logs, &stream, old_offset)
+        })
+        .await;
+        let recent_id = retry_busy("add recent job", || {
+            infra::file_list::add_job(&org, StreamType::Logs, &stream, run)
+        })
+        .await;
+        assert!(old_id > 0 && recent_id > 0 && old_id != recent_id);
+
+        // live-lane shaped claim: only the recent job may come back
+        let min_offsets = run - 2 * 3_600_000_000;
+        let claimed = retry_busy("claim live", || {
+            infra::file_list::get_pending_jobs("live-lane-node", 10_000, false, min_offsets)
+        })
+        .await;
+        assert!(
+            claimed.iter().any(|j| j.id == recent_id),
+            "the recent job must be claimable through the live lane"
+        );
+        assert!(
+            !claimed.iter().any(|j| j.id == old_id),
+            "the old hour must be invisible to the live lane"
+        );
+
+        // unfiltered claim still sees the old job (the bulk lane's view)
+        let claimed_all = retry_busy("claim all", || {
+            infra::file_list::get_pending_jobs("live-lane-node", 10_000, false, 0)
+        })
+        .await;
+        assert!(
+            claimed_all.iter().any(|j| j.id == old_id),
+            "the bulk lane must still claim the old hour"
+        );
+
+        // restore every touched row so parallel tests see a clean table
+        let mut ids: Vec<i64> = claimed.iter().map(|j| j.id).collect();
+        ids.extend(claimed_all.iter().map(|j| j.id));
+        ids.sort_unstable();
+        ids.dedup();
+        retry_busy("restore claimed jobs", || {
+            infra::file_list::set_job_pending(&ids, 0, None)
+        })
+        .await;
+    }
+
     /// PARKED in the scheduler channel — no worker has dequeued it — must
     /// keep its `updated_at` fresh so `check_running_jobs` cannot re-pend
     /// it onto another node mid-lease; once the worker-side owner drops the
@@ -220,7 +280,7 @@ mod job_scheduler_tests {
         // table-wide, so use a large limit, keep our job and restore any
         // stranger rows untouched-in-effect (back to pending).
         let claimed = retry_busy("claim", || {
-            infra::file_list::get_pending_jobs("lease-test-node", 10_000, false)
+            infra::file_list::get_pending_jobs("lease-test-node", 10_000, false, 0)
         })
         .await;
         assert!(
@@ -265,7 +325,7 @@ mod job_scheduler_tests {
         })
         .await;
         let reclaimable = retry_busy("probe claim", || {
-            infra::file_list::get_pending_jobs("lease-thief", 10_000, false)
+            infra::file_list::get_pending_jobs("lease-thief", 10_000, false, 0)
         })
         .await;
         assert!(
@@ -294,7 +354,7 @@ mod job_scheduler_tests {
         })
         .await;
         let reclaimable = retry_busy("reclaim", || {
-            infra::file_list::get_pending_jobs("lease-thief", 10_000, false)
+            infra::file_list::get_pending_jobs("lease-thief", 10_000, false, 0)
         })
         .await;
         assert!(
@@ -331,7 +391,9 @@ pub struct MergeWorker {
 
 impl MergeWorker {
     pub fn new(num: usize) -> Self {
-        let (tx, rx) = mpsc::channel::<(MergeSender, MergeBatch)>(1);
+        // keep the workers fed: a fat job submits hundreds of batches; a
+        // capacity-1 channel serialized submission behind the slowest batch
+        let (tx, rx) = mpsc::channel::<(MergeSender, MergeBatch)>(num.max(1) * 2);
         let rx = Arc::new(Mutex::new(rx));
         Self { num, rx, tx }
     }

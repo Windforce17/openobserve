@@ -51,10 +51,51 @@ pub async fn run() -> Result<(), anyhow::Error> {
         log::error!("[COMPACTOR::JOB] start merge worker error: {e}");
     }
 
-    let mut scheduler =
-        compact::worker::JobScheduler::new(cfg.limit.file_merge_thread_num, worker.tx());
+    // scheduler slots (concurrent jobs) decoupled from merge workers (#23):
+    // storms want few jobs × many workers each, steady state the opposite
+    let job_num = if cfg.compact.job_num > 0 {
+        cfg.compact.job_num
+    } else {
+        cfg.limit.file_merge_thread_num
+    };
+    let mut scheduler = compact::worker::JobScheduler::new(job_num, worker.tx());
     if let Err(e) = scheduler.run() {
         log::error!("[COMPACTOR::JOB] start merge job scheduler error: {e}");
+    }
+
+    // Live lane (#23): reserved scheduler slots + dedicated workers that
+    // claim only recent-hour jobs, so a storm/heal backlog can never starve
+    // the open hour's incremental merges (2026-08-06: apisix piled to 3,297
+    // open-hour L0s while every shared slot ground old fat hours).
+    let live_tx = if cfg.compact.live_job_num > 0 {
+        let mut live_worker = compact::worker::MergeWorker::new(cfg.compact.live_worker_num.max(1));
+        if let Err(e) = live_worker.run() {
+            log::error!("[COMPACTOR::JOB] start live merge worker error: {e}");
+        }
+        let mut live_scheduler =
+            compact::worker::JobScheduler::new(cfg.compact.live_job_num, live_worker.tx());
+        if let Err(e) = live_scheduler.run() {
+            log::error!("[COMPACTOR::JOB] start live merge job scheduler error: {e}");
+        }
+        Some(live_scheduler.tx())
+    } else {
+        None
+    };
+    if let Some(live_tx) = live_tx {
+        spawn_pausable_job!("run_merge_live", get_config().compact.interval + 1, {
+            let cfg = get_config();
+            let min_offsets = config::utils::time::now_micros()
+                - cfg.compact.live_lookback_hours.max(1) * 3_600_000_000;
+            if let Err(e) = compact::run_merge(
+                live_tx.clone(),
+                min_offsets,
+                cfg.compact.live_job_num as i64,
+            )
+            .await
+            {
+                log::error!("[COMPACTOR::JOB] run merge live error: {e}");
+            }
+        });
     }
 
     spawn_pausable_job!("run_generate_job", get_config().compact.interval, {
@@ -121,7 +162,7 @@ pub async fn run() -> Result<(), anyhow::Error> {
 
     spawn_pausable_job!("run_merge", get_config().compact.interval + 2, {
         log::debug!("[COMPACTOR::JOB] Running data merge");
-        if let Err(e) = compact::run_merge(scheduler.tx().clone()).await {
+        if let Err(e) = compact::run_merge(scheduler.tx().clone(), 0, 0).await {
             log::error!("[COMPACTOR::JOB] run data merge error: {e}");
         }
     });

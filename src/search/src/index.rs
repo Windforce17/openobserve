@@ -494,6 +494,23 @@ impl Condition {
             } else {
                 Condition::In(field, values, expr.negated())
             }
+        } else if let Some(expr) = expr.downcast_ref::<LikeExpr>() {
+            // gated by is_expr_valid_for_index: case-sensitive, non-negated
+            // LIKE on a string-typed index field whose pattern is a plain
+            // substring/equality shape (see like_pattern_shape)
+            if expr.negated() || expr.case_insensitive() {
+                unreachable!()
+            }
+            let field = get_physical_column_name(expr.expr()).to_string();
+            let pattern = get_physical_value(expr.pattern());
+            match like_pattern_shape(&pattern) {
+                Some(LikePatternShape::Contains(needle)) => {
+                    Condition::StrMatch(field, needle.to_string(), true)
+                }
+                Some(LikePatternShape::Equal(value)) => Condition::Equal(field, value.to_string()),
+                Some(LikePatternShape::NotNull) => Condition::IsNotNull(field),
+                None => unreachable!(),
+            }
         } else if let Some(expr) = expr.downcast_ref::<ScalarFunctionExpr>() {
             let name = expr.name();
             match name {
@@ -1171,6 +1188,41 @@ pub(crate) fn try_physical_value(expr: &Arc<dyn PhysicalExpr>) -> Option<String>
     })
 }
 
+/// The index-servable shapes of a **case-sensitive, non-negated** `LIKE`
+/// pattern; `None` for everything else, which stays on the scan path.
+/// `_` (any-single-char wildcard) and `\` (kernel escape) make the pattern
+/// more than a plain substring, and a `%` anywhere but the ends imposes an
+/// ordering the term index cannot express — all rejected. The servable
+/// shapes map onto existing EXACT conditions (filter removable): no
+/// wildcard at all is string equality, `%needle%` is exactly
+/// `str_match(field, needle)`, and a pattern of only `%`s matches every
+/// non-null string, i.e. `IS NOT NULL`.
+pub(crate) enum LikePatternShape<'a> {
+    Equal(&'a str),
+    Contains(&'a str),
+    NotNull,
+}
+
+pub(crate) fn like_pattern_shape(pattern: &str) -> Option<LikePatternShape<'_>> {
+    if pattern.contains('_') || pattern.contains('\\') {
+        return None;
+    }
+    if !pattern.contains('%') {
+        return Some(LikePatternShape::Equal(pattern));
+    }
+    if !(pattern.starts_with('%') && pattern.ends_with('%')) {
+        return None; // prefix/suffix anchor
+    }
+    let needle = pattern.trim_matches('%');
+    if needle.contains('%') {
+        return None; // interior wildcard: ordered multi-substring
+    }
+    if needle.is_empty() {
+        return Some(LikePatternShape::NotNull);
+    }
+    Some(LikePatternShape::Contains(needle))
+}
+
 // combine all exprs with OR operator
 fn disjunction(exprs: Vec<Arc<dyn PhysicalExpr>>) -> Arc<dyn PhysicalExpr> {
     if exprs.len() == 1 {
@@ -1548,6 +1600,67 @@ mod tests {
 
         assert_eq!(fields.len(), 1);
         assert!(fields.contains("поле"));
+    }
+
+    #[test]
+    fn test_like_pattern_shape() {
+        assert!(matches!(
+            like_pattern_shape("%err%"),
+            Some(LikePatternShape::Contains("err"))
+        ));
+        assert!(matches!(
+            like_pattern_shape("%%err%%"),
+            Some(LikePatternShape::Contains("err"))
+        ));
+        assert!(matches!(
+            like_pattern_shape("bar"),
+            Some(LikePatternShape::Equal("bar"))
+        ));
+        assert!(matches!(
+            like_pattern_shape(""),
+            Some(LikePatternShape::Equal(""))
+        ));
+        assert!(matches!(
+            like_pattern_shape("%"),
+            Some(LikePatternShape::NotNull)
+        ));
+        assert!(matches!(
+            like_pattern_shape("%%"),
+            Some(LikePatternShape::NotNull)
+        ));
+        for rejected in [
+            "err%", "%err", "a%b", "%a%b%", "%a_b%", "_", "%a\\%b%", "a_b", "a\\b",
+        ] {
+            assert!(
+                like_pattern_shape(rejected).is_none(),
+                "{rejected:?} must stay on the scan path"
+            );
+        }
+    }
+
+    #[test]
+    fn test_from_physical_expr_like() {
+        let index_fields = HashMap::new();
+        let like = |pattern: &str| -> Arc<dyn PhysicalExpr> {
+            Arc::new(LikeExpr::new(
+                false,
+                false,
+                Arc::new(Column::new("field1", 0)),
+                Arc::new(Literal::new(ScalarValue::Utf8(Some(pattern.to_string())))),
+            ))
+        };
+        assert_eq!(
+            Condition::from_physical_expr(&like("%err%"), &index_fields),
+            Condition::StrMatch("field1".to_string(), "err".to_string(), true)
+        );
+        assert_eq!(
+            Condition::from_physical_expr(&like("bar"), &index_fields),
+            Condition::Equal("field1".to_string(), "bar".to_string())
+        );
+        assert_eq!(
+            Condition::from_physical_expr(&like("%"), &index_fields),
+            Condition::IsNotNull("field1".to_string())
+        );
     }
 
     // add some test for str_match

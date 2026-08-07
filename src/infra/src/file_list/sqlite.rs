@@ -1081,6 +1081,7 @@ DO UPDATE SET
         node: &str,
         limit: i64,
         fast_mode: bool,
+        min_offsets: i64,
     ) -> Result<Vec<super::MergeJobRecord>> {
         let client = CLIENT_RW.clone();
         let client = client.lock().await;
@@ -1095,12 +1096,13 @@ DO UPDATE SET
         // several concurrently), so cross-node fan-out is safe; the advisory
         // lock still serializes claiming itself.
         let sql = if fast_mode {
-            r#"SELECT stream, id, 0 as num FROM file_list_jobs WHERE status = $1 ORDER BY offsets DESC LIMIT $2;"#
+            r#"SELECT stream, id, 0 as num FROM file_list_jobs WHERE status = $1 AND offsets >= $2 ORDER BY offsets DESC LIMIT $3;"#
         } else {
-            r#"SELECT stream, id, 0 as num FROM file_list_jobs WHERE status = $1 ORDER BY id ASC LIMIT $2;"#
+            r#"SELECT stream, id, 0 as num FROM file_list_jobs WHERE status = $1 AND offsets >= $2 ORDER BY id ASC LIMIT $3;"#
         };
         let ret = match sqlx::query_as::<_, super::MergeJobPendingRecord>(sql)
             .bind(super::FileListJobStatus::Pending)
+            .bind(min_offsets)
             .bind(limit)
             .fetch_all(&mut *tx)
             .await
@@ -2295,7 +2297,10 @@ mod tests {
         // the closed hour is re-queued: the same row returns to Pending
         let resurrected = list.add_job(org, st, stream, offset).await.unwrap();
         assert_eq!(resurrected, first, "resurrection reuses the row");
-        let claimed = list.get_pending_jobs("test_node", 10, false).await.unwrap();
+        let claimed = list
+            .get_pending_jobs("test_node", 10, false, 0)
+            .await
+            .unwrap();
         assert!(
             claimed.iter().any(|j| j.id == first),
             "a resurrected job must be claimable again"

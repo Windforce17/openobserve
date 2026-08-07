@@ -211,6 +211,7 @@ pub trait FileList: Sync + Send + 'static {
         node: &str,
         limit: i64,
         fast_mode: bool,
+        min_offsets: i64,
     ) -> Result<Vec<MergeJobRecord>>;
     async fn get_pending_jobs_count(&self) -> Result<stdHashMap<String, stdHashMap<String, i64>>>;
     async fn set_job_pending(&self, ids: &[i64], offsets: i64, stream: Option<&str>)
@@ -590,8 +591,11 @@ pub async fn get_pending_jobs(
     node: &str,
     limit: i64,
     fast_mode: bool,
+    min_offsets: i64,
 ) -> Result<Vec<MergeJobRecord>> {
-    CLIENT.get_pending_jobs(node, limit, fast_mode).await
+    CLIENT
+        .get_pending_jobs(node, limit, fast_mode, min_offsets)
+        .await
 }
 
 #[inline]

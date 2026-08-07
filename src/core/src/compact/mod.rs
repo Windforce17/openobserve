@@ -269,20 +269,37 @@ pub async fn run_generate_downsampling_job() -> Result<(), anyhow::Error> {
 }
 
 /// compactor merging
-pub async fn run_merge(job_tx: mpsc::Sender<worker::MergeJob>) -> Result<(), anyhow::Error> {
+/// `min_offsets` restricts the claim to jobs at or after that hour (0 = no
+/// restriction) — the live lane (#23) passes `now - lookback` so its
+/// reserved slots only ever pick recent-hour jobs. `max_jobs` overrides the
+/// claim size when > 0 (the live lane passes its slot count); 0 keeps the
+/// default worker-sized claim.
+pub async fn run_merge(
+    job_tx: mpsc::Sender<worker::MergeJob>,
+    min_offsets: i64,
+    max_jobs: i64,
+) -> Result<(), anyhow::Error> {
     let cfg = get_config();
     // Claim only what this node's merge workers can start soon: even with
     // heartbeats running from claim time (below), a worker-sized batch keeps
     // a slow node from hoarding jobs a healthy node could run. Oldest-first
     // claiming (get_pending_jobs) spreads a hot stream's hour-jobs across
     // the whole fleet.
-    let claim_limit = std::cmp::min(
-        cfg.compact.batch_size,
-        std::cmp::max(cfg.limit.file_merge_thread_num as i64, 1),
-    );
-    let jobs =
-        infra_file_list::get_pending_jobs(&LOCAL_NODE.uuid, claim_limit, cfg.compact.fast_mode)
-            .await?;
+    let claim_limit = if max_jobs > 0 {
+        max_jobs
+    } else {
+        std::cmp::min(
+            cfg.compact.batch_size,
+            std::cmp::max(cfg.limit.file_merge_thread_num as i64, 1),
+        )
+    };
+    let jobs = infra_file_list::get_pending_jobs(
+        &LOCAL_NODE.uuid,
+        claim_limit,
+        cfg.compact.fast_mode,
+        min_offsets,
+    )
+    .await?;
     if jobs.is_empty() {
         return Ok(());
     }

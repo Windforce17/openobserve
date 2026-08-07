@@ -1160,10 +1160,16 @@ pub struct Common {
     pub segment_retain_secs: u64,
     #[env_config(
         name = "ZO_SEGMENT_BUILD_BATCH",
-        default = 16,
-        help = "Segment WAL: max segments one builder claim processes into L0 files"
+        default = 32,
+        help = "Segment WAL: max segments one builder claim processes into L0 files. Bigger claims mean fewer, larger per-stream L0 files (a stream gets at most one file per claim per 128MB of ITS OWN decoded bytes), at the cost of the whole claim's decoded arrow held in RAM through the build: budget ~ batch x ZO_SEGMENT_FLUSH_SIZE_MB"
     )]
     pub segment_build_batch: usize,
+    #[env_config(
+        name = "ZO_SEGMENT_BUILD_MAX_WAIT_SECS",
+        default = 15,
+        help = "Segment WAL: builders wait for a full ZO_SEGMENT_BUILD_BATCH before claiming, up to this many seconds past the oldest claimable segment's registration. Turns the per-claim L0 output into full batches instead of 1-2-segment slivers (10k tiny files/hour/stream in prod, 2026-08-07). Data stays queryable through the segment tail while it waits. 0 = claim immediately (legacy behavior)"
+    )]
+    pub segment_build_max_wait_secs: u64,
     #[env_config(
         name = "ZO_SEGMENT_BUILD_LEASE_SECS",
         default = 120,
@@ -2190,6 +2196,30 @@ pub struct Compact {
     #[env_config(name = "ZO_COMPACT_INTERVAL", default = 10)] // seconds
     pub interval: u64,
     #[env_config(
+        name = "ZO_COMPACT_JOB_NUM",
+        default = 0,
+        help = "Concurrent merge jobs per compactor node (scheduler slots). 0 = ZO_FILE_MERGE_THREAD_NUM."
+    )]
+    pub job_num: usize,
+    #[env_config(
+        name = "ZO_COMPACT_LIVE_JOB_NUM",
+        default = 2,
+        help = "Reserved scheduler slots that claim only recent-hour jobs (offsets >= now - ZO_COMPACT_LIVE_LOOKBACK_HOURS), so a storm backlog can never starve the open hour. 0 disables the live lane."
+    )]
+    pub live_job_num: usize,
+    #[env_config(
+        name = "ZO_COMPACT_LIVE_WORKER_NUM",
+        default = 2,
+        help = "Dedicated merge workers serving the live lane's batches."
+    )]
+    pub live_worker_num: usize,
+    #[env_config(
+        name = "ZO_COMPACT_LIVE_LOOKBACK_HOURS",
+        default = 2,
+        help = "The live lane claims jobs with offsets within this many hours of now."
+    )]
+    pub live_lookback_hours: i64,
+    #[env_config(
         name = "ZO_COMPACT_DATA_RETENTION_INTERVAL",
         default = 3600,
         help = "Interval in seconds for the data retention job, default is 3600. Retention works at day granularity, so it doesn't need to run at ZO_COMPACT_INTERVAL"
@@ -3180,6 +3210,15 @@ fn check_common_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
         return Err(anyhow::anyhow!(
             "ZO_SEGMENT_BUILD_LEASE_SECS must be at least 30, got {}",
             cfg.common.segment_build_lease_secs
+        ));
+    }
+    // beyond ~5 minutes the gate stops buying larger files and only grows the
+    // per-query segment tail (and the sweeper's unbuilt-backlog warning fires
+    // at 10 minutes — a config must not look like an outage)
+    if cfg.common.segment_build_max_wait_secs > 300 {
+        return Err(anyhow::anyhow!(
+            "ZO_SEGMENT_BUILD_MAX_WAIT_SECS must be at most 300, got {}",
+            cfg.common.segment_build_max_wait_secs
         ));
     }
     if cfg.common.segment_retain_secs < 60 {

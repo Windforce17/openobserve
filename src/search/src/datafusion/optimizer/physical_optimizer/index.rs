@@ -33,7 +33,9 @@ use datafusion::{
     physical_optimizer::PhysicalOptimizerRule,
     physical_plan::{
         ExecutionPlan, PhysicalExpr,
-        expressions::{BinaryExpr, Column, InListExpr, IsNotNullExpr, IsNullExpr, NotExpr},
+        expressions::{
+            BinaryExpr, Column, InListExpr, IsNotNullExpr, IsNullExpr, LikeExpr, NotExpr,
+        },
         filter::{FilterExec, FilterExecBuilder},
         limit::LocalLimitExec,
         projection::ProjectionExec,
@@ -55,7 +57,8 @@ use crate::{
         },
     },
     index::{
-        Condition, IndexCondition, normalize_numeric_literal, numeric_kind_of, try_physical_value,
+        Condition, IndexCondition, like_pattern_shape, normalize_numeric_literal, numeric_kind_of,
+        try_physical_value,
     },
 };
 
@@ -515,6 +518,20 @@ fn is_expr_valid_for_index(expr: &Arc<dyn PhysicalExpr>, index_fields: &IndexFie
             }
             _ => false,
         };
+    } else if let Some(expr) = expr.downcast_ref::<LikeExpr>() {
+        // case-sensitive non-negated LIKE whose pattern is a plain
+        // substring/equality shape (see like_pattern_shape) is exactly a
+        // str_match/equality/IS-NOT-NULL condition. ILIKE case-folds
+        // differently from the index's lowercase-contains, and a NOT LIKE
+        // bitmap matches nearly every row — both stay on the scan path.
+        return !expr.negated()
+            && !expr.case_insensitive()
+            && is_column(expr.expr())
+            && index_fields
+                .get(get_column_name(expr.expr()))
+                .is_some_and(|dt| numeric_kind_of(dt).is_none())
+            && try_physical_value(expr.pattern())
+                .is_some_and(|pattern| like_pattern_shape(&pattern).is_some());
     } else if let Some(expr) = expr.downcast_ref::<IsNotNullExpr>() {
         // `field IS NOT NULL` maps to the core-file key-existence terms,
         // which exist for columns of every type
@@ -621,6 +638,20 @@ mod tests {
             vec![column(field), literal(lit)],
             FieldRef::new(Field::new(field, DataType::Utf8, true)),
             Arc::new(ConfigOptions::default()),
+        ))
+    }
+
+    fn like(
+        negated: bool,
+        case_insensitive: bool,
+        field: &str,
+        pattern: &str,
+    ) -> Arc<dyn PhysicalExpr> {
+        Arc::new(LikeExpr::new(
+            negated,
+            case_insensitive,
+            column(field),
+            literal(pattern),
         ))
     }
 
@@ -1015,6 +1046,40 @@ mod tests {
                 false,
                 None,
             ),
+            // name LIKE '%err%' is exactly str_match(name, 'err')
+            (
+                like(false, false, "name", "%err%"),
+                true,
+                Some(Condition::StrMatch(
+                    "name".to_string(),
+                    "err".to_string(),
+                    true,
+                )),
+            ),
+            // wildcard-free LIKE is string equality
+            (
+                like(false, false, "name", "bar"),
+                true,
+                Some(Condition::Equal("name".to_string(), "bar".to_string())),
+            ),
+            // LIKE '%' matches every non-null string
+            (
+                like(false, false, "name", "%"),
+                true,
+                Some(Condition::IsNotNull("name".to_string())),
+            ),
+            // prefix/suffix/interior wildcards are not plain substrings
+            (like(false, false, "name", "err%"), false, None),
+            (like(false, false, "name", "%err"), false, None),
+            (like(false, false, "name", "%a%b%"), false, None),
+            // `_` and `\` escapes make the pattern more than a substring
+            (like(false, false, "name", "%a_b%"), false, None),
+            (like(false, false, "name", "%a\\%b%"), false, None),
+            // NOT LIKE / ILIKE stay on the scan path
+            (like(true, false, "name", "%err%"), false, None),
+            (like(false, true, "name", "%err%"), false, None),
+            // LIKE on a non-index field stays in the filter
+            (like(false, false, "status", "%err%"), false, None),
         ];
 
         for (expr, is_valid, condition) in case {

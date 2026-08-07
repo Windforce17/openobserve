@@ -631,17 +631,19 @@ pub async fn merge_by_stream(
                     return Err(anyhow::Error::msg("send batch to worker failed"));
                 }
             }
-            let mut worker_results = Vec::with_capacity(batch_group_len);
-            for _ in 0..batch_group_len {
-                let result = inner_rx.recv().await.unwrap();
-                worker_results.push(result);
-            }
-
+            // Commit each batch AS ITS RESULT ARRIVES (streaming, #23): a
+            // long job interrupted mid-way (pod roll, lease loss, kill)
+            // keeps every batch committed so far, and the re-claim re-plans
+            // over the REMAINING files instead of redoing hours of work —
+            // the .69 recovery lost hour-14's merges repeatedly to the old
+            // collect-all-then-commit shape (2026-08-06). Each commit is
+            // individually safe: it is fenced on current job ownership.
             let mut last_error = None;
             let mut lease_lost = false;
             let mut check_guard = HashSet::with_capacity(batch_groups.len());
             let mut orphan_blooms = Vec::new();
-            for ret in worker_results {
+            for _ in 0..batch_group_len {
+                let ret = inner_rx.recv().await.unwrap();
                 let (batch_id, new_files, merged_files) = match ret {
                     Ok(v) => v,
                     Err(e) => {
@@ -2550,7 +2552,7 @@ mod tests {
 
         // claim for node-a (table-wide claim: keep ours, restore strangers)
         let claimed = retry_busy("claim", || {
-            infra_file_list::get_pending_jobs("fence-node-a", 10_000, false)
+            infra_file_list::get_pending_jobs("fence-node-a", 10_000, false, 0)
         })
         .await;
         assert!(claimed.iter().any(|j| j.id == job_id));
@@ -2592,7 +2594,7 @@ mod tests {
         })
         .await;
         let reclaimed = retry_busy("re-claim", || {
-            infra_file_list::get_pending_jobs("fence-node-b", 10_000, false)
+            infra_file_list::get_pending_jobs("fence-node-b", 10_000, false, 0)
         })
         .await;
         assert!(
