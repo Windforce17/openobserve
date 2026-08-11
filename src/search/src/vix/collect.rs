@@ -859,19 +859,26 @@ pub(super) fn unfiltered_top_n(
     limit: usize,
     ascend: bool,
 ) -> anyhow::Result<Option<TopNGroups>> {
-    let Some(counts) = reader.field_value_counts(field)? else {
+    let (k, max_groups) = top_n_overfetch(1, limit);
+    // #29 lever 1: doc_count-heap top-k — the winners' keys are the only
+    // dictionary keys ever materialized, so per-file memory is bounded by
+    // `max_groups` regardless of the field's cardinality (the old
+    // full-dictionary walk peaked at ~2GB on a 16M-distinct field)
+    let Some((counts, truncated)) = reader.field_value_top_k(field, max_groups, ascend)? else {
+        log::info!(
+            "search->vix: dict topn unavailable for field {field:?} \
+             (fts/partial/mixed-typed/over-cap), falling back",
+        );
         return Ok(None);
     };
     let mut top: TopNGroups = counts
         .into_iter()
         .map(|(value, count)| (vec![String::from_utf8_lossy(&value).into_owned()], count))
         .collect();
-    let (k, max_groups) = top_n_overfetch(1, limit);
-    if top.len() > max_groups {
+    if truncated {
         log::debug!(
-            "search->vix: dict topn file has {} distinct groups > max groups {max_groups}, \
+            "search->vix: dict topn file has more than {max_groups} distinct groups, \
              keeping top {k}, the merged top-n is approximate",
-            top.len(),
         );
         truncate_top_k(&mut top, k, ascend);
     }
@@ -890,25 +897,27 @@ pub(super) fn filtered_top_n(
     bitmap: &BooleanBuffer,
     field: &str,
     limit: usize,
-    ascend: bool,
+    _ascend: bool,
 ) -> anyhow::Result<Option<TopNGroups>> {
-    let Some(counts) = reader.field_value_counts_filtered(field, bitmap)? else {
+    // #29 lever 2: cap the value enumeration — a field with more distinct
+    // values than the per-file group budget falls back instead of
+    // materializing millions of keys
+    let (_, cap) = top_n_overfetch(1, limit);
+    let Some(counts) = reader.field_value_counts_filtered(field, bitmap, cap)? else {
+        log::info!(
+            "search->vix: filtered dict topn unavailable for field {field:?} \
+             (fts/partial/mixed-typed/over-cap {cap}), falling back",
+        );
         return Ok(None);
     };
-    let mut top: TopNGroups = counts
+    // the cap bounds enumeration at `max_groups`, so no post-truncation is
+    // needed: every enumerated group fits the per-file budget by
+    // construction (an over-budget file took the None arm above)
+    let top: TopNGroups = counts
         .into_iter()
         .filter(|(_, count)| *count > 0)
         .map(|(value, count)| (vec![String::from_utf8_lossy(&value).into_owned()], count))
         .collect();
-    let (k, max_groups) = top_n_overfetch(1, limit);
-    if top.len() > max_groups {
-        log::debug!(
-            "search->vix: filtered dict topn file has {} distinct groups > max groups \
-             {max_groups}, keeping top {k}, the merged top-n is approximate",
-            top.len(),
-        );
-        truncate_top_k(&mut top, k, ascend);
-    }
     Ok(Some(top))
 }
 
@@ -923,7 +932,18 @@ pub(super) fn filtered_distinct(
     limit: usize,
     ascend: bool,
 ) -> anyhow::Result<Option<HashSet<String>>> {
-    let Some(counts) = reader.field_value_counts_filtered(field, bitmap)? else {
+    // #29 lever 2: same enumeration cap as filtered_top_n — distinct only
+    // needs `limit` values, but the exactness contract still enumerates
+    // per-value counts, so the budget bounds that enumeration
+    let cap = config::get_config()
+        .limit
+        .inverted_index_topn_max_group_num
+        .max(limit);
+    let Some(counts) = reader.field_value_counts_filtered(field, bitmap, cap)? else {
+        log::info!(
+            "search->vix: filtered dict distinct unavailable for field {field:?} \
+             (fts/partial/mixed-typed/over-cap {cap}), falling back",
+        );
         return Ok(None);
     };
     let hit_values: Vec<&Vec<u8>> = counts
@@ -959,25 +979,22 @@ pub(super) fn unfiltered_distinct(
     limit: usize,
     ascend: bool,
 ) -> anyhow::Result<Option<HashSet<String>>> {
-    let Some(counts) = reader.field_value_counts(field)? else {
+    // #29 lever 1 (distinct shape): the dictionary is already in byte
+    // order, so the head/tail `limit` keys ARE the answer — resolve only
+    // those instead of materializing every distinct value
+    let Some(values) = reader.field_value_head(field, limit, !ascend)? else {
+        log::info!(
+            "search->vix: dict distinct unavailable for field {field:?} \
+             (fts/partial/mixed-typed), falling back",
+        );
         return Ok(None);
     };
-    let take = limit.min(counts.len());
-    let selected: HashSet<String> = if ascend {
-        counts
+    Ok(Some(
+        values
             .iter()
-            .take(take)
-            .map(|(value, _)| String::from_utf8_lossy(value).into_owned())
-            .collect()
-    } else {
-        counts
-            .iter()
-            .rev()
-            .take(take)
-            .map(|(value, _)| String::from_utf8_lossy(value).into_owned())
-            .collect()
-    };
-    Ok(Some(selected))
+            .map(|value| String::from_utf8_lossy(value).into_owned())
+            .collect(),
+    ))
 }
 
 /// Count every document's `field` value out of the `_source` JSON, in

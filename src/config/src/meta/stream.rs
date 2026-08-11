@@ -15,10 +15,14 @@
 
 use std::{cmp::max, fmt::Display, str::FromStr, sync::Arc};
 
-use arrow::buffer::BooleanBuffer;
+use arrow::{
+    buffer::{BooleanBuffer, MutableBuffer},
+    util::bit_util,
+};
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use hashbrown::HashMap;
 use proto::cluster_rpc;
+use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
 use utoipa::ToSchema;
 
@@ -268,11 +272,119 @@ impl MemorySize for RemoteStreamParams {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FileSelection {
-    /// Row ids matched by the inverted index, as a per-row bitmap of
-    /// length `num_rows` (one bit per row).
-    Rows(Arc<BooleanBuffer>),
+    /// Row ids matched by the inverted index, as a compressed bitmap over
+    /// the file's rows (see [`RowIdBitmap`]).
+    Rows(Arc<RowIdBitmap>),
     /// Row group ids selected by row-group-level sampling.
     RowGroups(Arc<Vec<u32>>),
+}
+
+/// Row ids matched by the inverted index for one data file, as a compressed
+/// (roaring) bitmap over the row-id universe `0..num_rows`.
+///
+/// The vix skip guard caps every surviving selection at the skip threshold
+/// (~35% density) and the common needle case matches a handful of rows out
+/// of millions, so this form is typically orders of magnitude smaller than
+/// the dense one-bit-per-row `BooleanBuffer` it replaced (512 KB for a 4M-row
+/// file regardless of match count). That matters because values of this type
+/// are RESIDENT: they live in the vix result cache, on
+/// [`FileKey::selection`], and in the per-query scan-selection registry for
+/// the whole scan. The reader's eval pipeline stays dense (transient, SIMD
+/// AND/OR) — [`RowIdBitmap::from_dense`] converts once at the result
+/// boundary and [`RowIdBitmap::to_dense`] materializes back the few times
+/// the dense form is needed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RowIdBitmap {
+    rows: RoaringBitmap,
+    num_rows: usize,
+}
+
+impl RowIdBitmap {
+    /// Compress a dense per-row match bitmap (one bit per row of the file).
+    pub fn from_dense(bits: &BooleanBuffer) -> Self {
+        let mut rows = RoaringBitmap::new();
+        for (start, end) in bits.set_slices() {
+            rows.insert_range(start as u32..end as u32);
+        }
+        // scattered mid-density inputs otherwise land as run stores with one
+        // interval per slice, up to ~1.4x the dense size; this settles every
+        // container into its minimal representation (bounded by the 8KB
+        // bitmap container, i.e. never meaningfully above dense)
+        rows.optimize();
+        Self {
+            rows,
+            num_rows: bits.len(),
+        }
+    }
+
+    /// Build from matched row ids in any order (duplicates are fine); every
+    /// id must be `< num_rows`.
+    pub fn from_row_ids(num_rows: usize, ids: impl IntoIterator<Item = u32>) -> Self {
+        let mut sorted: Vec<u32> = ids.into_iter().collect();
+        sorted.sort_unstable();
+        sorted.dedup();
+        debug_assert!(sorted.last().is_none_or(|&v| (v as usize) < num_rows));
+        let mut rows = RoaringBitmap::from_sorted_iter(sorted).expect("sorted and deduped above");
+        rows.optimize();
+        Self { rows, num_rows }
+    }
+
+    /// Materialize the dense per-row form, for code that combines bitmaps
+    /// with arrow's vectorized boolean ops.
+    pub fn to_dense(&self) -> BooleanBuffer {
+        let mut buffer = MutableBuffer::from_len_zeroed(bit_util::ceil(self.num_rows, 8));
+        let slice = buffer.as_slice_mut();
+        for id in &self.rows {
+            bit_util::set_bit(slice, id as usize);
+        }
+        BooleanBuffer::new(buffer.into(), 0, self.num_rows)
+    }
+
+    /// Number of rows in the file (the bitmap's universe) — NOT the match
+    /// count, which is [`Self::matched`].
+    pub fn num_rows(&self) -> usize {
+        self.num_rows
+    }
+
+    /// Number of matched rows.
+    pub fn matched(&self) -> u64 {
+        self.rows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// Whether every row of the file is selected (equivalent to a full scan).
+    pub fn selects_all(&self) -> bool {
+        self.rows.len() == self.num_rows as u64
+    }
+
+    /// Matched row ids in ascending order.
+    pub fn iter(&self) -> impl Iterator<Item = u32> + '_ {
+        self.rows.iter()
+    }
+
+    /// Matched rows as maximal half-open `[start, end)` runs, ascending.
+    pub fn runs(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        let mut iter = self.rows.iter().peekable();
+        std::iter::from_fn(move || {
+            let start = iter.next()?;
+            let mut end = start;
+            while end < u32::MAX && iter.peek() == Some(&(end + 1)) {
+                end += 1;
+                iter.next();
+            }
+            Some((start as usize, end as usize + 1))
+        })
+    }
+
+    /// Resident footprint estimate for cache budgeting. The portable
+    /// serialized size tracks the container heap within a small constant;
+    /// budgeting needs stable and monotone, not exact.
+    pub fn memory_size(&self) -> usize {
+        self.rows.serialized_size() + std::mem::size_of::<Self>()
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1958,12 +2070,126 @@ mod tests {
     fn test_file_key_with_selection() {
         let mut key = FileKey::from_file_name("files/k.parquet");
         assert!(key.selection.is_none());
-        let selection = FileSelection::Rows(Arc::new(BooleanBuffer::from_iter(
-            (0..16u32).map(|i| [1u32, 5, 9].contains(&i)),
-        )));
+        let selection = FileSelection::Rows(Arc::new(RowIdBitmap::from_row_ids(16, [1u32, 5, 9])));
         key.with_selection(selection, Some(1024));
         assert!(key.selection.is_some());
         assert_eq!(key.row_group_size, Some(1024));
+    }
+
+    #[test]
+    fn test_row_id_bitmap_dense_round_trip() {
+        // dense -> sparse -> dense is the identity, with the dense form as
+        // the oracle (scattered ids, runs, and boundary bits)
+        let dense = BooleanBuffer::from_iter(
+            (0..1000u32).map(|i| i == 0 || (100..200).contains(&i) || i == 511 || i == 999),
+        );
+        let sparse = RowIdBitmap::from_dense(&dense);
+        assert_eq!(sparse.num_rows(), 1000);
+        assert_eq!(sparse.matched(), dense.count_set_bits() as u64);
+        assert_eq!(sparse.to_dense(), dense);
+        assert_eq!(
+            sparse.iter().map(|v| v as usize).collect::<Vec<_>>(),
+            dense.set_indices().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            sparse.runs().collect::<Vec<_>>(),
+            dense.set_slices().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_row_id_bitmap_from_row_ids_unsorted_dups() {
+        let sparse = RowIdBitmap::from_row_ids(64, [9u32, 1, 5, 5, 1]);
+        assert_eq!(sparse.iter().collect::<Vec<_>>(), vec![1, 5, 9]);
+        assert_eq!(sparse.matched(), 3);
+        assert!(!sparse.is_empty());
+        assert!(!sparse.selects_all());
+    }
+
+    #[test]
+    fn test_row_id_bitmap_empty_and_full() {
+        let empty = RowIdBitmap::from_row_ids(128, std::iter::empty());
+        assert!(empty.is_empty());
+        assert_eq!(empty.matched(), 0);
+        assert_eq!(empty.to_dense(), BooleanBuffer::new_unset(128));
+        assert_eq!(empty.runs().count(), 0);
+
+        let full = RowIdBitmap::from_dense(&BooleanBuffer::new_set(128));
+        assert!(full.selects_all());
+        assert_eq!(full.matched(), 128);
+        assert_eq!(full.runs().collect::<Vec<_>>(), vec![(0, 128)]);
+        assert_eq!(full.to_dense(), BooleanBuffer::new_set(128));
+
+        let zero_rows = RowIdBitmap::from_row_ids(0, std::iter::empty());
+        assert!(zero_rows.is_empty());
+        // an empty universe has "all" of its zero rows selected
+        assert!(zero_rows.selects_all());
+        assert_eq!(zero_rows.to_dense().len(), 0);
+    }
+
+    /// Diagnostic, not a gate (run with `--ignored --nocapture`, release,
+    /// median of 3): resident footprint + conversion cost of representative
+    /// selection shapes at prod merged-file scale (1.92M rows). The
+    /// per-shape `to_dense == dense` assert doubles as a large-scale
+    /// round-trip oracle.
+    #[test]
+    #[ignore]
+    fn bench_row_id_bitmap_shapes() {
+        const NUM_ROWS: usize = 1_920_000;
+        // deterministic splitmix-style draw, no rand dep
+        let draw = |count: usize| -> Vec<u32> {
+            let mut x = 0x2545F4914F6CDD1Du64;
+            (0..count)
+                .map(|_| {
+                    x = x
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    ((x >> 33) % NUM_ROWS as u64) as u32
+                })
+                .collect()
+        };
+        let shapes: Vec<(&str, Vec<u32>)> = vec![
+            ("needle_x3", vec![17, 960_000, 1_919_999]),
+            ("2pct_scattered", draw(NUM_ROWS / 50)),
+            ("35pct_draw_scattered", draw(NUM_ROWS * 35 / 100)),
+            (
+                "2pct_one_run",
+                (100_000..100_000 + (NUM_ROWS as u32) / 50).collect(),
+            ),
+        ];
+        let dense_bytes = NUM_ROWS.div_ceil(8);
+        for (name, ids) in shapes {
+            let dense = RowIdBitmap::from_row_ids(NUM_ROWS, ids).to_dense();
+            let t = std::time::Instant::now();
+            let sparse = RowIdBitmap::from_dense(&dense);
+            let t_from = t.elapsed();
+            let t = std::time::Instant::now();
+            let back = sparse.to_dense();
+            let t_to = t.elapsed();
+            assert_eq!(back, dense, "round trip must be exact for {name}");
+            eprintln!(
+                "shape={name} matched={} ({:.2}%) dense={dense_bytes}B sparse={}B ratio={:.1}x from_dense={t_from:?} to_dense={t_to:?}",
+                sparse.matched(),
+                sparse.matched() as f64 / NUM_ROWS as f64 * 100.0,
+                sparse.memory_size(),
+                dense_bytes as f64 / sparse.memory_size() as f64,
+            );
+        }
+    }
+
+    #[test]
+    fn test_row_id_bitmap_needle_footprint() {
+        // the whole point of the sparse form: a needle match over a large
+        // file must cost bytes, not the dense num_rows/8
+        let sparse = RowIdBitmap::from_row_ids(4_000_000, [17u32, 1_999_999, 3_999_999]);
+        assert!(
+            sparse.memory_size() < 256,
+            "needle bitmap footprint {} should be tiny, not ~512KB",
+            sparse.memory_size()
+        );
+        assert_eq!(sparse.iter().collect::<Vec<_>>(), vec![
+            17, 1_999_999, 3_999_999
+        ]);
     }
 
     #[test]

@@ -25,8 +25,10 @@ use std::{
     },
 };
 
-use arrow::buffer::BooleanBuffer;
-use config::{meta::inverted_index::IndexOptimizeMode, metrics};
+use config::{
+    meta::{inverted_index::IndexOptimizeMode, stream::RowIdBitmap},
+    metrics,
+};
 use dashmap::DashMap;
 
 use super::VixSearchResult;
@@ -36,8 +38,12 @@ pub static GLOBAL_CACHE: Lazy<Arc<VixResultCache>> =
 
 #[derive(Debug, Clone)]
 pub enum CacheEntry {
-    /// (matched_row_ids bitmap, row_group_size_from_index_file)
-    RowIds(Arc<BooleanBuffer>, Option<u32>),
+    /// (matched row ids as a compressed bitmap, row_group_size_from_index_file).
+    /// The sparse form is the reason the cache can hold the needle-query
+    /// working set: a dense per-row bitmap cost ~512 KB per 4M-row file no
+    /// matter how few rows matched, capping the 256 MB budget at ~500
+    /// entries; compressed needle entries cost bytes.
+    RowIds(Arc<RowIdBitmap>, Option<u32>),
     /// simple select: (`(_timestamp, doc_id)` candidates, row_group_size)
     SelectCandidates(Arc<Vec<(i64, u32)>>, Option<u32>),
     /// simple count optimization
@@ -133,9 +139,7 @@ impl CacheEntry {
 impl CacheEntry {
     pub fn get_memory_size(&self) -> usize {
         match self {
-            CacheEntry::RowIds(packed, ..) => {
-                packed.inner().len() + std::mem::size_of::<BooleanBuffer>()
-            }
+            CacheEntry::RowIds(packed, ..) => packed.memory_size(),
             CacheEntry::SelectCandidates(candidates, ..) => {
                 candidates.capacity() * std::mem::size_of::<(i64, u32)>()
                     + std::mem::size_of::<Vec<(i64, u32)>>()
@@ -297,12 +301,7 @@ mod tests {
     use super::*;
 
     fn create_test_row_ids_result() -> CacheEntry {
-        CacheEntry::RowIds(
-            Arc::new(BooleanBuffer::from_iter(
-                (0..64u32).map(|i| [10u32, 20, 30].contains(&i)),
-            )),
-            None,
-        )
+        CacheEntry::RowIds(Arc::new(RowIdBitmap::from_row_ids(64, [10u32, 20, 30])), None)
     }
 
     fn create_test_count_result() -> CacheEntry {
@@ -327,7 +326,7 @@ mod tests {
         assert!(retrieved.is_some());
         match retrieved.unwrap() {
             VixSearchResult::RowIdsSelection { row_ids, .. } => {
-                assert_eq!(row_ids.set_indices().collect::<Vec<_>>(), vec![10, 20, 30]);
+                assert_eq!(row_ids.iter().collect::<Vec<_>>(), vec![10, 20, 30]);
             }
             _ => panic!("Expected RowIdsSelection result"),
         }
@@ -384,9 +383,7 @@ mod tests {
         let cache = VixResultCache::new(10);
 
         let entry = CacheEntry::RowIds(
-            Arc::new(BooleanBuffer::from_iter(
-                (0..64u32).map(|i| [10u32, 20].contains(&i)),
-            )),
+            Arc::new(RowIdBitmap::from_row_ids(64, [10u32, 20])),
             Some(1024),
         );
         cache.put("row_ids_key".to_string(), entry);
@@ -396,7 +393,7 @@ mod tests {
             row_group_size,
         }) = cache.get("row_ids_key", None)
         {
-            assert_eq!(row_ids.set_indices().collect::<Vec<_>>(), vec![10, 20]);
+            assert_eq!(row_ids.iter().collect::<Vec<_>>(), vec![10, 20]);
             assert_eq!(row_group_size, Some(1024));
         } else {
             panic!("Expected RowIdsSelection result");

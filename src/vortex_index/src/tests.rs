@@ -3041,6 +3041,167 @@ fn field_value_counts_exact_paths() {
     assert_eq!(reader.field_value_counts("missing").unwrap(), Some(vec![]));
 }
 
+/// Guard for the disjoint-count fast path: `count(query)` must equal
+/// `eval(query).count_set_bits()` for every leaf shape — single-field term
+/// leaves (the new doc_count-sum path), fts-field leaves and any-field
+/// leaves (which must keep the postings union: their term doc sets
+/// overlap), and numeric-mixed fields.
+#[test]
+fn count_matches_eval_popcount_across_leaf_shapes() {
+    let reader = build_docs_dataset(false);
+    let queries = vec![
+        // multi-ordinal single term field: api+auth -> disjoint-sum path
+        VixQuery::Prefix {
+            field: Some("svc".to_string()),
+            prefix: b"a".to_vec(),
+        },
+        // the whole field
+        VixQuery::Prefix {
+            field: Some("svc".to_string()),
+            prefix: b"".to_vec(),
+        },
+        // db+web via substring, both case paths
+        VixQuery::Contains {
+            field: Some("svc".to_string()),
+            needle: b"b".to_vec(),
+            case_insensitive: false,
+        },
+        VixQuery::Contains {
+            field: Some("svc".to_string()),
+            needle: b"B".to_vec(),
+            case_insensitive: true,
+        },
+        VixQuery::Regex {
+            field: Some("svc".to_string()),
+            pattern: ".*b.*".to_string(),
+        },
+        // numeric-typed field: tagged terms, still one value per doc
+        VixQuery::Prefix {
+            field: Some("code".to_string()),
+            prefix: b"".to_vec(),
+        },
+        // any-field leaves cross fields AND reach fts token terms (which
+        // overlap per doc) -> must stay on the union path. A scoped leaf on
+        // a pure-fts field cannot even resolve (require_field_id refuses),
+        // so field: None is the reachable overlap shape.
+        VixQuery::Contains {
+            field: None,
+            needle: b"e".to_vec(),
+            case_insensitive: false,
+        },
+        VixQuery::Prefix {
+            field: None,
+            prefix: b"a".to_vec(),
+        },
+    ];
+    for query in queries {
+        assert_eq!(
+            reader.count(&query).unwrap(),
+            reader.eval(&query).unwrap().count_set_bits() as u64,
+            "count must equal eval popcount for {query:?}"
+        );
+    }
+}
+
+/// #29 differential: the key-free top-k/head paths must agree with the
+/// full-walk `field_value_counts` on every eligibility shape — the same
+/// Some/None decisions, the same counts, the same keys, and the same
+/// truncation set as the collector's `truncate_top_k` comparator.
+#[test]
+fn field_value_top_k_and_head_match_walk() {
+    let reader = build_docs_dataset(false);
+
+    // untruncated: exact equality with the walk (both key-ascending)
+    for field in ["level", "svc"] {
+        let walk = reader.field_value_counts(field).unwrap().unwrap();
+        for ascend in [false, true] {
+            let (top, truncated) = reader
+                .field_value_top_k(field, 1000, ascend)
+                .unwrap()
+                .unwrap();
+            assert!(!truncated, "{field} has few distinct values");
+            assert_eq!(top, walk, "untruncated top-k must equal the walk for {field}");
+        }
+        let keys: Vec<Vec<u8>> = walk.iter().map(|(k, _)| k.clone()).collect();
+        for take in [1usize, 2, 100] {
+            let head = reader.field_value_head(field, take, false).unwrap().unwrap();
+            assert_eq!(head, keys.iter().take(take).cloned().collect::<Vec<_>>());
+            let tail = reader.field_value_head(field, take, true).unwrap().unwrap();
+            let n = take.min(keys.len());
+            assert_eq!(tail, keys[keys.len() - n..].to_vec());
+        }
+    }
+
+    // ineligible shapes refuse on EVERY path: fts (log), numeric-typed (code)
+    for field in ["log", "code"] {
+        assert_eq!(reader.field_value_counts(field).unwrap(), None);
+        assert_eq!(reader.field_value_top_k(field, 1000, false).unwrap(), None);
+        assert_eq!(reader.field_value_head(field, 5, false).unwrap(), None);
+    }
+    // absent field: provably empty on every path
+    assert_eq!(
+        reader.field_value_top_k("missing", 1000, false).unwrap(),
+        Some((vec![], false))
+    );
+    assert_eq!(
+        reader.field_value_head("missing", 5, false).unwrap(),
+        Some(vec![])
+    );
+
+    // truncation: the kept SET matches walk + the truncate_top_k comparator
+    // (count desc/asc, ties toward the smaller key). svc has a 3-way count
+    // tie (auth/db/web at 2), exercising the tie-break.
+    for field in ["level", "svc"] {
+        let walk = reader.field_value_counts(field).unwrap().unwrap();
+        for ascend in [false, true] {
+            let (mut top, truncated) = reader
+                .field_value_top_k(field, 2, ascend)
+                .unwrap()
+                .unwrap();
+            assert!(truncated, "{field} has more than 2 distinct values");
+            assert_eq!(top.len(), 2);
+            let mut oracle = walk.clone();
+            if ascend {
+                oracle.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+            } else {
+                oracle.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            }
+            oracle.truncate(2);
+            // top-k returns key-ascending; compare as sorted sets
+            oracle.sort();
+            top.sort();
+            assert_eq!(top, oracle, "{field} ascend={ascend}");
+        }
+    }
+
+    // empty-string values are ordinary countable groups on the new paths too
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("_timestamp", DataType::Int64, false),
+        Field::new("f", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+            Arc::new(StringArray::from(vec![Some(""), Some(""), Some("x")])),
+        ],
+    )
+    .unwrap();
+    let mut writer = VixWriter::new(&schema, VixWriterOptions::default(), false);
+    writer
+        .push_batch_with_source(&batch, &dataset_sources(0..3), None)
+        .unwrap();
+    let reader = VixReader::open(Bytes::from(writer.finish().unwrap())).unwrap();
+    assert_eq!(
+        reader.field_value_top_k("f", 10, false).unwrap(),
+        Some((vec![(b"".to_vec(), 2), (b"x".to_vec(), 1)], false))
+    );
+    assert_eq!(
+        reader.field_value_head("f", 1, false).unwrap(),
+        Some(vec![b"".to_vec()])
+    );
+}
+
 /// Dense-elided *value* terms keep their `doc_count`, and multi-row-group
 /// dictionaries aggregate across groups.
 #[test]
@@ -3881,6 +4042,69 @@ mod ranged {
         );
     }
 
+    /// #29 at scale: top-k/head over the 100k-distinct fixture equal the
+    /// walk-derived oracle in memory AND ranged mode, and the ranged top-k
+    /// stays fetch-bounded — it must never materialize the dictionary.
+    /// (Every svc count is 1, so this is also the tie-break stress: the
+    /// kept set is decided purely by the smaller-key rule at scale.)
+    #[test]
+    fn ranged_field_value_top_k_matches_walk_at_scale() {
+        let data = build_large_core_file();
+        let mem = VixReader::open(data.clone()).unwrap();
+        let walk = mem.field_value_counts("svc").unwrap().unwrap();
+        assert_eq!(walk.len(), 100_000);
+        let cap = 1000usize;
+        let oracle_set = |ascend: bool| -> Vec<(Vec<u8>, u64)> {
+            let mut oracle = walk.clone();
+            if ascend {
+                oracle.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+            } else {
+                oracle.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            }
+            oracle.truncate(cap);
+            oracle.sort();
+            oracle
+        };
+        for ascend in [false, true] {
+            let (mut top, truncated) =
+                mem.field_value_top_k("svc", cap, ascend).unwrap().unwrap();
+            assert!(truncated);
+            top.sort();
+            assert_eq!(top, oracle_set(ascend), "mem ascend={ascend}");
+        }
+        let keys: Vec<Vec<u8>> = walk.iter().map(|(k, _)| k.clone()).collect();
+        assert_eq!(
+            mem.field_value_head("svc", 7, false).unwrap().unwrap(),
+            keys[..7].to_vec()
+        );
+        assert_eq!(
+            mem.field_value_head("svc", 7, true).unwrap().unwrap(),
+            keys[keys.len() - 7..].to_vec()
+        );
+
+        let source = CountingSource::new(data);
+        let ranged =
+            VixReader::open_ranged(Arc::clone(&source) as Arc<dyn VixRangeSource>).unwrap();
+        let before = source.fetches();
+        let (mut top, truncated) = ranged.field_value_top_k("svc", cap, false).unwrap().unwrap();
+        assert!(truncated);
+        top.sort();
+        assert_eq!(top, oracle_set(false), "ranged top-k");
+        let topk_fetches = source.fetches() - before;
+        eprintln!(
+            "[top-k budget] fetches={topk_fetches} bytes={}",
+            source.bytes()
+        );
+        assert!(
+            topk_fetches <= 64,
+            "top-k must stay fetch-bounded, used {topk_fetches} fetches"
+        );
+        assert_eq!(
+            ranged.field_value_head("svc", 7, false).unwrap().unwrap(),
+            keys[..7].to_vec()
+        );
+    }
+
     /// #27: a multi-term union over out-of-row (plist) postings resolves
     /// every pointer record through ONE batched round trip instead of a
     /// point fetch per term.
@@ -4582,6 +4806,61 @@ fn docs_column_dict_matches_canonical() {
             }
         }
         assert!(reader.read_docs_column_dict("missing-column").is_err());
+    }
+}
+
+/// Manual #29 harness: times the unfiltered value-enumeration walk
+/// (`field_value_counts`) behind unfiltered TopN/Distinct and reports the
+/// peak-RSS it costs — the "allocation bomb" baseline and its fix's
+/// before/after instrument.
+/// `O2_VIX_FILE=<file> [O2_VIX_FIELD=trace_id] cargo test -p vortex_index
+/// --release bench_unfiltered_value_walk -- --ignored --nocapture`
+#[test]
+#[ignore = "manual #29 profiling against a real file (set O2_VIX_FILE)"]
+fn bench_unfiltered_value_walk() {
+    let Ok(path) = std::env::var("O2_VIX_FILE") else {
+        eprintln!("O2_VIX_FILE not set; skipping");
+        return;
+    };
+    let field = std::env::var("O2_VIX_FIELD").unwrap_or_else(|_| "trace_id".to_string());
+    let vm_hwm_kb = || -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find(|l| l.starts_with("VmHWM:"))
+                    .and_then(|l| l.split_whitespace().nth(1).and_then(|v| v.parse().ok()))
+            })
+            .unwrap_or(0)
+    };
+    let data = Bytes::from(std::fs::read(&path).expect("read vix file"));
+    let reader = VixReader::open(data).expect("open");
+    eprintln!("file={path} rows={} field={field}", reader.row_count());
+    // the #29 lever-1 path first, while the process high-water mark is
+    // still low — its footprint would be invisible after the walk
+    let before_kb = vm_hwm_kb();
+    for i in 0..3 {
+        let t = std::time::Instant::now();
+        let top = reader.field_value_top_k(&field, 1000, false).unwrap();
+        let wall = t.elapsed();
+        let n = top.as_ref().map(|(c, truncated)| (c.len(), *truncated));
+        eprintln!(
+            "top_k iter={i} wall={wall:?} kept={n:?} vm_hwm_delta_kb={}",
+            vm_hwm_kb().saturating_sub(before_kb)
+        );
+        std::hint::black_box(top);
+    }
+    let before_kb = vm_hwm_kb();
+    for i in 0..3 {
+        let t = std::time::Instant::now();
+        let counts = reader.field_value_counts(&field).unwrap();
+        let wall = t.elapsed();
+        let n = counts.as_ref().map(|c| c.len());
+        eprintln!(
+            "walk  iter={i} wall={wall:?} distinct={n:?} vm_hwm_delta_kb={}",
+            vm_hwm_kb().saturating_sub(before_kb)
+        );
+        std::hint::black_box(counts);
     }
 }
 

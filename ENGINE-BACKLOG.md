@@ -10,8 +10,20 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
   below: ~4KB prefix-compressed key blocks + resident restart index;
   pre-block files hard-error; FST deleted). Keys stay field-major
   `{fid u16 BE}{token}`; match_all = per-fts-field seeks; bloom keys
-  PINNED to v1 byte form forever. plist stages 1-4 in the binary, writer
-  dark (ZO_VIX_PLIST_MIN_DOCS=0; enable 8192 compactor-first next).
+  PINNED to v1 byte form forever. plist stages 1-4 in the binary; writer
+  LIVE compactor-only since 2026-08-04: ZO_VIX_PLIST_MIN_DOCS=8192 as a
+  direct env on the compactor workload (NOT in obs-env — verified in the
+  prod pod 2026-08-10; this line previously said "writer dark", stale).
+  CONSEQUENCE CORRECTED (2026-08-11, prod-ops #375 review caught the
+  first wording as a P0): the fleet's rollback floor is .62 and it is
+  HARD — but the cause is the BLOCK-DICTIONARY cutover (no legacy read
+  support; the .69 incident: "cannot read/write block-dictionary
+  .vix"; pre-cutover S3 prefix deleted 2026-08-05), NOT plist. Plist's
+  own reader constraint is >= .61 (stages 2-3 shipped dark in .61,
+  all read+merge paths) — weaker than and subsumed by the .62 line,
+  and it never sets the floor. Below .62 = total read outage, never a
+  rollback target; the floor never relaxes. Pin-site notes corrected
+  in prod-ops #375. Stage-4b (ranged sub-record reads) still open.
   Fetch gate ZO_VIX_FETCH_CONCURRENCY=16, point-block fetch_many.
   Segment-scan budget counts only plan-needed columns (#20).
 - Narrow WAL schemas (present fields only), spooled big move uploads
@@ -275,8 +287,9 @@ note: always quote matched-count + files context with timings.
    the current tree parented on FETCH_HEAD, author/committer `anonymous
    <anonymous@users.noreply.github.com>`, generic feature-summary
    message, fast-forward push only, NEVER identity/session links, never
-   force-push. Chain head df60f9091b published 2026-08-07 (== tree of
-   local c95687b221). gh on this box holds both accounts: switch with
+   force-push. Chain head da862aa6f5 published 2026-08-07 (== tree of
+   local 845243a404, the dev-verified .74 state; previous head
+   df60f9091b). gh on this box holds both accounts: switch with
    `gh auth switch --user Windforce17` to push, then switch back to
    wangzhichen-manus.
 7. Watch: ingester-4 OOMKilled 2x 2026-07-28 21:34Z (boot+burst, self-
@@ -1122,7 +1135,18 @@ replay/after74*):
   recovered; a force-killed (grace 0) ingester caused ZERO failed
   probes across 130s. (Synthetic-kill registrations cleaned via the
   normal death path; the fix covers the roll-orphaned class.)
-Prod PR: devops-argocd-prod-ops #373 (from branch zhichen).
+PROD SHIPPED 2026-08-08 ~02:15Z (#373 merged b82a576ac1 by owner
+instruction, admin merge; ROLLBACK NOTE (.74) added per review P1):
+20/20 engine pods Ready in ~7 min, zero restarts from the roll, one
+roll-stale registration evicted by the #28 fix ("remove it" x1),
+residual health failures 0 within minutes, armor firings 0.
+Prod probes: SimpleSelect 24h LIMIT 10000 = 1,214ms cold / 577ms warm
+(idx 382ms -> 1ms) over ~1,700 files/follower. Trace-list 1h = 4.5s /
+3.1s. Trace-list 24h = 186.6s + one querier OOM -> #29 below (NOT a
+regression: pre-.74 the same query needed ~580k point fetches — it was
+physically impossible, now it is merely pathological).
+RELEASE ANCESTOR GATE now: git merge-base --is-ancestor 02a9d3bf15c5
+HEAD (fleet commit for .74; supersedes 85399cceef).
 BUILD NOTE: the workspace's datafusion-functions-json sibling now lives
 IN-TREE at crates/datafusion-functions-json (VENDORED.md records base
 rev 0df53d71 + the local negative-number patch) — the old external
@@ -1157,3 +1181,261 @@ window fan-outs still dial the dead node — a short gRPC/HTTP CONNECT
 timeout + retry-elsewhere would shrink the blast radius to ms; (b) the
 NATS KV obs_nodes entry outlives the process (no lease-TTL expiry) —
 eviction is per-observer view only.
+
+
+## #29 unfiltered high-cardinality TopN is an allocation bomb once un-throttled (2026-08-08, prod evidence — FIXED IN TREE 2026-08-10, all three levers, ships next build)
+Evidence (prod, 24h unconditioned GROUP BY trace_id LIMIT 100, trace
+019fdf2e65cb71c19e2fb57f2284bdb4): 186.6s total; per-follower vix eval
+9.3-26.7s with 4,969-11,343 fetches / 8.5-18.7GB over 1,659-1,759 files
+(the #27 coalescing WORKING: ~3-7 fetches/file where pre-.74 needed
+~350/file = ~580k total, i.e. the query was previously impossible);
+top_n hits 479k-1.08M per follower; file_num 504-1,149 handed to the
+scan branch (is_add_filter_back true) which ate the remaining ~160s.
+obs-querier-3 OOMKilled (exit 137, 02:27:53Z) during the probe: the
+value-enumeration walk allocates millions of Vec<u8> keys per file and
+eval_concurrency (64) runs walks CONCURRENTLY — .74's fetch fix removed
+the accidental serialization that kept peak memory low. Realistic UI
+windows are fine (1h = 4.5s/3.1s, no OOM).
+DO NOT probe 24h unconditioned trace-list on prod until this lands.
+Levers, in order:
+1. doc_count-heap top-k for unfiltered single-field TopN (stream the
+   field's doc_count ordinal range into a k-heap, resolve only the k
+   winning keys, gate on string-only fields, fall back to the walk
+   otherwise) — kills BOTH the CPU and the allocation bomb; the #27
+   deferred lever, now prod-motivated.
+2. Enumeration cap in field_string_value_terms: past
+   max(inverted_index_topn_max_group_num, K) values, return None (the
+   caller falls back) — bounded per-file memory even where lever 1
+   does not apply (filtered variant, Distinct).
+3. Re-examine why 500-1,150 files/follower fell to the scan branch on
+   prod (dictionary exactness reconciliation shortfalls at this scale?
+   instrument the None reasons in field_value_counts before assuming).
+
+FIX SHIPPED TO TREE (2026-08-10, local perf pass; baselines from an
+8x2M-row merge_bench corpus merged to one 16M-row/3.58GB file with 16M
+distinct trace_ids — the exact prod shape):
+- BASELINE (the bomb, measured): ONE unfiltered field_value_counts walk
+  of trace_id = ~970ms wall, +1.87GB peak RSS per file per eval; the
+  perf profile is literally page-fault/clear_page_erms/realloc (the
+  16M x Vec<u8> churn), x64 eval_concurrency = the querier OOM.
+- LEVER 1 (implemented): reader.field_value_top_k — the field's STRING
+  ordinal ranges come from the resident dict index (+<=6 boundary block
+  probes; numeric-tagged sub-range excluded by construction, matching
+  the walk's is_numeric_value_token semantics incl. its documented 0x01
+  residual), doc_count streams over a NEW zero-alloc
+  RowSelection::Range scan into a bounded (count, ordinal) heap
+  (ordinal order == key order, so ties resolve identically to
+  truncate_top_k), reconciliation sum == key-term doc_count kept
+  verbatim, and ONLY the <=max_groups winners' keys resolve
+  (keys_for_ordinals: binary-search blocks, ONE batched fetch via the
+  new load_dict_blocks — scattered sibling of load_dict_block_span).
+  Same-file numbers: 43ms wall (22x), +92MB peak (20x, = streamed
+  doc_count decode chunks), kept=1000 exact winners.
+  reader.field_value_head serves SimpleDistinct head/tail the same way
+  (resolves exactly `limit` keys). Ranged-mode budget test: top-k over
+  the 100k-distinct fixture = 8 fetches / 1.2MB (walk: ~48 fetches +
+  full dictionary materialized) — ranged_field_value_top_k_matches_
+  walk_at_scale.
+- LEVER 2 (implemented): field_value_counts_filtered gained a cap
+  (max(inverted_index_topn_max_group_num, k-overfetch)); the
+  enumeration STOPS at cap+1 keys and returns None -> the caller falls
+  back (docs column / scan). scan_key_range closures can now
+  early-terminate. filtered_top_n's post-truncation became dead code
+  and was removed (the cap bounds enumeration by construction).
+- LEVER 3 (implemented): every dict-unavailable fallback now logs
+  (field + reason class), incl. the silent-before _source re-parse
+  last resort in both TopN and Distinct arms.
+- GUARDS: field_value_top_k_and_head_match_walk (differential vs the
+  walk on every eligibility shape: fts/numeric/absent/empty-string
+  refusal parity, truncation-set parity vs the truncate_top_k
+  comparator incl. the svc 3-way count tie) + the at-scale ranged test;
+  all existing suites green (search 981, vortex_index 174, incl.
+  test_unfiltered_collectors_match_docs_collectors and the
+  cached/ranged parity harness).
+- Residual: the +92MB transient is the vortex doc_count chunk decode;
+  bounded and 20x better, revisit only if 64-way concurrency shows
+  pressure. Invalid-UTF-8 values tie-break by raw bytes rather than
+  the lossy-decoded string — divergence only when counts tie across
+  values that differ solely in invalid UTF-8, accepted.
+
+ROUND 2 (same day, cross-class A/B follow-up; query_bench.rs is the
+harness, runs identically on older commits): first verified NO other
+query class regressed from the #29 work (pre/post medians at parity,
+Contains -7%; results byte-identical). Then two more wins landed:
+- DISJOINT-COUNT: count() of a multi-ordinal SINGLE-FIELD non-fts leaf
+  (Prefix/Contains/Regex with field: Some) now sums the doc_count
+  column instead of postings-union + popcount — one raw value term per
+  doc per field makes the term doc sets pairwise disjoint (numeric-
+  tagged included; fts token terms overlap and keep the union; a
+  scoped leaf on a pure-fts field cannot resolve at all, and dual-
+  marked fields are gated). count Prefix over a 30-term/16M-doc field:
+  21.2ms -> 583µs (36x), zero postings IO and zero bitmap. Guard:
+  count_matches_eval_popcount_across_leaf_shapes (every leaf shape
+  incl. the union-mandatory any-field ones).
+- CONTAINS SCAN: contains_bytes was naive windows(); the Contains arm
+  now hoists ONE memchr::memmem::Finder for the whole dictionary scan
+  (SIMD), and the case-insensitive arm reuses a lowercase buffer with
+  an ASCII fast path instead of from_utf8_lossy+to_lowercase PER KEY
+  (32M allocs on a 16M-key field, identical Unicode-fold semantics
+  kept for non-ASCII tokens). Full-field Contains over 16M keys:
+  1.046s -> 288ms (3.6x). memchr added to vortex_index (workspace dep
+  already).
+
+SHIPPED .76 BOTH ENVS + PROD ACCEPTANCE PROBE (2026-08-11 ~04:00Z,
+v0.93.0-vix-20260811.76 = engine 20862c321f; dev-ops #235 clean
+Approve, prod-ops #375 Approve after a P0+3 P1 cycle ON MY ROLLBACK
+NOTES, not the code — see the floor correction above; the push
+script's new auto prev-tag resolved cross-date .75 correctly on its
+first live run). Rollouts 13/13 dev + 21/21 prod, zero restarts.
+PARITY: all six replay md5s identical .75 vs .76 on BOTH envs incl.
+the new 1h GROUP BY trace_id anchor; its cold run 108->56ms dev,
+1182->454ms prod; dev logs show the new path serving: "Some(ALL)
+found top_n hits: 1000, index fetches: 0 (0 B), took: 0 ms".
+ACCEPTANCE PROBE (the 2026-08-08 OOM query): 6h unconditioned
+GROUP BY trace_id = 11.8s, RSS peak ~4GB, clean. 24h = NO OOM, NO
+restarts, RSS peak 10.1GB/24Gi (on .74 this OOMKilled obs-querier-3)
+— the allocation bomb is DEFUSED — but the query still exceeds the
+200s flight timeout: per-follower vix eval 12-41s / ~0.5-1.55M top_n
+hits / 5.8-15.5GB index fetches with is_add_filter_back=true and
+108-1291 files/follower left for the scan branch, which eats the
+rest. Lever-3 instrumentation fired ZERO dict-refusal lines — the
+scan-branch files come from the ROUTING gates (window-straddling
+files are excluded from the index-only TopN route by file_in_range,
+and docs-column files take the bitmap+column path), NOT from
+dictionary refusals. NEXT (#29 tail, new item-worthy): extend the
+index-only TopN route to straddling files (time-clamped per-value
+postings counting or zone-chunk rank cuts) and re-examine the
+per-follower fetch volume (299k fetches / 9.9GB on one follower —
+#27-adjacent). The 24h prod probe rule softens: memory-safe since
+.76, still times out — avoid on prod dashboards, fine as a manual
+probe.
+
+## #30 roaring row-id selections: resident vix bitmaps compressed (2026-08-10, SHIPPED .75 BOTH ENVS + VERIFIED)
+
+Every surviving index selection was a DENSE BooleanBuffer (num_rows/8
+bytes regardless of match count): 240KB per 1.92M-row file to memoize 3
+matched rows, capping the 256MB vix result cache at ~500 worst-case
+entries (a needle query touches 564-1,700 files — ONE query could churn
+the whole budget), and a wide query's SCAN_SELECTIONS registry held one
+dense buffer per selected file for the scan's lifetime (1,700 x 240KB
+≈ 400MB resident per in-flight query — #28/#29 memory-pressure class).
+
+Change (roaring 0.11.4, pure Rust, already in-tree via vortex-scan =
+zero new deps): new config::meta::stream::RowIdBitmap (RoaringBitmap +
+num_rows universe, containers settled via optimize()). Everything
+RESIDENT holds it: FileSelection::Rows, CacheEntry::RowIds,
+VixSearchResult::RowIdsSelection, VixScanSelection. The reader eval
+pipeline stays DENSE (SIMD AND/OR untouched, vortex_index crate
+unchanged); one from_dense at the guard boundary, so only survivors
+(≤ skip threshold, 35%) ever convert. Cache hits materialize via
+to_dense() O(matched) — replaces the 512KB deep clone per
+straddling-file hit. SimpleSelectPruner builds sparse directly (was: a
+dense num_rows-sized alloc for ≤limit winning rows). Vortex scans hand
+off Selection::IncludeRoaring (vortex 0.79's mask is roaring-backed;
+the old Buffer<u64> materialized 8B/matched-row only for vortex to
+re-compress it — an 82M-row match cost ~650MB transient). Legacy
+parquet plans coalesce runs() off the sparse iter.
+
+Measured (MEDIAN of 3, release, 1.92M-row universe, dense = 240,000B):
+needle x3 = 70B (3,429x) · 2% scattered = 76,362B (3.1x) · 2% one-run =
+57B (4,211x) · ~30% scattered (the guard ceiling shape) = 246,040B
+(1.0x parity; optimize() clamps the run-store blowup that measured 1.4x
+without it). Conversion: from_dense 18µs-8.6ms (needle→ceiling),
+to_dense 67µs-2.2ms — noise vs the postings decode they bracket (82M-id
+term = 76ms warm). Effective cache capacity for the needle class:
+~500 entries → effectively unbounded (70B against a 256MB budget).
+Diagnostic: bench_row_id_bitmap_shapes in config stream.rs tests
+(--ignored --nocapture, release).
+
+Gates run on the final tree: cargo check --workspace --tests clean;
+unit config+search 2,957 pass incl. new oracles (dense↔sparse identity,
+runs() vs set_slices(), poison-proof straddle-cache hit test);
+integration BOTH segment modes green (EXIT=0 in-log, logs in session
+scratchpad).
+
+Deliberately NOT converted (assessed 2026-08-10): on-disk postings
+codec (bitpacked deltas + skip table beat roaring serialization and
+carry the rank seeks; format-frozen), SBBF blooms (dense by design),
+PromQL signature sets (random u64 — roaring strictly worse), the
+postings_union inner loop and eval AND/OR (dense SIMD already right at
+these widths), file_id_list proto (frozen wire format). Follow-ons,
+separately motivated, in rough value order: (a) RoaringTreemap for
+query_by_ids' 3x HashSet<i64> builds + 2x difference() over
+time-clustered bigserial ids (core/src/file_list.rs query path; mind
+the negative WAL pseudo-ids); (b) writer terms-map hybrid (the
+BTreeMap<Vec<u8>,Vec<u32>> hits 15-19GB on a 10GB rebuild — roaring
+only above a doc-count threshold; measure the term-frequency
+distribution first); (c) promql topk/bottomk HashMap<i64,
+HashSet<usize>> dense-index sets. Ship note: cache admission unchanged
+(max_entry_size still 512KB) but entries admit at compressed size —
+expect VIX_RESULT_CACHE_MEMORY_USAGE to fall and the hit counter to
+rise on dashboard workloads; verify with follower log lines per the
+bench gate, never timing alone.
+
+DEV SHIP LOG (2026-08-10 ~12:40Z, v0.93.0-vix-20260810.75 = engine
+12973498ac, argocd-dev-ops PR #233, review verdict Approve/no-P0):
+rollout 13/13 pods clean, 0 restarts, 0 crashloops; the only post-roll
+ERROR lines were health-check-then-evict of the terminated .74 pods
+(the #28 sweep working). CORRECTNESS: fixed 5-query replay (sealed
+02:00-03:00Z window, script ~/obs-v75-replay.sh on ops-dev) —
+needle count/select on trace 27dac0d2a32f06da, match_all histogram
+(60 buckets, first 3272), ns top-n (argocd 42,261), vpc REJECT count
+18,159 — ALL FIVE result md5s byte-identical .74 vs .75
+(78e4aebfe1/d6b7c35d1e/d9d4391f3a/f8f1b2130d/3fb58a5a9f). EVIDENCE
+LINES: warm replay served index-only — "found count: 18159 ...
+index fetches: 0 (0 B), took: 0 ms", histogram hits 88816 fetches 0,
+top_n hits 14 fetches 0. MEMORY: fresh .75 caches after replay +
+live dashboards = 5.3-8.2 KB per querier vs 17-22 MB steady on .74
+(~500 B/entry avg vs 240 KB dense needle entries). Fresh ingest live
+(485k rows/10min queryable). FOLLOW-UPS: (1) review P1-2 — with
+~70 B needle entries the binding cache limit flips from the 512 MB
+byte budget to MAX_ENTRIES=100000 (~7 MB); soak dev, check the evict
+trigger, then raise MAX_ENTRIES in its own argocd PR with evidence.
+(2) push_image.py prev-tag digest gate FIXED in-tree (60374182cd):
+auto-resolves newest ECR -vix- tag, aborts instead of silently
+skipping — the .75 build itself needed a manual digest check because
+the old NN-1 default missed across the date change. (3) prod roll
+after dev soak.
+
+PROD SHIP LOG (2026-08-10 15:35Z merge, prod-ops PR #374, verdict
+Approve/no-P0; P1s fixed in-PR: pin-independent .74 rollback wording +
+new .75 rollback note "target .74, no format boundary, floor stays
+.24" + configmap comment drift vs dev twin): rollout 21/21 clean,
+0 restarts, only #28-sweep evictions of terminated .74 pods.
+CORRECTNESS: prod 5-query replay (same sealed window, script
+~/obs-v75-replay.sh on ops, trace f514a6e8e0d1158b) — ALL FIVE md5s
+byte-identical .74 vs .75 (4628858f87/7c0ee82564/8566c5d0fe/
+b9b354339b/f6c5fa19f6; anchors: 15 spans, histo first 18003, topn
+chatgpt4google-prod 625243, REJECT 400047). EVIDENCE: warm replay
+index-only across all five followers ("found count: 40003...132874,
+index fetches: 0 (0 B), took: 0 ms"; top_n hits 36-45 fetches 0).
+Fresh ingest 28.5M rows/10min queryable. Querier caches 16-19KB,
+~50% hit rate, gc_total zero (no evictions — MAX_ENTRIES bump not
+yet needed on prod; dev soaks 1M via argocd-dev #234 with the
+querier obs-env-rev annotation added, engine default 100k->1M in
+tree). CACHE-LIMIT DERIVATION (recorded at the dev pin): per-entry
+bytes vs MAX_SIZE include 2x key len (cache.rs entry_footprint);
+needle ~370B/entry -> 1M ≈ 370MB, conservative 500B -> ~500MB ≈ the
+512MB budget — never raise MAX_ENTRIES past 1M without raising
+MAX_SIZE. Fleet state: BOTH envs v0.93.0-vix-20260810.75 = engine
+commit 12973498ac (ancestor gate target).
+
+## #31 writer term-accumulation dominates index build and merge-rebuild RSS (2026-08-10, local perf pass — MEASURED, next perf item)
+
+From the 2026-08-10 perf pass (bench_build_core_file 1M rows, k8s-logs
+shape): push(term-accum) = 3.6-4.0s vs finish(encode) = 40-50ms —
+term accumulation is ~99% of build wall and does NOT scale with
+encode threads (it precedes them). merge_bench over 8x2M rows:
+index-merge fast path 28.4s / VmHWM 7.55GB; --rebuild 229s / VmHWM
+9.66GB (70.3M terms). The BTreeMap<Vec<u8>, Vec<u32>> accumulation
+(writer.rs terms map, spill.rs exists because of it) is the bound —
+candidates: arena-backed keys + hash map with sort-at-finish,
+per-chunk sorted runs merged at flush (the spill machinery
+generalized), or reserving via the known term distribution. Needs a
+dedicated profile of push_term before choosing. Perf tooling now on
+the box: perf 6.12 + inferno + rustfilt (demangle AFTER collapse),
+release-profiling needs CARGO_PROFILE_RELEASE_DEBUG=true AND
+CARGO_PROFILE_RELEASE_STRIP=none (plain release strips). Corpus
+generator: merge_bench gen (8x2M traces shape, ~23s/file); harnesses:
+bench_unfiltered_value_walk (walk-vs-top_k A/B), scan_bench, matrix
+log in the 2026-08-10 session scratchpad.

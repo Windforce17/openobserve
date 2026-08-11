@@ -18,8 +18,8 @@
 
 use std::sync::{Arc, LazyLock};
 
-use arrow::buffer::BooleanBuffer;
 use arrow_schema::Schema;
+use config::meta::stream::RowIdBitmap;
 use datafusion::{
     arrow::record_batch::RecordBatch,
     error::{DataFusionError, Result},
@@ -28,7 +28,6 @@ use vortex::{
     VortexSessionDefault,
     array::{ArrayRef, ExecutionCtx},
     arrow::{FromArrowArray, FromArrowType},
-    buffer::Buffer,
     compressor::{BtrBlocksCompressor, BtrBlocksCompressorBuilder},
     dtype::DType,
     error::VortexResult,
@@ -101,12 +100,17 @@ impl CompressorPlugin for Utf8Compressor {
 /// Convert a per-row match bitmap (from the inverted index) into a Vortex scan
 /// access plan. Returns `None` when the bitmap selects everything, so a full
 /// scan proceeds without the selection overhead.
-pub fn generate_vortex_access_plan(row_ids: &BooleanBuffer) -> Option<VortexAccessPlan> {
-    if row_ids.count_set_bits() == row_ids.len() {
+///
+/// Vortex's scan mask is roaring-backed, so the selection is handed over as a
+/// roaring treemap directly — the previous `Buffer<u64>` index list cost
+/// 8 bytes per matched row only for vortex to re-compress it internally.
+pub fn generate_vortex_access_plan(row_ids: &RowIdBitmap) -> Option<VortexAccessPlan> {
+    if row_ids.selects_all() {
         return None;
     }
-    let indices: Buffer<u64> = row_ids.set_indices().map(|i| i as u64).collect();
-    Some(VortexAccessPlan::default().with_selection(Selection::IncludeByIndex(indices)))
+    let rows = roaring::RoaringTreemap::from_sorted_iter(row_ids.iter().map(u64::from))
+        .expect("RowIdBitmap iterates ascending");
+    Some(VortexAccessPlan::default().with_selection(Selection::IncludeRoaring(rows)))
 }
 
 /// Drain `rx` into a single in-memory `.vortex` file. Mirrors `write_parquet`

@@ -23,10 +23,8 @@
 
 use std::sync::Arc;
 
-use config::meta::stream::{FileKey, FileSelection};
+use config::meta::stream::{FileKey, FileSelection, RowIdBitmap};
 use hashbrown::HashMap;
-
-use super::selection_from_row_ids;
 
 /// A file's top-`limit` candidates as `(_timestamp, doc_id)` plus the row
 /// group size of its index file.
@@ -155,8 +153,10 @@ impl SimpleSelectPruner {
             let file = file_list_map
                 .get_mut(key)
                 .expect("candidate files were retained above");
+            // the winners are at most `limit` rows: build the sparse bitmap
+            // directly instead of a dense num_rows-sized buffer
             let row_ids =
-                selection_from_row_ids(file.meta.records as usize, doc_ids.iter().copied());
+                RowIdBitmap::from_row_ids(file.meta.records as usize, doc_ids.iter().copied());
             file.with_selection(FileSelection::Rows(Arc::new(row_ids)), *row_group_size);
         }
 
@@ -354,7 +354,7 @@ mod tests {
 
     fn selected_rows(file: &FileKey) -> Vec<usize> {
         match file.selection.as_ref().expect("selection should be set") {
-            FileSelection::Rows(bitmap) => bitmap.set_indices().collect(),
+            FileSelection::Rows(bitmap) => bitmap.iter().map(|v| v as usize).collect(),
             other => panic!("expected a Rows selection, got {other:?}"),
         }
     }

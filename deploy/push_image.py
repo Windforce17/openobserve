@@ -41,6 +41,30 @@ def amd64_digests(profile, region, tag):
     return [s["digest"] for s in m.get("manifests", [])
             if s.get("platform", {}).get("architecture") == "amd64"]
 
+def tag_sort_key(tag):
+    # v0.93.0-vix-YYYYMMDD.NN -> (YYYYMMDD, NN); malformed tags sort first
+    try:
+        date_nn = tag.rsplit("-", 1)[1]
+        date, nn = date_nn.split(".", 1)
+        return (int(date), int(nn))
+    except Exception:
+        return (0, 0)
+
+def latest_existing_tag(profile, region, before_tag):
+    """Newest v*-vix-DATE.NN tag in ECR strictly older than before_tag.
+
+    Exists because the naive NN-1 default silently misses across a date
+    change (v...-20260810.75's NN-1 is v...-20260810.74, which never
+    existed — the real predecessor was v...-20260807.74) and an absent
+    prev tag DISABLED the stale-image digest gate on exactly the builds
+    that most need it (first build of a day)."""
+    text = out(["aws", "ecr", "list-images", "--profile", profile, "--region", region,
+                "--repository-name", "devops/obs", "--filter", "tagStatus=TAGGED",
+                "--query", "imageIds[].imageTag", "--output", "json"])
+    tags = [t for t in json.loads(text)
+            if "-vix-" in t and tag_sort_key(t) != (0, 0) and tag_sort_key(t) < tag_sort_key(before_tag)]
+    return max(tags, key=tag_sort_key) if tags else None
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tag", required=True)
@@ -49,8 +73,11 @@ def main():
     tag = args.tag
     prev = args.prev_tag
     if not prev:
-        base, nn = tag.rsplit(".", 1)
-        prev = f"{base}.{int(nn) - 1}"
+        prev = latest_existing_tag(*REGISTRIES[0][:2], tag)
+        if prev is None:
+            sys.exit("ABORT: no existing -vix- tag older than %s in ECR; pass --prev-tag "
+                     "explicitly (or confirm this is truly the first ship)" % tag)
+        print(f"auto prev tag (newest in ECR before {tag}): {prev}")
 
     dirty = out(["git", "-C", REPO, "status", "--porcelain"]).strip()
     if dirty:

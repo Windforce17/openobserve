@@ -60,6 +60,7 @@ proto.workspace = true
 reqwest.workspace = true
 regex.workspace = true
 rand.workspace = true
+roaring.workspace = true
 sea-orm.workspace = true
 serde.workspace = true
 serde_json.workspace = true

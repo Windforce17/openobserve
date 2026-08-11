@@ -40,10 +40,10 @@ use std::{fmt, sync::Arc};
 
 use arrow::{
     array::{Array, ArrayRef, Int64Array, RecordBatchOptions, StringArray, new_null_array},
-    buffer::BooleanBuffer,
     datatypes::{DataType, Field, FieldRef, Schema, SchemaRef},
     record_batch::RecordBatch,
 };
+use config::meta::stream::RowIdBitmap;
 use async_trait::async_trait;
 use datafusion::{
     catalog::Session,
@@ -86,11 +86,11 @@ const VIX_EXT: &str = "vix";
 
 /// Per-file row selection for a core-file scan, attached as a typed
 /// [`PartitionedFile`] extension by `generate_access_plan` (the counterpart
-/// of `VortexAccessPlan` / `ParquetAccessPlan` for `.vix` files). One bit per
-/// docs-blob row; only the set rows are decoded.
+/// of `VortexAccessPlan` / `ParquetAccessPlan` for `.vix` files). A
+/// compressed bitmap over the docs-blob rows; only the set rows are decoded.
 #[derive(Debug, Clone)]
 pub struct VixScanSelection {
-    pub row_ids: Arc<BooleanBuffer>,
+    pub row_ids: Arc<RowIdBitmap>,
 }
 
 /// DataFusion [`FileFormat`] for core `.vix` files.
@@ -648,7 +648,7 @@ fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
 fn scan_core_file(
     data: bytes::Bytes,
     projected_schema: &SchemaRef,
-    selection: Option<&BooleanBuffer>,
+    selection: Option<&RowIdBitmap>,
     timestamp_filter: Option<(i64, i64)>,
     on_batch: &mut dyn FnMut(RecordBatch) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
@@ -668,13 +668,13 @@ fn scan_core_file(
 fn scan_core_docs(
     docs: VixDocs,
     projected_schema: &SchemaRef,
-    selection: Option<&BooleanBuffer>,
+    selection: Option<&RowIdBitmap>,
     timestamp_filter: Option<(i64, i64)>,
     column_bounds: &[ColumnBound],
     on_batch: &mut dyn FnMut(RecordBatch) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let plan = LogicalProjectionPlan::new(&docs, projected_schema)?;
-    let rows = selection.map(|bits| bits.set_indices().map(|i| i as u64).collect::<Vec<u64>>());
+    let rows = selection.map(|bits| bits.iter().map(u64::from).collect::<Vec<u64>>());
     if let Some(rows) = rows.as_ref()
         && rows.is_empty()
     {
@@ -1116,7 +1116,7 @@ mod tests {
     fn scan_all(
         data: bytes::Bytes,
         projected: SchemaRef,
-        selection: Option<&BooleanBuffer>,
+        selection: Option<&RowIdBitmap>,
         ts: Option<(i64, i64)>,
     ) -> Vec<RecordBatch> {
         let mut out = Vec::new();
@@ -1182,7 +1182,7 @@ mod tests {
     #[test]
     fn scan_applies_row_selection_and_ts_filter() {
         // rows 1 and 2 match level=error; select them via the bitmap
-        let bits = BooleanBuffer::from_iter([false, true, true, false]);
+        let bits = RowIdBitmap::from_row_ids(4, [1u32, 2]);
         let batches = scan_all(build_core_file(), logical_schema(), Some(&bits), None);
         assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
         assert_eq!(
@@ -1573,7 +1573,7 @@ mod review_tests {
     fn scan_all(
         data: bytes::Bytes,
         projected: SchemaRef,
-        selection: Option<&BooleanBuffer>,
+        selection: Option<&RowIdBitmap>,
         ts: Option<(i64, i64)>,
     ) -> Vec<RecordBatch> {
         let mut out = Vec::new();
@@ -1856,7 +1856,7 @@ mod review_tests {
     /// path: such files are normally dropped before the scan).
     #[test]
     fn review_empty_selection_returns_no_rows() {
-        let bits = BooleanBuffer::new_unset(4);
+        let bits = RowIdBitmap::from_row_ids(4, std::iter::empty());
         let batches = scan_all(build_core_file(), logical_schema(), Some(&bits), None);
         assert!(batches.is_empty());
     }
@@ -2270,7 +2270,7 @@ mod ranged_tests {
         let meta = store.head(&path).await.unwrap();
 
         // in-memory truth
-        let bits = BooleanBuffer::from_iter([false, true, true, false]);
+        let bits = RowIdBitmap::from_row_ids(4, [1u32, 2]);
         let expect = {
             let mut out = Vec::new();
             scan_core_file(

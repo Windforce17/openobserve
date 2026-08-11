@@ -557,8 +557,7 @@ mod tests {
     /// other file.
     #[tokio::test]
     async fn split_scan_refilters_only_files_without_exact_selection() {
-        use arrow::buffer::BooleanBuffer;
-        use config::meta::stream::FileSelection;
+        use config::meta::stream::{FileSelection, RowIdBitmap};
 
         let file_schema = Arc::new(Schema::new(vec![
             Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
@@ -598,7 +597,7 @@ mod tests {
             ["nexus", "other", "nexus"],
         );
         exact_file.with_selection(
-            FileSelection::Rows(Arc::new(BooleanBuffer::from(vec![true, false, true]))),
+            FileSelection::Rows(Arc::new(RowIdBitmap::from_row_ids(3, [0u32, 2]))),
             None,
         );
         exact_file.selection_exact = true;

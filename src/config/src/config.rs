@@ -2060,7 +2060,7 @@ pub struct Limit {
     pub short_url_retention_days: i64,
     #[env_config(
         name = "ZO_INVERTED_INDEX_RESULT_CACHE_MAX_ENTRIES",
-        default = 100000,
+        default = 1000000, // roaring entries are ~70B-500B; the byte budget (MAX_SIZE) is the real bound
         help = "Maximum number of entries in the inverted index result cache. Higher values increase memory usage but may improve query performance."
     )]
     pub inverted_index_result_cache_max_entries: usize,

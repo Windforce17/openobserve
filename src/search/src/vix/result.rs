@@ -23,8 +23,10 @@
 
 use std::{collections::HashSet, fmt::Display, sync::Arc};
 
-use arrow::buffer::BooleanBuffer;
-use config::meta::{inverted_index::IndexOptimizeMode, stream::FileKey};
+use config::meta::{
+    inverted_index::IndexOptimizeMode,
+    stream::{FileKey, RowIdBitmap},
+};
 use hashbrown::HashMap;
 
 use super::pruner::SimpleSelectPruner;
@@ -33,8 +35,8 @@ use super::pruner::SimpleSelectPruner;
 #[derive(Debug, Clone)]
 pub enum VixSearchResult {
     RowIdsSelection {
-        /// per-row match bitmap, length == number of rows in the data file
-        row_ids: Arc<BooleanBuffer>,
+        /// matched row ids, as a compressed bitmap over the file's rows
+        row_ids: Arc<RowIdBitmap>,
         /// parquet row-group size recorded when the index was built
         row_group_size: Option<u32>,
     },
@@ -72,9 +74,7 @@ impl VixSearchResult {
 
     pub fn get_memory_size(&self) -> usize {
         match self {
-            Self::RowIdsSelection { row_ids, .. } => {
-                row_ids.inner().len() + std::mem::size_of::<BooleanBuffer>()
-            }
+            Self::RowIdsSelection { row_ids, .. } => row_ids.memory_size(),
             Self::SelectCandidates { candidates, .. } => {
                 candidates.capacity() * std::mem::size_of::<(i64, u32)>()
                     + std::mem::size_of::<Vec<(i64, u32)>>()
@@ -645,13 +645,19 @@ mod tests {
         assert_eq!(VixSearchResult::NoMatch.get_memory_size(), 0);
 
         let result = VixSearchResult::RowIdsSelection {
-            row_ids: Arc::new(BooleanBuffer::new_unset(0)),
+            row_ids: Arc::new(RowIdBitmap::from_row_ids(0, std::iter::empty())),
             row_group_size: None,
         };
-        assert_eq!(
-            result.get_memory_size(),
-            std::mem::size_of::<BooleanBuffer>()
-        );
+        // an empty selection costs only the fixed struct + serialized header
+        assert!(result.get_memory_size() < 128);
+
+        // the sparse invariant this migration exists for: a needle selection
+        // over a large file must not cost anything near num_rows / 8
+        let result = VixSearchResult::RowIdsSelection {
+            row_ids: Arc::new(RowIdBitmap::from_row_ids(4_000_000, [3u32, 1_234_567])),
+            row_group_size: None,
+        };
+        assert!(result.get_memory_size() < 256);
 
         let result = VixSearchResult::SelectCandidates {
             candidates: Arc::new(vec![(100i64, 1u32), (99, 2)]),

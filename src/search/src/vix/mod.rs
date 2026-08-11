@@ -65,17 +65,14 @@ pub mod source;
 
 use std::{collections::HashSet, sync::Arc};
 
-use arrow::{
-    buffer::{BooleanBuffer, MutableBuffer},
-    util::bit_util,
-};
+use arrow::buffer::BooleanBuffer;
 use config::{
     cluster::LOCAL_NODE,
     get_config,
     meta::{
         inverted_index::IndexOptimizeMode,
         search::ScanStats,
-        stream::{FileKey, FileSelection, StreamType},
+        stream::{FileKey, FileSelection, RowIdBitmap, StreamType},
     },
     metrics::{self, QUERY_PARQUET_CACHE_RATIO_NODE},
     utils::size::bytes_to_human_readable,
@@ -491,7 +488,7 @@ pub async fn vix_search(
                             row_ids,
                             row_group_size,
                         } => {
-                            let matched = row_ids.count_set_bits() as u64;
+                            let matched = row_ids.matched();
                             result_builder.add_row_nums(matched);
                             let file = file_list_map.get_mut(&file_name).unwrap();
                             file.with_selection(FileSelection::Rows(row_ids), row_group_size);
@@ -879,8 +876,12 @@ async fn search_vix_index(
                     };
                 }
                 None => (
+                    // the guard passed => the match set is under the skip
+                    // threshold; compress it once here so everything resident
+                    // downstream (result cache, FileKey selection, per-query
+                    // scan registry) holds the sparse form
                     VixSearchResult::RowIdsSelection {
-                        row_ids: Arc::new(bitmap),
+                        row_ids: Arc::new(RowIdBitmap::from_dense(&bitmap)),
                         row_group_size,
                     },
                     has_skipped,
@@ -1024,9 +1025,12 @@ fn evaluate_vix_index(
         let cached: Option<BooleanBuffer> = bitmap_cache_key.as_deref().and_then(|key| {
             match vix_result_cache::GLOBAL_CACHE.get(key, None) {
                 Some(VixSearchResult::RowIdsSelection { row_ids, .. })
-                    if row_ids.len() == reader.row_count() as usize =>
+                    if row_ids.num_rows() == reader.row_count() as usize =>
                 {
-                    Some((*row_ids).clone())
+                    // materialize the dense form for the eval pipeline; for
+                    // the sparse sets the cache holds this is cheaper than
+                    // the full-buffer deep clone it replaced
+                    Some(row_ids.to_dense())
                 }
                 Some(VixSearchResult::NoMatch) => {
                     Some(BooleanBuffer::new_unset(reader.row_count() as usize))
@@ -1039,7 +1043,10 @@ fn evaluate_vix_index(
             None => {
                 let bitmap = reader.eval(&query)?;
                 if let Some(key) = bitmap_cache_key.as_deref() {
-                    let entry = CacheEntry::RowIds(Arc::new(bitmap.clone()), row_group_size);
+                    let entry = CacheEntry::RowIds(
+                        Arc::new(RowIdBitmap::from_dense(&bitmap)),
+                        row_group_size,
+                    );
                     if entry.get_memory_size()
                         < get_config()
                             .limit
@@ -1159,7 +1166,14 @@ fn evaluate_vix_index(
                             has_skipped,
                         });
                     }
-                    // core files always carry `_source`: total, never skipped
+                    // core files always carry `_source`: total, never skipped.
+                    // This is the expensive last resort (full `_source` JSON
+                    // re-parse of every row) — #29 lever 3 makes it visible
+                    log::info!(
+                        "[trace_id {trace_id}] search->vix: unfiltered topn on {field:?} \
+                         fell through to the _source re-parse (dict and docs column \
+                         both unavailable)",
+                    );
                     let groups = collect::source_top_n(reader, field, limit, ascend)?;
                     return Ok(RawVixResult::TopN {
                         groups,
@@ -1206,6 +1220,11 @@ fn evaluate_vix_index(
                             has_skipped,
                         });
                     }
+                    log::info!(
+                        "[trace_id {trace_id}] search->vix: unfiltered distinct on {field:?} \
+                         fell through to the _source re-parse (dict and docs column \
+                         both unavailable)",
+                    );
                     let values = collect::source_distinct(reader, field, limit, ascend)?;
                     return Ok(RawVixResult::Distinct {
                         values,
@@ -1380,16 +1399,6 @@ fn get_cache_entry(
             unreachable!("unsupported vix search result in search_vix_index")
         }
     })
-}
-
-/// Build a per-row match bitmap of length `num_rows` from matched row ids.
-fn selection_from_row_ids(num_rows: usize, row_ids: impl Iterator<Item = u32>) -> BooleanBuffer {
-    let mut buffer = MutableBuffer::from_len_zeroed(bit_util::ceil(num_rows, 8));
-    let slice = buffer.as_slice_mut();
-    for id in row_ids {
-        bit_util::set_bit(slice, id as usize);
-    }
-    BooleanBuffer::new(buffer.into(), 0, num_rows)
 }
 
 /// The per-file result-cache key. Keyed on the STRUCTURAL hash of the
@@ -1626,17 +1635,15 @@ mod tests {
     #[test]
     fn test_get_cache_entry_row_ids_selection() {
         let result = VixSearchResult::RowIdsSelection {
-            row_ids: Arc::new(BooleanBuffer::from_iter(
-                (0..4u32).map(|i| [0u32, 2].contains(&i)),
-            )),
+            row_ids: Arc::new(RowIdBitmap::from_row_ids(4, [0u32, 2])),
             row_group_size: Some(1024),
         };
 
         let entry = get_cache_entry(result, None).unwrap();
         match entry {
             CacheEntry::RowIds(packed, row_group_size) => {
-                assert_eq!(packed.count_set_bits(), 2);
-                assert_eq!(packed.set_indices().collect::<Vec<_>>(), vec![0, 2]);
+                assert_eq!(packed.matched(), 2);
+                assert_eq!(packed.iter().collect::<Vec<_>>(), vec![0, 2]);
                 assert_eq!(row_group_size, Some(1024));
             }
             _ => panic!("Expected RowIds cache entry"),
@@ -1721,13 +1728,6 @@ mod tests {
         let entry =
             get_cache_entry_none(VixSearchResult::Distinct(HashSet::from(["v".to_string()])));
         assert!(matches!(entry, CacheEntry::Distinct(values) if values.contains("v")));
-    }
-
-    #[test]
-    fn test_selection_from_row_ids() {
-        let selection = selection_from_row_ids(10, [1u32, 3, 9].into_iter());
-        assert_eq!(selection.len(), 10);
-        assert_eq!(selection.set_indices().collect::<Vec<_>>(), vec![1, 3, 9]);
     }
 
     /// Build one core file with 10 rows ordered `_timestamp` DESC starting
@@ -1942,7 +1942,7 @@ mod tests {
         match vix_result_cache::GLOBAL_CACHE.get(&key, None) {
             Some(VixSearchResult::RowIdsSelection { row_ids, .. }) => {
                 assert_eq!(
-                    row_ids.set_indices().collect::<Vec<_>>(),
+                    row_ids.iter().collect::<Vec<_>>(),
                     vec![0, 2],
                     "the cache must hold the PRE-clamp condition bitmap"
                 );
@@ -1956,7 +1956,7 @@ mod tests {
         // condition bitmap was served from the cache, not recomputed
         vix_result_cache::GLOBAL_CACHE.put(
             key.clone(),
-            CacheEntry::RowIds(Arc::new(arrow::buffer::BooleanBuffer::new_set(4)), None),
+            CacheEntry::RowIds(Arc::new(RowIdBitmap::from_row_ids(4, 0..4u32)), None),
         );
         let raw = evaluate_vix_index(
             "t",
@@ -2006,7 +2006,7 @@ mod tests {
         let key_bad = "bitmap-cache-test-k3".to_string();
         vix_result_cache::GLOBAL_CACHE.put(
             key_bad.clone(),
-            CacheEntry::RowIds(Arc::new(arrow::buffer::BooleanBuffer::new_set(3)), None),
+            CacheEntry::RowIds(Arc::new(RowIdBitmap::from_row_ids(3, 0..3u32)), None),
         );
         let raw = evaluate_vix_index(
             "t",
@@ -2025,7 +2025,11 @@ mod tests {
         );
         match vix_result_cache::GLOBAL_CACHE.get(&key_bad, None) {
             Some(VixSearchResult::RowIdsSelection { row_ids, .. }) => {
-                assert_eq!(row_ids.len(), 4, "recompute must overwrite the bad entry");
+                assert_eq!(
+                    row_ids.num_rows(),
+                    4,
+                    "recompute must overwrite the bad entry"
+                );
             }
             other => panic!("expected the overwritten RowIds bitmap, got {other:?}"),
         }
@@ -2853,7 +2857,7 @@ mod tests {
         let selection = file_map["file_a"].selection.as_ref().unwrap();
         match selection {
             FileSelection::Rows(bits) => {
-                assert_eq!(bits.set_indices().collect::<Vec<_>>(), vec![0, 1, 2, 3, 4]);
+                assert_eq!(bits.iter().collect::<Vec<_>>(), vec![0, 1, 2, 3, 4]);
             }
             other => panic!("expected Rows selection, got {other:?}"),
         }
@@ -2881,7 +2885,7 @@ mod tests {
         let selection = file_map["file_c"].selection.as_ref().unwrap();
         match selection {
             FileSelection::Rows(bits) => {
-                assert_eq!(bits.set_indices().collect::<Vec<_>>(), vec![5, 6, 7, 8, 9]);
+                assert_eq!(bits.iter().collect::<Vec<_>>(), vec![5, 6, 7, 8, 9]);
             }
             other => panic!("expected Rows selection, got {other:?}"),
         }
@@ -2907,12 +2911,12 @@ mod tests {
         // top-12 desc: all 10 rows of file_a + the 2 newest of file_b
         assert_eq!(file_map.len(), 2);
         match file_map["file_a"].selection.as_ref().unwrap() {
-            FileSelection::Rows(bits) => assert_eq!(bits.count_set_bits(), 10),
+            FileSelection::Rows(bits) => assert_eq!(bits.matched(), 10),
             other => panic!("expected Rows selection, got {other:?}"),
         }
         match file_map["file_b"].selection.as_ref().unwrap() {
             FileSelection::Rows(bits) => {
-                assert_eq!(bits.set_indices().collect::<Vec<_>>(), vec![0, 1]);
+                assert_eq!(bits.iter().collect::<Vec<_>>(), vec![0, 1]);
             }
             other => panic!("expected Rows selection, got {other:?}"),
         }
@@ -4040,11 +4044,11 @@ mod review_tests {
         pruner.finalize("review", &mut map);
 
         // exactly 2 winning rows across the candidate files
-        let selected: usize = ["a", "b"]
+        let selected: u64 = ["a", "b"]
             .iter()
             .filter_map(|k| map.get(*k))
             .map(|f| match f.selection.as_ref() {
-                Some(FileSelection::Rows(bits)) => bits.count_set_bits(),
+                Some(FileSelection::Rows(bits)) => bits.matched(),
                 _ => 0,
             })
             .sum();

@@ -15,9 +15,11 @@
 
 use std::{ops::Range, sync::Arc};
 
-use arrow::buffer::BooleanBuffer;
 use arrow_schema::SchemaRef;
-use config::{FileFormat, TIMESTAMP_COL_NAME, meta::stream::FileSelection};
+use config::{
+    FileFormat, TIMESTAMP_COL_NAME,
+    meta::stream::{FileSelection, RowIdBitmap},
+};
 use datafusion::{
     common::{DataFusionError, Result, stats::Precision},
     datasource::{listing::PartitionedFile, physical_plan::parquet::ParquetAccessPlan},
@@ -99,7 +101,7 @@ pub fn generate_access_plan(file: &mut PartitionedFile) {
         // mapping (and no LEGACY_ROW_GROUP_SIZE fallback) is involved.
         FileFormat::Vix => match selection {
             FileSelection::Rows(row_ids) => {
-                if row_ids.count_set_bits() < row_ids.len() {
+                if !row_ids.selects_all() {
                     file.extensions.insert(VixScanSelection { row_ids });
                 }
             }
@@ -111,7 +113,7 @@ pub fn generate_access_plan(file: &mut PartitionedFile) {
 
 fn generate_parquet_access_plan(
     file: &PartitionedFile,
-    row_ids: &BooleanBuffer,
+    row_ids: &RowIdBitmap,
     row_group_size: Option<u32>,
 ) -> Option<ParquetAccessPlan> {
     let (num_rows, row_group_size) = parquet_file_layout(file, row_group_size)?;
@@ -121,7 +123,7 @@ fn generate_parquet_access_plan(
     let mut row_group_selection =
         RowGroupSelectionBuilder::new(&mut access_plan, row_group_size, num_rows);
 
-    for (start, end) in row_ids.set_slices() {
+    for (start, end) in row_ids.runs() {
         if end > num_rows {
             unreachable!("row_ids set slice end {end} exceeds num_rows {num_rows}");
         }
@@ -342,7 +344,7 @@ mod tests {
     fn test_generate_parquet_access_plan_from_sorted_row_ids() {
         // 10 rows, row groups of 4: rg0=[0..4), rg1=[4..8), rg2=[8..10)
         let file = make_partitioned_file(10);
-        let row_ids = BooleanBuffer::from_iter((0..10u32).map(|i| [0u32, 1, 5, 9].contains(&i)));
+        let row_ids = RowIdBitmap::from_row_ids(10, [0u32, 1, 5, 9]);
 
         let plan = generate_parquet_access_plan(&file, &row_ids, Some(4)).unwrap();
 
@@ -373,7 +375,7 @@ mod tests {
     fn test_generate_parquet_access_plan_skips_untouched_row_groups() {
         // only the middle row group has matches
         let file = make_partitioned_file(12);
-        let row_ids = BooleanBuffer::from_iter((0..12u32).map(|i| [4u32, 5, 6, 7].contains(&i)));
+        let row_ids = RowIdBitmap::from_row_ids(12, [4u32, 5, 6, 7]);
 
         let plan = generate_parquet_access_plan(&file, &row_ids, Some(4)).unwrap();
 
@@ -386,7 +388,7 @@ mod tests {
     #[test]
     fn test_generate_parquet_access_plan_keeps_disjoint_ranges_in_same_row_group() {
         let file = make_partitioned_file(8);
-        let row_ids = BooleanBuffer::from_iter((0..8u32).map(|i| [0u32, 2].contains(&i)));
+        let row_ids = RowIdBitmap::from_row_ids(8, [0u32, 2]);
 
         let plan = generate_parquet_access_plan(&file, &row_ids, Some(4)).unwrap();
 
@@ -409,7 +411,7 @@ mod tests {
         // a consecutive run 2..=5 spans rg0 [0..4) and rg1 [4..8); it must be
         // split at the boundary so both row groups get their own selection
         let file = make_partitioned_file(10);
-        let row_ids = BooleanBuffer::from_iter((0..10u32).map(|i| [2u32, 3, 4, 5].contains(&i)));
+        let row_ids = RowIdBitmap::from_row_ids(10, [2u32, 3, 4, 5]);
 
         let plan = generate_parquet_access_plan(&file, &row_ids, Some(4)).unwrap();
 

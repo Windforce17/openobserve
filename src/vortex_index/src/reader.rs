@@ -84,8 +84,9 @@ use crate::{
         BlobHandle, DICT_LAYOUT_BLOCKS, FIELD_TYPE_CS, FIELD_TYPE_FTS, FIELD_TYPE_TERM, FieldEntry,
         PROP_DICT_LAYOUT, PROP_FIELDS, PROP_PARTIAL_FIELDS, PROP_PLIST_MIN_DOCS, PROP_ROW_COUNT,
         PROP_ROW_GROUP_SIZE, PROP_TERM_COUNT, PROP_TOKENIZER, PROP_ZONE_MAP, RowSelection,
-        VixContainer, ZoneEntry, blob_arrow_schema, column_binary, column_u64, parse_container,
-        parse_container_ranged, require_supported_format, scan_blob, scan_blob_dict_column,
+        VixContainer, ZoneEntry, blob_arrow_schema, column_binary, column_u32, column_u64,
+        parse_container, parse_container_ranged, require_supported_format, scan_blob,
+        scan_blob_dict_column, scan_blob_streaming,
     },
     error::{Result, VixError},
     numeric::is_numeric_value_token,
@@ -1255,16 +1256,303 @@ impl VixReader {
     /// decode of the field's postings (SIMD, ≈ the field's row count in
     /// ids) — the fast serve for group-bys over files that predate the
     /// field's `column_store_fields` entry.
+    ///
+    /// `cap` (#29 lever 2) bounds the value enumeration: a field with more
+    /// than `cap` distinct string values returns `Ok(None)` after touching
+    /// at most `cap` keys, so per-file memory stays bounded no matter the
+    /// field's cardinality and the caller falls back to the scan paths.
     pub fn field_value_counts_filtered(
         &self,
         field: &str,
         filter: &BooleanBuffer,
+        cap: usize,
     ) -> anyhow::Result<Option<FieldValueCounts>> {
-        Ok(self.field_value_counts_filtered_inner(field, filter)?)
+        Ok(self.field_value_counts_filtered_inner(field, filter, cap)?)
+    }
+
+    /// #29 lever 1: the top `cap` values of `field` by exact doc count,
+    /// WITHOUT materializing the field's dictionary keys. Where
+    /// [`VixReader::field_value_counts`] walks every key and allocates one
+    /// `Vec<u8>` per distinct value (1.9GB peak for a 16M-distinct field),
+    /// this streams the field's contiguous `doc_count` ordinal range into a
+    /// bounded heap and resolves ONLY the winners' keys (≤ `cap` block
+    /// probes, batch-fetched).
+    ///
+    /// Eligibility and exactness are IDENTICAL to `field_value_counts`
+    /// (same gates, same key-term reconciliation): `Ok(None)` means this
+    /// file cannot prove exact per-value counts and the caller must fall
+    /// back. `Some((counts, truncated))`: counts ascending by key,
+    /// `truncated` when the field has more than `cap` distinct string
+    /// values — counts then holds the top `cap` by (`ascend` ? smallest :
+    /// largest) count, ties toward the smaller key, matching the collector's
+    /// `truncate_top_k` order.
+    pub fn field_value_top_k(
+        &self,
+        field: &str,
+        cap: usize,
+        ascend: bool,
+    ) -> anyhow::Result<Option<(FieldValueCounts, bool)>> {
+        Ok(self.field_value_top_k_inner(field, cap, ascend)?)
+    }
+
+    /// #29 companion for SimpleDistinct: the FIRST (or LAST) `limit` raw
+    /// string values of `field` in ascending key order — the dictionary
+    /// serves head/tail directly, so only the `limit` requested keys are
+    /// ever materialized. Same eligibility + reconciliation contract as
+    /// [`VixReader::field_value_top_k`] (`Ok(None)` = fall back).
+    pub fn field_value_head(
+        &self,
+        field: &str,
+        limit: usize,
+        from_end: bool,
+    ) -> anyhow::Result<Option<Vec<Vec<u8>>>> {
+        Ok(self.field_value_head_inner(field, limit, from_end)?)
+    }
+
+    fn field_value_head_inner(
+        &self,
+        field: &str,
+        limit: usize,
+        from_end: bool,
+    ) -> Result<Option<Vec<Vec<u8>>>> {
+        if self.partial_fields.contains(field) {
+            return Ok(None);
+        }
+        if self
+            .fields
+            .iter()
+            .any(|entry| entry.name == field && entry.has_type(FIELD_TYPE_FTS))
+        {
+            return Ok(None);
+        }
+        let field_docs = match self.lookup_exact(&self.composite(field.as_bytes(), KEY_FIELD_ID))? {
+            Some(ordinal) => self.read_doc_count(ordinal)?,
+            None => 0,
+        };
+        let Some(field_id) = self.field_id(field) else {
+            return Ok((field_docs == 0).then(Vec::new));
+        };
+        let ranges = self.string_value_ordinal_ranges(field_id)?;
+        let total_strings: u64 = ranges.iter().map(|r| r.end - r.start).sum();
+        if total_strings == 0 {
+            return Ok((field_docs == 0).then(Vec::new));
+        }
+        // exactness precondition, same as every value-count path: the
+        // STRING value doc counts must sum to the key-term doc count
+        if self.sum_string_value_doc_counts(&ranges)? != field_docs {
+            return Ok(None);
+        }
+        // the first/last `limit` ordinals across the (ascending) ranges
+        let take = (limit as u64).min(total_strings);
+        let mut ordinals: Vec<u64> = Vec::with_capacity(take as usize);
+        if from_end {
+            let mut remaining = take;
+            for range in ranges.iter().rev() {
+                let len = range.end - range.start;
+                let here = remaining.min(len);
+                ordinals.extend(range.end - here..range.end);
+                remaining -= here;
+                if remaining == 0 {
+                    break;
+                }
+            }
+            ordinals.sort_unstable();
+        } else {
+            let mut remaining = take;
+            for range in ranges.iter() {
+                let len = range.end - range.start;
+                let here = remaining.min(len);
+                ordinals.extend(range.start..range.start + here);
+                remaining -= here;
+                if remaining == 0 {
+                    break;
+                }
+            }
+        }
+        let mut keys = self.keys_for_ordinals(&ordinals)?;
+        for key in &mut keys {
+            if key.len() < 2 {
+                return Err(VixError::Malformed(
+                    "value term without a composite field id".to_string(),
+                ));
+            }
+            key.drain(..2);
+        }
+        Ok(Some(keys))
+    }
+
+    /// Sum the `doc_count` column over the given ordinal ranges without
+    /// touching keys or postings — the reconciliation half of the #29
+    /// key-free paths.
+    fn sum_string_value_doc_counts(&self, ranges: &[std::ops::Range<u64>]) -> Result<u64> {
+        let terms_blob = self
+            .terms_blob
+            .as_ref()
+            .ok_or_else(|| VixError::Malformed("missing terms blob".to_string()))?;
+        let mut sum = 0u64;
+        for range in ranges.iter().filter(|r| r.end > r.start) {
+            let mut seen = 0u64;
+            scan_blob_streaming(
+                terms_blob,
+                Some(&["doc_count"]),
+                RowSelection::Range(range.clone()),
+                None,
+                None,
+                0,
+                &mut |batch| {
+                    let doc_counts = column_u32(&batch, "doc_count")?;
+                    seen += doc_counts.len() as u64;
+                    sum += doc_counts.values().iter().map(|&v| v as u64).sum::<u64>();
+                    Ok(())
+                },
+            )?;
+            if seen != range.end - range.start {
+                return Err(VixError::Malformed(format!(
+                    "terms doc_count scan returned {seen} rows for ordinal range {range:?}",
+                )));
+            }
+        }
+        Ok(sum)
+    }
+
+    fn field_value_top_k_inner(
+        &self,
+        field: &str,
+        cap: usize,
+        ascend: bool,
+    ) -> Result<Option<(FieldValueCounts, bool)>> {
+        // identical eligibility gates to field_string_value_terms
+        if self.partial_fields.contains(field) {
+            return Ok(None);
+        }
+        if self
+            .fields
+            .iter()
+            .any(|entry| entry.name == field && entry.has_type(FIELD_TYPE_FTS))
+        {
+            return Ok(None);
+        }
+        let field_docs = match self.lookup_exact(&self.composite(field.as_bytes(), KEY_FIELD_ID))? {
+            Some(ordinal) => self.read_doc_count(ordinal)?,
+            None => 0,
+        };
+        let Some(field_id) = self.field_id(field) else {
+            return Ok((field_docs == 0).then(|| (Vec::new(), false)));
+        };
+        let ranges = self.string_value_ordinal_ranges(field_id)?;
+        let total_strings: u64 = ranges.iter().map(|r| r.end - r.start).sum();
+        if total_strings == 0 {
+            // no string value terms at all: exact iff no doc carries the
+            // field (mirrors the walk's values.is_empty() arm)
+            return Ok((field_docs == 0).then(|| (Vec::new(), false)));
+        }
+        let terms_blob = self
+            .terms_blob
+            .as_ref()
+            .ok_or_else(|| VixError::Malformed("missing terms blob".to_string()))?;
+
+        // Bounded selection over (count, ordinal), weakest at the heap root.
+        // Ordinals ascend in key order, so the "ties toward the smaller key"
+        // contract maps exactly to "ties toward the smaller ordinal".
+        use std::{cmp::Reverse, collections::BinaryHeap};
+        let mut sum = 0u64;
+        // pre-size the (single) heap actually used: it never grows past
+        // min(cap, distinct values), so the scan loop is allocation-free
+        let heap_capacity = usize::try_from(total_strings.min(cap as u64))
+            .unwrap_or(cap)
+            .saturating_add(1);
+        let mut keep_desc: BinaryHeap<Reverse<(u64, Reverse<u64>)>> =
+            BinaryHeap::with_capacity(if ascend { 0 } else { heap_capacity });
+        let mut keep_asc: BinaryHeap<(u64, u64)> =
+            BinaryHeap::with_capacity(if ascend { heap_capacity } else { 0 });
+        for range in ranges.iter().filter(|r| r.end > r.start) {
+            let mut next_ordinal = range.start;
+            scan_blob_streaming(
+                terms_blob,
+                Some(&["doc_count"]),
+                RowSelection::Range(range.clone()),
+                None,
+                None,
+                0,
+                &mut |batch| {
+                    // zero-copy u32 view: column_u64 would cast-copy every
+                    // batch twice, ~256MB of pure churn on a 16M-term field
+                    let doc_counts = column_u32(&batch, "doc_count")?;
+                    for &count in doc_counts.values().iter() {
+                        let count = count as u64;
+                        let ordinal = next_ordinal;
+                        next_ordinal += 1;
+                        sum += count;
+                        if cap == 0 {
+                            continue;
+                        }
+                        if ascend {
+                            if keep_asc.len() < cap {
+                                keep_asc.push((count, ordinal));
+                            } else if let Some(&root) = keep_asc.peek()
+                                && (count, ordinal) < root
+                            {
+                                keep_asc.pop();
+                                keep_asc.push((count, ordinal));
+                            }
+                        } else if keep_desc.len() < cap {
+                            keep_desc.push(Reverse((count, Reverse(ordinal))));
+                        } else if let Some(&Reverse(root)) = keep_desc.peek()
+                            && (count, Reverse(ordinal)) > root
+                        {
+                            keep_desc.pop();
+                            keep_desc.push(Reverse((count, Reverse(ordinal))));
+                        }
+                    }
+                    Ok(())
+                },
+            )?;
+            if next_ordinal != range.end {
+                return Err(VixError::Malformed(format!(
+                    "terms doc_count scan returned {} rows for ordinal range {range:?}",
+                    next_ordinal - range.start,
+                )));
+            }
+        }
+        // same exactness precondition as the walk: every doc carries at most
+        // one raw value, so exact STRING value counts sum to the key-term
+        // doc count; a shortfall (numeric-typed rows, pre-fix empty-string
+        // files, ...) refuses the fast path
+        if sum != field_docs {
+            return Ok(None);
+        }
+        let mut winners: Vec<(u64, u64)> = if ascend {
+            keep_asc.into_iter().collect()
+        } else {
+            keep_desc
+                .into_iter()
+                .map(|Reverse((count, Reverse(ordinal)))| (count, ordinal))
+                .collect()
+        };
+        // resolve winner keys in ascending ordinal (== key) order, stripped
+        // to their token part like the walk — in place (the field-id is a
+        // 2-byte prefix), so winners are allocated exactly once
+        winners.sort_unstable_by_key(|&(_, ordinal)| ordinal);
+        let ordinals: Vec<u64> = winners.iter().map(|&(_, ordinal)| ordinal).collect();
+        let mut keys = self.keys_for_ordinals(&ordinals)?;
+        for key in &mut keys {
+            if key.len() < 2 {
+                return Err(VixError::Malformed(
+                    "value term without a composite field id".to_string(),
+                ));
+            }
+            key.drain(..2);
+        }
+        let counts: FieldValueCounts = keys
+            .into_iter()
+            .zip(winners.into_iter().map(|(count, _)| count))
+            .collect();
+        Ok(Some((counts, total_strings > cap as u64)))
     }
 
     fn field_value_counts_inner(&self, field: &str) -> Result<Option<FieldValueCounts>> {
-        let Some((values, ordinals, field_docs)) = self.field_string_value_terms(field)? else {
+        let Some((values, ordinals, field_docs)) = self.field_string_value_terms(field, None)?
+        else {
             return Ok(None);
         };
         if values.is_empty() {
@@ -1288,6 +1576,7 @@ impl VixReader {
         &self,
         field: &str,
         filter: &BooleanBuffer,
+        cap: usize,
     ) -> Result<Option<FieldValueCounts>> {
         if filter.len() as u64 != self.row_count {
             return Err(VixError::Malformed(format!(
@@ -1296,7 +1585,9 @@ impl VixReader {
                 self.row_count
             )));
         }
-        let Some((values, ordinals, field_docs)) = self.field_string_value_terms(field)? else {
+        let Some((values, ordinals, field_docs)) =
+            self.field_string_value_terms(field, Some(cap))?
+        else {
             return Ok(None);
         };
         if values.is_empty() {
@@ -1396,11 +1687,15 @@ impl VixReader {
     /// Shared front half of the value-count paths: eligibility pre-checks +
     /// the field's raw STRING value terms `(values, ordinals, field_docs)`,
     /// both vecs ascending and parallel. `Ok(None)` when the dictionary
-    /// cannot enumerate the field's values exactly (partial / fts-marked).
+    /// cannot enumerate the field's values exactly (partial / fts-marked),
+    /// or when the field has more than `cap` distinct string values (#29
+    /// lever 2: the enumeration stops right there instead of materializing
+    /// millions of keys, and the caller falls back to the scan paths).
     #[allow(clippy::type_complexity)]
     fn field_string_value_terms(
         &self,
         field: &str,
+        cap: Option<usize>,
     ) -> Result<Option<(Vec<Vec<u8>>, Vec<u64>, u64)>> {
         // skipped values at build time: the dictionary misses documents
         if self.partial_fields.contains(field) {
@@ -1434,16 +1729,25 @@ impl VixReader {
         // must go through the scan's typed projection).
         let mut values: Vec<Vec<u8>> = Vec::new();
         let mut ordinals: Vec<u64> = Vec::new();
+        let mut over_cap = false;
         // field-major: the field's values are one contiguous range
         let (lower, upper) = Self::v2_field_range(field_id);
         self.scan_key_range(&lower, Some((&upper, false)), |key, ordinal| {
             if let Some((token, _)) = split_key(key)
                 && !is_numeric_value_token(token)
             {
+                if cap.is_some_and(|cap| values.len() >= cap) {
+                    over_cap = true;
+                    return false;
+                }
                 values.push(token.to_vec());
                 ordinals.push(ordinal);
             }
+            true
         })?;
+        if over_cap {
+            return Ok(None);
+        }
         Ok(Some((values, ordinals, field_docs)))
     }
 
@@ -1495,6 +1799,7 @@ impl VixReader {
                     paths.push(String::from_utf8_lossy(token).into_owned());
                     ordinals.push(ordinal);
                 }
+                true
             },
         )?;
         if ordinals.is_empty() {
@@ -1711,10 +2016,39 @@ impl VixReader {
                 match ordinals.len() {
                     0 => Ok(0),
                     1 => self.read_doc_count(ordinals.pop().expect("one ordinal")),
+                    // single-field leaves over a non-fts field: a document
+                    // carries exactly ONE value term of that field, so the
+                    // matched terms' doc sets are pairwise DISJOINT and the
+                    // count is the plain doc_count sum — no postings decode,
+                    // no bitmap. (fts token terms of one doc overlap, so fts
+                    // fields keep the union.) A 30-term prefix over 16M docs
+                    // drops from ~21ms of postings union to column point
+                    // reads.
+                    _ if self.leaf_term_docs_are_disjoint(leaf) => {
+                        Ok(self.read_doc_counts(&ordinals)?.iter().sum())
+                    }
                     _ => Ok(self.postings_union(ordinals)?.count_set_bits() as u64),
                 }
             }
         }
+    }
+
+    /// Whether a leaf's matched terms provably hold pairwise-disjoint doc
+    /// sets: the leaf is scoped to ONE named field and that field is not
+    /// fts-marked. Raw value terms are disjoint by construction (one value
+    /// per document per field — numeric-tagged terms included, a document's
+    /// value is either the string or the number); fts token terms are not.
+    fn leaf_term_docs_are_disjoint(&self, leaf: &VixQuery) -> bool {
+        let field = match leaf {
+            VixQuery::Prefix { field: Some(f), .. }
+            | VixQuery::Contains { field: Some(f), .. }
+            | VixQuery::Regex { field: Some(f), .. } => f,
+            _ => return false,
+        };
+        !self
+            .fields
+            .iter()
+            .any(|entry| entry.name == *field && entry.has_type(FIELD_TYPE_FTS))
     }
 
     /// Resolve a leaf query to the global ordinals of its matching terms.
@@ -1761,6 +2095,7 @@ impl VixReader {
                         {
                             ordinals.push(ordinal);
                         }
+                        true
                     })?;
                 }
                 Ok(ordinals)
@@ -1773,13 +2108,29 @@ impl VixReader {
                 let field_filter = self.optional_field_id(field)?;
                 if *case_insensitive {
                     let needle = String::from_utf8_lossy(needle).to_lowercase();
+                    let finder = memchr::memmem::Finder::new(needle.as_bytes());
+                    // reused per-token buffer: the old per-key
+                    // from_utf8_lossy + to_lowercase allocated twice for
+                    // EVERY dictionary key (32M allocs on a 16M-key field).
+                    // ASCII tokens (the norm) lowercase into the buffer;
+                    // Unicode tokens keep the exact old fold semantics.
+                    let mut lowered: Vec<u8> = Vec::new();
                     self.scan_all_tokens(field_filter, |token| {
-                        String::from_utf8_lossy(token)
-                            .to_lowercase()
-                            .contains(&needle)
+                        if token.is_ascii() {
+                            lowered.clear();
+                            lowered.extend(token.iter().map(|b| b.to_ascii_lowercase()));
+                            finder.find(&lowered).is_some()
+                        } else {
+                            String::from_utf8_lossy(token)
+                                .to_lowercase()
+                                .contains(&needle)
+                        }
                     })
                 } else {
-                    self.scan_all_tokens(field_filter, |token| contains_bytes(token, needle))
+                    // one SIMD searcher for the whole scan, not a fresh
+                    // scalar windows() pass per key
+                    let finder = memchr::memmem::Finder::new(needle.as_slice());
+                    self.scan_all_tokens(field_filter, |token| finder.find(token).is_some())
                 }
             }
             VixQuery::Regex { field, pattern } => {
@@ -1879,11 +2230,13 @@ impl VixReader {
     /// field-range walk costs a few MB-sized round trips instead of one
     /// ~4KB round trip per block — the #27 fetch storm (27k point reads
     /// over 78 files for one unfiltered trace-list TopN) was this loop.
+    /// `on_key` returns whether to CONTINUE — `false` ends the walk early
+    /// (the #29 lever-2 enumeration cap rides this).
     fn scan_key_range(
         &self,
         lower: &[u8],
         upper: Option<(&[u8], bool)>,
-        mut on_key: impl FnMut(&[u8], u64),
+        mut on_key: impl FnMut(&[u8], u64) -> bool,
     ) -> Result<()> {
         if self.term_count == 0 {
             return Ok(());
@@ -1906,7 +2259,7 @@ impl VixReader {
                 None => self.dict_block(b)?,
             };
             let first_ordinal = index.meta(b).1;
-            let mut past = false;
+            let mut done = false;
             crate::dict_blocks::block_scan(&block, |pos, key| {
                 if key < lower {
                     return true;
@@ -1914,13 +2267,16 @@ impl VixReader {
                 if let Some((bound, inclusive)) = upper
                     && ((inclusive && key > bound) || (!inclusive && key >= bound))
                 {
-                    past = true;
+                    done = true;
                     return false;
                 }
-                on_key(key, first_ordinal + pos as u64);
+                if !on_key(key, first_ordinal + pos as u64) {
+                    done = true;
+                    return false;
+                }
                 true
             })?;
-            if past {
+            if done {
                 break;
             }
         }
@@ -2001,6 +2357,186 @@ impl VixReader {
         Ok(Some(blocks_map))
     }
 
+    /// Bulk-load an arbitrary ASCENDING list of dictionary blocks (ranged
+    /// readers only; in-memory readers slice for free): the scattered-block
+    /// sibling of [`Self::load_dict_block_span`], for resolving a top-k's
+    /// winner ordinals whose blocks need not be consecutive. Runs of
+    /// adjacent missing blocks coalesce into one ranged read each; the
+    /// whole list resolves in ONE `block_fetch_many` round trip.
+    fn load_dict_blocks(
+        &self,
+        blocks: &[usize],
+    ) -> Result<Option<std::collections::HashMap<usize, Bytes>>> {
+        const SPAN_FETCH_MAX_BYTES: u64 = 8 * 1024 * 1024;
+        const SPAN_CACHE_MAX_BLOCKS: usize = 512;
+        let Some(BlobHandle::Ranged(ranged)) = self.dict_blocks_blob.as_ref() else {
+            return Ok(None);
+        };
+        if blocks.is_empty() {
+            return Ok(None);
+        }
+        let index = self.dict_index()?;
+        let blob_len = self.dict_blocks_len()?;
+        let mut runs: Vec<(std::ops::Range<usize>, std::ops::Range<u64>)> = Vec::new();
+        {
+            let cache = self.block_cache.lock().expect("poisoned");
+            for &b in blocks {
+                if b >= index.block_count() || cache.0.contains_key(&b) {
+                    continue;
+                }
+                let range = index.block_range(b, blob_len);
+                match runs.last_mut() {
+                    Some((run_blocks, bytes))
+                        if run_blocks.end == b
+                            && range.end - bytes.start <= SPAN_FETCH_MAX_BYTES =>
+                    {
+                        run_blocks.end = b + 1;
+                        bytes.end = range.end;
+                    }
+                    Some((run_blocks, _)) if run_blocks.contains(&b) => {}
+                    _ => runs.push((b..b + 1, range)),
+                }
+            }
+        }
+        if runs.is_empty() {
+            return Ok(None);
+        }
+        let ranges: Vec<std::ops::Range<u64>> = runs
+            .iter()
+            .map(|(_, bytes)| ranged.range.start + bytes.start..ranged.range.start + bytes.end)
+            .collect();
+        let fetched = crate::source::block_fetch_many(ranged.source.as_ref(), ranges)?;
+        let total_blocks: usize = runs.iter().map(|(run_blocks, _)| run_blocks.len()).sum();
+        let mut blocks_map = std::collections::HashMap::with_capacity(total_blocks);
+        for ((run_blocks, bytes), run) in runs.into_iter().zip(fetched) {
+            for b in run_blocks {
+                let range = index.block_range(b, blob_len);
+                blocks_map.insert(
+                    b,
+                    run.slice(
+                        (range.start - bytes.start) as usize..(range.end - bytes.start) as usize,
+                    ),
+                );
+            }
+        }
+        if blocks_map.len() <= SPAN_CACHE_MAX_BLOCKS {
+            let mut cache = self.block_cache.lock().expect("poisoned");
+            for (&b, bytes) in &blocks_map {
+                self.cache_dict_block(&mut cache, b, bytes);
+            }
+        }
+        Ok(Some(blocks_map))
+    }
+
+    /// First ordinal whose dictionary key is `>= key` (`term_count` when
+    /// every key is smaller). A resident-index probe plus at most one block
+    /// load.
+    fn ordinal_lower_bound(&self, key: &[u8]) -> Result<u64> {
+        if self.term_count == 0 {
+            return Ok(0);
+        }
+        let index = self.dict_index()?;
+        let Some(b) = index.predecessor_block(key)? else {
+            return Ok(0);
+        };
+        let block = self.dict_block(b)?;
+        let pos = crate::dict_blocks::block_lower_bound(&block, key)?;
+        Ok(index.meta(b).1 + pos as u64)
+    }
+
+    /// The (at most two) contiguous ordinal ranges holding `field_id`'s RAW
+    /// STRING value terms: values sorting below the numeric tag byte, and
+    /// values above the tagged numeric/bool sub-range. Mirrors the per-key
+    /// `is_numeric_value_token` classification of the dictionary walk —
+    /// including its documented residual (a string value whose first byte
+    /// IS the tag classifies as numeric on both paths).
+    fn string_value_ordinal_ranges(
+        &self,
+        field_id: u16,
+    ) -> Result<[std::ops::Range<u64>; 2]> {
+        let (lower, upper) = Self::v2_field_range(field_id);
+        let field_start = self.ordinal_lower_bound(&lower)?;
+        let field_end = self.ordinal_lower_bound(&upper)?;
+        let (num_lower, num_upper) =
+            Self::v2_prefix_range(field_id, &[crate::numeric::NUMERIC_TERM_TAG]);
+        let num_start = self
+            .ordinal_lower_bound(&num_lower)?
+            .clamp(field_start, field_end);
+        let num_end = self
+            .ordinal_lower_bound(&num_upper)?
+            .clamp(field_start, field_end);
+        Ok([field_start..num_start, num_end..field_end])
+    }
+
+    /// Resolve the dictionary keys of ASCENDING `ordinals`. Blocks are
+    /// binary-searched from the resident index, missing ones batch-fetched
+    /// in one round trip ([`Self::load_dict_blocks`]), and each touched
+    /// block is positionally scanned once. Cost is proportional to the
+    /// number of DISTINCT blocks touched (~4KB each), never to the field's
+    /// full dictionary span — the whole point of resolving only a top-k's
+    /// winners (#29).
+    fn keys_for_ordinals(&self, ordinals: &[u64]) -> Result<Vec<Vec<u8>>> {
+        if ordinals.is_empty() {
+            return Ok(Vec::new());
+        }
+        debug_assert!(ordinals.windows(2).all(|w| w[0] < w[1]));
+        let index = self.dict_index()?;
+        let block_count = index.block_count();
+        // block of each ordinal: last block whose first_ordinal <= ordinal
+        let block_of = |ordinal: u64| -> usize {
+            let mut lo = 0usize;
+            let mut hi = block_count; // invariant: meta(lo..).1 <= ordinal < meta(hi..).1
+            while hi - lo > 1 {
+                let mid = lo + (hi - lo) / 2;
+                if index.meta(mid).1 <= ordinal {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            lo
+        };
+        let blocks: Vec<(usize, std::ops::Range<usize>)> = {
+            // group the ascending ordinals by their block
+            let mut groups: Vec<(usize, std::ops::Range<usize>)> = Vec::new();
+            for (i, &ordinal) in ordinals.iter().enumerate() {
+                let b = block_of(ordinal);
+                match groups.last_mut() {
+                    Some((gb, span)) if *gb == b => span.end = i + 1,
+                    _ => groups.push((b, i..i + 1)),
+                }
+            }
+            groups
+        };
+        let block_ids: Vec<usize> = blocks.iter().map(|(b, _)| *b).collect();
+        let prefetched = self.load_dict_blocks(&block_ids)?;
+        let mut keys: Vec<Vec<u8>> = Vec::with_capacity(ordinals.len());
+        for (b, span) in blocks {
+            let block = match prefetched.as_ref().and_then(|m| m.get(&b)) {
+                Some(bytes) => bytes.clone(),
+                None => self.dict_block(b)?,
+            };
+            let first_ordinal = index.meta(b).1;
+            let wanted = &ordinals[span];
+            let mut next = 0usize;
+            crate::dict_blocks::block_scan(&block, |pos, key| {
+                while next < wanted.len() && first_ordinal + pos as u64 == wanted[next] {
+                    keys.push(key.to_vec());
+                    next += 1;
+                }
+                next < wanted.len()
+            })?;
+            if next != wanted.len() {
+                return Err(VixError::Malformed(format!(
+                    "dictionary block {b} ended before resolving {} of {} ordinals",
+                    wanted.len() - next,
+                    wanted.len()
+                )));
+            }
+        }
+        Ok(keys)
+    }
+
     /// Walk every FST key, apply `matches` to the token part (keys without a
     /// valid composite suffix — key terms, and TAGGED numeric/bool value
     /// terms — are skipped) and collect matching ordinals. The tagged terms
@@ -2028,6 +2564,7 @@ impl VixReader {
                 {
                     ordinals.push(ordinal);
                 }
+                true
             })?;
             return Ok(ordinals);
         }
@@ -2474,17 +3011,11 @@ fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-/// Plain byte-substring search (empty needle matches everything).
+/// Plain byte-substring search (empty needle matches everything) — pins the
+/// memmem semantics the Contains scan's hoisted `Finder` relies on.
+#[cfg(test)]
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
-    if needle.is_empty() {
-        return true;
-    }
-    if needle.len() > haystack.len() {
-        return false;
-    }
-    haystack
-        .windows(needle.len())
-        .any(|window| window == needle)
+    memchr::memmem::find(haystack, needle).is_some()
 }
 
 /// Run a [`tantivy_fst::Automaton`] over `input` (anchored full match).

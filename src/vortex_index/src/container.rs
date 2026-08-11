@@ -34,7 +34,9 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use arrow::{
-    array::{Array, ArrayRef as ArrowArrayRef, LargeBinaryArray, StructArray, UInt64Array},
+    array::{
+        Array, ArrayRef as ArrowArrayRef, LargeBinaryArray, StructArray, UInt32Array, UInt64Array,
+    },
     compute::cast,
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
@@ -969,6 +971,11 @@ pub(crate) enum RowSelection {
     All,
     /// Point reads of the given row indices (sorted + deduped internally).
     Indices(Vec<u64>),
+    /// One contiguous half-open row range — unlike [`RowSelection::Indices`]
+    /// this allocates nothing per row (vortex takes the range directly), so
+    /// it is the right shape for scanning a column over millions of
+    /// consecutive rows (#29's doc_count scans).
+    Range(std::ops::Range<u64>),
 }
 
 /// Scan an embedded Vortex file into arrow record batches, optionally
@@ -1031,10 +1038,16 @@ pub(crate) fn scan_blob_streaming(
     if let Some(columns) = projection {
         scan = scan.with_projection(select(columns.to_vec(), root()));
     }
-    if let RowSelection::Indices(mut indices) = selection {
-        indices.sort_unstable();
-        indices.dedup();
-        scan = scan.with_row_indices(Buffer::from(indices));
+    match selection {
+        RowSelection::All => {}
+        RowSelection::Indices(mut indices) => {
+            indices.sort_unstable();
+            indices.dedup();
+            scan = scan.with_row_indices(Buffer::from(indices));
+        }
+        RowSelection::Range(range) => {
+            scan = scan.with_row_range(range);
+        }
     }
     scan = scan.with_some_filter(filter);
     scan = scan.with_some_limit(limit);
@@ -1210,6 +1223,28 @@ pub(crate) fn column_binary(batch: &RecordBatch, name: &str) -> Result<LargeBina
         .downcast_ref::<LargeBinaryArray>()
         .cloned()
         .ok_or_else(|| VixError::Malformed(format!("column {name:?} is not binary")))
+}
+
+/// Borrow a physically-u32 column's values without casting or copying —
+/// the per-batch view for hot column loops (#29's doc_count scans), where
+/// [`column_u64`]'s cast + `to_vec` would copy every batch twice. Hard
+/// error on any other width: the terms schema has written `doc_count` as
+/// `UInt32` since the format epoch (no legacy readers by design).
+pub(crate) fn column_u32<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a UInt32Array> {
+    let column = get_column(batch, name)?
+        .as_any()
+        .downcast_ref::<UInt32Array>()
+        .ok_or_else(|| {
+            VixError::Malformed(format!(
+                "column {name:?} is not physically u32 (terms schema drift?)"
+            ))
+        })?;
+    if column.null_count() > 0 {
+        return Err(VixError::Malformed(format!(
+            "column {name:?} unexpectedly contains nulls"
+        )));
+    }
+    Ok(column)
 }
 
 /// Fetch an unsigned integer column as non-null `u64` values.
