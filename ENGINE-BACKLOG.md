@@ -3,6 +3,24 @@
 Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
 (deleted 2026-07-29; full history in git). Keep THIS file current.
 
+## .121 +2h OUTCOME 2026-08-26 ~08:3xZ — M30 VERIFIED; EQUILIBRIUM NAMED
+- Fleet merges/h 1,600 -> 6,065 (+1h) -> 6,742 (+2h) SUSTAINED (4.2x). Gate runs
+  4/4 slots on every pod; queue waits 168s mean -> 0.2-33s. Kills=0 through the
+  whole window; RSS 3.6-23.2GB worst vs the 43.4Gi envelope — the headroom check
+  never had to clamp below cap in practice. Pending jobs healthy (314/238).
+- Rollout itself: ~4min to 10/10 (Karpenter had capacity), dev auto-synced clean.
+- THE FINDING: 4.2x moved the fleet from falling-behind to TREADING WATER.
+  traces/default per-hour live counts stayed ~flat (9.0-9.7k) because arrivals
+  match consumption: ~7.1k/h bulk L0 (128-512MB, the real data) + ~3.5k/h TINY
+  <1MB files (85% landing in >1h-old hour partitions, ~0 bytes — the file-count
+  poison), vs ~6k files/h consumed for this stream. Throughput alone cannot
+  break this equilibrium: the next step is WORK REDUCTION per byte/file —
+  chartered as M31, design in DESIGN-MERGE.md (2026-08-26 architecture review).
+- M30 mechanism note for the record: cap 4 binds via CPU contention (4 rebuilds
+  x 3 threads = the 12C limit; per-merge slot hold stretched ~19s -> ~30-45s),
+  NOT via the memory envelope. No-CPU-raise is an owner/user constraint — M31's
+  levers are all CPU-reducing.
+
 ## M30 — HEADROOM-GATED REBUILD ADMISSION 2026-08-26 (ships as .121)
 - Prod re-measure (the gate contract's owed step, done live): gate=1 is 100%
   saturated (381/381 merges rebuild-path on the busiest pod/2h, ~19s slot
