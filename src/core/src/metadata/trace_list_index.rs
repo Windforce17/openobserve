@@ -205,7 +205,6 @@ impl TraceListIndex {
             let settings = StreamSettings {
                 partition_keys: vec![],
                 full_text_search_keys: vec![],
-                column_store_fields: vec![],
                 bloom_filter_fields: vec!["trace_id".to_string()],
                 data_retention: 0,
                 flatten_level: None,

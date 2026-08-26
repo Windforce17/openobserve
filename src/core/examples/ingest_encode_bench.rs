@@ -419,22 +419,19 @@ async fn main() -> Result<(), anyhow::Error> {
         input_bytes as f64 / 1e6
     );
 
-    // Prod `default` traces stream settings (fetched live 2026-07-27).
+    // Prod `default` traces stream settings (v2: every present field is a
+    // docs column — no column-store list).
     let fts_fields: Vec<String> = vec![];
-    let cs_fields: Vec<String> = ["duration", "service_name", "operation_name", "span_status"]
-        .into_iter()
-        .map(String::from)
-        .collect();
     let bloom_fields: Vec<String> = vec!["trace_id".to_string()];
 
     for pass in 0..repeat {
         let encode_start = Instant::now();
         let result = openobserve_core::vix::core_writer::write_core_file_from_tables(
             &format!("bench-{pass}"),
+            config::meta::stream::StreamType::Logs,
             schema.clone(),
             tables.clone(),
             &fts_fields,
-            &cs_fields,
             &bloom_fields,
             false,
             0,

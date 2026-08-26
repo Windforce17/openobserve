@@ -409,7 +409,6 @@ pub async fn save_stream_settings(
 
     // Check the fields are not reserved
     let fts_set: HashSet<_> = settings.full_text_search_keys.iter().cloned().collect();
-    let column_store_set: HashSet<_> = settings.column_store_fields.iter().cloned().collect();
     let bloom_set: HashSet<_> = settings.bloom_filter_fields.iter().cloned().collect();
     let pk_set: HashSet<_> = settings
         .partition_keys
@@ -421,11 +420,6 @@ pub async fn save_stream_settings(
     let strict_reserved: [&str; 1] = [TIMESTAMP_COL_NAME];
     let no_search_reserved: [&str; 1] = [ORIGINAL_DATA_COL_NAME];
     for &r in chain(strict_reserved.iter(), no_search_reserved.iter()) {
-        if column_store_set.contains(r) {
-            return Ok(MetaHttpResponse::bad_request(format!(
-                "field [{r}] is reserved and cannot be used for column store"
-            )));
-        }
         if bloom_set.contains(r) {
             return Ok(MetaHttpResponse::bad_request(format!(
                 "field [{r}] is reserved and cannot be used for bloom filter"
@@ -457,11 +451,6 @@ pub async fn save_stream_settings(
     if let Some(name) = pk_set.intersection(&fts_set).next() {
         return Ok(MetaHttpResponse::bad_request(format!(
             "partition key [{name}] cannot also be a full text search field"
-        )));
-    }
-    if let Some(name) = pk_set.intersection(&column_store_set).next() {
-        return Ok(MetaHttpResponse::bad_request(format!(
-            "partition key [{name}] cannot also be a column store field"
         )));
     }
     if let Some(name) = pk_set.intersection(&bloom_set).next() {
@@ -667,17 +656,6 @@ pub async fn update_stream_settings(
             .extend(new_settings.full_text_search_keys.add);
     }
 
-    // column_store_fields: remove first, then add
-    if !new_settings.column_store_fields.remove.is_empty() {
-        settings
-            .column_store_fields
-            .retain(|f| !new_settings.column_store_fields.remove.contains(f));
-    }
-    if !new_settings.column_store_fields.add.is_empty() {
-        settings
-            .column_store_fields
-            .extend(new_settings.column_store_fields.add);
-    }
 
     // bloom_filter_fields: remove first, then add
     if !new_settings.bloom_filter_fields.remove.is_empty() {
@@ -1242,7 +1220,7 @@ pub async fn update_fields_type(
 
 /// Make `settings` internally consistent before validation / persistence.
 /// One normalization, in-place: **dedup** each of `full_text_search_keys`,
-/// `column_store_fields`, `bloom_filter_fields`, and `partition_keys`,
+/// `bloom_filter_fields`, and `partition_keys`,
 /// preserving first-occurrence order. Matches the silent dedup the update path
 /// has always done on `.add` lists, so a user re-adding the same field is a
 /// no-op rather than an error.
@@ -1251,7 +1229,6 @@ pub async fn update_fields_type(
 /// the direct-save and update paths validate the same normalized shape.
 fn normalize_stream_settings(settings: &mut StreamSettings) {
     dedup_preserve_order(&mut settings.full_text_search_keys);
-    dedup_preserve_order(&mut settings.column_store_fields);
     dedup_preserve_order(&mut settings.bloom_filter_fields);
     let mut seen: HashSet<String> = HashSet::new();
     settings
@@ -1297,7 +1274,6 @@ mod tests {
     #[test]
     fn test_normalize_stream_settings_bloom_filter_fields_dedup() {
         let mut settings = StreamSettings {
-            column_store_fields: vec!["a".to_string()],
             bloom_filter_fields: vec!["b".to_string(), "b".to_string()],
             ..Default::default()
         };
@@ -1307,20 +1283,6 @@ mod tests {
         // bloom fields stand alone now (no folding into a secondary index
         // list) and get deduped
         assert_eq!(settings.bloom_filter_fields, vec!["b".to_string()]);
-        assert_eq!(settings.column_store_fields, vec!["a".to_string()]);
-    }
-
-    #[test]
-    fn test_normalize_stream_settings_column_store_fields_dedup() {
-        let mut settings = StreamSettings {
-            column_store_fields: vec!["b".to_string(), "a".to_string(), "b".to_string()],
-            ..Default::default()
-        };
-        normalize_stream_settings(&mut settings);
-        assert_eq!(
-            settings.column_store_fields,
-            vec!["b".to_string(), "a".to_string()]
-        );
     }
 
     #[test]
@@ -1516,7 +1478,6 @@ mod tests {
         let mut metadata = HashMap::new();
         let settings = StreamSettings {
             full_text_search_keys: vec!["message".to_string()],
-            column_store_fields: vec!["level".to_string()],
             data_retention: 365,
             max_query_range: 3600,
             ..Default::default()

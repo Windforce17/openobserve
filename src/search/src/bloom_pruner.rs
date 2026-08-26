@@ -53,6 +53,47 @@ use super::index::{Condition, IndexCondition};
 struct Predicate {
     field: String,
     values: Vec<String>,
+    /// #48: probe the reserved COMPOSITE section with `{field}\0{value}`
+    /// keys instead of a per-field section — set for equality/IN on fields
+    /// OUTSIDE `bloom_indexed_fields` when the composite bloom is enabled.
+    composite: bool,
+    /// M15: a per-field predicate (configured field) may FALL BACK to the
+    /// composite section for files its per-field section does not cover —
+    /// #52 bloom-only demotion drops the per-field bloom (the values live
+    /// in the composite instead), so without this a CONFIGURED demoted
+    /// field lost all `.bf` pruning. Set when the composite is enabled and
+    /// the field name fits the composite key form; the fallback engages
+    /// per GROUP only where coverage is actually missing, and per FILE
+    /// only for files without a per-field column (guard-gated, fail-open).
+    composite_fallback: bool,
+}
+
+impl Predicate {
+    /// The `.bf` section this predicate probes.
+    fn section(&self) -> &str {
+        if self.composite {
+            vortex_index::bloom::COMPOSITE_BLOOM_FIELD
+        } else {
+            &self.field
+        }
+    }
+
+    /// The bytes hashed for `value` in this predicate's section — the
+    /// composite form comes from the writer's own key assembler so both
+    /// sides hash identical bytes by construction.
+    fn probe_bytes<'a>(&self, value: &'a str) -> std::borrow::Cow<'a, [u8]> {
+        if self.composite {
+            let mut buf = Vec::new();
+            // None (field name > u16::MAX) is unreachable: collect_decidable
+            // never folds such a field into a composite predicate.
+            if vortex_index::bloom::composite_value_key(&self.field, value.as_bytes(), &mut buf)
+                .is_some()
+            {
+                return std::borrow::Cow::Owned(buf);
+            }
+        }
+        std::borrow::Cow::Borrowed(value.as_bytes())
+    }
 }
 
 /// Bytes pulled from the tail of a `.bf` on footer-cache miss. Big
@@ -97,7 +138,12 @@ fn bloom_prefetch_concurrency() -> usize {
 /// kept (no bloom info). If no condition is bloom-decidable, `files` is
 /// returned unchanged without touching any `.bf`.
 ///
+/// `composite_enabled` (`ZO_VIX_BLOOM_COMPOSITE`, read by the caller so
+/// tests can drive it) folds equality/IN on ANY field into composite-section
+/// probes as a second chance behind the per-field sections.
+///
 /// `trace_id` is threaded through purely for logging.
+#[allow(clippy::too_many_arguments)]
 pub async fn prune(
     trace_id: &str,
     org_id: &str,
@@ -106,9 +152,10 @@ pub async fn prune(
     files: Vec<FileKey>,
     index_condition: &IndexCondition,
     bloom_indexed_fields: Vec<String>,
+    composite_enabled: bool,
 ) -> Vec<FileKey> {
     let bloom_indexed_fields = bloom_indexed_fields.into_iter().collect::<HashSet<_>>();
-    let predicates = collect_decidable(index_condition, &bloom_indexed_fields);
+    let predicates = collect_decidable(index_condition, &bloom_indexed_fields, composite_enabled);
     if predicates.is_empty() {
         return files;
     }
@@ -330,26 +377,97 @@ async fn run_group(
     // reads per group instead of O(files).
     struct RowPlan {
         pred_idx: usize,
-        value_idx: usize,
+        /// `Some(vi)` = value probe; `None` = a #48 guard probe (does this
+        /// file's composite cover `pred_idx`'s field at all?).
+        value_idx: Option<usize>,
         range: std::ops::Range<u64>,
         /// SBBF bit-mask for this value, computed once and reused for every
         /// file's block in the row (the mask depends only on the hash, which
         /// is identical across all files in the group).
         mask: [u32; 8],
+        /// This row probes the COMPOSITE section (an original composite
+        /// predicate, or an M15 fallback row of a per-field predicate).
+        composite_row: bool,
     }
+    let composite_section = vortex_index::bloom::COMPOSITE_BLOOM_FIELD;
     let mut rows: Vec<RowPlan> = Vec::new();
-    for (pi, pred) in predicates.iter().enumerate() {
-        for (vi, value) in pred.values.iter().enumerate() {
-            if let Some((range, hash)) = reader.row_range(&pred.field, value.as_bytes()) {
+    let mut guard_buf = Vec::new();
+    // one guard-row set per (pred, COMPOSITE) — assembled by this closure
+    // for original composite predicates and M15 fallbacks alike
+    let mut push_guard_rows = |pi: usize, field: &str, rows: &mut Vec<RowPlan>| {
+        for probe in 0..vortex_index::bloom::COMPOSITE_GUARD_PROBES {
+            let Some(key) = vortex_index::bloom::composite_guard_key(field, probe, &mut guard_buf)
+            else {
+                break; // unreachable post collect_decidable filter
+            };
+            if let Some((range, hash)) = reader.row_range(composite_section, key) {
                 rows.push(RowPlan {
                     pred_idx: pi,
-                    value_idx: vi,
+                    value_idx: None,
                     range,
                     mask: mask_from_hash(hash),
+                    composite_row: true,
                 });
             }
-            // field absent in this .bf → no row → those (file, pred) pairs
-            // stay "no info" and are conservatively kept by the caller.
+        }
+    };
+    for (pi, pred) in predicates.iter().enumerate() {
+        for (vi, value) in pred.values.iter().enumerate() {
+            // #48 composite predicates probe the reserved section with the
+            // writer's tagged key form; per-field predicates are unchanged
+            if let Some((range, hash)) = reader.row_range(pred.section(), &pred.probe_bytes(value))
+            {
+                rows.push(RowPlan {
+                    pred_idx: pi,
+                    value_idx: Some(vi),
+                    range,
+                    mask: mask_from_hash(hash),
+                    composite_row: pred.composite,
+                });
+            }
+            // section absent in this .bf → no row → those (file, pred)
+            // pairs stay "no info" and are conservatively kept.
+        }
+        if pred.composite {
+            // #48 guard rows: a composite value miss is trusted only for
+            // files whose composite provably covers the field (all guard
+            // probes hit) — otherwise "not in the composite" would read as
+            // "not in the file" for fields that were never term-indexed
+            // (numeric columns, partial_fields drops) and wrongly drop.
+            push_guard_rows(pi, &pred.field, &mut rows);
+        } else if pred.composite_fallback
+            && !file_idxs.iter().all(|&fi| {
+                reader
+                    .column_index(&pred.field, with_bloom[fi].id as u64)
+                    .is_some()
+            })
+        {
+            // M15: the per-field section does NOT cover every group file —
+            // #52-demoted files carry no per-field bloom (their values live
+            // in the composite). Probe the composite as the fallback for
+            // exactly those files: tagged value keys + the guard rows that
+            // keep "composite has no info on this field" fail-open. Files
+            // the per-field section covers keep their per-field verdict
+            // (see the outcome pass). Footer-local decision — zero extra IO
+            // when the per-field section covers the whole group.
+            for (vi, value) in pred.values.iter().enumerate() {
+                let mut buf = Vec::new();
+                if let Some(key) = vortex_index::bloom::composite_value_key(
+                    &pred.field,
+                    value.as_bytes(),
+                    &mut buf,
+                ) && let Some((range, hash)) = reader.row_range(composite_section, key)
+                {
+                    rows.push(RowPlan {
+                        pred_idx: pi,
+                        value_idx: Some(vi),
+                        range,
+                        mask: mask_from_hash(hash),
+                        composite_row: true,
+                    });
+                }
+            }
+            push_guard_rows(pi, &pred.field, &mut rows);
         }
     }
     if rows.is_empty() {
@@ -385,24 +503,71 @@ async fn run_group(
     }
 
     // Step 4: for each file, slice its column out of each fetched row and run
-    // the 8-bit check. A file whose column is absent from a row's field stays
-    // "no info" for that predicate.
+    // the 8-bit check. A file whose column is absent from a row's section
+    // stays "no info" for that predicate.
+    //
+    // Guard pass first: a (file, predicate) pair whose guard probes don't ALL
+    // hit is NOT covered — its composite value outcomes are suppressed
+    // entirely, so the caller's fold sees "no info" (keep) instead of a false
+    // "definitely not". Guards gate COMPOSITE rows only: a per-field verdict
+    // never depends on composite coverage (M15 — a legacy file with a
+    // per-field section but no composite must keep pruning per-field).
+    let check = |r: &RowPlan, row_bytes: &bytes::Bytes, file_idx: usize| -> Option<bool> {
+        let file_id = with_bloom[file_idx].id as u64;
+        let section = if r.composite_row {
+            composite_section
+        } else {
+            predicates[r.pred_idx].section()
+        };
+        // file not a column for this section → no info
+        let col = reader.column_index(section, file_id)?;
+        let off = col * BLOCK_BYTES;
+        // footer/body disagreement shouldn't happen; treat as no info
+        if off + BLOCK_BYTES > row_bytes.len() {
+            return None;
+        }
+        let block: &[u8; BLOCK_BYTES] = row_bytes[off..off + BLOCK_BYTES].try_into().unwrap();
+        Some(check_block_with_mask(block, &r.mask))
+    };
+    let mut guard_miss: HashSet<(usize, usize)> = HashSet::new();
+    for (r, row_bytes) in rows.iter().zip(fetched.iter()) {
+        if r.value_idx.is_some() {
+            continue;
+        }
+        for &file_idx in file_idxs {
+            if check(r, row_bytes, file_idx) == Some(false) {
+                guard_miss.insert((file_idx, r.pred_idx));
+            }
+        }
+    }
     let mut outcomes: Vec<(usize, usize, usize, bool)> = Vec::new();
     for (r, row_bytes) in rows.iter().zip(fetched.iter()) {
-        let field = &predicates[r.pred_idx].field;
+        let Some(value_idx) = r.value_idx else {
+            continue;
+        };
         for &file_idx in file_idxs {
-            let file_id = with_bloom[file_idx].id as u64;
-            let Some(col) = reader.column_index(field, file_id) else {
-                continue; // file not a column for this field → no info
-            };
-            let off = col * BLOCK_BYTES;
-            if off + BLOCK_BYTES > row_bytes.len() {
-                // Shouldn't happen if footer + body agree; treat as no info.
-                continue;
+            if r.composite_row {
+                // composite verdicts require proven coverage (all guards hit)
+                if guard_miss.contains(&(file_idx, r.pred_idx)) {
+                    continue;
+                }
+                // M15 fallback rows govern ONLY the files the predicate's
+                // own per-field section does not cover (#52-demoted files);
+                // per-field-covered files keep their exact per-field verdict
+                if !predicates[r.pred_idx].composite
+                    && reader
+                        .column_index(
+                            &predicates[r.pred_idx].field,
+                            with_bloom[file_idx].id as u64,
+                        )
+                        .is_some()
+                {
+                    continue;
+                }
             }
-            let block: &[u8; BLOCK_BYTES] = row_bytes[off..off + BLOCK_BYTES].try_into().unwrap();
-            let hit = check_block_with_mask(block, &r.mask);
-            outcomes.push((file_idx, r.pred_idx, r.value_idx, hit));
+            if let Some(hit) = check(r, row_bytes, file_idx) {
+                outcomes.push((file_idx, r.pred_idx, value_idx, hit));
+            }
         }
     }
 
@@ -480,10 +645,37 @@ fn footer_shortfall(suffix: &[u8], total: u64) -> Option<u64> {
 fn collect_decidable(
     cond: &IndexCondition,
     bloom_indexed_fields: &HashSet<String>,
+    composite_enabled: bool,
 ) -> Vec<Predicate> {
     cond.conditions
         .iter()
-        .filter_map(|c| try_predicate(c, bloom_indexed_fields))
+        .filter_map(|c| {
+            // per-field sections first (exact blooms exist on old files
+            // too); the composite section is the any-field second chance
+            try_predicate(c, Some(bloom_indexed_fields))
+                .map(|mut p| {
+                    // M15: a configured field may be #52-DEMOTED in some or
+                    // all files (no per-field section there) — allow the
+                    // per-group composite fallback where the key form can
+                    // carry the field
+                    p.composite_fallback =
+                        composite_enabled && p.field.len() <= u16::MAX as usize;
+                    p
+                })
+                .or_else(|| {
+                    if !composite_enabled {
+                        return None;
+                    }
+                    try_predicate(c, None)
+                        // fields the composite key form cannot carry are never
+                        // covered — folding them would only waste probe IO
+                        .filter(|p| p.field.len() <= u16::MAX as usize)
+                        .map(|mut p| {
+                            p.composite = true;
+                            p
+                        })
+                })
+        })
         .collect()
 }
 
@@ -503,18 +695,24 @@ fn collect_decidable(
 /// / `MatchAll` / `FuzzyMatchAll`, nested `And`, negated or empty `In`, an
 /// `Or` whose leaves don't all fold or don't share a field, or any condition
 /// on a non-bloom-indexed field.
-fn try_predicate(cond: &Condition, bloom_indexed_fields: &HashSet<String>) -> Option<Predicate> {
+fn try_predicate(
+    cond: &Condition,
+    bloom_indexed_fields: Option<&HashSet<String>>,
+) -> Option<Predicate> {
+    let field_ok = |field: &String| bloom_indexed_fields.is_none_or(|set| set.contains(field));
     match cond {
-        Condition::Equal(field, value) if bloom_indexed_fields.contains(field) => Some(Predicate {
+        Condition::Equal(field, value) if field_ok(field) => Some(Predicate {
             field: field.clone(),
             values: vec![value.clone()],
+            composite: false,
+            composite_fallback: false,
         }),
-        Condition::In(field, values, false)
-            if bloom_indexed_fields.contains(field) && !values.is_empty() =>
-        {
+        Condition::In(field, values, false) if field_ok(field) && !values.is_empty() => {
             Some(Predicate {
                 field: field.clone(),
                 values: values.clone(),
+                composite: false,
+            composite_fallback: false,
             })
         }
         Condition::Or(left, right) => {
@@ -531,6 +729,8 @@ fn try_predicate(cond: &Condition, bloom_indexed_fields: &HashSet<String>) -> Op
             Some(Predicate {
                 field: lp.field,
                 values,
+                composite: false,
+            composite_fallback: false,
             })
         }
         _ => None,
@@ -567,7 +767,7 @@ mod tests {
     #[test]
     fn test_collect_equal_on_indexed_field() {
         let c = cond(vec![Condition::Equal("trace_id".into(), "abc".into())]);
-        let p = collect_decidable(&c, &fields(&["trace_id"]));
+        let p = collect_decidable(&c, &fields(&["trace_id"]), false);
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].field, "trace_id");
         assert_eq!(p[0].values, vec!["abc".to_string()]);
@@ -576,7 +776,7 @@ mod tests {
     #[test]
     fn test_collect_skips_non_indexed_field() {
         let c = cond(vec![Condition::Equal("body".into(), "abc".into())]);
-        assert!(collect_decidable(&c, &fields(&["trace_id"])).is_empty());
+        assert!(collect_decidable(&c, &fields(&["trace_id"]), false).is_empty());
     }
 
     #[test]
@@ -586,7 +786,7 @@ mod tests {
             vec!["a".into(), "b".into()],
             false,
         )]);
-        let p = collect_decidable(&c, &fields(&["trace_id"]));
+        let p = collect_decidable(&c, &fields(&["trace_id"]), false);
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].values, vec!["a".to_string(), "b".to_string()]);
     }
@@ -594,13 +794,13 @@ mod tests {
     #[test]
     fn test_collect_skips_empty_and_negated_in() {
         let empty = cond(vec![Condition::In("trace_id".into(), vec![], false)]);
-        assert!(collect_decidable(&empty, &fields(&["trace_id"])).is_empty());
+        assert!(collect_decidable(&empty, &fields(&["trace_id"]), false).is_empty());
         let negated = cond(vec![Condition::In(
             "trace_id".into(),
             vec!["a".into()],
             true,
         )]);
-        assert!(collect_decidable(&negated, &fields(&["trace_id"])).is_empty());
+        assert!(collect_decidable(&negated, &fields(&["trace_id"]), false).is_empty());
     }
 
     #[test]
@@ -610,7 +810,7 @@ mod tests {
             Condition::Regex("trace_id".into(), "^abc.*".into()),
             Condition::StrMatch("trace_id".into(), "abc".into(), true),
         ]);
-        assert!(collect_decidable(&c, &fields(&["trace_id"])).is_empty());
+        assert!(collect_decidable(&c, &fields(&["trace_id"]), false).is_empty());
     }
 
     // ---- same-field Or folding ----
@@ -623,7 +823,7 @@ mod tests {
             Box::new(Condition::Equal("trace_id".into(), "b".into())),
             Box::new(Condition::Equal("trace_id".into(), "a".into())),
         )]);
-        let p = collect_decidable(&c, &fields(&["trace_id"]));
+        let p = collect_decidable(&c, &fields(&["trace_id"]), false);
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].field, "trace_id");
         assert_eq!(p[0].values, vec!["a".to_string(), "b".to_string()]);
@@ -640,7 +840,7 @@ mod tests {
                 false,
             )),
         )]);
-        let p = collect_decidable(&c, &fields(&["trace_id"]));
+        let p = collect_decidable(&c, &fields(&["trace_id"]), false);
         assert_eq!(p.len(), 1);
         assert_eq!(
             p[0].values,
@@ -659,7 +859,7 @@ mod tests {
             Box::new(inner),
             Box::new(Condition::Equal("trace_id".into(), "3".into())),
         );
-        let p = collect_decidable(&cond(vec![outer]), &fields(&["trace_id"]));
+        let p = collect_decidable(&cond(vec![outer]), &fields(&["trace_id"]), false);
         assert_eq!(p.len(), 1);
         assert_eq!(
             p[0].values,
@@ -678,7 +878,7 @@ mod tests {
                 false,
             )),
         )]);
-        let p = collect_decidable(&c, &fields(&["trace_id"]));
+        let p = collect_decidable(&c, &fields(&["trace_id"]), false);
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].values, vec!["a".to_string(), "b".to_string()]);
     }
@@ -691,7 +891,7 @@ mod tests {
             Box::new(Condition::Equal("trace_id".into(), "a".into())),
             Box::new(Condition::Equal("service".into(), "x".into())),
         )]);
-        assert!(collect_decidable(&c, &fields(&["trace_id", "service"])).is_empty());
+        assert!(collect_decidable(&c, &fields(&["trace_id", "service"]), false).is_empty());
     }
 
     #[test]
@@ -701,7 +901,7 @@ mod tests {
             Box::new(Condition::Equal("trace_id".into(), "a".into())),
             Box::new(Condition::In("trace_id".into(), vec!["b".into()], true)),
         )]);
-        assert!(collect_decidable(&c, &fields(&["trace_id"])).is_empty());
+        assert!(collect_decidable(&c, &fields(&["trace_id"]), false).is_empty());
     }
 
     #[test]
@@ -712,7 +912,7 @@ mod tests {
             Box::new(Condition::Equal("body".into(), "a".into())),
             Box::new(Condition::Equal("body".into(), "b".into())),
         )]);
-        assert!(collect_decidable(&c, &fields(&["trace_id"])).is_empty());
+        assert!(collect_decidable(&c, &fields(&["trace_id"]), false).is_empty());
     }
 
     #[test]
@@ -726,7 +926,7 @@ mod tests {
             ),
             Condition::Equal("user_id".into(), "u-1".into()),
         ]);
-        let p = collect_decidable(&c, &fields(&["trace_id", "user_id"]));
+        let p = collect_decidable(&c, &fields(&["trace_id", "user_id"]), false);
         assert_eq!(p.len(), 2);
         let trace = p.iter().find(|p| p.field == "trace_id").unwrap();
         assert_eq!(trace.values, vec!["a".to_string(), "b".to_string()]);
@@ -743,7 +943,7 @@ mod tests {
             Condition::NotEqual("body".into(), "noise".into()),
             Condition::Equal("user_id".into(), "u-1".into()),
         ]);
-        let p = collect_decidable(&c, &fields(&["trace_id", "user_id"]));
+        let p = collect_decidable(&c, &fields(&["trace_id", "user_id"]), false);
         assert_eq!(p.len(), 2);
         assert!(p.iter().any(|x| x.field == "trace_id"));
         assert!(p.iter().any(|x| x.field == "user_id"));
@@ -778,6 +978,8 @@ mod tests {
         let pred = Predicate {
             field: "trace_id".into(),
             values: vec!["present-A".into()],
+            composite: false,
+            composite_fallback: false,
         };
         // file A: any value matches → kept
         assert!(
@@ -797,6 +999,8 @@ mod tests {
         let pred_in = Predicate {
             field: "trace_id".into(),
             values: vec!["present-A".into(), "absent-X".into()],
+            composite: false,
+            composite_fallback: false,
         };
         assert!(
             pred_in
@@ -809,12 +1013,152 @@ mod tests {
         let pred_other = Predicate {
             field: "trace_id".into(),
             values: vec!["absent-Z".into()],
+            composite: false,
+            composite_fallback: false,
         };
         let preds = [pred, pred_other];
         let kept = preds
             .iter()
             .all(|p| p.values.iter().any(|v| check(&p.field, id_a, v.as_bytes())));
         assert!(!kept);
+    }
+
+    /// #48: the composite second-chance fold — fields outside
+    /// `bloom_indexed_fields` fold into composite predicates when (and only
+    /// when) the config enables it, and per-field predicates keep priority.
+    #[test]
+    fn composite_fold_is_gated_and_second_chance() {
+        let c = cond(vec![Condition::Equal("svc".into(), "api".into())]);
+        // disabled → nothing decidable
+        assert!(collect_decidable(&c, &fields(&["trace_id"]), false).is_empty());
+        // enabled → composite predicate on the raw field name
+        let p = collect_decidable(&c, &fields(&["trace_id"]), true);
+        assert_eq!(p.len(), 1);
+        assert!(p[0].composite);
+        assert_eq!(p[0].field, "svc");
+        assert_eq!(p[0].section(), vortex_index::bloom::COMPOSITE_BLOOM_FIELD);
+        // a bloom-indexed field still folds per-field, composite untouched
+        let c = cond(vec![Condition::Equal("trace_id".into(), "t1".into())]);
+        let p = collect_decidable(&c, &fields(&["trace_id"]), true);
+        assert_eq!(p.len(), 1);
+        assert!(!p[0].composite);
+        assert_eq!(p[0].section(), "trace_id");
+        // mixed AND: one per-field + one composite
+        let c = cond(vec![
+            Condition::Equal("trace_id".into(), "t1".into()),
+            Condition::Equal("svc".into(), "api".into()),
+        ]);
+        let p = collect_decidable(&c, &fields(&["trace_id"]), true);
+        assert_eq!(p.len(), 2);
+        assert_eq!(
+            p.iter().filter(|p| p.composite).count(),
+            1,
+            "exactly the non-indexed field goes composite"
+        );
+    }
+
+    /// #48 writer→`.bf`→pruner contract over REAL accumulator-built bytes:
+    /// a composite value hit keeps, a covered miss drops, an uncovered
+    /// field (guard miss) and a composite-less legacy file both stay
+    /// "no info" — the keep direction.
+    #[test]
+    fn composite_probe_contract_with_guards() {
+        use vortex_index::bloom::{BloomHashAcc, COMPOSITE_GUARD_PROBES, composite_guard_key};
+
+        let v1_key = |value: &[u8], id: u16| {
+            let mut k = value.to_vec();
+            k.push(0);
+            k.extend_from_slice(&id.to_be_bytes());
+            k
+        };
+        let build_composite = |file_id: u64, value: &str| -> infra::bloom::FieldBloom {
+            let mut acc = BloomHashAcc::default();
+            acc.enable_composite([(1u16, "svc".to_string())]);
+            acc.observe(&v1_key(value.as_bytes(), 1));
+            let blooms = acc.build(0.001);
+            assert_eq!(blooms.len(), 1);
+            infra::bloom::FieldBloom {
+                field: blooms[0].field.clone(),
+                file_id,
+                n_items: blooms[0].n_items,
+                bytes: blooms[0].bytes.clone(),
+            }
+        };
+        let (id_a, id_b, id_c) = (301u64, 302, 303);
+        // files A/B carry a composite covering `svc`; legacy file C carries
+        // only a per-field trace_id section (pre-composite writer)
+        let mut sections = vec![
+            build_composite(id_a, "api-1"),
+            build_composite(id_b, "api-2"),
+        ];
+        {
+            let mut acc = BloomHashAcc::from_pairs([(1u16, "trace_id".to_string())]);
+            acc.observe(&v1_key(b"t-1", 1));
+            let blooms = acc.build(0.001);
+            sections.push(infra::bloom::FieldBloom {
+                field: blooms[0].field.clone(),
+                file_id: id_c,
+                n_items: blooms[0].n_items,
+                bytes: blooms[0].bytes.clone(),
+            });
+        }
+        let blob = BloomWriter::serialize(sections).unwrap();
+        let r = BloomReader::parse(&blob).unwrap();
+
+        // the run_group primitive: probe one key for one file, None = no info
+        let probe = |section: &str, key: &[u8], file_id: u64| -> Option<bool> {
+            let (range, hash) = r.row_range(section, key)?;
+            let col = r.column_index(section, file_id)?;
+            let row = &blob[range.start as usize..range.end as usize];
+            let off = col * BLOCK_BYTES;
+            let block: &[u8; BLOCK_BYTES] = row[off..off + BLOCK_BYTES].try_into().unwrap();
+            Some(check_block_with_mask(block, &mask_from_hash(hash)))
+        };
+        let covered = |pred: &Predicate, file_id: u64| -> Option<bool> {
+            let mut buf = Vec::new();
+            let mut all = true;
+            for p in 0..COMPOSITE_GUARD_PROBES {
+                let key = composite_guard_key(&pred.field, p, &mut buf).unwrap();
+                all &= probe(pred.section(), key, file_id)?;
+            }
+            Some(all)
+        };
+
+        let pred = Predicate {
+            field: "svc".into(),
+            values: vec!["api-1".into()],
+            composite: true,
+            composite_fallback: false,
+        };
+        // A and B are covered for `svc`…
+        assert_eq!(covered(&pred, id_a), Some(true));
+        assert_eq!(covered(&pred, id_b), Some(true));
+        // …so their value probes are authoritative: A keeps, B drops
+        assert_eq!(
+            probe(pred.section(), &pred.probe_bytes("api-1"), id_a),
+            Some(true)
+        );
+        assert_eq!(
+            probe(pred.section(), &pred.probe_bytes("api-1"), id_b),
+            Some(false)
+        );
+        // legacy C has no composite column at all → no info → keep
+        assert_eq!(
+            probe(pred.section(), &pred.probe_bytes("api-1"), id_c),
+            None
+        );
+        assert_eq!(covered(&pred, id_c), None);
+
+        // a field nobody term-indexed: guards miss → no info → keep, even
+        // though its value probe would have said "definitely not"
+        let uncovered = Predicate {
+            field: "severity".into(),
+            values: vec!["3".into()],
+            composite: true,
+            composite_fallback: false,
+        };
+        assert_eq!(covered(&uncovered, id_a), Some(false));
+        assert_eq!(covered(&uncovered, id_b), Some(false));
     }
 
     #[tokio::test]
@@ -832,6 +1176,7 @@ mod tests {
             files.clone(),
             &c,
             vec!["trace_id".to_string()],
+            false,
         )
         .await;
         assert_eq!(kept.len(), files.len());
@@ -850,6 +1195,7 @@ mod tests {
             files.clone(),
             &c,
             vec!["trace_id".to_string()],
+            false,
         )
         .await;
         assert_eq!(kept.len(), 1);
@@ -867,9 +1213,396 @@ mod tests {
             files.clone(),
             &c,
             vec!["trace_id".to_string()],
+            false,
         )
         .await;
         assert_eq!(kept.len(), 1);
+    }
+
+    /// #48 END-TO-END through `prune()` and a real `.bf` in local object
+    /// storage: composite value hit keeps, covered miss drops, a legacy
+    /// composite-less file and an uncovered field both stay (no info) —
+    /// and the same query with the flag off touches nothing.
+    #[tokio::test(flavor = "multi_thread")] // the disk-cache read path uses block_in_place
+    async fn composite_prune_end_to_end_against_real_bf() {
+        use vortex_index::bloom::BloomHashAcc;
+
+        let v1_key = |value: &[u8], id: u16| {
+            let mut k = value.to_vec();
+            k.push(0);
+            k.extend_from_slice(&id.to_be_bytes());
+            k
+        };
+        let composite_bloom = |file_id: u64, value: &str| {
+            let mut acc = BloomHashAcc::default();
+            acc.enable_composite([(1u16, "svc".to_string())]);
+            acc.observe(&v1_key(value.as_bytes(), 1));
+            let blooms = acc.build(0.001);
+            infra::bloom::FieldBloom {
+                field: blooms[0].field.clone(),
+                file_id,
+                n_items: blooms[0].n_items,
+                bytes: blooms[0].bytes.clone(),
+            }
+        };
+        let legacy_bloom = |file_id: u64, value: &str| {
+            let mut acc = BloomHashAcc::from_pairs([(1u16, "trace_id".to_string())]);
+            acc.observe(&v1_key(value.as_bytes(), 1));
+            let blooms = acc.build(0.001);
+            infra::bloom::FieldBloom {
+                field: blooms[0].field.clone(),
+                file_id,
+                n_items: blooms[0].n_items,
+                bytes: blooms[0].bytes.clone(),
+            }
+        };
+        let blob = BloomWriter::serialize(vec![
+            composite_bloom(301, "api-1"),
+            composite_bloom(302, "api-2"),
+            legacy_bloom(303, "t-1"),
+        ])
+        .unwrap();
+
+        const VER: i64 = 424_242;
+        let date = "2026/05/08/14";
+        let path = bloom_path("o", StreamType::Logs, "s-composite-e2e", date, VER);
+        let account = infra::storage::get_account("o", &path).unwrap_or_default();
+        infra::storage::put(&account, &path, bytes::Bytes::from(blob))
+            .await
+            .expect("local test object store accepts the .bf");
+
+        let file = |id: i64, name: &str| {
+            let mut k = fk(
+                &format!("files/o/logs/s-composite-e2e/{date}/{name}.parquet"),
+                VER,
+            );
+            k.id = id;
+            k
+        };
+        let files = vec![file(301, "a"), file(302, "b"), file(303, "c")];
+
+        // svc='api-1' (composite-decidable only): A hit, B covered miss
+        // (dropped), C has no composite column (kept, no info)
+        let c = cond(vec![Condition::Equal("svc".into(), "api-1".into())]);
+        let kept = prune(
+            "tid",
+            "o",
+            StreamType::Logs,
+            "s-composite-e2e",
+            files.clone(),
+            &c,
+            vec!["trace_id".to_string()],
+            true,
+        )
+        .await;
+        let kept_ids: Vec<i64> = kept.iter().map(|f| f.id).collect();
+        assert!(kept_ids.contains(&301), "value hit must keep A");
+        assert!(!kept_ids.contains(&302), "covered miss must drop B");
+        assert!(kept_ids.contains(&303), "legacy file has no info → kept");
+
+        // equality on a field nobody covered: guards miss → all kept
+        let c = cond(vec![Condition::Equal("severity".into(), "3".into())]);
+        let kept = prune(
+            "tid",
+            "o",
+            StreamType::Logs,
+            "s-composite-e2e",
+            files.clone(),
+            &c,
+            vec!["trace_id".to_string()],
+            true,
+        )
+        .await;
+        assert_eq!(kept.len(), 3, "uncovered field is no-info for every file");
+
+        // flag OFF: svc isn't bloom-indexed → nothing decidable → untouched
+        let c = cond(vec![Condition::Equal("svc".into(), "api-1".into())]);
+        let kept = prune(
+            "tid",
+            "o",
+            StreamType::Logs,
+            "s-composite-e2e",
+            files.clone(),
+            &c,
+            vec!["trace_id".to_string()],
+            false,
+        )
+        .await;
+        assert_eq!(kept.len(), 3, "dark flag must change nothing");
+    }
+
+    /// #52/M7 end-to-end: the composite blob a writer builds while AUTO-
+    /// demoting a field AT FIRST ENCODE, transposed into a `.bf` exactly as
+    /// the group assembler does, must file-prune equality on the demoted
+    /// field — value hit kept, covered miss dropped — with NO per-stream
+    /// bloom-field configuration at all (the demotion default needs none).
+    #[tokio::test(flavor = "multi_thread")] // the disk-cache read path uses block_in_place
+    async fn demoted_at_birth_blob_prunes_end_to_end() {
+        use std::sync::Arc;
+
+        use arrow::{
+            array::{ArrayRef, Int64Array, RecordBatch, StringArray},
+            datatypes::{DataType, Field, Schema},
+        };
+        use vortex_index::{VixReader, VixWriter, VixWriterOptions};
+
+        // one demoted-at-birth file per salt: 8 distinct trace ids / 8 rows
+        // crosses the (shrunk) AUTO thresholds at finish
+        let demoted_blooms = |salt: &str| {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("_timestamp", DataType::Int64, false),
+                Field::new("trace_id", DataType::Utf8, true),
+            ]));
+            let ids: Vec<String> = (0..8).map(|i| format!("t-{salt}-{i:04}")).collect();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(
+                        (0..8i64).map(|i| 1_000 - i).collect::<Vec<_>>(),
+                    )) as ArrayRef,
+                    Arc::new(StringArray::from(
+                        ids.iter().map(String::as_str).collect::<Vec<_>>(),
+                    )) as ArrayRef,
+                ],
+            )
+            .unwrap();
+            let source = StringArray::from_iter_values(
+                ids.iter().map(|t| format!(r#"{{"trace_id":"{t}"}}"#)),
+            );
+            let mut writer = VixWriter::new(
+                &schema,
+                VixWriterOptions {
+                    bloom_composite: true,
+                    bloom_only_auto_ratio: 0.5,
+                    bloom_only_min_distinct: 4,
+                    ..Default::default()
+                },
+                false,
+            );
+            writer
+                .push_batch_with_source(&batch, &source, None)
+                .unwrap();
+            let (data, index) = writer.finish().unwrap();
+            let reader = VixReader::open_with_index(
+                bytes::Bytes::from(data),
+                index.map(bytes::Bytes::from),
+            )
+            .unwrap();
+            assert_eq!(
+                reader.bloom_only_fields().collect::<Vec<_>>(),
+                ["trace_id"],
+                "precondition: demoted at first encode"
+            );
+            reader.file_blooms().unwrap().expect("per-file blob")
+        };
+
+        // the group assembler's transpose: per-file blob sections -> .bf
+        let to_field_blooms = |file_id: u64, salt: &str| {
+            demoted_blooms(salt)
+                .into_iter()
+                .map(move |b| infra::bloom::FieldBloom {
+                    field: b.field,
+                    file_id,
+                    n_items: b.n_items,
+                    bytes: b.bytes,
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut sections = to_field_blooms(401, "a");
+        sections.extend(to_field_blooms(402, "b"));
+        let blob = BloomWriter::serialize(sections).unwrap();
+
+        const VER: i64 = 525_252;
+        let date = "2026/05/08/15";
+        let path = bloom_path("o", StreamType::Logs, "s-m7-demoted", date, VER);
+        let account = infra::storage::get_account("o", &path).unwrap_or_default();
+        infra::storage::put(&account, &path, bytes::Bytes::from(blob))
+            .await
+            .expect("local test object store accepts the .bf");
+
+        let file = |id: i64, name: &str| {
+            let mut k = fk(
+                &format!("files/o/logs/s-m7-demoted/{date}/{name}.parquet"),
+                VER,
+            );
+            k.id = id;
+            k
+        };
+        let files = vec![file(401, "a"), file(402, "b")];
+
+        // equality on the demoted field, NO configured bloom fields: the
+        // composite alone decides — the holder kept, the covered miss dropped
+        let c = cond(vec![Condition::Equal(
+            "trace_id".into(),
+            "t-a-0003".into(),
+        )]);
+        let kept = prune(
+            "tid",
+            "o",
+            StreamType::Logs,
+            "s-m7-demoted",
+            files.clone(),
+            &c,
+            Vec::new(),
+            true,
+        )
+        .await;
+        let kept_ids: Vec<i64> = kept.iter().map(|f| f.id).collect();
+        assert_eq!(kept_ids, vec![401], "holder kept, covered miss dropped");
+
+        // an absent value: both files claim coverage → both drop
+        let c = cond(vec![Condition::Equal(
+            "trace_id".into(),
+            "t-nowhere".into(),
+        )]);
+        let kept = prune(
+            "tid",
+            "o",
+            StreamType::Logs,
+            "s-m7-demoted",
+            files.clone(),
+            &c,
+            Vec::new(),
+            true,
+        )
+        .await;
+        assert!(kept.is_empty(), "covered misses drop every file");
+    }
+
+    /// M15: a CONFIGURED bloom field (stream-settings `bloom_filter_fields`)
+    /// that was #52-demoted has NO per-field `.bf` section — the pruner
+    /// falls back to the COMPOSITE section for exactly the uncovered files:
+    /// keep/drop PARITY with a per-field-covered (non-demoted) control
+    /// group, per-file verdict priority in a MIXED group, guard fail-open
+    /// for uncovered fields, and the dark-flag behavior unchanged.
+    #[tokio::test(flavor = "multi_thread")] // the disk-cache read path uses block_in_place
+    async fn configured_demoted_field_prunes_via_composite_fallback() {
+        use vortex_index::bloom::BloomHashAcc;
+
+        let v1_key = |value: &[u8], id: u16| {
+            let mut k = value.to_vec();
+            k.push(0);
+            k.extend_from_slice(&id.to_be_bytes());
+            k
+        };
+        // a non-demoted #48-era file: per-field section AND composite
+        let both_sections = |file_id: u64, field: &str, value: &str| {
+            let mut acc = BloomHashAcc::from_pairs([(1u16, field.to_string())]);
+            acc.enable_composite([(1u16, field.to_string())]);
+            acc.observe(&v1_key(value.as_bytes(), 1));
+            acc.build(0.001)
+                .into_iter()
+                .map(|b| infra::bloom::FieldBloom {
+                    field: b.field,
+                    file_id,
+                    n_items: b.n_items,
+                    bytes: b.bytes,
+                })
+                .collect::<Vec<_>>()
+        };
+        // a #52-DEMOTED file: composite section only (no per-field bloom)
+        let composite_only = |file_id: u64, field: &str, value: &str| {
+            let mut acc = BloomHashAcc::default();
+            acc.enable_composite([(1u16, field.to_string())]);
+            acc.observe(&v1_key(value.as_bytes(), 1));
+            acc.build(0.001)
+                .into_iter()
+                .map(|b| infra::bloom::FieldBloom {
+                    field: b.field,
+                    file_id,
+                    n_items: b.n_items,
+                    bytes: b.bytes,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let stream = "s-m15-demoted-configured";
+        let date = "2026/05/08/16";
+        let store_bf = |ver: i64, sections: Vec<infra::bloom::FieldBloom>| async move {
+            let blob = BloomWriter::serialize(sections).unwrap();
+            let path = bloom_path("o", StreamType::Logs, stream, date, ver);
+            let account = infra::storage::get_account("o", &path).unwrap_or_default();
+            infra::storage::put(&account, &path, bytes::Bytes::from(blob))
+                .await
+                .expect("local test object store accepts the .bf");
+        };
+        let file = |id: i64, ver: i64, name: &str| {
+            let mut k = fk(&format!("files/o/logs/{stream}/{date}/{name}.parquet"), ver);
+            k.id = id;
+            k
+        };
+
+        // CONTROL group (ver 611): per-field sections present (non-demoted)
+        const CONTROL_VER: i64 = 611_000;
+        let mut sections = both_sections(601, "trace_id", "t-1");
+        sections.extend(both_sections(602, "trace_id", "t-2"));
+        store_bf(CONTROL_VER, sections).await;
+        // DEMOTED group (ver 612): composite only — the M15 shape
+        const DEMOTED_VER: i64 = 612_000;
+        let mut sections = composite_only(603, "trace_id", "t-1");
+        sections.extend(composite_only(604, "trace_id", "t-2"));
+        store_bf(DEMOTED_VER, sections).await;
+        // MIXED group (ver 613): one covered, one demoted
+        const MIXED_VER: i64 = 613_000;
+        let mut sections = both_sections(605, "trace_id", "m-1");
+        sections.extend(composite_only(606, "trace_id", "m-2"));
+        store_bf(MIXED_VER, sections).await;
+        // UNCOVERED group (ver 614): composite covers a DIFFERENT field only
+        const UNCOVERED_VER: i64 = 614_000;
+        store_bf(UNCOVERED_VER, composite_only(607, "other_field", "x-1")).await;
+
+        let all_files = || {
+            vec![
+                file(601, CONTROL_VER, "c1"),
+                file(602, CONTROL_VER, "c2"),
+                file(603, DEMOTED_VER, "d1"),
+                file(604, DEMOTED_VER, "d2"),
+                file(605, MIXED_VER, "m1"),
+                file(606, MIXED_VER, "m2"),
+                file(607, UNCOVERED_VER, "u1"),
+            ]
+        };
+        let run = |value: &str, composite_enabled: bool| {
+            let c = cond(vec![Condition::Equal("trace_id".into(), value.into())]);
+            let files = all_files();
+            async move {
+                let mut kept: Vec<i64> = prune(
+                    "tid",
+                    "o",
+                    StreamType::Logs,
+                    stream,
+                    files,
+                    &c,
+                    vec!["trace_id".to_string()], // CONFIGURED field
+                    composite_enabled,
+                )
+                .await
+                .iter()
+                .map(|f| f.id)
+                .collect();
+                kept.sort_unstable();
+                kept
+            }
+        };
+
+        // t-1: PARITY — the demoted holder (603) keeps and the demoted
+        // non-holder (604) drops exactly like the per-field control pair;
+        // mixed group: 605 drops per-field, 606 drops via composite;
+        // uncovered 607 stays (guards miss → no info)
+        assert_eq!(run("t-1", true).await, vec![601, 603, 607]);
+        // t-2: the mirror image
+        assert_eq!(run("t-2", true).await, vec![602, 604, 607]);
+        // m-2 (mixed group): 605's PER-FIELD verdict governs it (miss →
+        // drop) even though its composite also covers the field; 606 (no
+        // per-field column) keeps via its composite hit
+        assert_eq!(run("m-2", true).await, vec![606, 607]);
+        // m-1: 605 per-field hit keeps; 606 composite covered miss drops
+        assert_eq!(run("m-1", true).await, vec![605, 607]);
+        // absent value: every covered file drops, only the uncovered stays
+        assert_eq!(run("t-9", true).await, vec![607]);
+        // composite disabled: the per-field control still prunes, every
+        // demoted/uncovered file is no-info kept (the pre-M15 behavior)
+        assert_eq!(run("t-1", false).await, vec![601, 603, 604, 606, 607]);
     }
 
     #[tokio::test]
@@ -884,6 +1617,7 @@ mod tests {
             files,
             &c,
             vec!["trace_id".to_string()],
+            false,
         )
         .await;
         assert_eq!(kept.len(), 1);

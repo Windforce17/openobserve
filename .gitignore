@@ -85,3 +85,6 @@ tests/ui-testing/.env.old
 !/.claude/skills/
 /.claude/skills/*
 !/.claude/skills/ui-architect/
+src/api_query/data/
+crates/vortex-array/target/
+crates/vortex-layout/target/

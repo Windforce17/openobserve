@@ -70,11 +70,23 @@ pub async fn handle_request(
             // erased the error kind, so backpressure (ResourceError) answered
             // 500 instead of the retryable 503.
             Err(e) => {
-                // we do not want to log trial period expired errors
-                if !matches!(e, infra::errors::Error::TrialPeriodExpired) {
-                    log::error!(
-                        "[Loki] Stream {stream_name} ingestion failed for org {org_id}: {e}"
-                    );
+                match &e {
+                    // we do not want to log trial period expired errors
+                    infra::errors::Error::TrialPeriodExpired => {}
+                    // resource backpressure storms hit every stream of every
+                    // request; the request-level 503 is already counted into
+                    // the windowed summary by the HTTP handler — keep the
+                    // per-stream detail at debug
+                    infra::errors::Error::ResourceError(_) => {
+                        log::debug!(
+                            "[Loki] Stream {stream_name} ingestion failed for org {org_id}: {e}"
+                        );
+                    }
+                    _ => {
+                        log::error!(
+                            "[Loki] Stream {stream_name} ingestion failed for org {org_id}: {e}"
+                        );
+                    }
                 }
                 let code = match &e {
                     infra::errors::Error::ResourceError(_) => 503,

@@ -241,33 +241,46 @@ pub async fn search(
             let user_id = user_id.clone();
 
             let enter_span = tracing::span::Span::current();
-            let task = tokio::task::spawn(
-                (async move {
-                    let trace_id = trace_id.clone();
-                    req.query.start_time = delta.delta_start_time;
-                    req.query.end_time = delta.delta_end_time;
+            let guard_trace_id = trace_id.clone();
+            // Abort-on-drop (#37): this future being dropped is how a client
+            // disconnect reaches us (the oneshot heartbeat stream owns it) —
+            // a bare JoinHandle would DETACH every delta search and burn it
+            // to completion. Guarded, the drop aborts each delta, whose own
+            // guards cascade to the flight leaders and followers.
+            let task = crate::service::search::utils::AbortOnDrop::new(
+                tokio::task::spawn(
+                    (async move {
+                        let trace_id = trace_id.clone();
+                        req.query.start_time = delta.delta_start_time;
+                        req.query.end_time = delta.delta_end_time;
 
-                    let cfg = get_config();
-                    if cfg.common.result_cache_enabled
-                        && cfg.common.print_key_sql
-                        && c_resp.has_cached_data
-                    {
-                        log::info!(
-                            "[trace_id {trace_id}] Query new start time: {}, end time: {}",
-                            req.query.start_time,
-                            req.query.end_time
-                        );
-                    }
+                        let cfg = get_config();
+                        if cfg.common.result_cache_enabled
+                            && cfg.common.print_key_sql
+                            && c_resp.has_cached_data
+                        {
+                            log::info!(
+                                "[trace_id {trace_id}] Query new start time: {}, end time: {}",
+                                req.query.start_time,
+                                req.query.end_time
+                            );
+                        }
 
-                    SearchService::search(&trace_id, &org_id, stream_type, user_id, &req).await
-                })
-                .instrument(enter_span),
+                        SearchService::search(&trace_id, &org_id, stream_type, user_id, &req).await
+                    })
+                    .instrument(enter_span),
+                ),
+                guard_trace_id,
             );
             tasks.push(task);
         }
 
-        for task in tasks {
-            results.push(task.await.map_err(|e| Error::Message(e.to_string()))??);
+        for mut task in tasks {
+            results.push(
+                task.join()
+                    .await
+                    .map_err(|e| Error::Message(e.to_string()))??,
+            );
         }
         for res in &results {
             work_group_set.push(res.work_group.clone());

@@ -119,6 +119,47 @@ pub fn get_column_name(expr: &Arc<dyn PhysicalExpr>) -> &str {
     }
 }
 
+/// M16: `Some(column)` when the aggregate is a plain `count(column)` over a
+/// bare (possibly cast) column that is NOT `_timestamp` — the null-skipping
+/// per-column count [`is_count_rows_aggregate`] deliberately excludes
+/// (count(_timestamp) counts rows: `_timestamp` is never null).
+pub fn count_column_aggregate(expr: &AggregateFunctionExpr) -> Option<String> {
+    if !expr.fun().name().eq_ignore_ascii_case("count") || expr.is_distinct() {
+        return None;
+    }
+    let args = expr.expressions();
+    // a BARE column only (no cast: a safe cast can null out values and
+    // change the count; the fast path must answer the stored column)
+    if args.len() != 1 {
+        return None;
+    }
+    let column = args[0].downcast_ref::<Column>()?.name();
+    (column != TIMESTAMP_COL_NAME).then(|| column.to_string())
+}
+
+/// M16: `Some((column, is_max))` when the aggregate is a plain `min(column)`
+/// / `max(column)` over a bare (possibly cast) column.
+pub fn min_max_column_aggregate(expr: &AggregateFunctionExpr) -> Option<(String, bool)> {
+    let fun = expr.fun().name();
+    let is_max = if fun.eq_ignore_ascii_case("max") {
+        true
+    } else if fun.eq_ignore_ascii_case("min") {
+        false
+    } else {
+        return None;
+    };
+    if expr.is_distinct() {
+        return None;
+    }
+    let args = expr.expressions();
+    // a BARE column only (no cast: the fast path answers the stored values)
+    if args.len() != 1 {
+        return None;
+    }
+    let column = args[0].downcast_ref::<Column>()?;
+    Some((column.name().to_string(), is_max))
+}
+
 pub fn is_count_rows_aggregate(expr: &AggregateFunctionExpr) -> bool {
     if expr.name() == "count(Int64(1))" {
         return true;

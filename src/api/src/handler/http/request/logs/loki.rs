@@ -142,7 +142,16 @@ pub async fn loki_push(Path(org_id): Path<String>, headers: HeaderMap, body: Byt
         // the ingest layer's code reaches the wire: a failed durable write
         // reports 500/503 on the IngestionResponse and must not become a 204
         Ok(v) => {
-            if v.code >= 300 {
+            if v.code == StatusCode::SERVICE_UNAVAILABLE.as_u16() {
+                // resource backpressure (breaker/memtable/WAL queue) storms:
+                // counts at info in windows, detail at debug — no ERROR spam
+                ingester::admission::note_rejection(ingester::admission::REJECT_RESOURCE);
+                log::debug!(
+                    "[Loki] write rejected for org '{org_id}': code {}: {}",
+                    v.code,
+                    v.error.as_deref().unwrap_or("unknown error")
+                );
+            } else if v.code >= 300 {
                 log::error!(
                     "[Loki] write failed for org '{org_id}': code {}: {}",
                     v.code,

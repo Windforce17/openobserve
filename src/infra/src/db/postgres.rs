@@ -60,12 +60,32 @@ fn connect(readonly: bool, ddl: bool) -> Pool<Postgres> {
     let idle_timeout = zero_or(cfg.limit.sql_db_connections_idle_timeout, 600);
     let max_lifetime = zero_or(cfg.limit.sql_db_connections_max_lifetime, 1800);
 
+    // App-owned idle-in-transaction guard: a pod killed mid-transaction
+    // leaves its session holding row/advisory locks until TCP timeout
+    // (~30 min observed 2026-08-13, wedging every claimer fleet-wide).
+    // Setting the timeout per CONNECTION means every env gets the guard
+    // without DBA-side ALTER DATABASE, and new sessions can never predate
+    // it. Legitimate transactions here are ms-scale; 0 disables.
+    let idle_txn_secs = cfg.limit.sql_db_idle_in_txn_timeout_secs;
     PgPoolOptions::new()
         .min_connections(cfg.limit.sql_db_connections_min)
         .max_connections(cfg.limit.sql_db_connections_max)
         .acquire_timeout(Duration::from_secs(acquire_timeout))
         .idle_timeout(Some(Duration::from_secs(idle_timeout)))
         .max_lifetime(Some(Duration::from_secs(max_lifetime)))
+        .after_connect(move |conn, _meta| {
+            Box::pin(async move {
+                if idle_txn_secs > 0 {
+                    sqlx::Executor::execute(
+                        &mut *conn,
+                        format!("SET idle_in_transaction_session_timeout = '{idle_txn_secs}s'")
+                            .as_str(),
+                    )
+                    .await?;
+                }
+                Ok(())
+            })
+        })
         .connect_lazy_with(db_opts)
 }
 

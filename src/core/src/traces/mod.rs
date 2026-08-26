@@ -27,7 +27,7 @@ use axum::{
     response::{IntoResponse, Response as HttpResponse},
 };
 use bytes::BytesMut;
-use chrono::{Duration, Utc};
+use chrono::Utc;
 use config::{
     DISTINCT_FIELDS, TIMESTAMP_COL_NAME, get_config,
     meta::{
@@ -72,12 +72,15 @@ use crate::{
             TriggerAlertData, check_ingestion_allowed, evaluate_trigger, get_thread_id,
             grpc::get_val, write_file,
         },
-        logs::O2IngestJsonData,
+        logs::{O2IngestJsonData, bulk::TS_PARSE_FAILED},
         metadata::{
             MetadataItem, MetadataType, distinct_values::DvItem, trace_list_index::TraceListItem,
             write,
         },
-        schema::{check_for_schema, stream_schema_exists},
+        schema::{
+            check_for_schema, get_future_discard_error, get_upto_discard_error,
+            stream_schema_exists,
+        },
         self_reporting::report_request_usage_stats,
         traces::otel::{OtelIngestionProcessor, is_llm_trace},
     },
@@ -149,6 +152,115 @@ type AgentObservationBuffer = std::collections::BTreeMap<
 
 #[cfg(not(feature = "enterprise"))]
 type AgentObservationBuffer = Option<std::convert::Infallible>;
+
+/// Batch-scoped enforcement of the configured ingest time window
+/// (`ZO_INGEST_ALLOWED_UPTO` / `ZO_INGEST_ALLOWED_IN_FUTURE`) for span
+/// timestamps.
+///
+/// Mirrors the logs path (`service::logs::ingest::handle_timestamp`): a span
+/// is kept iff `min_ts <= ts <= max_ts` (both bounds inclusive, micros).
+/// Every write path that buffers a span record MUST route its timestamp
+/// through [`Self::accept`] — including records returned by pipelines, which
+/// can rewrite `_timestamp`.
+///
+/// Discards are only counted per record; [`Self::flush`] folds the counts
+/// into the OTLP partial-success response, bumps the ingest-error metric and
+/// emits ONE info-level summary per batch (log-noise discipline: counts at
+/// info, never per-record logging on the hot path).
+pub(crate) struct SpanTsClamp {
+    min_ts: i64,
+    max_ts: i64,
+    too_old: usize,
+    too_future: usize,
+    /// oldest out-of-range timestamp seen (micros), for the batch summary
+    oldest_seen: i64,
+    /// newest out-of-range timestamp seen (micros), for the batch summary
+    newest_seen: i64,
+}
+
+impl SpanTsClamp {
+    /// Window derived from the configured limits around `now` (micros),
+    /// exactly like the logs ingest paths.
+    pub(crate) fn new(now: i64) -> Self {
+        let cfg = get_config();
+        Self::with_bounds(
+            now - cfg.limit.ingest_allowed_upto_micro,
+            now + cfg.limit.ingest_allowed_in_future_micro,
+        )
+    }
+
+    pub(crate) fn with_bounds(min_ts: i64, max_ts: i64) -> Self {
+        Self {
+            min_ts,
+            max_ts,
+            too_old: 0,
+            too_future: 0,
+            oldest_seen: i64::MAX,
+            newest_seen: i64::MIN,
+        }
+    }
+
+    /// Returns `true` when the span timestamp (micros) is inside the allowed
+    /// window; otherwise counts the discard and returns `false`.
+    pub(crate) fn accept(&mut self, timestamp: i64) -> bool {
+        if timestamp < self.min_ts {
+            self.too_old += 1;
+        } else if timestamp > self.max_ts {
+            self.too_future += 1;
+        } else {
+            return true;
+        }
+        self.oldest_seen = self.oldest_seen.min(timestamp);
+        self.newest_seen = self.newest_seen.max(timestamp);
+        false
+    }
+
+    pub(crate) fn discarded(&self) -> usize {
+        self.too_old + self.too_future
+    }
+
+    /// Fold the discard counts into the OTLP partial-success response (same
+    /// accounting the logs path reports via its stream status), bump the
+    /// per-stream ingest-error metric and log a single per-batch summary.
+    pub(crate) fn flush(
+        &self,
+        endpoint: &str,
+        org_id: &str,
+        stream_name: &str,
+        partial_success: &mut ExportTracePartialSuccess,
+    ) {
+        let discarded = self.discarded();
+        if discarded == 0 {
+            return;
+        }
+        partial_success.rejected_spans += discarded as i64;
+        if partial_success.error_message.is_empty() {
+            partial_success.error_message = if self.too_old >= self.too_future {
+                get_upto_discard_error().to_string()
+            } else {
+                get_future_discard_error().to_string()
+            };
+        }
+        metrics::INGEST_ERRORS
+            .with_label_values(&[
+                org_id,
+                StreamType::Traces.as_str(),
+                stream_name,
+                TS_PARSE_FAILED,
+            ])
+            .inc_by(discarded as u64);
+        let cfg = get_config();
+        log::info!(
+            "[{endpoint}] {org_id}/{stream_name} discarded {discarded} span(s) outside the ingest window: {} older than ZO_INGEST_ALLOWED_UPTO={}h, {} beyond ZO_INGEST_ALLOWED_IN_FUTURE={}h (out-of-range _timestamp span: oldest={}, newest={})",
+            self.too_old,
+            cfg.limit.ingest_allowed_upto,
+            self.too_future,
+            cfg.limit.ingest_allowed_in_future,
+            self.oldest_seen,
+            self.newest_seen,
+        );
+    }
+}
 
 fn normalize_llm_field_types(record_val: &mut Map<String, json::Value>) {
     for &field in GEN_AI_INT64_FIELDS.iter() {
@@ -354,7 +466,14 @@ pub async fn handle_otlp_request(
         if matches!(e, infra::errors::Error::TrialPeriodExpired) {
             return Ok(MetaHttpResponse::too_many_requests(e));
         } else {
-            log::error!("[TRACES:OTLP] ingestion error: {e}");
+            if matches!(e, infra::errors::Error::ResourceError(_)) {
+                // resource backpressure storms: counts at info in windows,
+                // detail at debug — never per-request ERROR spam
+                ingester::admission::note_rejection(ingester::admission::REJECT_RESOURCE);
+                log::debug!("[TRACES:OTLP] ingestion error: {e}");
+            } else {
+                log::error!("[TRACES:OTLP] ingestion error: {e}");
+            }
             return Ok((
                 http::StatusCode::SERVICE_UNAVAILABLE,
                 Json(MetaHttpResponse::error(
@@ -384,15 +503,14 @@ pub async fn handle_otlp_request(
     let start = std::time::Instant::now();
     let started_at = Utc::now().timestamp_micros();
 
-    let cfg = get_config();
     let traces_stream_name = match in_stream_name {
         Some(name) => format_stream_name(name.to_string()),
         None => "default".to_owned(),
     };
 
-    let now = now_micros();
-    let min_ts = now - cfg.limit.ingest_allowed_upto_micro;
-    let max_ts = now + cfg.limit.ingest_allowed_in_future_micro;
+    // enforce ZO_INGEST_ALLOWED_UPTO / ZO_INGEST_ALLOWED_IN_FUTURE on every
+    // span write path of this request (entry spans AND pipeline outputs)
+    let mut ts_clamp = SpanTsClamp::new(now_micros());
 
     // llm stream detection
     let mut is_llm_stream = false;
@@ -595,18 +713,9 @@ pub async fn handle_otlp_request(
                 }
 
                 let timestamp = (start_time / 1000) as i64;
-                if timestamp < min_ts {
-                    log::error!(
-                        "[TRACES:OTLP] skipping span with timestamp older than allowed retention period, trace_id: {trace_id}"
-                    );
-                    partial_success.rejected_spans += 1;
-                    continue;
-                }
-                if timestamp > max_ts {
-                    log::error!(
-                        "[TRACES:OTLP] skipping span with timestamp newer than allowed retention period, trace_id: {trace_id}"
-                    );
-                    partial_success.rejected_spans += 1;
+                if !ts_clamp.accept(timestamp) {
+                    // counted; rejected_spans + one summary log per batch are
+                    // emitted by ts_clamp.flush() (no per-span logging)
                     continue;
                 }
                 // Derive inferred service identity (uninstrumented dependencies
@@ -780,6 +889,13 @@ pub async fn handle_otlp_request(
                                 partial_success.rejected_spans += 1;
                                 continue;
                             };
+                            // pipelines can rewrite _timestamp: re-enforce the
+                            // configured ingest window on pipeline outputs,
+                            // like the logs path does (logs/ingest.rs
+                            // handle_timestamp after process_batch)
+                            if !ts_clamp.accept(timestamp) {
+                                continue;
+                            }
                             let canonical_agent_fields = collect_gen_ai_agent_observation(
                                 org_id,
                                 StreamType::Traces,
@@ -831,6 +947,8 @@ pub async fn handle_otlp_request(
             json_data_by_stream.contains_key(&traces_stream_name)
         );
         if !has_user_pipeline && !json_data_by_stream.contains_key(&traces_stream_name) {
+            // stream_pipeline_inputs carry the entry-clamped timestamps
+            // (buffered after ts_clamp.accept above), so no re-check here
             for value in &stream_pipeline_inputs {
                 let _ = finalize_and_buffer_trace_span(
                     value.clone(),
@@ -844,6 +962,14 @@ pub async fn handle_otlp_request(
             }
         }
     }
+
+    // account all ingest-window discards of this batch (counts at info)
+    ts_clamp.flush(
+        "TRACES:OTLP",
+        org_id,
+        &traces_stream_name,
+        &mut partial_success,
+    );
 
     // if no data, fast return
     if json_data_by_stream.is_empty() {
@@ -1011,11 +1137,10 @@ pub async fn ingest_json(
         }
     }
 
-    let cfg = get_config();
-    let min_ts = (Utc::now() - Duration::try_hours(cfg.limit.ingest_allowed_upto).unwrap())
-        .timestamp_micros();
-    let max_ts = (Utc::now() + Duration::try_hours(cfg.limit.ingest_allowed_in_future).unwrap())
-        .timestamp_micros();
+    // enforce ZO_INGEST_ALLOWED_UPTO / ZO_INGEST_ALLOWED_IN_FUTURE with the
+    // same window derivation as the logs ingest paths
+    let now = now_micros();
+    let mut ts_clamp = SpanTsClamp::new(now);
 
     let json_values: Vec<json::Value> = json::from_slice(&body)?;
     let mut json_data_by_stream = HashMap::new();
@@ -1024,27 +1149,18 @@ pub async fn ingest_json(
         crate::service::db::system_settings::get_gen_ai_agent_mapping_config(org_id).await;
     let mut agent_observations = AgentObservationBuffer::default();
     for mut value in json_values {
+        // missing/unparsable timestamps fall back to now, mirroring the logs
+        // path (logs/ingest.rs handle_timestamp)
         let timestamp = value[TIMESTAMP_COL_NAME].as_i64().unwrap_or(
             value["start_time"]
                 .as_i64()
                 .map(|ts| ts / 1000)
-                .unwrap_or(min_ts),
+                .unwrap_or(now),
         );
         let trace_id = value["trace_id"].to_string();
-        if timestamp < min_ts {
-            log::error!(
-                "[TRACES:JSON] skipping span with timestamp older than allowed retention period, trace_id: {}",
-                trace_id
-            );
-            partial_success.rejected_spans += 1;
-            continue;
-        }
-        if timestamp > max_ts {
-            log::error!(
-                "[TRACES:JSON] skipping span with timestamp newer than allowed retention period, trace_id: {}",
-                trace_id
-            );
-            partial_success.rejected_spans += 1;
+        if !ts_clamp.accept(timestamp) {
+            // counted; rejected_spans + one summary log per batch are emitted
+            // by ts_clamp.flush() (no per-span logging)
             continue;
         }
 
@@ -1132,6 +1248,14 @@ pub async fn ingest_json(
         ts_data.push((timestamp, record_val));
     }
 
+    // account all ingest-window discards of this batch (counts at info)
+    ts_clamp.flush(
+        "TRACES:JSON",
+        org_id,
+        traces_stream_name,
+        &mut partial_success,
+    );
+
     // if no data, fast return
     if json_data_by_stream.is_empty() {
         return format_response(partial_success, req_type);
@@ -1212,8 +1336,13 @@ fn format_response(
     let partial = partial_success.rejected_spans > 0;
 
     let res = if partial {
-        partial_success.error_message =
-            "Some spans were rejected due to exceeding the allowed retention period".to_string();
+        // keep the more precise message when one was recorded (e.g. the
+        // ingest-window discard error, same text as the logs path)
+        if partial_success.error_message.is_empty() {
+            partial_success.error_message =
+                "Some spans were rejected due to exceeding the allowed retention period"
+                    .to_string();
+        }
         ExportTraceServiceResponse {
             partial_success: Some(partial_success),
         }
@@ -1605,8 +1734,121 @@ mod tests {
     use config::utils::json::json;
     use opentelemetry_proto::tonic::trace::v1::{Status, status::StatusCode};
 
-    use super::record_trace_id;
+    use super::{SpanTsClamp, record_trace_id};
     use crate::service::ingestion::grpc::get_val_for_attr;
+
+    // ── ZO_INGEST_ALLOWED_UPTO / _IN_FUTURE enforcement pins (M20b) ─────────
+
+    /// Boundary semantics must stay identical to the logs path
+    /// (`logs::ingest::handle_timestamp`): accept `[min_ts, max_ts]` with both
+    /// bounds INCLUSIVE, reject strictly outside.
+    #[test]
+    fn test_span_ts_clamp_inclusive_boundaries() {
+        let (min_ts, max_ts) = (1_000_000, 2_000_000);
+        let mut clamp = SpanTsClamp::with_bounds(min_ts, max_ts);
+        assert!(clamp.accept(min_ts), "min_ts itself must be accepted");
+        assert!(clamp.accept(max_ts), "max_ts itself must be accepted");
+        assert!(!clamp.accept(min_ts - 1), "below min_ts must be discarded");
+        assert!(!clamp.accept(max_ts + 1), "above max_ts must be discarded");
+        assert_eq!(clamp.discarded(), 2);
+    }
+
+    /// A batch with ancient + valid + far-future spans keeps the valid ones
+    /// and reports every discard through the OTLP partial-success count.
+    #[test]
+    fn test_span_ts_clamp_mixed_batch_partial_success_accounting() {
+        let now = config::utils::time::now_micros();
+        let mut clamp = SpanTsClamp::new(now);
+
+        // prod-shaped batch: one span months old (2026-04-ish relative to
+        // now), two valid, one far in the future
+        let ancient = now - 130 * 24 * 3_600 * 1_000_000; // ~130 days old
+        let future = now + 366 * 24 * 3_600 * 1_000_000; // ~1 year ahead
+        let batch = [ancient, now, now - 60_000_000, future];
+
+        let kept: Vec<i64> = batch
+            .iter()
+            .copied()
+            .filter(|ts| clamp.accept(*ts))
+            .collect();
+        assert_eq!(kept, vec![now, now - 60_000_000], "only valid spans kept");
+        assert_eq!(clamp.discarded(), 2);
+
+        let mut partial_success =
+            opentelemetry_proto::tonic::collector::trace::v1::ExportTracePartialSuccess::default();
+        clamp.flush("TRACES:OTLP", "test-org", "default", &mut partial_success);
+        assert_eq!(partial_success.rejected_spans, 2);
+        assert!(
+            partial_success
+                .error_message
+                .contains("ZO_INGEST_ALLOWED_UPTO"),
+            "discard message must carry the same env hint as the logs path, got: {}",
+            partial_success.error_message
+        );
+    }
+
+    /// flush() with no discards must not touch the partial-success response
+    /// (and must not log).
+    #[test]
+    fn test_span_ts_clamp_flush_noop_when_clean() {
+        let now = config::utils::time::now_micros();
+        let mut clamp = SpanTsClamp::new(now);
+        assert!(clamp.accept(now));
+        let mut partial_success =
+            opentelemetry_proto::tonic::collector::trace::v1::ExportTracePartialSuccess::default();
+        clamp.flush("TRACES:OTLP", "test-org", "default", &mut partial_success);
+        assert_eq!(partial_success.rejected_spans, 0);
+        assert!(partial_success.error_message.is_empty());
+    }
+
+    /// flush() must not clobber an earlier, more specific error message
+    /// (e.g. a pipeline failure recorded before the flush).
+    #[test]
+    fn test_span_ts_clamp_flush_keeps_existing_error_message() {
+        let mut clamp = SpanTsClamp::with_bounds(10, 20);
+        assert!(!clamp.accept(1));
+        let mut partial_success =
+            opentelemetry_proto::tonic::collector::trace::v1::ExportTracePartialSuccess {
+                rejected_spans: 3,
+                error_message: "Pipeline batch execution error: boom".to_string(),
+            };
+        clamp.flush("TRACES:OTLP", "test-org", "default", &mut partial_success);
+        assert_eq!(partial_success.rejected_spans, 4);
+        assert_eq!(
+            partial_success.error_message,
+            "Pipeline batch execution error: boom"
+        );
+    }
+
+    /// The traces window must be derived from the configured limits exactly
+    /// like the logs paths: `[now - upto_micro, now + in_future_micro]`.
+    /// With the compiled-in defaults that is 5h back / 24h ahead
+    /// (ZO_INGEST_ALLOWED_UPTO=5, ZO_INGEST_ALLOWED_IN_FUTURE=24).
+    #[test]
+    fn test_span_ts_clamp_window_matches_configured_limits() {
+        let cfg = config::get_config();
+        let now = config::utils::time::now_micros();
+        let mut clamp = SpanTsClamp::new(now);
+
+        // inside either edge of the configured window: accepted
+        assert!(clamp.accept(now - cfg.limit.ingest_allowed_upto_micro));
+        assert!(clamp.accept(now + cfg.limit.ingest_allowed_in_future_micro));
+        // strictly outside: discarded
+        assert!(!clamp.accept(now - cfg.limit.ingest_allowed_upto_micro - 1));
+        assert!(!clamp.accept(now + cfg.limit.ingest_allowed_in_future_micro + 1));
+        assert_eq!(clamp.discarded(), 2);
+
+        // micro fields are hours * 3600 * 1e6 of the (env-overridable) hour
+        // settings — the same derivation the logs paths consume
+        assert_eq!(
+            cfg.limit.ingest_allowed_upto_micro,
+            cfg.limit.ingest_allowed_upto * 3600 * 1_000_000
+        );
+        assert_eq!(
+            cfg.limit.ingest_allowed_in_future_micro,
+            cfg.limit.ingest_allowed_in_future * 3600 * 1_000_000
+        );
+    }
 
     /// The write-failure status keeps the error KIND: backpressure (the
     /// preserved infra ResourceError source) is a retryable 503 — which the

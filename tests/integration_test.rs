@@ -420,6 +420,7 @@ mod tests {
         e2e_post_multi().await;
         e2e_trace_context_canonicalization().await;
         e2e_post_trace().await;
+        e2e_post_trace_ingest_window_partial_success().await;
         e2e_post_metrics().await;
         e2e_post_hec().await;
         // e2e_post_kinesis_data().await;
@@ -1288,9 +1289,11 @@ mod tests {
         );
 
         // -----------------------------------------------------------------
-        // core-file shape: exactly ONE object per file unit. Everything
-        // in the vixtest storage prefix is a `.vix` core file (no parquet /
-        // vortex data files) and there is NO sibling index object.
+        // core-file shape (v3 sidecar split): every object in the vixtest
+        // storage prefix is a `.vix` DATA object or a `.vxi` INDEX sidecar
+        // (no parquet / vortex data files), every sidecar pairs with its
+        // data object, and the LEGACY parquet sibling-index prefix stays
+        // empty.
         // -----------------------------------------------------------------
         let mut stream_objects = Vec::new();
         find_files_with_ext(
@@ -1303,11 +1306,21 @@ mod tests {
             !stream_objects.is_empty(),
             "no storage objects found for stream vixtest"
         );
+        assert!(
+            stream_objects.iter().any(|object| object.ends_with(".vix")),
+            "no .vix data objects found for stream vixtest: {stream_objects:?}"
+        );
         for object in &stream_objects {
             assert!(
-                object.ends_with(".vix"),
-                "vixtest must be stored as core .vix objects only, found: {object}"
+                object.ends_with(".vix") || object.ends_with(".vxi"),
+                "vixtest must be stored as .vix data + .vxi sidecar objects only, found: {object}"
             );
+            if let Some(stem) = object.strip_suffix(".vxi") {
+                assert!(
+                    stream_objects.iter().any(|o| o == &format!("{stem}.vix")),
+                    "sidecar without its data object: {object}"
+                );
+            }
         }
         let mut sibling_indexes = Vec::new();
         find_files_with_ext(
@@ -1318,7 +1331,7 @@ mod tests {
         );
         assert!(
             sibling_indexes.is_empty(),
-            "core files must not have sibling index objects, found: {sibling_indexes:?}"
+            "core files must not have legacy sibling index objects, found: {sibling_indexes:?}"
         );
 
         // -----------------------------------------------------------------
@@ -1434,8 +1447,9 @@ mod tests {
         );
         for object in &v2_objects {
             assert!(
-                object.ends_with(".vix"),
-                "vixtest_dotted must be stored as core .vix objects only, found: {object}"
+                object.ends_with(".vix") || object.ends_with(".vxi"),
+                "vixtest_dotted must be stored as .vix data + .vxi sidecar objects only, \
+                 found: {object}"
             );
         }
         let mut v2_siblings = Vec::new();
@@ -1451,13 +1465,13 @@ mod tests {
         );
 
         // -----------------------------------------------------------------
-        // Aggregation fast paths (P3b): add "service" to column_store_fields,
-        // ingest a second batch (its files carry the service docs column and
-        // serve the fast paths), then assert CORRECT results for a
-        // TopN-shaped and a histogram-shaped query. Correctness is the
-        // assertion — fast path or fallback are both acceptable (first-batch
-        // files lack the service docs column, and the per-file capability
-        // probe routes them to the DataFusion branch).
+        // Aggregation fast paths (P3b): every present field is a docs column
+        // since v2 all-present-columns — both batches' files carry the
+        // service column with zero configuration. Assert CORRECT results for
+        // a TopN-shaped and a histogram-shaped query (fast path or fallback
+        // are both acceptable). The settings PUT below names the RETIRED
+        // `column_store_fields` key — the API must accept-and-drop it (the
+        // legacy-keys precedent) instead of erroring.
         // -----------------------------------------------------------------
         let body_str = r#"{"column_store_fields":{"add":["service"],"remove":[]}}"#;
         let (status, body) = make_request(
@@ -1470,7 +1484,7 @@ mod tests {
         .await;
         assert!(
             status.is_success(),
-            "vixtest settings update failed: {}",
+            "the retired column_store_fields key must be accepted-and-dropped: {}",
             String::from_utf8_lossy(&body)
         );
 
@@ -1719,15 +1733,18 @@ mod tests {
         );
     }
 
-    /// Single-file healing rebuild through the REAL compaction job flow
-    /// (`merge_by_stream` + the merge worker + the file_list commit): a
-    /// settled hour partition holding exactly ONE core file — a shape merge
-    /// grouping could never touch — is probed against the current stream
-    /// settings. A CURRENT file is a NO-OP (job completes, file untouched,
-    /// nothing written); after a `column_store_fields` settings change the
-    /// file is REBUILT through the normal merge commit (input replaced by
-    /// one healed output, query results identical); a further job over the
-    /// healed file is a no-op again (healing converges).
+    /// Single-file healing through the REAL compaction job flow
+    /// (`merge_by_stream` + the merge worker): a settled hour partition
+    /// holding exactly ONE core file — a shape merge grouping could never
+    /// touch — is probed against the current stream settings. A CURRENT
+    /// file is a NO-OP (job completes, file untouched, nothing written);
+    /// after a `full_text_search_keys` settings change (term-vs-fts marking
+    /// drift — a live heal trigger) the file heals SIDECAR-ONLY (M3,
+    /// DESIGN-V2 §5): the data object stays byte-identical under the SAME
+    /// key, only the `.vxi` is rewritten and the existing file_list row's
+    /// index_size updated — no add/delete events at all. Query results stay
+    /// identical, and a further job over the healed file is a no-op again
+    /// (healing converges: the sidecar bytes stop changing).
     async fn e2e_single_file_healing_compaction() {
         use chrono::TimeZone;
         use config::utils::time::hour_micros;
@@ -1904,20 +1921,64 @@ mod tests {
         .unwrap();
         let after_noop = query_partition().await;
         assert_eq!(after_noop.len(), 1, "no-op leg: still one file");
-        assert_eq!(
-            after_noop[0].key, original_key,
-            "a current single file must stay untouched (same key)"
-        );
-        disk_objects.clear();
-        find_files_with_ext(healtest_dir, ".vix", "", &mut disk_objects);
-        assert_eq!(
-            disk_objects.len(),
-            1,
-            "the no-op must not write any object: {disk_objects:?}"
-        );
+        // M3 sidecar-only heal: the data key NEVER changes on a heal — the
+        // stable identity every leg asserts on. Resolve the on-disk data
+        // object path once (local storage mirrors the key layout).
+        let data_object_path = || {
+            let mut objs = Vec::new();
+            find_files_with_ext(healtest_dir, ".vix", "", &mut objs);
+            assert_eq!(objs.len(), 1, "exactly ONE data object, got {objs:?}");
+            objs.remove(0)
+        };
+        // #42 L0 mode: the single file was WRITTEN index-off, so it is NOT
+        // current under the indexed logs merge plan — the same sweep heals
+        // it by attaching its FIRST `.vxi` sidecar (index_size 0 -> N)
+        // while the data object stays byte-identical under the same key.
+        let l0_mode = config::is_vix_l0_index_off(StreamType::Logs);
+        if l0_mode {
+            assert_eq!(
+                after_noop[0].key, original_key,
+                "L0 mode: the sidecar-only heal must keep the data key"
+            );
+            assert!(
+                after_noop[0].meta.index_size > 0,
+                "L0 mode: the healed row must point at the new sidecar, got meta {:?}",
+                after_noop[0].meta
+            );
+            assert_eq!(after_noop[0].meta.records, 6, "all rows preserved");
+            let sidecar_path = data_object_path().replace(".vix", ".vxi");
+            let sidecar_len = std::fs::metadata(&sidecar_path)
+                .unwrap_or_else(|e| panic!("healed sidecar {sidecar_path} must exist: {e}"))
+                .len();
+            assert_eq!(
+                sidecar_len as i64, after_noop[0].meta.index_size,
+                "row index_size must be the sidecar's exact size"
+            );
+            // identical results over the L0-healed file
+            let after = snapshot().await;
+            assert_eq!(baseline, after, "identical results across the L0 heal");
+        } else {
+            assert_eq!(
+                after_noop[0].key, original_key,
+                "a current single file must stay untouched (same key)"
+            );
+            disk_objects.clear();
+            find_files_with_ext(healtest_dir, ".vix", "", &mut disk_objects);
+            assert_eq!(
+                disk_objects.len(),
+                1,
+                "the no-op must not write any object: {disk_objects:?}"
+            );
+        }
+        let current_key = after_noop[0].key.clone();
+        // byte-identity anchors for Leg B: the data object must not change
+        // AT ALL across a sidecar-only heal; the sidecar must be REWRITTEN
+        let data_bytes_before = std::fs::read(data_object_path()).unwrap();
+        let sidecar_path = data_object_path().replace(".vix", ".vxi");
+        let sidecar_before = std::fs::read(&sidecar_path).unwrap_or_default();
 
-        // ---- Leg B: settings gain a cs field -> healing rebuild ---------
-        let body_str = r#"{"column_store_fields":{"add":["service"],"remove":[]}}"#;
+        // ---- Leg B: settings mark a field fts -> marking drift -> heal --
+        let body_str = r#"{"full_text_search_keys":{"add":["service"],"remove":[]}}"#;
         let (status, body) = make_request(
             &app,
             Method::PUT,
@@ -1938,7 +1999,7 @@ mod tests {
                 .await
                 .unwrap();
             let settings = infra::schema::unwrap_stream_settings(&latest_schema);
-            if settings.is_some_and(|s| s.column_store_fields.iter().any(|f| f == "service")) {
+            if settings.is_some_and(|s| s.full_text_search_keys.iter().any(|f| f == "service")) {
                 settings_visible = true;
                 break;
             }
@@ -1946,7 +2007,7 @@ mod tests {
         }
         assert!(
             settings_visible,
-            "column_store_fields change never reached the schema cache"
+            "full_text_search_keys change never reached the schema cache"
         );
 
         let job_id = infra::file_list::add_job("e2e", StreamType::Logs, "healtest", offset)
@@ -1964,24 +2025,41 @@ mod tests {
         .await
         .unwrap();
         let after_heal = query_partition().await;
-        assert_eq!(
-            after_heal.len(),
-            1,
-            "healing must land exactly one output file"
-        );
+        assert_eq!(after_heal.len(), 1, "healing must keep exactly one row");
         let healed_key = after_heal[0].key.clone();
-        assert_ne!(
-            healed_key, original_key,
-            "the healing rebuild must REPLACE the input file"
+        // M3 SIDECAR-ONLY: the heal REWRITES the `.vxi` in place and
+        // updates the EXISTING row — no new file id, no data-key change,
+        // no data upload.
+        assert_eq!(
+            healed_key, current_key,
+            "the sidecar-only heal must keep the data key"
         );
         assert_eq!(after_heal[0].meta.records, 6, "all rows preserved");
-        disk_objects.clear();
-        find_files_with_ext(healtest_dir, ".vix", "", &mut disk_objects);
         assert!(
-            disk_objects
-                .iter()
-                .any(|p| p.ends_with(healed_key.rsplit('/').next().unwrap_or_default())),
-            "the healed object must exist in storage: {disk_objects:?}"
+            after_heal[0].meta.index_size > 0,
+            "the healed row must point at a sidecar, got meta {:?}",
+            after_heal[0].meta
+        );
+        assert_eq!(
+            after_heal[0].meta.bloom_ver, 0,
+            "the heal must re-queue the file for the .bf assembler (bloom_ver = 0)"
+        );
+        let data_bytes_after = std::fs::read(data_object_path()).unwrap();
+        assert_eq!(
+            data_bytes_before, data_bytes_after,
+            "the DATA OBJECT must stay byte-identical across a sidecar-only heal"
+        );
+        let sidecar_after = std::fs::read(&sidecar_path)
+            .unwrap_or_else(|e| panic!("healed sidecar {sidecar_path} must exist: {e}"));
+        assert_ne!(
+            sidecar_before, sidecar_after,
+            "the heal must have REWRITTEN the sidecar (fts marking drift changes its fields \
+             table)"
+        );
+        assert_eq!(
+            sidecar_after.len() as i64,
+            after_heal[0].meta.index_size,
+            "row index_size must be the new sidecar's exact size"
         );
 
         // identical results over the healed file
@@ -2011,6 +2089,11 @@ mod tests {
         assert_eq!(
             after_second[0].key, healed_key,
             "the healed file must classify current (no rebuild loop)"
+        );
+        let sidecar_converged = std::fs::read(&sidecar_path).unwrap();
+        assert_eq!(
+            sidecar_after, sidecar_converged,
+            "convergence: a further sweep must not rewrite the sidecar again"
         );
     }
 
@@ -2425,7 +2508,101 @@ mod tests {
             Some(body_str),
         )
         .await;
+        // NOTE: the fixture's spans carry Dec-2022 timestamps — every span is
+        // outside the configured ingest window (ZO_INGEST_ALLOWED_UPTO), so
+        // this is a 206 partial success with all spans rejected. 2xx keeps
+        // this green; the window semantics are pinned explicitly in
+        // e2e_post_trace_ingest_window_partial_success.
         assert!(status.is_success());
+    }
+
+    /// Build a minimal OTLP/JSON trace export request with one span per
+    /// given start timestamp (nanoseconds).
+    fn otlp_trace_body_with_span_times(start_times_nano: &[u64]) -> String {
+        let spans: Vec<serde_json::Value> = start_times_nano
+            .iter()
+            .enumerate()
+            .map(|(i, ts)| {
+                json!({
+                    "traceId": format!("{:032x}", 0x29bc14368d7e8ae9d17ae2ebff851747u128 + i as u128),
+                    "spanId": format!("{:016x}", 0xfcca1617996aa1ecu64 + i as u64),
+                    "name": format!("m20b-clamp-span-{i}"),
+                    "kind": 1,
+                    "startTimeUnixNano": ts.to_string(),
+                    "endTimeUnixNano": (ts + 1_000_000).to_string(),
+                    "attributes": [],
+                    "events": [],
+                    "links": [],
+                    "status": {"code": 0}
+                })
+            })
+            .collect();
+        json!({
+            "resourceSpans": [{
+                "resource": {"attributes": [
+                    {"key": "service.name", "value": {"stringValue": "m20b-clamp-test"}}
+                ]},
+                "scopeSpans": [{"spans": spans}]
+            }]
+        })
+        .to_string()
+    }
+
+    /// M20b pin: a span batch mixing ancient + valid + far-future timestamps
+    /// must ingest the valid spans and report every out-of-window span in the
+    /// OTLP partial-success rejected count (ZO_INGEST_ALLOWED_UPTO /
+    /// ZO_INGEST_ALLOWED_IN_FUTURE enforcement on the traces path).
+    async fn e2e_post_trace_ingest_window_partial_success() {
+        let auth = setup();
+        let now_nano = chrono::Utc::now().timestamp_nanos_opt().unwrap() as u64;
+        let day_nano: u64 = 24 * 3_600 * 1_000_000_000;
+        // ~130 days old (prod-shaped ancient event time) and ~1 year ahead
+        let ancient = now_nano - 130 * day_nano;
+        let future = now_nano + 366 * day_nano;
+
+        let app = init_test_router();
+
+        // mixed batch: 2 valid, 1 ancient, 1 future -> partial success with 2 rejects
+        let body_str =
+            otlp_trace_body_with_span_times(&[ancient, now_nano, now_nano - 1_000_000_000, future]);
+        let (status, body) = make_request(
+            &app,
+            Method::POST,
+            &format!("/api/{}/traces", "e2e"),
+            Some(auth_headers(auth)),
+            Some(body_str),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::PARTIAL_CONTENT,
+            "mixed batch must be partial success, body: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let resp: serde_json::Value =
+            serde_json::from_slice(&body).expect("partial success body must be json");
+        let rejected = resp["partialSuccess"]["rejectedSpans"]
+            .as_i64()
+            .or_else(|| resp["partial_success"]["rejected_spans"].as_i64())
+            .expect("partial success must carry the rejected span count");
+        assert_eq!(rejected, 2, "ancient + future spans must be discarded");
+
+        // fully valid batch -> plain success, no partial block
+        let body_str = otlp_trace_body_with_span_times(&[now_nano, now_nano - 2_000_000_000]);
+        let (status, body) = make_request(
+            &app,
+            Method::POST,
+            &format!("/api/{}/traces", "e2e"),
+            Some(auth_headers(auth)),
+            Some(body_str),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "valid batch must ingest cleanly, body: {}",
+            String::from_utf8_lossy(&body)
+        );
     }
 
     async fn e2e_post_metrics() {

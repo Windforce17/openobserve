@@ -202,35 +202,6 @@ pub async fn get_merged_schema(
     ))
 }
 
-/// Column-store defaults for a brand-new TRACE stream (DESIGN §10):
-/// - `duration` — range filters, latency histograms and percentiles need a native numeric column,
-/// - `service_name` / `operation_name` — index-only TopN fast paths for the service/operation
-///   breakdowns every tracing UI opens with,
-/// - `span_status` — error-rate breakdowns.
-pub const DEFAULT_TRACE_COLUMN_STORE_FIELDS: [&str; 4] =
-    ["duration", "service_name", "operation_name", "span_status"];
-
-/// The stream settings a NEW stream is born with when the user has not
-/// configured any (the first-ingest path — a stream created through the
-/// settings API keeps exactly what the user posted).
-///
-/// Only TRACE streams get defaults today: `column_store_fields` =
-/// [`DEFAULT_TRACE_COLUMN_STORE_FIELDS`]. Every file of a new stream is
-/// written under these settings, and per-file capability probes handle
-/// routing — no settings freshness bookkeeping is needed.
-pub fn default_stream_settings_for_new_stream(stream_type: StreamType) -> Option<StreamSettings> {
-    match stream_type {
-        StreamType::Traces => Some(StreamSettings {
-            column_store_fields: DEFAULT_TRACE_COLUMN_STORE_FIELDS
-                .iter()
-                .map(|field| field.to_string())
-                .collect(),
-            ..Default::default()
-        }),
-        _ => None,
-    }
-}
-
 // handle_diff_schema is a slow path, it acquires a lock to update schema
 // steps:
 // 1. get schema from db, if schema is empty, set schema and return
@@ -269,15 +240,9 @@ pub(crate) async fn handle_diff_schema(
     }
     drop(read_cache);
 
-    // settings a brand-new stream starts with (None for most stream types)
-    let new_stream_settings = if is_new {
-        default_stream_settings_for_new_stream(stream_type)
-    } else {
-        None
-    };
-    let new_stream_settings_json = new_stream_settings
-        .as_ref()
-        .map(|settings| config::utils::json::to_string(settings).unwrap());
+    // v2 all-present-columns: no stream type is born with injected settings
+    // anymore (the trace column-store seeding died with
+    // `column_store_fields` — every present field is a native column).
 
     // first update thread cache
     if is_new {
@@ -285,9 +250,6 @@ pub(crate) async fn handle_diff_schema(
         metadata.insert("created_at".to_string(), record_ts.to_string());
         if is_derived {
             metadata.insert("is_derived".to_string(), "true".to_string());
-        }
-        if let Some(settings) = new_stream_settings_json.as_ref() {
-            metadata.insert("settings".to_string(), settings.clone());
         }
         stream_schema_map.insert(
             stream_name.to_string(),
@@ -300,14 +262,9 @@ pub(crate) async fn handle_diff_schema(
     let mut ret: Option<_> = None;
     // retry x times for update schema
     while retries < cfg.limit.meta_transaction_retries {
-        let schema_for_merge = if is_derived || new_stream_settings_json.is_some() {
-            let mut metadata = HashMap::with_capacity(2);
-            if is_derived {
-                metadata.insert("is_derived".to_string(), "true".to_string());
-            }
-            if let Some(settings) = new_stream_settings_json.as_ref() {
-                metadata.insert("settings".to_string(), settings.clone());
-            }
+        let schema_for_merge = if is_derived {
+            let mut metadata = HashMap::with_capacity(1);
+            metadata.insert("is_derived".to_string(), "true".to_string());
             &inferred_schema.clone().with_metadata(metadata)
         } else {
             inferred_schema
@@ -523,50 +480,4 @@ mod tests {
         infer_json_schema_from_map("test", stream_type, value_iter).unwrap();
     }
 
-    /// New TRACE streams are born with the column-store defaults; every
-    /// other stream type starts with no injected settings (DESIGN §10).
-    #[test]
-    fn test_default_stream_settings_for_new_trace_streams() {
-        let settings = default_stream_settings_for_new_stream(StreamType::Traces)
-            .expect("trace streams get default settings");
-        assert_eq!(
-            settings.column_store_fields,
-            vec!["duration", "service_name", "operation_name", "span_status"]
-        );
-        // nothing else deviates from the defaults
-        let expected = StreamSettings {
-            column_store_fields: settings.column_store_fields.clone(),
-            ..Default::default()
-        };
-        assert_eq!(
-            config::utils::json::to_string(&settings).unwrap(),
-            config::utils::json::to_string(&expected).unwrap()
-        );
-
-        for stream_type in [
-            StreamType::Logs,
-            StreamType::Metrics,
-            StreamType::EnrichmentTables,
-            StreamType::Metadata,
-            StreamType::Index,
-        ] {
-            assert!(
-                default_stream_settings_for_new_stream(stream_type).is_none(),
-                "{stream_type} must not get default settings"
-            );
-        }
-
-        // the settings survive the schema-metadata round trip the
-        // first-ingest path writes
-        let metadata = HashMap::from([(
-            "settings".to_string(),
-            config::utils::json::to_string(&settings).unwrap(),
-        )]);
-        let schema = Schema::empty().with_metadata(metadata);
-        let unwrapped = unwrap_stream_settings(&schema).unwrap();
-        assert_eq!(
-            unwrapped.column_store_fields,
-            vec!["duration", "service_name", "operation_name", "span_status"]
-        );
-    }
 }

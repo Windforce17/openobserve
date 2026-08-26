@@ -297,6 +297,14 @@ pub async fn init() -> Result<(), anyhow::Error> {
 
     let cfg = config::get_config();
 
+    // Sweep leaked vix_spill scratch before any build/merge loop starts.
+    // Spill files (term spill, upload/output spools) are removed by their
+    // owners on completion, but a SIGKILL (OOM) leaks whatever was in
+    // flight, and the files survive container restarts on the pod volume —
+    // prod compactors accreted to a full 200Gi PVC (2026-08-20). At process
+    // start nothing owns the dir; writers recreate it on demand.
+    sweep_vix_spill_scratch(&cfg.common.data_dir);
+
     // init root user
     if !db::user::root_user_exists().await {
         if cfg.auth.root_user_email.is_empty()
@@ -1047,6 +1055,15 @@ pub async fn init_deferred() -> Result<(), anyhow::Error> {
         .await
         .expect("Dashboard id->org cache failed");
 
+    // Post-online index warmup (#39): queriers prefetch their
+    // consistent-hash share of the recent hours' .vix metadata so a fresh
+    // pod (ephemeral cache since the Deployment migration) serves index
+    // queries warm within minutes instead of paying cold S3 round trips
+    // per first-touch query. Spawned: readiness never waits on it.
+    if LOCAL_NODE.is_querier() {
+        tokio::task::spawn(crate::service::search::warmup::warm_recent_indexes());
+    }
+
     Ok(())
 }
 
@@ -1080,4 +1097,44 @@ fn spawn_supervised_segment_flusher() {
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
         }
     });
+}
+
+/// Remove the `vix_spill` scratch dir under `data_dir` wholesale.
+///
+/// Only compact merge/rebuild paths write there (upload spools, term
+/// spill), every writer `create_dir_all`s it on demand, and at process
+/// start nothing can own it — so removal is always safe at boot and is
+/// the only reclaim for files leaked by SIGKILL.
+fn sweep_vix_spill_scratch(data_dir: &str) {
+    let dir = std::path::Path::new(data_dir).join("vix_spill");
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => log::info!("swept stale vix_spill scratch at boot"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => log::warn!("failed to sweep vix_spill scratch at boot: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod vix_spill_sweep_tests {
+    use super::sweep_vix_spill_scratch;
+
+    #[test]
+    fn removes_files_and_subdirs_and_tolerates_missing() {
+        let base = tempfile::tempdir().unwrap();
+        let spill = base.path().join("vix_spill");
+        std::fs::create_dir_all(spill.join("sub")).unwrap();
+        std::fs::write(spill.join("a.upload.spool"), b"x").unwrap();
+        std::fs::write(spill.join("sub/b.vix.spool"), b"y").unwrap();
+        // unrelated sibling must survive
+        std::fs::write(base.path().join("keep.txt"), b"k").unwrap();
+
+        let data_dir = base.path().to_str().unwrap();
+        sweep_vix_spill_scratch(data_dir);
+        assert!(!spill.exists());
+        assert!(base.path().join("keep.txt").exists());
+
+        // second call: dir absent, must not error/panic
+        sweep_vix_spill_scratch(data_dir);
+        assert!(!spill.exists());
+    }
 }

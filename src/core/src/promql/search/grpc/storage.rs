@@ -220,12 +220,18 @@ pub(crate) async fn create_context(
         use_inverted_index: true,
     });
 
-    // search vix inverted index
+    // search vix inverted index. Index-off stream types (#40 — metrics is
+    // the default) never probe it: their core files are column-store only,
+    // so the label matchers stay on the scan (is_add_filter_back remains
+    // true and the caller keeps the full filter).
     let mut idx_took = 0;
     let mut is_add_filter_back = true;
     let (index_condition, is_full_convert) =
         convert_matchers_to_index_condition(&matchers, &schema, &index_fields)?;
-    if !index_condition.conditions.is_empty() && cfg.common.inverted_index_enabled {
+    if !index_condition.conditions.is_empty()
+        && cfg.common.inverted_index_enabled
+        && !config::is_vix_index_disabled(StreamType::Metrics)
+    {
         (idx_took, is_add_filter_back,..) =
             vix_search(query.clone(), &mut files, Some(index_condition), None)
                 .await

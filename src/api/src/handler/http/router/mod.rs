@@ -58,6 +58,7 @@ use crate::{
 };
 
 pub mod decompression;
+pub mod ingest_admission;
 pub mod middlewares;
 pub mod openapi;
 pub mod ui;
@@ -908,6 +909,12 @@ pub fn service_routes() -> Router {
         }
     }
 
+    // Query cancellation works on OSS since .82 (#36): fan-out to the
+    // leader's abort registry
+    router = router
+        .route("/{org_id}/query_manager/cancel", put(search::query_manager::cancel_multiple_query))
+        .route("/{org_id}/query_manager/{query_id}/cancel", delete(search::query_manager::cancel_query));
+
     #[cfg(feature = "enterprise")]
     {
         router = router
@@ -918,10 +925,8 @@ pub fn service_routes() -> Router {
             .route("/{org_id}/search_jobs/{job_id}/cancel", post(search::search_job::cancel_job))
             .route("/{org_id}/search_jobs/{job_id}/retry", post(search::search_job::retry_job))
 
-            // Query manager
+            // Query manager status (needs the enterprise task registry)
             .route("/{org_id}/query_manager/status", get(search::query_manager::query_status))
-            .route("/{org_id}/query_manager/cancel", put(search::query_manager::cancel_multiple_query))
-            .route("/{org_id}/query_manager/{query_id}/cancel", delete(search::query_manager::cancel_query))
 
 
             // search inspector
@@ -1172,6 +1177,12 @@ pub fn service_routes() -> Router {
         .layer(middleware::from_fn(audit_middleware))
         .layer(middleware::from_fn(auth_middleware))
         .layer(RequestDecompressionLayer::new())
+        // pre-body ingest admission: must sit OUTSIDE the decompression layer
+        // so it sees the wire Content-Length/Content-Encoding and can reject
+        // before any body byte is buffered or decompressed
+        .layer(middleware::from_fn(
+            ingest_admission::ingest_admission_middleware,
+        ))
         .layer(middleware::from_fn(
             decompression::preprocess_encoding_middleware,
         ))
@@ -1200,6 +1211,9 @@ pub fn other_service_routes() -> Router {
         .layer(middleware::from_fn(aws_auth_middleware))
         .layer(RequestDecompressionLayer::new())
         .layer(middleware::from_fn(
+            ingest_admission::ingest_admission_middleware_all,
+        ))
+        .layer(middleware::from_fn(
             decompression::preprocess_encoding_middleware,
         ));
 
@@ -1212,6 +1226,9 @@ pub fn other_service_routes() -> Router {
         .layer(middleware::from_fn(gcp_auth_middleware))
         .layer(RequestDecompressionLayer::new())
         .layer(middleware::from_fn(
+            ingest_admission::ingest_admission_middleware_all,
+        ))
+        .layer(middleware::from_fn(
             decompression::preprocess_encoding_middleware,
         ));
 
@@ -1223,6 +1240,9 @@ pub fn other_service_routes() -> Router {
         .layer(middleware::from_fn(RumExtraData::extractor_middleware))
         .layer(middleware::from_fn(rum_auth_middleware))
         .layer(RequestDecompressionLayer::new())
+        .layer(middleware::from_fn(
+            ingest_admission::ingest_admission_middleware_all,
+        ))
         .layer(middleware::from_fn(
             decompression::preprocess_encoding_middleware,
         ));

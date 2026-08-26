@@ -209,6 +209,70 @@ impl Sbbf {
         self.insert_hash(hash_value(value));
     }
 
+    /// M12: bulk-insert MANY precomputed hashes, in parallel when `threads`
+    /// and the input size warrant it. BYTE-IDENTICAL to the sequential
+    /// `insert_hash` loop for any thread count: each hash touches exactly
+    /// one block ([`block_index`]), the block space is partitioned into
+    /// contiguous disjoint per-worker ranges (hashes bucketed by the same
+    /// mapping in one pass), and OR-ing bits within a block is
+    /// order-independent — so the final bit pattern cannot depend on the
+    /// partitioning. Small inputs (or `threads <= 1`) keep the plain loop;
+    /// the threshold keeps thread setup out of the per-field small builds.
+    pub fn insert_hashes(&mut self, hashes: &[u64], threads: usize) {
+        /// Below this many hashes the sequential loop wins outright.
+        const PARALLEL_MIN_HASHES: usize = 1 << 20;
+        let num_blocks = self.num_blocks() as u64;
+        let workers = threads
+            .min(hashes.len() / PARALLEL_MIN_HASHES + 1)
+            .min(num_blocks as usize)
+            .max(1);
+        if workers <= 1 || hashes.len() < PARALLEL_MIN_HASHES {
+            for h in hashes {
+                self.insert_hash(*h);
+            }
+            return;
+        }
+
+        // worker(b) = floor(b * workers / num_blocks); worker w owns blocks
+        // [ceil(w*nb/W), ceil((w+1)*nb/W)) — an exact tiling of the block
+        // space consistent with the bucketing below.
+        let w64 = workers as u64;
+        let boundary = |w: u64| -> usize { ((w * num_blocks).div_ceil(w64)) as usize };
+        let mut buckets: Vec<Vec<u64>> =
+            vec![Vec::with_capacity(hashes.len() / workers + 1); workers];
+        for &h in hashes {
+            let b = block_index(h, num_blocks as u32) as u64;
+            let w = (b * w64 / num_blocks) as usize;
+            buckets[w].push(h);
+        }
+
+        let mut slices: Vec<(usize, &mut [[u32; 8]])> = Vec::with_capacity(workers);
+        let mut rest: &mut [[u32; 8]] = &mut self.blocks;
+        let mut consumed = 0usize;
+        for w in 0..workers {
+            let end = boundary(w as u64 + 1);
+            let (own, tail) = rest.split_at_mut(end - consumed);
+            slices.push((consumed, own));
+            consumed = end;
+            rest = tail;
+        }
+
+        std::thread::scope(|scope| {
+            for ((start, blocks), bucket) in slices.into_iter().zip(&buckets) {
+                scope.spawn(move || {
+                    for &h in bucket {
+                        let idx = block_index(h, num_blocks as u32) as usize - start;
+                        let mask = mask_from_hash(h);
+                        let block = &mut blocks[idx];
+                        for i in 0..8 {
+                            block[i] |= mask[i];
+                        }
+                    }
+                });
+            }
+        });
+    }
+
     /// Membership test for a **precomputed hash**.
     pub fn check_hash(&self, hash: u64) -> bool {
         let idx = block_index(hash, self.num_blocks()) as usize;
@@ -372,6 +436,57 @@ mod tests {
                 .unwrap();
             assert!(check_block(block, h));
         }
+    }
+
+    /// M12: `insert_hashes` must be BYTE-IDENTICAL to the sequential
+    /// `insert_hash` loop for every thread count — including counts that
+    /// don't divide the block count, more threads than blocks, and inputs
+    /// below the parallel threshold. Deterministic pseudo-random hashes at
+    /// a scale that actually crosses the threshold.
+    #[test]
+    fn m12_insert_hashes_parallel_matches_sequential() {
+        // splitmix64: deterministic, well-spread 64-bit stream
+        fn splitmix(state: &mut u64) -> u64 {
+            *state = state.wrapping_add(0x9E3779B97F4A7C15);
+            let mut z = *state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+            z ^ (z >> 31)
+        }
+        let mut state = 0xC0FFEE_u64;
+        let hashes: Vec<u64> = (0..(1 << 21)).map(|_| splitmix(&mut state)).collect();
+
+        for num_blocks in [1u32, 7, 64, 4096, 65536] {
+            let mut sequential = Sbbf::new_with_num_blocks(num_blocks);
+            for h in &hashes {
+                sequential.insert_hash(*h);
+            }
+            let expected = sequential.to_bytes();
+            for threads in [1usize, 2, 3, 8, 61, 1024] {
+                let mut parallel = Sbbf::new_with_num_blocks(num_blocks);
+                parallel.insert_hashes(&hashes, threads);
+                assert_eq!(
+                    parallel.to_bytes(),
+                    expected,
+                    "num_blocks={num_blocks} threads={threads} must be byte-identical"
+                );
+            }
+        }
+
+        // below the threshold: still identical (plain loop path)
+        let small = &hashes[..1000];
+        let mut sequential = Sbbf::new_with_num_blocks(64);
+        for h in small {
+            sequential.insert_hash(*h);
+        }
+        let mut threaded = Sbbf::new_with_num_blocks(64);
+        threaded.insert_hashes(small, 8);
+        assert_eq!(threaded.to_bytes(), sequential.to_bytes());
+
+        // empty input: no-op
+        let mut empty = Sbbf::new_with_num_blocks(64);
+        empty.insert_hashes(&[], 8);
+        assert_eq!(empty.to_bytes(), Sbbf::new_with_num_blocks(64).to_bytes());
     }
 
     #[test]

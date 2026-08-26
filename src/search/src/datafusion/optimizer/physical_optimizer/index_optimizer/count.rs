@@ -23,9 +23,11 @@ use datafusion::{
     },
     physical_plan::{ExecutionPlan, aggregates::AggregateExec},
 };
+use hashbrown::HashSet;
 
 use crate::datafusion::optimizer::physical_optimizer::{
-    index_optimizer::utils::is_complex_plan, utils::is_count_rows_aggregate,
+    index_optimizer::utils::is_complex_plan,
+    utils::{count_column_aggregate, is_count_rows_aggregate},
 };
 
 #[rustfmt::skip]
@@ -43,45 +45,72 @@ use crate::datafusion::optimizer::physical_optimizer::{
 ///                 FilterExec: _timestamp@0 >= 175256100000000 AND _timestamp@0 < 17525610000000000
 ///                   CooperativeExec
 ///                     NewEmptyExec: name="default"
-pub fn is_simple_count(plan: Arc<dyn ExecutionPlan>) -> Option<IndexOptimizeMode> {
-    let mut visitor = SimpleCountVisitor::new();
+///
+/// M16: `select count(field)` over a bare column in `index_fields` (the
+/// stream's fast-path-eligible fields) additionally resolves to
+/// [`IndexOptimizeMode::SimpleCountField`] — the null-skipping per-column
+/// count, stats-answered from per-chunk presence counts.
+pub fn is_simple_count(
+    plan: Arc<dyn ExecutionPlan>,
+    index_fields: &HashSet<String>,
+) -> Option<IndexOptimizeMode> {
+    let mut visitor = SimpleCountVisitor::new(index_fields);
     let _ = plan.visit(&mut visitor);
-    if visitor.is_simple_count {
-        Some(IndexOptimizeMode::SimpleCount)
-    } else {
-        None
-    }
+    if visitor.failed { None } else { visitor.mode }
 }
 
-struct SimpleCountVisitor {
-    pub is_simple_count: bool,
+struct SimpleCountVisitor<'a> {
+    index_fields: &'a HashSet<String>,
+    /// The mode every AggregateExec level agreed on so far.
+    mode: Option<IndexOptimizeMode>,
+    failed: bool,
 }
 
-impl SimpleCountVisitor {
-    pub fn new() -> Self {
+impl<'a> SimpleCountVisitor<'a> {
+    pub fn new(index_fields: &'a HashSet<String>) -> Self {
         Self {
-            is_simple_count: false,
+            index_fields,
+            mode: None,
+            failed: true, // no AggregateExec seen yet
         }
     }
 }
 
-impl<'n> TreeNodeVisitor<'n> for SimpleCountVisitor {
+impl<'n> TreeNodeVisitor<'n> for SimpleCountVisitor<'_> {
     type Node = Arc<dyn ExecutionPlan>;
 
     fn f_down(&mut self, node: &'n Self::Node) -> Result<TreeNodeRecursion> {
         if let Some(aggregate) = node.downcast_ref::<AggregateExec>() {
-            if aggregate.group_expr().is_empty()
-                && aggregate.aggr_expr().len() == 1
-                && is_count_rows_aggregate(&aggregate.aggr_expr()[0])
+            let derived = if aggregate.group_expr().is_empty() && aggregate.aggr_expr().len() == 1
             {
-                self.is_simple_count = true;
+                let expr = &aggregate.aggr_expr()[0];
+                if is_count_rows_aggregate(expr) {
+                    Some(IndexOptimizeMode::SimpleCount)
+                } else {
+                    count_column_aggregate(expr)
+                        .filter(|column| self.index_fields.contains(column))
+                        .map(IndexOptimizeMode::SimpleCountField)
+                }
             } else {
-                self.is_simple_count = false;
-                return Ok(TreeNodeRecursion::Stop);
+                None
+            };
+            // every AggregateExec level (Final + Partial) must derive the
+            // SAME mode
+            match derived {
+                Some(mode) if self.mode.as_ref().is_none_or(|m| *m == mode) => {
+                    self.mode = Some(mode);
+                    self.failed = false;
+                }
+                _ => {
+                    self.mode = None;
+                    self.failed = true;
+                    return Ok(TreeNodeRecursion::Stop);
+                }
             }
         } else if is_complex_plan(node) {
             // if encounter complex plan, stop visiting
-            self.is_simple_count = false;
+            self.mode = None;
+            self.failed = true;
             return Ok(TreeNodeRecursion::Stop);
         }
         Ok(TreeNodeRecursion::Continue)
@@ -109,6 +138,7 @@ mod tests {
         let provider = NewEmptyTable::new("t", schema);
         ctx.register_table("t", Arc::new(provider)).unwrap();
 
+        let fields: HashSet<String> = ["name".to_string()].into_iter().collect();
         let cases = vec![
             (
                 "SELECT count(*) from t",
@@ -127,30 +157,35 @@ mod tests {
                 Some(IndexOptimizeMode::SimpleCount),
             ),
             ("SELECT name, count(*) as cnt from t group by name", None),
-            ("SELECT count(name) from t", None),
+            // M16: count(field) over an eligible column
+            (
+                "SELECT count(name) from t",
+                Some(IndexOptimizeMode::SimpleCountField("name".to_string())),
+            ),
+            (
+                "SELECT count(name) as cnt from t",
+                Some(IndexOptimizeMode::SimpleCountField("name".to_string())),
+            ),
+            // distinct is not the simple count shape
+            ("SELECT count(distinct name) from t", None),
         ];
 
         for (sql, expected) in cases {
             let plan = ctx.state().create_logical_plan(sql).await?;
             let physical_plan = ctx.state().create_physical_plan(&plan).await?;
 
-            assert_eq!(expected, is_simple_count(physical_plan));
+            assert_eq!(expected, is_simple_count(physical_plan, &fields), "{sql}");
         }
 
+        // count(field) on a column OUTSIDE index_fields is refused
+        let plan = ctx
+            .state()
+            .create_logical_plan("SELECT count(name) from t")
+            .await?;
+        let physical_plan = ctx.state().create_physical_plan(&plan).await?;
+        assert_eq!(is_simple_count(physical_plan, &HashSet::new()), None);
+
         Ok(())
-    }
-
-    #[test]
-    fn test_simple_count_visitor_initial_state() {
-        let visitor = SimpleCountVisitor::new();
-        assert!(!visitor.is_simple_count);
-    }
-
-    #[test]
-    fn test_simple_count_visitor_can_be_set_true() {
-        let mut visitor = SimpleCountVisitor::new();
-        visitor.is_simple_count = true;
-        assert!(visitor.is_simple_count);
     }
 
     #[test]
@@ -163,6 +198,6 @@ mod tests {
         )]));
         let plan: Arc<dyn datafusion::physical_plan::ExecutionPlan> =
             Arc::new(EmptyExec::new(schema));
-        assert!(is_simple_count(plan).is_none());
+        assert!(is_simple_count(plan, &HashSet::new()).is_none());
     }
 }

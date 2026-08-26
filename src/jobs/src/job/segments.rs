@@ -61,7 +61,10 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -90,11 +93,11 @@ use futures::StreamExt;
 use hashbrown::HashMap;
 use infra::{
     schema::{
-        get_stream_setting_bloom_filter_fields, get_stream_setting_column_store_fields,
+        get_stream_setting_bloom_filter_fields,
         get_stream_setting_fts_fields,
     },
     storage,
-    wal_segments::{self, SegmentMeta},
+    wal_segments::{self, ClaimOrder, SegmentMeta},
 };
 use segment_wal::{SegmentFrame, decode_segment};
 use tokio::time::MissedTickBehavior;
@@ -112,17 +115,217 @@ const HOUR_MICROS: i64 = 3_600_000_000;
 /// Claim poll interval while the backlog is empty; a full claim loops
 /// immediately so a backlog drains at build speed, not poll speed.
 const BUILDER_TICK_SECS: u64 = 5;
-/// Segments in flight for fetch+decode: each payload decompresses to
-/// ~`ZO_SEGMENT_FLUSH_SIZE_MB` of arrow memory, so decoding a whole claim at
-/// once multiplies that by the batch size; 2 overlaps the S3 fetch with the
-/// blocking decode without the spike.
-const FETCH_DECODE_CONCURRENCY: usize = 2;
+// Segments in flight for fetch+decode: M13 (1c) — was a hardcoded 2
+// (`FETCH_DECODE_CONCURRENCY`), now `ZO_SEGMENT_FETCH_DECODE_CONCURRENCY`
+// (default 2 keeps that behavior byte-for-byte). With items 1/1b removing
+// the claim-side waits, serial-ish fetch+decode of a ~512MB super-batch's
+// ~130 objects two at a time became THE drain-rate limiter on prod
+// (2026-08-19: 100-160s cycles dominated by this stage).
 /// Unbuilt-backlog visibility (same signal the sweeper logs): segments
 /// older than this and not yet built mean builders are down or behind.
 const BACKLOG_WARN_AGE_SECS: u64 = 600;
 /// The backlog check+warn runs at most this often — the claim loop passes
 /// every `BUILDER_TICK_SECS`, which would spam both the DB and the log.
 const BACKLOG_WARN_PERIOD: Duration = Duration::from_secs(60);
+/// M13 aging-lane cadence accumulator: per-mille of
+/// `ZO_SEGMENT_BUILD_AGE_LANE_RATIO` accumulated once per ENGAGED claim
+/// pass; each time it crosses a whole unit the pass claims oldest-first
+/// (see [`age_lane_fire`]). Process-global like the builder loop itself;
+/// it only advances while the lane is engaged, so steady state carries no
+/// cadence state.
+static AGE_LANE_ACC: AtomicU64 = AtomicU64::new(0);
+
+/// M17 item 3: process-wide DECODED-byte admission for L0 building —
+/// replaces the count-knob treadmill (`ZO_SEGMENT_BUILD_BATCH` /
+/// `ZO_L0_SUPERBATCH_MB` / `ZO_SEGMENT_BUILD_CONCURRENCY` retunes chased
+/// every traffic-shape change; 4 ops PRs in 24h around the .109 drain).
+/// Counts bound the wrong thing: the OOM dimension is resident DECODED
+/// bytes, which vary 1-10x per compressed byte by stream shape. Two
+/// reservation classes share one budget:
+///
+/// - **Claim**: `process_claim` reserves the batch's ESTIMATED decoded bytes (Σ segment meta size ×
+///   [`decode_inflation_ema`], seeded 5.0) before `fetch_and_decode`, RESIZES the reservation to
+///   the post-decode actual (the frames are resident until the batch ends) and feeds the EMA with
+///   the observed ratio. Released when the batch finishes.
+/// - **Build**: each stream-chunk build reserves its ACTUAL decoded input bytes (the proxy for its
+///   sort/synthesis working set, M12's accounting) for the duration of the build.
+///   `ZO_SEGMENT_BUILD_CONCURRENCY` stays as the secondary COUNT cap.
+///
+/// A reservation that cannot fit WAITS — but one reservation per class
+/// always admits (an oversized super-batch or a fat singleton build must
+/// proceed alone, never deadlock). Budget = `ZO_SEGMENT_BUILD_MEMORY_BUDGET_MB`,
+/// `0` (default) = 40% of the detected container/cgroup memory, floored at
+/// 256 MiB so an undetectable limit cannot stall building.
+struct BuildMemoryBudget {
+    budget: u64,
+    state: std::sync::Mutex<BudgetState>,
+    notify: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct BudgetState {
+    used: u64,
+    claims: usize,
+    builds: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BudgetClass {
+    Claim,
+    Build,
+}
+
+/// One admitted reservation; released (with waiter wakeup) on drop.
+struct BudgetReservation<'a> {
+    owner: &'a BuildMemoryBudget,
+    bytes: u64,
+    class: BudgetClass,
+}
+
+impl BuildMemoryBudget {
+    fn new(budget: u64) -> Self {
+        Self {
+            budget,
+            state: std::sync::Mutex::new(BudgetState::default()),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Admit `bytes` under `class`: immediately when it fits the budget or
+    /// when no reservation of this class is active (the always-one floor);
+    /// otherwise wait for releases.
+    async fn acquire(&self, bytes: u64, class: BudgetClass) -> BudgetReservation<'_> {
+        loop {
+            // arm the waiter BEFORE the check: a release between the failed
+            // check and the await would otherwise be a lost wakeup
+            let notified = self.notify.notified();
+            {
+                let mut state = self.state.lock().expect("budget state poisoned");
+                let class_active = match class {
+                    BudgetClass::Claim => state.claims,
+                    BudgetClass::Build => state.builds,
+                };
+                if class_active == 0 || state.used.saturating_add(bytes) <= self.budget {
+                    state.used = state.used.saturating_add(bytes);
+                    match class {
+                        BudgetClass::Claim => state.claims += 1,
+                        BudgetClass::Build => state.builds += 1,
+                    }
+                    return BudgetReservation {
+                        owner: self,
+                        bytes,
+                        class,
+                    };
+                }
+            }
+            notified.await;
+        }
+    }
+
+    /// Currently reserved bytes (tests / logging).
+    fn used(&self) -> u64 {
+        self.state.lock().expect("budget state poisoned").used
+    }
+}
+
+impl BudgetReservation<'_> {
+    /// Correct the reservation to `bytes` (the post-decode actual). The
+    /// adjustment is UNCONDITIONAL in both directions — the memory is
+    /// already real, so admission math must reflect it; a shrink wakes
+    /// waiters.
+    fn resize(&mut self, bytes: u64) {
+        let mut state = self.owner.state.lock().expect("budget state poisoned");
+        state.used = state.used.saturating_sub(self.bytes).saturating_add(bytes);
+        let shrank = bytes < self.bytes;
+        self.bytes = bytes;
+        drop(state);
+        if shrank {
+            self.owner.notify.notify_waiters();
+        }
+    }
+}
+
+impl Drop for BudgetReservation<'_> {
+    fn drop(&mut self) {
+        let mut state = self.owner.state.lock().expect("budget state poisoned");
+        state.used = state.used.saturating_sub(self.bytes);
+        match self.class {
+            BudgetClass::Claim => state.claims = state.claims.saturating_sub(1),
+            BudgetClass::Build => state.builds = state.builds.saturating_sub(1),
+        }
+        drop(state);
+        self.owner.notify.notify_waiters();
+    }
+}
+
+/// The process-wide budget instance (resolved once from config).
+static BUILD_MEMORY_BUDGET: std::sync::LazyLock<BuildMemoryBudget> =
+    std::sync::LazyLock::new(|| {
+        let budget = resolve_build_memory_budget_bytes();
+        log::info!(
+            "[SEGMENT:BUILD] memory budget: {} MB ({})",
+            budget / (1024 * 1024),
+            if get_config().common.segment_build_memory_budget_mb > 0 {
+                "configured"
+            } else {
+                "auto: 40% of detected memory"
+            }
+        );
+        BuildMemoryBudget::new(budget)
+    });
+
+fn resolve_build_memory_budget_bytes() -> u64 {
+    let cfg = get_config();
+    let configured_mb = cfg.common.segment_build_memory_budget_mb as u64;
+    let bytes = if configured_mb > 0 {
+        configured_mb.saturating_mul(1024 * 1024)
+    } else {
+        (cfg.limit.mem_total as u64).saturating_mul(2) / 5
+    };
+    bytes.max(256 * 1024 * 1024)
+}
+
+/// Compressed→decoded inflation EMA (seeded at 5.0 — conservative for the
+/// first claims; observed ratios clamp to [1, 64] against skew from tiny
+/// or pathological batches). Corrected after every decode with the
+/// measured actual, α = 0.2.
+static DECODE_INFLATION_EMA_BITS: AtomicU64 = AtomicU64::new(0);
+const DECODE_INFLATION_SEED: f64 = 5.0;
+const DECODE_INFLATION_ALPHA: f64 = 0.2;
+
+fn decode_inflation_ema() -> f64 {
+    let bits = DECODE_INFLATION_EMA_BITS.load(Ordering::Relaxed);
+    if bits == 0 {
+        DECODE_INFLATION_SEED
+    } else {
+        f64::from_bits(bits)
+    }
+}
+
+fn observe_decode_inflation(compressed_bytes: u64, decoded_bytes: u64) {
+    if compressed_bytes == 0 {
+        return;
+    }
+    let observed = (decoded_bytes as f64 / compressed_bytes as f64).clamp(1.0, 64.0);
+    let mut current = DECODE_INFLATION_EMA_BITS.load(Ordering::Relaxed);
+    loop {
+        let ema = if current == 0 {
+            DECODE_INFLATION_SEED
+        } else {
+            f64::from_bits(current)
+        };
+        let next = ema * (1.0 - DECODE_INFLATION_ALPHA) + observed * DECODE_INFLATION_ALPHA;
+        match DECODE_INFLATION_EMA_BITS.compare_exchange_weak(
+            current,
+            next.to_bits(),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return,
+            Err(actual) => current = actual,
+        }
+    }
+}
 
 /// Spawn the supervised builder. Same restart-on-error/panic pattern as
 /// `job::files::spawn_supervised`: this loop is the only path segment data
@@ -201,32 +404,100 @@ async fn run_loop() -> Result<(), anyhow::Error> {
         // queryable through the segment tail the whole time. Fails OPEN on
         // a stats error: building sliver claims beats not building.
         let max_wait_secs = cfg.common.segment_build_max_wait_secs;
-        if max_wait_secs > 0 {
-            match wal_segments::claimable_stats(lease_secs).await {
-                Ok((0, _)) => continue,
-                Ok((count, oldest_created_at))
-                    if (count as usize) < batch_size
-                        && now_micros().saturating_sub(oldest_created_at)
-                            < i64::try_from(max_wait_secs)
-                                .unwrap_or(i64::MAX)
-                                .saturating_mul(1_000_000) =>
-                {
-                    continue;
+        // All-or-nothing floor: when the pool holds a full batch, claim
+        // exactly batch-or-nothing — racing builders otherwise SPLIT one
+        // batch-sized pool into sliver claims, and every sliver claim
+        // emits a sliver L0 file per stream it touches (prod 2026-08-12:
+        // 14+ builders turned 32-segment pools into ~7-segment claims;
+        // metric streams landed 1-16-record files). Age-triggered claims
+        // drop the floor: freshness beats file size on quiet streams.
+        let mut min_batch = 1;
+        let mut effective_batch = batch_size;
+        // M13 aging lane: newest-first claiming is right in steady state
+        // (fresh windows recover first) but starves the oldest cohort under
+        // a STANDING backlog — the 1-day raw-object lifecycle then deletes
+        // unbuilt data (prod 2026-08-18/19: oldest pending stuck 15+ hours
+        // at a 74.5k backlog). While the oldest claimable segment is older
+        // than the lane threshold, a configured fraction of claim passes
+        // (the whole pass: initial claim + super-batch extensions) scans
+        // OLDEST-first instead. Claim semantics (floor, SKIP LOCKED) are
+        // identical in both lanes; disengaged behavior is byte-identical
+        // to pre-M13.
+        let lane_secs = cfg.common.segment_build_age_lane_secs;
+        let lane_ratio = cfg.common.segment_build_age_lane_ratio;
+        let lane_enabled = lane_secs > 0 && lane_ratio > 0.0;
+        let mut claim_order = ClaimOrder::NewestFirst;
+        if max_wait_secs > 0 || lane_enabled {
+            // #50: cheap existence probe each tick; the count/min/SUM
+            // aggregate runs only when something is claimable. Idle fleets
+            // cost one indexed LIMIT-1 row per builder-second with zero
+            // added drain latency (a timing-driven backoff here delayed
+            // seg-mode builds enough to flip alert triggers into retries —
+            // integration_test 3304, 2026-08-13).
+            match wal_segments::has_claimable(lease_secs).await {
+                Ok(false) => continue,
+                Ok(true) => {}
+                Err(e) => {
+                    log::error!("[SEGMENT:BUILD] has_claimable failed (claiming anyway): {e}");
                 }
-                Ok(_) => {}
+            }
+            match wal_segments::claimable_stats(lease_secs).await {
+                Ok((0, ..)) => continue,
+                Ok((count, oldest_created_at, total_size)) => {
+                    let now = now_micros();
+                    // #47: byte-budget adaptive batch — derive the claim
+                    // count from the live average segment size so the
+                    // decode-memory bound is the BUDGET, not a row count
+                    // (fat vpc-flow segments claim fewer, thin metrics
+                    // segments claim more).
+                    let claim_mb = cfg.common.segment_build_claim_mb;
+                    if claim_mb > 0 && count > 0 && total_size > 0 {
+                        let avg = (total_size / count).max(1) as usize;
+                        effective_batch = ((claim_mb * 1024 * 1024) / avg).clamp(4, 256);
+                    }
+                    if lane_enabled
+                        && age_lane_engaged(oldest_created_at, now, lane_secs)
+                        && age_lane_fire(&AGE_LANE_ACC, lane_ratio)
+                    {
+                        claim_order = ClaimOrder::OldestFirst;
+                        log::info!(
+                            "[SEGMENT:BUILD] aging lane: claiming oldest-first (oldest pending \
+                             {}s > lane {lane_secs}s, claimable {count})",
+                            now.saturating_sub(oldest_created_at) / 1_000_000,
+                        );
+                    }
+                    if max_wait_secs > 0 {
+                        let age_triggered = now.saturating_sub(oldest_created_at)
+                            >= i64::try_from(max_wait_secs)
+                                .unwrap_or(i64::MAX)
+                                .saturating_mul(1_000_000);
+                        if (count as usize) >= effective_batch {
+                            min_batch = effective_batch;
+                        } else if !age_triggered {
+                            continue;
+                        }
+                    }
+                }
                 Err(e) => {
                     log::error!("[SEGMENT:BUILD] claimable_stats failed (claiming anyway): {e}");
                 }
             }
         }
-        let claim =
-            match wal_segments::claim_pending(&LOCAL_NODE.uuid, batch_size, lease_secs).await {
-                Ok(v) => v,
-                Err(e) => {
-                    log::error!("[SEGMENT:BUILD] claim_pending failed: {e}");
-                    continue;
-                }
-            };
+        let claim = match wal_segments::claim_pending_with_floor(
+            &LOCAL_NODE.uuid,
+            effective_batch,
+            min_batch,
+            lease_secs,
+            claim_order,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                log::error!("[SEGMENT:BUILD] claim_pending failed: {e}");
+                continue;
+            }
+        };
         if claim.is_empty() {
             continue;
         }
@@ -237,11 +508,82 @@ async fn run_loop() -> Result<(), anyhow::Error> {
             LOCAL_NODE.uuid.clone(),
             lease_secs,
         );
-        match process_claim(&claim, &LOCAL_NODE.uuid).await {
+
+        // #54 super-batch: keep claiming and CONCATENATE while the pool has
+        // full batches, until the byte budget or the age cap. One
+        // process_claim over the union preserves today's all-or-nothing
+        // semantics exactly — it is simply a bigger batch across time — and
+        // each (stream, hour) it touches becomes ONE file instead of one
+        // file per claim (the small-L0 explosion was per-claim slicing, not
+        // data volume). Crash/failure re-pends the whole union via the same
+        // guards + fenced release; the age cap bounds the replay window.
+        //
+        // M13 (1b) backlog-mode sealing: WHILE CLAIMS RETURN ROWS the loop
+        // is bounded by WORK, never by the clock — claim to the byte target
+        // and seal immediately. The age clock and the arrival-gap sealing
+        // pace only the true steady-state trickle, i.e. after a claim comes
+        // back empty AND the cheap #50 probe confirms the table is out of
+        // claimable work (an empty claim WITH claimable work still present
+        // is a SKIP-LOCKED race loss — retry immediately, bounded). Under a
+        // 72k-segment prod backlog (2026-08-18/19) wait-paced accumulation
+        // held builders at 5-8 super-batch cycles per 15min/pod; the
+        // interim ops pin (prod-ops #432 clock=15s) becomes unnecessary.
+        let mut claim = claim;
+        let mut extra_guards: Vec<HeartbeatGuard> = Vec::new();
+        let super_mb = cfg.common.segment_build_superbatch_mb;
+        let super_secs = cfg.common.segment_build_superbatch_max_secs.max(10);
+        if super_mb > 0 {
+            accumulate_super_batch(
+                &mut claim,
+                &mut extra_guards,
+                &LOCAL_NODE.uuid,
+                effective_batch,
+                lease_secs,
+                claim_order,
+                (super_mb as i64) * 1024 * 1024,
+                super_secs,
+            )
+            .await;
+        }
+
+        // M12 fix 2 — self-tuning memory backoff: a batch that fails with a
+        // RESOURCES-EXHAUSTED error would fail identically on an identical
+        // retry (the pre-M12 loop released everything and re-claimed the
+        // same union), so HALVE the batch instead — release the dropped
+        // half for other builders and retry the kept half immediately.
+        // Convergent (log2 attempts to the 1-segment floor, which always
+        // gets a real attempt), resumable (identical deterministic keys),
+        // and fenced (released rows go back to Pending; our heartbeat
+        // no-ops on them — builder_node no longer matches). Non-memory
+        // errors keep the release-all-now behavior below unchanged.
+        let mut result = process_claim(&claim, &LOCAL_NODE.uuid).await;
+        while let Err(e) = &result {
+            if claim.len() <= 1 || !is_resources_exhausted(e) {
+                break;
+            }
+            let failed_len = claim.len();
+            let dropped = halve_for_retry(&mut claim);
+            log::warn!(
+                "[SEGMENT:BUILD] batch of {failed_len} segments failed on memory; retrying with \
+                 {} (releasing {} for other builders): {e:#}",
+                claim.len(),
+                dropped.len()
+            );
+            if let Err(re) = infra::wal_segments::release_claims(&dropped, &LOCAL_NODE.uuid).await
+            {
+                log::error!(
+                    "[SEGMENT:BUILD] releasing {} halved claims failed (lease expiry covers \
+                     them): {re}",
+                    dropped.len()
+                );
+            }
+            result = process_claim(&claim, &LOCAL_NODE.uuid).await;
+        }
+        match result {
             Ok(stats) => {
                 log::info!("[SEGMENT:BUILD] {stats}");
                 // a full claim means more may be pending: drain immediately
-                backlog = claim.len() >= batch_size;
+                backlog = claim.len() >= effective_batch;
             }
             Err(e) => {
                 // nothing was registered (registration and the Built flip
@@ -304,10 +646,229 @@ impl Drop for HeartbeatGuard {
     }
 }
 
+/// M12 fix 2: whether an error chain is a MEMORY-pool failure (DataFusion's
+/// `ResourcesExhausted`, canonical display prefix "Resources exhausted") —
+/// the one failure class where retrying the identical batch is pointless
+/// and HALVING it converges. Checked across the whole `anyhow` context
+/// chain: the builder wraps the plan error in per-stream/per-hour context.
+fn is_resources_exhausted(e: &anyhow::Error) -> bool {
+    e.chain()
+        .any(|cause| cause.to_string().contains("Resources exhausted"))
+}
+
+/// M12 fix 2: shrink `claim` to its first half for the memory-backoff retry
+/// (floor 1 — callers gate on `len() > 1`), returning the DROPPED segment
+/// ids so the caller releases them for other builders. Keeping the FIRST
+/// half keeps ids contiguous-ish with the original claim order, so the
+/// retry's deterministic L0 keys stay a prefix of the failed attempt's plan.
+fn halve_for_retry(claim: &mut Vec<SegmentMeta>) -> Vec<i64> {
+    let keep = (claim.len() / 2).max(1);
+    let dropped = claim[keep..].iter().map(|s| s.id).collect();
+    claim.truncate(keep);
+    dropped
+}
+
+/// M13 aging-lane engagement: the lane exists only while the OLDEST
+/// claimable segment (`claimable_stats`' min `created_at`, micros) is older
+/// than `lane_secs` (0 = lane disabled). It disengages by itself the moment
+/// the aged band drains below the threshold, restoring pure newest-first
+/// claiming.
+fn age_lane_engaged(oldest_created_at: i64, now: i64, lane_secs: u64) -> bool {
+    lane_secs > 0
+        && oldest_created_at > 0
+        && now.saturating_sub(oldest_created_at)
+            >= i64::try_from(lane_secs)
+                .unwrap_or(i64::MAX)
+                .saturating_mul(1_000_000)
+}
+
+/// One ENGAGED claim pass' lane decision: accumulate `ratio` in fixed-point
+/// per-mille and fire (claim oldest-first) each time the running total
+/// crosses a whole unit — ratio 0.25 fires every 4th engaged pass, 1.0
+/// every engaged pass, 0 never. Deterministic for any ratio in [0, 1] and
+/// exact in the long run (no drift); callers must only tick this while the
+/// lane is engaged so the cadence counts engaged passes, not wall ticks.
+fn age_lane_fire(acc: &AtomicU64, ratio: f64) -> bool {
+    let step = (ratio.clamp(0.0, 1.0) * 1000.0).round() as u64;
+    if step == 0 {
+        return false;
+    }
+    let prev = acc.fetch_add(step, Ordering::Relaxed);
+    (prev + step) / 1000 > prev / 1000
+}
+
+/// M13 (1b): consecutive immediate retries an empty extension claim gets
+/// while the #50 probe still reports claimable work, before it is treated
+/// as a real arrival gap. SKIP-LOCKED race losses resolve in milliseconds
+/// (candidate locks live for one statement), so a small bound both breaks
+/// the wait-pacing and guards against a pathological probe/claim
+/// disagreement spinning hot.
+const EMPTY_CLAIM_RACE_RETRIES: u32 = 3;
+
+/// What a super-batch accumulation does when an extension claim comes back
+/// EMPTY (M13 1b). See [`on_empty_extension_claim`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmptyClaimAction {
+    /// The table still has claimable work — the emptiness was a racing
+    /// loss, not an arrival gap: claim again immediately (no sleep, no
+    /// empty-tick), bounded by [`EMPTY_CLAIM_RACE_RETRIES`].
+    RetryNow,
+    /// Real arrival gap inside the age window: sleep one builder tick and
+    /// re-claim (the #54 trickle-accumulation mechanism, unchanged).
+    Wait,
+    /// Seal the batch now: the age clock expired or two consecutive empty
+    /// ticks mean traffic stopped.
+    Seal,
+}
+
+/// M13 (1b) backlog-mode sealing policy, pure for the test matrix: while
+/// the table has claimable work the accumulation is bounded by WORK (claim
+/// again immediately toward the byte target); the age clock and the
+/// two-empty-ticks arrival-gap seal pace only the true trickle — the state
+/// where claims come back empty AND nothing is claimable. `race_retries`
+/// resets on any non-empty claim (caller); `empty_ticks` counts only real
+/// gap waits, exactly like pre-M13 #54.
+fn on_empty_extension_claim(
+    claimable: bool,
+    race_retries: &mut u32,
+    empty_ticks: &mut u32,
+    elapsed: Duration,
+    super_secs: u64,
+) -> EmptyClaimAction {
+    if claimable && *race_retries < EMPTY_CLAIM_RACE_RETRIES {
+        *race_retries += 1;
+        return EmptyClaimAction::RetryNow;
+    }
+    // the age clock caps accumulated WAITING (the crash-replay bound);
+    // it never cuts a flowing accumulation — sealing by size is the point
+    if elapsed >= Duration::from_secs(super_secs) {
+        return EmptyClaimAction::Seal;
+    }
+    *empty_ticks += 1;
+    if *empty_ticks >= 2 {
+        return EmptyClaimAction::Seal;
+    }
+    EmptyClaimAction::Wait
+}
+
+/// #54 super-batch accumulation, extracted for the M13 (1b) pins: extend
+/// `claim` with floor-1 claims until `budget` bytes. WHILE CLAIMS RETURN
+/// ROWS the loop is bounded by WORK alone — no clock check, no sleeps —
+/// so a deep backlog seals by SIZE at claim speed. Empty claims consult
+/// the cheap #50 probe: claimable work still present = a SKIP-LOCKED race
+/// loss (retry immediately, bounded by [`EMPTY_CLAIM_RACE_RETRIES`]);
+/// otherwise the pre-M13 trickle mechanism paces — one builder-tick wait
+/// per gap, sealed by two consecutive empty ticks or the `super_secs` age
+/// clock (which caps accumulated WAITING and stays the crash-replay
+/// bound). Every claimed extension gets a [`HeartbeatGuard`] pushed to
+/// `extra_guards`. Returns the accumulated byte total.
+#[allow(clippy::too_many_arguments)]
+async fn accumulate_super_batch(
+    claim: &mut Vec<SegmentMeta>,
+    extra_guards: &mut Vec<HeartbeatGuard>,
+    node: &str,
+    effective_batch: usize,
+    lease_secs: u64,
+    claim_order: ClaimOrder,
+    budget: i64,
+    super_secs: u64,
+) -> i64 {
+    let started = Instant::now();
+    let mut total: i64 = claim.iter().map(|m| m.size).sum();
+    let mut empty_ticks: u32 = 0;
+    let mut race_retries: u32 = 0;
+    while total < budget {
+        // Extensions take ANYTHING that arrived (floor=1): the union is
+        // already at least one full batch, so #44 sliver-avoidance is
+        // satisfied by the batch as a whole — a full-batch floor here loses
+        // the race against the tick cadence and seals with zero extensions
+        // (.101 on dev: no accumulation ever).
+        let more = match wal_segments::claim_pending_with_floor(
+            node,
+            effective_batch,
+            1,
+            lease_secs,
+            // an aging pass extends oldest-first too: the union then drains
+            // a CONTIGUOUS aged band (adjacent old hours → fewer
+            // (stream, hour) output slices) instead of mixing the aged
+            // cohort with fresh arrivals
+            claim_order,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("[SEGMENT:BUILD] super-batch extension claim failed: {e}");
+                break;
+            }
+        };
+        if more.is_empty() {
+            let claimable = if race_retries < EMPTY_CLAIM_RACE_RETRIES {
+                wal_segments::has_claimable(lease_secs)
+                    .await
+                    .unwrap_or_else(|e| {
+                        log::warn!(
+                            "[SEGMENT:BUILD] super-batch claimable probe failed (treating as \
+                             an arrival gap): {e}"
+                        );
+                        false
+                    })
+            } else {
+                false
+            };
+            match on_empty_extension_claim(
+                claimable,
+                &mut race_retries,
+                &mut empty_ticks,
+                started.elapsed(),
+                super_secs,
+            ) {
+                EmptyClaimAction::RetryNow => continue,
+                EmptyClaimAction::Seal => break,
+                EmptyClaimAction::Wait => {
+                    // True arrival gap: wait for arrivals inside the age
+                    // window instead of sealing — outlasting the claim
+                    // cadence is the whole mechanism (the first cut sealed
+                    // here and dev reproduced pre-#54 slicing exactly). Two
+                    // consecutive empty ticks (traffic stopped) or the age
+                    // cap seal instead; the segment tail serves queries for
+                    // everything held here.
+                    tokio::time::sleep(Duration::from_secs(BUILDER_TICK_SECS)).await;
+                    if is_offline() {
+                        break;
+                    }
+                    continue;
+                }
+            }
+        }
+        race_retries = 0;
+        empty_ticks = 0;
+        extra_guards.push(HeartbeatGuard::spawn(
+            more.iter().map(|m| m.id).collect(),
+            node.to_string(),
+            lease_secs,
+        ));
+        total += more.iter().map(|m| m.size).sum::<i64>();
+        claim.extend(more);
+    }
+    if !extra_guards.is_empty() {
+        log::info!(
+            "[SEGMENT:BUILD] super-batch: {} segments / {} MB accumulated in {:?}",
+            claim.len(),
+            total / (1024 * 1024),
+            started.elapsed()
+        );
+    }
+    total
+}
+
 struct BatchStats {
     claimed: usize,
     built: usize,
     skipped: usize,
+    /// M29: claimed segments whose objects were gone (404) and were
+    /// terminally resolved this batch instead of recycling forever.
+    gone: usize,
     streams: usize,
     files: usize,
     rows: i64,
@@ -319,10 +880,11 @@ impl std::fmt::Display for BatchStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "batch done: segments in={} built={} skipped={} streams={} l0_files={} rows={} flipped={} took_ms={}",
+            "batch done: segments in={} built={} skipped={} gone={} streams={} l0_files={} rows={} flipped={} took_ms={}",
             self.claimed,
             self.built,
             self.skipped,
+            self.gone,
             self.streams,
             self.files,
             self.rows,
@@ -350,8 +912,91 @@ impl std::fmt::Display for BatchStats {
 async fn process_claim(claim: &[SegmentMeta], node: &str) -> Result<BatchStats, anyhow::Error> {
     let started = Instant::now();
 
-    let (decoded, skipped) = fetch_and_decode(claim).await;
+    // M17 admission: reserve the batch's ESTIMATED decoded bytes before
+    // anything decodes — the whole super-batch's frames stay resident until
+    // the batch commits, so this reservation is the process's claim-side
+    // memory truth (corrected to actuals right after decode).
+    let compressed_total: u64 = claim.iter().map(|m| m.size.max(0) as u64).sum();
+    let estimated = (compressed_total as f64 * decode_inflation_ema()) as u64;
+    let admission_started = Instant::now();
+    let mut claim_reservation = BUILD_MEMORY_BUDGET
+        .acquire(estimated, BudgetClass::Claim)
+        .await;
+    let admission_wait = admission_started.elapsed();
+    if admission_wait > Duration::from_millis(50) {
+        log::info!(
+            "[SEGMENT:BUILD] memory admission waited {admission_wait:?} for {} MB estimated \
+             decoded ({} segments)",
+            estimated / (1024 * 1024),
+            claim.len()
+        );
+    }
+
+    let (decoded, skipped, gone) = fetch_and_decode(claim).await;
     let built_ids: Vec<i64> = decoded.iter().map(|(id, _)| *id).collect();
+
+    // M29: terminally resolve claimed segments whose objects are GONE
+    // (fetch returned NotFound — lifecycle-expired; a retry can never
+    // succeed). Fenced flip to Built with zero files: exactly the state a
+    // confirmed-deleted segment ends in, so the normal sweeper retires the
+    // row (its object delete finds NotFound, which it counts as confirmed).
+    // Rows whose lease was lost meanwhile simply don't flip — the next
+    // claimer resolves them. One count line per batch; per-item at debug
+    // (house log discipline — the old per-item ERROR emitted 722k lines/30m
+    // fleet-wide and re-ingested into obs itself).
+    let mut tombstoned = 0u64;
+    if !gone.is_empty() {
+        match wal_segments::mark_built(&gone, node).await {
+            Ok(flipped) => {
+                tombstoned = flipped;
+                log::warn!(
+                    "[SEGMENT:BUILD] {} of {} claimed segments' objects are gone (404/lifecycle-expired): tombstoned (Built with no files; sweeper retires the rows); ids at debug",
+                    flipped,
+                    gone.len(),
+                );
+            }
+            Err(e) => {
+                // leave them leased; the lease expiry retries the resolution
+                log::error!(
+                    "[SEGMENT:BUILD] tombstoning {} gone segments failed (lease expiry retries them): {e}",
+                    gone.len(),
+                );
+            }
+        }
+    }
+    if !skipped.is_empty() {
+        log::warn!(
+            "[SEGMENT:BUILD] {} claimed segments skipped this round on transient fetch/decode failures (lease will expire and retry); ids at debug",
+            skipped.len(),
+        );
+    }
+
+    // post-decode correction: resize the reservation to the REAL resident
+    // bytes and teach the estimator the observed inflation
+    let decoded_actual: u64 = decoded
+        .iter()
+        .map(|(_, frames)| frames.iter().map(|f| f.batch.size() as u64).sum::<u64>())
+        .sum();
+    claim_reservation.resize(decoded_actual);
+    let skipped_set: std::collections::HashSet<i64> = skipped
+        .iter()
+        .chain(gone.iter())
+        .copied()
+        .collect();
+    let decoded_compressed: u64 = claim
+        .iter()
+        .filter(|m| !skipped_set.contains(&m.id))
+        .map(|m| m.size.max(0) as u64)
+        .sum();
+    observe_decode_inflation(decoded_compressed, decoded_actual);
+    log::debug!(
+        "[SEGMENT:BUILD] memory admission: estimated {} MB -> actual {} MB decoded (ema now \
+         {:.2}, budget used {} MB)",
+        estimated / (1024 * 1024),
+        decoded_actual / (1024 * 1024),
+        decode_inflation_ema(),
+        BUILD_MEMORY_BUDGET.used() / (1024 * 1024),
+    );
 
     let meta_by_id: HashMap<i64, &SegmentMeta> = claim.iter().map(|m| (m.id, m)).collect();
 
@@ -403,20 +1048,25 @@ async fn process_claim(claim: &[SegmentMeta], node: &str) -> Result<BatchStats, 
         }
     }
 
-    // Execute: small builds run BUILD_CONCURRENCY at a time; a build whose
-    // input alone exceeds the per-build budget runs SERIALLY so its plan
-    // gets the whole pool (repartition + external sort peak ~3x input).
+    // Execute: small builds run ZO_SEGMENT_BUILD_CONCURRENCY at a time
+    // (the M12 count cap, secondary since M17), each first RESERVING its
+    // decoded input bytes against the process budget — the byte budget is
+    // the binding control: builds only run wide when their bytes provably
+    // fit (the always-one floor keeps an oversized build from deadlocking).
+    // A build whose input alone exceeds the per-build byte cap still runs
+    // SERIALLY so nothing stacks beside it.
     let (large, small): (Vec<BuildPlan>, Vec<BuildPlan>) = plans
         .into_iter()
         .partition(|p| p.decoded_bytes > BUILD_GROUP_MAX_DECODED_BYTES);
     let mut built_files: Vec<BuiltL0File> = Vec::new();
     let mut rows: i64 = 0;
-    let mut small_results = futures::stream::iter(
-        small
-            .into_iter()
-            .map(|plan| async move { build_stream_files(plan.group, &plan.key_parts).await }),
-    )
-    .buffered(BUILD_CONCURRENCY);
+    let mut small_results = futures::stream::iter(small.into_iter().map(|plan| async move {
+        let _admitted = BUILD_MEMORY_BUDGET
+            .acquire(plan.decoded_bytes as u64, BudgetClass::Build)
+            .await;
+        build_stream_files(plan.group, &plan.key_parts).await
+    }))
+    .buffered(build_concurrency());
     while let Some(result) = small_results.next().await {
         let stream_files = result?;
         rows += stream_files
@@ -427,6 +1077,9 @@ async fn process_claim(claim: &[SegmentMeta], node: &str) -> Result<BatchStats, 
     }
     drop(small_results);
     for plan in large {
+        let _admitted = BUILD_MEMORY_BUDGET
+            .acquire(plan.decoded_bytes as u64, BudgetClass::Build)
+            .await;
         let stream_files = build_stream_files(plan.group, &plan.key_parts).await?;
         rows += stream_files
             .iter()
@@ -443,7 +1096,15 @@ async fn process_claim(claim: &[SegmentMeta], node: &str) -> Result<BatchStats, 
     // with no record naming it (per-boot node uuids mean no retry would ever
     // find it). The commit below clears the marker for the flipped rows.
     if !built_files.is_empty() {
-        let claim_ids: Vec<i64> = claim.iter().map(|m| m.id).collect();
+        // M29: tombstoned rows are Built now — they no longer match the
+        // fenced plan write, so counting them would misread every mixed
+        // batch (real + gone) as a lost lease and discard the build
+        let gone_set: std::collections::HashSet<i64> = gone.iter().copied().collect();
+        let claim_ids: Vec<i64> = claim
+            .iter()
+            .map(|m| m.id)
+            .filter(|id| !gone_set.contains(id))
+            .collect();
         let planned_keys: Vec<String> = files.iter().map(|f| f.key.clone()).collect();
         let planned = wal_segments::set_l0_planned(&claim_ids, node, &planned_keys)
             .await
@@ -459,6 +1120,7 @@ async fn process_claim(claim: &[SegmentMeta], node: &str) -> Result<BatchStats, 
                 claimed: claim.len(),
                 built: built_ids.len(),
                 skipped: skipped.len(),
+                gone: tombstoned as usize,
                 streams: stream_keys.len(),
                 files: files.len(),
                 rows,
@@ -507,6 +1169,7 @@ async fn process_claim(claim: &[SegmentMeta], node: &str) -> Result<BatchStats, 
         claimed: claim.len(),
         built: built_ids.len(),
         skipped: skipped.len(),
+        gone: tombstoned as usize,
         streams: stream_keys.len(),
         files: files.len(),
         rows,
@@ -528,9 +1191,16 @@ const BUILD_CHUNK_MAX_DECODED_BYTES: usize = 128 * 1024 * 1024;
 /// alone, not beside two siblings).
 const BUILD_GROUP_MAX_DECODED_BYTES: usize = 160 * 1024 * 1024;
 
-/// Concurrent small builds per claim: 3 x (~3 x 128MB peak) stays inside
-/// the 2048MB pool with headroom, and multiplies drain throughput.
-const BUILD_CONCURRENCY: usize = 3;
+/// Concurrent small builds per claim (`ZO_SEGMENT_BUILD_CONCURRENCY`, M12
+/// item 5 — was a hardcoded 3). Default 3 keeps today's behavior: 3 ×
+/// (~128MB decoded input) resident batches multiply drain throughput while
+/// staying modest on an 8Gi ingester; since M12's direct sorted-batch build
+/// the DataFusion pool is not involved for logs/traces at all, so dedicated
+/// builder/compactor pods can safely run higher (prod: ~370 seg/min
+/// arrivals vs ~195/min fleet builds at 3-per-pod). Floor 1 (config clamp).
+fn build_concurrency() -> usize {
+    get_config().common.segment_build_concurrency.max(1)
+}
 
 /// One stream's identity plus its byte-capped chunks out of one contiguous
 /// decoded run.
@@ -715,6 +1385,12 @@ struct BuiltL0File {
     /// Disk-spooled container — its temp file deletes on drop, so it lives
     /// exactly until this file uploaded (or the batch failed).
     spooled: Option<core_writer::VixOutput>,
+    /// The `.vxi` index-sidecar bytes (v3 split). `None` under the #42
+    /// L0 index-off posture (`file.meta.index_size == 0`); uploaded right
+    /// after the data object when present. The GC needs no extra planned
+    /// key: collecting an orphan `.vix` also attempts its derived sidecar
+    /// key (`compact::segments_sweep`).
+    index: Option<Vec<u8>>,
 }
 
 /// PUT one built L0 file, consuming its payload. A failure aborts the whole
@@ -722,7 +1398,12 @@ struct BuiltL0File {
 /// rows, so even a crash after a partial upload leaves a durable record the
 /// GC can act on.
 async fn upload_built_file(built: BuiltL0File) -> Result<(), anyhow::Error> {
-    let BuiltL0File { file, buf, spooled } = built;
+    let BuiltL0File {
+        file,
+        buf,
+        spooled,
+        index,
+    } = built;
     match spooled.as_ref().and_then(|o| o.spool_path()) {
         Some(spool) => {
             storage::put_file(&file.account, &file.key, spool)
@@ -736,6 +1417,16 @@ async fn upload_built_file(built: BuiltL0File) -> Result<(), anyhow::Error> {
                 .with_context(|| format!("upload L0 file {}", file.key))?;
         }
     }
+    // v3 split: the sidecar (when the build indexed) uploads AFTER the data
+    // object; the file_list row commits later still, so a crash here leaves
+    // only rowless orphans — the GC's derived-key delete collects them.
+    if let Some(index) = index {
+        let sidecar_key = config::vix_sidecar_key(&file.key)
+            .expect("core L0 outputs are .vix keys by construction");
+        storage::put(&file.account, &sidecar_key, Bytes::from(index))
+            .await
+            .with_context(|| format!("upload L0 index sidecar {sidecar_key}"))?;
+    }
     log::info!(
         "[SEGMENT:BUILD] built L0 file {}, records: {}, original_size: {}, compressed_size: {}",
         file.key,
@@ -747,27 +1438,53 @@ async fn upload_built_file(built: BuiltL0File) -> Result<(), anyhow::Error> {
 }
 
 /// Fetch and decode the claimed segments, at most
-/// [`FETCH_DECODE_CONCURRENCY`] in flight (`buffered` keeps claim order, so
-/// results still zip with the claim). A segment that fails to fetch,
-/// decode, or carries a path-unsafe stream identity is logged with its key
-/// and SKIPPED — left leased so its lease expires and it retries — never
-/// crashing the batch and never contributing partial data.
-async fn fetch_and_decode(claim: &[SegmentMeta]) -> (Vec<(i64, Vec<SegmentFrame>)>, Vec<i64>) {
+/// `ZO_SEGMENT_FETCH_DECODE_CONCURRENCY` in flight (`buffered` keeps claim
+/// order, so results still zip with the claim). Returns
+/// `(decoded, skipped, gone)`:
+/// - `skipped` — transient failures (fetch error, decode error, path-unsafe
+///   identity): left leased so the lease expires and the segment retries,
+///   never crashing the batch and never contributing partial data;
+/// - `gone` (M29) — the object GET returned NotFound: the S3 lifecycle (or an
+///   earlier confirmed delete) removed the object, and S3 reads are strongly
+///   consistent, so a retry can never succeed. The caller terminally resolves
+///   these rows instead of recycling them through every future claim (the
+///   kill-era zombie loop: claim -> 404 -> lease expiry -> re-claim, 722k
+///   skips/30m fleet-wide on prod 2026-08-24, diluting every claim batch to
+///   1-2 real segments and turning the batch-sized L0 design into per-stream
+///   sliver files).
+///
+/// Log discipline (house rule): per-item detail at DEBUG only; the caller
+/// emits one per-batch count line.
+async fn fetch_and_decode(
+    claim: &[SegmentMeta],
+) -> (Vec<(i64, Vec<SegmentFrame>)>, Vec<i64>, Vec<i64>) {
     // futures are built eagerly (they are lazy and tiny); `buffered` polls
-    // at most FETCH_DECODE_CONCURRENCY of them at a time
+    // at most the configured concurrency of them at a time (floor 1
+    // clamped at config load; memory scales with in-flight decoded
+    // objects — see ZO_SEGMENT_FETCH_DECODE_CONCURRENCY's help)
     let pending: Vec<_> = claim.iter().map(fetch_and_decode_one).collect();
     let results: Vec<Result<Vec<SegmentFrame>, anyhow::Error>> = futures::stream::iter(pending)
-        .buffered(FETCH_DECODE_CONCURRENCY)
+        .buffered(get_config().common.segment_fetch_decode_concurrency)
         .collect()
         .await;
 
+    let tombstone_404 = get_config().common.segment_build_404_tombstone;
     let mut decoded = Vec::with_capacity(claim.len());
     let mut skipped = Vec::new();
+    let mut gone = Vec::new();
     for (meta, result) in claim.iter().zip(results) {
         match result {
             Ok(frames) => decoded.push((meta.id, frames)),
+            Err(e) if tombstone_404 && infra::storage::is_not_found_error(&e) => {
+                log::debug!(
+                    "[SEGMENT:BUILD] segment id={} key={} object gone (404): terminally resolving: {e:#}",
+                    meta.id,
+                    meta.object_key
+                );
+                gone.push(meta.id);
+            }
             Err(e) => {
-                log::error!(
+                log::debug!(
                     "[SEGMENT:BUILD] segment id={} key={} skipped this round (lease will expire and retry): {e:#}",
                     meta.id,
                     meta.object_key
@@ -776,14 +1493,16 @@ async fn fetch_and_decode(claim: &[SegmentMeta]) -> (Vec<(i64, Vec<SegmentFrame>
             }
         }
     }
-    (decoded, skipped)
+    (decoded, skipped, gone)
 }
 
 /// Fetch and decode ONE segment object; any failure skips only this segment.
+/// The fetch error keeps its typed source chain (`object_store::Error`
+/// downcast) so the caller can classify NotFound precisely.
 async fn fetch_and_decode_one(meta: &SegmentMeta) -> Result<Vec<SegmentFrame>, anyhow::Error> {
     let bytes = storage::get_bytes("", &meta.object_key)
         .await
-        .map_err(|e| anyhow!("fetch failed: {e}"))?;
+        .map_err(|e| anyhow::Error::new(e).context("fetch failed"))?;
     // zstd + arrow ipc decode of up to ~32MB: keep it off the async workers
     let decoded = tokio::task::spawn_blocking(move || decode_segment(&bytes))
         .await
@@ -962,9 +1681,16 @@ async fn build_stream_files(
         return Ok(Vec::new());
     }
 
-    let sorted = sort_record_batch_by_column(merged, TIMESTAMP_COL_NAME, false, None)
+    // M12: sort DESCENDING — the stored v2 row order — so each hourly
+    // bucket feeds `write_core_file_from_sorted_batch` directly and NO
+    // DataFusion sort (the prod pool-starvation shape: RepartitionExec +
+    // two ExternalSorters under one SortPreservingMergeExec) runs at all.
+    let sorted = sort_record_batch_by_column(merged, TIMESTAMP_COL_NAME, true, None)
         .map_err(|e| anyhow!("{ctx}: sort by {TIMESTAMP_COL_NAME} failed: {e}"))?;
-    let buckets = split_by_hour(&sorted, &ctx)?;
+    // buckets in ascending-hour order regardless of the row sort direction
+    // (files/planned keys keep their pre-M12 order; rows inside stay DESC)
+    let mut buckets = split_by_hour(&sorted, &ctx)?;
+    buckets.sort_unstable_by_key(|(hour, _)| *hour);
 
     // stream settings drive the same fts/bloom/column-store/original wiring
     // the mover uses
@@ -1120,9 +1846,12 @@ fn timestamp_column<'a>(
         .ok_or_else(|| anyhow!("{ctx}: {TIMESTAMP_COL_NAME} is not Int64 after homogenization"))
 }
 
-/// Split an ascending-`_timestamp`-sorted batch into per-hour zero-copy
-/// slices, keyed by the hour's start micros. Input rows are non-null and
-/// > 0 (the degenerate filter ran first).
+/// Split a `_timestamp`-sorted batch (either direction — boundaries are
+/// detected on consecutive-row hour changes, and a sorted input keeps each
+/// hour contiguous) into per-hour zero-copy slices, keyed by the hour's
+/// start micros. The M12 builder sorts DESCENDING (the stored v2 row
+/// order), so buckets come out newest-hour-first with rows DESC inside.
+/// Input rows are non-null and > 0 (the degenerate filter ran first).
 fn split_by_hour(
     sorted: &RecordBatch,
     ctx: &str,
@@ -1154,6 +1883,46 @@ fn split_by_hour(
     Ok(buckets)
 }
 
+/// M18 item 3: slice-accurate arrow memory footprint of one (possibly
+/// zero-copy sliced) record batch. `RecordBatch::get_array_memory_size` on
+/// an hour SLICE reports the FULL backing buffers of the decoded run, so
+/// per-hour L0 buckets stamped wildly inflated `original_size` values (see
+/// the call site). Sums each column's slice-window bytes
+/// (`ArrayData::get_slice_memory_size`); if arrow cannot size a column
+/// per-slice (no segment column type today), the whole batch prorates the
+/// run's backing footprint by its row share — the backing row count read
+/// off the always-present non-null Int64 `_timestamp` buffer.
+fn sliced_batch_memory_size(batch: &RecordBatch, ctx: &str) -> usize {
+    let mut exact = 0usize;
+    for column in batch.columns() {
+        match column.to_data().get_slice_memory_size() {
+            Ok(bytes) => exact += bytes,
+            Err(error) => {
+                log::debug!(
+                    "[SEGMENT:BUILD] {ctx}: column type {} has no per-slice memory size \
+                     ({error}); prorating the run footprint by rows",
+                    column.data_type()
+                );
+                let full = batch.get_array_memory_size();
+                let backing_rows = batch
+                    .column_by_name(TIMESTAMP_COL_NAME)
+                    .and_then(|ts| {
+                        ts.to_data()
+                            .buffers()
+                            .first()
+                            .map(|buffer| buffer.len() / std::mem::size_of::<i64>())
+                    })
+                    .unwrap_or(0)
+                    .max(batch.num_rows())
+                    .max(1);
+                return ((full as u128 * batch.num_rows() as u128) / backing_rows as u128)
+                    as usize;
+            }
+        }
+    }
+    exact
+}
+
 /// Build ONE L0 file for a (stream, hour) bucket through the WAL mover's
 /// exact single-file builds: `write_core_file_from_tables` (one
 /// fully-indexed `.vix`) for logs/traces, `merge_parquet_files` for every
@@ -1178,11 +1947,17 @@ async fn build_one_file(
         return Err(anyhow!("{ctx}: empty bucket for hour {hour_start}"));
     }
     let ts = timestamp_column(&bucket, &ctx)?;
-    // ascending sort: first/last row give the data range
-    let (min_ts, max_ts) = (ts.value(0), ts.value(rows - 1));
+    // descending sort (M12): first/last row give the data range
+    let (min_ts, max_ts) = (ts.value(rows - 1), ts.value(0));
     // original_size basis: the rows' arrow memory footprint — segments carry
-    // no upstream JSON size, and this feeds the same spool/merge thresholds
-    let input_bytes = bucket.get_array_memory_size();
+    // no upstream JSON size, and this feeds the same spool/merge thresholds.
+    // M18: SLICE-accurate — `bucket` is a zero-copy hour slice of the whole
+    // decoded run, and `get_array_memory_size` on a slice reports the FULL
+    // backing buffers (a verified prod L0 file: 1 record, ~400 KB stored,
+    // original_size stamped 201,757,975 ≈ the run's footprint). Inflated
+    // sizes under-fill gen-1 merge groups fleet-wide (packing is by
+    // original_size), so size the slice window itself.
+    let input_bytes = sliced_batch_memory_size(&bucket, &ctx);
     let input_meta = FileMeta {
         min_ts,
         max_ts,
@@ -1193,36 +1968,30 @@ async fn build_one_file(
 
     let bloom_fields = get_stream_setting_bloom_filter_fields(stream_settings);
     let fts_fields = get_stream_setting_fts_fields(stream_settings);
-    let column_store_fields = stream_settings
-        .as_ref()
-        .map(get_stream_setting_column_store_fields)
-        .unwrap_or_default();
     let store_original = stream_settings
         .as_ref()
         .is_some_and(|settings| settings.store_original_data);
 
-    let hour_end = hour_start.saturating_add(HOUR_MICROS);
-    let table = NewMemTable::try_new(
-        Arc::clone(union),
-        vec![vec![bucket]],
-        Arc::clone(union),
-        false,
-        None,
-        vec![],
-        (hour_start, hour_end),
-    )
-    .map_err(|e| anyhow!("{ctx}: create memtable for hour {hour_start}: {e}"))?;
-    let tables = vec![Arc::new(table) as _];
-
     let trace_id = ider::generate();
-    let use_core_file = matches!(stream_type, StreamType::Logs | StreamType::Traces);
-    let (buf, spooled_output, file_meta, file_format) = if use_core_file {
-        let result = core_writer::write_core_file_from_tables(
+    // Metrics join the core-file path only behind the activation switch
+    // (#40, ZO_VIX_METRICS_CORE_FILE_ENABLED) and write COLUMN-STORE-ONLY
+    // files (ZO_VIX_INDEX_DISABLED_STREAM_TYPES).
+    let use_core_file = matches!(stream_type, StreamType::Logs | StreamType::Traces)
+        || (stream_type == StreamType::Metrics
+            && get_config().common.vix_metrics_core_file_enabled);
+    let (buf, spooled_output, index_bytes, file_meta, file_format) = if use_core_file {
+        // M12: the bucket is already sorted `_timestamp` DESC (the stored
+        // row order) and covers exactly this hour — the direct builder
+        // needs no DataFusion plan, no repartition and no sort. The prod
+        // 6 GB greedy-pool starvation (RepartitionExec buffering 3 GB it
+        // cannot spill + two ExternalSorters, the second failing its FIRST
+        // 122.8 MB allocation with 13.8 MB left) is unreachable here by
+        // construction.
+        let result = core_writer::write_core_file_from_sorted_batch(
             &trace_id,
-            Arc::clone(union),
-            tables,
+            stream_type,
+            bucket,
             &fts_fields,
-            &column_store_fields,
             &bloom_fields,
             store_original,
             input_bytes,
@@ -1258,8 +2027,28 @@ async fn build_one_file(
             &result.stats,
             &format!("[SEGMENT:BUILD] {ctx}"),
         )?;
-        (result.data, result.output, file_meta, FileFormat::Vix)
+        (result.data, result.output, result.index, file_meta, FileFormat::Vix)
     } else {
+        // non-core formats (metadata, index streams, metrics under the #40
+        // default) keep the DataFusion merge — planned SINGLE-PARTITION
+        // (M13): at prod volume default/metadata/trace_list_index buckets
+        // are NOT thin, and the 2-partition `ORDER BY ... DESC` plan was the
+        // fleet's last remaining "Not enough memory to continue external
+        // sort" source post-.108. One bounded in-memory bucket needs no
+        // parallel sort, and a single ExternalSorter spills properly (the
+        // M12 fix-1 rationale); the M12 halving backoff stays the backstop.
+        let hour_end = hour_start.saturating_add(HOUR_MICROS);
+        let table = NewMemTable::try_new(
+            Arc::clone(union),
+            vec![vec![bucket]],
+            Arc::clone(union),
+            false,
+            None,
+            vec![],
+            (hour_start, hour_end),
+        )
+        .map_err(|e| anyhow!("{ctx}: create memtable for hour {hour_start}: {e}"))?;
+        let tables = vec![Arc::new(table) as _];
         let result = merge_parquet_files(
             stream_type,
             stream,
@@ -1268,6 +2057,7 @@ async fn build_one_file(
             &bloom_fields,
             input_meta,
             true,
+            true, // M13: single-partition sort (see the note above)
         )
         .await
         .with_context(|| format!("{ctx}: build L0 file for hour {hour_start}"))?;
@@ -1276,7 +2066,7 @@ async fn build_one_file(
                 buf,
                 file_meta,
                 file_format,
-            } => (buf, None, file_meta, file_format),
+            } => (buf, None, None, file_meta, file_format),
             MergeParquetResult::Multiple { .. } => {
                 return Err(anyhow!(
                     "{ctx}: single-file L0 build unexpectedly returned multiple files"
@@ -1304,6 +2094,7 @@ async fn build_one_file(
         file: FileKey::new(0, account, key, file_meta, false),
         buf,
         spooled: spooled_output,
+        index: index_bytes,
     })
 }
 
@@ -1341,6 +2132,161 @@ mod tests {
 
     fn ts_field() -> Field {
         Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false)
+    }
+
+    // ── M17 item 3: byte-budgeted build admission ────────────────────────
+
+    /// Admission math units: fits admit immediately; an over-budget request
+    /// WAITS until a release; the always-one floor admits an oversized
+    /// reservation when its class is idle (claim and build floors are
+    /// independent — a fat claim must not starve the first build);
+    /// resize corrects the accounting in both directions and a shrink
+    /// wakes waiters.
+    #[tokio::test]
+    async fn m17_budget_admission_math() {
+        let budget = BuildMemoryBudget::new(1000);
+
+        // fits: claim + build admit immediately
+        let claim = budget.acquire(400, BudgetClass::Claim).await;
+        let build_a = budget.acquire(500, BudgetClass::Build).await;
+        assert_eq!(budget.used(), 900);
+
+        // waits: a second build over budget stays pending...
+        let pending = budget.acquire(200, BudgetClass::Build);
+        let pending = tokio::time::timeout(Duration::from_millis(50), pending).await;
+        assert!(pending.is_err(), "over-budget build must wait");
+        // ...until a release frees room
+        drop(build_a);
+        let build_b = tokio::time::timeout(
+            Duration::from_millis(1000),
+            budget.acquire(200, BudgetClass::Build),
+        )
+        .await
+        .expect("released bytes must admit the waiter");
+        assert_eq!(budget.used(), 600);
+        drop(build_b);
+        drop(claim);
+        assert_eq!(budget.used(), 0);
+
+        // always-one floors: an oversized claim admits alone; the FIRST
+        // build admits even while the claim holds more than the budget
+        let fat_claim = budget.acquire(5000, BudgetClass::Claim).await;
+        assert_eq!(budget.used(), 5000);
+        let first_build = tokio::time::timeout(
+            Duration::from_millis(1000),
+            budget.acquire(800, BudgetClass::Build),
+        )
+        .await
+        .expect("the first build always admits (class floor)");
+        // the SECOND build must wait (class active, over budget)
+        let second = tokio::time::timeout(
+            Duration::from_millis(50),
+            budget.acquire(10, BudgetClass::Build),
+        )
+        .await;
+        assert!(second.is_err(), "a second build over budget must wait");
+        drop(first_build);
+
+        // resize: correcting the fat estimate down wakes waiters
+        let mut fat_claim = fat_claim;
+        fat_claim.resize(100);
+        assert_eq!(budget.used(), 100);
+        let build = tokio::time::timeout(
+            Duration::from_millis(1000),
+            budget.acquire(700, BudgetClass::Build),
+        )
+        .await
+        .expect("the corrected reservation must admit the build");
+        assert_eq!(budget.used(), 800);
+        // resize can also grow (actual above estimate): unconditional
+        fat_claim.resize(400);
+        assert_eq!(budget.used(), 1100);
+        drop(build);
+        drop(fat_claim);
+        assert_eq!(budget.used(), 0);
+    }
+
+    /// EMA correction: seeded at 5.0; observations move it by α = 0.2 and
+    /// clamp to [1, 64]; zero-compressed observations are ignored.
+    #[test]
+    fn m17_decode_inflation_ema_correction() {
+        // NOTE: the EMA is process-global; this is the only test touching it.
+        assert!((decode_inflation_ema() - 5.0).abs() < 1e-9, "seed 5.0");
+        observe_decode_inflation(100, 300); // observed 3.0
+        let after = decode_inflation_ema();
+        assert!(
+            (after - 4.6).abs() < 1e-9,
+            "5.0*0.8 + 3.0*0.2 = 4.6, got {after}"
+        );
+        observe_decode_inflation(0, 12345); // ignored
+        assert!((decode_inflation_ema() - after).abs() < 1e-9);
+        observe_decode_inflation(1, 1_000_000); // clamps to 64
+        let clamped = decode_inflation_ema();
+        assert!(
+            (clamped - (after * 0.8 + 64.0 * 0.2)).abs() < 1e-9,
+            "observation clamps at 64, got {clamped}"
+        );
+        observe_decode_inflation(1000, 500); // ratios below 1 clamp to 1
+        let floored = decode_inflation_ema();
+        assert!(
+            (floored - (clamped * 0.8 + 1.0 * 0.2)).abs() < 1e-9,
+            "observation floors at 1, got {floored}"
+        );
+    }
+
+    /// The fat-shaped multi-build pin: ten 100-byte builds through the
+    /// buffered(16) execution shape at a 250-byte budget — every build
+    /// completes, at most two ever hold reservations concurrently (the
+    /// budget binds, not the count cap), and real overlap happened.
+    #[tokio::test]
+    async fn m17_fat_multibuild_bounded_concurrent_bytes() {
+        use std::sync::atomic::AtomicU64;
+        let budget = Arc::new(BuildMemoryBudget::new(250));
+        let max_used = Arc::new(AtomicU64::new(0));
+        let overlapped = Arc::new(AtomicU64::new(0));
+        let plans: Vec<u64> = vec![100; 10];
+        let mut results = futures::stream::iter(plans.into_iter().map(|bytes| {
+            let budget = Arc::clone(&budget);
+            let max_used = Arc::clone(&max_used);
+            let overlapped = Arc::clone(&overlapped);
+            async move {
+                let _admitted = budget.acquire(bytes, BudgetClass::Build).await;
+                let used = budget.used();
+                max_used.fetch_max(used, Ordering::Relaxed);
+                if used > bytes {
+                    overlapped.fetch_add(1, Ordering::Relaxed);
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Ok::<u64, anyhow::Error>(bytes)
+            }
+        }))
+        .buffered(16);
+        let mut completed = 0usize;
+        while let Some(result) = results.next().await {
+            result.unwrap();
+            completed += 1;
+        }
+        assert_eq!(completed, 10, "every build completes under the budget");
+        let max = max_used.load(Ordering::Relaxed);
+        assert!(
+            max <= 250,
+            "concurrent reserved decoded bytes must stay under the budget, saw {max}"
+        );
+        assert!(
+            overlapped.load(Ordering::Relaxed) > 0,
+            "the budget admits real overlap (2 x 100 <= 250)"
+        );
+        assert_eq!(budget.used(), 0, "everything released");
+
+        // an oversized singleton (> budget) still completes, alone
+        let fat = tokio::time::timeout(
+            Duration::from_millis(1000),
+            budget.acquire(400, BudgetClass::Build),
+        )
+        .await
+        .expect("the always-one floor admits an oversized build");
+        assert_eq!(budget.used(), 400);
+        drop(fat);
     }
 
     // ── schema homogenization ────────────────────────────────────────────
@@ -1560,7 +2506,7 @@ mod tests {
 
         // a single-hour batch yields exactly one bucket
         let one = RecordBatch::try_new(
-            schema,
+            Arc::clone(&schema),
             vec![
                 Arc::new(Int64Array::from(vec![hour11 + 1, hour11 + 2])),
                 Arc::new(Int64Array::from(vec![1, 2])),
@@ -1570,6 +2516,464 @@ mod tests {
         let buckets = split_by_hour(&one, "test").unwrap();
         assert_eq!(buckets.len(), 1);
         assert_eq!(buckets[0].0, hour11);
+
+        // M12: the production sort direction is DESCENDING — hours come out
+        // newest-first, rows DESC inside each slice, boundaries exact
+        let desc = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![
+                    hour11 + 3 * HOUR_MICROS, // 14:00 — first bucket
+                    hour11 + 42,
+                    hour11, // 11:00:00.000000 boundary row stays in hour 11
+                    hour11 - 1,
+                    hour11 - 2,
+                ])),
+                Arc::new(Int64Array::from(vec![5, 4, 3, 2, 1])),
+            ],
+        )
+        .unwrap();
+        let buckets = split_by_hour(&desc, "test").unwrap();
+        assert_eq!(buckets.len(), 3);
+        assert_eq!(buckets[0].0, hour11 + 3 * HOUR_MICROS);
+        assert_eq!(buckets[0].1.num_rows(), 1);
+        assert_eq!(buckets[1].0, hour11);
+        assert_eq!(buckets[1].1.num_rows(), 2);
+        assert_eq!(buckets[2].0, hour11 - HOUR_MICROS);
+        assert_eq!(buckets[2].1.num_rows(), 2);
+        let v2 = buckets[2]
+            .1
+            .column_by_name("v")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(v2.values(), &[2, 1], "rows stay DESC inside the slice");
+    }
+
+    /// M18 item 3 pin: `original_size` accounting must be SLICE-accurate.
+    /// A 1-row hour slice of a wide multi-hour run reports ~its own bytes,
+    /// not the run's full backing footprint (the prod bug: 1 record, ~400 KB
+    /// stored, original_size stamped ≈201 MB — the whole decoded run — which
+    /// under-filled gen-1 merge groups fleet-wide); an UNSLICED batch keeps
+    /// (approximately) the old arrow-footprint basis.
+    #[test]
+    fn test_sliced_batch_memory_size_is_slice_accurate() {
+        let hour11 = T0 + 11 * HOUR_MICROS;
+        let rows = 4096usize;
+        let schema = schema_of(vec![ts_field(), Field::new("v", DataType::Utf8, false)]);
+        // one lonely row in hour 11, the fat rest in hour 12 — DESC order,
+        // so the lonely row is LAST (the prod shape: a stray row on an hour
+        // boundary of a big decoded run)
+        let ts: Vec<i64> = (0..rows)
+            .map(|i| {
+                if i == rows - 1 {
+                    hour11 + 42
+                } else {
+                    hour11 + HOUR_MICROS + (rows - i) as i64
+                }
+            })
+            .collect();
+        let fat: Vec<String> = (0..rows).map(|i| format!("{i:0>512}")).collect();
+        let run = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(ts)),
+                Arc::new(StringArray::from(fat)),
+            ],
+        )
+        .unwrap();
+        let run_footprint = run.get_array_memory_size();
+        assert!(
+            run_footprint > 2 * 1024 * 1024,
+            "the run must be MB-scale for the pin to mean anything ({run_footprint})"
+        );
+
+        let buckets = split_by_hour(&run, "test").unwrap();
+        assert_eq!(buckets.len(), 2);
+        let lonely = &buckets[1].1;
+        assert_eq!(lonely.num_rows(), 1);
+        // the zero-copy slice still REPORTS the full run through the old
+        // basis — that inflation is the bug
+        assert!(
+            lonely.get_array_memory_size() >= run_footprint / 2,
+            "precondition: arrow's whole-batch footprint on a slice reports the backing run"
+        );
+        let sliced = sliced_batch_memory_size(lonely, "test");
+        assert!(
+            sliced < 16 * 1024,
+            "a 1-row slice must report ~KB-scale original_size, got {sliced}"
+        );
+
+        // full (unsliced) batch: ≈ the old value — the content bytes stay
+        // within the arrow footprint and carry its bulk
+        let whole = sliced_batch_memory_size(&run, "test");
+        assert!(
+            whole <= run_footprint,
+            "slice-accurate size never exceeds the arrow footprint"
+        );
+        assert!(
+            whole >= run_footprint / 2,
+            "an unsliced batch keeps the footprint basis (content-bytes bulk): {whole} vs \
+             {run_footprint}"
+        );
+    }
+
+    // ── M12 fix 2: memory-backoff helpers ────────────────────────────────
+
+    #[test]
+    fn test_is_resources_exhausted_matches_pool_failures_only() {
+        // the exact prod shape: a DataFusion pool failure wrapped in the
+        // builder's per-stream/per-hour anyhow context chain
+        let pool = datafusion::error::DataFusionError::ResourcesExhausted(
+            "Failed to allocate additional 122.8 MB for ExternalSorter[0] with 0.0 B already \
+             allocated for this reservation - 13.8 MB remain available for the total pool"
+                .to_string(),
+        );
+        let wrapped = anyhow::Error::new(pool)
+            .context("o/logs/aws_vpc_flow_logs: build L0 .vix for hour 1787054400000000");
+        assert!(is_resources_exhausted(&wrapped));
+
+        // non-memory failures must NOT trigger the halving retry
+        assert!(!is_resources_exhausted(&anyhow!("storage PUT failed: 503")));
+        assert!(!is_resources_exhausted(&anyhow::Error::new(
+            datafusion::error::DataFusionError::Execution("plan error".to_string())
+        )));
+    }
+
+    #[test]
+    fn test_halve_for_retry_converges_and_releases_the_tail() {
+        let mut claim: Vec<SegmentMeta> = (1..=160).map(|i| seg_meta(i, "n", i)).collect();
+        let mut sizes = vec![claim.len()];
+        let mut released_total = 0usize;
+        while claim.len() > 1 {
+            let dropped = halve_for_retry(&mut claim);
+            // the dropped set is exactly the tail beyond the kept half
+            assert_eq!(dropped.len() + claim.len(), sizes[sizes.len() - 1]);
+            assert_eq!(dropped[0], claim.last().unwrap().id + 1);
+            released_total += dropped.len();
+            sizes.push(claim.len());
+        }
+        assert_eq!(sizes, vec![160, 80, 40, 20, 10, 5, 2, 1], "log2 convergence");
+        assert_eq!(released_total, 159, "everything not kept was released");
+        assert_eq!(claim[0].id, 1, "the floor attempt still holds a segment");
+        // the floor never halves to zero
+        let dropped = halve_for_retry(&mut claim);
+        assert!(dropped.is_empty());
+        assert_eq!(claim.len(), 1);
+    }
+
+    // ── M13 aging lane ────────────────────────────────────────────────────
+
+    /// Engagement is a pure age comparison — engages exactly at the
+    /// threshold, disengages below it, and 0 disables the lane entirely.
+    #[test]
+    fn test_age_lane_engaged_by_oldest_age_only() {
+        let now = 1_700_000_000_000_000i64;
+        let lane = 21_600u64; // 6h
+        let old = now - 21_600 * 1_000_000; // exactly the threshold
+        assert!(age_lane_engaged(old, now, lane), "at-threshold engages");
+        assert!(age_lane_engaged(old - 1, now, lane), "older engages");
+        assert!(
+            !age_lane_engaged(old + 1_000_000, now, lane),
+            "younger than the threshold stays disengaged"
+        );
+        assert!(!age_lane_engaged(old, now, 0), "lane_secs=0 disables");
+        assert!(
+            !age_lane_engaged(0, now, lane),
+            "no claimable rows (oldest=0) never engages"
+        );
+    }
+
+    /// The fixed-point cadence: ratio 0.25 fires every 4th engaged pass
+    /// exactly, 1.0 every pass, 0 never — and non-reciprocal ratios keep
+    /// the exact long-run rate.
+    #[test]
+    fn test_age_lane_fire_cadence() {
+        let acc = AtomicU64::new(0);
+        let fired: Vec<bool> = (0..12).map(|_| age_lane_fire(&acc, 0.25)).collect();
+        assert_eq!(
+            fired,
+            vec![
+                false, false, false, true, false, false, false, true, false, false, false, true
+            ],
+            "0.25 = every 4th engaged pass"
+        );
+
+        let acc = AtomicU64::new(0);
+        assert!((0..5).all(|_| age_lane_fire(&acc, 1.0)), "1.0 = every pass");
+
+        let acc = AtomicU64::new(0);
+        assert!((0..5).all(|_| !age_lane_fire(&acc, 0.0)), "0 never fires");
+
+        // long-run exactness for a non-reciprocal ratio: 0.3 fires 30/100
+        let acc = AtomicU64::new(0);
+        let fires = (0..100).filter(|_| age_lane_fire(&acc, 0.3)).count();
+        assert_eq!(fires, 30);
+    }
+
+    /// STARVATION REGRESSION (the M13 pin): an aged backlog at BALANCED
+    /// capacity — every round adds exactly as many fresh segments as one
+    /// claim takes — is never drained by newest-first claiming (the prod
+    /// 2026-08-18/19 shape: oldest cohort pending 15+ hours while the S3
+    /// lifecycle walked toward its raw objects). With the aging lane at
+    /// ratio 0.25 the oldest cohort is fully claimed within
+    /// `cohort/batch * 4` rounds.
+    #[tokio::test]
+    async fn test_age_lane_starvation_regression() {
+        let _guard = setup().await;
+        // drain foreign claimable rows so ordering is deterministic (they
+        // stay leased under a long lease for the whole test)
+        wal_segments::claim_pending("m13-lane-drain", 100_000, 3600)
+            .await
+            .unwrap();
+
+        let old_node = unique_node("lane-old");
+        let mut old_ids = Vec::new();
+        for seq in 1..=8 {
+            old_ids.push(
+                wal_segments::add(&pending_seg(&old_node, seq))
+                    .await
+                    .unwrap(),
+            );
+        }
+        let old_created: i64 = wal_segments::get_by_ids(&old_ids).await.unwrap()[0].created_at;
+        // engagement clock: the cohort is 7h old against a 6h lane
+        let now = old_created + 7 * 3_600 * 1_000_000;
+        let lane_secs = 21_600u64;
+
+        let fresh_node = unique_node("lane-fresh");
+        async fn add_fresh(node: &str, seq: &mut i64, n: usize) {
+            for _ in 0..n {
+                *seq += 1;
+                wal_segments::add(&pending_seg(node, *seq)).await.unwrap();
+            }
+        }
+        let mut fresh_seq = 0i64;
+
+        // CONTROL: lane disabled — 16 balanced rounds never touch the old
+        // cohort (this is the structural hole, asserted)
+        for _ in 0..16 {
+            add_fresh(&fresh_node, &mut fresh_seq, 4).await;
+            let claimed =
+                wal_segments::claim_pending_with_floor("ctl", 4, 1, 3600, ClaimOrder::NewestFirst)
+                    .await
+                    .unwrap();
+            assert_eq!(claimed.len(), 4);
+            assert!(
+                claimed.iter().all(|m| m.node_uuid == fresh_node),
+                "newest-first under balanced arrivals must only ever claim fresh rows"
+            );
+            let ids: Vec<i64> = claimed.iter().map(|m| m.id).collect();
+            assert_eq!(wal_segments::mark_built(&ids, "ctl").await.unwrap(), 4);
+        }
+        for meta in wal_segments::get_by_ids(&old_ids).await.unwrap() {
+            assert_eq!(
+                meta.status,
+                SegmentStatus::Pending,
+                "control: the oldest cohort starves under pure newest-first"
+            );
+        }
+
+        // LANE: same balanced rounds, the REAL decision helpers at ratio
+        // 0.25 — rounds 4 and 8 fire oldest-first and drain the cohort
+        let acc = AtomicU64::new(0);
+        let mut cohort_done_round = None;
+        for round in 1..=16 {
+            add_fresh(&fresh_node, &mut fresh_seq, 4).await;
+            let (_, oldest_created_at, _) = wal_segments::claimable_stats(3600).await.unwrap();
+            let order = if age_lane_engaged(oldest_created_at, now, lane_secs)
+                && age_lane_fire(&acc, 0.25)
+            {
+                ClaimOrder::OldestFirst
+            } else {
+                ClaimOrder::NewestFirst
+            };
+            let claimed = wal_segments::claim_pending_with_floor("lane", 4, 1, 3600, order)
+                .await
+                .unwrap();
+            assert_eq!(claimed.len(), 4);
+            let ids: Vec<i64> = claimed.iter().map(|m| m.id).collect();
+            assert_eq!(wal_segments::mark_built(&ids, "lane").await.unwrap(), 4);
+            let built_old = wal_segments::get_by_ids(&old_ids)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|m| m.status == SegmentStatus::Built)
+                .count();
+            if round < 4 {
+                assert_eq!(built_old, 0, "the lane must not fire before its cadence");
+            }
+            if built_old == old_ids.len() && cohort_done_round.is_none() {
+                cohort_done_round = Some(round);
+            }
+        }
+        assert_eq!(
+            cohort_done_round,
+            Some(8),
+            "8-segment cohort at batch 4 / ratio 0.25 drains on the 2nd fire (round 8)"
+        );
+
+        // leave no Pending leftovers for other tests: claim + build the tail
+        loop {
+            let rest = wal_segments::claim_pending("m13-lane-sweep", 10_000, 3600)
+                .await
+                .unwrap();
+            let mine: Vec<i64> = rest
+                .iter()
+                .filter(|m| m.node_uuid == fresh_node || m.node_uuid == old_node)
+                .map(|m| m.id)
+                .collect();
+            if mine.is_empty() {
+                break;
+            }
+            wal_segments::mark_built(&mine, "m13-lane-sweep")
+                .await
+                .unwrap();
+        }
+    }
+
+    // ── M13 (1b) backlog-mode super-batch sealing ─────────────────────────
+
+    /// The empty-claim policy matrix: claimable work = bounded immediate
+    /// retries (work-bounded accumulation); no claimable work = the exact
+    /// pre-M13 trickle pacing (one wait, two-empty-ticks seal, age-clock
+    /// seal) — and the clock caps only WAITING, never a flowing claim.
+    #[test]
+    fn test_on_empty_extension_claim_policy_matrix() {
+        use std::time::Duration;
+
+        // racing losses: claimable work retries immediately, bounded
+        let (mut retries, mut ticks) = (0u32, 0u32);
+        for expect_retry in 1..=EMPTY_CLAIM_RACE_RETRIES {
+            assert_eq!(
+                on_empty_extension_claim(
+                    true,
+                    &mut retries,
+                    &mut ticks,
+                    Duration::from_secs(0),
+                    120
+                ),
+                EmptyClaimAction::RetryNow
+            );
+            assert_eq!((retries, ticks), (expect_retry, 0), "no tick on a race retry");
+        }
+        // retries exhausted: even with claimable work, fall to the gap path
+        assert_eq!(
+            on_empty_extension_claim(true, &mut retries, &mut ticks, Duration::from_secs(0), 120),
+            EmptyClaimAction::Wait
+        );
+        assert_eq!(ticks, 1);
+
+        // true trickle (nothing claimable): first gap waits, second seals
+        let (mut retries, mut ticks) = (0u32, 0u32);
+        assert_eq!(
+            on_empty_extension_claim(false, &mut retries, &mut ticks, Duration::from_secs(1), 120),
+            EmptyClaimAction::Wait
+        );
+        assert_eq!(
+            on_empty_extension_claim(false, &mut retries, &mut ticks, Duration::from_secs(6), 120),
+            EmptyClaimAction::Seal,
+            "two consecutive empty ticks seal (traffic stopped)"
+        );
+
+        // the age clock seals a WAITING accumulation...
+        let (mut retries, mut ticks) = (0u32, 0u32);
+        assert_eq!(
+            on_empty_extension_claim(
+                false,
+                &mut retries,
+                &mut ticks,
+                Duration::from_secs(120),
+                120
+            ),
+            EmptyClaimAction::Seal
+        );
+        assert_eq!(ticks, 0, "clock seal is not an empty tick");
+        // ...but a claimable-work retry outranks the clock: flowing
+        // accumulations are bounded by work, not time
+        let (mut retries, mut ticks) = (0u32, 0u32);
+        assert_eq!(
+            on_empty_extension_claim(
+                true,
+                &mut retries,
+                &mut ticks,
+                Duration::from_secs(999),
+                120
+            ),
+            EmptyClaimAction::RetryNow
+        );
+    }
+
+    /// DEEP-BACKLOG SEAL-BY-SIZE (the M13 1b pin): with a table full of
+    /// claimable work, accumulation runs claim-after-claim to the byte
+    /// budget and seals immediately — no wait-induced gaps (any single
+    /// arrival-gap sleep would cost BUILDER_TICK_SECS = 5s; the whole
+    /// accumulation must finish far under that), and the cycle is bounded
+    /// by WORK, not by the age clock (prod 2026-08-18/19: wait-paced
+    /// accumulation held builders at 5-8 super-batch cycles/15min under a
+    /// 72k backlog).
+    #[tokio::test]
+    async fn test_super_batch_deep_backlog_seals_by_size_without_waits() {
+        let _guard = setup().await;
+        // drain foreign claimable rows (kept leased for the whole test)
+        wal_segments::claim_pending("m13-sb-drain", 100_000, 3600)
+            .await
+            .unwrap();
+
+        let node = unique_node("sb-deep");
+        for seq in 1..=20 {
+            wal_segments::add(&pending_seg(&node, seq)).await.unwrap();
+        }
+
+        // initial full batch of 4 (pending_seg.size = 1024)
+        let mut claim =
+            wal_segments::claim_pending_with_floor("sb-builder", 4, 4, 3600, ClaimOrder::NewestFirst)
+                .await
+                .unwrap();
+        assert_eq!(claim.len(), 4);
+        let mut guards = Vec::new();
+        let started = std::time::Instant::now();
+        let total = accumulate_super_batch(
+            &mut claim,
+            &mut guards,
+            "sb-builder",
+            4,
+            3600,
+            ClaimOrder::NewestFirst,
+            16 * 1024, // budget: 16 segments' worth
+            120,
+        )
+        .await;
+        let wall = started.elapsed();
+        assert_eq!(total, 16 * 1024, "seals exactly at the byte budget");
+        assert_eq!(claim.len(), 16, "12 extension segments over 3 claims");
+        assert_eq!(guards.len(), 3, "every extension claim is heartbeat-guarded");
+        assert!(
+            wall < Duration::from_secs(BUILDER_TICK_SECS),
+            "deep-backlog accumulation must never sleep (took {wall:?})"
+        );
+        for m in &claim {
+            assert_eq!(m.status, SegmentStatus::Building);
+            assert_eq!(m.builder_node, "sb-builder");
+        }
+
+        // hygiene: build everything claimed + the 4 leftovers
+        let ids: Vec<i64> = claim.iter().map(|m| m.id).collect();
+        assert_eq!(
+            wal_segments::mark_built(&ids, "sb-builder").await.unwrap(),
+            16
+        );
+        let rest = wal_segments::claim_pending("m13-sb-sweep", 10_000, 3600)
+            .await
+            .unwrap();
+        let mine: Vec<i64> = rest
+            .iter()
+            .filter(|m| m.node_uuid == node)
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(mine.len(), 4);
+        wal_segments::mark_built(&mine, "m13-sb-sweep").await.unwrap();
     }
 
     // ── contiguous runs + deterministic keys ─────────────────────────────
@@ -1944,6 +3348,83 @@ mod tests {
         )
     }
 
+    /// M29: a claimed segment whose object GET returns NotFound (the
+    /// lifecycle-expired kill-era zombie shape) is terminally resolved by
+    /// `process_claim` — the row flips Built with no files and never comes
+    /// back through a claim, instead of the old claim -> 404 -> lease-expiry
+    /// -> re-claim loop (prod 2026-08-24: 189.7k such rows, 722k 404-skip
+    /// ERROR lines/30m, every claim batch diluted to 1-2 real segments).
+    #[tokio::test]
+    async fn test_m29_gone_object_claims_are_tombstoned_not_retried() {
+        let _guard = setup().await;
+        let writer = unique_node("m29gone");
+        let org = unique_node("m29gorg");
+        // seq 1: a REAL segment object; seqs 2 and 3: rows registered but
+        // objects gone (the lifecycle-expired kill-era shape) — the MIXED
+        // batch is the prod shape ("in=64 built=1 skipped=63")
+        put_segment_object(&writer, 1, &org).await;
+        let id_real = wal_segments::add(&pending_seg(&writer, 1)).await.unwrap();
+        let id_gone1 = wal_segments::add(&pending_seg(&writer, 2)).await.unwrap();
+        let id_gone2 = wal_segments::add(&pending_seg(&writer, 3)).await.unwrap();
+
+        let node = unique_node("m29-builder");
+        let claim = wal_segments::claim_pending(&node, 10_000, 3600)
+            .await
+            .unwrap();
+        let mine: Vec<SegmentMeta> = claim
+            .iter()
+            .filter(|m| m.node_uuid == writer)
+            .cloned()
+            .collect();
+        assert_eq!(mine.len(), 3, "all three rows must be claimable once");
+        let strangers: Vec<i64> = claim
+            .iter()
+            .filter(|m| m.node_uuid != writer)
+            .map(|m| m.id)
+            .collect();
+        if !strangers.is_empty() {
+            wal_segments::release_claims(&strangers, &node).await.unwrap();
+        }
+
+        // the REAL batch path: 404s tombstone, the real segment still builds
+        // and COMMITS (the plan fence must not count tombstoned rows — a
+        // mixed batch used to read as a lost lease and discard the build)
+        let stats = process_claim(&mine, &node).await.expect("batch succeeds");
+        assert_eq!(stats.gone, 2, "both gone rows terminally resolved");
+        assert_eq!(stats.skipped, 0, "a gone object is not a transient skip");
+        assert_eq!(stats.built, 1, "the real segment still builds");
+        assert_eq!(stats.flipped, 1, "the real build must COMMIT despite tombstoned batchmates");
+        assert!(stats.files >= 1, "the real segment's L0 file registers");
+
+        // even with every lease expired (timeout 0) none are reclaimable:
+        // gone rows are tombstoned, the real one is Built
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let thief = unique_node("m29-thief");
+        let reclaim = wal_segments::claim_pending(&thief, 10_000, 0).await.unwrap();
+        assert!(
+            !reclaim
+                .iter()
+                .any(|m| m.id == id_real || m.id == id_gone1 || m.id == id_gone2),
+            "tombstoned rows must never re-enter the claim/retry loop"
+        );
+        if !reclaim.is_empty() {
+            let ids: Vec<i64> = reclaim.iter().map(|m| m.id).collect();
+            wal_segments::release_claims(&ids, &thief).await.unwrap();
+        }
+
+        // the normal sweeper sees the tombstones as expired Built rows
+        let expired = wal_segments::list_expired(0, 100_000).await.unwrap();
+        for id in [id_gone1, id_gone2] {
+            assert!(
+                expired.iter().any(|m| m.id == id),
+                "tombstoned row {id} must reach the sweeper's Built-expired set"
+            );
+        }
+        wal_segments::delete(&[id_real, id_gone1, id_gone2])
+            .await
+            .unwrap();
+    }
+
     /// claim → build → lease stolen by a second node → the loser's fenced
     /// `mark_built_with_files` rolls back WHOLE: zero flips AND zero file
     /// rows registered; the winner then commits the identical keys with
@@ -2153,7 +3634,7 @@ mod tests {
             assert!(file.meta.compressed_size > 0);
             assert!(
                 file.meta.index_size > 0,
-                "L0 .vix must embed its inverted index: {}",
+                "an indexed L0 build must upload its .vxi sidecar (index_size = its size): {}",
                 file.key
             );
             // the object was really uploaded, byte length matches the meta
@@ -2166,6 +3647,13 @@ mod tests {
                 "{}",
                 file.key
             );
+            // v3 split: the sidecar uploaded too, with index_size = its
+            // exact object length
+            let sidecar_key = config::vix_sidecar_key(&file.key).expect("L0 keys are .vix");
+            let sidecar = storage::get_bytes(&file.account, &sidecar_key)
+                .await
+                .unwrap_or_else(|e| panic!("uploaded sidecar {sidecar_key} must exist: {e}"));
+            assert_eq!(sidecar.len() as i64, file.meta.index_size, "{sidecar_key}");
         }
     }
 
@@ -2375,8 +3863,17 @@ mod tests {
                 ..seg_meta(13, &writer, 3)
             },
         ];
-        let (decoded, skipped) = fetch_and_decode(&claim).await;
-        assert_eq!(skipped, vec![12, 13], "bad + missing must be skipped");
+        let (decoded, skipped, gone) = fetch_and_decode(&claim).await;
+        assert_eq!(
+            skipped,
+            vec![12],
+            "a garbage object is a transient skip (lease retry)"
+        );
+        assert_eq!(
+            gone,
+            vec![13],
+            "a MISSING object (404) is terminal — M29 tombstone class"
+        );
         assert_eq!(decoded.len(), 1);
         let (id, frames) = &decoded[0];
         assert_eq!(*id, 11);
@@ -2425,8 +3922,9 @@ mod tests {
             object_key: evil_key,
             ..seg_meta(14, &writer, 4)
         }];
-        let (decoded, skipped) = fetch_and_decode(&claim).await;
+        let (decoded, skipped, gone) = fetch_and_decode(&claim).await;
         assert!(decoded.is_empty());
         assert_eq!(skipped, vec![14]);
+        assert!(gone.is_empty(), "an unsafe identity is not a 404");
     }
 }

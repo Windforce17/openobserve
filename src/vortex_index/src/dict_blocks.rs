@@ -104,8 +104,59 @@ pub(crate) fn read_two_varints(data: &[u8], pos: &mut usize) -> Result<(usize, u
     Ok((shared, suffix_len))
 }
 
+/// Length of the common prefix of `a` and `b`, compared a word at a time:
+/// XOR of 8-byte chunks + trailing_zeros locates the first differing byte
+/// without a per-byte loop (dict keys are field-major composites, so runs
+/// of long shared prefixes are the common case — the encoder calls this
+/// once per key). The compiler widens the chunk loop further under AVX2.
 fn shared_prefix_len(a: &[u8], b: &[u8]) -> usize {
-    a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
+    let n = a.len().min(b.len());
+    let mut i = 0;
+    while i + 8 <= n {
+        let x = u64::from_le_bytes(a[i..i + 8].try_into().unwrap())
+            ^ u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
+        if x != 0 {
+            return i + (x.trailing_zeros() as usize) / 8;
+        }
+        i += 8;
+    }
+    while i < n && a[i] == b[i] {
+        i += 1;
+    }
+    i
+}
+
+#[cfg(test)]
+mod prefix_tests {
+    use super::shared_prefix_len;
+
+    #[test]
+    fn word_at_a_time_matches_bytewise() {
+        let bytewise =
+            |a: &[u8], b: &[u8]| a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count();
+        let cases: Vec<(Vec<u8>, Vec<u8>)> = vec![
+            (b"".to_vec(), b"".to_vec()),
+            (b"a".to_vec(), b"".to_vec()),
+            (b"abc".to_vec(), b"abc".to_vec()),
+            (b"abcdefgh".to_vec(), b"abcdefgh".to_vec()),
+            (b"abcdefghX".to_vec(), b"abcdefghY".to_vec()),
+            (b"abcdefgXijklmnop".to_vec(), b"abcdefgYijklmnop".to_vec()),
+            (vec![0xFF; 1000], {
+                let mut v = vec![0xFF; 1000];
+                v[777] = 0;
+                v
+            }),
+            (vec![7; 64], vec![7; 63]),
+        ];
+        for (a, b) in &cases {
+            assert_eq!(shared_prefix_len(a, b), bytewise(a, b), "a={a:?} b={b:?}");
+            assert_eq!(
+                shared_prefix_len(b, a),
+                bytewise(b, a),
+                "swapped a={a:?} b={b:?}"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

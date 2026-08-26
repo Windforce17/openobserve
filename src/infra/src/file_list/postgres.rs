@@ -398,6 +398,25 @@ SELECT min_ts, max_ts, records, original_size, compressed_size, index_size, bloo
         Ok(())
     }
 
+    async fn update_index_size_for_heal(&self, file: &str, index_size: i64) -> Result<()> {
+        let pool = CLIENT.clone();
+        let (stream_key, date_key, file_name) =
+            parse_file_key_columns(file).map_err(|e| Error::Message(e.to_string()))?;
+        DB_QUERY_NUMS
+            .with_label_values(&["update", "file_list"])
+            .inc();
+        sqlx::query(
+            r#"UPDATE file_list SET index_size = $1, bloom_ver = 0 WHERE stream = $2 AND date = $3 AND file = $4;"#,
+        )
+        .bind(index_size)
+        .bind(stream_key)
+        .bind(date_key)
+        .bind(file_name)
+        .execute(&pool)
+        .await?;
+        Ok(())
+    }
+
     async fn update_bloom_ver(&self, ids: &[i64], bloom_ver: i64) -> Result<()> {
         if ids.is_empty() {
             return Ok(());
@@ -1385,8 +1404,8 @@ DO UPDATE SET
         fast_mode: bool,
         min_offsets: i64,
     ) -> Result<Vec<super::MergeJobRecord>> {
-        // quick check without the advisory lock, if there are no pending jobs we can skip the
-        // locked transaction.
+        // quick check on the RO pool: with nothing pending, skip the write
+        // statement entirely (the common idle-tick case fleet-wide).
         let pool = CLIENT_RO.clone();
         let has_pending = sqlx::query(
             "SELECT id FROM file_list_jobs WHERE status = $1 AND offsets >= $2 LIMIT 1;",
@@ -1399,108 +1418,51 @@ DO UPDATE SET
             return Ok(Vec::new());
         }
 
-        let pool = CLIENT.clone();
-        let mut tx = pool.begin().await?;
-        let lock_key = "file_list_jobs:get_pending_jobs";
-        let lock_id = config::utils::hash::gxhash::new().sum64(lock_key);
-        let lock_id = if lock_id > (i64::MAX as u64) {
-            (lock_id >> 1) as i64
-        } else {
-            lock_id as i64
-        };
-        let lock_sql = format!("SELECT pg_advisory_xact_lock({lock_id})");
-        DB_QUERY_NUMS.with_label_values(&["get_lock", ""]).inc();
-        if let Err(e) = sqlx::query(&lock_sql).execute(&mut *tx).await {
-            if let Err(e) = tx.rollback().await {
-                log::error!("[POSTGRES] rollback get_pending_jobs error: {e}");
-            }
-            return Err(e.into());
-        }
-
-        DB_QUERY_NUMS
-            .with_label_values(&["select", "file_list_jobs"])
-            .inc();
-
-        // Claim the OLDEST pending jobs regardless of stream. The old
-        // normal-mode claim (GROUP BY stream, max(id), ORDER BY count) took
-        // ONE job per stream per pull and NEWEST first — a single hot stream
-        // (traces) fed the fleet one hour-job per pull cycle while a backlog's
-        // old hours starved behind fresh ones. Hour-jobs of one stream are
-        // independent (distinct hour partitions; single-node already runs
-        // several concurrently), so cross-node fan-out is safe; the advisory
-        // lock still serializes claiming itself.
-        let sql = if fast_mode {
-            r#"SELECT stream, id, 0::BIGINT AS num FROM file_list_jobs WHERE status = $1 AND offsets >= $2 ORDER BY offsets DESC LIMIT $3;"#
-        } else {
-            r#"SELECT stream, id, 0::BIGINT AS num FROM file_list_jobs WHERE status = $1 AND offsets >= $2 ORDER BY id ASC LIMIT $3;"#
-        };
-        let ret = match sqlx::query_as::<_, super::MergeJobPendingRecord>(sql)
-            .bind(super::FileListJobStatus::Pending)
-            .bind(min_offsets)
-            .bind(limit)
-            .fetch_all(&mut *tx)
-            .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                if let Err(e) = tx.rollback().await {
-                    log::error!("[POSTGRES] rollback get_pending_jobs for update error: {e}");
-                }
-                return Err(e.into());
-            }
-        };
-        // update jobs status to running
-        let ids = ret.iter().map(|r| r.id.to_string()).collect::<Vec<_>>();
-        if ids.is_empty() {
-            if let Err(e) = tx.rollback().await {
-                log::error!("[POSTGRES] rollback get_pending_jobs error: {e}");
-            }
-            return Ok(Vec::new());
-        }
+        // One autocommit statement claims and returns the batch. Racing
+        // claimers partition the pending rows via FOR UPDATE SKIP LOCKED —
+        // no global advisory lock, no multi-statement transaction, and
+        // therefore NO idle-in-transaction window a dying pod can freeze
+        // the whole fleet's claiming on (the 2026-08-13 incident: every
+        // compactor roll wedged the old pg_advisory_xact_lock for up to
+        // ~30 min behind killed holders, 47 waiters parked on prod).
+        //
+        // Claim the OLDEST pending jobs regardless of stream (id ASC): the
+        // old normal-mode claim (GROUP BY stream, newest first) let one hot
+        // stream starve a backlog's old hours. fast_mode keeps freshest-
+        // first (offsets DESC) for recent-window recovery.
+        let order = if fast_mode { "offsets DESC" } else { "id ASC" };
         let sql = format!(
-            "UPDATE file_list_jobs SET status = $1, node = $2, started_at = $3, updated_at = $4 WHERE id IN ({});",
-            ids.join(",")
+            r#"UPDATE file_list_jobs
+SET status = $1, node = $2, started_at = $3, updated_at = $3
+WHERE id IN (
+    SELECT id FROM file_list_jobs
+    WHERE status = $4 AND offsets >= $5
+    ORDER BY {order}
+    LIMIT $6
+    FOR UPDATE SKIP LOCKED
+)
+RETURNING *;"#
         );
-        let now = config::utils::time::now_micros();
+        let pool = CLIENT.clone();
         DB_QUERY_NUMS
             .with_label_values(&["update", "file_list_jobs"])
             .inc();
-        if let Err(e) = sqlx::query(&sql)
+        let now = config::utils::time::now_micros();
+        let mut ret = sqlx::query_as::<_, super::MergeJobRecord>(&sql)
             .bind(super::FileListJobStatus::Running)
             .bind(node)
             .bind(now)
-            .bind(now)
-            .execute(&mut *tx)
-            .await
-        {
-            if let Err(e) = tx.rollback().await {
-                log::error!("[POSTGRES] rollback update file_list_jobs status error: {e}");
-            }
-            return Err(e.into());
-        }
-        // get jobs by ids
-        DB_QUERY_NUMS
-            .with_label_values(&["select", "file_list_jobs"])
-            .inc();
-        let sql = format!(
-            "SELECT * FROM file_list_jobs WHERE id IN ({});",
-            ids.join(",")
-        );
-        let ret = match sqlx::query_as::<_, super::MergeJobRecord>(&sql)
-            .fetch_all(&mut *tx)
-            .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                if let Err(e) = tx.rollback().await {
-                    log::error!("[POSTGRES] rollback get_pending_jobs by ids error: {e}");
-                }
-                return Err(e.into());
-            }
-        };
-        if let Err(e) = tx.commit().await {
-            log::error!("[POSTGRES] commit for get_pending_jobs error: {e}");
-            return Err(e.into());
+            .bind(super::FileListJobStatus::Pending)
+            .bind(min_offsets)
+            .bind(limit)
+            .fetch_all(&pool)
+            .await?;
+        // RETURNING order is unspecified — restore the claim policy's order
+        // client-side (the subquery ORDER BY only governs which rows win).
+        if fast_mode {
+            ret.sort_unstable_by_key(|r| std::cmp::Reverse(r.offsets));
+        } else {
+            ret.sort_unstable_by_key(|r| r.id);
         }
         Ok(ret)
     }
@@ -3714,6 +3676,83 @@ mod tests {
             std::mem::size_of_val(&default_list),
             std::mem::size_of_val(&new_list)
         );
+    }
+
+    /// #50: the SKIP LOCKED single-statement claim — racing claimers must
+    /// partition the pending pool (no double-claims, no global lock), the
+    /// claim must be oldest-first (id ASC) in normal mode and freshest-
+    /// first (offsets DESC) in fast mode, and RETURNING must yield usable
+    /// rows. Runs against REAL postgres (the .93 lesson: sqlite-only suites
+    /// let a pg-only decode bug ship a fleet-wide regression).
+    #[tokio::test]
+    #[ignore = "Requires test PostgreSQL database setup"]
+    async fn pg_get_pending_jobs_skip_locked_claims() {
+        let pool = setup_test_db().await;
+        cleanup_test_data(&pool).await;
+
+        let list = PostgresFileList::new();
+        // rows inserted directly: the claim is under test, not add_job (whose
+        // ON CONFLICT arm needs the prod unique index this harness omits)
+        for (i, name) in ["s1", "s2", "s3", "s4", "s5"].iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO file_list_jobs (org, stream, offsets, status, node, started_at, updated_at) \
+                 VALUES ('org', $1, $2, 0, '', 0, 0);",
+            )
+            .bind(format!("org/logs/{name}"))
+            .bind(1_000 + i as i64)
+            .execute(&pool)
+            .await
+            .expect("insert job");
+        }
+
+        // two racing claimers, all-in-one statement each
+        let (a, b) = tokio::join!(
+            list.get_pending_jobs("node-a", 3, false, 0),
+            list.get_pending_jobs("node-b", 3, false, 0),
+        );
+        let a = a.expect("claim a");
+        let b = b.expect("claim b");
+        assert_eq!(
+            a.len() + b.len(),
+            5,
+            "every pending row claimed exactly once"
+        );
+        let mut ids: Vec<i64> = a.iter().chain(b.iter()).map(|r| r.id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 5, "no double-claims across racing claimers");
+        // oldest-first within each claim (id ASC)
+        for claim in [&a, &b] {
+            assert!(claim.windows(2).all(|w| w[0].id < w[1].id));
+        }
+        // rows are Running and owned after the claim
+        let (running,): (i64,) =
+            sqlx::query_as("SELECT count(*) FROM file_list_jobs WHERE status = 1 AND node <> '';")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(running, 5);
+
+        // nothing left → the RO quick-check path returns empty
+        assert!(
+            list.get_pending_jobs("node-c", 3, false, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // fast_mode claims freshest-first (offsets DESC)
+        sqlx::query("UPDATE file_list_jobs SET status = 0, node = '';")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let fast = list
+            .get_pending_jobs("node-f", 5, true, 0)
+            .await
+            .expect("fast claim");
+        assert_eq!(fast.len(), 5);
+        assert!(fast.windows(2).all(|w| w[0].offsets >= w[1].offsets));
+        cleanup_test_data(&pool).await;
     }
 
     #[tokio::test]

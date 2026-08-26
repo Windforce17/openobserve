@@ -126,7 +126,6 @@ fn dataset_batch(
 fn dataset_options() -> VixWriterOptions {
     VixWriterOptions {
         fts_field_names: vec!["log".to_string()],
-        column_store_field_names: vec!["svc".to_string(), "code".to_string()],
         row_group_size: 128,
         ..Default::default()
     }
@@ -134,11 +133,12 @@ fn dataset_options() -> VixWriterOptions {
 
 /// Build the 10-doc dataset with the given options and open a reader on it.
 fn build_dataset(opts: VixWriterOptions) -> VixReader {
-    VixReader::open(Bytes::from(build_dataset_bytes(opts))).unwrap()
+    let (data, index) = build_dataset_bytes(opts);
+    open_built(data, index)
 }
 
-/// Build the 10-doc dataset and return the raw `.vix` bytes.
-fn build_dataset_bytes(opts: VixWriterOptions) -> Vec<u8> {
+/// Build the 10-doc dataset and return the raw `(data, sidecar)` bytes.
+fn build_dataset_bytes(opts: VixWriterOptions) -> (Vec<u8>, Option<Vec<u8>>) {
     let schema = dataset_schema();
     let mut writer = VixWriter::new(&schema, opts, false);
     writer
@@ -204,6 +204,18 @@ fn eval_set(reader: &VixReader, query: &VixQuery) -> BTreeSet<u32> {
     bits_to_set(&bits)
 }
 
+/// Open a `(data, sidecar)` pair as one reader — the standard two-source
+/// in-memory open every finished build round-trips through (v3 split).
+fn open_built(data: Vec<u8>, index: Option<Vec<u8>>) -> VixReader {
+    VixReader::open_with_index(Bytes::from(data), index.map(Bytes::from)).unwrap()
+}
+
+/// Finish a writer into its two byte streams and open them as one reader.
+fn finish_open(writer: VixWriter) -> VixReader {
+    let (data, index) = writer.finish().unwrap();
+    open_built(data, index)
+}
+
 #[test]
 fn roundtrip_metadata_and_fields() {
     let reader = build_dataset(dataset_options());
@@ -235,11 +247,12 @@ fn roundtrip_metadata_and_fields() {
     assert_eq!(reader.field_id("_timestamp"), None);
     assert_eq!(reader.field_id("_o2_id"), None);
     assert_eq!(reader.field_id("_original"), None);
-    // ... but column-store members are known fields.
+    // ... but column-store members are known fields — v2 all-columns:
+    // every schema field (the reserved `_o2_id` included) is one.
     assert!(reader.has_field("code"));
     assert!(reader.has_field("_timestamp"));
     assert!(reader.has_field("level"));
-    assert!(!reader.has_field("_o2_id"));
+    assert!(reader.has_field("_o2_id"));
     assert!(!reader.has_field("missing"));
     assert!(reader.partial_fields().is_empty());
 }
@@ -566,7 +579,7 @@ fn doc_level_dedup() {
     writer
         .push_batch_with_source(&batch, &dataset_sources(0..2), None)
         .unwrap();
-    let reader = VixReader::open(Bytes::from(writer.finish().unwrap())).unwrap();
+    let reader = finish_open(writer);
     assert_eq!(eval_set(&reader, &any_token("dup")), docs(&[0, 1]));
     // doc_count column agrees (each doc exactly once in the postings).
     assert_eq!(reader.count(&any_token("dup")).unwrap(), 2);
@@ -605,7 +618,7 @@ fn multi_row_group_scans() {
             .push_batch_with_source(&batch, &dataset_sources(first..first + chunk.len()), None)
             .unwrap();
     }
-    let reader = VixReader::open(Bytes::from(writer.finish().unwrap())).unwrap();
+    let reader = finish_open(writer);
     assert!(
         reader.term_row_group_count() > 4,
         "expected many row groups, got {}",
@@ -643,7 +656,7 @@ fn nul_byte_inside_token() {
     writer
         .push_batch_with_source(&batch, &dataset_sources(0..2), None)
         .unwrap();
-    let reader = VixReader::open(Bytes::from(writer.finish().unwrap())).unwrap();
+    let reader = finish_open(writer);
 
     let nul_exact = VixQuery::Exact {
         field: "f".to_string(),
@@ -662,8 +675,14 @@ fn nul_byte_inside_token() {
     assert_eq!(eval_set(&reader, &nul_prefix), docs(&[0]));
 }
 
+/// Owner call 2026-08-12 (performance-first): an oversize raw value is
+/// skipped from the term index WITHOUT degrading the field — the index
+/// stays authoritative, every other value keeps exact index answers, and
+/// the ACCEPTED trade is that an equality probe for the skipped literal
+/// itself silently misses its row. Skips surface only through
+/// `VixWriterStats::oversize_skipped`.
 #[test]
-fn oversize_values_are_partial() {
+fn oversize_values_skip_without_field_degrade() {
     let schema = Arc::new(Schema::new(vec![
         Field::new("_timestamp", DataType::Int64, false),
         Field::new("big", DataType::Utf8, false),
@@ -690,13 +709,96 @@ fn oversize_values_are_partial() {
     writer
         .push_batch_with_source(&batch, &dataset_sources(0..2), None)
         .unwrap();
-    let reader = VixReader::open(Bytes::from(writer.finish().unwrap())).unwrap();
-    assert!(reader.partial_fields().contains("big"));
-    assert!(!reader.partial_fields().contains("ok"));
-    // The oversize value is not findable; the short one still is.
+    let (bytes, bytes_index, stats) = writer.finish_with_stats().unwrap();
+    let reader = open_built(bytes, bytes_index);
+    // no field degrade — the whole point of the policy
+    assert!(
+        reader.partial_fields().is_empty(),
+        "oversize must not taint: {:?}",
+        reader.partial_fields()
+    );
+    // the skip is counted (observability for the accepted miss)
+    assert_eq!(stats.oversize_skipped, 1);
+    // the ACCEPTED MISS: the oversize literal finds nothing, and because
+    // the field is not partial the index answer is final (no filter-back)
     assert_eq!(eval_set(&reader, &exact("big", &long)), docs(&[]));
+    // every other value answers exactly from the index
     assert_eq!(eval_set(&reader, &exact("big", "short")), docs(&[1]));
     assert_eq!(eval_set(&reader, &exact("ok", "fine")), docs(&[0, 1]));
+}
+
+/// #32 invariant, now load-bearing for the 2026-08-12 skip-without-degrade
+/// policy: KEY terms are emitted even for the doc whose VALUE was skipped,
+/// so `IS [NOT] NULL` (KeyExists) stays EXACT despite the un-indexed value
+/// — with no partial marker, the key term is the only thing keeping
+/// presence queries correct for those rows. Covers the oversize-string
+/// cause and the oversize-numeric-canonical-text cause; neither degrades
+/// the field anymore.
+#[test]
+fn key_terms_survive_oversize_value_skips() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("_timestamp", DataType::Int64, false),
+        Field::new("big", DataType::Utf8, true),
+        Field::new("num", DataType::Int64, true),
+    ]));
+    let mut writer = VixWriter::new(
+        &schema,
+        VixWriterOptions {
+            max_raw_term_len: 8,
+            ..Default::default()
+        },
+        false,
+    );
+    let long = "x".repeat(9);
+    // rows: 0 = oversize string + oversize-canonical number,
+    //       1 = short string + null num, 2 = both null
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+            Arc::new(StringArray::from(vec![
+                Some(long.as_str()),
+                Some("ok"),
+                None,
+            ])),
+            // canonical text "123456789" is 9 bytes > max_raw_term_len 8
+            Arc::new(Int64Array::from(vec![Some(123456789), None, None])),
+        ],
+    )
+    .unwrap();
+    writer
+        .push_batch_with_source(&batch, &dataset_sources(0..3), None)
+        .unwrap();
+    let (bytes, bytes_index, stats) = writer.finish_with_stats().unwrap();
+    let reader = open_built(bytes, bytes_index);
+    assert!(
+        reader.partial_fields().is_empty(),
+        "oversize skips must not degrade any field: {:?}",
+        reader.partial_fields()
+    );
+    assert_eq!(
+        stats.oversize_skipped, 2,
+        "one oversize string + one oversize numeric canonical text"
+    );
+    // the invariant: KeyExists sees the skipped-value docs
+    let key_exists = |path: &str| VixQuery::KeyExists {
+        path: path.to_string(),
+    };
+    assert_eq!(
+        eval_set(&reader, &key_exists("big")),
+        docs(&[0, 1]),
+        "doc 0's key term must survive its skipped value"
+    );
+    assert_eq!(
+        eval_set(&reader, &key_exists("num")),
+        docs(&[0]),
+        "doc 0's numeric key term must survive its skipped canonical text"
+    );
+    // IS NULL = Not(KeyExists): exact complements
+    assert_eq!(
+        eval_set(&reader, &VixQuery::Not(Box::new(key_exists("big")))),
+        docs(&[2])
+    );
 }
 
 /// REGRESSION (live image .10, "rebuilt files lose match_all"): an fts
@@ -707,7 +809,8 @@ fn oversize_values_are_partial() {
 /// partial set sends every match_all over the file back to a whole-file
 /// scan). Both term derivations must agree byte-identically: the
 /// column-driven path (move job) and the source-driven path (compaction
-/// rebuild). Raw fields keep the oversize-skip + partial degrade.
+/// rebuild). Raw fields skip the oversize VALUE but no longer degrade the
+/// field either (owner call 2026-08-12) — the skipped literal just misses.
 #[test]
 fn fts_oversize_values_tokenize_without_partial() {
     let schema = Arc::new(Schema::new(vec![
@@ -750,29 +853,29 @@ fn fts_oversize_values_tokenize_without_partial() {
     writer
         .push_batch_with_source(&batch, &source, None)
         .unwrap();
-    let column_driven = VixReader::open(Bytes::from(writer.finish().unwrap())).unwrap();
+    let column_driven = finish_open(writer);
 
     // source-driven derivation (the compaction rebuild) over the same rows
     let mut writer = VixWriter::new(&schema, opts, false);
     writer
         .push_docs_rows(&Int64Array::from(vec![2, 1]), &[], &source, None)
         .unwrap();
-    let source_driven = VixReader::open(Bytes::from(writer.finish().unwrap())).unwrap();
+    let source_driven = finish_open(writer);
 
     for (context, reader) in [
         ("column-driven", &column_driven),
         ("source-driven", &source_driven),
     ] {
-        // the fts field never goes partial; the raw field's oversize value
-        // still degrades it (rule unchanged there)
+        // neither field goes partial: fts values tokenize regardless of
+        // length, and a raw oversize value is skipped without degrade
         assert!(
-            !reader.partial_fields().contains("body"),
-            "{context}: fts field must not be partial"
+            reader.partial_fields().is_empty(),
+            "{context}: no field may be partial, got {:?}",
+            reader.partial_fields()
         );
-        assert!(
-            reader.partial_fields().contains("tag"),
-            "{context}: raw oversize still degrades"
-        );
+        // the raw field's accepted miss + intact exact answers
+        assert_eq!(eval_set(reader, &exact("tag", &long_tag)), docs(&[]));
+        assert_eq!(eval_set(reader, &exact("tag", "small")), docs(&[1]));
         // the oversize value's tokens are present and queryable — exactly
         // what match_all('heartbeat') consumes
         assert_eq!(
@@ -873,8 +976,12 @@ fn read_column_roundtrip() {
         ]
     );
 
-    // Not in the column store.
-    assert!(reader.read_column("level").is_err());
+    // v2 all-columns: every schema field is a docs column; only truly
+    // unknown names error.
+    let level = reader.read_column("level").unwrap();
+    let level = arrow::compute::cast(&level, &DataType::Utf8).unwrap();
+    let level = level.as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(level.value(0), "info");
     assert!(reader.read_column("missing").is_err());
 }
 
@@ -916,8 +1023,8 @@ fn scale_200k_docs_50k_terms() {
             )
             .unwrap();
     }
-    let bytes = writer.finish().unwrap();
-    let reader = VixReader::open(Bytes::from(bytes)).unwrap();
+    let (bytes, bytes_index) = writer.finish().unwrap();
+    let reader = open_built(bytes, bytes_index);
     assert_eq!(reader.row_count(), TOTAL as u64);
 
     // Every doc index d has msg = term{d % 50000}: 4 hits per term.
@@ -949,7 +1056,7 @@ fn scale_200k_docs_50k_terms() {
 
 /// A puffin container whose `version` property is not the supported value —
 /// different or absent — must fail with the single clear "unsupported .vix
-/// format (version X, reader supports 2)" error, on both the reader and the
+/// format (version X, reader supports 3)" error, on both the reader and the
 /// docs-scan entry points. `version` is the format's one evolution
 /// discriminator; there is no other gate.
 #[test]
@@ -975,7 +1082,7 @@ fn unsupported_version_containers_are_rejected() {
     assert!(
         err.to_string().contains("unsupported .vix format")
             && err.to_string().contains("\"1\"")
-            && err.to_string().contains("reader supports 2"),
+            && err.to_string().contains("reader supports 3"),
         "unexpected error: {err}"
     );
     let err = crate::VixDocs::open(Bytes::from(bytes)).unwrap_err();
@@ -1013,12 +1120,13 @@ fn unsupported_version_containers_are_rejected() {
 /// covers every existing on-disk file, e.g. the benchmark data).
 #[test]
 fn extra_unknown_properties_are_ignored() {
-    let bytes = repack_with_properties(build_docs_dataset_bytes(false), |props| {
+    let (data, index) = build_docs_dataset_bytes(false);
+    let bytes = repack_with_properties(data, |props| {
         props.push(("format".to_string(), "core-v2".to_string()));
         props.push(("x-future-hint".to_string(), "whatever".to_string()));
     });
 
-    let reader = VixReader::open(Bytes::from(bytes.clone())).unwrap();
+    let reader = open_built(bytes.clone(), index.clone());
     assert_eq!(reader.row_count(), 10);
     assert_eq!(
         eval_set(&reader, &exact("level", "error")),
@@ -1037,7 +1145,8 @@ fn extra_unknown_properties_are_ignored() {
 fn unknown_blob_types_are_ignored() {
     use crate::container::{BlobHandle, build_container, parse_container};
 
-    let data = Bytes::from(build_docs_dataset_bytes(false));
+    let (data, index) = build_docs_dataset_bytes(false);
+    let data = Bytes::from(data);
     let container = parse_container(&data).unwrap();
     let properties: Vec<(String, String)> = container
         .properties
@@ -1053,19 +1162,12 @@ fn unknown_blob_types_are_ignored() {
         vec![
             // an unknown blob FIRST, so recognition cannot rely on order
             ("some-future-blob-v9", "future", b"opaque bytes".to_vec()),
-            ("o2-vix-dict-v2", "dict", blob_bytes(container.dict)),
-            (
-                "o2-vix-dictblocks-v1",
-                "dict_blocks",
-                blob_bytes(container.dict_blocks),
-            ),
-            ("o2-vix-terms-v1", "terms", blob_bytes(container.terms)),
             ("o2-vix-docs-v1", "docs", blob_bytes(container.docs)),
         ],
     )
     .unwrap();
 
-    let reader = VixReader::open(Bytes::from(bytes)).unwrap();
+    let reader = open_built(bytes, index);
     assert_eq!(
         eval_set(&reader, &exact("level", "error")),
         docs(&[1, 5, 8])
@@ -1078,7 +1180,7 @@ fn open_rejects_malformed_bytes() {
     assert!(VixReader::open(Bytes::new()).is_err());
     assert!(VixReader::open(Bytes::from_static(b"not a vix file")).is_err());
 
-    let bytes = build_dataset_bytes(dataset_options());
+    let (bytes, index) = build_dataset_bytes(dataset_options());
     // Truncation must produce an error, never a panic.
     let truncated = Bytes::from(bytes[..bytes.len() / 2].to_vec());
     assert!(VixReader::open(truncated).is_err());
@@ -1087,6 +1189,10 @@ fn open_rejects_malformed_bytes() {
     let last = corrupt.len() - 1;
     corrupt[last] ^= 0xFF;
     assert!(VixReader::open(Bytes::from(corrupt)).is_err());
+    // A truncated/corrupted SIDECAR fails the pair open the same way.
+    let index = index.expect("indexed dataset has a sidecar");
+    let cut = Bytes::from(index[..index.len() / 2].to_vec());
+    assert!(VixReader::open_with_index(Bytes::from(bytes), Some(cut)).is_err());
 }
 
 #[test]
@@ -1095,7 +1201,8 @@ fn read_column_rows_point_reads() {
     assert!(reader.has_column_store_field("svc"));
     assert!(reader.has_column_store_field("code"));
     assert!(reader.has_column_store_field("_timestamp"));
-    assert!(!reader.has_column_store_field("level"));
+    // v2 all-columns: every schema field is a docs column
+    assert!(reader.has_column_store_field("level"));
     assert!(!reader.has_column_store_field("missing"));
 
     // svc values at rows 1, 4, 8 (spanning both pushed batches)
@@ -1126,8 +1233,10 @@ fn read_column_rows_point_reads() {
     let empty = reader.read_column_rows("code", &[]).unwrap();
     assert_eq!(empty.len(), 0);
 
-    // errors: unknown / non-cs field and out-of-range row
-    assert!(reader.read_column_rows("level", &[0]).is_err());
+    // errors: unknown field and out-of-range row (v2 all-columns: every
+    // schema field, `level` included, is point-readable)
+    assert!(reader.read_column_rows("level", &[0]).is_ok());
+    assert!(reader.read_column_rows("missing", &[0]).is_err());
     assert!(reader.read_column_rows("svc", &[10]).is_err());
 }
 
@@ -1196,7 +1305,7 @@ fn dataset_originals(range: std::ops::Range<usize>) -> StringArray {
     StringArray::from_iter_values(range.map(|i| format!("orig-{i}")))
 }
 
-fn build_docs_dataset_bytes(store_original: bool) -> Vec<u8> {
+fn build_docs_dataset_bytes(store_original: bool) -> (Vec<u8>, Option<Vec<u8>>) {
     let schema = docs_dataset_schema();
     let mut writer = VixWriter::new(&schema, dataset_options(), store_original);
     let batch1 = docs_dataset_batch(
@@ -1248,7 +1357,8 @@ fn build_docs_dataset_bytes(store_original: bool) -> Vec<u8> {
 }
 
 fn build_docs_dataset(store_original: bool) -> VixReader {
-    VixReader::open(Bytes::from(build_docs_dataset_bytes(store_original))).unwrap()
+    let (data, index) = build_docs_dataset_bytes(store_original);
+    open_built(data, index)
 }
 
 fn key_exists_set(reader: &VixReader, path: &str) -> BTreeSet<u32> {
@@ -1300,60 +1410,94 @@ fn format_detection_and_metadata() {
 
 #[test]
 fn container_properties_match_spec() {
-    let bytes = build_docs_dataset_bytes(true);
+    let (bytes, index) = build_docs_dataset_bytes(true);
     let meta = puffin::reader::parse_puffin_footer_from_bytes(&bytes).unwrap();
+    let index_meta =
+        puffin::reader::parse_puffin_footer_from_bytes(index.as_deref().expect("sidecar"))
+            .unwrap();
 
+    // DATA object: data-descriptive properties only (v3 split).
     let props = &meta.properties;
-    // `version` is the format's one evolution discriminator; the retired
-    // `format` property is no longer written (readers ignore it on old
-    // files).
-    assert_eq!(props["version"], "2");
+    assert_eq!(props["version"], "3");
     assert!(!props.contains_key("format"));
     assert_eq!(props["row_count"], "10");
     assert_eq!(props["row_group_size"], "128");
-    assert_eq!(props["tokenizer"], "o2-v2");
-    assert_eq!(props["dict_layout"], "blocks");
-    assert_eq!(props["partial_fields"], "[]");
-    assert!(props["term_count"].parse::<u64>().unwrap() > 0);
+    // index-descriptive properties must NOT leak onto the data object
+    for foreign in ["tokenizer", "dict_layout", "key_layout", "term_count", "fields"] {
+        assert!(!props.contains_key(foreign), "data object carries {foreign:?}");
+    }
+    // `columns`: the docs-column field list minus `_source`/`_original` —
+    // field presence WITH per-column present-row counts (H2), readable
+    // without the sidecar. v2 all-columns: EVERY schema field is a docs
+    // column. Counts: 10 rows total; code has 2 nulls, level/log 1 each.
+    let columns: serde_json::Value = serde_json::from_str(&props["columns"]).unwrap();
+    assert_eq!(
+        columns,
+        serde_json::json!([
+            ["_timestamp", 10],
+            ["_o2_id", 10],
+            ["code", 8],
+            ["level", 9],
+            ["log", 9],
+            ["svc", 10]
+        ])
+    );
+
+    // INDEX sidecar: index-descriptive properties.
+    let index_props = &index_meta.properties;
+    assert_eq!(index_props["version"], "3");
+    assert_eq!(index_props["row_count"], "10");
+    assert_eq!(index_props["tokenizer"], "o2-v2");
+    assert_eq!(index_props["dict_layout"], "blocks");
+    assert_eq!(index_props["key_layout"], "fid_v2");
+    assert_eq!(index_props["partial_fields"], "[]");
+    assert!(index_props["term_count"].parse::<u64>().unwrap() > 0);
 
     // `fields`: value-indexed fields sorted by name (index == field id) —
     // the numeric `code` included, its canonical values are term-indexed —
     // then the stored-only entries. Key terms and `_source`/`_original` get
-    // none; the fts field carries `fts` only (tokens, no raw values).
-    let fields: serde_json::Value = serde_json::from_str(&props["fields"]).unwrap();
+    // none; the fts field carries `fts` only (tokens, no raw values). v2
+    // all-columns: every field additionally carries `cs`.
+    let fields: serde_json::Value = serde_json::from_str(&index_props["fields"]).unwrap();
     assert_eq!(
         fields,
         serde_json::json!([
             {"name": "code", "types": ["term", "cs"]},
-            {"name": "level", "types": ["term"]},
-            {"name": "log", "types": ["fts"]},
+            {"name": "level", "types": ["term", "cs"]},
+            {"name": "log", "types": ["fts", "cs"]},
             {"name": "svc", "types": ["term", "cs"]},
             {"name": "_timestamp", "types": ["cs"]},
+            {"name": "_o2_id", "types": ["cs"]},
         ])
     );
 
-    // Blob order: `docs` first (it streams into the container while the
-    // rows are pushed), the index blobs after it, clustered at the tail
-    // next to the footer. Readers locate blobs by tag/offset, never by
-    // position — files written with the historical [dict, terms, docs]
-    // order stay readable.
-    let blobs: Vec<(&str, &str)> = meta
-        .blobs
-        .iter()
-        .map(|blob| {
-            (
-                blob.blob_type.as_str(),
-                blob.properties["blob_tag"].as_str(),
-            )
-        })
-        .collect();
+    // Blob split: the data object carries ONLY `docs`; the sidecar carries
+    // the index blobs with the small, hot ones (`dict`) at the tail next
+    // to the footer. Readers locate blobs by tag/offset, never by position.
+    let tags = |meta: &puffin::PuffinMeta| -> Vec<(String, String)> {
+        meta.blobs
+            .iter()
+            .map(|blob| {
+                (
+                    blob.blob_type.clone(),
+                    blob.properties["blob_tag"].clone(),
+                )
+            })
+            .collect()
+    };
     assert_eq!(
-        blobs,
+        tags(&meta),
         vec![
-            ("o2-vix-docs-v1", "docs"),
-            ("o2-vix-dict-v2", "dict"),
-            ("o2-vix-dictblocks-v1", "dict_blocks"),
-            ("o2-vix-terms-v1", "terms"),
+            ("o2-vix-docs-v1".to_string(), "docs".to_string()),
+            ("o2-vix-stats-v1".to_string(), "stats".to_string()),
+        ]
+    );
+    assert_eq!(
+        tags(&index_meta),
+        vec![
+            ("o2-vix-terms-v1".to_string(), "terms".to_string()),
+            ("o2-vix-dictblocks-v1".to_string(), "dict_blocks".to_string()),
+            ("o2-vix-dict-v2".to_string(), "dict".to_string()),
         ]
     );
 }
@@ -1523,7 +1667,7 @@ fn dense_elision_roundtrip() {
     writer
         .push_batch_with_source(&batch, &sources, None)
         .unwrap();
-    let reader = VixReader::open(Bytes::from(writer.finish().unwrap())).unwrap();
+    let reader = finish_open(writer);
 
     // Field ids (sorted string fields): env=0, level=1.
     // Dense value term and dense key terms: postings elided to zero bytes.
@@ -1653,8 +1797,10 @@ fn docs_column_reads() {
     assert_eq!(original.value(0), "orig-3");
     assert_eq!(reader.read_docs_column_rows("svc", &[]).unwrap().len(), 0);
 
-    // Unknown / non-stored columns error.
-    assert!(reader.read_docs_column("level").is_err());
+    // v2 all-columns: `level` is a docs column too; unknown columns error.
+    let level = as_string_array(reader.read_docs_column("level").unwrap().as_ref());
+    assert_eq!(level.value(0), "info");
+    assert!(level.is_null(3));
     assert!(reader.read_docs_column("missing").is_err());
     assert!(reader.read_docs_column_rows("svc", &[10]).is_err());
 }
@@ -1674,8 +1820,9 @@ fn column_reads_route_to_docs() {
     assert_eq!(reader.read_column_rows("svc", &[]).unwrap().len(), 0);
     assert!(reader.has_column_store_field("svc"));
     assert!(reader.has_column_store_field("_timestamp"));
-    assert!(!reader.has_column_store_field("level"));
-    assert!(reader.read_column("level").is_err());
+    // v2 all-columns: `level` is a docs column like every schema field
+    assert!(reader.has_column_store_field("level"));
+    assert!(reader.read_column("level").is_ok());
     assert!(reader.read_column_rows("svc", &[10]).is_err());
 
     assert_eq!(
@@ -1725,7 +1872,7 @@ fn original_present_and_absent() {
     writer
         .push_batch_with_source(&batch2, &dataset_sources(2..4), None)
         .unwrap();
-    let reader = VixReader::open(Bytes::from(writer.finish().unwrap())).unwrap();
+    let reader = finish_open(writer);
     let original = as_string_array(reader.read_docs_column("_original").unwrap().as_ref());
     assert_eq!(original.value(0), "orig-0");
     assert_eq!(original.value(1), "orig-1");
@@ -1848,7 +1995,7 @@ fn writer_input_validation() {
     writer
         .push_batch_with_source(&batch, &sources, None)
         .unwrap();
-    let reader = VixReader::open(Bytes::from(writer.finish().unwrap())).unwrap();
+    let reader = finish_open(writer);
     assert_eq!(reader.row_count(), 2);
 }
 
@@ -1885,7 +2032,7 @@ fn field_id_overflow_to_partial_fields() {
     writer
         .push_batch_with_source(&batch, &dataset_sources(0..2), None)
         .unwrap();
-    let reader = VixReader::open(Bytes::from(writer.finish().unwrap())).unwrap();
+    let reader = finish_open(writer);
 
     // The first three fields got ids; the overflow went to partial_fields.
     assert_eq!(reader.field_id("a"), Some(0));
@@ -1933,7 +2080,6 @@ fn dotted_paths_end_to_end() {
     ]));
     let opts = VixWriterOptions {
         fts_field_names: vec!["http.status_code".to_string()],
-        column_store_field_names: vec!["http.status_code".to_string()],
         ..Default::default()
     };
     let batch = RecordBatch::try_new(
@@ -1951,7 +2097,7 @@ fn dotted_paths_end_to_end() {
     writer
         .push_batch_with_source(&batch, &dataset_sources(0..2), None)
         .unwrap();
-    let reader = VixReader::open(Bytes::from(writer.finish().unwrap())).unwrap();
+    let reader = finish_open(writer);
     // The dotted field is fts: tokens only, per-field lookups do not resolve.
     assert!(
         reader
@@ -2005,7 +2151,7 @@ fn empty_file_and_no_cs_fields() {
         Field::new("f", DataType::Utf8, true),
     ]));
     let writer = VixWriter::new(&schema, VixWriterOptions::default(), false);
-    let bytes = writer.finish().unwrap();
+    let (bytes, bytes_index) = writer.finish().unwrap();
     let meta = puffin::reader::parse_puffin_footer_from_bytes(&bytes).unwrap();
     let blobs: Vec<(&str, &str)> = meta
         .blobs
@@ -2019,7 +2165,7 @@ fn empty_file_and_no_cs_fields() {
         .collect();
     assert_eq!(blobs, vec![("o2-vix-docs-v1", "docs")]);
 
-    let reader = VixReader::open(Bytes::from(bytes)).unwrap();
+    let reader = open_built(bytes, bytes_index);
     assert_eq!(reader.row_count(), 0);
     assert_eq!(reader.eval(&VixQuery::All).unwrap().len(), 0);
     assert_eq!(reader.count(&exact("f", "x")).unwrap(), 0);
@@ -2043,7 +2189,7 @@ fn empty_file_and_no_cs_fields() {
     writer
         .push_batch_with_source(&empty_batch, &StringArray::from(Vec::<&str>::new()), None)
         .unwrap();
-    let reader = VixReader::open(Bytes::from(writer.finish().unwrap())).unwrap();
+    let reader = finish_open(writer);
     assert_eq!(reader.row_count(), 0);
     assert_eq!(reader.read_source(&[]).unwrap().len(), 0);
 
@@ -2060,7 +2206,7 @@ fn empty_file_and_no_cs_fields() {
     writer
         .push_batch_with_source(&batch, &dataset_sources(0..2), None)
         .unwrap();
-    let reader = VixReader::open(Bytes::from(writer.finish().unwrap())).unwrap();
+    let reader = finish_open(writer);
     assert_eq!(reader.row_count(), 2);
     let source = as_string_array(reader.read_docs_column(SOURCE_COL_NAME).unwrap().as_ref());
     assert_eq!(source.value(1), "{\"i\":1}");
@@ -2110,7 +2256,7 @@ fn scale_200k_docs_dense_elision() {
             .push_batch_with_source(&batch, &sources, None)
             .unwrap();
     }
-    let bytes = writer.finish().unwrap();
+    let (bytes, bytes_index) = writer.finish().unwrap();
 
     // Blob sizes straight from the puffin footer.
     let meta = parse_puffin_footer_from_bytes(&bytes).unwrap();
@@ -2125,6 +2271,7 @@ fn scale_200k_docs_dense_elision() {
             "dict_blocks" => dict_size += size,
             "terms" => terms_size = size,
             "docs" => docs_size = size,
+            "stats" => {} // H2 per-column chunk stats (data-object tail blob)
             other => panic!("unexpected blob {other:?}"),
         }
     }
@@ -2143,7 +2290,7 @@ fn scale_200k_docs_dense_elision() {
     );
     assert!(docs_size > 0);
 
-    let reader = VixReader::open(Bytes::from(bytes)).unwrap();
+    let reader = open_built(bytes, bytes_index);
     assert_eq!(reader.row_count(), TOTAL as u64);
 
     // Every dense value and key term: postings elided to zero bytes,
@@ -2369,11 +2516,11 @@ fn source_driven_extraction_parity() {
             .unwrap();
     }
 
-    let (column_bytes, column_stats) = column_driven.finish_with_stats().unwrap();
-    let (source_bytes, source_stats) = source_driven.finish_with_stats().unwrap();
+    let (column_bytes, column_bytes_index, column_stats) = column_driven.finish_with_stats().unwrap();
+    let (source_bytes, source_bytes_index, source_stats) = source_driven.finish_with_stats().unwrap();
 
-    let column_reader = VixReader::open(Bytes::from(column_bytes)).unwrap();
-    let source_reader = VixReader::open(Bytes::from(source_bytes)).unwrap();
+    let column_reader = open_built(column_bytes, column_bytes_index);
+    let source_reader = open_built(source_bytes, source_bytes_index);
 
     // identical term inventory: raw composite bytes (same field ids — both
     // writers were built from the same schema), doc_counts, doc bitmaps
@@ -2461,8 +2608,8 @@ fn push_docs_rows_value_kinds() {
             None,
         )
         .unwrap();
-    let (bytes, stats) = writer.finish_with_stats().unwrap();
-    let reader = VixReader::open(Bytes::from(bytes)).unwrap();
+    let (bytes, bytes_index, stats) = writer.finish_with_stats().unwrap();
+    let reader = open_built(bytes, bytes_index);
 
     assert_eq!(reader.row_count(), 3);
     assert_eq!(stats.row_count, 3);
@@ -2495,14 +2642,15 @@ fn push_docs_rows_unindexable_string_key_is_partial() {
     writer
         .push_docs_rows(&Int64Array::from(vec![1, 2]), &[], &source, None)
         .unwrap();
-    let reader = VixReader::open(Bytes::from(writer.finish().unwrap())).unwrap();
+    let reader = finish_open(writer);
 
     assert_eq!(key_exists_set(&reader, "extra"), docs(&[0]));
     assert!(reader.partial_fields().contains("extra"));
     assert!(reader.field_id("extra").is_none());
 
-    // oversize values flag the field partial too, exactly like the
-    // column-driven path
+    // oversize values are skipped WITHOUT tainting — exactly like the
+    // column-driven path (owner call 2026-08-12): the key term lands, the
+    // skipped literal itself misses, the field stays index-authoritative
     let mut writer = VixWriter::new(
         &schema,
         VixWriterOptions {
@@ -2516,8 +2664,10 @@ fn push_docs_rows_unindexable_string_key_is_partial() {
     writer
         .push_docs_rows(&Int64Array::from(vec![1]), &[], &source, None)
         .unwrap();
-    let reader = VixReader::open(Bytes::from(writer.finish().unwrap())).unwrap();
-    assert!(reader.partial_fields().contains("msg"));
+    let (bytes, bytes_index, stats) = writer.finish_with_stats().unwrap();
+    let reader = open_built(bytes, bytes_index);
+    assert!(reader.partial_fields().is_empty());
+    assert_eq!(stats.oversize_skipped, 1);
     assert_eq!(key_exists_set(&reader, "msg"), docs(&[0]));
     assert_eq!(eval_set(&reader, &exact("msg", long.as_str())), docs(&[]));
 }
@@ -2554,6 +2704,12 @@ fn repack_with_properties(
     if let Some(terms) = blob_bytes(container.terms) {
         blobs.push(("o2-vix-terms-v1", "terms", terms));
     }
+    if let Some(plist) = blob_bytes(container.plist) {
+        blobs.push(("o2-vix-plist-v1", "plist", plist));
+    }
+    if let Some(bloom) = blob_bytes(container.bloom) {
+        blobs.push(("o2-vix-bloom-v1", "bloom", bloom));
+    }
     if let Some(docs) = blob_bytes(container.docs) {
         blobs.push(("o2-vix-docs-v1", "docs", docs));
     }
@@ -2575,7 +2731,6 @@ fn streamed_docs_encode_is_byte_identical() {
     ]));
     let build = |sample_bytes: usize| {
         let opts = VixWriterOptions {
-            column_store_field_names: vec!["svc".to_string()],
             docs_encode_sample_bytes: sample_bytes,
             ..Default::default()
         };
@@ -2609,7 +2764,8 @@ fn streamed_docs_encode_is_byte_identical() {
     let streamed = build(1);
     assert_eq!(buffered, streamed, "stream transition changed the output");
 
-    let reader = VixReader::open(Bytes::from(streamed)).unwrap();
+    let (streamed, streamed_index) = streamed;
+    let reader = open_built(streamed, streamed_index);
     assert_eq!(reader.row_count(), 32);
     let hits = reader
         .eval(&VixQuery::Exact {
@@ -2629,7 +2785,6 @@ fn spooled_output_is_byte_identical() {
     let build = |spool: bool| {
         let opts = VixWriterOptions {
             fts_field_names: vec!["log".to_string()],
-            column_store_field_names: vec!["svc".to_string(), "code".to_string()],
             row_group_size: 128,
             output_spool_dir: spool.then(|| spool_base.path().to_path_buf()),
             ..Default::default()
@@ -2656,7 +2811,6 @@ fn spilled_terms_are_byte_identical() {
     ]));
     let build = |spill: bool| {
         let opts = VixWriterOptions {
-            column_store_field_names: vec!["svc".to_string()],
             term_spill_dir: spill.then(|| spill_base.path().to_path_buf()),
             term_spill_bytes: usize::from(spill), // 1 byte -> spill every batch
             ..Default::default()
@@ -2699,7 +2853,8 @@ fn spilled_terms_are_byte_identical() {
 
     // spot-check semantics on the spilled file: cross-run postings union,
     // dense elision, numeric terms
-    let reader = VixReader::open(Bytes::from(spilled)).unwrap();
+    let (spilled, spilled_index) = spilled;
+    let reader = open_built(spilled, spilled_index);
     assert_eq!(reader.row_count(), 18);
     let api_hits = reader
         .eval(&VixQuery::Exact {
@@ -2723,10 +2878,10 @@ fn spilled_terms_are_byte_identical() {
 /// [docs, dict, terms] order — same term stream, same postings, same docs.
 #[test]
 fn legacy_blob_order_reads_identically() {
-    let bytes = build_dataset_bytes(dataset_options());
-    let new_reader = VixReader::open(Bytes::from(bytes.clone())).unwrap();
+    let (bytes, bytes_index) = build_dataset_bytes(dataset_options());
+    let new_reader = open_built(bytes.clone(), bytes_index.clone());
     let legacy_bytes = repack_with_properties(bytes, |_| {});
-    let legacy_reader = VixReader::open(Bytes::from(legacy_bytes)).unwrap();
+    let legacy_reader = open_built(legacy_bytes, bytes_index);
 
     let dump_terms = |reader: &VixReader| {
         let mut terms: Vec<(Vec<u8>, u64, Vec<u32>)> = Vec::new();
@@ -2775,11 +2930,11 @@ fn legacy_blob_order_reads_identically() {
 fn fts_fields_emit_tokens_only() {
     // `log` is fts with field id 2 in both datasets (code=0, level=1,
     // log=2, svc=3).
-    for bytes in [
+    for (bytes, bytes_index) in [
         build_dataset_bytes(dataset_options()),
         build_docs_dataset_bytes(false),
     ] {
-        let reader = VixReader::open(Bytes::from(bytes)).unwrap();
+        let reader = open_built(bytes, bytes_index);
         // no raw whole-value term ...
         assert_eq!(
             reader
@@ -2836,8 +2991,8 @@ fn writer_emits_canonical_tokens() {
     source_driven
         .push_docs_rows(&timestamps_of(&batch), &[], &source, None)
         .unwrap();
-    let column_reader = VixReader::open(Bytes::from(column_driven.finish().unwrap())).unwrap();
-    let source_reader = VixReader::open(Bytes::from(source_driven.finish().unwrap())).unwrap();
+    let column_reader = finish_open(column_driven);
+    let source_reader = finish_open(source_driven);
 
     // identical token inventory from both derivations
     assert_eq!(
@@ -2894,7 +3049,7 @@ fn empty_string_values_dense_elision_and_scans() {
     writer
         .push_batch_with_source(&batch, &dataset_sources(0..3), None)
         .unwrap();
-    let reader = VixReader::open(Bytes::from(writer.finish().unwrap())).unwrap();
+    let reader = finish_open(writer);
 
     // `blank` = "" in every doc: value term AND key term are dense-elided
     let blank_id = reader.field_id("blank").unwrap();
@@ -2981,7 +3136,7 @@ fn non_string_batch_column_marks_field_partial() {
     writer
         .push_batch_with_source(&batch2, &dataset_sources(1..2), None)
         .unwrap();
-    let reader = VixReader::open(Bytes::from(writer.finish().unwrap())).unwrap();
+    let reader = finish_open(writer);
 
     // the string batch indexed its raw value; the numeric batch indexed its
     // tagged CANONICAL value — no partial mark for either
@@ -2999,7 +3154,7 @@ fn non_string_batch_column_marks_field_partial() {
     writer
         .push_batch_with_source(&batch3, &dataset_sources(0..1), None)
         .unwrap();
-    let reader = VixReader::open(Bytes::from(writer.finish().unwrap())).unwrap();
+    let reader = finish_open(writer);
     assert!(
         reader.partial_fields().contains("f"),
         "the un-indexable batch must flag the field for scan fallback"
@@ -3120,11 +3275,17 @@ fn field_value_top_k_and_head_match_walk() {
                 .unwrap()
                 .unwrap();
             assert!(!truncated, "{field} has few distinct values");
-            assert_eq!(top, walk, "untruncated top-k must equal the walk for {field}");
+            assert_eq!(
+                top, walk,
+                "untruncated top-k must equal the walk for {field}"
+            );
         }
         let keys: Vec<Vec<u8>> = walk.iter().map(|(k, _)| k.clone()).collect();
         for take in [1usize, 2, 100] {
-            let head = reader.field_value_head(field, take, false).unwrap().unwrap();
+            let head = reader
+                .field_value_head(field, take, false)
+                .unwrap()
+                .unwrap();
             assert_eq!(head, keys.iter().take(take).cloned().collect::<Vec<_>>());
             let tail = reader.field_value_head(field, take, true).unwrap().unwrap();
             let n = take.min(keys.len());
@@ -3154,10 +3315,7 @@ fn field_value_top_k_and_head_match_walk() {
     for field in ["level", "svc"] {
         let walk = reader.field_value_counts(field).unwrap().unwrap();
         for ascend in [false, true] {
-            let (mut top, truncated) = reader
-                .field_value_top_k(field, 2, ascend)
-                .unwrap()
-                .unwrap();
+            let (mut top, truncated) = reader.field_value_top_k(field, 2, ascend).unwrap().unwrap();
             assert!(truncated, "{field} has more than 2 distinct values");
             assert_eq!(top.len(), 2);
             let mut oracle = walk.clone();
@@ -3191,7 +3349,7 @@ fn field_value_top_k_and_head_match_walk() {
     writer
         .push_batch_with_source(&batch, &dataset_sources(0..3), None)
         .unwrap();
-    let reader = VixReader::open(Bytes::from(writer.finish().unwrap())).unwrap();
+    let reader = finish_open(writer);
     assert_eq!(
         reader.field_value_top_k("f", 10, false).unwrap(),
         Some((vec![(b"".to_vec(), 2), (b"x".to_vec(), 1)], false))
@@ -3235,7 +3393,7 @@ fn field_value_counts_dense_elision_and_multi_rg() {
     writer
         .push_batch_with_source(&batch, &dataset_sources(0..6), None)
         .unwrap();
-    let reader = VixReader::open(Bytes::from(writer.finish().unwrap())).unwrap();
+    let reader = finish_open(writer);
     assert!(
         reader.term_row_group_count() > 1,
         "the dataset must span multiple dictionary row groups"
@@ -3254,11 +3412,12 @@ fn field_value_counts_dense_elision_and_multi_rg() {
     );
 }
 
-/// The dictionary-only path serves empty-string values (they are ordinary
-/// raw terms now) and still refuses fields whose dictionary provably misses
-/// values (partial fields skipped some).
+/// The dictionary-only serve policy: empty-string values serve as ordinary
+/// raw terms; an oversize-skip shortfall serves via the per-field allowance
+/// (counts omit the skipped values — the 2026-08-12 trade); the partial
+/// MARKER alone still refuses; and any unexplained shortfall refuses.
 #[test]
-fn field_value_counts_rejects_incomplete_dictionaries() {
+fn field_value_counts_allowance_and_refusal_policy() {
     let schema = Arc::new(Schema::new(vec![
         Field::new("_timestamp", DataType::Int64, false),
         Field::new("f", DataType::Utf8, true),
@@ -3278,7 +3437,8 @@ fn field_value_counts_rejects_incomplete_dictionaries() {
     writer
         .push_batch_with_source(&batch, &dataset_sources(0..3), None)
         .unwrap();
-    let reader = VixReader::open(Bytes::from(writer.finish().unwrap())).unwrap();
+    let (complete_bytes, complete_bytes_index) = writer.finish().unwrap();
+    let reader = open_built(complete_bytes.clone(), complete_bytes_index.clone());
     assert_eq!(
         reader.field_value_counts("f").unwrap(),
         Some(vec![
@@ -3288,7 +3448,11 @@ fn field_value_counts_rejects_incomplete_dictionaries() {
         ])
     );
 
-    // oversize values mark the field partial: refusal
+    // an oversize value is skipped without degrade (owner call 2026-08-12),
+    // so the field carries NO partial marker — but the dictionary-only
+    // serve still refuses it via doc-count reconciliation (2 key-term docs,
+    // 1 valued): top-k/group-by answers stay exact by falling back to the
+    // scan paths; only per-value probes take the accepted miss
     let batch = RecordBatch::try_new(
         Arc::clone(&schema),
         vec![
@@ -3311,7 +3475,69 @@ fn field_value_counts_rejects_incomplete_dictionaries() {
     writer
         .push_batch_with_source(&batch, &dataset_sources(0..2), None)
         .unwrap();
-    let reader = VixReader::open(Bytes::from(writer.finish().unwrap())).unwrap();
+    let reader = finish_open(writer);
+    assert!(reader.partial_fields().is_empty());
+    assert_eq!(reader.oversize_skips().get("f"), Some(&1));
+    // the skip is an exact allowance: the serve stays eligible and the
+    // counts OMIT the skipped value — no scan fallback for oversize
+    assert_eq!(
+        reader.field_value_counts("f").unwrap(),
+        Some(vec![(b"ok".to_vec(), 1)]),
+        "oversize allowance must keep the dictionary serve eligible"
+    );
+    assert_eq!(
+        reader.field_value_top_k("f", 10, false).unwrap(),
+        Some((vec![(b"ok".to_vec(), 1)], false)),
+    );
+    assert_eq!(
+        reader
+            .field_value_counts_filtered("f", &BooleanBuffer::new_set(2), 1000)
+            .unwrap(),
+        Some(vec![(b"ok".to_vec(), 1)]),
+    );
+    // a field whose EVERY value was oversize serves the exact empty group
+    // list (all docs accounted for by the allowance)
+    let schema_g = Arc::new(Schema::new(vec![
+        Field::new("_timestamp", DataType::Int64, false),
+        Field::new("g", DataType::Utf8, true),
+    ]));
+    let mut writer = VixWriter::new(
+        &schema_g,
+        VixWriterOptions {
+            max_raw_term_len: 8,
+            ..Default::default()
+        },
+        false,
+    );
+    let g_batch = RecordBatch::try_new(
+        Arc::clone(&schema_g),
+        vec![
+            Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+            Arc::new(StringArray::from(vec![Some("also far too long")])),
+        ],
+    )
+    .unwrap();
+    writer
+        .push_batch_with_source(&g_batch, &dataset_sources(0..1), None)
+        .unwrap();
+    let g_reader = finish_open(writer);
+    assert_eq!(g_reader.field_value_counts("g").unwrap(), Some(vec![]));
+    assert_eq!(
+        g_reader.field_value_top_k("g", 10, false).unwrap(),
+        Some((vec![], false)),
+    );
+
+    // the partial MARKER alone still refuses the serve, even over a
+    // dictionary whose counts reconcile — the legacy pre-2026-08-12 shape
+    // (taint written by the old oversize rule, or a surviving cause) is no
+    // longer buildable through the writer for oversize, so fabricate it
+    // via property patching over the COMPLETE file from above.
+    let tainted = crate::test_support::repack_with_partial_fields(
+        complete_bytes_index.as_deref().expect("sidecar"),
+        &["f"],
+    )
+    .unwrap();
+    let reader = open_built(complete_bytes.clone(), Some(tainted));
     assert!(reader.partial_fields().contains("f"));
     assert_eq!(reader.field_value_counts("f").unwrap(), None);
 }
@@ -3323,7 +3549,6 @@ fn push_docs_rows_input_validation() {
         Field::new("svc", DataType::Utf8, true),
     ]);
     let opts = VixWriterOptions {
-        column_store_field_names: vec!["svc".to_string()],
         ..Default::default()
     };
 
@@ -3353,16 +3578,30 @@ fn push_docs_rows_input_validation() {
         .unwrap_err();
     assert!(err.to_string().contains("_timestamp"), "{err}");
 
-    // a configured column-store column must be supplied
-    let err = writer
+    // v2 all-columns: an UNSUPPLIED docs column stores null (a merge input
+    // lacking the column contributes nulls by design) ...
+    writer
         .push_docs_rows(
             &Int64Array::from(vec![1]),
             &[],
             &StringArray::from(vec!["{}"]),
             None,
         )
+        .unwrap();
+    // ... while a supplied name that is NOT a docs column errors loudly
+    // (typo/plan-drift guard: its values would otherwise vanish)
+    let err = writer
+        .push_docs_rows(
+            &Int64Array::from(vec![1]),
+            &[(
+                "not_a_column".to_string(),
+                Arc::new(StringArray::from(vec!["a"])) as ArrayRef,
+            )],
+            &StringArray::from(vec!["{}"]),
+            None,
+        )
         .unwrap_err();
-    assert!(err.to_string().contains("svc"), "{err}");
+    assert!(err.to_string().contains("not_a_column"), "{err}");
 
     // wrong-length cs column
     let err = writer
@@ -3427,7 +3666,6 @@ fn push_docs_rows_stores_docs_and_originals() {
         Field::new("svc", DataType::Utf8, true),
     ]);
     let opts = VixWriterOptions {
-        column_store_field_names: vec!["svc".to_string()],
         ..Default::default()
     };
     let mut writer = VixWriter::new(&schema, opts, true);
@@ -3456,14 +3694,19 @@ fn push_docs_rows_stores_docs_and_originals() {
         )
         .unwrap();
 
-    let (bytes, stats) = writer.finish_with_stats().unwrap();
-    let total = bytes.len() as u64;
+    let (bytes, bytes_index, stats) = writer.finish_with_stats().unwrap();
     assert!(stats.index_size > 0);
     assert!(stats.docs_size > 0);
-    assert!(stats.index_size + stats.docs_size <= total);
+    // v3 split: index_size is the SIDECAR OBJECT's size, docs_size the docs
+    // blob inside the data object
+    assert_eq!(
+        stats.index_size,
+        bytes_index.as_ref().map_or(0, |b| b.len() as u64)
+    );
+    assert!(stats.docs_size <= bytes.len() as u64);
     assert_eq!(stats.row_count, 3);
 
-    let reader = VixReader::open(Bytes::from(bytes)).unwrap();
+    let reader = open_built(bytes, bytes_index);
     assert_eq!(
         as_i64_array(reader.read_docs_column("_timestamp").unwrap().as_ref())
             .values()
@@ -3499,10 +3742,11 @@ fn push_docs_rows_stores_docs_and_originals() {
 
 #[test]
 fn vix_docs_open_and_scan_all() {
-    let docs = crate::VixDocs::open(Bytes::from(build_docs_dataset_bytes(false))).unwrap();
+    let docs = crate::VixDocs::open(Bytes::from(build_docs_dataset_bytes(false).0)).unwrap();
     assert_eq!(docs.row_count(), 10);
     assert_eq!(docs.row_group_size(), 128);
-    // physical docs columns: _timestamp, cs fields (svc, code), _o2_id, _source
+    // physical docs columns (v2 all-columns): _timestamp + EVERY schema
+    // field + _source
     let names: Vec<&str> = docs
         .schema()
         .fields()
@@ -3514,8 +3758,8 @@ fn vix_docs_open_and_scan_all() {
     assert!(names.contains(&"code"));
     assert!(names.contains(&"_source"));
     assert!(
-        !names.contains(&"level"),
-        "level is not a cs field: {names:?}"
+        names.contains(&"level"),
+        "every schema field is a docs column: {names:?}"
     );
     assert!(
         !names.contains(&"_original"),
@@ -3546,7 +3790,7 @@ fn vix_docs_open_and_scan_all() {
 
 #[test]
 fn vix_docs_row_selection_and_ts_filter() {
-    let docs = crate::VixDocs::open(Bytes::from(build_docs_dataset_bytes(false))).unwrap();
+    let docs = crate::VixDocs::open(Bytes::from(build_docs_dataset_bytes(false).0)).unwrap();
 
     // point reads: rows 1, 3, 5 (ts 1001, 1003, 1005), out of order + duped
     let projection = vec!["_timestamp".to_string()];
@@ -3612,7 +3856,7 @@ fn vix_docs_rejects_unsupported_versions() {
     let err = crate::VixDocs::open(Bytes::from(bytes)).unwrap_err();
     assert!(
         err.to_string().contains("unsupported .vix format")
-            && err.to_string().contains("reader supports 2"),
+            && err.to_string().contains("reader supports 3"),
         "unexpected error: {err}"
     );
 }
@@ -3683,7 +3927,7 @@ fn docs_blob_zstd_beats_round1_by_4x() {
     writer
         .push_batch_with_source(&batch, &source_array, None)
         .unwrap();
-    let (bytes, stats) = writer.finish_with_stats().unwrap();
+    let (bytes, bytes_index, stats) = writer.finish_with_stats().unwrap();
 
     // Round-1 baseline: the identical docs batch through the old strategy
     // (plain BtrBlocks sampler, chunks following the 128Ki row-group size).
@@ -3724,7 +3968,7 @@ fn docs_blob_zstd_beats_round1_by_4x() {
     );
 
     // The zstd-encoded rows round-trip bit for bit.
-    let reader = VixReader::open(Bytes::from(bytes)).unwrap();
+    let reader = open_built(bytes, bytes_index);
     let picks = [0u64, 1, 4_242, 19_999];
     let got = reader.read_source(&picks).unwrap();
     for (i, row) in picks.iter().enumerate() {
@@ -3829,12 +4073,12 @@ mod ranged {
     /// realistic composition — the docs blob dwarfs the dictionary). Small
     /// dictionary row groups force several FSTs; postings chunks keep the
     /// writer default so point reads stay chunk-granular.
-    static LARGE_CORE_FILE: std::sync::LazyLock<Bytes> =
+    static LARGE_CORE_FILE: std::sync::LazyLock<(Bytes, Bytes)> =
         std::sync::LazyLock::new(build_large_core_file_uncached);
 
     /// One fresh build of the 100k-row fixture (use the shared
     /// [`build_large_core_file`] unless the bytes must be rebuilt).
-    fn build_large_core_file_uncached() -> Bytes {
+    fn build_large_core_file_uncached() -> (Bytes, Bytes) {
         let rows = 100_000usize;
         let schema = Arc::new(Schema::new(vec![
             Field::new("_timestamp", DataType::Int64, false),
@@ -3842,7 +4086,6 @@ mod ranged {
             Field::new("level", DataType::Utf8, true),
         ]));
         let opts = VixWriterOptions {
-            column_store_field_names: vec!["level".to_string()],
             row_group_size: 8192,
             // Pin docs chunks to the pre-Fix-B scale of this file (~8k rows
             // of ~250 arrow bytes): the budgets below assert F2's ranged-IO
@@ -3888,11 +4131,52 @@ mod ranged {
                 None,
             )
             .unwrap();
-        Bytes::from(writer.finish().unwrap())
+        let (data, index) = writer.finish().unwrap();
+        (
+            Bytes::from(data),
+            Bytes::from(index.expect("indexed fixture has a sidecar")),
+        )
     }
 
-    fn build_large_core_file() -> Bytes {
+    fn build_large_core_file() -> (Bytes, Bytes) {
         LARGE_CORE_FILE.clone()
+    }
+
+    /// Per-object counting sources of one (data, sidecar) pair. The
+    /// aggregate counters keep the pre-split budget assertions meaningful:
+    /// a fetch is a fetch, whichever object it hits.
+    struct PairSource {
+        data: Arc<CountingSource>,
+        index: Arc<CountingSource>,
+    }
+
+    impl PairSource {
+        fn new(data: Bytes, index: Bytes) -> Self {
+            Self {
+                data: CountingSource::new(data),
+                index: CountingSource::new(index),
+            }
+        }
+
+        fn open(&self) -> VixReader {
+            VixReader::open_ranged_with_index(
+                Arc::clone(&self.data) as Arc<dyn VixRangeSource>,
+                Some(Arc::clone(&self.index) as Arc<dyn VixRangeSource>),
+            )
+            .unwrap()
+        }
+
+        fn fetches(&self) -> usize {
+            self.data.fetches() + self.index.fetches()
+        }
+
+        fn bytes(&self) -> u64 {
+            self.data.bytes() + self.index.bytes()
+        }
+
+        fn batch_calls(&self) -> usize {
+            self.data.batch_calls() + self.index.batch_calls()
+        }
     }
 
     /// Cold open + exact-term point lookup: the Arch.md budget. Open is a
@@ -3901,18 +4185,18 @@ mod ranged {
     /// fetches — and the total fetched bytes stay far below the file size.
     #[test]
     fn ranged_exact_term_fetch_budget_and_parity() {
-        let data = build_large_core_file();
-        let file_size = data.len() as u64;
-        let mem = VixReader::open(data.clone()).unwrap();
-        let source = CountingSource::new(data);
-        let ranged =
-            VixReader::open_ranged(Arc::clone(&source) as Arc<dyn VixRangeSource>).unwrap();
+        let (data, index) = build_large_core_file();
+        let file_size = (data.len() + index.len()) as u64;
+        let mem = VixReader::open_with_index(data.clone(), Some(index.clone())).unwrap();
+        let source = PairSource::new(data, index);
+        let ranged = source.open();
 
-        // open: tail (footer fits the 64 KiB window) + whole dict.
+        // open: one tail fetch per object (both footers fit the 64 KiB
+        // window) + the dict from the sidecar.
         let open_fetches = source.fetches();
         assert!(
-            open_fetches <= 2,
-            "open should need at most 2 fetches (tail + dict), used {open_fetches}"
+            open_fetches <= 3,
+            "open should need at most 3 fetches (2 tails + dict), used {open_fetches}"
         );
         assert!(ranged.term_row_group_count() > 1, "want multiple FSTs");
 
@@ -3967,11 +4251,10 @@ mod ranged {
     /// never reads.
     #[test]
     fn ranged_all_query_needs_no_dictionary_io() {
-        let data = build_large_core_file();
-        let mem = VixReader::open(data.clone()).unwrap();
-        let source = CountingSource::new(data);
-        let ranged =
-            VixReader::open_ranged(Arc::clone(&source) as Arc<dyn VixRangeSource>).unwrap();
+        let (data, index) = build_large_core_file();
+        let mem = VixReader::open_with_index(data.clone(), Some(index.clone())).unwrap();
+        let source = PairSource::new(data, index);
+        let ranged = source.open();
         let open_fetches = source.fetches();
         let open_bytes = source.bytes();
 
@@ -4008,11 +4291,10 @@ mod ranged {
     /// hundreds of blocks; the walk must stay within a few round trips.
     #[test]
     fn ranged_field_walk_coalesces_dict_block_fetches() {
-        let data = build_large_core_file();
-        let mem = VixReader::open(data.clone()).unwrap();
-        let source = CountingSource::new(data);
-        let ranged =
-            VixReader::open_ranged(Arc::clone(&source) as Arc<dyn VixRangeSource>).unwrap();
+        let (data, index) = build_large_core_file();
+        let mem = VixReader::open_with_index(data.clone(), Some(index.clone())).unwrap();
+        let source = PairSource::new(data, index);
+        let ranged = source.open();
 
         let expect = mem
             .field_value_counts("svc")
@@ -4049,8 +4331,8 @@ mod ranged {
     /// kept set is decided purely by the smaller-key rule at scale.)
     #[test]
     fn ranged_field_value_top_k_matches_walk_at_scale() {
-        let data = build_large_core_file();
-        let mem = VixReader::open(data.clone()).unwrap();
+        let (data, index) = build_large_core_file();
+        let mem = VixReader::open_with_index(data.clone(), Some(index.clone())).unwrap();
         let walk = mem.field_value_counts("svc").unwrap().unwrap();
         assert_eq!(walk.len(), 100_000);
         let cap = 1000usize;
@@ -4066,8 +4348,7 @@ mod ranged {
             oracle
         };
         for ascend in [false, true] {
-            let (mut top, truncated) =
-                mem.field_value_top_k("svc", cap, ascend).unwrap().unwrap();
+            let (mut top, truncated) = mem.field_value_top_k("svc", cap, ascend).unwrap().unwrap();
             assert!(truncated);
             top.sort();
             assert_eq!(top, oracle_set(ascend), "mem ascend={ascend}");
@@ -4082,11 +4363,13 @@ mod ranged {
             keys[keys.len() - 7..].to_vec()
         );
 
-        let source = CountingSource::new(data);
-        let ranged =
-            VixReader::open_ranged(Arc::clone(&source) as Arc<dyn VixRangeSource>).unwrap();
+        let source = PairSource::new(data, index);
+        let ranged = source.open();
         let before = source.fetches();
-        let (mut top, truncated) = ranged.field_value_top_k("svc", cap, false).unwrap().unwrap();
+        let (mut top, truncated) = ranged
+            .field_value_top_k("svc", cap, false)
+            .unwrap()
+            .unwrap();
         assert!(truncated);
         top.sort();
         assert_eq!(top, oracle_set(false), "ranged top-k");
@@ -4156,17 +4439,19 @@ mod ranged {
                 None,
             )
             .unwrap();
-        let data = Bytes::from(writer.finish().unwrap());
+        let (data, index) = writer.finish().unwrap();
+        let data = Bytes::from(data);
+        let index = Bytes::from(index.expect("indexed fixture has a sidecar"));
         assert!(
-            data.len() > 64 * 1024,
-            "fixture must outgrow the 64 KiB open tail ({} bytes)",
-            data.len()
+            index.len() > 64 * 1024,
+            "the sidecar must outgrow the 64 KiB open tail ({} bytes) so the \
+             plist blob exercises the ranged batch path",
+            index.len()
         );
 
-        let mem = VixReader::open(data.clone()).unwrap();
-        let source = CountingSource::new(data);
-        let ranged =
-            VixReader::open_ranged(Arc::clone(&source) as Arc<dyn VixRangeSource>).unwrap();
+        let mem = VixReader::open_with_index(data.clone(), Some(index.clone())).unwrap();
+        let source = PairSource::new(data, index);
+        let ranged = source.open();
 
         // all 2000 values (20 docs each >= threshold 8) carry pointer
         // cells; the prefix union walks them through postings_union
@@ -4187,14 +4472,13 @@ mod ranged {
     /// in-memory reader bit for bit.
     #[test]
     fn ranged_prefix_fastpath_column_and_timestamp_budget() {
-        let data = build_large_core_file();
-        let file_size = data.len() as u64;
-        let mem = VixReader::open(data.clone()).unwrap();
-        let source = CountingSource::new(data);
-        let ranged =
-            VixReader::open_ranged(Arc::clone(&source) as Arc<dyn VixRangeSource>).unwrap();
+        let (data, index) = build_large_core_file();
+        let file_size = (data.len() + index.len()) as u64;
+        let mem = VixReader::open_with_index(data.clone(), Some(index.clone())).unwrap();
+        let source = PairSource::new(data, index);
+        let ranged = source.open();
         let open_fetches = source.fetches();
-        assert!(open_fetches <= 2);
+        assert!(open_fetches <= 3);
 
         // Prefix matching 10 terms (svc_00123x): a couple of postings chunks.
         let query = prefix(Some("svc"), "svc_00123");
@@ -4249,15 +4533,16 @@ mod ranged {
     /// single tail fetch.
     #[test]
     fn ranged_small_file_parity_from_one_fetch() {
-        let data = Bytes::from(build_docs_dataset_bytes(true));
-        let mem = VixReader::open(data.clone()).unwrap();
-        let source = CountingSource::new(data);
-        let ranged =
-            VixReader::open_ranged(Arc::clone(&source) as Arc<dyn VixRangeSource>).unwrap();
+        let (data, index) = build_docs_dataset_bytes(true);
+        let data = Bytes::from(data);
+        let index = Bytes::from(index.expect("indexed dataset has a sidecar"));
+        let mem = VixReader::open_with_index(data.clone(), Some(index.clone())).unwrap();
+        let source = PairSource::new(data, index);
+        let ranged = source.open();
         assert_eq!(
             source.fetches(),
-            1,
-            "a sub-64KiB file must be fully served by the tail fetch"
+            2,
+            "a sub-64KiB pair must be fully served by one tail fetch per object"
         );
 
         let queries = vec![
@@ -4311,8 +4596,8 @@ mod ranged {
             bits_to_set(&ranged.timestamp_range(1002, 1008).unwrap()),
             bits_to_set(&mem.timestamp_range(1002, 1008).unwrap())
         );
-        // everything above came out of the single tail fetch
-        assert_eq!(source.fetches(), 1);
+        // everything above came out of the two tail fetches
+        assert_eq!(source.fetches(), 2);
     }
 
     /// VixDocs over a ranged source: open = tail + docs-blob footer; a
@@ -4320,7 +4605,7 @@ mod ranged {
     /// in-memory scan row for row.
     #[test]
     fn ranged_docs_scan_budget_and_parity() {
-        let data = build_large_core_file();
+        let (data, _index) = build_large_core_file();
         let file_size = data.len() as u64;
         let mem = VixDocs::open(data.clone()).unwrap();
         let source = CountingSource::new(data);
@@ -4362,7 +4647,9 @@ mod ranged {
     /// `docs_chunk_bytes` byte budget instead of the data row-group size
     /// (128Ki rows in production — the pilot's matched-row fetches
     /// decompressed a whole 100k+-row chunk per point read, 250-800 ms).
-    /// Over a 100k-row docs blob with the default 4 MiB budget:
+    /// Over a 100k-row docs blob with the default 16 MiB budget (M9 flip:
+    /// the corpus is sized so the encoded blob still dwarfs 4 budgets —
+    /// every bound below is byte-for-byte the pre-flip calibration):
     /// - a full scan decodes many bounded chunks, each within the `[1024, 65536]`-row clamp and
     ///   none row-group-sized;
     /// - fetching ONE row over a ranged source moves at most ~one budget of bytes (the compressed
@@ -4371,25 +4658,26 @@ mod ranged {
     #[test]
     fn docs_chunk_budget_bounds_point_read_bytes() {
         let rows = 100_000usize;
-        let budget = crate::DEFAULT_DOCS_CHUNK_BYTES as u64; // 4 MiB
+        let budget = crate::DEFAULT_DOCS_CHUNK_BYTES as u64; // 16 MiB
         let schema = Arc::new(Schema::new(vec![
             Field::new("_timestamp", DataType::Int64, false),
             Field::new("level", DataType::Utf8, true),
         ]));
         let opts = VixWriterOptions {
-            column_store_field_names: vec!["level".to_string()],
             row_group_size: 128 * 1024, // production PARQUET_MAX_ROW_GROUP_SIZE
             ..Default::default()
         };
-        // ~700 B `_source` rows, half random hex: the blob stays large and
-        // chunk-compression cannot shrink a fetched chunk to noise.
+        // ~1.9 KiB `_source` rows, mostly random hex (encodes at ~0.5x,
+        // measured): the blob stays large — >4 budgets encoded even at the
+        // 16 MiB default — and chunk-compression cannot shrink a fetched
+        // chunk to noise.
         let mut rng = StdRng::seed_from_u64(0xB0B0);
         let levels = ["info", "warn", "error"];
         let ts: Vec<i64> = (0..rows as i64).map(|i| 2_000_000 + i).collect();
         let level: Vec<&str> = (0..rows).map(|i| levels[i % levels.len()]).collect();
         let sources: Vec<String> = (0..rows)
             .map(|i| {
-                let pad: String = (0..48)
+                let pad: String = (0..224)
                     .map(|_| format!("{:08x}", rng.random::<u32>()))
                     .collect();
                 format!(
@@ -4415,7 +4703,7 @@ mod ranged {
                 None,
             )
             .unwrap();
-        let (bytes, stats) = writer.finish_with_stats().unwrap();
+        let (bytes, _bytes_index, stats) = writer.finish_with_stats().unwrap();
         let data = Bytes::from(bytes);
         assert!(
             stats.docs_size > 4 * budget,
@@ -4499,74 +4787,49 @@ mod ranged {
             .expect("containers with an unsupported version must be rejected");
         assert!(
             err.to_string().contains("unsupported .vix format")
-                && err.to_string().contains("reader supports 2"),
+                && err.to_string().contains("reader supports 3"),
             "unexpected error: {err}"
         );
     }
 
-    /// A container whose footer LACKS the `key_layout` property is a pre-v2
-    /// file (the retired token-major layout, dead since the cutover wipe):
-    /// both open paths must hard-error instead of misreading the dictionary.
+    /// A SIDECAR whose footer LACKS the `key_layout` property carries a
+    /// foreign (retired token-major) dictionary layout: both open paths
+    /// must hard-error instead of misreading the dictionary.
     #[test]
     fn open_rejects_missing_key_layout_property() {
-        // fabricate: rebuild the shared fixture's container without the
+        // fabricate: rebuild the shared fixture's sidecar without the
         // key_layout property (current writers always stamp it)
-        let data = build_large_core_file();
-        let container = crate::container::parse_container(&data).unwrap();
-        let properties: Vec<(String, String)> = container
-            .properties
-            .iter()
-            .filter(|(key, _)| key.as_str() != crate::container::PROP_KEY_LAYOUT)
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect();
-        let mem_bytes = |handle: Option<crate::container::BlobHandle>| match handle {
-            Some(crate::container::BlobHandle::Mem(bytes)) => bytes.to_vec(),
-            other => panic!("expected an in-memory blob, got {other:?}"),
-        };
+        let (data, index) = build_large_core_file();
         let stripped = Bytes::from(
-            crate::container::build_container(
-                properties,
-                vec![
-                    (
-                        crate::container::BLOB_TYPE_DICT,
-                        crate::container::BLOB_TAG_DICT,
-                        mem_bytes(container.dict),
-                    ),
-                    (
-                        crate::container::BLOB_TYPE_TERMS,
-                        crate::container::BLOB_TAG_TERMS,
-                        mem_bytes(container.terms),
-                    ),
-                    (
-                        crate::container::BLOB_TYPE_DOCS,
-                        crate::container::BLOB_TAG_DOCS,
-                        mem_bytes(container.docs),
-                    ),
-                ],
+            crate::test_support::strip_property_for_tests(
+                &index,
+                crate::container::PROP_KEY_LAYOUT,
             )
             .unwrap(),
         );
 
         let check = |msg: String| {
             assert!(
-                msg.contains("unsupported .vix format")
-                    && msg.contains("pre-v2")
-                    && msg.contains("key_layout"),
+                msg.contains("unsupported .vix format") && msg.contains("key_layout"),
                 "unexpected error: {msg}"
             );
         };
         check(
-            VixReader::open(stripped.clone())
+            VixReader::open_with_index(data.clone(), Some(stripped.clone()))
                 .err()
-                .expect("a container without key_layout must be rejected")
+                .expect("a sidecar without key_layout must be rejected")
                 .to_string(),
         );
-        let source = CountingSource::new(stripped);
+        let data_source = CountingSource::new(data);
+        let index_source = CountingSource::new(stripped);
         check(
-            VixReader::open_ranged(Arc::clone(&source) as Arc<dyn VixRangeSource>)
-                .err()
-                .expect("a ranged open without key_layout must be rejected")
-                .to_string(),
+            VixReader::open_ranged_with_index(
+                Arc::clone(&data_source) as Arc<dyn VixRangeSource>,
+                Some(Arc::clone(&index_source) as Arc<dyn VixRangeSource>),
+            )
+            .err()
+            .expect("a ranged open without key_layout must be rejected")
+            .to_string(),
         );
     }
 
@@ -4577,47 +4840,261 @@ mod ranged {
     /// `_source` path instead of erroring.
     #[test]
     fn docs_open_survives_corrupt_dict() {
-        let data = build_large_core_file();
-        let container = crate::container::parse_container(&data).unwrap();
-        let mem_bytes = |handle: Option<crate::container::BlobHandle>| match handle {
-            Some(crate::container::BlobHandle::Mem(bytes)) => bytes.to_vec(),
-            other => panic!("expected an in-memory blob, got {other:?}"),
-        };
-        let mut dict = mem_bytes(container.dict);
-        dict.truncate(dict.len() / 2); // mangle the dictionary blob
-        let corrupted = Bytes::from(
-            crate::container::build_container(
-                container
-                    .properties
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
+        let (data, index) = build_large_core_file();
+        // mangle the dictionary blob inside the sidecar, in place
+        let dict_range = crate::test_support::blob_byte_range(&index, "dict").unwrap();
+        let mut corrupted = index.to_vec();
+        corrupted[dict_range.start + dict_range.len() / 2..dict_range.end].fill(0xFF);
+        let corrupted = Bytes::from(corrupted);
+        let data_source = CountingSource::new(data.clone());
+        let index_source = CountingSource::new(corrupted);
+        VixReader::open_ranged_with_index(
+            Arc::clone(&data_source) as Arc<dyn VixRangeSource>,
+            Some(Arc::clone(&index_source) as Arc<dyn VixRangeSource>),
+        )
+        .and_then(|reader| {
+            // the block index parses lazily on some paths: force a
+            // dictionary touch so the corruption must surface
+            reader.eval(&exact("svc", "svc_000001"))
+        })
+        .err()
+        .expect("a corrupt dictionary must fail the reader open/eval");
+        crate::VixDocs::open_ranged(Arc::clone(&data_source) as Arc<dyn VixRangeSource>)
+            .expect("docs must open even when the dictionary is unreadable");
+    }
+
+    // -----------------------------------------------------------------
+    // M6 fetch-accounting pins: the M5 A/B caught the PASSTHROUGH merge
+    // output defeating projected ranged reads (a 2-column projection
+    // fetched the whole interleaved docs blob; a needle selection paid
+    // one GET per surviving chunk). These pin the fixed fetch profile on
+    // a passthrough-built file so the regression class cannot silently
+    // return.
+    // -----------------------------------------------------------------
+
+    /// A wide-ish passthrough MERGE output: a first-encode input (many
+    /// small pushed chunks, incompressible-fat `_source` dominating the
+    /// blob) spliced chunk-by-chunk through a `docs_passthrough` writer —
+    /// the exact path compaction merges take.
+    fn build_wide_passthrough_file() -> Bytes {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let rows = 24_000usize;
+        let schema = Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("duration", DataType::Int64, true),
+            Field::new("code", DataType::Int64, true),
+            Field::new("svc", DataType::Utf8, true),
+            Field::new("level", DataType::Utf8, true),
+            Field::new("url", DataType::Utf8, true),
+        ]);
+        let mut rng = StdRng::seed_from_u64(0x4d36);
+        let ts: Vec<i64> = (0..rows).map(|i| 2_000_000 - i as i64).collect();
+        let duration: Vec<i64> = (0..rows).map(|_| rng.random_range(0..1_000_000)).collect();
+        let code: Vec<i64> = (0..rows).map(|i| (i % 7) as i64).collect();
+        let svc: Vec<String> = (0..rows).map(|i| format!("svc_{:02}", i % 13)).collect();
+        let level: Vec<String> = (0..rows)
+            .map(|i| ["info", "warn", "error"][i % 3].to_string())
+            .collect();
+        let url: Vec<String> = (0..rows)
+            .map(|i| format!("/api/v1/item/{}", i % 97))
+            .collect();
+        // incompressible padding keeps `_source` the dominant blob share,
+        // like real log/trace payloads
+        let sources: Vec<String> = (0..rows)
+            .map(|i| {
+                let pad: String = (0..288)
+                    .map(|_| char::from(b'a' + rng.random_range(0..26u8)))
+                    .collect();
+                format!("{{\"i\":{i},\"pad\":\"{pad}\"}}")
+            })
+            .collect();
+
+        // first-encode input with many small chunks (the merged-file shape
+        // whose encoded chunks the passthrough copies)
+        let input = {
+            let mut writer = VixWriter::new(
+                &schema,
+                VixWriterOptions {
+                    docs_chunk_bytes: 64 * 1024,
+                    ..Default::default()
+                },
+                false,
+            );
+            let batch = RecordBatch::try_new(
+                Arc::new(schema.clone()),
                 vec![
-                    (
-                        crate::container::BLOB_TYPE_DICT,
-                        crate::container::BLOB_TAG_DICT,
-                        dict,
-                    ),
-                    (
-                        crate::container::BLOB_TYPE_TERMS,
-                        crate::container::BLOB_TAG_TERMS,
-                        mem_bytes(container.terms),
-                    ),
-                    (
-                        crate::container::BLOB_TYPE_DOCS,
-                        crate::container::BLOB_TAG_DOCS,
-                        mem_bytes(container.docs),
-                    ),
+                    Arc::new(Int64Array::from(ts.clone())) as ArrayRef,
+                    Arc::new(Int64Array::from(duration.clone())) as ArrayRef,
+                    Arc::new(Int64Array::from(code.clone())) as ArrayRef,
+                    Arc::new(StringArray::from(svc.clone())) as ArrayRef,
+                    Arc::new(StringArray::from(level.clone())) as ArrayRef,
+                    Arc::new(StringArray::from(url.clone())) as ArrayRef,
                 ],
             )
-            .unwrap(),
+            .unwrap();
+            let source = StringArray::from(sources.clone());
+            writer
+                .push_batch_with_source(&batch, &source, None)
+                .unwrap();
+            let (data, _) = writer.finish().unwrap();
+            VixDocs::open(Bytes::from(data)).unwrap()
+        };
+        assert!(
+            input.zone_chunks().unwrap().len() >= 16,
+            "fixture must have many pushed chunks, got {}",
+            input.zone_chunks().unwrap().len()
         );
-        let source = CountingSource::new(corrupted);
-        VixReader::open_ranged(Arc::clone(&source) as Arc<dyn VixRangeSource>)
-            .err()
-            .expect("a corrupt dictionary must fail the reader open");
-        crate::VixDocs::open_ranged(Arc::clone(&source) as Arc<dyn VixRangeSource>)
-            .expect("docs must open even when the dictionary is unreadable");
+
+        // splice it through a passthrough writer (docs from encoded chunks,
+        // index from the pre-push)
+        let mut writer = VixWriter::new(
+            &schema,
+            VixWriterOptions {
+                docs_passthrough: true,
+                ..Default::default()
+            },
+            false,
+        );
+        writer
+            .push_docs_rows_index_only(
+                &Int64Array::from(ts.clone()),
+                &[],
+                &StringArray::from(sources.clone()),
+                None,
+            )
+            .unwrap();
+        let entries: Vec<crate::ZoneEntry> = input
+            .zone_chunks()
+            .unwrap()
+            .iter()
+            .map(|zone| (zone.row_count, zone.ts_min, zone.ts_max))
+            .collect();
+        let stats = input.spliceable_stats().unwrap().unwrap();
+        writer
+            .begin_docs_encoded_run(
+                rows as u64,
+                *ts.last().unwrap(),
+                ts[0],
+                &entries,
+                &stats,
+                Some(&[rows as u64]),
+            )
+            .unwrap();
+        input
+            .scan_docs_encoded_chunks(&mut |chunk| writer.push_docs_encoded_chunk(chunk))
+            .unwrap();
+        writer.finish_docs_encoded_run().unwrap();
+        let (data, _) = writer.finish().unwrap();
+        Bytes::from(data)
+    }
+
+    /// M6 pin (t1): a 2-column projection over a wide passthrough file
+    /// must fetch a small fraction of the blob — the M5 regression fetched
+    /// essentially ALL of it (interleaved leaves bridged by the ≤1 MiB
+    /// coalescer gap into whole-blob spans).
+    #[test]
+    fn passthrough_projection_fetch_budget() {
+        let data = build_wide_passthrough_file();
+        let file_size = data.len() as u64;
+        let mem = VixDocs::open(data.clone()).unwrap();
+        let source = CountingSource::new(data);
+        let ranged = VixDocs::open_ranged(Arc::clone(&source) as Arc<dyn VixRangeSource>).unwrap();
+        let projection = ["_timestamp".to_string(), "duration".to_string()];
+
+        for selection in [
+            None,
+            // dense uniform 10% selection (the M5 regression shape)
+            Some((0..mem.row_count()).step_by(10).collect::<Vec<u64>>()),
+        ] {
+            let before_bytes = source.bytes();
+            let mut ranged_rows = 0u64;
+            let mut batches = 0usize;
+            ranged
+                .scan_docs(Some(&projection), selection.clone(), None, &mut |batch| {
+                    ranged_rows += batch.num_rows() as u64;
+                    batches += 1;
+                    Ok(())
+                })
+                .unwrap();
+            let fetched = source.bytes() - before_bytes;
+            assert!(
+                fetched < file_size * 15 / 100,
+                "2-column projection (selection={}) fetched {fetched} of {file_size} bytes \
+                 (>{}%) — the projected ranged read is pulling unprojected columns again",
+                selection.is_some(),
+                fetched * 100 / file_size,
+            );
+            // coalesced narrow columns also mean coarse decode batches (the
+            // M5 in-memory +45% came from per-pushed-chunk batches)
+            assert!(
+                batches <= 8,
+                "2-column scan decoded {batches} batches — run coalescing is not active"
+            );
+            let mut mem_rows = 0u64;
+            mem.scan_docs(Some(&projection), selection, None, &mut |batch| {
+                mem_rows += batch.num_rows() as u64;
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(ranged_rows, mem_rows, "ranged/in-memory row parity");
+        }
+    }
+
+    /// M6 pin (t2): a needle selection must batch its fetches through the
+    /// coalescer — the M5 regression issued ONE GET PER SURVIVING CHUNK
+    /// (1600 round trips for 1600 rows; deadly on S3 latency).
+    #[test]
+    fn passthrough_needle_fetch_budget() {
+        let data = build_wide_passthrough_file();
+        let file_size = data.len() as u64;
+        let mem = VixDocs::open(data.clone()).unwrap();
+        let source = CountingSource::new(data);
+        let ranged = VixDocs::open_ranged(Arc::clone(&source) as Arc<dyn VixRangeSource>).unwrap();
+        let projection = ["_timestamp".to_string(), "duration".to_string()];
+
+        // one row per thousand: 24 scattered needles
+        let needles: Vec<u64> = (0..mem.row_count()).step_by(1000).collect();
+        let selected = needles.len();
+        let before_fetches = source.fetches();
+        let before_bytes = source.bytes();
+        let mut rows = 0u64;
+        ranged
+            .scan_docs(
+                Some(&projection),
+                Some(needles.clone()),
+                None,
+                &mut |batch| {
+                    rows += batch.num_rows() as u64;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let fetches = source.fetches() - before_fetches;
+        let fetched = source.bytes() - before_bytes;
+        assert_eq!(rows, selected as u64);
+        assert!(
+            fetches <= 12,
+            "needle selection of {selected} rows issued {fetches} fetches — \
+             selection-driven fetches are not batching through the coalescer"
+        );
+        assert!(
+            fetches < selected,
+            "fetch count {fetches} >= selected rows {selected}: the per-chunk \
+             round-trip pathology is back"
+        );
+        assert!(
+            fetched < file_size * 15 / 100,
+            "needle fetched {fetched} of {file_size} bytes (>{}%)",
+            fetched * 100 / file_size,
+        );
+        // row parity with the in-memory scan
+        let mut mem_rows = 0u64;
+        mem.scan_docs(Some(&projection), Some(needles), None, &mut |batch| {
+            mem_rows += batch.num_rows() as u64;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(rows, mem_rows);
     }
 }
 
@@ -4720,7 +5197,6 @@ fn build_multichunk_dataset(rows: usize) -> VixReader {
         Field::new("svc", DataType::Utf8, true),
     ]));
     let opts = VixWriterOptions {
-        column_store_field_names: vec!["svc".to_string()],
         // 1-byte budget clamps to the 1024-row chunk floor: several chunks
         docs_chunk_bytes: 1,
         ..Default::default()
@@ -4749,7 +5225,7 @@ fn build_multichunk_dataset(rows: usize) -> VixReader {
     writer
         .push_batch_with_source(&batch, &StringArray::from(sources), None)
         .unwrap();
-    VixReader::open(Bytes::from(writer.finish().unwrap())).unwrap()
+    finish_open(writer)
 }
 
 /// Dictionary-form column reads reassemble to exactly the canonical column
@@ -5147,20 +5623,23 @@ mod plist {
     #[test]
     fn plist_roundtrip_above_and_below_threshold() {
         let baseline = build_dataset(dataset_options());
-        let bytes = build_dataset_bytes(plist_options(4));
+        let (bytes, bytes_index) = build_dataset_bytes(plist_options(4));
 
-        // container: capability property + plist blob present
-        let meta = puffin::reader::parse_puffin_footer_from_bytes(&bytes).unwrap();
+        // sidecar: capability property + plist blob present
+        let meta = puffin::reader::parse_puffin_footer_from_bytes(
+            bytes_index.as_deref().expect("sidecar"),
+        )
+        .unwrap();
         assert_eq!(meta.properties["plist_min_docs"], "4");
         assert!(
             meta.blobs
                 .iter()
                 .any(|blob| blob.blob_type == "o2-vix-plist-v1"
                     && blob.properties["blob_tag"] == "plist"),
-            "plist blob missing from the container"
+            "plist blob missing from the sidecar"
         );
 
-        let reader = VixReader::open(Bytes::from(bytes)).unwrap();
+        let reader = open_built(bytes, bytes_index);
         assert_eq!(reader.plist_min_docs(), 4);
 
         // cell shapes — pointer (exactly 12 bytes) at/above the threshold:
@@ -5294,21 +5773,548 @@ mod plist {
     /// the option was never set (the field's default).
     #[test]
     fn plist_disabled_is_byte_identical() {
-        let default_bytes = build_dataset_bytes(dataset_options());
-        let off_bytes = build_dataset_bytes(plist_options(0));
+        let default_pair = build_dataset_bytes(dataset_options());
+        let off_pair = build_dataset_bytes(plist_options(0));
         assert!(
-            default_bytes == off_bytes,
+            default_pair == off_pair,
             "plist_min_docs = 0 must not change a single output byte \
-             ({} vs {} bytes)",
-            default_bytes.len(),
-            off_bytes.len()
+             ({}+{:?} vs {}+{:?} bytes)",
+            default_pair.0.len(),
+            default_pair.1.as_ref().map(Vec::len),
+            off_pair.0.len(),
+            off_pair.1.as_ref().map(Vec::len),
         );
-        let meta = puffin::reader::parse_puffin_footer_from_bytes(&off_bytes).unwrap();
+        let meta = puffin::reader::parse_puffin_footer_from_bytes(
+            off_pair.1.as_deref().expect("sidecar"),
+        )
+        .unwrap();
         assert!(!meta.properties.contains_key("plist_min_docs"));
         assert!(
             meta.blobs
                 .iter()
                 .all(|blob| blob.properties["blob_tag"] != "plist")
+        );
+    }
+}
+
+/// M10/#51b: the parallel k-way term merge must be byte-for-byte
+/// indistinguishable from the sequential one at the term-stream and bloom
+/// level — under every corpus shape that stressed the 2026-07-29 v1 range
+/// sampler corruption. `merge_kway_threads = 1` is the sequential path
+/// (exactly one range through the same code); `8` the parallel one.
+mod m10_parallel_kway {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+
+    use super::*;
+    use crate::{
+        DocIdMap,
+        merge::{partition_bounds, translate_bound},
+        query::{KEY_FIELD_ID, split_key, write_composite},
+    };
+
+    fn synth_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("aa", DataType::Utf8, true),
+            Field::new("bb", DataType::Utf8, true),
+            Field::new("cc", DataType::Utf8, true),
+        ]))
+    }
+
+    fn synth_opts() -> VixWriterOptions {
+        VixWriterOptions {
+            bloom_field_names: vec!["bb".to_string()],
+            bloom_composite: true,
+            ..Default::default()
+        }
+    }
+
+    /// One synthetic input of `rows` rows: per-row values from the
+    /// generators (`None` = null). Returns the reader plus the raw batch
+    /// and `_source` for the merged docs push.
+    fn synth_input(
+        opts: &VixWriterOptions,
+        ts_start: i64,
+        rows: usize,
+        aa: impl Fn(usize) -> Option<String>,
+        bb: impl Fn(usize) -> Option<String>,
+        cc: impl Fn(usize) -> Option<String>,
+    ) -> (VixReader, RecordBatch, StringArray) {
+        let schema = synth_schema();
+        // the writer refuses zero/negative timestamps: keep everything >= 1M
+        let ts: Vec<i64> = (0..rows).map(|r| 1_000_000 + ts_start + r as i64).collect();
+        let col = |make: &dyn Fn(usize) -> Option<String>| {
+            StringArray::from((0..rows).map(make).collect::<Vec<Option<String>>>())
+        };
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(ts)) as ArrayRef,
+                Arc::new(col(&aa)),
+                Arc::new(col(&bb)),
+                Arc::new(col(&cc)),
+            ],
+        )
+        .unwrap();
+        let source = synthesize_source_for_test(&batch);
+        let mut writer = VixWriter::new(&schema, opts.clone(), false);
+        writer.push_batch_with_source(&batch, &source, None).unwrap();
+        (finish_open(writer), batch, source)
+    }
+
+    /// Merge the inputs (concatenation-order offset maps) at the given
+    /// k-way range parallelism and return the finished `(data, sidecar)`.
+    fn merge_with_kway(
+        inputs: &[(VixReader, RecordBatch, StringArray)],
+        merged_opts: &VixWriterOptions,
+        kway: usize,
+    ) -> (Vec<u8>, Option<Vec<u8>>) {
+        let schema = synth_schema();
+        let refs: Vec<&VixReader> = inputs.iter().map(|(reader, _, _)| reader).collect();
+        let mut offset = 0u32;
+        let doc_maps: Vec<DocIdMap> = inputs
+            .iter()
+            .map(|(_, batch, _)| {
+                let map = DocIdMap::Offset(offset);
+                offset += batch.num_rows() as u32;
+                map
+            })
+            .collect();
+        let mut merged = VixWriter::new(
+            &schema,
+            VixWriterOptions {
+                merge_kway_threads: kway,
+                ..merged_opts.clone()
+            },
+            false,
+        );
+        merged.merge_input_indexes(&refs, &doc_maps, 8).unwrap();
+        for (_, batch, source) in inputs {
+            merged
+                .push_docs_rows_unindexed(
+                    &timestamps_of(batch),
+                    &cs_columns_of(batch, &["aa", "bb", "cc"]),
+                    source,
+                    None,
+                )
+                .unwrap();
+        }
+        merged.finish().unwrap()
+    }
+
+    /// The M7 fast-vs-rebuild digest: term count + an order-sensitive hash
+    /// of every `(key, doc_count, ids)` row.
+    fn term_digest(reader: &VixReader) -> (u64, u64) {
+        let mut hasher = DefaultHasher::new();
+        let mut count = 0u64;
+        reader
+            .for_each_term(&mut |key, doc_count, ids| {
+                key.hash(&mut hasher);
+                doc_count.hash(&mut hasher);
+                ids.hash(&mut hasher);
+                count += 1;
+                Ok(())
+            })
+            .unwrap();
+        (count, hasher.finish())
+    }
+
+    /// The serialized bloom blob of a finished sidecar (per-field sections
+    /// plus the #48 composite section).
+    fn bloom_blob(sidecar: &[u8]) -> Vec<u8> {
+        let meta = puffin::reader::parse_puffin_footer_from_bytes(sidecar).unwrap();
+        let blob = meta
+            .blobs
+            .iter()
+            .find(|blob| blob.properties["blob_tag"] == "bloom")
+            .expect("bloom blob");
+        let range = blob.get_offset(None);
+        sidecar[range.start as usize..range.end as usize].to_vec()
+    }
+
+    /// Sequential (kway=1) and parallel (kway=8) merges of the same inputs
+    /// must agree on the full term stream, the bloom bytes and the partial
+    /// fields.
+    fn assert_kway_equivalent(
+        inputs: &[(VixReader, RecordBatch, StringArray)],
+        merged_opts: &VixWriterOptions,
+        label: &str,
+    ) -> VixReader {
+        let (seq_data, seq_index) = merge_with_kway(inputs, merged_opts, 1);
+        let (par_data, par_index) = merge_with_kway(inputs, merged_opts, 8);
+        assert_eq!(
+            bloom_blob(seq_index.as_deref().expect("sidecar")),
+            bloom_blob(par_index.as_deref().expect("sidecar")),
+            "{label}: bloom blobs diverge"
+        );
+        let seq = open_built(seq_data, seq_index);
+        let par = open_built(par_data, par_index);
+        assert_eq!(
+            term_digest(&seq),
+            term_digest(&par),
+            "{label}: term digests diverge"
+        );
+        assert_eq!(
+            seq.partial_fields(),
+            par.partial_fields(),
+            "{label}: partial fields diverge"
+        );
+        par
+    }
+
+    /// Four disjoint-token inputs (the compaction common case), with a
+    /// direct build over the same rows as the independent oracle.
+    #[test]
+    fn disjoint_corpus_parallel_equals_sequential() {
+        let opts = synth_opts();
+        let inputs: Vec<_> = (0..4)
+            .map(|i| {
+                synth_input(
+                    &opts,
+                    i as i64 * 10_000,
+                    900,
+                    move |r| Some(format!("a{i}_{r:05}")),
+                    move |r| Some(format!("b{i}_{:05}", r / 3)),
+                    move |r| (r % 7 != 0).then(|| format!("c{i}_{:04}", r / 2)),
+                )
+            })
+            .collect();
+        let par = assert_kway_equivalent(&inputs, &opts, "disjoint");
+
+        // independent oracle: a direct build over the concatenated rows
+        let schema = synth_schema();
+        let batches: Vec<RecordBatch> = inputs.iter().map(|(_, b, _)| b.clone()).collect();
+        let concat = arrow::compute::concat_batches(&schema, &batches).unwrap();
+        let source = synthesize_source_for_test(&concat);
+        let mut direct = VixWriter::new(&schema, opts.clone(), false);
+        direct.push_batch_with_source(&concat, &source, None).unwrap();
+        let direct = finish_open(direct);
+        assert_eq!(
+            term_digest(&par),
+            term_digest(&direct),
+            "parallel merge diverges from the direct build"
+        );
+    }
+
+    /// Four inputs sharing one token universe: every output key unions
+    /// postings across all inputs, so range boundaries hit multi-way keys.
+    #[test]
+    fn overlapping_corpus_parallel_equals_sequential() {
+        let opts = synth_opts();
+        let inputs: Vec<_> = (0..4)
+            .map(|i| {
+                synth_input(
+                    &opts,
+                    i as i64 * 10_000,
+                    900,
+                    |r| Some(format!("a_{:05}", r)),
+                    |r| Some(format!("b_{:05}", r / 3)),
+                    |r| (r % 5 != 0).then(|| format!("c_{:04}", r / 2)),
+                )
+            })
+            .collect();
+        assert_kway_equivalent(&inputs, &opts, "overlapping");
+    }
+
+    /// M7-style demoted-mixed corpus: term-indexed inputs merged into a
+    /// bloom-only output field — the demoted fid's keys must route to their
+    /// range's worker for bloom absorption (never dict/terms emission), in
+    /// both modes identically.
+    #[test]
+    fn demoted_mixed_corpus_parallel_equals_sequential() {
+        let opts = synth_opts();
+        let inputs: Vec<_> = (0..3)
+            .map(|i| {
+                synth_input(
+                    &opts,
+                    i as i64 * 10_000,
+                    900,
+                    move |r| Some(format!("a{i}_{r:05}")),
+                    |r| Some(format!("b_{:05}", r / 2)),
+                    move |r| Some(format!("c{i}_{:04}", r / 3)),
+                )
+            })
+            .collect();
+        let demoting = VixWriterOptions {
+            bloom_only_field_names: vec!["aa".to_string()],
+            ..opts
+        };
+        let par = assert_kway_equivalent(&inputs, &demoting, "demoted-mixed");
+        assert!(
+            !par.has_term_capability("aa"),
+            "aa must be demoted in the merged output"
+        );
+    }
+
+    /// A bound landing EXACTLY on a fid's first key: `aa` holds 610 keys,
+    /// `bb` 590, so the total*4/8 quantile falls inside `aa`'s weight and
+    /// the bound snaps to `bb`'s first key (blocks cut at field
+    /// boundaries, so `bb`'s first key is a candidate).
+    #[test]
+    fn boundary_on_fid_first_key_parallel_equals_sequential() {
+        let opts = synth_opts();
+        let inputs = vec![synth_input(
+            &opts,
+            0,
+            610,
+            |r| Some(format!("a_{r:05}")),
+            |r| (r < 590).then(|| format!("b_{r:05}")),
+            |_| None,
+        )];
+        // prove the adversarial placement: with 8 ranges one bound IS the
+        // remapped first key of `bb` (output ids: aa=0, bb=1)
+        let out_ids: std::collections::HashMap<String, u16> =
+            [("aa".to_string(), 0u16), ("bb".to_string(), 1u16)]
+                .into_iter()
+                .collect();
+        let bounds = partition_bounds(&[&inputs[0].0], &out_ids, 8).unwrap();
+        let mut bb_first = Vec::new();
+        write_composite(&mut bb_first, b"b_00000", 1);
+        assert!(
+            bounds.contains(&bb_first),
+            "expected a bound exactly on bb's first key; bounds fids: {:?}",
+            bounds
+                .iter()
+                .map(|b| split_key(b).map(|(_, fid)| fid))
+                .collect::<Vec<_>>()
+        );
+        assert_kway_equivalent(&inputs, &opts, "fid-boundary bound");
+    }
+
+    /// One fid holding >90% of the keys: the block-key-count weighting must
+    /// pull the split points into that fid, and the digests must hold.
+    #[test]
+    fn skewed_fid_parallel_equals_sequential() {
+        let opts = synth_opts();
+        let inputs = vec![synth_input(
+            &opts,
+            0,
+            3000,
+            |r| Some(format!("a_{r:06}")),
+            |r| Some(format!("b_{:02}", r % 40)),
+            |r| Some(format!("c_{:02}", r % 40)),
+        )];
+        let out_ids: std::collections::HashMap<String, u16> = [
+            ("aa".to_string(), 0u16),
+            ("bb".to_string(), 1u16),
+            ("cc".to_string(), 2u16),
+        ]
+        .into_iter()
+        .collect();
+        let bounds = partition_bounds(&[&inputs[0].0], &out_ids, 8).unwrap();
+        assert!(!bounds.is_empty(), "a 3000-key input must yield bounds");
+        let inside_aa = bounds
+            .iter()
+            .filter(|b| split_key(b).is_some_and(|(_, fid)| fid == 0))
+            .count();
+        assert!(
+            inside_aa * 10 >= bounds.len() * 8,
+            "weighting must pull >=80% of bounds into the dominant fid \
+             ({inside_aa}/{} landed in aa)",
+            bounds.len()
+        );
+        assert_kway_equivalent(&inputs, &opts, "skewed fid");
+    }
+
+    /// More ranges than distinct keys: empty ranges must be harmless (the
+    /// assembly skips empty parts; nothing is emitted twice or dropped).
+    #[test]
+    fn more_ranges_than_keys_parallel_equals_sequential() {
+        let opts = synth_opts();
+        let inputs = vec![synth_input(
+            &opts,
+            0,
+            2,
+            |r| Some(format!("a_{r}")),
+            |_| None,
+            |_| None,
+        )];
+        assert_kway_equivalent(&inputs, &opts, "more ranges than keys");
+    }
+
+    /// Single-input merges must partition and reassemble identically (the
+    /// offset-0 single-contributor path reuses encoded cells verbatim).
+    #[test]
+    fn single_input_parallel_equals_sequential() {
+        let opts = synth_opts();
+        let inputs = vec![synth_input(
+            &opts,
+            0,
+            1500,
+            |r| Some(format!("a_{r:05}")),
+            |r| Some(format!("b_{:05}", r / 4)),
+            |r| (r % 3 == 0).then(|| format!("c_{:04}", r)),
+        )];
+        assert_kway_equivalent(&inputs, &opts, "single input");
+    }
+
+    /// The sampler's own contract: bounds are real remapped input keys,
+    /// strictly ascending, deduplicated; one range yields none; a
+    /// non-order-preserving remap disables partitioning entirely.
+    #[test]
+    fn sampler_bounds_are_real_sorted_and_gated() {
+        let opts = synth_opts();
+        let (r1, _, _) = synth_input(
+            &opts,
+            0,
+            900,
+            |r| Some(format!("a1_{r:05}")),
+            |r| Some(format!("b1_{:05}", r / 3)),
+            |_| None,
+        );
+        let (r2, _, _) = synth_input(
+            &opts,
+            10_000,
+            900,
+            |r| Some(format!("a2_{r:05}")),
+            |r| Some(format!("b2_{:05}", r / 3)),
+            |_| None,
+        );
+        let out_ids: std::collections::HashMap<String, u16> = [
+            ("aa".to_string(), 0u16),
+            ("bb".to_string(), 1u16),
+            ("cc".to_string(), 2u16),
+        ]
+        .into_iter()
+        .collect();
+        let inputs = [&r1, &r2];
+
+        // the full candidate universe, recomputed independently: every
+        // dict-block first key of every input, remapped to output ids
+        let mut candidates: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
+        for reader in inputs {
+            let entries = reader.field_entries();
+            let index = reader.dict_index().unwrap();
+            index
+                .walk_first_keys(|_, key| {
+                    let (token, fid) = split_key(key).unwrap();
+                    if fid == KEY_FIELD_ID {
+                        candidates.insert(key.to_vec());
+                    } else if let Some(&out) =
+                        entries.get(fid as usize).and_then(|e| out_ids.get(&e.name))
+                    {
+                        let mut k = Vec::new();
+                        write_composite(&mut k, token, out);
+                        candidates.insert(k);
+                    }
+                    true
+                })
+                .unwrap();
+        }
+
+        let bounds = partition_bounds(&inputs, &out_ids, 8).unwrap();
+        assert!(!bounds.is_empty());
+        for bound in &bounds {
+            assert!(
+                candidates.contains(bound),
+                "bound {bound:?} is not a real remapped input key"
+            );
+        }
+        assert!(
+            bounds.windows(2).all(|pair| pair[0] < pair[1]),
+            "bounds must be strictly ascending (sorted + deduplicated)"
+        );
+
+        // one range = no bounds
+        assert!(partition_bounds(&inputs, &out_ids, 1).unwrap().is_empty());
+
+        // a remap that reverses field order is not order-preserving: the
+        // sampler must refuse to partition (single-range fallback)
+        let reversed: std::collections::HashMap<String, u16> = [
+            ("aa".to_string(), 2u16),
+            ("bb".to_string(), 1u16),
+            ("cc".to_string(), 0u16),
+        ]
+        .into_iter()
+        .collect();
+        assert!(
+            partition_bounds(&inputs, &reversed, 8).unwrap().is_empty(),
+            "non-monotone remaps must disable partitioning"
+        );
+    }
+
+    /// `translate_bound`'s exactness contract, brute-forced: for every
+    /// emittable input key `k` and every bound `B`,
+    /// `k >= T(B) ⟺ remap(k) >= B`; translations are monotone in `B`
+    /// (consecutive ranges tile each input's raw key space).
+    #[test]
+    fn translate_bound_is_exact_and_monotone() {
+        // input fids 0..=3: 0 -> out 2, 1 -> dropped, 2 -> out 3, 3 -> out 7
+        let field_map: Vec<Option<u16>> = vec![Some(2), None, Some(3), Some(7)];
+        let tokens: [&[u8]; 4] = [b"", b"a", b"ab", b"z"];
+        let mut emittable: Vec<(Vec<u8>, Vec<u8>)> = Vec::new(); // (raw, remapped)
+        for (fid, mapped) in field_map.iter().enumerate() {
+            let Some(out) = mapped else { continue };
+            for token in tokens {
+                let mut raw = Vec::new();
+                write_composite(&mut raw, token, fid as u16);
+                let mut remapped = Vec::new();
+                write_composite(&mut remapped, token, *out);
+                emittable.push((raw, remapped));
+            }
+        }
+        // key terms are identity-mapped
+        for token in tokens {
+            let mut key = Vec::new();
+            write_composite(&mut key, token, KEY_FIELD_ID);
+            emittable.push((key.clone(), key));
+        }
+
+        // bounds: every remapped key, plus bounds at unmapped output fids
+        let mut bounds: Vec<Vec<u8>> = emittable.iter().map(|(_, m)| m.clone()).collect();
+        for fid in [0u16, 1, 4, 5, 8, 100] {
+            let mut b = Vec::new();
+            write_composite(&mut b, b"m", fid);
+            bounds.push(b);
+        }
+        bounds.sort();
+        bounds.dedup();
+
+        let mut prev_t: Option<Vec<u8>> = None;
+        for bound in &bounds {
+            let t = translate_bound(bound, &field_map).unwrap();
+            for (raw, remapped) in &emittable {
+                assert_eq!(
+                    raw.as_slice() >= t.as_slice(),
+                    remapped.as_slice() >= bound.as_slice(),
+                    "exactness violated: bound {bound:?}, T {t:?}, key {raw:?} -> {remapped:?}"
+                );
+            }
+            if let Some(prev) = &prev_t {
+                assert!(
+                    prev.as_slice() <= t.as_slice(),
+                    "translation must be monotone: {prev:?} then {t:?}"
+                );
+            }
+            prev_t = Some(t);
+        }
+
+        // spot-check the three translation shapes
+        let mk = |token: &[u8], fid: u16| {
+            let mut k = Vec::new();
+            write_composite(&mut k, token, fid);
+            k
+        };
+        // equal out fid: byte-exact within the field
+        assert_eq!(
+            translate_bound(&mk(b"tok", 3), &field_map).unwrap(),
+            mk(b"tok", 2)
+        );
+        // out fid between mapped ids (4 sits between out 3 and out 7): the
+        // next mapped INPUT field's 2-byte prefix — input fid 3 carries out 7
+        assert_eq!(
+            translate_bound(&mk(b"tok", 4), &field_map).unwrap(),
+            3u16.to_be_bytes().to_vec()
+        );
+        // beyond every mapped id: the key-term region prefix
+        assert_eq!(
+            translate_bound(&mk(b"tok", 8), &field_map).unwrap(),
+            KEY_FIELD_ID.to_be_bytes().to_vec()
+        );
+        // a key-term bound translates to itself
+        assert_eq!(
+            translate_bound(&mk(b"path", KEY_FIELD_ID), &field_map).unwrap(),
+            mk(b"path", KEY_FIELD_ID)
         );
     }
 }
@@ -5416,7 +6422,7 @@ mod index_merge {
     ) -> VixReader {
         let mut writer = VixWriter::new(schema, opts.clone(), false);
         writer.push_batch_with_source(batch, source, None).unwrap();
-        VixReader::open(Bytes::from(writer.finish().unwrap())).unwrap()
+        finish_open(writer)
     }
 
     /// Merge-path plist emission: plist-less inputs merged by a writer with
@@ -5445,7 +6451,7 @@ mod index_merge {
         let merged_batch = interleave_batches(&schema, &batches, &concat_order);
         let merged_source = interleave_strings(&sources.iter().collect::<Vec<_>>(), &concat_order);
 
-        let build_merged = |plist_min_docs: u32| -> Vec<u8> {
+        let build_merged = |plist_min_docs: u32| -> (Vec<u8>, Option<Vec<u8>>) {
             let mut merged = VixWriter::new(
                 &schema,
                 VixWriterOptions {
@@ -5466,17 +6472,23 @@ mod index_merge {
             merged.finish().unwrap()
         };
 
-        let baseline = VixReader::open(Bytes::from(build_merged(0))).unwrap();
-        let plist_bytes = build_merged(2);
-        let meta = puffin::reader::parse_puffin_footer_from_bytes(&plist_bytes).unwrap();
+        let baseline = {
+            let (data, index) = build_merged(0);
+            open_built(data, index)
+        };
+        let (plist_bytes, plist_index) = build_merged(2);
+        let meta = puffin::reader::parse_puffin_footer_from_bytes(
+            plist_index.as_deref().expect("sidecar"),
+        )
+        .unwrap();
         assert_eq!(meta.properties["plist_min_docs"], "2");
         assert!(
             meta.blobs
                 .iter()
                 .any(|blob| blob.properties["blob_tag"] == "plist"),
-            "merged container must carry the plist blob"
+            "the merged sidecar must carry the plist blob"
         );
-        let plist_reader = VixReader::open(Bytes::from(plist_bytes)).unwrap();
+        let plist_reader = open_built(plist_bytes, plist_index);
 
         // the whole resolved term stream matches the plist-less merge
         assert_eq!(all_terms(&plist_reader), all_terms(&baseline));
@@ -5542,7 +6554,7 @@ mod index_merge {
             "stage 3 resolves input pointer cells; the pre-flight must not reject them"
         );
 
-        let merge = |inputs: &[&VixReader], out_threshold: u32| -> Vec<u8> {
+        let merge = |inputs: &[&VixReader], out_threshold: u32| -> (Vec<u8>, Option<Vec<u8>>) {
             let mut merged = VixWriter::new(
                 &schema,
                 VixWriterOptions {
@@ -5564,17 +6576,11 @@ mod index_merge {
         };
 
         for out_threshold in [0u32, 2] {
-            let baseline = VixReader::open(Bytes::from(merge(
-                &plain.iter().collect::<Vec<_>>(),
-                out_threshold,
-            )))
-            .unwrap();
-            let from_capable = VixReader::open(Bytes::from(merge(
-                &capable.iter().collect::<Vec<_>>(),
-                out_threshold,
-            )))
-            .unwrap();
-            let from_mixed = VixReader::open(Bytes::from(merge(&mixed, out_threshold))).unwrap();
+            let open_merge = |pair: (Vec<u8>, Option<Vec<u8>>)| open_built(pair.0, pair.1);
+            let baseline = open_merge(merge(&plain.iter().collect::<Vec<_>>(), out_threshold));
+            let from_capable =
+                open_merge(merge(&capable.iter().collect::<Vec<_>>(), out_threshold));
+            let from_mixed = open_merge(merge(&mixed, out_threshold));
             assert_eq!(
                 all_terms(&from_capable),
                 all_terms(&baseline),
@@ -5663,15 +6669,15 @@ mod index_merge {
                     None,
                 )
                 .unwrap();
-            let (merged_bytes, merged_stats) = merged.finish_with_stats().unwrap();
-            let merged_reader = VixReader::open(Bytes::from(merged_bytes)).unwrap();
+            let (merged_bytes, merged_bytes_index, merged_stats) = merged.finish_with_stats().unwrap();
+            let merged_reader = open_built(merged_bytes, merged_bytes_index);
 
             let mut reference = VixWriter::new(&schema, opts.clone(), false);
             reference
                 .push_batch_with_source(&merged_batch, &merged_source, None)
                 .unwrap();
-            let (reference_bytes, reference_stats) = reference.finish_with_stats().unwrap();
-            let reference_reader = VixReader::open(Bytes::from(reference_bytes)).unwrap();
+            let (reference_bytes, reference_bytes_index, reference_stats) = reference.finish_with_stats().unwrap();
+            let reference_reader = open_built(reference_bytes, reference_bytes_index);
 
             assert_eq!(merged_stats.row_count, reference_stats.row_count, "{case}");
             assert_eq!(
@@ -5780,7 +6786,7 @@ mod index_merge {
         writer1
             .push_batch_with_source(&batch1, &source1, None)
             .unwrap();
-        let reader1 = VixReader::open(Bytes::from(writer1.finish().unwrap())).unwrap();
+        let reader1 = finish_open(writer1);
 
         // input 2: beta only
         let schema2 = Arc::new(Schema::new(vec![
@@ -5800,7 +6806,7 @@ mod index_merge {
         writer2
             .push_batch_with_source(&batch2, &source2, None)
             .unwrap();
-        let reader2 = VixReader::open(Bytes::from(writer2.finish().unwrap())).unwrap();
+        let reader2 = finish_open(writer2);
 
         // merged plan: code becomes a Timestamp column-store field — a type
         // with NO term derivation (numeric types would keep the remapped
@@ -5816,7 +6822,6 @@ mod index_merge {
             ),
         ]));
         let opts = VixWriterOptions {
-            column_store_field_names: vec!["code".to_string()],
             ..Default::default()
         };
         let merged_ts = Int64Array::from(vec![100, 90, 80, 70]);
@@ -5841,7 +6846,7 @@ mod index_merge {
                 None,
             )
             .unwrap();
-        let merged_reader = VixReader::open(Bytes::from(merged.finish().unwrap())).unwrap();
+        let merged_reader = finish_open(merged);
 
         // remapped lookups answer correctly
         assert_eq!(eval_set(&merged_reader, &exact("alpha", "x")), docs(&[0]));
@@ -5863,7 +6868,7 @@ mod index_merge {
                 None,
             )
             .unwrap();
-        let rebuild_reader = VixReader::open(Bytes::from(rebuild.finish().unwrap())).unwrap();
+        let rebuild_reader = finish_open(rebuild);
         assert_eq!(
             merged_reader.debug_all_terms().unwrap(),
             rebuild_reader.debug_all_terms().unwrap()
@@ -5900,7 +6905,7 @@ mod index_merge {
             (
                 batch,
                 source,
-                VixReader::open(Bytes::from(writer.finish().unwrap())).unwrap(),
+                finish_open(writer),
             )
         };
         let merge = |inputs: [&(RecordBatch, StringArray, VixReader); 2]| {
@@ -5915,7 +6920,7 @@ mod index_merge {
                     .push_docs_rows_unindexed(&timestamps_of(batch), &[], source, None)
                     .unwrap();
             }
-            VixReader::open(Bytes::from(merged.finish().unwrap())).unwrap()
+            finish_open(merged)
         };
 
         // both inputs dense in "api" -> merged dense -> elided again
@@ -5944,6 +6949,71 @@ mod index_merge {
         assert_eq!(eval_set(&merged, &exact("svc", "db")), docs(&[3]));
     }
 
+    /// The 2026-08-12 skip-without-degrade trade across a MERGE: the
+    /// inputs' per-field oversize-skip allowances SUM into the merged
+    /// file's `oversize_skips` property, so the merged dictionary serve
+    /// stays eligible — a lost allowance would demote every merged file
+    /// back to the scan fallback the trade exists to avoid.
+    #[test]
+    fn merge_sums_oversize_skip_allowances() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("f", DataType::Utf8, true),
+        ]));
+        let opts = VixWriterOptions {
+            max_raw_term_len: 8,
+            ..VixWriterOptions::default()
+        };
+        let build = |ts: Vec<i64>, values: Vec<Option<&str>>| -> VixReader {
+            let rows = ts.len();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(ts)) as ArrayRef,
+                    Arc::new(StringArray::from(values)),
+                ],
+            )
+            .unwrap();
+            let mut writer = VixWriter::new(&schema, opts.clone(), false);
+            writer
+                .push_batch_with_source(&batch, &dataset_sources(0..rows), None)
+                .unwrap();
+            finish_open(writer)
+        };
+        let long_a = "a".repeat(9);
+        let long_b = "b".repeat(9);
+        let f1 = build(vec![900, 800], vec![Some(long_a.as_str()), Some("ok")]);
+        let f2 = build(vec![700], vec![Some(long_b.as_str())]);
+        assert_eq!(f1.oversize_skips().get("f"), Some(&1));
+        assert_eq!(f2.oversize_skips().get("f"), Some(&1));
+
+        let mut merged = VixWriter::new(&schema, opts, false);
+        merged
+            .merge_input_indexes(&[&f1, &f2], &[DocIdMap::Offset(0), DocIdMap::Offset(2)], 1)
+            .unwrap();
+        merged
+            .push_docs_rows_unindexed(
+                &Int64Array::from(vec![900, 800, 700]),
+                &[],
+                &StringArray::from(vec![
+                    format!("{{\"f\":{long_a:?}}}"),
+                    r#"{"f":"ok"}"#.to_string(),
+                    format!("{{\"f\":{long_b:?}}}"),
+                ]),
+                None,
+            )
+            .unwrap();
+        let reader = finish_open(merged);
+        assert_eq!(reader.oversize_skips().get("f"), Some(&2));
+        assert!(reader.partial_fields().is_empty());
+        // the summed allowance keeps the merged serve eligible: 1 indexed
+        // value + 2 skipped == 3 key-term docs; counts omit both literals
+        assert_eq!(
+            reader.field_value_counts("f").unwrap(),
+            Some(vec![(b"ok".to_vec(), 1)]),
+        );
+    }
+
     /// Every incompatibility [`VixWriter::check_merge_inputs`] must reject
     /// (the compactor falls back to the term rebuild on any of them).
     #[test]
@@ -5958,13 +7028,14 @@ mod index_merge {
         writer.check_merge_inputs(&[&good]).unwrap();
 
         // foreign tokenizer property
-        let foreign = repack_with_properties(
-            {
-                let mut w = VixWriter::new(&schema, opts.clone(), false);
-                w.push_batch_with_source(&batches[0], &sources[0], None)
-                    .unwrap();
-                w.finish().unwrap()
-            },
+        let (foreign_data, foreign_index) = {
+            let mut w = VixWriter::new(&schema, opts.clone(), false);
+            w.push_batch_with_source(&batches[0], &sources[0], None)
+                .unwrap();
+            w.finish().unwrap()
+        };
+        let foreign_index = repack_with_properties(
+            foreign_index.expect("sidecar"),
             |properties| {
                 properties
                     .iter_mut()
@@ -5973,7 +7044,7 @@ mod index_merge {
                     .1 = "o2-v0".to_string();
             },
         );
-        let foreign = VixReader::open(Bytes::from(foreign)).unwrap();
+        let foreign = open_built(foreign_data, Some(foreign_index));
         let reason = writer.check_merge_inputs(&[&foreign]).unwrap_err();
         assert!(reason.contains("tokenizer"), "{reason}");
 
@@ -5981,13 +7052,14 @@ mod index_merge {
         // which the current writer cannot merge — forces the rebuild
         // (which re-tokenizes everything from `_source` with the canonical
         // tokenizer)
-        let legacy_v1 = repack_with_properties(
-            {
-                let mut w = VixWriter::new(&schema, opts.clone(), false);
-                w.push_batch_with_source(&batches[0], &sources[0], None)
-                    .unwrap();
-                w.finish().unwrap()
-            },
+        let (legacy_data, legacy_index) = {
+            let mut w = VixWriter::new(&schema, opts.clone(), false);
+            w.push_batch_with_source(&batches[0], &sources[0], None)
+                .unwrap();
+            w.finish().unwrap()
+        };
+        let legacy_index = repack_with_properties(
+            legacy_index.expect("sidecar"),
             |properties| {
                 properties
                     .iter_mut()
@@ -5996,7 +7068,7 @@ mod index_merge {
                     .1 = "o2-v1".to_string();
             },
         );
-        let legacy_v1 = VixReader::open(Bytes::from(legacy_v1)).unwrap();
+        let legacy_v1 = open_built(legacy_data, Some(legacy_index));
         let reason = writer.check_merge_inputs(&[&legacy_v1]).unwrap_err();
         assert!(reason.contains("tokenizer"), "{reason}");
         assert!(reason.contains("o2-v2"), "{reason}");
@@ -6021,7 +7093,7 @@ mod index_merge {
             let mut w = VixWriter::new(&schema, no_fts, false);
             w.push_batch_with_source(&batches[0], &sources[0], None)
                 .unwrap();
-            VixReader::open(Bytes::from(w.finish().unwrap())).unwrap()
+            finish_open(w)
         };
         let fts_plan = VixWriter::new(&schema, opts.clone(), false);
         let reason = fts_plan.check_merge_inputs(&[&term_input]).unwrap_err();
@@ -6041,7 +7113,7 @@ mod index_merge {
             None,
         )
         .unwrap();
-        let partial_input = VixReader::open(Bytes::from(w.finish().unwrap())).unwrap();
+        let partial_input = finish_open(w);
         assert!(partial_input.partial_fields().contains("extra"));
         let extra_schema = Schema::new(vec![
             Field::new("_timestamp", DataType::Int64, false),
@@ -6057,8 +7129,10 @@ mod index_merge {
         let no_extra_plan = VixWriter::new(&partial_schema, VixWriterOptions::default(), false);
         no_extra_plan.check_merge_inputs(&[&partial_input]).unwrap();
 
-        // a partial field the input DID value-index (oversize value) is
-        // mergeable: the dictionary holds everything a rebuild would
+        // an input whose only irregularity is an OVERSIZE value carries no
+        // taint at all since the 2026-08-12 skip-without-degrade call: its
+        // dictionary simply lacks that one literal (a rebuild could not
+        // index it either), so the fast path stays fully mergeable
         let oversize_opts = VixWriterOptions {
             max_raw_term_len: 8,
             ..VixWriterOptions::default()
@@ -6072,8 +7146,12 @@ mod index_merge {
             None,
         )
         .unwrap();
-        let oversize_input = VixReader::open(Bytes::from(w.finish().unwrap())).unwrap();
-        assert!(oversize_input.partial_fields().contains("msg"));
+        let oversize_input = finish_open(w);
+        assert!(
+            oversize_input.partial_fields().is_empty(),
+            "oversize values must not taint: {:?}",
+            oversize_input.partial_fields()
+        );
         let oversize_plan = VixWriter::new(&partial_schema, oversize_opts, false);
         oversize_plan
             .check_merge_inputs(&[&oversize_input])
@@ -6086,17 +7164,18 @@ mod index_merge {
         // drops the marking, un-tainting match_all for the merged file).
         // Fabricated via test-support property patching: the live pre-fix
         // shape is unbuildable through the current writer by design.
-        let tainted = crate::test_support::repack_with_partial_fields(
-            &{
-                let mut w = VixWriter::new(&schema, opts.clone(), false);
-                w.push_batch_with_source(&batches[0], &sources[0], None)
-                    .unwrap();
-                w.finish().unwrap()
-            },
+        let (tainted_data, tainted_index) = {
+            let mut w = VixWriter::new(&schema, opts.clone(), false);
+            w.push_batch_with_source(&batches[0], &sources[0], None)
+                .unwrap();
+            w.finish().unwrap()
+        };
+        let tainted_index = crate::test_support::repack_with_partial_fields(
+            tainted_index.as_deref().expect("sidecar"),
             &["log"],
         )
         .unwrap();
-        let tainted = VixReader::open(Bytes::from(tainted)).unwrap();
+        let tainted = open_built(tainted_data, Some(tainted_index));
         assert!(tainted.partial_fields().contains("log"));
         let fts_plan = VixWriter::new(&schema, opts.clone(), false);
         let reason = fts_plan.check_merge_inputs(&[&tainted]).unwrap_err();
@@ -6128,11 +7207,11 @@ mod index_merge {
             None,
         )
         .unwrap();
-        let bytes = w.finish().unwrap();
+        let (bytes, bytes_index) = w.finish().unwrap();
         let plan = VixWriter::new(&schema, VixWriterOptions::default(), false);
 
         // healthy: nothing lacking
-        let healthy = VixReader::open(Bytes::from(bytes.clone())).unwrap();
+        let healthy = open_built(bytes.clone(), bytes_index.clone());
         assert_eq!(
             plan.merge_inputs_lacking_term_capability(&[&healthy])
                 .unwrap(),
@@ -6141,9 +7220,12 @@ mod index_merge {
 
         // capability dropped (the pre-numeric-terms / demoted shape): the
         // carried field is reported
-        let dropped =
-            crate::test_support::repack_dropping_field_term_capability(&bytes, "code").unwrap();
-        let dropped = VixReader::open(Bytes::from(dropped)).unwrap();
+        let dropped = crate::test_support::repack_dropping_field_term_capability(
+            bytes_index.as_deref().expect("sidecar"),
+            "code",
+        )
+        .unwrap();
+        let dropped = open_built(bytes.clone(), Some(dropped));
         assert!(!dropped.has_term_capability("code"));
         assert!(dropped.key_term_exists("code").unwrap());
         assert_eq!(
@@ -6290,7 +7372,7 @@ mod review {
         column_writer
             .push_batch_with_source(&batch, &source, None)
             .unwrap();
-        let column_reader = VixReader::open(Bytes::from(column_writer.finish().unwrap())).unwrap();
+        let column_reader = finish_open(column_writer);
 
         // source-driven (compaction rebuild): the serialized `null` reads as
         // an absent field
@@ -6298,7 +7380,7 @@ mod review {
         source_writer
             .push_docs_rows(&Int64Array::from(vec![10]), &[], &source, None)
             .unwrap();
-        let source_reader = VixReader::open(Bytes::from(source_writer.finish().unwrap())).unwrap();
+        let source_reader = finish_open(source_writer);
 
         for (context, reader) in [("column", &column_reader), ("source", &source_reader)] {
             assert_eq!(
@@ -6327,12 +7409,12 @@ mod review {
         column_writer
             .push_batch_with_source(&batch, &source, None)
             .unwrap();
-        let column_reader = VixReader::open(Bytes::from(column_writer.finish().unwrap())).unwrap();
+        let column_reader = finish_open(column_writer);
         let mut source_writer = VixWriter::new(&schema, VixWriterOptions::default(), false);
         source_writer
             .push_docs_rows(&Int64Array::from(vec![10]), &[], &source, None)
             .unwrap();
-        let source_reader = VixReader::open(Bytes::from(source_writer.finish().unwrap())).unwrap();
+        let source_reader = finish_open(source_writer);
         assert_eq!(
             column_reader.key_exists("ratio").unwrap().count_set_bits(),
             source_reader.key_exists("ratio").unwrap().count_set_bits(),
@@ -6348,8 +7430,8 @@ mod review {
     /// ~4 KiB rows and a 16 KiB budget the writer cuts 64-row blocks and
     /// vortex's pipeline coalesces them only up to its ~1 MiB segment
     /// minimum (256 rows here) — the old floor forced 1024-row ~4.2 MiB
-    /// decode units regardless of the budget. With the default 4 MiB
-    /// budget the floor engages only past ~64 KiB average rows.
+    /// decode units regardless of the budget. With the default 16 MiB
+    /// budget the floor engages only past ~256 KiB average rows.
     #[test]
     fn review_docs_chunk_row_floor_overrides_byte_budget_for_wide_rows() {
         let schema = Schema::new(vec![Field::new("_timestamp", DataType::Int64, false)]);
@@ -6364,7 +7446,7 @@ mod review {
         let source =
             StringArray::from_iter_values((0..rows).map(|_| format!("{{\"log\":\"{wide}\"}}")));
         writer.push_docs_rows(&ts, &[], &source, None).unwrap();
-        let bytes = Bytes::from(writer.finish().unwrap());
+        let bytes = Bytes::from(writer.finish().unwrap().0);
 
         let docs = VixDocs::open(bytes).unwrap();
         let batches = docs.read_docs(None, None, None).unwrap();
@@ -6385,31 +7467,40 @@ mod review {
     }
 
     /// Companion to the floor change: normal ~1-2 KiB rows under the
-    /// default 4 MiB budget keep their chunk row count (the budget, not the
-    /// floor, decides — exactly as before the floor was lowered), so
-    /// full-scan throughput of typical files is untouched.
+    /// default 16 MiB budget keep their budget-derived chunk row count (the
+    /// budget — neither the floor nor the cap — decides), so full-scan
+    /// throughput of typical files is untouched. The corpus is bigger than
+    /// one budget so the budget actually cuts the file (M9: 6,000 rows fit
+    /// a single 16 MiB chunk and proved nothing).
     #[test]
     fn docs_chunk_default_budget_unchanged_for_normal_rows() {
         let schema = Schema::new(vec![Field::new("_timestamp", DataType::Int64, false)]);
-        let rows = 6000usize;
+        let rows = 30_000usize;
         let body = "x".repeat(1500);
         let mut writer = VixWriter::new(&schema, VixWriterOptions::default(), false);
         let ts = Int64Array::from((1..=rows as i64).rev().collect::<Vec<_>>());
         let source =
             StringArray::from_iter_values((0..rows).map(|_| format!("{{\"log\":\"{body}\"}}")));
         writer.push_docs_rows(&ts, &[], &source, None).unwrap();
-        let bytes = Bytes::from(writer.finish().unwrap());
+        let bytes = Bytes::from(writer.finish().unwrap().0);
 
         let docs = VixDocs::open(bytes).unwrap();
         let batches = docs.read_docs(None, None, None).unwrap();
         let chunk_rows: Vec<usize> = batches.iter().map(RecordBatch::num_rows).collect();
         assert_eq!(chunk_rows.iter().sum::<usize>(), rows);
         let max_chunk = chunk_rows.iter().copied().max().unwrap();
-        // budget/avg ≈ 4 MiB / ~1.5 KiB ≈ 2700 rows: far above both the old
+        // budget/avg ≈ 16 MiB / ~1.5 KiB ≈ 11k rows: far above both the old
         // (1024) and new (64) floor — the floor change cannot alter it
         assert!(
             max_chunk > 1024,
             "normal rows must still be budget-sized, got {max_chunk} (chunks: {chunk_rows:?})"
+        );
+        // and far below the file: the byte budget (not the 65,536 cap, not
+        // file size) is what cut it
+        assert!(
+            max_chunk < rows,
+            "the 16 MiB budget must cut a {rows}-row file into several chunks, \
+             got one of {max_chunk} (chunks: {chunk_rows:?})"
         );
         assert!(max_chunk <= 65536);
     }
@@ -6440,17 +7531,17 @@ mod review {
                 (0..rows).map(|i| format!("{{\"i\":{i},\"log\":\"{payload}\"}}")),
             );
             writer.push_docs_rows(&ts, &[], &source, None).unwrap();
-            Bytes::from(writer.finish().unwrap())
+            Bytes::from(writer.finish().unwrap().0)
         };
 
         // budget -> effective rows/chunk with ~8.2 KiB rows (the writer's
         // 64-row blocks get coalesced by vortex up to its ~1 MiB minimum):
         //   16 KiB    -> ~128 (the new floor + vortex 1 MiB coalescing),
-        //   4 MiB     -> ~500 (default budget, unchanged by the floor),
+        //   16 MiB    -> ~2000 (default budget, unchanged by the floor),
         //   8.75 MiB  -> ~1024 (the OLD floor's chunking, for comparison)
         for (label, budget) in [
             ("new floor + coalesce", 16 * 1024),
-            ("default 4MiB budget", crate::DEFAULT_DOCS_CHUNK_BYTES),
+            ("default 16MiB budget", crate::DEFAULT_DOCS_CHUNK_BYTES),
             ("old floor (~1024 rows)", 8 * 1024 * 1024 + 768 * 1024),
         ] {
             let bytes = build(budget);
@@ -6542,7 +7633,7 @@ mod review_query_eval {
         writer
             .push_batch_with_source(&batch, &StringArray::from(sources), None)
             .unwrap();
-        VixReader::open(Bytes::from(writer.finish().unwrap())).unwrap()
+        finish_open(writer)
     }
 
     /// FIXED (was `review_finding_empty_string_values_invisible_and_not_
@@ -6836,7 +7927,7 @@ mod review_query_eval {
         writer
             .push_batch_with_source(&batch, &StringArray::from(sources), None)
             .unwrap();
-        let reader = VixReader::open(Bytes::from(writer.finish().unwrap())).unwrap();
+        let reader = finish_open(writer);
         assert!(
             reader.term_row_group_count() >= 3,
             "the fat values must force several dictionary blocks, got {}",
@@ -7030,7 +8121,7 @@ fn numeric_and_bool_value_terms_roundtrip() {
     writer
         .push_batch_with_source(&batch, &source, None)
         .unwrap();
-    let reader = VixReader::open(Bytes::from(writer.finish().unwrap())).unwrap();
+    let reader = finish_open(writer);
 
     // canonical float form: ryu shortest — the VALUE 38.0, not a spelling
     assert_eq!(
@@ -7120,8 +8211,8 @@ fn numeric_terms_agree_between_column_and_source_paths() {
         .push_docs_rows(&timestamps_of(&batch), &[], &source, None)
         .unwrap();
 
-    let column_reader = VixReader::open(Bytes::from(column_driven.finish().unwrap())).unwrap();
-    let source_reader = VixReader::open(Bytes::from(source_driven.finish().unwrap())).unwrap();
+    let column_reader = finish_open(column_driven);
+    let source_reader = finish_open(source_driven);
     assert_eq!(
         column_reader.debug_all_terms().unwrap(),
         source_reader.debug_all_terms().unwrap()
@@ -7137,7 +8228,7 @@ fn numeric_terms_agree_between_column_and_source_paths() {
     variant_writer
         .push_docs_rows(&Int64Array::from(vec![100, 99]), &[], &spelled, None)
         .unwrap();
-    let variant_reader = VixReader::open(Bytes::from(variant_writer.finish().unwrap())).unwrap();
+    let variant_reader = finish_open(variant_writer);
     assert_eq!(
         eval_set(&variant_reader, &exact_numeric("credit", "38.0")),
         docs(&[0, 1])
@@ -7181,7 +8272,7 @@ fn merge_demotes_capability_carried_without_terms() {
     old_writer
         .push_batch_with_source(&old_batch, &old_source, None)
         .unwrap();
-    let old_reader = VixReader::open(Bytes::from(old_writer.finish().unwrap())).unwrap();
+    let old_reader = finish_open(old_writer);
     assert!(!old_reader.has_term_capability("code"));
     assert!(old_reader.key_term_exists("code").unwrap());
 
@@ -7205,7 +8296,7 @@ fn merge_demotes_capability_carried_without_terms() {
     new_writer
         .push_batch_with_source(&new_batch, &new_source, None)
         .unwrap();
-    let new_reader = VixReader::open(Bytes::from(new_writer.finish().unwrap())).unwrap();
+    let new_reader = finish_open(new_writer);
     assert!(new_reader.has_term_capability("code"));
 
     // Index-merge fast path over old + new.
@@ -7223,7 +8314,7 @@ fn merge_demotes_capability_carried_without_terms() {
     merged
         .push_docs_rows_unindexed(&merged_ts, &[], &merged_source, None)
         .unwrap();
-    let merged_reader = VixReader::open(Bytes::from(merged.finish().unwrap())).unwrap();
+    let merged_reader = finish_open(merged);
 
     // `code` is DEMOTED: no term capability (per-field lookups error →
     // callers skip + filter back), while its key terms stay exact and the
@@ -7246,7 +8337,7 @@ fn merge_demotes_capability_carried_without_terms() {
     rebuild
         .push_docs_rows(&merged_ts, &[], &merged_source, None)
         .unwrap();
-    let rebuild_reader = VixReader::open(Bytes::from(rebuild.finish().unwrap())).unwrap();
+    let rebuild_reader = finish_open(rebuild);
     assert!(rebuild_reader.has_term_capability("code"));
     assert_eq!(
         eval_set(&rebuild_reader, &exact_numeric("code", "38")),
@@ -7272,7 +8363,7 @@ fn merge_demotes_capability_carried_without_terms() {
             None,
         )
         .unwrap();
-    let both_reader = VixReader::open(Bytes::from(both_new.finish().unwrap())).unwrap();
+    let both_reader = finish_open(both_new);
     assert!(both_reader.has_term_capability("code"));
     assert_eq!(
         eval_set(&both_reader, &exact_numeric("code", "38")),
@@ -7311,7 +8402,7 @@ fn writer_stats_track_timestamp_range() {
     writer
         .push_batch_with_source(&batch, &synthesize_source_for_test(&batch), None)
         .unwrap();
-    let (_, stats) = writer.finish_with_stats().unwrap();
+    let (_, __index, stats) = writer.finish_with_stats().unwrap();
     assert_eq!((stats.min_ts, stats.max_ts), (100, 900));
 
     // source-driven push
@@ -7323,12 +8414,12 @@ fn writer_stats_track_timestamp_range() {
     writer
         .push_docs_rows(&Int64Array::from(vec![42, 7]), &[], &source, None)
         .unwrap();
-    let (_, stats) = writer.finish_with_stats().unwrap();
+    let (_, __index, stats) = writer.finish_with_stats().unwrap();
     assert_eq!((stats.min_ts, stats.max_ts), (7, 42));
 
     // empty file: 0/0
     let writer = VixWriter::new(&schema, VixWriterOptions::default(), false);
-    let (_, stats) = writer.finish_with_stats().unwrap();
+    let (_, __index, stats) = writer.finish_with_stats().unwrap();
     assert_eq!((stats.min_ts, stats.max_ts), (0, 0));
 }
 
@@ -7405,8 +8496,10 @@ fn test_support_unguarded_finish_fabricates_zero_ts_file() {
             None,
         )
         .unwrap();
-    let data = crate::test_support::finish_ignoring_timestamp_guard(writer).unwrap();
-    let reader = VixReader::open(bytes::Bytes::from(data)).unwrap();
+    let (data, index) = crate::test_support::finish_ignoring_timestamp_guard(writer).unwrap();
+    let reader =
+        VixReader::open_with_index(bytes::Bytes::from(data), index.map(bytes::Bytes::from))
+            .unwrap();
     assert_eq!(reader.row_count(), 3);
     let stored = reader.read_docs_column("_timestamp").unwrap();
     let stored = stored
@@ -7446,7 +8539,7 @@ fn numeric_term_dictionary_growth_is_bounded() {
         writer
             .push_batch_with_source(&batch, &source, None)
             .unwrap();
-        let (_, stats) = writer.finish_with_stats().unwrap();
+        let (_, __index, stats) = writer.finish_with_stats().unwrap();
         stats
     };
     let with = build(true);
@@ -7475,13 +8568,12 @@ mod zone_map_tests {
     /// several entries for the multi-row datasets here. Zones are derived from
     /// the stored `_timestamp` values, so the tiny budget shapes the zone
     /// granularity without needing large rows.
-    fn build_ts_file(ts: &[i64]) -> Vec<u8> {
+    fn build_ts_file(ts: &[i64]) -> (Vec<u8>, Option<Vec<u8>>) {
         let schema = Arc::new(Schema::new(vec![
             Field::new("_timestamp", DataType::Int64, false),
             Field::new("svc", DataType::Utf8, true),
         ]));
         let opts = VixWriterOptions {
-            column_store_field_names: vec!["svc".to_string()],
             docs_chunk_bytes: 1, // -> 64 rows/chunk (the row floor)
             ..Default::default()
         };
@@ -7541,7 +8633,10 @@ mod zone_map_tests {
     #[test]
     fn zone_map_roundtrip_matches_chunk_stats() {
         let ts: Vec<i64> = (0..300).map(|i| 5000 - i).collect(); // sorted DESC
-        let reader = VixReader::open(Bytes::from(build_ts_file(&ts))).unwrap();
+        let reader = {
+            let (data, index) = build_ts_file(&ts);
+            open_built(data, index)
+        };
         let chunks = reader
             .zone_chunks()
             .expect("a freshly written file carries a zone table")
@@ -7603,10 +8698,9 @@ mod zone_map_tests {
             ("piecewise", &piecewise),
             ("adversarial", &adversarial),
         ] {
-            let bytes = build_ts_file(ts);
-            let zoned = VixReader::open(Bytes::from(bytes.clone())).unwrap();
-            let decode =
-                VixReader::open(Bytes::from(strip_zone_map_property(&bytes).unwrap())).unwrap();
+            let (bytes, bytes_index) = build_ts_file(ts);
+            let zoned = open_built(bytes.clone(), bytes_index.clone());
+            let decode = open_built(strip_zone_map_property(&bytes).unwrap(), bytes_index.clone());
             assert!(
                 zoned.zone_chunks().is_some(),
                 "{name}: expected a zone table"
@@ -7658,7 +8752,7 @@ mod zone_map_tests {
         let build = |b: &RecordBatch, s: &StringArray| -> VixReader {
             let mut w = VixWriter::new(&schema, opts.clone(), false);
             w.push_batch_with_source(b, s, None).unwrap();
-            VixReader::open(Bytes::from(w.finish().unwrap())).unwrap()
+            finish_open(w)
         };
         let r0 = build(&b0, &s0);
         let r1 = build(&b1, &s1);
@@ -7679,7 +8773,7 @@ mod zone_map_tests {
                 )
                 .unwrap();
         }
-        let merged_reader = VixReader::open(Bytes::from(merged.finish().unwrap())).unwrap();
+        let merged_reader = finish_open(merged);
 
         // the merged file carries a re-derived, correct zone table
         let chunks = merged_reader
@@ -7720,11 +8814,10 @@ mod zone_map_tests {
             Field::new("svc", DataType::Utf8, true),
         ]));
         let opts = VixWriterOptions {
-            column_store_field_names: vec!["svc".to_string()],
             ..Default::default()
         };
         let writer = VixWriter::new(&schema, opts, false);
-        let reader = VixReader::open(Bytes::from(writer.finish().unwrap())).unwrap();
+        let reader = finish_open(writer);
         assert_eq!(reader.row_count(), 0);
         assert!(reader.zone_chunks().is_none());
         assert_eq!(reader.timestamp_range(0, 100).unwrap().len(), 0);
@@ -7740,7 +8833,8 @@ mod zone_map_tests {
 fn probe_file_source_integrity() {
     let path = std::env::var("VIX_PROBE_FILE").expect("set VIX_PROBE_FILE");
     let bytes = std::fs::read(&path).unwrap();
-    let reader = crate::VixReader::open(Bytes::from(bytes)).unwrap();
+    // data-only open: `_source`/`_timestamp` integrity needs no sidecar
+    let reader = VixReader::open(Bytes::from(bytes)).unwrap();
     let ts = as_i64_array(reader.read_docs_column("_timestamp").unwrap().as_ref());
     let src_col = reader.read_docs_column("_source").unwrap();
     let src = as_string_array(src_col.as_ref());
@@ -7976,7 +9070,7 @@ fn file_blooms_survive_index_merge() {
         writer
             .push_batch_with_source(&batch, &StringArray::from(sources), None)
             .unwrap();
-        VixReader::open(Bytes::from(writer.finish().unwrap())).unwrap()
+        finish_open(writer)
     };
 
     let newer = build_input(2000, "a");
@@ -7996,7 +9090,7 @@ fn file_blooms_survive_index_merge() {
     merged
         .push_docs_rows_unindexed(&merged_ts, &[], &merged_source, None)
         .unwrap();
-    let merged_reader = VixReader::open(Bytes::from(merged.finish().unwrap())).unwrap();
+    let merged_reader = finish_open(merged);
 
     let blooms = merged_reader.file_blooms().unwrap().unwrap();
     assert_eq!(blooms.len(), 1);
@@ -8066,7 +9160,7 @@ fn bloom_bits_pinned_to_v1_key_form() {
 /// strategy, do not delete the test.
 #[test]
 fn docs_column_stats_from_footer() {
-    let docs = crate::VixDocs::open(Bytes::from(build_docs_dataset_bytes(false))).unwrap();
+    let docs = crate::VixDocs::open(Bytes::from(build_docs_dataset_bytes(false).0)).unwrap();
     use crate::docs::NumScalar;
     let (min, max) = docs
         .column_stats("code")
@@ -8087,8 +9181,8 @@ fn docs_column_stats_from_footer() {
 /// keeps, across inclusive/exclusive shapes; limit stops the scan.
 #[test]
 fn docs_scan_bounds_and_limit() {
-    use crate::docs::{ColumnBound, NumScalar};
-    let docs = crate::VixDocs::open(Bytes::from(build_docs_dataset_bytes(false))).unwrap();
+    use crate::docs::{BoundValue, ColumnBound};
+    let docs = crate::VixDocs::open(Bytes::from(build_docs_dataset_bytes(false).0)).unwrap();
     let scan = |bounds: &[ColumnBound], limit: Option<u64>| -> Vec<i64> {
         let mut out = Vec::new();
         docs.scan_docs_opts(
@@ -8122,14 +9216,14 @@ fn docs_scan_bounds_and_limit() {
         max,
     };
     // code > 4 (exclusive; null rows never match)
-    let got = scan(&[bound(Some((NumScalar::I64(4), false)), None)], None);
+    let got = scan(&[bound(Some((BoundValue::I64(4), false)), None)], None);
     let want: Vec<i64> = all.iter().copied().filter(|c| *c > 4).collect();
     assert_eq!(got, want);
     // 2 <= code <= 8
     let got = scan(
         &[bound(
-            Some((NumScalar::I64(2), true)),
-            Some((NumScalar::I64(8), true)),
+            Some((BoundValue::I64(2), true)),
+            Some((BoundValue::I64(8), true)),
         )],
         None,
     );
@@ -8142,8 +9236,8 @@ fn docs_scan_bounds_and_limit() {
     // equality via min==max inclusive
     let got = scan(
         &[bound(
-            Some((NumScalar::I64(7), true)),
-            Some((NumScalar::I64(7), true)),
+            Some((BoundValue::I64(7), true)),
+            Some((BoundValue::I64(7), true)),
         )],
         None,
     );
@@ -8152,7 +9246,7 @@ fn docs_scan_bounds_and_limit() {
     let got = scan(
         &[ColumnBound {
             column: "not_a_column".to_string(),
-            min: Some((NumScalar::I64(1), true)),
+            min: Some((BoundValue::I64(1), true)),
             max: None,
         }],
         None,
@@ -8184,4 +9278,3804 @@ fn docs_scan_bounds_and_limit() {
     )
     .unwrap();
     assert_eq!(par, all);
+}
+
+/// #40 index-off roundtrip: a writer built with `index_enabled: false`
+/// produces a COLUMN-STORE-ONLY file — `index=none` stamped, no term/fts
+/// entries, no partial fields (even for values that WOULD be oversize-partial
+/// when indexed), zero index bytes — whose docs columns read back intact,
+/// whose condition-free evals stay valid, and whose term-query evals ERROR
+/// (per-file degradation to the scan branch, never a silent empty match).
+#[test]
+fn index_off_writer_roundtrip_column_store_only() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("_timestamp", DataType::Int64, false),
+        Field::new("big", DataType::Utf8, true),
+        Field::new("code", DataType::Int64, true),
+        Field::new("log", DataType::Utf8, true),
+        Field::new("svc", DataType::Utf8, true),
+    ]));
+    // `big` row 0 exceeds max_raw_term_len: an INDEXED build skips its
+    // term without degrade (2026-08-12); the index-off build has no term
+    // plan at all — neither may taint
+    let oversize = "x".repeat(64);
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(Int64Array::from(vec![1004, 1003, 1002, 1001])),
+        Arc::new(StringArray::from(vec![
+            Some(oversize.as_str()),
+            Some("short"),
+            None,
+            Some("tiny"),
+        ])),
+        Arc::new(Int64Array::from(vec![
+            Some(500),
+            Some(200),
+            None,
+            Some(404),
+        ])),
+        Arc::new(StringArray::from(vec![
+            Some("error timeout db"),
+            Some("all good"),
+            Some("warn disk"),
+            None,
+        ])),
+        Arc::new(StringArray::from(vec![
+            Some("api"),
+            Some("api"),
+            Some("db"),
+            Some("web"),
+        ])),
+    ];
+    let batch = RecordBatch::try_new(Arc::clone(&schema), columns).unwrap();
+    let sources = StringArray::from_iter_values((0..4).map(|i| format!("{{\"row\":{i}}}")));
+    // every writer materializes EVERY schema field as a docs column (v2)
+    let opts = |index_enabled: bool| VixWriterOptions {
+        fts_field_names: vec!["log".to_string()],
+        max_raw_term_len: 8,
+        index_enabled,
+        ..Default::default()
+    };
+
+    let mut writer = VixWriter::new(&schema, opts(false), false);
+    writer
+        .push_batch_with_source(&batch, &sources, None)
+        .unwrap();
+    let (bytes, bytes_index, stats) = writer.finish_with_stats().unwrap();
+
+    assert_eq!(stats.row_count, 4);
+    assert_eq!(stats.term_count, 0, "no terms of any kind");
+    assert_eq!(stats.index_size, 0, "no dict/terms/bloom bytes");
+    assert!(stats.docs_size > 0, "the docs blob is the whole payload");
+
+    let reader = open_built(bytes, bytes_index);
+    assert!(!reader.has_index(), "index=none must round-trip");
+    assert_eq!(reader.term_count(), 0);
+    assert!(
+        reader.term_field_names().is_empty(),
+        "no term field entries"
+    );
+    assert!(reader.fts_fields().is_empty(), "no fts field entries");
+    assert!(
+        reader.partial_fields().is_empty(),
+        "an empty term plan can never mark partials — the oversize value is \
+         simply not indexed, like everything else"
+    );
+    for field in ["big", "code", "log", "svc"] {
+        assert!(
+            !reader.has_term_capability(field),
+            "{field}: no term capability on an index-off file"
+        );
+        assert!(
+            reader.has_column_store_field(field),
+            "{field}: every schema field must be a docs column"
+        );
+    }
+
+    // docs columns read back intact (order preserved: pushed as-is)
+    assert_eq!(
+        as_i64_array(reader.read_docs_column("_timestamp").unwrap().as_ref())
+            .values()
+            .to_vec(),
+        vec![1004, 1003, 1002, 1001]
+    );
+    let svc = as_string_array(reader.read_docs_column("svc").unwrap().as_ref());
+    assert_eq!(
+        svc.iter()
+            .map(|v| v.map(str::to_string))
+            .collect::<Vec<_>>(),
+        vec![
+            Some("api".to_string()),
+            Some("api".to_string()),
+            Some("db".to_string()),
+            Some("web".to_string())
+        ]
+    );
+    let code = as_i64_array(reader.read_docs_column("code").unwrap().as_ref());
+    assert_eq!(
+        code.iter().collect::<Vec<_>>(),
+        vec![Some(500), Some(200), None, Some(404)]
+    );
+
+    // condition-free evals stay valid: All matches every row, exact count
+    assert_eq!(eval_set(&reader, &VixQuery::All), docs(&[0, 1, 2, 3]));
+    assert_eq!(reader.count(&VixQuery::All).unwrap(), 4);
+
+    // ANY term-shaped eval errors — never an empty (row-dropping) result
+    assert!(reader.eval(&exact("svc", "api")).is_err());
+    assert!(reader.eval(&any_token("error")).is_err());
+    assert!(reader.eval(&key_exists_query("svc")).is_err());
+    assert!(reader.count(&exact("svc", "api")).is_err());
+
+    // ... and the dictionary-absence probe stays void-by-construction:
+    // key_term_exists finds nothing, which is exactly why readers must gate
+    // on has_index() before trusting it (FieldCap guard in the query layer)
+    assert!(!reader.key_term_exists("svc").unwrap());
+
+    // control: the SAME data built with index_enabled: true opens as an
+    // indexed file (absent property = legacy default). The oversize "big"
+    // value skips its term WITHOUT degrading the field (2026-08-12), so
+    // the indexed control is taint-free too — the builds differ only in
+    // having an index at all
+    let mut indexed = VixWriter::new(&schema, opts(true), false);
+    indexed
+        .push_batch_with_source(&batch, &sources, None)
+        .unwrap();
+    let indexed = finish_open(indexed);
+    assert!(indexed.has_index());
+    assert!(indexed.term_count() > 0);
+    assert!(indexed.partial_fields().is_empty());
+    assert_eq!(eval_set(&indexed, &exact("svc", "api")), docs(&[0, 1]));
+    // the accepted miss: the skipped oversize literal finds nothing
+    assert_eq!(eval_set(&indexed, &exact("big", &oversize)), docs(&[]));
+}
+
+/// Helper for the index-off roundtrip: a `KeyExists` query (IS NOT NULL
+/// shape) — one of the condition shapes that bypass per-field capability.
+fn key_exists_query(path: &str) -> VixQuery {
+    VixQuery::KeyExists {
+        path: path.to_string(),
+    }
+}
+
+/// #51c: the encoded-run API refuses outright unless the writer was built
+/// with `docs_passthrough` — a standard encoder would route pre-encoded
+/// chunks through a pipeline that cannot account for them.
+#[test]
+fn encoded_run_requires_passthrough_writer() {
+    let schema = Schema::new(vec![Field::new("_timestamp", DataType::Int64, false)]);
+    let mut writer = VixWriter::new(&schema, VixWriterOptions::default(), false);
+    let err = writer
+        .begin_docs_encoded_run(1, 1, 1, &[(1, 1, 1)], &crate::SpliceableStats::default(), None)
+        .expect_err("passthrough-off writer must refuse encoded runs");
+    assert!(
+        err.to_string().contains("docs_passthrough"),
+        "unexpected error: {err}"
+    );
+
+    // with the flag on but a BUILD-mode writer (no merged index), the push
+    // mode check still refuses: encoded runs are a merge-storage path
+    let mut writer = VixWriter::new(
+        &schema,
+        VixWriterOptions {
+            docs_passthrough: true,
+            ..Default::default()
+        },
+        false,
+    );
+    let err = writer
+        .begin_docs_encoded_run(1, 1, 1, &[(1, 1, 1)], &crate::SpliceableStats::default(), None)
+        .expect_err("build-mode writer must refuse encoded runs");
+    assert!(
+        err.to_string().contains("merge_input_indexes"),
+        "unexpected error: {err}"
+    );
+
+    // chunk pushes and run finishes without an open run refuse too
+    let err = writer
+        .finish_docs_encoded_run()
+        .expect_err("no open run to finish");
+    assert!(
+        err.to_string().contains("without an open run"),
+        "unexpected error: {err}"
+    );
+}
+
+/// #51c heal: the index-only push API — the split that lets a heal rebuild
+/// index rows whose stored form arrives as copied encoded chunks — enforces
+/// its mode rules and the finish-time index/docs row equality.
+#[test]
+fn index_only_pushes_enforce_split_accounting() {
+    let schema = Schema::new(vec![Field::new("_timestamp", DataType::Int64, false)]);
+    let one_row = Int64Array::from(vec![1_000_000i64]);
+    let one_source = StringArray::from(vec!["{}"]);
+
+    // (1) requires a passthrough writer: without the passthrough encoder
+    // there is no path for the rows' stored form
+    let mut writer = VixWriter::new(&schema, VixWriterOptions::default(), false);
+    let err = writer
+        .push_docs_rows_index_only(&one_row, &[], &one_source, None)
+        .expect_err("passthrough-off writer must refuse index-only pushes");
+    assert!(
+        err.to_string().contains("docs_passthrough"),
+        "unexpected error: {err}"
+    );
+
+    // (2) requires an INDEXED writer: index-off derives no terms, so the
+    // rows would simply vanish
+    let mut writer = VixWriter::new(
+        &schema,
+        VixWriterOptions {
+            docs_passthrough: true,
+            index_enabled: false,
+            ..Default::default()
+        },
+        false,
+    );
+    let err = writer
+        .push_docs_rows_index_only(&one_row, &[], &one_source, None)
+        .expect_err("index-off writer must refuse index-only pushes");
+    assert!(
+        err.to_string().contains("index-off"),
+        "unexpected error: {err}"
+    );
+
+    // (3) once index-only rows arrived, coupled pushes are rejected (they
+    // would fork the doc-id/row accounting) while the encoded-run API — the
+    // split's docs-store side — opens even on this build-mode writer
+    let mut writer = VixWriter::new(
+        &schema,
+        VixWriterOptions {
+            docs_passthrough: true,
+            ..Default::default()
+        },
+        false,
+    );
+    writer
+        .push_docs_rows_index_only(&one_row, &[], &one_source, None)
+        .expect("index-only push on a passthrough writer");
+    let err = writer
+        .push_docs_rows(&one_row, &[], &one_source, None)
+        .expect_err("coupled push after an index-only push must be rejected");
+    assert!(
+        err.to_string().contains("index-only build mode"),
+        "unexpected error: {err}"
+    );
+    writer
+        .begin_docs_encoded_run(
+            1,
+            1_000_000,
+            1_000_000,
+            &[(1, 1_000_000, 1_000_000)],
+            &crate::SpliceableStats::default(),
+            None,
+        )
+        .expect("the encoded run is the index-only mode's docs store");
+    let err = writer
+        .finish_docs_encoded_run()
+        .expect_err("the run still owes its declared row");
+    assert!(
+        err.to_string().contains("short 1 rows"),
+        "unexpected error: {err}"
+    );
+
+    // (4) finish refuses an index that does not cover the stored rows
+    // exactly (here: 1 row indexed, 0 stored)
+    let mut writer = VixWriter::new(
+        &schema,
+        VixWriterOptions {
+            docs_passthrough: true,
+            ..Default::default()
+        },
+        false,
+    );
+    writer
+        .push_docs_rows_index_only(&one_row, &[], &one_source, None)
+        .expect("index-only push on a passthrough writer");
+    let err = writer
+        .finish()
+        .expect_err("finish must refuse the index/docs row divergence");
+    assert!(
+        err.to_string().contains("misaddress the stored rows"),
+        "unexpected error: {err}"
+    );
+}
+
+/// #51c-c: the `row_order` property round-trips writer -> file -> reader —
+/// every writer stamps it explicitly now ("ts_desc" by default, "concat"
+/// under [`VixWriterOptions::concat_row_order`]) — and a file WITHOUT the
+/// property (every historical file) reads as sorted: the exact
+/// backward-compatibility contract (missing == ts_desc, unknown values are
+/// the fail-safe Concat).
+#[test]
+fn row_order_property_roundtrip_and_historical_default() {
+    let schema = Schema::new(vec![Field::new("_timestamp", DataType::Int64, false)]);
+    let build = |concat: bool| -> (Vec<u8>, Option<Vec<u8>>) {
+        let mut writer = VixWriter::new(
+            &schema,
+            VixWriterOptions {
+                concat_row_order: concat,
+                ..Default::default()
+            },
+            false,
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![Arc::new(Int64Array::from(vec![2_000i64, 1_000, 3_000])) as ArrayRef],
+        )
+        .unwrap();
+        let source = StringArray::from(vec!["{}", "{}", "{}"]);
+        writer
+            .push_batch_with_source(&batch, &source, None)
+            .unwrap();
+        writer.finish().unwrap()
+    };
+
+    let (sorted, sorted_index) = build(false);
+    assert_eq!(
+        crate::test_support::row_order_property(&sorted)
+            .unwrap()
+            .as_deref(),
+        Some("ts_desc"),
+        "default writers stamp the sorted order explicitly"
+    );
+    assert!(
+        open_built(sorted.clone(), sorted_index.clone())
+            .row_order()
+            .is_ts_desc()
+    );
+
+    let (concat, concat_index) = build(true);
+    assert_eq!(
+        crate::test_support::row_order_property(&concat)
+            .unwrap()
+            .as_deref(),
+        Some("concat"),
+        "concat writers stamp row_order=concat"
+    );
+    assert_eq!(
+        open_built(concat, concat_index).row_order(),
+        crate::RowOrder::Concat
+    );
+
+    // the historical file: no row_order property at all -> sorted, and the
+    // file opens and reads exactly as before
+    let historical = crate::test_support::strip_row_order_property(&sorted).unwrap();
+    assert_eq!(
+        crate::test_support::row_order_property(&historical).unwrap(),
+        None
+    );
+    let reader = open_built(historical, sorted_index);
+    assert!(
+        reader.row_order().is_ts_desc(),
+        "missing property must read as the sorted historical default"
+    );
+    assert_eq!(reader.row_count(), 3);
+}
+
+/// #51c-c: `timestamp_range` over a CONCAT-order file — two DESC runs
+/// back-to-back, zone windows small enough that the zone table is really
+/// non-monotonic — must equal the per-row truth for windows that land
+/// inside runs, straddle the run boundary, and cover everything: the zoned
+/// fast path classifies each chunk independently, no global-monotonicity
+/// assumption.
+#[test]
+fn timestamp_range_on_concat_order_file_matches_per_row_truth() {
+    // run 1: [2000 .. 1901] DESC; run 2: [2050 .. 1951] DESC — concatenated
+    // the file jumps UP at row 100 (1901 -> 2050)
+    let ts: Vec<i64> = (0..100)
+        .map(|i| 2000 - i)
+        .chain((0..100).map(|i| 2050 - i))
+        .collect();
+    let schema = Schema::new(vec![Field::new("_timestamp", DataType::Int64, false)]);
+    let mut writer = VixWriter::new(
+        &schema,
+        VixWriterOptions {
+            concat_row_order: true,
+            // 1-byte budget clamps to the 64-row chunk floor -> 4 zone
+            // windows over 200 rows, non-monotonic across the run boundary
+            docs_chunk_bytes: 1,
+            ..Default::default()
+        },
+        false,
+    );
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(Int64Array::from(ts.clone())) as ArrayRef],
+    )
+    .unwrap();
+    let source = StringArray::from(vec!["{}"; 200]);
+    writer
+        .push_batch_with_source(&batch, &source, None)
+        .unwrap();
+    let reader = finish_open(writer);
+    assert_eq!(reader.row_order(), crate::RowOrder::Concat);
+
+    let zone = reader.zone_chunks().expect("zone table");
+    assert!(zone.len() >= 3, "need several zone windows, got {zone:?}");
+    assert!(
+        zone.windows(2).any(|pair| pair[1].ts_max > pair[0].ts_min),
+        "the zone table must be non-monotonic for this test to prove anything: {zone:?}"
+    );
+
+    for (min, max) in [
+        (0i64, i64::MAX), // everything
+        (1990, 2011),     // straddles the run boundary values
+        (1901, 1902),     // exactly one row of run 1
+        (2050, 2051),     // exactly one row of run 2
+        (1951, 2001),     // dense overlap of both runs
+        (3000, 4000),     // nothing
+    ] {
+        let got = bits_to_set(&reader.timestamp_range(min, max).unwrap());
+        let expected: BTreeSet<u32> = ts
+            .iter()
+            .enumerate()
+            .filter(|&(_, &t)| t >= min && t < max)
+            .map(|(row, _)| row as u32)
+            .collect();
+        assert_eq!(got, expected, "range [{min}, {max}) over the concat file");
+    }
+}
+
+/// §4 REGION table, decode path: a concat writer derives the desc-run
+/// decomposition from the ACTUAL stored `_timestamp` values (a strict
+/// increase vs the previous row starts a new region; equal timestamps
+/// continue one), stamps `row_regions`, and readers expose it as validated
+/// row ranges. A ts_desc writer never stamps the property (one region by
+/// definition), and a concat file WITHOUT it reads as piecewise-unknown.
+#[test]
+fn row_regions_auto_detected_on_concat_decode_path() {
+    let schema = Schema::new(vec![Field::new("_timestamp", DataType::Int64, false)]);
+    let build = |concat: bool, ts: &[i64]| -> (Vec<u8>, Option<Vec<u8>>) {
+        let mut writer = VixWriter::new(
+            &schema,
+            VixWriterOptions {
+                concat_row_order: concat,
+                // small zone windows so region boundaries cross chunk
+                // boundaries in the 200-row shape below
+                docs_chunk_bytes: 1,
+                ..Default::default()
+            },
+            false,
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![Arc::new(Int64Array::from(ts.to_vec())) as ArrayRef],
+        )
+        .unwrap();
+        let source = StringArray::from(vec!["{}"; ts.len()]);
+        writer
+            .push_batch_with_source(&batch, &source, None)
+            .unwrap();
+        writer.finish().unwrap()
+    };
+
+    // two desc runs of 100 rows: the boundary is an increase (1901 -> 2050)
+    let ts: Vec<i64> = (0..100)
+        .map(|i| 2000 - i)
+        .chain((0..100).map(|i| 2050 - i))
+        .collect();
+    let (concat, concat_index) = build(true, &ts);
+    assert_eq!(
+        crate::test_support::data_property(&concat, "row_regions")
+            .unwrap()
+            .as_deref(),
+        Some("[100,100]"),
+        "the decode path must derive the exact desc runs"
+    );
+    let reader = open_built(concat.clone(), concat_index.clone());
+    assert_eq!(
+        reader.ts_desc_row_ranges(),
+        Some(vec![0..100, 100..200]),
+        "reader exposes the validated region row ranges"
+    );
+
+    // EQUAL timestamps continue a run (non-increasing = still DESC); only a
+    // strict increase splits — [5,5,4] then [7,7,7] = two regions
+    let (eq, eq_index) = build(true, &[5, 5, 4, 7, 7, 7]);
+    assert_eq!(
+        crate::test_support::data_property(&eq, "row_regions")
+            .unwrap()
+            .as_deref(),
+        Some("[3,3]")
+    );
+    assert_eq!(
+        open_built(eq, eq_index).ts_desc_row_ranges(),
+        Some(vec![0..3, 3..6])
+    );
+
+    // ts_desc writer: no property, one implicit full-file region
+    let sorted_ts: Vec<i64> = (0..10).map(|i| 1000 - i).collect();
+    let (sorted, sorted_index) = build(false, &sorted_ts);
+    assert_eq!(
+        crate::test_support::data_property(&sorted, "row_regions").unwrap(),
+        None,
+        "ts_desc files never stamp row_regions"
+    );
+    assert_eq!(
+        open_built(sorted, sorted_index).ts_desc_row_ranges(),
+        Some(vec![0..10])
+    );
+
+    // a concat file WITHOUT the property (pre-M4 concat output): piecewise
+    // order unknown — readers must not assume anything
+    let stripped = crate::test_support::strip_property_for_tests(&concat, "row_regions").unwrap();
+    let reader = open_built(stripped, concat_index);
+    assert_eq!(reader.row_order(), crate::RowOrder::Concat);
+    assert_eq!(reader.ts_desc_row_ranges(), None);
+}
+
+/// §4 REGION table, malformed-property trust rules: a table that does not
+/// sum to `row_count`, carries a zero-count region, or is not a JSON u64
+/// array reads as ABSENT (fail-open), never as an error.
+#[test]
+fn row_regions_malformed_property_reads_as_absent() {
+    let schema = Schema::new(vec![Field::new("_timestamp", DataType::Int64, false)]);
+    let mut writer = VixWriter::new(
+        &schema,
+        VixWriterOptions {
+            concat_row_order: true,
+            ..Default::default()
+        },
+        false,
+    );
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(Int64Array::from(vec![10i64, 5, 20, 15])) as ArrayRef],
+    )
+    .unwrap();
+    let source = StringArray::from(vec!["{}"; 4]);
+    writer
+        .push_batch_with_source(&batch, &source, None)
+        .unwrap();
+    let (data, index) = writer.finish().unwrap();
+    assert_eq!(
+        crate::test_support::data_property(&data, "row_regions")
+            .unwrap()
+            .as_deref(),
+        Some("[2,2]")
+    );
+
+    for bad in ["[2,3]", "[0,4]", "[]", "\"junk\"", "[2]"] {
+        let tampered = crate::test_support::repack_properties(&data, |properties| {
+            for (key, value) in properties.iter_mut() {
+                if key == "row_regions" {
+                    *value = bad.to_string();
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+        let reader = open_built(tampered, index.clone());
+        assert_eq!(
+            reader.ts_desc_row_ranges(),
+            None,
+            "row_regions {bad:?} must read as absent (fail-open)"
+        );
+    }
+}
+
+/// §4 REGION table, passthrough path: an encoded run splices the caller's
+/// proven decomposition; a run WITHOUT one poisons the property (the copy
+/// itself is unaffected); and a mis-summed decomposition is refused before
+/// any chunk is accepted.
+#[test]
+fn row_regions_splice_through_encoded_runs() {
+    let schema = Schema::new(vec![Field::new("_timestamp", DataType::Int64, false)]);
+    // one ts_desc input file of 4 rows to copy chunks from
+    let input = {
+        let mut writer = VixWriter::new(&schema, VixWriterOptions::default(), false);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![Arc::new(Int64Array::from(vec![4_000i64, 3_000, 2_000, 1_000])) as ArrayRef],
+        )
+        .unwrap();
+        let source = StringArray::from(vec!["{}"; 4]);
+        writer
+            .push_batch_with_source(&batch, &source, None)
+            .unwrap();
+        let (data, _) = writer.finish().unwrap();
+        crate::VixDocs::open(bytes::Bytes::from(data)).unwrap()
+    };
+    let splice_input = |writer: &mut VixWriter, regions: Option<&[u64]>| {
+        let entries: Vec<crate::ZoneEntry> = input
+            .zone_chunks()
+            .unwrap()
+            .iter()
+            .map(|zone| (zone.row_count, zone.ts_min, zone.ts_max))
+            .collect();
+        let stats = input.spliceable_stats().unwrap().unwrap();
+        writer.begin_docs_encoded_run(4, 1_000, 4_000, &entries, &stats, regions)?;
+        input.scan_docs_encoded_chunks(&mut |chunk| writer.push_docs_encoded_chunk(chunk))?;
+        writer.finish_docs_encoded_run()
+    };
+    let passthrough_writer = || {
+        // the index-only pre-push moves the writer into the split mode that
+        // accepts encoded runs without a full merge harness
+        let mut writer = VixWriter::new(
+            &schema,
+            VixWriterOptions {
+                docs_passthrough: true,
+                concat_row_order: true,
+                ..Default::default()
+            },
+            false,
+        );
+        let ts = Int64Array::from(vec![4_000i64, 3_000, 2_000, 1_000, 4_000, 3_000, 2_000, 1_000]);
+        let source = StringArray::from(vec!["{}"; 8]);
+        writer
+            .push_docs_rows_index_only(&ts, &[], &source, None)
+            .unwrap();
+        writer
+    };
+
+    // two spliced runs, each declared as one desc run -> [4,4]
+    let mut writer = passthrough_writer();
+    splice_input(&mut writer, Some(&[4])).unwrap();
+    splice_input(&mut writer, Some(&[4])).unwrap();
+    let (data, _) = writer.finish().unwrap();
+    assert_eq!(
+        crate::test_support::data_property(&data, "row_regions")
+            .unwrap()
+            .as_deref(),
+        Some("[4,4]"),
+        "spliced decompositions concatenate"
+    );
+
+    // a run without a proven decomposition poisons the table
+    let mut writer = passthrough_writer();
+    splice_input(&mut writer, Some(&[4])).unwrap();
+    splice_input(&mut writer, None).unwrap();
+    let (data, _) = writer.finish().unwrap();
+    assert_eq!(
+        crate::test_support::data_property(&data, "row_regions").unwrap(),
+        None,
+        "an unproven run must poison the property (fail-open)"
+    );
+
+    // a decomposition that does not sum to the run is refused up front
+    let mut writer = passthrough_writer();
+    let err = splice_input(&mut writer, Some(&[3])).unwrap_err();
+    assert!(
+        err.to_string().contains("run_regions cover 3 rows"),
+        "unexpected error: {err}"
+    );
+}
+
+/// §4 chunk pruning (M4): build one 128-row file with two 64-row zone
+/// chunks whose per-column stats separate cleanly, then pin
+/// [`VixDocs::pruned_scan_ranges`]'s verdicts per tier: numeric range
+/// pruning, zero-presence pruning of a sparse column, whole-file
+/// exclusion, absent-column fail-open, and `_timestamp` zone pruning.
+#[test]
+fn chunk_stats_pruning_verdicts() {
+    use crate::docs::{BoundValue, ColumnBound};
+    let schema = Schema::new(vec![
+        Field::new("_timestamp", DataType::Int64, false),
+        Field::new("code", DataType::Int64, true),
+        Field::new("svc", DataType::Utf8, true),
+        Field::new("sparse", DataType::Int64, true),
+    ]);
+    let mut writer = VixWriter::new(
+        &schema,
+        VixWriterOptions {
+            docs_chunk_bytes: 1, // 64-row chunk floor -> 2 chunks over 128 rows
+            ..Default::default()
+        },
+        false,
+    );
+    // chunk 0 (rows 0..64): ts 1128..1065, code 0..63, svc "apple",
+    //   sparse all NULL
+    // chunk 1 (rows 64..128): ts 1064..1001, code 200..263, svc "zebra",
+    //   sparse fully populated
+    let ts: Vec<i64> = (0..128).map(|i| 1128 - i).collect();
+    let code: Vec<Option<i64>> = (0..128)
+        .map(|i| Some(if i < 64 { i } else { 200 + (i - 64) }))
+        .collect();
+    let svc: Vec<Option<&str>> = (0..128)
+        .map(|i| Some(if i < 64 { "apple" } else { "zebra" }))
+        .collect();
+    let sparse: Vec<Option<i64>> = (0..128).map(|i| (i >= 64).then_some(7)).collect();
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![
+            Arc::new(Int64Array::from(ts)) as ArrayRef,
+            Arc::new(Int64Array::from(code)) as ArrayRef,
+            Arc::new(StringArray::from(svc)) as ArrayRef,
+            Arc::new(Int64Array::from(sparse)) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let source = StringArray::from(vec!["{}"; 128]);
+    writer
+        .push_batch_with_source(&batch, &source, None)
+        .unwrap();
+    let (data, _) = writer.finish().unwrap();
+    let docs = crate::VixDocs::open(bytes::Bytes::from(data)).unwrap();
+    assert_eq!(docs.zone_chunks().unwrap().len(), 2);
+
+    let ge = |column: &str, value: BoundValue| ColumnBound {
+        column: column.to_string(),
+        min: Some((value, true)),
+        max: None,
+    };
+    let eq = |column: &str, value: BoundValue| ColumnBound {
+        column: column.to_string(),
+        min: Some((value.clone(), true)),
+        max: Some((value, true)),
+    };
+
+    // numeric range: code >= 150 excludes chunk 0
+    assert_eq!(
+        docs.pruned_scan_ranges(None, &[ge("code", BoundValue::I64(150))]),
+        Some(vec![64..128])
+    );
+    // numeric range: code <= 100 excludes chunk 1
+    assert_eq!(
+        docs.pruned_scan_ranges(
+            None,
+            &[ColumnBound {
+                column: "code".into(),
+                min: None,
+                max: Some((BoundValue::I64(100), true)),
+            }]
+        ),
+        Some(vec![0..64])
+    );
+    // whole file provably empty: code > 1000
+    assert_eq!(
+        docs.pruned_scan_ranges(None, &[ge("code", BoundValue::I64(1001))]),
+        Some(vec![])
+    );
+    // string bounds: svc = "mango" is between the chunks' values -> both
+    // chunks excluded (apple-max < mango, zebra-min > mango)
+    assert_eq!(
+        docs.pruned_scan_ranges(None, &[eq("svc", BoundValue::Str("mango".into()))]),
+        Some(vec![])
+    );
+    // svc = "apple": only chunk 0 survives
+    assert_eq!(
+        docs.pruned_scan_ranges(None, &[eq("svc", BoundValue::Str("apple".into()))]),
+        Some(vec![0..64])
+    );
+    // zero-presence pruning: any null-rejecting bound on `sparse` excludes
+    // chunk 0 (0 present values there), even without min/max logic
+    assert_eq!(
+        docs.pruned_scan_ranges(None, &[eq("sparse", BoundValue::I64(7))]),
+        Some(vec![64..128])
+    );
+    // absent column: no basis, fail-open (scan everything)
+    assert_eq!(
+        docs.pruned_scan_ranges(None, &[eq("nope", BoundValue::I64(1))]),
+        None
+    );
+    // cross-family bound (string bound on an i64 column): fail-open
+    assert_eq!(
+        docs.pruned_scan_ranges(None, &[eq("code", BoundValue::Str("5".into()))]),
+        None
+    );
+    // `_timestamp` zone pruning: [1001, 1010) lives in chunk 1 only
+    assert_eq!(
+        docs.pruned_scan_ranges(Some((1001, 1010)), &[]),
+        Some(vec![64..128])
+    );
+    // everything survives -> None (single full scan, no range overhead)
+    assert_eq!(
+        docs.pruned_scan_ranges(None, &[ge("code", BoundValue::I64(0))]),
+        None
+    );
+
+    // and the SCAN respects the pruning without losing rows: bounds that
+    // exclude chunk 0 return exactly chunk 1's matching rows
+    let batches = {
+        let mut out: Vec<RecordBatch> = Vec::new();
+        docs.scan_docs_opts(
+            Some(&["code".to_string()]),
+            None,
+            None,
+            &[ge("code", BoundValue::I64(150))],
+            None,
+            0,
+            &mut |batch| {
+                out.push(batch);
+                Ok(())
+            },
+        )
+        .unwrap();
+        out
+    };
+    let mut got: Vec<i64> = Vec::new();
+    for batch in &batches {
+        let code = batch.column_by_name("code").unwrap();
+        let code = code.as_any().downcast_ref::<Int64Array>().unwrap();
+        got.extend(code.iter().flatten());
+    }
+    assert_eq!(got, (200..264).collect::<Vec<i64>>());
+}
+
+/// M15 dict-aware equality filter-back: the string-equality pre-pass
+/// resolves the needle against each chunk's DICTIONARY and scans code ids
+/// (canonical decode + compare only for non-dict chunks); its row ids and
+/// the end-to-end scan output must EXACTLY equal the per-row oracle on
+/// dict-encoded, high-entropy and null-bearing columns, across thread
+/// counts, with the broad-match fallback and limit/ts composition intact.
+#[test]
+fn m15_eq_scan_dict_aware_parity() {
+    use vortex::array::arrays::Dict;
+
+    use crate::docs::{BoundValue, ColumnBound};
+
+    const ROWS: usize = 192; // 3 chunks x 64 rows at the chunk floor
+    let schema = Schema::new(vec![
+        Field::new("_timestamp", DataType::Int64, false),
+        Field::new("svc", DataType::Utf8, true),  // low-cardinality: dict
+        Field::new("rid", DataType::Utf8, true),  // per-row unique: non-dict
+    ]);
+    let ts: Vec<i64> = (0..ROWS as i64).map(|i| 10_000 - i).collect();
+    // svc: 3 hot values + one single-occurrence needle + one empty-string
+    // value + nulls
+    let svc: Vec<Option<String>> = (0..ROWS)
+        .map(|i| match i {
+            100 => Some("needle-one".to_string()),
+            140 => Some(String::new()),
+            i if i % 16 == 15 => None,
+            i => Some(format!("svc-{}", i % 3)),
+        })
+        .collect();
+    // rid: unique per row, one deliberate duplicate pair (rows 37 and 150),
+    // nulls sprinkled
+    let rid: Vec<Option<String>> = (0..ROWS)
+        .map(|i| match i {
+            150 => Some("rid-0037".to_string()),
+            i if i % 32 == 31 => None,
+            i => Some(format!("rid-{i:04}")),
+        })
+        .collect();
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![
+            Arc::new(Int64Array::from(ts.clone())) as ArrayRef,
+            Arc::new(StringArray::from(
+                svc.iter().map(|v| v.as_deref()).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(StringArray::from(
+                rid.iter().map(|v| v.as_deref()).collect::<Vec<_>>(),
+            )) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let source = StringArray::from(vec!["{}"; ROWS]);
+    let mut writer = VixWriter::new(
+        &schema,
+        VixWriterOptions {
+            docs_chunk_bytes: 1, // 64-row chunk floor
+            ..Default::default()
+        },
+        false,
+    );
+    writer
+        .push_batch_with_source(&batch, &source, None)
+        .unwrap();
+    let (data, _) = writer.finish().unwrap();
+    let docs = crate::VixDocs::open(Bytes::from(data)).unwrap();
+    assert_eq!(docs.zone_chunks().unwrap().len(), 3);
+
+    // the fixture must exercise the DICT arm: at least one stored chunk of
+    // the file is dict-encoded (svc is the repetitive column vortex probes)
+    let mut saw_dict = false;
+    docs.scan_docs_encoded_chunks(&mut |chunk| {
+        saw_dict |= chunk
+            .array
+            .depth_first_traversal()
+            .any(|node| node.is::<Dict>());
+        Ok(())
+    })
+    .unwrap();
+    assert!(
+        saw_dict,
+        "fixture must keep a dict-encoded column or the dict arm loses coverage"
+    );
+
+    let eq = |column: &str, value: &str| ColumnBound {
+        column: column.to_string(),
+        min: Some((BoundValue::Str(value.to_string()), true)),
+        max: Some((BoundValue::Str(value.to_string()), true)),
+    };
+    let oracle = |values: &[Option<String>], needle: &str| -> Vec<u64> {
+        values
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| v.as_deref() == Some(needle))
+            .map(|(i, _)| i as u64)
+            .collect()
+    };
+    let prepass = |column: &str, needle: &str, threads: usize| {
+        docs.eq_string_prepass(column, needle, None, &[eq(column, needle)], threads)
+            .unwrap()
+    };
+
+    // needle-grade shapes: the pre-pass returns the EXACT oracle ids, at
+    // every thread count (chunk-aligned splitting)
+    for threads in [0usize, 1, 4, 7] {
+        assert_eq!(
+            prepass("svc", "needle-one", threads),
+            Some(oracle(&svc, "needle-one")),
+            "threads={threads}"
+        );
+        assert_eq!(
+            prepass("rid", "rid-0037", threads),
+            Some(oracle(&rid, "rid-0037")),
+            "duplicate rid rows, threads={threads}"
+        );
+        assert_eq!(prepass("rid", "rid-0100", threads), Some(vec![100]));
+        assert_eq!(
+            prepass("svc", "", threads),
+            Some(oracle(&svc, "")),
+            "empty string is a real value, threads={threads}"
+        );
+        assert_eq!(
+            prepass("svc", "absent-value", threads),
+            Some(vec![]),
+            "threads={threads}"
+        );
+    }
+    // nulls never match (equality is null-rejecting): every oracle above
+    // came from non-null values only, and the null rows are absent
+    assert!(!prepass("svc", "needle-one", 4).unwrap().contains(&15));
+
+    // broad match: svc-0 covers ~1/3 of rows -> the pre-pass declines
+    assert_eq!(prepass("svc", "svc-0", 4), None);
+
+    // end-to-end scan parity: emitted rows == oracle, for a needle (fast
+    // path) AND a broad value (fallback path), with ts window and limit
+    // composed
+    let scan_rows = |column: &str,
+                     needle: &str,
+                     ts_range: Option<(i64, i64)>,
+                     limit: Option<u64>|
+     -> Vec<i64> {
+        let mut got = Vec::new();
+        docs.scan_docs_opts(
+            Some(&["_timestamp".to_string(), column.to_string()]),
+            None,
+            ts_range,
+            &[eq(column, needle)],
+            limit,
+            2,
+            &mut |batch| {
+                let ts = batch.column_by_name("_timestamp").unwrap();
+                let ts = arrow::compute::cast(ts, &DataType::Int64).unwrap();
+                let ts = ts.as_any().downcast_ref::<Int64Array>().unwrap();
+                let col = batch.column_by_name(column).unwrap();
+                let col = arrow::compute::cast(col, &DataType::Utf8).unwrap();
+                let col = col.as_any().downcast_ref::<StringArray>().unwrap();
+                for i in 0..batch.num_rows() {
+                    // the eq bound is NOT a row filter for the fallback
+                    // path (string bounds never are); apply it here the way
+                    // the engine's FilterExec would
+                    if !col.is_null(i) && col.value(i) == needle {
+                        got.push(ts.value(i));
+                    }
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        got
+    };
+    let oracle_ts = |values: &[Option<String>], needle: &str, window: Option<(i64, i64)>| {
+        oracle(values, needle)
+            .into_iter()
+            .map(|row| ts[row as usize])
+            .filter(|t| window.is_none_or(|(lo, hi)| *t >= lo && *t < hi))
+            .collect::<Vec<i64>>()
+    };
+    assert_eq!(
+        scan_rows("svc", "needle-one", None, None),
+        oracle_ts(&svc, "needle-one", None)
+    );
+    assert_eq!(
+        scan_rows("rid", "rid-0037", None, None),
+        oracle_ts(&rid, "rid-0037", None)
+    );
+    assert_eq!(
+        scan_rows("svc", "svc-1", None, None),
+        oracle_ts(&svc, "svc-1", None),
+        "broad-match fallback parity"
+    );
+    // ts window straddling chunk 1: the pass-2 point read still applies the
+    // vortex _timestamp filter to the matched rows
+    let window = Some((9_800i64, 9_950i64));
+    assert_eq!(
+        scan_rows("svc", "needle-one", window, None),
+        oracle_ts(&svc, "needle-one", window)
+    );
+    assert_eq!(
+        scan_rows("rid", "rid-0037", window, None),
+        oracle_ts(&rid, "rid-0037", window)
+    );
+    // limit: the first matching row only, in row order
+    assert_eq!(
+        scan_rows("rid", "rid-0037", None, Some(1)),
+        oracle_ts(&rid, "rid-0037", None)[..1].to_vec()
+    );
+}
+
+/// §4 string PREFIX bounds stay conservative: values longer than the
+/// 32-byte stats prefix store a truncated min and a prefix-incremented max;
+/// bounds that fall between a stored bound and the true value must KEEP the
+/// chunk (admit, never reject, borderline values).
+#[test]
+fn chunk_stats_string_prefix_bounds_are_conservative() {
+    use crate::docs::{BoundValue, ColumnBound};
+    let long_value = format!("{}zzzzzzzz", "a".repeat(32)); // 40 bytes
+    let schema = Schema::new(vec![
+        Field::new("_timestamp", DataType::Int64, false),
+        Field::new("s", DataType::Utf8, true),
+    ]);
+    let mut writer = VixWriter::new(&schema, VixWriterOptions::default(), false);
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![
+            Arc::new(Int64Array::from(vec![1000i64, 999])) as ArrayRef,
+            Arc::new(StringArray::from(vec![
+                Some(long_value.as_str()),
+                Some(long_value.as_str()),
+            ])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let source = StringArray::from(vec!["{}"; 2]);
+    writer
+        .push_batch_with_source(&batch, &source, None)
+        .unwrap();
+    let (data, _) = writer.finish().unwrap();
+    let docs = crate::VixDocs::open(bytes::Bytes::from(data)).unwrap();
+
+    let eq = |value: &str| {
+        vec![ColumnBound {
+            column: "s".to_string(),
+            min: Some((BoundValue::Str(value.to_string()), true)),
+            max: Some((BoundValue::Str(value.to_string()), true)),
+        }]
+    };
+    // the exact stored value: kept (obviously)
+    assert_eq!(docs.pruned_scan_ranges(None, &eq(&long_value)), None);
+    // a value between the stored PREFIX min ("a"*32) and the true value:
+    // must be kept — the interval [prefix-min, incremented-max] covers it
+    let between = format!("{}m", "a".repeat(32));
+    assert_eq!(docs.pruned_scan_ranges(None, &eq(&between)), None);
+    // the prefix itself (< true value, == stored min): kept, conservative
+    assert_eq!(docs.pruned_scan_ranges(None, &eq(&"a".repeat(32))), None);
+    // clearly outside the incremented upper bound: pruned
+    assert_eq!(docs.pruned_scan_ranges(None, &eq("b")), Some(vec![]));
+    // clearly below the prefix min: pruned
+    assert_eq!(docs.pruned_scan_ranges(None, &eq("Zzz")), Some(vec![]));
+}
+
+/// §4 splice-parity on the READ side (§11's anti-goal is the v1 stats
+/// loss): a PASSTHROUGH output — whose docs blob carries no vortex
+/// statistics at all — prunes chunks/files through its spliced O2 stats
+/// exactly like a first-encode file.
+#[test]
+fn chunk_stats_pruning_survives_passthrough() {
+    use crate::docs::{BoundValue, ColumnBound};
+    let schema = Schema::new(vec![
+        Field::new("_timestamp", DataType::Int64, false),
+        Field::new("code", DataType::Int64, true),
+    ]);
+    let build_input = |ts_hi: i64, code_base: i64| {
+        let mut writer = VixWriter::new(&schema, VixWriterOptions::default(), false);
+        let ts: Vec<i64> = (0..4).map(|i| ts_hi - i).collect();
+        let code: Vec<i64> = (0..4).map(|i| code_base + i).collect();
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![
+                Arc::new(Int64Array::from(ts)) as ArrayRef,
+                Arc::new(Int64Array::from(code)) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let source = StringArray::from(vec!["{}"; 4]);
+        writer
+            .push_batch_with_source(&batch, &source, None)
+            .unwrap();
+        let (data, _) = writer.finish().unwrap();
+        crate::VixDocs::open(bytes::Bytes::from(data)).unwrap()
+    };
+    // input A: ts 2000..1997 / code 0..3; input B: ts 1996..1993 / code 500..503
+    let a = build_input(2000, 0);
+    let b = build_input(1996, 500);
+
+    let mut writer = VixWriter::new(
+        &schema,
+        VixWriterOptions {
+            docs_passthrough: true,
+            ..Default::default()
+        },
+        false,
+    );
+    let ts = Int64Array::from(vec![2000i64, 1999, 1998, 1997, 1996, 1995, 1994, 1993]);
+    let source = StringArray::from(vec!["{}"; 8]);
+    writer
+        .push_docs_rows_index_only(&ts, &[], &source, None)
+        .unwrap();
+    for (input, (ts_min, ts_max)) in [(&a, (1997, 2000)), (&b, (1993, 1996))] {
+        let entries: Vec<crate::ZoneEntry> = input
+            .zone_chunks()
+            .unwrap()
+            .iter()
+            .map(|zone| (zone.row_count, zone.ts_min, zone.ts_max))
+            .collect();
+        let stats = input.spliceable_stats().unwrap().unwrap();
+        writer
+            .begin_docs_encoded_run(4, ts_min, ts_max, &entries, &stats, Some(&[4]))
+            .unwrap();
+        input
+            .scan_docs_encoded_chunks(&mut |chunk| writer.push_docs_encoded_chunk(chunk))
+            .unwrap();
+        writer.finish_docs_encoded_run().unwrap();
+    }
+    let (data, _) = writer.finish().unwrap();
+    let merged = crate::VixDocs::open(bytes::Bytes::from(data)).unwrap();
+    assert_eq!(merged.row_count(), 8);
+    assert_eq!(merged.zone_chunks().unwrap().len(), 2, "spliced zone table");
+
+    // the passthrough output has NO vortex file-level stats...
+    assert_eq!(merged.column_stats("code").unwrap(), None);
+    // ...but the spliced O2 stats prune exactly like a fresh encode:
+    let ge = |value: i64| {
+        vec![ColumnBound {
+            column: "code".to_string(),
+            min: Some((BoundValue::I64(value), true)),
+            max: None,
+        }]
+    };
+    assert_eq!(
+        merged.pruned_scan_ranges(None, &ge(100)),
+        Some(vec![4..8]),
+        "input A's chunk pruned by the spliced stats"
+    );
+    assert_eq!(
+        merged.pruned_scan_ranges(None, &ge(1000)),
+        Some(vec![]),
+        "whole passthrough file provably empty for code >= 1000"
+    );
+}
+
+/// M4 exact cross-type comparator edges: i64/u64 vs f64 comparisons must
+/// be EXACT — a lossy i64→f64 rounding could prune a chunk that matches.
+#[test]
+fn stats_bound_comparator_is_exact() {
+    use std::cmp::Ordering;
+
+    use crate::docs::{BoundValue, NumScalar, cmp_num_vs_bound};
+    // 2^63 - 1 vs (2^63 - 1) as f64 (rounds UP to 2^63): the int is SMALLER
+    assert_eq!(
+        cmp_num_vs_bound(NumScalar::I64(i64::MAX), &BoundValue::F64(i64::MAX as f64)),
+        Some(Ordering::Less)
+    );
+    // 2^53 + 1 vs 2^53 as f64: adjacent beyond float precision — must not
+    // collapse to Equal
+    let big = (1i64 << 53) + 1;
+    assert_eq!(
+        cmp_num_vs_bound(NumScalar::I64(big), &BoundValue::F64((1i64 << 53) as f64)),
+        Some(Ordering::Greater)
+    );
+    // fractional bounds order strictly between adjacent ints
+    assert_eq!(
+        cmp_num_vs_bound(NumScalar::I64(5), &BoundValue::F64(5.5)),
+        Some(Ordering::Less)
+    );
+    assert_eq!(
+        cmp_num_vs_bound(NumScalar::I64(6), &BoundValue::F64(5.5)),
+        Some(Ordering::Greater)
+    );
+    // negatives + fractional
+    assert_eq!(
+        cmp_num_vs_bound(NumScalar::I64(-6), &BoundValue::F64(-5.5)),
+        Some(Ordering::Less)
+    );
+    // NaN bound: incomparable (keep the chunk)
+    assert_eq!(
+        cmp_num_vs_bound(NumScalar::F64(1.0), &BoundValue::F64(f64::NAN)),
+        None
+    );
+    // infinities
+    assert_eq!(
+        cmp_num_vs_bound(NumScalar::I64(i64::MAX), &BoundValue::F64(f64::INFINITY)),
+        Some(Ordering::Less)
+    );
+    assert_eq!(
+        cmp_num_vs_bound(
+            NumScalar::I64(i64::MIN),
+            &BoundValue::F64(f64::NEG_INFINITY)
+        ),
+        Some(Ordering::Greater)
+    );
+    // u64 bound above i64::MAX vs an i64 stat: exact via i128
+    assert_eq!(
+        cmp_num_vs_bound(NumScalar::I64(-1), &BoundValue::U64(u64::MAX)),
+        Some(Ordering::Less)
+    );
+    // string bound vs numeric stat: incomparable
+    assert_eq!(
+        cmp_num_vs_bound(NumScalar::I64(1), &BoundValue::Str("1".into())),
+        None
+    );
+}
+
+/// §6.2 M4 k-way region-merged reads: a concat file with proven regions
+/// streams `ORDER BY _timestamp DESC` correctly across interleaved region
+/// time-ranges, EQUAL timestamps across regions, limits (early exit), row
+/// selections, and the internal `_timestamp` add-and-strip.
+#[test]
+fn merged_ordered_scan_over_concat_regions() {
+    let schema = Schema::new(vec![
+        Field::new("_timestamp", DataType::Int64, false),
+        Field::new("tag", DataType::Utf8, true),
+    ]);
+    // three regions with INTERLEAVED ranges and CROSS-REGION EQUAL ts:
+    //   r0: [500, 400, 300, 200]        (tag a)
+    //   r1: [450, 400, 350]             (tag b) — 400 ties r0, ranges overlap
+    //   r2: [1000, 100]                 (tag c) — brackets everything
+    let ts: Vec<i64> = vec![500, 400, 300, 200, 450, 400, 350, 1000, 100];
+    let tags: Vec<&str> = vec!["a", "a", "a", "a", "b", "b", "b", "c", "c"];
+    let mut writer = VixWriter::new(
+        &schema,
+        VixWriterOptions {
+            concat_row_order: true,
+            docs_chunk_bytes: 1,
+            ..Default::default()
+        },
+        false,
+    );
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![
+            Arc::new(Int64Array::from(ts.clone())) as ArrayRef,
+            Arc::new(StringArray::from(tags.clone())) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let source = StringArray::from(vec!["{}"; 9]);
+    writer
+        .push_batch_with_source(&batch, &source, None)
+        .unwrap();
+    let (data, _) = writer.finish().unwrap();
+    let docs = crate::VixDocs::open(bytes::Bytes::from(data)).unwrap();
+    assert_eq!(
+        docs.ts_desc_row_ranges(),
+        Some(vec![0..4, 4..7, 7..9]),
+        "the writer must have auto-detected the three desc runs"
+    );
+
+    let collect = |projection: Option<&[String]>,
+                   rows: Option<Vec<u64>>,
+                   ts_range: Option<(i64, i64)>,
+                   limit: Option<u64>|
+     -> (Vec<RecordBatch>, usize) {
+        let mut out = Vec::new();
+        let mut opened = 0usize;
+        docs.scan_docs_ts_desc_merged(
+            projection,
+            rows,
+            ts_range,
+            &[],
+            limit,
+            &mut || {
+                opened += 1;
+                Ok(())
+            },
+            &mut |batch| {
+                out.push(batch);
+                Ok(())
+            },
+        )
+        .unwrap();
+        (out, opened)
+    };
+    let ts_of = |batches: &[RecordBatch]| -> Vec<i64> {
+        let mut got = Vec::new();
+        for batch in batches {
+            let col = batch.column_by_name("_timestamp").unwrap();
+            let col = col.as_any().downcast_ref::<Int64Array>().unwrap();
+            got.extend(col.iter().flatten());
+        }
+        got
+    };
+
+    // full merged read = the global sort-desc truth, ROW COUNT PRESERVED
+    // (equal timestamps kept, in deterministic region order)
+    let (batches, opened) = collect(Some(&["_timestamp".to_string()]), None, None, None);
+    let mut want = ts.clone();
+    want.sort_unstable_by(|a, b| b.cmp(a));
+    assert_eq!(ts_of(&batches), want);
+    assert_eq!(opened, 3, "a full read opens every region");
+
+    // LIMIT early exit: top-2 = [1000, 500] (all 9 rows share ONE zone
+    // chunk here, so laziness proves nothing on this file — see the
+    // chunk-aligned laziness check below)
+    let (batches, _) = collect(Some(&["_timestamp".to_string()]), None, None, Some(2));
+    assert_eq!(ts_of(&batches), vec![1000, 500]);
+
+    // equal-ts run: top-4 covers the 400 tie from BOTH regions
+    let (batches, _) = collect(Some(&["_timestamp".to_string()]), None, None, Some(4));
+    assert_eq!(ts_of(&batches), vec![1000, 500, 450, 400]);
+    let (batches, _) = collect(Some(&["_timestamp".to_string()]), None, None, Some(5));
+    assert_eq!(ts_of(&batches), vec![1000, 500, 450, 400, 400]);
+
+    // projection WITHOUT _timestamp: internally added, stripped on emit,
+    // rows still in ts-desc order (tags prove it)
+    let (batches, _) = collect(Some(&["tag".to_string()]), None, None, None);
+    let mut tags_got: Vec<String> = Vec::new();
+    for batch in &batches {
+        assert!(
+            batch.column_by_name("_timestamp").is_none(),
+            "internal merge column must be stripped"
+        );
+        let col = batch.column_by_name("tag").unwrap();
+        let col = arrow::compute::cast(col, &DataType::Utf8).unwrap();
+        let col = col.as_any().downcast_ref::<StringArray>().unwrap();
+        tags_got.extend((0..col.len()).map(|i| col.value(i).to_string()));
+    }
+    // ts desc truth: 1000c 500a 450b [400 tie] 350b 300a 200a 100c.
+    // The 400 tie resolves to the region already emitting its run (r1's
+    // 400 rides the 450 run) — deterministic, and any tie order is correct
+    // for ORDER BY _timestamp DESC.
+    assert_eq!(
+        tags_got,
+        vec!["c", "a", "b", "b", "a", "b", "a", "a", "c"]
+    );
+
+    // ts_range pushdown composes: [300, 460) -> 450, 400, 400, 350, 300
+    let (batches, _) = collect(Some(&["_timestamp".to_string()]), None, Some((300, 460)), None);
+    assert_eq!(ts_of(&batches), vec![450, 400, 400, 350, 300]);
+
+    // row selection: rows {0 (ts500), 5 (ts400), 8 (ts100)} merge in order
+    let (batches, _) = collect(
+        Some(&["_timestamp".to_string()]),
+        Some(vec![0, 5, 8]),
+        None,
+        None,
+    );
+    assert_eq!(ts_of(&batches), vec![500, 400, 100]);
+
+    // a ts_desc file (single implicit region) streams unchanged
+    let sorted_docs = {
+        let mut writer = VixWriter::new(&schema, VixWriterOptions::default(), false);
+        let ts: Vec<i64> = (0..6).map(|i| 900 - i).collect();
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![
+                Arc::new(Int64Array::from(ts)) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("s"); 6])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let source = StringArray::from(vec!["{}"; 6]);
+        writer
+            .push_batch_with_source(&batch, &source, None)
+            .unwrap();
+        let (data, _) = writer.finish().unwrap();
+        crate::VixDocs::open(bytes::Bytes::from(data)).unwrap()
+    };
+    let mut got = Vec::new();
+    sorted_docs
+        .scan_docs_ts_desc_merged(
+            Some(&["_timestamp".to_string()]),
+            None,
+            None,
+            &[],
+            Some(3),
+            &mut || Ok(()),
+            &mut |batch| {
+                got.push(batch);
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(ts_of(&got), vec![900, 899, 898]);
+}
+
+/// §6.2 lazy region opening: when regions align with distinct zone chunks,
+/// a LIMIT that the newest region alone satisfies never opens (decodes)
+/// the time-disjoint older regions — their zone-derived upper bounds keep
+/// them parked in the heap.
+#[test]
+fn merged_ordered_scan_opens_regions_lazily() {
+    let schema = Schema::new(vec![Field::new("_timestamp", DataType::Int64, false)]);
+    // three 64-row regions (== the chunk floor, so zone chunks align),
+    // each STRICTLY newer than the previous one's tail so every boundary
+    // is a ts increase (adjacent decreasing runs would legally fuse):
+    // r0 oldest [3000..], r1 middle [4000..], r2 newest [5000..]
+    let ts: Vec<i64> = (0..64)
+        .map(|i| 3000 - i)
+        .chain((0..64).map(|i| 4000 - i))
+        .chain((0..64).map(|i| 5000 - i))
+        .collect();
+    let mut writer = VixWriter::new(
+        &schema,
+        VixWriterOptions {
+            concat_row_order: true,
+            docs_chunk_bytes: 1, // 64-row chunk floor
+            ..Default::default()
+        },
+        false,
+    );
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(Int64Array::from(ts.clone())) as ArrayRef],
+    )
+    .unwrap();
+    let source = StringArray::from(vec!["{}"; 192]);
+    writer
+        .push_batch_with_source(&batch, &source, None)
+        .unwrap();
+    let (data, _) = writer.finish().unwrap();
+    let docs = crate::VixDocs::open(bytes::Bytes::from(data)).unwrap();
+    assert_eq!(
+        docs.ts_desc_row_ranges(),
+        Some(vec![0..64, 64..128, 128..192])
+    );
+    assert_eq!(docs.zone_chunks().unwrap().len(), 3);
+
+    let mut opened = 0usize;
+    let mut got: Vec<i64> = Vec::new();
+    docs.scan_docs_ts_desc_merged(
+        Some(&["_timestamp".to_string()]),
+        None,
+        None,
+        &[],
+        Some(10),
+        &mut || {
+            opened += 1;
+            Ok(())
+        },
+        &mut |batch| {
+            let col = batch.column_by_name("_timestamp").unwrap();
+            let col = col.as_any().downcast_ref::<Int64Array>().unwrap();
+            got.extend(col.iter().flatten());
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(got, (0..10).map(|i| 5000 - i).collect::<Vec<i64>>());
+    assert_eq!(
+        opened, 1,
+        "the newest region alone satisfies the limit; the older regions' \
+         zone bounds must keep them unopened"
+    );
+}
+
+/// §6.2: an ordered merged read of a concat file WITHOUT proven regions
+/// must REFUSE (the caller sorts instead) — never emit silently unordered.
+#[test]
+fn merged_ordered_scan_refuses_unproven_concat() {
+    let schema = Schema::new(vec![Field::new("_timestamp", DataType::Int64, false)]);
+    let mut writer = VixWriter::new(
+        &schema,
+        VixWriterOptions {
+            concat_row_order: true,
+            ..Default::default()
+        },
+        false,
+    );
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(Int64Array::from(vec![5i64, 9, 1])) as ArrayRef],
+    )
+    .unwrap();
+    let source = StringArray::from(vec!["{}"; 3]);
+    writer
+        .push_batch_with_source(&batch, &source, None)
+        .unwrap();
+    let (data, _) = writer.finish().unwrap();
+    // strip the region table: piecewise order now unproven
+    let stripped = crate::test_support::strip_property_for_tests(&data, "row_regions").unwrap();
+    let docs = crate::VixDocs::open(bytes::Bytes::from(stripped)).unwrap();
+    assert_eq!(docs.ts_desc_row_ranges(), None);
+    let err = docs
+        .scan_docs_ts_desc_merged(None, None, None, &[], None, &mut || Ok(()), &mut |_| Ok(()))
+        .expect_err("unproven concat must refuse the ordered read");
+    assert!(
+        err.to_string().contains("row_regions"),
+        "unexpected error: {err}"
+    );
+}
+
+/// H1 (DESIGN §3): rows-per-chunk derives from PRESENT-VALUE bytes, never
+/// arrow width — a wide-sparse batch and a narrow batch carrying the same
+/// present bytes must land in the same rows-per-chunk ballpark, and an
+/// all-null 2,557-column schema (the historical collapse: ~10.5 KiB/row of
+/// arrow padding) must not collapse the chunk row count.
+#[test]
+fn h1_rows_per_chunk_follows_present_bytes_not_arrow_width() {
+    use arrow::array::new_null_array;
+
+    use crate::writer::docs_rows_per_chunk;
+
+    let rows = 1024usize;
+    let ts: ArrayRef = Arc::new(Int64Array::from_iter_values(
+        (0..rows).map(|row| 1_700_000_000_000_000 + row as i64),
+    ));
+    let msg: ArrayRef = Arc::new(StringArray::from_iter_values(
+        (0..rows).map(|_| "m".repeat(96)),
+    ));
+    let source: ArrayRef = Arc::new(StringArray::from_iter_values(
+        (0..rows).map(|_| "s".repeat(160)),
+    ));
+
+    let batch_of = |extra: Vec<(String, ArrayRef)>| -> RecordBatch {
+        let mut fields = vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("msg", DataType::Utf8, true),
+        ];
+        let mut arrays = vec![Arc::clone(&ts), Arc::clone(&msg)];
+        for (name, array) in extra {
+            fields.push(Field::new(&name, array.data_type().clone(), true));
+            arrays.push(array);
+        }
+        fields.push(Field::new("_source", DataType::Utf8, false));
+        arrays.push(Arc::clone(&source));
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).unwrap()
+    };
+
+    // narrow: 3 columns, all dense
+    let narrow = batch_of(Vec::new());
+    let narrow_rows = docs_rows_per_chunk(0, 0, std::slice::from_ref(&narrow));
+
+    // wide-sparse (nulls carry no data): the same values plus 1,500 all-null
+    // Utf8 columns — identical present bytes, so identical rows-per-chunk
+    let all_null: Vec<(String, ArrayRef)> = (0..1500)
+        .map(|i| (format!("sparse_{i:04}"), new_null_array(&DataType::Utf8, rows)))
+        .collect();
+    let wide_nulls = batch_of(all_null);
+    let wide_null_rows = docs_rows_per_chunk(0, 0, std::slice::from_ref(&wide_nulls));
+    assert_eq!(
+        narrow_rows, wide_null_rows,
+        "1,500 all-null columns must not change the chunk row count \
+         (narrow {narrow_rows} vs wide {wide_null_rows})"
+    );
+    assert!(
+        wide_nulls.get_array_memory_size() > 10 * narrow.get_array_memory_size(),
+        "the wide batch must actually dwarf the narrow one in arrow bytes for \
+         this test to prove anything"
+    );
+
+    // wide-sparse (values spread thin): the narrow batch's 96 msg bytes per
+    // row spread as 3×32-byte values across 1,500 columns — same present
+    // bytes, so the same ballpark (well within the H1 2x gate; only the
+    // per-present-value overhead differs)
+    let spread: Vec<(String, ArrayRef)> = (0..1500)
+        .map(|column| {
+            let values: StringArray = (0..rows)
+                .map(|row| (column % 500 == row % 500).then(|| "v".repeat(32)))
+                .collect();
+            (format!("spread_{column:04}"), Arc::new(values) as ArrayRef)
+        })
+        .collect();
+    let mut wide_spread_fields = vec![Field::new("_timestamp", DataType::Int64, false)];
+    let mut wide_spread_arrays: Vec<ArrayRef> = vec![Arc::clone(&ts)];
+    for (name, array) in spread {
+        wide_spread_fields.push(Field::new(&name, DataType::Utf8, true));
+        wide_spread_arrays.push(array);
+    }
+    wide_spread_fields.push(Field::new("_source", DataType::Utf8, false));
+    wide_spread_arrays.push(Arc::clone(&source));
+    let wide_spread =
+        RecordBatch::try_new(Arc::new(Schema::new(wide_spread_fields)), wide_spread_arrays)
+            .unwrap();
+    let wide_spread_rows = docs_rows_per_chunk(0, 0, std::slice::from_ref(&wide_spread));
+    let (low, high) = if narrow_rows < wide_spread_rows {
+        (narrow_rows, wide_spread_rows)
+    } else {
+        (wide_spread_rows, narrow_rows)
+    };
+    assert!(
+        high <= low * 2,
+        "equal present bytes must land within 2x rows-per-chunk: narrow \
+         {narrow_rows} vs wide-spread {wide_spread_rows}"
+    );
+
+    // the historical failure shape: 2,557 nullable Utf8 columns, ALL null,
+    // tiny row store — the chunk row count must saturate at the cap, not
+    // collapse toward the floor
+    let tiny_source: ArrayRef = Arc::new(StringArray::from_iter_values(
+        (0..rows).map(|_| "s".repeat(16)),
+    ));
+    let mut fat_fields = vec![Field::new("_timestamp", DataType::Int64, false)];
+    let mut fat_arrays: Vec<ArrayRef> = vec![Arc::clone(&ts)];
+    for i in 0..2557 {
+        fat_fields.push(Field::new(format!("fat_{i:04}"), DataType::Utf8, true));
+        fat_arrays.push(new_null_array(&DataType::Utf8, rows));
+    }
+    fat_fields.push(Field::new("_source", DataType::Utf8, false));
+    fat_arrays.push(tiny_source);
+    let fat = RecordBatch::try_new(Arc::new(Schema::new(fat_fields)), fat_arrays).unwrap();
+    assert_eq!(
+        docs_rows_per_chunk(0, 0, std::slice::from_ref(&fat)),
+        65536,
+        "an all-null 2,557-column schema with a tiny row store must saturate \
+         the rows-per-chunk cap, not collapse"
+    );
+}
+
+/// M8: `docs_chunk_max_rows` — the rows-per-chunk CEILING is liftable, and
+/// its default (`0` = 65,536) is byte-for-byte the pre-knob clamp.
+#[test]
+fn m8_docs_chunk_max_rows_caps_and_lifts() {
+    use crate::writer::{DEFAULT_DOCS_CHUNK_MAX_ROWS, docs_rows_per_chunk};
+
+    // ~1 KiB present bytes per row — the bench-corpus ballpark
+    let rows = 1024usize;
+    let ts: ArrayRef = Arc::new(Int64Array::from_iter_values(
+        (0..rows).map(|row| 1_700_000_000_000_000 + row as i64),
+    ));
+    let source: ArrayRef = Arc::new(StringArray::from_iter_values(
+        (0..rows).map(|_| "s".repeat(1000)),
+    ));
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("_source", DataType::Utf8, false),
+        ])),
+        vec![ts, source],
+    )
+    .unwrap();
+    let batches = std::slice::from_ref(&batch);
+
+    // DEFAULT UNCHANGED: `0` and the explicit historical cap agree at every
+    // budget, including the saturating ones
+    for budget in [0usize, 4 << 20, 16 << 20, 64 << 20, 2 << 30] {
+        assert_eq!(
+            docs_rows_per_chunk(budget, 0, batches),
+            docs_rows_per_chunk(budget, DEFAULT_DOCS_CHUNK_MAX_ROWS, batches),
+            "0 must mean the 65,536 default (budget {budget})"
+        );
+    }
+    // a 64 MiB budget saturates the default cap (~66k-row target)...
+    assert_eq!(docs_rows_per_chunk(64 << 20, 0, batches), 65536);
+    // ...and a 2 GiB budget saturates identically: bigger budgets are inert
+    assert_eq!(docs_rows_per_chunk(2 << 30, 0, batches), 65536);
+
+    // OVERRIDE LIFTS: the same 2 GiB budget under a 32M-row cap follows the
+    // byte budget instead (~2.1M rows at ~1 KiB/row)
+    let lifted = docs_rows_per_chunk(2 << 30, 32_000_000, batches);
+    assert!(
+        lifted > 65536 * 10,
+        "a lifted cap must let the byte budget govern, got {lifted}"
+    );
+    // OVERRIDE LOWERS: a small cap wins over the budget
+    assert_eq!(docs_rows_per_chunk(4 << 20, 128, batches), 128);
+    // the 64-row floor holds against a pathological cap
+    assert_eq!(docs_rows_per_chunk(4 << 20, 1, batches), 64);
+    // the options default carries the historical cap
+    assert_eq!(
+        VixWriterOptions::default().docs_chunk_max_rows,
+        DEFAULT_DOCS_CHUNK_MAX_ROWS
+    );
+}
+
+/// M8 end-to-end: `docs_chunk_max_rows` plumbs writer options → encoder →
+/// zone table. Default vs explicit-65,536 outputs are BYTE-identical (the
+/// knob's default changes nothing), and a lowered cap chunks the same rows
+/// into cap-sized zone entries where the default kept one chunk.
+#[test]
+fn m8_docs_chunk_max_rows_plumbs_into_the_chunking() {
+    use crate::VixDocs;
+
+    // byte-identity: Default options vs the explicit historical cap
+    let (default_data, default_index) = build_dataset_bytes(dataset_options());
+    let (pinned_data, pinned_index) = build_dataset_bytes(VixWriterOptions {
+        docs_chunk_max_rows: 65536,
+        ..dataset_options()
+    });
+    assert_eq!(default_data, pinned_data, "data must be byte-identical");
+    assert_eq!(default_index, pinned_index, "sidecar must be byte-identical");
+
+    // a lowered cap becomes the zone-table granularity: 1,000 rows under a
+    // saturating byte budget land in ceil(1000/128) = 8 chunks
+    let rows = 1000usize;
+    let schema = Schema::new(vec![
+        Field::new("_timestamp", DataType::Int64, false),
+        Field::new("code", DataType::Int64, true),
+    ]);
+    let build = |max_rows: usize| -> VixDocs {
+        let mut writer = VixWriter::new(
+            &schema,
+            VixWriterOptions {
+                docs_chunk_bytes: 1 << 30,
+                docs_chunk_max_rows: max_rows,
+                ..Default::default()
+            },
+            false,
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![
+                Arc::new(Int64Array::from_iter_values(
+                    (0..rows).map(|i| 2_000_000 - i as i64),
+                )) as ArrayRef,
+                Arc::new(Int64Array::from_iter_values((0..rows).map(|i| i as i64))) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let source = StringArray::from_iter_values((0..rows).map(|i| format!("{{\"code\":{i}}}")));
+        writer.push_batch_with_source(&batch, &source, None).unwrap();
+        let (data, _) = writer.finish().unwrap();
+        VixDocs::open(Bytes::from(data)).unwrap()
+    };
+    let capped = build(128);
+    let zones = capped.zone_chunks().expect("zone table");
+    assert_eq!(zones.len(), 8, "1,000 rows at a 128-row cap = 8 zone chunks");
+    assert!(
+        zones.iter().take(7).all(|zone| zone.row_count == 128),
+        "full chunks must carry exactly the cap"
+    );
+    assert_eq!(zones.last().unwrap().row_count, 1000 - 7 * 128);
+    // the default cap keeps the whole file in ONE chunk under the same budget
+    let default_cap = build(0);
+    assert_eq!(default_cap.zone_chunks().expect("zone table").len(), 1);
+}
+
+/// H2 (DESIGN §4): the DATA object carries a per-column chunk-stats blob —
+/// per zone entry: present count + min/max (strings prefix-bounded,
+/// numerics native) — plus present-row counts in the `columns` property.
+/// Density-gated columns keep presence only; the byte cap keeps the densest
+/// columns; splice-ability is exercised by the core-crate merge tests.
+#[test]
+fn h2_column_chunk_stats_written_and_gated() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("_timestamp", DataType::Int64, false),
+        Field::new("code", DataType::Int64, true),
+        Field::new("svc", DataType::Utf8, true),
+        Field::new("sparse", DataType::Utf8, true),
+    ]));
+    let rows = 512usize;
+    let ts: Vec<i64> = (0..rows as i64).map(|i| 1_000_000 - i).collect();
+    let code: Vec<Option<i64>> = (0..rows as i64).map(|i| Some(200 + (i % 100))).collect();
+    let svc: Vec<Option<String>> = (0..rows).map(|i| Some(format!("svc-{}", i % 3))).collect();
+    // 2% density: below the 10% default threshold
+    let sparse: Vec<Option<String>> = (0..rows)
+        .map(|i| (i % 50 == 0).then(|| format!("needle-{i}")))
+        .collect();
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(ts.clone())),
+            Arc::new(Int64Array::from(code.clone())),
+            Arc::new(StringArray::from(svc.clone())),
+            Arc::new(StringArray::from(sparse)),
+        ],
+    )
+    .unwrap();
+    let sources = dataset_sources(0..rows);
+    let opts = VixWriterOptions {
+        // several zone windows over 512 rows
+        docs_chunk_bytes: 4096,
+        ..Default::default()
+    };
+    let mut writer = VixWriter::new(&schema, opts, false);
+    writer
+        .push_batch_with_source(&batch, &sources, None)
+        .unwrap();
+    let (data, _index) = writer.finish().unwrap();
+
+    let docs = crate::VixDocs::open(Bytes::from(data.clone())).unwrap();
+    let reader = VixReader::open(Bytes::from(data)).unwrap_or_else(|_| unreachable!());
+    let zone = reader.zone_chunks().expect("zone table");
+    assert!(zone.len() >= 3, "need several zone windows: {}", zone.len());
+
+    // presence counts: every docs column, exact
+    let presence: std::collections::HashMap<&str, Option<u64>> = docs
+        .column_presence()
+        .iter()
+        .map(|(name, count)| (name.as_str(), *count))
+        .collect();
+    assert_eq!(presence["_timestamp"], Some(rows as u64));
+    assert_eq!(presence["code"], Some(rows as u64));
+    assert_eq!(presence["svc"], Some(rows as u64));
+    assert_eq!(presence["sparse"], Some((rows as u64).div_ceil(50)));
+
+    let stats = docs
+        .spliceable_stats()
+        .unwrap()
+        .expect("stats blob present");
+    // dense columns carry chunk tables aligned with the zone table
+    let code_stats = &stats.chunks.columns["code"];
+    assert_eq!(code_stats.tag, "i64");
+    assert_eq!(code_stats.chunks.len(), zone.len(), "1:1 zone alignment");
+    let mut offset = 0usize;
+    for (entry, zone_entry) in code_stats.chunks.iter().zip(zone) {
+        let entry = entry.as_ref().expect("fresh build: no unknown entries");
+        assert_eq!(entry.present, zone_entry.row_count, "code is dense");
+        // exact min/max over the covered rows
+        let window = &code[offset..offset + zone_entry.row_count as usize];
+        let expect_min = window.iter().flatten().min().copied().unwrap();
+        let expect_max = window.iter().flatten().max().copied().unwrap();
+        assert_eq!(entry.min, Some(crate::StatValue::I64(expect_min)));
+        assert_eq!(entry.max, Some(crate::StatValue::I64(expect_max)));
+        offset += zone_entry.row_count as usize;
+    }
+    let svc_stats = &stats.chunks.columns["svc"];
+    assert_eq!(svc_stats.tag, "str");
+    let first = svc_stats.chunks[0].as_ref().unwrap();
+    assert_eq!(first.min, Some(crate::StatValue::Str("svc-0".into())));
+    assert_eq!(first.max, Some(crate::StatValue::Str("svc-2".into())));
+
+    // density gate: the 2% column has NO chunk table (presence-only)
+    assert!(
+        !stats.chunks.columns.contains_key("sparse"),
+        "below-threshold column must not pay a chunk-stats table"
+    );
+    // _timestamp/_source never appear (the zone table IS _timestamp's stats)
+    assert!(!stats.chunks.columns.contains_key("_timestamp"));
+    assert!(!stats.chunks.columns.contains_key("_source"));
+
+    // byte cap: a tiny cap keeps at most the densest column(s), never errors
+    let mut writer = VixWriter::new(
+        &schema,
+        VixWriterOptions {
+            docs_chunk_bytes: 4096,
+            stats_max_bytes: 150,
+            ..Default::default()
+        },
+        false,
+    );
+    writer
+        .push_batch_with_source(&batch, &dataset_sources(0..rows), None)
+        .unwrap();
+    let (data, _index) = writer.finish().unwrap();
+    let docs = crate::VixDocs::open(Bytes::from(data)).unwrap();
+    let capped = docs.spliceable_stats().unwrap();
+    let kept = capped.map_or(0, |s| s.chunks.columns.len());
+    assert!(
+        kept < 2,
+        "a 150-byte cap must shed columns (kept {kept} tables)"
+    );
+    // presence counts survive the cap regardless
+    assert_eq!(
+        docs.column_presence()
+            .iter()
+            .find(|(name, _)| name == "svc")
+            .and_then(|(_, count)| *count),
+        Some(rows as u64)
+    );
+}
+
+// Manual diagnostic (kept from the M6 investigation): dumps the docs-blob
+// physical layout of a real .vix file — per-column chunk segment ids, byte
+// totals and offset spans — the tool that separated "projection ignored"
+// from "interleaved layout defeats the coalescer". Run with:
+//   M6_PROBE_FILE=/path/to/file.vix \
+//     cargo test -p vortex_index m6_probe_docs_layout -- --ignored --nocapture
+#[test]
+#[ignore]
+fn m6_probe_docs_layout() {
+    use vortex::{
+        VortexSessionDefault,
+        file::OpenOptionsSessionExt,
+        io::{
+            runtime::{BlockingRuntime, single::SingleThreadRuntime},
+            session::RuntimeSessionExt,
+        },
+        session::VortexSession,
+    };
+    let path = std::env::var("M6_PROBE_FILE").expect("M6_PROBE_FILE=<file.vix>");
+    let data = Bytes::from(std::fs::read(&path).unwrap());
+    let container = crate::container::parse_container(&data).unwrap();
+    let docs = container.docs.expect("docs blob");
+    let docs_bytes = docs.bytes().unwrap();
+    println!("file={path} docs_blob_bytes={}", docs_bytes.len());
+
+    let runtime = SingleThreadRuntime::default();
+    let session = VortexSession::default().with_handle(runtime.handle());
+    let vxf = session.open_options().open_buffer(docs_bytes).unwrap();
+    let footer = vxf.footer();
+    let segmap = footer.segment_map().clone();
+    println!("segments_total={}", segmap.len());
+    let root = footer.layout().clone();
+    println!(
+        "root encoding={} nchildren={}",
+        root.encoding_id(),
+        root.nchildren()
+    );
+
+    let names: Vec<std::sync::Arc<str>> = root.child_names().collect();
+    let children = root.children().unwrap();
+    for (name, child) in names.iter().zip(children.iter()) {
+        // per-column: chunk count, own segment ids, offset span
+        let mut seg_ids: Vec<u32> = Vec::new();
+        let mut stack = vec![child.clone()];
+        while let Some(node) = stack.pop() {
+            for sid in node.segment_ids() {
+                seg_ids.push(*sid);
+            }
+            if let Ok(kids) = node.children() {
+                stack.extend(kids);
+            }
+        }
+        seg_ids.sort_unstable();
+        let offs: Vec<u64> = seg_ids.iter().map(|&s| segmap[s as usize].offset).collect();
+        let total: u64 = seg_ids
+            .iter()
+            .map(|&s| segmap[s as usize].length as u64)
+            .sum();
+        let (lo, hi) = (
+            offs.iter().min().copied().unwrap_or(0),
+            offs.iter().max().copied().unwrap_or(0),
+        );
+        println!(
+            "col={name:<24} encoding={} segs={} bytes={} first_seg_ids={:?} offset_span={lo}..{hi}",
+            child.encoding_id(),
+            seg_ids.len(),
+            total,
+            &seg_ids[..seg_ids.len().min(6)],
+        );
+    }
+    // interleave check: offsets of the first 6 chunk-leaves of two narrow
+    // columns vs their neighbors
+    for probe in ["_timestamp", "duration"] {
+        if let Some(pos) = names.iter().position(|n| n.as_ref() == probe) {
+            let child = &children[pos];
+            let mut leaf_ids: Vec<u32> = Vec::new();
+            let mut stack = vec![child.clone()];
+            while let Some(node) = stack.pop() {
+                for sid in node.segment_ids() {
+                    leaf_ids.push(*sid);
+                }
+                if let Ok(kids) = node.children() {
+                    stack.extend(kids);
+                }
+            }
+            leaf_ids.sort_unstable();
+            let head: Vec<(u32, u64, u32)> = leaf_ids
+                .iter()
+                .take(6)
+                .map(|&s| (s, segmap[s as usize].offset, segmap[s as usize].length))
+                .collect();
+            println!("col={probe} first leaves (seg,off,len)={head:?}");
+        }
+    }
+}
+
+// M8 chunk-size sweep diagnostics (manual, ignored — the m6 probe's sibling):
+//
+//     M8_PROBE_FILE=<file.vix> [M8_PROBE_TS_FRAC=0.01] [M8_PROBE_LIMIT=100] \
+//       cargo test -p vortex_index --release m8_probe_chunk_geometry -- --ignored --nocapture
+//
+// Prints, for one data object: the zone-table chunk geometry (the
+// footer-backed chunk count the sweep records), per-column encoded bytes +
+// chunk-leaf counts (_source vs the rest — where compression wins land),
+// zone-map pruning under a mid-file `_timestamp` window (how much a
+// selective window still reads at this chunk size), LIMIT early-exit walls
+// (narrow and `_source` projections), and a 1-row point read of `_source`
+// (the decompression-granule cost of a needle hit).
+#[test]
+#[ignore]
+fn m8_probe_chunk_geometry() {
+    use vortex::{
+        VortexSessionDefault,
+        file::OpenOptionsSessionExt,
+        io::{
+            runtime::{BlockingRuntime, single::SingleThreadRuntime},
+            session::RuntimeSessionExt,
+        },
+        session::VortexSession,
+    };
+
+    use crate::VixDocs;
+
+    let path = std::env::var("M8_PROBE_FILE").expect("M8_PROBE_FILE=<file.vix>");
+    let ts_frac: f64 = std::env::var("M8_PROBE_TS_FRAC")
+        .ok()
+        .map(|v| v.parse().unwrap())
+        .unwrap_or(0.01);
+    let limit: u64 = std::env::var("M8_PROBE_LIMIT")
+        .ok()
+        .map(|v| v.parse().unwrap())
+        .unwrap_or(100);
+    let data = Bytes::from(std::fs::read(&path).unwrap());
+    let docs = VixDocs::open(data.clone()).unwrap();
+    let total_rows = docs.row_count();
+    println!("file={path} bytes={} rows={total_rows}", data.len());
+
+    // 1) zone-table chunk geometry — THE chunk count of the sweep table
+    match docs.zone_chunks() {
+        Some(zones) => {
+            let mut rows: Vec<u64> = zones.iter().map(|zone| zone.row_count).collect();
+            rows.sort_unstable();
+            println!(
+                "zone_chunks={} rows/chunk min={} median={} max={}",
+                zones.len(),
+                rows.first().unwrap_or(&0),
+                rows.get(rows.len() / 2).unwrap_or(&0),
+                rows.last().unwrap_or(&0),
+            );
+        }
+        None => println!("zone_chunks=NONE"),
+    }
+
+    // 2) per-column encoded bytes + chunk-leaf counts from the vortex footer
+    let container = crate::container::parse_container(&data).unwrap();
+    let docs_blob = container.docs.expect("docs blob");
+    let docs_bytes = docs_blob.bytes().unwrap();
+    println!("docs_blob_bytes={}", docs_bytes.len());
+    let runtime = SingleThreadRuntime::default();
+    let session = VortexSession::default().with_handle(runtime.handle());
+    let vxf = session.open_options().open_buffer(docs_bytes).unwrap();
+    let footer = vxf.footer();
+    let segmap = footer.segment_map().clone();
+    let root = footer.layout().clone();
+    let names: Vec<std::sync::Arc<str>> = root.child_names().collect();
+    let children = root.children().unwrap();
+    let mut source_bytes = 0u64;
+    let mut rest_bytes = 0u64;
+    for (name, child) in names.iter().zip(children.iter()) {
+        let mut seg_ids: Vec<u32> = Vec::new();
+        let mut stack = vec![child.clone()];
+        while let Some(node) = stack.pop() {
+            for sid in node.segment_ids() {
+                seg_ids.push(*sid);
+            }
+            if let Ok(kids) = node.children() {
+                stack.extend(kids);
+            }
+        }
+        let total: u64 = seg_ids
+            .iter()
+            .map(|&s| segmap[s as usize].length as u64)
+            .sum();
+        if name.as_ref() == "_source" {
+            source_bytes += total;
+        } else {
+            rest_bytes += total;
+        }
+        println!("col={name:<24} segs={} bytes={total}", seg_ids.len());
+    }
+    println!("col-group _source={source_bytes} rest={rest_bytes}");
+
+    // 3) zone-map pruning under a mid-file ts window of `ts_frac` span.
+    // zone_ts_bounds() is None on ts_desc files BY DESIGN (sorted files use
+    // boundary rows for stats) — the zone chunks still carry per-chunk ts
+    // bounds, so fold the file span from the zone table directly.
+    let file_span = docs.zone_ts_bounds().or_else(|| {
+        docs.zone_chunks().and_then(|chunks| {
+            let min = chunks.iter().map(|c| c.ts_min).min()?;
+            let max = chunks.iter().map(|c| c.ts_max).max()?;
+            Some((min, max))
+        })
+    });
+    if let Some((ts_min, ts_max)) = file_span {
+        let span = (ts_max - ts_min).max(1) as f64;
+        let half = (span * ts_frac / 2.0) as i64;
+        // anchor the window on the MID ROW's actual timestamp — the bench
+        // corpus is disjoint files with 10x ts spacing, so the span midpoint
+        // can land in an unpopulated gap and prune everything vacuously
+        let mut center = ts_min + (span / 2.0) as i64;
+        docs.scan_docs(
+            Some(&["_timestamp".to_string()]),
+            Some(vec![total_rows / 2]),
+            None,
+            &mut |batch| {
+                let ts = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("_timestamp is Int64");
+                if ts.len() > 0 {
+                    center = ts.value(0);
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        let window = (center - half, center + half + 1);
+        match docs.pruned_scan_ranges(Some(window), &[]) {
+            Some(ranges) => {
+                let surviving: u64 = ranges.iter().map(|r| r.end - r.start).sum();
+                println!(
+                    "ts-window frac={ts_frac} window_us={} center={center} -> \
+                     surviving_rows={surviving} ranges={}",
+                    2 * half + 1,
+                    ranges.len(),
+                );
+            }
+            None => println!("ts-window frac={ts_frac} -> NO pruning basis (full scan)"),
+        }
+    } else {
+        println!("no zone ts bounds");
+    }
+
+    // 4) LIMIT early-exit: decode cost of the first `limit` rows
+    for cols in [&["_timestamp", "duration"][..], &["_source"][..]] {
+        let projection: Vec<String> = cols.iter().map(|c| c.to_string()).collect();
+        let mut produced = 0u64;
+        let mut batches = 0u64;
+        let start = std::time::Instant::now();
+        docs.scan_docs_opts(
+            Some(&projection),
+            None,
+            None,
+            &[],
+            Some(limit),
+            0,
+            &mut |batch| {
+                produced += batch.num_rows() as u64;
+                batches += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+        println!(
+            "limit={limit} proj={cols:?} wall={:?} produced={produced} batches={batches}",
+            start.elapsed()
+        );
+    }
+
+    // 5) 1-row point read of `_source` — the needle decompression granule
+    let mid = total_rows / 2;
+    let projection = vec!["_source".to_string()];
+    let mut produced = 0u64;
+    let start = std::time::Instant::now();
+    docs.scan_docs(Some(&projection), Some(vec![mid]), None, &mut |batch| {
+        produced += batch.num_rows() as u64;
+        Ok(())
+    })
+    .unwrap();
+    println!(
+        "point-read row={mid} proj=[_source] wall={:?} produced={produced}",
+        start.elapsed()
+    );
+}
+
+/// M12 item 3 (prod "vortex.shared not permitted by ctx"): unit pins for
+/// [`crate::container::unwrap_shared`]. The dict LAYOUT reader wraps its
+/// values child in a non-serializable runtime `SharedArray`; the rewrite
+/// must strip it while preserving the dict's stored children and its
+/// `all_values_referenced` flag, and must refuse (=> canonicalize fallback)
+/// any shape it cannot provably rebuild.
+#[test]
+fn m12_unwrap_shared_strips_dict_reader_wrappers() {
+    use vortex::{
+        array::{
+            IntoArray,
+            arrays::{
+                Dict, DictArray, PrimitiveArray, SharedArray, StructArray,
+                dict::{DictArrayExt, DictArraySlotsExt},
+            },
+            validity::Validity,
+        },
+        buffer::buffer,
+    };
+
+    use crate::container::{contains_shared, unwrap_shared};
+
+    let codes = PrimitiveArray::new(buffer![0u32, 1, 0, 2], Validity::NonNullable).into_array();
+    let values = PrimitiveArray::new(buffer![10i64, 20, 30], Validity::NonNullable).into_array();
+
+    // no Shared anywhere: identity (the cheap common case)
+    let clean = unwrap_shared(&values).expect("shared-free arrays pass through");
+    assert!(!contains_shared(&clean));
+    assert_eq!(clean.len(), 3);
+
+    // a bare Shared wrapper unwraps to its SOURCE (stored form, not the
+    // canonical cache)
+    let bare = SharedArray::new(values.clone()).into_array();
+    assert!(contains_shared(&bare));
+    let clean = unwrap_shared(&bare).expect("bare Shared must unwrap");
+    assert!(!contains_shared(&clean));
+    assert_eq!(clean.len(), 3);
+    assert_eq!(clean.encoding_id(), values.encoding_id());
+
+    // THE prod shape — dict(codes, Shared(values)), the dict layout
+    // reader's projection output. SAFETY of the fixture: codes 0/1/2 all
+    // reference the 3 values, so the asserted flag is true in fact.
+    let wrapped = unsafe {
+        DictArray::new_unchecked(codes.clone(), SharedArray::new(values.clone()).into_array())
+            .set_all_values_referenced(true)
+    }
+    .into_array();
+    assert!(contains_shared(&wrapped), "fixture carries the wrapper");
+    let clean = unwrap_shared(&wrapped).expect("dict-wrapped Shared must unwrap");
+    assert!(
+        !contains_shared(&clean),
+        "no Shared may survive into the serialize path"
+    );
+    let dict = clean.as_typed::<Dict>().expect("stays dict-encoded");
+    assert!(
+        dict.has_all_values_referenced(),
+        "the encode-time flag must carry over"
+    );
+    assert_eq!(dict.codes().len(), 4);
+    assert_eq!(dict.values().len(), 3);
+    assert_eq!(dict.values().encoding_id(), values.encoding_id());
+
+    // a Shared under a parent the rewrite does not know (here: a nested
+    // struct column) must return None — the caller then canonicalizes the
+    // field instead of copying, never errors
+    let names: vortex::dtype::FieldNames =
+        vec![vortex::dtype::FieldName::from("inner")].into();
+    let nested = StructArray::try_new(
+        names,
+        vec![SharedArray::new(values.clone()).into_array()],
+        3,
+        Validity::NonNullable,
+    )
+    .unwrap()
+    .into_array();
+    assert!(
+        unwrap_shared(&nested).is_none(),
+        "unknown parents fall back to the canonicalize path"
+    );
+}
+
+/// M12 item 3 e2e: a chunk that stores a column under a DICT LAYOUT (what
+/// vortex's default first-encode strategy — [`crate::container::docs_strategy`]
+/// via `WriteStrategyBuilder`'s `DictStrategy` — produces for repetitive
+/// columns; the passthrough strategy itself never dict-probes) must survive
+/// the #51c verbatim chunk copy. The dict layout READER wraps the values
+/// child of every yielded chunk in a non-serializable `vortex.shared`
+/// runtime cache; single-chunk dict fields have no adjacent chunk to trip
+/// the slice guard's overlap canonicalization, so before the M12 unwrap the
+/// wrapper reached the writer and the copy failed with "Array encoding
+/// vortex.shared not permitted by ctx" (every prod heal-passthrough WARN).
+///
+/// Dict-present in the scanned chunk proves the field came through the dict
+/// layout reader — whose every values arm Shared-wraps — so dict-present
+/// PLUS Shared-absent proves the unwrap ran (the canonicalize fallback
+/// would have erased the dict encoding).
+#[test]
+fn m12_dict_layout_chunk_copy_roundtrip() {
+    use vortex::array::arrays::Dict;
+
+    use crate::{
+        VixDocs,
+        container::{contains_shared, unwrap_shared},
+    };
+    let _ = unwrap_shared; // referenced by the doc comment
+
+    // Corpus tuned so BtrBlocks' probe PICKS dict for the first chunk
+    // (high-entropy values with repeats — zstd wins low-card repetitive
+    // text instead, verified empirically): 1024 distinct random 32-char
+    // strings over 8192 rows, one chunk.
+    let rows = 8192usize;
+    let card = 1024usize;
+    let schema = Schema::new(vec![
+        Field::new("_timestamp", DataType::Int64, false),
+        Field::new("service", DataType::Utf8, true),
+    ]);
+    let mut rng = StdRng::seed_from_u64(0x0121_2012);
+    let pool: Vec<String> = (0..card)
+        .map(|_| {
+            (0..32)
+                .map(|_| char::from(b'a' + (rng.random::<u8>() % 26)))
+                .collect()
+        })
+        .collect();
+    let ts: Vec<i64> = (0..rows).map(|i| 1_000_000 - i as i64).collect();
+    let svc: Vec<&str> = (0..rows).map(|i| pool[i % card].as_str()).collect();
+    let sources: Vec<String> = svc
+        .iter()
+        .zip(&ts)
+        .map(|(s, t)| format!(r#"{{"_timestamp":{t},"service":"{s}"}}"#))
+        .collect();
+
+    // first-encode file (default docs strategy => dict probe runs)
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![
+            Arc::new(Int64Array::from(ts.clone())) as ArrayRef,
+            Arc::new(StringArray::from(svc.clone())) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let mut writer = VixWriter::new(&schema, VixWriterOptions::default(), false);
+    writer
+        .push_batch_with_source(&batch, &StringArray::from(sources.clone()), None)
+        .unwrap();
+    let (data, _) = writer.finish().unwrap();
+    let input = VixDocs::open(Bytes::from(data)).unwrap();
+
+    // the encoded-chunk scan: dict layout engaged, wrapper stripped
+    let mut scanned = Vec::new();
+    let mut saw_dict = false;
+    input
+        .scan_docs_encoded_chunks(&mut |chunk| {
+            saw_dict |= chunk
+                .array
+                .depth_first_traversal()
+                .any(|node| node.is::<Dict>());
+            assert!(
+                !contains_shared(&chunk.array),
+                "no vortex.shared may reach the copy consumer"
+            );
+            scanned.push(chunk);
+            Ok(())
+        })
+        .unwrap();
+    assert!(
+        saw_dict,
+        "fixture must produce a DICT LAYOUT (repetitive column, {rows} rows) — if this fires, \
+         the corpus no longer triggers vortex's dict probe and the test needs retuning"
+    );
+
+    // verbatim copy through a passthrough writer (the heal/merge shape) —
+    // pre-M12 this failed at serialize time
+    let mut out_writer = VixWriter::new(
+        &schema,
+        VixWriterOptions {
+            docs_passthrough: true,
+            concat_row_order: true,
+            ..Default::default()
+        },
+        false,
+    );
+    let ts_arr = Int64Array::from(ts.clone());
+    let cs: Vec<(String, ArrayRef)> = vec![(
+        "service".to_string(),
+        Arc::new(StringArray::from(svc.clone())) as ArrayRef,
+    )];
+    out_writer
+        .push_docs_rows_index_only(&ts_arr, &cs, &StringArray::from(sources.clone()), None)
+        .unwrap();
+    let entries: Vec<crate::ZoneEntry> = input
+        .zone_chunks()
+        .unwrap()
+        .iter()
+        .map(|zone| (zone.row_count, zone.ts_min, zone.ts_max))
+        .collect();
+    let stats = input.spliceable_stats().unwrap().unwrap();
+    out_writer
+        .begin_docs_encoded_run(
+            rows as u64,
+            *ts.last().unwrap(),
+            ts[0],
+            &entries,
+            &stats,
+            None,
+        )
+        .unwrap();
+    for chunk in scanned {
+        out_writer.push_docs_encoded_chunk(chunk).unwrap();
+    }
+    out_writer.finish_docs_encoded_run().unwrap();
+    let (out_data, _) = out_writer.finish().unwrap();
+
+    // the copied file: rows byte-equal on read-back, dict encoding kept in
+    // stored form (is_decoded_family(dict) = false => written as-is)
+    let output = VixDocs::open(Bytes::from(out_data)).unwrap();
+    let mut out_dict = false;
+    output
+        .scan_docs_encoded_chunks(&mut |chunk| {
+            out_dict |= chunk
+                .array
+                .depth_first_traversal()
+                .any(|node| node.is::<Dict>());
+            assert!(!contains_shared(&chunk.array));
+            Ok(())
+        })
+        .unwrap();
+    assert!(out_dict, "the verbatim copy must keep the dict encoding");
+
+    let read_rows = |docs: &VixDocs| -> Vec<(i64, String, String)> {
+        let mut out = Vec::new();
+        for batch in docs.read_docs(None, None, None).unwrap() {
+            let ts = batch
+                .column_by_name("_timestamp")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .clone();
+            let svc = arrow::compute::cast(
+                batch.column_by_name("service").unwrap(),
+                &DataType::Utf8,
+            )
+            .unwrap();
+            let svc = svc.as_any().downcast_ref::<StringArray>().unwrap().clone();
+            let src = arrow::compute::cast(
+                batch.column_by_name(crate::SOURCE_COL_NAME).unwrap(),
+                &DataType::Utf8,
+            )
+            .unwrap();
+            let src = src.as_any().downcast_ref::<StringArray>().unwrap().clone();
+            for i in 0..batch.num_rows() {
+                out.push((
+                    ts.value(i),
+                    svc.value(i).to_string(),
+                    src.value(i).to_string(),
+                ));
+            }
+        }
+        out
+    };
+    assert_eq!(
+        read_rows(&output),
+        read_rows(&input),
+        "copied rows must read back identically"
+    );
+}
+
+/// M25: a heal-passthrough copy of SPARSE low-cardinality columns must not
+/// bloat the output. The wide-schema shape: an input's sparse column is
+/// dict-encoded and COALESCED into leaves far coarser than the scan's
+/// union-grid windows (the dense `_source` column chunks finely), so every
+/// window of the sparse column arrives at the writer as a canonicalized
+/// SLICE — a decoded VarBinView root still borrowing the dict's encoded
+/// buffers. Pre-M25 the passthrough classified that mixed tree "encoded,
+/// copy verbatim" and stored the raw 16 B/row views buffer per column
+/// window: a 2,000-column merge wrote 15.6x its input bytes (7,034 MiB from
+/// 450 MiB). The fix keys the classification on the ROOT node
+/// ([`crate::container::is_decoded_root`]): decoded root => compress branch.
+/// (The M12 test above pins the opposite side: a WHOLE dict leaf — root
+/// `vortex.dict` — still copies verbatim.)
+#[test]
+fn m25_sparse_column_copy_does_not_bloat() {
+    use crate::VixDocs;
+
+    let rows = 40_000usize;
+    let sparse_cols = 8usize;
+    let mut fields = vec![Field::new("_timestamp", DataType::Int64, false)];
+    for c in 0..sparse_cols {
+        fields.push(Field::new(format!("k8s_label_{c:02}"), DataType::Utf8, true));
+    }
+    let schema = Schema::new(fields);
+    let ts: Vec<i64> = (0..rows).map(|i| 1_000_000_000 - i as i64).collect();
+    // ~10% present, 32 distinct values per column — the k8s label shape
+    let sparse: Vec<Vec<Option<String>>> = (0..sparse_cols)
+        .map(|c| {
+            (0..rows)
+                .map(|i| ((i + c) % 10 == 0).then(|| format!("v{c:02}-{:02}", (i / 10) % 32)))
+                .collect()
+        })
+        .collect();
+    // dense high-entropy _source (~120 B/row) so the docs blob carries many
+    // fine chunks while the sparse columns coalesce into coarse leaves
+    let mut rng = StdRng::seed_from_u64(0x2500_0001);
+    let sources: Vec<String> = (0..rows)
+        .map(|i| {
+            let noise: String = (0..96)
+                .map(|_| char::from(b'a' + (rng.random::<u8>() % 26)))
+                .collect();
+            format!(r#"{{"_timestamp":{},"blob":"{noise}"}}"#, ts[i])
+        })
+        .collect();
+
+    let mut columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(ts.clone()))];
+    for values in &sparse {
+        columns.push(Arc::new(StringArray::from(
+            values.iter().map(|v| v.as_deref()).collect::<Vec<_>>(),
+        )));
+    }
+    let batch = RecordBatch::try_new(Arc::new(schema.clone()), columns).unwrap();
+    let mut writer = VixWriter::new(
+        &schema,
+        VixWriterOptions {
+            // small chunks => many scan windows => the coarse sparse leaves
+            // are sliced by the union grid (the wide-merge shape)
+            docs_chunk_bytes: 256 * 1024,
+            ..Default::default()
+        },
+        false,
+    );
+    writer
+        .push_batch_with_source(&batch, &StringArray::from(sources.clone()), None)
+        .unwrap();
+    let (data, _) = writer.finish().unwrap();
+    let input = VixDocs::open(Bytes::from(data)).unwrap();
+    let input_docs = input.docs_blob_len();
+    // fixture guard: the copy consumer must actually SEE the mixed shape
+    // (decoded root over an encoded descendant — the sliced dict-layout
+    // canonical form). If this stops firing, the corpus no longer engages
+    // vortex's dict probe and the test needs retuning.
+    let mut mixed = 0usize;
+    input
+        .scan_docs_encoded_chunks(&mut |chunk| {
+            use vortex::array::arrays::{Struct, struct_::StructArrayExt};
+            let sa = chunk.array.as_typed::<Struct>().unwrap().clone();
+            for field in sa.unmasked_fields().iter() {
+                if crate::container::is_decoded_root(field)
+                    && !crate::container::is_decoded_family(field)
+                {
+                    mixed += 1;
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+    assert!(
+        mixed >= 8,
+        "fixture must yield sliced-dict mixed chunks (decoded root over encoded buffers), got \
+         {mixed}"
+    );
+
+    // the copy shape: encoded-chunk scan -> passthrough writer
+    let mut out_writer = VixWriter::new(
+        &schema,
+        VixWriterOptions {
+            docs_passthrough: true,
+            concat_row_order: true,
+            ..Default::default()
+        },
+        false,
+    );
+    let ts_arr = Int64Array::from(ts.clone());
+    let cs: Vec<(String, ArrayRef)> = sparse
+        .iter()
+        .enumerate()
+        .map(|(c, values)| {
+            (
+                format!("k8s_label_{c:02}"),
+                Arc::new(StringArray::from(
+                    values.iter().map(|v| v.as_deref()).collect::<Vec<_>>(),
+                )) as ArrayRef,
+            )
+        })
+        .collect();
+    out_writer
+        .push_docs_rows_index_only(&ts_arr, &cs, &StringArray::from(sources.clone()), None)
+        .unwrap();
+    let entries: Vec<crate::ZoneEntry> = input
+        .zone_chunks()
+        .unwrap()
+        .iter()
+        .map(|zone| (zone.row_count, zone.ts_min, zone.ts_max))
+        .collect();
+    let stats = input.spliceable_stats().unwrap().unwrap();
+    out_writer
+        .begin_docs_encoded_run(rows as u64, *ts.last().unwrap(), ts[0], &entries, &stats, None)
+        .unwrap();
+    input
+        .scan_docs_encoded_chunks(&mut |chunk| out_writer.push_docs_encoded_chunk(chunk))
+        .unwrap();
+    out_writer.finish_docs_encoded_run().unwrap();
+    let (out_data, _) = out_writer.finish().unwrap();
+    let output = VixDocs::open(Bytes::from(out_data)).unwrap();
+    let output_docs = output.docs_blob_len();
+
+    // pre-M25 the sparse columns' sliced windows stored raw views:
+    // 8 cols x 40k rows x 16 B ~ 5 MiB of bloat on a ~1.5 MiB input blob
+    // (measured 3.5-4x). Compressed, the copy stays within noise of the
+    // input.
+    assert!(
+        output_docs <= input_docs * 3 / 2,
+        "sparse-column copy bloated: input docs blob {input_docs} B -> output {output_docs} B \
+         (> 1.5x) — sliced sparse windows are being stored as raw views again"
+    );
+
+    // and the rows read back identically (values AND nulls)
+    let read_rows = |docs: &VixDocs| -> Vec<(i64, Vec<Option<String>>)> {
+        let mut out = Vec::new();
+        for batch in docs.read_docs(None, None, None).unwrap() {
+            let ts = batch
+                .column_by_name("_timestamp")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .clone();
+            let cols: Vec<StringArray> = (0..sparse_cols)
+                .map(|c| {
+                    let col = arrow::compute::cast(
+                        batch.column_by_name(&format!("k8s_label_{c:02}")).unwrap(),
+                        &DataType::Utf8,
+                    )
+                    .unwrap();
+                    col.as_any().downcast_ref::<StringArray>().unwrap().clone()
+                })
+                .collect();
+            for i in 0..batch.num_rows() {
+                out.push((
+                    ts.value(i),
+                    cols.iter()
+                        .map(|col| col.is_valid(i).then(|| col.value(i).to_string()))
+                        .collect(),
+                ));
+            }
+        }
+        out
+    };
+    assert_eq!(
+        read_rows(&output),
+        read_rows(&input),
+        "copied rows must read back identically (values and nulls)"
+    );
+}
+
+// M12 item 3 prod-repro probe (manual, ignored). Points at a REAL prod
+// `.vix` (read-only fetch) and proves the root cause + the fix on its bytes:
+//
+//   M12_REPRO_FILE=/tmp/claude-1000/m12/repro.vix \
+//     cargo test -p vortex_index --lib m12_probe_prod_shared_wrapper -- --ignored --nocapture
+//
+// (1) the RAW vortex scan (the pre-M12 read path) yields chunks whose dict
+//     columns carry the `vortex.shared` runtime wrapper, and serializing one
+//     with the file writer's own ctx construction reproduces the exact prod
+//     error "Array encoding vortex.shared not permitted by ctx";
+// (2) the FIXED [`crate::container::scan_blob_encoded_chunks`] yields the
+//     same chunks with the wrapper stripped, every one of which serializes.
+#[test]
+#[ignore]
+fn m12_probe_prod_shared_wrapper() {
+    use vortex::{
+        VortexSessionDefault,
+        array::{ArrayContext, arrays::Dict, session::ArraySessionExt},
+        file::OpenOptionsSessionExt,
+        io::{
+            runtime::{BlockingRuntime, single::SingleThreadRuntime},
+            session::RuntimeSessionExt,
+        },
+        session::VortexSession,
+    };
+
+    use crate::{VixDocs, container::contains_shared};
+
+    let path = std::env::var("M12_REPRO_FILE").expect("M12_REPRO_FILE=<file.vix>");
+    let data = Bytes::from(std::fs::read(&path).unwrap());
+
+    // (1) the raw scan — what the encoded-chunk copy consumed pre-M12
+    let container = crate::container::parse_container(&data).unwrap();
+    let docs_bytes = container.docs.expect("docs blob").bytes().unwrap();
+    let runtime = SingleThreadRuntime::default();
+    let session = VortexSession::default().with_handle(runtime.handle());
+    let vxf = session.open_options().open_buffer(docs_bytes).unwrap();
+    let scan = vxf.scan().unwrap();
+    let write_ctx = ArrayContext::new(Vec::new())
+        .with_registry(session.arrays().registry().clone());
+    let (mut raw_chunks, mut raw_shared, mut raw_dict, mut serialize_errors) = (0, 0, 0, 0);
+    let mut first_error = String::new();
+    for array in scan.into_array_iter(&runtime).unwrap() {
+        let array = array.unwrap();
+        if array.len() == 0 {
+            continue;
+        }
+        raw_chunks += 1;
+        raw_shared += usize::from(contains_shared(&array));
+        raw_dict += usize::from(
+            array
+                .depth_first_traversal()
+                .any(|node| node.is::<Dict>()),
+        );
+        if let Err(e) = array.serialize(&write_ctx, &session, &Default::default()) {
+            serialize_errors += 1;
+            if first_error.is_empty() {
+                first_error = format!("{e}");
+            }
+        }
+    }
+    println!(
+        "raw scan: chunks={raw_chunks} with_shared={raw_shared} with_dict={raw_dict} \
+         serialize_errors={serialize_errors}\nfirst_error={first_error}"
+    );
+
+    // (2) the fixed scan: wrapper stripped, everything serializes
+    let docs = VixDocs::open(data).unwrap();
+    let (mut fixed_chunks, mut fixed_dict) = (0, 0);
+    docs.scan_docs_encoded_chunks(&mut |chunk| {
+        fixed_chunks += 1;
+        assert!(
+            !contains_shared(&chunk.array),
+            "fixed scan must never yield a Shared node"
+        );
+        fixed_dict += usize::from(
+            chunk
+                .array
+                .depth_first_traversal()
+                .any(|node| node.is::<Dict>()),
+        );
+        chunk
+            .array
+            .serialize(&write_ctx, &session, &Default::default())
+            .expect("fixed scan chunks must serialize");
+        Ok(())
+    })
+    .unwrap();
+    println!("fixed scan: chunks={fixed_chunks} with_dict={fixed_dict} (all serialized)");
+
+    if raw_shared > 0 {
+        assert!(
+            first_error.contains("vortex.shared not permitted by ctx"),
+            "expected THE prod error on the raw path, got: {first_error}"
+        );
+        assert!(fixed_dict > 0, "the fix must preserve the dict encodings");
+    } else {
+        println!("NOTE: this file's raw scan carried no Shared wrapper (no dict layout?)");
+    }
+}
+
+// M12 diagnostic probe (manual, ignored — the m6/m8 probes' sibling): print
+// one file pair's term/bloom facts — bloom-only markers, per-field term
+// capability + partial taint, dictionary term counts, bloom section
+// geometry (num_blocks / n_items / bytes). This is what separated "the M10
+// coverage scan hashes `duration`" (it never did — numeric fields never
+// enter bloom_only; the merge-site AUTO log was the artifact) from the
+// real scan set (the four birth-demoted ID columns).
+//
+//   M12_PROBE_DATA=<x.vix> [M12_PROBE_IDX=<x.vxi>] \
+//     cargo test -p vortex_index --lib m12_probe_file_facts -- --ignored --nocapture
+#[test]
+#[ignore]
+fn m12_probe_file_facts() {
+    let data = std::env::var("M12_PROBE_DATA").expect("M12_PROBE_DATA");
+    let idx = std::env::var("M12_PROBE_IDX").ok();
+    let data_bytes = Bytes::from(std::fs::read(&data).unwrap());
+    let idx_bytes = idx.map(|p| Bytes::from(std::fs::read(p).unwrap()));
+    let reader = VixReader::open_with_index(data_bytes, idx_bytes).unwrap();
+    println!("file={data} rows={} terms={}", reader.row_count(), reader.term_count());
+    println!("bloom_only_fields={:?}", reader.bloom_only_fields().collect::<Vec<_>>());
+    for f in ["duration", "trace_id", "span_id", "http.url", "service_pod_name"] {
+        println!(
+            "field {f:?}: term_capability={} partial={}",
+            reader.has_term_capability(f),
+            reader.partial_fields().contains(f)
+        );
+    }
+    if let Ok(counts) = reader.term_counts_by_field() {
+        for (name, count) in counts.iter().filter(|(n, _)| n.contains("duration") || n.contains("trace")) {
+            println!("dict terms: {name:?} = {count}");
+        }
+    }
+    if let Ok(Some(blooms)) = reader.file_blooms() {
+        for b in &blooms {
+            println!("bloom section field={:?} num_blocks={} n_items={} bytes={}", b.field, b.num_blocks, b.n_items, b.bytes.len());
+        }
+    }
+}
+
+// ---------- M17: docs widen plan (gen-1 encode-once) ----------
+
+/// M17 plan edges: identity, null-widening, and every refusal class. The
+/// end-to-end chunk surgery (widened chunks round-tripping through a real
+/// merge) is pinned in core_writer's gen1_docs_copy tests; here the plan
+/// itself is held to its contract.
+#[test]
+fn m17_docs_widen_plan_edges() {
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    use crate::docs_widen_plan;
+    let ts = || Field::new(crate::TIMESTAMP_COL_NAME, DataType::Int64, false);
+    let src = || Field::new(crate::SOURCE_COL_NAME, DataType::Utf8, false);
+    let output = Schema::new(vec![
+        ts(),
+        Field::new("code", DataType::Int64, true),
+        Field::new("region", DataType::Utf8, true),
+        Field::new("svc", DataType::Utf8, true),
+        src(),
+    ]);
+
+    // identity: same fields, arrow string REPRESENTATION differences erase
+    // at the vortex dtype (Utf8View == Utf8 stored)
+    let identity = docs_widen_plan(
+        &Schema::new(vec![
+            ts(),
+            Field::new("code", DataType::Int64, true),
+            Field::new("region", DataType::Utf8View, true),
+            Field::new("svc", DataType::Utf8, true),
+            src(),
+        ]),
+        &output,
+    )
+    .expect("identity plan");
+    assert!(identity.is_identity());
+    assert_eq!(identity.null_columns(), 0);
+
+    // widening: a strict subset synthesizes the missing nullable columns
+    let widen = docs_widen_plan(
+        &Schema::new(vec![ts(), Field::new("svc", DataType::Utf8, true), src()]),
+        &output,
+    )
+    .expect("widen plan");
+    assert!(!widen.is_identity());
+    assert_eq!(widen.null_columns(), 2, "code + region synthesize");
+
+    // type flip: a shared column stored under a different dtype refuses
+    let flip = docs_widen_plan(
+        &Schema::new(vec![ts(), Field::new("code", DataType::Utf8, true), src()]),
+        &output,
+    );
+    assert!(
+        flip.unwrap_err().contains("type widening is a re-encode"),
+        "type flips must refuse"
+    );
+
+    // an input column the output would drop refuses
+    let extra = docs_widen_plan(
+        &Schema::new(vec![
+            ts(),
+            Field::new("zonly", DataType::Utf8, true),
+            src(),
+        ]),
+        &output,
+    );
+    assert!(extra.unwrap_err().contains("absent from the output schema"));
+
+    // a missing NON-NULLABLE output column refuses (nothing can null-fill)
+    let missing_src = docs_widen_plan(&Schema::new(vec![ts()]), &output);
+    assert!(missing_src.unwrap_err().contains("non-nullable"));
+}
+
+/// M17 chunk surgery: widen real encoded chunks (scanned off a stored docs
+/// blob) into a wider union and read the rows back — moved columns
+/// byte-survive (stored form untouched), synthesized columns read as nulls,
+/// and the widened chunks satisfy the wider writer's encoded-run dtype.
+#[test]
+fn m17_widen_chunks_roundtrip() {
+    use arrow::{
+        array::{Int64Array, StringArray},
+        datatypes::{DataType, Field, Schema},
+        record_batch::RecordBatch,
+    };
+
+    use crate::{VixDocs, docs_widen_plan};
+
+    // narrow input file: _timestamp + svc (+_source)
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(crate::TIMESTAMP_COL_NAME, DataType::Int64, false),
+        Field::new("svc", DataType::Utf8, true),
+    ]));
+    let n = 4096;
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(
+                (0..n).map(|i| 1_000_000 - i as i64).collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(StringArray::from(
+                (0..n).map(|i| format!("svc-{}", i % 7)).collect::<Vec<_>>(),
+            )) as _,
+        ],
+    )
+    .unwrap();
+    let source: StringArray = (0..n)
+        .map(|i| Some(format!("{{\"svc\":\"svc-{}\"}}", i % 7)))
+        .collect();
+    let mut writer = VixWriter::new(
+        &schema,
+        VixWriterOptions {
+            index_enabled: false,
+            ..Default::default()
+        },
+        false,
+    );
+    writer.push_batch_with_source(&batch, &source, None).unwrap();
+    let (data, _) = writer.finish().unwrap();
+    let docs = VixDocs::open(Bytes::from(data)).unwrap();
+
+    // the output union adds `code` (Int64) and `region` (Utf8)
+    let out_schema = Schema::new(vec![
+        Field::new(crate::TIMESTAMP_COL_NAME, DataType::Int64, false),
+        Field::new("code", DataType::Int64, true),
+        Field::new("region", DataType::Utf8, true),
+        Field::new("svc", DataType::Utf8, true),
+        Field::new(crate::SOURCE_COL_NAME, DataType::Utf8, false),
+    ]);
+    let plan = docs_widen_plan(docs.schema(), &out_schema).unwrap();
+    assert!(!plan.is_identity());
+    assert_eq!(plan.null_columns(), 2);
+
+    // a passthrough writer over the WIDER schema accepts the widened chunks
+    let out_construction = Schema::new(vec![
+        Field::new(crate::TIMESTAMP_COL_NAME, DataType::Int64, false),
+        Field::new("code", DataType::Int64, true),
+        Field::new("region", DataType::Utf8, true),
+        Field::new("svc", DataType::Utf8, true),
+    ]);
+    let mut out = VixWriter::new(
+        &out_construction,
+        VixWriterOptions {
+            index_enabled: false,
+            docs_passthrough: true,
+            ..Default::default()
+        },
+        false,
+    );
+    let stats = docs
+        .spliceable_stats()
+        .unwrap()
+        .expect("input carries spliceable stats");
+    let zone: Vec<crate::ZoneEntry> = docs
+        .zone_chunks()
+        .expect("zone table")
+        .iter()
+        .map(|z| (z.row_count, z.ts_min, z.ts_max))
+        .collect();
+    out.begin_docs_encoded_run(n as u64, 1_000_000 - (n as i64 - 1), 1_000_000, &zone, &stats, Some(&[n as u64]))
+        .unwrap();
+    docs.scan_docs_encoded_chunks(&mut |chunk| {
+        out.push_docs_encoded_chunk(plan.widen(chunk)?)
+    })
+    .unwrap();
+    out.finish_docs_encoded_run().unwrap();
+    let (widened_bytes, _) = out.finish().unwrap();
+    let widened = VixDocs::open(Bytes::from(widened_bytes)).unwrap();
+    assert_eq!(widened.row_count(), n as u64);
+    let batches = widened.read_docs(None, None, None).unwrap();
+    let mut rows = 0usize;
+    for batch in &batches {
+        let code = batch.column_by_name("code").unwrap();
+        let region = batch.column_by_name("region").unwrap();
+        assert_eq!(code.null_count(), batch.num_rows(), "code is all-null");
+        assert_eq!(region.null_count(), batch.num_rows(), "region is all-null");
+        rows += batch.num_rows();
+    }
+    assert_eq!(rows, n);
+    // moved columns read back exactly
+    let svc_batches = widened
+        .read_docs(Some(&["svc".to_string()]), None, None)
+        .unwrap();
+    let mut svc_values: Vec<String> = Vec::new();
+    for batch in &svc_batches {
+        let column = arrow::compute::cast(
+            batch.column_by_name("svc").unwrap(),
+            &DataType::Utf8,
+        )
+        .unwrap();
+        let column = column
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .clone();
+        svc_values.extend((0..column.len()).map(|i| column.value(i).to_string()));
+    }
+    assert_eq!(svc_values.len(), n);
+    for (i, value) in svc_values.iter().enumerate() {
+        assert_eq!(value, &format!("svc-{}", i % 7));
+    }
+}
+
+// ---------- M17 item 4: parallel rebuild index-blob build ----------
+
+/// The rebuild-arm parity pin: `merge_kway_threads` R=1 (the sequential
+/// pre-M17 path, bit-for-bit) vs R=8 (field-boundary range partitioning +
+/// per-range sinks + the re-cutting assembly) over one writer's own term
+/// map must produce BYTE-IDENTICAL outputs — data object AND `.vxi` index
+/// sidecar — across a corpus exercising every cell/blob class: many field
+/// regions (real split points), dense-elided terms, out-of-row plist
+/// pointer cells crossing range boundaries, small postings row blocks
+/// (many term batches to re-cut), an fts field, per-field blooms, the
+/// composite section, and a #52 bloom-only demotion.
+#[test]
+fn m17_rebuild_parallel_blob_build_byte_parity() {
+    use arrow::{
+        array::{ArrayRef as ArrowArrayRef, Int64Array, StringArray},
+        datatypes::{DataType, Field, Schema},
+        record_batch::RecordBatch,
+    };
+
+    let n = 3000usize;
+    let field_count = 20usize;
+    let mut fields = vec![Field::new(crate::TIMESTAMP_COL_NAME, DataType::Int64, false)];
+    for f in 0..field_count {
+        fields.push(Field::new(format!("f{f:02}"), DataType::Utf8, true));
+    }
+    fields.push(Field::new("num", DataType::Int64, true));
+    fields.push(Field::new("dense", DataType::Utf8, true));
+    let schema = Arc::new(Schema::new(fields));
+    let mut columns: Vec<ArrowArrayRef> = vec![Arc::new(Int64Array::from(
+        (0..n).map(|i| 2_000_000 - i as i64).collect::<Vec<_>>(),
+    ))];
+    for f in 0..field_count {
+        columns.push(Arc::new(StringArray::from(
+            (0..n)
+                .map(|i| {
+                    // ~256 distinct per field; some values repeat often
+                    // enough to cross the plist threshold, some are nulls
+                    (i % 17 != 3).then(|| format!("f{f:02}-value-{:03}", (i * (f + 7)) % 256))
+                })
+                .collect::<Vec<_>>(),
+        )));
+    }
+    columns.push(Arc::new(Int64Array::from(
+        (0..n).map(|i| (i % 97) as i64 * 13).collect::<Vec<_>>(),
+    )));
+    columns.push(Arc::new(StringArray::from(vec![Some("always"); n])));
+    let batch = RecordBatch::try_new(Arc::clone(&schema), columns).unwrap();
+    let source: StringArray = (0..n)
+        .map(|i| Some(format!("{{\"row\":{i},\"text\":\"error request {i} failed\"}}")))
+        .collect();
+
+    let build = |kway: usize| -> (Vec<u8>, Vec<u8>) {
+        let mut writer = VixWriter::new(
+            &schema,
+            VixWriterOptions {
+                fts_field_names: vec!["f00".to_string()],
+                bloom_field_names: vec!["f01".to_string()],
+                bloom_composite: true,
+                bloom_only_field_names: vec!["f19".to_string()],
+                postings_chunk_bytes: 192,
+                postings_plist_min_docs: 8,
+                merge_kway_threads: kway,
+                ..Default::default()
+            },
+            false,
+        );
+        writer
+            .push_batch_with_source(&batch, &source, None)
+            .unwrap();
+        let (data, index) = writer.finish().unwrap();
+        (data, index.expect("indexed build emits a sidecar"))
+    };
+
+    let (data_seq, index_seq) = build(1);
+    let (data_par, index_par) = build(8);
+    assert_eq!(
+        data_seq, data_par,
+        "data object must be byte-identical across rebuild blob-build parallelism"
+    );
+    assert_eq!(
+        index_seq.len(),
+        index_par.len(),
+        ".vxi length differs between R=1 and R=8"
+    );
+    assert_eq!(
+        index_seq, index_par,
+        ".vxi must be byte-identical across rebuild blob-build parallelism"
+    );
+
+    // digest-level sanity on top of the byte pin: the corpus really
+    // exercised the classes the re-cut must preserve
+    let reader =
+        VixReader::open_with_index(Bytes::from(data_seq), Some(Bytes::from(index_seq))).unwrap();
+    assert!(reader.term_count() > 2500, "multi-field term map expected");
+    let mut dense_count = 0u64;
+    let mut pointer_docs = 0u64;
+    reader
+        .for_each_term(&mut |_key, doc_count, ids| {
+            if doc_count == reader.row_count() {
+                dense_count += 1;
+            }
+            if doc_count >= 8 {
+                pointer_docs += 1;
+            }
+            assert_eq!(doc_count as usize, ids.len());
+            Ok(())
+        })
+        .unwrap();
+    assert!(dense_count >= 1, "dense-elided term expected");
+    assert!(pointer_docs > 50, "plist-eligible terms expected");
+    assert!(
+        reader.bloom_only_fields().any(|f| f == "f19"),
+        "the #52 demotion must survive"
+    );
+}
+
+// ---------- M17 item 2: composite bloom hashing off encoded chunks ----------
+
+/// The byte-equality pin: hashing a demoted field's values off its ENCODED
+/// chunks (dict → dictionary-only decode, each referenced distinct value
+/// once; FSST → one bulk decompress, raw slices; other → canonical
+/// per-row) must produce the EXACT hash sets — and therefore byte-identical
+/// bloom blobs — as the decoded-column scan, across all three encoding
+/// classes with nulls, empty strings and an oversize value.
+///
+/// Corpus: `dict_col` stores `vortex.dict` (the M12 recipe — 1024 distinct
+/// random 32-char strings, no nulls; the BtrBlocks dict probe rejects
+/// nullable shapes); `fsst_col` is REBUILT chunk-by-chunk into real
+/// `vortex.fsst` through the passthrough writer (this build's compact
+/// sampler prefers zstd for every synthetic string shape probed —
+/// m17_probe_stored_encodings — but merge inputs legitimately carry FSST
+/// from other lineages, M15b's 16M corpus measured exactly that);
+/// `zs_col`/`flat_col` stay zstd/constant — the canonical fallback arm.
+#[test]
+fn m17_bloom_encoded_scan_byte_equality() {
+    use arrow::{
+        array::{ArrayRef as ArrowArrayRef, Int64Array, StringArray},
+        datatypes::{DataType, Field, Schema},
+        record_batch::RecordBatch,
+    };
+    use vortex::{
+        VortexSessionDefault,
+        array::{
+            IntoArray, VortexSessionExecute,
+            arrays::{Struct, StructArray as VStructArray, struct_::StructArrayExt},
+            validity::Validity,
+        },
+        encodings::fsst::{fsst_compress, fsst_train_compressor},
+        io::{
+            runtime::{BlockingRuntime, single::SingleThreadRuntime},
+            session::RuntimeSessionExt,
+        },
+        session::VortexSession,
+    };
+
+    use crate::VixDocs;
+
+    let n = 8192usize;
+    let mut rng = StdRng::seed_from_u64(0x0121_2012);
+    let mut rand_str = |len: usize| -> String {
+        (0..len)
+            .map(|_| char::from(b'a' + (rng.random::<u8>() % 26)))
+            .collect()
+    };
+    let pool: Vec<String> = (0..1024).map(|_| rand_str(32)).collect();
+    let dict_col: Vec<Option<String>> = (0..n).map(|i| Some(pool[i % 1024].clone())).collect();
+    let oversize = "z".repeat(70_000);
+    let fsst_col: Vec<Option<String>> = (0..n)
+        .map(|i| {
+            if i % 29 == 7 {
+                None
+            } else if i == 1234 {
+                Some(oversize.clone()) // over max_raw_term_len: skipped by policy
+            } else if i == 2345 {
+                Some(String::new()) // empty string: hashed (policy keeps it)
+            } else {
+                Some(format!("{}-{i:08}", rand_str(24)))
+            }
+        })
+        .collect();
+    let zs_col: Vec<Option<String>> = (0..n)
+        .map(|i| (i % 13 != 5).then(|| format!("{}-{}", rand_str(16), i % 41)))
+        .collect();
+    let flat_col: Vec<Option<&str>> = (0..n).map(|_| Some("constant-value")).collect();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(crate::TIMESTAMP_COL_NAME, DataType::Int64, false),
+        Field::new("dict_col", DataType::Utf8, true),
+        Field::new("flat_col", DataType::Utf8, true),
+        Field::new("fsst_col", DataType::Utf8, true),
+        Field::new("zs_col", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(
+                (0..n).map(|i| 3_000_000 - i as i64).collect::<Vec<_>>(),
+            )) as ArrowArrayRef,
+            Arc::new(StringArray::from(dict_col)),
+            Arc::new(StringArray::from(flat_col)),
+            Arc::new(StringArray::from(fsst_col)),
+            Arc::new(StringArray::from(zs_col)),
+        ],
+    )
+    .unwrap();
+    let source: StringArray = (0..n).map(|i| Some(format!("{{\"row\":{i}}}"))).collect();
+    let mut data_writer = VixWriter::new(
+        &schema,
+        VixWriterOptions {
+            index_enabled: false,
+            ..Default::default()
+        },
+        false,
+    );
+    data_writer
+        .push_batch_with_source(&batch, &source, None)
+        .unwrap();
+    let (data, _) = data_writer.finish().unwrap();
+    let first = VixDocs::open(Bytes::from(data)).unwrap();
+
+    // chunk surgery: re-encode fsst_col's stored chunks into REAL
+    // vortex.fsst and store the file through the passthrough writer (the
+    // shape a merge input from an FSST-writing lineage arrives in)
+    let runtime = SingleThreadRuntime::default();
+    let session = VortexSession::default().with_handle(runtime.handle());
+    let mut pass = VixWriter::new(
+        &schema,
+        VixWriterOptions {
+            index_enabled: false,
+            docs_passthrough: true,
+            ..Default::default()
+        },
+        false,
+    );
+    let stats = first
+        .spliceable_stats()
+        .unwrap()
+        .expect("first-encode file carries stats");
+    let zone: Vec<crate::ZoneEntry> = first
+        .zone_chunks()
+        .expect("zone table")
+        .iter()
+        .map(|z| (z.row_count, z.ts_min, z.ts_max))
+        .collect();
+    pass.begin_docs_encoded_run(
+        n as u64,
+        3_000_000 - (n as i64 - 1),
+        3_000_000,
+        &zone,
+        &stats,
+        Some(&[n as u64]),
+    )
+    .unwrap();
+    let mut fsst_rebuilt = 0usize;
+    first
+        .scan_docs_encoded_chunks(&mut |chunk| {
+            let sa = chunk.array.as_typed::<Struct>().expect("struct chunk").clone();
+            let names = sa.names().clone();
+            let rows = chunk.rows();
+            let fields: Vec<vortex::array::ArrayRef> = sa
+                .unmasked_fields()
+                .iter()
+                .enumerate()
+                .map(|(index, field)| {
+                    if names[index].as_ref() != "fsst_col" {
+                        return field.clone();
+                    }
+                    let mut ctx = session.create_execution_ctx();
+                    let canonical = field
+                        .clone()
+                        .execute::<vortex::array::Canonical>(&mut ctx)
+                        .expect("canonicalize fsst_col")
+                        .into_array();
+                    let compressor =
+                        fsst_train_compressor(&canonical, &mut ctx).expect("train fsst");
+                    let rebuilt = fsst_compress(&canonical, &compressor, &mut ctx)
+                        .expect("fsst compress")
+                        .into_array();
+                    fsst_rebuilt += 1;
+                    rebuilt
+                })
+                .collect();
+            let rebuilt =
+                VStructArray::try_new(names, fields, rows, Validity::NonNullable).unwrap();
+            pass.push_docs_encoded_chunk(crate::EncodedDocsChunk::for_tests(
+                rebuilt.into_array(),
+                rows,
+            ))
+        })
+        .unwrap();
+    assert!(fsst_rebuilt >= 1, "surgery must have rebuilt fsst_col");
+    pass.finish_docs_encoded_run().unwrap();
+    let (data, _) = pass.finish().unwrap();
+    let docs = VixDocs::open(Bytes::from(data)).unwrap();
+
+    let fields = vec![
+        "dict_col".to_string(),
+        "flat_col".to_string(),
+        "fsst_col".to_string(),
+        "zs_col".to_string(),
+    ];
+    let make_writer = || {
+        VixWriter::new(
+            &schema,
+            VixWriterOptions {
+                bloom_composite: true,
+                bloom_only_field_names: fields.clone(),
+                ..Default::default()
+            },
+            false,
+        )
+    };
+    let writer_enc = make_writer();
+    let mut hasher_enc = writer_enc.bloom_only_hasher(&fields);
+    let mut census = crate::BloomEncodingCensus::default();
+    for field in &fields {
+        census.absorb(docs.hash_bloom_only_encoded(&mut hasher_enc, field).unwrap());
+    }
+    assert!(
+        census.dict_chunks >= 1,
+        "the dict corpus must exercise the dict arm: {census:?}"
+    );
+    assert!(
+        census.fsst_chunks >= 1,
+        "the FSST-rebuilt column must exercise the FSST arm: {census:?}"
+    );
+    assert!(
+        census.other_chunks >= 2,
+        "zstd + constant columns ride the canonical arm: {census:?}"
+    );
+
+    let writer_dec = make_writer();
+    let mut hasher_dec = writer_dec.bloom_only_hasher(&fields);
+    docs.scan_docs(Some(&fields), None, None, &mut |batch| {
+        let columns: Vec<(String, ArrowArrayRef)> = fields
+            .iter()
+            .map(|name| (name.clone(), Arc::clone(batch.column_by_name(name).unwrap())))
+            .collect();
+        hasher_dec.hash_columns(&columns);
+        Ok(())
+    })
+    .unwrap();
+
+    let sets_enc = hasher_enc.hash_sets();
+    let sets_dec = hasher_dec.hash_sets();
+    for (name, dec) in &sets_dec {
+        assert!(!dec.is_empty(), "{name}: decoded scan hashed nothing?");
+    }
+    assert_eq!(
+        sets_enc, sets_dec,
+        "encoded-chunk coverage must equal the decoded scan hash-for-hash"
+    );
+
+    // blob-level byte equality: identical pushes + the respective hashers
+    // folded in must finish byte-identical outputs (bloom blob included)
+    let build_with = |hasher: crate::BloomOnlyHasher| -> (Vec<u8>, Vec<u8>) {
+        let mut writer = make_writer();
+        writer.push_batch_with_source(&batch, &source, None).unwrap();
+        writer.absorb_bloom_only_hashes(hasher);
+        let (data, index) = writer.finish().unwrap();
+        (data, index.expect("indexed build emits a sidecar"))
+    };
+    let (data_a, index_a) = build_with(hasher_enc);
+    let (data_b, index_b) = build_with(hasher_dec);
+    assert_eq!(data_a, data_b, "data bytes must not depend on the scan path");
+    assert_eq!(
+        index_a, index_b,
+        ".vxi (bloom blob included) must be byte-identical across scan paths"
+    );
+}
+
+#[test]
+#[ignore]
+fn m17_probe_stored_encodings() {
+    use arrow::{
+        array::{ArrayRef as ArrowArrayRef, Int64Array, StringArray},
+        datatypes::{DataType, Field, Schema},
+        record_batch::RecordBatch,
+    };
+    let n: usize = std::env::var("M17_PROBE_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(8192);
+    let mut rng = StdRng::seed_from_u64(0x0121_2012);
+    let mut rand_str = |len: usize| -> String {
+        (0..len).map(|_| char::from(b'a' + (rng.random::<u8>() % 26))).collect()
+    };
+    let pool: Vec<String> = (0..1024).map(|_| rand_str(32)).collect();
+    let dict_col: Vec<Option<String>> = (0..n).map(|i| Some(pool[i % 1024].clone())).collect();
+    // scale-dependent
+    let dict_nulls: Vec<Option<String>> = (0..n).map(|i| (i % 13 != 5).then(|| pool[i % 1024].clone())).collect();
+    let id24: Vec<Option<String>> = (0..n).map(|i| Some(format!("{}-{i:08}", rand_str(24)))).collect();
+    let mut hex_str = {
+        let mut hex_rng = StdRng::seed_from_u64(0xFEED);
+        move || -> String {
+            (0..32)
+                .map(|_| char::from_digit(u32::from(hex_rng.random::<u8>() % 16), 16).unwrap())
+                .collect()
+        }
+    };
+    let hex32: Vec<Option<String>> = (0..n).map(|_| Some(hex_str())).collect();
+    let long64: Vec<Option<String>> = (0..n).map(|_| Some(rand_str(64))).collect();
+    let prefixed: Vec<Option<String>> = (0..n).map(|i| Some(format!("service-pod-name-{}-{i}", rand_str(12)))).collect();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(crate::TIMESTAMP_COL_NAME, DataType::Int64, false),
+        Field::new("dict_col", DataType::Utf8, true),
+        Field::new("dict_nulls", DataType::Utf8, true),
+        Field::new("id24", DataType::Utf8, true),
+        Field::new("hex32", DataType::Utf8, true),
+        Field::new("long64", DataType::Utf8, true),
+        Field::new("prefixed", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(Arc::clone(&schema), vec![
+        Arc::new(Int64Array::from((0..n).map(|i| 3_000_000 - i as i64).collect::<Vec<_>>())) as ArrowArrayRef,
+        Arc::new(StringArray::from(dict_col)),
+        Arc::new(StringArray::from(dict_nulls)),
+        Arc::new(StringArray::from(id24)),
+        Arc::new(StringArray::from(hex32)),
+        Arc::new(StringArray::from(long64)),
+        Arc::new(StringArray::from(prefixed)),
+    ]).unwrap();
+    let source: StringArray = (0..n).map(|i| Some(format!("{{\"row\":{i}}}"))).collect();
+    let mut w = VixWriter::new(&schema, VixWriterOptions { index_enabled: false, ..Default::default() }, false);
+    w.push_batch_with_source(&batch, &source, None).unwrap();
+    let (data, _) = w.finish().unwrap();
+    let docs = crate::VixDocs::open(Bytes::from(data)).unwrap();
+    for name in ["dict_col", "dict_nulls", "id24", "hex32", "long64", "prefixed"] {
+        crate::container::probe_column_encodings(&docs, name);
+    }
+}
+
+/// M18 pin: the vortex 0.79 behavior the M18 guards exist for. Slicing a
+/// `vortex.runend` array keeps a runtime `vortex.slice` wrapper (runend
+/// registers only an EXECUTE-time slice kernel, no static reduce rule), and
+/// that wrapper is neither in the file writer's allowed-encoding set nor in
+/// the session array registry — serializing it is exactly the prod .110
+/// "Array encoding vortex.slice not permitted by ctx". If a vortex upgrade
+/// makes this pin fail, the guard's trigger changed and M18's docs need a
+/// second look (the guard itself stays sound either way).
+#[test]
+fn m18_runend_slice_keeps_wrapper_the_write_ctx_rejects() {
+    use vortex::{
+        VortexSessionDefault,
+        array::{
+            IntoArray, VortexSessionExecute,
+            arrays::{PrimitiveArray, Slice},
+            session::ArraySessionExt,
+            validity::Validity,
+        },
+        buffer::buffer,
+        encodings::runend::RunEnd,
+        session::VortexSession,
+    };
+
+    use crate::container::is_ctx_serializable;
+
+    let session = VortexSession::default();
+    let mut ctx = session.create_execution_ctx();
+    let ends = PrimitiveArray::new(buffer![4u32, 9, 16], Validity::NonNullable).into_array();
+    let values = PrimitiveArray::new(buffer![10i64, 20, 30], Validity::NonNullable).into_array();
+    let runend = RunEnd::new(ends, values, &mut ctx).into_array();
+    assert!(
+        is_ctx_serializable(&runend),
+        "a whole runend chunk is a writable stored form"
+    );
+
+    let sliced = runend.slice(2..12).unwrap();
+    assert!(
+        sliced.depth_first_traversal().any(|node| node.is::<Slice>()),
+        "slicing runend must keep the lazy vortex.slice wrapper (no static reduce rule)"
+    );
+    assert!(
+        !is_ctx_serializable(&sliced),
+        "the wrapper is outside the file writer's allowed-encoding set"
+    );
+    assert!(
+        session
+            .arrays()
+            .registry()
+            .find(&sliced.encoding_id())
+            .is_none(),
+        "vortex.slice is not in the session array registry — interning it fails with \
+         'not permitted by ctx'"
+    );
+}
+
+/// M18 pin (THE prod corruption shape, scan side): a first-encode file
+/// whose narrow columns store COARSER chunks than `_source`'s yields every
+/// scan window with those columns sliced out of one stored leaf. Sliced
+/// forms do not survive a serialize round-trip (reduced slices drop their
+/// offset — pre-M18 this exact corpus re-read 126,100 of 131,072 `status`
+/// values WRONG after a verbatim copy; wrapper slices error the encoder).
+/// The M18 deterministic slice guard must canonicalize exactly those
+/// column-windows (counted), the copy must complete without the write-side
+/// fail-open firing, and the copied file must read back row-exact.
+#[test]
+fn m18_sliced_scan_canonicalizes_and_copies_row_exact() {
+    use vortex::{array::arrays::{Struct, struct_::StructArrayExt}, encodings::zstd::Zstd};
+
+    use crate::{SOURCE_COL_NAME, VixDocs, container::is_ctx_serializable};
+
+    let rows = 131_072usize;
+    let schema = Schema::new(vec![
+        Field::new("_timestamp", DataType::Int64, false),
+        Field::new("status", DataType::Int64, true),
+        Field::new("level", DataType::Utf8, true),
+    ]);
+    let ts: Vec<i64> = (0..rows).map(|i| 5_000_000 - i as i64).collect();
+    // 5..=12-row runs of random values: numeric enough for a compressed
+    // single-chunk column, misaligned with _source's fine byte-budget grid
+    let mut rng = StdRng::seed_from_u64(0x18_18);
+    let status: Vec<i64> = {
+        let mut out = Vec::with_capacity(rows);
+        while out.len() < rows {
+            let run = 5 + (rng.random::<u8>() % 8) as usize;
+            let value: i64 = rng.random::<i64>() >> 8;
+            for _ in 0..run.min(rows - out.len()) {
+                out.push(value);
+            }
+        }
+        out
+    };
+    let level: Vec<&str> =
+        (0..rows).map(|i| ["info", "warn", "error", "debug"][(i / 512) % 4]).collect();
+    let sources: Vec<String> = (0..rows)
+        .map(|i| {
+            format!(
+                r#"{{"_timestamp":{},"status":{},"level":"{}","pad":"{}"}}"#,
+                ts[i],
+                status[i],
+                level[i],
+                "x".repeat(160)
+            )
+        })
+        .collect();
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![
+            Arc::new(Int64Array::from(ts.clone())) as ArrayRef,
+            Arc::new(Int64Array::from(status.clone())) as ArrayRef,
+            Arc::new(StringArray::from(level.clone())) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let mut writer = VixWriter::new(
+        &schema,
+        VixWriterOptions {
+            index_enabled: false,
+            docs_chunk_bytes: 256 * 1024,
+            ..Default::default()
+        },
+        false,
+    );
+    writer
+        .push_batch_with_source(&batch, &StringArray::from(sources.clone()), None)
+        .unwrap();
+    let (data, _) = writer.finish().unwrap();
+    let docs = VixDocs::open(Bytes::from(data)).unwrap();
+
+    // the copy: every yielded chunk is fully ctx-serializable, the guard
+    // canonicalized the misaligned column-windows (counted), and the
+    // write-side fail-open never fires
+    let entries: Vec<crate::ZoneEntry> = docs
+        .zone_chunks()
+        .unwrap()
+        .iter()
+        .map(|zone| (zone.row_count, zone.ts_min, zone.ts_max))
+        .collect();
+    let stats = docs.spliceable_stats().unwrap().unwrap();
+    let mut out = VixWriter::new(
+        &schema,
+        VixWriterOptions {
+            index_enabled: false,
+            docs_passthrough: true,
+            concat_row_order: true,
+            ..Default::default()
+        },
+        false,
+    );
+    out.begin_docs_encoded_run(rows as u64, *ts.last().unwrap(), ts[0], &entries, &stats, None)
+        .unwrap();
+    let mut chunks = 0usize;
+    let sliced_windows = docs
+        .scan_docs_encoded_chunks(&mut |chunk| {
+            chunks += 1;
+            assert!(
+                is_ctx_serializable(&chunk.array),
+                "the scan must never yield a chunk the write context cannot serialize"
+            );
+            out.push_docs_encoded_chunk(chunk)
+        })
+        .unwrap();
+    assert!(chunks > 1, "the corpus must split into multiple windows");
+    assert!(
+        sliced_windows > 0,
+        "the coarse narrow columns must be detected as sliced (guard fired)"
+    );
+    out.finish_docs_encoded_run().unwrap();
+    let failopen = out.docs_failopen_counter();
+    let (out_data, _) = out.finish().unwrap();
+    assert_eq!(
+        failopen.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "the scan-side guard must catch everything before the writer's backstop"
+    );
+
+    // row-exact read-back — THE corruption pin (pre-M18: 126,100 of
+    // 131,072 status values wrong)
+    let out_docs = VixDocs::open(Bytes::from(out_data)).unwrap();
+    let read_all = |docs: &VixDocs| -> Vec<(i64, i64, String, String)> {
+        let mut rows_out = Vec::new();
+        for batch in docs.read_docs(None, None, None).unwrap() {
+            let ts = arrow::compute::cast(
+                batch.column_by_name("_timestamp").unwrap(),
+                &DataType::Int64,
+            )
+            .unwrap();
+            let ts = ts.as_any().downcast_ref::<Int64Array>().unwrap().clone();
+            let st =
+                arrow::compute::cast(batch.column_by_name("status").unwrap(), &DataType::Int64)
+                    .unwrap();
+            let st = st.as_any().downcast_ref::<Int64Array>().unwrap().clone();
+            let lv = arrow::compute::cast(batch.column_by_name("level").unwrap(), &DataType::Utf8)
+                .unwrap();
+            let lv = lv.as_any().downcast_ref::<StringArray>().unwrap().clone();
+            let sr = arrow::compute::cast(
+                batch.column_by_name(SOURCE_COL_NAME).unwrap(),
+                &DataType::Utf8,
+            )
+            .unwrap();
+            let sr = sr.as_any().downcast_ref::<StringArray>().unwrap().clone();
+            for i in 0..batch.num_rows() {
+                rows_out.push((
+                    ts.value(i),
+                    st.value(i),
+                    lv.value(i).to_string(),
+                    sr.value(i).to_string(),
+                ));
+            }
+        }
+        rows_out
+    };
+    let input_rows = read_all(&docs);
+    assert_eq!(input_rows.len(), rows);
+    for (i, row) in input_rows.iter().enumerate() {
+        assert_eq!(row.0, ts[i], "input file must read back the original rows");
+        assert_eq!(row.1, status[i]);
+    }
+    let output_rows = read_all(&out_docs);
+    assert_eq!(
+        input_rows, output_rows,
+        "the copied file must be row-exact (positions AND values)"
+    );
+
+    // the passthrough win survives: `_source` (the finest grid — never
+    // sliced) keeps its stored zstd form in the output
+    let mut source_zstd = 0usize;
+    out_docs
+        .scan_docs_encoded_chunks(&mut |chunk| {
+            let sa = chunk.array.as_typed::<Struct>().unwrap().clone();
+            let field = sa.unmasked_field_by_name(SOURCE_COL_NAME).unwrap();
+            source_zstd +=
+                usize::from(field.depth_first_traversal().any(|node| node.is::<Zstd>()));
+            Ok(())
+        })
+        .unwrap();
+    assert!(
+        source_zstd > 0,
+        "_source must still copy verbatim (stored zstd form) — the aligned column keeps the \
+         passthrough win"
+    );
+}
+
+/// M18 pin (write-side per-chunk fail-open, the STRUCTURAL layer): a
+/// hand-built `Slice(RunEnd)` column chunk — the exact prod .110 shape,
+/// large enough (> the clustered 16KiB coalesce threshold) to take the
+/// verbatim Ready path — pushed through the REAL passthrough writer must
+/// NOT error the encode (pre-M18: "vortex.slice not permitted by ctx" at
+/// finish, restarting the whole merge). The strategy canonicalizes + re-
+/// encodes THAT column chunk only, counts it, and the stored rows read
+/// back exactly (same rows at the same positions — the doc-id/row-position
+/// invariant across a substituted chunk). A wrapper-free control copy of
+/// the same rows keeps the runend stored form verbatim with a zero count.
+#[test]
+fn m18_writer_failopen_reencodes_slice_wrapped_chunk() {
+    use vortex::{
+        array::{
+            IntoArray, VortexSessionExecute,
+            arrays::{PrimitiveArray, SliceArray, StructArray},
+            validity::Validity,
+        },
+        arrow::{FromArrowArray, FromArrowType},
+        buffer::Buffer,
+        dtype::DType,
+        encodings::runend::RunEnd,
+        session::VortexSession,
+    };
+
+    use crate::{SOURCE_COL_NAME, VixDocs};
+
+    let rows = 65_536usize;
+    let schema = Schema::new(vec![
+        Field::new("_timestamp", DataType::Int64, false),
+        Field::new("status", DataType::Int64, true),
+    ]);
+    let ts: Vec<i64> = (0..rows).map(|i| 9_000_000 - i as i64).collect();
+
+    // hand-built runend over rows+pad rows, 8-row runs of distinct values;
+    // the Slice takes the middle `rows` — its expected decoded values:
+    let pad = 16usize;
+    let nruns = (rows + pad) / 8;
+    let run_values: Vec<i64> = (0..nruns as i64).map(|i| i * 7 + 3).collect();
+    let expected_status: Vec<i64> = (0..rows).map(|i| run_values[(i + 8) / 8]).collect();
+
+    let session = {
+        use vortex::VortexSessionDefault;
+        VortexSession::default()
+    };
+    let mut ctx = session.create_execution_ctx();
+    let ends: Vec<u32> = (1..=nruns as u32).map(|i| i * 8).collect();
+    let ends = PrimitiveArray::new(Buffer::copy_from(ends), Validity::NonNullable).into_array();
+    let values = <vortex::array::ArrayRef as FromArrowArray<_>>::from_arrow(
+        &Int64Array::from(run_values.clone()),
+        true,
+    )
+    .unwrap();
+    let runend = RunEnd::new(ends, values, &mut ctx).into_array();
+    assert!(
+        runend.nbytes() > crate::clustered::COALESCE_MAX_ENCODED_BYTES,
+        "the fixture must exceed the coalesce threshold to take the verbatim Ready path"
+    );
+
+    let source: Vec<String> = (0..rows).map(|i| format!("{{\"row\":{i}}}")).collect();
+    let docs_schema = Schema::new(vec![
+        Field::new("_timestamp", DataType::Int64, false),
+        Field::new("status", DataType::Int64, true),
+        Field::new(SOURCE_COL_NAME, DataType::Utf8, false),
+    ]);
+    let names: vortex::dtype::FieldNames = vec![
+        vortex::dtype::FieldName::from("_timestamp"),
+        vortex::dtype::FieldName::from("status"),
+        vortex::dtype::FieldName::from(SOURCE_COL_NAME),
+    ]
+    .into();
+    let build_chunk = |status_field: vortex::array::ArrayRef| -> vortex::array::ArrayRef {
+        let ts_field = <vortex::array::ArrayRef as FromArrowArray<_>>::from_arrow(
+            &Int64Array::from(ts.clone()),
+            false,
+        )
+        .unwrap();
+        let src_field = <vortex::array::ArrayRef as FromArrowArray<_>>::from_arrow(
+            &StringArray::from(source.clone()),
+            false,
+        )
+        .unwrap();
+        StructArray::try_new(
+            names.clone(),
+            vec![ts_field, status_field, src_field],
+            rows,
+            Validity::NonNullable,
+        )
+        .unwrap()
+        .into_array()
+    };
+
+    let copy = |status_field: vortex::array::ArrayRef| -> (u64, Vec<u8>) {
+        let chunk = build_chunk(status_field);
+        assert_eq!(chunk.dtype(), &DType::from_arrow(&docs_schema));
+        let mut writer = VixWriter::new(
+            &schema,
+            VixWriterOptions {
+                index_enabled: false,
+                docs_passthrough: true,
+                concat_row_order: true,
+                ..Default::default()
+            },
+            false,
+        );
+        writer
+            .begin_docs_encoded_run(
+                rows as u64,
+                *ts.last().unwrap(),
+                ts[0],
+                &[(rows as u64, *ts.last().unwrap(), ts[0])],
+                &crate::SpliceableStats::default(),
+                None,
+            )
+            .unwrap();
+        writer
+            .push_docs_encoded_chunk(crate::docs::EncodedDocsChunk::for_tests(chunk, rows))
+            .expect("M18: a wrapper chunk must not error the push");
+        writer.finish_docs_encoded_run().unwrap();
+        let failopen = writer.docs_failopen_counter();
+        let (data, _) = writer
+            .finish()
+            .expect("M18: a wrapper chunk must not error the encode (per-chunk fail-open)");
+        (failopen.load(std::sync::atomic::Ordering::Relaxed), data)
+    };
+
+    // (1) the wrapper shape: per-chunk fail-open fires exactly once (one
+    // column chunk), the file finishes, rows land at the same positions
+    let sliced = SliceArray::try_new(runend.clone(), 8..rows + 8)
+        .unwrap()
+        .into_array();
+    let (failopen, data) = copy(sliced);
+    assert_eq!(failopen, 1, "exactly the wrapped column chunk re-encodes");
+    let out = VixDocs::open(Bytes::from(data)).unwrap();
+    let mut got: Vec<(i64, i64)> = Vec::new();
+    for batch in out.read_docs(None, None, None).unwrap() {
+        let ts_col = arrow::compute::cast(
+            batch.column_by_name("_timestamp").unwrap(),
+            &DataType::Int64,
+        )
+        .unwrap();
+        let ts_col = ts_col.as_any().downcast_ref::<Int64Array>().unwrap().clone();
+        let st = arrow::compute::cast(batch.column_by_name("status").unwrap(), &DataType::Int64)
+            .unwrap();
+        let st = st.as_any().downcast_ref::<Int64Array>().unwrap().clone();
+        for i in 0..batch.num_rows() {
+            got.push((ts_col.value(i), st.value(i)));
+        }
+    }
+    assert_eq!(got.len(), rows);
+    for (i, (got_ts, got_status)) in got.iter().enumerate() {
+        assert_eq!(*got_ts, ts[i], "row {i}: _timestamp position must be exact");
+        assert_eq!(
+            *got_status, expected_status[i],
+            "row {i}: the re-encoded chunk must hold the same rows at the same positions"
+        );
+    }
+
+    // (2) control: the same rows as a WHOLE runend chunk (no wrapper) copy
+    // verbatim — zero fail-opens, runend stored form preserved
+    let whole = runend.slice(8..rows + 8).unwrap();
+    let mut ctx2 = session.create_execution_ctx();
+    use vortex::array::Canonical;
+    let whole_canonical = whole.execute::<Canonical>(&mut ctx2).unwrap().into_array();
+    // re-encode canonically into a self-contained runend chunk
+    let whole_runend = vortex::encodings::runend::RunEnd::encode(whole_canonical, &mut ctx2)
+        .expect("runend encode")
+        .into_array();
+    let (failopen, data) = copy(whole_runend);
+    assert_eq!(failopen, 0, "a wrapper-free encoded chunk copies verbatim");
+    let out = VixDocs::open(Bytes::from(data)).unwrap();
+    let mut saw_runend = false;
+    out.scan_docs_encoded_chunks(&mut |chunk| {
+        saw_runend |= chunk
+            .array
+            .depth_first_traversal()
+            .any(|node| node.is::<vortex::encodings::runend::RunEnd>());
+        Ok(())
+    })
+    .unwrap();
+    assert!(
+        saw_runend,
+        "the control copy must keep the runend stored form (the passthrough win)"
+    );
 }

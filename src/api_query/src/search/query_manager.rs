@@ -36,8 +36,9 @@ pub async fn cancel_query(Path(params): Path<(String, String)>) -> Response {
 
     #[cfg(not(feature = "enterprise"))]
     {
-        drop(params);
-        (StatusCode::FORBIDDEN, Json("Not Supported")).into_response()
+        let (org_id, trace_id) = params;
+        let trace_ids = trace_id.split(',').collect::<Vec<&str>>();
+        cancel_query_inner(&org_id, &trace_ids).await
     }
 }
 
@@ -57,9 +58,15 @@ pub async fn cancel_multiple_query(Path(params): Path<String>, body: Bytes) -> R
 
     #[cfg(not(feature = "enterprise"))]
     {
-        drop(params);
-        drop(body);
-        (StatusCode::FORBIDDEN, Json("Not Supported")).into_response()
+        let org_id = params;
+        let trace_ids: Vec<String> = match config::utils::json::from_slice(&body) {
+            Ok(v) => v,
+            Err(e) => {
+                return (StatusCode::BAD_REQUEST, Json(e.to_string())).into_response();
+            }
+        };
+        let trace_ids = trace_ids.iter().map(|s| s.as_str()).collect::<Vec<&str>>();
+        cancel_query_inner(&org_id, &trace_ids).await
     }
 }
 
@@ -106,9 +113,22 @@ pub async fn cancel_query_inner(org_id: &str, trace_ids: &[&str]) -> Response {
 
     #[cfg(not(feature = "enterprise"))]
     {
-        let _ = org_id;
-        let _ = trace_ids;
-        (StatusCode::FORBIDDEN, Json("Not Supported")).into_response()
+        if trace_ids.is_empty() {
+            return (StatusCode::BAD_REQUEST, Json("Invalid trace_id")).into_response();
+        }
+        let mut res = Vec::with_capacity(trace_ids.len());
+        for trace_id in trace_ids {
+            if trace_id.is_empty() {
+                continue;
+            }
+            match crate::service::search::cancel_query(org_id, trace_id).await {
+                Ok(status) => res.push(status),
+                Err(e) => {
+                    return (StatusCode::BAD_REQUEST, Json(e.to_string())).into_response();
+                }
+            }
+        }
+        Json(res).into_response()
     }
 }
 
@@ -116,11 +136,13 @@ pub async fn cancel_query_inner(org_id: &str, trace_ids: &[&str]) -> Response {
 /// (which share the `trace_id` as a prefix). Unlike [`cancel_query_inner`] this
 /// does not build an HTTP response — it is meant for internal callers such as
 /// the client-disconnect handler. Errors are logged, not returned.
-#[cfg(feature = "enterprise")]
 pub async fn cancel_query_internal(org_id: &str, trace_id: &str) {
     if trace_id.is_empty() {
         return;
     }
+    #[cfg(not(feature = "enterprise"))]
+    let ret = crate::service::search::cancel_query(org_id, trace_id).await;
+    #[cfg(feature = "enterprise")]
     let ret = if get_o2_config().super_cluster.enabled {
         o2_enterprise::enterprise::super_cluster::search::cancel_query(org_id, trace_id).await
     } else {

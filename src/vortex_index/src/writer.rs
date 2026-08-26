@@ -20,7 +20,7 @@
 //! the complete `.vix` puffin container ([`VixWriter::new`] +
 //! [`VixWriter::push_batch_with_source`] / [`VixWriter::push_docs_rows`]):
 //! the file *is* the data file. A `docs` blob stores one row per record
-//! (`_timestamp`, the column-store fields with their arrow types, the
+//! (`_timestamp`, EVERY schema field with its arrow type, the
 //! caller-supplied `_source` string and optionally `_original`); the
 //! inverted index additionally emits one *key term* (`{path}\x00\xFF\xFF`)
 //! per doc per non-internal column with a non-null value, and postings of
@@ -39,9 +39,8 @@
 //! each finite value emits ONE canonical, [`crate::numeric`]-tagged term
 //! (`\x01` + itoa/ryu text — value-based, so JSON `38.00` and `38.0` are one
 //! term while `38` and `38.0` stay distinct int/float forms the query layer
-//! probes as a union). Fields in
-//! [`VixWriterOptions::column_store_field_names`] (any type) are stored
-//! natively in the `docs` blob.
+//! probes as a union). EVERY schema field (any type) is stored natively in
+//! the `docs` blob (v2 all-present-columns, DESIGN §2).
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -61,15 +60,20 @@ use arrow::{
 
 use crate::{
     container::{
-        BLOB_TAG_BLOOM, BLOB_TAG_DICT, BLOB_TAG_DICT_BLOCKS, BLOB_TAG_PLIST, BLOB_TAG_TERMS,
-        BLOB_TYPE_BLOOM, BLOB_TYPE_DICT, BLOB_TYPE_DICT_BLOCKS, BLOB_TYPE_PLIST, BLOB_TYPE_TERMS,
-        DICT_LAYOUT_BLOCKS, DocsBlobEncoder, FIELD_TYPE_CS, FIELD_TYPE_FTS, FIELD_TYPE_TERM,
-        FieldEntry, KEY_LAYOUT_FID_V2, PROP_DICT_LAYOUT, PROP_FIELDS, PROP_KEY_LAYOUT,
-        PROP_PARTIAL_FIELDS, PROP_PLIST_MIN_DOCS, PROP_ROW_COUNT, PROP_ROW_GROUP_SIZE,
-        PROP_TERM_COUNT, PROP_TOKENIZER, PROP_VERSION, PROP_ZONE_MAP, TOKENIZER_ID,
-        VIX_FORMAT_VERSION, VixOutput, ZoneEntry, addressable_strategy, finish_streamed_container,
-        write_vortex_blob,
+        BLOB_TAG_BLOOM, BLOB_TAG_DICT, BLOB_TAG_DICT_BLOCKS, BLOB_TAG_PLIST, BLOB_TAG_STATS,
+        BLOB_TAG_TERMS, BLOB_TYPE_BLOOM, BLOB_TYPE_DICT, BLOB_TYPE_DICT_BLOCKS, BLOB_TYPE_PLIST,
+        BLOB_TYPE_STATS, BLOB_TYPE_TERMS,
+        DICT_LAYOUT_BLOCKS, DocsBlobEncoder, FIELD_TYPE_BLOOM, FIELD_TYPE_CS, FIELD_TYPE_FTS,
+        FIELD_TYPE_TERM, FieldEntry, KEY_LAYOUT_FID_V2, PROP_COLUMNS, PROP_COLUMNS_COMPLETE,
+        PROP_DICT_LAYOUT,
+        PROP_FIELDS, PROP_KEY_LAYOUT, PROP_OVERSIZE_SKIPS, PROP_PARTIAL_FIELDS,
+        PROP_PLIST_MIN_DOCS, PROP_ROW_COUNT, PROP_ROW_GROUP_SIZE, PROP_ROW_ORDER,
+        PROP_ROW_REGIONS, PROP_TERM_COUNT,
+        PROP_TOKENIZER, PROP_VERSION, PROP_ZONE_MAP, ROW_ORDER_CONCAT, ROW_ORDER_TS_DESC,
+        TOKENIZER_ID, VIX_FORMAT_VERSION, VixOutput, ZoneEntry, addressable_strategy,
+        finish_streamed_container, write_vortex_blob,
     },
+    container::{BlobPart, TermsBlobSpooler, build_container_parts},
     error::{Result, VixError},
     merge::{self, DocIdMap},
     numeric::{
@@ -80,6 +84,7 @@ use crate::{
     query::{KEY_FIELD_ID, MAX_REAL_FIELD_ID, write_composite},
     reader::VixReader,
     spill,
+    stats::{ColumnStatsFolder, SpliceableStats},
     tokenizer::o2_tokenize,
 };
 
@@ -112,6 +117,277 @@ fn is_string_family(data_type: &DataType) -> bool {
         data_type,
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
     )
+}
+
+/// #52 AUTO bloom-only demotion — the ONE rule shared by its two call
+/// sites (M7): the merge planner (`build_merge_plan` in the core crate,
+/// counting distinct terms from the INPUT dictionaries) and the writer's
+/// own finish (first encode / rebuild, counting from the accumulated term
+/// map). A candidate whose distinct-value count clears the absolute
+/// `min_distinct` floor AND whose distinct/rows ratio clears `ratio` is
+/// demoted, unless named in `never`. `ratio <= 0` disables. Candidates are
+/// pre-filtered by the caller (string-family ∩ term plan − fts; the writer
+/// construction resolution re-checks for the merge site), so the numeric
+/// thresholds here are the whole decision. `site` labels the log line
+/// (`"merge"` / `"build"`). Returned names are sorted and deduplicated.
+pub fn resolve_auto_bloom_only<'a>(
+    candidates: impl IntoIterator<Item = (&'a str, u64)>,
+    rows: u64,
+    ratio: f64,
+    min_distinct: u64,
+    never: &[String],
+    site: &str,
+) -> Vec<String> {
+    if ratio <= 0.0 || rows == 0 {
+        return Vec::new();
+    }
+    let mut selected: Vec<String> = candidates
+        .into_iter()
+        .filter(|&(name, distinct)| {
+            distinct >= min_distinct
+                && distinct as f64 / rows as f64 >= ratio
+                && !never.iter().any(|n| n == name)
+        })
+        .map(|(name, distinct)| {
+            log::info!(
+                "vix {site}: AUTO bloom-only demotion of {name:?} \
+                 (distinct≈{distinct} / rows={rows})"
+            );
+            name.to_string()
+        })
+        .collect();
+    selected.sort_unstable();
+    selected.dedup();
+    selected
+}
+
+/// THE value policy for hashing one bloom-only field's docs-column values
+/// into a composite-key hash set (#52; #41: values over `max_raw_term_len`
+/// are skipped silently — merge mode carries the inputs' stamped oversize
+/// allowances, counting here would double them; nulls hash nothing;
+/// non-string columns hash nothing). ONE implementation shared by the
+/// writer's inline absorption ([`VixWriter::absorb_bloom_only_columns`] /
+/// the streamed-merge push) and the detached M12 [`BloomOnlyHasher`], so
+/// every path derives bit-identical coverage by construction.
+fn hash_bloom_only_column_values(
+    bloom_name: &str,
+    column: &ArrowArrayRef,
+    max_raw_term_len: usize,
+    scratch: &mut Vec<u8>,
+    sink: &mut HashSet<u64>,
+) {
+    if let Some(strings) = StringColumn::try_new(column.as_ref()) {
+        for row in 0..column.len() {
+            let Some(value) = strings.value(row) else {
+                continue;
+            };
+            if value.len() > max_raw_term_len {
+                continue;
+            }
+            if let Some(k) = crate::bloom::composite_value_key(bloom_name, value.as_bytes(), scratch)
+            {
+                sink.insert(crate::sbbf::hash_value(k));
+            }
+        }
+    }
+}
+
+/// The `_source`-projected sibling of [`hash_bloom_only_column_values`]
+/// (#51c-d: fields with NO docs column in an input — their values live only
+/// in `_source`). Same value policy; `insert` routes each hash to its
+/// field's sink. Errors name the offending row.
+fn hash_bloom_only_source_values(
+    source: &ArrowArrayRef,
+    wanted: &[(String, u16)],
+    max_raw_term_len: usize,
+    scratch: &mut Vec<u8>,
+    mut insert: impl FnMut(u16, u64),
+) -> anyhow::Result<()> {
+    use sonic_rs::JsonValueTrait;
+    let Some(strings) = StringColumn::try_new(source.as_ref()) else {
+        return Err(VixError::Writer(format!(
+            "absorb_bloom_only_source: the {SOURCE_COL_NAME:?} column is {} — expected a \
+             string array",
+            source.data_type()
+        ))
+        .into());
+    };
+    for row in 0..source.len() {
+        let Some(text) = strings.value(row) else {
+            // `_source` is non-null by the docs-schema contract; treat a
+            // stray null defensively as an absent record
+            continue;
+        };
+        for entry in sonic_rs::to_object_iter(text) {
+            let (key, value) = entry.map_err(|e| {
+                VixError::Writer(format!(
+                    "absorb_bloom_only_source: _source of row {row} is not a JSON object: {e}"
+                ))
+            })?;
+            let key: &str = key.as_ref();
+            let Some((name, fid)) = wanted.iter().find(|(name, _)| name == key) else {
+                continue;
+            };
+            let Some(value) = value.as_str() else {
+                // non-string values never hash (bloom-only fields are
+                // string-family; a drifted row's value has no raw term)
+                continue;
+            };
+            if value.len() > max_raw_term_len {
+                continue;
+            }
+            if let Some(k) = crate::bloom::composite_value_key(name, value.as_bytes(), scratch) {
+                insert(*fid, crate::sbbf::hash_value(k));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// M12: one parallel coverage-scan worker's detached bloom-only hashing
+/// state — created by [`VixWriter::bloom_only_hasher`] over exactly the
+/// fields that worker's input must scan, filled off the writer on a scan
+/// thread, folded back with [`VixWriter::absorb_bloom_only_hashes`]. The
+/// two hashing entry points delegate to the SAME value-policy functions the
+/// writer's inline absorption uses.
+pub struct BloomOnlyHasher {
+    /// fid -> (bloom field name, this worker's hash set)
+    sets: HashMap<u16, (String, HashSet<u64>)>,
+    max_raw_term_len: usize,
+    scratch: Vec<u8>,
+}
+
+impl BloomOnlyHasher {
+    /// No tracked fields — the caller can skip the scan entirely.
+    pub fn is_empty(&self) -> bool {
+        self.sets.is_empty()
+    }
+
+    /// The tracked field names (sorted — the scan projection).
+    pub fn field_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.sets.values().map(|(name, _)| name.clone()).collect();
+        names.sort_unstable();
+        names
+    }
+
+    /// Hash tracked fields' values from materialized docs columns
+    /// (untracked columns are ignored).
+    pub fn hash_columns(&mut self, cs_columns: &[(String, ArrowArrayRef)]) {
+        for (name, column) in cs_columns {
+            let Some(fid) = self
+                .sets
+                .iter()
+                .find_map(|(fid, (n, _))| (n == name).then_some(*fid))
+            else {
+                continue;
+            };
+            let Some((bloom_name, sink)) = self.sets.get_mut(&fid) else {
+                continue;
+            };
+            hash_bloom_only_column_values(
+                bloom_name,
+                column,
+                self.max_raw_term_len,
+                &mut self.scratch,
+                sink,
+            );
+        }
+    }
+
+    /// M17: a borrowed per-field raw-value sink applying THE value policy
+    /// ([`hash_bloom_only_column_values`]'s per-value body) to caller-fed
+    /// byte slices — the encoded-chunk coverage scan's tight loop, which
+    /// hashes straight off dict values / FSST-decompressed slices without
+    /// per-value field lookups or arrow materialization. `None` = the field
+    /// is not tracked by this hasher (the caller skips its scan).
+    pub fn raw_sink(&mut self, field: &str) -> Option<RawValueSink<'_>> {
+        let Self {
+            sets,
+            max_raw_term_len,
+            scratch,
+        } = self;
+        let entry = sets
+            .iter_mut()
+            .find_map(|(_, entry)| (entry.0 == field).then_some(entry))?;
+        let (name, sink) = (&entry.0, &mut entry.1);
+        Some(RawValueSink {
+            name,
+            max_raw_term_len: *max_raw_term_len,
+            scratch,
+            sink,
+        })
+    }
+
+    /// Test/diagnostic view: per-field hash sets (name -> sorted hashes) —
+    /// the byte-equality pins compare these across scan implementations.
+    pub fn hash_sets(&self) -> std::collections::BTreeMap<String, Vec<u64>> {
+        self.sets
+            .values()
+            .map(|(name, set)| {
+                let mut hashes: Vec<u64> = set.iter().copied().collect();
+                hashes.sort_unstable();
+                (name.clone(), hashes)
+            })
+            .collect()
+    }
+
+    /// Hash the named tracked fields' values out of `_source` (#51c-d — the
+    /// fields with no docs column in this input).
+    pub fn hash_source(
+        &mut self,
+        source: &ArrowArrayRef,
+        fields: &[String],
+    ) -> anyhow::Result<()> {
+        let wanted: Vec<(String, u16)> = self
+            .sets
+            .iter()
+            .filter(|(_, (name, _))| fields.iter().any(|f| f == name))
+            .map(|(fid, (name, _))| (name.clone(), *fid))
+            .collect();
+        if wanted.is_empty() {
+            return Ok(());
+        }
+        let mut scratch = std::mem::take(&mut self.scratch);
+        let sets = &mut self.sets;
+        let result = hash_bloom_only_source_values(
+            source,
+            &wanted,
+            self.max_raw_term_len,
+            &mut scratch,
+            |fid, hash| {
+                if let Some((_, sink)) = sets.get_mut(&fid) {
+                    sink.insert(hash);
+                }
+            },
+        );
+        self.scratch = scratch;
+        result
+    }
+}
+
+/// M17: one tracked field's raw-value hash sink (see
+/// [`BloomOnlyHasher::raw_sink`]). [`Self::observe`] is the per-value body
+/// of [`hash_bloom_only_column_values`] verbatim — len gate, composite key,
+/// [`crate::sbbf::hash_value`] — so any scan feeding it raw value bytes
+/// derives bit-identical coverage to the decoded-column path.
+pub struct RawValueSink<'a> {
+    name: &'a str,
+    max_raw_term_len: usize,
+    scratch: &'a mut Vec<u8>,
+    sink: &'a mut HashSet<u64>,
+}
+
+impl RawValueSink<'_> {
+    /// Apply the value policy to one NON-NULL raw value's bytes.
+    #[inline]
+    pub fn observe(&mut self, value: &[u8]) {
+        if value.len() > self.max_raw_term_len {
+            return;
+        }
+        if let Some(k) = crate::bloom::composite_value_key(self.name, value, self.scratch) {
+            self.sink.insert(crate::sbbf::hash_value(k));
+        }
+    }
 }
 
 /// Types whose values are term-indexed: the string family (raw whole-value /
@@ -147,25 +423,61 @@ pub fn is_value_indexed_type(data_type: &DataType) -> bool {
 /// constructor (`core_writer_options` in the core crate; everything else
 /// spreads `..Default::default()`); per-file switches (e.g.
 /// `store_original`) are parameters of [`VixWriter::new`] instead.
+///
+/// Which fields become docs columns is NOT an option (v2, DESIGN §2): EVERY
+/// schema field is stored as a native Vortex column — the docs schema is
+/// `_timestamp` + all present fields + `_source` (+ `_original` opt-in).
 #[derive(Debug, Clone)]
 pub struct VixWriterOptions {
     /// Fields whose values are additionally tokenized for full-text search.
     pub fts_field_names: Vec<String>,
-    /// Fields (any type) stored as native Vortex columns in the `docs` blob.
-    pub column_store_field_names: Vec<String>,
     /// Raw-string term-indexed fields to record per-file value blooms for
     /// (the `bloom` puffin blob, built as a byproduct of term emission —
     /// see [`crate::bloom`]). Typically `trace_id`/`span_id`.
     pub bloom_field_names: Vec<String>,
+    /// #48: additionally build the reserved COMPOSITE bloom section —
+    /// `{field name}\0{value}` keys for EVERY term field — so equality on
+    /// any field is bloom-decidable ([`crate::bloom::COMPOSITE_BLOOM_FIELD`]).
+    pub bloom_composite: bool,
+    /// #52: fields demoted from the term index to BLOOM-ONLY — no
+    /// dictionary entries or postings; their raw string values are hashed
+    /// into the composite bloom (and the per-field bloom when also in
+    /// `bloom_field_names`). Equality on them = file-level bloom prune +
+    /// in-file filter-back scan. Resolution keeps string-family term-plan
+    /// fields only; `bloom_only_never` wins over both this list and any
+    /// caller-side auto demotion.
+    pub bloom_only_field_names: Vec<String>,
+    pub bloom_only_never: Vec<String>,
+    /// #52/M7 AUTO demotion at FIRST ENCODE: when `> 0`, a string-family
+    /// non-fts term field whose distinct-value count (from the writer's own
+    /// accumulated term map at `finish`) clears `bloom_only_min_distinct`
+    /// AND whose distinct/rows ratio clears this value is demoted to
+    /// bloom-only — the exact sidecar semantics of a construction-list
+    /// demotion (marker, composite coverage, no dict/postings). The rule is
+    /// [`resolve_auto_bloom_only`], shared with the merge planner's
+    /// input-dictionary AUTO. Skipped when the term map SPILLED (partial
+    /// resident counts would undercount) — move-job builds never spill.
+    /// `0.0` (the crate default) disables; production wires
+    /// `ZO_VIX_BLOOM_ONLY_AUTO_RATIO` (default-on in v2).
+    pub bloom_only_auto_ratio: f64,
+    /// Absolute distinct-count floor for [`Self::bloom_only_auto_ratio`] —
+    /// small files' noisy ratios must not demote real fields.
+    pub bloom_only_min_distinct: u64,
     /// False-positive probability of the per-file value blooms.
     pub bloom_fpp: f64,
     /// Target byte size of one postings row block (point-read granularity).
     pub postings_chunk_bytes: usize,
-    /// **Raw** (non-fts) values longer than this many bytes are skipped and
-    /// the field is recorded in the `partial_fields` property. Fts fields are
-    /// never gated by it: their values tokenize regardless of length (tokens
-    /// are byte-bounded by [`Self::max_token_len`]), so an fts field never
-    /// goes partial for oversize values.
+    /// **Raw** (non-fts) values longer than this many bytes are skipped from
+    /// the term index WITHOUT degrading the field (owner call 2026-08-12,
+    /// performance-first): the index stays authoritative for the field, so
+    /// an equality probe for one of the skipped oversize literals silently
+    /// misses its rows — the accepted trade. Skips are counted in
+    /// [`VixWriterStats::oversize_skipped`]. Key terms are still emitted for
+    /// the skipped rows, keeping `IS [NOT] NULL` exact. Fts fields are never
+    /// gated by it: their values tokenize regardless of length (tokens are
+    /// byte-bounded by [`Self::max_token_len`]). The bound itself is a
+    /// format limit — a composite term key `{token}{fid}` must fit the
+    /// dictionary's 64 KiB key space.
     pub max_raw_term_len: usize,
     /// Logical row-group size recorded as a file property (a grouping
     /// constant for downstream row-id encodings). `0` = unknown. The `docs`
@@ -173,16 +485,32 @@ pub struct VixWriterOptions {
     pub row_group_size: usize,
     /// Uncompressed-byte budget of one `docs`-blob chunk — the
     /// decompression unit of a matched-row point read. Rows per chunk =
-    /// `clamp(budget / avg_row_bytes, 64, 65536)` (the low floor lets the
-    /// byte budget govern even multi-KiB rows — a 1024-row floor used to
-    /// inflate ~4 KiB-row chunks to hundreds of times a small budget —
-    /// while the ceiling bounds decoded batch sizes). Vortex's write
-    /// pipeline still coalesces sub-1 MiB chunks up to ~1 MiB (its
-    /// S3-tuned segment minimum, in multiples of the row count above), so
-    /// the effective decode unit is ≈ `max(budget, 1 MiB)` — plus the
-    /// 64-row floor for pathological >16 KiB average rows.
-    /// `0` = the 4 MiB default.
+    /// `clamp(budget / avg_row_present_bytes, 64, 65536)`, where a row's
+    /// weight is the sum of its PRESENT (non-null) values' byte lengths
+    /// plus a small per-present-value overhead — NEVER whole-row arrow
+    /// width (H1, DESIGN §3: 2,557 nullable Utf8 columns ≈ 10.5 KiB/row of
+    /// arrow padding even all-null used to collapse rows-per-chunk on wide
+    /// sparse schemas). The low floor lets the byte budget govern even
+    /// multi-KiB rows — a 1024-row floor used to inflate ~4 KiB-row chunks
+    /// to hundreds of times a small budget — while the ceiling bounds
+    /// decoded batch sizes. Vortex's write pipeline still coalesces
+    /// sub-1 MiB chunks up to ~1 MiB (its S3-tuned segment minimum, in
+    /// multiples of the row count above), so the effective decode unit is
+    /// ≈ `max(budget, 1 MiB)` — plus the 64-row floor for pathological
+    /// >16 KiB average rows. `0` = the 16 MiB default
+    /// ([`DEFAULT_DOCS_CHUNK_BYTES`]).
     pub docs_chunk_bytes: usize,
+    /// Rows-per-chunk CEILING of the [`Self::docs_chunk_bytes`] clamp
+    /// (`0` = [`DEFAULT_DOCS_CHUNK_MAX_ROWS`], 65,536 — the historical hard
+    /// cap, unchanged by the M9 budget flip). The cap is what bounds a
+    /// huge byte budget: at ~1 KiB average rows a 64 MiB budget already
+    /// saturates it, so budgets beyond that change nothing unless this is
+    /// raised too. M8 chunk-size sweep knob — raising it toward the file's
+    /// row count makes the whole file one chunk, which is one zone-table
+    /// entry (no intra-file `_timestamp`/stats pruning), one `RowSelection`
+    /// granule and one DECOMPRESSION unit per matched-row point read.
+    /// Values below the 64-row floor are raised to the floor.
+    pub docs_chunk_max_rows: usize,
     /// Minimum full-text token length in **bytes** (clamped to `>= 2`;
     /// see [`crate::o2_tokenize`]).
     pub min_token_len: usize,
@@ -194,6 +522,20 @@ pub struct VixWriterOptions {
     /// the calling thread — the default; the compactor raises it
     /// (`ZO_VIX_MERGE_THREAD_NUM`).
     pub encode_threads: usize,
+    /// #51b: range parallelism of the compaction index merge's k-way phase
+    /// ([`Self::merge_input_indexes`]) — the OUTPUT key space is split into
+    /// real-key ranges merged concurrently. `0` (the default) =
+    /// `min(available_parallelism, 8)`; `1` = exactly one range, the
+    /// sequential path through the same code. Always additionally capped by
+    /// the per-merge thread budget passed to `merge_input_indexes`, so it
+    /// stacks with (never widens) `ZO_VIX_MERGE_THREAD_NUM`. Production
+    /// wires `ZO_VIX_MERGE_KWAY_THREADS`.
+    ///
+    /// M17 item 4: the same knob drives the REBUILD's parallel index-blob
+    /// build (the writer's own unspilled term map, range-partitioned at
+    /// field boundaries — byte-identical output for any value, capped by
+    /// `encode_threads`).
+    pub merge_kway_threads: usize,
     /// Arrow-bytes budget of the pre-encode sample that locks the docs
     /// blob's rows-per-chunk before the streaming encode starts (see
     /// [`DOCS_ENCODE_SAMPLE_BYTES`], the `0` default). Tests shrink it to
@@ -232,16 +574,76 @@ pub struct VixWriterOptions {
     /// default) disables the feature entirely: no `plist` blob, no
     /// property, byte-identical output to pre-plist writers.
     pub postings_plist_min_docs: u32,
+    /// `false` (#40, index-off stream types e.g. metrics; #42 L0 builds):
+    /// NO term index is built — no value/key/source term emission, and NO
+    /// `.vxi` sidecar is produced at all (`stats.index_size = 0`), so
+    /// readers void every dictionary-absence proof by construction. The
+    /// docs blob, `_source`, zone table and stats are unchanged: the file
+    /// is column-store only.
+    pub index_enabled: bool,
+    /// H2 per-column chunk stats: presence-density threshold below which a
+    /// docs column gets NO per-chunk stats rows (file-level presence only).
+    /// `0.0` = [`crate::stats::DEFAULT_STATS_MIN_DENSITY`].
+    pub stats_min_density: f64,
+    /// H2: byte cap of the serialized `stats` blob (densest columns kept
+    /// first). `0` = [`crate::stats::DEFAULT_STATS_MAX_BYTES`].
+    pub stats_max_bytes: usize,
+    /// #51c docs-chunk passthrough (default `false`): the docs blob is
+    /// written with the passthrough strategy, which copies already-encoded
+    /// chunks pushed through the encoded-run API
+    /// ([`VixWriter::begin_docs_encoded_run`]) WITHOUT decompressing or
+    /// recompressing them, while arrow batches pushed the normal way still
+    /// compress through the BtrBlocks compact pipeline. The blob format is
+    /// unchanged (same container, same blob type, same reader paths); the
+    /// write pipeline differs: no vortex zoned stats / dict layout /
+    /// coalescing (per-chunk pruning stats absent — readers fail open) and
+    /// no vortex footer FileStatistics. Only the compaction merge's
+    /// disjoint fast path sets this.
+    pub docs_passthrough: bool,
+    /// #51c-c concatenation-order output (default `false`): the rows this
+    /// writer stores are NOT globally `_timestamp` DESC — they are the
+    /// merge inputs' runs concatenated (each run internally DESC). The
+    /// finished file is stamped `row_order=concat` so every order-dependent
+    /// read fast path (declared file sort order, first/last-row stats,
+    /// first-set-bits top-N candidates) refuses to trust the file's row
+    /// order; `false` stamps `row_order=ts_desc` (the storage convention,
+    /// now explicit). Storage-only: the writer's own accounting (ts range,
+    /// zone folding, doc ids) is order-free either way. Only the compaction
+    /// merge's concatenation-order path sets this.
+    pub concat_row_order: bool,
+    /// §4: the CALLER asserts the all-present-columns invariant — every
+    /// field present in any pushed row's `_source` is also a docs column.
+    /// Stamps the `columns_complete` property, which is what licenses the
+    /// query path's "predicate on an absent column skips the whole file"
+    /// pruning. Producers whose batch shape upholds DESIGN §2 set it; a
+    /// merge sets it only when EVERY input carried it (incomplete inputs'
+    /// `_source` rows may hide fields that never became columns). Default
+    /// `false` (no pruning license) — raw-writer tests that fake
+    /// `_source`-only fields stay honest automatically.
+    pub columns_complete: bool,
 }
 
-/// Default [`VixWriterOptions::docs_chunk_bytes`]: 4 MiB.
-pub const DEFAULT_DOCS_CHUNK_BYTES: usize = 4 * 1024 * 1024;
-/// Rows-per-chunk clamp bounds of the `docs` blob (see
+/// Default [`VixWriterOptions::docs_chunk_bytes`]: 16 MiB (owner call
+/// 2026-08-18 on the M8 chunk-size sweep, S2: merge wall −25% / merge VmHWM
+/// −17%, storage-neutral; cost ~2x `_source` point-read decode. 4 MiB — the
+/// point-read-optimal setting — remains a knob, `ZO_VIX_DOCS_CHUNK_BYTES`).
+pub const DEFAULT_DOCS_CHUNK_BYTES: usize = 16 * 1024 * 1024;
+/// Default [`VixWriterOptions::docs_chunk_max_rows`]: the 65,536-row
+/// ceiling that has always bounded rows-per-chunk (decoded batch sizes).
+pub const DEFAULT_DOCS_CHUNK_MAX_ROWS: usize = 65536;
+/// Rows-per-chunk clamp FLOOR of the `docs` blob (see
 /// [`VixWriterOptions::docs_chunk_bytes`]). The floor is low so the byte
-/// budget governs wide rows too; with the 4 MiB default budget it only
-/// engages beyond ~64 KiB average rows.
+/// budget governs wide rows too; with the 16 MiB default budget it only
+/// engages beyond ~256 KiB average rows. The ceiling is
+/// [`VixWriterOptions::docs_chunk_max_rows`].
 const DOCS_CHUNK_MIN_ROWS: usize = 64;
-const DOCS_CHUNK_MAX_ROWS: usize = 65536;
+
+/// #51c: rows-per-chunk locked when a PASSTHROUGH writer's first push is an
+/// encoded run (empty sample — [`docs_rows_per_chunk`] would return the
+/// empty-file `0`, which disables zone folding for later re-encoded rows).
+/// A zone window + re-encode slicing width only; matches the core
+/// producers' docs batch row cap.
+const PASSTHROUGH_FALLBACK_ROWS_PER_CHUNK: usize = 8192;
 
 /// Arrow-bytes budget of the pre-encode sample that locks the docs blob's
 /// rows-per-chunk: pushed docs batches buffer until they reach it, then the
@@ -261,21 +663,33 @@ impl Default for VixWriterOptions {
     fn default() -> Self {
         Self {
             fts_field_names: Vec::new(),
-            column_store_field_names: Vec::new(),
             bloom_field_names: Vec::new(),
+            bloom_composite: false,
+            bloom_only_field_names: Vec::new(),
+            bloom_only_never: Vec::new(),
+            bloom_only_auto_ratio: 0.0,
+            bloom_only_min_distinct: 65536,
             bloom_fpp: crate::bloom::DEFAULT_FILE_BLOOM_FPP,
             postings_chunk_bytes: 128 * 1024,
             max_raw_term_len: 65532,
             row_group_size: 0,
             docs_chunk_bytes: DEFAULT_DOCS_CHUNK_BYTES,
+            docs_chunk_max_rows: DEFAULT_DOCS_CHUNK_MAX_ROWS,
             min_token_len: 2,
             max_token_len: 64,
             encode_threads: 0,
+            merge_kway_threads: 0,
             docs_encode_sample_bytes: 0,
             term_spill_dir: None,
             term_spill_bytes: 0,
             output_spool_dir: None,
             postings_plist_min_docs: 0,
+            stats_min_density: 0.0,
+            stats_max_bytes: 0,
+            index_enabled: true,
+            docs_passthrough: false,
+            concat_row_order: false,
+            columns_complete: false,
         }
     }
 }
@@ -288,12 +702,19 @@ pub struct VixWriterStats {
     pub row_count: u64,
     /// Composite terms (values, tokens and key terms).
     pub term_count: u64,
-    /// Bytes of the inverted-index blobs (`dict` + `terms`) inside the
-    /// container — the core-file equivalent of the old sibling index's size
-    /// (`FileMeta::index_size`; observability only).
+    /// TOTAL byte size of the `.vxi` index sidecar object (container
+    /// overhead included) — the `FileMeta::index_size` value. `0` ⟺ no
+    /// sidecar was produced (index-off builds), exactly the marker warmup
+    /// and the bloom queue key on.
     pub index_size: u64,
     /// Bytes of the stored-records blob (`docs`).
     pub docs_size: u64,
+    /// Raw (non-fts) values skipped from the term index for exceeding
+    /// [`VixWriterOptions::max_raw_term_len`]. The field is NOT degraded to
+    /// `partial_fields` for these (owner call 2026-08-12): equality probes
+    /// for the skipped literals themselves may silently miss — observability
+    /// for that trade lives in this counter.
+    pub oversize_skipped: u64,
     /// Smallest `_timestamp` among the stored rows (`0` for an empty file).
     /// Computed from the actual data the writer stored — the authoritative
     /// source for `FileMeta::min_ts` (never trust upstream footer stats).
@@ -312,6 +733,14 @@ pub struct VixWriter {
     term_field_ids: HashMap<String, u16>,
     /// Term-indexed fields that also emit full-text tokens.
     fts_fields: HashSet<String>,
+    /// Term fields with non-string (canonical tagged) value terms — kept out
+    /// of the composite bloom coverage (see `new_inner`).
+    non_string_term_fields: HashSet<String>,
+    /// #52 bloom-only fields: `fid -> (name, distinct composite-value-key
+    /// hashes)`. Values observed at push time (deduped here so bloom sizing
+    /// stays exact); folded into the bloom accumulation at finish. These
+    /// fids never reach `self.terms`.
+    bloom_only: HashMap<u16, (String, HashSet<u64>)>,
     /// Column-store fields present in the schema (`_timestamp` excluded).
     cs_fields: BTreeSet<String>,
     /// Arrow schema of the `docs` blob.
@@ -329,6 +758,12 @@ pub struct VixWriter {
     /// [`VixWriterOptions::term_spill_dir`] is unset).
     term_spill: Option<spill::TermSpill>,
     partial_fields: BTreeSet<String>,
+    /// Per-field count of raw values skipped for exceeding
+    /// [`VixWriterOptions::max_raw_term_len`] — stamped as the
+    /// `oversize_skips` property (never `partial_fields`) so the
+    /// dictionary-serve reconciliation can treat the shortfall as an exact
+    /// allowance; total reported via [`VixWriterStats::oversize_skipped`].
+    oversize_skips: BTreeMap<String, u64>,
     /// Docs batches buffered while the chunk-size sample is still open
     /// ([`DOCS_ENCODE_SAMPLE_BYTES`]); once the streaming encoder starts
     /// this stays empty.
@@ -340,9 +775,33 @@ pub struct VixWriter {
     /// pushed batches as they arrive so the writer never holds the whole
     /// file's decoded rows.
     docs_encoder: Option<DocsBlobEncoder>,
+    /// M18: encoded column chunks the passthrough write strategy had to
+    /// canonicalize + re-encode because their tree carried an encoding the
+    /// file writer cannot serialize (per-chunk fail-open — see
+    /// [`crate::container::docs_passthrough_strategy`]). Incremented on the
+    /// encoder worker; final after [`Self::finish`]/`finish_output` joins
+    /// it. Callers keep a clone of the handle
+    /// ([`Self::docs_failopen_counter`]) to read the count after finish.
+    docs_failopen_chunks: Arc<std::sync::atomic::AtomicU64>,
     /// `_timestamp` zone folding over the pushed rows, windowed by the
     /// locked rows-per-chunk. Lives and dies with `docs_encoder`.
     zone_folder: Option<ZoneMapFolder>,
+    /// #51c: the open encoded-chunk run
+    /// ([`Self::begin_docs_encoded_run`]..[`Self::finish_docs_encoded_run`]).
+    /// While open, every other push path is rejected — the run's zone
+    /// entries were spliced at begin, so foreign rows interleaving would
+    /// corrupt the zone table's row order.
+    encoded_run: Option<EncodedRunState>,
+    /// #51c heal mode: `Some(rows indexed so far)` once the first
+    /// index-only push ([`Self::push_docs_rows_index_only`] /
+    /// [`Self::push_batch_with_source_index_only`]) arrives — the doc-id
+    /// cursor of an index whose docs rows are stored separately through the
+    /// encoded-run API. While set, the coupled push paths are rejected
+    /// (they would advance `row_count` AND assign doc ids, colliding with
+    /// the split accounting), and finish demands this counter equal
+    /// `row_count` exactly — otherwise the postings' doc ids would
+    /// misaddress the stored rows.
+    index_only_rows: Option<u64>,
     row_count: u64,
     /// `_timestamp` range of the stored rows (`None` until the first row) —
     /// reported through [`VixWriterStats`], the authoritative FileMeta range.
@@ -367,6 +826,46 @@ pub struct VixWriter {
     /// pre-guard-era files (stored rows with `_timestamp <= 0`) that the
     /// compaction-time cleansing has to digest. Never set in production.
     skip_ts_guard: bool,
+}
+
+/// How one push call splits between the term index and the docs store.
+/// The build/rebuild paths couple both ([`IndexAndStore`]); the merge fast
+/// path stores without indexing ([`StoreOnly`], the index is pre-merged);
+/// the #51c heal passthrough indexes without storing ([`IndexOnly`] — the
+/// docs rows are copied separately through the encoded-run API).
+///
+/// [`IndexAndStore`]: DocsPushMode::IndexAndStore
+/// [`StoreOnly`]: DocsPushMode::StoreOnly
+/// [`IndexOnly`]: DocsPushMode::IndexOnly
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DocsPushMode {
+    IndexAndStore,
+    StoreOnly,
+    IndexOnly,
+}
+
+impl DocsPushMode {
+    /// Whether this push derives index terms from the rows.
+    fn indexes(self) -> bool {
+        matches!(self, Self::IndexAndStore | Self::IndexOnly)
+    }
+
+    /// Whether this push stages the rows into the docs store.
+    fn stores(self) -> bool {
+        matches!(self, Self::IndexAndStore | Self::StoreOnly)
+    }
+}
+
+/// State of one open #51c encoded-chunk run (see
+/// [`VixWriter::begin_docs_encoded_run`]).
+struct EncodedRunState {
+    /// The docs blob's vortex dtype — every pushed chunk must match EXACTLY
+    /// (names, order, types, nullability); a foreign chunk would corrupt
+    /// the blob for every reader.
+    dtype: vortex::dtype::DType,
+    /// Rows still owed by [`VixWriter::push_docs_encoded_chunk`] calls
+    /// before [`VixWriter::finish_docs_encoded_run`] may close the run.
+    remaining: u64,
 }
 
 /// The output of [`VixWriter::merge_input_indexes`], consumed by `finish`.
@@ -414,15 +913,22 @@ impl VixWriter {
         store_original: bool,
         max_real_field_id: u16,
     ) -> Self {
-        let mut term_fields: Vec<String> = schema
-            .fields()
-            .iter()
-            .filter(|field| {
-                is_value_indexed_type(field.data_type())
-                    && !NON_INDEXED_COLS.contains(&field.name().as_str())
-            })
-            .map(|field| field.name().clone())
-            .collect();
+        let mut term_fields: Vec<String> = if opts.index_enabled {
+            schema
+                .fields()
+                .iter()
+                .filter(|field| {
+                    is_value_indexed_type(field.data_type())
+                        && !NON_INDEXED_COLS.contains(&field.name().as_str())
+                })
+                .map(|field| field.name().clone())
+                .collect()
+        } else {
+            // index-off (#40): empty term plan — no field is term-indexed,
+            // no fts, and the field-id cap can never overflow into
+            // partial_fields
+            Vec::new()
+        };
         term_fields.sort_unstable();
         term_fields.dedup();
 
@@ -476,23 +982,63 @@ impl VixWriter {
             .cloned()
             .collect();
 
-        // The `docs` blob schema: `_timestamp` first (always as i64), then
-        // the column-store fields sorted by name with their original arrow
-        // types, then `_source` and optionally `_original`. Requested fields
-        // absent from the schema are ignored.
-        let cs_fields: BTreeSet<String> = opts
-            .column_store_field_names
-            .iter()
+        // Term fields whose value terms are NOT raw string bytes (numeric/
+        // bool: tagged canonical forms). They must stay OUT of the composite
+        // bloom's coverage set: the pruner probes with the query literal's
+        // raw bytes, so a covered-but-canonical field would read every miss
+        // as "definitely not" and wrongly drop files (`status = 200`).
+        // Uncovered ⇒ guards miss ⇒ "no info" ⇒ keep + scan, the safe side.
+        let non_string_term_fields: HashSet<String> = term_field_ids
+            .keys()
             .filter(|name| {
-                name.as_str() != TIMESTAMP_COL_NAME && schema.field_with_name(name).is_ok()
+                schema
+                    .field_with_name(name)
+                    .is_ok_and(|field| !is_string_family(field.data_type()))
             })
             .cloned()
+            .collect();
+
+        // #52 bloom-only resolution: explicit list ∩ term plan ∩ string
+        // family − never-list − fts. Kept in the fields table (they hold
+        // their field-id slot and emit KEY terms) but typed "bloom", and
+        // their raw values bypass the dictionary entirely.
+        let bloom_only: HashMap<u16, (String, HashSet<u64>)> = opts
+            .bloom_only_field_names
+            .iter()
+            .filter(|name| {
+                term_field_ids.contains_key(*name)
+                    && !opts.bloom_only_never.iter().any(|n| n == *name)
+                    && !opts.fts_field_names.iter().any(|n| n == *name)
+                    && schema
+                        .field_with_name(name)
+                        .is_ok_and(|field| is_string_family(field.data_type()))
+            })
+            .map(|name| (term_field_ids[name], (name.clone(), HashSet::new())))
+            .collect();
+
+        // The `docs` blob schema (v2, DESIGN §2 — ALL present fields as
+        // columns): `_timestamp` first (always as i64), then EVERY other
+        // schema field sorted by name with its original arrow type, then
+        // `_source` and optionally `_original`. There is no column-store
+        // curation: every field the batches carry is a native column (the
+        // #52 bloom-only demotion stays an index-side concept — its fields
+        // are columns like everything else).
+        let cs_fields: BTreeSet<String> = schema
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .filter(|name| name.as_str() != TIMESTAMP_COL_NAME)
             .collect();
         let mut docs_fields: Vec<Field> = Vec::with_capacity(cs_fields.len() + 3);
         docs_fields.push(Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false));
         for name in &cs_fields {
             if let Ok(field) = schema.field_with_name(name) {
-                docs_fields.push(field.clone());
+                // Docs columns are stored NULLABLE regardless of the batch
+                // schema: a merged file legitimately holds null runs for
+                // rows whose input lacked the column, and uniform
+                // nullability keeps the stored dtype identical across files
+                // (the passthrough identity requirement).
+                docs_fields.push(field.clone().with_nullable(true));
             }
         }
         docs_fields.push(Field::new(SOURCE_COL_NAME, DataType::Utf8, false));
@@ -507,6 +1053,8 @@ impl VixWriter {
             term_fields,
             term_field_ids,
             fts_fields,
+            non_string_term_fields,
+            bloom_only,
             cs_fields,
             docs_schema,
             terms: BTreeMap::new(),
@@ -514,10 +1062,14 @@ impl VixWriter {
             terms_bytes: 0,
             term_spill: None,
             partial_fields,
+            oversize_skips: BTreeMap::new(),
             sample_batches: Vec::new(),
             sample_bytes: 0,
             docs_encoder: None,
+            docs_failopen_chunks: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             zone_folder: None,
+            encoded_run: None,
+            index_only_rows: None,
             row_count: 0,
             ts_range: None,
             init_error,
@@ -544,7 +1096,27 @@ impl VixWriter {
         source: &StringArray,
         original: Option<&StringArray>,
     ) -> anyhow::Result<()> {
-        self.push_batch_inner(batch, source, original)?;
+        self.push_batch_inner(batch, source, original, DocsPushMode::IndexAndStore)?;
+        Ok(())
+    }
+
+    /// #51c heal passthrough: [`Self::push_batch_with_source`] with the docs
+    /// STORE side detached — the batch feeds ONLY the term index (value
+    /// terms, key terms, #52 bloom-only hashing, oversize/partial
+    /// accounting, exactly like the coupled push), while the rows' stored
+    /// form arrives separately through the encoded-run API in the SAME
+    /// order (`row_count`, the `_timestamp` range and the zone table
+    /// advance there). Doc ids are assigned from the index-only cursor;
+    /// finish verifies it equals the stored row count. Requires
+    /// [`VixWriterOptions::docs_passthrough`] and an indexed, non-merge-mode
+    /// writer.
+    pub fn push_batch_with_source_index_only(
+        &mut self,
+        batch: &RecordBatch,
+        source: &StringArray,
+        original: Option<&StringArray>,
+    ) -> anyhow::Result<()> {
+        self.push_batch_inner(batch, source, original, DocsPushMode::IndexOnly)?;
         Ok(())
     }
 
@@ -570,12 +1142,13 @@ impl VixWriter {
     /// - numbers/bools emit the key term only (numeric columns are never term-indexed).
     ///
     /// The stored `docs` row is assembled from the passed arrays:
-    /// `timestamps` (non-null, one per row), the schema's column-store
-    /// fields looked up by name in `cs_columns` (cast to the schema type;
-    /// every configured field must be supplied — pass an all-null array for
-    /// a column a caller has no data for), `source` and `original` (same
-    /// rules as [`Self::push_batch_with_source`]). Rows must arrive in
-    /// document order.
+    /// `timestamps` (non-null, one per row), the docs columns looked up by
+    /// name in `cs_columns` (cast to the schema type; a docs column the
+    /// caller supplies no data for stores null — v2 all-columns semantics,
+    /// where a merge input lacking a column contributes nulls — while a
+    /// supplied name that is NOT a docs column errors loudly), `source` and
+    /// `original` (same rules as [`Self::push_batch_with_source`]). Rows
+    /// must arrive in document order.
     pub fn push_docs_rows(
         &mut self,
         timestamps: &Int64Array,
@@ -583,7 +1156,40 @@ impl VixWriter {
         source: &StringArray,
         original: Option<&StringArray>,
     ) -> anyhow::Result<()> {
-        self.push_docs_rows_inner(timestamps, cs_columns, source, original, true)?;
+        self.push_docs_rows_inner(
+            timestamps,
+            cs_columns,
+            source,
+            original,
+            DocsPushMode::IndexAndStore,
+        )?;
+        Ok(())
+    }
+
+    /// #51c heal passthrough: [`Self::push_docs_rows`] with the docs STORE
+    /// side detached — the rows feed ONLY the term index (source-driven
+    /// term derivation, #52 bloom-only hashing from both the cs columns and
+    /// `_source`, oversize/partial accounting, exactly like the coupled
+    /// push), while their stored form arrives separately through the
+    /// encoded-run API in the SAME order (`row_count`, the `_timestamp`
+    /// range and the zone table advance there). Doc ids are assigned from
+    /// the index-only cursor; finish verifies it equals the stored row
+    /// count. Requires [`VixWriterOptions::docs_passthrough`] and an
+    /// indexed, non-merge-mode writer.
+    pub fn push_docs_rows_index_only(
+        &mut self,
+        timestamps: &Int64Array,
+        cs_columns: &[(String, ArrowArrayRef)],
+        source: &StringArray,
+        original: Option<&StringArray>,
+    ) -> anyhow::Result<()> {
+        self.push_docs_rows_inner(
+            timestamps,
+            cs_columns,
+            source,
+            original,
+            DocsPushMode::IndexOnly,
+        )?;
         Ok(())
     }
 
@@ -614,6 +1220,16 @@ impl VixWriter {
             return Err(error.clone());
         }
         for (position, reader) in inputs.iter().enumerate() {
+            // #40: an index-off input carries rows the dictionary merge
+            // would silently miss (it has no term/fts entries to demote
+            // on) — an INDEXED merge plan must rebuild from `_source`
+            // instead of fast-pathing over it.
+            if !reader.has_index() {
+                return Err(format!(
+                    "input {position}: column-store-only file (no index sidecar) cannot join a \
+                     dictionary merge"
+                ));
+            }
             // The writer emits the canonical [`TOKENIZER_ID`] tokens: an
             // input stamped with any other tokenizer id cannot be
             // dictionary-merged — the caller rebuilds from `_source`, which
@@ -690,6 +1306,21 @@ impl VixWriter {
             if self.fts_fields.contains(name) {
                 continue; // fts entries never claim raw-value capability
             }
+            // #52/M7: a plan-BLOOM-ONLY field claims no term capability in
+            // the output, so inputs owe it none — its bloom coverage
+            // re-derives completely from the docs columns (and legacy term
+            // inputs additionally converge through the dictionary path).
+            // Without this skip, every merge or classify of an
+            // already-demoted file would flag the field lacking: merges
+            // would degrade it to capability-less (coverage lost) and the
+            // single-file sweep would rebuild → re-demote → rebuild forever.
+            if self
+                .term_field_ids
+                .get(name)
+                .is_some_and(|id| self.bloom_only.contains_key(id))
+            {
+                continue;
+            }
             for reader in inputs {
                 if reader.has_term_capability(name) {
                     continue;
@@ -744,6 +1375,13 @@ impl VixWriter {
     ) -> Result<()> {
         if let Some(error) = &self.init_error {
             return Err(VixError::Writer(error.clone()));
+        }
+        if !self.opts.index_enabled {
+            return Err(VixError::Writer(
+                "merge_input_indexes on an index-off writer (#40): the plan must route this merge \
+                 through the docs-only path"
+                    .to_string(),
+            ));
         }
         if self.merged_index.is_some() || self.row_count > 0 || !self.terms.is_empty() {
             return Err(VixError::Writer(
@@ -828,19 +1466,51 @@ impl VixWriter {
             self.demoted_fields.insert(name);
         }
 
+        // #52: per-field bloom sections track only NON-demoted bloom fields
+        // — a demoted field's per-field acc observes NOTHING when the
+        // inputs are already demoted (no dictionary keys carry its values)
+        // and would publish an EMPTY reject-all filter: every equality
+        // probe against it reads "definitely not" and wrongly drops the
+        // file (caught by the M7 measurement's bloom accounting: a 32-byte
+        // n_items=0 trace_id section on a demoted-inputs merge). The build
+        // path has filtered exactly this since #52 (assemble_index_blobs);
+        // the composite section carries demoted values on both paths, and
+        // the pruner treats the ABSENT per-field section as "no info".
+        let bloom_field_names: Vec<String> = self
+            .opts
+            .bloom_field_names
+            .iter()
+            .filter(|name| {
+                self.term_field_ids
+                    .get(*name)
+                    .is_none_or(|id| !self.bloom_only.contains_key(id))
+            })
+            .cloned()
+            .collect();
         let merged = merge::merge_indexes(
             inputs,
             doc_maps,
             &self.term_field_ids,
-            &self.opts.bloom_field_names,
+            &bloom_field_names,
+            &self.composite_pairs(),
+            &self.bloom_only.keys().copied().collect(),
             total_rows,
             self.opts.postings_chunk_bytes,
             self.opts.postings_plist_min_docs,
             threads,
+            self.opts.merge_kway_threads,
         )?;
         for reader in inputs {
             self.partial_fields
                 .extend(reader.partial_fields().iter().cloned());
+            // Sum the inputs' oversize-skip allowances: the merged
+            // dictionary carries exactly the inputs' terms, so the merged
+            // file's serve reconciliation needs the combined allowance to
+            // keep serving (a lost allowance would demote every merged
+            // file back to the scan fallback).
+            for (field, count) in reader.oversize_skips() {
+                *self.oversize_skips.entry(field.clone()).or_default() += count;
+            }
         }
         self.partial_fields.extend(merged.dropped);
         self.merged_index = Some(PrebuiltIndex {
@@ -863,28 +1533,403 @@ impl VixWriter {
         source: &StringArray,
         original: Option<&StringArray>,
     ) -> anyhow::Result<()> {
-        self.push_docs_rows_inner(timestamps, cs_columns, source, original, false)?;
+        self.push_docs_rows_inner(
+            timestamps,
+            cs_columns,
+            source,
+            original,
+            DocsPushMode::StoreOnly,
+        )?;
         Ok(())
     }
 
-    /// Build and return the complete `.vix` (puffin) file bytes. With
-    /// [`VixWriterOptions::output_spool_dir`] set this reads the spool back
-    /// into memory — callers that spool should use [`Self::finish_output`].
-    pub fn finish(self) -> anyhow::Result<Vec<u8>> {
-        self.finish_inner()?.0.into_bytes()
+    /// #51c: open one encoded-chunk run — `expected_rows` docs rows about to
+    /// arrive as already-encoded chunks ([`Self::push_docs_encoded_chunk`]),
+    /// copied from ONE disjoint merge input without decode/re-encode. The
+    /// run's `_timestamp` bounds come from the caller's own read of the
+    /// input's timestamp column (never its footer), `zone_entries` are the
+    /// input's zone table spliced VERBATIM (the writer's own zone folding
+    /// flushes its open window first, so the spliced entries keep the
+    /// table's row-order invariant: each entry bounds its contiguous row
+    /// range; entries cover every row exactly once), and `spliced_stats`
+    /// carries the input's per-column chunk stats + file presence counts,
+    /// spliced alongside — a passthrough output ALWAYS carries full stats
+    /// (H2/§4: the v1 stats-loss regression is structurally impossible).
+    ///
+    /// Errors (before any chunk is accepted, so a caller can still fall
+    /// back to the decode path): the writer was not built with
+    /// [`VixWriterOptions::docs_passthrough`]; a run is already open; the
+    /// writer is not in a mode that accepts unindexed docs pushes; the run
+    /// is empty; the `_timestamp` bounds are degenerate (`<= 0`) or
+    /// inverted; the zone entries do not sum to `expected_rows`, carry an
+    /// empty/inverted window, or exceed the run's bounds.
+    /// `run_regions` (§4 region table): the run's PROVEN internally-DESC
+    /// decomposition as row counts summing to `expected_rows` — a ts_desc
+    /// input is `Some(&[expected_rows])`, a concat input passes its own
+    /// stamped region table. `None` = no proven decomposition (a concat
+    /// input without a region table): the OUTPUT's region table is poisoned
+    /// (property omitted, readers fail open to the full sort) while the
+    /// copy itself proceeds unchanged.
+    pub fn begin_docs_encoded_run(
+        &mut self,
+        expected_rows: u64,
+        ts_min: i64,
+        ts_max: i64,
+        zone_entries: &[ZoneEntry],
+        spliced_stats: &SpliceableStats,
+        run_regions: Option<&[u64]>,
+    ) -> anyhow::Result<()> {
+        if !self.opts.docs_passthrough {
+            return Err(VixError::Writer(
+                "begin_docs_encoded_run requires VixWriterOptions::docs_passthrough — this \
+                 writer's docs encoder compresses through the standard pipeline and would \
+                 canonicalize (or corrupt the accounting of) pre-encoded chunks"
+                    .to_string(),
+            )
+            .into());
+        }
+        if self.encoded_run.is_some() {
+            return Err(VixError::Writer(
+                "begin_docs_encoded_run: a previous encoded run is still open (missing \
+                 finish_docs_encoded_run)"
+                    .to_string(),
+            )
+            .into());
+        }
+        // Mode: the encoded run is a docs-STORE path. In the heal's
+        // index-only build mode (#51c heal passthrough) the run is exactly
+        // where the scanned-and-indexed rows get stored, so it is accepted
+        // as-is; otherwise the same mode rules as push_docs_rows_unindexed
+        // apply: merge mode (or index-off, where both push variants store
+        // identically).
+        if self.index_only_rows.is_none() {
+            self.check_push_mode(DocsPushMode::StoreOnly)?;
+        }
+        if expected_rows == 0 {
+            return Err(VixError::Writer(
+                "begin_docs_encoded_run: an encoded run must cover at least one row".to_string(),
+            )
+            .into());
+        }
+        if ts_min <= 0 || ts_max <= 0 || ts_min > ts_max {
+            return Err(VixError::Writer(format!(
+                "begin_docs_encoded_run: degenerate _timestamp bounds [{ts_min}, {ts_max}] — \
+                 passthrough inputs must be cleansed (rows with _timestamp <= 0 take the \
+                 rebuild path)"
+            ))
+            .into());
+        }
+        let mut covered = 0u64;
+        for &(rows, min, max) in zone_entries {
+            if rows == 0 || min > max || min < ts_min || max > ts_max {
+                return Err(VixError::Writer(format!(
+                    "begin_docs_encoded_run: zone entry ({rows}, {min}, {max}) is inconsistent \
+                     with the run ({expected_rows} rows, _timestamp [{ts_min}, {ts_max}]) — \
+                     refusing to splice a zone table that misbounds its rows"
+                ))
+                .into());
+            }
+            covered = covered.checked_add(rows).ok_or_else(|| {
+                VixError::Writer("begin_docs_encoded_run: zone row counts overflow u64".to_string())
+            })?;
+        }
+        if covered != expected_rows {
+            return Err(VixError::Writer(format!(
+                "begin_docs_encoded_run: zone entries cover {covered} rows but the run brings \
+                 {expected_rows} — a spliced zone table must cover the run exactly"
+            ))
+            .into());
+        }
+        if let Some(regions) = run_regions {
+            let mut region_rows = 0u64;
+            for &rows in regions {
+                if rows == 0 {
+                    return Err(VixError::Writer(
+                        "begin_docs_encoded_run: run_regions carries a zero-row region"
+                            .to_string(),
+                    )
+                    .into());
+                }
+                region_rows = region_rows.checked_add(rows).ok_or_else(|| {
+                    VixError::Writer(
+                        "begin_docs_encoded_run: run_regions row counts overflow u64".to_string(),
+                    )
+                })?;
+            }
+            if region_rows != expected_rows {
+                return Err(VixError::Writer(format!(
+                    "begin_docs_encoded_run: run_regions cover {region_rows} rows but the run \
+                     brings {expected_rows} — a region decomposition must cover the run exactly"
+                ))
+                .into());
+            }
+        }
+        self.check_doc_capacity(expected_rows as usize)?;
+
+        // rows-per-chunk locking still happens through the standard path
+        // (from the sample when one exists, the passthrough fallback window
+        // otherwise) before the first encoded push
+        if self.docs_encoder.is_none() {
+            self.start_docs_encoder()?;
+        }
+        let folder = self
+            .zone_folder
+            .as_mut()
+            .expect("zone folder exists whenever the encoder does");
+        folder.flush_open_window();
+        folder.append_spliced(zone_entries, spliced_stats, run_regions);
+        self.track_ts_bounds(ts_min, ts_max);
+        let dtype = {
+            use vortex::arrow::FromArrowType;
+            vortex::dtype::DType::from_arrow(self.docs_schema.as_ref())
+        };
+        self.encoded_run = Some(EncodedRunState {
+            dtype,
+            remaining: expected_rows,
+        });
+        Ok(())
+    }
+
+    /// #51c: store one already-encoded docs chunk of the open run (see
+    /// [`Self::begin_docs_encoded_run`]). The chunk's dtype must equal the
+    /// writer's docs dtype exactly, and the run's chunks must sum to the
+    /// declared row count by [`Self::finish_docs_encoded_run`].
+    pub fn push_docs_encoded_chunk(
+        &mut self,
+        chunk: crate::docs::EncodedDocsChunk,
+    ) -> anyhow::Result<()> {
+        let run = self.encoded_run.as_mut().ok_or_else(|| {
+            VixError::Writer(
+                "push_docs_encoded_chunk without an open run (begin_docs_encoded_run first)"
+                    .to_string(),
+            )
+        })?;
+        let rows = chunk.rows() as u64;
+        if rows == 0 {
+            return Ok(());
+        }
+        if chunk.array.len() as u64 != rows {
+            return Err(VixError::Writer(format!(
+                "push_docs_encoded_chunk: chunk claims {rows} rows but the array holds {}",
+                chunk.array.len()
+            ))
+            .into());
+        }
+        if chunk.array.dtype() != &run.dtype {
+            return Err(VixError::Writer(format!(
+                "push_docs_encoded_chunk: chunk dtype {} does not equal the writer docs dtype \
+                 {} — passthrough requires exact schema identity (names, order, types, \
+                 nullability); the input must take the decode path",
+                chunk.array.dtype(),
+                run.dtype
+            ))
+            .into());
+        }
+        if rows > run.remaining {
+            return Err(VixError::Writer(format!(
+                "push_docs_encoded_chunk: chunk brings {rows} rows but the run has only {} \
+                 left of its declared count",
+                run.remaining
+            ))
+            .into());
+        }
+        run.remaining -= rows;
+        self.docs_encoder
+            .as_mut()
+            .expect("encoder started at begin_docs_encoded_run")
+            .push_encoded(chunk.array)?;
+        self.row_count += rows;
+        Ok(())
+    }
+
+    /// #51c: close the open encoded run, verifying every declared row
+    /// arrived.
+    pub fn finish_docs_encoded_run(&mut self) -> anyhow::Result<()> {
+        let run = self.encoded_run.take().ok_or_else(|| {
+            VixError::Writer("finish_docs_encoded_run without an open run".to_string())
+        })?;
+        if run.remaining != 0 {
+            return Err(VixError::Writer(format!(
+                "finish_docs_encoded_run: the run is short {} rows of its declared count — \
+                 the spliced zone table would misdescribe the file",
+                run.remaining
+            ))
+            .into());
+        }
+        Ok(())
+    }
+
+    /// The arrow schema of the `docs` blob this writer stores — the schema
+    /// a #51c passthrough input must match (compare with
+    /// [`docs_schema_mismatch_reason`], which checks identity at the STORED
+    /// dtype level).
+    pub fn docs_schema(&self) -> &SchemaRef {
+        &self.docs_schema
+    }
+
+    /// M18: handle onto the passthrough encoder's per-chunk fail-open
+    /// counter (encoded column chunks canonicalized + re-encoded because
+    /// their tree carried a non-writable encoding). The count is final only
+    /// after `finish`/`finish_output` joins the encoder worker — callers
+    /// clone the handle before finishing and read it after, for the merge
+    /// summary.
+    pub fn docs_failopen_counter(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(&self.docs_failopen_chunks)
+    }
+
+    /// #52: the resolved bloom-only field names (string-family term-plan
+    /// fields minus never/fts). The #51c passthrough qualifier projects
+    /// exactly these columns for its bloom-coverage scan.
+    pub fn bloom_only_fields(&self) -> Vec<String> {
+        self.bloom_only
+            .values()
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    /// #52 + #51c: hash bloom-only field values from already-materialized
+    /// docs columns into the composite-bloom accumulation — the SAME
+    /// derivation [`Self::push_docs_rows_unindexed`] applies to streamed
+    /// columns, exposed for the passthrough path (whose docs rows never
+    /// decode; the caller scans ONLY the bloom-only columns). Row counts
+    /// are per call; the hash set dedupes across calls.
+    pub fn absorb_bloom_only_columns(
+        &mut self,
+        cs_columns: &[(String, ArrowArrayRef)],
+    ) -> anyhow::Result<()> {
+        if let Some((first_name, first)) = cs_columns.first() {
+            for (name, column) in cs_columns {
+                if column.len() != first.len() {
+                    return Err(VixError::Writer(format!(
+                        "absorb_bloom_only_columns: column {name:?} has {} rows but \
+                         {first_name:?} has {}",
+                        column.len(),
+                        first.len()
+                    ))
+                    .into());
+                }
+            }
+        }
+        self.hash_bloom_only_columns(cs_columns);
+        Ok(())
+    }
+
+    /// M12: a DETACHED bloom-only hasher over `fields` (∩ this writer's
+    /// resolved bloom-only set) — the parallel coverage scan's per-worker
+    /// state. Workers hash into their own sets off the writer; the writer
+    /// folds them back with [`Self::absorb_bloom_only_hashes`]. Hash
+    /// absorption is order-independent and set-union dedupes exactly like
+    /// the writer's own sets, so any worker partition produces the
+    /// identical final set.
+    pub fn bloom_only_hasher(&self, fields: &[String]) -> BloomOnlyHasher {
+        let wanted: Vec<(String, u16)> = fields
+            .iter()
+            .filter_map(|name| {
+                let fid = *self.term_field_ids.get(name)?;
+                self.bloom_only
+                    .contains_key(&fid)
+                    .then(|| (name.clone(), fid))
+            })
+            .collect();
+        BloomOnlyHasher {
+            sets: wanted
+                .iter()
+                .map(|(name, fid)| (*fid, (name.clone(), HashSet::new())))
+                .collect(),
+            max_raw_term_len: self.opts.max_raw_term_len,
+            scratch: Vec::new(),
+        }
+    }
+
+    /// M12: fold a detached hasher's sets back into the writer (set union —
+    /// the same dedupe the writer's own absorption applies).
+    pub fn absorb_bloom_only_hashes(&mut self, hasher: BloomOnlyHasher) {
+        for (fid, (_, hashes)) in hasher.sets {
+            if let Some((_, sink)) = self.bloom_only.get_mut(&fid) {
+                sink.extend(hashes);
+            }
+        }
+    }
+
+    /// #52 + #51c-d: hash bloom-only field values out of `_source` JSON into
+    /// the composite-bloom accumulation — the coverage source for a
+    /// schema-PINNED passthrough merge whose input stores NO docs column for
+    /// the field (nothing to project; the values live only in `_source`).
+    /// `fields` restricts hashing to the named bloom-only fields (the caller
+    /// passes exactly the ones missing from the input's docs schema; fields
+    /// present as columns keep the cheaper projected-column hashing).
+    ///
+    /// Value policy matches [`Self::absorb_bloom_only_columns`] exactly:
+    /// string values only, oversize values silently skipped WITHOUT touching
+    /// the `oversize_skips` allowance (merge mode carries the inputs'
+    /// stamped allowances; counting here would double them), nulls/absent
+    /// keys hash nothing, and the per-field hash sets dedupe across calls.
+    /// `source` accepts any arrow string flavor (a scanned `_source` column
+    /// reads back as the VIEW form). Errors name the offending row; the
+    /// caller treats any error as a pre-push qualification failure.
+    pub fn absorb_bloom_only_source(
+        &mut self,
+        source: &ArrowArrayRef,
+        fields: &[String],
+    ) -> anyhow::Result<()> {
+        // fid lookup for exactly the requested-AND-resolved bloom-only names
+        let wanted: Vec<(String, u16)> = fields
+            .iter()
+            .filter_map(|name| {
+                let fid = *self.term_field_ids.get(name)?;
+                self.bloom_only
+                    .contains_key(&fid)
+                    .then(|| (name.clone(), fid))
+            })
+            .collect();
+        if wanted.is_empty() {
+            return Ok(());
+        }
+        let mut scratch = std::mem::take(&mut self.scratch);
+        let max_raw_term_len = self.opts.max_raw_term_len;
+        let bloom_only = &mut self.bloom_only;
+        let result = hash_bloom_only_source_values(
+            source,
+            &wanted,
+            max_raw_term_len,
+            &mut scratch,
+            |fid, hash| {
+                if let Some((_, hashes)) = bloom_only.get_mut(&fid) {
+                    hashes.insert(hash);
+                }
+            },
+        );
+        self.scratch = scratch;
+        result
+    }
+
+    /// Build the file's TWO byte streams: the `.vix` DATA object (puffin
+    /// with the `docs` blob + data-descriptive properties) and the `.vxi`
+    /// INDEX sidecar (`None` for index-off builds — #40/#42 files have no
+    /// sidecar at all). With [`VixWriterOptions::output_spool_dir`] set this
+    /// reads the data spool back into memory — callers that spool should use
+    /// [`Self::finish_output`].
+    pub fn finish(self) -> anyhow::Result<(Vec<u8>, Option<Vec<u8>>)> {
+        let (output, index, _) = self.finish_inner()?;
+        Ok((output.into_bytes()?, index))
     }
 
     /// Like [`Self::finish`], additionally returning size/count stats of the
-    /// produced file (e.g. `index_size` for `FileMeta` accounting).
-    pub fn finish_with_stats(self) -> anyhow::Result<(Vec<u8>, VixWriterStats)> {
-        let (output, stats) = self.finish_inner()?;
-        Ok((output.into_bytes()?, stats))
+    /// produced file (`index_size` = the sidecar's byte size — the
+    /// `FileMeta::index_size` value; `0` ⟺ no sidecar).
+    pub fn finish_with_stats(self) -> anyhow::Result<(Vec<u8>, Option<Vec<u8>>, VixWriterStats)> {
+        let (output, index, stats) = self.finish_inner()?;
+        Ok((output.into_bytes()?, index, stats))
     }
 
-    /// Finish into a [`VixOutput`]: in-memory bytes, or — with
-    /// [`VixWriterOptions::output_spool_dir`] set — a temp-file spool the
-    /// container streamed into (upload from its path; it deletes on drop).
-    pub fn finish_output(self) -> anyhow::Result<(VixOutput, VixWriterStats)> {
+    /// Finish into a [`VixOutput`] for the DATA object — in-memory bytes,
+    /// or, with [`VixWriterOptions::output_spool_dir`] set, a temp-file
+    /// spool the container streamed into (upload from its path; it deletes
+    /// on drop) — plus the in-memory INDEX sidecar bytes (`None` for
+    /// index-off builds). The sidecar stays in memory: its blobs were
+    /// RAM-resident before assembly either way, so this matches the
+    /// pre-split memory profile.
+    pub fn finish_output(self) -> anyhow::Result<(VixOutput, Option<Vec<u8>>, VixWriterStats)> {
         Ok(self.finish_inner()?)
     }
 
@@ -894,13 +1939,13 @@ impl VixWriter {
     /// compaction-time cleansing tests need as merge inputs. Production
     /// writers must never call this — every real producer goes through
     /// [`Self::finish`]/[`Self::finish_with_stats`] and keeps the guard.
-    pub(crate) fn finish_unguarded(mut self) -> Result<(Vec<u8>, VixWriterStats)> {
+    pub(crate) fn finish_unguarded(mut self) -> Result<(Vec<u8>, Option<Vec<u8>>, VixWriterStats)> {
         self.skip_ts_guard = true;
-        let (output, stats) = self.finish_inner()?;
+        let (output, index, stats) = self.finish_inner()?;
         let bytes = output
             .into_bytes()
             .map_err(|e| VixError::Writer(format!("read back spooled output: {e}")))?;
-        Ok((bytes, stats))
+        Ok((bytes, index, stats))
     }
 
     fn push_batch_inner(
@@ -908,9 +1953,15 @@ impl VixWriter {
         batch: &RecordBatch,
         source: &StringArray,
         original: Option<&StringArray>,
+        mode: DocsPushMode,
     ) -> Result<()> {
+        debug_assert!(
+            mode.indexes(),
+            "push_batch_inner is a term-deriving path; StoreOnly rows go through \
+             push_docs_rows_unindexed"
+        );
         let num_rows = batch.num_rows();
-        self.check_push_mode(true)?;
+        self.check_push_mode(mode)?;
         for reserved in [SOURCE_COL_NAME, ORIGINAL_DATA_COL_NAME] {
             if batch.column_by_name(reserved).is_some() {
                 return Err(VixError::Writer(format!(
@@ -920,18 +1971,27 @@ impl VixWriter {
             }
         }
         self.check_push_inputs(num_rows, source, original)?;
-        let first_doc = self.check_doc_capacity(num_rows)?;
+        let first_doc = self.next_first_doc(mode, num_rows)?;
         if num_rows == 0 {
             return Ok(());
         }
 
-        self.index_value_terms(batch, first_doc);
-        self.index_key_terms(batch, first_doc);
+        if self.opts.index_enabled {
+            self.index_value_terms(batch, first_doc);
+            self.index_key_terms(batch, first_doc);
+        }
 
-        let docs_batch = self.project_docs(batch, source, original)?;
-        self.track_ts_range(&docs_batch)?;
-        self.stage_docs_batch(docs_batch)?;
-        self.row_count += num_rows as u64;
+        if mode.stores() {
+            let docs_batch = self.project_docs(batch, source, original)?;
+            self.track_ts_range(&docs_batch)?;
+            self.stage_docs_batch(docs_batch)?;
+            self.row_count += num_rows as u64;
+        } else {
+            // IndexOnly (#51c heal): the rows' stored form arrives
+            // separately through the encoded-run API (row_count, ts range
+            // and zone table advance there); only the doc-id cursor moves.
+            self.advance_index_only_cursor(num_rows);
+        }
         self.maybe_spill_terms()?;
         Ok(())
     }
@@ -966,13 +2026,38 @@ impl VixWriter {
     /// Lock the docs chunking on the buffered sample, spawn the streaming
     /// encoder and hand it the sample (in push order).
     fn start_docs_encoder(&mut self) -> Result<()> {
-        let rows_per_chunk = docs_rows_per_chunk(self.opts.docs_chunk_bytes, &self.sample_batches);
-        let mut folder = ZoneMapFolder::new(rows_per_chunk);
+        let mut rows_per_chunk = docs_rows_per_chunk(
+            self.opts.docs_chunk_bytes,
+            self.opts.docs_chunk_max_rows,
+            &self.sample_batches,
+        );
+        // #51c: a passthrough merge whose FIRST rows arrive as encoded
+        // chunks starts the encoder over an EMPTY sample (rows_per_chunk 0
+        // = the empty-file shape). That would make the zone folder a no-op
+        // for any LATER re-encoded batches — their rows would be missing
+        // from the zone table, breaking its every-row-covered invariant —
+        // so lock a fixed window instead. The window is only the zone
+        // table's granularity and the re-encode slicing width; it need not
+        // match any physical chunking (see [`ZoneMapFolder`]).
+        if self.opts.docs_passthrough && rows_per_chunk == 0 {
+            rows_per_chunk = PASSTHROUGH_FALLBACK_ROWS_PER_CHUNK;
+        }
+        let mut folder = ZoneMapFolder::new(
+            rows_per_chunk,
+            self.docs_schema.as_ref(),
+            self.opts.stats_min_density,
+            self.opts.stats_max_bytes,
+            // §4 region table: only concat outputs need the desc-run
+            // decomposition (a ts_desc file is one region by definition)
+            self.opts.concat_row_order,
+        );
         let mut encoder = DocsBlobEncoder::spawn(
             Arc::clone(&self.docs_schema),
             rows_per_chunk,
             self.opts.encode_threads,
             self.opts.output_spool_dir.clone(),
+            self.opts.docs_passthrough,
+            Arc::clone(&self.docs_failopen_chunks),
         )?;
         for batch in std::mem::take(&mut self.sample_batches) {
             folder.fold(&batch)?;
@@ -1006,18 +2091,89 @@ impl VixWriter {
                 "internal: {TIMESTAMP_COL_NAME:?} range of a non-empty batch is undefined"
             )));
         };
+        self.track_ts_bounds(min, max);
+        Ok(())
+    }
+
+    /// Fold an externally computed `_timestamp` range into the writer's
+    /// running range (the #51c encoded run's bounds, computed by the caller
+    /// from the input's materialized timestamp column).
+    fn track_ts_bounds(&mut self, min: i64, max: i64) {
         self.ts_range = Some(match self.ts_range {
             Some((cur_min, cur_max)) => (cur_min.min(min), cur_max.max(max)),
             None => (min, max),
         });
-        Ok(())
     }
 
     /// Reject push calls that do not match the writer's mode: after
     /// [`Self::merge_input_indexes`] only the unindexed docs push is valid
-    /// (the index is already built), and vice versa.
-    fn check_push_mode(&self, index_terms: bool) -> Result<()> {
-        match (index_terms, self.merged_index.is_some()) {
+    /// (the index is already built), and vice versa. While a #51c encoded
+    /// run is open, every push is rejected — its zone entries were spliced
+    /// at begin, so interleaved rows would corrupt the zone table's order.
+    /// Index-only pushes (#51c heal) additionally require a passthrough,
+    /// indexed, non-merge-mode writer; once one arrived, the coupled push
+    /// paths are rejected (docs rows then arrive ONLY as encoded chunks).
+    fn check_push_mode(&self, mode: DocsPushMode) -> Result<()> {
+        if self.encoded_run.is_some() {
+            return Err(VixError::Writer(
+                "rows pushed while an encoded docs run is open — finish_docs_encoded_run first \
+                 (the run's spliced zone entries own this row range)"
+                    .to_string(),
+            ));
+        }
+        if mode == DocsPushMode::IndexOnly {
+            if !self.opts.docs_passthrough {
+                return Err(VixError::Writer(
+                    "index-only push requires VixWriterOptions::docs_passthrough — without the \
+                     passthrough docs encoder there is no path for this row's stored form, so \
+                     the file would index rows it does not hold"
+                        .to_string(),
+                ));
+            }
+            if !self.opts.index_enabled {
+                return Err(VixError::Writer(
+                    "index-only push on an index-off writer (#40) derives no terms and stores \
+                     nothing — the rows would vanish; push them as encoded chunks or through \
+                     the storing paths instead"
+                        .to_string(),
+                ));
+            }
+            if self.merged_index.is_some() {
+                return Err(VixError::Writer(
+                    "the writer is in merge mode (merge_input_indexes); it cannot also build \
+                     terms from scanned rows — index-only pushes are for the heal rebuild"
+                        .to_string(),
+                ));
+            }
+            return Ok(());
+        }
+        if self.index_only_rows.is_some() {
+            if mode == DocsPushMode::StoreOnly {
+                // M17 mixed passthrough rebuild: an input the chunk copy
+                // cannot express (type flip, stats-less) re-encodes through
+                // decoded STORE-ONLY pushes while its terms came from the
+                // detached index-only scan — same split accounting as the
+                // encoded-run API (index_only_rows vs row_count; finish
+                // still refuses any divergence).
+                return Ok(());
+            }
+            return Err(VixError::Writer(
+                "this writer is in index-only build mode (#51c heal): docs rows arrive only \
+                 through the encoded-run API or store-only pushes, coupled index+store pushes \
+                 would fork the doc-id and row accounting"
+                    .to_string(),
+            ));
+        }
+        if !self.opts.index_enabled {
+            // index-off (#40): there is no index either way — both push
+            // variants store docs rows identically, so merge closures can
+            // reuse either API
+            return Ok(());
+        }
+        match (
+            mode == DocsPushMode::IndexAndStore,
+            self.merged_index.is_some(),
+        ) {
             (true, true) => Err(VixError::Writer(
                 "the writer is in merge mode (merge_input_indexes); rows must be stored with \
                  push_docs_rows_unindexed"
@@ -1030,6 +2186,34 @@ impl VixWriter {
             )),
             _ => Ok(()),
         }
+    }
+
+    /// The doc id of the next pushed row plus the u32 capacity check, on
+    /// the counter `mode` advances: the stored-row count for coupled/store
+    /// pushes, the index-only cursor for detached index pushes (#51c heal —
+    /// latched to `Some` here so the mode is declared even by an empty
+    /// first push).
+    fn next_first_doc(&mut self, mode: DocsPushMode, num_rows: usize) -> Result<u64> {
+        if mode == DocsPushMode::IndexOnly {
+            let first_doc = *self.index_only_rows.get_or_insert(0);
+            if first_doc + num_rows as u64 > u64::from(u32::MAX) {
+                return Err(VixError::Writer(format!(
+                    "doc id overflow: {} total rows exceed the u32 doc-id space",
+                    first_doc + num_rows as u64
+                )));
+            }
+            Ok(first_doc)
+        } else {
+            self.check_doc_capacity(num_rows)
+        }
+    }
+
+    /// Advance the index-only doc-id cursor past one pushed chunk.
+    fn advance_index_only_cursor(&mut self, num_rows: usize) {
+        *self
+            .index_only_rows
+            .as_mut()
+            .expect("latched by next_first_doc") += num_rows as u64;
     }
 
     /// Shared validation of the push paths: writer state plus the
@@ -1078,10 +2262,10 @@ impl VixWriter {
         cs_columns: &[(String, ArrowArrayRef)],
         source: &StringArray,
         original: Option<&StringArray>,
-        index_terms: bool,
+        mode: DocsPushMode,
     ) -> Result<()> {
         let num_rows = timestamps.len();
-        self.check_push_mode(index_terms)?;
+        self.check_push_mode(mode)?;
         self.check_push_inputs(num_rows, source, original)?;
         if timestamps.null_count() > 0 {
             return Err(VixError::Writer(
@@ -1097,21 +2281,162 @@ impl VixWriter {
                 )));
             }
         }
-        let first_doc = self.check_doc_capacity(num_rows)?;
+        // #52: bloom-only values ride the docs columns on this path (the
+        // merge fast path never runs term extraction) — hash them here so
+        // merged files keep composite coverage even when the inputs carried
+        // no dictionary terms for the field. Deduped by the hash set, so
+        // the indexed rebuild (whose source-driven derivation hashes the
+        // same values again) and the heal's index-only scan converge on
+        // identical coverage.
+        self.hash_bloom_only_columns(cs_columns);
+        let first_doc = self.next_first_doc(mode, num_rows)?;
         if num_rows == 0 {
             return Ok(());
         }
 
-        if index_terms {
+        if mode.indexes() && self.opts.index_enabled {
             self.index_source_terms(source, first_doc)?;
         }
 
-        let docs_batch = self.assemble_docs_rows(timestamps, cs_columns, source, original)?;
-        self.track_ts_range(&docs_batch)?;
-        self.stage_docs_batch(docs_batch)?;
-        self.row_count += num_rows as u64;
+        if mode.stores() {
+            let docs_batch = self.assemble_docs_rows(timestamps, cs_columns, source, original)?;
+            self.track_ts_range(&docs_batch)?;
+            self.stage_docs_batch(docs_batch)?;
+            self.row_count += num_rows as u64;
+        } else {
+            // IndexOnly (#51c heal): the rows' stored form arrives
+            // separately through the encoded-run API (row_count, ts range
+            // and zone table advance there); only the doc-id cursor moves.
+            self.advance_index_only_cursor(num_rows);
+        }
         self.maybe_spill_terms()?;
         Ok(())
+    }
+
+    /// #52: hash the bloom-only fields' values out of materialized docs
+    /// columns into `self.bloom_only` — shared by the streamed merge push
+    /// ([`Self::push_docs_rows_unindexed`]) and the #51c passthrough's
+    /// projected bloom scan ([`Self::absorb_bloom_only_columns`]), so both
+    /// derive the identical composite coverage. No-op when no field is
+    /// bloom-only; values over `max_raw_term_len` are skipped (#41 policy;
+    /// skip counters live on the build path).
+    fn hash_bloom_only_columns(&mut self, cs_columns: &[(String, ArrowArrayRef)]) {
+        if self.bloom_only.is_empty() {
+            return;
+        }
+        let mut scratch = std::mem::take(&mut self.scratch);
+        let max_raw_term_len = self.opts.max_raw_term_len;
+        for (name, column) in cs_columns {
+            let Some(&fid) = self.term_field_ids.get(name) else {
+                continue;
+            };
+            let Some((bname, hashes)) = self.bloom_only.get_mut(&fid) else {
+                continue;
+            };
+            hash_bloom_only_column_values(bname, column, max_raw_term_len, &mut scratch, hashes);
+        }
+        self.scratch = scratch;
+    }
+
+    /// #52/M7 AUTO bloom-only demotion at FIRST ENCODE (and unspilled
+    /// rebuilds): count each field's distinct value terms from the
+    /// accumulated term map, run the shared AUTO rule
+    /// ([`resolve_auto_bloom_only`] — the same function the merge planner
+    /// applies to input dictionaries), and DEMOTE the selected fields by
+    /// carving their value-term range out of the map (field-major keys make
+    /// that a contiguous `[fid, fid+1)` slice; KEY terms live under
+    /// [`KEY_FIELD_ID`] and stay, keeping `IS [NOT] NULL` exact) while
+    /// hashing every removed raw value into the field's composite-bloom set
+    /// — exactly where a construction-time demotion would have put it at
+    /// push time. Everything downstream (fields-table `bloom` marker,
+    /// per-field-bloom exclusion, composite coverage + guards via
+    /// `absorb_composite_hashes`) then follows from `self.bloom_only`
+    /// membership, so a demoted-at-birth field is byte-identical to a
+    /// construction-list demotion.
+    ///
+    /// Candidate filters mirror the construction resolution: string-family
+    /// ∩ term plan − fts − never-list (inside the shared rule) − already
+    /// demoted; `partial_fields` members are excluded too — their term maps
+    /// are knowingly incomplete, and claiming composite coverage from an
+    /// incomplete value set would turn bloom misses into wrong drops.
+    ///
+    /// SKIPPED when the term map spilled: the resident map then holds only
+    /// a suffix of the terms, distinct counts would undercount, and a
+    /// demotion decided on partial counts could strand spilled-run values
+    /// outside the bloom. Move-job builds never spill; a budget-crossing
+    /// rebuild keeps its terms and converges at its next merge instead
+    /// (input-dictionary AUTO).
+    fn auto_demote_bloom_only_at_finish(&mut self, row_count: u64) {
+        let ratio = self.opts.bloom_only_auto_ratio;
+        if !self.opts.index_enabled || ratio <= 0.0 || row_count == 0 || self.terms.is_empty() {
+            return;
+        }
+        if self.term_spill.is_some() {
+            log::debug!(
+                "vix build: term map spilled; skipping first-encode AUTO bloom-only demotion \
+                 (counts would be partial)"
+            );
+            return;
+        }
+        // Per-fid distinct value-term counts: keys are field-major, so one
+        // ordered pass counts contiguous runs.
+        let mut counts: Vec<(u16, u64)> = Vec::new();
+        for key in self.terms.keys() {
+            let Some((_, fid)) = crate::query::split_key(key) else {
+                continue;
+            };
+            if fid == KEY_FIELD_ID {
+                continue;
+            }
+            match counts.last_mut() {
+                Some((last, n)) if *last == fid => *n += 1,
+                _ => counts.push((fid, 1)),
+            }
+        }
+        let candidates: Vec<(&str, u64)> = counts
+            .iter()
+            .filter_map(|&(fid, distinct)| {
+                let name = self.term_fields.get(usize::from(fid))?;
+                (!self.fts_fields.contains(name)
+                    && !self.non_string_term_fields.contains(name)
+                    && !self.demoted_fields.contains(name)
+                    && !self.partial_fields.contains(name)
+                    && !self.bloom_only.contains_key(&fid))
+                .then_some((name.as_str(), distinct))
+            })
+            .collect();
+        let selected = resolve_auto_bloom_only(
+            candidates,
+            row_count,
+            ratio,
+            self.opts.bloom_only_min_distinct,
+            &self.opts.bloom_only_never,
+            "build",
+        );
+        for name in selected {
+            let Some(&fid) = self.term_field_ids.get(&name) else {
+                continue;
+            };
+            // Carve [fid, fid+1) out of the map (fid < KEY_FIELD_ID by
+            // construction, so the exclusive bound never reaches the key
+            // terms) and fold the raw values into the bloom set.
+            let lower = fid.to_be_bytes();
+            let upper = (fid + 1).to_be_bytes();
+            let mut demoted = self.terms.split_off(lower.as_slice());
+            let mut rest = demoted.split_off(upper.as_slice());
+            self.terms.append(&mut rest);
+            let mut scratch = std::mem::take(&mut self.scratch);
+            let mut hashes: HashSet<u64> = HashSet::with_capacity(demoted.len());
+            for key in demoted.keys() {
+                // the token IS the raw string value: candidates exclude
+                // fts (tokens) and non-string (tagged canonical) fields
+                if let Some(k) = crate::bloom::composite_value_key(&name, &key[2..], &mut scratch) {
+                    hashes.insert(crate::sbbf::hash_value(k));
+                }
+            }
+            self.scratch = scratch;
+            self.bloom_only.insert(fid, (name, hashes));
+        }
     }
 
     /// Spill the term map to a sorted run when it crosses the budget —
@@ -1147,19 +2472,29 @@ impl VixWriter {
     /// the same key/value/fts terms the column-driven path derives from
     /// flattened columns (see [`Self::push_docs_rows`] for the exact rules).
     fn index_source_terms(&mut self, source: &StringArray, first_doc: u64) -> Result<()> {
+        use sonic_rs::JsonValueTrait;
         for row in 0..source.len() {
             let doc = (first_doc + row as u64) as u32;
             let text = source.value(row);
-            let record: serde_json::Map<String, serde_json::Value> = serde_json::from_str(text)
-                .map_err(|e| {
+            // SIMD lazy parse (sonic-rs): iterate (key, raw-span) pairs
+            // without materializing a DOM. Strings unescape on demand;
+            // numbers stay RAW TEXT until a `serde_json::Number`
+            // (arbitrary_precision) re-parses just the token, so
+            // `canonical_number_text` sees exactly what the old whole-doc
+            // parse carried — byte parity with the column-driven derivation
+            // is pinned by the differential tests. `_source` is
+            // engine-synthesized from a Map, so objects carry no duplicate
+            // keys (a hand-crafted duplicate would now index every
+            // occurrence instead of serde_json's last-wins).
+            for entry in sonic_rs::to_object_iter(text) {
+                let (key, value) = entry.map_err(|e| {
                     VixError::Writer(format!("_source of doc {doc} is not a JSON object: {e}"))
                 })?;
-            for (key, value) in &record {
                 if value.is_null() {
                     // synthesis omits nulls; treat a stray one as absent
                     continue;
                 }
-                let key = key.as_str();
+                let key: &str = key.as_ref();
                 if NON_INDEXED_COLS.contains(&key) || key == SOURCE_COL_NAME {
                     continue;
                 }
@@ -1167,10 +2502,10 @@ impl VixWriter {
                 write_composite(&mut self.scratch, key.as_bytes(), KEY_FIELD_ID);
                 push_term(&mut self.terms, &mut self.terms_bytes, &self.scratch, doc);
 
-                match value {
+                match value.get_type() {
                     // a JSON string emits its value terms — fts tokens or
                     // the raw whole value
-                    serde_json::Value::String(value) => {
+                    sonic_rs::JsonType::String => {
                         let Some(&field_id) = self.term_field_ids.get(key) else {
                             // a string value we cannot value-index (the key
                             // is not a term field of the writer schema, or
@@ -1179,7 +2514,33 @@ impl VixWriter {
                             self.partial_fields.insert(key.to_string());
                             continue;
                         };
-                        if self.fts_fields.contains(key) {
+                        let Some(value) = value.as_str() else {
+                            return Err(VixError::Writer(format!(
+                                "_source of doc {doc}: invalid JSON string at key {key:?}"
+                            )));
+                        };
+                        if self.bloom_only.contains_key(&field_id) {
+                            // #52 bloom-only: the raw value is hashed in the
+                            // composite key form and never touches the
+                            // dictionary. Oversize values inherit the #41
+                            // skip policy (the bloom then can't answer for
+                            // them — same accepted hole as the index had).
+                            if value.len() > self.opts.max_raw_term_len {
+                                *self.oversize_skips.entry(key.to_string()).or_default() += 1;
+                            } else {
+                                let mut scratch = std::mem::take(&mut self.scratch);
+                                let (name, hashes) =
+                                    self.bloom_only.get_mut(&field_id).expect("checked");
+                                if let Some(k) = crate::bloom::composite_value_key(
+                                    name,
+                                    value.as_bytes(),
+                                    &mut scratch,
+                                ) {
+                                    hashes.insert(crate::sbbf::hash_value(k));
+                                }
+                                self.scratch = scratch;
+                            }
+                        } else if self.fts_fields.contains(key) {
                             // fts fields: tokens only, never the raw whole
                             // value (an empty value simply yields no
                             // tokens). Identical to the column-driven path:
@@ -1200,9 +2561,11 @@ impl VixWriter {
                                 );
                             }
                         } else if value.len() > self.opts.max_raw_term_len {
-                            // oversize raw value: skipped, so per-field
-                            // lookups may miss docs — degrade to partial
-                            self.partial_fields.insert(key.to_string());
+                            // oversize raw value: skipped WITHOUT degrading
+                            // the field (owner call 2026-08-12) — identical
+                            // to the column-driven path, so rebuilds do not
+                            // re-taint what the move build left clean
+                            *self.oversize_skips.entry(key.to_string()).or_default() += 1;
                         } else {
                             // the empty string included: `""` is a value
                             // (distinct from null) and its fid-only composite
@@ -1220,18 +2583,27 @@ impl VixWriter {
                     // unindexable strings, whose missing tokens force the
                     // partial taint). Field-id overflow was already recorded
                     // as partial at construction.
-                    serde_json::Value::Number(number) => {
+                    sonic_rs::JsonType::Number => {
                         if self.fts_fields.contains(key) {
                             continue; // numbers have no tokens
                         }
                         let Some(&field_id) = self.term_field_ids.get(key) else {
                             continue;
                         };
-                        let Some(text) = canonical_number_text(number) else {
+                        // re-parse just the number token through serde_json's
+                        // arbitrary_precision Number: exact-text semantics,
+                        // identical canonicalization to the old DOM parse
+                        let number: serde_json::Number =
+                            serde_json::from_str(value.as_raw_str().trim()).map_err(|e| {
+                                VixError::Writer(format!(
+                                    "_source of doc {doc}: invalid JSON number at key {key:?}: {e}"
+                                ))
+                            })?;
+                        let Some(text) = canonical_number_text(&number) else {
                             continue; // ±Inf overflow text: value-less, like null
                         };
                         if text.len() + 1 > self.opts.max_raw_term_len {
-                            self.partial_fields.insert(key.to_string());
+                            *self.oversize_skips.entry(key.to_string()).or_default() += 1;
                             continue;
                         }
                         push_numeric_term(
@@ -1244,19 +2616,22 @@ impl VixWriter {
                             doc,
                         );
                     }
-                    serde_json::Value::Bool(flag) => {
+                    sonic_rs::JsonType::Boolean => {
                         if self.fts_fields.contains(key) {
                             continue;
                         }
                         let Some(&field_id) = self.term_field_ids.get(key) else {
                             continue;
                         };
+                        // get_type read the token's first byte; the raw span
+                        // is exactly `true`/`false`
+                        let flag = value.as_bool().unwrap_or(false);
                         push_numeric_term(
                             &mut self.terms,
                             &mut self.terms_bytes,
                             &mut self.scratch,
                             &mut self.tag_scratch,
-                            canonical_bool_text(*flag),
+                            canonical_bool_text(flag),
                             field_id,
                             doc,
                         );
@@ -1280,6 +2655,23 @@ impl VixWriter {
         original: Option<&StringArray>,
     ) -> Result<RecordBatch> {
         let docs_schema = &self.docs_schema;
+        // A supplied name that is NOT a docs column is a caller bug (typo /
+        // plan-schema drift) — its values would silently vanish. Error
+        // loudly instead. The reverse direction is legitimate since v2
+        // all-columns: a docs column the caller has no data for stores null
+        // (a merge input lacking the column contributes nulls by design).
+        for (name, _) in cs_columns {
+            if name == TIMESTAMP_COL_NAME
+                || name == SOURCE_COL_NAME
+                || name == ORIGINAL_DATA_COL_NAME
+                || docs_schema.field_with_name(name).is_err()
+            {
+                return Err(VixError::Writer(format!(
+                    "push_docs_rows supplied column {name:?} which is not a docs column of \
+                     this writer — its values would be dropped"
+                )));
+            }
+        }
         let mut arrays: Vec<ArrowArrayRef> = Vec::with_capacity(docs_schema.fields().len());
         for field in docs_schema.fields() {
             let array: ArrowArrayRef = match field.name().as_str() {
@@ -1289,18 +2681,15 @@ impl VixWriter {
                     Some(values) => Arc::new(values.clone()),
                     None => Arc::new(StringArray::new_null(timestamps.len())),
                 },
-                name => {
-                    let column = cs_columns
-                        .iter()
-                        .find(|(cs_name, _)| cs_name == name)
-                        .map(|(_, column)| column)
-                        .ok_or_else(|| {
-                            VixError::Writer(format!(
-                                "push_docs_rows is missing column-store column {name:?}"
-                            ))
-                        })?;
-                    array_cast_as(column, field)?
-                }
+                name => match cs_columns
+                    .iter()
+                    .find(|(cs_name, _)| cs_name == name)
+                    .map(|(_, column)| column)
+                {
+                    Some(column) => array_cast_as(column, field)?,
+                    // no data for this docs column in these rows: null
+                    None => arrow::array::new_null_array(field.data_type(), timestamps.len()),
+                },
             };
             arrays.push(array);
         }
@@ -1357,17 +2746,44 @@ impl VixWriter {
                             push_term(&mut self.terms, &mut self.terms_bytes, &self.scratch, doc);
                         }
                     }
-                } else {
-                    let mut partial = false;
+                } else if self.bloom_only.contains_key(&field_id) {
+                    // #52 bloom-only: values hash into the composite key
+                    // form, no dictionary entries. Oversize inherits #41.
+                    let mut scratch = std::mem::take(&mut self.scratch);
+                    let mut oversize = 0u64;
+                    let (name, hashes) = self.bloom_only.get_mut(&field_id).expect("checked");
                     for row in 0..num_rows {
                         let Some(value) = strings.value(row) else {
                             continue;
                         };
                         if value.len() > self.opts.max_raw_term_len {
-                            // Oversize raw value: skip it and flag the field
-                            // as partially indexed (per-field lookups could
-                            // silently miss the skipped value).
-                            partial = true;
+                            oversize += 1;
+                            continue;
+                        }
+                        if let Some(k) =
+                            crate::bloom::composite_value_key(name, value.as_bytes(), &mut scratch)
+                        {
+                            hashes.insert(crate::sbbf::hash_value(k));
+                        }
+                    }
+                    self.scratch = scratch;
+                    if oversize > 0 {
+                        *self.oversize_skips.entry(field_name.clone()).or_default() += oversize;
+                    }
+                } else {
+                    for row in 0..num_rows {
+                        let Some(value) = strings.value(row) else {
+                            continue;
+                        };
+                        if value.len() > self.opts.max_raw_term_len {
+                            // Oversize raw value: skipped from the term index
+                            // WITHOUT degrading the field (owner call
+                            // 2026-08-12, performance-first). The index stays
+                            // authoritative — an equality probe for THIS
+                            // literal silently misses this row; every other
+                            // value keeps exact index answers. The row's key
+                            // term still lands (IS [NOT] NULL stays exact).
+                            *self.oversize_skips.entry(field_name.clone()).or_default() += 1;
                             continue;
                         }
                         let doc = (first_doc + row as u64) as u32;
@@ -1376,9 +2792,6 @@ impl VixWriter {
                         // is valid, so `field = ''` answers from the index
                         write_composite(&mut self.scratch, value.as_bytes(), field_id);
                         push_term(&mut self.terms, &mut self.terms_bytes, &self.scratch, doc);
-                    }
-                    if partial {
-                        self.partial_fields.insert(field_name.clone());
                     }
                 }
             } else if let Some(numbers) = NumericColumn::try_new(column.as_ref()) {
@@ -1395,8 +2808,9 @@ impl VixWriter {
                     }
                     if text.len() + 1 > self.opts.max_raw_term_len {
                         // canonical texts are ≤ ~25 bytes; guard kept for
-                        // uniformity with the raw-term path
-                        self.partial_fields.insert(field_name.clone());
+                        // uniformity with the raw-term path (skip + count,
+                        // no field degrade — same policy)
+                        *self.oversize_skips.entry(field_name.clone()).or_default() += 1;
                         continue;
                     }
                     let doc = (first_doc + row as u64) as u32;
@@ -1448,7 +2862,20 @@ impl VixWriter {
                 continue; // the path exists in none of this batch's docs
             }
             write_composite(&mut self.scratch, name.as_bytes(), KEY_FIELD_ID);
-            let postings = self.terms.entry(self.scratch.clone()).or_default();
+            // Key-term postings count toward the spill estimate exactly like
+            // push_term's: ~4 bytes per appended doc plus the per-entry key
+            // overhead on first insert. They used to bypass `terms_bytes`
+            // entirely (M23 follow-up (c)) — ~4B x rows x present-columns of
+            // resident postings invisible to the spill trigger, making a
+            // wide-schema rebuild spill late by hundreds of MB.
+            let terms_bytes = &mut self.terms_bytes;
+            let postings = match self.terms.entry(self.scratch.clone()) {
+                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    *terms_bytes += self.scratch.len() + spill::PER_TERM_OVERHEAD;
+                    entry.insert(Vec::new())
+                }
+            };
             let all_valid = finite.is_none() && column.null_count() == 0;
             for row in 0..num_rows {
                 let keep = match &finite {
@@ -1459,6 +2886,7 @@ impl VixWriter {
                     let doc = (first_doc + row as u64) as u32;
                     if postings.last() != Some(&doc) {
                         postings.push(doc);
+                        *terms_bytes += 4;
                     }
                 }
             }
@@ -1490,9 +2918,29 @@ impl VixWriter {
             .map_err(|e| VixError::Writer(format!("docs batch: {e}")))
     }
 
-    fn finish_inner(mut self) -> Result<(VixOutput, VixWriterStats)> {
+    fn finish_inner(mut self) -> Result<(VixOutput, Option<Vec<u8>>, VixWriterStats)> {
         if let Some(error) = &self.init_error {
             return Err(VixError::Writer(error.clone()));
+        }
+        if let Some(run) = &self.encoded_run {
+            return Err(VixError::Writer(format!(
+                "finish with an open encoded docs run ({} rows still owed) — \
+                 finish_docs_encoded_run first",
+                run.remaining
+            )));
+        }
+        // #51c heal: an index built from a detached scan must cover the
+        // stored rows EXACTLY — a shortfall or surplus means the postings'
+        // doc ids misaddress the docs blob (the corruption class the prior
+        // incident taught us to refuse loudly).
+        if let Some(indexed) = self.index_only_rows
+            && indexed != self.row_count
+        {
+            return Err(VixError::Writer(format!(
+                "index-only build indexed {indexed} rows but the docs store holds {} — the \
+                 index's doc ids would misaddress the stored rows; refusing to finish",
+                self.row_count
+            )));
         }
         let row_count = self.row_count;
         let (min_ts, max_ts) = self.ts_range.unwrap_or((0, 0));
@@ -1528,6 +2976,168 @@ impl VixWriter {
         let zone_folder = self.zone_folder.take().expect("created with the encoder");
         encoder.signal_finish()?;
 
+        let (blobs, term_count) = self.assemble_index_blobs(row_count)?;
+        let (sink, docs_size) = encoder.join()?;
+        // Zone table + per-column chunk stats: one `(row_count, ts_min,
+        // ts_max)` entry per docs row-block, folded over the stored
+        // `_timestamp` values windowed by the same `rows_per_chunk` the docs
+        // strategy blocks on, plus the H2 per-column table over the SAME
+        // windows. Cheap (one pass, no blob read-back), derived for EVERY
+        // finish and SPLICED through the passthrough — the move-job build
+        // and the compactor merge both land here.
+        let (zone_map, column_presence, stats_blob, row_regions) = zone_folder.finish();
+
+        // DATA-object properties: everything that describes the stored docs
+        // themselves. Survives index heals (a later milestone rewrites only
+        // the sidecar) by construction.
+        let mut data_properties = vec![
+            (PROP_VERSION.to_string(), VIX_FORMAT_VERSION.to_string()),
+            (PROP_ROW_COUNT.to_string(), row_count.to_string()),
+            (
+                PROP_ROW_GROUP_SIZE.to_string(),
+                self.opts.row_group_size.to_string(),
+            ),
+            // The docs-column field list WITH per-column present-row counts
+            // (field presence is data-descriptive and feeds pruning +
+            // sidecar-less column routing): the docs schema minus the
+            // reserved `_source`/`_original` columns — exactly the set the
+            // fields table types "cs". `_timestamp` is non-null by contract
+            // (count = row_count); a splice from a presence-less input
+            // degrades a column's count to unknown (plain-name entry).
+            (
+                PROP_COLUMNS.to_string(),
+                crate::stats::encode_columns_prop(
+                    &self
+                        .docs_schema
+                        .fields()
+                        .iter()
+                        .map(|field| field.name().as_str())
+                        .filter(|name| {
+                            *name != SOURCE_COL_NAME && *name != ORIGINAL_DATA_COL_NAME
+                        })
+                        .map(|name| {
+                            if name == TIMESTAMP_COL_NAME {
+                                (name.to_string(), Some(row_count))
+                            } else {
+                                (
+                                    name.to_string(),
+                                    column_presence
+                                        .iter()
+                                        .find(|(column, _)| column == name)
+                                        .and_then(|(_, count)| *count),
+                                )
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                )?,
+            ),
+            // #51c-c row order, stamped EXPLICITLY on every file: "ts_desc"
+            // (the storage convention — also what a MISSING property means)
+            // or "concat" (a concatenation-order merge output whose rows are
+            // NOT globally time-sorted; readers disable order-dependent
+            // fast paths for it).
+            (
+                PROP_ROW_ORDER.to_string(),
+                if self.opts.concat_row_order {
+                    ROW_ORDER_CONCAT
+                } else {
+                    ROW_ORDER_TS_DESC
+                }
+                .to_string(),
+            ),
+        ];
+        // Oversize-skip allowance: stamped only when something was skipped
+        // (absent == {} for readers). Data-side: it records what the DATA
+        // holds that the term index does not, so it must survive
+        // sidecar-only rewrites.
+        if !self.oversize_skips.is_empty() {
+            data_properties.push((
+                PROP_OVERSIZE_SKIPS.to_string(),
+                serde_json::to_string(&self.oversize_skips)?,
+            ));
+        }
+        // Only non-empty files get a zone table (an empty file has no chunks
+        // and its decode path already returns the empty result).
+        if !zone_map.is_empty() {
+            data_properties.push((PROP_ZONE_MAP.to_string(), serde_json::to_string(&zone_map)?));
+        }
+        // §4 REGION table: stamped only on concat outputs with a PROVEN
+        // internally-DESC run decomposition (derived from the stored
+        // `_timestamp` values on the decode path, spliced from the inputs'
+        // own tables on the passthrough path). Absent = piecewise order
+        // unknown — readers keep the full-sort path (fail-open).
+        if self.opts.concat_row_order
+            && let Some(regions) = row_regions
+            && !regions.is_empty()
+        {
+            data_properties.push((
+                PROP_ROW_REGIONS.to_string(),
+                serde_json::to_string(&regions)?,
+            ));
+        }
+        // §4 all-present-columns completeness: the caller's assertion that
+        // no `_source` field is missing from the columns list — the license
+        // for absent-column file pruning. Absent = incomplete (fail-open).
+        if self.opts.columns_complete {
+            data_properties.push((PROP_COLUMNS_COMPLETE.to_string(), "true".to_string()));
+        }
+        // H2 per-column chunk stats: a small tail blob (near the footer, so
+        // the eager tail fetch usually covers it). Every NON-EMPTY file
+        // carries one — even with zero qualifying columns (all-sparse
+        // schemas), so stats-era files always splice through the
+        // passthrough; only empty files (no chunks) omit it.
+        let data_blobs: Vec<(&'static str, &'static str, Vec<u8>)> = match stats_blob {
+            Some(blob) if !zone_map.is_empty() => vec![(BLOB_TYPE_STATS, BLOB_TAG_STATS, blob)],
+            _ => Vec::new(),
+        };
+        let output = finish_streamed_container(sink, docs_size, data_properties, data_blobs)?;
+
+        let index_output = self.build_index_sidecar_container(row_count, term_count, blobs)?;
+        let index_size = index_output.as_ref().map_or(0, |bytes| bytes.len() as u64);
+        let oversize_skipped: u64 = self.oversize_skips.values().sum();
+        if oversize_skipped > 0 {
+            // Observability for the accepted-miss trade: these values have
+            // no term, so equality probes for them return nothing from this
+            // file — while the per-field allowance keeps the dictionary
+            // top-k serves eligible (counts omit the skipped values).
+            log::info!(
+                "vix writer: skipped {oversize_skipped} oversize raw value(s) (> {} bytes) from \
+                 the term index without field degrade: {:?}",
+                self.opts.max_raw_term_len,
+                self.oversize_skips
+            );
+        }
+        let stats = VixWriterStats {
+            row_count,
+            term_count,
+            index_size,
+            docs_size,
+            oversize_skipped,
+            min_ts,
+            max_ts,
+        };
+        Ok((output, index_output, stats))
+    }
+
+    /// Build the INDEX-side blobs (terms/plist/dict + per-file blooms) from
+    /// this writer's accumulated term + bloom state over `row_count` doc
+    /// ids. Shared by [`Self::finish_inner`] (coupled docs+index build) and
+    /// [`Self::finish_index_sidecar`] (sidecar-only heal) so the two emit
+    /// byte-identical index blobs for the same pushes.
+    ///
+    /// Assembles the SIDECAR blob list (format "3": the data object carries
+    /// ONLY `docs`; every index blob lives in the `.vxi` sidecar). Empty
+    /// dict/terms tables are omitted entirely; the reader treats a missing
+    /// `dict`/`terms` pair as "no terms". Blob order clusters the small,
+    /// hot blobs (`dict` block index, `bloom`) at the TAIL, next to the
+    /// footer, so the eager tail fetch of a cold sidecar open covers them
+    /// in one read. Readers locate blobs by tag, so order carries no
+    /// meaning.
+    #[allow(clippy::type_complexity)]
+    fn assemble_index_blobs(
+        &mut self,
+        row_count: u64,
+    ) -> Result<(Vec<(&'static str, &'static str, BlobPart)>, u64)> {
         let (index_blobs, term_count, bloom_acc) = match self.merged_index.take() {
             Some(prebuilt) => {
                 if !self.terms.is_empty() {
@@ -1542,103 +3152,327 @@ impl VixWriter {
                         prebuilt.expected_rows
                     )));
                 }
-                (prebuilt.blobs, prebuilt.term_count, prebuilt.bloom)
+                (
+                    prebuilt.blobs.map(IndexBlobParts::from),
+                    prebuilt.term_count,
+                    prebuilt.bloom,
+                )
             }
             None => {
-                // Stream the globally sorted terms once through the sink,
-                // which cuts postings row blocks by byte budget and
+                // #52/M7 first-encode AUTO demotion: with the full term map
+                // accumulated (and not spilled), per-field distinct counts
+                // are exact — apply the shared AUTO rule BEFORE any blob or
+                // bloom assembly, so a demoted-at-birth field produces the
+                // identical sidecar a construction-list demotion would.
+                self.auto_demote_bloom_only_at_finish(row_count);
+                // Stream the globally sorted terms through the sink(s),
+                // which cut postings row blocks by byte budget and
                 // dictionary row groups by raw-term-byte budget. With spill
                 // runs (a budget-crossing rebuild), the runs and the final
                 // resident map k-way merge here in the same order — the
                 // sink sees the identical term stream either way, so the
                 // blobs are byte-identical to the unspilled path.
+                //
+                // M17 item 4: the UNSPILLED map (keys in memory — exact
+                // split, no sampling risk) is range-partitioned at REAL key
+                // quantiles snapped to FIELD boundaries and built by up to
+                // `merge_kway_threads` workers, one TermSink per range —
+                // postings encode + dict-block build + bloom hashing were
+                // the serial dominator of a gen-1 rebuild once the docs
+                // re-encode was gone. Field-boundary bounds keep the dict
+                // region byte-identical (the sequential sink also cuts
+                // blocks at every field change) and the re-cutting assembly
+                // ([`write_index_blobs_recut`]) restores the terms blob's
+                // continuous row-block accumulation, so the sidecar is
+                // BYTE-IDENTICAL for any worker count (pinned R=1 vs R=8);
+                // per-range bloom accumulators merge by set union (the M12
+                // pattern, byte-identical SBBF).
                 let bloom_pairs: Vec<(u16, String)> = self
                     .opts
                     .bloom_field_names
                     .iter()
                     .filter_map(|n| self.term_field_ids.get(n).map(|id| (*id, n.clone())))
+                    // #52: bloom-only fields have no terms — tracking them
+                    // per-field would publish an EMPTY (reject-all) filter
+                    // and wrongly drop; the composite carries their values
+                    .filter(|(id, _)| !self.bloom_only.contains_key(id))
                     .collect();
-                let mut sink = TermSink::new(self.opts.postings_chunk_bytes)
-                    .with_bloom(crate::bloom::BloomHashAcc::from_pairs(bloom_pairs))
-                    .with_plist_min_docs(self.opts.postings_plist_min_docs);
-                // The sink owns the cell policy (see [`TermSink::push_ids`]):
-                // dense elision first (a term in every doc keeps the empty
-                // cell), then the out-of-row plist threshold, then inline.
-                let mut emit = |key: &[u8], ids: Vec<u32>| -> Result<()> {
-                    sink.push_ids(key, &ids, row_count)
+                let composite_pairs = self.composite_pairs();
+                // #48: one reserved section covering (field name, value)
+                // for every ELIGIBLE term field — any-field equality
+                // pruning (see [`Self::composite_pairs`] for what
+                // eligibility excludes and why). #52 bloom-only fields'
+                // push-time hashes fold in AFTER the blob build (below).
+                let postings_chunk_bytes = self.opts.postings_chunk_bytes;
+                let plist_min_docs = self.opts.postings_plist_min_docs;
+                let encode_threads = self.opts.encode_threads;
+                let kway_threads = self.opts.merge_kway_threads;
+                let make_acc = || {
+                    let mut acc = crate::bloom::BloomHashAcc::from_pairs(bloom_pairs.clone());
+                    if !composite_pairs.is_empty() {
+                        acc.enable_composite(composite_pairs.iter().cloned());
+                    }
+                    acc
                 };
+                let make_sink = || {
+                    TermSink::new(postings_chunk_bytes)
+                        .with_bloom(make_acc())
+                        .with_plist_min_docs(plist_min_docs)
+                };
+                // the `terms` blob's schema (mirrors TermSink::new's)
+                let terms_blob_schema: SchemaRef = Arc::new(Schema::new(vec![
+                    Field::new("doc_count", DataType::UInt32, false),
+                    Field::new("postings", DataType::Binary, false),
+                ]));
                 let resident = std::mem::take(&mut self.terms);
                 self.terms_bytes = 0;
-                match self.term_spill.take() {
+                let (blobs, count, bloom) = match self.term_spill.take() {
                     None => {
-                        for (key, ids) in resident {
-                            emit(&key, ids)?;
+                        let threads = if encode_threads == 0 {
+                            std::thread::available_parallelism().map_or(1, |n| n.get())
+                        } else {
+                            encode_threads
+                        };
+                        let kway = if kway_threads == 0 {
+                            std::thread::available_parallelism()
+                                .map_or(1, |n| n.get())
+                                .min(8)
+                        } else {
+                            kway_threads
                         }
+                        .min(threads);
+                        // over-partition 4x and let workers pull ranges off
+                        // a shared cursor (field-boundary snapping skews
+                        // range sizes — same treatment as the k-way merge)
+                        let bounds = if kway > 1 {
+                            rebuild_partition_bounds(&resident, kway.saturating_mul(4))
+                        } else {
+                            Vec::new()
+                        };
+                        let (index, count, bloom) = if bounds.is_empty() {
+                            // sequential: exactly the pre-M17 path
+                            let mut sink = make_sink();
+                            for (key, ids) in &resident {
+                                sink.push_ids(key, ids, row_count)?;
+                            }
+                            write_index_blobs(vec![sink.into_parts()?], encode_threads)?
+                        } else {
+                            let started = std::time::Instant::now();
+                            use std::{
+                                ops::Bound,
+                                sync::{
+                                    Mutex,
+                                    atomic::{AtomicUsize, Ordering},
+                                },
+                            };
+                            type Range<'b> = (Option<&'b [u8]>, Option<&'b [u8]>);
+                            let mut ranges: Vec<Range<'_>> = Vec::with_capacity(bounds.len() + 1);
+                            {
+                                let mut lower: Option<&[u8]> = None;
+                                for bound in &bounds {
+                                    ranges.push((lower, Some(bound.as_slice())));
+                                    lower = Some(bound.as_slice());
+                                }
+                                ranges.push((lower, None));
+                            }
+                            let next = AtomicUsize::new(0);
+                            let slots: Vec<Mutex<Option<Result<TermSinkParts>>>> =
+                                (0..ranges.len()).map(|_| Mutex::new(None)).collect();
+                            let resident_ref = &resident;
+                            let workers = kway.min(ranges.len());
+                            std::thread::scope(|scope| {
+                                for _ in 0..workers {
+                                    scope.spawn(|| {
+                                        loop {
+                                            let index = next.fetch_add(1, Ordering::Relaxed);
+                                            let Some(&(lower, upper)) = ranges.get(index) else {
+                                                break;
+                                            };
+                                            let mut sink = make_sink();
+                                            let range = (
+                                                lower.map_or(Bound::Unbounded, |b| {
+                                                    Bound::Included(b.to_vec())
+                                                }),
+                                                upper.map_or(Bound::Unbounded, |b| {
+                                                    Bound::Excluded(b.to_vec())
+                                                }),
+                                            );
+                                            let result = (|| -> Result<TermSinkParts> {
+                                                for (key, ids) in resident_ref.range(range) {
+                                                    sink.push_ids(key, ids, row_count)?;
+                                                }
+                                                sink.into_parts()
+                                            })();
+                                            let failed = result.is_err();
+                                            *slots[index].lock().expect("range slot poisoned") =
+                                                Some(result);
+                                            if failed {
+                                                break;
+                                            }
+                                        }
+                                    });
+                                }
+                            });
+                            let mut parts = Vec::with_capacity(slots.len());
+                            let mut first_error = None;
+                            for slot in slots {
+                                match slot.into_inner().expect("range slot poisoned") {
+                                    Some(Ok(part)) => parts.push(part),
+                                    Some(Err(e)) => {
+                                        first_error.get_or_insert(e);
+                                    }
+                                    None => {}
+                                }
+                            }
+                            if let Some(e) = first_error {
+                                return Err(e);
+                            }
+                            log::debug!(
+                                "vix rebuild: parallel index-blob build ({} ranges, {workers} \
+                                 workers) in {:?}",
+                                ranges.len(),
+                                started.elapsed()
+                            );
+                            write_index_blobs_recut(parts, postings_chunk_bytes, encode_threads)?
+                        };
+                        (index.map(IndexBlobParts::from), count, bloom)
                     }
                     Some(spilled) => {
-                        log::debug!(
-                            "vix rebuild: k-way merging {} term spill runs + resident map",
-                            spilled.run_count(),
-                        );
+                        // spilled maps stream from disk in one key order —
+                        // stays sequential (the in-memory partitioning above
+                        // has no exact split points to offer).
+                        //
+                        // A budget-crossing rebuild's term stream is
+                        // proportional to the group's TOTAL distinct-term
+                        // vocabulary, so NOTHING vocabulary-sized may
+                        // accumulate here: the sink's byte regions spool to
+                        // unlinked temp files on the spill volume, closed
+                        // term batches stream into an incremental vortex
+                        // terms-blob writer (byte-identical to the one-shot
+                        // write_vortex_blob for the same batch sequence —
+                        // same pushes, same strategy), and the container
+                        // assembly later streams the spooled blobs back
+                        // (build_container_parts). Resident peak: the term
+                        // map remnant + one open batch + the final
+                        // container buffer, instead of ~3x the index size.
+                        let spool_dir = self
+                            .opts
+                            .term_spill_dir
+                            .clone()
+                            .expect("a spilled map implies term_spill_dir");
+                        let mut sink = make_sink().with_spool(&spool_dir)?;
+                        let mut spooler =
+                            TermsBlobSpooler::spawn(&spool_dir, Arc::clone(&terms_blob_schema))?;
                         let (runs, _spill_dir) = spilled.into_run_readers()?;
-                        spill::merge_spilled_terms(runs, resident, |key, ids| emit(&key, ids))?;
+                        spill::merge_spilled_terms(runs, resident, |key, ids| {
+                            sink.push_ids(&key, &ids, row_count)?;
+                            for batch in sink.take_closed_batches() {
+                                spooler.push(batch)?;
+                            }
+                            Ok(())
+                        })?;
+                        let parts = sink.into_spooled_parts()?;
+                        for batch in parts.tail_batches {
+                            spooler.push(batch)?;
+                        }
+                        if parts.term_count == 0 {
+                            // unreachable in practice (a spill run implies
+                            // terms), kept for parity with write_index_blobs
+                            drop(spooler);
+                            (None, 0, parts.bloom)
+                        } else {
+                            let terms = spooler.finish()?;
+                            // single sink: offsets/ordinals are global as-is
+                            let mut index = crate::dict_blocks::IndexBuilder::new();
+                            for (first_key, offset, first_ordinal) in &parts.dict_meta {
+                                index.push_block(first_key, *offset, *first_ordinal)?;
+                            }
+                            (
+                                Some(IndexBlobParts {
+                                    dict: index.finish(),
+                                    dict_blocks: parts.dict_blocks,
+                                    terms,
+                                    plist: parts.plist,
+                                }),
+                                parts.term_count,
+                                parts.bloom,
+                            )
+                        }
                     }
-                }
-                write_index_blobs(vec![sink.into_parts()?], self.opts.encode_threads)?
+                };
+                (blobs, count, bloom)
             }
         };
 
-        // Assemble the blobs appended after the streamed docs blob. Empty
-        // dict/terms tables are omitted entirely; the reader treats a
-        // missing `dict`/`terms` pair as "no terms". The `docs` blob always
-        // exists — even for an empty file it defines the stored schema
-        // (`_timestamp` + `_source` at minimum).
-        let mut blobs: Vec<(&'static str, &'static str, Vec<u8>)> = Vec::new();
-        let mut index_size = 0u64;
+        let mut blobs: Vec<(&'static str, &'static str, BlobPart)> = Vec::new();
         if let Some(index) = index_blobs {
-            index_size = (index.dict.len() + index.dict_blocks.len() + index.terms.len()) as u64;
-            blobs.push((BLOB_TYPE_DICT, BLOB_TAG_DICT, index.dict));
+            blobs.push((BLOB_TYPE_TERMS, BLOB_TAG_TERMS, index.terms));
+            // The out-of-row postings region: RAW concatenated
+            // `encode_record` bytes (pointer-addressed, deliberately not a
+            // Vortex file), present only when at least one pointer cell
+            // exists.
+            if let Some(plist) = index.plist {
+                blobs.push((BLOB_TYPE_PLIST, BLOB_TAG_PLIST, plist));
+            }
             blobs.push((
                 BLOB_TYPE_DICT_BLOCKS,
                 BLOB_TAG_DICT_BLOCKS,
                 index.dict_blocks,
             ));
-            blobs.push((BLOB_TYPE_TERMS, BLOB_TAG_TERMS, index.terms));
-            // The out-of-row postings region: RAW concatenated
-            // `encode_record` bytes (pointer-addressed, deliberately not a
-            // Vortex file), present only when at least one pointer cell
-            // exists. Index data, so it counts into `index_size`.
-            if let Some(plist) = index.plist {
-                index_size += plist.len() as u64;
-                blobs.push((BLOB_TYPE_PLIST, BLOB_TAG_PLIST, plist));
-            }
+            blobs.push((BLOB_TYPE_DICT, BLOB_TAG_DICT, BlobPart::Mem(index.dict)));
         }
         // Per-file value blooms (byproduct of term emission, both paths).
-        // Counted into index_size: the blob is index data, and file_list's
-        // `index_size > 0` is the bloom-queue eligibility filter.
-        let file_blooms = bloom_acc.build(self.opts.bloom_fpp);
+        // #52: fold bloom-only values in for BOTH build and merge modes —
+        // build mode observed them at push time; merge mode hashed them off
+        // the streamed docs columns (the only source that exists when the
+        // inputs were already bloom-only). Hashes drain; entries stay for
+        // field_entries typing.
+        let mut bloom_acc = bloom_acc;
+        for (fid, (name, hashes)) in self.bloom_only.iter_mut() {
+            bloom_acc.absorb_composite_hashes(*fid, name, std::mem::take(hashes));
+        }
+        let bloom_started = std::time::Instant::now();
+        // M12: the composite section over a big merge holds tens of millions
+        // of hashes — parallel bit-setting under the encode budget
+        // (byte-identical to sequential for any thread count)
+        let file_blooms = bloom_acc.build_threaded(self.opts.bloom_fpp, self.opts.encode_threads);
         if !file_blooms.is_empty() {
             let bloom_blob = crate::bloom::serialize_file_blooms(&file_blooms)?;
-            index_size += bloom_blob.len() as u64;
-            blobs.push((BLOB_TYPE_BLOOM, BLOB_TAG_BLOOM, bloom_blob));
+            log::debug!(
+                "vix finish: SBBF bloom build {:?} ({} sections, {} bytes)",
+                bloom_started.elapsed(),
+                file_blooms.len(),
+                bloom_blob.len()
+            );
+            blobs.push((BLOB_TYPE_BLOOM, BLOB_TAG_BLOOM, BlobPart::Mem(bloom_blob)));
         }
-        let (sink, docs_size) = encoder.join()?;
-        // Zone table: one `(row_count, ts_min, ts_max)` entry per docs
-        // row-block, folded over the stored `_timestamp` values windowed by
-        // the same `rows_per_chunk` the docs strategy blocks on. Cheap (one
-        // i64 pass, no blob read-back) and derived for EVERY finish — the
-        // move-job build and the compactor merge both land here, so a merged
-        // file re-derives it naturally.
-        let zone_map = zone_folder.finish();
+        Ok((blobs, term_count))
+    }
 
-        let mut properties = vec![
+    /// Assemble the `.vxi` INDEX-sidecar container. Emitted IFF the file is
+    /// indexed by design: #40/#42 index-off builds produce NO sidecar
+    /// (index_size = 0 — the file_list marker warmup and the bloom queue
+    /// key on), while an indexed file ALWAYS gets one, even with an
+    /// empty dictionary — its `fields` table still types the term plan,
+    /// so dictionary-absence proofs stay valid (term_count == 0 proves
+    /// absence on an indexed file; without a sidecar nothing does).
+    fn build_index_sidecar_container(
+        &self,
+        row_count: u64,
+        term_count: u64,
+        blobs: Vec<(&'static str, &'static str, BlobPart)>,
+    ) -> Result<Option<Vec<u8>>> {
+        if !self.opts.index_enabled {
+            debug_assert!(blobs.is_empty(), "an index-off writer produced index blobs");
+            return Ok(None);
+        }
+        let mut index_properties = vec![
             (PROP_VERSION.to_string(), VIX_FORMAT_VERSION.to_string()),
+            // Stamped on BOTH objects: readers verify the pair agrees,
+            // catching a sidecar mispaired with a foreign data object
+            // before its postings misaddress the stored rows.
             (PROP_ROW_COUNT.to_string(), row_count.to_string()),
             (PROP_TERM_COUNT.to_string(), term_count.to_string()),
-            (
-                PROP_ROW_GROUP_SIZE.to_string(),
-                self.opts.row_group_size.to_string(),
-            ),
             (
                 PROP_FIELDS.to_string(),
                 serde_json::to_string(&self.field_entries())?,
@@ -1649,37 +3483,130 @@ impl VixWriter {
             ),
             (PROP_TOKENIZER.to_string(), TOKENIZER_ID.to_string()),
             (PROP_DICT_LAYOUT.to_string(), DICT_LAYOUT_BLOCKS.to_string()),
-            // Stamped unconditionally: readers hard-error on an absent or
-            // foreign key_layout instead of silently misreading the
-            // field-major dictionary (container::require_supported_format).
+            // Stamped unconditionally: readers hard-error on an absent
+            // or foreign key_layout instead of silently misreading the
+            // field-major dictionary
+            // (container::require_supported_index_format).
             (PROP_KEY_LAYOUT.to_string(), KEY_LAYOUT_FID_V2.to_string()),
         ];
         // Plist capability marker: written IFF the feature was enabled.
         // Present ⇒ pointer cells may exist and `doc_count >= threshold`
         // selects them; absent ⇒ every postings cell is inline. Written
-        // even when no term crossed the threshold (no `plist` blob then) —
-        // capability, not blob presence, is what the reader dispatches on.
+        // even when no term crossed the threshold (no `plist` blob then)
+        // — capability, not blob presence, is what the reader
+        // dispatches on.
         if self.opts.postings_plist_min_docs > 0 {
-            properties.push((
+            index_properties.push((
                 PROP_PLIST_MIN_DOCS.to_string(),
                 self.opts.postings_plist_min_docs.to_string(),
             ));
         }
-        // Only non-empty files get a zone table (an empty file has no chunks
-        // and its decode path already returns the empty result).
-        if !zone_map.is_empty() {
-            properties.push((PROP_ZONE_MAP.to_string(), serde_json::to_string(&zone_map)?));
+        Ok(Some(build_container_parts(index_properties, blobs)?))
+    }
+
+    /// Sidecar-only heal (M3, DESIGN-V2 §5): finish ONLY the `.vxi` index
+    /// sidecar over rows fed through the index-only pushes, verifying the
+    /// scan covered `expected_rows` EXACTLY — the row count of the
+    /// UNTOUCHED data object, so the postings' doc ids address its stored
+    /// rows by construction. No docs store is assembled and no data-object
+    /// bytes exist: staging any docs row is a misuse and errors.
+    ///
+    /// Returns the sidecar container bytes plus stats (`index_size` = the
+    /// new `FileMeta::index_size`; `docs_size`/`min_ts`/`max_ts` are 0 —
+    /// the data object's row metadata is unchanged by a heal).
+    pub fn finish_index_sidecar(
+        mut self,
+        expected_rows: u64,
+    ) -> anyhow::Result<(Vec<u8>, VixWriterStats)> {
+        if let Some(error) = &self.init_error {
+            return Err(VixError::Writer(error.clone()).into());
         }
-        let output = finish_streamed_container(sink, docs_size, properties, blobs)?;
+        if !self.opts.index_enabled {
+            return Err(VixError::Writer(
+                "finish_index_sidecar on an index-off writer (an index-off plan has no sidecar \
+                 to rebuild)"
+                    .to_string(),
+            )
+            .into());
+        }
+        if self.merged_index.is_some() {
+            return Err(VixError::Writer(
+                "finish_index_sidecar on a merge-mode writer".to_string(),
+            )
+            .into());
+        }
+        if self.row_count > 0 || self.encoded_run.is_some() {
+            return Err(VixError::Writer(format!(
+                "finish_index_sidecar with {} staged docs rows — the sidecar-only heal never \
+                 rewrites the data object",
+                self.row_count
+            ))
+            .into());
+        }
+        let indexed = self.index_only_rows.unwrap_or(0);
+        if indexed != expected_rows {
+            return Err(VixError::Writer(format!(
+                "index-only scan covered {indexed} rows but the data object stores \
+                 {expected_rows} — the postings' doc ids would misaddress the stored rows; \
+                 refusing to finish"
+            ))
+            .into());
+        }
+        let (blobs, term_count) = self.assemble_index_blobs(expected_rows)?;
+        let container = self
+            .build_index_sidecar_container(expected_rows, term_count, blobs)?
+            .expect("index-enabled writers always produce a sidecar");
+        let oversize_skipped: u64 = self.oversize_skips.values().sum();
         let stats = VixWriterStats {
-            row_count,
+            row_count: expected_rows,
             term_count,
-            index_size,
-            docs_size,
-            min_ts,
-            max_ts,
+            index_size: container.len() as u64,
+            docs_size: 0,
+            oversize_skipped,
+            min_ts: 0,
+            max_ts: 0,
         };
-        Ok((output, stats))
+        Ok((container, stats))
+    }
+
+    /// Per-field oversize-skip counts accumulated by this writer's pushes
+    /// (what would become the `oversize_skips` DATA-object property). The
+    /// sidecar-only heal compares this against the stored file's existing
+    /// allowance: a NEWLY skipped field cannot be recorded on the untouched
+    /// data object, so such a heal must fall back to the docs rewrite.
+    pub fn oversize_skips(&self) -> &BTreeMap<String, u64> {
+        &self.oversize_skips
+    }
+
+    /// #48: the composite-bloom coverage set — `(field id, name)` for every
+    /// term field whose dictionary holds its COMPLETE raw values. Empty when
+    /// the option is off. Exclusions are correctness, not tuning: the
+    /// composite's guard keys tell the pruner "a value miss on this field is
+    /// authoritative", so
+    ///
+    /// - fts fields are out (their dictionary entries are TOKENS — probing a raw value against
+    ///   tokens would read "definitely not" for values the file holds), and
+    /// - merge-demoted fields are out (some input carried rows without term capability, so the
+    ///   merged dictionary's values are incomplete).
+    ///
+    /// The reader-side equivalent ([`crate::VixReader::term_fields`]) is
+    /// already this set — its map only holds `term`-typed entries.
+    fn composite_pairs(&self) -> Vec<(u16, String)> {
+        if !self.opts.bloom_composite {
+            return Vec::new();
+        }
+        self.term_field_ids
+            .iter()
+            .filter(|(name, _)| {
+                !self.fts_fields.contains(*name)
+                    && !self.demoted_fields.contains(*name)
+                    // non-string value terms are canonical-tagged bytes the
+                    // pruner's raw-literal probe can never match — coverage
+                    // would turn every such miss into a wrong drop
+                    && !self.non_string_term_fields.contains(*name)
+            })
+            .map(|(name, id)| (*id, name.clone()))
+            .collect()
     }
 
     /// The `fields` property: value-indexed fields first (array index ==
@@ -1703,6 +3630,13 @@ impl VixWriter {
                     vec![FIELD_TYPE_FTS.to_string()]
                 } else if self.demoted_fields.contains(name) {
                     Vec::new()
+                } else if self
+                    .term_field_ids
+                    .get(name)
+                    .is_some_and(|id| self.bloom_only.contains_key(id))
+                {
+                    // #52: values in the composite bloom + docs columns only
+                    vec![FIELD_TYPE_BLOOM.to_string()]
                 } else {
                     vec![FIELD_TYPE_TERM.to_string()]
                 };
@@ -1732,13 +3666,12 @@ impl VixWriter {
     }
 }
 
-/// Streaming builder of the `_timestamp` zone table: one `(row_count,
+/// Streaming builder of the `_timestamp` zone table — one `(row_count,
 /// ts_min, ts_max)` entry per `rows_per_chunk`-sized window of the stored
-/// rows, in push order — the same windowing the `docs` strategy blocks the
-/// blob on ([`docs_strategy`]/[`docs_rows_per_chunk`]), so an entry lines up
-/// with a docs row-block. Folded from the stored `_timestamp` values (pinned
-/// non-null `i64` in the docs schema) as the batches stream to the encoder —
-/// no blob read-back, no batch retention.
+/// rows, in push order — PLUS the per-column chunk-stats table (H2, DESIGN
+/// §4), folded over the SAME windows so stats entry `i` covers exactly zone
+/// entry `i`'s rows. Folded as the batches stream to the encoder — no blob
+/// read-back, no batch retention.
 ///
 /// The reader never needs the entries to match the *projected* `_timestamp`
 /// read's physical chunks (that read coalesces to ~1 MiB ≈ many blocks): the
@@ -1752,17 +3685,68 @@ struct ZoneMapFolder {
     count: u64,
     ts_min: i64,
     ts_max: i64,
+    stats: ColumnStatsFolder,
+    /// §4 REGION-table tracker (tracked only for concat outputs): row counts
+    /// of the file's maximal internally-`_timestamp`-DESC runs, in stored
+    /// order. Decoded rows extend/split runs by VALUE (an increase vs the
+    /// previous stored row starts a new region — exact, whatever order the
+    /// caller pushed); spliced encoded runs append the caller-declared
+    /// decomposition. `None` = poisoned (an input without a proven
+    /// decomposition, or the cap): the property is omitted, fail-open.
+    regions: Option<Vec<u64>>,
+    /// Rows in the currently open decoded run.
+    region_rows: u64,
+    /// `_timestamp` of the last stored row of the open decoded run.
+    region_last_ts: Option<i64>,
+    track_regions: bool,
 }
 
+/// Writer-side cap on tracked regions: a decomposition wider than this is
+/// dropped (the property is omitted). Bounds the property size and the
+/// pathological fully-unsorted case (every row its own region).
+const WRITER_REGION_CAP: usize = 4096;
+
 impl ZoneMapFolder {
-    fn new(rows_per_chunk: usize) -> Self {
+    fn new(
+        rows_per_chunk: usize,
+        docs_schema: &Schema,
+        stats_min_density: f64,
+        stats_max_bytes: usize,
+        track_regions: bool,
+    ) -> Self {
         Self {
             rows_per_chunk,
             entries: Vec::new(),
             count: 0,
             ts_min: i64::MAX,
             ts_max: i64::MIN,
+            stats: ColumnStatsFolder::new(
+                docs_schema,
+                &[TIMESTAMP_COL_NAME, SOURCE_COL_NAME, ORIGINAL_DATA_COL_NAME],
+                stats_min_density,
+                stats_max_bytes,
+            ),
+            regions: track_regions.then(Vec::new),
+            region_rows: 0,
+            region_last_ts: None,
+            track_regions,
         }
+    }
+
+    /// Close the open decoded desc run into one region entry.
+    fn close_open_region(&mut self) {
+        if self.region_rows == 0 {
+            return;
+        }
+        if let Some(regions) = self.regions.as_mut() {
+            if regions.len() >= WRITER_REGION_CAP {
+                self.regions = None; // poisoned: too fragmented to describe
+            } else {
+                regions.push(self.region_rows);
+            }
+        }
+        self.region_rows = 0;
+        self.region_last_ts = None;
     }
 
     fn fold(&mut self, batch: &RecordBatch) -> Result<()> {
@@ -1785,57 +3769,313 @@ impl ZoneMapFolder {
                 "internal: _timestamp has null rows; cannot bound its zone".to_string(),
             ));
         }
-        for &value in values.values() {
-            self.ts_min = self.ts_min.min(value);
-            self.ts_max = self.ts_max.max(value);
-            self.count += 1;
+        // window-sliced folding: the zone bounds and the per-column stats
+        // advance over identical row windows
+        let rows = batch.num_rows();
+        let mut offset = 0usize;
+        while offset < rows {
+            let space = self.rows_per_chunk - self.count as usize;
+            let take = space.min(rows - offset);
+            for &value in &values.values()[offset..offset + take] {
+                self.ts_min = self.ts_min.min(value);
+                self.ts_max = self.ts_max.max(value);
+                // §4 region tracking: an INCREASE vs the previous stored row
+                // ends the open desc run (equal timestamps continue it)
+                if self.track_regions && self.regions.is_some() {
+                    if let Some(last) = self.region_last_ts
+                        && value > last
+                    {
+                        self.close_open_region();
+                    }
+                    self.region_rows += 1;
+                    self.region_last_ts = Some(value);
+                }
+            }
+            self.stats.fold_window(batch, offset, take);
+            self.count += take as u64;
+            offset += take;
             if self.count as usize == self.rows_per_chunk {
-                self.entries.push((self.count, self.ts_min, self.ts_max));
-                self.count = 0;
-                self.ts_min = i64::MAX;
-                self.ts_max = i64::MIN;
+                self.close_window();
             }
         }
         Ok(())
     }
 
-    fn finish(mut self) -> Vec<ZoneEntry> {
-        if self.count > 0 {
-            self.entries.push((self.count, self.ts_min, self.ts_max));
+    /// Close the open window into one zone entry + one stats row per
+    /// column (a short entry is valid — readers only require each entry to
+    /// bound its own contiguous row range and the entries to cover every
+    /// row in order).
+    fn close_window(&mut self) {
+        if self.count == 0 {
+            return;
         }
-        self.entries
+        self.entries.push((self.count, self.ts_min, self.ts_max));
+        self.stats.close_window(self.count);
+        self.count = 0;
+        self.ts_min = i64::MAX;
+        self.ts_max = i64::MIN;
+    }
+
+    /// #51c: close the open window early so entries spliced from a
+    /// passthrough input can follow in row order.
+    fn flush_open_window(&mut self) {
+        self.close_window();
+    }
+
+    /// #51c: splice a passthrough input's zone entries VERBATIM — the rows
+    /// they describe are appended next, in the same order, so each entry
+    /// keeps bounding its own contiguous row range — together with the
+    /// input's per-column chunk stats (aligned 1:1 with the entries; a
+    /// column the input lacks contributes zero-presence rows, a stats-less
+    /// column contributes UNKNOWN rows). The caller flushes the open window
+    /// first and has validated the entries against the run.
+    ///
+    /// `run_regions` (§4): the run's proven internally-DESC decomposition
+    /// (row counts, validated by the caller to sum to the run) — appended
+    /// to the region table; `None` = no proven decomposition, which POISONS
+    /// the table (the property is omitted; readers fail open to the full
+    /// sort). A spliced run never merges into the preceding region — the
+    /// tracker cannot prove cross-boundary order without decoding.
+    fn append_spliced(
+        &mut self,
+        entries: &[ZoneEntry],
+        spliced: &SpliceableStats,
+        run_regions: Option<&[u64]>,
+    ) {
+        debug_assert_eq!(self.count, 0, "flush_open_window before splicing");
+        if self.track_regions {
+            self.close_open_region();
+            match (run_regions, self.regions.as_mut()) {
+                (Some(runs), Some(regions)) => {
+                    if regions.len() + runs.len() > WRITER_REGION_CAP {
+                        self.regions = None;
+                    } else {
+                        regions.extend_from_slice(runs);
+                    }
+                }
+                (None, Some(_)) => self.regions = None,
+                _ => {}
+            }
+        }
+        let rows: u64 = entries.iter().map(|(rows, ..)| rows).sum();
+        self.entries.extend_from_slice(entries);
+        self.stats.append_spliced(entries.len(), rows, spliced);
+    }
+
+    /// Close out: the zone table, the per-column file presence counts, the
+    /// serialized `stats` blob (`None` when no column qualified) and the §4
+    /// region table (`None` unless tracked and proven).
+    #[allow(clippy::type_complexity)]
+    fn finish(
+        mut self,
+    ) -> (
+        Vec<ZoneEntry>,
+        Vec<(String, Option<u64>)>,
+        Option<Vec<u8>>,
+        Option<Vec<u64>>,
+    ) {
+        self.close_window();
+        self.close_open_region();
+        let (presence, blob) = self.stats.finish();
+        (self.entries, presence, blob, self.regions.take())
     }
 }
 
+/// #51c: `None` when two arrow docs schemas describe the SAME stored docs
+/// blob shape — names, order, nullability and STORED types all equal;
+/// otherwise the first difference, named. The comparison happens at the
+/// vortex dtype level because the stored blob erases arrow representation
+/// choices (`Utf8`, `LargeUtf8` and `Utf8View` all store as vortex `Utf8`,
+/// and a file read back reports the VIEW form): two files whose docs dtypes
+/// are equal hold interchangeable encoded chunks, which is exactly the
+/// passthrough requirement.
+pub fn docs_schema_mismatch_reason(input: &Schema, output: &Schema) -> Option<String> {
+    use vortex::{arrow::FromArrowType, dtype::DType};
+    if DType::from_arrow(input) == DType::from_arrow(output) {
+        return None;
+    }
+    if input.fields().len() != output.fields().len() {
+        return Some(format!(
+            "docs schema has {} columns, the output stores {} (passthrough requires exact \
+             schema identity)",
+            input.fields().len(),
+            output.fields().len()
+        ));
+    }
+    for (theirs, ours) in input.fields().iter().zip(output.fields()) {
+        if theirs.name() != ours.name()
+            || DType::from_arrow(theirs.as_ref()) != DType::from_arrow(ours.as_ref())
+        {
+            return Some(format!(
+                "docs column {:?} ({}, nullable {}) does not match the output column {:?} \
+                 ({}, nullable {})",
+                theirs.name(),
+                theirs.data_type(),
+                theirs.is_nullable(),
+                ours.name(),
+                ours.data_type(),
+                ours.is_nullable()
+            ));
+        }
+    }
+    Some("docs schemas store different dtypes".to_string())
+}
+
 /// Rows per `docs`-blob chunk: the uncompressed-byte budget divided by the
-/// average row's bytes, clamped to `[64, 65536]`. Computed over the sample
-/// batches ([`DOCS_ENCODE_SAMPLE_BYTES`]) that lock the streaming encoder's
-/// chunking.
+/// average row's PRESENT-VALUE bytes, clamped to `[64, max_rows]` (the
+/// [`VixWriterOptions::docs_chunk_max_rows`] ceiling; `0` = the historical
+/// 65,536). Computed over the sample batches ([`DOCS_ENCODE_SAMPLE_BYTES`])
+/// that lock the streaming encoder's chunking.
 ///
-/// The average uses arrow's in-memory size (buffers incl. offsets/validity)
-/// as the uncompressed-bytes heuristic. The blob's chunks are the
-/// decompression unit of a matched-row point read, so they follow this byte
-/// budget instead of the data file's row-group row count (with ~KB `_source`
-/// rows, a 128Ki-row chunk would make every point read decode hundreds of
-/// MB). The floor is 64 rows so the budget governs wide rows too (a
-/// 1024-row floor used to force ~4 MiB decodes for ~4 KiB rows regardless
-/// of a smaller budget); vortex's own pipeline still coalesces sub-1 MiB
-/// chunks up to ~1 MiB (multiples of this row count), which bounds the
-/// effective decode unit from below. An empty file (schema-only blob)
-/// keeps vortex's default chunking.
-fn docs_rows_per_chunk(budget_bytes: usize, batches: &[RecordBatch]) -> usize {
+/// H1 (DESIGN §3): the row weight is the sum of the row's NON-NULL value
+/// byte lengths plus [`PRESENT_VALUE_OVERHEAD_BYTES`] per present value —
+/// never whole-row arrow width. A null slot costs nothing: sparse column
+/// data is null-suppressed at encode time, so present bytes are the honest
+/// proxy for decoded chunk weight, and a 1,500-column mostly-null schema
+/// sizes exactly like a narrow schema carrying the same values (the
+/// historical failure: 2,557 nullable Utf8 columns ≈ 10.5 KiB/row of arrow
+/// padding even all-null collapsed rows-per-chunk and multiplied every
+/// per-chunk stats table by the shrunken chunk size).
+///
+/// The blob's chunks are the decompression unit of a matched-row point
+/// read, so they follow this byte budget instead of the data file's
+/// row-group row count (with ~KB `_source` rows, a 128Ki-row chunk would
+/// make every point read decode hundreds of MB). The floor is 64 rows so
+/// the budget governs wide rows too (a 1024-row floor used to force ~4 MiB
+/// decodes for ~4 KiB rows regardless of a smaller budget); vortex's own
+/// pipeline still coalesces sub-1 MiB chunks up to ~1 MiB (multiples of
+/// this row count), which bounds the effective decode unit from below. An
+/// empty file (schema-only blob) keeps vortex's default chunking.
+pub(crate) fn docs_rows_per_chunk(
+    budget_bytes: usize,
+    max_rows: usize,
+    batches: &[RecordBatch],
+) -> usize {
     let budget_bytes = if budget_bytes == 0 {
         DEFAULT_DOCS_CHUNK_BYTES
     } else {
         budget_bytes
     };
+    // the ceiling never sinks below the floor — clamp() panics on an
+    // inverted range, and a sub-64-row cap was never a meaningful chunk
+    let max_rows = if max_rows == 0 {
+        DEFAULT_DOCS_CHUNK_MAX_ROWS
+    } else {
+        max_rows.max(DOCS_CHUNK_MIN_ROWS)
+    };
     let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
     if rows == 0 {
         return 0;
     }
-    let bytes: usize = batches.iter().map(RecordBatch::get_array_memory_size).sum();
+    let bytes: usize = batches.iter().map(batch_present_value_bytes).sum();
     let avg_row_bytes = (bytes / rows).max(1);
-    (budget_bytes / avg_row_bytes).clamp(DOCS_CHUNK_MIN_ROWS, DOCS_CHUNK_MAX_ROWS)
+    (budget_bytes / avg_row_bytes).clamp(DOCS_CHUNK_MIN_ROWS, max_rows)
+}
+
+/// Byte weight charged per PRESENT (non-null) value on top of its raw value
+/// bytes: a stand-in for per-value offset/validity/metadata overhead in the
+/// decoded form. Small on purpose — it must never dominate real value bytes,
+/// only keep many-tiny-values rows from weighing zero.
+const PRESENT_VALUE_OVERHEAD_BYTES: usize = 4;
+
+/// H1 present-value byte accounting of one docs batch: for every column,
+/// the sum of the NON-NULL values' byte lengths plus
+/// [`PRESENT_VALUE_OVERHEAD_BYTES`] per present value. Null slots cost
+/// nothing — arrow's per-slot padding (offsets, validity words) must never
+/// count, or wide sparse schemas collapse rows-per-chunk (the H1 failure).
+pub(crate) fn batch_present_value_bytes(batch: &RecordBatch) -> usize {
+    batch
+        .columns()
+        .iter()
+        .map(|column| column_present_value_bytes(column.as_ref()))
+        .sum()
+}
+
+fn column_present_value_bytes(column: &dyn Array) -> usize {
+    let present = column.len() - column.null_count();
+    if present == 0 {
+        return 0;
+    }
+    // Variable-length value bytes come from the offsets span (O(1); null
+    // slots have zero-length spans in every builder-produced array) or the
+    // view lengths; fixed-width types pay width × present.
+    let value_bytes = match column.data_type() {
+        DataType::Utf8 => {
+            let array = column
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("Utf8 downcast");
+            offsets_span(array.value_offsets())
+        }
+        DataType::LargeUtf8 => {
+            let array = column
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .expect("LargeUtf8 downcast");
+            offsets_span(array.value_offsets())
+        }
+        DataType::Binary => {
+            let array = column
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .expect("Binary downcast");
+            offsets_span(array.value_offsets())
+        }
+        DataType::LargeBinary => {
+            let array = column
+                .as_any()
+                .downcast_ref::<arrow::array::LargeBinaryArray>()
+                .expect("LargeBinary downcast");
+            offsets_span(array.value_offsets())
+        }
+        DataType::Utf8View => {
+            let array = column
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .expect("Utf8View downcast");
+            view_value_bytes(array.views(), column)
+        }
+        DataType::BinaryView => {
+            let array = column
+                .as_any()
+                .downcast_ref::<arrow::array::BinaryViewArray>()
+                .expect("BinaryView downcast");
+            view_value_bytes(array.views(), column)
+        }
+        DataType::Boolean => present,
+        data_type => match data_type.primitive_width() {
+            Some(width) => present * width,
+            // exotic types (nested, dictionary, ...): fall back to the
+            // arrow footprint — better too heavy than zero
+            None => column.get_array_memory_size(),
+        },
+    };
+    value_bytes + present * PRESENT_VALUE_OVERHEAD_BYTES
+}
+
+/// Total value bytes of an offsets-encoded array: the span between the
+/// first and last offset. Null slots contribute their (normally empty)
+/// spans — an O(1) heuristic, not an exact per-valid-row sum.
+fn offsets_span<O: arrow::array::OffsetSizeTrait>(offsets: &[O]) -> usize {
+    match (offsets.first(), offsets.last()) {
+        (Some(first), Some(last)) => (*last - *first).as_usize(),
+        _ => 0,
+    }
+}
+
+/// Total value bytes of a view array: the sum of the VALID views' lengths
+/// (low 32 bits of each raw view) — nulls excluded, one pass over a
+/// primitive buffer.
+fn view_value_bytes(views: &[u128], column: &dyn Array) -> usize {
+    if column.null_count() == 0 {
+        return views.iter().map(|view| (*view as u32) as usize).sum();
+    }
+    views
+        .iter()
+        .enumerate()
+        .filter(|(row, _)| column.is_valid(*row))
+        .map(|(_, view)| (*view as u32) as usize)
+        .sum()
 }
 
 /// For float-typed columns, the per-row "emits a key term" mask: valid AND
@@ -1956,6 +4196,83 @@ fn flush_terms_batch(
     Ok(())
 }
 
+/// Byte sink of one sink-produced blob region (`dict_blocks` / `plist`): in
+/// memory — the historical path, still used by every unspilled build — or
+/// written through to an UNLINKED temp file on the spill volume. A spooled
+/// region produces byte-identical blob bytes; only their residence differs.
+/// Spooling matters because these regions are proportional to the group's
+/// TOTAL distinct-term vocabulary (dict_blocks ≈ every distinct key's
+/// bytes), which for a budget-crossing rebuild is unbounded by the term
+/// map's spill budget.
+pub(crate) enum RegionSink {
+    Mem(Vec<u8>),
+    Spooled {
+        writer: std::io::BufWriter<std::fs::File>,
+        len: u64,
+    },
+}
+
+impl RegionSink {
+    fn new_spooled(dir: &std::path::Path) -> Result<Self> {
+        // unlinked temp file: freed by the OS on drop/crash, nothing to sweep
+        let file = tempfile::tempfile_in(dir)
+            .map_err(|e| VixError::Writer(format!("create blob spool in {dir:?}: {e}")))?;
+        Ok(RegionSink::Spooled {
+            writer: std::io::BufWriter::with_capacity(1024 * 1024, file),
+            len: 0,
+        })
+    }
+
+    fn len(&self) -> u64 {
+        match self {
+            RegionSink::Mem(data) => data.len() as u64,
+            RegionSink::Spooled { len, .. } => *len,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
+        match self {
+            RegionSink::Mem(data) => {
+                data.extend_from_slice(bytes);
+                Ok(())
+            }
+            RegionSink::Spooled { writer, len } => {
+                use std::io::Write;
+                writer
+                    .write_all(bytes)
+                    .map_err(|e| VixError::Writer(format!("write blob spool: {e}")))?;
+                *len += bytes.len() as u64;
+                Ok(())
+            }
+        }
+    }
+
+    /// Close the region into a container-ready [`BlobPart`] (spooled files
+    /// rewind to the payload start).
+    fn into_part(self) -> Result<BlobPart> {
+        match self {
+            RegionSink::Mem(data) => Ok(BlobPart::Mem(data)),
+            RegionSink::Spooled { writer, len } => {
+                use std::io::{Seek, Write};
+                let mut writer = writer;
+                writer
+                    .flush()
+                    .map_err(|e| VixError::Writer(format!("flush blob spool: {e}")))?;
+                let mut file = writer
+                    .into_inner()
+                    .map_err(|e| VixError::Writer(format!("close blob spool: {e}")))?;
+                file.seek(std::io::SeekFrom::Start(0))
+                    .map_err(|e| VixError::Writer(format!("rewind blob spool: {e}")))?;
+                Ok(BlobPart::Spooled { file, len })
+            }
+        }
+    }
+}
+
 /// Streaming encoder of the `dict`/`terms` blobs: consumes one
 /// `(composite key, doc_count, final postings blob)` triple per term, in
 /// strictly ascending key order, cutting postings row blocks by byte budget
@@ -1979,7 +4296,7 @@ pub(crate) struct TermSink {
     dict_block_first_ordinal: u64,
     /// This sink's concatenated encoded blocks (offsets sink-local;
     /// [`write_index_blobs`] rebases on concatenation).
-    dict_blocks: Vec<u8>,
+    dict_blocks: RegionSink,
     /// `(first_key, sink-local blocks offset, sink-local first ordinal)`
     /// per flushed block, in key order.
     dict_meta: Vec<(Vec<u8>, u64, u64)>,
@@ -2003,7 +4320,7 @@ pub(crate) struct TermSink {
     /// pushed through [`Self::push_plist`]. Offsets are SINK-LOCAL —
     /// [`write_index_blobs`] rebases them when it concatenates multiple
     /// sinks' regions into the single `plist` blob.
-    plist: Vec<u8>,
+    plist: RegionSink,
 }
 
 impl TermSink {
@@ -2022,7 +4339,7 @@ impl TermSink {
             dict_block: crate::dict_blocks::BlockBuilder::new(),
             dict_block_first_key: Vec::new(),
             dict_block_first_ordinal: 0,
-            dict_blocks: Vec::new(),
+            dict_blocks: RegionSink::Mem(Vec::new()),
             dict_meta: Vec::new(),
             first_key: Vec::new(),
             last_key: Vec::new(),
@@ -2030,8 +4347,20 @@ impl TermSink {
             bloom: crate::bloom::BloomHashAcc::default(),
             bloom_key_scratch: Vec::new(),
             plist_min_docs: 0,
-            plist: Vec::new(),
+            plist: RegionSink::Mem(Vec::new()),
         }
+    }
+
+    /// Spool this sink's byte regions (`dict_blocks`, `plist`) to unlinked
+    /// temp files under `dir` instead of accumulating them in memory —
+    /// byte-identical blob bytes, bounded residence. For the spilled-rebuild
+    /// finish, whose regions are vocabulary-proportional. Must be called
+    /// before the first push.
+    pub(crate) fn with_spool(mut self, dir: &std::path::Path) -> Result<Self> {
+        debug_assert!(self.term_count == 0, "with_spool after pushes");
+        self.dict_blocks = RegionSink::new_spooled(dir)?;
+        self.plist = RegionSink::new_spooled(dir)?;
+        Ok(self)
     }
 
     /// Close the open dictionary block into the sink's blocks region.
@@ -2039,9 +4368,9 @@ impl TermSink {
         if self.dict_block.is_empty() {
             return Ok(());
         }
-        let offset = self.dict_blocks.len() as u64;
+        let offset = self.dict_blocks.len();
         let bytes = self.dict_block.finish();
-        self.dict_blocks.extend_from_slice(&bytes);
+        self.dict_blocks.write_all(&bytes)?;
         self.dict_meta.push((
             std::mem::take(&mut self.dict_block_first_key),
             offset,
@@ -2053,6 +4382,14 @@ impl TermSink {
     pub(crate) fn with_bloom(mut self, bloom: crate::bloom::BloomHashAcc) -> Self {
         self.bloom = bloom;
         self
+    }
+
+    /// #52: route a bloom-only field's dictionary key (FIELD-MAJOR v2 form)
+    /// into the bloom accumulation WITHOUT it reaching the dictionary/
+    /// postings — how legacy indexed inputs' values survive a merge into a
+    /// bloom-only output.
+    pub(crate) fn observe_bloom_only_key(&mut self, key: &[u8]) {
+        self.bloom.observe_dict_key(key);
     }
 
     /// Enable out-of-row postings at/above `min_docs` docs (see
@@ -2084,8 +4421,8 @@ impl TermSink {
                 record.len()
             ))
         })?;
-        let cell = postings::encode_pointer_cell(self.plist.len() as u64, len);
-        self.plist.extend_from_slice(record);
+        let cell = postings::encode_pointer_cell(self.plist.len(), len);
+        self.plist.write_all(record)?;
         self.push(key, doc_count, &cell)
     }
 
@@ -2154,6 +4491,14 @@ impl TermSink {
         Ok(())
     }
 
+    /// Drain the CLOSED term batches accumulated so far (the open one keeps
+    /// filling). The spooled-rebuild finish streams these into the
+    /// incremental terms-blob writer as they close, so the sink never holds
+    /// more than one open batch of postings rows.
+    pub(crate) fn take_closed_batches(&mut self) -> Vec<RecordBatch> {
+        std::mem::take(&mut self.term_batches)
+    }
+
     /// Close the sink without writing the blobs: the raw term batches and
     /// dictionary rows (row-group `first_ordinal`s local to this sink). The
     /// parallel index merge runs one sink per key range and assembles the
@@ -2166,18 +4511,72 @@ impl TermSink {
             &mut self.term_batches,
         )?;
         self.flush_dict_block()?;
+        let RegionSink::Mem(dict_blocks) = self.dict_blocks else {
+            return Err(VixError::Writer(
+                "internal: into_parts on a spooled sink (spooled sinks close through \
+                 into_spooled_parts)"
+                    .to_string(),
+            ));
+        };
+        let RegionSink::Mem(plist) = self.plist else {
+            return Err(VixError::Writer(
+                "internal: into_parts on a spooled sink (spooled sinks close through \
+                 into_spooled_parts)"
+                    .to_string(),
+            ));
+        };
         Ok(TermSinkParts {
             term_batches: self.term_batches,
-            dict_blocks: self.dict_blocks,
+            dict_blocks,
             dict_meta: self.dict_meta,
             first_key: self.first_key,
             last_key: self.last_key,
             term_count: self.term_count,
             bloom: self.bloom,
             plist_min_docs: self.plist_min_docs,
-            plist: self.plist,
+            plist,
         })
     }
+
+    /// Close a SPOOLED sink (see [`Self::with_spool`]): flushes the open
+    /// term batch and dictionary block, then hands back the tail batches
+    /// (for the incremental terms-blob writer), the closed byte regions as
+    /// container-ready [`BlobPart`]s, and the dictionary/bloom state.
+    pub(crate) fn into_spooled_parts(mut self) -> Result<SpooledSinkParts> {
+        flush_terms_batch(
+            &self.terms_schema,
+            &mut self.doc_counts,
+            &mut self.postings_builder,
+            &mut self.term_batches,
+        )?;
+        self.flush_dict_block()?;
+        let plist = (!self.plist.is_empty())
+            .then(|| self.plist.into_part())
+            .transpose()?;
+        Ok(SpooledSinkParts {
+            tail_batches: self.term_batches,
+            dict_blocks: self.dict_blocks.into_part()?,
+            dict_meta: self.dict_meta,
+            term_count: self.term_count,
+            bloom: self.bloom,
+            plist,
+        })
+    }
+}
+
+/// A closed SPOOLED [`TermSink`] (single-sink rebuild finish only — no
+/// multi-part rebase, so offsets/ordinals are already global).
+pub(crate) struct SpooledSinkParts {
+    /// Closed term batches not yet pushed to the incremental terms writer.
+    pub(crate) tail_batches: Vec<RecordBatch>,
+    pub(crate) dict_blocks: BlobPart,
+    /// `(first_key, blocks offset, first ordinal)` per block, in key order.
+    pub(crate) dict_meta: Vec<(Vec<u8>, u64, u64)>,
+    pub(crate) term_count: u64,
+    pub(crate) bloom: crate::bloom::BloomHashAcc,
+    /// `None` when no pointer cell was pushed (mirrors
+    /// [`write_index_blobs`]'s empty-plist elision).
+    pub(crate) plist: Option<BlobPart>,
 }
 
 /// A closed [`TermSink`]: everything but the blob writes.
@@ -2197,6 +4596,28 @@ pub(crate) struct TermSinkParts {
     plist_min_docs: u32,
     /// The sink's out-of-row region, offsets local to this sink.
     plist: Vec<u8>,
+}
+
+/// [`IndexBlobs`] with container-ready payloads: the vocabulary-scaled
+/// blobs (`terms`/`dict_blocks`/`plist`) may be spooled ([`BlobPart`]);
+/// the small dictionary block index stays in memory. In-memory builds wrap
+/// their `Vec<u8>`s unchanged via `From<IndexBlobs>`.
+pub(crate) struct IndexBlobParts {
+    pub(crate) dict: Vec<u8>,
+    pub(crate) dict_blocks: BlobPart,
+    pub(crate) terms: BlobPart,
+    pub(crate) plist: Option<BlobPart>,
+}
+
+impl From<IndexBlobs> for IndexBlobParts {
+    fn from(blobs: IndexBlobs) -> Self {
+        IndexBlobParts {
+            dict: blobs.dict,
+            dict_blocks: BlobPart::Mem(blobs.dict_blocks),
+            terms: BlobPart::Mem(blobs.terms),
+            plist: blobs.plist.map(BlobPart::Mem),
+        }
+    }
 }
 
 /// The encoded index blobs of one build ([`write_index_blobs`]).
@@ -2306,6 +4727,205 @@ pub(crate) fn write_index_blobs(
             terms: terms_blob,
             // non-empty ⇔ at least one pointer cell was pushed (a record is
             // never zero bytes: its skip-table header alone is 4)
+            plist: (!plist.is_empty()).then_some(plist),
+        }),
+        term_count,
+        bloom,
+    ))
+}
+
+/// M17 item 4: split points for the PARALLEL rebuild index-blob build,
+/// chosen from the resident term map's own keys (in memory — exact, no
+/// sampling) as weighted quantiles SNAPPED UP to FIELD-REGION first keys.
+///
+/// Field-boundary snapping is what makes the parallel build BYTE-identical
+/// to the sequential one: [`TermSink::push`] cuts a dictionary block at
+/// every 2-byte field-id change, so a range starting at a field's first
+/// key begins a fresh block exactly where the sequential sink would — the
+/// concatenated dict-blocks region cannot differ. (The terms blob's
+/// row-block continuity is restored separately by
+/// [`write_index_blobs_recut`].) M10's output-keyspace invariants hold
+/// trivially: there is ONE key space (the writer's own), and every bound
+/// is a real key in it. Empty when fewer than 2 field regions exist or
+/// `ranges <= 1` — the caller then runs the sequential path.
+fn rebuild_partition_bounds(
+    terms: &BTreeMap<Vec<u8>, Vec<u32>>,
+    ranges: usize,
+) -> Vec<Vec<u8>> {
+    // floor: a small map (move-job L0 builds, tiny heals) gains nothing
+    // from worker spawn + range bookkeeping — stay sequential
+    if ranges <= 1 || terms.len() < 1024 {
+        return Vec::new();
+    }
+    // (key ordinal, first key) of every field region, in key order
+    let mut region_starts: Vec<(usize, &Vec<u8>)> = Vec::new();
+    let mut prev_fid: Option<&[u8]> = None;
+    for (ordinal, key) in terms.keys().enumerate() {
+        let fid = &key[..key.len().min(2)];
+        if prev_fid != Some(fid) {
+            region_starts.push((ordinal, key));
+            prev_fid = Some(fid);
+        }
+    }
+    if region_starts.len() <= 1 {
+        return Vec::new();
+    }
+    let total = terms.len();
+    let mut bounds: Vec<Vec<u8>> = Vec::with_capacity(ranges - 1);
+    for r in 1..ranges {
+        let target = total * r / ranges;
+        // first field region starting at/after the quantile ordinal
+        let pos = region_starts.partition_point(|(ordinal, _)| *ordinal < target);
+        let Some((ordinal, key)) = region_starts.get(pos) else {
+            break;
+        };
+        if *ordinal == 0 {
+            // a bound at the very first key would mint an empty first range
+            continue;
+        }
+        if bounds.last().is_none_or(|last| last.as_slice() < key.as_slice()) {
+            bounds.push((*key).clone());
+        }
+    }
+    bounds
+}
+
+/// [`write_index_blobs`] for the M17 parallel REBUILD build: identical
+/// ordering backstop, dict/plist rebase and bloom merge, but the terms
+/// batches are RE-CUT — every part's `(doc_count, cell)` rows stream
+/// through one continuous accumulation that replays [`TermSink::push`]'s
+/// flush rule (`bytes-since-flush >= postings_chunk_bytes`), so the
+/// row-block boundaries (and with them the terms blob's bytes) equal the
+/// single-sink sequential build EXACTLY for any range partitioning.
+/// Pointer cells rebase inline during the replay (same structural
+/// predicate as [`rebase_pointer_cells`]).
+#[allow(clippy::type_complexity)]
+pub(crate) fn write_index_blobs_recut(
+    parts: Vec<TermSinkParts>,
+    postings_chunk_bytes: usize,
+    encode_threads: usize,
+) -> Result<(Option<IndexBlobs>, u64, crate::bloom::BloomHashAcc)> {
+    let terms_schema = Arc::new(Schema::new(vec![
+        Field::new("doc_count", DataType::UInt32, false),
+        Field::new("postings", DataType::Binary, false),
+    ]));
+    let mut term_batches: Vec<RecordBatch> = Vec::new();
+    let mut index = crate::dict_blocks::IndexBuilder::new();
+    let mut dict_blocks: Vec<u8> = Vec::new();
+    let mut term_count = 0u64;
+    let mut bloom = crate::bloom::BloomHashAcc::default();
+    let mut prev_last: Option<&[u8]> = None;
+    for part in &parts {
+        if let (Some(prev), false) = (prev_last, part.first_key.is_empty()) {
+            if part.first_key.as_slice() <= prev {
+                return Err(VixError::Writer(format!(
+                    "rebuild range parts out of order: a range starts at key {:02x?} but the previous range ended at {:02x?}",
+                    &part.first_key[..part.first_key.len().min(24)],
+                    &prev[..prev.len().min(24)],
+                )));
+            }
+        }
+        if !part.last_key.is_empty() {
+            prev_last = Some(part.last_key.as_slice());
+        }
+    }
+    let plist_min_docs = parts.first().map_or(0, |part| part.plist_min_docs);
+    if parts
+        .iter()
+        .any(|part| part.plist_min_docs != plist_min_docs)
+    {
+        return Err(VixError::Writer(
+            "internal: rebuild range parts disagree on plist_min_docs".to_string(),
+        ));
+    }
+    let mut plist: Vec<u8> = Vec::new();
+    // the continuous re-cut accumulation (TermSink::push's exact rule)
+    let mut doc_counts: Vec<u32> = Vec::new();
+    let mut postings_builder = BinaryBuilder::new();
+    let mut block_bytes = 0usize;
+    for mut part in parts {
+        bloom.merge(std::mem::take(&mut part.bloom));
+        let plist_base = plist.len() as u64;
+        let blocks_base = dict_blocks.len() as u64;
+        for (first_key, offset, first_ordinal) in &part.dict_meta {
+            index.push_block(first_key, blocks_base + offset, term_count + first_ordinal)?;
+        }
+        dict_blocks.extend_from_slice(&part.dict_blocks);
+        for batch in &part.term_batches {
+            let counts = batch
+                .column_by_name("doc_count")
+                .and_then(|column| column.as_any().downcast_ref::<UInt32Array>())
+                .ok_or_else(|| {
+                    VixError::Writer(
+                        "internal: terms batch lacks a u32 doc_count column".to_string(),
+                    )
+                })?;
+            let cells = batch
+                .column_by_name("postings")
+                .and_then(|column| column.as_any().downcast_ref::<BinaryArray>())
+                .ok_or_else(|| {
+                    VixError::Writer(
+                        "internal: terms batch lacks a binary postings column".to_string(),
+                    )
+                })?;
+            for row in 0..batch.num_rows() {
+                let doc_count = counts.value(row);
+                let cell = cells.value(row);
+                let rebased;
+                let cell: &[u8] = if plist_base > 0
+                    && plist_min_docs > 0
+                    && doc_count >= plist_min_docs
+                    && !cell.is_empty()
+                {
+                    let (offset, len) = postings::decode_pointer_cell(cell)
+                        .map_err(|e| VixError::Writer(format!("internal: {e}")))?;
+                    let offset = offset.checked_add(plist_base).ok_or_else(|| {
+                        VixError::Writer(format!(
+                            "plist offset {offset} + base {plist_base} overflows u64"
+                        ))
+                    })?;
+                    rebased = postings::encode_pointer_cell(offset, len);
+                    &rebased
+                } else {
+                    cell
+                };
+                doc_counts.push(doc_count);
+                block_bytes += cell.len();
+                postings_builder.append_value(cell);
+                if block_bytes >= postings_chunk_bytes {
+                    flush_terms_batch(
+                        &terms_schema,
+                        &mut doc_counts,
+                        &mut postings_builder,
+                        &mut term_batches,
+                    )?;
+                    block_bytes = 0;
+                }
+            }
+        }
+        plist.append(&mut part.plist);
+        term_count += part.term_count;
+    }
+    flush_terms_batch(
+        &terms_schema,
+        &mut doc_counts,
+        &mut postings_builder,
+        &mut term_batches,
+    )?;
+    if term_count == 0 {
+        return Ok((None, 0, bloom));
+    }
+    let terms_blob = write_vortex_blob(
+        &terms_schema,
+        &term_batches,
+        addressable_strategy(),
+        encode_threads,
+    )?;
+    Ok((
+        Some(IndexBlobs {
+            dict: index.finish(),
+            dict_blocks,
+            terms: terms_blob,
             plist: (!plist.is_empty()).then_some(plist),
         }),
         term_count,

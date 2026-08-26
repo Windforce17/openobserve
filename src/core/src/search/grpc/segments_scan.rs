@@ -80,7 +80,8 @@ use infra::{
 };
 
 use crate::service::search::{
-    datafusion::table_provider::memtable::NewMemTable, index::IndexCondition,
+    datafusion::table_provider::memtable::NewMemTable,
+    index::{Condition, IndexCondition},
 };
 
 /// Cap on segments one query ships per stream. Past this the builder is far
@@ -114,15 +115,28 @@ impl SegmentShortfall {
     }
 }
 
-/// Hard cap on the bytes of kept batches one follower accumulates for a
-/// single query's segment scan, measured with [`RecordBatchExt::size`] — the
-/// same arrow accounting the segment buffer caps on. [`MAX_QUERY_SEGMENTS`]
-/// bounds only the segment COUNT; each segment can carry up to a whole flush
-/// buffer of one stream's rows, so count alone does not bound follower
-/// memory. Exceeding the budget fails the query loudly (correctness over
-/// availability, same stance as fetch/decode errors: a silently truncated
-/// scan would be silent partial data).
-const SEGMENT_SCAN_MAX_BYTES: usize = 512 * 1024 * 1024;
+/// Byte budgets on the kept batches one follower accumulates for a single
+/// query's segment scan, measured with [`RecordBatchExt::size`] — the same
+/// arrow accounting the segment buffer caps on. [`MAX_QUERY_SEGMENTS`]
+/// bounds only the segment COUNT; each segment can carry up to a whole
+/// flush buffer of one stream's rows, so count alone does not bound
+/// follower memory.
+///
+/// Returns `(soft, hard)`. Crossing the SOFT budget
+/// (`ZO_SEGMENT_SCAN_MAX_BYTES`, default 512 MiB, 0 = no warning) logs one
+/// warning and the query CONTINUES — recent-data queries must not fail
+/// just because the stream is busy (owner call, 2026-08-11: a filtered
+/// last-15min query died 0.03% over the old hard cap). The HARD ceiling —
+/// half the pod's cgroup memory limit, never below the soft budget — still
+/// fails the query loudly: past it the materialized backlog itself
+/// endangers the pod (correctness over availability, same stance as
+/// fetch/decode errors; a silently truncated scan would be silent partial
+/// data).
+fn segment_scan_budgets() -> (usize, usize) {
+    let soft = get_config().limit.segment_scan_max_bytes;
+    let hard = (config::utils::sysinfo::get_memory_limit() / 2).max(soft.max(1));
+    (soft, hard)
+}
 
 /// Storage account segment objects live under — the flusher PUTs with the
 /// default/empty account (see `segment_wal::uploader`).
@@ -452,6 +466,11 @@ pub async fn search(
     let needed_columns = Arc::new(needed_columns);
     let mut kept_batches: Vec<RecordBatch> = Vec::new();
     let mut kept_bytes: usize = 0;
+    let (scan_soft_budget, scan_hard_ceiling) = segment_scan_budgets();
+    // zero-yield classifiers (#38): objects fetched and walked for nothing,
+    // split by WHY — sizing input for the structural fixes
+    let mut zero_yield_stream_absent = 0usize;
+    let mut zero_yield_time_pruned = 0usize;
     let mut skipped_by_top_n: usize = 0;
     let mut next_meta: usize = 0;
     while next_meta < metas.len() {
@@ -534,6 +553,11 @@ pub async fn search(
         for (compressed_len, scanned) in decoded {
             scan_stats.compressed_size += compressed_len as i64;
             scan_stats.records += scanned.rows_examined;
+            if scanned.stream_frames == 0 {
+                zero_yield_stream_absent += 1;
+            } else if scanned.rows_examined == 0 {
+                zero_yield_time_pruned += 1;
+            }
             for (is_exact, batch) in scanned.kept {
                 // rows provably outside a top-n window are trimmed here
                 // (trim_batch_to_top_n — only for batches whose surviving
@@ -554,7 +578,8 @@ pub async fn search(
                     &mut kept_batches,
                     &mut kept_bytes,
                     batch,
-                    SEGMENT_SCAN_MAX_BYTES,
+                    scan_soft_budget,
+                    scan_hard_ceiling,
                     &query.org_id,
                     query.stream_type,
                     &query.stream_name,
@@ -570,7 +595,7 @@ pub async fn search(
     scan_stats.original_size = kept_bytes as i64;
 
     log::info!(
-        "[trace_id {trace_id}] segments_scan: {}/{}/{} loaded {} segments ({} skipped by top-n), kept {} batches, records {}, scan_size {}, took {} ms",
+        "[trace_id {trace_id}] segments_scan: {}/{}/{} loaded {} segments ({} skipped by top-n), kept {} batches, records {}, scan_size {}, zero-yield {} stream-absent + {} time-pruned, took {} ms",
         query.org_id,
         query.stream_type,
         query.stream_name,
@@ -579,6 +604,8 @@ pub async fn search(
         kept_batches.len(),
         scan_stats.records,
         scan_stats.original_size,
+        zero_yield_stream_absent,
+        zero_yield_time_pruned,
         load_start.elapsed().as_millis(),
     );
 
@@ -606,6 +633,12 @@ pub async fn search(
 struct ScannedSegment {
     rows_examined: i64,
     kept: Vec<(bool, RecordBatch)>,
+    /// Frames whose STREAM IDENTITY matched, before time pruning — the
+    /// classifier for zero-yield objects: 0 here means the object never
+    /// carried the stream (registry over-match / builder carry), >0 with
+    /// zero examined rows means its frames missed the query window
+    /// (object-level time bounds are coarser than per-stream ones).
+    stream_frames: i64,
 }
 
 /// Streaming scan of one segment object: decompress frame by frame, offer
@@ -627,10 +660,19 @@ fn scan_segment_object(
     let mut out = ScannedSegment {
         rows_examined: 0,
         kept: Vec::new(),
+        stream_frames: 0,
     };
+    let mut stream_frames = 0i64;
     segment_wal::format::decode_segment_filtered(
         bytes,
-        |info| frame_matches(info, org_id, stream_type, stream_name, time_range),
+        |info| {
+            let identity =
+                info.org == org_id && info.stream_type == stream_type && info.stream == stream_name;
+            if identity {
+                stream_frames += 1;
+            }
+            identity && frame_time_overlaps(info.min_ts, info.max_ts, time_range)
+        },
         |frame| {
             let batch = frame.batch;
             if batch.num_rows() == 0 {
@@ -656,6 +698,7 @@ fn scan_segment_object(
             Ok(())
         },
     )?;
+    out.stream_frames = stream_frames;
     Ok(out)
 }
 
@@ -669,11 +712,16 @@ fn frame_matches(
     stream_name: &str,
     time_range: (i64, i64),
 ) -> bool {
-    let (min_ts, max_ts) = time_range;
     info.org == org_id
         && info.stream_type == stream_type
         && info.stream == stream_name
-        && !((min_ts, max_ts) != (0, 0) && (info.min_ts > max_ts || info.max_ts < min_ts))
+        && frame_time_overlaps(info.min_ts, info.max_ts, time_range)
+}
+
+/// File-overlap time semantics; `(0, 0)` means unbounded.
+fn frame_time_overlaps(frame_min: i64, frame_max: i64, time_range: (i64, i64)) -> bool {
+    let (min_ts, max_ts) = time_range;
+    !((min_ts, max_ts) != (0, 0) && (frame_min > max_ts || frame_max < min_ts))
 }
 
 /// Resolve assigned segment ids against the listed rows; every id must
@@ -726,8 +774,9 @@ enum PrunedBatch {
 /// 3-row needle (`trace_id = X` over a wide range) died at 512MB of KEPT
 /// bytes purely because the stream was busy, while the rows it needed
 /// were a few KB. Conservative by construction:
-/// - a condition this batch's schema cannot evaluate (absent column, unsupported shape) => the
-///   batch is kept WHOLE;
+/// - conjuncts are handled per top-level AND member (see the body): absent fields DROP the batch
+///   only for positive null-rejecting predicates, everything else evaluates what it can and
+///   over-keeps;
 /// - evaluation errors keep the batch whole;
 /// - the provider downstream re-applies the condition uniformly, so pruning here only ever narrows
 ///   what the budget must hold.
@@ -740,28 +789,62 @@ fn prune_batch_by_condition(
     let Some(condition) = condition else {
         return PrunedBatch::Exact(batch);
     };
-    // Schema-mixed segment batches may lack a condition column entirely —
-    // and `to_physical_expr` resolves columns with an infallible lookup
-    // (panic, not Err), so presence is checked HERE and absence keeps the
-    // batch whole (the scan re-applies the full filter downstream anyway).
+    // Schema-mixed segment batches may lack condition columns entirely (raw
+    // write-time schemas carry present fields only) — and `to_physical_expr`
+    // resolves columns with an infallible lookup (panic, not Err), so
+    // presence is checked HERE, per top-level AND conjunct:
+    // - every field present         => the conjunct joins the prune filter;
+    // - a null-rejecting predicate  => no row of this batch has the field, on an absent field the
+    //   conjunct is false everywhere, the whole AND is: DROP the batch (this is what keeps a shared
+    //   busy stream from blowing the budget on batches that provably cannot match — most batches of
+    //   other services lack the filtered field entirely);
+    // - anything else on an absent  => the conjunct is skipped here and left field (IsNull matches
+    //   to the downstream re-filter; pruning absent, Or may match via        with the REMAINING
+    //   conjuncts still another arm, negations          narrows what the budget must hold depend on
+    //   product null          (partially-pruned batches classify semantics, match_all may        as
+    //   Whole, never Exact: surviving hit a present fts field)        rows are NOT known full
+    //   matches and must stay out of top-n trimming).
     let schema = batch.schema();
-    if condition
-        .get_schema_fields(fst_fields)
-        .iter()
-        .any(|field| schema.index_of(field).is_err())
-    {
+    let mut evaluable: Vec<&Condition> = Vec::with_capacity(condition.conditions.len());
+    let mut skipped_conjunct = false;
+    for cond in &condition.conditions {
+        let all_present = cond
+            .get_schema_fields(fst_fields)
+            .iter()
+            .all(|field| schema.index_of(field).is_ok());
+        if all_present {
+            evaluable.push(cond);
+        } else if conjunct_is_false_without_its_field(cond) {
+            return PrunedBatch::Dropped;
+        } else {
+            skipped_conjunct = true;
+        }
+    }
+    if evaluable.is_empty() {
         return PrunedBatch::Whole(batch);
     }
-    let expr = match condition.to_physical_expr(schema.as_ref(), fst_fields) {
+    let classify = |batch: RecordBatch| {
+        if skipped_conjunct {
+            PrunedBatch::Whole(batch)
+        } else {
+            PrunedBatch::Exact(batch)
+        }
+    };
+    let partial = IndexCondition {
+        conditions: evaluable.into_iter().cloned().collect(),
+    };
+    let expr = match partial.to_physical_expr(schema.as_ref(), fst_fields) {
         Ok(expr) => expr,
         Err(_) => return PrunedBatch::Whole(batch),
     };
     let mask = match expr.evaluate(&batch) {
         Ok(ColumnarValue::Array(array)) => array,
         Ok(ColumnarValue::Scalar(scalar)) => {
-            // a constant verdict: keep or drop the whole batch
+            // a constant verdict: keep or drop the whole batch (a FALSE
+            // verdict on the evaluated conjuncts falsifies the full AND
+            // even when other conjuncts were skipped)
             return match scalar {
-                datafusion::scalar::ScalarValue::Boolean(Some(true)) => PrunedBatch::Exact(batch),
+                datafusion::scalar::ScalarValue::Boolean(Some(true)) => classify(batch),
                 _ => PrunedBatch::Dropped,
             };
         }
@@ -771,10 +854,33 @@ fn prune_batch_by_condition(
         return PrunedBatch::Whole(batch);
     };
     match arrow::compute::filter_record_batch(&batch, mask) {
+        // zero survivors of the evaluated conjuncts => zero survivors of
+        // the full AND, no matter what was skipped
         Ok(filtered) if filtered.num_rows() == 0 => PrunedBatch::Dropped,
-        Ok(filtered) => PrunedBatch::Exact(filtered),
+        Ok(filtered) => classify(filtered),
         Err(_) => PrunedBatch::Whole(batch),
     }
+}
+
+/// Whether this conjunct is FALSE for every row of a batch whose schema
+/// lacks the (single) field it references — i.e. a positive, null-rejecting
+/// predicate: a row without the field has it null, and none of these match
+/// null. Only shapes where the index semantics and the downstream SQL
+/// filter AGREE that absent-cannot-match are listed; complement shapes
+/// (NotEqual, negated In/NumericCmp, IsNull, Not) are excluded because the
+/// product treats them as set complements that INCLUDE rows lacking the
+/// field, and structural/fts shapes (Or, And, MatchAll, Fuzzy, All) are
+/// excluded because another arm or another fts field may still match.
+fn conjunct_is_false_without_its_field(cond: &Condition) -> bool {
+    matches!(
+        cond,
+        Condition::Equal(..)
+            | Condition::StrMatch(..)
+            | Condition::In(_, _, false)
+            | Condition::NumericCmp(_, _, false, _)
+            | Condition::Regex(..)
+            | Condition::IsNotNull(_)
+    )
 }
 
 /// Running top-n `_timestamp` tracker for `ORDER BY _timestamp DESC LIMIT n`
@@ -931,26 +1037,35 @@ fn project_batch_to_needed(batch: RecordBatch, needed: &HashSet<String>) -> Resu
     })
 }
 
-/// Fold a kept batch into the accumulator, enforcing the scan bytes budget
-/// with [`RecordBatchExt::size`] accounting. `budget` is a parameter so
-/// tests can shrink it; the public path always passes
-/// [`SEGMENT_SCAN_MAX_BYTES`]. Over budget is a hard error, never a
-/// truncation (a capped-off subset would be silent partial data).
+/// Fold a kept batch into the accumulator, enforcing the scan byte budgets
+/// with [`RecordBatchExt::size`] accounting. `soft_budget`/`hard_ceiling`
+/// are parameters so tests can shrink them; the public path always passes
+/// [`segment_scan_budgets`]. Crossing the soft budget WARNS exactly once
+/// per accumulator and keeps going (recent-data queries must not fail on a
+/// busy stream); crossing the hard ceiling is an error, never a truncation
+/// (a capped-off subset would be silent partial data).
 fn push_within_budget(
     kept: &mut Vec<RecordBatch>,
     kept_bytes: &mut usize,
     batch: RecordBatch,
-    budget: usize,
+    soft_budget: usize,
+    hard_ceiling: usize,
     org_id: &str,
     stream_type: StreamType,
     stream_name: &str,
 ) -> Result<()> {
-    *kept_bytes = kept_bytes.saturating_add(batch.size());
-    if *kept_bytes > budget {
+    let prev_bytes = *kept_bytes;
+    *kept_bytes = prev_bytes.saturating_add(batch.size());
+    if *kept_bytes > hard_ceiling {
         return Err(Error::Message(format!(
-            "[SEGMENT:SCAN] {org_id}/{stream_type}/{stream_name}: this query needs {} bytes of not-yet-sealed live data, over the per-query scan budget {budget} — narrow the time range, add filters, or select fewer columns",
+            "[SEGMENT:SCAN] {org_id}/{stream_type}/{stream_name}: this query materialized {} bytes of not-yet-sealed live data, past the hard per-query ceiling {hard_ceiling} (half the pod's memory limit) — narrow the time range, add filters on always-present fields, or select fewer columns",
             *kept_bytes
         )));
+    }
+    if soft_budget > 0 && prev_bytes <= soft_budget && *kept_bytes > soft_budget {
+        log::warn!(
+            "[SEGMENT:SCAN] {org_id}/{stream_type}/{stream_name}: live-data scan passed the soft budget {soft_budget} bytes (ZO_SEGMENT_SCAN_MAX_BYTES) and continues — hard stop at {hard_ceiling}; consider a narrower time range, filters on always-present fields, or fewer columns"
+        );
     }
     kept.push(batch);
     Ok(())
@@ -1050,7 +1165,8 @@ mod tests {
     /// over a wide range hit 3 rows but died at the 512MB scan budget
     /// because the WHOLE live backlog counted against it. The prune keeps
     /// only rows the condition can match, so the budget sees KBs; a batch
-    /// whose schema cannot evaluate the condition stays whole; with no
+    /// whose schema lacks a positively-required field DROPS (#35), one
+    /// that merely cannot refute the condition stays whole; with no
     /// condition the budget still guards full scans.
     #[test]
     fn test_prune_batch_by_condition_saves_needle_queries() {
@@ -1100,9 +1216,11 @@ mod tests {
         };
         assert_eq!(whole.num_rows(), 4);
 
-        // a schema without the column keeps the batch WHOLE (the provider
-        // re-applies the condition downstream) — and Whole, not Exact, so
-        // top-n trimming never touches it
+        // a schema without the column DROPS the batch for a positive
+        // null-rejecting predicate: no row of this batch has the field, so
+        // `trace_id = needle` is false everywhere (#35 — a shared busy
+        // stream must not blow the budget on batches that provably cannot
+        // match)
         let no_col_schema = Arc::new(Schema::new(vec![arrow_schema::Field::new(
             "_timestamp",
             arrow_schema::DataType::Int64,
@@ -1113,11 +1231,104 @@ mod tests {
             vec![Arc::new(Int64Array::from(vec![1i64, 2]))],
         )
         .unwrap();
-        let PrunedBatch::Whole(kept) = prune_batch_by_condition(no_col, Some(&condition), &[])
+        assert!(matches!(
+            prune_batch_by_condition(no_col.clone(), Some(&condition), &[]),
+            PrunedBatch::Dropped
+        ));
+
+        // ...but only for shapes where absent-cannot-match is certain: an
+        // IS NULL (matches rows lacking the field) keeps the batch WHOLE
+        // for the downstream re-filter
+        let mut is_null = IndexCondition::new();
+        is_null.add_condition(Condition::IsNull("trace_id".to_string()));
+        let PrunedBatch::Whole(kept) =
+            prune_batch_by_condition(no_col.clone(), Some(&is_null), &[])
         else {
-            panic!("unevaluable condition must yield Whole");
+            panic!("IS NULL on an absent field must stay Whole");
         };
         assert_eq!(kept.num_rows(), 2);
+
+        // negated set-membership is a complement shape (the product treats
+        // it as including rows lacking the field): never dropped on absence
+        let mut not_in = IndexCondition::new();
+        not_in.add_condition(Condition::In(
+            "trace_id".to_string(),
+            vec!["x".to_string()],
+            true,
+        ));
+        assert!(matches!(
+            prune_batch_by_condition(no_col, Some(&not_in), &[]),
+            PrunedBatch::Whole(_)
+        ));
+    }
+
+    /// #35 conjunct granularity: a batch that can evaluate only SOME of the
+    /// AND conjuncts prunes with those and over-keeps the rest — classified
+    /// Whole (surviving rows are NOT known full matches, so top-n trimming
+    /// must not touch them) — and zero survivors of the evaluated subset
+    /// still drop the batch (an empty superset empties the full AND).
+    #[test]
+    fn test_prune_batch_partial_conjuncts_narrow_but_never_claim_exact() {
+        use crate::service::search::index::Condition;
+        let schema = Arc::new(Schema::new(vec![
+            arrow_schema::Field::new("_timestamp", arrow_schema::DataType::Int64, false),
+            arrow_schema::Field::new("service_name", arrow_schema::DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 2, 3, 4])),
+                Arc::new(StringArray::from(vec![
+                    "temporal", "nginx", "temporal", "api",
+                ])),
+            ],
+        )
+        .unwrap();
+
+        // AND(service_name='temporal', queue IS NULL): the queue field is
+        // absent — IS NULL can't be refuted, so it is skipped; the present
+        // conjunct still cuts the batch to 2 rows, kept as Whole
+        let mut cond = IndexCondition::new();
+        cond.add_condition(Condition::Equal(
+            "service_name".to_string(),
+            "temporal".to_string(),
+        ));
+        cond.add_condition(Condition::IsNull("wf_task_queue_name".to_string()));
+        let PrunedBatch::Whole(kept) = prune_batch_by_condition(batch.clone(), Some(&cond), &[])
+        else {
+            panic!("partially evaluated condition must yield Whole");
+        };
+        assert_eq!(kept.num_rows(), 2, "the present conjunct prunes rows");
+
+        // same shape, but the present conjunct matches nothing: Dropped
+        let mut cond_miss = IndexCondition::new();
+        cond_miss.add_condition(Condition::Equal(
+            "service_name".to_string(),
+            "no-such-service".to_string(),
+        ));
+        cond_miss.add_condition(Condition::IsNull("wf_task_queue_name".to_string()));
+        assert!(matches!(
+            prune_batch_by_condition(batch.clone(), Some(&cond_miss), &[]),
+            PrunedBatch::Dropped
+        ));
+
+        // AND(service_name='temporal', queue='q1'): the absent queue field
+        // is a positive equality — the whole batch drops without evaluating
+        // anything (the user-reported prod shape: shared stream, per-service
+        // fields)
+        let mut cond_drop = IndexCondition::new();
+        cond_drop.add_condition(Condition::Equal(
+            "service_name".to_string(),
+            "temporal".to_string(),
+        ));
+        cond_drop.add_condition(Condition::Equal(
+            "wf_task_queue_name".to_string(),
+            "q1".to_string(),
+        ));
+        assert!(matches!(
+            prune_batch_by_condition(batch, Some(&cond_drop), &[]),
+            PrunedBatch::Dropped
+        ));
     }
 
     /// End-to-end shape: pruned batches fit a budget the unpruned stream
@@ -1169,6 +1380,7 @@ mod tests {
                 &mut kept,
                 &mut kept_bytes,
                 batch,
+                0,
                 budget,
                 "org",
                 StreamType::Traces,
@@ -1229,6 +1441,7 @@ mod tests {
             &mut kept,
             &mut kept_bytes,
             projected,
+            0,
             budget,
             "org",
             StreamType::Traces,
@@ -1453,6 +1666,7 @@ mod tests {
                 &mut kept,
                 &mut kept_bytes,
                 batch,
+                0,
                 budget,
                 "org",
                 StreamType::Traces,
@@ -1919,6 +2133,7 @@ mod tests {
             &mut kept,
             &mut kept_bytes,
             first,
+            0,
             budget,
             "org1",
             StreamType::Logs,
@@ -1932,6 +2147,7 @@ mod tests {
             &mut kept,
             &mut kept_bytes,
             ts_batch("v", &[3], Some(&[3])),
+            0,
             budget,
             "org1",
             StreamType::Logs,
@@ -1940,10 +2156,47 @@ mod tests {
         .unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("org1/logs/app1") && msg.contains(&format!("budget {budget}")),
-            "error must name the stream and the budget: {msg}"
+            msg.contains("org1/logs/app1") && msg.contains(&format!("ceiling {budget}")),
+            "error must name the stream and the ceiling: {msg}"
         );
-        assert_eq!(kept.len(), 1, "the over-budget batch must not be kept");
+        assert_eq!(kept.len(), 1, "the over-ceiling batch must not be kept");
+    }
+
+    /// Crossing the SOFT budget warns and keeps going — only the hard
+    /// ceiling fails the query (the owner call that recent-data queries on
+    /// a busy stream must not die at an arbitrary byte line).
+    #[test]
+    fn push_within_budget_soft_crossing_keeps_the_batch_and_continues() {
+        let mut kept: Vec<RecordBatch> = Vec::new();
+        let mut kept_bytes = 0usize;
+        let first = ts_batch("v", &[1, 2], Some(&[1, 2]));
+        let soft = first.size(); // second push crosses the soft line
+        for i in 0..3i64 {
+            push_within_budget(
+                &mut kept,
+                &mut kept_bytes,
+                ts_batch("v", &[i], Some(&[i])),
+                soft,
+                usize::MAX,
+                "org1",
+                StreamType::Logs,
+                "app1",
+            )
+            .expect("soft budget must never fail the push");
+        }
+        push_within_budget(
+            &mut kept,
+            &mut kept_bytes,
+            first,
+            soft,
+            usize::MAX,
+            "org1",
+            StreamType::Logs,
+            "app1",
+        )
+        .expect("far past the soft budget still keeps going");
+        assert_eq!(kept.len(), 4, "every batch is kept in warn mode");
+        assert!(kept_bytes > soft);
     }
 
     #[test]

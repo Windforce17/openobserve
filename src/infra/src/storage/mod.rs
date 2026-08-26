@@ -176,6 +176,28 @@ pub async fn head(account: &str, file: &str) -> Result<ObjectMeta> {
     MULTI_ACCOUNTS.head(account, &file.into()).await
 }
 
+/// Whether an error (possibly wrapped/reformatted through anyhow layers)
+/// means "the object does not exist in the store" — the signal an S3
+/// lifecycle expiry leaves behind on a still-listed file (M19).
+///
+/// Checks the preserved error chain for a typed
+/// [`object_store::Error::NotFound`] first; falls back to matching the
+/// ALTERNATE-formatted text (`{e:#}` walks the chain, and layers that
+/// reformat instead of wrapping embed the inner `... not found ...`
+/// display verbatim). Timeouts / throttles / permission errors never
+/// carry either signal, so they are never misclassified.
+pub fn is_not_found_error(e: &anyhow::Error) -> bool {
+    if e.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<object_store::Error>(),
+            Some(object_store::Error::NotFound { .. })
+        )
+    }) {
+        return true;
+    }
+    format!("{e:#}").to_lowercase().contains("not found")
+}
+
 pub async fn get_bytes(account: &str, file: &str) -> Result<bytes::Bytes> {
     let data = get(account, file).await?;
     data.bytes().await
@@ -598,5 +620,35 @@ mod tests {
         let b = bytes::Bytes::from(data);
         let result = bytes_size_in_mb(&b);
         assert!((result - 1.0).abs() < 1e-9);
+    }
+
+    /// M19: not-found classification across the wrapping styles errors
+    /// really travel through — typed chain, contexted chain, reformatted
+    /// text — and never on other error classes.
+    #[test]
+    fn test_is_not_found_error_classification() {
+        let not_found = || object_store::Error::NotFound {
+            path: "files/o/logs/s/2021/01/02/00/a.vix".to_string(),
+            source: Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, "expired")),
+        };
+        // typed, direct
+        assert!(is_not_found_error(&anyhow::Error::from(not_found())));
+        // typed, under context layers (chain preserved)
+        let contexted = anyhow::Error::from(not_found())
+            .context("open docs blob")
+            .context("merge input fetch");
+        assert!(is_not_found_error(&contexted));
+        // reformatted (chain broken, display text embedded)
+        let reformatted = anyhow::anyhow!("vix open failed: {}", not_found());
+        assert!(is_not_found_error(&reformatted));
+        // other classes never classify
+        assert!(!is_not_found_error(&anyhow::anyhow!(
+            "vix range fetch timed out after 30s (ZO_VIX_FETCH_TIMEOUT)"
+        )));
+        let generic = object_store::Error::Generic {
+            store: "s3",
+            source: Box::new(std::io::Error::other("503 slow down")),
+        };
+        assert!(!is_not_found_error(&anyhow::Error::from(generic)));
     }
 }

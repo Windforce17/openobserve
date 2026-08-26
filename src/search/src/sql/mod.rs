@@ -113,7 +113,6 @@ impl Sql {
         search_event_type: Option<SearchEventType>,
         extract_patterns: bool,
     ) -> Result<Sql, Error> {
-        let cfg = get_config();
         let sql = query.sql.clone();
         let offset = query.from as i64;
         let mut limit = query.size as i64;
@@ -247,13 +246,12 @@ impl Sql {
                 total_schemas,
                 &columns,
                 has_original_column,
-                query.quick_mode || cfg.limit.quick_mode_force_enabled,
-                cfg.limit.quick_mode_num_fields,
                 &search_event_type,
                 match_visitor.has_match_all,
                 stream_type,
                 // row-store-driven star: plain single-stream statements
-                // only — joins/subqueries/CTEs keep the registry expansion
+                // only — joins/subqueries/CTEs keep the (referenced-column
+                // bounded, §9) registry expansion
                 !is_complex && stream_names.len() == 1,
             );
         } else {
@@ -552,7 +550,10 @@ mod tests {
         // finalize_schemas sorts by name: _source, _timestamp, referenced
         assert_eq!(names, vec!["_source", "_timestamp", "k8s.container.name"]);
 
-        // complex statements (CTE) keep the registry expansion
+        // complex statements (CTE): §9 keeps the registry-star ONLY here,
+        // BOUNDED by the statement's referenced columns — H4: plan cost
+        // O(query), flat in the 5000-field registry width (the #45
+        // multi-second-plan shape), quick-mode truncation deleted
         let query = star_query(
             r#"WITH f AS (SELECT * FROM "wide" WHERE "k8s.container.name" = 'x') SELECT * FROM f"#,
         );
@@ -561,7 +562,17 @@ mod tests {
             .schemas
             .get(&TableReference::bare("wide"))
             .expect("stream schema");
-        assert!(schema.schema().fields().len() > 400);
+        let names: Vec<&str> = schema
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["_timestamp", "k8s.container.name"],
+            "CTE star = referenced-column bound, never O(registry)"
+        );
         assert!(!schema.contains_field(vortex_index::SOURCE_COL_NAME));
     }
 

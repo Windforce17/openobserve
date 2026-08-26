@@ -241,8 +241,11 @@ mod tests {
         let handle = Handle::current();
         register_runtime("reg_test_unique".to_string(), handle);
         let after = RUNTIME_HANDLES.lock().unwrap().len();
-        // One new entry must have been appended.
-        assert_eq!(after, before + 1);
+        // At least this entry must have been appended (RUNTIME_HANDLES is
+        // process-global: sibling tests may register concurrently between
+        // the two counts, so exact `before + 1` is racy under the parallel
+        // test harness).
+        assert!(after >= before + 1, "after {after} < before {before} + 1");
         assert!(
             RUNTIME_HANDLES
                 .lock()

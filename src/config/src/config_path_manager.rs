@@ -71,8 +71,15 @@ pub fn update_config_file_last_hash(hash: String) {
 mod tests {
     use super::*;
 
+    /// The last-hash tests all mutate ONE process-global (`CONFIG_MANAGER`),
+    /// so cargo's parallel test threads raced them into spurious failures
+    /// (seen 2026-08-18 during the M12 gate: "abc123" observed where
+    /// "hash-xyz" was written). Serialize exactly the tests that touch it.
+    static LAST_HASH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_update_and_get_last_hash() {
+        let _guard = LAST_HASH_TEST_LOCK.lock().unwrap();
         update_config_file_last_hash("abc123".to_string());
         let hash = get_config_file_last_hash();
         assert_eq!(hash.as_deref(), Some("abc123"));
@@ -80,6 +87,7 @@ mod tests {
 
     #[test]
     fn test_update_last_hash_overwrites_previous() {
+        let _guard = LAST_HASH_TEST_LOCK.lock().unwrap();
         update_config_file_last_hash("first".to_string());
         update_config_file_last_hash("second".to_string());
         let hash = get_config_file_last_hash();
@@ -100,6 +108,7 @@ mod tests {
 
     #[test]
     fn test_update_last_hash_and_get() {
+        let _guard = LAST_HASH_TEST_LOCK.lock().unwrap();
         update_config_file_last_hash("hash-xyz".to_string());
         let result = get_config_file_last_hash();
         assert!(result.is_some());

@@ -24,6 +24,8 @@ use config::{
     },
     utils::schema_ext::SchemaExt,
 };
+use futures::StreamExt;
+
 use datafusion::{
     arrow::datatypes::{DataType, Schema},
     catalog::TableProvider,
@@ -37,7 +39,9 @@ use datafusion::{
     execution::{
         cache::cache_manager::{CacheManagerConfig, FileStatisticsCache},
         context::SessionConfig,
-        memory_pool::{FairSpillPool, GreedyMemoryPool, TrackConsumersPool, UnboundedMemoryPool},
+        memory_pool::{
+            FairSpillPool, GreedyMemoryPool, MemoryPool, TrackConsumersPool, UnboundedMemoryPool,
+        },
         runtime_env::{RuntimeEnv, RuntimeEnvBuilder},
         session_state::SessionStateBuilder,
     },
@@ -134,7 +138,69 @@ pub fn create_session_config(
     Ok(config)
 }
 
+/// Build the configured tracked pool (`TrackConsumersPool` over the
+/// `ZO_MEMORY_CACHE_DATAFUSION_MEMORY_POOL` type) with `memory_size` bytes.
+fn build_tracked_pool(memory_size: usize) -> Result<Arc<dyn MemoryPool>> {
+    let cfg = get_config();
+    let mem_pool = super::MemoryPoolType::from_str(&cfg.memory_cache.datafusion_memory_pool)
+        .map_err(|e| {
+            DataFusionError::Execution(format!("Invalid datafusion memory pool type: {e}"))
+        })?;
+    Ok(match mem_pool {
+        super::MemoryPoolType::Greedy => {
+            let pool = GreedyMemoryPool::new(memory_size);
+            Arc::new(TrackConsumersPool::new(pool, NonZero::new(20).unwrap()))
+        }
+        super::MemoryPoolType::Fair => {
+            let pool = FairSpillPool::new(memory_size);
+            Arc::new(TrackConsumersPool::new(pool, NonZero::new(20).unwrap()))
+                as Arc<dyn MemoryPool>
+        }
+        super::MemoryPoolType::None => {
+            let pool = UnboundedMemoryPool::default();
+            Arc::new(TrackConsumersPool::new(pool, NonZero::new(20).unwrap()))
+        }
+    })
+}
+
+/// M26: ONE process-wide memory pool shared by every `merge_parquet_files`
+/// context (compactor merges and segment-builder L0 builds of flat/metadata
+/// streams). Sized once with the SAME `datafusion_max_size` semantics a
+/// single merge context used to get.
+///
+/// Before this, every merge CONTEXT got its own pool of that full size —
+/// on a prod compactor (48Gi, `ZO_MEMORY_CACHE_DATAFUSION_MAX_SIZE=12288`,
+/// 4 merge workers + live lane + builder) the aggregate tracked ceiling was
+/// N x 12.9GB, structurally above the pod limit. Metadata-class merges
+/// (default/metadata/trace_list_index) measurably fill a whole per-context
+/// pool (repeated ~12.8GB `peak_memory_pool` drops fleet-wide, 2026-08-21),
+/// so a few overlapping merges ramped the pod 2GB -> 46GB at job-throughput
+/// speed and OOM-killed it — the M26 "live per-job leak" signature. Sharing
+/// the pool bounds the AGGREGATE: concurrent merges now spill (correct,
+/// bounded, alive) instead of stacking fresh gigabytes (unbounded, dead).
+/// Query contexts are untouched.
+static SHARED_MERGE_POOL: std::sync::LazyLock<Result<Arc<dyn MemoryPool>>> =
+    std::sync::LazyLock::new(|| {
+        let memory_size = std::cmp::max(
+            DATAFUSION_MIN_MEM,
+            get_config().memory_cache.datafusion_max_size,
+        );
+        log::info!(
+            "[DATAFUSION] shared merge memory pool created: {} MB",
+            memory_size / (1024 * 1024)
+        );
+        build_tracked_pool(memory_size)
+    });
+
 pub async fn create_runtime_env(trace_id: &str, memory_limit: usize) -> Result<RuntimeEnv> {
+    create_runtime_env_inner(trace_id, memory_limit, false).await
+}
+
+async fn create_runtime_env_inner(
+    trace_id: &str,
+    memory_limit: usize,
+    shared_merge_pool: bool,
+) -> Result<RuntimeEnv> {
     let object_store_registry = DefaultObjectStoreRegistry::new();
 
     let memory = super::storage::memory::FS::new();
@@ -156,28 +222,23 @@ pub async fn create_runtime_env(trace_id: &str, memory_limit: usize) -> Result<R
         builder = builder.with_cache_manager(cache_config);
     }
 
-    let memory_size = std::cmp::max(DATAFUSION_MIN_MEM, memory_limit);
-    let mem_pool = super::MemoryPoolType::from_str(&cfg.memory_cache.datafusion_memory_pool)
-        .map_err(|e| {
-            DataFusionError::Execution(format!("Invalid datafusion memory pool type: {e}"))
-        })?;
-    let memory_pool = match mem_pool {
-        super::MemoryPoolType::Greedy => {
-            let pool = GreedyMemoryPool::new(memory_size);
-            let track_memory_pool = TrackConsumersPool::new(pool, NonZero::new(20).unwrap());
-            PeakMemoryPool::new(Arc::new(track_memory_pool), trace_id.to_string())
+    let inner_pool = if shared_merge_pool {
+        match SHARED_MERGE_POOL.as_ref() {
+            Ok(pool) => Arc::clone(pool),
+            Err(e) => {
+                return Err(DataFusionError::Execution(format!(
+                    "shared merge memory pool init failed: {e}"
+                )));
+            }
         }
-        super::MemoryPoolType::Fair => {
-            let pool = FairSpillPool::new(memory_size);
-            let track_memory_pool = TrackConsumersPool::new(pool, NonZero::new(20).unwrap());
-            PeakMemoryPool::new(Arc::new(track_memory_pool), trace_id.to_string())
-        }
-        super::MemoryPoolType::None => {
-            let pool = UnboundedMemoryPool::default();
-            let track_memory_pool = TrackConsumersPool::new(pool, NonZero::new(20).unwrap());
-            PeakMemoryPool::new(Arc::new(track_memory_pool), trace_id.to_string())
-        }
+    } else {
+        let memory_size = std::cmp::max(DATAFUSION_MIN_MEM, memory_limit);
+        build_tracked_pool(memory_size)?
     };
+    // per-context peak observability on top of the (possibly shared) pool:
+    // with the shared pool the logged peak is the POOL level at this
+    // context's grows — the pod-relevant number
+    let memory_pool = PeakMemoryPool::new(inner_pool, trace_id.to_string());
 
     builder = builder.with_memory_pool(Arc::new(memory_pool));
     builder.build()
@@ -190,6 +251,8 @@ pub struct DataFusionContextBuilder<'a> {
     optimizer_rules: Vec<Arc<dyn OptimizerRule + Send + Sync>>,
     physical_optimizer_rules: Vec<Arc<dyn PhysicalOptimizerRule + Send + Sync>>,
     sorted_by_time: bool,
+    single_partition: bool,
+    shared_merge_pool: bool,
 }
 
 impl<'a> Default for DataFusionContextBuilder<'a> {
@@ -207,6 +270,8 @@ impl<'a> DataFusionContextBuilder<'a> {
             optimizer_rules: vec![],
             physical_optimizer_rules: vec![],
             sorted_by_time: false,
+            single_partition: false,
+            shared_merge_pool: false,
         }
     }
 
@@ -249,6 +314,32 @@ impl<'a> DataFusionContextBuilder<'a> {
         self
     }
 
+    /// M13/M20b: plan at exactly ONE partition, bypassing the
+    /// `datafusion_min_partition_num` floor (`create_session_config` clamps
+    /// to it otherwise). For bounded merge inputs — the segment builder's
+    /// ≤superbatch-MB in-memory batch (M13), or the compactor's size-capped
+    /// metadata merge groups (M20b) — parallel sort buys nothing, and the
+    /// repartitioned plan is the pool-starvation shape: RepartitionExec
+    /// buffers unspillably while N ExternalSorters split the pool until one
+    /// fails its first allocation (M12 fix-1 rationale; prod
+    /// default/metadata/trace_list_index builds and compactor merges were
+    /// the remaining instances). One sorter spills properly instead.
+    pub fn single_partition(mut self, single_partition: bool) -> Self {
+        self.single_partition = single_partition;
+        self
+    }
+
+    /// M26: draw this context's DataFusion memory from the ONE process-wide
+    /// merge pool (see [`SHARED_MERGE_POOL`]) instead of a fresh full-size
+    /// per-context pool. Set by `merge_parquet_files` — compactor merges and
+    /// segment-builder L0 builds — so CONCURRENT merges share (and spill
+    /// against) one bounded budget rather than stacking `datafusion_max_size`
+    /// each. Query contexts keep their per-context pools.
+    pub fn shared_merge_pool(mut self, shared_merge_pool: bool) -> Self {
+        self.shared_merge_pool = shared_merge_pool;
+        self
+    }
+
     pub async fn build(self, target_partitions: usize) -> Result<SessionContext, DataFusionError> {
         let cfg = get_config();
         let (target_partitions, memory_size) =
@@ -262,8 +353,15 @@ impl<'a> DataFusionContextBuilder<'a> {
         )
         .await?;
 
-        let session_config = create_session_config(self.sorted_by_time, target_partitions)?;
-        let runtime_env = Arc::new(create_runtime_env(self.trace_id, memory_size).await?);
+        let mut session_config = create_session_config(self.sorted_by_time, target_partitions)?;
+        if self.single_partition {
+            // after create_session_config on purpose: this is the one caller
+            // allowed under the min-partition floor (see single_partition)
+            session_config = session_config.with_target_partitions(1);
+        }
+        let runtime_env = Arc::new(
+            create_runtime_env_inner(self.trace_id, memory_size, self.shared_merge_pool).await?,
+        );
         let mut builder = SessionStateBuilder::new()
             .with_config(session_config)
             .with_runtime_env(runtime_env)
@@ -486,19 +584,76 @@ impl TableBuilder {
         }
 
         if !vix_files.is_empty() {
-            let table = self
-                .build_table_for_format(
-                    session.clone(),
-                    vix_files,
-                    schema.clone(),
-                    FileFormat::Vix,
-                    target_partitions,
-                )
-                .await?;
-            tables.push(table);
+            // Per-file `row_order` keying (v2 §6.2): files stamped ts_desc
+            // keep the declared per-file `_timestamp DESC` ordering, and —
+            // M4 — concat files with a PROVEN region decomposition join
+            // them (their scans k-way merge the regions, so the stream they
+            // emit really is ts_desc). Only OPAQUE concat files (no proven
+            // regions, or wider than the merge cap) go into the undeclared
+            // table and pay a real sort.
+            let (sorted_vix, concat_vix) = if self.sorted_by_time {
+                partition_vix_files_by_row_order(&session, vix_files).await
+            } else {
+                (vix_files, Vec::new())
+            };
+            if !concat_vix.is_empty() {
+                log::debug!(
+                    "[trace_id: {}] vix tables: {} file(s) keep the declared sort \
+                     (ts_desc or region-merged concat), {} opaque concat file(s) scan undeclared",
+                    session.id,
+                    sorted_vix.len(),
+                    concat_vix.len(),
+                );
+            }
+            if !sorted_vix.is_empty() {
+                let table = self
+                    .build_table_for_format(
+                        session.clone(),
+                        sorted_vix,
+                        schema.clone(),
+                        FileFormat::Vix,
+                        target_partitions,
+                    )
+                    .await?;
+                tables.push(table);
+            }
+            if !concat_vix.is_empty() {
+                let table = self
+                    .build_concat_vix_table(
+                        session.clone(),
+                        concat_vix,
+                        schema.clone(),
+                        target_partitions,
+                    )
+                    .await?;
+                tables.push(table);
+            }
         }
 
         Ok(tables)
+    }
+
+    /// The concat-order `.vix` table: same format/adapter as the sorted
+    /// table but registered under its own prefix token and WITHOUT the
+    /// per-file sort declaration (its files' rows are not globally
+    /// `_timestamp` DESC).
+    async fn build_concat_vix_table(
+        &self,
+        session: SearchSession,
+        files: Vec<FileKey>,
+        schema: Arc<Schema>,
+        target_partitions: usize,
+    ) -> Result<Arc<dyn TableProvider>> {
+        self.build_table_inner(
+            session,
+            files,
+            schema,
+            FileFormat::Vix,
+            target_partitions,
+            false,
+            "vix-concat",
+        )
+        .await
     }
 
     async fn build_table_for_format(
@@ -509,6 +664,30 @@ impl TableBuilder {
         format: FileFormat,
         target_partitions: usize,
     ) -> Result<Arc<dyn TableProvider>> {
+        let declare_sort = self.sorted_by_time;
+        self.build_table_inner(
+            session,
+            files,
+            schema,
+            format,
+            target_partitions,
+            declare_sort,
+            format.extension(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn build_table_inner(
+        &self,
+        session: SearchSession,
+        files: Vec<FileKey>,
+        schema: Arc<Schema>,
+        format: FileFormat,
+        target_partitions: usize,
+        declare_sort: bool,
+        prefix_token: &str,
+    ) -> Result<Arc<dyn TableProvider>> {
         // Configure listing options with the appropriate file format
         let file_format: Arc<dyn DataFusionFileFormat> = match format {
             FileFormat::Parquet => Arc::new(ParquetFormat::default()),
@@ -518,27 +697,38 @@ impl TableBuilder {
             }
             // Core files: logical stream schema over the docs blob, with
             // non-physical columns extracted from `_source`. The query time
-            // range is pushed into each file's vortex scan.
-            FileFormat::Vix => Arc::new(VixCoreFormat::new(self.timestamp_filter)),
+            // range is pushed into each file's vortex scan. A DECLARED-sort
+            // table additionally requires every scan to emit ts_desc — a
+            // concat file routed here (proven regions) k-way merges (§6.2).
+            FileFormat::Vix => Arc::new(
+                VixCoreFormat::new(self.timestamp_filter).with_ordered_output(declare_sort),
+            ),
         };
 
         let mut listing_options = ListingOptions::new(file_format)
             .with_target_partitions(target_partitions)
             .with_collect_stat(true);
 
-        if self.sorted_by_time {
+        if declare_sort {
             // Every format stores its rows ORDER BY _timestamp DESC, so
             // declare that per-file sort order. Core .vix files supply exact
             // `_timestamp` min/max statistics from `VixCoreFormat::infer_stats`
             // (parquet/vortex from their own footers), so
             // `split_file_groups_by_statistics` can order the file groups to
             // uphold the declared ordering and the SortExec is elided.
+            //
+            // .vix files stamped `row_order=concat` (concatenation-order
+            // merge outputs — rows NOT globally sorted) never reach a
+            // declared table: `partition_vix_files_by_row_order` routes them
+            // to the undeclared concat table, keyed on the FILE's own
+            // row_order property. Parquet/vortex files are never
+            // concat-ordered.
             listing_options = listing_options
                 .with_file_sort_order(vec![vec![col(TIMESTAMP_COL_NAME).sort(false, false)]]);
         }
 
         let schema_key = schema.hash_key();
-        let format = format.extension();
+        let format = prefix_token;
         let trace_id = &session.id;
         let prefix = match session.storage_type {
             StorageType::Memory => {
@@ -601,6 +791,157 @@ impl TableBuilder {
     }
 }
 
+/// Per-file ordering class of a `.vix` DATA object (§6.2, M4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VixOrderClass {
+    /// `row_order=ts_desc`: globally sorted, declared as before.
+    Sorted,
+    /// Concat file with a PROVEN region decomposition within the merge cap:
+    /// its scans k-way merge the regions, so it JOINS the declared table.
+    ConcatMergeable,
+    /// Concat file without proven regions (or over the cap, or unprobeable):
+    /// no order can be assumed — undeclared table, real sort.
+    Opaque,
+}
+
+/// Process-wide memo of `.vix` DATA objects' order-class verdicts, keyed by
+/// object key. Object keys are immutable (a rewritten file gets a new key),
+/// so a verdict never goes stale; entries for aged-out files are dropped by
+/// the crude clear-on-cap below (retention is 1 day, so the map stays
+/// small; a clear only costs re-probes of live files). NOTE the class
+/// depends on ZO_VIX_ORDER_MERGE_MAX_REGIONS — a runtime knob change needs
+/// a process restart to fully re-classify (verdicts are conservative
+/// either way).
+static VIX_ROW_ORDER_MEMO: std::sync::LazyLock<
+    parking_lot::RwLock<hashbrown::HashMap<String, VixOrderClass>>,
+> = std::sync::LazyLock::new(Default::default);
+const VIX_ROW_ORDER_MEMO_CAP: usize = 200_000;
+
+/// The order class from a probed reader's footer verdicts.
+fn classify_vix_order(
+    ts_desc: bool,
+    regions: Option<usize>,
+    has_zone: bool,
+) -> VixOrderClass {
+    if ts_desc {
+        return VixOrderClass::Sorted;
+    }
+    let cap = get_config().common.vix_order_merge_max_regions;
+    match regions {
+        // the zone table is required for the merge's lazy region bounds AND
+        // for the concat file's exact `_timestamp` statistics (infer_stats)
+        Some(count) if cap > 0 && count <= cap && has_zone => VixOrderClass::ConcatMergeable,
+        _ => VixOrderClass::Opaque,
+    }
+}
+
+/// Partition `.vix` files for a declared-sort query: `(declared, opaque)` —
+/// `declared` = ts_desc files plus region-mergeable concat files (their
+/// scans emit ts_desc through the §6.2 k-way merge), `opaque` = everything
+/// whose order cannot be proven (scans undeclared, real sort).
+///
+/// Verdict sources, cheapest first: the process memo, a reader already
+/// memoized by the index-eval path (zero IO), else ONE footer parse over
+/// the cache ladder (memory/disk cache first; a cold file pays one small
+/// tail GET — the same per-file plan-time IO class `infer_stats` already
+/// performs for the declared-sort statistics). Anything unprobeable
+/// (WAL-side sets, zero-size meta, open errors) lands in the OPAQUE bucket:
+/// never declare an order that is not proven — the scan itself surfaces any
+/// real error later, and an undeclared sorted file only costs a real sort.
+async fn partition_vix_files_by_row_order(
+    session: &SearchSession,
+    files: Vec<FileKey>,
+) -> (Vec<FileKey>, Vec<FileKey>) {
+    // WAL sets never contain .vix files (they are storage objects); if one
+    // ever appears the cache ladder cannot serve it — fail-safe to opaque.
+    if session.storage_type == StorageType::Wal {
+        return (Vec::new(), files);
+    }
+    let concurrency = max(1, get_config().limit.cpu_num.min(16));
+    let handle = tokio::runtime::Handle::current();
+    let probes = futures::stream::iter(files.into_iter().map(|file| {
+        let handle = handle.clone();
+        async move {
+            if let Some(&class) = VIX_ROW_ORDER_MEMO.read().get(&file.key) {
+                return (file, class);
+            }
+            if let Some(reader) = crate::vix::reader_cache::GLOBAL_CACHE.get(&file.key) {
+                let class = classify_vix_order(
+                    reader.row_order().is_ts_desc(),
+                    reader.ts_desc_row_ranges().map(|r| r.len()),
+                    reader.zone_chunks().is_some(),
+                );
+                memo_vix_row_order(&file.key, class);
+                return (file, class);
+            }
+            let Ok(size) = u64::try_from(file.meta.compressed_size) else {
+                return (file, VixOrderClass::Opaque);
+            };
+            if size == 0 {
+                return (file, VixOrderClass::Opaque);
+            }
+            let source = Arc::new(crate::vix::source::LadderRangeSource::new(
+                file.account.clone(),
+                &file.key,
+                size,
+                handle,
+                None,
+            ));
+            let key = file.key.clone();
+            let verdict = tokio::task::spawn_blocking(move || {
+                vortex_index::VixDocs::open_ranged(source).map(|docs| {
+                    classify_vix_order(
+                        docs.row_order().is_ts_desc(),
+                        docs.ts_desc_row_ranges().map(|r| r.len()),
+                        docs.zone_chunks().is_some(),
+                    )
+                })
+            })
+            .await;
+            match verdict {
+                Ok(Ok(class)) => {
+                    memo_vix_row_order(&key, class);
+                    (file, class)
+                }
+                Ok(Err(error)) => {
+                    log::debug!(
+                        "vix row-order probe of {key} failed (treated as opaque): {error:#}"
+                    );
+                    (file, VixOrderClass::Opaque)
+                }
+                Err(join_error) => {
+                    log::debug!(
+                        "vix row-order probe task of {key} failed (treated as opaque): \
+                         {join_error}"
+                    );
+                    (file, VixOrderClass::Opaque)
+                }
+            }
+        }
+    }))
+    .buffer_unordered(concurrency)
+    .collect::<Vec<_>>()
+    .await;
+
+    let mut declared = Vec::with_capacity(probes.len());
+    let mut opaque = Vec::new();
+    for (file, class) in probes {
+        match class {
+            VixOrderClass::Sorted | VixOrderClass::ConcatMergeable => declared.push(file),
+            VixOrderClass::Opaque => opaque.push(file),
+        }
+    }
+    (declared, opaque)
+}
+
+fn memo_vix_row_order(key: &str, class: VixOrderClass) {
+    let mut memo = VIX_ROW_ORDER_MEMO.write();
+    if memo.len() >= VIX_ROW_ORDER_MEMO_CAP {
+        memo.clear();
+    }
+    memo.insert(key.to_string(), class);
+}
+
 #[cfg(feature = "enterprise")]
 async fn get_cpu_and_mem_limit(
     trace_id: &str,
@@ -646,6 +987,59 @@ mod tests {
             Field::new("field1", DataType::Utf8, true),
             Field::new("field2", DataType::Int64, true),
         ]))
+    }
+
+    /// M26 pin: every `shared_merge_pool(true)` context draws from ONE
+    /// process-wide pool — a reservation made through context A is visible
+    /// in context B's pool level, so concurrent merges are bounded in
+    /// AGGREGATE (48Gi compactors died stacking ~12.8GB per-context
+    /// metadata-merge pool fills, 2026-08-21). Default contexts keep
+    /// isolated per-context pools.
+    #[tokio::test]
+    async fn m26_merge_contexts_share_one_memory_pool() {
+        use datafusion::execution::memory_pool::MemoryConsumer;
+
+        let ctx_a = DataFusionContextBuilder::new()
+            .trace_id("m26-shared-a")
+            .shared_merge_pool(true)
+            .build(2)
+            .await
+            .unwrap();
+        let ctx_b = DataFusionContextBuilder::new()
+            .trace_id("m26-shared-b")
+            .shared_merge_pool(true)
+            .build(2)
+            .await
+            .unwrap();
+        let pool_a = Arc::clone(&ctx_a.runtime_env().memory_pool);
+        let pool_b = Arc::clone(&ctx_b.runtime_env().memory_pool);
+
+        const GROW: usize = 64 * 1024 * 1024;
+        let base_b = pool_b.reserved();
+        let mut reservation = MemoryConsumer::new("m26-shared-pin").register(&pool_a);
+        reservation.grow(GROW);
+        assert!(
+            pool_b.reserved() >= base_b + GROW,
+            "a reservation through context A must be visible in context B's \
+             pool level: base={base_b}, now={}",
+            pool_b.reserved()
+        );
+
+        // a DEFAULT context's pool is its own: the shared reservation must
+        // not appear there
+        let ctx_c = DataFusionContextBuilder::new()
+            .trace_id("m26-default-c")
+            .build(2)
+            .await
+            .unwrap();
+        let pool_c = Arc::clone(&ctx_c.runtime_env().memory_pool);
+        assert!(
+            pool_c.reserved() < GROW,
+            "default contexts must keep isolated per-context pools, got {}",
+            pool_c.reserved()
+        );
+
+        reservation.free();
     }
 
     #[tokio::test]

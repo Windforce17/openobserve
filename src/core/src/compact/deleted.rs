@@ -26,21 +26,36 @@ pub async fn delete(org_id: &str, time_max: i64) -> Result<i64, anyhow::Error> {
     }
     let files_num = files.len() as i64;
 
-    // delete files from storage
-    if let Err(e) = storage::del(
-        files
+    // delete files from storage. v3 sidecar split: every `.vix` data key
+    // gets its `.vxi` sidecar key deleted UNCONDITIONALLY alongside it —
+    // simplest correct option over consulting the vestigial
+    // `file_list_deleted.index_file` flag (which stays always-false):
+    // index-off files simply have no sidecar and the delete tolerates
+    // NotFound (`storage::del` already swallows per-key not-found).
+    let mut sidecar_keys: Vec<(String, String)> = Vec::new();
+    for file in &files {
+        if !ingester::is_wal_file(&file.file)
+            && let Some(sidecar) = config::vix_sidecar_key(&file.file)
+        {
+            sidecar_keys.push((file.account.clone(), sidecar));
+        }
+    }
+    let mut del_keys: Vec<(&str, &str)> = files
+        .iter()
+        .filter_map(|file| {
+            if !ingester::is_wal_file(&file.file) {
+                Some((file.account.as_str(), file.file.as_str()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    del_keys.extend(
+        sidecar_keys
             .iter()
-            .filter_map(|file| {
-                if !ingester::is_wal_file(&file.file) {
-                    Some((file.account.as_str(), file.file.as_str()))
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>(),
-    )
-    .await
-    {
+            .map(|(account, key)| (account.as_str(), key.as_str())),
+    );
+    if let Err(e) = storage::del(del_keys).await {
         // maybe the file already deleted, so we just skip the `not found` error
         if !e.to_string().to_lowercase().contains("not found") {
             log::error!("[COMPACTOR] delete files from storage failed: {e}");

@@ -139,7 +139,14 @@ pub async fn handle_otlp_request(
         if matches!(e, infra::errors::Error::TrialPeriodExpired) {
             return Ok(MetaHttpResponse::too_many_requests(e));
         } else {
-            log::error!("[METRICS:OTLP] ingestion error: {e}");
+            if matches!(e, infra::errors::Error::ResourceError(_)) {
+                // resource backpressure storms: counts at info in windows,
+                // detail at debug — never per-request ERROR spam
+                ingester::admission::note_rejection(ingester::admission::REJECT_RESOURCE);
+                log::debug!("[METRICS:OTLP] ingestion error: {e}");
+            } else {
+                log::error!("[METRICS:OTLP] ingestion error: {e}");
+            }
             return Ok((
                 http::StatusCode::SERVICE_UNAVAILABLE,
                 Json(MetaHttpResponse::error(

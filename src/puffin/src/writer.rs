@@ -127,6 +127,37 @@ impl<W: io::Write> PuffinBytesWriter<W> {
         Ok(())
     }
 
+    /// [`Self::add_blob`] streaming from a reader instead of a slice: copies
+    /// exactly `length` bytes through a bounded buffer, so a multi-GB blob
+    /// (e.g. one spooled to disk by its producer) never has to reside in
+    /// memory to enter the container. Metadata and produced bytes are
+    /// identical to `add_blob` with the same payload.
+    pub fn add_blob_from(
+        &mut self,
+        mut reader: impl io::Read,
+        length: u64,
+        blob_type: impl Into<String>,
+        blob_tag: String,
+    ) -> Result<()> {
+        self.add_header_if_needed()
+            .context("Error writing puffin header")?;
+
+        let copied = io::copy(&mut reader, &mut self.writer)
+            .context("Error streaming puffin blob payload")?;
+        if copied != length {
+            anyhow::bail!("puffin blob payload is {copied} bytes, expected {length}");
+        }
+        let properties = {
+            let mut properties = BTreeMap::new();
+            properties.insert("blob_tag".to_string(), blob_tag);
+            properties
+        };
+        let blob_metadata = self.build_blob_metadata(blob_type.into(), properties, length);
+        self.blobs_metadata.push(blob_metadata);
+        self.written_bytes += length;
+        Ok(())
+    }
+
     pub fn finish(&mut self) -> Result<u64> {
         self.add_header_if_needed()
             .context("Error writing puffin header")?;
@@ -313,6 +344,41 @@ mod tests {
         }
 
         assert_eq!(reference, streamed);
+    }
+
+    /// add_blob_from must produce a byte-identical container to add_blob.
+    #[test]
+    fn test_puffin_bytes_writer_add_blob_from_matches_add_blob() {
+        let blob1 = vec![7u8; 3 * 1024 * 1024 + 13]; // spans several copy buffers
+        let blob2 = b"tail blob".to_vec();
+
+        let mut by_slice: Vec<u8> = Vec::new();
+        {
+            let mut writer = PuffinBytesWriter::new(&mut by_slice);
+            writer.set_property("k", "v");
+            writer.add_blob(&blob1, DICT, "big".to_string()).unwrap();
+            writer.add_blob(&blob2, TERMS, "tail".to_string()).unwrap();
+            writer.finish().unwrap();
+        }
+
+        let mut by_reader: Vec<u8> = Vec::new();
+        {
+            let mut writer = PuffinBytesWriter::new(&mut by_reader);
+            writer.set_property("k", "v");
+            writer
+                .add_blob_from(&blob1[..], blob1.len() as u64, DICT, "big".to_string())
+                .unwrap();
+            writer.add_blob(&blob2, TERMS, "tail".to_string()).unwrap();
+            writer.finish().unwrap();
+        }
+
+        assert_eq!(by_slice, by_reader);
+
+        // a short reader must fail loudly, not truncate silently
+        let mut broken: Vec<u8> = Vec::new();
+        let mut writer = PuffinBytesWriter::new(&mut broken);
+        let result = writer.add_blob_from(&blob2[..4], blob2.len() as u64, DICT, "x".to_string());
+        assert!(result.is_err());
     }
 
     #[test]

@@ -13,21 +13,63 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+#[cfg(not(feature = "enterprise"))]
+use std::sync::{Arc, LazyLock};
+
 use config::{
     datafusion::request::Request, get_config, meta::cluster::Node, metrics,
     utils::took_watcher::TookWatcher,
 };
 use infra::{
-    errors::{Error, Result},
+    errors::{Error, ErrorCodes, Result},
     file_list::FileId,
 };
+#[cfg(not(feature = "enterprise"))]
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 #[cfg(feature = "enterprise")]
 use {
-    crate::service::search::SEARCH_SERVER, config::meta::search::SearchEventType, infra::dist_lock,
-    infra::errors::ErrorCodes, o2_enterprise::enterprise::search::WorkGroup,
+    super::utils::AsyncDefer, crate::service::search::SEARCH_SERVER,
+    config::meta::search::SearchEventType, infra::dist_lock,
+    o2_enterprise::enterprise::search::WorkGroup,
 };
 
-use super::utils::AsyncDefer;
+/// Node-local admission gate for every query this node LEADS (SQL and
+/// promql): a counted semaphore sized by `ZO_QUERY_MAX_CONCURRENCY`
+/// (0 = unlimited). Requests past the limit fail IMMEDIATELY with
+/// `RatelimitExceeded` (HTTP 429) — there is no queue. This replaced the
+/// pre-.80 cluster-wide dist-lock queue (`/search/cluster_queue/global`),
+/// which serialized EVERY query in the cluster through one slot held for
+/// the whole runtime: any long scan made every needle behind it wait out
+/// the scan's tail (measured 2026-08-11: 33.8s for a 0.5s needle stuck
+/// behind a 33.3s aggregation).
+#[cfg(not(feature = "enterprise"))]
+static QUERY_ADMISSION: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
+    let max = get_config().limit.query_max_concurrency;
+    let permits = if max == 0 {
+        Semaphore::MAX_PERMITS
+    } else {
+        max
+    };
+    Arc::new(Semaphore::new(permits))
+});
+
+/// Holds one admission slot for the query's whole lifetime; the drop — on
+/// success, error, timeout, and disconnect-abort alike — frees the slot
+/// and decrements the running gauge, so neither can leak.
+#[cfg(not(feature = "enterprise"))]
+pub struct AdmissionGuard {
+    _permit: OwnedSemaphorePermit,
+    org_id: String,
+}
+
+#[cfg(not(feature = "enterprise"))]
+impl Drop for AdmissionGuard {
+    fn drop(&mut self) {
+        metrics::QUERY_RUNNING_NUMS
+            .with_label_values(&[&self.org_id])
+            .dec();
+    }
+}
 
 /// Guard that automatically releases work group lock when dropped
 pub struct DeferredLock {
@@ -35,10 +77,14 @@ pub struct DeferredLock {
     #[cfg(feature = "enterprise")]
     pub work_group: Option<WorkGroup>,
     pub work_group_str: String,
+    #[cfg(not(feature = "enterprise"))]
+    _guard: AdmissionGuard,
+    #[cfg(feature = "enterprise")]
     _guard: AsyncDefer,
 }
 
-/// OSS version: Uses distributed lock for concurrency control
+/// OSS version: node-local counted admission — reject-fast with HTTP 429,
+/// never queue. `_timeout` is unused since .80 (nothing waits anymore).
 #[cfg(not(feature = "enterprise"))]
 #[tracing::instrument(
     name = "service:search:work_group:check",
@@ -48,45 +94,41 @@ pub struct DeferredLock {
 pub async fn check_work_group(
     trace_id: &str,
     org_id: &str,
-    timeout: u64,
+    _timeout: u64,
     stop_watch: &mut TookWatcher,
     caller: &str,
 ) -> Result<DeferredLock> {
-    let cfg = get_config();
-    let work_group_str = "global".to_string();
-
-    let locker_key = format!("/search/cluster_queue/{work_group_str}");
-    let locker = if cfg.common.local_mode || !cfg.common.feature_query_queue_enabled {
-        None
-    } else {
-        infra::dist_lock::lock_with_trace_id(trace_id, &locker_key, timeout)
-            .await
-            .map_err(|e| {
-                metrics::QUERY_PENDING_NUMS
-                    .with_label_values(&[org_id])
-                    .dec();
-                Error::Message(e.to_string())
-            })?
+    let max = get_config().limit.query_max_concurrency;
+    let permit = match Arc::clone(&QUERY_ADMISSION).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            log::warn!(
+                "[trace_id {trace_id}] {caller}->search: admission rejected: this node already leads {max} queries (ZO_QUERY_MAX_CONCURRENCY)"
+            );
+            return Err(Error::ErrorCode(ErrorCodes::RatelimitExceeded(format!(
+                "query concurrency limit reached: this querier already leads {max} queries — retry shortly, or raise ZO_QUERY_MAX_CONCURRENCY"
+            ))));
+        }
     };
 
+    // kept for took_detail compatibility — admission is non-blocking, so
+    // this records ~0 rather than the pre-.80 queue wait
     let took_wait = stop_watch.record_split("queue_wait").as_millis() as usize;
-    log::info!("[trace_id {trace_id}] {caller}->search: wait in queue took: {took_wait} ms");
+    log::info!(
+        "[trace_id {trace_id}] {caller}->search: admitted without queueing (since .80), wait: {took_wait} ms"
+    );
 
-    // Create cleanup guard
-    let trace_id_owned = trace_id.to_string();
-    let caller_owned = caller.to_string();
-    let guard = AsyncDefer::new(async move {
-        if let Err(e) = infra::dist_lock::unlock_with_trace_id(&trace_id_owned, &locker).await {
-            log::error!(
-                "[trace_id {trace_id_owned}] {caller_owned}->search: failed to unlock: {e:?}"
-            );
-        }
-    });
+    metrics::QUERY_RUNNING_NUMS
+        .with_label_values(&[org_id])
+        .inc();
 
     Ok(DeferredLock {
         took_wait,
-        work_group_str,
-        _guard: guard,
+        work_group_str: "global".to_string(),
+        _guard: AdmissionGuard {
+            _permit: permit,
+            org_id: org_id.to_string(),
+        },
     })
 }
 
@@ -380,4 +422,51 @@ pub async fn acquire_work_group_lock(
         caller,
     )
     .await
+}
+
+#[cfg(all(test, not(feature = "enterprise")))]
+mod tests {
+    use config::utils::took_watcher::TookWatcher;
+    use infra::errors::{Error, ErrorCodes};
+
+    use super::*;
+
+    /// Admission is a counted gate with NO queue: the configured maximum
+    /// (default 30) admits immediately, the next request is rejected with
+    /// RatelimitExceeded (the HTTP layer maps it to 429), and dropping any
+    /// held lock frees a slot for the next caller.
+    #[tokio::test]
+    async fn admission_rejects_past_the_limit_and_recovers_on_drop() {
+        let max = get_config().limit.query_max_concurrency;
+        assert!(max > 0, "test assumes a bounded default");
+
+        let mut watch = TookWatcher::new();
+        let mut held = Vec::with_capacity(max);
+        for i in 0..max {
+            let lock = check_work_group(&format!("t-adm-{i}"), "org-adm", 60, &mut watch, "test")
+                .await
+                .expect("under the limit must admit immediately");
+            assert_eq!(lock.work_group_str, "global");
+            held.push(lock);
+        }
+
+        match check_work_group("t-adm-over", "org-adm", 60, &mut watch, "test").await {
+            Err(Error::ErrorCode(ErrorCodes::RatelimitExceeded(msg))) => {
+                assert!(
+                    msg.contains(&max.to_string()),
+                    "message names the limit: {msg}"
+                );
+            }
+            Err(other) => panic!("expected RatelimitExceeded, got {other:?}"),
+            Ok(_) => panic!("past the limit must reject, not queue"),
+        }
+
+        // freeing ONE slot re-admits exactly one caller
+        held.pop();
+        let lock = check_work_group("t-adm-after", "org-adm", 60, &mut watch, "test")
+            .await
+            .expect("a freed slot must admit the next caller");
+        drop(lock);
+        drop(held);
+    }
 }

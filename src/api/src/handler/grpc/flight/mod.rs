@@ -134,17 +134,24 @@ impl FlightService for FlightServiceImpl {
         .instrument(span.clone())
         .await;
 
+        // NOT plan construction alone: this spans the whole follower search
+        // setup — plan decode, schema maps, the vix INDEX EVALUATION, table
+        // registration and the segments scan. The per-stage durations are
+        // in the "storage search completed" / segments-scan lines; read
+        // those before attributing time to "planning" (#45 was misdiagnosed
+        // off this label on 2026-08-13).
         log::info!(
             "{}",
             search_inspector_fields(
                 format!(
-                    "[trace_id {trace_id}] flight->do_get: get_ctx_and_physical_plan took: {} ms",
+                    "[trace_id {trace_id}] flight->do_get: follower search setup (plan decode + \
+                     index eval + table registration) took: {} ms",
                     _start.elapsed().as_millis(),
                 ),
                 SearchInspectorFieldsBuilder::new()
                     .trace_id(trace_id.to_string())
                     .node_name(LOCAL_NODE.name.clone())
-                    .component("flight::do_get get_ctx_and_physical_plan".to_string())
+                    .component("flight::do_get follower search setup".to_string())
                     .search_role("follower".to_string())
                     .duration(_start.elapsed().as_millis() as usize)
                     .build()

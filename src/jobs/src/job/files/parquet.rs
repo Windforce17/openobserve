@@ -39,7 +39,7 @@ use config::{
 use hashbrown::HashSet;
 use infra::{
     schema::{
-        get_stream_setting_bloom_filter_fields, get_stream_setting_column_store_fields,
+        get_stream_setting_bloom_filter_fields,
         get_stream_setting_fts_fields,
     },
     storage,
@@ -962,10 +962,6 @@ async fn merge_files(
     let stream_settings = infra::schema::unwrap_stream_settings(&latest_schema);
     let bloom_filter_fields = get_stream_setting_bloom_filter_fields(&stream_settings);
     let full_text_search_fields = get_stream_setting_fts_fields(&stream_settings);
-    let column_store_fields = stream_settings
-        .as_ref()
-        .map(get_stream_setting_column_store_fields)
-        .unwrap_or_default();
 
     // we shouldn't use the latest schema, because there are too many fields, we need read schema
     // from files only get the fields what we need
@@ -1001,10 +997,16 @@ async fn merge_files(
     let start = std::time::Instant::now();
     // v2 core files: logs/traces always merge into ONE .vix object carrying
     // the records and the inverted index — no parquet data file and no
-    // sibling index. Every other stream type keeps the flat columnar path.
-    let use_core_file = matches!(stream_type, StreamType::Logs | StreamType::Traces);
+    // sibling index. Metrics join only behind the activation switch (#40,
+    // ZO_VIX_METRICS_CORE_FILE_ENABLED) and write COLUMN-STORE-ONLY files
+    // (no term index; see ZO_VIX_INDEX_DISABLED_STREAM_TYPES). Every other
+    // stream type keeps the flat columnar path.
+    let use_core_file = matches!(stream_type, StreamType::Logs | StreamType::Traces)
+        || (stream_type == StreamType::Metrics
+            && get_config().common.vix_metrics_core_file_enabled);
     type SpooledOutput = Option<crate::service::vix::core_writer::VixOutput>;
-    let merge_result: Result<(Vec<u8>, SpooledOutput, FileMeta, FileFormat), anyhow::Error> =
+    type SidecarBytes = Option<Vec<u8>>;
+    let merge_result: Result<(Vec<u8>, SpooledOutput, SidecarBytes, FileMeta, FileFormat), anyhow::Error> =
         if use_core_file {
             let store_original = stream_settings
                 .as_ref()
@@ -1012,10 +1014,10 @@ async fn merge_files(
             let bloom_filter_fields = get_stream_setting_bloom_filter_fields(&stream_settings);
             crate::service::vix::core_writer::write_core_file_from_tables(
             &trace_id,
+            stream_type,
             schema,
             tables,
             &full_text_search_fields,
-            &column_store_fields,
             &bloom_filter_fields,
             store_original,
             input_original_bytes,
@@ -1079,7 +1081,13 @@ async fn merge_files(
                 &result.stats,
                 &format!("[INGESTER:JOB:{thread_id}] {org_id}/{stream_type}/{stream_name}"),
             )?;
-            Ok((result.data, result.output, file_meta, FileFormat::Vix))
+            Ok((
+                result.data,
+                result.output,
+                result.index,
+                file_meta,
+                FileFormat::Vix,
+            ))
         })
         } else {
             merge::merge_parquet_files(
@@ -1090,6 +1098,10 @@ async fn merge_files(
                 &bloom_filter_fields,
                 new_file_meta,
                 true,
+                // ingester WAL move job: unchanged planning (single-partition
+                // sort covers the SEGMENT BUILDER (M13) and the COMPACTOR's
+                // metadata-class merges (M20b) only)
+                false,
             )
             .await
             .map_err(anyhow::Error::from)
@@ -1098,7 +1110,7 @@ async fn merge_files(
                     buf,
                     file_meta,
                     file_format,
-                } => (buf, None, file_meta, file_format),
+                } => (buf, None, None, file_meta, file_format),
                 MergeParquetResult::Multiple { .. } => {
                     // ingester should not support multiple files, it will be handled in compactor
                     // mode
@@ -1110,7 +1122,7 @@ async fn merge_files(
     // clear session data
     crate::service::search::datafusion::storage::file_list::clear(&trace_id);
 
-    let (buf, spooled_output, new_file_meta, file_format) = match merge_result {
+    let (buf, spooled_output, index_bytes, new_file_meta, file_format) = match merge_result {
         Ok(v) => v,
         Err(e) => {
             log::error!(
@@ -1145,20 +1157,34 @@ async fn merge_files(
     // vector), in-memory outputs keep the buffered path
     let account = storage::get_account(&org_id, &new_file_key).unwrap_or_default();
     let buf = Bytes::from(buf);
+    let cache_locally = cfg.cache_latest_files.enabled
+        && cfg.cache_latest_files.cache_parquet
+        && cfg.cache_latest_files.download_from_node;
     match spooled_output.as_ref().and_then(|o| o.spool_path()) {
         Some(spool) => {
             storage::put_file(&account, &new_file_key, spool).await?;
         }
         None => {
-            if cfg.cache_latest_files.enabled
-                && cfg.cache_latest_files.cache_parquet
-                && cfg.cache_latest_files.download_from_node
-            {
+            if cache_locally {
                 infra::cache::file_data::disk::set(&new_file_key, buf.clone()).await?;
                 log::debug!("merge_files {new_file_key} file_data::disk::set success");
             }
             storage::put(&account, &new_file_key, buf.clone()).await?;
         }
+    }
+    // v3 split: upload the `.vxi` index sidecar AFTER the data object and
+    // BEFORE the file_list row (written by the caller) — a crash in
+    // between leaves an orphan object without a row, today's semantics.
+    // Same account/placement as its data object.
+    if let Some(index) = index_bytes {
+        let sidecar_key = config::vix_sidecar_key(&new_file_key)
+            .expect("core-file move outputs are .vix keys");
+        debug_assert_eq!(index.len() as i64, new_file_meta.index_size);
+        let index = Bytes::from(index);
+        if cache_locally {
+            infra::cache::file_data::disk::set(&sidecar_key, index.clone()).await?;
+        }
+        storage::put(&account, &sidecar_key, index).await?;
     }
 
     // Enterprise: Extract service metadata during data processing
@@ -1230,9 +1256,10 @@ async fn merge_files(
         }
     }
 
-    // core files embed their inverted index (index_size already set from the
-    // writer stats); flat outputs (metrics + internal streams) get none —
-    // the v1 sidecar builder was removed
+    // v3 split: indexed core files uploaded their `.vxi` sidecar above
+    // (index_size = its object size, set from the writer stats); index-off
+    // core files and flat outputs (metrics + internal streams) have none
+    // (index_size = 0)
     Ok((account, new_file_key, new_file_meta, retain_file_list))
 }
 

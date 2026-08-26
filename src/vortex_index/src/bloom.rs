@@ -78,6 +78,67 @@ pub const FILE_BLOOM_ALGO_SBBF_GXHASH: u8 = 0x01;
 /// the textbook 1%).
 pub const DEFAULT_FILE_BLOOM_FPP: f64 = 0.001;
 
+/// Reserved section name of the #48 COMPOSITE bloom: one filter covering
+/// `(field name, value)` for every distinct value term of the file, making
+/// equality on ANY term field bloom-decidable. The `\u{1}` prefix keeps it
+/// out of the real field namespace and sorts it first; readers that never
+/// look this name up (pre-#48) ignore the section — no format version bump,
+/// and the v1 per-field sections stay byte-identical.
+pub const COMPOSITE_BLOOM_FIELD: &str = "\u{1}o2:any";
+
+/// Guard probes per covered field in the composite section. A field's
+/// coverage in a file is claimed only when ALL probes hit, so the chance of
+/// falsely treating an uncovered field as covered (the only path by which
+/// the composite could DROP a file it has no information about) is
+/// fpp^PROBES ≈ 1e-9 — everything else about the composite fails toward
+/// keeping the file.
+pub const COMPOSITE_GUARD_PROBES: u8 = 3;
+
+/// Tag byte of a composite VALUE key: `V {field len u16 BE} {field} {value}`.
+const COMPOSITE_KEY_VALUE_TAG: u8 = b'V';
+/// Tag byte of a composite GUARD key: `G {field len u16 BE} {field} {probe}`.
+const COMPOSITE_KEY_GUARD_TAG: u8 = b'G';
+
+/// Assemble the composite VALUE key for (`field`, `value`) into `buf` and
+/// return it. The tagged, length-prefixed form makes every key structurally
+/// unambiguous: a `{field}\0{value}` scheme would let `("a", "x\0y")` and
+/// `("a\0x", "y")` collide (JSON field names CAN contain `\0`), and — worse —
+/// let crafted values forge GUARD keys, turning a keep-direction collision
+/// into a wrong drop. `None` iff the field name overflows the u16 length
+/// prefix; such a field is simply never covered (probes on it stay "no
+/// info"). This function is the single choke point shared by the writers and
+/// the search-side pruner — the two MUST hash identical bytes.
+#[inline]
+pub fn composite_value_key<'a>(
+    field: &str,
+    value: &[u8],
+    buf: &'a mut Vec<u8>,
+) -> Option<&'a [u8]> {
+    let len = u16::try_from(field.len()).ok()?;
+    buf.clear();
+    buf.reserve(4 + field.len() + value.len());
+    buf.push(COMPOSITE_KEY_VALUE_TAG);
+    buf.extend_from_slice(&len.to_be_bytes());
+    buf.extend_from_slice(field.as_bytes());
+    buf.extend_from_slice(value);
+    Some(buf)
+}
+
+/// Assemble composite GUARD key `probe` for `field` into `buf` — see
+/// [`COMPOSITE_GUARD_PROBES`]. Same single-choke-point contract as
+/// [`composite_value_key`].
+#[inline]
+pub fn composite_guard_key<'a>(field: &str, probe: u8, buf: &'a mut Vec<u8>) -> Option<&'a [u8]> {
+    let len = u16::try_from(field.len()).ok()?;
+    buf.clear();
+    buf.reserve(4 + field.len());
+    buf.push(COMPOSITE_KEY_GUARD_TAG);
+    buf.extend_from_slice(&len.to_be_bytes());
+    buf.extend_from_slice(field.as_bytes());
+    buf.push(probe);
+    Some(buf)
+}
+
 /// One field's bloom in a per-file blob.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FileBloom {
@@ -151,6 +212,19 @@ struct FieldAcc {
 pub struct BloomHashAcc {
     /// field id -> accumulation
     fields: HashMap<u16, FieldAcc>,
+    /// #48 composite section: `(fid -> name)` for EVERY term-plan field.
+    /// Non-empty enables the composite accumulation — each observed key
+    /// ALSO hashes the file-independent form `{field name}\0{value}` into
+    /// ONE reserved section ([`COMPOSITE_BLOOM_FIELD`]), so equality on ANY
+    /// term field becomes bloom-decidable. Field NAMES (not per-file ids)
+    /// keep the hash stable across files, which is what lets the pruner
+    /// compute the probe key without knowing any file's term plan.
+    composite_names: HashMap<u16, String>,
+    /// The composite accumulation (name fixed to [`COMPOSITE_BLOOM_FIELD`]).
+    composite: FieldAcc,
+    /// Scratch for composite key assembly (separate from `scratch`: the
+    /// dict-walk path holds `scratch` across the inner `observe` call).
+    composite_scratch: Vec<u8>,
     /// Dictionary keys too short to carry a field-id prefix (a corrupt
     /// dictionary): unattributable to a field, so counted and dropped.
     short_keys: u64,
@@ -212,10 +286,48 @@ impl BloomHashAcc {
         }
     }
 
+    /// Enable the #48 composite section over `(field id, field name)` pairs.
+    /// Callers pass exactly the fields whose dictionaries hold COMPLETE raw
+    /// values (no fts/tokenized fields, no merge-demoted fields — see
+    /// `VixWriter::composite_pairs`): the guard keys claim authoritative
+    /// coverage for these names, so an ineligible pair here turns bloom
+    /// misses into wrong drops. Idempotent per build; call before the first
+    /// observe.
+    pub fn enable_composite<I: IntoIterator<Item = (u16, String)>>(&mut self, pairs: I) {
+        // names longer than the key form's u16 length prefix cannot be keyed:
+        // leave them untracked so their coverage honestly reads "no info"
+        // (tracking them would count every key as dropped and poison the
+        // whole build)
+        self.composite_names = pairs
+            .into_iter()
+            .filter(|(_, name)| name.len() <= u16::MAX as usize)
+            .collect();
+        self.composite.name = COMPOSITE_BLOOM_FIELD.to_string();
+    }
+
+    /// #52: absorb PRE-HASHED composite value keys for a bloom-only field
+    /// (values observed at push time, deduped by the writer). Registers the
+    /// field in the coverage set so guards are seeded for it at build —
+    /// callers must pass every distinct value's hash, or misses on the
+    /// missing values become wrong drops.
+    pub fn absorb_composite_hashes<I: IntoIterator<Item = u64>>(
+        &mut self,
+        fid: u16,
+        name: &str,
+        hashes: I,
+    ) {
+        if name.len() > u16::MAX as usize {
+            return; // cannot be keyed — never claim coverage
+        }
+        self.composite_names.insert(fid, name.to_string());
+        self.composite.name = COMPOSITE_BLOOM_FIELD.to_string();
+        self.composite.hashes.extend(hashes);
+    }
+
     /// Whether any field is tracked (skip the observe calls entirely when
     /// not — the common no-bloom-fields case must stay zero-cost).
     pub fn is_empty(&self) -> bool {
-        self.fields.is_empty()
+        self.fields.is_empty() && self.composite_names.is_empty()
     }
 
     /// Observe one distinct term key in the PINNED bloom byte form,
@@ -224,13 +336,26 @@ impl BloomHashAcc {
     /// [`Self::observe_dict_key`].
     #[inline]
     pub fn observe(&mut self, composite_key: &[u8]) {
-        if self.fields.is_empty() {
+        if self.fields.is_empty() && self.composite_names.is_empty() {
             return;
         }
-        if let Some((value, id)) = split_composite_key(composite_key)
-            && let Some(entry) = self.fields.get_mut(&id)
-        {
+        let Some((value, id)) = split_composite_key(composite_key) else {
+            return;
+        };
+        if let Some(entry) = self.fields.get_mut(&id) {
             entry.hashes.push(hash_value(value));
+        }
+        // #48: the same key also lands in the composite section in the
+        // file-independent tagged form (see [`composite_value_key`]). The
+        // `None` arm is unreachable — `enable_composite` filters names the
+        // key form cannot carry — but a silent skip here would surface as
+        // `dropped` and poison the build, so guard it explicitly.
+        if let Some(name) = self.composite_names.get(&id) {
+            let mut buf = std::mem::take(&mut self.composite_scratch);
+            if let Some(key) = composite_value_key(name, value, &mut buf) {
+                self.composite.hashes.push(hash_value(key));
+            }
+            self.composite_scratch = buf;
         }
     }
 
@@ -245,7 +370,7 @@ impl BloomHashAcc {
     /// them.
     #[inline]
     pub fn observe_dict_key(&mut self, key: &[u8]) {
-        if self.fields.is_empty() {
+        if self.fields.is_empty() && self.composite_names.is_empty() {
             return;
         }
         let Some((_, id)) = crate::query::split_key(key) else {
@@ -253,18 +378,30 @@ impl BloomHashAcc {
             self.short_keys = self.short_keys.saturating_add(1);
             return;
         };
-        // untracked field ids (every non-bloom field, plus key terms) are
-        // the common case and must stay a single lookup
-        let Some(before) = self.fields.get(&id).map(|entry| entry.hashes.len()) else {
+        // untracked field ids (neither a bloom field nor — with the #48
+        // composite enabled — any term field; key terms always land here)
+        // are the common case and must stay cheap lookups
+        let per_field_before = self.fields.get(&id).map(|entry| entry.hashes.len());
+        let composite_before = self
+            .composite_names
+            .contains_key(&id)
+            .then_some(self.composite.hashes.len());
+        if per_field_before.is_none() && composite_before.is_none() {
             return;
-        };
+        }
         let mut scratch = std::mem::take(&mut self.scratch);
         self.observe(crate::query::bloom_canonical_key(key, &mut scratch));
         self.scratch = scratch;
-        if let Some(entry) = self.fields.get_mut(&id)
+        if let Some(before) = per_field_before
+            && let Some(entry) = self.fields.get_mut(&id)
             && entry.hashes.len() == before
         {
             entry.dropped = entry.dropped.saturating_add(1);
+        }
+        if let Some(before) = composite_before
+            && self.composite.hashes.len() == before
+        {
+            self.composite.dropped = self.composite.dropped.saturating_add(1);
         }
     }
 
@@ -287,6 +424,18 @@ impl BloomHashAcc {
             entry.hashes.extend(hashes);
             entry.dropped = entry.dropped.saturating_add(dropped);
         }
+        // #48 composite: workers share the same enable_composite pairs
+        if !other.composite_names.is_empty() {
+            if self.composite_names.is_empty() {
+                self.composite_names = other.composite_names;
+                self.composite.name = COMPOSITE_BLOOM_FIELD.to_string();
+            }
+            self.composite.hashes.extend(other.composite.hashes);
+            self.composite.dropped = self
+                .composite
+                .dropped
+                .saturating_add(other.composite.dropped);
+        }
     }
 
     /// Build the per-field filters of a walk that covered the file's WHOLE
@@ -305,7 +454,16 @@ impl BloomHashAcc {
     /// error level; callers that can propagate instead should use
     /// [`Self::build_checked`].
     pub fn build(self, fpp: f64) -> Vec<FileBloom> {
-        let (out, issues) = self.finish(fpp, true);
+        self.build_threaded(fpp, 1)
+    }
+
+    /// [`Self::build`] with a thread budget for the SBBF bit-setting of
+    /// LARGE sections (M12 — the merged composite over tens of millions of
+    /// hashes was the single-threaded tail of the merge's index share).
+    /// Byte-identical to `threads = 1` for any budget
+    /// ([`crate::sbbf::Sbbf::insert_hashes`]'s disjoint-block partition).
+    pub fn build_threaded(self, fpp: f64, threads: usize) -> Vec<FileBloom> {
+        let (out, issues) = self.finish(fpp, true, threads);
         if issues.is_bug() {
             log::error!(
                 "[VIX:BLOOM] refusing to publish filters: {}",
@@ -327,7 +485,7 @@ impl BloomHashAcc {
     ///   field as "no info" (keeps the file) but an empty filter as "no value here" (drops the
     ///   file) — so the safe side is to publish nothing.
     pub fn build_checked(self, fpp: f64) -> Result<Vec<FileBloom>> {
-        let (out, issues) = self.finish(fpp, false);
+        let (out, issues) = self.finish(fpp, false, 1);
         if issues.is_bug() {
             return Err(VixError::Writer(issues.describe()));
         }
@@ -343,14 +501,42 @@ impl BloomHashAcc {
     /// Shared build: emits one filter per field, in field-name order.
     /// `publish_empty` decides what happens to a field with no observed
     /// values (see [`Self::build`] vs [`Self::build_checked`]); fields with
-    /// dropped keys are withheld either way.
-    fn finish(self, fpp: f64, publish_empty: bool) -> (Vec<FileBloom>, BuildIssues) {
-        let mut out: Vec<FileBloom> = Vec::with_capacity(self.fields.len());
+    /// dropped keys are withheld either way. `threads` bounds the parallel
+    /// bit-setting of large sections (1 = fully sequential; identical
+    /// bytes either way).
+    fn finish(self, fpp: f64, publish_empty: bool, threads: usize) -> (Vec<FileBloom>, BuildIssues) {
+        let mut out: Vec<FileBloom> = Vec::with_capacity(self.fields.len() + 1);
         let mut issues = BuildIssues {
             short_keys: self.short_keys,
             ..Default::default()
         };
         let mut fields: Vec<FieldAcc> = self.fields.into_values().collect();
+        // #48: the composite section rides the same publish semantics as a
+        // field (dropped => withheld); its reserved \u{1}-prefixed name
+        // sorts it first among sections
+        if !self.composite_names.is_empty() {
+            let mut composite = self.composite;
+            // Guard keys: COMPOSITE_GUARD_PROBES per covered field, seeded
+            // once at publish time (parallel merge workers fold their accs
+            // together BEFORE finish, so seeding earlier would duplicate
+            // them worker-fold times and inflate the sizing). The pruner
+            // claims a field covered only when ALL probes hit — an
+            // uncovered field (numeric column, partial_fields drop,
+            // schema drift) must read "no info" (keep), never "definitely
+            // not" (drop). Guards also make an enabled-but-value-less
+            // composite non-empty, so it publishes under `build_checked`'s
+            // withhold-empty rule too: a complete dictionary walk that saw
+            // no term keys IS proof the covered fields hold no values.
+            let mut buf = Vec::new();
+            for name in self.composite_names.values() {
+                for probe in 0..COMPOSITE_GUARD_PROBES {
+                    if let Some(key) = composite_guard_key(name, probe, &mut buf) {
+                        composite.hashes.push(hash_value(key));
+                    }
+                }
+            }
+            fields.push(composite);
+        }
         fields.sort_by(|a, b| a.name.cmp(&b.name));
         for FieldAcc {
             name,
@@ -370,9 +556,7 @@ impl BloomHashAcc {
             }
             let num_blocks = num_blocks_for(hashes.len() as u64, fpp);
             let mut sbbf = Sbbf::new_with_num_blocks(num_blocks);
-            for h in &hashes {
-                sbbf.insert_hash(*h);
-            }
+            sbbf.insert_hashes(&hashes, threads);
             out.push(FileBloom {
                 field: name,
                 num_blocks: sbbf.num_blocks(),
@@ -505,7 +689,7 @@ mod tests {
     /// A real `.vix` holding one raw-term `trace_id` column and NO per-file
     /// bloom blob — exactly the shape the group `.bf` assembler backfills by
     /// streaming the dictionary.
-    fn build_backfill_file(values: &[&str]) -> Vec<u8> {
+    fn build_backfill_file(values: &[&str]) -> (Vec<u8>, Option<Vec<u8>>) {
         use std::sync::Arc;
 
         use arrow::{
@@ -537,9 +721,11 @@ mod tests {
         writer.finish().unwrap()
     }
 
-    /// Re-pack a `.vix` with its `row_count` property overwritten: the
-    /// cheapest way to fabricate a `doc_count` cell that exceeds the file's
-    /// row count (the corrupt shape the walk must reject).
+    /// Re-pack ONE object with its `row_count` property overwritten (both
+    /// objects of a pair must be repacked together — the reader verifies
+    /// they agree): the cheapest way to fabricate a `doc_count` cell that
+    /// exceeds the file's row count (the corrupt shape the walk must
+    /// reject).
     fn repack_with_row_count(data: &[u8], row_count: u64) -> Vec<u8> {
         use crate::container::{
             BLOB_TAG_DICT, BLOB_TAG_DICT_BLOCKS, BLOB_TAG_DOCS, BLOB_TAG_TERMS, BLOB_TYPE_DICT,
@@ -590,8 +776,12 @@ mod tests {
     #[test]
     fn dict_key_backfill_matches_file_values() {
         let values = ["trace-a", "trace-b", "trace-c"];
-        let file = build_backfill_file(&values);
-        let reader = crate::VixReader::open(bytes::Bytes::from(file)).unwrap();
+        let (file, file_index) = build_backfill_file(&values);
+        let reader = crate::VixReader::open_with_index(
+            bytes::Bytes::from(file),
+            file_index.map(bytes::Bytes::from),
+        )
+        .unwrap();
         let field_id = reader.term_field_id("trace_id").unwrap();
 
         let mut acc = BloomHashAcc::from_pairs([(field_id, "trace_id".to_string())]);
@@ -690,9 +880,14 @@ mod tests {
     /// queues take the file out instead of spinning on it forever.
     #[test]
     fn backfill_walk_rejects_doc_count_above_row_count() {
-        let file = build_backfill_file(&["dup", "dup", "solo"]);
+        let (file, file_index) = build_backfill_file(&["dup", "dup", "solo"]);
         let poisoned = repack_with_row_count(&file, 1);
-        let reader = crate::VixReader::open(bytes::Bytes::from(poisoned)).unwrap();
+        let poisoned_index = repack_with_row_count(&file_index.expect("sidecar"), 1);
+        let reader = crate::VixReader::open_with_index(
+            bytes::Bytes::from(poisoned),
+            Some(bytes::Bytes::from(poisoned_index)),
+        )
+        .unwrap();
         let err = reader
             .for_each_term(&mut |_key, _doc_count, _ids| Ok(()))
             .unwrap_err();
@@ -743,10 +938,13 @@ mod tests {
         writer
             .push_batch_with_source(&batch, &source, None)
             .unwrap();
-        let data = bytes::Bytes::from(writer.finish().unwrap());
+        let (data, index) = writer.finish().unwrap();
+        let data = bytes::Bytes::from(data);
+        let index = bytes::Bytes::from(index.expect("sidecar"));
 
-        // ...repacked with the bloom blob's bytes replaced by garbage
-        let container = parse_container(&data).unwrap();
+        // ...the SIDECAR repacked with the bloom blob's bytes replaced by
+        // garbage
+        let container = parse_container(&index).unwrap();
         assert!(container.bloom.is_some(), "writer must emit the blob");
         let properties: Vec<(String, String)> = container
             .properties
@@ -774,7 +972,11 @@ mod tests {
         blobs.push((BLOB_TYPE_BLOOM, BLOB_TAG_BLOOM, vec![0xFF; 32]));
         let corrupt = build_container(properties, blobs).unwrap();
 
-        let reader = crate::VixReader::open(bytes::Bytes::from(corrupt)).unwrap();
+        let reader = crate::VixReader::open_with_index(
+            data.clone(),
+            Some(bytes::Bytes::from(corrupt)),
+        )
+        .unwrap();
         let err = reader.file_blooms().unwrap_err();
         assert!(
             is_unbuildable(&err),
@@ -840,7 +1042,14 @@ mod tests {
         writer
             .push_batch_with_source(&batch, &source, None)
             .unwrap();
-        let reader = crate::VixReader::open(bytes::Bytes::from(writer.finish().unwrap())).unwrap();
+        let reader = {
+            let (data, index) = writer.finish().unwrap();
+            crate::VixReader::open_with_index(
+                bytes::Bytes::from(data),
+                index.map(bytes::Bytes::from),
+            )
+            .unwrap()
+        };
 
         let pairs: Vec<(u16, String)> = reader
             .term_field_id("trace_id")
@@ -966,6 +1175,581 @@ mod tests {
         // deterministic field order (sorted by name)
         assert_eq!(parsed[0].field, "span_id");
         assert_eq!(parsed[1].field, "trace_id");
+    }
+
+    /// #48: the tagged composite key forms are structurally disjoint — no
+    /// (field, value) split is ambiguous, and no crafted value can forge a
+    /// guard key (a forged guard would flip a keep into a wrong drop).
+    #[test]
+    fn composite_key_forms_are_unambiguous() {
+        let mut b1 = Vec::new();
+        let mut b2 = Vec::new();
+        // the `{field}\0{value}` failure shape: ("a", "x\0y") vs ("a\0x", "y")
+        let k1 = composite_value_key("a", b"x\0y", &mut b1).unwrap().to_vec();
+        let k2 = composite_value_key("a\0x", b"y", &mut b2).unwrap().to_vec();
+        assert_ne!(k1, k2);
+        // a value crafted to mimic a guard's tail never equals one (tag byte)
+        let forged = composite_value_key("f", b"\x00\x01f\x00", &mut b1)
+            .unwrap()
+            .to_vec();
+        for probe_idx in 0..COMPOSITE_GUARD_PROBES {
+            let g = composite_guard_key("f", probe_idx, &mut b2).unwrap();
+            assert_eq!(g[0], COMPOSITE_KEY_GUARD_TAG);
+            assert_ne!(forged.as_slice(), g);
+        }
+        // field names beyond the u16 length prefix cannot be keyed
+        let long = "x".repeat(u16::MAX as usize + 1);
+        assert!(composite_value_key(&long, b"v", &mut b1).is_none());
+        assert!(composite_guard_key(&long, 0, &mut b1).is_none());
+    }
+
+    /// #48 composite accumulation end-to-end: values from EVERY covered
+    /// field land in the one reserved section, guard probes claim exactly
+    /// the covered fields, and an uncovered field's guards miss — the
+    /// pruner's signal to treat a value miss as "no info" instead of
+    /// "definitely not".
+    #[test]
+    fn composite_section_covers_values_and_guards() {
+        let mut acc = BloomHashAcc::from_pairs([(1u16, "trace_id".to_string())]);
+        acc.enable_composite([(1u16, "trace_id".to_string()), (2u16, "attr".to_string())]);
+        for i in 0..50u32 {
+            acc.observe(&composite(format!("t-{i}").as_bytes(), 1));
+            acc.observe(&composite(format!("a-{i}").as_bytes(), 2));
+        }
+        let blooms = acc.build(0.001);
+        assert_eq!(blooms.len(), 2, "per-field trace_id + composite");
+        let comp = &blooms[0];
+        assert_eq!(
+            comp.field, COMPOSITE_BLOOM_FIELD,
+            "reserved name sorts first"
+        );
+        // 100 distinct values + 2 covered fields × guard probes
+        assert_eq!(comp.n_items, 100 + 2 * COMPOSITE_GUARD_PROBES as u32);
+        let mut buf = Vec::new();
+        // values of BOTH fields present under their tagged keys
+        assert!(probe(
+            comp,
+            composite_value_key("trace_id", b"t-7", &mut buf).unwrap()
+        ));
+        assert!(probe(
+            comp,
+            composite_value_key("attr", b"a-33", &mut buf).unwrap()
+        ));
+        // absent value misses (deterministic for these fixed keys)
+        assert!(!probe(
+            comp,
+            composite_value_key("trace_id", b"absent", &mut buf).unwrap()
+        ));
+        // covered fields: ALL guard probes hit
+        for field in ["trace_id", "attr"] {
+            for p in 0..COMPOSITE_GUARD_PROBES {
+                assert!(probe(
+                    comp,
+                    composite_guard_key(field, p, &mut buf).unwrap()
+                ));
+            }
+        }
+        // an uncovered field: at least one guard probe misses
+        let uncovered_hits = (0..COMPOSITE_GUARD_PROBES)
+            .filter(|&p| probe(comp, composite_guard_key("severity", p, &mut buf).unwrap()))
+            .count();
+        assert!(uncovered_hits < COMPOSITE_GUARD_PROBES as usize);
+    }
+
+    /// Guards are seeded at publish time, exactly once — parallel merge
+    /// workers folding their accumulators must not duplicate them (the
+    /// sizing would silently inflate worker-fold times).
+    #[test]
+    fn composite_guards_seed_once_across_merged_workers() {
+        let pairs = [(1u16, "f".to_string())];
+        let mut a = BloomHashAcc::default();
+        a.enable_composite(pairs.clone());
+        a.observe(&composite(b"v1", 1));
+        let mut b = BloomHashAcc::default();
+        b.enable_composite(pairs);
+        b.observe(&composite(b"v2", 1));
+        a.merge(b);
+        let blooms = a.build(0.001);
+        assert_eq!(blooms.len(), 1);
+        assert_eq!(blooms[0].field, COMPOSITE_BLOOM_FIELD);
+        // 2 values + one set of guards — NOT two sets
+        assert_eq!(blooms[0].n_items, 2 + COMPOSITE_GUARD_PROBES as u32);
+    }
+
+    /// #48: fts fields must stay OUT of the composite coverage — their
+    /// dictionary entries are tokens, so claiming coverage would make a
+    /// raw-value equality probe read "definitely not" for values the file
+    /// holds (a wrong drop, not a missed optimization).
+    #[test]
+    fn composite_excludes_fts_fields() {
+        use std::sync::Arc;
+
+        use arrow::{
+            array::{ArrayRef, Int64Array, StringArray},
+            datatypes::{DataType, Field, Schema},
+            record_batch::RecordBatch,
+        };
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("svc", DataType::Utf8, true),
+            Field::new("msg", DataType::Utf8, true),
+            Field::new("status", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1_000i64])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["api"])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["hello bloom world"])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![200i64])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let source = StringArray::from_iter_values([
+            r#"{"svc":"api","msg":"hello bloom world","status":200}"#.to_string(),
+        ]);
+        let mut writer = crate::VixWriter::new(
+            &schema,
+            crate::VixWriterOptions {
+                bloom_composite: true,
+                fts_field_names: vec!["msg".to_string()],
+                ..Default::default()
+            },
+            false,
+        );
+        writer
+            .push_batch_with_source(&batch, &source, None)
+            .unwrap();
+        let reader = {
+            let (data, index) = writer.finish().unwrap();
+            crate::VixReader::open_with_index(
+                bytes::Bytes::from(data),
+                index.map(bytes::Bytes::from),
+            )
+            .unwrap()
+        };
+
+        let blooms = reader.file_blooms().unwrap().expect("composite blob");
+        let comp = blooms
+            .iter()
+            .find(|b| b.field == COMPOSITE_BLOOM_FIELD)
+            .expect("composite section");
+        let mut buf = Vec::new();
+        // the term field is covered and its value present
+        for p in 0..COMPOSITE_GUARD_PROBES {
+            assert!(probe(
+                comp,
+                composite_guard_key("svc", p, &mut buf).unwrap()
+            ));
+        }
+        assert!(probe(
+            comp,
+            composite_value_key("svc", b"api", &mut buf).unwrap()
+        ));
+        // the fts field is NOT covered: its guards must not all hit
+        let fts_hits = (0..COMPOSITE_GUARD_PROBES)
+            .filter(|&p| probe(comp, composite_guard_key("msg", p, &mut buf).unwrap()))
+            .count();
+        assert!(
+            fts_hits < COMPOSITE_GUARD_PROBES as usize,
+            "fts coverage claim would wrongly drop files on msg='raw value'"
+        );
+        // NUMERIC term fields are NOT covered either: their value terms are
+        // canonical tagged bytes, so the pruner's raw-literal probe
+        // (`status = 200`) would read "definitely not" and wrongly drop
+        let num_hits = (0..COMPOSITE_GUARD_PROBES)
+            .filter(|&p| probe(comp, composite_guard_key("status", p, &mut buf).unwrap()))
+            .count();
+        assert!(
+            num_hits < COMPOSITE_GUARD_PROBES as usize,
+            "numeric coverage claim would wrongly drop files on status=200"
+        );
+    }
+
+    /// #52 bloom-only: the demoted field contributes ZERO dictionary terms,
+    /// its values answer from the composite (with coverage guards), and the
+    /// indexed sibling field keeps exact index behavior.
+    #[test]
+    fn bloom_only_field_skips_dictionary_and_covers_composite() {
+        use std::sync::Arc;
+
+        use arrow::{
+            array::{ArrayRef, Int64Array, StringArray},
+            datatypes::{DataType, Field, Schema},
+            record_batch::RecordBatch,
+        };
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("svc", DataType::Utf8, true),
+            Field::new("trace_id", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1_000i64, 1_001])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["api", "api"])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["t-aaaa", "t-bbbb"])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let source = StringArray::from_iter_values([
+            r#"{"svc":"api","trace_id":"t-aaaa"}"#.to_string(),
+            r#"{"svc":"api","trace_id":"t-bbbb"}"#.to_string(),
+        ]);
+        let mut writer = crate::VixWriter::new(
+            &schema,
+            crate::VixWriterOptions {
+                bloom_composite: true,
+                bloom_only_field_names: vec!["trace_id".to_string()],
+                ..Default::default()
+            },
+            false,
+        );
+        writer
+            .push_batch_with_source(&batch, &source, None)
+            .unwrap();
+        let reader = {
+            let (data, index) = writer.finish().unwrap();
+            crate::VixReader::open_with_index(
+                bytes::Bytes::from(data),
+                index.map(bytes::Bytes::from),
+            )
+            .unwrap()
+        };
+
+        // no value-index capability for the demoted field; sibling keeps it
+        assert!(reader.term_field_id("trace_id").is_none());
+        assert!(reader.term_field_id("svc").is_some());
+        // and genuinely no trace_id VALUE terms in the dictionary
+        let mut trace_value_terms = 0;
+        reader
+            .for_each_term(&mut |key, _dc, _rgs| {
+                if let Some((token, fid)) = crate::query::split_key(key)
+                    && fid != crate::query::KEY_FIELD_ID
+                    && token.starts_with(b"t-")
+                {
+                    trace_value_terms += 1;
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            trace_value_terms, 0,
+            "bloom-only values must not reach the dictionary"
+        );
+
+        // composite: values present, coverage claimed
+        let blooms = reader.file_blooms().unwrap().expect("blob");
+        let comp = blooms
+            .iter()
+            .find(|b| b.field == COMPOSITE_BLOOM_FIELD)
+            .expect("composite section");
+        let mut buf = Vec::new();
+        for v in ["t-aaaa", "t-bbbb"] {
+            assert!(probe(
+                comp,
+                composite_value_key("trace_id", v.as_bytes(), &mut buf).unwrap()
+            ));
+        }
+        assert!(!probe(
+            comp,
+            composite_value_key("trace_id", b"t-absent", &mut buf).unwrap()
+        ));
+        for pr in 0..COMPOSITE_GUARD_PROBES {
+            assert!(probe(
+                comp,
+                composite_guard_key("trace_id", pr, &mut buf).unwrap()
+            ));
+        }
+    }
+
+    /// #52/M7: a field demoted by the FIRST-ENCODE AUTO rule (thresholds
+    /// crossed at finish, no configured list) must produce the EXACT same
+    /// file — data and index sidecar bytes — as a construction-list
+    /// demotion of the same field over the same pushes: same `bloom`
+    /// marker, same composite coverage + guards, no dictionary values, no
+    /// per-field bloom, key terms intact.
+    #[test]
+    fn first_encode_auto_demotion_matches_construction_list() {
+        use std::sync::Arc;
+
+        use arrow::{
+            array::{ArrayRef, Int64Array, StringArray},
+            datatypes::{DataType, Field, Schema},
+            record_batch::RecordBatch,
+        };
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("svc", DataType::Utf8, true),
+            Field::new("trace_id", DataType::Utf8, true),
+        ]));
+        let trace_values: Vec<String> = (0..8).map(|i| format!("t-{i:04}")).collect();
+        let build = |opts: crate::VixWriterOptions| {
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from((0..8i64).map(|i| 1_000 + i).collect::<Vec<_>>()))
+                        as ArrayRef,
+                    Arc::new(StringArray::from(vec!["api"; 8])) as ArrayRef,
+                    Arc::new(StringArray::from(
+                        trace_values.iter().map(String::as_str).collect::<Vec<_>>(),
+                    )) as ArrayRef,
+                ],
+            )
+            .unwrap();
+            let source = StringArray::from_iter_values(
+                trace_values
+                    .iter()
+                    .map(|t| format!(r#"{{"svc":"api","trace_id":"{t}"}}"#)),
+            );
+            let mut writer = crate::VixWriter::new(&schema, opts, false);
+            writer.push_batch_with_source(&batch, &source, None).unwrap();
+            writer.finish().unwrap()
+        };
+
+        // Both variants also NAME the field a per-file bloom field: the
+        // demotion must suppress the per-field section identically (an
+        // empty per-field filter would reject every probe).
+        let (list_data, list_index) = build(crate::VixWriterOptions {
+            bloom_composite: true,
+            bloom_field_names: vec!["trace_id".to_string()],
+            bloom_only_field_names: vec!["trace_id".to_string()],
+            ..Default::default()
+        });
+        let (auto_data, auto_index) = build(crate::VixWriterOptions {
+            bloom_composite: true,
+            bloom_field_names: vec!["trace_id".to_string()],
+            bloom_only_auto_ratio: 0.5,
+            bloom_only_min_distinct: 4,
+            ..Default::default()
+        });
+        assert_eq!(auto_data, list_data, "data object bytes must be identical");
+        assert_eq!(
+            auto_index, list_index,
+            "index sidecar bytes must be identical (marker, dict, blooms)"
+        );
+
+        let reader = crate::VixReader::open_with_index(
+            bytes::Bytes::from(auto_data),
+            auto_index.map(bytes::Bytes::from),
+        )
+        .unwrap();
+        // marker + capabilities: demoted field bloom-typed, sibling term
+        assert_eq!(reader.bloom_only_fields().collect::<Vec<_>>(), ["trace_id"]);
+        assert!(reader.term_field_id("trace_id").is_none());
+        assert!(reader.term_field_id("svc").is_some());
+        // key terms stay: `IS [NOT] NULL` proofs remain exact
+        assert!(reader.key_term_exists("trace_id").unwrap());
+        // no trace value ever reached the dictionary (svc's 8x-dense "api"
+        // and the key terms are all that remain)
+        let mut trace_value_terms = 0;
+        reader
+            .for_each_term(&mut |key, _dc, _rgs| {
+                if let Some((token, fid)) = crate::query::split_key(key)
+                    && fid != crate::query::KEY_FIELD_ID
+                    && token.starts_with(b"t-")
+                {
+                    trace_value_terms += 1;
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(trace_value_terms, 0);
+        // blooms: ONLY the composite section (per-field suppressed), all
+        // values probeable, absents miss, guards claim coverage
+        let blooms = reader.file_blooms().unwrap().expect("blob");
+        assert_eq!(blooms.len(), 1, "composite only — no per-field section");
+        let comp = &blooms[0];
+        assert_eq!(comp.field, COMPOSITE_BLOOM_FIELD);
+        let mut buf = Vec::new();
+        for v in &trace_values {
+            assert!(probe(
+                comp,
+                composite_value_key("trace_id", v.as_bytes(), &mut buf).unwrap()
+            ));
+        }
+        assert!(!probe(
+            comp,
+            composite_value_key("trace_id", b"t-absent", &mut buf).unwrap()
+        ));
+        for pr in 0..COMPOSITE_GUARD_PROBES {
+            assert!(probe(
+                comp,
+                composite_guard_key("trace_id", pr, &mut buf).unwrap()
+            ));
+        }
+    }
+
+    /// #52/M7 first-encode AUTO edges: the distinct floor, the ratio, the
+    /// never-list, and the candidate filters (fts and numeric fields are
+    /// never demoted regardless of cardinality).
+    #[test]
+    fn first_encode_auto_demotion_thresholds() {
+        use std::sync::Arc;
+
+        use arrow::{
+            array::{ArrayRef, Int64Array, StringArray},
+            datatypes::{DataType, Field, Schema},
+            record_batch::RecordBatch,
+        };
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("tid", DataType::Utf8, true),
+            Field::new("nvr", DataType::Utf8, true),
+            Field::new("msg", DataType::Utf8, true),
+            Field::new("num", DataType::Int64, true),
+        ]));
+        let build = |opts: crate::VixWriterOptions| {
+            let rows = 8i64;
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(
+                        (0..rows).map(|i| 1_000 + i).collect::<Vec<_>>(),
+                    )) as ArrayRef,
+                    Arc::new(StringArray::from(
+                        (0..rows).map(|i| format!("t{i}")).collect::<Vec<_>>(),
+                    )) as ArrayRef,
+                    Arc::new(StringArray::from(
+                        (0..rows).map(|i| format!("n{i}")).collect::<Vec<_>>(),
+                    )) as ArrayRef,
+                    Arc::new(StringArray::from(
+                        (0..rows).map(|i| format!("tok{i} shared")).collect::<Vec<_>>(),
+                    )) as ArrayRef,
+                    Arc::new(Int64Array::from((0..rows).collect::<Vec<_>>())) as ArrayRef,
+                ],
+            )
+            .unwrap();
+            let source = StringArray::from_iter_values((0..rows).map(|i| {
+                format!(
+                    r#"{{"tid":"t{i}","nvr":"n{i}","msg":"tok{i} shared","num":{i}}}"#
+                )
+            }));
+            let mut writer = crate::VixWriter::new(&schema, opts, false);
+            writer.push_batch_with_source(&batch, &source, None).unwrap();
+            let (data, index) = writer.finish().unwrap();
+            crate::VixReader::open_with_index(
+                bytes::Bytes::from(data),
+                index.map(bytes::Bytes::from),
+            )
+            .unwrap()
+        };
+
+        // every string field is at ratio 1.0 / distinct 8: tid demotes; the
+        // never-list protects nvr; msg is fts (tokens, never a candidate);
+        // num is numeric (tagged canonical terms, never a candidate)
+        let reader = build(crate::VixWriterOptions {
+            bloom_composite: true,
+            bloom_only_auto_ratio: 0.5,
+            bloom_only_min_distinct: 4,
+            bloom_only_never: vec!["nvr".to_string()],
+            fts_field_names: vec!["msg".to_string()],
+            ..Default::default()
+        });
+        assert_eq!(reader.bloom_only_fields().collect::<Vec<_>>(), ["tid"]);
+        assert!(reader.term_field_id("tid").is_none());
+        assert!(reader.term_field_id("nvr").is_some(), "never-list wins");
+        assert!(
+            reader.term_field_id("num").is_some(),
+            "numeric fields keep their canonical value terms"
+        );
+        assert!(
+            reader.fts_fields().contains("msg"),
+            "fts fields stay tokenized"
+        );
+
+        // absolute floor not met: nothing demotes
+        let reader = build(crate::VixWriterOptions {
+            bloom_composite: true,
+            bloom_only_auto_ratio: 0.5,
+            bloom_only_min_distinct: 9,
+            ..Default::default()
+        });
+        assert_eq!(reader.bloom_only_fields().count(), 0);
+        assert!(reader.term_field_id("tid").is_some());
+
+        // ratio not met (8 distinct / 8 rows = 1.0 < 1.1): nothing demotes
+        let reader = build(crate::VixWriterOptions {
+            bloom_composite: true,
+            bloom_only_auto_ratio: 1.1,
+            bloom_only_min_distinct: 4,
+            ..Default::default()
+        });
+        assert_eq!(reader.bloom_only_fields().count(), 0);
+
+        // ratio 0 (env-disabled): nothing demotes
+        let reader = build(crate::VixWriterOptions {
+            bloom_composite: true,
+            bloom_only_auto_ratio: 0.0,
+            bloom_only_min_distinct: 1,
+            ..Default::default()
+        });
+        assert_eq!(reader.bloom_only_fields().count(), 0);
+    }
+
+    /// #52/M7: a build whose term map SPILLED keeps its full term index —
+    /// the resident map holds only a suffix of the terms, so first-encode
+    /// AUTO must not decide (or half-cover a bloom) from partial counts.
+    #[test]
+    fn first_encode_auto_demotion_skipped_when_spilled() {
+        use std::sync::Arc;
+
+        use arrow::{
+            array::{ArrayRef, Int64Array, StringArray},
+            datatypes::{DataType, Field, Schema},
+            record_batch::RecordBatch,
+        };
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("tid", DataType::Utf8, true),
+        ]));
+        let spill_dir = tempfile::tempdir().unwrap();
+        let mut writer = crate::VixWriter::new(
+            &schema,
+            crate::VixWriterOptions {
+                bloom_composite: true,
+                bloom_only_auto_ratio: 0.5,
+                bloom_only_min_distinct: 1,
+                term_spill_dir: Some(spill_dir.path().to_path_buf()),
+                term_spill_bytes: 1, // force a spill at every push boundary
+                ..Default::default()
+            },
+            false,
+        );
+        for chunk in 0..2i64 {
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(vec![1_000 + chunk, 1_100 + chunk])) as ArrayRef,
+                    Arc::new(StringArray::from(vec![
+                        format!("t-{chunk}-a"),
+                        format!("t-{chunk}-b"),
+                    ])) as ArrayRef,
+                ],
+            )
+            .unwrap();
+            let source = StringArray::from_iter_values([
+                format!(r#"{{"tid":"t-{chunk}-a"}}"#),
+                format!(r#"{{"tid":"t-{chunk}-b"}}"#),
+            ]);
+            writer.push_batch_with_source(&batch, &source, None).unwrap();
+        }
+        let (data, index) = writer.finish().unwrap();
+        let reader = crate::VixReader::open_with_index(
+            bytes::Bytes::from(data),
+            index.map(bytes::Bytes::from),
+        )
+        .unwrap();
+        assert_eq!(reader.bloom_only_fields().count(), 0, "spilled: no AUTO");
+        assert!(
+            reader.term_field_id("tid").is_some(),
+            "the field stays fully term-indexed"
+        );
     }
 
     #[test]

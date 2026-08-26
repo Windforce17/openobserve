@@ -44,7 +44,7 @@ use hashbrown::{HashMap, HashSet};
 use infra::{
     errors::{Error, ErrorCodes},
     schema::{
-        get_stream_setting_bloom_filter_fields, get_stream_setting_column_store_fields,
+        get_stream_setting_bloom_filter_fields,
         get_stream_setting_fts_fields, unwrap_stream_settings,
     },
 };
@@ -200,16 +200,12 @@ pub async fn search(
         })
         .map(|f| (f.name().clone(), f.data_type().clone()))
         .collect();
-    // fast-path eligibility (DESIGN §15.6): the index-only aggregation fast
-    // paths may only touch non-`_timestamp` fields that are configured in the
-    // stream's `column_store_fields` setting
-    let column_store_fields: HashSet<String> = stream_settings
-        .as_ref()
-        .map(get_stream_setting_column_store_fields)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|v| latest_schema_map.contains_key(v))
-        .collect();
+    // fast-path eligibility: v2 all-present-columns (DESIGN §2) makes every
+    // schema field a docs column of the files that carry it — the per-file
+    // capability probes remain the correctness backstop, so the plan-level
+    // eligibility set is simply the schema's fields
+    let column_store_fields: HashSet<String> =
+        latest_schema_map.keys().map(|name| name.to_string()).collect();
     let bloom_indexed_fields = get_stream_setting_bloom_filter_fields(&stream_settings)
         .into_iter()
         .filter(|v| latest_schema_map.contains_key(v))
@@ -280,8 +276,14 @@ pub async fn search(
         stream_name: stream_name.to_string(),
         time_range: (req.search_info.start_time, req.search_info.end_time),
         work_group: work_group.clone(),
+        // Stream types in ZO_VIX_INDEX_DISABLED_STREAM_TYPES (#40, metrics
+        // by default) never probe the index: their core files are
+        // column-store only, so every query routes straight to the columnar
+        // scan (the extracted condition is re-applied there — see
+        // storage::search's add-filter-back handling for the skipped step).
         use_inverted_index: index_condition.is_some()
             && cfg.common.inverted_index_enabled
+            && !config::is_vix_index_disabled(stream_type)
             && (!index_condition.as_ref().unwrap().is_condition_all()
                 || idx_optimize_rule.is_some()),
     });
@@ -348,13 +350,21 @@ pub async fn search(
 
         let index_optimize_start = std::time::Instant::now();
         let mut storage_idx_optimize_rule = idx_optimize_rule.clone();
-        (index_file_list, file_list) = handle_index_optimize(
-            &mut storage_idx_optimize_rule, // pass by mutable reference
-            file_list,
-            query_params.time_range,
-            &column_store_fields,
-        )
-        .await?;
+        // Index-off stream types (#40) never route files to the index-only
+        // aggregate fast paths: their files carry no term index (and old
+        // indexed files must not be probed against policy either) — the
+        // whole list stays on the scan branch.
+        (index_file_list, file_list) = if config::is_vix_index_disabled(stream_type) {
+            (Vec::new(), file_list)
+        } else {
+            handle_index_optimize(
+                &mut storage_idx_optimize_rule, // pass by mutable reference
+                file_list,
+                query_params.time_range,
+                &column_store_fields,
+            )
+            .await?
+        };
 
         // Evaluate the aggregate fast path EAGERLY over the index files.
         // vix_search leaves every file it could NOT answer (missing docs
@@ -729,7 +739,7 @@ fn apply_pushdowns_and_optimizations(
     // rename columns). vortex prunes chunks by per-chunk stats, ranged
     // sources skip the fetches, provably-disjoint files skip entirely via
     // footer stats. Conservative-only — the filter re-applies everything.
-    physical_plan = search::datafusion::vix_format::inject_vix_numeric_bounds(physical_plan)
+    physical_plan = search::datafusion::vix_format::inject_vix_scan_pruning(physical_plan)
         .map_err(|e| {
             log::error!("[trace_id {trace_id}] flight->search: vix numeric pushdown error: {e}");
             e
@@ -943,10 +953,13 @@ async fn handle_index_optimize(
     time_range: (i64, i64),
     column_store_fields: &HashSet<String>,
 ) -> Result<(Vec<FileKey>, Vec<FileKey>), Error> {
-    // early return if not simple count, histogram or topn
+    // early return if not simple count, histogram, topn or the M16
+    // count(field)/min-max stats-answered modes
     if !matches!(
         idx_optimize_rule,
         Some(IndexOptimizeMode::SimpleCount)
+            | Some(IndexOptimizeMode::SimpleCountField(..))
+            | Some(IndexOptimizeMode::SimpleMinMax(..))
             | Some(IndexOptimizeMode::SimpleHistogram(..))
             | Some(IndexOptimizeMode::SimpleMultiHistogram(..))
             | Some(IndexOptimizeMode::SimpleTopN(..))
@@ -985,8 +998,9 @@ async fn handle_index_optimize(
     Ok((index_files, datafusion_files))
 }
 
-/// Index-branch eligibility: a core `.vix` file (the data file IS the
-/// index), with an index (`index_size > 0`), and — when `time_range` is set —
+/// Index-branch eligibility: a core `.vix` file with an index sidecar
+/// (`index_size > 0` — the `.vxi` object's size since the v3 split), and —
+/// when `time_range` is set —
 /// lying fully inside `[start, end)` (`max_ts < end`, matching the per-file
 /// `file_in_range` check of the vix evaluation). Everything else takes the
 /// DataFusion branch.

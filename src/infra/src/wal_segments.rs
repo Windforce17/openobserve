@@ -64,6 +64,30 @@ pub enum SegmentStatus {
     Built = 2,
 }
 
+/// Claim-scan ordering for [`claim_pending_with_floor`] (M13 aging lane).
+///
+/// Steady state claims NEWEST first: fresh segments build first so recent
+/// windows recover first under backlog (the compaction fast_mode lesson).
+/// But under a STANDING backlog at balanced capacity that ordering starves
+/// the oldest cohort indefinitely — every claim round finds newer rows —
+/// while the 1-day S3 lifecycle walks toward their raw objects (prod
+/// 2026-08-18/19: 74.5k pending, oldest stuck at the launch cohort for 15+
+/// hours). The builder therefore reserves a fraction of claims that scan
+/// OLDEST first once the oldest pending segment exceeds an age threshold
+/// (`job::segments`' aging lane, modeled on the compactor live-lane
+/// precedent `ZO_COMPACT_LIVE_JOB_NUM` — reserved slots for a specific age
+/// band). Both orders share the exact same claim semantics: the same
+/// candidate predicate, the ALL-OR-NOTHING floor, and SKIP LOCKED
+/// partitioning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ClaimOrder {
+    /// `created_at DESC, id DESC` — the steady-state freshness order.
+    #[default]
+    NewestFirst,
+    /// `created_at ASC, id ASC` — the aging lane's starvation breaker.
+    OldestFirst,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SegmentMeta {
     pub id: i64,
@@ -166,16 +190,23 @@ fn secs_to_micros(secs: u64) -> i64 {
 
 /// LIKE pattern matching the JSON-encoded array element exactly as [`add`]
 /// stored it (both sides go through `serde_json`, so names needing JSON
-/// escapes still round-trip). LIKE wildcards (`%`/`_`) inside a name can only
-/// WIDEN the match — an over-selected segment simply yields no frames for the
-/// stream at decode time; there are no false negatives.
+/// escapes still round-trip). LIKE metacharacters in the token are ESCAPED
+/// (queries pass `ESCAPE '\'`): the old "wildcards only WIDEN the match"
+/// trade was measured on prod 2026-08-11 as a fleet-wide no-op scan swarm —
+/// metric stream names are full of `_`, and every one of them over-selected
+/// sibling segments that were then fetched and frame-walked for nothing
+/// (~45ms a piece, thousands per hour). Literal matching only.
 fn stream_like_pattern(org: &str, stream_type: &str, stream: &str) -> Result<String> {
     let token = serde_json::to_string(&format!("{org}/{stream_type}/{stream}")).map_err(|e| {
         Error::Message(format!(
             "[WAL_SEGMENTS] cannot encode stream token {org}/{stream_type}/{stream}: {e}"
         ))
     })?;
-    Ok(format!("%{token}%"))
+    let escaped = token
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    Ok(format!("%{escaped}%"))
 }
 
 /// Reject degenerate registrations before any SQL: an empty streams list
@@ -243,7 +274,7 @@ pub async fn add(meta: &SegmentMeta) -> Result<i64> {
     }
 }
 
-/// Atomically claim up to `limit` buildable segments for `node`, oldest
+/// Atomically claim up to `limit` buildable segments for `node`, newest
 /// (`created_at`) first: rows in `Pending`, plus `Building` rows whose lease
 /// (`updated_at`) is older than `lease_timeout_secs` (a dead builder's claims
 /// must come back). Claimed rows are returned already flipped to `Building`
@@ -253,6 +284,30 @@ pub async fn claim_pending(
     limit: usize,
     lease_timeout_secs: u64,
 ) -> Result<Vec<SegmentMeta>> {
+    claim_pending_with_floor(node, limit, 1, lease_timeout_secs, ClaimOrder::NewestFirst).await
+}
+
+/// [`claim_pending`] with an ALL-OR-NOTHING floor: when fewer than
+/// `min_batch` rows are claimable (after SKIP LOCKED partitioning), claim
+/// NOTHING instead of a sliver. Racing full-batch claimers then serialize
+/// into batch-sized claims — without the floor, N concurrent builders split
+/// one batch-sized pool into N sliver claims, and every sliver claim emits
+/// a sliver L0 file per stream it touches (prod 2026-08-12: 14+ builders
+/// turned 32-segment batches into ~7-segment claims; per-metric-stream L0
+/// files landed with 1-16 records). `min_batch <= 1` = legacy behavior.
+/// The caller keeps freshness by dropping the floor on age-triggered
+/// claims.
+///
+/// `order` picks the scan direction ([`ClaimOrder`]): newest-first is the
+/// steady state, oldest-first is the aging lane. The floor and the SKIP
+/// LOCKED all-or-nothing semantics are identical in both lanes.
+pub async fn claim_pending_with_floor(
+    node: &str,
+    limit: usize,
+    min_batch: usize,
+    lease_timeout_secs: u64,
+    order: ClaimOrder,
+) -> Result<Vec<SegmentMeta>> {
     if node.is_empty() {
         return Err(Error::Message(
             "[WAL_SEGMENTS] claim_pending: empty builder node".to_string(),
@@ -261,13 +316,14 @@ pub async fn claim_pending(
     if limit == 0 {
         return Ok(Vec::new());
     }
+    let min_batch = i64::try_from(min_batch.clamp(1, limit)).unwrap_or(1);
     let limit = i64::try_from(limit).unwrap_or(i64::MAX);
     let now = now_micros();
     let stale_before = now.saturating_sub(secs_to_micros(lease_timeout_secs));
     if use_postgres() {
-        postgres::claim_pending(node, limit, now, stale_before).await
+        postgres::claim_pending(node, limit, min_batch, now, stale_before, order).await
     } else {
-        sqlite::claim_pending(node, limit, now, stale_before).await
+        sqlite::claim_pending(node, limit, min_batch, now, stale_before, order).await
     }
 }
 
@@ -593,12 +649,29 @@ pub async fn count_unbuilt_older_than(age_secs: u64) -> Result<i64> {
 /// `lease_timeout_secs` — using the exact claim predicate so the gate and
 /// the claim can never disagree about what is claimable. `(0, 0)` when
 /// nothing is claimable.
-pub async fn claimable_stats(lease_timeout_secs: u64) -> Result<(i64, i64)> {
+/// `(count, oldest_created_at, total_size)` over the claimable set —
+/// Pending rows plus stale-leased Building rows. `total_size` (the sum of
+/// the segments' `size` column) drives the byte-budget adaptive batch
+/// (#47): callers size claims by bytes, not row count.
+pub async fn claimable_stats(lease_timeout_secs: u64) -> Result<(i64, i64, i64)> {
     let stale_before = now_micros().saturating_sub(secs_to_micros(lease_timeout_secs));
     if use_postgres() {
         postgres::claimable_stats(stale_before).await
     } else {
         sqlite::claimable_stats(stale_before).await
+    }
+}
+
+/// #50: the CHEAP idle-tick probe — one indexed `LIMIT 1` row instead of the
+/// count/min/SUM aggregate. Fleets of builders tick every second; with
+/// nothing claimable this is the only statement they run, so the aggregate
+/// cost is paid exactly when there is work to size a claim for.
+pub async fn has_claimable(lease_timeout_secs: u64) -> Result<bool> {
+    let stale_before = now_micros().saturating_sub(secs_to_micros(lease_timeout_secs));
+    if use_postgres() {
+        postgres::has_claimable(stale_before).await
+    } else {
+        sqlite::has_claimable(stale_before).await
     }
 }
 
@@ -725,39 +798,75 @@ RETURNING id;"#,
     pub(super) async fn claim_pending(
         node: &str,
         limit: i64,
+        min_batch: i64,
         now: i64,
         stale_before: i64,
+        order: ClaimOrder,
     ) -> Result<Vec<SegmentMeta>> {
         let pool = CLIENT.clone();
         DB_QUERY_NUMS.with_label_values(&["update", TABLE]).inc();
         // FOR UPDATE SKIP LOCKED makes concurrent claimers partition the
-        // backlog instead of blocking or double-claiming.
-        let mut rows: Vec<SegmentRow> = sqlx::query_as(
-            r#"UPDATE wal_segments
-SET status = $1, builder_node = $2, updated_at = $3
-WHERE id IN (
+        // backlog instead of blocking or double-claiming; the CTE count
+        // guard makes the claim ALL-OR-NOTHING (fewer than min_batch
+        // candidates -> zero rows update, locks release at statement end),
+        // so racing full-batch claimers serialize instead of splitting the
+        // pool into slivers. The two lane SQL texts differ ONLY in the
+        // candidate ORDER BY direction (M13 aging lane) — everything else
+        // (predicate, floor guard, SKIP LOCKED) is shared byte-for-byte.
+        let sql = match order {
+            ClaimOrder::NewestFirst => {
+                r#"WITH candidates AS (
     SELECT id FROM wal_segments
     WHERE status = $4 OR (status = $1 AND updated_at < $5)
     ORDER BY created_at DESC, id DESC
     LIMIT $6
     FOR UPDATE SKIP LOCKED
 )
-RETURNING *;"#,
-        )
-        .bind(SegmentStatus::Building as i16)
-        .bind(node)
-        .bind(now)
-        .bind(SegmentStatus::Pending as i16)
-        .bind(stale_before)
-        .bind(limit)
-        .fetch_all(&pool)
-        .await
-        .map_err(|e| Error::Message(format!("[WAL_SEGMENTS] claim_pending node={node}: {e}")))?;
-        // RETURNING order is unspecified — restore newest-first (the claim
-        // order: fresh segments build first so recent windows recover first
-        // under backlog, the compaction fast_mode lesson; the stale-lease
-        // reclaim clause keeps old segments reachable)
-        rows.sort_unstable_by_key(|r| (std::cmp::Reverse(r.created_at), std::cmp::Reverse(r.id)));
+UPDATE wal_segments
+SET status = $1, builder_node = $2, updated_at = $3
+WHERE id IN (SELECT id FROM candidates)
+  AND (SELECT count(*) FROM candidates) >= $7
+RETURNING *;"#
+            }
+            ClaimOrder::OldestFirst => {
+                r#"WITH candidates AS (
+    SELECT id FROM wal_segments
+    WHERE status = $4 OR (status = $1 AND updated_at < $5)
+    ORDER BY created_at ASC, id ASC
+    LIMIT $6
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE wal_segments
+SET status = $1, builder_node = $2, updated_at = $3
+WHERE id IN (SELECT id FROM candidates)
+  AND (SELECT count(*) FROM candidates) >= $7
+RETURNING *;"#
+            }
+        };
+        let mut rows: Vec<SegmentRow> = sqlx::query_as(sql)
+            .bind(SegmentStatus::Building as i16)
+            .bind(node)
+            .bind(now)
+            .bind(SegmentStatus::Pending as i16)
+            .bind(stale_before)
+            .bind(limit)
+            .bind(min_batch)
+            .fetch_all(&pool)
+            .await
+            .map_err(|e| {
+                Error::Message(format!("[WAL_SEGMENTS] claim_pending node={node}: {e}"))
+            })?;
+        // RETURNING order is unspecified — restore the lane's claim order.
+        // Newest-first: fresh segments build first so recent windows recover
+        // first under backlog (the compaction fast_mode lesson; the
+        // stale-lease reclaim clause keeps old segments reachable).
+        // Oldest-first: the aging lane drains a contiguous aged band.
+        match order {
+            ClaimOrder::NewestFirst => rows.sort_unstable_by_key(|r| {
+                (std::cmp::Reverse(r.created_at), std::cmp::Reverse(r.id))
+            }),
+            ClaimOrder::OldestFirst => rows.sort_unstable_by_key(|r| (r.created_at, r.id)),
+        }
         rows_into_metas(rows)
     }
 
@@ -1007,7 +1116,7 @@ WHERE id = $3 AND status != $4 AND l0_planned != '' AND updated_at < $5;"#,
         DB_QUERY_NUMS.with_label_values(&["select", TABLE]).inc();
         let rows: Vec<SegmentRow> = sqlx::query_as(
             r#"SELECT * FROM wal_segments
-WHERE max_ts >= $1 AND min_ts <= $2 AND streams LIKE $3
+WHERE max_ts >= $1 AND min_ts <= $2 AND streams LIKE $3 ESCAPE '\'
   AND (status != $4 OR (status = $4 AND updated_at >= $5))
 ORDER BY min_ts ASC, id ASC
 LIMIT $6;"#,
@@ -1089,11 +1198,33 @@ LIMIT $3;"#,
         Ok(count)
     }
 
-    pub(super) async fn claimable_stats(stale_before: i64) -> Result<(i64, i64)> {
+    pub(super) async fn has_claimable(stale_before: i64) -> Result<bool> {
         let pool = CLIENT_RO.clone();
         DB_QUERY_NUMS.with_label_values(&["select", TABLE]).inc();
-        let row: (i64, i64) = sqlx::query_as(
-            r#"SELECT count(*), coalesce(min(created_at), 0) FROM wal_segments
+        let row: Option<(i64,)> = sqlx::query_as(
+            r#"SELECT id FROM wal_segments
+WHERE status = $1 OR (status = $2 AND updated_at < $3) LIMIT 1;"#,
+        )
+        .bind(SegmentStatus::Pending as i16)
+        .bind(SegmentStatus::Building as i16)
+        .bind(stale_before)
+        .fetch_optional(&pool)
+        .await
+        .map_err(|e| Error::Message(format!("[WAL_SEGMENTS] has_claimable: {e}")))?;
+        Ok(row.is_some())
+    }
+
+    pub(super) async fn claimable_stats(stale_before: i64) -> Result<(i64, i64, i64)> {
+        let pool = CLIENT_RO.clone();
+        DB_QUERY_NUMS.with_label_values(&["select", TABLE]).inc();
+        let row: (i64, i64, i64) = sqlx::query_as(
+            // CAST is load-bearing: postgres sum(bigint) yields NUMERIC,
+            // which sqlx cannot decode as i64 — without it every
+            // claimable_stats call fails on prod meta, the build loop
+            // fails OPEN, and the #44 claim gate is silently bypassed
+            // (live sliver storm, 2026-08-13; unit tests run sqlite only
+            // and never executed this statement on postgres).
+            r#"SELECT count(*), coalesce(min(created_at), 0), CAST(coalesce(sum(size), 0) AS BIGINT) FROM wal_segments
 WHERE status = $1 OR (status = $2 AND updated_at < $3);"#,
         )
         .bind(SegmentStatus::Pending as i16)
@@ -1225,30 +1356,43 @@ ON CONFLICT (node_uuid, seq) DO NOTHING;"#,
     pub(super) async fn claim_pending(
         node: &str,
         limit: i64,
+        min_batch: i64,
         now: i64,
         stale_before: i64,
+        order: ClaimOrder,
     ) -> Result<Vec<SegmentMeta>> {
         let client = CLIENT_RW.clone();
         let client = client.lock().await;
         // SELECT-then-UPDATE inside one transaction: the RW mutex is the
-        // single writer, so the pair is atomic against other claimers
+        // single writer, so the pair is atomic against other claimers.
+        // The two lane SQL texts differ ONLY in the ORDER BY direction
+        // (M13 aging lane); predicate and floor semantics are shared.
+        let select_sql = match order {
+            ClaimOrder::NewestFirst => {
+                r#"SELECT * FROM wal_segments
+WHERE status = $1 OR (status = $2 AND updated_at < $3)
+ORDER BY created_at DESC, id DESC
+LIMIT $4;"#
+            }
+            ClaimOrder::OldestFirst => {
+                r#"SELECT * FROM wal_segments
+WHERE status = $1 OR (status = $2 AND updated_at < $3)
+ORDER BY created_at ASC, id ASC
+LIMIT $4;"#
+            }
+        };
         let mut tx = client.begin().await.map_err(|e| {
             Error::Message(format!(
                 "[WAL_SEGMENTS] claim_pending node={node}: begin failed: {e}"
             ))
         })?;
-        let rows: Vec<SegmentRow> = match sqlx::query_as(
-            r#"SELECT * FROM wal_segments
-WHERE status = $1 OR (status = $2 AND updated_at < $3)
-ORDER BY created_at DESC, id DESC
-LIMIT $4;"#,
-        )
-        .bind(SegmentStatus::Pending as i16)
-        .bind(SegmentStatus::Building as i16)
-        .bind(stale_before)
-        .bind(limit)
-        .fetch_all(&mut *tx)
-        .await
+        let rows: Vec<SegmentRow> = match sqlx::query_as(select_sql)
+            .bind(SegmentStatus::Pending as i16)
+            .bind(SegmentStatus::Building as i16)
+            .bind(stale_before)
+            .bind(limit)
+            .fetch_all(&mut *tx)
+            .await
         {
             Ok(v) => v,
             Err(e) => {
@@ -1260,7 +1404,9 @@ LIMIT $4;"#,
                 )));
             }
         };
-        if rows.is_empty() {
+        if rows.is_empty() || (rows.len() as i64) < min_batch {
+            // all-or-nothing floor: a sliver pool claims NOTHING (see the
+            // public claim_pending_with_floor doc)
             if let Err(e) = tx.rollback().await {
                 log::error!("[WAL_SEGMENTS] rollback claim_pending empty error: {e}");
             }
@@ -1284,9 +1430,14 @@ LIMIT $4;"#,
                 "[WAL_SEGMENTS] claim_pending node={node}: update failed: {e}"
             )));
         }
-        // re-read the claimed rows so the returned state matches the DB
+        // re-read the claimed rows so the returned state matches the DB,
+        // in the lane's claim order
+        let dir = match order {
+            ClaimOrder::NewestFirst => "DESC",
+            ClaimOrder::OldestFirst => "ASC",
+        };
         let sql = format!(
-            "SELECT * FROM wal_segments WHERE id IN ({csv}) ORDER BY created_at DESC, id DESC;"
+            "SELECT * FROM wal_segments WHERE id IN ({csv}) ORDER BY created_at {dir}, id {dir};"
         );
         let rows: Vec<SegmentRow> = match sqlx::query_as(&sql).fetch_all(&mut *tx).await {
             Ok(v) => v,
@@ -1548,7 +1699,7 @@ WHERE id = $3 AND status != $4 AND l0_planned != '' AND updated_at < $5;"#,
         let pool = CLIENT_RO.clone();
         let rows: Vec<SegmentRow> = sqlx::query_as(
             r#"SELECT * FROM wal_segments
-WHERE max_ts >= $1 AND min_ts <= $2 AND streams LIKE $3
+WHERE max_ts >= $1 AND min_ts <= $2 AND streams LIKE $3 ESCAPE '\'
   AND (status != $4 OR (status = $4 AND updated_at >= $5))
 ORDER BY min_ts ASC, id ASC
 LIMIT $6;"#,
@@ -1627,10 +1778,31 @@ LIMIT $3;"#,
         Ok(count)
     }
 
-    pub(super) async fn claimable_stats(stale_before: i64) -> Result<(i64, i64)> {
+    pub(super) async fn has_claimable(stale_before: i64) -> Result<bool> {
         let pool = CLIENT_RO.clone();
-        let row: (i64, i64) = sqlx::query_as(
-            r#"SELECT count(*), coalesce(min(created_at), 0) FROM wal_segments
+        let row: Option<(i64,)> = sqlx::query_as(
+            r#"SELECT id FROM wal_segments
+WHERE status = $1 OR (status = $2 AND updated_at < $3) LIMIT 1;"#,
+        )
+        .bind(SegmentStatus::Pending as i16)
+        .bind(SegmentStatus::Building as i16)
+        .bind(stale_before)
+        .fetch_optional(&pool)
+        .await
+        .map_err(|e| Error::Message(format!("[WAL_SEGMENTS] has_claimable: {e}")))?;
+        Ok(row.is_some())
+    }
+
+    pub(super) async fn claimable_stats(stale_before: i64) -> Result<(i64, i64, i64)> {
+        let pool = CLIENT_RO.clone();
+        let row: (i64, i64, i64) = sqlx::query_as(
+            // CAST is load-bearing: postgres sum(bigint) yields NUMERIC,
+            // which sqlx cannot decode as i64 — without it every
+            // claimable_stats call fails on prod meta, the build loop
+            // fails OPEN, and the #44 claim gate is silently bypassed
+            // (live sliver storm, 2026-08-13; unit tests run sqlite only
+            // and never executed this statement on postgres).
+            r#"SELECT count(*), coalesce(min(created_at), 0), CAST(coalesce(sum(size), 0) AS BIGINT) FROM wal_segments
 WHERE status = $1 OR (status = $2 AND updated_at < $3);"#,
         )
         .bind(SegmentStatus::Pending as i16)
@@ -1804,6 +1976,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_claim_floor_is_all_or_nothing() {
+        let _guard = setup().await;
+        for seq in 1..=3 {
+            add(&seg("node-f", seq, T0, T0 + 1000, &["o/logs/s"]))
+                .await
+                .unwrap();
+        }
+        // pool (3) below the floor (5): claim NOTHING — the sliver stays
+        // pooled for a full-batch claimer (or an age-triggered floor-1 one)
+        assert!(
+            claim_pending_with_floor("bf", 5, 5, 60, ClaimOrder::NewestFirst)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a sliver pool must not be claimed under a full-batch floor"
+        );
+        // ... and nothing was leased by the refused claim
+        let all = claim_pending_with_floor("bf", 5, 3, 60, ClaimOrder::NewestFirst)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 3, "floor met: the whole pool claims at once");
+        for m in &all {
+            assert_eq!(m.status, SegmentStatus::Building);
+            assert_eq!(m.builder_node, "bf");
+        }
+        // floor <= 1 keeps legacy sliver semantics (age-triggered path)
+        assert!(
+            claim_pending_with_floor("bf2", 5, 1, 60, ClaimOrder::NewestFirst)
+                .await
+                .unwrap()
+                .is_empty(),
+            "pool drained; a floor-1 claim just finds nothing"
+        );
+    }
+
+    #[tokio::test]
     async fn test_claim_leases_newest_first_skips_fresh_reclaims_stale() {
         let _guard = setup().await;
         let id1 = add(&seg("node-c", 1, T0, T0 + 1000, &["o/logs/s"]))
@@ -1856,6 +2064,71 @@ mod tests {
 
         // empty node is a caller bug, not a silent no-op
         assert!(claim_pending("", 1, 60).await.is_err());
+    }
+
+    /// M13 aging lane: `ClaimOrder::OldestFirst` claims the OLDEST rows in
+    /// ascending order, with the ALL-OR-NOTHING floor, the fresh-lease skip
+    /// and the stale-lease reclaim all behaving exactly like the newest
+    /// lane — only the scan direction differs.
+    #[tokio::test]
+    async fn test_claim_oldest_first_lane_ordering_floor_and_leases() {
+        let _guard = setup().await;
+        let mut ids = Vec::new();
+        for seq in 1..=4 {
+            ids.push(
+                add(&seg("node-o", seq, T0, T0 + 1000, &["o/logs/s"]))
+                    .await
+                    .unwrap(),
+            );
+        }
+        // deterministic age order: ids[0] oldest .. ids[3] newest
+        for (i, id) in ids.iter().enumerate() {
+            force_created_at(*id, T0 + 10 * i as i64).await;
+        }
+
+        // floor above the pool: the lane claims NOTHING (all-or-nothing
+        // semantics are lane-independent) and leases nothing
+        assert!(
+            claim_pending_with_floor("ol", 8, 8, 60, ClaimOrder::OldestFirst)
+                .await
+                .unwrap()
+                .is_empty(),
+            "oldest lane must keep the all-or-nothing floor"
+        );
+
+        // the lane claims the two OLDEST, returned ascending
+        let claimed = claim_pending_with_floor("ol", 2, 2, 60, ClaimOrder::OldestFirst)
+            .await
+            .unwrap();
+        assert_eq!(
+            claimed.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![ids[0], ids[1]],
+            "aging-lane claim must be oldest-first"
+        );
+        for m in &claimed {
+            assert_eq!(m.status, SegmentStatus::Building);
+            assert_eq!(m.builder_node, "ol");
+        }
+
+        // freshly leased Building rows are skipped by the lane too: the next
+        // oldest-first claim gets the remaining pending rows, oldest first
+        let claimed2 = claim_pending_with_floor("ol2", 10, 1, 60, ClaimOrder::OldestFirst)
+            .await
+            .unwrap();
+        assert_eq!(
+            claimed2.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![ids[2], ids[3]]
+        );
+
+        // a stale lease is reclaimable through the lane as well
+        force_updated_at(ids[0], now_micros() - 61_000_000).await;
+        let reclaimed = claim_pending_with_floor("ol2", 10, 1, 60, ClaimOrder::OldestFirst)
+            .await
+            .unwrap();
+        assert_eq!(reclaimed.iter().map(|m| m.id).collect::<Vec<_>>(), vec![
+            ids[0]
+        ]);
+        assert_eq!(reclaimed[0].builder_node, "ol2");
     }
 
     #[tokio::test]
@@ -2270,6 +2543,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_query_unbuilt_underscores_match_literally_not_as_wildcards() {
+        let _guard = setup().await;
+        // `_` is a LIKE single-char wildcard; unescaped it made every
+        // metric stream over-select sibling segments (the prod no-op scan
+        // swarm, 2026-08-11). A `req_total` query must not select a
+        // segment carrying only `reqXtotal`.
+        let id_wild = add(&seg(
+            "node-u",
+            1,
+            T0,
+            T0 + 1000,
+            &["org1/metrics/reqXtotal"],
+        ))
+        .await
+        .unwrap();
+        let id_lit = add(&seg(
+            "node-u",
+            2,
+            T0,
+            T0 + 1000,
+            &["org1/metrics/req_total"],
+        ))
+        .await
+        .unwrap();
+        let hits = query_unbuilt("org1", "metrics", "req_total", (T0, T0 + 2000), 0, 1000)
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![id_lit],
+            "underscores must match literally; segment {id_wild} is not a candidate"
+        );
+    }
+
+    #[tokio::test]
     async fn test_list_expired_and_delete_round_trip() {
         let _guard = setup().await;
         let id1 = add(&seg("node-e", 1, T0, T0 + 1000, &["o/logs/s"]))
@@ -2374,10 +2682,21 @@ mod tests {
             stream_like_pattern("org1", "logs", "app1").unwrap(),
             "%\"org1/logs/app1\"%"
         );
-        // JSON-escaping names still produce the stored form
+        // JSON-escaping names: the JSON backslash is itself LIKE-escaped
+        // (the queries pass ESCAPE '\'), so the stored `we\"ird` matches
         assert_eq!(
             stream_like_pattern("org1", "logs", "we\"ird").unwrap(),
-            "%\"org1/logs/we\\\"ird\"%"
+            "%\"org1/logs/we\\\\\"ird\"%"
+        );
+        // LIKE metacharacters match LITERALLY — unescaped `_` made every
+        // metric stream over-select sibling segments (prod swarm 2026-08-11)
+        assert_eq!(
+            stream_like_pattern("org1", "metrics", "req_total").unwrap(),
+            "%\"org1/metrics/req\\_total\"%"
+        );
+        assert_eq!(
+            stream_like_pattern("org1", "logs", "100%cpu").unwrap(),
+            "%\"org1/logs/100\\%cpu\"%"
         );
     }
 

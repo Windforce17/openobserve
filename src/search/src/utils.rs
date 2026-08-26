@@ -57,6 +57,54 @@ impl Drop for AsyncDefer {
     }
 }
 
+/// A spawned search task that is ABORTED if its owner future is dropped
+/// before completion — the owner being dropped is how a client disconnect
+/// or cancel reaches us (actix drops the handler future; every layer above
+/// holds this guard instead of a bare `JoinHandle`, which would detach).
+/// Aborting the leader task drops its flight client streams, which cancels
+/// the follower RPCs (tonic RST_STREAM), whose encoder streams run their
+/// own drop cleanup — so one drop tears the whole query down.
+pub struct AbortOnDrop<T> {
+    handle: tokio::task::JoinHandle<T>,
+    trace_id: String,
+    done: bool,
+}
+
+impl<T> AbortOnDrop<T> {
+    pub fn new(handle: tokio::task::JoinHandle<T>, trace_id: impl Into<String>) -> Self {
+        Self {
+            handle,
+            trace_id: trace_id.into(),
+            done: false,
+        }
+    }
+
+    /// Await completion. Cancel-safe: if the surrounding select!/future is
+    /// dropped mid-poll the task is aborted by the guard's Drop.
+    pub async fn join(&mut self) -> Result<T, tokio::task::JoinError> {
+        let ret = (&mut self.handle).await;
+        self.done = true;
+        ret
+    }
+
+    pub fn abort(&mut self) {
+        self.done = true; // deliberate abort: Drop stays silent
+        self.handle.abort();
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        if !self.done && !self.handle.is_finished() {
+            self.handle.abort();
+            log::info!(
+                "[trace_id {}] search task aborted on drop (client disconnect or cancel)",
+                self.trace_id
+            );
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ScanStatsVisitor {
     pub scan_stats: ScanStats,
@@ -405,5 +453,50 @@ mod tests {
 
         let result = visitor.pre_visit(&mock_plan);
         assert!(result.is_ok_and(|v| v));
+    }
+
+    /// Dropping the guard aborts the task — pinned by watching the task's
+    /// locals drop while it would otherwise run forever. This is the
+    /// client-disconnect cancellation path: the handler future drops, the
+    /// guard aborts the search instead of detaching it.
+    #[tokio::test]
+    async fn abort_on_drop_cancels_the_task() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct Probe(Arc<AtomicBool>);
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let probe = Probe(Arc::clone(&dropped));
+        let guard = super::AbortOnDrop::new(
+            tokio::spawn(async move {
+                let _probe = probe;
+                std::future::pending::<()>().await;
+            }),
+            "test-abort",
+        );
+        drop(guard);
+
+        for _ in 0..100 {
+            if dropped.load(Ordering::SeqCst) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("task was not aborted within 1s of the guard dropping");
+    }
+
+    /// A task that finished (or was deliberately aborted via the guard)
+    /// must not be treated as a disconnect by the drop path.
+    #[tokio::test]
+    async fn abort_on_drop_join_completes_normally() {
+        let mut guard = super::AbortOnDrop::new(tokio::spawn(async { 41 + 1 }), "test-join");
+        let ret = guard.join().await.expect("task completes");
+        assert_eq!(ret, 42);
+        drop(guard);
     }
 }

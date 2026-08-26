@@ -195,7 +195,6 @@ fn streams_fixture() -> String {
             "settings": {
                 "partition_keys": {"level": {"field_name": "level", "types": "value"}},
                 "full_text_search_keys": ["log", "message"],
-                "column_store_fields": ["trace_id", "span_id"],
                 "bloom_filter_fields": ["trace_id"],
                 "distinct_value_fields": ["level", "service"],
                 "data_retention": 30,

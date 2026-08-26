@@ -625,7 +625,9 @@ async fn write_file_list(
                         id: 0,
                         account: v.account.clone(),
                         file: v.key.clone(),
-                        // always false: no file has a sibling index object
+                        // vestigial always-false: the deleted-file sweeper
+                        // derives the .vxi sidecar key from every .vix key
+                        // unconditionally (compact::deleted)
                         index_file: false,
                         flattened: v.meta.flattened,
                     })
@@ -731,6 +733,117 @@ mod tests {
 
     use super::*;
 
+    /// M19 — the headline lifecycle-consistency pin: engine retention on a
+    /// v2 stream removes the `.vix` DATA object, its `.vxi` INDEX SIDECAR,
+    /// and the file_list ROW, through the real production path:
+    /// `delete_from_file_list` (row delete + file_list_deleted bookkeeping,
+    /// mode "deleted" = the default) followed by the deferred-delete sweeper
+    /// (`compact::deleted::delete`), which derives the sidecar key
+    /// unconditionally. Sqlite file_list + local-disk object store.
+    #[tokio::test]
+    async fn m19_retention_removes_v2_object_pair_and_row() {
+        let _guard = crate::compact::jobs_test_support::setup().await;
+        std::fs::create_dir_all(&get_config().common.data_stream_dir)
+            .expect("create data_stream_dir for tests");
+        assert_eq!(
+            get_config().compact.file_list_deleted_mode,
+            "deleted",
+            "the retention arm must run in the default bookkeeping mode"
+        );
+
+        let run = config::utils::time::now_micros();
+        let org = format!("m19org{run}");
+        let stream = format!("m19stream{run}");
+        // data timestamp: 2021-01-02T00:30:00Z — safely past ANY retention
+        let ts = 1609547400000000_i64;
+        let key = format!("files/{org}/logs/{stream}/2021/01/02/00/m19_pair.vix");
+        let sidecar = config::vix_sidecar_key(&key).expect("core keys derive sidecar keys");
+
+        // the object PAIR in the store
+        infra::storage::put("", &key, bytes::Bytes::from_static(b"m19-data-object"))
+            .await
+            .expect("put data object");
+        infra::storage::put(
+            "",
+            &sidecar,
+            bytes::Bytes::from_static(b"m19-sidecar-object"),
+        )
+        .await
+        .expect("put sidecar object");
+
+        // the live file_list row (index_size > 0 ⟺ the sidecar exists)
+        let file = FileKey::new(
+            0,
+            String::new(),
+            key.clone(),
+            config::meta::stream::FileMeta {
+                min_ts: ts,
+                max_ts: ts + 1000,
+                records: 10,
+                original_size: 1000,
+                compressed_size: 15,
+                index_size: 18,
+                ..Default::default()
+            },
+            false,
+        );
+        crate::compact::jobs_test_support::retry_busy("seed file_list row", || {
+            infra_file_list::batch_add(std::slice::from_ref(&file))
+        })
+        .await;
+        assert!(infra_file_list::contains(&key).await.unwrap());
+
+        // ── the retention arm: rows out of file_list, into file_list_deleted
+        delete_from_file_list(
+            &org,
+            StreamType::Logs,
+            &stream,
+            (ts - hour_micros(1), ts + hour_micros(1)),
+        )
+        .await
+        .expect("delete_from_file_list");
+        assert!(
+            !infra_file_list::contains(&key).await.unwrap(),
+            "the file_list row must be gone the moment retention commits"
+        );
+        let pending = infra_file_list::list_deleted().await.expect("list_deleted");
+        assert!(
+            pending.iter().any(|d| d.file == key),
+            "the data key must be queued in file_list_deleted for the sweeper"
+        );
+        assert!(
+            infra::storage::head("", &key).await.is_ok(),
+            "objects survive the deferred-delete window (rows first, objects later)"
+        );
+
+        // ── the deferred-delete sweeper: object PAIR deleted, queue drained
+        let time_max = config::utils::time::now_micros() + hour_micros(3);
+        let swept = crate::compact::jobs_test_support::retry_busy("deleted::delete", || {
+            crate::compact::deleted::delete(&org, time_max)
+        })
+        .await;
+        assert!(swept >= 1, "the sweeper must process the queued file");
+        assert!(
+            matches!(
+                infra::storage::head("", &key).await,
+                Err(object_store::Error::NotFound { .. })
+            ),
+            "the .vix data object must be deleted"
+        );
+        assert!(
+            matches!(
+                infra::storage::head("", &sidecar).await,
+                Err(object_store::Error::NotFound { .. })
+            ),
+            "the .vxi index sidecar must be deleted alongside the data object"
+        );
+        let pending = infra_file_list::list_deleted().await.expect("list_deleted");
+        assert!(
+            !pending.iter().any(|d| d.file == key),
+            "the file_list_deleted row must be drained after the sweep"
+        );
+    }
+
     #[tokio::test]
     async fn test_generate_retention_job() {
         infra_file_list::create_table().await.unwrap();
@@ -747,6 +860,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_all() {
+        // self-sufficient db setup (the meta store is shared, sqlite in
+        // tests): without this the test silently depends on an
+        // alphabetically-earlier test having created the meta table —
+        // a schedule-sensitive "no such table: meta" flake (M20b)
+        infra::db::create_table().await.unwrap();
         infra_file_list::create_table().await.unwrap();
         let org_id = "test";
         let stream_name = "test";

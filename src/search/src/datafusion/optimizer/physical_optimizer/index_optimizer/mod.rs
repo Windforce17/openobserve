@@ -35,6 +35,7 @@ use parking_lot::Mutex;
 mod count;
 mod distinct;
 mod histogram;
+mod minmax;
 mod select;
 mod topn;
 mod utils;
@@ -45,6 +46,7 @@ use crate::datafusion::{
         count::is_simple_count,
         distinct::is_simple_distinct,
         histogram::{is_simple_histogram, is_simple_multi_histogram},
+        minmax::is_simple_min_max,
         select::is_simple_select,
         topn::is_simple_topn,
         utils::is_complex_plan,
@@ -171,8 +173,17 @@ impl TreeNodeRewriter for FollowerIndexOptimizer {
             }
             return Ok(Transformed::new(plan, false, TreeNodeRecursion::Continue));
         } else if plan.downcast_ref::<AggregateExec>().is_some() {
-            // Check for SimpleCount
-            if let Some(index_optimize_mode) = is_simple_count(Arc::clone(&plan)) {
+            // Check for SimpleCount / SimpleCountField (M16)
+            if let Some(index_optimize_mode) =
+                is_simple_count(Arc::clone(&plan), &self.index_fields)
+            {
+                *self.index_optimizer_mode.lock() = Some(index_optimize_mode);
+                return Ok(Transformed::new(plan, true, TreeNodeRecursion::Stop));
+            }
+            // Check for SimpleMinMax (M16)
+            if let Some(index_optimize_mode) =
+                is_simple_min_max(Arc::clone(&plan), &self.index_fields)
+            {
                 *self.index_optimizer_mode.lock() = Some(index_optimize_mode);
                 return Ok(Transformed::new(plan, true, TreeNodeRecursion::Stop));
             }
@@ -626,6 +637,61 @@ mod tests {
             index_optimizer_mode.lock().clone(),
             Some(IndexOptimizeMode::SimpleCount)
         );
+    }
+
+    /// M16: the follower extracts count(field)/min-max from the SHIPPED
+    /// sub-plan (post proto roundtrip — one Partial AggregateExec), with
+    /// the eligibility and numeric gates applied.
+    #[tokio::test]
+    async fn test_follower_extracts_m16_modes() {
+        use super::test_harness::follower_extracted_mode;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("code", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let fields: HashSet<String> = ["code".to_string(), "name".to_string()]
+            .into_iter()
+            .collect();
+        let time_range = (1_000i64, 2_000i64);
+        let cases = vec![
+            (
+                "SELECT count(name) FROM t",
+                Some(IndexOptimizeMode::SimpleCountField("name".to_string())),
+            ),
+            (
+                "SELECT count(code) as c FROM t",
+                Some(IndexOptimizeMode::SimpleCountField("code".to_string())),
+            ),
+            (
+                "SELECT min(code) FROM t",
+                Some(IndexOptimizeMode::SimpleMinMax("code".to_string(), false)),
+            ),
+            (
+                "SELECT max(code) FROM t",
+                Some(IndexOptimizeMode::SimpleMinMax("code".to_string(), true)),
+            ),
+            (
+                "SELECT max(_timestamp) FROM t",
+                Some(IndexOptimizeMode::SimpleMinMax("_timestamp".to_string(), true)),
+            ),
+            // strings are prefix-bounded: min/max never fast-paths them
+            ("SELECT min(name) FROM t", None),
+            // count(*) keeps its own mode
+            ("SELECT count(*) FROM t", Some(IndexOptimizeMode::SimpleCount)),
+        ];
+        for (sql, expected) in cases {
+            let mode = follower_extracted_mode(
+                sql,
+                Arc::clone(&schema),
+                time_range,
+                0,
+                fields.clone(),
+            )
+            .await;
+            assert_eq!(mode, expected, "{sql}");
+        }
     }
 
     #[tokio::test]

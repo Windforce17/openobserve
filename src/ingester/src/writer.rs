@@ -77,6 +77,12 @@ pub fn check_memtable_size() -> Result<()> {
 }
 
 // check total memory size
+//
+// The sampled process RSS (NODE_MEMORY_USAGE, updated every second) is
+// topped up with the projected bytes of admitted in-flight ingest requests
+// (see crate::admission), so allocations that are about to happen count
+// against the envelope before they show up in RSS. With no reservations
+// outstanding the trip point is exactly the historical one.
 pub fn check_memory_circuit_breaker() -> Result<()> {
     let cfg = get_config();
     if !cfg.common.memory_circuit_breaker_enabled || cfg.common.memory_circuit_breaker_ratio == 0 {
@@ -85,7 +91,15 @@ pub fn check_memory_circuit_breaker() -> Result<()> {
     let cur_mem = metrics::NODE_MEMORY_USAGE
         .with_label_values::<&str>(&[])
         .get() as usize;
-    if cur_mem > cfg.limit.mem_total / 100 * cfg.common.memory_circuit_breaker_ratio {
+    let cur_mem = cur_mem.saturating_add(crate::admission::reserved_bytes());
+    // single source of truth for the envelope arithmetic — shared with the
+    // pre-body admission path so both trip at exactly the same point
+    if cur_mem
+        > crate::admission::envelope_from(
+            cfg.limit.mem_total,
+            cfg.common.memory_circuit_breaker_ratio,
+        )
+    {
         Err(Error::MemoryCircuitBreakerError {})
     } else {
         Ok(())

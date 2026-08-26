@@ -15,6 +15,7 @@
 
 use config::{
     meta::{search, stream::StreamType},
+    metrics,
     utils::json,
 };
 use proto::cluster_rpc::{
@@ -253,9 +254,19 @@ impl Search for Searcher {
     #[cfg(not(feature = "enterprise"))]
     async fn cancel_query(
         &self,
-        _req: Request<CancelQueryRequest>,
+        req: Request<CancelQueryRequest>,
     ) -> Result<Response<CancelQueryResponse>, Status> {
-        Err(Status::unimplemented("Not Supported"))
+        let trace_id = req.into_inner().trace_id;
+        let cancelled = crate::service::search::cancel::cancel_local(&trace_id);
+        if cancelled > 0 {
+            log::info!(
+                "[trace_id {trace_id}] grpc->cancel_query: fired {cancelled} abort channel(s)"
+            );
+            metrics::QUERY_CANCELED_NUMS.with_label_values(&[""]).inc();
+        }
+        // is_success means "this node processed the request"; a node that
+        // never led the query simply had nothing registered
+        Ok(Response::new(CancelQueryResponse { is_success: true }))
     }
 
     #[cfg(feature = "enterprise")]

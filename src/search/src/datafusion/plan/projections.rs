@@ -1038,20 +1038,11 @@ mod tests {
         assert_eq!(extractor.ts_hist_alias, None);
         assert_eq!(extractor.timestamp_alias, Some("_timestamp".to_string()));
         assert!(extractor.group_by.is_empty());
+        // §9 (v2): a JOIN star is registry-star BOUNDED by the statement's
+        // referenced columns (+ internals) — never the full registry
         assert_eq!(
             extractor.projections,
-            vec![
-                "_timestamp",
-                "code",
-                "floatvalue",
-                "k8s_container_name",
-                "k8s_container_restart_count",
-                "k8s_namespace_name",
-                "k8s_node_name",
-                "k8s_pod_name",
-                "k8s_pod_uid",
-                "log"
-            ]
+            vec!["_timestamp", "k8s_namespace_name"]
         );
 
         let sql = r#"SELECT

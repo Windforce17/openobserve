@@ -70,6 +70,25 @@ fn ingestion_response(v: IngestionResponse) -> Response {
     ingest_response(v.code, v)
 }
 
+/// Log an ingest-handler failure at the right level.
+///
+/// Resource backpressure (memory/disk circuit breaker, memtable overflow,
+/// full WAL queue) arrives in storms — the breaker can reject 100% of
+/// traffic for tens of seconds — so it is counted into a windowed
+/// info-level summary with per-request detail at debug, never per-request
+/// ERROR spam. Trial-period expiry is expected and not logged at all.
+/// Everything else keeps its per-request ERROR line.
+fn log_ingest_error(route: &str, e: &infra::errors::Error) {
+    match e {
+        infra::errors::Error::TrialPeriodExpired => {}
+        infra::errors::Error::ResourceError(_) => {
+            ingester::admission::note_rejection(ingester::admission::REJECT_RESOURCE);
+            log::debug!("Error processing request {route}: {e}");
+        }
+        _ => log::error!("Error processing request {route}: {e}"),
+    }
+}
+
 /// _bulk ES compatible ingestion API
 #[utoipa::path(
     post,
@@ -126,10 +145,7 @@ pub async fn bulk(
     {
         Ok((v, code)) => ingest_response(code, v),
         Err(e) => {
-            // we do not want to log trial period expired errors
-            if !matches!(e, infra::errors::Error::TrialPeriodExpired) {
-                log::error!("Error processing request {org_id}/_bulk: {e}");
-            }
+            log_ingest_error(&format!("{org_id}/_bulk"), &e);
             if matches!(e, infra::errors::Error::ResourceError(_)) {
                 (
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -211,10 +227,7 @@ pub async fn multi(
     {
         Ok(v) => ingestion_response(v),
         Err(e) => {
-            // we do not want to log trial period expired errors
-            if !matches!(e, infra::errors::Error::TrialPeriodExpired) {
-                log::error!("Error processing request {org_id}/{stream_name}/_multi: {e}");
-            }
+            log_ingest_error(&format!("{org_id}/{stream_name}/_multi"), &e);
             if matches!(e, infra::errors::Error::ResourceError(_)) {
                 (
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -296,10 +309,7 @@ pub async fn json(
     {
         Ok(v) => ingestion_response(v),
         Err(e) => {
-            // we do not want to log trial period expired errors
-            if !matches!(e, infra::errors::Error::TrialPeriodExpired) {
-                log::error!("Error processing request {org_id}/{stream_name}/_json: {e}");
-            }
+            log_ingest_error(&format!("{org_id}/{stream_name}/_json"), &e);
             if matches!(e, infra::errors::Error::ResourceError(_)) {
                 (
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -391,10 +401,7 @@ pub async fn handle_kinesis_request(
             },
         ),
         Err(e) => {
-            // we do not want to log trial period expired errors
-            if !matches!(e, infra::errors::Error::TrialPeriodExpired) {
-                log::error!("Error processing kinesis request:  org_id: {org_id} {e}");
-            }
+            log_ingest_error(&format!("{org_id}/_kinesis_firehose"), &e);
             if matches!(e, infra::errors::Error::ResourceError(_)) {
                 (
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -450,10 +457,7 @@ pub async fn handle_gcp_request(
     {
         Ok(v) => ingestion_response(v),
         Err(e) => {
-            // we do not want to log trial period expired errors
-            if !matches!(e, infra::errors::Error::TrialPeriodExpired) {
-                log::error!("Error processing request {org_id}/{stream_name}/_gcp: {e:?}");
-            }
+            log_ingest_error(&format!("{org_id}/{stream_name}/_gcp"), &e);
             if matches!(e, infra::errors::Error::ResourceError(_)) {
                 (
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -564,12 +568,10 @@ pub async fn otlp_logs_write(
     {
         Ok(v) => v,
         Err(e) => {
-            // we do not want to log trial period expired errors
-            if !matches!(e, infra::errors::Error::TrialPeriodExpired) {
-                log::error!(
-                    "Error processing otlp {content_type} logs write request {org_id}/{in_stream_name:?}: {e:?}"
-                );
-            }
+            log_ingest_error(
+                &format!("otlp {content_type} logs {org_id}/{in_stream_name:?}"),
+                &e,
+            );
             if matches!(e, infra::errors::Error::ResourceError(_)) {
                 (
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -639,10 +641,7 @@ pub async fn hec(
         // batch as a permanent error.
         Ok(v) => ingest_response(v.code, v),
         Err(e) => {
-            // we do not want to log trial period expired errors
-            if !matches!(e, infra::errors::Error::TrialPeriodExpired) {
-                log::error!("Error processing request {org_id}/_hec: {e}");
-            }
+            log_ingest_error(&format!("{org_id}/_hec"), &e);
             let code = if matches!(e, infra::errors::Error::ResourceError(_)) {
                 StatusCode::SERVICE_UNAVAILABLE
             } else {

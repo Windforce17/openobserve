@@ -102,7 +102,14 @@ pub async fn ingest(
                 error: Some(e.to_string()),
             });
         } else {
-            log::error!("Metrics ingestion error: {e}");
+            if matches!(e, infra::errors::Error::ResourceError(_)) {
+                // resource backpressure storms: counts at info in windows,
+                // detail at debug — never per-request ERROR spam
+                ingester::admission::note_rejection(ingester::admission::REJECT_RESOURCE);
+                log::debug!("Metrics ingestion error: {e}");
+            } else {
+                log::error!("Metrics ingestion error: {e}");
+            }
             return Ok(IngestionResponse {
                 code: http::StatusCode::SERVICE_UNAVAILABLE.into(),
                 status: vec![],

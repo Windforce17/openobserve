@@ -20,13 +20,12 @@
 //! The compactor's row merge assigns every input row a new doc id; a
 //! [`DocIdMap`] captures that assignment per input. The merge then:
 //!
-//! - streams each input's composite terms in key order (its row-group FSTs), re-suffixing every
+//! - streams each input's composite terms in key order (its dictionary blocks), re-prefixing every
 //!   value term with the field's id in the *output* field table. Field ids are assigned by sorted
 //!   field name in every core file, so remapping preserves per-input key order — a strictness guard
-//!   catches the pathological exceptions (tokens whose bytes collide with the id suffix across the
-//!   `\x00` separator) and the caller falls back to a full rebuild. Terms of fields with no output
-//!   id (e.g. a field the merged docs store under a non-string type) are dropped and reported so
-//!   the writer can mark them `partial` — exactly what a rebuild would do;
+//!   catches the pathological exceptions and the caller falls back to a full rebuild. Terms of
+//!   fields with no output id (e.g. a field the merged docs store under a non-string type) are
+//!   dropped and reported so the writer can mark them `partial` — exactly what a rebuild would do;
 //! - k-way merges the remapped streams; equal keys union their postings with doc ids mapped through
 //!   the [`DocIdMap`]s. `doc_count` is the plain sum (doc-id spaces are disjoint). A term present
 //!   in every merged row is dense-elided (empty blob) against the *merged* row count; an input's
@@ -34,10 +33,12 @@
 //!   constant offset the remapped lists concatenate in offset order without sorting (and a single
 //!   contributor at offset 0 reuses its encoded blob byte-for-byte); table maps decode, remap,
 //!   sort, and verify distinctness;
-//! - runs the merge across `threads` workers by partitioning the key space into suffix-independent
-//!   ranges ([`partition_bounds`]) that each produce one [`crate::writer::TermSink`] run; the runs
-//!   concatenate into the final blobs with their row-group ordinals rebased
-//!   ([`crate::writer::write_index_blobs`]).
+//! - runs the merge across up to `ZO_VIX_MERGE_KWAY_THREADS` workers by partitioning the OUTPUT
+//!   key space into ranges bounded by real remapped input keys ([`partition_bounds`]), each bound
+//!   translated into every input's own key space ([`translate_bound`]); each range produces one
+//!   [`crate::writer::TermSink`] run and the runs concatenate into the final blobs with their
+//!   row-group ordinals rebased ([`crate::writer::write_index_blobs`], which hard-rejects
+//!   out-of-order runs).
 
 use std::collections::BTreeSet;
 
@@ -128,9 +129,12 @@ impl TermTable {
     }
 }
 
-/// One input's term stream over one key range (`[lower, upper)` on the raw
-/// composite keys; `None` = unbounded), with keys remapped into the output
-/// id space and guarded to stay strictly ascending.
+/// One input's term stream over one key range (`[lower, upper)` given in
+/// the OUTPUT key space; `None` = unbounded), with keys remapped into the
+/// output id space and guarded to stay strictly ascending. The bounds are
+/// translated into THIS input's own key space on construction
+/// ([`translate_bound`]) so the raw-key comparisons below are exact — the
+/// same output key falls on the same side of a bound in every input.
 struct RemappedTermStream<'r> {
     reader: &'r VixReader,
     /// The whole dictionary blocks region (compaction inputs are in-memory
@@ -144,8 +148,9 @@ struct RemappedTermStream<'r> {
     block_started: bool,
     raw_key: Vec<u8>,
     block_ordinal_pos: u64,
-    lower: Option<&'r [u8]>,
-    upper: Option<&'r [u8]>,
+    /// Range bounds TRANSLATED into this input's key space.
+    lower: Option<Vec<u8>>,
+    upper: Option<Vec<u8>>,
     /// `old field id -> Some(output field id)`; `None` = the field has no
     /// output id and its value terms are dropped.
     field_map: Vec<Option<u16>>,
@@ -160,11 +165,15 @@ struct RemappedTermStream<'r> {
 }
 
 impl<'r> RemappedTermStream<'r> {
+    /// `lower`/`upper` are OUTPUT-key-space range bounds (from
+    /// [`partition_bounds`]); they are translated into this input's key
+    /// space here, and [`Self::advance`] compares raw keys against the
+    /// translations.
     fn new(
         reader: &'r VixReader,
         out_field_ids: &std::collections::HashMap<String, u16>,
-        lower: Option<&'r [u8]>,
-        upper: Option<&'r [u8]>,
+        lower: Option<&[u8]>,
+        upper: Option<&[u8]>,
     ) -> Result<Self> {
         let entries = reader.field_entries();
         let mut field_map = Vec::with_capacity(entries.len());
@@ -173,12 +182,14 @@ impl<'r> RemappedTermStream<'r> {
             field_map.push(out_field_ids.get(&entry.name).copied());
             field_names.push(entry.name.clone());
         }
+        let lower = lower.map(|b| translate_bound(b, &field_map)).transpose()?;
+        let upper = upper.map(|b| translate_bound(b, &field_map)).transpose()?;
         let (start_block, blocks) = if reader.term_count() == 0 {
             // a zero-term input has no dictionary blobs at all: an
             // exhausted stream, not an error
             (usize::MAX, bytes::Bytes::new())
         } else {
-            let start = match lower {
+            let start = match &lower {
                 Some(lower) => reader.dict_index()?.predecessor_block(lower)?.unwrap_or(0),
                 None => 0,
             };
@@ -268,14 +279,20 @@ impl<'r> RemappedTermStream<'r> {
                 self.block_started = false;
                 continue;
             }
-            // range bounds on the RAW key space
-            if let Some(lower) = self.lower
-                && self.raw_key.as_slice() < lower
+            // Range bounds on the raw key space — sound because the bounds
+            // are this input's OWN translations of the output-space range
+            // ([`translate_bound`]): exact on every emittable key under the
+            // order-preserving remap [`partition_bounds`] pre-checks, and a
+            // consistent tiling for dropped-field keys (each raw key falls
+            // in exactly one range's walk, so dropped reporting stays
+            // complete).
+            if let Some(lower) = &self.lower
+                && self.raw_key.as_slice() < lower.as_slice()
             {
                 continue;
             }
-            if let Some(upper) = self.upper
-                && self.raw_key.as_slice() >= upper
+            if let Some(upper) = &self.upper
+                && self.raw_key.as_slice() >= upper.as_slice()
             {
                 return Ok(false);
             }
@@ -342,22 +359,29 @@ pub(crate) struct MergedIndexResult {
 
 /// Merge the inputs' term dictionaries into the final `dict`/`terms` blobs.
 ///
-/// The key space is partitioned into up to `threads` disjoint ranges (bounds
-/// sampled from the inputs' row-group `term_min`s — see
-/// [`partition_bounds`]); each range k-way merges independently on its own
+/// The OUTPUT key space is partitioned into disjoint ranges (bounds are real
+/// input dict-block first keys remapped into the output id space — see
+/// [`partition_bounds`]); each range k-way merges independently on a worker
 /// thread into its own [`TermSink`], and the sinks' parts are stitched into
-/// the blobs ([`write_index_blobs`] rebases the row-group ordinals). `threads
-/// == 0` uses the machine's available parallelism.
+/// the blobs ([`write_index_blobs`] rebases the row-group ordinals and
+/// hard-rejects out-of-order parts). `threads == 0` uses the machine's
+/// available parallelism; `kway_threads` is the #51b range-parallelism knob
+/// (`0` = `min(available_parallelism, 8)`, `1` = exactly one range — the
+/// sequential path through the same code), additionally capped by `threads`
+/// so it never exceeds the per-merge pool budget.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn merge_indexes(
     inputs: &[&VixReader],
     doc_maps: &[DocIdMap],
     out_field_ids: &std::collections::HashMap<String, u16>,
     bloom_field_names: &[String],
+    composite_pairs: &[(u16, String)],
+    bloom_only_fids: &std::collections::HashSet<u16>,
     total_rows: u64,
     postings_chunk_bytes: usize,
     plist_min_docs: u32,
     threads: usize,
+    kway_threads: usize,
 ) -> Result<MergedIndexResult> {
     debug_assert_eq!(inputs.len(), doc_maps.len());
     let threads = if threads == 0 {
@@ -365,6 +389,18 @@ pub(crate) fn merge_indexes(
     } else {
         threads
     };
+    // #51b range parallelism: default capped at 8 (diminishing returns and
+    // per-range sink overhead beyond that), and never above the per-merge
+    // thread budget (`ZO_VIX_MERGE_KWAY_THREADS` stacks with
+    // `ZO_VIX_MERGE_THREAD_NUM`, it does not widen it).
+    let kway = if kway_threads == 0 {
+        std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .min(8)
+    } else {
+        kway_threads
+    }
+    .min(threads);
 
     let started = std::time::Instant::now();
     let tables: Vec<TermTable> = if threads > 1 && inputs.len() > 1 {
@@ -390,12 +426,17 @@ pub(crate) fn merge_indexes(
         started.elapsed()
     );
 
-    // Over-partition (4 ranges per thread) and let `threads` workers pull
+    // Over-partition (4 ranges per k-way worker) and let the workers pull
     // ranges off a shared cursor: the sampled bounds only approximate work
     // quantiles, so static one-range-per-thread assignment loses half its
-    // speedup to skew.
+    // speedup to skew. `kway <= 1` asks for one range (no bounds) — the
+    // sequential path through the same code.
     let started = std::time::Instant::now();
-    let bounds = partition_bounds(inputs, threads.saturating_mul(4));
+    let bounds = if kway > 1 {
+        partition_bounds(inputs, out_field_ids, kway.saturating_mul(4))?
+    } else {
+        Vec::new()
+    };
     type KeyRange<'b> = (Option<&'b [u8]>, Option<&'b [u8]>);
     let mut ranges: Vec<KeyRange<'_>> = Vec::with_capacity(bounds.len() + 1);
     {
@@ -417,7 +458,7 @@ pub(crate) fn merge_indexes(
         let slots: Vec<Mutex<Option<Result<RangeOutput>>>> =
             (0..ranges.len()).map(|_| Mutex::new(None)).collect();
         std::thread::scope(|scope| {
-            for _ in 0..threads.min(ranges.len()) {
+            for _ in 0..kway.min(ranges.len()) {
                 scope.spawn(|| {
                     loop {
                         let index = next.fetch_add(1, Ordering::Relaxed);
@@ -430,6 +471,8 @@ pub(crate) fn merge_indexes(
                             doc_maps,
                             out_field_ids,
                             bloom_field_names,
+                            composite_pairs,
+                            bloom_only_fids,
                             total_rows,
                             postings_chunk_bytes,
                             plist_min_docs,
@@ -469,6 +512,8 @@ pub(crate) fn merge_indexes(
             doc_maps,
             out_field_ids,
             bloom_field_names,
+            composite_pairs,
+            bloom_only_fids,
             total_rows,
             postings_chunk_bytes,
             plist_min_docs,
@@ -486,9 +531,10 @@ pub(crate) fn merge_indexes(
     }
     let (blobs, term_count, bloom) = crate::writer::write_index_blobs(parts, threads)?;
     log::debug!(
-        "vix merge: k-way term merge ({} ranges) {merged_at:?}, dict/terms encode {:?} \
-         ({term_count} terms)",
+        "vix merge: k-way term merge ({} ranges, {} workers) {merged_at:?}, dict/terms encode \
+         {:?} ({term_count} terms)",
         ranges.len(),
+        kway.min(ranges.len()),
         started.elapsed() - merged_at,
     );
     Ok(MergedIndexResult {
@@ -499,32 +545,180 @@ pub(crate) fn merge_indexes(
     })
 }
 
-/// Key-range split points for the parallel merge: NONE under the
-/// field-major (v2) key layout — the retired sampler is UNSOUND there.
+/// Key-range split points for the parallel k-way merge, expressed in the
+/// OUTPUT key space (M10/#51b — the v1 sampler used raw input bytes as
+/// shared bounds and corrupted prod dictionaries on 2026-07-29: under
+/// field-major keys one raw-byte bound cuts different inputs at DIFFERENT
+/// fields, so the per-range sinks stopped covering disjoint ascending
+/// output ranges).
 ///
-/// It sampled inputs' row-group `term_min`s parsed under the v1 byte form
-/// and used the raw byte strings as range bounds. That was safe for
-/// v1-shaped keys (`{token}\x00{fid}`): a bound's comparison against a key
-/// is decided on the token BEFORE the fid suffix, so a key fell on the same
-/// side under its original and remapped field id. Field-major keys invert
-/// that: `{fid u16 BE}{token}` sorts by INPUT field id FIRST, and every
-/// input has its own fid table — one raw-byte bound cuts different inputs
-/// at DIFFERENT FIELDS, so after the per-input remap to output ids the
-/// per-range sinks no longer cover disjoint ascending output ranges and the
-/// concatenated dictionary carries OVERLAPPING row groups (prod corruption
-/// 2026-07-29: "row groups N and N+1 overlap or are unsorted" on 1GB
-/// second-pass merge outputs, whenever a v2 term_min happened to parse
-/// under the v1 form). A valid v2 sampler must express bounds in the
-/// OUTPUT key space and translate them per input (ENGINE-BACKLOG item 9);
-/// until then every merge runs single-range, and
-/// [`crate::writer::write_index_blobs`] hard-rejects out-of-order parts as
-/// the structural backstop.
-fn partition_bounds(_inputs: &[&VixReader], _threads: usize) -> Vec<Vec<u8>> {
-    Vec::new()
+/// Invariants:
+/// - Every bound is a REAL key: an input dict-block first key (read from
+///   the resident dict-block index, no block decode) remapped into the
+///   output id space — `{output fid u16 BE}{token}`. Nothing is ever
+///   fabricated by byte arithmetic.
+/// - Bounds are strictly ascending and deduplicated; `ranges <= 1`, no
+///   candidates, or a non-order-preserving remap yield NO bounds (one
+///   range — the sequential path). Split points are weighted quantiles
+///   over the candidate blocks' key counts, so ranges approximate equal
+///   key work regardless of input skew.
+/// - Bounds are only emitted when EVERY input's `input fid -> output fid`
+///   map is strictly increasing (checked here). Each range worker then
+///   translates a bound into each input's own key space
+///   ([`translate_bound`]) — exact on every emittable key — so all
+///   instances of one output key land in exactly one range.
+/// - [`crate::writer::write_index_blobs`] hard-rejects out-of-order parts
+///   as the structural backstop regardless.
+pub(crate) fn partition_bounds(
+    inputs: &[&VixReader],
+    out_field_ids: &std::collections::HashMap<String, u16>,
+    ranges: usize,
+) -> Result<Vec<Vec<u8>>> {
+    if ranges <= 1 {
+        return Ok(Vec::new());
+    }
+    // The translation (and the raw-key range filter it feeds) is only exact
+    // when every input's remap is order-preserving. Ids are assigned by
+    // sorted field name everywhere so this always holds in practice; a
+    // pathological map falls back to the single-range path, where the
+    // in-stream strictness guard still governs.
+    for reader in inputs {
+        let mut prev: Option<u16> = None;
+        for entry in reader.field_entries() {
+            let Some(&out_id) = out_field_ids.get(&entry.name) else {
+                continue;
+            };
+            if prev.is_some_and(|p| p >= out_id) {
+                return Ok(Vec::new());
+            }
+            prev = Some(out_id);
+        }
+    }
+    // Candidates: every input's dict-block first keys, remapped into the
+    // output key space, weighted by the block's key count.
+    let mut candidates: Vec<(Vec<u8>, u64)> = Vec::new();
+    for reader in inputs {
+        let term_count = reader.term_count();
+        if term_count == 0 {
+            continue;
+        }
+        let entries = reader.field_entries();
+        let index = reader.dict_index()?;
+        let mut walk_error: Option<VixError> = None;
+        index.walk_first_keys(|block, key| {
+            let Some((token, fid)) = split_key(key) else {
+                walk_error = Some(VixError::Malformed(format!(
+                    "dict-block first key too short to carry a field-id prefix: {key:?}"
+                )));
+                return false;
+            };
+            let remapped = if fid == KEY_FIELD_ID {
+                key.to_vec()
+            } else {
+                let out_id = entries
+                    .get(fid as usize)
+                    .and_then(|entry| out_field_ids.get(&entry.name));
+                let Some(&out_id) = out_id else {
+                    // no output id: the block starts on a dropped field's
+                    // key, which never reaches the output — not a candidate
+                    return true;
+                };
+                let mut k = Vec::new();
+                write_composite(&mut k, token, out_id);
+                k
+            };
+            candidates.push((remapped, index.block_key_count(block, term_count)));
+            true
+        })?;
+        if let Some(e) = walk_error {
+            return Err(e);
+        }
+    }
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    candidates.sort_unstable();
+    // merge duplicate keys (equal first keys across inputs), summing weights
+    let mut merged: Vec<(Vec<u8>, u64)> = Vec::with_capacity(candidates.len());
+    for (key, weight) in candidates {
+        match merged.last_mut() {
+            Some((last, sum)) if *last == key => *sum = sum.saturating_add(weight),
+            _ => merged.push((key, weight)),
+        }
+    }
+    let total: u128 = merged.iter().map(|(_, w)| u128::from(*w)).sum();
+    // R-1 weighted quantiles: bound r = the first candidate whose
+    // strictly-before cumulative weight reaches total * r / ranges.
+    let mut bounds: Vec<Vec<u8>> = Vec::with_capacity(ranges - 1);
+    let mut cum: u128 = 0;
+    let mut iter = merged.into_iter();
+    let mut current = iter.next();
+    for r in 1..ranges {
+        let target = total * r as u128 / ranges as u128;
+        while let Some((_, weight)) = &current {
+            if cum >= target {
+                break;
+            }
+            cum += u128::from(*weight);
+            current = iter.next();
+        }
+        match &current {
+            Some((key, _)) => {
+                if bounds.last().is_none_or(|last| last < key) {
+                    bounds.push(key.clone());
+                }
+            }
+            None => break,
+        }
+    }
+    Ok(bounds)
 }
 
-/// K-way merge one key range of the inputs' remapped term streams into a
-/// fresh [`TermSink`]. Postings cells are final: dense terms (`doc_count ==
+/// Translate an OUTPUT-key-space range bound into one input's own key
+/// space: the returned byte string `T` satisfies, for every key `k` the
+/// input can emit, `k >= T ⟺ remap(k) >= bound` — provided the input's
+/// `input fid -> output fid` map is strictly increasing over mapped fields
+/// ([`partition_bounds`] only emits bounds after checking exactly that).
+/// Dropped-field keys (no output id, never emitted) still get a definite
+/// side, so consecutive ranges tile each input's raw key space exactly.
+///
+/// Cases, scanning mapped input fids in ascending order:
+/// - first fid whose output id EQUALS the bound's fid: `{fid}{bound token}`
+///   (byte-exact within the field);
+/// - first fid whose output id EXCEEDS it: `{fid}` (2 bytes — every key of
+///   that field and beyond remaps at/above the bound);
+/// - none: only the key-term region (fid [`KEY_FIELD_ID`], identical bytes
+///   in every file) can still reach the bound — the bound itself when it
+///   IS a key-term bound, else the region prefix `{KEY_FIELD_ID}`.
+pub(crate) fn translate_bound(bound: &[u8], field_map: &[Option<u16>]) -> Result<Vec<u8>> {
+    let Some((token, out_fid)) = split_key(bound) else {
+        return Err(VixError::Malformed(format!(
+            "range bound too short to carry a field-id prefix: {bound:?}"
+        )));
+    };
+    for (fid, mapped) in field_map.iter().enumerate() {
+        let Some(out_id) = mapped else { continue };
+        debug_assert!(u16::try_from(fid).is_ok(), "field table exceeds u16 ids");
+        if *out_id > out_fid {
+            return Ok((fid as u16).to_be_bytes().to_vec());
+        }
+        if *out_id == out_fid {
+            let mut k = Vec::new();
+            write_composite(&mut k, token, fid as u16);
+            return Ok(k);
+        }
+    }
+    if out_fid == KEY_FIELD_ID {
+        Ok(bound.to_vec())
+    } else {
+        Ok(KEY_FIELD_ID.to_be_bytes().to_vec())
+    }
+}
+
+/// K-way merge one key range (`[lower, upper)` in the OUTPUT key space,
+/// `None` = unbounded; each stream translates the bounds into its own
+/// input's key space) of the inputs' remapped term streams into a fresh
+/// [`TermSink`]. Postings cells are final: dense terms (`doc_count ==
 /// total_rows`) are elided to the empty cell — taking precedence over the
 /// plist threshold — and terms at/above `plist_min_docs` go out-of-row into
 /// the sink's plist region as [`postings::encode_record`] bytes. Also
@@ -537,6 +731,8 @@ fn merge_term_range(
     doc_maps: &[DocIdMap],
     out_field_ids: &std::collections::HashMap<String, u16>,
     bloom_field_names: &[String],
+    composite_pairs: &[(u16, String)],
+    bloom_only_fids: &std::collections::HashSet<u16>,
     total_rows: u64,
     postings_chunk_bytes: usize,
     plist_min_docs: u32,
@@ -551,8 +747,18 @@ fn merge_term_range(
     // field ids; the remap is order-preserving (ids are assigned by sorted
     // field name everywhere), backstopped by the strictly-ascending check
     // in RemappedTermStream::advance.
+    let mut bloom_acc = crate::bloom::BloomHashAcc::from_pairs(bloom_pairs);
+    if !composite_pairs.is_empty() {
+        // #48: same reserved composite section as the writer build. The
+        // caller computes the ELIGIBLE pairs (value-lookup-capable term
+        // fields only — no fts, no merge-demoted): tokens are not raw
+        // values and demoted fields carry incomplete value terms, so
+        // claiming coverage for either would wrongly drop files on
+        // equality probes.
+        bloom_acc.enable_composite(composite_pairs.iter().cloned());
+    }
     let mut sink = crate::writer::TermSink::new(postings_chunk_bytes)
-        .with_bloom(crate::bloom::BloomHashAcc::from_pairs(bloom_pairs))
+        .with_bloom(bloom_acc)
         .with_plist_min_docs(plist_min_docs);
     let mut streams: Vec<RemappedTermStream<'_>> = inputs
         .iter()
@@ -593,6 +799,21 @@ fn merge_term_range(
         }
         key.clear();
         key.extend_from_slice(&streams[contributors[0]].cur_key);
+
+        // #52 bloom-only output fields: legacy inputs' dictionary terms for
+        // them feed the bloom accumulation and NOTHING else — no postings
+        // union, no dictionary entry. This is where a term-indexed history
+        // converges to the bloom-only plan.
+        if let Some((_, fid)) = crate::query::split_key(&key)
+            && fid != crate::query::KEY_FIELD_ID
+            && bloom_only_fids.contains(&fid)
+        {
+            sink.observe_bloom_only_key(&key);
+            for &index in &contributors {
+                alive[index] = streams[index].advance()?;
+            }
+            continue;
+        }
 
         let mut doc_count = 0u64;
         for &index in &contributors {

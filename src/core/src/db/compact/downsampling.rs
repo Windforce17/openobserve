@@ -162,6 +162,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_downsampling() {
+        // self-sufficient db setup — see compact::retention::test_delete_all
+        // (schedule-sensitive "no such table: meta" flake otherwise, M20b)
+        infra::db::create_table().await.unwrap();
         const OFFSET: i64 = 100;
         set_offset(
             "default",

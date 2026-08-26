@@ -131,7 +131,9 @@ pub async fn search(
     // row-level late materialization). Every other condition-ALL shape has
     // nothing for the index to answer, and bloom above always needs real
     // terms.
-    if vix_search_applicable(*use_inverted_index, condition_all, &idx_optimize_rule) {
+    let vix_applicable =
+        vix_search_applicable(*use_inverted_index, condition_all, &idx_optimize_rule);
+    if vix_applicable {
         // check vix inverted index
         (idx_took, is_add_filter_back, ..) = vix_search(
             query.clone(),
@@ -163,8 +165,16 @@ pub async fn search(
         );
     }
 
-    // set index_condition to None, means we do not need to add filter back
-    if !is_add_filter_back {
+    // set index_condition to None, means we do not need to add filter back.
+    // EXCEPTION (#40): when the vix step never ran over a REAL (non-ALL)
+    // extracted condition — index-off stream types keep
+    // `use_inverted_index` false — the condition MUST stay: the IndexRule
+    // already removed those conjuncts from the physical plan, so the scan
+    // tables are their only remaining evaluation point (nulling it here
+    // would silently return unfiltered rows).
+    let index_step_skipped_with_condition =
+        !vix_applicable && !condition_all && index_condition.is_some();
+    if !is_add_filter_back && !index_step_skipped_with_condition {
         index_condition = None;
         fst_fields = vec![];
     }
@@ -336,9 +346,12 @@ pub async fn check_bloom_filter(
     bloom_indexed_fields: Vec<String>,
 ) -> Result<(usize, bool), Error> {
     let cfg = get_config();
+    // #48: with the composite section enabled, equality on ANY field is
+    // potentially bloom-decidable — an empty per-stream bloom-field config
+    // no longer short-circuits the prune.
     if !cfg.common.bloom_filter_enabled
         || file_list.is_empty()
-        || bloom_indexed_fields.is_empty()
+        || (bloom_indexed_fields.is_empty() && !cfg.common.vix_bloom_composite)
         || index_condition.is_none()
     {
         return Ok((0, false));
@@ -357,6 +370,7 @@ pub async fn check_bloom_filter(
         file_list.to_vec(),
         index_condition.as_ref().unwrap(),
         bloom_indexed_fields,
+        cfg.common.vix_bloom_composite,
     )
     .await;
 

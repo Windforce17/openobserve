@@ -320,6 +320,23 @@ SELECT min_ts, max_ts, records, original_size, compressed_size, index_size, bloo
         Ok(())
     }
 
+    async fn update_index_size_for_heal(&self, file: &str, index_size: i64) -> Result<()> {
+        let client = CLIENT_RW.clone();
+        let client = client.lock().await;
+        let (stream_key, date_key, file_name) =
+            parse_file_key_columns(file).map_err(|e| Error::Message(e.to_string()))?;
+        sqlx::query(
+            r#"UPDATE file_list SET index_size = $1, bloom_ver = 0 WHERE stream = $2 AND date = $3 AND file = $4;"#,
+        )
+        .bind(index_size)
+        .bind(stream_key)
+        .bind(date_key)
+        .bind(file_name)
+        .execute(&*client)
+        .await?;
+        Ok(())
+    }
+
     async fn update_bloom_ver(&self, ids: &[i64], bloom_ver: i64) -> Result<()> {
         if ids.is_empty() {
             return Ok(());

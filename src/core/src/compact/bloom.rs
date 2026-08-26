@@ -176,7 +176,10 @@ async fn process_bucket_locked(
     let latest_schema = infra::schema::get(org_id, stream_name, stream_type).await?;
     let stream_settings = unwrap_stream_settings(&latest_schema);
     let bloom_fields = get_stream_setting_bloom_filter_fields(&stream_settings);
-    if bloom_fields.is_empty() {
+    // #48: the composite section needs no per-stream field config — with it
+    // enabled, every stream with term-indexed files gets a `.bf`
+    let composite = get_config().common.vix_bloom_composite;
+    if bloom_fields.is_empty() && !composite {
         // nothing to build for this stream — drain the queue
         let ids: Vec<i64> = files.iter().map(|f| f.id).collect();
         infra::file_list::update_bloom_ver(&ids, BLOOM_VER_NOT_APPLICABLE).await?;
@@ -336,19 +339,44 @@ async fn load_file_blooms(
     file: &FileKey,
     bloom_fields: &[String],
 ) -> Result<LoadedBlooms, anyhow::Error> {
+    let handle = tokio::runtime::Handle::current();
     let source: Arc<dyn vortex_index::VixRangeSource> = Arc::new(HealProbeRangeSource {
         account: file.account.clone(),
         location: object_store::path::Path::from(file.key.as_str()),
-        // a .vix FileMeta's compressed_size is the exact object size
+        // a .vix FileMeta's compressed_size is the exact DATA-object size
         size: file.meta.compressed_size as u64,
-        handle: tokio::runtime::Handle::current(),
+        handle: handle.clone(),
     });
+    // v3 split: the per-file bloom blob (and the dictionary the backfill
+    // streams) live in the `.vxi` SIDECAR, fetched by range. The pending
+    // queue selects `index_size > 0` rows only, so the sidecar exists for
+    // every file reaching here; index-less files keep their existing
+    // sentinel path upstream.
+    let index_source: Option<Arc<dyn vortex_index::VixRangeSource>> =
+        config::vix_sidecar_key(&file.key)
+            .filter(|_| file.meta.index_size > 0)
+            .map(|sidecar_key| {
+                Arc::new(HealProbeRangeSource {
+                    account: file.account.clone(),
+                    location: object_store::path::Path::from(sidecar_key.as_str()),
+                    size: file.meta.index_size as u64,
+                    handle,
+                }) as Arc<dyn vortex_index::VixRangeSource>
+            });
     let bloom_fields = bloom_fields.to_vec();
     let fpp = get_config().common.vix_bloom_fpp;
+    let composite = get_config().common.vix_bloom_composite;
     let file_key = file.key.clone();
     tokio::task::spawn_blocking(move || {
-        let reader = VixReader::open_ranged(source)?;
-        load_blooms_sync(&reader, &bloom_fields, fpp, &file_key, &FALLBACK_BUDGET)
+        let reader = VixReader::open_ranged_with_index(source, index_source)?;
+        load_blooms_sync(
+            &reader,
+            &bloom_fields,
+            fpp,
+            composite,
+            &file_key,
+            &FALLBACK_BUDGET,
+        )
     })
     .await?
 }
@@ -361,17 +389,34 @@ fn load_blooms_sync(
     reader: &VixReader,
     bloom_fields: &[String],
     fpp: f64,
+    composite: bool,
     file_key: &str,
     budget: &std::sync::atomic::AtomicI64,
 ) -> Result<LoadedBlooms, anyhow::Error> {
     match reader.file_blooms() {
         Ok(Some(blooms)) => {
-            // keep only the configured fields (settings may have shrunk)
-            let wanted: Vec<_> = blooms
-                .into_iter()
-                .filter(|b| bloom_fields.contains(&b.field))
-                .collect();
-            return Ok(LoadedBlooms::FromBlob(wanted));
+            // keep only the configured fields (settings may have shrunk),
+            // plus the #48 composite section whenever the writer built one —
+            // data-driven, so a later config flip never orphans it
+            let has_composite = blooms
+                .iter()
+                .any(|b| b.field == vortex_index::bloom::COMPOSITE_BLOOM_FIELD);
+            // #48 sweep coverage: with the composite enabled, a blob that
+            // PREDATES it (pre-.95 writers) must not short-circuit the
+            // rebuild — the budgeted dictionary walk below derives the
+            // composite for exactly these files, which is what makes a
+            // bloom_ver-reset sweep extend any-field pruning over history
+            // instead of faithfully re-publishing coverage-less blobs.
+            if !(composite && !has_composite && reader.term_fields().next().is_some()) {
+                let wanted: Vec<_> = blooms
+                    .into_iter()
+                    .filter(|b| {
+                        b.field == vortex_index::bloom::COMPOSITE_BLOOM_FIELD
+                            || bloom_fields.contains(&b.field)
+                    })
+                    .collect();
+                return Ok(LoadedBlooms::FromBlob(wanted));
+            }
         }
         Ok(None) => {}
         // a CORRUPT blob is file-shaped, but the dictionary may still be
@@ -389,7 +434,7 @@ fn load_blooms_sync(
     // backfill: one full dictionary stream, hashing configured fields —
     // bounded per pass by the fallback budget
     budgeted_backfill(budget, || {
-        blooms_from_dictionary(reader, bloom_fields, fpp, file_key)
+        blooms_from_dictionary(reader, bloom_fields, fpp, composite, file_key)
     })
 }
 
@@ -427,17 +472,34 @@ fn blooms_from_dictionary(
     reader: &VixReader,
     bloom_fields: &[String],
     fpp: f64,
+    composite: bool,
     context: &str,
 ) -> Result<Vec<vortex_index::bloom::FileBloom>, anyhow::Error> {
     let pairs: Vec<(u16, String)> = bloom_fields
         .iter()
         .filter_map(|n| reader.term_field_id(n).map(|id| (id, n.clone())))
         .collect();
-    if pairs.is_empty() {
+    // #48: a dictionary walk visits every key anyway, so with the composite
+    // enabled the SAME pass hashes the composite form over ALL of the file's
+    // term fields — this is how files written before the composite (or with
+    // it off) gain any-field pruning without a rewrite. Index-off files have
+    // no term fields and stay out naturally.
+    let composite_pairs: Vec<(u16, String)> = if composite {
+        reader
+            .term_fields()
+            .map(|(id, n)| (id, n.to_string()))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if pairs.is_empty() && composite_pairs.is_empty() {
         return Ok(Vec::new());
     }
     let wanted = pairs.len();
     let mut acc = vortex_index::bloom::BloomHashAcc::from_pairs(pairs);
+    if !composite_pairs.is_empty() {
+        acc.enable_composite(composite_pairs);
+    }
     // `for_each_term` yields FIELD-MAJOR v2 keys (`{fid BE}{token}`) while
     // the bloom byte form is pinned to v1: `observe_dict_key` is the only
     // entry point that converts. A raw `observe` here records NOTHING, and
@@ -448,11 +510,15 @@ fn blooms_from_dictionary(
         Ok(())
     })?;
     let blooms = finish_backfill_acc(acc, fpp, context)?;
-    if blooms.len() < wanted {
+    let per_field_published = blooms
+        .iter()
+        .filter(|b| b.field != vortex_index::bloom::COMPOSITE_BLOOM_FIELD)
+        .count();
+    if per_field_published < wanted {
         log::warn!(
             "[COMPACTOR:BLOOM] {context}: {} of {wanted} bloom fields carry no dictionary keys; \
              no filter published for them",
-            wanted - blooms.len()
+            wanted - per_field_published
         );
     }
     Ok(blooms)
@@ -493,8 +559,17 @@ mod tests {
         assert_eq!(parse_stream_key("only/two"), None);
     }
 
+    /// Open one built (data, sidecar) pair.
+    fn open_pair(pair: (Vec<u8>, Option<Vec<u8>>)) -> VixReader {
+        VixReader::open_with_index(
+            bytes::Bytes::from(pair.0),
+            pair.1.map(bytes::Bytes::from),
+        )
+        .unwrap()
+    }
+
     /// A `.vix` with no `bloom` blob — the shape this path backfills.
-    fn backfill_file(values: &[&str]) -> Vec<u8> {
+    fn backfill_file(values: &[&str]) -> (Vec<u8>, Option<Vec<u8>>) {
         use std::sync::Arc;
 
         use arrow::{
@@ -537,11 +612,17 @@ mod tests {
         use infra::bloom::sbbf::{BLOCK_BYTES, block_index, check_block, hash_value};
 
         let values = ["trace-a", "trace-b", "trace-c"];
-        let reader = VixReader::open(bytes::Bytes::from(backfill_file(&values))).unwrap();
+        let reader = open_pair(backfill_file(&values));
         assert!(!reader.has_file_blooms(), "the backfill shape has no blob");
 
-        let blooms =
-            blooms_from_dictionary(&reader, &["trace_id".to_string()], 0.001, "unit-test").unwrap();
+        let blooms = blooms_from_dictionary(
+            &reader,
+            &["trace_id".to_string()],
+            0.001,
+            false,
+            "unit-test",
+        )
+        .unwrap();
         assert_eq!(blooms.len(), 1);
         assert_eq!(blooms[0].field, "trace_id");
         assert_eq!(blooms[0].n_items, values.len() as u32);
@@ -561,14 +642,14 @@ mod tests {
         // a configured field the file does not carry yields NO filter at all
         // — never an empty one, which would reject every needle for it
         assert!(
-            blooms_from_dictionary(&reader, &["span_id".to_string()], 0.001, "unit-test")
+            blooms_from_dictionary(&reader, &["span_id".to_string()], 0.001, false, "unit-test")
                 .unwrap()
                 .is_empty()
         );
     }
 
     /// A `.vix` WITH a per-file `bloom` blob (the blob-transpose shape).
-    fn bloom_blob_file(values: &[&str]) -> Vec<u8> {
+    fn bloom_blob_file(values: &[&str]) -> (Vec<u8>, Option<Vec<u8>>) {
         use std::sync::Arc;
 
         use arrow::{
@@ -635,9 +716,15 @@ mod tests {
         );
 
         // ...so a healthy file in the same pass still gets the slot
-        let reader = VixReader::open(bytes::Bytes::from(backfill_file(&["trace-a"]))).unwrap();
+        let reader = open_pair(backfill_file(&["trace-a"]));
         let loaded = budgeted_backfill(&budget, || {
-            blooms_from_dictionary(&reader, &["trace_id".to_string()], 0.001, "unit-test")
+            blooms_from_dictionary(
+                &reader,
+                &["trace_id".to_string()],
+                0.001,
+                false,
+                "unit-test",
+            )
         })
         .unwrap();
         assert!(matches!(&loaded, LoadedBlooms::FromDict(b) if b.len() == 1));
@@ -691,12 +778,13 @@ mod tests {
     fn corrupt_blob_falls_back_to_the_dictionary() {
         use infra::bloom::sbbf::{BLOCK_BYTES, block_index, check_block, hash_value};
 
-        let mut data = bloom_blob_file(&["trace-a", "trace-b"]);
-        let range = vortex_index::test_support::blob_byte_range(&data, "bloom").unwrap();
-        for byte in &mut data[range] {
+        let (data, index) = bloom_blob_file(&["trace-a", "trace-b"]);
+        let mut index = index.expect("sidecar");
+        let range = vortex_index::test_support::blob_byte_range(&index, "bloom").unwrap();
+        for byte in &mut index[range] {
             *byte = 0xFF;
         }
-        let reader = VixReader::open(bytes::Bytes::from(data)).unwrap();
+        let reader = open_pair((data, Some(index)));
         assert!(reader.file_blooms().is_err(), "the blob must be corrupt");
 
         let budget = std::sync::atomic::AtomicI64::new(1);
@@ -704,6 +792,7 @@ mod tests {
             &reader,
             &["trace_id".to_string()],
             0.001,
+            false,
             "unit-test",
             &budget,
         )
@@ -724,17 +813,168 @@ mod tests {
 
         // and an INTACT blob still short-circuits to the transpose path
         // without touching the budget
-        let reader = VixReader::open(bytes::Bytes::from(bloom_blob_file(&["trace-a"]))).unwrap();
+        let reader = open_pair(bloom_blob_file(&["trace-a"]));
         let budget = std::sync::atomic::AtomicI64::new(0);
         let loaded = load_blooms_sync(
             &reader,
             &["trace_id".to_string()],
             0.001,
+            false,
             "unit-test",
             &budget,
         )
         .unwrap();
         assert!(matches!(&loaded, LoadedBlooms::FromBlob(b) if b.len() == 1));
         assert_eq!(budget.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    /// #48: with the composite enabled, the SAME dictionary walk covers
+    /// every term field of the file — no per-stream `bloom_filter_fields`
+    /// needed, and legacy blob-less files gain any-field pruning on their
+    /// next `.bf` build without a rewrite.
+    #[test]
+    fn dictionary_backfill_builds_composite_without_configured_fields() {
+        use infra::bloom::sbbf::{BLOCK_BYTES, block_index, check_block, hash_value};
+        use vortex_index::bloom::{
+            COMPOSITE_BLOOM_FIELD, COMPOSITE_GUARD_PROBES, composite_guard_key, composite_value_key,
+        };
+
+        let reader =
+            open_pair(backfill_file(&["trace-a", "trace-b"]));
+        // no per-stream bloom fields at all — the composite alone builds
+        let blooms = blooms_from_dictionary(&reader, &[], 0.001, true, "unit-test").unwrap();
+        assert_eq!(blooms.len(), 1);
+        assert_eq!(blooms[0].field, COMPOSITE_BLOOM_FIELD);
+
+        let probe = |key: &[u8]| {
+            let hash = hash_value(key);
+            let index = block_index(hash, blooms[0].num_blocks) as usize;
+            let block: &[u8; BLOCK_BYTES] = blooms[0].bytes
+                [index * BLOCK_BYTES..(index + 1) * BLOCK_BYTES]
+                .try_into()
+                .unwrap();
+            check_block(block, hash)
+        };
+        let mut buf = Vec::new();
+        // the pruner's own probe key form finds the file's values…
+        assert!(probe(
+            composite_value_key("trace_id", b"trace-a", &mut buf).unwrap()
+        ));
+        // …misses absent ones…
+        assert!(!probe(
+            composite_value_key("trace_id", b"absent", &mut buf).unwrap()
+        ));
+        // …and the covered field's guards all hit, while an uncovered
+        // field's don't (that miss is what keeps files instead of dropping
+        // them on fields that were never term-indexed)
+        for p in 0..COMPOSITE_GUARD_PROBES {
+            assert!(probe(composite_guard_key("trace_id", p, &mut buf).unwrap()));
+        }
+        let uncovered_hits = (0..COMPOSITE_GUARD_PROBES)
+            .filter(|&p| probe(composite_guard_key("severity", p, &mut buf).unwrap()))
+            .count();
+        assert!(uncovered_hits < COMPOSITE_GUARD_PROBES as usize);
+    }
+
+    /// #48 sweep coverage: a pre-composite blob must NOT short-circuit when
+    /// the composite is enabled — the dictionary backfill derives the
+    /// section, which is what lets a bloom_ver sweep extend any-field
+    /// pruning over history.
+    #[test]
+    fn pre_composite_blob_falls_through_to_backfill() {
+        use vortex_index::bloom::COMPOSITE_BLOOM_FIELD;
+
+        // a blob built WITHOUT composite (the pre-.95 shape)
+        let reader =
+            open_pair(bloom_blob_file(&["trace-a", "trace-b"]));
+        assert!(reader.has_file_blooms());
+
+        let budget = std::sync::atomic::AtomicI64::new(1);
+        let loaded = load_blooms_sync(
+            &reader,
+            &["trace_id".to_string()],
+            0.001,
+            true, // composite enabled
+            "unit-test",
+            &budget,
+        )
+        .unwrap();
+        let LoadedBlooms::FromDict(blooms) = loaded else {
+            panic!("pre-composite blob must take the dictionary backfill");
+        };
+        assert!(
+            blooms.iter().any(|b| b.field == COMPOSITE_BLOOM_FIELD),
+            "backfill must add the composite section"
+        );
+        assert!(blooms.iter().any(|b| b.field == "trace_id"));
+
+        // with composite OFF the blob still short-circuits (no wasted walks)
+        let budget = std::sync::atomic::AtomicI64::new(0);
+        let loaded = load_blooms_sync(
+            &reader,
+            &["trace_id".to_string()],
+            0.001,
+            false,
+            "unit-test",
+            &budget,
+        )
+        .unwrap();
+        assert!(matches!(loaded, LoadedBlooms::FromBlob(_)));
+    }
+
+    /// #48 blob path: a writer-built composite section survives the blob
+    /// load even when the stream has no configured bloom fields — the
+    /// section is data-driven, never orphaned by a config flip.
+    #[test]
+    fn blob_load_keeps_the_composite_section() {
+        let mut writer = {
+            use std::sync::Arc;
+
+            use arrow::{
+                array::{ArrayRef, Int64Array, StringArray},
+                datatypes::{DataType, Field, Schema},
+                record_batch::RecordBatch,
+            };
+
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("_timestamp", DataType::Int64, false),
+                Field::new("trace_id", DataType::Utf8, true),
+            ]));
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(vec![1_000i64, 1_001])) as ArrayRef,
+                    Arc::new(StringArray::from(vec!["trace-a", "trace-b"])) as ArrayRef,
+                ],
+            )
+            .unwrap();
+            let source = StringArray::from_iter_values(
+                ["trace-a", "trace-b"]
+                    .iter()
+                    .map(|v| format!("{{\"trace_id\":\"{v}\"}}")),
+            );
+            let mut writer = vortex_index::VixWriter::new(
+                &schema,
+                vortex_index::VixWriterOptions {
+                    bloom_composite: true,
+                    ..Default::default()
+                },
+                false,
+            );
+            writer
+                .push_batch_with_source(&batch, &source, None)
+                .unwrap();
+            writer
+        };
+        let reader = open_pair(writer.finish().unwrap());
+        assert!(reader.has_file_blooms(), "composite alone produces a blob");
+
+        let budget = std::sync::atomic::AtomicI64::new(0);
+        let loaded = load_blooms_sync(&reader, &[], 0.001, true, "unit-test", &budget).unwrap();
+        let LoadedBlooms::FromBlob(blooms) = loaded else {
+            panic!("expected the blob transpose path");
+        };
+        assert_eq!(blooms.len(), 1);
+        assert_eq!(blooms[0].field, vortex_index::bloom::COMPOSITE_BLOOM_FIELD);
     }
 }

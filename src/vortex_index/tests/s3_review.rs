@@ -102,7 +102,7 @@ impl VixRangeSource for CountingSource {
 /// Build a synthetic core file whose dictionary spans MANY row groups (tiny
 /// `rg_term_bytes`) and comfortably exceeds the 64 KiB footer tail window,
 /// so directory-vs-FST fetch behavior is observable.
-fn build_multi_rg_file() -> Bytes {
+fn build_multi_rg_file() -> (Bytes, Bytes) {
     let rows = 20_000usize;
     let schema = Arc::new(Schema::new(vec![
         Field::new("_timestamp", DataType::Int64, false),
@@ -137,7 +137,11 @@ fn build_multi_rg_file() -> Bytes {
             None,
         )
         .unwrap();
-    Bytes::from(writer.finish().unwrap())
+    let (data, index) = writer.finish().unwrap();
+    (
+        Bytes::from(data),
+        Bytes::from(index.expect("indexed fixture has a sidecar")),
+    )
 }
 
 /// The post-fix open/eval profile: a ranged open loads only the small
@@ -149,22 +153,29 @@ fn build_multi_rg_file() -> Bytes {
 /// above this layer is the only persistence, by design.
 #[test]
 fn s3_review_open_is_directory_only_and_fsts_load_lazily() {
-    let data = build_multi_rg_file();
-    let file_len = data.len() as u64;
+    let (data, index) = build_multi_rg_file();
+    let file_len = (data.len() + index.len()) as u64;
     assert!(
-        file_len > 2 * 64 * 1024,
-        "file must exceed the tail window for laziness to be observable"
+        index.len() as u64 > 2 * 64 * 1024,
+        "the sidecar must exceed the tail window for laziness to be observable"
     );
 
-    let source = CountingSource::new(data.clone());
-    let reader = VixReader::open_ranged(Arc::clone(&source) as Arc<dyn VixRangeSource>).unwrap();
-    // open is FOOTER-ONLY: the dictionary index parses lazily on the first
-    // dictionary touch, blocks fetch per lookup
-    let open_fetches = source.fetch_count();
-    let open_bytes = source.byte_count();
+    let dsource = CountingSource::new(data.clone());
+    let isource = CountingSource::new(index.clone());
+    let fetch_count = || dsource.fetch_count() + isource.fetch_count();
+    let byte_count = || dsource.byte_count() + isource.byte_count();
+    let reader = VixReader::open_ranged_with_index(
+        Arc::clone(&dsource) as Arc<dyn VixRangeSource>,
+        Some(Arc::clone(&isource) as Arc<dyn VixRangeSource>),
+    )
+    .unwrap();
+    // open is FOOTER-ONLY (one tail per object): the dictionary index
+    // parses lazily on the first dictionary touch, blocks fetch per lookup
+    let open_fetches = fetch_count();
+    let open_bytes = byte_count();
     assert!(
-        open_bytes < 64 * 1024 + 96 * 1024,
-        "open must fetch only the tail window: {open_bytes} bytes"
+        open_bytes < 2 * (64 * 1024) + 96 * 1024,
+        "open must fetch only the two tail windows: {open_bytes} bytes"
     );
     assert!(
         reader.term_row_group_count() > 20,
@@ -172,7 +183,8 @@ fn s3_review_open_is_directory_only_and_fsts_load_lazily() {
         reader.term_row_group_count()
     );
     let open_memory = reader.memory_size();
-    source.take_log();
+    dsource.take_log();
+    isource.take_log();
 
     // Cold exact-term probe: the directory prunes to ONE row group; exactly
     // one FST cell (a few KiB) is fetched, never the whole dict column.
@@ -182,8 +194,8 @@ fn s3_review_open_is_directory_only_and_fsts_load_lazily() {
     };
     let bitmap = reader.eval(&probe("svc-00010000-abcdefgh")).unwrap();
     assert_eq!(bitmap.count_set_bits(), 1);
-    let cold_fetches = source.fetch_count() - open_fetches;
-    let cold_bytes = source.byte_count() - open_bytes;
+    let cold_fetches = fetch_count() - open_fetches;
+    let cold_bytes = byte_count() - open_bytes;
     // one FST cell + the terms-blob footer + one doc_count/postings chunk
     // (plus read coalescing) — bounded, and far below a whole-dict load
     // (asserted against the full walk below)
@@ -199,11 +211,11 @@ fn s3_review_open_is_directory_only_and_fsts_load_lazily() {
 
     // A second needle in the SAME row group: the FST is resident, only the
     // postings point read remains.
-    let (f0, b0) = (source.fetch_count(), source.byte_count());
+    let (f0, b0) = (fetch_count(), byte_count());
     let bitmap = reader.eval(&probe("svc-00010001-abcdefgh")).unwrap();
     assert_eq!(bitmap.count_set_bits(), 1);
-    let hot_fetches = source.fetch_count() - f0;
-    let hot_bytes = source.byte_count() - b0;
+    let hot_fetches = fetch_count() - f0;
+    let hot_bytes = byte_count() - b0;
     assert_eq!(
         reader.memory_size(),
         after_first_probe,
@@ -217,19 +229,19 @@ fn s3_review_open_is_directory_only_and_fsts_load_lazily() {
     );
 
     // A needle in a DIFFERENT row group loads exactly one more cell.
-    let (_f1, b1) = (source.fetch_count(), source.byte_count());
+    let (_f1, b1) = (fetch_count(), byte_count());
     let bitmap = reader.eval(&probe("svc-00019999-abcdefgh")).unwrap();
     assert_eq!(bitmap.count_set_bits(), 1);
     assert!(
         reader.memory_size() > after_first_probe,
         "a probe in a new row group must load its FST cell"
     );
-    assert!(source.byte_count() - b1 < 256 * 1024);
+    assert!(byte_count() - b1 < 256 * 1024);
 
     // Full-dictionary walk (Contains = scan_all_tokens): loads EVERY
     // remaining FST cell — the needle probes above must have cost a small
     // fraction of this (the lazy-loading win).
-    let (_f2, b2) = (source.fetch_count(), source.byte_count());
+    let (_f2, b2) = (fetch_count(), byte_count());
     let ordinal_bitmap = reader
         .eval(&VixQuery::Contains {
             field: Some("svc".to_string()),
@@ -238,7 +250,7 @@ fn s3_review_open_is_directory_only_and_fsts_load_lazily() {
         })
         .unwrap();
     assert_eq!(ordinal_bitmap.count_set_bits(), 1);
-    let full_walk_bytes = source.byte_count() - b2;
+    let full_walk_bytes = byte_count() - b2;
     let full_memory = reader.memory_size();
     assert!(full_memory > after_first_probe);
     // resident-FST accounting is the honest lazy metric (fetch bytes mix in
@@ -252,12 +264,17 @@ fn s3_review_open_is_directory_only_and_fsts_load_lazily() {
          dictionary ({all_cells}B resident after the full walk)"
     );
 
-    // Re-open over a fresh source: the same small directory-only open (no
+    // Re-open over fresh sources: the same small footer-only open (no
     // layer below the in-process reader cache persists parsed state).
-    let source2 = CountingSource::new(data);
-    let _reader2 = VixReader::open_ranged(Arc::clone(&source2) as Arc<dyn VixRangeSource>).unwrap();
-    assert_eq!(source2.fetch_count(), open_fetches);
-    assert_eq!(source2.byte_count(), open_bytes);
+    let dsource2 = CountingSource::new(data);
+    let isource2 = CountingSource::new(index);
+    let _reader2 = VixReader::open_ranged_with_index(
+        Arc::clone(&dsource2) as Arc<dyn VixRangeSource>,
+        Some(Arc::clone(&isource2) as Arc<dyn VixRangeSource>),
+    )
+    .unwrap();
+    assert_eq!(dsource2.fetch_count() + isource2.fetch_count(), open_fetches);
+    assert_eq!(dsource2.byte_count() + isource2.byte_count(), open_bytes);
 
     println!(
         "s3_review synthetic (lazy): file={file_len}B open={open_fetches} fetches/{open_bytes}B, \
@@ -278,14 +295,25 @@ fn s3_review_real_file_fetch_profile() {
     let path = std::env::var("O2_S3_REVIEW_VIX_FILE")
         .expect("set O2_S3_REVIEW_VIX_FILE to a real .vix file");
     let data = Bytes::from(std::fs::read(&path).unwrap());
-    let total_len = data.len() as u64;
+    // the sidecar sits next to the data object (extension swapped), or
+    // wherever O2_S3_REVIEW_VXI_FILE points; absent = index-off file
+    let index_path = std::env::var("O2_S3_REVIEW_VXI_FILE")
+        .unwrap_or_else(|_| path.trim_end_matches(".vix").to_string() + ".vxi");
+    let index = std::fs::read(&index_path).ok().map(Bytes::from);
+    let total_len = (data.len() + index.as_ref().map_or(0, |b| b.len())) as u64;
     let source = CountingSource::new(data);
+    let index_source = index.map(CountingSource::new);
 
     let mut phase_start = (0usize, 0u64);
+    let index_for_phase = index_source.clone();
     let mut phase = |label: &str, source: &CountingSource| {
-        let fetches = source.fetch_count();
-        let bytes = source.byte_count();
-        let ranges = source.take_log();
+        let (mut fetches, mut bytes) = (source.fetch_count(), source.byte_count());
+        let mut ranges = source.take_log();
+        if let Some(isrc) = &index_for_phase {
+            fetches += isrc.fetch_count();
+            bytes += isrc.byte_count();
+            ranges.extend(isrc.take_log());
+        }
         let (df, db) = (fetches - phase_start.0, bytes - phase_start.1);
         println!(
             "s3_review real: {label:<38} +{df:>3} fetches, +{db:>12} bytes ({:.2}% of file) {}",
@@ -301,7 +329,13 @@ fn s3_review_real_file_fetch_profile() {
     };
 
     let open_start = std::time::Instant::now();
-    let reader = VixReader::open_ranged(Arc::clone(&source) as Arc<dyn VixRangeSource>).unwrap();
+    let reader = VixReader::open_ranged_with_index(
+        Arc::clone(&source) as Arc<dyn VixRangeSource>,
+        index_source
+            .as_ref()
+            .map(|s| Arc::clone(s) as Arc<dyn VixRangeSource>),
+    )
+    .unwrap();
     let open_elapsed = open_start.elapsed();
     println!(
         "s3_review real: file {} = {} bytes, {} rows, {} terms, {} term row-groups, \
@@ -402,11 +436,12 @@ fn s3_review_real_file_fetch_profile() {
         );
     }
 
+    let total_fetches =
+        source.fetch_count() + index_source.as_ref().map_or(0, |s| s.fetch_count());
+    let total_bytes = source.byte_count() + index_source.as_ref().map_or(0, |s| s.byte_count());
     println!(
-        "s3_review real: TOTAL {} fetches, {} bytes = {:.2}% of the {}-byte object",
-        source.fetch_count(),
-        source.byte_count(),
-        source.byte_count() as f64 / total_len as f64 * 100.0,
-        total_len,
+        "s3_review real: TOTAL {total_fetches} fetches, {total_bytes} bytes = {:.2}% of the \
+         {total_len}-byte pair",
+        total_bytes as f64 / total_len as f64 * 100.0,
     );
 }

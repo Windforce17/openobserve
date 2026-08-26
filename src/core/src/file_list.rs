@@ -310,9 +310,16 @@ pub async fn delete_parquet_file(account: &str, key: &str, file_list_only: bool)
     )])
     .await?;
 
-    // delete the parquet whaterever the file is exists or not
+    // delete the object whether the file exists or not. v3 split: a `.vix`
+    // data key also gets its `.vxi` sidecar key deleted unconditionally
+    // (NotFound tolerated — storage::del swallows per-key not-found).
     if !file_list_only {
-        _ = storage::del(vec![(account, key)]).await;
+        let sidecar = config::vix_sidecar_key(key);
+        let mut keys = vec![(account, key)];
+        if let Some(sidecar) = sidecar.as_deref() {
+            keys.push((account, sidecar));
+        }
+        _ = storage::del(keys).await;
     }
     Ok(())
 }
@@ -361,6 +368,72 @@ mod tests {
             row_group_size: None,
             selection_exact: false,
         }
+    }
+
+    /// M19: `delete_parquet_file(.., file_list_only=false)` on a v2 core
+    /// file removes the file_list ROW and BOTH objects — the `.vix` data
+    /// object and its derived `.vxi` index sidecar — and stays idempotent
+    /// when the objects are already gone (the merge input-reconciliation
+    /// arm calls it exactly then).
+    #[tokio::test]
+    async fn m19_delete_parquet_file_removes_v2_object_pair_and_row() {
+        // shared sqlite tables: serialize on the crate-wide lock
+        let _guard = crate::compact::jobs_test_support::setup().await;
+        std::fs::create_dir_all(&get_config().common.data_stream_dir)
+            .expect("create data_stream_dir for tests");
+
+        let run = config::utils::time::now_micros();
+        let key = format!("files/m19dpforg{run}/logs/s1/2021/01/02/00/pair.vix");
+        let sidecar = config::vix_sidecar_key(&key).expect("core keys derive sidecar keys");
+        infra::storage::put("", &key, bytes::Bytes::from_static(b"data"))
+            .await
+            .expect("put data object");
+        infra::storage::put("", &sidecar, bytes::Bytes::from_static(b"sidecar"))
+            .await
+            .expect("put sidecar object");
+        let file = FileKey::new(
+            0,
+            String::new(),
+            key.clone(),
+            config::meta::stream::FileMeta {
+                min_ts: 1,
+                max_ts: 2,
+                records: 10,
+                original_size: 100,
+                compressed_size: 4,
+                index_size: 7,
+                ..Default::default()
+            },
+            false,
+        );
+        crate::compact::jobs_test_support::retry_busy("seed file_list row", || {
+            infra_file_list::batch_add(std::slice::from_ref(&file))
+        })
+        .await;
+        assert!(infra_file_list::contains(&key).await.unwrap());
+
+        crate::compact::jobs_test_support::retry_busy("delete_parquet_file", || {
+            delete_parquet_file("", &key, false)
+        })
+        .await;
+        assert!(
+            !infra_file_list::contains(&key).await.unwrap(),
+            "the file_list row must be removed"
+        );
+        assert!(
+            infra::storage::head("", &key).await.is_err(),
+            "the .vix data object must be deleted"
+        );
+        assert!(
+            infra::storage::head("", &sidecar).await.is_err(),
+            "the .vxi sidecar object must be deleted with it"
+        );
+
+        // idempotent: both objects already gone (the external-delete case)
+        crate::compact::jobs_test_support::retry_busy("repeat delete_parquet_file", || {
+            delete_parquet_file("", &key, false)
+        })
+        .await;
     }
 
     #[tokio::test]

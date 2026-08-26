@@ -222,6 +222,13 @@ impl VixResultCache {
         entry.and_then(|entry| entry.into_result(rule))
     }
 
+    /// Whether an entry exists under `key` (no materialization, no metric
+    /// tick) — the M14 prefetch wave skips files whose result is already
+    /// memoized, since their evaluation never opens a reader at all.
+    pub fn contains(&self, key: &str) -> bool {
+        self.readers.contains_key(key)
+    }
+
     pub fn put(&self, key: String, value: CacheEntry) -> Option<CacheEntry> {
         let new_footprint = entry_footprint(&key, &value);
         let mut w = self.cacher.lock();
@@ -269,6 +276,47 @@ impl VixResultCache {
         old
     }
 
+    /// M12 heal invalidation: remove EVERY entry belonging to the given data
+    /// file keys, returning how many were dropped. Keys lead the cache-key
+    /// layout (`{file key}|...`, see `generate_cache_key`), so this is one
+    /// prefix extraction + set lookup per live entry — one pass covers a
+    /// whole broadcast batch. Complements the `index_size` key component:
+    /// the size change already makes pre-heal entries unreachable; this
+    /// sweep frees their budget immediately instead of waiting out the FIFO.
+    /// Stale FIFO slots left behind pop harmlessly (same contract as
+    /// overwrites).
+    pub fn remove_file_entries<'a, I: IntoIterator<Item = &'a str>>(&self, file_keys: I) -> usize {
+        let files: HashSet<&str> = file_keys.into_iter().collect();
+        if files.is_empty() || self.readers.is_empty() {
+            return 0;
+        }
+        let doomed: Vec<String> = self
+            .readers
+            .iter()
+            .filter_map(|entry| {
+                let key = entry.key();
+                let file = key.split('|').next().unwrap_or(key);
+                files.contains(file).then(|| key.clone())
+            })
+            .collect();
+        let mut removed = 0usize;
+        let mut freed = 0i64;
+        for key in doomed {
+            if let Some((key, entry)) = self.readers.remove(&key) {
+                let fp = entry_footprint(&key, &entry);
+                self.bytes.fetch_sub(fp, Ordering::Relaxed);
+                freed += fp as i64;
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            metrics::VIX_RESULT_CACHE_MEMORY_USAGE
+                .with_label_values::<&str>(&[])
+                .sub(freed);
+        }
+        removed
+    }
+
     pub fn len(&self) -> usize {
         self.readers.len()
     }
@@ -301,7 +349,10 @@ mod tests {
     use super::*;
 
     fn create_test_row_ids_result() -> CacheEntry {
-        CacheEntry::RowIds(Arc::new(RowIdBitmap::from_row_ids(64, [10u32, 20, 30])), None)
+        CacheEntry::RowIds(
+            Arc::new(RowIdBitmap::from_row_ids(64, [10u32, 20, 30])),
+            None,
+        )
     }
 
     fn create_test_count_result() -> CacheEntry {
@@ -498,6 +549,51 @@ mod tests {
             cache.put(format!("fill_{i}"), small());
         }
         assert!(cache.len() <= 1000);
+    }
+
+    /// M12: `remove_file_entries` drops every entry whose cache key belongs
+    /// to a purged data file (prefix up to `'|'`), exactly accounts the
+    /// freed bytes, and leaves other files' entries untouched. Stale FIFO
+    /// slots from the removals must pop harmlessly afterwards.
+    #[test]
+    fn test_remove_file_entries_purges_by_file_key() {
+        let cache = VixResultCache::new(100);
+        let healed = "files/org/logs/s1/2026/08/18/00/healed.vix";
+        let other = "files/org/logs/s1/2026/08/18/00/other.vix";
+        // two conditions x two index_size versions for the healed file,
+        // one entry for the other file
+        cache.put(format!("{healed}|100|aaaa_n_full"), CacheEntry::Count(1));
+        cache.put(format!("{healed}|100|bbbb_n_full"), CacheEntry::NoMatch);
+        cache.put(format!("{healed}|164|aaaa_n_full"), CacheEntry::Count(2));
+        cache.put(format!("{other}|100|aaaa_n_full"), CacheEntry::Count(3));
+
+        // unknown file: no-op
+        assert_eq!(cache.remove_file_entries(["files/org/none.vix"]), 0);
+        assert_eq!(cache.len(), 4);
+
+        let removed = cache.remove_file_entries([healed]);
+        assert_eq!(removed, 3, "every entry of the healed file must go");
+        assert_eq!(cache.len(), 1);
+        assert!(cache.get(&format!("{healed}|100|aaaa_n_full"), None).is_none());
+        assert!(cache.get(&format!("{healed}|164|aaaa_n_full"), None).is_none());
+        assert!(
+            matches!(
+                cache.get(&format!("{other}|100|aaaa_n_full"), None),
+                Some(VixSearchResult::Count(3))
+            ),
+            "other files' entries stay"
+        );
+        assert_eq!(
+            cache.memory_size(),
+            entry_footprint(&format!("{other}|100|aaaa_n_full"), &CacheEntry::Count(3)),
+            "freed bytes must be given back exactly"
+        );
+
+        // the removals' stale FIFO slots pop harmlessly under pressure
+        for i in 0..200 {
+            cache.put(format!("fill_{i}|0|k_n_full"), CacheEntry::Count(i));
+        }
+        assert!(cache.len() <= 100);
     }
 
     #[test]

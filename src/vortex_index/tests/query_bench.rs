@@ -36,8 +36,28 @@ fn bench_query_classes() {
         return;
     };
     let data = Bytes::from(std::fs::read(&path).expect("read vix file"));
-    let reader = VixReader::open(data).expect("open");
+    // v3 split: the sidecar sits next to the data object (extension
+    // swapped); the dictionary walks below need it
+    let index_path = path.trim_end_matches(".vix").to_string() + ".vxi";
+    let index = std::fs::read(&index_path).ok().map(Bytes::from);
+    let reader = VixReader::open_with_index(data.clone(), index).expect("open");
     eprintln!("file={path} rows={}", reader.row_count());
+    // .bf-relevant accounting: the per-file bloom blob is what the group
+    // assembler transposes — report its sections (composite included)
+    match reader.file_blooms() {
+        Ok(Some(blooms)) => {
+            for b in &blooms {
+                eprintln!(
+                    "bloom section {:?}: n_items={} bytes={}",
+                    b.field,
+                    b.n_items,
+                    b.bytes.len()
+                );
+            }
+        }
+        Ok(None) => eprintln!("bloom sections: none"),
+        Err(e) => eprintln!("bloom sections: unreadable ({e:#})"),
+    }
 
     // sample real values; the trace walk is expensive on big corpora but
     // runs identically on every tree (setup, not measured)
@@ -46,16 +66,9 @@ fn bench_query_classes() {
         .unwrap()
         .expect("service_name is dictionary-eligible");
     let (svc0, svc0_count) = svc.first().cloned().expect("has service values");
-    let traces = reader
-        .field_value_counts("trace_id")
-        .unwrap()
-        .expect("trace_id is dictionary-eligible");
-    let (t0, _) = traces.first().cloned().expect("has trace values");
-    drop(traces);
     eprintln!(
-        "sampled service={} (count {svc0_count}) trace={}",
+        "sampled service={} (count {svc0_count})",
         String::from_utf8_lossy(&svc0),
-        String::from_utf8_lossy(&t0),
     );
 
     let time = |name: &str, iters: usize, f: &mut dyn FnMut() -> u64| {
@@ -81,8 +94,24 @@ fn bench_query_classes() {
             .unwrap()
             .count_set_bits() as u64
     });
+
+    // #52/M7: on a file whose trace_id is DEMOTED to bloom-only there is no
+    // dictionary to sample or query — the v2 equality path is composite-
+    // bloom file pruning + a native-column filter-back scan. Measure THAT
+    // instead of the postings classes (which this branch reports as N/A).
+    let Some(traces) = reader.field_value_counts("trace_id").unwrap() else {
+        bench_demoted_trace_classes(&reader, &data, &svc0, &time, &exact);
+        return;
+    };
+    let (t0, _) = traces.first().cloned().expect("has trace values");
+    drop(traces);
+    eprintln!("sampled trace={}", String::from_utf8_lossy(&t0));
+
     time("eval Exact trace_id (needle)", 20, &mut || {
-        reader.eval(&exact("trace_id", &t0)).unwrap().count_set_bits() as u64
+        reader
+            .eval(&exact("trace_id", &t0))
+            .unwrap()
+            .count_set_bits() as u64
     });
     time("eval And[service, trace] (rarest-first)", 20, &mut || {
         reader
@@ -94,15 +123,19 @@ fn bench_query_classes() {
             .count_set_bits() as u64
     });
     let hex4 = t0[..4.min(t0.len())].to_vec();
-    time("eval Prefix trace_id[..4] (dict range walk)", 10, &mut || {
-        reader
-            .eval(&VixQuery::Prefix {
-                field: Some("trace_id".to_string()),
-                prefix: hex4.clone(),
-            })
-            .unwrap()
-            .count_set_bits() as u64
-    });
+    time(
+        "eval Prefix trace_id[..4] (dict range walk)",
+        10,
+        &mut || {
+            reader
+                .eval(&VixQuery::Prefix {
+                    field: Some("trace_id".to_string()),
+                    prefix: hex4.clone(),
+                })
+                .unwrap()
+                .count_set_bits() as u64
+        },
+    );
     time("count Prefix service_name[..3]", 10, &mut || {
         reader
             .count(&VixQuery::Prefix {
@@ -113,14 +146,322 @@ fn bench_query_classes() {
     });
     // the heaviest scan_key_range class: substring scan over EVERY key of a
     // 16M-term field (block_scan + memmem per key)
-    time("eval Contains trace_id 4-hex (full field scan)", 3, &mut || {
-        reader
-            .eval(&VixQuery::Contains {
-                field: Some("trace_id".to_string()),
-                needle: hex4.clone(),
-                case_insensitive: false,
-            })
-            .unwrap()
-            .count_set_bits() as u64
+    time(
+        "eval Contains trace_id 4-hex (full field scan)",
+        3,
+        &mut || {
+            reader
+                .eval(&VixQuery::Contains {
+                    field: Some("trace_id".to_string()),
+                    needle: hex4.clone(),
+                    case_insensitive: false,
+                })
+                .unwrap()
+                .count_set_bits() as u64
+        },
+    );
+}
+
+/// #52/M7: what equality on a BLOOM-ONLY (demoted) field actually costs in
+/// v2, measured in its three moving parts —
+///
+/// 1. the composite-bloom PER-FILE PRUNE decision (3 guard probes + the
+///    value probe: the pruner's whole per-file cost, both directions),
+/// 2. the surviving file's FILTER-BACK SCAN of the native column, with the
+///    equality bound engaging the M4 chunk-stat pruning tier (random hex
+///    IDs are expected to prune ~nothing there — reported once), and
+/// 3. the AND shape: the dense sibling narrows by postings first and the
+///    demoted leg filters back over the selected rows only.
+///
+/// Prefix/Contains have no demoted-field equivalent (no dictionary): the
+/// engine takes the full scan fallback — reported as N/A.
+fn bench_demoted_trace_classes(
+    reader: &VixReader,
+    data: &Bytes,
+    svc0: &[u8],
+    time: &dyn Fn(&str, usize, &mut dyn FnMut() -> u64),
+    exact: &dyn Fn(&str, &[u8]) -> VixQuery,
+) {
+    use arrow::array::Array;
+    use vortex_index::{
+        BoundValue, ColumnBound, VixDocs,
+        bloom::{
+            COMPOSITE_BLOOM_FIELD, COMPOSITE_GUARD_PROBES, composite_guard_key,
+            composite_value_key,
+        },
+        sbbf::{BLOCK_BYTES, block_index, check_block, hash_value},
+    };
+
+    eprintln!(
+        "trace_id is BLOOM-ONLY (demoted; markers: {:?}) — measuring the v2 \
+         equality path instead of the postings classes",
+        reader.bloom_only_fields().collect::<Vec<_>>()
+    );
+    let docs = VixDocs::open(data.clone()).expect("open docs");
+    let projection = vec!["trace_id".to_string()];
+
+    // decoded string columns arrive as any utf8 family (Utf8/Large/View):
+    // normalize to StringArray once per batch
+    let as_utf8 = |column: &arrow::array::ArrayRef| -> arrow::array::StringArray {
+        arrow::compute::cast(column, &arrow::datatypes::DataType::Utf8)
+            .expect("string-family column casts to Utf8")
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("cast produced Utf8")
+            .clone()
+    };
+
+    // sample the needle from the MIDDLE row's native column (setup)
+    let mut sampled: Option<String> = None;
+    docs.scan_docs(
+        Some(&projection),
+        Some(vec![reader.row_count() / 2]),
+        None,
+        &mut |batch| {
+            let strings = as_utf8(batch.column_by_name("trace_id").expect("projected"));
+            if strings.len() > 0 && !strings.is_null(0) {
+                sampled = Some(strings.value(0).to_string());
+            }
+            Ok(())
+        },
+    )
+    .expect("sample scan");
+    let t0 = sampled.expect("mid row carries a trace value");
+    eprintln!("sampled trace={t0}");
+
+    // (1) the pruner's per-file decision: guards x3 + value probe
+    let blooms = reader
+        .file_blooms()
+        .expect("bloom blob readable")
+        .expect("demoted file carries a per-file bloom blob");
+    let comp = blooms
+        .iter()
+        .find(|b| b.field == COMPOSITE_BLOOM_FIELD)
+        .expect("composite section");
+    let probe = |key: &[u8]| -> bool {
+        let h = hash_value(key);
+        let i = block_index(h, comp.num_blocks) as usize;
+        let block: &[u8; BLOCK_BYTES] = comp.bytes[i * BLOCK_BYTES..(i + 1) * BLOCK_BYTES]
+            .try_into()
+            .unwrap();
+        check_block(block, h)
+    };
+    let mut buf = Vec::new();
+    let guard_keys: Vec<Vec<u8>> = (0..COMPOSITE_GUARD_PROBES)
+        .map(|p| composite_guard_key("trace_id", p, &mut buf).unwrap().to_vec())
+        .collect();
+    let present_key = composite_value_key("trace_id", t0.as_bytes(), &mut buf)
+        .unwrap()
+        .to_vec();
+    let absent_key = composite_value_key("trace_id", b"no-such-trace-id-value", &mut buf)
+        .unwrap()
+        .to_vec();
+    time("bloom prune decision trace_id (hit: keep)", 100_000, &mut || {
+        u64::from(guard_keys.iter().all(|k| probe(k)) && probe(&present_key))
     });
+    time("bloom prune decision trace_id (miss: drop)", 100_000, &mut || {
+        u64::from(guard_keys.iter().all(|k| probe(k)) && probe(&absent_key))
+    });
+
+    // (2) filter-back scan of the native column, equality bound pushed —
+    // report the M4 chunk-stat tier's effect once (setup, not measured)
+    let bound = ColumnBound {
+        column: "trace_id".to_string(),
+        min: Some((BoundValue::Str(t0.clone()), true)),
+        max: Some((BoundValue::Str(t0.clone()), true)),
+    };
+    match docs.pruned_scan_ranges(None, std::slice::from_ref(&bound)) {
+        Some(ranges) => {
+            let surviving: u64 = ranges.iter().map(|r| r.end - r.start).sum();
+            eprintln!(
+                "M4 chunk-stat tier: {surviving} of {} rows survive the equality \
+                 bound ({} ranges) — random-ID min/max windows prune little, as expected",
+                reader.row_count(),
+                ranges.len()
+            );
+        }
+        None => eprintln!("M4 chunk-stat tier: no pruning basis for this bound"),
+    }
+    // measured comparison stays on the DECODED array type (no cast/copy in
+    // the loop — vortex yields Utf8View); the cast fallback covers exotics
+    let count_eq = |batch: &arrow::record_batch::RecordBatch, needle: &str| -> u64 {
+        let column = batch.column_by_name("trace_id").expect("projected");
+        let any = column.as_any();
+        if let Some(v) = any.downcast_ref::<arrow::array::StringViewArray>() {
+            v.iter().filter(|x| *x == Some(needle)).count() as u64
+        } else if let Some(v) = any.downcast_ref::<arrow::array::StringArray>() {
+            v.iter().filter(|x| *x == Some(needle)).count() as u64
+        } else if let Some(v) = any.downcast_ref::<arrow::array::LargeStringArray>() {
+            v.iter().filter(|x| *x == Some(needle)).count() as u64
+        } else {
+            as_utf8(column).iter().filter(|x| *x == Some(needle)).count() as u64
+        }
+    };
+    let mut scan_eq = |threads: usize| -> u64 {
+        let mut hits = 0u64;
+        docs.scan_docs_opts(
+            Some(&projection),
+            None,
+            None,
+            std::slice::from_ref(&bound),
+            None,
+            threads,
+            &mut |batch| {
+                hits += count_eq(&batch, &t0);
+                Ok(())
+            },
+        )
+        .expect("filter-back scan");
+        hits
+    };
+    time("filter-back scan trace_id == t0 (0 threads)", 3, &mut || {
+        scan_eq(0)
+    });
+    time("filter-back scan trace_id == t0 (4 threads)", 3, &mut || {
+        scan_eq(4)
+    });
+
+    // (3) the AND shape: postings narrow by the dense sibling, the demoted
+    // leg point-reads only the selected rows
+    let svc_rows: Vec<u64> = reader
+        .eval(&exact("service_name", svc0))
+        .expect("service postings")
+        .set_indices()
+        .map(|i| i as u64)
+        .collect();
+    eprintln!("And shape: service_name postings select {} rows", svc_rows.len());
+    time(
+        "And[svc postings -> trace filter-back point read]",
+        3,
+        &mut || {
+            let mut hits = 0u64;
+            docs.scan_docs(
+                Some(&projection),
+                Some(svc_rows.clone()),
+                None,
+                &mut |batch| {
+                    hits += count_eq(&batch, &t0);
+                    Ok(())
+                },
+            )
+            .expect("point-read scan");
+            hits
+        },
+    );
+
+    eprintln!(
+        "{:50} N/A — demoted field has no dictionary; the engine takes the \
+         scan fallback measured above",
+        "eval Prefix/Contains trace_id"
+    );
+}
+
+/// M15b measurement (manual): the demoted-needle FILTER-BACK scan, before
+/// vs after the dict-aware equality pre-pass, and its thread scaling.
+///
+/// `O2_VIX_FILE=<file.vix> cargo test -p vortex_index --release
+///  --test query_bench -- --ignored bench_eq_filter_back --nocapture`
+///
+/// - "old shape": unbounded single-column scan + per-row compare (what the M7 bench measured at
+///   635ms/16M rows, no thread scaling);
+/// - "eq-bound scan": the same scan_docs_opts call WITH the equality bound — the M15 pre-pass path
+///   end to end (dict resolve + code scan + point read of the matches).
+#[test]
+#[ignore = "manual M15b bench (set O2_VIX_FILE)"]
+fn bench_eq_filter_back() {
+    use arrow::array::Array;
+    use vortex_index::{BoundValue, ColumnBound, VixDocs};
+
+    let Ok(path) = std::env::var("O2_VIX_FILE") else {
+        eprintln!("O2_VIX_FILE not set; skipping");
+        return;
+    };
+    let column = std::env::var("O2_VIX_EQ_COLUMN").unwrap_or_else(|_| "trace_id".to_string());
+    let data = Bytes::from(std::fs::read(&path).expect("read vix file"));
+    let docs = VixDocs::open(data).expect("open docs");
+    eprintln!("file={path} rows={} column={column}", docs.row_count());
+
+    let as_utf8 = |column: &arrow::array::ArrayRef| -> arrow::array::StringArray {
+        arrow::compute::cast(column, &arrow::datatypes::DataType::Utf8)
+            .expect("string-family column casts to Utf8")
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("cast produced Utf8")
+            .clone()
+    };
+    // sample the needle from the middle row (setup, not measured)
+    let mut sampled: Option<String> = None;
+    let projection = vec![column.clone()];
+    docs.scan_docs(
+        Some(&projection),
+        Some(vec![docs.row_count() / 2]),
+        None,
+        &mut |batch| {
+            let strings = as_utf8(batch.column_by_name(&column).expect("projected"));
+            if strings.len() > 0 && !strings.is_null(0) {
+                sampled = Some(strings.value(0).to_string());
+            }
+            Ok(())
+        },
+    )
+    .expect("sample scan");
+    let needle = sampled.expect("mid row carries a value");
+    eprintln!("sampled needle={needle}");
+
+    let time = |name: &str, iters: usize, f: &mut dyn FnMut() -> u64| {
+        let warm = f();
+        let start = std::time::Instant::now();
+        for _ in 0..iters {
+            std::hint::black_box(f());
+        }
+        let per = start.elapsed() / iters as u32;
+        eprintln!("{name:55} {per:>12?}/iter (result {warm})");
+    };
+    let count_eq = |batch: &arrow::record_batch::RecordBatch| -> u64 {
+        let strings = as_utf8(batch.column_by_name(&column).expect("projected"));
+        strings
+            .iter()
+            .filter(|x| x.as_deref() == Some(needle.as_str()))
+            .count() as u64
+    };
+
+    // old shape: no bound pushed — full column decode + per-row compare
+    let old_scan = |threads: usize| -> u64 {
+        let mut hits = 0u64;
+        docs.scan_docs_opts(Some(&projection), None, None, &[], None, threads, &mut |b| {
+            hits += count_eq(&b);
+            Ok(())
+        })
+        .expect("old-shape scan");
+        hits
+    };
+    time("OLD full scan + compare (0 threads)", 3, &mut || old_scan(0));
+    time("OLD full scan + compare (4 threads)", 3, &mut || old_scan(4));
+
+    // new shape: the equality bound engages the M15 dict-aware pre-pass
+    let bound = ColumnBound {
+        column: column.clone(),
+        min: Some((BoundValue::Str(needle.clone()), true)),
+        max: Some((BoundValue::Str(needle.clone()), true)),
+    };
+    let eq_scan = |threads: usize| -> u64 {
+        let mut hits = 0u64;
+        docs.scan_docs_opts(
+            Some(&projection),
+            None,
+            None,
+            std::slice::from_ref(&bound),
+            None,
+            threads,
+            &mut |b| {
+                hits += count_eq(&b);
+                Ok(())
+            },
+        )
+        .expect("eq-bound scan");
+        hits
+    };
+    time("M15 eq-bound scan (0 threads)", 3, &mut || eq_scan(0));
+    time("M15 eq-bound scan (4 threads)", 3, &mut || eq_scan(4));
+    time("M15 eq-bound scan (16 threads)", 3, &mut || eq_scan(16));
 }

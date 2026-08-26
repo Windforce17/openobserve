@@ -3,26 +3,50 @@
 //!
 //! Subcommands:
 //!
-//!   gen <dir> <files> <rows_per_file>
+//!   gen <dir> <files> <rows_per_file> [--heal] [--overlap]
 //!       Build a corpus of move-job-shaped core files (the REAL move
 //!       builder, `write_core_file_from_tables`, prod traces stream
-//!       settings) with DISJOINT descending time ranges — the common
-//!       compaction group shape.
+//!       settings; v2: every present field is a docs column) with DISJOINT
+//!       descending time ranges — the common compaction group shape. With
+//!       `--heal` the corpus is INDEX-OFF (#42 L0 shape, via
+//!       ZO_VIX_L0_INDEX_OFF_STREAM_TYPES; the bench re-execs itself with
+//!       the env set) — merge such a corpus (a single file is prod's
+//!       dominant heal) and the indexed logs plan takes the rebuild that
+//!       BUILDS the index. With `--overlap` every file covers the SAME
+//!       time range (the concurrently-written-L0 shape: fully overlapping
+//!       timestamps, `contiguous_offsets` None) — the corpus the #51c-c
+//!       concatenation-order merge exists for. With `--vary-schema` (M17)
+//!       per-file column UNIONS differ (each file drops a deterministic
+//!       couple of the optional columns) — the prod gen-1 shape whose
+//!       merges re-encoded every byte before the widening chunk copy.
+//!       (`--narrow` is retired: v2 has no narrow docs schema.)
 //!
-//!   merge <dir> <out.vix>
+//!   merge <dir> <out.vix> [--rebuild]
 //!       Load every corpus file fully into memory (exactly like the
 //!       compactor worker) and run `merge_core_files`; prints load/merge
 //!       wall, output stats, and the process peak RSS (`VmHWM`) — run one
-//!       `merge` per process so the peak is the merge's.
+//!       `merge` per process so the peak is the merge's. The #51c
+//!       docs-chunk passthrough and the #51c-c concatenation order are the
+//!       DEFAULT merge shapes now (no knobs): a disjoint corpus copies
+//!       chunks, an overlapping corpus concatenates (`row_order=concat` —
+//!       compare such outputs with `--multiset`, never the row-order
+//!       digest), and `--rebuild` exercises the heal passthrough (index
+//!       built from the decoded scan, docs chunks copied verbatim).
 //!
-//!   compare <a.vix> <b.vix>
+//!   compare [--multiset] <a.vix> <b.vix>
 //!       Assert reader-visible equality of two merge outputs: row count,
-//!       term stream (keys, doc counts, postings — streamed through one
-//!       hasher), and every docs column. NOTE: the docs hash folds values
-//!       batch-by-batch, so it is only valid between outputs of the SAME
-//!       merge path (identical chunk boundaries) — comparing a fast-path
-//!       output against a rebuild output reports a false difference; the
-//!       in-tree differential oracle covers that pair.
+//!       term stream and every docs column. Default mode: term keys, doc
+//!       counts AND postings stream through one hasher, and the docs hash
+//!       folds each COLUMN's values in row order through its own hasher
+//!       (combined in sorted column order at the end) — chunk-boundary-
+//!       independent but ROW-ORDER-dependent: outputs of different merge
+//!       paths with the same row order (fast vs rebuild vs #51c
+//!       passthrough) compare by logical content. `--multiset` (#51c-c):
+//!       ORDER-INSENSITIVE content equality for outputs whose row order
+//!       legitimately differs (a concat-order output vs a sorted one) —
+//!       per-ROW content hashes folded commutatively, and the term stream
+//!       hashed as (key, doc_count) only (postings doc ids are positions;
+//!       the per-term doc_count and the row multiset pin the content).
 //!
 //! Typical A/B: `gen` once, build this example at the old and new code,
 //! run `merge` with each binary into different outputs, `compare` them.
@@ -170,45 +194,92 @@ fn make_batch(
     .unwrap()
 }
 
-/// Prod `default` traces stream settings.
-fn stream_settings() -> (Vec<String>, Vec<String>, Vec<String>) {
+/// Prod `default` traces stream settings (v2: every present field is a
+/// docs column — there is no column-store list).
+fn stream_settings() -> (Vec<String>, Vec<String>) {
     let fts: Vec<String> = vec![];
-    let cs: Vec<String> = ["duration", "service_name", "operation_name", "span_status"]
-        .into_iter()
-        .map(String::from)
-        .collect();
     let bloom: Vec<String> = vec!["trace_id".to_string()];
-    (fts, cs, bloom)
+    (fts, bloom)
 }
 
-async fn cmd_gen(dir: &str, files: usize, rows_per_file: usize) -> Result<(), anyhow::Error> {
+async fn cmd_gen(
+    dir: &str,
+    files: usize,
+    rows_per_file: usize,
+    overlap: bool,
+    narrow: bool,
+    vary_schema: bool,
+) -> Result<(), anyhow::Error> {
     std::fs::create_dir_all(dir)?;
     let schema = spans_schema();
-    let (fts, cs, bloom) = stream_settings();
+    let (fts, bloom) = stream_settings();
+    if narrow {
+        anyhow::bail!(
+            "--narrow is retired: v2 stores EVERY present field as a docs column, \
+             so a narrow docs schema no longer exists"
+        );
+    }
     let base_ts_us = 1_785_138_000_000_000_i64;
     // disjoint ranges: file i covers [base + i*span*10, +rows) — later files
-    // hold NEWER rows; each file is internally DESC after the builder sort
+    // hold NEWER rows; each file is internally DESC after the builder sort.
+    // --overlap (#51c-c): every file covers the SAME [base, base+rows) range
+    // — the concurrently-written shape whose merges always interleaved.
+    // --vary-schema (M17): per-file schema UNIONS differ (each file drops a
+    // couple of the optional columns by a deterministic pattern) — the prod
+    // gen-1 reality that disqualified every chunk copy pre-M17.
+    let droppable = [
+        "span_kind",
+        "http.url",
+        "http.method",
+        "server.address",
+        "service_service.version",
+        "db.query.text",
+    ];
     for file in 0..files {
         let mut rng = Rng(0x9E3779B97F4A7C15 ^ (file as u64 + 1).wrapping_mul(0xA24BAED4963EE407));
-        let file_base = base_ts_us + (file * rows_per_file * 10) as i64;
+        let file_base = if overlap {
+            base_ts_us
+        } else {
+            base_ts_us + (file * rows_per_file * 10) as i64
+        };
+        // per-file column subset: keep droppable[j] iff (file + j) % 3 != 0
+        // — every field survives in 2/3 of the files, so the merge union is
+        // the full schema while every pair of files differs
+        let keep: Vec<usize> = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(_, field)| {
+                if !vary_schema {
+                    return true;
+                }
+                match droppable.iter().position(|d| d == field.name()) {
+                    Some(j) => (file + j) % 3 != 0,
+                    None => true,
+                }
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let file_schema = Arc::new(schema.project(&keep)?);
         let mut batches = Vec::new();
         let mut left = rows_per_file;
         let mut offset = 0usize;
         while left > 0 {
             let n = left.min(BATCH_ROWS);
-            batches.push(make_batch(&schema, &mut rng, file_base + offset as i64, n));
+            let batch = make_batch(&schema, &mut rng, file_base + offset as i64, n);
+            batches.push(batch.project(&keep)?);
             left -= n;
             offset += n;
         }
         let table: Arc<dyn TableProvider> =
-            Arc::new(MemTable::try_new(Arc::clone(&schema), vec![batches])?);
+            Arc::new(MemTable::try_new(Arc::clone(&file_schema), vec![batches])?);
         let started = Instant::now();
         let result = openobserve_core::vix::core_writer::write_core_file_from_tables(
             &format!("merge-bench-gen-{file}"),
-            Arc::clone(&schema),
+            config::meta::stream::StreamType::Logs,
+            Arc::clone(&file_schema),
             vec![table],
             &fts,
-            &cs,
             &bloom,
             false,
             0,
@@ -216,10 +287,15 @@ async fn cmd_gen(dir: &str, files: usize, rows_per_file: usize) -> Result<(), an
         .await?;
         let path = format!("{dir}/{:04}.vix", file);
         std::fs::write(&path, &result.data)?;
+        // v3 split: the index sidecar is its own object next to the data
+        if let Some(index) = &result.index {
+            std::fs::write(format!("{dir}/{:04}.vxi", file), index)?;
+        }
         eprintln!(
-            "gen {path}: {} rows, {:.1} MiB, {} terms in {:.1}s",
+            "gen {path}: {} rows, {:.1} MiB data + {:.1} MiB index, {} terms in {:.1}s",
             result.stats.row_count,
             result.data.len() as f64 / (1024.0 * 1024.0),
+            result.index.as_ref().map_or(0, |b| b.len()) as f64 / (1024.0 * 1024.0),
             result.stats.term_count,
             started.elapsed().as_secs_f64(),
         );
@@ -286,22 +362,43 @@ fn load_inputs(
                     file,
                     len,
                 });
-            Ok((name, source))
+            // v3 split: the index sidecar sits next to the data object
+            let index_path = path.with_extension("vxi");
+            let index: Option<std::sync::Arc<dyn vortex_index::VixRangeSource>> =
+                match std::fs::File::open(&index_path) {
+                    Ok(file) => {
+                        let len = file.metadata()?.len();
+                        Some(std::sync::Arc::new(FileRangeSource {
+                            name: format!("{name}.vxi"),
+                            file,
+                            len,
+                        }))
+                    }
+                    Err(_) => None,
+                };
+            Ok((name, source, index))
         })
         .collect()
 }
 
 /// Derive merge-time settings from the corpus files themselves (unchanged
 /// stream settings — the common compaction case), mirroring the ignored
-/// in-tree bench.
+/// in-tree bench. Two prod-faithful adjustments:
+/// - term-only fields type from the bench "registry" ([`spans_schema`], the schema every corpus is
+///   generated from) instead of a blanket `Utf8` — the registry type is what a real merge plan
+///   resolves (`duration` is `Int64` there), and it is what decides a widened column's stored type;
+/// - the CONFIGURED column-store settings ([`stream_settings`]) union into the derived cs list — a
+///   no-op for corpora whose files already store those columns, and exactly prod's widening for a
+///   `--narrow` corpus (#51c-d: the plan wants columns the inputs never stored).
 fn derive_schema(
     inputs: &[openobserve_core::vix::core_writer::MergeInput],
-) -> (Schema, Vec<String>, Vec<String>) {
+) -> (Schema, Vec<String>) {
+    let registry = spans_schema();
     let mut fts: Vec<String> = Vec::new();
-    let mut cs: Vec<String> = Vec::new();
     let mut latest_fields: Vec<Field> = Vec::new();
-    for (_, data) in inputs {
-        let reader = VixReader::open_ranged(std::sync::Arc::clone(data)).unwrap();
+    for (_, data, index) in inputs {
+        let reader =
+            VixReader::open_ranged_with_index(std::sync::Arc::clone(data), index.clone()).unwrap();
         for field in reader.docs_schema().unwrap().fields() {
             let name = field.name().as_str();
             if name == "_source" || name == "_original" {
@@ -314,20 +411,21 @@ fn derive_schema(
                     name != TIMESTAMP_COL,
                 ));
             }
-            if name != TIMESTAMP_COL && !cs.iter().any(|f| f == name) {
-                cs.push(name.to_string());
-            }
         }
         for name in reader.term_field_names() {
             if !latest_fields.iter().any(|f| f.name() == name) {
-                latest_fields.push(Field::new(name, DataType::Utf8, true));
+                let data_type = registry
+                    .field_with_name(name)
+                    .map(|f| f.data_type().clone())
+                    .unwrap_or(DataType::Utf8);
+                latest_fields.push(Field::new(name, data_type, true));
             }
             if !reader.has_term_capability(name) && !fts.iter().any(|f| f == name) {
                 fts.push(name.to_string());
             }
         }
     }
-    (Schema::new(latest_fields), fts, cs)
+    (Schema::new(latest_fields), fts)
 }
 
 fn rss_lines() -> String {
@@ -339,17 +437,41 @@ fn rss_lines() -> String {
         .join("  ")
 }
 
+/// Make sure `key=value` is in this process's environment, re-exec'ing the
+/// bench with it set when it is not. The engine config is env-backed and
+/// process-global (`std::env::set_var` is unsafe in edition 2024), so the
+/// safe way to flip a knob per run is a fresh process image: `exec` replaces
+/// this one wholesale before any config access, and the re-exec'd child sees
+/// the variable set and falls straight through.
+fn ensure_env(key: &str, value: &str) {
+    if std::env::var(key).map(|v| v == value).unwrap_or(false) {
+        return;
+    }
+    use std::os::unix::process::CommandExt;
+    let exe = std::env::current_exe().expect("current_exe");
+    eprintln!("re-exec with {key}={value}");
+    let error = std::process::Command::new(exe)
+        .args(std::env::args_os().skip(1))
+        .env(key, value)
+        .exec();
+    // exec only returns on failure
+    panic!("re-exec with {key}={value} failed: {error}");
+}
+
 fn cmd_merge(dir: &str, out: &str, rebuild: bool) -> Result<(), anyhow::Error> {
     let mib = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
     let started = Instant::now();
     let inputs = load_inputs(dir)?;
-    let total_bytes: u64 = inputs.iter().map(|(_, data)| data.len()).sum();
+    let total_bytes: u64 = inputs
+        .iter()
+        .map(|(_, data, index)| data.len() + index.as_ref().map_or(0, |i| i.len()))
+        .sum();
     let load_elapsed = started.elapsed();
 
-    let (latest_schema, fts, cs) = derive_schema(&inputs);
+    let (latest_schema, fts) = derive_schema(&inputs);
     let bloom = vec!["trace_id".to_string()];
     eprintln!(
-        "opened {} files (ranged) / {:.1} MiB in {load_elapsed:.2?}; fts={fts:?} cs={cs:?}",
+        "opened {} files (ranged) / {:.1} MiB in {load_elapsed:.2?}; fts={fts:?}",
         inputs.len(),
         mib(total_bytes as usize),
     );
@@ -357,35 +479,54 @@ fn cmd_merge(dir: &str, out: &str, rebuild: bool) -> Result<(), anyhow::Error> {
     let started = Instant::now();
     let result = if rebuild {
         openobserve_core::vix::core_writer::merge_core_files_rebuild(
+            config::meta::stream::StreamType::Logs,
             &inputs,
             &latest_schema,
             &fts,
-            &cs,
             &bloom,
         )?
     } else {
         openobserve_core::vix::core_writer::merge_core_files(
+            config::meta::stream::StreamType::Logs,
             &inputs,
             &latest_schema,
             &fts,
-            &cs,
             &bloom,
         )?
     };
     let merge_elapsed = started.elapsed();
     let out_len = result.output.len();
+    // v3 split: write the merged sidecar next to the data output
+    if let Some(index) = &result.index {
+        std::fs::write(
+            std::path::Path::new(out).with_extension("vxi"),
+            index,
+        )?;
+    }
     match result.output {
         vortex_index::VixOutput::Bytes(data) => std::fs::write(out, &data)?,
         vortex_index::VixOutput::Spooled { file, .. } => {
-            file.persist(out)
-                .map_err(|e| anyhow::anyhow!("persist spool: {e}"))?;
+            // persist is a rename — it cannot cross filesystems (EXDEV, e.g.
+            // spool on the data volume, `out` on tmpfs): fall back to a copy
+            // (the temp file then deletes itself on drop)
+            if let Err(error) = file.persist(out) {
+                std::fs::copy(error.file.path(), out).map_err(|e| {
+                    anyhow::anyhow!(
+                        "persist spool: rename failed ({}), copy fallback failed too: {e}",
+                        error.error
+                    )
+                })?;
+            }
         }
     }
     eprintln!(
-        "merge: {merge_elapsed:.2?}  used_index_merge={}  docs_batches={}  out {:.1} MiB \
+        "merge: {merge_elapsed:.2?}  used_index_merge={}  docs_batches={}  \
+         docs_passthrough_inputs={}  concat_order={}  out {:.1} MiB \
          ({} rows, {} terms, index {:.1} MiB, docs {:.1} MiB)",
         result.used_index_merge,
         result.docs_batches,
+        result.docs_passthrough_inputs,
+        result.concat_order,
         mib(out_len as usize),
         result.stats.row_count,
         result.stats.term_count,
@@ -396,10 +537,18 @@ fn cmd_merge(dir: &str, out: &str, rebuild: bool) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-/// Stream-hash one file's term stream and docs columns.
-fn file_digest(path: &str) -> Result<(u64, u64, u64, Vec<String>), anyhow::Error> {
+/// Stream-hash one file's term stream and docs columns. `multiset` (#51c-c)
+/// is the ORDER-INSENSITIVE mode: per-ROW content hashes folded
+/// commutatively (wrapping add) and the term stream hashed WITHOUT postings
+/// doc ids — the only valid comparison between outputs whose row order
+/// legitimately differs (concat-order vs sorted).
+fn file_digest(path: &str, multiset: bool) -> Result<(u64, u64, u64, Vec<String>), anyhow::Error> {
     let data = bytes::Bytes::from(std::fs::read(path)?);
-    let reader = VixReader::open(data.clone())?;
+    // v3 split: the index sidecar sits next to the data object
+    let index = std::fs::read(std::path::Path::new(path).with_extension("vxi"))
+        .ok()
+        .map(bytes::Bytes::from);
+    let reader = VixReader::open_with_index(data.clone(), index)?;
     let row_count = reader.row_count();
 
     let mut term_hasher = DefaultHasher::new();
@@ -407,7 +556,10 @@ fn file_digest(path: &str) -> Result<(u64, u64, u64, Vec<String>), anyhow::Error
     reader.for_each_term(&mut |key, doc_count, postings| {
         key.hash(&mut term_hasher);
         doc_count.hash(&mut term_hasher);
-        postings.hash(&mut term_hasher);
+        if !multiset {
+            // postings are doc-id POSITIONS — row-order-dependent by nature
+            postings.hash(&mut term_hasher);
+        }
         term_count += 1;
         Ok(())
     })?;
@@ -420,24 +572,80 @@ fn file_digest(path: &str) -> Result<(u64, u64, u64, Vec<String>), anyhow::Error
         .map(|field| field.name().clone())
         .collect();
     columns.sort();
-    let mut docs_hasher = DefaultHasher::new();
-    docs.scan_docs(Some(&columns), None, None, &mut |batch| {
-        for name in &columns {
-            let column = batch
-                .column_by_name(name)
-                .ok_or_else(|| anyhow::anyhow!("scan lost column {name}"))?;
-            let column = arrow::compute::cast(column, &DataType::Utf8)
-                .unwrap_or_else(|_| Arc::clone(column));
-            hash_column(&column, &mut docs_hasher);
+    let docs_digest = if multiset {
+        // Order-insensitive docs digest: hash each ROW's content (values in
+        // sorted column order) into its own hasher and fold the row hashes
+        // with a commutative wrapping add — identical row MULTISETS digest
+        // identically whatever the storage order.
+        let mut folded: u64 = 0;
+        docs.scan_docs(Some(&columns), None, None, &mut |batch| {
+            let casted: Vec<ArrayRef> = columns
+                .iter()
+                .map(|name| {
+                    let column = batch
+                        .column_by_name(name)
+                        .ok_or_else(|| anyhow::anyhow!("scan lost column {name}"))?;
+                    Ok(arrow::compute::cast(column, &DataType::Utf8)
+                        .unwrap_or_else(|_| Arc::clone(column)))
+                })
+                .collect::<Result<_, anyhow::Error>>()?;
+            for row in 0..batch.num_rows() {
+                let mut row_hasher = DefaultHasher::new();
+                for column in &casted {
+                    hash_value_at(column, row, &mut row_hasher);
+                }
+                folded = folded.wrapping_add(row_hasher.finish());
+            }
+            Ok(())
+        })?;
+        folded
+    } else {
+        // Chunk-boundary-INDEPENDENT docs digest: one hasher per column,
+        // each folding that column's values in row order across every
+        // scanned batch, combined in sorted column order at the end.
+        // Hashing per batch column-by-column into one hasher (the old
+        // scheme) interleaved columns at batch boundaries, so two outputs
+        // holding identical rows but chunked differently (fast path vs
+        // rebuild vs #51c passthrough) hashed differently.
+        let mut column_hashers: Vec<DefaultHasher> =
+            columns.iter().map(|_| DefaultHasher::new()).collect();
+        docs.scan_docs(Some(&columns), None, None, &mut |batch| {
+            for (name, hasher) in columns.iter().zip(&mut column_hashers) {
+                let column = batch
+                    .column_by_name(name)
+                    .ok_or_else(|| anyhow::anyhow!("scan lost column {name}"))?;
+                let column = arrow::compute::cast(column, &DataType::Utf8)
+                    .unwrap_or_else(|_| Arc::clone(column));
+                hash_column(&column, hasher);
+            }
+            Ok(())
+        })?;
+        let mut docs_hasher = DefaultHasher::new();
+        for hasher in column_hashers {
+            hasher.finish().hash(&mut docs_hasher);
         }
-        Ok(())
-    })?;
+        docs_hasher.finish()
+    };
     Ok((
         row_count,
         term_count,
-        term_hasher.finish() ^ docs_hasher.finish(),
+        term_hasher.finish() ^ docs_digest,
         columns,
     ))
+}
+
+/// Hash one row's value of a (Utf8-casted where castable) column.
+fn hash_value_at(column: &ArrayRef, row: usize, hasher: &mut DefaultHasher) {
+    if let Some(strings) = column.as_any().downcast_ref::<StringArray>() {
+        strings
+            .is_valid(row)
+            .then(|| strings.value(row))
+            .hash(hasher);
+    } else if let Some(ints) = column.as_any().downcast_ref::<Int64Array>() {
+        ints.is_valid(row).then(|| ints.value(row)).hash(hasher);
+    } else {
+        panic!("unhashed docs column type {:?}", column.data_type());
+    }
 }
 
 fn hash_column(column: &ArrayRef, hasher: &mut DefaultHasher) {
@@ -454,9 +662,9 @@ fn hash_column(column: &ArrayRef, hasher: &mut DefaultHasher) {
     }
 }
 
-fn cmd_compare(a: &str, b: &str) -> Result<(), anyhow::Error> {
-    let da = file_digest(a)?;
-    let db = file_digest(b)?;
+fn cmd_compare(a: &str, b: &str, multiset: bool) -> Result<(), anyhow::Error> {
+    let da = file_digest(a, multiset)?;
+    let db = file_digest(b, multiset)?;
     anyhow::ensure!(
         da.3 == db.3,
         "docs schemas differ: {:?} vs {:?}",
@@ -465,8 +673,9 @@ fn cmd_compare(a: &str, b: &str) -> Result<(), anyhow::Error> {
     );
     anyhow::ensure!(
         da.0 == db.0 && da.1 == db.1 && da.2 == db.2,
-        "outputs differ: {a} (rows={}, terms={}, digest={:x}) vs {b} (rows={}, terms={}, \
-         digest={:x})",
+        "outputs differ ({} mode): {a} (rows={}, terms={}, digest={:x}) vs {b} (rows={}, \
+         terms={}, digest={:x})",
+        if multiset { "multiset" } else { "row-order" },
         da.0,
         da.1,
         da.2,
@@ -475,37 +684,90 @@ fn cmd_compare(a: &str, b: &str) -> Result<(), anyhow::Error> {
         db.2,
     );
     eprintln!(
-        "outputs equivalent: rows={}, terms={}, digest={:x}",
-        da.0, da.1, da.2
+        "outputs equivalent ({} mode): rows={}, terms={}, digest={:x}",
+        if multiset { "multiset" } else { "row-order" },
+        da.0,
+        da.1,
+        da.2
     );
     Ok(())
 }
 
+/// Minimal stderr logger (O2_BENCH_DEBUG_LOG=1): surfaces the merge's
+/// `log::debug!` phase timings (term-table load, k-way ranges/workers,
+/// dict/terms encode, SBBF bloom build, index merge total).
+struct StderrLogger;
+impl log::Log for StderrLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.target().contains("vix")
+            || metadata.target().starts_with("vortex_index")
+            || metadata.level() <= log::Level::Warn
+    }
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            eprintln!("[{}] {}", record.level(), record.args());
+        }
+    }
+    fn flush(&self) {}
+}
+
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
+    if std::env::var("O2_BENCH_DEBUG_LOG").is_ok_and(|v| v == "1") {
+        static LOGGER: StderrLogger = StderrLogger;
+        if log::set_logger(&LOGGER).is_ok() {
+            log::set_max_level(log::LevelFilter::Debug);
+        }
+    }
     let args: Vec<String> = std::env::args().collect();
+    let flag = |name: &str| args.iter().skip(2).any(|a| a == name);
     match args.get(1).map(String::as_str) {
         Some("gen") => {
-            let dir = args.get(2).expect("gen <dir> <files> <rows_per_file>");
+            let dir = args
+                .get(2)
+                .expect("gen <dir> <files> <rows_per_file> [--heal] [--overlap] [--vary-schema]");
             let files: usize = args.get(3).expect("files").parse()?;
             let rows: usize = args.get(4).expect("rows_per_file").parse()?;
-            cmd_gen(dir, files, rows).await
+            if flag("--heal") {
+                // the heal corpus: index-off L0 files (#42 shape) — the
+                // build-path knob, resolved before any file is written
+                ensure_env("ZO_VIX_L0_INDEX_OFF_STREAM_TYPES", "logs");
+            }
+            cmd_gen(
+                dir,
+                files,
+                rows,
+                flag("--overlap"),
+                flag("--narrow"),
+                flag("--vary-schema"),
+            )
+            .await
         }
         Some("merge") => {
             let dir = args.get(2).expect("merge <dir> <out.vix> [--rebuild]");
             let out = args.get(3).expect("out.vix");
-            let rebuild = args.get(4).is_some_and(|a| a == "--rebuild");
-            cmd_merge(dir, out, rebuild)
+            // #51c passthrough + #51c-c concatenation are the DEFAULT merge
+            // shapes now — no knobs to set.
+            cmd_merge(dir, out, flag("--rebuild"))
         }
         Some("compare") => {
-            let a = args.get(2).expect("compare <a.vix> <b.vix>");
-            let b = args.get(3).expect("b.vix");
-            cmd_compare(a, b)
+            // flags may precede the paths: compare [--multiset] <a> <b>
+            let multiset = flag("--multiset") || args.get(2).is_some_and(|a| a == "--multiset");
+            let paths: Vec<&String> = args
+                .iter()
+                .skip(2)
+                .filter(|a| !a.starts_with("--"))
+                .collect();
+            let a = paths.first().expect("compare [--multiset] <a.vix> <b.vix>");
+            let b = paths.get(1).expect("b.vix");
+            cmd_compare(a, b, multiset)
         }
         _ => {
             eprintln!(
-                "usage: merge_bench gen <dir> <files> <rows_per_file> | merge <dir> <out.vix> | \
-                 compare <a.vix> <b.vix>"
+                "usage: merge_bench gen <dir> <files> <rows_per_file> [--heal] [--overlap] \
+                 [--vary-schema] | \
+                 merge <dir> <out.vix> [--rebuild] | \
+                 compare [--multiset] <a.vix> <b.vix>"
             );
             std::process::exit(2);
         }

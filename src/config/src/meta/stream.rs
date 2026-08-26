@@ -438,14 +438,13 @@ impl FileKey {
 
 /// Sizes of one stream data file.
 ///
-/// Storage-accounting rule (core-file architecture): `compressed_size` is the
-/// FULL size of the stream data object. For core `.vix` files the inverted
-/// index (dict/terms blobs) lives INSIDE that object, so `index_size` is a
-/// SUBSET of `compressed_size` — informational ("of which index"), never an
-/// addend. Total storage = sum(compressed_size); do NOT add `index_size` on
-/// top. For legacy parquet files with a sibling index object, `index_size` is
-/// the sibling's size and totals undercount by it — accepted (only new data
-/// matters).
+/// Storage-accounting rule (v3 sidecar split): `compressed_size` is the
+/// FULL size of the `.vix` DATA object; `index_size` is the FULL size of
+/// its `.vxi` INDEX SIDECAR object (`0` ⟺ no sidecar exists — index-off
+/// files). The two are SEPARATE objects, so total storage =
+/// sum(compressed_size) + sum(index_size). `index_size > 0` doubles as the
+/// "this file has a usable index" marker (warmup, bloom queue, index
+/// eval eligibility).
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FileMeta {
     pub min_ts: i64, // microseconds
@@ -495,9 +494,11 @@ pub struct FileListDeleted {
     pub id: i64,
     pub account: String,
     pub file: String,
-    /// Always false: core `.vix` files embed their index in the data object,
-    /// so no file has a separate sibling index object to delete. The column
-    /// survives in the `file_list_deleted` table schema only.
+    /// Vestigial, always written false: the v3 `.vxi` sidecar delete is
+    /// UNCONDITIONAL — the sweeper derives the sidecar key from every
+    /// `.vix` key and tolerates NotFound (`compact::deleted`), so nothing
+    /// needs this flag. The column survives in the `file_list_deleted`
+    /// table schema only.
     pub index_file: bool,
     pub flattened: bool,
 }
@@ -577,17 +578,16 @@ impl From<&String> for MergeStrategy {
 
 /// Aggregated per-stream statistics.
 ///
-/// Accounting rule (core-file architecture): the three sizes are INDEPENDENT
-/// figures, never added together —
+/// Accounting rule (v3 sidecar split): the three sizes are INDEPENDENT
+/// figures —
 /// - `storage_size`   = sum of original (uncompressed) bytes ingested;
-/// - `compressed_size` = sum of stored object bytes = the stream's total storage footprint;
-/// - `index_size`     = informational "of which index": for core `.vix` files the dict/terms index
-///   is embedded in the data object, so this is a subset of `compressed_size` (for legacy parquet
-///   it was a separate sibling object, not counted in `compressed_size` — totals undercount by that
-///   sibling; accepted, only new data matters).
+/// - `compressed_size` = sum of stored DATA-object bytes;
+/// - `index_size`     = sum of stored `.vxi` INDEX-SIDECAR object bytes (a separate object per
+///   indexed file since v3, so the stream's total storage footprint is `compressed_size +
+///   index_size`).
 ///
-/// Consumers (org summary, UI columns, usage metering) must report each
-/// field separately and must NOT compute `compressed_size + index_size`.
+/// Consumers (org summary, UI columns, usage metering) report each field
+/// separately; a "total stored" figure is the sum of the last two.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct StreamStats {
     pub created_at: i64,
@@ -903,8 +903,6 @@ pub struct UpdateStreamSettings {
     #[serde(default)]
     pub full_text_search_keys: UpdateSettingsWrapper<String>,
     #[serde(default)]
-    pub column_store_fields: UpdateSettingsWrapper<String>,
-    #[serde(default)]
     pub bloom_filter_fields: UpdateSettingsWrapper<String>,
     #[serde(skip_serializing_if = "Option::None", default)]
     pub data_retention: Option<i64>,
@@ -1077,8 +1075,6 @@ pub struct StreamSettings {
     #[serde(default)]
     pub full_text_search_keys: Vec<String>,
     #[serde(default)]
-    pub column_store_fields: Vec<String>,
-    #[serde(default)]
     pub bloom_filter_fields: Vec<String>,
     #[serde(default)]
     pub storage_type: StorageType,
@@ -1111,7 +1107,6 @@ impl Default for StreamSettings {
         Self {
             partition_keys: Vec::new(),
             full_text_search_keys: Vec::new(),
-            column_store_fields: Vec::new(),
             bloom_filter_fields: Vec::new(),
             data_retention: 0,
             flatten_level: None,
@@ -1141,7 +1136,6 @@ impl Serialize for StreamSettings {
         }
         state.serialize_field("partition_keys", &part_keys)?;
         state.serialize_field("full_text_search_keys", &self.full_text_search_keys)?;
-        state.serialize_field("column_store_fields", &self.column_store_fields)?;
         state.serialize_field("bloom_filter_fields", &self.bloom_filter_fields)?;
         state.serialize_field("distinct_value_fields", &self.distinct_value_fields)?;
         state.serialize_field("data_retention", &self.data_retention)?;
@@ -1207,17 +1201,11 @@ impl From<&str> for StreamSettings {
         }
 
         // NOTE: legacy keys `index_fields`, `defined_schema_fields`,
-        // `index_original_data` and `index_all_values` may still be present in
-        // stored settings JSON; they are intentionally ignored since the `.vix`
-        // all-fields index made them obsolete.
-        let mut column_store_fields = Vec::new();
-        let fields = settings.get("column_store_fields");
-        if let Some(value) = fields {
-            let v: Vec<_> = value.as_array().unwrap().iter().collect();
-            for item in v {
-                column_store_fields.push(item.as_str().unwrap().to_string())
-            }
-        }
+        // `index_original_data`, `index_all_values` and `column_store_fields`
+        // may still be present in stored settings JSON; they are intentionally
+        // ignored — the `.vix` all-fields index made the first four obsolete,
+        // and the v2 all-present-columns docs format (every field a native
+        // column, DESIGN §2) retired column-store curation entirely.
 
         let mut bloom_filter_fields = Vec::new();
         let fields = settings.get("bloom_filter_fields");
@@ -1306,7 +1294,6 @@ impl From<&str> for StreamSettings {
         Self {
             partition_keys,
             full_text_search_keys,
-            column_store_fields,
             bloom_filter_fields,
             data_retention,
             max_query_range,
@@ -1329,7 +1316,6 @@ impl MemorySize for StreamSettings {
         std::mem::size_of::<StreamSettings>()
             + self.partition_keys.mem_size()
             + self.full_text_search_keys.mem_size()
-            + self.column_store_fields.mem_size()
             + self.bloom_filter_fields.mem_size()
             + self.distinct_value_fields.mem_size()
             + self.extended_retention_days.mem_size()
@@ -1463,30 +1449,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_stream_settings_column_store_fields_legacy_payload() {
-        // old settings payload without the key deserializes to an empty vec
-        let settings = StreamSettings::from(r#"{"data_retention": 30}"#);
-        assert_eq!(settings.data_retention, 30);
-        assert!(settings.column_store_fields.is_empty());
-
-        // the derived serde Deserialize path defaults to an empty vec as well
-        let settings: StreamSettings = json::from_str("{}").unwrap();
-        assert!(settings.column_store_fields.is_empty());
-    }
-
-    #[test]
     fn test_stream_settings_removed_legacy_keys_are_ignored() {
-        // Old stored settings JSON may still carry keys for concepts removed by
-        // the `.vix` all-fields index (UDS, secondary index list, `_all_values`
-        // materialization, index_original_data, the index_updated_at /
-        // index_fields_updated_at freshness stamps). They must parse fine and
-        // be silently dropped.
+        // Old stored settings JSON may still carry keys for concepts removed
+        // by the `.vix` all-fields index (UDS, secondary index list,
+        // `_all_values` materialization, index_original_data, the
+        // index_updated_at / index_fields_updated_at freshness stamps) and by
+        // the v2 all-present-columns docs format (`column_store_fields` —
+        // every field is a native column, no curation). They must parse fine
+        // and be silently dropped.
         let payload = r#"{
             "partition_keys": {"L0": "kubernetes_namespace_name"},
             "full_text_search_keys": ["log"],
             "index_fields": ["trace_id", "service_name"],
             "bloom_filter_fields": ["trace_id"],
             "defined_schema_fields": ["log", "message", "kubernetes_namespace_name"],
+            "column_store_fields": ["duration", "service_name"],
             "index_original_data": true,
             "index_all_values": true,
             "store_original_data": true,
@@ -1505,6 +1482,7 @@ mod tests {
         let reserialized = json::to_string(&settings).unwrap();
         assert!(!reserialized.contains("defined_schema_fields"));
         assert!(!reserialized.contains("\"index_fields\""));
+        assert!(!reserialized.contains("column_store_fields"));
         assert!(!reserialized.contains("index_original_data"));
         assert!(!reserialized.contains("index_all_values"));
         assert!(!reserialized.contains("index_updated_at"));
@@ -1512,10 +1490,11 @@ mod tests {
 
         // the derived serde Deserialize path also tolerates the legacy keys
         // (unknown fields are ignored by default)
-        let settings: StreamSettings = json::from_str(
+        let _settings: StreamSettings = json::from_str(
             r#"{
                 "index_fields": ["a"],
                 "defined_schema_fields": ["b"],
+                "column_store_fields": ["c"],
                 "index_original_data": true,
                 "index_all_values": true,
                 "index_updated_at": 100,
@@ -1523,25 +1502,14 @@ mod tests {
             }"#,
         )
         .unwrap();
-        assert!(settings.column_store_fields.is_empty());
-    }
 
-    #[test]
-    fn test_stream_settings_column_store_fields_roundtrip() {
-        // values survive a serialize -> parse round trip
-        let settings = StreamSettings {
-            column_store_fields: vec!["service_name".to_string(), "trace_id".to_string()],
-            ..Default::default()
-        };
-        let payload = json::to_string(&settings).unwrap();
-        // the key is always emitted, like index_fields
-        assert!(payload.contains("column_store_fields"));
-        let parsed = StreamSettings::from(payload.as_str());
-        assert_eq!(parsed.column_store_fields, settings.column_store_fields);
-
-        // an empty list is still emitted (always-serialize, like index_fields)
-        let payload = json::to_string(&StreamSettings::default()).unwrap();
-        assert!(payload.contains("column_store_fields"));
+        // an UpdateStreamSettings payload naming the retired key parses too
+        // (the settings API accepts-and-drops it)
+        let update: UpdateStreamSettings = json::from_str(
+            r#"{"column_store_fields": {"add": ["service"], "remove": []}}"#,
+        )
+        .unwrap();
+        assert!(update.full_text_search_keys.add.is_empty());
     }
 
     #[tokio::test]
@@ -2187,9 +2155,10 @@ mod tests {
             "needle bitmap footprint {} should be tiny, not ~512KB",
             sparse.memory_size()
         );
-        assert_eq!(sparse.iter().collect::<Vec<_>>(), vec![
-            17, 1_999_999, 3_999_999
-        ]);
+        assert_eq!(
+            sparse.iter().collect::<Vec<_>>(),
+            vec![17, 1_999_999, 3_999_999]
+        );
     }
 
     #[test]

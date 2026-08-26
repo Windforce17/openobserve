@@ -24,6 +24,88 @@ use infra::errors::{Error, ErrorCodes};
 pub use crate::service::authz::{StreamPermissionResourceType, check_stream_permissions};
 use crate::service::search::sql::Sql;
 
+/// Wrap a oneshot search response future so a vanished HTTP/1.1 client
+/// cancels the query (#36/.83). H1 gives the server no mid-request
+/// disconnect signal for a pending oneshot handler — hyper notices only at
+/// write time — so a killed client left queries burning to completion. The
+/// fix trades on exactly that: once the future outlives `grace_secs`, the
+/// response switches to a STREAMED body that writes a single space every
+/// 2s while the search keeps running inside the stream. Leading whitespace
+/// is legal JSON, so parsers are unaffected. When the client is gone the
+/// heartbeat write fails, hyper drops the body stream, the search future
+/// drops with it, and the AbortOnDrop/admission chain cancels the query
+/// and frees its permit.
+///
+/// The trade (documented on the knob): entering heartbeat mode commits
+/// HTTP 200 — a later failure arrives in-body via the `code` field every
+/// response already carries. Queries finishing within the grace keep exact
+/// status semantics; `grace_secs == 0` disables wrapping entirely.
+pub async fn with_oneshot_heartbeat<F>(grace_secs: u64, fut: F) -> axum::response::Response
+where
+    F: std::future::Future<Output = axum::response::Response> + Send + 'static,
+{
+    use axum::{body::Body, http::header::CONTENT_TYPE, response::Response};
+    use bytes::Bytes;
+
+    if grace_secs == 0 {
+        return fut.await;
+    }
+    let mut fut = Box::pin(fut);
+    tokio::select! {
+        res = &mut fut => return res,
+        _ = tokio::time::sleep(std::time::Duration::from_secs(grace_secs)) => {}
+    }
+    log::info!(
+        "[oneshot-heartbeat] response exceeded the {grace_secs}s grace — streaming heartbeats; a client disconnect now cancels the search"
+    );
+
+    /// Distinguishes "stream dropped mid-flight (client gone)" from normal
+    /// completion in the logs — the observable for disconnect-cancel.
+    struct StreamProbe {
+        completed: bool,
+    }
+    impl Drop for StreamProbe {
+        fn drop(&mut self) {
+            if !self.completed {
+                log::info!(
+                    "[oneshot-heartbeat] response stream dropped before completion — client gone; the search future is cancelled with it"
+                );
+            }
+        }
+    }
+
+    let stream = async_stream::stream! {
+        let mut probe = StreamProbe { completed: false };
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await; // the first tick fires immediately — arm it
+        loop {
+            tokio::select! {
+                res = &mut fut => {
+                    probe.completed = true;
+                    // 256MB response-read ceiling: far above any real search
+                    // payload, and axum's own default is unbounded here
+                    match axum::body::to_bytes(res.into_body(), 256 * 1024 * 1024).await {
+                        Ok(bytes) => yield Ok::<_, std::io::Error>(bytes),
+                        Err(e) => yield Ok(Bytes::from(format!(
+                            "{{\"code\":500,\"message\":\"response body read error: {e}\"}}"
+                        ))),
+                    }
+                    break;
+                }
+                _ = ticker.tick() => {
+                    yield Ok(Bytes::from_static(b" "));
+                }
+            }
+        }
+    };
+    Response::builder()
+        .status(axum::http::StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from_stream(stream))
+        .expect("static heartbeat response parts are valid")
+}
+
 // ============================================================================
 // Query Validation Helpers
 // ============================================================================
@@ -142,25 +224,16 @@ impl Drop for SearchStreamGuard {
         }
         // The response stream was dropped before a terminal event was produced:
         // the client is gone. Cancel the still-running query so we stop burning
-        // resources on results nobody will read.
-        #[cfg(feature = "enterprise")]
-        {
-            let org_id = std::mem::take(&mut self.org_id);
-            let trace_id = std::mem::take(&mut self.trace_id);
-            log::info!(
-                "[trace_id {trace_id}] client disconnected before search finished, cancelling query"
-            );
-            tokio::spawn(async move {
-                super::query_manager::cancel_query_internal(&org_id, &trace_id).await;
-            });
-        }
-        #[cfg(not(feature = "enterprise"))]
-        log::debug!(
-            "[trace_id {}] client disconnected before search finished (org {}); \
-             query cancellation requires the enterprise build",
-            self.trace_id,
-            self.org_id
+        // resources on results nobody will read. (Since .81 this works on OSS
+        // too: cancel_query_internal fans out to the leader's abort registry.)
+        let org_id = std::mem::take(&mut self.org_id);
+        let trace_id = std::mem::take(&mut self.trace_id);
+        log::info!(
+            "[trace_id {trace_id}] client disconnected before search finished, cancelling query"
         );
+        tokio::spawn(async move {
+            super::query_manager::cancel_query_internal(&org_id, &trace_id).await;
+        });
     }
 }
 
@@ -524,5 +597,52 @@ FROM k8s_events_agg"#;
             "body_type belongs to k8s_events, not default — must not be rejected \
              when validating the default stream. Got: {result:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod heartbeat_tests {
+    use axum::{body::Body, http::StatusCode, response::Response};
+
+    use super::with_oneshot_heartbeat;
+
+    fn resp(status: StatusCode, body: &'static str) -> Response {
+        Response::builder()
+            .status(status)
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    /// Within the grace period the response passes through untouched —
+    /// status codes stay exact for fast queries (and grace 0 disables).
+    #[tokio::test]
+    async fn heartbeat_grace_passes_response_through() {
+        let res = with_oneshot_heartbeat(5, async { resp(StatusCode::TOO_MANY_REQUESTS, "x") }).await;
+        assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+        let res = with_oneshot_heartbeat(0, async { resp(StatusCode::BAD_REQUEST, "y") }).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Past the grace the body streams: whitespace heartbeats, then the
+    /// real payload — legal JSON for any parser, and the search future
+    /// lives inside the stream so dropping the body cancels it.
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_streams_spaces_then_payload() {
+        let res = with_oneshot_heartbeat(1, async {
+            tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+            resp(StatusCode::OK, r#"{"hits":[]}"#)
+        })
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(res.into_body(), 1024 * 1024)
+            .await
+            .expect("collect stream");
+        let text = String::from_utf8(bytes.to_vec()).expect("utf8");
+        assert!(
+            text.starts_with(' '),
+            "heartbeat whitespace precedes the payload: {text:?}"
+        );
+        assert!(text.trim_start().starts_with('{'), "payload intact: {text:?}");
+        assert_eq!(text.trim_start(), r#"{"hits":[]}"#);
     }
 }

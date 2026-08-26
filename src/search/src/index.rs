@@ -80,6 +80,16 @@ pub enum FieldCap {
     /// index cannot decide conditions on it: skip them and re-apply the
     /// DataFusion filter (`has_skipped`).
     FtsOnly,
+    /// The field's value terms are INCOMPLETE in this file (the writer
+    /// skipped at least one value: oversize raw value, field-id overflow,
+    /// type drift — `partial_fields`). Value-term lookups may miss
+    /// documents, so conditions on it are skipped like [`FieldCap::FtsOnly`]
+    /// — at CONJUNCT granularity, which is superset-safe under the
+    /// top-level AND with the filter re-applied (#32; the old whole-file
+    /// bail burned minutes discovering per-file ineligibility). Key terms
+    /// are complete even on partial fields, so `IS [NOT] NULL` never
+    /// consults this capability.
+    Partial,
     /// No document of this file carries the field at all (no key term in
     /// the dictionary): it is NULL in every row. Conditions that can never
     /// be TRUE on all-NULL input map to [`VixQuery::Nothing`] — an EXACT
@@ -162,13 +172,17 @@ impl IndexCondition {
             // classify the fields this condition looks up in the per-file
             // term index
             let fields = condition.term_index_fields();
-            let mut fts_only: Option<&String> = None;
+            let mut unservable: Option<(&String, &str)> = None;
             let mut absent: HashSet<String> = HashSet::new();
             for field in &fields {
                 match field_cap(field) {
                     FieldCap::Term => {}
                     FieldCap::FtsOnly => {
-                        fts_only = Some(field);
+                        unservable = Some((field, "not term-indexed"));
+                        break;
+                    }
+                    FieldCap::Partial => {
+                        unservable = Some((field, "partial (value terms incomplete)"));
                         break;
                     }
                     FieldCap::Absent => {
@@ -176,9 +190,9 @@ impl IndexCondition {
                     }
                 }
             }
-            if let Some(missing) = fts_only {
+            if let Some((missing, why)) = unservable {
                 log::info!(
-                    "[trace_id {trace_id}] to_vix_query: skipping condition, field {missing} is not term-indexed in this file"
+                    "[trace_id {trace_id}] to_vix_query: skipping condition, field {missing} is {why} in this file"
                 );
                 has_skipped = true;
                 continue;
@@ -225,19 +239,27 @@ impl IndexCondition {
         }
     }
 
-    /// Whether the condition touches a field for which the vix index skipped
-    /// at least one value at build time. Term lookups on such fields may miss
-    /// documents, so the whole file must fall back to a scan.
+    /// Whether the condition consults fts TOKENS of a partial field — the
+    /// only remaining WHOLE-FILE partial bail (#32).
     ///
-    /// `fts_fields` is the FILE's fts-marked field set: match_all consults
-    /// only fts tokens, so it is tainted only by a partial field that is
-    /// fts-marked in this file. Writers never partial-mark an fts field for
-    /// oversize values (tokens are length-independent) — an fts field is
-    /// partial only when its tokens are genuinely missing (field-id
-    /// overflow, unindexable type drift, or a pre-token-fix build), and the
-    /// merge fast path already refuses such inputs. Value-term lookups
-    /// (equality/range/regex/...) keep the flat check: a partial mark always
-    /// means their raw terms may miss documents.
+    /// match_all/fuzzy conditions have no named-field granularity: they
+    /// probe fts tokens across fields, so a partial fts field (tokens
+    /// genuinely missing: field-id overflow, unindexable type drift, or a
+    /// pre-token-fix build — never oversize values, tokens are
+    /// length-independent) can silently hide matches and the file must
+    /// scan.
+    ///
+    /// Every NAMED-FIELD condition now handles partiality at CONJUNCT
+    /// granularity instead (#32): value-term lookups skip their conjunct
+    /// via [`FieldCap::Partial`] (superset-safe under the top-level AND
+    /// with the filter re-applied), and `IS [NOT] NULL` evaluates EXACTLY —
+    /// key terms are emitted under every partial cause (oversize value
+    /// path, the field-id-overflow path states it verbatim: "Their key
+    /// terms are still emitted", and the type-drift path — pinned by
+    /// writer tests). The prod incident this fixes: a 3-conjunct AND with
+    /// one `IS NULL` on a partial field spent 122-167s/follower opening
+    /// ~1531 files only to bail every one, while the other two conjuncts
+    /// were a 0.01% index needle.
     pub fn uses_partial_fields(
         &self,
         partial_fields: &std::collections::HashSet<String>,
@@ -294,6 +316,22 @@ impl IndexCondition {
     // for the condition that query without filter
     pub fn is_condition_all(&self) -> bool {
         self.conditions.len() == 1 && matches!(self.conditions[0], Condition::All())
+    }
+
+    /// M16 §4: the single positive numeric equality/IN conjunct (`f = v` /
+    /// `f IN (...)`, [`Condition::NumericCmp`] non-negated) when it is the
+    /// WHOLE condition — the shape the chunk-stats-decided count arms can
+    /// serve when the term index cannot.
+    pub fn single_numeric_eq(&self) -> Option<(&str, &[String], NumericKind)> {
+        if self.conditions.len() != 1 {
+            return None;
+        }
+        match &self.conditions[0] {
+            Condition::NumericCmp(field, values, false, kind) if !values.is_empty() => {
+                Some((field.as_str(), values.as_slice(), *kind))
+            }
+            _ => None,
+        }
     }
 
     // use for the simple histogram RANK fast path: the single `field = value` term
@@ -860,17 +898,19 @@ impl Condition {
         fts_fields: &std::collections::HashSet<String>,
     ) -> bool {
         match self {
-            Condition::Equal(field, _)
-            | Condition::NotEqual(field, _)
-            | Condition::In(field, ..)
-            | Condition::NumericCmp(field, ..)
-            | Condition::Regex(field, _)
-            | Condition::StrMatch(field, ..)
-            // conservative: key terms are written independently of the
-            // skipped values, but a partial-marked field is already degraded
-            // in this file — scan it rather than reason about writer paths
-            | Condition::IsNotNull(field)
-            | Condition::IsNull(field) => partial_fields.contains(field),
+            // #32: named-field value-term conditions no longer force the
+            // whole file to a scan — [`FieldCap::Partial`] skips just their
+            // conjunct in `to_vix_query` (superset + re-applied filter)
+            Condition::Equal(..)
+            | Condition::NotEqual(..)
+            | Condition::In(..)
+            | Condition::NumericCmp(..)
+            | Condition::Regex(..)
+            | Condition::StrMatch(..) => false,
+            // #32: IS [NOT] NULL consult only KEY terms, which the writer
+            // emits under every partial cause — they evaluate EXACTLY on
+            // partial files (invariant pinned by writer tests)
+            Condition::IsNotNull(_) | Condition::IsNull(_) => false,
             Condition::MatchAll(value) => {
                 !(value.is_empty() || value == "*")
                     && partial_fields.iter().any(|f| fts_fields.contains(f))
@@ -883,9 +923,7 @@ impl Condition {
                 left.uses_partial_fields(partial_fields, fts_fields)
                     || right.uses_partial_fields(partial_fields, fts_fields)
             }
-            Condition::Not(condition) => {
-                condition.uses_partial_fields(partial_fields, fts_fields)
-            }
+            Condition::Not(condition) => condition.uses_partial_fields(partial_fields, fts_fields),
         }
     }
 
@@ -1839,27 +1877,34 @@ mod tests {
 
     #[test]
     fn test_uses_partial_fields_field_conditions() {
+        // #32: named-field conditions no longer force the WHOLE FILE to a
+        // scan — partiality is handled per conjunct via FieldCap::Partial
+        // (value-term lookups skip their conjunct; IS [NOT] NULL evaluates
+        // exactly via key terms). uses_partial_fields keeps only the
+        // match_all token taint.
         let partial_fields = partial(&["log"]);
         let no_fts = partial(&[]);
         assert!(
-            Condition::Equal("log".to_string(), "v".to_string())
+            !Condition::Equal("log".to_string(), "v".to_string())
                 .uses_partial_fields(&partial_fields, &no_fts)
         );
         assert!(
-            !Condition::Equal("level".to_string(), "v".to_string())
+            !Condition::StrMatch("log".to_string(), "v".to_string(), true)
                 .uses_partial_fields(&partial_fields, &no_fts)
         );
         assert!(
-            Condition::StrMatch("log".to_string(), "v".to_string(), true)
-                .uses_partial_fields(&partial_fields, &no_fts)
-        );
-        assert!(
-            Condition::Not(Box::new(Condition::In(
+            !Condition::Not(Box::new(Condition::In(
                 "log".to_string(),
                 vec!["v".to_string()],
                 false
             )))
             .uses_partial_fields(&partial_fields, &no_fts)
+        );
+        assert!(
+            !Condition::IsNull("log".to_string()).uses_partial_fields(&partial_fields, &no_fts)
+        );
+        assert!(
+            !Condition::IsNotNull("log".to_string()).uses_partial_fields(&partial_fields, &no_fts)
         );
     }
 
@@ -1890,23 +1935,31 @@ mod tests {
             !Condition::FuzzyMatchAll("err".to_string(), 1)
                 .uses_partial_fields(&non_fts_partial, &fts)
         );
-        // ...but value lookups on that field still fall back
+        // value lookups no longer fall back WHOLE-FILE either (#32): they
+        // skip their conjunct via FieldCap::Partial
         assert!(
-            Condition::Equal("params.payload".to_string(), "v".to_string())
+            !Condition::Equal("params.payload".to_string(), "v".to_string())
                 .uses_partial_fields(&non_fts_partial, &fts)
         );
     }
 
     #[test]
     fn test_index_condition_uses_partial_fields() {
+        // the whole-file taint survives only through match_all over a
+        // partial fts field (#32)
         let mut index_condition = IndexCondition::new();
-        index_condition.add_condition(Condition::Equal("log".to_string(), "v".to_string()));
+        index_condition.add_condition(Condition::MatchAll("err".to_string()));
 
-        let no_fts = partial(&[]);
-        assert!(index_condition.uses_partial_fields(&partial(&["log"]), &no_fts));
-        assert!(!index_condition.uses_partial_fields(&partial(&["level"]), &no_fts));
+        let fts = partial(&["log"]);
+        assert!(index_condition.uses_partial_fields(&partial(&["log"]), &fts));
+        assert!(!index_condition.uses_partial_fields(&partial(&["level"]), &fts));
         // empty partial set: nothing to taint
-        assert!(!index_condition.uses_partial_fields(&partial(&[]), &no_fts));
+        assert!(!index_condition.uses_partial_fields(&partial(&[]), &fts));
+
+        // named-field conditions never whole-file taint
+        let mut named = IndexCondition::new();
+        named.add_condition(Condition::Equal("log".to_string(), "v".to_string()));
+        assert!(!named.uses_partial_fields(&partial(&["log"]), &fts));
     }
 
     #[test]
@@ -2783,8 +2836,10 @@ mod tests {
         // field bookkeeping matches the other per-field comparisons
         assert!(positive.term_index_fields().contains("code"));
         assert!(positive.get_schema_fields(&[]).contains("code"));
+        // #32: NumericCmp on a partial field skips at conjunct granularity
+        // (FieldCap::Partial), not whole-file
         let partial: std::collections::HashSet<String> = ["code".to_string()].into_iter().collect();
-        assert!(positive.uses_partial_fields(&partial, &Default::default()));
+        assert!(!positive.uses_partial_fields(&partial, &Default::default()));
     }
 
     #[test]

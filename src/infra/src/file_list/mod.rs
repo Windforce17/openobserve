@@ -68,6 +68,13 @@ pub trait FileList: Sync + Send + 'static {
     async fn get(&self, file: &str) -> Result<FileMeta>;
     async fn contains(&self, file: &str) -> Result<bool>;
     async fn update_compressed_size(&self, file: &str, size: i64) -> Result<()>;
+    /// Sidecar-only heal (M3): point the EXISTING row at its rewritten
+    /// `.vxi` — set `index_size` to the new sidecar's byte size (0 = the
+    /// index-off heal deleted it) and reset `bloom_ver` to 0 so the file
+    /// re-enters the `.bf` assembler queue with its NEW bloom (the pruner
+    /// treats 0 as no-bloom meanwhile — fail-open). No new file id, no
+    /// data-key change, no other column touched.
+    async fn update_index_size_for_heal(&self, file: &str, index_size: i64) -> Result<()>;
     /// Bulk-set `bloom_ver` for the given file_list ids. Used by the
     /// post-merge bloom builder (enterprise `bloom::compact`).
     /// Empty `ids` is a no-op.
@@ -342,6 +349,12 @@ pub async fn bloom_ver_referenced(
 #[tracing::instrument(name = "infra:file_list:db:update_compressed_size")]
 pub async fn update_compressed_size(file: &str, size: i64) -> Result<()> {
     CLIENT.update_compressed_size(file, size).await
+}
+
+/// See [`FileList::update_index_size_for_heal`].
+#[tracing::instrument(name = "infra:file_list:db:update_index_size_for_heal")]
+pub async fn update_index_size_for_heal(file: &str, index_size: i64) -> Result<()> {
+    CLIENT.update_index_size_for_heal(file, index_size).await
 }
 
 #[inline]
@@ -676,19 +689,21 @@ pub async fn query_dump_stats_by_date_range(
 /// `delete_by_org` in both backends — the SQL is identical, `$N` binds work
 /// for postgres and sqlite alike).
 ///
-/// `index_file` is always false: core `.vix` files embed their index in the
-/// data object, so no file has a separate sibling index object to GC.
+/// `index_file` is written as a vestigial false: the deleted-file sweeper
+/// (`compact::deleted`) derives the `.vxi` sidecar key from every `.vix`
+/// key unconditionally and tolerates NotFound, so the flag is never
+/// consulted for the v3 sidecar GC.
 pub(crate) const MOVE_FILE_LIST_TO_DELETED_SQL: &str = r#"INSERT INTO file_list_deleted (account, org, stream, date, file, index_file, flattened, created_at)
        SELECT account, org, stream, date, file, false, flattened, $2
        FROM file_list WHERE org = $1;"#;
 
 /// Returns `(sum(original_size), sum(index_size))` for one org+account.
 ///
-/// NOTE(accounting): these are two INDEPENDENT figures — never add them. The
-/// stored footprint is `sum(compressed_size)` (not returned here); for core
-/// `.vix` files `index_size` is a subset of `compressed_size` (the index is
-/// embedded in the data object), so any `x + index_size` total double-counts.
-/// Currently has no in-tree callers; kept for external/cloud consumers.
+/// NOTE(accounting, v3 sidecar split): `index_size` is the `.vxi` sidecar
+/// object's own size — a SEPARATE object from the data file, so the stored
+/// footprint is `sum(compressed_size) + sum(index_size)` (the former is not
+/// returned here). Currently has no in-tree callers; kept for
+/// external/cloud consumers.
 #[inline]
 pub async fn org_stats_by_account(org_id: &str, account: &str) -> Result<(i64, i64)> {
     CLIENT.org_stats_by_account(org_id, account).await

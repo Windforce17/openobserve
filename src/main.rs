@@ -95,12 +95,17 @@ use {
     o2_enterprise::enterprise::{ai, common::config::O2Config},
 };
 
+// M27: the real allocator stays underneath; the wrapper is fully inert (one
+// relaxed atomic load per alloc/dealloc) unless ZO_HEAP_PROFILE_SAMPLE_EVERY_MB
+// is set at process start (see config::heap_profile).
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: config::heap_profile::HeapProfileAlloc<mimalloc::MiMalloc> =
+    config::heap_profile::HeapProfileAlloc::new(mimalloc::MiMalloc);
 #[cfg(feature = "jemalloc")]
 #[global_allocator]
-static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+static GLOBAL: config::heap_profile::HeapProfileAlloc<tikv_jemallocator::Jemalloc> =
+    config::heap_profile::HeapProfileAlloc::new(tikv_jemallocator::Jemalloc);
 use tracing_subscriber::{
     EnvFilter, filter::LevelFilter as TracingLevelFilter, fmt::Layer, prelude::*,
 };
@@ -112,6 +117,10 @@ pub static malloc_conf: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:16\0
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
+    // M27: activate the sampling heap profiler if (and only if)
+    // ZO_HEAP_PROFILE_SAMPLE_EVERY_MB is set; no-op otherwise.
+    config::heap_profile::init();
+
     // CLI provides the path to the config file (if any)
     // In case a custom path is provided, the file will be read first
     // and config variables will be loaded.
@@ -256,6 +265,12 @@ async fn main() -> Result<(), anyhow::Error> {
                 job_init_tx.send(false).ok();
                 panic!("enterprise init failed: {e}");
             }
+
+            // one-time engine tunables from config (#39: fetch reduction —
+            // a bigger eager tail turns cold small-file opens into one GET)
+            openobserve::service::search::vix::set_tail_fetch_size(
+                config::get_config().limit.vix_eager_tail_bytes,
+            );
 
             // ingester init
             if let Err(e) = ingester::init().await {

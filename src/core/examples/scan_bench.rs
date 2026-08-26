@@ -32,7 +32,7 @@ use std::{
 };
 
 use futures::FutureExt;
-use vortex_index::{ColumnBound, NumScalar, VixDocs, VixRangeSource};
+use vortex_index::{BoundValue, ColumnBound, VixDocs, VixRangeSource};
 
 /// Range source over an in-memory buffer that counts fetches — stands in for
 /// the disk-cache/S3 ranged reads of prod (per-fetch latency is simulated by
@@ -81,7 +81,7 @@ fn run(
     let selected = rows.as_ref().map(|r| r.len());
     let bounds = [ColumnBound {
         column: "duration".to_string(),
-        min: Some((NumScalar::I64(2000), false)),
+        min: Some((BoundValue::I64(2000), false)),
         max: None,
     }];
     let mut produced: u64 = 0;
@@ -133,7 +133,7 @@ fn run_proj(
     }
     let bounds = [ColumnBound {
         column: "duration".to_string(),
-        min: Some((NumScalar::I64(2000), false)),
+        min: Some((BoundValue::I64(2000), false)),
         max: None,
     }];
     let projection: Option<Vec<String>> = if cols.is_empty() {
@@ -243,8 +243,17 @@ fn main() -> anyhow::Result<()> {
     run(
         "ranged-needle",
         &ranged_docs,
-        Some(needle),
+        Some(needle.clone()),
         0,
+        Some(counters),
+    )?;
+    // M8: the needle shape WITH `_source` — how many bytes a matched-row
+    // point read of the fat column actually fetches at this chunk size
+    run_proj(
+        "rng-src-needle",
+        &ranged_docs,
+        Some(needle),
+        &["_timestamp", "duration", "_source"],
         Some(counters),
     )?;
     run("ranged-full", &ranged_docs, None, 0, Some(counters))?;

@@ -61,6 +61,53 @@ pub enum VixSearchResult {
     TopN(Vec<(Vec<String>, u64)>),
     /// simple distinct optimization
     Distinct(HashSet<String>),
+    /// M16 min/max(field) optimization: the file's extreme value of the
+    /// column over the matched rows (`None` = no non-null value matched)
+    MinMax(Option<MinMaxValue>),
+}
+
+/// M16: one numeric min/max value, typed by the column's stored family.
+/// Cross-family folds (per-file type drift) compare EXACTLY (i128 for the
+/// integer families, lossless-checked against f64). NaN never enters a fold
+/// (both the stats builder and the decode folds skip it — JSON cannot carry
+/// NaN, so stored NaNs are synthetic anyway).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MinMaxValue {
+    I64(i64),
+    U64(u64),
+    F64(f64),
+}
+
+impl MinMaxValue {
+    /// Exact cross-family ordering (no lossy i64→f64 rounding — the same
+    /// rules as the chunk-stats comparators). NaN (never produced by the
+    /// folds) compares as `None` and the fold keeps the previous value.
+    pub(super) fn cmp_exact(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        use MinMaxValue::*;
+        use vortex_index::cmp_i128_vs_f64;
+        match (self, other) {
+            (I64(a), I64(b)) => Some(a.cmp(b)),
+            (U64(a), U64(b)) => Some(a.cmp(b)),
+            (I64(a), U64(b)) => Some((*a as i128).cmp(&(*b as i128))),
+            (U64(a), I64(b)) => Some((*a as i128).cmp(&(*b as i128))),
+            (F64(a), F64(b)) => a.partial_cmp(b),
+            (I64(a), F64(b)) => cmp_i128_vs_f64(*a as i128, *b),
+            (U64(a), F64(b)) => cmp_i128_vs_f64(*a as i128, *b),
+            (F64(a), I64(b)) => cmp_i128_vs_f64(*b as i128, *a).map(std::cmp::Ordering::reverse),
+            (F64(a), U64(b)) => cmp_i128_vs_f64(*b as i128, *a).map(std::cmp::Ordering::reverse),
+        }
+    }
+
+    /// Fold `other` into `self` under min/max semantics; an incomparable
+    /// pair (NaN) keeps `self` — unreachable for the folds' NaN-free
+    /// inputs, defensive otherwise.
+    pub fn fold(self, other: MinMaxValue, is_max: bool) -> MinMaxValue {
+        match self.cmp_exact(&other) {
+            Some(std::cmp::Ordering::Less) if is_max => other,
+            Some(std::cmp::Ordering::Greater) if !is_max => other,
+            _ => self,
+        }
+    }
 }
 
 impl VixSearchResult {
@@ -109,6 +156,7 @@ impl VixSearchResult {
                 distinct.iter().map(|s| s.capacity()).sum::<usize>()
                     + std::mem::size_of::<HashSet<String>>()
             }
+            Self::MinMax(_) => std::mem::size_of::<Option<MinMaxValue>>(),
         }
     }
 }
@@ -126,6 +174,10 @@ pub enum MultiResultBuilder {
     MultiHistogram(Vec<Vec<(i64, String, u64)>>),
     TopN(Vec<(Vec<String>, u64)>),
     Distinct(HashSet<String>),
+    MinMax {
+        is_max: bool,
+        value: Option<MinMaxValue>,
+    },
 }
 
 impl MultiResultBuilder {
@@ -140,6 +192,12 @@ impl MultiResultBuilder {
                 pruner: SimpleSelectPruner::new(*limit, *ascend, file_groups),
             },
             Some(IndexOptimizeMode::SimpleCount) => Self::Count(0),
+            // M16: count(field) merges exactly like count(*) — a per-file sum
+            Some(IndexOptimizeMode::SimpleCountField(_)) => Self::Count(0),
+            Some(IndexOptimizeMode::SimpleMinMax(_, is_max)) => Self::MinMax {
+                is_max: *is_max,
+                value: None,
+            },
             None => Self::RowNums(0),
         }
     }
@@ -217,6 +275,21 @@ impl MultiResultBuilder {
         }
     }
 
+    // M16 min/max(field): fold one file's extreme into the running one
+    pub fn add_min_max(&mut self, file_value: Option<MinMaxValue>) {
+        match self {
+            Self::MinMax { is_max, value } => {
+                if let Some(new) = file_value {
+                    *value = Some(match value.take() {
+                        Some(current) => current.fold(new, *is_max),
+                        None => new,
+                    });
+                }
+            }
+            _ => unreachable!("unsupported vix multi result"),
+        }
+    }
+
     /// Only for simple select: whether the groups after `group_id` can be
     /// dropped because the limit is already satisfied by earlier candidates.
     pub fn should_prune_remaining_groups(&self, trace_id: &str, group_id: usize) -> bool {
@@ -267,6 +340,7 @@ impl MultiResultBuilder {
             }
             Self::TopN(a) => MultiResult::TopN(a),
             Self::Distinct(a) => MultiResult::Distinct(a),
+            Self::MinMax { value, .. } => MultiResult::MinMax(value),
         }
     }
 }
@@ -281,6 +355,8 @@ pub enum MultiResult {
     MultiHistogram(Vec<(i64, String, u64)>),
     TopN(Vec<(Vec<String>, u64)>),
     Distinct(HashSet<String>),
+    /// M16 min/max(field): the cross-file fold (`None` = no value matched)
+    MinMax(Option<MinMaxValue>),
 }
 
 impl Display for MultiResult {
@@ -297,6 +373,7 @@ impl Display for MultiResult {
             }
             Self::TopN(top_n) => write!(f, "top_n hits: {}", top_n.len()),
             Self::Distinct(distinct) => write!(f, "distinct hits: {}", distinct.len()),
+            Self::MinMax(value) => write!(f, "min_max: {value:?}"),
         }
     }
 }
@@ -334,6 +411,15 @@ impl MultiResult {
         match self {
             Self::Distinct(a) => a,
             _ => HashSet::new(),
+        }
+    }
+
+    /// M16: the folded min/max value (`None` for other results or when no
+    /// row matched).
+    pub fn min_max(self) -> Option<MinMaxValue> {
+        match self {
+            Self::MinMax(a) => a,
+            _ => None,
         }
     }
 }

@@ -224,6 +224,32 @@ pub static INGEST_MEMTABLE_FILES: Lazy<IntGaugeVec> = Lazy::new(|| {
     .expect("Metric created")
 });
 
+pub static INGEST_ADMISSION_RESERVED_BYTES: Lazy<IntGaugeVec> = Lazy::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            "ingest_admission_reserved_bytes",
+            "Projected in-flight ingest request bytes reserved against the memory envelope."
+                .to_owned(),
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &[],
+    )
+    .expect("Metric created")
+});
+pub static INGEST_ADMISSION_REJECTED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "ingest_admission_rejected_total",
+            "Ingest requests rejected for size or memory backpressure, by reason (oversize/memory/resource).".to_owned(),
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &["reason"],
+    )
+    .expect("Metric created")
+});
+
 pub static INGEST_MEMTABLE_LOCK_TIME: Lazy<HistogramVec> = Lazy::new(|| {
     HistogramVec::new(
         HistogramOpts::new("ingest_memtable_lock_time", "ingest memtable lock time")
@@ -1982,6 +2008,12 @@ fn register_metrics(registry: &Registry) {
         .register(Box::new(INGEST_MEMTABLE_LOCK_TIME.clone()))
         .expect("Metric registered");
     registry
+        .register(Box::new(INGEST_ADMISSION_RESERVED_BYTES.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(INGEST_ADMISSION_REJECTED_TOTAL.clone()))
+        .expect("Metric registered");
+    registry
         .register(Box::new(INGEST_WAL_LOCK_TIME.clone()))
         .expect("Metric registered");
     registry
@@ -2548,6 +2580,8 @@ mod tests {
         let _ = INGEST_MEMTABLE_ARROW_BYTES.clone();
         let _ = INGEST_MEMTABLE_FILES.clone();
         let _ = INGEST_MEMTABLE_LOCK_TIME.clone();
+        let _ = INGEST_ADMISSION_RESERVED_BYTES.clone();
+        let _ = INGEST_ADMISSION_REJECTED_TOTAL.clone();
         let _ = INGEST_WAL_LOCK_TIME.clone();
     }
 

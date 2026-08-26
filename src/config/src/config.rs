@@ -96,6 +96,23 @@ pub const FILE_EXT_ARROW: &str = ".arrow";
 pub const FILE_EXT_PARQUET: &str = ".parquet";
 pub const FILE_EXT_VORTEX: &str = ".vortex";
 pub const FILE_EXT_VIX: &str = ".vix";
+/// The per-file INDEX SIDECAR of a `.vix` data object (format v3): same key
+/// with the extension swapped, holding the inverted-index blobs. NOT a
+/// file_list-tracked data file, never a merge input by itself; its size is
+/// the data row's `index_size` column (`0` ⟺ no sidecar). Derive keys with
+/// [`vix_sidecar_key`] — never by ad-hoc string surgery.
+pub const FILE_EXT_VXI: &str = ".vxi";
+
+/// The deterministic `.vxi` sidecar key of a `.vix` data-object key
+/// (extension swapped). Callers gate on `FileMeta::index_size > 0` for
+/// existence; this only derives the key. Non-`.vix` keys pass through
+/// with the extension appended-swapped semantics avoided: they return
+/// `None` (a sidecar exists only for core data files).
+pub fn vix_sidecar_key(data_key: &str) -> Option<String> {
+    data_key
+        .strip_suffix(FILE_EXT_VIX)
+        .map(|stem| format!("{stem}{FILE_EXT_VXI}"))
+}
 
 pub const QUERY_WITH_NO_LIMIT: i64 = -999;
 
@@ -198,6 +215,58 @@ pub static DISTINCT_FIELDS: Lazy<Vec<String>> = Lazy::new(|| {
     fields.dedup();
     fields
 });
+
+/// Stream types whose core .vix files are COLUMN-STORE ONLY (#40): no
+/// term index is built or merged for them, and queriers never probe their
+/// files. Owner call 2026-08-12 for metrics: one metric family per stream,
+/// low-cardinality labels, whole-window aggregations — the index is pure
+/// build/merge overhead there.
+pub static VIX_INDEX_DISABLED_STREAM_TYPES: Lazy<
+    std::collections::HashSet<crate::meta::stream::StreamType>,
+> = Lazy::new(|| {
+    get_config()
+        .common
+        .vix_index_disabled_stream_types
+        .split(',')
+        .filter_map(|s| {
+            let s = s.trim();
+            if s.is_empty() {
+                None
+            } else {
+                Some(crate::meta::stream::StreamType::from(s))
+            }
+        })
+        .collect()
+});
+
+pub fn is_vix_index_disabled(stream_type: crate::meta::stream::StreamType) -> bool {
+    VIX_INDEX_DISABLED_STREAM_TYPES.contains(&stream_type)
+}
+
+/// Stream types whose INGEST-SIDE builds (WAL move + segment L0) write
+/// column-store-only core files (#42). Merge plans ignore this set — the
+/// index materializes at compaction.
+pub static VIX_L0_INDEX_OFF_STREAM_TYPES: Lazy<
+    std::collections::HashSet<crate::meta::stream::StreamType>,
+> = Lazy::new(|| {
+    get_config()
+        .common
+        .vix_l0_index_off_stream_types
+        .split(',')
+        .filter_map(|s| {
+            let s = s.trim();
+            if s.is_empty() {
+                None
+            } else {
+                Some(crate::meta::stream::StreamType::from(s))
+            }
+        })
+        .collect()
+});
+
+pub fn is_vix_l0_index_off(stream_type: crate::meta::stream::StreamType) -> bool {
+    VIX_L0_INDEX_OFF_STREAM_TYPES.contains(&stream_type)
+}
 
 pub static BLOOM_FILTER_DEFAULT_FIELDS: Lazy<Vec<String>> = Lazy::new(|| {
     let mut fields = get_config()
@@ -510,10 +579,12 @@ pub enum FileFormat {
     #[default]
     Parquet,
     Vortex,
-    /// Core-file format: one `.vix` puffin container carrying the
-    /// records (`docs` blob) *and* the inverted index (`dict`/`terms`) — the
-    /// stream data file itself, not a sibling index. The unconditional
-    /// format of logs/traces; never a valid value for `ZO_FILE_FORMAT`.
+    /// Core-file format (v3): a `.vix` puffin DATA object carrying the
+    /// records (`docs` blob) plus a `.vxi` INDEX SIDECAR (same key,
+    /// extension swapped) carrying the inverted index — the sidecar exists
+    /// iff the file is indexed (`FileMeta::index_size > 0`) and is never a
+    /// data file itself. The unconditional format of logs/traces; never a
+    /// valid value for `ZO_FILE_FORMAT`.
     Vix,
 }
 
@@ -998,6 +1069,9 @@ pub struct Common {
     pub feature_distinct_extra_fields: String,
     #[env_config(name = "ZO_FEATURE_QUICK_MODE_FIELDS", default = "")]
     pub feature_quick_mode_fields: String,
+    // DEPRECATED since .80: the global query queue was removed in favor of
+    // node-local admission (ZO_QUERY_MAX_CONCURRENCY, HTTP 429 past the
+    // limit). No longer read by the OSS search path.
     #[env_config(name = "ZO_FEATURE_QUERY_QUEUE_ENABLED", default = true)]
     pub feature_query_queue_enabled: bool,
     #[env_config(
@@ -1165,17 +1239,99 @@ pub struct Common {
     )]
     pub segment_build_batch: usize,
     #[env_config(
+        name = "ZO_SEGMENT_BUILD_CLAIM_MB",
+        default = 0,
+        help = "Segment WAL (#47): size builder claims by BYTES instead of a fixed segment \
+                count — the effective batch becomes clamp(budget / live-average segment size, \
+                4, 256), adapting to segment-size variance (fat vpc-flow segments claim fewer, \
+                thin metrics segments claim more) while the decode-memory bound stays this \
+                budget. 0 = disabled, ZO_SEGMENT_BUILD_BATCH's fixed count applies. The \
+                all-or-nothing floor (#44) and the ZO_SEGMENT_BUILD_MAX_WAIT_SECS age escape \
+                apply identically in both modes."
+    )]
+    pub segment_build_claim_mb: usize,
+    #[env_config(
+        name = "ZO_SEGMENT_BUILD_CONCURRENCY",
+        default = 16,
+        help = "M12/M17: concurrent small stream-chunk L0 builds per claim. Since M17 this \
+                is the SECONDARY (count) cap — ZO_SEGMENT_BUILD_MEMORY_BUDGET_MB is the \
+                binding control (each build reserves its decoded input bytes before \
+                starting), which is why the default rose 3 -> 16: builds only run wide \
+                when the byte budget proves they fit. Floor 1."
+    )]
+    pub segment_build_concurrency: usize,
+    #[env_config(
+        name = "ZO_SEGMENT_BUILD_MEMORY_BUDGET_MB",
+        default = 0,
+        help = "M17: process-wide DECODED-byte budget for L0 build admission — replaces the \
+                count-knob treadmill (batch/superbatch/concurrency retunes per traffic \
+                shape). A claimed batch reserves its estimated decoded bytes before \
+                fetch+decode (segment meta size x an inflation EMA seeded at 5.0, corrected \
+                to post-decode actuals), and each stream-chunk build reserves its actual \
+                decoded input bytes before running; a reservation that cannot fit waits, \
+                but ONE claim and ONE build always admit (nothing deadlocks on an \
+                oversized unit). 0 = auto: 40% of the detected container/cgroup memory."
+    )]
+    pub segment_build_memory_budget_mb: usize,
+    #[env_config(
+        name = "ZO_SEGMENT_FETCH_DECODE_CONCURRENCY",
+        default = 2,
+        help = "M13 (1c): segment objects fetched+decoded concurrently per claimed batch \
+                (was a hardcoded 2). Memory scales with in-flight DECODED objects (each \
+                payload decompresses to ~ZO_SEGMENT_FLUSH_SIZE_MB of arrow) — pair with the \
+                decoded-bytes build caps; a ~512MB super-batch fetching its ~130 objects \
+                two at a time made this THE drain-rate limiter once claim-side waits were \
+                removed. Dedicated builder/compactor pods can run 8; ingesters stay low. \
+                Floor 1."
+    )]
+    pub segment_fetch_decode_concurrency: usize,
+    #[env_config(
         name = "ZO_SEGMENT_BUILD_MAX_WAIT_SECS",
         default = 15,
         help = "Segment WAL: builders wait for a full ZO_SEGMENT_BUILD_BATCH before claiming, up to this many seconds past the oldest claimable segment's registration. Turns the per-claim L0 output into full batches instead of 1-2-segment slivers (10k tiny files/hour/stream in prod, 2026-08-07). Data stays queryable through the segment tail while it waits. 0 = claim immediately (legacy behavior)"
     )]
     pub segment_build_max_wait_secs: u64,
     #[env_config(
+        name = "ZO_SEGMENT_BUILD_AGE_LANE_SECS",
+        default = 21600,
+        help = "Segment WAL aging lane (M13): once the OLDEST claimable segment is older than \
+                this many seconds, builders reserve a fraction of claim passes \
+                (ZO_SEGMENT_BUILD_AGE_LANE_RATIO) that scan OLDEST-first, so a standing \
+                backlog at balanced capacity can never starve the oldest cohort into the \
+                raw-object S3 lifecycle expiry (prod 2026-08-18: oldest pending stuck 15+ \
+                hours under a 74.5k backlog of newest-first claims). Modeled on \
+                ZO_COMPACT_LIVE_JOB_NUM's reserved-lane design; steady-state claiming is \
+                untouched while the lane is disengaged. 0 disables the lane."
+    )]
+    pub segment_build_age_lane_secs: u64,
+    #[env_config(
+        name = "ZO_SEGMENT_BUILD_AGE_LANE_RATIO",
+        default = 0.25,
+        help = "Fraction of builder claim passes that claim OLDEST-first while the aging \
+                lane is engaged (0.25 = every 4th pass, 1.0 = every pass). Clamped to \
+                [0.0, 1.0] at load; 0 disables the lane."
+    )]
+    pub segment_build_age_lane_ratio: f64,
+    #[env_config(
         name = "ZO_SEGMENT_BUILD_LEASE_SECS",
         default = 120,
         help = "Segment WAL: builder lease; a claim whose heartbeat is older than this is re-claimable"
     )]
     pub segment_build_lease_secs: u64,
+    #[env_config(
+        name = "ZO_SEGMENT_BUILD_404_TOMBSTONE",
+        default = true,
+        help = "M29: a claimed wal_segment whose object GET returns NotFound (the S3 \
+                lifecycle expired it — S3 reads are strongly consistent, so the data is \
+                gone for good) is terminally resolved: the row flips Built with no files \
+                and the sweeper retires it, instead of retrying the 404 on every lease \
+                expiry forever. Kill-era zombie rows otherwise recycle through EVERY \
+                claim batch and dilute real segments into per-stream sliver L0 files \
+                (prod 2026-08-24: 189.7k zombie rows, 722k 404-skips/30m, claim batches \
+                of 64 with 1 real segment emitting 7 sliver files). false = legacy \
+                skip-and-retry."
+    )]
+    pub segment_build_404_tombstone: bool,
     #[env_config(
         name = "ZO_SEGMENT_SCAN_DECODE_WAVE",
         default = 8,
@@ -1327,6 +1483,24 @@ pub struct Common {
     )]
     pub disk_circuit_breaker_threshold: usize,
     #[env_config(
+        name = "ZO_INGEST_ADMISSION_ENABLED",
+        default = true,
+        help = "Gate ingest HTTP requests on the memory envelope BEFORE the request body is buffered/decoded. Uses Content-Length to project the in-process transient and meters it against the memory circuit breaker envelope. Envelope gating requires the memory circuit breaker to be enabled; early 413 for oversized Content-Length works regardless."
+    )]
+    pub ingest_admission_enabled: bool,
+    #[env_config(
+        name = "ZO_INGEST_ADMISSION_EXPANSION_FACTOR",
+        default = 6,
+        help = "Projected in-process expansion multiple for an uncompressed ingest body (body buffer + decode + json + arrow transient). projected = content_length * factor."
+    )]
+    pub ingest_admission_expansion_factor: usize,
+    #[env_config(
+        name = "ZO_INGEST_ADMISSION_COMPRESSED_FACTOR",
+        default = 30,
+        help = "Projected in-process expansion multiple for a compressed (gzip/deflate/br/snappy) ingest body, covering decompression plus decode expansion. projected = content_length * factor."
+    )]
+    pub ingest_admission_compressed_factor: usize,
+    #[env_config(
         name = "ZO_RESTRICTED_ROUTES_ON_EMPTY_DATA",
         default = false,
         help = "Control the redirection of a user to ingestion page in case there is no stream found."
@@ -1340,12 +1514,14 @@ pub struct Common {
     pub inverted_index_enabled: bool,
     #[env_config(
         name = "ZO_WAL_NARROW_SCHEMA",
-        default = false,
+        default = true,
         help = "Ingest batches carry only the fields present in the data (plus _timestamp) \
                 instead of the full stream schema: WAL arrow-IPC bytes, memtable footprint \
                 and persist width all scale with the data, not the stream-schema union. The \
                 memtable/persist/search/replay paths adapt heterogeneous batch schemas \
-                natively; this flag exists as the rollout/rollback lever."
+                natively. Default TRUE since 2026-08-12 (owner call; both fleet envs had \
+                pinned it true since .26/.28 with no regressions) — false remains as the \
+                rollback lever."
     )]
     pub wal_narrow_schema: bool,
     #[env_config(
@@ -1379,6 +1555,16 @@ pub struct Common {
     #[env_config(name = "ZO_VIX_SCAN_DECODE_THREADS", default = 0)]
     pub vix_scan_decode_threads: usize,
     #[env_config(
+        name = "ZO_VIX_ORDER_MERGE_MAX_REGIONS",
+        default = 64,
+        help = "Concat-order .vix files with at most this many proven desc regions serve \
+                ORDER BY _timestamp DESC through the k-way region merge (declared sort, \
+                no SortExec); wider files fall back to the real sort. Each OPEN region \
+                costs one decoded chunk window; lazy opening keeps the usual count near 1. \
+                0 disables merged ordered reads (every concat file sorts)."
+    )]
+    pub vix_order_merge_max_regions: usize,
+    #[env_config(
         name = "ZO_VIX_POSTINGS_CHUNK_BYTES",
         default = 131072,
         help = "Target chunk size for the postings column in .vix index files."
@@ -1401,6 +1587,19 @@ pub struct Common {
     )]
     pub vix_fetch_concurrency: usize,
     #[env_config(
+        name = "ZO_VIX_QUERY_PREFETCH",
+        default = true,
+        help = "Cold-open prefetch for ranged vix index evaluation (M14): before a file \
+                group is evaluated, files WITHOUT a memoized reader batch-fetch their \
+                eager footer tails (data object + index sidecar, the \
+                ZO_VIX_EAGER_TAIL_BYTES window) in one bounded-concurrency wave, so a \
+                multi-file cold query pays one parallel fetch ROUND instead of per-file \
+                sequential open rounds. Wave fetches respect ZO_VIX_FETCH_CONCURRENCY \
+                and count toward the ZO_VIX_EVAL_BAIL_BYTES budget. false = open lazily \
+                per file (the pre-M14 behavior)."
+    )]
+    pub vix_query_prefetch: bool,
+    #[env_config(
         name = "ZO_VIX_PLIST_MIN_DOCS",
         default = 0,
         help = "Terms with at least this many matching docs store postings out-of-row with a \
@@ -1409,21 +1608,162 @@ pub struct Common {
     )]
     pub vix_plist_min_docs: usize,
     #[env_config(
+        name = "ZO_VIX_INDEX_DISABLED_STREAM_TYPES",
+        default = "metrics",
+        help = "Comma-separated stream types whose core .vix files are COLUMN-STORE ONLY (#40): \
+                no term index built or merged; every schema field materializes as a docs \
+                column; queriers route those streams straight to the columnar scan."
+    )]
+    pub vix_index_disabled_stream_types: String,
+    #[env_config(
+        name = "ZO_VIX_L0_INDEX_OFF_STREAM_TYPES",
+        default = "",
+        help = "Comma-separated stream types whose ingest-side builds (the WAL move job and \
+                the segment L0 builder) write COLUMN-STORE-ONLY core files (#42 hot-data \
+                mode): no term index is built at L0 — every present field materializes as a \
+                docs column and recent-window filters run columnar — and the index appears \
+                when compaction merges/heals the files (merge plans ignore this list and \
+                keep indexing per ZO_VIX_INDEX_DISABLED_STREAM_TYPES). DEFAULT EMPTY (off). \
+                Enable only when EVERY querier runs the index-off read guards (.88+): a \
+                pre-guard reader treats an index-off file's empty dictionary as proof of \
+                field absence and silently drops rows."
+    )]
+    pub vix_l0_index_off_stream_types: String,
+    #[env_config(
+        name = "ZO_VIX_METRICS_CORE_FILE_ENABLED",
+        default = false,
+        help = "Activation switch for metrics streams writing core .vix files at all \
+                (column-store-only per ZO_VIX_INDEX_DISABLED_STREAM_TYPES). DEFAULT OFF: flip \
+                only after EVERY querier in the fleet runs the index-off read guards (#15 \
+                rollout discipline) — a pre-guard reader treats an index-off file's empty \
+                dictionary as proof of field absence and silently drops rows."
+    )]
+    pub vix_metrics_core_file_enabled: bool,
+    #[env_config(
+        name = "ZO_VIX_BLOOM_COMPOSITE",
+        default = true,
+        help = "#48: per-file COMPOSITE value bloom — one reserved section keyed by \
+                {field name}\\0{value} over EVERY term field, making equality on ANY field \
+                bloom-decidable (file-skip pruning over multi-day windows with ~8KiB reads per \
+                256-file .bf group). Adds one hash per distinct term at build/merge time and \
+                ~2 bytes per distinct term of blob size at the default FPP. Readers that \
+                predate the section ignore it; the pruner keeps files whose .bf lacks it \
+                (fail-open) — safe to enable per-side in any order. DEFAULT ON since v2 M7 \
+                (it is what serves equality on #52 bloom-only-demoted fields); set false to \
+                go dark."
+    )]
+    pub vix_bloom_composite: bool,
+    #[env_config(
+        name = "ZO_VIX_BLOOM_ONLY_FIELDS",
+        default = "",
+        help = "Comma list of STRING fields demoted from the term index to bloom-only \
+                (#52): no dictionary/postings; values land in the composite bloom and \
+                equality queries take file-level bloom pruning + in-file column scan. \
+                For high-cardinality IDs (trace_id/span_id) this removes the most \
+                expensive part of the index build."
+    )]
+    pub vix_bloom_only_fields: String,
+    #[env_config(
+        name = "ZO_VIX_BLOOM_ONLY_NEVER",
+        default = "",
+        help = "Comma list of fields NEVER auto-demoted to bloom-only (keeps prefix \
+                search / index serving for fields the auto ratio would otherwise demote)."
+    )]
+    pub vix_bloom_only_never: String,
+    #[env_config(
+        name = "ZO_VIX_BLOOM_ONLY_AUTO_RATIO",
+        default = 0.5,
+        help = "AUTO bloom-only demotion threshold (#52): a string term field whose \
+                distinct-value/row ratio is >= this (and clears \
+                ZO_VIX_BLOOM_ONLY_MIN_DISTINCT) is written bloom-only. ONE rule, applied \
+                at BOTH write sites since v2 M7: merge plans count the input dictionaries, \
+                and first-encode builds (the move job) count the writer's own term map — \
+                ID-shaped fields (trace_id/span_id) are demoted from birth. The marker is \
+                sticky across merges; ZO_VIX_BLOOM_ONLY_NEVER + a heal un-demotes. \
+                DEFAULT 0.5 (the dev-proven value); 0 disables auto entirely."
+    )]
+    pub vix_bloom_only_auto_ratio: f64,
+    #[env_config(
+        name = "ZO_VIX_BLOOM_ONLY_MIN_DISTINCT",
+        default = 65536,
+        help = "Absolute distinct-term floor for the auto bloom-only demotion — small \
+                files' noisy ratios must not demote real fields."
+    )]
+    pub vix_bloom_only_min_distinct: u64,
+    #[env_config(
+        name = "ZO_L0_SUPERBATCH_MB",
+        default = 512,
+        help = "#54: builders CONCATENATE consecutive full segment claims until this \
+                many megabytes (or the age cap) and build them as ONE batch — each \
+                touched (stream, hour) becomes one L0 file instead of one per claim. \
+                0 restores per-claim builds. Bounds the builder's decoded-frame memory."
+    )]
+    pub segment_build_superbatch_mb: usize,
+    #[env_config(
+        name = "ZO_L0_SUPERBATCH_MAX_SECS",
+        default = 120,
+        help = "#54: age cap on super-batch accumulation — also the crash-replay bound \
+                (an unfinished super-batch re-pends whole via lease expiry)."
+    )]
+    pub segment_build_superbatch_max_secs: u64,
+    #[env_config(
         name = "ZO_VIX_MAX_RAW_TERM_LENGTH",
         default = 65532,
-        help = "Raw (non-full-text) values longer than this are not term-indexed (field becomes \
-                partial). Full-text fields tokenize regardless of value length."
+        help = "Raw (non-full-text) values longer than this are skipped from the term index \
+                WITHOUT degrading the field (owner call 2026-08-12, performance-first — \
+                previously one oversize value made the field partial for the whole file, \
+                sending every query on it to the scan branch): the index stays authoritative, \
+                so an equality search for a skipped oversize literal itself silently misses \
+                those rows. Key terms still index the rows (IS [NOT] NULL exact); skips are \
+                counted in writer stats. Full-text fields tokenize regardless of value length. \
+                The 64KiB ceiling is a format bound (composite term key must fit the \
+                dictionary key space) — do not raise it."
     )]
     pub vix_max_raw_term_len: usize,
     #[env_config(
         name = "ZO_VIX_DOCS_CHUNK_BYTES",
-        default = 4194304,
+        default = 16777216,
         help = "Uncompressed-byte budget of one docs-blob chunk in core .vix files — the \
                 decompression unit of a matched-row point read. Rows per chunk are \
-                clamp(budget / avg_row_bytes, 1024, 65536), so the effective chunk can \
-                exceed the budget for very wide rows. 0 = the 4 MiB default."
+                clamp(budget / avg_present_row_bytes, 64, ZO_VIX_DOCS_CHUNK_MAX_ROWS), so \
+                the effective chunk can exceed the budget for very wide rows. Default \
+                16 MiB (owner call 2026-08-18 on the M8 chunk-size sweep, S2: merge wall \
+                −25% / merge VmHWM −17%, storage-neutral, cost ~2x _source point-read \
+                decode; 4 MiB remains the point-read-optimal knob value). 0 = the \
+                16 MiB default."
     )]
     pub vix_docs_chunk_bytes: usize,
+    #[env_config(
+        name = "ZO_VIX_DOCS_CHUNK_MAX_ROWS",
+        default = 65536,
+        help = "Rows-per-chunk ceiling of the ZO_VIX_DOCS_CHUNK_BYTES clamp (the historical \
+                hard cap, unchanged by the M9 budget default flip). The cap is \
+                what bounds a huge byte budget: at ~1 KiB average rows a 64 MiB budget \
+                already saturates it. Raising it toward the file's row count makes the whole \
+                file one chunk = one zone-map/stats entry (no intra-file pruning), one \
+                RowSelection granule and one DECOMPRESSION unit per matched-row point read \
+                (M8 sweep knob). Values below the 64-row floor are raised to the floor; \
+                0 = the 65,536 default."
+    )]
+    pub vix_docs_chunk_max_rows: usize,
+    #[env_config(
+        name = "ZO_VIX_STATS_MIN_DENSITY",
+        default = 0.1,
+        help = "H2 pay-as-you-go per-column chunk stats: presence-density threshold (present \
+                rows / total rows) below which a docs column gets NO per-chunk min/max rows in \
+                the data object's stats blob — it keeps its file-level presence count. Sparse \
+                columns cost a presence entry, never a stats table. 0 = the built-in 0.1."
+    )]
+    pub vix_stats_min_density: f64,
+    #[env_config(
+        name = "ZO_VIX_STATS_MAX_BYTES",
+        default = 1048576,
+        help = "Byte cap of one data object's per-column chunk-stats blob (densest columns are \
+                kept first; the rest keep file-level presence only). Bounds footer-region size \
+                on wide corpora (H2: footer grows sub-linearly with column count). 0 = the \
+                built-in 1 MiB."
+    )]
+    pub vix_stats_max_bytes: usize,
     #[env_config(
         name = "ZO_VIX_READ_MODE",
         default = "ranged",
@@ -1444,6 +1784,28 @@ pub struct Common {
                 when many ZO_COMPACT_WORKER_NUM workers merge concurrently."
     )]
     pub vix_merge_thread_num: usize,
+    #[env_config(
+        name = "ZO_VIX_MERGE_KWAY_THREADS",
+        default = 0,
+        help = "#51b: range parallelism of the compaction term-dictionary k-way merge — \
+                the output key space splits into real-key ranges merged concurrently. \
+                0 = min(available parallelism, 8); 1 = exactly one range (the sequential \
+                path). Always additionally capped by the per-merge thread budget \
+                (ZO_VIX_MERGE_THREAD_NUM), so it stacks with it rather than widening it."
+    )]
+    pub vix_merge_kway_threads: usize,
+    #[env_config(
+        name = "ZO_VIX_REBUILD_CONCURRENCY",
+        default = 0,
+        help = "M12: process-wide admission for REBUILD-path compaction merges (decode + \
+                re-derive terms from _source — the memory-heavy shape; the dev launch's \
+                first-hour OOM wave was 8 concurrent first-gen rebuilds over multi-GB \
+                groups). At most this many rebuilds run at once; extra rebuild-path \
+                merges WAIT (their worker blocks) while passthrough/k-way fast-path \
+                merges stay unthrottled. 0 = auto: max(1, ZO_FILE_MERGE_THREAD_NUM / 2). \
+                Always admits at least one."
+    )]
+    pub vix_rebuild_concurrency: usize,
     #[env_config(
         name = "ZO_VIX_BUILD_THREAD_NUM",
         default = 0,
@@ -1699,6 +2061,12 @@ pub struct Limit {
         help = "MemTable bucket num, default is 1"
     )] // default is 1
     pub mem_table_bucket_num: usize,
+    #[env_config(
+        name = "ZO_SEGMENT_SCAN_MAX_BYTES",
+        default = 536870912,
+        help = "Soft per-query budget (bytes) on not-yet-sealed live data one segment scan may keep; crossing it logs a warning and the query CONTINUES (0 disables the warning). The hard stop is half the pod's cgroup memory limit."
+    )]
+    pub segment_scan_max_bytes: usize,
     #[env_config(name = "ZO_MEM_PERSIST_INTERVAL", default = 2)] // seconds
     pub mem_persist_interval: u64,
     #[env_config(name = "ZO_WAL_WRITE_BUFFER_SIZE", default = 16384)] // 16 KB
@@ -1730,6 +2098,42 @@ pub struct Limit {
     pub usage_reporting_thread_num: usize,
     #[env_config(name = "ZO_QUERY_THREAD_NUM", default = 0)]
     pub query_thread_num: usize,
+    #[env_config(
+        name = "ZO_QUERY_MAX_CONCURRENCY",
+        default = 30,
+        help = "Max concurrent queries this node LEADS (SQL + promql). Requests past the limit get HTTP 429 immediately — no queueing (0 = unlimited). Since .80: replaces the global cluster query queue."
+    )]
+    pub query_max_concurrency: usize,
+    #[env_config(
+        name = "ZO_VIX_EAGER_TAIL_BYTES",
+        default = 262144,
+        help = "Eager tail fetch size for ranged .vix opens (bytes; 0 = built-in 64KiB). Index blobs cluster at the file's end, so a tail covering them turns a cold open + term eval into one ranged GET on small files."
+    )]
+    pub vix_eager_tail_bytes: u64,
+    #[env_config(
+        name = "ZO_WARMUP_CACHE_HOURS",
+        default = 0,
+        help = "Queriers prefetch the .vix index metadata (footer + directory tail) for THEIR consistent-hash share of the last N hours' files right after coming online, so post-roll cold starts serve index queries warm (0 = off). Best-effort background task; never blocks readiness."
+    )]
+    pub warmup_cache_hours: usize,
+    #[env_config(
+        name = "ZO_WARMUP_CACHE_MAX_FILES",
+        default = 50000,
+        help = "Upper bound on files one warmup pass opens (newest first)."
+    )]
+    pub warmup_cache_max_files: usize,
+    #[env_config(
+        name = "ZO_WARMUP_CACHE_CONCURRENCY",
+        default = 4,
+        help = "Concurrent index-metadata prefetches during warmup."
+    )]
+    pub warmup_cache_concurrency: usize,
+    #[env_config(
+        name = "ZO_QUERY_HTTP_HEARTBEAT_SECS",
+        default = 5,
+        help = "Oneshot /_search responses still running after this many seconds switch to a streamed body emitting a whitespace heartbeat every 2s, so a vanished HTTP/1.1 client fails the write and the query cancels server-side. Within the grace period status codes stay exact; after it, errors arrive in-body on a 200 (the code field). 0 disables."
+    )]
+    pub query_http_heartbeat_secs: u64,
     #[env_config(
         name = "ZO_VIX_SEARCH_CONCURRENCY",
         default = 0,
@@ -1827,7 +2231,12 @@ pub struct Limit {
     pub metrics_cache_max_entries: usize,
     #[env_config(name = "ZO_METRICS_INLIST_FILTER_ENABLED", default = false)]
     pub metrics_inlist_filter_enabled: bool,
-    #[env_config(name = "ZO_COLS_PER_RECORD_LIMIT", default = 1000)]
+    // Default raised 1000 -> 65536 (owner call 2026-08-12): the old limit
+    // silently discarded k8s audit records with >1000 flattened keys
+    // (thousands/burst on eks_audit_log). Kept as a backstop against truly
+    // pathological million-key records; per-record cost scales only with
+    // PRESENT fields under narrow-schema WAL batches.
+    #[env_config(name = "ZO_COLS_PER_RECORD_LIMIT", default = 65536)]
     pub req_cols_per_record_limit: usize,
     #[env_config(name = "ZO_NODE_HEARTBEAT_TTL", default = 30)] // seconds
     pub node_heartbeat_ttl: i64,
@@ -2006,6 +2415,15 @@ pub struct Limit {
         help = "Seconds, Maximum acquire timeout of individual connections."
     )]
     pub sql_db_connections_acquire_timeout: u64,
+    #[env_config(
+        name = "ZO_META_IDLE_IN_TXN_TIMEOUT_SECS",
+        default = 120,
+        help = "Seconds before postgres kills a session idling INSIDE a transaction \
+                (app-owned guard set per connection; 0 disables). Sessions of killed \
+                pods otherwise hold their locks until TCP timeout (~30 min) and wedge \
+                every claimer fleet-wide."
+    )]
+    pub sql_db_idle_in_txn_timeout_secs: u64,
     #[env_config(
         name = "ZO_META_CONNECTION_POOL_IDLE_TIMEOUT",
         default = 0,
@@ -2228,6 +2646,19 @@ pub struct Compact {
     #[env_config(name = "ZO_COMPACT_OLD_DATA_INTERVAL", default = 3600)] // seconds
     pub old_data_interval: u64,
     #[env_config(
+        name = "ZO_COMPACT_MERGE_DEBT_INTERVAL",
+        default = 60,
+        help = "M29: seconds between merge-debt sweeps. Each sweep re-enqueues a merge job \
+                for EVERY closed hour in the retention window that still holds >= \
+                ZO_COMPACT_OLD_DATA_MIN_FILES small files (oldest hours first), so a \
+                partially merged or late-filled hour is revisited within this interval \
+                instead of waiting for the hourly old-data pass (and instead of the \
+                ZO_COMPACT_OLD_DATA_MIN_HOURS dead zone stranding the newest closed \
+                hours — the hot query window — entirely). Jobs dedup on (stream, hour): \
+                a pending or running hour is never double-enqueued. 0 disables the lane."
+    )]
+    pub merge_debt_interval: u64,
+    #[env_config(
         name = "ZO_COMPACT_BLOOM_BUILD_INTERVAL",
         default = 600,
         help = "Seconds between group .bf bloom-builder passes on the compactor (0 disables)."
@@ -2255,6 +2686,16 @@ pub struct Compact {
     pub sync_to_db_interval: u64,
     #[env_config(name = "ZO_COMPACT_MAX_FILE_SIZE", default = 2048)] // MB
     pub max_file_size: usize,
+    #[env_config(
+        name = "ZO_COMPACT_DOWNLOAD_BUDGET_MB",
+        default = 2048,
+        help = "Process-wide cap (MB) on in-flight compaction download bytes across ALL merge \
+                jobs: a download admits when its file's compressed_size fits the remaining \
+                budget (a worker holding nothing always admits one, so oversize files cannot \
+                starve). 0 = unlimited. The per-job concurrency semaphore still caps \
+                parallelism; this caps bytes (H3, 2026-08-17 compactor OOM)."
+    )]
+    pub download_budget_mb: usize,
     #[env_config(name = "ZO_COMPACT_EXTENDED_DATA_RETENTION_DAYS", default = 3650)] // days
     pub extended_data_retention_days: i64,
     #[env_config(name = "ZO_COMPACT_OLD_DATA_STREAMS", default = "")] // use comma to split
@@ -2294,6 +2735,16 @@ pub struct Compact {
     )]
     pub batch_size: i64,
     #[env_config(
+        name = "ZO_COMPACT_MAX_FILE_COUNT",
+        default = 128,
+        help = "Max INPUT FILES one merge batch takes (0 = bytes-only batching). The \
+                byte budget alone let sliver-debt hours pack 1,600+ small files into \
+                ONE k-way merge — memory scales with merge width (OOMKilled at 16Gi, \
+                dev 2026-08-13) and heap CPU superlinearly. Oversized groups split \
+                into multiple passes instead."
+    )]
+    pub max_file_count: i64,
+    #[env_config(
         name = "ZO_COMPACT_JOB_RUN_TIMEOUT",
         default = 600, // 10 minutes
         help = "If a compact job is not finished in this time, it will be marked as failed"
@@ -2319,14 +2770,34 @@ pub struct Compact {
 
 #[derive(Serialize, EnvConfig, Default)]
 pub struct CacheLatestFiles {
-    #[env_config(name = "ZO_CACHE_LATEST_FILES_ENABLED", default = false)]
+    // M11 default-on, owner call 2026-08-18: "cache_latest_files default to
+    // true — we need cache latest files."
+    #[env_config(
+        name = "ZO_CACHE_LATEST_FILES_ENABLED",
+        default = true,
+        help = "Broadcast new file_list rows and cache the latest files on their consistent-hash querier; also forces the file_hash query partition strategy so queries land where the cache is. Default ON (owner call 2026-08-18)."
+    )]
     pub enabled: bool,
-    // cache data files (parquet / core .vix)
-    #[env_config(name = "ZO_CACHE_LATEST_FILES_PARQUET", default = true)]
+    // cache data files: the `.vix` data object (or legacy parquet) AND its
+    // `.vxi` index sidecar when the row's index_size > 0 (v2: index_size IS
+    // the sidecar object's exact size, 0 = no sidecar)
+    #[env_config(
+        name = "ZO_CACHE_LATEST_FILES_PARQUET",
+        default = true,
+        help = "Cache the data object (.vix / legacy parquet) and, when the row's index_size > 0, its .vxi index sidecar."
+    )]
     pub cache_parquet: bool,
-    #[env_config(name = "ZO_CACHE_LATEST_FILES_DELETE_MERGE_FILES", default = false)]
+    #[env_config(
+        name = "ZO_CACHE_LATEST_FILES_DELETE_MERGE_FILES",
+        default = true,
+        help = "Evict merge inputs (data object + .vxi sidecar) from local caches when a merge broadcast replaces them. Default ON with the 2026-08-18 owner flip so caches drop inputs a merge superseded."
+    )]
     pub delete_merge_files: bool,
-    #[env_config(name = "ZO_CACHE_LATEST_FILES_DOWNLOAD_FROM_NODE", default = false)]
+    #[env_config(
+        name = "ZO_CACHE_LATEST_FILES_DOWNLOAD_FROM_NODE",
+        default = false,
+        help = "Peer-to-peer cache fill from the broadcasting node. HELD BACK by the owner at the 2026-08-18 default flip: stays OFF at launch, queriers fill straight from object storage."
+    )]
     pub download_from_node: bool,
     #[env_config(name = "ZO_CACHE_LATEST_FILES_DOWNLOAD_NODE_SIZE", default = 100)] // MB
     pub download_node_size: i64,
@@ -3072,7 +3543,11 @@ fn check_limit_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
     }
 
     if cfg.limit.sql_db_connections_max == 0 {
-        cfg.limit.sql_db_connections_max = cpu_num as u32 * 4;
+        // auto = cpu*4 CAPPED at 32: uncapped, every 16-core pod could open
+        // 64 conns per pool (× two pools) and a 50-pod fleet parked ~750
+        // mostly-idle connections on the shared meta RDS (prod 2026-08-13).
+        // An explicit env value still wins uncapped.
+        cfg.limit.sql_db_connections_max = (cpu_num as u32 * 4).min(32);
     }
     cfg.limit.sql_db_connections_max =
         max(REQUIRED_DB_CONNECTIONS, cfg.limit.sql_db_connections_max);
@@ -3149,7 +3624,14 @@ fn check_common_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
         cfg.limit.file_push_interval = 60;
     }
     if cfg.limit.req_cols_per_record_limit == 0 {
-        cfg.limit.req_cols_per_record_limit = 1000;
+        cfg.limit.req_cols_per_record_limit = 65536;
+    }
+    // ingest admission projection factors must be at least 1x
+    if cfg.common.ingest_admission_expansion_factor == 0 {
+        cfg.common.ingest_admission_expansion_factor = 1;
+    }
+    if cfg.common.ingest_admission_compressed_factor == 0 {
+        cfg.common.ingest_admission_compressed_factor = 1;
     }
 
     // check max_file_size_on_disk to MB
@@ -3206,6 +3688,11 @@ fn check_common_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
             cfg.common.segment_build_batch
         ));
     }
+    // M12 item 5: floor 1 — a zero would stall the small-build stream
+    cfg.common.segment_build_concurrency = cfg.common.segment_build_concurrency.max(1);
+    // M13 item 1c: floor 1 — a zero would stall fetch+decode entirely
+    cfg.common.segment_fetch_decode_concurrency =
+        cfg.common.segment_fetch_decode_concurrency.max(1);
     if cfg.common.segment_build_lease_secs < 30 {
         return Err(anyhow::anyhow!(
             "ZO_SEGMENT_BUILD_LEASE_SECS must be at least 30, got {}",
@@ -3220,6 +3707,16 @@ fn check_common_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
             "ZO_SEGMENT_BUILD_MAX_WAIT_SECS must be at most 300, got {}",
             cfg.common.segment_build_max_wait_secs
         ));
+    }
+    // M13 aging lane: the ratio is a fraction of claim passes — clamp
+    // silently (NaN and negatives disable the lane rather than erroring;
+    // >1.0 means every engaged pass)
+    if !cfg.common.segment_build_age_lane_ratio.is_finite()
+        || cfg.common.segment_build_age_lane_ratio < 0.0
+    {
+        cfg.common.segment_build_age_lane_ratio = 0.0;
+    } else if cfg.common.segment_build_age_lane_ratio > 1.0 {
+        cfg.common.segment_build_age_lane_ratio = 1.0;
     }
     if cfg.common.segment_retain_secs < 60 {
         return Err(anyhow::anyhow!(
@@ -3798,11 +4295,11 @@ fn check_disk_cache_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
 }
 
 fn check_compact_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
-    if cfg.compact.data_retention_days > 0 && cfg.compact.data_retention_days < 3 {
-        return Err(anyhow::anyhow!(
-            "Data retention is not allowed to be less than 3 days."
-        ));
-    }
+    // M19: any retention >= 1 day is valid (0/negative = disabled). The old
+    // 3-day floor predates the v2 era: the fleet runs engine-owned 1-day
+    // retention as the PRIMARY row+object lifecycle, with the S3 lifecycle
+    // rules kept at 2 days purely as the safety net — a 1-day setting must
+    // not be rejected at startup.
     if cfg.compact.interval < 1 {
         cfg.compact.interval = 10;
     }
@@ -4048,6 +4545,129 @@ pub fn ensure_not_empty(s: &str, name: &str) -> Result<(), anyhow::Error> {
 mod tests {
     use super::*;
 
+    /// M11 launch defaults (OWNER 2026-08-18: "cache_latest_files default
+    /// to true — we need cache latest files"): caching + merge-input
+    /// eviction ON, peer-to-peer fill explicitly HELD BACK.
+    #[test]
+    fn cache_latest_files_defaults_m11() {
+        let cfg = Config::init().unwrap();
+        assert!(cfg.cache_latest_files.enabled, "M11: caching defaults ON");
+        assert!(
+            cfg.cache_latest_files.cache_parquet,
+            "M11: data-file sub-flag ON (.vix data + .vxi sidecar)"
+        );
+        assert!(
+            cfg.cache_latest_files.delete_merge_files,
+            "M11: merge inputs evicted when replaced"
+        );
+        assert!(
+            !cfg.cache_latest_files.download_from_node,
+            "owner holds peer-to-peer fill back — must stay OFF"
+        );
+    }
+
+    /// M12 item 5 / M17: the per-pod L0 build concurrency is env-tunable
+    /// (`ZO_SEGMENT_BUILD_CONCURRENCY`) — default 16 since M17 (it became
+    /// the SECONDARY count cap under the byte-budget admission), floor 1
+    /// (a zero would stall the small-build stream). One test covers
+    /// default + override + floor sequentially: env vars are
+    /// process-global, so splitting these into parallel tests would race.
+    #[test]
+    fn segment_build_concurrency_default_and_override_m12() {
+        let key = "ZO_SEGMENT_BUILD_CONCURRENCY";
+        // default: 16 (M17 — the byte budget binds, the count cap is wide)
+        unsafe { std::env::remove_var(key) };
+        let cfg = Config::init().unwrap();
+        assert_eq!(cfg.common.segment_build_concurrency, 16);
+
+        // override wins
+        unsafe { std::env::set_var(key, "8") };
+        let cfg = Config::init().unwrap();
+        assert_eq!(cfg.common.segment_build_concurrency, 8);
+
+        // floor: 0 clamps to 1 (mirrors check_common_config)
+        unsafe { std::env::set_var(key, "0") };
+        let mut cfg = Config::init().unwrap();
+        check_common_config(&mut cfg).unwrap();
+        assert_eq!(cfg.common.segment_build_concurrency, 1);
+
+        unsafe { std::env::remove_var(key) };
+    }
+
+    /// M17 item 3: the byte-budget knob — default 0 = auto (40% of
+    /// detected memory, resolved at the consumer), override in MB wins.
+    #[test]
+    fn segment_build_memory_budget_env_m17() {
+        let key = "ZO_SEGMENT_BUILD_MEMORY_BUDGET_MB";
+        unsafe { std::env::remove_var(key) };
+        let cfg = Config::init().unwrap();
+        assert_eq!(cfg.common.segment_build_memory_budget_mb, 0, "0 = auto");
+
+        unsafe { std::env::set_var(key, "6144") };
+        let cfg = Config::init().unwrap();
+        assert_eq!(cfg.common.segment_build_memory_budget_mb, 6144);
+
+        unsafe { std::env::remove_var(key) };
+    }
+
+    /// M13 (1c): fetch+decode concurrency env — default 2 (the pre-M13
+    /// hardcoded constant, byte-for-byte behavior), override wins, floor 1
+    /// clamped at load. One test because env is process-global.
+    #[test]
+    fn segment_fetch_decode_concurrency_default_override_floor_m13() {
+        let key = "ZO_SEGMENT_FETCH_DECODE_CONCURRENCY";
+        unsafe { std::env::remove_var(key) };
+        let cfg = Config::init().unwrap();
+        assert_eq!(cfg.common.segment_fetch_decode_concurrency, 2);
+
+        unsafe { std::env::set_var(key, "8") };
+        let cfg = Config::init().unwrap();
+        assert_eq!(cfg.common.segment_fetch_decode_concurrency, 8);
+
+        unsafe { std::env::set_var(key, "0") };
+        let mut cfg = Config::init().unwrap();
+        check_common_config(&mut cfg).unwrap();
+        assert_eq!(
+            cfg.common.segment_fetch_decode_concurrency, 1,
+            "zero would stall fetch+decode; the floor clamps to 1"
+        );
+
+        unsafe { std::env::remove_var(key) };
+    }
+
+    /// M13 aging lane envs: safe defaults (6h / every 4th pass), override,
+    /// and the [0,1] ratio clamp — one test because env is process-global.
+    #[test]
+    fn segment_build_age_lane_defaults_and_clamp_m13() {
+        let secs_key = "ZO_SEGMENT_BUILD_AGE_LANE_SECS";
+        let ratio_key = "ZO_SEGMENT_BUILD_AGE_LANE_RATIO";
+        unsafe { std::env::remove_var(secs_key) };
+        unsafe { std::env::remove_var(ratio_key) };
+        let cfg = Config::init().unwrap();
+        assert_eq!(cfg.common.segment_build_age_lane_secs, 21600);
+        assert!((cfg.common.segment_build_age_lane_ratio - 0.25).abs() < f64::EPSILON);
+
+        // overrides win
+        unsafe { std::env::set_var(secs_key, "3600") };
+        unsafe { std::env::set_var(ratio_key, "0.5") };
+        let cfg = Config::init().unwrap();
+        assert_eq!(cfg.common.segment_build_age_lane_secs, 3600);
+        assert!((cfg.common.segment_build_age_lane_ratio - 0.5).abs() < f64::EPSILON);
+
+        // ratio clamps into [0, 1] (mirrors check_common_config)
+        unsafe { std::env::set_var(ratio_key, "3.0") };
+        let mut cfg = Config::init().unwrap();
+        check_common_config(&mut cfg).unwrap();
+        assert!((cfg.common.segment_build_age_lane_ratio - 1.0).abs() < f64::EPSILON);
+        unsafe { std::env::set_var(ratio_key, "-0.5") };
+        let mut cfg = Config::init().unwrap();
+        check_common_config(&mut cfg).unwrap();
+        assert_eq!(cfg.common.segment_build_age_lane_ratio, 0.0);
+
+        unsafe { std::env::remove_var(secs_key) };
+        unsafe { std::env::remove_var(ratio_key) };
+    }
+
     #[test]
     fn test_config_static_uses_std_lazylock_api() {
         let cfg = std::sync::LazyLock::force(&CONFIG).load();
@@ -4120,11 +4740,13 @@ mod tests {
         let ret = check_common_config(&mut cfg);
         assert!(ret.is_ok());
         assert_eq!(cfg.compact.data_retention_days, 10);
-        assert_eq!(cfg.limit.req_cols_per_record_limit, 1000);
+        assert_eq!(cfg.limit.req_cols_per_record_limit, 65536);
 
+        // M19: short engine retention is valid (1-day is the v2 ops plan)
         cfg.compact.data_retention_days = 2;
         let ret = check_compact_config(&mut cfg);
-        assert!(ret.is_err());
+        assert!(ret.is_ok());
+        assert_eq!(cfg.compact.data_retention_days, 2);
 
         cfg.common.data_dir = "".to_string();
         let ret = check_path_config(&mut cfg);
@@ -4653,12 +5275,16 @@ mod tests {
     }
 
     #[test]
-    fn test_check_compact_config_retention_too_short() {
+    fn test_check_compact_config_short_retention_allowed() {
+        // M19: engine-owned retention runs at 1 day in the v2 era (S3
+        // lifecycle at 2 days is only the backstop) — short values are valid
         let mut cfg = Config::default();
         cfg.compact.data_retention_days = 1;
-        assert!(check_compact_config(&mut cfg).is_err());
+        assert!(check_compact_config(&mut cfg).is_ok());
+        assert_eq!(cfg.compact.data_retention_days, 1);
         cfg.compact.data_retention_days = 2;
-        assert!(check_compact_config(&mut cfg).is_err());
+        assert!(check_compact_config(&mut cfg).is_ok());
+        assert_eq!(cfg.compact.data_retention_days, 2);
     }
 
     #[test]
@@ -4701,6 +5327,37 @@ mod tests {
             cfg.limit.ingest_allowed_in_future_micro,
             2 * 3600 * 1_000_000
         );
+    }
+
+    /// M20b pin: the ingest window defaults must stay at 5h back / 24h ahead
+    /// — the traces span clamp (core::traces::SpanTsClamp) and every logs
+    /// ingest path share these limits — and the ZO_INGEST_ALLOWED_UPTO env
+    /// override must propagate into the derived micros the clamps consume.
+    /// One test covers default + override sequentially: env vars are
+    /// process-global, so splitting these into parallel tests would race
+    /// (the M12 segment_build_concurrency pin set the pattern).
+    #[test]
+    fn test_ingest_allowed_upto_default_and_override_m20b() {
+        // default: 5h back / 24h ahead
+        unsafe { std::env::remove_var("ZO_INGEST_ALLOWED_UPTO") };
+        unsafe { std::env::remove_var("ZO_INGEST_ALLOWED_IN_FUTURE") };
+        let mut cfg = Config::init().unwrap();
+        check_limit_config(&mut cfg).unwrap();
+        assert_eq!(cfg.limit.ingest_allowed_upto, 5);
+        assert_eq!(cfg.limit.ingest_allowed_upto_micro, 5 * 3600 * 1_000_000);
+        assert_eq!(cfg.limit.ingest_allowed_in_future, 24);
+        assert_eq!(
+            cfg.limit.ingest_allowed_in_future_micro,
+            24 * 3600 * 1_000_000
+        );
+
+        // override wins and propagates into the derived micros
+        unsafe { std::env::set_var("ZO_INGEST_ALLOWED_UPTO", "7") };
+        let mut cfg = Config::init().unwrap();
+        unsafe { std::env::remove_var("ZO_INGEST_ALLOWED_UPTO") };
+        check_limit_config(&mut cfg).unwrap();
+        assert_eq!(cfg.limit.ingest_allowed_upto, 7);
+        assert_eq!(cfg.limit.ingest_allowed_upto_micro, 7 * 3600 * 1_000_000);
     }
 
     #[test]

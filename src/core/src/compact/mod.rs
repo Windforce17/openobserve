@@ -36,6 +36,7 @@ use crate::service::db;
 
 pub mod bloom;
 pub mod deleted;
+pub(crate) mod download_budget;
 pub mod dump;
 pub mod incremental;
 pub mod merge;
@@ -101,6 +102,10 @@ pub async fn run_retention() -> Result<(), anyhow::Error> {
 
 /// Generate job for compactor
 pub async fn run_generate_job(job_type: CompactionJobType) -> Result<(), anyhow::Error> {
+    // M29 debt-sweep tally: hours with standing merge debt across all owned
+    // streams this pass — ONE info line per pass (house log discipline),
+    // per-hour detail stays at debug in the generator.
+    let mut debt_hours = 0usize;
     let orgs = db::schema::list_organizations_from_cache().await;
     for org_id in orgs {
         // check backlist
@@ -184,9 +189,29 @@ pub async fn run_generate_job(job_type: CompactionJobType) -> Result<(), anyhow:
                             );
                         }
                     }
+                    CompactionJobType::Debt => {
+                        match merge::generate_merge_debt_job_by_stream(
+                            &org_id,
+                            stream_type,
+                            &stream_name,
+                        )
+                        .await
+                        {
+                            Ok(n) => debt_hours += n,
+                            Err(e) => {
+                                log::error!(
+                                    "[COMPACTOR] generate_merge_debt_job_by_stream [{org_id}/{stream_type}/{stream_name}] error: {e}"
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
+    }
+
+    if debt_hours > 0 {
+        log::info!("[COMPACTOR] merge-debt sweep: {debt_hours} hours enqueued/refreshed");
     }
 
     Ok(())

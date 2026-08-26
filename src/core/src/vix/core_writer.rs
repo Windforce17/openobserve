@@ -51,7 +51,7 @@ use std::{
     cmp::Ordering,
     collections::{BinaryHeap, VecDeque},
     sync::{
-        Arc,
+        Arc, Condvar, Mutex,
         mpsc::{Receiver, SyncSender, sync_channel},
     },
 };
@@ -67,7 +67,8 @@ use arrow::{
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use config::{
     ID_COL_NAME, ORIGINAL_DATA_COL_NAME, PARQUET_MAX_ROW_GROUP_SIZE, TIMESTAMP_COL_NAME, cluster,
-    get_config, meta::stream::FileMeta,
+    get_config,
+    meta::stream::{FileMeta, StreamType},
 };
 use datafusion::{catalog::TableProvider, physical_plan::execute_stream};
 pub use vortex_index::VixOutput;
@@ -78,7 +79,7 @@ use vortex_index::{
 
 use crate::search::datafusion::{
     exec::DataFusionContextBuilder, source_synthesis::synthesize_source,
-    table_provider::uniontable::NewUnionTable, vix_format::derive_cs_column_from_source,
+    table_provider::uniontable::NewUnionTable,
 };
 
 /// Maximum rows of one docs batch pushed into the writer by the core-file
@@ -103,6 +104,33 @@ const DOCS_BATCH_BYTES: usize = 256 * 1024 * 1024;
 struct BatchCaps {
     rows: usize,
     bytes: usize,
+    /// Test seam: force the build's index policy instead of resolving
+    /// [`vix_build_index_enabled`] from the live config (env-backed sets
+    /// are process-global, so tests cannot toggle them safely). `None` in
+    /// every production call.
+    index_enabled_override: Option<bool>,
+    /// Test seam (#52): comma list of bloom-only fields injected into the
+    /// merge writer options (env-backed config is process-global, so tests
+    /// cannot toggle `ZO_VIX_BLOOM_ONLY_FIELDS` safely). `None` in every
+    /// production call.
+    bloom_only_override: Option<&'static str>,
+    /// Test seam (#52/M7): `(auto_ratio, min_distinct)` injected into the
+    /// writer options on BOTH the build and merge paths — drives the
+    /// first-encode AUTO demotion and the merge-time input-dictionary AUTO
+    /// without touching the process-global env config (whose v2 defaults,
+    /// ratio 0.5 / floor 65536, keep AUTO out of small-data tests). `None`
+    /// in every production call.
+    bloom_auto_override: Option<(f64, u64)>,
+    /// Test seam: disable the #46 column-derived rebuild so a test can
+    /// produce the SOURCE-derived output over the same inputs (the parity
+    /// referee). `false` in every production call.
+    force_source_derivation: bool,
+    /// Test seam: disable the docs-chunk passthrough (and with it the
+    /// concatenation fast path) so a test can produce the pure
+    /// decode + re-encode output over the same inputs — the differential
+    /// oracle passthrough outputs are compared against. `false` in every
+    /// production call: passthrough is the DEFAULT merge shape.
+    force_decode: bool,
 }
 
 impl Default for BatchCaps {
@@ -110,6 +138,11 @@ impl Default for BatchCaps {
         Self {
             rows: DOCS_BATCH_ROWS,
             bytes: DOCS_BATCH_BYTES,
+            index_enabled_override: None,
+            bloom_only_override: None,
+            bloom_auto_override: None,
+            force_source_derivation: false,
+            force_decode: false,
         }
     }
 }
@@ -123,6 +156,10 @@ pub struct CoreFileResult {
     /// The build output: bytes or a disk spool (upload from its path; the
     /// spool file deletes when this drops). The move job uploads from here.
     pub output: Option<vortex_index::VixOutput>,
+    /// The `.vxi` index-sidecar bytes; `None` for index-off builds
+    /// (#40/#42 — `stats.index_size == 0`). Uploaded AFTER the data object,
+    /// BEFORE the file_list row.
+    pub index: Option<Vec<u8>>,
     pub stats: VixWriterStats,
     /// Compaction marker: `true` when the file's index was produced by the
     /// input-dictionary merge fast path, `false` for a full term rebuild
@@ -167,6 +204,9 @@ impl std::fmt::Debug for CoreFileResult {
 #[derive(Debug)]
 pub struct MergedCoreFile {
     pub output: VixOutput,
+    /// The `.vxi` index-sidecar bytes; `None` for index-off merge plans
+    /// (`stats.index_size == 0`).
+    pub index: Option<Vec<u8>>,
     pub stats: VixWriterStats,
     /// `true` when the index came from the input-dictionary merge fast
     /// path, `false` for a full term rebuild.
@@ -175,41 +215,116 @@ pub struct MergedCoreFile {
     pub docs_batches: usize,
     /// Rows dropped by degenerate-`_timestamp` cleansing.
     pub dropped_rows: u64,
+    /// #51c observability: inputs whose docs rows were copied through the
+    /// encoded-chunk passthrough (no decode, no recompression — the default
+    /// merge shape). `0` when no input qualified (every input decoded).
+    pub docs_passthrough_inputs: usize,
+    /// #51c-c: `true` when the output was written in CONCATENATION order
+    /// (stamped `row_order=concat` — rows not globally time-sorted). `false`
+    /// for every sorted output (disjoint concat of sorted inputs included:
+    /// that order IS globally sorted).
+    pub concat_order: bool,
+    /// M18 observability: column-windows the deterministic slice guard
+    /// canonicalized + recompressed during the encoded-chunk copies (a scan
+    /// window cutting inside one column's stored leaf — the shape that used
+    /// to reach the writer as a non-serializable slice or, worse, as an
+    /// offset-lossy reduced slice). `0` when every copied window was
+    /// leaf-aligned.
+    pub docs_sliced_windows: u64,
+    /// M18 observability: encoded column chunks the passthrough WRITE
+    /// strategy re-encoded because their tree carried an encoding the file
+    /// writer cannot serialize (per-chunk fail-open backstop; the loud prod
+    /// ".110 vortex.slice not permitted by ctx" class). With the scan-side
+    /// guard upstream this should stay `0` — nonzero means a wrapper shape
+    /// the scan did not predict, worth a look at debug logs.
+    pub docs_failopen_chunks: u64,
+}
+
+/// Whether core files of `stream_type` carry a term index at all (#40):
+/// stream types named in `ZO_VIX_INDEX_DISABLED_STREAM_TYPES` (default:
+/// metrics) write COLUMN-STORE-ONLY files — no dict/terms/bloom blobs,
+/// `index=none` stamped, every schema field materialized as a docs column.
+fn vix_index_enabled(stream_type: StreamType) -> bool {
+    !config::is_vix_index_disabled(stream_type)
+}
+
+/// Whether THIS build-path file (the WAL move job or the segment L0
+/// builder) carries a term index. Two knobs compose: #40's
+/// `ZO_VIX_INDEX_DISABLED_STREAM_TYPES` disables the index at EVERY level
+/// (builds and merges), while #42's `ZO_VIX_L0_INDEX_OFF_STREAM_TYPES`
+/// disables it for ingest-side builds only — merge plans keep resolving
+/// via [`vix_index_enabled`], so #42 files HEAL to indexed as compaction
+/// merges them (index-off inputs force the `_source` rebuild) or as the
+/// single-file sweep classifies them `NeedsRebuild` under an indexed plan.
+fn vix_build_index_enabled(stream_type: StreamType) -> bool {
+    vix_index_enabled(stream_type) && !config::is_vix_l0_index_off(stream_type)
 }
 
 /// The shared [`VixWriterOptions`] of every core-file producer.
 ///
 /// `_original` is never term-indexed, so it is dropped from the full-text
-/// list.
+/// list. `index_enabled` is the stream-type policy resolved by the caller
+/// ([`vix_index_enabled`]): `false` builds a column-store-only file (#40).
+/// Which fields become docs columns is not an option anymore (v2 DESIGN §2:
+/// every schema field is a column).
 fn core_writer_options(
     fts_fields: &[String],
-    column_store_fields: Vec<String>,
     bloom_fields: Vec<String>,
+    index_enabled: bool,
 ) -> VixWriterOptions {
     let cfg = get_config();
     VixWriterOptions {
+        index_enabled,
         bloom_field_names: bloom_fields,
+        bloom_composite: cfg.common.vix_bloom_composite,
+        bloom_only_field_names: cfg
+            .common
+            .vix_bloom_only_fields
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
+        bloom_only_never: cfg
+            .common
+            .vix_bloom_only_never
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
+        // #52/M7 first-encode AUTO demotion (the writer applies the shared
+        // rule to its own term map at finish; merge plans ALSO apply it to
+        // input dictionaries in build_merge_plan)
+        bloom_only_auto_ratio: cfg.common.vix_bloom_only_auto_ratio,
+        bloom_only_min_distinct: cfg.common.vix_bloom_only_min_distinct,
         bloom_fpp: cfg.common.vix_bloom_fpp,
         fts_field_names: fts_fields
             .iter()
             .filter(|f| f.as_str() != ORIGINAL_DATA_COL_NAME)
             .cloned()
             .collect(),
-        column_store_field_names: column_store_fields,
         postings_chunk_bytes: cfg.common.vix_postings_chunk_bytes,
         max_raw_term_len: cfg.common.vix_max_raw_term_len,
         row_group_size: PARQUET_MAX_ROW_GROUP_SIZE,
         docs_chunk_bytes: cfg.common.vix_docs_chunk_bytes,
+        docs_chunk_max_rows: cfg.common.vix_docs_chunk_max_rows,
         min_token_len: cfg.limit.inverted_index_min_token_length,
         max_token_len: cfg.limit.inverted_index_max_token_length,
         // #15 rollout discipline: default 0 keeps the out-of-row postings
         // writer dark; flip ZO_VIX_PLIST_MIN_DOCS only after the release
         // carrying pointer-cell read support is on EVERY pod.
         postings_plist_min_docs: cfg.common.vix_plist_min_docs as u32,
+        // H2 per-column chunk stats (pay-as-you-go density + byte cap)
+        stats_min_density: cfg.common.vix_stats_min_density,
+        stats_max_bytes: cfg.common.vix_stats_max_bytes,
         // Single-file build (move job): parallelize the `docs`/index blob
         // encode across cores when spare parallelism exists. The compaction
         // merge overrides this with merge_threads() in build_merge_plan.
         encode_threads: build_encode_threads(),
+        // #51b: only the compaction merge consumes this; build_merge_plan
+        // overrides it from ZO_VIX_MERGE_KWAY_THREADS
+        merge_kway_threads: 0,
         // 0 = the writer's default sample budget (tests shrink it)
         docs_encode_sample_bytes: 0,
         // move-job builds never spill terms (small dictionaries); the
@@ -219,8 +334,102 @@ fn core_writer_options(
         term_spill_dir: None,
         term_spill_bytes: 0,
         output_spool_dir: None,
+        // #51c: never a producer default — the compaction merge's disjoint
+        // arm flips it per merge when the gate says so
+        // (merge_core_files_indexed).
+        docs_passthrough: false,
+        // #51c-c: never a producer default — only the compaction merge's
+        // concatenation path stamps its writer concat (qualify_concat_fast_
+        // path / qualify_heal_passthrough / the forced-concat rebuild).
+        concat_row_order: false,
+        // §4: every core-file producer here upholds the all-present-columns
+        // invariant (DESIGN §2: docs schema = union of the batches' present
+        // fields), which licenses the query path's absent-column file skip.
+        // build_merge_plan demotes this to the AND over its inputs — an
+        // incomplete input's `_source` rows can hide fields that never
+        // became columns, and a decode-merge carries them along.
+        columns_complete: true,
     }
 }
+
+/// M12 rebuild admission: a process-wide cap on CONCURRENT rebuild-path
+/// merges (`ZO_VIX_REBUILD_CONCURRENCY`; 0 = auto: max(1,
+/// ZO_FILE_MERGE_THREAD_NUM / 2); always ≥ 1). The dev-launch OOM wave was
+/// 8 concurrent first-gen rebuilds over multi-GB groups: each rebuild's
+/// working set (windowed decode staging + `_source` term derivation + term
+/// map) is individually bounded by the batch caps and the term-spill
+/// budget, but the incident dimension was the NUMBER of such footprints
+/// stacking — the H3 byte budget bounds downloads, not per-rebuild working
+/// memory. A concurrency cap bounds the stack count exactly, with none of
+/// the 5-10x per-stream error a `original_size × factor` byte estimate
+/// carries (vpc-flow vs traces arrow expansion measured that far apart).
+/// Fast-path (passthrough + k-way) merges never touch this gate.
+struct RebuildGate {
+    permits: parking_lot::Mutex<usize>,
+    cv: parking_lot::Condvar,
+    max: usize,
+}
+
+struct RebuildPermit<'a>(&'a RebuildGate);
+
+impl RebuildGate {
+    fn new(max: usize) -> Self {
+        Self {
+            permits: parking_lot::Mutex::new(max),
+            cv: parking_lot::Condvar::new(),
+            max,
+        }
+    }
+
+    /// Block the calling (merge worker) thread until a rebuild slot frees.
+    /// Blocking is the mechanism, not an accident: the worker holds nothing
+    /// else, and at least one permit always exists, so progress is
+    /// guaranteed while the queue drains one bounded rebuild at a time.
+    fn acquire(&self) -> RebuildPermit<'_> {
+        let started = std::time::Instant::now();
+        let mut permits = self.permits.lock();
+        while *permits == 0 {
+            self.cv.wait(&mut permits);
+        }
+        *permits -= 1;
+        let in_flight = self.max - *permits;
+        drop(permits);
+        let waited = started.elapsed();
+        if waited > std::time::Duration::from_millis(50) {
+            log::info!(
+                "vix merge: rebuild admitted after {waited:?} wait ({in_flight}/{} slots busy)",
+                self.max
+            );
+        } else {
+            log::debug!(
+                "vix merge: rebuild admitted ({in_flight}/{} slots busy)",
+                self.max
+            );
+        }
+        RebuildPermit(self)
+    }
+}
+
+impl Drop for RebuildPermit<'_> {
+    fn drop(&mut self) {
+        let mut permits = self.0.permits.lock();
+        *permits += 1;
+        drop(permits);
+        self.0.cv.notify_one();
+    }
+}
+
+static REBUILD_GATE: std::sync::LazyLock<RebuildGate> = std::sync::LazyLock::new(|| {
+    let cfg = get_config();
+    let configured = cfg.common.vix_rebuild_concurrency;
+    let max = if configured > 0 {
+        configured
+    } else {
+        // file_merge_thread_num is already auto-resolved (>0) at config load
+        std::cmp::max(1, cfg.limit.file_merge_thread_num / 2)
+    };
+    RebuildGate::new(max.max(1))
+});
 
 /// Threads of one compaction merge (`ZO_VIX_MERGE_THREAD_NUM`; `0` = auto).
 /// Drives the term-dictionary merge partitioning, the per-input decode fan-out
@@ -324,18 +533,6 @@ pub fn apply_core_stats_to_meta(
     Ok(())
 }
 
-/// The column-store field list actually written: the stream's configured
-/// fields plus `_o2_id` when the data carries it — `_o2_id` is excluded from
-/// `_source` (internal dedup handle), so the docs column is its only home in
-/// a core file.
-fn effective_column_store_fields(column_store_fields: &[String], has_o2_id: bool) -> Vec<String> {
-    let mut fields = column_store_fields.to_vec();
-    if has_o2_id && !fields.iter().any(|f| f == ID_COL_NAME) {
-        fields.push(ID_COL_NAME.to_string());
-    }
-    fields
-}
-
 /// Move-job producer: merge the WAL batches behind `tables` (same table
 /// providers the parquet path builds) into ONE core `.vix` file.
 ///
@@ -345,22 +542,32 @@ fn effective_column_store_fields(column_store_fields: &[String], has_o2_id: bool
 /// `store_original` is the stream's `store_original_data` setting — it is
 /// also force-enabled when the inputs already carry an `_original` column,
 /// so a mid-hour settings flip never drops captured data.
+///
+/// EVERY plan field materializes as a docs column (v2 all-present-columns,
+/// DESIGN §2) — under narrow-schema WAL batches the plan schema is the
+/// union of PRESENT fields, so files stay hundreds of columns wide, never
+/// registry-wide. `stream_type` resolves the BUILD-path index policy
+/// ([`vix_build_index_enabled`]): #40 stream types (metrics by default)
+/// and #42 L0-mode stream types build a column-store-only file. #42 files
+/// re-index when compaction merges them (merge plans resolve
+/// [`vix_index_enabled`]).
+#[allow(clippy::too_many_arguments)]
 pub async fn write_core_file_from_tables(
     trace_id: &str,
+    stream_type: StreamType,
     schema: Arc<Schema>,
     tables: Vec<Arc<dyn TableProvider>>,
     fts_fields: &[String],
-    column_store_fields: &[String],
     bloom_fields: &[String],
     store_original: bool,
     input_original_bytes: usize,
 ) -> Result<CoreFileResult, anyhow::Error> {
     write_core_file_from_tables_with_caps(
         trace_id,
+        stream_type,
         schema,
         tables,
         fts_fields,
-        column_store_fields,
         bloom_fields,
         store_original,
         input_original_bytes,
@@ -371,12 +578,13 @@ pub async fn write_core_file_from_tables(
 
 /// [`write_core_file_from_tables`] with explicit batch caps (tests shrink
 /// them to prove the byte-bounded chunked flow with small data).
+#[allow(clippy::too_many_arguments)]
 async fn write_core_file_from_tables_with_caps(
     trace_id: &str,
+    stream_type: StreamType,
     schema: Arc<Schema>,
     tables: Vec<Arc<dyn TableProvider>>,
     fts_fields: &[String],
-    column_store_fields: &[String],
     bloom_fields: &[String],
     store_original: bool,
     input_original_bytes: usize,
@@ -396,7 +604,7 @@ async fn write_core_file_from_tables_with_caps(
     let plan_schema = physical_plan.schema();
 
     let mut batch_stream = execute_stream(physical_plan, ctx.task_ctx())?;
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<RecordBatch>(2);
+    let (tx, rx) = tokio::sync::mpsc::channel::<RecordBatch>(2);
     let read_task = tokio::task::spawn(async move {
         while let Some(batch) = futures::TryStreamExt::try_next(&mut batch_stream).await? {
             if tx.send(batch).await.is_err() {
@@ -406,30 +614,63 @@ async fn write_core_file_from_tables_with_caps(
         Ok::<(), anyhow::Error>(())
     });
 
-    let mut opts = core_writer_options(
-        fts_fields,
-        effective_column_store_fields(
-            column_store_fields,
-            plan_schema.field_with_name(ID_COL_NAME).is_ok(),
-        ),
-        bloom_fields.to_vec(),
-    );
-    // Big batched moves spool the finished container to the WAL volume and
-    // upload from the spool path — the buffered container (plus its upload
-    // clone) was the ingester's next OOM vector once the fields-limit
-    // batching guard retired. Small moves keep the in-memory path (no extra
-    // disk round-trip); tests and benches pass 0 and never spool.
+    let opts = single_file_build_opts(stream_type, fts_fields, bloom_fields, &caps, input_original_bytes);
+    let store_original =
+        store_original || plan_schema.field_with_name(ORIGINAL_DATA_COL_NAME).is_ok();
+
+    let builder = spawn_core_file_builder(rx, plan_schema, opts, store_original, caps);
+
+    read_task.await??;
+    builder.await?
+}
+
+/// The single-file build options every one-file core build shares (the WAL
+/// mover's DataFusion path and the L0 builder's direct sorted-batch path):
+/// v2 all-present-columns (DESIGN §2 — EVERY plan field becomes a docs
+/// column; under narrow-schema WAL batches the plan schema is the union of
+/// PRESENT fields, so files stay hundreds of columns wide, not
+/// registry-wide), the BUILD-path index policy (#40/#42 stream types build
+/// column-store-only), test-cap overrides, and the output spool decision
+/// (big builds spool the finished container to the WAL volume — the
+/// buffered container plus its upload clone was the ingester's OOM vector).
+fn single_file_build_opts(
+    stream_type: StreamType,
+    fts_fields: &[String],
+    bloom_fields: &[String],
+    caps: &BatchCaps,
+    input_original_bytes: usize,
+) -> VixWriterOptions {
+    let index_enabled = caps
+        .index_enabled_override
+        .unwrap_or_else(|| vix_build_index_enabled(stream_type));
+    let mut opts = core_writer_options(fts_fields, bloom_fields.to_vec(), index_enabled);
+    if let Some((ratio, floor)) = caps.bloom_auto_override {
+        opts.bloom_only_auto_ratio = ratio;
+        opts.bloom_only_min_distinct = floor;
+    }
     let spool_min = get_config().common.vix_move_spool_min_bytes;
     if spool_min > 0 && input_original_bytes >= spool_min {
         opts.output_spool_dir =
             Some(std::path::Path::new(&get_config().common.data_wal_dir).join("vix_spool"));
     }
-    let store_original =
-        store_original || plan_schema.field_with_name(ORIGINAL_DATA_COL_NAME).is_ok();
+    opts
+}
 
-    // All CPU-heavy work — _source synthesis, tokenizing, FST/postings/
-    // vortex encoding — stays off the async runtime.
-    let builder = tokio::task::spawn_blocking(move || {
+/// The shared single-file builder loop, off the async runtime: drain `rx`
+/// record batches — from the mover's DataFusion plan or the L0 builder's
+/// direct slicer, both delivering rows in the stored (`_timestamp` DESC)
+/// order — through degenerate-`_timestamp` cleansing, byte-capped
+/// splitting, `_source` synthesis and the indexed push path into ONE
+/// finished core file. All CPU-heavy work — `_source` synthesis,
+/// tokenizing, FST/postings/vortex encoding — stays on the blocking pool.
+fn spawn_core_file_builder(
+    mut rx: tokio::sync::mpsc::Receiver<RecordBatch>,
+    plan_schema: SchemaRef,
+    opts: VixWriterOptions,
+    store_original: bool,
+    caps: BatchCaps,
+) -> tokio::task::JoinHandle<Result<CoreFileResult, anyhow::Error>> {
+    tokio::task::spawn_blocking(move || {
         // A user field literally named `_source` (pre-guard WAL data — the
         // logs ingest path renames it now) collides with the reserved
         // serialized-record column: rename the column so its values survive
@@ -498,7 +739,7 @@ async fn write_core_file_from_tables_with_caps(
                 docs_batches += 1;
             }
         }
-        let (output, stats) = writer.finish_output()?;
+        let (output, index, stats) = writer.finish_output()?;
         // spooled outputs stay on disk (upload from path); in-memory
         // outputs land in `data` as before
         let (data, output) = match output {
@@ -508,13 +749,105 @@ async fn write_core_file_from_tables_with_caps(
         Ok::<CoreFileResult, anyhow::Error>(CoreFileResult {
             data,
             output,
+            index,
             stats,
             used_index_merge: false,
             docs_batches,
             dropped_rows,
         })
+    })
+}
+
+/// M12 L0-build fast path: build ONE core file from a record batch whose
+/// rows are ALREADY sorted `_timestamp` DESC — the L0 segment builder sorts
+/// its (stream, hour) bucket itself, so the DataFusion `ORDER BY ... DESC`
+/// plan [`write_core_file_from_tables`] runs contributed NOTHING here but
+/// its sort: with `target_partitions` ≥ 2 that plan shape
+/// (`RepartitionExec` feeding two `ExternalSorter`s under
+/// `SortPreservingMergeExec`) starved the shared greedy memory pool on prod
+/// fat-stream super-batches — RepartitionExec buffered ~3 GB it cannot
+/// spill while one sorter held the rest, and the second sorter's FIRST
+/// allocation failed with 0 bytes reserved (nothing of its own to spill).
+/// This entry feeds the SAME builder loop directly in bounded slices: no
+/// plan, no repartition, no sort, no memory-pool interaction at all.
+///
+/// The DESC contract is VERIFIED (one O(rows) pass), not trusted — an
+/// unsorted push would silently store a file violating the v2 row-order
+/// contract.
+pub async fn write_core_file_from_sorted_batch(
+    trace_id: &str,
+    stream_type: StreamType,
+    batch: RecordBatch,
+    fts_fields: &[String],
+    bloom_fields: &[String],
+    store_original: bool,
+    input_original_bytes: usize,
+) -> Result<CoreFileResult, anyhow::Error> {
+    write_core_file_from_sorted_batch_with_caps(
+        trace_id,
+        stream_type,
+        batch,
+        fts_fields,
+        bloom_fields,
+        store_original,
+        input_original_bytes,
+        BatchCaps::default(),
+    )
+    .await
+}
+
+/// [`write_core_file_from_sorted_batch`] with explicit batch caps (tests
+/// shrink them to prove the byte-bounded chunked flow with small data).
+#[allow(clippy::too_many_arguments)]
+async fn write_core_file_from_sorted_batch_with_caps(
+    trace_id: &str,
+    stream_type: StreamType,
+    batch: RecordBatch,
+    fts_fields: &[String],
+    bloom_fields: &[String],
+    store_original: bool,
+    input_original_bytes: usize,
+    caps: BatchCaps,
+) -> Result<CoreFileResult, anyhow::Error> {
+    // verify the caller's DESC contract before anything is built
+    let timestamps = as_int64_array(batch.column_by_name(TIMESTAMP_COL_NAME).ok_or_else(
+        || anyhow::anyhow!("[trace_id {trace_id}] sorted-batch build is missing {TIMESTAMP_COL_NAME:?}"),
+    )?)?;
+    let values = timestamps.values();
+    if values.windows(2).any(|pair| pair[0] < pair[1]) {
+        return Err(anyhow::anyhow!(
+            "[trace_id {trace_id}] sorted-batch build: rows are not sorted {TIMESTAMP_COL_NAME} \
+             DESC (caller contract) — refusing to store an out-of-order file"
+        ));
+    }
+
+    let plan_schema = batch.schema();
+    let opts =
+        single_file_build_opts(stream_type, fts_fields, bloom_fields, &caps, input_original_bytes);
+    let store_original =
+        store_original || plan_schema.field_with_name(ORIGINAL_DATA_COL_NAME).is_ok();
+
+    // Producer: zero-copy row slices in stored order, mirroring the
+    // DataFusion stream's batch granularity so the builder's byte-capped
+    // splitting and `_source` synthesis see the same shapes. The bounded
+    // channel keeps at most a couple of slices' derived state in flight.
+    const SLICE_ROWS: usize = 8192;
+    let (tx, rx) = tokio::sync::mpsc::channel::<RecordBatch>(2);
+    let rows = batch.num_rows();
+    let producer_batch = batch.clone();
+    let read_task = tokio::task::spawn(async move {
+        let mut offset = 0usize;
+        while offset < rows {
+            let len = SLICE_ROWS.min(rows - offset);
+            if tx.send(producer_batch.slice(offset, len)).await.is_err() {
+                break; // builder exited (error on its side); stop feeding
+            }
+            offset += len;
+        }
+        Ok::<(), anyhow::Error>(())
     });
 
+    let builder = spawn_core_file_builder(rx, plan_schema, opts, store_original, caps);
     read_task.await??;
     builder.await?
 }
@@ -716,6 +1049,18 @@ impl MergeSource {
         }
     }
 
+    /// Physical row order of the stored rows (#51c-c, `row_order` property;
+    /// missing == sorted). A [`vortex_index::RowOrder::Concat`] input is NOT
+    /// globally `_timestamp` DESC: the k-way merge order is meaningless
+    /// over it, so such inputs are exempt from the DESC input guard and
+    /// FORCE the concatenation-order merge.
+    fn row_order(&self) -> vortex_index::RowOrder {
+        match self {
+            MergeSource::Indexed(reader) => reader.row_order(),
+            MergeSource::DocsOnly(docs) => docs.row_order(),
+        }
+    }
+
     fn docs_schema(&self) -> Result<SchemaRef, anyhow::Error> {
         match self {
             MergeSource::Indexed(reader) => reader.docs_schema(),
@@ -723,32 +1068,13 @@ impl MergeSource {
         }
     }
 
-    fn term_field_names(&self) -> Vec<String> {
+    /// §4: whether the input asserts the all-present-columns invariant
+    /// (`columns_complete` property) — ANDed into the merge output's own
+    /// assertion by [`build_merge_plan`].
+    fn columns_complete(&self) -> bool {
         match self {
-            MergeSource::Indexed(reader) => reader
-                .term_field_names()
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
-            MergeSource::DocsOnly(_) => Vec::new(),
-        }
-    }
-
-    /// Whether any document of this input carries a (non-null) value at
-    /// `path` — the key-term probe. Docs-only inputs (unreadable index)
-    /// cannot answer and report `false`; they force the rebuild path anyway.
-    fn key_term_exists(&self, path: &str) -> bool {
-        match self {
-            MergeSource::Indexed(reader) => reader.key_term_exists(path).unwrap_or(false),
-            MergeSource::DocsOnly(_) => false,
-        }
-    }
-
-    /// Whether this input marks `name` as partially indexed.
-    fn is_partial_field(&self, name: &str) -> bool {
-        match self {
-            MergeSource::Indexed(reader) => reader.partial_fields().contains(name),
-            MergeSource::DocsOnly(_) => false,
+            MergeSource::Indexed(reader) => reader.columns_complete(),
+            MergeSource::DocsOnly(docs) => docs.columns_complete(),
         }
     }
 
@@ -789,7 +1115,15 @@ impl MergeSource {
 /// disk cache with remote fallback) so input files are never materialized
 /// whole in memory; tests wrap fabricated bytes in
 /// [`vortex_index::BytesRangeSource`].
-pub type MergeInput = (String, Arc<dyn vortex_index::VixRangeSource>);
+/// One merge input: `(object key, data-object source, index-sidecar
+/// source)`. The sidecar source is `Some` iff the file_list row carries
+/// `index_size > 0` (v3 split: the index lives in a separate `.vxi`
+/// object; a data file with none merges through the docs-only rebuild).
+pub type MergeInput = (
+    String,
+    Arc<dyn vortex_index::VixRangeSource>,
+    Option<Arc<dyn vortex_index::VixRangeSource>>,
+);
 
 /// The shared shape of one core-file merge, derived from the inputs and the
 /// current stream settings before either merge strategy runs.
@@ -801,6 +1135,15 @@ struct MergePlan {
     opts: VixWriterOptions,
     /// Row/byte bounds of every staged docs batch.
     caps: BatchCaps,
+    /// #46: every input is an index-off ALL-COLUMNAR file (readable, no
+    /// term index, agreeing term-derivable column types), so the rebuild
+    /// derives terms from the streamed COLUMNS — the cheap column-driven
+    /// path, byte-parity-pinned against the `_source` derivation — instead
+    /// of parsing `_source` JSON per row (measured 5.4× dict-merge cost).
+    /// Any gate miss keeps the source-driven derivation. The preserved
+    /// union IS the derivation column set (v2 all-columns) — no extra
+    /// streamed columns exist.
+    derive_from_columns: bool,
 }
 
 /// Why the index-merge fast path was abandoned.
@@ -833,18 +1176,14 @@ enum IndexedMergeFailure {
 /// overlapping inputs go through the windowed row-interleave path. Either
 /// way the staged batches are bounded by [`BatchCaps`].
 ///
-/// Preserved docs columns: the current `column_store_fields` ∩ the union of
-/// the inputs' available columns, plus `_o2_id` whenever any input stores it
-/// (it is unrecoverable from `_source`). Column types follow the current
-/// stream schema, falling back to the first input that has the column; an
-/// input lacking a column (it predates the field's `column_store_fields`
-/// entry) has it **derived from that input's `_source`**, exactly as a
-/// query-time scan would extract it — never null-filled, because the merged
-/// file's docs column is authoritative for reads. A configured column that
-/// NO input stores is still materialized (derived for every row) when the
-/// current schema types the field and some input carries values — all-old
-/// groups and the single-file healing rebuild converge to current
-/// capabilities. `_original` is preserved whenever any input carries it.
+/// Preserved docs columns (v2 all-present-columns, DESIGN §2/§6): the UNION
+/// of the inputs' docs columns — never the registry. Column types follow
+/// the current stream schema when it types the field, else the first input
+/// that has the column; an input lacking a column contributes NULLS for its
+/// rows (the column was absent from those records — `_source` still carries
+/// whatever each record really held, and the scan-side `json_get(_source)`
+/// fallback keeps serving fields absent from a file's columns).
+/// `_original` is preserved whenever any input carries it.
 ///
 /// **Cleansing**: inputs carrying degenerate-`_timestamp` rows
 /// (`_timestamp <= 0`; the pre-guard mover stored literal zeros behind
@@ -855,18 +1194,23 @@ enum IndexedMergeFailure {
 /// caller commits as "inputs deleted, no output file".
 ///
 /// Synchronous and CPU-bound — call it on a blocking thread.
+///
+/// `stream_type` resolves the index policy (#40): under an index-off plan
+/// the term dictionaries are never touched — docs rows stream through
+/// unchanged (disjoint concat or windowed interleave) and the output is
+/// column-store only, whatever mix of indexed/index-off inputs arrives.
 pub fn merge_core_files(
+    stream_type: StreamType,
     inputs: &[MergeInput],
     latest_schema: &Schema,
     fts_fields: &[String],
-    column_store_fields: &[String],
     bloom_fields: &[String],
 ) -> Result<MergedCoreFile, anyhow::Error> {
     merge_core_files_with_caps(
+        stream_type,
         inputs,
         latest_schema,
         fts_fields,
-        column_store_fields,
         bloom_fields,
         BatchCaps::default(),
     )
@@ -875,10 +1219,10 @@ pub fn merge_core_files(
 /// [`merge_core_files`] with explicit batch caps (tests shrink them to prove
 /// the chunked flow with small data).
 fn merge_core_files_with_caps(
+    stream_type: StreamType,
     inputs: &[MergeInput],
     latest_schema: &Schema,
     fts_fields: &[String],
-    column_store_fields: &[String],
     bloom_fields: &[String],
     caps: BatchCaps,
 ) -> Result<MergedCoreFile, anyhow::Error> {
@@ -890,10 +1234,10 @@ fn merge_core_files_with_caps(
         started.elapsed()
     );
     let plan = build_merge_plan(
+        stream_type,
         &sources,
         latest_schema,
         fts_fields,
-        column_store_fields,
         bloom_fields,
         caps,
     );
@@ -925,18 +1269,23 @@ fn merge_core_files_with_caps(
 /// merged rows. [`merge_core_files`] falls back to this when the index-merge
 /// fast path does not apply; it is public as the reference implementation
 /// (differential tests oracle).
+///
+/// Note the #51c HEAL docs-chunk passthrough lives INSIDE the rebuild
+/// ([`rebuild_over_sources`]): with every input qualified, the terms still
+/// rebuild from the decoded scan but the docs chunks copy verbatim (the
+/// default). Only a qualification miss decodes + re-encodes the docs.
 pub fn merge_core_files_rebuild(
+    stream_type: StreamType,
     inputs: &[MergeInput],
     latest_schema: &Schema,
     fts_fields: &[String],
-    column_store_fields: &[String],
     bloom_fields: &[String],
 ) -> Result<MergedCoreFile, anyhow::Error> {
     merge_core_files_rebuild_with_caps(
+        stream_type,
         inputs,
         latest_schema,
         fts_fields,
-        column_store_fields,
         bloom_fields,
         BatchCaps::default(),
     )
@@ -944,23 +1293,210 @@ pub fn merge_core_files_rebuild(
 
 /// [`merge_core_files_rebuild`] with explicit batch caps.
 fn merge_core_files_rebuild_with_caps(
+    stream_type: StreamType,
     inputs: &[MergeInput],
     latest_schema: &Schema,
     fts_fields: &[String],
-    column_store_fields: &[String],
     bloom_fields: &[String],
     caps: BatchCaps,
 ) -> Result<MergedCoreFile, anyhow::Error> {
     let sources = open_merge_sources(inputs)?;
     let plan = build_merge_plan(
+        stream_type,
         &sources,
         latest_schema,
         fts_fields,
-        column_store_fields,
         bloom_fields,
         caps,
     );
     rebuild_over_sources(inputs, &sources, &plan)
+}
+
+/// Outcome of a sidecar-only heal attempt over ONE stored core file
+/// ([`rebuild_core_file_sidecar`]).
+pub enum SidecarHealOutcome {
+    /// A fresh `.vxi` was built over the UNTOUCHED data object: upload it
+    /// to the SAME sidecar key and update the existing row's `index_size`.
+    Rebuilt {
+        index: Vec<u8>,
+        stats: VixWriterStats,
+    },
+    /// The current plan is index-off but the file carries a sidecar: the
+    /// heal is metadata-only — delete the `.vxi`, set `index_size = 0`.
+    /// (v2 all-columns files already materialize every present field as a
+    /// docs column, so the index-off direction needs no docs rewrite
+    /// either.)
+    DropSidecar,
+    /// This heal genuinely rewrites docs; route it to the whole-file
+    /// rebuild (new data object + new row). The two arms today:
+    /// degenerate-`_timestamp` cleansing, and an index scan whose oversize
+    /// skips the untouched data object's allowance cannot cover.
+    NeedsDocsRewrite(String),
+}
+
+impl std::fmt::Debug for SidecarHealOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rebuilt { index, stats } => f
+                .debug_struct("Rebuilt")
+                .field("index_len", &index.len())
+                .field("stats", stats)
+                .finish(),
+            Self::DropSidecar => write!(f, "DropSidecar"),
+            Self::NeedsDocsRewrite(reason) => {
+                f.debug_tuple("NeedsDocsRewrite").field(reason).finish()
+            }
+        }
+    }
+}
+
+/// M3 sidecar-only heal (DESIGN-V2 §5): rebuild ONLY the `.vxi` index of
+/// one stored core file — terms re-derived from the docs with the CURRENT
+/// stream settings (column-derived when the #46 gate holds, `_source`-
+/// derived otherwise, exactly like the whole-file rebuild) — while the
+/// data object stays byte-identical and keeps its key, so querier caches
+/// of the docs bytes survive the heal by construction.
+///
+/// Doc-id contract: the index-only scan consumes the single input in its
+/// STORED row order (a one-input concatenation — concat-order files
+/// included), so doc ids equal stored positions; the writer's
+/// [`VixWriter::finish_index_sidecar`] verifies the scan covered the data
+/// object's row count exactly.
+///
+/// Falls out to [`SidecarHealOutcome::NeedsDocsRewrite`] when the file
+/// needs what only a docs rewrite can do:
+/// - degenerate-`_timestamp` rows must be CLEANSED (a sidecar cannot drop stored rows);
+/// - the fresh index skipped oversize values in a field the data object's `oversize_skips`
+///   allowance does not record (the allowance rides the data object and cannot be restamped) —
+///   without it readers would read a bloom/dictionary miss on that field as authoritative
+///   absence.
+///
+/// M1-era stats-less data objects stay stats-less (the data object is
+/// untouched by design); they converge at their first real merge.
+///
+/// Blocks on ranged fetches — call from a blocking thread.
+pub fn rebuild_core_file_sidecar(
+    stream_type: StreamType,
+    input: &MergeInput,
+    latest_schema: &Schema,
+    fts_fields: &[String],
+    bloom_fields: &[String],
+) -> Result<SidecarHealOutcome, anyhow::Error> {
+    rebuild_core_file_sidecar_with_caps(
+        stream_type,
+        input,
+        latest_schema,
+        fts_fields,
+        bloom_fields,
+        BatchCaps::default(),
+    )
+}
+
+/// [`rebuild_core_file_sidecar`] with explicit batch caps (test seam).
+fn rebuild_core_file_sidecar_with_caps(
+    stream_type: StreamType,
+    input: &MergeInput,
+    latest_schema: &Schema,
+    fts_fields: &[String],
+    bloom_fields: &[String],
+    caps: BatchCaps,
+) -> Result<SidecarHealOutcome, anyhow::Error> {
+    let started = std::time::Instant::now();
+    let inputs = std::slice::from_ref(input);
+    let sources = open_merge_sources(inputs)?;
+    let plan = build_merge_plan(
+        stream_type,
+        &sources,
+        latest_schema,
+        fts_fields,
+        bloom_fields,
+        caps,
+    );
+
+    // Index-off plan: the heal direction is "drop the sidecar" — pure
+    // metadata, nothing to scan.
+    if !plan.opts.index_enabled {
+        return Ok(SidecarHealOutcome::DropSidecar);
+    }
+
+    // The data object's existing oversize allowance (a DATA-side property):
+    // the new index may only skip within it. DocsOnly sources (unreadable
+    // index) expose none here — conservative: any new skip falls back.
+    let existing_allowance: std::collections::HashSet<String> = match &sources[0] {
+        MergeSource::Indexed(reader) => reader.oversize_skips().keys().cloned().collect(),
+        MergeSource::DocsOnly(_) => Default::default(),
+    };
+
+    // Stored-order scan driver + the cleansing probe (fixed 8 bytes/row).
+    let timestamps = read_timestamp_columns(inputs, &sources)?;
+    let dropped_rows = count_degenerate_ts_rows(&timestamps);
+    if dropped_rows > 0 {
+        return Ok(SidecarHealOutcome::NeedsDocsRewrite(format!(
+            "{dropped_rows} degenerate-_timestamp row(s) must be cleansed, which a sidecar-only \
+             heal cannot express"
+        )));
+    }
+    let row_count = timestamps[0].len() as u64;
+    if row_count != sources[0].row_count() {
+        return Err(anyhow::anyhow!(
+            "core file {} stores {} rows but its container property says {} — refusing the \
+             sidecar heal over inconsistent metadata",
+            input.0,
+            row_count,
+            sources[0].row_count()
+        ));
+    }
+
+    // Index-only writer over the file's OWN stored order: a single input's
+    // concatenation IS its stored order, `row_order=concat` files included
+    // (the k-way merge order is never consulted).
+    let mut writer_opts = plan.opts.clone();
+    // enables the detached index-only pushes (#51c machinery); no docs
+    // store is ever assembled and no data-object property is written
+    writer_opts.docs_passthrough = true;
+    let mut writer = VixWriter::new(&plan.writer_schema, writer_opts, plan.store_original);
+    let order = concat_scan_order(&[0], &timestamps);
+    let scan_windows = if plan.derive_from_columns {
+        log::info!(
+            "vix sidecar heal: deriving terms from {} columns (index-off input)",
+            plan.preserved.len()
+        );
+        stream_merge_windows(inputs, &plan, &order, |ts, cs, source, original| {
+            let batch = derivation_window_batch(ts, cs)?;
+            writer.push_batch_with_source_index_only(&batch, source, original)?;
+            Ok(())
+        })?
+    } else {
+        stream_merge_windows(inputs, &plan, &order, |ts, cs, source, original| {
+            writer.push_docs_rows_index_only(ts, cs, source, original)
+        })?
+    };
+
+    // Oversize coverage: a field the NEW index skipped values from must
+    // already carry the data-side allowance — the untouched data object
+    // cannot be restamped, and an unrecorded skip would turn index misses
+    // on that field into wrong "definitely absent" answers.
+    let new_skips: Vec<&String> = writer
+        .oversize_skips()
+        .keys()
+        .filter(|field| !existing_allowance.contains(*field))
+        .collect();
+    if !new_skips.is_empty() {
+        return Ok(SidecarHealOutcome::NeedsDocsRewrite(format!(
+            "index scan skipped oversize value(s) in field(s) {new_skips:?} that the data \
+             object's oversize allowance does not record — only a docs rewrite restamps it"
+        )));
+    }
+
+    let (index, stats) = writer.finish_index_sidecar(row_count)?;
+    log::debug!(
+        "vix sidecar heal: rebuilt the index of {} over {row_count} rows in {scan_windows} \
+         windows, sidecar {} bytes, took {:?}",
+        input.0,
+        index.len(),
+        started.elapsed()
+    );
+    Ok(SidecarHealOutcome::Rebuilt { index, stats })
 }
 
 /// Outcome of [`classify_core_file`]: would a single-file healing rebuild
@@ -991,9 +1527,8 @@ pub enum CoreFileStatus {
 /// - [`VixWriter::merge_inputs_lacking_term_capability`] finds a term-planned field the file
 ///   carries without value terms (pre-numeric-value-terms files, fast-path-DEMOTED fields — the
 ///   index-merge fast path can only demote them again, never heal);
-/// - a column the merge plan preserves ([`build_merge_plan`]: configured `column_store_fields`,
-///   stored in the docs schema or derivable from `_source`) has no docs column in the file
-///   (fields-table `cs`-marker probe).
+/// - (v2 all-columns removed the per-column probe: the plan's preserved set is the file's own
+///   column union, so a column-capability gap vs settings can no longer exist.)
 ///
 /// COST: the container footer, fields table and dictionary directory, at
 /// most one FST cell per probed field, and the docs blob's FOOTER (its
@@ -1012,14 +1547,15 @@ pub enum CoreFileStatus {
 /// classifies `Current` (both sides run the same [`build_merge_plan`]), so
 /// healing converges instead of looping.
 pub fn classify_core_file(
+    stream_type: StreamType,
     key: &str,
     source: Arc<dyn VixRangeSource>,
+    index_source: Option<Arc<dyn VixRangeSource>>,
     latest_schema: &Schema,
     fts_fields: &[String],
-    column_store_fields: &[String],
     bloom_fields: &[String],
 ) -> Result<CoreFileStatus, anyhow::Error> {
-    let reader = match VixReader::open_ranged(Arc::clone(&source)) {
+    let reader = match VixReader::open_ranged_with_index(Arc::clone(&source), index_source) {
         Ok(reader) => reader,
         Err(index_error) => {
             return match VixDocs::open_ranged(source) {
@@ -1034,10 +1570,10 @@ pub fn classify_core_file(
     };
     let sources = [MergeSource::Indexed(Box::new(reader))];
     let plan = build_merge_plan(
+        stream_type,
         &sources,
         latest_schema,
         fts_fields,
-        column_store_fields,
         bloom_fields,
         BatchCaps::default(),
     );
@@ -1046,27 +1582,43 @@ pub fn classify_core_file(
     };
     let reader = reader.as_ref();
 
-    let writer = VixWriter::new(&plan.writer_schema, plan.opts.clone(), plan.store_original);
-    if let Err(reason) = writer.check_merge_inputs(&[reader]) {
-        return Ok(CoreFileStatus::NeedsRebuild(reason));
+    // Index-mode alignment first (#40): both drift directions rebuild —
+    // the dictionary probes below are meaningless across modes (an
+    // index-off writer rejects every dictionary merge, and an index-off
+    // FILE cannot join an indexed plan's fast path).
+    if plan.opts.index_enabled && !reader.has_index() {
+        return Ok(CoreFileStatus::NeedsRebuild(
+            "file carries no index sidecar but the stream policy indexes; a rebuild re-derives \
+             every term from _source"
+                .to_string(),
+        ));
     }
-    let lacking = writer
-        .merge_inputs_lacking_term_capability(&[reader])
-        .map_err(|reason| anyhow::anyhow!("core file {key}: {reason}"))?;
-    if let Some(name) = lacking.first() {
-        return Ok(CoreFileStatus::NeedsRebuild(format!(
-            "field {name:?} carries values without the value terms the current plan derives \
-             (a fast-path merge could only demote it)"
-        )));
+    if !plan.opts.index_enabled && reader.has_index() {
+        return Ok(CoreFileStatus::NeedsRebuild(
+            "file carries a term index but the stream policy is index-off (column-store only); \
+             a rebuild drops the index and materializes every field's docs column"
+                .to_string(),
+        ));
     }
-    for (name, _) in &plan.preserved {
-        if !reader.has_column_store_field(name) {
+
+    if plan.opts.index_enabled {
+        let writer = VixWriter::new(&plan.writer_schema, plan.opts.clone(), plan.store_original);
+        if let Err(reason) = writer.check_merge_inputs(&[reader]) {
+            return Ok(CoreFileStatus::NeedsRebuild(reason));
+        }
+        let lacking = writer
+            .merge_inputs_lacking_term_capability(&[reader])
+            .map_err(|reason| anyhow::anyhow!("core file {key}: {reason}"))?;
+        if let Some(name) = lacking.first() {
             return Ok(CoreFileStatus::NeedsRebuild(format!(
-                "configured column-store field {name:?} has no docs column (derivable from \
-                 _source)"
+                "field {name:?} carries values without the value terms the current plan derives \
+                 (a fast-path merge could only demote it)"
             )));
         }
     }
+    // v2 all-columns: the plan's preserved set IS this file's own column
+    // union, so a per-column probe is vacuous — column capabilities can no
+    // longer lag settings.
     Ok(CoreFileStatus::Current)
 }
 
@@ -1078,8 +1630,8 @@ fn open_merge_sources(inputs: &[MergeInput]) -> Result<Vec<MergeSource>, anyhow:
     }
     inputs
         .iter()
-        .map(
-            |(key, data)| match VixReader::open_ranged(Arc::clone(data)) {
+        .map(|(key, data, index)| {
+            match VixReader::open_ranged_with_index(Arc::clone(data), index.clone()) {
                 Ok(reader) => Ok(MergeSource::Indexed(Box::new(reader))),
                 Err(index_error) => match VixDocs::open_ranged(Arc::clone(data)) {
                     Ok(docs) => {
@@ -1091,8 +1643,8 @@ fn open_merge_sources(inputs: &[MergeInput]) -> Result<Vec<MergeSource>, anyhow:
                     }
                     Err(_) => Err(anyhow::anyhow!("open core file {key}: {index_error}")),
                 },
-            },
-        )
+            }
+        })
         .collect()
 }
 
@@ -1101,13 +1653,14 @@ fn open_merge_sources(inputs: &[MergeInput]) -> Result<Vec<MergeSource>, anyhow:
 /// unreadable poison nothing here — their columns are simply not offered —
 /// but such files fail later when their rows are read.
 fn build_merge_plan(
+    stream_type: StreamType,
     sources: &[MergeSource],
     latest_schema: &Schema,
     fts_fields: &[String],
-    column_store_fields: &[String],
     bloom_fields: &[String],
     caps: BatchCaps,
 ) -> MergePlan {
+    let index_enabled = vix_index_enabled(stream_type);
     // docs columns available across inputs (name -> first stored type),
     // writer-managed columns excluded
     let mut available: Vec<(String, DataType)> = Vec::new();
@@ -1129,110 +1682,156 @@ fn build_merge_plan(
         }
     }
 
-    // internal columns never join the term plan or the derive-from-source
-    // path: `key_term_exists` reports internals as always-present, and
-    // `_o2_id` is not recoverable from `_source` (it is excluded from it)
-    const NON_PLAN_COLS: [&str; 4] = [
-        TIMESTAMP_COL_NAME,
-        SOURCE_COL_NAME,
-        ORIGINAL_DATA_COL_NAME,
-        ID_COL_NAME,
-    ];
-
-    // preserved cs columns: current settings ∩ available, plus _o2_id
-    let mut preserved: Vec<(String, DataType)> = Vec::new();
-    for name in effective_column_store_fields(
-        column_store_fields,
-        available.iter().any(|(n, _)| n == ID_COL_NAME),
-    ) {
-        if preserved.iter().any(|(n, _)| *n == name) {
-            continue;
+    // #52: the full bloom-only list (config + test seam + STICKY input
+    // markers + merge-time AUTO from the inputs' dictionary block metas).
+    // Purely an INDEX-side concept since v2 all-columns: demoted fields
+    // lose dictionary/postings and keep bloom coverage — their docs
+    // columns exist like every other field's, no column-store side effect
+    // to manage.
+    let bloom_only_names: Vec<String> = {
+        let cfg = get_config();
+        let mut names: Vec<String> = cfg
+            .common
+            .vix_bloom_only_fields
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        if let Some(list) = caps.bloom_only_override {
+            names.extend(list.split(',').map(str::trim).map(str::to_string));
         }
-        let Some((_, stored_type)) = available.iter().find(|(n, _)| *n == name) else {
-            // Configured but a docs column in NO input: the field predates
-            // its `column_store_fields` entry everywhere, so its values
-            // live only in `_source`. When the CURRENT schema types the
-            // field and some input carries values (key-term probe),
-            // MATERIALIZE the column — `normalize_merge_chunk` derives it
-            // from `_source` per chunk, exactly like the mixed-inputs case
-            // (DESIGN §8) — so all-old merge groups and the single-file
-            // healing rebuild converge to current capabilities instead of
-            // leaving the column missing forever. Untyped (not in the
-            // schema) or value-less fields stay unmaterialized: there is
-            // nothing to derive.
-            if !NON_PLAN_COLS.contains(&name.as_str())
-                && let Ok(field) = latest_schema.field_with_name(&name)
-                && sources.iter().any(|source| source.key_term_exists(&name))
-            {
-                let data_type = field.data_type().clone();
-                preserved.push((name, data_type));
+        let (ratio, floor) = caps.bloom_auto_override.unwrap_or((
+            cfg.common.vix_bloom_only_auto_ratio,
+            cfg.common.vix_bloom_only_min_distinct,
+        ));
+        let merged_rows: u64 = sources
+            .iter()
+            .map(|source| match source {
+                MergeSource::Indexed(reader) => reader.row_count(),
+                _ => 0,
+            })
+            .sum();
+        if index_enabled {
+            // M7 STICKY demotion: a field ANY input already marks
+            // bloom-only stays bloom-only. Demoted inputs hold no
+            // dictionary terms for it, so the count-driven AUTO below can
+            // never re-derive the decision — without stickiness a second-
+            // generation merge would degrade the field to capability-less
+            // (bloom coverage lost) and the single-file sweep would
+            // rebuild → re-demote → rebuild forever. Un-demotion is the
+            // never-list (it wins at writer resolution) + the heal that
+            // then re-derives the terms.
+            for source in sources {
+                if let MergeSource::Indexed(reader) = source {
+                    names.extend(reader.bloom_only_fields().map(str::to_string));
+                }
             }
-            continue;
-        };
-        let target_type = latest_schema
-            .field_with_name(&name)
-            .map(|field| field.data_type().clone())
-            .unwrap_or_else(|_| stored_type.clone());
-        preserved.push((name, target_type));
-    }
+        }
+        if index_enabled && ratio > 0.0 && merged_rows > 0 {
+            let mut counts: std::collections::HashMap<String, u64> =
+                std::collections::HashMap::new();
+            for source in sources {
+                if let MergeSource::Indexed(reader) = source
+                    && let Ok(per_field) = reader.term_counts_by_field()
+                {
+                    for (name, count) in per_field {
+                        // M12: only STRING-family fields are bloom-only
+                        // candidates — the writer's construction re-check
+                        // enforces this anyway, but resolving (and INFO-
+                        // logging) a numeric field here was a lie: a
+                        // high-distinct numeric like `duration` logged
+                        // "AUTO bloom-only demotion" on every merge while
+                        // never actually leaving the dictionary (this
+                        // artifact misdirected the M10 phase analysis).
+                        let string_family = available.iter().any(|(n, stored)| {
+                            n == &name
+                                && matches!(
+                                    stored,
+                                    DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+                                )
+                        });
+                        if !string_family {
+                            continue;
+                        }
+                        *counts.entry(name).or_default() += count;
+                    }
+                }
+            }
+            // the shared #52 AUTO rule (one function, two call sites: here
+            // over input-dictionary counts, and the writer's finish over
+            // its own term map — see resolve_auto_bloom_only)
+            let never: Vec<String> = cfg
+                .common
+                .vix_bloom_only_never
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
+            names.extend(vortex_index::resolve_auto_bloom_only(
+                counts
+                    .iter()
+                    .filter(|(name, _)| !names.contains(name))
+                    .map(|(name, count)| (name.as_str(), *count)),
+                merged_rows,
+                ratio,
+                floor,
+                &never,
+                "merge",
+            ));
+        }
+        names.sort_unstable();
+        names.dedup();
+        names
+    };
 
-    // writer construction schema: _timestamp + preserved cs columns (their
-    // target types) + every term field any input knows (string-typed unless
-    // already preserved with another type)
+    // Preserved docs columns (v2 DESIGN §2/§6): the UNION of the inputs'
+    // docs columns, never the registry. Types follow the current stream
+    // schema when it types the field (normalize casts per chunk), else the
+    // first-seen stored type. `_o2_id` rides along like any other stored
+    // column (it is excluded from `_source`, so its docs column is its only
+    // home). There is no derive-from-`_source` arm anymore: a column absent
+    // from one input contributes NULLS for that input's rows.
+    let preserved: Vec<(String, DataType)> = available
+        .iter()
+        .map(|(name, stored_type)| {
+            let target_type = latest_schema
+                .field_with_name(name)
+                .map(|field| field.data_type().clone())
+                .unwrap_or_else(|_| stored_type.clone());
+            (name.clone(), target_type)
+        })
+        .collect();
+
+    // writer construction schema: `_timestamp` + the preserved columns at
+    // their target types. Since v3 files store EVERY present field as a
+    // column, this union already covers every term-derivable field any
+    // input carries — no dictionary/registry appendix arms.
     let mut writer_fields: Vec<Field> =
         vec![Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false)];
     for (name, data_type) in &preserved {
         writer_fields.push(Field::new(name, data_type.clone(), true));
     }
-    for source in sources {
-        for name in source.term_field_names() {
-            if name != TIMESTAMP_COL_NAME
-                && !writer_fields.iter().any(|field| field.name() == &name)
-            {
-                writer_fields.push(Field::new(&name, DataType::Utf8, true));
-            }
-        }
-    }
-    // ... plus every value-indexable field of the CURRENT stream schema that
-    // some input CARRIES (key-term probe) without value-indexing it — e.g. a
-    // numeric field in files written before numeric value terms existed
-    // (only its key terms and `_source` values exist). With a plan field id,
-    // a REBUILD re-derives its value terms from `_source` (old files
-    // converge to fully indexed at compaction), and the index-merge fast
-    // path can apply its per-field capability INTERSECTION (demotion)
-    // instead of silently claiming term coverage the merged dictionary lacks.
-    // Fields some input marks partial-without-value-indexing stay OUT of the
-    // plan: planning them would force the rebuild path on every merge
-    // (check_merge_inputs), while leaving them out keeps today's
-    // partial-union behavior.
-    {
-        let known: std::collections::HashSet<String> = writer_fields
-            .iter()
-            .map(|field| field.name().clone())
-            .collect();
-        for field in latest_schema.fields() {
-            let name = field.name().as_str();
-            if known.contains(name)
-                || NON_PLAN_COLS.contains(&name)
-                || !vortex_index::is_value_indexed_type(field.data_type())
-            {
-                continue;
-            }
-            if sources.iter().any(|source| source.is_partial_field(name)) {
-                continue;
-            }
-            if sources.iter().any(|source| source.key_term_exists(name)) {
-                writer_fields.push(Field::new(name, field.data_type().clone(), true));
-            }
-        }
-    }
     let writer_schema = Schema::new(writer_fields);
-    let mut opts = core_writer_options(
-        fts_fields,
-        preserved.iter().map(|(name, _)| name.clone()).collect(),
-        bloom_fields.to_vec(),
-    );
+    let mut opts = core_writer_options(fts_fields, bloom_fields.to_vec(), index_enabled);
     opts.encode_threads = merge_threads();
+    // #51b: k-way range parallelism (0 = min(available parallelism, 8),
+    // capped by the merge thread budget inside merge_indexes)
+    opts.merge_kway_threads = get_config().common.vix_merge_kway_threads;
+    if let Some((ratio, floor)) = caps.bloom_auto_override {
+        opts.bloom_only_auto_ratio = ratio;
+        opts.bloom_only_min_distinct = floor;
+    }
+    // §4 completeness propagation: the output asserts all-present-columns
+    // only when EVERY input did — an incomplete input's `_source` rows may
+    // carry fields that never became columns, and both the passthrough and
+    // the decode merge preserve those rows verbatim.
+    opts.columns_complete = sources.iter().all(MergeSource::columns_complete);
+    // #52: hand the writer the resolved bloom-only list (writer-side
+    // resolution re-filters to string-family ∩ term plan − never − fts).
+    opts.bloom_only_field_names = bloom_only_names.clone();
+
     // Rebuilds re-derive EVERY term from _source and, for a 10GB-original
     // group, used to hold ~15-19GB of term map until finish — the
     // compactor's worst-case memory bound. Spill runs to the data volume
@@ -1243,12 +1842,60 @@ fn build_merge_plan(
     // ... and the finished container spools there too: the upload streams
     // from the spool, so the merged multi-GB object never resides in RAM.
     opts.output_spool_dir = Some(scratch);
+
+    // #46 gate: an INDEXED output over inputs that are ALL index-off
+    // all-columnar files derives its terms from the streamed COLUMNS (the
+    // cheap column-driven path) instead of parsing `_source` per row.
+    // Strict preconditions, any miss = the source-driven fallback:
+    // readable index (index-off, not unreadable), every non-internal input
+    // column term-derivable (string/numeric/bool — write-time JSON types by
+    // construction), and no type flips — neither across inputs (`available`
+    // holds the first-seen type) nor between an input's stored type and the
+    // plan's target type (a cast could canonicalize differently than the
+    // `_source` derivation).
+    let mut derive_from_columns = index_enabled
+        && !caps.force_source_derivation
+        && !sources.is_empty()
+        && sources.iter().all(|source| match source {
+            MergeSource::Indexed(reader) => !reader.has_index(),
+            MergeSource::DocsOnly(_) => false,
+        });
+    if derive_from_columns {
+        'gate: for source in sources {
+            let Ok(schema) = source.docs_schema() else {
+                derive_from_columns = false;
+                break;
+            };
+            for field in schema.fields() {
+                let name = field.name().as_str();
+                if name == TIMESTAMP_COL_NAME
+                    || name == SOURCE_COL_NAME
+                    || name == ORIGINAL_DATA_COL_NAME
+                {
+                    continue;
+                }
+                let stored = available.iter().find(|(n, _)| n == name);
+                let target = preserved.iter().find(|(n, _)| n == name);
+                let type_ok = vortex_index::is_value_indexed_type(field.data_type())
+                    || name == ID_COL_NAME;
+                if !type_ok
+                    || stored.is_none_or(|(_, t)| t != field.data_type())
+                    || target.is_none_or(|(_, t)| t != field.data_type())
+                {
+                    derive_from_columns = false;
+                    break 'gate;
+                }
+            }
+        }
+    }
+
     MergePlan {
         store_original,
         preserved,
         writer_schema,
         opts,
         caps,
+        derive_from_columns,
     }
 }
 
@@ -1287,7 +1934,7 @@ fn read_timestamp_columns(
     sources
         .iter()
         .zip(inputs)
-        .map(|(source, (key, _))| {
+        .map(|(source, (key, ..))| {
             let column = source
                 .read_timestamp_column()
                 .map_err(|e| anyhow::anyhow!("read core file {key}: {e}"))?;
@@ -1305,20 +1952,29 @@ fn read_timestamp_columns(
             // hard-rejecting out-of-order parts). Degenerate rows
             // (ts <= 0) are exempt: the merge cleanses them before order
             // matters, mirroring the mover's backstop.
-            let mut prev: Option<(usize, i64)> = None;
-            for (row, &ts) in timestamps.values().iter().enumerate() {
-                if ts <= 0 {
-                    continue;
+            //
+            // #51c-c exemption: a file stamped `row_order=concat` is
+            // DECLARED not globally sorted — that is its contract, not
+            // corruption. Such inputs never feed the k-way merge order
+            // (the caller routes any merge containing one to the
+            // concatenation-order path, which is order-free); the guard
+            // stays armed for every sorted-declared file.
+            if source.row_order().is_ts_desc() {
+                let mut prev: Option<(usize, i64)> = None;
+                for (row, &ts) in timestamps.values().iter().enumerate() {
+                    if ts <= 0 {
+                        continue;
+                    }
+                    if let Some((prev_row, prev_ts)) = prev
+                        && ts > prev_ts
+                    {
+                        return Err(anyhow::anyhow!(
+                            "core file {key} violates the _timestamp DESC row order at rows \
+                             {prev_row}..={row} ({prev_ts} then {ts}): refusing to merge",
+                        ));
+                    }
+                    prev = Some((row, ts));
                 }
-                if let Some((prev_row, prev_ts)) = prev
-                    && ts > prev_ts
-                {
-                    return Err(anyhow::anyhow!(
-                        "core file {key} violates the _timestamp DESC row order at rows \
-                         {prev_row}..={row} ({prev_ts} then {ts}): refusing to merge",
-                    ));
-                }
-                prev = Some((row, ts));
             }
             Ok(timestamps)
         })
@@ -1387,7 +2043,131 @@ fn merge_order_inverse(maps: &[Vec<u32>]) -> Vec<(usize, usize)> {
     order
 }
 
+/// The key of the first #51c-c concat-order input, if any. Such an input is
+/// NOT globally `_timestamp` DESC, so the k-way merge order ([`merge_order`])
+/// is meaningless over the set: the merge always takes the
+/// concatenation-order path (there is no machinery to re-sort a multi-GB
+/// unsorted input, and proceeding sorted would corrupt the sorted-file
+/// contract).
+fn first_concat_order_input<'a>(
+    inputs: &'a [MergeInput],
+    sources: &[MergeSource],
+) -> Option<&'a str> {
+    sources
+        .iter()
+        .zip(inputs)
+        .find(|(source, _)| !source.row_order().is_ts_desc())
+        .map(|(_, (key, ..))| key.as_str())
+}
+
+/// #51c-c deterministic concatenation order over the merge inputs: sorted by
+/// each input's minimum `_timestamp` DESCENDING (the newest-starting input
+/// first — the nearest analogue of the storage convention and of the
+/// disjoint path's offset order), ties broken by file key ascending. Inputs
+/// with no rows (possible after cleansing on the rebuild path) sort last, by
+/// key. Computed over the CLEANSED per-input timestamp columns, so the order
+/// is a pure function of the rows the merge actually stores.
+fn concat_input_order(inputs: &[MergeInput], timestamps: &[Int64Array]) -> Vec<usize> {
+    let min_ts: Vec<Option<i64>> = timestamps.iter().map(arrow::compute::min).collect();
+    let mut order: Vec<usize> = (0..inputs.len()).collect();
+    order.sort_by(|&a, &b| {
+        match (min_ts[a], min_ts[b]) {
+            // larger minimum first; empty inputs (None) last
+            (Some(ta), Some(tb)) => tb.cmp(&ta),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+        .then_with(|| inputs[a].0.cmp(&inputs[b].0))
+    });
+    order
+}
+
+/// A concatenation merge's row order as the `merged doc id -> (input, input
+/// row)` array both scan drivers consume: each input's rows back-to-back, in
+/// `input_order`. Per-input row consumption is strictly forward, so
+/// [`stream_merge_windows`] streams it; the positions equal the chunk-copy
+/// positions, so an index built over this scan addresses copied chunks
+/// exactly.
+fn concat_scan_order(input_order: &[usize], timestamps: &[Int64Array]) -> Vec<(usize, usize)> {
+    let total: usize = timestamps.iter().map(Int64Array::len).sum();
+    let mut order = Vec::with_capacity(total);
+    for &input in input_order {
+        for row in 0..timestamps[input].len() {
+            order.push((input, row));
+        }
+    }
+    order
+}
+
+/// Per-input contiguous run offsets of a concatenation merge (parallel to
+/// `inputs`): the input at concat position `p` starts at the sum of the
+/// earlier inputs' row counts — the exact [`DocIdMap::Offset`] shape the
+/// disjoint fast path feeds the index merge. Errors when the total leaves
+/// the u32 doc-id space (the writer would refuse such a file anyway; fail
+/// before any index work).
+fn concat_doc_id_offsets(
+    input_order: &[usize],
+    timestamps: &[Int64Array],
+) -> Result<Vec<u32>, anyhow::Error> {
+    let mut offsets = vec![0u32; timestamps.len()];
+    let mut next = 0u64;
+    for &input in input_order {
+        offsets[input] = u32::try_from(next).map_err(|_| {
+            anyhow::anyhow!(
+                "concatenation merge exceeds the u32 doc-id space at input offset {next}"
+            )
+        })?;
+        next += timestamps[input].len() as u64;
+    }
+    if next > u64::from(u32::MAX) {
+        return Err(anyhow::anyhow!(
+            "concatenation merge stores {next} rows, exceeding the u32 doc-id space"
+        ));
+    }
+    Ok(offsets)
+}
+
+/// #51c-c: qualify the ENTIRE input set for a concatenation-order fast-path
+/// merge and build its writer (docs passthrough + concat row order — the
+/// encoder strategy is fixed at spawn, so the writer must be born concat).
+/// Requires EVERY input to pass the per-input #51c qualification
+/// (all-or-nothing): concatenation trades the sorted-file contract for the
+/// chunk copy, so if any input would decode anyway the trade buys nothing —
+/// the caller keeps today's sorted interleave (or, when a concat INPUT
+/// forces concatenation regardless, falls back to the rebuild, whose forced
+/// concatenation decodes unqualified inputs).
+fn qualify_concat_fast_path(
+    inputs: &[MergeInput],
+    readers: &[&VixReader],
+    plan: &MergePlan,
+    timestamps: &[Int64Array],
+) -> Result<(VixWriter, Vec<usize>), String> {
+    let mut writer_opts = plan.opts.clone();
+    writer_opts.docs_passthrough = true;
+    writer_opts.concat_row_order = true;
+    let writer = VixWriter::new(&plan.writer_schema, writer_opts, plan.store_original);
+    for (index, reader) in readers.iter().enumerate() {
+        if let Err(reason) =
+            qualify_passthrough_input(reader, timestamps[index].len() as u64, &writer)
+        {
+            return Err(format!(
+                "input {} does not qualify for the docs passthrough: {reason}",
+                inputs[index].0
+            ));
+        }
+    }
+    Ok((writer, concat_input_order(inputs, timestamps)))
+}
+
 /// The index-merge fast path (see [`merge_core_files`]).
+///
+/// Under an index-off plan (#40, `plan.opts.index_enabled == false`) the
+/// dictionary steps vanish — no input capability check, no index merge —
+/// and this degenerates to the pure docs-stream copy (disjoint concat or
+/// windowed interleave), reported with `used_index_merge: false`. The
+/// degenerate-`_timestamp` fallback to the rebuild stays: cleansing needs
+/// the rebuild's per-chunk row filtering either way.
 fn merge_core_files_indexed(
     inputs: &[MergeInput],
     sources: &[MergeSource],
@@ -1396,12 +2176,10 @@ fn merge_core_files_indexed(
 ) -> Result<MergedCoreFile, IndexedMergeFailure> {
     use IndexedMergeFailure::{Fallback, Fatal};
 
-    let mut writer = VixWriter::new(&plan.writer_schema, plan.opts.clone(), plan.store_original);
-    writer
-        .check_merge_inputs(readers)
-        .map_err(|reason| Fallback(anyhow::anyhow!(reason)))?;
-
-    // row merge (timestamps only): failures here would hit a rebuild too
+    // row merge (timestamps only) FIRST: the #51c passthrough gate needs to
+    // know whether the disjoint stream copy runs before the writer (whose
+    // docs encoder strategy is fixed at spawn) is constructed. Failures
+    // here would hit a rebuild too.
     let started = std::time::Instant::now();
     let timestamps = read_timestamp_columns(inputs, sources).map_err(Fatal)?;
     // Degenerate-`_timestamp` rows must be DROPPED (compaction-time
@@ -1417,81 +2195,221 @@ fn merge_core_files_indexed(
              data); dropping them requires the rebuild path"
         )));
     }
-    let maps = merge_order(&timestamps);
-    let offsets = contiguous_offsets(&maps);
-    let doc_maps: Vec<DocIdMap> = match &offsets {
-        Some(offsets) => offsets
-            .iter()
-            .map(|&offset| DocIdMap::Offset(offset))
-            .collect(),
-        None => maps
-            .iter()
-            .map(|map| DocIdMap::Table(map.clone()))
-            .collect(),
+    // #51c-c: a concat-order input invalidates the k-way merge order (its
+    // rows are declared unsorted), so the whole merge takes the
+    // concatenation path (concat inputs are always legal — passthrough is
+    // the native merge shape).
+    let concat_input = first_concat_order_input(inputs, sources);
+    let (maps, offsets) = match concat_input {
+        // never run merge_order over an unsorted input: its maps are garbage
+        Some(_) => (None, None),
+        None => {
+            let maps = merge_order(&timestamps);
+            let offsets = contiguous_offsets(&maps);
+            (Some(maps), offsets)
+        }
     };
     log::debug!(
-        "vix merge: row merge order over {} inputs in {:?} (disjoint: {})",
+        "vix merge: row merge order over {} inputs in {:?} (disjoint: {}, concat input: {})",
         inputs.len(),
         started.elapsed(),
         offsets.is_some(),
+        concat_input.is_some(),
     );
+
+    // #51c-c concatenation order — the DEFAULT for OVERLAPPING inputs
+    // (where the sorted interleave decodes everything) and for merges
+    // containing a concat input (which forces it): store the inputs
+    // back-to-back, unlocking the chunk copy. All-or-nothing per-input
+    // qualification; a miss keeps the sorted interleave (or, with a concat
+    // input, hands the merge to the rebuild's forced concatenation, which
+    // decodes unqualified inputs).
+    let mut concat: Option<(VixWriter, Vec<usize>)> = None;
+    if offsets.is_none() {
+        let disqualified = if plan.caps.force_decode {
+            // test seam: the fast path's concat requires the chunk copy —
+            // a merge containing a concat INPUT still must concatenate,
+            // through the rebuild's forced (decoding) concatenation
+            Some("force_decode test seam".to_string())
+        } else {
+            match qualify_concat_fast_path(inputs, readers, plan, &timestamps) {
+                Ok(qualified) => {
+                    log::debug!(
+                        "vix merge: {} overlapping inputs take the #51c-c concatenation order \
+                         (all passthrough-qualified)",
+                        inputs.len(),
+                    );
+                    concat = Some(qualified);
+                    None
+                }
+                Err(reason) => Some(reason),
+            }
+        };
+        if let Some(reason) = disqualified {
+            if let Some(key) = concat_input {
+                return Err(Fallback(anyhow::anyhow!(
+                    "input {key} is concatenation-order but the concat fast path is \
+                     disqualified ({reason}); the rebuild's forced concatenation handles it"
+                )));
+            }
+            log::debug!(
+                "vix merge: concatenation order disqualified ({reason}); interleaving as \
+                 today"
+            );
+        }
+    }
+
+    // The passthrough encoder engages wherever the docs blob is a pure
+    // chunk copy — the disjoint stream copy and the #51c-c concatenation
+    // (passthrough-native, no dark knob). An interleaving merge always
+    // decodes, so it keeps the standard docs pipeline (zoned stats, dict
+    // layout, coalescing) untouched.
+    let disjoint_passthrough = offsets.is_some() && !plan.caps.force_decode;
+    let (mut writer, concat_order) = match concat {
+        Some((writer, input_order)) => (writer, Some(input_order)),
+        None => {
+            let mut writer_opts = plan.opts.clone();
+            writer_opts.docs_passthrough = disjoint_passthrough;
+            (
+                VixWriter::new(&plan.writer_schema, writer_opts, plan.store_original),
+                None,
+            )
+        }
+    };
+    if plan.opts.index_enabled {
+        writer
+            .check_merge_inputs(readers)
+            .map_err(|reason| Fallback(anyhow::anyhow!(reason)))?;
+    }
 
     // merge the term dictionaries BEFORE any docs work: every index-side
     // problem (malformed postings, remap disorder, ...) falls back to the
-    // rebuild with nothing wasted
-    let started = std::time::Instant::now();
-    writer
-        .merge_input_indexes(readers, &doc_maps, merge_threads())
-        .map_err(Fallback)?;
-    log::debug!("vix merge: index merge total {:?}", started.elapsed());
+    // rebuild with nothing wasted. Index-off plans (#40) have no
+    // dictionaries to merge (and no doc-id maps to build) — the merge order
+    // above still shaped the row order, and the docs push below is the
+    // whole merge.
+    if plan.opts.index_enabled {
+        let doc_maps: Vec<DocIdMap> = if let Some(input_order) = &concat_order {
+            // #51c-c: per-input sequential offsets in concatenation order —
+            // the index merge consumes them exactly as in the disjoint case
+            concat_doc_id_offsets(input_order, &timestamps)
+                .map_err(Fatal)?
+                .into_iter()
+                .map(DocIdMap::Offset)
+                .collect()
+        } else {
+            match &offsets {
+                Some(offsets) => offsets
+                    .iter()
+                    .map(|&offset| DocIdMap::Offset(offset))
+                    .collect(),
+                None => maps
+                    .as_ref()
+                    .expect("sorted inputs always have merge maps")
+                    .iter()
+                    .map(|map| DocIdMap::Table(map.clone()))
+                    .collect(),
+            }
+        };
+        let started = std::time::Instant::now();
+        writer
+            .merge_input_indexes(readers, &doc_maps, merge_threads())
+            .map_err(Fallback)?;
+        log::debug!("vix merge: index merge total {:?}", started.elapsed());
+    }
 
     let started = std::time::Instant::now();
-    let docs_batches = if let Some(offsets) = offsets {
+    let (docs_batches, docs_passthrough_inputs, docs_sliced_windows) = if let Some(input_order) =
+        &concat_order
+    {
+        // #51c-c: the merged docs blob is the inputs' rows concatenated in
+        // min_ts order — the same streamed copy as the disjoint arm below
+        // (every input qualified up front; a pre-push runtime failure still
+        // decodes that input in place, its rows land at the same positions)
+        stream_inputs_disjoint(
+            inputs,
+            readers,
+            plan,
+            input_order,
+            &timestamps,
+            true,
+            &mut writer,
+        )
+        .map_err(Fatal)?
+    } else if let Some(offsets) = offsets {
         // disjoint inputs: the merged docs blob is the inputs' rows
         // concatenated in offset order — streamed batch copy, no per-row
-        // work. Each input decodes (and normalizes) on its own thread a
-        // bounded channel ahead of the pushes, which stay ordered.
+        // work. Each decoded input runs on its own thread a bounded channel
+        // ahead of the pushes, which stay ordered; #51c-qualified inputs
+        // copy their encoded chunks instead of decoding at all.
         let mut input_order: Vec<usize> = (0..inputs.len()).collect();
         input_order.sort_unstable_by_key(|&index| offsets[index]);
-        stream_inputs_sequential(inputs, plan, &input_order, |ts, cs, source, original| {
-            writer.push_docs_rows_unindexed(ts, cs, source, original)
-        })
+        stream_inputs_disjoint(
+            inputs,
+            readers,
+            plan,
+            &input_order,
+            &timestamps,
+            disjoint_passthrough,
+            &mut writer,
+        )
         .map_err(Fatal)?
     } else {
         // overlapping inputs: interleave rows in merged order (same
         // streaming and windowing as the rebuild, minus all term extraction)
-        let order = merge_order_inverse(&maps);
-        stream_merge_windows(inputs, plan, &order, |ts, cs, source, original| {
-            writer.push_docs_rows_unindexed(ts, cs, source, original)
-        })
-        .map_err(Fatal)?
+        let batches = stream_merge_windows(
+            inputs,
+            plan,
+            &merge_order_inverse(maps.as_ref().expect("sorted inputs always have merge maps")),
+            |ts, cs, source, original| writer.push_docs_rows_unindexed(ts, cs, source, original),
+        )
+        .map_err(Fatal)?;
+        (batches, 0, 0)
     };
     log::debug!(
-        "vix merge: docs rows staged in {:?} ({docs_batches} bounded batches)",
+        "vix merge: docs rows staged in {:?} ({docs_batches} bounded batches, \
+         {docs_passthrough_inputs} passthrough inputs, {docs_sliced_windows} sliced \
+         column-windows canonicalized)",
         started.elapsed()
     );
 
     let started = std::time::Instant::now();
-    let (output, stats) = writer.finish_output().map_err(Fatal)?;
+    // M18: the fail-open counter lives past finish (the encoder worker
+    // finishes inside finish_output)
+    let failopen = writer.docs_failopen_counter();
+    let (output, index, stats) = writer.finish_output().map_err(Fatal)?;
+    let docs_failopen_chunks = failopen.load(std::sync::atomic::Ordering::Relaxed);
+    if docs_failopen_chunks > 0 {
+        log::info!(
+            "vix merge: docs passthrough re-encoded {docs_failopen_chunks} chunk(s) (fail-open: \
+             non-writable encodings reached the encoder — see debug logs)"
+        );
+    }
     log::debug!(
         "vix merge: finish (docs blob encode + container) in {:?}",
         started.elapsed()
     );
     Ok(MergedCoreFile {
         output,
+        index,
         stats,
-        used_index_merge: true,
+        // index-off plans (#40) never merged a dictionary: there is no index
+        used_index_merge: plan.opts.index_enabled,
         docs_batches,
         // poison inputs fell back to the rebuild before any index work
         dropped_rows: 0,
+        docs_passthrough_inputs,
+        concat_order: concat_order.is_some(),
+        docs_sliced_windows,
+        docs_failopen_chunks,
     })
 }
 
 /// One normalized run of consecutive docs rows of one input, in the merge
 /// plan's shapes: `_timestamp` as `i64`, the preserved cs columns cast to
-/// their target types — **derived from this run's `_source`** when the input
-/// predates the column (never null-filled, DESIGN §8) — and
-/// `_source`/`_original` as `Utf8`. Runs are bounded by the plan's
+/// their target types — NULL-FILLED when the input lacks the column (v2
+/// all-present-columns; `_source` still carries each record's real fields) —
+/// and `_source`/`_original` as `Utf8`. Runs are bounded by the plan's
 /// [`BatchCaps`] (oversized decoded chunks are split before normalization)
 /// and carry per-row byte sizes for the window accounting.
 struct MergeChunk {
@@ -1504,12 +2422,215 @@ struct MergeChunk {
     original: StringArray,
     /// Per-row variable-length bytes (`_source` + `_original` + cs values).
     row_bytes: Vec<u32>,
+    /// M23b: `true` on the LAST chunk the producer sends for one DECODE UNIT
+    /// (one granted row range of a gated stream; free-running streams leave
+    /// it `false`) — the consumer counts delivered units off this tag to
+    /// keep its grant accounting in producer units.
+    last_in_unit: bool,
+    /// M25: aligned with `plan.preserved` — `true` where the column is
+    /// ABSENT from this input's docs schema, so `cs[i]` is a SYNTHESIZED
+    /// all-null array (one shared allocation per (type, len) per input, see
+    /// [`NullArrayCache`]) rather than decoded data. Synthesized columns are
+    /// skipped by the gated deep copy (they share nothing with decode
+    /// buffers) and by the transit byte accounting (their cost amortizes to
+    /// ~zero) — at prod schema widths they are MOST of the union, and
+    /// counting them at face value made a 4096-row unit ~35-50 MB of
+    /// transit. Empty slice = nothing synthesized.
+    synthesized: Arc<[bool]>,
 }
 
 impl MergeChunk {
     fn rows(&self) -> usize {
         self.timestamps.len()
     }
+}
+
+/// M23b: consumer-driven decode admission for one GATED (row-range) decode
+/// stream — see [`spawn_ranged_input_stream`].
+///
+/// The producer may decode unit `u` (1-based) only once `granted >= u`; it
+/// parks BEFORE decoding otherwise (a parked producer holds no decoded
+/// data). The CONSUMER issues grants — on demand (it is about to block on
+/// this input's channel) or on low-water prefetch (this input's remaining
+/// lookahead ran low, so the next unit's decode overlaps the remaining
+/// consumption). `close()` (cursor drop) releases a parked producer
+/// unconditionally so the scan can abort; the producer's next send then
+/// fails and the thread exits.
+///
+/// Deadlock-freedom: the consumer blocks only inside `rx.recv()`, and every
+/// blocking recv is preceded by `ensure_grant` — so a not-yet-exhausted
+/// producer always holds a grant covering the unit the consumer is waiting
+/// for (an exhausted producer has dropped `tx`, and recv returns
+/// immediately). A granted unit whose rows all cleansed away delivers
+/// nothing and consumes no grant (the producer proceeds to the next range
+/// under the same grant), so the consumer's delivered-units view never
+/// drifts from the producer's. The producer blocks only (a) in `tx.send`,
+/// released by the consumer's recv or by cursor drop (rx dropped -> send
+/// errs), or (b) in `await_grant`, released by a grant or by `close()` on
+/// cursor drop. Cursors drop before the enclosing `std::thread::scope`
+/// joins (they are locals of its closure, on success and unwind alike), so
+/// the join always completes.
+struct DecodeGate {
+    state: Mutex<(u64, bool)>, // (granted units, closed)
+    cv: Condvar,
+}
+
+impl DecodeGate {
+    /// A gate with `granted` units pre-granted (the spawn itself is the
+    /// consumer's demand for unit 1).
+    fn new(granted: u64) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new((granted, false)),
+            cv: Condvar::new(),
+        })
+    }
+
+    /// Producer: park until unit `unit` is granted. `false` = closed (the
+    /// consumer is gone): abort the scan.
+    fn await_grant(&self, unit: u64) -> bool {
+        let mut state = self.state.lock().unwrap();
+        while state.0 < unit && !state.1 {
+            state = self.cv.wait(state).unwrap();
+        }
+        !state.1
+    }
+
+    /// Consumer: raise the grant watermark (monotonic).
+    fn grant_to(&self, granted: u64) {
+        let mut state = self.state.lock().unwrap();
+        if granted > state.0 {
+            state.0 = granted;
+            self.cv.notify_all();
+        }
+    }
+
+    /// Consumer gone: release the producer unconditionally.
+    fn close(&self) {
+        self.state.lock().unwrap().1 = true;
+        self.cv.notify_all();
+    }
+}
+
+/// M23b: a k-way merge order is served by GATED row-range decode streams
+/// (instead of today's free-running whole-blob streams) only when at least
+/// this many of its inputs are SCATTERED (their rows do not form one
+/// contiguous run of the merged order). Scattered inputs are all mid-flight
+/// at once, so each one's resident decode must be a SMALL WINDOW; with
+/// fewer scattered inputs than this the whole-group buffering is bounded by
+/// (inputs x channel allowance) anyway — a few files' worth — and the
+/// free-running stream avoids the ranged scan's decode redundancy (a stored
+/// chunk intersecting k ranges decodes k times), which a low-N interleave
+/// consuming each input at up to 1/N of the scan rate could actually feel.
+/// At >= 8 scattered inputs each input is consumed at <= 1/8 of the scan
+/// rate and the redundant decode disappears into idle cores. Constant by
+/// design — resident-set correctness must not depend on deployment knobs
+/// (M23's no-knobs rule); compaction groups big enough to OOM are 40+
+/// files.
+const MERGE_SCATTERED_INPUTS_MIN: usize = 8;
+
+/// M23b: rows per GATED decode unit (one grant = one ranged scan of this
+/// many rows). Half a window (4096 at production caps) balances the two
+/// costs that scale with it: resident decode (every mid-flight input holds
+/// ~one unit; the interleaved wave crest holds ~two) and decode redundancy
+/// (a stored chunk intersecting k units decodes k times — at prod chunk
+/// geometry, 16 MiB decoded over 1.5-3 KB rows ≈ 5-10k rows/chunk, that is
+/// ~x2). `max(1024)` keeps tiny test caps from degenerating to per-row
+/// scans.
+///
+/// M25: this is now the UPPER bound — the producer adapts each unit's row
+/// count down toward [`MERGE_RANGED_UNIT_TARGET_BYTES`] of ARROW bytes when
+/// rows are wide (see [`stream_input_row_ranges`]).
+fn ranged_unit_rows(caps: BatchCaps) -> usize {
+    (caps.rows / 2).max(1024)
+}
+
+/// M25: target ARROW bytes per gated decode unit. M23b bounded the
+/// interleaved decode transit in ROWS (`caps.rows/2` = 4096), which priced a
+/// row at its VALUE bytes (~1.5 KB) — but the transit holds the rows' arrow
+/// form, whose per-row cost is value bytes + ~4-8 B x SCHEMA WIDTH of
+/// offsets/validity slots (every preserved column materializes per chunk,
+/// null-filled when absent). At prod logs width (~2,164 fields) a 4096-row
+/// unit is ~35-50 MB of arrow, x (1 delivered + 1 in-flight) x hundreds of
+/// interleaved inputs = the 15 GB decode transit M25 measured (128 x 12 MB
+/// inputs at width 2,000: peak 15.0 GB, ~7 GB of it unit transit). Sizing
+/// units by BYTES makes the bound width-invariant: narrow rows keep the full
+/// 4096-row unit (8 MiB / ~1.6 KB ≈ 5k rows, clamped), wide rows shrink to
+/// ~600-1000 rows. Unit boundaries are decode granularity only — outputs
+/// are proven byte-identical across unit sizes (the M23b gated-vs-free
+/// oracle) — so the adaptation cannot change stored bytes. The extra ranged
+/// decode redundancy stays in the M23b-accepted class (a stored chunk
+/// intersecting k units decodes k times; gated inputs are consumed at
+/// <= 1/8 scan rate, so it rides idle cores).
+const MERGE_RANGED_UNIT_TARGET_BYTES: usize = 8 << 20;
+
+/// M25: hard floor on adaptive unit rows — below this the per-unit fixed
+/// costs (grant round trip, ranged-scan setup, per-column array overhead of
+/// a part) dominate.
+const MERGE_RANGED_UNIT_MIN_ROWS: usize = 256;
+
+/// M25: total ARROW bytes of one normalized+copied [`MergeChunk`] — the
+/// resident cost of holding it (offsets/validity of every DECODED preserved
+/// column included; SYNTHESIZED all-null columns amortize to ~zero via the
+/// per-input shared allocation and are skipped), driving the producer's
+/// unit-size adaptation.
+fn merge_chunk_arrow_bytes(chunk: &MergeChunk) -> usize {
+    chunk.timestamps.get_array_memory_size()
+        + chunk.source.get_array_memory_size()
+        + chunk.original.get_array_memory_size()
+        + chunk
+            .cs
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !chunk.synthesized.get(*index).copied().unwrap_or(false))
+            .map(|(_, column)| column.get_array_memory_size())
+            .sum::<usize>()
+}
+
+/// M25: shared all-null arrays for preserved columns ABSENT from one input's
+/// docs schema, keyed by (type, rows). v2 null-fill used to allocate a fresh
+/// null array PER absent column PER chunk — at prod widths ~1,500-2,100 of
+/// the union's columns are absent from any given narrow-WAL file, and those
+/// allocations (4-8 B/row of offsets/validity EACH) dominated the merge's
+/// decode transit (~10 KB/row of arrow for ~0.6 KB of values). All absent
+/// columns of one (type, len) are the SAME logical array, so one allocation
+/// serves them all via Arc clones; the byte-identity of the output is
+/// untouched (an all-null array is an all-null array — the writer sees
+/// identical windows).
+#[derive(Default)]
+struct NullArrayCache(std::collections::HashMap<(DataType, usize), ArrayRef>);
+
+impl NullArrayCache {
+    fn get(&mut self, data_type: &DataType, rows: usize) -> ArrayRef {
+        Arc::clone(
+            self.0
+                .entry((data_type.clone(), rows))
+                .or_insert_with(|| arrow::array::new_null_array(data_type, rows)),
+        )
+    }
+}
+
+/// M23b: rows per deep-copied CHUNK within a gated unit (a quarter unit).
+/// Consumed rows of a unit free at chunk-copy granularity — without the
+/// split, a partially consumed unit stays fully resident until its LAST row
+/// is staged, doubling the interleaved wave crest. M25: computed from the
+/// CURRENT (byte-adapted) unit rows; `max(64)` bounds the per-part fixed
+/// cost (one array per preserved column materializes per part).
+fn ranged_part_rows_for(unit_rows: usize) -> usize {
+    (unit_rows / 4).max(64)
+}
+
+/// M23b: per-input low-water prefetch threshold, in rows of remaining
+/// delivered-not-yet-staged lookahead: when a gated input's lookahead drops
+/// below a quarter unit (1024 at production caps), the consumer grants its
+/// next decode unit so the decode overlaps the remaining consumption.
+/// Gated inputs exist only in >= [`MERGE_SCATTERED_INPUTS_MIN`]-way
+/// interleaves, where each input is consumed at <= 1/8 of the scan rate —
+/// a quarter unit of rows is then >= ~0.2 s of runway against a ~0.1 s
+/// unit decode (and SECONDS at real fan-ins), while keeping the crest
+/// overlap of consecutive units to ~a quarter unit. `max(64)` keeps tiny
+/// test caps prefetching.
+fn merge_low_water_rows(caps: BatchCaps) -> usize {
+    (ranged_unit_rows(caps) / 4).max(64)
 }
 
 /// Normalize one (already byte-capped) decoded docs batch into a
@@ -1527,6 +2648,8 @@ fn normalize_merge_chunk(
     key: &str,
     plan: &MergePlan,
     batch: &RecordBatch,
+    synthesized: &Arc<[bool]>,
+    null_cache: &mut NullArrayCache,
 ) -> Result<MergeChunk, anyhow::Error> {
     let raw_timestamps =
         as_int64_array(batch.column_by_name(TIMESTAMP_COL_NAME).ok_or_else(|| {
@@ -1558,20 +2681,26 @@ fn normalize_merge_chunk(
             Some(column) => cast(column, target_type).map_err(|e| {
                 anyhow::anyhow!("core file {key}: column {name:?} cast to {target_type}: {e}")
             })?,
-            // Pre-column input: the field predates its
-            // `column_store_fields` entry, so it has no docs column and
-            // lives only in `_source`. DERIVE it exactly as a query-time
-            // scan would extract it (identical `json_get_*` + cast), instead
-            // of null-filling — the merged file materializes ONE
-            // authoritative docs column that reads serve from directly, so a
-            // null fill would silently drop these rows from
-            // aggregations/TopN (DESIGN §8).
-            None => derive_cs_column_from_source(&source, name, target_type).map_err(|e| {
-                anyhow::anyhow!("core file {key}: derive column {name:?} from _source: {e}")
-            })?,
+            // v2 all-present-columns: an input lacking a column means the
+            // column was ABSENT from its records — it contributes nulls for
+            // these rows (`_source` still carries each record's real
+            // fields; the scan-side json_get fallback serves fields absent
+            // from a file's columns). The pre-v2 derive-from-`_source`
+            // materialization is gone with `column_store_fields`. M25: the
+            // null array is SHARED per (type, len) across all absent
+            // columns and chunks of this input (see [`NullArrayCache`]).
+            None => null_cache.get(target_type, rows),
         };
         cs.push(column);
     }
+    debug_assert!(
+        synthesized.is_empty()
+            || synthesized
+                .iter()
+                .zip(plan.preserved.iter())
+                .all(|(&synth, (name, _))| synth == batch.column_by_name(name).is_none()),
+        "core file {key}: synthesized mask out of sync with the batch's columns"
+    );
     let mut accessors: Vec<VarBytes> = Vec::with_capacity(cs.len() + 2);
     accessors.push(VarBytes::new(&source));
     accessors.push(VarBytes::new(&original));
@@ -1593,14 +2722,46 @@ fn normalize_merge_chunk(
         source,
         original,
         row_bytes,
+        last_in_unit: false,
+        synthesized: Arc::clone(synthesized),
     })
+}
+
+/// M25: the per-input synthesized-column mask (aligned with
+/// `plan.preserved`; `true` = the column is absent from this input's docs
+/// schema, so every chunk carries a shared synthesized null array for it).
+fn synthesized_columns_mask(schema: &SchemaRef, plan: &MergePlan) -> Arc<[bool]> {
+    plan.preserved
+        .iter()
+        .map(|(name, _)| schema.field_with_name(name).is_err())
+        .collect::<Vec<_>>()
+        .into()
+}
+
+/// The projected docs columns of one merge input (the columns
+/// [`normalize_merge_chunk`] consumes, restricted to what the file stores).
+fn merge_scan_projection(schema: &SchemaRef, plan: &MergePlan) -> Vec<String> {
+    let mut projection: Vec<String> =
+        vec![TIMESTAMP_COL_NAME.to_string(), SOURCE_COL_NAME.to_string()];
+    for (name, _) in &plan.preserved {
+        if schema.field_with_name(name).is_ok() {
+            projection.push(name.clone());
+        }
+    }
+    if plan.store_original && schema.field_with_name(ORIGINAL_DATA_COL_NAME).is_ok() {
+        projection.push(ORIGINAL_DATA_COL_NAME.to_string());
+    }
+    projection
 }
 
 /// Spawn one input's decode thread: stream the projected docs columns
 /// ([`VixDocs::scan_docs`], one decoded chunk at a time), split every chunk
 /// to the byte caps, normalize, and send the bounded [`MergeChunk`]s through
 /// a small channel — the input-side memory stays a few chunks regardless of
-/// file size. The thread stops as soon as the receiver is dropped.
+/// file size (but NOTE: a small L0 file is ~ONE stored chunk, so "a few
+/// chunks" is the whole file — use [`spawn_ranged_input_stream`] wherever
+/// many inputs are mid-flight at once). The thread stops as soon as the
+/// receiver is dropped.
 fn spawn_input_stream<'scope, 'env>(
     scope: &'scope std::thread::Scope<'scope, 'env>,
     key: &'env str,
@@ -1628,23 +2789,15 @@ fn stream_input_chunks(
     if docs.row_count() == 0 {
         return Ok(());
     }
-    let schema = docs.schema().clone();
-    let mut projection: Vec<String> =
-        vec![TIMESTAMP_COL_NAME.to_string(), SOURCE_COL_NAME.to_string()];
-    for (name, _) in &plan.preserved {
-        if schema.field_with_name(name).is_ok() {
-            projection.push(name.clone());
-        }
-    }
-    if plan.store_original && schema.field_with_name(ORIGINAL_DATA_COL_NAME).is_ok() {
-        projection.push(ORIGINAL_DATA_COL_NAME.to_string());
-    }
+    let projection = merge_scan_projection(docs.schema(), plan);
+    let synthesized = synthesized_columns_mask(docs.schema(), plan);
+    let mut null_cache = NullArrayCache::default();
     docs.scan_docs(Some(&projection), None, None, &mut |batch| {
         if batch.num_rows() == 0 {
             return Ok(());
         }
         for part in split_batch_by_bytes(&batch, plan.caps) {
-            let chunk = normalize_merge_chunk(key, plan, &part)?;
+            let chunk = normalize_merge_chunk(key, plan, &part, &synthesized, &mut null_cache)?;
             if chunk.rows() == 0 {
                 // every row of the part was cleansed away: nothing to stage
                 // (the merge order skipped the same rows)
@@ -1660,6 +2813,145 @@ fn stream_input_chunks(
     .map_err(|e| anyhow::anyhow!("stream core file {key}: {e}"))
 }
 
+/// M23b: one array deep-copied into fresh minimal buffers (a 0..len `take`
+/// gather — NOT `concat`, whose single-input fast path returns a
+/// buffer-sharing slice). Batch slices share the decode's backing buffers,
+/// so a ranged part sent as a slice would keep its whole decode unit (or
+/// worse, whatever the scan yielded) alive until the LAST of its rows is
+/// consumed. The copy makes every part independently freeable — the memory
+/// bound must hold by construction, not by the reader's current
+/// materialization habits — and is one gather of bytes the scan was going
+/// to consume anyway, off the consumer's critical path.
+fn deep_copy_array(array: &dyn Array) -> Result<ArrayRef, anyhow::Error> {
+    let indices = arrow::array::UInt32Array::from_iter_values(0..array.len() as u32);
+    Ok(arrow::compute::take(array, &indices, None)?)
+}
+
+/// M23b: spawn one input's GATED row-range decode thread — the bounded
+/// twin of [`spawn_input_stream`] for k-way orders where many inputs are
+/// mid-flight at once (see [`MERGE_SCATTERED_INPUTS_MIN`]).
+///
+/// Instead of one free-running whole-blob scan (whose decode unit is the
+/// STORED chunk — for the small-L0 population effectively the whole file),
+/// the producer decodes `caps.rows`-sized ROW RANGES
+/// ([`VixDocs::scan_docs_row_range`]), one per consumer grant
+/// ([`DecodeGate`]), deep-copying each normalized unit out of the decode's
+/// backing buffers. Resident per input ≈ one delivered unit (+ one granted
+/// unit in flight around a handoff) regardless of file or stored-chunk
+/// size; a stored chunk intersecting k ranges decodes k times, which is
+/// idle-core work at the input counts this stream is used for.
+fn spawn_ranged_input_stream<'scope, 'env>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    key: &'env str,
+    data: Arc<dyn vortex_index::VixRangeSource>,
+    plan: &'env MergePlan,
+    gate: Arc<DecodeGate>,
+) -> Receiver<Result<MergeChunk, anyhow::Error>> {
+    let (tx, rx) = sync_channel(2);
+    scope.spawn(move || {
+        if let Err(error) = stream_input_row_ranges(key, data, plan, &tx, &gate) {
+            // a failed send here means the consumer is already gone
+            let _ = tx.send(Err(error));
+        }
+    });
+    rx
+}
+
+fn stream_input_row_ranges(
+    key: &str,
+    data: Arc<dyn vortex_index::VixRangeSource>,
+    plan: &MergePlan,
+    tx: &SyncSender<Result<MergeChunk, anyhow::Error>>,
+    gate: &DecodeGate,
+) -> Result<(), anyhow::Error> {
+    let docs =
+        VixDocs::open_ranged(data).map_err(|e| anyhow::anyhow!("open core file {key}: {e}"))?;
+    let rows = docs.row_count();
+    if rows == 0 {
+        return Ok(());
+    }
+    let projection = merge_scan_projection(docs.schema(), plan);
+    let synthesized = synthesized_columns_mask(docs.schema(), plan);
+    let mut null_cache = NullArrayCache::default();
+    let max_unit_rows = ranged_unit_rows(plan.caps);
+    // M25: width-aware unit sizing — the resident cost of a unit is its
+    // ARROW bytes (per-column offset/validity slots of the DECODED columns;
+    // synthesized nulls are shared and near-free), so size units by bytes:
+    // start from a width-based estimate over this input's PRESENT columns,
+    // then track the measured bytes/row of the previous unit. Unit
+    // boundaries are decode granularity only (byte-identical outputs across
+    // unit sizes — the M23b oracle).
+    let present_columns = synthesized.iter().filter(|synth| !**synth).count();
+    let mut est_row_arrow_bytes = present_columns * 4 + 512;
+    // units DELIVERED (>= 1 chunk sent): a unit whose rows all cleansed away
+    // consumes no grant — the consumer never sees it, so it must not advance
+    // the grant bookkeeping either (see DecodeGate's deadlock notes)
+    let mut sent_units = 0u64;
+    let mut start = 0u64;
+    while start < rows {
+        // park BEFORE decoding — a parked producer holds no decoded data
+        if !gate.await_grant(sent_units + 1) {
+            return Err(anyhow::anyhow!("merge staging stopped"));
+        }
+        let unit_rows = (MERGE_RANGED_UNIT_TARGET_BYTES / est_row_arrow_bytes.max(1))
+            .clamp(MERGE_RANGED_UNIT_MIN_ROWS, max_unit_rows) as u64;
+        // parts are deep copies, so consumed rows free at part granularity —
+        // a caps whose byte bound is tighter than the part rows still applies
+        let part_caps = BatchCaps {
+            rows: ranged_part_rows_for(unit_rows as usize),
+            ..plan.caps
+        };
+        let end = rows.min(start + unit_rows);
+        let mut chunks: Vec<MergeChunk> = Vec::new();
+        docs.scan_docs_row_range(Some(&projection), start..end, &mut |batch| {
+            if batch.num_rows() == 0 {
+                return Ok(());
+            }
+            for part in split_batch_by_bytes(&batch, part_caps) {
+                let mut chunk =
+                    normalize_merge_chunk(key, plan, &part, &synthesized, &mut null_cache)?;
+                if chunk.rows() == 0 {
+                    continue; // fully cleansed part (order skipped the rows)
+                }
+                // decouple the unit from the decode's backing buffers.
+                // M25: SYNTHESIZED all-null columns skip the copy — they
+                // are our own shared allocations (see [`NullArrayCache`]),
+                // not views into the reader's decode buffers.
+                chunk.timestamps = as_int64_array(&deep_copy_array(&chunk.timestamps)?)?;
+                chunk.source = as_string_array(&deep_copy_array(&chunk.source)?)?;
+                chunk.original = as_string_array(&deep_copy_array(&chunk.original)?)?;
+                for (index, column) in chunk.cs.iter_mut().enumerate() {
+                    if chunk.synthesized.get(index).copied().unwrap_or(false) {
+                        continue;
+                    }
+                    *column = deep_copy_array(column.as_ref())?;
+                }
+                chunks.push(chunk);
+            }
+            Ok(())
+        })
+        .map_err(|e| anyhow::anyhow!("stream core file {key} rows {start}..{end}: {e}"))?;
+        start = end;
+        // adapt the next unit to the measured arrow weight of this one
+        let unit_arrow: usize = chunks.iter().map(merge_chunk_arrow_bytes).sum();
+        let unit_sent_rows: usize = chunks.iter().map(MergeChunk::rows).sum();
+        if unit_sent_rows > 0 {
+            est_row_arrow_bytes = (unit_arrow / unit_sent_rows).max(64);
+        }
+        if let Some(last) = chunks.last_mut() {
+            last.last_in_unit = true;
+            sent_units += 1;
+        }
+        for chunk in chunks {
+            if tx.send(Ok(chunk)).is_err() {
+                // consumer gone (finished or failed): stop quietly
+                return Err(anyhow::anyhow!("merge staging stopped"));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The staging side of one input's decode stream: buffers only the chunks
 /// covering the not-yet-pushed rows the open window needs.
 struct InputCursor {
@@ -1671,6 +2963,21 @@ struct InputCursor {
     /// Rows staged into the open window (starting at `consumed`, running
     /// across `pending` in order).
     staged: usize,
+    /// M23b decode admission (gated cursors only; `None` = free-running,
+    /// the sequential drain paths).
+    gate: Option<Arc<DecodeGate>>,
+    /// Decode units granted to the producer (it may decode unit `u` while
+    /// `granted_units >= u`).
+    granted_units: u64,
+    /// Decode units fully received (`last_in_unit` chunks seen). The grant
+    /// invariant `granted_units <= delivered_units + 1` bounds each input to
+    /// ONE unit in flight beyond its delivered ones.
+    delivered_units: u64,
+    /// Rows delivered but not yet staged/consumed — the input's remaining
+    /// lookahead, maintained incrementally (the low-water prefetch trigger).
+    lookahead_rows: usize,
+    /// [`merge_low_water_rows`] of the plan's caps, resolved at spawn.
+    low_water_rows: usize,
 }
 
 /// One input's contribution to one merge window (the interleave sources).
@@ -1706,6 +3013,9 @@ fn concat_parts(parts: Vec<ArrayRef>) -> Result<ArrayRef, anyhow::Error> {
 }
 
 impl InputCursor {
+    /// A free-running cursor (no decode admission): the sequential drain
+    /// paths, where one input is consumed at a time and the channel bound is
+    /// the right in-flight cap.
     fn new(key: String, rx: Receiver<Result<MergeChunk, anyhow::Error>>) -> Self {
         Self {
             key,
@@ -1713,6 +3023,39 @@ impl InputCursor {
             pending: VecDeque::new(),
             consumed: 0,
             staged: 0,
+            gate: None,
+            granted_units: 0,
+            delivered_units: 0,
+            lookahead_rows: 0,
+            low_water_rows: 0,
+        }
+    }
+
+    /// M23b: a gated cursor for the k-way window staging. `gate` must be the
+    /// one the producer was spawned with, pre-granted ONE unit (the spawn is
+    /// the demand for unit 1).
+    fn gated(
+        key: String,
+        rx: Receiver<Result<MergeChunk, anyhow::Error>>,
+        gate: Arc<DecodeGate>,
+        low_water_rows: usize,
+    ) -> Self {
+        let mut cursor = Self::new(key, rx);
+        cursor.gate = Some(gate);
+        cursor.granted_units = 1;
+        cursor.low_water_rows = low_water_rows;
+        cursor
+    }
+
+    /// Grant the producer its next decode unit if none is in flight
+    /// (`granted_units == delivered_units`) — the ONLY grant path, so
+    /// `granted_units <= delivered_units + 1` holds by construction.
+    fn ensure_grant(&mut self) {
+        if let Some(gate) = &self.gate
+            && self.granted_units == self.delivered_units
+        {
+            self.granted_units += 1;
+            gate.grant_to(self.granted_units);
         }
     }
 
@@ -1725,13 +3068,33 @@ impl InputCursor {
         }
     }
 
-    /// The next whole chunk in row order (the sequential path).
+    /// The next whole chunk in row order (the sequential path — free-running
+    /// cursors only).
     fn next_chunk(&mut self) -> Result<Option<MergeChunk>, anyhow::Error> {
         debug_assert_eq!(self.consumed + self.staged, 0);
+        debug_assert!(self.gate.is_none(), "next_chunk on a gated cursor");
         if let Some(chunk) = self.pending.pop_front() {
             return Ok(Some(chunk));
         }
         self.recv_chunk()
+    }
+
+    /// M23b: pull one more chunk into `pending`, keeping the admission
+    /// bookkeeping current. `false` = the stream ended cleanly.
+    fn recv_into_pending(&mut self) -> Result<bool, anyhow::Error> {
+        // demand: never block on a channel without a unit in flight — an
+        // un-exhausted producer then always progresses toward this recv
+        // (the deadlock-freedom half the gate comment relies on)
+        self.ensure_grant();
+        let Some(chunk) = self.recv_chunk()? else {
+            return Ok(false);
+        };
+        self.lookahead_rows += chunk.rows();
+        if chunk.last_in_unit {
+            self.delivered_units += 1;
+        }
+        self.pending.push_back(chunk);
+        Ok(true)
     }
 
     /// Stage the next unstaged row for the open window and return its
@@ -1744,23 +3107,31 @@ impl InputCursor {
         loop {
             match self.pending.get(chunk_index) {
                 Some(chunk) if position < chunk.rows() => {
+                    let bytes = chunk.row_bytes[position] as usize;
                     self.staged += 1;
-                    return Ok(chunk.row_bytes[position] as usize);
+                    self.lookahead_rows = self.lookahead_rows.saturating_sub(1);
+                    // low-water prefetch: the remaining lookahead of THIS
+                    // input is about to run out — grant the next unit now so
+                    // its decode overlaps the remaining consumption instead
+                    // of stalling the (much slower) scan at exhaustion.
+                    if self.lookahead_rows < self.low_water_rows {
+                        self.ensure_grant();
+                    }
+                    return Ok(bytes);
                 }
                 Some(chunk) => {
                     position -= chunk.rows();
                     chunk_index += 1;
                 }
-                None => match self.recv_chunk()? {
-                    Some(chunk) => self.pending.push_back(chunk),
-                    None => {
+                None => {
+                    if !self.recv_into_pending()? {
                         return Err(anyhow::anyhow!(
                             "core file {}: docs stream ended before all rows of the timestamp \
                              column were staged",
                             self.key
                         ));
                     }
-                },
+                }
             }
         }
     }
@@ -1810,6 +3181,17 @@ impl InputCursor {
     }
 }
 
+impl Drop for InputCursor {
+    fn drop(&mut self) {
+        // release a producer parked at the gate (its next send then fails on
+        // the dropped rx and the thread exits) — cursors drop before their
+        // thread scope joins, on success and unwind alike
+        if let Some(gate) = &self.gate {
+            gate.close();
+        }
+    }
+}
+
 /// Stream the merged rows to `push` in bounded windows: walk `order` (the
 /// merged doc order), staging each row on its input's cursor, and close a
 /// window when it reaches the plan's row cap or byte budget. Each window
@@ -1830,15 +3212,64 @@ fn stream_merge_windows(
     ) -> Result<(), anyhow::Error>,
 ) -> Result<usize, anyhow::Error> {
     std::thread::scope(|scope| {
-        let mut cursors: Vec<InputCursor> = inputs
-            .iter()
-            .map(|(key, data)| {
-                InputCursor::new(
-                    key.clone(),
-                    spawn_input_stream(scope, key, Arc::clone(data), plan),
-                )
-            })
-            .collect();
+        // M23: decode streams spawn LAZILY, on the first row the merge order
+        // actually needs from an input — NOT all upfront. Spawning every
+        // input's decode thread at once made a CONCATENATION-shaped order
+        // (disjoint inputs — the dominant compaction group shape) buffer the
+        // entire not-yet-consumed group DECODED in RAM: each idle input's
+        // thread eagerly decoded its whole (small) file into its bounded
+        // channel and sat on it until the scan reached that input. For a
+        // group of hundreds of small L0 files that is ~2-3x the group's
+        // original bytes of arrow, climbing at aggregate-decode speed — the
+        // production compactor OOM (M23). Lazy spawn keeps in-flight decode
+        // O(active input) on concatenation orders.
+        //
+        // M23b: an INTERLEAVED k-way order (overlapping inputs — the prod
+        // L0 population of one (stream,hour)) touches every input within
+        // the first window, so lazy spawn degenerates to eager — and the
+        // free-running stream's decode unit is the STORED chunk, for a
+        // small L0 file effectively the whole file: whole group resident
+        // again, the OOM signature unchanged (measured: 256x12MB
+        // interleaved peaks ~11.4 GB either way). Inputs whose rows are
+        // SCATTERED across the order therefore stream as GATED row-range
+        // decodes ([`spawn_ranged_input_stream`]): ≤ one `caps.rows` unit
+        // in flight beyond the delivered-and-unconsumed one, granted by
+        // demand or low-water prefetch — resident decode
+        // O(mid-flight inputs x caps unit) instead of O(group bytes).
+        // CONTIGUOUS-run inputs (concatenation orders — the dominant
+        // compaction shape, M23) and low-scatter orders keep the
+        // free-running stream: their consumption drains each input as it
+        // spawns, and they skip the ranged scan's decode redundancy.
+        let scattered: Vec<bool> = {
+            // per input: rows in `order` + [first, last] order positions
+            let mut count = vec![0usize; inputs.len()];
+            let mut first = vec![usize::MAX; inputs.len()];
+            let mut last = vec![0usize; inputs.len()];
+            for (position, &(input, _)) in order.iter().enumerate() {
+                count[input] += 1;
+                if first[input] == usize::MAX {
+                    first[input] = position;
+                }
+                last[input] = position;
+            }
+            let scattered: Vec<bool> = (0..inputs.len())
+                .map(|input| count[input] > 0 && last[input] - first[input] + 1 != count[input])
+                .collect();
+            let scattered_inputs = scattered.iter().filter(|s| **s).count();
+            if scattered_inputs >= MERGE_SCATTERED_INPUTS_MIN {
+                log::debug!(
+                    "vix merge: {scattered_inputs} of {} inputs are order-scattered: gated \
+                     row-range decode streams (unit {} rows)",
+                    inputs.len(),
+                    plan.caps.rows.max(1)
+                );
+                scattered
+            } else {
+                vec![false; inputs.len()]
+            }
+        };
+        let low_water_rows = merge_low_water_rows(plan.caps);
+        let mut cursors: Vec<Option<InputCursor>> = (0..inputs.len()).map(|_| None).collect();
 
         let mut windows = 0usize;
         let mut start = 0usize;
@@ -1848,7 +3279,26 @@ fn stream_merge_windows(
             let mut bytes = 0usize;
             while end < order.len() && end - start < plan.caps.rows.max(1) {
                 let (input, _) = order[end];
-                bytes = bytes.saturating_add(cursors[input].stage_next_row()?);
+                let cursor = cursors[input].get_or_insert_with(|| {
+                    let (key, data, _) = &inputs[input];
+                    if scattered[input] {
+                        let gate = DecodeGate::new(1);
+                        let stream = spawn_ranged_input_stream(
+                            scope,
+                            key,
+                            Arc::clone(data),
+                            plan,
+                            Arc::clone(&gate),
+                        );
+                        InputCursor::gated(key.clone(), stream, gate, low_water_rows)
+                    } else {
+                        InputCursor::new(
+                            key.clone(),
+                            spawn_input_stream(scope, key, Arc::clone(data), plan),
+                        )
+                    }
+                });
+                bytes = bytes.saturating_add(cursor.stage_next_row()?);
                 end += 1;
                 if bytes >= plan.caps.bytes.max(1) {
                     break;
@@ -1857,12 +3307,9 @@ fn stream_merge_windows(
 
             let staged: Vec<StagedInput> = cursors
                 .iter_mut()
-                .map(|cursor| {
-                    if cursor.staged > 0 {
-                        cursor.take_staged(plan)
-                    } else {
-                        Ok(empty_staged_input(plan))
-                    }
+                .map(|cursor| match cursor {
+                    Some(cursor) if cursor.staged > 0 => cursor.take_staged(plan),
+                    _ => Ok(empty_staged_input(plan)),
                 })
                 .collect::<Result<_, _>>()?;
 
@@ -1893,6 +3340,7 @@ fn stream_merge_windows(
             } else {
                 None
             };
+            // the preserved columns, in MergeChunk::cs positional order
             let cs_columns: Vec<(String, ArrayRef)> = plan
                 .preserved
                 .iter()
@@ -1905,59 +3353,479 @@ fn stream_merge_windows(
                 .collect::<Result<_, arrow::error::ArrowError>>()?;
             push(&timestamps, &cs_columns, &source, original.as_ref())?;
             windows += 1;
+            // M23b transit gauge (debug builds of the OOM analysis): counts
+            // only — proves the staged-transit bound vs writer-side growth.
+            // m25: plus the pending chunks' ARROW bytes (width-scaled: every
+            // pending chunk holds one array per preserved column, null
+            // arrays included).
+            if windows % 100 == 0 && log::log_enabled!(log::Level::Debug) {
+                let mut live = 0usize;
+                let mut pending_rows = 0usize;
+                let mut pending_arrow_bytes = 0usize;
+                let mut inflight_units = 0u64;
+                for cursor in cursors.iter().flatten() {
+                    live += 1;
+                    for chunk in &cursor.pending {
+                        pending_rows += chunk.rows();
+                        pending_arrow_bytes += merge_chunk_arrow_bytes(chunk);
+                    }
+                    inflight_units += cursor.granted_units - cursor.delivered_units;
+                }
+                log::debug!(
+                    "vix merge: window {windows}: {live} cursors, {pending_rows} pending rows, \
+                     {pending_arrow_bytes} pending arrow bytes, {inflight_units} decode units \
+                     in flight"
+                );
+            }
             start = end;
         }
         Ok(windows)
     })
 }
 
-/// Stream the inputs' rows to `push` input-by-input in `input_order` (the
-/// disjoint fast path: the merged docs blob is the inputs' rows
-/// concatenated). All inputs decode in parallel, each a bounded channel
-/// ahead of the staging; every pushed batch is byte-capped. Returns the
-/// number of batches pushed.
-fn stream_inputs_sequential(
+/// Stream the inputs' rows into `writer` input-by-input in `input_order`
+/// (the disjoint fast path: the merged docs blob is the inputs' rows
+/// concatenated). Decoding inputs run in parallel, each a bounded channel
+/// ahead of the staging; every pushed batch is byte-capped. Inputs that
+/// qualify (#51c — the DEFAULT merge shape) skip decoding entirely: their
+/// docs chunks are copied in stored (compressed) form through the writer's
+/// encoded-run API, their zone tables spliced verbatim, and — when the plan
+/// carries #52 bloom-only fields — ONLY those columns are decoded (a
+/// projected scan) for composite-bloom coverage. A qualification or
+/// pre-push failure silently falls back to the decode path for that input
+/// only. Returns `(batches_pushed, passthrough_inputs, sliced_windows)`.
+fn stream_inputs_disjoint(
     inputs: &[MergeInput],
+    readers: &[&VixReader],
     plan: &MergePlan,
     input_order: &[usize],
-    mut push: impl FnMut(
-        &Int64Array,
-        &[(String, ArrayRef)],
-        &StringArray,
-        Option<&StringArray>,
-    ) -> Result<(), anyhow::Error>,
-) -> Result<usize, anyhow::Error> {
-    std::thread::scope(|scope| {
-        let mut cursors: Vec<InputCursor> = input_order
-            .iter()
-            .map(|&index| {
-                let (key, data) = &inputs[index];
-                InputCursor::new(
-                    key.clone(),
-                    spawn_input_stream(scope, key, Arc::clone(data), plan),
-                )
-            })
-            .collect();
-        let mut batches = 0usize;
-        for cursor in &mut cursors {
-            while let Some(chunk) = cursor.next_chunk()? {
-                let cs_columns: Vec<(String, ArrayRef)> = plan
-                    .preserved
-                    .iter()
-                    .zip(&chunk.cs)
-                    .map(|((name, _), column)| (name.clone(), Arc::clone(column)))
-                    .collect();
-                push(
-                    &chunk.timestamps,
-                    &cs_columns,
-                    &chunk.source,
-                    plan.store_original.then_some(&chunk.original),
-                )?;
-                batches += 1;
+    timestamps: &[Int64Array],
+    docs_passthrough: bool,
+    writer: &mut VixWriter,
+) -> Result<(usize, usize, u64), anyhow::Error> {
+    // Qualify up front, so decode threads spawn only for decoding inputs.
+    // `docs_passthrough` mirrors the writer's own construction (false only
+    // under the force_decode test seam): a non-passthrough writer cannot
+    // accept encoded runs, so qualifying would be a pointless probe.
+    let mut qualified: Vec<Option<PassthroughSplice>> = (0..inputs.len()).map(|_| None).collect();
+    if docs_passthrough {
+        for &index in input_order {
+            let key = &inputs[index].0;
+            match qualify_passthrough_input(readers[index], timestamps[index].len() as u64, writer)
+            {
+                Ok(splice) => {
+                    log::debug!(
+                        "vix merge: input {key} qualifies for docs passthrough ({} zone entries)",
+                        splice.zone_entries.len()
+                    );
+                    qualified[index] = Some(splice);
+                }
+                Err(reason) => {
+                    log::debug!(
+                        "vix merge: input {key} does not qualify for docs passthrough \
+                         (decode path): {reason}"
+                    );
+                }
             }
         }
-        Ok(batches)
+    }
+
+    // M12: the #52 composite-bloom coverage scans of the qualified inputs —
+    // restricted per input to the fields the k-way dictionary walk cannot
+    // absorb from it (double-hash elimination) and run in PARALLEL across
+    // inputs on the merge thread budget (hash absorption commutes; each
+    // worker's set folds into the writer by union, identical to any
+    // sequential order). A failed scan demotes that input to the decode
+    // path — the same fallback a mid-copy scan failure took before — and
+    // its partial hashes are discarded (the decode push re-hashes every
+    // value; the sets dedupe).
+    let mut scan_queue: Vec<(usize, vortex_index::BloomOnlyHasher)> = Vec::new();
+    for &index in input_order {
+        if qualified[index].is_none() {
+            continue; // decode inputs hash at push time
+        }
+        let fields = bloom_scan_fields_for_input(writer, readers[index]);
+        if fields.is_empty() {
+            continue;
+        }
+        let hasher = writer.bloom_only_hasher(&fields);
+        if !hasher.is_empty() {
+            scan_queue.push((index, hasher));
+        }
+    }
+    if !scan_queue.is_empty() {
+        let started = std::time::Instant::now();
+        let tasks = scan_queue.len();
+        let workers = merge_threads().min(tasks).max(1);
+        let queue = std::sync::Mutex::new(scan_queue);
+        type ScanOutcome = Result<vortex_index::BloomEncodingCensus, anyhow::Error>;
+        let done: std::sync::Mutex<Vec<(usize, vortex_index::BloomOnlyHasher, ScanOutcome)>> =
+            std::sync::Mutex::new(Vec::with_capacity(tasks));
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| {
+                    loop {
+                        let Some((index, mut hasher)) = queue.lock().unwrap().pop() else {
+                            break;
+                        };
+                        let (key, data, _) = &inputs[index];
+                        let outcome = scan_bloom_coverage(key, Arc::clone(data), &mut hasher);
+                        done.lock().unwrap().push((index, hasher, outcome));
+                    }
+                });
+            }
+        });
+        let mut results = done.into_inner().unwrap();
+        // absorb in input order — cosmetic determinism (union commutes)
+        results.sort_unstable_by_key(|(index, ..)| *index);
+        let mut census = vortex_index::BloomEncodingCensus::default();
+        for (index, hasher, outcome) in results {
+            match outcome {
+                Ok(input_census) => {
+                    census.absorb(input_census);
+                    writer.absorb_bloom_only_hashes(hasher);
+                }
+                Err(reason) => {
+                    log::debug!(
+                        "vix merge: input {} fell back to the decode path (coverage scan): \
+                         {reason:#}",
+                        inputs[index].0
+                    );
+                    qualified[index] = None;
+                }
+            }
+        }
+        // M17 item 2's prod probe: one line per merge, counts only —
+        // which encoding classes the demoted-field byte volume rides.
+        log::info!(
+            "vix merge: bloom coverage encoding census: dict={} fsst={} other={} chunks over \
+             {tasks} inputs ({workers} workers, {:?})",
+            census.dict_chunks,
+            census.fsst_chunks,
+            census.other_chunks,
+            started.elapsed()
+        );
+    }
+
+    std::thread::scope(|scope| {
+        // M23b: decode streams spawn when their input's DRAIN starts — not
+        // all upfront. The drain is strictly input-by-input, so an upfront
+        // spawn made every not-yet-reached decode input buffer
+        // min(whole file, channel allowance) decoded for the whole time the
+        // earlier inputs drained — the M23 whole-group pathology whenever
+        // many inputs take the decode path (e.g. a type-flipped column
+        // disqualifying the passthrough). One active input needs no
+        // admission gate: the channel bound is the right in-flight cap.
+        let mut batches = 0usize;
+        let mut passthrough_inputs = 0usize;
+        let mut sliced_windows = 0u64;
+        for &index in input_order {
+            let (key, data, _) = &inputs[index];
+            if let Some(splice) = &qualified[index] {
+                match copy_passthrough_input(
+                    key,
+                    Arc::clone(data),
+                    &timestamps[index],
+                    splice,
+                    writer,
+                ) {
+                    Ok((chunks, sliced)) => {
+                        log::debug!(
+                            "vix merge: input {key} copied through docs passthrough \
+                             ({chunks} encoded chunks, {sliced} sliced column-windows \
+                             canonicalized)"
+                        );
+                        batches += chunks;
+                        passthrough_inputs += 1;
+                        sliced_windows += sliced;
+                        continue;
+                    }
+                    // nothing reached the writer: this input can still take
+                    // the decode path (spawn its stream now)
+                    Err(PassthroughFailure::BeforePush(reason)) => {
+                        log::debug!(
+                            "vix merge: input {key} fell back to the decode path: {reason:#}"
+                        );
+                        let mut cursor = InputCursor::new(
+                            key.clone(),
+                            spawn_input_stream(scope, key, Arc::clone(data), plan),
+                        );
+                        batches += drain_input_cursor(&mut cursor, plan, writer)?;
+                    }
+                    // encoded chunks already reached the writer: the docs
+                    // blob is part-written, no fallback can express that
+                    Err(PassthroughFailure::Poisoned(error)) => return Err(error),
+                }
+            } else {
+                let mut cursor = InputCursor::new(
+                    key.clone(),
+                    spawn_input_stream(scope, key, Arc::clone(data), plan),
+                );
+                batches += drain_input_cursor(&mut cursor, plan, writer)?;
+            }
+        }
+        Ok((batches, passthrough_inputs, sliced_windows))
     })
+}
+
+/// Drain one decoding input's chunks into the writer (the disjoint decode
+/// path, unchanged from before #51c).
+fn drain_input_cursor(
+    cursor: &mut InputCursor,
+    plan: &MergePlan,
+    writer: &mut VixWriter,
+) -> Result<usize, anyhow::Error> {
+    let mut batches = 0usize;
+    while let Some(chunk) = cursor.next_chunk()? {
+        let cs_columns: Vec<(String, ArrayRef)> = plan
+            .preserved
+            .iter()
+            .zip(&chunk.cs)
+            .map(|((name, _), column)| (name.clone(), Arc::clone(column)))
+            .collect();
+        writer.push_docs_rows_unindexed(
+            &chunk.timestamps,
+            &cs_columns,
+            &chunk.source,
+            plan.store_original.then_some(&chunk.original),
+        )?;
+        batches += 1;
+    }
+    Ok(batches)
+}
+
+/// Why one input's #51c passthrough copy did not complete.
+enum PassthroughFailure {
+    /// Nothing reached the writer yet — the input silently takes the
+    /// decode path.
+    BeforePush(anyhow::Error),
+    /// Encoded chunks were already stored — the merge must abort (the
+    /// docs blob cannot be un-written).
+    Poisoned(anyhow::Error),
+}
+
+/// One qualified passthrough input's spliceable metadata: its zone table
+/// (verbatim entries), its per-column chunk stats + presence counts, its §4
+/// region decomposition (per-run row counts, `None` = unproven — poisons
+/// the output's region table while the copy proceeds), and the M17 widen
+/// plan mapping its chunks into the output docs schema (identity when the
+/// schemas already match; null-synthesizing when the output union is a
+/// strict superset — the gen-1 encode-once case).
+struct PassthroughSplice {
+    zone_entries: Vec<vortex_index::ZoneEntry>,
+    stats: vortex_index::SpliceableStats,
+    regions: Option<Vec<u64>>,
+    widen: vortex_index::DocsWidenPlan,
+}
+
+/// #51c qualification of one disjoint-merge input for the encoded-chunk
+/// copy. Every check is metadata-cheap (footer + one small stats-blob
+/// fetch); any miss returns the reason and the input takes the decode path.
+/// STRUCTURAL stats guarantee (H2/§4): an input without a spliceable stats
+/// table — a pre-stats file, or misaligned tables — CANNOT copy through;
+/// it decodes and the output computes fresh stats, so a passthrough output
+/// always carries full pruning metadata (the v1 stats-loss regression is
+/// impossible by construction).
+fn qualify_passthrough_input(
+    reader: &VixReader,
+    materialized_rows: u64,
+    writer: &VixWriter,
+) -> Result<PassthroughSplice, String> {
+    if materialized_rows == 0 {
+        return Err("the input is empty".to_string());
+    }
+    if reader.row_count() != materialized_rows {
+        return Err(format!(
+            "row_count property ({}) disagrees with the timestamp column ({materialized_rows} \
+             rows)",
+            reader.row_count()
+        ));
+    }
+    let input_schema = match reader.docs_schema() {
+        Ok(schema) => schema,
+        Err(error) => return Err(format!("unreadable docs schema: {error:#}")),
+    };
+    // M17: schema identity is no longer required — a widen plan maps the
+    // input's chunks into the output union (missing columns synthesize as
+    // all-null constants). Only a genuine type flip (or a column the output
+    // would drop) still forces this input onto the decode path.
+    let widen = vortex_index::docs_widen_plan(&input_schema, writer.docs_schema())?;
+    let Some(chunks) = reader.zone_chunks() else {
+        return Err("no zone table (pre-zone-map file)".to_string());
+    };
+    let entries: Vec<vortex_index::ZoneEntry> = chunks
+        .iter()
+        .map(|zone| (zone.row_count, zone.ts_min, zone.ts_max))
+        .collect();
+    let covered: u64 = entries.iter().map(|(rows, ..)| rows).sum();
+    if covered != materialized_rows {
+        return Err(format!(
+            "zone table covers {covered} of {materialized_rows} rows"
+        ));
+    }
+    let stats = match reader.spliceable_stats() {
+        Ok(Some(stats)) => stats,
+        Ok(None) => {
+            return Err(
+                "no spliceable column stats (pre-stats file) — the decode path computes them \
+                 fresh"
+                    .to_string(),
+            );
+        }
+        Err(error) => return Err(format!("unreadable stats blob: {error:#}")),
+    };
+    if let Err(reason) = vortex_index::validate_spliceable(&stats, entries.len()) {
+        return Err(format!("stats not spliceable: {reason}"));
+    }
+    // §4 region decomposition: a ts_desc input is ONE desc run; a concat
+    // input contributes its own proven region table; a concat input without
+    // one stays copyable but poisons the output's region table (fail-open).
+    let regions = reader
+        .ts_desc_row_ranges()
+        .map(|ranges| ranges.iter().map(|r| r.end - r.start).collect());
+    Ok(PassthroughSplice {
+        zone_entries: entries,
+        stats,
+        regions,
+        widen,
+    })
+}
+
+/// Copy one qualified input through the #51c passthrough: splice its zone
+/// table, then stream its docs chunks in stored form into the writer.
+/// Returns `(encoded chunks copied, sliced column-windows canonicalized)` —
+/// the second is the M18 deterministic slice guard's per-input count (a
+/// window cutting inside one column's stored leaf re-encodes that column
+/// window instead of copying a form that cannot survive serialize). Pure
+/// copy since M12 — the #52 bloom-only coverage scan runs BEFORE the copy
+/// loop, in parallel across inputs ([`scan_bloom_coverage`] via
+/// [`bloom_scan_fields_for_input`]); the HEAL passthrough never scanned
+/// here anyway (its index-building decoded scan hashes every bloom-only
+/// value).
+fn copy_passthrough_input(
+    key: &str,
+    data: Arc<dyn vortex_index::VixRangeSource>,
+    timestamps: &Int64Array,
+    splice: &PassthroughSplice,
+    writer: &mut VixWriter,
+) -> Result<(usize, u64), PassthroughFailure> {
+    use PassthroughFailure::{BeforePush, Poisoned};
+    let docs = VixDocs::open_ranged(data)
+        .map_err(|e| BeforePush(anyhow::anyhow!("open core file {key}: {e:#}")))?;
+
+    // run bounds from the already-materialized timestamp column — never
+    // from the input's footer stats
+    let rows = timestamps.len() as u64;
+    let (Some(ts_min), Some(ts_max)) = (
+        arrow::compute::min(timestamps),
+        arrow::compute::max(timestamps),
+    ) else {
+        return Err(BeforePush(anyhow::anyhow!(
+            "core file {key}: _timestamp range of a non-empty input is undefined"
+        )));
+    };
+    writer
+        .begin_docs_encoded_run(
+            rows,
+            ts_min,
+            ts_max,
+            &splice.zone_entries,
+            &splice.stats,
+            splice.regions.as_deref(),
+        )
+        .map_err(|e| BeforePush(anyhow::anyhow!("core file {key}: {e:#}")))?;
+    // from here on the writer owns spliced zone entries and (after the
+    // first push) stored chunks: failures are fatal to the whole merge
+    let mut chunks = 0usize;
+    let widen = &splice.widen;
+    let sliced_windows = docs
+        .scan_docs_encoded_chunks(&mut |chunk| {
+            chunks += 1;
+            // M17: chunk-level surgery into the output union (identity = free)
+            writer.push_docs_encoded_chunk(widen.widen(chunk)?)
+        })
+        .map_err(|e| {
+            Poisoned(anyhow::anyhow!(
+                "copy encoded docs chunks of core file {key}: {e:#}"
+            ))
+        })?;
+    if !widen.is_identity() {
+        log::debug!(
+            "vix merge: input {key} chunks widened into the output union ({} null-synthesized \
+             columns per chunk)",
+            widen.null_columns()
+        );
+    }
+    writer
+        .finish_docs_encoded_run()
+        .map_err(|e| Poisoned(anyhow::anyhow!("core file {key}: {e:#}")))?;
+    Ok((chunks, sliced_windows))
+}
+
+/// M12 double-hash elimination: the #52 bloom-only fields whose values the
+/// k-way dictionary walk CANNOT absorb from `reader`'s input — the input
+/// demoted them itself (`bloom` marker: no value terms in its dictionary),
+/// never had term capability for them, or stamped them PARTIAL (its
+/// dictionary is knowingly incomplete; the docs column has every value).
+/// Only these need the projected coverage scan. Dictionary-covered fields
+/// are absorbed exactly once by `observe_bloom_only_key` during the index
+/// merge — before M12 the scan re-hashed them off the docs columns row by
+/// row (a merge-time AUTO demotion like `duration` was hashed 16M times
+/// into a set the dict walk had already completed; the dedupe hid it from
+/// the output bytes while the CPU dominated the merge wall).
+fn bloom_scan_fields_for_input(writer: &VixWriter, reader: &VixReader) -> Vec<String> {
+    writer
+        .bloom_only_fields()
+        .into_iter()
+        .filter(|name| {
+            !reader.has_term_capability(name) || reader.partial_fields().contains(name)
+        })
+        .collect()
+}
+
+/// M12/M17: one input's composite-bloom coverage scan into a detached
+/// hasher — exactly the hasher's fields. PRESENT columns hash off their
+/// ENCODED chunks (M17 item 2 — dict chunks decode only their dictionary
+/// and hash each referenced distinct value once, FSST chunks hash raw
+/// slices off one bulk decompress, other encodings keep the canonical
+/// per-row path; the M12 scan was decode-bandwidth-bound at 8 workers and
+/// this removes the per-row string materialization for the dominant
+/// encodings); fields with NO docs column keep the projected `_source`
+/// scan (#51c-d). One shared per-value policy everywhere, so any path mix
+/// derives bit-identical coverage. Runs on a scan worker thread; the
+/// caller folds the hasher into the writer (set union —
+/// order-independent) and aggregates the returned per-encoding-class
+/// census into the merge summary (the item-2 prod probe).
+fn scan_bloom_coverage(
+    key: &str,
+    data: Arc<dyn vortex_index::VixRangeSource>,
+    hasher: &mut vortex_index::BloomOnlyHasher,
+) -> Result<vortex_index::BloomEncodingCensus, anyhow::Error> {
+    let docs =
+        VixDocs::open_ranged(data).map_err(|e| anyhow::anyhow!("open core file {key}: {e:#}"))?;
+    let input_schema = docs.schema();
+    let (present, missing): (Vec<String>, Vec<String>) = hasher
+        .field_names()
+        .into_iter()
+        .partition(|name| input_schema.field_with_name(name).is_ok());
+    let mut census = vortex_index::BloomEncodingCensus::default();
+    for name in &present {
+        census.absorb(docs.hash_bloom_only_encoded(hasher, name).map_err(|e| {
+            anyhow::anyhow!("bloom-only encoded scan of {name:?} in core file {key}: {e:#}")
+        })?);
+    }
+    if !missing.is_empty() {
+        let projection = vec![SOURCE_COL_NAME.to_string()];
+        docs.scan_docs(Some(&projection), None, None, &mut |batch| {
+            let source = batch.column_by_name(SOURCE_COL_NAME).ok_or_else(|| {
+                anyhow::anyhow!("bloom-only scan lost the {SOURCE_COL_NAME:?} column")
+            })?;
+            hasher.hash_source(source, &missing)?;
+            Ok(())
+        })
+        .map_err(|e| anyhow::anyhow!("bloom-only coverage scan of core file {key}: {e:#}"))?;
+    }
+    Ok(census)
 }
 
 /// The rebuild strategy body: k-way merge order from the timestamp columns,
@@ -1974,13 +3842,24 @@ fn stream_inputs_sequential(
 /// surviving rows, and the writer's finish guard passes by construction.
 /// An all-poison input set yields a legitimate EMPTY file (`row_count` 0)
 /// with `dropped_rows` telling the caller what happened.
+///
+/// #51c HEAL passthrough: when the gate + every-input qualification passes
+/// ([`qualify_heal_passthrough`] — the dominant compactor shape, a
+/// single-file heal of an index-off L0 file, is exactly this), the decoded
+/// scan still runs and builds the ENTIRE index exactly as above, but the
+/// docs rows are NOT re-encoded — each input's already-compressed docs
+/// chunks are copied verbatim instead (docs re-compression is ~2/3 of a
+/// heal's CPU). Any failure after qualification restarts the standard
+/// rebuild from scratch with a fresh writer (never a partial output).
 fn rebuild_over_sources(
     inputs: &[MergeInput],
     sources: &[MergeSource],
     plan: &MergePlan,
 ) -> Result<MergedCoreFile, anyhow::Error> {
-    let mut writer = VixWriter::new(&plan.writer_schema, plan.opts.clone(), plan.store_original);
-
+    // M12 admission: rebuilds (direct AND fast-path fallbacks land here)
+    // are the memory-heavy merge shape — cap how many run at once
+    // process-wide. Fast-path merges never pass through this function.
+    let _rebuild_permit = REBUILD_GATE.acquire();
     let timestamps = read_timestamp_columns(inputs, sources)?;
     let dropped_rows = count_degenerate_ts_rows(&timestamps);
     let timestamps: Vec<Int64Array> = if dropped_rows == 0 {
@@ -1991,8 +3870,25 @@ fn rebuild_over_sources(
             .map(|ts| Int64Array::from_iter_values(ts.values().iter().copied().filter(|t| *t > 0)))
             .collect()
     };
-    let maps = merge_order(&timestamps);
-    let order = merge_order_inverse(&maps);
+    // #51c-c: a concat-order input's rows are declared unsorted — the k-way
+    // merge order is meaningless over it, so the WHOLE rebuild runs in
+    // concatenation order (concat inputs are always legal). Unlike the fast
+    // path, the rebuild's forced concatenation needs no passthrough
+    // qualification: unqualified inputs simply decode, and the coupled
+    // pushes below store them at the same concatenated positions.
+    let forced_concat = first_concat_order_input(inputs, sources);
+    let maps = match forced_concat {
+        // never run merge_order over an unsorted input: its maps are garbage
+        Some(_) => None,
+        None => Some(merge_order(&timestamps)),
+    };
+    let order = match &maps {
+        Some(maps) => merge_order_inverse(maps),
+        None => concat_scan_order(
+            &concat_input_order(inputs, timestamps.as_slice()),
+            &timestamps,
+        ),
+    };
     let expected_rows: usize = sources
         .iter()
         .map(|source| source.row_count() as usize)
@@ -2004,18 +3900,397 @@ fn rebuild_over_sources(
             order.len()
         ));
     }
-    let docs_batches = stream_merge_windows(inputs, plan, &order, |ts, cs, source, original| {
-        writer.push_docs_rows(ts, cs, source, original)
-    })?;
+
+    if let Some(heal) = qualify_heal_passthrough(
+        inputs,
+        sources,
+        plan,
+        &timestamps,
+        maps.as_deref(),
+        dropped_rows,
+    ) {
+        match rebuild_with_docs_passthrough(inputs, plan, &timestamps, heal) {
+            Ok(result) => return Ok(result),
+            // Fallback-silent-safe: the qualified attempt built nothing
+            // durable (its writer, spool and spill die with it) — restart
+            // the standard rebuild below with a fresh writer. Loud, because
+            // qualification said this could not happen.
+            Err(error) => log::warn!(
+                "vix merge: heal docs passthrough failed after qualification; restarting the \
+                 standard rebuild (decode + re-encode): {error:#}"
+            ),
+        }
+    }
+
+    // The standard rebuild: decode + re-encode every row in `order`. Under a
+    // forced concatenation (#51c-c) the writer is stamped concat — its rows
+    // are stored in concatenation order, NOT globally sorted.
+    let mut writer_opts = plan.opts.clone();
+    writer_opts.concat_row_order = forced_concat.is_some();
+    let mut writer = VixWriter::new(&plan.writer_schema, writer_opts, plan.store_original);
+    let docs_batches = if plan.derive_from_columns {
+        // #46: every input is index-off all-columnar — assemble the window
+        // into a RecordBatch and run the COLUMN-driven derivation (the
+        // move-job path, whose byte-parity with the `_source` derivation is
+        // the pinned contract). `project_docs` stores only the docs-schema
+        // columns; the extra derivation columns feed terms and vanish.
+        log::info!(
+            "vix merge: rebuild derives terms from {} columns (index-off inputs)",
+            plan.preserved.len()
+        );
+        stream_merge_windows(inputs, plan, &order, |ts, cs, source, original| {
+            let batch = derivation_window_batch(ts, cs)?;
+            writer.push_batch_with_source(&batch, source, original)?;
+            Ok(())
+        })?
+    } else {
+        stream_merge_windows(inputs, plan, &order, |ts, cs, source, original| {
+            writer.push_docs_rows(ts, cs, source, original)
+        })?
+    };
     log::debug!("vix merge: rebuild staged docs in {docs_batches} bounded batches");
 
-    let (output, stats) = writer.finish_output()?;
+    let (output, index, stats) = writer.finish_output()?;
     Ok(MergedCoreFile {
         output,
+        index,
         stats,
         used_index_merge: false,
         docs_batches,
         dropped_rows,
+        docs_passthrough_inputs: 0,
+        concat_order: forced_concat.is_some(),
+        // the standard rebuild decodes everything: nothing copies, nothing
+        // can carry a foreign encoding into the encoder
+        docs_sliced_windows: 0,
+        docs_failopen_chunks: 0,
+    })
+}
+
+/// Assemble one #46 column-derivation window batch (`_timestamp` + the
+/// preserved ⊕ derivation columns) for [`VixWriter::push_batch_with_source`]
+/// — shared by the standard rebuild and the heal-passthrough scan so the two
+/// derive terms from byte-identical batches.
+fn derivation_window_batch(
+    ts: &Int64Array,
+    cs: &[(String, ArrayRef)],
+) -> Result<RecordBatch, anyhow::Error> {
+    let mut fields: Vec<Field> = Vec::with_capacity(cs.len() + 1);
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(cs.len() + 1);
+    fields.push(Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false));
+    arrays.push(Arc::new(ts.clone()) as ArrayRef);
+    for (name, column) in cs {
+        fields.push(Field::new(name, column.data_type().clone(), true));
+        arrays.push(Arc::clone(column));
+    }
+    Ok(RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)?)
+}
+
+/// One qualified #51c heal-passthrough plan over a rebuild's inputs: the
+/// passthrough writer (constructed with
+/// [`VixWriterOptions::docs_passthrough`] so its docs encoder can accept
+/// copied chunks), the inputs in output-row order, and each input's verbatim
+/// zone table.
+struct HealPassthrough {
+    writer: VixWriter,
+    /// Input indices in OUTPUT-ROW order: sorted by contiguous run offset
+    /// when the merge order is a natural concatenation (disjoint inputs),
+    /// or the deterministic #51c-c concatenation order (min `_timestamp`
+    /// DESC, ties by key) when concatenation is forced/allowed over
+    /// overlapping inputs. Either way the index-building scan consumes the
+    /// inputs in exactly this order, so its doc ids equal the chunk-copy
+    /// positions.
+    input_order: Vec<usize>,
+    /// Per input (parallel to `inputs`): `Some` = the zone table + column
+    /// stats to splice and the widen plan (chunk copy); `None` = this input
+    /// FAILED qualification (type flip, stats-less, unreadable index) and
+    /// takes the decode + re-encode path at its concatenated position (M17
+    /// per-input fail-open — counted in the merge summary).
+    splices: Vec<Option<PassthroughSplice>>,
+    /// #51c-c: the output is concatenation-ordered over OVERLAPPING inputs
+    /// (stamped `row_order=concat`); `false` = the disjoint case, whose
+    /// concatenation IS globally sorted.
+    concat_order: bool,
+}
+
+/// #51c heal-passthrough gate + per-input qualification for a REBUILD.
+/// `None` (with the reason logged at debug) keeps today's full rebuild.
+///
+/// The doc-id/row-order invariant this enforces: the rebuild's index build
+/// assigns doc ids sequentially over the scanned rows, and the copied docs
+/// chunks must hold THE SAME rows at THE SAME positions. That holds exactly
+/// when
+/// - no row is cleansed (`dropped_rows == 0` — degenerate-`_timestamp` cleansing filters scan rows
+///   the copied chunks would still carry),
+/// - the scan order is a pure concatenation of the inputs: naturally so for disjoint inputs
+///   ([`contiguous_offsets`]; a single-input heal is trivially contiguous), and — #51c-c — BY
+///   CHOICE for overlapping inputs, whose scan then runs in the deterministic concatenation order
+///   and the output is stamped `row_order=concat`, and
+/// - each input's stored chunks cover its timestamp column's rows exactly, in row order
+///   ([`qualify_passthrough_input`]'s row-count and zone-table checks; the encoded-run API
+///   re-verifies per copied chunk).
+///
+/// The SCHEMA gate rides in [`qualify_passthrough_input`]: the input's docs
+/// schema must WIDEN into the output's (M17 — shared columns identical at
+/// the stored dtype; output-only columns synthesize as all-null constants,
+/// which is exactly what the decode path would store for them). Only a
+/// genuine type flip (or a stats-less/unreadable input) forces that input
+/// onto the per-input decode fail-open.
+///
+/// `maps` is `None` when a concat-order INPUT forced the caller to skip the
+/// k-way merge order entirely: the heal, if it qualifies, runs in
+/// concatenation order.
+fn qualify_heal_passthrough(
+    inputs: &[MergeInput],
+    sources: &[MergeSource],
+    plan: &MergePlan,
+    timestamps: &[Int64Array],
+    maps: Option<&[Vec<u32>]>,
+    dropped_rows: u64,
+) -> Option<HealPassthrough> {
+    if plan.caps.force_decode {
+        return None;
+    }
+    if !plan.opts.index_enabled {
+        // An index-off plan's rebuild is a pure docs copy already (no terms
+        // to split from the store); it only lands here for degenerate or
+        // unreadable-index inputs — keep those on the conservative path.
+        log::debug!("vix merge: heal passthrough disqualified: index-off plan");
+        return None;
+    }
+    if dropped_rows > 0 {
+        log::debug!(
+            "vix merge: heal passthrough disqualified: {dropped_rows} degenerate-_timestamp \
+             row(s) must be cleansed, which a chunk copy cannot express"
+        );
+        return None;
+    }
+    // Output-row order: the natural concatenation when the inputs are
+    // disjoint; otherwise (overlap, or a concat input that skipped the
+    // k-way order entirely) the #51c-c concatenation order — the output's
+    // rows are then NOT globally sorted and the file is stamped concat.
+    let natural_offsets = maps.and_then(contiguous_offsets);
+    let concat_order = natural_offsets.is_none();
+
+    let mut writer_opts = plan.opts.clone();
+    writer_opts.docs_passthrough = true;
+    writer_opts.concat_row_order = concat_order;
+    let writer = VixWriter::new(&plan.writer_schema, writer_opts, plan.store_original);
+    // M17 per-input verdicts: a qualification miss no longer kills the
+    // whole copy — that input decodes + re-encodes at its concatenated
+    // position while every qualified input still copies (the index scan
+    // covers every row either way, so doc ids stay position-exact).
+    let mut splices: Vec<Option<PassthroughSplice>> = Vec::with_capacity(inputs.len());
+    let mut qualified = 0usize;
+    for (index, source) in sources.iter().enumerate() {
+        let verdict = match source {
+            MergeSource::Indexed(reader) => {
+                qualify_passthrough_input(reader, timestamps[index].len() as u64, &writer)
+            }
+            MergeSource::DocsOnly(_) => Err(
+                "unreadable index (DocsOnly source) — its metadata cannot be trusted for a \
+                 verbatim chunk copy"
+                    .to_string(),
+            ),
+        };
+        match verdict {
+            Ok(splice) => {
+                qualified += 1;
+                splices.push(Some(splice));
+            }
+            Err(reason) => {
+                log::debug!(
+                    "vix merge: rebuild input {} takes the decode path (of a docs-copy \
+                     rebuild): {reason}",
+                    inputs[index].0,
+                );
+                splices.push(None);
+            }
+        }
+    }
+    if qualified == 0 {
+        log::debug!(
+            "vix merge: docs-copy rebuild disqualified: none of the {} inputs qualified",
+            inputs.len()
+        );
+        return None;
+    }
+    let input_order = match &natural_offsets {
+        Some(offsets) => {
+            let mut order: Vec<usize> = (0..inputs.len()).collect();
+            order.sort_unstable_by_key(|&index| offsets[index]);
+            order
+        }
+        None => concat_input_order(inputs, timestamps),
+    };
+    if concat_order {
+        log::debug!(
+            "vix merge: heal passthrough takes the #51c-c concatenation order over {} \
+             overlapping inputs",
+            inputs.len()
+        );
+    }
+    Some(HealPassthrough {
+        writer,
+        input_order,
+        splices,
+        concat_order,
+    })
+}
+
+/// The #51c/M17 docs-copy rebuild body (see [`rebuild_over_sources`]): the
+/// SAME decoded windowed scan as the standard rebuild feeds ONLY the index
+/// (terms, key terms, #52 bloom-only hashes, oversize/partial accounting —
+/// via the writer's index-only pushes), then every input's docs land in
+/// output-row order: QUALIFIED inputs copy their encoded chunks verbatim
+/// (widened by null-column synthesis when the output union is wider — the
+/// M17 gen-1 encode-once path; zone tables spliced, `row_count`/ts range
+/// advancing on the copy side), UNQUALIFIED inputs decode + re-encode
+/// through store-only pushes at the same positions (per-input fail-open,
+/// counted in the merge summary). The writer's finish refuses any
+/// index/docs row-count divergence.
+///
+/// The scan runs in `heal.input_order`'s concatenation — for disjoint
+/// inputs that IS the merge order; for a #51c-c concatenation heal it is
+/// the output's (unsorted) row order, so the index doc ids match the
+/// stored positions by construction either way.
+///
+/// Errors leave nothing durable — the caller restarts the standard rebuild.
+fn rebuild_with_docs_passthrough(
+    inputs: &[MergeInput],
+    plan: &MergePlan,
+    timestamps: &[Int64Array],
+    heal: HealPassthrough,
+) -> Result<MergedCoreFile, anyhow::Error> {
+    let HealPassthrough {
+        mut writer,
+        input_order,
+        splices,
+        concat_order,
+    } = heal;
+    let order = concat_scan_order(&input_order, timestamps);
+
+    // 1) Index build: today's decoded scan, docs staging detached.
+    let started = std::time::Instant::now();
+    let scan_windows = if plan.derive_from_columns {
+        log::info!(
+            "vix merge: heal-passthrough rebuild derives terms from {} columns \
+             (index-off inputs)",
+            plan.preserved.len()
+        );
+        stream_merge_windows(inputs, plan, &order, |ts, cs, source, original| {
+            let batch = derivation_window_batch(ts, cs)?;
+            writer.push_batch_with_source_index_only(&batch, source, original)?;
+            Ok(())
+        })?
+    } else {
+        stream_merge_windows(inputs, plan, &order, |ts, cs, source, original| {
+            writer.push_docs_rows_index_only(ts, cs, source, original)
+        })?
+    };
+    log::debug!(
+        "vix merge: heal passthrough indexed {} rows in {:?} ({scan_windows} windows, \
+         concat_order: {concat_order})",
+        order.len(),
+        started.elapsed()
+    );
+
+    // 2) Docs store: each input lands at its concatenated position in
+    // output-row order (the same order the scan consumed rows — the
+    // contiguity proof). Qualified inputs copy their encoded chunks
+    // verbatim (widened into the output union when schemas differ, M17);
+    // an unqualified input decodes and RE-ENCODES its rows through the
+    // store-only push — the per-input fail-open the merge summary counts.
+    // A mid-copy failure after chunks reached the writer aborts the
+    // attempt and the caller restarts the standard rebuild with a fresh
+    // writer.
+    let started = std::time::Instant::now();
+    let mut docs_batches = 0usize;
+    let mut copied_inputs = 0usize;
+    let mut reencoded_inputs = 0usize;
+    let mut widened_inputs = 0usize;
+    let mut docs_sliced_windows = 0u64;
+    std::thread::scope(|scope| -> Result<(), anyhow::Error> {
+        // Decode streams spawn only for the fail-open inputs, and — M23b —
+        // only when that input's drain STARTS (upfront spawns buffered every
+        // not-yet-reached fail-open input ~fully decoded while earlier
+        // inputs copied/drained; same M23 shape, rare here because fail-open
+        // inputs are the exception). Input-by-input drain: the channel bound
+        // caps the one active stream, no admission gate needed.
+        for &index in &input_order {
+            let (key, data, _) = &inputs[index];
+            match &splices[index] {
+                Some(splice) => {
+                    // the index scan above already hashed every #52
+                    // bloom-only value (cs columns + _source) — the copy
+                    // never re-hashes
+                    let (chunks, sliced) = match copy_passthrough_input(
+                        key,
+                        Arc::clone(data),
+                        &timestamps[index],
+                        splice,
+                        &mut writer,
+                    ) {
+                        Ok(counts) => counts,
+                        Err(PassthroughFailure::BeforePush(error))
+                        | Err(PassthroughFailure::Poisoned(error)) => {
+                            return Err(error.context(format!(
+                                "heal passthrough copy of core file {key} (input {index})"
+                            )));
+                        }
+                    };
+                    log::debug!(
+                        "vix merge: docs-copy rebuild copied input {key} ({chunks} encoded \
+                         chunks, {sliced} sliced column-windows canonicalized)"
+                    );
+                    docs_batches += chunks;
+                    copied_inputs += 1;
+                    docs_sliced_windows += sliced;
+                    if !splice.widen.is_identity() {
+                        widened_inputs += 1;
+                    }
+                }
+                None => {
+                    let mut cursor = InputCursor::new(
+                        key.clone(),
+                        spawn_input_stream(scope, key, Arc::clone(data), plan),
+                    );
+                    docs_batches += drain_input_cursor(&mut cursor, plan, &mut writer)?;
+                    reencoded_inputs += 1;
+                }
+            }
+        }
+        Ok(())
+    })?;
+
+    let store_elapsed = started.elapsed();
+
+    // M18: the fail-open counter lives past finish (the encoder worker
+    // finishes inside finish_output, so the count is final only after it)
+    let failopen = writer.docs_failopen_counter();
+    let (output, index, stats) = writer.finish_output()?;
+    let docs_failopen_chunks = failopen.load(std::sync::atomic::Ordering::Relaxed);
+    // The merge summary (M17 + M18): the fail-open counts are the signals
+    // the encode-once design watches in prod — counts only, no key lists.
+    log::info!(
+        "vix merge: docs-copy rebuild stored {} inputs in {store_elapsed:?}: copied \
+         {copied_inputs} ({widened_inputs} schema-widened), re-encoded {reencoded_inputs} \
+         (fail-open), re-encoded {docs_failopen_chunks} chunk(s) (fail-open), \
+         sliced-canonicalized {docs_sliced_windows} column-window(s), concat_order: \
+         {concat_order}",
+        input_order.len(),
+    );
+    Ok(MergedCoreFile {
+        output,
+        index,
+        stats,
+        used_index_merge: false,
+        docs_batches,
+        dropped_rows: 0,
+        docs_passthrough_inputs: copied_inputs,
+        concat_order,
+        docs_sliced_windows,
+        docs_failopen_chunks,
     })
 }
 
@@ -2023,18 +4298,140 @@ fn rebuild_over_sources(
 mod tests {
     use arrow::array::{BooleanArray, Int64Array, StringArray};
     use datafusion::datasource::MemTable;
-    use vortex_index::{VixDocs, VixQuery, VixReader};
+    use vortex_index::{RowOrder, VixDocs, VixQuery, VixReader};
 
     use super::*;
+    // The scan-extraction twin (`json_get_* + cast`, by construction): the
+    // parity ORACLE for tests that pin index answers against the scan-side
+    // `_source` fallback semantics. Production merges no longer derive
+    // columns from `_source` (v2 null-fill), so this import is test-only.
+    use crate::search::datafusion::vix_format::derive_cs_column_from_source;
 
-    /// Wrap fabricated in-memory files as ranged merge inputs (the merge
-    /// paths take [`MergeInput`] — production feeds cache-ladder sources).
-    fn as_inputs(v: &[(String, bytes::Bytes)]) -> Vec<MergeInput> {
+    /// One fabricated file's (data, sidecar) bytes — what every test
+    /// builder returns since the v3 split.
+    type BuiltPair = (bytes::Bytes, Option<bytes::Bytes>);
+
+    /// Open one fabricated pair as a full reader.
+    fn open_pair(pair: &BuiltPair) -> VixReader {
+        VixReader::open_with_index(pair.0.clone(), pair.1.clone()).unwrap()
+    }
+
+    /// FILE-LEVEL fold of one output's per-column chunk stats (H2): per
+    /// column, (total present, global min, global max) — the aggregate the
+    /// §11 pruning gate compares between a passthrough (SPLICED stats) and
+    /// a forced-decode rebuild (FRESH stats). Chunk windows legitimately
+    /// differ between the two (spliced tables keep the inputs' windows), so
+    /// the fold is the comparable surface; presence counts compare exactly.
+    #[allow(clippy::type_complexity)]
+    fn file_level_stats(
+        result: &MergedCoreFile,
+    ) -> (
+        std::collections::BTreeMap<
+            String,
+            (
+                u64,
+                Option<vortex_index::StatValue>,
+                Option<vortex_index::StatValue>,
+            ),
+        >,
+        std::collections::BTreeMap<String, Option<u64>>,
+    ) {
+        let docs =
+            VixDocs::open(bytes::Bytes::from(result.output.to_bytes().unwrap())).unwrap();
+        let presence = docs
+            .column_presence()
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let stats = docs
+            .spliceable_stats()
+            .unwrap()
+            .expect("every non-empty output carries a stats blob");
+        let mut folded = std::collections::BTreeMap::new();
+        for (name, table) in &stats.chunks.columns {
+            let mut present = 0u64;
+            let mut min: Option<vortex_index::StatValue> = None;
+            let mut max: Option<vortex_index::StatValue> = None;
+            let less = |a: &vortex_index::StatValue, b: &vortex_index::StatValue| -> bool {
+                use vortex_index::StatValue::*;
+                match (a, b) {
+                    (I64(x), I64(y)) => x < y,
+                    (U64(x), U64(y)) => x < y,
+                    (F64(x), F64(y)) => x < y,
+                    (Bool(x), Bool(y)) => x < y,
+                    (Str(x), Str(y)) => x < y,
+                    _ => false,
+                }
+            };
+            for entry in table.chunks.iter().flatten() {
+                present += entry.present;
+                if let Some(value) = &entry.min {
+                    if min.as_ref().is_none_or(|m| less(value, m)) {
+                        min = Some(value.clone());
+                    }
+                }
+                if let Some(value) = &entry.max {
+                    if max.as_ref().is_none_or(|m| less(m, value)) {
+                        max = Some(value.clone());
+                    }
+                }
+            }
+            folded.insert(name.clone(), (present, min, max));
+        }
+        (folded, presence)
+    }
+
+    /// The §11 splice gate: a passthrough output's (spliced) stats must
+    /// equal the forced-decode rebuild's (fresh) stats at the file-level
+    /// fold, presence counts exactly — the v1 stats-loss regression check.
+    fn assert_stats_splice_parity(
+        passthrough: &MergedCoreFile,
+        rebuild: &MergedCoreFile,
+        context: &str,
+    ) {
+        let (fast_fold, fast_presence) = file_level_stats(passthrough);
+        let (rebuild_fold, rebuild_presence) = file_level_stats(rebuild);
+        assert_eq!(
+            fast_presence, rebuild_presence,
+            "{context}: presence counts must survive the splice exactly"
+        );
+        assert_eq!(
+            fast_fold.keys().collect::<Vec<_>>(),
+            rebuild_fold.keys().collect::<Vec<_>>(),
+            "{context}: the same columns must carry chunk stats"
+        );
+        for (name, folded) in &fast_fold {
+            assert_eq!(
+                folded, &rebuild_fold[name],
+                "{context}: file-level fold of column {name:?} must match the fresh stats"
+            );
+        }
+    }
+
+    /// Open one merge result's (data, sidecar) outputs as a full reader.
+    fn open_merged(result: &MergedCoreFile) -> VixReader {
+        VixReader::open_with_index(
+            bytes::Bytes::from(result.output.to_bytes().unwrap()),
+            result.index.clone().map(bytes::Bytes::from),
+        )
+        .unwrap()
+    }
+
+    /// Wrap fabricated in-memory (data, sidecar) pairs as ranged merge
+    /// inputs (the merge paths take [`MergeInput`] — production feeds
+    /// cache-ladder sources).
+    fn as_inputs(v: &[(String, BuiltPair)]) -> Vec<MergeInput> {
         v.iter()
-            .map(|(key, data)| {
+            .map(|(key, (data, index))| {
                 (
                     key.clone(),
                     vortex_index::BytesRangeSource::new(key.clone(), data.clone()),
+                    index.as_ref().map(|bytes| {
+                        vortex_index::BytesRangeSource::new(
+                            format!("{key}.vxi"),
+                            bytes.clone(),
+                        )
+                    }),
                 )
             })
             .collect()
@@ -2136,10 +4533,10 @@ mod tests {
             Arc::new(MemTable::try_new(schema.clone(), vec![wal_batches(&schema)]).unwrap());
         let result = write_core_file_from_tables(
             "test-move-spool",
+            StreamType::Logs,
             schema,
             vec![table],
             &["log".to_string()],
-            &["svc".to_string()],
             &[],
             false,
             usize::MAX, // any real batch is "big enough" -> forces the spool
@@ -2181,10 +4578,10 @@ mod tests {
             Arc::new(MemTable::try_new(schema.clone(), vec![wal_batches(&schema)]).unwrap());
         let result = write_core_file_from_tables(
             "test-move-job",
+            StreamType::Logs,
             schema,
             vec![table],
             &["log".to_string()],
-            &["svc".to_string()],
             &[],
             false, // setting off, but the batches carry _original -> kept,
             0,
@@ -2203,7 +4600,7 @@ mod tests {
         // authoritative FileMeta range (WAL footer metadata is never trusted)
         assert_eq!((result.stats.min_ts, result.stats.max_ts), (100, 400));
 
-        let reader = VixReader::open(bytes::Bytes::from(result.data)).unwrap();
+        let reader = VixReader::open_with_index(bytes::Bytes::from(result.data), result.index.map(bytes::Bytes::from)).unwrap();
         assert_eq!(reader.row_count(), 4);
 
         // rows ordered by _timestamp DESC (docs 0..4 = ts 400,300,200,100)
@@ -2336,17 +4733,17 @@ mod tests {
         let table = Arc::new(MemTable::try_new(schema.clone(), vec![batches]).unwrap());
         let result = write_core_file_from_tables(
             "test-sorted-build",
+            StreamType::Logs,
             schema,
             vec![table],
             &["log".to_string()],
-            &["svc".to_string()],
             &[],
             false,
             0,
         )
         .await
         .unwrap();
-        let reader = VixReader::open(bytes::Bytes::from(result.data)).unwrap();
+        let reader = VixReader::open_with_index(bytes::Bytes::from(result.data), result.index.map(bytes::Bytes::from)).unwrap();
         assert_eq!(reader.row_count(), 9);
 
         // (1) rows are sorted `_timestamp` DESC (non-increasing)
@@ -2393,21 +4790,21 @@ mod tests {
         fields: Vec<Field>,
         columns: Vec<ArrayRef>,
         fts: &[String],
-        cs: Vec<String>,
         original: Option<StringArray>,
-    ) -> bytes::Bytes {
+    ) -> BuiltPair {
         let schema = Arc::new(Schema::new(fields));
         let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
         let source = synthesize_source(&batch).unwrap();
         let mut writer = VixWriter::new(
             &schema,
-            core_writer_options(fts, cs, Vec::new()),
+            core_writer_options(fts, Vec::new(), true),
             original.is_some(),
         );
         writer
             .push_batch_with_source(&batch, &source, original.as_ref())
             .unwrap();
-        bytes::Bytes::from(writer.finish().unwrap())
+        let (data, index) = writer.finish().unwrap();
+        (bytes::Bytes::from(data), index.map(bytes::Bytes::from))
     }
 
     /// [`build_core_file`] through the test-support UNGUARDED finish:
@@ -2418,18 +4815,21 @@ mod tests {
         fields: Vec<Field>,
         columns: Vec<ArrayRef>,
         fts: &[String],
-        cs: Vec<String>,
-    ) -> bytes::Bytes {
+    ) -> BuiltPair {
         let schema = Arc::new(Schema::new(fields));
         let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
         let source = synthesize_source(&batch).unwrap();
-        let mut writer = VixWriter::new(&schema, core_writer_options(fts, cs, Vec::new()), false);
+        let mut writer = VixWriter::new(
+            &schema,
+            core_writer_options(fts, Vec::new(), true),
+            false,
+        );
         writer
             .push_batch_with_source(&batch, &source, None)
             .unwrap();
-        bytes::Bytes::from(
-            vortex_index::test_support::finish_ignoring_timestamp_guard(writer).unwrap(),
-        )
+        let (data, index) =
+            vortex_index::test_support::finish_ignoring_timestamp_guard(writer).unwrap();
+        (bytes::Bytes::from(data), index.map(bytes::Bytes::from))
     }
 
     /// #27 armor: a merge input whose rows violate the `_timestamp` DESC
@@ -2450,7 +4850,6 @@ mod tests {
                     Arc::new(StringArray::from(logs)),
                 ],
                 &fts,
-                vec![],
                 None,
             )
         };
@@ -2461,15 +4860,27 @@ mod tests {
             Field::new("log", DataType::Utf8, true),
         ]);
         let inputs = vec![("good.vix".to_string(), good), ("bad.vix".to_string(), bad)];
-        let err = merge_core_files(&as_inputs(&inputs), &latest_schema, &fts, &[], &[])
-            .expect_err("ascending input must be rejected");
+        let err = merge_core_files(
+            StreamType::Logs,
+            &as_inputs(&inputs),
+            &latest_schema,
+            &fts,
+            &[],
+        )
+        .expect_err("ascending input must be rejected");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("violates the _timestamp DESC row order") && msg.contains("bad.vix"),
             "unexpected error: {msg}"
         );
-        let err = merge_core_files_rebuild(&as_inputs(&inputs), &latest_schema, &fts, &[], &[])
-            .expect_err("ascending input must be rejected by the rebuild flavor");
+        let err = merge_core_files_rebuild(
+            StreamType::Logs,
+            &as_inputs(&inputs),
+            &latest_schema,
+            &fts,
+            &[],
+        )
+        .expect_err("ascending input must be rejected by the rebuild flavor");
         assert!(
             format!("{err:#}").contains("violates the _timestamp DESC row order"),
             "rebuild flavor shares the ordering armor"
@@ -2497,7 +4908,6 @@ mod tests {
                 Arc::new(StringArray::from(vec!["api", "web"])),
             ],
             &fts,
-            vec!["svc".to_string()],
             Some(StringArray::from(vec![Some("raw-100"), Some("raw-50")])),
         );
         // file 2: no svc at all, has `extra` field; ties with file1/file3 on
@@ -2514,7 +4924,6 @@ mod tests {
                 Arc::new(StringArray::from(vec![Some("x1"), Some("x2")])),
             ],
             &fts,
-            vec![],
             None,
         );
         // file 3: svc + numeric code; ts 80,50,10
@@ -2530,7 +4939,6 @@ mod tests {
                 Arc::new(Int64Array::from(vec![Some(500), Some(200), None])),
             ],
             &fts,
-            vec!["svc".to_string()],
             None,
         );
 
@@ -2546,22 +4954,28 @@ mod tests {
             ("f2.vix".to_string(), file2),
             ("f3.vix".to_string(), file3),
         ];
-        let result = merge_core_files(
+        // force_decode: this test pins the SORTED-INTERLEAVE arm (table
+        // doc-id maps, tie-breaking, per-window interleave). Since M17 the
+        // production default for these schema-differing overlapping inputs
+        // is the widened concat chunk copy — covered by the gen1_docs_copy
+        // and concat differential tests.
+        let result = merge_core_files_with_caps(
+            StreamType::Logs,
             &as_inputs(&inputs),
             &latest_schema,
             &fts,
-            &["svc".to_string()],
             &[],
+            oracle_caps(),
         )
         .unwrap();
         assert_eq!(result.stats.row_count, 7);
         assert!(result.stats.index_size > 0);
-        // overlapping inputs still take the index-merge fast path (table
-        // doc-id maps + row interleave)
+        // overlapping inputs take the index-merge fast path (table
+        // doc-id maps + row interleave) under the forced decode
         assert!(result.used_index_merge);
 
         let merged =
-            VixReader::open(bytes::Bytes::from(result.output.to_bytes().unwrap())).unwrap();
+            open_merged(&result);
         assert_eq!(merged.row_count(), 7);
 
         // global DESC order; the ts=50 tie resolves in input order
@@ -2678,14 +5092,14 @@ mod tests {
         let reference_source = synthesize_source(&reference_batch).unwrap();
         let mut reference_writer = VixWriter::new(
             &reference_schema,
-            core_writer_options(&fts, vec!["svc".to_string()], Vec::new()),
+            core_writer_options(&fts, Vec::new(), true),
             false,
         );
         reference_writer
             .push_batch_with_source(&reference_batch, &reference_source, None)
             .unwrap();
         let reference =
-            VixReader::open(bytes::Bytes::from(reference_writer.finish().unwrap())).unwrap();
+            { let (data, index) = reference_writer.finish().unwrap(); VixReader::open_with_index(bytes::Bytes::from(data), index.map(bytes::Bytes::from)).unwrap() };
 
         let queries = [
             exact("svc", "api"),
@@ -2734,16 +5148,20 @@ mod tests {
         let latest_schema =
             Schema::new(vec![Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false)]);
         let err = merge_core_files(
-            &as_inputs(&[("bogus.vix".to_string(), bytes::Bytes::from_static(b"nope"))]),
+            StreamType::Logs,
+            &as_inputs(&[(
+                "bogus.vix".to_string(),
+                (bytes::Bytes::from_static(b"nope"), None),
+            )]),
             &latest_schema,
-            &[],
             &[],
             &[],
         )
         .unwrap_err();
         assert!(err.to_string().contains("bogus.vix"), "{err}");
 
-        let err = merge_core_files(&[], &latest_schema, &[], &[], &[]).unwrap_err();
+        let err =
+            merge_core_files(StreamType::Logs, &[], &latest_schema, &[], &[]).unwrap_err();
         assert!(err.to_string().contains("no input files"), "{err}");
     }
 
@@ -2752,6 +5170,71 @@ mod tests {
     /// same doc_counts and postings, same field capabilities and partials,
     /// and the same answers to a query battery.
     fn assert_core_files_equivalent(left: &VixReader, right: &VixReader, context: &str) {
+        assert_core_files_equivalent_inner(left, right, context, false)
+    }
+
+    /// #51c: like [`assert_core_files_equivalent`] but docs columns compare
+    /// by LOGICAL row value (null-aware) instead of raw arrow buffers — a
+    /// passthrough output's chunks come from a different encode lineage
+    /// than the rebuild's, so bytes under NULL slots may legitimately
+    /// differ while every observable value is identical.
+    fn assert_core_files_equivalent_logical_docs(
+        left: &VixReader,
+        right: &VixReader,
+        context: &str,
+    ) {
+        assert_core_files_equivalent_inner(left, right, context, true)
+    }
+
+    /// One logical (null-masked) row value, printable for assert messages.
+    fn logical_value(column: &ArrayRef, row: usize) -> Option<String> {
+        use arrow::array::Float64Array;
+        if column.is_null(row) {
+            return None;
+        }
+        Some(match column.data_type() {
+            DataType::Int64 => column
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(row)
+                .to_string(),
+            DataType::Utf8 => column
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(row)
+                .to_string(),
+            DataType::Utf8View => column
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .unwrap()
+                .value(row)
+                .to_string(),
+            DataType::Float64 => {
+                let value = column
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap()
+                    .value(row);
+                format!("{value:?}")
+            }
+            DataType::Boolean => column
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .unwrap()
+                .value(row)
+                .to_string(),
+            other => panic!("logical_value: unhandled docs column type {other:?}"),
+        })
+    }
+
+    fn assert_core_files_equivalent_inner(
+        left: &VixReader,
+        right: &VixReader,
+        context: &str,
+        logical_docs: bool,
+    ) {
         assert_eq!(left.row_count(), right.row_count(), "{context}: row_count");
         assert_eq!(
             left.term_count(),
@@ -2767,11 +5250,26 @@ mod tests {
             let name = field.name();
             let left_column = left.read_docs_column(name).unwrap();
             let right_column = right.read_docs_column(name).unwrap();
-            assert_eq!(
-                left_column.to_data(),
-                right_column.to_data(),
-                "{context}: docs column {name:?}"
-            );
+            if logical_docs {
+                assert_eq!(
+                    left_column.len(),
+                    right_column.len(),
+                    "{context}: docs column {name:?} length"
+                );
+                for row in 0..left_column.len() {
+                    assert_eq!(
+                        logical_value(&left_column, row),
+                        logical_value(&right_column, row),
+                        "{context}: docs column {name:?} row {row}"
+                    );
+                }
+            } else {
+                assert_eq!(
+                    left_column.to_data(),
+                    right_column.to_data(),
+                    "{context}: docs column {name:?}"
+                );
+            }
         }
 
         // the whole term table: keys, doc_counts, decoded postings
@@ -2817,6 +5315,33 @@ mod tests {
         );
 
         // a query battery over every term field + composites
+        let queries = query_battery(left);
+        for query in &queries {
+            assert_eq!(
+                matching_docs(left, query),
+                matching_docs(right, query),
+                "{context}: query {query:?}"
+            );
+            assert_eq!(
+                left.count(query).unwrap(),
+                right.count(query).unwrap(),
+                "{context}: count {query:?}"
+            );
+        }
+        for range in [(0i64, i64::MAX), (250, 850), (700, 701)] {
+            assert_eq!(
+                left.timestamp_range(range.0, range.1).unwrap(),
+                right.timestamp_range(range.0, range.1).unwrap(),
+                "{context}: ts range {range:?}"
+            );
+        }
+    }
+
+    /// The shared equivalence query battery (every term field + composites),
+    /// built from `reference`'s term surface — used positionally by
+    /// [`assert_core_files_equivalent_inner`] and by row CONTENT by
+    /// [`assert_core_files_content_equivalent`].
+    fn query_battery(reference: &VixReader) -> Vec<VixQuery> {
         let mut queries: Vec<VixQuery> = vec![
             VixQuery::All,
             VixQuery::TokenAnyField {
@@ -2839,9 +5364,9 @@ mod tests {
                 distance: 1,
             },
         ];
-        for name in left.term_field_names() {
+        for name in reference.term_field_names() {
             queries.push(key_exists(name));
-            if left.has_term_capability(name) {
+            if reference.has_term_capability(name) {
                 queries.push(VixQuery::Prefix {
                     field: Some(name.to_string()),
                     prefix: b"a".to_vec(),
@@ -2858,7 +5383,7 @@ mod tests {
             },
             VixQuery::Not(Box::new(key_exists("code"))),
         ]));
-        if left.has_term_capability("env") {
+        if reference.has_term_capability("env") {
             queries.push(VixQuery::Or(vec![
                 exact("env", "prod"),
                 VixQuery::TokenAnyField {
@@ -2866,11 +5391,126 @@ mod tests {
                 },
             ]));
         }
-        for query in &queries {
+        queries
+    }
+
+    /// #51c-c: every docs row of `reader` rendered as one stable string
+    /// (columns in sorted-name order, logical null-aware values) — the unit
+    /// of ORDER-INSENSITIVE comparisons between merge outputs whose row
+    /// order legitimately differs (concatenation vs sorted interleave).
+    fn docs_row_contents(reader: &VixReader) -> Vec<String> {
+        let schema = reader.docs_schema().unwrap();
+        let mut names: Vec<String> = schema
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect();
+        names.sort();
+        let columns: Vec<(String, ArrayRef)> = names
+            .into_iter()
+            .map(|name| {
+                let column = reader.read_docs_column(&name).unwrap();
+                (name, column)
+            })
+            .collect();
+        (0..reader.row_count() as usize)
+            .map(|row| {
+                columns
+                    .iter()
+                    .map(|(name, column)| format!("{name}={:?}", logical_value(column, row)))
+                    .collect::<Vec<_>>()
+                    .join("|")
+            })
+            .collect()
+    }
+
+    /// Render one doc-id list as its rows' CONTENT, sorted — how postings
+    /// and query answers compare across differently-ordered outputs.
+    fn contents_of(rows: &[String], ids: &[u32]) -> Vec<String> {
+        let mut contents: Vec<String> = ids.iter().map(|&id| rows[id as usize].clone()).collect();
+        contents.sort();
+        contents
+    }
+
+    /// #51c-c: reader equivalence between two merge outputs whose ROW ORDER
+    /// legitimately differs (a concatenation-order output vs the sorted
+    /// rebuild oracle): identical row MULTISETS (logical content), the same
+    /// term surface (names, capabilities, value counts, key coverage,
+    /// term_count), per-term `doc_count` + matched-row CONTENT sets, the
+    /// same [`query_battery`] answers by content and count, and
+    /// content-equal `timestamp_range` answers over probe windows spanning
+    /// the corpus. This replaces exactly the row-order-dependent pieces of
+    /// [`assert_core_files_equivalent`] (positional docs columns, postings
+    /// doc ids); everything else is held to equality.
+    fn assert_core_files_content_equivalent(left: &VixReader, right: &VixReader, context: &str) {
+        assert_eq!(left.row_count(), right.row_count(), "{context}: row_count");
+        assert_eq!(
+            left.term_count(),
+            right.term_count(),
+            "{context}: term_count"
+        );
+        let left_rows = docs_row_contents(left);
+        let right_rows = docs_row_contents(right);
+        {
+            let mut left_sorted = left_rows.clone();
+            let mut right_sorted = right_rows.clone();
+            left_sorted.sort();
+            right_sorted.sort();
+            assert_eq!(left_sorted, right_sorted, "{context}: row multisets");
+        }
+
+        // term surface parity (order-free metadata)
+        assert_eq!(
+            left.partial_fields(),
+            right.partial_fields(),
+            "{context}: partial_fields"
+        );
+        assert_eq!(
+            left.term_field_names(),
+            right.term_field_names(),
+            "{context}: term fields"
+        );
+        for name in left.term_field_names() {
             assert_eq!(
-                matching_docs(left, query),
-                matching_docs(right, query),
-                "{context}: query {query:?}"
+                left.has_term_capability(name),
+                right.has_term_capability(name),
+                "{context}: term capability of {name:?}"
+            );
+            assert_eq!(
+                left.field_value_counts(name).unwrap(),
+                right.field_value_counts(name).unwrap(),
+                "{context}: value counts of {name:?}"
+            );
+        }
+        assert_eq!(
+            left.keys_with_prefix("").unwrap(),
+            right.keys_with_prefix("").unwrap(),
+            "{context}: key coverage"
+        );
+
+        // the whole term table, postings compared by ROW CONTENT
+        let dump = |reader: &VixReader, rows: &[String]| {
+            let mut terms: Vec<(Vec<u8>, u64, Vec<String>)> = Vec::new();
+            reader
+                .for_each_term(&mut |key, doc_count, ids| {
+                    terms.push((key.to_vec(), doc_count, contents_of(rows, ids)));
+                    Ok(())
+                })
+                .unwrap();
+            terms
+        };
+        assert_eq!(
+            dump(left, &left_rows),
+            dump(right, &right_rows),
+            "{context}: term table by content"
+        );
+
+        // the query battery, answers compared by ROW CONTENT
+        for query in &query_battery(left) {
+            assert_eq!(
+                contents_of(&left_rows, &matching_docs(left, query)),
+                contents_of(&right_rows, &matching_docs(right, query)),
+                "{context}: query {query:?} by content"
             );
             assert_eq!(
                 left.count(query).unwrap(),
@@ -2878,11 +5518,28 @@ mod tests {
                 "{context}: count {query:?}"
             );
         }
-        for range in [(0i64, i64::MAX), (250, 850), (700, 701)] {
+
+        // timestamp ranges by content — non-monotonic zone tables (the
+        // concat shape) must prune to exactly the sorted oracle's rows
+        for range in [
+            (0i64, i64::MAX),
+            (700, 951),
+            (725, 726),
+            (975, 976),
+            (850, 1001),
+        ] {
+            let left_bits = left.timestamp_range(range.0, range.1).unwrap();
+            let right_bits = right.timestamp_range(range.0, range.1).unwrap();
+            let ids = |bits: &arrow::buffer::BooleanBuffer| -> Vec<u32> {
+                bits.iter()
+                    .enumerate()
+                    .filter_map(|(doc, set)| set.then_some(doc as u32))
+                    .collect()
+            };
             assert_eq!(
-                left.timestamp_range(range.0, range.1).unwrap(),
-                right.timestamp_range(range.0, range.1).unwrap(),
-                "{context}: ts range {range:?}"
+                contents_of(&left_rows, &ids(&left_bits)),
+                contents_of(&right_rows, &ids(&right_bits)),
+                "{context}: ts range {range:?} by content"
             );
         }
     }
@@ -2892,15 +5549,14 @@ mod tests {
     /// every row (`env=prod`), string + numeric cs columns, `_o2_id`,
     /// `_original` (one file), empty strings (fts AND structured — the
     /// empty raw term), non-finite floats (NaN/±Inf: key-term-less but
-    /// cs-stored), a NUL-byte value, an oversize value (partial field), and
-    /// a field only one file knows.
+    /// cs-stored), a NUL-byte value, an oversize value (term skipped, field
+    /// untainted since 2026-08-12), and a field only one file knows.
     ///
     /// `ts` supplies each file's descending timestamp column, so callers
     /// choose disjoint or overlapping ranges.
-    fn differential_inputs(ts: [Vec<i64>; 3]) -> Vec<(String, bytes::Bytes)> {
+    fn differential_inputs(ts: [Vec<i64>; 3]) -> Vec<(String, BuiltPair)> {
         use arrow::array::Float64Array;
         let fts = vec!["log".to_string()];
-        let cs = vec!["svc".to_string(), "code".to_string()];
         let oversize = "z".repeat(70_000);
         let file1 = build_core_file(
             vec![
@@ -2935,7 +5591,6 @@ mod tests {
                 Arc::new(Int64Array::from(vec![Some(11), Some(12), Some(13)])),
             ],
             &fts,
-            cs.clone(),
             Some(StringArray::from(vec![Some("raw-a"), None, Some("raw-c")])),
         );
         let file2 = build_core_file(
@@ -2975,7 +5630,6 @@ mod tests {
                 Arc::new(Int64Array::from(vec![Some(-7), None])),
             ],
             &fts,
-            vec![],
             None,
         );
         let file3 = build_core_file(
@@ -3000,7 +5654,6 @@ mod tests {
                 Arc::new(Int64Array::from(vec![Some(31), Some(32), Some(33)])),
             ],
             &fts,
-            vec!["svc".to_string()],
             None,
         );
         vec![
@@ -3032,7 +5685,6 @@ mod tests {
     #[tokio::test]
     async fn differential_index_merge_matches_rebuild() {
         let fts = vec!["log".to_string()];
-        let cs = vec!["svc".to_string(), "code".to_string()];
         let latest_schema = differential_latest_schema();
 
         // input order is f2, f1, f3 (see differential_inputs): f1 is the
@@ -3048,25 +5700,56 @@ mod tests {
             differential_inputs([vec![1000, 600, 500], vec![900, 600], vec![950, 600, 400]]);
 
         for (context, inputs) in [("disjoint", disjoint), ("overlapping", overlapping)] {
-            let fast =
-                merge_core_files(&as_inputs(&inputs), &latest_schema, &fts, &cs, &[]).unwrap();
+            let fast = merge_core_files(
+                StreamType::Logs,
+                &as_inputs(&inputs),
+                &latest_schema,
+                &fts,
+                &[],
+            )
+            .unwrap();
             assert!(fast.used_index_merge, "{context}: expected the fast path");
-            let rebuild =
-                merge_core_files_rebuild(&as_inputs(&inputs), &latest_schema, &fts, &cs, &[])
-                    .unwrap();
+            let rebuild = merge_core_files_rebuild(
+                StreamType::Logs,
+                &as_inputs(&inputs),
+                &latest_schema,
+                &fts,
+                &[],
+            )
+            .unwrap();
             assert!(!rebuild.used_index_merge);
 
             assert_eq!(fast.stats.row_count, rebuild.stats.row_count, "{context}");
             assert_eq!(fast.stats.term_count, rebuild.stats.term_count, "{context}");
 
             let fast_reader =
-                VixReader::open(bytes::Bytes::from(fast.output.to_bytes().unwrap())).unwrap();
+                open_merged(&fast);
             let rebuild_reader =
-                VixReader::open(bytes::Bytes::from(rebuild.output.to_bytes().unwrap())).unwrap();
+                open_merged(&rebuild);
             assert_core_files_equivalent(&fast_reader, &rebuild_reader, context);
 
-            // spot-check the merged features on the fast-path file itself
-            assert!(fast_reader.partial_fields().contains("huge"), "{context}");
+            // spot-check the merged features on the fast-path file itself:
+            // the oversize `huge` value skipped its term WITHOUT tainting
+            // (2026-08-12), so the merged file is clean through both
+            // strategies — the skipped literal misses, the same field's
+            // short value stays exact
+            assert!(
+                fast_reader.partial_fields().is_empty(),
+                "{context}: {:?}",
+                fast_reader.partial_fields()
+            );
+            assert_eq!(
+                fast_reader
+                    .count(&exact("huge", &"z".repeat(70_000)))
+                    .unwrap(),
+                0,
+                "{context}: the skipped oversize literal misses"
+            );
+            assert_eq!(
+                fast_reader.count(&exact("huge", "small")).unwrap(),
+                1,
+                "{context}: short values on the same field stay exact"
+            );
             assert_eq!(
                 fast_reader.count(&exact("env", "prod")).unwrap(),
                 fast_reader.row_count(),
@@ -3124,26 +5807,39 @@ mod tests {
     #[tokio::test]
     async fn merge_bounded_batches_match_default_caps() {
         let fts = vec!["log".to_string()];
-        let cs = vec!["svc".to_string(), "code".to_string()];
         let latest_schema = differential_latest_schema();
-        let tiny = BatchCaps { rows: 2, bytes: 96 };
+        // This test pins the WINDOWED DECODE flow under byte/row caps —
+        // since M17 widens schema-differing inputs into the chunk copy,
+        // the decode arms are forced explicitly (copies don't window).
+        let tiny = BatchCaps {
+            rows: 2,
+            bytes: 96,
+            force_decode: true,
+            ..BatchCaps::default()
+        };
 
         // overlapping ranges: the rebuild and the fast-path row interleave
         // both go through stream_merge_windows
         let overlapping =
             differential_inputs([vec![1000, 600, 500], vec![900, 600], vec![950, 600, 400]]);
-        let rebuild_default =
-            merge_core_files_rebuild(&as_inputs(&overlapping), &latest_schema, &fts, &cs, &[])
-                .unwrap();
+        let rebuild_default = merge_core_files_rebuild_with_caps(
+            StreamType::Logs,
+            &as_inputs(&overlapping),
+            &latest_schema,
+            &fts,
+            &[],
+            oracle_caps(),
+        )
+        .unwrap();
         assert_eq!(
             rebuild_default.docs_batches, 1,
             "8 rows fit one default-caps window"
         );
         let rebuild_tiny = merge_core_files_rebuild_with_caps(
+            StreamType::Logs,
             &as_inputs(&overlapping),
             &latest_schema,
             &fts,
-            &cs,
             &[],
             tiny,
         )
@@ -3153,19 +5849,16 @@ mod tests {
             "tiny caps must stage the rebuild in multiple bounded windows, got {}",
             rebuild_tiny.docs_batches
         );
-        let default_reader = VixReader::open(bytes::Bytes::from(
-            rebuild_default.output.to_bytes().unwrap(),
-        ))
-        .unwrap();
+        let default_reader = open_merged(&rebuild_default);
         let tiny_reader =
-            VixReader::open(bytes::Bytes::from(rebuild_tiny.output.to_bytes().unwrap())).unwrap();
+            open_merged(&rebuild_tiny);
         assert_core_files_equivalent(&tiny_reader, &default_reader, "rebuild tiny-vs-default");
 
         let fast_tiny = merge_core_files_with_caps(
+            StreamType::Logs,
             &as_inputs(&overlapping),
             &latest_schema,
             &fts,
-            &cs,
             &[],
             tiny,
         )
@@ -3177,7 +5870,7 @@ mod tests {
             fast_tiny.docs_batches
         );
         let fast_tiny_reader =
-            VixReader::open(bytes::Bytes::from(fast_tiny.output.to_bytes().unwrap())).unwrap();
+            open_merged(&fast_tiny);
         assert_core_files_equivalent(&fast_tiny_reader, &default_reader, "fast tiny-vs-rebuild");
 
         // the bounded output keeps the merge invariants: global DESC order
@@ -3194,12 +5887,24 @@ mod tests {
         // chunks by the caps as well
         let disjoint =
             differential_inputs([vec![1000, 950, 900], vec![800, 700], vec![700, 600, 500]]);
-        let disjoint_default =
-            merge_core_files(&as_inputs(&disjoint), &latest_schema, &fts, &cs, &[]).unwrap();
+        let disjoint_default = merge_core_files(
+            StreamType::Logs,
+            &as_inputs(&disjoint),
+            &latest_schema,
+            &fts,
+            &[],
+        )
+        .unwrap();
         assert!(disjoint_default.used_index_merge);
-        let disjoint_tiny =
-            merge_core_files_with_caps(&as_inputs(&disjoint), &latest_schema, &fts, &cs, &[], tiny)
-                .unwrap();
+        let disjoint_tiny = merge_core_files_with_caps(
+            StreamType::Logs,
+            &as_inputs(&disjoint),
+            &latest_schema,
+            &fts,
+            &[],
+            tiny,
+        )
+        .unwrap();
         assert!(disjoint_tiny.used_index_merge);
         assert!(
             disjoint_tiny.docs_batches >= 4
@@ -3208,13 +5913,13 @@ mod tests {
             disjoint_tiny.docs_batches,
             disjoint_default.docs_batches
         );
-        let disjoint_default_reader = VixReader::open(bytes::Bytes::from(
-            disjoint_default.output.to_bytes().unwrap(),
-        ))
-        .unwrap();
+        let disjoint_default_reader = open_merged(&disjoint_default);
         let disjoint_tiny_reader =
-            VixReader::open(bytes::Bytes::from(disjoint_tiny.output.to_bytes().unwrap())).unwrap();
-        assert_core_files_equivalent(
+            open_merged(&disjoint_tiny);
+        // logical docs compare: the default arm now COPIES (M17 widen) while
+        // the tiny arm force-decodes — bytes under null slots legitimately
+        // differ across encode lineages
+        assert_core_files_equivalent_logical_docs(
             &disjoint_tiny_reader,
             &disjoint_default_reader,
             "disjoint tiny-vs-default",
@@ -3231,13 +5936,12 @@ mod tests {
         let table =
             Arc::new(MemTable::try_new(schema.clone(), vec![wal_batches(&schema)]).unwrap());
         let fts = vec!["log".to_string()];
-        let cs = vec!["svc".to_string()];
         let default = write_core_file_from_tables(
             "test-move-caps",
+            StreamType::Logs,
             schema.clone(),
             vec![table.clone()],
             &fts,
-            &cs,
             &[],
             false,
             0,
@@ -3251,14 +5955,18 @@ mod tests {
         );
         let tiny = write_core_file_from_tables_with_caps(
             "test-move-caps",
+            StreamType::Logs,
             schema,
             vec![table],
             &fts,
-            &cs,
             &[],
             false,
             0,
-            BatchCaps { rows: 1, bytes: 1 },
+            BatchCaps {
+                rows: 1,
+                bytes: 1,
+                ..BatchCaps::default()
+            },
         )
         .await
         .unwrap();
@@ -3266,9 +5974,2879 @@ mod tests {
             tiny.docs_batches, 4,
             "the tiny caps stage one batch per row"
         );
-        let default_reader = VixReader::open(bytes::Bytes::from(default.data)).unwrap();
-        let tiny_reader = VixReader::open(bytes::Bytes::from(tiny.data)).unwrap();
+        let default_reader = VixReader::open_with_index(bytes::Bytes::from(default.data), default.index.map(bytes::Bytes::from)).unwrap();
+        let tiny_reader = VixReader::open_with_index(bytes::Bytes::from(tiny.data), tiny.index.map(bytes::Bytes::from)).unwrap();
         assert_core_files_equivalent(&tiny_reader, &default_reader, "move-job tiny-vs-default");
+    }
+
+    /// #42 L0 index-off mode, exercised through the BatchCaps policy seam
+    /// (the env-backed stream-type set is process-global, so tests cannot
+    /// toggle it): a LOGS-stream build forced index-off produces a
+    /// column-store-only file — index_size 0, EVERY plan field a docs
+    /// column, term-shaped evals erroring instead of row-dropping — and a
+    /// LOGS merge over two such files HEALS to an indexed output that is
+    /// reader-equivalent to the same rows merged from indexed builds (the
+    /// index-off inputs force the `_source` rebuild; the indexed control
+    /// takes the dictionary fast path — both strategies, one differential).
+    /// #52: merging LEGACY term-indexed inputs into a bloom-only plan — the
+    /// demoted field contributes zero output dictionary terms while its
+    /// values (recovered from the inputs' dictionaries through the k-way
+    /// stream) stay probeable in the composite bloom with coverage guards,
+    /// and the field gains a docs column for the scan path. The sibling
+    /// field keeps exact index answers. A second-generation merge (bloom-
+    /// only inputs, values recovered from COLUMNS) preserves all of it.
+    #[test]
+    fn bloom_only_merge_converges_legacy_indexed_inputs() {
+        use vortex_index::{
+            bloom::{
+                COMPOSITE_BLOOM_FIELD, COMPOSITE_GUARD_PROBES, composite_guard_key,
+                composite_value_key,
+            },
+            sbbf::{BLOCK_BYTES, block_index, check_block, hash_value},
+        };
+
+        let fields = || {
+            vec![
+                Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+                Field::new("svc", DataType::Utf8, true),
+                Field::new("trace_id", DataType::Utf8, true),
+            ]
+        };
+        let file1 = build_core_file(
+            fields(),
+            vec![
+                Arc::new(Int64Array::from(vec![100i64, 90])),
+                Arc::new(StringArray::from(vec!["api", "api"])),
+                Arc::new(StringArray::from(vec!["t-a1", "t-a2"])),
+            ],
+            &[],
+            None,
+        );
+        let file2 = build_core_file(
+            fields(),
+            vec![
+                Arc::new(Int64Array::from(vec![80i64, 70])),
+                Arc::new(StringArray::from(vec!["web", "web"])),
+                Arc::new(StringArray::from(vec!["t-b1", "t-b2"])),
+            ],
+            &[],
+            None,
+        );
+        let latest_schema = Schema::new(fields());
+        let inputs = vec![("f1.vix".to_string(), file1), ("f2.vix".to_string(), file2)];
+        let caps = BatchCaps {
+            bloom_only_override: Some("trace_id"),
+            ..Default::default()
+        };
+        let result = merge_core_files_with_caps(
+            StreamType::Logs,
+            &as_inputs(&inputs),
+            &latest_schema,
+            &[],
+            &[],
+            caps,
+        )
+        .unwrap();
+        let merged =
+            open_merged(&result);
+        assert_eq!(merged.row_count(), 4);
+
+        // demoted: no value-index capability, no dictionary value terms
+        assert!(merged.term_field_id("trace_id").is_none());
+        let mut trace_terms = 0;
+        merged
+            .for_each_term(&mut |key, _dc, _rgs| {
+                // v2 field-major keys: `{fid u16 BE}{token}`
+                if key.len() > 2 && key[2..].starts_with(b"t-") {
+                    trace_terms += 1;
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            trace_terms, 0,
+            "no trace_id values in the merged dictionary"
+        );
+        // sibling keeps exact index behavior
+        assert_eq!(matching_docs(&merged, &exact("svc", "api")).len(), 2);
+        // the scan column exists and carries the values
+        assert_eq!(
+            read_strings(&merged, "trace_id")
+                .iter()
+                .filter(|v| v.is_some())
+                .count(),
+            4
+        );
+
+        // composite: all four values probeable, absent misses, guards claim
+        let blooms = merged.file_blooms().unwrap().expect("blob");
+        let comp = blooms
+            .iter()
+            .find(|b| b.field == COMPOSITE_BLOOM_FIELD)
+            .expect("composite section");
+        let probe = |key: &[u8]| {
+            let h = hash_value(key);
+            let i = block_index(h, comp.num_blocks) as usize;
+            let block: &[u8; BLOCK_BYTES] = comp.bytes[i * BLOCK_BYTES..(i + 1) * BLOCK_BYTES]
+                .try_into()
+                .unwrap();
+            check_block(block, h)
+        };
+        let mut buf = Vec::new();
+        for v in ["t-a1", "t-a2", "t-b1", "t-b2"] {
+            assert!(
+                probe(composite_value_key("trace_id", v.as_bytes(), &mut buf).unwrap()),
+                "merged composite must carry {v}"
+            );
+        }
+        assert!(!probe(
+            composite_value_key("trace_id", b"t-absent", &mut buf).unwrap()
+        ));
+        for pr in 0..COMPOSITE_GUARD_PROBES {
+            assert!(probe(
+                composite_guard_key("trace_id", pr, &mut buf).unwrap()
+            ));
+        }
+
+        // SECOND GENERATION: merge the bloom-only output with itself-shaped
+        // sibling — values must survive via the docs COLUMNS this time
+        let gen2_inputs = vec![(
+            "g1.vix".to_string(),
+            (
+                bytes::Bytes::from(result.output.to_bytes().unwrap()),
+                result.index.clone().map(bytes::Bytes::from),
+            ),
+        )];
+        let gen2 = merge_core_files_with_caps(
+            StreamType::Logs,
+            &as_inputs(&gen2_inputs),
+            &latest_schema,
+            &[],
+            &[],
+            caps,
+        )
+        .unwrap();
+        let merged2 = open_merged(&gen2);
+        let blooms2 = merged2.file_blooms().unwrap().expect("gen2 blob");
+        let comp2 = blooms2
+            .iter()
+            .find(|b| b.field == COMPOSITE_BLOOM_FIELD)
+            .expect("gen2 composite");
+        let probe2 = |key: &[u8]| {
+            let h = hash_value(key);
+            let i = block_index(h, comp2.num_blocks) as usize;
+            let block: &[u8; BLOCK_BYTES] = comp2.bytes[i * BLOCK_BYTES..(i + 1) * BLOCK_BYTES]
+                .try_into()
+                .unwrap();
+            check_block(block, h)
+        };
+        for v in ["t-a1", "t-a2", "t-b1", "t-b2"] {
+            assert!(
+                probe2(composite_value_key("trace_id", v.as_bytes(), &mut buf).unwrap()),
+                "gen2 composite must carry {v} (column-derived)"
+            );
+        }
+        for pr in 0..COMPOSITE_GUARD_PROBES {
+            assert!(probe2(
+                composite_guard_key("trace_id", pr, &mut buf).unwrap()
+            ));
+        }
+    }
+
+    /// M7 helper: one file built through the REAL move-job path
+    /// (`write_core_file_from_tables`) with the AUTO thresholds shrunk so
+    /// `trace_id` (distinct == rows) demotes AT FIRST ENCODE while `svc`
+    /// (2 distinct) stays term-indexed. `ts` descending, values salted.
+    async fn demoted_at_birth_file(ts: &[i64], salt: &str) -> BuiltPair {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+            Field::new("svc", DataType::Utf8, true),
+            Field::new("trace_id", DataType::Utf8, true),
+        ]));
+        let n = ts.len();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(ts.to_vec())) as ArrayRef,
+                Arc::new(StringArray::from(
+                    (0..n)
+                        .map(|r| if r % 2 == 0 { "api" } else { "web" })
+                        .collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(StringArray::from(
+                    (0..n).map(|r| format!("t-{salt}-{r:04}")).collect::<Vec<_>>(),
+                )) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let table = Arc::new(MemTable::try_new(schema.clone(), vec![vec![batch]]).unwrap());
+        let result = write_core_file_from_tables_with_caps(
+            "test-m7-demoted-birth",
+            StreamType::Logs,
+            schema,
+            vec![table],
+            &[],
+            &[],
+            false,
+            0,
+            BatchCaps {
+                bloom_auto_override: Some((0.5, 4)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        (
+            bytes::Bytes::from(result.data),
+            result.index.map(bytes::Bytes::from),
+        )
+    }
+
+    /// Probe one composite section for a key (SBBF mechanics, shared by the
+    /// M7 tests below).
+    fn composite_probe(blooms: &[vortex_index::bloom::FileBloom], key: &[u8]) -> bool {
+        use vortex_index::{
+            bloom::COMPOSITE_BLOOM_FIELD,
+            sbbf::{BLOCK_BYTES, block_index, check_block, hash_value},
+        };
+        let comp = blooms
+            .iter()
+            .find(|b| b.field == COMPOSITE_BLOOM_FIELD)
+            .expect("composite section");
+        let h = hash_value(key);
+        let i = block_index(h, comp.num_blocks) as usize;
+        let block: &[u8; BLOCK_BYTES] = comp.bytes[i * BLOCK_BYTES..(i + 1) * BLOCK_BYTES]
+            .try_into()
+            .unwrap();
+        check_block(block, h)
+    }
+
+    /// Count a reader's dictionary VALUE terms with a given token prefix
+    /// (key terms under `KEY_FIELD_ID` excluded) — the "no demoted values
+    /// in the dictionary" assertion of the M7 tests.
+    fn value_terms_with_prefix(reader: &VixReader, prefix: &[u8]) -> usize {
+        let mut hits = 0;
+        reader
+            .for_each_term(&mut |key, _dc, _rgs| {
+                if key.len() > 2 && key[0..2] != [0xFF, 0xFF] && key[2..].starts_with(prefix) {
+                    hits += 1;
+                }
+                Ok(())
+            })
+            .unwrap();
+        hits
+    }
+
+    /// #52/M7 (1): a file demoted at FIRST ENCODE through the real move-job
+    /// path carries the construction-demotion semantics — `bloom` marker,
+    /// no dictionary values, composite coverage + guards, key terms intact,
+    /// the scan column readable for filter-back — and the single-file sweep
+    /// classifies it CURRENT under the default plan (sticky marker), never
+    /// looping rebuild → re-demote → rebuild.
+    #[tokio::test]
+    async fn auto_demotes_at_first_encode_and_classifies_current() {
+        use vortex_index::bloom::{
+            COMPOSITE_GUARD_PROBES, composite_guard_key, composite_value_key,
+        };
+
+        let ts: Vec<i64> = (0..8).map(|i| 1_000 - i).collect();
+        let built = demoted_at_birth_file(&ts, "a").await;
+        let reader = open_pair(&built);
+        assert_eq!(reader.row_count(), 8);
+
+        // marker + capabilities
+        assert_eq!(reader.bloom_only_fields().collect::<Vec<_>>(), ["trace_id"]);
+        assert!(reader.term_field_id("trace_id").is_none());
+        assert!(reader.has_term_capability("svc"));
+        assert_eq!(value_terms_with_prefix(&reader, b"t-"), 0);
+        // key terms stay: IS [NOT] NULL proofs remain exact
+        assert_eq!(matching_docs(&reader, &key_exists("trace_id")).len(), 8);
+        // sibling keeps exact index behavior
+        assert_eq!(matching_docs(&reader, &exact("svc", "api")).len(), 4);
+        // filter-back scan column: every demoted value present natively
+        let stored = read_strings(&reader, "trace_id");
+        assert_eq!(stored.iter().filter(|v| v.is_some()).count(), 8);
+        // composite: every value probeable, absent misses, guards claim
+        let blooms = reader.file_blooms().unwrap().expect("blob");
+        let mut buf = Vec::new();
+        for value in stored.iter().flatten() {
+            assert!(composite_probe(
+                &blooms,
+                composite_value_key("trace_id", value.as_bytes(), &mut buf).unwrap()
+            ));
+        }
+        assert!(!composite_probe(
+            &blooms,
+            composite_value_key("trace_id", b"t-absent", &mut buf).unwrap()
+        ));
+        for pr in 0..COMPOSITE_GUARD_PROBES {
+            assert!(composite_probe(
+                &blooms,
+                composite_guard_key("trace_id", pr, &mut buf).unwrap()
+            ));
+        }
+
+        // classify under the DEFAULT plan (no caps seam): the sticky marker
+        // must make the demoted file Current — a NeedsRebuild here would be
+        // the rebuild → re-demote → rebuild loop
+        let latest_schema = Schema::new(vec![
+            Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+            Field::new("svc", DataType::Utf8, true),
+            Field::new("trace_id", DataType::Utf8, true),
+        ]);
+        let status = classify_core_file(
+            StreamType::Logs,
+            "m7-demoted.vix",
+            vortex_index::BytesRangeSource::new("m7-demoted.vix", built.0.clone()),
+            built
+                .1
+                .as_ref()
+                .map(|b| vortex_index::BytesRangeSource::new("m7-demoted.vxi", b.clone())),
+            &latest_schema,
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert!(
+            matches!(status, CoreFileStatus::Current),
+            "demoted-at-birth file must classify Current, got {status:?}"
+        );
+    }
+
+    /// #52/M7 (2): merging two demoted-at-birth inputs with AUTO OFF at
+    /// merge time keeps the demotion (STICKY marker) — fast path + docs
+    /// passthrough, `bloom` marker on the output, composite coverage
+    /// re-derived from the docs columns for BOTH inputs' values — and the
+    /// merged output classifies Current in turn.
+    #[tokio::test]
+    async fn sticky_merge_of_demoted_inputs_keeps_bloom_only() {
+        use vortex_index::bloom::{
+            COMPOSITE_GUARD_PROBES, composite_guard_key, composite_value_key,
+        };
+
+        let file_a = demoted_at_birth_file(&(0..8).map(|i| 2_000 - i).collect::<Vec<_>>(), "a")
+            .await;
+        let file_b = demoted_at_birth_file(&(0..8).map(|i| 1_000 - i).collect::<Vec<_>>(), "b")
+            .await;
+        let latest_schema = Schema::new(vec![
+            Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+            Field::new("svc", DataType::Utf8, true),
+            Field::new("trace_id", DataType::Utf8, true),
+        ]);
+        let inputs = vec![
+            ("m7-a.vix".to_string(), file_a),
+            ("m7-b.vix".to_string(), file_b),
+        ];
+        let result = merge_core_files_with_caps(
+            StreamType::Logs,
+            &as_inputs(&inputs),
+            &latest_schema,
+            &[],
+            // trace_id IS a configured per-file bloom field: the demotion
+            // must suppress its per-field section (an empty one would
+            // reject every probe and wrongly drop the file)
+            &["trace_id".to_string()],
+            BatchCaps {
+                // AUTO fully OFF at merge: stickiness alone must carry
+                bloom_auto_override: Some((0.0, u64::MAX)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(result.used_index_merge, "demoted inputs keep the fast path");
+        assert_eq!(
+            result.docs_passthrough_inputs, 2,
+            "schema-identical disjoint inputs copy encoded; bloom coverage \
+             comes from the projected column scan"
+        );
+        let merged = open_merged(&result);
+        assert_eq!(merged.row_count(), 16);
+        assert_eq!(merged.bloom_only_fields().collect::<Vec<_>>(), ["trace_id"]);
+        assert!(merged.term_field_id("trace_id").is_none());
+        assert_eq!(value_terms_with_prefix(&merged, b"t-"), 0);
+        assert_eq!(matching_docs(&merged, &exact("svc", "api")).len(), 8);
+        assert_eq!(matching_docs(&merged, &key_exists("trace_id")).len(), 16);
+
+        let blooms = merged.file_blooms().unwrap().expect("blob");
+        // the demoted field's per-field section is SUPPRESSED, never
+        // published empty: an all-zero filter would read "definitely not"
+        // for every value and wrongly drop the file (M7 P0)
+        assert!(
+            blooms.iter().all(|b| b.field != "trace_id"),
+            "no per-field section for the demoted configured bloom field"
+        );
+        let mut buf = Vec::new();
+        for value in read_strings(&merged, "trace_id").iter().flatten() {
+            assert!(
+                composite_probe(
+                    &blooms,
+                    composite_value_key("trace_id", value.as_bytes(), &mut buf).unwrap()
+                ),
+                "merged composite must carry {value}"
+            );
+        }
+        for pr in 0..COMPOSITE_GUARD_PROBES {
+            assert!(composite_probe(
+                &blooms,
+                composite_guard_key("trace_id", pr, &mut buf).unwrap()
+            ));
+        }
+
+        // convergence: the merged output classifies Current too
+        let merged_pair: BuiltPair = (
+            bytes::Bytes::from(result.output.to_bytes().unwrap()),
+            result.index.clone().map(bytes::Bytes::from),
+        );
+        let status = classify_core_file(
+            StreamType::Logs,
+            "m7-merged.vix",
+            vortex_index::BytesRangeSource::new("m7-merged.vix", merged_pair.0.clone()),
+            merged_pair
+                .1
+                .as_ref()
+                .map(|b| vortex_index::BytesRangeSource::new("m7-merged.vxi", b.clone())),
+            &latest_schema,
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert!(matches!(status, CoreFileStatus::Current));
+    }
+
+    /// #52/M7 (3): a MIXED merge — one demoted-at-birth input + one legacy
+    /// term-indexed input — converges on bloom-only: sticky drives the plan
+    /// (AUTO off), the legacy input's dictionary values are diverted into
+    /// the composite (never the output dictionary), and coverage spans BOTH
+    /// inputs' values.
+    #[tokio::test]
+    async fn mixed_merge_demoted_and_legacy_term_inputs_converges() {
+        use vortex_index::bloom::{
+            COMPOSITE_GUARD_PROBES, composite_guard_key, composite_value_key,
+        };
+
+        let fields = || {
+            vec![
+                Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+                Field::new("svc", DataType::Utf8, true),
+                Field::new("trace_id", DataType::Utf8, true),
+            ]
+        };
+        let demoted = demoted_at_birth_file(&(0..8).map(|i| 2_000 - i).collect::<Vec<_>>(), "a")
+            .await;
+        assert_eq!(
+            open_pair(&demoted).bloom_only_fields().count(),
+            1,
+            "precondition: input A demoted at birth"
+        );
+        // legacy: same schema, trace_id fully TERM-indexed
+        let legacy = build_core_file(
+            fields(),
+            vec![
+                Arc::new(Int64Array::from(vec![900i64, 800])),
+                Arc::new(StringArray::from(vec!["api", "web"])),
+                Arc::new(StringArray::from(vec!["t-legacy-1", "t-legacy-2"])),
+            ],
+            &[],
+            None,
+        );
+        assert!(
+            open_pair(&legacy).has_term_capability("trace_id"),
+            "precondition: input B term-indexed"
+        );
+
+        let latest_schema = Schema::new(fields());
+        let inputs = vec![
+            ("m7-demoted.vix".to_string(), demoted),
+            ("m7-legacy.vix".to_string(), legacy),
+        ];
+        let result = merge_core_files_with_caps(
+            StreamType::Logs,
+            &as_inputs(&inputs),
+            &latest_schema,
+            &[],
+            // configured per-file bloom field: the mixed merge would give
+            // its per-field acc ONLY the legacy input's dictionary values —
+            // a PARTIAL filter wrongly dropping the demoted input's values
+            // — so demotion must suppress the section entirely
+            &["trace_id".to_string()],
+            BatchCaps {
+                bloom_auto_override: Some((0.0, u64::MAX)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(result.used_index_merge, "mixed inputs keep the fast path");
+        let merged = open_merged(&result);
+        assert_eq!(merged.row_count(), 10);
+        // converged: bloom marker (NOT the capability-less demoted_fields
+        // degrade — bloom typing loses to it, so this assert covers both)
+        assert_eq!(merged.bloom_only_fields().collect::<Vec<_>>(), ["trace_id"]);
+        assert!(merged.term_field_id("trace_id").is_none());
+        assert_eq!(
+            value_terms_with_prefix(&merged, b"t-"),
+            0,
+            "legacy dictionary values must divert to the bloom, not the output dictionary"
+        );
+        assert_eq!(matching_docs(&merged, &key_exists("trace_id")).len(), 10);
+        assert_eq!(matching_docs(&merged, &exact("svc", "api")).len(), 5);
+        // the scan column carries every row's value for filter-back
+        let stored = read_strings(&merged, "trace_id");
+        assert_eq!(stored.iter().filter(|v| v.is_some()).count(), 10);
+        // composite coverage spans BOTH inputs
+        let blooms = merged.file_blooms().unwrap().expect("blob");
+        assert!(
+            blooms.iter().all(|b| b.field != "trace_id"),
+            "no partial per-field section for the demoted configured bloom field"
+        );
+        let mut buf = Vec::new();
+        for value in stored.iter().flatten() {
+            assert!(
+                composite_probe(
+                    &blooms,
+                    composite_value_key("trace_id", value.as_bytes(), &mut buf).unwrap()
+                ),
+                "merged composite must carry {value}"
+            );
+        }
+        assert!(!composite_probe(
+            &blooms,
+            composite_value_key("trace_id", b"t-absent", &mut buf).unwrap()
+        ));
+        for pr in 0..COMPOSITE_GUARD_PROBES {
+            assert!(composite_probe(
+                &blooms,
+                composite_guard_key("trace_id", pr, &mut buf).unwrap()
+            ));
+        }
+    }
+
+    /// M12 double-hash elimination predicate: an input whose DICTIONARY
+    /// fully covers a bloom-only output field (term capability, not
+    /// partial) contributes its values through the k-way walk and must NOT
+    /// be re-scanned; inputs that demoted the field at birth (bloom
+    /// marker), lack capability, or stamped it partial MUST scan.
+    #[tokio::test]
+    async fn m12_bloom_scan_fields_skip_dictionary_covered_inputs() {
+        let fields = || {
+            vec![
+                Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+                Field::new("svc", DataType::Utf8, true),
+                Field::new("trace_id", DataType::Utf8, true),
+            ]
+        };
+        // a merge writer whose OUTPUT plan demotes trace_id to bloom-only
+        let schema = Schema::new(fields());
+        let mut opts = core_writer_options(&[], Vec::new(), true);
+        opts.bloom_only_field_names = vec!["trace_id".to_string()];
+        let writer = VixWriter::new(&schema, opts, false);
+        assert_eq!(writer.bloom_only_fields(), vec!["trace_id".to_string()]);
+
+        // (a) term-capable input: its dictionary holds every trace_id value
+        // — the k-way walk absorbs them, the scan must SKIP the field
+        let ts = vec![900i64, 800, 700, 600];
+        let capable = build_core_file(
+            fields(),
+            vec![
+                Arc::new(Int64Array::from(ts.clone())),
+                Arc::new(StringArray::from(vec!["api", "db", "api", "db"])),
+                Arc::new(StringArray::from(vec!["t-1", "t-2", "t-3", "t-4"])),
+            ],
+            &[],
+            None,
+        );
+        let capable_reader = open_pair(&capable);
+        assert!(capable_reader.has_term_capability("trace_id"));
+        assert!(
+            bloom_scan_fields_for_input(&writer, &capable_reader).is_empty(),
+            "dictionary-covered fields must not re-scan (the M12 double-hash)"
+        );
+
+        // (b) birth-demoted input: bloom marker, no value terms — scan
+        let demoted = demoted_at_birth_file(&ts, "m12").await;
+        let demoted_reader = open_pair(&demoted);
+        assert!(!demoted_reader.has_term_capability("trace_id"));
+        assert_eq!(
+            bloom_scan_fields_for_input(&writer, &demoted_reader),
+            vec!["trace_id".to_string()],
+            "a bloom-marked input's values exist only in its docs column"
+        );
+
+        // (c) partial input: capability claimed but the dictionary is
+        // knowingly incomplete — the docs column is the only complete source
+        let partial: BuiltPair = (
+            capable.0.clone(),
+            Some(bytes::Bytes::from(
+                vortex_index::test_support::repack_with_partial_fields(
+                    capable.1.as_deref().expect("sidecar"),
+                    &["trace_id"],
+                )
+                .unwrap(),
+            )),
+        );
+        let partial_reader = open_pair(&partial);
+        assert!(partial_reader.partial_fields().contains("trace_id"));
+        assert_eq!(
+            bloom_scan_fields_for_input(&writer, &partial_reader),
+            vec!["trace_id".to_string()],
+            "a partial dictionary must never be trusted for coverage"
+        );
+    }
+
+    /// #51c corpus fields: feature-dense (fts tokens, nullable string +
+    /// numeric cs columns with nulls, a dense value field) and buildable
+    /// SCHEMA-IDENTICAL across inputs — the shape the docs-chunk
+    /// passthrough requires (exact docs-schema identity with the output).
+    fn passthrough_fields() -> Vec<Field> {
+        vec![
+            Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+            Field::new("log", DataType::Utf8, true),
+            Field::new("svc", DataType::Utf8, true),
+            Field::new("env", DataType::Utf8, true),
+            Field::new("code", DataType::Int64, true),
+        ]
+    }
+
+    /// One #51c input file over `ts` (descending), salted so the two
+    /// inputs' values are distinguishable.
+    fn passthrough_file(ts: &[i64], salt: &str) -> BuiltPair {
+        let n = ts.len();
+        let fts = vec!["log".to_string()];
+        build_core_file(
+            passthrough_fields(),
+            vec![
+                Arc::new(Int64Array::from(ts.to_vec())),
+                Arc::new(StringArray::from(
+                    (0..n)
+                        .map(|r| (r % 3 != 0).then(|| format!("error {salt} row {r}")))
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    (0..n)
+                        .map(|r| (r % 4 != 1).then(|| format!("svc-{salt}-{}", r % 2)))
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(vec![Some("prod"); n])),
+                Arc::new(Int64Array::from(
+                    (0..n as i64)
+                        .map(|r| (r % 5 != 2).then_some(200 + r))
+                        .collect::<Vec<_>>(),
+                )),
+            ],
+            &fts,
+            None,
+        )
+    }
+
+    /// #51c differential (a): a disjoint merge (passthrough is the DEFAULT)
+    /// must be reader-equivalent to the forced-decode rebuild —
+    /// identical row content (logical compare: bytes under null slots may
+    /// differ across encode lineages), identical row_count and `_timestamp`
+    /// range, and a zone table covering every row contiguously — with BOTH
+    /// inputs copied encoded (counter == input count) and none under the
+    /// force_decode oracle seam.
+    #[tokio::test]
+    async fn docs_passthrough_matches_rebuild() {
+        let fts = vec!["log".to_string()];
+        let latest_schema = Schema::new(passthrough_fields());
+        let inputs = vec![
+            (
+                "pa.vix".to_string(),
+                passthrough_file(&[1000, 950, 900, 850], "a"),
+            ),
+            (
+                "pb.vix".to_string(),
+                passthrough_file(&[800, 750, 700], "b"),
+            ),
+        ];
+
+        let fast = merge_core_files(
+            StreamType::Logs,
+            &as_inputs(&inputs),
+            &latest_schema,
+            &fts,
+            &[],
+        )
+        .unwrap();
+        assert!(fast.used_index_merge, "expected the index-merge fast path");
+        assert_eq!(
+            fast.docs_passthrough_inputs, 2,
+            "both schema-identical disjoint inputs must copy encoded (the default)"
+        );
+
+        // seam sanity: the same merge under force_decode decodes everything
+        let control = merge_core_files_with_caps(
+            StreamType::Logs,
+            &as_inputs(&inputs),
+            &latest_schema,
+            &fts,
+            &[],
+            BatchCaps {
+                force_decode: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(control.docs_passthrough_inputs, 0);
+
+        let rebuild = merge_core_files_rebuild_with_caps(
+            StreamType::Logs,
+            &as_inputs(&inputs),
+            &latest_schema,
+            &fts,
+            &[],
+            BatchCaps {
+                force_decode: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(fast.stats.row_count, rebuild.stats.row_count);
+        assert_eq!(fast.stats.min_ts, rebuild.stats.min_ts, "min_ts");
+        assert_eq!(fast.stats.max_ts, rebuild.stats.max_ts, "max_ts");
+
+        let fast_reader =
+            open_merged(&fast);
+        let rebuild_reader =
+            open_merged(&rebuild);
+        assert_core_files_equivalent_logical_docs(
+            &fast_reader,
+            &rebuild_reader,
+            "passthrough-vs-rebuild",
+        );
+        // H2 §11 splice gate: the copied output carries FULL stats equal to
+        // the fresh ones — the v1 stats-loss regression is structurally gone
+        assert_stats_splice_parity(&fast, &rebuild, "passthrough-vs-rebuild stats");
+
+        // spliced zone table: contiguous entries covering every row
+        let zone = fast_reader.zone_chunks().expect("merged zone table");
+        let mut expected_offset = 0u64;
+        for chunk in zone {
+            assert_eq!(chunk.row_offset, expected_offset, "contiguous zone rows");
+            assert!(chunk.row_count > 0, "no empty zone entries");
+            assert!(chunk.ts_min <= chunk.ts_max, "zone bounds sane");
+            expected_offset += chunk.row_count;
+        }
+        assert_eq!(expected_offset, fast_reader.row_count(), "zone coverage");
+        // the concat preserved the global DESC storage order
+        let ts = read_i64(&fast_reader, TIMESTAMP_COL_NAME);
+        assert!(ts.windows(2).all(|pair| pair[0] >= pair[1]), "global DESC");
+    }
+
+    /// #51c × #52 (b): a passthrough merge over bloom-only-plan inputs
+    /// (whose trace_id values live ONLY in docs columns) must keep
+    /// composite-bloom coverage for BOTH inputs' values — the projected
+    /// bloom-only column scan is the single coverage source when docs rows
+    /// never decode.
+    #[test]
+    fn docs_passthrough_bloom_only_coverage() {
+        use vortex_index::{
+            bloom::{
+                COMPOSITE_BLOOM_FIELD, COMPOSITE_GUARD_PROBES, composite_guard_key,
+                composite_value_key,
+            },
+            sbbf::{BLOCK_BYTES, block_index, check_block, hash_value},
+        };
+
+        let fields = || {
+            vec![
+                Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+                Field::new("svc", DataType::Utf8, true),
+                Field::new("trace_id", DataType::Utf8, true),
+            ]
+        };
+        let latest_schema = Schema::new(fields());
+        let build = |ts: Vec<i64>, svc: Vec<&str>, traces: Vec<&str>| {
+            build_core_file(
+                fields(),
+                vec![
+                    Arc::new(Int64Array::from(ts)),
+                    Arc::new(StringArray::from(svc)),
+                    Arc::new(StringArray::from(traces)),
+                ],
+                &[],
+                None,
+            )
+        };
+        // gen1: term-indexed inputs converge onto the bloom-only plan
+        // through the DECODE path (force_decode) — this stage exists to
+        // produce bloom-only files (columns exist from the build; v2
+        // all-columns) whose values live in NO dictionary
+        let gen1_caps = BatchCaps {
+            bloom_only_override: Some("trace_id"),
+            force_decode: true,
+            ..Default::default()
+        };
+        let gen1 = |name: &str, file: BuiltPair| {
+            let inputs = vec![(name.to_string(), file)];
+            let result = merge_core_files_with_caps(
+                StreamType::Logs,
+                &as_inputs(&inputs),
+                &latest_schema,
+                &[],
+                &[],
+                gen1_caps,
+            )
+            .unwrap();
+            assert_eq!(
+                result.docs_passthrough_inputs, 0,
+                "{name}: the force_decode merge must decode"
+            );
+            (
+                bytes::Bytes::from(result.output.to_bytes().unwrap()),
+                result.index.map(bytes::Bytes::from),
+            )
+        };
+        let gen1a = gen1(
+            "a1.vix",
+            build(vec![100, 90], vec!["api", "api"], vec!["t-a1", "t-a2"]),
+        );
+        let gen1b = gen1(
+            "b1.vix",
+            build(vec![80, 70], vec!["web", "web"], vec!["t-b1", "t-b2"]),
+        );
+
+        // gen2: both inputs store trace_id as a docs column and share the
+        // plan's exact docs schema — the passthrough (the default) engages,
+        // and the composite bloom must still carry every value of BOTH
+        // inputs
+        let gen2_inputs = vec![("ga.vix".to_string(), gen1a), ("gb.vix".to_string(), gen1b)];
+        let gen2 = merge_core_files_with_caps(
+            StreamType::Logs,
+            &as_inputs(&gen2_inputs),
+            &latest_schema,
+            &[],
+            &[],
+            BatchCaps {
+                bloom_only_override: Some("trace_id"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(gen2.used_index_merge);
+        assert_eq!(
+            gen2.docs_passthrough_inputs, 2,
+            "gen2 inputs are schema-identical bloom-only files"
+        );
+        let merged = open_merged(&gen2);
+        assert_eq!(merged.row_count(), 4);
+
+        let blooms = merged.file_blooms().unwrap().expect("bloom blob");
+        let comp = blooms
+            .iter()
+            .find(|b| b.field == COMPOSITE_BLOOM_FIELD)
+            .expect("composite section");
+        let probe = |key: &[u8]| {
+            let h = hash_value(key);
+            let i = block_index(h, comp.num_blocks) as usize;
+            let block: &[u8; BLOCK_BYTES] = comp.bytes[i * BLOCK_BYTES..(i + 1) * BLOCK_BYTES]
+                .try_into()
+                .unwrap();
+            check_block(block, h)
+        };
+        let mut buf = Vec::new();
+        for value in ["t-a1", "t-a2", "t-b1", "t-b2"] {
+            assert!(
+                probe(composite_value_key("trace_id", value.as_bytes(), &mut buf).unwrap()),
+                "passthrough merge must keep composite coverage for {value} (projected \
+                 bloom-only scan)"
+            );
+        }
+        assert!(
+            !probe(composite_value_key("trace_id", b"t-absent", &mut buf).unwrap()),
+            "absent value must miss"
+        );
+        for pr in 0..COMPOSITE_GUARD_PROBES {
+            assert!(
+                probe(composite_guard_key("trace_id", pr, &mut buf).unwrap()),
+                "coverage guard {pr}"
+            );
+        }
+
+        // and the passthrough rows equal the rebuild's, logically — under
+        // force_decode for the oracle: the rebuild path passes through too
+        // by default, which would compare copied chunks against copied
+        // chunks
+        let rebuild = merge_core_files_rebuild_with_caps(
+            StreamType::Logs,
+            &as_inputs(&gen2_inputs),
+            &latest_schema,
+            &[],
+            &[],
+            gen1_caps,
+        )
+        .unwrap();
+        assert_eq!(rebuild.docs_passthrough_inputs, 0, "oracle stays plain");
+        let rebuild_reader =
+            open_merged(&rebuild);
+        assert_core_files_equivalent_logical_docs(
+            &merged,
+            &rebuild_reader,
+            "gen2 passthrough-vs-rebuild",
+        );
+    }
+
+    /// #51c (c): mixed qualification under UNION schemas (v2) — the output
+    /// docs schema is the UNION of the inputs' columns, so the input whose
+    /// schema equals the union copies encoded while the NARROWER input
+    /// silently decodes (its missing column null-fills); the output stays
+    /// equivalent to the rebuild and carries the union column.
+    #[tokio::test]
+    async fn docs_passthrough_mixed_qualification() {
+        let fts = vec!["log".to_string()];
+        let latest_schema = Schema::new(passthrough_fields());
+
+        // input B stores an EXTRA column ("extra"): the union plan output
+        // includes it — pre-M17 that DISQUALIFIED the narrower input A;
+        // the widen plan now null-synthesizes "extra" for A's chunks, so A
+        // copies too. Input C stores `code` at a FLIPPED width (Int32 vs
+        // the plan's Int64) — a genuine re-encode the widen plan refuses —
+        // and is the one input that must keep the decode path.
+        let mut extra_fields = passthrough_fields();
+        extra_fields.push(Field::new("extra", DataType::Utf8, true));
+        let ts_b = [800i64, 750, 700];
+        let n = ts_b.len();
+        let file_b = build_core_file(
+            extra_fields,
+            vec![
+                Arc::new(Int64Array::from(ts_b.to_vec())),
+                Arc::new(StringArray::from(
+                    (0..n)
+                        .map(|r| Some(format!("error b row {r}")))
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(vec![Some("svc-b-0"); n])),
+                Arc::new(StringArray::from(vec![Some("prod"); n])),
+                Arc::new(Int64Array::from(vec![Some(500i64); n])),
+                Arc::new(StringArray::from(vec![Some("x1"); n])),
+            ],
+            &fts,
+            None,
+        );
+        let mut flip_fields = passthrough_fields();
+        flip_fields[4] = Field::new("code", DataType::Int32, true);
+        let file_c = build_core_file(
+            flip_fields,
+            vec![
+                Arc::new(Int64Array::from(vec![650i64, 600])),
+                Arc::new(StringArray::from(vec![Some("error c row 0"), None])),
+                Arc::new(StringArray::from(vec![Some("svc-c-0"); 2])),
+                Arc::new(StringArray::from(vec![Some("prod"); 2])),
+                Arc::new(arrow::array::Int32Array::from(vec![Some(301), Some(302)])),
+            ],
+            &fts,
+            None,
+        );
+        let inputs = vec![
+            (
+                "pa.vix".to_string(),
+                passthrough_file(&[1000, 950, 900, 850], "a"),
+            ),
+            ("pb-extra.vix".to_string(), file_b),
+            ("pc-flip.vix".to_string(), file_c),
+        ];
+
+        let fast = merge_core_files(
+            StreamType::Logs,
+            &as_inputs(&inputs),
+            &latest_schema,
+            &fts,
+            &[],
+        )
+        .unwrap();
+        assert!(fast.used_index_merge);
+        assert_eq!(
+            fast.docs_passthrough_inputs, 2,
+            "the union-widened input copies alongside the identical one; only the width-flipped \
+             input decodes (M17 per-input fail-open)"
+        );
+
+        let rebuild = merge_core_files_rebuild_with_caps(
+            StreamType::Logs,
+            &as_inputs(&inputs),
+            &latest_schema,
+            &fts,
+            &[],
+            BatchCaps {
+                force_decode: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let fast_reader =
+            open_merged(&fast);
+        let rebuild_reader =
+            open_merged(&rebuild);
+        assert_core_files_equivalent_logical_docs(
+            &fast_reader,
+            &rebuild_reader,
+            "mixed passthrough-vs-rebuild",
+        );
+        // the union column exists; rows that never carried it read NULL —
+        // v2 null-fill semantics, consistent with `_source` — whether the
+        // rows arrived by widened chunk copy (A), identity copy (B) or the
+        // decode fail-open (C)
+        let extra = read_strings(&fast_reader, "extra");
+        // merged DESC order: A's 4 rows (1000..850), B's 3 (800..700),
+        // C's 2 (650..600)
+        assert_eq!(
+            extra,
+            vec![
+                None,
+                None,
+                None,
+                None,
+                Some("x1".to_string()),
+                Some("x1".to_string()),
+                Some("x1".to_string()),
+                None,
+                None,
+            ],
+            "the narrower inputs' rows null-fill the union column"
+        );
+        // the flipped input's code values were CAST to the plan width by
+        // the decode path
+        let code = read_i64(&fast_reader, "code");
+        assert_eq!(&code[7..], &[301, 302], "Int32 -> Int64 cast image");
+        // zone coverage still exact over the mixed (spliced + folded) table
+        let zone = fast_reader.zone_chunks().expect("zone table");
+        assert_eq!(
+            zone.iter().map(|chunk| chunk.row_count).sum::<u64>(),
+            fast_reader.row_count()
+        );
+    }
+
+    /// #51c (d): overlapping inputs CONCATENATE by default (v2 §6.1 —
+    /// passthrough-native): both inputs copy encoded and the output is
+    /// stamped concat; under the force_decode oracle the merge interleaves
+    /// sorted, and the two outputs are content-equivalent as multisets.
+    #[tokio::test]
+    async fn overlap_merge_concatenates_by_default() {
+        let fts = vec!["log".to_string()];
+        let latest_schema = Schema::new(passthrough_fields());
+        let inputs = vec![
+            (
+                "pa.vix".to_string(),
+                passthrough_file(&[1000, 800, 600], "a"),
+            ),
+            (
+                "pb.vix".to_string(),
+                passthrough_file(&[900, 800, 500], "b"),
+            ),
+        ];
+
+        let fast = merge_core_files(
+            StreamType::Logs,
+            &as_inputs(&inputs),
+            &latest_schema,
+            &fts,
+            &[],
+        )
+        .unwrap();
+        assert!(fast.used_index_merge);
+        assert!(fast.concat_order, "overlap concatenates by default");
+        assert_eq!(
+            fast.docs_passthrough_inputs, 2,
+            "every overlapping input copies encoded under the default concat"
+        );
+
+        let sorted = merge_core_files_with_caps(
+            StreamType::Logs,
+            &as_inputs(&inputs),
+            &latest_schema,
+            &fts,
+            &[],
+            BatchCaps {
+                force_decode: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!sorted.concat_order, "force_decode keeps the sorted interleave");
+        assert_eq!(sorted.docs_passthrough_inputs, 0);
+        let fast_reader =
+            open_merged(&fast);
+        let sorted_reader =
+            open_merged(&sorted);
+        assert_eq!(fast_reader.row_order(), RowOrder::Concat);
+        assert_eq!(sorted_reader.row_order(), RowOrder::TsDesc);
+        let ts = read_i64(&sorted_reader, TIMESTAMP_COL_NAME);
+        assert!(ts.windows(2).all(|pair| pair[0] >= pair[1]), "global DESC");
+        assert_core_files_content_equivalent(
+            &fast_reader,
+            &sorted_reader,
+            "default concat vs forced-decode interleave",
+        );
+    }
+
+    /// #51c HEAL differential (a): a SINGLE index-off L0 input healing to
+    /// indexed through the REBUILD — with the passthrough on must produce a
+    /// file reader-equivalent to today's full rebuild (identical logical
+    /// docs content, identical term table / capabilities / query battery
+    /// via the shared helper, identical row_count and `_timestamp` range)
+    /// while copying the docs chunks instead of re-encoding them
+    /// (`docs_passthrough_inputs == 1`), and the knob off keeps today's
+    /// byte path (`== 0`).
+    ///
+    /// M3 NOTE: production single-file heals are SIDECAR-ONLY now (the docs
+    /// never rewrite — `rebuild_core_file_sidecar`); this pins the
+    /// surviving docs-rewriting REBUILD ARM, which single-file heals still
+    /// reach on the NeedsDocsRewrite fallback and multi-input rebuild
+    /// merges reach routinely.
+    ///
+    /// The heal's cs plan covers EVERY input column, so the output docs
+    /// schema equals the index-off input's all-columnar docs schema — the
+    /// exact-identity gate the passthrough requires.
+    #[tokio::test]
+    async fn heal_docs_passthrough_matches_rebuild() {
+        let schema = wal_schema();
+        let fts = vec!["log".to_string()];
+        let table =
+            Arc::new(MemTable::try_new(schema.clone(), vec![wal_batches(&schema)]).unwrap());
+        let l0 = write_core_file_from_tables_with_caps(
+            "test-heal-passthrough",
+            StreamType::Logs,
+            schema.clone(),
+            vec![table],
+            &fts,
+            &[],
+            false,
+            0,
+            BatchCaps {
+                index_enabled_override: Some(false),
+                ..BatchCaps::default()
+            },
+        )
+        .await
+        .unwrap();
+        let l0_reader = VixReader::open_with_index(bytes::Bytes::from(l0.data.clone()), l0.index.clone().map(bytes::Bytes::from)).unwrap();
+        assert!(!l0_reader.has_index(), "the heal input must be index-off");
+
+        let latest_schema = schema.as_ref().clone();
+        let inputs = vec![(
+            "l0-heal.vix".to_string(),
+            (
+                bytes::Bytes::from(l0.data.clone()),
+                l0.index.clone().map(bytes::Bytes::from),
+            ),
+        )];
+        let heal_with = |force_decode: bool| {
+            merge_core_files_with_caps(
+                StreamType::Logs,
+                &as_inputs(&inputs),
+                &latest_schema,
+                &fts,
+                &[],
+                BatchCaps {
+                    force_decode,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        };
+
+        let healed = heal_with(false);
+        assert!(
+            !healed.used_index_merge,
+            "an index-off input must force the rebuild (the heal)"
+        );
+        assert_eq!(
+            healed.docs_passthrough_inputs, 1,
+            "the schema-identical single-input heal must copy its docs chunks (the default)"
+        );
+        assert_eq!(healed.dropped_rows, 0);
+
+        let control = heal_with(true);
+        assert!(!control.used_index_merge);
+        assert_eq!(
+            control.docs_passthrough_inputs, 0,
+            "force_decode keeps the decode + re-encode oracle"
+        );
+
+        // identical logical outcome: rows, ts range, index, queries
+        assert_eq!(healed.stats.row_count, control.stats.row_count);
+        assert_eq!(healed.stats.min_ts, control.stats.min_ts, "min_ts");
+        assert_eq!(healed.stats.max_ts, control.stats.max_ts, "max_ts");
+        assert_eq!(healed.stats.term_count, control.stats.term_count);
+        let healed_reader =
+            open_merged(&healed);
+        let control_reader =
+            open_merged(&control);
+        assert!(healed_reader.has_index(), "the heal output is indexed");
+        assert!(healed_reader.term_count() > 0);
+        assert_core_files_equivalent_logical_docs(
+            &healed_reader,
+            &control_reader,
+            "heal passthrough vs rebuild",
+        );
+        // H2 §11 splice gate on the heal shape too
+        assert_stats_splice_parity(&healed, &control, "heal passthrough stats");
+
+        // spliced zone table: contiguous, covering every row, and bounding
+        // the same global _timestamp range the stats report
+        let zone = healed_reader.zone_chunks().expect("healed zone table");
+        let mut expected_offset = 0u64;
+        for chunk in zone {
+            assert_eq!(chunk.row_offset, expected_offset, "contiguous zone rows");
+            assert!(chunk.row_count > 0, "no empty zone entries");
+            assert!(chunk.ts_min <= chunk.ts_max, "zone bounds sane");
+            expected_offset += chunk.row_count;
+        }
+        assert_eq!(expected_offset, healed_reader.row_count(), "zone coverage");
+        assert_eq!(
+            zone.iter().map(|chunk| chunk.ts_min).min().unwrap(),
+            healed.stats.min_ts,
+            "zone global min == stats"
+        );
+        assert_eq!(
+            zone.iter().map(|chunk| chunk.ts_max).max().unwrap(),
+            healed.stats.max_ts,
+            "zone global max == stats"
+        );
+        // the copy preserved the storage DESC order
+        let ts = read_i64(&healed_reader, TIMESTAMP_COL_NAME);
+        assert!(ts.windows(2).all(|pair| pair[0] >= pair[1]), "global DESC");
+    }
+
+    /// M18 (prod .110 "vortex.slice not permitted by ctx"): a heal
+    /// passthrough over an input whose NARROW columns store coarser chunks
+    /// than `_source`'s byte-budget grid — the scan then yields those
+    /// columns as slices of one stored leaf, the exact shape that pre-M18
+    /// either errored the docs encoder (wrapper slices → whole-merge
+    /// restart) or, worse, copied an offset-lossy reduced slice (silent
+    /// wrong rows; the vortex_index-level pin measured 96% corruption on
+    /// this corpus class). The deterministic slice guard must canonicalize
+    /// exactly those column-windows (counted in `docs_sliced_windows`),
+    /// the copy must complete as a passthrough (no restart, no write-side
+    /// fail-open), and rows + doc ids must be position-exact against the
+    /// forced-decode oracle.
+    #[test]
+    fn m18_heal_passthrough_sliced_columns_stay_row_exact() {
+        let rows = 65_536usize;
+        let fts = vec!["log".to_string()];
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+            Field::new("log", DataType::Utf8, true),
+            Field::new("status", DataType::Int64, true),
+            Field::new("level", DataType::Utf8, true),
+        ]));
+        let ts: Vec<i64> = (0..rows).map(|i| 5_000_000 - i as i64).collect();
+        // variable 5..=12-row runs of pseudo-random values (inline LCG —
+        // deterministic): the column stores as one coarse compressed chunk
+        // per ~64Ki rows, far coarser than _source's grid, so every scan
+        // window slices it
+        let mut state = 0x1818_u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 16
+        };
+        let status: Vec<i64> = {
+            let mut out = Vec::with_capacity(rows);
+            while out.len() < rows {
+                let run = 5 + (next() % 8) as usize;
+                let value = (next() as i64) >> 8;
+                for _ in 0..run.min(rows - out.len()) {
+                    out.push(value);
+                }
+            }
+            out
+        };
+        let level: Vec<&str> = (0..rows)
+            .map(|i| ["info", "warn", "error", "debug"][(i / 512) % 4])
+            .collect();
+        let log_col: Vec<String> = (0..rows).map(|i| format!("evt{}", i % 97)).collect();
+        let sources: Vec<String> = (0..rows)
+            .map(|i| {
+                format!(
+                    r#"{{"_timestamp":{},"log":"{}","status":{},"level":"{}","pad":"{}"}}"#,
+                    ts[i],
+                    log_col[i],
+                    status[i],
+                    level[i],
+                    "x".repeat(120)
+                )
+            })
+            .collect();
+
+        // index-off all-columnar input (the #46 L0 shape) with a SMALL docs
+        // chunk budget so _source stores many fine chunks
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(ts.clone())) as ArrayRef,
+                Arc::new(StringArray::from(log_col.clone())) as ArrayRef,
+                Arc::new(Int64Array::from(status.clone())) as ArrayRef,
+                Arc::new(StringArray::from(level.clone())) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let mut input_writer = VixWriter::new(
+            &schema,
+            vortex_index::VixWriterOptions {
+                index_enabled: false,
+                docs_chunk_bytes: 128 * 1024,
+                ..Default::default()
+            },
+            false,
+        );
+        input_writer
+            .push_batch_with_source(&batch, &StringArray::from(sources.clone()), None)
+            .unwrap();
+        let (data, index) = input_writer.finish().unwrap();
+        let inputs = vec![(
+            "m18-sliced.vix".to_string(),
+            (bytes::Bytes::from(data), index.map(bytes::Bytes::from)),
+        )];
+        let heal_with = |force_decode: bool| {
+            merge_core_files_with_caps(
+                StreamType::Logs,
+                &as_inputs(&inputs),
+                &schema,
+                &fts,
+                &[],
+                BatchCaps {
+                    force_decode,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        };
+
+        let healed = heal_with(false);
+        assert!(!healed.used_index_merge, "index-off input forces the heal");
+        assert_eq!(
+            healed.docs_passthrough_inputs, 1,
+            "the copy must COMPLETE as a passthrough — no whole-merge restart"
+        );
+        assert!(
+            healed.docs_sliced_windows > 0,
+            "the coarse narrow columns must trip the deterministic slice guard"
+        );
+        assert_eq!(
+            healed.docs_failopen_chunks, 0,
+            "the scan-side guard catches everything before the writer backstop"
+        );
+
+        let control = heal_with(true);
+        assert_eq!(control.docs_passthrough_inputs, 0, "forced-decode oracle");
+        assert_eq!(healed.stats.row_count, control.stats.row_count);
+        assert_eq!(healed.stats.min_ts, control.stats.min_ts);
+        assert_eq!(healed.stats.max_ts, control.stats.max_ts);
+        assert_eq!(healed.stats.term_count, control.stats.term_count);
+
+        let healed_reader = open_merged(&healed);
+        let control_reader = open_merged(&control);
+        assert_core_files_equivalent_logical_docs(
+            &healed_reader,
+            &control_reader,
+            "M18 sliced heal vs rebuild",
+        );
+        assert_stats_splice_parity(&healed, &control, "M18 sliced heal stats");
+
+        // row-position exactness through the canonicalized column-windows:
+        // the copied file holds the SAME values at the SAME positions
+        assert_eq!(read_i64(&healed_reader, "status"), status);
+        assert_eq!(read_i64(&healed_reader, TIMESTAMP_COL_NAME), ts);
+
+        // doc-id invariant: index hits land on the same positions as the
+        // oracle's, and the docs rows AT those positions hold the queried
+        // value
+        let healed_levels = read_strings(&healed_reader, "level");
+        for token in ["error", "warn"] {
+            let healed_docs = matching_docs(&healed_reader, &exact("level", token));
+            let control_docs = matching_docs(&control_reader, &exact("level", token));
+            assert!(!healed_docs.is_empty(), "{token} must have hits");
+            assert_eq!(healed_docs, control_docs, "{token}: doc ids position-exact");
+            for &doc in &healed_docs {
+                assert_eq!(
+                    healed_levels[doc as usize].as_deref(),
+                    Some(token),
+                    "doc {doc} must hold the queried value"
+                );
+            }
+        }
+    }
+
+    /// #51c HEAL (b), v2 rescope: a docs-schema DIFFERENCE still falls back
+    /// to the full decode+rebuild. Union schemas make a shrink impossible
+    /// (the plan preserves every input column), so the surviving
+    /// non-additive case is a TYPE CHANGE: the current stream schema types
+    /// a column differently than the file stores it — the plan's target
+    /// type differs, the output dtype differs, and the input must decode
+    /// (cast) instead of copying chunks. The same input under an agreeing
+    /// schema passes through — proving the gate, not the harness, makes
+    /// the call.
+    #[test]
+    fn heal_docs_passthrough_type_change_falls_back() {
+        let fts = vec!["log".to_string()];
+        let fields = vec![
+            Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+            Field::new("log", DataType::Utf8, true),
+            Field::new("svc", DataType::Utf8, true),
+            Field::new("code", DataType::Int64, true),
+        ];
+        let file = build_core_file(
+            fields.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![900i64, 800, 700])),
+                Arc::new(StringArray::from(vec![
+                    Some("error timeout"),
+                    Some("all good"),
+                    Some("error again"),
+                ])),
+                Arc::new(StringArray::from(vec![Some("api"), Some("web"), None])),
+                Arc::new(Int64Array::from(vec![Some(500i64), None, Some(503)])),
+            ],
+            &fts,
+            None,
+        );
+        let inputs = vec![("typeflip.vix".to_string(), file)];
+        let heal = |latest: &Schema| {
+            merge_core_files_rebuild(StreamType::Logs, &as_inputs(&inputs), latest, &fts, &[])
+                .unwrap()
+        };
+
+        // type-flipped plan: the registry types `code` Utf8 while the file
+        // stores Int64 — the output stores Utf8, so the chunks cannot copy
+        let mut flipped_fields = fields.clone();
+        flipped_fields[3] = Field::new("code", DataType::Utf8, true);
+        let flipped = heal(&Schema::new(flipped_fields));
+        assert_eq!(
+            flipped.docs_passthrough_inputs, 0,
+            "a type-changing heal must fall back to the full rebuild"
+        );
+        let flipped_reader = open_merged(&flipped);
+        assert_eq!(
+            read_strings(&flipped_reader, "code"),
+            vec![Some("500".to_string()), None, Some("503".to_string())],
+            "the rebuild casts the column to the plan type"
+        );
+        assert_eq!(read_i64(&flipped_reader, TIMESTAMP_COL_NAME).len(), 3);
+
+        // sanity: the SAME input under the agreeing schema does copy
+        let identical = heal(&Schema::new(fields));
+        assert_eq!(
+            identical.docs_passthrough_inputs, 1,
+            "a schema-identical heal must pass through (otherwise this test \
+             proves nothing about the type gate)"
+        );
+    }
+
+    /// #51c HEAL (c): degenerate `_timestamp` rows force compaction-time
+    /// cleansing — a row FILTER the chunk copy cannot express — so the heal
+    /// passthrough must fall back and the rebuild must drop the rows as
+    /// today.
+    #[test]
+    fn heal_docs_passthrough_degenerate_ts_falls_back() {
+        let fts = vec!["log".to_string()];
+        let fields = vec![
+            Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+            Field::new("log", DataType::Utf8, true),
+        ];
+        let poisoned = build_poisoned_core_file(
+            fields.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![100i64, 0, 50])),
+                Arc::new(StringArray::from(vec![
+                    Some("keep new"),
+                    Some("poison row"),
+                    Some("keep old"),
+                ])),
+            ],
+            &fts,
+        );
+        let latest_schema = Schema::new(fields);
+        let inputs = vec![("poison.vix".to_string(), poisoned)];
+        let healed = merge_core_files(
+            StreamType::Logs,
+            &as_inputs(&inputs),
+            &latest_schema,
+            &fts,
+            &[],
+        )
+        .unwrap();
+        assert!(
+            !healed.used_index_merge,
+            "degenerate rows force the rebuild"
+        );
+        assert_eq!(
+            healed.docs_passthrough_inputs, 0,
+            "cleansing disqualifies the chunk copy"
+        );
+        assert_eq!(healed.dropped_rows, 1, "the poison row is dropped");
+        assert_eq!(healed.stats.row_count, 2);
+        let reader =
+            open_merged(&healed);
+        assert_eq!(
+            read_i64(&reader, TIMESTAMP_COL_NAME),
+            vec![100, 50],
+            "only the cleansed rows survive, in DESC order"
+        );
+    }
+
+    /// #51c HEAL (d) × #52: a heal over a bloom-only-plan input must keep
+    /// composite-bloom coverage for the input's values with the passthrough
+    /// ON — the coverage now comes from the index-building decoded scan
+    /// (the projected bloom scan is skipped to avoid double hashing).
+    #[test]
+    fn heal_docs_passthrough_bloom_only_coverage() {
+        use vortex_index::{
+            bloom::{
+                COMPOSITE_BLOOM_FIELD, COMPOSITE_GUARD_PROBES, composite_guard_key,
+                composite_value_key,
+            },
+            sbbf::{BLOCK_BYTES, block_index, check_block, hash_value},
+        };
+
+        let fields = || {
+            vec![
+                Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+                Field::new("svc", DataType::Utf8, true),
+                Field::new("trace_id", DataType::Utf8, true),
+            ]
+        };
+        let latest_schema = Schema::new(fields());
+        let caps = BatchCaps {
+            bloom_only_override: Some("trace_id"),
+            ..Default::default()
+        };
+        // gen1: a term-indexed file converges onto the bloom-only plan
+        // through a FORCE-DECODE merge — this stage exists to produce the
+        // bloom-only heal input whose values live in no dictionary
+        let legacy = build_core_file(
+            fields(),
+            vec![
+                Arc::new(Int64Array::from(vec![100i64, 90])),
+                Arc::new(StringArray::from(vec!["api", "api"])),
+                Arc::new(StringArray::from(vec!["t-h1", "t-h2"])),
+            ],
+            &[],
+            None,
+        );
+        let gen1_inputs = vec![("legacy.vix".to_string(), legacy)];
+        let gen1 = merge_core_files_with_caps(
+            StreamType::Logs,
+            &as_inputs(&gen1_inputs),
+            &latest_schema,
+            &[],
+            &[],
+            BatchCaps {
+                force_decode: true,
+                ..caps
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            gen1.docs_passthrough_inputs, 0,
+            "the force_decode merge must decode"
+        );
+        let bloom_only_file: BuiltPair = (
+            bytes::Bytes::from(gen1.output.to_bytes().unwrap()),
+            gen1.index.clone().map(bytes::Bytes::from),
+        );
+
+        // the heal: a single bloom-only input rebuilt under the SAME plan —
+        // schema-identical, so the passthrough engages (the default)
+        let heal_inputs = vec![("bloom-heal.vix".to_string(), bloom_only_file)];
+        let healed = merge_core_files_rebuild_with_caps(
+            StreamType::Logs,
+            &as_inputs(&heal_inputs),
+            &latest_schema,
+            &[],
+            &[],
+            caps,
+        )
+        .unwrap();
+        assert_eq!(
+            healed.docs_passthrough_inputs, 1,
+            "the schema-identical bloom-only heal must copy its docs chunks"
+        );
+        let healed_reader =
+            open_merged(&healed);
+        assert_eq!(healed_reader.row_count(), 2);
+
+        // composite coverage for the input's values, from the decoded scan
+        let blooms = healed_reader.file_blooms().unwrap().expect("bloom blob");
+        let comp = blooms
+            .iter()
+            .find(|b| b.field == COMPOSITE_BLOOM_FIELD)
+            .expect("composite section");
+        let probe = |key: &[u8]| {
+            let h = hash_value(key);
+            let i = block_index(h, comp.num_blocks) as usize;
+            let block: &[u8; BLOCK_BYTES] = comp.bytes[i * BLOCK_BYTES..(i + 1) * BLOCK_BYTES]
+                .try_into()
+                .unwrap();
+            check_block(block, h)
+        };
+        let mut buf = Vec::new();
+        for value in ["t-h1", "t-h2"] {
+            assert!(
+                probe(composite_value_key("trace_id", value.as_bytes(), &mut buf).unwrap()),
+                "heal passthrough must keep composite coverage for {value}"
+            );
+        }
+        assert!(
+            !probe(composite_value_key("trace_id", b"t-absent", &mut buf).unwrap()),
+            "absent value must miss"
+        );
+        for pr in 0..COMPOSITE_GUARD_PROBES {
+            assert!(
+                probe(composite_guard_key("trace_id", pr, &mut buf).unwrap()),
+                "coverage guard {pr}"
+            );
+        }
+
+        // and the healed rows equal the plain rebuild's, logically
+        let control = merge_core_files_rebuild_with_caps(
+            StreamType::Logs,
+            &as_inputs(&heal_inputs),
+            &latest_schema,
+            &[],
+            &[],
+            BatchCaps {
+                force_decode: true,
+                ..caps
+            },
+        )
+        .unwrap();
+        assert_eq!(control.docs_passthrough_inputs, 0);
+        let control_reader =
+            open_merged(&control);
+        assert_core_files_equivalent_logical_docs(
+            &healed_reader,
+            &control_reader,
+            "bloom-only heal vs rebuild",
+        );
+    }
+
+    /// v2 union semantics: a merge over inputs with DIFFERENT column sets
+    /// produces the UNION docs schema — since M17 BOTH inputs copy encoded
+    /// (the narrower one's chunks widen by null-column synthesis), and the
+    /// narrower input's rows read NULL in the union column (consistent with
+    /// their `_source`, which never carried the field). The old
+    /// derive-from-`_source` materialization is gone with
+    /// `column_store_fields`.
+    #[tokio::test]
+    async fn merge_union_null_fills_missing_columns() {
+        let fts = vec!["log".to_string()];
+        let narrow_fields = vec![
+            Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+            Field::new("log", DataType::Utf8, true),
+        ];
+        let wide_fields = vec![
+            Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+            Field::new("log", DataType::Utf8, true),
+            Field::new("duration", DataType::Int64, true),
+        ];
+        // input A: records genuinely WITHOUT `duration`
+        let narrow = build_core_file(
+            narrow_fields,
+            vec![
+                Arc::new(Int64Array::from(vec![1000i64, 950])),
+                Arc::new(StringArray::from(vec![
+                    Some("error a row 0"),
+                    Some("error a row 1"),
+                ])),
+            ],
+            &fts,
+            None,
+        );
+        // input B: records WITH `duration`
+        let wide = build_core_file(
+            wide_fields.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![600i64, 500])),
+                Arc::new(StringArray::from(vec![
+                    Some("error w row 0"),
+                    Some("error w row 1"),
+                ])),
+                Arc::new(Int64Array::from(vec![Some(11i64), Some(13)])),
+            ],
+            &fts,
+            None,
+        );
+        let latest_schema = Schema::new(wide_fields);
+        let inputs = vec![
+            ("na.vix".to_string(), narrow),
+            ("wide.vix".to_string(), wide),
+        ];
+        let merged = merge_core_files(
+            StreamType::Logs,
+            &as_inputs(&inputs),
+            &latest_schema,
+            &fts,
+            &[],
+        )
+        .unwrap();
+        assert!(merged.used_index_merge, "disjoint fast path");
+        assert_eq!(
+            merged.docs_passthrough_inputs, 2,
+            "M17: the narrow input widens and copies alongside the union-schema one"
+        );
+        let reader = open_merged(&merged);
+        let durations = reader
+            .read_docs_column("duration")
+            .expect("the merged output must store the UNION schema");
+        // rows are [1000, 950, 600, 500] DESC: the narrow input's rows
+        // null-fill, the wide input's values copy through
+        assert_eq!(
+            as_int64_array(&durations).unwrap(),
+            Int64Array::from(vec![None, None, Some(11i64), Some(13)]),
+        );
+        // ... and the null rows' `_source` never carried the field, so a
+        // scan-side json_get(_source) fallback agrees with the nulls
+        let sources = read_strings(&reader, SOURCE_COL_NAME);
+        assert!(
+            sources[0].as_ref().unwrap().find("duration").is_none(),
+            "the narrow rows' _source has no duration key"
+        );
+        assert!(
+            sources[2].as_ref().unwrap().contains("\"duration\":11"),
+            "the wide rows' _source carries the value"
+        );
+        // the force_decode oracle produces the same logical file
+        let oracle = merge_core_files_with_caps(
+            StreamType::Logs,
+            &as_inputs(&inputs),
+            &latest_schema,
+            &fts,
+            &[],
+            BatchCaps {
+                force_decode: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(oracle.docs_passthrough_inputs, 0);
+        let oracle_reader = open_merged(&oracle);
+        assert_core_files_equivalent_logical_docs(&reader, &oracle_reader, "union null-fill");
+    }
+
+    /// The pure decode + re-encode oracle caps (test seam; the passthrough
+    /// and concat order are production defaults).
+    fn oracle_caps() -> BatchCaps {
+        BatchCaps {
+            force_decode: true,
+            ..Default::default()
+        }
+    }
+
+    /// #51c-c differential (a): a merge over OVERLAPPING inputs (prod's
+    /// width-N heal-merge shape — concurrently written files, interleaved
+    /// timestamps, `contiguous_offsets` None) concatenates BY DEFAULT:
+    /// every input copies its docs chunks encoded
+    /// (`docs_passthrough_inputs == input count`, previously 0 on every
+    /// overlap), the output is stamped `row_order=concat` with the inputs
+    /// back-to-back in min-`_timestamp`-DESC order, and the file is
+    /// CONTENT-equivalent to the sorted rebuild oracle — equal row
+    /// multisets, equal term behavior (equality/needle answers by row
+    /// content), zone table covering every row (non-monotonic zones prune
+    /// exactly), equal file `_timestamp` span. The row-order-dependent
+    /// digest legitimately differs; content is the oracle.
+    #[test]
+    fn concat_merge_matches_rebuild_as_multiset() {
+        let fts = vec!["log".to_string()];
+        let latest_schema = Schema::new(passthrough_fields());
+        // mutually overlapping ranges: min_ts a=700 < c=725 < b=750
+        let inputs = vec![
+            (
+                "pa.vix".to_string(),
+                passthrough_file(&[1000, 900, 800, 700], "a"),
+            ),
+            (
+                "pb.vix".to_string(),
+                passthrough_file(&[950, 850, 750], "b"),
+            ),
+            ("pc.vix".to_string(), passthrough_file(&[975, 725], "c")),
+        ];
+
+        let fast = merge_core_files_with_caps(
+            StreamType::Logs,
+            &as_inputs(&inputs),
+            &latest_schema,
+            &fts,
+            &[],
+            BatchCaps::default(),
+        )
+        .unwrap();
+        assert!(fast.used_index_merge, "the index still merges (fast path)");
+        assert!(fast.concat_order, "overlap = concat order (the default)");
+        assert_eq!(
+            fast.docs_passthrough_inputs, 3,
+            "every overlapping input must copy encoded under the concat order"
+        );
+
+        // the sorted decode + re-encode oracle
+        let rebuild = merge_core_files_rebuild_with_caps(
+            StreamType::Logs,
+            &as_inputs(&inputs),
+            &latest_schema,
+            &fts,
+            &[],
+            oracle_caps(),
+        )
+        .unwrap();
+        assert!(!rebuild.concat_order);
+        assert_eq!(rebuild.docs_passthrough_inputs, 0, "oracle stays plain");
+
+        // identical file-level accounting: rows, span, term count
+        assert_eq!(fast.stats.row_count, rebuild.stats.row_count);
+        assert_eq!(fast.stats.min_ts, rebuild.stats.min_ts, "min_ts span");
+        assert_eq!(fast.stats.max_ts, rebuild.stats.max_ts, "max_ts span");
+        assert_eq!((fast.stats.min_ts, fast.stats.max_ts), (700, 1000));
+        assert_eq!(fast.stats.term_count, rebuild.stats.term_count);
+
+        let fast_reader =
+            open_merged(&fast);
+        let rebuild_reader =
+            open_merged(&rebuild);
+        assert_eq!(fast_reader.row_order(), RowOrder::Concat, "concat stamp");
+        assert_eq!(
+            rebuild_reader.row_order(),
+            RowOrder::TsDesc,
+            "the sorted oracle stamps ts_desc"
+        );
+
+        // deterministic concatenation: inputs by min_ts DESC (b, c, a),
+        // each input's run verbatim
+        assert_eq!(
+            read_i64(&fast_reader, TIMESTAMP_COL_NAME),
+            vec![950, 850, 750, 975, 725, 1000, 900, 800, 700],
+            "concatenation order: min_ts DESC, runs verbatim"
+        );
+
+        // the non-negotiable oracle: content equivalence (rows, terms,
+        // queries, ts ranges)
+        assert_core_files_content_equivalent(
+            &fast_reader,
+            &rebuild_reader,
+            "concat-vs-rebuild multiset",
+        );
+        // H2 §11 splice gate: the concat copy carries FULL stats — the
+        // file-level fold equals the sorted rebuild's fresh stats (windows
+        // differ, aggregates must not)
+        assert_stats_splice_parity(&fast, &rebuild, "concat-vs-rebuild stats");
+
+        // spliced zone table: contiguous coverage of every row, sane
+        // per-entry bounds, and REALLY non-monotonic (the shape the pruning
+        // equivalence above exercises)
+        let zone = fast_reader.zone_chunks().expect("merged zone table");
+        let mut expected_offset = 0u64;
+        for chunk in zone {
+            assert_eq!(chunk.row_offset, expected_offset, "contiguous zone rows");
+            assert!(chunk.row_count > 0, "no empty zone entries");
+            assert!(chunk.ts_min <= chunk.ts_max, "zone bounds sane");
+            expected_offset += chunk.row_count;
+        }
+        assert_eq!(expected_offset, fast_reader.row_count(), "zone coverage");
+        assert!(
+            zone.windows(2).any(|pair| pair[1].ts_max > pair[0].ts_min),
+            "the concat zone table must be non-monotonic — otherwise this test proves nothing \
+             about non-monotonic pruning"
+        );
+    }
+
+    /// M23b differential: the SORTED rebuild over a wide interleave must be
+    /// BYTE-identical whether its inputs stream through the GATED row-range
+    /// decode (>= [`MERGE_SCATTERED_INPUTS_MIN`] scattered inputs) or the
+    /// free-running whole-blob decode (below the threshold). One row
+    /// population with globally unique timestamps is partitioned round-robin
+    /// into 10 files (gated) and re-partitioned into 7 (free): the k-way
+    /// order, the window boundaries and every staged value are identical by
+    /// construction, so the outputs (data AND index sidecar) must match to
+    /// the byte — pinning that gating/deep-copying/re-chunking changes
+    /// DELIVERY only, never content.
+    ///
+    /// Tiny caps make the shape adversarial for the admission protocol
+    /// (the "tiny budget" stress): 64-row windows over a 10-way interleave
+    /// stage ~6 rows per input per window, units are 1024 rows (~3 grant
+    /// cycles per input, 256-row deep-copied parts), and every input is
+    /// mid-flight from the first window to the last — a deadlock or a
+    /// lost/duplicated grant would hang or corrupt this test immediately.
+    #[test]
+    fn gated_ranged_rebuild_matches_free_rebuild_bytes() {
+        let fts = vec!["log".to_string()];
+        let fields = || {
+            vec![
+                Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+                Field::new("log", DataType::Utf8, true),
+                Field::new("code", DataType::Int64, true),
+            ]
+        };
+        let latest_schema = Schema::new(fields());
+        // one global population, unique DESC timestamps
+        const ROWS: i64 = 26_000;
+        let build_partition = |ways: usize| -> Vec<(String, BuiltPair)> {
+            (0..ways)
+                .map(|part| {
+                    // rows of this partition, globally DESC: ts = 1e9 - r
+                    // for r ≡ part (mod ways)
+                    let ts: Vec<i64> = (0..ROWS)
+                        .filter(|r| (*r as usize) % ways == part)
+                        .map(|r| 1_000_000_000 - r)
+                        .collect();
+                    let logs: Vec<String> = ts
+                        .iter()
+                        .map(|t| format!("event word{} tail{}", t % 97, t % 13))
+                        .collect();
+                    let codes: Vec<i64> = ts.iter().map(|t| 200 + (t % 5)).collect();
+                    let pair = build_core_file(
+                        fields(),
+                        vec![
+                            Arc::new(Int64Array::from(ts)),
+                            Arc::new(StringArray::from(logs)),
+                            Arc::new(Int64Array::from(codes)),
+                        ],
+                        &fts,
+                        None,
+                    );
+                    (format!("part-{ways}way-{part}.vix"), pair)
+                })
+                .collect()
+        };
+        // force_decode disqualifies the heal passthrough on BOTH sides, so
+        // both run the standard sorted rebuild through stream_merge_windows
+        let caps = BatchCaps {
+            rows: 64,
+            force_decode: true,
+            ..Default::default()
+        };
+        assert!(MERGE_SCATTERED_INPUTS_MIN <= 10 && MERGE_SCATTERED_INPUTS_MIN > 7);
+
+        let gated_inputs = build_partition(10); // scattered >= threshold
+        let gated = merge_core_files_rebuild_with_caps(
+            StreamType::Logs,
+            &as_inputs(&gated_inputs),
+            &latest_schema,
+            &fts,
+            &[],
+            caps,
+        )
+        .unwrap();
+
+        let free_inputs = build_partition(7); // scattered < threshold
+        let free = merge_core_files_rebuild_with_caps(
+            StreamType::Logs,
+            &as_inputs(&free_inputs),
+            &latest_schema,
+            &fts,
+            &[],
+            caps,
+        )
+        .unwrap();
+
+        assert_eq!(gated.stats.row_count, ROWS as u64);
+        assert_eq!(free.stats.row_count, ROWS as u64);
+        // the merged rows are one strictly-DESC run either way
+        let gated_reader = open_merged(&gated);
+        let merged_ts = read_i64(&gated_reader, TIMESTAMP_COL_NAME);
+        assert!(
+            merged_ts.windows(2).all(|pair| pair[0] > pair[1]),
+            "sorted rebuild must produce strictly DESC timestamps"
+        );
+        // byte identity: same rows, same order, same windows => same file
+        assert_eq!(
+            gated.output.to_bytes().unwrap(),
+            free.output.to_bytes().unwrap(),
+            "gated (10-way) and free (7-way) sorted rebuilds must emit identical data bytes"
+        );
+        assert_eq!(
+            gated.index, free.index,
+            "gated and free sorted rebuilds must emit identical index sidecars"
+        );
+    }
+
+    /// #51c-c (b): the FAST path's concat order engages only when EVERY
+    /// input passes the passthrough qualification (all-or-nothing) — one
+    /// unqualifiable input keeps the whole merge on the sorted interleave
+    /// (equivalent to the rebuild). Since M17 widens schema-subset inputs,
+    /// the disqualifier here is a genuine TYPE-WIDTH FLIP (`code` stored
+    /// Int32 vs the plan's Int64 — a real re-encode the widen plan
+    /// refuses). Union-only differences no longer disqualify anything.
+    #[test]
+    fn concat_merge_requires_all_inputs_qualified() {
+        let fts = vec!["log".to_string()];
+        let latest_schema = Schema::new(passthrough_fields());
+        // input B stores `code` at a flipped width: the plan targets Int64
+        // (latest schema), so B's chunks cannot copy
+        let mut flip_fields = passthrough_fields();
+        flip_fields[4] = Field::new("code", DataType::Int32, true);
+        let ts_b = [990i64, 780, 710];
+        let n = ts_b.len();
+        let file_b = build_core_file(
+            flip_fields,
+            vec![
+                Arc::new(Int64Array::from(ts_b.to_vec())),
+                Arc::new(StringArray::from(
+                    (0..n)
+                        .map(|r| Some(format!("error b row {r}")))
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(vec![Some("svc-b-0"); n])),
+                Arc::new(StringArray::from(vec![Some("prod"); n])),
+                Arc::new(arrow::array::Int32Array::from(vec![Some(500); n])),
+            ],
+            &fts,
+            None,
+        );
+        let inputs = vec![
+            (
+                "pa.vix".to_string(),
+                passthrough_file(&[1000, 900, 800, 700], "a"),
+            ),
+            ("pb-extra.vix".to_string(), file_b),
+        ];
+
+        let fast = merge_core_files(
+            StreamType::Logs,
+            &as_inputs(&inputs),
+            &latest_schema,
+            &fts,
+            &[],
+        )
+        .unwrap();
+        assert!(fast.used_index_merge);
+        assert!(
+            !fast.concat_order,
+            "one unqualified input must keep the sorted interleave"
+        );
+        assert_eq!(fast.docs_passthrough_inputs, 0, "interleave never copies");
+
+        let rebuild = merge_core_files_rebuild_with_caps(
+            StreamType::Logs,
+            &as_inputs(&inputs),
+            &latest_schema,
+            &fts,
+            &[],
+            oracle_caps(),
+        )
+        .unwrap();
+        let fast_reader =
+            open_merged(&fast);
+        let rebuild_reader =
+            open_merged(&rebuild);
+        assert_eq!(fast_reader.row_order(), RowOrder::TsDesc);
+        assert_core_files_equivalent(&fast_reader, &rebuild_reader, "disqualified concat");
+        // ... and the interleaved output really is globally sorted
+        let ts = read_i64(&fast_reader, TIMESTAMP_COL_NAME);
+        assert!(ts.windows(2).all(|pair| pair[0] >= pair[1]), "global DESC");
+    }
+
+    /// #51c-c (c): a concat-order OUTPUT re-entering a later merge is
+    /// always legal (concat inputs force the concatenation path): the
+    /// default re-merge concatenates again through the chunk copy, and the
+    /// force_decode flavor lands on the rebuild's forced concatenation
+    /// (decode; still stamped concat). The union multiset survives both.
+    #[test]
+    fn concat_output_remerges_by_default() {
+        let fts = vec!["log".to_string()];
+        let latest_schema = Schema::new(passthrough_fields());
+        let gen1_inputs = vec![
+            (
+                "pa.vix".to_string(),
+                passthrough_file(&[1000, 900, 800, 700], "a"),
+            ),
+            (
+                "pb.vix".to_string(),
+                passthrough_file(&[950, 850, 750], "b"),
+            ),
+        ];
+        let gen1 = merge_core_files(
+            StreamType::Logs,
+            &as_inputs(&gen1_inputs),
+            &latest_schema,
+            &fts,
+            &[],
+        )
+        .unwrap();
+        assert!(gen1.concat_order && gen1.docs_passthrough_inputs == 2);
+        let concat_bytes: BuiltPair = (
+            bytes::Bytes::from(gen1.output.to_bytes().unwrap()),
+            gen1.index.clone().map(bytes::Bytes::from),
+        );
+        assert_eq!(open_pair(&concat_bytes).row_order(), RowOrder::Concat);
+        let fresh = passthrough_file(&[985, 735], "d");
+        let gen2_inputs = vec![
+            ("gen1-concat.vix".to_string(), concat_bytes.clone()),
+            ("fresh.vix".to_string(), fresh.clone()),
+        ];
+
+        // expected union multiset (content-level)
+        let mut expected = docs_row_contents(&open_pair(&concat_bytes));
+        expected.extend(docs_row_contents(&open_pair(&fresh)));
+        expected.sort();
+
+        // default: concatenates again through the copy
+        let gen2 = merge_core_files(
+            StreamType::Logs,
+            &as_inputs(&gen2_inputs),
+            &latest_schema,
+            &fts,
+            &[],
+        )
+        .unwrap();
+        assert!(gen2.concat_order);
+        assert_eq!(gen2.docs_passthrough_inputs, 2);
+        let gen2_reader =
+            open_merged(&gen2);
+        assert_eq!(gen2_reader.row_order(), RowOrder::Concat);
+        let mut gen2_rows = docs_row_contents(&gen2_reader);
+        gen2_rows.sort();
+        assert_eq!(gen2_rows, expected, "gen2 copy keeps the union multiset");
+
+        // force_decode: the fast path cannot copy, so the rebuild's forced
+        // concatenation DECODES — same union, still concat
+        let gen2_decode = merge_core_files_with_caps(
+            StreamType::Logs,
+            &as_inputs(&gen2_inputs),
+            &latest_schema,
+            &fts,
+            &[],
+            BatchCaps {
+                force_decode: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(gen2_decode.concat_order, "forced concat, decode flavor");
+        assert!(
+            !gen2_decode.used_index_merge,
+            "the decode flavor is the rebuild"
+        );
+        assert_eq!(gen2_decode.docs_passthrough_inputs, 0);
+        let decode_reader =
+            open_merged(&gen2_decode);
+        assert_eq!(decode_reader.row_order(), RowOrder::Concat);
+        let mut decode_rows = docs_row_contents(&decode_reader);
+        decode_rows.sort();
+        assert_eq!(
+            decode_rows, expected,
+            "gen2 decode keeps the union multiset"
+        );
+        // and the two gen2 flavors agree on the whole reader surface
+        assert_core_files_content_equivalent(
+            &gen2_reader,
+            &decode_reader,
+            "gen2 copy vs gen2 decode",
+        );
+    }
+
+    /// #51c-c HEAL (d): OVERLAPPING index-off L0 inputs (written
+    /// concurrently by multiple ingesters) healing to indexed through the
+    /// rebuild. With both knobs on the heal builds the ENTIRE index from
+    /// the decoded scan in concatenation order and copies every input's
+    /// docs chunks (`docs_passthrough_inputs == 2`, previously 0 on every
+    /// overlap), content-equivalent to the sorted rebuild oracle; #52
+    /// bloom-only coverage (the values live only in docs columns) holds for
+    /// BOTH inputs' values from the index-building scan.
+    ///
+    /// M3 NOTE: this ≥2-input shape is a MERGE (both inputs consumed into
+    /// one output) — the rebuild path here is untouched by the sidecar-only
+    /// heal, which covers exactly the single-file case.
+    #[tokio::test]
+    async fn heal_concat_passthrough_matches_rebuild() {
+        let fields = || {
+            vec![
+                Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+                Field::new("log", DataType::Utf8, true),
+                Field::new("svc", DataType::Utf8, true),
+                Field::new("trace_id", DataType::Utf8, true),
+            ]
+        };
+        let schema = Arc::new(Schema::new(fields()));
+        let fts = vec!["log".to_string()];
+        let build_l0 =
+            |name: &'static str, ts: Vec<i64>, svc: &'static str, traces: Vec<&'static str>| {
+                let schema = Arc::clone(&schema);
+                let fts = fts.clone();
+                async move {
+                    let n = ts.len();
+                    let batch = RecordBatch::try_new(
+                        Arc::clone(&schema),
+                        vec![
+                            Arc::new(Int64Array::from(ts)) as ArrayRef,
+                            Arc::new(StringArray::from(
+                                (0..n)
+                                    .map(|r| Some(format!("error {svc} row {r}")))
+                                    .collect::<Vec<_>>(),
+                            )),
+                            Arc::new(StringArray::from(vec![Some(svc); n])),
+                            Arc::new(StringArray::from(
+                                traces.into_iter().map(Some).collect::<Vec<_>>(),
+                            )),
+                        ],
+                    )
+                    .unwrap();
+                    let table = Arc::new(
+                        MemTable::try_new(Arc::clone(&schema), vec![vec![batch]]).unwrap(),
+                    );
+                    let l0 = write_core_file_from_tables_with_caps(
+                        name,
+                        StreamType::Logs,
+                        Arc::clone(&schema),
+                        vec![table],
+                        &fts,
+                        &[],
+                        false,
+                        0,
+                        BatchCaps {
+                            index_enabled_override: Some(false),
+                            ..BatchCaps::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    (
+                        bytes::Bytes::from(l0.data),
+                        l0.index.map(bytes::Bytes::from),
+                    )
+                }
+            };
+        // fully overlapping ranges — the concurrent-ingester shape
+        let l0_a = build_l0(
+            "concat-heal-a",
+            vec![1000, 800, 600, 400],
+            "api",
+            vec!["t-a1", "t-a2", "t-a3", "t-a4"],
+        )
+        .await;
+        let l0_b = build_l0(
+            "concat-heal-b",
+            vec![900, 700, 500, 300],
+            "web",
+            vec!["t-b1", "t-b2", "t-b3", "t-b4"],
+        )
+        .await;
+        assert!(
+            !open_pair(&l0_a).has_index(),
+            "the heal inputs must be index-off"
+        );
+
+        let latest_schema = schema.as_ref().clone();
+        let inputs = vec![
+            ("l0-a.vix".to_string(), l0_a),
+            ("l0-b.vix".to_string(), l0_b),
+        ];
+        let heal_with = |caps: BatchCaps| {
+            merge_core_files_with_caps(
+                StreamType::Logs,
+                &as_inputs(&inputs),
+                &latest_schema,
+                &fts,
+                &[],
+                caps,
+            )
+            .unwrap()
+        };
+
+        let bloom = |caps: BatchCaps| BatchCaps {
+            bloom_only_override: Some("trace_id"),
+            ..caps
+        };
+        let healed = heal_with(bloom(BatchCaps::default()));
+        assert!(
+            !healed.used_index_merge,
+            "index-off inputs force the rebuild (the heal)"
+        );
+        assert!(healed.concat_order, "overlapping heal concatenates");
+        assert_eq!(
+            healed.docs_passthrough_inputs, 2,
+            "both overlapping index-off inputs must copy their docs chunks"
+        );
+        assert_eq!(healed.dropped_rows, 0);
+
+        let control = heal_with(bloom(oracle_caps()));
+        assert!(!control.concat_order);
+        assert_eq!(
+            control.docs_passthrough_inputs, 0,
+            "the oracle keeps today's sorted decode + re-encode"
+        );
+
+        assert_eq!(healed.stats.row_count, control.stats.row_count);
+        assert_eq!(healed.stats.min_ts, control.stats.min_ts, "min_ts");
+        assert_eq!(healed.stats.max_ts, control.stats.max_ts, "max_ts");
+        assert_eq!((healed.stats.min_ts, healed.stats.max_ts), (300, 1000));
+        let healed_reader =
+            open_merged(&healed);
+        let control_reader =
+            open_merged(&control);
+        assert!(healed_reader.has_index(), "the heal output is indexed");
+        assert!(healed_reader.term_count() > 0);
+        assert_eq!(healed_reader.row_order(), RowOrder::Concat);
+        assert_eq!(control_reader.row_order(), RowOrder::TsDesc);
+        assert_core_files_content_equivalent(
+            &healed_reader,
+            &control_reader,
+            "concat heal vs sorted rebuild",
+        );
+
+        // zone table: contiguous coverage; bounds equal the stats span
+        let zone = healed_reader.zone_chunks().expect("healed zone table");
+        assert_eq!(
+            zone.iter().map(|chunk| chunk.row_count).sum::<u64>(),
+            healed_reader.row_count(),
+            "zone coverage"
+        );
+        assert_eq!(
+            (
+                zone.iter().map(|chunk| chunk.ts_min).min().unwrap(),
+                zone.iter().map(|chunk| chunk.ts_max).max().unwrap(),
+            ),
+            (healed.stats.min_ts, healed.stats.max_ts),
+            "zone span == stats span"
+        );
+
+        // #52 bloom-only coverage from the index-building scan: BOTH
+        // inputs' trace values probe positive, absents miss, guards hold
+        use vortex_index::{
+            bloom::{
+                COMPOSITE_BLOOM_FIELD, COMPOSITE_GUARD_PROBES, composite_guard_key,
+                composite_value_key,
+            },
+            sbbf::{BLOCK_BYTES, block_index, check_block, hash_value},
+        };
+        let blooms = healed_reader.file_blooms().unwrap().expect("bloom blob");
+        let comp = blooms
+            .iter()
+            .find(|b| b.field == COMPOSITE_BLOOM_FIELD)
+            .expect("composite section");
+        let probe = |key: &[u8]| {
+            let h = hash_value(key);
+            let i = block_index(h, comp.num_blocks) as usize;
+            let block: &[u8; BLOCK_BYTES] = comp.bytes[i * BLOCK_BYTES..(i + 1) * BLOCK_BYTES]
+                .try_into()
+                .unwrap();
+            check_block(block, h)
+        };
+        let mut buf = Vec::new();
+        for value in [
+            "t-a1", "t-a2", "t-a3", "t-a4", "t-b1", "t-b2", "t-b3", "t-b4",
+        ] {
+            assert!(
+                probe(composite_value_key("trace_id", value.as_bytes(), &mut buf).unwrap()),
+                "concat heal must keep composite coverage for {value}"
+            );
+        }
+        assert!(
+            !probe(composite_value_key("trace_id", b"t-absent", &mut buf).unwrap()),
+            "absent value must miss"
+        );
+        for pr in 0..COMPOSITE_GUARD_PROBES {
+            assert!(
+                probe(composite_guard_key("trace_id", pr, &mut buf).unwrap()),
+                "coverage guard {pr}"
+            );
+        }
+    }
+
+    /// M17 gen-1 encode-once (a): a multi-input REBUILD merge over
+    /// index-off L0s whose per-file schema UNIONS DIFFER (the dominant prod
+    /// gen-1 shape — every fat stream's segments see different field sets)
+    /// copies EVERY input's docs chunks, widening them into the output
+    /// union by null-column synthesis — no docs byte is re-encoded. Pinned
+    /// against the forced decode + re-encode oracle: row-content
+    /// equivalence, §11 stats-splice parity (presence + file-level fold),
+    /// M4 region decomposition (piecewise-DESC regions k-way merge to the
+    /// exact global order), and storage-size parity (verbatim chunk copy at
+    /// the same zstd level).
+    #[tokio::test]
+    async fn gen1_docs_copy_widens_schema_differing_inputs() {
+        let fts = vec!["log".to_string()];
+        // per-input schemas: a={log,svc}, b={log,code}, c={log,svc,code,region}
+        let build_l0 = |name: &'static str,
+                        fields: Vec<Field>,
+                        columns: Vec<ArrayRef>| {
+            let fts = fts.clone();
+            async move {
+                let schema = Arc::new(Schema::new(fields));
+                let batch = RecordBatch::try_new(Arc::clone(&schema), columns).unwrap();
+                let table =
+                    Arc::new(MemTable::try_new(Arc::clone(&schema), vec![vec![batch]]).unwrap());
+                let l0 = write_core_file_from_tables_with_caps(
+                    name,
+                    StreamType::Logs,
+                    Arc::clone(&schema),
+                    vec![table],
+                    &fts,
+                    &[],
+                    false,
+                    0,
+                    BatchCaps {
+                        index_enabled_override: Some(false),
+                        ..BatchCaps::default()
+                    },
+                )
+                .await
+                .unwrap();
+                (
+                    bytes::Bytes::from(l0.data),
+                    l0.index.map(bytes::Bytes::from),
+                )
+            }
+        };
+        let ts_field = || Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false);
+        // sized so DATA dominates the file (the ±5% storage pin is
+        // meaningless when fixed footers dominate a dozen rows); overlapping
+        // interleaved ts ranges force the concat order
+        let (n_a, n_b, n_c) = (4096usize, 3000usize, 2000usize);
+        let logs = |svc: &str, n: usize, base: usize| -> Vec<String> {
+            (0..n)
+                .map(|r| {
+                    format!(
+                        "error {svc} request {} failed with backend latency {}ms attempt {}",
+                        (base + r) * 7919 % 100_000,
+                        (base + r) * 37 % 1500,
+                        r % 5
+                    )
+                })
+                .collect()
+        };
+        let ts_desc = |n: usize, hi: i64, step: i64| -> Vec<i64> {
+            (0..n as i64).map(|i| hi - i * step).collect()
+        };
+        let l0_a = build_l0(
+            "gen1-widen-a",
+            vec![
+                ts_field(),
+                Field::new("log", DataType::Utf8, true),
+                Field::new("svc", DataType::Utf8, true),
+            ],
+            vec![
+                Arc::new(Int64Array::from(ts_desc(n_a, 1_000_000, 3))) as ArrayRef,
+                Arc::new(StringArray::from(logs("api", n_a, 0))),
+                Arc::new(StringArray::from(vec![Some("api"); n_a])),
+            ],
+        )
+        .await;
+        let l0_b = build_l0(
+            "gen1-widen-b",
+            vec![
+                ts_field(),
+                Field::new("code", DataType::Int64, true),
+                Field::new("log", DataType::Utf8, true),
+            ],
+            vec![
+                Arc::new(Int64Array::from(ts_desc(n_b, 999_500, 4))) as ArrayRef,
+                Arc::new(Int64Array::from(
+                    (0..n_b).map(|r| [200i64, 404, 500][r % 3]).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(logs("web", n_b, 50_000))),
+            ],
+        )
+        .await;
+        let l0_c = build_l0(
+            "gen1-widen-c",
+            vec![
+                ts_field(),
+                Field::new("code", DataType::Int64, true),
+                Field::new("log", DataType::Utf8, true),
+                Field::new("region", DataType::Utf8, true),
+                Field::new("svc", DataType::Utf8, true),
+            ],
+            vec![
+                Arc::new(Int64Array::from(ts_desc(n_c, 999_800, 5))) as ArrayRef,
+                Arc::new(Int64Array::from(
+                    (0..n_c).map(|r| 300 + (r as i64 % 4)).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(logs("db", n_c, 90_000))),
+                Arc::new(StringArray::from(
+                    (0..n_c)
+                        .map(|r| (r % 10 != 1).then(|| format!("eu-{}", r % 3)))
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(vec![Some("db"); n_c])),
+            ],
+        )
+        .await;
+        for (name, pair) in [("a", &l0_a), ("b", &l0_b), ("c", &l0_c)] {
+            assert!(!open_pair(pair).has_index(), "input {name} must be index-off");
+        }
+
+        // union schema (the merge's latest_schema): types agree, no flip
+        let latest_schema = Schema::new(vec![
+            ts_field(),
+            Field::new("code", DataType::Int64, true),
+            Field::new("log", DataType::Utf8, true),
+            Field::new("region", DataType::Utf8, true),
+            Field::new("svc", DataType::Utf8, true),
+        ]);
+        let inputs = vec![
+            ("gen1-a.vix".to_string(), l0_a),
+            ("gen1-b.vix".to_string(), l0_b),
+            ("gen1-c.vix".to_string(), l0_c),
+        ];
+        let merge_with = |caps: BatchCaps| {
+            merge_core_files_with_caps(
+                StreamType::Logs,
+                &as_inputs(&inputs),
+                &latest_schema,
+                &fts,
+                &[],
+                caps,
+            )
+            .unwrap()
+        };
+
+        let copied = merge_with(BatchCaps::default());
+        assert!(
+            !copied.used_index_merge,
+            "index-off inputs force the rebuild (gen-1)"
+        );
+        assert!(copied.concat_order, "overlapping gen-1 inputs concatenate");
+        assert_eq!(
+            copied.docs_passthrough_inputs, 3,
+            "ALL schema-differing inputs must copy through the widen plan"
+        );
+        assert_eq!(copied.dropped_rows, 0);
+
+        let oracle = merge_with(oracle_caps());
+        assert_eq!(
+            oracle.docs_passthrough_inputs, 0,
+            "the oracle is the pure decode + re-encode"
+        );
+
+        let copied_reader = open_merged(&copied);
+        let oracle_reader = open_merged(&oracle);
+        assert!(copied_reader.has_index(), "gen-1 output is indexed");
+        assert!(copied_reader.term_count() > 0);
+        assert_eq!(copied_reader.row_order(), RowOrder::Concat);
+        assert_core_files_content_equivalent(
+            &copied_reader,
+            &oracle_reader,
+            "gen-1 widen copy vs decode rebuild",
+        );
+
+        // §11 stats splice parity: spliced tables (widened inputs
+        // synthesize zero-presence chunk rows for their missing columns)
+        // fold to exactly the fresh-stats oracle
+        assert_stats_splice_parity(&copied, &oracle, "gen-1 widen splice");
+
+        // widened columns hold NULLS where the input lacked them: probe by
+        // stored position (input a's run stores svc values but null code)
+        let rows = copied_reader.row_count() as usize;
+        assert_eq!(rows, n_a + n_b + n_c);
+        let code = copied_reader.read_docs_column("code").unwrap();
+        let svc = copied_reader.read_docs_column("svc").unwrap();
+        let region = copied_reader.read_docs_column("region").unwrap();
+        assert_eq!(code.len(), rows);
+        let null_counts = (
+            code.null_count(),
+            svc.null_count(),
+            region.null_count(),
+        );
+        assert_eq!(
+            null_counts,
+            (n_a, n_b, n_a + n_b + n_c / 10),
+            "null runs must land exactly where inputs lacked the column \
+             (a: no code; b: no svc; a+b: no region, c every 10th null region)"
+        );
+
+        // M4 region decomposition on the concat output: every region is
+        // internally `_timestamp` DESC, regions cover every row exactly,
+        // and their k-way merge reproduces the global sorted order (the
+        // ordered-read contract the query path exploits)
+        let docs = VixDocs::open(bytes::Bytes::from(copied.output.to_bytes().unwrap())).unwrap();
+        let regions = docs.ts_desc_row_ranges().expect("proven region table");
+        assert_eq!(
+            regions.iter().map(|r| r.end - r.start).sum::<u64>(),
+            copied_reader.row_count()
+        );
+        let ts = read_i64(&copied_reader, TIMESTAMP_COL_NAME);
+        let mut merged_ts: Vec<i64> = Vec::with_capacity(ts.len());
+        {
+            let mut cursors: Vec<(usize, usize)> = Vec::new(); // (next, end)
+            for range in &regions {
+                let (start, end) = (range.start as usize, range.end as usize);
+                assert!(
+                    ts[start..end].windows(2).all(|w| w[0] >= w[1]),
+                    "region rows must be internally DESC"
+                );
+                cursors.push((start, end));
+            }
+            while let Some(best) = cursors
+                .iter()
+                .enumerate()
+                .filter(|(_, (next, end))| next < end)
+                .max_by_key(|(_, (next, _))| ts[*next])
+                .map(|(index, _)| index)
+            {
+                merged_ts.push(ts[cursors[best].0]);
+                cursors[best].0 += 1;
+            }
+        }
+        let mut sorted_ts = ts.clone();
+        sorted_ts.sort_unstable_by(|a, b| b.cmp(a));
+        assert_eq!(merged_ts, sorted_ts, "region k-way merge == global sort");
+
+        // Storage-size pins ("same zstd level — assert, don't assume").
+        // The copy can only SHRINK relative to both baselines, never grow:
+        // `_source`-scale chunks copy byte-identical (same zstd frames),
+        // the M6 coalescer recompresses only tiny (≤16KiB) column slices —
+        // fewer, larger frames — and widened null constants encode to
+        // ~nothing. Measured here: 0.92x vs Σ input docs blobs (coalesced
+        // small columns + one vortex footer instead of three), 0.82x vs a
+        // same-order re-encode (fresh per-chunk scheme sampling), 0.59x vs
+        // the sorted-interleave re-encode (interleaving destroys per-input
+        // value locality). A symmetric ±5% against a re-encode is
+        // therefore not a sound assertion; the protective direction is.
+        let copied_bytes = copied.output.to_bytes().unwrap().len() as f64;
+        let oracle_bytes = oracle.output.to_bytes().unwrap().len() as f64;
+        let merged_docs_bytes = docs.docs_blob_len() as f64;
+        let input_docs_bytes: f64 = inputs
+            .iter()
+            .map(|(_, (data, _))| VixDocs::open(data.clone()).unwrap().docs_blob_len() as f64)
+            .sum();
+        let structural = merged_docs_bytes / input_docs_bytes;
+        assert!(
+            structural <= 1.05,
+            "verbatim-copy no-bloat: merged docs blob {merged_docs_bytes} vs Σ input docs \
+             blobs {input_docs_bytes} (ratio {structural:.3})"
+        );
+        assert!(
+            copied_bytes <= oracle_bytes * 1.05,
+            "the copy must never bloat storage vs the decode path: copy {copied_bytes} vs \
+             sorted re-encode {oracle_bytes}"
+        );
+    }
+
+    /// M17 gen-1 encode-once (b): per-input fail-open. An input whose
+    /// stored column type FLIPPED against the merge target (a genuine
+    /// re-encode) decodes at its concatenated position while every other
+    /// input still copies — a qualification miss no longer forfeits the
+    /// whole copy (pre-M17: any miss = every byte re-encoded). Content
+    /// stays equivalent to the full-decode oracle.
+    #[tokio::test]
+    async fn gen1_docs_copy_type_flip_fails_open_per_input() {
+        let fts: Vec<String> = Vec::new();
+        let build_l0 = |name: &'static str, fields: Vec<Field>, columns: Vec<ArrayRef>| async move {
+            let schema = Arc::new(Schema::new(fields));
+            let batch = RecordBatch::try_new(Arc::clone(&schema), columns).unwrap();
+            let table =
+                Arc::new(MemTable::try_new(Arc::clone(&schema), vec![vec![batch]]).unwrap());
+            let l0 = write_core_file_from_tables_with_caps(
+                name,
+                StreamType::Logs,
+                Arc::clone(&schema),
+                vec![table],
+                &[],
+                &[],
+                false,
+                0,
+                BatchCaps {
+                    index_enabled_override: Some(false),
+                    ..BatchCaps::default()
+                },
+            )
+            .await
+            .unwrap();
+            (
+                bytes::Bytes::from(l0.data),
+                l0.index.map(bytes::Bytes::from),
+            )
+        };
+        let ts_field = || Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false);
+        // input a stores `code` as Int64 — the flip victim
+        let l0_a = build_l0(
+            "gen1-flip-a",
+            vec![ts_field(), Field::new("code", DataType::Int64, true)],
+            vec![
+                Arc::new(Int64Array::from(vec![1000, 800])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![200, 404])),
+            ],
+        )
+        .await;
+        // input b stores `code` as Utf8 — matches the merge target
+        let l0_b = build_l0(
+            "gen1-flip-b",
+            vec![ts_field(), Field::new("code", DataType::Utf8, true)],
+            vec![
+                Arc::new(Int64Array::from(vec![900, 700])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["500", "302"])),
+            ],
+        )
+        .await;
+        let latest_schema = Schema::new(vec![
+            ts_field(),
+            Field::new("code", DataType::Utf8, true),
+        ]);
+        let inputs = vec![
+            ("gen1-flip-a.vix".to_string(), l0_a),
+            ("gen1-flip-b.vix".to_string(), l0_b),
+        ];
+        let merge_with = |caps: BatchCaps| {
+            merge_core_files_with_caps(
+                StreamType::Logs,
+                &as_inputs(&inputs),
+                &latest_schema,
+                &fts,
+                &[],
+                caps,
+            )
+            .unwrap()
+        };
+        let mixed = merge_with(BatchCaps::default());
+        assert!(!mixed.used_index_merge);
+        assert_eq!(
+            mixed.docs_passthrough_inputs, 1,
+            "the type-flipped input must fail open to the decode path; the clean input copies"
+        );
+        let oracle = merge_with(oracle_caps());
+        assert_eq!(oracle.docs_passthrough_inputs, 0);
+        assert_core_files_content_equivalent(
+            &open_merged(&mixed),
+            &open_merged(&oracle),
+            "type-flip fail-open vs decode rebuild",
+        );
+        // the flipped input's values were CAST to the target type by the
+        // decode path — verify the stored column is the cast image
+        let reader = open_merged(&mixed);
+        let mut codes = read_strings(&reader, "code");
+        codes.sort();
+        assert_eq!(
+            codes,
+            vec![
+                Some("200".to_string()),
+                Some("302".to_string()),
+                Some("404".to_string()),
+                Some("500".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn l0_index_off_build_heals_to_indexed_on_merge() {
+        let schema = wal_schema();
+        let fts = vec!["log".to_string()];
+        let build = |index: Option<bool>| {
+            let schema = schema.clone();
+            let fts = fts.clone();
+            async move {
+                let table = Arc::new(
+                    MemTable::try_new(schema.clone(), vec![wal_batches(&schema)]).unwrap(),
+                );
+                write_core_file_from_tables_with_caps(
+                    "test-l0-index-off",
+                    StreamType::Logs,
+                    schema,
+                    vec![table],
+                    &fts,
+                    &[],
+                    false,
+                    0,
+                    BatchCaps {
+                        index_enabled_override: index,
+                        ..BatchCaps::default()
+                    },
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        let l0_a = build(Some(false)).await;
+        let l0_b = build(Some(false)).await;
+        assert_eq!(l0_a.stats.index_size, 0, "no dict/terms/bloom bytes");
+        assert_eq!(l0_a.stats.term_count, 0);
+        let l0_reader = VixReader::open_with_index(bytes::Bytes::from(l0_a.data.clone()), l0_a.index.clone().map(bytes::Bytes::from)).unwrap();
+        assert!(!l0_reader.has_index(), "index=none must round-trip");
+        // every plan field materialized as a docs column (the writer drops
+        // _timestamp/_source/_original itself)
+        for field in ["log", "svc", "code", "ok", ID_COL_NAME] {
+            assert!(
+                l0_reader.read_docs_column(field).is_ok(),
+                "{field:?} must be a docs column"
+            );
+        }
+        // term-shaped evals error — never an empty (row-dropping) result
+        assert!(l0_reader.eval(&exact("svc", "api")).is_err());
+
+        let indexed_a = build(None).await; // production resolve: logs = indexed
+        let indexed_b = build(None).await;
+        assert!(indexed_a.stats.index_size > 0);
+
+        let latest_schema = schema.as_ref().clone();
+        let merge = |name: &str, a: &CoreFileResult, b: &CoreFileResult| {
+            let inputs = vec![
+                (
+                format!("{name}-a.vix"),
+                (
+                    bytes::Bytes::from(a.data.clone()),
+                    a.index.clone().map(bytes::Bytes::from),
+                ),
+            ),
+                (
+                format!("{name}-b.vix"),
+                (
+                    bytes::Bytes::from(b.data.clone()),
+                    b.index.clone().map(bytes::Bytes::from),
+                ),
+            ),
+            ];
+            merge_core_files(
+                StreamType::Logs,
+                &as_inputs(&inputs),
+                &latest_schema,
+                &fts,
+                &[],
+            )
+            .unwrap()
+        };
+        let healed = merge("l0", &l0_a, &l0_b);
+        assert!(
+            !healed.used_index_merge,
+            "index-off inputs must force the source rebuild"
+        );
+        let control = merge("idx", &indexed_a, &indexed_b);
+        assert!(
+            control.used_index_merge,
+            "indexed inputs keep the dictionary fast path"
+        );
+        let healed_reader =
+            open_merged(&healed);
+        assert!(healed_reader.has_index(), "the merge output is indexed");
+        assert!(healed_reader.term_count() > 0);
+        let control_reader =
+            open_merged(&control);
+        assert_core_files_equivalent(&healed_reader, &control_reader, "l0-healed-vs-indexed");
+
+        // #46 referee: the heal above ran the COLUMN-derived rebuild (all
+        // inputs index-off all-columnar); force the SOURCE-derived rebuild
+        // over the same inputs and demand reader equivalence — the two term
+        // derivations must agree byte-identically.
+        let l0_inputs = vec![
+            (
+            "l0-a.vix".to_string(),
+            (
+                bytes::Bytes::from(l0_a.data.clone()),
+                l0_a.index.clone().map(bytes::Bytes::from),
+            ),
+        ),
+            (
+            "l0-b.vix".to_string(),
+            (
+                bytes::Bytes::from(l0_b.data.clone()),
+                l0_b.index.clone().map(bytes::Bytes::from),
+            ),
+        ),
+        ];
+        let source_forced = merge_core_files_rebuild_with_caps(
+            StreamType::Logs,
+            &as_inputs(&l0_inputs),
+            &latest_schema,
+            &fts,
+            &[],
+            BatchCaps {
+                force_source_derivation: true,
+                ..BatchCaps::default()
+            },
+        )
+        .unwrap();
+        assert!(!source_forced.used_index_merge);
+        let source_reader =
+            open_merged(&source_forced);
+        assert_core_files_equivalent(&healed_reader, &source_reader, "column-vs-source heal");
     }
 
     /// LIVE-SHAPE regression (image .8 zero-ts merge outputs): an event-time
@@ -3282,7 +8860,6 @@ mod tests {
     #[tokio::test]
     async fn merge_many_tiny_inputs_meta_range_matches_data() {
         let fts = vec!["log".to_string()];
-        let cs = vec!["svc".to_string()];
         // 2026-07-24T10:00:00Z in micros — the live partition's hour
         const HOUR: i64 = 1_784_887_200_000_000;
         let latest_schema = Schema::new(vec![
@@ -3311,7 +8888,7 @@ mod tests {
                 columns.push(Arc::new(StringArray::from(vec!["batch"; rows])));
                 file_cs.push("svc".to_string());
             }
-            build_core_file(fields, columns, &fts, file_cs, None)
+            build_core_file(fields, columns, &fts, None)
         };
 
         // overlapping: input i's rows interleave across the whole hour
@@ -3343,12 +8920,25 @@ mod tests {
             for (strategy, result) in [
                 (
                     "fast",
-                    merge_core_files(&as_inputs(inputs), &latest_schema, &fts, &cs, &[]).unwrap(),
+                    merge_core_files(
+                        StreamType::Logs,
+                        &as_inputs(inputs),
+                        &latest_schema,
+                        &fts,
+                        &[],
+                    )
+                    .unwrap(),
                 ),
                 (
                     "rebuild",
-                    merge_core_files_rebuild(&as_inputs(inputs), &latest_schema, &fts, &cs, &[])
-                        .unwrap(),
+                    merge_core_files_rebuild(
+                        StreamType::Logs,
+                        &as_inputs(inputs),
+                        &latest_schema,
+                        &fts,
+                        &[],
+                    )
+                    .unwrap(),
                 ),
             ] {
                 assert_eq!(
@@ -3356,7 +8946,7 @@ mod tests {
                     "{context}/{strategy}: row count"
                 );
                 let reader =
-                    VixReader::open(bytes::Bytes::from(result.output.to_bytes().unwrap())).unwrap();
+                    open_merged(&result);
                 let stored = read_i64(&reader, TIMESTAMP_COL_NAME);
                 let data_min = *stored.iter().min().unwrap();
                 let data_max = *stored.iter().max().unwrap();
@@ -3413,21 +9003,19 @@ mod tests {
     /// `_timestamp <= 0` rows spread ACROSS inputs and positions (interior,
     /// trailing), plus their CLEAN TWINS holding exactly the healthy rows.
     /// Poison rows carry the same field set as healthy rows plus a marker
-    /// token (`zeroline`) that must vanish from the merged terms, and f2
-    /// carries svc/code as PLAIN fields (pre-`column_store_fields` shape) so
-    /// cs derivation from `_source` crosses the cleansing too.
+    /// token (`zeroline`) that must vanish from the merged terms.
     ///
     /// Returns `(poisoned_inputs, clean_inputs, poison_count)`.
     #[allow(clippy::type_complexity)]
     fn cleansing_inputs(
         disjoint: bool,
     ) -> (
-        Vec<(String, bytes::Bytes)>,
-        Vec<(String, bytes::Bytes)>,
+        Vec<(String, BuiltPair)>,
+        Vec<(String, BuiltPair)>,
         u64,
     ) {
         let fts = vec!["log".to_string()];
-        let file = |name: &str, ts: Vec<i64>, svc_column_stored: bool, poisoned: bool| {
+        let file = |name: &str, ts: Vec<i64>, poisoned: bool| {
             let logs: Vec<String> = ts
                 .iter()
                 .enumerate()
@@ -3460,15 +9048,10 @@ mod tests {
                 Arc::new(StringArray::from(svc)),
                 Arc::new(Int64Array::from(codes)),
             ];
-            let file_cs = if svc_column_stored {
-                vec!["svc".to_string(), "code".to_string()]
-            } else {
-                vec![]
-            };
             let data = if poisoned {
-                build_poisoned_core_file(fields, columns, &fts, file_cs)
+                build_poisoned_core_file(fields, columns, &fts)
             } else {
-                build_core_file(fields, columns, &fts, file_cs, None)
+                build_core_file(fields, columns, &fts, None)
             };
             (name.to_string(), data)
         };
@@ -3491,15 +9074,15 @@ mod tests {
             )
         };
         let poisoned = vec![
-            file("f1.vix", f1_ts.clone(), true, true),
-            file("f2.vix", f2_ts.clone(), false, true),
-            file("f3.vix", f3_ts.clone(), true, false),
+            file("f1.vix", f1_ts.clone(), true),
+            file("f2.vix", f2_ts.clone(), true),
+            file("f3.vix", f3_ts.clone(), false),
         ];
         let healthy = |ts: Vec<i64>| ts.into_iter().filter(|t| *t > 0).collect::<Vec<i64>>();
         let clean = vec![
-            file("c1.vix", healthy(f1_ts.clone()), true, false),
-            file("c2.vix", healthy(f2_ts.clone()), false, false),
-            file("c3.vix", healthy(f3_ts), true, false),
+            file("c1.vix", healthy(f1_ts.clone()), false),
+            file("c2.vix", healthy(f2_ts.clone()), false),
+            file("c3.vix", healthy(f3_ts), false),
         ];
         let poison_count = f1_ts.iter().chain(&f2_ts).filter(|t| **t <= 0).count() as u64;
         (poisoned, clean, poison_count)
@@ -3526,7 +9109,6 @@ mod tests {
     #[tokio::test]
     async fn merge_cleanses_zero_timestamp_rows() {
         let fts = vec!["log".to_string()];
-        let cs = vec!["svc".to_string(), "code".to_string()];
         let latest_schema = cleansing_latest_schema();
 
         for (context, disjoint) in [("overlapping", false), ("disjoint", true)] {
@@ -3535,21 +9117,44 @@ mod tests {
 
             // the clean twins take the index-merge fast path (sanity that
             // the poison check does not over-block healthy merges)...
-            let clean_fast =
-                merge_core_files(&as_inputs(&clean), &latest_schema, &fts, &cs, &[]).unwrap();
+            let clean_fast = merge_core_files(
+                StreamType::Logs,
+                &as_inputs(&clean),
+                &latest_schema,
+                &fts,
+                &[],
+            )
+            .unwrap();
             assert!(clean_fast.used_index_merge, "{context}: clean fast path");
             assert_eq!(clean_fast.dropped_rows, 0, "{context}");
-            // ... and the referee is the clean rebuild (the oracle)
-            let referee =
-                merge_core_files_rebuild(&as_inputs(&clean), &latest_schema, &fts, &cs, &[])
-                    .unwrap();
+            // ... and the referee is the clean force_decode rebuild (the
+            // sorted oracle — the poisoned merge lands on the sorted
+            // standard rebuild, so the referee must be sorted too)
+            let referee = merge_core_files_rebuild_with_caps(
+                StreamType::Logs,
+                &as_inputs(&clean),
+                &latest_schema,
+                &fts,
+                &[],
+                BatchCaps {
+                    force_decode: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
             assert_eq!(referee.dropped_rows, 0, "{context}");
             let referee_reader =
-                VixReader::open(bytes::Bytes::from(referee.output.to_bytes().unwrap())).unwrap();
+                open_merged(&referee);
 
             // the poisoned merge: fast path refuses -> rebuild cleanses
-            let merged =
-                merge_core_files(&as_inputs(&poisoned), &latest_schema, &fts, &cs, &[]).unwrap();
+            let merged = merge_core_files(
+                StreamType::Logs,
+                &as_inputs(&poisoned),
+                &latest_schema,
+                &fts,
+                &[],
+            )
+            .unwrap();
             assert!(
                 !merged.used_index_merge,
                 "{context}: poison must force the rebuild path"
@@ -3568,7 +9173,7 @@ mod tests {
                 "{context}: stats range == healthy range"
             );
             let merged_reader =
-                VixReader::open(bytes::Bytes::from(merged.output.to_bytes().unwrap())).unwrap();
+                open_merged(&merged);
             assert_core_files_equivalent(
                 &merged_reader,
                 &referee_reader,
@@ -3603,12 +9208,16 @@ mod tests {
             );
 
             // tiny caps: poison rows cross chunk boundaries and still drop
-            let tiny = BatchCaps { rows: 2, bytes: 96 };
+            let tiny = BatchCaps {
+                rows: 2,
+                bytes: 96,
+                ..BatchCaps::default()
+            };
             let bounded = merge_core_files_rebuild_with_caps(
+                StreamType::Logs,
                 &as_inputs(&poisoned),
                 &latest_schema,
                 &fts,
-                &cs,
                 &[],
                 tiny,
             )
@@ -3623,7 +9232,7 @@ mod tests {
                 bounded.docs_batches
             );
             let bounded_reader =
-                VixReader::open(bytes::Bytes::from(bounded.output.to_bytes().unwrap())).unwrap();
+                open_merged(&bounded);
             assert_core_files_equivalent(
                 &bounded_reader,
                 &referee_reader,
@@ -3644,7 +9253,6 @@ mod tests {
     #[tokio::test]
     async fn merge_all_poison_inputs_yield_empty_output() {
         let fts = vec!["log".to_string()];
-        let cs = vec!["svc".to_string()];
         let latest_schema = cleansing_latest_schema();
         let fields = || {
             vec![
@@ -3663,7 +9271,6 @@ mod tests {
                 Arc::new(Int64Array::from(vec![Some(1), Some(2)])),
             ],
             &fts,
-            vec!["svc".to_string(), "code".to_string()],
         );
         let p2 = build_poisoned_core_file(
             fields(),
@@ -3674,7 +9281,6 @@ mod tests {
                 Arc::new(Int64Array::from(vec![Some(3)])),
             ],
             &fts,
-            vec![],
         );
         // one legitimately EMPTY file rides along: zero rows, zero dropped
         let empty = build_core_file(
@@ -3686,7 +9292,6 @@ mod tests {
                 Arc::new(Int64Array::from(Vec::<Option<i64>>::new())),
             ],
             &fts,
-            vec!["svc".to_string()],
             None,
         );
         let inputs = vec![
@@ -3695,7 +9300,14 @@ mod tests {
             ("p2.vix".to_string(), p2),
         ];
 
-        let result = merge_core_files(&as_inputs(&inputs), &latest_schema, &fts, &cs, &[]).unwrap();
+        let result = merge_core_files(
+            StreamType::Logs,
+            &as_inputs(&inputs),
+            &latest_schema,
+            &fts,
+            &[],
+        )
+        .unwrap();
         assert!(!result.used_index_merge, "poison must force the rebuild");
         assert_eq!(result.dropped_rows, 3, "every data row was poison");
         assert_eq!(result.stats.row_count, 0, "nothing survives");
@@ -3708,7 +9320,7 @@ mod tests {
         // want to keep it could; merge_core_group deliberately commits
         // "inputs deleted, no output" instead
         let reader =
-            VixReader::open(bytes::Bytes::from(result.output.to_bytes().unwrap())).unwrap();
+            open_merged(&result);
         assert_eq!(reader.row_count(), 0);
     }
 
@@ -3750,7 +9362,6 @@ mod tests {
             .unwrap()
         };
         let fts = vec!["log".to_string()];
-        let cs = vec!["svc".to_string()];
 
         // poison spread across two WAL batches
         let poisoned_table = Arc::new(
@@ -3762,10 +9373,10 @@ mod tests {
         );
         let result = write_core_file_from_tables(
             "test-move-cleansing",
+            StreamType::Logs,
             schema.clone(),
             vec![poisoned_table],
             &fts,
-            &cs,
             &[],
             false,
             0,
@@ -3785,10 +9396,10 @@ mod tests {
         );
         let clean = write_core_file_from_tables(
             "test-move-cleansing-clean",
+            StreamType::Logs,
             schema.clone(),
             vec![clean_table],
             &fts,
-            &cs,
             &[],
             false,
             0,
@@ -3796,8 +9407,8 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(clean.dropped_rows, 0);
-        let cleansed_reader = VixReader::open(bytes::Bytes::from(result.data)).unwrap();
-        let clean_reader = VixReader::open(bytes::Bytes::from(clean.data)).unwrap();
+        let cleansed_reader = VixReader::open_with_index(bytes::Bytes::from(result.data), result.index.map(bytes::Bytes::from)).unwrap();
+        let clean_reader = VixReader::open_with_index(bytes::Bytes::from(clean.data), clean.index.map(bytes::Bytes::from)).unwrap();
         assert_core_files_equivalent(&cleansed_reader, &clean_reader, "move cleansed-vs-clean");
         assert_eq!(
             cleansed_reader
@@ -3814,10 +9425,10 @@ mod tests {
             Arc::new(MemTable::try_new(schema.clone(), vec![vec![batch(vec![0, -1])]]).unwrap());
         let empty = write_core_file_from_tables(
             "test-move-cleansing-empty",
+            StreamType::Logs,
             schema.clone(),
             vec![all_poison_table],
             &fts,
-            &cs,
             &[],
             false,
             0,
@@ -3826,7 +9437,7 @@ mod tests {
         .unwrap();
         assert_eq!(empty.dropped_rows, 2);
         assert_eq!(empty.stats.row_count, 0);
-        let empty_reader = VixReader::open(bytes::Bytes::from(empty.data)).unwrap();
+        let empty_reader = VixReader::open_with_index(bytes::Bytes::from(empty.data), empty.index.map(bytes::Bytes::from)).unwrap();
         assert_eq!(empty_reader.row_count(), 0);
     }
 
@@ -3849,7 +9460,6 @@ mod tests {
     #[tokio::test]
     async fn rebuild_preserves_fts_capability_for_oversize_values() {
         let fts = vec!["body".to_string()];
-        let cs = vec!["svc".to_string()];
         let fields = || {
             vec![
                 Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
@@ -3899,25 +9509,30 @@ mod tests {
             fields(),
             columns(vec![900, 0, 700]),
             &fts,
-            vec!["svc".to_string()],
         );
         let f2 = build_core_file(
             fields(),
             columns(vec![800, 600]),
             &fts,
-            vec!["svc".to_string()],
             None,
         );
         let inputs = vec![
             ("f1.vix".to_string(), f1),
             ("f2.vix".to_string(), f2.clone()),
         ];
-        let merged = merge_core_files(&as_inputs(&inputs), &latest_schema, &fts, &cs, &[]).unwrap();
+        let merged = merge_core_files(
+            StreamType::Logs,
+            &as_inputs(&inputs),
+            &latest_schema,
+            &fts,
+            &[],
+        )
+        .unwrap();
         assert!(!merged.used_index_merge, "poison must force the rebuild");
         assert_eq!(merged.dropped_rows, 1);
         assert_eq!(merged.stats.row_count, 4);
         let merged_reader =
-            VixReader::open(bytes::Bytes::from(merged.output.to_bytes().unwrap())).unwrap();
+            open_merged(&merged);
 
         // the move-built referee over the same healthy rows
         let wal_schema = Arc::new(Schema::new(fields()));
@@ -3931,10 +9546,10 @@ mod tests {
         );
         let move_built = write_core_file_from_tables(
             "test-fts-oversize-move",
+            StreamType::Logs,
             wal_schema.clone(),
             vec![table],
             &fts,
-            &cs,
             &[],
             false,
             0,
@@ -3942,7 +9557,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(move_built.dropped_rows, 0);
-        let move_reader = VixReader::open(bytes::Bytes::from(move_built.data)).unwrap();
+        let move_reader = VixReader::open_with_index(bytes::Bytes::from(move_built.data), move_built.index.map(bytes::Bytes::from)).unwrap();
 
         for (context, reader) in [("rebuilt", &merged_reader), ("move-built", &move_reader)] {
             // fts typing preserved in the fields table: `body` stays in the
@@ -4010,21 +9625,32 @@ mod tests {
             fields(),
             columns(vec![900, 700]),
             &fts,
-            vec!["svc".to_string()],
             None,
         );
         let clean_inputs = vec![
             ("c1.vix".to_string(), f1_clean.clone()),
             ("c2.vix".to_string(), f2.clone()),
         ];
-        let clean_fast =
-            merge_core_files(&as_inputs(&clean_inputs), &latest_schema, &fts, &cs, &[]).unwrap();
+        // force_decode: the move referee is SORTED, and these inputs
+        // overlap — the default concat order would legitimately differ
+        let clean_fast = merge_core_files_with_caps(
+            StreamType::Logs,
+            &as_inputs(&clean_inputs),
+            &latest_schema,
+            &fts,
+            &[],
+            BatchCaps {
+                force_decode: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert!(
             clean_fast.used_index_merge,
             "clean oversize-fts inputs must keep the fast path"
         );
         let clean_fast_reader =
-            VixReader::open(bytes::Bytes::from(clean_fast.output.to_bytes().unwrap())).unwrap();
+            open_merged(&clean_fast);
         assert_core_files_equivalent(&clean_fast_reader, &move_reader, "clean-fast-vs-move");
 
         // HEALING: a pre-fix tainted input — fts field marked partial,
@@ -4033,22 +9659,41 @@ mod tests {
         // dictionary is missing the oversize values' tokens only a
         // `_source` rebuild re-derives), and the rebuilt output must drop
         // the taint instead of unioning it forward forever.
-        let tainted = bytes::Bytes::from(
-            vortex_index::test_support::repack_with_partial_fields(&f2, &["body"]).unwrap(),
+        let tainted: BuiltPair = (
+            f2.0.clone(),
+            Some(bytes::Bytes::from(
+                vortex_index::test_support::repack_with_partial_fields(
+                    f2.1.as_deref().expect("sidecar"),
+                    &["body"],
+                )
+                .unwrap(),
+            )),
         );
         let tainted_inputs = vec![
             ("c1.vix".to_string(), f1_clean),
             ("tainted.vix".to_string(), tainted),
         ];
-        let healed =
-            merge_core_files(&as_inputs(&tainted_inputs), &latest_schema, &fts, &cs, &[]).unwrap();
+        // force_decode: the move referee is sorted; the default heal over
+        // these overlapping inputs would concatenate
+        let healed = merge_core_files_with_caps(
+            StreamType::Logs,
+            &as_inputs(&tainted_inputs),
+            &latest_schema,
+            &fts,
+            &[],
+            BatchCaps {
+                force_decode: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert!(
             !healed.used_index_merge,
             "a tainted fts field must force the healing rebuild"
         );
         assert_eq!(healed.dropped_rows, 0);
         let healed_reader =
-            VixReader::open(bytes::Bytes::from(healed.output.to_bytes().unwrap())).unwrap();
+            open_merged(&healed);
         assert!(
             healed_reader.partial_fields().is_empty(),
             "the taint must not survive the rebuild"
@@ -4102,20 +9747,19 @@ mod tests {
                 ])),
             ],
             &resolved,
-            vec![],
             None,
         );
         let latest_schema = Schema::new(fields());
         let rebuilt = merge_core_files_rebuild(
+            StreamType::Logs,
             &as_inputs(&[("in.vix".to_string(), input)]),
             &latest_schema,
             &resolved,
             &[],
-            &[],
         )
         .unwrap();
         let reader =
-            VixReader::open(bytes::Bytes::from(rebuilt.output.to_bytes().unwrap())).unwrap();
+            open_merged(&rebuilt);
         assert!(reader.term_field_names().contains(&"body"));
         assert!(
             !reader.has_term_capability("body"),
@@ -4169,20 +9813,25 @@ mod tests {
     }
 
     fn classify_bytes(
-        data: &bytes::Bytes,
+        pair: &BuiltPair,
         latest_schema: &Schema,
         fts: &[String],
-        cs: &[String],
     ) -> Result<CoreFileStatus, anyhow::Error> {
         classify_core_file(
+            StreamType::Logs,
             "probe.vix",
             Arc::new(CountingRangeSource {
-                data: data.clone(),
+                data: pair.0.clone(),
                 fetched: Arc::default(),
+            }),
+            pair.1.as_ref().map(|index| {
+                Arc::new(CountingRangeSource {
+                    data: index.clone(),
+                    fetched: Arc::default(),
+                }) as Arc<dyn VixRangeSource>
             }),
             latest_schema,
             fts,
-            cs,
             &[],
         )
     }
@@ -4250,31 +9899,36 @@ mod tests {
     #[test]
     fn classify_core_file_decides_single_file_healing() {
         let fts = vec!["body".to_string()];
-        let cs = vec!["svc".to_string()];
         let latest_schema = Schema::new(healing_fields());
         let current = build_core_file(
             healing_fields(),
             healing_columns(vec![900, 800, 700]),
             &fts,
-            vec!["svc".to_string()],
             None,
         );
 
         // fully capable file: the no-op verdict
         assert!(
             matches!(
-                classify_bytes(&current, &latest_schema, &fts, &cs),
+                classify_bytes(&current, &latest_schema, &fts),
                 Ok(CoreFileStatus::Current)
             ),
             "a current file must classify Current"
         );
 
         // pre-.11 oversize taint: a plan-fts field marked partial
-        let tainted = bytes::Bytes::from(
-            vortex_index::test_support::repack_with_partial_fields(&current, &["body"]).unwrap(),
+        let tainted: BuiltPair = (
+            current.0.clone(),
+            Some(bytes::Bytes::from(
+                vortex_index::test_support::repack_with_partial_fields(
+                    current.1.as_deref().expect("sidecar"),
+                    &["body"],
+                )
+                .unwrap(),
+            )),
         );
         assert_needs_rebuild(
-            &classify_bytes(&tainted, &latest_schema, &fts, &cs),
+            &classify_bytes(&tainted, &latest_schema, &fts),
             &["body", "partial"],
             "fts taint",
         );
@@ -4282,29 +9936,25 @@ mod tests {
         // missing value terms: the file carries `code` values without term
         // capability (pre-numeric-value-terms files, fast-path-demoted
         // fields) — the registry-enriched plan value-indexes it
-        let demoted = bytes::Bytes::from(
-            vortex_index::test_support::repack_dropping_field_term_capability(&current, "code")
+        let demoted: BuiltPair = (
+            current.0.clone(),
+            Some(bytes::Bytes::from(
+                vortex_index::test_support::repack_dropping_field_term_capability(
+                    current.1.as_deref().expect("sidecar"),
+                    "code",
+                )
                 .unwrap(),
+            )),
         );
         assert_needs_rebuild(
-            &classify_bytes(&demoted, &latest_schema, &fts, &cs),
+            &classify_bytes(&demoted, &latest_schema, &fts),
             &["code", "value terms"],
             "dropped value-term capability",
         );
 
-        // configured cs field stored only in _source (no docs column)
-        let plain = build_core_file(
-            healing_fields(),
-            healing_columns(vec![900, 800, 700]),
-            &fts,
-            vec![],
-            None,
-        );
-        assert_needs_rebuild(
-            &classify_bytes(&plain, &latest_schema, &fts, &cs),
-            &["svc", "docs column"],
-            "missing cs column",
-        );
+        // (v2 all-columns: the "configured cs field stored only in _source"
+        // heal class no longer exists — a file's columns are its own
+        // present-field union, so no column-capability gap can open.)
 
         // fts settings drift: `note` raw-term-indexed in the file, fts in
         // the current plan
@@ -4313,57 +9963,49 @@ mod tests {
                 &current,
                 &latest_schema,
                 &["body".to_string(), "note".to_string()],
-                &cs,
             ),
             &["note"],
             "term-vs-fts marking drift",
         );
 
         // tokenizer drift
-        let old_tokenizer = bytes::Bytes::from(
-            vortex_index::test_support::repack_with_tokenizer_property(&current, "o2-v1").unwrap(),
+        let old_tokenizer: BuiltPair = (
+            current.0.clone(),
+            Some(bytes::Bytes::from(
+                vortex_index::test_support::repack_with_tokenizer_property(
+                    current.1.as_deref().expect("sidecar"),
+                    "o2-v1",
+                )
+                .unwrap(),
+            )),
         );
         assert_needs_rebuild(
-            &classify_bytes(&old_tokenizer, &latest_schema, &fts, &cs),
+            &classify_bytes(&old_tokenizer, &latest_schema, &fts),
             &["tokenizer"],
             "tokenizer drift",
         );
 
-        // NO false heal: a configured cs field the file does not carry (no
-        // key term) has nothing to derive — Current either when the schema
-        // types it or when it is unknown entirely
+        // NO false heal: a registry field the file does not carry (v2: the
+        // file's columns are its own present-field union; the registry can
+        // be arbitrarily wider) must never trigger a heal
         let mut ghost_schema_fields = healing_fields();
         ghost_schema_fields.push(Field::new("ghost", DataType::Utf8, true));
         let ghost_schema = Schema::new(ghost_schema_fields);
-        for (schema, cs_config, context) in [
-            (
-                &ghost_schema,
-                vec!["svc".to_string(), "ghost".to_string()],
-                "carried by no doc",
+        assert!(
+            matches!(
+                classify_bytes(&current, &ghost_schema, &fts),
+                Ok(CoreFileStatus::Current)
             ),
-            (
-                &latest_schema,
-                vec!["svc".to_string(), "not_in_schema".to_string()],
-                "not in the schema",
-            ),
-        ] {
-            assert!(
-                matches!(
-                    classify_bytes(&current, schema, &fts, &cs_config),
-                    Ok(CoreFileStatus::Current)
-                ),
-                "cs field {context}: nothing to derive, must stay Current"
-            );
-        }
+            "a registry-only field (carried by no doc) must stay Current"
+        );
 
         // an unreadable container errors (healing it would gut the index);
         // the probe caller logs and leaves the file alone
         assert!(
             classify_bytes(
-                &bytes::Bytes::from_static(b"not a vix container"),
+                &(bytes::Bytes::from_static(b"not a vix container"), None),
                 &latest_schema,
                 &fts,
-                &cs
             )
             .is_err()
         );
@@ -4373,24 +10015,25 @@ mod tests {
         for (context, data) in [
             ("fts taint", &tainted),
             ("dropped value-term capability", &demoted),
-            ("missing cs column", &plain),
             ("tokenizer drift", &old_tokenizer),
         ] {
             let healed = merge_core_files_rebuild(
+                StreamType::Logs,
                 &as_inputs(&[("single.vix".to_string(), data.clone())]),
                 &latest_schema,
                 &fts,
-                &cs,
                 &[],
             )
             .unwrap();
             assert!(
                 matches!(
                     classify_bytes(
-                        &bytes::Bytes::from(healed.output.to_bytes().unwrap()),
+                        &(
+                            bytes::Bytes::from(healed.output.to_bytes().unwrap()),
+                            healed.index.clone().map(bytes::Bytes::from),
+                        ),
                         &latest_schema,
                         &fts,
-                        &cs
                     ),
                     Ok(CoreFileStatus::Current)
                 ),
@@ -4440,7 +10083,6 @@ mod tests {
                 Arc::new(StringArray::from(svc)),
             ],
             &["body".to_string()],
-            vec!["svc".to_string()],
             Some(StringArray::from(
                 originals.iter().map(String::as_str).collect::<Vec<_>>(),
             )),
@@ -4448,21 +10090,27 @@ mod tests {
 
         let fetched = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let status = classify_core_file(
+            StreamType::Logs,
             "probe.vix",
             Arc::new(CountingRangeSource {
-                data: data.clone(),
+                data: data.0.clone(),
                 fetched: Arc::clone(&fetched),
+            }),
+            data.1.as_ref().map(|index| {
+                Arc::new(CountingRangeSource {
+                    data: index.clone(),
+                    fetched: Arc::clone(&fetched),
+                }) as Arc<dyn VixRangeSource>
             }),
             &Schema::new(fields),
             &["body".to_string()],
-            &["svc".to_string()],
             &[],
         )
         .unwrap();
         assert!(matches!(status, CoreFileStatus::Current));
 
         let read = fetched.load(std::sync::atomic::Ordering::Relaxed);
-        let total = data.len() as u64;
+        let total = (data.0.len() + data.1.as_ref().map_or(0, |b| b.len())) as u64;
         assert!(read > 0, "the probe must have read the footer");
         assert!(
             read * 4 < total,
@@ -4470,17 +10118,22 @@ mod tests {
         );
     }
 
-    /// THE single-file healing differential: each outdated shape — the
-    /// pre-.11 fts taint, dropped value-term capability, a configured cs
-    /// field with no docs column — is healed by ONE single-input rebuild
+    /// The single-input REBUILD differential: each outdated shape — the
+    /// pre-.11 fts taint, dropped value-term capability — is healed by ONE
+    /// single-input rebuild
     /// whose output is reader-EQUIVALENT to a move-built file of the same
     /// rows under the current settings (docs columns, term table +
     /// postings, capabilities, partials, query battery), restores the
     /// specific capability, and classifies Current.
+    ///
+    /// M3 NOTE: production routes these index-only reasons to the
+    /// SIDECAR-ONLY heal (`sidecar_only_heal_restores_capabilities_without_
+    /// touching_docs` is the production-shape twin); this keeps pinning
+    /// `merge_core_files_rebuild` as the docs-rewriting fallback arm and
+    /// the reference oracle.
     #[tokio::test]
     async fn single_file_healing_rebuild_restores_capabilities() {
         let fts = vec!["body".to_string()];
-        let cs = vec!["svc".to_string()];
         let latest_schema = Schema::new(healing_fields());
         let ts = vec![900i64, 800, 700, 600];
 
@@ -4490,50 +10143,49 @@ mod tests {
         let table = Arc::new(MemTable::try_new(wal_schema.clone(), vec![vec![batch]]).unwrap());
         let move_built = write_core_file_from_tables(
             "test-single-heal-move",
+            StreamType::Logs,
             wal_schema.clone(),
             vec![table],
             &fts,
-            &cs,
             &[],
             false,
             0,
         )
         .await
         .unwrap();
-        let move_reader = VixReader::open(bytes::Bytes::from(move_built.data)).unwrap();
+        let move_reader = VixReader::open_with_index(bytes::Bytes::from(move_built.data), move_built.index.map(bytes::Bytes::from)).unwrap();
 
         let current = build_core_file(
             healing_fields(),
             healing_columns(ts.clone()),
             &fts,
-            vec!["svc".to_string()],
             None,
         );
-        let cases: Vec<(&str, bytes::Bytes)> = vec![
+        let cases: Vec<(&str, BuiltPair)> = vec![
             (
                 "fts-tainted",
-                bytes::Bytes::from(
-                    vortex_index::test_support::repack_with_partial_fields(&current, &["body"])
+                (
+                    current.0.clone(),
+                    Some(bytes::Bytes::from(
+                        vortex_index::test_support::repack_with_partial_fields(
+                            current.1.as_deref().expect("sidecar"),
+                            &["body"],
+                        )
                         .unwrap(),
+                    )),
                 ),
             ),
             (
                 "value-terms-dropped",
-                bytes::Bytes::from(
-                    vortex_index::test_support::repack_dropping_field_term_capability(
-                        &current, "code",
-                    )
-                    .unwrap(),
-                ),
-            ),
-            (
-                "cs-missing",
-                build_core_file(
-                    healing_fields(),
-                    healing_columns(ts.clone()),
-                    &fts,
-                    vec![],
-                    None,
+                (
+                    current.0.clone(),
+                    Some(bytes::Bytes::from(
+                        vortex_index::test_support::repack_dropping_field_term_capability(
+                            current.1.as_deref().expect("sidecar"),
+                            "code",
+                        )
+                        .unwrap(),
+                    )),
                 ),
             ),
         ];
@@ -4541,23 +10193,26 @@ mod tests {
         for (context, data) in cases {
             assert!(
                 matches!(
-                    classify_bytes(&data, &latest_schema, &fts, &cs),
+                    classify_bytes(&data, &latest_schema, &fts),
                     Ok(CoreFileStatus::NeedsRebuild(_))
                 ),
                 "{context}: the probe must flag the file"
             );
             let healed = merge_core_files_rebuild(
+                StreamType::Logs,
                 &as_inputs(&[("single.vix".to_string(), data)]),
                 &latest_schema,
                 &fts,
-                &cs,
                 &[],
             )
             .unwrap();
             assert!(!healed.used_index_merge, "{context}: heal is a rebuild");
             assert_eq!(healed.dropped_rows, 0, "{context}");
-            let healed_bytes = bytes::Bytes::from(healed.output.to_bytes().unwrap());
-            let healed_reader = VixReader::open(healed_bytes.clone()).unwrap();
+            let healed_bytes: BuiltPair = (
+                bytes::Bytes::from(healed.output.to_bytes().unwrap()),
+                healed.index.clone().map(bytes::Bytes::from),
+            );
+            let healed_reader = open_pair(&healed_bytes);
 
             // the healed output carries EVERY current capability and is
             // indistinguishable from a fresh move build of the same rows
@@ -4600,12 +10255,411 @@ mod tests {
             );
             assert!(
                 matches!(
-                    classify_bytes(&healed_bytes, &latest_schema, &fts, &cs),
+                    classify_bytes(&healed_bytes, &latest_schema, &fts),
                     Ok(CoreFileStatus::Current)
                 ),
                 "{context}: healing converges (no rebuild loop)"
             );
         }
+    }
+
+    /// M3 SIDECAR-ONLY HEAL differential (DESIGN-V2 §5): the same outdated
+    /// shapes as `single_file_healing_rebuild_restores_capabilities`, healed
+    /// by [`rebuild_core_file_sidecar`] — a fresh `.vxi` built over the
+    /// UNTOUCHED data object (no docs bytes are produced at all). The
+    /// healed pair (ORIGINAL data bytes + new sidecar) must be
+    /// reader-equivalent to a fresh move build of the same rows, restore
+    /// each capability, and classify Current (convergence — no heal loop).
+    #[tokio::test]
+    async fn sidecar_only_heal_restores_capabilities_without_touching_docs() {
+        let fts = vec!["body".to_string()];
+        let latest_schema = Schema::new(healing_fields());
+        let ts = vec![900i64, 800, 700, 600];
+
+        // the move-built referee over the same rows with CURRENT settings
+        let wal_schema = Arc::new(Schema::new(healing_fields()));
+        let batch = RecordBatch::try_new(wal_schema.clone(), healing_columns(ts.clone())).unwrap();
+        let table = Arc::new(MemTable::try_new(wal_schema.clone(), vec![vec![batch]]).unwrap());
+        let move_built = write_core_file_from_tables(
+            "test-sidecar-heal-move",
+            StreamType::Logs,
+            wal_schema.clone(),
+            vec![table],
+            &fts,
+            &[],
+            false,
+            0,
+        )
+        .await
+        .unwrap();
+        let move_reader = VixReader::open_with_index(
+            bytes::Bytes::from(move_built.data),
+            move_built.index.map(bytes::Bytes::from),
+        )
+        .unwrap();
+
+        let current = build_core_file(healing_fields(), healing_columns(ts.clone()), &fts, None);
+        let cases: Vec<(&str, BuiltPair)> = vec![
+            (
+                "fts-tainted",
+                (
+                    current.0.clone(),
+                    Some(bytes::Bytes::from(
+                        vortex_index::test_support::repack_with_partial_fields(
+                            current.1.as_deref().expect("sidecar"),
+                            &["body"],
+                        )
+                        .unwrap(),
+                    )),
+                ),
+            ),
+            (
+                "value-terms-dropped",
+                (
+                    current.0.clone(),
+                    Some(bytes::Bytes::from(
+                        vortex_index::test_support::repack_dropping_field_term_capability(
+                            current.1.as_deref().expect("sidecar"),
+                            "code",
+                        )
+                        .unwrap(),
+                    )),
+                ),
+            ),
+        ];
+
+        for (context, data) in cases {
+            assert!(
+                matches!(
+                    classify_bytes(&data, &latest_schema, &fts),
+                    Ok(CoreFileStatus::NeedsRebuild(_))
+                ),
+                "{context}: the probe must flag the file"
+            );
+            let input = &as_inputs(&[("single.vix".to_string(), data.clone())])[0];
+            let outcome =
+                rebuild_core_file_sidecar(StreamType::Logs, input, &latest_schema, &fts, &[])
+                    .unwrap();
+            let SidecarHealOutcome::Rebuilt { index, stats } = outcome else {
+                panic!("{context}: expected Rebuilt, got {outcome:?}");
+            };
+            assert_eq!(
+                stats.docs_size, 0,
+                "{context}: a sidecar-only heal produces NO data-object bytes"
+            );
+            assert_eq!(stats.index_size as usize, index.len(), "{context}");
+            assert_eq!(stats.row_count, ts.len() as u64, "{context}");
+
+            // the healed pair = the ORIGINAL data bytes + the fresh sidecar
+            // (data key/bytes unchanged by construction)
+            let healed_pair: BuiltPair = (data.0.clone(), Some(bytes::Bytes::from(index)));
+            let healed_reader = open_pair(&healed_pair);
+            assert_core_files_equivalent(
+                &healed_reader,
+                &move_reader,
+                &format!("{context}: sidecar-healed vs move-built"),
+            );
+            assert!(
+                healed_reader.partial_fields().is_empty(),
+                "{context}: no taint survives"
+            );
+            assert_eq!(
+                matching_docs(
+                    &healed_reader,
+                    &VixQuery::TokenAnyField {
+                        token: b"heartbeat".to_vec()
+                    }
+                ),
+                vec![0, 1, 2, 3],
+                "{context}: match_all capability restored for every row"
+            );
+            assert!(
+                healed_reader.has_term_capability("code"),
+                "{context}: numeric value terms restored"
+            );
+            assert!(
+                matches!(
+                    classify_bytes(&healed_pair, &latest_schema, &fts),
+                    Ok(CoreFileStatus::Current)
+                ),
+                "{context}: sidecar healing converges (no rebuild loop)"
+            );
+
+            // M12 result-cache heal invalidation e2e: a query result memoized
+            // BEFORE the heal must be unreachable by the same (condition,
+            // file) query AFTER it. The key carries meta.index_size — the
+            // heal rewrites the sidecar under a stable data key, and the new
+            // size (the same freshness witness M3's byte-cache eviction
+            // uses) versions the key; the broadcast purge then frees the
+            // dead entry.
+            {
+                use crate::search::{
+                    index::{Condition, IndexCondition},
+                    vix::{
+                        cache::{CacheEntry, GLOBAL_CACHE},
+                        generate_cache_key,
+                    },
+                };
+                let file_key = format!("files/e2e/logs/healcache/2026/08/18/00/{context}.vix");
+                let pre_index_size = data.1.as_ref().expect("pre-heal sidecar").len() as i64;
+                let post_index_size = stats.index_size as i64;
+                assert_ne!(
+                    pre_index_size, post_index_size,
+                    "{context}: the heal must change the sidecar size — index_size is the \
+                     freshness witness BOTH the M3 byte-cache eviction and the M12 result-cache \
+                     key rely on"
+                );
+                let mut condition = IndexCondition::new();
+                condition.add_condition(Condition::Equal(
+                    "level".to_string(),
+                    "error".to_string(),
+                ));
+                let file = |index_size: i64| config::meta::stream::FileKey {
+                    key: file_key.clone(),
+                    meta: config::meta::stream::FileMeta {
+                        min_ts: 600,
+                        max_ts: 900,
+                        records: ts.len() as i64,
+                        compressed_size: healed_pair.0.len() as i64,
+                        index_size,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                // a pre-heal query memoized its (wrong-after-heal) answer
+                let key_pre = generate_cache_key(&condition, &None, &file(pre_index_size), None);
+                GLOBAL_CACHE.put(key_pre.clone(), CacheEntry::NoMatch);
+                // the SAME query against the healed row's meta: new key, miss
+                let key_post = generate_cache_key(&condition, &None, &file(post_index_size), None);
+                assert_ne!(
+                    key_pre, key_post,
+                    "{context}: post-heal queries must not share the pre-heal cache key"
+                );
+                assert!(
+                    GLOBAL_CACHE.get(&key_post, None).is_none(),
+                    "{context}: the same (condition, file) query must MISS after the heal, \
+                     never serve the pre-heal entry"
+                );
+                // and the broadcast sweep purges the dead pre-heal entry
+                assert_eq!(
+                    GLOBAL_CACHE.remove_file_entries([file_key.as_str()]),
+                    1,
+                    "{context}: the heal broadcast purge must evict the pre-heal entry"
+                );
+                assert!(GLOBAL_CACHE.get(&key_pre, None).is_none(), "{context}");
+            }
+        }
+    }
+
+    /// M12 item 4 (L0 external-sort fix): the direct sorted-batch build is a
+    /// DROP-IN for the DataFusion `ORDER BY _timestamp DESC` build the L0
+    /// builder used before — same rows, fts, terms, capabilities and stats
+    /// over a fat multi-slice corpus with SHRUNK byte caps (many bounded
+    /// splits), with zero plan/pool/sort involvement. Also pins the DESC
+    /// contract: an unsorted batch is refused loudly, never stored.
+    #[tokio::test]
+    async fn m12_sorted_batch_build_matches_tables_build() {
+        let fts = vec!["body".to_string()];
+        let rows = 20_000i64;
+        // unsorted input rows; the DF arm sorts, the direct arm gets them
+        // pre-sorted DESC (what the M12 L0 builder now produces)
+        let ts_unsorted: Vec<i64> = (0..rows).map(|i| 1_000_000 + ((i * 7919) % rows)).collect();
+        let mut ts_desc = ts_unsorted.clone();
+        ts_desc.sort_unstable_by(|a, b| b.cmp(a));
+        let schema = Arc::new(Schema::new(healing_fields()));
+        let caps = BatchCaps {
+            rows: 512,
+            bytes: 16 * 1024,
+            index_enabled_override: Some(true),
+            ..BatchCaps::default()
+        };
+
+        let df_built = {
+            let batch =
+                RecordBatch::try_new(Arc::clone(&schema), healing_columns(ts_unsorted)).unwrap();
+            let table =
+                Arc::new(MemTable::try_new(Arc::clone(&schema), vec![vec![batch]]).unwrap());
+            write_core_file_from_tables_with_caps(
+                "m12-sorted-df",
+                StreamType::Logs,
+                Arc::clone(&schema),
+                vec![table],
+                &fts,
+                &[],
+                false,
+                0,
+                caps.clone(),
+            )
+            .await
+            .unwrap()
+        };
+        let direct_built = {
+            let batch =
+                RecordBatch::try_new(Arc::clone(&schema), healing_columns(ts_desc.clone()))
+                    .unwrap();
+            write_core_file_from_sorted_batch_with_caps(
+                "m12-sorted-direct",
+                StreamType::Logs,
+                batch,
+                &fts,
+                &[],
+                false,
+                0,
+                caps.clone(),
+            )
+            .await
+            .unwrap()
+        };
+        assert_eq!(direct_built.stats.row_count, rows as u64);
+        assert!(
+            direct_built.docs_batches > 1,
+            "the shrunk caps must exercise the multi-slice bounded flow \
+             (got {} batches)",
+            direct_built.docs_batches
+        );
+        let df_reader = VixReader::open_with_index(
+            bytes::Bytes::from(df_built.data),
+            df_built.index.map(bytes::Bytes::from),
+        )
+        .unwrap();
+        let direct_reader = VixReader::open_with_index(
+            bytes::Bytes::from(direct_built.data),
+            direct_built.index.map(bytes::Bytes::from),
+        )
+        .unwrap();
+        assert_core_files_equivalent(
+            &direct_reader,
+            &df_reader,
+            "m12: direct sorted-batch build vs DataFusion tables build",
+        );
+
+        // the DESC contract is verified, not trusted
+        let unsorted =
+            RecordBatch::try_new(Arc::clone(&schema), healing_columns(vec![100, 300, 200]))
+                .unwrap();
+        let err = write_core_file_from_sorted_batch_with_caps(
+            "m12-sorted-bad",
+            StreamType::Logs,
+            unsorted,
+            &fts,
+            &[],
+            false,
+            0,
+            caps,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("not sorted"),
+            "unsorted input must be refused: {err:#}"
+        );
+    }
+
+    /// A file holding degenerate-`_timestamp` rows cannot heal sidecar-only
+    /// (cleansing drops stored rows, which only a docs rewrite expresses):
+    /// [`rebuild_core_file_sidecar`] must route it to the whole-file arm.
+    #[tokio::test]
+    async fn sidecar_only_heal_falls_back_on_degenerate_ts() {
+        let fts = vec!["body".to_string()];
+        let latest_schema = Schema::new(healing_fields());
+        let poisoned = build_poisoned_core_file(
+            healing_fields(),
+            healing_columns(vec![900, 0, 700, 600]),
+            &fts,
+        );
+        let input = &as_inputs(&[("poison.vix".to_string(), poisoned)])[0];
+        let outcome =
+            rebuild_core_file_sidecar(StreamType::Logs, input, &latest_schema, &fts, &[]).unwrap();
+        let SidecarHealOutcome::NeedsDocsRewrite(reason) = outcome else {
+            panic!("expected NeedsDocsRewrite, got {outcome:?}");
+        };
+        assert!(
+            reason.contains("degenerate"),
+            "the reason must name the cleansing need: {reason}"
+        );
+    }
+
+    /// An index-off plan (default: metrics) over an INDEXED file heals by
+    /// DROPPING the sidecar — pure metadata, no scan, no docs rewrite (v2
+    /// all-columns files already materialize every present field).
+    #[tokio::test]
+    async fn sidecar_only_heal_drops_sidecar_on_index_off_plan() {
+        assert_default_index_policy();
+        let fts = vec!["body".to_string()];
+        let latest_schema = Schema::new(healing_fields());
+        let indexed = build_core_file(
+            healing_fields(),
+            healing_columns(vec![900, 800]),
+            &fts,
+            None,
+        );
+        assert!(indexed.1.is_some(), "the input must carry a sidecar");
+        let input = &as_inputs(&[("single.vix".to_string(), indexed)])[0];
+        // metrics resolve index-off under the default policy
+        let outcome =
+            rebuild_core_file_sidecar(StreamType::Metrics, input, &latest_schema, &fts, &[])
+                .unwrap();
+        assert!(
+            matches!(outcome, SidecarHealOutcome::DropSidecar),
+            "expected DropSidecar, got {outcome:?}"
+        );
+    }
+
+    /// The v2 L0 heal shape: an index-off all-columnar L0 file under an
+    /// indexed plan gains its FIRST sidecar via the sidecar-only heal
+    /// (column-derived terms, #46). The healed pair answers queries like
+    /// the whole-file rebuild of the same input and classifies Current.
+    #[tokio::test]
+    async fn sidecar_only_heal_indexes_index_off_l0_file() {
+        assert_default_index_policy();
+        let latest_schema = Schema::new(index_off_fields());
+        let l0 = build_index_off_core_file(
+            index_off_fields(),
+            index_off_columns(vec![400, 300, 200], vec!["api", "db", "api"], vec![1, 2, 3]),
+        );
+        assert!(l0.1.is_none(), "an index-off build carries no sidecar");
+
+        let input = &as_inputs(&[("l0.vix".to_string(), l0.clone())])[0];
+        let outcome =
+            rebuild_core_file_sidecar(StreamType::Logs, input, &latest_schema, &[], &[]).unwrap();
+        let SidecarHealOutcome::Rebuilt { index, stats } = outcome else {
+            panic!("expected Rebuilt, got {outcome:?}");
+        };
+        assert_eq!(stats.docs_size, 0);
+        assert_eq!(stats.row_count, 3);
+
+        let healed_pair: BuiltPair = (l0.0.clone(), Some(bytes::Bytes::from(index)));
+        let healed_reader = open_pair(&healed_pair);
+        assert!(healed_reader.has_index(), "the healed pair is indexed");
+        assert_eq!(
+            matching_docs(&healed_reader, &exact("svc", "api")),
+            vec![0, 2],
+            "value terms derived from the columns"
+        );
+
+        // parity referee: the whole-file rebuild of the same input
+        let rebuilt = merge_core_files_rebuild(
+            StreamType::Logs,
+            &as_inputs(&[("l0.vix".to_string(), l0)]),
+            &latest_schema,
+            &[],
+            &[],
+        )
+        .unwrap();
+        let rebuilt_reader = open_merged(&rebuilt);
+        assert_core_files_equivalent(
+            &healed_reader,
+            &rebuilt_reader,
+            "sidecar-healed L0 vs whole-file rebuild",
+        );
+
+        assert!(
+            matches!(
+                classify_bytes(&healed_pair, &latest_schema, &[]),
+                Ok(CoreFileStatus::Current)
+            ),
+            "the sidecar-healed L0 file converges"
+        );
     }
 
     /// A configured `column_store_fields` entry that NO merge input stores
@@ -4615,21 +10669,18 @@ mod tests {
     #[tokio::test]
     async fn merge_materializes_configured_cs_column_missing_from_all_inputs() {
         let fts = vec!["body".to_string()];
-        let cs = vec!["svc".to_string()];
         let latest_schema = Schema::new(healing_fields());
         // disjoint time ranges: the docs stream-copy (sequential) path
         let old1 = build_core_file(
             healing_fields(),
             healing_columns(vec![900, 800]),
             &fts,
-            vec![],
             None,
         );
         let old2 = build_core_file(
             healing_fields(),
             healing_columns(vec![700, 600]),
             &fts,
-            vec![],
             None,
         );
         let inputs = vec![
@@ -4637,13 +10688,20 @@ mod tests {
             ("old2.vix".to_string(), old2),
         ];
 
-        let fast = merge_core_files(&as_inputs(&inputs), &latest_schema, &fts, &cs, &[]).unwrap();
+        let fast = merge_core_files(
+            StreamType::Logs,
+            &as_inputs(&inputs),
+            &latest_schema,
+            &fts,
+            &[],
+        )
+        .unwrap();
         assert!(
             fast.used_index_merge,
             "cs materialization must not force the rebuild path"
         );
         let fast_reader =
-            VixReader::open(bytes::Bytes::from(fast.output.to_bytes().unwrap())).unwrap();
+            open_merged(&fast);
         assert!(fast_reader.has_column_store_field("svc"));
         assert_eq!(
             read_strings(&fast_reader, "svc"),
@@ -4656,10 +10714,16 @@ mod tests {
             "derived docs column holds the _source truth for every row"
         );
 
-        let rebuilt =
-            merge_core_files_rebuild(&as_inputs(&inputs), &latest_schema, &fts, &cs, &[]).unwrap();
+        let rebuilt = merge_core_files_rebuild(
+            StreamType::Logs,
+            &as_inputs(&inputs),
+            &latest_schema,
+            &fts,
+            &[],
+        )
+        .unwrap();
         let rebuilt_reader =
-            VixReader::open(bytes::Bytes::from(rebuilt.output.to_bytes().unwrap())).unwrap();
+            open_merged(&rebuilt);
         assert_core_files_equivalent(&fast_reader, &rebuilt_reader, "all-old cs: fast vs rebuild");
     }
 
@@ -4685,8 +10749,11 @@ mod tests {
             Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
             Field::new("payload", DataType::Utf8, true),
         ]));
-        let mut writer =
-            VixWriter::new(&schema, core_writer_options(&[], vec![], Vec::new()), false);
+        let mut writer = VixWriter::new(
+            &schema,
+            core_writer_options(&[], Vec::new(), true),
+            false,
+        );
         let filler = "x".repeat(ROW_BYTES);
         for row in 0..ROWS {
             let batch = RecordBatch::try_new(
@@ -4702,8 +10769,12 @@ mod tests {
                 .push_batch_with_source(&batch, &source, None)
                 .unwrap();
         }
-        let input = bytes::Bytes::from(writer.finish().unwrap());
-        eprintln!("input file: {} MiB compressed", input.len() / (1024 * 1024));
+        let (input_data, input_index) = writer.finish().unwrap();
+        let input: BuiltPair = (
+            bytes::Bytes::from(input_data),
+            input_index.map(bytes::Bytes::from),
+        );
+        eprintln!("input file: {} MiB compressed", input.0.len() / (1024 * 1024));
 
         let latest_schema = Schema::new(vec![
             Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
@@ -4711,8 +10782,14 @@ mod tests {
         ]);
         let inputs = vec![("big.vix".to_string(), input)];
         let started = std::time::Instant::now();
-        let rebuild =
-            merge_core_files_rebuild(&as_inputs(&inputs), &latest_schema, &[], &[], &[]).unwrap();
+        let rebuild = merge_core_files_rebuild(
+            StreamType::Logs,
+            &as_inputs(&inputs),
+            &latest_schema,
+            &[],
+            &[],
+        )
+        .unwrap();
         eprintln!(
             "rebuild: {} rows in {} bounded batches, {:?}",
             rebuild.stats.row_count,
@@ -4726,7 +10803,7 @@ mod tests {
             rebuild.docs_batches
         );
         let reader =
-            VixReader::open(bytes::Bytes::from(rebuild.output.to_bytes().unwrap())).unwrap();
+            open_merged(&rebuild);
         assert_eq!(reader.row_count(), ROWS as u64);
         let ts = read_i64(&reader, TIMESTAMP_COL_NAME);
         assert!(ts.windows(2).all(|pair| pair[0] >= pair[1]), "DESC order");
@@ -4759,7 +10836,6 @@ mod tests {
                 Arc::new(StringArray::from(vec!["api gateway", "db"])),
             ],
             &["svc".to_string()],
-            vec![],
             None,
         );
         let file2 = build_core_file(
@@ -4769,21 +10845,33 @@ mod tests {
                 Arc::new(StringArray::from(vec!["api gateway", "web"])),
             ],
             &[],
-            vec![],
             None,
         );
         let latest_schema = Schema::new(schema_fields());
         let inputs = vec![("f1.vix".to_string(), file1), ("f2.vix".to_string(), file2)];
 
         // current settings: svc NOT fts -> file1 conflicts -> rebuild
-        let result = merge_core_files(&as_inputs(&inputs), &latest_schema, &[], &[], &[]).unwrap();
+        let result = merge_core_files(
+            StreamType::Logs,
+            &as_inputs(&inputs),
+            &latest_schema,
+            &[],
+            &[],
+        )
+        .unwrap();
         assert!(!result.used_index_merge);
-        let reference =
-            merge_core_files_rebuild(&as_inputs(&inputs), &latest_schema, &[], &[], &[]).unwrap();
+        let reference = merge_core_files_rebuild(
+            StreamType::Logs,
+            &as_inputs(&inputs),
+            &latest_schema,
+            &[],
+            &[],
+        )
+        .unwrap();
         let result_reader =
-            VixReader::open(bytes::Bytes::from(result.output.to_bytes().unwrap())).unwrap();
+            open_merged(&result);
         let reference_reader =
-            VixReader::open(bytes::Bytes::from(reference.output.to_bytes().unwrap())).unwrap();
+            open_merged(&reference);
         assert_core_files_equivalent(&result_reader, &reference_reader, "conflict");
         // the rebuild re-derived raw svc terms for every row
         assert_eq!(
@@ -4793,10 +10881,10 @@ mod tests {
 
         // current settings: svc fts -> file2 conflicts -> rebuild too
         let result = merge_core_files(
+            StreamType::Logs,
             &as_inputs(&inputs),
             &latest_schema,
             &["svc".to_string()],
-            &[],
             &[],
         )
         .unwrap();
@@ -4855,17 +10943,23 @@ mod tests {
             .collect();
         paths.sort();
         assert!(!paths.is_empty(), "no .vix files in {dir:?}");
-        let inputs: Vec<(String, bytes::Bytes)> = paths
+        let inputs: Vec<(String, BuiltPair)> = paths
             .iter()
             .map(|path| {
+                let index = std::fs::read(path.with_extension("vxi"))
+                    .ok()
+                    .map(bytes::Bytes::from);
                 (
                     path.file_name().unwrap().to_string_lossy().into_owned(),
-                    bytes::Bytes::from(std::fs::read(path).unwrap()),
+                    (bytes::Bytes::from(std::fs::read(path).unwrap()), index),
                 )
             })
             .collect();
         let mib = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
-        let total_bytes: usize = inputs.iter().map(|(_, data)| data.len()).sum();
+        let total_bytes: usize = inputs
+            .iter()
+            .map(|(_, (data, index))| data.len() + index.as_ref().map_or(0, |b| b.len()))
+            .sum();
 
         // derive the stream settings from the files themselves — the
         // compactor merges under unchanged settings in the common case
@@ -4875,7 +10969,7 @@ mod tests {
         let mut rows = 0u64;
         let mut ranges: Vec<(i64, i64)> = Vec::new();
         for (key, data) in &inputs {
-            let reader = VixReader::open(data.clone()).unwrap();
+            let reader = open_pair(data);
             rows += reader.row_count();
             let ts = as_int64_array(&reader.read_docs_column(TIMESTAMP_COL_NAME).unwrap()).unwrap();
             let (min_ts, max_ts) = (
@@ -4885,7 +10979,7 @@ mod tests {
             eprintln!(
                 "  {key}: {} rows, ts [{min_ts}, {max_ts}], {:.1} MiB",
                 reader.row_count(),
-                mib(data.len()),
+                mib(data.0.len() + data.1.as_ref().map_or(0, |b| b.len())),
             );
             ranges.push((min_ts, max_ts));
             for field in reader.docs_schema().unwrap().fields() {
@@ -4927,7 +11021,14 @@ mod tests {
         );
 
         let started = std::time::Instant::now();
-        let fast = merge_core_files(&as_inputs(&inputs), &latest_schema, &fts, &cs, &[]).unwrap();
+        let fast = merge_core_files(
+            StreamType::Logs,
+            &as_inputs(&inputs),
+            &latest_schema,
+            &fts,
+            &[],
+        )
+        .unwrap();
         let fast_elapsed = started.elapsed();
         eprintln!(
             "index-merge path: {fast_elapsed:>8.2?}  (used_index_merge={}, out {:.1} MiB, {} \
@@ -4948,8 +11049,14 @@ mod tests {
             return;
         }
         let started = std::time::Instant::now();
-        let rebuild =
-            merge_core_files_rebuild(&as_inputs(&inputs), &latest_schema, &fts, &cs, &[]).unwrap();
+        let rebuild = merge_core_files_rebuild(
+            StreamType::Logs,
+            &as_inputs(&inputs),
+            &latest_schema,
+            &fts,
+            &[],
+        )
+        .unwrap();
         let rebuild_elapsed = started.elapsed();
         eprintln!(
             "rebuild path:     {rebuild_elapsed:>8.2?}  (out {:.1} MiB, {} terms)",
@@ -4967,9 +11074,9 @@ mod tests {
         if std::env::var("O2_VIX_MERGE_BENCH_VERIFY").is_ok_and(|v| v == "1") {
             use std::hash::{DefaultHasher, Hash, Hasher};
             let fast_reader =
-                VixReader::open(bytes::Bytes::from(fast.output.to_bytes().unwrap())).unwrap();
+                open_merged(&fast);
             let rebuild_reader =
-                VixReader::open(bytes::Bytes::from(rebuild.output.to_bytes().unwrap())).unwrap();
+                open_merged(&rebuild);
             let digest = |reader: &VixReader| {
                 let mut hasher = DefaultHasher::new();
                 let mut count = 0u64;
@@ -5117,9 +11224,8 @@ mod tests {
         );
 
         let fts = vec!["message".to_string()];
-        let cs = vec!["kubernetes.namespace.name".to_string()];
         for &threads in &thread_list {
-            let mut opts = core_writer_options(&fts, cs.clone(), Vec::new());
+            let mut opts = core_writer_options(&fts, Vec::new(), true);
             opts.encode_threads = threads;
             let writer_schema = writer_input_schema(&Arc::new((*schema).clone()));
             let mut writer = VixWriter::new(&writer_schema, opts, false);
@@ -5129,7 +11235,7 @@ mod tests {
             }
             let push_elapsed = t_push.elapsed();
             let t_finish = std::time::Instant::now();
-            let (data, stats) = writer.finish_with_stats().unwrap();
+            let (data, _index, stats) = writer.finish_with_stats().unwrap();
             let finish_elapsed = t_finish.elapsed();
             eprintln!(
                 "threads={threads:>2}  push(term-accum) {push_elapsed:>8.2?}  \
@@ -5166,40 +11272,48 @@ mod tests {
                     Arc::new(StringArray::from(svc)),
                 ],
                 &["log".to_string()],
-                vec!["svc".to_string()],
                 None,
             )
         };
         let file1 = build(vec![100, 90], vec!["error one", "fine"], vec!["api", "db"]);
         let file2 = build(vec![80, 70], vec!["error two", "ok"], vec!["db", "web"]);
 
-        // corrupt the dictionary blob of file1 (located by tag — blob order
-        // is not part of the format); the puffin footer and the docs blob
-        // stay intact, so a docs-only open still works
-        let mut corrupt = file1.to_vec();
-        let dict_range = vortex_index::test_support::blob_byte_range(&corrupt, "dict").unwrap();
-        for byte in &mut corrupt[dict_range.start..(dict_range.start + 32).min(dict_range.end)] {
+        // corrupt the dictionary blob of file1's SIDECAR (located by tag —
+        // blob order is not part of the format); the data object stays
+        // intact, so a docs-only open still works
+        let mut corrupt_index = file1.1.as_deref().expect("sidecar").to_vec();
+        let dict_range =
+            vortex_index::test_support::blob_byte_range(&corrupt_index, "dict").unwrap();
+        for byte in
+            &mut corrupt_index[dict_range.start..(dict_range.start + 32).min(dict_range.end)]
+        {
             *byte = 0xAB;
         }
-        let corrupt = bytes::Bytes::from(corrupt);
+        let corrupt: BuiltPair = (file1.0.clone(), Some(bytes::Bytes::from(corrupt_index)));
         // open is footer-only under the block dictionary: corruption in the
         // dict blob surfaces at the first DICTIONARY touch, not at open —
         // and the merge maps that error to the rebuild fallback below
-        let opened = VixReader::open(corrupt.clone()).unwrap();
+        let opened = open_pair(&corrupt);
         assert!(
             opened.for_each_term(&mut |_k, _d, _i| Ok(())).is_err(),
             "corruption did not break the dictionary read"
         );
-        assert!(VixDocs::open(corrupt.clone()).is_ok());
+        assert!(VixDocs::open(corrupt.0.clone()).is_ok());
 
         let latest_schema = Schema::new(schema_fields());
         let fts = vec!["log".to_string()];
-        let cs = vec!["svc".to_string()];
         let inputs = vec![
             ("bad.vix".to_string(), corrupt),
             ("good.vix".to_string(), file2.clone()),
         ];
-        let result = merge_core_files(&as_inputs(&inputs), &latest_schema, &fts, &cs, &[]).unwrap();
+        let result = merge_core_files(
+            StreamType::Logs,
+            &as_inputs(&inputs),
+            &latest_schema,
+            &fts,
+            &[],
+        )
+        .unwrap();
         assert!(!result.used_index_merge);
 
         // equivalent to rebuilding over the pristine bytes (file2 supplies
@@ -5208,13 +11322,18 @@ mod tests {
             ("f1.vix".to_string(), file1),
             ("good.vix".to_string(), file2),
         ];
-        let reference =
-            merge_core_files_rebuild(&as_inputs(&pristine), &latest_schema, &fts, &cs, &[])
-                .unwrap();
+        let reference = merge_core_files_rebuild(
+            StreamType::Logs,
+            &as_inputs(&pristine),
+            &latest_schema,
+            &fts,
+            &[],
+        )
+        .unwrap();
         let result_reader =
-            VixReader::open(bytes::Bytes::from(result.output.to_bytes().unwrap())).unwrap();
+            open_merged(&result);
         let reference_reader =
-            VixReader::open(bytes::Bytes::from(reference.output.to_bytes().unwrap())).unwrap();
+            open_merged(&reference);
         assert_core_files_equivalent(&result_reader, &reference_reader, "corrupt");
     }
 
@@ -5240,11 +11359,17 @@ mod tests {
                 Arc::new(StringArray::from(vec!["café latte", "用户admin登录"])),
             ],
             &fts,
-            vec![],
             None,
         );
-        let old_file = bytes::Bytes::from(
-            vortex_index::test_support::repack_with_tokenizer_property(&old_file, "o2-v1").unwrap(),
+        let old_file: BuiltPair = (
+            old_file.0.clone(),
+            Some(bytes::Bytes::from(
+                vortex_index::test_support::repack_with_tokenizer_property(
+                    old_file.1.as_deref().expect("sidecar"),
+                    "o2-v1",
+                )
+                .unwrap(),
+            )),
         );
         let new_file = build_core_file(
             fields(),
@@ -5253,7 +11378,6 @@ mod tests {
                 Arc::new(StringArray::from(vec!["plain admin login"])),
             ],
             &fts,
-            vec![],
             None,
         );
 
@@ -5262,24 +11386,39 @@ mod tests {
             ("old.vix".to_string(), old_file),
             ("new.vix".to_string(), new_file),
         ];
-        let result = merge_core_files(&as_inputs(&inputs), &latest_schema, &fts, &[], &[]).unwrap();
+        let result = merge_core_files(
+            StreamType::Logs,
+            &as_inputs(&inputs),
+            &latest_schema,
+            &fts,
+            &[],
+        )
+        .unwrap();
         assert!(
             !result.used_index_merge,
             "the tokenizer property mismatch must force the rebuild"
         );
         // ... and the rebuild is what merge_core_files_rebuild produces
-        let reference =
-            merge_core_files_rebuild(&as_inputs(&inputs), &latest_schema, &fts, &[], &[]).unwrap();
+        let reference = merge_core_files_rebuild(
+            StreamType::Logs,
+            &as_inputs(&inputs),
+            &latest_schema,
+            &fts,
+            &[],
+        )
+        .unwrap();
         let result_reader =
-            VixReader::open(bytes::Bytes::from(result.output.to_bytes().unwrap())).unwrap();
+            open_merged(&result);
         let reference_reader =
-            VixReader::open(bytes::Bytes::from(reference.output.to_bytes().unwrap())).unwrap();
+            open_merged(&reference);
         assert_core_files_equivalent(&result_reader, &reference_reader, "legacy tokenizer");
 
-        // the output file is stamped with the current tokenizer ...
+        // the output SIDECAR is stamped with the current tokenizer ...
         assert_eq!(
-            vortex_index::test_support::tokenizer_property(&result.output.to_bytes().unwrap())
-                .unwrap(),
+            vortex_index::test_support::tokenizer_property(
+                result.index.as_deref().expect("indexed merge output"),
+            )
+            .unwrap(),
             Some("o2-v2".to_string())
         );
         // ... and its tokens are current-semantics: per-char non-ASCII plus
@@ -5335,7 +11474,6 @@ mod tests {
                 Arc::new(Float64Array::from(vec![Some(f64::NAN), None])),
             ],
             &[],
-            vec![],
             None,
         );
         let file2 = build_core_file(
@@ -5346,12 +11484,11 @@ mod tests {
                 Arc::new(Float64Array::from(vec![Some(1.5), Some(f64::INFINITY)])),
             ],
             &[],
-            vec![],
             None,
         );
 
         // the write side: NaN becomes a JSON null inside _source ...
-        let r1 = VixReader::open(file1.clone()).unwrap();
+        let r1 = open_pair(&file1);
         let src: serde_json::Value =
             serde_json::from_str(r1.read_source(&[0]).unwrap().value(0)).unwrap();
         assert_eq!(
@@ -5364,17 +11501,30 @@ mod tests {
 
         let latest_schema = Schema::new(fields);
         let inputs = vec![("f1.vix".to_string(), file1), ("f2.vix".to_string(), file2)];
-        let fast = merge_core_files(&as_inputs(&inputs), &latest_schema, &[], &[], &[]).unwrap();
+        let fast = merge_core_files(
+            StreamType::Logs,
+            &as_inputs(&inputs),
+            &latest_schema,
+            &[],
+            &[],
+        )
+        .unwrap();
         assert!(fast.used_index_merge);
-        let rebuild =
-            merge_core_files_rebuild(&as_inputs(&inputs), &latest_schema, &[], &[], &[]).unwrap();
+        let rebuild = merge_core_files_rebuild(
+            StreamType::Logs,
+            &as_inputs(&inputs),
+            &latest_schema,
+            &[],
+            &[],
+        )
+        .unwrap();
 
         // merged order (ts DESC): doc0=NaN, doc1=absent, doc2=1.5, doc3=Inf
         // — both strategies agree: only the finite value keys the doc
         let fast_reader =
-            VixReader::open(bytes::Bytes::from(fast.output.to_bytes().unwrap())).unwrap();
+            open_merged(&fast);
         let rebuild_reader =
-            VixReader::open(bytes::Bytes::from(rebuild.output.to_bytes().unwrap())).unwrap();
+            open_merged(&rebuild);
         for (context, reader) in [("fast", &fast_reader), ("rebuild", &rebuild_reader)] {
             assert_eq!(
                 matching_docs(reader, &key_exists("ratio")),
@@ -5402,7 +11552,6 @@ mod tests {
                     Arc::new(StringArray::from(vec![svc, svc])),
                 ],
                 &[],
-                vec!["svc".to_string()],
                 None,
             )
         };
@@ -5416,27 +11565,27 @@ mod tests {
             ("f3.vix".to_string(), build("c")),
         ];
         let fast = merge_core_files(
+            StreamType::Logs,
             &as_inputs(&inputs),
             &latest_schema,
             &[],
-            &["svc".to_string()],
             &[],
         )
         .unwrap();
         assert!(fast.used_index_merge);
         let rebuild = merge_core_files_rebuild(
+            StreamType::Logs,
             &as_inputs(&inputs),
             &latest_schema,
             &[],
-            &["svc".to_string()],
             &[],
         )
         .unwrap();
 
         let fast_reader =
-            VixReader::open(bytes::Bytes::from(fast.output.to_bytes().unwrap())).unwrap();
+            open_merged(&fast);
         let rebuild_reader =
-            VixReader::open(bytes::Bytes::from(rebuild.output.to_bytes().unwrap())).unwrap();
+            open_merged(&rebuild);
         assert_core_files_equivalent(&fast_reader, &rebuild_reader, "full ties");
         assert_eq!(
             read_i64(&fast_reader, TIMESTAMP_COL_NAME),
@@ -5460,7 +11609,6 @@ mod tests {
     #[tokio::test]
     async fn review_merge_single_and_empty_inputs() {
         let fts = vec!["log".to_string()];
-        let cs = vec!["svc".to_string()];
         let fields = || {
             vec![
                 Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
@@ -5476,7 +11624,6 @@ mod tests {
                 Arc::new(StringArray::from(vec!["api", "db"])),
             ],
             &fts,
-            cs.clone(),
             None,
         );
         let empty = build_core_file(
@@ -5487,18 +11634,24 @@ mod tests {
                 Arc::new(StringArray::from(Vec::<Option<&str>>::new())),
             ],
             &fts,
-            cs.clone(),
             None,
         );
         let latest_schema = Schema::new(fields());
 
         // single input: the merged file must be equivalent to the original
         let single = vec![("real.vix".to_string(), real.clone())];
-        let fast = merge_core_files(&as_inputs(&single), &latest_schema, &fts, &cs, &[]).unwrap();
+        let fast = merge_core_files(
+            StreamType::Logs,
+            &as_inputs(&single),
+            &latest_schema,
+            &fts,
+            &[],
+        )
+        .unwrap();
         assert!(fast.used_index_merge);
         let fast_reader =
-            VixReader::open(bytes::Bytes::from(fast.output.to_bytes().unwrap())).unwrap();
-        let original_reader = VixReader::open(real.clone()).unwrap();
+            open_merged(&fast);
+        let original_reader = open_pair(&real);
         assert_core_files_equivalent(&fast_reader, &original_reader, "single input");
 
         // a zero-row input alongside a real one
@@ -5506,17 +11659,28 @@ mod tests {
             ("empty.vix".to_string(), empty),
             ("real.vix".to_string(), real),
         ];
-        let fast =
-            merge_core_files(&as_inputs(&with_empty), &latest_schema, &fts, &cs, &[]).unwrap();
+        let fast = merge_core_files(
+            StreamType::Logs,
+            &as_inputs(&with_empty),
+            &latest_schema,
+            &fts,
+            &[],
+        )
+        .unwrap();
         assert!(fast.used_index_merge);
         assert_eq!(fast.stats.row_count, 2);
-        let rebuild =
-            merge_core_files_rebuild(&as_inputs(&with_empty), &latest_schema, &fts, &cs, &[])
-                .unwrap();
+        let rebuild = merge_core_files_rebuild(
+            StreamType::Logs,
+            &as_inputs(&with_empty),
+            &latest_schema,
+            &fts,
+            &[],
+        )
+        .unwrap();
         let fast_reader =
-            VixReader::open(bytes::Bytes::from(fast.output.to_bytes().unwrap())).unwrap();
+            open_merged(&fast);
         let rebuild_reader =
-            VixReader::open(bytes::Bytes::from(rebuild.output.to_bytes().unwrap())).unwrap();
+            open_merged(&rebuild);
         assert_core_files_equivalent(&fast_reader, &rebuild_reader, "empty input");
         assert_eq!(read_i64(&fast_reader, TIMESTAMP_COL_NAME), vec![100, 90]);
     }
@@ -5531,7 +11695,6 @@ mod tests {
     /// (differential holds) and documents the null-out semantics.
     #[tokio::test]
     async fn review_merge_cs_type_drift_nulls_are_consistent() {
-        let cs = vec!["code".to_string()];
         let file1 = build_core_file(
             vec![
                 Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
@@ -5542,7 +11705,6 @@ mod tests {
                 Arc::new(StringArray::from(vec![Some("abc"), Some("123")])),
             ],
             &[],
-            cs.clone(),
             None,
         );
         let file2 = build_core_file(
@@ -5555,7 +11717,6 @@ mod tests {
                 Arc::new(Int64Array::from(vec![Some(7), None])),
             ],
             &[],
-            cs.clone(),
             None,
         );
         let latest_schema = Schema::new(vec![
@@ -5564,17 +11725,30 @@ mod tests {
         ]);
         let inputs = vec![("f1.vix".to_string(), file1), ("f2.vix".to_string(), file2)];
 
-        let fast = merge_core_files(&as_inputs(&inputs), &latest_schema, &[], &cs, &[]).unwrap();
+        let fast = merge_core_files(
+            StreamType::Logs,
+            &as_inputs(&inputs),
+            &latest_schema,
+            &[],
+            &[],
+        )
+        .unwrap();
         assert!(
             fast.used_index_merge,
             "a typed-conflict field is dropped+partial, not a fast-path rejection"
         );
-        let rebuild =
-            merge_core_files_rebuild(&as_inputs(&inputs), &latest_schema, &[], &cs, &[]).unwrap();
+        let rebuild = merge_core_files_rebuild(
+            StreamType::Logs,
+            &as_inputs(&inputs),
+            &latest_schema,
+            &[],
+            &[],
+        )
+        .unwrap();
         let fast_reader =
-            VixReader::open(bytes::Bytes::from(fast.output.to_bytes().unwrap())).unwrap();
+            open_merged(&fast);
         let rebuild_reader =
-            VixReader::open(bytes::Bytes::from(rebuild.output.to_bytes().unwrap())).unwrap();
+            open_merged(&rebuild);
         assert_core_files_equivalent(&fast_reader, &rebuild_reader, "cs type drift");
 
         // "abc" nulled by the safe cast, "123" parsed — silently
@@ -5621,7 +11795,6 @@ mod tests {
     /// null-filled) and passes after.
     #[tokio::test]
     async fn merge_derives_missing_cs_column_from_source_not_nulls() {
-        let cs = vec!["ns".to_string(), "code".to_string()];
         // Input A (newer): ns/code ARE column-stored.
         let with_columns = build_core_file(
             vec![
@@ -5639,7 +11812,6 @@ mod tests {
                 Arc::new(Int64Array::from(vec![Some(500), Some(-5), Some(200)])),
             ],
             &[],
-            cs.clone(),
             None,
         );
         // Input B (older, PRE-COLUMN): ns/code are plain fields -> `_source`
@@ -5661,8 +11833,7 @@ mod tests {
                 ])),
                 Arc::new(Int64Array::from(vec![Some(-5), None, Some(300), None])),
             ],
-            &[],
-            vec![], // NOT column-stored in this input
+            &[], // NOT column-stored in this input
             None,
         );
         let latest_schema = Schema::new(vec![
@@ -5694,15 +11865,28 @@ mod tests {
         ];
         let code_not_null = 5u64;
 
-        let fast = merge_core_files(&as_inputs(&inputs), &latest_schema, &[], &cs, &[]).unwrap();
+        let fast = merge_core_files(
+            StreamType::Logs,
+            &as_inputs(&inputs),
+            &latest_schema,
+            &[],
+            &[],
+        )
+        .unwrap();
         assert!(fast.used_index_merge, "disjoint inputs take the fast path");
-        let rebuild =
-            merge_core_files_rebuild(&as_inputs(&inputs), &latest_schema, &[], &cs, &[]).unwrap();
+        let rebuild = merge_core_files_rebuild(
+            StreamType::Logs,
+            &as_inputs(&inputs),
+            &latest_schema,
+            &[],
+            &[],
+        )
+        .unwrap();
         assert!(!rebuild.used_index_merge);
 
         for (label, result) in [("fast", fast), ("rebuild", rebuild)] {
             let reader =
-                VixReader::open(bytes::Bytes::from(result.output.to_bytes().unwrap())).unwrap();
+                open_merged(&result);
             assert_eq!(reader.row_count(), 7, "{label}: row count");
 
             // --- string field: the full consistency triangle ---
@@ -5783,9 +11967,9 @@ mod tests {
         let table = Arc::new(MemTable::try_new(schema.clone(), vec![vec![batch]]).unwrap());
         let result = write_core_file_from_tables(
             "review-source-col",
+            StreamType::Logs,
             schema,
             vec![table],
-            &[],
             &[],
             &[],
             false,
@@ -5794,7 +11978,7 @@ mod tests {
         .await
         .unwrap();
 
-        let reader = VixReader::open(bytes::Bytes::from(result.data)).unwrap();
+        let reader = VixReader::open_with_index(bytes::Bytes::from(result.data), result.index.map(bytes::Bytes::from)).unwrap();
         assert_eq!(reader.row_count(), 2);
         // the synthesized _source carries the value under the renamed key
         let sources = reader.read_source(&[0, 1]).unwrap();
@@ -5843,6 +12027,7 @@ mod tests {
             term_count: 10,
             index_size: 128,
             docs_size: 512,
+            oversize_skipped: 0,
             min_ts: 1_700_000_000_000_000,
             max_ts: 1_700_000_400_000_000,
         };
@@ -5959,8 +12144,11 @@ mod tests {
         )
         .unwrap();
         let source = synthesize_source(&batch).unwrap();
-        let mut writer =
-            VixWriter::new(&schema, core_writer_options(&[], vec![], Vec::new()), false);
+        let mut writer = VixWriter::new(
+            &schema,
+            core_writer_options(&[], Vec::new(), true),
+            false,
+        );
         writer
             .push_batch_with_source(&batch, &source, None)
             .unwrap();
@@ -5980,20 +12168,21 @@ mod tests {
         plan_fields: Vec<Field>,
         batch_fields: Vec<Field>,
         columns: Vec<ArrayRef>,
-    ) -> bytes::Bytes {
+    ) -> BuiltPair {
         let plan_schema = Arc::new(Schema::new(plan_fields));
         let batch_schema = Arc::new(Schema::new(batch_fields));
         let batch = RecordBatch::try_new(batch_schema, columns).unwrap();
         let source = synthesize_source(&batch).unwrap();
         let mut writer = VixWriter::new(
             &plan_schema,
-            core_writer_options(&[], vec![], Vec::new()),
+            core_writer_options(&[], Vec::new(), true),
             false,
         );
         writer
             .push_batch_with_source(&batch, &source, None)
             .unwrap();
-        bytes::Bytes::from(writer.finish().unwrap())
+        let (data, index) = writer.finish().unwrap();
+        (bytes::Bytes::from(data), index.map(bytes::Bytes::from))
     }
 
     fn tagged_numeric(field: &str, canonical: &str) -> VixQuery {
@@ -6037,9 +12226,9 @@ mod tests {
             ],
         );
         {
-            let old_reader = VixReader::open(old_file.clone()).unwrap();
+            let old_reader = open_pair(&old_file);
             assert!(!old_reader.has_term_capability("code"));
-            let new_reader = VixReader::open(new_file.clone()).unwrap();
+            let new_reader = open_pair(&new_file);
             assert!(new_reader.has_term_capability("code"));
         }
 
@@ -6050,11 +12239,18 @@ mod tests {
         ];
 
         // FAST-path merge: capability intersection demotes `code`
-        let merged = merge_core_files(&as_inputs(&inputs), &latest_schema, &[], &[], &[]).unwrap();
+        let merged = merge_core_files(
+            StreamType::Logs,
+            &as_inputs(&inputs),
+            &latest_schema,
+            &[],
+            &[],
+        )
+        .unwrap();
         assert!(merged.used_index_merge, "old+new must keep the fast path");
         assert_eq!((merged.stats.min_ts, merged.stats.max_ts), (70, 100));
         let reader =
-            VixReader::open(bytes::Bytes::from(merged.output.to_bytes().unwrap())).unwrap();
+            open_merged(&merged);
         assert!(
             !reader.has_term_capability("code"),
             "a term claim would silently miss the old input's rows"
@@ -6065,9 +12261,17 @@ mod tests {
         // the string field keeps full capability
         assert!(reader.has_term_capability("svc"));
         assert_eq!(matching_docs(&reader, &exact("svc", "api")), vec![0, 2]);
-        // FILTER-BACK ground truth: the scan-identical extraction over the
-        // merged `_source` sees every code value (old rows included) — the
-        // results a query gets through the skip + filter-back path
+        // v2 union semantics on the merged DOCS COLUMN: the old input never
+        // stored `code` as a column, so its rows read NULL (never derived) —
+        // while `_source` retains every value (the scan-extraction twin
+        // proves it), so star reads and json_get fallbacks stay whole.
+        // (Pre-v2-shaped inputs like old.vix are fabrications: production
+        // v2 writers materialize every present field as a column.)
+        assert_eq!(
+            as_int64_array(&reader.read_docs_column("code").unwrap()).unwrap(),
+            Int64Array::from(vec![None, None, Some(38i64), Some(9)]),
+            "old rows null-fill; new rows carry values"
+        );
         let source = reader.read_source(&[0, 1, 2, 3]).unwrap();
         let derived = derive_cs_column_from_source(&source, "code", &DataType::Int64).unwrap();
         let derived = derived
@@ -6079,41 +12283,70 @@ mod tests {
             .filter(|&row| derived.is_valid(row) && derived.value(row) == 38)
             .map(|row| row as u32)
             .collect();
-        assert_eq!(matches_38, vec![0, 2], "rows ts=100 (old) and ts=80 (new)");
+        assert_eq!(
+            matches_38,
+            vec![0, 2],
+            "_source keeps rows ts=100 (old) and ts=80 (new)"
+        );
 
-        // REBUILD of the same inputs: terms re-derived from `_source`
-        // (registry-driven plan enrichment gives `code` a field id even when
-        // NO input value-indexed it), converging old files to full capability
-        for inputs in [
-            inputs.clone(),
-            vec![
-                ("old.vix".to_string(), old_file.clone()),
-                ("old2.vix".to_string(), old_file.clone()),
-            ],
-        ] {
-            let rebuilt =
-                merge_core_files_rebuild(&as_inputs(&inputs), &latest_schema, &[], &[], &[])
-                    .unwrap();
-            assert!(!rebuilt.used_index_merge);
-            let reader =
-                VixReader::open(bytes::Bytes::from(rebuilt.output.to_bytes().unwrap())).unwrap();
-            assert!(reader.has_term_capability("code"));
-            let hits = matching_docs(&reader, &tagged_numeric("code", "38"));
-            assert!(!hits.is_empty(), "rebuild must index old numeric rows");
-        }
+        // REBUILD of old+new: `code` is in the plan (the union carries the
+        // NEW input's column), so terms re-derive from `_source` — old
+        // rows' values included — converging to full capability
+        let rebuilt = merge_core_files_rebuild(
+            StreamType::Logs,
+            &as_inputs(&inputs),
+            &latest_schema,
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert!(!rebuilt.used_index_merge);
+        let reader =
+            open_merged(&rebuilt);
+        assert!(reader.has_term_capability("code"));
+        let hits = matching_docs(&reader, &tagged_numeric("code", "38"));
+        assert_eq!(hits, vec![0, 2], "rebuild must index old numeric rows");
 
-        // ... while the old+old FAST path demotes (no capable input at all)
+        // ... while old+old (NO input carries a `code` column) stays
+        // uncapable on BOTH strategies: v2 plans are the union of the
+        // inputs' PRESENT columns, never the registry — a value living only
+        // in `_source` of a pre-v2-shaped file is unreachable by plan
+        // (production v2 writers cannot produce such files)
         let both_old = vec![
             ("old.vix".to_string(), old_file.clone()),
             ("old2.vix".to_string(), old_file),
         ];
-        let merged =
-            merge_core_files(&as_inputs(&both_old), &latest_schema, &[], &[], &[]).unwrap();
-        assert!(merged.used_index_merge);
-        let reader =
-            VixReader::open(bytes::Bytes::from(merged.output.to_bytes().unwrap())).unwrap();
-        assert!(!reader.has_term_capability("code"));
-        assert!(reader.has_term_capability("svc"));
+        for (context, result) in [
+            (
+                "fast",
+                merge_core_files(
+                    StreamType::Logs,
+                    &as_inputs(&both_old),
+                    &latest_schema,
+                    &[],
+                    &[],
+                )
+                .unwrap(),
+            ),
+            (
+                "rebuild",
+                merge_core_files_rebuild(
+                    StreamType::Logs,
+                    &as_inputs(&both_old),
+                    &latest_schema,
+                    &[],
+                    &[],
+                )
+                .unwrap(),
+            ),
+        ] {
+            let reader = open_merged(&result);
+            assert!(
+                !reader.has_term_capability("code"),
+                "{context}: no input column, no plan entry, no capability"
+            );
+            assert!(reader.has_term_capability("svc"), "{context}");
+        }
     }
 
     /// Mixed-type parity (task-critical): for one field holding numbers AND
@@ -6144,12 +12377,15 @@ mod tests {
             r#"{"_timestamp":94}"#,
         ]);
         let timestamps = Int64Array::from(vec![100, 99, 98, 97, 96, 95, 94]);
-        let mut writer =
-            VixWriter::new(&schema, core_writer_options(&[], vec![], Vec::new()), false);
+        let mut writer = VixWriter::new(
+            &schema,
+            core_writer_options(&[], Vec::new(), true),
+            false,
+        );
         writer
             .push_docs_rows(&timestamps, &[], &sources, None)
             .unwrap();
-        let reader = VixReader::open(bytes::Bytes::from(writer.finish().unwrap())).unwrap();
+        let reader = { let (data, index) = writer.finish().unwrap(); VixReader::open_with_index(bytes::Bytes::from(data), index.map(bytes::Bytes::from)).unwrap() };
 
         let tokenize = |_: &str| Vec::<String>::new();
         let index_rows = |condition: &Condition| -> Vec<u32> {
@@ -6225,5 +12461,436 @@ mod tests {
             )),
             truth
         );
+    }
+
+    // ---------- #40: index-off (column-store-only) merges + classify ----------
+
+    /// The default config puts EXACTLY metrics on the index-off list — the
+    /// tests below pivot on StreamType::Metrics (index-off plan) vs
+    /// StreamType::Logs (indexed plan) resolving through the real policy.
+    fn assert_default_index_policy() {
+        assert!(
+            config::is_vix_index_disabled(StreamType::Metrics),
+            "test premise: metrics defaults to index-off"
+        );
+        assert!(
+            !config::is_vix_index_disabled(StreamType::Logs),
+            "test premise: logs defaults to indexed"
+        );
+    }
+
+    /// Build one synthetic COLUMN-STORE-ONLY core file (#40) the way the
+    /// index-off move job does: no term index, EVERY schema field a docs
+    /// column.
+    fn build_index_off_core_file(fields: Vec<Field>, columns: Vec<ArrayRef>) -> BuiltPair {
+        let schema = Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+        let source = synthesize_source(&batch).unwrap();
+        let mut writer = VixWriter::new(
+            &schema,
+            core_writer_options(&[], Vec::new(), false),
+            false,
+        );
+        writer
+            .push_batch_with_source(&batch, &source, None)
+            .unwrap();
+        let (data, index) = writer.finish().unwrap();
+        (bytes::Bytes::from(data), index.map(bytes::Bytes::from))
+    }
+
+    fn index_off_fields() -> Vec<Field> {
+        vec![
+            Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+            Field::new("svc", DataType::Utf8, true),
+            Field::new("code", DataType::Int64, true),
+        ]
+    }
+
+    fn index_off_columns(ts: Vec<i64>, svc: Vec<&str>, code: Vec<i64>) -> Vec<ArrayRef> {
+        vec![
+            Arc::new(Int64Array::from(ts)),
+            Arc::new(StringArray::from(svc)),
+            Arc::new(Int64Array::from(code)),
+        ]
+    }
+
+    /// (#40 a) index-off x index-off merge: the output stays column-store
+    /// only — no dictionary was ever touched (`used_index_merge` false), the
+    /// row count is the inputs' sum, order stays global DESC, every docs
+    /// column survives, and the merged file classifies Current under the
+    /// index-off plan (healing converges, never loops). Covers BOTH docs
+    /// strategies: the disjoint concat fast path and the windowed
+    /// interleave.
+    #[tokio::test]
+    async fn index_off_merge_stays_column_store_only() {
+        assert_default_index_policy();
+        let latest_schema = Schema::new(index_off_fields());
+        let disjoint = vec![
+            (
+                "a.vix".to_string(),
+                build_index_off_core_file(
+                    index_off_fields(),
+                    index_off_columns(vec![400, 300], vec!["api", "db"], vec![1, 2]),
+                ),
+            ),
+            (
+                "b.vix".to_string(),
+                build_index_off_core_file(
+                    index_off_fields(),
+                    index_off_columns(vec![200, 100], vec!["api", "web"], vec![3, 4]),
+                ),
+            ),
+        ];
+
+        let merged = merge_core_files(
+            StreamType::Metrics,
+            &as_inputs(&disjoint),
+            &latest_schema,
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert!(
+            !merged.used_index_merge,
+            "an index-off plan never merges a dictionary"
+        );
+        assert_eq!(merged.stats.row_count, 4, "row counts sum");
+        assert_eq!(merged.stats.index_size, 0, "no index bytes");
+        assert_eq!(merged.dropped_rows, 0);
+        let merged_bytes = bytes::Bytes::from(merged.output.to_bytes().unwrap());
+        let reader = VixReader::open(merged_bytes.clone()).unwrap();
+        assert!(!reader.has_index(), "output must stay index=none");
+        assert_eq!(reader.term_count(), 0);
+        assert_eq!(reader.row_count(), 4);
+        assert_eq!(
+            read_i64(&reader, TIMESTAMP_COL_NAME),
+            vec![400, 300, 200, 100]
+        );
+        assert_eq!(
+            read_strings(&reader, "svc"),
+            vec![
+                Some("api".to_string()),
+                Some("db".to_string()),
+                Some("api".to_string()),
+                Some("web".to_string())
+            ]
+        );
+        // the non-configured `code` column survives too: with no term index
+        // the docs column is the only per-field read path (#40 widening)
+        assert_eq!(read_i64(&reader, "code"), vec![1, 2, 3, 4]);
+        // condition-free eval works; term evals error (scan-branch route)
+        assert_eq!(reader.count(&VixQuery::All).unwrap(), 4);
+        assert!(reader.eval(&exact("svc", "api")).is_err());
+
+        // convergence: the merged output is Current under the same plan
+        assert!(
+            matches!(
+                classify_core_file(
+                    StreamType::Metrics,
+                    "merged.vix",
+                    vortex_index::BytesRangeSource::new("merged.vix", merged_bytes),
+                    None,
+                    &latest_schema,
+                    &[],
+                    &[],
+                )
+                .unwrap(),
+                CoreFileStatus::Current
+            ),
+            "an index-off merge output must classify Current under the index-off plan"
+        );
+
+        // overlapping inputs: the default CONCATENATES (passthrough-native,
+        // index-off included) — runs in min-ts-DESC input order, stamped
+        // concat
+        let overlapping = vec![
+            disjoint[0].clone(),
+            disjoint[1].clone(),
+            (
+                "c.vix".to_string(),
+                build_index_off_core_file(
+                    index_off_fields(),
+                    index_off_columns(vec![350, 150], vec!["db", "api"], vec![5, 6]),
+                ),
+            ),
+        ];
+        let merged = merge_core_files(
+            StreamType::Metrics,
+            &as_inputs(&overlapping),
+            &latest_schema,
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert!(!merged.used_index_merge);
+        assert!(merged.concat_order, "overlap concatenates by default");
+        assert_eq!(merged.stats.row_count, 6);
+        let reader =
+            open_merged(&merged);
+        assert!(!reader.has_index());
+        assert_eq!(reader.row_order(), RowOrder::Concat);
+        assert_eq!(
+            read_i64(&reader, TIMESTAMP_COL_NAME),
+            vec![400, 300, 350, 150, 200, 100],
+            "concat order: inputs by min_ts DESC (a: min 300, c: min 150, b: min 100)"
+        );
+        assert_eq!(read_i64(&reader, "code"), vec![1, 2, 5, 6, 3, 4]);
+
+        // ... and the force_decode interleave keeps the sorted shape
+        let sorted = merge_core_files_with_caps(
+            StreamType::Metrics,
+            &as_inputs(&overlapping),
+            &latest_schema,
+            &[],
+            &[],
+            BatchCaps {
+                force_decode: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!sorted.concat_order);
+        let sorted_reader = open_merged(&sorted);
+        assert_eq!(
+            read_i64(&sorted_reader, TIMESTAMP_COL_NAME),
+            vec![400, 350, 300, 200, 150, 100]
+        );
+        assert_eq!(read_i64(&sorted_reader, "code"), vec![1, 5, 2, 3, 6, 4]);
+    }
+
+    /// (#40 b) MIXED inputs under the index-off plan: an INDEXED input
+    /// carrying a `label` column (v2 all-columns: every present field is
+    /// one) merged with an index-off input that never saw the field — the
+    /// union output keeps the label column, the labelless input's rows
+    /// null-fill, and the output itself is column-store only.
+    #[tokio::test]
+    async fn index_off_merge_materializes_label_from_indexed_input() {
+        assert_default_index_policy();
+        let indexed_fields = vec![
+            Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+            Field::new("svc", DataType::Utf8, true),
+            Field::new("label", DataType::Utf8, true),
+        ];
+        let indexed = build_core_file(
+            indexed_fields,
+            vec![
+                Arc::new(Int64Array::from(vec![400, 300])),
+                Arc::new(StringArray::from(vec![Some("api"), Some("db")])),
+                Arc::new(StringArray::from(vec![Some("us"), None])),
+            ],
+            &[],
+            None,
+        );
+        let index_off = build_index_off_core_file(
+            vec![
+                Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+                Field::new("svc", DataType::Utf8, true),
+            ],
+            vec![
+                Arc::new(Int64Array::from(vec![200, 100])),
+                Arc::new(StringArray::from(vec![Some("api"), Some("web")])),
+            ],
+        );
+        let inputs = vec![
+            ("indexed.vix".to_string(), indexed),
+            ("off.vix".to_string(), index_off),
+        ];
+        let latest_schema = Schema::new(vec![
+            Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+            Field::new("svc", DataType::Utf8, true),
+            Field::new("label", DataType::Utf8, true),
+        ]);
+
+        let merged = merge_core_files(
+            StreamType::Metrics,
+            &as_inputs(&inputs),
+            &latest_schema,
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert!(!merged.used_index_merge);
+        assert_eq!(merged.stats.row_count, 4);
+        let reader =
+            open_merged(&merged);
+        assert!(!reader.has_index(), "index-off plan output is index=none");
+        assert_eq!(
+            read_i64(&reader, TIMESTAMP_COL_NAME),
+            vec![400, 300, 200, 100]
+        );
+        assert!(
+            reader.has_column_store_field("label"),
+            "the label the indexed input carried only in _source must \
+             materialize as a docs column"
+        );
+        assert_eq!(
+            read_strings(&reader, "label"),
+            vec![Some("us".to_string()), None, None, None],
+            "derived from the indexed input's _source; null where no input \
+             carried it"
+        );
+        assert_eq!(
+            read_strings(&reader, "svc"),
+            vec![
+                Some("api".to_string()),
+                Some("db".to_string()),
+                Some("api".to_string()),
+                Some("web".to_string())
+            ]
+        );
+    }
+
+    /// (#40 c, the rollback direction) MIXED inputs under an INDEXED plan:
+    /// the fast path must fall back (an index-off input cannot join a
+    /// dictionary merge), and the rebuild re-derives EVERY term from
+    /// `_source` — the output is fully indexed and term queries find rows
+    /// from BOTH inputs.
+    #[tokio::test]
+    async fn rollback_mixed_inputs_rebuild_to_indexed() {
+        assert_default_index_policy();
+        let latest_schema = Schema::new(index_off_fields());
+        let inputs = vec![
+            (
+                "indexed.vix".to_string(),
+                build_core_file(
+                    index_off_fields(),
+                    index_off_columns(vec![400, 300], vec!["api", "db"], vec![1, 2]),
+                    &[],
+                    None,
+                ),
+            ),
+            (
+                "off.vix".to_string(),
+                build_index_off_core_file(
+                    index_off_fields(),
+                    index_off_columns(vec![200, 100], vec!["api", "web"], vec![3, 4]),
+                ),
+            ),
+        ];
+
+        let merged = merge_core_files(
+            StreamType::Logs,
+            &as_inputs(&inputs),
+            &latest_schema,
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert!(
+            !merged.used_index_merge,
+            "the index-off input must force the rebuild fallback"
+        );
+        assert_eq!(merged.stats.row_count, 4);
+        let reader =
+            open_merged(&merged);
+        assert!(reader.has_index(), "the indexed plan re-indexes everything");
+        assert!(reader.term_count() > 0);
+        assert_eq!(
+            read_i64(&reader, TIMESTAMP_COL_NAME),
+            vec![400, 300, 200, 100]
+        );
+        // term queries span BOTH inputs (row 0 from the indexed input, row 2
+        // from the index-off input)
+        assert_eq!(matching_docs(&reader, &exact("svc", "api")), vec![0, 2]);
+        assert_eq!(matching_docs(&reader, &exact("svc", "web")), vec![3]);
+        assert_eq!(
+            matching_docs(&reader, &key_exists("code")),
+            vec![0, 1, 2, 3]
+        );
+    }
+
+    /// (#40 d) classify_core_file index-mode matrix: both drift directions
+    /// classify NeedsRebuild, aligned modes classify Current, and ONE
+    /// healing rebuild converges each drift direction to Current under its
+    /// plan.
+    #[test]
+    fn classify_core_file_index_mode_matrix() {
+        assert_default_index_policy();
+        let latest_schema = Schema::new(index_off_fields());
+        let indexed = build_core_file(
+            index_off_fields(),
+            index_off_columns(vec![400, 300], vec!["api", "db"], vec![1, 2]),
+            &[],
+            None,
+        );
+        let index_off = build_index_off_core_file(
+            index_off_fields(),
+            index_off_columns(vec![200, 100], vec!["api", "web"], vec![3, 4]),
+        );
+
+        let classify = |stream_type: StreamType, pair: &BuiltPair| {
+            classify_core_file(
+                stream_type,
+                "probe.vix",
+                vortex_index::BytesRangeSource::new("probe.vix", pair.0.clone()),
+                pair.1.as_ref().map(|index| {
+                    vortex_index::BytesRangeSource::new("probe.vxi", index.clone())
+                }),
+                &latest_schema,
+                &[],
+                &[],
+            )
+        };
+
+        // aligned modes: the no-op verdicts
+        assert!(
+            matches!(
+                classify(StreamType::Logs, &indexed),
+                Ok(CoreFileStatus::Current)
+            ),
+            "indexed file under the indexed plan"
+        );
+        assert!(
+            matches!(
+                classify(StreamType::Metrics, &index_off),
+                Ok(CoreFileStatus::Current)
+            ),
+            "index-off file under the index-off plan"
+        );
+
+        // drift: indexed file, index-off policy
+        assert_needs_rebuild(
+            &classify(StreamType::Metrics, &indexed),
+            &["index-off"],
+            "indexed file under the index-off plan",
+        );
+        // drift (rollback): index-off file, indexed policy
+        assert_needs_rebuild(
+            &classify(StreamType::Logs, &index_off),
+            &["no index sidecar"],
+            "index-off file under the indexed plan",
+        );
+
+        // convergence: one single-input healing rebuild per direction
+        for (stream_type, data, context) in [
+            (StreamType::Metrics, &indexed, "indexed -> index-off"),
+            (StreamType::Logs, &index_off, "index-off -> indexed"),
+        ] {
+            let healed = merge_core_files_rebuild(
+                stream_type,
+                &as_inputs(&[("single.vix".to_string(), data.clone())]),
+                &latest_schema,
+                &[],
+                &[],
+            )
+            .unwrap();
+            let healed_bytes: BuiltPair = (
+                bytes::Bytes::from(healed.output.to_bytes().unwrap()),
+                healed.index.clone().map(bytes::Bytes::from),
+            );
+            let healed_reader = open_pair(&healed_bytes);
+            assert_eq!(
+                healed_reader.has_index(),
+                stream_type == StreamType::Logs,
+                "{context}: the healed output's mode follows the plan"
+            );
+            assert!(
+                matches!(
+                    classify(stream_type, &healed_bytes),
+                    Ok(CoreFileStatus::Current)
+                ),
+                "{context}: the healed output must classify Current"
+            );
+        }
     }
 }

@@ -61,9 +61,16 @@ fn ingest_response(v: IngestionResponse) -> Response {
 /// retryable 503: answering 400 told the RUM SDK the batch was malformed and
 /// it dropped the data permanently. Everything else stays a 400.
 fn ingest_error_response(e: infra::errors::Error) -> Response {
-    // we do not want to log trial period expired errors
-    if !matches!(e, infra::errors::Error::TrialPeriodExpired) {
-        log::error!("Error processing RUM request: {e}");
+    match &e {
+        // we do not want to log trial period expired errors
+        infra::errors::Error::TrialPeriodExpired => {}
+        // resource backpressure arrives in storms: counts at info in windows
+        // (note_rejection), per-request detail at debug — never ERROR spam
+        infra::errors::Error::ResourceError(_) => {
+            ingester::admission::note_rejection(ingester::admission::REJECT_RESOURCE);
+            log::debug!("Error processing RUM request: {e}");
+        }
+        _ => log::error!("Error processing RUM request: {e}"),
     }
     if matches!(e, infra::errors::Error::ResourceError(_)) {
         (

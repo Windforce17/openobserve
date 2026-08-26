@@ -204,7 +204,7 @@ pub async fn search(trace_id: &str, sql: Arc<Sql>, mut req: Request) -> Result<S
         .with_label_values(&[&req.org_id])
         .inc();
 
-    let _lock = crate::service::search::work_group::acquire_work_group_lock(
+    let _lock = match crate::service::search::work_group::acquire_work_group_lock(
         trace_id,
         &req,
         &mut took_watch,
@@ -212,7 +212,20 @@ pub async fn search(trace_id: &str, sql: Arc<Sql>, mut req: Request) -> Result<S
         &nodes,
         &file_id_list_vec,
     )
-    .await?;
+    .await
+    {
+        Ok(lock) => lock,
+        Err(e) => {
+            // OSS admission rejection (429) returns without touching the
+            // pending gauge; balance the increment above here. Enterprise
+            // rejection paths decrement it internally already.
+            #[cfg(not(feature = "enterprise"))]
+            metrics::QUERY_PENDING_NUMS
+                .with_label_values(&[&req.org_id])
+                .dec();
+            return Err(e);
+        }
+    };
     let mut _took_wait = _lock.took_wait;
 
     let work_group_str = _lock.work_group_str.clone();
@@ -250,6 +263,9 @@ pub async fn search(trace_id: &str, sql: Arc<Sql>, mut req: Request) -> Result<S
     metrics::QUERY_PENDING_NUMS
         .with_label_values(&[&sql.org_id])
         .dec();
+    // OSS: the running gauge is owned by the AdmissionGuard (inc on admit,
+    // dec on drop — leak-proof across error/timeout/disconnect exits)
+    #[cfg(feature = "enterprise")]
     metrics::QUERY_RUNNING_NUMS
         .with_label_values(&[&sql.org_id])
         .inc();
@@ -295,6 +311,11 @@ pub async fn search(trace_id: &str, sql: Arc<Sql>, mut req: Request) -> Result<S
             )),
         ));
     }
+    // OSS: register with the abort registry so the query_manager cancel API
+    // and the client-disconnect stream guard can stop this query. The RAII
+    // registration deregisters on every exit path.
+    #[cfg(not(feature = "enterprise"))]
+    let (_abort_registration, abort_receiver) = crate::service::search::cancel::register(trace_id);
 
     let trace_stream_name = json::to_string(
         &sql.stream_names
@@ -311,16 +332,22 @@ pub async fn search(trace_id: &str, sql: Arc<Sql>, mut req: Request) -> Result<S
     );
 
     let trace_id_move = trace_id.to_string();
-    let query_task = DATAFUSION_RUNTIME.spawn(async move {
-        run_datafusion(trace_id_move, req, sql, nodes, partitioned_file_lists)
-            .instrument(datafusion_span)
-            .await
-    });
-    tokio::pin!(query_task);
+    // Abort-on-drop: if THIS future is dropped (client disconnect or
+    // cancel propagated from the handler), the datafusion task aborts,
+    // its follower flight streams drop, and the followers cancel — a
+    // bare JoinHandle would detach and burn the whole query to completion.
+    let mut query_task = crate::service::search::utils::AbortOnDrop::new(
+        DATAFUSION_RUNTIME.spawn(async move {
+            run_datafusion(trace_id_move, req, sql, nodes, partitioned_file_lists)
+                .instrument(datafusion_span)
+                .await
+        }),
+        trace_id.to_string(),
+    );
 
     // 8. execute physical plan
     let task = tokio::select! {
-        ret = &mut query_task => {
+        ret = query_task.join() => {
             match ret {
                 Ok(ret) => Ok(ret),
                 Err(err) => {
@@ -335,10 +362,14 @@ pub async fn search(trace_id: &str, sql: Arc<Sql>, mut req: Request) -> Result<S
             Err(Error::ErrorCode(ErrorCodes::SearchTimeout("flight->search: search timeout".to_string())))
         },
         _ = async {
-            #[cfg(feature = "enterprise")]
-            let _ = abort_receiver.await;
-            #[cfg(not(feature = "enterprise"))]
-            futures::future::pending::<()>().await;
+            // fires on explicit cancel (query_manager API) or when the
+            // client-disconnect stream guard cancels by trace_id; on OSS a
+            // dropped registration resolves as Err, which must NOT cancel —
+            // hold forever instead (the other arms decide then)
+            match abort_receiver.await {
+                Ok(_) => {}
+                Err(_) => futures::future::pending::<()>().await,
+            }
         } => {
             query_task.abort();
             log::info!("[trace_id {trace_id}] flight->search: search canceled");

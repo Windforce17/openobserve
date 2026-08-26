@@ -462,19 +462,43 @@ where
             match file_list::contains(key).await {
                 // registered: the normal file lifecycle owns it — NEVER delete
                 Ok(true) => {}
-                Ok(false) => match delete_object(key.clone()).await {
-                    Ok(()) => stats.l0_orphans_deleted += 1,
-                    // never uploaded (crash before this key's PUT) or already
-                    // collected — both converged states
-                    Err(object_store::Error::NotFound { .. }) => {}
-                    Err(e) => {
-                        row_failed = true;
-                        stats.failures += 1;
-                        log::error!(
-                            "[SEGMENT:GC] L0 orphan delete failed: row id={id} key={key} error={e}"
-                        );
+                Ok(false) => {
+                    let mut key_failed = false;
+                    match delete_object(key.clone()).await {
+                        Ok(()) => stats.l0_orphans_deleted += 1,
+                        // never uploaded (crash before this key's PUT) or
+                        // already collected — both converged states
+                        Err(object_store::Error::NotFound { .. }) => {}
+                        Err(e) => {
+                            key_failed = true;
+                            stats.failures += 1;
+                            log::error!(
+                                "[SEGMENT:GC] L0 orphan delete failed: row id={id} key={key} error={e}"
+                            );
+                        }
                     }
-                },
+                    // v3 split: an orphan `.vix` may have uploaded its
+                    // `.vxi` sidecar before the crash (data first, sidecar
+                    // second) — attempt the derived key too, NotFound
+                    // tolerated. Liveness was decided on the DATA key
+                    // (sidecars have no file_list row of their own). Skipped
+                    // when this key's data delete failed (the retry pass
+                    // covers both).
+                    if !key_failed && let Some(sidecar) = config::vix_sidecar_key(key) {
+                        match delete_object(sidecar.clone()).await {
+                            Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+                            Err(e) => {
+                                key_failed = true;
+                                stats.failures += 1;
+                                log::error!(
+                                    "[SEGMENT:GC] L0 orphan sidecar delete failed: row id={id} \
+                                     key={sidecar} error={e}"
+                                );
+                            }
+                        }
+                    }
+                    row_failed |= key_failed;
+                }
                 Err(e) => {
                     // fail CLOSED: without a trustworthy existence answer the
                     // key might be registered, so it must not be deleted
@@ -1151,11 +1175,13 @@ mod tests {
         assert_eq!(stats, GcStats::default(), "armed row must age out first");
         assert_eq!(deletes.load(Ordering::SeqCst), 0);
 
-        // once dead again, the retry collects the key and clears the plan
+        // once dead again, the retry collects the key and clears the plan.
+        // v3 split: collecting a `.vix` orphan also attempts its derived
+        // `.vxi` sidecar key — two delete calls, one counted orphan.
         force_row_age(id, 7200).await;
         let stats = gc_l0_pass(360, GC_L0_ROW_BATCH, &counting).await.unwrap();
         assert_eq!(stats.l0_orphans_deleted, 1);
-        assert_eq!(deletes.load(Ordering::SeqCst), 1);
+        assert_eq!(deletes.load(Ordering::SeqCst), 2);
         assert_eq!(gc_row(id).await.2, "", "plan cleared after the retry");
     }
 

@@ -40,7 +40,7 @@ use datafusion::{
 };
 use hashbrown::HashSet;
 use infra::schema::{
-    SchemaCache, get_stream_setting_column_store_fields, get_stream_setting_fts_fields,
+    SchemaCache, get_stream_setting_fts_fields,
     unwrap_stream_settings,
 };
 #[cfg(feature = "enterprise")]
@@ -197,9 +197,10 @@ pub fn generate_physical_optimizer_rules(
     }
 
     // should after remote scan
-    // fast-path eligibility (DESIGN §15.6): the index-only aggregation fast
-    // paths may only touch non-`_timestamp` fields that are configured in the
-    // stream's `column_store_fields` setting — plus, for unfiltered
+    // fast-path eligibility: v2 all-present-columns (DESIGN §2) makes every
+    // schema field a docs column of the files that carry it, so the
+    // plan-level eligibility set is the schema's fields (per-file capability
+    // probes stay the correctness backstop) — plus, for unfiltered
     // single-field TopN/Distinct, any term-indexed string field (pilot fix
     // B: served from the term dictionary alone, per-file capability check
     // as backstop)
@@ -219,18 +220,22 @@ pub fn generate_physical_optimizer_rules(
     rules
 }
 
-/// Fast-path field eligibility set for a stream (DESIGN §15.6): the stream's
-/// configured `column_store_fields` (read from the schema `settings`
-/// metadata), filtered to fields present in the schema. Empty when the stream
-/// has no settings, which keeps the index-only fast paths that reference
-/// non-`_timestamp` fields disabled.
+/// Fast-path field eligibility set for a stream: EVERY schema field except
+/// the internal columns (v2 all-present-columns — a field a file carries is
+/// always a native docs column there; the per-file capability probes are
+/// the correctness backstop for files that lack the field).
 fn stream_column_store_fields(schema: &SchemaCache) -> HashSet<String> {
-    let Some(settings) = unwrap_stream_settings(schema.schema()) else {
-        return HashSet::new();
-    };
-    get_stream_setting_column_store_fields(&settings)
-        .into_iter()
-        .filter(|f| schema.contains_field(f))
+    schema
+        .schema()
+        .fields()
+        .iter()
+        .filter(|f| {
+            f.name() != config::TIMESTAMP_COL_NAME
+                && f.name() != config::ID_COL_NAME
+                && f.name() != ORIGINAL_DATA_COL_NAME
+                && f.name() != vortex_index::SOURCE_COL_NAME
+        })
+        .map(|f| f.name().clone())
         .collect()
 }
 
@@ -288,7 +293,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_stream_column_store_fields_reads_settings_metadata() {
+    fn test_stream_column_store_fields_is_the_schema_minus_internals() {
+        // v2 all-present-columns: every non-internal schema field is
+        // column-eligible — settings play no role (the retired
+        // `column_store_fields` key in metadata is ignored)
         let metadata = HashMap::from([(
             "settings".to_string(),
             r#"{"column_store_fields":["service","level"]}"#.to_string(),
@@ -301,20 +309,20 @@ mod tests {
         .with_metadata(metadata);
 
         let fields = stream_column_store_fields(&SchemaCache::new(schema));
+        assert_eq!(
+            fields,
+            HashSet::from(["service".to_string(), "log".to_string()])
+        );
 
-        // `level` is configured but absent from the schema, so it is filtered
-        // out; `log` is in the schema but not configured
-        assert_eq!(fields, HashSet::from(["service".to_string()]));
-    }
-
-    #[test]
-    fn test_stream_column_store_fields_without_settings_is_empty() {
+        // no settings at all: same rule
         let schema = Schema::new(vec![
             Field::new("_timestamp", DataType::Int64, false),
             Field::new("service", DataType::Utf8, false),
         ]);
-
-        assert!(stream_column_store_fields(&SchemaCache::new(schema)).is_empty());
+        assert_eq!(
+            stream_column_store_fields(&SchemaCache::new(schema)),
+            HashSet::from(["service".to_string()])
+        );
     }
 
     #[test]

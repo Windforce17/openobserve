@@ -28,9 +28,10 @@ pub enum VixError {
     /// The container or one of its blobs cannot be decoded.
     #[error("malformed .vix data: {0}")]
     Malformed(String),
-    /// The file's `version` property is not the one format version this
-    /// crate understands (`version = "2"`, the format's single
-    /// future-evolution discriminator).
+    /// The object's `version` property is not the one format version this
+    /// crate understands (`version = "3"`, the format's single
+    /// future-evolution discriminator), or the sidecar's `key_layout` is
+    /// foreign.
     #[error("unsupported .vix format: {0}")]
     UnsupportedFormat(String),
     /// A query referenced a field that is not term-indexed in this file.

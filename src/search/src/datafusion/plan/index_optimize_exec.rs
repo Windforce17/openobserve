@@ -198,10 +198,21 @@ fn adapt_index_result(
     // first level is for each record batch
     // second level is each array in record batch
     let array: Vec<Vec<Arc<dyn Array>>> = match idx_optimize_mode {
-        IndexOptimizeMode::SimpleCount => {
+        // M16: count(field) merges and adapts exactly like count(*) — one
+        // Int64 partial-count row
+        IndexOptimizeMode::SimpleCount | IndexOptimizeMode::SimpleCountField(_) => {
             vec![vec![Arc::new(Int64Array::from(vec![
                 result.num_rows() as i64
             ]))]]
+        }
+        IndexOptimizeMode::SimpleMinMax(..) => {
+            // one partial min/max row of the aggregate's own output type;
+            // NO rows when no value matched (the union's scan branch and
+            // the final aggregate handle emptiness)
+            match result.min_max() {
+                Some(value) => vec![create_min_max_arrow_array(schema, value)?],
+                None => vec![],
+            }
         }
         IndexOptimizeMode::SimpleHistogram(min_value, bucket_width, num_buckets, _ts_offset) => {
             vec![create_histogram_arrow_array(
@@ -357,6 +368,48 @@ fn create_histogram_arrow_array(
     };
 
     Ok(vec![timestamp_array, count_array])
+}
+
+/// M16: one partial min/max row typed by the schema's single field. Exact
+/// conversions only — a fold value the schema type cannot represent
+/// exactly errors loudly (never a silently rounded aggregate).
+fn create_min_max_arrow_array(
+    schema: &SchemaRef,
+    value: crate::vix::MinMaxValue,
+) -> Result<Vec<Arc<dyn arrow::array::Array>>, DataFusionError> {
+    use crate::vix::MinMaxValue;
+    if schema.fields().len() != 1 {
+        return Err(DataFusionError::Internal(format!(
+            "Expected schema with 1 field for MinMax, got {}",
+            schema.fields().len()
+        )));
+    }
+    let field = &schema.fields()[0];
+    let mismatch = |value: &MinMaxValue| {
+        DataFusionError::Internal(format!(
+            "MinMax value {value:?} does not fit the aggregate output type {:?}",
+            field.data_type()
+        ))
+    };
+    let array: Arc<dyn Array> = match (field.data_type(), &value) {
+        (arrow_schema::DataType::Int64, MinMaxValue::I64(v)) => {
+            Arc::new(Int64Array::from(vec![*v]))
+        }
+        (arrow_schema::DataType::Int64, MinMaxValue::U64(v)) => Arc::new(Int64Array::from(vec![
+            i64::try_from(*v).map_err(|_| mismatch(&value))?,
+        ])),
+        (arrow_schema::DataType::UInt64, MinMaxValue::U64(v)) => {
+            Arc::new(UInt64Array::from(vec![*v]))
+        }
+        (arrow_schema::DataType::UInt64, MinMaxValue::I64(v)) => Arc::new(UInt64Array::from(
+            vec![u64::try_from(*v).map_err(|_| mismatch(&value))?],
+        )),
+        (arrow_schema::DataType::Float64, MinMaxValue::F64(v)) => {
+            Arc::new(arrow::array::Float64Array::from(vec![*v]))
+        }
+        _ => return Err(mismatch(&value)),
+    };
+    Ok(vec![array])
 }
 
 /// Creates the multi-histogram arrays: timestamps, breakdown values and
@@ -764,6 +817,93 @@ mod tests {
             stats.num_rows,
             datafusion::common::stats::Precision::Absent
         ));
+    }
+
+    /// M16: count(field) adapts exactly like count(*) (one Int64 partial
+    /// row); min/max adapts one typed row — or NO rows when nothing matched
+    /// — and refuses lossy conversions.
+    #[test]
+    fn test_adapt_m16_modes() {
+        use crate::vix::MinMaxValue;
+
+        // count(field): same one-row Int64 shape as SimpleCount
+        let batches = adapt_index_result(
+            &count_schema(),
+            &IndexOptimizeMode::SimpleCountField("f".to_string()),
+            MultiResult::Count(42),
+        )
+        .unwrap();
+        assert_eq!(batches.len(), 1);
+        let count = batches[0].column(0);
+        assert_eq!(
+            count.as_any().downcast_ref::<Int64Array>().unwrap().value(0),
+            42
+        );
+
+        // min/max: one typed row
+        let i64_schema: SchemaRef = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("min(t.f)", DataType::Int64, true),
+        ]));
+        let batches = adapt_index_result(
+            &i64_schema,
+            &IndexOptimizeMode::SimpleMinMax("f".to_string(), false),
+            MultiResult::MinMax(Some(MinMaxValue::I64(-7))),
+        )
+        .unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            -7
+        );
+        let f64_schema: SchemaRef = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("max(t.f)", DataType::Float64, true),
+        ]));
+        let batches = adapt_index_result(
+            &f64_schema,
+            &IndexOptimizeMode::SimpleMinMax("f".to_string(), true),
+            MultiResult::MinMax(Some(MinMaxValue::F64(1.5))),
+        )
+        .unwrap();
+        assert_eq!(
+            batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(0),
+            1.5
+        );
+        // cross-family exact conversion: u64 that fits i64 adapts; one that
+        // does not errors loudly instead of rounding
+        assert!(
+            adapt_index_result(
+                &i64_schema,
+                &IndexOptimizeMode::SimpleMinMax("f".to_string(), false),
+                MultiResult::MinMax(Some(MinMaxValue::U64(9))),
+            )
+            .is_ok()
+        );
+        assert!(
+            adapt_index_result(
+                &i64_schema,
+                &IndexOptimizeMode::SimpleMinMax("f".to_string(), false),
+                MultiResult::MinMax(Some(MinMaxValue::U64(u64::MAX))),
+            )
+            .is_err()
+        );
+        // no matched value: no partial rows (the final aggregate emits NULL)
+        let batches = adapt_index_result(
+            &i64_schema,
+            &IndexOptimizeMode::SimpleMinMax("f".to_string(), false),
+            MultiResult::MinMax(None),
+        )
+        .unwrap();
+        assert!(batches.is_empty());
     }
 
     #[test]

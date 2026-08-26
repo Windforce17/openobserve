@@ -25,6 +25,16 @@ pub const MAX_SIMPLE_TOPN_FIELDS: usize = 4;
 pub enum IndexOptimizeMode {
     SimpleSelect(usize, bool),
     SimpleCount,
+    /// M16: `count(field)` — non-null count of one column (stats-answered
+    /// from per-chunk presence counts where they exist). LOCAL-only mode:
+    /// derived by the follower's own optimizer, never sent over the wire
+    /// (the proto oneof carries TopN/Distinct only).
+    SimpleCountField(String),
+    /// M16: `min(field)` / `max(field)` (`true` = max) over one NUMERIC
+    /// column (stats-answered from per-chunk exact min/max where they
+    /// exist; string columns are prefix-bounded and never eligible).
+    /// LOCAL-only mode, like [`Self::SimpleCountField`].
+    SimpleMinMax(String, bool),
     /// (min_value, bucket_width, num_buckets, ts_offset)
     SimpleHistogram(i64, u64, usize, i64),
     /// (min_value, max_value, bucket_width, ts_offset, breakdown_field)
@@ -40,6 +50,8 @@ impl IndexOptimizeMode {
             IndexOptimizeMode::SimpleTopN(fields, ..) => fields.clone(),
             IndexOptimizeMode::SimpleDistinct(field, ..) => vec![field.clone()],
             IndexOptimizeMode::SimpleMultiHistogram(.., field) => vec![field.clone()],
+            IndexOptimizeMode::SimpleCountField(field) => vec![field.clone()],
+            IndexOptimizeMode::SimpleMinMax(field, _) => vec![field.clone()],
             IndexOptimizeMode::SimpleSelect(..)
             | IndexOptimizeMode::SimpleCount
             | IndexOptimizeMode::SimpleHistogram(..) => vec![],
@@ -50,6 +62,8 @@ impl IndexOptimizeMode {
         match self {
             IndexOptimizeMode::SimpleSelect(limit, ascend) => format!("s(l:{limit},a:{ascend})"),
             IndexOptimizeMode::SimpleCount => "c".to_string(),
+            IndexOptimizeMode::SimpleCountField(field) => format!("cf(f:{field})"),
+            IndexOptimizeMode::SimpleMinMax(field, is_max) => format!("mm(f:{field},x:{is_max})"),
             IndexOptimizeMode::SimpleHistogram(min_value, bucket_width, num_buckets, ts_offset) => {
                 format!("h(m:{min_value},b:{bucket_width},n:{num_buckets},o:{ts_offset})")
             }
@@ -80,6 +94,14 @@ impl std::fmt::Display for IndexOptimizeMode {
                 write!(f, "select(limit: {limit}, ascend: {ascend})")
             }
             IndexOptimizeMode::SimpleCount => write!(f, "count"),
+            IndexOptimizeMode::SimpleCountField(field) => write!(f, "count(field: {field})"),
+            IndexOptimizeMode::SimpleMinMax(field, is_max) => {
+                write!(
+                    f,
+                    "{}(field: {field})",
+                    if *is_max { "max" } else { "min" }
+                )
+            }
             IndexOptimizeMode::SimpleHistogram(min_value, bucket_width, num_buckets, ts_offset) => {
                 write!(
                     f,

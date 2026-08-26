@@ -33,23 +33,25 @@ use config::{
     utils::{base64, json, schema::filter_source_by_partition_key, time::now_micros},
 };
 use hashbrown::HashMap;
-use infra::errors::{Error, ErrorCodes};
+use infra::{
+    client::grpc::make_grpc_search_client,
+    cluster::get_cached_online_query_nodes,
+    errors::{Error, ErrorCodes},
+};
 use opentelemetry::trace::TraceContextExt;
 use proto::cluster_rpc::SearchQuery;
 use sql::Sql;
-use tracing::Instrument;
+use tracing::{Instrument, info_span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 #[cfg(feature = "enterprise")]
 use {
     crate::service::search::partition::aggregate::prepare_streaming_aggregate,
     config::{META_ORG_ID, meta::self_reporting::usage::USAGE_STREAM},
-    infra::{client::grpc::make_grpc_search_client, cluster::get_cached_online_query_nodes},
     o2_enterprise::enterprise::{
         common::config::get_config as get_o2_config,
         search::{TaskStatus, datafusion::distributed_plan::streaming_aggs_exec},
     },
     std::collections::HashSet,
-    tracing::info_span,
 };
 
 use super::self_reporting::report_request_usage_stats;
@@ -65,6 +67,7 @@ use crate::{
 };
 
 pub mod cache;
+pub mod cancel;
 #[cfg(feature = "enterprise")]
 pub mod cardinality;
 pub mod cluster;
@@ -76,6 +79,7 @@ mod searcher;
 pub mod streaming;
 #[cfg(feature = "enterprise")]
 pub mod super_cluster;
+pub mod warmup;
 pub mod work_group;
 
 pub use ::search::{bloom_pruner, datafusion, index, inspector, sql, utils, vix};
@@ -193,11 +197,20 @@ pub async fn search(
     }
 
     let span = tracing::span::Span::current();
-    let handle = tokio::task::spawn(
-        async move { cluster::http::search(request, query, req_regions, req_clusters, true).await }
-            .instrument(span),
-    );
-    let res = match handle.await {
+    // Abort-on-drop: actix drops this handler future when the client
+    // disconnects or cancels; the guard aborts the spawned search instead
+    // of letting a detached JoinHandle run the query to completion.
+    let mut handle =
+        utils::AbortOnDrop::new(
+            tokio::task::spawn(
+                async move {
+                    cluster::http::search(request, query, req_regions, req_clusters, true).await
+                }
+                .instrument(span),
+            ),
+            trace_id.clone(),
+        );
+    let res = match handle.join().await {
         Ok(Ok(res)) => Ok(res),
         Ok(Err(e)) => Err(e),
         Err(e) => Err(Error::Message(e.to_string())),
@@ -809,7 +822,6 @@ pub async fn query_status() -> Result<search::QueryStatusResponse, Error> {
     Ok(search::QueryStatusResponse { status })
 }
 
-#[cfg(feature = "enterprise")]
 pub async fn cancel_query(
     _org_id: &str,
     trace_id: &str,

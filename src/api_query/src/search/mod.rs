@@ -237,7 +237,24 @@ pub async fn search(
     Headers(user_email): Headers<UserEmail>,
     headers: HeaderMap,
     Query(url_query): Query<HashMap<String, String>>,
-    Json(mut req): Json<Request>,
+    Json(req): Json<Request>,
+) -> Response {
+    // heartbeat wrapper (#36/.83): a oneshot client that disconnects
+    // mid-query must cancel it — see with_oneshot_heartbeat
+    let grace_secs = get_config().limit.query_http_heartbeat_secs;
+    utils::with_oneshot_heartbeat(
+        grace_secs,
+        search_inner(org_id, user_email, headers, url_query, req),
+    )
+    .await
+}
+
+async fn search_inner(
+    org_id: String,
+    user_email: UserEmail,
+    headers: HeaderMap,
+    url_query: HashMap<String, String>,
+    mut req: Request,
 ) -> Response {
     let start = std::time::Instant::now();
     let cfg = get_config();

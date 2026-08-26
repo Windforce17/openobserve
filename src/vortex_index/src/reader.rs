@@ -81,12 +81,14 @@ use tantivy_fst::{Automaton, Regex};
 
 use crate::{
     container::{
-        BlobHandle, DICT_LAYOUT_BLOCKS, FIELD_TYPE_CS, FIELD_TYPE_FTS, FIELD_TYPE_TERM, FieldEntry,
-        PROP_DICT_LAYOUT, PROP_FIELDS, PROP_PARTIAL_FIELDS, PROP_PLIST_MIN_DOCS, PROP_ROW_COUNT,
-        PROP_ROW_GROUP_SIZE, PROP_TERM_COUNT, PROP_TOKENIZER, PROP_ZONE_MAP, RowSelection,
-        VixContainer, ZoneEntry, blob_arrow_schema, column_binary, column_u32, column_u64,
-        parse_container, parse_container_ranged, require_supported_format, scan_blob,
-        scan_blob_dict_column, scan_blob_streaming,
+        BlobHandle, DICT_LAYOUT_BLOCKS, FIELD_TYPE_BLOOM, FIELD_TYPE_CS, FIELD_TYPE_FTS,
+        FIELD_TYPE_TERM, FieldEntry,
+        PROP_COLUMNS, PROP_DICT_LAYOUT, PROP_FIELDS, PROP_OVERSIZE_SKIPS, PROP_PARTIAL_FIELDS,
+        PROP_PLIST_MIN_DOCS, PROP_ROW_COUNT, PROP_ROW_GROUP_SIZE, PROP_ROW_ORDER, PROP_TERM_COUNT,
+        PROP_TOKENIZER, PROP_ZONE_MAP, RowOrder, RowSelection, VixContainer, ZoneEntry,
+        blob_arrow_schema, column_binary, column_u32, column_u64, parse_container,
+        parse_container_ranged, require_supported_data_format, require_supported_index_format,
+        scan_blob, scan_blob_dict_column, scan_blob_streaming,
     },
     error::{Result, VixError},
     numeric::is_numeric_value_token,
@@ -180,9 +182,12 @@ pub struct ZoneChunk {
     pub ts_max: i64,
 }
 
-/// Reader over one `.vix` core file — held fully in memory
-/// ([`VixReader::open`]) or fetched by ranges on demand
-/// ([`VixReader::open_ranged`]).
+/// Reader over one logical core file — the `.vix` DATA object plus its
+/// optional `.vxi` INDEX sidecar — held fully in memory
+/// ([`VixReader::open_with_index`]) or fetched by ranges on demand
+/// ([`VixReader::open_ranged_with_index`]). Opened without a sidecar the
+/// reader is docs-only: no term/bloom capability, "no usable index →
+/// filter-back scan" semantics.
 pub struct VixReader {
     row_count: u64,
     term_count: u64,
@@ -194,6 +199,17 @@ pub struct VixReader {
     /// per-field point seeks/ranges (field-major keys cluster by fid).
     indexed_field_ids: Vec<u16>,
     partial_fields: HashSet<String>,
+    /// Per-field oversize-skip allowance from the `oversize_skips` property
+    /// (empty for legacy files): the dictionary-serve reconciliation adds it
+    /// to the indexed sum, so files whose ONLY value shortfall is skipped
+    /// oversize values keep serving (counts omit those values — the
+    /// 2026-08-12 trade); any other shortfall still refuses.
+    oversize_skips: HashMap<String, u64>,
+    /// `false` = opened WITHOUT an index sidecar (#40/#42 index-off files
+    /// have none; a caller may also open data-only): the dictionary proves
+    /// nothing — `key_term_exists`' absence proof and every capability
+    /// derived from it are VOID for this reader.
+    index_enabled: bool,
     /// Fields fts-marked in THIS file (token-indexed): the taint domain for
     /// any-field token queries over `partial_fields`.
     fts_fields: HashSet<String>,
@@ -241,6 +257,21 @@ pub struct VixReader {
     /// Bytes of lazily loaded FST cells currently resident (grows
     /// monotonically; loaded cells stay for the reader's lifetime).
     dict_loaded_bytes: AtomicUsize,
+    /// Per-column present-row counts from the data object's `columns`
+    /// property (`None` count = unknown, an M1 plain-name entry).
+    column_presence: Vec<(String, Option<u64>)>,
+    /// The H2 per-column chunk-stats blob of the data object (absent on
+    /// pre-stats and empty files).
+    stats_blob: Option<BlobHandle>,
+    /// Lazily decoded per-column chunk stats (`stats` blob) for the M16
+    /// stats-answered aggregation arms; `None` inside = no blob or
+    /// undecodable (fail open to decode paths). One small fetch on ranged
+    /// readers (the blob sits in the eager tail), then resident.
+    decoded_stats: OnceLock<Option<crate::stats::FileColumnStats>>,
+    /// Approximate resident bytes of the decoded stats table (the encoded
+    /// blob length — same order as the parsed form), folded into
+    /// [`Self::memory_size`] so the reader cache accounts for it.
+    stats_loaded_bytes: AtomicUsize,
     /// Per-chunk `_timestamp` zone table of the `docs` blob (`zone_map`
     /// property), in scan-iteration order with derived row offsets. `None`
     /// when the file carries no zone table (written before it landed, or a
@@ -248,40 +279,83 @@ pub struct VixReader {
     /// then take the full-decode path. Loaded at open from the footer, so a
     /// fully-shortcuttable file answers a histogram/count with zero docs IO.
     zone_map: Option<Vec<ZoneChunk>>,
+    /// Physical row order of the `docs` blob (`row_order` property, #51c-c).
+    /// Missing == [`RowOrder::TsDesc`] (every historical file is sorted).
+    /// [`RowOrder::Concat`] disables the order-dependent fast paths for
+    /// this file (first-set-bits top-N candidates and everything the
+    /// callers derive from stored order).
+    row_order: RowOrder,
+    /// §4 REGION table of a concat file (`row_regions` property, validated):
+    /// per-region row counts in stored order, each region internally
+    /// `_timestamp` DESC. `None` on ts_desc files (whole file = one region)
+    /// and on concat files without a proven decomposition.
+    row_regions: Option<Vec<u64>>,
+    /// §4: the file asserts the all-present-columns invariant
+    /// (`columns_complete` property). `false` when absent (fail-open).
+    columns_complete: bool,
 }
 
 impl VixReader {
-    /// Open a `.vix` file from its complete bytes.
+    /// Open a core file from its complete DATA-object bytes, WITHOUT an
+    /// index sidecar: the reader carries no term/bloom capability — every
+    /// conditioned evaluation takes the "no usable index → filter-back
+    /// scan" path, exactly like an index-off file.
     pub fn open(data: Bytes) -> anyhow::Result<Self> {
-        Ok(Self::open_inner(data)?)
+        Self::open_with_index(data, None)
     }
 
-    /// Open a `.vix` file over a ranged source, fetching only what queries
-    /// touch: the puffin footer (one 64 KiB tail fetch, two for oversized
-    /// footers) and the small dictionary DIRECTORY eagerly; the per-row-group
-    /// `fst` cells and all `terms`/`docs` reads load lazily at chunk
-    /// granularity. Blocks on fetches — call from a blocking thread, never on
-    /// an async executor.
-    pub fn open_ranged(source: Arc<dyn VixRangeSource>) -> anyhow::Result<Self> {
-        let container = parse_container_ranged(&source)?;
-        Ok(Self::from_container(container, false)?)
-    }
-
-    fn open_inner(data: Bytes) -> Result<Self> {
+    /// Open a core file from its complete DATA-object bytes plus the
+    /// optional complete `.vxi` INDEX-sidecar bytes — the two-source
+    /// in-memory open. `index = None` ⟺ [`Self::open`].
+    pub fn open_with_index(data: Bytes, index: Option<Bytes>) -> anyhow::Result<Self> {
         let container = parse_container(&data)?;
-        Self::from_container(container, true)
+        let index_container = match &index {
+            Some(bytes) => Some(parse_container(bytes)?),
+            None => None,
+        };
+        Ok(Self::from_containers(container, index_container, true)?)
     }
 
-    fn from_container(container: VixContainer, eager_docs_schema: bool) -> Result<Self> {
+    /// Open a core file over a ranged DATA source WITHOUT a sidecar (see
+    /// [`Self::open`] for the semantics). Blocks on fetches — call from a
+    /// blocking thread, never on an async executor.
+    pub fn open_ranged(source: Arc<dyn VixRangeSource>) -> anyhow::Result<Self> {
+        Self::open_ranged_with_index(source, None)
+    }
+
+    /// Open a core file over a ranged DATA source plus an optional ranged
+    /// INDEX-sidecar source, fetching only what queries touch: each object's
+    /// puffin footer (one 64 KiB tail fetch, two for oversized footers) is
+    /// parsed at open; the small dictionary DIRECTORY, the per-row-group
+    /// `fst` cells and all `terms`/`docs`/`bloom` reads load lazily at chunk
+    /// granularity from their own source. Blocks on fetches — call from a
+    /// blocking thread, never on an async executor.
+    pub fn open_ranged_with_index(
+        source: Arc<dyn VixRangeSource>,
+        index: Option<Arc<dyn VixRangeSource>>,
+    ) -> anyhow::Result<Self> {
+        let container = parse_container_ranged(&source)?;
+        let index_container = match &index {
+            Some(source) => Some(parse_container_ranged(source)?),
+            None => None,
+        };
+        Ok(Self::from_containers(container, index_container, false)?)
+    }
+
+    fn from_containers(
+        container: VixContainer,
+        index_container: Option<VixContainer>,
+        eager_docs_schema: bool,
+    ) -> Result<Self> {
+        // DATA object: docs blob + data-descriptive properties.
         let properties = &container.properties;
-        require_supported_format(properties)?;
+        require_supported_data_format(properties)?;
         let row_count = u64_prop(properties, PROP_ROW_COUNT)?;
         if row_count > u64::from(u32::MAX) {
             return Err(VixError::Malformed(format!(
                 "row_count {row_count} exceeds the u32 doc-id space"
             )));
         }
-        let term_count = u64_prop(properties, PROP_TERM_COUNT)?;
         let row_group_size = match properties.get(PROP_ROW_GROUP_SIZE) {
             None => 0,
             Some(raw) => raw.parse().map_err(|_| {
@@ -290,10 +364,108 @@ impl VixReader {
                 ))
             })?,
         };
-        let fields: Vec<FieldEntry> =
-            serde_json::from_str(required_prop(properties, PROP_FIELDS)?)?;
-        let partial_fields: HashSet<String> =
-            serde_json::from_str(required_prop(properties, PROP_PARTIAL_FIELDS)?)?;
+        // Oversize-skip allowance: data-side since v3 (it records what the
+        // DATA holds that the term index does not, surviving sidecar-only
+        // rewrites); absent when nothing was skipped — an empty map changes
+        // nothing.
+        let oversize_skips: HashMap<String, u64> = match properties.get(PROP_OVERSIZE_SKIPS) {
+            Some(raw) => serde_json::from_str(raw).map_err(|e| {
+                VixError::Malformed(format!(
+                    "property {PROP_OVERSIZE_SKIPS:?} is not a field-count map: {e}"
+                ))
+            })?,
+            None => HashMap::new(),
+        };
+        let zone_map = parse_zone_map(properties.get(PROP_ZONE_MAP).map(String::as_str), row_count);
+        let row_order = RowOrder::from_property(properties.get(PROP_ROW_ORDER).map(String::as_str));
+        let row_regions = if row_order.is_ts_desc() {
+            None
+        } else {
+            crate::container::parse_row_regions(
+                properties.get(crate::container::PROP_ROW_REGIONS).map(String::as_str),
+                row_count,
+            )
+        };
+        let column_presence = properties
+            .get(PROP_COLUMNS)
+            .map(|raw| crate::stats::parse_columns_prop(raw))
+            .transpose()?
+            .unwrap_or_default();
+        let columns_complete = properties
+            .get(crate::container::PROP_COLUMNS_COMPLETE)
+            .is_some_and(|v| v == "true");
+        let stats_blob = container.stats;
+
+        // INDEX sidecar: term/bloom capability + index-descriptive
+        // properties. Its ABSENCE is the #40/#42 "no usable index" state:
+        // no term/fts/bloom capability, dictionary proofs void, column
+        // routing synthesized from the data object's `columns` list.
+        let index_enabled = index_container.is_some();
+        let (fields, partial_fields, term_count, tokenizer, plist_min_docs, index_container) =
+            match index_container {
+                Some(index) => {
+                    let index_props = &index.properties;
+                    require_supported_index_format(index_props)?;
+                    // Pairing guard: a sidecar carries the doc-id space of
+                    // exactly one data object — a mismatched pair would make
+                    // the postings misaddress the stored rows.
+                    let index_rows = u64_prop(index_props, PROP_ROW_COUNT)?;
+                    if index_rows != row_count {
+                        return Err(VixError::Malformed(format!(
+                            "index sidecar covers {index_rows} rows but the data object stores \
+                             {row_count} — mispaired objects"
+                        )));
+                    }
+                    let fields: Vec<FieldEntry> =
+                        serde_json::from_str(required_prop(index_props, PROP_FIELDS)?)?;
+                    let partial_fields: HashSet<String> =
+                        serde_json::from_str(required_prop(index_props, PROP_PARTIAL_FIELDS)?)?;
+                    let term_count = u64_prop(index_props, PROP_TERM_COUNT)?;
+                    let tokenizer = index_props.get(PROP_TOKENIZER).cloned();
+                    // Out-of-row postings capability: the property present ⇒
+                    // pointer cells may exist and `doc_count >=
+                    // plist_min_docs` selects them; absent ⇒ every cell is
+                    // inline. The blob itself may legitimately be absent even
+                    // with the property set (no term crossed the threshold),
+                    // so its existence is checked only when a pointer cell is
+                    // actually resolved.
+                    let plist_min_docs: u32 = match index_props.get(PROP_PLIST_MIN_DOCS) {
+                        None => 0,
+                        Some(raw) => raw.parse().map_err(|_| {
+                            VixError::Malformed(format!(
+                                "property {PROP_PLIST_MIN_DOCS:?} is not an integer: {raw:?}"
+                            ))
+                        })?,
+                    };
+                    (
+                        fields,
+                        partial_fields,
+                        term_count,
+                        tokenizer,
+                        plist_min_docs,
+                        Some(index),
+                    )
+                }
+                None => {
+                    // No sidecar: synthesize column-store-only field entries
+                    // from the data object's docs-column list, which is
+                    // exactly what an index-off file's `fields` property
+                    // carried before the split (no term/fts/bloom types, so
+                    // no capability is ever claimed). Entries are
+                    // `[name, present_rows]` pairs since the H2 stats
+                    // extension (plain names on M1 files).
+                    let columns =
+                        crate::stats::parse_columns_prop(required_prop(properties, PROP_COLUMNS)?)?;
+                    let fields = columns
+                        .into_iter()
+                        .map(|(name, _)| FieldEntry {
+                            name,
+                            types: vec![FIELD_TYPE_CS.to_string()],
+                        })
+                        .collect();
+                    (fields, HashSet::new(), 0, None, 0, None)
+                }
+            };
         // The file's fts-marked field set, resolved once: any-field token
         // queries consult it to decide whether a partial field can actually
         // hide tokens (readers are memoized, so this is per-open, not
@@ -303,22 +475,6 @@ impl VixReader {
             .filter(|entry| entry.has_type(FIELD_TYPE_FTS))
             .map(|entry| entry.name.clone())
             .collect();
-        let tokenizer = properties.get(PROP_TOKENIZER).cloned();
-        let zone_map = parse_zone_map(properties.get(PROP_ZONE_MAP).map(String::as_str), row_count);
-        // Out-of-row postings capability: the property present ⇒ pointer
-        // cells may exist and `doc_count >= plist_min_docs` selects them;
-        // absent ⇒ every cell is inline. The blob itself may legitimately
-        // be absent even with the property set (no term crossed the
-        // threshold), so its existence is checked only when a pointer cell
-        // is actually resolved.
-        let plist_min_docs: u32 = match properties.get(PROP_PLIST_MIN_DOCS) {
-            None => 0,
-            Some(raw) => raw.parse().map_err(|_| {
-                VixError::Malformed(format!(
-                    "property {PROP_PLIST_MIN_DOCS:?} is not an integer: {raw:?}"
-                ))
-            })?,
-        };
 
         // Entries typed `term` or `fts` own their positional field id
         // (their value terms / tokens carry it as the composite fid prefix).
@@ -350,38 +506,46 @@ impl VixReader {
         let mut approx_memory = 1024usize;
         let mut dict_blob = None;
         let mut dict_blocks_blob = None;
-        if term_count > 0 {
-            // The dictionary is the BLOCK layout — the only readable layout.
-            // Monolithic-FST files were retired without read support
-            // (ENGINE-BACKLOG #18): absent/foreign layouts hard-error here.
-            match properties.get(PROP_DICT_LAYOUT).map(String::as_str) {
-                Some(DICT_LAYOUT_BLOCKS) => {}
-                other => {
-                    return Err(VixError::Malformed(format!(
-                        "unsupported dict layout {other:?}: this reader only supports                          {DICT_LAYOUT_BLOCKS:?} (pre-block dictionaries were retired)",
-                    )));
+        let mut terms_blob = None;
+        let mut bloom_blob = None;
+        let mut plist_blob = None;
+        if let Some(index) = index_container {
+            if term_count > 0 {
+                // The dictionary is the BLOCK layout — the only readable
+                // layout. Monolithic-FST files were retired without read
+                // support (ENGINE-BACKLOG #18): absent/foreign layouts
+                // hard-error here.
+                match index.properties.get(PROP_DICT_LAYOUT).map(String::as_str) {
+                    Some(DICT_LAYOUT_BLOCKS) => {}
+                    other => {
+                        return Err(VixError::Malformed(format!(
+                            "unsupported dict layout {other:?}: this reader only supports \
+                             {DICT_LAYOUT_BLOCKS:?} (pre-block dictionaries were retired)",
+                        )));
+                    }
+                }
+                dict_blob = Some(
+                    index
+                        .dict
+                        .ok_or_else(|| VixError::Malformed("missing dict blob".to_string()))?,
+                );
+                dict_blocks_blob = Some(index.dict_blocks.ok_or_else(|| {
+                    VixError::Malformed("missing dict_blocks blob".to_string())
+                })?);
+                if index.terms.is_none() {
+                    return Err(VixError::Malformed("missing terms blob".to_string()));
                 }
             }
-            dict_blob = Some(
-                container
-                    .dict
-                    .ok_or_else(|| VixError::Malformed("missing dict blob".to_string()))?,
-            );
-            dict_blocks_blob = Some(
-                container
-                    .dict_blocks
-                    .ok_or_else(|| VixError::Malformed("missing dict_blocks blob".to_string()))?,
-            );
-            if container.terms.is_none() {
-                return Err(VixError::Malformed("missing terms blob".to_string()));
-            }
+            terms_blob = index.terms;
+            bloom_blob = index.bloom;
+            plist_blob = index.plist;
         }
         approx_memory += fields
             .iter()
             .map(|entry| entry.name.len() + 64)
             .sum::<usize>();
 
-        // Core files always carry a `docs` blob (it defines the stored
+        // Data objects always carry a `docs` blob (it defines the stored
         // schema even for zero-row files). In-memory readers load its schema
         // eagerly (zero IO); ranged readers defer it to the first docs
         // access so pure index queries never fetch docs bytes.
@@ -397,6 +561,8 @@ impl VixReader {
             term_field_ids,
             indexed_field_ids,
             partial_fields,
+            oversize_skips,
+            index_enabled,
             fts_fields,
             tokenizer,
             dict_index: OnceLock::new(),
@@ -406,15 +572,22 @@ impl VixReader {
                 std::collections::VecDeque::new(),
             )),
             dict_blob,
-            terms_blob: container.terms,
+            terms_blob,
             docs_blob,
-            bloom_blob: container.bloom,
-            plist_blob: container.plist,
+            bloom_blob,
+            plist_blob,
             plist_min_docs,
             docs_schema: OnceLock::new(),
             base_memory: approx_memory,
             dict_loaded_bytes: AtomicUsize::new(0),
+            column_presence,
+            stats_blob,
+            decoded_stats: OnceLock::new(),
+            stats_loaded_bytes: AtomicUsize::new(0),
             zone_map,
+            row_order,
+            row_regions,
+            columns_complete,
         };
         if eager_docs_schema {
             reader.docs_schema_inner()?;
@@ -422,9 +595,46 @@ impl VixReader {
         Ok(reader)
     }
 
+    /// Whether this reader carries a term index at all: `false` when it was
+    /// opened without an index sidecar (#40/#42 index-off files have none),
+    /// where dictionary-absence proofs are void and only condition-free
+    /// evals are valid.
+    pub fn has_index(&self) -> bool {
+        self.index_enabled
+    }
+
     /// Number of documents in the indexed data file.
     pub fn row_count(&self) -> u64 {
         self.row_count
+    }
+
+    /// Physical row order of the stored docs rows (`row_order` property,
+    /// #51c-c): [`RowOrder::TsDesc`] for every historical file (missing
+    /// property) and every sorted writer output; [`RowOrder::Concat`] for
+    /// concatenation-order merge outputs (and unknown future values — the
+    /// fail-safe reading). Callers deriving ANYTHING from stored order
+    /// (newest == first row, declared file sort order, first-set-bits
+    /// candidates) must check this first.
+    pub fn row_order(&self) -> RowOrder {
+        self.row_order
+    }
+
+    /// §4: the file's internally-`_timestamp`-DESC row ranges, in stored
+    /// order (the piecewise-order decomposition). One full-file range for a
+    /// ts_desc file; the validated `row_regions` table for a concat file;
+    /// `None` for a concat file without a proven decomposition (readers
+    /// must not assume ANY order there — full sort / by-value paths only).
+    pub fn ts_desc_row_ranges(&self) -> Option<Vec<std::ops::Range<u64>>> {
+        if self.row_order.is_ts_desc() {
+            return Some(if self.row_count == 0 {
+                Vec::new()
+            } else {
+                vec![0..self.row_count]
+            });
+        }
+        self.row_regions
+            .as_deref()
+            .map(crate::container::region_row_ranges)
     }
 
     /// The per-chunk `_timestamp` zone table of the `docs` blob — one
@@ -437,6 +647,68 @@ impl VixReader {
     /// decode (`read_docs_column(_timestamp)` etc.).
     pub fn zone_chunks(&self) -> Option<&[ZoneChunk]> {
         self.zone_map.as_deref()
+    }
+
+    /// Per-column present-row counts (`columns` property; `None` count =
+    /// unknown — an M1 plain-name entry).
+    pub fn column_presence(&self) -> &[(String, Option<u64>)] {
+        &self.column_presence
+    }
+
+    /// §4: whether the file asserts the all-present-columns invariant —
+    /// every field present in any row's `_source` is a docs column.
+    /// `false` when absent (fail-open: no absent-column pruning).
+    pub fn columns_complete(&self) -> bool {
+        self.columns_complete
+    }
+
+    /// The file's spliceable stats (H2, DESIGN §4): the per-column chunk
+    /// table from the `stats` blob plus the file-level presence counts.
+    /// `Ok(None)` when the file carries NO stats blob (pre-stats file, or
+    /// empty file) — such an input cannot feed a stats-preserving
+    /// passthrough and must decode. On a ranged open this is ONE small
+    /// fetch (the blob sits in the eager tail for typical files).
+    pub fn spliceable_stats(&self) -> anyhow::Result<Option<crate::stats::SpliceableStats>> {
+        let Some(blob) = &self.stats_blob else {
+            return Ok(None);
+        };
+        let bytes = blob.bytes()?;
+        let chunks = crate::stats::decode_stats_blob(&bytes)?;
+        Ok(Some(crate::stats::SpliceableStats {
+            presence: self.column_presence.clone(),
+            chunks,
+        }))
+    }
+
+    /// M16: the decoded per-column chunk-stats table (`stats` blob), fetched
+    /// and parsed ONCE per reader (memoized readers keep it resident) —
+    /// `None` when the file carries no readable stats (pre-stats/M1 files,
+    /// empty files, undecodable blob: fail open, the aggregation arms
+    /// decode instead). Rows align 1:1 with the zone table by construction;
+    /// consumers must still gate on `chunks.len() == zone.len()` per column.
+    pub fn column_chunk_stats(&self) -> Option<&crate::stats::FileColumnStats> {
+        self.decoded_stats
+            .get_or_init(|| {
+                let blob = self.stats_blob.as_ref()?;
+                let bytes = match blob.bytes() {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        log::debug!("vix: stats blob unreadable, no stats-answered arms: {e}");
+                        return None;
+                    }
+                };
+                match crate::stats::decode_stats_blob(&bytes) {
+                    Ok(stats) => {
+                        self.stats_loaded_bytes.store(bytes.len(), Ordering::Relaxed);
+                        Some(stats)
+                    }
+                    Err(e) => {
+                        log::debug!("vix: stats blob undecodable, no stats-answered arms: {e}");
+                        None
+                    }
+                }
+            })
+            .as_ref()
     }
 
     /// Parquet row-group size recorded at build time (`0` = unknown).
@@ -476,11 +748,40 @@ impl VixReader {
         self.fields.iter().any(|entry| entry.name == name)
     }
 
-    /// Fields for which at least one value was skipped at build time
-    /// (oversize values, or field-id overflow); term lookups on
-    /// them may miss documents.
+    /// #52: the fields this file marks BLOOM-ONLY (values live in the
+    /// composite bloom + docs columns; no dictionary/postings). The merge
+    /// planner treats the marker as STICKY — an input's demotion carries
+    /// into every merge plan over it, because the demoted field has no
+    /// dictionary terms left for the count-driven AUTO rule to re-derive
+    /// the decision from (the never-list + a heal is the un-demotion path).
+    pub fn bloom_only_fields(&self) -> impl Iterator<Item = &str> + '_ {
+        self.fields
+            .iter()
+            .filter(|entry| entry.has_type(FIELD_TYPE_BLOOM))
+            .map(|entry| entry.name.as_str())
+    }
+
+    /// Fields whose VALUE TERMS are knowingly incomplete (type drift,
+    /// field-id overflow, source keys outside the term plan, or a legacy
+    /// file's pre-2026-08-12 oversize taint); term lookups on them may miss
+    /// documents, so the query layer falls back to scanning. Oversize skips
+    /// by current writers deliberately do NOT set this — they surface in
+    /// [`Self::oversize_skips`] instead.
     pub fn partial_fields(&self) -> &HashSet<String> {
         &self.partial_fields
+    }
+
+    /// Per-field count of raw values the writer skipped for exceeding its
+    /// `max_raw_term_len` (the `oversize_skips` property; empty for legacy
+    /// files). Merges sum inputs' maps forward. The dictionary-serve paths
+    /// treat these as an exact reconciliation allowance.
+    pub fn oversize_skips(&self) -> &HashMap<String, u64> {
+        &self.oversize_skips
+    }
+
+    /// The oversize-skip allowance for one field (`0` when absent).
+    fn field_oversize_skips(&self, field: &str) -> u64 {
+        self.oversize_skips.get(field).copied().unwrap_or(0)
     }
 
     /// The file's fts-marked field names (token-indexed fields).
@@ -655,7 +956,9 @@ impl VixReader {
     /// dictionary index parses and blocks cache lazily — external caches
     /// should re-read it when re-touching an entry.
     pub fn memory_size(&self) -> usize {
-        self.base_memory + self.dict_loaded_bytes.load(Ordering::Relaxed)
+        self.base_memory
+            + self.dict_loaded_bytes.load(Ordering::Relaxed)
+            + self.stats_loaded_bytes.load(Ordering::Relaxed)
     }
 
     /// The parsed dictionary block index, fetching + parsing it on first
@@ -962,6 +1265,42 @@ impl VixReader {
         self.term_field_ids.get(name).copied()
     }
 
+    /// Every value-term field of this file as `(field id, name)` pairs —
+    /// the #48 composite coverage set for dictionary-walk bloom builds.
+    /// FTS and key fields are excluded by construction (the map only holds
+    /// `term`-typed entries).
+    pub fn term_fields(&self) -> impl Iterator<Item = (u16, &str)> + '_ {
+        self.term_field_ids.iter().map(|(n, id)| (*id, n.as_str()))
+    }
+
+    /// #52: APPROXIMATE distinct-term count per value-term field, from the
+    /// field-major dictionary's block metadata alone (no block decodes).
+    /// Each field's span is bounded by `predecessor_block` binary searches
+    /// on the 2-byte fid prefix, so the error is at most one block per
+    /// boundary — callers gate decisions on ratios plus a large absolute
+    /// floor, where block granularity is noise. Returns `(name, count)`.
+    pub fn term_counts_by_field(&self) -> Result<Vec<(String, u64)>> {
+        if self.term_count() == 0 || self.term_field_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let index = self.dict_index()?;
+        let total = self.term_count();
+        let mut ids: Vec<(u16, &str)> = self.term_fields().collect();
+        ids.sort_unstable_by_key(|(id, _)| *id);
+        // start ordinal (block-approximate) of each fid's key range
+        let mut starts: Vec<(usize, u64)> = Vec::with_capacity(ids.len());
+        for (pos, (id, _)) in ids.iter().enumerate() {
+            let block = index.predecessor_block(&id.to_be_bytes())?.unwrap_or(0);
+            starts.push((pos, index.meta(block).1));
+        }
+        let mut out = Vec::with_capacity(ids.len());
+        for (pos, start) in &starts {
+            let end = starts.get(pos + 1).map(|(_, next)| *next).unwrap_or(total);
+            out.push((ids[*pos].1.to_string(), end.saturating_sub(*start)));
+        }
+        Ok(out)
+    }
+
     /// Parse the per-file value blooms (`bloom` blob) if present. On ranged
     /// readers this fetches the whole blob (small: megabytes at trace-scale
     /// cardinality) in one ranged read.
@@ -1233,15 +1572,22 @@ impl VixReader {
     /// Returns `Ok(None)` when the file cannot prove the counts are exact
     /// per-value counts, and the caller must fall back to the docs columns
     /// (or a scan):
-    /// - the field is in `partial_fields` (skipped oversize values / field-id overflow),
+    /// - the field is in `partial_fields` (type drift / field-id overflow / source keys outside the
+    ///   term plan / legacy pre-2026-08-12 taint),
     /// - the field is fts-marked in this file (its dictionary holds tokens, not raw values),
-    /// - the raw-term doc counts do not sum to the field's key-term doc count — some docs carry
-    ///   values the dictionary lacks (e.g. a field stored under a non-string type in this file has
-    ///   key terms only). The empty string is a countable value: writers raw-index it, so `("",
-    ///   doc_count)` appears like any other value.
+    /// - the raw-term doc counts PLUS the field's `oversize_skips` allowance do not sum to the
+    ///   key-term doc count — some docs carry values the dictionary lacks for a reason other than
+    ///   an oversize skip (e.g. a field stored under a non-string type in this file has key terms
+    ///   only). The empty string is a countable value: writers raw-index it, so `("", doc_count)`
+    ///   appears like any other value.
     ///
-    /// `Ok(Some(vec![]))` means the file provably contains **no** document
-    /// with a value at `field` — an exact empty result.
+    /// Oversize-skipped values (the 2026-08-12 performance-first trade) do
+    /// NOT refuse the serve: the counts simply OMIT those values, and their
+    /// docs appear in no group.
+    ///
+    /// `Ok(Some(vec![]))` means every doc carrying `field` is accounted for
+    /// with no servable value — no docs at all, or only oversize-skipped
+    /// ones — an exact empty group list under the trade above.
     pub fn field_value_counts(&self, field: &str) -> anyhow::Result<Option<FieldValueCounts>> {
         Ok(self.field_value_counts_inner(field)?)
     }
@@ -1307,6 +1653,39 @@ impl VixReader {
         from_end: bool,
     ) -> anyhow::Result<Option<Vec<Vec<u8>>>> {
         Ok(self.field_value_head_inner(field, limit, from_end)?)
+    }
+
+    /// M13 dispatch probe: how many RAW STRING value terms `field` holds in
+    /// this file's dictionary — the (at most two) contiguous field-major
+    /// ordinal ranges' total length. `None` when the dictionary cannot
+    /// serve the field's value counts anyway (no index, fts-marked,
+    /// partial) or the field is absent from the field table; the caller
+    /// then keeps the docs-column path.
+    ///
+    /// Cost: four resident-index probes plus at most a handful of ~4KB
+    /// block loads — cheap enough to gate the top-k/distinct dispatch per
+    /// query. This is the DICTIONARY's distinct-value count (each stored
+    /// raw string value once, numeric/bool sub-ranges excluded); the
+    /// docs-column group-by's cost tracks `row_count`, so `distinct / rows`
+    /// is the dispatch ratio (`field_value_top_k`'s own doc-count
+    /// reconciliation still decides final eligibility — a probe here never
+    /// commits correctness, only cost).
+    pub fn field_distinct_string_terms(&self, field: &str) -> anyhow::Result<Option<u64>> {
+        if !self.has_index() || self.partial_fields.contains(field) {
+            return Ok(None);
+        }
+        if self
+            .fields
+            .iter()
+            .any(|entry| entry.name == field && entry.has_type(FIELD_TYPE_FTS))
+        {
+            return Ok(None);
+        }
+        let Some(field_id) = self.field_id(field) else {
+            return Ok(None);
+        };
+        let ranges = self.string_value_ordinal_ranges(field_id)?;
+        Ok(Some(ranges.iter().map(|r| r.end - r.start).sum()))
     }
 
     fn field_value_head_inner(
@@ -1436,15 +1815,20 @@ impl VixReader {
             Some(ordinal) => self.read_doc_count(ordinal)?,
             None => 0,
         };
+        // The oversize-skip allowance: skipped values have key terms but no
+        // value term, so they legitimately account for a shortfall — the
+        // served top-k then omits them (the 2026-08-12 trade).
+        let skips = self.field_oversize_skips(field);
         let Some(field_id) = self.field_id(field) else {
-            return Ok((field_docs == 0).then(|| (Vec::new(), false)));
+            return Ok((field_docs == skips).then(|| (Vec::new(), false)));
         };
         let ranges = self.string_value_ordinal_ranges(field_id)?;
         let total_strings: u64 = ranges.iter().map(|r| r.end - r.start).sum();
         if total_strings == 0 {
-            // no string value terms at all: exact iff no doc carries the
-            // field (mirrors the walk's values.is_empty() arm)
-            return Ok((field_docs == 0).then(|| (Vec::new(), false)));
+            // no string value terms at all: exact iff every doc carrying
+            // the field is accounted for by the skip allowance (mirrors the
+            // walk's values.is_empty() arm)
+            return Ok((field_docs == skips).then(|| (Vec::new(), false)));
         }
         let terms_blob = self
             .terms_blob
@@ -1515,10 +1899,11 @@ impl VixReader {
             }
         }
         // same exactness precondition as the walk: every doc carries at most
-        // one raw value, so exact STRING value counts sum to the key-term
-        // doc count; a shortfall (numeric-typed rows, pre-fix empty-string
-        // files, ...) refuses the fast path
-        if sum != field_docs {
+        // one raw value, so exact STRING value counts plus the oversize-skip
+        // allowance sum to the key-term doc count; any OTHER shortfall
+        // (numeric-typed rows, pre-fix empty-string files, ...) refuses the
+        // fast path
+        if sum + skips != field_docs {
             return Ok(None);
         }
         let mut winners: Vec<(u64, u64)> = if ascend {
@@ -1555,18 +1940,22 @@ impl VixReader {
         else {
             return Ok(None);
         };
+        let skips = self.field_oversize_skips(field);
         if values.is_empty() {
-            // no value terms at all: exact iff no doc carries the field
-            // (e.g. the field is stored under a non-string type here)
-            return Ok((field_docs == 0).then(Vec::new));
+            // no value terms at all: exact iff every doc carrying the field
+            // is accounted for by the oversize-skip allowance (e.g. the
+            // field is stored under a non-string type here)
+            return Ok((field_docs == skips).then(Vec::new));
         }
         let counts = self.read_doc_counts(&ordinals)?;
-        // each doc has at most one raw value per field, so exact counts sum
-        // to the key-term doc count; a shortfall means values the dictionary
-        // lacks (values of another stored type, empty strings in pre-fix
-        // files, ...) — empty-string terms written by current writers are
-        // ordinary dictionary entries and reconcile like any other value
-        if counts.iter().sum::<u64>() != field_docs {
+        // each doc has at most one raw value per field, so exact counts plus
+        // the oversize-skip allowance sum to the key-term doc count — the
+        // served counts then OMIT the skipped values (2026-08-12 trade). Any
+        // OTHER shortfall means values the dictionary lacks (values of
+        // another stored type, empty strings in pre-fix files, ...) —
+        // empty-string terms written by current writers are ordinary
+        // dictionary entries and reconcile like any other value
+        if counts.iter().sum::<u64>() + skips != field_docs {
             return Ok(None);
         }
         Ok(Some(values.into_iter().zip(counts).collect()))
@@ -1590,8 +1979,9 @@ impl VixReader {
         else {
             return Ok(None);
         };
+        let skips = self.field_oversize_skips(field);
         if values.is_empty() {
-            return Ok((field_docs == 0).then(Vec::new));
+            return Ok((field_docs == skips).then(Vec::new));
         }
         let terms_blob = self
             .terms_blob
@@ -1677,8 +2067,10 @@ impl VixReader {
             )));
         }
         // the exactness precondition reconciles on UNFILTERED counts (the
-        // filtered sum legitimately falls short of field_docs)
-        if unfiltered_sum != field_docs {
+        // filtered sum legitimately falls short of field_docs) — plus the
+        // oversize-skip allowance, whose docs simply never surface in any
+        // served group (2026-08-12 trade)
+        if unfiltered_sum + skips != field_docs {
             return Ok(None);
         }
         Ok(Some(values.into_iter().zip(filtered).collect()))
@@ -1925,6 +2317,14 @@ impl VixReader {
 
     fn eval_query(&self, query: &VixQuery) -> Result<BooleanBuffer> {
         let len = self.row_count as usize;
+        if !self.index_enabled && !matches!(query, VixQuery::All) {
+            // insurance (#40): the routing layers keep conditions away from
+            // index-off files; a slipped call degrades safely — per-file
+            // eval errors leave the file on the scan branch, filter intact
+            return Err(VixError::UnsupportedFormat(
+                "condition eval on a file opened without an index sidecar".to_string(),
+            ));
+        }
         match query {
             VixQuery::All => Ok(BooleanBuffer::new_set(len)),
             VixQuery::And(subs) => self.eval_and(subs),
@@ -2002,6 +2402,11 @@ impl VixReader {
     }
 
     fn count_inner(&self, query: &VixQuery) -> Result<u64> {
+        if !self.index_enabled && !matches!(query, VixQuery::All) {
+            return Err(VixError::UnsupportedFormat(
+                "condition count on a file opened without an index sidecar".to_string(),
+            ));
+        }
         match query {
             VixQuery::All => Ok(self.row_count),
             VixQuery::And(_) | VixQuery::Or(_) | VixQuery::Not(_) => {
@@ -2450,10 +2855,7 @@ impl VixReader {
     /// `is_numeric_value_token` classification of the dictionary walk —
     /// including its documented residual (a string value whose first byte
     /// IS the tag classifies as numeric on both paths).
-    fn string_value_ordinal_ranges(
-        &self,
-        field_id: u16,
-    ) -> Result<[std::ops::Range<u64>; 2]> {
+    fn string_value_ordinal_ranges(&self, field_id: u16) -> Result<[std::ops::Range<u64>; 2]> {
         let (lower, upper) = Self::v2_field_range(field_id);
         let field_start = self.ordinal_lower_bound(&lower)?;
         let field_end = self.ordinal_lower_bound(&upper)?;
@@ -2956,7 +3358,7 @@ fn timestamps_as_i64(column: &ArrowArrayRef) -> Result<Int64Array> {
 /// equal the file's `row_count` (a stale or corrupt table). A trustworthy but
 /// empty table (`row_count == 0`) also yields `None`; the decode path already
 /// returns the empty result for a zero-row file.
-fn parse_zone_map(raw: Option<&str>, row_count: u64) -> Option<Vec<ZoneChunk>> {
+pub(crate) fn parse_zone_map(raw: Option<&str>, row_count: u64) -> Option<Vec<ZoneChunk>> {
     let raw = raw?;
     let entries: Vec<ZoneEntry> = match serde_json::from_str(raw) {
         Ok(entries) => entries,

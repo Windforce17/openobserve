@@ -17,24 +17,21 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, FieldRef};
 use config::{
-    ID_COL_NAME, ORIGINAL_DATA_COL_NAME, TIMESTAMP_COL_NAME, get_config,
+    ID_COL_NAME, ORIGINAL_DATA_COL_NAME, TIMESTAMP_COL_NAME,
     meta::{search::SearchEventType, sql::TableReferenceExt, stream::StreamType},
 };
 use datafusion::{arrow::datatypes::Schema, common::TableReference};
 use hashbrown::{HashMap, HashSet};
 use infra::schema::{
-    SchemaCache, get_stream_setting_column_store_fields, get_stream_setting_fts_fields,
+    SchemaCache, get_stream_setting_fts_fields,
     unwrap_stream_settings,
 };
 use vortex_index::SOURCE_COL_NAME;
 
-#[allow(clippy::too_many_arguments)]
 pub fn generate_select_star_schema(
     schemas: HashMap<TableReference, Arc<SchemaCache>>,
     columns: &HashMap<TableReference, HashSet<String>>,
     has_original_column: HashMap<TableReference, bool>,
-    quick_mode: bool,
-    quick_mode_num_fields: usize,
     search_event_type: &Option<SearchEventType>,
     need_fst_fields: bool,
     sql_stream_type: StreamType,
@@ -42,10 +39,9 @@ pub fn generate_select_star_schema(
 ) -> HashMap<TableReference, Arc<SchemaCache>> {
     let mut used_schemas = HashMap::new();
     for (name, schema) in schemas {
-        let stream_settings = unwrap_stream_settings(schema.schema());
         let has_original_column = *has_original_column.get(&name).unwrap_or(&false);
 
-        // Row-store-driven star (DESIGN §5): for a plain single-stream
+        // Row-store-driven star (DESIGN §2.1): for a plain single-stream
         // `SELECT *` over a logs/traces stream, the star never enumerates
         // the schema registry — each hit is materialized from its own
         // record's `_source` at the response layer. Plan cost is
@@ -69,37 +65,49 @@ pub fn generate_select_star_schema(
             continue;
         }
 
-        let quick_mode = quick_mode && schema.schema().fields().len() > quick_mode_num_fields;
         // don't automatically skip _original for scheduled pipeline searches
         let skip_original_column = !has_original_column
             && !matches!(search_event_type, Some(SearchEventType::DerivedStream))
             && schema.contains_field(ORIGINAL_DATA_COL_NAME);
-        if quick_mode || skip_original_column {
-            let fields = if quick_mode {
-                let columns = columns.get(&name).cloned();
-                let fts_fields = get_stream_setting_fts_fields(&stream_settings);
-                generate_quick_mode_fields(
-                    schema.schema(),
-                    columns,
-                    &fts_fields,
-                    skip_original_column,
-                    need_fst_fields,
-                )
-            } else {
-                // skip selecting "_original" column if `SELECT * ...`
-                let mut fields = schema.schema().fields().iter().cloned().collect::<Vec<_>>();
-                if !need_fst_fields {
+
+        // §9 (v2): registry-star survives ONLY for CTE/join/subquery
+        // shapes, BOUNDED by the statement's referenced columns (H4: plan
+        // cost O(query), never O(registry width)). quick_mode's arbitrary
+        // first-N truncation is deleted. Fail-open: a table whose
+        // referenced-column set is EMPTY (e.g. the inner star of
+        // `SELECT * FROM (SELECT * FROM t)`) keeps the full registry
+        // expansion — bounding it to zero columns would break the query.
+        let referenced = columns.get(&name).filter(|cols| !cols.is_empty());
+        let fields = match referenced {
+            Some(cols) => {
+                let mut fields =
+                    generate_schema_fields(cols.clone(), &schema, need_fst_fields);
+                // `_original` rides only when the statement references it
+                // or a scheduled pipeline needs it (never by default)
+                if !skip_original_column
+                    && !fields.iter().any(|f| f.name() == ORIGINAL_DATA_COL_NAME)
+                    && let Some(field) = schema.field_with_name(ORIGINAL_DATA_COL_NAME)
+                {
+                    fields.push(field.clone());
+                }
+                if skip_original_column && !need_fst_fields {
                     fields.retain(|field| field.name() != ORIGINAL_DATA_COL_NAME);
                 }
                 fields
-            };
-            let schema = Arc::new(SchemaCache::new(
-                Schema::new(fields).with_metadata(schema.schema().metadata().clone()),
-            ));
-            used_schemas.insert(name, schema);
-        } else {
-            used_schemas.insert(name, schema);
-        }
+            }
+            None => {
+                // full registry expansion, minus the `_original` skip
+                let mut fields = schema.schema().fields().iter().cloned().collect::<Vec<_>>();
+                if skip_original_column && !need_fst_fields {
+                    fields.retain(|field| field.name() != ORIGINAL_DATA_COL_NAME);
+                }
+                fields
+            }
+        };
+        let schema = Arc::new(SchemaCache::new(
+            Schema::new(fields).with_metadata(schema.schema().metadata().clone()),
+        ));
+        used_schemas.insert(name, schema);
     }
     used_schemas
 }
@@ -137,13 +145,9 @@ pub fn generate_row_store_star_fields(
     if has_original_column {
         push(ORIGINAL_DATA_COL_NAME, &mut fields, &mut names);
     }
-    // the column-store columns: native docs columns, they overlay the
-    // `_source` image in the response (authoritative for merged files)
-    if let Some(settings) = stream_settings.as_ref() {
-        for field in get_stream_setting_column_store_fields(settings) {
-            push(&field, &mut fields, &mut names);
-        }
-    }
+    // (v2 all-present-columns: `_source` alone is authoritative for the
+    // star image — every field's value lives in it, and every present field
+    // is also a native column; no settings-driven column overlay exists.)
     // fields the statement references (WHERE/ORDER BY/GROUP BY — already
     // registry-resolved by ColumnVisitor), so the plan can bind them
     if let Some(columns) = columns {
@@ -159,133 +163,6 @@ pub fn generate_row_store_star_fields(
     }
     // the record itself
     fields.push(Arc::new(Field::new(SOURCE_COL_NAME, DataType::Utf8, true)));
-    fields
-}
-
-pub fn generate_quick_mode_fields(
-    schema: &Schema,
-    columns: Option<HashSet<String>>,
-    fts_fields: &[String],
-    skip_original_column: bool,
-    need_fst_fields: bool,
-) -> Vec<Arc<arrow_schema::Field>> {
-    let cfg = get_config();
-    let strategy = cfg.limit.quick_mode_strategy.to_lowercase();
-    let schema_fields = schema.fields().iter().cloned().collect::<Vec<_>>();
-    let mut fields = match strategy.as_str() {
-        "last" => {
-            let skip = std::cmp::max(0, schema_fields.len() - cfg.limit.quick_mode_num_fields);
-            schema_fields.into_iter().skip(skip).collect()
-        }
-        "both" => {
-            let need_num = std::cmp::min(schema_fields.len(), cfg.limit.quick_mode_num_fields);
-            let mut inner_fields = schema_fields
-                .iter()
-                .take(need_num / 2)
-                .cloned()
-                .collect::<Vec<_>>();
-            if schema_fields.len() > inner_fields.len() {
-                let skip = std::cmp::max(0, schema_fields.len() + inner_fields.len() - need_num);
-                inner_fields.extend(schema_fields.into_iter().skip(skip));
-            }
-            inner_fields
-        }
-        _ => {
-            // default is first mode
-            schema_fields
-                .into_iter()
-                .take(cfg.limit.quick_mode_num_fields)
-                .collect()
-        }
-    };
-
-    let mut fields_name = fields
-        .iter()
-        .map(|f| f.name().to_string())
-        .collect::<HashSet<_>>();
-
-    // check the internal columns excluded from `SELECT *`
-    if cfg.common.feature_query_exclude_all && fields_name.contains(ORIGINAL_DATA_COL_NAME) {
-        fields.retain(|field| field.name().ne(ORIGINAL_DATA_COL_NAME));
-    }
-
-    // check _timestamp column
-    if !fields_name.contains(TIMESTAMP_COL_NAME)
-        && let Ok(field) = schema.field_with_name(TIMESTAMP_COL_NAME)
-    {
-        fields.push(Arc::new(field.clone()));
-        fields_name.insert(TIMESTAMP_COL_NAME.to_string());
-    }
-    // add the selected columns
-    if let Some(columns) = columns {
-        for column in columns {
-            if !fields_name.contains(&column)
-                && let Ok(field) = schema.field_with_name(&column)
-            {
-                fields.push(Arc::new(field.clone()));
-                fields_name.insert(column.to_string());
-            }
-        }
-    }
-    // check fts fields
-    if need_fst_fields {
-        for field in fts_fields {
-            if !fields_name.contains(field)
-                && let Ok(field) = schema.field_with_name(field)
-            {
-                fields.push(Arc::new(field.clone()));
-                fields_name.insert(field.to_string());
-            }
-        }
-    }
-
-    // check quick mode fields
-    for field in config::QUICK_MODEL_FIELDS.iter() {
-        if !fields_name.contains(field)
-            && let Ok(field) = schema.field_with_name(field)
-        {
-            fields.push(Arc::new(field.clone()));
-            fields_name.insert(field.to_string());
-        }
-    }
-
-    // include gen AI fields for LLM streams
-    if let Some(settings) = unwrap_stream_settings(schema)
-        && settings.is_llm_stream
-    {
-        use config::meta::traces::{
-            GEN_AI_SENTINEL_COLUMN, OPTIONAL_GEN_AI_FIELDS, OPTIONAL_LLM_FIELDS,
-            REQUIRED_GEN_AI_FIELDS, REQUIRED_LLM_FIELDS,
-        };
-
-        let field_lists: &[&[&str]] = if schema.field_with_name(GEN_AI_SENTINEL_COLUMN).is_ok() {
-            &[
-                REQUIRED_GEN_AI_FIELDS,
-                OPTIONAL_GEN_AI_FIELDS,
-                &["trace_id", "gen_ai_conversation_id", "user_id"],
-            ]
-        } else {
-            &[
-                REQUIRED_LLM_FIELDS,
-                OPTIONAL_LLM_FIELDS,
-                &["trace_id", "llm_session_id", "llm_user_id"],
-            ]
-        };
-        for list in field_lists {
-            for field_name in *list {
-                if !fields_name.contains(*field_name)
-                    && let Ok(field) = schema.field_with_name(field_name)
-                {
-                    fields.push(Arc::new(field.clone()));
-                    fields_name.insert(field_name.to_string());
-                }
-            }
-        }
-    }
-
-    if !need_fst_fields && skip_original_column && fields_name.contains(ORIGINAL_DATA_COL_NAME) {
-        fields.retain(|field| field.name() != ORIGINAL_DATA_COL_NAME);
-    }
     fields
 }
 
@@ -433,92 +310,6 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_quick_mode_fields_first_strategy() {
-        let fields = vec![
-            Arc::new(Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false)),
-            Arc::new(Field::new("field1", DataType::Utf8, true)),
-            Arc::new(Field::new("field2", DataType::Int32, true)),
-            Arc::new(Field::new("field3", DataType::Float64, true)),
-            Arc::new(Field::new("field4", DataType::Boolean, true)),
-        ];
-        let schema = Schema::new(fields);
-
-        // Mock config - default strategy is "first"
-        let result = generate_quick_mode_fields(&schema, None, &[], false, false);
-
-        // Should include timestamp and some fields (exact count depends on config)
-        assert!(!result.is_empty());
-        assert!(result.iter().any(|f| f.name() == TIMESTAMP_COL_NAME));
-    }
-
-    #[test]
-    fn test_generate_quick_mode_fields_with_columns() {
-        let fields = vec![
-            Arc::new(Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false)),
-            Arc::new(Field::new("field1", DataType::Utf8, true)),
-            Arc::new(Field::new("field2", DataType::Int32, true)),
-            Arc::new(Field::new("selected_field", DataType::Float64, true)),
-        ];
-        let schema = Schema::new(fields);
-
-        let mut columns = HashSet::new();
-        columns.insert("selected_field".to_string());
-
-        let result = generate_quick_mode_fields(&schema, Some(columns), &[], false, false);
-
-        // Should include timestamp and selected field
-        assert!(result.iter().any(|f| f.name() == TIMESTAMP_COL_NAME));
-        assert!(result.iter().any(|f| f.name() == "selected_field"));
-    }
-
-    #[test]
-    fn test_generate_quick_mode_fields_skip_original() {
-        let fields = vec![
-            Arc::new(Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false)),
-            Arc::new(Field::new(ORIGINAL_DATA_COL_NAME, DataType::Utf8, true)),
-            Arc::new(Field::new("field1", DataType::Utf8, true)),
-        ];
-        let schema = Schema::new(fields);
-
-        let result = generate_quick_mode_fields(
-            &schema,
-            None,
-            &[],
-            true, // skip_original_column = true
-            false,
-        );
-
-        // Should not include original data column
-        assert!(!result.iter().any(|f| f.name() == ORIGINAL_DATA_COL_NAME));
-        assert!(result.iter().any(|f| f.name() == TIMESTAMP_COL_NAME));
-    }
-
-    #[test]
-    fn test_generate_quick_mode_fields_with_fts_fields() {
-        let fields = vec![
-            Arc::new(Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false)),
-            Arc::new(Field::new("fts_field1", DataType::Utf8, true)),
-            Arc::new(Field::new("fts_field2", DataType::Utf8, true)),
-            Arc::new(Field::new("normal_field", DataType::Int32, true)),
-        ];
-        let schema = Schema::new(fields);
-
-        let fts_fields = vec!["fts_field1".to_string(), "fts_field2".to_string()];
-
-        let result = generate_quick_mode_fields(
-            &schema,
-            None,
-            &fts_fields,
-            false,
-            true, // need_fst_fields = true
-        );
-
-        // Should include FTS fields
-        assert!(result.iter().any(|f| f.name() == "fts_field1"));
-        assert!(result.iter().any(|f| f.name() == "fts_field2"));
-    }
-
-    #[test]
     fn test_generate_schema_fields_basic() {
         let fields = vec![
             Arc::new(Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false)),
@@ -642,7 +433,9 @@ mod tests {
         };
         // identical projection regardless of registry width
         assert_eq!(names(&narrow), names(&wide));
-        // _timestamp + _o2_id + cs (svc, code) + referenced + _source
+        // _timestamp + _o2_id + referenced + _source: no settings-driven
+        // column overlay exists since v2 all-present-columns — `_source`
+        // alone is authoritative for the star image
         let mut sorted = names(&wide);
         sorted.sort_unstable();
         assert_eq!(
@@ -651,9 +444,7 @@ mod tests {
                 ID_COL_NAME,
                 vortex_index::SOURCE_COL_NAME,
                 TIMESTAMP_COL_NAME,
-                "code",
                 "k8s.container.name",
-                "svc",
             ]
             .map(String::from)
         );
@@ -664,7 +455,7 @@ mod tests {
         let full = names(&full);
         assert!(full.contains(&"log".to_string()));
         assert!(full.contains(&ORIGINAL_DATA_COL_NAME.to_string()));
-        assert_eq!(full.len(), 8);
+        assert_eq!(full.len(), 6);
     }
 
     /// `generate_select_star_schema` routes plain single-stream logs/traces
@@ -688,15 +479,12 @@ mod tests {
             (schemas, columns, has_original)
         };
 
-        // row-store eligible: tiny projection ending in _source, even with
-        // quick mode forced on
+        // row-store eligible: tiny projection ending in _source
         let (schemas, columns, has_original) = make_input();
         let used = generate_select_star_schema(
             schemas,
             &columns,
             has_original,
-            true, // quick mode forced (the live default)
-            500,
             &None,
             false,
             StreamType::Logs,
@@ -710,19 +498,47 @@ mod tests {
             .map(|f| f.name().as_str())
             .collect();
         assert!(names.contains(&vortex_index::SOURCE_COL_NAME));
-        assert_eq!(names.len(), 6, "star projection must not scale: {names:?}");
+        assert_eq!(names.len(), 4, "star projection must not scale: {names:?}");
         // stream settings metadata survives (o2_id/settings consumers)
         assert!(schema.schema().metadata().contains_key("settings"));
 
-        // not row-store eligible (join/subquery/CTE shapes): the legacy
-        // registry expansion stays — quick mode truncates to its first-N
+        // not row-store eligible (join/subquery/CTE shapes): the §9
+        // registry-star BOUNDED by the referenced columns — never the
+        // arbitrary quick-mode first-N truncation, never O(registry)
         let (schemas, columns, has_original) = make_input();
         let used = generate_select_star_schema(
             schemas,
             &columns,
             has_original,
-            true,
-            500,
+            &None,
+            false,
+            StreamType::Logs,
+            false,
+        );
+        let schema = used.get(&TableReference::bare("default")).unwrap();
+        let mut names: Vec<&str> = schema
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec![ID_COL_NAME, TIMESTAMP_COL_NAME, "k8s.container.name"],
+            "CTE/join star = referenced columns + internals, O(query) not O(registry)"
+        );
+        assert!(!schema.contains_field(vortex_index::SOURCE_COL_NAME));
+
+        // fail-open: an EMPTY referenced set keeps the full registry
+        // expansion (the inner star of a nested `SELECT *` must not
+        // collapse to zero columns), `_original` auto-skip still applied
+        let (schemas, _, has_original) = make_input();
+        let empty_columns: HashMap<TableReference, HashSet<String>> = HashMap::new();
+        let used = generate_select_star_schema(
+            schemas,
+            &empty_columns,
+            has_original,
             &None,
             false,
             StreamType::Logs,
@@ -730,7 +546,7 @@ mod tests {
         );
         let schema = used.get(&TableReference::bare("default")).unwrap();
         assert!(schema.schema().fields().len() > 400);
-        assert!(!schema.contains_field(vortex_index::SOURCE_COL_NAME));
+        assert!(!schema.contains_field(ORIGINAL_DATA_COL_NAME));
     }
 
     #[test]

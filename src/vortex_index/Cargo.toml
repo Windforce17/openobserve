@@ -12,6 +12,7 @@ gxhash = ["dep:gxhash"]
 [dependencies]
 anyhow.workspace = true
 arrow.workspace = true
+async-trait.workspace = true
 arrow-schema.workspace = true
 bitpacking.workspace = true
 bytes.workspace = true
@@ -32,6 +33,7 @@ tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 vortex.workspace = true
+sonic-rs.workspace = true
 
 [dev-dependencies]
 rand.workspace = true

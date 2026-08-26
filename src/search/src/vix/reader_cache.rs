@@ -24,10 +24,14 @@
 //! readers grow. Sized by `ZO_VIX_READER_CACHE_MAX_SIZE` (default 10% of
 //! RAM, no upper clamp; falls back to the inverted-index footer-cache knob
 //! `ZO_INVERTED_INDEX_FOOTER_CACHE_MAX_SIZE` when only that one is set).
-//! Eviction is LRU (a get refreshes the entry); `.vix` objects are
-//! immutable, so entries never go stale — deleted files simply age out.
-//! Only the ranged read mode populates this cache — in cached mode the
-//! whole object sits in the local file cache and reopening it is pure CPU.
+//! Eviction is LRU (a get refreshes the entry); `.vix` DATA objects are
+//! immutable, so deleted files simply age out. The `.vxi` INDEX sidecar is
+//! the one exception since the M3 sidecar-only heal: it can be REWRITTEN
+//! under the same data key, so the file-update broadcast calls
+//! [`VixReaderCache::remove`] to drop the memoized reader (its loaded
+//! index state is pre-heal). Only the ranged read mode populates this
+//! cache — in cached mode the whole object sits in the local file cache
+//! and reopening it is pure CPU.
 //!
 //! Prometheus: `vix_reader_cache_entries`, `vix_reader_cache_memory_bytes`,
 //! `vix_reader_cache_{hits,misses}_total`.
@@ -89,6 +93,13 @@ impl VixReaderCache {
         found
     }
 
+    /// Whether a reader is memoized for `file` — the M14 prefetch cold check.
+    /// No hit/miss metric tick and no LRU refresh: probing must not distort
+    /// the cache-effectiveness counters or the eviction order.
+    pub fn contains(&self, file: &str) -> bool {
+        self.state.lock().0.contains_key(file)
+    }
+
     /// Insert a parsed reader (first writer wins on races), evicting the
     /// least-recently-used entries when over budget. Readers larger than the
     /// whole budget are not cached. Every insert first re-syncs all entry
@@ -125,6 +136,23 @@ impl VixReaderCache {
         metrics::VIX_READER_CACHE_MEMORY_BYTES
             .with_label_values::<&str>(&[])
             .set(state.1 as i64);
+    }
+
+    /// Drop a memoized reader (keyed by the DATA key). M3 sidecar-only
+    /// heal: the `.vxi` under this key was rewritten in place, so a parsed
+    /// reader's loaded index state serves pre-heal results until dropped.
+    /// Cheap no-op when absent.
+    pub fn remove(&self, file: &str) {
+        let mut state = self.state.lock();
+        if let Some((_reader, size)) = state.0.remove(file) {
+            state.1 = state.1.saturating_sub(size);
+            metrics::VIX_READER_CACHE_ENTRIES
+                .with_label_values::<&str>(&[])
+                .set(state.0.len() as i64);
+            metrics::VIX_READER_CACHE_MEMORY_BYTES
+                .with_label_values::<&str>(&[])
+                .set(state.1 as i64);
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -168,7 +196,11 @@ mod tests {
         writer
             .push_batch_with_source(&batch, &sources, None)
             .unwrap();
-        Arc::new(VixReader::open(bytes::Bytes::from(writer.finish().unwrap())).unwrap())
+        let (data, index) = writer.finish().unwrap();
+        Arc::new(
+            VixReader::open_with_index(bytes::Bytes::from(data), index.map(bytes::Bytes::from))
+                .unwrap(),
+        )
     }
 
     #[test]
@@ -223,6 +255,30 @@ mod tests {
             "get must re-sync the entry to the grown reader size"
         );
         assert!(cache.memory_size() > before);
+    }
+
+    #[test]
+    fn remove_drops_the_memoized_reader_and_its_bytes() {
+        // M3 sidecar-only heal: the update broadcast must be able to drop a
+        // stale memoized reader by its DATA key
+        let reader = small_reader();
+        let cache = VixReaderCache::new(usize::MAX);
+        cache.put("healed.vix".to_string(), Arc::clone(&reader));
+        assert!(cache.get("healed.vix").is_some());
+        let before = cache.memory_size();
+        assert!(before > 0);
+
+        cache.remove("healed.vix");
+        assert!(
+            cache.get("healed.vix").is_none(),
+            "the stale reader must be gone"
+        );
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.memory_size(), 0, "accounted bytes released");
+
+        // removing an absent key is a cheap no-op
+        cache.remove("never-cached.vix");
+        assert!(cache.is_empty());
     }
 
     #[test]

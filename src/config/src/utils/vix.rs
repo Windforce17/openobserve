@@ -110,7 +110,7 @@ pub fn docs_blob_from_vix_bytes(data: &bytes::Bytes) -> Result<bytes::Bytes, any
         })
         .ok_or_else(|| {
             anyhow::anyhow!(
-                ".vix file has no docs blob (a legacy v1 sidecar index, not a core data file?)"
+                ".vix file has no docs blob (a .vxi index sidecar fed in as a data file?)"
             )
         })?;
     let start = usize::try_from(docs.offset)

@@ -141,6 +141,8 @@ pub async fn search(
     );
 
     // Check work group (OSS uses dist_lock, Enterprise uses WorkGroup::Short)
+    // pass the error through unchanged: an admission rejection is already
+    // ErrorCodes::RatelimitExceeded and must surface as HTTP 429, not 500
     #[cfg(not(feature = "enterprise"))]
     let _lock = crate::service::search::work_group::check_work_group(
         trace_id,
@@ -149,8 +151,7 @@ pub async fn search(
         &mut stop_watch,
         "metrics",
     )
-    .await
-    .map_err(|e| Error::ErrorCode(ErrorCodes::ServerInternalError(e.to_string())))?;
+    .await?;
 
     // Enterprise: Always use Short workgroup for metrics queries
     #[cfg(feature = "enterprise")]

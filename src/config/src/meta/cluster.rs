@@ -304,9 +304,13 @@ pub fn get_internal_grpc_token() -> String {
 }
 
 // CompactionJobType is used to distinguish between current and historical compaction jobs.
+// `Debt` (M29) is the merge-debt sweep: re-enqueue every closed hour in the retention
+// window that still holds mergeable small files, oldest first, at
+// ZO_COMPACT_MERGE_DEBT_INTERVAL cadence.
 pub enum CompactionJobType {
     Current,
     Historical,
+    Debt,
 }
 
 #[cfg(test)]

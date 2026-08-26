@@ -105,6 +105,23 @@ pub async fn run() -> Result<(), anyhow::Error> {
         }
     });
 
+    // M29 merge-debt sweep: keep the job table stocked with every closed hour
+    // that still holds mergeable small files (oldest first), so partially
+    // consumed hours and late-built L0s are revisited at this cadence instead
+    // of the hourly old-data pass — and the newest closed hours (the old-data
+    // lane's dead zone, the hottest query window) are covered too. Idempotent
+    // per (stream, hour); 0 disables.
+    spawn_pausable_job!(
+        "run_generate_merge_debt_job",
+        get_config().compact.merge_debt_interval,
+        {
+            log::debug!("[COMPACTOR::JOB] Running generate merge debt job");
+            if let Err(e) = compact::run_generate_job(CompactionJobType::Debt).await {
+                log::error!("[COMPACTOR::JOB] run generate merge debt job error: {e}");
+            }
+        }
+    );
+
     // One-shot boot pass for the historical sweep: the pausable job sleeps a
     // FULL old_data_interval (1h) before its first run, so every compactor
     // restart used to push the old-data sweep out by an hour — repeated rolls

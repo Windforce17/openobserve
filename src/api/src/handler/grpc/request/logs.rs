@@ -138,8 +138,10 @@ impl LogsService for LogsServer {
 
                 export_response_from_http(response).await
             }
-            // backpressure stays retryable end to end
+            // backpressure stays retryable end to end; counted into the
+            // windowed rejection summary (info), never per-request ERROR
             Err(e) if matches!(e, infra::errors::Error::ResourceError(_)) => {
+                ingester::admission::note_rejection(ingester::admission::REJECT_RESOURCE);
                 Err(Status::unavailable(e.to_string()))
             }
             Err(e) if matches!(e, infra::errors::Error::TrialPeriodExpired) => {

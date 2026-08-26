@@ -670,10 +670,47 @@ pub async fn set(file: &str, data: Bytes) -> Result<(), anyhow::Error> {
     // write to tmp file
     let data_size = data.len();
     let (file, tmp_file) = write_tmp_file(file, data).await?;
+    set_from_tmp_file(&file, &tmp_file, data_size).await
+}
+
+/// Seed the disk cache from a LOCAL file (e.g. a compaction spool) without
+/// transiting RAM (H3): file-to-file copy into the cache tmp dir, then the
+/// same rename-into-cache tail as [`set`].
+pub async fn set_from_local_file(
+    file: &str,
+    source: &std::path::Path,
+) -> Result<(), anyhow::Error> {
+    if !get_config().disk_cache.enabled {
+        return Ok(());
+    }
+    let tmp_file = alloc_tmp_file_path().await?;
+    let size = tokio::fs::copy(source, &tmp_file).await.map_err(|e| {
+        anyhow::anyhow!(
+            "[FileData::Disk] copy local file {} to tmp file {tmp_file} failed: {e}",
+            source.display()
+        )
+    })? as usize;
+    set_from_tmp_file(file, &tmp_file, size).await
+}
+
+/// Move an already-written tmp file into the disk cache under `file` — the
+/// tail of [`set`], and the direct entry point for the H3 streamed download
+/// (the object body was streamed into `tmp_file`; nothing here re-reads it).
+/// The tmp file is consumed: renamed into the cache, or removed when the
+/// entry already exists / the cache is disabled.
+async fn set_from_tmp_file(
+    file: &str,
+    tmp_file: &str,
+    data_size: usize,
+) -> Result<(), anyhow::Error> {
+    if !get_config().disk_cache.enabled {
+        let _ = tokio::fs::remove_file(tmp_file).await;
+        return Ok(());
+    }
 
     // hash the file name and get the bucket index
     let start = std::time::Instant::now();
-    let idx = get_bucket_idx(&file);
+    let idx = get_bucket_idx(file);
 
     // get all the files from the bucket
     let mut files = if file.starts_with("files") {
@@ -691,9 +728,9 @@ pub async fn set(file: &str, data: Bytes) -> Result<(), anyhow::Error> {
         log::info!("disk->cache: set file {file} get lock took: {get_lock_took} ms");
     }
 
-    if files.exist(&file).await {
+    if files.exist(file).await {
         // remove the tmp file
-        if let Err(e) = tokio::fs::remove_file(&tmp_file).await {
+        if let Err(e) = tokio::fs::remove_file(tmp_file).await {
             log::warn!(
                 "[CacheType:{}] File disk cache remove tmp file {} error: {}",
                 files.file_type,
@@ -703,7 +740,7 @@ pub async fn set(file: &str, data: Bytes) -> Result<(), anyhow::Error> {
         }
         return Ok(());
     }
-    let ret = files.set(&file, &tmp_file, data_size).await;
+    let ret = files.set(file, tmp_file, data_size).await;
 
     let set_took = start.elapsed().as_millis() as usize;
     if set_took > 100 {
@@ -1008,13 +1045,32 @@ pub async fn get_dir() -> String {
     FILES[0].read().await.root_dir.clone()
 }
 
+/// Fill the disk cache from object storage. H3: the object body STREAMS
+/// into the cache's tmp file in bounded chunks and the finished tmp file is
+/// renamed into the cache — the object never resides in RAM whole (the
+/// pre-H3 `res.bytes()` buffering at compaction fan-out is what OOM'd the
+/// 24Gi compactors on 2026-08-17).
 pub async fn download(
     account: &str,
     file: &str,
     size: Option<usize>,
 ) -> Result<usize, anyhow::Error> {
-    let (data_len, data_bytes) = super::download_from_storage(account, file, size).await?;
-    if let Err(e) = set(file, data_bytes).await {
+    let tmp_file = alloc_tmp_file_path().await?;
+    let data_len =
+        match super::download_from_storage_to_file(account, file, size, std::path::Path::new(
+            &tmp_file,
+        ))
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                // best-effort cleanup of the partial tmp file
+                let _ = tokio::fs::remove_file(&tmp_file).await;
+                return Err(e);
+            }
+        };
+    if let Err(e) = set_from_tmp_file(file, &tmp_file, data_len).await {
+        let _ = tokio::fs::remove_file(&tmp_file).await;
         return Err(anyhow::anyhow!(
             "set file {} to disk cache failed: {}",
             file,
@@ -1121,8 +1177,10 @@ fn get_etag(metadata: &std::fs::Metadata) -> String {
     format!("{mtime:x}-{size:x}")
 }
 
-// Write data to a temporary random file and return the file path
-async fn write_tmp_file(file: &str, data: Bytes) -> Result<(String, String), anyhow::Error> {
+/// Allocate a unique tmp-file path under the cache's tmp dir (creating the
+/// dir). Streamed downloads (H3) write into this path directly; the buffered
+/// [`write_tmp_file`] fills it with in-memory bytes.
+async fn alloc_tmp_file_path() -> Result<String, anyhow::Error> {
     let tmp_path = format!(
         "{}/{}",
         get_config().common.data_tmp_dir,
@@ -1137,15 +1195,20 @@ async fn write_tmp_file(file: &str, data: Bytes) -> Result<(String, String), any
     }
     let tmp_path = tokio::fs::canonicalize(&tmp_path).await.unwrap();
     let tmp_file = tmp_path.join(format!("{}.tmp", config::ider::generate()));
-    let tmp_file = tmp_file.to_str().unwrap();
-    if let Err(e) = config::utils::async_file::put_file_contents(tmp_file, &data).await {
+    Ok(tmp_file.to_str().unwrap().to_string())
+}
+
+// Write data to a temporary random file and return the file path
+async fn write_tmp_file(file: &str, data: Bytes) -> Result<(String, String), anyhow::Error> {
+    let tmp_file = alloc_tmp_file_path().await?;
+    if let Err(e) = config::utils::async_file::put_file_contents(&tmp_file, &data).await {
         return Err(anyhow::anyhow!(
             "[FileData::Disk] write tmp file {}, failed: {}",
             tmp_file,
             e
         ));
     }
-    Ok((file.to_string(), tmp_file.to_string()))
+    Ok((file.to_string(), tmp_file))
 }
 
 #[cfg(test)]

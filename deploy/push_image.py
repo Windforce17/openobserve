@@ -69,6 +69,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tag", required=True)
     ap.add_argument("--prev-tag", help="tag whose image the new one must DIFFER from (default: NN-1)")
+    ap.add_argument("--arm64", action="store_true",
+                    help="also image target/aarch64-unknown-linux-gnu/release/openobserve and "
+                         "push {tag} as a MULTI-ARCH manifest list (amd64+arm64). The same "
+                         "provenance gates run on both binaries; per-arch images are pushed "
+                         "as {tag}-amd64/{tag}-arm64 and stitched with docker manifest.")
     args = ap.parse_args()
     tag = args.tag
     prev = args.prev_tag
@@ -88,15 +93,19 @@ def main():
     head_ct = int(out(["git", "-C", REPO, "log", "-1", "--format=%ct",
                        "--", "src", "Cargo.toml", "Cargo.lock", "web"]).strip())
 
-    binary = os.path.join(REPO, "target/release/openobserve")
-    if os.path.getmtime(binary) <= head_ct:
-        sys.exit("ABORT: target/release/openobserve predates HEAD commit — stale artifact (rebuild!)")
-    with open(binary, "rb") as f:
-        data = f.read()
-    if b"mimalloc" not in data:
-        sys.exit("ABORT: binary does not embed mimalloc")
-    sha = hashlib.sha256(data).hexdigest()
-    print(f"binary sha256={sha} size={len(data)/1e6:.0f}MB commit={commit}")
+    binaries = {"amd64": os.path.join(REPO, "target/release/openobserve")}
+    if args.arm64:
+        binaries["arm64"] = os.path.join(
+            REPO, "target/aarch64-unknown-linux-gnu/release/openobserve")
+    for arch, binary in binaries.items():
+        if os.path.getmtime(binary) <= head_ct:
+            sys.exit(f"ABORT: {binary} predates HEAD commit — stale artifact (rebuild!)")
+        with open(binary, "rb") as f:
+            data = f.read()
+        if b"mimalloc" not in data:
+            sys.exit(f"ABORT: {arch} binary does not embed mimalloc")
+        sha = hashlib.sha256(data).hexdigest()
+        print(f"{arch} binary sha256={sha} size={len(data)/1e6:.0f}MB commit={commit}")
 
     prev_digests = set(amd64_digests(*REGISTRIES[0][:2], prev))
     print(f"prev tag {prev} amd64 digests: {sorted(prev_digests) or 'none (skip digest gate)'}")
@@ -105,31 +114,57 @@ def main():
     # the raw binary carry full DWARF (~4.4GB since .40; 364MB before) and
     # rolls pay the pull. zlib-compressed debug keeps addr2line/perf usable
     # at a fraction of the bytes. Falls back to a plain copy if objcopy is
-    # unavailable.
-    ctx_bin = os.path.join(CTX, "openobserve")
-    try:
-        sh(["objcopy", "--compress-debug-sections=zlib", binary, ctx_bin])
-        os.chmod(ctx_bin, 0o755)
-        print(f"debug-compressed image binary: {os.path.getsize(ctx_bin)/1e6:.0f}MB (raw {len(data)/1e6:.0f}MB)")
-    except Exception as e:
-        print(f"objcopy compress failed ({e}); shipping raw binary")
-        shutil.copy2(binary, ctx_bin)
+    # unavailable. Cross binaries get the target-prefixed objcopy.
+    OBJCOPY = {"amd64": "objcopy", "arm64": "aarch64-linux-gnu-objcopy"}
+    PLATFORM = {"amd64": "linux/amd64", "arm64": "linux/arm64"}
     with open(os.path.join(CTX, "GIT_COMMIT"), "w") as f:
         f.write(commit + "\n")
-    tags = [f"{reg}/devops/obs:{tag}" for _, _, reg in REGISTRIES]
-    sh(["docker", "build", "--network=host", "--build-arg", f"GIT_COMMIT={commit}",
-        *sum((["-t", t] for t in tags), []), CTX])
+    ctx_bin = os.path.join(CTX, "openobserve")
+    multi = args.arm64
+    arch_tags = {a: (f"{tag}-{a}" if multi else tag) for a in binaries}
+    for arch, binary in binaries.items():
+        try:
+            sh([OBJCOPY[arch], "--compress-debug-sections=zlib", binary, ctx_bin])
+            os.chmod(ctx_bin, 0o755)
+            print(f"{arch} debug-compressed image binary: {os.path.getsize(ctx_bin)/1e6:.0f}MB")
+        except Exception as e:
+            print(f"{arch} objcopy compress failed ({e}); shipping raw binary")
+            shutil.copy2(binary, ctx_bin)
+        tags = [f"{reg}/devops/obs:{arch_tags[arch]}" for _, _, reg in REGISTRIES]
+        sh(["docker", "build", "--network=host", "--platform", PLATFORM[arch],
+            "--build-arg", f"GIT_COMMIT={commit}",
+            *sum((["-t", t] for t in tags), []), CTX])
 
     for profile, region, reg in REGISTRIES:
         pw = out(["aws", "ecr", "get-login-password", "--profile", profile, "--region", region])
         subprocess.run(["docker", "login", "--username", "AWS", "--password-stdin", reg],
                        input=pw, text=True, check=True, capture_output=True)
-        sh(["docker", "push", f"{reg}/devops/obs:{tag}"])
+        for arch in binaries:
+            sh(["docker", "push", f"{reg}/devops/obs:{arch_tags[arch]}"])
+        if multi:
+            # one tag serving both archs: nodes pull their platform's image,
+            # so the migration/rollback is manifest-only. imagetools (not
+            # `docker manifest create`) because BuildKit pushes each arch
+            # tag as its own manifest LIST (provenance wrapper), which the
+            # legacy command refuses to nest.
+            sh(["docker", "buildx", "imagetools", "create",
+                "-t", f"{reg}/devops/obs:{tag}",
+                *[f"{reg}/devops/obs:{arch_tags[a]}" for a in binaries]])
 
     new_digests = set(amd64_digests(*REGISTRIES[0][:2], tag))
     print(f"pushed amd64 digests: {sorted(new_digests)}")
     if prev_digests and new_digests & prev_digests:
         sys.exit(f"ABORT: pushed image is IDENTICAL to {prev} — stale binary shipped AGAIN")
+    if args.arm64:
+        arm = [s for m in [json.loads(out(["aws", "ecr", "batch-get-image", "--profile",
+                REGISTRIES[0][0], "--region", REGISTRIES[0][1],
+                "--repository-name", "devops/obs", "--image-ids", f"imageTag={tag}",
+                "--query", "images[0].imageManifest", "--output", "text"]))]
+               for s in m.get("manifests", [])
+               if s.get("platform", {}).get("architecture") == "arm64"]
+        if not arm:
+            sys.exit("ABORT: multi-arch push requested but the manifest list carries no arm64 entry")
+        print(f"pushed arm64 digests: {[s['digest'] for s in arm]}")
     for f in ("openobserve", "GIT_COMMIT"):
         os.remove(os.path.join(CTX, f))
     print(f"OK: {tag} pushed to both registries (commit {commit[:12]}, differs from {prev})")

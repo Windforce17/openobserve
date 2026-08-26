@@ -2499,6 +2499,7 @@ dependencies = [
  "aws-sdk-sns",
  "axum",
  "axum-client-ip",
+ "backtrace",
  "base64 0.22.1",
  "bytes",
  "chromiumoxide",
@@ -7311,6 +7312,7 @@ name = "openobserve-api-query"
 version = "0.1.0"
 dependencies = [
  "arrow-schema",
+ "async-stream",
  "axum",
  "bytes",
  "chrono",
@@ -7380,6 +7382,7 @@ dependencies = [
  "log",
  "maxminddb",
  "md5",
+ "mimalloc",
  "multer",
  "o2_dex",
  "o2_enterprise",
@@ -7441,6 +7444,7 @@ dependencies = [
  "bytes",
  "chrono",
  "config",
+ "datafusion",
  "futures",
  "hashbrown 0.16.1",
  "infra",
@@ -7458,6 +7462,7 @@ dependencies = [
  "reqwest 0.13.2",
  "segment_wal",
  "serde_json",
+ "tempfile",
  "tokio",
  "tonic",
  "wal",
@@ -10650,6 +10655,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "sonic-number"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3775c3390edf958191f1ab1e8c5c188907feebd0f3ce1604cb621f72961dbf32"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
+name = "sonic-rs"
+version = "0.5.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d971cc77a245ccf1756dbd1a87c3e7f709c0191464096510d43eec056d0f2c4f"
+dependencies = [
+ "ahash 0.8.12",
+ "bumpalo",
+ "bytes",
+ "cfg-if",
+ "faststr",
+ "itoa",
+ "ref-cast",
+ "serde",
+ "simdutf8",
+ "sonic-number",
+ "sonic-simd",
+ "thiserror 2.0.18",
+ "zmij",
+]
+
+[[package]]
+name = "sonic-simd"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f99e664ecd2d85a68c87e3c7a3cfe691f647ea9e835de984aba4d54a41f817d4"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "sourcemap"
 version = "9.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12418,8 +12462,6 @@ dependencies = [
 [[package]]
 name = "vortex-array"
 version = "0.79.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a84e86528b45b08efcdfbb7fd2f8380fac7fc5b627c7954bc016204e7935580"
 dependencies = [
  "arc-swap",
  "arcref",
@@ -12798,8 +12840,6 @@ dependencies = [
 [[package]]
 name = "vortex-layout"
 version = "0.79.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "022f7b4bf55b5f920aa9c2f69a5a6dab3f078187acf176c1ed6b1b939f20e2f4"
 dependencies = [
  "arcref",
  "arrow-array",
@@ -13011,6 +13051,7 @@ dependencies = [
  "anyhow",
  "arrow",
  "arrow-schema",
+ "async-trait",
  "bitpacking",
  "bytes",
  "futures",
@@ -13026,6 +13067,7 @@ dependencies = [
  "ryu",
  "serde",
  "serde_json",
+ "sonic-rs",
  "tantivy-fst",
  "tempfile",
  "thiserror 2.0.18",

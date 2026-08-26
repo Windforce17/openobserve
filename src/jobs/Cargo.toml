@@ -46,3 +46,10 @@ serde_json.workspace = true
 tokio.workspace = true
 tonic.workspace = true
 wal.workspace = true
+
+[dev-dependencies]
+# M12: the memory-backoff pin constructs a REAL DataFusion
+# ResourcesExhausted error to prove is_resources_exhausted matches the
+# canonical display through an anyhow context chain.
+datafusion.workspace = true
+tempfile.workspace = true

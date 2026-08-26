@@ -55,6 +55,8 @@ use config::{TIMESTAMP_COL_NAME, meta::inverted_index::MAX_SIMPLE_TOPN_FIELDS};
 use hashbrown::HashMap;
 use vortex_index::VixReader;
 
+use super::result::MinMaxValue;
+
 /// Whether the file can serve reads of `name` through the docs-column
 /// chokepoint (a `docs`-blob column). Files that predate a
 /// `column_store_fields` setting lack the column and must fall back to a
@@ -68,12 +70,19 @@ pub(super) fn docs_column_available(reader: &VixReader, name: &str) -> anyhow::R
 /// cannot serve from its docs columns (the file predates the
 /// `column_store_fields` setting), if any — such a file falls back to the
 /// scan path.
+///
+/// `_source` is treated as always-missing here even though it IS a docs
+/// column: serving a group-by/distinct over it through the fast paths
+/// would materialize the ENTIRE column (every row's full JSON) into one
+/// arrow array (`read_docs_column`), silently — a multi-GB allocation and
+/// an i32-offset-overflow hazard on big files. The scan branch streams it
+/// chunk by chunk instead.
 pub(super) fn missing_docs_column(
     reader: &VixReader,
     rule: &config::meta::inverted_index::IndexOptimizeMode,
 ) -> anyhow::Result<Option<String>> {
     for field in rule.referenced_fields() {
-        if !docs_column_available(reader, &field)? {
+        if field == vortex_index::SOURCE_COL_NAME || !docs_column_available(reader, &field)? {
             return Ok(Some(field));
         }
     }
@@ -170,11 +179,24 @@ impl RowAccess {
 /// (`ascend` = `ORDER BY _timestamp ASC`), as `(_timestamp, doc_id)` pairs,
 /// timestamp-ordered best-first.
 ///
-/// Docs rows are stored `ORDER BY _timestamp DESC`, so ascending doc ids
-/// are descending timestamps. The exact per-candidate timestamps are
-/// read back for the cross-file merge, and the final sort is on those
-/// timestamps, so a not-perfectly-sorted file only costs accuracy at the
-/// truncation boundary (as before).
+/// Sorted files (`row_order` ts_desc — every historical file): docs rows
+/// are stored `ORDER BY _timestamp DESC`, so ascending doc ids are
+/// descending timestamps and the best rows are the first (DESC) / last
+/// (ASC) set bits. The exact per-candidate timestamps are read back for the
+/// cross-file merge, and the final sort is on those timestamps, so a
+/// not-perfectly-sorted file only costs accuracy at the truncation boundary
+/// (as before).
+///
+/// #51c-c CONCAT-order files are NOT globally sorted — doc-id position says
+/// nothing about recency, so the positional shortcut would return wrong
+/// candidates (and, through the pruner merge, wrong query results). M4
+/// (§6.2): a concat file with a PROVEN region decomposition narrows the
+/// work piecewise — within a region rows ARE ts_desc, so each region's
+/// best `limit` matched rows are its first (DESC) / last (ASC) set bits,
+/// and only that candidate union's `_timestamp`s are read (≤ regions ×
+/// limit values instead of every matched row) before the exact value-based
+/// top-`limit`. A concat file WITHOUT proven regions reads every matched
+/// row's `_timestamp` (the by-value fallback) — exact either way.
 pub(super) fn simple_select(
     reader: &VixReader,
     bitmap: &BooleanBuffer,
@@ -185,6 +207,12 @@ pub(super) fn simple_select(
     let take = limit.min(matched);
     if take == 0 {
         return Ok(Vec::new());
+    }
+    if !reader.row_order().is_ts_desc() {
+        if let Some(regions) = reader.ts_desc_row_ranges() {
+            return simple_select_piecewise(reader, bitmap, take, ascend, &regions);
+        }
+        return simple_select_by_value(reader, bitmap, take, ascend);
     }
     // best rows: newest first for DESC = the first set bits (rows are stored
     // newest-first); oldest first for ASC = the last set bits
@@ -213,6 +241,106 @@ pub(super) fn simple_select(
         candidates.sort_unstable();
     } else {
         candidates.sort_unstable_by(|a, b| b.cmp(a));
+    }
+    Ok(candidates)
+}
+
+/// [`simple_select`] for files whose stored order proves nothing (#51c-c
+/// concat files without proven regions): read every matched row's
+/// `_timestamp` and select the true top-`take` by VALUE (partial select,
+/// then the best-first sort the pruner merge requires). Doc-id order never
+/// enters the result.
+fn simple_select_by_value(
+    reader: &VixReader,
+    bitmap: &BooleanBuffer,
+    take: usize,
+    ascend: bool,
+) -> anyhow::Result<Vec<(i64, u32)>> {
+    let rows: Vec<u64> = bitmap.set_indices().map(|i| i as u64).collect();
+    select_top_by_value(reader, rows, take, ascend)
+}
+
+/// §6.2 M4: [`simple_select`] over a PROVEN region decomposition — each
+/// region is internally ts_desc, so its best `take` matched rows are its
+/// first (DESC) / last (ASC) set bits; the global exact top-`take` lives in
+/// that candidate union (a region contributes a positional prefix/suffix of
+/// its matched rows to any timestamp top-k). Only the candidates'
+/// `_timestamp`s are read. Equal timestamps across the per-region cut may
+/// resolve to different doc ids than the full by-value walk — an equally
+/// correct tie subset (ORDER BY `_timestamp` constrains only timestamps).
+fn simple_select_piecewise(
+    reader: &VixReader,
+    bitmap: &BooleanBuffer,
+    take: usize,
+    ascend: bool,
+    regions: &[std::ops::Range<u64>],
+) -> anyhow::Result<Vec<(i64, u32)>> {
+    let mut candidates: Vec<u64> = Vec::new();
+    for region in regions {
+        let start = region.start as usize;
+        let len = (region.end - region.start) as usize;
+        let window = bitmap.slice(start, len);
+        let matched = window.count_set_bits();
+        if matched == 0 {
+            continue;
+        }
+        let keep = take.min(matched);
+        if ascend {
+            // oldest = the region's LAST set bits
+            candidates.extend(
+                window
+                    .set_indices()
+                    .skip(matched - keep)
+                    .map(|i| (start + i) as u64),
+            );
+        } else {
+            // newest = the region's FIRST set bits
+            candidates.extend(window.set_indices().take(keep).map(|i| (start + i) as u64));
+        }
+    }
+    select_top_by_value(reader, candidates, take, ascend)
+}
+
+/// Exact top-`take` of `rows` by `_timestamp` VALUE (partial select, then
+/// the best-first sort the pruner merge requires); equal timestamps prefer
+/// the smaller doc id among the given rows.
+fn select_top_by_value(
+    reader: &VixReader,
+    rows: Vec<u64>,
+    take: usize,
+    ascend: bool,
+) -> anyhow::Result<Vec<(i64, u32)>> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let timestamps = read_timestamps(reader, Some(&rows))?;
+    if timestamps.null_count() > 0 {
+        return Err(anyhow::anyhow!(
+            "missing {TIMESTAMP_COL_NAME} value in select candidates"
+        ));
+    }
+    let mut candidates: Vec<(i64, u32)> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, &row)| (timestamps.value(i), row as u32))
+        .collect();
+    // exact top-`take` by timestamp; equal timestamps prefer the smaller
+    // doc id (deterministic; a tie subset is equally correct for ORDER BY
+    // _timestamp, which constrains only the timestamp)
+    let desc = |a: &(i64, u32), b: &(i64, u32)| b.0.cmp(&a.0).then(a.1.cmp(&b.1));
+    let take = take.min(candidates.len());
+    if take < candidates.len() {
+        if ascend {
+            candidates.select_nth_unstable(take - 1);
+        } else {
+            candidates.select_nth_unstable_by(take - 1, desc);
+        }
+        candidates.truncate(take);
+    }
+    if ascend {
+        candidates.sort_unstable();
+    } else {
+        candidates.sort_unstable_by(desc);
     }
     Ok(candidates)
 }
@@ -433,6 +561,444 @@ pub(super) fn ranked_count_in_window(
         }
     }
     Ok(count)
+}
+
+/// M16: the per-column chunk-stats table of `field`, validated to align
+/// 1:1 with the zone table (the stats writer emits one row per zone entry;
+/// anything else is untrustworthy — fail open). `None` = no zone table, no
+/// stats blob, or no rows for this column (density-gated).
+fn column_stats_table<'a>(
+    reader: &'a VixReader,
+    field: &str,
+) -> Option<(
+    &'a [vortex_index::ZoneChunk],
+    &'a vortex_index::ColumnChunkStats,
+)> {
+    let zone = reader.zone_chunks()?;
+    let table = reader.column_chunk_stats()?.columns.get(field)?;
+    (table.chunks.len() == zone.len()).then_some((zone, table))
+}
+
+/// M16 count(field): the non-null count of one docs column over the file —
+/// stats-answered wherever per-chunk presence counts exist, decode
+/// elsewhere; EXACTLY equal to the full-decode count by construction
+/// (stats are exact: immutable files, no deletes, splice-pinned).
+///
+/// - `bitmap` (conditioned evaluations): count the valid values over the matched rows — the normal
+///   path, no stats shortcut (a subset of a chunk proves nothing).
+/// - no bitmap + no `window` (condition-all, file fully inside the query range): the file-level
+///   presence count from the `columns` property answers outright (v3 writers stamp it; merges sum
+///   it); unknown (M1 entry) falls to the full decode.
+/// - no bitmap + `window` (condition-all, straddling file): chunks fully inside the window
+///   contribute their stats row's `present`; boundary chunks — and chunks without a stats row —
+///   decode their rows (validity + `_timestamp` window check).
+pub(super) fn count_field(
+    reader: &VixReader,
+    field: &str,
+    window: Option<(i64, i64)>,
+    bitmap: Option<&BooleanBuffer>,
+) -> anyhow::Result<u64> {
+    // conditioned: the bitmap already folds the window clamp
+    if let Some(bitmap) = bitmap {
+        if bitmap.count_set_bits() == 0 {
+            return Ok(0);
+        }
+        let access = RowAccess::plan(bitmap);
+        let column = match access.point_rows() {
+            Some(rows) => reader.read_docs_column_rows(field, rows)?,
+            None => reader.read_docs_column(field)?,
+        };
+        let mut count = 0u64;
+        access.for_each_position(bitmap, column.len(), |i| {
+            if column.is_valid(i) {
+                count += 1;
+            }
+        });
+        return Ok(count);
+    }
+    let Some((start, end)) = window else {
+        // fully covered: the file-level presence count IS the answer
+        if let Some((_, Some(present))) = reader
+            .column_presence()
+            .iter()
+            .find(|(name, _)| name == field)
+        {
+            return Ok(*present);
+        }
+        // M1-era unknown presence: full decode
+        let column = reader.read_docs_column(field)?;
+        return Ok((column.len() - column.null_count()) as u64);
+    };
+    // straddling: fold covered chunks from stats, decode the rest
+    let stats = column_stats_table(reader, field);
+    let mut count = 0u64;
+    let mut decode_rows: Vec<u64> = Vec::new();
+    match reader.zone_chunks() {
+        Some(chunks) => {
+            for (index, chunk) in chunks.iter().enumerate() {
+                if chunk.ts_max < start || chunk.ts_min >= end {
+                    continue; // whole chunk outside the window
+                }
+                let fully_inside = chunk.ts_min >= start && chunk.ts_max < end;
+                if fully_inside
+                    && let Some((_, table)) = &stats
+                    && let Some(Some(stat)) = table.chunks.get(index)
+                {
+                    count += stat.present;
+                    continue;
+                }
+                decode_rows.extend(chunk.row_offset..chunk.row_offset + chunk.row_count);
+            }
+        }
+        None => {
+            // no zone table (M1 files): decode everything
+            decode_rows.extend(0..reader.row_count());
+        }
+    }
+    if !decode_rows.is_empty() {
+        let column = reader.read_docs_column_rows(field, &decode_rows)?;
+        let timestamps = read_timestamps(reader, Some(&decode_rows))?;
+        for i in 0..column.len() {
+            if column.is_valid(i) && timestamps.is_valid(i) {
+                let ts = timestamps.value(i);
+                if ts >= start && ts < end {
+                    count += 1;
+                }
+            }
+        }
+    }
+    Ok(count)
+}
+
+/// M16: the numeric family of one docs column for the min/max arm —
+/// `None` for non-numeric stored types (string stats are prefix-bounded
+/// and must NEVER answer; the caller degrades the file to the scan branch).
+pub(super) fn min_max_family(
+    reader: &VixReader,
+    field: &str,
+) -> anyhow::Result<Option<MinMaxFamily>> {
+    let schema = reader.docs_schema()?;
+    let Ok(field) = schema.field_with_name(field) else {
+        return Ok(None);
+    };
+    Ok(match field.data_type() {
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
+            Some(MinMaxFamily::I64)
+        }
+        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
+            Some(MinMaxFamily::U64)
+        }
+        DataType::Float16 | DataType::Float32 | DataType::Float64 => Some(MinMaxFamily::F64),
+        _ => None,
+    })
+}
+
+/// The numeric family a min/max evaluation folds in (the docs column's
+/// stored family; the stats table's tag must agree).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) enum MinMaxFamily {
+    I64,
+    U64,
+    F64,
+}
+
+impl MinMaxFamily {
+    fn stats_tag(&self) -> &'static str {
+        match self {
+            MinMaxFamily::I64 => "i64",
+            MinMaxFamily::U64 => "u64",
+            MinMaxFamily::F64 => "f64",
+        }
+    }
+
+    /// The stats bound as a fold value; `None` for cross-tag values
+    /// (defensive — the tag gate upstream should prevent it) and NaN.
+    fn stat_value(&self, value: &vortex_index::StatValue) -> Option<MinMaxValue> {
+        use vortex_index::StatValue;
+        match (self, value) {
+            (MinMaxFamily::I64, StatValue::I64(v)) => Some(MinMaxValue::I64(*v)),
+            (MinMaxFamily::U64, StatValue::U64(v)) => Some(MinMaxValue::U64(*v)),
+            (MinMaxFamily::F64, StatValue::F64(v)) => {
+                (!v.is_nan()).then_some(MinMaxValue::F64(*v))
+            }
+            _ => None,
+        }
+    }
+
+    /// Cast one decoded arrow column to the family's widest type for the
+    /// per-row fold.
+    fn cast_column(&self, column: &ArrayRef) -> anyhow::Result<ArrayRef> {
+        let target = match self {
+            MinMaxFamily::I64 => DataType::Int64,
+            MinMaxFamily::U64 => DataType::UInt64,
+            MinMaxFamily::F64 => DataType::Float64,
+        };
+        cast(column, &target).map_err(|e| anyhow::anyhow!("column cast for min/max: {e}"))
+    }
+
+    /// Row `i` of a family-cast column as a fold value (`None` = null, or a
+    /// NaN float — excluded from folds exactly like the stats builder).
+    fn row_value(&self, column: &ArrayRef, i: usize) -> Option<MinMaxValue> {
+        if column.is_null(i) {
+            return None;
+        }
+        match self {
+            MinMaxFamily::I64 => column
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .map(|a| MinMaxValue::I64(a.value(i))),
+            MinMaxFamily::U64 => column
+                .as_any()
+                .downcast_ref::<arrow::array::UInt64Array>()
+                .map(|a| MinMaxValue::U64(a.value(i))),
+            MinMaxFamily::F64 => column
+                .as_any()
+                .downcast_ref::<arrow::array::Float64Array>()
+                .and_then(|a| {
+                    let v = a.value(i);
+                    (!v.is_nan()).then_some(MinMaxValue::F64(v))
+                }),
+        }
+    }
+}
+
+/// M16 min/max(field) for NUMERIC columns — per-chunk EXACT min/max stats
+/// fold for covered chunks, decode for boundary/stats-less chunks;
+/// `None` result = no non-null (non-NaN) value matched. Same
+/// window/bitmap contract as [`count_field`]. String columns never reach
+/// here (the caller gates on [`min_max_family`]).
+pub(super) fn min_max_field(
+    reader: &VixReader,
+    field: &str,
+    family: MinMaxFamily,
+    is_max: bool,
+    window: Option<(i64, i64)>,
+    bitmap: Option<&BooleanBuffer>,
+) -> anyhow::Result<Option<MinMaxValue>> {
+    let mut best: Option<MinMaxValue> = None;
+    let mut fold = |value: MinMaxValue, best: &mut Option<MinMaxValue>| {
+        *best = Some(match best.take() {
+            Some(current) => current.fold(value, is_max),
+            None => value,
+        });
+    };
+    // conditioned: decode the matched rows (a chunk subset proves nothing)
+    if let Some(bitmap) = bitmap {
+        if bitmap.count_set_bits() == 0 {
+            return Ok(None);
+        }
+        let access = RowAccess::plan(bitmap);
+        let column = match access.point_rows() {
+            Some(rows) => reader.read_docs_column_rows(field, rows)?,
+            None => reader.read_docs_column(field)?,
+        };
+        let column = family.cast_column(&column)?;
+        access.for_each_position(bitmap, column.len(), |i| {
+            if let Some(value) = family.row_value(&column, i) {
+                fold(value, &mut best);
+            }
+        });
+        return Ok(best);
+    }
+    // condition-all: stats fold + boundary/unknown decode. `_timestamp`'s
+    // stats ARE the zone table (per-chunk exact inclusive min/max of the
+    // stored values; the stats blob deliberately excludes the column).
+    let ts_zone_served = field == TIMESTAMP_COL_NAME && family == MinMaxFamily::I64;
+    let stats = column_stats_table(reader, field)
+        .filter(|(_, table)| table.tag == family.stats_tag());
+    let mut decode_rows: Vec<u64> = Vec::new();
+    match reader.zone_chunks() {
+        Some(chunks) => {
+            for (index, chunk) in chunks.iter().enumerate() {
+                if let Some((start, end)) = window
+                    && (chunk.ts_max < start || chunk.ts_min >= end)
+                {
+                    continue; // whole chunk outside the window
+                }
+                let fully_inside = window.is_none_or(|(start, end)| {
+                    chunk.ts_min >= start && chunk.ts_max < end
+                });
+                if fully_inside {
+                    if ts_zone_served {
+                        fold(
+                            MinMaxValue::I64(if is_max { chunk.ts_max } else { chunk.ts_min }),
+                            &mut best,
+                        );
+                        continue;
+                    }
+                    if let Some((_, table)) = &stats
+                        && let Some(Some(stat)) = table.chunks.get(index)
+                    {
+                        if stat.present == 0 {
+                            continue; // all-null chunk contributes nothing
+                        }
+                        let bound = if is_max { &stat.max } else { &stat.min };
+                        if let Some(value) = bound.as_ref().and_then(|b| family.stat_value(b)) {
+                            fold(value, &mut best);
+                            continue;
+                        }
+                        // present values but no usable bound: decode the chunk
+                    }
+                }
+                decode_rows.extend(chunk.row_offset..chunk.row_offset + chunk.row_count);
+            }
+        }
+        None => decode_rows.extend(0..reader.row_count()),
+    }
+    if !decode_rows.is_empty() {
+        let column = reader.read_docs_column_rows(field, &decode_rows)?;
+        let column = family.cast_column(&column)?;
+        let timestamps = match window {
+            Some(_) => Some(read_timestamps(reader, Some(&decode_rows))?),
+            None => None,
+        };
+        for i in 0..column.len() {
+            if let Some((start, end)) = window {
+                let ts = timestamps.as_ref().expect("read above");
+                if ts.is_null(i) {
+                    continue;
+                }
+                let t = ts.value(i);
+                if t < start || t >= end {
+                    continue;
+                }
+            }
+            if let Some(value) = family.row_value(&column, i) {
+                fold(value, &mut best);
+            }
+        }
+    }
+    Ok(best)
+}
+
+/// M16 chunk-decidable equality (DESIGN §4): the EXACT match bitmap of a
+/// single numeric equality/IN conjunct, decided per chunk from the stats
+/// table wherever possible and decoded elsewhere — the serve for
+/// count-shaped aggregates whose conjunct the term index cannot answer
+/// (#40/#42 index-off files, partial fields).
+///
+/// Per chunk: `present == 0` ⇒ no row matches (null-rejecting predicate);
+/// every value outside `[min, max]` ⇒ no row matches; `present ==
+/// row_count && min == max == v` for some probed value ⇒ EVERY row matches
+/// (no nulls, all values equal v); anything else decodes the chunk and
+/// compares per row. `Ok(None)` = no basis (no zone table, non-matching
+/// type families, unparseable literals): the caller keeps today's path.
+///
+/// STRICT family gate: `Int` literals serve int-family columns, `Float`
+/// literals float-family columns — cross-family coercions (the engine's
+/// json_get semantics) never take this arm.
+pub(super) fn stats_eq_bitmap(
+    reader: &VixReader,
+    field: &str,
+    values: &[String],
+    kind: crate::index::NumericKind,
+) -> anyhow::Result<Option<BooleanBuffer>> {
+    use arrow::array::BooleanBufferBuilder;
+
+    if values.is_empty() {
+        return Ok(None);
+    }
+    let Some(chunks) = reader.zone_chunks() else {
+        return Ok(None); // no chunk geometry: nothing to decide with
+    };
+    let Some(family) = min_max_family(reader, field)? else {
+        return Ok(None);
+    };
+    // strict kind<->family pairing (no cross-family coercion here)
+    let family_ok = match kind {
+        crate::index::NumericKind::Int => {
+            matches!(family, MinMaxFamily::I64 | MinMaxFamily::U64)
+        }
+        crate::index::NumericKind::Float => matches!(family, MinMaxFamily::F64),
+        crate::index::NumericKind::Bool => false,
+    };
+    if !family_ok {
+        return Ok(None);
+    }
+    // parse the probed literals into the column family; any unparseable
+    // text refuses the arm (never guess normalization)
+    let mut probes: Vec<MinMaxValue> = Vec::with_capacity(values.len());
+    for text in values {
+        let parsed = match family {
+            MinMaxFamily::I64 => text.parse::<i64>().ok().map(MinMaxValue::I64),
+            MinMaxFamily::U64 => text.parse::<u64>().ok().map(MinMaxValue::U64),
+            MinMaxFamily::F64 => text
+                .parse::<f64>()
+                .ok()
+                .filter(|v| v.is_finite())
+                .map(MinMaxValue::F64),
+        };
+        match parsed {
+            Some(value) => probes.push(value),
+            None => return Ok(None),
+        }
+    }
+    let stats = column_stats_table(reader, field)
+        .filter(|(_, table)| table.tag == family.stats_tag());
+    let len = reader.row_count() as usize;
+    let mut builder = BooleanBufferBuilder::new(len);
+    builder.append_n(len, false);
+    let mut decode_rows: Vec<u64> = Vec::new();
+    let eq = |a: &MinMaxValue, b: &MinMaxValue| -> bool {
+        matches!(a.cmp_exact(b), Some(std::cmp::Ordering::Equal))
+    };
+    for (index, chunk) in chunks.iter().enumerate() {
+        let stat = stats
+            .as_ref()
+            .and_then(|(_, table)| table.chunks.get(index))
+            .and_then(|row| row.as_ref());
+        let verdict = match stat {
+            Some(stat) if stat.present == 0 => Some(false), // no values: no matches
+            Some(stat) => {
+                let min = stat.min.as_ref().and_then(|b| family.stat_value(b));
+                let max = stat.max.as_ref().and_then(|b| family.stat_value(b));
+                match (min, max) {
+                    (Some(min), Some(max)) => {
+                        let all_outside = probes.iter().all(|p| {
+                            matches!(p.cmp_exact(&min), Some(std::cmp::Ordering::Less))
+                                || matches!(
+                                    p.cmp_exact(&max),
+                                    Some(std::cmp::Ordering::Greater)
+                                )
+                        });
+                        if all_outside {
+                            Some(false)
+                        } else if stat.present == chunk.row_count
+                            && eq(&min, &max)
+                            && probes.iter().any(|p| eq(p, &min))
+                        {
+                            Some(true) // no nulls, every value == a probe
+                        } else {
+                            None // inconclusive: decode
+                        }
+                    }
+                    _ => None, // missing bound: decode
+                }
+            }
+            None => None, // no stats row: decode
+        };
+        match verdict {
+            Some(false) => {}
+            Some(true) => {
+                for row in chunk.row_offset..chunk.row_offset + chunk.row_count {
+                    builder.set_bit(row as usize, true);
+                }
+            }
+            None => decode_rows.extend(chunk.row_offset..chunk.row_offset + chunk.row_count),
+        }
+    }
+    if !decode_rows.is_empty() {
+        let column = reader.read_docs_column_rows(field, &decode_rows)?;
+        let column = family.cast_column(&column)?;
+        for (i, &row) in decode_rows.iter().enumerate() {
+            if let Some(value) = family.row_value(&column, i)
+                && probes.iter().any(|p| eq(p, &value))
+            {
+                builder.set_bit(row as usize, true);
+            }
+        }
+    }
+    Ok(Some(builder.finish()))
 }
 
 /// Add row `i` of `timestamps` to its histogram bucket (the exact per-row
@@ -865,7 +1431,10 @@ pub(super) fn unfiltered_top_n(
     // `max_groups` regardless of the field's cardinality (the old
     // full-dictionary walk peaked at ~2GB on a 16M-distinct field)
     let Some((counts, truncated)) = reader.field_value_top_k(field, max_groups, ascend)? else {
-        log::info!(
+        // debug: with the M13 dictionary-first dispatch this fires for
+        // EVERY file on a refused field (e.g. bloom-only-demoted) — a
+        // per-file info line here is query-hot-path log spam
+        log::debug!(
             "search->vix: dict topn unavailable for field {field:?} \
              (fts/partial/mixed-typed/over-cap), falling back",
         );
@@ -983,7 +1552,9 @@ pub(super) fn unfiltered_distinct(
     // order, so the head/tail `limit` keys ARE the answer — resolve only
     // those instead of materializing every distinct value
     let Some(values) = reader.field_value_head(field, limit, !ascend)? else {
-        log::info!(
+        // debug: per-file on every refused field under the M13
+        // dictionary-first dispatch (see unfiltered_top_n)
+        log::debug!(
             "search->vix: dict distinct unavailable for field {field:?} \
              (fts/partial/mixed-typed), falling back",
         );
@@ -1004,8 +1575,17 @@ pub(super) fn unfiltered_distinct(
 /// partial fields, per-file type drift). Values are stringified like the
 /// docs-column path (numbers/bools via `to_string`); nulls/absent form no
 /// group.
+///
+/// The group map is HARD-CAPPED: on a high-cardinality field this last
+/// resort would otherwise accumulate one string per distinct value with no
+/// bound — the exact allocation-bomb shape #29 removed from the dictionary
+/// path. Exceeding the cap errors, which the caller degrades to the scan
+/// branch per file (DataFusion streams the same group-by in bounded
+/// batches instead).
 fn source_value_counts(reader: &VixReader, field: &str) -> anyhow::Result<HashMap<String, u64>> {
     const CHUNK_ROWS: usize = 65_536;
+    /// memory backstop: ~1M groups x ~50B avg entry ≈ tens of MB, transient
+    const MAX_SOURCE_GROUPS: usize = 1_000_000;
     let rows = reader.row_count();
     let mut counts: HashMap<String, u64> = HashMap::new();
     let mut row = 0u64;
@@ -1029,8 +1609,21 @@ fn source_value_counts(reader: &VixReader, field: &str) -> anyhow::Result<HashMa
                 Some(other) => *counts.entry(other.to_string()).or_insert(0) += 1,
             }
         }
+        if counts.len() > MAX_SOURCE_GROUPS {
+            return Err(anyhow::anyhow!(
+                "field {field:?} has more than {MAX_SOURCE_GROUPS} distinct values in the \
+                 _source fallback (scanned {} of {rows} rows) — the file degrades to the \
+                 scan branch",
+                row + take,
+            ));
+        }
         row += take;
     }
+    log::info!(
+        "search->vix: _source fallback walked {rows} rows of field {field:?} \
+         ({} distinct values)",
+        counts.len(),
+    );
     Ok(counts)
 }
 
@@ -1119,12 +1712,6 @@ mod tests {
             Field::new("ratio", DataType::Float64, true),
         ]));
         let opts = VixWriterOptions {
-            column_store_field_names: vec![
-                "level".to_string(),
-                "service".to_string(),
-                "code".to_string(),
-                "ratio".to_string(),
-            ],
             row_group_size: 4,
             ..Default::default()
         };
@@ -1195,7 +1782,7 @@ mod tests {
         writer
             .push_batch_with_source(&batch, &sources, None)
             .unwrap();
-        VixReader::open(bytes::Bytes::from(writer.finish().unwrap())).unwrap()
+        { let (data, index) = writer.finish().unwrap(); VixReader::open_with_index(bytes::Bytes::from(data), index.map(bytes::Bytes::from)).unwrap() }
     }
 
     fn all_set(len: usize) -> BooleanBuffer {
@@ -1291,6 +1878,70 @@ mod tests {
         // ASC: oldest 3, best (smallest ts) first
         let candidates = simple_select(&reader, &bitmap, 3, true).unwrap();
         assert_eq!(candidates, vec![(100, 7), (101, 6), (102, 5)]);
+    }
+
+    /// #51c-c: over a CONCAT-order file the positional shortcut is a lie —
+    /// the newest matched rows are NOT the first set bits. `simple_select`
+    /// must return the true value-based top-K (ASC and DESC, bitmap
+    /// respected, ties on the smaller doc id), or the pruner merge feeds
+    /// wrong candidates into `ORDER BY _timestamp LIMIT n` answers.
+    #[test]
+    fn test_simple_select_concat_order_file_selects_by_value() {
+        // two DESC runs back-to-back: [300, 250, 200] then [320, 270, 220]
+        let ts: Vec<i64> = vec![300, 250, 200, 320, 270, 220];
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "_timestamp",
+            DataType::Int64,
+            false,
+        )]));
+        let mut writer = VixWriter::new(
+            &schema,
+            VixWriterOptions {
+                concat_row_order: true,
+                ..Default::default()
+            },
+            false,
+        );
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(ts.clone()))],
+        )
+        .unwrap();
+        let sources: Vec<String> = ts
+            .iter()
+            .map(|t| format!(r#"{{"_timestamp":{t}}}"#))
+            .collect();
+        let sources = StringArray::from(sources);
+        writer
+            .push_batch_with_source(&batch, &sources, None)
+            .unwrap();
+        let reader = { let (data, index) = writer.finish().unwrap(); VixReader::open_with_index(bytes::Bytes::from(data), index.map(bytes::Bytes::from)).unwrap() };
+        assert!(
+            !reader.row_order().is_ts_desc(),
+            "the file under test must be concat-order"
+        );
+
+        // full bitmap: true top-3 DESC crosses both runs (320, 300, 270) —
+        // the positional shortcut would have said (300, 250, 200)
+        let bitmap = all_set(6);
+        let candidates = simple_select(&reader, &bitmap, 3, false).unwrap();
+        assert_eq!(candidates, vec![(320, 3), (300, 0), (270, 4)]);
+        // ASC: true oldest 3 (200, 220, 250) — positional said (320,270,220)
+        let candidates = simple_select(&reader, &bitmap, 3, true).unwrap();
+        assert_eq!(candidates, vec![(200, 2), (220, 5), (250, 1)]);
+
+        // bitmap respected: only docs 0, 2, 5 (ts 300, 200, 220) match
+        let bitmap = BooleanBuffer::from_iter([true, false, true, false, false, true]);
+        let candidates = simple_select(&reader, &bitmap, 2, false).unwrap();
+        assert_eq!(candidates, vec![(300, 0), (220, 5)]);
+        let candidates = simple_select(&reader, &bitmap, 2, true).unwrap();
+        assert_eq!(candidates, vec![(200, 2), (220, 5)]);
+        // limit >= matches returns them all, still value-ordered
+        let candidates = simple_select(&reader, &bitmap, 10, false).unwrap();
+        assert_eq!(candidates, vec![(300, 0), (220, 5), (200, 2)]);
+        // empty bitmap
+        let empty = BooleanBuffer::new_unset(6);
+        assert!(simple_select(&reader, &empty, 5, false).unwrap().is_empty());
     }
 
     #[test]
@@ -1853,13 +2504,12 @@ mod tests {
     /// order) with a `bd` utf8 column-store breakdown field. `docs_chunk_bytes
     /// = 1` blocks the zone table at the 64-row floor, so any dataset over ~64
     /// rows spans several chunks.
-    fn build_zone_file(ts: &[i64], bd: &[Option<&str>]) -> Vec<u8> {
+    fn build_zone_file(ts: &[i64], bd: &[Option<&str>]) -> (Vec<u8>, Option<Vec<u8>>) {
         let schema = Arc::new(Schema::new(vec![
             Field::new("_timestamp", DataType::Int64, false),
             Field::new("bd", DataType::Utf8, true),
         ]));
         let opts = VixWriterOptions {
-            column_store_field_names: vec!["bd".to_string()],
             docs_chunk_bytes: 1,
             ..Default::default()
         };
@@ -1888,11 +2538,16 @@ mod tests {
     /// The zone-map reader and the decode-path reader (zone table stripped)
     /// over the same bytes.
     fn zoned_and_decode(ts: &[i64], bd: &[Option<&str>]) -> (VixReader, VixReader) {
-        let bytes = build_zone_file(ts, bd);
-        let zoned = VixReader::open(bytes::Bytes::from(bytes.clone())).unwrap();
-        let decode = VixReader::open(bytes::Bytes::from(
-            vortex_index::test_support::strip_zone_map_property(&bytes).unwrap(),
-        ))
+        let (bytes, index) = build_zone_file(ts, bd);
+        let index = index.map(bytes::Bytes::from);
+        let zoned =
+            VixReader::open_with_index(bytes::Bytes::from(bytes.clone()), index.clone()).unwrap();
+        let decode = VixReader::open_with_index(
+            bytes::Bytes::from(
+                vortex_index::test_support::strip_zone_map_property(&bytes).unwrap(),
+            ),
+            index,
+        )
         .unwrap();
         assert!(zoned.zone_chunks().is_some());
         assert!(decode.zone_chunks().is_none());
@@ -2115,5 +2770,380 @@ mod tests {
         // correctness vs the decode path on the same query
         let hist_decode = simple_histogram(&decode, &bitmap, 99_000, 200, 10, 0).unwrap();
         assert_eq!(hist, hist_decode);
+    }
+    // ---------------- M16: stats-answered aggregation arms ----------------
+
+    const M16_ROWS: usize = 256; // 4 chunks x 64 rows at the chunk floor
+
+    /// Multi-chunk M16 fixture. Columns:
+    /// - `code`: i64, dense (per-chunk stats rows exist)
+    /// - `ratio`: f64 with nulls (dense enough for stats)
+    /// - `sparse`: i64 at ~2.7% density — BELOW the 10% stats threshold
+    ///   (file-level presence only, no chunk rows)
+    /// - `void`: i64, all NULL
+    /// - `name`: utf8 (string stats are prefix bounds — never answers)
+    /// - `gate`: i64 with the §4 verdict shapes per chunk — all-7s /
+    ///   mixed 7-and-8 / all-9s / 7s-with-nulls
+    ///
+    /// `with_stats = false` raises the density threshold above 1.0 so NO
+    /// column gets chunk rows (the M1-era no-stats shape).
+    fn m16_fixture(with_stats: bool) -> (VixReader, M16Data) {
+        let ts: Vec<i64> = (0..M16_ROWS as i64).map(|i| 100_000 - i).collect();
+        let code: Vec<Option<i64>> = (0..M16_ROWS).map(|i| Some((i as i64) % 97)).collect();
+        let ratio: Vec<Option<f64>> = (0..M16_ROWS)
+            .map(|i| (i % 8 != 7).then(|| i as f64 * 0.5 - 30.0))
+            .collect();
+        let sparse: Vec<Option<i64>> = (0..M16_ROWS)
+            .map(|i| (i % 40 == 0).then(|| i as i64 * 3))
+            .collect();
+        let void: Vec<Option<i64>> = vec![None; M16_ROWS];
+        let name: Vec<Option<String>> = (0..M16_ROWS).map(|i| Some(format!("n-{}", i % 5))).collect();
+        let gate: Vec<Option<i64>> = (0..M16_ROWS)
+            .map(|i| match i / 64 {
+                0 => Some(7),
+                1 => Some(if i % 2 == 0 { 7 } else { 8 }),
+                2 => Some(9),
+                _ => (i % 4 != 0).then_some(7),
+            })
+            .collect();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("code", DataType::Int64, true),
+            Field::new("ratio", DataType::Float64, true),
+            Field::new("sparse", DataType::Int64, true),
+            Field::new("void", DataType::Int64, true),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("gate", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(ts.clone())),
+                Arc::new(Int64Array::from(code.clone())),
+                Arc::new(Float64Array::from(ratio.clone())),
+                Arc::new(Int64Array::from(sparse.clone())),
+                Arc::new(Int64Array::from(void.clone())),
+                Arc::new(StringArray::from(
+                    name.iter().map(|v| v.as_deref()).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(gate.clone())),
+            ],
+        )
+        .unwrap();
+        let sources = StringArray::from(vec!["{}"; M16_ROWS]);
+        let mut writer = VixWriter::new(
+            &schema,
+            VixWriterOptions {
+                docs_chunk_bytes: 1, // 64-row chunk floor
+                stats_min_density: if with_stats { 0.0 } else { 2.0 },
+                ..Default::default()
+            },
+            false,
+        );
+        writer
+            .push_batch_with_source(&batch, &sources, None)
+            .unwrap();
+        let reader = {
+            let (data, index) = writer.finish().unwrap();
+            VixReader::open_with_index(
+                bytes::Bytes::from(data),
+                index.map(bytes::Bytes::from),
+            )
+            .unwrap()
+        };
+        assert_eq!(reader.zone_chunks().unwrap().len(), 4);
+        if with_stats {
+            assert!(
+                column_stats_table(&reader, "code").is_some(),
+                "dense column must carry chunk stats"
+            );
+            assert!(
+                column_stats_table(&reader, "sparse").is_none(),
+                "a ~2.7%-density column must stay below the stats threshold"
+            );
+        } else {
+            assert!(
+                reader.column_chunk_stats().is_none()
+                    || column_stats_table(&reader, "code").is_none(),
+                "the no-stats fixture must carry no usable chunk rows"
+            );
+        }
+        (
+            reader,
+            M16Data {
+                ts,
+                code,
+                ratio,
+                sparse,
+                void,
+                gate,
+            },
+        )
+    }
+
+    struct M16Data {
+        ts: Vec<i64>,
+        code: Vec<Option<i64>>,
+        ratio: Vec<Option<f64>>,
+        sparse: Vec<Option<i64>>,
+        void: Vec<Option<i64>>,
+        gate: Vec<Option<i64>>,
+    }
+
+    impl M16Data {
+        /// The full-decode COUNT oracle: matched rows with a non-null value.
+        fn count_oracle<T>(
+            &self,
+            values: &[Option<T>],
+            window: Option<(i64, i64)>,
+            matched: Option<&BooleanBuffer>,
+        ) -> u64 {
+            values
+                .iter()
+                .enumerate()
+                .filter(|(i, v)| {
+                    v.is_some()
+                        && window.is_none_or(|(s, e)| self.ts[*i] >= s && self.ts[*i] < e)
+                        && matched.is_none_or(|b| b.value(*i))
+                })
+                .count() as u64
+        }
+
+        /// The full-decode i64 MIN/MAX oracle.
+        fn min_max_i64_oracle(
+            &self,
+            values: &[Option<i64>],
+            is_max: bool,
+            window: Option<(i64, i64)>,
+            matched: Option<&BooleanBuffer>,
+        ) -> Option<MinMaxValue> {
+            let it = values.iter().enumerate().filter_map(|(i, v)| {
+                let v = (*v)?;
+                (window.is_none_or(|(s, e)| self.ts[i] >= s && self.ts[i] < e)
+                    && matched.is_none_or(|b| b.value(i)))
+                .then_some(v)
+            });
+            (if is_max { it.max() } else { it.min() }).map(MinMaxValue::I64)
+        }
+
+        /// The full-decode f64 MIN/MAX oracle (NaN-free fixture).
+        fn min_max_f64_oracle(
+            &self,
+            is_max: bool,
+            window: Option<(i64, i64)>,
+            matched: Option<&BooleanBuffer>,
+        ) -> Option<MinMaxValue> {
+            let mut best: Option<f64> = None;
+            for (i, v) in self.ratio.iter().enumerate() {
+                let Some(v) = *v else { continue };
+                if !(window.is_none_or(|(s, e)| self.ts[i] >= s && self.ts[i] < e)
+                    && matched.is_none_or(|b| b.value(i)))
+                {
+                    continue;
+                }
+                best = Some(match best {
+                    Some(b) => {
+                        if is_max {
+                            b.max(v)
+                        } else {
+                            b.min(v)
+                        }
+                    }
+                    None => v,
+                });
+            }
+            best.map(MinMaxValue::F64)
+        }
+    }
+
+    /// bitmap matching every third row (a representative condition)
+    fn every_third(len: usize) -> BooleanBuffer {
+        use arrow::array::BooleanBufferBuilder;
+        let mut builder = BooleanBufferBuilder::new(len);
+        builder.append_n(len, false);
+        for i in (0..len).step_by(3) {
+            builder.set_bit(i, true);
+        }
+        builder.finish()
+    }
+
+    /// M16 pin: count_field == full-decode oracle across every arm — the
+    /// presence-count answer, the straddling stats fold, sparse (no chunk
+    /// rows), the all-null column, the conditioned bitmap path, and the
+    /// no-stats (M1-era) file.
+    #[test]
+    fn m16_count_field_matches_full_decode() {
+        for with_stats in [true, false] {
+            let (reader, data) = m16_fixture(with_stats);
+            let bitmap = every_third(M16_ROWS);
+            // ts desc from 100_000: a window straddling chunks 1 and 2
+            // (cuts mid-chunk on both edges) and one fully-outside window
+            let straddle = Some((100_000 - 170, 100_000 - 90 + 1));
+            let outside = Some((1, 2));
+            for (field, values) in [
+                ("code", &data.code),
+                ("sparse", &data.sparse),
+                ("void", &data.void),
+                ("gate", &data.gate),
+            ] {
+                // fully covered (no window)
+                assert_eq!(
+                    count_field(&reader, field, None, None).unwrap(),
+                    data.count_oracle(values, None, None),
+                    "{field} full, with_stats={with_stats}"
+                );
+                // straddling window: covered chunks fold, boundaries decode
+                assert_eq!(
+                    count_field(&reader, field, straddle, None).unwrap(),
+                    data.count_oracle(values, straddle, None),
+                    "{field} straddle, with_stats={with_stats}"
+                );
+                // fully outside window
+                assert_eq!(count_field(&reader, field, outside, None).unwrap(), 0);
+                // conditioned bitmap
+                assert_eq!(
+                    count_field(&reader, field, None, Some(&bitmap)).unwrap(),
+                    data.count_oracle(values, None, Some(&bitmap)),
+                    "{field} bitmap, with_stats={with_stats}"
+                );
+            }
+            // f64 column too
+            assert_eq!(
+                count_field(&reader, "ratio", straddle, None).unwrap(),
+                data.count_oracle(&data.ratio, straddle, None)
+            );
+        }
+    }
+
+    /// M16 pin: min_max_field == full-decode oracle — numeric i64/f64 min
+    /// and max, `_timestamp` (zone-served), sparse and all-null columns,
+    /// straddling windows, conditioned bitmaps, and the no-stats file;
+    /// string columns are refused by the family gate.
+    #[test]
+    fn m16_min_max_matches_full_decode() {
+        for with_stats in [true, false] {
+            let (reader, data) = m16_fixture(with_stats);
+            let bitmap = every_third(M16_ROWS);
+            let straddle = Some((100_000 - 170, 100_000 - 90 + 1));
+            for is_max in [false, true] {
+                for (field, values) in
+                    [("code", &data.code), ("sparse", &data.sparse), ("void", &data.void)]
+                {
+                    let family = min_max_family(&reader, field).unwrap().unwrap();
+                    assert_eq!(family, MinMaxFamily::I64);
+                    for window in [None, straddle] {
+                        assert_eq!(
+                            min_max_field(&reader, field, family, is_max, window, None)
+                                .unwrap(),
+                            data.min_max_i64_oracle(values, is_max, window, None),
+                            "{field} is_max={is_max} window={window:?} stats={with_stats}"
+                        );
+                    }
+                    assert_eq!(
+                        min_max_field(&reader, field, family, is_max, None, Some(&bitmap))
+                            .unwrap(),
+                        data.min_max_i64_oracle(values, is_max, None, Some(&bitmap)),
+                        "{field} bitmap is_max={is_max} stats={with_stats}"
+                    );
+                }
+                // f64 column
+                let family = min_max_family(&reader, "ratio").unwrap().unwrap();
+                assert_eq!(family, MinMaxFamily::F64);
+                for window in [None, straddle] {
+                    assert_eq!(
+                        min_max_field(&reader, "ratio", family, is_max, window, None).unwrap(),
+                        data.min_max_f64_oracle(is_max, window, None),
+                        "ratio is_max={is_max} window={window:?} stats={with_stats}"
+                    );
+                }
+                // _timestamp: the zone table IS its stats
+                let family = min_max_family(&reader, "_timestamp").unwrap().unwrap();
+                let ts_values: Vec<Option<i64>> = data.ts.iter().map(|t| Some(*t)).collect();
+                for window in [None, straddle] {
+                    assert_eq!(
+                        min_max_field(&reader, "_timestamp", family, is_max, window, None)
+                            .unwrap(),
+                        data.min_max_i64_oracle(&ts_values, is_max, window, None),
+                        "_timestamp is_max={is_max} window={window:?}"
+                    );
+                }
+            }
+            // strings never answer: the family gate refuses
+            assert_eq!(min_max_family(&reader, "name").unwrap(), None);
+            // absent column: family gate refuses too (callers decide the
+            // columns-complete zero shortcut)
+            assert_eq!(min_max_family(&reader, "nope").unwrap(), None);
+        }
+    }
+
+    /// M16 §4 pin: stats_eq_bitmap == per-row compare oracle over the
+    /// verdict shapes (all-match without decode, no-match, inconclusive,
+    /// null-bearing all-equal), multi-value IN, and the refusal gates
+    /// (string column, cross-family kind, unparseable literal, no zone).
+    #[test]
+    fn m16_stats_eq_bitmap_matches_per_row_compare() {
+        use crate::index::NumericKind;
+
+        for with_stats in [true, false] {
+            let (reader, data) = m16_fixture(with_stats);
+            let oracle = |values: &[Option<i64>], probes: &[i64]| -> Vec<usize> {
+                values
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, v)| v.is_some_and(|v| probes.contains(&v)))
+                    .map(|(i, _)| i)
+                    .collect()
+            };
+            let run = |field: &str, texts: &[&str], kind: NumericKind| {
+                stats_eq_bitmap(
+                    &reader,
+                    field,
+                    &texts.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                    kind,
+                )
+                .unwrap()
+            };
+            for (texts, probes) in [
+                (vec!["7"], vec![7i64]),          // all-match chunk 0, mixed 1, none 2, nulls 3
+                (vec!["9"], vec![9i64]),          // only chunk 2
+                (vec!["8"], vec![8i64]),          // only the mixed chunk
+                (vec!["12345"], vec![12345i64]),  // matches nothing
+                (vec!["7", "9"], vec![7i64, 9]),  // IN list
+            ] {
+                let bitmap = run("gate", &texts, NumericKind::Int)
+                    .unwrap_or_else(|| panic!("gate arm must engage for {texts:?}"));
+                assert_eq!(bitmap.len(), M16_ROWS);
+                let got: Vec<usize> = bitmap.set_indices().collect();
+                assert_eq!(
+                    got,
+                    oracle(&data.gate, &probes),
+                    "probes={texts:?} stats={with_stats}"
+                );
+            }
+            // sparse column (no stats rows): still exact, all chunks decode
+            let bitmap = run("sparse", &["120"], NumericKind::Int).unwrap();
+            assert_eq!(
+                bitmap.set_indices().collect::<Vec<_>>(),
+                oracle(&data.sparse, &[120])
+            );
+            // refusals: string column, cross-family kind, unparseable text
+            assert!(run("name", &["n-1"], NumericKind::Int).is_none());
+            assert!(run("gate", &["7"], NumericKind::Float).is_none());
+            assert!(run("ratio", &["1"], NumericKind::Int).is_none());
+            assert!(run("gate", &["not-a-number"], NumericKind::Int).is_none());
+            assert!(run("gate", &["7"], NumericKind::Bool).is_none());
+            // float family with Float kind engages
+            let probe_ratio = data.ratio[10].unwrap(); // 10*0.5-30 = -25.0
+            let bitmap = run("ratio", &[&probe_ratio.to_string()], NumericKind::Float).unwrap();
+            let want: Vec<usize> = data
+                .ratio
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| **v == Some(probe_ratio))
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(bitmap.set_indices().collect::<Vec<_>>(), want);
+        }
     }
 }

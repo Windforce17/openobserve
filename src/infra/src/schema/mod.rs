@@ -370,16 +370,6 @@ pub fn get_schema_index_fields(schema: &Schema) -> Vec<String> {
         .collect()
 }
 
-/// Column-store (secondary index) fields configured on the stream.
-/// No default fields are unioned in — this is exactly the per-stream
-/// configured list, deduped and sorted.
-pub fn get_stream_setting_column_store_fields(settings: &StreamSettings) -> Vec<String> {
-    let mut fields = settings.column_store_fields.clone();
-    fields.sort();
-    fields.dedup();
-    fields
-}
-
 pub fn get_stream_setting_bloom_filter_fields(settings: &Option<StreamSettings>) -> Vec<String> {
     let default_fields = BLOOM_FILTER_DEFAULT_FIELDS.clone();
     match settings {

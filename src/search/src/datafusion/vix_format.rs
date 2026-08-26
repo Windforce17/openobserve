@@ -43,8 +43,8 @@ use arrow::{
     datatypes::{DataType, Field, FieldRef, Schema, SchemaRef},
     record_batch::RecordBatch,
 };
-use config::meta::stream::RowIdBitmap;
 use async_trait::async_trait;
+use config::meta::stream::RowIdBitmap;
 use datafusion::{
     catalog::Session,
     common::{
@@ -61,7 +61,7 @@ use datafusion::{
         source::DataSourceExec,
         table_schema::TableSchema,
     },
-    execution::memory_pool::{MemoryConsumer, MemoryPool},
+    execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation},
     logical_expr::ScalarUDF,
     physical_expr::{PhysicalExpr, ScalarFunctionExpr, projection::ProjectionExprs},
     physical_plan::{
@@ -75,7 +75,7 @@ use futures::{FutureExt, StreamExt};
 use object_store::{GetOptions, ObjectMeta, ObjectStore};
 use tokio_stream::wrappers::ReceiverStream;
 use vortex_index::{
-    ColumnBound, NumScalar, SOURCE_COL_NAME, TIMESTAMP_COL_NAME, VixDocs, VixRangeSource,
+    BoundValue, ColumnBound, SOURCE_COL_NAME, TIMESTAMP_COL_NAME, VixDocs, VixRangeSource,
 };
 
 use super::vortex_support::VORTEX_RUNTIME;
@@ -100,13 +100,28 @@ pub struct VixCoreFormat {
     /// every file (zone-map pruned). The same bounds are re-applied by the
     /// combined filter above the scan, so this is a pure early-out.
     timestamp_filter: Option<(i64, i64)>,
-    /// Numeric column conjuncts extracted from the plan's FilterExec
-    /// (see [`inject_vix_numeric_bounds`]) — pushed into every file's
-    /// vortex scan (per-chunk stats pruning; ranged sources skip the
-    /// FETCH too) and checked against file-level stats for whole-file
-    /// skips. Conservative-only: the FilterExec above re-applies the
-    /// predicate on every returned row.
+    /// Range conjuncts extracted from the plan's FilterExec (see
+    /// [`inject_vix_scan_pruning`]) — numeric bounds push into every file's
+    /// vortex scan as row filters, and every bound (strings included)
+    /// prunes chunks/files through the O2 stats blob. Conservative-only:
+    /// the FilterExec above re-applies the predicate on every returned row.
     column_bounds: Vec<ColumnBound>,
+    /// Columns on which the plan's filter is NULL-REJECTING (a NULL cell
+    /// can never satisfy the conjunct: `=`, `!=`, `<`, `>`, LIKE, IN,
+    /// IS NOT NULL, str_match…). §4 field-presence pruning: a file whose
+    /// footer proves such a column all-NULL (absent from a
+    /// columns-complete file, or presence count 0) is skipped whole,
+    /// BEFORE any docs read or json_get fallback.
+    null_rejected_columns: Vec<String>,
+    /// §6.2: this table DECLARES per-file `_timestamp DESC` output, so a
+    /// concat file's scan must stream through the k-way region merge (its
+    /// stored rows are only piecewise sorted). exec.rs sets it on the
+    /// declared-sort table only — and routes there only concat files whose
+    /// proven region decomposition fits the merge (probed at plan time), so
+    /// an opener finding no regions is a hard error, never a silent
+    /// unordered stream. `false` (the default; the undeclared/concat table
+    /// and every ad-hoc listing): scans stream in stored order.
+    emit_ts_desc: bool,
 }
 
 impl VixCoreFormat {
@@ -114,7 +129,16 @@ impl VixCoreFormat {
         Self {
             timestamp_filter,
             column_bounds: Vec::new(),
+            null_rejected_columns: Vec::new(),
+            emit_ts_desc: false,
         }
+    }
+
+    /// Declare that every scan of this table must emit `_timestamp` DESC
+    /// (the declared-sort table): concat files k-way merge their regions.
+    pub fn with_ordered_output(mut self, emit_ts_desc: bool) -> Self {
+        self.emit_ts_desc = emit_ts_desc;
+        self
     }
 }
 
@@ -152,13 +176,17 @@ fn docs_range_source(
 async fn open_docs(store: &Arc<dyn ObjectStore>, meta: &ObjectMeta) -> Result<VixDocs> {
     let location = meta.location.clone();
     if let Some(source) = docs_range_source(store, meta, true) {
-        // ranged opens block on fetches: keep them off the async runtime
+        // ranged opens block on fetches: keep them off the async runtime.
+        // `{e:#}` keeps the full cause chain in the text (the not-found
+        // detection below string-matches it).
         return VORTEX_RUNTIME
             .spawn_blocking(move || VixDocs::open_ranged(source))
             .await
             .map_err(|e| DataFusionError::Execution(format!("vix open task failed: {e}")))?
             .map_err(|e| {
-                DataFusionError::Execution(format!("failed to open core .vix file {location}: {e}"))
+                DataFusionError::Execution(format!(
+                    "failed to open core .vix file {location}: {e:#}"
+                ))
             });
     }
     let data = store
@@ -167,16 +195,108 @@ async fn open_docs(store: &Arc<dyn ObjectStore>, meta: &ObjectMeta) -> Result<Vi
         .bytes()
         .await?;
     VixDocs::open(data).map_err(|e| {
-        DataFusionError::Execution(format!("failed to open core .vix file {location}: {e}"))
+        DataFusionError::Execution(format!("failed to open core .vix file {location}: {e:#}"))
     })
 }
 
-/// `_timestamp` bounds of a non-empty docs blob. The rows are stored ordered
-/// `_timestamp` DESC, so only the first and the last row are read (the row
-/// indices are deduped internally when `num_rows == 1`); min/max of the two
-/// values is taken for robustness. `None` when the values cannot be read as
-/// non-null `Int64` — the column then keeps unknown statistics.
+// ─── M19: lifecycle-expired objects on the query path ────────────────────────
+//
+// A `.vix` object can be deleted externally (S3 lifecycle expiry) while its
+// file_list row is still live. Pre-M19 that 404 failed the WHOLE query, and
+// nothing removed the row — every retry/query re-listed the file forever.
+// The scan now (a) degrades: the missing file contributes zero rows instead
+// of erroring the query (only for the NOT-FOUND error class — outages,
+// timeouts and permission errors still fail loudly), and (b) reconciles:
+// the file's stale file_list row is removed in the background, so the next
+// query does not list it at all. The `.vxi` sidecar needs no handling here:
+// index absence already fails open to the scan, and a heal-rewritten sidecar
+// can only be YOUNGER than its data object under the lifecycle.
+
+/// The file_list key to reconcile when `location`'s object is gone, if the
+/// location names a file_list-tracked storage object: the search stores
+/// encode locations as `trace_id/$$/[account/::/]files/org/...`; after
+/// stripping those prefixes the key must be the canonical 9-segment
+/// `files/{org}/{stype}/{stream}/{Y}/{M}/{D}/{H}/{file}.vix` shape. WAL
+/// paths (11+ segments) and anything else return `None` — their missing
+/// files keep erroring loudly (a vanished WAL file is a bug, not a
+/// lifecycle).
+fn stale_row_cleanup_key(location: &object_store::path::Path) -> Option<String> {
+    let (_account, path) = super::storage::format_location(location);
+    let key = path.to_string();
+    let start = if key.starts_with("files/") {
+        0
+    } else {
+        // ad-hoc listings (tests, tools) may carry a URL-prefix before the
+        // canonical key — anchor on the first segment-aligned "files/"
+        key.find("/files/").map(|i| i + 1)?
+    };
+    let key = &key[start..];
+    (key.split('/').count() == 9 && key.ends_with(".vix")).then(|| key.to_string())
+}
+
+/// Whether an already-stringified DataFusion/anyhow error means "the object
+/// does not exist" — see `infra::storage::is_not_found_error` for the typed
+/// variant; here errors have been formatted through the scan pipeline, so
+/// the ALTERNATE-formatted text is the reliable carrier (reformatting layers
+/// embed the object_store `... not found ...` display verbatim).
+fn error_text_is_not_found(text: &str) -> bool {
+    text.to_lowercase().contains("not found")
+}
+
+/// Background reconciliation of one stale row: remove it from the meta
+/// file_list (+ the local cache mirror) and drop the file's memoized reader.
+/// Idempotent; failures only log (the next query's 404 retries it).
+async fn remove_stale_file_list_row(key: String) {
+    match infra::file_list::remove(&key).await {
+        Ok(()) => log::warn!(
+            "vix scan: removed stale file_list row of {key} (object deleted externally, e.g. lifecycle expiry)"
+        ),
+        Err(e) => log::warn!("vix scan: removing stale file_list row of {key} failed: {e}"),
+    }
+    if let Err(e) = infra::file_list::LOCAL_CACHE.remove(&key).await {
+        log::debug!("vix scan: local file_list cache remove of {key} failed: {e}");
+    }
+    crate::vix::reader_cache::GLOBAL_CACHE.remove(&key);
+}
+
+/// Fire [`remove_stale_file_list_row`] without blocking the scan (callable
+/// from the async opener; the blocking-thread arm passes a captured handle).
+fn spawn_stale_row_cleanup(handle: Option<&tokio::runtime::Handle>, key: String) {
+    match handle {
+        Some(handle) => {
+            handle.spawn(remove_stale_file_list_row(key));
+        }
+        None => {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(remove_stale_file_list_row(key));
+            } else {
+                log::warn!(
+                    "vix scan: no runtime at hand to reconcile stale file_list row of {key}"
+                );
+            }
+        }
+    }
+}
+
+/// `_timestamp` bounds of a non-empty docs blob.
+///
+/// Sorted files (`row_order` ts_desc — every historical file and every
+/// non-concat writer output): the rows are stored ordered `_timestamp`
+/// DESC, so only the first and the last row are read (the row indices are
+/// deduped internally when `num_rows == 1`); min/max of the two values is
+/// taken for robustness.
+///
+/// #51c-c CONCAT-order files: the first/last rows are NOT the newest/oldest
+/// — the exact bounds come from the file's zone table instead (parsed at
+/// open, zero data reads; the spliced table covers every row). A concat
+/// file without a trustworthy zone table reports `None`.
+///
+/// `None` either way when the bounds cannot be derived — the column then
+/// keeps unknown statistics (fail-open: no pruning, no ordering assumption).
 fn timestamp_bounds(docs: &VixDocs, num_rows: usize) -> Option<(i64, i64)> {
+    if !docs.row_order().is_ts_desc() {
+        return docs.zone_ts_bounds();
+    }
     let rows = vec![0, num_rows as u64 - 1];
     let batches = docs
         .read_docs(Some(&[TIMESTAMP_COL_NAME.to_string()]), Some(rows), None)
@@ -259,13 +379,15 @@ impl DataFusionFileFormat for VixCoreFormat {
 
     /// Exact row count from the container properties (one footer parse over
     /// locally cached bytes), plus exact `_timestamp` min/max column
-    /// statistics: core files store their rows ordered `_timestamp` DESC, so
-    /// the bounds come from a point read of just the first and last row.
-    /// They let `split_file_groups_by_statistics` arrange non-overlapping
-    /// files into file groups that uphold the `_timestamp` DESC file sort
-    /// order declared in `exec.rs::build_table_for_format`, eliding the sort
-    /// for `ORDER BY _timestamp DESC` queries. Statistics of every other
-    /// column are unknown (and stay unknown for zero-row files).
+    /// statistics: sorted core files store their rows ordered `_timestamp`
+    /// DESC, so the bounds come from a point read of just the first and
+    /// last row; #51c-c concat-order files (not globally sorted) derive
+    /// them from their zone table instead — see [`timestamp_bounds`]. They
+    /// let `split_file_groups_by_statistics` arrange non-overlapping files
+    /// into file groups that uphold the `_timestamp` DESC file sort order
+    /// declared in `exec.rs::build_table_for_format`, eliding the sort for
+    /// `ORDER BY _timestamp DESC` queries. Statistics of every other column
+    /// are unknown (and stay unknown for zero-row files).
     async fn infer_stats(
         &self,
         _state: &dyn Session,
@@ -273,7 +395,26 @@ impl DataFusionFileFormat for VixCoreFormat {
         table_schema: SchemaRef,
         object: &ObjectMeta,
     ) -> Result<Statistics> {
-        let docs = open_docs(store, object).await?;
+        let docs = match open_docs(store, object).await {
+            Ok(docs) => docs,
+            Err(e) => {
+                // M19: a stats probe hitting an externally deleted object
+                // must not fail the query at PLAN time — return unknown
+                // statistics (the exec-side opener degrades the same file to
+                // zero rows) and reconcile the stale row in the background.
+                if error_text_is_not_found(&e.to_string())
+                    && let Some(key) = stale_row_cleanup_key(&object.location)
+                {
+                    log::warn!(
+                        "vix stats: object {} is gone (deleted externally): degrading to unknown statistics; removing its stale file_list row",
+                        object.location
+                    );
+                    spawn_stale_row_cleanup(None, key);
+                    return Ok(Statistics::new_unknown(&table_schema));
+                }
+                return Err(e);
+            }
+        };
         let num_rows = usize::try_from(docs.row_count())
             .map_err(|_| DataFusionError::Execution("row count overflow".to_string()))?;
         let mut column_statistics = vec![ColumnStatistics::default(); table_schema.fields().len()];
@@ -331,7 +472,9 @@ impl DataFusionFileFormat for VixCoreFormat {
     fn file_source(&self, table_schema: TableSchema) -> Arc<dyn FileSource> {
         Arc::new(
             VixCoreSource::new(table_schema, self.timestamp_filter)
-                .with_column_bounds(self.column_bounds.clone()),
+                .with_column_bounds(self.column_bounds.clone())
+                .with_null_rejected_columns(self.null_rejected_columns.clone())
+                .with_ordered_output(self.emit_ts_desc),
         )
     }
 }
@@ -347,8 +490,12 @@ pub struct VixCoreSource {
     projection: SplitProjection,
     timestamp_filter: Option<(i64, i64)>,
     /// See [`VixCoreFormat::column_bounds`] (injected post-plan by
-    /// [`inject_vix_numeric_bounds`]).
+    /// [`inject_vix_scan_pruning`]).
     column_bounds: Vec<ColumnBound>,
+    /// See [`VixCoreFormat::null_rejected_columns`].
+    null_rejected_columns: Vec<String>,
+    /// See [`VixCoreFormat::emit_ts_desc`].
+    emit_ts_desc: bool,
     /// Session memory pool (injected by `create_physical_plan`); the opener
     /// reserves its object/decode bytes against it.
     memory_pool: Option<Arc<dyn MemoryPool>>,
@@ -363,12 +510,24 @@ impl VixCoreSource {
             metrics: ExecutionPlanMetricsSet::new(),
             timestamp_filter,
             column_bounds: Vec::new(),
+            null_rejected_columns: Vec::new(),
+            emit_ts_desc: false,
             memory_pool: None,
         }
     }
 
     pub fn with_column_bounds(mut self, column_bounds: Vec<ColumnBound>) -> Self {
         self.column_bounds = column_bounds;
+        self
+    }
+
+    pub fn with_null_rejected_columns(mut self, columns: Vec<String>) -> Self {
+        self.null_rejected_columns = columns;
+        self
+    }
+
+    pub fn with_ordered_output(mut self, emit_ts_desc: bool) -> Self {
+        self.emit_ts_desc = emit_ts_desc;
         self
     }
 }
@@ -396,6 +555,8 @@ impl FileSource for VixCoreSource {
 
         let opener = Arc::new(VixCoreOpener {
             column_bounds: self.column_bounds.clone(),
+            null_rejected_columns: self.null_rejected_columns.clone(),
+            emit_ts_desc: self.emit_ts_desc,
             object_store,
             projected_schema,
             timestamp_filter: self.timestamp_filter,
@@ -448,8 +609,13 @@ impl FileSource for VixCoreSource {
 /// Opens one core file and streams record batches of the requested LOGICAL
 /// columns, resolving each against the file's physical docs columns.
 struct VixCoreOpener {
-    /// Numeric conjuncts pushed into the scan + file-level skip check.
+    /// Range conjuncts pushed into the scan + file/chunk skip checks.
     column_bounds: Vec<ColumnBound>,
+    /// Columns whose conjuncts are null-rejecting (field-presence skips).
+    null_rejected_columns: Vec<String>,
+    /// §6.2: the table declares `_timestamp DESC` — concat files must
+    /// stream through the k-way region merge.
+    emit_ts_desc: bool,
     object_store: Arc<dyn ObjectStore>,
     /// The logical columns to produce, in output order.
     projected_schema: SchemaRef,
@@ -482,6 +648,8 @@ impl FileOpener for VixCoreOpener {
         let projected_schema = Arc::clone(&self.projected_schema);
         let timestamp_filter = self.timestamp_filter;
         let column_bounds = self.column_bounds.clone();
+        let null_rejected_columns = self.null_rejected_columns.clone();
+        let emit_ts_desc = self.emit_ts_desc;
         let memory_pool = self.memory_pool.clone();
         // Row selection from the inverted index, if any.
         let selection = file
@@ -527,15 +695,30 @@ impl FileOpener for VixCoreOpener {
                     .unwrap_or(usize::MAX)
                     .saturating_add(chunk_bytes.saturating_mul(2))
             };
-            let reservation = match &memory_pool {
-                Some(pool) => {
-                    let reservation =
-                        MemoryConsumer::new(format!("VixCoreOpener[{location}]")).register(pool);
-                    reservation.try_grow(estimate)?;
-                    Some(reservation)
-                }
-                None => None,
-            };
+            // Shared so the ordered merge path can GROW it per opened
+            // region from the blocking scan thread (pool pushback instead
+            // of invisible allocation); the stream holds it alive.
+            let reservation: Arc<parking_lot::Mutex<Option<MemoryReservation>>> =
+                Arc::new(parking_lot::Mutex::new(match &memory_pool {
+                    Some(pool) => {
+                        let reservation = MemoryConsumer::new(format!(
+                            "VixCoreOpener[{location}]"
+                        ))
+                        .register(pool);
+                        reservation.try_grow(estimate)?;
+                        Some(reservation)
+                    }
+                    None => None,
+                }));
+            let scan_reservation = Arc::clone(&reservation);
+
+            // M19: when this file's object is gone from the store (deleted
+            // externally, e.g. S3 lifecycle expiry) the scan DEGRADES — the
+            // file contributes zero rows instead of failing the whole query
+            // — and its stale file_list row is reconciled in the background.
+            // Only for the not-found error class and file_list-tracked keys.
+            let cleanup_key = stale_row_cleanup_key(&location);
+            let cleanup_handle = tokio::runtime::Handle::try_current().ok();
 
             // An index row selection means a point read: in ranged mode open
             // the docs blob over range fetches and decode only the selected
@@ -545,13 +728,31 @@ impl FileOpener for VixCoreOpener {
             // enqueues background downloads at index-evaluation time).
             let input = match docs_range_source(&store, &file.object_meta, ranged_wanted) {
                 Some(source) => DocsInput::Ranged(source),
-                None => DocsInput::Bytes(
-                    store
-                        .get_opts(&location, GetOptions::default())
-                        .await?
-                        .bytes()
-                        .await?,
-                ),
+                None => {
+                    let bytes = async {
+                        store
+                            .get_opts(&location, GetOptions::default())
+                            .await?
+                            .bytes()
+                            .await
+                    }
+                    .await;
+                    match bytes {
+                        Ok(bytes) => DocsInput::Bytes(bytes),
+                        Err(e @ object_store::Error::NotFound { .. })
+                            if cleanup_key.is_some() =>
+                        {
+                            log::warn!(
+                                "vix scan: object {location} is gone (deleted externally): degrading to an empty scan; removing its stale file_list row ({e})"
+                            );
+                            if let Some(key) = cleanup_key {
+                                spawn_stale_row_cleanup(cleanup_handle.as_ref(), key);
+                            }
+                            return Ok(futures::stream::empty().boxed());
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                }
             };
 
             // The whole scan (footer parse + chunk decode, plus the range
@@ -567,10 +768,44 @@ impl FileOpener for VixCoreOpener {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     input.open().and_then(|docs| {
                         // file-level skip: the predicate provably matches
-                        // nothing in this file (footer stats only — zero
+                        // nothing in this file (footer metadata only — zero
                         // data reads). Empty stream, reservation released.
-                        if file_provably_disjoint(&docs, &column_bounds) {
+                        if let Some(tier) = file_provably_skippable(
+                            &docs,
+                            timestamp_filter,
+                            &column_bounds,
+                            &null_rejected_columns,
+                        ) {
+                            log::debug!("vix scan: skipped {location} ({tier})");
                             return Ok(());
+                        }
+                        let mut send = |batch: RecordBatch| {
+                            tx.blocking_send(Ok(batch))
+                                .map_err(|_| anyhow::anyhow!("scan consumer dropped"))
+                        };
+                        // §6.2: under a declared-sort table a CONCAT file
+                        // streams through the k-way region merge (its rows
+                        // are only piecewise sorted); each opened region
+                        // grows the reservation by its decode window.
+                        if emit_ts_desc && !docs.row_order().is_ts_desc() {
+                            return scan_core_docs_merged(
+                                docs,
+                                &projected_schema,
+                                selection.as_deref(),
+                                timestamp_filter,
+                                &column_bounds,
+                                &mut || {
+                                    if let Some(reservation) =
+                                        scan_reservation.lock().as_mut()
+                                    {
+                                        reservation
+                                            .try_grow(chunk_bytes.saturating_mul(3))
+                                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                                    }
+                                    Ok(())
+                                },
+                                &mut send,
+                            );
                         }
                         scan_core_docs(
                             docs,
@@ -578,21 +813,36 @@ impl FileOpener for VixCoreOpener {
                             selection.as_deref(),
                             timestamp_filter,
                             &column_bounds,
-                            &mut |batch| {
-                                tx.blocking_send(Ok(batch))
-                                    .map_err(|_| anyhow::anyhow!("scan consumer dropped"))
-                            },
+                            &mut send,
                         )
                     })
                 }));
                 match result {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => {
-                        // Receiver may already be gone (e.g. limit reached);
-                        // nothing to do then.
-                        let _ = tx.blocking_send(Err(DataFusionError::Execution(format!(
-                            "core .vix scan of {location} failed: {e}"
-                        ))));
+                        // M19: a ranged open/fetch hitting an externally
+                        // deleted object degrades this file to the rows
+                        // already emitted (usually none — the open fails on
+                        // the first tail fetch) instead of failing the
+                        // query, and reconciles the stale row. `{e:#}`
+                        // carries the chain, so the not-found class is
+                        // detectable even through reformatting layers.
+                        let text = format!("{e:#}");
+                        if error_text_is_not_found(&text) && cleanup_key.is_some() {
+                            log::warn!(
+                                "vix scan: object {location} is gone (deleted externally): degrading to an empty scan; removing its stale file_list row ({text})"
+                            );
+                            if let Some(key) = cleanup_key {
+                                spawn_stale_row_cleanup(cleanup_handle.as_ref(), key);
+                            }
+                            // drop tx without sending: the stream ends clean
+                        } else {
+                            // Receiver may already be gone (e.g. limit
+                            // reached); nothing to do then.
+                            let _ = tx.blocking_send(Err(DataFusionError::Execution(format!(
+                                "core .vix scan of {location} failed: {text}"
+                            ))));
+                        }
                     }
                     Err(panic) => {
                         let msg = panic_message(&panic);
@@ -701,38 +951,116 @@ fn scan_core_docs(
     )
 }
 
-/// `true` when the file's footer statistics PROVE no row can satisfy every
-/// bound (exact stats only; any uncertainty keeps the file).
-fn file_provably_disjoint(docs: &VixDocs, bounds: &[ColumnBound]) -> bool {
+/// [`scan_core_docs`] through the §6.2 k-way region merge: the same
+/// logical-projection mapping, but rows stream in GLOBAL `_timestamp` DESC
+/// order (a concat file's regions merged by timestamp instead of a full
+/// sort above the scan). `on_region_open` is the per-opened-region memory
+/// hook. Used only under a declared-sort table; a file without a proven
+/// region decomposition errs (never a silent unordered stream).
+fn scan_core_docs_merged(
+    docs: VixDocs,
+    projected_schema: &SchemaRef,
+    selection: Option<&RowIdBitmap>,
+    timestamp_filter: Option<(i64, i64)>,
+    column_bounds: &[ColumnBound],
+    on_region_open: &mut dyn FnMut() -> anyhow::Result<()>,
+    on_batch: &mut dyn FnMut(RecordBatch) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let plan = LogicalProjectionPlan::new(&docs, projected_schema)?;
+    let rows = selection.map(|bits| bits.iter().map(u64::from).collect::<Vec<u64>>());
+    if let Some(rows) = rows.as_ref()
+        && rows.is_empty()
+    {
+        return Ok(());
+    }
+    docs.scan_docs_ts_desc_merged(
+        Some(&plan.physical_projection),
+        rows,
+        timestamp_filter,
+        column_bounds,
+        None,
+        on_region_open,
+        &mut |batch| on_batch(plan.project(&batch)?),
+    )
+}
+
+/// The v2 per-file skip hook: `Some(tier)` when the file's FOOTER metadata
+/// PROVES no row can satisfy the plan's filter — zero data reads either
+/// way (ranged opens have fetched only the footer at this point). Tiers,
+/// cheapest first; any uncertainty keeps the file (fail-open):
+///
+/// 1. `"field-presence"` (§4): a NULL-REJECTING conjunct references a column that is provably
+///    all-NULL here — its presence count is 0, or it is absent from the docs schema of a
+///    `columns_complete` file (the all-present invariant makes absence a proof; the `json_get`
+///    fallback would only synthesize NULLs). Files without the completeness marker never prune on
+///    absence — their `_source` may hide values.
+/// 2. `"file-stats"`: a range conjunct is provably outside the vortex footer's file-level min/max
+///    (first-encode files only; numeric, exact stats).
+/// 3. `"chunk-stats-empty"`: the zone table + the O2 per-column chunk stats exclude EVERY chunk
+///    (the passthrough-surviving path — such files carry no vortex stats at all). This is the
+///    file-level fold of the same per-chunk logic the scan applies.
+fn file_provably_skippable(
+    docs: &VixDocs,
+    ts_range: Option<(i64, i64)>,
+    bounds: &[ColumnBound],
+    null_rejected: &[String],
+) -> Option<&'static str> {
     use std::cmp::Ordering;
-    let cmp = |a: NumScalar, b: NumScalar| -> Option<Ordering> {
-        match (a, b) {
-            (NumScalar::I64(a), NumScalar::I64(b)) => Some(a.cmp(&b)),
-            (NumScalar::F64(a), NumScalar::F64(b)) => a.partial_cmp(&b),
-            _ => None,
+
+    // Tier 1: field presence. The `columns` list enumerates the docs
+    // columns (reserved `_source`/`_original` excluded — the schema check
+    // below keeps predicates on those out of this tier).
+    let presence = docs.column_presence();
+    if !null_rejected.is_empty() && !presence.is_empty() {
+        for column in null_rejected {
+            match presence.iter().find(|(name, _)| name == column) {
+                // an explicit zero presence count: every native cell is
+                // NULL, and native columns are authoritative for reads
+                Some((_, Some(0))) => return Some("field-presence"),
+                Some(_) => {}
+                // absent from the columns list: only a columns-complete
+                // file proves the field never occurs in `_source` either
+                None => {
+                    if docs.columns_complete()
+                        && docs.schema().field_with_name(column).is_err()
+                    {
+                        return Some("field-presence");
+                    }
+                }
+            }
         }
-    };
+    }
+
+    // Tier 2: vortex footer file-level stats (numeric, first-encode files).
     for bound in bounds {
         let Ok(Some((file_min, file_max))) = docs.column_stats(&bound.column) else {
             continue;
         };
-        if let Some((value, inclusive)) = bound.min {
+        if let Some((value, inclusive)) = &bound.min {
             // need rows with column >(=) value; impossible if file_max <(=) value
-            match cmp(file_max, value) {
-                Some(Ordering::Less) => return true,
-                Some(Ordering::Equal) if !inclusive => return true,
+            match vortex_index::cmp_num_vs_bound(file_max, value) {
+                Some(Ordering::Less) => return Some("file-stats"),
+                Some(Ordering::Equal) if !inclusive => return Some("file-stats"),
                 _ => {}
             }
         }
-        if let Some((value, inclusive)) = bound.max {
-            match cmp(file_min, value) {
-                Some(Ordering::Greater) => return true,
-                Some(Ordering::Equal) if !inclusive => return true,
+        if let Some((value, inclusive)) = &bound.max {
+            match vortex_index::cmp_num_vs_bound(file_min, value) {
+                Some(Ordering::Greater) => return Some("file-stats"),
+                Some(Ordering::Equal) if !inclusive => return Some("file-stats"),
                 _ => {}
             }
         }
     }
-    false
+
+    // Tier 3: every chunk excluded by the zone table + O2 chunk stats.
+    if docs
+        .pruned_scan_ranges(ts_range, bounds)
+        .is_some_and(|ranges| ranges.is_empty())
+    {
+        return Some("chunk-stats-empty");
+    }
+    None
 }
 
 /// The per-file mapping from the requested logical columns to the physical
@@ -1014,7 +1342,6 @@ mod tests {
         ]));
         let opts = VixWriterOptions {
             fts_field_names: vec![],
-            column_store_field_names: vec!["code".to_string()],
             row_group_size: 2,
             ..Default::default()
         };
@@ -1047,7 +1374,7 @@ mod tests {
         writer
             .push_batch_with_source(&batch, &sources, None)
             .unwrap();
-        bytes::Bytes::from(writer.finish().unwrap())
+        bytes::Bytes::from(writer.finish().unwrap().0)
     }
 
     /// One core file with 10 rows ordered `_timestamp` DESC
@@ -1058,7 +1385,6 @@ mod tests {
             Field::new("level", DataType::Utf8, true),
         ]));
         let opts = VixWriterOptions {
-            column_store_field_names: vec!["level".to_string()],
             row_group_size: 4,
             ..Default::default()
         };
@@ -1080,7 +1406,7 @@ mod tests {
         writer
             .push_batch_with_source(&batch, &sources, None)
             .unwrap();
-        bytes::Bytes::from(writer.finish().unwrap())
+        bytes::Bytes::from(writer.finish().unwrap().0)
     }
 
     fn build_single_row_core_file(ts: i64) -> bytes::Bytes {
@@ -1099,7 +1425,7 @@ mod tests {
         writer
             .push_batch_with_source(&batch, &sources, None)
             .unwrap();
-        bytes::Bytes::from(writer.finish().unwrap())
+        bytes::Bytes::from(writer.finish().unwrap().0)
     }
 
     pub(super) fn logical_schema() -> SchemaRef {
@@ -1237,7 +1563,7 @@ mod tests {
             writer
                 .push_batch_with_source(&batch, &sources, None)
                 .unwrap();
-            bytes::Bytes::from(writer.finish().unwrap())
+            bytes::Bytes::from(writer.finish().unwrap().0)
         };
         let projected = Arc::new(Schema::new(vec![
             Field::new("code", DataType::Int64, true),
@@ -1321,7 +1647,6 @@ mod tests {
             Field::new("code", DataType::Int64, true),
         ]));
         let opts = VixWriterOptions {
-            column_store_field_names: vec!["code".to_string()],
             ..Default::default()
         };
         let mut writer = VixWriter::new(&schema, opts, false);
@@ -1343,7 +1668,7 @@ mod tests {
         writer
             .push_batch_with_source(&batch, &sources, None)
             .unwrap();
-        let data = bytes::Bytes::from(writer.finish().unwrap());
+        let data = bytes::Bytes::from(writer.finish().unwrap().0);
 
         let projected = Arc::new(Schema::new(vec![
             Field::new("_timestamp", DataType::Int64, false),
@@ -1541,6 +1866,577 @@ mod tests {
         assert_eq!(rows, expected);
         Ok(())
     }
+
+    // ── M19: lifecycle-expired objects on the query path ─────────────────
+
+    /// An ObjectStore whose LISTING still advertises objects the store no
+    /// longer serves — the exact desync a live file_list row + an S3
+    /// lifecycle expiry produces (the `memory:///` adapter lists from
+    /// file_list rows and gets from storage).
+    #[derive(Debug)]
+    struct LifecycleExpiredStore {
+        inner: InMemory,
+        missing: Vec<ObjectMeta>,
+    }
+
+    impl fmt::Display for LifecycleExpiredStore {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "LifecycleExpiredStore")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for LifecycleExpiredStore {
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            if self.missing.iter().any(|m| &m.location == location) {
+                return Err(object_store::Error::NotFound {
+                    path: location.to_string(),
+                    source: Box::new(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "lifecycle expired",
+                    )),
+                });
+            }
+            self.inner.get_opts(location, options).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
+            let prefix_str = prefix.map(|p| p.to_string()).unwrap_or_default();
+            let ghosts: Vec<object_store::Result<ObjectMeta>> = self
+                .missing
+                .iter()
+                .filter(|m| m.location.as_ref().starts_with(&prefix_str))
+                .cloned()
+                .map(Ok)
+                .collect();
+            self.inner
+                .list(prefix)
+                .chain(futures::stream::iter(ghosts))
+                .boxed()
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<'static, object_store::Result<Path>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    fn ghost_meta(key: &str, size: u64) -> ObjectMeta {
+        ObjectMeta {
+            location: Path::from(key),
+            last_modified: chrono::Utc::now(),
+            size,
+            e_tag: None,
+            version: None,
+        }
+    }
+
+    /// M19 end-to-end: a query over one LIVE file and two EXPIRED ones —
+    /// one small (whole-object `Bytes` open) and one past the 256MB ranged
+    /// threshold (`open_ranged`, the blocking-thread error arm) — must
+    /// SUCCEED with exactly the live file's rows (each missing file
+    /// degrades to zero rows), and the expired files' stale file_list rows
+    /// must be reconciled away in the background. `collect_stat(true)`
+    /// routes the missing files through the `infer_stats` hook first, so
+    /// the plan-time arm is exercised by the same query.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn m19_scan_missing_objects_degrades_and_reconciles_rows() -> Result<()> {
+        // sqlite file_list tables so the background reconciliation is
+        // observable end-to-end
+        std::fs::create_dir_all(&config::get_config().common.data_db_dir)
+            .expect("create data_db_dir for tests");
+        infra::file_list::create_table()
+            .await
+            .expect("create file_list tables");
+
+        let run = config::utils::time::now_micros();
+        let live_key = format!("files/m19org{run}/logs/s1/2021/01/02/00/live.vix");
+        let gone_small_key = format!("files/m19org{run}/logs/s1/2021/01/02/00/gone_small.vix");
+        let gone_ranged_key = format!("files/m19org{run}/logs/s1/2021/01/02/00/gone_ranged.vix");
+
+        // seed live file_list rows for the EXPIRED keys (the stale rows)
+        for key in [&gone_small_key, &gone_ranged_key] {
+            infra::file_list::add(
+                "",
+                key,
+                &config::meta::stream::FileMeta {
+                    min_ts: 1000,
+                    max_ts: 1003,
+                    records: 4,
+                    original_size: 100,
+                    compressed_size: 4096,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("seed stale file_list row");
+            assert!(infra::file_list::contains(key).await.unwrap());
+        }
+
+        let inner = InMemory::new();
+        inner
+            .put(&Path::from(live_key.as_str()), build_core_file().into())
+            .await?;
+        let store = Arc::new(LifecycleExpiredStore {
+            inner,
+            missing: vec![
+                ghost_meta(&gone_small_key, 4096),
+                // >= ZO_VIX_FULL_SCAN_RANGED_MIN_BYTES (256MB default): the
+                // opener takes the ranged arm for this one
+                ghost_meta(&gone_ranged_key, 512 * 1024 * 1024),
+            ],
+        });
+
+        let registry = DefaultObjectStoreRegistry::new();
+        registry.register_store(&url::Url::parse("test:///").unwrap(), store);
+        let runtime_env = RuntimeEnvBuilder::new()
+            .with_object_store_registry(Arc::new(registry))
+            .build()?;
+        // canonical storage keys live DEEP under the listing prefix —
+        // mirror exec.rs: nested files must not be ignored
+        let mut session_config = SessionConfig::new().with_target_partitions(2);
+        session_config
+            .options_mut()
+            .execution
+            .listing_table_ignore_subdirectory = false;
+        let state = SessionStateBuilder::new()
+            .with_config(session_config)
+            .with_runtime_env(Arc::new(runtime_env))
+            .with_default_features()
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+
+        let table_schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+            Field::new("level", DataType::Utf8, true),
+        ]));
+        let listing_options = ListingOptions::new(Arc::new(VixCoreFormat::new(None)))
+            .with_collect_stat(true)
+            .with_target_partitions(2);
+        let config = ListingTableConfig::new(ListingTableUrl::parse(format!(
+            "test:///files/m19org{run}/"
+        ))?)
+        .with_listing_options(listing_options)
+        .with_schema(Arc::clone(&table_schema));
+        ctx.register_table("t", Arc::new(ListingTable::try_new(config)?))?;
+
+        // the query must SUCCEED with exactly the live file's 4 rows
+        let df = ctx
+            .sql("SELECT _timestamp FROM t ORDER BY _timestamp")
+            .await?;
+        let batches = df.collect().await?;
+        let mut rows = Vec::new();
+        for batch in &batches {
+            let ts = batch.column_by_name(TIMESTAMP_COL_NAME).unwrap();
+            let ts = ts.as_any().downcast_ref::<Int64Array>().unwrap();
+            for i in 0..batch.num_rows() {
+                rows.push(ts.value(i));
+            }
+        }
+        assert_eq!(
+            rows,
+            vec![1000, 1001, 1002, 1003],
+            "the live file's rows and ONLY those — each expired file degrades to zero rows"
+        );
+
+        // the background reconciliation removes the stale rows (spawned
+        // tasks; poll briefly)
+        for key in [&gone_small_key, &gone_ranged_key] {
+            let mut gone = false;
+            for _ in 0..100 {
+                if !infra::file_list::contains(key).await.unwrap() {
+                    gone = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            assert!(gone, "the stale file_list row of {key} must be reconciled away");
+        }
+        Ok(())
+    }
+
+    /// M19 plan-time arm in isolation: `infer_stats` on a vanished object
+    /// returns UNKNOWN statistics instead of failing the query at plan time.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn m19_infer_stats_missing_object_degrades_to_unknown() {
+        let key = "files/m19statorg/logs/s1/2021/01/02/00/gone.vix";
+        let meta = ghost_meta(key, 4096);
+        let store: Arc<dyn ObjectStore> = Arc::new(LifecycleExpiredStore {
+            inner: InMemory::new(),
+            missing: vec![meta.clone()],
+        });
+        let state = SessionContext::new().state();
+        let format = VixCoreFormat::new(None);
+        let table_schema = logical_schema();
+        let stats = format
+            .infer_stats(&state, &store, Arc::clone(&table_schema), &meta)
+            .await
+            .expect("a vanished object must not fail the stats probe");
+        assert_eq!(stats.num_rows, Precision::Absent);
+        assert!(
+            stats
+                .column_statistics
+                .iter()
+                .all(|c| c.min_value == Precision::Absent && c.max_value == Precision::Absent),
+            "all column statistics stay unknown"
+        );
+    }
+
+    /// M19: only canonical 9-segment `files/...*.vix` storage keys are
+    /// eligible for stale-row cleanup (and the error swallow that comes
+    /// with it) — WAL-shaped paths and other extensions keep erroring
+    /// loudly.
+    #[test]
+    fn m19_stale_row_cleanup_key_gates_on_storage_shape() {
+        // the memory:/// adapter's real location shape (trace + account)
+        assert_eq!(
+            stale_row_cleanup_key(&Path::from(
+                "trace1/schema=abc/format=vix/$$/acct/::/files/org/logs/s1/2021/01/02/00/a.vix"
+            ))
+            .as_deref(),
+            Some("files/org/logs/s1/2021/01/02/00/a.vix")
+        );
+        // no account
+        assert_eq!(
+            stale_row_cleanup_key(&Path::from(
+                "trace1/schema=abc/format=vix/$$/files/org/logs/s1/2021/01/02/00/a.vix"
+            ))
+            .as_deref(),
+            Some("files/org/logs/s1/2021/01/02/00/a.vix")
+        );
+        // bare canonical key (ad-hoc listing)
+        assert_eq!(
+            stale_row_cleanup_key(&Path::from("files/org/logs/s1/2021/01/02/00/a.vix"))
+                .as_deref(),
+            Some("files/org/logs/s1/2021/01/02/00/a.vix")
+        );
+        // WAL-shaped path (thread_id + schema_key = 11 segments): ineligible
+        assert_eq!(
+            stale_row_cleanup_key(&Path::from(
+                "files/org/logs/s1/0/2021/01/02/00/1234567890abcdef/a.vix"
+            )),
+            None
+        );
+        // non-.vix extensions: ineligible
+        assert_eq!(
+            stale_row_cleanup_key(&Path::from(
+                "files/org/logs/s1/2021/01/02/00/a.parquet"
+            )),
+            None
+        );
+        // unrelated paths: ineligible
+        assert_eq!(stale_row_cleanup_key(&Path::from("results/org/x.json")), None);
+    }
+
+    /// #51c-c: one CONCAT-order core file — DESC `runs` (each `(newest,
+    /// len)`) stored back-to-back, stamped `row_order=concat` exactly like
+    /// a concatenation-merge output. NOT globally sorted whenever a later
+    /// run is newer than the previous run's tail.
+    fn build_concat_core_file(runs: &[(i64, usize)], level: &str) -> bytes::Bytes {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("level", DataType::Utf8, true),
+        ]));
+        let opts = VixWriterOptions {
+            row_group_size: 4,
+            concat_row_order: true,
+            ..Default::default()
+        };
+        let timestamps: Vec<i64> = runs
+            .iter()
+            .flat_map(|&(newest, len)| (0..len as i64).map(move |i| newest - i))
+            .collect();
+        let sources: Vec<String> = timestamps
+            .iter()
+            .map(|ts| format!(r#"{{"_timestamp":{ts},"level":"{level}"}}"#))
+            .collect();
+        let mut writer = VixWriter::new(&schema, opts, false);
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(timestamps.clone())),
+                Arc::new(StringArray::from(vec![Some(level); timestamps.len()])),
+            ],
+        )
+        .unwrap();
+        let sources = StringArray::from_iter_values(sources.iter().map(String::as_str));
+        writer
+            .push_batch_with_source(&batch, &sources, None)
+            .unwrap();
+        bytes::Bytes::from(writer.finish().unwrap().0)
+    }
+
+    /// #51c-c: `infer_stats` over a CONCAT-order file must report the TRUE
+    /// `_timestamp` bounds. The sorted-file shortcut (first + last row)
+    /// would report (316, 300) for this file — both wrong — because neither
+    /// boundary row is a global extreme; the zone table carries the exact
+    /// span (296, 320).
+    #[tokio::test]
+    async fn infer_stats_concat_file_reports_zone_bounds() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("c1.vix");
+        // rows: [300..296] then [320..316] — first row 300, last row 316,
+        // true span [296, 320]
+        store
+            .put(
+                &path,
+                build_concat_core_file(&[(300, 5), (320, 5)], "c").into(),
+            )
+            .await
+            .unwrap();
+        let meta = store.head(&path).await.unwrap();
+        let state = SessionContext::new().state();
+        let format = VixCoreFormat::new(None);
+
+        let table_schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+            Field::new("level", DataType::Utf8, true),
+        ]));
+        let stats = format
+            .infer_stats(&state, &store, Arc::clone(&table_schema), &meta)
+            .await
+            .unwrap();
+        assert_eq!(stats.num_rows, Precision::Exact(10));
+        let ts_stats = &stats.column_statistics[table_schema.index_of(TIMESTAMP_COL_NAME).unwrap()];
+        assert_eq!(
+            ts_stats.min_value,
+            Precision::Exact(ScalarValue::Int64(Some(296))),
+            "concat min must come from the zone table, not the last row"
+        );
+        assert_eq!(
+            ts_stats.max_value,
+            Precision::Exact(ScalarValue::Int64(Some(320))),
+            "concat max must come from the zone table, not the first row"
+        );
+        assert_eq!(ts_stats.null_count, Precision::Exact(0));
+    }
+
+    /// #51c-c: the `[min, max)` `_timestamp` filter pushed into a
+    /// CONCAT-order file's scan returns exactly the per-row truth — the
+    /// pushdown re-evaluates per row (chunk pruning is stats-based and
+    /// fail-open), so an unsorted file loses nothing.
+    #[test]
+    fn concat_file_ts_filter_scan_equivalence() {
+        let data = build_concat_core_file(&[(300, 5), (320, 5)], "c");
+        let projected: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            TIMESTAMP_COL_NAME,
+            DataType::Int64,
+            false,
+        )]));
+        let stored: Vec<i64> = vec![300, 299, 298, 297, 296, 320, 319, 318, 317, 316];
+        for (min, max) in [
+            (0i64, i64::MAX),
+            (297, 319), // cuts both runs
+            (296, 297), // one row of run 1
+            (320, 321), // one row of run 2
+            (301, 316), // gap between the runs: nothing
+        ] {
+            let mut got: Vec<i64> = Vec::new();
+            for batch in scan_all(data.clone(), Arc::clone(&projected), None, Some((min, max))) {
+                let ts = batch.column_by_name(TIMESTAMP_COL_NAME).unwrap();
+                let ts = ts.as_any().downcast_ref::<Int64Array>().unwrap();
+                got.extend(ts.iter().flatten());
+            }
+            let expected: Vec<i64> = stored
+                .iter()
+                .copied()
+                .filter(|&t| t >= min && t < max)
+                .collect();
+            assert_eq!(
+                got, expected,
+                "ts filter [{min}, {max}) over the concat file"
+            );
+        }
+    }
+
+    /// Register the two-file table (one CONCAT-order file + one sorted
+    /// file) the way `exec.rs::build_table_for_format` does. `declare_sort`
+    /// adds the per-file `_timestamp DESC` declaration; `ordered_source`
+    /// makes the source ordered-aware (M4: concat files k-way merge their
+    /// regions) — `declare_sort && ordered_source` is the M4 declared
+    /// table, `declare_sort && !ordered_source` is the pinned hazard.
+    async fn concat_order_by_ctx(declare_sort: bool, ordered_source: bool) -> Result<SessionContext> {
+        let store = Arc::new(InMemory::new());
+        // concat file: rows [300..296, 320..316] — the newest rows of the
+        // TABLE live mid-file; a trusted per-file DESC order returns 300
+        // before 320
+        store
+            .put(
+                &Path::from("data/c1.vix"),
+                build_concat_core_file(&[(300, 5), (320, 5)], "c").into(),
+            )
+            .await?;
+        // plus one honestly sorted file, strictly older
+        store
+            .put(
+                &Path::from("data/f2.vix"),
+                build_desc_core_file(200, "b").into(),
+            )
+            .await?;
+
+        let registry = DefaultObjectStoreRegistry::new();
+        registry.register_store(&url::Url::parse("test:///").unwrap(), store);
+        let runtime_env = RuntimeEnvBuilder::new()
+            .with_object_store_registry(Arc::new(registry))
+            .build()?;
+        let mut session_config = SessionConfig::new().with_target_partitions(2);
+        session_config
+            .options_mut()
+            .execution
+            .split_file_groups_by_statistics = true;
+        let state = SessionStateBuilder::new()
+            .with_config(session_config)
+            .with_runtime_env(Arc::new(runtime_env))
+            .with_default_features()
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+
+        let table_schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+            Field::new("level", DataType::Utf8, true),
+        ]));
+        let mut listing_options = ListingOptions::new(Arc::new(
+            VixCoreFormat::new(None).with_ordered_output(ordered_source),
+        ))
+        .with_collect_stat(true)
+        .with_target_partitions(2);
+        if declare_sort {
+            listing_options = listing_options.with_file_sort_order(vec![vec![
+                datafusion::prelude::col(TIMESTAMP_COL_NAME).sort(false, false),
+            ]]);
+        }
+        let config = ListingTableConfig::new(ListingTableUrl::parse("test:///data/")?)
+            .with_listing_options(listing_options)
+            .with_schema(table_schema);
+        ctx.register_table("t", Arc::new(ListingTable::try_new(config)?))?;
+        Ok(ctx)
+    }
+
+    async fn concat_order_by_top7(ctx: &SessionContext) -> Result<(String, Vec<i64>)> {
+        let df = ctx
+            .sql("SELECT _timestamp FROM t ORDER BY _timestamp DESC LIMIT 7")
+            .await?;
+        let plan = df.create_physical_plan().await?;
+        let rendered = displayable(plan.as_ref()).indent(true).to_string();
+        let batches = collect(plan, ctx.task_ctx()).await?;
+        let mut got = Vec::new();
+        for batch in &batches {
+            let ts = batch.column_by_name(TIMESTAMP_COL_NAME).unwrap();
+            let ts = ts.as_any().downcast_ref::<Int64Array>().unwrap();
+            got.extend((0..batch.num_rows()).map(|i| ts.value(i)));
+        }
+        Ok((rendered, got))
+    }
+
+    /// #51c-c wrong-results regression (non-negotiable): `ORDER BY
+    /// _timestamp DESC LIMIT k` over a table containing a CONCAT-order file
+    /// must equal the full-sort truth WHEN the per-file sort declaration is
+    /// dropped — the exec.rs routing for OPAQUE concat files. The plan pays
+    /// a real SortExec; that is the documented trade.
+    #[tokio::test]
+    async fn order_by_desc_over_concat_file_without_declaration_is_correct() -> Result<()> {
+        let ctx = concat_order_by_ctx(false, false).await?;
+        let (rendered, got) = concat_order_by_top7(&ctx).await?;
+        assert!(
+            rendered.contains("SortExec"),
+            "without the declaration a real sort must run, got plan:\n{rendered}"
+        );
+        // global truth: the concat file's SECOND run holds the newest rows
+        let expected: Vec<i64> = vec![320, 319, 318, 317, 316, 300, 299];
+        assert_eq!(
+            got, expected,
+            "full-sort baseline must hold over the concat file;\nplan:\n{rendered}"
+        );
+        Ok(())
+    }
+
+    /// #51c-c hazard probe (the WHY of the two-table split): the SAME table
+    /// WITH the `_timestamp DESC` per-file declaration but WITHOUT an
+    /// ordered-aware source — a declared table wrongly fed a concat file
+    /// whose scan streams stored order — elides the sort (no SortExec:
+    /// DataFusion trusts the declared within-file order) and returns WRONG
+    /// top-k rows. This is why exec.rs routes ONLY provably-mergeable files
+    /// into the declared table and sets `with_ordered_output` there. If a
+    /// DataFusion upgrade ever makes `got` equal the truth here, revisit.
+    #[tokio::test]
+    async fn order_by_desc_over_concat_file_with_declaration_is_the_hazard() -> Result<()> {
+        let ctx = concat_order_by_ctx(true, false).await?;
+        let (rendered, got) = concat_order_by_top7(&ctx).await?;
+        assert!(
+            !rendered.contains("SortExec"),
+            "the declaration elides the sort — that elision is the hazard, got plan:\n{rendered}"
+        );
+        let truth: Vec<i64> = vec![320, 319, 318, 317, 316, 300, 299];
+        assert_ne!(
+            got, truth,
+            "declared order over a concat file returned the right rows by luck — if this is a \
+             DataFusion behavior change, revisit the #51c-c declaration drop;\nplan:\n{rendered}"
+        );
+        Ok(())
+    }
+
+    /// §6.2 M4: the declared table WITH the ordered-aware source — exactly
+    /// what exec.rs builds for ts_desc + region-mergeable files — elides
+    /// the sort AND returns the exact top-k: the concat file's scan k-way
+    /// merges its regions, so its declared per-file order is genuinely
+    /// upheld. The piecewise-order read this milestone exists for.
+    #[tokio::test]
+    async fn order_by_desc_over_concat_file_with_ordered_source_is_correct() -> Result<()> {
+        let ctx = concat_order_by_ctx(true, true).await?;
+        let (rendered, got) = concat_order_by_top7(&ctx).await?;
+        assert!(
+            !rendered.contains("SortExec"),
+            "the declared+merged path must elide the sort, got plan:\n{rendered}"
+        );
+        let truth: Vec<i64> = vec![320, 319, 318, 317, 316, 300, 299];
+        assert_eq!(
+            got, truth,
+            "region-merged ordered scan must equal the full-sort truth;\nplan:\n{rendered}"
+        );
+        Ok(())
+    }
 }
 
 /// Adversarial-review proving tests (DataFusion scan integration / SQL
@@ -1609,7 +2505,7 @@ mod review_tests {
         writer
             .push_batch_with_source(&batch, &sources, None)
             .unwrap();
-        bytes::Bytes::from(writer.finish().unwrap())
+        bytes::Bytes::from(writer.finish().unwrap().0)
     }
 
     /// PARITY GATE: the compaction-time [`derive_cs_column_from_source`] and
@@ -1952,6 +2848,8 @@ mod review_tests {
 
         let opener = VixCoreOpener {
             column_bounds: Vec::new(),
+            null_rejected_columns: Vec::new(),
+            emit_ts_desc: false,
             object_store: Arc::clone(&store),
             projected_schema: logical_schema(),
             timestamp_filter: None,
@@ -2017,7 +2915,7 @@ mod review_tests {
         writer
             .push_batch_with_source(&batch, &sources, None)
             .unwrap();
-        bytes::Bytes::from(writer.finish().unwrap())
+        bytes::Bytes::from(writer.finish().unwrap().0)
     }
 
     /// file_sort_order hazard probe: four MUTUALLY overlapping files while
@@ -2422,14 +3320,353 @@ mod prod_probe_tests {
     }
 }
 
+/// M4 pruning-tier tests: field presence (§4), chunk-stats file exclusion,
+/// null-semantics fail-open pins, and the native-vs-json_get routing pin.
+#[cfg(test)]
+mod m4_pruning_tests {
+    use arrow::array::StringArray;
+    use datafusion::{
+        datasource::{
+            listing::{ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl},
+            object_store::{DefaultObjectStoreRegistry, ObjectStoreRegistry},
+        },
+        execution::{runtime_env::RuntimeEnvBuilder, session_state::SessionStateBuilder},
+        physical_plan::collect,
+        prelude::{SessionConfig, SessionContext},
+    };
+    use object_store::{ObjectStoreExt, memory::InMemory, path::Path};
+    use vortex_index::{VixWriter, VixWriterOptions};
+
+    use super::*;
+
+    /// One file with `_timestamp` + `level` columns (optionally stamped
+    /// `columns_complete`); `hidden` optionally smuggles a `ghost` field
+    /// into `_source` WITHOUT a column — the deliberate invariant violation
+    /// that makes a fired presence skip OBSERVABLE (a scan that reaches
+    /// json_get would find the values; a skipped file returns nothing).
+    fn build_presence_file(complete: bool, hidden: bool) -> bytes::Bytes {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("level", DataType::Utf8, true),
+        ]));
+        let opts = VixWriterOptions {
+            columns_complete: complete,
+            ..Default::default()
+        };
+        let mut writer = VixWriter::new(&schema, opts, false);
+        let ts: Vec<i64> = (0..4).map(|i| 1000 - i).collect();
+        let sources: Vec<String> = ts
+            .iter()
+            .map(|t| {
+                if hidden {
+                    format!(r#"{{"_timestamp":{t},"level":"info","ghost":"boo"}}"#)
+                } else {
+                    format!(r#"{{"_timestamp":{t},"level":"info"}}"#)
+                }
+            })
+            .collect();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(ts)),
+                Arc::new(StringArray::from(vec![Some("info"); 4])),
+            ],
+        )
+        .unwrap();
+        let sources = StringArray::from_iter_values(sources.iter().map(String::as_str));
+        writer
+            .push_batch_with_source(&batch, &sources, None)
+            .unwrap();
+        bytes::Bytes::from(writer.finish().unwrap().0)
+    }
+
+    /// Tier-by-tier verdicts of [`file_provably_skippable`].
+    #[test]
+    fn skip_hook_tiers_fire_correctly() {
+        // FIELD PRESENCE: a columns-complete file skips on an absent
+        // null-rejected column; an incomplete file never does (fail-open)
+        let complete = VixDocs::open(build_presence_file(true, false)).unwrap();
+        assert_eq!(
+            file_provably_skippable(&complete, None, &[], &["ghost".to_string()]),
+            Some("field-presence")
+        );
+        // a PRESENT column with values never presence-skips
+        assert_eq!(
+            file_provably_skippable(&complete, None, &[], &["level".to_string()]),
+            None
+        );
+        // reserved columns are in the docs schema, never presence-skipped
+        assert_eq!(
+            file_provably_skippable(&complete, None, &[], &[SOURCE_COL_NAME.to_string()]),
+            None
+        );
+        let incomplete = VixDocs::open(build_presence_file(false, true)).unwrap();
+        assert_eq!(
+            file_provably_skippable(&incomplete, None, &[], &["ghost".to_string()]),
+            None,
+            "no completeness marker: ghost may hide in _source — fail open"
+        );
+
+        // ZERO-PRESENCE: an all-NULL column skips unconditionally (native
+        // columns are authoritative for reads), completeness irrelevant
+        let all_null = {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("_timestamp", DataType::Int64, false),
+                Field::new("empty_col", DataType::Int64, true),
+            ]));
+            let mut writer = VixWriter::new(&schema, VixWriterOptions::default(), false);
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(vec![10i64, 9])),
+                    Arc::new(Int64Array::from(vec![None::<i64>, None])),
+                ],
+            )
+            .unwrap();
+            let sources = StringArray::from(vec!["{}", "{}"]);
+            writer
+                .push_batch_with_source(&batch, &sources, None)
+                .unwrap();
+            VixDocs::open(bytes::Bytes::from(writer.finish().unwrap().0)).unwrap()
+        };
+        assert_eq!(
+            file_provably_skippable(&all_null, None, &[], &["empty_col".to_string()]),
+            Some("field-presence")
+        );
+
+        // FILE-STATS (vortex footer, first-encode numerics): code 0..=3
+        let coded = {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("_timestamp", DataType::Int64, false),
+                Field::new("code", DataType::Int64, true),
+            ]));
+            let mut writer = VixWriter::new(&schema, VixWriterOptions::default(), false);
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(vec![10i64, 9, 8, 7])),
+                    Arc::new(Int64Array::from(vec![0i64, 1, 2, 3])),
+                ],
+            )
+            .unwrap();
+            let sources = StringArray::from(vec!["{}"; 4]);
+            writer
+                .push_batch_with_source(&batch, &sources, None)
+                .unwrap();
+            VixDocs::open(bytes::Bytes::from(writer.finish().unwrap().0)).unwrap()
+        };
+        let ge_code = |v: i64| {
+            vec![ColumnBound {
+                column: "code".to_string(),
+                min: Some((BoundValue::I64(v), true)),
+                max: None,
+            }]
+        };
+        assert_eq!(
+            file_provably_skippable(&coded, None, &ge_code(100), &["code".to_string()]),
+            Some("file-stats")
+        );
+        assert_eq!(
+            file_provably_skippable(&coded, None, &ge_code(2), &["code".to_string()]),
+            None
+        );
+
+        // CHUNK-STATS-EMPTY: a STRING bound has no vortex file stats
+        // (tier 2 silent), so the O2 chunk fold is what proves emptiness
+        let eq_level = |v: &str| {
+            vec![ColumnBound {
+                column: "level".to_string(),
+                min: Some((BoundValue::Str(v.to_string()), true)),
+                max: Some((BoundValue::Str(v.to_string()), true)),
+            }]
+        };
+        assert_eq!(
+            file_provably_skippable(&complete, None, &eq_level("zzz"), &["level".to_string()]),
+            Some("chunk-stats-empty")
+        );
+        assert_eq!(
+            file_provably_skippable(&complete, None, &eq_level("info"), &["level".to_string()]),
+            None
+        );
+    }
+
+    async fn presence_ctx(files: Vec<(&str, bytes::Bytes)>) -> Result<SessionContext> {
+        let store = Arc::new(InMemory::new());
+        for (name, data) in files {
+            store.put(&Path::from(name), data.into()).await?;
+        }
+        let registry = DefaultObjectStoreRegistry::new();
+        registry.register_store(&url::Url::parse("test:///").unwrap(), store);
+        let runtime_env = RuntimeEnvBuilder::new()
+            .with_object_store_registry(Arc::new(registry))
+            .build()?;
+        let state = SessionStateBuilder::new()
+            .with_config(SessionConfig::new().with_target_partitions(1))
+            .with_runtime_env(Arc::new(runtime_env))
+            .with_default_features()
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        // logical schema knows `ghost` (registry type Utf8); the files may not
+        let table_schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+            Field::new("level", DataType::Utf8, true),
+            Field::new("ghost", DataType::Utf8, true),
+        ]));
+        let listing_options =
+            ListingOptions::new(Arc::new(VixCoreFormat::new(None))).with_collect_stat(true);
+        let config = ListingTableConfig::new(ListingTableUrl::parse("test:///data/")?)
+            .with_listing_options(listing_options)
+            .with_schema(table_schema);
+        ctx.register_table("t", Arc::new(ListingTable::try_new(config)?))?;
+        Ok(ctx)
+    }
+
+    async fn run_counting(ctx: &SessionContext, sql: &str) -> Result<usize> {
+        let df = ctx.sql(sql).await?;
+        let plan = df.create_physical_plan().await?;
+        // the follower-side injection pass (flight.rs applies it post-plan)
+        let plan = inject_vix_scan_pruning(plan)?;
+        let batches = collect(plan, ctx.task_ctx()).await?;
+        Ok(batches.iter().map(|b| b.num_rows()).sum())
+    }
+
+    /// E2E §4 presence pruning through the injector + opener: the file is
+    /// stamped columns-complete BUT its `_source` secretly carries `ghost`
+    /// values (the deliberate lie that makes the skip observable). Every
+    /// null-rejecting shape returns 0 rows — json_get was never consulted —
+    /// while the null-ACCEPTING shapes return all rows, proving both the
+    /// skip and its exact null-semantics boundary.
+    #[tokio::test]
+    async fn presence_pruning_e2e_null_semantics() -> Result<()> {
+        let ctx = presence_ctx(vec![("data/lying.vix", build_presence_file(true, true))]).await?;
+
+        // null-rejecting shapes on the absent column: the presence skip
+        // fires BEFORE the scan could fall back to json_get(_source)
+        for sql in [
+            "SELECT _timestamp FROM t WHERE ghost = 'boo'",
+            "SELECT _timestamp FROM t WHERE ghost != 'x'",
+            "SELECT _timestamp FROM t WHERE ghost < 'zzz'",
+            "SELECT _timestamp FROM t WHERE ghost LIKE 'b%'",
+            "SELECT _timestamp FROM t WHERE ghost IN ('boo', 'bar')",
+            "SELECT _timestamp FROM t WHERE ghost IS NOT NULL",
+            "SELECT _timestamp FROM t WHERE str_match(ghost, 'boo')",
+        ] {
+            // register the udf-bearing context per query (str_match)
+            crate::datafusion::exec::register_udf(&ctx, "org").unwrap();
+            assert_eq!(
+                run_counting(&ctx, sql).await?,
+                0,
+                "null-rejecting predicate must skip the file whole: {sql}"
+            );
+        }
+
+        // OR across DIFFERENT columns never presence-prunes (intersection
+        // is empty): the rows survive through the json_get fallback branch
+        assert_eq!(
+            run_counting(
+                &ctx,
+                "SELECT _timestamp FROM t WHERE ghost = 'boo' OR level = 'info'"
+            )
+            .await?,
+            4
+        );
+
+        // null-ACCEPTING shapes must NOT prune. Pinned on an HONEST
+        // columns-complete file whose `ghost` really is all-NULL: a wrong
+        // presence skip would return 0 where the truth is every row.
+        let ctx =
+            presence_ctx(vec![("data/honest.vix", build_presence_file(true, false))]).await?;
+        for sql in [
+            "SELECT _timestamp FROM t WHERE ghost IS NULL",
+            "SELECT _timestamp FROM t WHERE COALESCE(ghost, 'x') = 'x'",
+            "SELECT _timestamp FROM t WHERE ghost IS DISTINCT FROM 'boo'",
+        ] {
+            assert_eq!(
+                run_counting(&ctx, sql).await?,
+                4,
+                "null-accepting predicate must keep every row: {sql}"
+            );
+        }
+        Ok(())
+    }
+
+    /// An honest INCOMPLETE file (no marker) with `ghost` only in `_source`
+    /// keeps the json_get fallback: the same equality returns the rows.
+    #[tokio::test]
+    async fn incomplete_file_keeps_json_get_fallback() -> Result<()> {
+        let ctx =
+            presence_ctx(vec![("data/honest.vix", build_presence_file(false, true))]).await?;
+        assert_eq!(
+            run_counting(&ctx, "SELECT _timestamp FROM t WHERE ghost = 'boo'").await?,
+            4,
+            "without the completeness marker the scan must fall back to json_get"
+        );
+        Ok(())
+    }
+
+    /// Task-5 pin: a column PRESENT in the file is read natively (no
+    /// `_source` fetch, no json_get), an ABSENT one is a `json_get`
+    /// extraction over `_source` with NULL-correct semantics.
+    #[test]
+    fn present_column_native_absent_column_json_get() {
+        let docs = VixDocs::open(build_presence_file(false, true)).unwrap();
+
+        // present only: native reference, _source NOT fetched
+        let present_only: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "level",
+            DataType::Utf8,
+            true,
+        )]));
+        let plan = LogicalProjectionPlan::new(&docs, &present_only).unwrap();
+        assert_eq!(plan.physical_projection, vec!["level"]);
+
+        // absent column: _source fetched exactly once, extraction is NULL
+        // where _source lacks the key and the value where it has it
+        let mixed: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("level", DataType::Utf8, true),
+            Field::new("ghost", DataType::Utf8, true),
+            Field::new("never_anywhere", DataType::Utf8, true),
+        ]));
+        let plan = LogicalProjectionPlan::new(&docs, &mixed).unwrap();
+        assert_eq!(plan.physical_projection, vec!["level", SOURCE_COL_NAME]);
+
+        let mut batches = Vec::new();
+        scan_core_docs(docs, &mixed, None, None, &[], &mut |batch| {
+            batches.push(batch);
+            Ok(())
+        })
+        .unwrap();
+        let batch = &batches[0];
+        let level = batch.column_by_name("level").unwrap();
+        let level = level.as_any().downcast_ref::<StringArray>().unwrap();
+        let ghost = batch.column_by_name("ghost").unwrap();
+        let ghost = ghost.as_any().downcast_ref::<StringArray>().unwrap();
+        let never = batch.column_by_name("never_anywhere").unwrap();
+        for row in 0..batch.num_rows() {
+            assert_eq!(level.value(row), "info", "native column read");
+            assert_eq!(ghost.value(row), "boo", "json_get extraction");
+            assert!(never.is_null(row), "absent everywhere: NULL");
+        }
+    }
+}
+
 /// Walk a follower's physical plan; for every `FilterExec` sitting (through
-/// pass-through nodes) above a vix scan, extract top-level-AND numeric
-/// conjuncts (`col > | >= | < | <= | = literal`, i64/f64, type-matching the
-/// scan schema) and inject them into the scan's [`VixCoreSource`]. The
-/// FilterExec stays — pruning is conservative-only and every row is
-/// re-checked. Non-matching shapes (OR, functions, casts, other types) are
-/// simply not pushed.
-pub fn inject_vix_numeric_bounds(
+/// pass-through nodes) above a vix scan, extract from its top-level-AND
+/// conjuncts:
+///
+/// - RANGE BOUNDS (`col > | >= | < | <= | = literal`, numeric or string, type-family-matching the
+///   scan schema; plus the min/max fold of a non-negated all-literal `IN` list) — pushed into the
+///   scan for vortex row filtering (numerics) and O2 chunk/file stats pruning (strings included,
+///   conservative prefix logic);
+/// - NULL-REJECTED COLUMNS: plain columns on which the conjunct can NEVER hold for a NULL cell
+///   (`=`, `!=`, `<`…, `LIKE`/`NOT LIKE`, `IN`/`NOT IN` over non-null literals, `IS NOT NULL`,
+///   `str_match`/`match_field`/`fuzzy_match`) — the §4 field-presence file skip. Null-ACCEPTING
+///   shapes (`IS NULL`, `IS [NOT] DISTINCT FROM`, `coalesce(...)`, OR branches, NOT wrappers,
+///   casts) are deliberately NOT extracted: when in doubt, don't prune.
+///
+/// The FilterExec stays — pruning is conservative-only and every returned
+/// row is re-checked.
+pub fn inject_vix_scan_pruning(
     plan: Arc<dyn ExecutionPlan>,
 ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
     use datafusion::{
@@ -2441,31 +3678,104 @@ pub fn inject_vix_numeric_bounds(
         },
     };
 
-    fn literal_scalar(value: &ScalarValue) -> Option<NumScalar> {
+    fn literal_value(value: &ScalarValue) -> Option<BoundValue> {
         match value {
-            ScalarValue::Int64(Some(v)) => Some(NumScalar::I64(*v)),
-            ScalarValue::UInt64(Some(v)) => i64::try_from(*v).ok().map(NumScalar::I64),
-            ScalarValue::Float64(Some(v)) => Some(NumScalar::F64(*v)),
+            ScalarValue::Int8(Some(v)) => Some(BoundValue::I64(*v as i64)),
+            ScalarValue::Int16(Some(v)) => Some(BoundValue::I64(*v as i64)),
+            ScalarValue::Int32(Some(v)) => Some(BoundValue::I64(*v as i64)),
+            ScalarValue::Int64(Some(v)) => Some(BoundValue::I64(*v)),
+            ScalarValue::UInt8(Some(v)) => Some(BoundValue::U64(*v as u64)),
+            ScalarValue::UInt16(Some(v)) => Some(BoundValue::U64(*v as u64)),
+            ScalarValue::UInt32(Some(v)) => Some(BoundValue::U64(*v as u64)),
+            ScalarValue::UInt64(Some(v)) => Some(BoundValue::U64(*v)),
+            ScalarValue::Float32(Some(v)) => Some(BoundValue::F64(*v as f64)),
+            ScalarValue::Float64(Some(v)) => Some(BoundValue::F64(*v)),
+            ScalarValue::Utf8(Some(v))
+            | ScalarValue::LargeUtf8(Some(v))
+            | ScalarValue::Utf8View(Some(v)) => Some(BoundValue::Str(v.clone())),
             _ => None,
         }
     }
 
-    fn scalar_matches_type(scalar: NumScalar, data_type: &DataType) -> bool {
+    fn value_matches_type(value: &BoundValue, data_type: &DataType) -> bool {
         matches!(
-            (scalar, data_type),
-            (NumScalar::I64(_), DataType::Int64) | (NumScalar::F64(_), DataType::Float64)
+            (value, data_type),
+            (
+                BoundValue::I64(_),
+                DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+            ) | (
+                BoundValue::U64(_),
+                DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64
+            ) | (BoundValue::F64(_), DataType::Float32 | DataType::Float64)
+                | (
+                    BoundValue::Str(_),
+                    DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+                )
         )
     }
 
-    fn extract_bounds(
-        predicate: &Arc<dyn PhysicalExpr>,
-        schema: &Schema,
-        out: &mut Vec<ColumnBound>,
-    ) {
+    /// Whether the conjunct's literal is non-null (a `col = NULL` shape is
+    /// never true, but keep it out of the analysis entirely).
+    fn non_null_literal(literal: &phys::Literal) -> bool {
+        !literal.value().is_null()
+    }
+
+    #[derive(Default)]
+    struct Extracted {
+        bounds: Vec<ColumnBound>,
+        null_rejected: Vec<String>,
+    }
+
+    impl Extracted {
+        fn reject_null(&mut self, column: &str) {
+            if !self.null_rejected.iter().any(|c| c == column) {
+                self.null_rejected.push(column.to_string());
+            }
+        }
+    }
+
+    /// The columns a predicate is null-rejecting on — NULL in the column
+    /// makes the predicate non-true, whatever the other columns hold. AND
+    /// unions its branches (any branch failing kills the row); OR
+    /// INTERSECTS them (every branch must fail on NULL — this catches the
+    /// `IN`-list shapes DataFusion rewrites into `=` OR-chains). Leaves are
+    /// the allowlisted shapes; anything else contributes nothing.
+    fn null_rejected_of(predicate: &Arc<dyn PhysicalExpr>, out: &mut Extracted) {
+        if let Some(binary) = predicate.downcast_ref::<phys::BinaryExpr>() {
+            match binary.op() {
+                Operator::And => {
+                    null_rejected_of(binary.left(), out);
+                    null_rejected_of(binary.right(), out);
+                    return;
+                }
+                Operator::Or => {
+                    let mut left = Extracted::default();
+                    let mut right = Extracted::default();
+                    null_rejected_of(binary.left(), &mut left);
+                    null_rejected_of(binary.right(), &mut right);
+                    for column in left.null_rejected {
+                        if right.null_rejected.iter().any(|c| *c == column) {
+                            out.reject_null(&column);
+                        }
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
+        // leaves share the AND-conjunct analysis, bounds discarded
+        let mut leaf = Extracted::default();
+        extract(predicate, &Schema::empty(), &mut leaf);
+        for column in leaf.null_rejected {
+            out.reject_null(&column);
+        }
+    }
+
+    fn extract(predicate: &Arc<dyn PhysicalExpr>, schema: &Schema, out: &mut Extracted) {
         if let Some(binary) = predicate.downcast_ref::<phys::BinaryExpr>() {
             if matches!(binary.op(), Operator::And) {
-                extract_bounds(binary.left(), schema, out);
-                extract_bounds(binary.right(), schema, out);
+                extract(binary.left(), schema, out);
+                extract(binary.right(), schema, out);
                 return;
             }
             let (column, literal, op) = match (
@@ -2483,19 +3793,37 @@ pub fn inject_vix_numeric_bounds(
                         Operator::Lt => Operator::Gt,
                         Operator::LtEq => Operator::GtEq,
                         Operator::Eq => Operator::Eq,
+                        Operator::NotEq => Operator::NotEq,
                         _ => return,
                     };
                     (column, literal, flipped)
                 }
                 _ => return,
             };
-            let Some(value) = literal_scalar(literal.value()) else {
+            // Every plain comparison against a NON-NULL literal is
+            // null-rejecting (NULL op x = NULL, filtered out). NOTE:
+            // IsDistinctFrom/IsNotDistinctFrom are DIFFERENT operators and
+            // never reach here as Eq/NotEq — they accept NULLs.
+            if !matches!(
+                op,
+                Operator::Eq
+                    | Operator::NotEq
+                    | Operator::Lt
+                    | Operator::LtEq
+                    | Operator::Gt
+                    | Operator::GtEq
+            ) || !non_null_literal(literal)
+            {
+                return;
+            }
+            out.reject_null(column.name());
+            let Some(value) = literal_value(literal.value()) else {
                 return;
             };
             let Ok(field) = schema.field_with_name(column.name()) else {
                 return;
             };
-            if !scalar_matches_type(value, field.data_type()) {
+            if !value_matches_type(&value, field.data_type()) {
                 return;
             }
             let name = column.name().to_string();
@@ -2522,21 +3850,123 @@ pub fn inject_vix_numeric_bounds(
                 },
                 Operator::Eq => ColumnBound {
                     column: name,
-                    min: Some((value, true)),
+                    min: Some((value.clone(), true)),
                     max: Some((value, true)),
                 },
+                // `!=` rejects NULL but bounds nothing
                 _ => return,
             };
-            out.push(bound);
+            out.bounds.push(bound);
+            return;
+        }
+        // col [NOT] LIKE 'pattern': NULL LIKE p is NULL either way
+        if let Some(like) = predicate.downcast_ref::<phys::LikeExpr>() {
+            if let Some(column) = like.expr().downcast_ref::<phys::Column>()
+                && let Some(literal) = like.pattern().downcast_ref::<phys::Literal>()
+                && non_null_literal(literal)
+            {
+                out.reject_null(column.name());
+            }
+            return;
+        }
+        // col [NOT] IN (l1, l2, ...): NULL IN (...) is NULL either way when
+        // the list is all non-null literals; the non-negated list also
+        // folds to an inclusive [min, max] bound
+        if let Some(in_list) = predicate.downcast_ref::<phys::InListExpr>() {
+            let Some(column) = in_list.expr().downcast_ref::<phys::Column>() else {
+                return;
+            };
+            let literals: Option<Vec<BoundValue>> = in_list
+                .list()
+                .iter()
+                .map(|item| {
+                    item.downcast_ref::<phys::Literal>()
+                        .filter(|l| non_null_literal(l))
+                        .and_then(|l| literal_value(l.value()))
+                })
+                .collect();
+            let Some(values) = literals else {
+                return; // non-literal or NULL member: fail-open
+            };
+            if values.is_empty() {
+                return;
+            }
+            out.reject_null(column.name());
+            if in_list.negated() {
+                return; // NOT IN rejects NULL but bounds nothing
+            }
+            if let Ok(field) = schema.field_with_name(column.name())
+                && values.iter().all(|v| value_matches_type(v, field.data_type()))
+                && let (Some(min), Some(max)) = (
+                    values.iter().cloned().reduce(|a, b| bound_min(a, b)),
+                    values.iter().cloned().reduce(|a, b| bound_max(a, b)),
+                )
+            {
+                out.bounds.push(ColumnBound {
+                    column: column.name().to_string(),
+                    min: Some((min, true)),
+                    max: Some((max, true)),
+                });
+            }
+            return;
+        }
+        // col IS NOT NULL: rejects NULL by definition
+        if let Some(is_not_null) = predicate.downcast_ref::<phys::IsNotNullExpr>() {
+            if let Some(column) = is_not_null.arg().downcast_ref::<phys::Column>() {
+                out.reject_null(column.name());
+            }
+            return;
+        }
+        // str_match/match_field/fuzzy_match(col, 'value'): the arrow string
+        // kernels propagate NULL input to a non-true output
+        if let Some(udf) = predicate.downcast_ref::<ScalarFunctionExpr>() {
+            use crate::datafusion::udf::{
+                FUZZY_MATCH_UDF_NAME, MATCH_FIELD_IGNORE_CASE_UDF_NAME, MATCH_FIELD_UDF_NAME,
+                STR_MATCH_UDF_IGNORE_CASE_NAME, STR_MATCH_UDF_NAME,
+            };
+            let null_rejecting = matches!(
+                udf.name(),
+                STR_MATCH_UDF_NAME
+                    | STR_MATCH_UDF_IGNORE_CASE_NAME
+                    | MATCH_FIELD_UDF_NAME
+                    | MATCH_FIELD_IGNORE_CASE_UDF_NAME
+                    | FUZZY_MATCH_UDF_NAME
+            );
+            if null_rejecting
+                && let Some(column) = udf.args().first().and_then(|a| a.downcast_ref::<phys::Column>())
+            {
+                out.reject_null(column.name());
+            }
+        }
+        // everything else (IS NULL, IS [NOT] DISTINCT FROM, coalesce, OR,
+        // NOT, casts, ...): fail-open — extracted nothing
+    }
+
+    /// Total order over same-family bound values (IN-list folding; the
+    /// caller has type-gated the family). NaN floats sort last (max) /
+    /// first (min) harmlessly — the fold stays conservative.
+    fn bound_min(a: BoundValue, b: BoundValue) -> BoundValue {
+        if bound_le(&a, &b) { a } else { b }
+    }
+    fn bound_max(a: BoundValue, b: BoundValue) -> BoundValue {
+        if bound_le(&a, &b) { b } else { a }
+    }
+    fn bound_le(a: &BoundValue, b: &BoundValue) -> bool {
+        match (a, b) {
+            (BoundValue::I64(a), BoundValue::I64(b)) => a <= b,
+            (BoundValue::U64(a), BoundValue::U64(b)) => a <= b,
+            (BoundValue::F64(a), BoundValue::F64(b)) => a <= b || b.is_nan(),
+            (BoundValue::Str(a), BoundValue::Str(b)) => a <= b,
+            _ => true, // mixed families are type-gated out before folding
         }
     }
 
-    /// Inject `bounds` into every vix DataSourceExec under `node`, passing
-    /// through repartition/coalesce/projection-free nodes only (a
+    /// Inject the extraction into every vix DataSourceExec under `node`,
+    /// passing through repartition/coalesce/projection-free nodes only (a
     /// projection can rename columns — stop there).
     fn inject(
         node: Arc<dyn ExecutionPlan>,
-        bounds: &[ColumnBound],
+        extracted: &Extracted,
     ) -> datafusion::common::Result<Transformed<Arc<dyn ExecutionPlan>>> {
         if let Some(exec) = node.downcast_ref::<DataSourceExec>()
             && let Some(conf) = exec.data_source().downcast_ref::<FileScanConfig>()
@@ -2545,8 +3975,13 @@ pub fn inject_vix_numeric_bounds(
             if let Some(source) = source.downcast_ref::<VixCoreSource>() {
                 let mut source = source.clone();
                 let mut merged = source.column_bounds.clone();
-                merged.extend(bounds.iter().cloned());
+                merged.extend(extracted.bounds.iter().cloned());
                 source.column_bounds = merged;
+                for column in &extracted.null_rejected {
+                    if !source.null_rejected_columns.iter().any(|c| c == column) {
+                        source.null_rejected_columns.push(column.clone());
+                    }
+                }
                 let mut conf = conf.clone();
                 conf.file_source = Arc::new(source);
                 return Ok(Transformed::yes(DataSourceExec::from_data_source(conf)));
@@ -2563,7 +3998,7 @@ pub fn inject_vix_numeric_bounds(
             .children()
             .into_iter()
             .map(|child| {
-                inject(Arc::clone(child), bounds).map(|t| {
+                inject(Arc::clone(child), extracted).map(|t| {
                     changed |= t.transformed;
                     t.data
                 })
@@ -2580,22 +4015,37 @@ pub fn inject_vix_numeric_bounds(
         let Some(filter) = node.downcast_ref::<FilterExec>() else {
             return Ok(Transformed::no(node));
         };
-        let mut bounds = Vec::new();
-        extract_bounds(filter.predicate(), &filter.input().schema(), &mut bounds);
-        if bounds.is_empty() {
+        let mut extracted = Extracted::default();
+        extract(filter.predicate(), &filter.input().schema(), &mut extracted);
+        // the null-rejection walk also crosses OR (intersection semantics),
+        // catching the IN-list shapes the planner rewrites to `=` OR-chains
+        let mut or_aware = Extracted::default();
+        null_rejected_of(filter.predicate(), &mut or_aware);
+        for column in or_aware.null_rejected {
+            extracted.reject_null(&column);
+        }
+        if extracted.bounds.is_empty() && extracted.null_rejected.is_empty() {
             return Ok(Transformed::no(node));
         }
-        let injected = inject(Arc::clone(filter.input()), &bounds)?;
+        let injected = inject(Arc::clone(filter.input()), &extracted)?;
         if !injected.transformed {
             log::debug!(
-                "vix numeric pushdown: {} bound(s) extracted but no vix scan adjacent",
-                bounds.len()
+                "vix scan pruning: {} bound(s) / {} null-rejected column(s) extracted but no \
+                 vix scan adjacent",
+                extracted.bounds.len(),
+                extracted.null_rejected.len(),
             );
             return Ok(Transformed::no(node));
         }
         log::info!(
-            "vix numeric pushdown: injected {} bound(s): {bounds:?}",
-            bounds.len()
+            "vix scan pruning: injected {} bound(s), {} null-rejected column(s)",
+            extracted.bounds.len(),
+            extracted.null_rejected.len(),
+        );
+        log::debug!(
+            "vix scan pruning details: bounds {:?}, null-rejected {:?}",
+            extracted.bounds,
+            extracted.null_rejected,
         );
         Ok(Transformed::yes(
             node.with_new_children(vec![injected.data])?,
