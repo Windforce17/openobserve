@@ -3,6 +3,53 @@
 Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
 (deleted 2026-07-29; full history in git). Keep THIS file current.
 
+## M31a — INGEST LATE LANE 2026-08-26 (ships as .124; the tiny-file source fix)
+- DESIGN DEVIATION from the DESIGN-MERGE.md §2 charter, for cause: the
+  charter's per-segment pending-(stream,hour) pool has NO representation in
+  the provenance scheme — dedup_candidates suppresses by (stream, segment
+  id-range), so an L0 covering an id whose hour-H rows were withheld makes
+  those rows INVISIBLE (invariant survey 2026-08-26: the visibility unit is
+  the whole segment per stream; Built is terminal; no row-level _o2_id
+  dedup exists to absorb any at-least-once alternative). The safe unit is
+  the WHOLE SEGMENT — so the split moves UPSTREAM of the builder:
+- Mechanism: (1) the ingest buffer routes frames whose hour is ≥
+  ZO_SEGMENT_LATE_LANE_HOURS behind now (frames are per-(stream,hour) by
+  construction) into a LATE sub-buffer that ships as its OWN all-late
+  segments on slower triggers (ZO_SEGMENT_LATE_FLUSH_SIZE_MB=8 /
+  _MAX_SECS=30 — the documented durability trade: ≤30s RAM window for
+  LATE rows only); (2) all-late segments (classifier created_at - max_ts,
+  NO schema/format change) are EXCLUDED from the fresh claim lanes + the
+  #44/#50 gates and claimed by a third lane (ClaimOrder::LateOldestFirst)
+  after ZO_SEGMENT_LATE_CLAIM_HOLD_SECS=900 — one wave per hold window
+  coalesces the whole fleet's late rows into ONE L0 per (stream, hour)
+  instead of ~one 1-record ~3KB file per hour per build batch (~3.5k/h on
+  traces alone, 85% into old hours; ~300KB compressed metadata floor each
+  = ~1GB/h of pure S3 metadata churn).
+- Invariants kept: whole-segment claim granularity, deterministic chunk
+  keys, single wal_segments producer, Built stays terminal, stale-lease
+  recovery covers late claims through the fresh lanes, rows stay
+  query-visible through the segment tail during the hold, hold ≪ the 1d
+  lifecycle. Backlog WARN keeps counting hold-EXPIRED late segments (lane
+  stall signal) and ignores held ones. Lane off (0, the default) is
+  byte-for-byte today's behavior — ships DARK, enabled per env via
+  configmap (both builder roles must see the env together).
+- Tests: sqlite claim/probe/stats semantics (fresh excludes all-late; late
+  lane claims exactly hold-expired, oldest first; lane-off degradation),
+  buffer routing/triggers/shared-cap/drain. Suites green.
+
+## .123 +1h OUTCOME 2026-08-26 ~10:5xZ — WEDGE HEAL WAVE SELF-TERMINATED
+- The lone-index-less sweep clause surfaced the FULL wedge population on
+  arrival (not just .122's deferred outputs — weeks of pre-existing lone
+  L0s, dominated by logs/default): fleet heals peaked ~12.5k/10m, decayed
+  97% to 416/10m within ~1.5h, zero probe failures, every file healed
+  EXACTLY once (verified: no repeated keys). Debt-sweep pass size 186-era
+  -> 1-8 steady with transient 37s while the clause worked the window.
+- Group merges dipped to ~2k/h during the wave (shared workers), then
+  RECOVERED TO ~8.7k/h — 5.4x the pre-M30 baseline — with 81% of rebuild
+  merges on the #46 column arm (836/1037 sampled) and deferred copy-shape
+  outputs flowing (18/15min, avg 27MB, no throwaway sidecars).
+- Remaining before file counts DRAIN: the arrival side — M31a above.
+
 ## M31b 2026-08-26 — INDEX ONCE PER BYTE (ships as .122; charter: DESIGN-MERGE.md)
 - b(0) ROOT CAUSE of the dead #46 gate, measured on real prod L0s
   (m31_gate_probe example, 5 traces files + the registry schema): strict

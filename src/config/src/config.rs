@@ -1313,6 +1313,52 @@ pub struct Common {
     )]
     pub segment_build_age_lane_ratio: f64,
     #[env_config(
+        name = "ZO_SEGMENT_LATE_LANE_HOURS",
+        default = 0,
+        help = "M31a: the LATE LANE master switch. Rows whose hour partition is at \
+                least this many hours behind the current hour are LATE (late-arriving \
+                spans/logs): at ingest they buffer separately and ship as ALL-LATE \
+                segments (classifier: created_at - max_ts, no schema change), and the \
+                builder holds those segments from claiming until \
+                ZO_SEGMENT_LATE_CLAIM_HOLD_SECS so one build wave coalesces the whole \
+                fleet's late rows into one L0 file per (stream, hour) per wave — \
+                instead of one 1-record ~3KB file per hour per build batch (prod \
+                measured ~3.5k such files/h on traces alone, 85% into old hours). \
+                Rows stay queryable through the segment tail the entire hold. 0 = OFF \
+                (exact pre-M31a behavior). Sane value: 2 (the previous hour is NOT \
+                late — hour-boundary rows keep today's path)."
+    )]
+    pub segment_late_lane_hours: usize,
+    #[env_config(
+        name = "ZO_SEGMENT_LATE_FLUSH_SIZE_MB",
+        default = 8,
+        help = "M31a: byte trigger of the LATE sub-buffer (late frames accumulate \
+                across flush ticks and ship as their own segment when this fills or \
+                the age trigger below fires). Counts toward ZO_SEGMENT_BUFFER_MAX_MB."
+    )]
+    pub segment_late_flush_size_mb: usize,
+    #[env_config(
+        name = "ZO_SEGMENT_LATE_FLUSH_MAX_SECS",
+        default = 30,
+        help = "M31a: age trigger of the LATE sub-buffer. NOTE the deliberate \
+                durability trade, called out per the owner's crash-window contract: \
+                LATE rows (already ≥ ZO_SEGMENT_LATE_LANE_HOURS old) may sit in \
+                memory up to this long before shipping, vs ~ZO_SEGMENT_FLUSH_INTERVAL_MS \
+                for fresh rows — a node crash loses up to this window of LATE rows \
+                only. Fresh-row durability is unchanged."
+    )]
+    pub segment_late_flush_max_secs: u64,
+    #[env_config(
+        name = "ZO_SEGMENT_LATE_CLAIM_HOLD_SECS",
+        default = 900,
+        help = "M31a: all-late segments become claimable only this many seconds after \
+                creation — the hold is what batches a fleet's late rows into one \
+                build wave. Must stay far under the raw-object S3 lifecycle (1d prod; \
+                the aging lane is the deeper backstop). Late segments stay query-\
+                visible through the segment tail while held."
+    )]
+    pub segment_late_claim_hold_secs: u64,
+    #[env_config(
         name = "ZO_SEGMENT_BUILD_LEASE_SECS",
         default = 120,
         help = "Segment WAL: builder lease; a claim whose heartbeat is older than this is re-claimable"

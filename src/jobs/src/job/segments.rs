@@ -427,7 +427,30 @@ async fn run_loop() -> Result<(), anyhow::Error> {
         let lane_ratio = cfg.common.segment_build_age_lane_ratio;
         let lane_enabled = lane_secs > 0 && lane_ratio > 0.0;
         let mut claim_order = ClaimOrder::NewestFirst;
-        if max_wait_secs > 0 || lane_enabled {
+        // M31a late lane: hold-expired ALL-LATE segments (the fleet's
+        // late-arriving rows, segregated at flush) claim as their OWN pass,
+        // oldest-first — one wave coalesces them into one L0 file per
+        // (stream, hour) instead of a sliver per build batch. Takes this
+        // tick INSTEAD of a fresh pass; late waves surface roughly once per
+        // hold window, so fresh starvation is not a real shape. The fresh
+        // gates below (claim floor / max-wait / byte budget) don't apply —
+        // the hold already did the batching.
+        let mut late_pass = false;
+        if cfg.common.segment_late_lane_hours > 0 {
+            match wal_segments::has_late_claimable().await {
+                Ok(true) => late_pass = true,
+                Ok(false) => {}
+                Err(e) => {
+                    log::error!("[SEGMENT:BUILD] has_late_claimable failed: {e}");
+                }
+            }
+        }
+        if late_pass {
+            claim_order = ClaimOrder::LateOldestFirst;
+            log::info!(
+                "[SEGMENT:BUILD] late lane: claiming hold-expired all-late segments oldest-first"
+            );
+        } else if max_wait_secs > 0 || lane_enabled {
             // #50: cheap existence probe each tick; the count/min/SUM
             // aggregate runs only when something is claimable. Idle fleets
             // cost one indexed LIMIT-1 row per builder-second with zero

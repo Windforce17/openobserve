@@ -53,6 +53,20 @@ floor OR its oldest row exceeds an age bound (e.g. 600s = the legacy mover's
 re-polluted, so merged hours STAY converged. This is the highest-leverage
 single change in the whole review.
 
+[SUPERSEDED AS DESIGNED, KEPT AS BUILT 2026-08-26 (.124): the invariant
+survey killed the pending-pool shape — per-(stream,hour) withholding has no
+representation in the id-range provenance (dedup_candidates suppresses by
+(stream, segment id-range): an L0 covering an id whose hour-H rows were
+withheld makes them INVISIBLE), Built is terminal for tail visibility, and
+no row-level dedup exists to absorb an at-least-once variant. The shipped
+design moves the split UPSTREAM where the unit is naturally whole-segment:
+the ingest buffer segregates late frames into their own ALL-LATE segments
+(classifier created_at - max_ts, no schema/format change) and a third claim
+lane (LateOldestFirst) picks them up after a 900s hold — one wave per hold
+window coalesces the fleet's late rows. Same accumulate-or-age effect, zero
+provenance surgery. ENGINE-BACKLOG "M31a — INGEST LATE LANE" has the
+details.]
+
 ## 3. Leak 2 — the index is built 2-3x per byte (merge shapes)
 
 Cost model (survey of core_writer.rs/vortex_index, measured anchors in

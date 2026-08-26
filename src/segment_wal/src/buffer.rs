@@ -120,6 +120,18 @@ struct Inner {
     /// When the oldest buffered frame arrived; None while empty (explicit,
     /// never a zero-instant sentinel).
     oldest: Option<Instant>,
+    /// M31a LATE sub-buffer: frames whose hour partition is ≥
+    /// `ZO_SEGMENT_LATE_LANE_HOURS` behind now accumulate here across flush
+    /// ticks and ship as their OWN (all-late) segments — the thing that
+    /// makes the builder's late-lane hold possible at whole-segment
+    /// granularity. Same accounting shape as the main buffer; `late_bytes`
+    /// counts toward the shared `ZO_SEGMENT_BUFFER_MAX_MB` cap so the 503
+    /// backpressure contract is unchanged. Empty forever while the lane is
+    /// off (append routes nothing here).
+    late_frames: Vec<SegmentFrame>,
+    late_frame_sizes: Vec<usize>,
+    late_bytes: usize,
+    late_oldest: Option<Instant>,
 }
 
 pub struct SegmentBuffer {
@@ -170,11 +182,36 @@ impl SegmentBuffer {
         max_ts: i64,
         batch: RecordBatch,
     ) -> Result<(), AppendError> {
-        // cap read per call so a config reload takes effect without restart
-        let max_bytes = config::get_config().common.segment_buffer_max_mb * 1024 * 1024;
-        self.append_with_cap(org, stream_type, stream, min_ts, max_ts, batch, max_bytes)
+        // caps read per call so a config reload takes effect without restart
+        let cfg = config::get_config();
+        let max_bytes = cfg.common.segment_buffer_max_mb * 1024 * 1024;
+        // M31a: a frame is one (stream, hour, schema) entry by construction
+        // (ingestion buckets by hour partition key), so `max_ts` sits inside
+        // the frame's hour — a frame at least `late_lane_hours` behind now
+        // is a LATE frame, routed to the late sub-buffer. `>` on the hour
+        // floor keeps hour-boundary rows (previous hour right after
+        // rollover) on the fresh path at lane=2.
+        let late = match cfg.common.segment_late_lane_hours {
+            0 => false,
+            lane_hours => {
+                let cutoff = config::utils::time::now_micros()
+                    - (lane_hours as i64).saturating_mul(3_600_000_000);
+                max_ts < cutoff
+            }
+        };
+        self.append_with_cap(
+            org,
+            stream_type,
+            stream,
+            min_ts,
+            max_ts,
+            batch,
+            max_bytes,
+            late,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn append_with_cap(
         &self,
         org: &str,
@@ -184,6 +221,7 @@ impl SegmentBuffer {
         max_ts: i64,
         batch: RecordBatch,
         max_bytes: usize,
+        late: bool,
     ) -> Result<(), AppendError> {
         // a frame the encoder cannot represent must be rejected ALONE, here,
         // before it is buffered — once buffered it fails encode_segment for
@@ -200,19 +238,30 @@ impl SegmentBuffer {
             batch,
         };
         let mut inner = self.lock();
-        if inner.buffered_bytes + incoming > max_bytes {
+        // shared cap across BOTH sub-buffers: the 503 backpressure contract
+        // is about total node memory, not which lane holds it
+        if inner.buffered_bytes + inner.late_bytes + incoming > max_bytes {
             return Err(BufferFull {
-                buffered_bytes: inner.buffered_bytes,
+                buffered_bytes: inner.buffered_bytes + inner.late_bytes,
                 max_bytes,
             }
             .into());
         }
-        inner.buffered_bytes += incoming;
-        if inner.oldest.is_none() {
-            inner.oldest = Some(Instant::now());
+        if late {
+            inner.late_bytes += incoming;
+            if inner.late_oldest.is_none() {
+                inner.late_oldest = Some(Instant::now());
+            }
+            inner.late_frames.push(frame);
+            inner.late_frame_sizes.push(incoming);
+        } else {
+            inner.buffered_bytes += incoming;
+            if inner.oldest.is_none() {
+                inner.oldest = Some(Instant::now());
+            }
+            inner.frames.push(frame);
+            inner.frame_sizes.push(incoming);
         }
-        inner.frames.push(frame);
-        inner.frame_sizes.push(incoming);
         Ok(())
     }
 
@@ -268,17 +317,49 @@ impl SegmentBuffer {
         }
     }
 
-    /// Unconditionally drain everything buffered (shutdown's final flush).
+    /// M31a: swap out the LATE sub-buffer when either trigger is due —
+    /// same contract as [`Self::take_if`] but over the late frames, and it
+    /// always takes the WHOLE late set (late segments exist to be few and
+    /// coalesced; size-capping them back into slivers would defeat the
+    /// lane). Returns None when the lane is empty or neither trigger fired.
+    pub fn take_late_if(&self, min_bytes: usize, max_age: Duration) -> Option<Vec<SegmentFrame>> {
+        let mut inner = self.lock();
+        if inner.late_frames.is_empty() {
+            return None;
+        }
+        let size_due = inner.late_bytes >= min_bytes;
+        let age_due = inner
+            .late_oldest
+            .map(|oldest| oldest.elapsed() >= max_age)
+            .unwrap_or(false);
+        if !size_due && !age_due {
+            return None;
+        }
+        inner.late_bytes = 0;
+        inner.late_oldest = None;
+        inner.late_frame_sizes.clear();
+        Some(std::mem::take(&mut inner.late_frames))
+    }
+
+    /// Unconditionally drain everything buffered (shutdown's final flush) —
+    /// BOTH sub-buffers, main frames first: on graceful shutdown late rows
+    /// keep the same durability as fresh ones.
     pub fn drain(&self) -> Vec<SegmentFrame> {
         let mut inner = self.lock();
         inner.buffered_bytes = 0;
         inner.oldest = None;
         inner.frame_sizes.clear();
-        std::mem::take(&mut inner.frames)
+        inner.late_bytes = 0;
+        inner.late_oldest = None;
+        inner.late_frame_sizes.clear();
+        let mut frames = std::mem::take(&mut inner.frames);
+        frames.append(&mut inner.late_frames);
+        frames
     }
 
     pub fn buffered_bytes(&self) -> usize {
-        self.lock().buffered_bytes
+        let inner = self.lock();
+        inner.buffered_bytes + inner.late_bytes
     }
 }
 
@@ -336,7 +417,7 @@ mod tests {
     }
 
     fn append(buf: &SegmentBuffer, b: RecordBatch, cap: usize) -> Result<(), AppendError> {
-        buf.append_with_cap("org1", StreamType::Logs, "app1", 1, 2, b, cap)
+        buf.append_with_cap("org1", StreamType::Logs, "app1", 1, 2, b, cap, false)
     }
 
     fn expect_full(err: AppendError) -> BufferFull {
@@ -394,6 +475,56 @@ mod tests {
         // a fresh append starts a fresh age window
         append(&buf, batch(&[2]), usize::MAX).unwrap();
         assert!(buf.take_if(usize::MAX, Duration::from_millis(50)).is_none());
+    }
+
+    /// M31a: late-routed frames live in the late sub-buffer — invisible to
+    /// take_if, drained by take_late_if on its own size/age triggers, and
+    /// still part of the shared cap + the unconditional drain.
+    #[test]
+    fn late_lane_routing_and_triggers() {
+        let buf = SegmentBuffer::new();
+        let b_fresh = batch(&[1]);
+        let b_late = batch(&[2, 3]);
+        let late_size = b_late.size();
+        buf.append_with_cap("org1", StreamType::Logs, "app1", 1, 2, b_fresh, usize::MAX, false)
+            .unwrap();
+        buf.append_with_cap("org1", StreamType::Logs, "app1", 1, 2, b_late, usize::MAX, true)
+            .unwrap();
+        // main take never surfaces late frames
+        let taken = buf.take_if(0, Duration::ZERO).expect("fresh frame due");
+        assert_eq!(taken.len(), 1);
+        // late lane: size trigger not met, age not met -> None
+        assert!(buf.take_late_if(late_size + 1, Duration::from_secs(3600)).is_none());
+        // size trigger met -> whole late set
+        let late = buf.take_late_if(late_size, Duration::from_secs(3600)).unwrap();
+        assert_eq!(late.len(), 1);
+        assert_eq!(buf.buffered_bytes(), 0);
+        // age trigger fires with tiny bytes
+        buf.append_with_cap("org1", StreamType::Logs, "app1", 1, 2, batch(&[4]), usize::MAX, true)
+            .unwrap();
+        assert!(buf.take_late_if(usize::MAX, Duration::from_secs(3600)).is_none());
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(buf.take_late_if(usize::MAX, Duration::from_millis(20)).is_some());
+    }
+
+    #[test]
+    fn late_lane_shares_the_cap_and_the_drain() {
+        let buf = SegmentBuffer::new();
+        let b1 = batch(&[1, 2, 3, 4]);
+        let size1 = b1.size();
+        let cap = size1 + 8;
+        buf.append_with_cap("org1", StreamType::Logs, "app1", 1, 2, b1, cap, true)
+            .unwrap();
+        // a fresh append is rejected against the SHARED cap
+        let err = expect_full(
+            buf.append_with_cap("org1", StreamType::Logs, "app1", 1, 2, batch(&[1, 2, 3, 4]), cap, false)
+                .unwrap_err(),
+        );
+        assert_eq!(err.buffered_bytes, size1);
+        // drain returns late frames too and zeroes all accounting
+        assert_eq!(buf.drain().len(), 1);
+        assert_eq!(buf.buffered_bytes(), 0);
+        assert!(buf.take_late_if(0, Duration::ZERO).is_none());
     }
 
     #[test]
@@ -464,7 +595,16 @@ mod tests {
         // buffers NOTHING — it must never reach a future encode_segment
         for (field, org, stream) in [("org", long.as_str(), "app1"), ("stream", "org1", &long)] {
             let err = buf
-                .append_with_cap(org, StreamType::Logs, stream, 1, 2, batch(&[1]), usize::MAX)
+                .append_with_cap(
+                    org,
+                    StreamType::Logs,
+                    stream,
+                    1,
+                    2,
+                    batch(&[1]),
+                    usize::MAX,
+                    false,
+                )
                 .unwrap_err();
             match err {
                 AppendError::Unencodable(e) => {
@@ -492,6 +632,7 @@ mod tests {
             2,
             batch(&[1]),
             usize::MAX,
+            false,
         )
         .unwrap();
         assert_eq!(buf.drain().len(), 1);

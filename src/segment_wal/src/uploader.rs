@@ -121,8 +121,32 @@ pub async fn run_flusher() -> Result<(), anyhow::Error> {
                 // backlog standing
             }
             None => {
-                drop(permit);
-                tokio::time::sleep(interval).await;
+                // M31a: the LATE sub-buffer ships on its own (slower)
+                // size/age triggers, as its OWN all-late segment — the
+                // builder's late-lane hold needs late rows segregated at
+                // whole-segment granularity. Polled only when the main
+                // lane has nothing due, on the same permit: late frames
+                // are minutes-late already, they never preempt fresh work.
+                let late_due = cfg.common.segment_late_lane_hours > 0
+                    && global_buffer()
+                        .take_late_if(
+                            cfg.common.segment_late_flush_size_mb * 1024 * 1024,
+                            Duration::from_secs(cfg.common.segment_late_flush_max_secs),
+                        )
+                        .map(|frames| {
+                            tokio::spawn(async move {
+                                let _permit = permit;
+                                if let Err(e) = ship(frames).await {
+                                    log::error!(
+                                        "[SEGMENT:FLUSH] late-lane ship task failed: {e:#}"
+                                    );
+                                }
+                            });
+                        })
+                        .is_some();
+                if !late_due {
+                    tokio::time::sleep(interval).await;
+                }
             }
         }
     }
