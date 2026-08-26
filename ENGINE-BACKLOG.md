@@ -35,6 +35,25 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
 - NEXT (M31a, own pass): ingest per-(stream,hour) accumulate-or-age gate —
   the 1-record late-arrival spray fix at source (DESIGN-MERGE.md §2).
 
+## .123 2026-08-26 — M31b FOLLOW-UP (the #465/#301 review P1)
+- The .122 defer had a CONVERGENCE WEDGE the prod review caught: a closed
+  low-traffic hour that collapses to ONE sub-512MB index-less file falls
+  under the debt predicate's min-files floor, is never revisited, and the
+  single-file heal — the only thing that indexes a lone file — never runs:
+  permanent column-scan for that hour. (Same wedge PRE-EXISTED for 1-file
+  hours under .121: a lone L0 in a quiet hour never got indexed.)
+- Fix: query_old_data_hours grew include_lone_unindexed — the sweep also
+  returns hours holding ANY index-less .vix data file, floor or not.
+  Self-terminating (heal stamps index_size > 0, hour drops out); callers
+  pass false for by-design index-less stream types (metrics — their probe
+  no-ops, the clause would re-enqueue forever); parquet rows excluded in
+  SQL. postgres + sqlite twins.
+- Review's other P1s (all comment/contract): max_file_size <-> defer-pin
+  coupling cross-referenced BOTH sides; #42 rollback runbooks now name the
+  defer env; dev comments reworded dev-first (no dangling "prod parity");
+  the .122 rollback note states (1)/(2)/grouping have NO env brake (image
+  rollback only; deliberate — parity-pinned byte-identical).
+
 ## .121 +2h OUTCOME 2026-08-26 ~08:3xZ — M30 VERIFIED; EQUILIBRIUM NAMED
 - Fleet merges/h 1,600 -> 6,065 (+1h) -> 6,742 (+2h) SUSTAINED (4.2x). Gate runs
   4/4 slots on every pod; queue waits 168s mean -> 0.2-33s. Kills=0 through the

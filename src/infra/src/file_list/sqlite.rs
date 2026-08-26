@@ -681,6 +681,7 @@ SELECT stream, date FROM file_list WHERE index_size > 0 AND bloom_ver = 0 AND da
         stream_type: StreamType,
         stream_name: &str,
         time_range: (i64, i64),
+        include_lone_unindexed: bool,
     ) -> Result<Vec<String>> {
         let (time_start, time_end) = time_range;
         let stream_key = format!("{org_id}/{stream_type}/{stream_name}");
@@ -688,11 +689,15 @@ SELECT stream, date FROM file_list WHERE index_size > 0 AND bloom_ver = 0 AND da
         let pool = CLIENT_RO.clone();
         let cfg = get_config();
         let max_ts_upper_bound = super::calculate_max_ts_upper_bound(time_end, stream_type);
+        // $7 (M31b follow-up): the lone index-less .vix heal wedge — see the
+        // mod.rs doc and the postgres twin.
         let sql = r#"
 SELECT date
     FROM file_list
     WHERE stream = $1 AND max_ts >= $2 AND max_ts <= $3 AND min_ts <= $4 AND original_size <= $5
-    GROUP BY date HAVING count(*) >= $6;
+    GROUP BY date
+    HAVING count(*) >= $6
+        OR ($7 AND sum(CASE WHEN index_size = 0 AND file LIKE '%.vix' THEN 1 ELSE 0 END) > 0);
             "#;
 
         let ret = sqlx::query(sql)
@@ -702,6 +707,7 @@ SELECT date
             .bind(time_end)
             .bind(cfg.compact.max_file_size as i64 / 2)
             .bind(cfg.compact.old_data_min_files)
+            .bind(include_lone_unindexed)
             .fetch_all(&pool)
             .await?;
         Ok(ret

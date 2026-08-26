@@ -846,6 +846,7 @@ SELECT stream, date FROM file_list WHERE index_size > 0 AND bloom_ver = 0 AND da
         stream_type: StreamType,
         stream_name: &str,
         time_range: (i64, i64),
+        include_lone_unindexed: bool,
     ) -> Result<Vec<String>> {
         let start = std::time::Instant::now();
         let (time_start, time_end) = time_range;
@@ -858,11 +859,17 @@ SELECT stream, date FROM file_list WHERE index_size > 0 AND bloom_ver = 0 AND da
         let cfg = get_config();
         let max_ts_upper_bound = super::calculate_max_ts_upper_bound(time_end, stream_type);
         let (date_from, date_to) = derive_date_range(time_start, time_end);
+        // $9 (M31b follow-up): also surface hours holding ANY index-less
+        // .vix data file — the lone-deferred/lone-L0 heal wedge (see the
+        // mod.rs doc). Flat parquet rows never carry a vix index and are
+        // excluded by the extension filter.
         let sql = r#"
 SELECT date
     FROM file_list
     WHERE stream = $1 AND max_ts >= $2 AND max_ts <= $3 AND min_ts <= $4 AND original_size <= $5 AND date >= $7 AND date < $8
-    GROUP BY date HAVING count(*) >= $6;
+    GROUP BY date
+    HAVING count(*) >= $6
+        OR ($9 AND sum(CASE WHEN index_size = 0 AND file LIKE '%.vix' THEN 1 ELSE 0 END) > 0);
             "#;
 
         let ret = sqlx::query(sql)
@@ -874,6 +881,7 @@ SELECT date
             .bind(cfg.compact.old_data_min_files)
             .bind(date_from)
             .bind(date_to)
+            .bind(include_lone_unindexed)
             .fetch_all(&pool)
             .await?;
 

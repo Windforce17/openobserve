@@ -153,6 +153,7 @@ pub trait FileList: Sync + Send + 'static {
         stream_type: StreamType,
         stream_name: &str,
         time_range: (i64, i64),
+        include_lone_unindexed: bool,
     ) -> Result<Vec<String>>;
     async fn query_deleted(
         &self,
@@ -467,6 +468,17 @@ pub async fn query_ids_by_files(files: &[FileKey]) -> Result<stdHashMap<String, 
     CLIENT.query_ids_by_files(files).await
 }
 
+/// `include_lone_unindexed` (M31b follow-up, .123): ALSO return hours that
+/// hold ANY index-less `.vix` data file (`index_size = 0`), regardless of
+/// the min-files floor. Closes the index-defer convergence wedge: a closed
+/// hour that collapses to ONE sub-threshold deferred (or L0) file falls
+/// under `count >= min_files`, is never revisited, and the single-file heal
+/// — the only thing that indexes a lone file — never runs. The clause is
+/// self-terminating (the heal stamps index_size > 0 and the hour drops
+/// out). Callers must pass `false` for stream types whose files are
+/// index-less BY DESIGN (ZO_VIX_INDEX_DISABLED_STREAM_TYPES — their heal
+/// probe no-ops, so the clause would re-enqueue those hours forever); flat
+/// parquet files are excluded inside the SQL for the same reason.
 #[inline]
 #[tracing::instrument(name = "infra:file_list:db:query_old_data_hours")]
 pub async fn query_old_data_hours(
@@ -474,10 +486,17 @@ pub async fn query_old_data_hours(
     stream_type: StreamType,
     stream_name: &str,
     time_range: (i64, i64),
+    include_lone_unindexed: bool,
 ) -> Result<Vec<String>> {
     validate_time_range(time_range)?;
     CLIENT
-        .query_old_data_hours(org_id, stream_type, stream_name, time_range)
+        .query_old_data_hours(
+            org_id,
+            stream_type,
+            stream_name,
+            time_range,
+            include_lone_unindexed,
+        )
         .await
 }
 

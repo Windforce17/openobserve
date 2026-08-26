@@ -217,6 +217,11 @@ pub async fn generate_old_data_job_by_stream(
         stream_type,
         stream_name,
         (start_time, end_time - 1),
+        // M31b follow-up: surface lone index-less .vix files for the
+        // single-file heal — but never for stream types that are
+        // index-less BY DESIGN (their heal probe no-ops; the clause would
+        // re-enqueue those hours forever).
+        !config::is_vix_index_disabled(stream_type),
     )
     .await?;
 
@@ -342,6 +347,10 @@ pub async fn generate_merge_debt_job_by_stream(
         stream_type,
         stream_name,
         (start_time, end_time),
+        // M31b follow-up: lone index-less .vix files must keep the hour in
+        // debt until the single-file heal indexes them (never for
+        // by-design index-less stream types — no-op churn otherwise).
+        !config::is_vix_index_disabled(stream_type),
     )
     .await?;
     if hours.is_empty() {
@@ -2520,17 +2529,23 @@ mod tests {
             .await
             .expect("set compact offset");
 
-        // three seeded cohorts:
+        // four seeded cohorts:
         //  - 26h ago: deep backlog, min_files + 2 files -> MUST be enqueued
         //  - 2h ago: inside the old-data lane's default dead zone
         //    (old_data_min_hours) -> the debt sweep MUST cover it anyway
-        //  - 5h ago: min_files - 1 files -> below threshold, MUST NOT enqueue
+        //  - 5h ago: min_files - 1 INDEX-LESS .vix files -> M31b/.123: the
+        //    lone-unindexed clause MUST enqueue it below the floor (these
+        //    files need the heal visit; pre-.123 this cohort proved the
+        //    floor excluded it — that exclusion WAS the convergence wedge)
+        //  - 8h ago: min_files - 1 INDEXED .vix files -> the floor still
+        //    governs indexed files, MUST NOT enqueue
         let hour = hour_micros(1);
         let now_hour = run - run % hour;
         let dense_old = now_hour - 26 * hour;
         let dense_hot = now_hour - 2 * hour;
         let sparse = now_hour - 5 * hour;
-        let mk_files = |hour_start: i64, n: usize| -> Vec<FileKey> {
+        let sparse_indexed = now_hour - 8 * hour;
+        let mk_files = |hour_start: i64, n: usize, index_size: i64| -> Vec<FileKey> {
             let t = Utc.timestamp_nanos(hour_start * 1000);
             (0..n)
                 .map(|i| {
@@ -2547,6 +2562,7 @@ mod tests {
                             records: 100,
                             original_size: 4096,
                             compressed_size: 1024,
+                            index_size,
                             ..Default::default()
                         },
                         false,
@@ -2554,10 +2570,11 @@ mod tests {
                 })
                 .collect()
         };
-        let mut seeded = mk_files(dense_old, min_files + 2);
-        seeded.extend(mk_files(dense_hot, min_files + 2));
+        let mut seeded = mk_files(dense_old, min_files + 2, 0);
+        seeded.extend(mk_files(dense_hot, min_files + 2, 0));
         if min_files > 1 {
-            seeded.extend(mk_files(sparse, min_files - 1));
+            seeded.extend(mk_files(sparse, min_files - 1, 0));
+            seeded.extend(mk_files(sparse_indexed, min_files - 1, 64));
         }
         retry_busy("batch_process seed", || {
             infra_file_list::batch_process(&seeded)
@@ -2569,7 +2586,11 @@ mod tests {
             generate_merge_debt_job_by_stream(&org, StreamType::Logs, &stream)
                 .await
                 .expect("debt sweep");
-        assert_eq!(enqueued, 2, "exactly the two dense cohorts carry debt");
+        assert_eq!(
+            enqueued, 3,
+            "the two dense cohorts + the below-floor INDEX-LESS cohort carry debt \
+             (the indexed below-floor cohort must not)"
+        );
 
         let stream_key = format!("{org}/logs/{stream}");
         let claimed = retry_busy("claim", || {
@@ -2580,8 +2601,9 @@ mod tests {
         let offsets: Vec<i64> = mine.iter().map(|j| j.offsets).collect();
         assert_eq!(
             offsets,
-            vec![dense_old, dense_hot],
-            "both debt hours enqueued, oldest cohort first (id ASC claim order)"
+            vec![dense_old, sparse, dense_hot],
+            "debt hours enqueued oldest cohort first (id ASC claim order); the \
+             indexed sparse cohort is absent"
         );
         // release strangers claimed alongside ours
         let strangers: Vec<i64> = claimed
@@ -2603,7 +2625,7 @@ mod tests {
             generate_merge_debt_job_by_stream(&org, StreamType::Logs, &stream)
                 .await
                 .expect("debt sweep resurrect");
-        assert_eq!(enqueued, 2, "done hours with standing debt resurrect");
+        assert_eq!(enqueued, 3, "done hours with standing debt resurrect");
         let claimed = retry_busy("re-claim", || {
             infra_file_list::get_pending_jobs("m29-debt-test", 10_000, false, 0)
         })
@@ -2615,7 +2637,7 @@ mod tests {
             .collect();
         assert_eq!(
             mine2,
-            vec![dense_old, dense_hot],
+            vec![dense_old, sparse, dense_hot],
             "resurrected rows are claimable again"
         );
 
