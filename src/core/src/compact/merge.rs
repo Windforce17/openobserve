@@ -582,11 +582,27 @@ pub async fn merge_by_stream(
             let (oversize_files, files_with_size): (Vec<FileKey>, Vec<FileKey>) = files_with_size
                 .into_iter()
                 .partition(|f| f.meta.original_size > oversize_cutoff);
-            let (mut core_files, mut flat_files): (Vec<FileKey>, Vec<FileKey>) = files_with_size
+            let (core_files, mut flat_files): (Vec<FileKey>, Vec<FileKey>) = files_with_size
                 .into_iter()
                 .partition(|f| f.key.ends_with(config::FILE_EXT_VIX));
+            // M31: sidecar-HOMOGENEOUS core grouping — never mix indexed
+            // and index-less core files in one group. A mixed group is the
+            // WORST merge shape: the dictionary fast path rejects on the
+            // first index-less input, the full rebuild then re-derives
+            // terms for every input (DISCARDING the good dictionaries it
+            // rejected), and the #46 column arm disqualifies too (it needs
+            // every input index-less). Split on the zero-IO FileMeta
+            // signal (index_size > 0 ⟺ a .vxi sidecar exists): index-less
+            // groups take the rebuild — or the M31 deferred copy shape —
+            // and indexed groups take the gate-free dictionary fast path.
+            // Cross-class convergence needs no mixed group: an index-less
+            // leftover heals to indexed through the existing single-file
+            // probe, then groups with its class.
+            let (mut plain_core, mut indexed_core): (Vec<FileKey>, Vec<FileKey>) = core_files
+                .into_iter()
+                .partition(|f| f.meta.index_size == 0);
             // sort by file size
-            for files in [&mut flat_files, &mut core_files] {
+            for files in [&mut flat_files, &mut plain_core, &mut indexed_core] {
                 match job_strategy {
                     MergeStrategy::FileSize => {
                         files.sort_by_key(|k| k.meta.original_size);
@@ -599,6 +615,7 @@ pub async fn merge_by_stream(
                     }
                 }
             }
+            let core_total = plain_core.len() + indexed_core.len();
 
             // downsampling applies to metrics only, which are never core files
             #[cfg(feature = "enterprise")]
@@ -624,10 +641,10 @@ pub async fn merge_by_stream(
             // when outdated. Skipped in incremental rounds: the hour is
             // still open, more files are coming, and the hour-end pass
             // probes once.
-            let single_core_heal_candidate = core_files.len() == 1 && !is_incremental;
+            let single_core_heal_candidate = core_total == 1 && !is_incremental;
 
             if flat_files.len() <= 1
-                && core_files.len() <= 1
+                && core_total <= 1
                 && !skip_group_files
                 && !single_core_heal_candidate
             {
@@ -657,16 +674,18 @@ pub async fn merge_by_stream(
                     &job_strategy,
                 );
             }
-            group_files_into_batches(
-                &mut batch_groups,
-                &core_files,
-                &org_id,
-                stream_type,
-                &stream_name,
-                &prefix,
-                is_incremental,
-                &job_strategy,
-            );
+            for class in [&plain_core, &indexed_core] {
+                group_files_into_batches(
+                    &mut batch_groups,
+                    class,
+                    &org_id,
+                    stream_type,
+                    &stream_name,
+                    &prefix,
+                    is_incremental,
+                    &job_strategy,
+                );
+            }
 
             // Healing probe candidates: the lone file of a single-file
             // partition, PLUS every core file batching left out (a file at
@@ -676,15 +695,16 @@ pub async fn merge_by_stream(
             // non-incremental rounds.
             let mut heal_candidates: Vec<&FileKey> = Vec::new();
             if single_core_heal_candidate {
-                heal_candidates.push(&core_files[0]);
+                heal_candidates.extend(plain_core.first().or(indexed_core.first()));
             } else if !is_incremental {
                 let batched: std::collections::HashSet<&str> = batch_groups
                     .iter()
                     .flat_map(|b| b.files.iter().map(|f| f.key.as_str()))
                     .collect();
                 heal_candidates.extend(
-                    core_files
+                    plain_core
                         .iter()
+                        .chain(indexed_core.iter())
                         .filter(|f| !batched.contains(f.key.as_str())),
                 );
             }
@@ -1581,9 +1601,32 @@ async fn merge_core_group(
         })
         .collect();
 
+    // M31 index-defer policy: a NON-FINAL group — every input index-less
+    // (L0s and previously deferred outputs; the homogeneous grouping cuts
+    // groups that way) summing under the configured line — writes a
+    // column-store-only output: its index would be discarded by the next
+    // hop anyway. Never for healing batches (their whole point is building
+    // the index) and never when any input already carries a sidecar (a
+    // deferred output over it would DROP that capability).
+    let defer_below_bytes =
+        cfg.common.vix_merge_index_defer_below_mb.saturating_mul(1024 * 1024) as i64;
+    let index_deferred = !force_rebuild
+        && defer_below_bytes > 0
+        && new_file_list.len() > 1
+        && new_file_meta.original_size < defer_below_bytes
+        && new_file_list.iter().all(|f| f.meta.index_size == 0);
+
     let result = match tokio::task::spawn_blocking(move || {
         if force_rebuild {
             crate::service::vix::core_writer::merge_core_files_rebuild(
+                stream_type,
+                &inputs,
+                &latest_schema,
+                &full_text_search_fields,
+                &bloom_filter_fields,
+            )
+        } else if index_deferred {
+            crate::service::vix::core_writer::merge_core_files_index_deferred(
                 stream_type,
                 &inputs,
                 &latest_schema,
@@ -1689,13 +1732,14 @@ async fn merge_core_group(
     let id = ider::generate_file_name();
     let new_file_key = format!("{prefix}/{id}{}", FileFormat::Vix.extension());
     log::info!(
-        "[COMPACTOR:WORKER:{thread_id}] merged {} core files into a new file: {new_file_key}, original_size: {}, compressed_size: {}, index_merge: {}, docs_passthrough: {}, concat_order: {}, took: {} ms",
+        "[COMPACTOR:WORKER:{thread_id}] merged {} core files into a new file: {new_file_key}, original_size: {}, compressed_size: {}, index_merge: {}, docs_passthrough: {}, concat_order: {}, terms_from_columns: {}, took: {} ms",
         retain_file_list.len(),
         new_file_meta.original_size,
         new_file_meta.compressed_size,
         result.used_index_merge,
         result.docs_passthrough_inputs,
         result.concat_order,
+        result.terms_from_columns,
         start.elapsed().as_millis(),
     );
 

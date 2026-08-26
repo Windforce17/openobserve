@@ -1823,6 +1823,24 @@ pub struct Common {
     )]
     pub vix_rebuild_headroom_mb: usize,
     #[env_config(
+        name = "ZO_VIX_MERGE_INDEX_DEFER_BELOW_MB",
+        default = 0,
+        help = "M31: defer the inverted-index build on NON-FINAL compaction merges. A \
+                core-file merge group whose inputs are ALL index-less (index_size 0: \
+                L0s and previously deferred outputs) and whose summed original_size is \
+                below this many MB writes a COLUMN-STORE-ONLY output (no dictionary, \
+                no postings, no bloom, no rebuild-gate admission — the copy-shape \
+                merge), because an output below the ZO_COMPACT_MAX_FILE_SIZE/2 debt \
+                line is guaranteed to be merged again — building its index would be \
+                thrown away on the next hop. The index is built exactly once, when a \
+                group crosses this line (or by the existing single-file heal when a \
+                deferred leftover is the partition's terminal file). Sane value: \
+                ZO_COMPACT_MAX_FILE_SIZE/2. 0 = off (today's behavior: every merge \
+                output is indexed). Interim cost: a deferred output is queryable \
+                exactly like an L0 (column scans, no term index) until its final hop."
+    )]
+    pub vix_merge_index_defer_below_mb: usize,
+    #[env_config(
         name = "ZO_VIX_BUILD_THREAD_NUM",
         default = 0,
         help = "Threads used to ENCODE one single-file core build on the WAL→storage \

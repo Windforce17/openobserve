@@ -3,6 +3,38 @@
 Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
 (deleted 2026-07-29; full history in git). Keep THIS file current.
 
+## M31b 2026-08-26 — INDEX ONCE PER BYTE (ships as .122; charter: DESIGN-MERGE.md)
+- b(0) ROOT CAUSE of the dead #46 gate, measured on real prod L0s
+  (m31_gate_probe example, 5 traces files + the registry schema): strict
+  DataType equality vs the registry — prod L0s store strings as Utf8View,
+  the registry says Utf8; 909/918 fields "mismatched" ⇒ ZERO column-derived
+  rebuilds fleet-wide (0 engagement lines vs 550 rebuilds/h/pod), every
+  rebuild on the 5.4x `_source` JSON arm, and NO log line said why. Fixed:
+  string-family equivalence (Utf8/LargeUtf8/Utf8View — lossless
+  representation, terms derive byte-identically) + a reason INFO on every
+  gate miss + `terms_from_columns` in the merged summary line. Parity
+  referee extended to the drift shape: byte-identical.
+- b(1) `_source` is no longer decoded on the #46 heal-passthrough scan when
+  every input is spliced — it fed a length/null check only (the fattest
+  column of every input, decoded for nothing on the dominant prod shape;
+  M17 measured the derivation scan at 113.6s of a 133.8s gen-1 merge).
+  Plan-level scan_source=false + synthesized empty source keeps the push
+  contract; fail-open inputs keep full projection.
+- b(2) INDEX-DEFER (`ZO_VIX_MERGE_INDEX_DEFER_BELOW_MB`, default 0=off,
+  prod pin 512 = max_file_size/2): an all-index-less group summing under
+  the line writes a COLUMN-STORE-ONLY output — copy-shape merge, no
+  dictionary/postings/bloom, no rebuild-gate slot. The index is built ONCE:
+  at the group crossing the line, or by the standing single-file heal on a
+  terminal leftover (prod evidence for the waste: 39MB merge outputs
+  carrying 29MB sidecars). PLUS sidecar-HOMOGENEOUS grouping
+  (FileMeta.index_size split at group formation): mixed groups — the shape
+  that poisons the fast path AND #46 — stop existing; indexed groups take
+  the gate-free dictionary merge.
+- Tests: defer round-trip (L0s → deferred copy hop → final rebuild) is
+  byte-equivalent to the direct heal; drift parity; full core suite green.
+- NEXT (M31a, own pass): ingest per-(stream,hour) accumulate-or-age gate —
+  the 1-record late-arrival spray fix at source (DESIGN-MERGE.md §2).
+
 ## .121 +2h OUTCOME 2026-08-26 ~08:3xZ — M30 VERIFIED; EQUILIBRIUM NAMED
 - Fleet merges/h 1,600 -> 6,065 (+1h) -> 6,742 (+2h) SUSTAINED (4.2x). Gate runs
   4/4 slots on every pod; queue waits 168s mean -> 0.2-33s. Kills=0 through the

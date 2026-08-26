@@ -89,6 +89,11 @@ non-final hop".**
      decoded for nothing.
    - verify #46 column-derive actually engages on the all-L0 shape in prod
      (log it), since `_source`-arm derivation is priced at 5.4x.
+     [RESOLVED 2026-08-26, M31b(0): it NEVER engaged — prod L0s store
+     strings as Utf8View, the registry says Utf8, and the gate's strict
+     DataType equality rejected 909/918 fields. Fixed with string-family
+     equivalence + a gate-miss reason log + the terms_from_columns summary
+     signal; parity referee extended to the drift shape.]
 3. Sidecar-homogeneous grouping: `index_size > 0` is already in FileMeta at
    group-formation time (zero IO). Never mix indexed and index-less inputs
    in one group — indexed-only groups take fast path A (no gate at all);

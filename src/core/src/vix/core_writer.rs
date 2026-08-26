@@ -104,10 +104,13 @@ const DOCS_BATCH_BYTES: usize = 256 * 1024 * 1024;
 struct BatchCaps {
     rows: usize,
     bytes: usize,
-    /// Test seam: force the build's index policy instead of resolving
-    /// [`vix_build_index_enabled`] from the live config (env-backed sets
-    /// are process-global, so tests cannot toggle them safely). `None` in
-    /// every production call.
+    /// Force the index policy instead of resolving it from the live config
+    /// (build path: [`vix_build_index_enabled`]; merge path:
+    /// [`vix_index_enabled`], consulted by [`build_merge_plan`]). Two
+    /// callers: tests (env-backed sets are process-global and cannot be
+    /// toggled safely), and — M31 — the compactor's index-DEFER policy,
+    /// which passes `Some(false)` for a non-final all-index-less merge
+    /// group (see `ZO_VIX_MERGE_INDEX_DEFER_BELOW_MB`).
     index_enabled_override: Option<bool>,
     /// Test seam (#52): comma list of bloom-only fields injected into the
     /// merge writer options (env-backed config is process-global, so tests
@@ -238,6 +241,13 @@ pub struct MergedCoreFile {
     /// guard upstream this should stay `0` — nonzero means a wrapper shape
     /// the scan did not predict, worth a look at debug logs.
     pub docs_failopen_chunks: u64,
+    /// M31 observability: `true` when a REBUILD derived its terms from the
+    /// streamed columns (#46) instead of parsing `_source` per row (the
+    /// 5.4x arm). Always `false` on the fast path (no derivation ran).
+    /// Watched in the compactor's merged-file summary line — the gate's
+    /// fleet-wide silent miss (Utf8View vs Utf8) hid behind having no
+    /// signal for exactly this.
+    pub terms_from_columns: bool,
 }
 
 /// Whether core files of `stream_type` carry a term index at all (#40):
@@ -1262,6 +1272,7 @@ pub type MergeInput = (
 
 /// The shared shape of one core-file merge, derived from the inputs and the
 /// current stream settings before either merge strategy runs.
+#[derive(Clone)]
 struct MergePlan {
     store_original: bool,
     /// Preserved docs columns with their target types.
@@ -1270,6 +1281,16 @@ struct MergePlan {
     opts: VixWriterOptions,
     /// Row/byte bounds of every staged docs batch.
     caps: BatchCaps,
+    /// M31: project `_source` into the decode scan. `true` everywhere except
+    /// the one shape that provably never reads it — the #46 column-derived
+    /// heal-passthrough scan with EVERY input spliced (docs copied encoded,
+    /// terms derived from columns): there the projected `_source` array
+    /// reached the writer only for a length/null check, i.e. the single
+    /// fattest column of every input was decoded for nothing (M17 measured
+    /// the derivation scan at 113.6s of a 133.8s gen-1 merge — `_source`
+    /// decode is a large share of it). The scan substitutes a synthesized
+    /// empty-string array to keep the push contract intact.
+    scan_source: bool,
     /// #46: every input is an index-off ALL-COLUMNAR file (readable, no
     /// term index, agreeing term-derivable column types), so the rebuild
     /// derives terms from the streamed COLUMNS — the cheap column-driven
@@ -1348,6 +1369,33 @@ pub fn merge_core_files(
         fts_fields,
         bloom_fields,
         BatchCaps::default(),
+    )
+}
+
+/// M31: [`merge_core_files`] with the index build DEFERRED — the output is
+/// COLUMN-STORE-ONLY (`index=None`, `index_size` 0), the copy-shape merge:
+/// no dictionary/postings/bloom work, no rebuild-gate admission. For
+/// non-final merge groups whose output will provably be merged again (the
+/// compactor's `ZO_VIX_MERGE_INDEX_DEFER_BELOW_MB` policy); the index is
+/// built once, at the group that crosses the line (or by the single-file
+/// heal on a terminal leftover).
+pub fn merge_core_files_index_deferred(
+    stream_type: StreamType,
+    inputs: &[MergeInput],
+    latest_schema: &Schema,
+    fts_fields: &[String],
+    bloom_fields: &[String],
+) -> Result<MergedCoreFile, anyhow::Error> {
+    merge_core_files_with_caps(
+        stream_type,
+        inputs,
+        latest_schema,
+        fts_fields,
+        bloom_fields,
+        BatchCaps {
+            index_enabled_override: Some(false),
+            ..BatchCaps::default()
+        },
     )
 }
 
@@ -1787,6 +1835,22 @@ fn open_merge_sources(inputs: &[MergeInput]) -> Result<Vec<MergeSource>, anyhow:
 /// [`merge_core_files`] for the rules). Inputs whose docs schema is
 /// unreadable poison nothing here — their columns are simply not offered —
 /// but such files fail later when their rows are read.
+/// M31: type equivalence for the #46 derivation gate. Strict equality is the
+/// rule — the gate's fear is a cast canonicalizing differently than the
+/// `_source` derivation — but the arrow STRING representations (`Utf8` /
+/// `LargeUtf8` / `Utf8View`) hold byte-identical logical values, and the
+/// normalize cast between them is lossless, so terms derive identically.
+/// Measured 2026-08-26 on prod L0s: 909/918 traces fields "mismatched" as
+/// stored `Utf8View` vs registry `Utf8` — strict equality kept the WHOLE
+/// FLEET on the 5.4x `_source` arm for a representation difference.
+/// Numerics stay strict: Int64 vs Float64 genuinely canonicalize apart.
+fn derivation_type_equivalent(a: &DataType, b: &DataType) -> bool {
+    fn string_family(t: &DataType) -> bool {
+        matches!(t, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View)
+    }
+    a == b || (string_family(a) && string_family(b))
+}
+
 fn build_merge_plan(
     stream_type: StreamType,
     sources: &[MergeSource],
@@ -1795,7 +1859,12 @@ fn build_merge_plan(
     bloom_fields: &[String],
     caps: BatchCaps,
 ) -> MergePlan {
-    let index_enabled = vix_index_enabled(stream_type);
+    // M31: the caps override (production use: the compactor's index-defer
+    // policy over non-final all-index-less groups) beats the stream-type
+    // resolution, exactly like the build path's consult.
+    let index_enabled = caps
+        .index_enabled_override
+        .unwrap_or_else(|| vix_index_enabled(stream_type));
     // docs columns available across inputs (name -> first stored type),
     // writer-managed columns excluded
     let mut available: Vec<(String, DataType)> = Vec::new();
@@ -1999,6 +2068,9 @@ fn build_merge_plan(
         'gate: for source in sources {
             let Ok(schema) = source.docs_schema() else {
                 derive_from_columns = false;
+                log::info!(
+                    "vix merge: column derivation off — an input's docs schema is unreadable"
+                );
                 break;
             };
             for field in schema.fields() {
@@ -2014,10 +2086,22 @@ fn build_merge_plan(
                 let type_ok = vortex_index::is_value_indexed_type(field.data_type())
                     || name == ID_COL_NAME;
                 if !type_ok
-                    || stored.is_none_or(|(_, t)| t != field.data_type())
-                    || target.is_none_or(|(_, t)| t != field.data_type())
+                    || stored.is_none_or(|(_, t)| !derivation_type_equivalent(t, field.data_type()))
+                    || target.is_none_or(|(_, t)| !derivation_type_equivalent(t, field.data_type()))
                 {
                     derive_from_columns = false;
+                    // M31: the reason line this gate always lacked — its
+                    // absence hid a FLEET-WIDE silent miss (every prod L0
+                    // stores strings as Utf8View while the registry says
+                    // Utf8; the strict != above kept every rebuild on the
+                    // 5.4x _source arm and nothing said why).
+                    log::info!(
+                        "vix merge: column derivation off — field {name:?} stored {:?} vs \
+                         first-seen {:?} / target {:?} (value-indexed type: {type_ok})",
+                        field.data_type(),
+                        stored.map(|(_, t)| t),
+                        target.map(|(_, t)| t),
+                    );
                     break 'gate;
                 }
             }
@@ -2030,6 +2114,7 @@ fn build_merge_plan(
         writer_schema,
         opts,
         caps,
+        scan_source: true,
         derive_from_columns,
     }
 }
@@ -2537,6 +2622,8 @@ fn merge_core_files_indexed(
         concat_order: concat_order.is_some(),
         docs_sliced_windows,
         docs_failopen_chunks,
+        // fast path / index-off plan: no term derivation ran
+        terms_from_columns: false,
     })
 }
 
@@ -2803,9 +2890,19 @@ fn normalize_merge_chunk(
         None => (batch, raw_timestamps),
     };
     let rows = batch.num_rows();
-    let source = as_string_array(batch.column_by_name(SOURCE_COL_NAME).ok_or_else(|| {
-        anyhow::anyhow!("core file {key}: docs batch is missing {SOURCE_COL_NAME:?}")
-    })?)?;
+    let source = match batch.column_by_name(SOURCE_COL_NAME) {
+        Some(column) => as_string_array(column)?,
+        // M31 (!plan.scan_source): `_source` was deliberately not projected
+        // — the #46 index-only scan never reads it. A synthesized all-empty
+        // (non-null) array keeps the push contract (len match, no nulls)
+        // at offsets-buffer cost only.
+        None if !plan.scan_source => StringArray::from(vec![""; rows]),
+        None => {
+            return Err(anyhow::anyhow!(
+                "core file {key}: docs batch is missing {SOURCE_COL_NAME:?}"
+            ));
+        }
+    };
     let original = match batch.column_by_name(ORIGINAL_DATA_COL_NAME) {
         Some(column) => as_string_array(column)?,
         None => StringArray::new_null(rows),
@@ -2876,8 +2973,10 @@ fn synthesized_columns_mask(schema: &SchemaRef, plan: &MergePlan) -> Arc<[bool]>
 /// The projected docs columns of one merge input (the columns
 /// [`normalize_merge_chunk`] consumes, restricted to what the file stores).
 fn merge_scan_projection(schema: &SchemaRef, plan: &MergePlan) -> Vec<String> {
-    let mut projection: Vec<String> =
-        vec![TIMESTAMP_COL_NAME.to_string(), SOURCE_COL_NAME.to_string()];
+    let mut projection: Vec<String> = vec![TIMESTAMP_COL_NAME.to_string()];
+    if plan.scan_source {
+        projection.push(SOURCE_COL_NAME.to_string());
+    }
     for (name, _) in &plan.preserved {
         if schema.field_with_name(name).is_ok() {
             projection.push(name.clone());
@@ -4099,6 +4198,7 @@ fn rebuild_over_sources(
         // can carry a foreign encoding into the encoder
         docs_sliced_windows: 0,
         docs_failopen_chunks: 0,
+        terms_from_columns: plan.derive_from_columns,
     })
 }
 
@@ -4308,12 +4408,27 @@ fn rebuild_with_docs_passthrough(
     // 1) Index build: today's decoded scan, docs staging detached.
     let started = std::time::Instant::now();
     let scan_windows = if plan.derive_from_columns {
+        // M31: with every input spliced (docs copied encoded), the scan
+        // exists ONLY to derive terms from columns — `_source` would be
+        // decoded for a length/null check. Drop it from the projection;
+        // any fail-open input still decodes its docs for the RE-ENCODE
+        // below, which reads full chunks through its own stream (scan_plan
+        // is scoped to this index scan).
+        let all_spliced = splices.iter().all(Option::is_some);
+        let scan_plan = if all_spliced {
+            let mut scan_plan = plan.clone();
+            scan_plan.scan_source = false;
+            scan_plan
+        } else {
+            plan.clone()
+        };
         log::info!(
             "vix merge: heal-passthrough rebuild derives terms from {} columns \
-             (index-off inputs)",
-            plan.preserved.len()
+             (index-off inputs, _source projected: {})",
+            plan.preserved.len(),
+            scan_plan.scan_source
         );
-        stream_merge_windows(inputs, plan, &order, |ts, cs, source, original| {
+        stream_merge_windows(inputs, &scan_plan, &order, |ts, cs, source, original| {
             let batch = derivation_window_batch(ts, cs)?;
             writer.push_batch_with_source_index_only(&batch, source, original)?;
             Ok(())
@@ -4426,6 +4541,7 @@ fn rebuild_with_docs_passthrough(
         concat_order,
         docs_sliced_windows,
         docs_failopen_chunks,
+        terms_from_columns: plan.derive_from_columns,
     })
 }
 
@@ -8982,6 +9098,110 @@ mod tests {
         let source_reader =
             open_merged(&source_forced);
         assert_core_files_equivalent(&healed_reader, &source_reader, "column-vs-source heal");
+        // the healed run took the column arm — the M31 prod signal
+        assert!(healed.terms_from_columns);
+        assert!(!source_forced.terms_from_columns);
+
+        // M31 regression: registry/stored STRING-REPRESENTATION drift must
+        // not kill column derivation. Prod measured 909/918 traces fields
+        // "mismatching" as stored Utf8View vs registry Utf8 — a lossless
+        // representation difference — which silently kept the WHOLE FLEET
+        // on the 5.4x `_source` arm. Exercised here in the mirror
+        // direction (stored Utf8, registry Utf8View): same equivalence
+        // class, and the parity referee must still hold byte-identically.
+        let drifted_schema = Schema::new(
+            latest_schema
+                .fields()
+                .iter()
+                .map(|f| match f.data_type() {
+                    DataType::Utf8 => {
+                        Field::new(f.name(), DataType::Utf8View, f.is_nullable())
+                    }
+                    _ => f.as_ref().clone(),
+                })
+                .collect::<Vec<_>>(),
+        );
+        let drifted = merge_core_files(
+            StreamType::Logs,
+            &as_inputs(&l0_inputs),
+            &drifted_schema,
+            &fts,
+            &[],
+        )
+        .unwrap();
+        assert!(
+            drifted.terms_from_columns,
+            "string-family registry drift (Utf8View vs Utf8) must keep the #46 column arm"
+        );
+        let drifted_source_forced = merge_core_files_rebuild_with_caps(
+            StreamType::Logs,
+            &as_inputs(&l0_inputs),
+            &drifted_schema,
+            &fts,
+            &[],
+            BatchCaps {
+                force_source_derivation: true,
+                ..BatchCaps::default()
+            },
+        )
+        .unwrap();
+        assert!(!drifted_source_forced.terms_from_columns);
+        assert_core_files_equivalent(
+            &open_merged(&drifted),
+            &open_merged(&drifted_source_forced),
+            "column-vs-source under string-representation drift",
+        );
+
+        // M31: the DEFERRED merge over the same index-off inputs writes a
+        // COLUMN-STORE-ONLY output (the copy-shape non-final hop): no
+        // index, no derivation, docs columns intact and L0-read semantics.
+        let deferred = merge_core_files_index_deferred(
+            StreamType::Logs,
+            &as_inputs(&l0_inputs),
+            &latest_schema,
+            &fts,
+            &[],
+        )
+        .unwrap();
+        assert!(deferred.index.is_none(), "deferred output has no sidecar");
+        assert_eq!(deferred.stats.index_size, 0);
+        assert!(!deferred.terms_from_columns, "no term derivation ran");
+        let deferred_reader = open_merged(&deferred);
+        assert!(!deferred_reader.has_index());
+        assert_eq!(deferred_reader.row_count(), healed_reader.row_count());
+        for field in ["log", "svc", "code", "ok", ID_COL_NAME] {
+            assert!(
+                deferred_reader.read_docs_column(field).is_ok(),
+                "{field:?} must be a docs column on the deferred output"
+            );
+        }
+        assert!(deferred_reader.eval(&exact("svc", "api")).is_err());
+        // the FINAL hop over deferred outputs then heals to indexed exactly
+        // like L0s do (same index-less class): parity against the indexed
+        // control ensures the deferred generation lost nothing.
+        let deferred_pair = vec![(
+            "deferred-a.vix".to_string(),
+            (
+                bytes::Bytes::from(deferred.output.to_bytes().unwrap()),
+                None,
+            ),
+        )];
+        let finalized = merge_core_files_rebuild_with_caps(
+            StreamType::Logs,
+            &as_inputs(&deferred_pair),
+            &latest_schema,
+            &fts,
+            &[],
+            BatchCaps::default(),
+        )
+        .unwrap();
+        assert!(finalized.stats.index_size > 0, "final hop builds the index");
+        assert!(finalized.terms_from_columns, "final hop takes the #46 arm");
+        assert_core_files_equivalent(
+            &open_merged(&finalized),
+            &healed_reader,
+            "deferred-then-finalized vs direct heal",
+        );
     }
 
     /// LIVE-SHAPE regression (image .8 zero-ts merge outputs): an event-time
