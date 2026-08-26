@@ -352,7 +352,7 @@ fn core_writer_options(
     }
 }
 
-/// M12 rebuild admission: a process-wide cap on CONCURRENT rebuild-path
+/// M12/M30 rebuild admission: a process-wide gate on CONCURRENT rebuild-path
 /// merges (`ZO_VIX_REBUILD_CONCURRENCY`; 0 = auto: max(1,
 /// ZO_FILE_MERGE_THREAD_NUM / 2); always ≥ 1). The dev-launch OOM wave was
 /// 8 concurrent first-gen rebuilds over multi-GB groups: each rebuild's
@@ -364,45 +364,98 @@ fn core_writer_options(
 /// the 5-10x per-stream error a `original_size × factor` byte estimate
 /// carries (vpc-flow vs traces arrow expansion measured that far apart).
 /// Fast-path (passthrough + k-way) merges never touch this gate.
+///
+/// M30 closes the gate contract's owed re-measure the other way around: the
+/// count stays the hard CAP, but every slot beyond the guaranteed first one
+/// additionally requires LIVE memory headroom — sampled process RSS (the
+/// same 1s-cadence `NODE_MEMORY_USAGE` gauge the ingest breaker consults)
+/// plus `ZO_VIX_REBUILD_HEADROOM_MB` charged for each extra rebuild in
+/// flight (candidate included — their transit may not be RSS-visible yet,
+/// the ingest-admission burst lesson) must stay under 90% of the memory
+/// limit. Per-rebuild transit varies 5-10x per stream, so it is bounded at
+/// runtime instead of estimated; a pod whose RSS floor leaves no room simply
+/// stays at one slot, which is exactly the pinned prod regime that held
+/// kills=0. Waiters re-check on a 500ms tick since RSS moves without gate
+/// events. Headroom 0 = the exact M12 count-only behavior.
 struct RebuildGate {
-    permits: parking_lot::Mutex<usize>,
+    in_flight: parking_lot::Mutex<usize>,
     cv: parking_lot::Condvar,
     max: usize,
+    /// Bytes charged per extra rebuild against the envelope; 0 = count-only.
+    headroom_bytes: usize,
+    /// 90% of the cgroup/node memory limit; admission ceiling for extras.
+    envelope_bytes: usize,
 }
 
 struct RebuildPermit<'a>(&'a RebuildGate);
 
 impl RebuildGate {
-    fn new(max: usize) -> Self {
+    fn new(max: usize, headroom_bytes: usize, envelope_bytes: usize) -> Self {
         Self {
-            permits: parking_lot::Mutex::new(max),
+            in_flight: parking_lot::Mutex::new(0),
             cv: parking_lot::Condvar::new(),
             max,
+            headroom_bytes,
+            envelope_bytes,
         }
+    }
+
+    /// Would admitting one more rebuild (with `running` already in flight)
+    /// keep projected memory inside the envelope? `running ≥ 1` here — the
+    /// first slot never consults this. Charges the full headroom for every
+    /// extra INCLUDING the candidate: an admitted rebuild's transit lags in
+    /// the sampled RSS, and double-charging while it materializes only errs
+    /// conservative. An unsampled gauge (rss 0 — benches, tests, boot)
+    /// admits up to the count cap: there is nothing to bound against.
+    fn headroom_admits(&self, running: usize, rss: usize) -> bool {
+        if self.headroom_bytes == 0 {
+            return true;
+        }
+        let projected = self.headroom_bytes.saturating_mul(running);
+        rss.saturating_add(projected) <= self.envelope_bytes
+    }
+
+    /// The 1s-cadence sampled process RSS (same gauge the ingest breaker
+    /// consults; updated by `update_node_memory_usage` in the jobs crate).
+    fn sampled_rss() -> usize {
+        config::metrics::NODE_MEMORY_USAGE
+            .with_label_values::<&str>(&[])
+            .get()
+            .max(0) as usize
     }
 
     /// Block the calling (merge worker) thread until a rebuild slot frees.
     /// Blocking is the mechanism, not an accident: the worker holds nothing
-    /// else, and at least one permit always exists, so progress is
-    /// guaranteed while the queue drains one bounded rebuild at a time.
+    /// else, and the first slot always admits, so progress is guaranteed
+    /// while the queue drains one bounded rebuild at a time.
     fn acquire(&self) -> RebuildPermit<'_> {
         let started = std::time::Instant::now();
-        let mut permits = self.permits.lock();
-        while *permits == 0 {
-            self.cv.wait(&mut permits);
+        let mut in_flight = self.in_flight.lock();
+        loop {
+            if *in_flight == 0 {
+                break; // guaranteed slot: progress regardless of memory
+            }
+            if *in_flight < self.max && self.headroom_admits(*in_flight, Self::sampled_rss()) {
+                break;
+            }
+            // Timed wait: a permit drop notifies immediately, but memory
+            // headroom can also open with NO gate event (RSS falls as a
+            // build wave drains) — the tick re-evaluates admission then.
+            self.cv
+                .wait_for(&mut in_flight, std::time::Duration::from_millis(500));
         }
-        *permits -= 1;
-        let in_flight = self.max - *permits;
-        drop(permits);
+        *in_flight += 1;
+        let busy = *in_flight;
+        drop(in_flight);
         let waited = started.elapsed();
         if waited > std::time::Duration::from_millis(50) {
             log::info!(
-                "vix merge: rebuild admitted after {waited:?} wait ({in_flight}/{} slots busy)",
+                "vix merge: rebuild admitted after {waited:?} wait ({busy}/{} slots busy)",
                 self.max
             );
         } else {
             log::debug!(
-                "vix merge: rebuild admitted ({in_flight}/{} slots busy)",
+                "vix merge: rebuild admitted ({busy}/{} slots busy)",
                 self.max
             );
         }
@@ -412,10 +465,13 @@ impl RebuildGate {
 
 impl Drop for RebuildPermit<'_> {
     fn drop(&mut self) {
-        let mut permits = self.0.permits.lock();
-        *permits += 1;
-        drop(permits);
-        self.0.cv.notify_one();
+        let mut in_flight = self.0.in_flight.lock();
+        *in_flight = in_flight.saturating_sub(1);
+        drop(in_flight);
+        // notify_all, not one: with the memory check, the waiter woken by a
+        // permit drop is not necessarily admissible while another is — every
+        // waiter re-evaluates its own admission (worker counts are ≤ ~10).
+        self.0.cv.notify_all();
     }
 }
 
@@ -428,8 +484,87 @@ static REBUILD_GATE: std::sync::LazyLock<RebuildGate> = std::sync::LazyLock::new
         // file_merge_thread_num is already auto-resolved (>0) at config load
         std::cmp::max(1, cfg.limit.file_merge_thread_num / 2)
     };
-    RebuildGate::new(max.max(1))
+    RebuildGate::new(
+        max.max(1),
+        cfg.common
+            .vix_rebuild_headroom_mb
+            .saturating_mul(1024 * 1024),
+        cfg.limit.mem_total / 100 * 90,
+    )
 });
+
+#[cfg(test)]
+mod rebuild_gate_tests {
+    use super::RebuildGate;
+
+    const GB: usize = 1024 * 1024 * 1024;
+
+    #[test]
+    fn headroom_disabled_is_count_only() {
+        let gate = RebuildGate::new(4, 0, 0);
+        // envelope 0 + any rss would reject every extra were the check live
+        assert!(gate.headroom_admits(1, 40 * GB));
+        assert!(gate.headroom_admits(3, usize::MAX));
+    }
+
+    #[test]
+    fn headroom_charges_every_extra_including_candidate() {
+        // 48G limit -> 43.2G envelope, 5G headroom, floor 30G:
+        // extras 1..2 admit (35G, 40G), the 3rd extra projects 45G > 43.2G.
+        let envelope = 48 * GB / 100 * 90;
+        let gate = RebuildGate::new(8, 5 * GB, envelope);
+        assert!(gate.headroom_admits(1, 30 * GB));
+        assert!(gate.headroom_admits(2, 30 * GB));
+        assert!(!gate.headroom_admits(3, 30 * GB));
+        // a fatter floor stays at one slot (the pinned-prod regime)
+        assert!(!gate.headroom_admits(1, 40 * GB));
+        // an unsampled gauge (0) bounds nothing — count cap governs
+        assert!(gate.headroom_admits(7, 0));
+    }
+
+    #[test]
+    fn headroom_arithmetic_saturates() {
+        let gate = RebuildGate::new(2, usize::MAX, usize::MAX);
+        // usize::MAX projected + rss must not overflow-panic
+        assert!(gate.headroom_admits(1, usize::MAX));
+    }
+
+    #[test]
+    fn first_slot_admits_even_with_zero_envelope() {
+        // memory check would reject everything; the first acquire must not block
+        let gate = RebuildGate::new(2, GB, 0);
+        let permit = gate.acquire();
+        drop(permit);
+    }
+
+    #[test]
+    fn count_cap_blocks_and_release_unblocks() {
+        use std::{
+            sync::{
+                Arc,
+                atomic::{AtomicBool, Ordering},
+            },
+            time::Duration,
+        };
+        // headroom disabled -> pure count gate at 1
+        let gate = Arc::new(RebuildGate::new(1, 0, 0));
+        let first = gate.acquire();
+        let entered = Arc::new(AtomicBool::new(false));
+        let handle = {
+            let gate = Arc::clone(&gate);
+            let entered = Arc::clone(&entered);
+            std::thread::spawn(move || {
+                let _p = gate.acquire();
+                entered.store(true, Ordering::SeqCst);
+            })
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!entered.load(Ordering::SeqCst), "second acquire ran past a full gate");
+        drop(first);
+        handle.join().unwrap();
+        assert!(entered.load(Ordering::SeqCst));
+    }
+}
 
 /// Threads of one compaction merge (`ZO_VIX_MERGE_THREAD_NUM`; `0` = auto).
 /// Drives the term-dictionary merge partitioning, the per-input decode fan-out

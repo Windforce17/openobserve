@@ -3,6 +3,26 @@
 Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
 (deleted 2026-07-29; full history in git). Keep THIS file current.
 
+## M30 — HEADROOM-GATED REBUILD ADMISSION 2026-08-26 (ships as .121)
+- Prod re-measure (the gate contract's owed step, done live): gate=1 is 100%
+  saturated (381/381 merges rebuild-path on the busiest pod/2h, ~19s slot
+  hold, MEAN 168s queue wait per merge), fleet ceiling ~1.6k merges/h vs
+  arrivals — 2026-08-25 closed with 274,977 live traces/default files
+  (10-15k/hour partitions, L0 never reaching target); hours converge ~3 days
+  out. Meanwhile SAMPLED RSS breathes 1.35-18.15GB (kubectl top's 22-40GB is
+  disk-cache page cache) — 30-45GB of real headroom the count pin can't see.
+- Mechanism: count stays the hard CAP; every slot beyond the guaranteed
+  first also needs live headroom — NODE_MEMORY_USAGE + 
+  ZO_VIX_REBUILD_HEADROOM_MB (default 5120 = the contract's ~5GB/rebuild
+  arithmetic) charged per extra IN FLIGHT (candidate included, ingest-
+  admission burst lesson) under 90% of mem limit; waiters re-poll 500ms.
+  Headroom=0 restores exact M12 count-only. First slot unconditional.
+- Config delta shipped alongside: compactor ZO_VIX_REBUILD_CONCURRENCY 1->4
+  (the auto value; now a cap). Expected ~3-4x merge throughput/pod
+  (~750/h/pod), recent-hour file counts draining in hours. Brakes are
+  config-only: concurrency=1 (exact today-regime) or headroom=0.
+- Full detail + watch list: M30-NOTE.md.
+
 ## .120 +2h OUTCOME 2026-08-24 ~10:15Z — M29 CONVERGING
 - Zombies eliminated: Building 189,688 -> 351 (real work), pending 31, sweeper retiring tombstones (22.6k rows total left in wal_segments).
 - Batch amortization restored: in=61 built=61 skipped=0 gone=0, ~1.25 l0_files/segment (was 4.63 slivers, ~4x better).

@@ -1781,7 +1781,7 @@ pub struct Common {
         help = "Threads used by one core-file compaction merge (input decode + the \
                 range-partitioned term-dictionary merge). 0 = the machine's available \
                 parallelism. Each compact worker merge spawns its own set, so lower this \
-                when many ZO_COMPACT_WORKER_NUM workers merge concurrently."
+                when many ZO_FILE_MERGE_THREAD_NUM workers merge concurrently."
     )]
     pub vix_merge_thread_num: usize,
     #[env_config(
@@ -1806,6 +1806,22 @@ pub struct Common {
                 Always admits at least one."
     )]
     pub vix_rebuild_concurrency: usize,
+    #[env_config(
+        name = "ZO_VIX_REBUILD_HEADROOM_MB",
+        default = 5120,
+        help = "M30: live-memory admission for rebuild slots BEYOND the guaranteed \
+                first one. An extra rebuild is admitted only while sampled process RSS \
+                plus this many MB charged for every extra rebuild in flight (the \
+                candidate included) stays under 90% of the memory limit — \
+                ZO_VIX_REBUILD_CONCURRENCY becomes the hard CAP and live RSS decides \
+                how much of it is usable moment to moment. This replaces the blind \
+                count raise the M12 gate contract owed: per-rebuild transit varies \
+                5-10x per stream, so it is bounded at runtime instead of estimated. \
+                Waiters re-check every 500ms as RSS moves. 0 = no memory check (the \
+                count is the only gate, exact M12 behavior). The first rebuild always \
+                admits regardless, so progress is guaranteed."
+    )]
+    pub vix_rebuild_headroom_mb: usize,
     #[env_config(
         name = "ZO_VIX_BUILD_THREAD_NUM",
         default = 0,

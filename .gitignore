@@ -88,3 +88,4 @@ tests/ui-testing/.env.old
 src/api_query/data/
 crates/vortex-array/target/
 crates/vortex-layout/target/
+__pycache__/

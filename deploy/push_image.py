@@ -10,7 +10,8 @@ the image pipeline copied it. Every gate here answers that incident:
   1. binary mtime must postdate the HEAD commit (no stale artifact)
   2. binary must embed mimalloc (owner directive; default cargo feature)
   3. image carries git_commit label + /GIT_COMMIT + in-image mimalloc grep
-  4. pushed amd64 manifest digest must differ from --prev-tag's
+  4. pushed manifest digest must differ from --prev-tag's (gate arch:
+     amd64, or arm64 under --arm64-only)
 Ship verification is on the caller: check the extraction/inspector log
 lines and scan_size on prod — NEVER timing alone.
 """
@@ -30,7 +31,7 @@ def sh(cmd, **kw):
 def out(cmd):
     return subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
 
-def amd64_digests(profile, region, tag):
+def arch_digests(profile, region, tag, arch):
     try:
         text = out(["aws", "ecr", "batch-get-image", "--profile", profile, "--region", region,
                     "--repository-name", "devops/obs", "--image-ids", f"imageTag={tag}",
@@ -39,7 +40,7 @@ def amd64_digests(profile, region, tag):
     except Exception:
         return []
     return [s["digest"] for s in m.get("manifests", [])
-            if s.get("platform", {}).get("architecture") == "amd64"]
+            if s.get("platform", {}).get("architecture") == arch]
 
 def tag_sort_key(tag):
     # v0.93.0-vix-YYYYMMDD.NN -> (YYYYMMDD, NN); malformed tags sort first
@@ -74,7 +75,17 @@ def main():
                          "push {tag} as a MULTI-ARCH manifest list (amd64+arm64). The same "
                          "provenance gates run on both binaries; per-arch images are pushed "
                          "as {tag}-amd64/{tag}-arm64 and stitched with docker manifest.")
+    ap.add_argument("--arm64-only", action="store_true",
+                    help="image ONLY target/aarch64-unknown-linux-gnu/release/openobserve — no "
+                         "amd64 binary required. Every obs workload in BOTH envs pins "
+                         "kubernetes.io/arch: arm64 (dev + prod checked 2026-08-26), so the "
+                         "amd64 half stopped serving anything. {tag} is still pushed as a "
+                         "manifest LIST (single arm64 member, stitched exactly like --arm64) so "
+                         "the tag layout matches every earlier ship, and the stale-image digest "
+                         "gate runs on the arm64 digests instead of amd64.")
     args = ap.parse_args()
+    if args.arm64 and args.arm64_only:
+        sys.exit("ABORT: --arm64 and --arm64-only are mutually exclusive")
     tag = args.tag
     prev = args.prev_tag
     if not prev:
@@ -93,10 +104,15 @@ def main():
     head_ct = int(out(["git", "-C", REPO, "log", "-1", "--format=%ct",
                        "--", "src", "Cargo.toml", "Cargo.lock", "web"]).strip())
 
-    binaries = {"amd64": os.path.join(REPO, "target/release/openobserve")}
-    if args.arm64:
-        binaries["arm64"] = os.path.join(
-            REPO, "target/aarch64-unknown-linux-gnu/release/openobserve")
+    if args.arm64_only:
+        binaries = {"arm64": os.path.join(
+            REPO, "target/aarch64-unknown-linux-gnu/release/openobserve")}
+    else:
+        binaries = {"amd64": os.path.join(REPO, "target/release/openobserve")}
+        if args.arm64:
+            binaries["arm64"] = os.path.join(
+                REPO, "target/aarch64-unknown-linux-gnu/release/openobserve")
+    gate_arch = "arm64" if args.arm64_only else "amd64"
     for arch, binary in binaries.items():
         if os.path.getmtime(binary) <= head_ct:
             sys.exit(f"ABORT: {binary} predates HEAD commit — stale artifact (rebuild!)")
@@ -107,20 +123,39 @@ def main():
         sha = hashlib.sha256(data).hexdigest()
         print(f"{arch} binary sha256={sha} size={len(data)/1e6:.0f}MB commit={commit}")
 
-    prev_digests = set(amd64_digests(*REGISTRIES[0][:2], prev))
-    print(f"prev tag {prev} amd64 digests: {sorted(prev_digests) or 'none (skip digest gate)'}")
+    prev_digests = set(arch_digests(*REGISTRIES[0][:2], prev, gate_arch))
+    print(f"prev tag {prev} {gate_arch} digests: {sorted(prev_digests) or 'none (skip digest gate)'}")
 
     # Ship with COMPRESSED debug sections: the perf-profiling env vars make
     # the raw binary carry full DWARF (~4.4GB since .40; 364MB before) and
     # rolls pay the pull. zlib-compressed debug keeps addr2line/perf usable
     # at a fraction of the bytes. Falls back to a plain copy if objcopy is
     # unavailable. Cross binaries get the target-prefixed objcopy.
-    OBJCOPY = {"amd64": "objcopy", "arm64": "aarch64-linux-gnu-objcopy"}
+    # Cross objcopy resolution: binutils' target-prefixed tool on a Linux
+    # ship host; llvm-objcopy (arch-agnostic ELF support) anywhere else —
+    # rustup's llvm-tools component ships one next to the active toolchain,
+    # which covers a macOS ship host with no binutils cross package.
+    def resolve_objcopy(candidates):
+        for c in candidates:
+            if shutil.which(c):
+                return c
+        try:
+            sysroot = out(["rustc", "--print", "sysroot"]).strip()
+            for p in [os.path.join(root, "llvm-objcopy")
+                      for root, _, files in os.walk(os.path.join(sysroot, "lib", "rustlib"))
+                      if "llvm-objcopy" in files]:
+                return p
+        except Exception:
+            pass
+        return candidates[0]  # let the call fail -> raw-binary fallback
+
+    OBJCOPY = {"amd64": resolve_objcopy(["objcopy", "llvm-objcopy"]),
+               "arm64": resolve_objcopy(["aarch64-linux-gnu-objcopy", "llvm-objcopy"])}
     PLATFORM = {"amd64": "linux/amd64", "arm64": "linux/arm64"}
     with open(os.path.join(CTX, "GIT_COMMIT"), "w") as f:
         f.write(commit + "\n")
     ctx_bin = os.path.join(CTX, "openobserve")
-    multi = args.arm64
+    multi = args.arm64 or args.arm64_only
     arch_tags = {a: (f"{tag}-{a}" if multi else tag) for a in binaries}
     for arch, binary in binaries.items():
         try:
@@ -151,11 +186,11 @@ def main():
                 "-t", f"{reg}/devops/obs:{tag}",
                 *[f"{reg}/devops/obs:{arch_tags[a]}" for a in binaries]])
 
-    new_digests = set(amd64_digests(*REGISTRIES[0][:2], tag))
-    print(f"pushed amd64 digests: {sorted(new_digests)}")
+    new_digests = set(arch_digests(*REGISTRIES[0][:2], tag, gate_arch))
+    print(f"pushed {gate_arch} digests: {sorted(new_digests)}")
     if prev_digests and new_digests & prev_digests:
         sys.exit(f"ABORT: pushed image is IDENTICAL to {prev} — stale binary shipped AGAIN")
-    if args.arm64:
+    if args.arm64 or args.arm64_only:
         arm = [s for m in [json.loads(out(["aws", "ecr", "batch-get-image", "--profile",
                 REGISTRIES[0][0], "--region", REGISTRIES[0][1],
                 "--repository-name", "devops/obs", "--image-ids", f"imageTag={tag}",
