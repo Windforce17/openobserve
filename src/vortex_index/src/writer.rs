@@ -2010,13 +2010,24 @@ impl VixWriter {
                 .fold(&batch)?;
             return encoder.push(batch);
         }
-        self.sample_bytes += batch.get_array_memory_size();
-        self.sample_batches.push(batch);
         let budget = if self.opts.docs_encode_sample_bytes == 0 {
             DOCS_ENCODE_SAMPLE_BYTES
         } else {
             self.opts.docs_encode_sample_bytes
         };
+        let batch_bytes = batch.get_array_memory_size();
+        // Keep the sample budget a resident-memory bound, not merely a
+        // post-push threshold. Once a non-empty representative sample exists,
+        // start the encoder BEFORE a whole next batch would cross the budget;
+        // that batch then streams directly. A first batch larger than the
+        // budget remains the explicit single-batch oversize exception.
+        if !self.sample_batches.is_empty() && self.sample_bytes.saturating_add(batch_bytes) > budget
+        {
+            self.start_docs_encoder()?;
+            return self.stage_docs_batch(batch);
+        }
+        self.sample_bytes = self.sample_bytes.saturating_add(batch_bytes);
+        self.sample_batches.push(batch);
         if self.sample_bytes >= budget {
             self.start_docs_encoder()?;
         }

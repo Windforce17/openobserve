@@ -20,6 +20,9 @@
 //!       couple of the optional columns) — the prod gen-1 shape whose
 //!       merges re-encoded every byte before the widening chunk copy.
 //!       (`--narrow` is retired: v2 has no narrow docs schema.)
+//!       With `--type-drift`, `status_code` cycles through Utf8, Boolean,
+//!       Float64, and Int64 physical columns; file 0 is Utf8, making the
+//!       derived latest schema exercise Boolean/Float/Int64 -> Utf8.
 //!
 //!   merge <dir> <out.vix> [--rebuild]
 //!       Load every corpus file fully into memory (exactly like the
@@ -33,7 +36,7 @@
 //!       digest), and `--rebuild` exercises the heal passthrough (index
 //!       built from the decoded scan, docs chunks copied verbatim).
 //!
-//!   compare [--multiset] <a.vix> <b.vix>
+//!   compare [--multiset] [--docs-only] [--ignore-source] <a.vix> <b.vix>
 //!       Assert reader-visible equality of two merge outputs: row count,
 //!       term stream and every docs column. Default mode: term keys, doc
 //!       counts AND postings stream through one hasher, and the docs hash
@@ -58,7 +61,7 @@ use std::{
 };
 
 use arrow::{
-    array::{Array, ArrayRef, Int64Array, StringArray},
+    array::{Array, ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray},
     datatypes::{DataType, Field, Schema},
 };
 use datafusion::{catalog::TableProvider, datasource::MemTable};
@@ -194,6 +197,39 @@ fn make_batch(
     .unwrap()
 }
 
+fn with_status_code_type(
+    batch: arrow::record_batch::RecordBatch,
+    target: &DataType,
+) -> Result<arrow::record_batch::RecordBatch, anyhow::Error> {
+    let status_index = batch.schema().index_of("status_code")?;
+    let mut fields: Vec<Field> = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect();
+    fields[status_index] = Field::new("status_code", target.clone(), true);
+    let mut columns = batch.columns().to_vec();
+    let rows = batch.num_rows();
+    columns[status_index] = match target {
+        DataType::Utf8 => arrow::compute::cast(&columns[status_index], target)?,
+        DataType::Boolean => Arc::new(BooleanArray::from(
+            (0..rows).map(|row| row % 2 == 0).collect::<Vec<_>>(),
+        )),
+        DataType::Float64 => Arc::new(Float64Array::from_iter_values(
+            (0..rows).map(|row| [200.5, 400.25, 500.75][row % 3]),
+        )),
+        DataType::Int64 => Arc::new(Int64Array::from_iter_values(
+            (0..rows).map(|row| [200, 400, 500][row % 3]),
+        )),
+        other => anyhow::bail!("unsupported type-drift benchmark type {other:?}"),
+    };
+    Ok(arrow::record_batch::RecordBatch::try_new(
+        Arc::new(Schema::new(fields)),
+        columns,
+    )?)
+}
+
 /// Prod `default` traces stream settings (v2: every present field is a
 /// docs column — there is no column-store list).
 fn stream_settings() -> (Vec<String>, Vec<String>) {
@@ -209,6 +245,7 @@ async fn cmd_gen(
     overlap: bool,
     narrow: bool,
     vary_schema: bool,
+    type_drift: bool,
 ) -> Result<(), anyhow::Error> {
     std::fs::create_dir_all(dir)?;
     let schema = spans_schema();
@@ -260,13 +297,37 @@ async fn cmd_gen(
             })
             .map(|(index, _)| index)
             .collect();
-        let file_schema = Arc::new(schema.project(&keep)?);
+        let drift_type = [
+            DataType::Utf8,
+            DataType::Boolean,
+            DataType::Float64,
+            DataType::Int64,
+        ][file % 4]
+            .clone();
+        let full_schema = if type_drift {
+            let status_index = schema.index_of("status_code")?;
+            let mut fields: Vec<Field> = schema
+                .fields()
+                .iter()
+                .map(|field| field.as_ref().clone())
+                .collect();
+            fields[status_index] = Field::new("status_code", drift_type.clone(), true);
+            Arc::new(Schema::new(fields))
+        } else {
+            Arc::clone(&schema)
+        };
+        let file_schema = Arc::new(full_schema.project(&keep)?);
         let mut batches = Vec::new();
         let mut left = rows_per_file;
         let mut offset = 0usize;
         while left > 0 {
             let n = left.min(BATCH_ROWS);
             let batch = make_batch(&schema, &mut rng, file_base + offset as i64, n);
+            let batch = if type_drift {
+                with_status_code_type(batch, &drift_type)?
+            } else {
+                batch
+            };
             batches.push(batch.project(&keep)?);
             left -= n;
             offset += n;
@@ -392,10 +453,25 @@ fn load_inputs(
 ///   `--narrow` corpus (#51c-d: the plan wants columns the inputs never stored).
 fn derive_schema(
     inputs: &[openobserve_core::vix::core_writer::MergeInput],
+    status_code_utf8: bool,
 ) -> (Schema, Vec<String>) {
     let registry = spans_schema();
     let mut fts: Vec<String> = Vec::new();
-    let mut latest_fields: Vec<Field> = Vec::new();
+    // The registry is authoritative for every field it knows. The explicit
+    // override models the production Boolean/Float -> latest Utf8 drift
+    // without making corpus filename/order choose the target type.
+    let mut latest_fields: Vec<Field> = registry
+        .fields()
+        .iter()
+        .filter(|field| field.name() != "_source" && field.name() != "_original")
+        .map(|field| {
+            if status_code_utf8 && field.name() == "status_code" {
+                Field::new(field.name(), DataType::Utf8, field.is_nullable())
+            } else {
+                field.as_ref().clone()
+            }
+        })
+        .collect();
     for (_, data, index) in inputs {
         let reader =
             VixReader::open_ranged_with_index(std::sync::Arc::clone(data), index.clone()).unwrap();
@@ -458,7 +534,13 @@ fn ensure_env(key: &str, value: &str) {
     panic!("re-exec with {key}={value} failed: {error}");
 }
 
-fn cmd_merge(dir: &str, out: &str, rebuild: bool) -> Result<(), anyhow::Error> {
+fn cmd_merge(
+    dir: &str,
+    out: &str,
+    rebuild: bool,
+    status_code_utf8: bool,
+    require_columns: bool,
+) -> Result<(), anyhow::Error> {
     let mib = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
     let started = Instant::now();
     let inputs = load_inputs(dir)?;
@@ -468,7 +550,7 @@ fn cmd_merge(dir: &str, out: &str, rebuild: bool) -> Result<(), anyhow::Error> {
         .sum();
     let load_elapsed = started.elapsed();
 
-    let (latest_schema, fts) = derive_schema(&inputs);
+    let (latest_schema, fts) = derive_schema(&inputs, status_code_utf8);
     let bloom = vec!["trace_id".to_string()];
     eprintln!(
         "opened {} files (ranged) / {:.1} MiB in {load_elapsed:.2?}; fts={fts:?}",
@@ -495,13 +577,16 @@ fn cmd_merge(dir: &str, out: &str, rebuild: bool) -> Result<(), anyhow::Error> {
         )?
     };
     let merge_elapsed = started.elapsed();
+    if require_columns {
+        anyhow::ensure!(
+            result.terms_from_columns,
+            "requested column-derived rebuild, but merge selected another path"
+        );
+    }
     let out_len = result.output.len();
     // v3 split: write the merged sidecar next to the data output
     if let Some(index) = &result.index {
-        std::fs::write(
-            std::path::Path::new(out).with_extension("vxi"),
-            index,
-        )?;
+        std::fs::write(std::path::Path::new(out).with_extension("vxi"), index)?;
     }
     match result.output {
         vortex_index::VixOutput::Bytes(data) => std::fs::write(out, &data)?,
@@ -520,10 +605,11 @@ fn cmd_merge(dir: &str, out: &str, rebuild: bool) -> Result<(), anyhow::Error> {
         }
     }
     eprintln!(
-        "merge: {merge_elapsed:.2?}  used_index_merge={}  docs_batches={}  \
+        "merge: {merge_elapsed:.2?}  used_index_merge={}  terms_from_columns={}  docs_batches={}  \
          docs_passthrough_inputs={}  concat_order={}  out {:.1} MiB \
          ({} rows, {} terms, index {:.1} MiB, docs {:.1} MiB)",
         result.used_index_merge,
+        result.terms_from_columns,
         result.docs_batches,
         result.docs_passthrough_inputs,
         result.concat_order,
@@ -533,7 +619,10 @@ fn cmd_merge(dir: &str, out: &str, rebuild: bool) -> Result<(), anyhow::Error> {
         mib(result.stats.index_size as usize),
         mib(result.stats.docs_size as usize),
     );
-    eprintln!("peak memory: {}", rss_lines());
+    eprintln!(
+        "process memory after merge (includes setup): {}",
+        rss_lines()
+    );
     Ok(())
 }
 
@@ -542,7 +631,11 @@ fn cmd_merge(dir: &str, out: &str, rebuild: bool) -> Result<(), anyhow::Error> {
 /// commutatively (wrapping add) and the term stream hashed WITHOUT postings
 /// doc ids — the only valid comparison between outputs whose row order
 /// legitimately differs (concat-order vs sorted).
-fn file_digest(path: &str, multiset: bool) -> Result<(u64, u64, u64, Vec<String>), anyhow::Error> {
+fn file_digest(
+    path: &str,
+    multiset: bool,
+    ignore_source: bool,
+) -> Result<(u64, u64, u64, u64, Vec<(String, DataType, bool)>), anyhow::Error> {
     let data = bytes::Bytes::from(std::fs::read(path)?);
     // v3 split: the index sidecar sits next to the data object
     let index = std::fs::read(std::path::Path::new(path).with_extension("vxi"))
@@ -566,12 +659,20 @@ fn file_digest(path: &str, multiset: bool) -> Result<(u64, u64, u64, Vec<String>
 
     let docs = VixDocs::open(data)?;
     let schema = docs.schema().clone();
-    let mut columns: Vec<String> = schema
+    let mut fields: Vec<(String, DataType, bool)> = schema
         .fields()
         .iter()
-        .map(|field| field.name().clone())
+        .filter(|field| !ignore_source || field.name() != "_source")
+        .map(|field| {
+            (
+                field.name().clone(),
+                field.data_type().clone(),
+                field.is_nullable(),
+            )
+        })
         .collect();
-    columns.sort();
+    fields.sort_by(|a, b| a.0.cmp(&b.0));
+    let columns: Vec<String> = fields.iter().map(|field| field.0.clone()).collect();
     let docs_digest = if multiset {
         // Order-insensitive docs digest: hash each ROW's content (values in
         // sorted column order) into its own hasher and fold the row hashes
@@ -629,8 +730,9 @@ fn file_digest(path: &str, multiset: bool) -> Result<(u64, u64, u64, Vec<String>
     Ok((
         row_count,
         term_count,
-        term_hasher.finish() ^ docs_digest,
-        columns,
+        term_hasher.finish(),
+        docs_digest,
+        fields,
     ))
 }
 
@@ -662,33 +764,61 @@ fn hash_column(column: &ArrayRef, hasher: &mut DefaultHasher) {
     }
 }
 
-fn cmd_compare(a: &str, b: &str, multiset: bool) -> Result<(), anyhow::Error> {
-    let da = file_digest(a, multiset)?;
-    let db = file_digest(b, multiset)?;
+fn cmd_compare(
+    a: &str,
+    b: &str,
+    multiset: bool,
+    docs_only: bool,
+    ignore_source: bool,
+) -> Result<(), anyhow::Error> {
+    let da = file_digest(a, multiset, ignore_source)?;
+    let db = file_digest(b, multiset, ignore_source)?;
     anyhow::ensure!(
-        da.3 == db.3,
+        da.4 == db.4,
         "docs schemas differ: {:?} vs {:?}",
-        da.3,
-        db.3
+        da.4,
+        db.4
     );
+    if docs_only {
+        anyhow::ensure!(
+            da.0 == db.0 && da.3 == db.3,
+            "docs differ ({} mode): {a} (rows={}, docs_digest={:x}) vs {b} (rows={}, \
+             docs_digest={:x})",
+            if multiset { "multiset" } else { "row-order" },
+            da.0,
+            da.3,
+            db.0,
+            db.3,
+        );
+        eprintln!(
+            "docs equivalent ({} mode): rows={}, docs_digest={:x}",
+            if multiset { "multiset" } else { "row-order" },
+            da.0,
+            da.3,
+        );
+        return Ok(());
+    }
     anyhow::ensure!(
-        da.0 == db.0 && da.1 == db.1 && da.2 == db.2,
-        "outputs differ ({} mode): {a} (rows={}, terms={}, digest={:x}) vs {b} (rows={}, \
-         terms={}, digest={:x})",
+        da.0 == db.0 && da.1 == db.1 && da.2 == db.2 && da.3 == db.3,
+        "outputs differ ({} mode): {a} (rows={}, terms={}, term_digest={:x}, docs_digest={:x}) \
+         vs {b} (rows={}, terms={}, term_digest={:x}, docs_digest={:x})",
         if multiset { "multiset" } else { "row-order" },
         da.0,
         da.1,
         da.2,
+        da.3,
         db.0,
         db.1,
         db.2,
+        db.3,
     );
     eprintln!(
-        "outputs equivalent ({} mode): rows={}, terms={}, digest={:x}",
+        "outputs equivalent ({} mode): rows={}, terms={}, term_digest={:x}, docs_digest={:x}",
         if multiset { "multiset" } else { "row-order" },
         da.0,
         da.1,
-        da.2
+        da.2,
+        da.3,
     );
     Ok(())
 }
@@ -723,12 +853,13 @@ async fn main() -> Result<(), anyhow::Error> {
     let flag = |name: &str| args.iter().skip(2).any(|a| a == name);
     match args.get(1).map(String::as_str) {
         Some("gen") => {
-            let dir = args
-                .get(2)
-                .expect("gen <dir> <files> <rows_per_file> [--heal] [--overlap] [--vary-schema]");
+            let dir = args.get(2).expect(
+                "gen <dir> <files> <rows_per_file> [--heal] [--overlap] [--vary-schema] \
+                     [--type-drift]",
+            );
             let files: usize = args.get(3).expect("files").parse()?;
             let rows: usize = args.get(4).expect("rows_per_file").parse()?;
-            if flag("--heal") {
+            if flag("--heal") || flag("--type-drift") {
                 // the heal corpus: index-off L0 files (#42 shape) — the
                 // build-path knob, resolved before any file is written
                 ensure_env("ZO_VIX_L0_INDEX_OFF_STREAM_TYPES", "logs");
@@ -740,34 +871,56 @@ async fn main() -> Result<(), anyhow::Error> {
                 flag("--overlap"),
                 flag("--narrow"),
                 flag("--vary-schema"),
+                flag("--type-drift"),
             )
             .await
         }
         Some("merge") => {
-            let dir = args.get(2).expect("merge <dir> <out.vix> [--rebuild]");
+            let dir = args.get(2).expect(
+                "merge <dir> <out.vix> [--rebuild] [--latest-status-code-utf8] \
+                 [--require-columns]",
+            );
             let out = args.get(3).expect("out.vix");
             // #51c passthrough + #51c-c concatenation are the DEFAULT merge
             // shapes now — no knobs to set.
-            cmd_merge(dir, out, flag("--rebuild"))
+            cmd_merge(
+                dir,
+                out,
+                flag("--rebuild"),
+                flag("--latest-status-code-utf8"),
+                flag("--require-columns"),
+            )
         }
         Some("compare") => {
-            // flags may precede the paths: compare [--multiset] <a> <b>
+            // flags may precede the paths: compare [--multiset] [--docs-only]
+            // [--ignore-source] <a> <b>
             let multiset = flag("--multiset") || args.get(2).is_some_and(|a| a == "--multiset");
             let paths: Vec<&String> = args
                 .iter()
                 .skip(2)
                 .filter(|a| !a.starts_with("--"))
                 .collect();
-            let a = paths.first().expect("compare [--multiset] <a.vix> <b.vix>");
+            let a = paths
+                .first()
+                .expect(
+                    "compare [--multiset] [--docs-only] [--ignore-source] <a.vix> <b.vix>",
+                );
             let b = paths.get(1).expect("b.vix");
-            cmd_compare(a, b, multiset)
+            cmd_compare(
+                a,
+                b,
+                multiset,
+                flag("--docs-only"),
+                flag("--ignore-source"),
+            )
         }
         _ => {
             eprintln!(
                 "usage: merge_bench gen <dir> <files> <rows_per_file> [--heal] [--overlap] \
-                 [--vary-schema] | \
-                 merge <dir> <out.vix> [--rebuild] | \
-                 compare [--multiset] <a.vix> <b.vix>"
+                 [--vary-schema] [--type-drift] | \
+                 merge <dir> <out.vix> [--rebuild] [--latest-status-code-utf8] \
+                 [--require-columns] | \
+                 compare [--multiset] [--docs-only] [--ignore-source] <a.vix> <b.vix>"
             );
             std::process::exit(2);
         }

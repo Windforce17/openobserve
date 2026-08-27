@@ -58,10 +58,11 @@ use std::{
 
 use arrow::{
     array::{
-        Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Int64Array, LargeBinaryArray,
-        LargeStringArray, StringArray, StringViewArray, new_empty_array,
+        Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Float16Array, Float32Array,
+        Float64Array, Int64Array, LargeBinaryArray, LargeStringArray, StringArray, StringViewArray,
+        new_empty_array,
     },
-    compute::{cast, filter_record_batch, interleave},
+    compute::{cast, filter_record_batch, interleave, nullif},
     record_batch::RecordBatch,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -96,6 +97,27 @@ const DOCS_BATCH_ROWS: usize = 8192;
 /// loaded whole input columns. 256 MiB keeps an ~8x margin; a single row
 /// larger than the budget still forms its own batch (progress is by row).
 const DOCS_BATCH_BYTES: usize = 256 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MergeTypePolicy {
+    /// Existing behavior: latest stream schema selects the target type, and
+    /// column derivation requires equivalent physical types.
+    Legacy,
+    /// Latest stream schema selects the fixed target type. In addition to
+    /// derivation-equivalent representations, scalar JSON values may cast to
+    /// a string-family target; lossy and value-dependent reverse casts stay
+    /// on the `_source` fallback.
+    LatestSchema,
+}
+
+impl MergeTypePolicy {
+    fn configured() -> Self {
+        match get_config().common.vix_merge_type_policy.as_str() {
+            "latest_schema" => Self::LatestSchema,
+            _ => Self::Legacy,
+        }
+    }
+}
 
 /// The row/byte bounds of one staged docs batch. Production uses
 /// [`Default`]; tests shrink the caps to prove the chunked flow with small
@@ -134,6 +156,8 @@ struct BatchCaps {
     /// oracle passthrough outputs are compared against. `false` in every
     /// production call: passthrough is the DEFAULT merge shape.
     force_decode: bool,
+    /// Test seam for the env-backed compaction type policy.
+    merge_type_policy_override: Option<MergeTypePolicy>,
 }
 
 impl Default for BatchCaps {
@@ -146,6 +170,7 @@ impl Default for BatchCaps {
             bloom_auto_override: None,
             force_source_derivation: false,
             force_decode: false,
+            merge_type_policy_override: None,
         }
     }
 }
@@ -872,7 +897,7 @@ fn spawn_core_file_builder(
             // synthesis materializes one JSON string per row, so a wide-row
             // WAL batch must be split before the strings of a whole batch
             // land in one arrow array.
-            for part in split_batch_by_bytes(&batch, caps) {
+            for part in split_batch_by_bytes(&batch, caps, true) {
                 let source = synthesize_source(&part)?;
                 let original = if store_original {
                     batch_string_column(&part, ORIGINAL_DATA_COL_NAME)?
@@ -1071,20 +1096,26 @@ enum VarBytes<'a> {
     Binary(&'a BinaryArray),
     LargeBinary(&'a LargeBinaryArray),
     BinaryView(&'a BinaryViewArray),
-    Fixed(usize),
+    Fixed(&'a dyn Array, usize),
+    Opaque(&'a dyn Array),
 }
 
 impl<'a> VarBytes<'a> {
     fn new(array: &'a dyn Array) -> Self {
         let any = array.as_any();
         match array.data_type() {
-            DataType::Utf8 => any.downcast_ref().map_or(Self::Fixed(8), Self::Utf8),
-            DataType::LargeUtf8 => any.downcast_ref().map_or(Self::Fixed(8), Self::LargeUtf8),
-            DataType::Utf8View => any.downcast_ref().map_or(Self::Fixed(8), Self::Utf8View),
-            DataType::Binary => any.downcast_ref().map_or(Self::Fixed(8), Self::Binary),
-            DataType::LargeBinary => any.downcast_ref().map_or(Self::Fixed(8), Self::LargeBinary),
-            DataType::BinaryView => any.downcast_ref().map_or(Self::Fixed(8), Self::BinaryView),
-            other => Self::Fixed(other.primitive_width().unwrap_or(8)),
+            DataType::Utf8 => any.downcast_ref().map_or(Self::Fixed(array, 8), Self::Utf8),
+            DataType::LargeUtf8 => any.downcast_ref().map_or(Self::Fixed(array, 8), Self::LargeUtf8),
+            DataType::Utf8View => any.downcast_ref().map_or(Self::Fixed(array, 8), Self::Utf8View),
+            DataType::Binary => any.downcast_ref().map_or(Self::Fixed(array, 8), Self::Binary),
+            DataType::LargeBinary => any.downcast_ref().map_or(Self::Fixed(array, 8), Self::LargeBinary),
+            DataType::BinaryView => any.downcast_ref().map_or(Self::Fixed(array, 8), Self::BinaryView),
+            DataType::Null => Self::Fixed(array, 0),
+            DataType::Boolean => Self::Fixed(array, 1),
+            other if other.primitive_width().is_some() => {
+                Self::Fixed(array, other.primitive_width().unwrap_or(8))
+            }
+            _ => Self::Opaque(array),
         }
     }
 
@@ -1099,17 +1130,101 @@ impl<'a> VarBytes<'a> {
             Self::Binary(array) => valid(*array, row, array.value_length(row) as usize),
             Self::LargeBinary(array) => valid(*array, row, array.value_length(row) as usize),
             Self::BinaryView(array) => valid(*array, row, array.value(row).len()),
-            Self::Fixed(width) => *width,
+            Self::Fixed(array, width) => valid(*array, row, *width),
+            Self::Opaque(array) => valid(*array, row, usize::MAX),
+        }
+    }
+
+    /// Bytes needed for this scalar in Arrow JSON. String families use the
+    /// exact JSON escaping expansion; binary gets a conservative 6x bound;
+    /// fixed-width term-eligible scalars fit in 32 textual bytes.
+    fn json_len_bound(&self, row: usize) -> usize {
+        match self {
+            Self::Utf8(array) => array
+                .is_valid(row)
+                .then(|| json_string_len(array.value(row).as_bytes()))
+                .unwrap_or(0),
+            Self::LargeUtf8(array) => array
+                .is_valid(row)
+                .then(|| json_string_len(array.value(row).as_bytes()))
+                .unwrap_or(0),
+            Self::Utf8View(array) => array
+                .is_valid(row)
+                .then(|| json_string_len(array.value(row).as_bytes()))
+                .unwrap_or(0),
+            Self::Binary(array) => array
+                .is_valid(row)
+                .then(|| array.value(row).len().saturating_mul(6).saturating_add(2))
+                .unwrap_or(0),
+            Self::LargeBinary(array) => array
+                .is_valid(row)
+                .then(|| array.value(row).len().saturating_mul(6).saturating_add(2))
+                .unwrap_or(0),
+            Self::BinaryView(array) => array
+                .is_valid(row)
+                .then(|| array.value(row).len().saturating_mul(6).saturating_add(2))
+                .unwrap_or(0),
+            Self::Fixed(array, _) => if array.is_valid(row) { 128 } else { 0 },
+            // Nested/dictionary values do not have a cheap exact per-row
+            // memory/JSON bound. Force them into the documented one-row
+            // oversize exception rather than weakening the aggregate cap.
+            Self::Opaque(array) => if array.is_valid(row) { usize::MAX } else { 0 },
         }
     }
 }
 
+/// Exact byte length of a valid UTF-8 string after JSON quoting/escaping.
+fn json_string_len(value: &[u8]) -> usize {
+    value.iter().fold(2usize, |bytes, byte| {
+        bytes.saturating_add(match byte {
+            b'"' | b'\\' | b'\x08' | b'\t' | b'\n' | b'\x0c' | b'\r' => 2,
+            0x00..=0x1f => 6,
+            _ => 1,
+        })
+    })
+}
+
+/// Conservative serialized length of one `_source` row. Value escaping is
+/// exact for string families; key/punctuation bytes are included explicitly.
+fn source_json_row_len_bound(
+    fields: &[Arc<Field>],
+    accessors: &[VarBytes<'_>],
+    row: usize,
+) -> usize {
+    fields
+        .iter()
+        .zip(accessors)
+        .filter(|(field, _)| {
+            !matches!(
+                field.name().as_str(),
+                ID_COL_NAME | ORIGINAL_DATA_COL_NAME | SOURCE_COL_NAME
+            )
+        })
+        .fold(2usize, |bytes, (field, accessor)| {
+            let value_bytes = accessor.json_len_bound(row);
+            if value_bytes == 0 {
+                bytes
+            } else {
+                bytes
+                    .saturating_add(json_string_len(field.name().as_bytes()))
+                    .saturating_add(1) // ':'
+                    .saturating_add(value_bytes)
+                    .saturating_add(1) // conservative trailing ','
+            }
+        })
+}
+
 /// Split `batch` into consecutive row slices (zero-copy), each within the
-/// caps. Bytes are measured with [`VarBytes`] plus a small per-row constant
-/// per column (covers the key/punctuation overhead of the `_source` JSON
-/// image a slice may be serialized into). A single row over the byte budget
-/// still forms its own slice.
-fn split_batch_by_bytes(batch: &RecordBatch, caps: BatchCaps) -> Vec<RecordBatch> {
+/// logical work caps. When `synthesize_source` is true, the charge also
+/// includes twice the bounded `_source` JSON length: the serializer briefly
+/// owns both its line buffer and the copied [`StringArray`] values. Ordinary
+/// source-preserving scans skip that expensive sizing pass. A single row over
+/// the byte budget still forms its own slice.
+fn split_batch_by_bytes(
+    batch: &RecordBatch,
+    caps: BatchCaps,
+    synthesize_source: bool,
+) -> Vec<RecordBatch> {
     let rows = batch.num_rows();
     if rows <= 1 {
         return vec![batch.clone()];
@@ -1119,16 +1234,34 @@ fn split_batch_by_bytes(batch: &RecordBatch, caps: BatchCaps) -> Vec<RecordBatch
         .iter()
         .map(|column| VarBytes::new(column.as_ref()))
         .collect();
+    let fields = batch.schema().fields().to_vec();
     let fixed_per_row = 24usize.saturating_mul(batch.num_columns());
     let mut parts = Vec::new();
     let mut start = 0usize;
     let mut part_rows = 0usize;
     let mut part_bytes = 0usize;
     for row in 0..rows {
+        let resident = accessors
+            .iter()
+            .fold(0usize, |bytes, accessor| bytes.saturating_add(accessor.get(row)));
+        let source_peak = synthesize_source
+            .then(|| source_json_row_len_bound(&fields, &accessors, row).saturating_mul(2))
+            .unwrap_or(0);
+        let row_bytes = fixed_per_row
+            .saturating_add(resident)
+            .saturating_add(source_peak);
+        let next_rows = part_rows.saturating_add(1);
+        let next_bytes = part_bytes.saturating_add(row_bytes);
+        if part_rows > 0
+            && (next_rows > caps.rows.max(1) || next_bytes > caps.bytes.max(1))
+        {
+            parts.push(batch.slice(start, part_rows));
+            start = row;
+            part_rows = 0;
+            part_bytes = 0;
+        }
         part_rows += 1;
-        part_bytes = part_bytes
-            .saturating_add(fixed_per_row)
-            .saturating_add(accessors.iter().map(|a| a.get(row)).sum());
+        part_bytes = part_bytes.saturating_add(row_bytes);
         if part_rows >= caps.rows.max(1) || part_bytes >= caps.bytes.max(1) {
             parts.push(batch.slice(start, part_rows));
             start = row + 1;
@@ -1291,15 +1424,23 @@ struct MergePlan {
     /// decode is a large share of it). The scan substitutes a synthesized
     /// empty-string array to keep the push contract intact.
     scan_source: bool,
-    /// #46: every input is an index-off ALL-COLUMNAR file (readable, no
-    /// term index, agreeing term-derivable column types), so the rebuild
-    /// derives terms from the streamed COLUMNS — the cheap column-driven
-    /// path, byte-parity-pinned against the `_source` derivation — instead
-    /// of parsing `_source` JSON per row (measured 5.4× dict-merge cost).
+    /// #46: every input is readable and ALL-COLUMNAR with compatible
+    /// term-derivable types. Legacy enables this for index-off inputs; the
+    /// opt-in fixed latest-schema migration also enables it for indexed
+    /// inputs that need their representation normalized. The rebuild derives
+    /// terms from streamed COLUMNS instead of parsing `_source` JSON per row
+    /// (measured 5.4× dict-merge cost).
     /// Any gate miss keeps the source-driven derivation. The preserved
     /// union IS the derivation column set (v2 all-columns) — no extra
     /// streamed columns exist.
     derive_from_columns: bool,
+    /// The fixed latest-schema policy admitted at least one physical-type to
+    /// string-family cast. The rebuild must therefore synthesize `_source`
+    /// from the normalized complete columns as well as deriving terms from
+    /// them. This makes the representation durable: a later source-driven
+    /// heal or an older/legacy compactor sees the same string values and
+    /// cannot silently revert their term/token semantics.
+    rewrite_source_from_columns: bool,
 }
 
 /// Why the index-merge fast path was abandoned.
@@ -1432,7 +1573,11 @@ fn merge_core_files_with_caps(
             MergeSource::DocsOnly(_) => None,
         })
         .collect();
-    if let Some(readers) = readers {
+    if plan.rewrite_source_from_columns {
+        log::info!(
+            "vix merge: rebuilding to persist latest-schema string casts in docs and _source"
+        );
+    } else if let Some(readers) = readers {
         match merge_core_files_indexed(inputs, &sources, &readers, &plan) {
             Ok(result) => return Ok(result),
             Err(IndexedMergeFailure::Fatal(e)) => return Err(e),
@@ -1600,6 +1745,13 @@ fn rebuild_core_file_sidecar_with_caps(
     // metadata, nothing to scan.
     if !plan.opts.index_enabled {
         return Ok(SidecarHealOutcome::DropSidecar);
+    }
+    if plan.rewrite_source_from_columns {
+        return Ok(SidecarHealOutcome::NeedsDocsRewrite(
+            "latest-schema casts must rewrite _source together with docs; a sidecar-only heal \
+             would leave non-repeatable term semantics"
+                .to_string(),
+        ));
     }
 
     // The data object's existing oversize allowance (a DATA-side property):
@@ -1845,10 +1997,39 @@ fn open_merge_sources(inputs: &[MergeInput]) -> Result<Vec<MergeSource>, anyhow:
 /// FLEET on the 5.4x `_source` arm for a representation difference.
 /// Numerics stay strict: Int64 vs Float64 genuinely canonicalize apart.
 fn derivation_type_equivalent(a: &DataType, b: &DataType) -> bool {
-    fn string_family(t: &DataType) -> bool {
-        matches!(t, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View)
-    }
     a == b || (string_family(a) && string_family(b))
+}
+
+fn string_family(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+    )
+}
+
+/// Casts admitted by the opt-in fixed latest-schema policy. The source must
+/// already be a scalar whose `_source` image is a JSON Boolean/number, and the
+/// authoritative target must be a string representation. Reverse parsing,
+/// numeric narrowing, and Boolean coercion are deliberately excluded: Arrow
+/// has kernels for them, but they can silently null or change valid values.
+fn latest_schema_derivation_cast_allowed(source: &DataType, target: &DataType) -> bool {
+    derivation_type_equivalent(source, target)
+        || (string_family(target)
+            && matches!(
+                source,
+                DataType::Boolean
+                    | DataType::Int8
+                    | DataType::Int16
+                    | DataType::Int32
+                    | DataType::Int64
+                    | DataType::UInt8
+                    | DataType::UInt16
+                    | DataType::UInt32
+                    | DataType::UInt64
+                    | DataType::Float16
+                    | DataType::Float32
+                    | DataType::Float64
+            ))
 }
 
 fn build_merge_plan(
@@ -1859,6 +2040,9 @@ fn build_merge_plan(
     bloom_fields: &[String],
     caps: BatchCaps,
 ) -> MergePlan {
+    let merge_type_policy = caps
+        .merge_type_policy_override
+        .unwrap_or_else(MergeTypePolicy::configured);
     // M31: the caps override (production use: the compactor's index-defer
     // policy over non-final all-index-less groups) beats the stream-type
     // resolution, exactly like the build path's consult.
@@ -1868,6 +2052,7 @@ fn build_merge_plan(
     // docs columns available across inputs (name -> first stored type),
     // writer-managed columns excluded
     let mut available: Vec<(String, DataType)> = Vec::new();
+    let mut available_index = hashbrown::HashMap::<String, usize>::new();
     let mut store_original = false;
     for source in sources {
         let Ok(docs_schema) = source.docs_schema() else {
@@ -1878,7 +2063,8 @@ fn build_merge_plan(
                 TIMESTAMP_COL_NAME | SOURCE_COL_NAME => {}
                 ORIGINAL_DATA_COL_NAME => store_original = true,
                 name => {
-                    if !available.iter().any(|(n, _)| n == name) {
+                    if !available_index.contains_key(name) {
+                        available_index.insert(name.to_string(), available.len());
                         available.push((name.to_string(), field.data_type().clone()));
                     }
                 }
@@ -2007,6 +2193,10 @@ fn build_merge_plan(
             (name.clone(), target_type)
         })
         .collect();
+    let preserved_index: hashbrown::HashMap<&str, &DataType> = preserved
+        .iter()
+        .map(|(name, data_type)| (name.as_str(), data_type))
+        .collect();
 
     // writer construction schema: `_timestamp` + the preserved columns at
     // their target types. Since v3 files store EVERY present field as a
@@ -2047,9 +2237,11 @@ fn build_merge_plan(
     // from the spool, so the merged multi-GB object never resides in RAM.
     opts.output_spool_dir = Some(scratch);
 
-    // #46 gate: an INDEXED output over inputs that are ALL index-off
-    // all-columnar files derives its terms from the streamed COLUMNS (the
-    // cheap column-driven path) instead of parsing `_source` per row.
+    // #46 gate: an INDEXED output over complete all-columnar inputs derives
+    // its terms from streamed COLUMNS (the cheap column-driven path) instead
+    // of parsing `_source` per row. Legacy limits this to index-off inputs;
+    // latest_schema also admits indexed inputs when normalizing their durable
+    // representation.
     // Strict preconditions, any miss = the source-driven fallback:
     // readable index (index-off, not unreadable), every non-internal input
     // column term-derivable (string/numeric/bool — write-time JSON types by
@@ -2057,13 +2249,19 @@ fn build_merge_plan(
     // holds the first-seen type) nor between an input's stored type and the
     // plan's target type (a cast could canonicalize differently than the
     // `_source` derivation).
+    let all_index_off = sources.iter().all(|source| match source {
+        MergeSource::Indexed(reader) => !reader.has_index(),
+        MergeSource::DocsOnly(_) => false,
+    });
     let mut derive_from_columns = index_enabled
         && !caps.force_source_derivation
         && !sources.is_empty()
+        && (all_index_off || merge_type_policy == MergeTypePolicy::LatestSchema)
         && sources.iter().all(|source| match source {
-            MergeSource::Indexed(reader) => !reader.has_index(),
+            MergeSource::Indexed(reader) => reader.columns_complete(),
             MergeSource::DocsOnly(_) => false,
         });
+    let mut rewrite_source_from_columns = false;
     if derive_from_columns {
         'gate: for source in sources {
             let Ok(schema) = source.docs_schema() else {
@@ -2081,14 +2279,35 @@ fn build_merge_plan(
                 {
                     continue;
                 }
-                let stored = available.iter().find(|(n, _)| n == name);
-                let target = preserved.iter().find(|(n, _)| n == name);
-                let type_ok = vortex_index::is_value_indexed_type(field.data_type())
-                    || name == ID_COL_NAME;
-                if !type_ok
-                    || stored.is_none_or(|(_, t)| !derivation_type_equivalent(t, field.data_type()))
-                    || target.is_none_or(|(_, t)| !derivation_type_equivalent(t, field.data_type()))
-                {
+                let stored = available_index
+                    .get(name)
+                    .and_then(|index| available.get(*index));
+                let target = preserved_index.get(name).copied();
+                let type_ok =
+                    vortex_index::is_value_indexed_type(field.data_type()) || name == ID_COL_NAME;
+                let target_ok = target.is_some_and(|target_type| {
+                    if merge_type_policy == MergeTypePolicy::LatestSchema
+                        && latest_schema.field_with_name(name).is_ok()
+                    {
+                        latest_schema_derivation_cast_allowed(field.data_type(), target_type)
+                    } else {
+                        derivation_type_equivalent(field.data_type(), target_type)
+                    }
+                });
+                let rewrites_source = merge_type_policy == MergeTypePolicy::LatestSchema
+                    && latest_schema.field_with_name(name).is_ok()
+                    && target.is_some_and(|target_type| {
+                        !derivation_type_equivalent(field.data_type(), target_type)
+                            && latest_schema_derivation_cast_allowed(
+                                field.data_type(),
+                                target_type,
+                            )
+                    });
+                let first_seen_ok = merge_type_policy == MergeTypePolicy::LatestSchema
+                    || stored.is_some_and(|(_, data_type)| {
+                        derivation_type_equivalent(data_type, field.data_type())
+                    });
+                if !type_ok || !first_seen_ok || !target_ok {
                     derive_from_columns = false;
                     // M31: the reason line this gate always lacked — its
                     // absence hid a FLEET-WIDE silent miss (every prod L0
@@ -2100,13 +2319,28 @@ fn build_merge_plan(
                          first-seen {:?} / target {:?} (value-indexed type: {type_ok})",
                         field.data_type(),
                         stored.map(|(_, t)| t),
-                        target.map(|(_, t)| t),
+                        target,
                     );
                     break 'gate;
                 }
+                rewrite_source_from_columns |= rewrites_source;
             }
         }
     }
+    if !derive_from_columns {
+        rewrite_source_from_columns = false;
+    }
+    if rewrite_source_from_columns {
+        // The default writer samples 256 MiB before choosing docs chunking.
+        // A fixed-type migration cannot passthrough old chunks (it rewrites
+        // `_source`), so that sample remains resident alongside normalized
+        // columns + synthesized source and dominated the benchmark's RSS.
+        // 8 MiB still samples tens of thousands of rows at the measured
+        // production-like density while starting the streaming encoder early;
+        // it is scoped to this opt-in one-generation migration only.
+        opts.docs_encode_sample_bytes = 8 * 1024 * 1024;
+    }
+    drop(preserved_index);
 
     MergePlan {
         store_original,
@@ -2114,8 +2348,9 @@ fn build_merge_plan(
         writer_schema,
         opts,
         caps,
-        scan_source: true,
+        scan_source: !rewrite_source_from_columns,
         derive_from_columns,
+        rewrite_source_from_columns,
     }
 }
 
@@ -2910,7 +3145,12 @@ fn normalize_merge_chunk(
     let mut cs = Vec::with_capacity(plan.preserved.len());
     for (name, target_type) in &plan.preserved {
         let column = match batch.column_by_name(name) {
-            Some(column) => cast(column, target_type).map_err(|e| {
+            Some(column) => normalize_merge_column(
+                column,
+                target_type,
+                plan.rewrite_source_from_columns,
+            )
+            .map_err(|e| {
                 anyhow::anyhow!("core file {key}: column {name:?} cast to {target_type}: {e}")
             })?,
             // v2 all-present-columns: an input lacking a column means the
@@ -2939,12 +3179,45 @@ fn normalize_merge_chunk(
     for column in &cs {
         accessors.push(VarBytes::new(column.as_ref()));
     }
+    // The fixed latest-schema path deliberately does not decode the old
+    // `_source`, but it materializes a replacement from these columns just
+    // before the writer push. Charge exact string escaping, conservative
+    // scalar text, every key, and BOTH simultaneously-live JSON copies (the
+    // arrow-json line buffer and the returned StringArray value buffer).
+    let synthesized_source_fixed = plan.rewrite_source_from_columns.then(|| {
+        2usize // object braces
+            .saturating_add(json_string_len(TIMESTAMP_COL_NAME.as_bytes()))
+            .saturating_add(1 + 128 + 1) // ':', timestamp value, ','
+            .saturating_add(
+                plan.preserved
+                    .iter()
+                    .map(|(name, _)| json_string_len(name.as_bytes()) + 2)
+                    .sum::<usize>(),
+            )
+    });
     let row_bytes: Vec<u32> = (0..rows)
         .map(|row| {
-            accessors
-                .iter()
-                .map(|accessor| accessor.get(row))
-                .sum::<usize>()
+            let resident_values = accessors.iter().fold(8usize, |bytes, accessor| {
+                bytes.saturating_add(accessor.get(row))
+            });
+            // At the window peak both the staged arrays and the interleaved
+            // output arrays are live. Charge two copies of value buffers plus
+            // conservative offset/validity/capacity overhead for timestamp,
+            // source, original, and every preserved column.
+            let resident_peak = resident_values
+                .saturating_mul(2)
+                .saturating_add(48usize.saturating_mul(accessors.len() + 1));
+            let synthesized_source = synthesized_source_fixed.map_or(0, |fixed| {
+                fixed
+                    .saturating_add(
+                        accessors[2..].iter().fold(0usize, |bytes, accessor| {
+                            bytes.saturating_add(accessor.json_len_bound(row))
+                        }),
+                    )
+                    .saturating_mul(2)
+            });
+            resident_peak
+                .saturating_add(synthesized_source)
                 .min(u32::MAX as usize) as u32
         })
         .collect();
@@ -2957,6 +3230,53 @@ fn normalize_merge_chunk(
         last_in_unit: false,
         synthesized: Arc::clone(synthesized),
     })
+}
+
+/// Normalize one preserved docs column while keeping `_source`'s JSON-null
+/// contract for non-finite floats. Arrow's float-to-string kernel emits
+/// `"NaN"`/`"inf"`; arrow-json writes those source slots as `null`, so mask
+/// them before the cast or compaction would manufacture docs values/postings.
+fn normalize_merge_column(
+    column: &ArrayRef,
+    target_type: &DataType,
+    mask_non_finite: bool,
+) -> Result<ArrayRef, arrow_schema::ArrowError> {
+    let finite_column = if mask_non_finite && string_family(target_type) {
+        let non_finite = match column.data_type() {
+            DataType::Float16 => Some(BooleanArray::from_iter(
+                column
+                    .as_any()
+                    .downcast_ref::<Float16Array>()
+                    .expect("Float16 type")
+                    .iter()
+                    .map(|value| value.map(|value| !value.is_finite())),
+            )),
+            DataType::Float32 => Some(BooleanArray::from_iter(
+                column
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .expect("Float32 type")
+                    .iter()
+                    .map(|value| value.map(|value| !value.is_finite())),
+            )),
+            DataType::Float64 => Some(BooleanArray::from_iter(
+                column
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .expect("Float64 type")
+                    .iter()
+                    .map(|value| value.map(|value| !value.is_finite())),
+            )),
+            _ => None,
+        };
+        match non_finite {
+            Some(mask) => nullif(column.as_ref(), &mask)?,
+            None => Arc::clone(column),
+        }
+    } else {
+        Arc::clone(column)
+    };
+    cast(&finite_column, target_type)
 }
 
 /// M25: the per-input synthesized-column mask (aligned with
@@ -3030,7 +3350,7 @@ fn stream_input_chunks(
         if batch.num_rows() == 0 {
             return Ok(());
         }
-        for part in split_batch_by_bytes(&batch, plan.caps) {
+        for part in split_batch_by_bytes(&batch, plan.caps, false) {
             let chunk = normalize_merge_chunk(key, plan, &part, &synthesized, &mut null_cache)?;
             if chunk.rows() == 0 {
                 // every row of the part was cleansed away: nothing to stage
@@ -3141,7 +3461,7 @@ fn stream_input_row_ranges(
             if batch.num_rows() == 0 {
                 return Ok(());
             }
-            for part in split_batch_by_bytes(&batch, part_caps) {
+            for part in split_batch_by_bytes(&batch, part_caps, false) {
                 let mut chunk =
                     normalize_merge_chunk(key, plan, &part, &synthesized, &mut null_cache)?;
                 if chunk.rows() == 0 {
@@ -4169,12 +4489,21 @@ fn rebuild_over_sources(
         // the pinned contract). `project_docs` stores only the docs-schema
         // columns; the extra derivation columns feed terms and vanish.
         log::info!(
-            "vix merge: rebuild derives terms from {} columns (index-off inputs)",
-            plan.preserved.len()
+            "vix merge: rebuild derives terms from {} columns (rewrite _source: {})",
+            plan.preserved.len(),
+            plan.rewrite_source_from_columns,
         );
         stream_merge_windows(inputs, plan, &order, |ts, cs, source, original| {
             let batch = derivation_window_batch(ts, cs)?;
-            writer.push_batch_with_source(&batch, source, original)?;
+            let rewritten_source = plan
+                .rewrite_source_from_columns
+                .then(|| synthesize_source(&batch))
+                .transpose()?;
+            writer.push_batch_with_source(
+                &batch,
+                rewritten_source.as_ref().unwrap_or(source),
+                original,
+            )?;
             Ok(())
         })?
     } else {
@@ -4284,6 +4613,11 @@ fn qualify_heal_passthrough(
     dropped_rows: u64,
 ) -> Option<HealPassthrough> {
     if plan.caps.force_decode {
+        return None;
+    }
+    if plan.rewrite_source_from_columns {
+        // The encoded docs chunks still contain the old `_source`; copying
+        // them would defeat the durable fixed-type migration.
         return None;
     }
     if !plan.opts.index_enabled {
@@ -4408,20 +4742,11 @@ fn rebuild_with_docs_passthrough(
     // 1) Index build: today's decoded scan, docs staging detached.
     let started = std::time::Instant::now();
     let scan_windows = if plan.derive_from_columns {
-        // M31: with every input spliced (docs copied encoded), the scan
-        // exists ONLY to derive terms from columns — `_source` would be
-        // decoded for a length/null check. Drop it from the projection;
-        // any fail-open input still decodes its docs for the RE-ENCODE
-        // below, which reads full chunks through its own stream (scan_plan
-        // is scoped to this index scan).
-        let all_spliced = splices.iter().all(Option::is_some);
-        let scan_plan = if all_spliced {
-            let mut scan_plan = plan.clone();
-            scan_plan.scan_source = false;
-            scan_plan
-        } else {
-            plan.clone()
-        };
+        // This detached pass exists ONLY to derive terms from columns, so it
+        // never projects `_source`. Inputs that fail encoded docs splicing
+        // read `_source` exactly once later in their store-only re-encode.
+        let mut scan_plan = plan.clone();
+        scan_plan.scan_source = false;
         log::info!(
             "vix merge: heal-passthrough rebuild derives terms from {} columns \
              (index-off inputs, _source projected: {})",
@@ -4547,7 +4872,7 @@ fn rebuild_with_docs_passthrough(
 
 #[cfg(test)]
 mod tests {
-    use arrow::array::{BooleanArray, Int64Array, StringArray};
+    use arrow::array::{BooleanArray, Float64Array, Int64Array, StringArray};
     use datafusion::datasource::MemTable;
     use vortex_index::{RowOrder, VixDocs, VixQuery, VixReader};
 
@@ -4561,6 +4886,41 @@ mod tests {
     /// One fabricated file's (data, sidecar) bytes — what every test
     /// builder returns since the v3 split.
     type BuiltPair = (bytes::Bytes, Option<bytes::Bytes>);
+
+    #[test]
+    fn split_batch_preflights_the_next_row_against_the_byte_cap() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+            Field::new("body", DataType::Utf8, false),
+        ]));
+        let escaped = "\u{0001}".repeat(40);
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![3, 2, 1])),
+                Arc::new(StringArray::from(vec![
+                    escaped.clone(),
+                    escaped,
+                    "c".to_string(),
+                ])),
+            ],
+        )
+        .unwrap();
+        let parts = split_batch_by_bytes(
+            &batch,
+            BatchCaps {
+                rows: 10,
+                bytes: 1_000,
+                ..BatchCaps::default()
+            },
+            true,
+        );
+
+        assert_eq!(
+            parts.iter().map(RecordBatch::num_rows).collect::<Vec<_>>(),
+            vec![1, 1, 1]
+        );
+    }
 
     /// Open one fabricated pair as a full reader.
     fn open_pair(pair: &BuiltPair) -> VixReader {
@@ -12128,6 +12488,393 @@ mod tests {
         assert_eq!(
             matching_docs(&fast_reader, &tagged_numeric("code", "7")),
             vec![2]
+        );
+    }
+
+    /// Fixed-type policy: the latest stream schema remains authoritative, but
+    /// physical Boolean/Float/numeric/string variants safe-cast to that target
+    /// and continue down the column-derived rebuild path.
+    #[tokio::test]
+    async fn merge_latest_schema_policy_safe_casts_type_drift_from_columns() {
+        let file1 = build_index_off_core_file(
+            vec![
+                Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+                Field::new("code", DataType::Int64, true),
+            ],
+            vec![
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(Int64Array::from(vec![Some(7)])),
+            ],
+        );
+        let file2 = build_index_off_core_file(
+            vec![
+                Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+                Field::new("code", DataType::Utf8, true),
+            ],
+            vec![
+                Arc::new(Int64Array::from(vec![90, 80])),
+                Arc::new(StringArray::from(vec![Some("123"), Some("abc")])),
+            ],
+        );
+        let latest_schema = Schema::new(vec![
+            Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+            Field::new("code", DataType::Utf8, true),
+        ]);
+        let inputs = vec![("f1.vix".to_string(), file1), ("f2.vix".to_string(), file2)];
+
+        let rebuilt = merge_core_files_rebuild_with_caps(
+            StreamType::Logs,
+            &as_inputs(&inputs),
+            &latest_schema,
+            &[],
+            &[],
+            BatchCaps {
+                merge_type_policy_override: Some(MergeTypePolicy::LatestSchema),
+                ..BatchCaps::default()
+            },
+        )
+        .unwrap();
+        assert!(rebuilt.terms_from_columns);
+        let reader = open_merged(&rebuilt);
+        assert!(
+            matches!(
+                reader
+                    .docs_schema()
+                    .unwrap()
+                    .field_with_name("code")
+                    .unwrap()
+                    .data_type(),
+                DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+            ),
+            "the writer may normalize the fixed logical string type to Utf8View",
+        );
+        let code = as_string_array(&reader.read_docs_column("code").unwrap()).unwrap();
+        assert_eq!(
+            (0..code.len())
+                .map(|row| code.is_valid(row).then(|| code.value(row)))
+                .collect::<Vec<_>>(),
+            vec![Some("7"), Some("123"), Some("abc")],
+        );
+        assert_eq!(matching_docs(&reader, &exact("code", "7")), vec![0]);
+        assert_eq!(matching_docs(&reader, &exact("code", "123")), vec![1]);
+        assert_eq!(matching_docs(&reader, &exact("code", "abc")), vec![2]);
+        assert_eq!(matching_docs(&reader, &key_exists("code")), vec![0, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn merge_latest_schema_policy_rejects_string_to_numeric_derivation() {
+        let file = build_index_off_core_file(
+            vec![
+                Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+                Field::new("code", DataType::Utf8, true),
+            ],
+            vec![
+                Arc::new(Int64Array::from(vec![100, 90])),
+                Arc::new(StringArray::from(vec![Some("123"), Some("abc")])),
+            ],
+        );
+        let latest_schema = Schema::new(vec![
+            Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+            Field::new("code", DataType::Int64, true),
+        ]);
+        let inputs = vec![("string.vix".to_string(), file)];
+
+        let rebuilt = merge_core_files_rebuild_with_caps(
+            StreamType::Logs,
+            &as_inputs(&inputs),
+            &latest_schema,
+            &[],
+            &[],
+            BatchCaps {
+                merge_type_policy_override: Some(MergeTypePolicy::LatestSchema),
+                ..BatchCaps::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            !rebuilt.terms_from_columns,
+            "value-dependent Utf8 parsing must stay on the _source derivation path"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_latest_schema_policy_casts_boolean_and_float_to_utf8_terms() {
+        let file = build_index_off_core_file(
+            vec![
+                Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+                Field::new("flag", DataType::Boolean, true),
+                Field::new("ratio", DataType::Float64, true),
+            ],
+            vec![
+                Arc::new(Int64Array::from(vec![100, 90, 80, 70, 60])),
+                Arc::new(BooleanArray::from(vec![
+                    Some(true),
+                    Some(false),
+                    Some(true),
+                    Some(false),
+                    None,
+                ])),
+                Arc::new(Float64Array::from(vec![
+                    Some(1.5),
+                    Some(-2.25),
+                    Some(f64::NAN),
+                    Some(f64::INFINITY),
+                    Some(f64::NEG_INFINITY),
+                ])),
+            ],
+        );
+        let latest_schema = Schema::new(vec![
+            Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+            Field::new("flag", DataType::Utf8, true),
+            Field::new("ratio", DataType::Utf8, true),
+        ]);
+        let inputs = vec![("typed.vix".to_string(), file)];
+
+        let rebuilt = merge_core_files_rebuild_with_caps(
+            StreamType::Logs,
+            &as_inputs(&inputs),
+            &latest_schema,
+            &[],
+            &[],
+            BatchCaps {
+                merge_type_policy_override: Some(MergeTypePolicy::LatestSchema),
+                ..BatchCaps::default()
+            },
+        )
+        .unwrap();
+        assert!(rebuilt.terms_from_columns);
+        let reader = open_merged(&rebuilt);
+        assert_eq!(matching_docs(&reader, &exact("flag", "true")), vec![0, 2]);
+        assert_eq!(matching_docs(&reader, &exact("flag", "false")), vec![1, 3]);
+        assert_eq!(matching_docs(&reader, &exact("ratio", "1.5")), vec![0]);
+        assert_eq!(matching_docs(&reader, &exact("ratio", "-2.25")), vec![1]);
+        assert_eq!(
+            matching_docs(&reader, &exact("ratio", "NaN")),
+            Vec::<u32>::new()
+        );
+        assert_eq!(
+            matching_docs(&reader, &exact("ratio", "inf")),
+            Vec::<u32>::new()
+        );
+        assert_eq!(
+            matching_docs(&reader, &key_exists("flag")),
+            vec![0, 1, 2, 3]
+        );
+        assert_eq!(matching_docs(&reader, &key_exists("ratio")), vec![0, 1]);
+
+        let ratio = as_string_array(&reader.read_docs_column("ratio").unwrap()).unwrap();
+        assert_eq!(
+            (0..ratio.len())
+                .map(|row| ratio.is_valid(row).then(|| ratio.value(row)))
+                .collect::<Vec<_>>(),
+            vec![Some("1.5"), Some("-2.25"), None, None, None],
+        );
+        for row in 2..5 {
+            let source = reader.read_source(&[row]).unwrap();
+            let source: serde_json::Value = serde_json::from_str(source.value(0)).unwrap();
+            assert_eq!(source.get("ratio"), None);
+        }
+
+        // The fixed-type output is durable, not merely an index-side view:
+        // `_source` carries the same authoritative strings as the docs
+        // columns, so a future source-driven rebuild or a legacy rollback
+        // cannot silently restore numeric/bool tagged terms.
+        for (row, expected) in [(0, "1.5"), (1, "-2.25")] {
+            let source = reader.read_source(&[row]).unwrap();
+            let source: serde_json::Value = serde_json::from_str(source.value(0)).unwrap();
+            assert_eq!(source.get("ratio"), Some(&serde_json::json!(expected)));
+        }
+        let generation_one = (
+            bytes::Bytes::from(rebuilt.output.to_bytes().unwrap()),
+            rebuilt.index.clone().map(bytes::Bytes::from),
+        );
+        let generation_two_inputs = vec![("generation-one.vix".to_string(), generation_one)];
+        let generation_two = merge_core_files_rebuild_with_caps(
+            StreamType::Logs,
+            &as_inputs(&generation_two_inputs),
+            &latest_schema,
+            &[],
+            &[],
+            BatchCaps {
+                force_source_derivation: true,
+                merge_type_policy_override: Some(MergeTypePolicy::Legacy),
+                ..BatchCaps::default()
+            },
+        )
+        .unwrap();
+        assert!(!generation_two.terms_from_columns);
+        let generation_two_reader = open_merged(&generation_two);
+        assert_core_files_equivalent(
+            &reader,
+            &generation_two_reader,
+            "latest-schema output after legacy source rebuild",
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_legacy_rollback_stabilizes_mixed_typed_and_rewritten_inputs() {
+        let old_typed = build_index_off_core_file(
+            vec![
+                Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+                Field::new("flag", DataType::Boolean, true),
+                Field::new("ratio", DataType::Float64, true),
+            ],
+            vec![
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(BooleanArray::from(vec![Some(false)])),
+                Arc::new(Float64Array::from(vec![Some(2.5)])),
+            ],
+        );
+        let canary_input = build_index_off_core_file(
+            vec![
+                Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+                Field::new("flag", DataType::Boolean, true),
+                Field::new("ratio", DataType::Float64, true),
+            ],
+            vec![
+                Arc::new(Int64Array::from(vec![90])),
+                Arc::new(BooleanArray::from(vec![Some(true)])),
+                Arc::new(Float64Array::from(vec![Some(1.5)])),
+            ],
+        );
+        let latest_schema = Schema::new(vec![
+            Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+            Field::new("flag", DataType::Utf8, true),
+            Field::new("ratio", DataType::Utf8, true),
+        ]);
+        let canary_inputs = vec![("canary-input.vix".to_string(), canary_input)];
+        let canary = merge_core_files_rebuild_with_caps(
+            StreamType::Logs,
+            &as_inputs(&canary_inputs),
+            &latest_schema,
+            &[],
+            &[],
+            BatchCaps {
+                merge_type_policy_override: Some(MergeTypePolicy::LatestSchema),
+                ..BatchCaps::default()
+            },
+        )
+        .unwrap();
+        assert!(canary.terms_from_columns);
+        let canary_pair = (
+            bytes::Bytes::from(canary.output.to_bytes().unwrap()),
+            canary.index.clone().map(bytes::Bytes::from),
+        );
+
+        // A rollback can see untouched typed files and already rewritten
+        // canary output in one ordinary merge group. Force the legacy/source
+        // arm and pin that each row keeps its own durable representation.
+        let mixed_inputs = vec![
+            ("old-typed.vix".to_string(), old_typed),
+            ("canary-output.vix".to_string(), canary_pair),
+        ];
+        let rolled_back = merge_core_files_rebuild_with_caps(
+            StreamType::Logs,
+            &as_inputs(&mixed_inputs),
+            &latest_schema,
+            &[],
+            &[],
+            BatchCaps {
+                force_source_derivation: true,
+                merge_type_policy_override: Some(MergeTypePolicy::Legacy),
+                ..BatchCaps::default()
+            },
+        )
+        .unwrap();
+        assert!(!rolled_back.terms_from_columns);
+        let rolled_back_reader = open_merged(&rolled_back);
+        let ratio = as_string_array(&rolled_back_reader.read_docs_column("ratio").unwrap()).unwrap();
+        assert_eq!(
+            (0..ratio.len()).map(|row| ratio.value(row)).collect::<Vec<_>>(),
+            vec!["2.5", "1.5"]
+        );
+        let old_source: serde_json::Value = serde_json::from_str(
+            rolled_back_reader.read_source(&[0]).unwrap().value(0),
+        )
+        .unwrap();
+        let canary_source: serde_json::Value = serde_json::from_str(
+            rolled_back_reader.read_source(&[1]).unwrap().value(0),
+        )
+        .unwrap();
+        assert_eq!(old_source.get("ratio"), Some(&serde_json::json!(2.5)));
+        assert_eq!(canary_source.get("ratio"), Some(&serde_json::json!("1.5")));
+        assert_eq!(
+            matching_docs(&rolled_back_reader, &tagged_numeric("ratio", "2.5")),
+            vec![0]
+        );
+        assert_eq!(
+            matching_docs(&rolled_back_reader, &exact("ratio", "1.5")),
+            vec![1]
+        );
+        assert_eq!(matching_docs(&rolled_back_reader, &key_exists("ratio")), vec![0, 1]);
+
+        // A later all-legacy generation is byte-semantically stable: terms,
+        // postings, docs columns and each row's `_source` all reproduce.
+        let rolled_back_pair = (
+            bytes::Bytes::from(rolled_back.output.to_bytes().unwrap()),
+            rolled_back.index.clone().map(bytes::Bytes::from),
+        );
+        let next_inputs = vec![("rolled-back.vix".to_string(), rolled_back_pair)];
+        let next = merge_core_files_rebuild_with_caps(
+            StreamType::Logs,
+            &as_inputs(&next_inputs),
+            &latest_schema,
+            &[],
+            &[],
+            BatchCaps {
+                force_source_derivation: true,
+                merge_type_policy_override: Some(MergeTypePolicy::Legacy),
+                ..BatchCaps::default()
+            },
+        )
+        .unwrap();
+        assert_core_files_equivalent(
+            &rolled_back_reader,
+            &open_merged(&next),
+            "mixed canary/legacy rollback after another legacy generation",
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_legacy_policy_keeps_non_finite_float_to_string_behavior() {
+        let file = build_index_off_core_file(
+            vec![
+                Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+                Field::new("ratio", DataType::Float64, true),
+            ],
+            vec![
+                Arc::new(Int64Array::from(vec![100, 90, 80])),
+                Arc::new(Float64Array::from(vec![
+                    Some(f64::NAN),
+                    Some(f64::INFINITY),
+                    Some(f64::NEG_INFINITY),
+                ])),
+            ],
+        );
+        let latest_schema = Schema::new(vec![
+            Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+            Field::new("ratio", DataType::Utf8, true),
+        ]);
+        let inputs = vec![("typed.vix".to_string(), file)];
+
+        let rebuilt = merge_core_files_rebuild_with_caps(
+            StreamType::Logs,
+            &as_inputs(&inputs),
+            &latest_schema,
+            &[],
+            &[],
+            BatchCaps {
+                merge_type_policy_override: Some(MergeTypePolicy::Legacy),
+                ..BatchCaps::default()
+            },
+        )
+        .unwrap();
+        assert!(!rebuilt.terms_from_columns);
+        let reader = open_merged(&rebuilt);
+        let ratio = as_string_array(&reader.read_docs_column("ratio").unwrap()).unwrap();
+        assert_eq!(
+            (0..ratio.len()).map(|row| ratio.value(row)).collect::<Vec<_>>(),
+            vec!["NaN", "inf", "-inf"],
         );
     }
 
