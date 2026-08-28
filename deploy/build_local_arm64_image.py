@@ -37,6 +37,7 @@ EXPECTED_ZIG_VERSION = "0.16.0"
 @dataclasses.dataclass(frozen=True)
 class RepositoryState:
     commit: str
+    version: str
     status: str
     fingerprint: str
 
@@ -113,6 +114,7 @@ def sha256_tree(root: Path) -> str:
 
 def repository_state() -> RepositoryState:
     commit = output(["git", "rev-parse", "HEAD"])
+    version = output(["git", "describe", "--tags", "--abbrev=0"])
     status_bytes = output_bytes(
         ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"]
     )
@@ -123,6 +125,8 @@ def repository_state() -> RepositoryState:
 
     digest = hashlib.sha256()
     digest.update(commit.encode())
+    digest.update(b"\0version\0")
+    digest.update(version.encode())
     digest.update(b"\0status\0")
     digest.update(status_bytes)
     digest.update(b"\0diff\0")
@@ -140,6 +144,7 @@ def repository_state() -> RepositoryState:
 
     return RepositoryState(
         commit=commit,
+        version=version,
         status=status_bytes.replace(b"\0", b"\n").decode(errors="replace").strip(),
         fingerprint=digest.hexdigest(),
     )
@@ -151,8 +156,10 @@ def validate_repository_unchanged(initial: RepositoryState) -> None:
         raise RuntimeError(
             "repository changed while the build was running; refusing to package a "
             "mixed-source binary\n"
-            f"initial commit={initial.commit} fingerprint={initial.fingerprint}\n"
-            f"current commit={current.commit} fingerprint={current.fingerprint}\n"
+            f"initial commit={initial.commit} version={initial.version} "
+            f"fingerprint={initial.fingerprint}\n"
+            f"current commit={current.commit} version={current.version} "
+            f"fingerprint={current.fingerprint}\n"
             f"current status:\n{current.status or '(clean)'}"
         )
 
@@ -201,7 +208,7 @@ def validate_host() -> None:
     print("toolchain: " + ", ".join(versions), flush=True)
 
 
-def validate_binary(commit: str) -> None:
+def validate_binary(commit: str, version: str) -> None:
     if not BINARY.is_file():
         raise RuntimeError(f"cross-build did not create expected binary: {BINARY}")
 
@@ -209,7 +216,11 @@ def validate_binary(commit: str) -> None:
     if "ELF 64-bit" not in description or "ARM aarch64" not in description:
         raise RuntimeError(f"expected an ARM64 Linux ELF, got: {description}")
 
-    for needle, description_text in (("mimalloc", "mimalloc"), (commit, "Git commit")):
+    for needle, description_text in (
+        ("mimalloc", "mimalloc"),
+        (commit, "Git commit"),
+        (version, "Git version"),
+    ):
         result = subprocess.run(
             ["grep", "-a", "-q", needle, str(BINARY)],
             cwd=REPO,
@@ -230,6 +241,7 @@ def validate_binary(commit: str) -> None:
 def build_runtime_image(
     image: str,
     commit: str,
+    version: str,
     web_dist_sha256: str,
     pre_tag_check: Callable[[], None],
 ) -> None:
@@ -251,6 +263,8 @@ def build_runtime_image(
                     "linux/arm64",
                     "--build-arg",
                     f"GIT_COMMIT={commit}",
+                    "--build-arg",
+                    f"GIT_VERSION={version}",
                     "--build-arg",
                     f"BINARY_SHA256={binary_sha256}",
                     "--build-arg",
@@ -275,6 +289,7 @@ def build_runtime_image(
             for label, expected in (
                 ("git_commit", commit),
                 ("org.opencontainers.image.revision", commit),
+                ("org.opencontainers.image.version", version),
                 ("org.opencontainers.image.openobserve.binary.sha256", binary_sha256),
                 (
                     "org.opencontainers.image.openobserve.web-dist.sha256",
@@ -414,6 +429,9 @@ def main() -> int:
         )
 
     commit = initial_state.commit
+    version = initial_state.version
+    compile_jobs = max(1, os.cpu_count() or 1)
+    print(f"compile jobs={compile_jobs} (all detected logical CPUs)", flush=True)
     run(["npm", "ci", "--no-audit", "--no-fund"], cwd=WEB)
     web_env = os.environ.copy()
     web_env["NODE_OPTIONS"] = "--max-old-space-size=8192"
@@ -422,15 +440,29 @@ def main() -> int:
     web_dist_sha256 = sha256_tree(WEB / "dist")
     print(f"web/dist sha256={web_dist_sha256}", flush=True)
 
-    # The build script embeds the current Git SHA/date. Cleaning only the
-    # metadata and web crates prevents Cargo from reusing an old commit or UI
-    # while preserving the expensive dependency graph and Kache.
-    run(["cargo", "clean", "-p", "config", "-p", "web", "--target", TARGET])
+    # Force the current UI into the binary. Git metadata does not need a clean:
+    # config/build.rs tracks the explicit commit/tag environment below, so a
+    # new commit invalidates only that small crate and its dependents.
+    run(
+        [
+            "cargo",
+            "clean",
+            "-p",
+            "web",
+            "--profile",
+            PROFILE,
+            "--target",
+            TARGET,
+        ]
+    )
     build_env = os.environ.copy()
     build_env.update(
         {
             "CARGO_INCREMENTAL": "0",
+            "CARGO_BUILD_JOBS": str(compile_jobs),
             "KACHE_MAX_SIZE": "150GiB",
+            "OPENOBSERVE_BUILD_GIT_COMMIT": commit,
+            "OPENOBSERVE_BUILD_GIT_VERSION": version,
         }
     )
     run(
@@ -451,14 +483,14 @@ def main() -> int:
 
     validate_repository_unchanged(initial_state)
     validate_web_dist_unchanged(web_dist_sha256)
-    validate_binary(commit)
+    validate_binary(commit, version)
     run(["kache", "stats"])
 
     def pre_tag_check() -> None:
         validate_repository_unchanged(initial_state)
         validate_web_dist_unchanged(web_dist_sha256)
 
-    build_runtime_image(args.image, commit, web_dist_sha256, pre_tag_check)
+    build_runtime_image(args.image, commit, version, web_dist_sha256, pre_tag_check)
     return 0
 
 

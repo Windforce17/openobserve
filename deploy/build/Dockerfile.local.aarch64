@@ -8,6 +8,7 @@ ARG RUNTIME_IMAGE=gcr.io/distroless/cc-debian13:latest-arm64@sha256:abd48bd7141f
 FROM --platform=$TARGETPLATFORM ${RUNTIME_IMAGE}
 
 ARG GIT_COMMIT
+ARG GIT_VERSION
 ARG BINARY_SHA256
 ARG WEB_DIST_SHA256
 
@@ -16,6 +17,7 @@ COPY GIT_COMMIT /GIT_COMMIT
 
 LABEL git_commit=$GIT_COMMIT \
       org.opencontainers.image.revision=$GIT_COMMIT \
+      org.opencontainers.image.version=$GIT_VERSION \
       org.opencontainers.image.source="https://github.com/Windforce17/openobserve" \
       org.opencontainers.image.openobserve.binary.sha256=$BINARY_SHA256 \
       org.opencontainers.image.openobserve.web-dist.sha256=$WEB_DIST_SHA256

@@ -1,0 +1,4 @@
+# `rust-embed-for-web` reads this tree from a proc macro. Rustc does not report
+# those filesystem reads, so Kache must include the generated UI explicitly in
+# the `web` crate's cache key to prevent restoring an ELF with stale assets.
+extra_inputs = ["../../web/dist"]
