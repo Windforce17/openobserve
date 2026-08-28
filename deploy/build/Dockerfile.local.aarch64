@@ -1,0 +1,24 @@
+# syntax=docker/dockerfile:1.7
+
+# This Dockerfile never compiles or installs anything. The build context must
+# contain an ARM64 Linux ELF named `openobserve` and a matching `GIT_COMMIT`.
+# The pinned image is the same distroless Debian 13 family used by the normal
+# ARM64 release image, without a package manager or shell in the final image.
+ARG RUNTIME_IMAGE=gcr.io/distroless/cc-debian13:latest-arm64@sha256:abd48bd7141fd6f41c2c7d33bea045c860940e53d9854a3c5bd702f7aa8adbec
+FROM --platform=$TARGETPLATFORM ${RUNTIME_IMAGE}
+
+ARG GIT_COMMIT
+ARG BINARY_SHA256
+ARG WEB_DIST_SHA256
+
+COPY --chmod=0755 openobserve /openobserve
+COPY GIT_COMMIT /GIT_COMMIT
+
+LABEL git_commit=$GIT_COMMIT \
+      org.opencontainers.image.revision=$GIT_COMMIT \
+      org.opencontainers.image.source="https://github.com/Windforce17/openobserve" \
+      org.opencontainers.image.openobserve.binary.sha256=$BINARY_SHA256 \
+      org.opencontainers.image.openobserve.web-dist.sha256=$WEB_DIST_SHA256
+
+STOPSIGNAL SIGTERM
+CMD ["/openobserve"]
