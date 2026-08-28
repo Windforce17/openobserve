@@ -51,7 +51,10 @@ use crate::{
         db,
         ingestion::{TriggerAlertData, evaluate_trigger, get_write_partition_key, write_file},
         metadata::{MetadataItem, MetadataType, distinct_values::DvItem, write},
-        schema::{check_for_schema, stream_schema_exists},
+        schema::{
+            CanonicalizationSummary, canonicalize_record_into, check_for_schema,
+            stream_schema_exists,
+        },
         self_reporting::report_request_usage_stats,
     },
 };
@@ -773,6 +776,7 @@ async fn write_logs(
         .clone()
         .with_metadata(HashMap::new());
     let schema_key = latest_schema.hash_key();
+    let canonical_schema = stream_schema_map.get(stream_name).unwrap();
     // use latest schema as schema key
     // use inferred schema as record schema
     let rec_schema = match infer_schema {
@@ -786,8 +790,17 @@ async fn write_logs(
     let mut write_buf: HashMap<String, SchemaRecords> = HashMap::new();
     // buffered but not durable: accounted on `status` only after `write_file`
     let mut pending = PendingRecords::new(status);
+    let mut canonical_summary = CanonicalizationSummary::default();
 
     for (timestamp, mut record_val) in json_data {
+        if cfg.common.ingest_canonical_schema {
+            canonicalize_record_into(
+                StreamType::Logs,
+                canonical_schema,
+                &mut record_val,
+                &mut canonical_summary,
+            );
+        }
         let doc_id = match record_doc_id(&record_val) {
             Ok(doc_id) => doc_id,
             Err(e) => {
@@ -807,7 +820,9 @@ async fn write_logs(
         };
 
         // validate record
-        if let Some(delta) = schema_evolution.types_delta.as_ref() {
+        if !cfg.common.ingest_canonical_schema
+            && let Some(delta) = schema_evolution.types_delta.as_ref()
+        {
             let ret_val = if !schema_evolution.is_schema_changed {
                 cast_to_type(&mut record_val, delta.to_owned())
             } else {
@@ -927,6 +942,19 @@ async fn write_logs(
 
         // buffered only — success is accounted after the durable write
         pending.push(doc_id);
+    }
+
+    canonical_summary.flush_metrics(StreamType::Logs);
+    if canonical_summary.nulled > 0 {
+        let failure = canonical_summary.first_failure.as_ref().unwrap();
+        log::warn!(
+            "[LOGS] canonical schema normalization for {org_id}/{stream_name}: converted {} value(s), nulled {} failed value(s); first failure field={:?}, source_type={}, target_type={}",
+            canonical_summary.converted,
+            canonical_summary.nulled,
+            failure.field,
+            failure.source_type,
+            failure.target_type,
+        );
     }
 
     // write data to wal

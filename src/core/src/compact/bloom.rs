@@ -346,6 +346,7 @@ async fn load_file_blooms(
         // a .vix FileMeta's compressed_size is the exact DATA-object size
         size: file.meta.compressed_size as u64,
         handle: handle.clone(),
+        cancel: None,
     });
     // v3 split: the per-file bloom blob (and the dictionary the backfill
     // streams) live in the `.vxi` SIDECAR, fetched by range. The pending
@@ -361,6 +362,7 @@ async fn load_file_blooms(
                     location: object_store::path::Path::from(sidecar_key.as_str()),
                     size: file.meta.index_size as u64,
                     handle,
+                    cancel: None,
                 }) as Arc<dyn vortex_index::VixRangeSource>
             });
     let bloom_fields = bloom_fields.to_vec();
@@ -561,11 +563,8 @@ mod tests {
 
     /// Open one built (data, sidecar) pair.
     fn open_pair(pair: (Vec<u8>, Option<Vec<u8>>)) -> VixReader {
-        VixReader::open_with_index(
-            bytes::Bytes::from(pair.0),
-            pair.1.map(bytes::Bytes::from),
-        )
-        .unwrap()
+        VixReader::open_with_index(bytes::Bytes::from(pair.0), pair.1.map(bytes::Bytes::from))
+            .unwrap()
     }
 
     /// A `.vix` with no `bloom` blob — the shape this path backfills.
@@ -839,8 +838,7 @@ mod tests {
             COMPOSITE_BLOOM_FIELD, COMPOSITE_GUARD_PROBES, composite_guard_key, composite_value_key,
         };
 
-        let reader =
-            open_pair(backfill_file(&["trace-a", "trace-b"]));
+        let reader = open_pair(backfill_file(&["trace-a", "trace-b"]));
         // no per-stream bloom fields at all — the composite alone builds
         let blooms = blooms_from_dictionary(&reader, &[], 0.001, true, "unit-test").unwrap();
         assert_eq!(blooms.len(), 1);
@@ -885,8 +883,7 @@ mod tests {
         use vortex_index::bloom::COMPOSITE_BLOOM_FIELD;
 
         // a blob built WITHOUT composite (the pre-.95 shape)
-        let reader =
-            open_pair(bloom_blob_file(&["trace-a", "trace-b"]));
+        let reader = open_pair(bloom_blob_file(&["trace-a", "trace-b"]));
         assert!(reader.has_file_blooms());
 
         let budget = std::sync::atomic::AtomicI64::new(1);
@@ -927,7 +924,7 @@ mod tests {
     /// section is data-driven, never orphaned by a config flip.
     #[test]
     fn blob_load_keeps_the_composite_section() {
-        let mut writer = {
+        let writer = {
             use std::sync::Arc;
 
             use arrow::{

@@ -391,6 +391,30 @@ pub async fn merge(
     schema: &Schema,
     min_ts: Option<i64>,
 ) -> Result<Option<(Schema, Vec<Field>)>> {
+    merge_with_policy(org_id, stream_name, stream_type, schema, min_ts, false).await
+}
+
+/// Watched/CAS schema merge used by canonical ingestion. Existing field types
+/// are immutable; only absent fields are appended. Consequently the first
+/// successful registration wins concurrent new-field races.
+pub async fn merge_pinned(
+    org_id: &str,
+    stream_name: &str,
+    stream_type: StreamType,
+    schema: &Schema,
+    min_ts: Option<i64>,
+) -> Result<Option<(Schema, Vec<Field>)>> {
+    merge_with_policy(org_id, stream_name, stream_type, schema, min_ts, true).await
+}
+
+async fn merge_with_policy(
+    org_id: &str,
+    stream_name: &str,
+    stream_type: StreamType,
+    schema: &Schema,
+    min_ts: Option<i64>,
+    pin_existing_types: bool,
+) -> Result<Option<(Schema, Vec<Field>)>> {
     let stream_name = stream_name.trim();
     if stream_name.is_empty() {
         return Ok(None);
@@ -453,7 +477,11 @@ pub async fn merge(
                     };
                     // merge schema
                     let (is_schema_changed, field_datatype_delta, merged_fields) =
-                        get_merge_schema_changes(latest_schema, &inferred_schema);
+                        if pin_existing_types {
+                            get_merge_schema_changes_pinned(latest_schema, &inferred_schema)
+                        } else {
+                            get_merge_schema_changes(latest_schema, &inferred_schema)
+                        };
 
                     if !is_schema_changed {
                         tx.send(Some((latest_schema.clone(), field_datatype_delta)))
@@ -503,6 +531,48 @@ pub async fn merge(
     )
     .await?;
     rx.await.map_err(|e| Error::Message(e.to_string()))
+}
+
+pub fn get_merge_schema_changes_pinned(
+    schema: &Schema,
+    inferred_schema: &Schema,
+) -> (bool, Vec<Field>, Vec<Field>) {
+    let mut is_schema_changed = false;
+    let mut field_datatype_delta = Vec::new();
+    let mut merged_fields = schema.fields().iter().collect::<Vec<_>>();
+    let mut fields_by_name = hashbrown::HashMap::with_capacity(merged_fields.len());
+    for (index, field) in merged_fields.iter().enumerate() {
+        fields_by_name.insert(field.name(), index);
+    }
+
+    for candidate in &inferred_schema.fields {
+        match fields_by_name.get(candidate.name()) {
+            None => {
+                is_schema_changed = true;
+                merged_fields.push(candidate);
+                fields_by_name.insert(candidate.name(), merged_fields.len() - 1);
+            }
+            Some(index) => {
+                let existing = &merged_fields[*index];
+                if existing.data_type() != candidate.data_type() {
+                    let mut metadata = existing.metadata().clone();
+                    metadata.insert("zo_cast".to_owned(), true.to_string());
+                    field_datatype_delta.push(existing.as_ref().clone().with_metadata(metadata));
+                }
+            }
+        }
+    }
+
+    if !is_schema_changed {
+        (false, field_datatype_delta, Vec::new())
+    } else {
+        let mut fields = merged_fields
+            .into_iter()
+            .map(|field| field.as_ref().clone())
+            .collect::<Vec<_>>();
+        fields.sort_by(|left, right| left.name().cmp(right.name()));
+        (true, field_datatype_delta, fields)
+    }
 }
 
 pub async fn update_setting(
@@ -705,8 +775,55 @@ pub fn get_merge_schema_changes(
 pub struct SchemaCache {
     schema: SchemaRef,
     fields_map: HashMap<String, usize>,
+    #[serde(skip)]
+    canonical_plan: Arc<[CanonicalType]>,
     hash_key: String,
     is_derived: bool,
+}
+
+/// Compact JSON-ingest operation aligned with `SchemaCache::schema.fields()`.
+/// It avoids cloning `Field`s or walking a stream's full schema per record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CanonicalType {
+    Boolean,
+    Signed(u8),
+    Unsigned(u8),
+    Float(u8),
+    String,
+    Unsupported,
+}
+
+impl CanonicalType {
+    fn from_data_type(data_type: &DataType) -> Self {
+        match data_type {
+            DataType::Boolean => Self::Boolean,
+            DataType::Int8 => Self::Signed(8),
+            DataType::Int16 => Self::Signed(16),
+            DataType::Int32 => Self::Signed(32),
+            DataType::Int64 => Self::Signed(64),
+            DataType::UInt8 => Self::Unsigned(8),
+            DataType::UInt16 => Self::Unsigned(16),
+            DataType::UInt32 => Self::Unsigned(32),
+            DataType::UInt64 => Self::Unsigned(64),
+            DataType::Float16 => Self::Float(16),
+            DataType::Float32 => Self::Float(32),
+            DataType::Float64 => Self::Float(64),
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Self::String,
+            DataType::Dictionary(_, value_type) => Self::from_data_type(value_type),
+            _ => Self::Unsupported,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Boolean => "boolean",
+            Self::Signed(_) => "signed_integer",
+            Self::Unsigned(_) => "unsigned_integer",
+            Self::Float(_) => "float",
+            Self::String => "string",
+            Self::Unsupported => "unsupported",
+        }
+    }
 }
 
 impl SchemaCache {
@@ -722,9 +839,16 @@ impl SchemaCache {
             .enumerate()
             .map(|(i, f)| (f.name().to_owned(), i))
             .collect();
+        let canonical_plan = schema
+            .fields()
+            .iter()
+            .map(|field| CanonicalType::from_data_type(field.data_type()))
+            .collect::<Vec<_>>()
+            .into();
         Self {
             schema,
             fields_map,
+            canonical_plan,
             hash_key,
             is_derived: false,
         }
@@ -752,6 +876,13 @@ impl SchemaCache {
             .and_then(|i| self.schema.fields().get(*i))
     }
 
+    pub fn canonical_type(&self, field_name: &str) -> Option<CanonicalType> {
+        self.fields_map
+            .get(field_name)
+            .and_then(|index| self.canonical_plan.get(*index))
+            .copied()
+    }
+
     pub fn size(&self) -> usize {
         let mut size = std::mem::size_of::<SchemaRef>() + self.schema.size();
         size += std::mem::size_of::<HashMap<String, usize>>();
@@ -760,6 +891,7 @@ impl SchemaCache {
             size += std::mem::size_of::<usize>();
         }
         size += std::mem::size_of::<String>() + self.hash_key.len();
+        size += std::mem::size_of::<CanonicalType>() * self.canonical_plan.len();
         size
     }
 
@@ -774,6 +906,7 @@ impl MemorySize for SchemaCache {
             + self.schema.size()
             + self.fields_map.mem_size()
             + self.hash_key.mem_size()
+            + std::mem::size_of::<CanonicalType>() * self.canonical_plan.len()
     }
 }
 
@@ -857,6 +990,72 @@ pub fn is_widening_conversion(from: &DataType, to: &DataType) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pinned_merge_keeps_existing_type_and_appends_new_fields() {
+        let existing = Schema::new(vec![Field::new("value", DataType::Int64, true)]);
+        let candidate = Schema::new(vec![
+            Field::new("value", DataType::Utf8, true),
+            Field::new("new", DataType::Boolean, true),
+        ]);
+
+        let (changed, delta, merged) = get_merge_schema_changes_pinned(&existing, &candidate);
+        assert!(changed);
+        assert_eq!(delta.len(), 1);
+        assert_eq!(delta[0].data_type(), &DataType::Int64);
+        assert_eq!(
+            delta[0].metadata().get("zo_cast").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            merged
+                .iter()
+                .find(|field| field.name() == "value")
+                .unwrap()
+                .data_type(),
+            &DataType::Int64
+        );
+        assert_eq!(
+            merged
+                .iter()
+                .find(|field| field.name() == "new")
+                .unwrap()
+                .data_type(),
+            &DataType::Boolean
+        );
+    }
+
+    #[test]
+    fn schema_cache_canonical_plan_is_index_aligned() {
+        let cache = SchemaCache::new(Schema::new(vec![
+            Field::new("text", DataType::Utf8View, true),
+            Field::new("small", DataType::Int16, true),
+            Field::new(
+                "nested",
+                DataType::List(Arc::new(Field::new_list_field(DataType::Utf8, true))),
+                true,
+            ),
+            Field::new(
+                "dictionary",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                true,
+            ),
+        ]));
+        assert_eq!(cache.canonical_type("text"), Some(CanonicalType::String));
+        assert_eq!(
+            cache.canonical_type("small"),
+            Some(CanonicalType::Signed(16))
+        );
+        assert_eq!(
+            cache.canonical_type("nested"),
+            Some(CanonicalType::Unsupported)
+        );
+        assert_eq!(
+            cache.canonical_type("dictionary"),
+            Some(CanonicalType::String)
+        );
+        assert_eq!(cache.canonical_type("missing"), None);
+    }
 
     #[test]
     fn test_is_widening_conversion() {

@@ -43,7 +43,7 @@
 //! the `docs` blob (v2 all-present-columns, DESIGN §2).
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet},
     sync::Arc,
 };
 
@@ -57,23 +57,21 @@ use arrow::{
     datatypes::{DataType, Field, Schema, SchemaRef},
     record_batch::RecordBatch,
 };
+use rapidhash::fast::GlobalState;
 
 use crate::{
     container::{
         BLOB_TAG_BLOOM, BLOB_TAG_DICT, BLOB_TAG_DICT_BLOCKS, BLOB_TAG_PLIST, BLOB_TAG_STATS,
         BLOB_TAG_TERMS, BLOB_TYPE_BLOOM, BLOB_TYPE_DICT, BLOB_TYPE_DICT_BLOCKS, BLOB_TYPE_PLIST,
-        BLOB_TYPE_STATS, BLOB_TYPE_TERMS,
-        DICT_LAYOUT_BLOCKS, DocsBlobEncoder, FIELD_TYPE_BLOOM, FIELD_TYPE_CS, FIELD_TYPE_FTS,
-        FIELD_TYPE_TERM, FieldEntry, KEY_LAYOUT_FID_V2, PROP_COLUMNS, PROP_COLUMNS_COMPLETE,
-        PROP_DICT_LAYOUT,
-        PROP_FIELDS, PROP_KEY_LAYOUT, PROP_OVERSIZE_SKIPS, PROP_PARTIAL_FIELDS,
-        PROP_PLIST_MIN_DOCS, PROP_ROW_COUNT, PROP_ROW_GROUP_SIZE, PROP_ROW_ORDER,
-        PROP_ROW_REGIONS, PROP_TERM_COUNT,
+        BLOB_TYPE_STATS, BLOB_TYPE_TERMS, BlobPart, DICT_LAYOUT_BLOCKS, DocsBlobEncoder,
+        FIELD_TYPE_BLOOM, FIELD_TYPE_CS, FIELD_TYPE_FTS, FIELD_TYPE_TERM, FieldEntry,
+        KEY_LAYOUT_FID_V2, PROP_COLUMNS, PROP_COLUMNS_COMPLETE, PROP_DICT_LAYOUT, PROP_FIELDS,
+        PROP_KEY_LAYOUT, PROP_OVERSIZE_SKIPS, PROP_PARTIAL_FIELDS, PROP_PLIST_MIN_DOCS,
+        PROP_ROW_COUNT, PROP_ROW_GROUP_SIZE, PROP_ROW_ORDER, PROP_ROW_REGIONS, PROP_TERM_COUNT,
         PROP_TOKENIZER, PROP_VERSION, PROP_ZONE_MAP, ROW_ORDER_CONCAT, ROW_ORDER_TS_DESC,
-        TOKENIZER_ID, VIX_FORMAT_VERSION, VixOutput, ZoneEntry, addressable_strategy,
-        finish_streamed_container, write_vortex_blob,
+        TOKENIZER_ID, TermsBlobSpooler, VIX_FORMAT_VERSION, VixOutput, ZoneEntry,
+        addressable_strategy, build_container_parts, finish_streamed_container, write_vortex_blob,
     },
-    container::{BlobPart, TermsBlobSpooler, build_container_parts},
     error::{Result, VixError},
     merge::{self, DocIdMap},
     numeric::{
@@ -85,6 +83,7 @@ use crate::{
     reader::VixReader,
     spill,
     stats::{ColumnStatsFolder, SpliceableStats},
+    term_accumulator::{SortedTermShard, TermAccumulator},
     tokenizer::o2_tokenize,
 };
 
@@ -111,6 +110,9 @@ pub const SOURCE_RENAMED_COL_NAME: &str = "_source_field";
 /// Internal columns: never term-indexed and never given key terms.
 pub(crate) const NON_INDEXED_COLS: [&str; 3] =
     [TIMESTAMP_COL_NAME, ID_COL_NAME, ORIGINAL_DATA_COL_NAME];
+
+type FastHashMap<K, V> = std::collections::HashMap<K, V, GlobalState>;
+type FastHashSet<K> = std::collections::HashSet<K, GlobalState>;
 
 fn is_string_family(data_type: &DataType) -> bool {
     matches!(
@@ -174,7 +176,7 @@ fn hash_bloom_only_column_values(
     column: &ArrowArrayRef,
     max_raw_term_len: usize,
     scratch: &mut Vec<u8>,
-    sink: &mut HashSet<u64>,
+    sink: &mut FastHashSet<u64>,
 ) {
     if let Some(strings) = StringColumn::try_new(column.as_ref()) {
         for row in 0..column.len() {
@@ -184,7 +186,8 @@ fn hash_bloom_only_column_values(
             if value.len() > max_raw_term_len {
                 continue;
             }
-            if let Some(k) = crate::bloom::composite_value_key(bloom_name, value.as_bytes(), scratch)
+            if let Some(k) =
+                crate::bloom::composite_value_key(bloom_name, value.as_bytes(), scratch)
             {
                 sink.insert(crate::sbbf::hash_value(k));
             }
@@ -252,7 +255,7 @@ fn hash_bloom_only_source_values(
 /// writer's inline absorption uses.
 pub struct BloomOnlyHasher {
     /// fid -> (bloom field name, this worker's hash set)
-    sets: HashMap<u16, (String, HashSet<u64>)>,
+    sets: FastHashMap<u16, (String, FastHashSet<u64>)>,
     max_raw_term_len: usize,
     scratch: Vec<u8>,
 }
@@ -333,11 +336,7 @@ impl BloomOnlyHasher {
 
     /// Hash the named tracked fields' values out of `_source` (#51c-d — the
     /// fields with no docs column in this input).
-    pub fn hash_source(
-        &mut self,
-        source: &ArrowArrayRef,
-        fields: &[String],
-    ) -> anyhow::Result<()> {
+    pub fn hash_source(&mut self, source: &ArrowArrayRef, fields: &[String]) -> anyhow::Result<()> {
         let wanted: Vec<(String, u16)> = self
             .sets
             .iter()
@@ -374,7 +373,7 @@ pub struct RawValueSink<'a> {
     name: &'a str,
     max_raw_term_len: usize,
     scratch: &'a mut Vec<u8>,
-    sink: &'a mut HashSet<u64>,
+    sink: &'a mut FastHashSet<u64>,
 }
 
 impl RawValueSink<'_> {
@@ -730,29 +729,26 @@ pub struct VixWriter {
     store_original: bool,
     /// Term-indexed field names sorted by name; the index is the field id.
     term_fields: Vec<String>,
-    term_field_ids: HashMap<String, u16>,
+    term_field_ids: FastHashMap<String, u16>,
     /// Term-indexed fields that also emit full-text tokens.
-    fts_fields: HashSet<String>,
+    fts_fields: FastHashSet<String>,
     /// Term fields with non-string (canonical tagged) value terms — kept out
     /// of the composite bloom coverage (see `new_inner`).
-    non_string_term_fields: HashSet<String>,
+    non_string_term_fields: FastHashSet<String>,
     /// #52 bloom-only fields: `fid -> (name, distinct composite-value-key
     /// hashes)`. Values observed at push time (deduped here so bloom sizing
     /// stays exact); folded into the bloom accumulation at finish. These
     /// fids never reach `self.terms`.
-    bloom_only: HashMap<u16, (String, HashSet<u64>)>,
+    bloom_only: FastHashMap<u16, (String, FastHashSet<u64>)>,
     /// Column-store fields present in the schema (`_timestamp` excluded).
     cs_fields: BTreeSet<String>,
     /// Arrow schema of the `docs` blob.
     docs_schema: SchemaRef,
-    /// Composite term -> ascending doc ids (deduped on push).
-    terms: BTreeMap<Vec<u8>, Vec<u32>>,
+    /// Field-sharded term -> ascending doc ids (deduped on push).
+    terms: TermAccumulator,
     /// Reusable numeric-tag buffer (`\x01{canonical}`) fed to the layout
     /// composite builder.
     tag_scratch: Vec<u8>,
-    /// Estimated resident bytes of `terms` (spill trigger; see
-    /// [`VixWriterOptions::term_spill_bytes`]).
-    terms_bytes: usize,
     /// External-sort state: sorted runs already drained from `terms`.
     /// `None` until the first spill (and always `None` when
     /// [`VixWriterOptions::term_spill_dir`] is unset).
@@ -803,6 +799,17 @@ pub struct VixWriter {
     /// misaddress the stored rows.
     index_only_rows: Option<u64>,
     row_count: u64,
+    /// Optional caller-known maximum for this writer's final row count. This
+    /// is an internal performance hint, not a merge-size limit. It lets
+    /// AUTO bloom-only fields demote as soon as their final ratio is already
+    /// mathematically guaranteed, instead of retaining doomed postings until
+    /// `finish`. A bound is only a performance hint; final AUTO semantics
+    /// still use the actual row count.
+    auto_demote_expected_max_rows: Option<u64>,
+    /// Whether the expected-maximum hint has already caused a demotion. If a
+    /// caller later exceeds its bound, finishing must fail rather than keep a
+    /// field demoted under a ratio that was not actually satisfied.
+    auto_demoted_early: bool,
     /// `_timestamp` range of the stored rows (`None` until the first row) —
     /// reported through [`VixWriterStats`], the authoritative FileMeta range.
     ts_range: Option<(i64, i64)>,
@@ -956,21 +963,21 @@ impl VixWriter {
                 ));
             }
         }
-        let term_field_ids: HashMap<String, u16> = if init_error.is_none() {
+        let term_field_ids: FastHashMap<String, u16> = if init_error.is_none() {
             term_fields
                 .iter()
                 .enumerate()
                 .map(|(id, name)| (name.clone(), id as u16))
                 .collect()
         } else {
-            HashMap::new()
+            FastHashMap::default()
         };
 
         // fts marking applies to string-family fields only: tokenization is
         // a text concept. A numeric/bool field named in `fts_field_names`
         // stays a plain term field (canonical value terms), matching the
         // source-driven path where non-string values never tokenize.
-        let fts_fields: HashSet<String> = opts
+        let fts_fields: FastHashSet<String> = opts
             .fts_field_names
             .iter()
             .filter(|name| {
@@ -988,7 +995,7 @@ impl VixWriter {
         // raw bytes, so a covered-but-canonical field would read every miss
         // as "definitely not" and wrongly drop files (`status = 200`).
         // Uncovered ⇒ guards miss ⇒ "no info" ⇒ keep + scan, the safe side.
-        let non_string_term_fields: HashSet<String> = term_field_ids
+        let non_string_term_fields: FastHashSet<String> = term_field_ids
             .keys()
             .filter(|name| {
                 schema
@@ -1002,7 +1009,7 @@ impl VixWriter {
         // family − never-list − fts. Kept in the fields table (they hold
         // their field-id slot and emit KEY terms) but typed "bloom", and
         // their raw values bypass the dictionary entirely.
-        let bloom_only: HashMap<u16, (String, HashSet<u64>)> = opts
+        let bloom_only: FastHashMap<u16, (String, FastHashSet<u64>)> = opts
             .bloom_only_field_names
             .iter()
             .filter(|name| {
@@ -1013,7 +1020,7 @@ impl VixWriter {
                         .field_with_name(name)
                         .is_ok_and(|field| is_string_family(field.data_type()))
             })
-            .map(|name| (term_field_ids[name], (name.clone(), HashSet::new())))
+            .map(|name| (term_field_ids[name], (name.clone(), FastHashSet::default())))
             .collect();
 
         // The `docs` blob schema (v2, DESIGN §2 — ALL present fields as
@@ -1046,6 +1053,7 @@ impl VixWriter {
             docs_fields.push(Field::new(ORIGINAL_DATA_COL_NAME, DataType::Utf8, true));
         }
         let docs_schema = Arc::new(Schema::new(docs_fields));
+        let term_field_count = term_fields.len();
 
         Self {
             opts,
@@ -1057,9 +1065,8 @@ impl VixWriter {
             bloom_only,
             cs_fields,
             docs_schema,
-            terms: BTreeMap::new(),
+            terms: TermAccumulator::new(term_field_count),
             tag_scratch: Vec::new(),
-            terms_bytes: 0,
             term_spill: None,
             partial_fields,
             oversize_skips: BTreeMap::new(),
@@ -1071,6 +1078,8 @@ impl VixWriter {
             encoded_run: None,
             index_only_rows: None,
             row_count: 0,
+            auto_demote_expected_max_rows: None,
+            auto_demoted_early: false,
             ts_range: None,
             init_error,
             scratch: Vec::new(),
@@ -1078,6 +1087,28 @@ impl VixWriter {
             demoted_fields: BTreeSet::new(),
             skip_ts_guard: false,
         }
+    }
+
+    /// Supply the maximum rows this writer is expected to finish with.
+    ///
+    /// When AUTO bloom-only is enabled, a string field can be demoted early
+    /// once its current distinct count already satisfies the configured
+    /// threshold against this (possibly larger) final denominator. This is
+    /// exact: distinct counts can only increase and the actual row count is
+    /// required not to exceed the bound after an early demotion.
+    pub fn set_expected_max_rows_for_auto_demotion(&mut self, rows: u64) -> anyhow::Result<()> {
+        if self.row_count != 0
+            || self.index_only_rows.is_some()
+            || !self.terms.is_empty()
+            || self.merged_index.is_some()
+        {
+            anyhow::bail!(
+                "expected maximum rows for AUTO bloom-only demotion must be supplied before the \
+                 first writer operation"
+            );
+        }
+        self.auto_demote_expected_max_rows = Some(rows);
+        Ok(())
     }
 
     /// Index one record batch of a core file, together with the
@@ -1487,13 +1518,14 @@ impl VixWriter {
             })
             .cloned()
             .collect();
+        let bloom_only_fids: FastHashSet<u16> = self.bloom_only.keys().copied().collect();
         let merged = merge::merge_indexes(
             inputs,
             doc_maps,
             &self.term_field_ids,
             &bloom_field_names,
             &self.composite_pairs(),
-            &self.bloom_only.keys().copied().collect(),
+            &bloom_only_fids,
             total_rows,
             self.opts.postings_chunk_bytes,
             self.opts.postings_plist_min_docs,
@@ -1645,8 +1677,7 @@ impl VixWriter {
             for &rows in regions {
                 if rows == 0 {
                     return Err(VixError::Writer(
-                        "begin_docs_encoded_run: run_regions carries a zero-row region"
-                            .to_string(),
+                        "begin_docs_encoded_run: run_regions carries a zero-row region".to_string(),
                     )
                     .into());
                 }
@@ -1834,7 +1865,7 @@ impl VixWriter {
         BloomOnlyHasher {
             sets: wanted
                 .iter()
-                .map(|(name, fid)| (*fid, (name.clone(), HashSet::new())))
+                .map(|(name, fid)| (*fid, (name.clone(), FastHashSet::default())))
                 .collect(),
             max_raw_term_len: self.opts.max_raw_term_len,
             scratch: Vec::new(),
@@ -1992,6 +2023,7 @@ impl VixWriter {
             // and zone table advance there); only the doc-id cursor moves.
             self.advance_index_only_cursor(num_rows);
         }
+        self.maybe_auto_demote_bloom_only_early()?;
         self.maybe_spill_terms()?;
         Ok(())
     }
@@ -2320,6 +2352,7 @@ impl VixWriter {
             // and zone table advance there); only the doc-id cursor moves.
             self.advance_index_only_cursor(num_rows);
         }
+        self.maybe_auto_demote_bloom_only_early()?;
         self.maybe_spill_terms()?;
         Ok(())
     }
@@ -2378,35 +2411,70 @@ impl VixWriter {
     /// rebuild keeps its terms and converges at its next merge instead
     /// (input-dictionary AUTO).
     fn auto_demote_bloom_only_at_finish(&mut self, row_count: u64) {
+        self.auto_demote_bloom_only(row_count, "build");
+    }
+
+    /// Use a caller-known final-row maximum to discard value postings
+    /// as soon as AUTO demotion is guaranteed. This is especially valuable
+    /// for unique identifiers: without it, the writer built and sorted a
+    /// near-row-count dictionary only to remove it at finish.
+    fn maybe_auto_demote_bloom_only_early(&mut self) -> Result<()> {
+        let Some(row_upper_bound) = self.auto_demote_expected_max_rows else {
+            return Ok(());
+        };
+        let observed_rows = self.index_only_rows.unwrap_or(self.row_count);
+        if observed_rows > row_upper_bound {
+            if self.auto_demoted_early {
+                return Err(VixError::Writer(format!(
+                    "writer exceeded the expected maximum rows after early AUTO bloom-only \
+                     demotion: observed {observed_rows} rows, expected maximum {row_upper_bound}"
+                )));
+            }
+            // No decision used the hint yet, so discard a bad hint and let
+            // finish evaluate AUTO against the actual row count.
+            self.auto_demote_expected_max_rows = None;
+            return Ok(());
+        }
+        if self.term_spill.is_some() || row_upper_bound == 0 {
+            return Ok(());
+        }
+        let required_distinct = self
+            .opts
+            .bloom_only_min_distinct
+            .max((self.opts.bloom_only_auto_ratio * row_upper_bound as f64).ceil() as u64);
+        if observed_rows < required_distinct {
+            return Ok(());
+        }
+        if self.auto_demote_bloom_only(row_upper_bound, "build-early") > 0 {
+            self.auto_demoted_early = true;
+        }
+        Ok(())
+    }
+
+    /// Demote every currently qualifying field using `ratio_rows` as the
+    /// denominator. Returns the number newly demoted.
+    fn auto_demote_bloom_only(&mut self, ratio_rows: u64, phase: &str) -> usize {
         let ratio = self.opts.bloom_only_auto_ratio;
-        if !self.opts.index_enabled || ratio <= 0.0 || row_count == 0 || self.terms.is_empty() {
-            return;
+        if !self.opts.index_enabled || ratio <= 0.0 || ratio_rows == 0 || self.terms.is_empty() {
+            return 0;
         }
         if self.term_spill.is_some() {
             log::debug!(
                 "vix build: term map spilled; skipping first-encode AUTO bloom-only demotion \
                  (counts would be partial)"
             );
-            return;
+            return 0;
         }
-        // Per-fid distinct value-term counts: keys are field-major, so one
-        // ordered pass counts contiguous runs.
-        let mut counts: Vec<(u16, u64)> = Vec::new();
-        for key in self.terms.keys() {
-            let Some((_, fid)) = crate::query::split_key(key) else {
-                continue;
-            };
-            if fid == KEY_FIELD_ID {
-                continue;
-            }
-            match counts.last_mut() {
-                Some((last, n)) if *last == fid => *n += 1,
-                _ => counts.push((fid, 1)),
-            }
-        }
-        let candidates: Vec<(&str, u64)> = counts
+        let candidates: Vec<(&str, u64)> = self
+            .term_fields
             .iter()
-            .filter_map(|&(fid, distinct)| {
+            .enumerate()
+            .filter_map(|(fid, _name)| {
+                let fid = fid as u16;
+                let distinct = self.terms.field_len(fid) as u64;
+                if distinct == 0 {
+                    return None;
+                }
                 let name = self.term_fields.get(usize::from(fid))?;
                 (!self.fts_fields.contains(name)
                     && !self.non_string_term_fields.contains(name)
@@ -2418,36 +2486,34 @@ impl VixWriter {
             .collect();
         let selected = resolve_auto_bloom_only(
             candidates,
-            row_count,
+            ratio_rows,
             ratio,
             self.opts.bloom_only_min_distinct,
             &self.opts.bloom_only_never,
-            "build",
+            phase,
         );
+        let selected_count = selected.len();
         for name in selected {
             let Some(&fid) = self.term_field_ids.get(&name) else {
                 continue;
             };
-            // Carve [fid, fid+1) out of the map (fid < KEY_FIELD_ID by
-            // construction, so the exclusive bound never reaches the key
-            // terms) and fold the raw values into the bloom set.
-            let lower = fid.to_be_bytes();
-            let upper = (fid + 1).to_be_bytes();
-            let mut demoted = self.terms.split_off(lower.as_slice());
-            let mut rest = demoted.split_off(upper.as_slice());
-            self.terms.append(&mut rest);
+            // Remove the complete field shard and fold its raw values into
+            // the bloom set. No global-map range walk or split is needed.
+            let demoted = self.terms.take_field(fid);
             let mut scratch = std::mem::take(&mut self.scratch);
-            let mut hashes: HashSet<u64> = HashSet::with_capacity(demoted.len());
-            for key in demoted.keys() {
+            let mut hashes: FastHashSet<u64> =
+                FastHashSet::with_capacity_and_hasher(demoted.len(), GlobalState::default());
+            for token in demoted.keys() {
                 // the token IS the raw string value: candidates exclude
                 // fts (tokens) and non-string (tagged canonical) fields
-                if let Some(k) = crate::bloom::composite_value_key(&name, &key[2..], &mut scratch) {
+                if let Some(k) = crate::bloom::composite_value_key(&name, token, &mut scratch) {
                     hashes.insert(crate::sbbf::hash_value(k));
                 }
             }
             self.scratch = scratch;
             self.bloom_only.insert(fid, (name, hashes));
         }
+        selected_count
     }
 
     /// Spill the term map to a sorted run when it crosses the budget —
@@ -2465,7 +2531,7 @@ impl VixWriter {
         } else {
             self.opts.term_spill_bytes
         };
-        if self.terms_bytes < budget || self.terms.is_empty() {
+        if self.terms.estimated_bytes() < budget || self.terms.is_empty() {
             return Ok(());
         }
         if self.term_spill.is_none() {
@@ -2475,7 +2541,6 @@ impl VixWriter {
             .as_mut()
             .expect("created above")
             .write_run(&mut self.terms)?;
-        self.terms_bytes = 0;
         Ok(())
     }
 
@@ -2510,8 +2575,7 @@ impl VixWriter {
                     continue;
                 }
                 // key term: this doc has a value at `key`
-                write_composite(&mut self.scratch, key.as_bytes(), KEY_FIELD_ID);
-                push_term(&mut self.terms, &mut self.terms_bytes, &self.scratch, doc);
+                self.terms.push(KEY_FIELD_ID, key.as_bytes(), doc);
 
                 match value.get_type() {
                     // a JSON string emits its value terms — fts tokens or
@@ -2563,13 +2627,7 @@ impl VixWriter {
                             for token in
                                 o2_tokenize(value, self.opts.min_token_len, self.opts.max_token_len)
                             {
-                                write_composite(&mut self.scratch, token.as_bytes(), field_id);
-                                push_term(
-                                    &mut self.terms,
-                                    &mut self.terms_bytes,
-                                    &self.scratch,
-                                    doc,
-                                );
+                                self.terms.push(field_id, token.as_bytes(), doc);
                             }
                         } else if value.len() > self.opts.max_raw_term_len {
                             // oversize raw value: skipped WITHOUT degrading
@@ -2582,8 +2640,7 @@ impl VixWriter {
                             // (distinct from null) and its fid-only composite
                             // key is valid, so `field = ''` answers from the
                             // index
-                            write_composite(&mut self.scratch, value.as_bytes(), field_id);
-                            push_term(&mut self.terms, &mut self.terms_bytes, &self.scratch, doc);
+                            self.terms.push(field_id, value.as_bytes(), doc);
                         }
                     }
                     // a JSON number emits its tagged CANONICAL value term
@@ -2619,8 +2676,6 @@ impl VixWriter {
                         }
                         push_numeric_term(
                             &mut self.terms,
-                            &mut self.terms_bytes,
-                            &mut self.scratch,
                             &mut self.tag_scratch,
                             &text,
                             field_id,
@@ -2639,8 +2694,6 @@ impl VixWriter {
                         let flag = value.as_bool().unwrap_or(false);
                         push_numeric_term(
                             &mut self.terms,
-                            &mut self.terms_bytes,
-                            &mut self.scratch,
                             &mut self.tag_scratch,
                             canonical_bool_text(flag),
                             field_id,
@@ -2753,8 +2806,7 @@ impl VixWriter {
                         for token in
                             o2_tokenize(value, self.opts.min_token_len, self.opts.max_token_len)
                         {
-                            write_composite(&mut self.scratch, token.as_bytes(), field_id);
-                            push_term(&mut self.terms, &mut self.terms_bytes, &self.scratch, doc);
+                            self.terms.push(field_id, token.as_bytes(), doc);
                         }
                     }
                 } else if self.bloom_only.contains_key(&field_id) {
@@ -2801,8 +2853,7 @@ impl VixWriter {
                         // the empty string included: `""` is a value
                         // (distinct from null) and its fid-only composite key
                         // is valid, so `field = ''` answers from the index
-                        write_composite(&mut self.scratch, value.as_bytes(), field_id);
-                        push_term(&mut self.terms, &mut self.terms_bytes, &self.scratch, doc);
+                        self.terms.push(field_id, value.as_bytes(), doc);
                     }
                 }
             } else if let Some(numbers) = NumericColumn::try_new(column.as_ref()) {
@@ -2825,15 +2876,7 @@ impl VixWriter {
                         continue;
                     }
                     let doc = (first_doc + row as u64) as u32;
-                    push_numeric_term(
-                        &mut self.terms,
-                        &mut self.terms_bytes,
-                        &mut self.scratch,
-                        &mut self.tag_scratch,
-                        &text,
-                        field_id,
-                        doc,
-                    );
+                    push_numeric_term(&mut self.terms, &mut self.tag_scratch, &text, field_id, doc);
                 }
             } else {
                 // The batch stores this term field under a type with no term
@@ -2872,35 +2915,18 @@ impl VixWriter {
             if !emits_any {
                 continue; // the path exists in none of this batch's docs
             }
-            write_composite(&mut self.scratch, name.as_bytes(), KEY_FIELD_ID);
-            // Key-term postings count toward the spill estimate exactly like
-            // push_term's: ~4 bytes per appended doc plus the per-entry key
-            // overhead on first insert. They used to bypass `terms_bytes`
-            // entirely (M23 follow-up (c)) — ~4B x rows x present-columns of
-            // resident postings invisible to the spill trigger, making a
-            // wide-schema rebuild spill late by hundreds of MB.
-            let terms_bytes = &mut self.terms_bytes;
-            let postings = match self.terms.entry(self.scratch.clone()) {
-                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
-                std::collections::btree_map::Entry::Vacant(entry) => {
-                    *terms_bytes += self.scratch.len() + spill::PER_TERM_OVERHEAD;
-                    entry.insert(Vec::new())
-                }
-            };
             let all_valid = finite.is_none() && column.null_count() == 0;
-            for row in 0..num_rows {
-                let keep = match &finite {
-                    Some(mask) => mask[row],
-                    None => all_valid || column.is_valid(row),
-                };
-                if keep {
-                    let doc = (first_doc + row as u64) as u32;
-                    if postings.last() != Some(&doc) {
-                        postings.push(doc);
-                        *terms_bytes += 4;
-                    }
-                }
-            }
+            self.terms.extend(
+                KEY_FIELD_ID,
+                name.as_bytes(),
+                (0..num_rows).filter_map(|row| {
+                    let keep = match &finite {
+                        Some(mask) => mask[row],
+                        None => all_valid || column.is_valid(row),
+                    };
+                    keep.then_some((first_doc + row as u64) as u32)
+                }),
+            );
         }
     }
 
@@ -3023,9 +3049,7 @@ impl VixWriter {
                         .fields()
                         .iter()
                         .map(|field| field.name().as_str())
-                        .filter(|name| {
-                            *name != SOURCE_COL_NAME && *name != ORIGINAL_DATA_COL_NAME
-                        })
+                        .filter(|name| *name != SOURCE_COL_NAME && *name != ORIGINAL_DATA_COL_NAME)
                         .map(|name| {
                             if name == TIMESTAMP_COL_NAME {
                                 (name.to_string(), Some(row_count))
@@ -3235,10 +3259,13 @@ impl VixWriter {
                     Field::new("doc_count", DataType::UInt32, false),
                     Field::new("postings", DataType::Binary, false),
                 ]));
-                let resident = std::mem::take(&mut self.terms);
-                self.terms_bytes = 0;
+                let resident = std::mem::replace(
+                    &mut self.terms,
+                    TermAccumulator::new(self.term_fields.len()),
+                );
                 let (blobs, count, bloom) = match self.term_spill.take() {
                     None => {
+                        let resident = resident.into_sorted_shards();
                         let threads = if encode_threads == 0 {
                             std::thread::available_parallelism().map_or(1, |n| n.get())
                         } else {
@@ -3255,37 +3282,22 @@ impl VixWriter {
                         // over-partition 4x and let workers pull ranges off
                         // a shared cursor (field-boundary snapping skews
                         // range sizes — same treatment as the k-way merge)
-                        let bounds = if kway > 1 {
-                            rebuild_partition_bounds(&resident, kway.saturating_mul(4))
+                        let ranges = if kway > 1 {
+                            rebuild_partition_ranges(&resident, kway.saturating_mul(4))
                         } else {
                             Vec::new()
                         };
-                        let (index, count, bloom) = if bounds.is_empty() {
+                        let (index, count, bloom) = if ranges.is_empty() {
                             // sequential: exactly the pre-M17 path
                             let mut sink = make_sink();
-                            for (key, ids) in &resident {
-                                sink.push_ids(key, ids, row_count)?;
-                            }
+                            push_sorted_shards(&resident, &mut sink, row_count)?;
                             write_index_blobs(vec![sink.into_parts()?], encode_threads)?
                         } else {
                             let started = std::time::Instant::now();
-                            use std::{
-                                ops::Bound,
-                                sync::{
-                                    Mutex,
-                                    atomic::{AtomicUsize, Ordering},
-                                },
+                            use std::sync::{
+                                Mutex,
+                                atomic::{AtomicUsize, Ordering},
                             };
-                            type Range<'b> = (Option<&'b [u8]>, Option<&'b [u8]>);
-                            let mut ranges: Vec<Range<'_>> = Vec::with_capacity(bounds.len() + 1);
-                            {
-                                let mut lower: Option<&[u8]> = None;
-                                for bound in &bounds {
-                                    ranges.push((lower, Some(bound.as_slice())));
-                                    lower = Some(bound.as_slice());
-                                }
-                                ranges.push((lower, None));
-                            }
                             let next = AtomicUsize::new(0);
                             let slots: Vec<Mutex<Option<Result<TermSinkParts>>>> =
                                 (0..ranges.len()).map(|_| Mutex::new(None)).collect();
@@ -3296,24 +3308,19 @@ impl VixWriter {
                                     scope.spawn(|| {
                                         loop {
                                             let index = next.fetch_add(1, Ordering::Relaxed);
-                                            let Some(&(lower, upper)) = ranges.get(index) else {
+                                            let Some(range) = ranges.get(index).cloned() else {
                                                 break;
                                             };
                                             let mut sink = make_sink();
-                                            let range = (
-                                                lower.map_or(Bound::Unbounded, |b| {
-                                                    Bound::Included(b.to_vec())
-                                                }),
-                                                upper.map_or(Bound::Unbounded, |b| {
-                                                    Bound::Excluded(b.to_vec())
-                                                }),
-                                            );
-                                            let result = (|| -> Result<TermSinkParts> {
-                                                for (key, ids) in resident_ref.range(range) {
-                                                    sink.push_ids(key, ids, row_count)?;
-                                                }
+                                            let result: Result<TermSinkParts> = (|| {
+                                                push_sorted_shards(
+                                                    &resident_ref[range],
+                                                    &mut sink,
+                                                    row_count,
+                                                )?;
                                                 sink.into_parts()
-                                            })();
+                                            })(
+                                            );
                                             let failed = result.is_err();
                                             *slots[index].lock().expect("range slot poisoned") =
                                                 Some(result);
@@ -3348,7 +3355,7 @@ impl VixWriter {
                         };
                         (index.map(IndexBlobParts::from), count, bloom)
                     }
-                    Some(spilled) => {
+                    Some(mut spilled) => {
                         // spilled maps stream from disk in one key order —
                         // stays sequential (the in-memory partitioning above
                         // has no exact split points to offer).
@@ -3371,12 +3378,19 @@ impl VixWriter {
                             .term_spill_dir
                             .clone()
                             .expect("a spilled map implies term_spill_dir");
+                        // Drain the final resident shard set as one more run.
+                        // This avoids materializing a second globally sorted
+                        // resident representation during the k-way merge.
+                        let mut resident = resident;
+                        if !resident.is_empty() {
+                            spilled.write_run(&mut resident)?;
+                        }
                         let mut sink = make_sink().with_spool(&spool_dir)?;
                         let mut spooler =
                             TermsBlobSpooler::spawn(&spool_dir, Arc::clone(&terms_blob_schema))?;
                         let (runs, _spill_dir) = spilled.into_run_readers()?;
-                        spill::merge_spilled_terms(runs, resident, |key, ids| {
-                            sink.push_ids(&key, &ids, row_count)?;
+                        spill::merge_spilled_terms(runs, |key, ids| {
+                            sink.push_ids(key, &ids, row_count)?;
                             for batch in sink.take_closed_batches() {
                                 spooler.push(batch)?;
                             }
@@ -4126,28 +4140,10 @@ fn finite_float_mask(column: &dyn Array) -> Option<Vec<bool>> {
 
 /// Append `doc` to the postings of `key`, deduping consecutive pushes of the
 /// same doc (raw term == token, or the same token twice in one value).
-/// `bytes` tracks the map's estimated resident size — the spill trigger
-/// ([`crate::spill`]); the estimate is deliberately rough (key bytes +
-/// [`spill::PER_TERM_OVERHEAD`] per entry + 4 per posting).
-fn push_term(terms: &mut BTreeMap<Vec<u8>, Vec<u32>>, bytes: &mut usize, key: &[u8], doc: u32) {
-    if let Some(postings) = terms.get_mut(key) {
-        if postings.last() != Some(&doc) {
-            postings.push(doc);
-            *bytes += 4;
-        }
-    } else {
-        terms.insert(key.to_vec(), vec![doc]);
-        *bytes += key.len() + spill::PER_TERM_OVERHEAD + 4;
-    }
-}
-
 /// Emit one tagged canonical numeric/bool value term: the token is
 /// `\x01{canonical text}` (see [`crate::numeric`] for why the tag exists).
-/// `scratch` is the reusable composite-key buffer.
 fn push_numeric_term(
-    terms: &mut BTreeMap<Vec<u8>, Vec<u32>>,
-    bytes: &mut usize,
-    scratch: &mut Vec<u8>,
+    terms: &mut TermAccumulator,
     tag_scratch: &mut Vec<u8>,
     canonical: &str,
     field_id: u16,
@@ -4157,8 +4153,7 @@ fn push_numeric_term(
     tag_scratch.reserve(canonical.len() + 1);
     tag_scratch.push(NUMERIC_TERM_TAG);
     tag_scratch.extend_from_slice(canonical.as_bytes());
-    write_composite(scratch, tag_scratch, field_id);
-    push_term(terms, bytes, scratch, doc);
+    terms.push(field_id, tag_scratch, doc);
 }
 
 /// Fetch the batch column backing `field`, casting where needed
@@ -4332,6 +4327,9 @@ pub(crate) struct TermSink {
     /// [`write_index_blobs`] rebases them when it concatenates multiple
     /// sinks' regions into the single `plist` blob.
     plist: RegionSink,
+    /// Reused across terms; avoids two heap allocations per postings list.
+    postings_encode_scratch: Vec<u8>,
+    postings_record_scratch: Vec<u8>,
 }
 
 impl TermSink {
@@ -4359,6 +4357,8 @@ impl TermSink {
             bloom_key_scratch: Vec::new(),
             plist_min_docs: 0,
             plist: RegionSink::Mem(Vec::new()),
+            postings_encode_scratch: Vec::new(),
+            postings_record_scratch: Vec::new(),
         }
     }
 
@@ -4453,10 +4453,28 @@ impl TermSink {
             return self.push(key, ids.len() as u32, &[]);
         }
         if self.plist_eligible(ids.len() as u64) {
-            let record = postings::encode_record(ids)?;
-            return self.push_plist(key, ids.len() as u32, &record);
+            let mut record = std::mem::take(&mut self.postings_record_scratch);
+            let mut encoded = std::mem::take(&mut self.postings_encode_scratch);
+            let encode_result = postings::encode_record_into(ids, &mut record, &mut encoded);
+            if let Err(error) = encode_result {
+                self.postings_record_scratch = record;
+                self.postings_encode_scratch = encoded;
+                return Err(error);
+            }
+            let result = self.push_plist(key, ids.len() as u32, &record);
+            self.postings_record_scratch = record;
+            self.postings_encode_scratch = encoded;
+            return result;
         }
-        self.push(key, ids.len() as u32, &postings::encode(ids)?)
+        let mut encoded = std::mem::take(&mut self.postings_encode_scratch);
+        let encode_result = postings::encode_into(ids, &mut encoded);
+        if let Err(error) = encode_result {
+            self.postings_encode_scratch = encoded;
+            return Err(error);
+        }
+        let result = self.push(key, ids.len() as u32, &encoded);
+        self.postings_encode_scratch = encoded;
+        result
     }
 
     pub(crate) fn push(&mut self, key: &[u8], doc_count: u32, blob: &[u8]) -> Result<()> {
@@ -4745,9 +4763,27 @@ pub(crate) fn write_index_blobs(
     ))
 }
 
-/// M17 item 4: split points for the PARALLEL rebuild index-blob build,
-/// chosen from the resident term map's own keys (in memory — exact, no
-/// sampling) as weighted quantiles SNAPPED UP to FIELD-REGION first keys.
+/// Stream sorted field shards while constructing the composite key in one
+/// reusable buffer. Shards and their tokens are already in exact on-disk
+/// order.
+fn push_sorted_shards(
+    shards: &[SortedTermShard],
+    sink: &mut TermSink,
+    row_count: u64,
+) -> Result<()> {
+    let mut key = Vec::new();
+    for shard in shards {
+        for (token, ids) in &shard.terms {
+            write_composite(&mut key, token, shard.field_id);
+            sink.push_ids(&key, ids, row_count)?;
+        }
+    }
+    Ok(())
+}
+
+/// M17 item 4: shard ranges for the PARALLEL rebuild index-blob build,
+/// chosen from exact resident field sizes as weighted quantiles snapped up
+/// to field boundaries.
 ///
 /// Field-boundary snapping is what makes the parallel build BYTE-identical
 /// to the sequential one: [`TermSink::push`] cuts a dictionary block at
@@ -4759,46 +4795,30 @@ pub(crate) fn write_index_blobs(
 /// trivially: there is ONE key space (the writer's own), and every bound
 /// is a real key in it. Empty when fewer than 2 field regions exist or
 /// `ranges <= 1` — the caller then runs the sequential path.
-fn rebuild_partition_bounds(
-    terms: &BTreeMap<Vec<u8>, Vec<u32>>,
+fn rebuild_partition_ranges(
+    shards: &[SortedTermShard],
     ranges: usize,
-) -> Vec<Vec<u8>> {
+) -> Vec<std::ops::Range<usize>> {
     // floor: a small map (move-job L0 builds, tiny heals) gains nothing
     // from worker spawn + range bookkeeping — stay sequential
-    if ranges <= 1 || terms.len() < 1024 {
+    let total: usize = shards.iter().map(|shard| shard.terms.len()).sum();
+    if ranges <= 1 || total < 1024 || shards.len() <= 1 {
         return Vec::new();
     }
-    // (key ordinal, first key) of every field region, in key order
-    let mut region_starts: Vec<(usize, &Vec<u8>)> = Vec::new();
-    let mut prev_fid: Option<&[u8]> = None;
-    for (ordinal, key) in terms.keys().enumerate() {
-        let fid = &key[..key.len().min(2)];
-        if prev_fid != Some(fid) {
-            region_starts.push((ordinal, key));
-            prev_fid = Some(fid);
+    let mut out = Vec::with_capacity(ranges.min(shards.len()));
+    let mut start = 0usize;
+    let mut cumulative = 0usize;
+    let mut next_target = total / ranges;
+    for (index, shard) in shards.iter().enumerate() {
+        if index > start && cumulative >= next_target && out.len() + 1 < ranges {
+            out.push(start..index);
+            start = index;
+            next_target = total * (out.len() + 1) / ranges;
         }
+        cumulative += shard.terms.len();
     }
-    if region_starts.len() <= 1 {
-        return Vec::new();
-    }
-    let total = terms.len();
-    let mut bounds: Vec<Vec<u8>> = Vec::with_capacity(ranges - 1);
-    for r in 1..ranges {
-        let target = total * r / ranges;
-        // first field region starting at/after the quantile ordinal
-        let pos = region_starts.partition_point(|(ordinal, _)| *ordinal < target);
-        let Some((ordinal, key)) = region_starts.get(pos) else {
-            break;
-        };
-        if *ordinal == 0 {
-            // a bound at the very first key would mint an empty first range
-            continue;
-        }
-        if bounds.last().is_none_or(|last| last.as_slice() < key.as_slice()) {
-            bounds.push((*key).clone());
-        }
-    }
-    bounds
+    out.push(start..shards.len());
+    out
 }
 
 /// [`write_index_blobs`] for the M17 parallel REBUILD build: identical

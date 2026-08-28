@@ -16,6 +16,7 @@
 use arrow::datatypes::Schema;
 use async_recursion::async_recursion;
 use config::{
+    get_config,
     meta::stream::StreamType,
     utils::{json, time::now_micros},
 };
@@ -66,9 +67,12 @@ pub(crate) async fn process(msg: Message) -> Result<()> {
 async fn merge(msg: Message) -> Result<()> {
     let (org_id, stream_type, stream_name) = parse_key(&msg.key)?;
     let schema: Schema = json::from_slice(msg.value.as_ref().unwrap())?;
-    if let Err(e) =
+    let result = if get_config().common.ingest_canonical_schema {
+        infra::schema::merge_pinned(&org_id, &stream_name, stream_type, &schema, msg.start_dt).await
+    } else {
         infra::schema::merge(&org_id, &stream_name, stream_type, &schema, msg.start_dt).await
-    {
+    };
+    if let Err(e) = result {
         if e.to_string().to_lowercase().contains("duplicate key")
             && e.to_string()
                 .to_lowercase()

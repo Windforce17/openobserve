@@ -19,7 +19,7 @@ use anyhow::{Result, anyhow};
 use axum::http;
 use bytes::Bytes;
 use config::{
-    TIMESTAMP_COL_NAME,
+    TIMESTAMP_COL_NAME, get_config,
     meta::{
         alerts::alert::Alert,
         promql::{HASH_LABEL, METADATA_LABEL, Metadata, NAME_LABEL, TYPE_LABEL, VALUE_LABEL},
@@ -52,7 +52,10 @@ use crate::{
             get_write_partition_key, write_file,
         },
         pipeline::batch_execution::ExecutablePipeline,
-        schema::check_for_schema,
+        schema::{
+            CanonicalizationSummary, canonicalize_field_value_into, canonicalize_record_into,
+            check_for_schema,
+        },
         self_reporting::report_request_usage_stats,
     },
 };
@@ -133,6 +136,9 @@ pub async fn ingest(
     // realtime alerts
     let mut stream_alerts_map: HashMap<String, Vec<Alert>> = HashMap::new();
     let mut stream_trigger_map: HashMap<String, Option<TriggerAlertData>> = HashMap::new();
+    let canonical_schema_enabled = get_config().common.ingest_canonical_schema;
+    let mut canonical_summary = CanonicalizationSummary::default();
+    let mut first_canonical_failure_stream = None;
 
     // records buffer
     let mut json_data_by_stream: HashMap<String, Vec<_>> = HashMap::new();
@@ -192,14 +198,28 @@ pub async fn ingest(
                     json::to_string(&metadata).unwrap(),
                 );
                 schema = schema.with_metadata(extra_metadata);
-                db::schema::merge(
-                    org_id,
-                    &stream_name,
-                    StreamType::Metrics,
-                    &schema,
-                    Some(now_micros()),
-                )
-                .await?;
+                let merged = if canonical_schema_enabled {
+                    db::schema::merge_pinned(
+                        org_id,
+                        &stream_name,
+                        StreamType::Metrics,
+                        &schema,
+                        Some(now_micros()),
+                    )
+                    .await?
+                } else {
+                    db::schema::merge(
+                        org_id,
+                        &stream_name,
+                        StreamType::Metrics,
+                        &schema,
+                        Some(now_micros()),
+                    )
+                    .await?
+                };
+                if let Some((registered_schema, _)) = merged {
+                    schema = registered_schema;
+                }
             }
             stream_schema_map.insert(stream_name.clone(), SchemaCache::new(schema));
         }
@@ -424,14 +444,28 @@ pub async fn ingest(
                         json::to_string(&metadata).unwrap(),
                     );
                     schema = inferred_schema.with_metadata(extra_metadata);
-                    db::schema::merge(
-                        org_id,
-                        &stream_name,
-                        StreamType::Metrics,
-                        &schema,
-                        Some(timestamp),
-                    )
-                    .await?;
+                    let merged = if canonical_schema_enabled {
+                        db::schema::merge_pinned(
+                            org_id,
+                            &stream_name,
+                            StreamType::Metrics,
+                            &schema,
+                            Some(timestamp),
+                        )
+                        .await?
+                    } else {
+                        db::schema::merge(
+                            org_id,
+                            &stream_name,
+                            StreamType::Metrics,
+                            &schema,
+                            Some(timestamp),
+                        )
+                        .await?
+                    };
+                    if let Some((registered_schema, _)) = merged {
+                        schema = registered_schema;
+                    }
                     crate::common::utils::auth::set_ownership(
                         org_id,
                         StreamType::Metrics.as_str(),
@@ -453,6 +487,32 @@ pub async fn ingest(
                 false, // is_derived is false for metrics
             )
             .await?;
+
+            if canonical_schema_enabled {
+                let canonical_schema = stream_schema_map.get(&stream_name).unwrap();
+                let had_failure = canonical_summary.first_failure.is_some();
+                canonicalize_record_into(
+                    StreamType::Metrics,
+                    canonical_schema,
+                    &mut record,
+                    &mut canonical_summary,
+                );
+
+                let hash = super::signature_without_labels(&record, &get_exclude_labels());
+                let mut hash_value = json::Value::Number(hash.into());
+                canonicalize_field_value_into(
+                    StreamType::Metrics,
+                    canonical_schema,
+                    HASH_LABEL,
+                    &mut hash_value,
+                    &mut canonical_summary,
+                );
+                if !had_failure && canonical_summary.first_failure.is_some() {
+                    first_canonical_failure_stream = Some(stream_name.clone());
+                }
+                record.insert(HASH_LABEL.to_string(), hash_value);
+            }
+            let record_str = json::to_string(&record).unwrap();
 
             // write into buffer
             let schema = stream_schema_map
@@ -510,6 +570,20 @@ pub async fn ingest(
             }
             // End check for alert trigger
         }
+    }
+
+    canonical_summary.flush_metrics(StreamType::Metrics);
+    if canonical_summary.nulled > 0 {
+        let stream_name = first_canonical_failure_stream.unwrap();
+        let failure = canonical_summary.first_failure.as_ref().unwrap();
+        log::warn!(
+            "[METRICS:JSON] canonical schema normalization for {org_id}/{stream_name}: converted {} value(s), nulled {} failed value(s); first failure field={:?}, source_type={}, target_type={}",
+            canonical_summary.converted,
+            canonical_summary.nulled,
+            failure.field,
+            failure.source_type,
+            failure.target_type,
+        );
     }
 
     // write data to wal

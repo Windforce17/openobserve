@@ -41,8 +41,7 @@ use infra::{
     runtime::DATAFUSION_RUNTIME,
     schema::{
         get_partition_time_level, get_stream_setting_bloom_filter_fields,
-        get_stream_setting_fts_fields,
-        unwrap_stream_created_at,
+        get_stream_setting_fts_fields, unwrap_stream_created_at,
     },
     storage,
 };
@@ -54,7 +53,7 @@ use tokio::{
 };
 use vortex_index::VixOutput;
 
-use super::worker::{MergeBatch, MergeSender};
+use super::worker::{MergeBatch, MergeCancellation, MergeSender};
 use crate::service::{
     db, file_list,
     search::datafusion::{
@@ -67,6 +66,56 @@ use crate::service::{
 /// `storage::put` arm may carry. Anything bigger streams from a spool file
 /// (one multipart part's worth is "trivially small").
 const BUFFERED_UPLOAD_MAX_BYTES: u64 = 16 * 1024 * 1024;
+/// A single claimed hour may contain hundreds of batches. Keep only a tiny
+/// window queued/running so lease loss or shutdown does not leave an hour's
+/// worth of CPU work and uploads that can no longer commit.
+const JOB_BATCH_IN_FLIGHT: usize = 2;
+
+fn vix_cpu_capacity() -> usize {
+    let machine = std::thread::available_parallelism().map_or(1, |n| n.get());
+    std::cmp::max(1, machine / config::cluster::cpu_role_divisor())
+}
+
+fn vix_threads_per_merge() -> usize {
+    let capacity = vix_cpu_capacity();
+    match get_config().common.vix_merge_thread_num {
+        0 => capacity.min(8),
+        configured => configured.clamp(1, capacity),
+    }
+}
+
+static VIX_CPU_GATE: std::sync::LazyLock<Arc<Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(Semaphore::new(vix_cpu_capacity())));
+
+async fn acquire_vix_cpu(
+    cancel: &MergeCancellation,
+    context: &str,
+) -> Result<tokio::sync::OwnedSemaphorePermit, anyhow::Error> {
+    let permits = vix_threads_per_merge() as u32;
+    let started = std::time::Instant::now();
+    loop {
+        cancel.check(context)?;
+        tokio::select! {
+            permit = VIX_CPU_GATE.clone().acquire_many_owned(permits) => {
+                let permit = permit.map_err(|_| anyhow::anyhow!(
+                    "VIX CPU admission closed while waiting for {permits} permit(s) at {context}"
+                ))?;
+                let waited = started.elapsed();
+                if waited >= std::time::Duration::from_millis(100) {
+                    log::info!(
+                        "[COMPACTOR] VIX CPU admission waited {} ms for {permits}/{} permit(s) at {context}",
+                        waited.as_millis(),
+                        vix_cpu_capacity(),
+                    );
+                }
+                return Ok(permit);
+            }
+            _ = wait_for_merge_cancellation(cancel) => {
+                cancel.check(context)?;
+            }
+        }
+    }
+}
 
 /// Generate merging job by stream
 /// 1. get offset from db
@@ -569,12 +618,14 @@ pub async fn merge_by_stream(
 
     // use multiple threads to merge
     let semaphore = std::sync::Arc::new(Semaphore::new(cfg.limit.file_merge_thread_num));
+    let job_cancel = MergeCancellation::default();
     let mut tasks = Vec::with_capacity(partition_files_with_size.len());
     for (prefix, files_with_size) in partition_files_with_size.into_iter() {
         let org_id = org_id.to_string();
         let stream_name = stream_name.to_string();
         let permit = semaphore.clone().acquire_owned().await.unwrap();
         let worker_tx = worker_tx.clone();
+        let job_cancel = job_cancel.clone();
         let task: JoinHandle<Result<Vec<i64>, anyhow::Error>> = tokio::task::spawn(async move {
             let cfg = get_config();
             let job_strategy = MergeStrategy::from(&cfg.compact.strategy);
@@ -607,9 +658,8 @@ pub async fn merge_by_stream(
             // Cross-class convergence needs no mixed group: an index-less
             // leftover heals to indexed through the existing single-file
             // probe, then groups with its class.
-            let (mut plain_core, mut indexed_core): (Vec<FileKey>, Vec<FileKey>) = core_files
-                .into_iter()
-                .partition(|f| f.meta.index_size == 0);
+            let (mut plain_core, mut indexed_core): (Vec<FileKey>, Vec<FileKey>) =
+                core_files.into_iter().partition(|f| f.meta.index_size == 0);
             // sort by file size
             for files in [&mut flat_files, &mut plain_core, &mut indexed_core] {
                 match job_strategy {
@@ -670,6 +720,7 @@ pub async fn merge_by_stream(
                     stream_name: stream_name.clone(),
                     prefix: prefix.clone(),
                     files: flat_files.clone(),
+                    cancel: MergeCancellation::default(),
                 });
             } else {
                 group_files_into_batches(
@@ -741,6 +792,7 @@ pub async fn merge_by_stream(
                             stream_name: stream_name.clone(),
                             prefix: prefix.clone(),
                             files: vec![candidate.clone()],
+                            cancel: MergeCancellation::default(),
                         });
                     }
                     // current file: the no-op path — no batch, no docs IO
@@ -763,15 +815,13 @@ pub async fn merge_by_stream(
                 return Ok(vec![]); // no files need to merge
             }
 
+            for batch in &mut batch_groups {
+                batch.cancel = job_cancel.clone();
+            }
+
             // send to worker
             let batch_group_len = batch_groups.len();
             let (inner_tx, mut inner_rx) = mpsc::channel(batch_group_len);
-            for batch in batch_groups.iter() {
-                if let Err(e) = worker_tx.send((inner_tx.clone(), batch.clone())).await {
-                    log::error!("[COMPACTOR] send batch to worker failed: {e}");
-                    return Err(anyhow::Error::msg("send batch to worker failed"));
-                }
-            }
             // Commit each batch AS ITS RESULT ARRIVES (streaming, #23): a
             // long job interrupted mid-way (pod roll, lease loss, kill)
             // keeps every batch committed so far, and the re-claim re-plans
@@ -783,8 +833,39 @@ pub async fn merge_by_stream(
             let mut lease_lost = false;
             let mut check_guard = HashSet::with_capacity(batch_groups.len());
             let mut orphan_blooms = Vec::new();
-            for _ in 0..batch_group_len {
-                let ret = inner_rx.recv().await.unwrap();
+            let mut next_batch = 0usize;
+            let mut in_flight = 0usize;
+            while in_flight > 0 || next_batch < batch_group_len {
+                while !lease_lost
+                    && !job_cancel.is_cancelled()
+                    && in_flight < JOB_BATCH_IN_FLIGHT
+                    && next_batch < batch_group_len
+                {
+                    let batch = batch_groups[next_batch].clone();
+                    if let Err(e) = worker_tx.send((inner_tx.clone(), batch)).await {
+                        log::error!("[COMPACTOR] send batch to worker failed: {e}");
+                        return Err(anyhow::Error::msg("send batch to worker failed"));
+                    }
+                    next_batch += 1;
+                    in_flight += 1;
+                }
+                if in_flight == 0 {
+                    if next_batch < batch_group_len && last_error.is_none() {
+                        last_error = Some(anyhow::anyhow!(
+                            "compaction cancelled with {}/{} batches not started",
+                            batch_group_len - next_batch,
+                            batch_group_len,
+                        ));
+                    }
+                    break;
+                }
+                let Some(ret) = inner_rx.recv().await else {
+                    last_error = Some(anyhow::anyhow!(
+                        "compaction worker result channel closed with {in_flight} batch(es) still in flight"
+                    ));
+                    break;
+                };
+                in_flight -= 1;
                 let (batch_id, new_files, merged_files) = match ret {
                     Ok(v) => v,
                     Err(e) => {
@@ -892,6 +973,7 @@ pub async fn merge_by_stream(
                         );
                         last_error = Some(anyhow::anyhow!("job {job_id} lease lost before commit"));
                         lease_lost = true;
+                        job_cancel.cancel();
                         continue;
                     }
                     // fence query or file_list write failed: nothing proven
@@ -1030,6 +1112,7 @@ fn group_files_into_batches(
                 stream_name: stream_name.to_string(),
                 prefix: prefix.to_string(),
                 files: new_file_list.clone(),
+                cancel: MergeCancellation::default(),
             });
             new_file_size = 0;
             new_file_list.clear();
@@ -1050,6 +1133,7 @@ fn group_files_into_batches(
             stream_name: stream_name.to_string(),
             prefix: prefix.to_string(),
             files: new_file_list.clone(),
+            cancel: MergeCancellation::default(),
         });
     }
 }
@@ -1091,8 +1175,10 @@ pub async fn merge_files(
     stream_name: &str,
     prefix: &str,
     files_with_size: &[FileKey],
+    cancel: &MergeCancellation,
 ) -> Result<(Vec<FileKey>, Vec<FileKey>), anyhow::Error> {
     let start = std::time::Instant::now();
+    cancel.check("merge input planning")?;
 
     // batch selection groups same-kind files only (see merge_by_stream); a
     // mixed group would corrupt whichever writer ran, so reject it loudly
@@ -1163,10 +1249,17 @@ pub async fn merge_files(
         return Ok((Vec::new(), Vec::new()));
     }
 
-    // cache parquet files
+    // Cache merge inputs and VIX sidecars under a bounded byte/request
+    // budget. Keep this phase separate from merge CPU in production
+    // telemetry so object-store latency cannot masquerade as encoder cost.
+    let prefetch_started = std::time::Instant::now();
     let deleted_files = cache_remote_files(&new_file_list).await?;
+    cancel.check("merge input prefetch")?;
+    metrics::COMPACT_VIX_PHASE_DURATION
+        .with_label_values(&["prefetch", if is_core_group { "core" } else { "flat" }])
+        .observe(prefetch_started.elapsed().as_secs_f64());
     log::info!(
-        "[COMPACTOR:WORKER:{thread_id}] download {} parquet files, took: {} ms",
+        "[COMPACTOR:WORKER:{thread_id}] prefetched {} merge input data object(s) and eligible VIX sidecar(s), took: {} ms",
         new_file_list.len(),
         start.elapsed().as_millis()
     );
@@ -1246,6 +1339,7 @@ pub async fn merge_files(
             bloom_filter_fields,
             storage_type,
             is_single_core_heal,
+            cancel,
             start,
         )
         .await;
@@ -1256,6 +1350,7 @@ pub async fn merge_files(
     let files = new_file_list.clone();
     let mut fi = 0;
     for file in new_file_list.iter() {
+        cancel.check("flat-file schema scan")?;
         fi += 1;
         log::info!(
             "[COMPACTOR:WORKER:{thread_id}:{fi}] merge small file: {}",
@@ -1313,6 +1408,7 @@ pub async fn merge_files(
     // compact_single_partition_sort for the prod rationale)
     let single_partition_sort = compact_single_partition_sort(stream_type);
     let merge_result = {
+        cancel.check("flat-file DataFusion merge")?;
         let stream_name = stream_name.to_string();
         DATAFUSION_RUNTIME
             .spawn(async move {
@@ -1330,6 +1426,7 @@ pub async fn merge_files(
             })
             .await?
     };
+    cancel.check("flat-file upload")?;
 
     // clear session data
     crate::service::search::datafusion::storage::file_list::clear(&trace_id);
@@ -1383,6 +1480,7 @@ pub async fn merge_files(
                 &new_file_key,
                 buf.clone(),
                 cfg.s3.feature_force_infrequent_access && storage_type.is_compliance(),
+                cancel,
             )
             .await?;
 
@@ -1425,6 +1523,7 @@ pub async fn merge_files(
                     &new_file_key,
                     buf.clone(),
                     cfg.s3.feature_force_infrequent_access && storage_type.is_compliance(),
+                    cancel,
                 )
                 .await?;
 
@@ -1455,11 +1554,13 @@ async fn put_merged_output(
     new_file_key: &str,
     buf: Bytes,
     compliance: bool,
+    cancel: &MergeCancellation,
 ) -> Result<(), anyhow::Error> {
     const MAX_ATTEMPTS: usize = 3;
     let mut backoff = tokio::time::Duration::from_millis(500);
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 1..=MAX_ATTEMPTS {
+        cancel.check(&format!("upload attempt {attempt} for {new_file_key}"))?;
         let ret = if compliance {
             storage::put_with_compliance(account, new_file_key, buf.clone()).await
         } else {
@@ -1473,7 +1574,12 @@ async fn put_merged_output(
                 );
                 last_err = Some(e.into());
                 if attempt < MAX_ATTEMPTS {
-                    tokio::time::sleep(backoff).await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(backoff) => {}
+                        _ = wait_for_merge_cancellation(cancel) => {
+                            cancel.check(&format!("upload retry backoff for {new_file_key}"))?;
+                        }
+                    }
                     backoff *= 2;
                 }
             }
@@ -1491,11 +1597,15 @@ async fn put_merged_output_file(
     new_file_key: &str,
     spool: &std::path::Path,
     compliance: bool,
+    cancel: &MergeCancellation,
 ) -> Result<(), anyhow::Error> {
     const MAX_ATTEMPTS: usize = 3;
     let mut backoff = tokio::time::Duration::from_millis(500);
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 1..=MAX_ATTEMPTS {
+        cancel.check(&format!(
+            "streaming upload attempt {attempt} for {new_file_key}"
+        ))?;
         let ret = if compliance {
             storage::put_file_with_compliance(account, new_file_key, spool).await
         } else {
@@ -1509,13 +1619,27 @@ async fn put_merged_output_file(
                 );
                 last_err = Some(e.into());
                 if attempt < MAX_ATTEMPTS {
-                    tokio::time::sleep(backoff).await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(backoff) => {}
+                        _ = wait_for_merge_cancellation(cancel) => {
+                            cancel.check(&format!("streaming upload retry backoff for {new_file_key}"))?;
+                        }
+                    }
                     backoff *= 2;
                 }
             }
         }
     }
     Err(last_err.expect("at least one upload attempt ran"))
+}
+
+/// Await cancellation without a permanently-running helper task. The short
+/// poll is used only during bounded retry backoff; CPU-heavy loops perform
+/// direct atomic checks at their natural batch/window boundaries.
+async fn wait_for_merge_cancellation(cancel: &MergeCancellation) {
+    while !cancel.is_cancelled() {
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
 }
 
 /// Merge one same-kind group of core `.vix` files into a single core
@@ -1544,9 +1668,11 @@ async fn merge_core_group(
     bloom_filter_fields: Vec<String>,
     storage_type: StorageType,
     force_rebuild: bool,
+    cancel: &MergeCancellation,
     start: std::time::Instant,
 ) -> Result<(Vec<FileKey>, Vec<FileKey>), anyhow::Error> {
     let cfg = get_config();
+    cancel.check("core merge planning")?;
 
     // M3 SIDECAR-ONLY HEAL (DESIGN-V2 §5): a single-file healing batch
     // rewrites ONLY the `.vxi` index sidecar — same sidecar key, data
@@ -1567,6 +1693,7 @@ async fn merge_core_group(
             full_text_search_fields.clone(),
             bloom_filter_fields.clone(),
             cfg.s3.feature_force_infrequent_access && storage_type.is_compliance(),
+            cancel,
             start,
         )
         .await?;
@@ -1592,6 +1719,7 @@ async fn merge_core_group(
                 location: object_store::path::Path::from(file.key.as_str()),
                 size: file.meta.compressed_size as u64,
                 handle: handle.clone(),
+                cancel: Some(cancel.clone()),
             });
             // v3 split: the index sidecar is its own object; index_size is
             // its exact size and 0 means no sidecar (docs-only rebuild).
@@ -1604,6 +1732,7 @@ async fn merge_core_group(
                             location: object_store::path::Path::from(sidecar_key.as_str()),
                             size: file.meta.index_size as u64,
                             handle: handle.clone(),
+                            cancel: Some(cancel.clone()),
                         }) as Arc<dyn vortex_index::VixRangeSource>
                     });
             (file.key.clone(), source, index_source)
@@ -1617,43 +1746,61 @@ async fn merge_core_group(
     // hop anyway. Never for healing batches (their whole point is building
     // the index) and never when any input already carries a sidecar (a
     // deferred output over it would DROP that capability).
-    let defer_below_bytes =
-        cfg.common.vix_merge_index_defer_below_mb.saturating_mul(1024 * 1024) as i64;
+    let defer_below_bytes = cfg
+        .common
+        .vix_merge_index_defer_below_mb
+        .saturating_mul(1024 * 1024) as i64;
     let index_deferred = !force_rebuild
         && defer_below_bytes > 0
         && new_file_list.len() > 1
         && new_file_meta.original_size < defer_below_bytes
         && new_file_list.iter().all(|f| f.meta.index_size == 0);
 
-    let result = match tokio::task::spawn_blocking(move || {
+    let cpu_permit = acquire_vix_cpu(cancel, "core merge CPU admission").await?;
+    let merge_started = std::time::Instant::now();
+    cancel.check("core merge CPU phase")?;
+    let vix_cancellation = cancel.vix_token();
+    let mut merge_task = tokio::task::spawn_blocking(move || {
         if force_rebuild {
-            crate::service::vix::core_writer::merge_core_files_rebuild(
+            crate::service::vix::core_writer::merge_core_files_rebuild_with_cancellation(
                 stream_type,
                 &inputs,
                 &latest_schema,
                 &full_text_search_fields,
                 &bloom_filter_fields,
+                &vix_cancellation,
             )
         } else if index_deferred {
-            crate::service::vix::core_writer::merge_core_files_index_deferred(
+            crate::service::vix::core_writer::merge_core_files_index_deferred_with_cancellation(
                 stream_type,
                 &inputs,
                 &latest_schema,
                 &full_text_search_fields,
                 &bloom_filter_fields,
+                &vix_cancellation,
             )
         } else {
-            crate::service::vix::core_writer::merge_core_files(
+            crate::service::vix::core_writer::merge_core_files_with_cancellation(
                 stream_type,
                 &inputs,
                 &latest_schema,
                 &full_text_search_fields,
                 &bloom_filter_fields,
+                &vix_cancellation,
             )
         }
-    })
-    .await?
-    {
+    });
+    let merge_join = tokio::select! {
+        result = &mut merge_task => result,
+        _ = wait_for_merge_cancellation(cancel) => {
+            // `spawn_blocking` cannot be force-aborted once running. The
+            // shared token makes it leave at the next bounded VIX boundary;
+            // await it so shutdown never detaches a CPU-heavy merge.
+            cancel.cancel();
+            merge_task.await
+        }
+    };
+    let result = match merge_join? {
         Ok(result) => result,
         Err(e) => {
             // M19: a mid-merge range fetch hitting an externally deleted
@@ -1677,6 +1824,20 @@ async fn merge_core_group(
             return Err(e);
         }
     };
+    drop(cpu_permit);
+    let merge_shape = if result.used_index_merge {
+        "index_merge"
+    } else if result.docs_passthrough_inputs > 0 {
+        "docs_copy_rebuild"
+    } else if result.terms_from_columns {
+        "column_rebuild"
+    } else {
+        "source_rebuild"
+    };
+    metrics::COMPACT_VIX_PHASE_DURATION
+        .with_label_values(&["merge", merge_shape])
+        .observe(merge_started.elapsed().as_secs_f64());
+    cancel.check("core merge upload")?;
 
     // Compaction-time cleansing: the merge DROPS stored rows whose
     // `_timestamp` is degenerate (<= 0) — pre-guard-era files hide such
@@ -1741,7 +1902,7 @@ async fn merge_core_group(
     let id = ider::generate_file_name();
     let new_file_key = format!("{prefix}/{id}{}", FileFormat::Vix.extension());
     log::info!(
-        "[COMPACTOR:WORKER:{thread_id}] merged {} core files into a new file: {new_file_key}, original_size: {}, compressed_size: {}, index_merge: {}, docs_passthrough: {}, concat_order: {}, terms_from_columns: {}, took: {} ms",
+        "[COMPACTOR:WORKER:{thread_id}] merged {} core files into a new file: {new_file_key}, original_size: {}, compressed_size: {}, index_merge: {}, docs_passthrough: {}, concat_order: {}, terms_from_columns: {}, order_entries: {}, staged_empty_arrays: {}, interleaved_columns: {}, took: {} ms",
         retain_file_list.len(),
         new_file_meta.original_size,
         new_file_meta.compressed_size,
@@ -1749,6 +1910,9 @@ async fn merge_core_group(
         result.docs_passthrough_inputs,
         result.concat_order,
         result.terms_from_columns,
+        result.perf.order_entries_materialized,
+        result.perf.staged_empty_arrays,
+        result.perf.interleaved_columns,
         start.elapsed().as_millis(),
     );
 
@@ -1788,7 +1952,8 @@ async fn merge_core_group(
                         infra::cache::file_data::disk::set_from_local_file(&new_file_key, &spool)
                             .await?;
                     }
-                    put_merged_output_file(&account, &new_file_key, &spool, compliance).await
+                    put_merged_output_file(&account, &new_file_key, &spool, compliance, cancel)
+                        .await
                 }
                 .await;
                 let _ = tokio::fs::remove_file(&spool).await;
@@ -1798,7 +1963,7 @@ async fn merge_core_group(
                     infra::cache::file_data::disk::set(&new_file_key, buf.clone()).await?;
                     log::debug!("merge_files {new_file_key} file_data::disk::set success");
                 }
-                put_merged_output(&account, &new_file_key, buf, compliance).await?;
+                put_merged_output(&account, &new_file_key, buf, compliance, cancel).await?;
             }
         }
         VixOutput::Spooled { .. } => {
@@ -1812,7 +1977,7 @@ async fn merge_core_group(
                 infra::cache::file_data::disk::set_from_local_file(&new_file_key, spool).await?;
                 log::debug!("merge_files {new_file_key} file_data::disk::set success");
             }
-            put_merged_output_file(&account, &new_file_key, spool, compliance).await?;
+            put_merged_output_file(&account, &new_file_key, spool, compliance, cancel).await?;
         }
     }
     drop(result.output);
@@ -1829,7 +1994,7 @@ async fn merge_core_group(
         if cache_locally {
             infra::cache::file_data::disk::set(&sidecar_key, buf.clone()).await?;
         }
-        put_merged_output(&account, &sidecar_key, buf, compliance).await?;
+        put_merged_output(&account, &sidecar_key, buf, compliance, cancel).await?;
     }
 
     Ok((
@@ -1871,9 +2036,12 @@ async fn sidecar_only_heal(
     full_text_search_fields: Vec<String>,
     bloom_filter_fields: Vec<String>,
     compliance: bool,
+    cancel: &MergeCancellation,
     start: std::time::Instant,
 ) -> Result<bool, anyhow::Error> {
     use crate::service::vix::core_writer::{SidecarHealOutcome, rebuild_core_file_sidecar};
+
+    cancel.check("sidecar heal planning")?;
 
     let handle = tokio::runtime::Handle::current();
     let source: Arc<dyn vortex_index::VixRangeSource> = Arc::new(HealProbeRangeSource {
@@ -1881,6 +2049,7 @@ async fn sidecar_only_heal(
         location: object_store::path::Path::from(file.key.as_str()),
         size: file.meta.compressed_size as u64,
         handle: handle.clone(),
+        cancel: Some(cancel.clone()),
     });
     let index_source: Option<Arc<dyn vortex_index::VixRangeSource>> =
         config::vix_sidecar_key(&file.key)
@@ -1891,10 +2060,12 @@ async fn sidecar_only_heal(
                     location: object_store::path::Path::from(sidecar_key.as_str()),
                     size: file.meta.index_size as u64,
                     handle,
+                    cancel: Some(cancel.clone()),
                 }) as Arc<dyn vortex_index::VixRangeSource>
             });
     let input = (file.key.clone(), source, index_source);
-    let outcome = tokio::task::spawn_blocking(move || {
+    let cpu_permit = acquire_vix_cpu(cancel, "sidecar heal CPU admission").await?;
+    let mut heal_task = tokio::task::spawn_blocking(move || {
         rebuild_core_file_sidecar(
             stream_type,
             &input,
@@ -1902,8 +2073,17 @@ async fn sidecar_only_heal(
             &full_text_search_fields,
             &bloom_filter_fields,
         )
-    })
-    .await??;
+    });
+    let heal_join = tokio::select! {
+        result = &mut heal_task => result,
+        _ = wait_for_merge_cancellation(cancel) => {
+            cancel.cancel();
+            heal_task.await
+        }
+    };
+    let outcome = heal_join??;
+    drop(cpu_permit);
+    cancel.check("sidecar heal upload")?;
 
     let sidecar_key = config::vix_sidecar_key(&file.key)
         .ok_or_else(|| anyhow::anyhow!("healing batches carry .vix keys: {}", file.key))?;
@@ -1926,8 +2106,14 @@ async fn sidecar_only_heal(
             // fail-open on the unreadable pair and the next sweep
             // re-classifies NeedsRebuild — convergent, never corrupt (doc
             // ids address the unchanged docs either way).
-            put_merged_output(&file.account, &sidecar_key, Bytes::from(index), compliance)
-                .await?;
+            put_merged_output(
+                &file.account,
+                &sidecar_key,
+                Bytes::from(index),
+                compliance,
+                cancel,
+            )
+            .await?;
             index_size
         }
         // Index-off policy heal: metadata-only. The row zeroes FIRST
@@ -1950,8 +2136,8 @@ async fn sidecar_only_heal(
         );
     }
 
-    if new_index_size == 0 && let Err(e) =
-        storage::del(vec![(file.account.as_str(), sidecar_key.as_str())]).await
+    if new_index_size == 0
+        && let Err(e) = storage::del(vec![(file.account.as_str(), sidecar_key.as_str())]).await
     {
         log::warn!(
             "[COMPACTOR:WORKER:{thread_id}] sidecar heal delete of {sidecar_key} failed \
@@ -2000,6 +2186,7 @@ pub(crate) struct HealProbeRangeSource {
     pub(crate) location: object_store::path::Path,
     pub(crate) size: u64,
     pub(crate) handle: tokio::runtime::Handle,
+    pub(crate) cancel: Option<MergeCancellation>,
 }
 
 impl vortex_index::VixRangeSource for HealProbeRangeSource {
@@ -2012,22 +2199,46 @@ impl vortex_index::VixRangeSource for HealProbeRangeSource {
         range: std::ops::Range<u64>,
     ) -> futures::future::BoxFuture<'static, anyhow::Result<Bytes>> {
         use futures::FutureExt;
+        if self
+            .cancel
+            .as_ref()
+            .is_some_and(MergeCancellation::is_cancelled)
+        {
+            return futures::future::ready(Err(anyhow::anyhow!(
+                "vix range fetch of {} cancelled before request",
+                self.location,
+            )))
+            .boxed();
+        }
         let account = self.account.clone();
         let location = self.location.clone();
+        let cancel = self.cancel.clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.handle.spawn(async move {
             let fut = infra::cache::storage::get_range(&account, &location, range);
             let timeout_secs = get_config().limit.vix_fetch_timeout;
-            let result = if timeout_secs > 0 {
-                match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), fut).await
-                {
-                    Ok(result) => result.map_err(anyhow::Error::from),
-                    Err(_) => Err(anyhow::anyhow!(
-                        "vix range fetch timed out after {timeout_secs}s (ZO_VIX_FETCH_TIMEOUT)"
-                    )),
+            let fetch = async move {
+                if timeout_secs > 0 {
+                    match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), fut)
+                        .await
+                    {
+                        Ok(result) => result.map_err(anyhow::Error::from),
+                        Err(_) => Err(anyhow::anyhow!(
+                            "vix range fetch timed out after {timeout_secs}s (ZO_VIX_FETCH_TIMEOUT)"
+                        )),
+                    }
+                } else {
+                    fut.await.map_err(anyhow::Error::from)
                 }
-            } else {
-                fut.await.map_err(anyhow::Error::from)
+            };
+            let result = match cancel {
+                Some(cancel) => tokio::select! {
+                    result = fetch => result,
+                    _ = wait_for_merge_cancellation(&cancel) => Err(anyhow::anyhow!(
+                        "vix range fetch cancelled during request"
+                    )),
+                },
+                None => fetch.await,
             };
             if let Ok(bytes) = &result {
                 metrics::VIX_FETCH_COUNT_TOTAL
@@ -2080,6 +2291,7 @@ async fn single_core_file_heal_reason(
         // a .vix FileMeta's compressed_size is the exact DATA-object size
         size: file.meta.compressed_size as u64,
         handle: handle.clone(),
+        cancel: None,
     });
     // v3 split: the term dictionary lives in the `.vxi` sidecar
     // (index_size = its exact size; 0 = no sidecar, classify routes such
@@ -2093,6 +2305,7 @@ async fn single_core_file_heal_reason(
                     location: object_store::path::Path::from(sidecar_key.as_str()),
                     size: file.meta.index_size as u64,
                     handle,
+                    cancel: None,
                 }) as Arc<dyn vortex_index::VixRangeSource>
             });
     let key = file.key.clone();
@@ -2326,7 +2539,14 @@ async fn reconcile_missing_merge_inputs(files: &[FileKey]) -> usize {
 
 async fn cache_remote_files(files: &[FileKey]) -> Result<Vec<String>, anyhow::Error> {
     let cfg = get_config();
-    let scan_size = files.iter().map(|f| f.meta.compressed_size).sum::<i64>();
+    // Indexed VIX merges consume the sidecar almost as eagerly as the data
+    // footer/docs object.  Prefetch both through the same bounded cache
+    // ladder; previously only data objects were warmed and dictionary merge
+    // paid many remote range requests for `.vxi`.
+    let scan_size = files
+        .iter()
+        .map(|f| f.meta.compressed_size.saturating_add(f.meta.index_size))
+        .sum::<i64>();
     if is_local_disk_storage()
         || !cfg.disk_cache.enabled
         || scan_size >= cfg.disk_cache.skip_size as i64
@@ -2334,7 +2554,27 @@ async fn cache_remote_files(files: &[FileKey]) -> Result<Vec<String>, anyhow::Er
         return Ok(Vec::new());
     };
 
-    let mut tasks = Vec::with_capacity(files.len());
+    let mut objects = Vec::with_capacity(files.len().saturating_mul(2));
+    for file in files {
+        objects.push((
+            file.account.clone(),
+            file.key.clone(),
+            file.meta.compressed_size as usize,
+            true,
+        ));
+        if file.meta.index_size > 0
+            && let Some(sidecar) = config::vix_sidecar_key(&file.key)
+        {
+            objects.push((
+                file.account.clone(),
+                sidecar,
+                file.meta.index_size as usize,
+                false,
+            ));
+        }
+    }
+
+    let mut tasks = Vec::with_capacity(objects.len());
     let semaphore = std::sync::Arc::new(Semaphore::new(cfg.limit.cpu_num));
     // H3: the semaphore caps this job's request PARALLELISM; the
     // process-wide byte budget caps in-flight BYTES across all merge jobs
@@ -2342,10 +2582,7 @@ async fn cache_remote_files(files: &[FileKey]) -> Result<Vec<String>, anyhow::Er
     // one download, so oversize files delay but never starve).
     let download_budget = super::download_budget::global();
     let worker_bytes = std::sync::Arc::new(super::download_budget::WorkerBytes::default());
-    for file in files.iter() {
-        let file_account = file.account.to_string();
-        let file_name = file.key.to_string();
-        let file_size = file.meta.compressed_size as usize;
+    for (file_account, file_name, file_size, required_data_object) in objects {
         let permit = semaphore.clone().acquire_owned().await.unwrap();
         let budget = download_budget.clone();
         let worker = worker_bytes.clone();
@@ -2358,24 +2595,27 @@ async fn cache_remote_files(files: &[FileKey]) -> Result<Vec<String>, anyhow::Er
             } else {
                 Ok(0)
             };
-            // In case where the parquet file is not found or has no data, we assume that it
-            // must have been deleted by some external entity, and hence we
-            // should remove the entry from file_list table.
+            // A missing DATA object invalidates its file-list row. A sidecar
+            // miss is deliberately non-destructive here: the merge/heal path
+            // owns the capability fallback and will rebuild it, whereas
+            // deleting the live data row would lose records.
             let file_name = match ret {
                 Ok(data_len) => {
                     if data_len > 0 && data_len != file_size {
                         log::warn!(
                             "[COMPACT] download file {file_name} found size mismatch, expected: {file_size}, actual: {data_len}, will skip it",
                         );
-                        // skip this file for compact
-                        Some(file_name)
+                        let _ = file_data::disk::remove(&file_name).await;
+                        required_data_object.then_some(file_name)
                     } else {
                         None
                     }
                 }
                 Err(e) => {
-                    if e.to_string().to_lowercase().contains("not found")
-                        || e.to_string().to_lowercase().contains("data size is zero")
+                    let detail = e.to_string();
+                    if required_data_object
+                        && (detail.to_lowercase().contains("not found")
+                            || detail.to_lowercase().contains("data size is zero"))
                     {
                         // delete file from file list AND the object pair:
                         // file_list_only=false also issues the storage
@@ -2393,7 +2633,14 @@ async fn cache_remote_files(files: &[FileKey]) -> Result<Vec<String>, anyhow::Er
                         }
                         Some(file_name)
                     } else {
-                        log::error!("[COMPACT] download file to cache err: {e}");
+                        let object_kind = if required_data_object {
+                            "data"
+                        } else {
+                            "index sidecar"
+                        };
+                        log::warn!(
+                            "[COMPACT] prefetch {object_kind} {file_name} to cache failed; merge range reads will retry/fallback: {detail}"
+                        );
                         // remove downloaded file
                         let _ = file_data::disk::remove(&file_name).await;
                         None
@@ -2425,24 +2672,33 @@ async fn cache_remote_files(files: &[FileKey]) -> Result<Vec<String>, anyhow::Er
 
 /// sort by time range without overlapping
 fn sort_by_time_range(mut file_list: Vec<FileKey>) -> Vec<FileKey> {
+    use std::{cmp::Reverse, collections::BinaryHeap};
+
     let files_num = file_list.len();
     file_list.sort_by_key(|f| f.meta.min_ts);
     let mut groups: Vec<Vec<FileKey>> = Vec::with_capacity(files_num);
+    // The former first-fit scan walked every existing group for every file,
+    // which turns a heavily overlapping partition into O(files * groups).
+    // A min-heap exposes the group whose tail ends first; if that tail still
+    // overlaps the next file, every other group overlaps it as well.  Group
+    // ids keep the final flattening deterministic without moving the groups.
+    let mut available: BinaryHeap<Reverse<(i64, usize)>> = BinaryHeap::new();
     for file in file_list {
-        let mut inserted = None;
-        for (i, group) in groups.iter().enumerate() {
-            if group
-                .last()
-                .is_some_and(|f| file.meta.min_ts >= f.meta.max_ts)
-            {
-                inserted = Some(i);
-                break;
-            }
-        }
-        if let Some(i) = inserted {
-            groups[i].push(file);
+        if available
+            .peek()
+            .is_some_and(|Reverse((max_ts, _))| file.meta.min_ts >= *max_ts)
+        {
+            let Reverse((_, group_id)) = available
+                .pop()
+                .expect("peek proved that a time-range group is available");
+            let next_max = file.meta.max_ts;
+            groups[group_id].push(file);
+            available.push(Reverse((next_max, group_id)));
         } else {
+            let next_max = file.meta.max_ts;
+            let group_id = groups.len();
             groups.push(vec![file]);
+            available.push(Reverse((next_max, group_id)));
         }
     }
     let mut files = Vec::with_capacity(files_num);
@@ -2531,14 +2787,13 @@ mod tests {
 
         // four seeded cohorts:
         //  - 26h ago: deep backlog, min_files + 2 files -> MUST be enqueued
-        //  - 2h ago: inside the old-data lane's default dead zone
-        //    (old_data_min_hours) -> the debt sweep MUST cover it anyway
-        //  - 5h ago: min_files - 1 INDEX-LESS .vix files -> M31b/.123: the
-        //    lone-unindexed clause MUST enqueue it below the floor (these
-        //    files need the heal visit; pre-.123 this cohort proved the
-        //    floor excluded it — that exclusion WAS the convergence wedge)
-        //  - 8h ago: min_files - 1 INDEXED .vix files -> the floor still
-        //    governs indexed files, MUST NOT enqueue
+        //  - 2h ago: inside the old-data lane's default dead zone (old_data_min_hours) -> the debt
+        //    sweep MUST cover it anyway
+        //  - 5h ago: min_files - 1 INDEX-LESS .vix files -> M31b/.123: the lone-unindexed clause
+        //    MUST enqueue it below the floor (these files need the heal visit; pre-.123 this cohort
+        //    proved the floor excluded it — that exclusion WAS the convergence wedge)
+        //  - 8h ago: min_files - 1 INDEXED .vix files -> the floor still governs indexed files,
+        //    MUST NOT enqueue
         let hour = hour_micros(1);
         let now_hour = run - run % hour;
         let dense_old = now_hour - 26 * hour;
@@ -2582,10 +2837,9 @@ mod tests {
         .await;
 
         // first sweep: both dense cohorts enqueue, oldest first
-        let enqueued =
-            generate_merge_debt_job_by_stream(&org, StreamType::Logs, &stream)
-                .await
-                .expect("debt sweep");
+        let enqueued = generate_merge_debt_job_by_stream(&org, StreamType::Logs, &stream)
+            .await
+            .expect("debt sweep");
         assert_eq!(
             enqueued, 3,
             "the two dense cohorts + the below-floor INDEX-LESS cohort carry debt \
@@ -2621,10 +2875,9 @@ mod tests {
         // a finished hour that still holds debt is resurrected next sweep
         let done_ids: Vec<i64> = mine.iter().map(|j| j.id).collect();
         retry_busy("set_job_done", || infra_file_list::set_job_done(&done_ids)).await;
-        let enqueued =
-            generate_merge_debt_job_by_stream(&org, StreamType::Logs, &stream)
-                .await
-                .expect("debt sweep resurrect");
+        let enqueued = generate_merge_debt_job_by_stream(&org, StreamType::Logs, &stream)
+            .await
+            .expect("debt sweep resurrect");
         assert_eq!(enqueued, 3, "done hours with standing debt resurrect");
         let claimed = retry_busy("re-claim", || {
             infra_file_list::get_pending_jobs("m29-debt-test", 10_000, false, 0)
@@ -2652,7 +2905,10 @@ mod tests {
             }
         }
         if !cleanup_done.is_empty() {
-            retry_busy("cleanup done", || infra_file_list::set_job_done(&cleanup_done)).await;
+            retry_busy("cleanup done", || {
+                infra_file_list::set_job_done(&cleanup_done)
+            })
+            .await;
         }
         if !cleanup_release.is_empty() {
             retry_busy("cleanup release", || {
@@ -3328,10 +3584,7 @@ mod tests {
             )
         };
         let files = vec![mk(&present_key), mk(&gone_key)];
-        retry_busy("seed file_list rows", || {
-            infra_file_list::batch_add(&files)
-        })
-        .await;
+        retry_busy("seed file_list rows", || infra_file_list::batch_add(&files)).await;
 
         let removed = reconcile_missing_merge_inputs(&files).await;
         assert_eq!(removed, 1, "exactly the vanished input reconciles");

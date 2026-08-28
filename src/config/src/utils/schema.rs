@@ -79,6 +79,58 @@ where
     Ok(fix_schema(Schema::new(fields), stream_type.into()))
 }
 
+/// Infer one request's schema without widening a field after its first non-null
+/// scalar value. The database's watched schema merge is still the authority:
+/// this only makes a new field's registration candidate deterministic with
+/// respect to input order. A concurrent writer may win the registration race,
+/// in which case its type becomes canonical and the caller casts to it.
+pub fn infer_json_schema_from_map_first_seen<I, V>(
+    stream_name: &str,
+    stream_type: impl Into<StreamType>,
+    value_iter: I,
+) -> Result<Schema, ArrowError>
+where
+    I: Iterator<Item = V>,
+    V: Borrow<Map<String, Value>>,
+{
+    let mut fields = FxIndexMap::default();
+    let mut reserved = false;
+    for value in value_iter {
+        if !reserved {
+            fields.reserve(value.borrow().len());
+            reserved = true;
+        }
+        for (key, value) in value.borrow() {
+            if fields.contains_key(key) || value.is_null() {
+                continue;
+            }
+            let data_type = match value {
+                Value::String(_) => DataType::Utf8,
+                Value::Number(v) if v.is_i64() => DataType::Int64,
+                Value::Number(v) if v.is_u64() => DataType::UInt64,
+                Value::Number(v) if v.is_f64() => DataType::Float64,
+                Value::Number(v) => {
+                    log::warn!(
+                        "stream: {stream_name}, first non-null number for field {key:?} is outside i64/u64/f64; pinning it as string: {v:?}"
+                    );
+                    DataType::Utf8
+                }
+                Value::Bool(_) => DataType::Boolean,
+                _ => {
+                    return Err(ArrowError::SchemaError(format!(
+                        "Cannot infer canonical schema for {stream_name}: field {key:?} has a non-scalar first value"
+                    )));
+                }
+            };
+            fields.insert(key.clone(), Field::new(key, data_type, true));
+        }
+    }
+    Ok(fix_schema(
+        Schema::new(fields.into_values().collect::<Vec<_>>()),
+        stream_type.into(),
+    ))
+}
+
 pub fn infer_json_schema_from_values<I, V>(
     stream_name: &str,
     stream_type: impl Into<StreamType>,
@@ -341,6 +393,29 @@ pub fn schema_eq(a: &Schema, b: &Schema) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_seen_schema_ignores_nulls_and_later_type_drift() {
+        let first = serde_json::json!({"a": null, "b": "7"});
+        let second = serde_json::json!({"a": 7, "b": 7});
+        let third = serde_json::json!({"a": "later", "b": false});
+        let records = [first, second, third];
+        let schema = infer_json_schema_from_map_first_seen(
+            "ordered",
+            StreamType::Logs,
+            records.iter().map(|value| value.as_object().unwrap()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            schema.field_with_name("a").unwrap().data_type(),
+            &DataType::Int64
+        );
+        assert_eq!(
+            schema.field_with_name("b").unwrap().data_type(),
+            &DataType::Utf8
+        );
+    }
 
     #[test]
     fn test_format_stream_name_no_changes() {

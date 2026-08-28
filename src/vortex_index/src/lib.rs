@@ -37,12 +37,11 @@
 //!   each flattened path, and **dense elision** writes an empty postings blob for any term whose
 //!   `doc_count` equals the file's row count (the reader synthesizes the all-ones bitmap).
 //! - `docs`:  one row per record — `_timestamp: i64`, one native column per PRESENT field (v2
-//!   all-present-columns, DESIGN §2), the
-//!   caller-supplied `_source: utf8` (always) and `_original: utf8` (opt-in). Its columns are
-//!   compressed with the BtrBlocks sampler *plus* the zstd/pco compact schemes
-//!   (`_source`/`_original` JSON text lands on zstd), and its chunks — the decompression unit of a
-//!   matched-row point read — are sized by the [`VixWriterOptions::docs_chunk_bytes`] byte budget,
-//!   not the data row-group size.
+//!   all-present-columns, DESIGN §2), the caller-supplied `_source: utf8` (always) and `_original:
+//!   utf8` (opt-in). Its columns are compressed with the BtrBlocks sampler *plus* the zstd/pco
+//!   compact schemes (`_source`/`_original` JSON text lands on zstd), and its chunks — the
+//!   decompression unit of a matched-row point read — are sized by the
+//!   [`VixWriterOptions::docs_chunk_bytes`] byte budget, not the data row-group size.
 //!
 //! Composite dictionary keys are field-major `{field_id u16 BE}{token}`
 //! (`key_layout = "fid_v2"`) so one dictionary serves per-field
@@ -85,16 +84,18 @@ mod source;
 mod spill;
 #[doc(hidden)]
 mod stats;
+mod term_accumulator;
 pub mod test_support;
 mod tokenizer;
 mod writer;
 
-pub use container::{BloomEncodingCensus, RowOrder, VixOutput, ZoneEntry, set_tail_fetch_size};
+pub use container::{
+    BloomEncodingCensus, RowOrder, VixOutput, ZoneEntry, region_row_ranges, set_tail_fetch_size,
+};
 pub use docs::{
     BoundValue, ColumnBound, DocsWidenPlan, EncodedDocsChunk, NumScalar, VixDocs, cmp_i128_vs_f64,
     cmp_num_vs_bound, docs_widen_plan,
 };
-pub use container::region_row_ranges;
 pub use error::VixError;
 pub use merge::DocIdMap;
 pub use numeric::{
@@ -104,16 +105,16 @@ pub use numeric::{
 pub use query::VixQuery;
 pub use reader::{DocsDictChunk, FieldValueCounts, PlistCursor, TermVisitor, VixReader, ZoneChunk};
 pub use source::{BytesRangeSource, VixRangeSource};
-pub use tokenizer::o2_tokenize;
 pub use stats::{
     ColumnChunkStat, ColumnChunkStats, DEFAULT_STATS_MAX_BYTES, DEFAULT_STATS_MIN_DENSITY,
     FileColumnStats, SpliceableStats, StatValue, validate_spliceable,
 };
+pub use tokenizer::o2_tokenize;
 pub use writer::{
     BloomOnlyHasher, DEFAULT_DOCS_CHUNK_BYTES, DEFAULT_DOCS_CHUNK_MAX_ROWS, ID_COL_NAME,
     ORIGINAL_DATA_COL_NAME, RawValueSink, SOURCE_COL_NAME, SOURCE_RENAMED_COL_NAME,
-    TIMESTAMP_COL_NAME, VixWriter, VixWriterOptions, VixWriterStats,
-    docs_schema_mismatch_reason, is_value_indexed_type, resolve_auto_bloom_only,
+    TIMESTAMP_COL_NAME, VixWriter, VixWriterOptions, VixWriterStats, docs_schema_mismatch_reason,
+    is_value_indexed_type, resolve_auto_bloom_only,
 };
 
 #[cfg(test)]

@@ -62,7 +62,10 @@ use crate::{
             TriggerAlertData, check_ingestion_allowed, evaluate_trigger, get_thread_id, write_file,
         },
         pipeline::batch_execution::ExecutablePipeline,
-        schema::{check_for_schema, stream_schema_exists},
+        schema::{
+            CanonicalizationSummary, canonicalize_field_value_into, canonicalize_record_into,
+            check_for_schema, stream_schema_exists,
+        },
         search as search_service,
         self_reporting::report_request_usage_stats,
     },
@@ -80,6 +83,8 @@ pub async fn remote_write(
     let started_at = Utc::now().timestamp_micros();
 
     let cfg = get_config();
+    let mut canonical_summary = CanonicalizationSummary::default();
+    let mut first_canonical_failure_stream = None;
     let dedup_enabled = cfg.common.metrics_dedup_enabled;
     let election_interval = cfg.limit.metrics_leader_election_interval * 1000000;
     let mut cluster_name = String::new();
@@ -507,8 +512,6 @@ pub async fn remote_write(
                 TIMESTAMP_COL_NAME.to_string(),
                 json::Value::Number(timestamp.into()),
             );
-            let value_str = config::utils::json::to_string(&val_map).unwrap();
-
             // check for schema evolution
             let schema_fields = match metric_schema_map.get(&stream_name) {
                 Some(schema) => schema
@@ -542,6 +545,32 @@ pub async fn remote_write(
                     schema_evolved.insert(stream_name.clone(), true);
                 }
             }
+
+            if cfg.common.ingest_canonical_schema {
+                let canonical_schema = metric_schema_map.get(&stream_name).unwrap();
+                let had_failure = canonical_summary.first_failure.is_some();
+                canonicalize_record_into(
+                    StreamType::Metrics,
+                    canonical_schema,
+                    &mut val_map,
+                    &mut canonical_summary,
+                );
+
+                let hash = super::signature_without_labels(&val_map, &[VALUE_LABEL, HASH_LABEL]);
+                let mut hash_value = json::Value::Number(hash.into());
+                canonicalize_field_value_into(
+                    StreamType::Metrics,
+                    canonical_schema,
+                    HASH_LABEL,
+                    &mut hash_value,
+                    &mut canonical_summary,
+                );
+                if !had_failure && canonical_summary.first_failure.is_some() {
+                    first_canonical_failure_stream = Some(stream_name.clone());
+                }
+                val_map.insert(HASH_LABEL.to_string(), hash_value);
+            }
+            let value_str = config::utils::json::to_string(&val_map).unwrap();
 
             let schema = metric_schema_map
                 .get(&stream_name)
@@ -599,6 +628,20 @@ pub async fn remote_write(
     if elapsed_ms > 200 {
         log::info!(
             "[remote_write] org: {org_id}, build records and schema check took: {elapsed_ms} ms",
+        );
+    }
+
+    canonical_summary.flush_metrics(StreamType::Metrics);
+    if canonical_summary.nulled > 0 {
+        let stream_name = first_canonical_failure_stream.unwrap();
+        let failure = canonical_summary.first_failure.as_ref().unwrap();
+        log::warn!(
+            "[METRICS:PROM] canonical schema normalization for {org_id}/{stream_name}: converted {} value(s), nulled {} failed value(s); first failure field={:?}, source_type={}, target_type={}",
+            canonical_summary.converted,
+            canonical_summary.nulled,
+            failure.field,
+            failure.source_type,
+            failure.target_type,
         );
     }
 

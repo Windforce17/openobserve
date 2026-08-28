@@ -23,20 +23,17 @@ use config::{
     cluster::LOCAL_NODE_ID,
     get_config,
     ider::SnowflakeIdGenerator,
-    meta::{
-        promql::METADATA_LABEL,
-        stream::{StreamSettings, StreamType},
-    },
+    meta::{promql::METADATA_LABEL, stream::StreamType},
     metrics,
     utils::{
-        schema::{infer_json_schema_from_map, schema_eq},
+        schema::{infer_json_schema_from_map, infer_json_schema_from_map_first_seen, schema_eq},
         schema_ext::SchemaExt,
         time::now_micros,
     },
 };
 use datafusion::arrow::datatypes::{Field, Schema};
 use infra::schema::{
-    STREAM_RECORD_ID_GENERATOR, STREAM_SCHEMAS_LATEST, STREAM_SETTINGS, SchemaCache,
+    CanonicalType, STREAM_RECORD_ID_GENERATOR, STREAM_SCHEMAS_LATEST, STREAM_SETTINGS, SchemaCache,
     unwrap_stream_settings,
 };
 use serde_json::{Map, Value};
@@ -89,7 +86,31 @@ pub async fn check_for_schema(
 
     // get infer schema
     let value_iter = record_vals.into_iter();
-    let inferred_schema = infer_json_schema_from_map(stream_name, stream_type, value_iter)?;
+    let inferred_schema = if cfg.common.ingest_canonical_schema {
+        infer_json_schema_from_map_first_seen(stream_name, stream_type, value_iter)?
+    } else {
+        infer_json_schema_from_map(stream_name, stream_type, value_iter)?
+    };
+
+    // A cached registry type is the rollout baseline. Reconcile only the
+    // request-width schema (never the full stream schema) before the fast
+    // comparison. `merge_pinned` repeats this rule inside the watched DB CAS,
+    // closing the concurrent-new-field race when this cache is stale.
+    let inferred_schema = if cfg.common.ingest_canonical_schema && !schema.is_empty() {
+        let fields = inferred_schema
+            .fields()
+            .iter()
+            .map(|candidate| {
+                schema
+                    .field_with_name(candidate.name())
+                    .cloned()
+                    .unwrap_or_else(|| candidate.clone())
+            })
+            .collect::<Vec<_>>();
+        Schema::new(fields)
+    } else {
+        inferred_schema
+    };
 
     // fast path
     if schema_eq(schema.schema(), &inferred_schema) {
@@ -269,15 +290,26 @@ pub(crate) async fn handle_diff_schema(
         } else {
             inferred_schema
         };
-        match db::schema::merge(
-            org_id,
-            stream_name,
-            stream_type,
-            schema_for_merge,
-            Some(record_ts),
-        )
-        .await
-        {
+        let merge_result = if cfg.common.ingest_canonical_schema {
+            db::schema::merge_pinned(
+                org_id,
+                stream_name,
+                stream_type,
+                schema_for_merge,
+                Some(record_ts),
+            )
+            .await
+        } else {
+            db::schema::merge(
+                org_id,
+                stream_name,
+                stream_type,
+                schema_for_merge,
+                Some(record_ts),
+            )
+            .await
+        };
+        match merge_result {
             Err(e) => {
                 log::error!(
                     "handle_diff_schema [{org_id}/{stream_type}/{stream_name}] with hash {}, start_dt {record_ts}, error: {e}, retrying...{retries}",
@@ -345,6 +377,323 @@ pub(crate) async fn handle_diff_schema(
         is_schema_changed: true,
         types_delta: Some(field_datatype_delta),
     }))
+}
+
+#[derive(Debug)]
+pub struct CanonicalizationSummary {
+    pub converted: usize,
+    pub nulled: usize,
+    pub first_failure: Option<CanonicalizationFailure>,
+    metric_counts: [u64; CANONICAL_METRIC_SLOTS],
+}
+
+const CANONICAL_SOURCE_LABELS: [&str; 7] = [
+    "boolean",
+    "signed_integer",
+    "unsigned_integer",
+    "float",
+    "string",
+    "array",
+    "object",
+];
+const CANONICAL_TARGET_LABELS: [&str; 6] = [
+    "boolean",
+    "signed_integer",
+    "unsigned_integer",
+    "float",
+    "string",
+    "unsupported",
+];
+const CANONICAL_OUTCOME_LABELS: [&str; 2] = ["converted", "nulled"];
+const CANONICAL_METRIC_SLOTS: usize =
+    CANONICAL_SOURCE_LABELS.len() * CANONICAL_TARGET_LABELS.len() * CANONICAL_OUTCOME_LABELS.len();
+
+impl Default for CanonicalizationSummary {
+    fn default() -> Self {
+        Self {
+            converted: 0,
+            nulled: 0,
+            first_failure: None,
+            metric_counts: [0; CANONICAL_METRIC_SLOTS],
+        }
+    }
+}
+
+impl CanonicalizationSummary {
+    /// Flush at most one Prometheus lookup/increment per bounded label tuple,
+    /// irrespective of the number of converted cells in the request.
+    pub fn flush_metrics(&self, stream_type: StreamType) {
+        for (index, count) in self.metric_counts.iter().copied().enumerate() {
+            if count == 0 {
+                continue;
+            }
+            let outcome_index = index % CANONICAL_OUTCOME_LABELS.len();
+            let pair_index = index / CANONICAL_OUTCOME_LABELS.len();
+            let target_index = pair_index % CANONICAL_TARGET_LABELS.len();
+            let source_index = pair_index / CANONICAL_TARGET_LABELS.len();
+            metrics::INGEST_SCHEMA_CASTS
+                .with_label_values(&[
+                    stream_type.as_str(),
+                    CANONICAL_SOURCE_LABELS[source_index],
+                    CANONICAL_TARGET_LABELS[target_index],
+                    CANONICAL_OUTCOME_LABELS[outcome_index],
+                ])
+                .inc_by(count);
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct CanonicalizationFailure {
+    pub field: String,
+    pub source_type: &'static str,
+    pub target_type: &'static str,
+}
+
+/// Canonicalize only fields present in a JSON record using the immutable,
+/// index-aligned plan carried by the schema cache. Invalid or unsupported
+/// scalar conversions become null so Arrow materialization and every index
+/// consumer observe the same absence.
+pub fn canonicalize_record(
+    stream_type: StreamType,
+    schema: &SchemaCache,
+    record: &mut Map<String, Value>,
+) -> CanonicalizationSummary {
+    let mut summary = CanonicalizationSummary::default();
+    canonicalize_record_into(stream_type, schema, record, &mut summary);
+    summary
+}
+
+pub fn canonicalize_record_into(
+    _stream_type: StreamType,
+    schema: &SchemaCache,
+    record: &mut Map<String, Value>,
+    summary: &mut CanonicalizationSummary,
+) {
+    for (field_name, value) in record.iter_mut() {
+        if value.is_null() {
+            continue;
+        }
+        let Some(target) = schema.canonical_type(field_name) else {
+            // A field can only be unknown here if an out-of-band schema-cache
+            // update raced this request. Leave it untouched; the request's
+            // schema/CAS path already owns registering it.
+            continue;
+        };
+        canonicalize_present_value(field_name, target, value, summary);
+    }
+}
+
+/// Canonicalize one derived field without scanning the record again. Metrics
+/// ingestion uses this after recomputing its series hash from already
+/// normalized labels.
+pub fn canonicalize_field_value(
+    stream_type: StreamType,
+    schema: &SchemaCache,
+    field_name: &str,
+    value: &mut Value,
+) -> CanonicalizationSummary {
+    let mut summary = CanonicalizationSummary::default();
+    canonicalize_field_value_into(stream_type, schema, field_name, value, &mut summary);
+    summary
+}
+
+pub fn canonicalize_field_value_into(
+    _stream_type: StreamType,
+    schema: &SchemaCache,
+    field_name: &str,
+    value: &mut Value,
+    summary: &mut CanonicalizationSummary,
+) {
+    if value.is_null() {
+        return;
+    }
+    if let Some(target) = schema.canonical_type(field_name) {
+        canonicalize_present_value(field_name, target, value, summary);
+    }
+}
+
+fn canonicalize_present_value(
+    field_name: &str,
+    target: CanonicalType,
+    value: &mut Value,
+    summary: &mut CanonicalizationSummary,
+) {
+    let source_type = json_scalar_type(value);
+    let outcome = canonical_value(value, target);
+    let outcome_index = match outcome {
+        CanonicalValueOutcome::Identity => return,
+        CanonicalValueOutcome::Converted => {
+            summary.converted += 1;
+            0
+        }
+        CanonicalValueOutcome::Failed => {
+            *value = Value::Null;
+            summary.nulled += 1;
+            if summary.first_failure.is_none() {
+                summary.first_failure = Some(CanonicalizationFailure {
+                    field: field_name.to_string(),
+                    source_type,
+                    target_type: target.label(),
+                });
+            }
+            1
+        }
+    };
+    let source_index = canonical_source_index(source_type);
+    let target_index = canonical_target_index(target);
+    let metric_index = (source_index * CANONICAL_TARGET_LABELS.len() + target_index)
+        * CANONICAL_OUTCOME_LABELS.len()
+        + outcome_index;
+    summary.metric_counts[metric_index] += 1;
+}
+
+fn canonical_source_index(label: &str) -> usize {
+    match label {
+        "boolean" => 0,
+        "signed_integer" => 1,
+        "unsigned_integer" => 2,
+        "float" => 3,
+        "string" => 4,
+        "array" => 5,
+        "object" => 6,
+        _ => unreachable!("canonical source labels are closed"),
+    }
+}
+
+fn canonical_target_index(target: CanonicalType) -> usize {
+    match target {
+        CanonicalType::Boolean => 0,
+        CanonicalType::Signed(_) => 1,
+        CanonicalType::Unsigned(_) => 2,
+        CanonicalType::Float(_) => 3,
+        CanonicalType::String => 4,
+        CanonicalType::Unsupported => 5,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CanonicalValueOutcome {
+    Identity,
+    Converted,
+    Failed,
+}
+
+fn json_scalar_type(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(number) if number.is_i64() => "signed_integer",
+        Value::Number(number) if number.is_u64() => "unsigned_integer",
+        Value::Number(_) => "float",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+fn canonical_value(value: &mut Value, target: CanonicalType) -> CanonicalValueOutcome {
+    let source = json_scalar_type(value);
+    let replacement = match target {
+        CanonicalType::String => match value {
+            Value::String(_) => return CanonicalValueOutcome::Identity,
+            Value::Bool(v) => Some(Value::String(v.to_string())),
+            Value::Number(v) => Some(Value::String(v.to_string())),
+            _ => None,
+        },
+        CanonicalType::Boolean => match value {
+            Value::Bool(_) => return CanonicalValueOutcome::Identity,
+            Value::String(v) => v.parse::<bool>().ok().map(Value::Bool),
+            Value::Number(v) => v
+                .as_f64()
+                .filter(|v| v.is_finite())
+                .map(|v| Value::Bool(v != 0.0)),
+            _ => None,
+        },
+        CanonicalType::Signed(bits) => signed_value(value, bits).map(|v| Value::Number(v.into())),
+        CanonicalType::Unsigned(bits) => {
+            unsigned_value(value, bits).map(|v| Value::Number(v.into()))
+        }
+        CanonicalType::Float(bits) => float_value(value, bits)
+            .and_then(serde_json::Number::from_f64)
+            .map(Value::Number),
+        CanonicalType::Unsupported => None,
+    };
+    match replacement {
+        Some(replacement) => {
+            let outcome = if source == target.label() && *value == replacement {
+                CanonicalValueOutcome::Identity
+            } else {
+                CanonicalValueOutcome::Converted
+            };
+            *value = replacement;
+            outcome
+        }
+        None => CanonicalValueOutcome::Failed,
+    }
+}
+
+fn signed_value(value: &Value, bits: u8) -> Option<i64> {
+    let value = match value {
+        Value::Number(v) if v.is_i64() => v.as_i64()?,
+        Value::Number(v) if v.is_u64() => i64::try_from(v.as_u64()?).ok()?,
+        Value::Number(v) => {
+            let v = v.as_f64()?;
+            (v.is_finite() && v >= i64::MIN as f64 && v < -(i64::MIN as f64))
+                .then_some(v.trunc() as i64)?
+        }
+        Value::String(v) => v.parse().ok()?,
+        Value::Bool(v) => i64::from(*v),
+        _ => return None,
+    };
+    let (min, max) = match bits {
+        8 => (i8::MIN as i64, i8::MAX as i64),
+        16 => (i16::MIN as i64, i16::MAX as i64),
+        32 => (i32::MIN as i64, i32::MAX as i64),
+        64 => (i64::MIN, i64::MAX),
+        _ => return None,
+    };
+    (min..=max).contains(&value).then_some(value)
+}
+
+fn unsigned_value(value: &Value, bits: u8) -> Option<u64> {
+    let value = match value {
+        Value::Number(v) if v.is_u64() => v.as_u64()?,
+        Value::Number(v) if v.is_i64() => u64::try_from(v.as_i64()?).ok()?,
+        Value::Number(v) => {
+            let v = v.as_f64()?;
+            (v.is_finite() && v >= 0.0 && v < u64::MAX as f64).then_some(v.trunc() as u64)?
+        }
+        Value::String(v) => v.parse().ok()?,
+        Value::Bool(v) => u64::from(*v),
+        _ => return None,
+    };
+    let max = match bits {
+        8 => u8::MAX as u64,
+        16 => u16::MAX as u64,
+        32 => u32::MAX as u64,
+        64 => u64::MAX,
+        _ => return None,
+    };
+    (value <= max).then_some(value)
+}
+
+fn float_value(value: &Value, bits: u8) -> Option<f64> {
+    let value = match value {
+        Value::Number(v) => v.as_f64()?,
+        Value::String(v) => v.parse().ok()?,
+        Value::Bool(v) => u8::from(*v) as f64,
+        _ => return None,
+    };
+    if !value.is_finite() {
+        return None;
+    }
+    match bits {
+        16 if value.abs() <= 65_504.0 => Some(value),
+        32 if value.abs() <= f32::MAX as f64 => Some((value as f32) as f64),
+        64 => Some(value),
+        _ => None,
+    }
 }
 
 pub fn get_schema_changes(schema: &SchemaCache, inferred_schema: &Schema) -> (bool, Vec<Field>) {
@@ -430,6 +779,56 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn canonicalization_converts_successes_and_nulls_failures() {
+        let schema = SchemaCache::new(Schema::new(vec![
+            Field::new("number", DataType::Int64, true),
+            Field::new("flag", DataType::Boolean, true),
+            Field::new("text", DataType::Utf8View, true),
+            Field::new("small", DataType::UInt8, true),
+        ]));
+        let mut record = serde_json::json!({
+            "number": "42",
+            "flag": "not-a-bool",
+            "text": 17,
+            "small": 256,
+            "unknown": "untouched"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let summary = canonicalize_record(StreamType::Logs, &schema, &mut record);
+        assert_eq!(summary.converted, 2);
+        assert_eq!(summary.nulled, 2);
+        assert_eq!(record["number"], serde_json::json!(42));
+        assert_eq!(record["text"], serde_json::json!("17"));
+        assert!(record["flag"].is_null());
+        assert!(record["small"].is_null());
+        assert_eq!(record["unknown"], serde_json::json!("untouched"));
+    }
+
+    #[test]
+    fn canonicalization_does_not_wrap_integer_ranges_or_default_values() {
+        let schema = SchemaCache::new(Schema::new(vec![
+            Field::new("signed", DataType::Int64, true),
+            Field::new("unsigned", DataType::UInt64, true),
+            Field::new("boolean", DataType::Boolean, true),
+        ]));
+        let mut record = serde_json::json!({
+            "signed": 18446744073709551615u64,
+            "unsigned": -1,
+            "boolean": "invalid"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let summary = canonicalize_record(StreamType::Metrics, &schema, &mut record);
+        assert_eq!(summary.nulled, 3);
+        assert!(record.values().all(Value::is_null));
+    }
+
     #[tokio::test]
     async fn test_check_for_schema() {
         let stream_name = "Sample";
@@ -479,5 +878,4 @@ mod tests {
         let value_iter = record_val.into_iter();
         infer_json_schema_from_map("test", stream_type, value_iter).unwrap();
     }
-
 }

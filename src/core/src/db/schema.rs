@@ -77,6 +77,31 @@ pub async fn merge(
     Ok(ret)
 }
 
+pub async fn merge_pinned(
+    org_id: &str,
+    stream_name: &str,
+    stream_type: StreamType,
+    schema: &Schema,
+    min_ts: Option<i64>,
+) -> Result<Option<(Schema, Vec<Field>)>, anyhow::Error> {
+    let ret = infra::schema::merge_pinned(org_id, stream_name, stream_type, schema, min_ts).await?;
+
+    #[cfg(feature = "enterprise")]
+    if get_o2_config().super_cluster.enabled {
+        let key = mk_key(org_id, stream_type, stream_name);
+        o2_enterprise::enterprise::super_cluster::queue::schema_merge(
+            &key,
+            json::to_vec(&schema).unwrap().into(),
+            infra::db::NEED_WATCH,
+            min_ts,
+        )
+        .await
+        .map_err(|e| Error::Message(e.to_string()))?;
+    }
+
+    Ok(ret)
+}
+
 pub async fn update_setting(
     org_id: &str,
     stream_name: &str,

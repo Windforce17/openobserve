@@ -22,7 +22,7 @@ use axum::{
 use bytes::{Bytes, BytesMut};
 use chrono::Utc;
 use config::{
-    TIMESTAMP_COL_NAME,
+    TIMESTAMP_COL_NAME, get_config,
     meta::{
         alerts::alert,
         otlp::OtlpRequestType,
@@ -60,7 +60,10 @@ use crate::{
         },
         metrics::get_exclude_labels,
         pipeline::batch_execution::ExecutablePipeline,
-        schema::{check_for_schema, stream_schema_exists},
+        schema::{
+            CanonicalizationSummary, canonicalize_field_value_into, canonicalize_record_into,
+            check_for_schema, stream_schema_exists,
+        },
         self_reporting::report_request_usage_stats,
     },
 };
@@ -164,6 +167,9 @@ pub async fn handle_otlp_request(
     let mut metric_data_map: HashMap<String, HashMap<String, SchemaRecords>> = HashMap::new();
     let mut metric_schema_map: HashMap<String, SchemaCache> = HashMap::new();
     let mut stream_partitioning_map: HashMap<String, Vec<StreamPartition>> = HashMap::new();
+    let canonical_schema_enabled = get_config().common.ingest_canonical_schema;
+    let mut canonical_summary = CanonicalizationSummary::default();
+    let mut first_canonical_failure_stream = None;
 
     // associated pipeline
     let mut stream_executable_pipelines: HashMap<String, Vec<ExecutablePipeline>> = HashMap::new();
@@ -492,7 +498,39 @@ pub async fn handle_otlp_request(
         )
         .await?;
 
-        for val_map in json_data {
+        let canonical_schema = metric_schema_map.get(&local_metric_name).unwrap();
+        let record_schema = Arc::new(
+            canonical_schema
+                .schema()
+                .as_ref()
+                .clone()
+                .with_metadata(HashMap::new()),
+        );
+        let schema_key = record_schema.hash_key();
+        for mut val_map in json_data {
+            if canonical_schema_enabled {
+                let had_failure = canonical_summary.first_failure.is_some();
+                canonicalize_record_into(
+                    StreamType::Metrics,
+                    canonical_schema,
+                    &mut val_map,
+                    &mut canonical_summary,
+                );
+
+                let hash = super::signature_without_labels(&val_map, &get_exclude_labels());
+                let mut hash_value = json::Value::Number(hash.into());
+                canonicalize_field_value_into(
+                    StreamType::Metrics,
+                    canonical_schema,
+                    HASH_LABEL,
+                    &mut hash_value,
+                    &mut canonical_summary,
+                );
+                if !had_failure && canonical_summary.first_failure.is_some() {
+                    first_canonical_failure_stream = Some(local_metric_name.clone());
+                }
+                val_map.insert(HASH_LABEL.to_string(), hash_value);
+            }
             let timestamp = val_map
                 .get(TIMESTAMP_COL_NAME)
                 .and_then(|ts| ts.as_i64())
@@ -503,14 +541,6 @@ pub async fn handle_otlp_request(
             let buf = metric_data_map
                 .entry(local_metric_name.to_owned())
                 .or_default();
-            let schema = metric_schema_map
-                .get(&local_metric_name)
-                .unwrap()
-                .schema()
-                .as_ref()
-                .clone()
-                .with_metadata(HashMap::new());
-            let schema_key = schema.hash_key();
             // get hour key
             let hour_key = crate::service::ingestion::get_write_partition_key(
                 timestamp,
@@ -520,8 +550,8 @@ pub async fn handle_otlp_request(
                 Some(&schema_key),
             );
             let hour_buf = buf.entry(hour_key).or_insert_with(|| SchemaRecords {
-                schema_key,
-                schema: Arc::new(schema),
+                schema_key: schema_key.clone(),
+                schema: record_schema.clone(),
                 records: vec![],
                 records_size: 0,
             });
@@ -552,6 +582,20 @@ pub async fn handle_otlp_request(
             }
             // End check for alert trigger
         }
+    }
+
+    canonical_summary.flush_metrics(StreamType::Metrics);
+    if canonical_summary.nulled > 0 {
+        let stream_name = first_canonical_failure_stream.unwrap();
+        let failure = canonical_summary.first_failure.as_ref().unwrap();
+        log::warn!(
+            "[METRICS:OTLP] canonical schema normalization for {org_id}/{stream_name}: converted {} value(s), nulled {} failed value(s); first failure field={:?}, source_type={}, target_type={}",
+            canonical_summary.converted,
+            canonical_summary.nulled,
+            failure.field,
+            failure.source_type,
+            failure.target_type,
+        );
     }
 
     // write data to wal

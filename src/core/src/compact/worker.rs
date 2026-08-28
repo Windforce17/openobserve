@@ -29,6 +29,47 @@ pub struct MergeBatch {
     pub stream_name: String,
     pub prefix: String,
     pub files: Vec<FileKey>,
+    /// Shared by every batch produced for one claimed compaction job. Lease
+    /// loss or shutdown marks it so queued work can stop before doing more
+    /// I/O/CPU and active phases can cooperatively exit at their next
+    /// boundary.
+    pub cancel: MergeCancellation,
+}
+
+#[derive(Clone, Default)]
+pub struct MergeCancellation(crate::service::vix::core_writer::VixMergeCancellation);
+
+impl MergeCancellation {
+    #[inline]
+    pub fn cancel(&self) {
+        self.0.cancel();
+    }
+
+    #[inline]
+    pub fn is_cancelled(&self) -> bool {
+        if is_offline() {
+            // Mirror process shutdown into the dependency-neutral token used
+            // by blocking VIX workers. Once observed, cancellation remains
+            // monotonic even if the outer async worker is no longer polled.
+            self.0.cancel();
+        }
+        self.0.is_cancelled()
+    }
+
+    #[inline]
+    pub fn vix_token(&self) -> crate::service::vix::core_writer::VixMergeCancellation {
+        self.0.clone()
+    }
+
+    pub fn check(&self, context: &str) -> Result<(), anyhow::Error> {
+        if self.is_cancelled() {
+            Err(anyhow::anyhow!(
+                "compaction cancelled before {context}: job lease was lost or node is shutting down"
+            ))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 pub struct MergeResult {
@@ -419,6 +460,15 @@ impl MergeWorker {
                             break;
                         }
                         Some((tx, msg)) => {
+                            if let Err(e) = msg.cancel.check("worker merge start") {
+                                if let Err(send_error) = tx.send(Err(e)).await {
+                                    log::error!(
+                                        "[COMPACTOR:WORKER:{thread_id}] failed to report cancelled batch {}: {send_error}",
+                                        msg.batch_id,
+                                    );
+                                }
+                                continue;
+                            }
                             match super::merge::merge_files(
                                 thread_id,
                                 &msg.org_id,
@@ -426,6 +476,7 @@ impl MergeWorker {
                                 &msg.stream_name,
                                 &msg.prefix,
                                 &msg.files,
+                                &msg.cancel,
                             )
                             .await
                             {

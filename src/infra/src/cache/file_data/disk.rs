@@ -674,8 +674,11 @@ pub async fn set(file: &str, data: Bytes) -> Result<(), anyhow::Error> {
 }
 
 /// Seed the disk cache from a LOCAL file (e.g. a compaction spool) without
-/// transiting RAM (H3): file-to-file copy into the cache tmp dir, then the
-/// same rename-into-cache tail as [`set`].
+/// transiting RAM (H3). Prefer a hard link so a compaction output on the same
+/// filesystem is promoted without another full-file read/write pass; fall
+/// back to a file copy across devices or on filesystems that reject links.
+/// The cache's rename-into-place tail consumes only the temporary link/copy,
+/// never the caller-owned source spool.
 pub async fn set_from_local_file(
     file: &str,
     source: &std::path::Path,
@@ -684,12 +687,35 @@ pub async fn set_from_local_file(
         return Ok(());
     }
     let tmp_file = alloc_tmp_file_path().await?;
-    let size = tokio::fs::copy(source, &tmp_file).await.map_err(|e| {
-        anyhow::anyhow!(
-            "[FileData::Disk] copy local file {} to tmp file {tmp_file} failed: {e}",
-            source.display()
-        )
-    })? as usize;
+    let size = match tokio::fs::hard_link(source, &tmp_file).await {
+        Ok(()) => match tokio::fs::metadata(source).await {
+            Ok(metadata) => metadata.len() as usize,
+            Err(error) => {
+                let _ = tokio::fs::remove_file(&tmp_file).await;
+                return Err(anyhow::anyhow!(
+                    "[FileData::Disk] stat hard-linked local file {} failed; removed temporary link {tmp_file}: {error}",
+                    source.display()
+                ));
+            }
+        },
+        Err(link_error) => match tokio::fs::copy(source, &tmp_file).await {
+            Ok(size) => {
+                log::debug!(
+                    "[FileData::Disk] hard-link promotion of {} failed ({link_error}); copied {} bytes instead",
+                    source.display(),
+                    size,
+                );
+                size as usize
+            }
+            Err(copy_error) => {
+                let _ = tokio::fs::remove_file(&tmp_file).await;
+                return Err(anyhow::anyhow!(
+                    "[FileData::Disk] promote local file {} to cache tmp {tmp_file} failed: hard link: {link_error}; copy fallback: {copy_error}",
+                    source.display()
+                ));
+            }
+        },
+    };
     set_from_tmp_file(file, &tmp_file, size).await
 }
 
@@ -1056,19 +1082,21 @@ pub async fn download(
     size: Option<usize>,
 ) -> Result<usize, anyhow::Error> {
     let tmp_file = alloc_tmp_file_path().await?;
-    let data_len =
-        match super::download_from_storage_to_file(account, file, size, std::path::Path::new(
-            &tmp_file,
-        ))
-        .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                // best-effort cleanup of the partial tmp file
-                let _ = tokio::fs::remove_file(&tmp_file).await;
-                return Err(e);
-            }
-        };
+    let data_len = match super::download_from_storage_to_file(
+        account,
+        file,
+        size,
+        std::path::Path::new(&tmp_file),
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            // best-effort cleanup of the partial tmp file
+            let _ = tokio::fs::remove_file(&tmp_file).await;
+            return Err(e);
+        }
+    };
     if let Err(e) = set_from_tmp_file(file, &tmp_file, data_len).await {
         let _ = tokio::fs::remove_file(&tmp_file).await;
         return Err(anyhow::anyhow!(

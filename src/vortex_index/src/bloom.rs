@@ -57,11 +57,14 @@
 //! ```
 
 use hashbrown::HashMap;
+use rapidhash::fast::GlobalState;
 
 use crate::{
     error::{Result, VixError},
     sbbf::{BLOCK_BYTES, Sbbf, hash_value, num_blocks_for},
 };
+
+type FastHashMap<K, V> = HashMap<K, V, GlobalState>;
 
 /// Blob magic (head only; the blob sits inside the puffin envelope, which
 /// carries its own integrity framing).
@@ -211,7 +214,7 @@ struct FieldAcc {
 #[derive(Debug, Default)]
 pub struct BloomHashAcc {
     /// field id -> accumulation
-    fields: HashMap<u16, FieldAcc>,
+    fields: FastHashMap<u16, FieldAcc>,
     /// #48 composite section: `(fid -> name)` for EVERY term-plan field.
     /// Non-empty enables the composite accumulation — each observed key
     /// ALSO hashes the file-independent form `{field name}\0{value}` into
@@ -219,7 +222,7 @@ pub struct BloomHashAcc {
     /// term field becomes bloom-decidable. Field NAMES (not per-file ids)
     /// keep the hash stable across files, which is what lets the pruner
     /// compute the probe key without knowing any file's term plan.
-    composite_names: HashMap<u16, String>,
+    composite_names: FastHashMap<u16, String>,
     /// The composite accumulation (name fixed to [`COMPOSITE_BLOOM_FIELD`]).
     composite: FieldAcc,
     /// Scratch for composite key assembly (separate from `scratch`: the
@@ -270,7 +273,7 @@ impl BloomHashAcc {
     /// callers resolve configured names against their own field table
     /// (names absent from a file are simply not tracked).
     pub fn from_pairs<I: IntoIterator<Item = (u16, String)>>(pairs: I) -> Self {
-        let mut fields = HashMap::new();
+        let mut fields = FastHashMap::default();
         for (id, name) in pairs {
             fields.insert(
                 id,
@@ -1581,6 +1584,240 @@ mod tests {
                 composite_guard_key("trace_id", pr, &mut buf).unwrap()
             ));
         }
+    }
+
+    /// An exact expected final-row maximum lets a high-cardinality field demote
+    /// at a push boundary, before the remaining rows build value postings.
+    /// The optimization must remain byte-identical to the finish-time AUTO
+    /// decision: it changes temporary work only, never the file contract.
+    #[test]
+    fn early_auto_demotion_matches_finish_time_bytes() {
+        use std::sync::Arc;
+
+        use arrow::{
+            array::{ArrayRef, Int64Array, StringArray},
+            datatypes::{DataType, Field, Schema},
+            record_batch::RecordBatch,
+        };
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("trace_id", DataType::Utf8, true),
+        ]));
+        let build = |early: bool| {
+            let mut writer = crate::VixWriter::new(
+                &schema,
+                crate::VixWriterOptions {
+                    bloom_composite: true,
+                    bloom_only_auto_ratio: 0.5,
+                    bloom_only_min_distinct: 4,
+                    ..Default::default()
+                },
+                false,
+            );
+            if early {
+                writer.set_expected_max_rows_for_auto_demotion(8).unwrap();
+            }
+            for chunk in 0..2i64 {
+                let first = chunk * 4;
+                let ids: Vec<String> = (first..first + 4)
+                    .map(|row| format!("trace-{row}"))
+                    .collect();
+                let batch = RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(Int64Array::from(
+                            (first..first + 4)
+                                .map(|row| 10_000 + row)
+                                .collect::<Vec<_>>(),
+                        )) as ArrayRef,
+                        Arc::new(StringArray::from(
+                            ids.iter().map(String::as_str).collect::<Vec<_>>(),
+                        )) as ArrayRef,
+                    ],
+                )
+                .unwrap();
+                let source = StringArray::from_iter_values(
+                    ids.iter()
+                        .map(|trace_id| format!(r#"{{"trace_id":"{trace_id}"}}"#)),
+                );
+                writer
+                    .push_batch_with_source(&batch, &source, None)
+                    .unwrap();
+                if early && chunk == 0 {
+                    assert_eq!(
+                        writer.bloom_only_fields(),
+                        ["trace_id"],
+                        "the second half must bypass value-postings construction"
+                    );
+                }
+            }
+            writer.finish().unwrap()
+        };
+
+        let finish_time = build(false);
+        let early = build(true);
+        assert_eq!(early.0, finish_time.0, "data bytes changed");
+        assert_eq!(early.1, finish_time.1, "index bytes changed");
+    }
+
+    /// Once an expected-maximum-driven decision has discarded postings, an
+    /// underestimated bound must fail loudly instead of publishing an AUTO
+    /// decision that the true final denominator might not satisfy.
+    #[test]
+    fn early_auto_demotion_rejects_exceeded_row_bound() {
+        use std::sync::Arc;
+
+        use arrow::{
+            array::{ArrayRef, Int64Array, StringArray},
+            datatypes::{DataType, Field, Schema},
+            record_batch::RecordBatch,
+        };
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("trace_id", DataType::Utf8, true),
+        ]));
+        let mut writer = crate::VixWriter::new(
+            &schema,
+            crate::VixWriterOptions {
+                bloom_only_auto_ratio: 0.5,
+                bloom_only_min_distinct: 1,
+                ..Default::default()
+            },
+            false,
+        );
+        writer.set_expected_max_rows_for_auto_demotion(2).unwrap();
+
+        let push = |writer: &mut crate::VixWriter, timestamps: Vec<i64>, ids: Vec<&str>| {
+            let source = StringArray::from_iter_values(
+                ids.iter()
+                    .map(|trace_id| format!(r#"{{"trace_id":"{trace_id}"}}"#)),
+            );
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(timestamps)) as ArrayRef,
+                    Arc::new(StringArray::from(ids)) as ArrayRef,
+                ],
+            )
+            .unwrap();
+            writer.push_batch_with_source(&batch, &source, None)
+        };
+
+        push(&mut writer, vec![10], vec!["trace-a"]).unwrap();
+        assert_eq!(writer.bloom_only_fields(), ["trace_id"]);
+        let error = push(&mut writer, vec![9, 8], vec!["trace-b", "trace-c"]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("exceeded the expected maximum rows"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// Run with:
+    /// `cargo test -p vortex_index benchmark_early_auto_demotion --release -- --ignored
+    /// --nocapture`
+    ///
+    /// This isolates the expected-final-row hint from the other compactor
+    /// changes: both arms use the same rapidhash accumulator and produce
+    /// byte-identical files; only the point at which unique `trace_id`
+    /// postings are discarded differs.
+    #[test]
+    #[ignore = "manual high-cardinality AUTO-demotion benchmark"]
+    fn benchmark_early_auto_demotion() {
+        use std::{sync::Arc, time::Instant};
+
+        use arrow::{
+            array::{ArrayRef, Int64Array, StringArray},
+            datatypes::{DataType, Field, Schema},
+            record_batch::RecordBatch,
+        };
+
+        const ROWS: usize = 400_000;
+        const BATCH_ROWS: usize = 8_192;
+        const RUNS: usize = 7;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("trace_id", DataType::Utf8, true),
+        ]));
+        let corpus: Vec<(RecordBatch, StringArray)> = (0..ROWS)
+            .step_by(BATCH_ROWS)
+            .map(|offset| {
+                let len = BATCH_ROWS.min(ROWS - offset);
+                let ids: Vec<String> = (offset..offset + len)
+                    .map(|row| format!("{row:032x}"))
+                    .collect();
+                let batch = RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(Int64Array::from_iter_values(
+                            (offset..offset + len)
+                                .map(|row| 2_000_000_000_000_000i64 - row as i64),
+                        )) as ArrayRef,
+                        Arc::new(StringArray::from(
+                            ids.iter().map(String::as_str).collect::<Vec<_>>(),
+                        )) as ArrayRef,
+                    ],
+                )
+                .unwrap();
+                let source = StringArray::from_iter_values(
+                    ids.iter()
+                        .map(|trace_id| format!(r#"{{"trace_id":"{trace_id}"}}"#)),
+                );
+                (batch, source)
+            })
+            .collect();
+        let run = |early: bool| {
+            let started = Instant::now();
+            let mut writer = crate::VixWriter::new(
+                &schema,
+                crate::VixWriterOptions {
+                    bloom_composite: true,
+                    bloom_only_auto_ratio: 0.5,
+                    bloom_only_min_distinct: 65_536,
+                    ..Default::default()
+                },
+                false,
+            );
+            if early {
+                writer
+                    .set_expected_max_rows_for_auto_demotion(ROWS as u64)
+                    .unwrap();
+            }
+            for (batch, source) in &corpus {
+                writer.push_batch_with_source(batch, source, None).unwrap();
+            }
+            let output = writer.finish().unwrap();
+            (started.elapsed(), output)
+        };
+
+        let (_, late_output) = run(false);
+        let (_, early_output) = run(true);
+        assert_eq!(early_output, late_output, "benchmark outputs changed");
+        drop((late_output, early_output));
+
+        let mut late = Vec::with_capacity(RUNS);
+        let mut early = Vec::with_capacity(RUNS);
+        for round in 0..RUNS {
+            if round % 2 == 0 {
+                late.push(run(false).0);
+                early.push(run(true).0);
+            } else {
+                early.push(run(true).0);
+                late.push(run(false).0);
+            }
+        }
+        late.sort_unstable();
+        early.sort_unstable();
+        let late = late[RUNS / 2];
+        let early = early[RUNS / 2];
+        eprintln!(
+            "rows={ROWS} finish_time_auto={late:?} early_auto={early:?} speedup={:.3}x",
+            late.as_secs_f64() / early.as_secs_f64()
+        );
     }
 
     /// #52/M7 first-encode AUTO edges: the distinct floor, the ratio, the

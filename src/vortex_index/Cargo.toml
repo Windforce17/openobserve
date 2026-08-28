@@ -19,6 +19,7 @@ bytes.workspace = true
 futures.workspace = true
 gxhash = { version = "3.5", optional = true }
 hashbrown.workspace = true
+rapidhash.workspace = true
 itertools.workspace = true
 itoa = "1.0"
 levenshtein_automata.workspace = true

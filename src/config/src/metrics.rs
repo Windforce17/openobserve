@@ -138,6 +138,20 @@ pub static INGEST_ERRORS: Lazy<IntCounterVec> = Lazy::new(|| {
     )
     .expect("Metric created")
 });
+/// Bounded-cardinality visibility for pinned-schema scalar normalization.
+/// Field and stream names are deliberately excluded.
+pub static INGEST_SCHEMA_CASTS: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "ingest_schema_casts_total",
+            "Scalar values converted or nulled by first-seen canonical schema ingestion",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &["stream_type", "source_type", "target_type", "outcome"],
+    )
+    .expect("Metric created")
+});
 pub static INGEST_WAL_USED_BYTES: Lazy<IntGaugeVec> = Lazy::new(|| {
     IntGaugeVec::new(
         Opts::new(
@@ -675,6 +689,25 @@ pub static COMPACT_DROPPED_ZERO_TS_ROWS: Lazy<IntCounterVec> = Lazy::new(|| {
         .namespace(NAMESPACE)
         .const_labels(create_const_labels()),
         &["organization", "stream_type", "stream"],
+    )
+    .expect("Metric created")
+});
+/// Low-cardinality VIX compaction phase latency.  Keep stream/field names
+/// out of labels: production wide streams would otherwise turn the
+/// observability intended to diagnose compaction into another hot path.
+pub static COMPACT_VIX_PHASE_DURATION: Lazy<HistogramVec> = Lazy::new(|| {
+    HistogramVec::new(
+        HistogramOpts::new(
+            "compact_vix_phase_duration_seconds",
+            "VIX compaction wall time by bounded phase and merge shape.".to_owned() + HELP_SUFFIX,
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels())
+        .buckets(vec![
+            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
+            120.0, 300.0,
+        ]),
+        &["phase", "shape"],
     )
     .expect("Metric created")
 });
@@ -1984,6 +2017,9 @@ fn register_metrics(registry: &Registry) {
         .register(Box::new(INGEST_ERRORS.clone()))
         .expect("Metric registered");
     registry
+        .register(Box::new(INGEST_SCHEMA_CASTS.clone()))
+        .expect("Metric registered");
+    registry
         .register(Box::new(INGEST_WAL_USED_BYTES.clone()))
         .expect("Metric registered");
     registry
@@ -2115,6 +2151,9 @@ fn register_metrics(registry: &Registry) {
         .expect("Metric registered");
     registry
         .register(Box::new(COMPACT_DROPPED_ZERO_TS_ROWS.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(COMPACT_VIX_PHASE_DURATION.clone()))
         .expect("Metric registered");
 
     // bloom filter prune metrics
@@ -2572,6 +2611,7 @@ mod tests {
         let _ = INGEST_RECORDS.clone();
         let _ = INGEST_BYTES.clone();
         let _ = INGEST_ERRORS.clone();
+        let _ = INGEST_SCHEMA_CASTS.clone();
         let _ = INGEST_WAL_USED_BYTES.clone();
         let _ = INGEST_PARQUET_FILES.clone();
         let _ = INGEST_WAL_WRITE_BYTES.clone();
@@ -2640,6 +2680,7 @@ mod tests {
         let _ = COMPACT_MERGED_BYTES.clone();
         let _ = COMPACT_PENDING_JOBS.clone();
         let _ = COMPACT_DROPPED_ZERO_TS_ROWS.clone();
+        let _ = COMPACT_VIX_PHASE_DURATION.clone();
         let _ = STREAM_STATS_SCAN_DURATION.clone();
         let _ = STREAM_STATS_SCAN_TOTAL.clone();
         let _ = STREAM_STATS_SCAN_ERRORS_TOTAL.clone();

@@ -37,9 +37,18 @@ pub const BLOCK_LEN: usize = BitPacker4x::BLOCK_LEN;
 ///
 /// Returns an error if the ids are not ascending.
 pub fn encode(doc_ids: &[u32]) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    encode_into(doc_ids, &mut out)?;
+    Ok(out)
+}
+
+/// Encode into a caller-owned buffer, retaining its capacity for the next
+/// postings list.
+pub(crate) fn encode_into(doc_ids: &[u32], out: &mut Vec<u8>) -> Result<()> {
     let packer = BitPacker4x::new();
     // 2 bytes/id is a decent guess for typical gap distributions.
-    let mut out = Vec::with_capacity(doc_ids.len() * 2);
+    out.clear();
+    out.reserve(doc_ids.len().saturating_mul(2));
     let mut deltas = [0u32; BLOCK_LEN];
     let mut prev = 0u32;
 
@@ -67,10 +76,10 @@ pub fn encode(doc_ids: &[u32]) -> Result<Vec<u8>> {
             .checked_sub(prev)
             .ok_or_else(|| VixError::Malformed("doc ids are not ascending".to_string()))?;
         prev = id;
-        write_vint(&mut out, delta);
+        write_vint(out, delta);
     }
 
-    Ok(out)
+    Ok(())
 }
 
 /// Decode a postings blob of exactly `doc_count` ids, invoking `on_doc` for
@@ -196,10 +205,24 @@ pub const SKIP_STRIDE: usize = 8;
 /// blob for full decodes. `doc_count` stays external, exactly like the
 /// in-cell format.
 pub fn encode_record(doc_ids: &[u32]) -> Result<Vec<u8>> {
-    let blob = encode(doc_ids)?;
+    let mut out = Vec::new();
+    let mut blob = Vec::new();
+    encode_record_into(doc_ids, &mut out, &mut blob)?;
+    Ok(out)
+}
+
+/// Encode a plist record into reusable caller-owned record and plain-blob
+/// buffers.
+pub(crate) fn encode_record_into(
+    doc_ids: &[u32],
+    out: &mut Vec<u8>,
+    blob: &mut Vec<u8>,
+) -> Result<()> {
+    encode_into(doc_ids, blob)?;
     let full_blocks = doc_ids.len() / BLOCK_LEN;
     let entries = full_blocks.div_ceil(SKIP_STRIDE);
-    let mut out = Vec::with_capacity(4 + entries * 8 + blob.len());
+    out.clear();
+    out.reserve(4 + entries * 8 + blob.len());
     out.extend_from_slice(
         &u32::try_from(entries)
             .map_err(|_| VixError::Malformed("postings skip table overflows u32".to_string()))?
@@ -222,8 +245,8 @@ pub fn encode_record(doc_ids: &[u32]) -> Result<Vec<u8>> {
         let num_bits = blob[pos];
         pos += 1 + num_bits as usize * BLOCK_LEN / 8;
     }
-    out.extend_from_slice(&blob);
-    Ok(out)
+    out.extend_from_slice(blob);
+    Ok(())
 }
 
 /// The plain [`encode`]d blob region of a record (skip table stripped), for

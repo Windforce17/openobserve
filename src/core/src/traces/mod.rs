@@ -78,8 +78,8 @@ use crate::{
             write,
         },
         schema::{
-            check_for_schema, get_future_discard_error, get_upto_discard_error,
-            stream_schema_exists,
+            CanonicalizationSummary, canonicalize_record_into, check_for_schema,
+            get_future_discard_error, get_upto_discard_error, stream_schema_exists,
         },
         self_reporting::report_request_usage_stats,
         traces::otel::{OtelIngestionProcessor, is_llm_trace},
@@ -1539,13 +1539,23 @@ async fn write_traces(
         .with_metadata(HashMap::new());
     let record_schema = Arc::new(record_schema);
     let schema_key = record_schema.hash_key();
+    let canonical_schema = traces_schema_map.get(stream_name).unwrap();
 
     let mut data_buf: HashMap<String, SchemaRecords> = HashMap::new();
     let mut distinct_values = Vec::with_capacity(16);
     let mut trace_index_values = Vec::with_capacity(json_data.len());
+    let mut canonical_summary = CanonicalizationSummary::default();
 
     // Start write data
-    for (timestamp, record_val) in json_data {
+    for (timestamp, mut record_val) in json_data {
+        if cfg.common.ingest_canonical_schema {
+            canonicalize_record_into(
+                StreamType::Traces,
+                canonical_schema,
+                &mut record_val,
+                &mut canonical_summary,
+            );
+        }
         // `trace_id` is user-supplied on the json ingest path and a pipeline
         // can re-type it: a non-string form rejects that span alone, it never
         // unwinds the request.
@@ -1650,6 +1660,19 @@ async fn write_traces(
         let record_size = json::estimate_json_bytes(&record_val);
         hour_buf.records.push(Arc::new(record_val));
         hour_buf.records_size += record_size;
+    }
+
+    canonical_summary.flush_metrics(StreamType::Traces);
+    if canonical_summary.nulled > 0 {
+        let failure = canonical_summary.first_failure.as_ref().unwrap();
+        log::warn!(
+            "[TRACES] canonical schema normalization for {org_id}/{stream_name}: converted {} value(s), nulled {} failed value(s); first failure field={:?}, source_type={}, target_type={}",
+            canonical_summary.converted,
+            canonical_summary.nulled,
+            failure.field,
+            failure.source_type,
+            failure.target_type,
+        );
     }
 
     // write data to wal

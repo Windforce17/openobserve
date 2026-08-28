@@ -1571,6 +1571,12 @@ pub struct Common {
     )]
     pub wal_narrow_schema: bool,
     #[env_config(
+        name = "ZO_INGEST_CANONICAL_SCHEMA",
+        default = false,
+        help = "Pin each stream field to the first non-null type successfully registered in the schema store and cast later scalar values to that type before alerts, partitioning, distinct extraction, and WAL writes. Existing stream field types are the rollout baseline. Failed scalar casts become null. Keep false until every writer in a mixed-version deployment understands the pinned-type policy."
+    )]
+    pub ingest_canonical_schema: bool,
+    #[env_config(
         name = "ZO_VIX_FULL_SCAN_RANGED_MIN_BYTES",
         default = 268435456,
         help = "Core-file full scans (no index row selection) switch to chunk-granular \

@@ -33,14 +33,17 @@
 //!   constant offset the remapped lists concatenate in offset order without sorting (and a single
 //!   contributor at offset 0 reuses its encoded blob byte-for-byte); table maps decode, remap,
 //!   sort, and verify distinctness;
-//! - runs the merge across up to `ZO_VIX_MERGE_KWAY_THREADS` workers by partitioning the OUTPUT
-//!   key space into ranges bounded by real remapped input keys ([`partition_bounds`]), each bound
+//! - runs the merge across up to `ZO_VIX_MERGE_KWAY_THREADS` workers by partitioning the OUTPUT key
+//!   space into ranges bounded by real remapped input keys ([`partition_bounds`]), each bound
 //!   translated into every input's own key space ([`translate_bound`]); each range produces one
 //!   [`crate::writer::TermSink`] run and the runs concatenate into the final blobs with their
 //!   row-group ordinals rebased ([`crate::writer::write_index_blobs`], which hard-rejects
 //!   out-of-order runs).
 
-use std::collections::BTreeSet;
+use std::{
+    collections::{BTreeSet, HashMap, HashSet},
+    hash::BuildHasher,
+};
 
 use arrow::array::LargeBinaryArray;
 
@@ -169,9 +172,9 @@ impl<'r> RemappedTermStream<'r> {
     /// [`partition_bounds`]); they are translated into this input's key
     /// space here, and [`Self::advance`] compares raw keys against the
     /// translations.
-    fn new(
+    fn new<S: BuildHasher>(
         reader: &'r VixReader,
-        out_field_ids: &std::collections::HashMap<String, u16>,
+        out_field_ids: &HashMap<String, u16, S>,
         lower: Option<&[u8]>,
         upper: Option<&[u8]>,
     ) -> Result<Self> {
@@ -370,19 +373,23 @@ pub(crate) struct MergedIndexResult {
 /// sequential path through the same code), additionally capped by `threads`
 /// so it never exceeds the per-merge pool budget.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn merge_indexes(
+pub(crate) fn merge_indexes<MapState, SetState>(
     inputs: &[&VixReader],
     doc_maps: &[DocIdMap],
-    out_field_ids: &std::collections::HashMap<String, u16>,
+    out_field_ids: &HashMap<String, u16, MapState>,
     bloom_field_names: &[String],
     composite_pairs: &[(u16, String)],
-    bloom_only_fids: &std::collections::HashSet<u16>,
+    bloom_only_fids: &HashSet<u16, SetState>,
     total_rows: u64,
     postings_chunk_bytes: usize,
     plist_min_docs: u32,
     threads: usize,
     kway_threads: usize,
-) -> Result<MergedIndexResult> {
+) -> Result<MergedIndexResult>
+where
+    MapState: BuildHasher + Sync,
+    SetState: BuildHasher + Sync,
+{
     debug_assert_eq!(inputs.len(), doc_maps.len());
     let threads = if threads == 0 {
         std::thread::available_parallelism().map_or(1, |n| n.get())
@@ -553,25 +560,22 @@ pub(crate) fn merge_indexes(
 /// output ranges).
 ///
 /// Invariants:
-/// - Every bound is a REAL key: an input dict-block first key (read from
-///   the resident dict-block index, no block decode) remapped into the
-///   output id space — `{output fid u16 BE}{token}`. Nothing is ever
-///   fabricated by byte arithmetic.
-/// - Bounds are strictly ascending and deduplicated; `ranges <= 1`, no
-///   candidates, or a non-order-preserving remap yield NO bounds (one
-///   range — the sequential path). Split points are weighted quantiles
-///   over the candidate blocks' key counts, so ranges approximate equal
-///   key work regardless of input skew.
-/// - Bounds are only emitted when EVERY input's `input fid -> output fid`
-///   map is strictly increasing (checked here). Each range worker then
-///   translates a bound into each input's own key space
-///   ([`translate_bound`]) — exact on every emittable key — so all
-///   instances of one output key land in exactly one range.
-/// - [`crate::writer::write_index_blobs`] hard-rejects out-of-order parts
-///   as the structural backstop regardless.
-pub(crate) fn partition_bounds(
+/// - Every bound is a REAL key: an input dict-block first key (read from the resident dict-block
+///   index, no block decode) remapped into the output id space — `{output fid u16 BE}{token}`.
+///   Nothing is ever fabricated by byte arithmetic.
+/// - Bounds are strictly ascending and deduplicated; `ranges <= 1`, no candidates, or a
+///   non-order-preserving remap yield NO bounds (one range — the sequential path). Split points are
+///   weighted quantiles over the candidate blocks' key counts, so ranges approximate equal key work
+///   regardless of input skew.
+/// - Bounds are only emitted when EVERY input's `input fid -> output fid` map is strictly
+///   increasing (checked here). Each range worker then translates a bound into each input's own key
+///   space ([`translate_bound`]) — exact on every emittable key — so all instances of one output
+///   key land in exactly one range.
+/// - [`crate::writer::write_index_blobs`] hard-rejects out-of-order parts as the structural
+///   backstop regardless.
+pub(crate) fn partition_bounds<S: BuildHasher>(
     inputs: &[&VixReader],
-    out_field_ids: &std::collections::HashMap<String, u16>,
+    out_field_ids: &HashMap<String, u16, S>,
     ranges: usize,
 ) -> Result<Vec<Vec<u8>>> {
     if ranges <= 1 {
@@ -683,13 +687,13 @@ pub(crate) fn partition_bounds(
 /// side, so consecutive ranges tile each input's raw key space exactly.
 ///
 /// Cases, scanning mapped input fids in ascending order:
-/// - first fid whose output id EQUALS the bound's fid: `{fid}{bound token}`
-///   (byte-exact within the field);
-/// - first fid whose output id EXCEEDS it: `{fid}` (2 bytes — every key of
-///   that field and beyond remaps at/above the bound);
-/// - none: only the key-term region (fid [`KEY_FIELD_ID`], identical bytes
-///   in every file) can still reach the bound — the bound itself when it
-///   IS a key-term bound, else the region prefix `{KEY_FIELD_ID}`.
+/// - first fid whose output id EQUALS the bound's fid: `{fid}{bound token}` (byte-exact within the
+///   field);
+/// - first fid whose output id EXCEEDS it: `{fid}` (2 bytes — every key of that field and beyond
+///   remaps at/above the bound);
+/// - none: only the key-term region (fid [`KEY_FIELD_ID`], identical bytes in every file) can still
+///   reach the bound — the bound itself when it IS a key-term bound, else the region prefix
+///   `{KEY_FIELD_ID}`.
 pub(crate) fn translate_bound(bound: &[u8], field_map: &[Option<u16>]) -> Result<Vec<u8>> {
     let Some((token, out_fid)) = split_key(bound) else {
         return Err(VixError::Malformed(format!(
@@ -725,14 +729,14 @@ pub(crate) fn translate_bound(bound: &[u8], field_map: &[Option<u16>]) -> Result
 /// returns the names of the fields whose value terms were dropped for lack
 /// of an output field id.
 #[allow(clippy::too_many_arguments)]
-fn merge_term_range(
+fn merge_term_range<MapState: BuildHasher, SetState: BuildHasher>(
     inputs: &[&VixReader],
     tables: &[TermTable],
     doc_maps: &[DocIdMap],
-    out_field_ids: &std::collections::HashMap<String, u16>,
+    out_field_ids: &HashMap<String, u16, MapState>,
     bloom_field_names: &[String],
     composite_pairs: &[(u16, String)],
-    bloom_only_fids: &std::collections::HashSet<u16>,
+    bloom_only_fids: &HashSet<u16, SetState>,
     total_rows: u64,
     postings_chunk_bytes: usize,
     plist_min_docs: u32,
@@ -773,6 +777,7 @@ fn merge_term_range(
     let mut contributors: Vec<usize> = Vec::new();
     let mut ids: Vec<u32> = Vec::new();
     let mut blob: Vec<u8> = Vec::new();
+    let mut encode_scratch: Vec<u8> = Vec::new();
     loop {
         // smallest current key across the live streams (k is small: a linear
         // scan beats a heap's per-term allocations)
@@ -845,6 +850,7 @@ fn merge_term_range(
                 as_record,
                 &mut ids,
                 &mut blob,
+                &mut encode_scratch,
             )?;
             if as_record {
                 sink.push_plist(&key, doc_count as u32, &blob)?;
@@ -880,6 +886,7 @@ fn merge_postings(
     as_record: bool,
     ids: &mut Vec<u32>,
     blob: &mut Vec<u8>,
+    encode_scratch: &mut Vec<u8>,
 ) -> Result<()> {
     // single contributor at offset 0: the cell's bytes are valid verbatim
     // when input and output agree on the representation — inline blob for an
@@ -970,21 +977,33 @@ fn merge_postings(
     }
     if !all_offsets {
         // a permutation from a time-ordered interleave is not monotonic per
-        // input: sort, then prove distinctness (injective maps guarantee it;
-        // a duplicate means the maps were wrong)
-        ids.sort_unstable();
-        if ids.windows(2).any(|pair| pair[0] == pair[1]) {
-            return Err(VixError::Malformed(
-                "merged postings contain a duplicate doc id (doc-id maps overlap)".to_string(),
-            ));
-        }
+        // input in general. Production DocIdMap tables are monotonic for
+        // non-interleaved inputs, however, so retain the already-sorted fast
+        // path and sort only when the completed list proves it is needed.
+        ensure_sorted_unique(ids)?;
     }
-    *blob = if as_record {
-        postings::encode_record(ids)?
+    if as_record {
+        postings::encode_record_into(ids, blob, encode_scratch)?;
     } else {
-        postings::encode(ids)?
-    };
+        postings::encode_into(ids, blob)?;
+    }
     Ok(())
+}
+
+/// Return whether a fallback sort was needed. Strictly monotonic production
+/// table maps take the zero-sort path; permutations are sorted and overlapping
+/// maps are rejected.
+fn ensure_sorted_unique(ids: &mut [u32]) -> Result<bool> {
+    if ids.windows(2).all(|pair| pair[0] < pair[1]) {
+        return Ok(false);
+    }
+    ids.sort_unstable();
+    if ids.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(VixError::Malformed(
+            "merged postings contain a duplicate doc id (doc-id maps overlap)".to_string(),
+        ));
+    }
+    Ok(true)
 }
 
 fn check_input_dense(doc_count: u32, input_rows: u64) -> Result<()> {
@@ -1001,4 +1020,23 @@ fn doc_out_of_range(doc: u32, input_rows: u64) -> VixError {
     VixError::Malformed(format!(
         "postings doc id {doc} out of range (row_count {input_rows})"
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_sorted_unique;
+
+    #[test]
+    fn monotonic_mapped_postings_skip_sort_with_fallback() {
+        let mut monotonic = vec![1, 4, 9, 12];
+        assert!(!ensure_sorted_unique(&mut monotonic).unwrap());
+        assert_eq!(monotonic, [1, 4, 9, 12]);
+
+        let mut interleaved = vec![1, 9, 4, 12];
+        assert!(ensure_sorted_unique(&mut interleaved).unwrap());
+        assert_eq!(interleaved, [1, 4, 9, 12]);
+
+        let mut overlap = vec![1, 4, 4, 9];
+        assert!(ensure_sorted_unique(&mut overlap).is_err());
+    }
 }
