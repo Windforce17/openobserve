@@ -52,7 +52,7 @@ pub type RwAHashSet<K> = tokio::sync::RwLock<HashSet<K>>;
 pub type RwBTreeMap<K, V> = tokio::sync::RwLock<BTreeMap<K, V>>;
 
 // for DDL commands and migrations
-pub const DB_SCHEMA_VERSION: u64 = 49;
+pub const DB_SCHEMA_VERSION: u64 = 50;
 pub const DB_SCHEMA_KEY: &str = "/db_schema_version/";
 
 // global version variables
@@ -2710,6 +2710,12 @@ pub struct Limit {
 pub struct Compact {
     #[env_config(name = "ZO_COMPACT_ENABLED", default = true)]
     pub enabled: bool,
+    #[env_config(
+        name = "ZO_COMPACT_LEASE_GENERATION_ENABLED",
+        default = false,
+        help = "Enable generation-fenced compactor merge and dump job claims after every node in the fleet has been upgraded."
+    )]
+    pub lease_generation_enabled: bool,
     #[env_config(name = "ZO_COMPACT_INTERVAL", default = 10)] // seconds
     pub interval: u64,
     #[env_config(

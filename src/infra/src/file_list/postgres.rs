@@ -1332,35 +1332,36 @@ DO UPDATE SET
         DB_QUERY_NUMS
             .with_label_values(&["insert", "file_list_jobs"])
             .inc();
-        match
-            sqlx
-                ::query(
-                    // A DONE row for this (stream, hour) must NOT block the
-                    // insert: an hour whose job ran while the hour was still
-                    // OPEN completed WITHOUT sealing it (incremental rounds
-                    // carry their remainder), so the closed hour needs a fresh
-                    // run. DO NOTHING stranded such hours at ~1250 files until
-                    // the row aged out via job_clean_wait_time (prod
-                    // 2026-07-30: 15-20x query file fan-out). Resurrect the
-                    // row to Pending instead; PENDING and RUNNING rows are
-                    // left alone (a worker may hold the latter).
-                    "INSERT INTO file_list_jobs (org, stream, offsets, status, node, started_at, updated_at) VALUES ($1, $2, $3, $4, '', 0, 0) \
-                     ON CONFLICT (stream, offsets) DO UPDATE SET status = $4, node = '', started_at = 0 \
-                     WHERE file_list_jobs.status = $5;"
-                )
-                .bind(org_id)
-                .bind(&stream_key)
-                .bind(offset)
-                .bind(super::FileListJobStatus::Pending)
-                .bind(super::FileListJobStatus::Done)
-                .execute(&mut *tx).await
+        match sqlx::query(
+            // A late add while a dump worker owns this DONE row must
+            // survive that dump. Mark it for requeue; otherwise
+            // resurrect an unowned DONE row immediately. Generation is
+            // never reset by either path.
+            r#"INSERT INTO file_list_jobs
+    (org, stream, offsets, status, node, started_at, updated_at)
+VALUES ($1, $2, $3, $4, '', 0, 0)
+ON CONFLICT (stream, offsets) DO UPDATE SET
+    status = CASE WHEN file_list_jobs.node = '' THEN $4 ELSE file_list_jobs.status END,
+    started_at = CASE WHEN file_list_jobs.node = '' THEN 0 ELSE file_list_jobs.started_at END,
+    pending_after_dump = CASE WHEN file_list_jobs.node = '' THEN false ELSE true END
+WHERE file_list_jobs.status = $5;"#,
+        )
+        .bind(org_id)
+        .bind(&stream_key)
+        .bind(offset)
+        .bind(super::FileListJobStatus::Pending)
+        .bind(super::FileListJobStatus::Done)
+        .execute(&mut *tx)
+        .await
         {
-            Err(sqlx::Error::Database(e)) => if !e.is_unique_violation() {
-                return Err(Error::Message(e.to_string()));
+            Err(sqlx::Error::Database(e)) => {
+                if !e.is_unique_violation() {
+                    return Err(Error::Message(e.to_string()));
+                }
             }
             Err(e) => {
                 return Err(e.into());
-            },
+            }
             Ok(_) => {}
         };
 
@@ -1385,13 +1386,15 @@ DO UPDATE SET
         let status = ret.try_get::<i64, &str>("status").unwrap_or_default();
         if id > 0
             && super::FileListJobStatus::from(status) == super::FileListJobStatus::Done
-            && let Err(e) =
-                sqlx::query("UPDATE file_list_jobs SET status = $1 WHERE status = $2 AND id = $3;")
-                    .bind(super::FileListJobStatus::Pending)
-                    .bind(super::FileListJobStatus::Done)
-                    .bind(id)
-                    .execute(&mut *tx)
-                    .await
+            && let Err(e) = sqlx::query(
+                "UPDATE file_list_jobs SET status = $1, node = '', started_at = 0, \
+                 pending_after_dump = false WHERE status = $2 AND node = '' AND id = $3;",
+            )
+            .bind(super::FileListJobStatus::Pending)
+            .bind(super::FileListJobStatus::Done)
+            .bind(id)
+            .execute(&mut *tx)
+            .await
         {
             if let Err(e) = tx.rollback().await {
                 log::error!("[POSTGRES] rollback update job status error: {e}");
@@ -1409,47 +1412,35 @@ DO UPDATE SET
         &self,
         node: &str,
         limit: i64,
-        fast_mode: bool,
-        min_offsets: i64,
+        order: super::FileListJobOrder,
+        min_offsets: Option<i64>,
+        max_offsets: Option<i64>,
     ) -> Result<Vec<super::MergeJobRecord>> {
-        // quick check on the RO pool: with nothing pending, skip the write
-        // statement entirely (the common idle-tick case fleet-wide).
-        let pool = CLIENT_RO.clone();
-        let has_pending = sqlx::query(
-            "SELECT id FROM file_list_jobs WHERE status = $1 AND offsets >= $2 LIMIT 1;",
-        )
-        .bind(super::FileListJobStatus::Pending)
-        .bind(min_offsets)
-        .fetch_optional(&pool)
-        .await?;
-        if has_pending.is_none() {
-            return Ok(Vec::new());
-        }
-
-        // One autocommit statement claims and returns the batch. Racing
-        // claimers partition the pending rows via FOR UPDATE SKIP LOCKED —
-        // no global advisory lock, no multi-statement transaction, and
-        // therefore NO idle-in-transaction window a dying pod can freeze
-        // the whole fleet's claiming on (the 2026-08-13 incident: every
-        // compactor roll wedged the old pg_advisory_xact_lock for up to
-        // ~30 min behind killed holders, 47 waiters parked on prod).
-        //
-        // Claim the OLDEST pending jobs regardless of stream (id ASC): the
-        // old normal-mode claim (GROUP BY stream, newest first) let one hot
-        // stream starve a backlog's old hours. fast_mode keeps freshest-
-        // first (offsets DESC) for recent-window recovery.
-        let order = if fast_mode { "offsets DESC" } else { "id ASC" };
+        // This must remain one autocommit statement. Racing claimers partition
+        // pending rows through row locks, and the generation returned here is
+        // the generation installed by the same atomic claim.
+        let order_sql = match order {
+            super::FileListJobOrder::EnqueueOldest => "id ASC",
+            super::FileListJobOrder::OffsetNewest => "offsets DESC, id ASC",
+        };
         let sql = format!(
             r#"UPDATE file_list_jobs
-SET status = $1, node = $2, started_at = $3, updated_at = $3
+SET status = $1,
+    node = $2,
+    started_at = $3,
+    updated_at = $3,
+    lease_generation = lease_generation + 1
 WHERE id IN (
-    SELECT id FROM file_list_jobs
-    WHERE status = $4 AND offsets >= $5
-    ORDER BY {order}
-    LIMIT $6
+    SELECT id
+    FROM file_list_jobs
+    WHERE status = $4
+      AND ($5::BIGINT IS NULL OR offsets >= $5)
+      AND ($6::BIGINT IS NULL OR offsets < $6)
+    ORDER BY {order_sql}
+    LIMIT $7
     FOR UPDATE SKIP LOCKED
 )
-RETURNING *;"#
+RETURNING id, stream, offsets, lease_generation;"#
         );
         let pool = CLIENT.clone();
         DB_QUERY_NUMS
@@ -1462,118 +1453,112 @@ RETURNING *;"#
             .bind(now)
             .bind(super::FileListJobStatus::Pending)
             .bind(min_offsets)
+            .bind(max_offsets)
             .bind(limit)
             .fetch_all(&pool)
             .await?;
-        // RETURNING order is unspecified — restore the claim policy's order
-        // client-side (the subquery ORDER BY only governs which rows win).
-        if fast_mode {
-            ret.sort_unstable_by_key(|r| std::cmp::Reverse(r.offsets));
-        } else {
-            ret.sort_unstable_by_key(|r| r.id);
+        // PostgreSQL does not guarantee RETURNING order.
+        match order {
+            super::FileListJobOrder::EnqueueOldest => ret.sort_unstable_by_key(|r| r.id),
+            super::FileListJobOrder::OffsetNewest => {
+                ret.sort_unstable_by_key(|r| (std::cmp::Reverse(r.offsets), r.id));
+            }
         }
         Ok(ret)
     }
 
-    async fn set_job_pending(
-        &self,
-        ids: &[i64],
-        offsets: i64,
-        stream: Option<&str>,
-    ) -> Result<u64> {
-        let pool = CLIENT.clone();
-        let mut conditions: Vec<String> = Vec::new();
-        if !ids.is_empty() {
-            conditions.push(format!(
-                "id IN ({})",
-                ids.iter()
-                    .map(|id| id.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            ));
-        }
-        if offsets > 0 {
-            conditions.push(format!("offsets >= {offsets}"));
-        }
-        if let Some(stream) = stream {
-            conditions.push(format!("stream = '{stream}'"));
-        }
-        let sql = if conditions.is_empty() {
-            "UPDATE file_list_jobs SET status = $1;".to_string()
-        } else {
-            format!(
-                "UPDATE file_list_jobs SET status = $1 WHERE {};",
-                conditions.join(" AND ")
-            )
-        };
-        DB_QUERY_NUMS
-            .with_label_values(&["update", "file_list_jobs"])
-            .inc();
-        let ret = sqlx::query(&sql)
-            .bind(super::FileListJobStatus::Pending)
-            .execute(&pool)
-            .await?;
-        Ok(ret.rows_affected())
-    }
-
-    async fn set_job_done(&self, ids: &[i64]) -> Result<()> {
-        let cfg = get_config();
-        let pool = CLIENT.clone();
-        DB_QUERY_NUMS
-            .with_label_values(&["update", "file_list_jobs"])
-            .inc();
-        let sql = format!(
-            "UPDATE file_list_jobs SET status = $1, updated_at = $2, dumped = $3, node = '' WHERE id IN ({});",
-            ids.iter()
-                .map(|id| id.to_string())
-                .collect::<Vec<_>>()
-                .join(",")
-        );
-        // if dump enabled we set dumped to false, so dump job can work
-        // id dump disabled, we set it to true, so cleanup can remvoe the jobs
-        sqlx::query(&sql)
-            .bind(super::FileListJobStatus::Done)
-            .bind(config::utils::time::now_micros())
-            .bind(!cfg.compact.file_list_dump_enabled)
-            .execute(&pool)
-            .await?;
-        Ok(())
-    }
-
-    async fn update_running_jobs(&self, ids: &[i64]) -> Result<()> {
-        let pool = CLIENT.clone();
-        DB_QUERY_NUMS
-            .with_label_values(&["update", "file_list_jobs"])
-            .inc();
-        let sql = format!(
-            r#"UPDATE file_list_jobs SET updated_at = $1 WHERE id IN ({})"#,
-            ids.iter()
-                .map(|id| id.to_string())
-                .collect::<Vec<_>>()
-                .join(",")
-        );
-        sqlx::query(&sql)
-            .bind(config::utils::time::now_micros())
-            .execute(&pool)
-            .await?;
-        Ok(())
-    }
-
-    async fn confirm_job_ownership(&self, id: i64, node: &str) -> Result<bool> {
+    async fn reset_jobs_admin(&self, offsets: i64, stream: Option<&str>) -> Result<u64> {
         let pool = CLIENT.clone();
         DB_QUERY_NUMS
             .with_label_values(&["update", "file_list_jobs"])
             .inc();
         let ret = sqlx::query(
-            r#"UPDATE file_list_jobs SET updated_at = $1 WHERE id = $2 AND node = $3 AND status = $4;"#,
+            r#"UPDATE file_list_jobs
+SET status = $1,
+    node = '',
+    updated_at = $4,
+    pending_after_dump = false,
+    lease_generation = lease_generation + 1
+WHERE ($2 <= 0 OR offsets >= $2)
+  AND ($3::VARCHAR IS NULL OR stream = $3);"#,
+        )
+        .bind(super::FileListJobStatus::Pending)
+        .bind(offsets)
+        .bind(stream)
+        .bind(config::utils::time::now_micros())
+        .execute(&pool)
+        .await?;
+        Ok(ret.rows_affected())
+    }
+
+    async fn touch_job_lease(
+        &self,
+        id: i64,
+        node: &str,
+        generation: i64,
+        expected_status: super::FileListJobStatus,
+    ) -> Result<bool> {
+        let pool = CLIENT.clone();
+        DB_QUERY_NUMS
+            .with_label_values(&["update", "file_list_jobs"])
+            .inc();
+        let ret = sqlx::query(
+            r#"UPDATE file_list_jobs
+SET updated_at = $1
+WHERE id = $2 AND node = $3 AND lease_generation = $4 AND status = $5;"#,
         )
         .bind(config::utils::time::now_micros())
         .bind(id)
         .bind(node)
+        .bind(generation)
+        .bind(expected_status)
+        .execute(&pool)
+        .await?;
+        Ok(ret.rows_affected() == 1)
+    }
+
+    async fn set_job_pending_owned(&self, id: i64, node: &str, generation: i64) -> Result<bool> {
+        let pool = CLIENT.clone();
+        DB_QUERY_NUMS
+            .with_label_values(&["update", "file_list_jobs"])
+            .inc();
+        let ret = sqlx::query(
+            r#"UPDATE file_list_jobs
+SET status = $1, node = '', updated_at = $2, pending_after_dump = false
+WHERE id = $3 AND node = $4 AND lease_generation = $5 AND status = $6;"#,
+        )
+        .bind(super::FileListJobStatus::Pending)
+        .bind(config::utils::time::now_micros())
+        .bind(id)
+        .bind(node)
+        .bind(generation)
         .bind(super::FileListJobStatus::Running)
         .execute(&pool)
         .await?;
-        Ok(ret.rows_affected() > 0)
+        Ok(ret.rows_affected() == 1)
+    }
+
+    async fn set_job_done_owned(&self, id: i64, node: &str, generation: i64) -> Result<bool> {
+        let cfg = get_config();
+        let pool = CLIENT.clone();
+        DB_QUERY_NUMS
+            .with_label_values(&["update", "file_list_jobs"])
+            .inc();
+        let ret = sqlx::query(
+            r#"UPDATE file_list_jobs
+SET status = $1, updated_at = $2, dumped = $3, node = '', pending_after_dump = false
+WHERE id = $4 AND node = $5 AND lease_generation = $6 AND status = $7;"#,
+        )
+        .bind(super::FileListJobStatus::Done)
+        .bind(config::utils::time::now_micros())
+        .bind(!cfg.compact.file_list_dump_enabled)
+        .bind(id)
+        .bind(node)
+        .bind(generation)
+        .bind(super::FileListJobStatus::Running)
+        .execute(&pool)
+        .await?;
+        Ok(ret.rows_affected() == 1)
     }
 
     async fn check_running_jobs(&self, before_date: i64) -> Result<()> {
@@ -1582,9 +1567,12 @@ RETURNING *;"#
             .with_label_values(&["update", "file_list_jobs"])
             .inc();
 
-        // reset running jobs status to pending
+        // Invalidate the old lease even before a successor claims it. This
+        // closes same-node ABA: an old task cannot mutate the re-pended row.
         let ret = sqlx::query(
-            r#"UPDATE file_list_jobs SET status = $1 WHERE status = $2 AND updated_at < $3;"#,
+            r#"UPDATE file_list_jobs
+SET status = $1, node = '', lease_generation = lease_generation + 1
+WHERE status = $2 AND updated_at < $3;"#,
         )
         .bind(super::FileListJobStatus::Pending)
         .bind(super::FileListJobStatus::Running)
@@ -1598,9 +1586,10 @@ RETURNING *;"#
             );
         }
 
-        // reset dumping jobs node to empty
         let ret = sqlx::query(
-            r#"UPDATE file_list_jobs SET node = '' WHERE status = $1 AND dumped = $2 AND node != '' AND updated_at < $3;"#,
+            r#"UPDATE file_list_jobs
+SET node = '', lease_generation = lease_generation + 1
+WHERE status = $1 AND dumped = $2 AND node != '' AND updated_at < $3;"#,
         )
         .bind(super::FileListJobStatus::Done)
         .bind(false)
@@ -1679,99 +1668,69 @@ RETURNING *;"#
         &self,
         node: &str,
         limit: i64,
-    ) -> Result<Vec<(i64, String, i64)>> {
+    ) -> Result<Vec<super::DumpJobRecord>> {
         let pool = CLIENT.clone();
-        let mut tx = pool.begin().await?;
-        let lock_key = "file_list_jobs:get_pending_dump_jobs";
-        let lock_id = config::utils::hash::gxhash::new().sum64(lock_key);
-        let lock_id = if lock_id > (i64::MAX as u64) {
-            (lock_id >> 1) as i64
-        } else {
-            lock_id as i64
-        };
-        let lock_sql = format!("SELECT pg_advisory_xact_lock({lock_id})");
-        DB_QUERY_NUMS.with_label_values(&["get_lock", ""]).inc();
-        if let Err(e) = sqlx::query(&lock_sql).execute(&mut *tx).await {
-            if let Err(e) = tx.rollback().await {
-                log::error!("[POSTGRES] rollback get_pending_dump_jobs error: {e}");
-            }
-            return Err(e.into());
-        }
-        // get pending dump jobs by updated_at asc
-        DB_QUERY_NUMS
-            .with_label_values(&["select", "file_list_jobs"])
-            .inc();
-        let ret = match sqlx::query_as::<_, (i64, String, i64)>(
-            r#"SELECT id, stream, offsets FROM file_list_jobs WHERE status = $1 AND dumped = $2 AND node = '' ORDER BY updated_at ASC limit $3"#,
-        )
-        .bind(super::FileListJobStatus::Done)
-        .bind(false)
-        .bind(limit)
-        .fetch_all(&mut *tx)
-        .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                if let Err(e) = tx.rollback().await {
-                    log::error!(
-                        "[POSTGRES] rollback get_pending_dump_jobs for update error: {e}"
-                    );
-                }
-                return Err(e.into());
-            }
-        };
-
-        // update jobs node, created_at and updated_at
-        let ids = ret.iter().map(|r| r.0.to_string()).collect::<Vec<_>>();
-        if ids.is_empty() {
-            if let Err(e) = tx.rollback().await {
-                log::error!("[POSTGRES] rollback get_pending_dump_jobs error: {e}");
-            }
-            return Ok(Vec::new());
-        }
-        let sql = format!(
-            "UPDATE file_list_jobs SET node = $1, started_at = $2, updated_at = $3 WHERE id IN ({});",
-            ids.join(",")
-        );
         let now = config::utils::time::now_micros();
         DB_QUERY_NUMS
             .with_label_values(&["update", "file_list_jobs"])
             .inc();
-        if let Err(e) = sqlx::query(&sql)
-            .bind(node)
-            .bind(now)
-            .bind(now)
-            .execute(&mut *tx)
-            .await
-        {
-            if let Err(e) = tx.rollback().await {
-                log::error!("[POSTGRES] rollback update get_pending_dump_jobs status error: {e}");
-            }
-            return Err(e.into());
-        }
-        // commit transaction
-        if let Err(e) = tx.commit().await {
-            log::error!("[POSTGRES] commit for get_pending_dump_jobs error: {e}");
-            return Err(e.into());
-        }
-
+        let mut ret = sqlx::query_as::<_, super::DumpJobRecord>(
+            r#"UPDATE file_list_jobs
+SET node = $1,
+    started_at = $2,
+    updated_at = $2,
+    lease_generation = lease_generation + 1
+WHERE id IN (
+    SELECT id
+    FROM file_list_jobs
+    WHERE status = $3 AND dumped = $4 AND node = ''
+    ORDER BY updated_at ASC, id ASC
+    LIMIT $5
+    FOR UPDATE SKIP LOCKED
+)
+RETURNING id, stream, offsets, lease_generation;"#,
+        )
+        .bind(node)
+        .bind(now)
+        .bind(super::FileListJobStatus::Done)
+        .bind(false)
+        .bind(limit)
+        .fetch_all(&pool)
+        .await?;
+        ret.sort_unstable_by_key(|r| r.id);
         Ok(ret)
     }
 
-    async fn set_job_dumped_status(&self, ids: &[i64], dumped: bool) -> Result<()> {
+    async fn set_job_dumped_status_owned(
+        &self,
+        id: i64,
+        node: &str,
+        generation: i64,
+        dumped: bool,
+    ) -> Result<bool> {
         let pool = CLIENT.clone();
         DB_QUERY_NUMS
             .with_label_values(&["update", "file_list_jobs"])
             .inc();
-        let sql = format!(
-            "UPDATE file_list_jobs SET dumped = $1, node = '' WHERE id IN ({});",
-            ids.iter()
-                .map(|id| id.to_string())
-                .collect::<Vec<_>>()
-                .join(",")
-        );
-        sqlx::query(&sql).bind(dumped).execute(&pool).await?;
-        Ok(())
+        let ret = sqlx::query(
+            r#"UPDATE file_list_jobs
+SET status = CASE WHEN $1 AND pending_after_dump THEN $2 ELSE status END,
+    dumped = CASE WHEN $1 AND pending_after_dump THEN false ELSE $1 END,
+    node = '',
+    updated_at = $3,
+    pending_after_dump = CASE WHEN $1 AND pending_after_dump THEN false ELSE pending_after_dump END
+WHERE id = $4 AND node = $5 AND lease_generation = $6 AND status = $7;"#,
+        )
+        .bind(dumped)
+        .bind(super::FileListJobStatus::Pending)
+        .bind(config::utils::time::now_micros())
+        .bind(id)
+        .bind(node)
+        .bind(generation)
+        .bind(super::FileListJobStatus::Done)
+        .execute(&pool)
+        .await?;
+        Ok(ret.rows_affected() == 1)
     }
 
     async fn insert_dump_stats(&self, file: &str, stats: &StreamStats) -> Result<()> {
@@ -2999,7 +2958,9 @@ CREATE TABLE IF NOT EXISTS file_list_jobs
     node       VARCHAR(100) not null,
     started_at BIGINT not null,
     updated_at BIGINT not null,
-    dumped     BOOLEAN default false not null
+    dumped     BOOLEAN default false not null,
+    lease_generation BIGINT default 0 not null,
+    pending_after_dump BOOLEAN default false not null
 );
         "#,
     )
@@ -3048,6 +3009,18 @@ CREATE TABLE IF NOT EXISTS stream_stats
     .await?;
     add_column("file_list_jobs", "started_at", "BIGINT default 0 not null").await?;
     add_column("file_list_jobs", "dumped", "BOOLEAN default false not null").await?;
+    add_column(
+        "file_list_jobs",
+        "lease_generation",
+        "BIGINT default 0 not null",
+    )
+    .await?;
+    add_column(
+        "file_list_jobs",
+        "pending_after_dump",
+        "BOOLEAN default false not null",
+    )
+    .await?;
     add_column("stream_stats", "index_size", "BIGINT default 0 not null").await?;
     add_column(
         "stream_stats",
@@ -3488,12 +3461,12 @@ WHERE t.relname = $1
 mod tests {
     use std::sync::Once;
 
-    use config::meta::stream::{FileKey, FileMeta};
+    use config::meta::stream::{FileKey, FileMeta, StreamType};
     use sqlx::PgPool;
     use tokio::sync::OnceCell;
 
     use super::*;
-    use crate::file_list::FileList;
+    use crate::file_list::{FileList, FileListJobOrder, FileListJobStatus};
 
     static _INIT: Once = Once::new();
     static DB_POOL: OnceCell<PgPool> = OnceCell::const_new();
@@ -3597,9 +3570,29 @@ mod tests {
                 node VARCHAR(100) not null,
                 started_at BIGINT not null,
                 updated_at BIGINT not null,
-                dumped BOOLEAN default false not null
+                dumped BOOLEAN default false not null,
+                lease_generation BIGINT default 0 not null,
+                pending_after_dump BOOLEAN default false not null
             )
             "#,
+        )
+        .execute(pool)
+        .await?;
+
+        sqlx::query(
+            "ALTER TABLE file_list_jobs ADD COLUMN IF NOT EXISTS lease_generation BIGINT NOT NULL DEFAULT 0;",
+        )
+        .execute(pool)
+        .await?;
+
+        sqlx::query(
+            "ALTER TABLE file_list_jobs ADD COLUMN IF NOT EXISTS pending_after_dump BOOLEAN NOT NULL DEFAULT false;",
+        )
+        .execute(pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS file_list_jobs_stream_offsets_idx ON file_list_jobs (stream, offsets);",
         )
         .execute(pool)
         .await?;
@@ -3715,8 +3708,8 @@ mod tests {
 
         // two racing claimers, all-in-one statement each
         let (a, b) = tokio::join!(
-            list.get_pending_jobs("node-a", 3, false, 0),
-            list.get_pending_jobs("node-b", 3, false, 0),
+            list.get_pending_jobs("node-a", 3, FileListJobOrder::EnqueueOldest, None, None,),
+            list.get_pending_jobs("node-b", 3, FileListJobOrder::EnqueueOldest, None, None,),
         );
         let a = a.expect("claim a");
         let b = b.expect("claim b");
@@ -3741,25 +3734,214 @@ mod tests {
                 .unwrap();
         assert_eq!(running, 5);
 
-        // nothing left → the RO quick-check path returns empty
         assert!(
-            list.get_pending_jobs("node-c", 3, false, 0)
+            list.get_pending_jobs("node-c", 3, FileListJobOrder::EnqueueOldest, None, None,)
                 .await
                 .unwrap()
                 .is_empty()
         );
 
-        // fast_mode claims freshest-first (offsets DESC)
+        // OffsetNewest honors the inclusive lower and exclusive upper bounds.
         sqlx::query("UPDATE file_list_jobs SET status = 0, node = '';")
             .execute(&pool)
             .await
             .unwrap();
         let fast = list
-            .get_pending_jobs("node-f", 5, true, 0)
+            .get_pending_jobs(
+                "node-f",
+                5,
+                FileListJobOrder::OffsetNewest,
+                Some(1_001),
+                Some(1_005),
+            )
             .await
-            .expect("fast claim");
-        assert_eq!(fast.len(), 5);
-        assert!(fast.windows(2).all(|w| w[0].offsets >= w[1].offsets));
+            .expect("freshest claim");
+        assert_eq!(
+            fast.iter().map(|r| r.offsets).collect::<Vec<_>>(),
+            vec![1_004, 1_003, 1_002, 1_001]
+        );
+        assert!(fast.iter().all(|r| r.lease_generation > 0));
+        cleanup_test_data(&pool).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires test PostgreSQL database setup"]
+    async fn pg_generation_fences_same_node_aba_stale_and_dump_leases() {
+        let pool = setup_test_db().await;
+        cleanup_test_data(&pool).await;
+        let list = PostgresFileList::new();
+        let offset = 1_900_000_000_000_000_i64;
+        sqlx::query(
+            "INSERT INTO file_list_jobs \
+             (org, stream, offsets, status, node, started_at, updated_at) \
+             VALUES ('org', 'org/logs/fence', $1, 0, '', 0, 0);",
+        )
+        .bind(offset)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let first = list
+            .get_pending_jobs(
+                "same-node",
+                1,
+                FileListJobOrder::EnqueueOldest,
+                Some(offset),
+                Some(offset + 1),
+            )
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(
+            list.set_job_pending_owned(first.id, "same-node", first.lease_generation)
+                .await
+                .unwrap()
+        );
+        let second = list
+            .get_pending_jobs(
+                "same-node",
+                1,
+                FileListJobOrder::EnqueueOldest,
+                Some(offset),
+                Some(offset + 1),
+            )
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(second.lease_generation, first.lease_generation + 1);
+        assert!(
+            !list
+                .touch_job_lease(
+                    second.id,
+                    "same-node",
+                    first.lease_generation,
+                    FileListJobStatus::Running,
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            !list
+                .set_job_pending_owned(second.id, "same-node", first.lease_generation)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !list
+                .set_job_done_owned(second.id, "same-node", first.lease_generation)
+                .await
+                .unwrap()
+        );
+
+        sqlx::query("UPDATE file_list_jobs SET updated_at = 0 WHERE id = $1;")
+            .bind(second.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        list.check_running_jobs(1).await.unwrap();
+        let (status, node, reset_generation): (i32, String, i64) = sqlx::query_as(
+            "SELECT status, node, lease_generation FROM file_list_jobs WHERE id = $1;",
+        )
+        .bind(second.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, FileListJobStatus::Pending as i32);
+        assert!(node.is_empty());
+        assert_eq!(reset_generation, second.lease_generation + 1);
+
+        sqlx::query(
+            "UPDATE file_list_jobs SET status = $1, dumped = false, node = '', updated_at = 0 \
+             WHERE id = $2;",
+        )
+        .bind(FileListJobStatus::Done)
+        .bind(second.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let dump = list
+            .get_pending_dump_jobs("dump-node", 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(dump.lease_generation, reset_generation + 1);
+        assert!(
+            list.touch_job_lease(
+                dump.id,
+                "dump-node",
+                dump.lease_generation,
+                FileListJobStatus::Done,
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !list
+                .set_job_dumped_status_owned(dump.id, "dump-node", reset_generation, true)
+                .await
+                .unwrap()
+        );
+
+        let same_id = list
+            .add_job("org", StreamType::Logs, "fence", offset)
+            .await
+            .unwrap();
+        assert_eq!(same_id, dump.id);
+        let (status, node, marker): (i32, String, bool) = sqlx::query_as(
+            "SELECT status, node, pending_after_dump FROM file_list_jobs WHERE id = $1;",
+        )
+        .bind(dump.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, FileListJobStatus::Done as i32);
+        assert_eq!(node, "dump-node");
+        assert!(marker);
+
+        assert!(
+            list.set_job_dumped_status_owned(dump.id, "dump-node", dump.lease_generation, false)
+                .await
+                .unwrap()
+        );
+        let (status, node, dumped, marker): (i32, String, bool, bool) = sqlx::query_as(
+            "SELECT status, node, dumped, pending_after_dump FROM file_list_jobs WHERE id = $1;",
+        )
+        .bind(dump.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, FileListJobStatus::Done as i32);
+        assert!(node.is_empty());
+        assert!(!dumped);
+        assert!(marker);
+
+        let retry = list
+            .get_pending_dump_jobs("dump-node", 1)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(retry.id, dump.id);
+        assert_eq!(retry.lease_generation, dump.lease_generation + 1);
+        assert!(
+            list.set_job_dumped_status_owned(retry.id, "dump-node", retry.lease_generation, true,)
+                .await
+                .unwrap()
+        );
+        let (status, node, dumped, marker): (i32, String, bool, bool) = sqlx::query_as(
+            "SELECT status, node, dumped, pending_after_dump FROM file_list_jobs WHERE id = $1;",
+        )
+        .bind(dump.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, FileListJobStatus::Pending as i32);
+        assert!(node.is_empty());
+        assert!(!dumped);
+        assert!(!marker);
         cleanup_test_data(&pool).await;
     }
 

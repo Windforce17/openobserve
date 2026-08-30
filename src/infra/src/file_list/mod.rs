@@ -218,23 +218,31 @@ pub trait FileList: Sync + Send + 'static {
         &self,
         node: &str,
         limit: i64,
-        fast_mode: bool,
-        min_offsets: i64,
+        order: FileListJobOrder,
+        min_offsets: Option<i64>,
+        max_offsets: Option<i64>,
     ) -> Result<Vec<MergeJobRecord>>;
     async fn get_pending_jobs_count(&self) -> Result<stdHashMap<String, stdHashMap<String, i64>>>;
-    async fn set_job_pending(&self, ids: &[i64], offsets: i64, stream: Option<&str>)
-    -> Result<u64>;
-    async fn set_job_done(&self, ids: &[i64]) -> Result<()>;
-    async fn update_running_jobs(&self, ids: &[i64]) -> Result<()>;
-    async fn confirm_job_ownership(&self, id: i64, node: &str) -> Result<bool>;
+    async fn reset_jobs_admin(&self, offsets: i64, stream: Option<&str>) -> Result<u64>;
+    async fn touch_job_lease(
+        &self,
+        id: i64,
+        node: &str,
+        generation: i64,
+        expected_status: FileListJobStatus,
+    ) -> Result<bool>;
+    async fn set_job_pending_owned(&self, id: i64, node: &str, generation: i64) -> Result<bool>;
+    async fn set_job_done_owned(&self, id: i64, node: &str, generation: i64) -> Result<bool>;
     async fn check_running_jobs(&self, before_date: i64) -> Result<()>;
     async fn clean_done_jobs(&self, before_date: i64) -> Result<()>;
-    async fn get_pending_dump_jobs(
+    async fn get_pending_dump_jobs(&self, node: &str, limit: i64) -> Result<Vec<DumpJobRecord>>;
+    async fn set_job_dumped_status_owned(
         &self,
+        id: i64,
         node: &str,
-        limit: i64,
-    ) -> Result<Vec<(i64, String, i64)>>;
-    async fn set_job_dumped_status(&self, ids: &[i64], dumped: bool) -> Result<()>;
+        generation: i64,
+        dumped: bool,
+    ) -> Result<bool>;
 
     // file_list_dump_stats table methods
     async fn insert_dump_stats(&self, file: &str, stats: &StreamStats) -> Result<()>;
@@ -622,11 +630,12 @@ pub async fn add_job(
 pub async fn get_pending_jobs(
     node: &str,
     limit: i64,
-    fast_mode: bool,
-    min_offsets: i64,
+    order: FileListJobOrder,
+    min_offsets: Option<i64>,
+    max_offsets: Option<i64>,
 ) -> Result<Vec<MergeJobRecord>> {
     CLIENT
-        .get_pending_jobs(node, limit, fast_mode, min_offsets)
+        .get_pending_jobs(node, limit, order, min_offsets, max_offsets)
         .await
 }
 
@@ -636,30 +645,30 @@ pub async fn get_pending_jobs_count() -> Result<stdHashMap<String, stdHashMap<St
 }
 
 #[inline]
-pub async fn set_job_pending(ids: &[i64], offsets: i64, stream: Option<&str>) -> Result<u64> {
-    CLIENT.set_job_pending(ids, offsets, stream).await
+pub async fn reset_jobs_admin(offsets: i64, stream: Option<&str>) -> Result<u64> {
+    CLIENT.reset_jobs_admin(offsets, stream).await
 }
 
 #[inline]
-pub async fn set_job_done(ids: &[i64]) -> Result<()> {
-    CLIENT.set_job_done(ids).await
+pub async fn touch_job_lease(
+    id: i64,
+    node: &str,
+    generation: i64,
+    expected_status: FileListJobStatus,
+) -> Result<bool> {
+    CLIENT
+        .touch_job_lease(id, node, generation, expected_status)
+        .await
 }
 
 #[inline]
-pub async fn update_running_jobs(ids: &[i64]) -> Result<()> {
-    CLIENT.update_running_jobs(ids).await
+pub async fn set_job_pending_owned(id: i64, node: &str, generation: i64) -> Result<bool> {
+    CLIENT.set_job_pending_owned(id, node, generation).await
 }
 
-/// Commit fence for merge jobs (2026-07-30 audit): refresh `updated_at` of
-/// ONE job with a single conditional UPDATE — `WHERE id = $job AND node =
-/// $node AND status = Running` — and report whether the row was hit.
-/// `false` means the lease was lost (the job timed out and was re-pended,
-/// and possibly re-claimed by another node): the caller must DISCARD its
-/// merge result instead of committing it, or two nodes double-commit the
-/// same inputs (permanent duplicate rows).
 #[inline]
-pub async fn confirm_job_ownership(id: i64, node: &str) -> Result<bool> {
-    CLIENT.confirm_job_ownership(id, node).await
+pub async fn set_job_done_owned(id: i64, node: &str, generation: i64) -> Result<bool> {
+    CLIENT.set_job_done_owned(id, node, generation).await
 }
 
 #[inline]
@@ -673,13 +682,20 @@ pub async fn clean_done_jobs(before_date: i64) -> Result<()> {
 }
 
 #[inline]
-pub async fn get_pending_dump_jobs(node: &str, limit: i64) -> Result<Vec<(i64, String, i64)>> {
+pub async fn get_pending_dump_jobs(node: &str, limit: i64) -> Result<Vec<DumpJobRecord>> {
     CLIENT.get_pending_dump_jobs(node, limit).await
 }
 
 #[inline]
-pub async fn set_job_dumped_status(ids: &[i64], dumped: bool) -> Result<()> {
-    CLIENT.set_job_dumped_status(ids, dumped).await
+pub async fn set_job_dumped_status_owned(
+    id: i64,
+    node: &str,
+    generation: i64,
+    dumped: bool,
+) -> Result<bool> {
+    CLIENT
+        .set_job_dumped_status_owned(id, node, generation, dumped)
+        .await
 }
 
 #[inline]
@@ -951,16 +967,24 @@ pub struct MergeJobRecord {
     pub id: i64,
     pub stream: String, // default/logs/default
     pub offsets: i64,   // 1718603746000000
+    pub lease_generation: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
-pub struct MergeJobPendingRecord {
+pub struct DumpJobRecord {
     pub id: i64,
     pub stream: String,
-    pub num: i64,
+    pub offsets: i64,
+    pub lease_generation: i64,
 }
 
-#[derive(Debug, Clone, sqlx::Type, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileListJobOrder {
+    EnqueueOldest,
+    OffsetNewest,
+}
+
+#[derive(Debug, Clone, Copy, sqlx::Type, PartialEq, Eq, Default)]
 #[repr(i64)]
 pub enum FileListJobStatus {
     #[default]

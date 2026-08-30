@@ -330,7 +330,7 @@ async fn cmd_run(streams: usize, max_secs: u64) -> Result<(), anyhow::Error> {
     };
     let mut scheduler = openobserve_core::compact::worker::JobScheduler::new(job_num, worker.tx());
     scheduler.run()?;
-    let job_tx = scheduler.tx();
+    let scheduler_handle = scheduler.handle();
 
     let hist_every: u64 = std::env::var("M29_HIST_EVERY")
         .ok()
@@ -381,7 +381,12 @@ async fn cmd_run(streams: usize, max_secs: u64) -> Result<(), anyhow::Error> {
         {
             eprintln!("[run] generate merge-debt error: {e}");
         }
-        if let Err(e) = openobserve_core::compact::run_merge(job_tx.clone(), 0, 0).await {
+        if let Err(e) = openobserve_core::compact::run_merge(
+            &scheduler_handle,
+            openobserve_core::compact::MergeLane::All,
+        )
+        .await
+        {
             eprintln!("[run] run_merge error: {e}");
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;

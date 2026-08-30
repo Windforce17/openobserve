@@ -208,10 +208,16 @@ pub async fn cli() -> Result<bool, anyhow::Error> {
     let cfg = config::get_config();
     match name.as_str() {
         "reset" => {
+            let component = command.get_one::<String>("component").unwrap().clone();
+            if component == "file-list-jobs" {
+                // This standalone command can run before any server process.
+                // Apply the normal schema migration before infra opens the
+                // file-list client and before reset_jobs_admin uses new columns.
+                crate::migration::init_db().await?;
+            }
             infra::init().await?;
             db::org_users::cache().await?;
             db::org_ingestion_tokens::cache().await?;
-            let component = command.get_one::<String>("component").unwrap();
             match component.as_str() {
                 "root" => {
                     if let Err(msg) = config::utils::password::validate_password_strength(
@@ -319,8 +325,8 @@ pub async fn cli() -> Result<bool, anyhow::Error> {
                         "reset {n} compact file offsets to {time} (stream: {})",
                         stream.unwrap_or("*")
                     );
-                    // 2. set file list jobs to pending
-                    let rows = infra_file_list::set_job_pending(&[], time, stream).await?;
+                    // 2. administratively reset matching file-list jobs
+                    let rows = infra_file_list::reset_jobs_admin(time, stream).await?;
                     println!(
                         "reset {rows} file_list_jobs to pending (offsets >= {time}, stream: {})",
                         stream.unwrap_or("*")

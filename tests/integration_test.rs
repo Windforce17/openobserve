@@ -55,7 +55,10 @@ mod tests {
             json,
         },
     };
-    use infra::schema::{STREAM_SCHEMAS, STREAM_SCHEMAS_LATEST, STREAM_SETTINGS};
+    use infra::{
+        file_list::FileListJobOrder,
+        schema::{STREAM_SCHEMAS, STREAM_SCHEMAS_LATEST, STREAM_SETTINGS},
+    };
     use openobserve::{
         common::{
             infra::config::ENRICHMENT_TABLES,
@@ -183,15 +186,21 @@ mod tests {
     /// The compactor commit fence (heartbeat-from-claim, 2026-07-31)
     /// refuses to commit a job this node does not OWN — tests invoking
     /// merge_by_stream directly must claim exactly like run_merge does.
-    async fn claim_job_for_merge(job_id: i64) {
-        let claimed =
-            infra::file_list::get_pending_jobs(&config::cluster::LOCAL_NODE.uuid, 20, true, 0)
-                .await
-                .unwrap();
-        assert!(
-            claimed.iter().any(|j| j.id == job_id),
-            "job {job_id} must be claimable by this node: {claimed:?}"
-        );
+    async fn claim_job_for_merge(job_id: i64) -> i64 {
+        let claimed = infra::file_list::get_pending_jobs(
+            &config::cluster::LOCAL_NODE.uuid,
+            20,
+            FileListJobOrder::EnqueueOldest,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        claimed
+            .iter()
+            .find(|job| job.id == job_id)
+            .unwrap_or_else(|| panic!("job {job_id} must be claimable: {claimed:?}"))
+            .lease_generation
     }
 
     async fn make_request(
@@ -1748,7 +1757,10 @@ mod tests {
     async fn e2e_single_file_healing_compaction() {
         use chrono::TimeZone;
         use config::utils::time::hour_micros;
-        use openobserve::service::compact::{merge::merge_by_stream, worker::MergeWorker};
+        use openobserve::service::compact::{
+            merge::merge_by_stream,
+            worker::{MergeCancellation, MergeWorker},
+        };
 
         let auth = setup();
         let app = init_test_router();
@@ -1908,14 +1920,17 @@ mod tests {
         let job_id = infra::file_list::add_job("e2e", StreamType::Logs, "healtest", offset)
             .await
             .unwrap();
-        claim_job_for_merge(job_id).await;
+        let generation = claim_job_for_merge(job_id).await;
+        let cancel = MergeCancellation::default();
         merge_by_stream(
             worker.tx(),
             "e2e",
             StreamType::Logs,
             "healtest",
             job_id,
+            generation,
             offset,
+            &cancel,
         )
         .await
         .unwrap();
@@ -2013,14 +2028,17 @@ mod tests {
         let job_id = infra::file_list::add_job("e2e", StreamType::Logs, "healtest", offset)
             .await
             .unwrap();
-        claim_job_for_merge(job_id).await;
+        let generation = claim_job_for_merge(job_id).await;
+        let cancel = MergeCancellation::default();
         merge_by_stream(
             worker.tx(),
             "e2e",
             StreamType::Logs,
             "healtest",
             job_id,
+            generation,
             offset,
+            &cancel,
         )
         .await
         .unwrap();
@@ -2073,14 +2091,17 @@ mod tests {
         let job_id = infra::file_list::add_job("e2e", StreamType::Logs, "healtest", offset)
             .await
             .unwrap();
-        claim_job_for_merge(job_id).await;
+        let generation = claim_job_for_merge(job_id).await;
+        let cancel = MergeCancellation::default();
         merge_by_stream(
             worker.tx(),
             "e2e",
             StreamType::Logs,
             "healtest",
             job_id,
+            generation,
             offset,
+            &cancel,
         )
         .await
         .unwrap();

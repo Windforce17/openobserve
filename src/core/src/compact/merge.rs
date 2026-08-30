@@ -34,10 +34,13 @@ use config::{
     },
 };
 use hashbrown::{HashMap, HashSet};
+#[cfg(test)]
+use infra::file_list::FileListJobOrder;
 use infra::{
     cache::file_data,
     cluster::get_node_by_uuid,
-    dist_lock, file_list as infra_file_list,
+    dist_lock,
+    file_list::{self as infra_file_list, FileListJobStatus},
     runtime::DATAFUSION_RUNTIME,
     schema::{
         get_partition_time_level, get_stream_setting_bloom_filter_fields,
@@ -70,6 +73,44 @@ const BUFFERED_UPLOAD_MAX_BYTES: u64 = 16 * 1024 * 1024;
 /// window queued/running so lease loss or shutdown does not leave an hour's
 /// worth of CPU work and uploads that can no longer commit.
 const JOB_BATCH_IN_FLIGHT: usize = 2;
+
+type MergeBatchOutcome = Result<(usize, Vec<FileKey>, Vec<FileKey>), anyhow::Error>;
+
+enum MergeBatchReceive {
+    Result(MergeBatchOutcome),
+    Closed,
+    Cancelled,
+}
+
+async fn receive_merge_batch_result(
+    rx: &mut mpsc::Receiver<MergeBatchOutcome>,
+    cancel: &MergeCancellation,
+) -> MergeBatchReceive {
+    tokio::select! {
+        result = rx.recv() => match result {
+            Some(result) => MergeBatchReceive::Result(result),
+            None => MergeBatchReceive::Closed,
+        },
+        _ = wait_for_merge_cancellation(cancel) => MergeBatchReceive::Cancelled,
+    }
+}
+
+async fn send_merge_batch(
+    worker_tx: &mpsc::Sender<(MergeSender, MergeBatch)>,
+    result_tx: MergeSender,
+    batch: MergeBatch,
+    cancel: &MergeCancellation,
+) -> Result<(), anyhow::Error> {
+    tokio::select! {
+        biased;
+        _ = wait_for_merge_cancellation(cancel) => {
+            Err(anyhow::anyhow!("compaction cancelled while waiting to submit batch"))
+        }
+        result = worker_tx.send((result_tx, batch)) => {
+            result.map_err(|e| anyhow::anyhow!("send batch to worker failed: {e}"))
+        }
+    }
+}
 
 fn vix_cpu_capacity() -> usize {
     let machine = std::thread::available_parallelism().map_or(1, |n| n.get());
@@ -539,17 +580,33 @@ pub async fn merge_by_stream(
     stream_type: StreamType,
     stream_name: &str,
     job_id: i64,
+    lease_generation: i64,
     offset: i64,
+    cancel: &MergeCancellation,
 ) -> Result<(), anyhow::Error> {
     let cfg = get_config();
     let start = std::time::Instant::now();
 
-    // get schema
+    cancel.check("stream schema lookup")?;
     let schema = infra::schema::get(org_id, stream_name, stream_type).await?;
+    cancel.check("stream schema lookup")?;
     if schema == Schema::empty() {
-        // the stream was deleted, mark the job as done
-        if let Err(e) = infra_file_list::set_job_done(&[job_id]).await {
-            log::error!("[COMPACTOR] set_job_done failed: {e}");
+        match infra_file_list::set_job_done_owned(job_id, &LOCAL_NODE.uuid, lease_generation).await
+        {
+            Ok(true) => log::info!(
+                "[COMPACTOR] merge job completed job_id={job_id} generation={lease_generation} outcome=deleted_stream"
+            ),
+            Ok(false) => {
+                cancel.cancel();
+                return Err(anyhow::anyhow!(
+                    "job {job_id} generation {lease_generation} lost ownership on deleted-stream completion"
+                ));
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "set_job_done_owned failed for job {job_id} generation {lease_generation}: {e}"
+                ));
+            }
         }
         return Ok(());
     }
@@ -593,16 +650,29 @@ pub async fn merge_by_stream(
     )
     .await
     .map_err(|e| anyhow::anyhow!("query file list failed: {e}"))?;
+    cancel.check("file-list query")?;
 
     log::debug!(
         "[COMPACTOR] merge_by_stream [{org_id}/{stream_type}/{stream_name}] date range: [{date_start},{date_end}], files: {}",
         files.len(),
     );
-
     if files.is_empty() {
-        // update job status
-        if let Err(e) = infra_file_list::set_job_done(&[job_id]).await {
-            log::error!("[COMPACTOR] set_job_done failed: {e}");
+        match infra_file_list::set_job_done_owned(job_id, &LOCAL_NODE.uuid, lease_generation).await
+        {
+            Ok(true) => log::info!(
+                "[COMPACTOR] merge job completed job_id={job_id} generation={lease_generation} outcome=empty_stream"
+            ),
+            Ok(false) => {
+                cancel.cancel();
+                return Err(anyhow::anyhow!(
+                    "job {job_id} generation {lease_generation} lost ownership on empty-stream completion"
+                ));
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "set_job_done_owned failed for job {job_id} generation {lease_generation}: {e}"
+                ));
+            }
         }
         return Ok(());
     }
@@ -618,7 +688,7 @@ pub async fn merge_by_stream(
 
     // use multiple threads to merge
     let semaphore = std::sync::Arc::new(Semaphore::new(cfg.limit.file_merge_thread_num));
-    let job_cancel = MergeCancellation::default();
+    let job_cancel = cancel.clone();
     let mut tasks = Vec::with_capacity(partition_files_with_size.len());
     for (prefix, files_with_size) in partition_files_with_size.into_iter() {
         let org_id = org_id.to_string();
@@ -627,6 +697,7 @@ pub async fn merge_by_stream(
         let worker_tx = worker_tx.clone();
         let job_cancel = job_cancel.clone();
         let task: JoinHandle<Result<Vec<i64>, anyhow::Error>> = tokio::task::spawn(async move {
+            job_cancel.check("partition planning")?;
             let cfg = get_config();
             let job_strategy = MergeStrategy::from(&cfg.compact.strategy);
 
@@ -842,9 +913,11 @@ pub async fn merge_by_stream(
                     && next_batch < batch_group_len
                 {
                     let batch = batch_groups[next_batch].clone();
-                    if let Err(e) = worker_tx.send((inner_tx.clone(), batch)).await {
-                        log::error!("[COMPACTOR] send batch to worker failed: {e}");
-                        return Err(anyhow::Error::msg("send batch to worker failed"));
+                    if let Err(e) =
+                        send_merge_batch(&worker_tx, inner_tx.clone(), batch, &job_cancel).await
+                    {
+                        log::error!("[COMPACTOR] {e}");
+                        return Err(e);
                     }
                     next_batch += 1;
                     in_flight += 1;
@@ -859,11 +932,20 @@ pub async fn merge_by_stream(
                     }
                     break;
                 }
-                let Some(ret) = inner_rx.recv().await else {
-                    last_error = Some(anyhow::anyhow!(
-                        "compaction worker result channel closed with {in_flight} batch(es) still in flight"
-                    ));
-                    break;
+                let ret = match receive_merge_batch_result(&mut inner_rx, &job_cancel).await {
+                    MergeBatchReceive::Result(ret) => ret,
+                    MergeBatchReceive::Closed => {
+                        last_error = Some(anyhow::anyhow!(
+                            "compaction worker result channel closed with {in_flight} batch(es) still in flight"
+                        ));
+                        break;
+                    }
+                    MergeBatchReceive::Cancelled => {
+                        last_error = Some(anyhow::anyhow!(
+                            "compaction cancelled with {in_flight} batch(es) still in flight"
+                        ));
+                        break;
+                    }
                 };
                 in_flight -= 1;
                 let (batch_id, new_files, merged_files) = match ret {
@@ -958,8 +1040,15 @@ pub async fn merge_by_stream(
                 // the same inputs with the new owner (permanent duplicate
                 // rows), so the whole result is discarded instead and only
                 // the uploaded objects are orphaned.
-                match commit_batch_if_owner(job_id, &LOCAL_NODE.uuid, &org_id, stream_type, &events)
-                    .await
+                match commit_batch_if_owner(
+                    job_id,
+                    &LOCAL_NODE.uuid,
+                    lease_generation,
+                    &org_id,
+                    stream_type,
+                    &events,
+                )
+                .await
                 {
                     Ok(FencedCommit::Committed) => {}
                     Ok(FencedCommit::LeaseLost) => {
@@ -1041,14 +1130,23 @@ pub async fn merge_by_stream(
 
     let _ = (is_incremental, orphan_blooms);
 
-    // An INCREMENTAL round leaves the hour unsealed (its below-budget
-    // remainder is carried forward), but the job still COMPLETES and
-    // leaves the claim queue — keeping it pending would park a
-    // never-finishing job at the head of the newest-first claim order and
-    // starve every older hour. Re-queueing the closed hour is `add_job`'s
-    // job: it resurrects the done row (see `add_job`).
-    if let Err(e) = infra_file_list::set_job_done(&[job_id]).await {
-        log::error!("[COMPACTOR] set_job_done failed: {e}");
+    cancel.check("job completion")?;
+    match infra_file_list::set_job_done_owned(job_id, &LOCAL_NODE.uuid, lease_generation).await {
+        Ok(true) => log::info!(
+            "[COMPACTOR] merge job completed job_id={job_id} generation={lease_generation} outcome=done elapsed_ms={}",
+            start.elapsed().as_millis(),
+        ),
+        Ok(false) => {
+            cancel.cancel();
+            return Err(anyhow::anyhow!(
+                "job {job_id} generation {lease_generation} lost ownership before completion"
+            ));
+        }
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "set_job_done_owned failed for job {job_id} generation {lease_generation}: {e}"
+            ));
+        }
     }
 
     // metrics
@@ -2370,15 +2468,23 @@ enum FencedCommit {
 async fn commit_batch_if_owner(
     job_id: i64,
     node: &str,
+    lease_generation: i64,
     org_id: &str,
     stream_type: StreamType,
     events: &[FileKey],
 ) -> Result<FencedCommit, anyhow::Error> {
-    let owned = infra_file_list::confirm_job_ownership(job_id, node)
-        .await
-        .map_err(|e| {
-            anyhow::anyhow!("confirm_job_ownership for job {job_id} failed (commit discarded): {e}")
-        })?;
+    let owned = infra_file_list::touch_job_lease(
+        job_id,
+        node,
+        lease_generation,
+        FileListJobStatus::Running,
+    )
+    .await
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "generation fence for job {job_id} generation {lease_generation} failed (commit discarded): {e}"
+        )
+    })?;
     if !owned {
         return Ok(FencedCommit::LeaseLost);
     }
@@ -2737,6 +2843,71 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn merge_batch_result_wait_stops_on_cancellation() {
+        let (_tx, mut rx) = mpsc::channel::<MergeBatchOutcome>(1);
+        let cancel = MergeCancellation::default();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+            trigger.cancel();
+        });
+
+        let outcome = tokio::time::timeout(
+            tokio::time::Duration::from_secs(1),
+            receive_merge_batch_result(&mut rx, &cancel),
+        )
+        .await
+        .expect("cancelled result wait must not deadlock");
+        assert!(matches!(outcome, MergeBatchReceive::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn merge_batch_submission_stops_on_cancellation() {
+        let cancel = MergeCancellation::default();
+        let make_batch = |batch_id, cancel: MergeCancellation| MergeBatch {
+            batch_id,
+            org_id: "org".to_string(),
+            stream_type: StreamType::Logs,
+            stream_name: "stream".to_string(),
+            prefix: "files/org/logs/stream/2026/01/01/00/".to_string(),
+            files: Vec::new(),
+            cancel,
+        };
+        let (result_tx, _result_rx) = mpsc::channel::<MergeBatchOutcome>(1);
+        let (worker_tx, mut worker_rx) = mpsc::channel::<(MergeSender, MergeBatch)>(1);
+        worker_tx
+            .send((result_tx.clone(), make_batch(1, cancel.clone())))
+            .await
+            .expect("fill worker queue");
+
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+            trigger.cancel();
+        });
+        let error = tokio::time::timeout(
+            tokio::time::Duration::from_secs(1),
+            send_merge_batch(
+                &worker_tx,
+                result_tx,
+                make_batch(2, cancel.clone()),
+                &cancel,
+            ),
+        )
+        .await
+        .expect("cancelled worker send must not deadlock")
+        .expect_err("cancelled worker send must fail");
+
+        assert!(error.to_string().contains("cancelled"));
+        let (_, queued) = worker_rx.recv().await.expect("original queued batch");
+        assert_eq!(queued.batch_id, 1);
+        assert!(
+            worker_rx.try_recv().is_err(),
+            "cancelled batch must not be queued"
+        );
+    }
+
     /// M20b pin: the compactor's parquet merge plans single-partition for
     /// METADATA-class streams ONLY (the prod trace_list_index OOM class);
     /// every data stream type keeps the multi-partition plan. The plan shape
@@ -2848,7 +3019,13 @@ mod tests {
 
         let stream_key = format!("{org}/logs/{stream}");
         let claimed = retry_busy("claim", || {
-            infra_file_list::get_pending_jobs("m29-debt-test", 10_000, false, 0)
+            infra_file_list::get_pending_jobs(
+                "m29-debt-test",
+                10_000,
+                FileListJobOrder::EnqueueOldest,
+                None,
+                None,
+            )
         })
         .await;
         let mine: Vec<_> = claimed.iter().filter(|j| j.stream == stream_key).collect();
@@ -2860,27 +3037,38 @@ mod tests {
              indexed sparse cohort is absent"
         );
         // release strangers claimed alongside ours
-        let strangers: Vec<i64> = claimed
-            .iter()
-            .filter(|j| j.stream != stream_key)
-            .map(|j| j.id)
-            .collect();
-        if !strangers.is_empty() {
-            retry_busy("release strangers", || {
-                infra_file_list::set_job_pending(&strangers, 0, None)
+        for stranger in claimed.iter().filter(|j| j.stream != stream_key) {
+            let id = stranger.id;
+            let generation = stranger.lease_generation;
+            let released = retry_busy("release stranger", || {
+                infra_file_list::set_job_pending_owned(id, "m29-debt-test", generation)
             })
             .await;
+            assert!(released, "test must still own stranger claim {id}");
         }
 
         // a finished hour that still holds debt is resurrected next sweep
-        let done_ids: Vec<i64> = mine.iter().map(|j| j.id).collect();
-        retry_busy("set_job_done", || infra_file_list::set_job_done(&done_ids)).await;
+        for job in &mine {
+            let id = job.id;
+            let generation = job.lease_generation;
+            let done = retry_busy("set_job_done_owned", || {
+                infra_file_list::set_job_done_owned(id, "m29-debt-test", generation)
+            })
+            .await;
+            assert!(done, "test must still own debt claim {id}");
+        }
         let enqueued = generate_merge_debt_job_by_stream(&org, StreamType::Logs, &stream)
             .await
             .expect("debt sweep resurrect");
         assert_eq!(enqueued, 3, "done hours with standing debt resurrect");
         let claimed = retry_busy("re-claim", || {
-            infra_file_list::get_pending_jobs("m29-debt-test", 10_000, false, 0)
+            infra_file_list::get_pending_jobs(
+                "m29-debt-test",
+                10_000,
+                FileListJobOrder::EnqueueOldest,
+                None,
+                None,
+            )
         })
         .await;
         let mine2: Vec<i64> = claimed
@@ -2895,26 +3083,22 @@ mod tests {
         );
 
         // cleanup: our jobs done, strangers restored
-        let mut cleanup_done = Vec::new();
-        let mut cleanup_release = Vec::new();
-        for j in &claimed {
-            if j.stream == stream_key {
-                cleanup_done.push(j.id);
+        for job in &claimed {
+            let id = job.id;
+            let generation = job.lease_generation;
+            if job.stream == stream_key {
+                let done = retry_busy("cleanup done", || {
+                    infra_file_list::set_job_done_owned(id, "m29-debt-test", generation)
+                })
+                .await;
+                assert!(done, "test must still own cleanup claim {id}");
             } else {
-                cleanup_release.push(j.id);
+                let released = retry_busy("cleanup release", || {
+                    infra_file_list::set_job_pending_owned(id, "m29-debt-test", generation)
+                })
+                .await;
+                assert!(released, "test must still own cleanup stranger {id}");
             }
-        }
-        if !cleanup_done.is_empty() {
-            retry_busy("cleanup done", || {
-                infra_file_list::set_job_done(&cleanup_done)
-            })
-            .await;
-        }
-        if !cleanup_release.is_empty() {
-            retry_busy("cleanup release", || {
-                infra_file_list::set_job_pending(&cleanup_release, 0, None)
-            })
-            .await;
         }
     }
 
@@ -3634,20 +3818,28 @@ mod tests {
 
         // claim for node-a (table-wide claim: keep ours, restore strangers)
         let claimed = retry_busy("claim", || {
-            infra_file_list::get_pending_jobs("fence-node-a", 10_000, false, 0)
+            infra_file_list::get_pending_jobs(
+                "fence-node-a",
+                10_000,
+                FileListJobOrder::EnqueueOldest,
+                None,
+                None,
+            )
         })
         .await;
-        assert!(claimed.iter().any(|j| j.id == job_id));
-        let strangers = claimed
+        let generation_a = claimed
             .iter()
-            .map(|j| j.id)
-            .filter(|id| *id != job_id)
-            .collect::<Vec<_>>();
-        if !strangers.is_empty() {
-            retry_busy("restore stranger jobs", || {
-                infra_file_list::set_job_pending(&strangers, 0, None)
+            .find(|j| j.id == job_id)
+            .expect("our job must be claimed")
+            .lease_generation;
+        for stranger in claimed.iter().filter(|j| j.id != job_id) {
+            let id = stranger.id;
+            let generation = stranger.lease_generation;
+            let released = retry_busy("restore stranger job", || {
+                infra_file_list::set_job_pending_owned(id, "fence-node-a", generation)
             })
             .await;
+            assert!(released, "node-a must still own stranger claim {id}");
         }
 
         // the running owner's fenced commit lands: one add + one delete
@@ -3655,7 +3847,14 @@ mod tests {
         let new_a = commit_test_file(&org, &stream, "new_a");
         let events_a = build_commit_events(vec![new_a.clone()], std::slice::from_ref(&old_a));
         let outcome = retry_busy("owner commit", || {
-            commit_batch_if_owner(job_id, "fence-node-a", &org, StreamType::Logs, &events_a)
+            commit_batch_if_owner(
+                job_id,
+                "fence-node-a",
+                generation_a,
+                &org,
+                StreamType::Logs,
+                &events_a,
+            )
         })
         .await;
         match outcome {
@@ -3676,23 +3875,32 @@ mod tests {
         })
         .await;
         let reclaimed = retry_busy("re-claim", || {
-            infra_file_list::get_pending_jobs("fence-node-b", 10_000, false, 0)
+            infra_file_list::get_pending_jobs(
+                "fence-node-b",
+                10_000,
+                FileListJobOrder::EnqueueOldest,
+                None,
+                None,
+            )
         })
         .await;
-        assert!(
-            reclaimed.iter().any(|j| j.id == job_id),
-            "node-b must have re-claimed the job"
-        );
-        let strangers = reclaimed
+        let generation_b = reclaimed
             .iter()
-            .map(|j| j.id)
-            .filter(|id| *id != job_id)
-            .collect::<Vec<_>>();
-        if !strangers.is_empty() {
-            retry_busy("restore stranger jobs", || {
-                infra_file_list::set_job_pending(&strangers, 0, None)
+            .find(|j| j.id == job_id)
+            .expect("node-b must have re-claimed the job")
+            .lease_generation;
+        assert_ne!(
+            generation_a, generation_b,
+            "a stale reset and re-claim must advance the generation"
+        );
+        for stranger in reclaimed.iter().filter(|j| j.id != job_id) {
+            let id = stranger.id;
+            let generation = stranger.lease_generation;
+            let released = retry_busy("restore stranger job", || {
+                infra_file_list::set_job_pending_owned(id, "fence-node-b", generation)
             })
             .await;
+            assert!(released, "node-b must still own stranger claim {id}");
         }
 
         // node-a finishes its merge late: the fenced commit must DISCARD —
@@ -3701,7 +3909,14 @@ mod tests {
         let new_b = commit_test_file(&org, &stream, "new_b");
         let events_b = build_commit_events(vec![new_b.clone()], std::slice::from_ref(&old_b));
         let outcome = retry_busy("loser commit attempt", || {
-            commit_batch_if_owner(job_id, "fence-node-a", &org, StreamType::Logs, &events_b)
+            commit_batch_if_owner(
+                job_id,
+                "fence-node-a",
+                generation_a,
+                &org,
+                StreamType::Logs,
+                &events_b,
+            )
         })
         .await;
         match outcome {
@@ -3724,7 +3939,14 @@ mod tests {
 
         // the new owner still commits fine
         let outcome = retry_busy("winner commit", || {
-            commit_batch_if_owner(job_id, "fence-node-b", &org, StreamType::Logs, &events_b)
+            commit_batch_if_owner(
+                job_id,
+                "fence-node-b",
+                generation_b,
+                &org,
+                StreamType::Logs,
+                &events_b,
+            )
         })
         .await;
         match outcome {
@@ -3739,10 +3961,10 @@ mod tests {
         );
 
         // cleanup
-        let done_ids = [job_id];
-        retry_busy("cleanup set_job_done", || {
-            infra_file_list::set_job_done(&done_ids)
+        let done = retry_busy("cleanup set_job_done_owned", || {
+            infra_file_list::set_job_done_owned(job_id, "fence-node-b", generation_b)
         })
         .await;
+        assert!(done, "node-b must still own the fenced job at cleanup");
     }
 }

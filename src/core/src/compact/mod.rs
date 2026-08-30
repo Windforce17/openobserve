@@ -25,12 +25,11 @@ use config::{
 };
 use infra::{
     cluster::get_node_from_consistent_hash,
-    file_list as infra_file_list,
+    file_list::{self as infra_file_list, FileListJobOrder, FileListJobStatus, MergeJobRecord},
     schema::{get_partition_time_level, get_settings},
 };
 #[cfg(feature = "enterprise")]
 use o2_enterprise::enterprise::common::downsampling::get_matching_downsampling_rules;
-use tokio::sync::mpsc;
 
 use crate::service::db;
 
@@ -293,170 +292,255 @@ pub async fn run_generate_downsampling_job() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-/// compactor merging
-/// `min_offsets` restricts the claim to jobs at or after that hour (0 = no
-/// restriction) — the live lane (#23) passes `now - lookback` so its
-/// reserved slots only ever pick recent-hour jobs. `max_jobs` overrides the
-/// claim size when > 0 (the live lane passes its slot count); 0 keeps the
-/// default worker-sized claim.
+const HOUR_MICROS: i64 = 3_600_000_000;
+
+pub fn live_claim_floor(now_micros: i64, lookback_hours: i64) -> i64 {
+    let current_hour = now_micros.div_euclid(HOUR_MICROS) * HOUR_MICROS;
+    current_hour.saturating_sub(lookback_hours.max(1).saturating_mul(HOUR_MICROS))
+}
+
+/// A scheduler lane's database view. When live compaction is enabled callers
+/// use the same hour boundary for `Backlog` and `Live`, making the two claim
+/// sets disjoint by construction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MergeLane {
+    /// All pending jobs, oldest enqueue first.
+    All,
+    /// Jobs strictly before the live floor, oldest enqueue first.
+    Backlog { before: i64 },
+    /// Jobs at or after the live floor, newest offset first.
+    Live { from: i64 },
+}
+
+impl MergeLane {
+    fn claim_spec(self) -> (FileListJobOrder, Option<i64>, Option<i64>, &'static str) {
+        match self {
+            Self::All => (FileListJobOrder::EnqueueOldest, None, None, "all"),
+            Self::Backlog { before } => (
+                FileListJobOrder::EnqueueOldest,
+                None,
+                Some(before),
+                "backlog",
+            ),
+            Self::Live { from } => (FileListJobOrder::OffsetNewest, Some(from), None, "live"),
+        }
+    }
+}
+
+async fn transition_claim(
+    job: &MergeJobRecord,
+    cancel: &worker::MergeCancellation,
+    done: bool,
+    outcome: &'static str,
+) {
+    let result = if done {
+        infra_file_list::set_job_done_owned(job.id, &LOCAL_NODE.uuid, job.lease_generation).await
+    } else {
+        infra_file_list::set_job_pending_owned(job.id, &LOCAL_NODE.uuid, job.lease_generation).await
+    };
+    match result {
+        Ok(true) => log::info!(
+            "[COMPACTOR] merge claim completed job_id={} generation={} outcome={outcome}",
+            job.id,
+            job.lease_generation,
+        ),
+        Ok(false) => {
+            cancel.cancel();
+            log::warn!(
+                "[COMPACTOR] merge claim transition missed ownership job_id={} generation={} outcome={outcome}",
+                job.id,
+                job.lease_generation,
+            );
+        }
+        Err(e) => log::error!(
+            "[COMPACTOR] merge claim transition failed job_id={} generation={} outcome={outcome}: {e}",
+            job.id,
+            job.lease_generation,
+        ),
+    }
+}
+
+/// Claim and dispatch compaction work for one scheduler lane.
+///
+/// Scheduler permits are reserved before the database claim and moved
+/// one-for-one into non-cloneable `MergeJob`s. The claim ceiling remains the
+/// configured batch size, additionally bounded by merge-worker count and
+/// currently-free lane capacity.
 pub async fn run_merge(
-    job_tx: mpsc::Sender<worker::MergeJob>,
-    min_offsets: i64,
-    max_jobs: i64,
+    scheduler: &worker::JobSchedulerHandle,
+    lane: MergeLane,
 ) -> Result<(), anyhow::Error> {
     let cfg = get_config();
-    // Claim only what this node's merge workers can start soon: even with
-    // heartbeats running from claim time (below), a worker-sized batch keeps
-    // a slow node from hoarding jobs a healthy node could run. Oldest-first
-    // claiming (get_pending_jobs) spreads a hot stream's hour-jobs across
-    // the whole fleet.
-    let claim_limit = if max_jobs > 0 {
-        max_jobs
-    } else {
-        std::cmp::min(
-            cfg.compact.batch_size,
-            std::cmp::max(cfg.limit.file_merge_thread_num as i64, 1),
-        )
-    };
-    let jobs = infra_file_list::get_pending_jobs(
+    let batch_limit = usize::try_from(cfg.compact.batch_size.max(0)).unwrap_or(usize::MAX);
+    let reserve_limit = batch_limit.min(cfg.limit.file_merge_thread_num.max(1));
+    let permits = scheduler.reserve(reserve_limit);
+    if permits.is_empty() {
+        log::debug!(
+            "[COMPACTOR] merge claim skipped lane={} active_slots={} free_slots=0",
+            lane.claim_spec().3,
+            scheduler.capacity(),
+        );
+        return Ok(());
+    }
+
+    let (order, min_offsets, max_offsets, lane_name) = lane.claim_spec();
+    let claim_limit = permits.len() as i64;
+    let jobs = match infra_file_list::get_pending_jobs(
         &LOCAL_NODE.uuid,
         claim_limit,
-        cfg.compact.fast_mode,
+        order,
         min_offsets,
+        max_offsets,
     )
-    .await?;
+    .await
+    {
+        Ok(jobs) => jobs,
+        Err(e) => {
+            drop(permits);
+            return Err(e.into());
+        }
+    };
+    log::info!(
+        "[COMPACTOR] merge claim lane={lane_name} requested={claim_limit} claimed={} active_slots={} free_slots={}",
+        jobs.len(),
+        scheduler.capacity().saturating_sub(scheduler.free_slots()),
+        scheduler.free_slots(),
+    );
     if jobs.is_empty() {
         return Ok(());
     }
 
-    // Heartbeat-from-claim: every claimed job gets its lease heartbeat NOW,
-    // before any dispatch work. The guard is handed through the scheduler
-    // channel inside MergeJob, so one continuous heartbeat covers the job
-    // from CLAIM through the worker's COMMIT — a job parked in the
-    // capacity-1 channel behind a long merge stays fresh instead of being
-    // re-pended by check_running_jobs and double-merged by another node
-    // (2026-07-30 audit). Guards of jobs that are released or done below
-    // drop with this map at the end of the function.
-    //
-    // ttl: 1/4 of job_run_timeout — the timeout covers the whole job, and
-    // refreshing at 1/2 could still cross the threshold under scheduling
-    // delay, so 1/4 keeps a safety margin.
     let ttl = std::cmp::max(60, cfg.compact.job_run_timeout / 4) as u64;
-    let mut leases: std::collections::HashMap<i64, worker::JobLeaseGuard> = jobs
-        .iter()
-        .map(|job| (job.id, worker::JobLeaseGuard::spawn(job.id, ttl)))
-        .collect();
-
     let now = config::utils::time::now();
     let data_lifecycle_end = now - Duration::try_days(cfg.compact.data_retention_days).unwrap();
+    let mut permits = permits.into_iter();
+    let mut claimed_jobs = Vec::with_capacity(jobs.len());
+    let mut overflow = Vec::new();
 
-    // if the stream partition_time_level is daily we only allow one compactor
-    let mut need_release_ids = Vec::new();
-    let mut need_done_ids = Vec::new();
-    let mut merge_jobs = Vec::with_capacity(jobs.len());
+    // Start every heartbeat immediately after the claim, before any one
+    // record can block on schema/settings/ownership lookups.
     for job in jobs {
+        let Some(permit) = permits.next() else {
+            overflow.push(job);
+            continue;
+        };
+        let cancel = worker::MergeCancellation::default();
+        let lease = worker::JobLeaseGuard::spawn(
+            job.id,
+            LOCAL_NODE.uuid.clone(),
+            job.lease_generation,
+            FileListJobStatus::Running,
+            ttl,
+            cfg.compact.job_run_timeout.max(1) as u64,
+            cancel.clone(),
+        );
+        claimed_jobs.push((job, permit, cancel, lease));
+    }
+    for job in overflow {
+        // Defensive only: the storage API is required to honor `limit`.
+        // Never retain an unreserved claim if an implementation regresses.
+        let cancel = worker::MergeCancellation::default();
+        transition_claim(&job, &cancel, false, "claim_overflow").await;
+    }
+
+    for (job, permit, cancel, lease) in claimed_jobs {
         if job.offsets == 0 {
-            log::error!("[COMPACTOR] merge job offset error: {}", job.offsets);
+            log::error!(
+                "[COMPACTOR] merge job has invalid offset job_id={} generation={}",
+                job.id,
+                job.lease_generation,
+            );
+            transition_claim(&job, &cancel, true, "invalid_offset").await;
             continue;
         }
         let columns = job.stream.split('/').collect::<Vec<&str>>();
-        assert_eq!(columns.len(), 3);
+        if columns.len() != 3 {
+            log::error!(
+                "[COMPACTOR] merge job has invalid stream key job_id={} generation={}",
+                job.id,
+                job.lease_generation,
+            );
+            transition_claim(&job, &cancel, true, "invalid_stream").await;
+            continue;
+        }
         let org_id = columns[0].to_string();
         let stream_type = StreamType::from(columns[1]);
         let stream_name = columns[2].to_string();
         let stream_settings = get_settings(&org_id, &stream_name, stream_type)
             .await
             .unwrap_or_default();
+        if cancel.is_cancelled() {
+            log::warn!(
+                "[COMPACTOR] merge claim cancelled before dispatch job_id={} generation={}",
+                job.id,
+                job.lease_generation,
+            );
+            continue;
+        }
         let partition_time_level = get_partition_time_level(stream_type);
-        // to avoid compacting conflict with retention, need check the data retention time
         let stream_data_retention_end = if stream_settings.data_retention > 0 {
             now - Duration::try_days(stream_settings.data_retention).unwrap()
         } else {
             data_lifecycle_end
         };
         if job.offsets <= stream_data_retention_end.timestamp_micros() {
-            need_done_ids.push(job.id); // the data will be deleted by retention, just skip
+            transition_claim(&job, &cancel, true, "retention_skip").await;
             continue;
         }
-        // check if we are allowed to merge or just skip
         if db::compact::retention::is_deleting_stream(&org_id, stream_type, &stream_name, None) {
-            need_done_ids.push(job.id); // the data will be deleted by retention, just skip
+            transition_claim(&job, &cancel, true, "deleting_stream").await;
             continue;
         }
+
+        let mut stream_locked = false;
         if partition_time_level == PartitionTimeLevel::Daily {
-            // check if this stream need process by this node
             let Some(node_name) =
                 get_node_from_consistent_hash(&stream_name, &Role::Compactor, None).await
             else {
-                continue; // no compactor node
+                transition_claim(&job, &cancel, false, "no_daily_owner").await;
+                continue;
             };
             if LOCAL_NODE.name.ne(&node_name) {
-                need_release_ids.push(job.id); // not this node
+                transition_claim(&job, &cancel, false, "daily_owner_reject").await;
                 continue;
             }
-
-            // check if already running a job for this stream
             if db::compact::stream::is_running(&job.stream) {
-                need_release_ids.push(job.id); // another job is running
+                transition_claim(&job, &cancel, false, "stream_busy").await;
                 continue;
-            } else {
-                db::compact::stream::set_running(&job.stream);
             }
+            db::compact::stream::set_running(&job.stream);
+            stream_locked = true;
         }
-        // collect the merge jobs
-        let Some(lease) = leases.remove(&job.id) else {
-            // a duplicate id from the claim query would have consumed its
-            // lease guard already — never run the same job twice
-            log::error!(
-                "[COMPACTOR] claimed job {} appeared twice, skipping the duplicate",
-                job.id
-            );
+
+        if cancel.is_cancelled() {
+            if stream_locked {
+                db::compact::stream::clear_running(&job.stream);
+            }
             continue;
-        };
-        merge_jobs.push(worker::MergeJob {
+        }
+        let merge_job = worker::MergeJob::new(
             org_id,
             stream_type,
             stream_name,
-            job_id: job.id,
-            offset: job.offsets,
+            job.id,
+            job.offsets,
+            job.lease_generation,
+            cancel.clone(),
             lease,
-        });
-    }
-
-    if !need_release_ids.is_empty() {
-        // release those jobs
-        if let Err(e) = infra_file_list::set_job_pending(&need_release_ids, 0, None).await {
-            log::error!("[COMPACTOR] set_job_pending failed: {e}");
-        }
-    }
-
-    if !need_done_ids.is_empty() {
-        // set those jobs to done
-        if let Err(e) = infra_file_list::set_job_done(&need_done_ids).await {
-            log::error!("[COMPACTOR] set_job_done failed: {e}");
-        }
-    }
-
-    // Hand each job (with its lease guard inside) to the scheduler. The old
-    // batch-level heartbeat that lived only until this loop finished is gone:
-    // the per-job guards spawned at claim time above cover the whole
-    // claim-to-commit window.
-    for job in merge_jobs {
-        if let Err(e) = job_tx.send(job.clone()).await {
+            permit,
+        );
+        if let Err(e) = scheduler.send(merge_job).await {
+            let unsent = e.0;
             log::error!(
-                "[COMPACTOR] send merge job to worker failed [{}/{}/{}] error: {e}",
-                job.org_id,
-                job.stream_type,
-                job.stream_name,
+                "[COMPACTOR] merge dispatch failed job_id={} generation={}",
+                unsent.job_id,
+                unsent.lease_generation,
             );
-            // the job never reached a worker (scheduler shut down): release
-            // the claim right away instead of letting the lease time out
-            if let Err(e) = infra_file_list::set_job_pending(&[job.job_id], 0, None).await {
-                log::error!(
-                    "[COMPACTOR] set_job_pending for undispatched job {} failed: {e}",
-                    job.job_id,
-                );
+            if stream_locked {
+                db::compact::stream::clear_running(&job.stream);
             }
+            drop(unsent.lease);
+            transition_claim(&job, &cancel, false, "send_failure").await;
         }
     }
 
@@ -539,10 +623,35 @@ pub(crate) fn is_past_hour(offset: i64) -> bool {
                 * 3
 }
 
-/// Shared harness for the compact tests that exercise the process-global
-/// sqlite file_list tables (`worker` heartbeat lifetime, `merge` commit
-/// fencing): they claim/re-pend jobs table-wide, so tests across BOTH
-/// modules must serialize on ONE lock, and rows are namespaced per run.
+#[cfg(test)]
+mod merge_lane_tests {
+    use super::*;
+
+    #[test]
+    fn live_and_backlog_claim_windows_are_disjoint() {
+        let floor = 1_725_000_000_000_000;
+        let backlog = MergeLane::Backlog { before: floor }.claim_spec();
+        let live = MergeLane::Live { from: floor }.claim_spec();
+
+        assert_eq!(backlog.0, FileListJobOrder::EnqueueOldest);
+        assert_eq!(backlog.1, None);
+        assert_eq!(backlog.2, Some(floor));
+        assert_eq!(live.0, FileListJobOrder::OffsetNewest);
+        assert_eq!(live.1, Some(floor));
+        assert_eq!(live.2, None);
+    }
+
+    #[test]
+    fn live_claim_floor_is_hour_aligned() {
+        let now = 10 * HOUR_MICROS + HOUR_MICROS / 2;
+        assert_eq!(live_claim_floor(now, 2), 8 * HOUR_MICROS);
+        assert_eq!(live_claim_floor(now, 0), 9 * HOUR_MICROS);
+    }
+}
+
+/// Shared harness for compact tests that exercise process-global sqlite
+/// file-list job tables. They claim/re-pend jobs table-wide, so tests across
+/// modules serialize on one lock and namespace rows per run.
 #[cfg(test)]
 pub(crate) mod jobs_test_support {
     /// Serializes every test touching `file_list_jobs` in this crate.

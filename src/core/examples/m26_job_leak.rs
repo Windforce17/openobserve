@@ -9,9 +9,9 @@
 //!   claim (get_pending_jobs) -> heartbeat-from-claim (JobLeaseGuard) ->
 //!   scheduler channel -> merge_by_stream (schema get, file_list query,
 //!   partition tasks, worker channel) -> merge_files/merge_core_group (real
-//!   merge, spool, upload) -> fenced streaming commits (confirm_job_ownership
-//!   + batch_process + batch_add_deleted + query_ids_by_files + broadcast) ->
-//!   set_job_done
+//!   merge, spool, upload) -> generation-fenced streaming commits
+//!   (touch_job_lease + batch_process + batch_add_deleted +
+//!   query_ids_by_files + broadcast) -> set_job_done_owned
 //!
 //! and samples LIVE allocated bytes (counting mimalloc wrapper, the M23
 //! instrument) per completed job across hundreds of tiny jobs.
@@ -388,10 +388,7 @@ fn job_offset_micros(hour_index: usize) -> i64 {
 fn hour_prefix(stream: &str, offset_micros: i64) -> String {
     use chrono::TimeZone;
     let t = chrono::Utc.timestamp_nanos(offset_micros * 1000);
-    format!(
-        "files/{ORG}/logs/{stream}/{}",
-        t.format("%Y/%m/%d/%H"),
-    )
+    format!("files/{ORG}/logs/{stream}/{}", t.format("%Y/%m/%d/%H"),)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -402,7 +399,10 @@ async fn cmd_seed(
     rows_per_file: usize,
     width: usize,
 ) -> Result<(), anyhow::Error> {
-    anyhow::ensure!(files_per_job >= 2, "need >= 2 files per job to form a merge group");
+    anyhow::ensure!(
+        files_per_job >= 2,
+        "need >= 2 files per job to form a merge group"
+    );
     let started = Instant::now();
     init_meta().await?;
 
@@ -415,9 +415,15 @@ async fn cmd_seed(
     let now = config::utils::time::now_micros();
     for s in 0..streams {
         let name = stream_name(s);
-        infra::schema::merge(ORG, &name, StreamType::Logs, latest_schema.as_ref(), Some(now))
-            .await
-            .map_err(|e| anyhow::anyhow!("schema merge for {name}: {e}"))?;
+        infra::schema::merge(
+            ORG,
+            &name,
+            StreamType::Logs,
+            latest_schema.as_ref(),
+            Some(now),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("schema merge for {name}: {e}"))?;
     }
     eprintln!(
         "[seed] registered {streams} stream schemas ({} fields each)",
@@ -437,7 +443,11 @@ async fn cmd_seed(
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     let n_templates = if interleave { files_per_job } else { 1 };
-    let file_schema = if width == 0 { logs_schema() } else { wide_file_schema() };
+    let file_schema = if width == 0 {
+        logs_schema()
+    } else {
+        wide_file_schema()
+    };
     let template_base_ts = job_offset_micros(0);
     let mut templates: Vec<(bytes::Bytes, FileMeta)> = Vec::with_capacity(n_templates);
     for f in 0..n_templates {
@@ -451,8 +461,10 @@ async fn cmd_seed(
             f,
             f * hicard,
         );
-        let table: Arc<dyn TableProvider> =
-            Arc::new(MemTable::try_new(Arc::clone(&file_schema), vec![vec![batch]])?);
+        let table: Arc<dyn TableProvider> = Arc::new(MemTable::try_new(
+            Arc::clone(&file_schema),
+            vec![vec![batch]],
+        )?);
         let result = openobserve_core::vix::core_writer::write_core_file_from_tables(
             "m26-template",
             StreamType::Logs,
@@ -549,22 +561,27 @@ async fn cmd_seed_tli(
         Field::new("trace_id", DataType::Utf8, false),
     ]));
     let now = config::utils::time::now_micros();
-    infra::schema::merge(ORG, stream, StreamType::Metadata, schema.as_ref(), Some(now))
-        .await
-        .map_err(|e| anyhow::anyhow!("schema merge for {stream}: {e}"))?;
+    infra::schema::merge(
+        ORG,
+        stream,
+        StreamType::Metadata,
+        schema.as_ref(),
+        Some(now),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("schema merge for {stream}: {e}"))?;
 
     let mut total_files = 0usize;
     let mut total_bytes = 0usize;
     let mut rng = Rng(0xD1B54A32D192ED03);
     for h in 0..hours {
         let offset = job_offset_micros(h);
-        let prefix = format!(
-            "files/{ORG}/metadata/{stream}/{}",
-            {
-                use chrono::TimeZone;
-                chrono::Utc.timestamp_nanos(offset * 1000).format("%Y/%m/%d/%H")
-            }
-        );
+        let prefix = format!("files/{ORG}/metadata/{stream}/{}", {
+            use chrono::TimeZone;
+            chrono::Utc
+                .timestamp_nanos(offset * 1000)
+                .format("%Y/%m/%d/%H")
+        });
         let mut adds = Vec::with_capacity(files_per_job);
         // `chains` (prod l0_multi shape, 2026-08-21 log evidence: "file
         // groups: 88, max group len: 2" on the 12.87GB merges): ~60% of the
@@ -616,12 +633,15 @@ async fn cmd_seed_tli(
             }
             let min_ts = *ts.iter().min().unwrap();
             let max_ts = *ts.iter().max().unwrap();
-            let batch = arrow::record_batch::RecordBatch::try_new(Arc::clone(&schema), vec![
-                Arc::new(Int64Array::from(ts)) as ArrayRef,
-                Arc::new(StringArray::from(sname)),
-                Arc::new(StringArray::from(svc)),
-                Arc::new(StringArray::from(trace)),
-            ])?;
+            let batch = arrow::record_batch::RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(ts)) as ArrayRef,
+                    Arc::new(StringArray::from(sname)),
+                    Arc::new(StringArray::from(svc)),
+                    Arc::new(StringArray::from(trace)),
+                ],
+            )?;
             let file_meta = FileMeta {
                 min_ts,
                 max_ts,
@@ -651,8 +671,14 @@ async fn cmd_seed_tli(
                 writer.write(&batch).await?;
                 writer.close().await?;
             } else {
-                let mut writer =
-                    config::utils::parquet::new_parquet_writer(&mut buf, &schema, &[], &file_meta, false, None);
+                let mut writer = config::utils::parquet::new_parquet_writer(
+                    &mut buf,
+                    &schema,
+                    &[],
+                    &file_meta,
+                    false,
+                    None,
+                );
                 writer.write(&batch).await?;
                 writer.close().await?;
             }
@@ -710,7 +736,9 @@ async fn probe_registries(tag: &str) {
         .len();
     let dedup = openobserve_core::db::file_list::DEDUPLICATE_FILES.len();
     let deleted = openobserve_core::db::file_list::DELETED_FILES.len();
-    let tasks = tokio::runtime::Handle::current().metrics().num_alive_tasks();
+    let tasks = tokio::runtime::Handle::current()
+        .metrics()
+        .num_alive_tasks();
     // metric SERIES count: non-comment lines of the prometheus exposition
     let series = config::metrics::gather()
         .lines()
@@ -736,23 +764,24 @@ async fn cmd_run(files_per_job: usize, max_rounds: usize) -> Result<(), anyhow::
         .unwrap_or(5);
 
     // the REAL worker + scheduler wiring (jobs/compactor.rs shape)
-    let mut worker = openobserve_core::compact::worker::MergeWorker::new(
-        cfg.limit.file_merge_thread_num,
-    );
+    let mut worker =
+        openobserve_core::compact::worker::MergeWorker::new(cfg.limit.file_merge_thread_num);
     worker.run()?;
     let job_num = if cfg.compact.job_num > 0 {
         cfg.compact.job_num
     } else {
         cfg.limit.file_merge_thread_num
     };
-    let mut scheduler =
-        openobserve_core::compact::worker::JobScheduler::new(job_num, worker.tx());
+    let mut scheduler = openobserve_core::compact::worker::JobScheduler::new(job_num, worker.tx());
     scheduler.run()?;
-    let job_tx = scheduler.tx();
+    let scheduler_handle = scheduler.handle();
 
     let rows0 = infra::file_list::len().await as i64;
     let pending0 = pending_jobs().await;
-    anyhow::ensure!(pending0 > 0, "nothing to do: pending={pending0} (seed first)");
+    anyhow::ensure!(
+        pending0 > 0,
+        "nothing to do: pending={pending0} (seed first)"
+    );
     eprintln!(
         "[run] start: pending_jobs={pending0} file_list_rows={rows0} files_per_job={files_per_job} \
          merge_threads={} job_slots={job_num} schema_clear={schema_clear}",
@@ -773,7 +802,12 @@ async fn cmd_run(files_per_job: usize, max_rounds: usize) -> Result<(), anyhow::
     let mut rounds = 0usize;
     loop {
         rounds += 1;
-        if let Err(e) = openobserve_core::compact::run_merge(job_tx.clone(), 0, 0).await {
+        if let Err(e) = openobserve_core::compact::run_merge(
+            &scheduler_handle,
+            openobserve_core::compact::MergeLane::All,
+        )
+        .await
+        {
             eprintln!("[run] run_merge error: {e}");
         }
         if schema_clear {
@@ -916,7 +950,10 @@ fn main() -> Result<(), anyhow::Error> {
     let mode = args.get(1).map(String::as_str);
     match mode {
         Some("seed") => {
-            let streams: usize = args.get(2).expect("seed <streams> <hours> <files_per_job> <rows_per_file> <width>").parse()?;
+            let streams: usize = args
+                .get(2)
+                .expect("seed <streams> <hours> <files_per_job> <rows_per_file> <width>")
+                .parse()?;
             let hours: usize = args.get(3).expect("hours").parse()?;
             let files_per_job: usize = args.get(4).expect("files_per_job").parse()?;
             let rows_per_file: usize = args.get(5).expect("rows_per_file").parse()?;
@@ -925,10 +962,19 @@ fn main() -> Result<(), anyhow::Error> {
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?
-                .block_on(cmd_seed(streams, hours, files_per_job, rows_per_file, width))
+                .block_on(cmd_seed(
+                    streams,
+                    hours,
+                    files_per_job,
+                    rows_per_file,
+                    width,
+                ))
         }
         Some(mode @ ("seed-tli" | "seed-tli-chains")) => {
-            let hours: usize = args.get(2).expect("seed-tli <hours> <files_per_job> <rows_per_file>").parse()?;
+            let hours: usize = args
+                .get(2)
+                .expect("seed-tli <hours> <files_per_job> <rows_per_file>")
+                .parse()?;
             let files_per_job: usize = args.get(3).expect("files_per_job").parse()?;
             let rows_per_file: usize = args.get(4).expect("rows_per_file").parse()?;
             ensure_env_many(&pins);
@@ -943,7 +989,10 @@ fn main() -> Result<(), anyhow::Error> {
                 ))
         }
         Some("run") => {
-            let files_per_job: usize = args.get(2).expect("run <files_per_job> [max_rounds]").parse()?;
+            let files_per_job: usize = args
+                .get(2)
+                .expect("run <files_per_job> [max_rounds]")
+                .parse()?;
             let max_rounds: usize = args.get(3).map(|s| s.parse()).transpose()?.unwrap_or(0);
             ensure_env_many(&pins);
             spawn_rss_sampler();

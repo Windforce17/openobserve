@@ -37,8 +37,8 @@ use config::{
 use futures::StreamExt;
 use infra::{
     cluster::get_node_from_consistent_hash,
-    errors, file_list as infra_file_list,
-    file_list::FileRecord,
+    errors,
+    file_list::{self as infra_file_list, DumpJobRecord, FileListJobStatus, FileRecord},
     schema::{STREAM_SCHEMAS_LATEST, SchemaCache, get_partition_time_level, get_settings},
 };
 use itertools::Itertools;
@@ -47,13 +47,15 @@ use tokio::sync::mpsc;
 
 use crate::service::{db, file_list_dump::*};
 
-#[derive(Clone)]
 pub struct DumpJob {
     pub org_id: String,
     pub stream_type: StreamType,
     pub stream_name: String,
     pub job_id: i64,
     pub offset: i64,
+    pub lease_generation: i64,
+    pub cancel: super::worker::MergeCancellation,
+    pub lease: super::worker::JobLeaseGuard,
 }
 
 // compactor dump run steps:
@@ -63,34 +65,89 @@ pub struct DumpJob {
 //    check_running_jobs.
 // 3. if one job wasn't update for a long time, we will reset the node to empty and another job will
 //    pick it up
+async fn transition_dump_claim(
+    job: &DumpJobRecord,
+    cancel: &super::worker::MergeCancellation,
+    dumped: bool,
+    outcome: &'static str,
+) {
+    match infra_file_list::set_job_dumped_status_owned(
+        job.id,
+        &LOCAL_NODE.uuid,
+        job.lease_generation,
+        dumped,
+    )
+    .await
+    {
+        Ok(true) => log::info!(
+            "[COMPACTOR::DUMP] claim completed job_id={} generation={} outcome={outcome}",
+            job.id,
+            job.lease_generation,
+        ),
+        Ok(false) => {
+            cancel.cancel();
+            log::warn!(
+                "[COMPACTOR::DUMP] claim transition missed ownership job_id={} generation={} outcome={outcome}",
+                job.id,
+                job.lease_generation,
+            );
+        }
+        Err(e) => log::error!(
+            "[COMPACTOR::DUMP] claim transition failed job_id={} generation={} outcome={outcome}: {e}",
+            job.id,
+            job.lease_generation,
+        ),
+    }
+}
+
 pub async fn run(tx: mpsc::Sender<DumpJob>) -> Result<(), anyhow::Error> {
     let cfg = get_config();
-    let jobs =
-        infra_file_list::get_pending_dump_jobs(&LOCAL_NODE.uuid, cfg.compact.batch_size).await?;
+    let claim_limit = cfg
+        .compact
+        .batch_size
+        .max(0)
+        .min(cfg.limit.file_merge_thread_num.max(1) as i64);
+    let jobs = infra_file_list::get_pending_dump_jobs(&LOCAL_NODE.uuid, claim_limit).await?;
     if jobs.is_empty() {
         return Ok(());
     }
 
     let now = now();
     let data_lifecycle_end = now - Duration::try_days(cfg.compact.data_retention_days).unwrap();
+    let ttl = std::cmp::max(60, cfg.compact.job_run_timeout / 4) as u64;
 
-    // check jobs before dumping
-    let mut need_release_ids = Vec::new();
-    let mut need_done_ids = Vec::new();
-    let mut dump_jobs = Vec::with_capacity(jobs.len());
-    for (job_id, stream, offset) in jobs.iter() {
-        // if the stream partition_time_level is daily we only allow one compactor
-        let columns = stream.split('/').collect::<Vec<&str>>();
-        assert_eq!(columns.len(), 3);
+    let mut claimed_jobs = Vec::with_capacity(jobs.len());
+    for job in jobs {
+        let cancel = super::worker::MergeCancellation::default();
+        let lease = super::worker::JobLeaseGuard::spawn(
+            job.id,
+            LOCAL_NODE.uuid.clone(),
+            job.lease_generation,
+            FileListJobStatus::Done,
+            ttl,
+            cfg.compact.job_run_timeout.max(1) as u64,
+            cancel.clone(),
+        );
+        claimed_jobs.push((job, cancel, lease));
+    }
+
+    let mut dump_jobs = Vec::with_capacity(claimed_jobs.len());
+
+    for (job, cancel, lease) in claimed_jobs {
+        let columns = job.stream.split('/').collect::<Vec<&str>>();
+        if columns.len() != 3 {
+            transition_dump_claim(&job, &cancel, true, "invalid_stream").await;
+            continue;
+        }
         let org_id = columns[0].to_string();
         let stream_type = StreamType::from(columns[1]);
         let stream_name = columns[2].to_string();
         if stream_type == StreamType::Filelist {
-            need_done_ids.push(*job_id); // we don't dump for file_list stream
+            transition_dump_claim(&job, &cancel, true, "filelist_stream").await;
             continue;
         }
-        if !super::is_past_hour(*offset) {
-            need_done_ids.push(*job_id); // the data is not past hour, need to wait
+        if !super::is_past_hour(job.offsets) {
+            transition_dump_claim(&job, &cancel, true, "open_hour").await;
             continue;
         }
         let stream_settings = get_settings(&org_id, &stream_name, stream_type)
@@ -103,13 +160,12 @@ pub async fn run(tx: mpsc::Sender<DumpJob>) -> Result<(), anyhow::Error> {
         } else {
             data_lifecycle_end
         };
-        if *offset <= stream_data_retention_end.timestamp_micros() {
-            need_done_ids.push(*job_id); // the data will be deleted by retention, just skip
+        if job.offsets <= stream_data_retention_end.timestamp_micros() {
+            transition_dump_claim(&job, &cancel, true, "retention_skip").await;
             continue;
         }
-        // check if we are allowed to merge or just skip
         if db::compact::retention::is_deleting_stream(&org_id, stream_type, &stream_name, None) {
-            need_done_ids.push(*job_id); // the data will be deleted by retention, just skip
+            transition_dump_claim(&job, &cancel, true, "deleting_stream").await;
             continue;
         }
         if partition_time_level == PartitionTimeLevel::Daily {
@@ -117,19 +173,20 @@ pub async fn run(tx: mpsc::Sender<DumpJob>) -> Result<(), anyhow::Error> {
             let Some(node_name) =
                 get_node_from_consistent_hash(&stream_name, &Role::Compactor, None).await
             else {
-                continue; // no compactor node
+                transition_dump_claim(&job, &cancel, false, "no_daily_owner").await;
+                continue;
             };
             if LOCAL_NODE.name.ne(&node_name) {
-                need_release_ids.push(*job_id); // not this node
+                transition_dump_claim(&job, &cancel, false, "daily_owner_reject").await;
                 continue;
             }
 
             // check if already running a job for this stream
-            if db::compact::stream::is_running(stream) {
-                need_release_ids.push(*job_id); // another job is running
+            if db::compact::stream::is_running(&job.stream) {
+                transition_dump_claim(&job, &cancel, false, "stream_busy").await;
                 continue;
             } else {
-                db::compact::stream::set_running(stream);
+                db::compact::stream::set_running(&job.stream);
             }
         }
         // collect the dump jobs
@@ -137,65 +194,97 @@ pub async fn run(tx: mpsc::Sender<DumpJob>) -> Result<(), anyhow::Error> {
             org_id,
             stream_type,
             stream_name,
-            job_id: *job_id,
-            offset: *offset,
+            job_id: job.id,
+            offset: job.offsets,
+            lease_generation: job.lease_generation,
+            cancel,
+            lease,
         });
     }
 
-    if !need_release_ids.is_empty() {
-        // release those jobs
-        if let Err(e) = infra_file_list::set_job_dumped_status(&need_release_ids, false).await {
-            log::error!("[COMPACTOR::DUMP] set_job_dumped_status failed: {e}");
-        }
-    }
-
-    if !need_done_ids.is_empty() {
-        // set those jobs to done
-        if let Err(e) = infra_file_list::set_job_dumped_status(&need_done_ids, true).await {
-            log::error!("[COMPACTOR::DUMP] set_job_dumped_status failed: {e}");
-        }
-    }
-
-    // create a thread to keep updating the job status
-    //
-    // Update job status (updated_at) to prevent pickup by another node
-    // convert job_timeout from secs to micros, and check 1/4 of job_timeout
-    // why 1/4 of job_run_timeout?
-    // because the timeout is for the entire job, we need to update the job status
-    // before it timeout, using 1/2 might still risk a timeout, so we use 1/4 for safety
-    let ttl = std::cmp::max(60, cfg.compact.job_run_timeout / 4) as u64;
-    let job_ids = dump_jobs.iter().map(|job| job.job_id).collect::<Vec<_>>();
-    let (_tx, mut rx) = mpsc::channel::<()>(1);
-    tokio::task::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = tokio::time::sleep(tokio::time::Duration::from_secs(ttl)) => {}
-                _ = rx.recv() => {
-                    log::debug!("[COMPACTOR::DUMP] update_running_jobs done");
-                    return;
-                }
-            }
-            if let Err(e) = infra_file_list::update_running_jobs(&job_ids).await {
-                log::error!("[COMPACTOR::DUMP] update_job_status failed: {e}");
-            }
-        }
-    });
-
     for job in dump_jobs {
-        if let Err(e) = tx.send(job.clone()).await {
+        if let Err(e) = tx.send(job).await {
+            let unsent = e.0;
             log::error!(
-                "[COMPACTOR::DUMP] error in sending dump job to worker thread for [{}/{}/{}] offset {}: {e}",
-                job.org_id,
-                job.stream_type,
-                job.stream_name,
-                job.offset,
+                "[COMPACTOR::DUMP] dispatch failed job_id={} generation={}",
+                unsent.job_id,
+                unsent.lease_generation,
             );
+            let stream = format!(
+                "{}/{}/{}",
+                unsent.org_id,
+                unsent.stream_type.as_str(),
+                unsent.stream_name,
+            );
+            crate::service::db::compact::stream::clear_running(&stream);
+            drop(unsent.lease);
+            match infra_file_list::set_job_dumped_status_owned(
+                unsent.job_id,
+                &LOCAL_NODE.uuid,
+                unsent.lease_generation,
+                false,
+            )
+            .await
+            {
+                Ok(true) => log::info!(
+                    "[COMPACTOR::DUMP] claim completed job_id={} generation={} outcome=send_failure",
+                    unsent.job_id,
+                    unsent.lease_generation,
+                ),
+                Ok(false) => {
+                    unsent.cancel.cancel();
+                    log::warn!(
+                        "[COMPACTOR::DUMP] send failure release missed ownership job_id={} generation={}",
+                        unsent.job_id,
+                        unsent.lease_generation,
+                    );
+                }
+                Err(release_error) => log::error!(
+                    "[COMPACTOR::DUMP] send failure release failed job_id={} generation={}: {release_error}",
+                    unsent.job_id,
+                    unsent.lease_generation,
+                ),
+            }
         }
     }
     Ok(())
 }
 
+async fn finish_dump_job(job: &DumpJob, outcome: &'static str) -> Result<(), anyhow::Error> {
+    match infra_file_list::set_job_dumped_status_owned(
+        job.job_id,
+        &LOCAL_NODE.uuid,
+        job.lease_generation,
+        true,
+    )
+    .await
+    {
+        Ok(true) => {
+            log::info!(
+                "[COMPACTOR::DUMP] job completed job_id={} generation={} outcome={outcome}",
+                job.job_id,
+                job.lease_generation,
+            );
+            Ok(())
+        }
+        Ok(false) => {
+            job.cancel.cancel();
+            Err(anyhow::anyhow!(
+                "dump job {} generation {} lost ownership before completion",
+                job.job_id,
+                job.lease_generation,
+            ))
+        }
+        Err(e) => Err(anyhow::anyhow!(
+            "set_job_dumped_status_owned failed for job {} generation {}: {e}",
+            job.job_id,
+            job.lease_generation,
+        )),
+    }
+}
+
 pub async fn dump(job: &DumpJob) -> Result<(), anyhow::Error> {
+    job.cancel.check("dump start")?;
     let start = std::time::Instant::now();
     let stream = format!("{}/{}/{}", job.org_id, job.stream_type, job.stream_name);
     log::debug!(
@@ -240,13 +329,9 @@ pub async fn dump(job: &DumpJob) -> Result<(), anyhow::Error> {
         (start_time, end_time),
     )
     .await?;
+    job.cancel.check("dump file-list query")?;
     if files.is_empty() {
-        if let Err(e) = infra_file_list::set_job_dumped_status(&[job.job_id], true).await {
-            log::error!(
-                "[COMPACTOR::DUMP] error in setting dumped = true for job with id {}, error: {e}",
-                job.job_id,
-            );
-        }
+        finish_dump_job(job, "empty_stream").await?;
         log::debug!(
             "[COMPACTOR::DUMP] no files to dump for stream [{}/{}/{}] offset [{start_time},{end_time}]",
             job.org_id,
@@ -333,31 +418,48 @@ pub async fn dump(job: &DumpJob) -> Result<(), anyhow::Error> {
         }
     };
 
-    if let Some(dump_file) = dump_file {
-        // update the entries in db
-        let records = dump_file.meta.records;
-        let file_name = dump_file.key.clone();
-        infra_file_list::update_dump_records(&dump_file, &ids).await?;
-
-        // insert dump stats
-        if let Err(e) = infra_file_list::insert_dump_stats(&file_name, &stats).await {
-            log::error!("[COMPACTOR::DUMP] error inserting dump stats for {file_name}: {e}");
-        }
-
-        infra_file_list::set_job_dumped_status(&[job.job_id], true).await?;
-
-        log::info!(
-            "[COMPACTOR::DUMP] successfully dumped {records} records to file {file_name}, took: {} ms",
-            start.elapsed().as_millis(),
-        );
-    } else {
-        log::error!(
-            "[COMPACTOR::DUMP] failed to generate dump file for stream [{}/{}/{}] offset [{start_time},{end_time}]",
+    let Some(dump_file) = dump_file else {
+        return Err(anyhow::anyhow!(
+            "failed to generate dump file for stream [{}/{}/{}] offset [{start_time},{end_time}]",
             job.org_id,
             job.stream_type,
             job.stream_name,
-        );
+        ));
+    };
+
+    // Fence the irreversible file-list update against the exact dump claim
+    // generation. A stale dumper may leave an uploaded object, but it must
+    // never move rows after a newer owner has taken the job.
+    let owned = infra_file_list::touch_job_lease(
+        job.job_id,
+        &LOCAL_NODE.uuid,
+        job.lease_generation,
+        FileListJobStatus::Done,
+    )
+    .await?;
+    if !owned {
+        job.cancel.cancel();
+        return Err(anyhow::anyhow!(
+            "dump job {} generation {} lost ownership before commit",
+            job.job_id,
+            job.lease_generation,
+        ));
     }
+    job.cancel.check("dump commit")?;
+
+    let records = dump_file.meta.records;
+    let file_name = dump_file.key.clone();
+    infra_file_list::update_dump_records(&dump_file, &ids).await?;
+
+    if let Err(e) = infra_file_list::insert_dump_stats(&file_name, &stats).await {
+        log::error!("[COMPACTOR::DUMP] error inserting dump stats for {file_name}: {e}");
+    }
+    finish_dump_job(job, "dumped").await?;
+
+    log::info!(
+        "[COMPACTOR::DUMP] successfully dumped {records} records to file {file_name}, took: {} ms",
+        start.elapsed().as_millis(),
+    );
 
     Ok(())
 }
@@ -794,111 +896,6 @@ mod tests {
     use arrow::array::{BooleanArray, Int64Array, StringArray};
 
     use super::*;
-
-    // ---- DumpJob ----
-
-    #[test]
-    fn test_dump_job_creation() {
-        let job = DumpJob {
-            org_id: "test_org".to_string(),
-            stream_type: StreamType::Logs,
-            stream_name: "test_stream".to_string(),
-            job_id: 123,
-            offset: 1000000,
-        };
-
-        assert_eq!(job.org_id, "test_org");
-        assert_eq!(job.stream_type, StreamType::Logs);
-        assert_eq!(job.stream_name, "test_stream");
-        assert_eq!(job.job_id, 123);
-        assert_eq!(job.offset, 1000000);
-    }
-
-    #[test]
-    fn test_dump_job_clone() {
-        let job = DumpJob {
-            org_id: "test_org".to_string(),
-            stream_type: StreamType::Metrics,
-            stream_name: "metric_stream".to_string(),
-            job_id: 456,
-            offset: 2000000,
-        };
-
-        let cloned = job.clone();
-        assert_eq!(cloned.org_id, job.org_id);
-        assert_eq!(cloned.stream_type, job.stream_type);
-        assert_eq!(cloned.stream_name, job.stream_name);
-        assert_eq!(cloned.job_id, job.job_id);
-        assert_eq!(cloned.offset, job.offset);
-    }
-
-    #[test]
-    fn test_dump_job_traces_stream_type() {
-        let job = DumpJob {
-            org_id: "org".to_string(),
-            stream_type: StreamType::Traces,
-            stream_name: "trace_stream".to_string(),
-            job_id: 1,
-            offset: 100,
-        };
-        assert_eq!(job.stream_type, StreamType::Traces);
-    }
-
-    #[test]
-    fn test_dump_job_zero_offset() {
-        let job = DumpJob {
-            org_id: "org".to_string(),
-            stream_type: StreamType::Logs,
-            stream_name: "stream".to_string(),
-            job_id: 0,
-            offset: 0,
-        };
-        assert_eq!(job.job_id, 0);
-        assert_eq!(job.offset, 0);
-    }
-
-    #[test]
-    fn test_dump_job_negative_offset() {
-        // offsets can technically be any i64
-        let job = DumpJob {
-            org_id: "org".to_string(),
-            stream_type: StreamType::Logs,
-            stream_name: "stream".to_string(),
-            job_id: 99,
-            offset: -1,
-        };
-        assert_eq!(job.offset, -1);
-    }
-
-    #[test]
-    fn test_dump_job_max_values() {
-        let job = DumpJob {
-            org_id: "org".to_string(),
-            stream_type: StreamType::Metrics,
-            stream_name: "stream".to_string(),
-            job_id: i64::MAX,
-            offset: i64::MAX,
-        };
-        assert_eq!(job.job_id, i64::MAX);
-        assert_eq!(job.offset, i64::MAX);
-    }
-
-    #[test]
-    fn test_dump_job_clone_independence() {
-        // Modifying the original should not affect the clone (String fields are value types)
-        let original = DumpJob {
-            org_id: "original_org".to_string(),
-            stream_type: StreamType::Logs,
-            stream_name: "original_stream".to_string(),
-            job_id: 1,
-            offset: 100,
-        };
-        let mut cloned = original.clone();
-        cloned.job_id = 999;
-        cloned.offset = 9999;
-        assert_eq!(original.job_id, 1);
-        assert_eq!(original.offset, 100);
-    }
 
     // ---- create_record_batch ----
 
@@ -1723,32 +1720,5 @@ mod tests {
         }
 
         assert_eq!(stats.doc_time_min, 0);
-    }
-
-    #[test]
-    fn test_dump_job_various_stream_types_for_stream_format() {
-        // The dump function formats stream as "org/stream_type/name"
-        // Verify this pattern is consistent with DumpJob fields
-        let cases = vec![
-            (StreamType::Logs, "logs"),
-            (StreamType::Metrics, "metrics"),
-            (StreamType::Traces, "traces"),
-        ];
-        for (stype, type_str) in cases {
-            let job = DumpJob {
-                org_id: "org".to_string(),
-                stream_type: stype,
-                stream_name: "stream".to_string(),
-                job_id: 1,
-                offset: 0,
-            };
-            let formatted = format!("{}/{}/{}", job.org_id, job.stream_type, job.stream_name);
-            assert!(
-                formatted.contains(type_str),
-                "formatted stream '{}' should contain type '{}'",
-                formatted,
-                type_str
-            );
-        }
     }
 }

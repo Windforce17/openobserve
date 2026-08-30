@@ -19,7 +19,8 @@ use config::{
     cluster::is_offline,
     meta::stream::{FileKey, StreamType},
 };
-use tokio::sync::{Mutex, mpsc};
+use infra::file_list::FileListJobStatus;
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, TryAcquireError, mpsc};
 
 #[derive(Clone)]
 pub struct MergeBatch {
@@ -85,35 +86,115 @@ pub struct MergeResult {
 /// and retry on a later cycle.
 pub type MergeSender = mpsc::Sender<Result<(usize, Vec<FileKey>, Vec<FileKey>), anyhow::Error>>;
 
-/// Stop-guard for one claimed job's lease heartbeat. The heartbeat task
-/// spawns at CLAIM time (see `run_merge`) and keeps refreshing the job's
-/// `updated_at` every `ttl_secs` until EVERY clone of the guard has dropped
-/// — the guard rides inside [`MergeJob`] through the scheduler channel, so
-/// the lease stays covered while the job sits buffered waiting for a worker
-/// and while `merge_by_stream` runs, one continuous window from claim to
-/// completion. Without it a job parked in the capacity-1 channel behind a
-/// long merge had NO heartbeat, `check_running_jobs` re-pended it, and a
-/// second node merged the same hour concurrently (permanent duplicate rows —
-/// 2026-07-30 audit).
-#[derive(Clone)]
+fn lease_refresh_expired(
+    unconfirmed_for: tokio::time::Duration,
+    lease_timeout: tokio::time::Duration,
+) -> bool {
+    unconfirmed_for >= lease_timeout
+}
+
+async fn wait_for_job_cancellation(cancel: &MergeCancellation) {
+    while !cancel.is_cancelled() {
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// Stop-guard for one claimed job's lease heartbeat. The heartbeat begins at
+/// claim time and stops when the job leaves its scheduler slot. Transient
+/// storage errors are tolerated only until the full lease timeout has elapsed
+/// since the last confirmed touch; work is then cancelled before a stale
+/// recovery can safely hand the generation to another owner.
 pub struct JobLeaseGuard {
     _stop: mpsc::Sender<()>,
 }
 
 impl JobLeaseGuard {
-    pub fn spawn(job_id: i64, ttl_secs: u64) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn(
+        job_id: i64,
+        node: String,
+        lease_generation: i64,
+        expected_status: FileListJobStatus,
+        heartbeat_secs: u64,
+        lease_timeout_secs: u64,
+        cancel: MergeCancellation,
+    ) -> Self {
         let (tx, mut rx) = mpsc::channel::<()>(1);
         tokio::task::spawn(async move {
+            let heartbeat = tokio::time::Duration::from_secs(heartbeat_secs.max(1));
+            let lease_timeout = tokio::time::Duration::from_secs(lease_timeout_secs.max(1));
+            let mut last_confirmed = tokio::time::Instant::now();
             loop {
+                let deadline = last_confirmed + lease_timeout;
                 tokio::select! {
-                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(ttl_secs)) => {}
+                    _ = tokio::time::sleep(heartbeat) => {}
+                    _ = tokio::time::sleep_until(deadline) => {
+                        log::error!(
+                            "[COMPACTOR] lease refresh timed out job_id={job_id} generation={lease_generation}"
+                        );
+                        cancel.cancel();
+                        return;
+                    }
                     _ = rx.recv() => {
-                        log::debug!("[COMPACTOR] job {job_id} lease heartbeat stopped");
+                        log::debug!(
+                            "[COMPACTOR] lease heartbeat stopped job_id={job_id} generation={lease_generation}"
+                        );
+                        return;
+                    }
+                    _ = wait_for_job_cancellation(&cancel) => {
+                        log::debug!(
+                            "[COMPACTOR] lease heartbeat cancelled job_id={job_id} generation={lease_generation}"
+                        );
                         return;
                     }
                 }
-                if let Err(e) = infra::file_list::update_running_jobs(&[job_id]).await {
-                    log::error!("[COMPACTOR] job {job_id} lease heartbeat update failed: {e}");
+
+                // Bound the touch call itself by the remaining confirmed
+                // lease lifetime. A hung/transient store must not let stale
+                // recovery reassign while this worker continues.
+                let touch = tokio::select! {
+                    result = infra::file_list::touch_job_lease(
+                        job_id,
+                        &node,
+                        lease_generation,
+                        expected_status,
+                    ) => Some(result),
+                    _ = tokio::time::sleep_until(deadline) => None,
+                    _ = rx.recv() => return,
+                    _ = wait_for_job_cancellation(&cancel) => return,
+                };
+                let Some(touch) = touch else {
+                    log::error!(
+                        "[COMPACTOR] lease refresh timed out job_id={job_id} generation={lease_generation}"
+                    );
+                    cancel.cancel();
+                    return;
+                };
+                match touch {
+                    Ok(true) => {
+                        last_confirmed = tokio::time::Instant::now();
+                        log::debug!(
+                            "[COMPACTOR] lease heartbeat renewed job_id={job_id} generation={lease_generation}"
+                        );
+                    }
+                    Ok(false) => {
+                        log::warn!(
+                            "[COMPACTOR] lease ownership lost job_id={job_id} generation={lease_generation}"
+                        );
+                        cancel.cancel();
+                        return;
+                    }
+                    Err(e) => {
+                        let unconfirmed_for = last_confirmed.elapsed();
+                        log::error!(
+                            "[COMPACTOR] lease heartbeat failed job_id={job_id} generation={lease_generation} unconfirmed_ms={}: {e}",
+                            unconfirmed_for.as_millis(),
+                        );
+                        if lease_refresh_expired(unconfirmed_for, lease_timeout) {
+                            cancel.cancel();
+                            return;
+                        }
+                    }
                 }
             }
         });
@@ -121,48 +202,122 @@ impl JobLeaseGuard {
     }
 }
 
-#[derive(Clone)]
+/// A claimed merge job and its single scheduler-capacity reservation.
+///
+/// This type deliberately is not `Clone`: duplicating it would separate one
+/// database claim from its one local scheduler permit.
 pub struct MergeJob {
     pub org_id: String,
     pub stream_type: StreamType,
     pub stream_name: String,
     pub job_id: i64,
     pub offset: i64,
-    /// Claim-time lease heartbeat (see [`JobLeaseGuard`]); dropping the last
-    /// clone — the worker's, after `merge_by_stream` returns — stops it.
+    pub lease_generation: i64,
+    pub cancel: MergeCancellation,
     pub lease: JobLeaseGuard,
+    _slot: OwnedSemaphorePermit,
 }
 
-/// JobScheduler is a worker that processes jobs
+impl MergeJob {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        org_id: String,
+        stream_type: StreamType,
+        stream_name: String,
+        job_id: i64,
+        offset: i64,
+        lease_generation: i64,
+        cancel: MergeCancellation,
+        lease: JobLeaseGuard,
+        slot: OwnedSemaphorePermit,
+    ) -> Self {
+        Self {
+            org_id,
+            stream_type,
+            stream_name,
+            job_id,
+            offset,
+            lease_generation,
+            cancel,
+            lease,
+            _slot: slot,
+        }
+    }
+}
+
+/// Cloneable producer handle for one scheduler lane. The semaphore is lane
+/// local, so the live lane can never borrow backlog capacity (or vice versa).
+#[derive(Clone)]
+pub struct JobSchedulerHandle {
+    tx: mpsc::Sender<MergeJob>,
+    slots: Arc<Semaphore>,
+    capacity: usize,
+}
+
+impl JobSchedulerHandle {
+    /// Reserve up to `limit` currently-free slots without waiting. Callers do
+    /// this before claiming from the database, so every returned claim can be
+    /// paired one-for-one with a permit.
+    pub fn reserve(&self, limit: usize) -> Vec<OwnedSemaphorePermit> {
+        let mut permits = Vec::with_capacity(limit.min(self.free_slots()));
+        for _ in 0..limit {
+            match self.slots.clone().try_acquire_owned() {
+                Ok(permit) => permits.push(permit),
+                Err(TryAcquireError::NoPermits | TryAcquireError::Closed) => break,
+            }
+        }
+        permits
+    }
+
+    #[inline]
+    pub fn free_slots(&self) -> usize {
+        self.slots.available_permits()
+    }
+
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub async fn send(&self, job: MergeJob) -> Result<(), mpsc::error::SendError<MergeJob>> {
+        self.tx.send(job).await
+    }
+}
+
+/// JobScheduler is a worker that processes jobs.
 pub struct JobScheduler {
     num: usize,
     rx: Arc<Mutex<mpsc::Receiver<MergeJob>>>,
-    tx: mpsc::Sender<MergeJob>,
+    handle: JobSchedulerHandle,
     worker_tx: mpsc::Sender<(MergeSender, MergeBatch)>,
 }
 
 impl JobScheduler {
     pub fn new(num: usize, worker_tx: mpsc::Sender<(MergeSender, MergeBatch)>) -> Self {
-        // one in-flight job may park per scheduler slot without blocking the
-        // claimer (#23) — capacity 1 used to stall run_merge holding leases
-        let (tx, rx) = mpsc::channel::<MergeJob>(num.max(1));
-        let rx = Arc::new(Mutex::new(rx));
+        let capacity = num.max(1);
+        let (tx, rx) = mpsc::channel::<MergeJob>(capacity);
+        let slots = Arc::new(Semaphore::new(capacity));
         Self {
-            num,
-            rx,
-            tx,
+            num: capacity,
+            rx: Arc::new(Mutex::new(rx)),
+            handle: JobSchedulerHandle {
+                tx,
+                slots,
+                capacity,
+            },
             worker_tx,
         }
     }
 
-    pub fn tx(&self) -> mpsc::Sender<MergeJob> {
-        self.tx.clone()
+    pub fn handle(&self) -> JobSchedulerHandle {
+        self.handle.clone()
     }
 
     pub fn run(&mut self) -> Result<(), anyhow::Error> {
         for thread_id in 0..self.num {
             let rx = self.rx.clone();
             let worker_tx = self.worker_tx.clone();
+            let handle = self.handle.clone();
             tokio::spawn(async move {
                 loop {
                     if is_offline() {
@@ -177,29 +332,60 @@ impl JobScheduler {
                             break;
                         }
                         Some(job) => {
-                            // `job.lease` is the claim-time heartbeat guard
-                            // (see run_merge): holding `job` through
-                            // merge_by_stream keeps the lease refreshed until
-                            // the merge — commits included — has finished;
-                            // it drops with `job` at the end of this arm.
+                            log::info!(
+                                "[COMPACTOR] merge job started job_id={} generation={} active_slots={} free_slots={}",
+                                job.job_id,
+                                job.lease_generation,
+                                handle.capacity().saturating_sub(handle.free_slots()),
+                                handle.free_slots(),
+                            );
                             if let Err(e) = super::merge::merge_by_stream(
                                 worker_tx.clone(),
                                 &job.org_id,
                                 job.stream_type,
                                 &job.stream_name,
                                 job.job_id,
+                                job.lease_generation,
                                 job.offset,
+                                &job.cancel,
                             )
                             .await
                             {
                                 log::error!(
-                                    "[COMPACTOR:SCHEDULER:{thread_id}] merge_by_stream [{}/{}/{}] error: {e}",
+                                    "[COMPACTOR:SCHEDULER:{thread_id}] merge_by_stream [{}/{}/{}] job_id={} generation={} error: {e}",
                                     job.org_id,
                                     job.stream_type,
                                     job.stream_name,
+                                    job.job_id,
+                                    job.lease_generation,
                                 );
+                                match infra::file_list::set_job_pending_owned(
+                                    job.job_id,
+                                    &config::cluster::LOCAL_NODE.uuid,
+                                    job.lease_generation,
+                                )
+                                .await
+                                {
+                                    Ok(true) => log::info!(
+                                        "[COMPACTOR] merge job released job_id={} generation={} outcome=retry",
+                                        job.job_id,
+                                        job.lease_generation,
+                                    ),
+                                    Ok(false) => {
+                                        job.cancel.cancel();
+                                        log::warn!(
+                                            "[COMPACTOR] merge job release missed ownership job_id={} generation={}",
+                                            job.job_id,
+                                            job.lease_generation,
+                                        );
+                                    }
+                                    Err(release_error) => log::error!(
+                                        "[COMPACTOR] merge job release failed job_id={} generation={}: {release_error}",
+                                        job.job_id,
+                                        job.lease_generation,
+                                    ),
+                                }
                             }
-                            // release locked stream
                             let key = format!(
                                 "{}/{}/{}",
                                 job.org_id,
@@ -207,6 +393,12 @@ impl JobScheduler {
                                 job.stream_name
                             );
                             crate::service::db::compact::stream::clear_running(&key);
+                            drop(job);
+                            log::info!(
+                                "[COMPACTOR] merge scheduler slot released active_slots={} free_slots={}",
+                                handle.capacity().saturating_sub(handle.free_slots()),
+                                handle.free_slots(),
+                            );
                         }
                     }
                 }
@@ -223,203 +415,74 @@ mod job_scheduler_tests {
     use super::*;
 
     #[test]
-    fn test_job_scheduler_new_and_tx() {
+    fn scheduler_handles_share_one_capacity_pool() {
         let (worker_tx, _rx) = mpsc::channel::<(MergeSender, MergeBatch)>(1);
         let scheduler = JobScheduler::new(3, worker_tx);
-        let tx = scheduler.tx();
-        drop(tx);
+        let first = scheduler.handle();
+        let second = scheduler.handle();
+
+        let held = first.reserve(usize::MAX);
+        assert_eq!(held.len(), 3);
+        assert_eq!(second.free_slots(), 0);
+        assert!(second.reserve(1).is_empty());
+
+        drop(held);
+        assert_eq!(second.free_slots(), 3);
     }
 
     #[test]
-    fn test_job_scheduler_multiple_tx_clones() {
+    fn scheduler_permits_release_individually() {
         let (worker_tx, _rx) = mpsc::channel::<(MergeSender, MergeBatch)>(1);
-        let scheduler = JobScheduler::new(1, worker_tx);
-        let tx1 = scheduler.tx();
-        let tx2 = scheduler.tx();
-        drop(tx1);
-        drop(tx2);
+        let scheduler = JobScheduler::new(2, worker_tx);
+        let handle = scheduler.handle();
+        let mut held = handle.reserve(2);
+
+        assert_eq!(handle.free_slots(), 0);
+        drop(held.pop());
+        assert_eq!(handle.free_slots(), 1);
+        assert_eq!(handle.reserve(usize::MAX).len(), 1);
     }
 
-    /// Heartbeat-from-claim lifetime (2026-07-30 audit): a claimed job
-    /// The live lane's claim (#23) must see ONLY jobs at or after
-    /// `min_offsets`: an old backlog hour stays invisible to the reserved
-    /// slots while a recent hour is claimable. Sqlite-backed through the
-    /// real file_list job API.
-    #[tokio::test]
-    async fn test_get_pending_jobs_min_offsets_filters_old_hours() {
-        use crate::compact::jobs_test_support::retry_busy;
-        let _guard = crate::compact::jobs_test_support::setup().await;
-        let run = config::utils::time::now_micros();
-        let org = format!("liveorg{run}");
-        let stream = format!("livestream{run}");
-        let old_offset = run - 10 * 3_600_000_000; // 10 hours ago
-        let old_id = retry_busy("add old job", || {
-            infra::file_list::add_job(&org, StreamType::Logs, &stream, old_offset)
-        })
-        .await;
-        let recent_id = retry_busy("add recent job", || {
-            infra::file_list::add_job(&org, StreamType::Logs, &stream, run)
-        })
-        .await;
-        assert!(old_id > 0 && recent_id > 0 && old_id != recent_id);
+    #[test]
+    fn merge_cancellation_is_shared_and_monotonic() {
+        let cancellation = MergeCancellation::default();
+        let batch_cancellation = cancellation.clone();
+        assert!(!batch_cancellation.is_cancelled());
 
-        // live-lane shaped claim: only the recent job may come back
-        let min_offsets = run - 2 * 3_600_000_000;
-        let claimed = retry_busy("claim live", || {
-            infra::file_list::get_pending_jobs("live-lane-node", 10_000, false, min_offsets)
-        })
-        .await;
-        assert!(
-            claimed.iter().any(|j| j.id == recent_id),
-            "the recent job must be claimable through the live lane"
-        );
-        assert!(
-            !claimed.iter().any(|j| j.id == old_id),
-            "the old hour must be invisible to the live lane"
-        );
+        cancellation.cancel();
 
-        // unfiltered claim still sees the old job (the bulk lane's view)
-        let claimed_all = retry_busy("claim all", || {
-            infra::file_list::get_pending_jobs("live-lane-node", 10_000, false, 0)
-        })
-        .await;
-        assert!(
-            claimed_all.iter().any(|j| j.id == old_id),
-            "the bulk lane must still claim the old hour"
-        );
-
-        // restore every touched row so parallel tests see a clean table
-        let mut ids: Vec<i64> = claimed.iter().map(|j| j.id).collect();
-        ids.extend(claimed_all.iter().map(|j| j.id));
-        ids.sort_unstable();
-        ids.dedup();
-        retry_busy("restore claimed jobs", || {
-            infra::file_list::set_job_pending(&ids, 0, None)
-        })
-        .await;
+        assert!(batch_cancellation.is_cancelled());
+        assert!(batch_cancellation.check("test boundary").is_err());
     }
 
-    /// PARKED in the scheduler channel — no worker has dequeued it — must
-    /// keep its `updated_at` fresh so `check_running_jobs` cannot re-pend
-    /// it onto another node mid-lease; once the worker-side owner drops the
-    /// job (merge finished), the heartbeat must stop and the normal timeout
-    /// path takes over. Sqlite-backed through the real file_list job API.
+    #[test]
+    fn transient_heartbeat_errors_expire_at_lease_timeout() {
+        let timeout = tokio::time::Duration::from_secs(120);
+        assert!(!lease_refresh_expired(
+            timeout - tokio::time::Duration::from_nanos(1),
+            timeout,
+        ));
+        assert!(lease_refresh_expired(timeout, timeout));
+        assert!(lease_refresh_expired(
+            timeout + tokio::time::Duration::from_secs(1),
+            timeout,
+        ));
+    }
+
     #[tokio::test]
-    async fn test_job_lease_guard_covers_channel_parked_job() {
-        use crate::compact::jobs_test_support::retry_busy;
-        let _guard = crate::compact::jobs_test_support::setup().await;
-        let run = config::utils::time::now_micros();
-        let org = format!("leaseorg{run}");
-        let stream = format!("leasestream{run}");
-        let job_id = retry_busy("add_job", || {
-            infra::file_list::add_job(&org, StreamType::Logs, &stream, run)
-        })
-        .await;
-        assert!(job_id > 0);
-
-        // claim it, as run_merge's get_pending_jobs does. The claim is
-        // table-wide, so use a large limit, keep our job and restore any
-        // stranger rows untouched-in-effect (back to pending).
-        let claimed = retry_busy("claim", || {
-            infra::file_list::get_pending_jobs("lease-test-node", 10_000, false, 0)
-        })
-        .await;
-        assert!(
-            claimed.iter().any(|j| j.id == job_id),
-            "the fresh job must be claimable"
-        );
-        let strangers = claimed
-            .iter()
-            .map(|j| j.id)
-            .filter(|id| *id != job_id)
-            .collect::<Vec<_>>();
-        if !strangers.is_empty() {
-            retry_busy("restore stranger jobs", || {
-                infra::file_list::set_job_pending(&strangers, 0, None)
-            })
-            .await;
-        }
-
-        // heartbeat-from-claim with a 1s tick, then park the job in a tiny
-        // channel with no worker consuming it (the slow-worker scenario)
-        let lease = JobLeaseGuard::spawn(job_id, 1);
-        let (tx, mut rx) = mpsc::channel::<MergeJob>(1);
-        tx.send(MergeJob {
-            org_id: org.clone(),
-            stream_type: StreamType::Logs,
-            stream_name: stream.clone(),
-            job_id,
-            offset: run,
-            lease,
-        })
+    async fn heartbeat_cancellation_wait_stops_promptly() {
+        let cancel = MergeCancellation::default();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+            trigger.cancel();
+        });
+        tokio::time::timeout(
+            tokio::time::Duration::from_secs(1),
+            wait_for_job_cancellation(&cancel),
+        )
         .await
-        .expect("park job in channel");
-
-        // several heartbeats fire while the job sits buffered
-        tokio::time::sleep(tokio::time::Duration::from_secs(4)).await;
-
-        // a janitor pass with a 3s staleness threshold must NOT re-pend it:
-        // the parked job's updated_at is at most ~1s old
-        let stale_before = config::utils::time::now_micros() - 3_000_000;
-        retry_busy("check_running_jobs", || {
-            infra::file_list::check_running_jobs(stale_before)
-        })
-        .await;
-        let reclaimable = retry_busy("probe claim", || {
-            infra::file_list::get_pending_jobs("lease-thief", 10_000, false, 0)
-        })
-        .await;
-        assert!(
-            !reclaimable.iter().any(|j| j.id == job_id),
-            "a channel-parked job with a live lease guard must stay running"
-        );
-        if !reclaimable.is_empty() {
-            let ids = reclaimable.iter().map(|j| j.id).collect::<Vec<_>>();
-            retry_busy("restore probe-claimed jobs", || {
-                infra::file_list::set_job_pending(&ids, 0, None)
-            })
-            .await;
-        }
-
-        // the worker dequeues and finishes: dropping the job releases the
-        // last guard clone, which stops the heartbeat
-        let job = rx.recv().await.expect("job parked in channel");
-        drop(job);
-        drop(tx);
-        tokio::time::sleep(tokio::time::Duration::from_secs(4)).await;
-
-        // the same janitor threshold now reclaims the silent job
-        let stale_before = config::utils::time::now_micros() - 3_000_000;
-        retry_busy("check_running_jobs after drop", || {
-            infra::file_list::check_running_jobs(stale_before)
-        })
-        .await;
-        let reclaimable = retry_busy("reclaim", || {
-            infra::file_list::get_pending_jobs("lease-thief", 10_000, false, 0)
-        })
-        .await;
-        assert!(
-            reclaimable.iter().any(|j| j.id == job_id),
-            "after the guard drops the heartbeat must stop and the lease must expire"
-        );
-
-        // cleanup: our job done, strangers back to pending
-        let done_ids = [job_id];
-        retry_busy("cleanup set_job_done", || {
-            infra::file_list::set_job_done(&done_ids)
-        })
-        .await;
-        let strangers = reclaimable
-            .iter()
-            .map(|j| j.id)
-            .filter(|id| *id != job_id)
-            .collect::<Vec<_>>();
-        if !strangers.is_empty() {
-            retry_busy("restore stranger jobs", || {
-                infra::file_list::set_job_pending(&strangers, 0, None)
-            })
-            .await;
-        }
+        .expect("heartbeat cancellation observer must not wait for the heartbeat interval");
     }
 }
 
@@ -434,7 +497,8 @@ impl MergeWorker {
     pub fn new(num: usize) -> Self {
         // keep the workers fed: a fat job submits hundreds of batches; a
         // capacity-1 channel serialized submission behind the slowest batch
-        let (tx, rx) = mpsc::channel::<(MergeSender, MergeBatch)>(num.max(1) * 2);
+        let num = num.max(1);
+        let (tx, rx) = mpsc::channel::<(MergeSender, MergeBatch)>(num * 2);
         let rx = Arc::new(Mutex::new(rx));
         Self { num, rx, tx }
     }

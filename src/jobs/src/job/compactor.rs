@@ -44,106 +44,103 @@ pub async fn run() -> Result<(), anyhow::Error> {
     if !cfg.compact.enabled {
         return Ok(());
     }
+    let lease_generation_enabled = cfg.compact.lease_generation_enabled;
+    if !lease_generation_enabled {
+        log::warn!(
+            "[COMPACTOR::JOB] merge job generation, execution, and maintenance are disabled until ZO_COMPACT_LEASE_GENERATION_ENABLED is enabled on the whole rollout"
+        );
+    }
     log::info!("[COMPACTOR::JOB] Compactor is enabled");
 
-    let mut worker = compact::worker::MergeWorker::new(cfg.limit.file_merge_thread_num);
-    if let Err(e) = worker.run() {
-        log::error!("[COMPACTOR::JOB] start merge worker error: {e}");
-    }
-
-    // scheduler slots (concurrent jobs) decoupled from merge workers (#23):
-    // storms want few jobs × many workers each, steady state the opposite
-    let job_num = if cfg.compact.job_num > 0 {
-        cfg.compact.job_num
-    } else {
-        cfg.limit.file_merge_thread_num
-    };
-    let mut scheduler = compact::worker::JobScheduler::new(job_num, worker.tx());
-    if let Err(e) = scheduler.run() {
-        log::error!("[COMPACTOR::JOB] start merge job scheduler error: {e}");
-    }
-
-    // Live lane (#23): reserved scheduler slots + dedicated workers that
-    // claim only recent-hour jobs, so a storm/heal backlog can never starve
-    // the open hour's incremental merges (2026-08-06: apisix piled to 3,297
-    // open-hour L0s while every shared slot ground old fat hours).
-    let live_tx = if cfg.compact.live_job_num > 0 {
-        let mut live_worker = compact::worker::MergeWorker::new(cfg.compact.live_worker_num.max(1));
-        if let Err(e) = live_worker.run() {
-            log::error!("[COMPACTOR::JOB] start live merge worker error: {e}");
+    let (main_handle, live_handle) = if lease_generation_enabled {
+        let mut worker = compact::worker::MergeWorker::new(cfg.limit.file_merge_thread_num);
+        if let Err(e) = worker.run() {
+            log::error!("[COMPACTOR::JOB] start merge worker error: {e}");
         }
-        let mut live_scheduler =
-            compact::worker::JobScheduler::new(cfg.compact.live_job_num, live_worker.tx());
-        if let Err(e) = live_scheduler.run() {
-            log::error!("[COMPACTOR::JOB] start live merge job scheduler error: {e}");
+
+        // scheduler slots (concurrent jobs) decoupled from merge workers (#23):
+        // storms want few jobs × many workers each, steady state the opposite
+        let job_num = if cfg.compact.job_num > 0 {
+            cfg.compact.job_num
+        } else {
+            cfg.limit.file_merge_thread_num
+        };
+        let mut scheduler = compact::worker::JobScheduler::new(job_num, worker.tx());
+        if let Err(e) = scheduler.run() {
+            log::error!("[COMPACTOR::JOB] start merge job scheduler error: {e}");
         }
-        Some(live_scheduler.tx())
+        let main_handle = scheduler.handle();
+
+        // Live lane (#23): reserved scheduler slots + dedicated workers that
+        // claim only recent-hour jobs.
+        let live_handle = if cfg.compact.live_job_num > 0 {
+            let mut live_worker =
+                compact::worker::MergeWorker::new(cfg.compact.live_worker_num.max(1));
+            if let Err(e) = live_worker.run() {
+                log::error!("[COMPACTOR::JOB] start live merge worker error: {e}");
+            }
+            let mut live_scheduler =
+                compact::worker::JobScheduler::new(cfg.compact.live_job_num, live_worker.tx());
+            if let Err(e) = live_scheduler.run() {
+                log::error!("[COMPACTOR::JOB] start live merge job scheduler error: {e}");
+            }
+            Some(live_scheduler.handle())
+        } else {
+            None
+        };
+        (Some(main_handle), live_handle)
     } else {
-        None
+        (None, None)
     };
-    if let Some(live_tx) = live_tx {
-        spawn_pausable_job!("run_merge_live", get_config().compact.interval + 1, {
-            let cfg = get_config();
-            let min_offsets = config::utils::time::now_micros()
-                - cfg.compact.live_lookback_hours.max(1) * 3_600_000_000;
-            if let Err(e) = compact::run_merge(
-                live_tx.clone(),
-                min_offsets,
-                cfg.compact.live_job_num as i64,
-            )
-            .await
-            {
-                log::error!("[COMPACTOR::JOB] run merge live error: {e}");
+
+    if lease_generation_enabled {
+        spawn_pausable_job!("run_generate_job", get_config().compact.interval, {
+            log::debug!("[COMPACTOR::JOB] Running generate merge job");
+            if let Err(e) = compact::run_generate_job(CompactionJobType::Current).await {
+                log::error!("[COMPACTOR::JOB] run generate merge job error: {e}");
             }
         });
-    }
 
-    spawn_pausable_job!("run_generate_job", get_config().compact.interval, {
-        log::debug!("[COMPACTOR::JOB] Running generate merge job");
-        if let Err(e) = compact::run_generate_job(CompactionJobType::Current).await {
-            log::error!("[COMPACTOR::JOB] run generate merge job error: {e}");
-        }
-    });
-
-    // M29 merge-debt sweep: keep the job table stocked with every closed hour
-    // that still holds mergeable small files (oldest first), so partially
-    // consumed hours and late-built L0s are revisited at this cadence instead
-    // of the hourly old-data pass — and the newest closed hours (the old-data
-    // lane's dead zone, the hottest query window) are covered too. Idempotent
-    // per (stream, hour); 0 disables.
-    spawn_pausable_job!(
-        "run_generate_merge_debt_job",
-        get_config().compact.merge_debt_interval,
-        {
-            log::debug!("[COMPACTOR::JOB] Running generate merge debt job");
-            if let Err(e) = compact::run_generate_job(CompactionJobType::Debt).await {
-                log::error!("[COMPACTOR::JOB] run generate merge debt job error: {e}");
+        // M29 merge-debt sweep: keep the job table stocked with every closed hour
+        // that still holds mergeable small files (oldest first), so partially
+        // consumed hours and late-built L0s are revisited at this cadence instead
+        // of the hourly old-data pass — and the newest closed hours (the old-data
+        // lane's dead zone, the hottest query window) are covered too. Idempotent
+        // per (stream, hour); 0 disables.
+        spawn_pausable_job!(
+            "run_generate_merge_debt_job",
+            get_config().compact.merge_debt_interval,
+            {
+                log::debug!("[COMPACTOR::JOB] Running generate merge debt job");
+                if let Err(e) = compact::run_generate_job(CompactionJobType::Debt).await {
+                    log::error!("[COMPACTOR::JOB] run generate merge debt job error: {e}");
+                }
             }
-        }
-    );
+        );
 
-    // One-shot boot pass for the historical sweep: the pausable job sleeps a
-    // FULL old_data_interval (1h) before its first run, so every compactor
-    // restart used to push the old-data sweep out by an hour — repeated rolls
-    // starved it indefinitely and stranded pre-watermark hours. The short
-    // delay lets the node ring settle so stream ownership is stable.
-    tokio::task::spawn(async move {
-        tokio::time::sleep(tokio::time::Duration::from_secs(120)).await;
-        log::info!("[COMPACTOR::JOB] boot pass: generate merge job for old data");
-        if let Err(e) = compact::run_generate_job(CompactionJobType::Historical).await {
-            log::error!("[COMPACTOR::JOB] boot old-data generate error: {e}");
-        }
-    });
-    spawn_pausable_job!(
-        "run_generate_old_data_job",
-        get_config().compact.old_data_interval.saturating_add(1),
-        {
-            log::debug!("[COMPACTOR::JOB] Running generate merge job for old data");
+        // One-shot boot pass for the historical sweep: the pausable job sleeps a
+        // FULL old_data_interval (1h) before its first run, so every compactor
+        // restart used to push the old-data sweep out by an hour — repeated rolls
+        // starved it indefinitely and stranded pre-watermark hours. The short
+        // delay lets the node ring settle so stream ownership is stable.
+        tokio::task::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_secs(120)).await;
+            log::info!("[COMPACTOR::JOB] boot pass: generate merge job for old data");
             if let Err(e) = compact::run_generate_job(CompactionJobType::Historical).await {
-                log::error!("[COMPACTOR::JOB] run generate merge job for old data error: {e}");
+                log::error!("[COMPACTOR::JOB] boot old-data generate error: {e}");
             }
-        }
-    );
+        });
+        spawn_pausable_job!(
+            "run_generate_old_data_job",
+            get_config().compact.old_data_interval.saturating_add(1),
+            {
+                log::debug!("[COMPACTOR::JOB] Running generate merge job for old data");
+                if let Err(e) = compact::run_generate_job(CompactionJobType::Historical).await {
+                    log::error!("[COMPACTOR::JOB] run generate merge job for old data error: {e}");
+                }
+            }
+        );
+    }
 
     if get_config().compact.bloom_build_interval > 0 {
         spawn_pausable_job!(
@@ -159,30 +156,51 @@ pub async fn run() -> Result<(), anyhow::Error> {
     }
 
     #[cfg(feature = "enterprise")]
-    spawn_pausable_job!(
-        "compactor_downsampling",
-        get_o2_config().downsampling.downsampling_interval,
-        {
-            if get_o2_config()
-                .downsampling
-                .metrics_downsampling_rules
-                .is_empty()
+    if lease_generation_enabled {
+        spawn_pausable_job!(
+            "compactor_downsampling",
+            get_o2_config().downsampling.downsampling_interval,
             {
-                continue;
+                if get_o2_config()
+                    .downsampling
+                    .metrics_downsampling_rules
+                    .is_empty()
+                {
+                    continue;
+                }
+                log::debug!("[COMPACTOR::JOB] Running generate downsampling job");
+                if let Err(e) = compact::run_generate_downsampling_job().await {
+                    log::error!("[COMPACTOR::JOB] run generate downsampling job error: {e}");
+                }
             }
-            log::debug!("[COMPACTOR::JOB] Running generate downsampling job");
-            if let Err(e) = compact::run_generate_downsampling_job().await {
-                log::error!("[COMPACTOR::JOB] run generate downsampling job error: {e}");
-            }
-        }
-    );
+        );
+    }
 
-    spawn_pausable_job!("run_merge", get_config().compact.interval + 2, {
-        log::debug!("[COMPACTOR::JOB] Running data merge");
-        if let Err(e) = compact::run_merge(scheduler.tx().clone(), 0, 0).await {
-            log::error!("[COMPACTOR::JOB] run data merge error: {e}");
-        }
-    });
+    if let Some(main_handle) = main_handle {
+        spawn_pausable_job!("run_merge", get_config().compact.interval + 2, {
+            log::debug!("[COMPACTOR::JOB] Running data merge claim cycle");
+            if let Some(live_handle) = live_handle.as_ref() {
+                let cfg = get_config();
+                let floor = compact::live_claim_floor(
+                    config::utils::time::now_micros(),
+                    cfg.compact.live_lookback_hours,
+                );
+                if let Err(e) =
+                    compact::run_merge(live_handle, compact::MergeLane::Live { from: floor }).await
+                {
+                    log::error!("[COMPACTOR::JOB] run merge live error: {e}");
+                }
+                if let Err(e) =
+                    compact::run_merge(&main_handle, compact::MergeLane::Backlog { before: floor })
+                        .await
+                {
+                    log::error!("[COMPACTOR::JOB] run merge backlog error: {e}");
+                }
+            } else if let Err(e) = compact::run_merge(&main_handle, compact::MergeLane::All).await {
+                log::error!("[COMPACTOR::JOB] run data merge error: {e}");
+            }
+        });
+    }
 
     spawn_pausable_job!(
         "run_retention",
@@ -234,33 +252,35 @@ pub async fn run() -> Result<(), anyhow::Error> {
         }
     );
 
-    spawn_pausable_job!(
-        "compactor_check_running_jobs",
-        get_config().compact.job_run_timeout,
-        {
-            log::debug!("[COMPACTOR::JOB] Running check running jobs");
-            let timeout = get_config().compact.job_run_timeout;
-            let updated_at = config::utils::time::now_micros() - (timeout * 1000 * 1000);
-            if let Err(e) = infra::file_list::check_running_jobs(updated_at).await {
-                log::error!("[COMPACTOR::JOB] run check running jobs error: {e}");
-            }
-        },
-        sleep_after
-    );
+    if lease_generation_enabled {
+        spawn_pausable_job!(
+            "compactor_check_running_jobs",
+            get_config().compact.job_run_timeout,
+            {
+                log::debug!("[COMPACTOR::JOB] Running check running jobs");
+                let timeout = get_config().compact.job_run_timeout;
+                let updated_at = config::utils::time::now_micros() - (timeout * 1000 * 1000);
+                if let Err(e) = infra::file_list::check_running_jobs(updated_at).await {
+                    log::error!("[COMPACTOR::JOB] run check running jobs error: {e}");
+                }
+            },
+            sleep_after
+        );
 
-    spawn_pausable_job!(
-        "compactor_clean_done_jobs",
-        get_config().compact.job_clean_wait_time,
-        {
-            log::debug!("[COMPACTOR::JOB] Running clean done jobs");
-            let wait_time = get_config().compact.job_clean_wait_time;
-            let updated_at = config::utils::time::now_micros() - (wait_time * 1000 * 1000);
-            if let Err(e) = infra::file_list::clean_done_jobs(updated_at).await {
-                log::error!("[COMPACTOR::JOB] run clean done jobs error: {e}");
-            }
-        },
-        sleep_after
-    );
+        spawn_pausable_job!(
+            "compactor_clean_done_jobs",
+            get_config().compact.job_clean_wait_time,
+            {
+                log::debug!("[COMPACTOR::JOB] Running clean done jobs");
+                let wait_time = get_config().compact.job_clean_wait_time;
+                let updated_at = config::utils::time::now_micros() - (wait_time * 1000 * 1000);
+                if let Err(e) = infra::file_list::clean_done_jobs(updated_at).await {
+                    log::error!("[COMPACTOR::JOB] run clean done jobs error: {e}");
+                }
+            },
+            sleep_after
+        );
+    }
 
     spawn_pausable_job!(
         "run_compactor_pending_jobs_metric",

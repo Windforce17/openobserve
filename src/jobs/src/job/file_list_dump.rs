@@ -16,7 +16,7 @@
 use std::sync::Arc;
 
 use config::{cluster, get_config};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::Mutex;
 
 use crate::service::compact::dump;
 
@@ -31,12 +31,17 @@ pub async fn run() -> Result<(), anyhow::Error> {
     if !cfg.compact.file_list_dump_enabled {
         return Ok(());
     }
+    if !cfg.compact.lease_generation_enabled {
+        log::warn!(
+            "[FILE_LIST_DUMP:JOB] file-list dump jobs are disabled until ZO_COMPACT_LEASE_GENERATION_ENABLED is enabled on the whole rollout"
+        );
+        return Ok(());
+    }
 
     // spawn threads which will do the actual dumping
-    let ttl = std::cmp::max(60, cfg.compact.job_run_timeout / 4) as u64;
     let (tx, rx) = tokio::sync::mpsc::channel::<dump::DumpJob>(1);
     let rx = Arc::new(Mutex::new(rx));
-    for thread_id in 0..cfg.limit.file_merge_thread_num {
+    for thread_id in 0..cfg.limit.file_merge_thread_num.max(1) {
         let rx = rx.clone();
         tokio::spawn(async move {
             loop {
@@ -47,35 +52,48 @@ pub async fn run() -> Result<(), anyhow::Error> {
                         break;
                     }
                     Some(job) => {
-                        let (_tx, mut rx) = mpsc::channel::<()>(1);
-                        tokio::task::spawn(async move {
-                            loop {
-                                tokio::select! {
-                                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(ttl)) => {}
-                                    _ = rx.recv() => {
-                                        log::debug!("[FILE_LIST_DUMP:JOB:{thread_id}] update_running_jobs[{}] done", job.job_id);
-                                        return;
-                                    }
-                                }
-                                if let Err(e) =
-                                    infra::file_list::update_running_jobs(&[job.job_id]).await
-                                {
-                                    log::error!(
-                                        "[FILE_LIST_DUMP:JOB:{thread_id}] update_job_status[{}] failed: {}",
-                                        job.job_id,
-                                        e
-                                    );
-                                }
-                            }
-                        });
+                        log::info!(
+                            "[FILE_LIST_DUMP:JOB:{thread_id}] job started job_id={} generation={}",
+                            job.job_id,
+                            job.lease_generation,
+                        );
                         if let Err(e) = crate::service::compact::dump::dump(&job).await {
                             log::error!(
-                                "[FILE_LIST_DUMP:JOB:{thread_id}] dump for stream [{}/{}/{}] offset {}: error: {e}",
+                                "[FILE_LIST_DUMP:JOB:{thread_id}] dump for stream [{}/{}/{}] job_id={} generation={} offset {}: error: {e}",
                                 job.org_id,
                                 job.stream_type,
                                 job.stream_name,
+                                job.job_id,
+                                job.lease_generation,
                                 job.offset,
                             );
+                            match infra::file_list::set_job_dumped_status_owned(
+                                job.job_id,
+                                &cluster::LOCAL_NODE.uuid,
+                                job.lease_generation,
+                                false,
+                            )
+                            .await
+                            {
+                                Ok(true) => log::info!(
+                                    "[FILE_LIST_DUMP:JOB:{thread_id}] job released job_id={} generation={} outcome=retry",
+                                    job.job_id,
+                                    job.lease_generation,
+                                ),
+                                Ok(false) => {
+                                    job.cancel.cancel();
+                                    log::warn!(
+                                        "[FILE_LIST_DUMP:JOB:{thread_id}] release missed ownership job_id={} generation={}",
+                                        job.job_id,
+                                        job.lease_generation,
+                                    );
+                                }
+                                Err(release_error) => log::error!(
+                                    "[FILE_LIST_DUMP:JOB:{thread_id}] release failed job_id={} generation={}: {release_error}",
+                                    job.job_id,
+                                    job.lease_generation,
+                                ),
+                            }
                         }
                         // release locked stream
                         let key = format!(
