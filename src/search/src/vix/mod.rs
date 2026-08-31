@@ -251,11 +251,12 @@ pub async fn vix_search(
         .filter(|file| is_core_file(&file.key) && (file.meta.index_size > 0 || data_only_capable))
         .cloned()
         .collect_vec();
-    // Whole-sidecar caching and its metrics still cover only actual `.vxi`
-    // objects; data-only native evaluations use the range ladder directly.
+    // Whole-sidecar caching and its metrics cover only evaluations that
+    // actually read `.vxi`. A WHERE-less histogram is data-only even when
+    // the file has an index sidecar.
     let index_files = eval_files
         .iter()
-        .filter(|file| file.meta.index_size > 0)
+        .filter(|file| file.meta.index_size > 0 && !all_histogram)
         .cloned()
         .collect_vec();
     scan_stats.compressed_size = index_files.iter().map(|file| file.meta.index_size).sum();
@@ -1267,9 +1268,10 @@ async fn search_vix_index(
             &idx_optimize_rule,
             Some(IndexOptimizeMode::SimpleHistogram(..))
         )
-        && !reader_cache::GLOBAL_CACHE.contains(&vix_file_name);
-    let data_only_all_histogram = parquet_file.meta.index_size <= 0
-        && condition.is_condition_all()
+        && !reader_cache::GLOBAL_CACHE
+            .get(&vix_file_name)
+            .is_some_and(|reader| reader.has_index());
+    let data_only_all_histogram = condition.is_condition_all()
         && matches!(
             &idx_optimize_rule,
             Some(IndexOptimizeMode::SimpleHistogram(..))
@@ -1295,9 +1297,18 @@ async fn search_vix_index(
     // cache ladder (memory -> disk -> object storage).
     let reader_input = match read_mode {
         VixReadMode::Ranged => {
-            if let Some(reader) = reader_cache::GLOBAL_CACHE.get(&vix_file_name) {
-                Some(VixReaderInput::Shared(reader))
+            let cached_reader = reader_cache::GLOBAL_CACHE.get(&vix_file_name);
+            if let Some(reader) = cached_reader.as_ref().filter(|reader| {
+                data_only_all_histogram || parquet_file.meta.index_size <= 0 || reader.has_index()
+            }) {
+                Some(VixReaderInput::Shared(Arc::clone(reader)))
             } else {
+                // `put` is first-writer-wins, so an incompatible data-only
+                // reader must leave before the sidecar-backed replacement
+                // opens. Existing users retain their Arc safely.
+                if cached_reader.is_some() {
+                    reader_cache::GLOBAL_CACHE.remove(&vix_file_name);
+                }
                 // v3 split: the data object's exact size is compressed_size;
                 // the optional `.vxi` sidecar is attached only when this
                 // file's metadata reports a positive index_size.
@@ -1315,7 +1326,7 @@ async fn search_vix_index(
                         )),
                         index: config::vix_sidecar_key(&vix_file_name)
                             .zip(u64::try_from(parquet_file.meta.index_size).ok())
-                            .filter(|(_, size)| *size > 0)
+                            .filter(|(_, size)| *size > 0 && !data_only_all_histogram)
                             .map(|(sidecar_key, size)| {
                                 Arc::new(LadderRangeSource::new(
                                     file_account.clone(),
@@ -1342,7 +1353,7 @@ async fn search_vix_index(
                     anyhow::anyhow!("failed to load vix data file {vix_file_name}: {e}")
                 })?;
             let index_bytes = match config::vix_sidecar_key(&vix_file_name)
-                .filter(|_| parquet_file.meta.index_size > 0)
+                .filter(|_| parquet_file.meta.index_size > 0 && !data_only_all_histogram)
             {
                 Some(sidecar_key) => Some(
                     file_data::get(&file_account, &sidecar_key, None)
@@ -4684,6 +4695,114 @@ mod tests {
         assert!(
             reader_cache::GLOBAL_CACHE.contains(&key),
             "bucket-straddling ALL histogram must open the data-only reader"
+        );
+    }
+
+    /// An indexed ALL histogram is still data-only. Give the sidecar an
+    /// impossible declared size so any attempted open fails; the zone
+    /// collector must answer entirely from the data object.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_indexed_all_histogram_skips_sidecar() {
+        let master = store_core_file(
+            "files/org/logs/native-histogram/2026/01/01/00/all-indexed-boundary.vix",
+            1_000,
+        )
+        .await;
+        let mut histogram_file = master.clone();
+        histogram_file.meta.index_size = i64::MAX;
+        let key = master.key.clone();
+        reader_cache::GLOBAL_CACHE.remove(&key);
+        vix_result_cache::GLOBAL_CACHE.remove_file_entries(std::iter::once(key.as_str()));
+        let params = Arc::new(crate::types::QueryParams {
+            trace_id: "all-indexed-histogram-zone".to_string(),
+            org_id: "org".to_string(),
+            stream: datafusion::sql::TableReference::from("t"),
+            stream_type: StreamType::Logs,
+            stream_name: "t".to_string(),
+            time_range: (990, 1_010),
+            work_group: None,
+            use_inverted_index: true,
+        });
+        let mut condition = IndexCondition::new();
+        condition.add_condition(Condition::All());
+        let mut files = vec![histogram_file];
+
+        let (_took, add_filter_back, result) = vix_search(
+            params,
+            &mut files,
+            Some(condition),
+            Some(IndexOptimizeMode::SimpleHistogram(990, 5, 5, 0)),
+        )
+        .await
+        .unwrap();
+
+        assert!(!add_filter_back);
+        assert!(files.is_empty(), "zone histogram must remove the file");
+        match result {
+            MultiResult::Histogram(histogram) => assert_eq!(histogram, vec![4, 5, 1, 0, 0]),
+            other => panic!("expected zone histogram, got {other:?}"),
+        }
+        let data_only_reader = reader_cache::GLOBAL_CACHE
+            .get(&key)
+            .expect("indexed ALL histogram must memoize a data-only reader");
+        assert!(
+            !data_only_reader.has_index(),
+            "ALL histogram must not attach the sidecar"
+        );
+
+        let mut filtered_condition = IndexCondition::new();
+        filtered_condition.add_condition(Condition::Equal(
+            "level".to_string(),
+            "not-present".to_string(),
+        ));
+        let fetch_stats = Arc::new(source::FetchStats::default());
+        let (histogram_key, equality_histogram, has_skipped) = search_vix_index(
+            "equality-histogram-after-all-indexed-histogram",
+            (990, 1_010),
+            Some(filtered_condition.clone()),
+            Some(IndexOptimizeMode::SimpleHistogram(990, 5, 5, 0)),
+            &master,
+            VixReadMode::Ranged,
+            &fetch_stats,
+        )
+        .await
+        .unwrap();
+        assert_eq!(histogram_key, key);
+        assert!(matches!(equality_histogram, VixSearchResult::NoMatch));
+        assert!(!has_skipped);
+        assert!(
+            reader_cache::GLOBAL_CACHE
+                .get(&key)
+                .is_some_and(|reader| !reader.has_index()),
+            "equality histogram after ALL histogram must stay data-only"
+        );
+
+        let mut sidecar_condition = IndexCondition::new();
+        sidecar_condition.add_condition(Condition::Equal(
+            "level".to_string(),
+            "also-not-present".to_string(),
+        ));
+        vix_result_cache::GLOBAL_CACHE.remove_file_entries(std::iter::once(key.as_str()));
+        let (result_key, filtered_result, has_skipped) = search_vix_index(
+            "filter-after-all-indexed-histogram",
+            (990, 1_010),
+            Some(sidecar_condition),
+            None,
+            &master,
+            VixReadMode::Ranged,
+            &fetch_stats,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result_key, key);
+        assert!(matches!(filtered_result, VixSearchResult::NoMatch));
+        assert!(!has_skipped);
+        assert!(
+            reader_cache::GLOBAL_CACHE
+                .get(&key)
+                .is_some_and(|reader| reader.has_index()),
+            "a later filtered query must upgrade the cached reader with its sidecar"
         );
     }
 

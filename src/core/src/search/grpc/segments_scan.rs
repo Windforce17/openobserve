@@ -73,7 +73,7 @@ use std::{
 use arrow::array::{BooleanArray, Int64Array};
 use arrow_schema::Schema;
 use config::{
-    TIMESTAMP_COL_NAME, get_config,
+    TIMESTAMP_COL_NAME, get_config, is_local_disk_storage,
     meta::{search::ScanStats, stream::StreamType},
     metrics,
     utils::record_batch_ext::{RecordBatchExt, concat_batches},
@@ -151,6 +151,46 @@ fn segment_scan_budgets() -> (usize, usize) {
 /// Storage account segment objects live under — the flusher PUTs with the
 /// default/empty account (see `segment_wal::uploader`).
 const SEGMENT_STORAGE_ACCOUNT: &str = "";
+
+fn choose_segment_cache_type(
+    total_size: usize,
+    memory_skip_size: Option<usize>,
+    disk_skip_size: Option<usize>,
+) -> file_data::CacheType {
+    if memory_skip_size.is_some_and(|skip_size| total_size < skip_size) {
+        file_data::CacheType::Memory
+    } else if disk_skip_size.is_some_and(|skip_size| total_size < skip_size) {
+        file_data::CacheType::Disk
+    } else {
+        file_data::CacheType::None
+    }
+}
+
+fn segment_cache_type(metas: &[SegmentMeta]) -> file_data::CacheType {
+    let total_size = metas.iter().fold(0usize, |total, meta| {
+        total.saturating_add(usize::try_from(meta.size).unwrap_or(usize::MAX))
+    });
+    let cfg = get_config();
+    choose_segment_cache_type(
+        total_size,
+        cfg.memory_cache
+            .enabled
+            .then_some(cfg.memory_cache.skip_size),
+        (!is_local_disk_storage() && cfg.disk_cache.enabled).then_some(cfg.disk_cache.skip_size),
+    )
+}
+
+async fn cache_segment(
+    cache_type: file_data::CacheType,
+    object_key: &str,
+    bytes: bytes::Bytes,
+) -> std::result::Result<(), anyhow::Error> {
+    match cache_type {
+        file_data::CacheType::Memory => file_data::memory::set(object_key, bytes).await,
+        file_data::CacheType::Disk => file_data::disk::set(object_key, bytes).await,
+        file_data::CacheType::None => Ok(()),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SegmentFetchSource {
@@ -332,7 +372,10 @@ async fn read_segment_cache(
     }
     None
 }
-async fn fetch_segment(meta: &SegmentMeta) -> Result<FetchedSegment> {
+async fn fetch_segment(
+    meta: &SegmentMeta,
+    cache_type: file_data::CacheType,
+) -> Result<FetchedSegment> {
     let expected_size = usize::try_from(meta.size)
         .ok()
         .filter(|size| *size > 0)
@@ -401,9 +444,9 @@ async fn fetch_segment(meta: &SegmentMeta) -> Result<FetchedSegment> {
                 ))
             })?;
             let remote_fetch = remote_started.elapsed();
-            if let Err(e) = file_data::set(&object_key, bytes.clone()).await {
+            if let Err(e) = cache_segment(cache_type, &object_key, bytes.clone()).await {
                 log::warn!(
-                    "[SEGMENT:SCAN] fetched segment object {object_key} but could not populate the query cache: {e:#}"
+                    "[SEGMENT:SCAN] fetched segment object {object_key} but could not populate the {cache_type:?} query cache: {e:#}"
                 );
             }
             Ok(Arc::new(SharedSegmentFetch {
@@ -707,6 +750,7 @@ pub async fn search(
     // class this path exists to prevent).
     let rows = wal_segments::get_by_ids(segment_ids).await?;
     let mut metas = resolve_assigned(segment_ids, rows, &query.org_id, &query.stream_name)?;
+    let cache_type = segment_cache_type(&metas);
 
     // `ORDER BY _timestamp DESC LIMIT n` scans (the UI default) only ever
     // read the n newest matching rows — a running top-n timestamp threshold
@@ -803,7 +847,7 @@ pub async fn search(
             let fst_fields = fst_fields.clone();
             let needed_columns = Arc::clone(&needed_columns);
             async move {
-                let fetched = match fetch_segment(meta).await {
+                let fetched = match fetch_segment(meta, cache_type).await {
                     Ok(fetched) => {
                         record_segment_cache_outcome(&org_id, stream_type, Some(fetched.source));
                         fetched
@@ -976,6 +1020,7 @@ pub async fn search_histogram(
 
     let rows = wal_segments::get_by_ids(segment_ids).await?;
     let metas = resolve_assigned(segment_ids, rows, &query.org_id, &query.stream_name)?;
+    let cache_type = segment_cache_type(&metas);
 
     let mut scan_stats = ScanStats::new();
     scan_stats.files = metas.len() as i64;
@@ -1011,17 +1056,17 @@ pub async fn search_histogram(
         let mut fetches = futures::stream::iter(metas.into_iter())
             .map(|meta| {
                 let fetch_budget = Arc::clone(&fetch_budget);
-            async move {
+                async move {
                     let permit_count = segment_permits(meta.size, fetch_budget_permits);
                     let permit = fetch_budget
                         .acquire_many_owned(permit_count)
-                    .await
+                        .await
                         .map_err(|_| {
                             Error::Message(
                                 "[SEGMENT:SCAN] compressed-byte fetch budget closed".to_string(),
                             )
-                    })?;
-                    let fetched = fetch_segment(&meta).await?;
+                        })?;
+                    let fetched = fetch_segment(&meta, cache_type).await?;
                     Ok::<_, Error>((meta, fetched, permit))
                 }
             })
@@ -1115,8 +1160,8 @@ pub async fn search_histogram(
                     Error::Message("[SEGMENT:SCAN] histogram count overflow".to_string())
                 })?;
             }
-        tokio::task::coop::consume_budget().await;
-    }
+            tokio::task::coop::consume_budget().await;
+        }
         Ok::<_, Error>(timings)
     };
 
@@ -1844,6 +1889,30 @@ mod tests {
         );
         assert_eq!(segment_permits(i64::MAX, 7), 7);
         assert_eq!(segment_permits(i64::MAX, usize::MAX), u32::MAX);
+    }
+
+    #[test]
+    fn segment_cache_type_respects_aggregate_placement_limits() {
+        assert_eq!(
+            choose_segment_cache_type(10, Some(11), Some(101)),
+            file_data::CacheType::Memory
+        );
+        assert_eq!(
+            choose_segment_cache_type(11, Some(11), Some(101)),
+            file_data::CacheType::Disk
+        );
+        assert_eq!(
+            choose_segment_cache_type(101, Some(11), Some(101)),
+            file_data::CacheType::None
+        );
+        assert_eq!(
+            choose_segment_cache_type(10, None, Some(101)),
+            file_data::CacheType::Disk
+        );
+        assert_eq!(
+            choose_segment_cache_type(10, None, None),
+            file_data::CacheType::None
+        );
     }
 
     #[test]
