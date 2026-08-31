@@ -146,6 +146,13 @@ pub trait FileList: Sync + Send + 'static {
         stream_name: &str,
         time_range: (i64, i64),
     ) -> Result<Vec<FileId>>;
+    async fn query_ids_with_file(
+        &self,
+        org_id: &str,
+        stream_type: StreamType,
+        stream_name: &str,
+        time_range: (i64, i64),
+    ) -> Result<Vec<FileIdWithFile>>;
     async fn query_ids_by_files(&self, files: &[FileKey]) -> Result<stdHashMap<String, i64>>;
     async fn query_old_data_hours(
         &self,
@@ -467,6 +474,20 @@ pub async fn query_ids(
     validate_time_range(time_range)?;
     CLIENT
         .query_ids(org_id, stream_type, stream_name, time_range)
+        .await
+}
+
+#[inline]
+#[tracing::instrument(name = "infra:file_list:db:query_ids_with_file")]
+pub async fn query_ids_with_file(
+    org_id: &str,
+    stream_type: StreamType,
+    stream_name: &str,
+    time_range: (i64, i64),
+) -> Result<Vec<FileIdWithFile>> {
+    validate_time_range(time_range)?;
+    CLIENT
+        .query_ids_with_file(org_id, stream_type, stream_name, time_range)
         .await
 }
 
@@ -1013,10 +1034,16 @@ pub struct FileId {
     pub deleted: bool,
 }
 
-#[derive(Clone, Debug, Default, sqlx::FromRow)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, sqlx::FromRow)]
 pub struct FileIdWithFile {
     pub id: i64,
     pub file: String,
+    #[sqlx(default)]
+    pub records: i64,
+    #[sqlx(default)]
+    pub original_size: i64,
+    #[sqlx(default)]
+    pub deleted: bool,
 }
 
 #[cfg(test)]

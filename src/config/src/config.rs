@@ -1379,11 +1379,17 @@ pub struct Common {
     )]
     pub segment_build_404_tombstone: bool,
     #[env_config(
-        name = "ZO_SEGMENT_SCAN_DECODE_WAVE",
-        default = 8,
-        help = "Segment WAL: segments fetched+decoded concurrently per live-tail query. Decode streams frame-by-frame (peak ~ one frame per slot), so this trades tail-scan latency against per-query CPU share on the querier."
+        name = "ZO_SEGMENT_SCAN_FETCH_CONCURRENCY",
+        default = 32,
+        help = "Segment WAL: concurrent cache/object-store reads per live-tail query. Fetching is pipelined separately from decode so small-object latency does not serialize behind zstd work."
     )]
-    pub segment_scan_decode_wave: usize,
+    pub segment_scan_fetch_concurrency: usize,
+    #[env_config(
+        name = "ZO_SEGMENT_SCAN_DECODE_CONCURRENCY",
+        default = 8,
+        help = "Segment WAL: concurrent blocking zstd/CRC decodes per live-tail query. The regular ordered top-n path also uses this as its bounded decode wave size."
+    )]
+    pub segment_scan_decode_concurrency: usize,
     #[env_config(
         name = "ZO_WAL_WRITE_QUEUE_ENABLED",
         default = false,

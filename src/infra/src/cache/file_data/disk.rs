@@ -109,6 +109,52 @@ pub static METRICS_RESULT_CACHE: Lazy<RwLock<Vec<String>>> = Lazy::new(|| RwLock
 pub static LOADING_FROM_DISK_NUM: Lazy<AtomicUsize> = Lazy::new(|| AtomicUsize::new(0));
 pub static LOADING_FROM_DISK_DONE: Lazy<AtomicBool> = Lazy::new(|| AtomicBool::new(false));
 
+/// Owns a disk-cache temporary path until it is renamed. Drop uses a
+/// synchronous unlink so cancellation at any await cannot strand
+/// segment-sized `.tmp` files until the next process restart.
+struct TempFileGuard {
+    path: String,
+}
+
+impl TempFileGuard {
+    fn new(path: String) -> Self {
+        Self { path }
+    }
+
+    fn path(&self) -> &str {
+        &self.path
+    }
+}
+
+impl std::ops::Deref for TempFileGuard {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        &self.path
+    }
+}
+
+impl AsRef<std::ffi::OsStr> for TempFileGuard {
+    fn as_ref(&self) -> &std::ffi::OsStr {
+        self.path.as_ref()
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                log::warn!(
+                    "[FileData::Disk] remove abandoned temporary file {} failed: {error}",
+                    self.path
+                );
+            }
+        }
+    }
+}
+
 pub struct FileData {
     max_size: usize,
     cur_size: usize,
@@ -229,7 +275,10 @@ impl FileData {
         let file_ops_start = std::time::Instant::now();
         let file_path = self.get_file_path(file);
         tokio::fs::create_dir_all(Path::new(&file_path).parent().unwrap()).await?;
-        tokio::fs::rename(tmp_file, &file_path).await.map_err(|e| {
+        // Local cache rename + index update is one cancellation-free critical
+        // section. A canceled future therefore leaves either the guarded tmp
+        // file or a fully indexed final file, never a renamed orphan.
+        std::fs::rename(tmp_file, &file_path).map_err(|e| {
             anyhow::anyhow!(
                 "[CacheType:{}] File disk cache rename tmp file {tmp_file} to real file {file_path} error: {e}",
                 self.file_type,
@@ -244,10 +293,10 @@ impl FileData {
         }
 
         // set size
-        self.set_size(file, data_size).await
+        self.set_size(file, data_size)
     }
 
-    async fn set_size(&mut self, file: &str, data_size: usize) -> Result<(), anyhow::Error> {
+    fn set_size(&mut self, file: &str, data_size: usize) -> Result<(), anyhow::Error> {
         // update size
         self.cur_size += data_size;
         self.data.insert(file.to_string(), data_size);
@@ -670,7 +719,7 @@ pub async fn set(file: &str, data: Bytes) -> Result<(), anyhow::Error> {
     // write to tmp file
     let data_size = data.len();
     let (file, tmp_file) = write_tmp_file(file, data).await?;
-    set_from_tmp_file(&file, &tmp_file, data_size).await
+    set_from_tmp_file(&file, tmp_file, data_size).await
 }
 
 /// Seed the disk cache from a LOCAL file (e.g. a compaction spool) without
@@ -687,18 +736,19 @@ pub async fn set_from_local_file(
         return Ok(());
     }
     let tmp_file = alloc_tmp_file_path().await?;
-    let size = match tokio::fs::hard_link(source, &tmp_file).await {
+    let size = match tokio::fs::hard_link(source, tmp_file.path()).await {
         Ok(()) => match tokio::fs::metadata(source).await {
             Ok(metadata) => metadata.len() as usize,
             Err(error) => {
-                let _ = tokio::fs::remove_file(&tmp_file).await;
+                let _ = tokio::fs::remove_file(tmp_file.path()).await;
                 return Err(anyhow::anyhow!(
-                    "[FileData::Disk] stat hard-linked local file {} failed; removed temporary link {tmp_file}: {error}",
-                    source.display()
+                    "[FileData::Disk] stat hard-linked local file {} failed; removed temporary link {}: {error}",
+                    source.display(),
+                    tmp_file.path()
                 ));
             }
         },
-        Err(link_error) => match tokio::fs::copy(source, &tmp_file).await {
+        Err(link_error) => match tokio::fs::copy(source, tmp_file.path()).await {
             Ok(size) => {
                 log::debug!(
                     "[FileData::Disk] hard-link promotion of {} failed ({link_error}); copied {} bytes instead",
@@ -708,15 +758,16 @@ pub async fn set_from_local_file(
                 size as usize
             }
             Err(copy_error) => {
-                let _ = tokio::fs::remove_file(&tmp_file).await;
+                let _ = tokio::fs::remove_file(tmp_file.path()).await;
                 return Err(anyhow::anyhow!(
-                    "[FileData::Disk] promote local file {} to cache tmp {tmp_file} failed: hard link: {link_error}; copy fallback: {copy_error}",
-                    source.display()
+                    "[FileData::Disk] promote local file {} to cache tmp {} failed: hard link: {link_error}; copy fallback: {copy_error}",
+                    source.display(),
+                    tmp_file.path()
                 ));
             }
         },
     };
-    set_from_tmp_file(file, &tmp_file, size).await
+    set_from_tmp_file(file, tmp_file, size).await
 }
 
 /// Move an already-written tmp file into the disk cache under `file` — the
@@ -726,11 +777,11 @@ pub async fn set_from_local_file(
 /// entry already exists / the cache is disabled.
 async fn set_from_tmp_file(
     file: &str,
-    tmp_file: &str,
+    tmp_file: TempFileGuard,
     data_size: usize,
 ) -> Result<(), anyhow::Error> {
     if !get_config().disk_cache.enabled {
-        let _ = tokio::fs::remove_file(tmp_file).await;
+        let _ = tokio::fs::remove_file(tmp_file.path()).await;
         return Ok(());
     }
 
@@ -756,17 +807,17 @@ async fn set_from_tmp_file(
 
     if files.exist(file).await {
         // remove the tmp file
-        if let Err(e) = tokio::fs::remove_file(tmp_file).await {
+        if let Err(e) = tokio::fs::remove_file(tmp_file.path()).await {
             log::warn!(
                 "[CacheType:{}] File disk cache remove tmp file {} error: {}",
                 files.file_type,
-                tmp_file,
+                tmp_file.path(),
                 e
             );
         }
         return Ok(());
     }
-    let ret = files.set(file, tmp_file, data_size).await;
+    let ret = files.set(file, tmp_file.path(), data_size).await;
 
     let set_took = start.elapsed().as_millis() as usize;
     if set_took > 100 {
@@ -798,7 +849,7 @@ pub async fn set_size(file: &str, data_size: usize) -> Result<(), anyhow::Error>
     if files.exist(file).await {
         return Ok(());
     }
-    files.set_size(file, data_size).await
+    files.set_size(file, data_size)
 }
 
 #[inline]
@@ -1082,29 +1133,16 @@ pub async fn download(
     size: Option<usize>,
 ) -> Result<usize, anyhow::Error> {
     let tmp_file = alloc_tmp_file_path().await?;
-    let data_len = match super::download_from_storage_to_file(
+    let data_len = super::download_from_storage_to_file(
         account,
         file,
         size,
-        std::path::Path::new(&tmp_file),
+        std::path::Path::new(tmp_file.path()),
     )
-    .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            // best-effort cleanup of the partial tmp file
-            let _ = tokio::fs::remove_file(&tmp_file).await;
-            return Err(e);
-        }
-    };
-    if let Err(e) = set_from_tmp_file(file, &tmp_file, data_len).await {
-        let _ = tokio::fs::remove_file(&tmp_file).await;
-        return Err(anyhow::anyhow!(
-            "set file {} to disk cache failed: {}",
-            file,
-            e
-        ));
-    };
+    .await?;
+    set_from_tmp_file(file, tmp_file, data_len)
+        .await
+        .map_err(|e| anyhow::anyhow!("set file {file} to disk cache failed: {e}"))?;
     Ok(data_len)
 }
 
@@ -1208,7 +1246,7 @@ fn get_etag(metadata: &std::fs::Metadata) -> String {
 /// Allocate a unique tmp-file path under the cache's tmp dir (creating the
 /// dir). Streamed downloads (H3) write into this path directly; the buffered
 /// [`write_tmp_file`] fills it with in-memory bytes.
-async fn alloc_tmp_file_path() -> Result<String, anyhow::Error> {
+async fn alloc_tmp_file_path() -> Result<TempFileGuard, anyhow::Error> {
     let tmp_path = format!(
         "{}/{}",
         get_config().common.data_tmp_dir,
@@ -1223,16 +1261,21 @@ async fn alloc_tmp_file_path() -> Result<String, anyhow::Error> {
     }
     let tmp_path = tokio::fs::canonicalize(&tmp_path).await.unwrap();
     let tmp_file = tmp_path.join(format!("{}.tmp", config::ider::generate()));
-    Ok(tmp_file.to_str().unwrap().to_string())
+    Ok(TempFileGuard::new(tmp_file.to_str().unwrap().to_string()))
 }
 
 // Write data to a temporary random file and return the file path
-async fn write_tmp_file(file: &str, data: Bytes) -> Result<(String, String), anyhow::Error> {
+async fn write_tmp_file(
+    file: &str,
+    data: Bytes,
+) -> Result<(String, TempFileGuard), anyhow::Error> {
     let tmp_file = alloc_tmp_file_path().await?;
-    if let Err(e) = config::utils::async_file::put_file_contents(&tmp_file, &data).await {
+    if let Err(e) =
+        config::utils::async_file::put_file_contents(tmp_file.path(), &data).await
+    {
         return Err(anyhow::anyhow!(
             "[FileData::Disk] write tmp file {}, failed: {}",
-            tmp_file,
+            tmp_file.path(),
             e
         ));
     }
@@ -1242,6 +1285,19 @@ async fn write_tmp_file(file: &str, data: Bytes) -> Result<(String, String), any
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn abandoned_temporary_file_is_removed_on_drop() {
+        let file_key = "wal_segments/test/cancelled-cache-fill.seg";
+        let (_, tmp_file) = write_tmp_file(file_key, Bytes::from_static(b"segment"))
+            .await
+            .unwrap();
+        let path = tmp_file.path().to_string();
+        assert!(Path::new(&path).exists());
+
+        drop(tmp_file);
+        assert!(!Path::new(&path).exists());
+    }
 
     #[tokio::test]
     async fn test_disk_lru_cache_set_file() {

@@ -798,6 +798,78 @@ SELECT stream, date FROM file_list WHERE index_size > 0 AND bloom_ver = 0 AND da
         Ok(rets)
     }
 
+    async fn query_ids_with_file(
+        &self,
+        org_id: &str,
+        stream_type: StreamType,
+        stream_name: &str,
+        time_range: (i64, i64),
+    ) -> Result<Vec<super::FileIdWithFile>> {
+        let start = std::time::Instant::now();
+        let (time_start, time_end) = time_range;
+        let stream_key = format!("{org_id}/{stream_type}/{stream_name}");
+
+        let day_partitions = if time_end - time_start <= DAY_MICRO_SECS
+            || time_end - time_start > DAY_MICRO_SECS * 30
+            || !get_config().compact.file_list_multi_thread
+        {
+            vec![(time_start, time_end)]
+        } else {
+            let mut partitions = Vec::new();
+            let mut start = time_start;
+            while start < time_end {
+                let end_of_day = std::cmp::min(end_of_the_day(start), time_end);
+                partitions.push((start, end_of_day));
+                start = end_of_day + 1;
+            }
+            partitions
+        };
+        log::debug!("file_list day_partitions: {day_partitions:?}");
+
+        let mut tasks = Vec::with_capacity(day_partitions.len());
+
+        for (time_start, time_end) in day_partitions {
+            let stream_key = stream_key.clone();
+            tasks.push(tokio::task::spawn(async move {
+                let pool = CLIENT_RO.clone();
+                DB_QUERY_NUMS
+                    .with_label_values(&["query_ids_with_file", "file_list"])
+                    .inc();
+                let max_ts_upper_bound =
+                    super::calculate_max_ts_upper_bound(time_end, stream_type);
+                let (date_from, date_to) = derive_date_range(time_start, time_end);
+                let query = "SELECT id, file, records, original_size FROM file_list WHERE stream = $1 AND max_ts >= $2 AND max_ts <= $3 AND min_ts < $4 AND date >= $5 AND date < $6;";
+                sqlx::query_as::<_, super::FileIdWithFile>(query)
+                    .bind(stream_key)
+                    .bind(time_start)
+                    .bind(max_ts_upper_bound)
+                    .bind(time_end)
+                    .bind(date_from)
+                    .bind(date_to)
+                    .fetch_all(&pool)
+                    .await
+            }));
+        }
+
+        let mut rets = Vec::new();
+        for task in tasks {
+            match task.await {
+                Ok(Ok(r)) => rets.extend(r),
+                Ok(Err(e)) => {
+                    return Err(e.into());
+                }
+                Err(e) => {
+                    return Err(Error::Message(e.to_string()));
+                }
+            };
+        }
+        let time = start.elapsed().as_secs_f64();
+        DB_QUERY_TIME
+            .with_label_values(&["query_ids_with_file", "file_list"])
+            .observe(time);
+        Ok(rets)
+    }
+
     async fn query_ids_by_files(&self, files: &[FileKey]) -> Result<stdHashMap<String, i64>> {
         let mut ret = stdHashMap::with_capacity(files.len());
         // group by date

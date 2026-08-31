@@ -241,6 +241,12 @@ fn validate_for_add(meta: &SegmentMeta) -> Result<()> {
             meta.object_key
         )));
     }
+    if meta.size <= 0 {
+        return Err(Error::InvalidFileMeta(format!(
+            "[WAL_SEGMENTS] add object_key={}: non-positive object size {}",
+            meta.object_key, meta.size
+        )));
+    }
     if meta.min_ts <= 0 || meta.max_ts < meta.min_ts {
         return Err(Error::InvalidFileMeta(format!(
             "[WAL_SEGMENTS] add object_key={}: degenerate time range [{}, {}]",
@@ -2124,7 +2130,13 @@ mod tests {
         let err = add(&zero_ts).await.unwrap_err();
         assert!(err.is_deterministic_db_error(), "{err:?}");
 
-        let mut no_node = seg("", 4, T0, T0 + 1000, &["org1/logs/app1"]);
+        let mut zero_size = seg("node-bad", 4, T0, T0 + 1000, &["org1/logs/app1"]);
+        zero_size.size = 0;
+        let err = add(&zero_size).await.unwrap_err();
+        assert!(err.to_string().contains("non-positive object size"), "{err}");
+        assert!(err.is_deterministic_db_error(), "{err:?}");
+
+        let mut no_node = seg("", 5, T0, T0 + 1000, &["org1/logs/app1"]);
         no_node.object_key = "wal_segments/x/4".to_string();
         let err = add(&no_node).await.unwrap_err();
         assert!(err.is_deterministic_db_error(), "{err:?}");

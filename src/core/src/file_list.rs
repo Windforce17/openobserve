@@ -272,6 +272,33 @@ pub async fn query_ids(
     Ok(files)
 }
 
+#[tracing::instrument(
+    name = "service::file_list::query_ids_with_file",
+    skip_all,
+    fields(org_id = org_id, stream_name = stream_name)
+)]
+pub async fn query_ids_with_file(
+    trace_id: &str,
+    org_id: &str,
+    stream_type: StreamType,
+    stream_name: &str,
+    time_range: (i64, i64),
+) -> Result<Vec<infra_file_list::FileIdWithFile>> {
+    let mut files =
+        infra_file_list::query_ids_with_file(org_id, stream_type, stream_name, time_range).await?;
+    let dumped_files =
+        file_list_dump::query_ids_with_file(trace_id, org_id, stream_type, stream_name, time_range)
+            .await?;
+    files.extend(dumped_files);
+    sort_dedup_file_ids_with_file(&mut files);
+    Ok(files)
+}
+
+fn sort_dedup_file_ids_with_file(files: &mut Vec<infra_file_list::FileIdWithFile>) {
+    files.par_sort_unstable_by_key(|file| file.id);
+    files.dedup_by_key(|file| file.id);
+}
+
 #[inline]
 pub async fn calculate_files_size(files: &[FileKey]) -> Result<ScanStats> {
     let mut stats = ScanStats::new();
@@ -614,5 +641,42 @@ mod tests {
         assert_eq!(stats.original_size, 10000); // 5000 + 5000
         assert_eq!(stats.compressed_size, 5000); // 2500 + 2500
         assert_eq!(stats.idx_scan_size, 500); // 250 + 250
+    }
+
+    #[test]
+    fn test_sort_dedup_file_ids_with_file() {
+        let mut files = vec![
+            infra_file_list::FileIdWithFile {
+                id: 2,
+                file: "second.parquet".to_string(),
+                records: 20,
+                original_size: 200,
+                deleted: false,
+            },
+            infra_file_list::FileIdWithFile {
+                id: 1,
+                file: "first.parquet".to_string(),
+                records: 10,
+                original_size: 100,
+                deleted: false,
+            },
+            infra_file_list::FileIdWithFile {
+                id: 2,
+                file: "second.parquet".to_string(),
+                records: 20,
+                original_size: 200,
+                deleted: false,
+            },
+        ];
+
+        sort_dedup_file_ids_with_file(&mut files);
+
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].id, 1);
+        assert_eq!(files[0].file, "first.parquet");
+        assert_eq!(files[1].id, 2);
+        assert_eq!(files[1].records, 20);
+        assert_eq!(files[1].original_size, 200);
+        assert!(!files[1].deleted);
     }
 }

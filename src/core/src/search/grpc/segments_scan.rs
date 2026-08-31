@@ -16,7 +16,7 @@
 //! Querier-side scan of segment-WAL objects (DESIGN-SEGMENT-WAL.md).
 //!
 //! Recent, not-yet-built segments must be queryable with exactly-once
-//! semantics. The leader seam ([`leader_append_segments`]) runs after the
+//! semantics. The leader seam ([`append_surviving`]) runs after the
 //! file_list snapshot is fetched and appends the surviving segments as
 //! pseudo-files; the follower seam ([`search`]) resolves and scans them.
 //!
@@ -60,7 +60,15 @@
 //!   serve a Built status whose L0 file_list rows have not replicated yet, reopening the gap this
 //!   ordering closes.
 
-use std::{cmp::Reverse, collections::BinaryHeap, sync::Arc};
+use std::{
+    cmp::Reverse,
+    collections::BinaryHeap,
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use arrow::array::{BooleanArray, Int64Array};
 use arrow_schema::Schema;
@@ -70,12 +78,14 @@ use config::{
     metrics,
     utils::record_batch_ext::{RecordBatchExt, concat_batches},
 };
+use dashmap::{DashMap, mapref::entry::Entry};
 use datafusion::{arrow::record_batch::RecordBatch, datasource::TableProvider};
+use futures::StreamExt;
 use hashbrown::{HashMap, HashSet};
 use infra::{
     cache::file_data,
     errors::{Error, Result},
-    file_list::FileId,
+    file_list::{FileId, FileIdWithFile},
     wal_segments::{self, SegmentMeta},
 };
 
@@ -142,6 +152,326 @@ fn segment_scan_budgets() -> (usize, usize) {
 /// default/empty account (see `segment_wal::uploader`).
 const SEGMENT_STORAGE_ACCOUNT: &str = "";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SegmentFetchSource {
+    Memory,
+    Disk,
+    Remote,
+    Coalesced,
+}
+
+struct SharedSegmentFetch {
+    bytes: bytes::Bytes,
+    source: SegmentFetchSource,
+    cache_lookup: Duration,
+    remote_fetch: Duration,
+    cache_lookup_metric_claimed: AtomicBool,
+    remote_metric_claimed: AtomicBool,
+}
+
+type SharedSegmentFetchResult = std::result::Result<Arc<SharedSegmentFetch>, Arc<str>>;
+type SharedSegmentFetchCell = tokio::sync::OnceCell<SharedSegmentFetchResult>;
+
+static INFLIGHT_SEGMENT_FETCHES: LazyLock<DashMap<String, Arc<SharedSegmentFetchCell>>> =
+    LazyLock::new(DashMap::new);
+
+struct InflightSegmentFetchCleanup {
+    key: String,
+    cell: Arc<SharedSegmentFetchCell>,
+    armed: bool,
+}
+
+impl Drop for InflightSegmentFetchCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Hold the DashMap shard lock while proving that only the map and
+        // this guard own an uninitialized cell. Otherwise a new waiter can
+        // clone the cell between strong_count and remove, then race a second
+        // initializer installed under the same key.
+        if let Entry::Occupied(entry) = INFLIGHT_SEGMENT_FETCHES.entry(self.key.clone())
+            && Arc::ptr_eq(entry.get(), &self.cell)
+            && !entry.get().initialized()
+            && Arc::strong_count(entry.get()) == 2
+        {
+            entry.remove();
+        }
+    }
+}
+
+fn remove_inflight_segment_fetch(key: &str, cell: &Arc<SharedSegmentFetchCell>) {
+    if let Entry::Occupied(entry) = INFLIGHT_SEGMENT_FETCHES.entry(key.to_string())
+        && Arc::ptr_eq(entry.get(), cell)
+    {
+        entry.remove();
+    }
+}
+
+struct FetchedSegment {
+    bytes: bytes::Bytes,
+    source: SegmentFetchSource,
+    cache_lookup: Duration,
+    fetch_wait: Duration,
+    remote_fetch: Duration,
+}
+
+struct SegmentFetchStats {
+    source: SegmentFetchSource,
+    compressed_size: i64,
+    cache_lookup: Duration,
+    fetch_wait: Duration,
+    remote_fetch: Duration,
+}
+
+impl FetchedSegment {
+    fn into_parts(self) -> (bytes::Bytes, SegmentFetchStats) {
+        let compressed_size = self.bytes.len() as i64;
+        (
+            self.bytes,
+            SegmentFetchStats {
+                source: self.source,
+                compressed_size,
+                cache_lookup: self.cache_lookup,
+                fetch_wait: self.fetch_wait,
+                remote_fetch: self.remote_fetch,
+            },
+        )
+    }
+}
+
+#[derive(Default)]
+struct SegmentScanTimings {
+    memory_hits: u64,
+    disk_hits: u64,
+    remote_fetches: u64,
+    coalesced_fetches: u64,
+    cache_lookup_sum: Duration,
+    cache_lookup_max: Duration,
+    fetch_wait_sum: Duration,
+    fetch_wait_max: Duration,
+    remote_fetch_sum: Duration,
+    remote_fetch_max: Duration,
+    blocking_queue_sum: Duration,
+    blocking_queue_max: Duration,
+    decode_sum: Duration,
+    decode_max: Duration,
+}
+
+impl SegmentScanTimings {
+    fn record_fetch(&mut self, fetched: &SegmentFetchStats) {
+        match fetched.source {
+            SegmentFetchSource::Memory => self.memory_hits += 1,
+            SegmentFetchSource::Disk => self.disk_hits += 1,
+            SegmentFetchSource::Remote => self.remote_fetches += 1,
+            SegmentFetchSource::Coalesced => self.coalesced_fetches += 1,
+        }
+        self.cache_lookup_sum += fetched.cache_lookup;
+        self.cache_lookup_max = self.cache_lookup_max.max(fetched.cache_lookup);
+        self.fetch_wait_sum += fetched.fetch_wait;
+        self.fetch_wait_max = self.fetch_wait_max.max(fetched.fetch_wait);
+        self.remote_fetch_sum += fetched.remote_fetch;
+        self.remote_fetch_max = self.remote_fetch_max.max(fetched.remote_fetch);
+    }
+
+    fn record_decode(&mut self, blocking_queue: Duration, decode: Duration) {
+        self.blocking_queue_sum += blocking_queue;
+        self.blocking_queue_max = self.blocking_queue_max.max(blocking_queue);
+        self.decode_sum += decode;
+        self.decode_max = self.decode_max.max(decode);
+    }
+
+    fn apply_cache_stats(&self, scan_stats: &mut ScanStats) {
+        scan_stats.querier_memory_cached_files += self.memory_hits as i64;
+        scan_stats.querier_disk_cached_files += self.disk_hits as i64;
+    }
+}
+
+fn record_segment_cache_outcome(
+    org_id: &str,
+    stream_type: StreamType,
+    source: Option<SegmentFetchSource>,
+) {
+    let metric = if matches!(
+        source,
+        Some(SegmentFetchSource::Memory | SegmentFetchSource::Disk)
+    ) {
+        &metrics::QUERY_DISK_CACHE_HIT_COUNT
+    } else {
+        &metrics::QUERY_DISK_CACHE_MISS_COUNT
+    };
+    metric
+        .with_label_values(&[org_id, stream_type.as_str(), "segment"])
+        .inc();
+}
+
+async fn read_segment_cache(
+    object_key: &str,
+    expected_size: usize,
+) -> Option<(bytes::Bytes, SegmentFetchSource)> {
+    let cached = if let Some(bytes) = file_data::memory::get(object_key, None).await {
+        Some((bytes, SegmentFetchSource::Memory))
+    } else {
+        file_data::disk::get(object_key, None)
+            .await
+            .map(|bytes| (bytes, SegmentFetchSource::Disk))
+    };
+    let (bytes, source) = cached?;
+    if bytes.len() == expected_size {
+        return Some((bytes, source));
+    }
+    log::warn!(
+        "[SEGMENT:SCAN] cached segment object {object_key} has size {}, expected {expected_size}; evicting it before a verified remote read",
+        bytes.len()
+    );
+    if let Err(e) = file_data::memory::remove(object_key).await {
+        log::warn!("[SEGMENT:SCAN] could not evict {object_key} from memory cache: {e:#}");
+    }
+    if let Err(e) = file_data::disk::remove(object_key).await {
+        log::warn!("[SEGMENT:SCAN] could not evict {object_key} from disk cache: {e:#}");
+    }
+    None
+}
+async fn fetch_segment(meta: &SegmentMeta) -> Result<FetchedSegment> {
+    let expected_size = usize::try_from(meta.size)
+        .ok()
+        .filter(|size| *size > 0)
+        .ok_or_else(|| {
+            Error::Message(format!(
+                "[SEGMENT:SCAN] segment object {} (id {}) has invalid expected size {}",
+                meta.object_key, meta.id, meta.size
+            ))
+        })?;
+    let fetch_started = Instant::now();
+    let cache_started = Instant::now();
+    if let Some((bytes, source)) = read_segment_cache(&meta.object_key, expected_size).await {
+        return Ok(FetchedSegment {
+            bytes,
+            source,
+            cache_lookup: cache_started.elapsed(),
+            fetch_wait: fetch_started.elapsed(),
+            remote_fetch: Duration::ZERO,
+        });
+    }
+    let cache_lookup = cache_started.elapsed();
+
+    let cell = match INFLIGHT_SEGMENT_FETCHES.entry(meta.object_key.clone()) {
+        Entry::Occupied(entry) => Arc::clone(entry.get()),
+        Entry::Vacant(entry) => {
+            let cell = Arc::new(tokio::sync::OnceCell::new());
+            entry.insert(Arc::clone(&cell));
+            cell
+        }
+    };
+    let mut cleanup = InflightSegmentFetchCleanup {
+        key: meta.object_key.clone(),
+        cell,
+        armed: true,
+    };
+    let object_key = meta.object_key.clone();
+    let shared = cleanup
+        .cell
+        .get_or_init(|| async {
+            // A cache fill can win between the caller's first lookup and its
+            // singleflight slot. Recheck before issuing the only remote GET.
+            let recheck_started = Instant::now();
+            let rechecked = read_segment_cache(&object_key, expected_size).await;
+            let recheck_lookup = recheck_started.elapsed();
+            if let Some((bytes, source)) = rechecked {
+                return Ok(Arc::new(SharedSegmentFetch {
+                    bytes,
+                    source,
+                    cache_lookup: recheck_lookup,
+                    remote_fetch: Duration::ZERO,
+                    cache_lookup_metric_claimed: AtomicBool::new(false),
+                    remote_metric_claimed: AtomicBool::new(false),
+                }));
+            }
+
+            let remote_started = Instant::now();
+            let (_, bytes) = file_data::download_from_storage_exact(
+                SEGMENT_STORAGE_ACCOUNT,
+                &object_key,
+                expected_size,
+            )
+            .await
+            .map_err(|e| {
+                Arc::<str>::from(format!(
+                    "fetch segment object {object_key} from storage failed: {e:#}"
+                ))
+            })?;
+            let remote_fetch = remote_started.elapsed();
+            if let Err(e) = file_data::set(&object_key, bytes.clone()).await {
+                log::warn!(
+                    "[SEGMENT:SCAN] fetched segment object {object_key} but could not populate the query cache: {e:#}"
+                );
+            }
+            Ok(Arc::new(SharedSegmentFetch {
+                bytes,
+                source: SegmentFetchSource::Remote,
+                cache_lookup: recheck_lookup,
+                remote_fetch,
+                cache_lookup_metric_claimed: AtomicBool::new(false),
+                remote_metric_claimed: AtomicBool::new(false),
+            }))
+        })
+        .await
+        .clone();
+    // Successful and failed initializations are both one-shot. Remove the
+    // published cell before interpreting the result so a transient storage
+    // failure cannot poison this object key forever.
+    remove_inflight_segment_fetch(&cleanup.key, &cleanup.cell);
+    cleanup.armed = false;
+    let shared = shared.map_err(|e| {
+        Error::Message(format!(
+            "[SEGMENT:SCAN] fetch segment object {} (id {}) failed: {e}",
+            meta.object_key, meta.id
+        ))
+    })?;
+
+    let shared_cache_lookup = if !shared
+        .cache_lookup_metric_claimed
+        .swap(true, Ordering::AcqRel)
+    {
+        shared.cache_lookup
+    } else {
+        Duration::ZERO
+    };
+    let (source, remote_fetch) = if shared.source == SegmentFetchSource::Remote {
+        if !shared.remote_metric_claimed.swap(true, Ordering::AcqRel) {
+            (SegmentFetchSource::Remote, shared.remote_fetch)
+        } else {
+            (SegmentFetchSource::Coalesced, Duration::ZERO)
+        }
+    } else {
+        (shared.source, Duration::ZERO)
+    };
+    Ok(FetchedSegment {
+        bytes: shared.bytes.clone(),
+        source,
+        cache_lookup: cache_lookup + shared_cache_lookup,
+        fetch_wait: fetch_started.elapsed(),
+        remote_fetch,
+    })
+}
+
+const SEGMENT_FETCH_PERMIT_BYTES: usize = 1024 * 1024;
+
+fn segment_fetch_budget_permits() -> usize {
+    let soft = get_config().limit.segment_scan_max_bytes;
+    let bytes = if soft == 0 { 512 * 1024 * 1024 } else { soft };
+    bytes.div_ceil(SEGMENT_FETCH_PERMIT_BYTES).max(1)
+}
+
+fn segment_permits(size: i64, budget_permits: usize) -> u32 {
+    let bytes = usize::try_from(size).unwrap_or(SEGMENT_FETCH_PERMIT_BYTES);
+    bytes
+        .div_ceil(SEGMENT_FETCH_PERMIT_BYTES)
+        .max(1)
+        .min(budget_permits)
+        .min(u32::MAX as usize) as u32
+}
+
 // ---------------------------------------------------------------------------
 // leader side
 // ---------------------------------------------------------------------------
@@ -203,47 +533,45 @@ fn apply_query_cap(
     )
 }
 
+/// Split one causally consistent file-list snapshot into the compact ids sent
+/// to followers and the L0 provenance ranges used to suppress duplicate
+/// segment candidates. Keeping both projections from one query removes the
+/// previous second file-list query and prevents its result from drifting past
+/// the snapshot the query actually scans.
+pub fn split_snapshot_file_ids(snapshot: Vec<FileIdWithFile>) -> (Vec<FileId>, Vec<(i64, i64)>) {
+    let mut files = Vec::with_capacity(snapshot.len());
+    let mut l0_ranges = Vec::new();
+    for row in snapshot {
+        if let Some(range) = parse_l0_range(&row.file) {
+            l0_ranges.push(range);
+        }
+        files.push(FileId {
+            id: row.id,
+            records: row.records,
+            original_size: row.original_size,
+            deleted: row.deleted,
+        });
+    }
+    (files, l0_ranges)
+}
+
 /// Leader seam, phase 2 — runs AFTER the file_list snapshot is fetched:
-/// dedup phase-1 candidates against the snapshot's `l0_` provenance and
-/// append the survivors as negative-id pseudo-files.
-pub async fn append_surviving(
+/// dedup phase-1 candidates against that same snapshot's `l0_` provenance
+/// and append the survivors as negative-id pseudo-files.
+pub fn append_surviving(
     trace_id: &str,
     org_id: &str,
     stream_type: StreamType,
     stream_name: &str,
     candidates: Vec<SegmentMeta>,
+    l0_ranges: &[(i64, i64)],
     files: &mut Vec<FileId>,
 ) -> Result<()> {
     if candidates.is_empty() {
         return Ok(());
     }
 
-    // Provenance dedup needs the SNAPSHOT files' names, but the snapshot was
-    // fetched id-only. Re-query keys over the candidates' (narrow) time
-    // window and keep only rows whose id is in the snapshot — a key fetched
-    // here that the snapshot does not contain must not suppress a candidate
-    // (its data will not be scanned by this query).
-    let snapshot_ids: HashSet<i64> = files.iter().map(|f| f.id).collect();
-    let (window_min, window_max) = candidates
-        .iter()
-        .fold((i64::MAX, i64::MIN), |(min, max), c| {
-            (min.min(c.min_ts), max.max(c.max_ts))
-        });
-    let recent_files = crate::service::file_list::query(
-        trace_id,
-        org_id,
-        stream_type,
-        stream_name,
-        infra::schema::get_partition_time_level(stream_type),
-        window_min,
-        window_max,
-    )
-    .await?;
-    let l0_ranges = l0_ranges_in_snapshot(
-        recent_files.iter().map(|f| (f.id, f.key.as_str())),
-        &snapshot_ids,
-    );
-    let survivors = dedup_candidates(candidates, &l0_ranges);
+    let survivors = dedup_candidates(candidates, l0_ranges);
     if survivors.is_empty() {
         return Ok(());
     }
@@ -304,17 +632,6 @@ fn parse_l0_range(key: &str) -> Option<(i64, i64)> {
         return None;
     }
     Some((min, max))
-}
-
-/// Collect the provenance ranges of every L0 file that is IN the snapshot.
-fn l0_ranges_in_snapshot<'a>(
-    files: impl Iterator<Item = (i64, &'a str)>,
-    snapshot_ids: &HashSet<i64>,
-) -> Vec<(i64, i64)> {
-    files
-        .filter(|(id, _)| snapshot_ids.contains(id))
-        .filter_map(|(_, key)| parse_l0_range(key))
-        .collect()
 }
 
 /// Drop every candidate whose id falls inside any registered L0 range — its
@@ -411,26 +728,6 @@ pub async fn search(
     scan_stats.files = metas.len() as i64;
     scan_stats.querier_files = scan_stats.files;
 
-    // Warm the disk-backed file cache exactly the way parquet files are
-    // warmed: cache hits are counted into scan_stats, misses are queued for
-    // background download so repeated dashboards hit the disk cache. The
-    // reads below go through the same cache and fall back to object storage
-    // for anything not yet downloaded.
-    let account = SEGMENT_STORAGE_ACCOUNT.to_string();
-    let cache_tuples = metas
-        .iter()
-        .map(|m| (-m.id, &account, &m.object_key, m.size, m.max_ts, 0i64))
-        .collect::<Vec<_>>();
-    let (_cache_type, cache_hits, cache_misses) =
-        ::search::file_cache::cache_files(trace_id, &cache_tuples, &mut scan_stats, "segment")
-            .await;
-    metrics::QUERY_DISK_CACHE_HIT_COUNT
-        .with_label_values(&[query.org_id.as_str(), query.stream_type.as_str(), "segment"])
-        .inc_by(cache_hits);
-    metrics::QUERY_DISK_CACHE_MISS_COUNT
-        .with_label_values(&[query.org_id.as_str(), query.stream_type.as_str(), "segment"])
-        .inc_by(cache_misses);
-
     // check memory circuit breaker before decoding anything
     ingester::check_memory_circuit_breaker().map_err(|e| Error::ResourceError(e.to_string()))?;
 
@@ -451,18 +748,13 @@ pub async fn search(
     }
     needed_columns.insert(TIMESTAMP_COL_NAME.to_string());
 
-    // Fetch + decode in WAVES of decode_wave segments. Decode is STREAMING
-    // (`decode_segment_filtered`): the zstd payload decompresses frame by
-    // frame, other streams' frames skip IPC parsing entirely (segments are
-    // mixed-stream — a logs query used to pay full IPC parse of the
-    // trace-heavy tail), and each kept frame is condition-pruned and
-    // projected to plan-needed columns INSIDE the blocking stage — so a
-    // wave slot's peak is one frame plus its post-projection remnant,
-    // never a whole decoded payload. Trimming and budgeting stay
-    // sequential below (the top-n heap is shared), and the top-n segment
-    // skip re-evaluates between submissions so a threshold locked by wave
-    // 1 skips every older segment before it is ever fetched.
-    let decode_wave = get_config().common.segment_scan_decode_wave.max(1);
+    // The ordered top-n path keeps bounded decode waves because trimming
+    // mutates one running threshold between waves. Reads are now foreground
+    // read-through cache fills: one miss performs one remote GET, and
+    // concurrent queries for the same object share that GET instead of
+    // racing a detached cache warmer. Decode remains streaming, so one slot
+    // retains at most one frame plus its projected remnant.
+    let decode_wave = get_config().common.segment_scan_decode_concurrency.max(1);
     let needed_columns = Arc::new(needed_columns);
     let mut kept_batches: Vec<RecordBatch> = Vec::new();
     let mut kept_bytes: usize = 0;
@@ -471,6 +763,7 @@ pub async fn search(
     // split by WHY — sizing input for the structural fixes
     let mut zero_yield_stream_absent = 0usize;
     let mut zero_yield_time_pruned = 0usize;
+    let mut timings = SegmentScanTimings::default();
     let mut skipped_by_top_n: usize = 0;
     let mut next_meta: usize = 0;
     while next_meta < metas.len() {
@@ -510,20 +803,26 @@ pub async fn search(
             let fst_fields = fst_fields.clone();
             let needed_columns = Arc::clone(&needed_columns);
             async move {
-                let bytes = file_data::get(SEGMENT_STORAGE_ACCOUNT, &meta.object_key, None)
-                    .await
-                    .map_err(|e| {
-                        Error::Message(format!(
-                            "[SEGMENT:SCAN] fetch segment object {} (id {}) failed: {e}",
-                            meta.object_key, meta.id
-                        ))
-                    })?;
-                let compressed_len = bytes.len();
+                let fetched = match fetch_segment(meta).await {
+                    Ok(fetched) => {
+                        record_segment_cache_outcome(&org_id, stream_type, Some(fetched.source));
+                        fetched
+                    }
+                    Err(err) => {
+                        record_segment_cache_outcome(&org_id, stream_type, None);
+                        return Err(err);
+                    }
+                };
+                let (bytes, fetch_stats) = fetched.into_parts();
                 let object_key = meta.object_key.clone();
+                let submitted = Instant::now();
                 // zstd + arrow ipc + prune/project — keep it off the async
-                // workers
-                let scanned = tokio::task::spawn_blocking(move || {
-                    scan_segment_object(
+                // workers and account blocking-pool queueing separately.
+                let (blocking_queue, decode, scanned) =
+                    tokio::task::spawn_blocking(move || {
+                        let blocking_queue = submitted.elapsed();
+                        let decode_started = Instant::now();
+                        let scanned = scan_segment_object(
                         &bytes,
                         &org_id,
                         stream_type,
@@ -537,7 +836,8 @@ pub async fn search(
                         Error::Message(format!(
                             "[SEGMENT:SCAN] decode segment object {object_key} failed: {e:#}"
                         ))
-                    })
+                        });
+                        (blocking_queue, decode_started.elapsed(), scanned)
                 })
                 .await
                 .map_err(|e| {
@@ -545,13 +845,15 @@ pub async fn search(
                         "[SEGMENT:SCAN] decode task for segment object {} (id {}) did not complete: {e}",
                         meta.object_key, meta.id
                     ))
-                })??;
-                Ok::<_, Error>((compressed_len, scanned))
+                    })?;
+                Ok::<_, Error>((fetch_stats, blocking_queue, decode, scanned?))
             }
         }))
         .await?;
-        for (compressed_len, scanned) in decoded {
-            scan_stats.compressed_size += compressed_len as i64;
+        for (fetch_stats, blocking_queue, decode, scanned) in decoded {
+            timings.record_fetch(&fetch_stats);
+            timings.record_decode(blocking_queue, decode);
+            scan_stats.compressed_size += fetch_stats.compressed_size;
             scan_stats.records += scanned.rows_examined;
             if scanned.stream_frames == 0 {
                 zero_yield_stream_absent += 1;
@@ -588,6 +890,7 @@ pub async fn search(
         }
         tokio::task::coop::consume_budget().await;
     }
+    timings.apply_cache_stats(&mut scan_stats);
     // scan_size for the segment branch = the bytes the query actually HELD
     // after prune/project/trim (what the budget guarded). Summing decoded
     // batch capacities double-counted the shared IPC body buffer per batch
@@ -595,7 +898,7 @@ pub async fn search(
     scan_stats.original_size = kept_bytes as i64;
 
     log::info!(
-        "[trace_id {trace_id}] segments_scan: {}/{}/{} loaded {} segments ({} skipped by top-n), kept {} batches, records {}, scan_size {}, zero-yield {} stream-absent + {} time-pruned, took {} ms",
+        "[trace_id {trace_id}] segments_scan: {}/{}/{} loaded {} segments ({} skipped by top-n), kept {} batches, records {}, scan_size {}, zero-yield {} stream-absent + {} time-pruned, cache memory/disk/remote/coalesced {}/{}/{}/{}, phase_ms lookup sum/max {}/{}, fetch-wait sum/max {}/{}, remote sum/max {}/{}, blocking-queue sum/max {}/{}, decode sum/max {}/{}, took {} ms",
         query.org_id,
         query.stream_type,
         query.stream_name,
@@ -606,6 +909,20 @@ pub async fn search(
         scan_stats.original_size,
         zero_yield_stream_absent,
         zero_yield_time_pruned,
+        timings.memory_hits,
+        timings.disk_hits,
+        timings.remote_fetches,
+        timings.coalesced_fetches,
+        timings.cache_lookup_sum.as_millis(),
+        timings.cache_lookup_max.as_millis(),
+        timings.fetch_wait_sum.as_millis(),
+        timings.fetch_wait_max.as_millis(),
+        timings.remote_fetch_sum.as_millis(),
+        timings.remote_fetch_max.as_millis(),
+        timings.blocking_queue_sum.as_millis(),
+        timings.blocking_queue_max.as_millis(),
+        timings.decode_sum.as_millis(),
+        timings.decode_max.as_millis(),
         load_start.elapsed().as_millis(),
     );
 
@@ -664,57 +981,97 @@ pub async fn search_histogram(
     scan_stats.files = metas.len() as i64;
     scan_stats.querier_files = scan_stats.files;
 
-    // Keep cache warming and its accounting identical to the regular
-    // segment scan. Reads below use the same cache-backed accessor.
-    let account = SEGMENT_STORAGE_ACCOUNT.to_string();
-    let cache_tuples = metas
-        .iter()
-        .map(|m| (-m.id, &account, &m.object_key, m.size, m.max_ts, 0i64))
-        .collect::<Vec<_>>();
-    let (_cache_type, cache_hits, cache_misses) =
-        ::search::file_cache::cache_files(trace_id, &cache_tuples, &mut scan_stats, "segment")
-            .await;
-    metrics::QUERY_DISK_CACHE_HIT_COUNT
-        .with_label_values(&[query.org_id.as_str(), query.stream_type.as_str(), "segment"])
-        .inc_by(cache_hits);
-    metrics::QUERY_DISK_CACHE_MISS_COUNT
-        .with_label_values(&[query.org_id.as_str(), query.stream_type.as_str(), "segment"])
-        .inc_by(cache_misses);
-
     ingester::check_memory_circuit_breaker().map_err(|e| Error::ResourceError(e.to_string()))?;
 
-    // Match the regular path's bounded fetch/decode waves. A wave retains
-    // only one fixed counter vector per in-flight segment; decoded
-    // RecordBatches live solely for the duration of their frame callback.
-    let decode_wave = get_config().common.segment_scan_decode_wave.max(1);
-    let mut next_meta = 0usize;
-    while next_meta < metas.len() {
-        let wave_end = (next_meta + decode_wave).min(metas.len());
-        let wave = &metas[next_meta..wave_end];
-        next_meta = wave_end;
-        let decoded = futures::future::try_join_all(wave.iter().map(|meta| {
-            let org_id = query.org_id.clone();
-            let stream_type = query.stream_type;
-            let stream_name = query.stream_name.clone();
-            let time_range = query.time_range;
+    // Fetch and decode are separate bounded stages. The old fixed waves
+    // waited for the slowest GET+decode before submitting any work from the
+    // next wave, amplifying small-object latency. The channel keeps fetches
+    // moving while at most `decode_concurrency` blocking tasks consume prior
+    // results. Byte permits cover active reads, queued objects, and objects
+    // being decoded, so higher fetch concurrency cannot grow memory without
+    // bound. Dropping either future cancels all async reads; only already
+    // running spawn_blocking calls (bounded by decode_concurrency) finish.
+    let fetch_concurrency = get_config().common.segment_scan_fetch_concurrency.max(1);
+    let decode_concurrency = get_config().common.segment_scan_decode_concurrency.max(1);
+    let fetch_budget_permits = segment_fetch_budget_permits();
+    let fetch_budget = Arc::new(tokio::sync::Semaphore::new(fetch_budget_permits));
+    let channel_capacity = fetch_concurrency.max(decode_concurrency);
+    let (tx, rx) = tokio::sync::mpsc::channel::<
+        Result<(
+            SegmentMeta,
+            FetchedSegment,
+            tokio::sync::OwnedSemaphorePermit,
+        )>,
+    >(channel_capacity);
+    let metas_len = metas.len();
+    let metric_org_id = query.org_id.clone();
+    let metric_stream_type = query.stream_type;
+
+    let producer = async move {
+        let mut fetches = futures::stream::iter(metas.into_iter())
+            .map(|meta| {
+                let fetch_budget = Arc::clone(&fetch_budget);
             async move {
-                let bytes = file_data::get(SEGMENT_STORAGE_ACCOUNT, &meta.object_key, None)
+                    let permit_count = segment_permits(meta.size, fetch_budget_permits);
+                    let permit = fetch_budget
+                        .acquire_many_owned(permit_count)
                     .await
-                    .map_err(|e| {
-                        Error::Message(format!(
-                            "[SEGMENT:SCAN] fetch segment object {} (id {}) failed: {e}",
-                            meta.object_key, meta.id
-                        ))
+                        .map_err(|_| {
+                            Error::Message(
+                                "[SEGMENT:SCAN] compressed-byte fetch budget closed".to_string(),
+                            )
                     })?;
-                let compressed_len = bytes.len();
+                    let fetched = fetch_segment(&meta).await?;
+                    Ok::<_, Error>((meta, fetched, permit))
+                }
+            })
+            .buffer_unordered(fetch_concurrency);
+        while let Some(result) = fetches.next().await {
+            match result.as_ref() {
+                Ok((_, fetched, _)) => record_segment_cache_outcome(
+                    &metric_org_id,
+                    metric_stream_type,
+                    Some(fetched.source),
+                ),
+                Err(_) => record_segment_cache_outcome(&metric_org_id, metric_stream_type, None),
+            }
+            let failed = result.is_err();
+            if tx.send(result).await.is_err() {
+                break;
+            }
+            if failed {
+                break;
+            }
+        }
+        Ok::<_, Error>(())
+    };
+
+    let consumer_query = Arc::clone(&query);
+    let consumer = async {
+        let received = futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        });
+        let decoded = received
+            .map(|result| {
+                let query = Arc::clone(&consumer_query);
+                async move {
+                    let (meta, fetched, permit) = result?;
+                    let (bytes, fetch_stats) = fetched.into_parts();
                 let object_key = meta.object_key.clone();
-                let scanned = tokio::task::spawn_blocking(move || {
-                    scan_segment_histogram(
+                    let submitted = Instant::now();
+                    let (permit, blocking_queue, decode, scanned) =
+                        tokio::task::spawn_blocking(move || {
+                            // The permit enters the blocking closure so query
+                            // cancellation cannot release byte accounting
+                            // while an orphaned decode still retains `bytes`.
+                            let blocking_queue = submitted.elapsed();
+                            let decode_started = Instant::now();
+                            let scanned = scan_segment_histogram(
                         &bytes,
-                        &org_id,
-                        stream_type,
-                        &stream_name,
-                        time_range,
+                                &query.org_id,
+                                query.stream_type,
+                                &query.stream_name,
+                                query.time_range,
                         min_value,
                         bucket_width,
                         num_buckets,
@@ -724,7 +1081,13 @@ pub async fn search_histogram(
                         Error::Message(format!(
                             "[SEGMENT:SCAN] decode segment object {object_key} failed: {e:#}"
                         ))
-                    })
+                            });
+                            (
+                                permit,
+                                blocking_queue,
+                                decode_started.elapsed(),
+                                scanned,
+                            )
                 })
                 .await
                 .map_err(|e| {
@@ -732,32 +1095,59 @@ pub async fn search_histogram(
                         "[SEGMENT:SCAN] decode task for segment object {} (id {}) did not complete: {e}",
                         meta.object_key, meta.id
                     ))
-                })??;
-                Ok::<_, Error>((compressed_len, scanned))
+                        })?;
+                    Ok::<_, Error>((fetch_stats, permit, blocking_queue, decode, scanned?))
             }
-        }))
-        .await?;
+            })
+            .buffer_unordered(decode_concurrency);
+        futures::pin_mut!(decoded);
 
-        for (compressed_len, scanned) in decoded {
-            scan_stats.compressed_size += compressed_len as i64;
+        let mut timings = SegmentScanTimings::default();
+        while let Some(result) = decoded.next().await {
+            let (fetch_stats, permit, blocking_queue, decode, scanned) = result?;
+            timings.record_fetch(&fetch_stats);
+            timings.record_decode(blocking_queue, decode);
+            scan_stats.compressed_size += fetch_stats.compressed_size;
+            drop(permit);
             scan_stats.records += scanned.rows_examined;
             for (total, count) in histogram.iter_mut().zip(scanned.histogram) {
                 *total = total.checked_add(count).ok_or_else(|| {
                     Error::Message("[SEGMENT:SCAN] histogram count overflow".to_string())
                 })?;
             }
-        }
         tokio::task::coop::consume_budget().await;
     }
+        Ok::<_, Error>(timings)
+    };
+
+    let (_, timings) = tokio::try_join!(producer, consumer)?;
+    timings.apply_cache_stats(&mut scan_stats);
 
     log::info!(
-        "[trace_id {trace_id}] segments_scan histogram: {}/{}/{} loaded {} segments, records {}, compressed_size {}, took {} ms",
+        "[trace_id {trace_id}] segments_scan histogram: {}/{}/{} loaded {} segments, records {}, compressed_size {}, concurrency fetch/decode {}/{}, budget_mib {}, cache memory/disk/remote/coalesced {}/{}/{}/{}, phase_ms lookup sum/max {}/{}, fetch-wait sum/max {}/{}, remote sum/max {}/{}, blocking-queue sum/max {}/{}, decode sum/max {}/{}, took {} ms",
         query.org_id,
         query.stream_type,
         query.stream_name,
-        metas.len(),
+        metas_len,
         scan_stats.records,
         scan_stats.compressed_size,
+        fetch_concurrency,
+        decode_concurrency,
+        fetch_budget_permits * SEGMENT_FETCH_PERMIT_BYTES / (1024 * 1024),
+        timings.memory_hits,
+        timings.disk_hits,
+        timings.remote_fetches,
+        timings.coalesced_fetches,
+        timings.cache_lookup_sum.as_millis(),
+        timings.cache_lookup_max.as_millis(),
+        timings.fetch_wait_sum.as_millis(),
+        timings.fetch_wait_max.as_millis(),
+        timings.remote_fetch_sum.as_millis(),
+        timings.remote_fetch_max.as_millis(),
+        timings.blocking_queue_sum.as_millis(),
+        timings.blocking_queue_max.as_millis(),
+        timings.decode_sum.as_millis(),
+        timings.decode_max.as_millis(),
         load_start.elapsed().as_millis(),
     );
     Ok((histogram, scan_stats))
@@ -1443,6 +1833,64 @@ fn group_by_batch_schema(batches: Vec<RecordBatch>) -> HashMap<Arc<Schema>, Vec<
 mod tests {
     use arrow::array::{Int64Array, StringArray};
 
+    #[test]
+    fn segment_fetch_permits_are_bounded_and_never_zero() {
+        assert_eq!(segment_permits(-1, 512), 1);
+        assert_eq!(segment_permits(0, 512), 1);
+        assert_eq!(segment_permits(1, 512), 1);
+        assert_eq!(
+            segment_permits(SEGMENT_FETCH_PERMIT_BYTES as i64 + 1, 512),
+            2
+        );
+        assert_eq!(segment_permits(i64::MAX, 7), 7);
+        assert_eq!(segment_permits(i64::MAX, usize::MAX), u32::MAX);
+    }
+
+    #[test]
+    fn cancelled_last_waiter_removes_uninitialized_singleflight_cell() {
+        let key = "segments_scan_test_cancelled_last_waiter";
+        INFLIGHT_SEGMENT_FETCHES.remove(key);
+        let cell = Arc::new(SharedSegmentFetchCell::new());
+        INFLIGHT_SEGMENT_FETCHES.insert(key.to_string(), Arc::clone(&cell));
+        let first = InflightSegmentFetchCleanup {
+            key: key.to_string(),
+            cell: Arc::clone(&cell),
+            armed: true,
+        };
+        let last = InflightSegmentFetchCleanup {
+            key: key.to_string(),
+            cell: Arc::clone(&cell),
+            armed: true,
+        };
+        drop(cell);
+
+        drop(first);
+        assert!(INFLIGHT_SEGMENT_FETCHES.contains_key(key));
+        drop(last);
+        assert!(!INFLIGHT_SEGMENT_FETCHES.contains_key(key));
+    }
+
+    #[test]
+    fn initialized_error_cell_can_be_removed_before_retry() {
+        let key = "segments_scan_test_initialized_error";
+        INFLIGHT_SEGMENT_FETCHES.remove(key);
+        let failed = Arc::new(SharedSegmentFetchCell::new());
+        assert!(
+            failed
+                .set(Err(Arc::<str>::from("transient storage failure")))
+                .is_ok()
+        );
+        INFLIGHT_SEGMENT_FETCHES.insert(key.to_string(), Arc::clone(&failed));
+
+        remove_inflight_segment_fetch(key, &failed);
+        assert!(!INFLIGHT_SEGMENT_FETCHES.contains_key(key));
+
+        let retry = Arc::new(SharedSegmentFetchCell::new());
+        INFLIGHT_SEGMENT_FETCHES.insert(key.to_string(), Arc::clone(&retry));
+        assert!(!Arc::ptr_eq(&failed, &retry));
+        INFLIGHT_SEGMENT_FETCHES.remove(key);
+    }
+
     /// THE prod failure this guards against (2026-08-01): `trace_id = X`
     /// over a wide range hit 3 rows but died at the 512MB scan budget
     /// because the WHOLE live backlog counted against it. The prune keeps
@@ -2115,18 +2563,34 @@ mod tests {
     }
 
     #[test]
-    fn l0_ranges_only_counted_from_snapshot_members() {
-        // the L0 registered after the snapshot (id NOT in snapshot) must be
-        // ignored — honoring it would drop a segment whose rows the query
-        // will not scan from files (a gap)
-        let snapshot: HashSet<i64> = [100, 101].into_iter().collect();
-        let files = vec![
-            (100i64, "files/o/logs/s/l0_u_2_9_3.vix"),   // in snapshot
-            (999i64, "files/o/logs/s/l0_u_10_20_2.vix"), // NOT in snapshot
-            (101i64, "files/o/logs/s/plain_file.parquet"), // in snapshot, not l0
+    fn snapshot_projection_keeps_ids_and_l0_ranges_from_the_same_rows() {
+        let snapshot = vec![
+            FileIdWithFile {
+                id: 100,
+                file: "files/o/logs/s/l0_u_2_9_3.vix".to_string(),
+                records: 11,
+                original_size: 101,
+                deleted: false,
+            },
+            FileIdWithFile {
+                id: 101,
+                file: "files/o/logs/s/plain_file.parquet".to_string(),
+                records: 12,
+                original_size: 102,
+                deleted: true,
+            },
         ];
-        let ranges = l0_ranges_in_snapshot(files.into_iter(), &snapshot);
+        let (files, ranges) = split_snapshot_file_ids(snapshot);
         assert_eq!(ranges, vec![(2, 9)]);
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].id, 100);
+        assert_eq!(files[0].records, 11);
+        assert_eq!(files[0].original_size, 101);
+        assert!(!files[0].deleted);
+        assert_eq!(files[1].id, 101);
+        assert_eq!(files[1].records, 12);
+        assert_eq!(files[1].original_size, 102);
+        assert!(files[1].deleted);
     }
 
     // ---- pseudo id transport ----

@@ -27,7 +27,7 @@ use config::{
 use hashbrown::HashMap;
 use infra::{
     errors,
-    file_list::{FileId, FileRecord, calculate_max_ts_upper_bound},
+    file_list::{FileId, FileIdWithFile, FileRecord, calculate_max_ts_upper_bound},
 };
 use itertools::Itertools;
 use rayon::slice::ParallelSliceMut;
@@ -61,6 +61,7 @@ pub static FILE_LIST_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
 enum QueryType {
     FileRecord,
     FileId,
+    FileIdWithFile,
 }
 
 macro_rules! get_col {
@@ -138,6 +139,27 @@ fn record_batch_to_file_id(rb: RecordBatch) -> Vec<FileId> {
             deleted: false,
         };
         ret.push(t);
+    }
+    ret.par_sort_unstable_by_key(|f| f.id);
+    ret.dedup_by_key(|f| f.id);
+    ret
+}
+
+fn record_batch_to_file_id_with_file(rb: RecordBatch) -> Vec<FileIdWithFile> {
+    get_col!(id_col, "id", Int64Array, rb);
+    get_col!(file_col, "file", StringArray, rb);
+    get_col!(records_col, "records", Int64Array, rb);
+    get_col!(original_size_col, "original_size", Int64Array, rb);
+
+    let mut ret = Vec::with_capacity(rb.num_rows());
+    for idx in 0..rb.num_rows() {
+        ret.push(FileIdWithFile {
+            id: id_col.value(idx),
+            file: file_col.value(idx).to_string(),
+            records: records_col.value(idx),
+            original_size: original_size_col.value(idx),
+            deleted: false,
+        });
     }
     ret.par_sort_unstable_by_key(|f| f.id);
     ret.dedup_by_key(|f| f.id);
@@ -327,6 +349,39 @@ pub async fn query_ids(
     Ok(ret)
 }
 
+pub async fn query_ids_with_file(
+    trace_id: &str,
+    org_id: &str,
+    stream_type: StreamType,
+    stream_name: &str,
+    range: (i64, i64),
+) -> Result<Vec<FileIdWithFile>, errors::Error> {
+    let cfg = get_config();
+    if !cfg.compact.file_list_dump_enabled {
+        return Ok(vec![]);
+    }
+    let start = std::time::Instant::now();
+    let batches = query_inner(
+        trace_id,
+        org_id,
+        stream_type,
+        stream_name,
+        range,
+        &[],
+        QueryType::FileIdWithFile,
+    )
+    .await?;
+    let ret = batches
+        .into_iter()
+        .flat_map(record_batch_to_file_id_with_file)
+        .collect();
+    log::info!(
+        "[FILE_LIST_DUMP {trace_id}] query_ids_with_file took {} ms",
+        start.elapsed().as_millis()
+    );
+    Ok(ret)
+}
+
 async fn query_inner(
     trace_id: &str,
     org_id: &str,
@@ -356,6 +411,7 @@ async fn query_inner(
     let fields = match query_type {
         QueryType::FileRecord => "*",
         QueryType::FileId => "id, records, original_size",
+        QueryType::FileIdWithFile => "id, file, records, original_size",
     };
     let query = if !ids.is_empty() && ids.len() <= 1000 {
         format!(
@@ -695,6 +751,41 @@ mod tests {
         assert_eq!(file_ids.len(), 2);
         assert_eq!(file_ids[0].id, 101);
         assert_eq!(file_ids[1].id, 102);
+    }
+
+    #[test]
+    fn test_record_batch_to_file_id_with_file_conversion_and_deduplication() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("file", DataType::Utf8, false),
+            Field::new("records", DataType::Int64, false),
+            Field::new("original_size", DataType::Int64, false),
+        ]));
+        let rb = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![102, 101, 101])),
+                Arc::new(StringArray::from(vec![
+                    "second.parquet",
+                    "first.parquet",
+                    "first.parquet",
+                ])),
+                Arc::new(Int64Array::from(vec![2000, 1000, 1000])),
+                Arc::new(Int64Array::from(vec![20000, 10000, 10000])),
+            ],
+        )
+        .unwrap();
+
+        let files = record_batch_to_file_id_with_file(rb);
+
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].id, 101);
+        assert_eq!(files[0].file, "first.parquet");
+        assert_eq!(files[0].records, 1000);
+        assert_eq!(files[0].original_size, 10000);
+        assert!(!files[0].deleted);
+        assert_eq!(files[1].id, 102);
+        assert_eq!(files[1].file, "second.parquet");
     }
 
     fn create_test_stats_record_batch() -> RecordBatch {

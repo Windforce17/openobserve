@@ -432,6 +432,12 @@ async fn validate_file_ranged(path: &Path, ftype: FileType) -> Result<(), anyhow
 /// - other transport errors propagate immediately (they were never retried here).
 ///
 /// `fetch` re-opens the object per attempt (injectable for tests).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExpectedSizePolicy {
+    Reconcile,
+    Exact,
+}
+
 async fn download_with_retries<F, Fut>(
     fetch: F,
     file: &str,
@@ -440,7 +446,21 @@ async fn download_with_retries<F, Fut>(
 ) -> Result<usize, anyhow::Error>
 where
     F: Fn() -> Fut,
-    Fut: std::future::Future<Output = object_store::Result<GetResult>>,
+    Fut: Future<Output = object_store::Result<GetResult>>,
+{
+    download_with_retries_policy(fetch, file, size, sink, ExpectedSizePolicy::Reconcile).await
+}
+
+async fn download_with_retries_policy<F, Fut>(
+    fetch: F,
+    file: &str,
+    size: Option<usize>,
+    sink: &mut DownloadSink,
+    size_policy: ExpectedSizePolicy,
+) -> Result<usize, anyhow::Error>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = object_store::Result<GetResult>>,
 {
     let mut data_len: u64 = 0;
     let mut retry_time = 1;
@@ -469,6 +489,14 @@ where
         expected_blob_size = res.meta.size;
         if expected_blob_size == 0 {
             return Err(anyhow::anyhow!("file {} data size is zero", file));
+        }
+        if size_policy == ExpectedSizePolicy::Exact
+            && let Some(size) = size
+            && expected_blob_size != size as u64
+        {
+            return Err(anyhow::anyhow!(
+                "file {file} object-store size {expected_blob_size} differs from registered size {size}; refusing to buffer beyond the caller's byte permit"
+            ));
         }
 
         // stream the body into the sink in bounded chunks (H3: never
@@ -575,6 +603,30 @@ async fn download_from_storage(
     let data_len =
         download_with_retries(|| crate::storage::get(account, file), file, size, &mut sink)
             .await?;
+    let DownloadSink::Buffer(buf) = sink else {
+        unreachable!("buffer sink stays a buffer");
+    };
+    Ok((data_len, bytes::Bytes::from(buf)))
+}
+
+/// Buffered download for metadata whose registered size is an allocation
+/// invariant (segment-WAL objects). The object-store header is compared
+/// before the response body is collected, so a corrupt undersized metadata
+/// row cannot bypass the caller's in-flight byte budget.
+pub async fn download_from_storage_exact(
+    account: &str,
+    file: &str,
+    expected_size: usize,
+) -> Result<(usize, bytes::Bytes), anyhow::Error> {
+    let mut sink = DownloadSink::buffer();
+    let data_len = download_with_retries_policy(
+        || crate::storage::get(account, file),
+        file,
+        Some(expected_size),
+        &mut sink,
+        ExpectedSizePolicy::Exact,
+    )
+    .await?;
     let DownloadSink::Buffer(buf) = sink else {
         unreachable!("buffer sink stays a buffer");
     };
@@ -969,6 +1021,33 @@ mod tests {
         }
     }
 
+
+    #[tokio::test]
+    async fn exact_size_policy_rejects_header_before_buffering_body() {
+        let mut sink = DownloadSink::buffer();
+        let error = download_with_retries_policy(
+            || async {
+                Ok(synthetic_get_result(
+                    vec![Bytes::from_static(b"must not be buffered")],
+                    19,
+                ))
+            },
+            "wal_segments/node/1.seg",
+            Some(1),
+            &mut sink,
+            ExpectedSizePolicy::Exact,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("refusing to buffer beyond the caller's byte permit"),
+            "{error}"
+        );
+        assert_eq!(sink.len(), 0);
+    }
     fn scratch_file(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "o2-m3-download-{}-{}",
