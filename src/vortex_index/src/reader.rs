@@ -59,6 +59,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    ops::Range,
     sync::{
         Arc, OnceLock,
         atomic::{AtomicUsize, Ordering},
@@ -82,13 +83,13 @@ use tantivy_fst::{Automaton, Regex};
 use crate::{
     container::{
         BlobHandle, DICT_LAYOUT_BLOCKS, FIELD_TYPE_BLOOM, FIELD_TYPE_CS, FIELD_TYPE_FTS,
-        FIELD_TYPE_TERM, FieldEntry,
-        PROP_COLUMNS, PROP_DICT_LAYOUT, PROP_FIELDS, PROP_OVERSIZE_SKIPS, PROP_PARTIAL_FIELDS,
-        PROP_PLIST_MIN_DOCS, PROP_ROW_COUNT, PROP_ROW_GROUP_SIZE, PROP_ROW_ORDER, PROP_TERM_COUNT,
-        PROP_TOKENIZER, PROP_ZONE_MAP, RowOrder, RowSelection, VixContainer, ZoneEntry,
-        blob_arrow_schema, column_binary, column_u32, column_u64, parse_container,
-        parse_container_ranged, require_supported_data_format, require_supported_index_format,
-        scan_blob, scan_blob_dict_column, scan_blob_streaming,
+        FIELD_TYPE_TERM, FieldEntry, PROP_COLUMNS, PROP_DICT_LAYOUT, PROP_FIELDS,
+        PROP_OVERSIZE_SKIPS, PROP_PARTIAL_FIELDS, PROP_PLIST_MIN_DOCS, PROP_ROW_COUNT,
+        PROP_ROW_GROUP_SIZE, PROP_ROW_ORDER, PROP_TERM_COUNT, PROP_TOKENIZER, PROP_ZONE_MAP,
+        RowOrder, RowSelection, VixContainer, ZoneEntry, blob_arrow_schema, column_binary,
+        column_u32, column_u64, parse_container, parse_container_ranged,
+        require_supported_data_format, require_supported_index_format, scan_blob,
+        scan_blob_dict_column, scan_blob_streaming,
     },
     error::{Result, VixError},
     numeric::is_numeric_value_token,
@@ -122,8 +123,21 @@ pub struct DocsDictChunk {
 /// windowed counts and chunk-bounded walks without materializing a bitmap.
 /// Obtained via [`VixReader::single_term_plist_cursor`].
 pub struct PlistCursor {
-    record: Bytes,
+    record: PlistCursorRecord,
     doc_count: u64,
+}
+
+enum PlistCursorRecord {
+    Memory(Bytes),
+    Ranged {
+        source: Arc<dyn VixRangeSource>,
+        /// Absolute record range inside `source`.
+        range: Range<u64>,
+        /// The resident record prefix. It always contains the full skip
+        /// header and normally carries the first few postings groups too.
+        prefix: Bytes,
+        header_len: usize,
+    },
 }
 
 impl PlistCursor {
@@ -132,34 +146,182 @@ impl PlistCursor {
         self.doc_count
     }
 
-    /// How many ids are strictly below `target` — the postings rank at a
-    /// row cut. Decodes at most one skip group plus the tail.
-    pub fn rank(&self, target: u32) -> anyhow::Result<u64> {
-        Ok(postings::rank_at(
-            &self.record,
-            self.doc_count as usize,
-            target,
-        )?)
+    fn doc_count_usize(&self) -> anyhow::Result<usize> {
+        usize::try_from(self.doc_count)
+            .map_err(|_| anyhow::anyhow!("plist doc_count {} overflows usize", self.doc_count))
     }
 
-    /// Every id in `[start, end)`, ascending — decodes only the touched
-    /// skip groups.
+    fn ranged_window(
+        source: &Arc<dyn VixRangeSource>,
+        record: &Range<u64>,
+        prefix: &Bytes,
+        relative: &Range<usize>,
+    ) -> Result<Bytes> {
+        if relative.end <= prefix.len() {
+            return Ok(prefix.slice(relative.clone()));
+        }
+        let start = record
+            .start
+            .checked_add(relative.start as u64)
+            .ok_or_else(|| VixError::Malformed("plist window start overflows u64".to_string()))?;
+        let end = record
+            .start
+            .checked_add(relative.end as u64)
+            .filter(|&end| end <= record.end)
+            .ok_or_else(|| VixError::Malformed("plist window exceeds its record".to_string()))?;
+        crate::source::block_fetch(source.as_ref(), start..end)
+    }
+
+    /// Several ranks in input order. Ranged readers deduplicate equal skip
+    /// groups and fetch every missing group through one `fetch_many` round
+    /// trip, which is the histogram path's normal consumption shape.
+    pub fn ranks(&self, targets: &[u32]) -> anyhow::Result<Vec<u64>> {
+        let doc_count = self.doc_count_usize()?;
+        match &self.record {
+            PlistCursorRecord::Memory(record) => targets
+                .iter()
+                .map(|&target| {
+                    postings::rank_at(record, doc_count, target).map_err(anyhow::Error::from)
+                })
+                .collect(),
+            PlistCursorRecord::Ranged {
+                source,
+                range,
+                prefix,
+                header_len,
+            } => {
+                let record_len = usize::try_from(range.end - range.start)
+                    .map_err(|_| anyhow::anyhow!("plist record length overflows usize"))?;
+                let header = &prefix[..*header_len];
+                let plans: Vec<_> = targets
+                    .iter()
+                    .map(|&target| {
+                        postings::plan_rank(header, record_len, doc_count, target)
+                            .map_err(anyhow::Error::from)
+                    })
+                    .collect::<anyhow::Result<_>>()?;
+
+                let mut unique = Vec::<Range<usize>>::new();
+                let mut unique_by_range = HashMap::<(usize, usize), usize>::new();
+                let mut plan_windows = Vec::with_capacity(plans.len());
+                for plan in &plans {
+                    let postings::RankPlan::Decode {
+                        range: relative, ..
+                    } = plan
+                    else {
+                        plan_windows.push(None);
+                        continue;
+                    };
+                    let key = (relative.start, relative.end);
+                    let index = *unique_by_range.entry(key).or_insert_with(|| {
+                        let index = unique.len();
+                        unique.push(relative.clone());
+                        index
+                    });
+                    plan_windows.push(Some(index));
+                }
+
+                let mut windows: Vec<Option<Bytes>> = vec![None; unique.len()];
+                let mut remote_indices = Vec::new();
+                let mut remote_ranges = Vec::new();
+                for (index, relative) in unique.iter().enumerate() {
+                    if relative.end <= prefix.len() {
+                        windows[index] = Some(prefix.slice(relative.clone()));
+                        continue;
+                    }
+                    let start = range
+                        .start
+                        .checked_add(relative.start as u64)
+                        .ok_or_else(|| anyhow::anyhow!("plist window start overflows u64"))?;
+                    let end = range
+                        .start
+                        .checked_add(relative.end as u64)
+                        .filter(|&end| end <= range.end)
+                        .ok_or_else(|| anyhow::anyhow!("plist window exceeds its record"))?;
+                    remote_indices.push(index);
+                    remote_ranges.push(start..end);
+                }
+                if !remote_ranges.is_empty() {
+                    let fetched = crate::source::block_fetch_many(source.as_ref(), remote_ranges)?;
+                    for (index, bytes) in remote_indices.into_iter().zip(fetched) {
+                        windows[index] = Some(bytes);
+                    }
+                }
+
+                plans
+                    .iter()
+                    .zip(targets)
+                    .zip(plan_windows)
+                    .map(|((plan, &target), window)| match plan {
+                        postings::RankPlan::Exact(rank) => Ok(*rank),
+                        postings::RankPlan::Decode { .. } => {
+                            let bytes = windows[window.expect("decode plan has a window")]
+                                .as_ref()
+                                .expect("every plist window was resolved");
+                            postings::rank_from_plan(
+                                header, record_len, doc_count, target, plan, bytes,
+                            )
+                            .map_err(anyhow::Error::from)
+                        }
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    /// Every id in `[start, end)`, ascending. Ranged readers fetch only the
+    /// skip groups that can overlap the requested row interval.
     pub fn for_each_in_range(
         &self,
         start: u32,
         end: u32,
         mut on_doc: impl FnMut(u32) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
-        Ok(postings::for_each_in_range(
-            &self.record,
-            self.doc_count as usize,
-            start,
-            end,
-            |doc| {
-                on_doc(doc).map_err(VixError::Callback)?;
-                Ok(())
-            },
-        )?)
+        let doc_count = self.doc_count_usize()?;
+        match &self.record {
+            PlistCursorRecord::Memory(record) => Ok(postings::for_each_in_range(
+                record,
+                doc_count,
+                start,
+                end,
+                |doc| {
+                    on_doc(doc).map_err(VixError::Callback)?;
+                    Ok(())
+                },
+            )?),
+            PlistCursorRecord::Ranged {
+                source,
+                range,
+                prefix,
+                header_len,
+            } => {
+                let record_len = usize::try_from(range.end - range.start)
+                    .map_err(|_| anyhow::anyhow!("plist record length overflows usize"))?;
+                let header = &prefix[..*header_len];
+                let plan = postings::plan_range(header, record_len, doc_count, start, end)?;
+                match &plan {
+                    postings::RangePlan::Empty => Ok(()),
+                    postings::RangePlan::Decode {
+                        range: relative, ..
+                    } => {
+                        let window = Self::ranged_window(source, range, prefix, relative)?;
+                        Ok(postings::for_each_from_plan(
+                            header,
+                            record_len,
+                            doc_count,
+                            start,
+                            end,
+                            &plan,
+                            &window,
+                            |doc| {
+                                on_doc(doc).map_err(VixError::Callback)?;
+                                Ok(())
+                            },
+                        )?)
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -382,7 +544,9 @@ impl VixReader {
             None
         } else {
             crate::container::parse_row_regions(
-                properties.get(crate::container::PROP_ROW_REGIONS).map(String::as_str),
+                properties
+                    .get(crate::container::PROP_ROW_REGIONS)
+                    .map(String::as_str),
                 row_count,
             )
         };
@@ -529,9 +693,10 @@ impl VixReader {
                         .dict
                         .ok_or_else(|| VixError::Malformed("missing dict blob".to_string()))?,
                 );
-                dict_blocks_blob = Some(index.dict_blocks.ok_or_else(|| {
-                    VixError::Malformed("missing dict_blocks blob".to_string())
-                })?);
+                dict_blocks_blob =
+                    Some(index.dict_blocks.ok_or_else(|| {
+                        VixError::Malformed("missing dict_blocks blob".to_string())
+                    })?);
                 if index.terms.is_none() {
                     return Err(VixError::Malformed("missing terms blob".to_string()));
                 }
@@ -699,7 +864,8 @@ impl VixReader {
                 };
                 match crate::stats::decode_stats_blob(&bytes) {
                     Ok(stats) => {
-                        self.stats_loaded_bytes.store(bytes.len(), Ordering::Relaxed);
+                        self.stats_loaded_bytes
+                            .store(bytes.len(), Ordering::Relaxed);
                         Some(stats)
                     }
                     Err(e) => {
@@ -1177,19 +1343,80 @@ impl VixReader {
                 if !self.plist_pointer_cell(doc_count, cell) {
                     return Ok(None);
                 }
-                let record = self.plist_record_bytes(cell)?;
-                return Ok(Some(PlistCursor { record, doc_count }));
+                return Ok(Some(self.open_plist_cursor(cell, doc_count)?));
             }
         }
         Ok(None)
     }
 
+    /// Open one out-of-row postings pointer for rank consumers. In-memory
+    /// readers retain the record slice; ranged readers keep only a bounded
+    /// prefix containing the skip header and fetch selected groups on demand.
+    fn open_plist_cursor(&self, cell: &[u8], doc_count: u64) -> Result<PlistCursor> {
+        const PREFIX_BYTES: u64 = 64 * 1024;
+
+        let (offset, end) = self.plist_pointer_window(cell)?;
+        let handle = self
+            .plist_blob
+            .as_ref()
+            .expect("plist_pointer_window checked the blob");
+        let record = match handle {
+            BlobHandle::Mem(bytes) => {
+                let record = bytes.slice(offset as usize..end as usize);
+                let header_len = postings::record_header_len(&record)?;
+                if header_len > record.len() {
+                    return Err(VixError::Malformed(format!(
+                        "plist header is {header_len} bytes but record is only {} bytes",
+                        record.len()
+                    )));
+                }
+                PlistCursorRecord::Memory(record)
+            }
+            BlobHandle::Ranged(ranged) => {
+                let start = ranged.range.start.checked_add(offset).ok_or_else(|| {
+                    VixError::Malformed("plist record start overflows u64".to_string())
+                })?;
+                let end = ranged.range.start.checked_add(end).ok_or_else(|| {
+                    VixError::Malformed("plist record end overflows u64".to_string())
+                })?;
+                let prefix_end = start + (end - start).min(PREFIX_BYTES);
+                let mut prefix =
+                    crate::source::block_fetch(ranged.source.as_ref(), start..prefix_end)?;
+                let header_len = postings::record_header_len(&prefix)?;
+                let record_len = usize::try_from(end - start).map_err(|_| {
+                    VixError::Malformed("plist record length overflows usize".to_string())
+                })?;
+                if header_len > record_len {
+                    return Err(VixError::Malformed(format!(
+                        "plist header is {header_len} bytes but record is only {record_len} bytes"
+                    )));
+                }
+                if header_len > prefix.len() {
+                    let header_end = start.checked_add(header_len as u64).ok_or_else(|| {
+                        VixError::Malformed("plist header end overflows u64".to_string())
+                    })?;
+                    let rest =
+                        crate::source::block_fetch(ranged.source.as_ref(), prefix_end..header_end)?;
+                    let mut complete = Vec::with_capacity(header_len);
+                    complete.extend_from_slice(&prefix);
+                    complete.extend_from_slice(&rest);
+                    prefix = Bytes::from(complete);
+                }
+                PlistCursorRecord::Ranged {
+                    source: Arc::clone(&ranged.source),
+                    range: start..end,
+                    prefix,
+                    header_len,
+                }
+            }
+        };
+        Ok(PlistCursor { record, doc_count })
+    }
+
     /// Resolve one out-of-row postings POINTER CELL (`[u64 LE offset]
-    /// [u32 LE len]`) to the [`postings::encode_record`] bytes it addresses
-    /// inside the `plist` blob. The caller has already selected the cell by
-    /// `doc_count >= plist_min_docs` — never by its bytes — so a wrong
-    /// length or an out-of-bounds window here is file corruption. In-memory
-    /// blobs slice for free; ranged blobs fetch exactly the record window.
+    /// [u32 LE len]`) to all [`postings::encode_record`] bytes it addresses.
+    /// Full bitmap decoders use this path; rank consumers use
+    /// [`Self::open_plist_cursor`] instead.
     pub(crate) fn plist_record_bytes(&self, cell: &[u8]) -> Result<Bytes> {
         let (offset, end) = self.plist_pointer_window(cell)?;
         let handle = self
@@ -3434,7 +3661,52 @@ fn automaton_matches<A: Automaton>(automaton: &A, input: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicU64;
+
+    use futures::{FutureExt, future::BoxFuture};
+
     use super::*;
+
+    struct CountingPlistSource {
+        data: Bytes,
+        fetches: AtomicUsize,
+        bytes: AtomicU64,
+        batch_calls: AtomicUsize,
+    }
+
+    impl VixRangeSource for CountingPlistSource {
+        fn len(&self) -> u64 {
+            self.data.len() as u64
+        }
+
+        fn fetch(&self, range: Range<u64>) -> BoxFuture<'static, anyhow::Result<Bytes>> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            self.bytes
+                .fetch_add(range.end - range.start, Ordering::SeqCst);
+            let result = if range.start <= range.end && range.end <= self.data.len() as u64 {
+                Ok(self.data.slice(range.start as usize..range.end as usize))
+            } else {
+                Err(anyhow::anyhow!("test range {range:?} is out of bounds"))
+            };
+            async move { result }.boxed()
+        }
+
+        fn fetch_many(
+            &self,
+            ranges: Vec<Range<u64>>,
+        ) -> BoxFuture<'static, anyhow::Result<Vec<Bytes>>> {
+            self.batch_calls.fetch_add(1, Ordering::SeqCst);
+            let futures: Vec<_> = ranges.into_iter().map(|range| self.fetch(range)).collect();
+            async move {
+                let mut out = Vec::with_capacity(futures.len());
+                for future in futures {
+                    out.push(future.await?);
+                }
+                Ok(out)
+            }
+            .boxed()
+        }
+    }
 
     #[test]
     fn prefix_successor_basics() {
@@ -3450,5 +3722,71 @@ mod tests {
         assert!(contains_bytes(b"abc", b""));
         assert!(!contains_bytes(b"abc", b"abcd"));
         assert!(!contains_bytes(b"abc", b"bd"));
+    }
+    #[test]
+    fn ranged_plist_cursor_fetches_only_rank_groups() {
+        let ids: Vec<u32> = (0..50_000).map(|index| index * 3 + 2).collect();
+        let record = Bytes::from(postings::encode_record(&ids).unwrap());
+        let header_len = postings::record_header_len(&record).unwrap();
+        assert!(
+            header_len * 8 < record.len(),
+            "fixture must have a postings body much larger than its header"
+        );
+
+        let object_prefix = 123usize;
+        let mut object = vec![0xA5; object_prefix];
+        object.extend_from_slice(&record);
+        object.extend_from_slice(&[0x5A; 17]);
+        let source = Arc::new(CountingPlistSource {
+            data: Bytes::from(object),
+            fetches: AtomicUsize::new(0),
+            bytes: AtomicU64::new(0),
+            batch_calls: AtomicUsize::new(0),
+        });
+        let source_dyn: Arc<dyn VixRangeSource> = source.clone();
+        let cursor = PlistCursor {
+            record: PlistCursorRecord::Ranged {
+                source: source_dyn,
+                range: object_prefix as u64..(object_prefix + record.len()) as u64,
+                prefix: record.slice(..header_len),
+                header_len,
+            },
+            doc_count: ids.len() as u64,
+        };
+
+        let targets = [0, 1, 3, 3_000, 30_000, 75_000, 120_000, u32::MAX];
+        let expected: Vec<u64> = targets
+            .iter()
+            .map(|target| ids.partition_point(|id| id < target) as u64)
+            .collect();
+        assert_eq!(cursor.ranks(&targets).unwrap(), expected);
+        assert_eq!(
+            source.batch_calls.load(Ordering::SeqCst),
+            1,
+            "all missing rank groups must share one ranged round trip"
+        );
+        assert!(
+            source.bytes.load(Ordering::SeqCst) < record.len() as u64 / 2,
+            "rank cuts fetched too much of the {}-byte record",
+            record.len()
+        );
+
+        let mut walked = Vec::new();
+        cursor
+            .for_each_in_range(30_000, 31_000, |id| {
+                walked.push(id);
+                Ok(())
+            })
+            .unwrap();
+        let expected_walk: Vec<u32> = ids
+            .iter()
+            .copied()
+            .filter(|id| *id >= 30_000 && *id < 31_000)
+            .collect();
+        assert_eq!(walked, expected_walk);
+        assert!(
+            source.bytes.load(Ordering::SeqCst) < record.len() as u64,
+            "rank plus bounded walk fetched the whole postings record"
+        );
     }
 }

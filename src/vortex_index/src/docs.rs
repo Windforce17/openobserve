@@ -1587,10 +1587,10 @@ impl VixDocs {
 
         // strip the internal `_timestamp` from an emitted slice
         let output_schema: std::cell::OnceCell<SchemaRef> = std::cell::OnceCell::new();
-        let mut emit = |batch: &RecordBatch,
-                        offset: usize,
-                        len: usize,
-                        on_batch: &mut dyn FnMut(RecordBatch) -> anyhow::Result<()>|
+        let emit = |batch: &RecordBatch,
+                    offset: usize,
+                    len: usize,
+                    on_batch: &mut dyn FnMut(RecordBatch) -> anyhow::Result<()>|
          -> anyhow::Result<()> {
             let slice = batch.slice(offset, len);
             if !strip_ts {

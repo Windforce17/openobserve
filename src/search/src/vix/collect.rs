@@ -491,17 +491,24 @@ pub(super) fn ranked_simple_histogram(
         .zone_chunks()
         .ok_or_else(|| anyhow::anyhow!("ranked histogram requires a zone table"))?;
 
-    let mut boundary_rows: Vec<u64> = Vec::new();
-    // consecutive chunks share a boundary: one rank per boundary, not two
-    let mut rank_at_start = cursor.rank(0)?;
+    let mut boundaries = Vec::with_capacity(chunks.len() + 1);
+    boundaries.push(0);
     for chunk in chunks {
-        let start = u32::try_from(chunk.row_offset)
-            .map_err(|_| anyhow::anyhow!("chunk row offset overflows u32"))?;
-        let end = u32::try_from(chunk.row_offset + chunk.row_count)
-            .map_err(|_| anyhow::anyhow!("chunk row end overflows u32"))?;
-        let rank_at_end = cursor.rank(end)?;
-        let matched = rank_at_end - rank_at_start;
-        rank_at_start = rank_at_end;
+        boundaries.push(
+            u32::try_from(chunk.row_offset + chunk.row_count)
+                .map_err(|_| anyhow::anyhow!("chunk row end overflows u32"))?,
+        );
+    }
+    // One batched ranged read for all distinct skip groups. Calling `rank`
+    // per boundary would serialize one object-store request per chunk.
+    let ranks = cursor.ranks(&boundaries)?;
+    let mut boundary_rows: Vec<u64> = Vec::new();
+    for (index, chunk) in chunks.iter().enumerate() {
+        let start = boundaries[index];
+        let end = boundaries[index + 1];
+        let matched = ranks[index + 1].checked_sub(ranks[index]).ok_or_else(|| {
+            anyhow::anyhow!("postings ranks decreased across chunk {start}..{end}")
+        })?;
         if matched == 0 {
             continue;
         }
@@ -560,15 +567,21 @@ pub(super) fn ranked_count_in_window(
         .ok_or_else(|| anyhow::anyhow!("ranked count requires a zone table"))?;
     let mut count = 0u64;
     let mut boundary_rows: Vec<u64> = Vec::new();
-    let mut rank_at_start = cursor.rank(0)?;
+    let mut boundaries = Vec::with_capacity(chunks.len() + 1);
+    boundaries.push(0);
     for chunk in chunks {
-        let start = u32::try_from(chunk.row_offset)
-            .map_err(|_| anyhow::anyhow!("chunk row offset overflows u32"))?;
-        let end = u32::try_from(chunk.row_offset + chunk.row_count)
-            .map_err(|_| anyhow::anyhow!("chunk row end overflows u32"))?;
-        let rank_at_end = cursor.rank(end)?;
-        let matched = rank_at_end - rank_at_start;
-        rank_at_start = rank_at_end;
+        boundaries.push(
+            u32::try_from(chunk.row_offset + chunk.row_count)
+                .map_err(|_| anyhow::anyhow!("chunk row end overflows u32"))?,
+        );
+    }
+    let ranks = cursor.ranks(&boundaries)?;
+    for (index, chunk) in chunks.iter().enumerate() {
+        let start = boundaries[index];
+        let end = boundaries[index + 1];
+        let matched = ranks[index + 1].checked_sub(ranks[index]).ok_or_else(|| {
+            anyhow::anyhow!("postings ranks decreased across chunk {start}..{end}")
+        })?;
         if matched == 0 {
             continue;
         }
@@ -809,7 +822,7 @@ pub(super) fn min_max_field(
     bitmap: Option<&BooleanBuffer>,
 ) -> anyhow::Result<Option<MinMaxValue>> {
     let mut best: Option<MinMaxValue> = None;
-    let mut fold = |value: MinMaxValue, best: &mut Option<MinMaxValue>| {
+    let fold = |value: MinMaxValue, best: &mut Option<MinMaxValue>| {
         *best = Some(match best.take() {
             Some(current) => current.fold(value, is_max),
             None => value,

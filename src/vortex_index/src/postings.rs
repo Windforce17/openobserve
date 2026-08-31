@@ -26,6 +26,8 @@
 //! `doc_count` column of the `terms` table, so the blob starts directly with
 //! the blocks. Decoding therefore always takes the expected `doc_count`.
 
+use std::ops::Range;
+
 use bitpacking::{BitPacker, BitPacker4x};
 
 use crate::error::{Result, VixError};
@@ -258,9 +260,7 @@ pub fn record_blob(record: &[u8]) -> Result<&[u8]> {
         .ok_or_else(|| truncated("plist record blob"))
 }
 
-/// The byte range of the record that [`rank_at`] for `target` touches —
-/// `4 + S*8` header bytes plus one block group (callers with ranged sources
-/// can fetch the header first, then exactly this window).
+/// Decode the leading skip-entry count from a record or header prefix.
 fn record_entries(record: &[u8]) -> Result<usize> {
     let head: [u8; 4] = record
         .get(..4)
@@ -270,54 +270,220 @@ fn record_entries(record: &[u8]) -> Result<usize> {
     Ok(u32::from_le_bytes(head) as usize)
 }
 
-/// How many of the record's `doc_count` ids are `< target` — the postings
-/// rank at a row cut. Decodes at most one `SKIP_STRIDE` block group plus the
-/// vint tail instead of the whole list.
-pub fn rank_at(record: &[u8], doc_count: usize, target: u32) -> Result<u64> {
-    let entries = record_entries(record)?;
-    let table = record
-        .get(4..4 + entries * 8)
-        .ok_or_else(|| truncated("plist skip table"))?;
-    let blob = &record[4 + entries * 8..];
-    let full_blocks = doc_count / BLOCK_LEN;
+/// Exact byte length of a plist record's skip-table header. `prefix` only
+/// needs to contain the leading entry count; callers can then range-fetch the
+/// rest of the header without opening the postings body.
+pub(crate) fn record_header_len(prefix: &[u8]) -> Result<usize> {
+    record_entries(prefix)?
+        .checked_mul(8)
+        .and_then(|table| 4usize.checked_add(table))
+        .ok_or_else(|| VixError::Malformed("plist skip table length overflows usize".to_string()))
+}
 
-    let entry_first =
-        |k: usize| -> u32 { u32::from_le_bytes(table[k * 8..k * 8 + 4].try_into().unwrap()) };
-    let entry_offset = |k: usize| -> usize {
-        u32::from_le_bytes(table[k * 8 + 4..k * 8 + 8].try_into().unwrap()) as usize
-    };
+struct RecordTable<'a> {
+    table: &'a [u8],
+    entries: usize,
+    header_len: usize,
+    blob_len: usize,
+    full_blocks: usize,
+}
 
-    // last group whose first id is < target (all groups before it lie
-    // entirely below target)
-    let mut group = None;
-    if entries > 0 {
-        let (mut lo, mut hi) = (0usize, entries);
+impl<'a> RecordTable<'a> {
+    fn parse(header: &'a [u8], record_len: usize, doc_count: usize) -> Result<Self> {
+        let header_len = record_header_len(header)?;
+        let table = header
+            .get(4..header_len)
+            .ok_or_else(|| truncated("plist skip table"))?;
+        if header_len > record_len {
+            return Err(VixError::Malformed(format!(
+                "plist header is {header_len} bytes but record is only {record_len} bytes"
+            )));
+        }
+        let entries = table.len() / 8;
+        let full_blocks = doc_count / BLOCK_LEN;
+        let expected_entries = full_blocks.div_ceil(SKIP_STRIDE);
+        if entries != expected_entries {
+            return Err(VixError::Malformed(format!(
+                "plist skip table has {entries} entries, expected {expected_entries} for \
+                 {doc_count} docs"
+            )));
+        }
+        let blob_len = record_len - header_len;
+        let mut previous_first = None;
+        let mut previous_offset = None;
+        for group in 0..entries {
+            let first = u32::from_le_bytes(
+                table[group * 8..group * 8 + 4]
+                    .try_into()
+                    .expect("sized skip entry"),
+            );
+            let offset = u32::from_le_bytes(
+                table[group * 8 + 4..group * 8 + 8]
+                    .try_into()
+                    .expect("sized skip entry"),
+            ) as usize;
+            if group == 0 && offset != 0 {
+                return Err(VixError::Malformed(format!(
+                    "first plist skip group starts at blob offset {offset}, expected 0"
+                )));
+            }
+            if previous_first.is_some_and(|previous| first <= previous) {
+                return Err(VixError::Malformed(
+                    "plist skip first doc ids are not strictly ascending".to_string(),
+                ));
+            }
+            if previous_offset.is_some_and(|previous| offset <= previous) {
+                return Err(VixError::Malformed(
+                    "plist skip blob offsets are not strictly ascending".to_string(),
+                ));
+            }
+            if offset > blob_len {
+                return Err(VixError::Malformed(format!(
+                    "plist skip blob offset {offset} exceeds {blob_len}-byte blob"
+                )));
+            }
+            previous_first = Some(first);
+            previous_offset = Some(offset);
+        }
+        Ok(Self {
+            table,
+            entries,
+            header_len,
+            blob_len,
+            full_blocks,
+        })
+    }
+
+    fn entry_first(&self, group: usize) -> u32 {
+        u32::from_le_bytes(
+            self.table[group * 8..group * 8 + 4]
+                .try_into()
+                .expect("validated skip entry"),
+        )
+    }
+
+    fn entry_offset(&self, group: usize) -> usize {
+        u32::from_le_bytes(
+            self.table[group * 8 + 4..group * 8 + 8]
+                .try_into()
+                .expect("validated skip entry"),
+        ) as usize
+    }
+
+    /// First group whose first doc id is `>= target`.
+    fn lower_bound(&self, target: u32) -> usize {
+        let (mut lo, mut hi) = (0usize, self.entries);
         while lo < hi {
             let mid = (lo + hi) / 2;
-            if entry_first(mid) < target {
+            if self.entry_first(mid) < target {
                 lo = mid + 1;
             } else {
                 hi = mid;
             }
         }
-        // lo = first group with first_id >= target
-        if lo > 0 {
-            group = Some(lo - 1);
-        }
+        lo
     }
 
-    let Some(group) = group else {
-        if entries > 0 {
-            // some full block exists and even group 0's first id (the
-            // global first id) is >= target: nothing ranks below.
-            return Ok(0);
-        }
-        // tail-only list (no full block): walk the vint tail from the start
+    /// Last group whose first doc id is `< target`.
+    fn group_before(&self, target: u32) -> Option<usize> {
+        self.lower_bound(target).checked_sub(1)
+    }
+
+    fn group_record_range(&self, group: usize) -> Range<usize> {
+        let start = self.entry_offset(group);
+        let end = if group + 1 < self.entries {
+            self.entry_offset(group + 1)
+        } else {
+            self.blob_len
+        };
+        self.header_len + start..self.header_len + end
+    }
+}
+
+/// A rank answer that is either known from the skip header alone, or names
+/// the one record-relative byte window needed to decode it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RankPlan {
+    Exact(u64),
+    Decode {
+        group: Option<usize>,
+        range: Range<usize>,
+    },
+}
+
+/// A bounded postings walk that is empty from the skip header alone, or names
+/// the record-relative groups needed to enumerate `[start, end)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RangePlan {
+    Empty,
+    Decode {
+        group: Option<usize>,
+        range: Range<usize>,
+        last_block: usize,
+        include_tail: bool,
+    },
+}
+
+/// How many of the record's `doc_count` ids are `< target` — the postings
+/// rank at a row cut. Decodes at most one `SKIP_STRIDE` block group plus the
+/// vint tail instead of the whole list.
+/// Plan a rank from the resident skip header. The decode variant names only
+/// one skip group (plus the tail for the last group), never the full record.
+pub(crate) fn plan_rank(
+    header: &[u8],
+    record_len: usize,
+    doc_count: usize,
+    target: u32,
+) -> Result<RankPlan> {
+    let table = RecordTable::parse(header, record_len, doc_count)?;
+    let group = table.group_before(target);
+    if group.is_none() && table.entries > 0 {
+        return Ok(RankPlan::Exact(0));
+    }
+    let range = match group {
+        Some(group) => table.group_record_range(group),
+        None => table.header_len..record_len,
+    };
+    Ok(RankPlan::Decode { group, range })
+}
+
+/// Execute a [`RankPlan`] from exactly its planned bytes.
+pub(crate) fn rank_from_plan(
+    header: &[u8],
+    record_len: usize,
+    doc_count: usize,
+    target: u32,
+    plan: &RankPlan,
+    window: &[u8],
+) -> Result<u64> {
+    let table = RecordTable::parse(header, record_len, doc_count)?;
+    let expected = plan_rank(header, record_len, doc_count, target)?;
+    if &expected != plan {
+        return Err(VixError::Malformed(
+            "plist rank plan does not match its target".to_string(),
+        ));
+    }
+    let RankPlan::Decode { group, range } = plan else {
+        let RankPlan::Exact(rank) = plan else {
+            unreachable!()
+        };
+        return Ok(*rank);
+    };
+    if window.len() != range.len() {
+        return Err(VixError::Malformed(format!(
+            "plist rank window is {} bytes, expected {}",
+            window.len(),
+            range.len()
+        )));
+    }
+    let blob_base = range.start - table.header_len;
+
+    let Some(group) = *group else {
         let mut rank = 0u64;
         let mut pos = 0usize;
         let mut prev = 0u32;
         for _ in 0..doc_count % BLOCK_LEN {
-            let (delta, used) = read_vint(blob.get(pos..).unwrap_or_default())?;
+            let (delta, used) = read_vint(window.get(pos..).unwrap_or_default())?;
             pos += used;
             prev = advance(prev, delta)?;
             if prev < target {
@@ -329,32 +495,22 @@ pub fn rank_at(record: &[u8], doc_count: usize, target: u32) -> Result<u64> {
         return Ok(rank);
     };
 
-    // ids strictly before this group
     let mut rank = (group * SKIP_STRIDE * BLOCK_LEN) as u64;
-    // walk this group's blocks (and, off its end, the remaining blocks up
-    // to the tail — only reachable for the LAST group) counting ids < target
     let packer = BitPacker4x::new();
     let mut deltas = [0u32; BLOCK_LEN];
-    let mut pos = entry_offset(group);
-    let mut prev = if group == 0 {
-        0u32
-    } else {
-        // reconstruct the running prev: the group's first id is absolute,
-        // and the first delta of the group is relative to the LAST id of
-        // the previous group — which we do not have. The encoder therefore
-        // guarantees group-relative decode: delta[0] of a group is
-        // first_id - prev_last... NOT available. Instead decode the group
-        // using its recorded first id: the first delta reconstructs
-        // first_id from prev_last, so seed prev with first_id and SKIP the
-        // first delta reconstruction by tracking position.
-        0
-    };
+    let mut pos = table
+        .entry_offset(group)
+        .checked_sub(blob_base)
+        .ok_or_else(|| VixError::Malformed("plist rank window starts too late".to_string()))?;
+    let mut prev = 0u32;
     let first_block = group * SKIP_STRIDE;
-    let last_block = ((group + 1) * SKIP_STRIDE).min(full_blocks);
+    let last_block = ((group + 1) * SKIP_STRIDE).min(table.full_blocks);
     let mut seeded = group == 0;
-    let group_first = entry_first(group);
+    let group_first = table.entry_first(group);
     for _ in first_block..last_block {
-        let num_bits = *blob.get(pos).ok_or_else(|| truncated("block bit width"))?;
+        let num_bits = *window
+            .get(pos)
+            .ok_or_else(|| truncated("block bit width"))?;
         pos += 1;
         if num_bits > 32 {
             return Err(VixError::Malformed(format!(
@@ -365,7 +521,7 @@ pub fn rank_at(record: &[u8], doc_count: usize, target: u32) -> Result<u64> {
             deltas.fill(0);
         } else {
             let packed_len = num_bits as usize * BLOCK_LEN / 8;
-            let packed = blob
+            let packed = window
                 .get(pos..pos + packed_len)
                 .ok_or_else(|| truncated("bitpacked block"))?;
             packer.decompress(packed, &mut deltas, num_bits);
@@ -373,8 +529,6 @@ pub fn rank_at(record: &[u8], doc_count: usize, target: u32) -> Result<u64> {
         }
         for (i, &delta) in deltas.iter().enumerate() {
             if !seeded && i == 0 {
-                // the group's first id is known absolutely; the stored
-                // delta is relative to the previous group's last id
                 prev = group_first;
                 seeded = true;
             } else {
@@ -387,10 +541,9 @@ pub fn rank_at(record: &[u8], doc_count: usize, target: u32) -> Result<u64> {
             }
         }
     }
-    // the group ran to the end of the full blocks: continue into the tail
-    if last_block == full_blocks {
+    if last_block == table.full_blocks {
         for _ in 0..doc_count % BLOCK_LEN {
-            let (delta, used) = read_vint(blob.get(pos..).unwrap_or_default())?;
+            let (delta, used) = read_vint(window.get(pos..).unwrap_or_default())?;
             pos += used;
             prev = advance(prev, delta)?;
             if prev < target {
@@ -403,65 +556,120 @@ pub fn rank_at(record: &[u8], doc_count: usize, target: u32) -> Result<u64> {
     Ok(rank)
 }
 
-/// Invoke `on_doc` for every id of the record in `[start, end)`, in
-/// ascending order. Jumps in via the skip table (like [`rank_at`]) and stops
-/// at the first id `>= end` — a chunk-bounded decode touches only the block
-/// groups overlapping the range instead of the whole list.
-pub fn for_each_in_range(
-    record: &[u8],
+/// How many of the record's `doc_count` ids are `< target` — the postings
+/// rank at a row cut. Decodes at most one `SKIP_STRIDE` block group plus the
+/// vint tail instead of the whole list.
+pub fn rank_at(record: &[u8], doc_count: usize, target: u32) -> Result<u64> {
+    let header_len = record_header_len(record)?;
+    let header = record
+        .get(..header_len)
+        .ok_or_else(|| truncated("plist skip table"))?;
+    let plan = plan_rank(header, record.len(), doc_count, target)?;
+    match &plan {
+        RankPlan::Exact(rank) => Ok(*rank),
+        RankPlan::Decode { range, .. } => {
+            let window = record
+                .get(range.clone())
+                .ok_or_else(|| truncated("plist rank window"))?;
+            rank_from_plan(header, record.len(), doc_count, target, &plan, window)
+        }
+    }
+}
+
+/// Plan the exact plist groups needed to enumerate doc ids in `[start, end)`.
+pub(crate) fn plan_range(
+    header: &[u8],
+    record_len: usize,
     doc_count: usize,
     start: u32,
     end: u32,
+) -> Result<RangePlan> {
+    let table = RecordTable::parse(header, record_len, doc_count)?;
+    if start >= end || doc_count == 0 {
+        return Ok(RangePlan::Empty);
+    }
+    let group = table.group_before(start);
+    let start_offset = group.map_or(0, |group| table.entry_offset(group));
+    let end_group = table.lower_bound(end);
+    if group.is_none() && table.entries > 0 && end_group == 0 {
+        return Ok(RangePlan::Empty);
+    }
+    let (end_offset, last_block, include_tail) = if end_group < table.entries {
+        (
+            table.entry_offset(end_group),
+            (end_group * SKIP_STRIDE).min(table.full_blocks),
+            false,
+        )
+    } else {
+        (table.blob_len, table.full_blocks, true)
+    };
+    if start_offset >= end_offset {
+        return Ok(RangePlan::Empty);
+    }
+    Ok(RangePlan::Decode {
+        group,
+        range: table.header_len + start_offset..table.header_len + end_offset,
+        last_block,
+        include_tail,
+    })
+}
+
+/// Execute a [`RangePlan`] from exactly its planned bytes.
+pub(crate) fn for_each_from_plan(
+    header: &[u8],
+    record_len: usize,
+    doc_count: usize,
+    start: u32,
+    end: u32,
+    plan: &RangePlan,
+    window: &[u8],
     mut on_doc: impl FnMut(u32) -> Result<()>,
 ) -> Result<()> {
-    if start >= end || doc_count == 0 {
+    let table = RecordTable::parse(header, record_len, doc_count)?;
+    let expected = plan_range(header, record_len, doc_count, start, end)?;
+    if &expected != plan {
+        return Err(VixError::Malformed(
+            "plist range plan does not match its bounds".to_string(),
+        ));
+    }
+    let RangePlan::Decode {
+        group,
+        range,
+        last_block,
+        include_tail,
+    } = plan
+    else {
         return Ok(());
-    }
-    let entries = record_entries(record)?;
-    let table = record
-        .get(4..4 + entries * 8)
-        .ok_or_else(|| truncated("plist skip table"))?;
-    let blob = &record[4 + entries * 8..];
-    let full_blocks = doc_count / BLOCK_LEN;
-
-    let entry_first =
-        |k: usize| -> u32 { u32::from_le_bytes(table[k * 8..k * 8 + 4].try_into().unwrap()) };
-    let entry_offset = |k: usize| -> usize {
-        u32::from_le_bytes(table[k * 8 + 4..k * 8 + 8].try_into().unwrap()) as usize
     };
-
-    // last group whose first id is < start; None = begin at the very front
-    // (group 0 or the tail-only list)
-    let mut group = None;
-    if entries > 0 {
-        let (mut lo, mut hi) = (0usize, entries);
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            if entry_first(mid) < start {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        if lo > 0 {
-            group = Some(lo - 1);
-        }
+    if window.len() != range.len() {
+        return Err(VixError::Malformed(format!(
+            "plist range window is {} bytes, expected {}",
+            window.len(),
+            range.len()
+        )));
     }
-
+    let blob_base = range.start - table.header_len;
     let packer = BitPacker4x::new();
     let mut deltas = [0u32; BLOCK_LEN];
-    let (first_block, mut pos, mut prev, mut seeded, group_first) = match group {
-        Some(g) => (
-            g * SKIP_STRIDE,
-            entry_offset(g),
+    let (first_block, mut pos, mut prev, mut seeded, group_first) = match *group {
+        Some(group) => (
+            group * SKIP_STRIDE,
+            table
+                .entry_offset(group)
+                .checked_sub(blob_base)
+                .ok_or_else(|| {
+                    VixError::Malformed("plist range window starts too late".to_string())
+                })?,
             0u32,
-            g == 0,
-            entry_first(g),
+            group == 0,
+            table.entry_first(group),
         ),
         None => (0, 0, 0u32, true, 0),
     };
-    for _ in first_block..full_blocks {
-        let num_bits = *blob.get(pos).ok_or_else(|| truncated("block bit width"))?;
+    for _ in first_block..*last_block {
+        let num_bits = *window
+            .get(pos)
+            .ok_or_else(|| truncated("block bit width"))?;
         pos += 1;
         if num_bits > 32 {
             return Err(VixError::Malformed(format!(
@@ -472,7 +680,7 @@ pub fn for_each_in_range(
             deltas.fill(0);
         } else {
             let packed_len = num_bits as usize * BLOCK_LEN / 8;
-            let packed = blob
+            let packed = window
                 .get(pos..pos + packed_len)
                 .ok_or_else(|| truncated("bitpacked block"))?;
             packer.decompress(packed, &mut deltas, num_bits);
@@ -480,9 +688,6 @@ pub fn for_each_in_range(
         }
         for (i, &delta) in deltas.iter().enumerate() {
             if !seeded && i == 0 {
-                // jump-in seeding: the group's first id is absolute in the
-                // skip table; its stored delta is relative to the previous
-                // group's last id, which a jump never decodes
                 prev = group_first;
                 seeded = true;
             } else {
@@ -496,27 +701,60 @@ pub fn for_each_in_range(
             }
         }
     }
-    // vint tail
-    for _ in 0..doc_count % BLOCK_LEN {
-        let (delta, used) = read_vint(blob.get(pos..).unwrap_or_default())?;
-        pos += used;
-        if !seeded {
-            // tail-only list reached via a jump cannot happen (entries == 0
-            // implies group == None which seeds at the front), but keep the
-            // invariant explicit
-            prev = group_first;
-            seeded = true;
-        } else {
-            prev = advance(prev, delta)?;
-        }
-        if prev >= end {
-            return Ok(());
-        }
-        if prev >= start {
-            on_doc(prev)?;
+    if *include_tail {
+        for _ in 0..doc_count % BLOCK_LEN {
+            let (delta, used) = read_vint(window.get(pos..).unwrap_or_default())?;
+            pos += used;
+            if !seeded {
+                prev = group_first;
+                seeded = true;
+            } else {
+                prev = advance(prev, delta)?;
+            }
+            if prev >= end {
+                return Ok(());
+            }
+            if prev >= start {
+                on_doc(prev)?;
+            }
         }
     }
     Ok(())
+}
+
+/// Invoke `on_doc` for every id of the record in `[start, end)`, in
+/// ascending order. Jumps in via the skip table and decodes only the groups
+/// that can overlap the range.
+pub fn for_each_in_range(
+    record: &[u8],
+    doc_count: usize,
+    start: u32,
+    end: u32,
+    on_doc: impl FnMut(u32) -> Result<()>,
+) -> Result<()> {
+    let header_len = record_header_len(record)?;
+    let header = record
+        .get(..header_len)
+        .ok_or_else(|| truncated("plist skip table"))?;
+    let plan = plan_range(header, record.len(), doc_count, start, end)?;
+    match &plan {
+        RangePlan::Empty => Ok(()),
+        RangePlan::Decode { range, .. } => {
+            let window = record
+                .get(range.clone())
+                .ok_or_else(|| truncated("plist range window"))?;
+            for_each_from_plan(
+                header,
+                record.len(),
+                doc_count,
+                start,
+                end,
+                &plan,
+                window,
+                on_doc,
+            )
+        }
+    }
 }
 
 /// Byte length of an out-of-row postings POINTER CELL: `[u64 LE offset]
