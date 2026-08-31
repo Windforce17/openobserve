@@ -47,7 +47,7 @@ pub fn aggregate_optimize_rewrite(
         total.saturating_add(file.meta.records.max(0))
     });
     let metadata_files = metadata_count_file_list.len();
-    if metadata_records == 0 && (index_file_list.is_empty() || index_result.is_none()) {
+    if metadata_records == 0 && index_result.is_none() {
         return Ok(physical_plan);
     }
 
@@ -65,8 +65,9 @@ pub fn aggregate_optimize_rewrite(
 pub struct AggregateOptimizeRewriter {
     query: Arc<QueryParams>,
     file_list: Vec<FileKey>,
-    /// The index result precomputed by the eager vix_search in `flight.rs`,
-    /// covering exactly `file_list`.
+    /// The precomputed result covers every source removed from the scan plan.
+    /// `file_list` names core VIX files for display; segment-WAL contributions
+    /// can make the result non-empty even when this list is empty.
     index_result: Option<MultiResult>,
     index_optimize_mode: Option<IndexOptimizeMode>,
     #[allow(unused)]
@@ -125,7 +126,7 @@ impl AggregateOptimizeRewriter {
             inputs.push(self.metadata_count_exec(schema.clone())?);
         }
 
-        if !self.file_list.is_empty() && self.index_result.is_some() {
+        if self.index_result.is_some() {
             inputs.push(self.index_optimize_exec(schema));
         }
 
@@ -263,6 +264,25 @@ mod tests {
         assert_eq!(inputs[0].name(), "AggregateExec");
         assert_eq!(inputs[1].name(), "IndexOptimizeExec");
 
+        Ok(())
+    }
+    #[test]
+    fn test_aggregate_optimize_rewrite_precomputed_result_without_core_files() -> Result<()> {
+        let rewritten = aggregate_optimize_rewrite(
+            query_params(),
+            vec![],
+            vec![],
+            Some(MultiResult::Count(7)),
+            Some(IndexOptimizeMode::SimpleCount),
+            partial_count_exec()?,
+        )?;
+
+        let union = rewritten
+            .downcast_ref::<UnionExec>()
+            .expect("segment-only result must wrap the partial aggregate");
+        let inputs = union.inputs();
+        assert_eq!(inputs.len(), 2);
+        assert_eq!(inputs[1].name(), "IndexOptimizeExec");
         Ok(())
     }
 

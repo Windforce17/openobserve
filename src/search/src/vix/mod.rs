@@ -42,10 +42,10 @@
 //! (`field_value_counts`), with docs-column and `_source` fallbacks per
 //! file.
 //!
-//! Only core files (the data file itself ends in `.vix`) carry an index —
-//! the file IS the index. Other data files (`.parquet`/`.vortex`) are
-//! index-less here: they keep the DataFusion filter and are answered by the
-//! scan path.
+//! Only core data files (ending in `.vix`) enter this path. Their optional
+//! `.vxi` sidecar supplies term indexes; indexless core files can still serve
+//! query shapes that need only native docs columns, file metadata, or zones.
+//! Legacy `.parquet`/`.vortex` files remain on the DataFusion scan path.
 //!
 //! Per-file evaluation uses an owned `buffer_unordered` bounded by
 //! `ZO_VIX_SEARCH_CONCURRENCY` (default 4x CPU cores, capped at 64): each
@@ -69,6 +69,7 @@ pub mod source;
 use std::{collections::HashSet, panic::AssertUnwindSafe, sync::Arc};
 
 use arrow::buffer::BooleanBuffer;
+pub use collect::{histogram_bucket, histogram_range_bucket};
 use config::{
     cluster::LOCAL_NODE,
     get_config,
@@ -98,6 +99,62 @@ use crate::{
     inspector::{SearchInspectorFieldsBuilder, search_inspector_fields},
     types::QueryParams,
 };
+
+fn fold_metadata_histogram(
+    files: &mut HashMap<String, FileKey>,
+    time_range: (i64, i64),
+    index_condition: &Option<IndexCondition>,
+    idx_optimize_mode: &Option<IndexOptimizeMode>,
+) -> Result<(Option<Vec<u64>>, usize), Error> {
+    let Some(condition) = index_condition.as_ref() else {
+        return Ok((None, 0));
+    };
+    let Some(IndexOptimizeMode::SimpleHistogram(min_value, bucket_width, num_buckets, ts_offset)) =
+        idx_optimize_mode.as_ref()
+    else {
+        return Ok((None, 0));
+    };
+    if !condition.is_condition_all() {
+        return Ok((None, 0));
+    }
+
+    let mut histogram = vec![0u64; *num_buckets];
+    let mut answered = Vec::new();
+    for (key, file) in files.iter() {
+        let file_in_range = time_range == (0, 0)
+            || (file.meta.min_ts >= time_range.0 && file.meta.max_ts < time_range.1);
+        if !is_core_file(&file.key) || !file_in_range || file.meta.records < 0 {
+            continue;
+        }
+        let bucket = histogram_range_bucket(
+            file.meta.min_ts,
+            file.meta.max_ts,
+            *min_value,
+            *bucket_width,
+            *num_buckets,
+            *ts_offset,
+        )
+        .map_err(|error| {
+            Error::Message(format!(
+                "metadata histogram bucket calculation failed for {}: {error:#}",
+                file.key
+            ))
+        })?;
+        let Some(bucket) = bucket else {
+            continue;
+        };
+        let rows = u64::try_from(file.meta.records)
+            .map_err(|_| Error::Message(format!("negative file row count for {}", file.key)))?;
+        histogram[bucket] = histogram[bucket].checked_add(rows).ok_or_else(|| {
+            Error::Message("metadata histogram bucket count overflowed u64".to_string())
+        })?;
+        answered.push(key.clone());
+    }
+    for key in &answered {
+        files.remove(key);
+    }
+    Ok((Some(histogram), answered.len()))
+}
 
 /// Filter file list using the vix inverted index.
 ///
@@ -148,15 +205,31 @@ pub async fn vix_search(
             query.time_range,
         );
     }
-    // Sidecar-backed core files always reach VIX evaluation. Every core file
-    // can also answer exact string-equality SimpleSelect and SimpleHistogram
-    // shapes from native docs columns without `_source`; the histogram path
-    // uses this for COLD indexed files too, avoiding the sidecar dictionary +
-    // dense-postings fetch storm. Legacy parquet/vortex files stay on the
-    // ordinary DataFusion path.
+    // Fold metadata-answerable ALL-histogram files as one bounded counter
+    // vector before constructing per-file futures. This is the dominant hot
+    // L0 shape and avoids thousands of task/result-vector allocations.
+    let (metadata_histogram, metadata_answered) = fold_metadata_histogram(
+        &mut file_list_map,
+        query.time_range,
+        &index_condition,
+        &idx_optimize_mode,
+    )?;
+    if metadata_answered > 0 {
+        log::info!(
+            "[trace_id {trace_id}] search->vix: metadata histogram answered {metadata_answered} files without object reads"
+        );
+    }
+    // Sidecar-backed core files always reach VIX evaluation. Indexless core
+    // files are also exact for the native equality select/histogram shapes
+    // and for a WHERE-less histogram: Condition::All needs no term index,
+    // and the reader folds its data-file zone table. Legacy parquet/vortex
+    // files stay on the ordinary DataFusion path.
     let single_equality = index_condition
         .as_ref()
         .is_some_and(|condition| condition.single_equal_term().is_some());
+    let condition_all = index_condition
+        .as_ref()
+        .is_some_and(IndexCondition::is_condition_all);
     let native_simple_select = single_equality
         && matches!(
             &idx_optimize_mode,
@@ -167,12 +240,15 @@ pub async fn vix_search(
             &idx_optimize_mode,
             Some(IndexOptimizeMode::SimpleHistogram(..))
         );
-    let native_docs_equality = native_simple_select || native_histogram;
+    let all_histogram = condition_all
+        && matches!(
+            &idx_optimize_mode,
+            Some(IndexOptimizeMode::SimpleHistogram(..))
+        );
+    let data_only_capable = native_simple_select || native_histogram || all_histogram;
     let eval_files = file_list_map
         .values()
-        .filter(|file| {
-            is_core_file(&file.key) && (file.meta.index_size > 0 || native_docs_equality)
-        })
+        .filter(|file| is_core_file(&file.key) && (file.meta.index_size > 0 || data_only_capable))
         .cloned()
         .collect_vec();
     // Whole-sidecar caching and its metrics still cover only actual `.vxi`
@@ -304,6 +380,9 @@ pub async fn vix_search(
 
     let mut no_more_files = false;
     let mut result_builder = MultiResultBuilder::new(&idx_optimize_mode, &index_parquet_files);
+    if let Some(histogram) = metadata_histogram {
+        result_builder.add_histogram(histogram);
+    }
     log::info!(
         "[trace_id {trace_id}] search->vix: target_partitions: {target_partitions}, file_groups: {}",
         index_parquet_files.len(),
@@ -349,12 +428,13 @@ pub async fn vix_search(
 
     // M14: query-shaped cold-open prefetch (ranged mode). Cold sidecar paths
     // pay the data footer + sidecar footer/dictionary directory in one
-    // bounded-concurrency wave. A single-equality histogram deliberately
-    // skips that wave: cold files stream the two native docs columns instead
-    // of opening their sidecars, while files with memoized readers retain the
-    // faster index path.
-    let prefetch_enabled =
-        read_mode == VixReadMode::Ranged && cfg.common.vix_query_prefetch && !native_histogram;
+    // bounded-concurrency wave. Equality histograms use native docs columns;
+    // ALL histograms first use file metadata and then the data-file zone
+    // table, so prefetching every sidecar would turn zero-read files into IO.
+    let prefetch_enabled = read_mode == VixReadMode::Ranged
+        && cfg.common.vix_query_prefetch
+        && !native_histogram
+        && !all_histogram;
     #[cfg(test)]
     let prefetch_enabled = tests::prefetch_override(trace_id).unwrap_or(prefetch_enabled);
     // wave bytes prefetched so far (all-files costs, paid once): the bail
@@ -547,10 +627,11 @@ pub async fn vix_search(
                     files_evaluated += 1;
                     if bail_bytes_cap > 0
                         && idx_optimize_mode.is_some()
-                        // Native SimpleSelect stays bounded by K and never
-                        // decodes `_source`; bailing it to a wide scan is
-                        // strictly more expensive regardless of selectivity.
+                        // Native SimpleSelect stays bounded by K, and an ALL
+                        // histogram uses metadata/zones. Bailing either to a
+                        // wide scan is strictly more expensive.
                         && !native_simple_select
+                        && !all_histogram
                         && files_evaluated >= BAIL_SAMPLE_FILES
                         && files_evaluated < files_total
                         && !eval_bail.load(std::sync::atomic::Ordering::Relaxed)
@@ -1178,17 +1259,22 @@ async fn search_vix_index(
         }
     }
 
-    // Data-only core files have no sidecar. A COLD indexed equality histogram
-    // also uses the native docs columns: a representative production file
-    // needed 848 KiB / 7 ranged reads versus the MB-class sidecar dictionary
-    // plus dense postings walk. Memoized readers keep the lower-CPU index path.
+    // Data-only equality shapes use the native docs helper. An ALL histogram
+    // instead opens a VixReader without a sidecar: its eval(All) and zone
+    // collector are exact and avoid scanning `_source`.
     let cold_native_histogram = condition.single_equal_term().is_some()
         && matches!(
             &idx_optimize_rule,
             Some(IndexOptimizeMode::SimpleHistogram(..))
         )
         && !reader_cache::GLOBAL_CACHE.contains(&vix_file_name);
-    if parquet_file.meta.index_size <= 0 || cold_native_histogram {
+    let data_only_all_histogram = parquet_file.meta.index_size <= 0
+        && condition.is_condition_all()
+        && matches!(
+            &idx_optimize_rule,
+            Some(IndexOptimizeMode::SimpleHistogram(..))
+        );
+    if (parquet_file.meta.index_size <= 0 && !data_only_all_histogram) || cold_native_histogram {
         return search_vix_docs_optimized(
             trace_id,
             &condition,
@@ -1213,8 +1299,8 @@ async fn search_vix_index(
                 Some(VixReaderInput::Shared(reader))
             } else {
                 // v3 split: the data object's exact size is compressed_size;
-                // the `.vxi` sidecar's is index_size (> 0 for every file
-                // this path evaluates — the caller gates on it)
+                // the optional `.vxi` sidecar is attached only when this
+                // file's metadata reports a positive index_size.
                 u64::try_from(parquet_file.meta.compressed_size)
                     .ok()
                     .filter(|size| *size > 0)
@@ -4431,6 +4517,174 @@ mod tests {
             MultiResult::Histogram(histogram) => assert_eq!(histogram, vec![4, 5, 1, 0, 0]),
             other => panic!("expected native histogram, got {other:?}"),
         }
+    }
+
+    /// A fully covered indexless file whose metadata range fits one bucket
+    /// is answered without touching an object. The key deliberately does not
+    /// exist in storage: any accidental open makes the test fail.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_indexless_all_histogram_uses_file_metadata() {
+        let params = Arc::new(crate::types::QueryParams {
+            trace_id: "all-histogram-metadata".to_string(),
+            org_id: "org".to_string(),
+            stream: datafusion::sql::TableReference::from("t"),
+            stream_type: StreamType::Logs,
+            stream_name: "t".to_string(),
+            time_range: (990, 1_010),
+            work_group: None,
+            use_inverted_index: true,
+        });
+        let mut condition = IndexCondition::new();
+        condition.add_condition(Condition::All());
+        let mut files = vec![FileKey {
+            key: "files/org/logs/native-histogram/2026/01/01/00/missing.vix".to_string(),
+            meta: FileMeta {
+                min_ts: 991,
+                max_ts: 1_000,
+                records: 10,
+                compressed_size: 4_096,
+                index_size: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        }];
+
+        let (_took, add_filter_back, result) = vix_search(
+            params,
+            &mut files,
+            Some(condition),
+            Some(IndexOptimizeMode::SimpleHistogram(990, 20, 2, 0)),
+        )
+        .await
+        .unwrap();
+
+        assert!(!add_filter_back);
+        assert!(files.is_empty(), "metadata histogram must remove the file");
+        match result {
+            MultiResult::Histogram(histogram) => assert_eq!(histogram, vec![10, 0]),
+            other => panic!("expected metadata histogram, got {other:?}"),
+        }
+    }
+    /// Production-shape smoke: every one of the 4,569 indexless current-hour
+    /// ranges is metadata-answerable. Besides exact totals, nonexistent object
+    /// keys prove the fan-out performs zero data/index reads.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_indexless_all_histogram_scales_across_current_hour_file_count() {
+        const FILES: usize = 4_569;
+        const BUCKETS: usize = 121;
+        const WIDTH: u64 = 30_000_000;
+        const ORIGIN: i64 = 1_000_000_000_000;
+
+        let mut expected = vec![0u64; BUCKETS];
+        let mut files = Vec::with_capacity(FILES);
+        for i in 0..FILES {
+            let bucket = i % BUCKETS;
+            let min_ts = ORIGIN + bucket as i64 * WIDTH as i64 + 1;
+            let records = (i % 97 + 1) as i64;
+            expected[bucket] += records as u64;
+            files.push(FileKey {
+                key: format!("files/org/logs/native-histogram/2026/01/01/00/missing-{i}.vix"),
+                meta: FileMeta {
+                    min_ts,
+                    max_ts: min_ts + 1_000,
+                    records,
+                    compressed_size: 4_096,
+                    index_size: 0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        }
+        let params = Arc::new(crate::types::QueryParams {
+            trace_id: "all-histogram-current-hour-scale".to_string(),
+            org_id: "org".to_string(),
+            stream: datafusion::sql::TableReference::from("t"),
+            stream_type: StreamType::Logs,
+            stream_name: "t".to_string(),
+            time_range: (ORIGIN, ORIGIN + WIDTH as i64 * BUCKETS as i64),
+            work_group: None,
+            use_inverted_index: true,
+        });
+        let mut condition = IndexCondition::new();
+        condition.add_condition(Condition::All());
+        let mode = IndexOptimizeMode::SimpleHistogram(ORIGIN, WIDTH, BUCKETS, 0);
+
+        // Warm process-global config/cache initialization outside the timed
+        // run; production queriers pay it at startup, not per request.
+        let mut warmup_files = files.clone();
+        vix_search(
+            Arc::clone(&params),
+            &mut warmup_files,
+            Some(condition.clone()),
+            Some(mode.clone()),
+        )
+        .await
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        let (reported_ms, add_filter_back, result) =
+            vix_search(params, &mut files, Some(condition), Some(mode))
+                .await
+                .unwrap();
+
+        eprintln!(
+            "metadata-only histogram: {FILES} files, {BUCKETS} buckets, reported {reported_ms} ms, wall {} ms",
+            started.elapsed().as_millis()
+        );
+        assert!(!add_filter_back);
+        assert!(files.is_empty());
+        match result {
+            MultiResult::Histogram(histogram) => assert_eq!(histogram, expected),
+            other => panic!("expected scaled metadata histogram, got {other:?}"),
+        }
+    }
+
+    /// A bucket-straddling indexless file opens its data object without a
+    /// sidecar and uses the existing zone/timestamp collector.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_indexless_all_histogram_uses_zone_collector() {
+        let mut master = store_core_file(
+            "files/org/logs/native-histogram/2026/01/01/00/all-boundary.vix",
+            1_000,
+        )
+        .await;
+        master.meta.index_size = 0;
+        let key = master.key.clone();
+        reader_cache::GLOBAL_CACHE.remove(&key);
+        vix_result_cache::GLOBAL_CACHE.remove_file_entries(std::iter::once(key.as_str()));
+        let params = Arc::new(crate::types::QueryParams {
+            trace_id: "all-histogram-zone".to_string(),
+            org_id: "org".to_string(),
+            stream: datafusion::sql::TableReference::from("t"),
+            stream_type: StreamType::Logs,
+            stream_name: "t".to_string(),
+            time_range: (990, 1_010),
+            work_group: None,
+            use_inverted_index: true,
+        });
+        let mut condition = IndexCondition::new();
+        condition.add_condition(Condition::All());
+        let mut files = vec![master];
+
+        let (_took, add_filter_back, result) = vix_search(
+            params,
+            &mut files,
+            Some(condition),
+            Some(IndexOptimizeMode::SimpleHistogram(990, 5, 5, 0)),
+        )
+        .await
+        .unwrap();
+
+        assert!(!add_filter_back);
+        assert!(files.is_empty(), "zone histogram must remove the file");
+        match result {
+            MultiResult::Histogram(histogram) => assert_eq!(histogram, vec![4, 5, 1, 0, 0]),
+            other => panic!("expected zone histogram, got {other:?}"),
+        }
+        assert!(
+            reader_cache::GLOBAL_CACHE.contains(&key),
+            "bucket-straddling ALL histogram must open the data-only reader"
+        );
     }
 
     /// A cold indexed equality histogram must use the data-only native docs

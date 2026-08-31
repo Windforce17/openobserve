@@ -58,9 +58,11 @@ use crate::{types::QueryParams, vix::MultiResult};
 #[derive(Debug)]
 pub struct IndexOptimizeExec {
     query: Arc<QueryParams>,
-    schema: SchemaRef,       // The schema for the produced row
-    file_list: Vec<FileKey>, // The files the result covers (display/logging)
-    /// The precomputed index result, taken by the (single) execution.
+    schema: SchemaRef, // The schema for the produced row
+    /// Core VIX files represented by the result, for display only. Direct
+    /// segment-WAL contributions can also be folded into `result`.
+    file_list: Vec<FileKey>,
+    /// The precomputed aggregate result, taken by the single execution.
     result: parking_lot::Mutex<Option<MultiResult>>,
     cache: Arc<PlanProperties>, // Cached properties of this plan
     index_optimize_mode: IndexOptimizeMode, // Type of query the vix index optimizes
@@ -150,10 +152,10 @@ impl ExecutionPlan for IndexOptimizeExec {
             );
         }
 
-        // The precomputed result covers this exec's whole file list; it is
-        // consumed by the (single) execution. A second execution has nothing
-        // to serve — error loudly rather than emit an empty (= wrong)
-        // aggregate contribution.
+        // The precomputed result is consumed by the single execution. It can
+        // combine core VIX files and direct segment-WAL histogram counters.
+        // A second execution has nothing to serve — error loudly rather than
+        // emit an empty (= wrong) aggregate contribution.
         let Some(result) = self.result.lock().take() else {
             return internal_err!("IndexOptimizeExec result was already consumed");
         };
@@ -162,7 +164,7 @@ impl ExecutionPlan for IndexOptimizeExec {
         let timer = metrics.elapsed_compute().timer();
 
         log::info!(
-            "[trace_id {}] search->storage: stream {}/{}/{}, IndexOptimizeExec serving the precomputed index result ({result}) over {} files",
+            "[trace_id {}] search->storage: stream {}/{}/{}, IndexOptimizeExec serving the precomputed result over {} core files (plus any direct segment contribution)",
             self.query.trace_id,
             self.query.org_id,
             self.query.stream_type,
@@ -401,9 +403,9 @@ fn create_min_max_arrow_array(
         (arrow_schema::DataType::UInt64, MinMaxValue::U64(v)) => {
             Arc::new(UInt64Array::from(vec![*v]))
         }
-        (arrow_schema::DataType::UInt64, MinMaxValue::I64(v)) => Arc::new(UInt64Array::from(
-            vec![u64::try_from(*v).map_err(|_| mismatch(&value))?],
-        )),
+        (arrow_schema::DataType::UInt64, MinMaxValue::I64(v)) => Arc::new(UInt64Array::from(vec![
+            u64::try_from(*v).map_err(|_| mismatch(&value))?,
+        ])),
         (arrow_schema::DataType::Float64, MinMaxValue::F64(v)) => {
             Arc::new(arrow::array::Float64Array::from(vec![*v]))
         }
@@ -836,14 +838,21 @@ mod tests {
         assert_eq!(batches.len(), 1);
         let count = batches[0].column(0);
         assert_eq!(
-            count.as_any().downcast_ref::<Int64Array>().unwrap().value(0),
+            count
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
             42
         );
 
         // min/max: one typed row
-        let i64_schema: SchemaRef = Arc::new(arrow_schema::Schema::new(vec![
-            arrow_schema::Field::new("min(t.f)", DataType::Int64, true),
-        ]));
+        let i64_schema: SchemaRef =
+            Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                "min(t.f)",
+                DataType::Int64,
+                true,
+            )]));
         let batches = adapt_index_result(
             &i64_schema,
             &IndexOptimizeMode::SimpleMinMax("f".to_string(), false),
@@ -860,9 +869,12 @@ mod tests {
                 .value(0),
             -7
         );
-        let f64_schema: SchemaRef = Arc::new(arrow_schema::Schema::new(vec![
-            arrow_schema::Field::new("max(t.f)", DataType::Float64, true),
-        ]));
+        let f64_schema: SchemaRef =
+            Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                "max(t.f)",
+                DataType::Float64,
+                true,
+            )]));
         let batches = adapt_index_result(
             &f64_schema,
             &IndexOptimizeMode::SimpleMinMax("f".to_string(), true),

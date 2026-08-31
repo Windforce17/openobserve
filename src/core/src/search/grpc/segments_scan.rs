@@ -624,6 +624,305 @@ pub async fn search(
     )?;
     Ok((tables, scan_stats))
 }
+/// Direct segment-WAL path for a no-filter histogram. Matching frames whose
+/// exact bounds are wholly inside the half-open query window and one bucket
+/// contribute their declared row count without parsing Arrow IPC. Only
+/// window- or bucket-straddling frames decode, and decoded batches are
+/// consumed immediately rather than retained or wrapped in a MemTable.
+///
+/// As with [`search`], every assigned id must resolve and every fetched
+/// object must decompress and pass its frame CRCs. Any failure aborts the
+/// whole query rather than returning a partial histogram.
+pub async fn search_histogram(
+    query: Arc<super::QueryParams>,
+    segment_ids: &[i64],
+    min_value: i64,
+    bucket_width: u64,
+    num_buckets: usize,
+    ts_offset: i64,
+) -> Result<(Vec<u64>, ScanStats)> {
+    let trace_id = &query.trace_id;
+    let mut histogram = vec![0u64; num_buckets];
+    if segment_ids.is_empty() {
+        return Ok((histogram, ScanStats::new()));
+    }
+    if segment_ids.len() > MAX_QUERY_SEGMENTS {
+        return Err(Error::Message(format!(
+            "[SEGMENT:SCAN] {}/{}/{}: assigned {} segments exceed the per-query cap {MAX_QUERY_SEGMENTS}",
+            query.org_id,
+            query.stream_type,
+            query.stream_name,
+            segment_ids.len()
+        )));
+    }
+    let load_start = std::time::Instant::now();
+
+    let rows = wal_segments::get_by_ids(segment_ids).await?;
+    let metas = resolve_assigned(segment_ids, rows, &query.org_id, &query.stream_name)?;
+
+    let mut scan_stats = ScanStats::new();
+    scan_stats.files = metas.len() as i64;
+    scan_stats.querier_files = scan_stats.files;
+
+    // Keep cache warming and its accounting identical to the regular
+    // segment scan. Reads below use the same cache-backed accessor.
+    let account = SEGMENT_STORAGE_ACCOUNT.to_string();
+    let cache_tuples = metas
+        .iter()
+        .map(|m| (-m.id, &account, &m.object_key, m.size, m.max_ts, 0i64))
+        .collect::<Vec<_>>();
+    let (_cache_type, cache_hits, cache_misses) =
+        ::search::file_cache::cache_files(trace_id, &cache_tuples, &mut scan_stats, "segment")
+            .await;
+    metrics::QUERY_DISK_CACHE_HIT_COUNT
+        .with_label_values(&[query.org_id.as_str(), query.stream_type.as_str(), "segment"])
+        .inc_by(cache_hits);
+    metrics::QUERY_DISK_CACHE_MISS_COUNT
+        .with_label_values(&[query.org_id.as_str(), query.stream_type.as_str(), "segment"])
+        .inc_by(cache_misses);
+
+    ingester::check_memory_circuit_breaker().map_err(|e| Error::ResourceError(e.to_string()))?;
+
+    // Match the regular path's bounded fetch/decode waves. A wave retains
+    // only one fixed counter vector per in-flight segment; decoded
+    // RecordBatches live solely for the duration of their frame callback.
+    let decode_wave = get_config().common.segment_scan_decode_wave.max(1);
+    let mut next_meta = 0usize;
+    while next_meta < metas.len() {
+        let wave_end = (next_meta + decode_wave).min(metas.len());
+        let wave = &metas[next_meta..wave_end];
+        next_meta = wave_end;
+        let decoded = futures::future::try_join_all(wave.iter().map(|meta| {
+            let org_id = query.org_id.clone();
+            let stream_type = query.stream_type;
+            let stream_name = query.stream_name.clone();
+            let time_range = query.time_range;
+            async move {
+                let bytes = file_data::get(SEGMENT_STORAGE_ACCOUNT, &meta.object_key, None)
+                    .await
+                    .map_err(|e| {
+                        Error::Message(format!(
+                            "[SEGMENT:SCAN] fetch segment object {} (id {}) failed: {e}",
+                            meta.object_key, meta.id
+                        ))
+                    })?;
+                let compressed_len = bytes.len();
+                let object_key = meta.object_key.clone();
+                let scanned = tokio::task::spawn_blocking(move || {
+                    scan_segment_histogram(
+                        &bytes,
+                        &org_id,
+                        stream_type,
+                        &stream_name,
+                        time_range,
+                        min_value,
+                        bucket_width,
+                        num_buckets,
+                        ts_offset,
+                    )
+                    .map_err(|e| {
+                        Error::Message(format!(
+                            "[SEGMENT:SCAN] decode segment object {object_key} failed: {e:#}"
+                        ))
+                    })
+                })
+                .await
+                .map_err(|e| {
+                    Error::Message(format!(
+                        "[SEGMENT:SCAN] decode task for segment object {} (id {}) did not complete: {e}",
+                        meta.object_key, meta.id
+                    ))
+                })??;
+                Ok::<_, Error>((compressed_len, scanned))
+            }
+        }))
+        .await?;
+
+        for (compressed_len, scanned) in decoded {
+            scan_stats.compressed_size += compressed_len as i64;
+            scan_stats.records += scanned.rows_examined;
+            for (total, count) in histogram.iter_mut().zip(scanned.histogram) {
+                *total = total.checked_add(count).ok_or_else(|| {
+                    Error::Message("[SEGMENT:SCAN] histogram count overflow".to_string())
+                })?;
+            }
+        }
+        tokio::task::coop::consume_budget().await;
+    }
+
+    log::info!(
+        "[trace_id {trace_id}] segments_scan histogram: {}/{}/{} loaded {} segments, records {}, compressed_size {}, took {} ms",
+        query.org_id,
+        query.stream_type,
+        query.stream_name,
+        metas.len(),
+        scan_stats.records,
+        scan_stats.compressed_size,
+        load_start.elapsed().as_millis(),
+    );
+    Ok((histogram, scan_stats))
+}
+
+#[derive(Debug)]
+struct ScannedHistogram {
+    histogram: Vec<u64>,
+    rows_examined: i64,
+    #[cfg(test)]
+    decoded_frames: usize,
+}
+
+/// Consume one segment into fixed histogram counters. `decode_segment_filtered`
+/// still walks and CRC-checks every frame; returning false merely avoids IPC
+/// parsing for irrelevant or whole-frame-folded data.
+#[allow(clippy::too_many_arguments)]
+fn scan_segment_histogram(
+    bytes: &[u8],
+    org_id: &str,
+    stream_type: StreamType,
+    stream_name: &str,
+    time_range: (i64, i64),
+    min_value: i64,
+    bucket_width: u64,
+    num_buckets: usize,
+    ts_offset: i64,
+) -> anyhow::Result<ScannedHistogram> {
+    // Validate the shared grid arithmetic once. The selector cannot return
+    // an error, so all subsequent range-helper calls are then infallible.
+    if num_buckets != 0 {
+        let _ = ::search::vix::histogram_bucket(
+            min_value,
+            min_value,
+            bucket_width,
+            num_buckets,
+            ts_offset,
+        )?;
+    }
+
+    let histogram = std::cell::RefCell::new(vec![0u64; num_buckets]);
+    let rows_examined = std::cell::Cell::new(0i64);
+    let selector_error = std::cell::RefCell::new(None::<anyhow::Error>);
+    #[cfg(test)]
+    let decoded_frames = std::cell::Cell::new(0usize);
+
+    segment_wal::format::decode_segment_filtered(
+        bytes,
+        |info| {
+            if selector_error.borrow().is_some()
+                || info.org != org_id
+                || info.stream_type != stream_type
+                || info.stream != stream_name
+                || !frame_time_overlaps_half_open(info.min_ts, info.max_ts, time_range)
+            {
+                return false;
+            }
+
+            let Some(rows) = rows_examined.get().checked_add(i64::from(info.rows)) else {
+                *selector_error.borrow_mut() =
+                    Some(anyhow::anyhow!("segment histogram row count overflow"));
+                return false;
+            };
+            rows_examined.set(rows);
+
+            if frame_fully_inside_half_open(info.min_ts, info.max_ts, time_range) {
+                match ::search::vix::histogram_range_bucket(
+                    info.min_ts,
+                    info.max_ts,
+                    min_value,
+                    bucket_width,
+                    num_buckets,
+                    ts_offset,
+                ) {
+                    Ok(Some(bucket)) => {
+                        let mut counts = histogram.borrow_mut();
+                        let Some(count) = counts[bucket].checked_add(u64::from(info.rows)) else {
+                            *selector_error.borrow_mut() =
+                                Some(anyhow::anyhow!("segment histogram bucket count overflow"));
+                            return false;
+                        };
+                        counts[bucket] = count;
+                        return false;
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        *selector_error.borrow_mut() = Some(err);
+                        return false;
+                    }
+                }
+            }
+            true
+        },
+        |frame| {
+            #[cfg(test)]
+            decoded_frames.set(decoded_frames.get() + 1);
+            let timestamps = frame
+                .batch
+                .column_by_name(TIMESTAMP_COL_NAME)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "stream {}/{}/{}: decoded histogram frame lacks {TIMESTAMP_COL_NAME}",
+                        frame.org,
+                        frame.stream_type,
+                        frame.stream
+                    )
+                })?
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "stream {}/{}/{}: decoded histogram frame {TIMESTAMP_COL_NAME} is not Int64",
+                        frame.org,
+                        frame.stream_type,
+                        frame.stream
+                    )
+                })?;
+            let mut counts = histogram.borrow_mut();
+            for timestamp in timestamps.iter().flatten() {
+                if !timestamp_inside_half_open(timestamp, time_range) {
+                    continue;
+                }
+                if let Some(bucket) = ::search::vix::histogram_bucket(
+                    timestamp,
+                    min_value,
+                    bucket_width,
+                    num_buckets,
+                    ts_offset,
+                )? {
+                    counts[bucket] = counts[bucket].checked_add(1).ok_or_else(|| {
+                        anyhow::anyhow!("segment histogram bucket count overflow")
+                    })?;
+                }
+            }
+            Ok(())
+        },
+    )?;
+
+    if let Some(err) = selector_error.into_inner() {
+        return Err(err);
+    }
+    Ok(ScannedHistogram {
+        histogram: histogram.into_inner(),
+        rows_examined: rows_examined.get(),
+        #[cfg(test)]
+        decoded_frames: decoded_frames.get(),
+    })
+}
+
+/// Exact overlap with the query's half-open `[start, end)` row semantics.
+/// `(0, 0)` retains the existing segment-scan convention of no time bound.
+fn frame_time_overlaps_half_open(frame_min: i64, frame_max: i64, time_range: (i64, i64)) -> bool {
+    time_range == (0, 0)
+        || (time_range.0 < time_range.1 && frame_max >= time_range.0 && frame_min < time_range.1)
+}
+
+fn frame_fully_inside_half_open(frame_min: i64, frame_max: i64, time_range: (i64, i64)) -> bool {
+    time_range == (0, 0)
+        || (time_range.0 < time_range.1 && frame_min >= time_range.0 && frame_max < time_range.1)
+}
+
+fn timestamp_inside_half_open(timestamp: i64, time_range: (i64, i64)) -> bool {
+    time_range == (0, 0)
+        || (time_range.0 < time_range.1 && timestamp >= time_range.0 && timestamp < time_range.1)
+}
 
 /// One scanned segment object's contribution: rows examined (pre-prune, for
 /// stats) and the kept batches, each flagged `is_exact` (its surviving rows
@@ -641,9 +940,8 @@ struct ScannedSegment {
     stream_frames: i64,
 }
 
-/// Streaming scan of one segment object: decompress frame by frame, offer
-/// each frame's identity to [`frame_matches`] (other streams and
-/// out-of-range frames skip IPC parsing entirely), and run kept frames
+/// Streaming scan of one segment object: inspect each frame's stream identity
+/// and time range before IPC parsing, then run kept frames
 /// through condition prune + plan projection immediately, so peak memory is
 /// one frame plus its post-projection remnant — never the whole payload.
 #[allow(clippy::too_many_arguments)]
@@ -700,22 +998,6 @@ fn scan_segment_object(
     )?;
     out.stream_frames = stream_frames;
     Ok(out)
-}
-
-/// Frame eligibility for a query: stream identity plus the file-overlap
-/// time test (closed range, mirroring the WAL parquet skip check;
-/// `(0, 0)` means unbounded).
-fn frame_matches(
-    info: &segment_wal::format::FrameInfo,
-    org_id: &str,
-    stream_type: StreamType,
-    stream_name: &str,
-    time_range: (i64, i64),
-) -> bool {
-    info.org == org_id
-        && info.stream_type == stream_type
-        && info.stream == stream_name
-        && frame_time_overlaps(info.min_ts, info.max_ts, time_range)
 }
 
 /// File-overlap time semantics; `(0, 0)` means unbounded.
@@ -2017,6 +2299,224 @@ mod tests {
         let needed: HashSet<String> = needed.iter().map(|s| s.to_string()).collect();
         scan_segment_object(encoded, org, stype, stream, range, None, &[], &needed)
             .expect("scan segment")
+    }
+    #[test]
+    fn histogram_filters_stream_and_window_and_folds_single_bucket_frames() {
+        let header = SegmentHeader {
+            node_uuid: "node-histogram-fold".to_string(),
+            seq: 1,
+            created_at: 1_700_000_000_000_000,
+        };
+        let frames = vec![
+            frame(
+                "other-org",
+                StreamType::Logs,
+                "app1",
+                102,
+                108,
+                ts_batch("v", &[102], Some(&[1])),
+            ),
+            frame(
+                "org1",
+                StreamType::Traces,
+                "app1",
+                102,
+                108,
+                ts_batch("v", &[102], Some(&[1])),
+            ),
+            frame(
+                "org1",
+                StreamType::Logs,
+                "other-stream",
+                102,
+                108,
+                ts_batch("v", &[102], Some(&[1])),
+            ),
+            frame(
+                "org1",
+                StreamType::Logs,
+                "app1",
+                80,
+                90,
+                ts_batch("v", &[80, 90], Some(&[1, 2])),
+            ),
+            frame(
+                "org1",
+                StreamType::Logs,
+                "app1",
+                102,
+                108,
+                ts_batch("v", &[102, 105, 108], Some(&[1, 2, 3])),
+            ),
+        ];
+        let encoded = encode_segment(&header, &frames).expect("encode segment");
+        let scanned = scan_segment_histogram(
+            &encoded,
+            "org1",
+            StreamType::Logs,
+            "app1",
+            (100, 130),
+            100,
+            10,
+            3,
+            0,
+        )
+        .expect("scan histogram");
+
+        assert_eq!(scanned.histogram, vec![3, 0, 0]);
+        assert_eq!(
+            scanned.rows_examined, 3,
+            "foreign and out-of-window frame rows do not enter scan stats"
+        );
+        assert_eq!(
+            scanned.decoded_frames, 0,
+            "the matching single-bucket frame must fold from FrameInfo.rows"
+        );
+    }
+
+    #[test]
+    fn histogram_decodes_window_and_bucket_boundaries_with_half_open_bounds() {
+        let header = SegmentHeader {
+            node_uuid: "node-histogram-boundaries".to_string(),
+            seq: 2,
+            created_at: 1_700_000_000_000_000,
+        };
+        let frames = vec![
+            // Query-start straddle: 90 drops, 100 is included.
+            frame(
+                "org1",
+                StreamType::Logs,
+                "app1",
+                90,
+                100,
+                ts_batch("v", &[90, 100], Some(&[1, 2])),
+            ),
+            // Bucket edge: each side lands exactly once.
+            frame(
+                "org1",
+                StreamType::Logs,
+                "app1",
+                109,
+                110,
+                ts_batch("v", &[109, 110], Some(&[3, 4])),
+            ),
+            // Query-end straddle: 129 is included, 130 is excluded.
+            frame(
+                "org1",
+                StreamType::Logs,
+                "app1",
+                129,
+                130,
+                ts_batch("v", &[129, 130], Some(&[5, 6])),
+            ),
+        ];
+        let encoded = encode_segment(&header, &frames).expect("encode segment");
+        let scanned = scan_segment_histogram(
+            &encoded,
+            "org1",
+            StreamType::Logs,
+            "app1",
+            (100, 130),
+            100,
+            10,
+            3,
+            0,
+        )
+        .expect("scan histogram");
+
+        assert_eq!(
+            scanned.histogram,
+            vec![2, 1, 1],
+            "100+109, 110, and 129 count once; 90 and the exclusive end 130 drop"
+        );
+        assert_eq!(
+            scanned.rows_examined, 6,
+            "scan stats retain pre-window frame-row accounting"
+        );
+        assert_eq!(scanned.decoded_frames, 3);
+    }
+
+    #[test]
+    fn histogram_whole_frame_fold_uses_timestamp_offset_grid() {
+        let header = SegmentHeader {
+            node_uuid: "node-histogram-offset".to_string(),
+            seq: 3,
+            created_at: 1_700_000_000_000_000,
+        };
+        let frames = vec![
+            frame(
+                "org1",
+                StreamType::Logs,
+                "app1",
+                100,
+                109,
+                ts_batch("v", &[100, 109], Some(&[1, 2])),
+            ),
+            frame(
+                "org1",
+                StreamType::Logs,
+                "app1",
+                110,
+                110,
+                ts_batch("v", &[110], Some(&[3])),
+            ),
+        ];
+        let encoded = encode_segment(&header, &frames).expect("encode segment");
+        let scanned = scan_segment_histogram(
+            &encoded,
+            "org1",
+            StreamType::Logs,
+            "app1",
+            (100, 120),
+            102,
+            10,
+            2,
+            2,
+        )
+        .expect("scan histogram");
+
+        assert_eq!(scanned.histogram, vec![2, 1]);
+        assert_eq!(scanned.rows_examined, 3);
+        assert_eq!(
+            scanned.decoded_frames, 0,
+            "offset-adjusted single-bucket frames still avoid IPC callbacks"
+        );
+    }
+
+    #[test]
+    fn histogram_folded_frames_still_surface_segment_corruption() {
+        let header = SegmentHeader {
+            node_uuid: "node-histogram-corrupt".to_string(),
+            seq: 4,
+            created_at: 1_700_000_000_000_000,
+        };
+        let frames = vec![frame(
+            "org1",
+            StreamType::Logs,
+            "app1",
+            101,
+            102,
+            ts_batch("v", &[101, 102], Some(&[1, 2])),
+        )];
+        let mut encoded = encode_segment(&header, &frames).expect("encode segment");
+        let middle = encoded.len() / 2;
+        encoded[middle] ^= 0x55;
+
+        assert!(
+            scan_segment_histogram(
+                &encoded,
+                "org1",
+                StreamType::Logs,
+                "app1",
+                (100, 110),
+                100,
+                10,
+                1,
+                0,
+            )
+            .is_err(),
+            "CRC or decompression corruption must remain a hard error even when IPC is skipped"
+        );
     }
 
     #[test]

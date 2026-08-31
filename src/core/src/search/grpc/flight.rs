@@ -44,8 +44,8 @@ use hashbrown::{HashMap, HashSet};
 use infra::{
     errors::{Error, ErrorCodes},
     schema::{
-        get_stream_setting_bloom_filter_fields,
-        get_stream_setting_fts_fields, unwrap_stream_settings,
+        get_stream_setting_bloom_filter_fields, get_stream_setting_fts_fields,
+        unwrap_stream_settings,
     },
 };
 use itertools::Itertools;
@@ -204,8 +204,10 @@ pub async fn search(
     // schema field a docs column of the files that carry it — the per-file
     // capability probes remain the correctness backstop, so the plan-level
     // eligibility set is simply the schema's fields
-    let column_store_fields: HashSet<String> =
-        latest_schema_map.keys().map(|name| name.to_string()).collect();
+    let column_store_fields: HashSet<String> = latest_schema_map
+        .keys()
+        .map(|name| name.to_string())
+        .collect();
     let bloom_indexed_fields = get_stream_setting_bloom_filter_fields(&stream_settings)
         .into_iter()
         .filter(|v| latest_schema_map.contains_key(v))
@@ -358,10 +360,11 @@ pub async fn search(
             (Vec::new(), file_list)
         } else {
             handle_index_optimize(
-                &mut storage_idx_optimize_rule, // pass by mutable reference
+                &mut storage_idx_optimize_rule,
                 file_list,
                 query_params.time_range,
                 &column_store_fields,
+                index_condition.as_ref(),
             )
             .await?
         };
@@ -379,16 +382,14 @@ pub async fn search(
             match idx_optimize_rule.clone() {
                 Some(agg_mode) => {
                     let all_index_files = index_file_list.clone();
-                    let (idx_took, _add_filter_back, result) =
-                        super::storage::vix_search(
-                            query_params.clone(),
-                            &mut index_file_list,
-                            index_condition.clone(),
-                            Some(agg_mode),
-                        )
-                        .await?;
-                    scan_stats.idx_took =
-                        std::cmp::max(scan_stats.idx_took, idx_took as i64);
+                    let (idx_took, _add_filter_back, result) = super::storage::vix_search(
+                        query_params.clone(),
+                        &mut index_file_list,
+                        index_condition.clone(),
+                        Some(agg_mode),
+                    )
+                    .await?;
+                    scan_stats.idx_took = std::cmp::max(scan_stats.idx_took, idx_took as i64);
                     if !index_file_list.is_empty() {
                         log::warn!(
                             "[trace_id {trace_id}] flight->search: {} of {} index files could not be answered by the aggregate fast path, moving them to the scan branch",
@@ -451,12 +452,23 @@ pub async fn search(
             .await;
         }
 
+        // An unsorted ALL histogram neither orders nor prunes residual files
+        // from footer statistics. Avoid reopening every fallback object
+        // during planning solely to rediscover bounds already in FileKey.
+        let collect_file_stats = !(index_condition
+            .as_ref()
+            .is_some_and(IndexCondition::is_condition_all)
+            && matches!(
+                &idx_optimize_rule,
+                Some(IndexOptimizeMode::SimpleHistogram(..))
+            ));
         let storage_search_start = std::time::Instant::now();
         let (tbls, stats, _) = match super::storage::search(
             query_params.clone(),
             latest_schema.clone(),
             &file_list,
             empty_exec.sorted_by_time(),
+            collect_file_stats,
             file_stats_cache.clone(),
             index_condition.clone(),
             fst_fields.clone(),
@@ -495,57 +507,112 @@ pub async fn search(
         scan_stats.add(&stats);
     }
 
-    // scan assigned segment-WAL objects (negative ticket ids). Errors MUST
+    // Scan assigned segment-WAL objects (negative ticket ids). Errors MUST
     // fail the query: a silently missing segment is silent partial data.
     if !segment_ids.is_empty() {
         let segments_scan_start = std::time::Instant::now();
-        // The plan's LIMIT rides on the SimpleSelect optimizer rule, not the
-        // scan node (DataFusion keeps the fetch above the sort, so
-        // empty_exec.limit() is None for the UI's ORDER BY _timestamp DESC
-        // LIMIT n shape). DESC only — an ascending scan reads from the
-        // sealed end and top-n-newest trimming does not apply.
-        let segment_limit = match &idx_optimize_rule {
-            Some(IndexOptimizeMode::SimpleSelect(n, false)) if *n > 0 => Some(*n),
-            _ => empty_exec.limit(),
+        let all_histogram = match (&idx_optimize_rule, index_condition.as_ref()) {
+            (
+                Some(IndexOptimizeMode::SimpleHistogram(
+                    min_value,
+                    bucket_width,
+                    num_buckets,
+                    ts_offset,
+                )),
+                Some(condition),
+            ) if condition.is_condition_all() => {
+                Some((*min_value, *bucket_width, *num_buckets, *ts_offset))
+            }
+            _ => None,
         };
-        let (tbls, stats) = match super::segments_scan::search(
-            query_params.clone(),
-            latest_schema.clone(),
-            empty_exec.schema().clone(),
-            &segment_ids,
-            empty_exec.sorted_by_time(),
-            segment_limit,
-            index_condition.clone(),
-            fst_fields.clone(),
-        )
-        .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                // clear session data registered by the storage branch above
+
+        if let Some((min_value, bucket_width, num_buckets, ts_offset)) = all_histogram {
+            let (histogram, stats) = match super::segments_scan::search_histogram(
+                query_params.clone(),
+                &segment_ids,
+                min_value,
+                bucket_width,
+                num_buckets,
+                ts_offset,
+            )
+            .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    super::super::datafusion::storage::file_list::clear(&trace_id);
+                    log::error!(
+                        "[trace_id {trace_id}] flight->search: segment histogram failed: {e}"
+                    );
+                    return Err(e);
+                }
+            };
+            if let Err(e) = merge_histogram_result(&mut index_result, histogram) {
                 super::super::datafusion::storage::file_list::clear(&trace_id);
-                log::error!("[trace_id {trace_id}] flight->search: search segments error: {e}");
                 return Err(e);
             }
-        };
-        log::info!(
-            "{}",
-            search_inspector_fields(
-                format!(
-                    "[trace_id {trace_id}] flight->search: segments scan completed, {} segments",
-                    segment_ids.len()
-                ),
-                SearchInspectorFieldsBuilder::new()
-                    .trace_id(trace_id.to_string())
-                    .node_name(LOCAL_NODE.name.clone())
-                    .component("flight:do_get::search segments scan".to_string())
-                    .search_role("follower".to_string())
-                    .duration(segments_scan_start.elapsed().as_millis() as usize)
-                    .build()
+            scan_stats.add(&stats);
+            log::info!(
+                "{}",
+                search_inspector_fields(
+                    format!(
+                        "[trace_id {trace_id}] flight->search: segment histogram completed, {} segments",
+                        segment_ids.len()
+                    ),
+                    SearchInspectorFieldsBuilder::new()
+                        .trace_id(trace_id.to_string())
+                        .node_name(LOCAL_NODE.name.clone())
+                        .component("flight:do_get::search segment histogram".to_string())
+                        .search_role("follower".to_string())
+                        .duration(segments_scan_start.elapsed().as_millis() as usize)
+                        .build()
+                )
+            );
+        } else {
+            // The plan's LIMIT rides on the SimpleSelect optimizer rule, not
+            // the scan node. DESC only — ascending scans cannot use the
+            // top-n-newest segment trimming path.
+            let segment_limit = match &idx_optimize_rule {
+                Some(IndexOptimizeMode::SimpleSelect(n, false)) if *n > 0 => Some(*n),
+                _ => empty_exec.limit(),
+            };
+            let (tbls, stats) = match super::segments_scan::search(
+                query_params.clone(),
+                latest_schema.clone(),
+                empty_exec.schema().clone(),
+                &segment_ids,
+                empty_exec.sorted_by_time(),
+                segment_limit,
+                index_condition.clone(),
+                fst_fields.clone(),
             )
-        );
-        tables.extend(tbls);
-        scan_stats.add(&stats);
+            .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    super::super::datafusion::storage::file_list::clear(&trace_id);
+                    log::error!("[trace_id {trace_id}] flight->search: search segments error: {e}");
+                    return Err(e);
+                }
+            };
+            tables.extend(tbls);
+            scan_stats.add(&stats);
+            log::info!(
+                "{}",
+                search_inspector_fields(
+                    format!(
+                        "[trace_id {trace_id}] flight->search: segments scan completed, {} segments",
+                        segment_ids.len()
+                    ),
+                    SearchInspectorFieldsBuilder::new()
+                        .trace_id(trace_id.to_string())
+                        .node_name(LOCAL_NODE.name.clone())
+                        .component("flight:do_get::search segments scan".to_string())
+                        .search_role("follower".to_string())
+                        .duration(segments_scan_start.elapsed().as_millis() as usize)
+                        .build()
+                )
+            );
+        }
     }
 
     // search in WAL memory first to capture the snapshot_time
@@ -771,7 +838,8 @@ fn apply_pushdowns_and_optimizations(
         })?;
     }
 
-    if !metadata_count_file_list.is_empty() || !index_file_list.is_empty() {
+    if !metadata_count_file_list.is_empty() || !index_file_list.is_empty() || index_result.is_some()
+    {
         let index_optimize_start = std::time::Instant::now();
         scan_stats.add(&collect_stats(&metadata_count_file_list));
         scan_stats.add(&collect_stats(&index_file_list));
@@ -955,6 +1023,7 @@ async fn handle_index_optimize(
     file_list: Vec<FileKey>,
     time_range: (i64, i64),
     column_store_fields: &HashSet<String>,
+    index_condition: Option<&IndexCondition>,
 ) -> Result<(Vec<FileKey>, Vec<FileKey>), Error> {
     // early return if not simple count, histogram, topn or the M16
     // count(field)/min-max stats-answered modes
@@ -983,6 +1052,7 @@ async fn handle_index_optimize(
         _ => false,
     };
 
+    let allow_data_only_vix = data_only_vix_capable(idx_optimize_rule, index_condition);
     // TODO: support IndexOptimizeMode::SimpleDistinct for add timestamp
     // filter to vix search
     let time_range = if needs_dict_only
@@ -994,19 +1064,39 @@ async fn handle_index_optimize(
     } else {
         None
     };
-    let (index_files, datafusion_files) = split_file_list_by_time_range(file_list, time_range);
+    let (index_files, datafusion_files) =
+        split_file_list_by_time_range(file_list, time_range, allow_data_only_vix);
     // set optimize rule to None, because datafusion should not use it
     *idx_optimize_rule = None;
 
     Ok((index_files, datafusion_files))
 }
+/// Whether an indexless core data file can answer this query exactly without
+/// a `.vxi` sidecar. The VIX evaluator has native docs-column equality paths,
+/// while Condition::All histograms need only file metadata/zones.
+fn data_only_vix_capable(
+    idx_optimize_rule: &Option<IndexOptimizeMode>,
+    index_condition: Option<&IndexCondition>,
+) -> bool {
+    let Some(condition) = index_condition else {
+        return false;
+    };
+    match idx_optimize_rule {
+        Some(IndexOptimizeMode::SimpleHistogram(..)) => {
+            condition.is_condition_all() || condition.single_equal_term().is_some()
+        }
+        Some(IndexOptimizeMode::SimpleSelect(limit, _)) if *limit > 0 => {
+            condition.single_equal_term().is_some()
+        }
+        _ => false,
+    }
+}
 
-/// Index-branch eligibility: a core `.vix` file with an index sidecar
-/// (`index_size > 0` — the `.vxi` object's size since the v3 split), and —
-/// when `time_range` is set —
-/// lying fully inside `[start, end)` (`max_ts < end`, matching the per-file
-/// `file_in_range` check of the vix evaluation). Everything else takes the
-/// DataFusion branch.
+/// Index-branch eligibility: every core `.vix` file with an index sidecar,
+/// plus data-only core files whose query shape is exact without one. When
+/// `time_range` is set, the file must lie fully inside `[start, end)`
+/// (`max_ts < end`, matching the per-file `file_in_range` check). Everything
+/// else takes the DataFusion branch.
 ///
 /// There is deliberately NO settings-freshness gate here (the legacy
 /// `index_updated_at` settings stamp was removed entirely): whether an
@@ -1019,10 +1109,11 @@ async fn handle_index_optimize(
 fn split_file_list_by_time_range(
     file_list: Vec<FileKey>,
     time_range: Option<(i64, i64)>,
+    allow_data_only_vix: bool,
 ) -> (Vec<FileKey>, Vec<FileKey>) {
     file_list.into_iter().partition(|file| {
         config::FileFormat::from_extension(&file.key) == Some(config::FileFormat::Vix)
-            && file.meta.index_size > 0
+            && (file.meta.index_size > 0 || allow_data_only_vix)
             && time_range
                 .is_none_or(|(start, end)| file.meta.min_ts >= start && file.meta.max_ts < end)
     })
@@ -1038,6 +1129,36 @@ fn collect_stats(files: &[FileKey]) -> ScanStats {
         scan_stats.idx_scan_size += file.meta.index_size;
     }
     scan_stats
+}
+fn merge_histogram_result(
+    target: &mut Option<MultiResult>,
+    contribution: Vec<u64>,
+) -> Result<(), Error> {
+    let Some(current) = target else {
+        *target = Some(MultiResult::Histogram(contribution));
+        return Ok(());
+    };
+    let MultiResult::Histogram(histogram) = current else {
+        return Err(Error::Message(
+            "segment histogram cannot merge with a non-histogram index result".to_string(),
+        ));
+    };
+    if histogram.is_empty() {
+        histogram.resize(contribution.len(), 0);
+    }
+    if histogram.len() != contribution.len() {
+        return Err(Error::Message(format!(
+            "segment histogram has {} buckets, precomputed result has {}",
+            contribution.len(),
+            histogram.len()
+        )));
+    }
+    for (total, value) in histogram.iter_mut().zip(contribution) {
+        *total = total.checked_add(value).ok_or_else(|| {
+            Error::Message("segment histogram bucket count overflowed u64".to_string())
+        })?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1086,8 +1207,27 @@ mod tests {
     }
 
     #[test]
+    fn test_merge_segment_histogram_with_core_result() {
+        let mut result = None;
+        merge_histogram_result(&mut result, vec![1, 2, 0]).unwrap();
+        merge_histogram_result(&mut result, vec![3, 4, 5]).unwrap();
+        assert!(matches!(
+            &result,
+            Some(MultiResult::Histogram(histogram))
+                if histogram == &vec![4, 6, 5]
+        ));
+
+        let err = merge_histogram_result(&mut result, vec![1, 2]).unwrap_err();
+        assert!(err.to_string().contains("2 buckets"));
+
+        let mut wrong = Some(MultiResult::Count(1));
+        let err = merge_histogram_result(&mut wrong, vec![1]).unwrap_err();
+        assert!(err.to_string().contains("non-histogram"));
+    }
+
+    #[test]
     fn test_split_file_list_empty() {
-        let (index_files, datafusion) = split_file_list_by_time_range(vec![], None);
+        let (index_files, datafusion) = split_file_list_by_time_range(vec![], None, false);
         assert!(index_files.is_empty());
         assert!(datafusion.is_empty());
     }
@@ -1095,7 +1235,7 @@ mod tests {
     #[test]
     fn test_split_file_list_all_index() {
         let files = vec![core_file(100, 200, 512), core_file(300, 400, 1024)];
-        let (index_files, datafusion) = split_file_list_by_time_range(files, None);
+        let (index_files, datafusion) = split_file_list_by_time_range(files, None, false);
         assert_eq!(index_files.len(), 2);
         assert!(datafusion.is_empty());
     }
@@ -1103,9 +1243,44 @@ mod tests {
     #[test]
     fn test_split_file_list_no_index_goes_to_datafusion() {
         let files = vec![core_file(100, 200, 0)]; // index_size == 0
-        let (index_files, datafusion) = split_file_list_by_time_range(files, None);
+        let (index_files, datafusion) = split_file_list_by_time_range(files, None, false);
         assert!(index_files.is_empty());
         assert_eq!(datafusion.len(), 1);
+    }
+    #[test]
+    fn test_split_file_list_data_only_vix_when_capable() {
+        let files = vec![core_file(100, 200, 0)];
+        let (index_files, datafusion) = split_file_list_by_time_range(files, None, true);
+        assert_eq!(index_files.len(), 1);
+        assert!(datafusion.is_empty());
+    }
+    #[test]
+    fn test_data_only_vix_capability_is_query_shaped() {
+        let mut all = IndexCondition::new();
+        all.add_condition(Condition::All());
+        let mut equality = IndexCondition::new();
+        equality.add_condition(Condition::Equal("service".to_string(), "api".to_string()));
+
+        assert!(data_only_vix_capable(
+            &Some(IndexOptimizeMode::SimpleHistogram(0, 10, 2, 0)),
+            Some(&all),
+        ));
+        assert!(data_only_vix_capable(
+            &Some(IndexOptimizeMode::SimpleHistogram(0, 10, 2, 0)),
+            Some(&equality),
+        ));
+        assert!(data_only_vix_capable(
+            &Some(IndexOptimizeMode::SimpleSelect(10, false)),
+            Some(&equality),
+        ));
+        assert!(!data_only_vix_capable(
+            &Some(IndexOptimizeMode::SimpleSelect(10, false)),
+            Some(&all),
+        ));
+        assert!(!data_only_vix_capable(
+            &Some(IndexOptimizeMode::SimpleHistogram(0, 10, 2, 0)),
+            None,
+        ));
     }
 
     /// Only core `.vix` files are index-eligible: parquet/vortex files never
@@ -1124,7 +1299,7 @@ mod tests {
             make_file("files/default/logs/s/1.vortex", 100, 200, 512),
             core_file(100, 200, 512),
         ];
-        let (index_files, datafusion) = split_file_list_by_time_range(files, None);
+        let (index_files, datafusion) = split_file_list_by_time_range(files, None, false);
         assert_eq!(index_files.len(), 1);
         assert!(index_files[0].key.ends_with(".vix"));
         assert_eq!(datafusion.len(), 2);
@@ -1152,7 +1327,8 @@ mod tests {
             file("files/default/logs/s/c.vix", 100, 200), // core, max_ts == end (out)
             file("files/default/logs/s/d.vix", 50, 150),  // core, starts before range
         ];
-        let (index_files, datafusion) = split_file_list_by_time_range(files, Some((100, 200)));
+        let (index_files, datafusion) =
+            split_file_list_by_time_range(files, Some((100, 200)), false);
         assert_eq!(index_files.len(), 1);
         assert!(index_files[0].key.ends_with("a.vix"));
         assert_eq!(datafusion.len(), 3);
@@ -1184,7 +1360,7 @@ mod tests {
                 512,
             ),
         ];
-        let (index_files, datafusion) = split_file_list_by_time_range(files, None);
+        let (index_files, datafusion) = split_file_list_by_time_range(files, None, false);
         assert_eq!(index_files.len(), 2);
         assert!(datafusion.is_empty());
     }

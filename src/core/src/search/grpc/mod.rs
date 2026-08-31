@@ -43,6 +43,7 @@ pub async fn create_tables_from_files<F>(
     query: Arc<QueryParams>,
     schema_ref: Arc<Schema>,
     sorted_by_time: bool,
+    collect_stat: bool,
     file_stat_cache: Option<Arc<dyn FileStatisticsCache>>,
     index_condition: Option<IndexCondition>,
     fst_fields: Vec<String>,
@@ -73,6 +74,7 @@ where
         async move {
             let mut builder = TableBuilder::new()
                 .sorted_by_time(sorted_by_time)
+                .collect_stat(collect_stat)
                 .file_stat_cache(file_stat_cache)
                 .index_condition(index_condition)
                 .fst_fields(fst_fields);

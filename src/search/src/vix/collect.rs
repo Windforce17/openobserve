@@ -366,18 +366,20 @@ pub(super) fn whole_file_histogram_bucket(
     let Some(first) = chunks.first() else {
         return Ok(None);
     };
-    let width = i64::try_from(bucket_width.max(1))
-        .map_err(|_| anyhow::anyhow!("histogram bucket width overflows i64: {bucket_width}"))?;
-    let origin = min_value
-        .checked_sub(ts_offset)
-        .ok_or_else(|| anyhow::anyhow!("histogram bucket origin overflows i64"))?;
     let mut ts_min = first.ts_min;
     let mut ts_max = first.ts_max;
     for chunk in &chunks[1..] {
         ts_min = ts_min.min(chunk.ts_min);
         ts_max = ts_max.max(chunk.ts_max);
     }
-    Ok(chunk_single_bucket(ts_min, ts_max, origin, width, num_buckets).flatten())
+    histogram_range_bucket(
+        ts_min,
+        ts_max,
+        min_value,
+        bucket_width,
+        num_buckets,
+        ts_offset,
+    )
 }
 
 /// SimpleHistogram: count the matched rows into `num_buckets` fixed-width
@@ -1041,6 +1043,57 @@ pub(super) fn stats_eq_bitmap(
         }
     }
     Ok(Some(builder.finish()))
+}
+
+/// Return the fixed histogram bucket containing `timestamp`, or `None` when
+/// the value falls outside the grid. This is the shared per-row rule for VIX
+/// data and segment-WAL frames.
+pub fn histogram_bucket(
+    timestamp: i64,
+    min_value: i64,
+    bucket_width: u64,
+    num_buckets: usize,
+    ts_offset: i64,
+) -> anyhow::Result<Option<usize>> {
+    if num_buckets == 0 {
+        return Ok(None);
+    }
+    let width = i64::try_from(bucket_width.max(1))
+        .map_err(|_| anyhow::anyhow!("histogram bucket width overflows i64: {bucket_width}"))?;
+    let origin = min_value
+        .checked_sub(ts_offset)
+        .ok_or_else(|| anyhow::anyhow!("histogram bucket origin overflows i64"))?;
+    let Some(offset) = timestamp.checked_sub(origin) else {
+        return Ok(None);
+    };
+    if offset < 0 {
+        return Ok(None);
+    }
+    let bucket = (offset / width) as usize;
+    Ok((bucket < num_buckets).then_some(bucket))
+}
+
+/// Return one in-grid bucket only when every timestamp in the inclusive
+/// `[ts_min, ts_max]` range is guaranteed to land in it. `None` means the
+/// range is outside the grid or crosses a bucket boundary and must be
+/// inspected row-by-row.
+pub fn histogram_range_bucket(
+    ts_min: i64,
+    ts_max: i64,
+    min_value: i64,
+    bucket_width: u64,
+    num_buckets: usize,
+    ts_offset: i64,
+) -> anyhow::Result<Option<usize>> {
+    if num_buckets == 0 || ts_min > ts_max {
+        return Ok(None);
+    }
+    let width = i64::try_from(bucket_width.max(1))
+        .map_err(|_| anyhow::anyhow!("histogram bucket width overflows i64: {bucket_width}"))?;
+    let origin = min_value
+        .checked_sub(ts_offset)
+        .ok_or_else(|| anyhow::anyhow!("histogram bucket origin overflows i64"))?;
+    Ok(chunk_single_bucket(ts_min, ts_max, origin, width, num_buckets).flatten())
 }
 
 /// Add row `i` of `timestamps` to its histogram bucket (the exact per-row

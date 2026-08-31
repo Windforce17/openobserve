@@ -215,6 +215,7 @@ pub async fn search_parquet(
         query.clone(),
         schema,
         sorted_by_time,
+        true,
         file_stat_cache,
         index_condition,
         fst_fields,

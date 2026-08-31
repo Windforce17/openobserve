@@ -24,8 +24,6 @@ use config::{
     },
     utils::schema_ext::SchemaExt,
 };
-use futures::StreamExt;
-
 use datafusion::{
     arrow::datatypes::{DataType, Schema},
     catalog::TableProvider,
@@ -50,6 +48,7 @@ use datafusion::{
     physical_optimizer::PhysicalOptimizerRule,
     prelude::{SessionContext, col},
 };
+use futures::StreamExt;
 #[cfg(feature = "enterprise")]
 use o2_enterprise::enterprise::search::WorkGroup;
 use vortex::{VortexSessionDefault, io::session::RuntimeSessionExt, session::VortexSession};
@@ -460,6 +459,7 @@ pub struct TableBuilder {
     index_condition: Option<IndexCondition>,
     fst_fields: Vec<String>,
     timestamp_filter: Option<(i64, i64)>,
+    collect_stat: bool,
 }
 
 impl Default for TableBuilder {
@@ -476,6 +476,7 @@ impl TableBuilder {
             index_condition: None,
             fst_fields: vec![],
             timestamp_filter: None,
+            collect_stat: true,
         }
     }
 
@@ -505,6 +506,14 @@ impl TableBuilder {
     /// apply timestamp filter to the table
     pub fn timestamp_filter(mut self, timestamp_filter: (i64, i64)) -> Self {
         self.timestamp_filter = Some(timestamp_filter);
+        self
+    }
+    /// Whether DataFusion should open every file to infer statistics while
+    /// planning. Histogram fallbacks already carry trusted file-list bounds
+    /// and do not declare file ordering, so they can disable this O(files)
+    /// probe and scan only the unresolved files.
+    pub fn collect_stat(mut self, collect_stat: bool) -> Self {
+        self.collect_stat = collect_stat;
         self
     }
 
@@ -707,7 +716,7 @@ impl TableBuilder {
 
         let mut listing_options = ListingOptions::new(file_format)
             .with_target_partitions(target_partitions)
-            .with_collect_stat(true);
+            .with_collect_stat(self.collect_stat);
 
         if declare_sort {
             // Every format stores its rows ORDER BY _timestamp DESC, so
@@ -818,11 +827,7 @@ static VIX_ROW_ORDER_MEMO: std::sync::LazyLock<
 const VIX_ROW_ORDER_MEMO_CAP: usize = 200_000;
 
 /// The order class from a probed reader's footer verdicts.
-fn classify_vix_order(
-    ts_desc: bool,
-    regions: Option<usize>,
-    has_zone: bool,
-) -> VixOrderClass {
+fn classify_vix_order(ts_desc: bool, regions: Option<usize>, has_zone: bool) -> VixOrderClass {
     if ts_desc {
         return VixOrderClass::Sorted;
     }

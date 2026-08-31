@@ -170,7 +170,9 @@ pub enum MultiResultBuilder {
         num_rows: u64,
         pruner: SimpleSelectPruner,
     },
-    Histogram(Vec<Vec<u64>>),
+    /// Running bucket totals. Fold each per-file vector immediately so a
+    /// hot window does not retain one allocation per core file.
+    Histogram(Vec<u64>),
     MultiHistogram(Vec<Vec<(i64, String, u64)>>),
     TopN(Vec<(Vec<String>, u64)>),
     Distinct(HashSet<String>),
@@ -238,9 +240,13 @@ impl MultiResultBuilder {
     // simple histogram
     pub fn add_histogram(&mut self, histogram: Vec<u64>) {
         match self {
-            Self::Histogram(a) => {
-                if !histogram.is_empty() {
-                    a.push(histogram);
+            Self::Histogram(total) if total.is_empty() => *total = histogram,
+            Self::Histogram(total) => {
+                // Preserve the established normalization: the first result's
+                // length wins; missing later buckets contribute zero and
+                // extra later buckets are ignored.
+                for (sum, value) in total.iter_mut().zip(histogram) {
+                    *sum += value;
                 }
             }
             _ => unreachable!("unsupported vix multi result"),
@@ -318,21 +324,7 @@ impl MultiResultBuilder {
                 pruner.finalize(trace_id, file_list_map);
                 MultiResult::SimpleSelect(num_rows)
             }
-            Self::Histogram(histograms_hits) => {
-                if histograms_hits.is_empty() {
-                    return MultiResult::Histogram(vec![]);
-                }
-                let len = histograms_hits[0].len();
-                let histogram = (0..len)
-                    .map(|i| {
-                        histograms_hits
-                            .iter()
-                            .map(|v| v.get(i).unwrap_or(&0))
-                            .sum::<u64>()
-                    })
-                    .collect();
-                MultiResult::Histogram(histogram)
-            }
+            Self::Histogram(histogram) => MultiResult::Histogram(histogram),
             Self::MultiHistogram(results) => {
                 // Merge: flatten all per-file results into a single Vec
                 let merged: Vec<(i64, String, u64)> = results.into_iter().flatten().collect();
