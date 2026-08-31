@@ -148,10 +148,12 @@ pub async fn vix_search(
             query.time_range,
         );
     }
-    // Sidecar-backed core files always reach VIX evaluation. Indexless core
-    // files can also answer exact string-equality SimpleSelect and
-    // SimpleHistogram shapes from native docs columns without `_source`.
-    // Legacy parquet/vortex files remain on the ordinary DataFusion path.
+    // Sidecar-backed core files always reach VIX evaluation. Every core file
+    // can also answer exact string-equality SimpleSelect and SimpleHistogram
+    // shapes from native docs columns without `_source`; the histogram path
+    // uses this for COLD indexed files too, avoiding the sidecar dictionary +
+    // dense-postings fetch storm. Legacy parquet/vortex files stay on the
+    // ordinary DataFusion path.
     let single_equality = index_condition
         .as_ref()
         .is_some_and(|condition| condition.single_equal_term().is_some());
@@ -160,12 +162,12 @@ pub async fn vix_search(
             &idx_optimize_mode,
             Some(IndexOptimizeMode::SimpleSelect(limit, _)) if *limit > 0
         );
-    let native_docs_equality = single_equality
-        && (native_simple_select
-            || matches!(
-                &idx_optimize_mode,
-                Some(IndexOptimizeMode::SimpleHistogram(..))
-            ));
+    let native_histogram = single_equality
+        && matches!(
+            &idx_optimize_mode,
+            Some(IndexOptimizeMode::SimpleHistogram(..))
+        );
+    let native_docs_equality = native_simple_select || native_histogram;
     let eval_files = file_list_map
         .values()
         .filter(|file| {
@@ -345,13 +347,14 @@ pub async fn vix_search(
         .sum();
     let bail_threshold = eval_bail_threshold(bail_bytes_cap, window_compressed_bytes);
 
-    // M14: query-shaped cold-open prefetch (ranged mode). Cold files (no
-    // memoized reader) pay their eager tail fetches — the data object's
-    // puffin footer plus the sidecar's footer + dictionary directory — as
-    // ONE bounded-concurrency wave per group before evaluation fans out,
-    // instead of one sequential open round inside each eval task. Wave
-    // bytes tick this query's fetch stats and count toward the bail budget.
-    let prefetch_enabled = read_mode == VixReadMode::Ranged && cfg.common.vix_query_prefetch;
+    // M14: query-shaped cold-open prefetch (ranged mode). Cold sidecar paths
+    // pay the data footer + sidecar footer/dictionary directory in one
+    // bounded-concurrency wave. A single-equality histogram deliberately
+    // skips that wave: cold files stream the two native docs columns instead
+    // of opening their sidecars, while files with memoized readers retain the
+    // faster index path.
+    let prefetch_enabled =
+        read_mode == VixReadMode::Ranged && cfg.common.vix_query_prefetch && !native_histogram;
     #[cfg(test)]
     let prefetch_enabled = tests::prefetch_override(trace_id).unwrap_or(prefetch_enabled);
     // wave bytes prefetched so far (all-files costs, paid once): the bail
@@ -1175,10 +1178,17 @@ async fn search_vix_index(
         }
     }
 
-    // Index-off core files still carry complete native docs columns. Exact
-    // string equality can answer bounded ordered candidates and histograms
-    // there without routing the file through the wide DataFusion scan.
-    if parquet_file.meta.index_size <= 0 {
+    // Data-only core files have no sidecar. A COLD indexed equality histogram
+    // also uses the native docs columns: a representative production file
+    // needed 848 KiB / 7 ranged reads versus the MB-class sidecar dictionary
+    // plus dense postings walk. Memoized readers keep the lower-CPU index path.
+    let cold_native_histogram = condition.single_equal_term().is_some()
+        && matches!(
+            &idx_optimize_rule,
+            Some(IndexOptimizeMode::SimpleHistogram(..))
+        )
+        && !reader_cache::GLOBAL_CACHE.contains(&vix_file_name);
+    if parquet_file.meta.index_size <= 0 || cold_native_histogram {
         return search_vix_docs_optimized(
             trace_id,
             &condition,
@@ -1414,10 +1424,10 @@ async fn search_vix_index(
     Ok((key, result, has_skipped))
 }
 
-/// Native exact-equality evaluation for a core file with no `.vxi` sidecar.
+/// Native exact-equality evaluation over a core file's docs columns.
 /// SimpleSelect returns bounded timestamp candidates for the global pruner;
 /// SimpleHistogram streams the equality column and timestamp directly into
-/// fixed counters. Neither path reads `_source`.
+/// fixed counters. Neither path reads `_source` or a `.vxi` sidecar.
 #[allow(clippy::too_many_arguments)]
 async fn search_vix_docs_optimized(
     trace_id: &str,
@@ -1434,7 +1444,7 @@ async fn search_vix_docs_optimized(
         Some(IndexOptimizeMode::SimpleHistogram(..)) => {}
         other => {
             log::info!(
-                "[trace_id {trace_id}] search->vix: indexless file {} cannot use native equality \
+                "[trace_id {trace_id}] search->vix: native docs file {} cannot use equality \
                  evaluation for optimize mode {other:?}; back to datafusion",
                 file.key,
             );
@@ -1448,8 +1458,8 @@ async fn search_vix_docs_optimized(
     let cache_mode = idx_optimize_rule.clone();
     let Some((field, needle)) = condition.single_equal_term() else {
         log::info!(
-            "[trace_id {trace_id}] search->vix: indexless file {} has no single exact equality \
-             for native evaluation; back to datafusion",
+            "[trace_id {trace_id}] search->vix: native docs file {} has no single exact equality \
+             for evaluation; back to datafusion",
             file.key,
         );
         return Ok((
@@ -1484,8 +1494,8 @@ async fn search_vix_docs_optimized(
             .await
             .map_err(|error| {
                 anyhow::anyhow!(
-                    "[trace_id {trace_id}] failed to load indexless vix data file {key} for \
-                     native equality evaluation: {error}"
+                    "[trace_id {trace_id}] failed to load native docs vix data file {key} for \
+                     equality evaluation: {error}"
                 )
             })?;
         VixDocsInput::Bytes(bytes)
@@ -1497,7 +1507,7 @@ async fn search_vix_docs_optimized(
     let evaluated = tokio::task::spawn_blocking(move || {
         let docs = input
             .open()
-            .map_err(|error| anyhow::anyhow!("open indexless vix docs {task_key}: {error:#}"))?;
+            .map_err(|error| anyhow::anyhow!("open native vix docs {task_key}: {error:#}"))?;
         let row_count = docs.row_count();
         let row_group_size = u32::try_from(docs.row_group_size())
             .ok()
@@ -1535,13 +1545,13 @@ async fn search_vix_docs_optimized(
     .await
     .map_err(|error| {
         anyhow::anyhow!(
-            "[trace_id {trace_id}] native equality task for indexless file {key} failed: {error}"
+            "[trace_id {trace_id}] native equality task for docs file {key} failed: {error}"
         )
     })??;
 
     let (Some(result), row_count) = evaluated else {
         log::info!(
-            "[trace_id {trace_id}] search->vix: indexless file {key} lacks string-family native \
+            "[trace_id {trace_id}] search->vix: native docs file {key} lacks string-family \
              column {field:?}; back to datafusion",
         );
         return Ok((
@@ -1552,13 +1562,13 @@ async fn search_vix_docs_optimized(
     };
     let expected_rows = u64::try_from(file.meta.records).map_err(|_| {
         anyhow::anyhow!(
-            "[trace_id {trace_id}] indexless file {key} has negative record count {}",
+            "[trace_id {trace_id}] native docs file {key} has negative record count {}",
             file.meta.records
         )
     })?;
     if row_count != expected_rows {
         return Err(anyhow::anyhow!(
-            "[trace_id {trace_id}] indexless vix docs row_count {row_count} does not match \
+            "[trace_id {trace_id}] native vix docs row_count {row_count} does not match \
              metadata records {expected_rows} for {key}"
         ));
     }
@@ -4421,6 +4431,55 @@ mod tests {
             MultiResult::Histogram(histogram) => assert_eq!(histogram, vec![4, 5, 1, 0, 0]),
             other => panic!("expected native histogram, got {other:?}"),
         }
+    }
+
+    /// A cold indexed equality histogram must use the data-only native docs
+    /// path. Opening either the query-prefetch or ordinary sidecar path would
+    /// memoize a `VixReader`, which this regression detects.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_cold_indexed_equality_histogram_skips_sidecar() {
+        let master = store_core_file(
+            "files/org/logs/native-histogram/2026/01/01/00/cold-indexed.vix",
+            1_000,
+        )
+        .await;
+        assert!(master.meta.index_size > 0);
+        let key = master.key.clone();
+        reader_cache::GLOBAL_CACHE.remove(&key);
+        vix_result_cache::GLOBAL_CACHE.remove_file_entries(std::iter::once(key.as_str()));
+        let params = Arc::new(crate::types::QueryParams {
+            trace_id: "cold-indexed-native-histogram".to_string(),
+            org_id: "org".to_string(),
+            stream: datafusion::sql::TableReference::from("t"),
+            stream_type: StreamType::Logs,
+            stream_name: "t".to_string(),
+            time_range: (990, 1_010),
+            work_group: None,
+            use_inverted_index: true,
+        });
+        let mut condition = IndexCondition::new();
+        condition.add_condition(Condition::Equal("level".to_string(), "info".to_string()));
+        let mut files = vec![master];
+
+        let (_took, add_filter_back, result) = vix_search(
+            params,
+            &mut files,
+            Some(condition),
+            Some(IndexOptimizeMode::SimpleHistogram(990, 5, 5, 0)),
+        )
+        .await
+        .unwrap();
+
+        assert!(!add_filter_back);
+        assert!(files.is_empty(), "native histogram must remove the file");
+        match result {
+            MultiResult::Histogram(histogram) => assert_eq!(histogram, vec![4, 5, 1, 0, 0]),
+            other => panic!("expected native histogram, got {other:?}"),
+        }
+        assert!(
+            !reader_cache::GLOBAL_CACHE.contains(&key),
+            "cold native histogram must not open or prefetch the sidecar"
+        );
     }
 }
 
