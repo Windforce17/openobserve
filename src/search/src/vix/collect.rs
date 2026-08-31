@@ -345,6 +345,41 @@ fn select_top_by_value(
     Ok(candidates)
 }
 
+/// Return the one histogram bucket containing every row in `reader`, when
+/// the zone table proves such a bucket exists. This is checked before a
+/// condition's postings are opened: a fully covered file can then contribute
+/// `count(condition)` directly instead of materializing row ids or reading
+/// `_timestamp`.
+pub(super) fn whole_file_histogram_bucket(
+    reader: &VixReader,
+    min_value: i64,
+    bucket_width: u64,
+    num_buckets: usize,
+    ts_offset: i64,
+) -> anyhow::Result<Option<usize>> {
+    if num_buckets == 0 {
+        return Ok(None);
+    }
+    let Some(chunks) = reader.zone_chunks() else {
+        return Ok(None);
+    };
+    let Some(first) = chunks.first() else {
+        return Ok(None);
+    };
+    let width = i64::try_from(bucket_width.max(1))
+        .map_err(|_| anyhow::anyhow!("histogram bucket width overflows i64: {bucket_width}"))?;
+    let origin = min_value
+        .checked_sub(ts_offset)
+        .ok_or_else(|| anyhow::anyhow!("histogram bucket origin overflows i64"))?;
+    let mut ts_min = first.ts_min;
+    let mut ts_max = first.ts_max;
+    for chunk in &chunks[1..] {
+        ts_min = ts_min.min(chunk.ts_min);
+        ts_max = ts_max.max(chunk.ts_max);
+    }
+    Ok(chunk_single_bucket(ts_min, ts_max, origin, width, num_buckets).flatten())
+}
+
 /// SimpleHistogram: count the matched rows into `num_buckets` fixed-width
 /// `_timestamp` buckets starting at `min_value - ts_offset` (the old
 /// collector shifted the range instead of the per-doc values). The returned
@@ -1974,6 +2009,29 @@ mod tests {
         // narrower range drops out-of-range rows, zeros included
         let counts = simple_histogram(&reader, &bitmap, 104, 2, 4, 0).unwrap();
         assert_eq!(counts, vec![2, 2, 0, 0]);
+    }
+    #[test]
+    fn test_whole_file_histogram_bucket_requires_one_in_range_bucket() {
+        let reader = build_reader(); // timestamps 100..=107 across two zone chunks
+        assert_eq!(
+            whole_file_histogram_bucket(&reader, 100, 10, 2, 0).unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            whole_file_histogram_bucket(&reader, 102, 10, 2, 2).unwrap(),
+            Some(0),
+            "timezone offset keeps the same absolute bucket origin"
+        );
+        assert_eq!(
+            whole_file_histogram_bucket(&reader, 100, 4, 2, 0).unwrap(),
+            None,
+            "a file crossing a bucket edge cannot use one count"
+        );
+        assert_eq!(
+            whole_file_histogram_bucket(&reader, 200, 10, 2, 0).unwrap(),
+            None,
+            "an out-of-grid file contributes no in-range bucket"
+        );
     }
 
     #[test]

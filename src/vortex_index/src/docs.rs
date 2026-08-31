@@ -752,6 +752,62 @@ impl VixDocs {
         }
         Ok(Some(winners.into_best_first()))
     }
+    /// Exact fixed-width `_timestamp` histogram for `column = needle`.
+    /// Only the predicate column and timestamp are decoded; results stream
+    /// into `num_buckets` counters, so memory is independent of match count.
+    ///
+    /// `Ok(None)` means the native column is absent or not string-family;
+    /// callers must keep the ordinary filtered scan for that file.
+    pub fn eq_string_histogram(
+        &self,
+        column: &str,
+        needle: &str,
+        ts_range: Option<(i64, i64)>,
+        min_value: i64,
+        bucket_width: u64,
+        num_buckets: usize,
+        ts_offset: i64,
+    ) -> anyhow::Result<Option<Vec<u64>>> {
+        use arrow::datatypes::DataType;
+
+        let Ok(field) = self.schema.field_with_name(column) else {
+            return Ok(None);
+        };
+        if !matches!(
+            field.data_type(),
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+        ) {
+            return Ok(None);
+        }
+        let mut counts = vec![0u64; num_buckets];
+        if num_buckets == 0 || self.row_count == 0 {
+            return Ok(Some(counts));
+        }
+        let width = i64::try_from(bucket_width.max(1))
+            .map_err(|_| anyhow::anyhow!("histogram bucket width overflows i64: {bucket_width}"))?;
+        let origin = min_value
+            .checked_sub(ts_offset)
+            .ok_or_else(|| anyhow::anyhow!("histogram bucket origin overflows i64"))?;
+        crate::container::scan_eq_string_candidates_range(
+            &self.docs_blob,
+            column,
+            needle,
+            0..self.row_count,
+            ts_range,
+            &mut |timestamp, _row_id| {
+                if let Some(offset) = timestamp.checked_sub(origin)
+                    && offset >= 0
+                {
+                    let bucket = (offset / width) as usize;
+                    if bucket < counts.len() {
+                        counts[bucket] += 1;
+                    }
+                }
+                true
+            },
+        )?;
+        Ok(Some(counts))
+    }
 
     /// The decoded per-column chunk-stats table (`stats` blob), fetched and
     /// parsed once per open handle. `None` = no blob / undecodable

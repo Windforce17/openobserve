@@ -3851,7 +3851,7 @@ fn vix_docs_row_selection_and_ts_filter() {
 }
 
 #[test]
-fn vix_docs_broad_string_equality_top_n_is_exact() {
+fn vix_docs_broad_string_equality_aggregates_are_exact() {
     let schema = Arc::new(Schema::new(vec![
         Field::new("_timestamp", DataType::Int64, false),
         Field::new("svc", DataType::Utf8, false),
@@ -3898,13 +3898,43 @@ fn vix_docs_broad_string_equality_top_n_is_exact() {
             .unwrap(),
         vec![(107, 3), (106, 4), (104, 6)]
     );
+    assert_eq!(
+        docs.eq_string_histogram("svc", "hit", None, 100, 5, 3, 0)
+            .unwrap()
+            .unwrap(),
+        vec![3, 3, 1]
+    );
+    assert_eq!(
+        docs.eq_string_histogram("svc", "hit", Some((103, 109)), 100, 5, 3, 0)
+            .unwrap()
+            .unwrap(),
+        vec![2, 2, 0],
+        "histogram applies the same half-open timestamp clamp"
+    );
+    assert_eq!(
+        docs.eq_string_histogram("svc", "hit", None, 102, 5, 3, 2)
+            .unwrap()
+            .unwrap(),
+        vec![3, 3, 1],
+        "timezone offset shifts back to the same absolute grid"
+    );
     assert!(
         docs.eq_string_top_n("missing", "hit", None, 3, false)
             .unwrap()
             .is_none()
     );
     assert!(
+        docs.eq_string_histogram("missing", "hit", None, 100, 5, 3, 0)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
         docs.eq_string_top_n("_timestamp", "107", None, 3, false)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        docs.eq_string_histogram("_timestamp", "107", None, 100, 5, 3, 0)
             .unwrap()
             .is_none()
     );

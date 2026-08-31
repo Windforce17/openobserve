@@ -148,26 +148,33 @@ pub async fn vix_search(
             query.time_range,
         );
     }
-    // Sidecar-backed core files always reach VIX evaluation. For the exact
-    // `field = value ORDER BY _timestamp LIMIT K` shape, indexless core
-    // files are candidate-capable too: their native docs column produces
-    // exact per-file top-K row ids without projecting `_source`. Legacy
-    // parquet/vortex files remain on the ordinary DataFusion scan path.
-    let native_simple_select = matches!(
-        idx_optimize_mode,
-        Some(IndexOptimizeMode::SimpleSelect(limit, _)) if limit > 0
-    ) && index_condition
+    // Sidecar-backed core files always reach VIX evaluation. Indexless core
+    // files can also answer exact string-equality SimpleSelect and
+    // SimpleHistogram shapes from native docs columns without `_source`.
+    // Legacy parquet/vortex files remain on the ordinary DataFusion path.
+    let single_equality = index_condition
         .as_ref()
         .is_some_and(|condition| condition.single_equal_term().is_some());
+    let native_simple_select = single_equality
+        && matches!(
+            &idx_optimize_mode,
+            Some(IndexOptimizeMode::SimpleSelect(limit, _)) if *limit > 0
+        );
+    let native_docs_equality = single_equality
+        && (native_simple_select
+            || matches!(
+                &idx_optimize_mode,
+                Some(IndexOptimizeMode::SimpleHistogram(..))
+            ));
     let eval_files = file_list_map
         .values()
         .filter(|file| {
-            is_core_file(&file.key) && (file.meta.index_size > 0 || native_simple_select)
+            is_core_file(&file.key) && (file.meta.index_size > 0 || native_docs_equality)
         })
         .cloned()
         .collect_vec();
     // Whole-sidecar caching and its metrics still cover only actual `.vxi`
-    // objects; data-only candidate scans use the range ladder directly.
+    // objects; data-only native evaluations use the range ladder directly.
     let index_files = eval_files
         .iter()
         .filter(|file| file.meta.index_size > 0)
@@ -537,9 +544,9 @@ pub async fn vix_search(
                     files_evaluated += 1;
                     if bail_bytes_cap > 0
                         && idx_optimize_mode.is_some()
-                        // Native equality candidates decode no `_source` and
-                        // stay bounded by K; bailing them to the wide scan is
-                        // strictly more expensive, regardless of selectivity.
+                        // Native SimpleSelect stays bounded by K and never
+                        // decodes `_source`; bailing it to a wide scan is
+                        // strictly more expensive regardless of selectivity.
                         && !native_simple_select
                         && files_evaluated >= BAIL_SAMPLE_FILES
                         && files_evaluated < files_total
@@ -831,7 +838,7 @@ impl VixReaderInput {
     }
 }
 
-/// Data-only input for the indexless SimpleSelect candidate pass. Unlike a
+/// Data-only input for indexless native equality evaluation. Unlike a
 /// [`VixReaderInput`], a ranged docs handle is deliberately not inserted in
 /// the sidecar-aware reader cache: a later sidecar-bearing open must never
 /// reuse a data-only reader.
@@ -1168,12 +1175,11 @@ async fn search_vix_index(
         }
     }
 
-    // Index-off core files still carry the complete native docs columns.
-    // For this exact ordered-limit shape, produce bounded row candidates
-    // there and let the existing global SimpleSelect pruner point-read only
-    // the winning `_source` rows.
+    // Index-off core files still carry complete native docs columns. Exact
+    // string equality can answer bounded ordered candidates and histograms
+    // there without routing the file through the wide DataFusion scan.
     if parquet_file.meta.index_size <= 0 {
-        return search_vix_docs_simple_select(
+        return search_vix_docs_optimized(
             trace_id,
             &condition,
             idx_optimize_rule,
@@ -1408,12 +1414,12 @@ async fn search_vix_index(
     Ok((key, result, has_skipped))
 }
 
-/// Data-only SimpleSelect evaluation for a core file with no `.vxi`
-/// sidecar. The first phase scans the native equality column and timestamp
-/// into at most K exact candidates; the existing global pruner performs the
-/// second phase by attaching only winning row ids to the wide data scan.
+/// Native exact-equality evaluation for a core file with no `.vxi` sidecar.
+/// SimpleSelect returns bounded timestamp candidates for the global pruner;
+/// SimpleHistogram streams the equality column and timestamp directly into
+/// fixed counters. Neither path reads `_source`.
 #[allow(clippy::too_many_arguments)]
-async fn search_vix_docs_simple_select(
+async fn search_vix_docs_optimized(
     trace_id: &str,
     condition: &IndexCondition,
     idx_optimize_rule: Option<IndexOptimizeMode>,
@@ -1423,12 +1429,13 @@ async fn search_vix_docs_simple_select(
     time_clamp: Option<(i64, i64)>,
     cache_key: String,
 ) -> anyhow::Result<(String, VixSearchResult, bool)> {
-    let cache_mode = idx_optimize_rule.clone();
-    let (limit, ascend) = match idx_optimize_rule {
-        Some(IndexOptimizeMode::SimpleSelect(limit, ascend)) if limit > 0 => (limit, ascend),
+    match idx_optimize_rule.as_ref() {
+        Some(IndexOptimizeMode::SimpleSelect(limit, _)) if *limit > 0 => {}
+        Some(IndexOptimizeMode::SimpleHistogram(..)) => {}
         other => {
             log::info!(
-                "[trace_id {trace_id}] search->vix: indexless file {} cannot use native candidates for optimize mode {other:?}; back to datafusion",
+                "[trace_id {trace_id}] search->vix: indexless file {} cannot use native equality \
+                 evaluation for optimize mode {other:?}; back to datafusion",
                 file.key,
             );
             return Ok((
@@ -1437,10 +1444,12 @@ async fn search_vix_docs_simple_select(
                 true,
             ));
         }
-    };
+    }
+    let cache_mode = idx_optimize_rule.clone();
     let Some((field, needle)) = condition.single_equal_term() else {
         log::info!(
-            "[trace_id {trace_id}] search->vix: indexless file {} has no single exact equality for native candidates; back to datafusion",
+            "[trace_id {trace_id}] search->vix: indexless file {} has no single exact equality \
+             for native evaluation; back to datafusion",
             file.key,
         );
         return Ok((
@@ -1468,22 +1477,23 @@ async fn search_vix_docs_simple_select(
             }),
         VixReadMode::Cached => None,
     };
-    let input =
-        match ranged {
-            Some(input) => input,
-            None => {
-                let bytes = file_data::get(&account, &key, None).await.map_err(|error| {
+    let input = if let Some(input) = ranged {
+        input
+    } else {
+        let bytes = file_data::get(&account, &key, None)
+            .await
+            .map_err(|error| {
                 anyhow::anyhow!(
                     "[trace_id {trace_id}] failed to load indexless vix data file {key} for \
-                     native SimpleSelect candidates: {error}"
+                     native equality evaluation: {error}"
                 )
             })?;
-                VixDocsInput::Bytes(bytes)
-            }
-        };
+        VixDocsInput::Bytes(bytes)
+    };
 
     let task_key = key.clone();
     let task_field = field.clone();
+    let task_mode = idx_optimize_rule.expect("supported optimize mode checked above");
     let evaluated = tokio::task::spawn_blocking(move || {
         let docs = input
             .open()
@@ -1492,25 +1502,47 @@ async fn search_vix_docs_simple_select(
         let row_group_size = u32::try_from(docs.row_group_size())
             .ok()
             .filter(|size| *size > 0);
-        let candidates = docs
-            .eq_string_top_n(&task_field, &needle, time_clamp, limit, ascend)
-            .map_err(|error| {
-                anyhow::anyhow!(
-                    "native equality candidate scan of {task_key} field {task_field:?}: {error:#}"
+        let result = match task_mode {
+            IndexOptimizeMode::SimpleSelect(limit, ascend) => docs
+                .eq_string_top_n(&task_field, &needle, time_clamp, limit, ascend)
+                .map(|candidates| {
+                    candidates.map(|candidates| VixSearchResult::SelectCandidates {
+                        candidates: Arc::new(candidates),
+                        row_group_size,
+                    })
+                }),
+            IndexOptimizeMode::SimpleHistogram(min_value, bucket_width, num_buckets, ts_offset) => {
+                docs.eq_string_histogram(
+                    &task_field,
+                    &needle,
+                    time_clamp,
+                    min_value,
+                    bucket_width,
+                    num_buckets,
+                    ts_offset,
                 )
-            })?;
-        Ok::<_, anyhow::Error>((candidates, row_count, row_group_size))
+                .map(|histogram| histogram.map(VixSearchResult::Histogram))
+            }
+            _ => unreachable!("unsupported optimize mode rejected before task spawn"),
+        }
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "native equality evaluation of {task_key} field {task_field:?}: {error:#}"
+            )
+        })?;
+        Ok::<_, anyhow::Error>((result, row_count))
     })
     .await
     .map_err(|error| {
         anyhow::anyhow!(
-            "[trace_id {trace_id}] native candidate task for indexless file {key} failed: {error}"
+            "[trace_id {trace_id}] native equality task for indexless file {key} failed: {error}"
         )
     })??;
 
-    let (Some(candidates), row_count, row_group_size) = evaluated else {
+    let (Some(result), row_count) = evaluated else {
         log::info!(
-            "[trace_id {trace_id}] search->vix: indexless file {key} lacks string-family native column {field:?}; back to datafusion",
+            "[trace_id {trace_id}] search->vix: indexless file {key} lacks string-family native \
+             column {field:?}; back to datafusion",
         );
         return Ok((
             String::new(),
@@ -1530,17 +1562,18 @@ async fn search_vix_docs_simple_select(
              metadata records {expected_rows} for {key}"
         ));
     }
-    if candidates.is_empty() {
+    let no_match = match &result {
+        VixSearchResult::SelectCandidates { candidates, .. } => candidates.is_empty(),
+        VixSearchResult::Histogram(histogram) => histogram.iter().all(|count| *count == 0),
+        _ => unreachable!("native docs evaluation only returns select or histogram"),
+    };
+    if no_match {
         if !cache_key.is_empty() {
             vix_result_cache::GLOBAL_CACHE.put(cache_key, CacheEntry::NoMatch);
         }
         return Ok((key, VixSearchResult::NoMatch, false));
     }
 
-    let result = VixSearchResult::SelectCandidates {
-        candidates: Arc::new(candidates),
-        row_group_size,
-    };
     let cfg = get_config();
     if !cache_key.is_empty()
         && result.get_memory_size() < cfg.limit.inverted_index_result_cache_max_entry_size
@@ -1791,6 +1824,33 @@ fn evaluate_vix_index(
             num_buckets,
             ts_offset,
         )) => {
+            // Most immutable log files span only a few seconds while UI
+            // histogram buckets span a minute or more. If this fully covered
+            // file lies in one bucket, count the predicate from the term's
+            // `doc_count` and never open its potentially MB-sized postings
+            // record or `_timestamp` chunks.
+            if !has_skipped
+                && file_in_range
+                && let Some(bucket) = collect::whole_file_histogram_bucket(
+                    reader,
+                    min_value,
+                    bucket_width,
+                    num_buckets,
+                    ts_offset,
+                )?
+            {
+                let count = if stats_eq.is_some() {
+                    eval_bitmap(reader)?.count_set_bits() as u64
+                } else {
+                    reader.count(&query)?
+                };
+                let mut histogram = vec![0u64; num_buckets];
+                histogram[bucket] = count;
+                return Ok(RawVixResult::Histogram {
+                    histogram,
+                    has_skipped: false,
+                });
+            }
             // dense out-of-row term with a zone table: per-chunk rank diffs
             // fold straight into buckets, only bucket-straddling chunks
             // decode (stage 4 of the plist design). The grid IS the query
@@ -2986,11 +3046,10 @@ mod tests {
     }
 
     /// Stage 4 (cuts+ranks): SimpleCount and SimpleHistogram over a dense
-    /// out-of-row term answer from skip-table rank diffs per zone chunk —
-    /// and must match the bitmap path EXACTLY on the same rows, across
-    /// full-range and straddling windows, coarse (chunk-folding) and fine
-    /// (bucket-straddling) grids. Multi-chunk file via tiny docs chunks;
-    /// deterministic scattered timestamps.
+    /// out-of-row term must match the bitmap path EXACTLY across full-range
+    /// and straddling windows. The histogram grids cover the whole-file
+    /// direct-count shortcut, coarse chunk folds, and fine boundary decodes.
+    /// Multi-chunk file via tiny docs chunks; deterministic scattered timestamps.
     #[test]
     fn test_ranked_consumers_match_bitmap_path() {
         use arrow::{
@@ -3121,9 +3180,9 @@ mod tests {
                 .collect();
             assert_eq!(counts[0], counts[1], "count mismatch at {range:?}");
 
-            // SimpleHistogram: coarse buckets (chunks fold) and fine buckets
-            // (chunks straddle edges -> boundary decode)
-            for bucket_width in [50_000u64, 1_000] {
+            // SimpleHistogram: a whole-file bucket (direct term count),
+            // coarse buckets (chunks fold), and fine buckets (boundary decode).
+            for bucket_width in [100_000u64, 50_000, 1_000] {
                 let num_buckets = ((range.1 - range.0) as u64).div_ceil(bucket_width) as usize;
                 let hists: Vec<Vec<u64>> = [&plist_file, &bitmap_file]
                     .iter()
@@ -4321,6 +4380,46 @@ mod tests {
                 }
                 other => panic!("expected exact candidate rows, got {other:?}"),
             }
+        }
+    }
+    /// A data-only core file with a native equality column contributes an
+    /// exact histogram and is removed from the DataFusion scan list.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_indexless_broad_equality_histogram_is_aggregated_natively() {
+        let mut master = store_core_file(
+            "files/org/logs/native-histogram/2026/01/01/00/broad.vix",
+            1_000,
+        )
+        .await;
+        master.meta.index_size = 0;
+        let params = Arc::new(crate::types::QueryParams {
+            trace_id: "native-histogram".to_string(),
+            org_id: "org".to_string(),
+            stream: datafusion::sql::TableReference::from("t"),
+            stream_type: StreamType::Logs,
+            stream_name: "t".to_string(),
+            time_range: (990, 1_010),
+            work_group: None,
+            use_inverted_index: true,
+        });
+        let mut condition = IndexCondition::new();
+        condition.add_condition(Condition::Equal("level".to_string(), "info".to_string()));
+        let mut files = vec![master];
+
+        let (_took, add_filter_back, result) = vix_search(
+            params,
+            &mut files,
+            Some(condition),
+            Some(IndexOptimizeMode::SimpleHistogram(990, 5, 5, 0)),
+        )
+        .await
+        .unwrap();
+
+        assert!(!add_filter_back);
+        assert!(files.is_empty(), "native histogram must remove the file");
+        match result {
+            MultiResult::Histogram(histogram) => assert_eq!(histogram, vec![4, 5, 1, 0, 0]),
+            other => panic!("expected native histogram, got {other:?}"),
         }
     }
 }
