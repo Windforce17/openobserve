@@ -1579,10 +1579,10 @@ pub struct Common {
     #[env_config(
         name = "ZO_VIX_FULL_SCAN_RANGED_MIN_BYTES",
         default = 268435456,
-        help = "Core-file full scans (no index row selection) switch to chunk-granular \
-                ranged reads when the object is at least this many bytes, instead of \
-                buffering the whole compressed blob in RAM (and reserving it from the \
-                DataFusion pool). 0 keeps whole-object gets for all sizes."
+        help = "Wide core-file full scans that request _source switch to chunk-granular ranged \
+                reads when the object is at least this many bytes, instead of buffering the \
+                whole compressed blob in RAM. Row selections and projections without _source \
+                always use ranged reads. 0 keeps whole-object gets only for small wide scans."
     )]
     pub vix_full_scan_ranged_min_bytes: usize,
     #[env_config(

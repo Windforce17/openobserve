@@ -642,6 +642,21 @@ impl DocsInput {
     }
 }
 
+/// Ranged scans are mandatory for row selections, narrow projections, and
+/// large objects. `_source` is the dominant row-store column: a full scan
+/// that does not request it should not fetch and reserve it merely because
+/// the object is below the whole-object safety threshold.
+fn should_use_ranged_scan(
+    projected_schema: &Schema,
+    has_row_selection: bool,
+    file_size: usize,
+    large_file_threshold: usize,
+) -> bool {
+    has_row_selection
+        || projected_schema.field_with_name(SOURCE_COL_NAME).is_err()
+        || (large_file_threshold > 0 && file_size >= large_file_threshold)
+}
+
 impl FileOpener for VixCoreOpener {
     fn open(&self, file: PartitionedFile) -> Result<FileOpenFuture> {
         let store = Arc::clone(&self.object_store);
@@ -659,17 +674,16 @@ impl FileOpener for VixCoreOpener {
 
         Ok(async move {
             let location = file.object_meta.location.clone();
-            // Full scans of LARGE objects also go ranged: the whole-object
-            // GET buffers the entire compressed blob in RAM and reserves it
-            // from the pool — a handful of multi-GB consolidated files
-            // otherwise exhausts any pool (observed: greedy 12.0/12.0 GB).
-            // Chunk-granular ranged decode keeps the reservation at
-            // 4 x docs_chunk_bytes regardless of file size.
+            // Row selections and projections that do not request `_source`
+            // use chunk-granular reads regardless of object size. Large
+            // wide scans also go ranged to bound their pool reservation.
             let force_ranged_size = config::get_config().common.vix_full_scan_ranged_min_bytes;
-            let ranged_wanted = selection.is_some()
-                || (force_ranged_size > 0
-                    && usize::try_from(file.object_meta.size).unwrap_or(usize::MAX)
-                        >= force_ranged_size);
+            let ranged_wanted = should_use_ranged_scan(
+                &projected_schema,
+                selection.is_some(),
+                usize::try_from(file.object_meta.size).unwrap_or(usize::MAX),
+                force_ranged_size,
+            );
             let wants_ranged =
                 docs_range_source(&store, &file.object_meta, ranged_wanted).is_some();
 
@@ -720,12 +734,9 @@ impl FileOpener for VixCoreOpener {
             let cleanup_key = stale_row_cleanup_key(&location);
             let cleanup_handle = tokio::runtime::Handle::try_current().ok();
 
-            // An index row selection means a point read: in ranged mode open
-            // the docs blob over range fetches and decode only the selected
-            // chunks. Full scans (no selection) keep the single whole-object
-            // get — they decode most of the docs blob anyway, and the object
-            // is usually already in the local file cache (cache_files
-            // enqueues background downloads at index-evaluation time).
+            // Ranged mode fetches only projected column chunks. Wide
+            // `_source` scans below the configured threshold retain a
+            // single whole-object get for cache locality.
             let input = match docs_range_source(&store, &file.object_meta, ranged_wanted) {
                 Some(source) => DocsInput::Ranged(source),
                 None => {
@@ -1331,6 +1342,24 @@ mod tests {
     use vortex_index::{VixWriter, VixWriterOptions};
 
     use super::*;
+
+    #[test]
+    fn narrow_full_scans_use_ranged_reads_below_size_threshold() {
+        let narrow = Schema::new(vec![
+            Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+            Field::new("service_release.version", DataType::Utf8, true),
+        ]);
+        let wide = Schema::new(vec![
+            Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+            Field::new(SOURCE_COL_NAME, DataType::Utf8, true),
+        ]);
+        let threshold = 256 * 1024 * 1024;
+
+        assert!(should_use_ranged_scan(&narrow, false, 48 * 1024 * 1024, threshold));
+        assert!(!should_use_ranged_scan(&wide, false, 48 * 1024 * 1024, threshold));
+        assert!(should_use_ranged_scan(&wide, true, 48 * 1024 * 1024, threshold));
+        assert!(should_use_ranged_scan(&wide, false, threshold, threshold));
+    }
 
     /// 4 docs, schema `_timestamp` + `level` (term) + `code` (cs, i64);
     /// `http.status` exists only inside `_source`.
@@ -3067,7 +3096,7 @@ mod review_tests {
 /// objects and matches the in-memory scan bit for bit.
 #[cfg(test)]
 mod ranged_tests {
-    use futures::stream::BoxStream;
+    use futures::{TryStreamExt, stream::BoxStream};
     use object_store::{
         CopyOptions, Error as ObjectStoreError, GetResult, ListResult, MultipartUpload,
         ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult,
@@ -3152,6 +3181,48 @@ mod ranged_tests {
         ) -> ObjectStoreResult<()> {
             self.inner.copy_opts(from, to, options).await
         }
+    }
+
+    /// A small no-selection scan that projects native columns must stay
+    /// columnar: it may not fall back to a whole-object get merely because
+    /// the file is below the wide-scan size threshold.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn small_narrow_full_scan_uses_range_reads_only() {
+        let data = build_core_file();
+        let store: Arc<dyn ObjectStore> = Arc::new(RangeOnlyStore {
+            inner: InMemory::new(),
+        });
+        let path = Path::from("stream/narrow.vix");
+        store.put(&path, data.into()).await.unwrap();
+        let meta = store.head(&path).await.unwrap();
+        assert!(meta.size < 256 * 1024 * 1024);
+
+        let projected_schema = Arc::new(Schema::new(vec![
+            Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+            Field::new("level", DataType::Utf8, true),
+        ]));
+        let opener = VixCoreOpener {
+            column_bounds: Vec::new(),
+            null_rejected_columns: Vec::new(),
+            emit_ts_desc: false,
+            object_store: Arc::clone(&store),
+            projected_schema,
+            timestamp_filter: None,
+            memory_pool: None,
+        };
+        let mut file = PartitionedFile::new(path.to_string(), meta.size);
+        file.object_meta = meta;
+
+        let batches: Vec<RecordBatch> = opener
+            .open(file)
+            .unwrap()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 4);
     }
 
     /// A selection-driven scan over a ranged docs blob returns exactly the

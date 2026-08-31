@@ -23,7 +23,6 @@ use datafusion::common::TableReference;
 use hashbrown::HashMap;
 use proto::cluster_rpc::{IndexInfo, KvItem, QueryIdentifier, SearchInfo, SuperClusterInfo};
 
-use crate::sql::histogram::histogram_bucket_start;
 
 #[derive(Debug, Clone)]
 pub struct RemoteScanNodes {
@@ -75,14 +74,10 @@ impl RemoteScanNodes {
                 .get(table_name)
                 .unwrap_or(&vec![])
                 .clone(),
-            start_time: {
-                let t = self.req.time_range.as_ref().map(|x| x.0).unwrap_or(0);
-                if self.req.histogram_interval > 0 {
-                    histogram_bucket_start(t, self.req.histogram_interval * 1_000_000)
-                } else {
-                    t
-                }
-            },
+            // Never widen this to a histogram bucket boundary: the follower
+            // scan window must equal the requested range or bucket sums can
+            // include records that count(*) excludes.
+            start_time: self.req.time_range.as_ref().map(|x| x.0).unwrap_or(0),
             end_time: self.req.time_range.as_ref().map(|x| x.1).unwrap_or(0),
             timeout: self.req.timeout as u64,
             use_cache: self.req.use_cache,
@@ -236,6 +231,29 @@ mod tests {
         node.search_infos.file_id_list = vec![vec![1, 2], vec![]];
         assert!(!node.is_file_list_empty(0));
         assert!(node.is_file_list_empty(1));
+    }
+
+    #[test]
+    fn test_get_remote_node_keeps_requested_histogram_range() {
+        let req = Request {
+            time_range: Some((1_700_000_017_000_000, 1_700_000_900_000_000)),
+            histogram_interval: 30,
+            ..Default::default()
+        };
+        let nodes = RemoteScanNodes::new(
+            req,
+            vec![],
+            HashMap::new(),
+            HashMap::new(),
+            false,
+            opentelemetry::Context::new(),
+            None,
+        );
+
+        let info = nodes.get_remote_node(&TableReference::from("logs"));
+
+        assert_eq!(info.search_infos.start_time, 1_700_000_017_000_000);
+        assert_eq!(info.search_infos.end_time, 1_700_000_900_000_000);
     }
 
     #[test]

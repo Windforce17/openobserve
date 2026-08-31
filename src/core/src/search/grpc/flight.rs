@@ -379,13 +379,16 @@ pub async fn search(
             match idx_optimize_rule.clone() {
                 Some(agg_mode) => {
                     let all_index_files = index_file_list.clone();
-                    let (_idx_took, _add_filter_back, result) = super::storage::vix_search(
-                        query_params.clone(),
-                        &mut index_file_list,
-                        index_condition.clone(),
-                        Some(agg_mode),
-                    )
-                    .await?;
+                    let (idx_took, _add_filter_back, result) =
+                        super::storage::vix_search(
+                            query_params.clone(),
+                            &mut index_file_list,
+                            index_condition.clone(),
+                            Some(agg_mode),
+                        )
+                        .await?;
+                    scan_stats.idx_took =
+                        std::cmp::max(scan_stats.idx_took, idx_took as i64);
                     if !index_file_list.is_empty() {
                         log::warn!(
                             "[trace_id {trace_id}] flight->search: {} of {} index files could not be answered by the aggregate fast path, moving them to the scan branch",

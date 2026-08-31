@@ -718,9 +718,7 @@ impl MinMaxFamily {
         match (self, value) {
             (MinMaxFamily::I64, StatValue::I64(v)) => Some(MinMaxValue::I64(*v)),
             (MinMaxFamily::U64, StatValue::U64(v)) => Some(MinMaxValue::U64(*v)),
-            (MinMaxFamily::F64, StatValue::F64(v)) => {
-                (!v.is_nan()).then_some(MinMaxValue::F64(*v))
-            }
+            (MinMaxFamily::F64, StatValue::F64(v)) => (!v.is_nan()).then_some(MinMaxValue::F64(*v)),
             _ => None,
         }
     }
@@ -804,8 +802,8 @@ pub(super) fn min_max_field(
     // stats ARE the zone table (per-chunk exact inclusive min/max of the
     // stored values; the stats blob deliberately excludes the column).
     let ts_zone_served = field == TIMESTAMP_COL_NAME && family == MinMaxFamily::I64;
-    let stats = column_stats_table(reader, field)
-        .filter(|(_, table)| table.tag == family.stats_tag());
+    let stats =
+        column_stats_table(reader, field).filter(|(_, table)| table.tag == family.stats_tag());
     let mut decode_rows: Vec<u64> = Vec::new();
     match reader.zone_chunks() {
         Some(chunks) => {
@@ -815,9 +813,8 @@ pub(super) fn min_max_field(
                 {
                     continue; // whole chunk outside the window
                 }
-                let fully_inside = window.is_none_or(|(start, end)| {
-                    chunk.ts_min >= start && chunk.ts_max < end
-                });
+                let fully_inside =
+                    window.is_none_or(|(start, end)| chunk.ts_min >= start && chunk.ts_max < end);
                 if fully_inside {
                     if ts_zone_served {
                         fold(
@@ -933,8 +930,8 @@ pub(super) fn stats_eq_bitmap(
             None => return Ok(None),
         }
     }
-    let stats = column_stats_table(reader, field)
-        .filter(|(_, table)| table.tag == family.stats_tag());
+    let stats =
+        column_stats_table(reader, field).filter(|(_, table)| table.tag == family.stats_tag());
     let len = reader.row_count() as usize;
     let mut builder = BooleanBufferBuilder::new(len);
     builder.append_n(len, false);
@@ -956,10 +953,7 @@ pub(super) fn stats_eq_bitmap(
                     (Some(min), Some(max)) => {
                         let all_outside = probes.iter().all(|p| {
                             matches!(p.cmp_exact(&min), Some(std::cmp::Ordering::Less))
-                                || matches!(
-                                    p.cmp_exact(&max),
-                                    Some(std::cmp::Ordering::Greater)
-                                )
+                                || matches!(p.cmp_exact(&max), Some(std::cmp::Ordering::Greater))
                         });
                         if all_outside {
                             Some(false)
@@ -1782,7 +1776,11 @@ mod tests {
         writer
             .push_batch_with_source(&batch, &sources, None)
             .unwrap();
-        { let (data, index) = writer.finish().unwrap(); VixReader::open_with_index(bytes::Bytes::from(data), index.map(bytes::Bytes::from)).unwrap() }
+        {
+            let (data, index) = writer.finish().unwrap();
+            VixReader::open_with_index(bytes::Bytes::from(data), index.map(bytes::Bytes::from))
+                .unwrap()
+        }
     }
 
     fn all_set(len: usize) -> BooleanBuffer {
@@ -1915,7 +1913,11 @@ mod tests {
         writer
             .push_batch_with_source(&batch, &sources, None)
             .unwrap();
-        let reader = { let (data, index) = writer.finish().unwrap(); VixReader::open_with_index(bytes::Bytes::from(data), index.map(bytes::Bytes::from)).unwrap() };
+        let reader = {
+            let (data, index) = writer.finish().unwrap();
+            VixReader::open_with_index(bytes::Bytes::from(data), index.map(bytes::Bytes::from))
+                .unwrap()
+        };
         assert!(
             !reader.row_order().is_ts_desc(),
             "the file under test must be concat-order"
@@ -2778,12 +2780,12 @@ mod tests {
     /// Multi-chunk M16 fixture. Columns:
     /// - `code`: i64, dense (per-chunk stats rows exist)
     /// - `ratio`: f64 with nulls (dense enough for stats)
-    /// - `sparse`: i64 at ~2.7% density — BELOW the 10% stats threshold
-    ///   (file-level presence only, no chunk rows)
+    /// - `sparse`: i64 at ~2.7% density — BELOW the 10% stats threshold (file-level presence only,
+    ///   no chunk rows)
     /// - `void`: i64, all NULL
     /// - `name`: utf8 (string stats are prefix bounds — never answers)
-    /// - `gate`: i64 with the §4 verdict shapes per chunk — all-7s /
-    ///   mixed 7-and-8 / all-9s / 7s-with-nulls
+    /// - `gate`: i64 with the §4 verdict shapes per chunk — all-7s / mixed 7-and-8 / all-9s /
+    ///   7s-with-nulls
     ///
     /// `with_stats = false` raises the density threshold above 1.0 so NO
     /// column gets chunk rows (the M1-era no-stats shape).
@@ -2797,7 +2799,9 @@ mod tests {
             .map(|i| (i % 40 == 0).then(|| i as i64 * 3))
             .collect();
         let void: Vec<Option<i64>> = vec![None; M16_ROWS];
-        let name: Vec<Option<String>> = (0..M16_ROWS).map(|i| Some(format!("n-{}", i % 5))).collect();
+        let name: Vec<Option<String>> = (0..M16_ROWS)
+            .map(|i| Some(format!("n-{}", i % 5)))
+            .collect();
         let gate: Vec<Option<i64>> = (0..M16_ROWS)
             .map(|i| match i / 64 {
                 0 => Some(7),
@@ -2846,11 +2850,8 @@ mod tests {
             .unwrap();
         let reader = {
             let (data, index) = writer.finish().unwrap();
-            VixReader::open_with_index(
-                bytes::Bytes::from(data),
-                index.map(bytes::Bytes::from),
-            )
-            .unwrap()
+            VixReader::open_with_index(bytes::Bytes::from(data), index.map(bytes::Bytes::from))
+                .unwrap()
         };
         assert_eq!(reader.zone_chunks().unwrap().len(), 4);
         if with_stats {
@@ -3027,22 +3028,22 @@ mod tests {
             let bitmap = every_third(M16_ROWS);
             let straddle = Some((100_000 - 170, 100_000 - 90 + 1));
             for is_max in [false, true] {
-                for (field, values) in
-                    [("code", &data.code), ("sparse", &data.sparse), ("void", &data.void)]
-                {
+                for (field, values) in [
+                    ("code", &data.code),
+                    ("sparse", &data.sparse),
+                    ("void", &data.void),
+                ] {
                     let family = min_max_family(&reader, field).unwrap().unwrap();
                     assert_eq!(family, MinMaxFamily::I64);
                     for window in [None, straddle] {
                         assert_eq!(
-                            min_max_field(&reader, field, family, is_max, window, None)
-                                .unwrap(),
+                            min_max_field(&reader, field, family, is_max, window, None).unwrap(),
                             data.min_max_i64_oracle(values, is_max, window, None),
                             "{field} is_max={is_max} window={window:?} stats={with_stats}"
                         );
                     }
                     assert_eq!(
-                        min_max_field(&reader, field, family, is_max, None, Some(&bitmap))
-                            .unwrap(),
+                        min_max_field(&reader, field, family, is_max, None, Some(&bitmap)).unwrap(),
                         data.min_max_i64_oracle(values, is_max, None, Some(&bitmap)),
                         "{field} bitmap is_max={is_max} stats={with_stats}"
                     );
@@ -3062,8 +3063,7 @@ mod tests {
                 let ts_values: Vec<Option<i64>> = data.ts.iter().map(|t| Some(*t)).collect();
                 for window in [None, straddle] {
                     assert_eq!(
-                        min_max_field(&reader, "_timestamp", family, is_max, window, None)
-                            .unwrap(),
+                        min_max_field(&reader, "_timestamp", family, is_max, window, None).unwrap(),
                         data.min_max_i64_oracle(&ts_values, is_max, window, None),
                         "_timestamp is_max={is_max} window={window:?}"
                     );
@@ -3105,11 +3105,11 @@ mod tests {
                 .unwrap()
             };
             for (texts, probes) in [
-                (vec!["7"], vec![7i64]),          // all-match chunk 0, mixed 1, none 2, nulls 3
-                (vec!["9"], vec![9i64]),          // only chunk 2
-                (vec!["8"], vec![8i64]),          // only the mixed chunk
-                (vec!["12345"], vec![12345i64]),  // matches nothing
-                (vec!["7", "9"], vec![7i64, 9]),  // IN list
+                (vec!["7"], vec![7i64]), // all-match chunk 0, mixed 1, none 2, nulls 3
+                (vec!["9"], vec![9i64]), // only chunk 2
+                (vec!["8"], vec![8i64]), // only the mixed chunk
+                (vec!["12345"], vec![12345i64]), // matches nothing
+                (vec!["7", "9"], vec![7i64, 9]), // IN list
             ] {
                 let bitmap = run("gate", &texts, NumericKind::Int)
                     .unwrap_or_else(|| panic!("gate arm must engage for {texts:?}"));

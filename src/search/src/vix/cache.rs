@@ -574,8 +574,16 @@ mod tests {
         let removed = cache.remove_file_entries([healed]);
         assert_eq!(removed, 3, "every entry of the healed file must go");
         assert_eq!(cache.len(), 1);
-        assert!(cache.get(&format!("{healed}|100|aaaa_n_full"), None).is_none());
-        assert!(cache.get(&format!("{healed}|164|aaaa_n_full"), None).is_none());
+        assert!(
+            cache
+                .get(&format!("{healed}|100|aaaa_n_full"), None)
+                .is_none()
+        );
+        assert!(
+            cache
+                .get(&format!("{healed}|164|aaaa_n_full"), None)
+                .is_none()
+        );
         assert!(
             matches!(
                 cache.get(&format!("{other}|100|aaaa_n_full"), None),

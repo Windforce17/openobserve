@@ -47,12 +47,13 @@
 //! index-less here: they keep the DataFusion filter and are answered by the
 //! scan path.
 //!
-//! Per-file evaluation fans out behind a semaphore of `ZO_VIX_SEARCH_CONCURRENCY`
-//! permits (default 4x CPU cores, capped at 64): each file's work is a few
-//! small — usually locally cached — range reads plus microseconds of CPU, so
-//! the sweet spot sits well above the core count. Only `SimpleSelect`
-//! partitions files into multiple groups (its global top-N prunes remaining
-//! groups between rounds); every other mode evaluates all files as one group.
+//! Per-file evaluation uses an owned `buffer_unordered` bounded by
+//! `ZO_VIX_SEARCH_CONCURRENCY` (default 4x CPU cores, capped at 64): each
+//! file's work is a few small — usually locally cached — range reads plus
+//! microseconds of CPU, so the sweet spot sits well above the core count.
+//! Only `SimpleSelect` partitions files into multiple groups (its global
+//! top-N prunes remaining groups between rounds); every other mode evaluates
+//! all files as one group.
 
 pub mod cache;
 mod collect;
@@ -65,7 +66,7 @@ pub mod reader_cache;
 mod result;
 pub mod source;
 
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, panic::AssertUnwindSafe, sync::Arc};
 
 use arrow::buffer::BooleanBuffer;
 use config::{
@@ -79,14 +80,12 @@ use config::{
     metrics::{self, QUERY_PARQUET_CACHE_RATIO_NODE},
     utils::size::bytes_to_human_readable,
 };
-use futures::{StreamExt, stream};
+use futures::{FutureExt, StreamExt, stream};
 use hashbrown::HashMap;
 use infra::{cache::file_data, errors::Error};
 use itertools::Itertools;
 pub use result::{MinMaxValue, MultiResult, MultiResultBuilder, VixSearchResult};
-use tokio::sync::Semaphore;
-use tokio_stream::StreamExt as _;
-use vortex_index::VixReader;
+use vortex_index::{VixDocs, VixReader};
 
 use self::{
     cache::{self as vix_result_cache, CacheEntry},
@@ -149,24 +148,32 @@ pub async fn vix_search(
             query.time_range,
         );
     }
-    // Only core files WITH an index reach index evaluation. Legacy
-    // parquet/vortex files — including v1-era ones with a sibling index
-    // object still in storage — are index-less, and index-off core files
-    // (#40 stream types, #42 L0 mode; always stamped index_size == 0)
-    // would be whole-object downloaded just to bail at the has_index()
-    // guard: all of them keep the DataFusion filter (add-filter-back) and
-    // are answered by the scan path.
-    let index_files = file_list_map
-        .iter()
-        .filter_map(|(_, f)| {
-            if is_core_file(&f.key) && f.meta.index_size > 0 {
-                scan_stats.compressed_size += f.meta.compressed_size;
-                Some(f.clone())
-            } else {
-                None
-            }
+    // Sidecar-backed core files always reach VIX evaluation. For the exact
+    // `field = value ORDER BY _timestamp LIMIT K` shape, indexless core
+    // files are candidate-capable too: their native docs column produces
+    // exact per-file top-K row ids without projecting `_source`. Legacy
+    // parquet/vortex files remain on the ordinary DataFusion scan path.
+    let native_simple_select = matches!(
+        idx_optimize_mode,
+        Some(IndexOptimizeMode::SimpleSelect(limit, _)) if limit > 0
+    ) && index_condition
+        .as_ref()
+        .is_some_and(|condition| condition.single_equal_term().is_some());
+    let eval_files = file_list_map
+        .values()
+        .filter(|file| {
+            is_core_file(&file.key) && (file.meta.index_size > 0 || native_simple_select)
         })
+        .cloned()
         .collect_vec();
+    // Whole-sidecar caching and its metrics still cover only actual `.vxi`
+    // objects; data-only candidate scans use the range ladder directly.
+    let index_files = eval_files
+        .iter()
+        .filter(|file| file.meta.index_size > 0)
+        .cloned()
+        .collect_vec();
+    scan_stats.compressed_size = index_files.iter().map(|file| file.meta.index_size).sum();
     scan_stats.querier_files = index_files.len() as i64;
     // v3 split: the INDEX object is the `.vxi` sidecar (its exact size is
     // the row's index_size); the data object is enqueued by the scan-side
@@ -207,9 +214,12 @@ pub async fn vix_search(
         .with_label_values(&[query.org_id.as_str(), query.stream_type.as_str(), "index"])
         .inc_by(cache_misses);
 
-    let cached_ratio = (scan_stats.querier_memory_cached_files
-        + scan_stats.querier_disk_cached_files) as f64
-        / scan_stats.querier_files as f64;
+    let cached_ratio = if scan_stats.querier_files == 0 {
+        0.0
+    } else {
+        (scan_stats.querier_memory_cached_files + scan_stats.querier_disk_cached_files) as f64
+            / scan_stats.querier_files as f64
+    };
 
     let download_msg = if cache_type == file_data::CacheType::None {
         "".to_string()
@@ -265,17 +275,17 @@ pub async fn vix_search(
     );
 
     let search_start = std::time::Instant::now();
-    let mut is_add_filter_back = file_list_map.len() != index_files.len();
+    let mut is_add_filter_back = file_list_map.len() != eval_files.len();
     if is_add_filter_back {
         log::info!(
-            "[trace_id {trace_id}] search->vix: {} of {} files have no vix index, the filter will be added back to datafusion for them",
-            file_list_map.len() - index_files.len(),
+            "[trace_id {trace_id}] search->vix: {} of {} files cannot produce exact vix candidates, the filter will be added back to datafusion for them",
+            file_list_map.len() - eval_files.len(),
             file_list_map.len(),
         );
     }
     let time_range = query.time_range;
     let index_parquet_files =
-        partition_vix_files(index_files, &idx_optimize_mode, target_partitions);
+        partition_vix_files(eval_files, &idx_optimize_mode, target_partitions);
 
     // Per-query index-fetch accounting (ranged mode): every range GET issued
     // through sources THIS query opens ticks these counters. Fetches through
@@ -378,23 +388,19 @@ pub async fn vix_search(
             }
         }
 
-        // Spawn a task for each file in the group to filter rows via the index
-        let mut tasks = Vec::new();
-        let semaphore = Arc::new(Semaphore::new(eval_concurrency));
-        for file in file_group {
+        // Buffer owned per-file futures instead of spawning detached tasks.
+        // Dropping the query cancels queued evaluations and async I/O; a
+        // blocking evaluation already running may still finish its CPU step.
+        let tasks = file_group.into_iter().map(|file| {
             let trace_id = query.trace_id.to_string();
             let index_condition_clone = index_condition.clone();
             let idx_optimize_rule_clone = idx_optimize_mode.clone();
-            let semaphore_clone = semaphore.clone();
             let fetch_stats = Arc::clone(&fetch_stats);
             let eval_bail = Arc::clone(&eval_bail);
-            let task = tokio::task::spawn(async move {
-                let permit = semaphore_clone.acquire_owned().await.unwrap();
+            AssertUnwindSafe(async move {
                 if eval_bail.load(std::sync::atomic::Ordering::Relaxed) {
-                    // the query tripped the projected-cost bail: this file
-                    // goes back nameless -> it stays in the map for the scan
-                    // branch, with the filter added back
-                    drop(permit);
+                    // The query tripped the projected-cost bail: this file
+                    // stays in the map for the scan branch, with its filter.
                     return Ok((
                         String::new(),
                         VixSearchResult::Skipped { percent: 100 },
@@ -440,7 +446,6 @@ pub async fn vix_search(
                     )
                     .await;
                 }
-                drop(permit);
                 match ret {
                     Ok(ret) => Ok(ret),
                     Err(e) => {
@@ -452,28 +457,32 @@ pub async fn vix_search(
                         Err(e)
                     }
                 }
-            });
-            tasks.push(task)
-        }
+            })
+            .catch_unwind()
+        });
 
         let mut tasks = stream::iter(tasks).buffer_unordered(eval_concurrency);
-        while let Some(result) = match tasks.try_next().await {
-            Err(e) => {
-                // A panicked eval task is not a per-file condition: restore
-                // the remaining files and fail LOUDLY — both callers either
-                // propagate the error (storage search) or fail the aggregate
-                // query, never silently continue with an empty file list.
-                let took = start.elapsed().as_millis() as usize;
-                log::error!(
-                    "[trace_id {trace_id}] search->vix: index evaluation task panicked, error: {e:?}, took: {took} ms",
-                );
-                file_list.extend(file_list_map.into_values());
-                return Err(Error::Message(format!(
-                    "vix index evaluation task panicked: {e}"
-                )));
-            }
-            Ok(result) => result,
-        } {
+        while let Some(outcome) = tasks.next().await {
+            let result = match outcome {
+                Ok(result) => result,
+                Err(payload) => {
+                    // A panicked eval future is not a per-file condition:
+                    // restore the remaining files and fail loudly.
+                    let panic_message = payload
+                        .downcast_ref::<&str>()
+                        .map(|message| (*message).to_owned())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "non-string panic payload".to_string());
+                    let took = start.elapsed().as_millis() as usize;
+                    log::error!(
+                        "[trace_id {trace_id}] search->vix: index evaluation panicked: {panic_message}, took: {took} ms",
+                    );
+                    file_list.extend(file_list_map.into_values());
+                    return Err(Error::Message(format!(
+                        "vix index evaluation panicked: {panic_message}"
+                    )));
+                }
+            };
             // Each result corresponds to a file in the file list
             match result {
                 Ok((file_name, result, has_skipped_conditions)) => {
@@ -528,6 +537,10 @@ pub async fn vix_search(
                     files_evaluated += 1;
                     if bail_bytes_cap > 0
                         && idx_optimize_mode.is_some()
+                        // Native equality candidates decode no `_source` and
+                        // stay bounded by K; bailing them to the wide scan is
+                        // strictly more expensive, regardless of selectivity.
+                        && !native_simple_select
                         && files_evaluated >= BAIL_SAMPLE_FILES
                         && files_evaluated < files_total
                         && !eval_bail.load(std::sync::atomic::Ordering::Relaxed)
@@ -539,8 +552,9 @@ pub async fn vix_search(
                         // only the per-file eval bytes (multiplying the wave
                         // by files_total/sample would inflate quadratically)
                         let eval_bytes = bytes_so_far.saturating_sub(prefetched_bytes);
-                        let projected = prefetched_bytes
-                            .saturating_add(eval_bytes / files_evaluated as u64 * files_total as u64);
+                        let projected = prefetched_bytes.saturating_add(
+                            eval_bytes / files_evaluated as u64 * files_total as u64,
+                        );
                         if projected > bail_threshold {
                             eval_bail.store(true, std::sync::atomic::Ordering::Relaxed);
                             is_add_filter_back = true;
@@ -817,6 +831,24 @@ impl VixReaderInput {
     }
 }
 
+/// Data-only input for the indexless SimpleSelect candidate pass. Unlike a
+/// [`VixReaderInput`], a ranged docs handle is deliberately not inserted in
+/// the sidecar-aware reader cache: a later sidecar-bearing open must never
+/// reuse a data-only reader.
+enum VixDocsInput {
+    Bytes(bytes::Bytes),
+    Ranged(Arc<dyn vortex_index::VixRangeSource>),
+}
+
+impl VixDocsInput {
+    fn open(self) -> anyhow::Result<VixDocs> {
+        match self {
+            Self::Bytes(bytes) => VixDocs::open(bytes),
+            Self::Ranged(source) => VixDocs::open_ranged(source),
+        }
+    }
+}
+
 pub use vortex_index::set_tail_fetch_size;
 
 /// Warm one core `.vix` file's index metadata into the caches (#39 GAP 2):
@@ -949,18 +981,14 @@ async fn prefetch_cold_tails(
         else {
             continue;
         };
-        let Some(index_size) = u64::try_from(file.meta.index_size)
-            .ok()
-            .filter(|s| *s > 0)
-        else {
+        let Some(index_size) = u64::try_from(file.meta.index_size).ok().filter(|s| *s > 0) else {
             continue;
         };
         if reader_cache::GLOBAL_CACHE.contains(&file.key) {
             continue;
         }
         if result_cache_enabled && let Some(condition) = index_condition {
-            let file_in_range =
-                file.meta.min_ts >= start_time && file.meta.max_ts < end_time;
+            let file_in_range = file.meta.min_ts >= start_time && file.meta.max_ts < end_time;
             let time_clamp = if file_in_range {
                 None
             } else {
@@ -981,7 +1009,12 @@ async fn prefetch_cold_tails(
             continue;
         }
         estimated += estimate;
-        planned.push((file.account.clone(), file.key.clone(), compressed, index_size));
+        planned.push((
+            file.account.clone(),
+            file.key.clone(),
+            compressed,
+            index_size,
+        ));
     }
     if planned.is_empty() {
         return wave;
@@ -1040,8 +1073,7 @@ async fn prefetch_cold_tails(
                 }
             }
         });
-    StreamExt::collect::<Vec<()>>(stream::iter(opens).buffer_unordered(concurrency.max(1)))
-        .await;
+    StreamExt::collect::<Vec<()>>(stream::iter(opens).buffer_unordered(concurrency.max(1))).await;
     wave.fetches = fetch_stats
         .fetches
         .load(std::sync::atomic::Ordering::Relaxed)
@@ -1089,6 +1121,14 @@ async fn search_vix_index(
     let (start_time, end_time) = time_range;
     let file_in_range =
         parquet_file.meta.min_ts >= start_time && parquet_file.meta.max_ts < end_time;
+    let time_clamp = if file_in_range {
+        None
+    } else {
+        Some((
+            start_time.max(parquet_file.meta.min_ts),
+            end_time.min(parquet_file.meta.max_ts.saturating_add(1)),
+        ))
+    };
     // Stats-served count: an unfiltered COUNT over a file FULLY inside the
     // range needs no bytes from the file — file_list's `records` (the
     // writer-stamped row count already in hand) IS the answer. This is how
@@ -1117,14 +1157,6 @@ async fn search_vix_index(
         // result depends on the applied timestamp filter, so its key pins
         // the effective clamp — deep-merged multi-hour files at the window
         // boundary are the most expensive evaluations we memoize.
-        let time_clamp = if file_in_range {
-            None
-        } else {
-            Some((
-                start_time.max(parquet_file.meta.min_ts),
-                end_time.min(parquet_file.meta.max_ts + 1),
-            ))
-        };
         cache_key = generate_cache_key(&condition, &idx_optimize_rule, parquet_file, time_clamp);
         if let Some(result) =
             vix_result_cache::GLOBAL_CACHE.get(&cache_key, idx_optimize_rule.as_ref())
@@ -1134,6 +1166,24 @@ async fn search_vix_index(
                 .inc();
             return Ok((parquet_file.key.to_string(), result, false));
         }
+    }
+
+    // Index-off core files still carry the complete native docs columns.
+    // For this exact ordered-limit shape, produce bounded row candidates
+    // there and let the existing global SimpleSelect pruner point-read only
+    // the winning `_source` rows.
+    if parquet_file.meta.index_size <= 0 {
+        return search_vix_docs_simple_select(
+            trace_id,
+            &condition,
+            idx_optimize_rule,
+            parquet_file,
+            read_mode,
+            fetch_stats,
+            time_clamp,
+            cache_key,
+        )
+        .await;
     }
 
     // Resolve how the object reaches the reader. Ranged mode opens it over
@@ -1196,9 +1246,7 @@ async fn search_vix_index(
                     file_data::get(&file_account, &sidecar_key, None)
                         .await
                         .map_err(|e| {
-                            anyhow::anyhow!(
-                                "failed to load vix index sidecar {sidecar_key}: {e}"
-                            )
+                            anyhow::anyhow!("failed to load vix index sidecar {sidecar_key}: {e}")
                         })?,
                 ),
                 None => None,
@@ -1360,6 +1408,149 @@ async fn search_vix_index(
     Ok((key, result, has_skipped))
 }
 
+/// Data-only SimpleSelect evaluation for a core file with no `.vxi`
+/// sidecar. The first phase scans the native equality column and timestamp
+/// into at most K exact candidates; the existing global pruner performs the
+/// second phase by attaching only winning row ids to the wide data scan.
+#[allow(clippy::too_many_arguments)]
+async fn search_vix_docs_simple_select(
+    trace_id: &str,
+    condition: &IndexCondition,
+    idx_optimize_rule: Option<IndexOptimizeMode>,
+    file: &FileKey,
+    read_mode: VixReadMode,
+    fetch_stats: &Arc<source::FetchStats>,
+    time_clamp: Option<(i64, i64)>,
+    cache_key: String,
+) -> anyhow::Result<(String, VixSearchResult, bool)> {
+    let cache_mode = idx_optimize_rule.clone();
+    let (limit, ascend) = match idx_optimize_rule {
+        Some(IndexOptimizeMode::SimpleSelect(limit, ascend)) if limit > 0 => (limit, ascend),
+        other => {
+            log::info!(
+                "[trace_id {trace_id}] search->vix: indexless file {} cannot use native candidates for optimize mode {other:?}; back to datafusion",
+                file.key,
+            );
+            return Ok((
+                String::new(),
+                VixSearchResult::Skipped { percent: 100 },
+                true,
+            ));
+        }
+    };
+    let Some((field, needle)) = condition.single_equal_term() else {
+        log::info!(
+            "[trace_id {trace_id}] search->vix: indexless file {} has no single exact equality for native candidates; back to datafusion",
+            file.key,
+        );
+        return Ok((
+            String::new(),
+            VixSearchResult::Skipped { percent: 100 },
+            true,
+        ));
+    };
+
+    let account = file.account.clone();
+    let key = file.key.clone();
+    let ranged = match read_mode {
+        VixReadMode::Ranged => u64::try_from(file.meta.compressed_size)
+            .ok()
+            .filter(|size| *size > 0)
+            .zip(tokio::runtime::Handle::try_current().ok())
+            .map(|(size, handle)| {
+                VixDocsInput::Ranged(Arc::new(LadderRangeSource::new(
+                    account.clone(),
+                    &key,
+                    size,
+                    handle,
+                    Some(Arc::clone(fetch_stats)),
+                )))
+            }),
+        VixReadMode::Cached => None,
+    };
+    let input =
+        match ranged {
+            Some(input) => input,
+            None => {
+                let bytes = file_data::get(&account, &key, None).await.map_err(|error| {
+                anyhow::anyhow!(
+                    "[trace_id {trace_id}] failed to load indexless vix data file {key} for \
+                     native SimpleSelect candidates: {error}"
+                )
+            })?;
+                VixDocsInput::Bytes(bytes)
+            }
+        };
+
+    let task_key = key.clone();
+    let task_field = field.clone();
+    let evaluated = tokio::task::spawn_blocking(move || {
+        let docs = input
+            .open()
+            .map_err(|error| anyhow::anyhow!("open indexless vix docs {task_key}: {error:#}"))?;
+        let row_count = docs.row_count();
+        let row_group_size = u32::try_from(docs.row_group_size())
+            .ok()
+            .filter(|size| *size > 0);
+        let candidates = docs
+            .eq_string_top_n(&task_field, &needle, time_clamp, limit, ascend)
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "native equality candidate scan of {task_key} field {task_field:?}: {error:#}"
+                )
+            })?;
+        Ok::<_, anyhow::Error>((candidates, row_count, row_group_size))
+    })
+    .await
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "[trace_id {trace_id}] native candidate task for indexless file {key} failed: {error}"
+        )
+    })??;
+
+    let (Some(candidates), row_count, row_group_size) = evaluated else {
+        log::info!(
+            "[trace_id {trace_id}] search->vix: indexless file {key} lacks string-family native column {field:?}; back to datafusion",
+        );
+        return Ok((
+            String::new(),
+            VixSearchResult::Skipped { percent: 100 },
+            true,
+        ));
+    };
+    let expected_rows = u64::try_from(file.meta.records).map_err(|_| {
+        anyhow::anyhow!(
+            "[trace_id {trace_id}] indexless file {key} has negative record count {}",
+            file.meta.records
+        )
+    })?;
+    if row_count != expected_rows {
+        return Err(anyhow::anyhow!(
+            "[trace_id {trace_id}] indexless vix docs row_count {row_count} does not match \
+             metadata records {expected_rows} for {key}"
+        ));
+    }
+    if candidates.is_empty() {
+        if !cache_key.is_empty() {
+            vix_result_cache::GLOBAL_CACHE.put(cache_key, CacheEntry::NoMatch);
+        }
+        return Ok((key, VixSearchResult::NoMatch, false));
+    }
+
+    let result = VixSearchResult::SelectCandidates {
+        candidates: Arc::new(candidates),
+        row_group_size,
+    };
+    let cfg = get_config();
+    if !cache_key.is_empty()
+        && result.get_memory_size() < cfg.limit.inverted_index_result_cache_max_entry_size
+        && let Some(entry) = get_cache_entry(result.clone(), cache_mode.as_ref())
+    {
+        vix_result_cache::GLOBAL_CACHE.put(cache_key, entry);
+    }
+    Ok((key, result, false))
+}
+
 /// Evaluate one opened `.vix` index against the condition (and optional
 /// optimize mode). Pure and synchronous over the reader — the reader decides
 /// whether reads are in-memory or ranged, which is exactly what the
@@ -1400,7 +1591,8 @@ fn evaluate_vix_index(
             | Some(IndexOptimizeMode::SimpleHistogram(..))
             | Some(IndexOptimizeMode::SimpleCountField(..))
             | Some(IndexOptimizeMode::SimpleMinMax(..))
-    ) && let Some((field, values, kind)) = condition.single_numeric_eq()
+    ) && let Some((field, values, kind)) =
+        condition.single_numeric_eq()
         && !matches!(
             field_capability(trace_id, reader, field),
             FieldCap::Term | FieldCap::Absent
@@ -2019,16 +2211,14 @@ fn get_cache_entry(
 /// the same effective overlap shares the key.
 ///
 /// LAYOUT: `{file key}|{index_size}|{condition hash}_{rule}_{clamp}`.
-/// - The FILE KEY leads so [`VixResultCache::remove_file_entries`] can purge
-///   every entry of a healed file by prefix (`'|'` never occurs in object
-///   keys, so the boundary is unambiguous).
-/// - `index_size` is the index VERSION component (M12): a sidecar-only heal
-///   (M3) rewrites the `.vxi` under a STABLE data key, and `index_size` is
-///   the sidecar's exact object size (v2 semantics) — the same freshness
-///   witness the byte-cache eviction sweep uses — so a post-heal `FileKey`
-///   can never read a pre-heal entry. Both call sites (the main result key
-///   and the straddling-file bitmap memo) flow through here, preserving the
-///   documented memo/main-key identity.
+/// - The FILE KEY leads so [`VixResultCache::remove_file_entries`] can purge every entry of a
+///   healed file by prefix (`'|'` never occurs in object keys, so the boundary is unambiguous).
+/// - `index_size` is the index VERSION component (M12): a sidecar-only heal (M3) rewrites the
+///   `.vxi` under a STABLE data key, and `index_size` is the sidecar's exact object size (v2
+///   semantics) — the same freshness witness the byte-cache eviction sweep uses — so a post-heal
+///   `FileKey` can never read a pre-heal entry. Both call sites (the main result key and the
+///   straddling-file bitmap memo) flow through here, preserving the documented memo/main-key
+///   identity.
 ///
 /// Pub for the openobserve-core heal e2e (the result cache is only
 /// CONSULTED here in the search crate, but heals happen core-side).
@@ -2412,7 +2602,11 @@ mod tests {
         writer
             .push_batch_with_source(&batch, &StringArray::from(sources), None)
             .unwrap();
-        let reader = { let (data, index) = writer.finish().unwrap(); VixReader::open_with_index(bytes::Bytes::from(data), index.map(bytes::Bytes::from)).unwrap() };
+        let reader = {
+            let (data, index) = writer.finish().unwrap();
+            VixReader::open_with_index(bytes::Bytes::from(data), index.map(bytes::Bytes::from))
+                .unwrap()
+        };
         let file = FileKey {
             key: name.to_string(),
             meta: FileMeta {
@@ -2474,7 +2668,11 @@ mod tests {
         writer
             .push_batch_with_source(&batch, &StringArray::from(sources), None)
             .unwrap();
-        let reader = { let (data, index) = writer.finish().unwrap(); VixReader::open_with_index(bytes::Bytes::from(data), index.map(bytes::Bytes::from)).unwrap() };
+        let reader = {
+            let (data, index) = writer.finish().unwrap();
+            VixReader::open_with_index(bytes::Bytes::from(data), index.map(bytes::Bytes::from))
+                .unwrap()
+        };
         assert!(!reader.has_term_capability("message"));
         assert!(reader.has_term_capability("level"));
 
@@ -2555,7 +2753,12 @@ mod tests {
         let mut writer = VixWriter::new(&schema, opts, false);
         let ts = vec![100i64, 99, 98, 97];
         let levels = vec![Some("info"), Some("error"), Some("info"), Some("error")];
-        let traces = vec![Some("t-0001"), Some("t-0002"), Some("t-0003"), Some("t-0004")];
+        let traces = vec![
+            Some("t-0001"),
+            Some("t-0002"),
+            Some("t-0003"),
+            Some("t-0004"),
+        ];
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![
@@ -2659,7 +2862,11 @@ mod tests {
         writer
             .push_batch_with_source(&batch, &StringArray::from(sources), None)
             .unwrap();
-        let reader = { let (data, index) = writer.finish().unwrap(); VixReader::open_with_index(bytes::Bytes::from(data), index.map(bytes::Bytes::from)).unwrap() };
+        let reader = {
+            let (data, index) = writer.finish().unwrap();
+            VixReader::open_with_index(bytes::Bytes::from(data), index.map(bytes::Bytes::from))
+                .unwrap()
+        };
         let condition = IndexCondition {
             conditions: vec![Condition::MatchAll("hello".to_string())],
         };
@@ -2839,7 +3046,11 @@ mod tests {
             writer
                 .push_batch_with_source(&batch, &StringArray::from(sources), None)
                 .unwrap();
-            { let (data, index) = writer.finish().unwrap(); VixReader::open_with_index(bytes::Bytes::from(data), index.map(bytes::Bytes::from)).unwrap() }
+            {
+                let (data, index) = writer.finish().unwrap();
+                VixReader::open_with_index(bytes::Bytes::from(data), index.map(bytes::Bytes::from))
+                    .unwrap()
+            }
         };
         let bitmap_file = build(0);
         let plist_file = build(100);
@@ -3063,7 +3274,11 @@ mod tests {
                 .push_batch_with_source(&batch, &StringArray::from(sources), None)
                 .unwrap();
         }
-        let reader = { let (data, index) = writer.finish().unwrap(); VixReader::open_with_index(bytes::Bytes::from(data), index.map(bytes::Bytes::from)).unwrap() };
+        let reader = {
+            let (data, index) = writer.finish().unwrap();
+            VixReader::open_with_index(bytes::Bytes::from(data), index.map(bytes::Bytes::from))
+                .unwrap()
+        };
         eprintln!("build: {:?} ({N} rows)", t_build.elapsed());
         let condition = IndexCondition {
             conditions: vec![Condition::MatchAll("failed".to_string())],
@@ -3276,7 +3491,11 @@ mod tests {
         writer
             .push_batch_with_source(&batch, &StringArray::from(sources), None)
             .unwrap();
-        let reader = { let (data, index) = writer.finish().unwrap(); VixReader::open_with_index(bytes::Bytes::from(data), index.map(bytes::Bytes::from)).unwrap() };
+        let reader = {
+            let (data, index) = writer.finish().unwrap();
+            VixReader::open_with_index(bytes::Bytes::from(data), index.map(bytes::Bytes::from))
+                .unwrap()
+        };
         let file = FileKey {
             key: name.to_string(),
             meta: FileMeta {
@@ -3497,7 +3716,11 @@ mod tests {
         writer
             .push_batch_with_source(&batch, &StringArray::from(sources), None)
             .unwrap();
-        let reader = { let (data, index) = writer.finish().unwrap(); VixReader::open_with_index(bytes::Bytes::from(data), index.map(bytes::Bytes::from)).unwrap() };
+        let reader = {
+            let (data, index) = writer.finish().unwrap();
+            VixReader::open_with_index(bytes::Bytes::from(data), index.map(bytes::Bytes::from))
+                .unwrap()
+        };
         // v2 all-columns: code_fn is a docs column too (the filtered
         // grouped read serves from it)
         assert!(reader.has_column_store_field("code_fn"), "test premise");
@@ -3899,7 +4122,8 @@ mod tests {
                 .await,
             );
         }
-        let wave = prefetch_cold_tails(&strapped, &condition, &mode, (0, 4_000), 8, &stats, 1).await;
+        let wave =
+            prefetch_cold_tails(&strapped, &condition, &mode, (0, 4_000), 8, &stats, 1).await;
         assert_eq!(wave.cold, 2);
         assert_eq!(
             (wave.prefetched, wave.fetches),
@@ -4047,6 +4271,57 @@ mod tests {
             matches!(result, MultiResult::Count(40)),
             "expected Count(40), got {result:?}"
         );
+    }
+    /// Broad equality on an index-off core file must still enter the
+    /// SimpleSelect candidate path. The final file selection contains only
+    /// global winners and is exact, so the scan point-reads `_source`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_indexless_broad_equality_simple_select_late_materializes() {
+        let mut master = store_core_file(
+            "files/org/logs/native-select/2026/01/01/00/broad.vix",
+            1_000,
+        )
+        .await;
+        master.meta.index_size = 0;
+
+        for (ascend, expected, trace_id) in [
+            (false, vec![0, 1, 2], "native-select-desc"),
+            (true, vec![7, 8, 9], "native-select-asc"),
+        ] {
+            let params = Arc::new(crate::types::QueryParams {
+                trace_id: trace_id.to_string(),
+                org_id: "org".to_string(),
+                stream: datafusion::sql::TableReference::from("t"),
+                stream_type: StreamType::Logs,
+                stream_name: "t".to_string(),
+                time_range: (0, 2_000),
+                work_group: None,
+                use_inverted_index: true,
+            });
+            let mut condition = IndexCondition::new();
+            condition.add_condition(Condition::Equal("level".to_string(), "info".to_string()));
+            let mut files = vec![master.clone()];
+
+            let (_took, add_filter_back, result) = vix_search(
+                params,
+                &mut files,
+                Some(condition),
+                Some(IndexOptimizeMode::SimpleSelect(3, ascend)),
+            )
+            .await
+            .unwrap();
+
+            assert!(!add_filter_back);
+            assert!(matches!(result, MultiResult::SimpleSelect(3)));
+            assert_eq!(files.len(), 1);
+            assert!(files[0].selection_exact);
+            match files[0].selection.as_ref().unwrap() {
+                FileSelection::Rows(rows) => {
+                    assert_eq!(rows.iter().collect::<Vec<_>>(), expected);
+                }
+                other => panic!("expected exact candidate rows, got {other:?}"),
+            }
+        }
     }
 }
 
@@ -4242,8 +4517,7 @@ mod ranged_parity_tests {
             "parity pair must exceed the tail window to exercise ranged blobs"
         );
         // cached mode's reader: complete in-memory bytes
-        let mem_reader =
-            VixReader::open_with_index(data.clone(), Some(index.clone())).unwrap();
+        let mem_reader = VixReader::open_with_index(data.clone(), Some(index.clone())).unwrap();
         // decode-path reader: the same bytes with the zone table stripped, so
         // the fast paths take the full-decode path — a third parity leg
         // proving the zone-map path (mem/ranged) agrees with the decode path
@@ -4511,9 +4785,7 @@ mod ranged_parity_tests {
             })
             .collect();
         let code: Vec<Option<i64>> = (0..ROWS).map(|i| Some(i as i64 % 31)).collect();
-        let svc: Vec<Option<&str>> = (0..ROWS)
-            .map(|i| (i % 5 != 4).then_some("api"))
-            .collect();
+        let svc: Vec<Option<&str>> = (0..ROWS).map(|i| (i % 5 != 4).then_some("api")).collect();
         let schema = Arc::new(Schema::new(vec![
             Field::new("_timestamp", DataType::Int64, false),
             Field::new("gate", DataType::Int64, true),
@@ -4656,8 +4928,7 @@ mod ranged_parity_tests {
                     let it = (0..ROWS)
                         .filter(|&i| gate[i] == Some(7))
                         .filter_map(|i| code[i]);
-                    let oracle =
-                        (if is_max { it.max() } else { it.min() }).map(MinMaxValue::I64);
+                    let oracle = (if is_max { it.max() } else { it.min() }).map(MinMaxValue::I64);
                     assert_eq!(value, oracle, "is_max={is_max}");
                 }
                 other => panic!("expected min/max, got {}", fingerprint(&other)),
@@ -4880,7 +5151,11 @@ mod review_tests {
         writer
             .push_batch_with_source(&batch, &StringArray::from(sources), None)
             .unwrap();
-        { let (data, index) = writer.finish().unwrap(); VixReader::open_with_index(bytes::Bytes::from(data), index.map(bytes::Bytes::from)).unwrap() }
+        {
+            let (data, index) = writer.finish().unwrap();
+            VixReader::open_with_index(bytes::Bytes::from(data), index.map(bytes::Bytes::from))
+                .unwrap()
+        }
     }
 
     /// One-batch core file with `svc` fully term-indexed and `payload`
@@ -4921,7 +5196,11 @@ mod review_tests {
                 None,
             )
             .unwrap();
-        { let (data, index) = writer.finish().unwrap(); VixReader::open_with_index(bytes::Bytes::from(data), index.map(bytes::Bytes::from)).unwrap() }
+        {
+            let (data, index) = writer.finish().unwrap();
+            VixReader::open_with_index(bytes::Bytes::from(data), index.map(bytes::Bytes::from))
+                .unwrap()
+        }
     }
 
     /// #32: a partial field no longer sends the whole file to the scan
@@ -5120,7 +5399,11 @@ mod review_tests {
         writer
             .push_batch_with_source(&batch, &StringArray::from(sources), None)
             .unwrap();
-        { let (data, index) = writer.finish().unwrap(); VixReader::open_with_index(bytes::Bytes::from(data), index.map(bytes::Bytes::from)).unwrap() }
+        {
+            let (data, index) = writer.finish().unwrap();
+            VixReader::open_with_index(bytes::Bytes::from(data), index.map(bytes::Bytes::from))
+                .unwrap()
+        }
     }
 
     fn eval_bits(reader: &VixReader, conditions: Vec<Condition>) -> (Vec<usize>, bool) {
@@ -5826,7 +6109,11 @@ mod review_tests {
         writer
             .push_batch_with_source(&batch, &StringArray::from(sources), None)
             .unwrap();
-        { let (data, index) = writer.finish().unwrap(); VixReader::open_with_index(bytes::Bytes::from(data), index.map(bytes::Bytes::from)).unwrap() }
+        {
+            let (data, index) = writer.finish().unwrap();
+            VixReader::open_with_index(bytes::Bytes::from(data), index.map(bytes::Bytes::from))
+                .unwrap()
+        }
     }
 
     /// #40: an index-off file answers NOTHING but condition-free evals.
@@ -6012,7 +6299,11 @@ mod ui_histogram_differential_tests {
                 None,
             )
             .unwrap();
-        { let (data, index) = writer.finish().unwrap(); VixReader::open_with_index(bytes::Bytes::from(data), index.map(bytes::Bytes::from)).unwrap() }
+        {
+            let (data, index) = writer.finish().unwrap();
+            VixReader::open_with_index(bytes::Bytes::from(data), index.map(bytes::Bytes::from))
+                .unwrap()
+        }
     }
 
     /// Executes `sql` (the exact generated shape) over the same rows with

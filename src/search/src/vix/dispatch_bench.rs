@@ -192,8 +192,7 @@ fn bench_dispatch_classes() {
             None => eprintln!("  dict filtered topn[{field}]: REFUSED (fallback path)"),
         }
         let docs = timed(&format!("docs topn filtered[{field}]"), || {
-            collect::simple_top_n(&reader, &bitmap, std::slice::from_ref(field), 10, false)
-                .unwrap()
+            collect::simple_top_n(&reader, &bitmap, std::slice::from_ref(field), 10, false).unwrap()
         });
         eprintln!(
             "  docs filtered topn[{field}]: {} groups, top={:?}",

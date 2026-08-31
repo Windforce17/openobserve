@@ -158,6 +158,10 @@ impl SimpleSelectPruner {
             let row_ids =
                 RowIdBitmap::from_row_ids(file.meta.records as usize, doc_ids.iter().copied());
             file.with_selection(FileSelection::Rows(Arc::new(row_ids)), *row_group_size);
+            // Candidate generation evaluated the complete predicate for
+            // this file. The point-read scan must not decode `_source` only
+            // to re-run the same filter.
+            file.selection_exact = true;
         }
 
         // with a full winner set, drop the files without candidates that
@@ -392,6 +396,8 @@ mod tests {
         // the selections shrink to the winning rows only
         assert_eq!(selected_rows(&files["file_91_100"]), vec![10, 11]);
         assert_eq!(selected_rows(&files["file_81_90"]), vec![20]);
+        assert!(files["file_91_100"].selection_exact);
+        assert!(files["file_81_90"].selection_exact);
         assert_eq!(files["file_91_100"].row_group_size, Some(1024));
     }
 

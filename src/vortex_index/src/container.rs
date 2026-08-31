@@ -581,7 +581,10 @@ pub(crate) enum BlobPart {
     Mem(Vec<u8>),
     /// The file cursor must be at the payload start (byte 0); `len` is the
     /// payload length in bytes.
-    Spooled { file: std::fs::File, len: u64 },
+    Spooled {
+        file: std::fs::File,
+        len: u64,
+    },
 }
 
 /// Assemble the final puffin container from properties and pre-built blobs
@@ -1177,7 +1180,9 @@ pub(crate) fn docs_strategy(row_block_size: usize) -> Arc<dyn LayoutStrategy> {
 /// `_source` text UNCOMPRESSED (caught by the #51c probe).
 #[cfg_attr(not(test), expect(dead_code))]
 pub(crate) fn is_decoded_family(chunk: &ArrayRef) -> bool {
-    chunk.depth_first_traversal().all(|node| is_decoded_node(&node))
+    chunk
+        .depth_first_traversal()
+        .all(|node| is_decoded_node(&node))
 }
 
 /// M25: whether the ROOT node alone is decoded-family. A chunk whose root is
@@ -1458,15 +1463,13 @@ fn column_leaf_boundaries(vxf: &VortexFile) -> Option<Vec<Vec<u64>>> {
 /// are coarser than the split grid arrives as SLICES of one stored chunk.
 /// A sliced form does NOT survive a serialize round-trip:
 ///
-/// - encodings WITHOUT a metadata slice rule keep a runtime `vortex.slice`
-///   wrapper (`vortex.runend` / `vortex.fastlanes.rle` register only
-///   execute-time slice kernels), which the file writer's context cannot
-///   intern — "Array encoding vortex.slice not permitted by ctx", the prod
-///   .110 failure;
-/// - encodings WITH a metadata rule reduce to offset-bearing forms whose
-///   serialize silently DROPS the offset — the M18 probe measured a sliced
-///   `vortex.zigzag` column re-reading 96% wrong rows after a verbatim
-///   copy (the M5-era pco probe was the same class).
+/// - encodings WITHOUT a metadata slice rule keep a runtime `vortex.slice` wrapper (`vortex.runend`
+///   / `vortex.fastlanes.rle` register only execute-time slice kernels), which the file writer's
+///   context cannot intern — "Array encoding vortex.slice not permitted by ctx", the prod .110
+///   failure;
+/// - encodings WITH a metadata rule reduce to offset-bearing forms whose serialize silently DROPS
+///   the offset — the M18 probe measured a sliced `vortex.zigzag` column re-reading 96% wrong rows
+///   after a verbatim copy (the M5-era pco probe was the same class).
 ///
 /// Detection is therefore DETERMINISTIC, not heuristic: a field's window is
 /// copied verbatim only when both window edges lie on that column's OWN
@@ -1696,10 +1699,7 @@ impl TermsBlobSpooler {
                 let mut writer = VortexWriteOptions::new(session)
                     .with_strategy(addressable_strategy())
                     .blocking(&runtime)
-                    .writer(
-                        std::io::BufWriter::with_capacity(1024 * 1024, sink),
-                        dtype,
-                    );
+                    .writer(std::io::BufWriter::with_capacity(1024 * 1024, sink), dtype);
                 while let Ok(batch) = rx.recv() {
                     if batch.num_rows() == 0 {
                         continue;
@@ -2049,28 +2049,66 @@ pub(crate) struct DictColumnChunk {
     pub values: ArrowArrayRef,
 }
 
-/// M15: row ids (ascending) whose stored `name` value EQUALS `needle`, over
-/// the given ascending disjoint row `ranges` of the blob — the fast
-/// filter-back scan for equality on a #52-demoted (bloom-only) column.
+/// Shared row-id allocation budget for the equality pre-pass. Workers may
+/// collectively retain at most `limit` matches; the first additional match
+/// marks the pass broad and makes every worker stop at its next check.
+pub(crate) struct EqMatchBudget {
+    limit: u64,
+    claimed: std::sync::atomic::AtomicU64,
+    exceeded: std::sync::atomic::AtomicBool,
+}
+
+impl EqMatchBudget {
+    pub(crate) fn new(limit: u64) -> Self {
+        Self {
+            limit,
+            claimed: std::sync::atomic::AtomicU64::new(0),
+            exceeded: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    pub(crate) fn is_exceeded(&self) -> bool {
+        self.exceeded.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn try_push(&self, row: u64, out: &mut Vec<u64>) -> bool {
+        if self.is_exceeded() {
+            return false;
+        }
+        let slot = self
+            .claimed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if slot >= self.limit {
+            self.exceeded
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            return false;
+        }
+        out.push(row);
+        true
+    }
+}
+
+/// Row ids (ascending) whose stored `name` value equals `needle`, over the
+/// given ascending disjoint row `ranges`. Returns `None` as soon as the
+/// shared match budget proves the point-read follow-up is too broad.
 ///
 /// Per chunk, dictionary-aware: a chunk stored DICT-encoded (the norm for
 /// the columns vortex's sampler dict-probes) resolves the needle against
-/// its small distinct-values array ONCE and then scans the u64 code array
+/// its small distinct-values array once and then scans the u64 code array
 /// for the matched code ids — no per-row string materialization or compare.
 /// Non-dict chunks (high-entropy FSST/plain, or any conversion failure)
 /// take the existing shape per chunk: canonical decode + per-row compare.
 /// Null rows never match (equality is null-rejecting).
 ///
-/// Runs single-threaded over ITS ranges by design — the caller
-/// ([`crate::VixDocs`]) splits ranges across OS threads and concatenates
-/// (each worker opens its own single-thread vortex session over the shared
-/// blob handle; the cached footer makes reopens footer-fetch-free).
+/// Runs single-threaded over its ranges. The caller splits ranges across
+/// OS threads; all workers share `budget`, bounding aggregate row-id memory.
 pub(crate) fn eq_string_rows_ranges(
     blob: &BlobHandle,
     name: &str,
     needle: &str,
     ranges: &[std::ops::Range<u64>],
-) -> Result<Vec<u64>> {
+    budget: &EqMatchBudget,
+) -> Result<Option<Vec<u64>>> {
     use arrow::array::{StringArray, UInt64Array};
     use vortex::array::arrays::{
         Dict, Struct, dict::DictArraySlotsExt, shared::SharedArrayExt, struct_::StructArrayExt,
@@ -2092,11 +2130,12 @@ pub(crate) fn eq_string_rows_ranges(
             .as_any()
             .downcast_ref::<StringArray>()
             .cloned()
-            .ok_or_else(|| {
-                VixError::Malformed(format!("column {name:?} did not convert to Utf8"))
-            })
+            .ok_or_else(|| VixError::Malformed(format!("column {name:?} did not convert to Utf8")))
     };
     for range in ranges {
+        if budget.is_exceeded() {
+            return Ok(None);
+        }
         if range.start >= range.end {
             continue;
         }
@@ -2106,13 +2145,14 @@ pub(crate) fn eq_string_rows_ranges(
             .with_row_range(range.clone());
         let mut row = range.start;
         for array in scan.into_array_iter(&runtime)? {
+            if budget.is_exceeded() {
+                return Ok(None);
+            }
             let array = array?;
             let field = array
                 .as_typed::<Struct>()
                 .ok_or_else(|| {
-                    VixError::Malformed(
-                        "projected scan did not produce a struct array".to_string(),
-                    )
+                    VixError::Malformed("projected scan did not produce a struct array".to_string())
                 })?
                 .unmasked_field_by_name(name)
                 .map_err(|e| VixError::Malformed(format!("column {name:?}: {e}")))?
@@ -2156,8 +2196,8 @@ pub(crate) fn eq_string_rows_ranges(
                                 Some(m) => code == m,
                                 None => matched.contains(&code),
                             };
-                            if hit {
-                                out.push(row + i as u64);
+                            if hit && !budget.try_push(row + i as u64, &mut out) {
+                                return Ok(None);
                             }
                         }
                     }
@@ -2169,8 +2209,11 @@ pub(crate) fn eq_string_rows_ranges(
                 // scan shape, per chunk — canonical decode + per-row compare
                 let values = to_utf8(&field, &session)?;
                 for i in 0..values.len() {
-                    if !values.is_null(i) && values.value(i) == needle {
-                        out.push(row + i as u64);
+                    if !values.is_null(i)
+                        && values.value(i) == needle
+                        && !budget.try_push(row + i as u64, &mut out)
+                    {
+                        return Ok(None);
                     }
                 }
             }
@@ -2183,7 +2226,111 @@ pub(crate) fn eq_string_rows_ranges(
             )));
         }
     }
-    Ok(out)
+    Ok(Some(out))
+}
+/// Stream exact `(timestamp, row_id)` candidates for one string equality
+/// over an ascending row range. The equality and optional timestamp clamp
+/// execute inside Vortex; dictionary chunks compare the literal against
+/// their distinct values once and reuse the codes. The projection contains
+/// only `_timestamp` and Vortex's absolute row-index expression, so callers
+/// can stop after enough ordered candidates without touching `_source`.
+///
+/// Returning `false` from `on_candidate` stops the scan cleanly. This is the
+/// filtered-scan equivalent of a LIMIT (Vortex 0.79 rejects a ScanBuilder
+/// carrying both a filter and a limit).
+pub(crate) fn scan_eq_string_candidates_range(
+    blob: &BlobHandle,
+    name: &str,
+    needle: &str,
+    range: std::ops::Range<u64>,
+    ts_range: Option<(i64, i64)>,
+    on_candidate: &mut dyn FnMut(i64, u32) -> bool,
+) -> Result<()> {
+    use arrow::array::{Int64Array, UInt64Array};
+    use vortex::{
+        dtype::Nullability,
+        expr::{and, col, eq, gt_eq, lit, lt, pack},
+        layout::layouts::row_idx::row_idx,
+    };
+
+    const ROW_ID_COL: &str = "__vix_row_id";
+
+    if range.start >= range.end {
+        return Ok(());
+    }
+    let runtime = SingleThreadRuntime::default();
+    let session = VortexSession::default().with_handle(runtime.handle());
+    let vxf = open_blob(&runtime, &session, blob)?;
+    let mut filter = eq(col(name), lit(needle.to_string()));
+    if let Some((start, end)) = ts_range {
+        let time_filter = and(
+            gt_eq(col(crate::writer::TIMESTAMP_COL_NAME), lit(start)),
+            lt(col(crate::writer::TIMESTAMP_COL_NAME), lit(end)),
+        );
+        filter = and(filter, time_filter);
+    }
+    let projection = pack(
+        [
+            (
+                crate::writer::TIMESTAMP_COL_NAME,
+                col(crate::writer::TIMESTAMP_COL_NAME),
+            ),
+            (ROW_ID_COL, row_idx()),
+        ],
+        Nullability::NonNullable,
+    );
+    let scan = vxf
+        .scan()?
+        .with_projection(projection)
+        .with_filter(filter)
+        .with_row_range(range);
+    let arrow_schema = scan.dtype()?.to_arrow_schema()?;
+    let data_type = DataType::Struct(arrow_schema.fields().clone());
+    for array in scan.into_array_iter(&runtime)? {
+        let batch = vortex_to_record_batch(&session, array?, &data_type)?;
+        let timestamps = batch
+            .column_by_name(crate::writer::TIMESTAMP_COL_NAME)
+            .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+            .ok_or_else(|| {
+                VixError::Malformed(format!(
+                    "filtered equality scan did not produce {:?} as i64",
+                    crate::writer::TIMESTAMP_COL_NAME
+                ))
+            })?;
+        let row_ids = batch
+            .column_by_name(ROW_ID_COL)
+            .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+            .ok_or_else(|| {
+                VixError::Malformed(
+                    "filtered equality scan did not produce absolute u64 row ids".to_string(),
+                )
+            })?;
+        if timestamps.len() != row_ids.len()
+            || timestamps.null_count() > 0
+            || row_ids.null_count() > 0
+        {
+            return Err(VixError::Malformed(format!(
+                "filtered equality scan returned invalid candidate columns: timestamps={} \
+                 ({} nulls), row_ids={} ({} nulls)",
+                timestamps.len(),
+                timestamps.null_count(),
+                row_ids.len(),
+                row_ids.null_count(),
+            )));
+        }
+        for i in 0..timestamps.len() {
+            let row_id = u32::try_from(row_ids.value(i)).map_err(|_| {
+                VixError::Malformed(format!(
+                    "filtered equality row id {} exceeds u32",
+                    row_ids.value(i)
+                ))
+            })?;
+            if !on_candidate(timestamps.value(i), row_id) {
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Scan one column of a stored blob in dictionary form, chunk by chunk,
@@ -2304,7 +2451,10 @@ pub(crate) fn hash_blob_column_bloom_encoded(
     use arrow::array::StringArray;
     use vortex::{
         array::{
-            arrays::{Dict, Struct, dict::DictArraySlotsExt, shared::SharedArrayExt, struct_::StructArrayExt, varbin::VarBinArrayExt},
+            arrays::{
+                Dict, Struct, dict::DictArraySlotsExt, shared::SharedArrayExt,
+                struct_::StructArrayExt, varbin::VarBinArrayExt,
+            },
             validity::Validity,
         },
         encodings::fsst::{FSST, FSSTArrayExt},
@@ -2572,7 +2722,10 @@ pub(crate) fn probe_column_encodings(docs: &crate::VixDocs, name: &str) {
     let runtime = SingleThreadRuntime::default();
     let session = VortexSession::default().with_handle(runtime.handle());
     let vxf = open_blob(&runtime, &session, blob).unwrap();
-    let scan = vxf.scan().unwrap().with_projection(select(vec![name], root()));
+    let scan = vxf
+        .scan()
+        .unwrap()
+        .with_projection(select(vec![name], root()));
     for (i, array) in scan.into_array_iter(&runtime).unwrap().enumerate() {
         let array = array.unwrap();
         let field = array

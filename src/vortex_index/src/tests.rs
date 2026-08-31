@@ -1413,8 +1413,7 @@ fn container_properties_match_spec() {
     let (bytes, index) = build_docs_dataset_bytes(true);
     let meta = puffin::reader::parse_puffin_footer_from_bytes(&bytes).unwrap();
     let index_meta =
-        puffin::reader::parse_puffin_footer_from_bytes(index.as_deref().expect("sidecar"))
-            .unwrap();
+        puffin::reader::parse_puffin_footer_from_bytes(index.as_deref().expect("sidecar")).unwrap();
 
     // DATA object: data-descriptive properties only (v3 split).
     let props = &meta.properties;
@@ -1423,8 +1422,17 @@ fn container_properties_match_spec() {
     assert_eq!(props["row_count"], "10");
     assert_eq!(props["row_group_size"], "128");
     // index-descriptive properties must NOT leak onto the data object
-    for foreign in ["tokenizer", "dict_layout", "key_layout", "term_count", "fields"] {
-        assert!(!props.contains_key(foreign), "data object carries {foreign:?}");
+    for foreign in [
+        "tokenizer",
+        "dict_layout",
+        "key_layout",
+        "term_count",
+        "fields",
+    ] {
+        assert!(
+            !props.contains_key(foreign),
+            "data object carries {foreign:?}"
+        );
     }
     // `columns`: the docs-column field list minus `_source`/`_original` —
     // field presence WITH per-column present-row counts (H2), readable
@@ -1477,12 +1485,7 @@ fn container_properties_match_spec() {
     let tags = |meta: &puffin::PuffinMeta| -> Vec<(String, String)> {
         meta.blobs
             .iter()
-            .map(|blob| {
-                (
-                    blob.blob_type.clone(),
-                    blob.properties["blob_tag"].clone(),
-                )
-            })
+            .map(|blob| (blob.blob_type.clone(), blob.properties["blob_tag"].clone()))
             .collect()
     };
     assert_eq!(
@@ -1496,7 +1499,10 @@ fn container_properties_match_spec() {
         tags(&index_meta),
         vec![
             ("o2-vix-terms-v1".to_string(), "terms".to_string()),
-            ("o2-vix-dictblocks-v1".to_string(), "dict_blocks".to_string()),
+            (
+                "o2-vix-dictblocks-v1".to_string(),
+                "dict_blocks".to_string()
+            ),
             ("o2-vix-dict-v2".to_string(), "dict".to_string()),
         ]
     );
@@ -2516,8 +2522,10 @@ fn source_driven_extraction_parity() {
             .unwrap();
     }
 
-    let (column_bytes, column_bytes_index, column_stats) = column_driven.finish_with_stats().unwrap();
-    let (source_bytes, source_bytes_index, source_stats) = source_driven.finish_with_stats().unwrap();
+    let (column_bytes, column_bytes_index, column_stats) =
+        column_driven.finish_with_stats().unwrap();
+    let (source_bytes, source_bytes_index, source_stats) =
+        source_driven.finish_with_stats().unwrap();
 
     let column_reader = open_built(column_bytes, column_bytes_index);
     let source_reader = open_built(source_bytes, source_bytes_index);
@@ -3839,6 +3847,66 @@ fn vix_docs_row_selection_and_ts_filter() {
     assert!(
         docs.read_docs(Some(&["nope".to_string()]), None, None)
             .is_err()
+    );
+}
+
+#[test]
+fn vix_docs_broad_string_equality_top_n_is_exact() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("_timestamp", DataType::Int64, false),
+        Field::new("svc", DataType::Utf8, false),
+    ]));
+    let timestamps = vec![110, 109, 108, 107, 106, 105, 104, 103, 102, 101];
+    let services = vec![
+        "hit", "hit", "miss", "hit", "hit", "miss", "hit", "hit", "miss", "hit",
+    ];
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(timestamps)) as ArrayRef,
+            Arc::new(StringArray::from(services)) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let source = StringArray::from_iter_values((0..10).map(|row| format!("{{\"row\":{row}}}")));
+    let mut writer = VixWriter::new(&schema, dataset_options(), false);
+    writer
+        .push_batch_with_source(&batch, &source, None)
+        .unwrap();
+    let (data, _) = writer.finish().unwrap();
+    let docs = crate::VixDocs::open(Bytes::from(data)).unwrap();
+    assert!(docs.row_order().is_ts_desc());
+
+    // Seven of ten rows match: deliberately beyond the 2% selective
+    // point-read threshold that used to fall back to a wide `_source` scan.
+    assert_eq!(
+        docs.eq_string_top_n("svc", "hit", None, 3, false)
+            .unwrap()
+            .unwrap(),
+        vec![(110, 0), (109, 1), (107, 3)]
+    );
+    assert_eq!(
+        docs.eq_string_top_n("svc", "hit", None, 3, true)
+            .unwrap()
+            .unwrap(),
+        vec![(101, 9), (103, 7), (104, 6)]
+    );
+    // Exact half-open clamp: 109 is excluded and 103 is included.
+    assert_eq!(
+        docs.eq_string_top_n("svc", "hit", Some((103, 109)), 3, false)
+            .unwrap()
+            .unwrap(),
+        vec![(107, 3), (106, 4), (104, 6)]
+    );
+    assert!(
+        docs.eq_string_top_n("missing", "hit", None, 3, false)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        docs.eq_string_top_n("_timestamp", "107", None, 3, false)
+            .unwrap()
+            .is_none()
     );
 }
 
@@ -5784,10 +5852,9 @@ mod plist {
             off_pair.0.len(),
             off_pair.1.as_ref().map(Vec::len),
         );
-        let meta = puffin::reader::parse_puffin_footer_from_bytes(
-            off_pair.1.as_deref().expect("sidecar"),
-        )
-        .unwrap();
+        let meta =
+            puffin::reader::parse_puffin_footer_from_bytes(off_pair.1.as_deref().expect("sidecar"))
+                .unwrap();
         assert!(!meta.properties.contains_key("plist_min_docs"));
         assert!(
             meta.blobs
@@ -5858,7 +5925,9 @@ mod m10_parallel_kway {
         .unwrap();
         let source = synthesize_source_for_test(&batch);
         let mut writer = VixWriter::new(&schema, opts.clone(), false);
-        writer.push_batch_with_source(&batch, &source, None).unwrap();
+        writer
+            .push_batch_with_source(&batch, &source, None)
+            .unwrap();
         (finish_open(writer), batch, source)
     }
 
@@ -5870,7 +5939,7 @@ mod m10_parallel_kway {
         kway: usize,
     ) -> (Vec<u8>, Option<Vec<u8>>) {
         let schema = synth_schema();
-        let refs: Vec<&VixReader> = inputs.iter().map(|(reader, _, _)| reader).collect();
+        let refs: Vec<&VixReader> = inputs.iter().map(|(reader, ..)| reader).collect();
         let mut offset = 0u32;
         let doc_maps: Vec<DocIdMap> = inputs
             .iter()
@@ -5987,7 +6056,9 @@ mod m10_parallel_kway {
         let concat = arrow::compute::concat_batches(&schema, &batches).unwrap();
         let source = synthesize_source_for_test(&concat);
         let mut direct = VixWriter::new(&schema, opts.clone(), false);
-        direct.push_batch_with_source(&concat, &source, None).unwrap();
+        direct
+            .push_batch_with_source(&concat, &source, None)
+            .unwrap();
         let direct = finish_open(direct);
         assert_eq!(
             term_digest(&par),
@@ -6154,7 +6225,7 @@ mod m10_parallel_kway {
     #[test]
     fn sampler_bounds_are_real_sorted_and_gated() {
         let opts = synth_opts();
-        let (r1, _, _) = synth_input(
+        let (r1, ..) = synth_input(
             &opts,
             0,
             900,
@@ -6162,7 +6233,7 @@ mod m10_parallel_kway {
             |r| Some(format!("b1_{:05}", r / 3)),
             |_| None,
         );
-        let (r2, _, _) = synth_input(
+        let (r2, ..) = synth_input(
             &opts,
             10_000,
             900,
@@ -6669,14 +6740,16 @@ mod index_merge {
                     None,
                 )
                 .unwrap();
-            let (merged_bytes, merged_bytes_index, merged_stats) = merged.finish_with_stats().unwrap();
+            let (merged_bytes, merged_bytes_index, merged_stats) =
+                merged.finish_with_stats().unwrap();
             let merged_reader = open_built(merged_bytes, merged_bytes_index);
 
             let mut reference = VixWriter::new(&schema, opts.clone(), false);
             reference
                 .push_batch_with_source(&merged_batch, &merged_source, None)
                 .unwrap();
-            let (reference_bytes, reference_bytes_index, reference_stats) = reference.finish_with_stats().unwrap();
+            let (reference_bytes, reference_bytes_index, reference_stats) =
+                reference.finish_with_stats().unwrap();
             let reference_reader = open_built(reference_bytes, reference_bytes_index);
 
             assert_eq!(merged_stats.row_count, reference_stats.row_count, "{case}");
@@ -6902,11 +6975,7 @@ mod index_merge {
             writer
                 .push_batch_with_source(&batch, &source, None)
                 .unwrap();
-            (
-                batch,
-                source,
-                finish_open(writer),
-            )
+            (batch, source, finish_open(writer))
         };
         let merge = |inputs: [&(RecordBatch, StringArray, VixReader); 2]| {
             let readers = [&inputs[0].2, &inputs[1].2];
@@ -7034,16 +7103,13 @@ mod index_merge {
                 .unwrap();
             w.finish().unwrap()
         };
-        let foreign_index = repack_with_properties(
-            foreign_index.expect("sidecar"),
-            |properties| {
-                properties
-                    .iter_mut()
-                    .find(|(key, _)| key == "tokenizer")
-                    .unwrap()
-                    .1 = "o2-v0".to_string();
-            },
-        );
+        let foreign_index = repack_with_properties(foreign_index.expect("sidecar"), |properties| {
+            properties
+                .iter_mut()
+                .find(|(key, _)| key == "tokenizer")
+                .unwrap()
+                .1 = "o2-v0".to_string();
+        });
         let foreign = open_built(foreign_data, Some(foreign_index));
         let reason = writer.check_merge_inputs(&[&foreign]).unwrap_err();
         assert!(reason.contains("tokenizer"), "{reason}");
@@ -7058,16 +7124,13 @@ mod index_merge {
                 .unwrap();
             w.finish().unwrap()
         };
-        let legacy_index = repack_with_properties(
-            legacy_index.expect("sidecar"),
-            |properties| {
-                properties
-                    .iter_mut()
-                    .find(|(key, _)| key == "tokenizer")
-                    .unwrap()
-                    .1 = "o2-v1".to_string();
-            },
-        );
+        let legacy_index = repack_with_properties(legacy_index.expect("sidecar"), |properties| {
+            properties
+                .iter_mut()
+                .find(|(key, _)| key == "tokenizer")
+                .unwrap()
+                .1 = "o2-v1".to_string();
+        });
         let legacy_v1 = open_built(legacy_data, Some(legacy_index));
         let reason = writer.check_merge_inputs(&[&legacy_v1]).unwrap_err();
         assert!(reason.contains("tokenizer"), "{reason}");
@@ -8700,7 +8763,10 @@ mod zone_map_tests {
         ] {
             let (bytes, bytes_index) = build_ts_file(ts);
             let zoned = open_built(bytes.clone(), bytes_index.clone());
-            let decode = open_built(strip_zone_map_property(&bytes).unwrap(), bytes_index.clone());
+            let decode = open_built(
+                strip_zone_map_property(&bytes).unwrap(),
+                bytes_index.clone(),
+            );
             assert!(
                 zoned.zone_chunks().is_some(),
                 "{name}: expected a zone table"
@@ -9445,7 +9511,14 @@ fn encoded_run_requires_passthrough_writer() {
     let schema = Schema::new(vec![Field::new("_timestamp", DataType::Int64, false)]);
     let mut writer = VixWriter::new(&schema, VixWriterOptions::default(), false);
     let err = writer
-        .begin_docs_encoded_run(1, 1, 1, &[(1, 1, 1)], &crate::SpliceableStats::default(), None)
+        .begin_docs_encoded_run(
+            1,
+            1,
+            1,
+            &[(1, 1, 1)],
+            &crate::SpliceableStats::default(),
+            None,
+        )
         .expect_err("passthrough-off writer must refuse encoded runs");
     assert!(
         err.to_string().contains("docs_passthrough"),
@@ -9463,7 +9536,14 @@ fn encoded_run_requires_passthrough_writer() {
         false,
     );
     let err = writer
-        .begin_docs_encoded_run(1, 1, 1, &[(1, 1, 1)], &crate::SpliceableStats::default(), None)
+        .begin_docs_encoded_run(
+            1,
+            1,
+            1,
+            &[(1, 1, 1)],
+            &crate::SpliceableStats::default(),
+            None,
+        )
         .expect_err("build-mode writer must refuse encoded runs");
     assert!(
         err.to_string().contains("merge_input_indexes"),
@@ -9900,7 +9980,9 @@ fn row_regions_splice_through_encoded_runs() {
             },
             false,
         );
-        let ts = Int64Array::from(vec![4_000i64, 3_000, 2_000, 1_000, 4_000, 3_000, 2_000, 1_000]);
+        let ts = Int64Array::from(vec![
+            4_000i64, 3_000, 2_000, 1_000, 4_000, 3_000, 2_000, 1_000,
+        ]);
         let source = StringArray::from(vec!["{}"; 8]);
         writer
             .push_docs_rows_index_only(&ts, &[], &source, None)
@@ -10107,8 +10189,8 @@ fn m15_eq_scan_dict_aware_parity() {
     const ROWS: usize = 192; // 3 chunks x 64 rows at the chunk floor
     let schema = Schema::new(vec![
         Field::new("_timestamp", DataType::Int64, false),
-        Field::new("svc", DataType::Utf8, true),  // low-cardinality: dict
-        Field::new("rid", DataType::Utf8, true),  // per-row unique: non-dict
+        Field::new("svc", DataType::Utf8, true), // low-cardinality: dict
+        Field::new("rid", DataType::Utf8, true), // per-row unique: non-dict
     ]);
     let ts: Vec<i64> = (0..ROWS as i64).map(|i| 10_000 - i).collect();
     // svc: 3 hot values + one single-occurrence needle + one empty-string
@@ -10298,6 +10380,21 @@ fn m15_eq_scan_dict_aware_parity() {
         scan_rows("rid", "rid-0037", None, Some(1)),
         oracle_ts(&rid, "rid-0037", None)[..1].to_vec()
     );
+}
+
+#[test]
+fn equality_match_budget_bounds_rows_across_workers() {
+    let budget = crate::container::EqMatchBudget::new(3);
+    let mut first_worker = Vec::new();
+    let mut second_worker = Vec::new();
+
+    assert!(budget.try_push(1, &mut first_worker));
+    assert!(budget.try_push(2, &mut second_worker));
+    assert!(budget.try_push(3, &mut first_worker));
+    assert!(!budget.try_push(4, &mut second_worker));
+    assert!(budget.is_exceeded());
+    assert!(!budget.try_push(5, &mut first_worker));
+    assert_eq!(first_worker.len() + second_worker.len(), 3);
 }
 
 /// §4 string PREFIX bounds stay conservative: values longer than the
@@ -10622,13 +10719,15 @@ fn merged_ordered_scan_over_concat_regions() {
     // The 400 tie resolves to the region already emitting its run (r1's
     // 400 rides the 450 run) — deterministic, and any tie order is correct
     // for ORDER BY _timestamp DESC.
-    assert_eq!(
-        tags_got,
-        vec!["c", "a", "b", "b", "a", "b", "a", "a", "c"]
-    );
+    assert_eq!(tags_got, vec!["c", "a", "b", "b", "a", "b", "a", "a", "c"]);
 
     // ts_range pushdown composes: [300, 460) -> 450, 400, 400, 350, 300
-    let (batches, _) = collect(Some(&["_timestamp".to_string()]), None, Some((300, 460)), None);
+    let (batches, _) = collect(
+        Some(&["_timestamp".to_string()]),
+        None,
+        Some((300, 460)),
+        None,
+    );
     assert_eq!(ts_of(&batches), vec![450, 400, 400, 350, 300]);
 
     // row selection: rows {0 (ts500), 5 (ts400), 8 (ts100)} merge in order
@@ -10827,7 +10926,12 @@ fn h1_rows_per_chunk_follows_present_bytes_not_arrow_width() {
     // wide-sparse (nulls carry no data): the same values plus 1,500 all-null
     // Utf8 columns — identical present bytes, so identical rows-per-chunk
     let all_null: Vec<(String, ArrayRef)> = (0..1500)
-        .map(|i| (format!("sparse_{i:04}"), new_null_array(&DataType::Utf8, rows)))
+        .map(|i| {
+            (
+                format!("sparse_{i:04}"),
+                new_null_array(&DataType::Utf8, rows),
+            )
+        })
         .collect();
     let wide_nulls = batch_of(all_null);
     let wide_null_rows = docs_rows_per_chunk(0, 0, std::slice::from_ref(&wide_nulls));
@@ -10862,9 +10966,11 @@ fn h1_rows_per_chunk_follows_present_bytes_not_arrow_width() {
     }
     wide_spread_fields.push(Field::new("_source", DataType::Utf8, false));
     wide_spread_arrays.push(Arc::clone(&source));
-    let wide_spread =
-        RecordBatch::try_new(Arc::new(Schema::new(wide_spread_fields)), wide_spread_arrays)
-            .unwrap();
+    let wide_spread = RecordBatch::try_new(
+        Arc::new(Schema::new(wide_spread_fields)),
+        wide_spread_arrays,
+    )
+    .unwrap();
     let wide_spread_rows = docs_rows_per_chunk(0, 0, std::slice::from_ref(&wide_spread));
     let (low, high) = if narrow_rows < wide_spread_rows {
         (narrow_rows, wide_spread_rows)
@@ -10971,7 +11077,10 @@ fn m8_docs_chunk_max_rows_plumbs_into_the_chunking() {
         ..dataset_options()
     });
     assert_eq!(default_data, pinned_data, "data must be byte-identical");
-    assert_eq!(default_index, pinned_index, "sidecar must be byte-identical");
+    assert_eq!(
+        default_index, pinned_index,
+        "sidecar must be byte-identical"
+    );
 
     // a lowered cap becomes the zone-table granularity: 1,000 rows under a
     // saturating byte budget land in ceil(1000/128) = 8 chunks
@@ -11001,13 +11110,19 @@ fn m8_docs_chunk_max_rows_plumbs_into_the_chunking() {
         )
         .unwrap();
         let source = StringArray::from_iter_values((0..rows).map(|i| format!("{{\"code\":{i}}}")));
-        writer.push_batch_with_source(&batch, &source, None).unwrap();
+        writer
+            .push_batch_with_source(&batch, &source, None)
+            .unwrap();
         let (data, _) = writer.finish().unwrap();
         VixDocs::open(Bytes::from(data)).unwrap()
     };
     let capped = build(128);
     let zones = capped.zone_chunks().expect("zone table");
-    assert_eq!(zones.len(), 8, "1,000 rows at a 128-row cap = 8 zone chunks");
+    assert_eq!(
+        zones.len(),
+        8,
+        "1,000 rows at a 128-row cap = 8 zone chunks"
+    );
     assert!(
         zones.iter().take(7).all(|zone| zone.row_count == 128),
         "full chunks must carry exactly the cap"
@@ -11494,8 +11609,7 @@ fn m12_unwrap_shared_strips_dict_reader_wrappers() {
     // a Shared under a parent the rewrite does not know (here: a nested
     // struct column) must return None — the caller then canonicalizes the
     // field instead of copying, never errors
-    let names: vortex::dtype::FieldNames =
-        vec![vortex::dtype::FieldName::from("inner")].into();
+    let names: vortex::dtype::FieldNames = vec![vortex::dtype::FieldName::from("inner")].into();
     let nested = StructArray::try_new(
         names,
         vec![SharedArray::new(values.clone()).into_array()],
@@ -11668,11 +11782,9 @@ fn m12_dict_layout_chunk_copy_roundtrip() {
                 .downcast_ref::<Int64Array>()
                 .unwrap()
                 .clone();
-            let svc = arrow::compute::cast(
-                batch.column_by_name("service").unwrap(),
-                &DataType::Utf8,
-            )
-            .unwrap();
+            let svc =
+                arrow::compute::cast(batch.column_by_name("service").unwrap(), &DataType::Utf8)
+                    .unwrap();
             let svc = svc.as_any().downcast_ref::<StringArray>().unwrap().clone();
             let src = arrow::compute::cast(
                 batch.column_by_name(crate::SOURCE_COL_NAME).unwrap(),
@@ -11718,7 +11830,11 @@ fn m25_sparse_column_copy_does_not_bloat() {
     let sparse_cols = 8usize;
     let mut fields = vec![Field::new("_timestamp", DataType::Int64, false)];
     for c in 0..sparse_cols {
-        fields.push(Field::new(format!("k8s_label_{c:02}"), DataType::Utf8, true));
+        fields.push(Field::new(
+            format!("k8s_label_{c:02}"),
+            DataType::Utf8,
+            true,
+        ));
     }
     let schema = Schema::new(fields);
     let ts: Vec<i64> = (0..rows).map(|i| 1_000_000_000 - i as i64).collect();
@@ -11824,7 +11940,14 @@ fn m25_sparse_column_copy_does_not_bloat() {
         .collect();
     let stats = input.spliceable_stats().unwrap().unwrap();
     out_writer
-        .begin_docs_encoded_run(rows as u64, *ts.last().unwrap(), ts[0], &entries, &stats, None)
+        .begin_docs_encoded_run(
+            rows as u64,
+            *ts.last().unwrap(),
+            ts[0],
+            &entries,
+            &stats,
+            None,
+        )
         .unwrap();
     input
         .scan_docs_encoded_chunks(&mut |chunk| out_writer.push_docs_encoded_chunk(chunk))
@@ -11921,8 +12044,8 @@ fn m12_probe_prod_shared_wrapper() {
     let session = VortexSession::default().with_handle(runtime.handle());
     let vxf = session.open_options().open_buffer(docs_bytes).unwrap();
     let scan = vxf.scan().unwrap();
-    let write_ctx = ArrayContext::new(Vec::new())
-        .with_registry(session.arrays().registry().clone());
+    let write_ctx =
+        ArrayContext::new(Vec::new()).with_registry(session.arrays().registry().clone());
     let (mut raw_chunks, mut raw_shared, mut raw_dict, mut serialize_errors) = (0, 0, 0, 0);
     let mut first_error = String::new();
     for array in scan.into_array_iter(&runtime).unwrap() {
@@ -11932,11 +12055,7 @@ fn m12_probe_prod_shared_wrapper() {
         }
         raw_chunks += 1;
         raw_shared += usize::from(contains_shared(&array));
-        raw_dict += usize::from(
-            array
-                .depth_first_traversal()
-                .any(|node| node.is::<Dict>()),
-        );
+        raw_dict += usize::from(array.depth_first_traversal().any(|node| node.is::<Dict>()));
         if let Err(e) = array.serialize(&write_ctx, &session, &Default::default()) {
             serialize_errors += 1;
             if first_error.is_empty() {
@@ -12002,9 +12121,22 @@ fn m12_probe_file_facts() {
     let data_bytes = Bytes::from(std::fs::read(&data).unwrap());
     let idx_bytes = idx.map(|p| Bytes::from(std::fs::read(p).unwrap()));
     let reader = VixReader::open_with_index(data_bytes, idx_bytes).unwrap();
-    println!("file={data} rows={} terms={}", reader.row_count(), reader.term_count());
-    println!("bloom_only_fields={:?}", reader.bloom_only_fields().collect::<Vec<_>>());
-    for f in ["duration", "trace_id", "span_id", "http.url", "service_pod_name"] {
+    println!(
+        "file={data} rows={} terms={}",
+        reader.row_count(),
+        reader.term_count()
+    );
+    println!(
+        "bloom_only_fields={:?}",
+        reader.bloom_only_fields().collect::<Vec<_>>()
+    );
+    for f in [
+        "duration",
+        "trace_id",
+        "span_id",
+        "http.url",
+        "service_pod_name",
+    ] {
         println!(
             "field {f:?}: term_capability={} partial={}",
             reader.has_term_capability(f),
@@ -12012,13 +12144,22 @@ fn m12_probe_file_facts() {
         );
     }
     if let Ok(counts) = reader.term_counts_by_field() {
-        for (name, count) in counts.iter().filter(|(n, _)| n.contains("duration") || n.contains("trace")) {
+        for (name, count) in counts
+            .iter()
+            .filter(|(n, _)| n.contains("duration") || n.contains("trace"))
+        {
             println!("dict terms: {name:?} = {count}");
         }
     }
     if let Ok(Some(blooms)) = reader.file_blooms() {
         for b in &blooms {
-            println!("bloom section field={:?} num_blocks={} n_items={} bytes={}", b.field, b.num_blocks, b.n_items, b.bytes.len());
+            println!(
+                "bloom section field={:?} num_blocks={} n_items={} bytes={}",
+                b.field,
+                b.num_blocks,
+                b.n_items,
+                b.bytes.len()
+            );
         }
     }
 }
@@ -12081,11 +12222,7 @@ fn m17_docs_widen_plan_edges() {
 
     // an input column the output would drop refuses
     let extra = docs_widen_plan(
-        &Schema::new(vec![
-            ts(),
-            Field::new("zonly", DataType::Utf8, true),
-            src(),
-        ]),
+        &Schema::new(vec![ts(), Field::new("zonly", DataType::Utf8, true), src()]),
         &output,
     );
     assert!(extra.unwrap_err().contains("absent from the output schema"));
@@ -12138,7 +12275,9 @@ fn m17_widen_chunks_roundtrip() {
         },
         false,
     );
-    writer.push_batch_with_source(&batch, &source, None).unwrap();
+    writer
+        .push_batch_with_source(&batch, &source, None)
+        .unwrap();
     let (data, _) = writer.finish().unwrap();
     let docs = VixDocs::open(Bytes::from(data)).unwrap();
 
@@ -12180,12 +12319,17 @@ fn m17_widen_chunks_roundtrip() {
         .iter()
         .map(|z| (z.row_count, z.ts_min, z.ts_max))
         .collect();
-    out.begin_docs_encoded_run(n as u64, 1_000_000 - (n as i64 - 1), 1_000_000, &zone, &stats, Some(&[n as u64]))
-        .unwrap();
-    docs.scan_docs_encoded_chunks(&mut |chunk| {
-        out.push_docs_encoded_chunk(plan.widen(chunk)?)
-    })
+    out.begin_docs_encoded_run(
+        n as u64,
+        1_000_000 - (n as i64 - 1),
+        1_000_000,
+        &zone,
+        &stats,
+        Some(&[n as u64]),
+    )
     .unwrap();
+    docs.scan_docs_encoded_chunks(&mut |chunk| out.push_docs_encoded_chunk(plan.widen(chunk)?))
+        .unwrap();
     out.finish_docs_encoded_run().unwrap();
     let (widened_bytes, _) = out.finish().unwrap();
     let widened = VixDocs::open(Bytes::from(widened_bytes)).unwrap();
@@ -12206,11 +12350,8 @@ fn m17_widen_chunks_roundtrip() {
         .unwrap();
     let mut svc_values: Vec<String> = Vec::new();
     for batch in &svc_batches {
-        let column = arrow::compute::cast(
-            batch.column_by_name("svc").unwrap(),
-            &DataType::Utf8,
-        )
-        .unwrap();
+        let column =
+            arrow::compute::cast(batch.column_by_name("svc").unwrap(), &DataType::Utf8).unwrap();
         let column = column
             .as_any()
             .downcast_ref::<StringArray>()
@@ -12245,7 +12386,11 @@ fn m17_rebuild_parallel_blob_build_byte_parity() {
 
     let n = 3000usize;
     let field_count = 20usize;
-    let mut fields = vec![Field::new(crate::TIMESTAMP_COL_NAME, DataType::Int64, false)];
+    let mut fields = vec![Field::new(
+        crate::TIMESTAMP_COL_NAME,
+        DataType::Int64,
+        false,
+    )];
     for f in 0..field_count {
         fields.push(Field::new(format!("f{f:02}"), DataType::Utf8, true));
     }
@@ -12272,7 +12417,11 @@ fn m17_rebuild_parallel_blob_build_byte_parity() {
     columns.push(Arc::new(StringArray::from(vec![Some("always"); n])));
     let batch = RecordBatch::try_new(Arc::clone(&schema), columns).unwrap();
     let source: StringArray = (0..n)
-        .map(|i| Some(format!("{{\"row\":{i},\"text\":\"error request {i} failed\"}}")))
+        .map(|i| {
+            Some(format!(
+                "{{\"row\":{i},\"text\":\"error request {i} failed\"}}"
+            ))
+        })
         .collect();
 
     let build = |kway: usize| -> (Vec<u8>, Vec<u8>) {
@@ -12480,7 +12629,11 @@ fn m17_bloom_encoded_scan_byte_equality() {
     let mut fsst_rebuilt = 0usize;
     first
         .scan_docs_encoded_chunks(&mut |chunk| {
-            let sa = chunk.array.as_typed::<Struct>().expect("struct chunk").clone();
+            let sa = chunk
+                .array
+                .as_typed::<Struct>()
+                .expect("struct chunk")
+                .clone();
             let names = sa.names().clone();
             let rows = chunk.rows();
             let fields: Vec<vortex::array::ArrayRef> = sa
@@ -12540,7 +12693,10 @@ fn m17_bloom_encoded_scan_byte_equality() {
     let mut hasher_enc = writer_enc.bloom_only_hasher(&fields);
     let mut census = crate::BloomEncodingCensus::default();
     for field in &fields {
-        census.absorb(docs.hash_bloom_only_encoded(&mut hasher_enc, field).unwrap());
+        census.absorb(
+            docs.hash_bloom_only_encoded(&mut hasher_enc, field)
+                .unwrap(),
+        );
     }
     assert!(
         census.dict_chunks >= 1,
@@ -12560,7 +12716,12 @@ fn m17_bloom_encoded_scan_byte_equality() {
     docs.scan_docs(Some(&fields), None, None, &mut |batch| {
         let columns: Vec<(String, ArrowArrayRef)> = fields
             .iter()
-            .map(|name| (name.clone(), Arc::clone(batch.column_by_name(name).unwrap())))
+            .map(|name| {
+                (
+                    name.clone(),
+                    Arc::clone(batch.column_by_name(name).unwrap()),
+                )
+            })
             .collect();
         hasher_dec.hash_columns(&columns);
         Ok(())
@@ -12581,14 +12742,19 @@ fn m17_bloom_encoded_scan_byte_equality() {
     // folded in must finish byte-identical outputs (bloom blob included)
     let build_with = |hasher: crate::BloomOnlyHasher| -> (Vec<u8>, Vec<u8>) {
         let mut writer = make_writer();
-        writer.push_batch_with_source(&batch, &source, None).unwrap();
+        writer
+            .push_batch_with_source(&batch, &source, None)
+            .unwrap();
         writer.absorb_bloom_only_hashes(hasher);
         let (data, index) = writer.finish().unwrap();
         (data, index.expect("indexed build emits a sidecar"))
     };
     let (data_a, index_a) = build_with(hasher_enc);
     let (data_b, index_b) = build_with(hasher_dec);
-    assert_eq!(data_a, data_b, "data bytes must not depend on the scan path");
+    assert_eq!(
+        data_a, data_b,
+        "data bytes must not depend on the scan path"
+    );
     assert_eq!(
         index_a, index_b,
         ".vxi (bloom blob included) must be byte-identical across scan paths"
@@ -12603,16 +12769,25 @@ fn m17_probe_stored_encodings() {
         datatypes::{DataType, Field, Schema},
         record_batch::RecordBatch,
     };
-    let n: usize = std::env::var("M17_PROBE_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(8192);
+    let n: usize = std::env::var("M17_PROBE_ROWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8192);
     let mut rng = StdRng::seed_from_u64(0x0121_2012);
     let mut rand_str = |len: usize| -> String {
-        (0..len).map(|_| char::from(b'a' + (rng.random::<u8>() % 26))).collect()
+        (0..len)
+            .map(|_| char::from(b'a' + (rng.random::<u8>() % 26)))
+            .collect()
     };
     let pool: Vec<String> = (0..1024).map(|_| rand_str(32)).collect();
     let dict_col: Vec<Option<String>> = (0..n).map(|i| Some(pool[i % 1024].clone())).collect();
     // scale-dependent
-    let dict_nulls: Vec<Option<String>> = (0..n).map(|i| (i % 13 != 5).then(|| pool[i % 1024].clone())).collect();
-    let id24: Vec<Option<String>> = (0..n).map(|i| Some(format!("{}-{i:08}", rand_str(24)))).collect();
+    let dict_nulls: Vec<Option<String>> = (0..n)
+        .map(|i| (i % 13 != 5).then(|| pool[i % 1024].clone()))
+        .collect();
+    let id24: Vec<Option<String>> = (0..n)
+        .map(|i| Some(format!("{}-{i:08}", rand_str(24))))
+        .collect();
     let mut hex_str = {
         let mut hex_rng = StdRng::seed_from_u64(0xFEED);
         move || -> String {
@@ -12623,7 +12798,9 @@ fn m17_probe_stored_encodings() {
     };
     let hex32: Vec<Option<String>> = (0..n).map(|_| Some(hex_str())).collect();
     let long64: Vec<Option<String>> = (0..n).map(|_| Some(rand_str(64))).collect();
-    let prefixed: Vec<Option<String>> = (0..n).map(|i| Some(format!("service-pod-name-{}-{i}", rand_str(12)))).collect();
+    let prefixed: Vec<Option<String>> = (0..n)
+        .map(|i| Some(format!("service-pod-name-{}-{i}", rand_str(12))))
+        .collect();
     let schema = Arc::new(Schema::new(vec![
         Field::new(crate::TIMESTAMP_COL_NAME, DataType::Int64, false),
         Field::new("dict_col", DataType::Utf8, true),
@@ -12633,21 +12810,41 @@ fn m17_probe_stored_encodings() {
         Field::new("long64", DataType::Utf8, true),
         Field::new("prefixed", DataType::Utf8, true),
     ]));
-    let batch = RecordBatch::try_new(Arc::clone(&schema), vec![
-        Arc::new(Int64Array::from((0..n).map(|i| 3_000_000 - i as i64).collect::<Vec<_>>())) as ArrowArrayRef,
-        Arc::new(StringArray::from(dict_col)),
-        Arc::new(StringArray::from(dict_nulls)),
-        Arc::new(StringArray::from(id24)),
-        Arc::new(StringArray::from(hex32)),
-        Arc::new(StringArray::from(long64)),
-        Arc::new(StringArray::from(prefixed)),
-    ]).unwrap();
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(
+                (0..n).map(|i| 3_000_000 - i as i64).collect::<Vec<_>>(),
+            )) as ArrowArrayRef,
+            Arc::new(StringArray::from(dict_col)),
+            Arc::new(StringArray::from(dict_nulls)),
+            Arc::new(StringArray::from(id24)),
+            Arc::new(StringArray::from(hex32)),
+            Arc::new(StringArray::from(long64)),
+            Arc::new(StringArray::from(prefixed)),
+        ],
+    )
+    .unwrap();
     let source: StringArray = (0..n).map(|i| Some(format!("{{\"row\":{i}}}"))).collect();
-    let mut w = VixWriter::new(&schema, VixWriterOptions { index_enabled: false, ..Default::default() }, false);
+    let mut w = VixWriter::new(
+        &schema,
+        VixWriterOptions {
+            index_enabled: false,
+            ..Default::default()
+        },
+        false,
+    );
     w.push_batch_with_source(&batch, &source, None).unwrap();
     let (data, _) = w.finish().unwrap();
     let docs = crate::VixDocs::open(Bytes::from(data)).unwrap();
-    for name in ["dict_col", "dict_nulls", "id24", "hex32", "long64", "prefixed"] {
+    for name in [
+        "dict_col",
+        "dict_nulls",
+        "id24",
+        "hex32",
+        "long64",
+        "prefixed",
+    ] {
         crate::container::probe_column_encodings(&docs, name);
     }
 }
@@ -12689,7 +12886,9 @@ fn m18_runend_slice_keeps_wrapper_the_write_ctx_rejects() {
 
     let sliced = runend.slice(2..12).unwrap();
     assert!(
-        sliced.depth_first_traversal().any(|node| node.is::<Slice>()),
+        sliced
+            .depth_first_traversal()
+            .any(|node| node.is::<Slice>()),
         "slicing runend must keep the lazy vortex.slice wrapper (no static reduce rule)"
     );
     assert!(
@@ -12718,7 +12917,10 @@ fn m18_runend_slice_keeps_wrapper_the_write_ctx_rejects() {
 /// fail-open firing, and the copied file must read back row-exact.
 #[test]
 fn m18_sliced_scan_canonicalizes_and_copies_row_exact() {
-    use vortex::{array::arrays::{Struct, struct_::StructArrayExt}, encodings::zstd::Zstd};
+    use vortex::{
+        array::arrays::{Struct, struct_::StructArrayExt},
+        encodings::zstd::Zstd,
+    };
 
     use crate::{SOURCE_COL_NAME, VixDocs, container::is_ctx_serializable};
 
@@ -12743,8 +12945,9 @@ fn m18_sliced_scan_canonicalizes_and_copies_row_exact() {
         }
         out
     };
-    let level: Vec<&str> =
-        (0..rows).map(|i| ["info", "warn", "error", "debug"][(i / 512) % 4]).collect();
+    let level: Vec<&str> = (0..rows)
+        .map(|i| ["info", "warn", "error", "debug"][(i / 512) % 4])
+        .collect();
     let sources: Vec<String> = (0..rows)
         .map(|i| {
             format!(
@@ -12800,8 +13003,15 @@ fn m18_sliced_scan_canonicalizes_and_copies_row_exact() {
         },
         false,
     );
-    out.begin_docs_encoded_run(rows as u64, *ts.last().unwrap(), ts[0], &entries, &stats, None)
-        .unwrap();
+    out.begin_docs_encoded_run(
+        rows as u64,
+        *ts.last().unwrap(),
+        ts[0],
+        &entries,
+        &stats,
+        None,
+    )
+    .unwrap();
     let mut chunks = 0usize;
     let sliced_windows = docs
         .scan_docs_encoded_chunks(&mut |chunk| {
@@ -12882,8 +13092,7 @@ fn m18_sliced_scan_canonicalizes_and_copies_row_exact() {
         .scan_docs_encoded_chunks(&mut |chunk| {
             let sa = chunk.array.as_typed::<Struct>().unwrap().clone();
             let field = sa.unmasked_field_by_name(SOURCE_COL_NAME).unwrap();
-            source_zstd +=
-                usize::from(field.depth_first_traversal().any(|node| node.is::<Zstd>()));
+            source_zstd += usize::from(field.depth_first_traversal().any(|node| node.is::<Zstd>()));
             Ok(())
         })
         .unwrap();
@@ -13035,7 +13244,11 @@ fn m18_writer_failopen_reencodes_slice_wrapped_chunk() {
             &DataType::Int64,
         )
         .unwrap();
-        let ts_col = ts_col.as_any().downcast_ref::<Int64Array>().unwrap().clone();
+        let ts_col = ts_col
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .clone();
         let st = arrow::compute::cast(batch.column_by_name("status").unwrap(), &DataType::Int64)
             .unwrap();
         let st = st.as_any().downcast_ref::<Int64Array>().unwrap().clone();

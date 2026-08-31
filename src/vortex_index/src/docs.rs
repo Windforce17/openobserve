@@ -59,7 +59,10 @@ impl BoundValue {
     /// The vortex literal for the ROW-FILTER push, gated on the stored
     /// column type family (a family mismatch pushes nothing — the bound
     /// still prunes through the stats blob, and the engine re-filters).
-    fn to_row_filter_lit(&self, stored: &arrow::datatypes::DataType) -> Option<vortex::expr::Expression> {
+    fn to_row_filter_lit(
+        &self,
+        stored: &arrow::datatypes::DataType,
+    ) -> Option<vortex::expr::Expression> {
         use arrow::datatypes::DataType;
         match (self, stored) {
             (
@@ -330,15 +333,78 @@ impl DocsWidenPlan {
                     }
                     Ok(field)
                 }
-                None => {
-                    Ok(ConstantArray::new(Scalar::null(dtype.clone()), rows).into_array())
-                }
+                None => Ok(ConstantArray::new(Scalar::null(dtype.clone()), rows).into_array()),
             })
             .collect::<Result<_>>()?;
         let array = StructArray::try_new(self.names.clone(), fields, rows, Validity::NonNullable)
             .map_err(|e| VixError::Malformed(format!("widen docs chunk: {e}")))?
             .into_array();
         Ok(EncodedDocsChunk { array, rows })
+    }
+}
+
+/// Bounded exact top-N candidates. The heap root is always the weakest
+/// retained row, so memory is O(limit) even for an unordered broad match.
+enum CandidateHeap {
+    Oldest {
+        limit: usize,
+        rows: std::collections::BinaryHeap<(i64, u32)>,
+    },
+    Newest {
+        limit: usize,
+        rows: std::collections::BinaryHeap<std::cmp::Reverse<(i64, u32)>>,
+    },
+}
+
+impl CandidateHeap {
+    fn new(limit: usize, ascend: bool) -> Self {
+        if ascend {
+            Self::Oldest {
+                limit,
+                rows: std::collections::BinaryHeap::with_capacity(limit),
+            }
+        } else {
+            Self::Newest {
+                limit,
+                rows: std::collections::BinaryHeap::with_capacity(limit),
+            }
+        }
+    }
+
+    fn push(&mut self, candidate: (i64, u32)) {
+        match self {
+            Self::Oldest { limit, rows } => {
+                if rows.len() < *limit {
+                    rows.push(candidate);
+                } else if rows.peek().is_some_and(|weakest| candidate < *weakest) {
+                    rows.pop();
+                    rows.push(candidate);
+                }
+            }
+            Self::Newest { limit, rows } => {
+                if rows.len() < *limit {
+                    rows.push(std::cmp::Reverse(candidate));
+                } else if rows.peek().is_some_and(|weakest| candidate > weakest.0) {
+                    rows.pop();
+                    rows.push(std::cmp::Reverse(candidate));
+                }
+            }
+        }
+    }
+
+    fn into_best_first(self) -> Vec<(i64, u32)> {
+        match self {
+            Self::Oldest { rows, .. } => {
+                let mut rows = rows.into_vec();
+                rows.sort_unstable();
+                rows
+            }
+            Self::Newest { rows, .. } => {
+                let mut rows: Vec<_> = rows.into_iter().map(|row| row.0).collect();
+                rows.sort_unstable_by(|a, b| b.cmp(a));
+                rows
+            }
+        }
     }
 }
 
@@ -570,6 +636,121 @@ impl VixDocs {
         self.row_regions
             .as_deref()
             .map(crate::container::region_row_ranges)
+    }
+
+    /// Exact per-file top-N candidates for `column = needle`, ordered by
+    /// `_timestamp`. Only the predicate column, timestamp, and absolute row
+    /// index are evaluated; `_source` is never projected.
+    ///
+    /// For proven timestamp-descending regions the scan is adaptive:
+    /// descending queries stop after `limit` matches, while ascending
+    /// queries read backward in exponentially growing row windows and stop
+    /// once the oldest `limit` matches are known. A concat file with proven
+    /// regions keeps `limit` candidates per region and reduces them through
+    /// a bounded heap. Unknown physical order scans the two narrow columns
+    /// once and retains only `limit` rows. Thus broad predicates are cheap
+    /// without changing their SQL semantics, and memory stays O(limit).
+    ///
+    /// `Ok(None)` means the native column is absent or not string-family;
+    /// callers must keep the ordinary filtered scan for that file.
+    pub fn eq_string_top_n(
+        &self,
+        column: &str,
+        needle: &str,
+        ts_range: Option<(i64, i64)>,
+        limit: usize,
+        ascend: bool,
+    ) -> anyhow::Result<Option<Vec<(i64, u32)>>> {
+        use arrow::datatypes::DataType;
+
+        let Ok(field) = self.schema.field_with_name(column) else {
+            return Ok(None);
+        };
+        if !matches!(
+            field.data_type(),
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+        ) {
+            return Ok(None);
+        }
+        if limit == 0 || self.row_count == 0 {
+            return Ok(Some(Vec::new()));
+        }
+
+        let mut winners = CandidateHeap::new(limit, ascend);
+        match self.ts_desc_row_ranges() {
+            Some(regions) => {
+                for region in regions {
+                    if region.start >= region.end {
+                        continue;
+                    }
+                    let mut local = Vec::with_capacity(limit);
+                    if ascend {
+                        // Stored rows are newest-first. Start at the tail of
+                        // each region; grow the window only when selectivity
+                        // is too low to fill the bounded candidate set.
+                        const INITIAL_ROWS: u64 = 4 * 1024;
+                        const MAX_ROWS: u64 = 256 * 1024;
+                        let mut end = region.end;
+                        let mut rows = INITIAL_ROWS;
+                        while end > region.start && local.len() < limit {
+                            let start = end.saturating_sub(rows).max(region.start);
+                            let remaining = limit - local.len();
+                            let mut tail = std::collections::VecDeque::with_capacity(remaining);
+                            crate::container::scan_eq_string_candidates_range(
+                                &self.docs_blob,
+                                column,
+                                needle,
+                                start..end,
+                                ts_range,
+                                &mut |ts, row_id| {
+                                    if tail.len() == remaining {
+                                        tail.pop_front();
+                                    }
+                                    tail.push_back((ts, row_id));
+                                    true
+                                },
+                            )?;
+                            // Scan order is newest-first; reverse the last
+                            // matches so this region remains oldest-first.
+                            local.extend(tail.into_iter().rev());
+                            end = start;
+                            rows = rows.saturating_mul(2).min(MAX_ROWS);
+                        }
+                    } else {
+                        crate::container::scan_eq_string_candidates_range(
+                            &self.docs_blob,
+                            column,
+                            needle,
+                            region,
+                            ts_range,
+                            &mut |ts, row_id| {
+                                local.push((ts, row_id));
+                                local.len() < limit
+                            },
+                        )?;
+                    }
+                    for candidate in local {
+                        winners.push(candidate);
+                    }
+                }
+            }
+            None => {
+                // No order proof: evaluate every match, but never retain an
+                // unbounded row-id vector.
+                crate::container::scan_eq_string_candidates_range(
+                    &self.docs_blob,
+                    column,
+                    needle,
+                    0..self.row_count,
+                    ts_range,
+                    &mut |ts, row_id| {
+                        winners.push((ts, row_id));
+                        true
+                    },
+                )?;
+            }
+        }
+        Ok(Some(winners.into_best_first()))
     }
 
     /// The decoded per-column chunk-stats table (`stats` blob), fetched and
@@ -847,10 +1028,10 @@ impl VixDocs {
         // needle per chunk against the column's DICTIONARY and scans code
         // ids instead of materializing and comparing one string per row;
         // the surviving row ids then point-read the projection (only
-        // matching rows decode their other columns). Broad matches (beyond
-        // ~2% of rows) fall through to the plain streaming scan — the
-        // pre-pass cost is one single-column pass, small against the full
-        // scan it precedes. Exact by construction (byte equality on the
+        // matching rows decode their other columns). Broad matches stop the
+        // shared pre-pass at an aggregate ~2% row-id budget and fall through
+        // to the plain streaming scan, rather than finishing and retaining a
+        // redundant full-column pass. Exact by construction (byte equality on the
         // stored values), and the engine re-applies the predicate on
         // returned rows regardless.
         if rows.is_none()
@@ -1012,8 +1193,8 @@ impl VixDocs {
     ///
     /// - `Ok(Some(vec![]))` — provably nothing matches (also when pruning excluded every chunk).
     /// - `Ok(Some(ids))` — the exact matching rows; the caller point-reads them.
-    /// - `Ok(None)` — broad match (beyond ~2% of rows): the plain streaming scan wins from here, run
-    ///   it unchanged.
+    /// - `Ok(None)` — broad match (beyond ~2% of rows): the plain streaming scan wins from here,
+    ///   run it unchanged.
     pub(crate) fn eq_string_prepass(
         &self,
         column: &str,
@@ -1031,43 +1212,54 @@ impl VixDocs {
             None => vec![0..self.row_count],
         };
         let groups = split_ranges_for_threads(threads, &ranges, self.zone_chunks());
+        let budget = crate::container::EqMatchBudget::new(self.row_count / 50);
         let matched: Vec<u64> = if groups.len() <= 1 {
-            crate::container::eq_string_rows_ranges(&self.docs_blob, column, needle, &ranges)?
+            match crate::container::eq_string_rows_ranges(
+                &self.docs_blob,
+                column,
+                needle,
+                &ranges,
+                &budget,
+            )? {
+                Some(rows) => rows,
+                None => return Ok(None),
+            }
         } else {
-            // contiguous chunk-aligned groups per worker: concatenation in
-            // group order preserves ascending row ids
+            // Contiguous chunk-aligned groups per worker: concatenation in
+            // group order preserves ascending row ids. The shared budget
+            // bounds retained row ids across every worker.
             let results = std::thread::scope(|scope| {
                 let workers: Vec<_> = groups
                     .iter()
                     .map(|group| {
                         let blob = &self.docs_blob;
+                        let budget = &budget;
                         scope.spawn(move || {
-                            crate::container::eq_string_rows_ranges(blob, column, needle, group)
+                            crate::container::eq_string_rows_ranges(
+                                blob, column, needle, group, budget,
+                            )
                         })
                     })
                     .collect();
                 workers
                     .into_iter()
                     .map(|worker| {
-                        worker
-                            .join()
-                            .unwrap_or_else(|_| Err(VixError::Malformed(
-                                "eq-scan worker panicked".to_string(),
-                            )))
+                        worker.join().unwrap_or_else(|_| {
+                            Err(VixError::Malformed("eq-scan worker panicked".to_string()))
+                        })
                     })
                     .collect::<Vec<_>>()
             });
             let mut out = Vec::new();
             for result in results {
-                out.extend(result?);
+                match result? {
+                    Some(rows) => out.extend(rows),
+                    None => return Ok(None),
+                }
             }
             out
         };
-        // beyond needle-grade selectivity the point-read follow-up loses to
-        // the plain streaming scan (chunks decode whole either way)
-        if (matched.len() as u64).saturating_mul(50) > self.row_count {
-            return Ok(None);
-        }
+        debug_assert!(!budget.is_exceeded());
         Ok(Some(matched))
     }
 
@@ -1461,23 +1653,27 @@ impl VixDocs {
                         let names: Option<Vec<&str>> = scan_projection
                             .as_ref()
                             .map(|cols| cols.iter().map(String::as_str).collect());
-                        let run = |selection: RowSelection,
-                                   tx: &std::sync::mpsc::SyncSender<anyhow::Result<RecordBatch>>|
-                         -> anyhow::Result<()> {
-                            scan_blob_streaming(
-                                docs_blob,
-                                names.as_deref(),
-                                selection,
-                                filter.clone(),
-                                None,
-                                0,
-                                &mut |batch| {
-                                    tx.send(Ok(batch))
-                                        .map_err(|_| VixError::Callback(anyhow::anyhow!("merge consumer dropped")))
-                                },
-                            )?;
-                            Ok(())
-                        };
+                        let run =
+                            |selection: RowSelection,
+                             tx: &std::sync::mpsc::SyncSender<anyhow::Result<RecordBatch>>|
+                             -> anyhow::Result<()> {
+                                scan_blob_streaming(
+                                    docs_blob,
+                                    names.as_deref(),
+                                    selection,
+                                    filter.clone(),
+                                    None,
+                                    0,
+                                    &mut |batch| {
+                                        tx.send(Ok(batch)).map_err(|_| {
+                                            VixError::Callback(anyhow::anyhow!(
+                                                "merge consumer dropped"
+                                            ))
+                                        })
+                                    },
+                                )?;
+                                Ok(())
+                            };
                         let result = match region_work {
                             RegionWork::Ranges(ranges) => ranges
                                 .into_iter()
@@ -1504,8 +1700,8 @@ impl VixDocs {
                     let batch = cursor.batch.as_ref().expect("open cursor holds a batch");
                     let values = Cursor::ts_values(batch, ts_index)?;
                     // rows [pos..end) all have ts >= next_key
-                    let end = cursor.pos
-                        + values[cursor.pos..].partition_point(|&ts| ts >= next_key);
+                    let end =
+                        cursor.pos + values[cursor.pos..].partition_point(|&ts| ts >= next_key);
                     let mut take = end - cursor.pos;
                     if let Some(left) = remaining {
                         take = take.min(left as usize);

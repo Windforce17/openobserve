@@ -165,13 +165,13 @@ fn bench_query_classes() {
 /// #52/M7: what equality on a BLOOM-ONLY (demoted) field actually costs in
 /// v2, measured in its three moving parts —
 ///
-/// 1. the composite-bloom PER-FILE PRUNE decision (3 guard probes + the
-///    value probe: the pruner's whole per-file cost, both directions),
-/// 2. the surviving file's FILTER-BACK SCAN of the native column, with the
-///    equality bound engaging the M4 chunk-stat pruning tier (random hex
-///    IDs are expected to prune ~nothing there — reported once), and
-/// 3. the AND shape: the dense sibling narrows by postings first and the
-///    demoted leg filters back over the selected rows only.
+/// 1. the composite-bloom PER-FILE PRUNE decision (3 guard probes + the value probe: the pruner's
+///    whole per-file cost, both directions),
+/// 2. the surviving file's FILTER-BACK SCAN of the native column, with the equality bound engaging
+///    the M4 chunk-stat pruning tier (random hex IDs are expected to prune ~nothing there —
+///    reported once), and
+/// 3. the AND shape: the dense sibling narrows by postings first and the demoted leg filters back
+///    over the selected rows only.
 ///
 /// Prefix/Contains have no demoted-field equivalent (no dictionary): the
 /// engine takes the full scan fallback — reported as N/A.
@@ -186,8 +186,7 @@ fn bench_demoted_trace_classes(
     use vortex_index::{
         BoundValue, ColumnBound, VixDocs,
         bloom::{
-            COMPOSITE_BLOOM_FIELD, COMPOSITE_GUARD_PROBES, composite_guard_key,
-            composite_value_key,
+            COMPOSITE_BLOOM_FIELD, COMPOSITE_GUARD_PROBES, composite_guard_key, composite_value_key,
         },
         sbbf::{BLOCK_BYTES, block_index, check_block, hash_value},
     };
@@ -248,7 +247,11 @@ fn bench_demoted_trace_classes(
     };
     let mut buf = Vec::new();
     let guard_keys: Vec<Vec<u8>> = (0..COMPOSITE_GUARD_PROBES)
-        .map(|p| composite_guard_key("trace_id", p, &mut buf).unwrap().to_vec())
+        .map(|p| {
+            composite_guard_key("trace_id", p, &mut buf)
+                .unwrap()
+                .to_vec()
+        })
         .collect();
     let present_key = composite_value_key("trace_id", t0.as_bytes(), &mut buf)
         .unwrap()
@@ -256,12 +259,16 @@ fn bench_demoted_trace_classes(
     let absent_key = composite_value_key("trace_id", b"no-such-trace-id-value", &mut buf)
         .unwrap()
         .to_vec();
-    time("bloom prune decision trace_id (hit: keep)", 100_000, &mut || {
-        u64::from(guard_keys.iter().all(|k| probe(k)) && probe(&present_key))
-    });
-    time("bloom prune decision trace_id (miss: drop)", 100_000, &mut || {
-        u64::from(guard_keys.iter().all(|k| probe(k)) && probe(&absent_key))
-    });
+    time(
+        "bloom prune decision trace_id (hit: keep)",
+        100_000,
+        &mut || u64::from(guard_keys.iter().all(|k| probe(k)) && probe(&present_key)),
+    );
+    time(
+        "bloom prune decision trace_id (miss: drop)",
+        100_000,
+        &mut || u64::from(guard_keys.iter().all(|k| probe(k)) && probe(&absent_key)),
+    );
 
     // (2) filter-back scan of the native column, equality bound pushed —
     // report the M4 chunk-stat tier's effect once (setup, not measured)
@@ -294,7 +301,10 @@ fn bench_demoted_trace_classes(
         } else if let Some(v) = any.downcast_ref::<arrow::array::LargeStringArray>() {
             v.iter().filter(|x| *x == Some(needle)).count() as u64
         } else {
-            as_utf8(column).iter().filter(|x| *x == Some(needle)).count() as u64
+            as_utf8(column)
+                .iter()
+                .filter(|x| *x == Some(needle))
+                .count() as u64
         }
     };
     let mut scan_eq = |threads: usize| -> u64 {
@@ -314,12 +324,16 @@ fn bench_demoted_trace_classes(
         .expect("filter-back scan");
         hits
     };
-    time("filter-back scan trace_id == t0 (0 threads)", 3, &mut || {
-        scan_eq(0)
-    });
-    time("filter-back scan trace_id == t0 (4 threads)", 3, &mut || {
-        scan_eq(4)
-    });
+    time(
+        "filter-back scan trace_id == t0 (0 threads)",
+        3,
+        &mut || scan_eq(0),
+    );
+    time(
+        "filter-back scan trace_id == t0 (4 threads)",
+        3,
+        &mut || scan_eq(4),
+    );
 
     // (3) the AND shape: postings narrow by the dense sibling, the demoted
     // leg point-reads only the selected rows
@@ -329,7 +343,10 @@ fn bench_demoted_trace_classes(
         .set_indices()
         .map(|i| i as u64)
         .collect();
-    eprintln!("And shape: service_name postings select {} rows", svc_rows.len());
+    eprintln!(
+        "And shape: service_name postings select {} rows",
+        svc_rows.len()
+    );
     time(
         "And[svc postings -> trace filter-back point read]",
         3,
@@ -370,7 +387,7 @@ fn bench_demoted_trace_classes(
 #[ignore = "manual M15b bench (set O2_VIX_FILE)"]
 fn bench_eq_filter_back() {
     use arrow::array::Array;
-    use vortex_index::{BoundValue, ColumnBound, VixDocs};
+    use vortex_index::{BoundValue, ColumnBound, SOURCE_COL_NAME, VixDocs};
 
     let Ok(path) = std::env::var("O2_VIX_FILE") else {
         eprintln!("O2_VIX_FILE not set; skipping");
@@ -389,24 +406,33 @@ fn bench_eq_filter_back() {
             .expect("cast produced Utf8")
             .clone()
     };
-    // sample the needle from the middle row (setup, not measured)
-    let mut sampled: Option<String> = None;
-    let projection = vec![column.clone()];
-    docs.scan_docs(
-        Some(&projection),
-        Some(vec![docs.row_count() / 2]),
-        None,
-        &mut |batch| {
+    // Allow a production needle to be supplied directly. Otherwise sample
+    // several rows so nullable/sparse columns do not make the manual bench fail.
+    let needle = if let Ok(value) = std::env::var("O2_VIX_EQ_VALUE") {
+        value
+    } else {
+        let sample_rows = (0..128_u64)
+            .map(|offset| offset.saturating_mul(docs.row_count()) / 128)
+            .collect::<Vec<_>>();
+        let mut sampled: Option<String> = None;
+        let projection = vec![column.clone()];
+        docs.scan_docs(Some(&projection), Some(sample_rows), None, &mut |batch| {
             let strings = as_utf8(batch.column_by_name(&column).expect("projected"));
-            if strings.len() > 0 && !strings.is_null(0) {
-                sampled = Some(strings.value(0).to_string());
+            if sampled.is_none() {
+                sampled = strings.iter().flatten().next().map(str::to_owned);
             }
             Ok(())
-        },
-    )
-    .expect("sample scan");
-    let needle = sampled.expect("mid row carries a value");
-    eprintln!("sampled needle={needle}");
+        })
+        .expect("sample scan");
+        sampled.expect("sampled rows carry a value")
+    };
+    eprintln!("needle={needle}");
+    let projection = vec![column.clone()];
+    let iterations = std::env::var("O2_VIX_BENCH_ITERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(3);
+    assert!(iterations > 0, "O2_VIX_BENCH_ITERS must be positive");
 
     let time = |name: &str, iters: usize, f: &mut dyn FnMut() -> u64| {
         let warm = f();
@@ -428,15 +454,97 @@ fn bench_eq_filter_back() {
     // old shape: no bound pushed — full column decode + per-row compare
     let old_scan = |threads: usize| -> u64 {
         let mut hits = 0u64;
-        docs.scan_docs_opts(Some(&projection), None, None, &[], None, threads, &mut |b| {
-            hits += count_eq(&b);
-            Ok(())
-        })
+        docs.scan_docs_opts(
+            Some(&projection),
+            None,
+            None,
+            &[],
+            None,
+            threads,
+            &mut |b| {
+                hits += count_eq(&b);
+                Ok(())
+            },
+        )
         .expect("old-shape scan");
         hits
     };
-    time("OLD full scan + compare (0 threads)", 3, &mut || old_scan(0));
-    time("OLD full scan + compare (4 threads)", 3, &mut || old_scan(4));
+    time(
+        "OLD full scan + compare (0 threads)",
+        iterations,
+        &mut || old_scan(0),
+    );
+    time(
+        "OLD full scan + compare (4 threads)",
+        iterations,
+        &mut || old_scan(4),
+    );
+
+    // Production raw-SELECT shape: the fallback decodes `_source` beside
+    // the predicate before DataFusion can apply ORDER BY/LIMIT.
+    let raw_projection = vec![column.clone(), SOURCE_COL_NAME.to_string()];
+    let old_raw_scan = || -> u64 {
+        let mut hits = 0u64;
+        docs.scan_docs_opts(
+            Some(&raw_projection),
+            None,
+            None,
+            &[],
+            None,
+            0,
+            &mut |batch| {
+                hits += count_eq(&batch);
+                std::hint::black_box(batch.column_by_name(SOURCE_COL_NAME).expect("source"));
+                Ok(())
+            },
+        )
+        .expect("old raw-select scan");
+        hits
+    };
+    time(
+        "OLD raw equality + full _source decode",
+        iterations,
+        &mut || old_raw_scan(),
+    );
+
+    let limit = std::env::var("O2_VIX_TOP_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(100);
+    assert!(limit > 0, "O2_VIX_TOP_LIMIT must be positive");
+    let adaptive_candidates = || {
+        docs.eq_string_top_n(&column, &needle, None, limit, false)
+            .expect("adaptive equality candidates")
+            .expect("native string column")
+    };
+    time(
+        "NEW adaptive equality top-K (no _source)",
+        iterations,
+        &mut || adaptive_candidates().len() as u64,
+    );
+    time(
+        "NEW adaptive top-K + winning _source point read",
+        iterations,
+        &mut || {
+            let row_ids = adaptive_candidates()
+                .into_iter()
+                .map(|(_, row_id)| row_id as u64)
+                .collect();
+            let mut rows = 0u64;
+            docs.scan_docs(
+                Some(&[SOURCE_COL_NAME.to_string()]),
+                Some(row_ids),
+                None,
+                &mut |batch| {
+                    rows += batch.num_rows() as u64;
+                    std::hint::black_box(batch.column(0));
+                    Ok(())
+                },
+            )
+            .expect("winning source point read");
+            rows
+        },
+    );
 
     // new shape: the equality bound engages the M15 dict-aware pre-pass
     let bound = ColumnBound {
@@ -461,7 +569,13 @@ fn bench_eq_filter_back() {
         .expect("eq-bound scan");
         hits
     };
-    time("M15 eq-bound scan (0 threads)", 3, &mut || eq_scan(0));
-    time("M15 eq-bound scan (4 threads)", 3, &mut || eq_scan(4));
-    time("M15 eq-bound scan (16 threads)", 3, &mut || eq_scan(16));
+    time("M15 eq-bound scan (0 threads)", iterations, &mut || {
+        eq_scan(0)
+    });
+    time("M15 eq-bound scan (4 threads)", iterations, &mut || {
+        eq_scan(4)
+    });
+    time("M15 eq-bound scan (16 threads)", iterations, &mut || {
+        eq_scan(16)
+    });
 }
