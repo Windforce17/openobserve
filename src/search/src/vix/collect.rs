@@ -456,6 +456,107 @@ pub(super) fn simple_histogram(
     Ok(counts)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RankedChunkAction {
+    Skip,
+    Fold(usize),
+    Decode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RankedFoldRun {
+    start: u32,
+    end: u32,
+    bucket: usize,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RankedChunkPlan {
+    folds: Vec<RankedFoldRun>,
+    decode: Vec<std::ops::Range<u32>>,
+}
+
+/// Coalesce adjacent zone chunks before touching postings. Rank-at-every-zone
+/// walks the entire record when zone chunks are finer than histogram buckets;
+/// one rank pair per equal-bucket run only touches the run boundaries.
+fn plan_ranked_chunks(
+    chunks: &[vortex_index::ZoneChunk],
+    mut classify: impl FnMut(&vortex_index::ZoneChunk) -> RankedChunkAction,
+) -> anyhow::Result<RankedChunkPlan> {
+    let mut plan = RankedChunkPlan::default();
+    for chunk in chunks {
+        let start = u32::try_from(chunk.row_offset)
+            .map_err(|_| anyhow::anyhow!("chunk row start overflows u32: {}", chunk.row_offset))?;
+        let row_end = chunk
+            .row_offset
+            .checked_add(chunk.row_count)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "chunk row end overflows u64: {} + {}",
+                    chunk.row_offset,
+                    chunk.row_count
+                )
+            })?;
+        let end = u32::try_from(row_end)
+            .map_err(|_| anyhow::anyhow!("chunk row end overflows u32: {row_end}"))?;
+
+        match classify(chunk) {
+            RankedChunkAction::Skip => {}
+            RankedChunkAction::Fold(bucket) => {
+                if let Some(last) = plan.folds.last_mut()
+                    && last.end == start
+                    && last.bucket == bucket
+                {
+                    last.end = end;
+                } else {
+                    plan.folds.push(RankedFoldRun { start, end, bucket });
+                }
+            }
+            RankedChunkAction::Decode => {
+                if let Some(last) = plan.decode.last_mut()
+                    && last.end == start
+                {
+                    last.end = end;
+                } else {
+                    plan.decode.push(start..end);
+                }
+            }
+        }
+    }
+    Ok(plan)
+}
+
+fn ranked_fold_counts(
+    cursor: &vortex_index::PlistCursor,
+    folds: &[RankedFoldRun],
+) -> anyhow::Result<Vec<u64>> {
+    let mut boundaries = Vec::with_capacity(folds.len() * 2);
+    for run in folds {
+        boundaries.extend([run.start, run.end]);
+    }
+    let ranks = cursor.ranks(&boundaries)?;
+    if ranks.len() != boundaries.len() {
+        return Err(anyhow::anyhow!(
+            "postings returned {} ranks for {} requested boundaries",
+            ranks.len(),
+            boundaries.len()
+        ));
+    }
+    folds
+        .iter()
+        .zip(ranks.chunks_exact(2))
+        .map(|(run, pair)| {
+            pair[1].checked_sub(pair[0]).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "postings ranks decreased across folded run {}..{}",
+                    run.start,
+                    run.end
+                )
+            })
+        })
+        .collect()
+}
+
 /// [`simple_histogram`] for a single dense out-of-row term, WITHOUT the
 /// bitmap: each zone chunk's matched count is a skip-table rank diff
 /// (`rank(chunk_end) - rank(chunk_start)`), single-bucket chunks fold that
@@ -491,44 +592,35 @@ pub(super) fn ranked_simple_histogram(
         .zone_chunks()
         .ok_or_else(|| anyhow::anyhow!("ranked histogram requires a zone table"))?;
 
-    let mut boundaries = Vec::with_capacity(chunks.len() + 1);
-    boundaries.push(0);
-    for chunk in chunks {
-        boundaries.push(
-            u32::try_from(chunk.row_offset + chunk.row_count)
-                .map_err(|_| anyhow::anyhow!("chunk row end overflows u32"))?,
-        );
-    }
-    // One batched ranged read for all distinct skip groups. Calling `rank`
-    // per boundary would serialize one object-store request per chunk.
-    let ranks = cursor.ranks(&boundaries)?;
-    let mut boundary_rows: Vec<u64> = Vec::new();
-    for (index, chunk) in chunks.iter().enumerate() {
-        let start = boundaries[index];
-        let end = boundaries[index + 1];
-        let matched = ranks[index + 1].checked_sub(ranks[index]).ok_or_else(|| {
-            anyhow::anyhow!("postings ranks decreased across chunk {start}..{end}")
-        })?;
-        if matched == 0 {
-            continue;
-        }
-        // window first (inclusive chunk bounds vs half-open window)
+    let plan = plan_ranked_chunks(chunks, |chunk| {
+        // Inclusive chunk bounds vs half-open window.
         if chunk.ts_max < win_start || chunk.ts_min >= win_end {
-            continue; // whole chunk outside the query window
+            return RankedChunkAction::Skip;
         }
         let fully_in_window = chunk.ts_min >= win_start && chunk.ts_max < win_end;
-        if fully_in_window {
-            match chunk_single_bucket(chunk.ts_min, chunk.ts_max, origin, width, num_buckets) {
-                Some(Some(bucket)) => {
-                    counts[bucket] += matched;
-                    continue;
-                }
-                Some(None) => continue, // whole chunk outside the grid
-                None => {}              // straddles bucket edges: decode below
-            }
+        if !fully_in_window {
+            return RankedChunkAction::Decode;
         }
-        // bucket-straddling or window-straddling: decode the chunk's rows
-        cursor.for_each_in_range(start, end, |row| {
+        match chunk_single_bucket(chunk.ts_min, chunk.ts_max, origin, width, num_buckets) {
+            Some(Some(bucket)) => RankedChunkAction::Fold(bucket),
+            Some(None) => RankedChunkAction::Skip,
+            None => RankedChunkAction::Decode,
+        }
+    })?;
+
+    // Fetch only the two postings rank groups at each coalesced bucket run,
+    // rather than one rank at every zone boundary.
+    for (run, matched) in plan
+        .folds
+        .iter()
+        .zip(ranked_fold_counts(cursor, &plan.folds)?)
+    {
+        counts[run.bucket] += matched;
+    }
+
+    let mut boundary_rows: Vec<u64> = Vec::new();
+    for range in plan.decode {
+        cursor.for_each_in_range(range.start, range.end, |row| {
             boundary_rows.push(u64::from(row));
             Ok(())
         })?;
@@ -565,37 +657,26 @@ pub(super) fn ranked_count_in_window(
     let chunks = reader
         .zone_chunks()
         .ok_or_else(|| anyhow::anyhow!("ranked count requires a zone table"))?;
-    let mut count = 0u64;
-    let mut boundary_rows: Vec<u64> = Vec::new();
-    let mut boundaries = Vec::with_capacity(chunks.len() + 1);
-    boundaries.push(0);
-    for chunk in chunks {
-        boundaries.push(
-            u32::try_from(chunk.row_offset + chunk.row_count)
-                .map_err(|_| anyhow::anyhow!("chunk row end overflows u32"))?,
-        );
-    }
-    let ranks = cursor.ranks(&boundaries)?;
-    for (index, chunk) in chunks.iter().enumerate() {
-        let start = boundaries[index];
-        let end = boundaries[index + 1];
-        let matched = ranks[index + 1].checked_sub(ranks[index]).ok_or_else(|| {
-            anyhow::anyhow!("postings ranks decreased across chunk {start}..{end}")
-        })?;
-        if matched == 0 {
-            continue;
-        }
-        // inclusive chunk bounds vs [start_time, end_time)
+    let plan = plan_ranked_chunks(chunks, |chunk| {
+        // Inclusive chunk bounds vs [start_time, end_time).
         if chunk.ts_min >= start_time && chunk.ts_max < end_time {
-            count += matched;
+            RankedChunkAction::Fold(0)
         } else if chunk.ts_max < start_time || chunk.ts_min >= end_time {
-            // disjoint
+            RankedChunkAction::Skip
         } else {
-            cursor.for_each_in_range(start, end, |row| {
-                boundary_rows.push(u64::from(row));
-                Ok(())
-            })?;
+            RankedChunkAction::Decode
         }
+    })?;
+
+    let mut count = ranked_fold_counts(cursor, &plan.folds)?
+        .into_iter()
+        .sum::<u64>();
+    let mut boundary_rows: Vec<u64> = Vec::new();
+    for range in plan.decode {
+        cursor.for_each_in_range(range.start, range.end, |row| {
+            boundary_rows.push(u64::from(row));
+            Ok(())
+        })?;
     }
     if !boundary_rows.is_empty() {
         let timestamps = read_timestamps(reader, Some(&boundary_rows))?;
@@ -1740,6 +1821,82 @@ mod tests {
 
     fn decoded_histogram_chunks() -> usize {
         DECODED_HISTOGRAM_CHUNKS.with(|c| c.get())
+    }
+
+    #[test]
+    fn ranked_chunk_plan_coalesces_equal_bucket_runs() {
+        let chunks: Vec<vortex_index::ZoneChunk> = (0..32u64)
+            .map(|i| vortex_index::ZoneChunk {
+                row_offset: i * 64,
+                row_count: 64,
+                ts_min: i as i64,
+                ts_max: i as i64,
+            })
+            .collect();
+        let plan = plan_ranked_chunks(&chunks, |chunk| {
+            RankedChunkAction::Fold(chunk.ts_min as usize / 8)
+        })
+        .unwrap();
+
+        assert!(plan.decode.is_empty());
+        assert_eq!(
+            plan.folds,
+            vec![
+                RankedFoldRun {
+                    start: 0,
+                    end: 512,
+                    bucket: 0,
+                },
+                RankedFoldRun {
+                    start: 512,
+                    end: 1024,
+                    bucket: 1,
+                },
+                RankedFoldRun {
+                    start: 1024,
+                    end: 1536,
+                    bucket: 2,
+                },
+                RankedFoldRun {
+                    start: 1536,
+                    end: 2048,
+                    bucket: 3,
+                },
+            ]
+        );
+
+        let mixed = plan_ranked_chunks(&chunks[..8], |chunk| match chunk.ts_min {
+            0 => RankedChunkAction::Skip,
+            1 | 2 => RankedChunkAction::Fold(7),
+            3 | 4 => RankedChunkAction::Decode,
+            5 => RankedChunkAction::Fold(7),
+            6 => RankedChunkAction::Fold(8),
+            _ => RankedChunkAction::Skip,
+        })
+        .unwrap();
+        assert_eq!(
+            mixed,
+            RankedChunkPlan {
+                folds: vec![
+                    RankedFoldRun {
+                        start: 64,
+                        end: 192,
+                        bucket: 7,
+                    },
+                    RankedFoldRun {
+                        start: 320,
+                        end: 384,
+                        bucket: 7,
+                    },
+                    RankedFoldRun {
+                        start: 384,
+                        end: 448,
+                        bucket: 8,
+                    },
+                ],
+                decode: vec![192..320],
+            }
+        );
     }
 
     /// Build a core file: 8 docs ordered `_timestamp` DESC with columns
