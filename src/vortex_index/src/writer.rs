@@ -516,10 +516,11 @@ pub struct VixWriterOptions {
     /// Maximum full-text token length in **bytes** (clamped to `>= 64`,
     /// exclusive bound; see [`crate::o2_tokenize`]).
     pub max_token_len: usize,
-    /// Threads for the blob encode/compress pipelines at `finish` (and for
-    /// the compaction index merge's blob writes). `0`/`1` = everything on
-    /// the calling thread — the default; the compactor raises it
-    /// (`ZO_VIX_MERGE_THREAD_NUM`).
+    /// Per-writer blob encode policy at `finish` (and for compaction index
+    /// blob writes). `0`/`1` keeps child compression on the calling thread;
+    /// values above one submit CPU leaves to the bounded process-wide
+    /// executor instead of creating a private pool. The compactor supplies
+    /// `ZO_VIX_MERGE_THREAD_NUM`.
     pub encode_threads: usize,
     /// #51b: range parallelism of the compaction index merge's k-way phase
     /// ([`Self::merge_input_indexes`]) — the OUTPUT key space is split into
@@ -3294,60 +3295,51 @@ impl VixWriter {
                             write_index_blobs(vec![sink.into_parts()?], encode_threads)?
                         } else {
                             let started = std::time::Instant::now();
-                            use std::sync::{
-                                Mutex,
-                                atomic::{AtomicUsize, Ordering},
-                            };
-                            let next = AtomicUsize::new(0);
-                            let slots: Vec<Mutex<Option<Result<TermSinkParts>>>> =
-                                (0..ranges.len()).map(|_| Mutex::new(None)).collect();
-                            let resident_ref = &resident;
                             let workers = kway.min(ranges.len());
-                            std::thread::scope(|scope| {
-                                for _ in 0..workers {
-                                    scope.spawn(|| {
-                                        loop {
-                                            let index = next.fetch_add(1, Ordering::Relaxed);
-                                            let Some(range) = ranges.get(index).cloned() else {
-                                                break;
-                                            };
-                                            let mut sink = make_sink();
-                                            let result: Result<TermSinkParts> = (|| {
-                                                push_sorted_shards(
-                                                    &resident_ref[range],
-                                                    &mut sink,
-                                                    row_count,
-                                                )?;
-                                                sink.into_parts()
-                                            })(
-                                            );
-                                            let failed = result.is_err();
-                                            *slots[index].lock().expect("range slot poisoned") =
-                                                Some(result);
-                                            if failed {
-                                                break;
-                                            }
+                            let resident = Arc::new(resident);
+                            let bloom_pairs = Arc::new(bloom_pairs.clone());
+                            let composite_pairs = Arc::new(composite_pairs.clone());
+                            let handle = crate::cpu_executor::shared_vortex_execution_handle()?;
+                            let tasks: Vec<_> = ranges
+                                .iter()
+                                .cloned()
+                                .map(|range| {
+                                    let resident = Arc::clone(&resident);
+                                    let bloom_pairs = Arc::clone(&bloom_pairs);
+                                    let composite_pairs = Arc::clone(&composite_pairs);
+                                    handle.spawn_cpu(move || {
+                                        let mut acc = crate::bloom::BloomHashAcc::from_pairs(
+                                            bloom_pairs.as_ref().clone(),
+                                        );
+                                        if !composite_pairs.is_empty() {
+                                            acc.enable_composite(composite_pairs.iter().cloned());
                                         }
-                                    });
-                                }
-                            });
-                            let mut parts = Vec::with_capacity(slots.len());
+                                        let mut sink = TermSink::new(postings_chunk_bytes)
+                                            .with_bloom(acc)
+                                            .with_plist_min_docs(plist_min_docs);
+                                        push_sorted_shards(&resident[range], &mut sink, row_count)?;
+                                        sink.into_parts()
+                                    })
+                                })
+                                .collect();
+                            let results =
+                                futures::executor::block_on(futures::future::join_all(tasks));
+                            let mut parts = Vec::with_capacity(results.len());
                             let mut first_error = None;
-                            for slot in slots {
-                                match slot.into_inner().expect("range slot poisoned") {
-                                    Some(Ok(part)) => parts.push(part),
-                                    Some(Err(e)) => {
-                                        first_error.get_or_insert(e);
+                            for result in results {
+                                match result {
+                                    Ok(part) => parts.push(part),
+                                    Err(error) => {
+                                        first_error.get_or_insert(error);
                                     }
-                                    None => {}
                                 }
                             }
-                            if let Some(e) = first_error {
-                                return Err(e);
+                            if let Some(error) = first_error {
+                                return Err(error);
                             }
                             log::debug!(
-                                "vix rebuild: parallel index-blob build ({} ranges, {workers} \
-                                 workers) in {:?}",
+                                "vix rebuild: shared-pool index-blob build ({} ranges, \
+                                 per-merge target {workers}) in {:?}",
                                 ranges.len(),
                                 started.elapsed()
                             );

@@ -213,7 +213,8 @@ async fn write_downsampled_vortex(
             let mut file_meta = FileMeta::default();
             let mut last_min_ts = 0;
 
-            let session = VortexSession::default().with_tokio();
+            let session = VortexSession::default()
+                .with_handle(vortex_index::shared_vortex_execution_handle()?);
             let dtype = DType::from_arrow(schema.as_ref());
 
             // Helper to create write options - need to recreate for each writer

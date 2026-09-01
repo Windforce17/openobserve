@@ -20,7 +20,10 @@ use config::{
     meta::stream::{FileKey, StreamType},
 };
 use infra::file_list::FileListJobStatus;
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, TryAcquireError, mpsc};
+use parking_lot::Mutex;
+use tokio::sync::{
+    Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError, mpsc,
+};
 
 #[derive(Clone)]
 pub struct MergeBatch {
@@ -202,10 +205,291 @@ impl JobLeaseGuard {
     }
 }
 
-/// A claimed merge job and its single scheduler-capacity reservation.
+/// Logical compaction lanes sharing one finite set of physical scheduler slots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MergeAdmissionLane {
+    Hot,
+    Recent,
+    Backlog,
+}
+
+impl MergeAdmissionLane {
+    const ALL: [Self; 3] = [Self::Hot, Self::Recent, Self::Backlog];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Hot => 0,
+            Self::Recent => 1,
+            Self::Backlog => 2,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct LanePolicy {
+    entitlement: usize,
+    active: bool,
+    in_use: usize,
+    fair_credit: i64,
+}
+
+struct AdmissionState {
+    lanes: [LanePolicy; 3],
+    physical_cursor: usize,
+}
+
+struct PhysicalPool {
+    owner: MergeAdmissionLane,
+    scheduler: JobSchedulerHandle,
+}
+
+/// Work-conserving admission across the hot, recent, and backlog lanes.
+///
+/// Each configured physical scheduler contributes its capacity as that lane's
+/// entitlement. A lane below its entitlement is always eligible before excess
+/// work. Once every active lane is at entitlement, excess slots use smooth
+/// weighted round-robin with the entitlements as weights.
+pub struct LaneAdmission {
+    state: Mutex<AdmissionState>,
+    pools: Vec<PhysicalPool>,
+    capacity: usize,
+    released: Notify,
+}
+
+impl LaneAdmission {
+    pub fn new(pools: Vec<(MergeAdmissionLane, JobSchedulerHandle)>) -> Arc<Self> {
+        let mut lanes = [LanePolicy {
+            entitlement: 0,
+            active: false,
+            in_use: 0,
+            fair_credit: 0,
+        }; 3];
+        let mut physical = Vec::with_capacity(pools.len());
+        let mut capacity = 0usize;
+        for (owner, scheduler) in pools {
+            let entitlement = scheduler.capacity();
+            lanes[owner.index()] = LanePolicy {
+                entitlement,
+                active: true,
+                in_use: 0,
+                fair_credit: 0,
+            };
+            capacity = capacity.saturating_add(entitlement);
+            physical.push(PhysicalPool { owner, scheduler });
+        }
+        Arc::new(Self {
+            state: Mutex::new(AdmissionState {
+                lanes,
+                physical_cursor: 0,
+            }),
+            pools: physical,
+            capacity,
+            released: Notify::new(),
+        })
+    }
+
+    pub fn handle(self: &Arc<Self>, lane: MergeAdmissionLane) -> LaneSchedulerHandle {
+        assert!(
+            self.state.lock().lanes[lane.index()].entitlement > 0,
+            "lane admission handle requires a configured physical pool"
+        );
+        LaneSchedulerHandle {
+            admission: self.clone(),
+            lane,
+        }
+    }
+
+    fn begin_cycle(&self) {
+        let mut state = self.state.lock();
+        for lane in &mut state.lanes {
+            if lane.entitlement > 0 {
+                lane.active = true;
+            }
+        }
+    }
+
+    fn set_exhausted(&self, lane: MergeAdmissionLane) {
+        let mut state = self.state.lock();
+        let lane = &mut state.lanes[lane.index()];
+        lane.active = false;
+        lane.fair_credit = 0;
+    }
+
+    fn entitlement_choice(state: &AdmissionState) -> Option<MergeAdmissionLane> {
+        let mut selected = None;
+        let mut largest_deficit = 0usize;
+        for lane in MergeAdmissionLane::ALL {
+            let policy = state.lanes[lane.index()];
+            if !policy.active {
+                continue;
+            }
+            let deficit = policy.entitlement.saturating_sub(policy.in_use);
+            if deficit > largest_deficit {
+                largest_deficit = deficit;
+                selected = Some(lane);
+            }
+        }
+        selected
+    }
+
+    fn fair_choice(state: &AdmissionState) -> Option<(MergeAdmissionLane, [i64; 3])> {
+        let mut credits = [
+            state.lanes[0].fair_credit,
+            state.lanes[1].fair_credit,
+            state.lanes[2].fair_credit,
+        ];
+        let mut total_weight = 0i64;
+        let mut selected = None;
+        for lane in MergeAdmissionLane::ALL {
+            let policy = state.lanes[lane.index()];
+            if !policy.active || policy.entitlement == 0 {
+                continue;
+            }
+            let weight = i64::try_from(policy.entitlement).unwrap_or(i64::MAX);
+            credits[lane.index()] = credits[lane.index()].saturating_add(weight);
+            total_weight = total_weight.saturating_add(weight);
+            if selected.map_or(true, |current: MergeAdmissionLane| {
+                credits[lane.index()] > credits[current.index()]
+            }) {
+                selected = Some(lane);
+            }
+        }
+        let selected = selected?;
+        credits[selected.index()] = credits[selected.index()].saturating_sub(total_weight);
+        Some((selected, credits))
+    }
+
+    fn acquire_physical(
+        &self,
+        state: &mut AdmissionState,
+        lane: MergeAdmissionLane,
+    ) -> Option<(JobSchedulerHandle, OwnedSemaphorePermit)> {
+        let preferred = self.pools.iter().position(|pool| pool.owner == lane);
+        if let Some(index) = preferred {
+            let pool = &self.pools[index];
+            if let Some(permit) = pool.scheduler.try_reserve() {
+                state.physical_cursor = (index + 1) % self.pools.len();
+                return Some((pool.scheduler.clone(), permit));
+            }
+        }
+        for offset in 0..self.pools.len() {
+            let index = (state.physical_cursor + offset) % self.pools.len();
+            if Some(index) == preferred {
+                continue;
+            }
+            let pool = &self.pools[index];
+            if let Some(permit) = pool.scheduler.try_reserve() {
+                state.physical_cursor = (index + 1) % self.pools.len();
+                return Some((pool.scheduler.clone(), permit));
+            }
+        }
+        None
+    }
+
+    fn reserve(
+        self: &Arc<Self>,
+        lane: MergeAdmissionLane,
+        limit: usize,
+    ) -> Vec<LaneAdmissionPermit> {
+        let mut reservations = Vec::with_capacity(limit.min(self.free_slots()));
+        for _ in 0..limit {
+            let mut state = self.state.lock();
+            let policy = state.lanes[lane.index()];
+            if !policy.active {
+                break;
+            }
+
+            let fair_credits = if let Some(selected) = Self::entitlement_choice(&state) {
+                if selected != lane {
+                    break;
+                }
+                None
+            } else {
+                let Some((selected, credits)) = Self::fair_choice(&state) else {
+                    break;
+                };
+                if selected != lane {
+                    break;
+                }
+                Some(credits)
+            };
+
+            let Some((scheduler, physical)) = self.acquire_physical(&mut state, lane) else {
+                break;
+            };
+            state.lanes[lane.index()].in_use += 1;
+            if let Some(credits) = fair_credits {
+                for (policy, credit) in state.lanes.iter_mut().zip(credits) {
+                    policy.fair_credit = credit;
+                }
+            }
+            drop(state);
+            reservations.push(LaneAdmissionPermit {
+                admission: self.clone(),
+                lane,
+                scheduler,
+                physical: Some(physical),
+            });
+        }
+        reservations
+    }
+
+    fn free_slots(&self) -> usize {
+        self.pools
+            .iter()
+            .map(|pool| pool.scheduler.free_slots())
+            .sum()
+    }
+
+    fn has_active_lanes(&self) -> bool {
+        self.state
+            .lock()
+            .lanes
+            .iter()
+            .any(|lane| lane.active && lane.entitlement > 0)
+    }
+
+    async fn wait_for_release(&self) {
+        self.released.notified().await;
+    }
+
+    #[cfg(test)]
+    fn in_use(&self, lane: MergeAdmissionLane) -> usize {
+        self.state.lock().lanes[lane.index()].in_use
+    }
+}
+
+/// One logical admission and one physical scheduler slot.
+///
+/// The physical scheduler determines which of the two existing MergeWorker
+/// transports executes the job. Because every physical scheduler has exactly
+/// one receiver task per permit, borrowed jobs cannot accumulate in a
+/// lane-local FIFO behind unrelated work while their database lease ticks.
+pub struct LaneAdmissionPermit {
+    admission: Arc<LaneAdmission>,
+    lane: MergeAdmissionLane,
+    scheduler: JobSchedulerHandle,
+    physical: Option<OwnedSemaphorePermit>,
+}
+
+impl Drop for LaneAdmissionPermit {
+    fn drop(&mut self) {
+        let mut state = self.admission.state.lock();
+        let policy = &mut state.lanes[self.lane.index()];
+        policy.in_use = policy
+            .in_use
+            .checked_sub(1)
+            .expect("lane admission count must match its RAII permits");
+        drop(state);
+        drop(self.physical.take());
+        self.admission.released.notify_one();
+    }
+}
+
+/// A claimed merge job and its single logical and physical capacity reservation.
 ///
 /// This type deliberately is not `Clone`: duplicating it would separate one
-/// database claim from its one local scheduler permit.
+/// database claim from its one local scheduler admission.
 pub struct MergeJob {
     pub org_id: String,
     pub stream_type: StreamType,
@@ -215,7 +499,7 @@ pub struct MergeJob {
     pub lease_generation: i64,
     pub cancel: MergeCancellation,
     pub lease: JobLeaseGuard,
-    _slot: OwnedSemaphorePermit,
+    _slot: LaneAdmissionPermit,
 }
 
 impl MergeJob {
@@ -229,7 +513,7 @@ impl MergeJob {
         lease_generation: i64,
         cancel: MergeCancellation,
         lease: JobLeaseGuard,
-        slot: OwnedSemaphorePermit,
+        slot: LaneAdmissionPermit,
     ) -> Self {
         Self {
             org_id,
@@ -245,8 +529,56 @@ impl MergeJob {
     }
 }
 
-/// Cloneable producer handle for one scheduler lane. The semaphore is lane
-/// local, so the live lane can never borrow backlog capacity (or vice versa).
+/// Cloneable logical-lane producer backed by the shared admission policy.
+#[derive(Clone)]
+pub struct LaneSchedulerHandle {
+    admission: Arc<LaneAdmission>,
+    lane: MergeAdmissionLane,
+}
+
+impl LaneSchedulerHandle {
+    /// Start a polling cycle by treating every configured lane as potentially
+    /// active. An empty or short database claim marks that lane exhausted
+    /// again, allowing its unused entitlement to be borrowed.
+    pub fn begin_cycle(&self) {
+        self.admission.begin_cycle();
+    }
+
+    pub fn reserve(&self, limit: usize) -> Vec<LaneAdmissionPermit> {
+        self.admission.reserve(self.lane, limit)
+    }
+
+    pub fn set_exhausted(&self) {
+        self.admission.set_exhausted(self.lane);
+    }
+
+    pub fn free_slots(&self) -> usize {
+        self.admission.free_slots()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.admission.capacity
+    }
+
+    pub fn has_active_lanes(&self) -> bool {
+        self.admission.has_active_lanes()
+    }
+
+    pub async fn wait_for_release(&self) {
+        self.admission.wait_for_release().await;
+    }
+
+    pub fn lane(&self) -> MergeAdmissionLane {
+        self.lane
+    }
+
+    pub async fn send(&self, job: MergeJob) -> Result<(), mpsc::error::SendError<MergeJob>> {
+        let tx = job._slot.scheduler.tx.clone();
+        tx.send(job).await
+    }
+}
+
+/// Cloneable producer handle for one finite physical scheduler pool.
 #[derive(Clone)]
 pub struct JobSchedulerHandle {
     tx: mpsc::Sender<MergeJob>,
@@ -255,18 +587,11 @@ pub struct JobSchedulerHandle {
 }
 
 impl JobSchedulerHandle {
-    /// Reserve up to `limit` currently-free slots without waiting. Callers do
-    /// this before claiming from the database, so every returned claim can be
-    /// paired one-for-one with a permit.
-    pub fn reserve(&self, limit: usize) -> Vec<OwnedSemaphorePermit> {
-        let mut permits = Vec::with_capacity(limit.min(self.free_slots()));
-        for _ in 0..limit {
-            match self.slots.clone().try_acquire_owned() {
-                Ok(permit) => permits.push(permit),
-                Err(TryAcquireError::NoPermits | TryAcquireError::Closed) => break,
-            }
+    fn try_reserve(&self) -> Option<OwnedSemaphorePermit> {
+        match self.slots.clone().try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(TryAcquireError::NoPermits | TryAcquireError::Closed) => None,
         }
-        permits
     }
 
     #[inline]
@@ -278,16 +603,12 @@ impl JobSchedulerHandle {
     pub fn capacity(&self) -> usize {
         self.capacity
     }
-
-    pub async fn send(&self, job: MergeJob) -> Result<(), mpsc::error::SendError<MergeJob>> {
-        self.tx.send(job).await
-    }
 }
 
 /// JobScheduler is a worker that processes jobs.
 pub struct JobScheduler {
     num: usize,
-    rx: Arc<Mutex<mpsc::Receiver<MergeJob>>>,
+    rx: Arc<AsyncMutex<mpsc::Receiver<MergeJob>>>,
     handle: JobSchedulerHandle,
     worker_tx: mpsc::Sender<(MergeSender, MergeBatch)>,
 }
@@ -299,7 +620,7 @@ impl JobScheduler {
         let slots = Arc::new(Semaphore::new(capacity));
         Self {
             num: capacity,
-            rx: Arc::new(Mutex::new(rx)),
+            rx: Arc::new(AsyncMutex::new(rx)),
             handle: JobSchedulerHandle {
                 tx,
                 slots,
@@ -309,7 +630,16 @@ impl JobScheduler {
         }
     }
 
-    pub fn handle(&self) -> JobSchedulerHandle {
+    /// Standalone backlog-only logical handle used by callers that do not
+    /// configure hot/recent lanes.
+    pub fn handle(&self) -> LaneSchedulerHandle {
+        let admission =
+            LaneAdmission::new(vec![(MergeAdmissionLane::Backlog, self.physical_handle())]);
+        admission.handle(MergeAdmissionLane::Backlog)
+    }
+
+    /// Physical pool handle used to assemble a shared multi-lane admission.
+    pub fn physical_handle(&self) -> JobSchedulerHandle {
         self.handle.clone()
     }
 
@@ -414,33 +744,202 @@ mod job_scheduler_tests {
 
     use super::*;
 
-    #[test]
-    fn scheduler_handles_share_one_capacity_pool() {
-        let (worker_tx, _rx) = mpsc::channel::<(MergeSender, MergeBatch)>(1);
-        let scheduler = JobScheduler::new(3, worker_tx);
-        let first = scheduler.handle();
-        let second = scheduler.handle();
+    fn admission(
+        capacities: [usize; 3],
+    ) -> (
+        Arc<LaneAdmission>,
+        [LaneSchedulerHandle; 3],
+        Vec<JobScheduler>,
+    ) {
+        let (worker_tx, _worker_rx) = mpsc::channel::<(MergeSender, MergeBatch)>(1);
+        let schedulers = vec![
+            JobScheduler::new(capacities[0], worker_tx.clone()),
+            JobScheduler::new(capacities[1], worker_tx.clone()),
+            JobScheduler::new(capacities[2], worker_tx),
+        ];
+        let admission = LaneAdmission::new(vec![
+            (MergeAdmissionLane::Hot, schedulers[0].physical_handle()),
+            (MergeAdmissionLane::Recent, schedulers[1].physical_handle()),
+            (MergeAdmissionLane::Backlog, schedulers[2].physical_handle()),
+        ]);
+        let handles = [
+            admission.handle(MergeAdmissionLane::Hot),
+            admission.handle(MergeAdmissionLane::Recent),
+            admission.handle(MergeAdmissionLane::Backlog),
+        ];
+        (admission, handles, schedulers)
+    }
 
-        let held = first.reserve(usize::MAX);
-        assert_eq!(held.len(), 3);
-        assert_eq!(second.free_slots(), 0);
-        assert!(second.reserve(1).is_empty());
-
-        drop(held);
-        assert_eq!(second.free_slots(), 3);
+    fn reserve_entitlements(
+        handles: &[LaneSchedulerHandle; 3],
+        capacity: usize,
+    ) -> [Vec<LaneAdmissionPermit>; 3] {
+        let mut held: [Vec<LaneAdmissionPermit>; 3] = std::array::from_fn(|_| Vec::new());
+        while held.iter().map(Vec::len).sum::<usize>() < capacity {
+            let before = held.iter().map(Vec::len).sum::<usize>();
+            for (lane, lane_held) in handles.iter().zip(&mut held) {
+                lane_held.extend(lane.reserve(usize::MAX));
+            }
+            assert!(
+                held.iter().map(Vec::len).sum::<usize>() > before,
+                "active entitlement fill must make progress"
+            );
+        }
+        held
     }
 
     #[test]
-    fn scheduler_permits_release_individually() {
-        let (worker_tx, _rx) = mpsc::channel::<(MergeSender, MergeBatch)>(1);
-        let scheduler = JobScheduler::new(2, worker_tx);
-        let handle = scheduler.handle();
-        let mut held = handle.reserve(2);
+    fn all_pending_lanes_receive_four_four_two_guarantees() {
+        let (admission, [hot, recent, backlog], _schedulers) = admission([4, 4, 2]);
+        let [_hot, _recent, _backlog] = reserve_entitlements(
+            &[hot.clone(), recent.clone(), backlog.clone()],
+            admission.capacity,
+        );
 
-        assert_eq!(handle.free_slots(), 0);
+        assert_eq!(admission.in_use(MergeAdmissionLane::Hot), 4);
+        assert_eq!(admission.in_use(MergeAdmissionLane::Recent), 4);
+        assert_eq!(admission.in_use(MergeAdmissionLane::Backlog), 2);
+        assert_eq!(admission.free_slots(), 0);
+    }
+
+    #[test]
+    fn sole_active_lane_borrows_all_empty_lane_capacity() {
+        let (admission, [hot, recent, backlog], _schedulers) = admission([4, 4, 2]);
+        let [hot_jobs, recent_jobs, mut backlog_jobs] = reserve_entitlements(
+            &[hot.clone(), recent.clone(), backlog.clone()],
+            admission.capacity,
+        );
+
+        hot.set_exhausted();
+        recent.set_exhausted();
+        drop(hot_jobs);
+        drop(recent_jobs);
+        backlog_jobs.extend(backlog.reserve(usize::MAX));
+
+        assert_eq!(backlog_jobs.len(), 10);
+        assert_eq!(admission.in_use(MergeAdmissionLane::Backlog), 10);
+        assert_eq!(admission.free_slots(), 0);
+    }
+
+    #[test]
+    fn newly_active_under_guarantee_lane_preempts_next_excess_admission() {
+        let (admission, [hot, recent, backlog], _schedulers) = admission([4, 4, 2]);
+        let [hot_jobs, recent_jobs, mut backlog_jobs] = reserve_entitlements(
+            &[hot.clone(), recent.clone(), backlog.clone()],
+            admission.capacity,
+        );
+        hot.set_exhausted();
+        recent.set_exhausted();
+        drop(hot_jobs);
+        drop(recent_jobs);
+        backlog_jobs.extend(backlog.reserve(8));
+        assert_eq!(backlog_jobs.len(), 10);
+
+        backlog.begin_cycle();
+        drop(backlog_jobs.pop());
+
+        assert!(backlog.reserve(1).is_empty());
+        assert_eq!(hot.reserve(1).len(), 1);
+    }
+
+    #[test]
+    fn excess_admission_is_weighted_fair() {
+        let (admission, [hot, recent, backlog], _schedulers) = admission([6, 3, 9]);
+        let [mut hot_jobs, mut recent_jobs, backlog_jobs] = reserve_entitlements(
+            &[hot.clone(), recent.clone(), backlog.clone()],
+            admission.capacity,
+        );
+        backlog.set_exhausted();
+        drop(backlog_jobs);
+
+        for _ in 0..9 {
+            hot_jobs.extend(hot.reserve(1));
+            recent_jobs.extend(recent.reserve(1));
+        }
+
+        assert_eq!(hot_jobs.len(), 12);
+        assert_eq!(recent_jobs.len(), 6);
+    }
+
+    #[test]
+    fn dropping_each_admission_releases_its_slot() {
+        let (admission, [hot, recent, backlog], _schedulers) = admission([4, 4, 2]);
+        recent.set_exhausted();
+        backlog.set_exhausted();
+        let mut held = hot.reserve(2);
+
+        assert_eq!(admission.in_use(MergeAdmissionLane::Hot), 2);
         drop(held.pop());
-        assert_eq!(handle.free_slots(), 1);
-        assert_eq!(handle.reserve(usize::MAX).len(), 1);
+        assert_eq!(admission.in_use(MergeAdmissionLane::Hot), 1);
+        assert_eq!(admission.free_slots(), 9);
+    }
+
+    #[tokio::test]
+    async fn dropping_admission_wakes_refill_waiter() {
+        let (_admission, [hot, recent, backlog], _schedulers) = admission([4, 4, 2]);
+        recent.set_exhausted();
+        backlog.set_exhausted();
+        let mut held = hot.reserve(1);
+        let waiter = hot.clone();
+        let waiting = tokio::spawn(async move {
+            waiter.wait_for_release().await;
+        });
+        tokio::task::yield_now().await;
+
+        drop(held.pop());
+
+        tokio::time::timeout(tokio::time::Duration::from_secs(1), waiting)
+            .await
+            .expect("released slot must wake the refill loop")
+            .expect("refill waiter must complete");
+    }
+
+    #[tokio::test]
+    async fn cancelled_task_releases_admission() {
+        let (admission, [hot, _, _], _schedulers) = admission([4, 4, 2]);
+        let held = hot.reserve(1);
+        let task = tokio::spawn(async move {
+            let _held = held;
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        task.abort();
+        let _ = task.await;
+
+        assert_eq!(admission.in_use(MergeAdmissionLane::Hot), 0);
+        assert_eq!(admission.free_slots(), 10);
+    }
+
+    #[tokio::test]
+    async fn scheduler_shutdown_releases_waiting_admission() {
+        let (admission, [hot, _, _], schedulers) = admission([4, 4, 2]);
+        let held = hot.reserve(1);
+        let closed = held[0].scheduler.tx.clone();
+        let task = tokio::spawn(async move {
+            closed.closed().await;
+            drop(held);
+        });
+
+        drop(schedulers);
+        tokio::time::timeout(tokio::time::Duration::from_secs(1), task)
+            .await
+            .expect("scheduler receiver shutdown must wake the waiting admission")
+            .expect("shutdown admission task must complete");
+
+        assert_eq!(admission.in_use(MergeAdmissionLane::Hot), 0);
+        assert_eq!(admission.free_slots(), 10);
+    }
+
+    #[test]
+    fn total_admission_never_exceeds_physical_capacity() {
+        let (admission, [hot, recent, backlog], _schedulers) = admission([4, 4, 2]);
+        hot.set_exhausted();
+        recent.set_exhausted();
+        let held = backlog.reserve(usize::MAX);
+
+        assert_eq!(held.len(), 10);
+        assert!(backlog.reserve(1).is_empty());
+        assert_eq!(admission.in_use(MergeAdmissionLane::Backlog), 10);
     }
 
     #[test]
@@ -489,7 +988,7 @@ mod job_scheduler_tests {
 /// MergeWorker is a worker that merges files
 pub struct MergeWorker {
     num: usize,
-    rx: Arc<Mutex<mpsc::Receiver<(MergeSender, MergeBatch)>>>,
+    rx: Arc<AsyncMutex<mpsc::Receiver<(MergeSender, MergeBatch)>>>,
     tx: mpsc::Sender<(MergeSender, MergeBatch)>,
 }
 
@@ -499,7 +998,7 @@ impl MergeWorker {
         // capacity-1 channel serialized submission behind the slowest batch
         let num = num.max(1);
         let (tx, rx) = mpsc::channel::<(MergeSender, MergeBatch)>(num * 2);
-        let rx = Arc::new(Mutex::new(rx));
+        let rx = Arc::new(AsyncMutex::new(rx));
         Self { num, rx, tx }
     }
 

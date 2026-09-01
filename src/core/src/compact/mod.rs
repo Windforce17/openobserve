@@ -369,15 +369,23 @@ async fn transition_claim(
 
 /// Claim and dispatch compaction work for one scheduler lane.
 ///
-/// Scheduler permits are reserved before the database claim and moved
+/// Shared lane admissions are reserved before the database claim and moved
 /// one-for-one into non-cloneable `MergeJob`s. The claim ceiling remains the
 /// configured batch size, additionally bounded by merge-worker count and
-/// currently-free lane capacity.
+/// currently-free physical capacity.
 pub async fn run_merge(
-    scheduler: &worker::JobSchedulerHandle,
+    scheduler: &worker::LaneSchedulerHandle,
     lane: MergeLane,
-) -> Result<(), anyhow::Error> {
+) -> Result<usize, anyhow::Error> {
     let cfg = get_config();
+    debug_assert_eq!(
+        scheduler.lane(),
+        match lane {
+            MergeLane::All | MergeLane::Backlog { .. } => worker::MergeAdmissionLane::Backlog,
+            MergeLane::Recent { .. } => worker::MergeAdmissionLane::Recent,
+            MergeLane::Live { .. } => worker::MergeAdmissionLane::Hot,
+        }
+    );
     let batch_limit = usize::try_from(cfg.compact.batch_size.max(0)).unwrap_or(usize::MAX);
     let reserve_limit = batch_limit.min(cfg.limit.file_merge_thread_num.max(1));
     let permits = scheduler.reserve(reserve_limit);
@@ -387,7 +395,7 @@ pub async fn run_merge(
             lane.claim_spec().3,
             scheduler.capacity(),
         );
-        return Ok(());
+        return Ok(0);
     }
 
     let (order, min_offsets, max_offsets, lane_name) = lane.claim_spec();
@@ -413,9 +421,13 @@ pub async fn run_merge(
         scheduler.capacity().saturating_sub(scheduler.free_slots()),
         scheduler.free_slots(),
     );
-    if jobs.is_empty() {
-        return Ok(());
+    if jobs.len() < permits.len() {
+        scheduler.set_exhausted();
     }
+    if jobs.is_empty() {
+        return Ok(0);
+    }
+    let claimed_count = jobs.len();
 
     let ttl = std::cmp::max(60, cfg.compact.job_run_timeout / 4) as u64;
     let now = config::utils::time::now();
@@ -551,7 +563,7 @@ pub async fn run_merge(
         }
     }
 
-    Ok(())
+    Ok(claimed_count)
 }
 
 /// compactor delay delete files run steps:

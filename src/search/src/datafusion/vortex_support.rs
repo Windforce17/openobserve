@@ -39,10 +39,16 @@ use vortex::{
 };
 use vortex_datafusion::VortexAccessPlan;
 
-/// Dedicated runtime for CPU-heavy Vortex encode/decode work, sized by
-/// `ZO_VORTEX_THREAD_NUM` (0 = number of CPU cores).
+/// Dedicated runtime for Vortex writer coordination and decode work, sized
+/// by `ZO_VORTEX_THREAD_NUM`. Writer CPU leaves use the shared bounded VIX
+/// executor instead of this runtime.
 pub static VORTEX_RUNTIME: LazyLock<VortexRuntime> = LazyLock::new(|| {
-    let threads = config::get_config().limit.vortex_thread_num.max(1);
+    let cfg = config::get_config();
+    let threads = cfg.limit.vortex_thread_num.max(1);
+    let leaf_threads = (cfg.limit.cpu_num / config::cluster::cpu_role_divisor())
+        .saturating_sub(2)
+        .max(1);
+    vortex_index::configure_shared_cpu_executor(leaf_threads);
     VortexRuntime::new(threads)
 });
 
@@ -123,7 +129,10 @@ pub async fn write_vortex(
 ) -> Result<Vec<u8>> {
     let writer_task = VORTEX_RUNTIME.spawn_blocking(move || {
         VORTEX_RUNTIME.block_on(async move {
-            let session = VortexSession::default().with_tokio();
+            let handle = vortex_index::shared_vortex_execution_handle().map_err(|error| {
+                DataFusionError::Execution(format!("shared Vortex executor: {error}"))
+            })?;
+            let session = VortexSession::default().with_handle(handle);
             let dtype = DType::from_arrow(schema.as_ref());
             let strategy = WriteStrategyBuilder::default()
                 .with_compressor(Utf8Compressor::default())

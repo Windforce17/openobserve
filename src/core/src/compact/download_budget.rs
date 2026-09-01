@@ -28,9 +28,9 @@
 //! Admission rules (deterministic):
 //! - capacity `0` = unlimited (admit immediately);
 //! - a download admits when `in_flight + bytes <= capacity`;
-//! - a WORKER holding no admitted bytes always admits its next download regardless of size —
-//!   every merge job can always make progress, so a file larger than the whole budget delays
-//!   (until the worker's earlier downloads drain) but never deadlocks or starves.
+//! - a WORKER holding no admitted bytes always admits its next download regardless of size — every
+//!   merge job can always make progress, so a file larger than the whole budget delays (until the
+//!   worker's earlier downloads drain) but never deadlocks or starves.
 //!
 //! The per-job `Semaphore` in `cache_remote_files` still caps request
 //! parallelism; concurrency knobs cap parallelism, the byte budget caps

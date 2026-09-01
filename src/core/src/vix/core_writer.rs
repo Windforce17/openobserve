@@ -379,6 +379,7 @@ fn core_writer_options(
     index_enabled: bool,
 ) -> VixWriterOptions {
     let cfg = get_config();
+    vortex_index::configure_shared_cpu_executor(vix_cpu_executor_threads());
     VixWriterOptions {
         index_enabled,
         bloom_field_names: bloom_fields,
@@ -610,6 +611,25 @@ static REBUILD_GATE: std::sync::LazyLock<RebuildGate> = std::sync::LazyLock::new
         cfg.limit.mem_total / 100 * 90,
     )
 });
+/// An owned process-wide rebuild-memory admission permit. The compactor
+/// acquires this before starting the blocking rebuild controller, so only
+/// memory-admitted rebuilds enter execution. Construction stays private to
+/// this module; dropping the value releases the slot.
+pub struct VixRebuildPermit {
+    _permit: RebuildPermit<'static>,
+}
+
+/// Block an orchestration thread until rebuild memory is available.
+///
+/// The caller acquires this before starting the rebuild controller.
+/// Cancellation is checked on every gate wake/tick.
+pub fn acquire_vix_rebuild_permit_with_cancellation(
+    cancellation: &VixMergeCancellation,
+) -> Result<VixRebuildPermit, anyhow::Error> {
+    REBUILD_GATE
+        .acquire_with_cancellation(Some(cancellation))
+        .map(|permit| VixRebuildPermit { _permit: permit })
+}
 
 #[cfg(test)]
 mod rebuild_gate_tests {
@@ -687,6 +707,18 @@ mod rebuild_gate_tests {
     }
 }
 
+/// CPU quota available to VIX after sharing the process with configured
+/// query/ingest roles.
+fn vix_role_cpu_capacity() -> usize {
+    std::cmp::max(1, get_config().limit.cpu_num / cluster::cpu_role_divisor())
+}
+
+/// Until flat compaction joins the same executor, retain two CPUs for Tokio,
+/// lease/range completion, and the independent DataFusion path.
+fn vix_cpu_executor_threads() -> usize {
+    vix_role_cpu_capacity().saturating_sub(2).max(1)
+}
+
 /// Threads of one compaction merge (`ZO_VIX_MERGE_THREAD_NUM`; `0` = auto).
 /// Drives the term-dictionary merge partitioning, the per-input decode fan-out
 /// and the blob encode pools. Auto = the machine's available parallelism
@@ -697,8 +729,7 @@ mod rebuild_gate_tests {
 /// nested pool (see [`cluster::cpu_role_divisor`]).
 fn merge_threads() -> usize {
     let configured = get_config().common.vix_merge_thread_num;
-    let base = std::thread::available_parallelism().map_or(1, |n| n.get());
-    let role_capacity = std::cmp::max(1, base / cluster::cpu_role_divisor());
+    let role_capacity = vix_role_cpu_capacity();
     if configured != 0 {
         return configured.clamp(1, role_capacity);
     }
@@ -1610,6 +1641,52 @@ enum IndexedMergeFailure {
     /// a rebuild would fail the same way.
     Fatal(anyhow::Error),
 }
+/// Strategy requested by the compactor's first CPU phase.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoreMergeMode {
+    /// Use the indexed merge when possible and return a prepared rebuild on
+    /// an incompatible or docs-only input.
+    Automatic,
+    /// Refuse every rebuild fallback. Used by batches above the safe rebuild
+    /// size ceiling.
+    IndexedOnly,
+    /// Produce a column-store-only intermediate; its final index is built by
+    /// a later merge or terminal heal.
+    IndexDeferred,
+}
+
+/// The first CPU phase either finishes the merge or returns owned state for a
+/// separately admitted rebuild. No indexed child work or partial writer
+/// survives in `NeedsRebuild`.
+pub enum CoreMergeAttempt {
+    Complete(MergedCoreFile),
+    NeedsRebuild(PreparedCoreRebuild),
+}
+
+/// Open inputs and a completed merge plan retained across rebuild-memory
+/// admission. All fields are private so execution can only resume through
+/// [`execute_prepared_core_rebuild`].
+pub struct PreparedCoreRebuild {
+    inputs: Vec<MergeInput>,
+    sources: Vec<MergeSource>,
+    plan: MergePlan,
+    requires_memory_admission: bool,
+}
+
+impl PreparedCoreRebuild {
+    /// Whether this continuation builds a term index and therefore owns the
+    /// memory-heavy rebuild footprint.
+    pub fn requires_memory_admission(&self) -> bool {
+        self.requires_memory_admission
+    }
+}
+enum InternalCoreMergeAttempt {
+    Complete(MergedCoreFile),
+    NeedsRebuild {
+        sources: Vec<MergeSource>,
+        plan: MergePlan,
+    },
+}
 
 /// Compactor producer: k-way merge core files into one, ordered by
 /// `_timestamp` descending (the storage-file convention; inputs are already
@@ -1769,30 +1846,55 @@ pub fn merge_core_files_index_deferred_with_cancellation(
         false,
     )
 }
-
-/// [`merge_core_files`] with explicit batch caps (tests shrink them to prove
-/// the chunked flow with small data).
-fn merge_core_files_with_caps(
+/// Run the compactor's planning/indexed phase while owning all inputs. A
+/// fallback returns a continuation instead of entering rebuild admission
+/// while the caller still owns CPU capacity.
+#[allow(clippy::too_many_arguments)]
+pub fn try_merge_core_files_with_cancellation(
     stream_type: StreamType,
-    inputs: &[MergeInput],
-    latest_schema: &Schema,
-    fts_fields: &[String],
-    bloom_fields: &[String],
-    caps: BatchCaps,
-) -> Result<MergedCoreFile, anyhow::Error> {
-    merge_core_files_with_caps_and_cancellation(
+    inputs: Vec<MergeInput>,
+    latest_schema: Arc<Schema>,
+    fts_fields: Vec<String>,
+    bloom_fields: Vec<String>,
+    cancellation: VixMergeCancellation,
+    mode: CoreMergeMode,
+) -> Result<CoreMergeAttempt, anyhow::Error> {
+    let (caps, require_indexed_merge) = match mode {
+        CoreMergeMode::Automatic => (BatchCaps::default(), false),
+        CoreMergeMode::IndexedOnly => (BatchCaps::default(), true),
+        CoreMergeMode::IndexDeferred => (
+            BatchCaps {
+                index_enabled_override: Some(false),
+                ..BatchCaps::default()
+            },
+            false,
+        ),
+    };
+    match attempt_core_merge(
         stream_type,
-        inputs,
-        latest_schema,
-        fts_fields,
-        bloom_fields,
+        &inputs,
+        latest_schema.as_ref(),
+        &fts_fields,
+        &bloom_fields,
         caps,
-        None,
-        false,
-    )
+        Some(cancellation),
+        require_indexed_merge,
+    )? {
+        InternalCoreMergeAttempt::Complete(result) => Ok(CoreMergeAttempt::Complete(result)),
+        InternalCoreMergeAttempt::NeedsRebuild { sources, plan } => {
+            let requires_memory_admission = plan.opts.index_enabled;
+            Ok(CoreMergeAttempt::NeedsRebuild(PreparedCoreRebuild {
+                inputs,
+                sources,
+                plan,
+                requires_memory_admission,
+            }))
+        }
+    }
 }
 
-fn merge_core_files_with_caps_and_cancellation(
+#[allow(clippy::too_many_arguments)]
+fn attempt_core_merge(
     stream_type: StreamType,
     inputs: &[MergeInput],
     latest_schema: &Schema,
@@ -1801,7 +1903,7 @@ fn merge_core_files_with_caps_and_cancellation(
     caps: BatchCaps,
     cancellation: Option<VixMergeCancellation>,
     require_indexed_merge: bool,
-) -> Result<MergedCoreFile, anyhow::Error> {
+) -> Result<InternalCoreMergeAttempt, anyhow::Error> {
     let started = std::time::Instant::now();
     let sources = open_merge_sources(inputs, cancellation.as_ref())?;
     log::debug!(
@@ -1839,8 +1941,8 @@ fn merge_core_files_with_caps_and_cancellation(
         );
     } else if let Some(readers) = readers {
         match merge_core_files_indexed(inputs, &sources, &readers, &plan) {
-            Ok(result) => return Ok(result),
-            Err(IndexedMergeFailure::Fatal(e)) => return Err(e),
+            Ok(result) => return Ok(InternalCoreMergeAttempt::Complete(result)),
+            Err(IndexedMergeFailure::Fatal(error)) => return Err(error),
             Err(IndexedMergeFailure::Fallback(reason)) => {
                 if require_indexed_merge {
                     return Err(reason.context(
@@ -1859,7 +1961,56 @@ fn merge_core_files_with_caps_and_cancellation(
              sidecar; refusing a large full rebuild"
         ));
     }
-    rebuild_over_sources(inputs, &sources, &plan)
+    Ok(InternalCoreMergeAttempt::NeedsRebuild { sources, plan })
+}
+
+/// [`merge_core_files`] with explicit batch caps (tests shrink them to prove
+/// the chunked flow with small data).
+fn merge_core_files_with_caps(
+    stream_type: StreamType,
+    inputs: &[MergeInput],
+    latest_schema: &Schema,
+    fts_fields: &[String],
+    bloom_fields: &[String],
+    caps: BatchCaps,
+) -> Result<MergedCoreFile, anyhow::Error> {
+    merge_core_files_with_caps_and_cancellation(
+        stream_type,
+        inputs,
+        latest_schema,
+        fts_fields,
+        bloom_fields,
+        caps,
+        None,
+        false,
+    )
+}
+
+fn merge_core_files_with_caps_and_cancellation(
+    stream_type: StreamType,
+    inputs: &[MergeInput],
+    latest_schema: &Schema,
+    fts_fields: &[String],
+    bloom_fields: &[String],
+    caps: BatchCaps,
+    cancellation: Option<VixMergeCancellation>,
+    require_indexed_merge: bool,
+) -> Result<MergedCoreFile, anyhow::Error> {
+    match attempt_core_merge(
+        stream_type,
+        inputs,
+        latest_schema,
+        fts_fields,
+        bloom_fields,
+        caps,
+        cancellation,
+        require_indexed_merge,
+    )? {
+        InternalCoreMergeAttempt::Complete(result) => Ok(result),
+        InternalCoreMergeAttempt::NeedsRebuild { sources, plan } => {
+            rebuild_over_sources(inputs, &sources, &plan)
+        }
+    }
 }
 
 /// The full-rebuild merge: k-way row merge + terms re-derived from `_source`
@@ -1907,6 +2058,48 @@ pub fn merge_core_files_rebuild_with_cancellation(
         BatchCaps::default(),
         Some(cancellation.clone()),
     )
+}
+/// Run a known full rebuild after the caller has acquired memory admission.
+/// Admission stays outside the blocking rebuild controller so a
+/// memory-ineligible rebuild never enters execution.
+pub fn merge_core_files_rebuild_admitted_with_cancellation(
+    stream_type: StreamType,
+    inputs: &[MergeInput],
+    latest_schema: &Schema,
+    fts_fields: &[String],
+    bloom_fields: &[String],
+    cancellation: &VixMergeCancellation,
+    permit: VixRebuildPermit,
+) -> Result<MergedCoreFile, anyhow::Error> {
+    let _permit = permit;
+    let sources = open_merge_sources(inputs, Some(cancellation))?;
+    let mut plan = build_merge_plan(
+        stream_type,
+        &sources,
+        latest_schema,
+        fts_fields,
+        bloom_fields,
+        BatchCaps::default(),
+    );
+    plan.cancellation = Some(cancellation.clone());
+    plan.check_cancel("post-plan")?;
+    rebuild_over_sources_admitted(inputs, &sources, &plan)
+}
+
+/// Resume an automatic/deferred merge after its indexed phase has yielded.
+/// Indexed rebuilds require an owned memory permit; index-deferred execution
+/// has no term-map footprint and therefore requires none.
+pub fn execute_prepared_core_rebuild(
+    prepared: PreparedCoreRebuild,
+    permit: Option<VixRebuildPermit>,
+) -> Result<MergedCoreFile, anyhow::Error> {
+    if prepared.requires_memory_admission && permit.is_none() {
+        return Err(anyhow::anyhow!(
+            "prepared indexed rebuild resumed without rebuild-memory admission"
+        ));
+    }
+    let _permit = permit;
+    rebuild_over_sources_admitted(&prepared.inputs, &prepared.sources, &prepared.plan)
 }
 
 /// [`merge_core_files_rebuild`] with explicit batch caps.
@@ -2021,29 +2214,52 @@ pub fn rebuild_core_file_sidecar(
     fts_fields: &[String],
     bloom_fields: &[String],
 ) -> Result<SidecarHealOutcome, anyhow::Error> {
-    rebuild_core_file_sidecar_with_caps(
+    rebuild_core_file_sidecar_with_caps_and_cancellation(
         stream_type,
         input,
         latest_schema,
         fts_fields,
         bloom_fields,
         BatchCaps::default(),
+        None,
     )
 }
 
-/// [`rebuild_core_file_sidecar`] with explicit batch caps (test seam).
-fn rebuild_core_file_sidecar_with_caps(
+/// Production sidecar build after rebuild-memory admission.
+pub fn rebuild_core_file_sidecar_admitted_with_cancellation(
+    stream_type: StreamType,
+    input: &MergeInput,
+    latest_schema: &Schema,
+    fts_fields: &[String],
+    bloom_fields: &[String],
+    cancellation: &VixMergeCancellation,
+    permit: VixRebuildPermit,
+) -> Result<SidecarHealOutcome, anyhow::Error> {
+    let _permit = permit;
+    rebuild_core_file_sidecar_with_caps_and_cancellation(
+        stream_type,
+        input,
+        latest_schema,
+        fts_fields,
+        bloom_fields,
+        BatchCaps::default(),
+        Some(cancellation.clone()),
+    )
+}
+
+fn rebuild_core_file_sidecar_with_caps_and_cancellation(
     stream_type: StreamType,
     input: &MergeInput,
     latest_schema: &Schema,
     fts_fields: &[String],
     bloom_fields: &[String],
     caps: BatchCaps,
+    cancellation: Option<VixMergeCancellation>,
 ) -> Result<SidecarHealOutcome, anyhow::Error> {
     let started = std::time::Instant::now();
     let inputs = std::slice::from_ref(input);
-    let sources = open_merge_sources(inputs, None)?;
-    let plan = build_merge_plan(
+    let sources = open_merge_sources(inputs, cancellation.as_ref())?;
+    let mut plan = build_merge_plan(
         stream_type,
         &sources,
         latest_schema,
@@ -2051,6 +2267,8 @@ fn rebuild_core_file_sidecar_with_caps(
         bloom_fields,
         caps,
     );
+    plan.cancellation = cancellation;
+    plan.check_cancel("sidecar post-plan")?;
 
     // Index-off plan: the heal direction is "drop the sidecar" — pure
     // metadata, nothing to scan.
@@ -4931,10 +5149,17 @@ fn rebuild_over_sources(
     sources: &[MergeSource],
     plan: &MergePlan,
 ) -> Result<MergedCoreFile, anyhow::Error> {
-    // M12 admission: rebuilds (direct AND fast-path fallbacks land here)
-    // are the memory-heavy merge shape — cap how many run at once
-    // process-wide. Fast-path merges never pass through this function.
+    // Compatibility entry points acquire internally. Production compaction
+    // uses the admitted APIs so this wait occurs before rebuild execution.
     let _rebuild_permit = REBUILD_GATE.acquire_with_cancellation(plan.cancellation.as_ref())?;
+    rebuild_over_sources_admitted(inputs, sources, plan)
+}
+
+fn rebuild_over_sources_admitted(
+    inputs: &[MergeInput],
+    sources: &[MergeSource],
+    plan: &MergePlan,
+) -> Result<MergedCoreFile, anyhow::Error> {
     let timestamps = read_timestamp_columns(inputs, sources, plan.cancellation.as_ref())?;
     let dropped_rows = count_degenerate_ts_rows(&timestamps);
     let timestamps: Vec<Int64Array> = if dropped_rows == 0 {
@@ -12225,6 +12450,140 @@ mod tests {
         )
         .unwrap();
         assert!(!result.used_index_merge);
+    }
+
+    #[test]
+    fn prepared_rebuild_enforces_admission_strictness_and_cancellation() {
+        let schema_fields = || {
+            vec![
+                Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+                Field::new("svc", DataType::Utf8, true),
+            ]
+        };
+        let file1 = build_core_file(
+            schema_fields(),
+            vec![
+                Arc::new(Int64Array::from(vec![100, 90])),
+                Arc::new(StringArray::from(vec!["api gateway", "db"])),
+            ],
+            &["svc".to_string()],
+            None,
+        );
+        let file2 = build_core_file(
+            schema_fields(),
+            vec![
+                Arc::new(Int64Array::from(vec![80, 70])),
+                Arc::new(StringArray::from(vec!["api gateway", "web"])),
+            ],
+            &[],
+            None,
+        );
+        let pairs = vec![("f1.vix".to_string(), file1), ("f2.vix".to_string(), file2)];
+        let latest_schema = Arc::new(Schema::new(schema_fields()));
+
+        let prepare =
+            |cancellation: VixMergeCancellation| match try_merge_core_files_with_cancellation(
+                StreamType::Logs,
+                as_inputs(&pairs),
+                Arc::clone(&latest_schema),
+                Vec::new(),
+                Vec::new(),
+                cancellation,
+                CoreMergeMode::Automatic,
+            )
+            .unwrap()
+            {
+                CoreMergeAttempt::NeedsRebuild(prepared) => prepared,
+                CoreMergeAttempt::Complete(_) => {
+                    panic!("the capability conflict must return a prepared rebuild")
+                }
+            };
+
+        let cancellation = VixMergeCancellation::new();
+        let prepared = prepare(cancellation);
+        assert!(prepared.requires_memory_admission());
+        let error = execute_prepared_core_rebuild(prepared, None)
+            .expect_err("an indexed rebuild requires memory admission");
+        assert!(format!("{error:#}").contains("without rebuild-memory admission"));
+
+        let strict = try_merge_core_files_with_cancellation(
+            StreamType::Logs,
+            as_inputs(&pairs),
+            Arc::clone(&latest_schema),
+            Vec::new(),
+            Vec::new(),
+            VixMergeCancellation::new(),
+            CoreMergeMode::IndexedOnly,
+        );
+        let error = match strict {
+            Ok(_) => panic!("the strict path must reject the rebuild fallback"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:#}").contains(
+                "required indexed merge is not applicable; refusing a large full rebuild"
+            )
+        );
+
+        let cancellation = VixMergeCancellation::new();
+        let prepared = prepare(cancellation.clone());
+        let permit = acquire_vix_rebuild_permit_with_cancellation(&cancellation).unwrap();
+        cancellation.cancel();
+        let error = execute_prepared_core_rebuild(prepared, Some(permit))
+            .expect_err("a prepared rebuild must retain cooperative cancellation");
+        assert!(format!("{error:#}").contains("cancelled"));
+
+        let cancellation = VixMergeCancellation::new();
+        let prepared = prepare(cancellation.clone());
+        let permit = acquire_vix_rebuild_permit_with_cancellation(&cancellation).unwrap();
+        let resumed = execute_prepared_core_rebuild(prepared, Some(permit)).unwrap();
+        let reference = merge_core_files_rebuild(
+            StreamType::Logs,
+            &as_inputs(&pairs),
+            latest_schema.as_ref(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert_core_files_equivalent(
+            &open_merged(&resumed),
+            &open_merged(&reference),
+            "prepared rebuild",
+        );
+    }
+
+    #[test]
+    fn prepared_index_deferred_merge_needs_no_rebuild_memory() {
+        let fields = vec![
+            Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+            Field::new("svc", DataType::Utf8, true),
+        ];
+        let pair = build_poisoned_core_file(
+            fields.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![100, 0])),
+                Arc::new(StringArray::from(vec!["api", "db"])),
+            ],
+            &[],
+        );
+        let inputs = vec![("deferred-poison.vix".to_string(), pair)];
+        let attempt = try_merge_core_files_with_cancellation(
+            StreamType::Logs,
+            as_inputs(&inputs),
+            Arc::new(Schema::new(fields)),
+            Vec::new(),
+            Vec::new(),
+            VixMergeCancellation::new(),
+            CoreMergeMode::IndexDeferred,
+        )
+        .unwrap();
+        let CoreMergeAttempt::NeedsRebuild(prepared) = attempt else {
+            panic!("a deferred merge that must cleanse rows must resume through the copy rebuild");
+        };
+        assert!(!prepared.requires_memory_admission());
+        let output = execute_prepared_core_rebuild(prepared, None).unwrap();
+        assert!(output.index.is_none());
+        assert_eq!(output.stats.index_size, 0);
     }
 
     /// Manual timing harness over REAL core files (compaction-shaped data).

@@ -112,50 +112,28 @@ async fn send_merge_batch(
     }
 }
 
-fn vix_cpu_capacity() -> usize {
-    let machine = std::thread::available_parallelism().map_or(1, |n| n.get());
-    std::cmp::max(1, machine / config::cluster::cpu_role_divisor())
-}
-
-fn vix_threads_per_merge() -> usize {
-    let capacity = vix_cpu_capacity();
-    match get_config().common.vix_merge_thread_num {
-        0 => capacity.min(8),
-        configured => configured.clamp(1, capacity),
-    }
-}
-
-static VIX_CPU_GATE: std::sync::LazyLock<Arc<Semaphore>> =
-    std::sync::LazyLock::new(|| Arc::new(Semaphore::new(vix_cpu_capacity())));
-
-async fn acquire_vix_cpu(
+/// Acquire rebuild-memory admission on Tokio's blocking pool. The gate uses
+/// a cancellation-aware condvar wait; the async controller remains available
+/// for lease loss and shutdown.
+async fn acquire_vix_rebuild_memory(
     cancel: &MergeCancellation,
     context: &str,
-) -> Result<tokio::sync::OwnedSemaphorePermit, anyhow::Error> {
-    let permits = vix_threads_per_merge() as u32;
-    let started = std::time::Instant::now();
-    loop {
-        cancel.check(context)?;
-        tokio::select! {
-            permit = VIX_CPU_GATE.clone().acquire_many_owned(permits) => {
-                let permit = permit.map_err(|_| anyhow::anyhow!(
-                    "VIX CPU admission closed while waiting for {permits} permit(s) at {context}"
-                ))?;
-                let waited = started.elapsed();
-                if waited >= std::time::Duration::from_millis(100) {
-                    log::info!(
-                        "[COMPACTOR] VIX CPU admission waited {} ms for {permits}/{} permit(s) at {context}",
-                        waited.as_millis(),
-                        vix_cpu_capacity(),
-                    );
-                }
-                return Ok(permit);
-            }
-            _ = wait_for_merge_cancellation(cancel) => {
-                cancel.check(context)?;
-            }
+) -> Result<crate::service::vix::core_writer::VixRebuildPermit, anyhow::Error> {
+    cancel.check(context)?;
+    let cancellation = cancel.vix_token();
+    let mut task = tokio::task::spawn_blocking(move || {
+        crate::service::vix::core_writer::acquire_vix_rebuild_permit_with_cancellation(
+            &cancellation,
+        )
+    });
+    let result = tokio::select! {
+        result = &mut task => result,
+        _ = wait_for_merge_cancellation(cancel) => {
+            cancel.cancel();
+            task.await
         }
-    }
+    };
+    result?
 }
 
 /// Generate merging job by stream
@@ -1920,46 +1898,50 @@ async fn merge_core_group(
     // silently multiplying rebuild memory.
     let require_indexed_merge = !force_rebuild && exceeds_global_rebuild_limit;
 
-    let cpu_permit = acquire_vix_cpu(cancel, "core merge CPU admission").await?;
+    // Known rebuilds acquire memory before their blocking controller starts.
+    // Automatic merges that discover a rebuild acquire memory before starting
+    // the fallback controller below.
+    let force_rebuild_permit = if force_rebuild {
+        Some(acquire_vix_rebuild_memory(cancel, "forced rebuild memory admission").await?)
+    } else {
+        None
+    };
     let merge_started = std::time::Instant::now();
-    cancel.check("core merge CPU phase")?;
+    cancel.check("core merge controller phase")?;
     let vix_cancellation = cancel.vix_token();
     let mut merge_task = tokio::task::spawn_blocking(move || {
+        use crate::service::vix::core_writer::{CoreMergeAttempt, CoreMergeMode};
+
         if force_rebuild {
-            crate::service::vix::core_writer::merge_core_files_rebuild_with_cancellation(
+            let permit = force_rebuild_permit.ok_or_else(|| {
+                anyhow::anyhow!("forced core rebuild started without memory admission")
+            })?;
+            crate::service::vix::core_writer::merge_core_files_rebuild_admitted_with_cancellation(
                 stream_type,
                 &inputs,
                 &latest_schema,
                 &full_text_search_fields,
                 &bloom_filter_fields,
                 &vix_cancellation,
+                permit,
             )
-        } else if index_deferred {
-            crate::service::vix::core_writer::merge_core_files_index_deferred_with_cancellation(
-                stream_type,
-                &inputs,
-                &latest_schema,
-                &full_text_search_fields,
-                &bloom_filter_fields,
-                &vix_cancellation,
-            )
-        } else if require_indexed_merge {
-            crate::service::vix::core_writer::merge_core_files_indexed_only_with_cancellation(
-                stream_type,
-                &inputs,
-                &latest_schema,
-                &full_text_search_fields,
-                &bloom_filter_fields,
-                &vix_cancellation,
-            )
+            .map(CoreMergeAttempt::Complete)
         } else {
-            crate::service::vix::core_writer::merge_core_files_with_cancellation(
+            let mode = if index_deferred {
+                CoreMergeMode::IndexDeferred
+            } else if require_indexed_merge {
+                CoreMergeMode::IndexedOnly
+            } else {
+                CoreMergeMode::Automatic
+            };
+            crate::service::vix::core_writer::try_merge_core_files_with_cancellation(
                 stream_type,
-                &inputs,
-                &latest_schema,
-                &full_text_search_fields,
-                &bloom_filter_fields,
-                &vix_cancellation,
+                inputs,
+                latest_schema,
+                full_text_search_fields,
+                bloom_filter_fields,
+                vix_cancellation,
+                mode,
             )
         }
     });
@@ -1973,7 +1955,36 @@ async fn merge_core_group(
             merge_task.await
         }
     };
-    let result = match merge_join? {
+    let first_attempt = merge_join?;
+
+    let merge_result = match first_attempt {
+        Ok(crate::service::vix::core_writer::CoreMergeAttempt::Complete(result)) => Ok(result),
+        Ok(crate::service::vix::core_writer::CoreMergeAttempt::NeedsRebuild(prepared)) => {
+            let rebuild_permit = if prepared.requires_memory_admission() {
+                Some(acquire_vix_rebuild_memory(cancel, "fallback rebuild memory admission").await?)
+            } else {
+                None
+            };
+            cancel.check("fallback rebuild controller phase")?;
+            let mut rebuild_task = tokio::task::spawn_blocking(move || {
+                crate::service::vix::core_writer::execute_prepared_core_rebuild(
+                    prepared,
+                    rebuild_permit,
+                )
+            });
+            let rebuild_join = tokio::select! {
+                result = &mut rebuild_task => result,
+                _ = wait_for_merge_cancellation(cancel) => {
+                    cancel.cancel();
+                    rebuild_task.await
+                }
+            };
+            rebuild_join?
+        }
+        Err(error) => Err(error),
+    };
+
+    let result = match merge_result {
         Ok(result) => result,
         Err(e) => {
             // M19: a mid-merge range fetch hitting an externally deleted
@@ -1997,7 +2008,6 @@ async fn merge_core_group(
             return Err(e);
         }
     };
-    drop(cpu_permit);
     let merge_shape = if result.used_index_merge {
         "index_merge"
     } else if result.docs_passthrough_inputs > 0 {
@@ -2212,7 +2222,9 @@ async fn sidecar_only_heal(
     cancel: &MergeCancellation,
     start: std::time::Instant,
 ) -> Result<bool, anyhow::Error> {
-    use crate::service::vix::core_writer::{SidecarHealOutcome, rebuild_core_file_sidecar};
+    use crate::service::vix::core_writer::{
+        SidecarHealOutcome, rebuild_core_file_sidecar_admitted_with_cancellation,
+    };
 
     cancel.check("sidecar heal planning")?;
 
@@ -2237,14 +2249,18 @@ async fn sidecar_only_heal(
                 }) as Arc<dyn vortex_index::VixRangeSource>
             });
     let input = (file.key.clone(), source, index_source);
-    let cpu_permit = acquire_vix_cpu(cancel, "sidecar heal CPU admission").await?;
+    let rebuild_permit =
+        acquire_vix_rebuild_memory(cancel, "sidecar rebuild memory admission").await?;
+    let vix_cancellation = cancel.vix_token();
     let mut heal_task = tokio::task::spawn_blocking(move || {
-        rebuild_core_file_sidecar(
+        rebuild_core_file_sidecar_admitted_with_cancellation(
             stream_type,
             &input,
             &latest_schema,
             &full_text_search_fields,
             &bloom_filter_fields,
+            &vix_cancellation,
+            rebuild_permit,
         )
     });
     let heal_join = tokio::select! {
@@ -2255,7 +2271,6 @@ async fn sidecar_only_heal(
         }
     };
     let outcome = heal_join??;
-    drop(cpu_permit);
     cancel.check("sidecar heal upload")?;
 
     let sidecar_key = config::vix_sidecar_key(&file.key)

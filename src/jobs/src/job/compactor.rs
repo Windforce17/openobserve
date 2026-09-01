@@ -73,7 +73,8 @@ pub async fn run() -> Result<(), anyhow::Error> {
             log::error!("[COMPACTOR::JOB] start merge worker error: {e}");
         }
 
-        // Scheduler slots (concurrent jobs) are decoupled from merge workers.
+        // Physical scheduler slots (concurrent jobs) are decoupled from merge
+        // workers. Logical lanes share these slots through LaneAdmission.
         let job_num = if cfg.compact.job_num > 0 {
             cfg.compact.job_num
         } else {
@@ -83,12 +84,12 @@ pub async fn run() -> Result<(), anyhow::Error> {
         if let Err(e) = scheduler.run() {
             log::error!("[COMPACTOR::JOB] start merge job scheduler error: {e}");
         }
-        let main_handle = scheduler.handle();
+        let main_physical = scheduler.physical_handle();
 
-        // One fixed-capacity worker pool serves two disjoint priorities. The
-        // split never adds workers or scheduler slots: hot jobs keep one half,
-        // while closed recent hours get FIFO progress with the other half.
-        let (live_handle, recent_handle) = if cfg.compact.live_job_num > 0 {
+        // Hot and recent keep their existing MergeWorker transport and
+        // physical scheduler pools. Admission may borrow an idle physical
+        // slot, in which case that slot's transport executes the job.
+        let (live_physical, recent_physical) = if cfg.compact.live_job_num > 0 {
             let (hot_job_num, recent_job_num) = live_lane_job_split(
                 cfg.compact.live_job_num,
                 cfg.compact.live_lookback_hours,
@@ -114,22 +115,37 @@ pub async fn run() -> Result<(), anyhow::Error> {
             if let Err(e) = live_scheduler.run() {
                 log::error!("[COMPACTOR::JOB] start live merge job scheduler error: {e}");
             }
-            let live_handle = Some(live_scheduler.handle());
 
-            let recent_handle = if recent_job_num > 0 {
+            let recent_physical = if recent_job_num > 0 {
                 let mut recent_scheduler =
                     compact::worker::JobScheduler::new(recent_job_num, worker_tx);
                 if let Err(e) = recent_scheduler.run() {
                     log::error!("[COMPACTOR::JOB] start recent merge job scheduler error: {e}");
                 }
-                Some(recent_scheduler.handle())
+                Some(recent_scheduler.physical_handle())
             } else {
                 None
             };
-            (live_handle, recent_handle)
+            (Some(live_scheduler.physical_handle()), recent_physical)
         } else {
             (None, None)
         };
+        let has_live = live_physical.is_some();
+        let has_recent = recent_physical.is_some();
+
+        let mut pools = vec![(compact::worker::MergeAdmissionLane::Backlog, main_physical)];
+        if let Some(handle) = live_physical {
+            pools.push((compact::worker::MergeAdmissionLane::Hot, handle));
+        }
+        if let Some(handle) = recent_physical {
+            pools.push((compact::worker::MergeAdmissionLane::Recent, handle));
+        }
+        let admission = compact::worker::LaneAdmission::new(pools);
+        let main_handle = admission.handle(compact::worker::MergeAdmissionLane::Backlog);
+        let live_handle =
+            has_live.then(|| admission.handle(compact::worker::MergeAdmissionLane::Hot));
+        let recent_handle =
+            has_recent.then(|| admission.handle(compact::worker::MergeAdmissionLane::Recent));
         (Some(main_handle), live_handle, recent_handle)
     } else {
         (None, None, None)
@@ -226,36 +242,107 @@ pub async fn run() -> Result<(), anyhow::Error> {
             let live_floor = live_handle
                 .as_ref()
                 .map(|_| compact::live_claim_floor(now, cfg.compact.live_lookback_hours));
-
-            if let (Some(live_handle), Some(floor)) = (live_handle.as_ref(), live_floor)
-                && let Err(e) =
-                    compact::run_merge(live_handle, compact::MergeLane::Live { from: floor }).await
-            {
-                log::error!("[COMPACTOR::JOB] run merge live error: {e}");
-            }
-
             let recent_floor = recent_handle.as_ref().and_then(|_| {
                 let floor = compact::live_claim_floor(now, cfg.compact.recent_lookback_hours);
                 let before = live_floor.unwrap_or(i64::MAX);
                 (floor < before).then_some((floor, before))
             });
-            if let (Some(recent_handle), Some((from, before))) =
-                (recent_handle.as_ref(), recent_floor)
-                && let Err(e) =
-                    compact::run_merge(recent_handle, compact::MergeLane::Recent { from, before })
-                        .await
-            {
-                log::error!("[COMPACTOR::JOB] run merge recent error: {e}");
-            }
-
             let backlog_floor = recent_floor.map(|(from, _)| from).or(live_floor);
-            let result = if let Some(before) = backlog_floor {
-                compact::run_merge(&main_handle, compact::MergeLane::Backlog { before }).await
-            } else {
-                compact::run_merge(&main_handle, compact::MergeLane::All).await
-            };
-            if let Err(e) = result {
-                log::error!("[COMPACTOR::JOB] run merge backlog error: {e}");
+
+            // Restore every active lane's entitlement, then refill released
+            // slots while the database still proves pending work. The absolute
+            // cycle deadline cannot be postponed by frequent backlog releases:
+            // the pausable outer loop regularly reactivates newly non-empty
+            // hot/recent lanes and refreshes their time boundaries.
+            main_handle.begin_cycle();
+            let cycle_deadline = tokio::time::Instant::now()
+                + std::time::Duration::from_secs(cfg.compact.interval.max(1));
+            let mut idle_rounds = 0usize;
+            loop {
+                if tokio::time::Instant::now() >= cycle_deadline {
+                    break;
+                }
+                let mut made_progress = false;
+                let mut failed = false;
+                if let (Some(live_handle), Some(floor)) = (live_handle.as_ref(), live_floor) {
+                    match compact::run_merge(live_handle, compact::MergeLane::Live { from: floor })
+                        .await
+                    {
+                        Ok(claimed) => {
+                            if claimed > 0 {
+                                made_progress = true;
+                            }
+                        }
+                        Err(e) => {
+                            failed = true;
+                            log::error!("[COMPACTOR::JOB] run merge live error: {e}");
+                        }
+                    }
+                }
+                if let (Some(recent_handle), Some((from, before))) =
+                    (recent_handle.as_ref(), recent_floor)
+                {
+                    match compact::run_merge(
+                        recent_handle,
+                        compact::MergeLane::Recent { from, before },
+                    )
+                    .await
+                    {
+                        Ok(claimed) => {
+                            if claimed > 0 {
+                                made_progress = true;
+                            }
+                        }
+                        Err(e) => {
+                            failed = true;
+                            log::error!("[COMPACTOR::JOB] run merge recent error: {e}");
+                        }
+                    }
+                }
+
+                let result = if let Some(before) = backlog_floor {
+                    compact::run_merge(&main_handle, compact::MergeLane::Backlog { before }).await
+                } else {
+                    compact::run_merge(&main_handle, compact::MergeLane::All).await
+                };
+                match result {
+                    Ok(claimed) => {
+                        if claimed > 0 {
+                            made_progress = true;
+                        }
+                    }
+                    Err(e) => {
+                        failed = true;
+                        log::error!("[COMPACTOR::JOB] run merge backlog error: {e}");
+                    }
+                }
+
+                if failed || !main_handle.has_active_lanes() {
+                    break;
+                }
+                if main_handle.free_slots() == 0 {
+                    if tokio::time::timeout_at(cycle_deadline, main_handle.wait_for_release())
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    idle_rounds = 0;
+                    continue;
+                }
+                if made_progress {
+                    idle_rounds = 0;
+                } else {
+                    idle_rounds += 1;
+                    if idle_rounds >= 3 {
+                        log::warn!(
+                            "[COMPACTOR::JOB] merge lane admission made no progress with free \
+                             capacity; ending this claim cycle"
+                        );
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
             }
         });
     }

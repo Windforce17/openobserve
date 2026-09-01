@@ -845,9 +845,9 @@ enum DocsEncodeMsg {
 /// The channel is small on purpose: a slow encode backpressures the pushers
 /// (the merge decode threads / the move job), keeping the pipeline bounded
 /// end to end. Encode parallelism inside the worker mirrors
-/// [`write_vortex_blob`] (`encode_threads` > 1 runs chunk compression on a
-/// dedicated pool). Dropping the encoder without [`Self::signal_finish`]
-/// aborts the worker on its next receive.
+/// [`write_vortex_blob`] (`encode_threads` > 1 submits chunk compression to
+/// the bounded process-wide CPU executor). Dropping the encoder without
+/// [`Self::signal_finish`] aborts the worker on its next receive.
 pub(crate) struct DocsBlobEncoder {
     tx: Option<std::sync::mpsc::SyncSender<DocsEncodeMsg>>,
     handle: Option<std::thread::JoinHandle<Result<(ContainerSink, u64)>>>,
@@ -958,8 +958,8 @@ impl DocsBlobEncoder {
     }
 }
 
-/// The worker body: encode received batches into a `MAGIC`-prefixed buffer,
-/// mirroring [`write_vortex_blob`]'s runtime/pool shape.
+/// The worker body: encode received batches into a `MAGIC`-prefixed buffer.
+/// Parallel writers share the process CPU executor.
 fn run_docs_encoder(
     schema: &Schema,
     rows_per_chunk: usize,
@@ -1011,18 +1011,9 @@ fn run_docs_encoder(
         }
     };
     let result = if encode_threads > 1 {
-        let pool = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(encode_threads)
-            .thread_name("vix-encode")
-            .build()
-            .map_err(|e| VixError::Writer(format!("encode thread pool: {e}")))?;
-        let pool_runtime = TokioRuntime::new(pool.handle().clone());
-        let session = VortexSession::default().with_handle(pool_runtime.handle());
-        let result = run(&mut sink, session);
-        // Non-blocking shutdown: safe on any thread. All encode tasks
-        // completed before the writer's `finish` returned.
-        pool.shutdown_background();
-        result
+        let session = VortexSession::default()
+            .with_handle(crate::cpu_executor::shared_vortex_execution_handle()?);
+        run(&mut sink, session)
     } else {
         let session = VortexSession::default().with_handle(runtime.handle());
         run(&mut sink, session)
@@ -1650,11 +1641,11 @@ pub(crate) fn addressable_strategy() -> Arc<dyn LayoutStrategy> {
 /// Write `batches` (all matching `schema`; empty ones are skipped) as an
 /// in-memory Vortex file, one pushed chunk per batch.
 ///
-/// `encode_threads > 1` runs the chunk encoding/compression pipeline on a
-/// dedicated multi-thread pool (vortex's layout writers spawn one CPU task
-/// per chunk onto the session handle); `0`/`1` keeps everything on the
-/// calling thread. The caller thread only pumps chunks and collects buffers
-/// either way, so the produced bytes are identical.
+/// `encode_threads > 1` runs chunk encoding/compression on the process-wide
+/// VIX CPU executor (Vortex's layout writers spawn one CPU task per chunk
+/// onto the session handle); `0`/`1` keeps everything on the calling thread.
+/// The caller thread only pumps chunks and collects buffers either way, so
+/// the produced bytes are identical.
 pub(crate) fn write_vortex_blob(
     schema: &Schema,
     batches: &[RecordBatch],
@@ -1663,19 +1654,9 @@ pub(crate) fn write_vortex_blob(
 ) -> Result<Vec<u8>> {
     let runtime = SingleThreadRuntime::default();
     if encode_threads > 1 {
-        let pool = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(encode_threads)
-            .thread_name("vix-encode")
-            .build()
-            .map_err(|e| VixError::Writer(format!("encode thread pool: {e}")))?;
-        let pool_runtime = TokioRuntime::new(pool.handle().clone());
-        let session = VortexSession::default().with_handle(pool_runtime.handle());
-        let result = write_vortex_blob_inner(&runtime, session, schema, batches, strategy);
-        // Non-blocking shutdown: safe on any thread (including inside an
-        // async context, where dropping a runtime would panic). All encode
-        // tasks completed before `finish` returned.
-        pool.shutdown_background();
-        result
+        let session = VortexSession::default()
+            .with_handle(crate::cpu_executor::shared_vortex_execution_handle()?);
+        write_vortex_blob_inner(&runtime, session, schema, batches, strategy)
     } else {
         let session = VortexSession::default().with_handle(runtime.handle());
         write_vortex_blob_inner(&runtime, session, schema, batches, strategy)
