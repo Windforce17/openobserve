@@ -1417,23 +1417,38 @@ DO UPDATE SET
             .with_label_values(&["insert", "file_list_jobs"])
             .inc();
         match sqlx::query(
-            // A late add while a dump worker owns this DONE row must
-            // survive that dump. Mark it for requeue; otherwise
-            // resurrect an unowned DONE row immediately. Generation is
-            // never reset by either path.
+            // A trigger that collides with an owned merge or dump must survive
+            // that worker's snapshot. Unowned DONE rows are resurrected
+            // immediately. Neither conflict path changes the active lease.
             r#"INSERT INTO file_list_jobs
     (org, stream, offsets, status, node, started_at, updated_at)
 VALUES ($1, $2, $3, $4, '', 0, 0)
 ON CONFLICT (stream, offsets) DO UPDATE SET
-    status = CASE WHEN file_list_jobs.node = '' THEN $4 ELSE file_list_jobs.status END,
-    started_at = CASE WHEN file_list_jobs.node = '' THEN 0 ELSE file_list_jobs.started_at END,
-    pending_after_dump = CASE WHEN file_list_jobs.node = '' THEN false ELSE true END
-WHERE file_list_jobs.status = $5;"#,
+    status = CASE
+        WHEN file_list_jobs.status = $6 AND file_list_jobs.node = '' THEN $4
+        ELSE file_list_jobs.status
+    END,
+    started_at = CASE
+        WHEN file_list_jobs.status = $6 AND file_list_jobs.node = '' THEN 0
+        ELSE file_list_jobs.started_at
+    END,
+    pending_after_run = CASE
+        WHEN file_list_jobs.status = $5 THEN true
+        WHEN file_list_jobs.status = $6 AND file_list_jobs.node = '' THEN false
+        ELSE file_list_jobs.pending_after_run
+    END,
+    pending_after_dump = CASE
+        WHEN file_list_jobs.status = $6 AND file_list_jobs.node = '' THEN false
+        WHEN file_list_jobs.status = $6 THEN true
+        ELSE file_list_jobs.pending_after_dump
+    END
+WHERE file_list_jobs.status IN ($5, $6);"#,
         )
         .bind(org_id)
         .bind(&stream_key)
         .bind(offset)
         .bind(super::FileListJobStatus::Pending)
+        .bind(super::FileListJobStatus::Running)
         .bind(super::FileListJobStatus::Done)
         .execute(&mut *tx)
         .await
@@ -1472,7 +1487,8 @@ WHERE file_list_jobs.status = $5;"#,
             && super::FileListJobStatus::from(status) == super::FileListJobStatus::Done
             && let Err(e) = sqlx::query(
                 "UPDATE file_list_jobs SET status = $1, node = '', started_at = 0, \
-                 pending_after_dump = false WHERE status = $2 AND node = '' AND id = $3;",
+                 pending_after_run = false, pending_after_dump = false \
+                 WHERE status = $2 AND node = '' AND id = $3;",
             )
             .bind(super::FileListJobStatus::Pending)
             .bind(super::FileListJobStatus::Done)
@@ -1516,6 +1532,7 @@ SET status = $1,
     node = $2,
     started_at = $3,
     updated_at = $3,
+    pending_after_run = false,
     lease_generation = lease_generation + 1
 WHERE id IN (
     SELECT id
@@ -1564,6 +1581,7 @@ RETURNING id, stream, offsets, lease_generation;"#
 SET status = $1,
     node = '',
     updated_at = $4,
+    pending_after_run = false,
     pending_after_dump = false,
     lease_generation = lease_generation + 1
 WHERE ($2 <= 0 OR offsets >= $2)
@@ -1633,9 +1651,16 @@ WHERE id = $3 AND node = $4 AND lease_generation = $5 AND status = $6;"#,
             .inc();
         let ret = sqlx::query(
             r#"UPDATE file_list_jobs
-SET status = $1, updated_at = $2, dumped = $3, node = '', pending_after_dump = false
-WHERE id = $4 AND node = $5 AND lease_generation = $6 AND status = $7;"#,
+SET status = CASE WHEN pending_after_run THEN $1 ELSE $2 END,
+    started_at = CASE WHEN pending_after_run THEN 0 ELSE started_at END,
+    updated_at = $3,
+    dumped = CASE WHEN pending_after_run THEN false ELSE $4 END,
+    node = '',
+    pending_after_dump = CASE WHEN pending_after_run THEN pending_after_dump ELSE false END,
+    pending_after_run = false
+WHERE id = $5 AND node = $6 AND lease_generation = $7 AND status = $8;"#,
         )
+        .bind(super::FileListJobStatus::Pending)
         .bind(super::FileListJobStatus::Done)
         .bind(config::utils::time::now_micros())
         .bind(!cfg.compact.file_list_dump_enabled)
@@ -3047,6 +3072,7 @@ CREATE TABLE IF NOT EXISTS file_list_jobs
     updated_at BIGINT not null,
     dumped     BOOLEAN default false not null,
     lease_generation BIGINT default 0 not null,
+    pending_after_run BOOLEAN default false not null,
     pending_after_dump BOOLEAN default false not null
 );
         "#,
@@ -3104,10 +3130,114 @@ CREATE TABLE IF NOT EXISTS stream_stats
     .await?;
     add_column(
         "file_list_jobs",
+        "pending_after_run",
+        "BOOLEAN default false not null",
+    )
+    .await?;
+    add_column(
+        "file_list_jobs",
         "pending_after_dump",
         "BOOLEAN default false not null",
     )
     .await?;
+    // Mixed-version safety: old producers and workers do not know about the
+    // run latch. Keep both sides of the handoff in the database so an exact
+    // legacy upsert followed by legacy completion cannot strand work in DONE.
+    let mut trigger_tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(7106314119727825232);")
+        .execute(&mut *trigger_tx)
+        .await?;
+    sqlx::query(
+        r#"
+CREATE OR REPLACE FUNCTION file_list_jobs_pending_after_run_transition()
+RETURNS trigger AS $$
+BEGIN
+    IF OLD.status = 0 AND NEW.status = 1 AND OLD.pending_after_run THEN
+        NEW.pending_after_run := false;
+    ELSIF OLD.status = 1 AND NEW.status = 2 AND OLD.pending_after_run THEN
+        NEW.status := 0;
+        NEW.node := '';
+        NEW.started_at := 0;
+        NEW.dumped := false;
+        NEW.pending_after_run := false;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+"#,
+    )
+    .execute(&mut *trigger_tx)
+    .await?;
+    sqlx::query(
+        r#"
+CREATE OR REPLACE FUNCTION file_list_jobs_pending_after_run_insert()
+RETURNS trigger AS $$
+DECLARE
+    existing_status INT;
+BEGIN
+    IF NEW.status = 0
+       AND NEW.node = ''
+       AND NEW.started_at = 0
+       AND NEW.updated_at = 0
+       AND NEW.dumped = false
+       AND NEW.lease_generation = 0
+       AND NEW.pending_after_run = false
+       AND NEW.pending_after_dump = false THEN
+        SELECT status
+        INTO existing_status
+        FROM file_list_jobs
+        WHERE stream = NEW.stream
+          AND offsets = NEW.offsets
+        FOR UPDATE;
+        IF existing_status = 1 THEN
+            UPDATE file_list_jobs
+            SET pending_after_run = true
+            WHERE stream = NEW.stream
+              AND offsets = NEW.offsets
+              AND status = 1;
+            RETURN NULL;
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+"#,
+    )
+    .execute(&mut *trigger_tx)
+    .await?;
+    sqlx::query(
+        r#"
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_trigger
+        WHERE tgname = 'file_list_jobs_pending_after_run_transition'
+          AND tgrelid = 'file_list_jobs'::regclass
+    ) THEN
+        CREATE TRIGGER file_list_jobs_pending_after_run_transition
+        BEFORE UPDATE OF status ON file_list_jobs
+        FOR EACH ROW
+        EXECUTE FUNCTION file_list_jobs_pending_after_run_transition();
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_trigger
+        WHERE tgname = 'file_list_jobs_pending_after_run_insert'
+          AND tgrelid = 'file_list_jobs'::regclass
+    ) THEN
+        CREATE TRIGGER file_list_jobs_pending_after_run_insert
+        BEFORE INSERT ON file_list_jobs
+        FOR EACH ROW
+        EXECUTE FUNCTION file_list_jobs_pending_after_run_insert();
+    END IF;
+END
+$$;
+"#,
+    )
+    .execute(&mut *trigger_tx)
+    .await?;
+    trigger_tx.commit().await?;
     add_column("stream_stats", "index_size", "BIGINT default 0 not null").await?;
     add_column(
         "stream_stats",
@@ -3659,6 +3789,7 @@ mod tests {
                 updated_at BIGINT not null,
                 dumped BOOLEAN default false not null,
                 lease_generation BIGINT default 0 not null,
+                pending_after_run BOOLEAN default false not null,
                 pending_after_dump BOOLEAN default false not null
             )
             "#,
@@ -3673,10 +3804,108 @@ mod tests {
         .await?;
 
         sqlx::query(
+            "ALTER TABLE file_list_jobs ADD COLUMN IF NOT EXISTS pending_after_run BOOLEAN NOT NULL DEFAULT false;",
+        )
+        .execute(pool)
+        .await?;
+        sqlx::query(
             "ALTER TABLE file_list_jobs ADD COLUMN IF NOT EXISTS pending_after_dump BOOLEAN NOT NULL DEFAULT false;",
         )
         .execute(pool)
         .await?;
+        let mut trigger_tx = pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(7106314119727825232);")
+            .execute(&mut *trigger_tx)
+            .await?;
+        sqlx::query(
+            r#"
+            CREATE OR REPLACE FUNCTION file_list_jobs_pending_after_run_transition()
+            RETURNS trigger AS $$
+            BEGIN
+                IF OLD.status = 0 AND NEW.status = 1 AND OLD.pending_after_run THEN
+                    NEW.pending_after_run := false;
+                ELSIF OLD.status = 1 AND NEW.status = 2 AND OLD.pending_after_run THEN
+                    NEW.status := 0;
+                    NEW.node := '';
+                    NEW.started_at := 0;
+                    NEW.dumped := false;
+                    NEW.pending_after_run := false;
+                END IF;
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql;
+            "#,
+        )
+        .execute(&mut *trigger_tx)
+        .await?;
+        sqlx::query(
+            r#"
+            CREATE OR REPLACE FUNCTION file_list_jobs_pending_after_run_insert()
+            RETURNS trigger AS $$
+            DECLARE
+                existing_status INT;
+            BEGIN
+                IF NEW.status = 0
+                   AND NEW.node = ''
+                   AND NEW.started_at = 0
+                   AND NEW.updated_at = 0
+                   AND NEW.dumped = false
+                   AND NEW.lease_generation = 0
+                   AND NEW.pending_after_run = false
+                   AND NEW.pending_after_dump = false THEN
+                    SELECT status
+                    INTO existing_status
+                    FROM file_list_jobs
+                    WHERE stream = NEW.stream
+                      AND offsets = NEW.offsets
+                    FOR UPDATE;
+                    IF existing_status = 1 THEN
+                        UPDATE file_list_jobs
+                        SET pending_after_run = true
+                        WHERE stream = NEW.stream
+                          AND offsets = NEW.offsets
+                          AND status = 1;
+                        RETURN NULL;
+                    END IF;
+                END IF;
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql;
+            "#,
+        )
+        .execute(&mut *trigger_tx)
+        .await?;
+        sqlx::query(
+            r#"
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_trigger
+                    WHERE tgname = 'file_list_jobs_pending_after_run_transition'
+                      AND tgrelid = 'file_list_jobs'::regclass
+                ) THEN
+                    CREATE TRIGGER file_list_jobs_pending_after_run_transition
+                    BEFORE UPDATE OF status ON file_list_jobs
+                    FOR EACH ROW
+                    EXECUTE FUNCTION file_list_jobs_pending_after_run_transition();
+                END IF;
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_trigger
+                    WHERE tgname = 'file_list_jobs_pending_after_run_insert'
+                      AND tgrelid = 'file_list_jobs'::regclass
+                ) THEN
+                    CREATE TRIGGER file_list_jobs_pending_after_run_insert
+                    BEFORE INSERT ON file_list_jobs
+                    FOR EACH ROW
+                    EXECUTE FUNCTION file_list_jobs_pending_after_run_insert();
+                END IF;
+            END
+            $$;
+            "#,
+        )
+        .execute(&mut *trigger_tx)
+        .await?;
+        trigger_tx.commit().await?;
 
         sqlx::query(
             "CREATE UNIQUE INDEX IF NOT EXISTS file_list_jobs_stream_offsets_idx ON file_list_jobs (stream, offsets);",
@@ -4011,8 +4240,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(same_id, dump.id);
-        let (status, node, marker): (i32, String, bool) = sqlx::query_as(
-            "SELECT status, node, pending_after_dump FROM file_list_jobs WHERE id = $1;",
+        let (status, node, run_marker, dump_marker): (i32, String, bool, bool) = sqlx::query_as(
+            "SELECT status, node, pending_after_run, pending_after_dump \
+                 FROM file_list_jobs WHERE id = $1;",
         )
         .bind(dump.id)
         .fetch_one(&pool)
@@ -4020,24 +4250,28 @@ mod tests {
         .unwrap();
         assert_eq!(status, FileListJobStatus::Done as i32);
         assert_eq!(node, "dump-node");
-        assert!(marker);
+        assert!(!run_marker);
+        assert!(dump_marker);
 
         assert!(
             list.set_job_dumped_status_owned(dump.id, "dump-node", dump.lease_generation, false)
                 .await
                 .unwrap()
         );
-        let (status, node, dumped, marker): (i32, String, bool, bool) = sqlx::query_as(
-            "SELECT status, node, dumped, pending_after_dump FROM file_list_jobs WHERE id = $1;",
-        )
-        .bind(dump.id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let (status, node, dumped, run_marker, dump_marker): (i32, String, bool, bool, bool) =
+            sqlx::query_as(
+                "SELECT status, node, dumped, pending_after_run, pending_after_dump \
+             FROM file_list_jobs WHERE id = $1;",
+            )
+            .bind(dump.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(status, FileListJobStatus::Done as i32);
         assert!(node.is_empty());
         assert!(!dumped);
-        assert!(marker);
+        assert!(!run_marker);
+        assert!(dump_marker);
 
         let retry = list
             .get_pending_dump_jobs("dump-node", 1)
@@ -4052,17 +4286,395 @@ mod tests {
                 .await
                 .unwrap()
         );
-        let (status, node, dumped, marker): (i32, String, bool, bool) = sqlx::query_as(
-            "SELECT status, node, dumped, pending_after_dump FROM file_list_jobs WHERE id = $1;",
-        )
-        .bind(dump.id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let (status, node, dumped, run_marker, dump_marker): (i32, String, bool, bool, bool) =
+            sqlx::query_as(
+                "SELECT status, node, dumped, pending_after_run, pending_after_dump \
+             FROM file_list_jobs WHERE id = $1;",
+            )
+            .bind(dump.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(status, FileListJobStatus::Pending as i32);
         assert!(node.is_empty());
         assert!(!dumped);
-        assert!(!marker);
+        assert!(!run_marker);
+        assert!(!dump_marker);
+        cleanup_test_data(&pool).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires test PostgreSQL database setup"]
+    async fn pg_running_retrigger_is_durable_fenced_and_retry_safe() {
+        let pool = setup_test_db().await;
+        cleanup_test_data(&pool).await;
+        let list = PostgresFileList::new();
+        let offset = 1_910_000_000_000_000_i64;
+
+        let id = list
+            .add_job(
+                "retrigger_org",
+                StreamType::Logs,
+                "running_retrigger",
+                offset,
+            )
+            .await
+            .unwrap();
+        let first = list
+            .get_pending_jobs(
+                "merge-node",
+                1,
+                FileListJobOrder::EnqueueOldest,
+                Some(offset),
+                Some(offset + 1),
+            )
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(first.id, id);
+
+        assert_eq!(
+            list.add_job(
+                "retrigger_org",
+                StreamType::Logs,
+                "running_retrigger",
+                offset
+            )
+            .await
+            .unwrap(),
+            id
+        );
+        let latched: (i32, String, i64, bool, bool) = sqlx::query_as(
+            "SELECT status, node, lease_generation, pending_after_run, pending_after_dump \
+             FROM file_list_jobs WHERE id = $1;",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(latched.0, FileListJobStatus::Running as i32);
+        assert_eq!(latched.1, "merge-node");
+        assert_eq!(latched.2, first.lease_generation);
+        assert!(latched.3);
+        assert!(!latched.4, "merge and dump latches are independent");
+
+        assert!(
+            !list
+                .set_job_done_owned(id, "merge-node", first.lease_generation - 1)
+                .await
+                .unwrap()
+        );
+        let latch_after_stale: bool =
+            sqlx::query_scalar("SELECT pending_after_run FROM file_list_jobs WHERE id = $1;")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(latch_after_stale);
+        assert!(
+            list.set_job_done_owned(id, "merge-node", first.lease_generation)
+                .await
+                .unwrap()
+        );
+        let requeued: (i32, String, i64, bool, bool) = sqlx::query_as(
+            "SELECT status, node, started_at, pending_after_run, pending_after_dump \
+             FROM file_list_jobs WHERE id = $1;",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(requeued.0, FileListJobStatus::Pending as i32);
+        assert!(requeued.1.is_empty());
+        assert_eq!(requeued.2, 0);
+        assert!(!requeued.3);
+        assert!(!requeued.4);
+
+        let second = list
+            .get_pending_jobs(
+                "merge-node",
+                1,
+                FileListJobOrder::EnqueueOldest,
+                Some(offset),
+                Some(offset + 1),
+            )
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(second.id, id);
+        assert_eq!(second.lease_generation, first.lease_generation + 1);
+        assert!(
+            list.set_job_done_owned(id, "merge-node", second.lease_generation)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !list
+                .set_job_done_owned(id, "merge-node", second.lease_generation)
+                .await
+                .unwrap(),
+            "a normal completion is accepted exactly once"
+        );
+        let finished: (i32, bool) =
+            sqlx::query_as("SELECT status, pending_after_run FROM file_list_jobs WHERE id = $1;")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(finished, (FileListJobStatus::Done as i32, false));
+
+        let failure_offset = offset + 1;
+        let failure_id = list
+            .add_job(
+                "retrigger_org",
+                StreamType::Traces,
+                "failed_retrigger",
+                failure_offset,
+            )
+            .await
+            .unwrap();
+        let failed_run = list
+            .get_pending_jobs(
+                "failure-node",
+                1,
+                FileListJobOrder::EnqueueOldest,
+                Some(failure_offset),
+                Some(failure_offset + 1),
+            )
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(failed_run.id, failure_id);
+        list.add_job(
+            "retrigger_org",
+            StreamType::Traces,
+            "failed_retrigger",
+            failure_offset,
+        )
+        .await
+        .unwrap();
+        assert!(
+            list.set_job_pending_owned(failure_id, "failure-node", failed_run.lease_generation,)
+                .await
+                .unwrap()
+        );
+        let preserved: (i32, bool) =
+            sqlx::query_as("SELECT status, pending_after_run FROM file_list_jobs WHERE id = $1;")
+                .bind(failure_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(preserved, (FileListJobStatus::Pending as i32, true));
+
+        let retry = list
+            .get_pending_jobs(
+                "failure-node",
+                1,
+                FileListJobOrder::EnqueueOldest,
+                Some(failure_offset),
+                Some(failure_offset + 1),
+            )
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let consumed: bool =
+            sqlx::query_scalar("SELECT pending_after_run FROM file_list_jobs WHERE id = $1;")
+                .bind(failure_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(!consumed);
+        assert!(
+            list.set_job_done_owned(failure_id, "failure-node", retry.lease_generation)
+                .await
+                .unwrap()
+        );
+        let retry_status: i32 =
+            sqlx::query_scalar("SELECT status FROM file_list_jobs WHERE id = $1;")
+                .bind(failure_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(retry_status, FileListJobStatus::Done as i32);
+
+        let old_offset = offset + 2;
+        let old_id = list
+            .add_job(
+                "retrigger_org",
+                StreamType::Logs,
+                "old_worker_retrigger",
+                old_offset,
+            )
+            .await
+            .unwrap();
+        let old_stream = format!("retrigger_org/{}/old_worker_retrigger", StreamType::Logs);
+        let legacy_add_sql = "INSERT INTO file_list_jobs (org, stream, offsets, status, node, started_at, updated_at) \
+             VALUES ($1, $2, $3, $4, '', 0, 0) \
+             ON CONFLICT (stream, offsets) DO UPDATE SET status = $4, node = '', started_at = 0 \
+             WHERE file_list_jobs.status = $5;";
+        let mut pending_insert_tx = pool.begin().await.unwrap();
+        let pending_legacy_add = sqlx::query(legacy_add_sql)
+            .bind("retrigger_org")
+            .bind(&old_stream)
+            .bind(old_offset)
+            .bind(FileListJobStatus::Pending)
+            .bind(FileListJobStatus::Done)
+            .execute(&mut *pending_insert_tx)
+            .await
+            .unwrap();
+        assert_eq!(pending_legacy_add.rows_affected(), 0);
+        let pending_unchanged: (i32, bool) =
+            sqlx::query_as("SELECT status, pending_after_run FROM file_list_jobs WHERE id = $1;")
+                .bind(old_id)
+                .fetch_one(&mut *pending_insert_tx)
+                .await
+                .unwrap();
+        assert_eq!(
+            pending_unchanged,
+            (FileListJobStatus::Pending as i32, false)
+        );
+        let claim_while_legacy_insert_is_open = list
+            .get_pending_jobs(
+                "old-node",
+                1,
+                FileListJobOrder::EnqueueOldest,
+                Some(old_offset),
+                Some(old_offset + 1),
+            )
+            .await
+            .unwrap();
+        assert!(claim_while_legacy_insert_is_open.is_empty());
+        pending_insert_tx.commit().await.unwrap();
+        let old_claim = list
+            .get_pending_jobs(
+                "old-node",
+                1,
+                FileListJobOrder::EnqueueOldest,
+                Some(old_offset),
+                Some(old_offset + 1),
+            )
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(old_claim.id, old_id);
+        let legacy_add = sqlx::query(legacy_add_sql)
+            .bind("retrigger_org")
+            .bind(&old_stream)
+            .bind(old_offset)
+            .bind(FileListJobStatus::Pending)
+            .bind(FileListJobStatus::Done)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(legacy_add.rows_affected(), 0);
+        let old_latched: (i32, String, bool) = sqlx::query_as(
+            "SELECT status, node, pending_after_run FROM file_list_jobs WHERE id = $1;",
+        )
+        .bind(old_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            old_latched,
+            (
+                FileListJobStatus::Running as i32,
+                "old-node".to_string(),
+                true
+            )
+        );
+
+        let legacy_completion_sql = format!(
+            "UPDATE file_list_jobs SET status = $1, updated_at = $2, dumped = $3, node = '' \
+             WHERE id IN ({old_id});"
+        );
+        let completed = sqlx::query(&legacy_completion_sql)
+            .bind(FileListJobStatus::Done)
+            .bind(now_micros())
+            .bind(true)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(completed.rows_affected(), 1);
+        let old_requeued: (i32, String, i64, bool) = sqlx::query_as(
+            "SELECT status, node, started_at, pending_after_run \
+             FROM file_list_jobs WHERE id = $1;",
+        )
+        .bind(old_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            old_requeued,
+            (FileListJobStatus::Pending as i32, String::new(), 0, false)
+        );
+
+        let old_rerun = list
+            .get_pending_jobs(
+                "old-node-2",
+                1,
+                FileListJobOrder::EnqueueOldest,
+                Some(old_offset),
+                Some(old_offset + 1),
+            )
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(old_rerun.id, old_id);
+        assert_eq!(old_rerun.lease_generation, old_claim.lease_generation + 1);
+        let completed_rerun = sqlx::query(&legacy_completion_sql)
+            .bind(FileListJobStatus::Done)
+            .bind(now_micros())
+            .bind(true)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(completed_rerun.rows_affected(), 1);
+        let old_finished: (i32, bool) =
+            sqlx::query_as("SELECT status, pending_after_run FROM file_list_jobs WHERE id = $1;")
+                .bind(old_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(old_finished, (FileListJobStatus::Done as i32, false));
+        let no_extra_rerun = list
+            .get_pending_jobs(
+                "old-node-3",
+                1,
+                FileListJobOrder::EnqueueOldest,
+                Some(old_offset),
+                Some(old_offset + 1),
+            )
+            .await
+            .unwrap();
+        assert!(no_extra_rerun.is_empty());
+        let fresh_offset = old_offset + 1;
+        let fresh_stream = format!("retrigger_org/{}/ordinary_legacy_insert", StreamType::Logs);
+        let ordinary_insert = sqlx::query(legacy_add_sql)
+            .bind("retrigger_org")
+            .bind(&fresh_stream)
+            .bind(fresh_offset)
+            .bind(FileListJobStatus::Pending)
+            .bind(FileListJobStatus::Done)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(ordinary_insert.rows_affected(), 1);
+        let ordinary_row: (i32, bool) = sqlx::query_as(
+            "SELECT status, pending_after_run FROM file_list_jobs \
+             WHERE stream = $1 AND offsets = $2;",
+        )
+        .bind(&fresh_stream)
+        .bind(fresh_offset)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(ordinary_row, (FileListJobStatus::Pending as i32, false));
         cleanup_test_data(&pool).await;
     }
 
