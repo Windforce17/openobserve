@@ -531,24 +531,30 @@ SELECT id, account, stream, date, file, min_ts, max_ts, records, original_size, 
             .inc();
 
         let cfg = get_config();
-        // include_oversize widens the fetch to full-size files so the
-        // caller's healing probe can see them (they are still excluded
-        // from merge grouping by the caller — see merge_by_stream)
-        let max_size = if include_oversize {
-            i64::MAX
+        // Indexed core files can merge through the bounded dictionary
+        // passthrough path, so they may use a larger target than flat or
+        // index-less inputs. Closed-hour healing still requests every size.
+        let (max_size, indexed_max_size) = if include_oversize {
+            (i64::MAX, i64::MAX)
         } else {
-            cfg.compact.max_file_size as i64 * 95 / 100
+            (
+                cfg.compact.max_file_size as i64 * 95 / 100,
+                cfg.compact.max_file_size_for_merge(stream_type, true) as i64 * 95 / 100,
+            )
         };
         let sql = r#"
 SELECT id, account, stream, date, file, min_ts, max_ts, records, original_size, compressed_size, index_size, bloom_ver, flattened
     FROM file_list
-    WHERE stream = $1 AND date >= $2 AND date <= $3 AND original_size <= $4;
+    WHERE stream = $1 AND date >= $2 AND date <= $3
+        AND (original_size <= $4
+            OR (index_size > 0 AND file LIKE '%.vix' AND original_size <= $5));
                 "#;
         let ret = sqlx::query_as::<_, super::FileRecord>(sql)
             .bind(stream_key)
             .bind(date_start)
             .bind(date_end)
             .bind(max_size)
+            .bind(indexed_max_size)
             .fetch_all(&pool)
             .await;
         let time = start.elapsed().as_secs_f64();
@@ -934,11 +940,16 @@ SELECT stream, date FROM file_list WHERE index_size > 0 AND bloom_ver = 0 AND da
         // $9 (M31b follow-up): also surface hours holding ANY index-less
         // .vix data file — the lone-deferred/lone-L0 heal wedge (see the
         // mod.rs doc). Flat parquet rows never carry a vix index and are
-        // excluded by the extension filter.
+        // excluded by the extension filter. Indexed .vix rows use their
+        // higher passthrough target's half-size debt line ($10); every other
+        // file stays on the rebuild-safe global line ($5).
         let sql = r#"
 SELECT date
     FROM file_list
-    WHERE stream = $1 AND max_ts >= $2 AND max_ts <= $3 AND min_ts <= $4 AND original_size <= $5 AND date >= $7 AND date < $8
+    WHERE stream = $1 AND max_ts >= $2 AND max_ts <= $3 AND min_ts <= $4
+        AND (original_size <= $5
+            OR (index_size > 0 AND file LIKE '%.vix' AND original_size <= $10))
+        AND date >= $7 AND date < $8
     GROUP BY date
     HAVING count(*) >= $6
         OR ($9 AND sum(CASE WHEN index_size = 0 AND file LIKE '%.vix' THEN 1 ELSE 0 END) > 0);
@@ -954,6 +965,7 @@ SELECT date
             .bind(date_from)
             .bind(date_to)
             .bind(include_lone_unindexed)
+            .bind(cfg.compact.max_file_size_for_merge(stream_type, true) as i64 / 2)
             .fetch_all(&pool)
             .await?;
 

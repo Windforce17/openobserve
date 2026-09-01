@@ -21,10 +21,10 @@
 //! ENTIRE dict blob — ~33 MiB per real benchmark file, ~22% of the object,
 //! re-fetched on every reader-cache miss; ~26 GB per cold query over 1057
 //! files. Today an open fetches only the tail + the small dictionary
-//! DIRECTORY, and per-row-group FST cells load lazily:
+//! DIRECTORY, and key blocks load lazily:
 //!
-//! - `s3_review_open_is_directory_only_and_fsts_load_lazily` pins the new profile over a synthetic
-//!   multi-row-group file;
+//! - `s3_review_open_is_directory_only_and_blocks_load_lazily` pins the profile over a synthetic
+//!   multi-block file;
 //! - the real-file battery (`O2_S3_REVIEW_VIX_FILE=<path> cargo test -p vortex_index --test
 //!   s3_review -- --ignored --nocapture`) prints per-operation request counts and byte volumes.
 
@@ -99,17 +99,17 @@ impl VixRangeSource for CountingSource {
     }
 }
 
-/// Build a synthetic core file whose dictionary spans MANY row groups (tiny
-/// `rg_term_bytes`) and comfortably exceeds the 64 KiB footer tail window,
-/// so directory-vs-FST fetch behavior is observable.
+/// Build a synthetic core file whose dictionary spans MANY 64 KiB key
+/// blocks and comfortably exceeds the 64 KiB footer tail window, so
+/// directory-vs-block fetch behavior is observable.
 fn build_multi_rg_file() -> (Bytes, Bytes) {
-    let rows = 20_000usize;
+    let rows = 80_000usize;
     let schema = Arc::new(Schema::new(vec![
         Field::new("_timestamp", DataType::Int64, false),
         Field::new("svc", DataType::Utf8, true),
     ]));
     let ts: Vec<i64> = (0..rows as i64).map(|i| 1_000_000 - i).collect();
-    // one unique value per row: 20k raw terms of ~26 bytes each
+    // one unique value per row: 80k raw terms of ~26 bytes each
     let svc: Vec<String> = (0..rows).map(|i| format!("svc-{i:08}-abcdefgh")).collect();
     let sources: Vec<String> = (0..rows)
         .map(|i| format!(r#"{{"_timestamp":{},"svc":"{}"}}"#, ts[i], svc[i]))
@@ -125,8 +125,8 @@ fn build_multi_rg_file() -> (Bytes, Bytes) {
     )
     .unwrap();
     let opts = VixWriterOptions {
-        // ~26-byte terms with a 4 KiB row-group budget: ~150 terms per row
-        // group, >100 row groups
+        // ~26-byte terms with a 64 KiB block target: 80k terms still span
+        // more than 20 dictionary blocks.
         ..Default::default()
     };
     let mut writer = VixWriter::new(&schema, opts, false);
@@ -145,14 +145,14 @@ fn build_multi_rg_file() -> (Bytes, Bytes) {
 }
 
 /// The post-fix open/eval profile: a ranged open loads only the small
-/// dictionary DIRECTORY (never the FST cells), an exact-term probe loads
-/// exactly the ONE row-group FST the directory prunes to, a second probe in
-/// the same row group is FST-free, and loaded cells grow
-/// `VixReader::memory_size` (external caches re-read it). A re-open over a
-/// fresh source pays the same small open again — the parsed-reader cache
-/// above this layer is the only persistence, by design.
+/// dictionary DIRECTORY, an exact-term probe loads exactly the ONE key block
+/// the directory selects, a second probe in the same block is dictionary-IO
+/// free, and loaded blocks grow `VixReader::memory_size` (external caches
+/// re-read it). A re-open over a fresh source pays the same small open again
+/// — the parsed-reader cache above this layer is the only persistence, by
+/// design.
 #[test]
-fn s3_review_open_is_directory_only_and_fsts_load_lazily() {
+fn s3_review_open_is_directory_only_and_blocks_load_lazily() {
     let (data, index) = build_multi_rg_file();
     let file_len = (data.len() + index.len()) as u64;
     assert!(
@@ -186,60 +186,60 @@ fn s3_review_open_is_directory_only_and_fsts_load_lazily() {
     dsource.take_log();
     isource.take_log();
 
-    // Cold exact-term probe: the directory prunes to ONE row group; exactly
-    // one FST cell (a few KiB) is fetched, never the whole dict column.
+    // Cold exact-term probe: the directory prunes to ONE key block; exactly
+    // one block (tens of KiB) is fetched, never the whole dictionary.
     let probe = |needle: &str| VixQuery::Exact {
         field: "svc".to_string(),
         token: needle.as_bytes().to_vec(),
     };
-    let bitmap = reader.eval(&probe("svc-00010000-abcdefgh")).unwrap();
+    let bitmap = reader.eval(&probe("svc-00040000-abcdefgh")).unwrap();
     assert_eq!(bitmap.count_set_bits(), 1);
     let cold_fetches = fetch_count() - open_fetches;
     let cold_bytes = byte_count() - open_bytes;
-    // one FST cell + the terms-blob footer + one doc_count/postings chunk
-    // (plus read coalescing) — bounded, and far below a whole-dict load
+    // one key block + the terms-blob footer + one doc_count/postings chunk
+    // (plus read coalescing), still far below a whole-dictionary walk
     // (asserted against the full walk below)
     assert!(
-        cold_bytes < 512 * 1024,
-        "a needle probe must load ~one FST cell + one postings chunk, moved {cold_bytes} bytes"
+        cold_bytes < 768 * 1024,
+        "a needle probe must load ~one key block + one postings chunk, moved {cold_bytes} bytes"
     );
     let after_first_probe = reader.memory_size();
     assert!(
         after_first_probe > open_memory,
-        "a loaded FST cell must grow memory_size ({open_memory} -> {after_first_probe})"
+        "a loaded dictionary block must grow memory_size ({open_memory} -> {after_first_probe})"
     );
 
-    // A second needle in the SAME row group: the FST is resident, only the
-    // postings point read remains.
+    // A second needle in the SAME key block: the block is resident, only
+    // the postings point read remains.
     let (f0, b0) = (fetch_count(), byte_count());
-    let bitmap = reader.eval(&probe("svc-00010001-abcdefgh")).unwrap();
+    let bitmap = reader.eval(&probe("svc-00040001-abcdefgh")).unwrap();
     assert_eq!(bitmap.count_set_bits(), 1);
     let hot_fetches = fetch_count() - f0;
     let hot_bytes = byte_count() - b0;
     assert_eq!(
         reader.memory_size(),
         after_first_probe,
-        "a probe in a resident row group must not load another FST"
+        "a probe in a resident key block must not load another block"
     );
-    // (the memory_size equality above is the FST-free proof; the fetch is
-    // the ~128 KiB postings chunk of the second needle)
+    // (the memory_size equality above is the block-cache proof; the fetch is
+    // the postings chunk of the second needle)
     assert!(
-        hot_fetches <= 1 && hot_bytes < 512 * 1024,
-        "same-row-group probe must be FST-free: {hot_fetches} fetches / {hot_bytes} bytes"
+        hot_fetches <= 1 && hot_bytes < 768 * 1024,
+        "same-block probe must be dictionary-free: {hot_fetches} fetches / {hot_bytes} bytes"
     );
 
-    // A needle in a DIFFERENT row group loads exactly one more cell.
+    // A needle in a DIFFERENT key block loads exactly one more block.
     let (_f1, b1) = (fetch_count(), byte_count());
-    let bitmap = reader.eval(&probe("svc-00019999-abcdefgh")).unwrap();
+    let bitmap = reader.eval(&probe("svc-00079999-abcdefgh")).unwrap();
     assert_eq!(bitmap.count_set_bits(), 1);
     assert!(
         reader.memory_size() > after_first_probe,
-        "a probe in a new row group must load its FST cell"
+        "a probe in a new key block must grow resident dictionary bytes"
     );
-    assert!(byte_count() - b1 < 256 * 1024);
+    assert!(byte_count() - b1 < 768 * 1024);
 
     // Full-dictionary walk (Contains = scan_all_tokens): loads EVERY
-    // remaining FST cell — the needle probes above must have cost a small
+    // remaining key block — the needle probes above must have cost a small
     // fraction of this (the lazy-loading win).
     let (_f2, b2) = (fetch_count(), byte_count());
     let ordinal_bitmap = reader
@@ -253,14 +253,14 @@ fn s3_review_open_is_directory_only_and_fsts_load_lazily() {
     let full_walk_bytes = byte_count() - b2;
     let full_memory = reader.memory_size();
     assert!(full_memory > after_first_probe);
-    // resident-FST accounting is the honest lazy metric (fetch bytes mix in
-    // terms-blob reads and read coalescing): one probe loads ~1 cell of the
-    // >100-cell dictionary
+    // Resident dictionary-block accounting is the honest lazy metric (fetch
+    // bytes mix in terms-blob reads and read coalescing): one point lookup
+    // loads one of more than 20 key blocks.
     let one_cell = after_first_probe - open_memory;
     let all_cells = full_memory - open_memory;
     assert!(
         one_cell * 10 <= all_cells,
-        "one lazily loaded FST cell ({one_cell}B) must be a small fraction of the whole \
+        "one lazily loaded key block ({one_cell}B) must be a small fraction of the whole \
          dictionary ({all_cells}B resident after the full walk)"
     );
 
@@ -273,7 +273,10 @@ fn s3_review_open_is_directory_only_and_fsts_load_lazily() {
         Some(Arc::clone(&isource2) as Arc<dyn VixRangeSource>),
     )
     .unwrap();
-    assert_eq!(dsource2.fetch_count() + isource2.fetch_count(), open_fetches);
+    assert_eq!(
+        dsource2.fetch_count() + isource2.fetch_count(),
+        open_fetches
+    );
     assert_eq!(dsource2.byte_count() + isource2.byte_count(), open_bytes);
 
     println!(
@@ -349,44 +352,47 @@ fn s3_review_real_file_fetch_profile() {
         open_elapsed,
     );
     let (open_fetches, open_bytes) = phase("open (tail + dict directory)", &source);
-    // Lazy dict loading: open fetches the tail plus the small directory
-    // columns — NEVER the FST cells. (Pre-fix this was tail + the whole
-    // ~33 MiB dict blob, the 200M-benchmark cold-query killer.)
+    // Lazy dictionary loading: open fetches the tail plus the small
+    // predecessor directory, never key blocks. Before the block layout this
+    // fetched the whole ~33 MiB dictionary.
     assert!(open_fetches <= 8, "open took {open_fetches} fetches");
     assert!(
         open_bytes < 4 * 1024 * 1024,
         "open must not fetch the whole dict: {open_bytes} bytes"
     );
 
-    // needle-style probe FIRST (before any full-dictionary walk): the
-    // directory prunes an exact key lookup to one row group — one FST cell
-    // (or, on pre-lazy files, the one big fst chunk) + one doc_count point
-    // read: the shape of every exact-term / count fast-path per-file eval.
-    // `_timestamp` is never key-termed; default to the ubiquitous `level`
-    // (override with O2_S3_REVIEW_NEEDLE_KEY for non-log files).
+    // Needle-style probe FIRST (before any full-dictionary walk): the
+    // directory prunes an exact lookup to one key block plus one doc_count
+    // point read — the shape of every exact-term/count fast path per file.
+    // `_timestamp` is never key-termed; default to the ubiquitous `level`.
+    // Set O2_S3_REVIEW_NEEDLE_VALUE to measure a raw value equality instead
+    // of the default KeyExists probe.
     let needle_key =
         std::env::var("O2_S3_REVIEW_NEEDLE_KEY").unwrap_or_else(|_| "level".to_string());
-    let count = reader
-        .count(&VixQuery::KeyExists {
-            path: needle_key.clone(),
-        })
-        .unwrap();
-    phase(
-        &format!("count(KeyExists({needle_key:?}))={count}: needle"),
-        &source,
-    );
+    let (needle_query, needle_label) = match std::env::var("O2_S3_REVIEW_NEEDLE_VALUE") {
+        Ok(value) => (
+            VixQuery::Exact {
+                field: needle_key.clone(),
+                token: value.into_bytes(),
+            },
+            format!("Exact({needle_key:?})"),
+        ),
+        Err(_) => (
+            VixQuery::KeyExists {
+                path: needle_key.clone(),
+            },
+            format!("KeyExists({needle_key:?})"),
+        ),
+    };
+    let count = reader.count(&needle_query).unwrap();
+    phase(&format!("count({needle_label})={count}: needle"), &source);
 
-    let bitmap = reader
-        .eval(&VixQuery::KeyExists {
-            path: needle_key.clone(),
-        })
-        .unwrap();
+    let bitmap = reader.eval(&needle_query).unwrap();
     assert_eq!(bitmap.count_set_bits() as u64, count);
-    phase(&format!("KeyExists({needle_key:?}) postings"), &source);
+    phase(&format!("{needle_label} postings"), &source);
 
-    // full-dictionary walk: loads EVERY remaining FST cell (inherent to
-    // whole-key enumeration; per-cell on lazy-layout files, the one big
-    // chunk on pre-lazy files)
+    // Full-dictionary walk: loads every remaining key block (inherent to
+    // whole-key enumeration).
     let keys = reader.keys_with_prefix("").unwrap();
     assert!(!keys.is_empty());
     phase("keys_with_prefix(\"\") FULL dict walk", &source);
@@ -414,11 +420,10 @@ fn s3_review_real_file_fetch_profile() {
     reader.read_source(&picks).unwrap();
     phase("_source point read of 3 rows", &source);
 
-    // partial-time-range profile: eval_bitmap ANDs a timestamp_range bitmap,
-    // which reads the WHOLE `_timestamp` column of the docs blob
+    // Timestamp-range profile. Current files can answer a whole-file window
+    // from the footer zone map, so zero docs bytes is a valid fast path.
     reader.timestamp_range(0, i64::MAX).unwrap();
-    let (_, ts_bytes) = phase("timestamp_range (whole ts column)", &source);
-    assert!(ts_bytes > 0);
+    phase("timestamp_range (zone-map eligible)", &source);
 
     // dict-only unfiltered TopN/Distinct source (pilot fix B): doc_count
     // point reads for every value of one field, no postings, no docs
@@ -436,8 +441,7 @@ fn s3_review_real_file_fetch_profile() {
         );
     }
 
-    let total_fetches =
-        source.fetch_count() + index_source.as_ref().map_or(0, |s| s.fetch_count());
+    let total_fetches = source.fetch_count() + index_source.as_ref().map_or(0, |s| s.fetch_count());
     let total_bytes = source.byte_count() + index_source.as_ref().map_or(0, |s| s.byte_count());
     println!(
         "s3_review real: TOTAL {total_fetches} fetches, {total_bytes} bytes = {:.2}% of the \

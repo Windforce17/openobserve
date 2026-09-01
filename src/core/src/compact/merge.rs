@@ -701,36 +701,35 @@ pub async fn merge_by_stream(
             let cfg = get_config();
             let job_strategy = MergeStrategy::from(&cfg.compact.strategy);
 
-            // core files (.vix) and flat data files (parquet/vortex) never
-            // merge together — their write paths differ entirely — so a merge
-            // group must be same-kind. Split the candidates by kind; each
-            // kind sorts and groups independently.
-            // Full-size files never join a merge group; feeding them into
-            // the grouping loop would poison it (its singleton-replace
-            // logic drops neighbors). Split them out first — core-file
-            // oversize entries remain HEALING PROBE candidates below.
-            let oversize_cutoff = cfg.compact.max_file_size as i64 * 95 / 100;
-            let (oversize_files, files_with_size): (Vec<FileKey>, Vec<FileKey>) = files_with_size
-                .into_iter()
-                .partition(|f| f.meta.original_size > oversize_cutoff);
-            let (core_files, mut flat_files): (Vec<FileKey>, Vec<FileKey>) = files_with_size
+            // Core files (.vix) and flat data files (parquet/vortex) never
+            // merge together. Indexed core files split again: their
+            // dictionary-passthrough path has a separate, larger byte target,
+            // while flat and index-less groups retain the rebuild-safe global
+            // target. Full-size files stay outside grouping; core files among
+            // them remain healing-probe candidates below.
+            let (core_files, flat_candidates): (Vec<FileKey>, Vec<FileKey>) = files_with_size
                 .into_iter()
                 .partition(|f| f.key.ends_with(config::FILE_EXT_VIX));
             // M31: sidecar-HOMOGENEOUS core grouping — never mix indexed
-            // and index-less core files in one group. A mixed group is the
-            // WORST merge shape: the dictionary fast path rejects on the
-            // first index-less input, the full rebuild then re-derives
-            // terms for every input (DISCARDING the good dictionaries it
-            // rejected), and the #46 column arm disqualifies too (it needs
-            // every input index-less). Split on the zero-IO FileMeta
-            // signal (index_size > 0 ⟺ a .vxi sidecar exists): index-less
-            // groups take the rebuild — or the M31 deferred copy shape —
-            // and indexed groups take the gate-free dictionary fast path.
-            // Cross-class convergence needs no mixed group: an index-less
-            // leftover heals to indexed through the existing single-file
-            // probe, then groups with its class.
-            let (mut plain_core, mut indexed_core): (Vec<FileKey>, Vec<FileKey>) =
+            // and index-less core files in one group. A mixed group rejects
+            // the dictionary fast path then rebuilds every input.
+            let (plain_candidates, indexed_candidates): (Vec<FileKey>, Vec<FileKey>) =
                 core_files.into_iter().partition(|f| f.meta.index_size == 0);
+            let global_cutoff = cfg.compact.max_file_size as i64 * 95 / 100;
+            let indexed_cutoff =
+                cfg.compact.max_file_size_for_merge(stream_type, true) as i64 * 95 / 100;
+            let (_oversize_flat, mut flat_files): (Vec<FileKey>, Vec<FileKey>) = flat_candidates
+                .into_iter()
+                .partition(|f| f.meta.original_size > global_cutoff);
+            let (plain_oversize, mut plain_core): (Vec<FileKey>, Vec<FileKey>) = plain_candidates
+                .into_iter()
+                .partition(|f| f.meta.original_size > global_cutoff);
+            let (indexed_oversize, mut indexed_core): (Vec<FileKey>, Vec<FileKey>) =
+                indexed_candidates
+                    .into_iter()
+                    .partition(|f| f.meta.original_size > indexed_cutoff);
+            let oversize_core_files: Vec<FileKey> =
+                plain_oversize.into_iter().chain(indexed_oversize).collect();
             // sort by file size
             for files in [&mut flat_files, &mut plain_core, &mut indexed_core] {
                 match job_strategy {
@@ -775,6 +774,7 @@ pub async fn merge_by_stream(
 
             if flat_files.len() <= 1
                 && core_total <= 1
+                && oversize_core_files.is_empty()
                 && !skip_group_files
                 && !single_core_heal_candidate
             {
@@ -801,22 +801,33 @@ pub async fn merge_by_stream(
                     stream_type,
                     &stream_name,
                     &prefix,
+                    cfg.compact.max_file_size as i64,
                     is_incremental,
                     &job_strategy,
                 );
             }
-            for class in [&plain_core, &indexed_core] {
-                group_files_into_batches(
-                    &mut batch_groups,
-                    class,
-                    &org_id,
-                    stream_type,
-                    &stream_name,
-                    &prefix,
-                    is_incremental,
-                    &job_strategy,
-                );
-            }
+            group_files_into_batches(
+                &mut batch_groups,
+                &plain_core,
+                &org_id,
+                stream_type,
+                &stream_name,
+                &prefix,
+                cfg.compact.max_file_size as i64,
+                is_incremental,
+                &job_strategy,
+            );
+            group_files_into_batches(
+                &mut batch_groups,
+                &indexed_core,
+                &org_id,
+                stream_type,
+                &stream_name,
+                &prefix,
+                cfg.compact.max_file_size_for_merge(stream_type, true) as i64,
+                is_incremental,
+                &job_strategy,
+            );
 
             // Healing probe candidates: the lone file of a single-file
             // partition, PLUS every core file batching left out (a file at
@@ -840,11 +851,7 @@ pub async fn merge_by_stream(
                 );
             }
             if !is_incremental {
-                heal_candidates.extend(
-                    oversize_files
-                        .iter()
-                        .filter(|f| f.key.ends_with(config::FILE_EXT_VIX)),
-                );
+                heal_candidates.extend(oversize_core_files.iter());
             }
             for candidate in heal_candidates {
                 match single_core_file_heal_reason(&org_id, stream_type, &stream_name, candidate)
@@ -1159,10 +1166,12 @@ pub async fn merge_by_stream(
 }
 
 /// Cut `files` (already sorted by the job strategy) into merge batches
-/// bounded by `compact.max_file_size` / `compact.max_group_files`, appending
-/// them to `batch_groups`. In incremental mode the below-budget trailing
-/// remainder is carried to the next round instead of being sealed (see
-/// `merge_by_stream`). Lists of one file produce no batch.
+/// bounded by the supplied class-specific `max_file_size` and
+/// `compact.max_group_files`, appending them to `batch_groups`. Indexed core
+/// callers pass the larger dictionary-passthrough target; flat/index-less
+/// callers pass the global rebuild-safe target. In incremental mode the
+/// below-budget trailing remainder is carried to the next round instead of
+/// being sealed (see `merge_by_stream`). Lists of one file produce no batch.
 #[allow(clippy::too_many_arguments)]
 fn group_files_into_batches(
     batch_groups: &mut Vec<MergeBatch>,
@@ -1171,6 +1180,7 @@ fn group_files_into_batches(
     stream_type: StreamType,
     stream_name: &str,
     prefix: &str,
+    max_file_size: i64,
     is_incremental: bool,
     job_strategy: &MergeStrategy,
 ) {
@@ -1191,7 +1201,7 @@ fn group_files_into_batches(
     let mut new_file_list = Vec::new();
     let mut new_file_size = 0;
     for file in files.iter() {
-        if new_file_size + file.meta.original_size > cfg.compact.max_file_size as i64
+        if new_file_size + file.meta.original_size > max_file_size
             || (max_group_len > 0 && new_file_list.len() >= max_group_len)
         {
             if new_file_list.len() <= 1 {
@@ -1308,6 +1318,8 @@ pub async fn merge_files(
     // >= 2 guards and the size budget — the rebuilt output replaces the
     // input at roughly its own size, so the group-size cap does not apply.
     let is_single_core_heal = is_core_group && files_with_size.len() == 1;
+    let is_indexed_core_group =
+        is_core_group && files_with_size.iter().all(|file| file.meta.index_size > 0);
 
     if files_with_size.len() <= 1 && !is_match_downsampling_rule && !is_single_core_heal {
         return Ok((Vec::new(), Vec::new()));
@@ -1317,10 +1329,12 @@ pub async fn merge_files(
     let mut new_compressed_file_size = 0;
     let mut new_file_list = Vec::new();
     let cfg = get_config();
+    let max_file_size = cfg
+        .compact
+        .max_file_size_for_merge(stream_type, is_indexed_core_group) as i64;
     for file in files_with_size.iter() {
-        if (new_file_size + file.meta.original_size > cfg.compact.max_file_size as i64
-            || new_compressed_file_size + file.meta.compressed_size
-                > cfg.compact.max_file_size as i64
+        if (new_file_size + file.meta.original_size > max_file_size
+            || new_compressed_file_size + file.meta.compressed_size > max_file_size
             // #51: bound the merge WIDTH too — bytes alone let sliver-debt
             // hours stack 1,600+ files into one k-way merge (memory tracks
             // width; heap CPU superlinear). The remainder merges next pass.
@@ -1739,18 +1753,27 @@ async fn wait_for_merge_cancellation(cancel: &MergeCancellation) {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
     }
 }
+#[inline]
+fn indexed_trace_group_exceeds_global_rebuild_limit(
+    stream_type: StreamType,
+    all_inputs_indexed: bool,
+    original_size: i64,
+    compressed_size: i64,
+    global_limit: i64,
+) -> bool {
+    stream_type == StreamType::Traces
+        && all_inputs_indexed
+        && (original_size > global_limit || compressed_size > global_limit)
+}
 
 /// Merge one same-kind group of core `.vix` files into a single core
 /// file and upload it. The inputs come through the same disk-cache ladder as
 /// parquet compaction; the CPU-bound k-way merge + index rebuild
 /// (`vix::core_writer::merge_core_files`) runs on a blocking thread.
 ///
-/// `force_rebuild` (single-file healing batches) always takes the
-/// `_source` rebuild: the index-merge fast path could only DEMOTE a field
-/// carried without value terms (capability intersection) instead of
-/// restoring it, while the rebuild is the one path that lands every
-/// current capability — fts tokens, numeric value terms, cs columns
-/// (derived when missing), zone table, cleansed rows.
+/// `force_rebuild` marks a single-file healing batch. Its sidecar-only repair
+/// runs first; a required docs rewrite may use the full rebuild only while
+/// both input byte measures fit the global rebuild-safe ceiling.
 #[allow(clippy::too_many_arguments)]
 async fn merge_core_group(
     thread_id: usize,
@@ -1771,6 +1794,17 @@ async fn merge_core_group(
 ) -> Result<(Vec<FileKey>, Vec<FileKey>), anyhow::Error> {
     let cfg = get_config();
     cancel.check("core merge planning")?;
+    let all_inputs_indexed = new_file_list.iter().all(|file| file.meta.index_size > 0);
+    let input_compressed_size = new_file_list.iter().fold(0_i64, |total, file| {
+        total.saturating_add(file.meta.compressed_size)
+    });
+    let exceeds_global_rebuild_limit = indexed_trace_group_exceeds_global_rebuild_limit(
+        stream_type,
+        all_inputs_indexed,
+        new_file_meta.original_size,
+        input_compressed_size,
+        cfg.compact.max_file_size as i64,
+    );
 
     // M3 SIDECAR-ONLY HEAL (DESIGN-V2 §5): a single-file healing batch
     // rewrites ONLY the `.vxi` index sidecar — same sidecar key, data
@@ -1800,6 +1834,17 @@ async fn merge_core_group(
             // (the row update + broadcast already happened)
             return Ok((Vec::new(), Vec::new()));
         }
+    }
+    if force_rebuild && exceeds_global_rebuild_limit {
+        return Err(anyhow::anyhow!(
+            "[COMPACTOR:WORKER:{thread_id}] refusing oversized indexed trace rebuild after \
+             sidecar-only healing required a docs rewrite: inputs={}, original_size={}, \
+             compressed_size={}, global_rebuild_limit={}",
+            new_file_list.len(),
+            new_file_meta.original_size,
+            input_compressed_size,
+            cfg.compact.max_file_size,
+        ));
     }
 
     // The merge reads its inputs by RANGE through the cache ladder
@@ -1853,6 +1898,11 @@ async fn merge_core_group(
         && new_file_list.len() > 1
         && new_file_meta.original_size < defer_below_bytes
         && new_file_list.iter().all(|f| f.meta.index_size == 0);
+    // The trace-only enlarged target is safe only on the indexed merge path.
+    // A normal-size batch may still rebuild to heal an incompatible input;
+    // a batch above the global rebuild-safe ceiling must fail rather than
+    // silently multiplying rebuild memory.
+    let require_indexed_merge = !force_rebuild && exceeds_global_rebuild_limit;
 
     let cpu_permit = acquire_vix_cpu(cancel, "core merge CPU admission").await?;
     let merge_started = std::time::Instant::now();
@@ -1870,6 +1920,15 @@ async fn merge_core_group(
             )
         } else if index_deferred {
             crate::service::vix::core_writer::merge_core_files_index_deferred_with_cancellation(
+                stream_type,
+                &inputs,
+                &latest_schema,
+                &full_text_search_fields,
+                &bloom_filter_fields,
+                &vix_cancellation,
+            )
+        } else if require_indexed_merge {
+            crate::service::vix::core_writer::merge_core_files_indexed_only_with_cancellation(
                 stream_type,
                 &inputs,
                 &latest_schema,
@@ -3127,6 +3186,7 @@ mod tests {
             StreamType::Logs,
             "s1",
             "files/org/logs/s1/2026/08/24/00",
+            cfg.compact.max_file_size as i64,
             false,
             &MergeStrategy::FileTime,
         );
@@ -3147,11 +3207,78 @@ mod tests {
             StreamType::Logs,
             "s1",
             "files/org/logs/s1/2026/08/24/00",
+            cfg.compact.max_file_size as i64,
             true,
             &MergeStrategy::FileTime,
         );
         assert_eq!(batches.len(), 2, "incremental keeps the trailing remainder");
         assert!(batches.iter().all(|b| b.files.len() == width));
+    }
+
+    #[test]
+    fn indexed_core_group_target_reduces_batches_without_widening_rebuilds() {
+        let files: Vec<FileKey> = (0..4)
+            .map(|i| create_file_key(&format!("f{i}.vix"), i, i + 1, 400))
+            .collect();
+        let collect = |max_file_size| {
+            let mut batches = Vec::new();
+            group_files_into_batches(
+                &mut batches,
+                &files,
+                "org",
+                StreamType::Traces,
+                "default",
+                "files/org/traces/default/2026/09/01/00",
+                max_file_size,
+                false,
+                &MergeStrategy::FileTime,
+            );
+            batches
+        };
+
+        let rebuild_batches = collect(1_000);
+        assert_eq!(
+            rebuild_batches
+                .iter()
+                .map(|batch| batch.files.len())
+                .collect::<Vec<_>>(),
+            vec![2, 2]
+        );
+        let indexed_batches = collect(4_000);
+        assert_eq!(indexed_batches.len(), 1);
+        assert_eq!(indexed_batches[0].files.len(), 4);
+    }
+
+    #[test]
+    fn indexed_trace_strict_path_covers_original_and_compressed_caps() {
+        assert!(indexed_trace_group_exceeds_global_rebuild_limit(
+            StreamType::Traces,
+            true,
+            1_200,
+            800,
+            1_000,
+        ));
+        assert!(indexed_trace_group_exceeds_global_rebuild_limit(
+            StreamType::Traces,
+            true,
+            800,
+            1_200,
+            1_000,
+        ));
+        assert!(!indexed_trace_group_exceeds_global_rebuild_limit(
+            StreamType::Logs,
+            true,
+            1_200,
+            1_200,
+            1_000,
+        ));
+        assert!(!indexed_trace_group_exceeds_global_rebuild_limit(
+            StreamType::Traces,
+            false,
+            1_200,
+            1_200,
+            1_000,
+        ));
     }
 
     #[test]

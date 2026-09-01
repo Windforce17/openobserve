@@ -17,14 +17,14 @@
 //!
 //! Sorted composite keys (`{fid u16 BE}{token}`) are cut into
 //! prefix-compressed BLOCKS of ~[`BLOCK_TARGET_BYTES`] raw key bytes (a
-//! block never spans a field boundary). The dictionary's read granularity
-//! is therefore ONE BLOCK (~KBs), not a whole dictionary segment: an exact
-//! lookup binary-searches the resident block INDEX for the predecessor
-//! block and fetches only that block. The previous layout (one monolithic
-//! FST per 8MB row group) made the smallest possible read the whole row
-//! group — measured 23.4GB of demand for one cold token count over 55
-//! merged files vs the ~KBs/file an sstable-shaped dictionary pays
-//! (ENGINE-BACKLOG #18).
+//! block never spans a field boundary). The 64 KiB target balances the two
+//! reads paid by a cold point lookup: a larger block costs more to fetch, but
+//! cuts the resident predecessor index proportionally. On a production trace
+//! sidecar with 806k terms, the former 4 KiB target produced 7,570 blocks and
+//! a 757 KiB predecessor index that every exact lookup had to fetch; 64 KiB
+//! puts the combined index + one-block demand near its measured minimum.
+//! The previous monolithic-FST layout made the smallest possible read the
+//! whole dictionary segment (ENGINE-BACKLOG #18).
 //!
 //! Ordinals are implicit: keys are stored in global ordinal order, block
 //! `b` starts at `meta[b].first_ordinal`, so the ordinal of the key at
@@ -57,9 +57,11 @@
 use crate::error::{Result, VixError};
 
 /// Target raw-key bytes per block. A block closes at the first key that
-/// would push it past this (and always at field boundaries). Code
-/// constant by design — the read side self-describes through the index.
-pub(crate) const BLOCK_TARGET_BYTES: usize = 4096;
+/// would push it past this (and always at field boundaries). Code constant
+/// by design — the read side self-describes through the index. 64 KiB is the
+/// measured cold point-lookup optimum: predecessor-index bytes fall roughly
+/// inversely with this value while the one fetched block grows linearly.
+pub(crate) const BLOCK_TARGET_BYTES: usize = 64 * 1024;
 
 /// Every Nth first-key in the index region is stored whole as a binary
 /// search restart point.

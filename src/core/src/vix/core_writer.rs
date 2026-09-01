@@ -1689,6 +1689,33 @@ pub fn merge_core_files_with_cancellation(
         bloom_fields,
         BatchCaps::default(),
         Some(cancellation.clone()),
+        false,
+    )
+}
+/// [`merge_core_files_with_cancellation`] without the full-rebuild fallback.
+///
+/// Large indexed-core compactions use this entry point: falling back after
+/// planning a multi-gigabyte index merge could multiply peak memory. An
+/// incompatible or damaged input fails the job with the precise fast-path
+/// rejection instead; ordinary rebuild-sized batches keep using
+/// [`merge_core_files_with_cancellation`] and can heal through a rebuild.
+pub fn merge_core_files_indexed_only_with_cancellation(
+    stream_type: StreamType,
+    inputs: &[MergeInput],
+    latest_schema: &Schema,
+    fts_fields: &[String],
+    bloom_fields: &[String],
+    cancellation: &VixMergeCancellation,
+) -> Result<MergedCoreFile, anyhow::Error> {
+    merge_core_files_with_caps_and_cancellation(
+        stream_type,
+        inputs,
+        latest_schema,
+        fts_fields,
+        bloom_fields,
+        BatchCaps::default(),
+        Some(cancellation.clone()),
+        true,
     )
 }
 
@@ -1739,6 +1766,7 @@ pub fn merge_core_files_index_deferred_with_cancellation(
             ..BatchCaps::default()
         },
         Some(cancellation.clone()),
+        false,
     )
 }
 
@@ -1760,6 +1788,7 @@ fn merge_core_files_with_caps(
         bloom_fields,
         caps,
         None,
+        false,
     )
 }
 
@@ -1771,6 +1800,7 @@ fn merge_core_files_with_caps_and_cancellation(
     bloom_fields: &[String],
     caps: BatchCaps,
     cancellation: Option<VixMergeCancellation>,
+    require_indexed_merge: bool,
 ) -> Result<MergedCoreFile, anyhow::Error> {
     let started = std::time::Instant::now();
     let sources = open_merge_sources(inputs, cancellation.as_ref())?;
@@ -1798,6 +1828,12 @@ fn merge_core_files_with_caps_and_cancellation(
         })
         .collect();
     if plan.rewrite_source_from_columns {
+        if require_indexed_merge {
+            return Err(anyhow::anyhow!(
+                "required indexed merge is not applicable: latest-schema casts must rewrite \
+                 _source together with docs"
+            ));
+        }
         log::info!(
             "vix merge: rebuilding to persist latest-schema string casts in docs and _source"
         );
@@ -1806,12 +1842,22 @@ fn merge_core_files_with_caps_and_cancellation(
             Ok(result) => return Ok(result),
             Err(IndexedMergeFailure::Fatal(e)) => return Err(e),
             Err(IndexedMergeFailure::Fallback(reason)) => {
+                if require_indexed_merge {
+                    return Err(reason.context(
+                        "required indexed merge is not applicable; refusing a large full rebuild",
+                    ));
+                }
                 log::warn!(
                     "merge_core_files: index merge not applicable, rebuilding terms from \
                      _source: {reason:#}"
                 );
             }
         }
+    } else if require_indexed_merge {
+        return Err(anyhow::anyhow!(
+            "required indexed merge is not applicable: one or more inputs has no readable index \
+             sidecar; refusing a large full rebuild"
+        ));
     }
     rebuild_over_sources(inputs, &sources, &plan)
 }
@@ -12594,6 +12640,21 @@ mod tests {
             ("bad.vix".to_string(), corrupt),
             ("good.vix".to_string(), file2.clone()),
         ];
+        let cancellation = VixMergeCancellation::new();
+        let strict_error = merge_core_files_indexed_only_with_cancellation(
+            StreamType::Logs,
+            &as_inputs(&inputs),
+            &latest_schema,
+            &fts,
+            &[],
+            &cancellation,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{strict_error:#}").contains("required indexed merge is not applicable"),
+            "large indexed batches must refuse the rebuild fallback: {strict_error:#}"
+        );
+
         let result = merge_core_files(
             StreamType::Logs,
             &as_inputs(&inputs),
