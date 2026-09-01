@@ -26,6 +26,21 @@ use o2_enterprise::enterprise::common::config::get_config as get_o2_config;
 use crate::service::compact;
 const ENRICHMENT_TABLE_MERGE_LOCK_KEY: &str = "/compact/enrichment_table";
 
+fn live_lane_job_split(
+    live_job_num: usize,
+    live_lookback_hours: i64,
+    recent_lookback_hours: i64,
+) -> (usize, usize) {
+    if live_job_num < 2
+        || recent_lookback_hours <= 0
+        || recent_lookback_hours.max(1) <= live_lookback_hours.max(1)
+    {
+        return (live_job_num, 0);
+    }
+    let recent_job_num = live_job_num / 2;
+    (live_job_num - recent_job_num, recent_job_num)
+}
+
 pub async fn run() -> Result<(), anyhow::Error> {
     if !LOCAL_NODE.is_compactor() {
         return Ok(());
@@ -52,14 +67,13 @@ pub async fn run() -> Result<(), anyhow::Error> {
     }
     log::info!("[COMPACTOR::JOB] Compactor is enabled");
 
-    let (main_handle, live_handle) = if lease_generation_enabled {
+    let (main_handle, live_handle, recent_handle) = if lease_generation_enabled {
         let mut worker = compact::worker::MergeWorker::new(cfg.limit.file_merge_thread_num);
         if let Err(e) = worker.run() {
             log::error!("[COMPACTOR::JOB] start merge worker error: {e}");
         }
 
-        // scheduler slots (concurrent jobs) decoupled from merge workers (#23):
-        // storms want few jobs × many workers each, steady state the opposite
+        // Scheduler slots (concurrent jobs) are decoupled from merge workers.
         let job_num = if cfg.compact.job_num > 0 {
             cfg.compact.job_num
         } else {
@@ -71,26 +85,54 @@ pub async fn run() -> Result<(), anyhow::Error> {
         }
         let main_handle = scheduler.handle();
 
-        // Live lane (#23): reserved scheduler slots + dedicated workers that
-        // claim only recent-hour jobs.
-        let live_handle = if cfg.compact.live_job_num > 0 {
+        // One fixed-capacity worker pool serves two disjoint priorities. The
+        // split never adds workers or scheduler slots: hot jobs keep one half,
+        // while closed recent hours get FIFO progress with the other half.
+        let (live_handle, recent_handle) = if cfg.compact.live_job_num > 0 {
+            let (hot_job_num, recent_job_num) = live_lane_job_split(
+                cfg.compact.live_job_num,
+                cfg.compact.live_lookback_hours,
+                cfg.compact.recent_lookback_hours,
+            );
+            if cfg.compact.recent_lookback_hours > 0 && recent_job_num == 0 {
+                log::warn!(
+                    "[COMPACTOR::JOB] recent merge lane disabled: require ZO_COMPACT_RECENT_LOOKBACK_HOURS > ZO_COMPACT_LIVE_LOOKBACK_HOURS and ZO_COMPACT_LIVE_JOB_NUM >= 2; recent_lookback_hours={} live_lookback_hours={} live_job_num={}",
+                    cfg.compact.recent_lookback_hours,
+                    cfg.compact.live_lookback_hours,
+                    cfg.compact.live_job_num,
+                );
+            }
+
             let mut live_worker =
                 compact::worker::MergeWorker::new(cfg.compact.live_worker_num.max(1));
             if let Err(e) = live_worker.run() {
                 log::error!("[COMPACTOR::JOB] start live merge worker error: {e}");
             }
+            let worker_tx = live_worker.tx();
             let mut live_scheduler =
-                compact::worker::JobScheduler::new(cfg.compact.live_job_num, live_worker.tx());
+                compact::worker::JobScheduler::new(hot_job_num, worker_tx.clone());
             if let Err(e) = live_scheduler.run() {
                 log::error!("[COMPACTOR::JOB] start live merge job scheduler error: {e}");
             }
-            Some(live_scheduler.handle())
+            let live_handle = Some(live_scheduler.handle());
+
+            let recent_handle = if recent_job_num > 0 {
+                let mut recent_scheduler =
+                    compact::worker::JobScheduler::new(recent_job_num, worker_tx);
+                if let Err(e) = recent_scheduler.run() {
+                    log::error!("[COMPACTOR::JOB] start recent merge job scheduler error: {e}");
+                }
+                Some(recent_scheduler.handle())
+            } else {
+                None
+            };
+            (live_handle, recent_handle)
         } else {
-            None
+            (None, None)
         };
-        (Some(main_handle), live_handle)
+        (Some(main_handle), live_handle, recent_handle)
     } else {
-        (None, None)
+        (None, None, None)
     };
 
     if lease_generation_enabled {
@@ -179,25 +221,41 @@ pub async fn run() -> Result<(), anyhow::Error> {
     if let Some(main_handle) = main_handle {
         spawn_pausable_job!("run_merge", get_config().compact.interval + 2, {
             log::debug!("[COMPACTOR::JOB] Running data merge claim cycle");
-            if let Some(live_handle) = live_handle.as_ref() {
-                let cfg = get_config();
-                let floor = compact::live_claim_floor(
-                    config::utils::time::now_micros(),
-                    cfg.compact.live_lookback_hours,
-                );
-                if let Err(e) =
+            let cfg = get_config();
+            let now = config::utils::time::now_micros();
+            let live_floor = live_handle
+                .as_ref()
+                .map(|_| compact::live_claim_floor(now, cfg.compact.live_lookback_hours));
+
+            if let (Some(live_handle), Some(floor)) = (live_handle.as_ref(), live_floor)
+                && let Err(e) =
                     compact::run_merge(live_handle, compact::MergeLane::Live { from: floor }).await
-                {
-                    log::error!("[COMPACTOR::JOB] run merge live error: {e}");
-                }
-                if let Err(e) =
-                    compact::run_merge(&main_handle, compact::MergeLane::Backlog { before: floor })
+            {
+                log::error!("[COMPACTOR::JOB] run merge live error: {e}");
+            }
+
+            let recent_floor = recent_handle.as_ref().and_then(|_| {
+                let floor = compact::live_claim_floor(now, cfg.compact.recent_lookback_hours);
+                let before = live_floor.unwrap_or(i64::MAX);
+                (floor < before).then_some((floor, before))
+            });
+            if let (Some(recent_handle), Some((from, before))) =
+                (recent_handle.as_ref(), recent_floor)
+                && let Err(e) =
+                    compact::run_merge(recent_handle, compact::MergeLane::Recent { from, before })
                         .await
-                {
-                    log::error!("[COMPACTOR::JOB] run merge backlog error: {e}");
-                }
-            } else if let Err(e) = compact::run_merge(&main_handle, compact::MergeLane::All).await {
-                log::error!("[COMPACTOR::JOB] run data merge error: {e}");
+            {
+                log::error!("[COMPACTOR::JOB] run merge recent error: {e}");
+            }
+
+            let backlog_floor = recent_floor.map(|(from, _)| from).or(live_floor);
+            let result = if let Some(before) = backlog_floor {
+                compact::run_merge(&main_handle, compact::MergeLane::Backlog { before }).await
+            } else {
+                compact::run_merge(&main_handle, compact::MergeLane::All).await
+            };
+            if let Err(e) = result {
+                log::error!("[COMPACTOR::JOB] run merge backlog error: {e}");
             }
         });
     }
@@ -375,4 +433,21 @@ async fn run_enrichment_table_merge() -> Result<(), anyhow::Error> {
     }
     crate::service::enrichment::storage::remote::run_merge_job().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::live_lane_job_split;
+
+    #[test]
+    fn recent_lane_splits_existing_live_capacity_only_when_valid() {
+        assert_eq!(live_lane_job_split(0, 2, 24), (0, 0));
+        assert_eq!(live_lane_job_split(1, 2, 24), (1, 0));
+        assert_eq!(live_lane_job_split(2, 2, 0), (2, 0));
+        assert_eq!(live_lane_job_split(2, -1, 0), (2, 0));
+        assert_eq!(live_lane_job_split(2, 0, 1), (2, 0));
+        assert_eq!(live_lane_job_split(2, 2, 2), (2, 0));
+        assert_eq!(live_lane_job_split(2, 2, 24), (1, 1));
+        assert_eq!(live_lane_job_split(7, 2, 24), (4, 3));
+    }
 }

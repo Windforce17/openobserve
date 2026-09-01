@@ -2733,13 +2733,13 @@ pub struct Compact {
     #[env_config(
         name = "ZO_COMPACT_LIVE_JOB_NUM",
         default = 2,
-        help = "Reserved scheduler slots that claim only recent-hour jobs (offsets >= now - ZO_COMPACT_LIVE_LOOKBACK_HOURS), so a storm backlog can never starve the open hour. 0 disables the live lane."
+        help = "Total reserved scheduler slots outside the FIFO backlog lane. Without ZO_COMPACT_RECENT_LOOKBACK_HOURS all slots claim hot jobs at offsets >= now - ZO_COMPACT_LIVE_LOOKBACK_HOURS. When the recent lane is enabled, capacity is split approximately in half and the hot lane keeps the extra odd slot. 0 disables both lanes."
     )]
     pub live_job_num: usize,
     #[env_config(
         name = "ZO_COMPACT_LIVE_WORKER_NUM",
         default = 2,
-        help = "Dedicated merge workers serving the live lane's batches."
+        help = "Dedicated merge workers shared by the hot and optional recent-history schedulers."
     )]
     pub live_worker_num: usize,
     #[env_config(
@@ -2748,6 +2748,12 @@ pub struct Compact {
         help = "The live lane claims jobs with offsets within this many hours of now."
     )]
     pub live_lookback_hours: i64,
+    #[env_config(
+        name = "ZO_COMPACT_RECENT_LOOKBACK_HOURS",
+        default = 0,
+        help = "Split the existing live lane between hot jobs and FIFO recent-history jobs in [now - this value, now - ZO_COMPACT_LIVE_LOOKBACK_HOURS). Requires ZO_COMPACT_LIVE_JOB_NUM >= 2; shares ZO_COMPACT_LIVE_WORKER_NUM workers, so enabling it does not add worker or scheduler capacity. 0 disables the split."
+    )]
+    pub recent_lookback_hours: i64,
     #[env_config(
         name = "ZO_COMPACT_DATA_RETENTION_INTERVAL",
         default = 3600,

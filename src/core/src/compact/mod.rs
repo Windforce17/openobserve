@@ -299,16 +299,17 @@ pub fn live_claim_floor(now_micros: i64, lookback_hours: i64) -> i64 {
     current_hour.saturating_sub(lookback_hours.max(1).saturating_mul(HOUR_MICROS))
 }
 
-/// A scheduler lane's database view. When live compaction is enabled callers
-/// use the same hour boundary for `Backlog` and `Live`, making the two claim
-/// sets disjoint by construction.
+/// A scheduler lane's database view. When recent-history compaction is
+/// enabled, callers use shared hour boundaries so all claim sets are disjoint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MergeLane {
     /// All pending jobs, oldest enqueue first.
     All,
-    /// Jobs strictly before the live floor, oldest enqueue/requeue first.
+    /// Jobs strictly before the recent-history floor, oldest enqueue/requeue first.
     Backlog { before: i64 },
-    /// Jobs at or after the live floor, newest offset first.
+    /// Closed historical jobs in `[from, before)`, oldest enqueue/requeue first.
+    Recent { from: i64, before: i64 },
+    /// Hot jobs at or after the live floor, newest offset first.
     Live { from: i64 },
 }
 
@@ -321,6 +322,12 @@ impl MergeLane {
                 None,
                 Some(before),
                 "backlog",
+            ),
+            Self::Recent { from, before } => (
+                FileListJobOrder::EnqueueOldest,
+                Some(from),
+                Some(before),
+                "recent",
             ),
             Self::Live { from } => (FileListJobOrder::OffsetNewest, Some(from), None, "live"),
         }
@@ -628,17 +635,47 @@ mod merge_lane_tests {
     use super::*;
 
     #[test]
-    fn live_and_backlog_claim_windows_are_disjoint() {
-        let floor = 1_725_000_000_000_000;
-        let backlog = MergeLane::Backlog { before: floor }.claim_spec();
-        let live = MergeLane::Live { from: floor }.claim_spec();
+    fn live_recent_and_backlog_claim_windows_are_disjoint() {
+        let recent_floor = 1_725_000_000_000_000;
+        let live_floor = recent_floor + 22 * HOUR_MICROS;
+        let backlog = MergeLane::Backlog {
+            before: recent_floor,
+        }
+        .claim_spec();
+        let recent = MergeLane::Recent {
+            from: recent_floor,
+            before: live_floor,
+        }
+        .claim_spec();
+        let live = MergeLane::Live { from: live_floor }.claim_spec();
 
-        assert_eq!(backlog.0, FileListJobOrder::EnqueueOldest);
-        assert_eq!(backlog.1, None);
-        assert_eq!(backlog.2, Some(floor));
-        assert_eq!(live.0, FileListJobOrder::OffsetNewest);
-        assert_eq!(live.1, Some(floor));
-        assert_eq!(live.2, None);
+        assert_eq!(
+            backlog,
+            (
+                FileListJobOrder::EnqueueOldest,
+                None,
+                Some(recent_floor),
+                "backlog",
+            )
+        );
+        assert_eq!(
+            recent,
+            (
+                FileListJobOrder::EnqueueOldest,
+                Some(recent_floor),
+                Some(live_floor),
+                "recent",
+            )
+        );
+        assert_eq!(
+            live,
+            (
+                FileListJobOrder::OffsetNewest,
+                Some(live_floor),
+                None,
+                "live",
+            )
+        );
     }
 
     #[test]
