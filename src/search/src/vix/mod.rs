@@ -357,10 +357,18 @@ pub async fn vix_search(
 
     let target_partitions =
         calc_target_partitions(cfg.limit.cpu_num, cfg.limit.query_thread_num, cached_ratio);
-    // Per-file index evaluation is a few small (usually cached) IO waits
-    // plus microseconds of CPU — far more IO- than CPU-bound. Fan it out
-    // beyond the DataFusion partition count (`ZO_VIX_SEARCH_CONCURRENCY`).
-    let eval_concurrency = cfg.limit.vix_search_concurrency.max(1);
+    // Remote-cold readers stay on the conservative per-query cap: otherwise
+    // five followers can multiply one histogram into an S3 request storm.
+    // A fully local equality histogram is disk/CPU bound and already sits
+    // behind the node-wide fetch gate, so let it use that larger concurrency.
+    let eval_concurrency = if native_histogram && all_index_sidecars_cached {
+        cfg.limit
+            .vix_search_concurrency
+            .max(cfg.common.vix_fetch_concurrency)
+            .max(1)
+    } else {
+        cfg.limit.vix_search_concurrency.max(1)
+    };
 
     log::info!(
         "[trace_id {trace_id}] search->vix: session target_partitions: {target_partitions}, eval_concurrency: {eval_concurrency}",
