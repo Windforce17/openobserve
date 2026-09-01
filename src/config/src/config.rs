@@ -1235,7 +1235,10 @@ pub struct Common {
     #[env_config(
         name = "ZO_SEGMENT_BUILD_BATCH",
         default = 32,
-        help = "Segment WAL: max segments one builder claim processes into L0 files. Bigger claims mean fewer, larger per-stream L0 files (a stream gets at most one file per claim per 128MB of ITS OWN decoded bytes), at the cost of the whole claim's decoded arrow held in RAM through the build: budget ~ batch x ZO_SEGMENT_FLUSH_SIZE_MB"
+        help = "Segment WAL: max segments one builder claim processes into L0 files. Bigger \
+                claims mean fewer, larger per-(stream, hour) L0 files (capped independently \
+                by ZO_SEGMENT_BUILD_CHUNK_MB), at the cost of the whole claim's decoded \
+                Arrow held in RAM through the build: budget ~ batch x ZO_SEGMENT_FLUSH_SIZE_MB"
     )]
     pub segment_build_batch: usize,
     #[env_config(
@@ -1250,6 +1253,15 @@ pub struct Common {
                 apply identically in both modes."
     )]
     pub segment_build_claim_mb: usize,
+    #[env_config(
+        name = "ZO_SEGMENT_BUILD_CHUNK_MB",
+        default = 128,
+        help = "Segment WAL: maximum decoded Arrow MiB accumulated into one direct L0 build \
+                for a single (stream, actual timestamp hour) inside one contiguous segment-ID \
+                run. The cap is applied only between whole per-segment/hour contributions, so \
+                an oversized contribution still builds alone. Floor 1 MiB."
+    )]
+    pub segment_build_chunk_mb: usize,
     #[env_config(
         name = "ZO_SEGMENT_BUILD_CONCURRENCY",
         default = 16,
@@ -2136,6 +2148,18 @@ pub struct Common {
 impl Common {
     pub fn should_create_span(&self) -> bool {
         self.tracing_enabled || self.tracing_search_enabled || self.search_inspector_enabled
+    }
+
+    /// Decoded-byte cap for one segment-builder `(stream, hour)` chunk.
+    ///
+    /// Compute this directly from the normalized config on every use: config
+    /// is already process-global, so a second cache would make tests and
+    /// runtime overrides observe different values. Saturation keeps an
+    /// extreme environment override from wrapping to a tiny admission cap.
+    pub fn segment_build_chunk_bytes(&self) -> usize {
+        self.segment_build_chunk_mb
+            .max(1)
+            .saturating_mul(1024 * 1024)
     }
 }
 
@@ -3830,6 +3854,9 @@ fn check_common_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
             cfg.common.segment_build_batch
         ));
     }
+    // A zero-sized chunk would make every non-empty contribution look
+    // oversized. Keep the unit useful and let the byte conversion saturate.
+    cfg.common.segment_build_chunk_mb = cfg.common.segment_build_chunk_mb.max(1);
     // M12 item 5: floor 1 — a zero would stall the small-build stream
     cfg.common.segment_build_concurrency = cfg.common.segment_build_concurrency.max(1);
     // M13 item 1c: floor 1 — a zero would stall fetch+decode entirely
@@ -4769,6 +4796,32 @@ mod tests {
         let cfg = Config::init().unwrap();
         assert_eq!(cfg.common.segment_build_memory_budget_mb, 6144);
 
+        unsafe { std::env::remove_var(key) };
+    }
+
+    /// Direct L0 chunk sizing is 128 MiB by default, accepts an environment
+    /// override, floors zero, and converts without overflow.
+    #[test]
+    fn segment_build_chunk_default_override_and_safe_bytes() {
+        let key = "ZO_SEGMENT_BUILD_CHUNK_MB";
+        unsafe { std::env::remove_var(key) };
+        let cfg = Config::init().unwrap();
+        assert_eq!(cfg.common.segment_build_chunk_mb, 128);
+        assert_eq!(cfg.common.segment_build_chunk_bytes(), 128 * 1024 * 1024);
+
+        unsafe { std::env::set_var(key, "512") };
+        let cfg = Config::init().unwrap();
+        assert_eq!(cfg.common.segment_build_chunk_mb, 512);
+        assert_eq!(cfg.common.segment_build_chunk_bytes(), 512 * 1024 * 1024);
+
+        unsafe { std::env::set_var(key, "0") };
+        let mut cfg = Config::init().unwrap();
+        check_common_config(&mut cfg).unwrap();
+        assert_eq!(cfg.common.segment_build_chunk_mb, 1);
+        assert_eq!(cfg.common.segment_build_chunk_bytes(), 1024 * 1024);
+
+        cfg.common.segment_build_chunk_mb = usize::MAX;
+        assert_eq!(cfg.common.segment_build_chunk_bytes(), usize::MAX);
         unsafe { std::env::remove_var(key) };
     }
 

@@ -25,13 +25,12 @@
 //! mid-work), fetch + decode each object with a small bounded concurrency
 //! (a segment that fails to fetch or decode is SKIPPED and left leased —
 //! the lease expires and it retries; it never blocks the rest of the
-//! batch), split the DECODED ids into contiguous runs, and per run: chunk
-//! each stream's frames on ITS OWN decoded bytes (`chunk_run_per_stream` —
-//! per-stream chunking is what keeps a stream's file count proportional to
-//! its own volume instead of the fleet's segment cadence), homogenize each
-//! chunk's write-time schemas ONCE (this is the designed single place
-//! type-flips get resolved), split rows into hourly buckets, and build ONE
-//! L0 file per (stream chunk, hour) through the exact same single-file
+//! batch), split each contiguous decoded ID run into independent
+//! `(stream, actual timestamp hour)` contribution sequences, cap each
+//! sequence on ITS OWN decoded bytes (`chunk_run_per_stream_hour`), homogenize
+//! each chunk's write-time schemas ONCE (this is the designed single place
+//! type-flips get resolved), validate that it still contains exactly its
+//! planned hour, and build ONE L0 file through the exact same single-file
 //! build the WAL mover uses (`write_core_file_from_tables` for logs/traces
 //! `.vix`, `merge_parquet_files` for everything else) so compaction and the
 //! query path stay completely unchanged. Before the FIRST upload, the batch's
@@ -45,17 +44,17 @@
 //! between registration and the flip, and a lost lease rolls the
 //! registration back whole.
 //!
-//! Provenance: L0 object keys are a pure function of (the stream's chunk
-//! ids, stream, hour) — `l0_{writer uuid|multi}_{chunk min id}_{chunk max
-//! id}_{hour index}` — and a chunk only ever spans CONSECUTIVE decoded ids
-//! (each stream's chunk ranges tile its run's whole id span), so every id
-//! inside a registered key range is genuinely contained in the file: a
-//! covered segment either contributed its rows for that stream or carried
-//! none. The leader dedups candidates PER STREAM against that stream's own
-//! registered `l0_` ranges, so different streams cutting the same run at
-//! different byte boundaries is sound. A skipped id splits the runs around
-//! it, stays outside every range, and remains queryable as a segment. Any build/upload failure
-//! aborts the WHOLE batch before anything is registered, the segments stay leased, and
+//! Provenance: L0 object keys are a pure function of (the stream/hour
+//! chunk's ids, stream, hour) — `l0_{writer uuid|multi}_{chunk min
+//! id}_{chunk max id}_{hour index}` — and a chunk only ever spans
+//! CONSECUTIVE decoded ids. For every `(stream, hour)` present in a run, its
+//! chunk ranges tile that run's whole id span, so every id inside a
+//! registered key range is genuinely covered: a segment either contributed
+//! rows to that stream/hour or carried none. The leader dedups candidates
+//! PER STREAM against that stream's own registered `l0_` ranges. A skipped
+//! ID splits the runs around it, stays outside every range, and remains
+//! queryable as a segment. Any build/upload failure aborts the WHOLE batch
+//! before anything is registered, the segments stay leased, and
 //! the expired lease retries them; the retry's identical decode set
 //! re-produces identical keys, so uploads overwrite the same objects.
 
@@ -70,8 +69,11 @@ use std::{
 
 use anyhow::{Context, anyhow};
 use arrow::{
-    array::{Array, ArrayRef, BooleanArray, Int64Array, new_null_array},
-    compute::{cast, concat_batches, filter_record_batch},
+    array::{
+        Array, ArrayRef, BinaryViewArray, BooleanArray, Int64Array, StringViewArray, UInt32Array,
+        new_null_array,
+    },
+    compute::{cast, concat_batches, filter_record_batch, take_record_batch},
     record_batch::RecordBatch,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -92,10 +94,7 @@ use config::{
 use futures::StreamExt;
 use hashbrown::HashMap;
 use infra::{
-    schema::{
-        get_stream_setting_bloom_filter_fields,
-        get_stream_setting_fts_fields,
-    },
+    schema::{get_stream_setting_bloom_filter_fields, get_stream_setting_fts_fields},
     storage,
     wal_segments::{self, ClaimOrder, SegmentMeta},
 };
@@ -1023,26 +1022,39 @@ async fn process_claim(claim: &[SegmentMeta], node: &str) -> Result<BatchStats, 
 
     let meta_by_id: HashMap<i64, &SegmentMeta> = claim.iter().map(|m| (m.id, m)).collect();
 
-    // Plan every (stream chunk) build first. Chunk inputs are measured in
-    // DECODED arrow bytes — the compressed column `size` under-measured
-    // traces ~10x and OOM'd the pool (2026-07-31) — and the byte cap is per
-    // STREAM (`chunk_run_per_stream`): capping the run's aggregate bytes
-    // emitted a sliver file for every stream in every ~128MB of fleet
-    // traffic. The plans are then executed with bounded concurrency;
-    // oversized singletons run with the whole budget to themselves.
+    // Plan every `(stream, actual timestamp hour)` build first. Inputs are
+    // measured in DECODED arrow bytes — the compressed column `size`
+    // under-measured traces ~10x and OOM'd the pool (2026-07-31). The cap is
+    // independent per stream/hour inside each contiguous ID run, and is
+    // applied only after aggregating one segment's whole contribution. The
+    // plans are then executed with bounded concurrency; oversized
+    // contributions run with the whole budget to themselves.
     struct BuildPlan {
         key_parts: L0KeyParts,
         group: StreamGroup,
+        hour_start_micros: i64,
         decoded_bytes: usize,
     }
     let mut plans: Vec<BuildPlan> = Vec::new();
     let mut stream_keys: BTreeSet<String> = BTreeSet::new();
+    let build_chunk_bytes = build_chunk_max_decoded_bytes();
+    let scratch_bytes = planning_scratch_bytes(&decoded);
+    let scratch_reservation = if scratch_bytes == 0 {
+        None
+    } else {
+        Some(
+            BUILD_MEMORY_BUDGET
+                .acquire(scratch_bytes as u64, BudgetClass::Build)
+                .await,
+        )
+    };
     for run in split_into_id_runs(decoded) {
-        for chunked in chunk_run_per_stream(run) {
+        for chunked in chunk_run_per_stream_hour(run, build_chunk_bytes)? {
             let StreamChunks {
                 org,
                 stream_type,
                 stream,
+                hour_start_micros,
                 chunks,
             } = chunked;
             stream_keys.insert(format!("{org}/{stream_type}/{stream}"));
@@ -1065,11 +1077,17 @@ async fn process_claim(claim: &[SegmentMeta], node: &str) -> Result<BatchStats, 
                         stream: stream.clone(),
                         batches: chunk.batches,
                     },
+                    hour_start_micros,
                     decoded_bytes: chunk.decoded_bytes,
                 });
             }
         }
     }
+    let planned_decoded_bytes = plans.iter().fold(0u64, |bytes, plan| {
+        bytes.saturating_add(plan.decoded_bytes as u64)
+    });
+    claim_reservation.resize(planned_decoded_bytes);
+    drop(scratch_reservation);
 
     // Execute: small builds run ZO_SEGMENT_BUILD_CONCURRENCY at a time
     // (the M12 count cap, secondary since M17), each first RESERVING its
@@ -1080,14 +1098,16 @@ async fn process_claim(claim: &[SegmentMeta], node: &str) -> Result<BatchStats, 
     // SERIALLY so nothing stacks beside it.
     let (large, small): (Vec<BuildPlan>, Vec<BuildPlan>) = plans
         .into_iter()
-        .partition(|p| p.decoded_bytes > BUILD_GROUP_MAX_DECODED_BYTES);
+        .partition(|plan| is_serial_oversized(plan.decoded_bytes, build_chunk_bytes));
     let mut built_files: Vec<BuiltL0File> = Vec::new();
     let mut rows: i64 = 0;
     let mut small_results = futures::stream::iter(small.into_iter().map(|plan| async move {
         let _admitted = BUILD_MEMORY_BUDGET
             .acquire(plan.decoded_bytes as u64, BudgetClass::Build)
             .await;
-        build_stream_files(plan.group, &plan.key_parts).await
+        let stream_files = build_stream_files(plan.group, &plan.key_parts).await?;
+        validate_planned_hour(&stream_files, plan.hour_start_micros)?;
+        Ok::<_, anyhow::Error>(stream_files)
     }))
     .buffered(build_concurrency());
     while let Some(result) = small_results.next().await {
@@ -1104,6 +1124,7 @@ async fn process_claim(claim: &[SegmentMeta], node: &str) -> Result<BatchStats, 
             .acquire(plan.decoded_bytes as u64, BudgetClass::Build)
             .await;
         let stream_files = build_stream_files(plan.group, &plan.key_parts).await?;
+        validate_planned_hour(&stream_files, plan.hour_start_micros)?;
         rows += stream_files
             .iter()
             .map(|f| f.file.meta.records)
@@ -1201,40 +1222,37 @@ async fn process_claim(claim: &[SegmentMeta], node: &str) -> Result<BatchStats, 
     })
 }
 
-/// DECODED arrow bytes one stream chunk may feed into its build. The L0
-/// sort runs inside the ingester's DataFusion pool (2048MB) and its
-/// repartition + external sort together peak at ~3x the decoded input, so
-/// chunks are capped on the size that actually matters — the compressed
-/// `size` column under-measured traces ~10x and kept the OOM loop alive
-/// (2026-07-31).
-const BUILD_CHUNK_MAX_DECODED_BYTES: usize = 128 * 1024 * 1024;
+/// A single stream/hour contribution sequence is capped on decoded Arrow
+/// bytes. The configured MiB value is normalized by `config::Common` and
+/// converted without a second process-global cache.
+fn build_chunk_max_decoded_bytes() -> usize {
+    get_config().common.segment_build_chunk_bytes()
+}
 
-/// A single stream-chunk build larger than this runs SERIALLY with the
-/// whole pool to itself (oversized backlog segments must still build —
-/// alone, not beside two siblings).
-const BUILD_GROUP_MAX_DECODED_BYTES: usize = 160 * 1024 * 1024;
+fn is_serial_oversized(decoded_bytes: usize, build_chunk_bytes: usize) -> bool {
+    decoded_bytes > build_chunk_bytes.max(1)
+}
 
 /// Concurrent small builds per claim (`ZO_SEGMENT_BUILD_CONCURRENCY`, M12
-/// item 5 — was a hardcoded 3). Default 3 keeps today's behavior: 3 ×
-/// (~128MB decoded input) resident batches multiply drain throughput while
-/// staying modest on an 8Gi ingester; since M12's direct sorted-batch build
-/// the DataFusion pool is not involved for logs/traces at all, so dedicated
-/// builder/compactor pods can safely run higher (prod: ~370 seg/min
-/// arrivals vs ~195/min fleet builds at 3-per-pod). Floor 1 (config clamp).
+/// item 5). The decoded-byte admission budget remains the binding control:
+/// builds run wide only when their configured hour-aware chunks fit, while
+/// dedicated builder/compactor pods may raise the secondary count cap.
+/// Floor 1 (config clamp).
 fn build_concurrency() -> usize {
     get_config().common.segment_build_concurrency.max(1)
 }
 
-/// One stream's identity plus its byte-capped chunks out of one contiguous
-/// decoded run.
+/// One `(stream, actual timestamp hour)` identity plus its byte-capped
+/// chunks out of one contiguous decoded run.
 struct StreamChunks {
     org: String,
     stream_type: StreamType,
     stream: String,
+    hour_start_micros: i64,
     chunks: Vec<StreamChunk>,
 }
 
-/// A consecutive sub-range of a run's ids plus the stream's frames from
+/// A consecutive sub-range of a run's ids plus one stream/hour's rows from
 /// exactly those segments; `[start_id, end_id]` becomes the file's
 /// provenance range.
 struct StreamChunk {
@@ -1244,130 +1262,284 @@ struct StreamChunk {
     decoded_bytes: usize,
 }
 
-/// Chunk one CONTIGUOUS decoded run per stream: each stream accumulates ITS
-/// OWN frames in id order and closes a chunk (on whole-segment boundaries
-/// only) as soon as adding the next segment's frames would exceed
-/// [`BUILD_CHUNK_MAX_DECODED_BYTES`]; a single oversized segment still
-/// builds alone — nothing is ever skipped. Every stream's chunk ranges tile
-/// the run's WHOLE id span — the first chunk starts at the run's first id,
-/// each successor starts right after its predecessor closes, the last ends
-/// at the run's last id — so provenance ranges stay consecutive-and-covered
-/// (a covered segment either contributed its rows for the stream or carried
-/// none) while different streams cut the same run at different byte
-/// boundaries; segments carrying no frames for a stream extend its open
-/// chunk's range without adding bytes. Purely a function of the run's ids
-/// and per-(segment, stream) decoded frame sizes, so re-claims of the same
-/// decode set reproduce identical chunks and therefore identical keys.
+fn same_valid_metadata_hour(frame: &SegmentFrame) -> Option<i64> {
+    if frame.min_ts <= 0 || frame.max_ts <= 0 {
+        return None;
+    }
+    let min_hour = frame.min_ts.div_euclid(HOUR_MICROS) * HOUR_MICROS;
+    let max_hour = frame.max_ts.div_euclid(HOUR_MICROS) * HOUR_MICROS;
+    (min_hour == max_hour).then_some(min_hour)
+}
+
+/// Peak-copy reservation for eager hour splitting. Same-hour frames move
+/// through unchanged and need no scratch; every frame that must be inspected
+/// may coexist briefly with materialized hour buckets of its full decoded
+/// size.
+fn planning_scratch_bytes(decoded: &[(i64, Vec<SegmentFrame>)]) -> usize {
+    decoded
+        .iter()
+        .flat_map(|(_, frames)| frames)
+        .filter(|frame| same_valid_metadata_hour(frame).is_none())
+        .fold(0usize, |bytes, frame| {
+            bytes.saturating_add(frame.batch.size())
+        })
+}
+
+/// `take_record_batch` materializes fixed-width/classic variable-width
+/// arrays, but Arrow's Utf8View/BinaryView take kernel intentionally
+/// shallow-clones every source data buffer. GC top-level view arrays after
+/// selection so a tiny old-hour bucket owns only its retained non-inline
+/// values. Segment frames are flat record batches; nested reconstruction is
+/// deliberately outside this path.
+fn compact_top_level_view_arrays(
+    batch: RecordBatch,
+    ctx: &str,
+) -> Result<RecordBatch, anyhow::Error> {
+    let mut compacted = false;
+    let mut columns = Vec::with_capacity(batch.num_columns());
+    for column in batch.columns() {
+        let column: ArrayRef = match column.data_type() {
+            DataType::Utf8View => {
+                let view = column
+                    .as_any()
+                    .downcast_ref::<StringViewArray>()
+                    .ok_or_else(|| anyhow!("{ctx}: Utf8View column failed concrete downcast"))?;
+                compacted = true;
+                Arc::new(view.gc())
+            }
+            DataType::BinaryView => {
+                let view = column
+                    .as_any()
+                    .downcast_ref::<BinaryViewArray>()
+                    .ok_or_else(|| anyhow!("{ctx}: BinaryView column failed concrete downcast"))?;
+                compacted = true;
+                Arc::new(view.gc())
+            }
+            _ => Arc::clone(column),
+        };
+        columns.push(column);
+    }
+    if !compacted {
+        return Ok(batch);
+    }
+    RecordBatch::try_new(batch.schema(), columns)
+        .with_context(|| format!("{ctx}: rebuild batch after compacting view arrays"))
+}
+
+/// Partition one frame by the ACTUAL `_timestamp` values that the builder
+/// will use. The frame header's min/max are produced from those same rows;
+/// when both are valid and share an hour, the whole frame moves through
+/// zero-copy without inspecting or casting its arrays. A spanning frame is
+/// scanned once into ordered `hour -> row indices` buckets, then each bucket
+/// is taken into compact arrays in O(rows + output) work.
 ///
-/// The PER-STREAM cap is the point of this shape: capping the run's
-/// aggregate bytes (the pre-2026-08-07 behavior) closed a sub-run for every
-/// ~128MB of fleet-wide traffic and emitted one file for EVERY stream
-/// present in it, so a stream at ~1% of traffic still got ~10k sliver L0
-/// files/hour — per-file query arithmetic 10-30x'd the orbit services view
-/// until compaction caught up hours later.
-fn chunk_run_per_stream(run: Vec<(i64, Vec<SegmentFrame>)>) -> Vec<StreamChunks> {
+/// Timestamp casts and degenerate rows follow the normal builder
+/// conventions. Null/zero/negative rows ride with the earliest valid hour
+/// and are dropped exactly once by `filter_degenerate_ts`; an all-degenerate
+/// frame uses its metadata only as a carry bucket and can produce no key.
+fn split_frame_by_actual_hour(
+    frame: SegmentFrame,
+) -> Result<(String, StreamType, String, Vec<(i64, RecordBatch)>), anyhow::Error> {
+    if let Some(hour) = same_valid_metadata_hour(&frame) {
+        return Ok((
+            frame.org,
+            frame.stream_type,
+            frame.stream,
+            vec![(hour, frame.batch)],
+        ));
+    }
+
+    let SegmentFrame {
+        org,
+        stream_type,
+        stream,
+        min_ts,
+        batch,
+        ..
+    } = frame;
+    let ctx = format!("{org}/{stream_type}/{stream}");
+    let raw_ts = batch
+        .column_by_name(TIMESTAMP_COL_NAME)
+        .ok_or_else(|| anyhow!("{ctx}: batch is missing {TIMESTAMP_COL_NAME}"))?;
+    let cast_ts = if raw_ts.data_type() == &DataType::Int64 {
+        Arc::clone(raw_ts)
+    } else {
+        cast(raw_ts, &DataType::Int64).with_context(|| {
+            format!(
+                "{ctx}: cast field {TIMESTAMP_COL_NAME:?} from {} to Int64",
+                raw_ts.data_type()
+            )
+        })?
+    };
+    let ts = cast_ts
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| anyhow!("{ctx}: {TIMESTAMP_COL_NAME} is not Int64 after cast"))?;
+
+    let mut rows_by_hour: HashMap<i64, Vec<u32>> = HashMap::new();
+    let mut degenerate_rows = Vec::new();
+    for (row, value) in ts.iter().enumerate() {
+        let row = u32::try_from(row)
+            .with_context(|| format!("{ctx}: row index exceeds Arrow UInt32 take capacity"))?;
+        match value {
+            Some(value) if value > 0 => {
+                let hour = value.div_euclid(HOUR_MICROS) * HOUR_MICROS;
+                rows_by_hour.entry(hour).or_default().push(row);
+            }
+            _ => degenerate_rows.push(row),
+        }
+    }
+
+    if rows_by_hour.len() <= 1 {
+        let hour = rows_by_hour
+            .keys()
+            .next()
+            .copied()
+            .unwrap_or_else(|| min_ts.max(0).div_euclid(HOUR_MICROS) * HOUR_MICROS);
+        return Ok((org, stream_type, stream, vec![(hour, batch)]));
+    }
+
+    let first_hour = *rows_by_hour
+        .keys()
+        .min()
+        .expect("multi-hour map is non-empty");
+    let first_rows = rows_by_hour
+        .get_mut(&first_hour)
+        .expect("first hour came from the map");
+    first_rows.extend(degenerate_rows);
+    first_rows.sort_unstable();
+
+    let mut ordered_hours: Vec<_> = rows_by_hour.into_iter().collect();
+    ordered_hours.sort_unstable_by_key(|(hour, _)| *hour);
+    let mut split = Vec::with_capacity(ordered_hours.len());
+    for (hour, rows) in ordered_hours {
+        let indices = UInt32Array::from(rows);
+        let retained = take_record_batch(&batch, &indices)
+            .with_context(|| format!("{ctx}: materialize rows for hour {hour}"))?;
+        let retained = compact_top_level_view_arrays(retained, &ctx)?;
+        split.push((hour, retained));
+    }
+    Ok((org, stream_type, stream, split))
+}
+
+/// Chunk one CONTIGUOUS decoded run per `(stream, actual timestamp hour)`.
+/// Every segment's frames are first split by their real row timestamps, then
+/// all batches for one segment/stream/hour are aggregated before the cap
+/// decision. Thus a boundary can occur only between segment contributions;
+/// a single oversized contribution remains alone and nothing is skipped.
+///
+/// Every emitted hour's ranges tile the run's WHOLE ID span: the first chunk
+/// begins at `run_first`, each successor begins immediately after its
+/// predecessor, and the tail seals at `run_last`. IDs without rows for that
+/// hour therefore extend provenance without opening gaps or crossing a
+/// missing decoded ID. The BTree maps make stream/hour and chunk order a pure
+/// function of the decoded run.
+fn chunk_run_per_stream_hour(
+    run: Vec<(i64, Vec<SegmentFrame>)>,
+    max_decoded_bytes: usize,
+) -> Result<Vec<StreamChunks>, anyhow::Error> {
     let Some(run_first) = run.first().map(|(id, _)| *id) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let run_last = run.last().map(|(id, _)| *id).unwrap_or(run_first);
+    let max_decoded_bytes = max_decoded_bytes.max(1);
 
     struct Accum {
         org: String,
         stream_type: StreamType,
         stream: String,
+        hour_start_micros: i64,
         done: Vec<StreamChunk>,
         open_start: i64,
         open_batches: Vec<RecordBatch>,
         open_bytes: usize,
     }
-    // BTreeMap keeps the emitted stream order deterministic
-    let mut accums: BTreeMap<String, Accum> = BTreeMap::new();
+    // `(stream identity, hour)` ordering is deterministic.
+    let mut accums: BTreeMap<(String, i64), Accum> = BTreeMap::new();
 
     for (id, frames) in run {
-        // group THIS segment's frames per stream first (preserving frame
-        // order), so the close/open decision sees the segment's whole
-        // contribution at once — chunks close on segment boundaries only
-        let mut seg_order: Vec<String> = Vec::new();
-        let mut seg_groups: HashMap<String, (Vec<SegmentFrame>, usize)> = HashMap::new();
+        // Aggregate THIS segment's entire contribution before deciding
+        // whether it fits. BTree order also removes dependence on frame
+        // interleaving while each contribution retains frame order.
+        let mut segment_groups: BTreeMap<
+            (String, i64),
+            (String, StreamType, String, Vec<RecordBatch>, usize),
+        > = BTreeMap::new();
         for frame in frames {
-            let key = format!("{}/{}/{}", frame.org, frame.stream_type, frame.stream);
-            let bytes = frame.batch.size();
-            match seg_groups.get_mut(&key) {
-                Some((group_frames, group_bytes)) => {
-                    group_frames.push(frame);
-                    *group_bytes = group_bytes.saturating_add(bytes);
-                }
-                None => {
-                    seg_order.push(key.clone());
-                    seg_groups.insert(key, (vec![frame], bytes));
-                }
+            let (org, stream_type, stream, hourly) = split_frame_by_actual_hour(frame)?;
+            let stream_key = format!("{org}/{stream_type}/{stream}");
+            for (hour_start_micros, batch) in hourly {
+                let bytes = batch.size();
+                let contribution = segment_groups
+                    .entry((stream_key.clone(), hour_start_micros))
+                    .or_insert_with(|| (org.clone(), stream_type, stream.clone(), Vec::new(), 0));
+                contribution.3.push(batch);
+                contribution.4 = contribution.4.saturating_add(bytes);
             }
         }
-        for key in seg_order {
-            let Some((group_frames, group_bytes)) = seg_groups.remove(&key) else {
-                continue;
-            };
-            let first = &group_frames[0];
-            let acc = accums.entry(key).or_insert_with(|| Accum {
-                org: first.org.clone(),
-                stream_type: first.stream_type,
-                stream: first.stream.clone(),
-                done: Vec::new(),
-                open_start: run_first,
-                open_batches: Vec::new(),
-                open_bytes: 0,
-            });
+
+        for ((stream_key, hour_start_micros), contribution) in segment_groups {
+            let (org, stream_type, stream, batches, contribution_bytes) = contribution;
+            let acc = accums
+                .entry((stream_key, hour_start_micros))
+                .or_insert_with(|| Accum {
+                    org,
+                    stream_type,
+                    stream,
+                    hour_start_micros,
+                    done: Vec::new(),
+                    open_start: run_first,
+                    open_batches: Vec::new(),
+                    open_bytes: 0,
+                });
             if acc.open_bytes > 0
-                && acc.open_bytes.saturating_add(group_bytes) > BUILD_CHUNK_MAX_DECODED_BYTES
+                && acc.open_bytes.saturating_add(contribution_bytes) > max_decoded_bytes
             {
                 acc.done.push(StreamChunk {
                     start_id: acc.open_start,
-                    // ids inside a run are consecutive, so the previous
-                    // segment is exactly id - 1
+                    // The caller split missing decoded IDs into another run.
                     end_id: id - 1,
                     batches: std::mem::take(&mut acc.open_batches),
                     decoded_bytes: std::mem::replace(&mut acc.open_bytes, 0),
                 });
                 acc.open_start = id;
             }
-            acc.open_batches
-                .extend(group_frames.into_iter().map(|f| f.batch));
-            acc.open_bytes = acc.open_bytes.saturating_add(group_bytes);
+            acc.open_batches.extend(batches);
+            acc.open_bytes = acc.open_bytes.saturating_add(contribution_bytes);
         }
     }
 
-    accums
+    Ok(accums
         .into_values()
-        .map(|acc| {
+        .filter_map(|acc| {
             let Accum {
                 org,
                 stream_type,
                 stream,
+                hour_start_micros,
                 mut done,
                 open_start,
                 open_batches,
                 open_bytes,
             } = acc;
-            // the open chunk is never empty here: an accumulator only exists
-            // once frames arrived, and every close is immediately followed
-            // by an extend
-            if !open_batches.is_empty() {
-                done.push(StreamChunk {
-                    start_id: open_start,
-                    end_id: run_last,
-                    batches: open_batches,
-                    decoded_bytes: open_bytes,
-                });
+            if open_batches.is_empty() {
+                return None;
             }
-            StreamChunks {
+            done.push(StreamChunk {
+                start_id: open_start,
+                end_id: run_last,
+                batches: open_batches,
+                decoded_bytes: open_bytes,
+            });
+            Some(StreamChunks {
                 org,
                 stream_type,
                 stream,
+                hour_start_micros,
                 chunks: done,
-            }
+            })
         })
-        .filter(|s| !s.chunks.is_empty())
-        .collect()
+        .collect())
 }
 
 fn split_into_id_runs<T>(mut decoded: Vec<(i64, T)>) -> Vec<Vec<(i64, T)>> {
@@ -1414,6 +1586,32 @@ struct BuiltL0File {
     /// key: collecting an orphan `.vix` also attempts its derived sidecar
     /// key (`compact::segments_sweep`).
     index: Option<Vec<u8>>,
+}
+
+/// Guard the planner/build boundary: an hour-aware plan must produce at most
+/// one file and every retained row must remain in the hour used for its
+/// deterministic key. This leaves `build_stream_files`' schema, casting and
+/// degenerate-row validation intact while making a planner regression fail
+/// before planned keys or uploads.
+fn validate_planned_hour(files: &[BuiltL0File], expected_hour: i64) -> Result<(), anyhow::Error> {
+    if files.len() > 1 {
+        return Err(anyhow!(
+            "hour-aware segment plan for {expected_hour} produced {} files",
+            files.len()
+        ));
+    }
+    if let Some(file) = files.first()
+        && (file.file.meta.min_ts.div_euclid(HOUR_MICROS) * HOUR_MICROS != expected_hour
+            || file.file.meta.max_ts.div_euclid(HOUR_MICROS) * HOUR_MICROS != expected_hour)
+    {
+        return Err(anyhow!(
+            "hour-aware segment plan for {expected_hour} built out-of-hour range {}..{} ({})",
+            file.file.meta.min_ts,
+            file.file.meta.max_ts,
+            file.file.key
+        ));
+    }
+    Ok(())
 }
 
 /// PUT one built L0 file, consuming its payload. A failure aborts the whole
@@ -2999,153 +3197,359 @@ mod tests {
         wal_segments::mark_built(&mine, "m13-sb-sweep").await.unwrap();
     }
 
-    // ── contiguous runs + deterministic keys ─────────────────────────────
+    // ── hour-aware contiguous-run planning ──────────────────────────────
 
-    #[test]
-    fn test_chunk_run_per_stream_caps_each_stream_on_its_own_bytes() {
-        // "big" carries ~2/3 of the cap per segment; "tiny" a few rows. The
-        // aggregate crosses the cap every other segment, but ONLY the big
-        // stream may split — the tiny stream must come out as ONE chunk
-        // spanning the whole run (the sliver-file regression, 2026-08-07).
-        let big_rows = (BUILD_CHUNK_MAX_DECODED_BYTES * 2 / 3) / 8; // 8 bytes per i64 row
-        let frame_of = |stream: &str, n: usize| {
-            let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
-            let batch =
-                RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![7i64; n]))])
-                    .unwrap();
-            SegmentFrame {
-                org: "o".into(),
-                stream_type: StreamType::Logs,
-                stream: stream.into(),
-                min_ts: 1,
-                max_ts: 2,
-                batch,
-            }
-        };
-        let run = vec![
-            (1, vec![frame_of("big", big_rows), frame_of("tiny", 4)]),
-            (2, vec![frame_of("big", big_rows), frame_of("tiny", 4)]),
-            (3, vec![frame_of("big", big_rows), frame_of("tiny", 4)]),
-        ];
-        let chunked = chunk_run_per_stream(run);
-        assert_eq!(chunked.len(), 2);
+    fn planner_frame(stream: &str, timestamps: Vec<i64>) -> SegmentFrame {
+        let min_ts = timestamps.iter().copied().min().unwrap_or(0);
+        let max_ts = timestamps.iter().copied().max().unwrap_or(0);
+        let values: Vec<i64> = (0..timestamps.len()).map(|i| i as i64).collect();
+        let schema = schema_of(vec![ts_field(), Field::new("v", DataType::Int64, false)]);
+        SegmentFrame {
+            org: "o".into(),
+            stream_type: StreamType::Logs,
+            stream: stream.into(),
+            min_ts,
+            max_ts,
+            batch: RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(Int64Array::from(timestamps)),
+                    Arc::new(Int64Array::from(values)),
+                ],
+            )
+            .unwrap(),
+        }
+    }
 
-        let big = chunked.iter().find(|s| s.stream == "big").unwrap();
-        let ranges: Vec<(i64, i64)> = big.chunks.iter().map(|c| (c.start_id, c.end_id)).collect();
-        // seg1 alone (adding seg2 would overflow its cap), then seg2, then
-        // seg3 — and the ranges tile the run without gaps
-        assert_eq!(ranges, vec![(1, 1), (2, 2), (3, 3)]);
-        assert!(big.chunks.iter().all(|c| !c.batches.is_empty()));
-
-        let tiny = chunked.iter().find(|s| s.stream == "tiny").unwrap();
-        let ranges: Vec<(i64, i64)> = tiny.chunks.iter().map(|c| (c.start_id, c.end_id)).collect();
-        assert_eq!(
-            ranges,
-            vec![(1, 3)],
-            "a small stream must not inherit its neighbors' chunk boundaries"
-        );
-        assert_eq!(tiny.chunks[0].batches.len(), 3);
+    fn planner_shape(groups: &[StreamChunks]) -> Vec<(String, i64, Vec<(i64, i64)>, usize)> {
+        groups
+            .iter()
+            .map(|group| {
+                (
+                    group.stream.clone(),
+                    group.hour_start_micros,
+                    group
+                        .chunks
+                        .iter()
+                        .map(|chunk| (chunk.start_id, chunk.end_id))
+                        .collect(),
+                    group
+                        .chunks
+                        .iter()
+                        .flat_map(|chunk| &chunk.batches)
+                        .map(RecordBatch::num_rows)
+                        .sum(),
+                )
+            })
+            .collect()
     }
 
     #[test]
-    fn test_chunk_run_per_stream_absent_segments_extend_ranges() {
-        // stream "gappy" appears only in segments 5 and 7 of run 4..=8: its
-        // single chunk must still cover the whole run [4, 8] — covered ids
-        // without frames contribute no rows, so the wider range is sound and
-        // keeps ranges tiling the run.
-        let frame_of = |stream: &str| {
-            let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
-            let batch =
-                RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![7i64; 2]))])
-                    .unwrap();
-            SegmentFrame {
-                org: "o".into(),
-                stream_type: StreamType::Logs,
-                stream: stream.into(),
-                min_ts: 1,
-                max_ts: 2,
-                batch,
-            }
-        };
-        let run = vec![
-            (4, vec![frame_of("steady")]),
-            (5, vec![frame_of("steady"), frame_of("gappy")]),
-            (6, vec![frame_of("steady")]),
-            (7, vec![frame_of("gappy")]),
-            (8, vec![frame_of("steady")]),
-        ];
-        let chunked = chunk_run_per_stream(run);
-        for group in &chunked {
-            assert_eq!(group.chunks.len(), 1);
-            assert_eq!(
-                (group.chunks[0].start_id, group.chunks[0].end_id),
-                (4, 8),
-                "stream {} must span the whole run",
-                group.stream
-            );
-        }
-        let gappy = chunked.iter().find(|s| s.stream == "gappy").unwrap();
-        assert_eq!(gappy.chunks[0].batches.len(), 2);
+    fn test_hour_planner_repeated_dominant_boundaries_keep_prior_hour_whole() {
+        let prior = T0 + HOUR_MICROS - 1;
+        let current = T0 + HOUR_MICROS + 1;
 
-        // determinism: the same run re-chunked reproduces identical ranges
-        let run = vec![
-            (4, vec![frame_of("steady")]),
-            (5, vec![frame_of("steady"), frame_of("gappy")]),
-            (6, vec![frame_of("steady")]),
-            (7, vec![frame_of("gappy")]),
-            (8, vec![frame_of("steady")]),
-        ];
-        let again = chunk_run_per_stream(run);
-        let ranges = |groups: &[StreamChunks]| -> Vec<(String, Vec<(i64, i64)>)> {
-            groups
-                .iter()
-                .map(|g| {
+        // Measure the two sibling current-hour pieces separately, then put
+        // the cap above either piece but below their sum. Only aggregation
+        // before the boundary decision can treat the segment contribution
+        // as one intentional oversized unit.
+        let (_, _, _, sample_split) = split_frame_by_actual_hour(planner_frame(
+            "s",
+            std::iter::once(prior)
+                .chain(std::iter::repeat_n(current, 192))
+                .collect(),
+        ))
+        .unwrap();
+        let current_bytes = sample_split
+            .iter()
+            .find(|(hour, _)| *hour == T0 + HOUR_MICROS)
+            .unwrap()
+            .1
+            .size();
+        let tail_bytes = planner_frame("s", vec![current; 64]).batch.size();
+        let cap = current_bytes.max(tail_bytes) + 1;
+        assert!(current_bytes + tail_bytes > cap);
+
+        let make_run = || {
+            (1usize..=4)
+                .map(|prior_rows| {
+                    let mut mixed = vec![prior; prior_rows];
+                    mixed.extend(std::iter::repeat_n(current, 192));
                     (
-                        g.stream.clone(),
-                        g.chunks.iter().map(|c| (c.start_id, c.end_id)).collect(),
+                        99 + prior_rows as i64,
+                        vec![
+                            planner_frame("s", mixed),
+                            planner_frame("s", vec![current; 64]),
+                        ],
                     )
                 })
-                .collect()
+                .collect::<Vec<_>>()
         };
-        assert_eq!(ranges(&chunked), ranges(&again));
 
-        // empty run → nothing
-        assert!(chunk_run_per_stream(Vec::new()).is_empty());
+        let planned = chunk_run_per_stream_hour(make_run(), cap).unwrap();
+        assert_eq!(
+            planner_shape(&planned),
+            vec![
+                ("s".to_string(), T0, vec![(100, 103)], 10),
+                (
+                    "s".to_string(),
+                    T0 + HOUR_MICROS,
+                    vec![(100, 100), (101, 101), (102, 102), (103, 103)],
+                    1024,
+                ),
+            ],
+            "1-4 prior-hour rows stay in one tiled chunk while every repeated dominant-hour contribution seals alone"
+        );
+        let current_group = planned
+            .iter()
+            .find(|group| group.hour_start_micros == T0 + HOUR_MICROS)
+            .unwrap();
+        assert!(
+            current_group
+                .chunks
+                .iter()
+                .all(|chunk| chunk.decoded_bytes > cap),
+            "each two-frame segment contribution is aggregated before admission and retained as one oversized unit"
+        );
+        assert_eq!(
+            planned
+                .iter()
+                .flat_map(|group| &group.chunks)
+                .flat_map(|chunk| &chunk.batches)
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            1034,
+            "planning conserves every row exactly once"
+        );
+        let deterministic_keys: BTreeSet<(String, i64, i64, i64)> = planned
+            .iter()
+            .flat_map(|group| {
+                group.chunks.iter().map(|chunk| {
+                    (
+                        group.stream.clone(),
+                        group.hour_start_micros,
+                        chunk.start_id,
+                        chunk.end_id,
+                    )
+                })
+            })
+            .collect();
+        assert_eq!(
+            deterministic_keys.len(),
+            planned
+                .iter()
+                .map(|group| group.chunks.len())
+                .sum::<usize>(),
+            "one plan identity maps to exactly one deterministic key"
+        );
+
+        let again = chunk_run_per_stream_hour(make_run(), cap).unwrap();
+        assert_eq!(
+            planner_shape(&planned),
+            planner_shape(&again),
+            "same decoded run must reproduce the same ordered hour/range plan"
+        );
     }
 
     #[test]
-    fn test_chunk_run_per_stream_oversized_segment_builds_alone() {
-        // one segment alone over the cap must still produce a chunk (nothing
-        // is ever skipped); the next segment starts the following chunk
-        let over_rows = (BUILD_CHUNK_MAX_DECODED_BYTES + 1024) / 8;
-        let frame_of = |n: usize| {
-            let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
-            let batch =
-                RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![7i64; n]))])
-                    .unwrap();
-            SegmentFrame {
-                org: "o".into(),
-                stream_type: StreamType::Logs,
-                stream: "s".into(),
-                min_ts: 1,
-                max_ts: 2,
-                batch,
-            }
+    fn test_frame_hour_split_casts_conserves_and_compacts_tiny_slice() {
+        let prior = T0 + HOUR_MICROS - 1;
+        let current = T0 + HOUR_MICROS + 1;
+        let rows = 4096usize;
+        let schema = schema_of(vec![
+            Field::new(TIMESTAMP_COL_NAME, DataType::Utf8, false),
+            Field::new("v", DataType::Int64, false),
+        ]);
+        let mut timestamps = vec![current.to_string(); rows];
+        timestamps[0] = prior.to_string();
+        timestamps[1] = "0".to_string();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(timestamps)),
+                Arc::new(Int64Array::from(vec![7; rows])),
+            ],
+        )
+        .unwrap();
+        let original_bytes = batch.get_array_memory_size();
+        let original_values = Arc::clone(batch.column_by_name("v").unwrap());
+        let frame = SegmentFrame {
+            org: "o".into(),
+            stream_type: StreamType::Logs,
+            stream: "s".into(),
+            // Spanning metadata selects the actual-row split/cast path.
+            min_ts: prior,
+            max_ts: current,
+            batch,
         };
-        let run = vec![(10, vec![frame_of(over_rows)]), (11, vec![frame_of(4)])];
-        let chunked = chunk_run_per_stream(run);
-        assert_eq!(chunked.len(), 1);
-        let ranges: Vec<(i64, i64)> = chunked[0]
-            .chunks
-            .iter()
-            .map(|c| (c.start_id, c.end_id))
+
+        let (_, _, _, split) = split_frame_by_actual_hour(frame).unwrap();
+        assert_eq!(split.len(), 2);
+        assert_eq!(
+            split
+                .iter()
+                .map(|(_, batch)| batch.num_rows())
+                .sum::<usize>(),
+            rows,
+            "valid and degenerate rows are assigned exactly once"
+        );
+        let prior_batch = &split.iter().find(|(hour, _)| *hour == T0).unwrap().1;
+        assert_eq!(
+            prior_batch.num_rows(),
+            2,
+            "the prior row plus the one degenerate row share the earliest carry bucket"
+        );
+        assert!(
+            prior_batch.get_array_memory_size() < original_bytes / 8,
+            "a tiny retained hour must own compact arrays, not pin the full frame"
+        );
+        assert!(
+            !Arc::ptr_eq(prior_batch.column_by_name("v").unwrap(), &original_values),
+            "cross-hour filtering materializes retained arrays"
+        );
+
+        let whole = planner_frame("s", vec![current; 4]);
+        let whole_values = Arc::clone(whole.batch.column_by_name("v").unwrap());
+        let (_, _, _, one_hour) = split_frame_by_actual_hour(whole).unwrap();
+        assert_eq!(one_hour.len(), 1);
+        assert!(
+            Arc::ptr_eq(one_hour[0].1.column_by_name("v").unwrap(), &whole_values),
+            "single-hour frames stay on the zero-copy whole-frame path"
+        );
+    }
+
+    #[test]
+    fn test_cross_hour_utf8_view_gc_releases_unretained_source_buffers() {
+        let prior = T0 + HOUR_MICROS - 1;
+        let current = T0 + HOUR_MICROS + 1;
+        let rows = 4096usize;
+        let long_values: Vec<String> = (0..rows)
+            .map(|i| format!("row-{i:04}-{}", "x".repeat(1024)))
             .collect();
-        assert_eq!(ranges, vec![(10, 10), (11, 11)]);
+        let expected_prior = long_values[0].clone();
+        let schema = schema_of(vec![
+            ts_field(),
+            Field::new("view", DataType::Utf8View, false),
+            Field::new("binary", DataType::BinaryView, false),
+        ]);
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(
+                    std::iter::once(prior)
+                        .chain(std::iter::repeat_n(current, rows - 1))
+                        .collect::<Vec<_>>(),
+                )),
+                Arc::new(StringViewArray::from_iter_values(
+                    long_values.iter().map(String::as_str),
+                )),
+                Arc::new(BinaryViewArray::from_iter_values(
+                    long_values.iter().map(|value| value.as_bytes()),
+                )),
+            ],
+        )
+        .unwrap();
+        let original_bytes = batch.get_array_memory_size();
+        assert!(original_bytes > 4 * 1024 * 1024);
+        let frame = SegmentFrame {
+            org: "o".into(),
+            stream_type: StreamType::Logs,
+            stream: "view".into(),
+            min_ts: prior,
+            max_ts: current,
+            batch,
+        };
+
+        let (_, _, _, split) = split_frame_by_actual_hour(frame).unwrap();
+        let prior_batch = &split.iter().find(|(hour, _)| *hour == T0).unwrap().1;
+        assert_eq!(prior_batch.num_rows(), 1);
+        let retained = prior_batch
+            .column_by_name("view")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .unwrap();
+        assert_eq!(retained.value(0), expected_prior);
+        let retained_binary = prior_batch
+            .column_by_name("binary")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BinaryViewArray>()
+            .unwrap();
+        assert_eq!(retained_binary.value(0), expected_prior.as_bytes());
+        assert!(
+            prior_batch.get_array_memory_size() < 64 * 1024,
+            "Utf8View/BinaryView gc must copy retained non-inline values instead of retaining the multi-MiB source buffers"
+        );
+    }
+
+    #[test]
+    fn test_hour_planning_scratch_and_serial_classification_use_configured_cap() {
+        let prior = T0 + HOUR_MICROS - 1;
+        let current = T0 + HOUR_MICROS + 1;
+        let same_hour = planner_frame("s", vec![current; 8]);
+        let spanning = planner_frame("s", vec![prior, current]);
+        let spanning_bytes = spanning.batch.size();
+        let decoded = vec![(1, vec![same_hour, spanning])];
+        assert_eq!(
+            planning_scratch_bytes(&decoded),
+            spanning_bytes,
+            "same-hour zero-copy frames reserve no scratch; inspected frames reserve their decoded size"
+        );
+
+        let configured = 512 * 1024 * 1024;
+        assert!(!is_serial_oversized(configured, configured));
+        assert!(!is_serial_oversized(160 * 1024 * 1024 + 1, configured));
+        assert!(is_serial_oversized(configured + 1, configured));
+    }
+
+    #[test]
+    fn test_hour_planner_tiles_absent_ids_and_never_crosses_decoded_gap() {
+        let hour = T0 + 7;
+        let decoded = vec![
+            (4, vec![planner_frame("gappy", vec![hour; 2])]),
+            (5, Vec::new()),
+            (7, Vec::new()),
+            (8, vec![planner_frame("gappy", vec![hour; 2])]),
+        ];
+        let planned: Vec<StreamChunks> = split_into_id_runs(decoded)
+            .into_iter()
+            .flat_map(|run| chunk_run_per_stream_hour(run, usize::MAX).unwrap())
+            .collect();
+        assert_eq!(
+            planner_shape(&planned),
+            vec![
+                ("gappy".to_string(), T0, vec![(4, 5)], 2),
+                ("gappy".to_string(), T0, vec![(7, 8)], 2),
+            ],
+            "absent IDs extend each run tail, while missing ID 6 splits provenance"
+        );
+        assert!(chunk_run_per_stream_hour(Vec::new(), 1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_hour_planner_oversized_segment_contribution_builds_alone() {
+        let hour = T0 + 1;
+        let first = planner_frame("s", vec![hour; 32]);
+        let cap = first.batch.size() / 2;
+        let planned = chunk_run_per_stream_hour(
+            vec![
+                (10, vec![first]),
+                (11, vec![planner_frame("s", vec![hour; 2])]),
+            ],
+            cap,
+        )
+        .unwrap();
+        assert_eq!(
+            planner_shape(&planned),
+            vec![("s".to_string(), T0, vec![(10, 10), (11, 11)], 34)],
+            "one contribution over the cap is retained alone and the tail still seals"
+        );
     }
 
     #[test]
     fn test_split_into_id_runs_shapes() {
-        // contiguity only — byte capping happens in split_into_decoded_runs
+        // contiguity only — hour-aware byte capping happens inside each run
         let runs = split_into_id_runs(vec![(2, "b"), (1, "a"), (3, "c")]);
         assert_eq!(
             runs,
