@@ -14,9 +14,41 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::collections::HashSet;
+#[cfg(test)]
+use std::sync::LazyLock;
 
 use config::{get_config, is_local_disk_storage, meta::search::ScanStats};
+#[cfg(test)]
+use hashbrown::HashMap;
 use infra::cache::{file_data, file_downloader};
+
+/// Whether cache misses should start the ordinary detached cache-fill path.
+///
+/// Exact equality histograms can answer remote-cold files from narrow native
+/// docs columns, but still need the cache probe to prefer sidecars that are
+/// already local. `CheckOnly` preserves that probe without warming sidecars
+/// the query will not read.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CacheMissPolicy {
+    Enqueue,
+    CheckOnly,
+}
+
+impl CacheMissPolicy {
+    #[inline]
+    fn enqueue_misses(self) -> bool {
+        matches!(self, Self::Enqueue)
+    }
+}
+
+#[cfg(test)]
+static CACHE_MISS_POLICIES: LazyLock<parking_lot::Mutex<HashMap<String, CacheMissPolicy>>> =
+    LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+pub(crate) fn take_cache_miss_policy(trace_id: &str) -> Option<CacheMissPolicy> {
+    CACHE_MISS_POLICIES.lock().remove(trace_id)
+}
 
 /// Linear interpolation: cached_ratio=0 -> query_thread_num, cached_ratio=1 -> cpu_num.
 pub fn calc_target_partitions(cpu_num: usize, query_thread_num: usize, cached_ratio: f64) -> usize {
@@ -32,6 +64,28 @@ pub async fn cache_files(
     scan_stats: &mut ScanStats,
     file_type: &str,
 ) -> (file_data::CacheType, u64, u64) {
+    cache_files_with_policy(
+        trace_id,
+        files,
+        scan_stats,
+        file_type,
+        CacheMissPolicy::Enqueue,
+    )
+    .await
+}
+
+pub(crate) async fn cache_files_with_policy(
+    trace_id: &str,
+    files: &[(i64, &String, &String, i64, i64, i64)],
+    scan_stats: &mut ScanStats,
+    file_type: &str,
+    miss_policy: CacheMissPolicy,
+) -> (file_data::CacheType, u64, u64) {
+    #[cfg(test)]
+    CACHE_MISS_POLICIES
+        .lock()
+        .insert(trace_id.to_string(), miss_policy);
+
     let mut cached_files = HashSet::with_capacity(files.len());
     let (mut cache_hits, mut cache_misses) = (0, 0);
 
@@ -77,6 +131,13 @@ pub async fn cache_files(
         log::warn!(
             "[trace_id {trace_id}] search->storage: check file cache took: {check_cache_took} ms",
         );
+    }
+
+    // A check-only caller consumes the hit/miss counts and ScanStats above to
+    // retain its local-cache fast paths. Return before selecting a cache type,
+    // cloning missing keys/accounts, or spawning the detached enqueuer.
+    if !miss_policy.enqueue_misses() {
+        return (file_data::CacheType::None, cache_hits, cache_misses);
     }
 
     let files_num = files.len() as i64;
@@ -144,7 +205,13 @@ pub async fn cache_files(
 
 #[cfg(test)]
 mod tests {
-    use super::calc_target_partitions;
+    use super::{CacheMissPolicy, calc_target_partitions};
+
+    #[test]
+    fn check_only_cache_policy_never_enqueues_misses() {
+        assert!(!CacheMissPolicy::CheckOnly.enqueue_misses());
+        assert!(CacheMissPolicy::Enqueue.enqueue_misses());
+    }
 
     #[test]
     fn target_partitions_interpolates_cache_ratio() {

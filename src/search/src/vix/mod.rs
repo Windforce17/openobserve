@@ -94,7 +94,7 @@ use self::{
     source::{LadderRangeSource, VixReadMode, vix_read_mode},
 };
 use crate::{
-    file_cache::{cache_files, calc_target_partitions},
+    file_cache::{CacheMissPolicy, cache_files_with_policy, calc_target_partitions},
     index::{FieldCap, IndexCondition},
     inspector::{SearchInspectorFieldsBuilder, search_inspector_fields},
     types::QueryParams,
@@ -279,7 +279,16 @@ pub async fn vix_search(
             })
         })
         .collect_vec();
-    let (cache_type, cache_hits, cache_misses) = cache_files(
+    // A cold exact histogram reads the predicate/timestamp columns from the
+    // data object. Probe sidecar caches so already-local postings remain the
+    // preferred path, but do not detach whole-sidecar downloads for misses.
+    // Every other query class retains the ordinary cache-fill behavior.
+    let cache_miss_policy = if native_histogram {
+        CacheMissPolicy::CheckOnly
+    } else {
+        CacheMissPolicy::Enqueue
+    };
+    let (cache_type, cache_hits, cache_misses) = cache_files_with_policy(
         &query.trace_id,
         &index_cache_entries
             .iter()
@@ -289,6 +298,7 @@ pub async fn vix_search(
             .collect_vec(),
         &mut scan_stats,
         "index",
+        cache_miss_policy,
     )
     .await;
 
@@ -4213,19 +4223,24 @@ mod tests {
     /// (local) object store, returning a FileKey with true object sizes —
     /// the M14 prefetch tests drive the production ranged ladder against it.
     async fn store_core_file(key: &str, max_ts: i64) -> FileKey {
+        store_core_file_with_rows(key, max_ts, 10).await
+    }
+
+    async fn store_core_file_with_rows(key: &str, max_ts: i64, rows: usize) -> FileKey {
         use arrow::{
             array::{Int64Array, RecordBatch, StringArray},
             datatypes::{DataType, Field, Schema},
         };
         use vortex_index::{VixWriter, VixWriterOptions};
 
+        let rows = i64::try_from(rows).expect("test row count fits i64");
         let schema = Arc::new(Schema::new(vec![
             Field::new("_timestamp", DataType::Int64, false),
             Field::new("level", DataType::Utf8, true),
         ]));
         let mut writer = VixWriter::new(&schema, VixWriterOptions::default(), false);
-        let ts: Vec<i64> = (0..10).map(|i| max_ts - i).collect();
-        let levels: Vec<&str> = (0..10).map(|_| "info").collect();
+        let ts: Vec<i64> = (0..rows).map(|i| max_ts - i).collect();
+        let levels: Vec<&str> = (0..rows).map(|_| "info").collect();
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![
@@ -4256,9 +4271,9 @@ mod tests {
             key: key.to_string(),
             account,
             meta: FileMeta {
-                min_ts: max_ts - 9,
+                min_ts: max_ts - rows + 1,
                 max_ts,
-                records: 10,
+                records: rows,
                 compressed_size: data_len as i64,
                 index_size: index_len as i64,
                 ..Default::default()
@@ -4407,6 +4422,16 @@ mod tests {
         let (off_afb, off_result, off_files) =
             run("m14-diff-off", false, files_master.clone()).await;
         let (on_afb, on_result, on_files) = run("m14-diff-on", true, files_master.clone()).await;
+        assert_eq!(
+            crate::file_cache::take_cache_miss_policy("m14-diff-off"),
+            Some(CacheMissPolicy::Enqueue),
+            "ordinary index queries must retain background cache-fill behavior"
+        );
+        assert_eq!(
+            crate::file_cache::take_cache_miss_policy("m14-diff-on"),
+            Some(CacheMissPolicy::Enqueue),
+            "enabling query-tail prefetch must not disable ordinary cache fills"
+        );
         assert_eq!(off_afb, on_afb);
         assert!(off_files.is_empty() && on_files.is_empty());
         let (MultiResult::Count(off), MultiResult::Count(on)) = (&off_result, &on_result) else {
@@ -4859,15 +4884,29 @@ mod tests {
     /// memoize a `VixReader`, which this regression detects.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_cold_indexed_equality_histogram_skips_sidecar() {
-        let master = store_core_file(
+        let master = store_core_file_with_rows(
             "files/org/logs/native-histogram/2026/01/01/00/cold-indexed.vix",
             1_000,
+            100,
         )
         .await;
         assert!(master.meta.index_size > 0);
+        assert!(
+            infra::cache::file_downloader::should_download(master.meta.records),
+            "the fixture must remain eligible for the ordinary background downloader"
+        );
         let key = master.key.clone();
+        let sidecar_key = config::vix_sidecar_key(&key).unwrap();
         reader_cache::GLOBAL_CACHE.remove(&key);
         vix_result_cache::GLOBAL_CACHE.remove_file_entries(std::iter::once(key.as_str()));
+        file_data::memory::remove(&sidecar_key).await.unwrap();
+        file_data::disk::remove(&sidecar_key).await.unwrap();
+        assert!(!file_data::memory::exist(&sidecar_key).await);
+        assert!(!file_data::disk::exist(&sidecar_key).await);
+        assert_eq!(
+            crate::file_cache::take_cache_miss_policy("cold-indexed-native-histogram"),
+            None
+        );
         let params = Arc::new(crate::types::QueryParams {
             trace_id: "cold-indexed-native-histogram".to_string(),
             org_id: "org".to_string(),
@@ -4894,13 +4933,87 @@ mod tests {
         assert!(!add_filter_back);
         assert!(files.is_empty(), "native histogram must remove the file");
         match result {
-            MultiResult::Histogram(histogram) => assert_eq!(histogram, vec![4, 5, 1, 0, 0]),
+            MultiResult::Histogram(histogram) => assert_eq!(histogram, vec![5, 5, 1, 0, 0]),
             other => panic!("expected native histogram, got {other:?}"),
         }
+        assert_eq!(
+            crate::file_cache::take_cache_miss_policy("cold-indexed-native-histogram"),
+            Some(CacheMissPolicy::CheckOnly),
+            "cold exact histograms must probe caches without enqueueing sidecar misses"
+        );
         assert!(
             !reader_cache::GLOBAL_CACHE.contains(&key),
             "cold native histogram must not open or prefetch the sidecar"
         );
+    }
+
+    /// Check-only miss handling must not weaken the all-local shortcut: when
+    /// the sidecar bytes are already in the disk cache, top-level vix_search
+    /// still opens an indexed reader and serves the histogram from postings.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_check_only_equality_histogram_still_uses_local_sidecar() {
+        let master = store_core_file(
+            "files/org/logs/native-histogram/2026/01/01/00/check-only-local.vix",
+            1_000,
+        )
+        .await;
+        let key = master.key.clone();
+        let sidecar_key = config::vix_sidecar_key(&key).unwrap();
+        let sidecar = infra::storage::get(&master.account, &sidecar_key)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        reader_cache::GLOBAL_CACHE.remove(&key);
+        vix_result_cache::GLOBAL_CACHE.remove_file_entries(std::iter::once(key.as_str()));
+        file_data::memory::remove(&sidecar_key).await.unwrap();
+        file_data::disk::remove(&sidecar_key).await.unwrap();
+        file_data::disk::set(&sidecar_key, sidecar).await.unwrap();
+        assert!(file_data::disk::exist(&sidecar_key).await);
+
+        let trace_id = "check-only-local-sidecar-histogram";
+        assert_eq!(crate::file_cache::take_cache_miss_policy(trace_id), None);
+        let params = Arc::new(crate::types::QueryParams {
+            trace_id: trace_id.to_string(),
+            org_id: "org".to_string(),
+            stream: datafusion::sql::TableReference::from("t"),
+            stream_type: StreamType::Logs,
+            stream_name: "t".to_string(),
+            time_range: (990, 1_010),
+            work_group: None,
+            use_inverted_index: true,
+        });
+        let mut condition = IndexCondition::new();
+        condition.add_condition(Condition::Equal("level".to_string(), "info".to_string()));
+        let mut files = vec![master];
+
+        let (_took, add_filter_back, result) = vix_search(
+            params,
+            &mut files,
+            Some(condition),
+            Some(IndexOptimizeMode::SimpleHistogram(990, 5, 5, 0)),
+        )
+        .await
+        .unwrap();
+
+        assert!(!add_filter_back);
+        assert!(files.is_empty());
+        match result {
+            MultiResult::Histogram(histogram) => assert_eq!(histogram, vec![4, 5, 1, 0, 0]),
+            other => panic!("expected indexed histogram, got {other:?}"),
+        }
+        assert_eq!(
+            crate::file_cache::take_cache_miss_policy(trace_id),
+            Some(CacheMissPolicy::CheckOnly)
+        );
+        assert!(
+            reader_cache::GLOBAL_CACHE
+                .get(&key)
+                .is_some_and(|reader| reader.has_index()),
+            "check-only probing must preserve the cached-sidecar postings path"
+        );
+        file_data::disk::remove(&sidecar_key).await.unwrap();
     }
 
     /// A first-touch equality histogram should use term postings when the
