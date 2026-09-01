@@ -1889,7 +1889,7 @@ impl VixReader {
     /// partial) or the field is absent from the field table; the caller
     /// then keeps the docs-column path.
     ///
-    /// Cost: four resident-index probes plus at most a handful of ~4KB
+    /// Cost: four resident-index probes plus at most a handful of dictionary
     /// block loads — cheap enough to gate the top-k/distinct dispatch per
     /// query. This is the DICTIONARY's distinct-value count (each stored
     /// raw string value once, numeric/bool sub-ranges excluded); the
@@ -2860,7 +2860,7 @@ impl VixReader {
     /// Ranged readers bulk-load the walk's whole block span up front: the
     /// resident index bounds the last reachable block without IO, so a
     /// field-range walk costs a few MB-sized round trips instead of one
-    /// ~4KB round trip per block — the #27 fetch storm (27k point reads
+    /// block-sized round trip per block — the #27 fetch storm (27k point reads
     /// over 78 files for one unfiltered trace-list TopN) was this loop.
     /// `on_key` returns whether to CONTINUE — `false` ends the walk early
     /// (the #29 lever-2 enumeration cap rides this).
@@ -3101,7 +3101,7 @@ impl VixReader {
     /// binary-searched from the resident index, missing ones batch-fetched
     /// in one round trip ([`Self::load_dict_blocks`]), and each touched
     /// block is positionally scanned once. Cost is proportional to the
-    /// number of DISTINCT blocks touched (~4KB each), never to the field's
+    /// number of DISTINCT blocks touched, never to the field's
     /// full dictionary span — the whole point of resolving only a top-k's
     /// winners (#29).
     fn keys_for_ordinals(&self, ordinals: &[u64]) -> Result<Vec<Vec<u8>>> {

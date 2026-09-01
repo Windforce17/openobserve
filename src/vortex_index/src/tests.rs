@@ -589,7 +589,9 @@ fn doc_level_dedup() {
 
 #[test]
 fn multi_row_group_scans() {
-    // ~2000 unique terms with a 1 KiB row-group budget forces many FSTs.
+    // Size 2,000 unique terms from the production dictionary target so the
+    // `w` field spans several blocks without depending on a retired writer
+    // row-group option.
     let schema = Arc::new(Schema::new(vec![
         Field::new("_timestamp", DataType::Int64, false),
         Field::new("w", DataType::Utf8, false),
@@ -601,7 +603,10 @@ fn multi_row_group_scans() {
         },
         false,
     );
-    let values: Vec<String> = (0..2000).map(|i| format!("w{i:04}")).collect();
+    const VALUE_SUFFIX_BYTES: usize = crate::dict_blocks::BLOCK_TARGET_BYTES / 256;
+    let values: Vec<String> = (0..2000)
+        .map(|i| format!("w{i:04}{}", "x".repeat(VALUE_SUFFIX_BYTES)))
+        .collect();
     for (index, chunk) in values.chunks(500).enumerate() {
         let first = index * 500;
         let batch = RecordBatch::try_new(
@@ -619,21 +624,34 @@ fn multi_row_group_scans() {
             .unwrap();
     }
     let reader = finish_open(writer);
+    let field_id = reader.field_id("w").expect("w field id");
+    let mut first_key = Vec::new();
+    crate::query::write_composite(&mut first_key, values[0].as_bytes(), field_id);
+    let mut last_key = Vec::new();
+    crate::query::write_composite(&mut last_key, values.last().unwrap().as_bytes(), field_id);
+    let dict_index = reader.dict_index().expect("dictionary index");
+    let first_block = dict_index
+        .predecessor_block(&first_key)
+        .expect("first block lookup")
+        .expect("first w block");
+    let last_block = dict_index
+        .predecessor_block(&last_key)
+        .expect("last block lookup")
+        .expect("last w block");
     assert!(
-        reader.term_row_group_count() > 4,
-        "expected many row groups, got {}",
-        reader.term_row_group_count()
+        last_block > first_block,
+        "w values must span dictionary blocks, got block {first_block}..={last_block}"
     );
-    // Cross-row-group prefix scan: w1000..w1999.
+    // Cross-block prefix scan: w1000..w1999.
     let expected: BTreeSet<u32> = (1000..2000).collect();
     assert_eq!(eval_set(&reader, &prefix(None, "w1")), expected);
     // Point lookups at both edges and in the middle.
-    assert_eq!(eval_set(&reader, &exact("w", "w0000")), docs(&[0]));
-    assert_eq!(eval_set(&reader, &exact("w", "w0999")), docs(&[999]));
-    assert_eq!(eval_set(&reader, &exact("w", "w1999")), docs(&[1999]));
-    // Any-field token lookups also cross row groups.
-    assert_eq!(eval_set(&reader, &any_token("w1500")), docs(&[1500]));
-    // Full-dictionary walks (contains) see every row group.
+    assert_eq!(eval_set(&reader, &exact("w", &values[0])), docs(&[0]));
+    assert_eq!(eval_set(&reader, &exact("w", &values[999])), docs(&[999]));
+    assert_eq!(eval_set(&reader, &exact("w", &values[1999])), docs(&[1999]));
+    // Any-field token lookups also cross blocks.
+    assert_eq!(eval_set(&reader, &any_token(&values[1500])), docs(&[1500]));
+    // Full-dictionary walks (contains) see every block.
     let all: BTreeSet<u32> = (0..2000).collect();
     assert_eq!(eval_set(&reader, &contains(None, "w", false)), all);
 }
@@ -4384,7 +4402,7 @@ mod ranged {
 
     /// #27: a field-scoped dictionary walk (the unfiltered TopN/Distinct
     /// value enumeration) must bulk-load its block span instead of one
-    /// ~4KB round trip per block — 78 files x ~350 point reads was the
+    /// block-sized round trip per block — 78 files x ~350 point reads was the
     /// trace-list fetch storm. The 100k-distinct `svc` field spans
     /// hundreds of blocks; the walk must stay within a few round trips.
     #[test]
@@ -6187,11 +6205,17 @@ mod m10_parallel_kway {
     #[test]
     fn skewed_fid_parallel_equals_sequential() {
         let opts = synth_opts();
+        // Keep the dominant field spread across enough production-sized
+        // dictionary blocks to offer all seven parallel split points. The
+        // field still owns >90% of distinct keys; only their byte width is
+        // derived from the block target so this remains a partition test
+        // when that target is tuned.
+        const AA_VALUE_SUFFIX_BYTES: usize = crate::dict_blocks::BLOCK_TARGET_BYTES / 256;
         let inputs = vec![synth_input(
             &opts,
             0,
             3000,
-            |r| Some(format!("a_{r:06}")),
+            |r| Some(format!("a_{r:06}{}", "x".repeat(AA_VALUE_SUFFIX_BYTES))),
             |r| Some(format!("b_{:02}", r % 40)),
             |r| Some(format!("c_{:02}", r % 40)),
         )];
@@ -7988,14 +8012,16 @@ mod review_query_eval {
     }
 
     /// VERIFIED: exact lookups and prefix scans are correct when matches
-    /// span dictionary row-group boundaries (tiny `rg_term_bytes` forces a
-    /// row group roughly per term).
+    /// span dictionary block boundaries.
     #[test]
     fn review_prefix_and_exact_across_row_group_boundaries() {
-        // ~300-byte values: 40 of them exceed several 4KB block targets,
-        // so matches genuinely span dictionary block boundaries
+        // Size the values from the production block target so this fixture
+        // keeps spanning several blocks when the target is tuned. Comparing
+        // the first and last value's predecessor blocks below proves that
+        // field-boundary block cuts cannot make the assertion pass by chance.
+        const VALUE_BYTES: usize = crate::dict_blocks::BLOCK_TARGET_BYTES / 8;
         let values: Vec<String> = (0..40)
-            .map(|i| format!("k{i:02}{}", "x".repeat(300)))
+            .map(|i| format!("k{i:02}{}", "x".repeat(VALUE_BYTES)))
             .collect();
         let schema = Arc::new(Schema::new(vec![
             Field::new("_timestamp", DataType::Int64, false),
@@ -8021,13 +8047,26 @@ mod review_query_eval {
             .push_batch_with_source(&batch, &StringArray::from(sources), None)
             .unwrap();
         let reader = finish_open(writer);
+        let field_id = reader.field_id("svc").expect("svc field id");
+        let mut first_key = Vec::new();
+        crate::query::write_composite(&mut first_key, values[0].as_bytes(), field_id);
+        let mut last_key = Vec::new();
+        crate::query::write_composite(&mut last_key, values.last().unwrap().as_bytes(), field_id);
+        let dict_index = reader.dict_index().expect("dictionary index");
+        let first_block = dict_index
+            .predecessor_block(&first_key)
+            .expect("first block lookup")
+            .expect("first svc block");
+        let last_block = dict_index
+            .predecessor_block(&last_key)
+            .expect("last block lookup")
+            .expect("last svc block");
         assert!(
-            reader.term_row_group_count() >= 3,
-            "the fat values must force several dictionary blocks, got {}",
-            reader.term_row_group_count()
+            last_block > first_block,
+            "svc values must span dictionary blocks, got block {first_block}..={last_block}"
         );
 
-        // exact lookup of every value (each in its own row group)
+        // Exact lookup of every value, including values in different blocks.
         for (i, value) in values.iter().enumerate() {
             assert_eq!(
                 eval_set(&reader, &exact("svc", value)),
@@ -8035,7 +8074,7 @@ mod review_query_eval {
                 "exact {value}"
             );
         }
-        // prefixes spanning several row groups
+        // Prefixes spanning several blocks.
         assert_eq!(
             eval_set(&reader, &prefix(None, "k1")),
             (10..20).collect::<BTreeSet<u32>>()
