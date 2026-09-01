@@ -1198,7 +1198,7 @@ fn group_files_into_batches(
         (0, c) => c as usize,
         (g, c) => std::cmp::min(g, c as usize),
     };
-    let mut new_file_list = Vec::new();
+    let mut new_file_list: Vec<FileKey> = Vec::new();
     let mut new_file_size = 0;
     for file in files.iter() {
         if new_file_size + file.meta.original_size > max_file_size
@@ -1207,6 +1207,22 @@ fn group_files_into_batches(
             if new_file_list.len() <= 1 {
                 if *job_strategy == MergeStrategy::FileSize {
                     break;
+                }
+                // Closed-hour debt discovery counts <= half-target files as
+                // constructively mergeable. Under FileTime, a near-target
+                // file between two such small files used to replace the
+                // first singleton, so the hour was rediscovered forever but
+                // never produced a batch. Retain the smaller singleton
+                // across an interleaver; once a second small file arrives it
+                // forms a real batch. Incremental hours keep their original
+                // adjacency behavior to avoid premature sealing.
+                if !is_incremental
+                    && *job_strategy == MergeStrategy::FileTime
+                    && new_file_list.first().is_some_and(|current| {
+                        current.meta.original_size <= file.meta.original_size
+                    })
+                {
+                    continue;
                 }
                 new_file_list.clear();
                 new_file_size = file.meta.original_size;
@@ -3092,7 +3108,7 @@ mod tests {
         assert_eq!(
             offsets,
             vec![dense_old, sparse, dense_hot],
-            "debt hours enqueued oldest cohort first (id ASC claim order); the \
+            "debt hours enqueued oldest cohort first (enqueue-time claim order); the \
              indexed sparse cohort is absent"
         );
         // release strangers claimed alongside ours
@@ -3213,6 +3229,77 @@ mod tests {
         );
         assert_eq!(batches.len(), 2, "incremental keeps the trailing remainder");
         assert!(batches.iter().all(|b| b.files.len() == width));
+    }
+
+    /// Closed-hour FileTime grouping must make constructive progress on the
+    /// same <= half-target files that the debt query counts, even when
+    /// near-target outputs sit between them in timestamp order.
+    #[test]
+    fn test_file_time_cutter_pairs_small_debt_across_large_interleavers() {
+        let sizes = [900, 252, 900, 127, 900, 195];
+        let files: Vec<FileKey> = sizes
+            .into_iter()
+            .enumerate()
+            .map(|(i, size)| {
+                create_file_key(
+                    &format!("f{i}-{size}.vix"),
+                    1_000 + i as i64,
+                    2_000 + i as i64,
+                    size,
+                )
+            })
+            .collect();
+
+        let mut batches = Vec::new();
+        group_files_into_batches(
+            &mut batches,
+            &files,
+            "org",
+            StreamType::Logs,
+            "s1",
+            "files/org/logs/s1/2026/08/24/00",
+            1_024,
+            false,
+            &MergeStrategy::FileTime,
+        );
+        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            batches[0]
+                .files
+                .iter()
+                .map(|file| file.meta.original_size)
+                .collect::<Vec<_>>(),
+            vec![252, 127]
+        );
+        let batched_keys = batches[0]
+            .files
+            .iter()
+            .map(|file| file.key.as_str())
+            .collect::<HashSet<_>>();
+        assert!(
+            files
+                .iter()
+                .filter(|file| !batched_keys.contains(file.key.as_str()))
+                .all(|file| [900, 195].contains(&file.meta.original_size)),
+            "large interleavers and the final small singleton must remain live"
+        );
+
+        let mut incremental = Vec::new();
+        group_files_into_batches(
+            &mut incremental,
+            &files,
+            "org",
+            StreamType::Logs,
+            "s1",
+            "files/org/logs/s1/2026/08/24/00",
+            1_024,
+            true,
+            &MergeStrategy::FileTime,
+        );
+        assert!(
+            incremental.is_empty(),
+            "open-hour adjacency and trailing-remainder behavior stays unchanged"
+        );
     }
 
     #[test]

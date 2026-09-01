@@ -1504,7 +1504,10 @@ WHERE file_list_jobs.status = $5;"#,
         // pending rows through row locks, and the generation returned here is
         // the generation installed by the same atomic claim.
         let order_sql = match order {
-            super::FileListJobOrder::EnqueueOldest => "id ASC",
+            // DONE debt rows are resurrected in place, retaining their old
+            // ids. Completion/requeue stamps updated_at, so it is the true
+            // FIFO enqueue clock; id only breaks equal-time ties.
+            super::FileListJobOrder::EnqueueOldest => "updated_at ASC, id ASC",
             super::FileListJobOrder::OffsetNewest => "offsets DESC, id ASC",
         };
         let sql = format!(
@@ -3765,10 +3768,11 @@ mod tests {
 
     /// #50: the SKIP LOCKED single-statement claim — racing claimers must
     /// partition the pending pool (no double-claims, no global lock), the
-    /// claim must be oldest-first (id ASC) in normal mode and freshest-
-    /// first (offsets DESC) in fast mode, and RETURNING must yield usable
-    /// rows. Runs against REAL postgres (the .93 lesson: sqlite-only suites
-    /// let a pg-only decode bug ship a fleet-wide regression).
+    /// claim must be oldest enqueue/requeue first (updated_at, then id) in
+    /// normal mode and freshest-first (offsets DESC) in fast mode, and
+    /// RETURNING must yield usable rows. Runs against REAL postgres (the .93
+    /// lesson: sqlite-only suites let a pg-only decode bug ship a fleet-wide
+    /// regression).
     #[tokio::test]
     #[ignore = "Requires test PostgreSQL database setup"]
     async fn pg_get_pending_jobs_skip_locked_claims() {
@@ -3806,7 +3810,7 @@ mod tests {
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), 5, "no double-claims across racing claimers");
-        // oldest-first within each claim (id ASC)
+        // Equal enqueue times use stable id as their deterministic tie-break.
         for claim in [&a, &b] {
             assert!(claim.windows(2).all(|w| w[0].id < w[1].id));
         }
@@ -3845,6 +3849,39 @@ mod tests {
             vec![1_004, 1_003, 1_002, 1_001]
         );
         assert!(fast.iter().all(|r| r.lease_generation > 0));
+
+        // A requeued low-id row must not monopolize the FIFO. Seed explicit
+        // enqueue clocks to pin the PostgreSQL ORDER BY behavior.
+        cleanup_test_data(&pool).await;
+        let low_id: i64 = sqlx::query_scalar(
+            "INSERT INTO file_list_jobs \
+             (org, stream, offsets, status, node, started_at, updated_at) \
+             VALUES ('org', 'org/logs/requeued', 2000, 0, '', 0, 200) RETURNING id;",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let waiting_id: i64 = sqlx::query_scalar(
+            "INSERT INTO file_list_jobs \
+             (org, stream, offsets, status, node, started_at, updated_at) \
+             VALUES ('org', 'org/logs/waiting', 2001, 0, '', 0, 100) RETURNING id;",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(low_id < waiting_id);
+        let fair = list
+            .get_pending_jobs(
+                "node-fair",
+                1,
+                FileListJobOrder::EnqueueOldest,
+                Some(2_000),
+                Some(2_002),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fair.len(), 1);
+        assert_eq!(fair[0].id, waiting_id);
         cleanup_test_data(&pool).await;
     }
 

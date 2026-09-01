@@ -1191,7 +1191,10 @@ WHERE file_list_jobs.status = $5;"#,
         let client = client.lock().await;
         let mut tx = client.begin().await?;
         let order_sql = match order {
-            super::FileListJobOrder::EnqueueOldest => "id ASC",
+            // DONE debt rows are resurrected in place, retaining their old
+            // ids. Completion/requeue stamps updated_at, so it is the true
+            // FIFO enqueue clock; id only breaks equal-time ties.
+            super::FileListJobOrder::EnqueueOldest => "updated_at ASC, id ASC",
             super::FileListJobOrder::OffsetNewest => "offsets DESC, id ASC",
         };
         let sql = format!(
@@ -3158,6 +3161,73 @@ mod tests {
         assert!(node.is_empty());
         assert_eq!(admin_generation, reset_generation + 1);
         raw_delete_jobs(&[id]).await;
+    }
+
+    /// A requeued stable-id job must move behind older waiting work.
+    /// Otherwise an old hour that remains a deterministic no-op is claimed
+    /// every sweep and newer mergeable hours never run.
+    #[tokio::test]
+    async fn test_enqueue_oldest_uses_requeue_time_before_stable_id_sqlite() {
+        let _guard = jobs_setup().await;
+        let list = SqliteFileList::new();
+        let base = now_micros();
+        let old_id = list
+            .add_job(
+                "fair_queue_org",
+                StreamType::Logs,
+                &format!("fair_queue_old_{base}"),
+                base,
+            )
+            .await
+            .unwrap();
+        let waiting_id = list
+            .add_job(
+                "fair_queue_org",
+                StreamType::Logs,
+                &format!("fair_queue_waiting_{base}"),
+                base + 1,
+            )
+            .await
+            .unwrap();
+        assert!(old_id < waiting_id, "test requires stable-id order");
+
+        // Give only the old row one turn, then requeue it as a completed
+        // debt sweep would. This stamps its enqueue clock after the still-
+        // waiting row while retaining the smaller stable id.
+        let first = list
+            .get_pending_jobs(
+                "fair-queue-node",
+                1,
+                FileListJobOrder::EnqueueOldest,
+                Some(base),
+                Some(base + 2),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].id, old_id);
+        assert!(
+            list.set_job_pending_owned(first[0].id, "fair-queue-node", first[0].lease_generation,)
+                .await
+                .unwrap()
+        );
+
+        let claimed = list
+            .get_pending_jobs(
+                "fair-queue-node",
+                1,
+                FileListJobOrder::EnqueueOldest,
+                Some(base),
+                Some(base + 2),
+            )
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(
+            claimed[0].id, waiting_id,
+            "older waiting work must run before a requeued low-id row"
+        );
+        raw_delete_jobs(&[old_id, waiting_id]).await;
     }
 
     #[tokio::test]

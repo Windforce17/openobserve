@@ -306,7 +306,7 @@ pub fn live_claim_floor(now_micros: i64, lookback_hours: i64) -> i64 {
 pub enum MergeLane {
     /// All pending jobs, oldest enqueue first.
     All,
-    /// Jobs strictly before the live floor, oldest enqueue first.
+    /// Jobs strictly before the live floor, oldest enqueue/requeue first.
     Backlog { before: i64 },
     /// Jobs at or after the live floor, newest offset first.
     Live { from: i64 },
