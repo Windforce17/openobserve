@@ -299,6 +299,12 @@ pub async fn vix_search(
     metrics::QUERY_DISK_CACHE_MISS_COUNT
         .with_label_values(&[query.org_id.as_str(), query.stream_type.as_str(), "index"])
         .inc_by(cache_misses);
+    // `cache_files` has already checked every sidecar. Preserve that
+    // query-wide fact so an equality histogram can prefer the much smaller
+    // term-postings path when all sidecars are local, without repeating a
+    // cache-index lookup for every file.
+    let all_index_sidecars_cached =
+        index_cache_entries.len() == index_files.len() && cache_misses == 0;
 
     let cached_ratio = if scan_stats.querier_files == 0 {
         0.0
@@ -429,7 +435,8 @@ pub async fn vix_search(
 
     // M14: query-shaped cold-open prefetch (ranged mode). Cold sidecar paths
     // pay the data footer + sidecar footer/dictionary directory in one
-    // bounded-concurrency wave. Equality histograms use native docs columns;
+    // bounded-concurrency wave. Remote-cold equality histograms use native
+    // docs columns; equality histograms with local sidecars need no prefetch.
     // ALL histograms first use file metadata and then the data-file zone
     // table, so prefetching every sidecar would turn zero-read files into IO.
     let prefetch_enabled = read_mode == VixReadMode::Ranged
@@ -505,6 +512,7 @@ pub async fn vix_search(
                     idx_optimize_rule_clone.clone(),
                     &file,
                     read_mode,
+                    all_index_sidecars_cached,
                     &fetch_stats,
                 )
                 .await;
@@ -533,6 +541,7 @@ pub async fn vix_search(
                         idx_optimize_rule_clone,
                         &file,
                         read_mode,
+                        all_index_sidecars_cached,
                         &fetch_stats,
                     )
                     .await;
@@ -888,13 +897,13 @@ enum VixReaderInput {
     /// Complete (data, sidecar) bytes (cached mode, plus ranged-mode
     /// fallbacks).
     Bytes(bytes::Bytes, Option<bytes::Bytes>),
-    /// Open over per-object range sources, memoizing the parsed reader
-    /// under `cache_key` (the DATA key — one reader per logical file; the
-    /// byte caches below key the two objects independently).
+    /// Open over per-object range sources. `cache_key=None` keeps the parsed
+    /// reader query-local; `Some(DATA key)` memoizes one reader per logical
+    /// file in the shared reader cache.
     Ranged {
         source: Arc<dyn vortex_index::VixRangeSource>,
         index: Option<Arc<dyn vortex_index::VixRangeSource>>,
-        cache_key: String,
+        cache_key: Option<String>,
     },
     /// A previously parsed (memoized) reader — zero IO to open.
     Shared(Arc<VixReader>),
@@ -915,7 +924,9 @@ impl VixReaderInput {
                 cache_key,
             } => {
                 let reader = Arc::new(VixReader::open_ranged_with_index(source, index)?);
-                reader_cache::GLOBAL_CACHE.put(cache_key, Arc::clone(&reader));
+                if let Some(cache_key) = cache_key {
+                    reader_cache::GLOBAL_CACHE.put(cache_key, Arc::clone(&reader));
+                }
                 reader
             }
             VixReaderInput::Shared(reader) => reader,
@@ -994,7 +1005,7 @@ pub async fn warm_file(
     let input = VixReaderInput::Ranged {
         source,
         index,
-        cache_key: key.to_string(),
+        cache_key: Some(key.to_string()),
     };
     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let reader = input.open()?;
@@ -1141,7 +1152,7 @@ async fn prefetch_cold_tails(
                 let input = VixReaderInput::Ranged {
                     source,
                     index,
-                    cache_key: key.clone(),
+                    cache_key: Some(key.clone()),
                 };
                 // the ranged open blocks on its tail fetches: off the runtime
                 let opened = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
@@ -1186,6 +1197,7 @@ async fn search_vix_index(
     idx_optimize_rule: Option<IndexOptimizeMode>,
     parquet_file: &FileKey,
     read_mode: VixReadMode,
+    all_index_sidecars_cached: bool,
     fetch_stats: &Arc<source::FetchStats>,
 ) -> anyhow::Result<(String, VixSearchResult, bool)> {
     // test-only rendezvous proving the per-file fan-out really runs
@@ -1260,17 +1272,40 @@ async fn search_vix_index(
         }
     }
 
-    // Data-only equality shapes use the native docs helper. An ALL histogram
-    // instead opens a VixReader without a sidecar: its eval(All) and zone
-    // collector are exact and avoid scanning `_source`.
-    let cold_native_histogram = condition.single_equal_term().is_some()
+    // A remote-cold equality histogram uses the native docs helper: reading
+    // its narrow predicate/timestamp columns is cheaper than downloading a
+    // whole sidecar. Once the sidecar is local (or its parsed reader is hot),
+    // use term postings instead. Wide first-touch queries commonly have all
+    // sidecars on disk but no parsed readers; treating those as remote-cold
+    // scanned billions of docs and read gigabytes unnecessarily.
+    let equality_histogram = condition.single_equal_term().is_some()
         && matches!(
             &idx_optimize_rule,
             Some(IndexOptimizeMode::SimpleHistogram(..))
-        )
-        && !reader_cache::GLOBAL_CACHE
+        );
+    let parsed_sidecar_available = equality_histogram
+        && reader_cache::GLOBAL_CACHE
             .get(&vix_file_name)
             .is_some_and(|reader| reader.has_index());
+    let local_sidecar_available = if equality_histogram
+        && parquet_file.meta.index_size > 0
+        && !parsed_sidecar_available
+        && !all_index_sidecars_cached
+    {
+        match config::vix_sidecar_key(&vix_file_name) {
+            Some(sidecar_key) => {
+                file_data::memory::exist(&sidecar_key).await
+                    || file_data::disk::exist(&sidecar_key).await
+            }
+            None => false,
+        }
+    } else {
+        equality_histogram && parquet_file.meta.index_size > 0 && all_index_sidecars_cached
+    };
+    let cold_native_histogram =
+        equality_histogram && !parsed_sidecar_available && !local_sidecar_available;
+    // An ALL histogram instead opens a VixReader without a sidecar: its
+    // eval(All) and zone collector are exact and avoid scanning `_source`.
     let data_only_all_histogram = condition.is_condition_all()
         && matches!(
             &idx_optimize_rule,
@@ -1337,7 +1372,14 @@ async fn search_vix_index(
                                 ))
                                     as Arc<dyn vortex_index::VixRangeSource>
                             }),
-                        cache_key: vix_file_name.clone(),
+                        // An ALL histogram already memoizes its compact exact
+                        // result. Keeping thousands of data-only readers would
+                        // retain decoded timestamp chunks and force the
+                        // size-accounted reader cache through an O(entries)
+                        // resync on every cold file open; filtered queries
+                        // cannot reuse those readers because they need the
+                        // sidecar anyway.
+                        cache_key: (!data_only_all_histogram).then(|| vix_file_name.clone()),
                     })
             }
         }
@@ -4651,7 +4693,8 @@ mod tests {
     }
 
     /// A bucket-straddling indexless file opens its data object without a
-    /// sidecar and uses the existing zone/timestamp collector.
+    /// sidecar, uses the existing zone/timestamp collector, and leaves the
+    /// large parsed reader query-local.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_indexless_all_histogram_uses_zone_collector() {
         let mut master = store_core_file(
@@ -4693,14 +4736,14 @@ mod tests {
             other => panic!("expected zone histogram, got {other:?}"),
         }
         assert!(
-            reader_cache::GLOBAL_CACHE.contains(&key),
-            "bucket-straddling ALL histogram must open the data-only reader"
+            !reader_cache::GLOBAL_CACHE.contains(&key),
+            "ALL histogram must not retain its data-only reader"
         );
     }
 
-    /// An indexed ALL histogram is still data-only. Give the sidecar an
-    /// impossible declared size so any attempted open fails; the zone
-    /// collector must answer entirely from the data object.
+    /// An indexed ALL histogram is still data-only and query-local. Give the
+    /// sidecar an impossible declared size so any attempted open fails; the
+    /// zone collector must answer entirely from the data object.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_indexed_all_histogram_skips_sidecar() {
         let master = store_core_file(
@@ -4742,12 +4785,9 @@ mod tests {
             MultiResult::Histogram(histogram) => assert_eq!(histogram, vec![4, 5, 1, 0, 0]),
             other => panic!("expected zone histogram, got {other:?}"),
         }
-        let data_only_reader = reader_cache::GLOBAL_CACHE
-            .get(&key)
-            .expect("indexed ALL histogram must memoize a data-only reader");
         assert!(
-            !data_only_reader.has_index(),
-            "ALL histogram must not attach the sidecar"
+            !reader_cache::GLOBAL_CACHE.contains(&key),
+            "indexed ALL histogram must not retain its data-only reader"
         );
 
         let mut filtered_condition = IndexCondition::new();
@@ -4763,6 +4803,7 @@ mod tests {
             Some(IndexOptimizeMode::SimpleHistogram(990, 5, 5, 0)),
             &master,
             VixReadMode::Ranged,
+            false,
             &fetch_stats,
         )
         .await
@@ -4771,10 +4812,8 @@ mod tests {
         assert!(matches!(equality_histogram, VixSearchResult::NoMatch));
         assert!(!has_skipped);
         assert!(
-            reader_cache::GLOBAL_CACHE
-                .get(&key)
-                .is_some_and(|reader| !reader.has_index()),
-            "equality histogram after ALL histogram must stay data-only"
+            !reader_cache::GLOBAL_CACHE.contains(&key),
+            "equality histogram after ALL histogram must stay query-local"
         );
 
         let mut sidecar_condition = IndexCondition::new();
@@ -4790,6 +4829,7 @@ mod tests {
             None,
             &master,
             VixReadMode::Ranged,
+            false,
             &fetch_stats,
         )
         .await
@@ -4852,6 +4892,51 @@ mod tests {
         assert!(
             !reader_cache::GLOBAL_CACHE.contains(&key),
             "cold native histogram must not open or prefetch the sidecar"
+        );
+    }
+
+    /// A first-touch equality histogram should use term postings when the
+    /// sidecar file is already local, even if no parsed reader exists yet.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_local_sidecar_equality_histogram_uses_index() {
+        let master = store_core_file(
+            "files/org/logs/native-histogram/2026/01/01/00/local-sidecar.vix",
+            1_000,
+        )
+        .await;
+        let key = master.key.clone();
+        reader_cache::GLOBAL_CACHE.remove(&key);
+        vix_result_cache::GLOBAL_CACHE.remove_file_entries(std::iter::once(key.as_str()));
+        let mut condition = IndexCondition::new();
+        condition.add_condition(Condition::Equal("level".to_string(), "info".to_string()));
+        let fetch_stats = Arc::new(source::FetchStats::default());
+
+        let (result_key, result, has_skipped) = search_vix_index(
+            "local-sidecar-native-histogram",
+            (990, 1_010),
+            Some(condition),
+            Some(IndexOptimizeMode::SimpleHistogram(990, 5, 5, 0)),
+            &master,
+            VixReadMode::Ranged,
+            true,
+            &fetch_stats,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result_key, key);
+        assert!(!has_skipped);
+        match result {
+            VixSearchResult::Histogram(histogram) => {
+                assert_eq!(histogram, vec![4, 5, 1, 0, 0])
+            }
+            other => panic!("expected indexed histogram, got {other:?}"),
+        }
+        assert!(
+            reader_cache::GLOBAL_CACHE
+                .get(&key)
+                .is_some_and(|reader| reader.has_index()),
+            "local sidecar histogram must retain its parsed indexed reader"
         );
     }
 }
