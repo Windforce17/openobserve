@@ -78,15 +78,24 @@ struct TermTable {
     postings: Vec<LargeBinaryArray>,
     /// First global ordinal of each `postings` batch.
     batch_starts: Vec<u64>,
+    /// Dictionary blocks loaded once per input. Range workers clone the
+    /// `Bytes` handle instead of re-reading the whole ranged blob per range.
+    dict_blocks: bytes::Bytes,
 }
 
 impl TermTable {
     fn load(reader: &VixReader) -> Result<Self> {
         let term_count = reader.term_count();
+        let dict_blocks = if term_count == 0 {
+            bytes::Bytes::new()
+        } else {
+            reader.dict_blocks_all_for_merge()?
+        };
         let mut table = TermTable {
             doc_counts: Vec::with_capacity(term_count as usize),
             postings: Vec::new(),
             batch_starts: Vec::new(),
+            dict_blocks,
         };
         if term_count == 0 {
             return Ok(table);
@@ -140,8 +149,8 @@ impl TermTable {
 /// same output key falls on the same side of a bound in every input.
 struct RemappedTermStream<'r> {
     reader: &'r VixReader,
-    /// The whole dictionary blocks region (compaction inputs are in-memory
-    /// blobs — this is a zero-copy clone, one per stream).
+    /// Whole dictionary blocks region loaded once into the input's
+    /// [`TermTable`], then shared by cheap `Bytes` clones across key ranges.
     blocks: bytes::Bytes,
     /// Current block id and the decode offset/prev-key state within it
     /// (an incremental [`crate::dict_blocks::BlockIter`] cannot borrow
@@ -174,6 +183,7 @@ impl<'r> RemappedTermStream<'r> {
     /// translations.
     fn new<S: BuildHasher>(
         reader: &'r VixReader,
+        blocks: bytes::Bytes,
         out_field_ids: &HashMap<String, u16, S>,
         lower: Option<&[u8]>,
         upper: Option<&[u8]>,
@@ -187,16 +197,15 @@ impl<'r> RemappedTermStream<'r> {
         }
         let lower = lower.map(|b| translate_bound(b, &field_map)).transpose()?;
         let upper = upper.map(|b| translate_bound(b, &field_map)).transpose()?;
-        let (start_block, blocks) = if reader.term_count() == 0 {
+        let start_block = if reader.term_count() == 0 {
             // a zero-term input has no dictionary blobs at all: an
             // exhausted stream, not an error
-            (usize::MAX, bytes::Bytes::new())
+            usize::MAX
         } else {
-            let start = match &lower {
+            match &lower {
                 Some(lower) => reader.dict_index()?.predecessor_block(lower)?.unwrap_or(0),
                 None => 0,
-            };
-            (start, reader.dict_blocks_all_for_merge()?)
+            }
         };
         Ok(Self {
             reader,
@@ -411,16 +420,36 @@ where
 
     let started = std::time::Instant::now();
     let tables: Vec<TermTable> = if threads > 1 && inputs.len() > 1 {
+        use std::sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let next = AtomicUsize::new(0);
+        let slots: Vec<Mutex<Option<Result<TermTable>>>> =
+            (0..inputs.len()).map(|_| Mutex::new(None)).collect();
         std::thread::scope(|scope| {
-            let handles: Vec<_> = inputs
-                .iter()
-                .map(|reader| scope.spawn(move || TermTable::load(reader)))
-                .collect();
-            handles
-                .into_iter()
-                .map(|handle| handle.join().expect("term-table load panicked"))
-                .collect::<Result<_>>()
-        })?
+            for _ in 0..threads.min(inputs.len()) {
+                scope.spawn(|| {
+                    loop {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(reader) = inputs.get(index) else {
+                            break;
+                        };
+                        *slots[index].lock().expect("term-table slot poisoned") =
+                            Some(TermTable::load(reader));
+                    }
+                });
+            }
+        });
+        slots
+            .into_iter()
+            .map(|slot| {
+                slot.into_inner()
+                    .expect("term-table slot poisoned")
+                    .expect("term-table worker exited before filling slot")
+            })
+            .collect::<Result<_>>()?
     } else {
         inputs
             .iter()
@@ -766,7 +795,16 @@ fn merge_term_range<MapState: BuildHasher, SetState: BuildHasher>(
         .with_plist_min_docs(plist_min_docs);
     let mut streams: Vec<RemappedTermStream<'_>> = inputs
         .iter()
-        .map(|reader| RemappedTermStream::new(reader, out_field_ids, lower, upper))
+        .zip(tables)
+        .map(|(reader, table)| {
+            RemappedTermStream::new(
+                reader,
+                table.dict_blocks.clone(),
+                out_field_ids,
+                lower,
+                upper,
+            )
+        })
         .collect::<Result<_>>()?;
     let mut alive: Vec<bool> = Vec::with_capacity(streams.len());
     for stream in &mut streams {

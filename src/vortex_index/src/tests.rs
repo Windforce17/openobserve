@@ -5280,6 +5280,55 @@ mod ranged {
         .unwrap();
         assert_eq!(rows, mem_rows);
     }
+    /// Parallel k-way ranges share one dictionary-block load per input.
+    /// Re-reading the whole ranged dictionary inside every range multiplied
+    /// compactor disk/S3 bytes by roughly `4 * merge_threads`.
+    #[test]
+    fn parallel_index_merge_does_not_refetch_dictionary_per_range() {
+        fn merge_fetch_cost(threads: usize) -> (usize, u64) {
+            let (data, index) = build_large_core_file();
+            let sources = [
+                PairSource::new(data.clone(), index.clone()),
+                PairSource::new(data, index),
+            ];
+            let readers: Vec<VixReader> = sources.iter().map(PairSource::open).collect();
+            let refs: Vec<&VixReader> = readers.iter().collect();
+            let before_fetches: usize = sources.iter().map(PairSource::fetches).sum();
+            let before_bytes: u64 = sources.iter().map(PairSource::bytes).sum();
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("_timestamp", DataType::Int64, false),
+                Field::new("svc", DataType::Utf8, true),
+                Field::new("level", DataType::Utf8, true),
+            ]));
+            let mut writer = VixWriter::new(
+                &schema,
+                VixWriterOptions {
+                    merge_kway_threads: threads,
+                    ..Default::default()
+                },
+                false,
+            );
+            let rows = readers[0].row_count() as u32;
+            writer
+                .merge_input_indexes(
+                    &refs,
+                    &[crate::DocIdMap::Offset(0), crate::DocIdMap::Offset(rows)],
+                    threads,
+                )
+                .unwrap();
+            (
+                sources.iter().map(PairSource::fetches).sum::<usize>() - before_fetches,
+                sources.iter().map(PairSource::bytes).sum::<u64>() - before_bytes,
+            )
+        }
+
+        let sequential = merge_fetch_cost(1);
+        let parallel = merge_fetch_cost(4);
+        assert_eq!(
+            parallel, sequential,
+            "parallel key ranges must not multiply ranged dictionary reads"
+        );
+    }
 }
 
 /// AND evaluation short-circuits: a leaf that matches no term proves the
