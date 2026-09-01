@@ -469,6 +469,20 @@ impl VixDocs {
         Ok(Self::from_container(container)?)
     }
 
+    /// Open a data-only docs reader with the built-in compact tail probe.
+    ///
+    /// The process-wide eager-tail override is tuned for index sidecars,
+    /// whose dictionary and bloom live next to their puffin footer. A data
+    /// object has no such tail-resident index payload, so fetching more than
+    /// the default footer probe only adds cold-read amplification.
+    pub fn open_ranged_data_only(source: Arc<dyn VixRangeSource>) -> anyhow::Result<Self> {
+        let container = crate::container::parse_container_ranged_with_tail(
+            &source,
+            crate::container::DEFAULT_TAIL_FETCH_BYTES,
+        )?;
+        Ok(Self::from_container(container)?)
+    }
+
     fn open_inner(data: Bytes) -> Result<Self> {
         let container = parse_container(&data)?;
         Self::from_container(container)
@@ -807,6 +821,34 @@ impl VixDocs {
             },
         )?;
         Ok(Some(counts))
+    }
+
+    /// Exact count for `column = needle` without reading `_timestamp`.
+    ///
+    /// This is the whole-file/single-histogram-bucket primitive: only the
+    /// predicate column is needed and the result stays constant-memory.
+    /// `Ok(None)` means the native column is absent or not string-family.
+    pub fn eq_string_count(&self, column: &str, needle: &str) -> anyhow::Result<Option<u64>> {
+        use arrow::datatypes::DataType;
+
+        let Ok(field) = self.schema.field_with_name(column) else {
+            return Ok(None);
+        };
+        if !matches!(
+            field.data_type(),
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+        ) {
+            return Ok(None);
+        }
+        if self.row_count == 0 {
+            return Ok(Some(0));
+        }
+        Ok(Some(crate::container::count_eq_string_matches(
+            &self.docs_blob,
+            column,
+            needle,
+            0..self.row_count,
+        )?))
     }
 
     /// The decoded per-column chunk-stats table (`stats` blob), fetched and

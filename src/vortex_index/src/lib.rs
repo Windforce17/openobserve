@@ -90,7 +90,8 @@ mod tokenizer;
 mod writer;
 
 pub use container::{
-    BloomEncodingCensus, RowOrder, VixOutput, ZoneEntry, region_row_ranges, set_tail_fetch_size,
+    BloomEncodingCensus, DEFAULT_TAIL_FETCH_BYTES, RowOrder, VixOutput, ZoneEntry,
+    region_row_ranges, set_tail_fetch_size,
 };
 pub use docs::{
     BoundValue, ColumnBound, DocsWidenPlan, EncodedDocsChunk, NumScalar, VixDocs, cmp_i128_vs_f64,

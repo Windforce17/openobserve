@@ -95,7 +95,7 @@ use crate::{
 /// large enough to cover them turns a cold sidecar open + term eval into
 /// ONE ranged fetch. On prod, cold evals averaged ~8-9 GETs per file
 /// before this was tunable.
-const TAIL_FETCH_SIZE: u64 = 64 * 1024;
+pub const DEFAULT_TAIL_FETCH_BYTES: u64 = 64 * 1024;
 static TAIL_FETCH_OVERRIDE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Set the eager tail fetch size for ranged opens (bytes; 0 keeps the
@@ -106,7 +106,7 @@ pub fn set_tail_fetch_size(bytes: u64) {
 
 fn tail_fetch_size() -> u64 {
     match TAIL_FETCH_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
-        0 => TAIL_FETCH_SIZE,
+        0 => DEFAULT_TAIL_FETCH_BYTES,
         v => v.max(MIN_FILE_SIZE),
     }
 }
@@ -517,10 +517,24 @@ pub(crate) fn parse_container(data: &Bytes) -> Result<VixContainer> {
 }
 
 /// Parse the puffin envelope of a ranged source: one tail fetch of up to
-/// [`TAIL_FETCH_SIZE`] bytes (a second, precise fetch when the footer payload
-/// exceeds it) yields the footer; blobs fully covered by the fetched tail are
-/// sliced from it, all others become on-demand windows of `source`.
+/// The configured eager-tail bytes (a second, precise fetch when the footer
+/// payload exceeds them) yield the footer; blobs fully covered by the fetched
+/// tail are sliced from it, all others become on-demand windows of `source`.
 pub(crate) fn parse_container_ranged(source: &Arc<dyn VixRangeSource>) -> Result<VixContainer> {
+    parse_container_ranged_with_tail(source, tail_fetch_size())
+}
+
+/// Parse a ranged container with a caller-selected initial tail probe.
+///
+/// Data-only readers use the built-in 64 KiB probe even when the process-wide
+/// override is larger for sidecars: a data object has no tail-resident term
+/// dictionary or bloom to amortize the extra bytes. If a pathological puffin
+/// footer exceeds the probe, the parser still performs the same exact second
+/// fetch as the ordinary ranged open.
+pub(crate) fn parse_container_ranged_with_tail(
+    source: &Arc<dyn VixRangeSource>,
+    eager_tail_bytes: u64,
+) -> Result<VixContainer> {
     let total = source.len();
     if total < MIN_FILE_SIZE {
         return Err(VixError::Malformed(format!(
@@ -531,7 +545,7 @@ pub(crate) fn parse_container_ranged(source: &Arc<dyn VixRangeSource>) -> Result
     // Tail probe. The footer region is `HeadMagic[4] + payload + FOOTER_SIZE`
     // at the very end of the file; read the payload size out of the footer
     // tail and refetch precisely when the probe fell short.
-    let mut tail_start = total.saturating_sub(tail_fetch_size());
+    let mut tail_start = total.saturating_sub(eager_tail_bytes.max(MIN_FILE_SIZE));
     let mut tail = block_fetch(source.as_ref(), tail_start..total)?;
     let footer_tail = &tail[tail.len() - FOOTER_SIZE as usize..];
     if footer_tail[(FOOTER_SIZE - MAGIC_SIZE) as usize..] != MAGIC {
@@ -2331,6 +2345,47 @@ pub(crate) fn scan_eq_string_candidates_range(
         }
     }
     Ok(())
+}
+
+/// Count rows matching one string equality over an ascending row range.
+/// The filter reads the predicate column; projecting only the synthetic row
+/// index prevents the count-only path from fetching or decoding `_timestamp`.
+pub(crate) fn count_eq_string_matches(
+    blob: &BlobHandle,
+    name: &str,
+    needle: &str,
+    range: std::ops::Range<u64>,
+) -> Result<u64> {
+    use vortex::{
+        dtype::Nullability,
+        expr::{col, eq, lit, pack},
+        layout::layouts::row_idx::row_idx,
+    };
+
+    const ROW_ID_COL: &str = "__vix_row_id";
+
+    if range.start >= range.end {
+        return Ok(0);
+    }
+    let runtime = SingleThreadRuntime::default();
+    let session = VortexSession::default().with_handle(runtime.handle());
+    let vxf = open_blob(&runtime, &session, blob)?;
+    let projection = pack([(ROW_ID_COL, row_idx())], Nullability::NonNullable);
+    let scan = vxf
+        .scan()?
+        .with_projection(projection)
+        .with_filter(eq(col(name), lit(needle.to_string())))
+        .with_row_range(range);
+    let mut count = 0u64;
+    for array in scan.into_array_iter(&runtime)? {
+        let batch_rows = u64::try_from(array?.len()).map_err(|_| {
+            VixError::Malformed("string equality batch length exceeds u64".to_string())
+        })?;
+        count = count.checked_add(batch_rows).ok_or_else(|| {
+            VixError::Malformed("string equality count overflowed u64".to_string())
+        })?;
+    }
+    Ok(count)
 }
 
 /// Scan one column of a stored blob in dictionary form, chunk by chunk,

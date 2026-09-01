@@ -3922,6 +3922,8 @@ fn vix_docs_broad_string_equality_aggregates_are_exact() {
             .unwrap(),
         vec![3, 3, 1]
     );
+    assert_eq!(docs.eq_string_count("svc", "hit").unwrap(), Some(7));
+    assert_eq!(docs.eq_string_count("svc", "absent").unwrap(), Some(0));
     assert_eq!(
         docs.eq_string_histogram("svc", "hit", Some((103, 109)), 100, 5, 3, 0)
             .unwrap()
@@ -3946,6 +3948,7 @@ fn vix_docs_broad_string_equality_aggregates_are_exact() {
             .unwrap()
             .is_none()
     );
+    assert!(docs.eq_string_count("missing", "hit").unwrap().is_none());
     assert!(
         docs.eq_string_top_n("_timestamp", "107", None, 3, false)
             .unwrap()
@@ -3956,6 +3959,7 @@ fn vix_docs_broad_string_equality_aggregates_are_exact() {
             .unwrap()
             .is_none()
     );
+    assert!(docs.eq_string_count("_timestamp", "107").unwrap().is_none());
 }
 
 #[test]
@@ -4756,6 +4760,70 @@ mod ranged {
             "fetched {} of {} bytes",
             source.bytes(),
             file_size
+        );
+    }
+
+    /// Data-only opens must not inherit the wider sidecar tail. Both probes
+    /// parse the same container in one request, while the compact probe saves
+    /// exactly 192 KiB on a production-sized data object.
+    #[test]
+    fn data_only_tail_probe_avoids_sidecar_read_amplification() {
+        let (data, _index) = build_large_core_file();
+        assert!(data.len() > 256 * 1024);
+
+        let compact = CountingSource::new(data.clone());
+        let compact_dyn: Arc<dyn VixRangeSource> = compact.clone();
+        crate::container::parse_container_ranged_with_tail(
+            &compact_dyn,
+            crate::DEFAULT_TAIL_FETCH_BYTES,
+        )
+        .unwrap();
+
+        let sidecar_sized = CountingSource::new(data);
+        let sidecar_dyn: Arc<dyn VixRangeSource> = sidecar_sized.clone();
+        crate::container::parse_container_ranged_with_tail(&sidecar_dyn, 256 * 1024).unwrap();
+
+        assert_eq!(compact.fetches(), 1);
+        assert_eq!(sidecar_sized.fetches(), 1);
+        assert_eq!(compact.bytes(), crate::DEFAULT_TAIL_FETCH_BYTES);
+        assert_eq!(sidecar_sized.bytes(), 256 * 1024);
+        assert_eq!(sidecar_sized.bytes() - compact.bytes(), 192 * 1024);
+    }
+
+    /// A one-bucket equality needs only the predicate column. The general
+    /// histogram remains the parity oracle and additionally reads timestamp.
+    #[test]
+    fn ranged_eq_string_count_reads_less_than_histogram() {
+        let (data, _index) = build_large_core_file();
+
+        let count_source = CountingSource::new(data.clone());
+        let count_docs =
+            VixDocs::open_ranged_data_only(Arc::clone(&count_source) as Arc<dyn VixRangeSource>)
+                .unwrap();
+        let count_open_bytes = count_source.bytes();
+        let count = count_docs
+            .eq_string_count("level", "info")
+            .unwrap()
+            .unwrap();
+        let count_scan_bytes = count_source.bytes() - count_open_bytes;
+
+        let histogram_source = CountingSource::new(data);
+        let histogram_docs = VixDocs::open_ranged_data_only(
+            Arc::clone(&histogram_source) as Arc<dyn VixRangeSource>
+        )
+        .unwrap();
+        let histogram_open_bytes = histogram_source.bytes();
+        let histogram = histogram_docs
+            .eq_string_histogram("level", "info", None, 1_000_000, 100_000, 1, 0)
+            .unwrap()
+            .unwrap();
+        let histogram_scan_bytes = histogram_source.bytes() - histogram_open_bytes;
+
+        assert_eq!(count, 33_334);
+        assert_eq!(histogram, vec![count]);
+        assert!(
+            count_scan_bytes < histogram_scan_bytes,
+            "count fetched {count_scan_bytes}B, histogram fetched {histogram_scan_bytes}B"
         );
     }
 

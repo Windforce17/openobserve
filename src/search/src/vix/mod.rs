@@ -100,6 +100,29 @@ use crate::{
     types::QueryParams,
 };
 
+fn fully_covered_file_histogram_bucket(
+    file: &FileKey,
+    fully_covered: bool,
+    mode: Option<&IndexOptimizeMode>,
+) -> anyhow::Result<Option<usize>> {
+    let Some(IndexOptimizeMode::SimpleHistogram(min_value, bucket_width, num_buckets, ts_offset)) =
+        mode
+    else {
+        return Ok(None);
+    };
+    if !fully_covered {
+        return Ok(None);
+    }
+    histogram_range_bucket(
+        file.meta.min_ts,
+        file.meta.max_ts,
+        *min_value,
+        *bucket_width,
+        *num_buckets,
+        *ts_offset,
+    )
+}
+
 fn fold_metadata_histogram(
     files: &mut HashMap<String, FileKey>,
     time_range: (i64, i64),
@@ -251,6 +274,29 @@ pub async fn vix_search(
         .filter(|file| is_core_file(&file.key) && (file.meta.index_size > 0 || data_only_capable))
         .cloned()
         .collect_vec();
+    if native_histogram {
+        let mut one_bucket_files = 0usize;
+        for file in &eval_files {
+            let fully_covered =
+                file.meta.min_ts >= query.time_range.0 && file.meta.max_ts < query.time_range.1;
+            let bucket = fully_covered_file_histogram_bucket(
+                file,
+                fully_covered,
+                idx_optimize_mode.as_ref(),
+            )
+            .map_err(|error| {
+                Error::Message(format!(
+                    "native histogram bucket calculation failed for {}: {error:#}",
+                    file.key
+                ))
+            })?;
+            one_bucket_files += usize::from(bucket.is_some());
+        }
+        log::info!(
+            "[trace_id {trace_id}] search->vix: native histogram one-bucket files: {one_bucket_files} of {}",
+            eval_files.len(),
+        );
+    }
     // Whole-sidecar caching and its metrics cover only evaluations that
     // actually read `.vxi`. A WHERE-less histogram is data-only even when
     // the file has an index sidecar.
@@ -965,7 +1011,7 @@ impl VixDocsInput {
     fn open(self) -> anyhow::Result<VixDocs> {
         match self {
             Self::Bytes(bytes) => VixDocs::open(bytes),
-            Self::Ranged(source) => VixDocs::open_ranged(source),
+            Self::Ranged(source) => VixDocs::open_ranged_data_only(source),
         }
     }
 }
@@ -1660,6 +1706,11 @@ async fn search_vix_docs_optimized(
 
     let task_key = key.clone();
     let task_field = field.clone();
+    let whole_file_bucket = fully_covered_file_histogram_bucket(
+        file,
+        time_clamp.is_none(),
+        idx_optimize_rule.as_ref(),
+    )?;
     let task_mode = idx_optimize_rule.expect("supported optimize mode checked above");
     let evaluated = tokio::task::spawn_blocking(move || {
         let docs = input
@@ -1679,16 +1730,26 @@ async fn search_vix_docs_optimized(
                     })
                 }),
             IndexOptimizeMode::SimpleHistogram(min_value, bucket_width, num_buckets, ts_offset) => {
-                docs.eq_string_histogram(
-                    &task_field,
-                    &needle,
-                    time_clamp,
-                    min_value,
-                    bucket_width,
-                    num_buckets,
-                    ts_offset,
-                )
-                .map(|histogram| histogram.map(VixSearchResult::Histogram))
+                if let Some(bucket) = whole_file_bucket {
+                    docs.eq_string_count(&task_field, &needle).map(|count| {
+                        count.map(|count| {
+                            let mut histogram = vec![0u64; num_buckets];
+                            histogram[bucket] = count;
+                            VixSearchResult::Histogram(histogram)
+                        })
+                    })
+                } else {
+                    docs.eq_string_histogram(
+                        &task_field,
+                        &needle,
+                        time_clamp,
+                        min_value,
+                        bucket_width,
+                        num_buckets,
+                        ts_offset,
+                    )
+                    .map(|histogram| histogram.map(VixSearchResult::Histogram))
+                }
             }
             _ => unreachable!("unsupported optimize mode rejected before task spawn"),
         }
@@ -4601,6 +4662,57 @@ mod tests {
         assert!(files.is_empty(), "native histogram must remove the file");
         match result {
             MultiResult::Histogram(histogram) => assert_eq!(histogram, vec![4, 5, 1, 0, 0]),
+            other => panic!("expected native histogram, got {other:?}"),
+        }
+    }
+
+    /// A fully covered file inside one histogram bucket uses the native
+    /// predicate-only count and contributes that exact count to the bucket.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_indexless_equality_histogram_one_bucket_count_is_exact() {
+        let mut master = store_core_file_with_rows(
+            "files/org/logs/native-histogram/2026/01/01/00/one-bucket.vix",
+            1_000,
+            100,
+        )
+        .await;
+        master.meta.index_size = 0;
+        assert_eq!(
+            fully_covered_file_histogram_bucket(
+                &master,
+                true,
+                Some(&IndexOptimizeMode::SimpleHistogram(800, 500, 2, 0)),
+            )
+            .unwrap(),
+            Some(0)
+        );
+        let params = Arc::new(crate::types::QueryParams {
+            trace_id: "native-histogram-one-bucket".to_string(),
+            org_id: "org".to_string(),
+            stream: datafusion::sql::TableReference::from("t"),
+            stream_type: StreamType::Logs,
+            stream_name: "t".to_string(),
+            time_range: (800, 1_500),
+            work_group: None,
+            use_inverted_index: true,
+        });
+        let mut condition = IndexCondition::new();
+        condition.add_condition(Condition::Equal("level".to_string(), "info".to_string()));
+        let mut files = vec![master];
+
+        let (_took, add_filter_back, result) = vix_search(
+            params,
+            &mut files,
+            Some(condition),
+            Some(IndexOptimizeMode::SimpleHistogram(800, 500, 2, 0)),
+        )
+        .await
+        .unwrap();
+
+        assert!(!add_filter_back);
+        assert!(files.is_empty());
+        match result {
+            MultiResult::Histogram(histogram) => assert_eq!(histogram, vec![100, 0]),
             other => panic!("expected native histogram, got {other:?}"),
         }
     }
