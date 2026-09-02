@@ -748,7 +748,7 @@ pub async fn get_file_id_lists(
         // from one causally consistent file-list snapshot instead of issuing
         // a second full file query after the id snapshot.
         let snapshot_started = Instant::now();
-        let (mut file_id_list, l0_ranges) = if seg_candidates.is_empty() {
+        let (mut file_id_list, l0_coverage) = if seg_candidates.is_empty() {
             (
                 crate::service::file_list::query_ids(
                     trace_id,
@@ -758,7 +758,7 @@ pub async fn get_file_id_lists(
                     time_range,
                 )
                 .await?,
-                Vec::new(),
+                Default::default(),
             )
         } else {
             let snapshot = crate::service::file_list::query_ids_with_file(
@@ -768,12 +768,16 @@ pub async fn get_file_id_lists(
                 &name,
                 time_range,
             )
-                .await?;
-            crate::service::search::grpc::segments_scan::split_snapshot_file_ids(snapshot)
+            .await?;
+            crate::service::search::grpc::segments_scan::split_snapshot_file_ids(
+                snapshot,
+                &seg_candidates,
+            )
         };
         let snapshot_ms = snapshot_started.elapsed().as_millis();
         let candidate_count = seg_candidates.len();
-        let l0_range_count = l0_ranges.len();
+        let l0_range_count = l0_coverage.range_count();
+        let l0_exact_id_count = l0_coverage.exact_id_count();
 
         let append_started = Instant::now();
         crate::service::search::grpc::segments_scan::append_surviving(
@@ -782,15 +786,16 @@ pub async fn get_file_id_lists(
             stream_type,
             &name,
             seg_candidates,
-            &l0_ranges,
+            &l0_coverage,
             &mut file_id_list,
         )?;
         let append_ms = append_started.elapsed().as_millis();
         log::info!(
-            "[trace_id {trace_id}] file id snapshot: {org_id}/{stream_type}/{name} candidates {}, files {}, L0 ranges {}, phase_ms candidates/snapshot/append {}/{}/{}",
+            "[trace_id {trace_id}] file id snapshot: {org_id}/{stream_type}/{name} candidates {}, files {}, L0 ranges {}, exact L0 ids {}, phase_ms candidates/snapshot/append {}/{}/{}",
             candidate_count,
             file_id_list.len(),
             l0_range_count,
+            l0_exact_id_count,
             candidates_ms,
             snapshot_ms,
             append_ms,

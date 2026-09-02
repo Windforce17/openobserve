@@ -48,10 +48,10 @@
 //!   away while its segment was still inside the grace: e2e heal test, 2026-07-31.)
 //! - A candidate observed Pending/Building whose build commits between the two reads would be
 //!   served twice (segment + L0 rows in the snapshot). L0 filenames embed provenance for exactly
-//!   this race: `l0_{uuid-or-multi}_{minSegId}_{maxSegId}_{n}` with any extension; any candidate
-//!   whose id falls inside a snapshot `l0_` range is dropped ([`dedup_candidates`]). Only snapshot
-//!   members may suppress a candidate — an L0 registered after the snapshot names data this query
-//!   will not scan from files, so honoring it would open a gap.
+//!   this race: legacy/h1 keys encode inclusive segment-id ranges, while h2 keys encode the exact
+//!   contributing ids. [`dedup_candidates`] drops only candidates covered by that provenance. Only
+//!   snapshot provenance members may suppress a candidate — an L0 registered after the snapshot
+//!   names data this query will not scan from files, so honoring it would open a gap.
 //! - The ordering invariant additionally requires the `wal_segments` read and the file_list
 //!   snapshot read to be CAUSALLY CONSISTENT. Both run on the RO pool, and `CLIENT_RO == CLIENT` by
 //!   default: an empty `ZO_META_POSTGRES_RO_DSN` falls back to the RW DSN
@@ -87,6 +87,7 @@ use infra::{
     cache::file_data,
     errors::{Error, Result},
     file_list::{FileId, FileIdWithFile},
+    l0_provenance::{L0Provenance, parse_l0_provenance},
     wal_segments::{self, SegmentMeta},
 };
 
@@ -593,17 +594,82 @@ fn apply_query_cap(
     )
 }
 
+/// Compact provenance coverage projected from the exact file-list snapshot a
+/// query scans. Legacy/h1 ranges stay ranges; sparse h2 ids stay exact.
+#[derive(Debug, Clone, Default)]
+pub struct L0Coverage {
+    ranges: Vec<(i64, i64)>,
+    exact_ids: HashSet<i64>,
+}
+
+impl L0Coverage {
+    pub fn range_count(&self) -> usize {
+        self.ranges.len()
+    }
+
+    pub fn exact_id_count(&self) -> usize {
+        self.exact_ids.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.ranges.is_empty() && self.exact_ids.is_empty()
+    }
+
+    fn insert(&mut self, provenance: L0Provenance, candidate_ids: &[i64]) {
+        match provenance {
+            L0Provenance::Range(min, max) => self.ranges.push((min, max)),
+            L0Provenance::Exact(ids) => self.exact_ids.extend(
+                ids.into_iter()
+                    .filter(|id| candidate_ids.binary_search(id).is_ok()),
+            ),
+        }
+    }
+
+    fn compact(&mut self) {
+        self.ranges.sort_unstable();
+        let mut write = 0;
+        for read in 0..self.ranges.len() {
+            let (min, max) = self.ranges[read];
+            if write > 0 && min <= self.ranges[write - 1].1.saturating_add(1) {
+                self.ranges[write - 1].1 = self.ranges[write - 1].1.max(max);
+            } else {
+                self.ranges[write] = (min, max);
+                write += 1;
+            }
+        }
+        self.ranges.truncate(write);
+        let ranges = &self.ranges;
+        self.exact_ids.retain(|id| !range_contains(ranges, *id));
+    }
+
+    fn contains(&self, id: i64) -> bool {
+        self.exact_ids.contains(&id) || range_contains(&self.ranges, id)
+    }
+}
+
+fn range_contains(ranges: &[(i64, i64)], id: i64) -> bool {
+    let index = ranges.partition_point(|&(min, _)| min <= id);
+    index > 0 && id <= ranges[index - 1].1
+}
+
 /// Split one causally consistent file-list snapshot into the compact ids sent
-/// to followers and the L0 provenance ranges used to suppress duplicate
-/// segment candidates. Keeping both projections from one query removes the
-/// previous second file-list query and prevents its result from drifting past
-/// the snapshot the query actually scans.
-pub fn split_snapshot_file_ids(snapshot: Vec<FileIdWithFile>) -> (Vec<FileId>, Vec<(i64, i64)>) {
+/// to followers and the L0 provenance coverage used to suppress duplicate
+/// segment candidates. Exact h2 coverage is intersected with the bounded
+/// candidate set while decoding, so accumulated file provenance cannot expand
+/// query-leader memory beyond [`MAX_QUERY_SEGMENTS`].
+pub fn split_snapshot_file_ids(
+    snapshot: Vec<FileIdWithFile>,
+    candidates: &[SegmentMeta],
+) -> (Vec<FileId>, L0Coverage) {
+    let mut candidate_ids = candidates.iter().map(|meta| meta.id).collect::<Vec<_>>();
+    candidate_ids.sort_unstable();
+    candidate_ids.dedup();
+
     let mut files = Vec::with_capacity(snapshot.len());
-    let mut l0_ranges = Vec::new();
+    let mut coverage = L0Coverage::default();
     for row in snapshot {
-        if let Some(range) = parse_l0_range(&row.file) {
-            l0_ranges.push(range);
+        if let Some(provenance) = parse_l0_provenance(&row.file) {
+            coverage.insert(provenance, &candidate_ids);
         }
         files.push(FileId {
             id: row.id,
@@ -612,7 +678,8 @@ pub fn split_snapshot_file_ids(snapshot: Vec<FileIdWithFile>) -> (Vec<FileId>, V
             deleted: row.deleted,
         });
     }
-    (files, l0_ranges)
+    coverage.compact();
+    (files, coverage)
 }
 
 /// Leader seam, phase 2 — runs AFTER the file_list snapshot is fetched:
@@ -624,14 +691,14 @@ pub fn append_surviving(
     stream_type: StreamType,
     stream_name: &str,
     candidates: Vec<SegmentMeta>,
-    l0_ranges: &[(i64, i64)],
+    l0_coverage: &L0Coverage,
     files: &mut Vec<FileId>,
 ) -> Result<()> {
     if candidates.is_empty() {
         return Ok(());
     }
 
-    let survivors = dedup_candidates(candidates, l0_ranges);
+    let survivors = dedup_candidates(candidates, l0_coverage);
     if survivors.is_empty() {
         return Ok(());
     }
@@ -642,9 +709,10 @@ pub fn append_surviving(
         )));
     }
     log::info!(
-        "[trace_id {trace_id}] segments_scan: {org_id}/{stream_type}/{stream_name} appending {} segments ({} L0 ranges deduped) to the file id list",
+        "[trace_id {trace_id}] segments_scan: {org_id}/{stream_type}/{stream_name} appending {} segments ({} L0 ranges and {} exact L0 ids in snapshot coverage) to the file id list",
         survivors.len(),
-        l0_ranges.len(),
+        l0_coverage.range_count(),
+        l0_coverage.exact_id_count(),
     );
     files.reserve(survivors.len());
     for meta in &survivors {
@@ -671,42 +739,16 @@ fn pseudo_file_id(meta: &SegmentMeta) -> Result<FileId> {
     })
 }
 
-/// Parse the `(minSegId, maxSegId)` provenance range out of an L0 file key.
-///
-/// Filenames match `l0_{uuid-or-multi}_{minSegId}_{maxSegId}_{n}` with any
-/// extension. The middle part may itself contain `_`, so the numeric fields
-/// are taken from the END. Returns `None` for anything that does not parse
-/// cleanly — an unparsable name must never suppress a segment (dup is
-/// recoverable, a gap is not).
-fn parse_l0_range(key: &str) -> Option<(i64, i64)> {
-    let name = key.rsplit('/').next()?;
-    let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name);
-    let rest = stem.strip_prefix("l0_")?;
-    let mut parts = rest.rsplit('_');
-    let _n: u64 = parts.next()?.parse().ok()?;
-    let max: i64 = parts.next()?.parse().ok()?;
-    let min: i64 = parts.next()?.parse().ok()?;
-    // at least the {uuid-or-multi} field must remain
-    parts.next()?;
-    if min < 1 || max < min {
-        return None;
-    }
-    Some((min, max))
-}
-
-/// Drop every candidate whose id falls inside any registered L0 range — its
-/// rows are already served by files the query scans.
-fn dedup_candidates(candidates: Vec<SegmentMeta>, l0_ranges: &[(i64, i64)]) -> Vec<SegmentMeta> {
-    if l0_ranges.is_empty() {
+/// Drop every candidate covered by registered L0 provenance — its rows are
+/// already served by files the query scans. Exact h2 ids are looked up in a
+/// hash set, so candidate checks allocate nothing and numeric gaps survive.
+fn dedup_candidates(candidates: Vec<SegmentMeta>, coverage: &L0Coverage) -> Vec<SegmentMeta> {
+    if coverage.is_empty() {
         return candidates;
     }
     candidates
         .into_iter()
-        .filter(|c| {
-            !l0_ranges
-                .iter()
-                .any(|&(min, max)| c.id >= min && c.id <= max)
-        })
+        .filter(|candidate| !coverage.contains(candidate.id))
         .collect()
 }
 
@@ -2665,121 +2707,77 @@ mod tests {
         }
     }
 
-    // ---- provenance parsing ----
+    // ---- provenance dedup rule ----
 
     #[test]
-    fn parse_l0_range_valid_forms() {
-        // plain uuid middle, .vix extension, nested path
-        assert_eq!(
-            parse_l0_range(
-                "files/org1/logs/app1/2026/07/31/10/l0_7f9c24e5-1a2b-4c3d-8e9f-000000000001_2_9_3.vix"
-            ),
-            Some((2, 9))
-        );
-        // "multi" middle, other extension — extension-agnostic
-        assert_eq!(
-            parse_l0_range("files/o/logs/s/l0_multi_10_10_1.parquet"),
-            Some((10, 10))
-        );
-        // no extension at all
-        assert_eq!(parse_l0_range("l0_multi_5_7_2"), Some((5, 7)));
-        // middle containing underscores parses from the END
-        assert_eq!(
-            parse_l0_range("l0_node_a_b_100_200_4.vix"),
-            Some((100, 200))
-        );
-        // large ids
-        assert_eq!(
-            parse_l0_range("l0_x_9223372036854775806_9223372036854775807_1.vix"),
-            Some((9223372036854775806, 9223372036854775807))
-        );
-    }
-
-    #[test]
-    fn parse_l0_range_rejects_junk_without_panicking() {
-        for key in [
-            "",
-            "/",
-            "files/o/logs/s/1234.parquet",    // not l0_
-            "files/o/logs/s/al0_x_1_2_3.vix", // prefix not at start
-            "l0_2_9_3.vix",                   // missing uuid-or-multi field
-            "l0_x_2_9.vix",                   // missing {n}
-            "l0_x_a_9_3.vix",                 // non-numeric min
-            "l0_x_2_b_3.vix",                 // non-numeric max
-            "l0_x_2_9_c.vix",                 // non-numeric n
-            "l0_x_9_2_3.vix",                 // min > max
-            "l0_x_0_9_3.vix",                 // min < 1 (ids are >= 1)
-            "l0_x_-5_9_3.vix",                // negative min
-            "l0_x_2_9_3.",                    // trailing dot only
-            "l0__2_9_3",                      // empty middle is still a field
-        ] {
-            let got = parse_l0_range(key);
-            match key {
-                // empty middle part is tolerated shape-wise: 5 fields present
-                "l0__2_9_3" => assert_eq!(got, Some((2, 9)), "key {key:?}"),
-                "l0_x_2_9_3." => assert_eq!(got, Some((2, 9)), "key {key:?}"),
-                _ => assert_eq!(got, None, "key {key:?} must not parse"),
-            }
-        }
-    }
-
-    // ---- dedup rule ----
-
-    #[test]
-    fn dedup_drops_inside_keeps_outside_multiple_ranges() {
-        let candidates = vec![
-            seg_meta(1, 0, 10),
-            seg_meta(2, 0, 10), // == min of [2,9] -> dropped
-            seg_meta(5, 0, 10), // inside [2,9] -> dropped
-            seg_meta(9, 0, 10), // == max of [2,9] -> dropped
-            seg_meta(10, 0, 10),
-            seg_meta(15, 0, 10), // inside [15,15] -> dropped
-            seg_meta(16, 0, 10),
-        ];
-        let ranges = vec![(2, 9), (15, 15)];
-        let survivors = dedup_candidates(candidates, &ranges);
-        assert_eq!(
-            survivors.iter().map(|m| m.id).collect::<Vec<_>>(),
-            vec![1, 10, 16]
-        );
-    }
-
-    #[test]
-    fn dedup_with_no_ranges_keeps_everything() {
-        let candidates = vec![seg_meta(1, 0, 10), seg_meta(2, 0, 10)];
-        let survivors = dedup_candidates(candidates, &[]);
-        assert_eq!(survivors.len(), 2);
-    }
-
-    #[test]
-    fn snapshot_projection_keeps_ids_and_l0_ranges_from_the_same_rows() {
+    fn dedup_drops_legacy_ranges_but_only_exact_h2_ids() {
+        let candidates = [1, 2, 5, 9, 10, 20, 21, 22, 30, 31, 32]
+            .into_iter()
+            .map(|id| seg_meta(id, 0, 10))
+            .collect::<Vec<_>>();
+        let token = infra::l0_provenance::encode_exact_ids(&[20, 22, 99]).unwrap();
         let snapshot = vec![
             FileIdWithFile {
                 id: 100,
-                file: "files/o/logs/s/l0_u_2_9_3.vix".to_string(),
+                file: "files/o/logs/s/l0_h1_node_a_2_9_3.vix".to_string(),
                 records: 11,
                 original_size: 101,
                 deleted: false,
             },
             FileIdWithFile {
                 id: 101,
-                file: "files/o/logs/s/plain_file.parquet".to_string(),
+                file: format!("files/o/logs/s/l0_h2_{token}_3.vix"),
                 records: 12,
                 original_size: 102,
                 deleted: true,
             },
+            FileIdWithFile {
+                id: 102,
+                // A malformed h2 key must never suppress its apparent range.
+                file: "files/o/logs/s/l0_h2_30_32_3.vix".to_string(),
+                records: 13,
+                original_size: 103,
+                deleted: false,
+            },
         ];
-        let (files, ranges) = split_snapshot_file_ids(snapshot);
-        assert_eq!(ranges, vec![(2, 9)]);
-        assert_eq!(files.len(), 2);
+        let (files, coverage) = split_snapshot_file_ids(snapshot, &candidates);
+        assert_eq!(coverage.range_count(), 1);
+        assert_eq!(coverage.exact_id_count(), 2);
+        assert_eq!(files.len(), 3);
         assert_eq!(files[0].id, 100);
         assert_eq!(files[0].records, 11);
         assert_eq!(files[0].original_size, 101);
         assert!(!files[0].deleted);
-        assert_eq!(files[1].id, 101);
-        assert_eq!(files[1].records, 12);
-        assert_eq!(files[1].original_size, 102);
         assert!(files[1].deleted);
+
+        let survivors = dedup_candidates(candidates, &coverage);
+        assert_eq!(
+            survivors.iter().map(|meta| meta.id).collect::<Vec<_>>(),
+            vec![1, 10, 21, 30, 31, 32]
+        );
+    }
+
+    #[test]
+    fn coverage_compacts_ranges_and_exact_ids_already_inside_them() {
+        let mut coverage = L0Coverage::default();
+        let candidate_ids = [3, 9];
+        coverage.insert(L0Provenance::Range(5, 7), &candidate_ids);
+        coverage.insert(L0Provenance::Range(1, 4), &candidate_ids);
+        coverage.insert(L0Provenance::Exact(vec![3, 9]), &candidate_ids);
+        coverage.compact();
+        assert_eq!(coverage.range_count(), 1);
+        assert_eq!(coverage.exact_id_count(), 1);
+        assert!(coverage.contains(1));
+        assert!(coverage.contains(7));
+        assert!(!coverage.contains(8));
+        assert!(coverage.contains(9));
+    }
+
+    #[test]
+    fn dedup_with_empty_coverage_keeps_everything() {
+        let candidates = vec![seg_meta(1, 0, 10), seg_meta(2, 0, 10)];
+        let survivors = dedup_candidates(candidates, &L0Coverage::default());
+        assert_eq!(survivors.len(), 2);
     }
 
     // ---- pseudo id transport ----

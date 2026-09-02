@@ -1346,13 +1346,13 @@ pub struct Common {
         help = "M31a: the LATE LANE master switch. Rows whose hour partition is at \
                 least this many hours behind the current hour are LATE (late-arriving \
                 spans/logs): at ingest they buffer separately and ship as ALL-LATE \
-                segments (classifier: created_at - max_ts, no schema change), and the \
-                builder holds those segments from claiming until \
-                ZO_SEGMENT_LATE_CLAIM_HOLD_SECS so one build wave coalesces the whole \
-                fleet's late rows into one L0 file per (stream, hour) per wave — \
-                instead of one 1-record ~3KB file per hour per build batch (prod \
-                measured ~3.5k such files/h on traces alone, 85% into old hours). \
-                Rows stay queryable through the segment tail the entire hold. 0 = OFF \
+                segments (classifier: created_at - max_ts, no schema change). The builder \
+                assigns registrations to fixed ZO_SEGMENT_LATE_CLAIM_HOLD_SECS wall-clock \
+                cohorts and releases each cohort only when its boundary closes, so one \
+                fleet-wide build wave coalesces late rows into one L0 file per (stream, \
+                hour) unless decoded-size or exact-provenance limits require a split. Rows \
+                stay queryable through the segment tail while their cohort remains open. \
+                0 = OFF \
                 (exact pre-M31a behavior). Sane value: 2 (the previous hour is NOT \
                 late — hour-boundary rows keep today's path)."
     )]
@@ -1379,11 +1379,12 @@ pub struct Common {
     #[env_config(
         name = "ZO_SEGMENT_LATE_CLAIM_HOLD_SECS",
         default = 900,
-        help = "M31a: all-late segments become claimable only this many seconds after \
-                creation — the hold is what batches a fleet's late rows into one \
-                build wave. Must stay far under the raw-object S3 lifecycle (1d prod; \
-                the aging lane is the deeper backstop). Late segments stay query-\
-                visible through the segment tail while held."
+        help = "M31a: width in seconds of fixed wall-clock cohorts for all-late segments. \
+                A segment becomes buildable at the next cohort boundary, so the wait is \
+                in [0, width) rather than a rolling per-segment delay; a single cohort \
+                owner batches the fleet's late rows. Must stay far under the raw-object \
+                S3 lifecycle (1d prod). Late segments remain query-visible through the \
+                segment tail while their cohort is open. 0 closes immediately."
     )]
     pub segment_late_claim_hold_secs: u64,
     #[env_config(
