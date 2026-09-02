@@ -8485,6 +8485,90 @@ fn numeric_terms_agree_between_column_and_source_paths() {
     assert!(variant_reader.partial_fields().is_empty());
 }
 
+/// Intentional exact-value exclusion is a capability demotion, not data
+/// loss: native docs columns and KEY postings remain authoritative while
+/// value probes fail open to the caller's scan fallback. A fast merge from
+/// a fully indexed input must physically discard the excluded value terms.
+#[test]
+fn value_index_exclusion_preserves_columns_keys_and_merge_semantics() {
+    use arrow::array::UInt64Array;
+
+    use crate::DocIdMap;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("_timestamp", DataType::Int64, false),
+        Field::new("start_time", DataType::UInt64, true),
+        Field::new("end_time", DataType::UInt64, true),
+        Field::new("svc", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![100, 99, 98])) as ArrayRef,
+            Arc::new(UInt64Array::from(vec![Some(10), None, Some(30)])),
+            Arc::new(UInt64Array::from(vec![Some(11), Some(22), None])),
+            Arc::new(StringArray::from(vec![
+                Some("api"),
+                Some("db"),
+                Some("api"),
+            ])),
+        ],
+    )
+    .unwrap();
+    let source = synthesize_source_for_test(&batch);
+    let excluded_options = VixWriterOptions {
+        value_index_excluded_field_names: vec!["start_time".to_string(), "end_time".to_string()],
+        ..VixWriterOptions::default()
+    };
+
+    let mut excluded = VixWriter::new(&schema, excluded_options.clone(), false);
+    excluded
+        .push_batch_with_source(&batch, &source, None)
+        .unwrap();
+    let excluded_reader = finish_open(excluded);
+
+    for field in ["start_time", "end_time"] {
+        assert!(excluded_reader.has_column_store_field(field));
+        assert!(!excluded_reader.has_term_capability(field));
+        assert!(excluded_reader.eval(&exact_numeric(field, "10")).is_err());
+        assert!(!excluded_reader.partial_fields().contains(field));
+    }
+    assert_eq!(
+        key_exists_set(&excluded_reader, "start_time"),
+        docs(&[0, 2])
+    );
+    assert_eq!(key_exists_set(&excluded_reader, "end_time"), docs(&[0, 1]));
+    assert!(excluded_reader.has_term_capability("svc"));
+    assert_eq!(
+        eval_set(&excluded_reader, &exact("svc", "api")),
+        docs(&[0, 2])
+    );
+
+    // The input carries start/end value terms. The excluded merge plan must
+    // retain positional field IDs and KEY terms but drop those value rows.
+    let mut full = VixWriter::new(&schema, VixWriterOptions::default(), false);
+    full.push_batch_with_source(&batch, &source, None).unwrap();
+    let full_reader = finish_open(full);
+    assert!(full_reader.has_term_capability("start_time"));
+    assert!(full_reader.has_term_capability("end_time"));
+
+    let refs = [&full_reader];
+    let maps = [DocIdMap::Offset(0)];
+    let mut merged = VixWriter::new(&schema, excluded_options, false);
+    merged.check_merge_inputs(&refs).unwrap();
+    merged.merge_input_indexes(&refs, &maps, 1).unwrap();
+    merged
+        .push_docs_rows_unindexed(&Int64Array::from(vec![100, 99, 98]), &[], &source, None)
+        .unwrap();
+    let merged_reader = finish_open(merged);
+    assert_eq!(
+        merged_reader.debug_all_terms().unwrap(),
+        excluded_reader.debug_all_terms().unwrap()
+    );
+    assert_eq!(key_exists_set(&merged_reader, "start_time"), docs(&[0, 2]));
+    assert!(!merged_reader.has_term_capability("start_time"));
+}
+
 /// Merge capability INTERSECTION: a term-planned field some input carries
 /// (key term) without term capability there — a numeric field in a file
 /// written before numeric value terms existed — is DEMOTED in the merged

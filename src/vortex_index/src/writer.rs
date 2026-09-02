@@ -179,19 +179,16 @@ fn hash_bloom_only_column_values(
     sink: &mut FastHashSet<u64>,
 ) {
     if let Some(strings) = StringColumn::try_new(column.as_ref()) {
-        for row in 0..column.len() {
-            let Some(value) = strings.value(row) else {
-                continue;
-            };
+        strings.for_each_present(|_row, value| {
             if value.len() > max_raw_term_len {
-                continue;
+                return;
             }
             if let Some(k) =
                 crate::bloom::composite_value_key(bloom_name, value.as_bytes(), scratch)
             {
                 sink.insert(crate::sbbf::hash_value(k));
             }
-        }
+        });
     }
 }
 
@@ -430,6 +427,12 @@ pub fn is_value_indexed_type(data_type: &DataType) -> bool {
 pub struct VixWriterOptions {
     /// Fields whose values are additionally tokenized for full-text search.
     pub fts_field_names: Vec<String>,
+    /// Fields retained in their value-field-id slot, native docs column and
+    /// key-presence index, but excluded from exact value terms. Their field
+    /// entry is capability-less apart from column storage, so equality/IN
+    /// predicates use the normal per-file scan fallback. This is independent
+    /// of [`Self::bloom_only_field_names`]: no value bloom is built.
+    pub value_index_excluded_field_names: Vec<String>,
     /// Raw-string term-indexed fields to record per-file value blooms for
     /// (the `bloom` puffin blob, built as a byproduct of term emission —
     /// see [`crate::bloom`]). Typically `trace_id`/`span_id`.
@@ -663,6 +666,7 @@ impl Default for VixWriterOptions {
     fn default() -> Self {
         Self {
             fts_field_names: Vec::new(),
+            value_index_excluded_field_names: Vec::new(),
             bloom_field_names: Vec::new(),
             bloom_composite: false,
             bloom_only_field_names: Vec::new(),
@@ -850,6 +854,11 @@ pub struct VixWriter {
     /// silently miss them. Per-field capability INTERSECTION across inputs;
     /// conditions on demoted fields take the skip + filter-back path.
     demoted_fields: BTreeSet<String>,
+    /// Policy-level exact-value exclusions. Unlike [`Self::demoted_fields`],
+    /// these are complete by construction: writers intentionally emit no
+    /// value terms, keep key terms and column storage, and must not classify
+    /// the missing capability as damage on later merges/heals.
+    value_index_excluded_fields: BTreeSet<String>,
     /// Test-support escape ONLY ([`Self::finish_unguarded`]): skip the
     /// degenerate-`_timestamp` finish guard so tests can fabricate the
     /// pre-guard-era files (stored rows with `_timestamp <= 0`) that the
@@ -994,6 +1003,12 @@ impl VixWriter {
         } else {
             FastHashMap::default()
         };
+        let value_index_excluded_fields: BTreeSet<String> = opts
+            .value_index_excluded_field_names
+            .iter()
+            .filter(|name| term_field_ids.contains_key(*name))
+            .cloned()
+            .collect();
 
         // fts marking applies to string-family fields only: tokenization is
         // a text concept. A numeric/bool field named in `fts_field_names`
@@ -1004,6 +1019,7 @@ impl VixWriter {
             .iter()
             .filter(|name| {
                 term_field_ids.contains_key(*name)
+                    && !value_index_excluded_fields.contains(*name)
                     && schema
                         .field_with_name(name)
                         .is_ok_and(|field| is_string_family(field.data_type()))
@@ -1038,6 +1054,7 @@ impl VixWriter {
                 term_field_ids.contains_key(*name)
                     && !opts.bloom_only_never.iter().any(|n| n == *name)
                     && !opts.fts_field_names.iter().any(|n| n == *name)
+                    && !value_index_excluded_fields.contains(*name)
                     && schema
                         .field_with_name(name)
                         .is_ok_and(|field| is_string_family(field.data_type()))
@@ -1107,6 +1124,7 @@ impl VixWriter {
             scratch: Vec::new(),
             merged_index: None,
             demoted_fields: BTreeSet::new(),
+            value_index_excluded_fields,
             skip_ts_guard: false,
         }
     }
@@ -1294,6 +1312,9 @@ impl VixWriter {
                 ));
             }
             for entry in reader.field_entries() {
+                if self.value_index_excluded_fields.contains(&entry.name) {
+                    continue;
+                }
                 let input_term = entry.has_type(FIELD_TYPE_TERM);
                 let input_fts = entry.has_type(FIELD_TYPE_FTS);
                 if !input_term && !input_fts {
@@ -1324,7 +1345,10 @@ impl VixWriter {
                     entry.name == *name
                         && (entry.has_type(FIELD_TYPE_TERM) || entry.has_type(FIELD_TYPE_FTS))
                 });
-                if !value_indexed && self.term_field_ids.contains_key(name) {
+                if !value_indexed
+                    && self.term_field_ids.contains_key(name)
+                    && !self.value_index_excluded_fields.contains(name)
+                {
                     return Err(format!(
                         "field {name:?} is partial and not value-indexed in input {position}, \
                          but the merge plan value-indexes it — its values are only recoverable \
@@ -1356,6 +1380,9 @@ impl VixWriter {
         }
         let mut lacking = Vec::new();
         for name in &self.term_fields {
+            if self.value_index_excluded_fields.contains(name) {
+                continue;
+            }
             if self.fts_fields.contains(name) {
                 continue; // fts entries never claim raw-value capability
             }
@@ -1534,17 +1561,26 @@ impl VixWriter {
             .bloom_field_names
             .iter()
             .filter(|name| {
-                self.term_field_ids
-                    .get(*name)
-                    .is_none_or(|id| !self.bloom_only.contains_key(id))
+                !self.demoted_fields.contains(*name)
+                    && !self.value_index_excluded_fields.contains(*name)
+                    && self
+                        .term_field_ids
+                        .get(*name)
+                        .is_none_or(|id| !self.bloom_only.contains_key(id))
             })
             .cloned()
+            .collect();
+        let merge_term_field_ids: FastHashMap<String, u16> = self
+            .term_field_ids
+            .iter()
+            .filter(|(name, _)| !self.value_index_excluded_fields.contains(*name))
+            .map(|(name, id)| (name.clone(), *id))
             .collect();
         let bloom_only_fids: FastHashSet<u16> = self.bloom_only.keys().copied().collect();
         let merged = merge::merge_indexes(
             inputs,
             doc_maps,
-            &self.term_field_ids,
+            &merge_term_field_ids,
             &bloom_field_names,
             &self.composite_pairs(),
             &bloom_only_fids,
@@ -2501,6 +2537,7 @@ impl VixWriter {
                 (!self.fts_fields.contains(name)
                     && !self.non_string_term_fields.contains(name)
                     && !self.demoted_fields.contains(name)
+                    && !self.value_index_excluded_fields.contains(name)
                     && !self.partial_fields.contains(name)
                     && !self.bloom_only.contains_key(&fid))
                 .then_some((name.as_str(), distinct))
@@ -2598,6 +2635,11 @@ impl VixWriter {
                 }
                 // key term: this doc has a value at `key`
                 self.terms.push(KEY_FIELD_ID, key.as_bytes(), doc);
+                if self.demoted_fields.contains(key)
+                    || self.value_index_excluded_fields.contains(key)
+                {
+                    continue;
+                }
 
                 match value.get_type() {
                     // a JSON string emits its value terms — fts tokens or
@@ -2803,10 +2845,22 @@ impl VixWriter {
     fn index_value_terms(&mut self, batch: &RecordBatch, first_doc: u64) {
         let num_rows = batch.num_rows();
         for (field_id, field_name) in self.term_fields.iter().enumerate() {
+            if self.demoted_fields.contains(field_name)
+                || self.value_index_excluded_fields.contains(field_name)
+            {
+                continue;
+            }
             let Some(column) = batch.column_by_name(field_name) else {
                 // Tolerate a column missing from this batch: all-null.
                 continue;
             };
+            // A planned column can be physically present in the batch schema
+            // while every row is null (common for wide sparse streams).
+            // Nothing in this column emits a value term, and its physical
+            // type is irrelevant until a non-null value exists.
+            if column.null_count() == num_rows {
+                continue;
+            }
             let field_id = field_id as u16;
             let is_fts = self.fts_fields.contains(field_name);
             if let Some(strings) = StringColumn::try_new(column.as_ref()) {
@@ -2820,46 +2874,37 @@ impl VixWriter {
                     // the field never degrades to `partial_fields` (which
                     // would cost whole-file match_all filter-backs — the
                     // live regression this fixed).
-                    for row in 0..num_rows {
-                        let Some(value) = strings.value(row) else {
-                            continue;
-                        };
+                    strings.for_each_present(|row, value| {
                         let doc = (first_doc + row as u64) as u32;
                         for token in
                             o2_tokenize(value, self.opts.min_token_len, self.opts.max_token_len)
                         {
                             self.terms.push(field_id, token.as_bytes(), doc);
                         }
-                    }
+                    });
                 } else if self.bloom_only.contains_key(&field_id) {
                     // #52 bloom-only: values hash into the composite key
                     // form, no dictionary entries. Oversize inherits #41.
                     let mut scratch = std::mem::take(&mut self.scratch);
                     let mut oversize = 0u64;
                     let (name, hashes) = self.bloom_only.get_mut(&field_id).expect("checked");
-                    for row in 0..num_rows {
-                        let Some(value) = strings.value(row) else {
-                            continue;
-                        };
+                    strings.for_each_present(|_row, value| {
                         if value.len() > self.opts.max_raw_term_len {
                             oversize += 1;
-                            continue;
+                            return;
                         }
                         if let Some(k) =
                             crate::bloom::composite_value_key(name, value.as_bytes(), &mut scratch)
                         {
                             hashes.insert(crate::sbbf::hash_value(k));
                         }
-                    }
+                    });
                     self.scratch = scratch;
                     if oversize > 0 {
                         *self.oversize_skips.entry(field_name.clone()).or_default() += oversize;
                     }
                 } else {
-                    for row in 0..num_rows {
-                        let Some(value) = strings.value(row) else {
-                            continue;
-                        };
+                    strings.for_each_present(|row, value| {
                         if value.len() > self.opts.max_raw_term_len {
                             // Oversize raw value: skipped from the term index
                             // WITHOUT degrading the field (owner call
@@ -2869,14 +2914,14 @@ impl VixWriter {
                             // value keeps exact index answers. The row's key
                             // term still lands (IS [NOT] NULL stays exact).
                             *self.oversize_skips.entry(field_name.clone()).or_default() += 1;
-                            continue;
+                            return;
                         }
                         let doc = (first_doc + row as u64) as u32;
                         // the empty string included: `""` is a value
                         // (distinct from null) and its fid-only composite key
                         // is valid, so `field = ''` answers from the index
                         self.terms.push(field_id, value.as_bytes(), doc);
-                    }
+                    });
                 }
             } else if let Some(numbers) = NumericColumn::try_new(column.as_ref()) {
                 if is_fts {
@@ -2886,20 +2931,20 @@ impl VixWriter {
                     continue;
                 }
                 let mut text = String::new();
-                for row in 0..num_rows {
+                for_each_present_row(column.as_ref(), |row| {
                     if !numbers.canonical_into(row, &mut text) {
-                        continue; // null, or non-finite float (== null in _source)
+                        return; // non-finite float (== null in _source)
                     }
                     if text.len() + 1 > self.opts.max_raw_term_len {
                         // canonical texts are ≤ ~25 bytes; guard kept for
                         // uniformity with the raw-term path (skip + count,
                         // no field degrade — same policy)
                         *self.oversize_skips.entry(field_name.clone()).or_default() += 1;
-                        continue;
+                        return;
                     }
                     let doc = (first_doc + row as u64) as u32;
                     push_numeric_term(&mut self.terms, &mut self.tag_scratch, &text, field_id, doc);
-                }
+                });
             } else {
                 // The batch stores this term field under a type with no term
                 // derivation (per-batch schema drift to e.g. Timestamp): its
@@ -2930,25 +2975,29 @@ impl VixWriter {
             let column = batch.column(index);
             // `Some(mask)` for float columns: `mask[row]` = valid AND finite.
             let finite = finite_float_mask(column.as_ref());
-            let emits_any = match &finite {
-                Some(mask) => mask.iter().any(|&keep| keep),
-                None => column.null_count() < column.len(),
-            };
-            if !emits_any {
-                continue; // the path exists in none of this batch's docs
+            match &finite {
+                Some(mask) => self.terms.extend(
+                    KEY_FIELD_ID,
+                    name.as_bytes(),
+                    mask.iter()
+                        .enumerate()
+                        .filter_map(|(row, &keep)| keep.then_some((first_doc + row as u64) as u32)),
+                ),
+                None if column.null_count() == 0 => self.terms.extend(
+                    KEY_FIELD_ID,
+                    name.as_bytes(),
+                    (0..num_rows).map(|row| (first_doc + row as u64) as u32),
+                ),
+                None => self.terms.extend(
+                    KEY_FIELD_ID,
+                    name.as_bytes(),
+                    column.nulls().into_iter().flat_map(|nulls| {
+                        nulls
+                            .valid_indices()
+                            .map(|row| (first_doc + row as u64) as u32)
+                    }),
+                ),
             }
-            let all_valid = finite.is_none() && column.null_count() == 0;
-            self.terms.extend(
-                KEY_FIELD_ID,
-                name.as_bytes(),
-                (0..num_rows).filter_map(|row| {
-                    let keep = match &finite {
-                        Some(mask) => mask[row],
-                        None => all_valid || column.is_valid(row),
-                    };
-                    keep.then_some((first_doc + row as u64) as u32)
-                }),
-            );
         }
     }
 
@@ -3267,10 +3316,15 @@ impl VixWriter {
                     .bloom_field_names
                     .iter()
                     .filter_map(|n| self.term_field_ids.get(n).map(|id| (*id, n.clone())))
-                    // #52: bloom-only fields have no terms — tracking them
+                    // #52 bloom-only and intentionally excluded fields have
+                    // no authoritative value terms — tracking either
                     // per-field would publish an EMPTY (reject-all) filter
-                    // and wrongly drop; the composite carries their values
-                    .filter(|(id, _)| !self.bloom_only.contains_key(id))
+                    // and wrongly drop; the composite excludes both as well.
+                    .filter(|(id, name)| {
+                        !self.bloom_only.contains_key(id)
+                            && !self.demoted_fields.contains(name)
+                            && !self.value_index_excluded_fields.contains(name)
+                    })
                     .collect();
                 let composite_pairs = self.composite_pairs();
                 // #48: one reserved section covering (field name, value)
@@ -3667,6 +3721,7 @@ impl VixWriter {
             .filter(|(name, _)| {
                 !self.fts_fields.contains(*name)
                     && !self.demoted_fields.contains(*name)
+                    && !self.value_index_excluded_fields.contains(*name)
                     // non-string value terms are canonical-tagged bytes the
                     // pruner's raw-literal probe can never match — coverage
                     // would turn every such miss into a wrong drop
@@ -3695,7 +3750,9 @@ impl VixWriter {
             .map(|name| {
                 let mut types = if self.fts_fields.contains(name) {
                     vec![FIELD_TYPE_FTS.to_string()]
-                } else if self.demoted_fields.contains(name) {
+                } else if self.demoted_fields.contains(name)
+                    || self.value_index_excluded_fields.contains(name)
+                {
                     Vec::new()
                 } else if self
                     .term_field_ids
@@ -4143,6 +4200,22 @@ fn view_value_bytes(views: &[u128], column: &dyn Array) -> usize {
         .filter(|(row, _)| column.is_valid(*row))
         .map(|(_, view)| (*view as u32) as usize)
         .sum()
+}
+
+/// Visit the physical non-null row indices without scanning every row of a
+/// sparse array. Arrow validity indices are relative to an array slice, so
+/// document offsets remain correct for sliced batches.
+#[inline]
+fn for_each_present_row(column: &dyn Array, mut visit: impl FnMut(usize)) {
+    if column.null_count() == 0 {
+        for row in 0..column.len() {
+            visit(row);
+        }
+    } else if let Some(nulls) = column.nulls() {
+        for row in nulls.valid_indices() {
+            visit(row);
+        }
+    }
 }
 
 /// For float-typed columns, the per-row "emits a key term" mask: valid AND
@@ -5173,6 +5246,24 @@ impl<'a> StringColumn<'a> {
         }
     }
 
+    /// Visit each physical non-null value. Dispatch the string representation
+    /// once per column, then walk only set validity bits; the callback cannot
+    /// retain a view beyond this call.
+    #[inline]
+    fn for_each_present(&self, mut visit: impl FnMut(usize, &str)) {
+        match self {
+            Self::Utf8(array) => {
+                for_each_present_row(*array, |row| visit(row, array.value(row)));
+            }
+            Self::LargeUtf8(array) => {
+                for_each_present_row(*array, |row| visit(row, array.value(row)));
+            }
+            Self::Utf8View(array) => {
+                for_each_present_row(*array, |row| visit(row, array.value(row)));
+            }
+        }
+    }
+
     /// The value at `row`, or `None` when null.
     fn value(&self, row: usize) -> Option<&'a str> {
         match self {
@@ -5388,3 +5479,7 @@ mod plist_sink_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "writer/full_path_bench.rs"]
+mod full_path_bench;

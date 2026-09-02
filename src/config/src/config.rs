@@ -1702,6 +1702,16 @@ pub struct Common {
     )]
     pub vix_index_disabled_stream_types: String,
     #[env_config(
+        name = "ZO_VIX_VALUE_INDEX_EXCLUDED_FIELDS",
+        default = "",
+        help = "Comma-separated fields retained in every native docs column and in the \
+                key-presence index, but excluded from exact value terms. Equality/IN \
+                predicates on these fields fall back to the column scan. Use for \
+                near-row-cardinality values such as trace start_time/end_time where a \
+                term dictionary adds build cost without useful pruning."
+    )]
+    pub vix_value_index_excluded_fields: String,
+    #[env_config(
         name = "ZO_VIX_L0_INDEX_OFF_STREAM_TYPES",
         default = "",
         help = "Comma-separated stream types whose ingest-side builds (the WAL move job and \

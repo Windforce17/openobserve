@@ -381,6 +381,14 @@ fn core_writer_options(
     let cfg = get_config();
     vortex_index::configure_shared_cpu_executor(vix_cpu_executor_threads());
     VixWriterOptions {
+        value_index_excluded_field_names: cfg
+            .common
+            .vix_value_index_excluded_fields
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
         index_enabled,
         bloom_field_names: bloom_fields,
         bloom_composite: cfg.common.vix_bloom_composite,
@@ -1217,8 +1225,10 @@ fn batch_string_column(
 }
 
 fn as_string_array(column: &ArrayRef) -> Result<StringArray, anyhow::Error> {
-    let column = cast(column, &DataType::Utf8)?;
-    column
+    if let Some(array) = column.as_any().downcast_ref::<StringArray>() {
+        return Ok(array.clone());
+    }
+    cast(column, &DataType::Utf8)?
         .as_any()
         .downcast_ref::<StringArray>()
         .cloned()
@@ -1226,17 +1236,21 @@ fn as_string_array(column: &ArrayRef) -> Result<StringArray, anyhow::Error> {
 }
 
 fn as_int64_array(column: &ArrayRef) -> Result<Int64Array, anyhow::Error> {
-    let column = cast(column, &DataType::Int64)?;
-    column
+    if let Some(array) = column.as_any().downcast_ref::<Int64Array>() {
+        return Ok(array.clone());
+    }
+    cast(column, &DataType::Int64)?
         .as_any()
         .downcast_ref::<Int64Array>()
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("column is not an int64 array"))
 }
 
-/// Per-row value-byte accessor of one column, used for the batch byte caps.
-/// Variable-length families report each slot's value bytes; everything else
-/// counts as its fixed width (`8` when unknown). Null slots cost `0`.
+/// Column-specialized value-byte accounting used by the hard batch caps.
+/// Accumulation is column-major: all-null columns are O(1), sparse columns
+/// visit validity set bits only, and dense columns use tight typed loops.
+/// Variable-length families report value bytes; other types use their fixed
+/// width (`8` when unknown). Null slots cost `0`.
 enum VarBytes<'a> {
     Utf8(&'a StringArray),
     LargeUtf8(&'a LargeStringArray),
@@ -1277,68 +1291,95 @@ impl<'a> VarBytes<'a> {
         }
     }
 
-    fn get(&self, row: usize) -> usize {
-        fn valid(array: &dyn Array, row: usize, len: usize) -> usize {
-            if array.is_valid(row) { len } else { 0 }
-        }
+    fn accumulate_value_bytes(&self, rows: &mut [usize], scale: usize) {
         match self {
-            Self::Utf8(array) => valid(*array, row, array.value_length(row) as usize),
-            Self::LargeUtf8(array) => valid(*array, row, array.value_length(row) as usize),
-            Self::Utf8View(array) => valid(*array, row, array.value(row).len()),
-            Self::Binary(array) => valid(*array, row, array.value_length(row) as usize),
-            Self::LargeBinary(array) => valid(*array, row, array.value_length(row) as usize),
-            Self::BinaryView(array) => valid(*array, row, array.value(row).len()),
-            Self::Fixed(array, width) => valid(*array, row, *width),
-            Self::Opaque(array) => valid(*array, row, usize::MAX),
+            Self::Utf8(array) => accumulate_present(*array, rows, scale, 0, |row| {
+                array.value_length(row) as usize
+            }),
+            Self::LargeUtf8(array) => accumulate_present(*array, rows, scale, 0, |row| {
+                array.value_length(row) as usize
+            }),
+            Self::Utf8View(array) => {
+                accumulate_present(*array, rows, scale, 0, |row| array.value(row).len())
+            }
+            Self::Binary(array) => accumulate_present(*array, rows, scale, 0, |row| {
+                array.value_length(row) as usize
+            }),
+            Self::LargeBinary(array) => accumulate_present(*array, rows, scale, 0, |row| {
+                array.value_length(row) as usize
+            }),
+            Self::BinaryView(array) => {
+                accumulate_present(*array, rows, scale, 0, |row| array.value(row).len())
+            }
+            Self::Fixed(array, width) => accumulate_present(*array, rows, scale, 0, |_| *width),
+            Self::Opaque(array) => accumulate_present(*array, rows, scale, 0, |_| usize::MAX),
         }
     }
 
-    /// Bytes needed for this scalar in Arrow JSON. String families use the
-    /// exact JSON escaping expansion; binary gets a conservative 6x bound;
-    /// fixed-width term-eligible scalars fit in 32 textual bytes.
-    fn json_len_bound(&self, row: usize) -> usize {
+    /// Add the conservative Arrow-JSON value bound for every PRESENT row.
+    /// `entry_bytes` is the caller-specific fixed cost around the value
+    /// (field name, colon and comma); `scale` accounts simultaneously-live
+    /// copies. Iterating validity set bits makes sparse, width-thousands
+    /// batches proportional to their present cells rather than rows × fields.
+    fn accumulate_json_bytes(&self, rows: &mut [usize], entry_bytes: usize, scale: usize) {
         match self {
-            Self::Utf8(array) => array
-                .is_valid(row)
-                .then(|| json_string_len(array.value(row).as_bytes()))
-                .unwrap_or(0),
-            Self::LargeUtf8(array) => array
-                .is_valid(row)
-                .then(|| json_string_len(array.value(row).as_bytes()))
-                .unwrap_or(0),
-            Self::Utf8View(array) => array
-                .is_valid(row)
-                .then(|| json_string_len(array.value(row).as_bytes()))
-                .unwrap_or(0),
-            Self::Binary(array) => array
-                .is_valid(row)
-                .then(|| array.value(row).len().saturating_mul(6).saturating_add(2))
-                .unwrap_or(0),
-            Self::LargeBinary(array) => array
-                .is_valid(row)
-                .then(|| array.value(row).len().saturating_mul(6).saturating_add(2))
-                .unwrap_or(0),
-            Self::BinaryView(array) => array
-                .is_valid(row)
-                .then(|| array.value(row).len().saturating_mul(6).saturating_add(2))
-                .unwrap_or(0),
-            Self::Fixed(array, _) => {
-                if array.is_valid(row) {
-                    128
-                } else {
-                    0
-                }
+            Self::Utf8(array) => accumulate_present(*array, rows, scale, entry_bytes, |row| {
+                json_string_len(array.value(row).as_bytes())
+            }),
+            Self::LargeUtf8(array) => accumulate_present(*array, rows, scale, entry_bytes, |row| {
+                json_string_len(array.value(row).as_bytes())
+            }),
+            Self::Utf8View(array) => accumulate_present(*array, rows, scale, entry_bytes, |row| {
+                json_string_len(array.value(row).as_bytes())
+            }),
+            Self::Binary(array) => accumulate_present(*array, rows, scale, entry_bytes, |row| {
+                array.value(row).len().saturating_mul(6).saturating_add(2)
+            }),
+            Self::LargeBinary(array) => {
+                accumulate_present(*array, rows, scale, entry_bytes, |row| {
+                    array.value(row).len().saturating_mul(6).saturating_add(2)
+                })
             }
-            // Nested/dictionary values do not have a cheap exact per-row
-            // memory/JSON bound. Force them into the documented one-row
-            // oversize exception rather than weakening the aggregate cap.
+            Self::BinaryView(array) => {
+                accumulate_present(*array, rows, scale, entry_bytes, |row| {
+                    array.value(row).len().saturating_mul(6).saturating_add(2)
+                })
+            }
+            Self::Fixed(array, _) => accumulate_present(*array, rows, scale, entry_bytes, |_| 128),
             Self::Opaque(array) => {
-                if array.is_valid(row) {
-                    usize::MAX
-                } else {
-                    0
-                }
+                accumulate_present(*array, rows, scale, entry_bytes, |_| usize::MAX)
             }
+        }
+    }
+}
+
+fn accumulate_present(
+    array: &dyn Array,
+    rows: &mut [usize],
+    scale: usize,
+    fixed: usize,
+    mut value_bytes: impl FnMut(usize) -> usize,
+) {
+    debug_assert_eq!(array.len(), rows.len());
+    let null_count = array.null_count();
+    if null_count == array.len() {
+        return;
+    }
+    let mut add = |row: usize| {
+        let bytes = fixed.saturating_add(value_bytes(row)).saturating_mul(scale);
+        rows[row] = rows[row].saturating_add(bytes);
+    };
+    if null_count == 0 {
+        for row in 0..array.len() {
+            add(row);
+        }
+    } else if let Some(nulls) = array.nulls() {
+        for row in nulls.valid_indices() {
+            add(row);
+        }
+    } else {
+        for row in 0..array.len() {
+            add(row);
         }
     }
 }
@@ -1352,36 +1393,6 @@ fn json_string_len(value: &[u8]) -> usize {
             _ => 1,
         })
     })
-}
-
-/// Conservative serialized length of one `_source` row. Value escaping is
-/// exact for string families; key/punctuation bytes are included explicitly.
-fn source_json_row_len_bound(
-    fields: &[Arc<Field>],
-    accessors: &[VarBytes<'_>],
-    row: usize,
-) -> usize {
-    fields
-        .iter()
-        .zip(accessors)
-        .filter(|(field, _)| {
-            !matches!(
-                field.name().as_str(),
-                ID_COL_NAME | ORIGINAL_DATA_COL_NAME | SOURCE_COL_NAME
-            )
-        })
-        .fold(2usize, |bytes, (field, accessor)| {
-            let value_bytes = accessor.json_len_bound(row);
-            if value_bytes == 0 {
-                bytes
-            } else {
-                bytes
-                    .saturating_add(json_string_len(field.name().as_bytes()))
-                    .saturating_add(1) // ':'
-                    .saturating_add(value_bytes)
-                    .saturating_add(1) // conservative trailing ','
-            }
-        })
 }
 
 /// Split `batch` into consecutive row slices (zero-copy), each within the
@@ -1404,24 +1415,35 @@ fn split_batch_by_bytes(
         .iter()
         .map(|column| VarBytes::new(column.as_ref()))
         .collect();
-    let fields = batch.schema().fields().to_vec();
-    let fixed_per_row = 24usize.saturating_mul(batch.num_columns());
+    let fixed_per_row = 24usize
+        .saturating_mul(batch.num_columns())
+        // `_source` object braces, with both the serializer line buffer and
+        // the returned StringArray values simultaneously live.
+        .saturating_add(if synthesize_source { 4 } else { 0 });
+    let mut row_bytes = vec![fixed_per_row; rows];
+    for accessor in &accessors {
+        accessor.accumulate_value_bytes(&mut row_bytes, 1);
+    }
+    if synthesize_source {
+        for (field, accessor) in batch.schema().fields().iter().zip(&accessors) {
+            if matches!(
+                field.name().as_str(),
+                ID_COL_NAME | ORIGINAL_DATA_COL_NAME | SOURCE_COL_NAME
+            ) {
+                continue;
+            }
+            let entry_bytes = json_string_len(field.name().as_bytes()).saturating_add(2);
+            accessor.accumulate_json_bytes(&mut row_bytes, entry_bytes, 2);
+        }
+    }
+
     let mut parts = Vec::new();
     let mut start = 0usize;
     let mut part_rows = 0usize;
     let mut part_bytes = 0usize;
-    for row in 0..rows {
-        let resident = accessors.iter().fold(0usize, |bytes, accessor| {
-            bytes.saturating_add(accessor.get(row))
-        });
-        let source_peak = synthesize_source
-            .then(|| source_json_row_len_bound(&fields, &accessors, row).saturating_mul(2))
-            .unwrap_or(0);
-        let row_bytes = fixed_per_row
-            .saturating_add(resident)
-            .saturating_add(source_peak);
+    for (row, &bytes) in row_bytes.iter().enumerate() {
         let next_rows = part_rows.saturating_add(1);
-        let next_bytes = part_bytes.saturating_add(row_bytes);
+        let next_bytes = part_bytes.saturating_add(bytes);
         if part_rows > 0 && (next_rows > caps.rows.max(1) || next_bytes > caps.bytes.max(1)) {
             parts.push(batch.slice(start, part_rows));
             start = row;
@@ -1429,7 +1451,7 @@ fn split_batch_by_bytes(
             part_bytes = 0;
         }
         part_rows += 1;
-        part_bytes = part_bytes.saturating_add(row_bytes);
+        part_bytes = part_bytes.saturating_add(bytes);
         if part_rows >= caps.rows.max(1) || part_bytes >= caps.bytes.max(1) {
             parts.push(batch.slice(start, part_rows));
             start = row + 1;
@@ -3676,16 +3698,16 @@ fn merge_chunk_arrow_bytes(chunk: &MergeChunk) -> usize {
             .sum::<usize>()
 }
 
-/// M25: shared all-null arrays for preserved columns ABSENT from one input's
-/// docs schema, keyed by (type, rows). v2 null-fill used to allocate a fresh
-/// null array PER absent column PER chunk — at prod widths ~1,500-2,100 of
-/// the union's columns are absent from any given narrow-WAL file, and those
-/// allocations (4-8 B/row of offsets/validity EACH) dominated the merge's
-/// decode transit (~10 KB/row of arrow for ~0.6 KB of values). All absent
-/// columns of one (type, len) are the SAME logical array, so one allocation
-/// serves them all via Arc clones; the byte-identity of the output is
-/// untouched (an all-null array is an all-null array — the writer sees
-/// identical windows).
+/// M25: shared all-null arrays for preserved columns not decoded from one
+/// input (schema-absent or metadata-proven empty), keyed by (type, rows). v2
+/// null-fill used to allocate a fresh null array PER absent column PER chunk
+/// — at prod widths ~1,500-2,100 of the union's columns are absent from any
+/// given narrow-WAL file, and those allocations (4-8 B/row of offsets/validity
+/// EACH) dominated the merge's decode transit (~10 KB/row of arrow for ~0.6 KB
+/// of values). All such columns of one (type, len) are the SAME logical array,
+/// so one allocation serves them all via Arc clones; the byte-identity of the
+/// output is untouched (an all-null array is an all-null array — the writer
+/// sees identical windows).
 #[derive(Default)]
 struct NullArrayCache(FastHashMap<(DataType, usize), ArrayRef>);
 
@@ -3781,13 +3803,14 @@ fn normalize_merge_chunk(
                 anyhow::anyhow!("core file {key}: column {name:?} cast to {target_type}: {e}")
             })?,
             // v2 all-present-columns: an input lacking a column means the
-            // column was ABSENT from its records — it contributes nulls for
-            // these rows (`_source` still carries each record's real
+            // column was ABSENT from its records. An exact zero in the
+            // input's column-presence metadata proves the same thing without
+            // decoding its physical all-null array. Both contribute nulls
+            // for these rows (`_source` still carries each record's real
             // fields; the scan-side json_get fallback serves fields absent
-            // from a file's columns). The pre-v2 derive-from-`_source`
-            // materialization is gone with `column_store_fields`. M25: the
-            // null array is SHARED per (type, len) across all absent
-            // columns and chunks of this input (see [`NullArrayCache`]).
+            // from a file's columns). M25: the null array is SHARED per
+            // (type, len) across all omitted columns and chunks of this input
+            // (see [`NullArrayCache`]).
             None => null_cache.get(target_type, rows),
         };
         cs.push(column);
@@ -3802,11 +3825,16 @@ fn normalize_merge_chunk(
     for column in &cs {
         accessors.push(VarBytes::new(column.as_ref()));
     }
+    // At the window peak both staged and interleaved value buffers are
+    // live. Build the exact same conservative per-row bound column-major:
+    // all-null columns become O(1), sparse columns visit only validity set
+    // bits, and dense columns run tight type-specialized loops.
+    let resident_fixed = 16usize // timestamp's 8 bytes, counted twice
+        .saturating_add(48usize.saturating_mul(accessors.len() + 1));
     // The fixed latest-schema path deliberately does not decode the old
-    // `_source`, but it materializes a replacement from these columns just
-    // before the writer push. Charge exact string escaping, conservative
-    // scalar text, every key, and BOTH simultaneously-live JSON copies (the
-    // arrow-json line buffer and the returned StringArray value buffer).
+    // `_source`, but materializes a replacement from these columns before
+    // the writer push. Charge exact string escaping, conservative scalar
+    // text, every key, and both simultaneously-live JSON copies.
     let synthesized_source_fixed = plan.rewrite_source_from_columns.then(|| {
         2usize // object braces
             .saturating_add(json_string_len(TIMESTAMP_COL_NAME.as_bytes()))
@@ -3818,29 +3846,20 @@ fn normalize_merge_chunk(
                     .sum::<usize>(),
             )
     });
-    let row_bytes: Vec<u32> = (0..rows)
-        .map(|row| {
-            let resident_values = accessors.iter().fold(8usize, |bytes, accessor| {
-                bytes.saturating_add(accessor.get(row))
-            });
-            // At the window peak both the staged arrays and the interleaved
-            // output arrays are live. Charge two copies of value buffers plus
-            // conservative offset/validity/capacity overhead for timestamp,
-            // source, original, and every preserved column.
-            let resident_peak = resident_values
-                .saturating_mul(2)
-                .saturating_add(48usize.saturating_mul(accessors.len() + 1));
-            let synthesized_source = synthesized_source_fixed.map_or(0, |fixed| {
-                fixed
-                    .saturating_add(accessors[2..].iter().fold(0usize, |bytes, accessor| {
-                        bytes.saturating_add(accessor.json_len_bound(row))
-                    }))
-                    .saturating_mul(2)
-            });
-            resident_peak
-                .saturating_add(synthesized_source)
-                .min(u32::MAX as usize) as u32
-        })
+    let initial =
+        resident_fixed.saturating_add(synthesized_source_fixed.unwrap_or(0).saturating_mul(2));
+    let mut row_bytes = vec![initial; rows];
+    for accessor in &accessors {
+        accessor.accumulate_value_bytes(&mut row_bytes, 2);
+    }
+    if synthesized_source_fixed.is_some() {
+        for accessor in &accessors[2..] {
+            accessor.accumulate_json_bytes(&mut row_bytes, 0, 2);
+        }
+    }
+    let row_bytes = row_bytes
+        .into_iter()
+        .map(|bytes| bytes.min(u32::MAX as usize) as u32)
         .collect();
     Ok(MergeChunk {
         timestamps,
@@ -3909,14 +3928,28 @@ struct MergeScanPlan {
     source_index: Option<usize>,
     original_index: Option<usize>,
     preserved_indices: Vec<Option<usize>>,
+    /// Columns materialized from [`NullArrayCache`] instead of decoded:
+    /// absent from the input schema or proven all-null by exact metadata.
     synthesized: Arc<[bool]>,
 }
 
-fn build_merge_scan_plan(schema: &SchemaRef, plan: &MergePlan) -> MergeScanPlan {
+fn build_merge_scan_plan(
+    schema: &SchemaRef,
+    column_presence: &[(String, Option<u64>)],
+    plan: &MergePlan,
+) -> MergeScanPlan {
     let present: FastHashSet<&str> = schema
         .fields()
         .iter()
         .map(|field| field.name().as_str())
+        .collect();
+    // Stats-era files stamp an exact present-row count for every docs
+    // column. A known-zero column cannot emit terms, keys, source fields or
+    // stats, so do not pay Vortex canonicalization for it. Unknown legacy
+    // counts fail open and remain projected.
+    let known_empty: FastHashSet<&str> = column_presence
+        .iter()
+        .filter_map(|(name, count)| (*count == Some(0)).then_some(name.as_str()))
         .collect();
     let mut projection: Vec<String> = vec![TIMESTAMP_COL_NAME.to_string()];
     let timestamp_index = 0;
@@ -3929,7 +3962,7 @@ fn build_merge_scan_plan(schema: &SchemaRef, plan: &MergePlan) -> MergeScanPlan 
     };
     let mut preserved_indices = Vec::with_capacity(plan.preserved.len());
     for (name, _) in &plan.preserved {
-        if present.contains(name.as_str()) {
+        if present.contains(name.as_str()) && !known_empty.contains(name.as_str()) {
             preserved_indices.push(Some(projection.len()));
             projection.push(name.clone());
         } else {
@@ -3994,7 +4027,7 @@ fn stream_input_chunks(
     if docs.row_count() == 0 {
         return Ok(());
     }
-    let scan = build_merge_scan_plan(docs.schema(), plan);
+    let scan = build_merge_scan_plan(docs.schema(), docs.column_presence(), plan);
     let mut null_cache = NullArrayCache::default();
     docs.scan_docs(Some(&scan.projection), None, None, &mut |batch| {
         plan.check_cancel_context("decode unit", key)?;
@@ -4075,7 +4108,7 @@ fn stream_input_row_ranges(
     if rows == 0 {
         return Ok(());
     }
-    let scan = build_merge_scan_plan(docs.schema(), plan);
+    let scan = build_merge_scan_plan(docs.schema(), docs.column_presence(), plan);
     let mut null_cache = NullArrayCache::default();
     let max_unit_rows = ranged_unit_rows(plan.caps);
     // M25: width-aware unit sizing — the resident cost of a unit is its
@@ -5690,6 +5723,203 @@ mod tests {
     /// One fabricated file's (data, sidecar) bytes — what every test
     /// builder returns since the v3 split.
     type BuiltPair = (bytes::Bytes, Option<bytes::Bytes>);
+
+    #[test]
+    fn column_major_row_accounting_matches_scalar_reference() {
+        use arrow::array::{
+            BinaryArray, BinaryViewArray, FixedSizeBinaryArray, LargeBinaryArray, LargeStringArray,
+            NullArray, StringViewArray,
+        };
+
+        fn scalar_value(accessor: &VarBytes<'_>, row: usize) -> usize {
+            fn valid(array: &dyn Array, row: usize, bytes: usize) -> usize {
+                if array.is_valid(row) { bytes } else { 0 }
+            }
+            match accessor {
+                VarBytes::Utf8(array) => valid(*array, row, array.value_length(row) as usize),
+                VarBytes::LargeUtf8(array) => valid(*array, row, array.value_length(row) as usize),
+                VarBytes::Utf8View(array) => valid(*array, row, array.value(row).len()),
+                VarBytes::Binary(array) => valid(*array, row, array.value_length(row) as usize),
+                VarBytes::LargeBinary(array) => {
+                    valid(*array, row, array.value_length(row) as usize)
+                }
+                VarBytes::BinaryView(array) => valid(*array, row, array.value(row).len()),
+                VarBytes::Fixed(array, width) => valid(*array, row, *width),
+                VarBytes::Opaque(array) => valid(*array, row, usize::MAX),
+            }
+        }
+
+        fn scalar_json(accessor: &VarBytes<'_>, row: usize) -> Option<usize> {
+            match accessor {
+                VarBytes::Utf8(array) => array
+                    .is_valid(row)
+                    .then(|| json_string_len(array.value(row).as_bytes())),
+                VarBytes::LargeUtf8(array) => array
+                    .is_valid(row)
+                    .then(|| json_string_len(array.value(row).as_bytes())),
+                VarBytes::Utf8View(array) => array
+                    .is_valid(row)
+                    .then(|| json_string_len(array.value(row).as_bytes())),
+                VarBytes::Binary(array) => array
+                    .is_valid(row)
+                    .then(|| array.value(row).len().saturating_mul(6).saturating_add(2)),
+                VarBytes::LargeBinary(array) => array
+                    .is_valid(row)
+                    .then(|| array.value(row).len().saturating_mul(6).saturating_add(2)),
+                VarBytes::BinaryView(array) => array
+                    .is_valid(row)
+                    .then(|| array.value(row).len().saturating_mul(6).saturating_add(2)),
+                VarBytes::Fixed(array, _) => array.is_valid(row).then_some(128),
+                VarBytes::Opaque(array) => array.is_valid(row).then_some(usize::MAX),
+            }
+        }
+
+        let base: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(vec![
+                None,
+                Some("a"),
+                Some("b\u{0001}"),
+                Some(""),
+                None,
+            ])),
+            Arc::new(LargeStringArray::from(vec![
+                Some("outside"),
+                None,
+                Some("large"),
+                None,
+                Some("outside"),
+            ])),
+            Arc::new(StringViewArray::from(vec![
+                Some("outside"),
+                Some("view"),
+                None,
+                Some("v"),
+                None,
+            ])),
+            Arc::new(BinaryArray::from(vec![
+                Some(b"outside".as_slice()),
+                Some(b"a".as_slice()),
+                None,
+                Some(b"bc".as_slice()),
+                None,
+            ])),
+            Arc::new(LargeBinaryArray::from(vec![
+                None,
+                Some(b"large".as_slice()),
+                Some(b"".as_slice()),
+                None,
+                Some(b"outside".as_slice()),
+            ])),
+            Arc::new(BinaryViewArray::from(vec![
+                None,
+                Some(b"view".as_slice()),
+                None,
+                Some(b"x".as_slice()),
+                Some(b"outside".as_slice()),
+            ])),
+            Arc::new(Int64Array::from(vec![
+                Some(9),
+                Some(1),
+                None,
+                Some(3),
+                Some(9),
+            ])),
+            Arc::new(BooleanArray::from(vec![
+                None,
+                Some(true),
+                Some(false),
+                None,
+                Some(true),
+            ])),
+            Arc::new(NullArray::new(5)),
+        ];
+        // Exercise slice-relative validity offsets, including the first
+        // string column whose selected slice is all-valid but retains a
+        // validity buffer with a non-zero bit offset.
+        let arrays: Vec<ArrayRef> = base.iter().map(|array| array.slice(1, 3)).collect();
+        let accessors: Vec<VarBytes<'_>> = arrays
+            .iter()
+            .map(|array| VarBytes::new(array.as_ref()))
+            .collect();
+
+        let mut values = vec![17usize; 3];
+        for accessor in &accessors {
+            accessor.accumulate_value_bytes(&mut values, 2);
+        }
+        let expected_values: Vec<usize> = (0..3)
+            .map(|row| {
+                accessors.iter().fold(17usize, |bytes, accessor| {
+                    bytes.saturating_add(scalar_value(accessor, row).saturating_mul(2))
+                })
+            })
+            .collect();
+        assert_eq!(values, expected_values);
+        assert_eq!(values, vec![65, 33, 41]);
+
+        let mut json = vec![23usize; 3];
+        for accessor in &accessors {
+            accessor.accumulate_json_bytes(&mut json, 7, 2);
+        }
+        let expected_json: Vec<usize> = (0..3)
+            .map(|row| {
+                accessors.iter().fold(23usize, |bytes, accessor| {
+                    scalar_json(accessor, row).map_or(bytes, |value| {
+                        bytes.saturating_add(7usize.saturating_add(value).saturating_mul(2))
+                    })
+                })
+            })
+            .collect();
+        assert_eq!(json, expected_json);
+        assert_eq!(json, vec![1053, 641, 673]);
+
+        // The complexity contract: sliced validity indices stay relative,
+        // all-null columns do no value work, and an all-valid slice with a
+        // retained bitmap takes the dense arm.
+        let sparse = Int64Array::from(vec![Some(9), None, Some(2), None, Some(9)]).slice(1, 3);
+        let mut sparse_rows = vec![0usize; 3];
+        let mut sparse_visited = Vec::new();
+        accumulate_present(&sparse, &mut sparse_rows, 1, 0, |row| {
+            sparse_visited.push(row);
+            1
+        });
+        assert_eq!(sparse_visited, vec![1]);
+
+        let all_null = StringArray::new_null(3);
+        let mut null_rows = vec![0usize; 3];
+        let mut null_visited = Vec::new();
+        accumulate_present(&all_null, &mut null_rows, 1, 0, |row| {
+            null_visited.push(row);
+            1
+        });
+        assert!(null_visited.is_empty());
+
+        let mut dense_rows = vec![0usize; 3];
+        let mut dense_visited = Vec::new();
+        accumulate_present(arrays[0].as_ref(), &mut dense_rows, 1, 0, |row| {
+            dense_visited.push(row);
+            1
+        });
+        assert_eq!(dense_visited, vec![0, 1, 2]);
+
+        // Fixed-size binary is deliberately Opaque to VarBytes. PRESENT
+        // rows retain the old usize::MAX one-row-oversize sentinel.
+        let opaque: ArrayRef = Arc::new(
+            FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                vec![None, Some(vec![7u8, 8]), None, Some(vec![9, 10]), None].into_iter(),
+                2,
+            )
+            .unwrap(),
+        );
+        let opaque = opaque.slice(1, 3);
+        let opaque = VarBytes::new(opaque.as_ref());
+        assert!(matches!(opaque, VarBytes::Opaque(_)));
+        let mut opaque_values = vec![5usize; 3];
+        opaque.accumulate_value_bytes(&mut opaque_values, 1);
+        assert_eq!(opaque_values, vec![usize::MAX, 5, usize::MAX]);
+        let mut opaque_json = vec![11usize; 3];
+        opaque.accumulate_json_bytes(&mut opaque_json, 7, 2);
+        assert_eq!(opaque_json, vec![usize::MAX, 11, usize::MAX]);
+    }
 
     #[test]
     fn split_batch_preflights_the_next_row_against_the_byte_cap() {
