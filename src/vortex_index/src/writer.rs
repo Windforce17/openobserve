@@ -430,8 +430,10 @@ pub struct VixWriterOptions {
     /// Fields retained in their value-field-id slot, native docs column and
     /// key-presence index, but excluded from exact value terms. Their field
     /// entry is capability-less apart from column storage, so equality/IN
-    /// predicates use the normal per-file scan fallback. This is independent
-    /// of [`Self::bloom_only_field_names`]: no value bloom is built.
+    /// predicates use the normal per-file scan fallback. Full-text search
+    /// takes precedence for an overlapping string field: its tokens and FTS
+    /// capability remain intact. This is independent of
+    /// [`Self::bloom_only_field_names`]: no value bloom is built.
     pub value_index_excluded_field_names: Vec<String>,
     /// Raw-string term-indexed fields to record per-file value blooms for
     /// (the `bloom` puffin blob, built as a byproduct of term emission —
@@ -1003,14 +1005,7 @@ impl VixWriter {
         } else {
             FastHashMap::default()
         };
-        let value_index_excluded_fields: BTreeSet<String> = opts
-            .value_index_excluded_field_names
-            .iter()
-            .filter(|name| term_field_ids.contains_key(*name))
-            .cloned()
-            .collect();
-
-        // fts marking applies to string-family fields only: tokenization is
+        // FTS marking applies to string-family fields only: tokenization is
         // a text concept. A numeric/bool field named in `fts_field_names`
         // stays a plain term field (canonical value terms), matching the
         // source-driven path where non-string values never tokenize.
@@ -1019,11 +1014,21 @@ impl VixWriter {
             .iter()
             .filter(|name| {
                 term_field_ids.contains_key(*name)
-                    && !value_index_excluded_fields.contains(*name)
                     && schema
                         .field_with_name(name)
                         .is_ok_and(|field| is_string_family(field.data_type()))
             })
+            .cloned()
+            .collect();
+
+        // Exclusion suppresses exact whole-value terms only. An overlapping
+        // string FTS field must keep token emission and FTS capability;
+        // otherwise MatchAll could treat a token-less file as authoritative
+        // and silently drop matching rows.
+        let value_index_excluded_fields: BTreeSet<String> = opts
+            .value_index_excluded_field_names
+            .iter()
+            .filter(|name| term_field_ids.contains_key(*name) && !fts_fields.contains(*name))
             .cloned()
             .collect();
 

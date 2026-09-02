@@ -8569,6 +8569,74 @@ fn value_index_exclusion_preserves_columns_keys_and_merge_semantics() {
     assert!(!merged_reader.has_term_capability("start_time"));
 }
 
+/// Exact-value exclusion is orthogonal to full-text search. If the same
+/// string field is configured for both, FTS wins so MatchAll keeps complete
+/// token coverage instead of treating a token-less file as authoritative.
+#[test]
+fn value_index_exclusion_preserves_overlapping_fts_tokens() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("_timestamp", DataType::Int64, false),
+        Field::new("body", DataType::Utf8, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![100, 99, 98])) as ArrayRef,
+            Arc::new(StringArray::from(vec![
+                Some("heartbeat ready"),
+                Some("database slow"),
+                None,
+            ])),
+        ],
+    )
+    .unwrap();
+    let source = synthesize_source_for_test(&batch);
+    let options = VixWriterOptions {
+        fts_field_names: vec!["body".to_string()],
+        value_index_excluded_field_names: vec!["body".to_string()],
+        ..VixWriterOptions::default()
+    };
+
+    let mut column_driven = VixWriter::new(&schema, options.clone(), false);
+    column_driven
+        .push_batch_with_source(&batch, &source, None)
+        .unwrap();
+    let mut source_driven = VixWriter::new(&schema, options, false);
+    source_driven
+        .push_docs_rows(&timestamps_of(&batch), &[], &source, None)
+        .unwrap();
+    let column_reader = finish_open(column_driven);
+    let source_reader = finish_open(source_driven);
+
+    assert_eq!(
+        column_reader.debug_all_terms().unwrap(),
+        source_reader.debug_all_terms().unwrap()
+    );
+    for (context, reader) in [
+        ("column-driven", &column_reader),
+        ("source-driven", &source_reader),
+    ] {
+        assert_eq!(
+            eval_set(reader, &any_token("heartbeat")),
+            docs(&[0]),
+            "{context}"
+        );
+        assert_eq!(
+            eval_set(reader, &any_token("database")),
+            docs(&[1]),
+            "{context}"
+        );
+        assert_eq!(key_exists_set(reader, "body"), docs(&[0, 1]), "{context}");
+        assert!(
+            reader.field_entries().iter().any(|entry| {
+                entry.name == "body" && entry.has_type(crate::container::FIELD_TYPE_FTS)
+            }),
+            "{context}: body must retain FTS capability"
+        );
+        assert!(!reader.partial_fields().contains("body"), "{context}");
+    }
+}
+
 /// Merge capability INTERSECTION: a term-planned field some input carries
 /// (key term) without term capability there — a numeric field in a file
 /// written before numeric value terms existed — is DEMOTED in the merged
