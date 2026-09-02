@@ -131,18 +131,21 @@ async fn record_pending_file(
     RecordOutcome::Recorded
 }
 
-async fn take_schedule_candidate(
+async fn take_schedule_candidate_excluding(
     pending: &RwAHashMap<String, PendingStream>,
     stream_key: &str,
     threshold: usize,
+    excluded_hours: &[i64],
 ) -> Option<i64> {
     let mut streams = pending.write().await;
     let stream = streams.get_mut(stream_key)?;
     let hour = stream
         .hours
         .iter()
-        .filter(|(_, counter)| {
-            !counter.scheduling && (counter.schedule_required || counter.files >= threshold.max(1))
+        .filter(|(hour, counter)| {
+            !excluded_hours.contains(hour)
+                && !counter.scheduling
+                && (counter.schedule_required || counter.files >= threshold.max(1))
         })
         .min_by_key(|(hour, counter)| (!counter.schedule_required, **hour))
         .map(|(hour, _)| *hour)?;
@@ -151,6 +154,15 @@ async fn take_schedule_candidate(
     counter.in_flight_files = counter.files;
     counter.schedule_required = false;
     Some(hour)
+}
+
+#[cfg(test)]
+async fn take_schedule_candidate(
+    pending: &RwAHashMap<String, PendingStream>,
+    stream_key: &str,
+    threshold: usize,
+) -> Option<i64> {
+    take_schedule_candidate_excluding(pending, stream_key, threshold, &[]).await
 }
 
 async fn finish_scheduling(
@@ -225,16 +237,29 @@ pub async fn incr_pending_file(
             "[COMPACTOR:INCREMENTAL] bounded counter capacity reached for \
              [{org_id}/{stream_type}/{stream_name}]: all {MAX_HOURS_PER_STREAM} slots are \
              retained by recent, in-flight, or failed scheduling debt; hour {requested_hour} \
-             is not counted yet and will be retried after each successful debt drain during \
-             this arrival; if no slot opens, the 60-second merge-debt sweep is the fallback"
+             is not counted yet and will be retried after successful debt drains during this \
+             bounded arrival pass; if no slot opens, the 60-second merge-debt sweep is the fallback"
         );
     }
 
-    loop {
-        let Some(hour) = take_schedule_candidate(&PENDING_FILES, &stream_key, threshold).await
+    // One producer arrival may drain each tracked hour once. Arrivals that
+    // race an add_job call leave that hour latched for the next invocation;
+    // they must not turn this hint path into an unbounded database loop.
+    let mut attempted_hours = [0_i64; MAX_HOURS_PER_STREAM];
+    let mut attempted_count = 0;
+    while attempted_count < MAX_HOURS_PER_STREAM {
+        let Some(hour) = take_schedule_candidate_excluding(
+            &PENDING_FILES,
+            &stream_key,
+            threshold,
+            &attempted_hours[..attempted_count],
+        )
+        .await
         else {
             break;
         };
+        attempted_hours[attempted_count] = hour;
+        attempted_count += 1;
         let result = infra::file_list::add_job(org_id, stream_type, stream_name, hour).await;
         let scheduled = result.is_ok();
         finish_scheduling(&PENDING_FILES, &stream_key, hour, scheduled, threshold).await;
@@ -437,6 +462,11 @@ mod tests {
             record_pending_file(&pending, STREAM, now, now, 3).await;
         }
         finish_scheduling(&pending, STREAM, now, true, 12).await;
+        assert_eq!(
+            take_schedule_candidate_excluding(&pending, STREAM, 12, &[now]).await,
+            None,
+            "one arrival must not immediately reschedule the same hot hour"
+        );
 
         assert_eq!(
             take_schedule_candidate(&pending, STREAM, 12).await,

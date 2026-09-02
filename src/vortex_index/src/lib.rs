@@ -116,8 +116,8 @@ pub use tokenizer::o2_tokenize;
 pub use writer::{
     BloomOnlyHasher, DEFAULT_DOCS_CHUNK_BYTES, DEFAULT_DOCS_CHUNK_MAX_ROWS, ID_COL_NAME,
     ORIGINAL_DATA_COL_NAME, RawValueSink, SOURCE_COL_NAME, SOURCE_RENAMED_COL_NAME,
-    TIMESTAMP_COL_NAME, VixWriter, VixWriterOptions, VixWriterStats, docs_schema_mismatch_reason,
-    is_value_indexed_type, resolve_auto_bloom_only,
+    TIMESTAMP_COL_NAME, VixWriter, VixWriterOptions, VixWriterStats, VixWriterTimings,
+    docs_schema_mismatch_reason, is_value_indexed_type, resolve_auto_bloom_only,
 };
 
 #[cfg(test)]

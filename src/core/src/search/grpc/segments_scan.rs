@@ -63,9 +63,10 @@
 use std::{
     cmp::Reverse,
     collections::BinaryHeap,
+    future::Future,
     sync::{
         Arc, LazyLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicI64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -80,7 +81,7 @@ use config::{
 };
 use dashmap::{DashMap, mapref::entry::Entry};
 use datafusion::{arrow::record_batch::RecordBatch, datasource::TableProvider};
-use futures::StreamExt;
+use futures::{Stream, StreamExt, stream::BoxStream};
 use hashbrown::{HashMap, HashSet};
 use infra::{
     cache::file_data,
@@ -515,6 +516,22 @@ fn segment_permits(size: i64, budget_permits: usize) -> u32 {
         .min(u32::MAX as usize) as u32
 }
 
+/// Keep a bounded stage continuously full instead of waiting for fixed waves.
+/// Ordered stages preserve top-n threshold behavior; unordered stages avoid
+/// head-of-line blocking when result order has no semantic value.
+fn rolling_stage<S, F, T>(stream: S, concurrency: usize, ordered: bool) -> BoxStream<'static, T>
+where
+    S: Stream<Item = F> + Send + 'static,
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    if ordered {
+        stream.buffered(concurrency.max(1)).boxed()
+    } else {
+        stream.buffer_unordered(concurrency.max(1)).boxed()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // leader side
 // ---------------------------------------------------------------------------
@@ -767,9 +784,10 @@ pub async fn search(
     if top_n.is_some() {
         metas.sort_by_key(|m| Reverse(m.max_ts));
     }
+    let metas_len = metas.len();
 
     let mut scan_stats = ScanStats::new();
-    scan_stats.files = metas.len() as i64;
+    scan_stats.files = metas_len as i64;
     scan_stats.querier_files = scan_stats.files;
 
     // check memory circuit breaker before decoding anything
@@ -792,145 +810,182 @@ pub async fn search(
     }
     needed_columns.insert(TIMESTAMP_COL_NAME.to_string());
 
-    // The ordered top-n path keeps bounded decode waves because trimming
-    // mutates one running threshold between waves. Reads are now foreground
-    // read-through cache fills: one miss performs one remote GET, and
-    // concurrent queries for the same object share that GET instead of
-    // racing a detached cache warmer. Decode remains streaming, so one slot
-    // retains at most one frame plus its projected remnant.
-    let decode_wave = get_config().common.segment_scan_decode_concurrency.max(1);
+    // Fetch and decode are independent rolling stages. The old fixed waves
+    // waited for the slowest GET+decode before submitting any work from the
+    // next wave. Ordered top-n scans still consume results newest-first so
+    // their threshold remains effective, but `buffered` keeps later fetches
+    // and decodes in flight. Other scans use unordered completion to avoid
+    // head-of-line blocking entirely.
+    //
+    // Byte permits cover active reads, queued objects, and blocking decodes.
+    // The permit enters spawn_blocking so cancellation cannot release its
+    // accounting while an orphaned decode still retains the compressed bytes.
+    let fetch_concurrency = get_config().common.segment_scan_fetch_concurrency.max(1);
+    let decode_concurrency = get_config().common.segment_scan_decode_concurrency.max(1);
+    let fetch_budget_permits = segment_fetch_budget_permits();
+    let fetch_budget = Arc::new(tokio::sync::Semaphore::new(fetch_budget_permits));
+    let ordered = top_n.is_some();
+    let can_skip_by_top_n = index_condition
+        .as_ref()
+        .is_none_or(|condition| condition.is_condition_all());
+    let top_n_threshold = Arc::new(AtomicI64::new(i64::MIN));
     let needed_columns = Arc::new(needed_columns);
-    let mut kept_batches: Vec<RecordBatch> = Vec::new();
-    let mut kept_bytes: usize = 0;
-    let (scan_soft_budget, scan_hard_ceiling) = segment_scan_budgets();
-    // zero-yield classifiers (#38): objects fetched and walked for nothing,
-    // split by WHY — sizing input for the structural fixes
-    let mut zero_yield_stream_absent = 0usize;
-    let mut zero_yield_time_pruned = 0usize;
-    let mut timings = SegmentScanTimings::default();
-    let mut skipped_by_top_n: usize = 0;
-    let mut next_meta: usize = 0;
-    while next_meta < metas.len() {
-        let mut wave: Vec<&SegmentMeta> = Vec::with_capacity(decode_wave);
-        while next_meta < metas.len() && wave.len() < decode_wave {
-            let meta = &metas[next_meta];
-            next_meta += 1;
-            // Once the top-n threshold is locked, a segment whose max_ts
-            // sits below it cannot contribute a top-n row — skip the fetch
-            // and the decode outright. Gated on conditions that match every
-            // row (absent, or the WHERE-less `Condition::All` the optimizer
-            // emits): with a real condition, batches this node cannot
-            // evaluate (schema-mixed segments) pass through whole for the
-            // provider to re-filter, and those rows never feed the
-            // threshold — but they could still live in an older segment.
-            if index_condition
-                .as_ref()
-                .is_none_or(|c| c.is_condition_all())
-                && let Some(top) = top_n.as_ref()
-                && let Some(threshold) = top.threshold()
-                && meta.max_ts < threshold
-            {
-                skipped_by_top_n += 1;
-                continue;
-            }
-            wave.push(meta);
-        }
-        if wave.is_empty() {
-            continue;
-        }
-        let decoded = futures::future::try_join_all(wave.iter().map(|meta| {
-            let org_id = query.org_id.clone();
-            let stream_type = query.stream_type;
-            let stream_name = query.stream_name.clone();
-            let time_range = query.time_range;
-            let condition = index_condition.clone();
-            let fst_fields = fst_fields.clone();
-            let needed_columns = Arc::clone(&needed_columns);
+    let scan_fst_fields = Arc::new(fst_fields.clone());
+    let scan_condition = Arc::new(index_condition.clone());
+    let metric_org_id = query.org_id.clone();
+    let metric_stream_type = query.stream_type;
+
+    let fetches = futures::stream::iter(metas.into_iter()).map({
+        let fetch_budget = Arc::clone(&fetch_budget);
+        let top_n_threshold = Arc::clone(&top_n_threshold);
+        move |meta| {
+            let fetch_budget = Arc::clone(&fetch_budget);
+            let top_n_threshold = Arc::clone(&top_n_threshold);
+            let org_id = metric_org_id.clone();
             async move {
-                let fetched = match fetch_segment(meta, cache_type).await {
+                if can_skip_by_top_n && meta.max_ts < top_n_threshold.load(Ordering::Acquire) {
+                    return Ok::<_, Error>(None);
+                }
+                let permit_count = segment_permits(meta.size, fetch_budget_permits);
+                let permit = fetch_budget
+                    .acquire_many_owned(permit_count)
+                    .await
+                    .map_err(|_| {
+                        Error::Message(
+                            "[SEGMENT:SCAN] compressed-byte fetch budget closed".to_string(),
+                        )
+                    })?;
+                let fetched = match fetch_segment(&meta, cache_type).await {
                     Ok(fetched) => {
-                        record_segment_cache_outcome(&org_id, stream_type, Some(fetched.source));
+                        record_segment_cache_outcome(
+                            &org_id,
+                            metric_stream_type,
+                            Some(fetched.source),
+                        );
                         fetched
                     }
                     Err(err) => {
-                        record_segment_cache_outcome(&org_id, stream_type, None);
+                        record_segment_cache_outcome(&org_id, metric_stream_type, None);
                         return Err(err);
                     }
+                };
+                Ok(Some((meta, fetched, permit)))
+            }
+        }
+    });
+    let fetched = rolling_stage(fetches, fetch_concurrency, ordered);
+
+    let consumer_query = Arc::clone(&query);
+    let decoded_tasks = fetched.map({
+        let needed_columns = Arc::clone(&needed_columns);
+        let scan_fst_fields = Arc::clone(&scan_fst_fields);
+        let scan_condition = Arc::clone(&scan_condition);
+        move |result| {
+            let query = Arc::clone(&consumer_query);
+            let needed_columns = Arc::clone(&needed_columns);
+            let scan_fst_fields = Arc::clone(&scan_fst_fields);
+            let scan_condition = Arc::clone(&scan_condition);
+            async move {
+                let Some((meta, fetched, permit)) = result? else {
+                    return Ok::<_, Error>(None);
                 };
                 let (bytes, fetch_stats) = fetched.into_parts();
                 let object_key = meta.object_key.clone();
                 let submitted = Instant::now();
-                // zstd + arrow ipc + prune/project — keep it off the async
-                // workers and account blocking-pool queueing separately.
-                let (blocking_queue, decode, scanned) =
+                let (permit, blocking_queue, decode, scanned) =
                     tokio::task::spawn_blocking(move || {
                         let blocking_queue = submitted.elapsed();
                         let decode_started = Instant::now();
                         let scanned = scan_segment_object(
-                        &bytes,
-                        &org_id,
-                        stream_type,
-                        &stream_name,
-                        time_range,
-                        condition.as_ref(),
-                        &fst_fields,
-                        &needed_columns,
-                    )
+                            &bytes,
+                            &query.org_id,
+                            query.stream_type,
+                            &query.stream_name,
+                            query.time_range,
+                            scan_condition.as_ref().as_ref(),
+                            &scan_fst_fields,
+                            &needed_columns,
+                        )
+                        .map_err(|e| {
+                            Error::Message(format!(
+                                "[SEGMENT:SCAN] decode segment object {object_key} failed: {e:#}"
+                            ))
+                        });
+                        (
+                            permit,
+                            blocking_queue,
+                            decode_started.elapsed(),
+                            scanned,
+                        )
+                    })
+                    .await
                     .map_err(|e| {
                         Error::Message(format!(
-                            "[SEGMENT:SCAN] decode segment object {object_key} failed: {e:#}"
+                            "[SEGMENT:SCAN] decode task for segment object {} (id {}) did not complete: {e}",
+                            meta.object_key, meta.id
                         ))
-                        });
-                        (blocking_queue, decode_started.elapsed(), scanned)
-                })
-                .await
-                .map_err(|e| {
-                    Error::Message(format!(
-                        "[SEGMENT:SCAN] decode task for segment object {} (id {}) did not complete: {e}",
-                        meta.object_key, meta.id
-                    ))
                     })?;
-                Ok::<_, Error>((fetch_stats, blocking_queue, decode, scanned?))
+                Ok(Some((
+                    fetch_stats,
+                    permit,
+                    blocking_queue,
+                    decode,
+                    scanned?,
+                )))
             }
-        }))
-        .await?;
-        for (fetch_stats, blocking_queue, decode, scanned) in decoded {
-            timings.record_fetch(&fetch_stats);
-            timings.record_decode(blocking_queue, decode);
-            scan_stats.compressed_size += fetch_stats.compressed_size;
-            scan_stats.records += scanned.rows_examined;
-            if scanned.stream_frames == 0 {
-                zero_yield_stream_absent += 1;
-            } else if scanned.rows_examined == 0 {
-                zero_yield_time_pruned += 1;
-            }
-            for (is_exact, batch) in scanned.kept {
-                // rows provably outside a top-n window are trimmed here
-                // (trim_batch_to_top_n — only for batches whose surviving
-                // rows are KNOWN matches; batches kept whole for downstream
-                // re-filtering never trim and never feed the threshold)
-                let batch = if is_exact {
-                    match top_n.as_mut() {
-                        Some(top) => match trim_batch_to_top_n(batch, top)? {
-                            Some(batch) => batch,
-                            None => continue,
-                        },
-                        None => batch,
-                    }
-                } else {
-                    batch
-                };
-                push_within_budget(
-                    &mut kept_batches,
-                    &mut kept_bytes,
-                    batch,
-                    scan_soft_budget,
-                    scan_hard_ceiling,
-                    &query.org_id,
-                    query.stream_type,
-                    &query.stream_name,
-                )?;
-            }
+        }
+    });
+    let mut decoded = rolling_stage(decoded_tasks, decode_concurrency, ordered);
+
+    let mut kept_batches: Vec<RecordBatch> = Vec::new();
+    let mut kept_bytes: usize = 0;
+    let (scan_soft_budget, scan_hard_ceiling) = segment_scan_budgets();
+    let mut zero_yield_stream_absent = 0usize;
+    let mut zero_yield_time_pruned = 0usize;
+    let mut timings = SegmentScanTimings::default();
+    let mut skipped_by_top_n: usize = 0;
+    while let Some(result) = decoded.next().await {
+        let Some((fetch_stats, permit, blocking_queue, decode, scanned)) = result? else {
+            skipped_by_top_n += 1;
+            continue;
+        };
+        timings.record_fetch(&fetch_stats);
+        timings.record_decode(blocking_queue, decode);
+        scan_stats.compressed_size += fetch_stats.compressed_size;
+        drop(permit);
+        scan_stats.records += scanned.rows_examined;
+        if scanned.stream_frames == 0 {
+            zero_yield_stream_absent += 1;
+        } else if scanned.rows_examined == 0 {
+            zero_yield_time_pruned += 1;
+        }
+        for (is_exact, batch) in scanned.kept {
+            // Only exact matches feed the top-n threshold. Batches retained
+            // for downstream condition evaluation must remain untrimmed.
+            let batch = if is_exact {
+                match top_n.as_mut() {
+                    Some(top) => match trim_batch_to_top_n(batch, top)? {
+                        Some(batch) => batch,
+                        None => continue,
+                    },
+                    None => batch,
+                }
+            } else {
+                batch
+            };
+            push_within_budget(
+                &mut kept_batches,
+                &mut kept_bytes,
+                batch,
+                scan_soft_budget,
+                scan_hard_ceiling,
+                &query.org_id,
+                query.stream_type,
+                &query.stream_name,
+            )?;
+        }
+        if let Some(threshold) = top_n.as_ref().and_then(TopNTimestamps::threshold) {
+            top_n_threshold.store(threshold, Ordering::Release);
         }
         tokio::task::coop::consume_budget().await;
     }
@@ -942,17 +997,20 @@ pub async fn search(
     scan_stats.original_size = kept_bytes as i64;
 
     log::info!(
-        "[trace_id {trace_id}] segments_scan: {}/{}/{} loaded {} segments ({} skipped by top-n), kept {} batches, records {}, scan_size {}, zero-yield {} stream-absent + {} time-pruned, cache memory/disk/remote/coalesced {}/{}/{}/{}, phase_ms lookup sum/max {}/{}, fetch-wait sum/max {}/{}, remote sum/max {}/{}, blocking-queue sum/max {}/{}, decode sum/max {}/{}, took {} ms",
+        "[trace_id {trace_id}] segments_scan: {}/{}/{} loaded {} segments ({} skipped by top-n), kept {} batches, records {}, scan_size {}, zero-yield {} stream-absent + {} time-pruned, concurrency fetch/decode {}/{}, budget_mib {}, cache memory/disk/remote/coalesced {}/{}/{}/{}, phase_ms lookup sum/max {}/{}, fetch-wait sum/max {}/{}, remote sum/max {}/{}, blocking-queue sum/max {}/{}, decode sum/max {}/{}, took {} ms",
         query.org_id,
         query.stream_type,
         query.stream_name,
-        metas.len() - skipped_by_top_n,
+        metas_len - skipped_by_top_n,
         skipped_by_top_n,
         kept_batches.len(),
         scan_stats.records,
         scan_stats.original_size,
         zero_yield_stream_absent,
         zero_yield_time_pruned,
+        fetch_concurrency,
+        decode_concurrency,
+        fetch_budget_permits * SEGMENT_FETCH_PERMIT_BYTES / (1024 * 1024),
         timings.memory_hits,
         timings.disk_hits,
         timings.remote_fetches,
@@ -1889,6 +1947,68 @@ mod tests {
         );
         assert_eq!(segment_permits(i64::MAX, 7), 7);
         assert_eq!(segment_permits(i64::MAX, usize::MAX), u32::MAX);
+    }
+
+    #[tokio::test]
+    async fn rolling_stage_refills_before_the_slowest_item_finishes() {
+        async fn assert_refills(ordered: bool) {
+            let gates = Arc::new(
+                (0..3)
+                    .map(|_| Arc::new(tokio::sync::Notify::new()))
+                    .collect::<Vec<_>>(),
+            );
+            let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+            let work = futures::stream::iter(0..3).map({
+                let gates = Arc::clone(&gates);
+                move |index| {
+                    let gate = Arc::clone(&gates[index]);
+                    let started_tx = started_tx.clone();
+                    async move {
+                        started_tx.send(index).unwrap();
+                        gate.notified().await;
+                        index
+                    }
+                }
+            });
+            let collector = tokio::spawn(rolling_stage(work, 2, ordered).collect::<Vec<usize>>());
+
+            let mut first_two = Vec::with_capacity(2);
+            for _ in 0..2 {
+                first_two.push(
+                    tokio::time::timeout(std::time::Duration::from_secs(1), started_rx.recv())
+                        .await
+                        .unwrap_or_else(|_| {
+                            panic!("initial rolling-stage window did not fill; ordered={ordered}")
+                        })
+                        .expect("started channel closed"),
+                );
+            }
+            first_two.sort_unstable();
+            assert_eq!(first_two, vec![0, 1]);
+
+            // Item 1 deliberately remains blocked. Completing item 0 must
+            // start item 2 immediately; fixed waves would wait for item 1.
+            gates[0].notify_one();
+            let third =
+                tokio::time::timeout(std::time::Duration::from_secs(1), started_rx.recv())
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "rolling stage waited for its slowest peer before refilling; ordered={ordered}"
+                        )
+                    })
+                    .expect("started channel closed");
+            assert_eq!(third, 2);
+
+            gates[1].notify_one();
+            gates[2].notify_one();
+            let mut completed = collector.await.expect("collector task failed");
+            completed.sort_unstable();
+            assert_eq!(completed, vec![0, 1, 2]);
+        }
+
+        assert_refills(true).await;
+        assert_refills(false).await;
     }
 
     #[test]

@@ -1273,6 +1273,22 @@ pub struct Common {
     )]
     pub segment_build_concurrency: usize,
     #[env_config(
+        name = "ZO_SEGMENT_BUILD_UPLOAD_CONCURRENCY",
+        default = 8,
+        help = "Segment WAL: maximum L0 files uploaded concurrently after their planned keys \
+                are durable. Each file preserves DATA-before-INDEX ordering; the count is a \
+                secondary cap under ZO_SEGMENT_BUILD_UPLOAD_MAX_INFLIGHT_MB. Floor 1."
+    )]
+    pub segment_build_upload_concurrency: usize,
+    #[env_config(
+        name = "ZO_SEGMENT_BUILD_UPLOAD_MAX_INFLIGHT_MB",
+        default = 256,
+        help = "Segment WAL: process-local MiB budget for L0 payloads in concurrent object-store \
+                PUTs. Admission counts DATA plus the optional INDEX sidecar; one oversized file \
+                takes the whole budget and still runs, preventing deadlock. Floor 1 MiB."
+    )]
+    pub segment_build_upload_max_inflight_mb: usize,
+    #[env_config(
         name = "ZO_SEGMENT_BUILD_MEMORY_BUDGET_MB",
         default = 0,
         help = "M17: process-wide DECODED-byte budget for L0 build admission — replaces the \
@@ -3859,6 +3875,11 @@ fn check_common_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
     cfg.common.segment_build_chunk_mb = cfg.common.segment_build_chunk_mb.max(1);
     // M12 item 5: floor 1 — a zero would stall the small-build stream
     cfg.common.segment_build_concurrency = cfg.common.segment_build_concurrency.max(1);
+    // Upload fan-out is bounded independently by count and payload bytes.
+    cfg.common.segment_build_upload_concurrency =
+        cfg.common.segment_build_upload_concurrency.max(1);
+    cfg.common.segment_build_upload_max_inflight_mb =
+        cfg.common.segment_build_upload_max_inflight_mb.max(1);
     // M13 item 1c: floor 1 — a zero would stall fetch+decode entirely
     cfg.common.segment_fetch_decode_concurrency =
         cfg.common.segment_fetch_decode_concurrency.max(1);
@@ -4210,7 +4231,12 @@ fn check_memory_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
         .collect();
     if cfg.memory_cache.datafusion_max_size == 0 {
         if local_node_role == [cluster::Role::Compactor] {
-            cfg.memory_cache.datafusion_max_size = mem_total / cfg.limit.file_merge_thread_num;
+            // Merge contexts share one pool. Above DataFusion's 256 MiB
+            // runtime floor, retain at least two thirds of the cgroup for
+            // segment builds, VIX rebuilds, and native allocations; the old
+            // two-worker divisor gave this shared pool half the pod.
+            cfg.memory_cache.datafusion_max_size =
+                mem_total / cfg.limit.file_merge_thread_num.max(3);
         } else if cfg.common.local_mode {
             cfg.memory_cache.datafusion_max_size = (mem_total - cfg.memory_cache.max_size) / 2; // 25%
         } else {
@@ -4783,6 +4809,44 @@ mod tests {
         unsafe { std::env::remove_var(key) };
     }
 
+    /// L0 uploads are independently bounded by file count and admitted
+    /// payload MiB. Defaults, overrides and zero floors are covered in one
+    /// process-global environment test.
+    #[test]
+    fn segment_build_upload_limits_default_override_and_floor() {
+        let concurrency_key = "ZO_SEGMENT_BUILD_UPLOAD_CONCURRENCY";
+        let bytes_key = "ZO_SEGMENT_BUILD_UPLOAD_MAX_INFLIGHT_MB";
+        unsafe {
+            std::env::remove_var(concurrency_key);
+            std::env::remove_var(bytes_key);
+        }
+        let cfg = Config::init().unwrap();
+        assert_eq!(cfg.common.segment_build_upload_concurrency, 8);
+        assert_eq!(cfg.common.segment_build_upload_max_inflight_mb, 256);
+
+        unsafe {
+            std::env::set_var(concurrency_key, "3");
+            std::env::set_var(bytes_key, "96");
+        }
+        let cfg = Config::init().unwrap();
+        assert_eq!(cfg.common.segment_build_upload_concurrency, 3);
+        assert_eq!(cfg.common.segment_build_upload_max_inflight_mb, 96);
+
+        unsafe {
+            std::env::set_var(concurrency_key, "0");
+            std::env::set_var(bytes_key, "0");
+        }
+        let mut cfg = Config::init().unwrap();
+        check_common_config(&mut cfg).unwrap();
+        assert_eq!(cfg.common.segment_build_upload_concurrency, 1);
+        assert_eq!(cfg.common.segment_build_upload_max_inflight_mb, 1);
+
+        unsafe {
+            std::env::remove_var(concurrency_key);
+            std::env::remove_var(bytes_key);
+        }
+    }
+
     /// M17 item 3: the byte-budget knob — default 0 = auto (40% of
     /// detected memory, resolved at the consumer), override in MB wins.
     #[test]
@@ -4947,6 +5011,17 @@ mod tests {
         check_memory_config(&mut cfg).unwrap();
         assert_eq!(cfg.memory_cache.max_size, 1024 * 1024 * 1024);
         assert_eq!(cfg.memory_cache.release_size, 1024 * 1024 * 1024);
+
+        let mut compactor_cfg = Config::init().unwrap();
+        compactor_cfg.common.node_role = cluster::Role::Compactor.to_string();
+        compactor_cfg.memory_cache.datafusion_max_size = 0;
+        compactor_cfg.memory_cache.bucket_num = 1;
+        compactor_cfg.limit.file_merge_thread_num = 2;
+        check_memory_config(&mut compactor_cfg).unwrap();
+        assert_eq!(
+            compactor_cfg.memory_cache.datafusion_max_size,
+            compactor_cfg.limit.mem_total / 3
+        );
 
         cfg.limit.file_push_interval = 0;
         cfg.limit.req_cols_per_record_limit = 0;

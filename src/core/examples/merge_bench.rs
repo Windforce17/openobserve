@@ -36,6 +36,10 @@
 //!       digest), and `--rebuild` exercises the heal passthrough (index
 //!       built from the decoded scan, docs chunks copied verbatim).
 //!
+//!   sidecar <dir> [--stored-schema] [--traces]
+//!       Rebuild only the detached index for the directory's single core
+//!       file, without assembling or writing a new docs object. This
+//!       isolates the current column-derived term/index path.
 //!   compare [--multiset] [--docs-only] [--ignore-source] <a.vix> <b.vix>
 //!       Assert reader-visible equality of two merge outputs: row count,
 //!       term stream and every docs column. Default mode: term keys, doc
@@ -454,24 +458,28 @@ fn load_inputs(
 fn derive_schema(
     inputs: &[openobserve_core::vix::core_writer::MergeInput],
     status_code_utf8: bool,
+    stored_schema: bool,
 ) -> (Schema, Vec<String>) {
     let registry = spans_schema();
     let mut fts: Vec<String> = Vec::new();
-    // The registry is authoritative for every field it knows. The explicit
-    // override models the production Boolean/Float -> latest Utf8 drift
-    // without making corpus filename/order choose the target type.
-    let mut latest_fields: Vec<Field> = registry
-        .fields()
-        .iter()
-        .filter(|field| field.name() != "_source" && field.name() != "_original")
-        .map(|field| {
-            if status_code_utf8 && field.name() == "status_code" {
-                Field::new(field.name(), DataType::Utf8, field.is_nullable())
-            } else {
-                field.as_ref().clone()
-            }
-        })
-        .collect();
+    // Real-file benchmarks can use the stored schema as the exact target;
+    // synthetic drift fixtures keep the built-in registry authoritative.
+    let mut latest_fields: Vec<Field> = if stored_schema {
+        Vec::new()
+    } else {
+        registry
+            .fields()
+            .iter()
+            .filter(|field| field.name() != "_source" && field.name() != "_original")
+            .map(|field| {
+                if status_code_utf8 && field.name() == "status_code" {
+                    Field::new(field.name(), DataType::Utf8, field.is_nullable())
+                } else {
+                    field.as_ref().clone()
+                }
+            })
+            .collect()
+    };
     for (_, data, index) in inputs {
         let reader =
             VixReader::open_ranged_with_index(std::sync::Arc::clone(data), index.clone()).unwrap();
@@ -481,11 +489,11 @@ fn derive_schema(
                 continue;
             }
             if !latest_fields.iter().any(|f| f.name() == name) {
-                latest_fields.push(Field::new(
-                    name,
-                    field.data_type().clone(),
-                    name != TIMESTAMP_COL,
-                ));
+                latest_fields.push(if stored_schema {
+                    field.as_ref().clone()
+                } else {
+                    Field::new(name, field.data_type().clone(), name != TIMESTAMP_COL)
+                });
             }
         }
         for name in reader.term_field_names() {
@@ -540,6 +548,8 @@ fn cmd_merge(
     rebuild: bool,
     status_code_utf8: bool,
     require_columns: bool,
+    stored_schema: bool,
+    stream_type: config::meta::stream::StreamType,
 ) -> Result<(), anyhow::Error> {
     let mib = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
     let started = Instant::now();
@@ -550,8 +560,12 @@ fn cmd_merge(
         .sum();
     let load_elapsed = started.elapsed();
 
-    let (latest_schema, fts) = derive_schema(&inputs, status_code_utf8);
-    let bloom = vec!["trace_id".to_string()];
+    let (latest_schema, fts) = derive_schema(&inputs, status_code_utf8, stored_schema);
+    let bloom = if stream_type == config::meta::stream::StreamType::Traces {
+        vec!["trace_id".to_string(), "span_id".to_string()]
+    } else {
+        vec!["trace_id".to_string()]
+    };
     eprintln!(
         "opened {} files (ranged) / {:.1} MiB in {load_elapsed:.2?}; fts={fts:?}",
         inputs.len(),
@@ -561,7 +575,7 @@ fn cmd_merge(
     let started = Instant::now();
     let result = if rebuild {
         openobserve_core::vix::core_writer::merge_core_files_rebuild(
-            config::meta::stream::StreamType::Logs,
+            stream_type,
             &inputs,
             &latest_schema,
             &fts,
@@ -569,7 +583,7 @@ fn cmd_merge(
         )?
     } else {
         openobserve_core::vix::core_writer::merge_core_files(
-            config::meta::stream::StreamType::Logs,
+            stream_type,
             &inputs,
             &latest_schema,
             &fts,
@@ -621,6 +635,60 @@ fn cmd_merge(
     );
     eprintln!(
         "process memory after merge (includes setup): {}",
+        rss_lines()
+    );
+    Ok(())
+}
+
+fn cmd_sidecar(
+    dir: &str,
+    stored_schema: bool,
+    stream_type: config::meta::stream::StreamType,
+) -> Result<(), anyhow::Error> {
+    let started = Instant::now();
+    let inputs = load_inputs(dir)?;
+    anyhow::ensure!(
+        inputs.len() == 1,
+        "sidecar benchmark requires exactly one input, found {}",
+        inputs.len()
+    );
+    let load_elapsed = started.elapsed();
+    let (latest_schema, fts) = derive_schema(&inputs, false, stored_schema);
+    let bloom = if stream_type == config::meta::stream::StreamType::Traces {
+        vec!["trace_id".to_string(), "span_id".to_string()]
+    } else {
+        vec!["trace_id".to_string()]
+    };
+    eprintln!(
+        "opened one ranged file in {load_elapsed:.2?}; fields={} fts={fts:?} bloom={bloom:?}",
+        latest_schema.fields().len(),
+    );
+
+    let started = Instant::now();
+    let outcome = openobserve_core::vix::core_writer::rebuild_core_file_sidecar(
+        stream_type,
+        &inputs[0],
+        &latest_schema,
+        &fts,
+        &bloom,
+    )?;
+    let rebuild_elapsed = started.elapsed();
+    match outcome {
+        openobserve_core::vix::core_writer::SidecarHealOutcome::Rebuilt { index, stats } => {
+            eprintln!(
+                "sidecar: {rebuild_elapsed:.2?}  index {:.1} MiB  stats={stats:?}",
+                index.len() as f64 / (1024.0 * 1024.0),
+            );
+        }
+        openobserve_core::vix::core_writer::SidecarHealOutcome::DropSidecar => {
+            anyhow::bail!("sidecar benchmark selected index-off DropSidecar")
+        }
+        openobserve_core::vix::core_writer::SidecarHealOutcome::NeedsDocsRewrite(reason) => {
+            anyhow::bail!("sidecar benchmark requires a docs rewrite: {reason}")
+        }
+    }
+    eprintln!(
+        "process memory after sidecar rebuild (includes setup): {}",
         rss_lines()
     );
     Ok(())
@@ -878,18 +946,36 @@ async fn main() -> Result<(), anyhow::Error> {
         Some("merge") => {
             let dir = args.get(2).expect(
                 "merge <dir> <out.vix> [--rebuild] [--latest-status-code-utf8] \
-                 [--require-columns]",
+                 [--require-columns] [--stored-schema] [--traces]",
             );
             let out = args.get(3).expect("out.vix");
             // #51c passthrough + #51c-c concatenation are the DEFAULT merge
             // shapes now — no knobs to set.
+            let stream_type = if flag("--traces") {
+                config::meta::stream::StreamType::Traces
+            } else {
+                config::meta::stream::StreamType::Logs
+            };
             cmd_merge(
                 dir,
                 out,
                 flag("--rebuild"),
                 flag("--latest-status-code-utf8"),
                 flag("--require-columns"),
+                flag("--stored-schema"),
+                stream_type,
             )
+        }
+        Some("sidecar") => {
+            let dir = args
+                .get(2)
+                .expect("sidecar <dir> [--stored-schema] [--traces]");
+            let stream_type = if flag("--traces") {
+                config::meta::stream::StreamType::Traces
+            } else {
+                config::meta::stream::StreamType::Logs
+            };
+            cmd_sidecar(dir, flag("--stored-schema"), stream_type)
         }
         Some("compare") => {
             // flags may precede the paths: compare [--multiset] [--docs-only]
@@ -902,24 +988,17 @@ async fn main() -> Result<(), anyhow::Error> {
                 .collect();
             let a = paths
                 .first()
-                .expect(
-                    "compare [--multiset] [--docs-only] [--ignore-source] <a.vix> <b.vix>",
-                );
+                .expect("compare [--multiset] [--docs-only] [--ignore-source] <a.vix> <b.vix>");
             let b = paths.get(1).expect("b.vix");
-            cmd_compare(
-                a,
-                b,
-                multiset,
-                flag("--docs-only"),
-                flag("--ignore-source"),
-            )
+            cmd_compare(a, b, multiset, flag("--docs-only"), flag("--ignore-source"))
         }
         _ => {
             eprintln!(
                 "usage: merge_bench gen <dir> <files> <rows_per_file> [--heal] [--overlap] \
                  [--vary-schema] [--type-drift] | \
                  merge <dir> <out.vix> [--rebuild] [--latest-status-code-utf8] \
-                 [--require-columns] | \
+                 [--require-columns] [--stored-schema] [--traces] | \
+                 sidecar <dir> [--stored-schema] [--traces] | \
                  compare [--multiset] [--docs-only] [--ignore-source] <a.vix> <b.vix>"
             );
             std::process::exit(2);

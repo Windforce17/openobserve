@@ -44,10 +44,11 @@
 //! between registration and the flip, and a lost lease rolls the
 //! registration back whole.
 //!
-//! Provenance: L0 object keys are a pure function of (the stream/hour
-//! chunk's ids, stream, hour) — `l0_{writer uuid|multi}_{chunk min
-//! id}_{chunk max id}_{hour index}` — and a chunk only ever spans
-//! CONSECUTIVE decoded ids. For every `(stream, hour)` present in a run, its
+//! Provenance: L0 object keys are a pure function of (planner version,
+//! the stream/hour chunk's ids, stream, hour) —
+//! `l0_h1_{writer uuid|multi}_{chunk min id}_{chunk max id}_{hour index}` —
+//! and a chunk only ever spans CONSECUTIVE decoded ids. For every
+//! `(stream, hour)` present in a run, its
 //! chunk ranges tile that run's whole id span, so every id inside a
 //! registered key range is genuinely covered: a segment either contributed
 //! rows to that stream/hour or carried none. The leader dedups candidates
@@ -62,7 +63,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -111,6 +112,10 @@ use crate::service::{
 };
 
 const HOUR_MICROS: i64 = 3_600_000_000;
+// Object-key planner version. This separates the hour-aware schema planner
+// from pre-hour-aware builders during a fenced rolling handoff: different
+// planners must never upload incompatible data and sidecars to the same key.
+const L0_PLANNER_VERSION: &str = "h1";
 /// Claim poll interval while the backlog is empty; a full claim loops
 /// immediately so a backlog drains at build speed, not poll speed.
 const BUILDER_TICK_SECS: u64 = 5;
@@ -591,8 +596,7 @@ async fn run_loop() -> Result<(), anyhow::Error> {
                 claim.len(),
                 dropped.len()
             );
-            if let Err(re) = infra::wal_segments::release_claims(&dropped, &LOCAL_NODE.uuid).await
-            {
+            if let Err(re) = infra::wal_segments::release_claims(&dropped, &LOCAL_NODE.uuid).await {
                 log::error!(
                     "[SEGMENT:BUILD] releasing {} halved claims failed (lease expiry covers \
                      them): {re}",
@@ -884,6 +888,102 @@ async fn accumulate_super_batch(
     total
 }
 
+fn elapsed_millis_u64(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn observe_build_phase(phase: &'static str, elapsed_ms: u64) {
+    metrics::SEGMENT_BUILD_PHASE_DURATION
+        .with_label_values(&[phase])
+        .observe(elapsed_ms as f64 / 1000.0);
+}
+
+/// Observes failed phases on scope exit as well as successful phases through
+/// `finish`, so an early `?` does not erase the latency that diagnosed it.
+struct ObservedPhaseTimer {
+    phase: &'static str,
+    started: Instant,
+    finished: bool,
+}
+
+impl ObservedPhaseTimer {
+    fn start(phase: &'static str) -> Self {
+        Self {
+            phase,
+            started: Instant::now(),
+            finished: false,
+        }
+    }
+
+    fn finish(mut self) -> u64 {
+        let elapsed_ms = elapsed_millis_u64(self.started);
+        observe_build_phase(self.phase, elapsed_ms);
+        self.finished = true;
+        elapsed_ms
+    }
+}
+
+impl Drop for ObservedPhaseTimer {
+    fn drop(&mut self) {
+        if !self.finished {
+            observe_build_phase(self.phase, elapsed_millis_u64(self.started));
+        }
+    }
+}
+
+/// End-to-end builder phase timings. Fields ending in `_sum_ms` add work
+/// across concurrently built/uploaded files and may exceed the wall clock.
+/// `index_finish_sum_ms` is a nested subphase of `writer_finish_sum_ms`
+/// because docs encoding overlaps index assembly; operators must not add them.
+#[derive(Clone, Copy, Default)]
+struct BatchTimings {
+    admission_wait_ms: u64,
+    fetch_decode_ms: u64,
+    plan_ms: u64,
+    schema_sort_sum_ms: u64,
+    build_wall_ms: u64,
+    file_build_sum_ms: u64,
+    writer_push_sum_ms: u64,
+    writer_finish_sum_ms: u64,
+    index_finish_sum_ms: u64,
+    plan_keys_ms: u64,
+    upload_admission_sum_ms: u64,
+    upload_wall_ms: u64,
+    data_upload_sum_ms: u64,
+    index_upload_sum_ms: u64,
+    commit_ms: u64,
+}
+
+impl BatchTimings {
+    fn add_stream_build(&mut self, built: &StreamBuildResult) {
+        self.schema_sort_sum_ms = self.schema_sort_sum_ms.saturating_add(built.schema_sort_ms);
+        observe_build_phase("schema_sort", built.schema_sort_ms);
+        for file in &built.files {
+            let timing = file.build_timing;
+            self.file_build_sum_ms = self.file_build_sum_ms.saturating_add(timing.file_build_ms);
+            observe_build_phase("file_build", timing.file_build_ms);
+            if timing.core_writer {
+                self.writer_push_sum_ms = self
+                    .writer_push_sum_ms
+                    .saturating_add(timing.writer_push_ms);
+                self.writer_finish_sum_ms = self
+                    .writer_finish_sum_ms
+                    .saturating_add(timing.writer_finish_ms);
+                self.index_finish_sum_ms = self
+                    .index_finish_sum_ms
+                    .saturating_add(timing.index_finish_ms);
+                observe_build_phase("writer_push", timing.writer_push_ms);
+                observe_build_phase("writer_finish", timing.writer_finish_ms);
+                observe_build_phase("index_finish", timing.index_finish_ms);
+            }
+        }
+    }
+}
+
 struct BatchStats {
     claimed: usize,
     built: usize,
@@ -896,13 +996,14 @@ struct BatchStats {
     rows: i64,
     flipped: u64,
     took_ms: u128,
+    timings: BatchTimings,
 }
 
 impl std::fmt::Display for BatchStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "batch done: segments in={} built={} skipped={} gone={} streams={} l0_files={} rows={} flipped={} took_ms={}",
+            "batch done: segments in={} built={} skipped={} gone={} streams={} l0_files={} rows={} flipped={} admit_ms={} fetch_decode_ms={} plan_ms={} schema_sort_sum_ms={} build_wall_ms={} file_build_sum_ms={} writer_push_sum_ms={} writer_finish_sum_ms={} index_finish_sum_ms={} plan_keys_ms={} upload_admit_sum_ms={} upload_wall_ms={} data_upload_sum_ms={} index_upload_sum_ms={} commit_ms={} took_ms={}",
             self.claimed,
             self.built,
             self.skipped,
@@ -911,6 +1012,21 @@ impl std::fmt::Display for BatchStats {
             self.files,
             self.rows,
             self.flipped,
+            self.timings.admission_wait_ms,
+            self.timings.fetch_decode_ms,
+            self.timings.plan_ms,
+            self.timings.schema_sort_sum_ms,
+            self.timings.build_wall_ms,
+            self.timings.file_build_sum_ms,
+            self.timings.writer_push_sum_ms,
+            self.timings.writer_finish_sum_ms,
+            self.timings.index_finish_sum_ms,
+            self.timings.plan_keys_ms,
+            self.timings.upload_admission_sum_ms,
+            self.timings.upload_wall_ms,
+            self.timings.data_upload_sum_ms,
+            self.timings.index_upload_sum_ms,
+            self.timings.commit_ms,
             self.took_ms
         )
     }
@@ -933,6 +1049,7 @@ impl std::fmt::Display for BatchStats {
 /// leases expire and the identical keys make the retry idempotent.
 async fn process_claim(claim: &[SegmentMeta], node: &str) -> Result<BatchStats, anyhow::Error> {
     let started = Instant::now();
+    let mut timings = BatchTimings::default();
 
     // M17 admission: reserve the batch's ESTIMATED decoded bytes before
     // anything decodes — the whole super-batch's frames stay resident until
@@ -945,6 +1062,8 @@ async fn process_claim(claim: &[SegmentMeta], node: &str) -> Result<BatchStats, 
         .acquire(estimated, BudgetClass::Claim)
         .await;
     let admission_wait = admission_started.elapsed();
+    timings.admission_wait_ms = duration_millis_u64(admission_wait);
+    observe_build_phase("admission", timings.admission_wait_ms);
     if admission_wait > Duration::from_millis(50) {
         log::info!(
             "[SEGMENT:BUILD] memory admission waited {admission_wait:?} for {} MB estimated \
@@ -954,7 +1073,10 @@ async fn process_claim(claim: &[SegmentMeta], node: &str) -> Result<BatchStats, 
         );
     }
 
+    let fetch_decode_started = Instant::now();
     let (decoded, skipped, gone) = fetch_and_decode(claim).await;
+    timings.fetch_decode_ms = elapsed_millis_u64(fetch_decode_started);
+    observe_build_phase("fetch_decode", timings.fetch_decode_ms);
     let built_ids: Vec<i64> = decoded.iter().map(|(id, _)| *id).collect();
 
     // M29: terminally resolve claimed segments whose objects are GONE
@@ -1000,11 +1122,8 @@ async fn process_claim(claim: &[SegmentMeta], node: &str) -> Result<BatchStats, 
         .map(|(_, frames)| frames.iter().map(|f| f.batch.size() as u64).sum::<u64>())
         .sum();
     claim_reservation.resize(decoded_actual);
-    let skipped_set: std::collections::HashSet<i64> = skipped
-        .iter()
-        .chain(gone.iter())
-        .copied()
-        .collect();
+    let skipped_set: std::collections::HashSet<i64> =
+        skipped.iter().chain(gone.iter()).copied().collect();
     let decoded_compressed: u64 = claim
         .iter()
         .filter(|m| !skipped_set.contains(&m.id))
@@ -1020,6 +1139,7 @@ async fn process_claim(claim: &[SegmentMeta], node: &str) -> Result<BatchStats, 
         BUILD_MEMORY_BUDGET.used() / (1024 * 1024),
     );
 
+    let plan_timer = ObservedPhaseTimer::start("plan");
     let meta_by_id: HashMap<i64, &SegmentMeta> = claim.iter().map(|m| (m.id, m)).collect();
 
     // Plan every `(stream, actual timestamp hour)` build first. Inputs are
@@ -1088,6 +1208,7 @@ async fn process_claim(claim: &[SegmentMeta], node: &str) -> Result<BatchStats, 
     });
     claim_reservation.resize(planned_decoded_bytes);
     drop(scratch_reservation);
+    timings.plan_ms = plan_timer.finish();
 
     // Execute: small builds run ZO_SEGMENT_BUILD_CONCURRENCY at a time
     // (the M12 count cap, secondary since M17), each first RESERVING its
@@ -1096,6 +1217,7 @@ async fn process_claim(claim: &[SegmentMeta], node: &str) -> Result<BatchStats, 
     // fit (the always-one floor keeps an oversized build from deadlocking).
     // A build whose input alone exceeds the per-build byte cap still runs
     // SERIALLY so nothing stacks beside it.
+    let build_timer = ObservedPhaseTimer::start("build");
     let (large, small): (Vec<BuildPlan>, Vec<BuildPlan>) = plans
         .into_iter()
         .partition(|plan| is_serial_oversized(plan.decoded_bytes, build_chunk_bytes));
@@ -1105,32 +1227,37 @@ async fn process_claim(claim: &[SegmentMeta], node: &str) -> Result<BatchStats, 
         let _admitted = BUILD_MEMORY_BUDGET
             .acquire(plan.decoded_bytes as u64, BudgetClass::Build)
             .await;
-        let stream_files = build_stream_files(plan.group, &plan.key_parts).await?;
-        validate_planned_hour(&stream_files, plan.hour_start_micros)?;
-        Ok::<_, anyhow::Error>(stream_files)
+        let stream_result = build_stream_files(plan.group, &plan.key_parts).await?;
+        validate_planned_hour(&stream_result.files, plan.hour_start_micros)?;
+        Ok::<_, anyhow::Error>(stream_result)
     }))
     .buffered(build_concurrency());
     while let Some(result) = small_results.next().await {
-        let stream_files = result?;
-        rows += stream_files
+        let stream_result = result?;
+        timings.add_stream_build(&stream_result);
+        rows += stream_result
+            .files
             .iter()
             .map(|f| f.file.meta.records)
             .sum::<i64>();
-        built_files.extend(stream_files);
+        built_files.extend(stream_result.files);
     }
     drop(small_results);
     for plan in large {
         let _admitted = BUILD_MEMORY_BUDGET
             .acquire(plan.decoded_bytes as u64, BudgetClass::Build)
             .await;
-        let stream_files = build_stream_files(plan.group, &plan.key_parts).await?;
-        validate_planned_hour(&stream_files, plan.hour_start_micros)?;
-        rows += stream_files
+        let stream_result = build_stream_files(plan.group, &plan.key_parts).await?;
+        validate_planned_hour(&stream_result.files, plan.hour_start_micros)?;
+        timings.add_stream_build(&stream_result);
+        rows += stream_result
+            .files
             .iter()
             .map(|f| f.file.meta.records)
             .sum::<i64>();
-        built_files.extend(stream_files);
+        built_files.extend(stream_result.files);
     }
+    timings.build_wall_ms = build_timer.finish();
     let files: Vec<FileKey> = built_files.iter().map(|b| b.file.clone()).collect();
 
     // planned keys go durable BEFORE the first PUT (GC design): every whole
@@ -1150,8 +1277,11 @@ async fn process_claim(claim: &[SegmentMeta], node: &str) -> Result<BatchStats, 
             .filter(|id| !gone_set.contains(id))
             .collect();
         let planned_keys: Vec<String> = files.iter().map(|f| f.key.clone()).collect();
-        let planned = wal_segments::set_l0_planned(&claim_ids, node, &planned_keys)
-            .await
+        let plan_keys_started = Instant::now();
+        let planned_result = wal_segments::set_l0_planned(&claim_ids, node, &planned_keys).await;
+        timings.plan_keys_ms = elapsed_millis_u64(plan_keys_started);
+        observe_build_phase("plan_write", timings.plan_keys_ms);
+        let planned = planned_result
             .with_context(|| format!("set_l0_planned for segment ids {claim_ids:?}"))?;
         if planned != claim_ids.len() as u64 {
             log::warn!(
@@ -1169,15 +1299,22 @@ async fn process_claim(claim: &[SegmentMeta], node: &str) -> Result<BatchStats, 
                 files: files.len(),
                 rows,
                 flipped: 0,
+                timings,
                 took_ms: started.elapsed().as_millis(),
             });
         }
         // only now may objects leave this node; a failure aborts the batch
         // (nothing registered), and whatever was already PUT is named by the
-        // rows' plans — the GC's job if this claim never finishes
-        for built in built_files {
-            upload_built_file(built).await?;
-        }
+        // rows' plans — the GC's job if this claim never finishes. Uploads
+        // run concurrently under count + active-payload byte admission.
+        let upload_started = Instant::now();
+        let upload_result = upload_built_files(built_files).await;
+        timings.upload_wall_ms = elapsed_millis_u64(upload_started);
+        observe_build_phase("upload", timings.upload_wall_ms);
+        let uploaded = upload_result?;
+        timings.upload_admission_sum_ms = uploaded.admission_sum_ms;
+        timings.data_upload_sum_ms = uploaded.data_sum_ms;
+        timings.index_upload_sum_ms = uploaded.index_sum_ms;
     }
 
     // registration + fenced flip commit or roll back TOGETHER — the crash
@@ -1185,8 +1322,12 @@ async fn process_claim(claim: &[SegmentMeta], node: &str) -> Result<BatchStats, 
     let mut flipped = 0;
     let mut committed = built_ids.is_empty();
     if !built_ids.is_empty() {
-        flipped = wal_segments::mark_built_with_files(&built_ids, node, files.clone())
-            .await
+        let commit_started = Instant::now();
+        let commit_result =
+            wal_segments::mark_built_with_files(&built_ids, node, files.clone()).await;
+        timings.commit_ms = elapsed_millis_u64(commit_started);
+        observe_build_phase("commit", timings.commit_ms);
+        flipped = commit_result
             .with_context(|| format!("mark_built_with_files for segment ids {built_ids:?}"))?;
         committed = flipped == built_ids.len() as u64;
         if !committed {
@@ -1218,6 +1359,7 @@ async fn process_claim(claim: &[SegmentMeta], node: &str) -> Result<BatchStats, 
         files: files.len(),
         rows,
         flipped,
+        timings,
         took_ms: started.elapsed().as_millis(),
     })
 }
@@ -1567,6 +1709,20 @@ struct StreamGroup {
     batches: Vec<RecordBatch>,
 }
 
+struct StreamBuildResult {
+    files: Vec<BuiltL0File>,
+    schema_sort_ms: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+struct L0FileBuildTiming {
+    file_build_ms: u64,
+    core_writer: bool,
+    writer_push_ms: u64,
+    writer_finish_ms: u64,
+    index_finish_ms: u64,
+}
+
 /// One L0 file, built but NOT yet uploaded: the registration row plus the
 /// bytes (or the disk spool) to PUT. Payloads are held until every file of
 /// the batch is built and the batch's planned keys are durably recorded in
@@ -1586,6 +1742,157 @@ struct BuiltL0File {
     /// key: collecting an orphan `.vix` also attempts its derived sidecar
     /// key (`compact::segments_sweep`).
     index: Option<Vec<u8>>,
+    build_timing: L0FileBuildTiming,
+}
+
+impl BuiltL0File {
+    fn upload_payload_bytes(&self) -> u64 {
+        let data_bytes = self
+            .spooled
+            .as_ref()
+            .map_or(self.buf.len() as u64, |output| output.len() as u64);
+        data_bytes.saturating_add(self.index.as_ref().map_or(0, |index| index.len() as u64))
+    }
+}
+
+#[derive(Clone)]
+struct UploadByteBudget {
+    total_mib: u32,
+    semaphore: Arc<tokio::sync::Semaphore>,
+}
+
+impl UploadByteBudget {
+    fn new(total_mib: usize) -> Self {
+        let total_mib = u32::try_from(total_mib.max(1)).unwrap_or(u32::MAX);
+        Self {
+            total_mib,
+            semaphore: Arc::new(tokio::sync::Semaphore::new(total_mib as usize)),
+        }
+    }
+
+    fn permits_for(&self, bytes: u64) -> u32 {
+        const MIB: u64 = 1024 * 1024;
+        bytes.div_ceil(MIB).clamp(1, self.total_mib as u64) as u32
+    }
+
+    async fn acquire(&self, bytes: u64) -> tokio::sync::OwnedSemaphorePermit {
+        Arc::clone(&self.semaphore)
+            .acquire_many_owned(self.permits_for(bytes))
+            .await
+            .expect("L0 upload byte-budget semaphore is never closed")
+    }
+}
+
+static L0_UPLOAD_BYTE_BUDGET: std::sync::LazyLock<UploadByteBudget> =
+    std::sync::LazyLock::new(|| {
+        let mib = get_config()
+            .common
+            .segment_build_upload_max_inflight_mb
+            .max(1);
+        log::info!(
+            "[SEGMENT:BUILD] L0 upload active-payload budget: {mib} MiB, count cap {}",
+            get_config().common.segment_build_upload_concurrency.max(1)
+        );
+        UploadByteBudget::new(mib)
+    });
+
+async fn run_bounded_uploads<T, R, E, Size, Upload, Fut>(
+    items: Vec<T>,
+    concurrency: usize,
+    budget: UploadByteBudget,
+    size: Size,
+    upload: Upload,
+) -> Result<Vec<(R, u64)>, E>
+where
+    Size: Fn(&T) -> u64,
+    Upload: Fn(T) -> Fut + Clone,
+    Fut: std::future::Future<Output = Result<R, E>>,
+{
+    let stopped = Arc::new(AtomicBool::new(false));
+    let task_stop = Arc::clone(&stopped);
+    let mut pending = items.into_iter().enumerate().map(move |(index, item)| {
+        let bytes = size(&item);
+        let budget = budget.clone();
+        let upload = upload.clone();
+        let stopped = Arc::clone(&task_stop);
+        async move {
+            let admission_started = Instant::now();
+            let _permit = budget.acquire(bytes).await;
+            let admission_ms = elapsed_millis_u64(admission_started);
+            if stopped.load(Ordering::Acquire) {
+                return (index, None);
+            }
+            (
+                index,
+                Some(upload(item).await.map(|result| (result, admission_ms))),
+            )
+        }
+    });
+    let mut in_flight = futures::stream::FuturesUnordered::new();
+    for _ in 0..concurrency.max(1) {
+        let Some(upload) = pending.next() else {
+            break;
+        };
+        in_flight.push(upload);
+    }
+    let mut completed = Vec::new();
+    let mut first_error: Option<(usize, E)> = None;
+    while let Some((index, result)) = in_flight.next().await {
+        match result {
+            Some(Ok(result)) => completed.push((index, result)),
+            Some(Err(error)) => {
+                stopped.store(true, Ordering::Release);
+                if first_error
+                    .as_ref()
+                    .is_none_or(|(first_index, _)| index < *first_index)
+                {
+                    first_error = Some((index, error));
+                }
+            }
+            None => {}
+        }
+        if first_error.is_none()
+            && let Some(upload) = pending.next()
+        {
+            in_flight.push(upload);
+        }
+    }
+    if let Some((_, error)) = first_error {
+        return Err(error);
+    }
+    completed.sort_unstable_by_key(|(index, _)| *index);
+    Ok(completed.into_iter().map(|(_, result)| result).collect())
+}
+
+#[derive(Clone, Copy, Default)]
+struct FileUploadTiming {
+    data_ms: u64,
+    index_ms: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+struct UploadSummary {
+    admission_sum_ms: u64,
+    data_sum_ms: u64,
+    index_sum_ms: u64,
+}
+
+async fn upload_built_files(files: Vec<BuiltL0File>) -> Result<UploadSummary, anyhow::Error> {
+    let results = run_bounded_uploads(
+        files,
+        get_config().common.segment_build_upload_concurrency,
+        L0_UPLOAD_BYTE_BUDGET.clone(),
+        BuiltL0File::upload_payload_bytes,
+        upload_built_file,
+    )
+    .await?;
+    let mut summary = UploadSummary::default();
+    for (timing, admission_ms) in results {
+        summary.admission_sum_ms = summary.admission_sum_ms.saturating_add(admission_ms);
+        summary.data_sum_ms = summary.data_sum_ms.saturating_add(timing.data_ms);
+        summary.index_sum_ms = summary.index_sum_ms.saturating_add(timing.index_ms);
+    }
+    Ok(summary)
 }
 
 /// Guard the planner/build boundary: an hour-aware plan must produce at most
@@ -1616,63 +1923,71 @@ fn validate_planned_hour(files: &[BuiltL0File], expected_hour: i64) -> Result<()
 
 /// PUT one built L0 file, consuming its payload. A failure aborts the whole
 /// batch (nothing is registered yet); the planned keys stay on the claimed
-/// rows, so even a crash after a partial upload leaves a durable record the
-/// GC can act on.
-async fn upload_built_file(built: BuiltL0File) -> Result<(), anyhow::Error> {
+/// rows, so even a crash after concurrent partial uploads leaves a durable
+/// record the GC can act on. DATA-before-INDEX ordering remains per file.
+async fn upload_built_file(built: BuiltL0File) -> Result<FileUploadTiming, anyhow::Error> {
     let BuiltL0File {
         file,
         buf,
         spooled,
         index,
+        build_timing: _,
     } = built;
-    match spooled.as_ref().and_then(|o| o.spool_path()) {
+    let data_started = Instant::now();
+    let data_result = match spooled.as_ref().and_then(|o| o.spool_path()) {
         Some(spool) => {
+            // the NamedTempFile spool deletes when `spooled` drops
             storage::put_file(&file.account, &file.key, spool)
                 .await
-                .with_context(|| format!("upload spooled L0 file {}", file.key))?;
-            // the NamedTempFile spool deletes when `spooled` drops
+                .with_context(|| format!("upload spooled L0 file {}", file.key))
         }
-        None => {
-            storage::put(&file.account, &file.key, Bytes::from(buf))
-                .await
-                .with_context(|| format!("upload L0 file {}", file.key))?;
-        }
-    }
+        None => storage::put(&file.account, &file.key, Bytes::from(buf))
+            .await
+            .with_context(|| format!("upload L0 file {}", file.key)),
+    };
+    let data_ms = elapsed_millis_u64(data_started);
+    observe_build_phase("data_upload", data_ms);
+    data_result?;
     // v3 split: the sidecar (when the build indexed) uploads AFTER the data
     // object; the file_list row commits later still, so a crash here leaves
     // only rowless orphans — the GC's derived-key delete collects them.
+    let mut index_ms = 0;
     if let Some(index) = index {
         let sidecar_key = config::vix_sidecar_key(&file.key)
             .expect("core L0 outputs are .vix keys by construction");
-        storage::put(&file.account, &sidecar_key, Bytes::from(index))
+        let index_started = Instant::now();
+        let index_result = storage::put(&file.account, &sidecar_key, Bytes::from(index))
             .await
-            .with_context(|| format!("upload L0 index sidecar {sidecar_key}"))?;
+            .with_context(|| format!("upload L0 index sidecar {sidecar_key}"));
+        index_ms = elapsed_millis_u64(index_started);
+        observe_build_phase("index_upload", index_ms);
+        index_result?;
     }
     log::info!(
-        "[SEGMENT:BUILD] built L0 file {}, records: {}, original_size: {}, compressed_size: {}",
+        "[SEGMENT:BUILD] built L0 file {}, records: {}, original_size: {}, compressed_size: {}, data_upload_ms: {}, index_upload_ms: {}",
         file.key,
         file.meta.records,
         file.meta.original_size,
         file.meta.compressed_size,
+        data_ms,
+        index_ms,
     );
-    Ok(())
+    Ok(FileUploadTiming { data_ms, index_ms })
 }
 
 /// Fetch and decode the claimed segments, at most
 /// `ZO_SEGMENT_FETCH_DECODE_CONCURRENCY` in flight (`buffered` keeps claim
 /// order, so results still zip with the claim). Returns
 /// `(decoded, skipped, gone)`:
-/// - `skipped` — transient failures (fetch error, decode error, path-unsafe
-///   identity): left leased so the lease expires and the segment retries,
-///   never crashing the batch and never contributing partial data;
-/// - `gone` (M29) — the object GET returned NotFound: the S3 lifecycle (or an
-///   earlier confirmed delete) removed the object, and S3 reads are strongly
-///   consistent, so a retry can never succeed. The caller terminally resolves
-///   these rows instead of recycling them through every future claim (the
-///   kill-era zombie loop: claim -> 404 -> lease expiry -> re-claim, 722k
-///   skips/30m fleet-wide on prod 2026-08-24, diluting every claim batch to
-///   1-2 real segments and turning the batch-sized L0 design into per-stream
-///   sliver files).
+/// - `skipped` — transient failures (fetch error, decode error, path-unsafe identity): left leased
+///   so the lease expires and the segment retries, never crashing the batch and never contributing
+///   partial data;
+/// - `gone` (M29) — the object GET returned NotFound: the S3 lifecycle (or an earlier confirmed
+///   delete) removed the object, and S3 reads are strongly consistent, so a retry can never
+///   succeed. The caller terminally resolves these rows instead of recycling them through every
+///   future claim (the kill-era zombie loop: claim -> 404 -> lease expiry -> re-claim, 722k
+///   skips/30m fleet-wide on prod 2026-08-24, diluting every claim batch to 1-2 real segments and
+///   turning the batch-sized L0 design into per-stream sliver files).
 ///
 /// Log discipline (house rule): per-item detail at DEBUG only; the caller
 /// emits one per-batch count line.
@@ -1785,11 +2100,13 @@ fn l0_key_parts(run: &[&SegmentMeta]) -> Result<L0KeyParts, anyhow::Error> {
     })
 }
 
-/// Deterministic L0 object key:
-/// `files/{org}/{type}/{stream}/{YYYY/MM/DD/HH}/l0_{uuid|multi}_{min}_{max}_{hour index}{ext}`.
-/// The trailing hour index is hours-since-epoch — a pure function of the
-/// hour itself, so it can never shift between retries the way a positional
-/// bucket index would when a previously skipped segment adds an hour.
+/// Deterministic, planner-versioned L0 object key:
+/// `files/{org}/{type}/{stream}/{YYYY/MM/DD/HH}/l0_h1_{uuid|multi}_{min}_{max}_{hour index}{ext}`.
+/// The version prevents mixed planner generations from overwriting one
+/// another during a lease handoff. The trailing hour index is
+/// hours-since-epoch — a pure function of the hour itself, so it can never
+/// shift between retries the way a positional bucket index would when a
+/// previously skipped segment adds an hour.
 fn l0_object_key(
     org: &str,
     stream_type: StreamType,
@@ -1806,7 +2123,7 @@ fn l0_object_key(
     let date_path = dt.format("%Y/%m/%d/%H");
     let hour_index = hour_start_micros.div_euclid(HOUR_MICROS);
     Ok(format!(
-        "files/{org}/{stream_type}/{stream}/{date_path}/l0_{}_{}_{}_{hour_index}{extension}",
+        "files/{org}/{stream_type}/{stream}/{date_path}/l0_{L0_PLANNER_VERSION}_{}_{}_{}_{hour_index}{extension}",
         parts.writer_uuid, parts.min_id, parts.max_id
     ))
 }
@@ -1832,7 +2149,8 @@ fn parse_l0_stream(key: &str) -> Option<(String, StreamType, String)> {
 async fn build_stream_files(
     group: StreamGroup,
     key_parts: &L0KeyParts,
-) -> Result<Vec<BuiltL0File>, anyhow::Error> {
+) -> Result<StreamBuildResult, anyhow::Error> {
+    let schema_sort_started = Instant::now();
     let StreamGroup {
         org,
         stream_type,
@@ -1879,7 +2197,10 @@ async fn build_stream_files(
         homogenized.push(homogenize_batch(&merged, &union, &ctx)?);
     }
     if homogenized.is_empty() {
-        return Ok(Vec::new());
+        return Ok(StreamBuildResult {
+            files: Vec::new(),
+            schema_sort_ms: elapsed_millis_u64(schema_sort_started),
+        });
     }
     let merged = concat_batches(&union, homogenized.iter())
         .with_context(|| format!("{ctx}: concat homogenized batches"))?;
@@ -1899,7 +2220,10 @@ async fn build_stream_files(
             "[SEGMENT:BUILD] {ctx}: every row carried a degenerate _timestamp ({dropped} dropped); \
              no L0 file produced for this stream"
         );
-        return Ok(Vec::new());
+        return Ok(StreamBuildResult {
+            files: Vec::new(),
+            schema_sort_ms: elapsed_millis_u64(schema_sort_started),
+        });
     }
 
     // M12: sort DESCENDING — the stored v2 row order — so each hourly
@@ -1912,6 +2236,7 @@ async fn build_stream_files(
     // (files/planned keys keep their pre-M12 order; rows inside stay DESC)
     let mut buckets = split_by_hour(&sorted, &ctx)?;
     buckets.sort_unstable_by_key(|(hour, _)| *hour);
+    let schema_sort_ms = elapsed_millis_u64(schema_sort_started);
 
     // stream settings drive the same fts/bloom/column-store/original wiring
     // the mover uses
@@ -1932,7 +2257,10 @@ async fn build_stream_files(
             .await?,
         );
     }
-    Ok(files)
+    Ok(StreamBuildResult {
+        files,
+        schema_sort_ms,
+    })
 }
 
 /// Union schema across a stream's per-batch schemas. Field-name conflicts
@@ -2136,8 +2464,7 @@ fn sliced_batch_memory_size(batch: &RecordBatch, ctx: &str) -> usize {
                     .unwrap_or(0)
                     .max(batch.num_rows())
                     .max(1);
-                return ((full as u128 * batch.num_rows() as u128) / backing_rows as u128)
-                    as usize;
+                return ((full as u128 * batch.num_rows() as u128) / backing_rows as u128) as usize;
             }
         }
     }
@@ -2161,6 +2488,7 @@ async fn build_one_file(
     key_parts: &L0KeyParts,
     stream_settings: &Option<config::meta::stream::StreamSettings>,
 ) -> Result<BuiltL0File, anyhow::Error> {
+    let file_build_started = Instant::now();
     let ctx = format!("{org}/{stream_type}/{stream}");
     let rows = bucket.num_rows();
     if rows == 0 {
@@ -2200,6 +2528,7 @@ async fn build_one_file(
     let use_core_file = matches!(stream_type, StreamType::Logs | StreamType::Traces)
         || (stream_type == StreamType::Metrics
             && get_config().common.vix_metrics_core_file_enabled);
+    let mut build_timing = L0FileBuildTiming::default();
     let (buf, spooled_output, index_bytes, file_meta, file_format) = if use_core_file {
         // M12: the bucket is already sorted `_timestamp` DESC (the stored
         // row order) and covers exactly this hour — the direct builder
@@ -2219,6 +2548,13 @@ async fn build_one_file(
         )
         .await
         .with_context(|| format!("{ctx}: build L0 .vix for hour {hour_start}"))?;
+        let writer_timing = result.stats.timings;
+        build_timing.core_writer = true;
+        build_timing.writer_push_ms = writer_timing.push_wall_ms;
+        build_timing.writer_finish_ms = writer_timing.finish_wall_ms;
+        build_timing.index_finish_ms = writer_timing
+            .index_assemble_ms
+            .saturating_add(writer_timing.index_container_ms);
         let mut file_meta = input_meta;
         if result.dropped_rows > 0 {
             // unreachable in practice (the degenerate filter ran first);
@@ -2248,7 +2584,13 @@ async fn build_one_file(
             &result.stats,
             &format!("[SEGMENT:BUILD] {ctx}"),
         )?;
-        (result.data, result.output, result.index, file_meta, FileFormat::Vix)
+        (
+            result.data,
+            result.output,
+            result.index,
+            file_meta,
+            FileFormat::Vix,
+        )
     } else {
         // non-core formats (metadata, index streams, metrics under the #40
         // default) keep the DataFusion merge — planned SINGLE-PARTITION
@@ -2311,11 +2653,13 @@ async fn build_one_file(
         file_format.extension(),
     )?;
     let account = storage::get_account(org, &key).unwrap_or_default();
+    build_timing.file_build_ms = elapsed_millis_u64(file_build_started);
     Ok(BuiltL0File {
         file: FileKey::new(0, account, key, file_meta, false),
         buf,
         spooled: spooled_output,
         index: index_bytes,
+        build_timing,
     })
 }
 
@@ -2425,6 +2769,125 @@ mod tests {
         drop(build);
         drop(fat_claim);
         assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn l0_upload_byte_permit_boundaries() {
+        const MIB: u64 = 1024 * 1024;
+        let budget = UploadByteBudget::new(3);
+        assert_eq!(budget.permits_for(0), 1);
+        assert_eq!(budget.permits_for(1), 1);
+        assert_eq!(budget.permits_for(MIB), 1);
+        assert_eq!(budget.permits_for(MIB + 1), 2);
+        assert_eq!(budget.permits_for(4 * MIB), 3);
+    }
+
+    #[tokio::test]
+    async fn l0_upload_scheduler_bounds_count_and_payload_bytes() {
+        const MIB: u64 = 1024 * 1024;
+        let active = Arc::new(AtomicU64::new(0));
+        let max_active = Arc::new(AtomicU64::new(0));
+        let active_bytes = Arc::new(AtomicU64::new(0));
+        let max_bytes = Arc::new(AtomicU64::new(0));
+        let upload = {
+            let active = Arc::clone(&active);
+            let max_active = Arc::clone(&max_active);
+            let active_bytes = Arc::clone(&active_bytes);
+            let max_bytes = Arc::clone(&max_bytes);
+            move |bytes: u64| {
+                let active = Arc::clone(&active);
+                let max_active = Arc::clone(&max_active);
+                let active_bytes = Arc::clone(&active_bytes);
+                let max_bytes = Arc::clone(&max_bytes);
+                async move {
+                    let now_active = active.fetch_add(1, Ordering::AcqRel) + 1;
+                    max_active.fetch_max(now_active, Ordering::AcqRel);
+                    let now_bytes = active_bytes.fetch_add(bytes, Ordering::AcqRel) + bytes;
+                    max_bytes.fetch_max(now_bytes, Ordering::AcqRel);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    active_bytes.fetch_sub(bytes, Ordering::AcqRel);
+                    active.fetch_sub(1, Ordering::AcqRel);
+                    Ok::<u64, &'static str>(bytes)
+                }
+            }
+        };
+        let completed = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_bounded_uploads(
+                vec![2 * MIB, 2 * MIB, MIB, MIB],
+                3,
+                UploadByteBudget::new(3),
+                |bytes| *bytes,
+                upload,
+            ),
+        )
+        .await
+        .expect("bounded uploads must not deadlock")
+        .unwrap();
+        assert_eq!(completed.len(), 4);
+        assert_eq!(max_active.load(Ordering::Acquire), 2);
+        assert_eq!(max_bytes.load(Ordering::Acquire), 3 * MIB);
+
+        let oversized = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_bounded_uploads(
+                vec![4 * MIB],
+                usize::MAX,
+                UploadByteBudget::new(3),
+                |bytes| *bytes,
+                |bytes| async move { Ok::<u64, &'static str>(bytes) },
+            ),
+        )
+        .await
+        .expect("an oversized file monopolizes the budget but still runs")
+        .unwrap();
+        assert_eq!(oversized.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn l0_upload_scheduler_stops_refill_drains_and_orders_errors() {
+        let started = Arc::new(AtomicU64::new(0));
+        let finished = Arc::new(AtomicU64::new(0));
+        let upload = {
+            let started = Arc::clone(&started);
+            let finished = Arc::clone(&finished);
+            move |index: usize| {
+                let started = Arc::clone(&started);
+                let finished = Arc::clone(&finished);
+                async move {
+                    started.fetch_add(1, Ordering::AcqRel);
+                    tokio::time::sleep(Duration::from_millis(if index == 0 { 40 } else { 5 }))
+                        .await;
+                    finished.fetch_add(1, Ordering::AcqRel);
+                    match index {
+                        0 => Err("zero"),
+                        1 => Err("one"),
+                        _ => Ok(index),
+                    }
+                }
+            }
+        };
+        let started_at = Instant::now();
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_bounded_uploads(
+                vec![0usize, 1, 2],
+                2,
+                UploadByteBudget::new(8),
+                |_| 1,
+                upload,
+            ),
+        )
+        .await
+        .expect("started uploads must drain")
+        .unwrap_err();
+        assert_eq!(error, "zero", "lowest started input index wins");
+        assert!(
+            started_at.elapsed() >= Duration::from_millis(35),
+            "the slow already-started upload must drain before return"
+        );
+        assert_eq!(started.load(Ordering::Acquire), 2, "failure stops refill");
+        assert_eq!(finished.load(Ordering::Acquire), 2, "started uploads drain");
     }
 
     /// EMA correction: seeded at 5.0; observations move it by α = 0.2 and
@@ -2875,7 +3338,11 @@ mod tests {
             released_total += dropped.len();
             sizes.push(claim.len());
         }
-        assert_eq!(sizes, vec![160, 80, 40, 20, 10, 5, 2, 1], "log2 convergence");
+        assert_eq!(
+            sizes,
+            vec![160, 80, 40, 20, 10, 5, 2, 1],
+            "log2 convergence"
+        );
         assert_eq!(released_total, 159, "everything not kept was released");
         assert_eq!(claim[0].id, 1, "the floor attempt still holds a segment");
         // the floor never halves to zero
@@ -3077,7 +3544,11 @@ mod tests {
                 ),
                 EmptyClaimAction::RetryNow
             );
-            assert_eq!((retries, ticks), (expect_retry, 0), "no tick on a race retry");
+            assert_eq!(
+                (retries, ticks),
+                (expect_retry, 0),
+                "no tick on a race retry"
+            );
         }
         // retries exhausted: even with claimable work, fall to the gap path
         assert_eq!(
@@ -3148,10 +3619,15 @@ mod tests {
         }
 
         // initial full batch of 4 (pending_seg.size = 1024)
-        let mut claim =
-            wal_segments::claim_pending_with_floor("sb-builder", 4, 4, 3600, ClaimOrder::NewestFirst)
-                .await
-                .unwrap();
+        let mut claim = wal_segments::claim_pending_with_floor(
+            "sb-builder",
+            4,
+            4,
+            3600,
+            ClaimOrder::NewestFirst,
+        )
+        .await
+        .unwrap();
         assert_eq!(claim.len(), 4);
         let mut guards = Vec::new();
         let started = std::time::Instant::now();
@@ -3169,7 +3645,11 @@ mod tests {
         let wall = started.elapsed();
         assert_eq!(total, 16 * 1024, "seals exactly at the byte budget");
         assert_eq!(claim.len(), 16, "12 extension segments over 3 claims");
-        assert_eq!(guards.len(), 3, "every extension claim is heartbeat-guarded");
+        assert_eq!(
+            guards.len(),
+            3,
+            "every extension claim is heartbeat-guarded"
+        );
         assert!(
             wall < Duration::from_secs(BUILDER_TICK_SECS),
             "deep-backlog accumulation must never sleep (took {wall:?})"
@@ -3194,7 +3674,9 @@ mod tests {
             .map(|m| m.id)
             .collect();
         assert_eq!(mine.len(), 4);
-        wal_segments::mark_built(&mine, "m13-sb-sweep").await.unwrap();
+        wal_segments::mark_built(&mine, "m13-sb-sweep")
+            .await
+            .unwrap();
     }
 
     // ── hour-aware contiguous-run planning ──────────────────────────────
@@ -3595,7 +4077,7 @@ mod tests {
         assert_eq!(
             key,
             format!(
-                "files/default/logs/app1/2021/01/01/11/l0_node-a_3_5_{}.vix",
+                "files/default/logs/app1/2021/01/01/11/l0_h1_node-a_3_5_{}.vix",
                 hour11 / HOUR_MICROS
             )
         );
@@ -3623,7 +4105,7 @@ mod tests {
         let (stream_key, date_key, file_name) = parse_file_key_columns(&key).unwrap();
         assert_eq!(stream_key, "default/logs/app1");
         assert_eq!(date_key, "2021/01/01/11");
-        assert!(file_name.starts_with("l0_node-a_3_5_"));
+        assert!(file_name.starts_with("l0_h1_node-a_3_5_"));
 
         // the compaction-hint inverse agrees
         let (org, stream_type, stream) = parse_l0_stream(&key).unwrap();
@@ -3668,8 +4150,8 @@ mod tests {
         assert_eq!(
             keys,
             vec![
-                format!("files/default/logs/app1/2021/01/01/11/l0_node-a_3_4_{hour_index}.vix"),
-                format!("files/default/logs/app1/2021/01/01/11/l0_node-a_6_7_{hour_index}.vix"),
+                format!("files/default/logs/app1/2021/01/01/11/l0_h1_node-a_3_4_{hour_index}.vix"),
+                format!("files/default/logs/app1/2021/01/01/11/l0_h1_node-a_6_7_{hour_index}.vix"),
             ]
         );
 
@@ -3810,7 +4292,9 @@ mod tests {
             .map(|m| m.id)
             .collect();
         if !strangers.is_empty() {
-            wal_segments::release_claims(&strangers, &node).await.unwrap();
+            wal_segments::release_claims(&strangers, &node)
+                .await
+                .unwrap();
         }
 
         // the REAL batch path: 404s tombstone, the real segment still builds
@@ -3820,14 +4304,19 @@ mod tests {
         assert_eq!(stats.gone, 2, "both gone rows terminally resolved");
         assert_eq!(stats.skipped, 0, "a gone object is not a transient skip");
         assert_eq!(stats.built, 1, "the real segment still builds");
-        assert_eq!(stats.flipped, 1, "the real build must COMMIT despite tombstoned batchmates");
+        assert_eq!(
+            stats.flipped, 1,
+            "the real build must COMMIT despite tombstoned batchmates"
+        );
         assert!(stats.files >= 1, "the real segment's L0 file registers");
 
         // even with every lease expired (timeout 0) none are reclaimable:
         // gone rows are tombstoned, the real one is Built
         tokio::time::sleep(Duration::from_millis(20)).await;
         let thief = unique_node("m29-thief");
-        let reclaim = wal_segments::claim_pending(&thief, 10_000, 0).await.unwrap();
+        let reclaim = wal_segments::claim_pending(&thief, 10_000, 0)
+            .await
+            .unwrap();
         assert!(
             !reclaim
                 .iter()
@@ -4024,8 +4513,8 @@ mod tests {
             max_id: 2,
         };
         let built = build_stream_files(group, &parts).await.unwrap();
-        assert_eq!(built.len(), 2, "one L0 file per hour bucket");
-        let files: Vec<FileKey> = built.iter().map(|b| b.file.clone()).collect();
+        assert_eq!(built.files.len(), 2, "one L0 file per hour bucket");
+        let files: Vec<FileKey> = built.files.iter().map(|b| b.file.clone()).collect();
 
         let expect_a =
             l0_object_key(&org, StreamType::Logs, "app1", hour_a, &parts, ".vix").unwrap();
@@ -4054,9 +4543,7 @@ mod tests {
             );
         }
 
-        for one in built {
-            upload_built_file(one).await.unwrap();
-        }
+        upload_built_files(built.files).await.unwrap();
         for file in &files {
             assert!(file.meta.compressed_size > 0);
             assert!(

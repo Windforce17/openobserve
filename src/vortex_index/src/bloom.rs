@@ -507,7 +507,12 @@ impl BloomHashAcc {
     /// dropped keys are withheld either way. `threads` bounds the parallel
     /// bit-setting of large sections (1 = fully sequential; identical
     /// bytes either way).
-    fn finish(self, fpp: f64, publish_empty: bool, threads: usize) -> (Vec<FileBloom>, BuildIssues) {
+    fn finish(
+        self,
+        fpp: f64,
+        publish_empty: bool,
+        threads: usize,
+    ) -> (Vec<FileBloom>, BuildIssues) {
         let mut out: Vec<FileBloom> = Vec::with_capacity(self.fields.len() + 1);
         let mut issues = BuildIssues {
             short_keys: self.short_keys,
@@ -975,11 +980,9 @@ mod tests {
         blobs.push((BLOB_TYPE_BLOOM, BLOB_TAG_BLOOM, vec![0xFF; 32]));
         let corrupt = build_container(properties, blobs).unwrap();
 
-        let reader = crate::VixReader::open_with_index(
-            data.clone(),
-            Some(bytes::Bytes::from(corrupt)),
-        )
-        .unwrap();
+        let reader =
+            crate::VixReader::open_with_index(data.clone(), Some(bytes::Bytes::from(corrupt)))
+                .unwrap();
         let err = reader.file_blooms().unwrap_err();
         assert!(
             is_unbuildable(&err),
@@ -1494,8 +1497,9 @@ mod tests {
             let batch = RecordBatch::try_new(
                 Arc::clone(&schema),
                 vec![
-                    Arc::new(Int64Array::from((0..8i64).map(|i| 1_000 + i).collect::<Vec<_>>()))
-                        as ArrayRef,
+                    Arc::new(Int64Array::from(
+                        (0..8i64).map(|i| 1_000 + i).collect::<Vec<_>>(),
+                    )) as ArrayRef,
                     Arc::new(StringArray::from(vec!["api"; 8])) as ArrayRef,
                     Arc::new(StringArray::from(
                         trace_values.iter().map(String::as_str).collect::<Vec<_>>(),
@@ -1509,7 +1513,9 @@ mod tests {
                     .map(|t| format!(r#"{{"svc":"api","trace_id":"{t}"}}"#)),
             );
             let mut writer = crate::VixWriter::new(&schema, opts, false);
-            writer.push_batch_with_source(&batch, &source, None).unwrap();
+            writer
+                .push_batch_with_source(&batch, &source, None)
+                .unwrap();
             writer.finish().unwrap()
         };
 
@@ -1754,8 +1760,7 @@ mod tests {
                     Arc::clone(&schema),
                     vec![
                         Arc::new(Int64Array::from_iter_values(
-                            (offset..offset + len)
-                                .map(|row| 2_000_000_000_000_000i64 - row as i64),
+                            (offset..offset + len).map(|row| 2_000_000_000_000_000i64 - row as i64),
                         )) as ArrayRef,
                         Arc::new(StringArray::from(
                             ids.iter().map(String::as_str).collect::<Vec<_>>(),
@@ -1855,19 +1860,21 @@ mod tests {
                         (0..rows).map(|i| format!("n{i}")).collect::<Vec<_>>(),
                     )) as ArrayRef,
                     Arc::new(StringArray::from(
-                        (0..rows).map(|i| format!("tok{i} shared")).collect::<Vec<_>>(),
+                        (0..rows)
+                            .map(|i| format!("tok{i} shared"))
+                            .collect::<Vec<_>>(),
                     )) as ArrayRef,
                     Arc::new(Int64Array::from((0..rows).collect::<Vec<_>>())) as ArrayRef,
                 ],
             )
             .unwrap();
             let source = StringArray::from_iter_values((0..rows).map(|i| {
-                format!(
-                    r#"{{"tid":"t{i}","nvr":"n{i}","msg":"tok{i} shared","num":{i}}}"#
-                )
+                format!(r#"{{"tid":"t{i}","nvr":"n{i}","msg":"tok{i} shared","num":{i}}}"#)
             }));
             let mut writer = crate::VixWriter::new(&schema, opts, false);
-            writer.push_batch_with_source(&batch, &source, None).unwrap();
+            writer
+                .push_batch_with_source(&batch, &source, None)
+                .unwrap();
             let (data, index) = writer.finish().unwrap();
             crate::VixReader::open_with_index(
                 bytes::Bytes::from(data),
@@ -1974,7 +1981,9 @@ mod tests {
                 format!(r#"{{"tid":"t-{chunk}-a"}}"#),
                 format!(r#"{{"tid":"t-{chunk}-b"}}"#),
             ]);
-            writer.push_batch_with_source(&batch, &source, None).unwrap();
+            writer
+                .push_batch_with_source(&batch, &source, None)
+                .unwrap();
         }
         let (data, index) = writer.finish().unwrap();
         let reader = crate::VixReader::open_with_index(

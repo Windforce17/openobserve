@@ -1212,7 +1212,8 @@ WHERE file_list_jobs.status IN ($5, $6);"#,
             // ids. Completion/requeue stamps updated_at, so it is the true
             // FIFO enqueue clock; id only breaks equal-time ties.
             super::FileListJobOrder::EnqueueOldest => "updated_at ASC, id ASC",
-            super::FileListJobOrder::OffsetNewest => "offsets DESC, id ASC",
+            // Fast mode still rotates work within the selected hour.
+            super::FileListJobOrder::OffsetNewest => "offsets DESC, updated_at ASC, id ASC",
         };
         let sql = format!(
             r#"UPDATE file_list_jobs
@@ -2078,12 +2079,18 @@ CREATE TABLE IF NOT EXISTS file_list_dump_stats
         "BOOLEAN default false not null",
     )
     .await?;
-    // SQLite databases are normally node-local, but keep the same transition
-    // contract if an old process overlaps an upgraded process on one file.
+    // SQLite databases are normally node-local, but keep the same mixed-version
+    // handoff contract if an old process overlaps an upgraded process on one
+    // file. These triggers predate this behavior and were originally created
+    // with IF NOT EXISTS, so recreate them on every upgrade.
+    let mut trigger_tx = client.begin().await?;
+    sqlx::query("DROP TRIGGER IF EXISTS file_list_jobs_pending_after_run_transition;")
+        .execute(&mut *trigger_tx)
+        .await?;
     sqlx::query(
         r#"
-CREATE TRIGGER IF NOT EXISTS file_list_jobs_pending_after_run_transition
-AFTER UPDATE OF status ON file_list_jobs
+CREATE TRIGGER file_list_jobs_pending_after_run_transition
+AFTER UPDATE OF status, dumped ON file_list_jobs
 BEGIN
     UPDATE file_list_jobs
     SET pending_after_run = false
@@ -2098,31 +2105,49 @@ BEGIN
         dumped = false,
         pending_after_run = false
     WHERE id = NEW.id
-      AND OLD.status = 1
+      AND OLD.status IN (0, 1)
       AND NEW.status = 2
       AND OLD.pending_after_run;
+    UPDATE file_list_jobs
+    SET status = 0,
+        node = '',
+        started_at = 0,
+        dumped = false,
+        pending_after_dump = false
+    WHERE id = NEW.id
+      AND OLD.status = 2
+      AND OLD.node <> ''
+      AND OLD.pending_after_dump
+      AND NEW.dumped;
 END;
 "#,
     )
-    .execute(&*client)
+    .execute(&mut *trigger_tx)
     .await?;
-    // A legacy add_job uses an INSERT whose ON CONFLICT update is restricted
-    // to DONE rows. Intercept its conflict with an active merge before SQLite
-    // reaches that gated update: latch one rerun on the existing singleton and
-    // ignore only the attempted duplicate insert. RAISE(IGNORE) preserves the
-    // UPDATE performed by this trigger.
+    // An exact legacy add uses an INSERT whose conflict update would steal an
+    // owned DONE dump lease. Intercept active merge and dump conflicts, latch
+    // the corresponding rerun, and suppress only the duplicate insert.
+    sqlx::query("DROP TRIGGER IF EXISTS file_list_jobs_legacy_insert_running_latch;")
+        .execute(&mut *trigger_tx)
+        .await?;
     sqlx::query(
         r#"
-CREATE TRIGGER IF NOT EXISTS file_list_jobs_legacy_insert_running_latch
+CREATE TRIGGER file_list_jobs_legacy_insert_running_latch
 BEFORE INSERT ON file_list_jobs
 WHEN NEW.status = 0
  AND NEW.node = ''
+ AND NEW.started_at = 0
+ AND NEW.updated_at = 0
+ AND NEW.dumped = false
+ AND NEW.lease_generation = 0
+ AND NEW.pending_after_run = false
+ AND NEW.pending_after_dump = false
  AND EXISTS (
      SELECT 1
      FROM file_list_jobs
      WHERE stream = NEW.stream
        AND offsets = NEW.offsets
-       AND status = 1
+       AND (status = 1 OR (status = 2 AND node <> ''))
  )
 BEGIN
     UPDATE file_list_jobs
@@ -2130,12 +2155,19 @@ BEGIN
     WHERE stream = NEW.stream
       AND offsets = NEW.offsets
       AND status = 1;
+    UPDATE file_list_jobs
+    SET pending_after_dump = true
+    WHERE stream = NEW.stream
+      AND offsets = NEW.offsets
+      AND status = 2
+      AND node <> '';
     SELECT RAISE(IGNORE);
 END;
 "#,
     )
-    .execute(&*client)
+    .execute(&mut *trigger_tx)
     .await?;
+    trigger_tx.commit().await?;
 
     // create columns is_recent and updated_at for stream_stats for version >= 0.30.0
     add_column(
@@ -3078,6 +3110,14 @@ mod tests {
     // other modules sharing the sqlite file are never touched.
 
     static JOBS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    const LEGACY_ADD_JOB_SQL: &str = r#"INSERT INTO file_list_jobs
+    (org, stream, offsets, status, node, started_at, updated_at)
+VALUES ($1, $2, $3, $4, '', 0, 0)
+ON CONFLICT (stream, offsets) DO UPDATE SET
+    status = $4,
+    node = '',
+    started_at = 0
+WHERE file_list_jobs.status = $5;"#;
 
     async fn jobs_setup() -> tokio::sync::MutexGuard<'static, ()> {
         let guard = JOBS_TEST_LOCK.lock().await;
@@ -3334,6 +3374,67 @@ mod tests {
             "older waiting work must run before a requeued low-id row"
         );
         raw_delete_jobs(&[old_id, waiting_id]).await;
+    }
+
+    #[tokio::test]
+    async fn test_offset_newest_rotates_requeued_row_within_same_hour_sqlite() {
+        let _guard = jobs_setup().await;
+        let list = SqliteFileList::new();
+        let offset = now_micros();
+        let first_id = list
+            .add_job(
+                "fast_fair_org",
+                StreamType::Logs,
+                &format!("fast_fair_first_{offset}"),
+                offset,
+            )
+            .await
+            .unwrap();
+        let waiting_id = list
+            .add_job(
+                "fast_fair_org",
+                StreamType::Logs,
+                &format!("fast_fair_waiting_{offset}"),
+                offset,
+            )
+            .await
+            .unwrap();
+        assert!(first_id < waiting_id, "test requires stable-id order");
+
+        let first = list
+            .get_pending_jobs(
+                "fast-fair-node",
+                1,
+                FileListJobOrder::OffsetNewest,
+                Some(offset),
+                Some(offset + 1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].id, first_id);
+        assert!(
+            list.set_job_pending_owned(first_id, "fast-fair-node", first[0].lease_generation)
+                .await
+                .unwrap()
+        );
+
+        let next = list
+            .get_pending_jobs(
+                "fast-fair-node",
+                1,
+                FileListJobOrder::OffsetNewest,
+                Some(offset),
+                Some(offset + 1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(next.len(), 1);
+        assert_eq!(
+            next[0].id, waiting_id,
+            "same-hour work with the older enqueue clock must precede the requeued row"
+        );
+        raw_delete_jobs(&[first_id, waiting_id]).await;
     }
 
     #[tokio::test]
@@ -3668,15 +3769,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_legacy_add_and_completion_honor_running_latch_sqlite() {
-        const LEGACY_ADD_SQL: &str = r#"INSERT INTO file_list_jobs
-    (org, stream, offsets, status, node, started_at, updated_at)
-VALUES ($1, $2, $3, $4, '', 0, 0)
-ON CONFLICT (stream, offsets) DO UPDATE SET
-    status = $4,
-    node = '',
-    started_at = 0
-WHERE file_list_jobs.status = $5;"#;
-
         let _guard = jobs_setup().await;
         let list = SqliteFileList::new();
         let offset = now_micros();
@@ -3687,7 +3779,7 @@ WHERE file_list_jobs.status = $5;"#;
         // exact legacy producer statement.
         let client = CLIENT_RW.clone();
         let client = client.lock().await;
-        let inserted = sqlx::query(LEGACY_ADD_SQL)
+        let inserted = sqlx::query(LEGACY_ADD_JOB_SQL)
             .bind("retrigger_org")
             .bind(&stream_key)
             .bind(offset)
@@ -3726,7 +3818,7 @@ WHERE file_list_jobs.status = $5;"#;
         let client = CLIENT_RW.clone();
         let client = client.lock().await;
         for _ in 0..2 {
-            let ignored = sqlx::query(LEGACY_ADD_SQL)
+            let ignored = sqlx::query(LEGACY_ADD_JOB_SQL)
                 .bind("retrigger_org")
                 .bind(&stream_key)
                 .bind(offset)
@@ -3801,6 +3893,190 @@ WHERE file_list_jobs.status = $5;"#;
             raw_job_merge_row(id).await.0,
             FileListJobStatus::Done as i64
         );
+        raw_delete_jobs(&[id]).await;
+    }
+
+    #[tokio::test]
+    async fn test_legacy_add_and_dump_completion_preserve_owned_dump_sqlite() {
+        let _guard = jobs_setup().await;
+        let list = SqliteFileList::new();
+        let offset = now_micros();
+        let stream = format!("legacy_dump_retrigger_{offset}");
+        let stream_key = format!("retrigger_org/logs/{stream}");
+        let id = list
+            .add_job("retrigger_org", StreamType::Logs, &stream, offset)
+            .await
+            .unwrap();
+
+        let client = CLIENT_RW.clone();
+        let client = client.lock().await;
+        sqlx::query(
+            "UPDATE file_list_jobs \
+             SET status = $1, node = 'legacy-dump-node', started_at = 42, \
+                 updated_at = $2, dumped = false, lease_generation = lease_generation + 1 \
+             WHERE id = $3;",
+        )
+        .bind(FileListJobStatus::Done)
+        .bind(now_micros())
+        .bind(id)
+        .execute(&*client)
+        .await
+        .unwrap();
+        for _ in 0..2 {
+            let ignored = sqlx::query(LEGACY_ADD_JOB_SQL)
+                .bind("retrigger_org")
+                .bind(&stream_key)
+                .bind(offset)
+                .bind(FileListJobStatus::Pending)
+                .bind(FileListJobStatus::Done)
+                .execute(&*client)
+                .await
+                .unwrap();
+            assert_eq!(ignored.rows_affected(), 0);
+        }
+        drop(client);
+
+        let owned = raw_job_merge_row(id).await;
+        assert_eq!(owned.0, FileListJobStatus::Done as i64);
+        assert_eq!(owned.1, "legacy-dump-node");
+        assert_eq!(owned.2, 42);
+        assert_eq!(owned.3, 1);
+        assert!(!owned.4);
+        assert!(owned.5);
+
+        let client = CLIENT_RW.clone();
+        let client = client.lock().await;
+        let completed = sqlx::query(
+            "UPDATE file_list_jobs SET dumped = true, node = '', updated_at = $1 WHERE id = $2;",
+        )
+        .bind(now_micros())
+        .bind(id)
+        .execute(&*client)
+        .await
+        .unwrap();
+        assert_eq!(completed.rows_affected(), 1);
+        drop(client);
+
+        let requeued = raw_job_merge_row(id).await;
+        assert_eq!(requeued.0, FileListJobStatus::Pending as i64);
+        assert!(requeued.1.is_empty());
+        assert_eq!(requeued.2, 0);
+        assert!(!requeued.4);
+        assert!(!requeued.5);
+        assert!(!raw_job_lease_row(id).await.2);
+
+        let rerun = list
+            .get_pending_jobs(
+                "merge-after-dump",
+                1,
+                FileListJobOrder::EnqueueOldest,
+                Some(offset),
+                Some(offset + 1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rerun.len(), 1);
+        assert_eq!(rerun[0].id, id);
+        assert!(
+            list.set_job_done_owned(id, "merge-after-dump", rerun[0].lease_generation)
+                .await
+                .unwrap()
+        );
+        assert!(
+            list.get_pending_jobs(
+                "no-second-rerun",
+                1,
+                FileListJobOrder::EnqueueOldest,
+                Some(offset),
+                Some(offset + 1),
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+        raw_delete_jobs(&[id]).await;
+    }
+
+    #[tokio::test]
+    async fn test_stale_legacy_completion_cannot_consume_pending_rerun_sqlite() {
+        let _guard = jobs_setup().await;
+        let list = SqliteFileList::new();
+        let offset = now_micros();
+        let stream = format!("legacy_stale_completion_{offset}");
+        let stream_key = format!("retrigger_org/traces/{stream}");
+        let id = list
+            .add_job("retrigger_org", StreamType::Traces, &stream, offset)
+            .await
+            .unwrap();
+        let first = list
+            .get_pending_jobs(
+                "timed-out-old-node",
+                1,
+                FileListJobOrder::EnqueueOldest,
+                Some(offset),
+                Some(offset + 1),
+            )
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+
+        let client = CLIENT_RW.clone();
+        let client = client.lock().await;
+        let ignored = sqlx::query(LEGACY_ADD_JOB_SQL)
+            .bind("retrigger_org")
+            .bind(&stream_key)
+            .bind(offset)
+            .bind(FileListJobStatus::Pending)
+            .bind(FileListJobStatus::Done)
+            .execute(&*client)
+            .await
+            .unwrap();
+        assert_eq!(ignored.rows_affected(), 0);
+        sqlx::query(
+            "UPDATE file_list_jobs \
+             SET status = $1, node = '', lease_generation = lease_generation + 1 \
+             WHERE id = $2;",
+        )
+        .bind(FileListJobStatus::Pending)
+        .bind(id)
+        .execute(&*client)
+        .await
+        .unwrap();
+        let stale_completed = sqlx::query(
+            "UPDATE file_list_jobs \
+             SET status = $1, updated_at = $2, dumped = true, node = '' \
+             WHERE id = $3;",
+        )
+        .bind(FileListJobStatus::Done)
+        .bind(now_micros())
+        .bind(id)
+        .execute(&*client)
+        .await
+        .unwrap();
+        assert_eq!(stale_completed.rows_affected(), 1);
+        drop(client);
+
+        let preserved = raw_job_merge_row(id).await;
+        assert_eq!(preserved.0, FileListJobStatus::Pending as i64);
+        assert!(preserved.1.is_empty());
+        assert_eq!(preserved.2, 0);
+        assert!(!preserved.4);
+        assert!(!raw_job_lease_row(id).await.2);
+
+        let rerun = list
+            .get_pending_jobs(
+                "replacement-node",
+                1,
+                FileListJobOrder::EnqueueOldest,
+                Some(offset),
+                Some(offset + 1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rerun.len(), 1);
+        assert_eq!(rerun[0].id, id);
+        assert_eq!(rerun[0].lease_generation, first.lease_generation + 2);
         raw_delete_jobs(&[id]).await;
     }
 

@@ -29,14 +29,13 @@
 //! zone entry `i`, so readers reuse the zone table's row-offset prefix sum).
 //! A row is one of
 //!
-//! - UNKNOWN (`null`): spliced from an input that carried no stats for this
-//!   column (fail-open: the chunk cannot be pruned on this column),
-//! - `[present]`: the non-null value count only (zero-presence runs, and
-//!   types without an ordered min/max encoding), or
-//! - `[present, min, max]`: full (either bound may be `null`; string bounds
-//!   are truncated to a bounded prefix — the min is a plain prefix, always
-//!   `<=` the true minimum, and the max is prefix-INCREMENTED so it stays
-//!   `>=` the true maximum).
+//! - UNKNOWN (`null`): spliced from an input that carried no stats for this column (fail-open: the
+//!   chunk cannot be pruned on this column),
+//! - `[present]`: the non-null value count only (zero-presence runs, and types without an ordered
+//!   min/max encoding), or
+//! - `[present, min, max]`: full (either bound may be `null`; string bounds are truncated to a
+//!   bounded prefix — the min is a plain prefix, always `<=` the true minimum, and the max is
+//!   prefix-INCREMENTED so it stays `>=` the true maximum).
 //!
 //! Pay-as-you-go (H2): a column's chunk rows are emitted only when its
 //! presence DENSITY clears a threshold, and the whole blob is bounded by a
@@ -515,8 +514,7 @@ impl ColumnStatsFolder {
                         // approximate: unknown entries' rows are not
                         // separable without the zone table — attribute
                         // proportionally (density is a heuristic gate)
-                        column.known_rows +=
-                            entry_rows * known as u64 / entry_count.max(1) as u64;
+                        column.known_rows += entry_rows * known as u64 / entry_count.max(1) as u64;
                     }
                 }
                 Some(_) | None if input_presence.is_none() => {
@@ -769,7 +767,10 @@ fn fold_array(window: &mut WindowAcc, tag: &str, array: &ArrowArrayRef) {
 /// decodes; fresh stats are computed) — this is what makes the v1
 /// stats-loss regression structurally impossible: a chunk copy CANNOT
 /// produce a stats-less output.
-pub fn validate_spliceable(stats: &SpliceableStats, zone_entries: usize) -> std::result::Result<(), String> {
+pub fn validate_spliceable(
+    stats: &SpliceableStats,
+    zone_entries: usize,
+) -> std::result::Result<(), String> {
     for (name, count) in &stats.presence {
         if count.is_none() {
             return Err(format!(

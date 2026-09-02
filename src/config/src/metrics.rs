@@ -712,6 +712,25 @@ pub static COMPACT_VIX_PHASE_DURATION: Lazy<HistogramVec> = Lazy::new(|| {
     .expect("Metric created")
 });
 
+/// Low-cardinality Segment-WAL L0 builder phase latency. One batch spans
+/// multiple organizations and streams, so only a fixed phase label is safe.
+pub static SEGMENT_BUILD_PHASE_DURATION: Lazy<HistogramVec> = Lazy::new(|| {
+    HistogramVec::new(
+        HistogramOpts::new(
+            "segment_build_phase_duration_seconds",
+            "Segment-WAL L0 builder wall time by bounded phase.",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels())
+        .buckets(vec![
+            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
+            120.0, 300.0,
+        ]),
+        &["phase"],
+    )
+    .expect("Metric created")
+});
+
 // stream stats aggregation metrics
 pub static STREAM_STATS_SCAN_DURATION: Lazy<HistogramVec> = Lazy::new(|| {
     HistogramVec::new(
@@ -2155,6 +2174,9 @@ fn register_metrics(registry: &Registry) {
     registry
         .register(Box::new(COMPACT_VIX_PHASE_DURATION.clone()))
         .expect("Metric registered");
+    registry
+        .register(Box::new(SEGMENT_BUILD_PHASE_DURATION.clone()))
+        .expect("Metric registered");
 
     // bloom filter prune metrics
     registry
@@ -2681,6 +2703,7 @@ mod tests {
         let _ = COMPACT_PENDING_JOBS.clone();
         let _ = COMPACT_DROPPED_ZERO_TS_ROWS.clone();
         let _ = COMPACT_VIX_PHASE_DURATION.clone();
+        let _ = SEGMENT_BUILD_PHASE_DURATION.clone();
         let _ = STREAM_STATS_SCAN_DURATION.clone();
         let _ = STREAM_STATS_SCAN_TOTAL.clone();
         let _ = STREAM_STATS_SCAN_ERRORS_TOTAL.clone();

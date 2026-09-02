@@ -993,6 +993,7 @@ fn spawn_core_file_builder(
         }
         let mut docs_batches = 0usize;
         let mut dropped_rows = 0u64;
+        let push_started = std::time::Instant::now();
         while let Some(batch) = rx.blocking_recv() {
             if batch.num_rows() == 0 {
                 continue;
@@ -1039,7 +1040,9 @@ fn spawn_core_file_builder(
                 docs_batches += 1;
             }
         }
-        let (output, index, stats) = writer.finish_output()?;
+        let push_wall_ms = u64::try_from(push_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let (output, index, mut stats) = writer.finish_output()?;
+        stats.timings.push_wall_ms = push_wall_ms;
         // spooled outputs stay on disk (upload from path); in-memory
         // outputs land in `data` as before
         let (data, output) = match output {
@@ -14119,6 +14122,7 @@ mod tests {
             oversize_skipped: 0,
             min_ts: 1_700_000_000_000_000,
             max_ts: 1_700_000_400_000_000,
+            timings: Default::default(),
         };
         // a WAL-meta-degenerate input (the live bug shape: min 0, max real)
         let mut meta = FileMeta {

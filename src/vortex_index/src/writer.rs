@@ -694,6 +694,25 @@ impl Default for VixWriterOptions {
     }
 }
 
+fn elapsed_millis_u64(started: std::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Wall-time decomposition for one writer finish. Docs encoding runs
+/// concurrently with term/index assembly, so `docs_finish_wait_ms` is only
+/// the remaining encoder wait after index assembly; these fields must not be
+/// summed as mutually exclusive phases. `push_wall_ms` is populated by
+/// producers that own the push loop (the direct core-file path does).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VixWriterTimings {
+    pub push_wall_ms: u64,
+    pub finish_wall_ms: u64,
+    pub index_assemble_ms: u64,
+    pub docs_finish_wait_ms: u64,
+    pub data_container_ms: u64,
+    pub index_container_ms: u64,
+}
+
 /// Size/count statistics of one finished `.vix` file, returned by
 /// [`VixWriter::finish_with_stats`].
 #[derive(Debug, Clone, Copy, Default)]
@@ -721,6 +740,8 @@ pub struct VixWriterStats {
     pub min_ts: i64,
     /// Largest `_timestamp` among the stored rows (`0` for an empty file).
     pub max_ts: i64,
+    /// Build-time wall decomposition; never persisted in the file format.
+    pub timings: VixWriterTimings,
 }
 
 /// Builder of one `.vix` core file. See the [module docs](self).
@@ -2957,6 +2978,7 @@ impl VixWriter {
     }
 
     fn finish_inner(mut self) -> Result<(VixOutput, Option<Vec<u8>>, VixWriterStats)> {
+        let finish_started = std::time::Instant::now();
         if let Some(error) = &self.init_error {
             return Err(VixError::Writer(error.clone()));
         }
@@ -3014,8 +3036,12 @@ impl VixWriter {
         let zone_folder = self.zone_folder.take().expect("created with the encoder");
         encoder.signal_finish()?;
 
+        let index_assemble_started = std::time::Instant::now();
         let (blobs, term_count) = self.assemble_index_blobs(row_count)?;
+        let index_assemble_ms = elapsed_millis_u64(index_assemble_started);
+        let docs_finish_started = std::time::Instant::now();
         let (sink, docs_size) = encoder.join()?;
+        let docs_finish_wait_ms = elapsed_millis_u64(docs_finish_started);
         // Zone table + per-column chunk stats: one `(row_count, ts_min,
         // ts_max)` entry per docs row-block, folded over the stored
         // `_timestamp` values windowed by the same `rows_per_chunk` the docs
@@ -3126,9 +3152,13 @@ impl VixWriter {
             Some(blob) if !zone_map.is_empty() => vec![(BLOB_TYPE_STATS, BLOB_TAG_STATS, blob)],
             _ => Vec::new(),
         };
+        let data_container_started = std::time::Instant::now();
         let output = finish_streamed_container(sink, docs_size, data_properties, data_blobs)?;
+        let data_container_ms = elapsed_millis_u64(data_container_started);
 
+        let index_container_started = std::time::Instant::now();
         let index_output = self.build_index_sidecar_container(row_count, term_count, blobs)?;
+        let index_container_ms = elapsed_millis_u64(index_container_started);
         let index_size = index_output.as_ref().map_or(0, |bytes| bytes.len() as u64);
         let oversize_skipped: u64 = self.oversize_skips.values().sum();
         if oversize_skipped > 0 {
@@ -3143,6 +3173,14 @@ impl VixWriter {
                 self.oversize_skips
             );
         }
+        let timings = VixWriterTimings {
+            finish_wall_ms: elapsed_millis_u64(finish_started),
+            index_assemble_ms,
+            docs_finish_wait_ms,
+            data_container_ms,
+            index_container_ms,
+            ..Default::default()
+        };
         let stats = VixWriterStats {
             row_count,
             term_count,
@@ -3151,6 +3189,7 @@ impl VixWriter {
             oversize_skipped,
             min_ts,
             max_ts,
+            timings,
         };
         Ok((output, index_output, stats))
     }
@@ -3535,6 +3574,7 @@ impl VixWriter {
         mut self,
         expected_rows: u64,
     ) -> anyhow::Result<(Vec<u8>, VixWriterStats)> {
+        let finish_started = std::time::Instant::now();
         if let Some(error) = &self.init_error {
             return Err(VixError::Writer(error.clone()).into());
         }
@@ -3569,10 +3609,14 @@ impl VixWriter {
             ))
             .into());
         }
+        let index_assemble_started = std::time::Instant::now();
         let (blobs, term_count) = self.assemble_index_blobs(expected_rows)?;
+        let index_assemble_ms = elapsed_millis_u64(index_assemble_started);
+        let index_container_started = std::time::Instant::now();
         let container = self
             .build_index_sidecar_container(expected_rows, term_count, blobs)?
             .expect("index-enabled writers always produce a sidecar");
+        let index_container_ms = elapsed_millis_u64(index_container_started);
         let oversize_skipped: u64 = self.oversize_skips.values().sum();
         let stats = VixWriterStats {
             row_count: expected_rows,
@@ -3582,6 +3626,12 @@ impl VixWriter {
             oversize_skipped,
             min_ts: 0,
             max_ts: 0,
+            timings: VixWriterTimings {
+                finish_wall_ms: elapsed_millis_u64(finish_started),
+                index_assemble_ms,
+                index_container_ms,
+                ..Default::default()
+            },
         };
         Ok((container, stats))
     }
