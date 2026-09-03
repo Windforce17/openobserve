@@ -78,6 +78,7 @@ use vortex::{
             table::TableStrategy,
         },
     },
+    scan::selection::Selection,
     session::VortexSession,
 };
 
@@ -1674,10 +1675,13 @@ pub(crate) fn write_vortex_blob(
 pub(crate) struct TermsBlobSpooler {
     tx: Option<std::sync::mpsc::SyncSender<RecordBatch>>,
     handle: Option<std::thread::JoinHandle<Result<BlobPart>>>,
+    abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl TermsBlobSpooler {
     pub(crate) fn spawn(spool_dir: &std::path::Path, schema: SchemaRef) -> Result<Self> {
+        std::fs::create_dir_all(spool_dir)
+            .map_err(|e| VixError::Writer(format!("create terms spool dir {spool_dir:?}: {e}")))?;
         // unlinked temp file: freed by the OS on drop/crash, nothing to sweep
         let mut file = tempfile::tempfile_in(spool_dir)
             .map_err(|e| VixError::Writer(format!("create terms spool in {spool_dir:?}: {e}")))?;
@@ -1685,6 +1689,8 @@ impl TermsBlobSpooler {
             .try_clone()
             .map_err(|e| VixError::Writer(format!("clone terms spool handle: {e}")))?;
         let (tx, rx) = std::sync::mpsc::sync_channel::<RecordBatch>(2);
+        let abort = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_abort = std::sync::Arc::clone(&abort);
         let handle = std::thread::Builder::new()
             .name("vix-terms-spool".to_string())
             .spawn(move || -> Result<BlobPart> {
@@ -1701,9 +1707,12 @@ impl TermsBlobSpooler {
                     }
                     writer.push(ArrayRef::from_arrow(&batch, false)?)?;
                 }
-                // the sender dropped: every batch is in — finalize the blob
-                // (an aborted caller discards the result; the file is
-                // unlinked, so a spurious finalize costs nothing)
+                if worker_abort.load(std::sync::atomic::Ordering::Acquire) {
+                    return Err(VixError::Writer("terms spool aborted".to_string()));
+                }
+                // Normal close: every batch is in, so finalize the blob.
+                // Abort returns above and drops the unlinked spool without
+                // paying the final encode/footer work.
                 writer.finish()?;
                 use std::io::Seek;
                 let len = file
@@ -1718,6 +1727,7 @@ impl TermsBlobSpooler {
         Ok(Self {
             tx: Some(tx),
             handle: Some(handle),
+            abort,
         })
     }
 
@@ -1759,6 +1769,16 @@ impl TermsBlobSpooler {
                 Err(_) => VixError::Writer("terms spool thread panicked".to_string()),
             },
             None => VixError::Writer("terms spooler already failed".to_string()),
+        }
+    }
+}
+
+impl Drop for TermsBlobSpooler {
+    fn drop(&mut self) {
+        self.abort.store(true, std::sync::atomic::Ordering::Release);
+        drop(self.tx.take());
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
         }
     }
 }
@@ -1831,6 +1851,10 @@ pub(crate) enum RowSelection {
     All,
     /// Point reads of the given row indices (sorted + deduped internally).
     Indices(Vec<u64>),
+    /// A Vortex-native compressed row selection.
+    Vortex(Selection),
+    /// A Vortex-native selection restricted to one absolute row range.
+    VortexRange(Selection, std::ops::Range<u64>),
     /// One contiguous half-open row range — unlike [`RowSelection::Indices`]
     /// this allocates nothing per row (vortex takes the range directly), so
     /// it is the right shape for scanning a column over millions of
@@ -1907,6 +1931,12 @@ pub(crate) fn scan_blob_streaming(
         }
         RowSelection::Range(range) => {
             scan = scan.with_row_range(range);
+        }
+        RowSelection::Vortex(selection) => {
+            scan = scan.with_selection(selection);
+        }
+        RowSelection::VortexRange(selection, range) => {
+            scan = scan.with_row_range(range).with_selection(selection);
         }
     }
     scan = scan.with_some_filter(filter);

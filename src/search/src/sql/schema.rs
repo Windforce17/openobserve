@@ -22,10 +22,7 @@ use config::{
 };
 use datafusion::{arrow::datatypes::Schema, common::TableReference};
 use hashbrown::{HashMap, HashSet};
-use infra::schema::{
-    SchemaCache, get_stream_setting_fts_fields,
-    unwrap_stream_settings,
-};
+use infra::schema::{SchemaCache, get_stream_setting_fts_fields, unwrap_stream_settings};
 use vortex_index::SOURCE_COL_NAME;
 
 pub fn generate_select_star_schema(
@@ -80,8 +77,7 @@ pub fn generate_select_star_schema(
         let referenced = columns.get(&name).filter(|cols| !cols.is_empty());
         let fields = match referenced {
             Some(cols) => {
-                let mut fields =
-                    generate_schema_fields(cols.clone(), &schema, need_fst_fields);
+                let mut fields = generate_schema_fields(cols.clone(), &schema, need_fst_fields);
                 // `_original` rides only when the statement references it
                 // or a scheduled pipeline needs it (never by default)
                 if !skip_original_column

@@ -84,6 +84,93 @@ pub(crate) fn encode_into(doc_ids: &[u32], out: &mut Vec<u8>) -> Result<()> {
     Ok(())
 }
 
+/// Shift every encoded doc id by a constant offset without materializing the
+/// posting list. The delta codec changes only its first delta; all remaining
+/// encoded blocks/tail bytes are copied verbatim. The full input is still
+/// walked for layout and u32-overflow validation.
+pub(crate) fn shift_encoded_into(
+    encoded: &[u8],
+    doc_count: usize,
+    offset: u32,
+    source_rows: u64,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    validate_shift(encoded, doc_count, offset, source_rows, |_, _| Ok(()))?;
+    shift_encoded_validated(encoded, doc_count, offset, out)
+}
+
+fn validate_shift(
+    encoded: &[u8],
+    doc_count: usize,
+    offset: u32,
+    source_rows: u64,
+    mut on_doc: impl FnMut(usize, u32) -> Result<()>,
+) -> Result<()> {
+    let mut index = 0usize;
+    let mut last = None;
+    decode_each(encoded, doc_count, |doc| {
+        if u64::from(doc) >= source_rows {
+            return Err(VixError::Malformed(format!(
+                "postings doc id {doc} outside source row count {source_rows}"
+            )));
+        }
+        on_doc(index, doc)?;
+        index += 1;
+        last = Some(doc);
+        Ok(())
+    })?;
+    if let Some(last) = last {
+        last.checked_add(offset).ok_or_else(|| {
+            VixError::Malformed("shifted postings doc id overflows u32".to_string())
+        })?;
+    }
+    Ok(())
+}
+
+fn shift_encoded_validated(
+    encoded: &[u8],
+    doc_count: usize,
+    offset: u32,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    out.clear();
+    if offset == 0 || doc_count == 0 {
+        out.extend_from_slice(encoded);
+        return Ok(());
+    }
+    if doc_count >= BLOCK_LEN {
+        let packer = BitPacker4x::new();
+        let old_bits = encoded[0];
+        let old_len = 1 + old_bits as usize * BLOCK_LEN / 8;
+        let mut deltas = [0u32; BLOCK_LEN];
+        if old_bits > 0 {
+            packer.decompress(&encoded[1..old_len], &mut deltas, old_bits);
+        }
+        deltas[0] = deltas[0]
+            .checked_add(offset)
+            .ok_or_else(|| VixError::Malformed("shifted first delta overflows u32".to_string()))?;
+        let new_bits = packer.num_bits(&deltas);
+        out.reserve(encoded.len() + BLOCK_LEN * 4);
+        out.push(new_bits);
+        if new_bits > 0 {
+            let packed_len = new_bits as usize * BLOCK_LEN / 8;
+            out.resize(1 + packed_len, 0);
+            let written = packer.compress(&deltas, &mut out[1..], new_bits);
+            debug_assert_eq!(written, packed_len);
+        }
+        out.extend_from_slice(&encoded[old_len..]);
+    } else {
+        let (first, used) = read_vint(encoded)?;
+        let first = first
+            .checked_add(offset)
+            .ok_or_else(|| VixError::Malformed("shifted first delta overflows u32".to_string()))?;
+        out.reserve(encoded.len() + 5);
+        write_vint(out, first);
+        out.extend_from_slice(&encoded[used..]);
+    }
+    Ok(())
+}
+
 /// Decode a postings blob of exactly `doc_count` ids, invoking `on_doc` for
 /// each id in ascending order.
 ///
@@ -1003,6 +1090,40 @@ mod tests {
         // Wrong doc_count (too small => trailing bytes; too large => truncated).
         assert!(decode_all(&blob, ids.len() - 1).is_err());
         assert!(decode_all(&blob, ids.len() + 1).is_err());
+    }
+
+    #[test]
+    fn shift_inline_matches_decode_offset_reencode() {
+        for n in [1usize, 5, 127, 128, 129, 1024, 1101] {
+            let mut ids = Vec::with_capacity(n);
+            let mut doc = 3u32;
+            for i in 0..n {
+                doc += 1 + (i as u32 % 17);
+                ids.push(doc);
+            }
+            for offset in [1u32, 127, 65_537] {
+                let shifted: Vec<u32> = ids.iter().map(|doc| doc + offset).collect();
+                let source_rows = u64::from(ids.last().copied().unwrap()) + 1;
+
+                let encoded = encode(&ids).unwrap();
+                let mut actual = Vec::new();
+                shift_encoded_into(&encoded, n, offset, source_rows, &mut actual).unwrap();
+                assert_eq!(
+                    actual,
+                    encode(&shifted).unwrap(),
+                    "inline n={n} offset={offset}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shift_inline_rejects_source_bounds_and_offset_overflow() {
+        let ids = [5u32, 9];
+        let encoded = encode(&ids).unwrap();
+        let mut out = Vec::new();
+        assert!(shift_encoded_into(&encoded, ids.len(), 1, 9, &mut out).is_err());
+        assert!(shift_encoded_into(&encoded, ids.len(), u32::MAX, 10, &mut out).is_err());
     }
 
     #[test]

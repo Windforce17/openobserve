@@ -81,8 +81,7 @@ impl<'n> TreeNodeVisitor<'n> for SimpleCountVisitor<'_> {
 
     fn f_down(&mut self, node: &'n Self::Node) -> Result<TreeNodeRecursion> {
         if let Some(aggregate) = node.downcast_ref::<AggregateExec>() {
-            let derived = if aggregate.group_expr().is_empty() && aggregate.aggr_expr().len() == 1
-            {
+            let derived = if aggregate.group_expr().is_empty() && aggregate.aggr_expr().len() == 1 {
                 let expr = &aggregate.aggr_expr()[0];
                 if is_count_rows_aggregate(expr) {
                     Some(IndexOptimizeMode::SimpleCount)

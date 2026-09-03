@@ -333,9 +333,10 @@ impl DownloadSink {
         if let DownloadSink::File { path, writer, .. } = self
             && let Some(writer) = writer.as_mut()
         {
-            writer.flush().await.map_err(|e| {
-                anyhow::anyhow!("flush download tmp file {}: {e}", path.display())
-            })?;
+            writer
+                .flush()
+                .await
+                .map_err(|e| anyhow::anyhow!("flush download tmp file {}: {e}", path.display()))?;
         }
         Ok(())
     }
@@ -419,16 +420,16 @@ async fn validate_file_ranged(path: &Path, ftype: FileType) -> Result<(), anyhow
 
 /// The shared download contract over any [`DownloadSink`], preserved
 /// exactly from the pre-H3 buffered implementation:
-/// - up to [`DOWNLOAD_RETRY_TIMES`] attempts with doubling backoff when the body length
-///   disagrees with the blob store's own header size (partial download);
-/// - a body length that then disagrees with the file_list `size` reconciles: a structurally
-///   valid file corrects the db row (`update_compressed_size`), a corrupt one removes it
-///   and errors — both only for file_list-tracked data files;
-/// - M19: a clean 404 on a file_list-tracked data file reconciles TOO — the object was
-///   deleted externally (S3 lifecycle expiry) while its row is still live, so the row is
-///   removed exactly like the corrupt-file arm. A 404 is a stronger signal than a size
-///   mismatch (S3 reads are strongly consistent): no retry, no validation probe. Without
-///   this, every query listing the row re-enqueues the download forever.
+/// - up to [`DOWNLOAD_RETRY_TIMES`] attempts with doubling backoff when the body length disagrees
+///   with the blob store's own header size (partial download);
+/// - a body length that then disagrees with the file_list `size` reconciles: a structurally valid
+///   file corrects the db row (`update_compressed_size`), a corrupt one removes it and errors —
+///   both only for file_list-tracked data files;
+/// - M19: a clean 404 on a file_list-tracked data file reconciles TOO — the object was deleted
+///   externally (S3 lifecycle expiry) while its row is still live, so the row is removed exactly
+///   like the corrupt-file arm. A 404 is a stronger signal than a size mismatch (S3 reads are
+///   strongly consistent): no retry, no validation probe. Without this, every query listing the row
+///   re-enqueues the download forever.
 /// - other transport errors propagate immediately (they were never retried here).
 ///
 /// `fetch` re-opens the object per attempt (injectable for tests).
@@ -469,9 +470,7 @@ where
         // get the initial headers
         let res = match fetch().await {
             Ok(res) => res,
-            Err(object_store::Error::NotFound { .. })
-                if is_file_list_tracked_data_file(file) =>
-            {
+            Err(object_store::Error::NotFound { .. }) if is_file_list_tracked_data_file(file) => {
                 log::warn!(
                     "download file {file} not found in object store (deleted externally, e.g. lifecycle expiry), deleting entry from file_list"
                 );
@@ -601,8 +600,7 @@ async fn download_from_storage(
 ) -> Result<(usize, bytes::Bytes), anyhow::Error> {
     let mut sink = DownloadSink::buffer();
     let data_len =
-        download_with_retries(|| crate::storage::get(account, file), file, size, &mut sink)
-            .await?;
+        download_with_retries(|| crate::storage::get(account, file), file, size, &mut sink).await?;
     let DownloadSink::Buffer(buf) = sink else {
         unreachable!("buffer sink stays a buffer");
     };
@@ -1021,7 +1019,6 @@ mod tests {
         }
     }
 
-
     #[tokio::test]
     async fn exact_size_policy_rejects_header_before_buffering_body() {
         let mut sink = DownloadSink::buffer();
@@ -1145,7 +1142,8 @@ mod tests {
         .await
         .unwrap_err();
         assert!(
-            err.to_string().contains("could not be downloaded completely"),
+            err.to_string()
+                .contains("could not be downloaded completely"),
             "unexpected error: {err}"
         );
         assert_eq!(fetches.load(Ordering::SeqCst), DOWNLOAD_RETRY_TIMES);
@@ -1200,7 +1198,12 @@ mod tests {
         let path = scratch_file("mismatch-corrupt");
         let mut sink = DownloadSink::file(path.clone());
         let err = download_with_retries(
-            || async { Ok(synthetic_get_result(vec![Bytes::from_static(b"garbage")], 7)) },
+            || async {
+                Ok(synthetic_get_result(
+                    vec![Bytes::from_static(b"garbage")],
+                    7,
+                ))
+            },
             "files/default/logs/s/2025/04/08/06/6.bin",
             Some(99),
             &mut sink,
@@ -1300,10 +1303,7 @@ mod tests {
             || async {
                 Err(object_store::Error::NotFound {
                     path: "files/o/logs/s/2026/08/19/00/x.vxi".to_string(),
-                    source: Box::new(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        "expired",
-                    )),
+                    source: Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, "expired")),
                 })
             },
             "files/o/logs/s/2026/08/19/00/x.vxi",

@@ -486,25 +486,63 @@ mod tests {
         let b_fresh = batch(&[1]);
         let b_late = batch(&[2, 3]);
         let late_size = b_late.size();
-        buf.append_with_cap("org1", StreamType::Logs, "app1", 1, 2, b_fresh, usize::MAX, false)
-            .unwrap();
-        buf.append_with_cap("org1", StreamType::Logs, "app1", 1, 2, b_late, usize::MAX, true)
-            .unwrap();
+        buf.append_with_cap(
+            "org1",
+            StreamType::Logs,
+            "app1",
+            1,
+            2,
+            b_fresh,
+            usize::MAX,
+            false,
+        )
+        .unwrap();
+        buf.append_with_cap(
+            "org1",
+            StreamType::Logs,
+            "app1",
+            1,
+            2,
+            b_late,
+            usize::MAX,
+            true,
+        )
+        .unwrap();
         // main take never surfaces late frames
         let taken = buf.take_if(0, Duration::ZERO).expect("fresh frame due");
         assert_eq!(taken.len(), 1);
         // late lane: size trigger not met, age not met -> None
-        assert!(buf.take_late_if(late_size + 1, Duration::from_secs(3600)).is_none());
+        assert!(
+            buf.take_late_if(late_size + 1, Duration::from_secs(3600))
+                .is_none()
+        );
         // size trigger met -> whole late set
-        let late = buf.take_late_if(late_size, Duration::from_secs(3600)).unwrap();
+        let late = buf
+            .take_late_if(late_size, Duration::from_secs(3600))
+            .unwrap();
         assert_eq!(late.len(), 1);
         assert_eq!(buf.buffered_bytes(), 0);
         // age trigger fires with tiny bytes
-        buf.append_with_cap("org1", StreamType::Logs, "app1", 1, 2, batch(&[4]), usize::MAX, true)
-            .unwrap();
-        assert!(buf.take_late_if(usize::MAX, Duration::from_secs(3600)).is_none());
+        buf.append_with_cap(
+            "org1",
+            StreamType::Logs,
+            "app1",
+            1,
+            2,
+            batch(&[4]),
+            usize::MAX,
+            true,
+        )
+        .unwrap();
+        assert!(
+            buf.take_late_if(usize::MAX, Duration::from_secs(3600))
+                .is_none()
+        );
         std::thread::sleep(Duration::from_millis(30));
-        assert!(buf.take_late_if(usize::MAX, Duration::from_millis(20)).is_some());
+        assert!(
+            buf.take_late_if(usize::MAX, Duration::from_millis(20))
+                .is_some()
+        );
     }
 
     #[test]
@@ -517,8 +555,17 @@ mod tests {
             .unwrap();
         // a fresh append is rejected against the SHARED cap
         let err = expect_full(
-            buf.append_with_cap("org1", StreamType::Logs, "app1", 1, 2, batch(&[1, 2, 3, 4]), cap, false)
-                .unwrap_err(),
+            buf.append_with_cap(
+                "org1",
+                StreamType::Logs,
+                "app1",
+                1,
+                2,
+                batch(&[1, 2, 3, 4]),
+                cap,
+                false,
+            )
+            .unwrap_err(),
         );
         assert_eq!(err.buffered_bytes, size1);
         // drain returns late frames too and zeroes all accounting

@@ -33,7 +33,11 @@ use std::sync::Arc;
 
 use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
 use bytes::Bytes;
-use vortex::expr::{and, get_item, gt_eq, lit, lt, root};
+use vortex::{
+    buffer::Buffer,
+    expr::{and, get_item, gt_eq, lit, lt, root},
+    scan::selection::Selection,
+};
 
 /// A numeric literal for pushed-down column bounds ([`ColumnBound`]).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1098,11 +1102,41 @@ impl VixDocs {
     /// - `limit`: stop the scan after this many produced rows (LIMIT shapes; rows are stored
     ///   `_timestamp` DESC, so a DESC top-N stops at the first `limit` matching rows).
     /// - `decode_threads`: >1 decodes one file's chunks in parallel.
+    /// Compatibility surface for callers that still hold expanded row ids.
+    /// Core VIX scans use [`Self::scan_docs_selection_opts`] to retain their
+    /// compressed roaring representation.
     #[allow(clippy::too_many_arguments)]
     pub fn scan_docs_opts(
         &self,
         projection: Option<&[String]>,
         rows: Option<Vec<u64>>,
+        ts_range: Option<(i64, i64)>,
+        bounds: &[ColumnBound],
+        limit: Option<u64>,
+        decode_threads: usize,
+        on_batch: &mut dyn FnMut(RecordBatch) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let selection = rows.map(|mut rows| {
+            rows.sort_unstable();
+            rows.dedup();
+            Selection::IncludeByIndex(Buffer::from(rows))
+        });
+        self.scan_docs_selection_opts(
+            projection,
+            selection,
+            ts_range,
+            bounds,
+            limit,
+            decode_threads,
+            on_batch,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn scan_docs_selection_opts(
+        &self,
+        projection: Option<&[String]>,
+        rows: Option<Selection>,
         ts_range: Option<(i64, i64)>,
         bounds: &[ColumnBound],
         limit: Option<u64>,
@@ -1165,11 +1199,11 @@ impl VixDocs {
             None
         };
         match rows {
-            Some(indices) => {
+            Some(selection) => {
                 scan_blob_streaming(
                     &self.docs_blob,
                     names.as_deref(),
-                    RowSelection::Indices(indices),
+                    RowSelection::Vortex(selection),
                     filter,
                     limit,
                     decode_threads,
@@ -1501,11 +1535,39 @@ impl VixDocs {
     /// (memory-accounting hook); its error aborts the scan. Errors when the
     /// file has no proven piecewise decomposition — callers route such
     /// files to a real sort instead.
+    /// Compatibility surface for callers that still hold expanded row ids.
     #[allow(clippy::too_many_arguments)]
     pub fn scan_docs_ts_desc_merged(
         &self,
         projection: Option<&[String]>,
         rows: Option<Vec<u64>>,
+        ts_range: Option<(i64, i64)>,
+        bounds: &[ColumnBound],
+        limit: Option<u64>,
+        on_region_open: &mut dyn FnMut() -> anyhow::Result<()>,
+        on_batch: &mut dyn FnMut(RecordBatch) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let selection = rows.map(|mut rows| {
+            rows.sort_unstable();
+            rows.dedup();
+            Selection::IncludeByIndex(Buffer::from(rows))
+        });
+        self.scan_docs_ts_desc_merged_selection(
+            projection,
+            selection,
+            ts_range,
+            bounds,
+            limit,
+            on_region_open,
+            on_batch,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn scan_docs_ts_desc_merged_selection(
+        &self,
+        projection: Option<&[String]>,
+        rows: Option<Selection>,
         ts_range: Option<(i64, i64)>,
         bounds: &[ColumnBound],
         limit: Option<u64>,
@@ -1560,30 +1622,74 @@ impl VixDocs {
         // per-region work: chunk-pruned scan ranges, or the selection split
         enum RegionWork {
             Ranges(Vec<std::ops::Range<u64>>),
-            Indices(Vec<u64>),
+            Selection(Selection, Option<std::ops::Range<u64>>),
         }
         let pruned = if rows.is_none() {
             self.pruned_scan_ranges(ts_range, bounds)
         } else {
             None
         };
-        let selection = rows.map(|mut indices| {
-            indices.sort_unstable();
-            indices.dedup();
-            indices
-        });
+        let selection = rows;
+        // Partition one roaring selection across the ascending, disjoint
+        // regions in one pass. Each row id stays absolute; ids outside every
+        // declared region are ignored defensively.
+        let mut roaring_by_region: Option<Vec<Option<Selection>>> = match &selection {
+            Some(Selection::IncludeRoaring(rows)) => {
+                let mut by_region: Vec<Option<Selection>> = (0..regions.len())
+                    .map(|_| {
+                        Some(Selection::IncludeRoaring(
+                            std::iter::empty::<u64>().collect(),
+                        ))
+                    })
+                    .collect();
+                let mut region_index = 0usize;
+                for row in rows.iter() {
+                    while region_index < regions.len() && row >= regions[region_index].end {
+                        region_index += 1;
+                    }
+                    if region_index == regions.len() {
+                        break;
+                    }
+                    let region = &regions[region_index];
+                    if row >= region.start
+                        && let Some(Selection::IncludeRoaring(selected)) =
+                            by_region[region_index].as_mut()
+                    {
+                        selected.insert(row);
+                    }
+                }
+                Some(by_region)
+            }
+            _ => None,
+        };
         let zone = self.zone_chunks();
         let mut work: Vec<(RegionWork, i64)> = Vec::new(); // (work, ts upper bound)
-        for region in &regions {
+        for (region_index, region) in regions.iter().enumerate() {
             let item = match &selection {
-                Some(indices) => {
+                Some(Selection::IncludeByIndex(indices)) => {
                     let start = indices.partition_point(|&row| row < region.start);
                     let end = indices.partition_point(|&row| row < region.end);
                     if start == end {
                         continue;
                     }
-                    RegionWork::Indices(indices[start..end].to_vec())
+                    RegionWork::Selection(
+                        Selection::IncludeByIndex(indices.slice(start..end)),
+                        None,
+                    )
                 }
+                Some(Selection::IncludeRoaring(_)) => {
+                    let Some(Selection::IncludeRoaring(selected)) = roaring_by_region
+                        .as_mut()
+                        .and_then(|by_region| by_region[region_index].take())
+                    else {
+                        unreachable!("roaring regions initialized above")
+                    };
+                    if selected.is_empty() {
+                        continue;
+                    }
+                    RegionWork::Selection(Selection::IncludeRoaring(selected), None)
+                }
+                Some(selection) => RegionWork::Selection(selection.clone(), Some(region.clone())),
                 None => {
                     let ranges: Vec<std::ops::Range<u64>> = match &pruned {
                         None => vec![region.clone()],
@@ -1726,112 +1832,131 @@ impl VixDocs {
             })
             .collect();
         for (cursor, (item, _)) in cursors.iter_mut().zip(work.iter_mut()) {
-            cursor.work = Some(std::mem::replace(item, RegionWork::Indices(Vec::new())));
+            cursor.work = Some(std::mem::replace(
+                item,
+                RegionWork::Selection(Selection::All, None),
+            ));
         }
 
         let mut remaining = limit;
         std::thread::scope(|scope| -> anyhow::Result<()> {
-            // max-heap on (ts key, smaller region index wins ties)
-            let mut heap: std::collections::BinaryHeap<(i64, Reverse<usize>)> =
-                std::collections::BinaryHeap::new();
-            for (index, (_, bound)) in work.iter().enumerate() {
-                heap.push((*bound, Reverse(index)));
-            }
-            while let Some((_, Reverse(index))) = heap.pop() {
-                let cursor = &mut cursors[index];
-                if !cursor.opened {
-                    // open at its bound: spawn the region's scan stream
-                    on_region_open()?;
-                    cursor.opened = true;
-                    let (tx, rx) = std::sync::mpsc::sync_channel::<anyhow::Result<RecordBatch>>(1);
-                    let region_work = cursor.work.take().expect("unopened cursor has work");
-                    let scan_projection = scan_projection.clone();
-                    let filter = filter.clone();
-                    scope.spawn(move || {
-                        let names: Option<Vec<&str>> = scan_projection
-                            .as_ref()
-                            .map(|cols| cols.iter().map(String::as_str).collect());
-                        let run =
-                            |selection: RowSelection,
-                             tx: &std::sync::mpsc::SyncSender<anyhow::Result<RecordBatch>>|
-                             -> anyhow::Result<()> {
-                                scan_blob_streaming(
-                                    docs_blob,
-                                    names.as_deref(),
-                                    selection,
-                                    filter.clone(),
-                                    None,
-                                    0,
-                                    &mut |batch| {
-                                        tx.send(Ok(batch)).map_err(|_| {
-                                            VixError::Callback(anyhow::anyhow!(
-                                                "merge consumer dropped"
-                                            ))
-                                        })
+            let result = (|| -> anyhow::Result<()> {
+                // max-heap on (ts key, smaller region index wins ties)
+                let mut heap: std::collections::BinaryHeap<(i64, Reverse<usize>)> =
+                    std::collections::BinaryHeap::new();
+                for (index, (_, bound)) in work.iter().enumerate() {
+                    heap.push((*bound, Reverse(index)));
+                }
+                while let Some((_, Reverse(index))) = heap.pop() {
+                    let cursor = &mut cursors[index];
+                    if !cursor.opened {
+                        // open at its bound: spawn the region's scan stream
+                        on_region_open()?;
+                        cursor.opened = true;
+                        let (tx, rx) =
+                            std::sync::mpsc::sync_channel::<anyhow::Result<RecordBatch>>(1);
+                        let region_work = cursor.work.take().expect("unopened cursor has work");
+                        let scan_projection = scan_projection.clone();
+                        let filter = filter.clone();
+                        scope.spawn(move || {
+                            let names: Option<Vec<&str>> = scan_projection
+                                .as_ref()
+                                .map(|cols| cols.iter().map(String::as_str).collect());
+                            let run =
+                                |selection: RowSelection,
+                                 tx: &std::sync::mpsc::SyncSender<anyhow::Result<RecordBatch>>|
+                                 -> anyhow::Result<()> {
+                                    scan_blob_streaming(
+                                        docs_blob,
+                                        names.as_deref(),
+                                        selection,
+                                        filter.clone(),
+                                        None,
+                                        0,
+                                        &mut |batch| {
+                                            tx.send(Ok(batch)).map_err(|_| {
+                                                VixError::Callback(anyhow::anyhow!(
+                                                    "merge consumer dropped"
+                                                ))
+                                            })
+                                        },
+                                    )?;
+                                    Ok(())
+                                };
+                            let result = match region_work {
+                                RegionWork::Ranges(ranges) => ranges
+                                    .into_iter()
+                                    .try_for_each(|range| run(RowSelection::Range(range), &tx)),
+                                RegionWork::Selection(selection, range) => run(
+                                    match range {
+                                        Some(range) => RowSelection::VortexRange(selection, range),
+                                        None => RowSelection::Vortex(selection),
                                     },
-                                )?;
-                                Ok(())
+                                    &tx,
+                                ),
                             };
-                        let result = match region_work {
-                            RegionWork::Ranges(ranges) => ranges
-                                .into_iter()
-                                .try_for_each(|range| run(RowSelection::Range(range), &tx)),
-                            RegionWork::Indices(indices) => {
-                                run(RowSelection::Indices(indices), &tx)
+                            if let Err(e) = result {
+                                // consumer may be gone (limit/cancel): ignore
+                                let _ = tx.send(Err(e));
                             }
-                        };
-                        if let Err(e) = result {
-                            // consumer may be gone (limit/cancel): ignore
-                            let _ = tx.send(Err(e));
+                        });
+                        cursor.rx = Some(rx);
+                        if cursor.fetch(ts_index)? {
+                            heap.push((cursor.ts, Reverse(index)));
                         }
-                    });
-                    cursor.rx = Some(rx);
-                    if cursor.fetch(ts_index)? {
-                        heap.push((cursor.ts, Reverse(index)));
+                        continue;
                     }
-                    continue;
-                }
-                // opened cursor at its ACTUAL current ts: emit its run down
-                // to the next-best key (rows are non-increasing per region)
-                let next_key = heap.peek().map(|(key, _)| *key).unwrap_or(i64::MIN);
-                loop {
-                    let batch = cursor.batch.as_ref().expect("open cursor holds a batch");
-                    let values = Cursor::ts_values(batch, ts_index)?;
-                    // rows [pos..end) all have ts >= next_key
-                    let end =
-                        cursor.pos + values[cursor.pos..].partition_point(|&ts| ts >= next_key);
-                    let mut take = end - cursor.pos;
-                    if let Some(left) = remaining {
-                        take = take.min(left as usize);
-                    }
-                    if take > 0 {
-                        emit(batch, cursor.pos, take, on_batch)?;
-                        cursor.pos += take;
-                        if let Some(left) = remaining.as_mut() {
-                            *left -= take as u64;
-                            if *left == 0 {
-                                return Ok(());
+                    // opened cursor at its ACTUAL current ts: emit its run down
+                    // to the next-best key (rows are non-increasing per region)
+                    let next_key = heap.peek().map(|(key, _)| *key).unwrap_or(i64::MIN);
+                    loop {
+                        let batch = cursor.batch.as_ref().expect("open cursor holds a batch");
+                        let values = Cursor::ts_values(batch, ts_index)?;
+                        // rows [pos..end) all have ts >= next_key
+                        let end =
+                            cursor.pos + values[cursor.pos..].partition_point(|&ts| ts >= next_key);
+                        let mut take = end - cursor.pos;
+                        if let Some(left) = remaining {
+                            take = take.min(left as usize);
+                        }
+                        if take > 0 {
+                            emit(batch, cursor.pos, take, on_batch)?;
+                            cursor.pos += take;
+                            if let Some(left) = remaining.as_mut() {
+                                *left -= take as u64;
+                                if *left == 0 {
+                                    return Ok(());
+                                }
                             }
                         }
-                    }
-                    if cursor.pos < batch.num_rows() {
-                        // stopped at a row below next_key: yield the turn
-                        cursor.ts = values[cursor.pos];
-                        heap.push((cursor.ts, Reverse(index)));
-                        break;
-                    }
-                    // batch drained: pull the next one and keep emitting
-                    // while it still tops next_key
-                    if !cursor.fetch(ts_index)? {
-                        break; // region exhausted
-                    }
-                    if cursor.ts < next_key {
-                        heap.push((cursor.ts, Reverse(index)));
-                        break;
+                        if cursor.pos < batch.num_rows() {
+                            // stopped at a row below next_key: yield the turn
+                            cursor.ts = values[cursor.pos];
+                            heap.push((cursor.ts, Reverse(index)));
+                            break;
+                        }
+                        // batch drained: pull the next one and keep emitting
+                        // while it still tops next_key
+                        if !cursor.fetch(ts_index)? {
+                            break; // region exhausted
+                        }
+                        if cursor.ts < next_key {
+                            heap.push((cursor.ts, Reverse(index)));
+                            break;
+                        }
                     }
                 }
+                Ok(())
+            })();
+            // The scoped producers may be blocked on their one-slot
+            // channels when LIMIT, cancellation, or the downstream callback
+            // exits early. Drop every receiver before `scope` joins them so
+            // blocked sends wake and unwind; retain the original result.
+            for cursor in &mut cursors {
+                cursor.rx.take();
+                cursor.batch.take();
             }
-            Ok(())
+            result
         })
     }
 

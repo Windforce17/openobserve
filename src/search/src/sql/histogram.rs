@@ -256,7 +256,6 @@ fn extract_where_clause(statement: &Statement) -> Result<String, Error> {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::{

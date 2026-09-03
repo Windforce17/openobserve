@@ -910,9 +910,9 @@ struct EncodedRunState {
 
 /// The output of [`VixWriter::merge_input_indexes`], consumed by `finish`.
 struct PrebuiltIndex {
-    /// The index blob bytes; `None` when the merged inputs have no terms
-    /// at all.
-    blobs: Option<IndexBlobs>,
+    /// Container-ready index blob payloads; `None` when the merged inputs
+    /// have no terms at all.
+    blobs: Option<IndexBlobParts>,
     term_count: u64,
     /// Per-file value-bloom hashes collected by the merge workers.
     bloom: crate::bloom::BloomHashAcc,
@@ -1594,6 +1594,7 @@ impl VixWriter {
             self.opts.postings_plist_min_docs,
             threads,
             self.opts.merge_kway_threads,
+            self.opts.term_spill_dir.as_deref(),
         )?;
         for reader in inputs {
             self.partial_fields
@@ -3281,11 +3282,7 @@ impl VixWriter {
                         prebuilt.expected_rows
                     )));
                 }
-                (
-                    prebuilt.blobs.map(IndexBlobParts::from),
-                    prebuilt.term_count,
-                    prebuilt.bloom,
-                )
+                (prebuilt.blobs, prebuilt.term_count, prebuilt.bloom)
             }
             None => {
                 // #52/M7 first-encode AUTO demotion: with the full term map

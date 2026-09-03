@@ -96,8 +96,7 @@ impl<'n> TreeNodeVisitor<'n> for SimpleMinMaxVisitor<'_> {
 
     fn f_down(&mut self, node: &'n Self::Node) -> Result<TreeNodeRecursion> {
         if let Some(aggregate) = node.downcast_ref::<AggregateExec>() {
-            let derived = if aggregate.group_expr().is_empty() && aggregate.aggr_expr().len() == 1
-            {
+            let derived = if aggregate.group_expr().is_empty() && aggregate.aggr_expr().len() == 1 {
                 min_max_column_aggregate(&aggregate.aggr_expr()[0]).filter(|(field, _)| {
                     field == TIMESTAMP_COL_NAME || self.index_fields.contains(field)
                 })

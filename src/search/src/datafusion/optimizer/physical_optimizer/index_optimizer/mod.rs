@@ -674,22 +674,23 @@ mod tests {
             ),
             (
                 "SELECT max(_timestamp) FROM t",
-                Some(IndexOptimizeMode::SimpleMinMax("_timestamp".to_string(), true)),
+                Some(IndexOptimizeMode::SimpleMinMax(
+                    "_timestamp".to_string(),
+                    true,
+                )),
             ),
             // strings are prefix-bounded: min/max never fast-paths them
             ("SELECT min(name) FROM t", None),
             // count(*) keeps its own mode
-            ("SELECT count(*) FROM t", Some(IndexOptimizeMode::SimpleCount)),
+            (
+                "SELECT count(*) FROM t",
+                Some(IndexOptimizeMode::SimpleCount),
+            ),
         ];
         for (sql, expected) in cases {
-            let mode = follower_extracted_mode(
-                sql,
-                Arc::clone(&schema),
-                time_range,
-                0,
-                fields.clone(),
-            )
-            .await;
+            let mode =
+                follower_extracted_mode(sql, Arc::clone(&schema), time_range, 0, fields.clone())
+                    .await;
             assert_eq!(mode, expected, "{sql}");
         }
     }

@@ -58,14 +58,13 @@ pub enum MergeParquetResult {
 /// `single_partition_sort` (M13/M20b): plan the `ORDER BY` at exactly one
 /// partition — no RepartitionExec, one ExternalSorter that spills properly
 /// under pool pressure. Callers with BOUNDED inputs pass `true`:
-/// - SEGMENT-BUILDER invocations (M13): one bounded in-memory batch
-///   (≤ the super-batch budget), where the repartitioned 2-partition sort
-///   was prod's post-.108 "Not enough memory to continue external sort"
-///   source (default/metadata/trace_list_index L0 builds; the M12 fix-1
-///   rationale applies verbatim).
-/// - COMPACTOR invocations for METADATA-class streams (M20b): size-capped
-///   merge groups whose repartitioned min-floor plan was prod's compactor
-///   killer (116MB→6GB DataFusion spikes in ~2s on trace_list_index).
+/// - SEGMENT-BUILDER invocations (M13): one bounded in-memory batch (≤ the super-batch budget),
+///   where the repartitioned 2-partition sort was prod's post-.108 "Not enough memory to continue
+///   external sort" source (default/metadata/trace_list_index L0 builds; the M12 fix-1 rationale
+///   applies verbatim).
+/// - COMPACTOR invocations for METADATA-class streams (M20b): size-capped merge groups whose
+///   repartitioned min-floor plan was prod's compactor killer (116MB→6GB DataFusion spikes in ~2s
+///   on trace_list_index).
 ///
 /// The ingester WAL move job and non-metadata compactor merges keep `false`
 /// (unchanged planning).
@@ -379,11 +378,14 @@ mod tests {
             Field::new("trace_id", DataType::Utf8, true),
             Field::new("service_name", DataType::Utf8, true),
         ]));
-        let batch = arrow::record_batch::RecordBatch::try_new(schema.clone(), vec![
-            Arc::new(Int64Array::from(vec![3i64, 1, 2])),
-            Arc::new(StringArray::from(vec!["a", "b", "c"])),
-            Arc::new(StringArray::from(vec!["s1", "s2", "s1"])),
-        ])
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![3i64, 1, 2])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+                Arc::new(StringArray::from(vec!["s1", "s2", "s1"])),
+            ],
+        )
         .unwrap();
 
         let plan_for = |single: bool| {
@@ -397,10 +399,9 @@ mod tests {
                     .build(get_config().limit.datafusion_min_partition_num)
                     .await
                     .unwrap();
-                let table = datafusion::datasource::MemTable::try_new(schema.clone(), vec![vec![
-                    batch,
-                ]])
-                .unwrap();
+                let table =
+                    datafusion::datasource::MemTable::try_new(schema.clone(), vec![vec![batch]])
+                        .unwrap();
                 ctx.register_table("tbl", Arc::new(table)).unwrap();
                 let sql = format!("SELECT * FROM tbl ORDER BY {TIMESTAMP_COL_NAME} DESC");
                 let logical = ctx.state().create_logical_plan(&sql).await.unwrap();
@@ -408,8 +409,15 @@ mod tests {
                 let display = datafusion::physical_plan::displayable(physical.as_ref())
                     .indent(false)
                     .to_string();
-                let partitions = physical.properties().output_partitioning().partition_count();
-                (ctx.state().config().target_partitions(), partitions, display)
+                let partitions = physical
+                    .properties()
+                    .output_partitioning()
+                    .partition_count();
+                (
+                    ctx.state().config().target_partitions(),
+                    partitions,
+                    display,
+                )
             }
         };
 
@@ -494,22 +502,25 @@ mod tests {
                 svc.push(format!("service-{}", r % 40));
                 op.push(format!("operation/{}/{}", r % 12, r % 97));
             }
-            let batch = arrow::record_batch::RecordBatch::try_new(schema.clone(), vec![
-                Arc::new(Int64Array::from(ts)),
-                Arc::new(StringArray::from(trace)),
-                Arc::new(StringArray::from(span)),
-                Arc::new(StringArray::from(svc)),
-                Arc::new(StringArray::from(op)),
-                Arc::new(Int64Array::from_iter_values(
-                    (0..ROWS_PER_BATCH).map(|_| next() as i64 % 1_000_000),
-                )),
-                Arc::new(Int64Array::from_iter_values(
-                    (0..ROWS_PER_BATCH).map(|_| next() as i64),
-                )),
-                Arc::new(Int64Array::from_iter_values(
-                    (0..ROWS_PER_BATCH).map(|_| next() as i64),
-                )),
-            ])
+            let batch = arrow::record_batch::RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(ts)),
+                    Arc::new(StringArray::from(trace)),
+                    Arc::new(StringArray::from(span)),
+                    Arc::new(StringArray::from(svc)),
+                    Arc::new(StringArray::from(op)),
+                    Arc::new(Int64Array::from_iter_values(
+                        (0..ROWS_PER_BATCH).map(|_| next() as i64 % 1_000_000),
+                    )),
+                    Arc::new(Int64Array::from_iter_values(
+                        (0..ROWS_PER_BATCH).map(|_| next() as i64),
+                    )),
+                    Arc::new(Int64Array::from_iter_values(
+                        (0..ROWS_PER_BATCH).map(|_| next() as i64),
+                    )),
+                ],
+            )
             .unwrap();
             total_bytes += batch.get_array_memory_size();
             batches.push(batch);
@@ -624,12 +635,15 @@ mod tests {
                 svc.push(format!("service-{}", r % 40));
                 trace.push(format!("{:032x}", (r as u128) << 64 | (b * i) as u128));
             }
-            let batch = arrow::record_batch::RecordBatch::try_new(schema.clone(), vec![
-                Arc::new(Int64Array::from(ts)),
-                Arc::new(StringArray::from(stream)),
-                Arc::new(StringArray::from(svc)),
-                Arc::new(StringArray::from(trace)),
-            ])
+            let batch = arrow::record_batch::RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(ts)),
+                    Arc::new(StringArray::from(stream)),
+                    Arc::new(StringArray::from(svc)),
+                    Arc::new(StringArray::from(trace)),
+                ],
+            )
             .unwrap();
             total_bytes += batch.get_array_memory_size();
             batches.push(batch);

@@ -912,8 +912,14 @@ pub fn service_routes() -> Router {
     // Query cancellation works on OSS since .82 (#36): fan-out to the
     // leader's abort registry
     router = router
-        .route("/{org_id}/query_manager/cancel", put(search::query_manager::cancel_multiple_query))
-        .route("/{org_id}/query_manager/{query_id}/cancel", delete(search::query_manager::cancel_query));
+        .route(
+            "/{org_id}/query_manager/cancel",
+            put(search::query_manager::cancel_multiple_query),
+        )
+        .route(
+            "/{org_id}/query_manager/{query_id}/cancel",
+            delete(search::query_manager::cancel_query),
+        );
 
     #[cfg(feature = "enterprise")]
     {

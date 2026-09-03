@@ -26,15 +26,131 @@ use o2_enterprise::enterprise::common::config::get_config as get_o2_config;
 use crate::service::compact;
 const ENRICHMENT_TABLE_MERGE_LOCK_KEY: &str = "/compact/enrichment_table";
 
+const MIB: usize = 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MergeConcurrencyResolution {
+    role_cpu: usize,
+    per_merge_threads: usize,
+    memory_ceiling_bytes: usize,
+    segment_budget_bytes: usize,
+    download_budget_bytes: usize,
+    memory_remainder_bytes: usize,
+    target_file_size_bytes: usize,
+    cpu_slots: usize,
+    memory_slots: usize,
+    total: usize,
+}
+
+fn scaled_floor(value: usize, numerator: usize, denominator: usize) -> usize {
+    (value / denominator)
+        .saturating_mul(numerator)
+        .saturating_add((value % denominator).saturating_mul(numerator) / denominator)
+}
+
+fn resolve_auto_merge_concurrency(
+    role_cpu: usize,
+    mem_total_bytes: usize,
+    configured_vix_merge_threads: usize,
+    max_file_size_bytes: usize,
+    traces_indexed_max_file_size_bytes: usize,
+    configured_segment_budget_mb: usize,
+    download_budget_mb: usize,
+) -> MergeConcurrencyResolution {
+    let role_cpu = role_cpu.max(1);
+    let per_merge_threads = if configured_vix_merge_threads == 0 {
+        role_cpu.min(8)
+    } else {
+        configured_vix_merge_threads.min(role_cpu)
+    };
+    let cpu_slots = (role_cpu.saturating_sub(per_merge_threads) / per_merge_threads).max(1);
+
+    let memory_ceiling_bytes = scaled_floor(mem_total_bytes, 4, 5);
+    let segment_budget_bytes = if configured_segment_budget_mb == 0 {
+        scaled_floor(mem_total_bytes, 2, 5)
+    } else {
+        configured_segment_budget_mb.saturating_mul(MIB)
+    }
+    .max(256 * MIB);
+    let download_budget_bytes = download_budget_mb.saturating_mul(MIB);
+    let memory_remainder_bytes = memory_ceiling_bytes
+        .saturating_sub(segment_budget_bytes)
+        .saturating_sub(download_budget_bytes);
+    let target_file_size_bytes = max_file_size_bytes
+        .max(traces_indexed_max_file_size_bytes)
+        .max(1);
+    let memory_slots = (memory_remainder_bytes / target_file_size_bytes).max(1);
+    let total = cpu_slots.min(memory_slots).max(1);
+
+    MergeConcurrencyResolution {
+        role_cpu,
+        per_merge_threads,
+        memory_ceiling_bytes,
+        segment_budget_bytes,
+        download_budget_bytes,
+        memory_remainder_bytes,
+        target_file_size_bytes,
+        cpu_slots,
+        memory_slots,
+        total,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AutoMergeTopology {
+    backlog_workers: usize,
+    backlog_scheduler_slots: usize,
+    live_workers: usize,
+    hot_scheduler_slots: usize,
+    recent_scheduler_slots: usize,
+}
+
+fn resolve_auto_merge_topology(
+    total: usize,
+    live_enabled: bool,
+    recent_enabled: bool,
+) -> AutoMergeTopology {
+    let total = total.max(1);
+    if !live_enabled {
+        return AutoMergeTopology {
+            backlog_workers: total,
+            backlog_scheduler_slots: total,
+            live_workers: 0,
+            hot_scheduler_slots: 0,
+            recent_scheduler_slots: 0,
+        };
+    }
+
+    let live_workers = total.saturating_sub(1).max(1);
+    let live_scheduler_slots = if recent_enabled {
+        live_workers.max(2)
+    } else {
+        live_workers
+    };
+    let recent_scheduler_slots = if recent_enabled {
+        live_scheduler_slots / 2
+    } else {
+        0
+    };
+    AutoMergeTopology {
+        backlog_workers: 1,
+        backlog_scheduler_slots: 1,
+        live_workers,
+        hot_scheduler_slots: live_scheduler_slots - recent_scheduler_slots,
+        recent_scheduler_slots,
+    }
+}
+
+fn recent_lane_is_valid(live_lookback_hours: i64, recent_lookback_hours: i64) -> bool {
+    recent_lookback_hours > 0 && recent_lookback_hours.max(1) > live_lookback_hours.max(1)
+}
+
 fn live_lane_job_split(
     live_job_num: usize,
     live_lookback_hours: i64,
     recent_lookback_hours: i64,
 ) -> (usize, usize) {
-    if live_job_num < 2
-        || recent_lookback_hours <= 0
-        || recent_lookback_hours.max(1) <= live_lookback_hours.max(1)
-    {
+    if live_job_num < 2 || !recent_lane_is_valid(live_lookback_hours, recent_lookback_hours) {
         return (live_job_num, 0);
     }
     let recent_job_num = live_job_num / 2;
@@ -68,44 +184,132 @@ pub async fn run() -> Result<(), anyhow::Error> {
     log::info!("[COMPACTOR::JOB] Compactor is enabled");
 
     let (main_handle, live_handle, recent_handle) = if lease_generation_enabled {
-        let mut worker = compact::worker::MergeWorker::new(cfg.limit.file_merge_thread_num);
+        let configured_main_job_num = if cfg.compact.job_num > 0 {
+            cfg.compact.job_num
+        } else {
+            cfg.limit.file_merge_thread_num
+        };
+        let live_lanes_enabled = cfg.compact.live_job_num > 0;
+        let recent_lane_valid = recent_lane_is_valid(
+            cfg.compact.live_lookback_hours,
+            cfg.compact.recent_lookback_hours,
+        );
+
+        let (
+            backlog_worker_num,
+            backlog_job_num,
+            live_worker_num,
+            live_job_num,
+            execution_gate_capacity,
+        ) = if cfg.compact.auto_merge_concurrency {
+            let role_divisor = config::cluster::cpu_role_divisor();
+            let role_cpu = (cfg.limit.cpu_num / role_divisor).max(1);
+            let resolution = resolve_auto_merge_concurrency(
+                role_cpu,
+                cfg.limit.mem_total,
+                cfg.common.vix_merge_thread_num,
+                cfg.compact.max_file_size,
+                cfg.compact.traces_indexed_max_file_size,
+                cfg.common.segment_build_memory_budget_mb,
+                cfg.compact.download_budget_mb,
+            );
+            let topology = resolve_auto_merge_topology(
+                resolution.total,
+                live_lanes_enabled,
+                recent_lane_valid,
+            );
+            let live_job_num = topology.hot_scheduler_slots + topology.recent_scheduler_slots;
+            log::info!(
+                "[COMPACTOR::JOB] auto merge concurrency: cgroup_cpu={} resolved_cpu={} role_divisor={} role_cpu={} cgroup_memory_mib={} configured_vix_merge_threads={} per_merge_threads={} configured_segment_budget_mib={} effective_segment_budget_mib={} download_budget_mib={} global_target_mib={} traces_indexed_target_mib={} effective_target_mib={} memory_ceiling_mib={} memory_remainder_mib={} cpu_slots={} memory_slots={} total={} backlog_workers={} backlog_scheduler_slots={} live_workers={} hot_scheduler_slots={} recent_scheduler_slots={}",
+                cfg.limit.real_cpu_num,
+                cfg.limit.cpu_num,
+                role_divisor,
+                resolution.role_cpu,
+                cfg.limit.mem_total / MIB,
+                cfg.common.vix_merge_thread_num,
+                resolution.per_merge_threads,
+                cfg.common.segment_build_memory_budget_mb,
+                resolution.segment_budget_bytes / MIB,
+                resolution.download_budget_bytes / MIB,
+                cfg.compact.max_file_size / MIB,
+                cfg.compact.traces_indexed_max_file_size / MIB,
+                resolution.target_file_size_bytes / MIB,
+                resolution.memory_ceiling_bytes / MIB,
+                resolution.memory_remainder_bytes / MIB,
+                resolution.cpu_slots,
+                resolution.memory_slots,
+                resolution.total,
+                topology.backlog_workers,
+                topology.backlog_scheduler_slots,
+                topology.live_workers,
+                topology.hot_scheduler_slots,
+                topology.recent_scheduler_slots,
+            );
+            (
+                topology.backlog_workers,
+                topology.backlog_scheduler_slots,
+                topology.live_workers,
+                live_job_num,
+                resolution.total,
+            )
+        } else {
+            let live_worker_num = cfg.compact.live_worker_num.max(1);
+            let execution_gate_capacity = cfg
+                .limit
+                .file_merge_thread_num
+                .saturating_add(if live_lanes_enabled {
+                    live_worker_num
+                } else {
+                    0
+                })
+                .max(1);
+            (
+                cfg.limit.file_merge_thread_num,
+                configured_main_job_num,
+                live_worker_num,
+                cfg.compact.live_job_num,
+                execution_gate_capacity,
+            )
+        };
+
+        let execution_gate = compact::worker::MergeExecutionGate::new(execution_gate_capacity);
+        let mut worker = compact::worker::MergeWorker::new_with_execution_gate(
+            backlog_worker_num,
+            execution_gate.clone(),
+        );
         if let Err(e) = worker.run() {
             log::error!("[COMPACTOR::JOB] start merge worker error: {e}");
         }
 
         // Physical scheduler slots (concurrent jobs) are decoupled from merge
         // workers. Logical lanes share these slots through LaneAdmission.
-        let job_num = if cfg.compact.job_num > 0 {
-            cfg.compact.job_num
-        } else {
-            cfg.limit.file_merge_thread_num
-        };
-        let mut scheduler = compact::worker::JobScheduler::new(job_num, worker.tx());
+        let mut scheduler = compact::worker::JobScheduler::new(backlog_job_num, worker.tx());
         if let Err(e) = scheduler.run() {
             log::error!("[COMPACTOR::JOB] start merge job scheduler error: {e}");
         }
         let main_physical = scheduler.physical_handle();
 
-        // Hot and recent keep their existing MergeWorker transport and
-        // physical scheduler pools. Admission may borrow an idle physical
-        // slot, in which case that slot's transport executes the job.
-        let (live_physical, recent_physical) = if cfg.compact.live_job_num > 0 {
+        // Hot and recent keep their existing shared MergeWorker transport.
+        // The process-wide execution gate caps aggregate work across all lanes.
+        let (live_physical, recent_physical) = if live_job_num > 0 {
             let (hot_job_num, recent_job_num) = live_lane_job_split(
-                cfg.compact.live_job_num,
+                live_job_num,
                 cfg.compact.live_lookback_hours,
                 cfg.compact.recent_lookback_hours,
             );
             if cfg.compact.recent_lookback_hours > 0 && recent_job_num == 0 {
                 log::warn!(
-                    "[COMPACTOR::JOB] recent merge lane disabled: require ZO_COMPACT_RECENT_LOOKBACK_HOURS > ZO_COMPACT_LIVE_LOOKBACK_HOURS and ZO_COMPACT_LIVE_JOB_NUM >= 2; recent_lookback_hours={} live_lookback_hours={} live_job_num={}",
+                    "[COMPACTOR::JOB] recent merge lane disabled: require ZO_COMPACT_RECENT_LOOKBACK_HOURS > ZO_COMPACT_LIVE_LOOKBACK_HOURS and at least 2 live scheduler slots; recent_lookback_hours={} live_lookback_hours={} live_job_num={}",
                     cfg.compact.recent_lookback_hours,
                     cfg.compact.live_lookback_hours,
-                    cfg.compact.live_job_num,
+                    live_job_num,
                 );
             }
 
-            let mut live_worker =
-                compact::worker::MergeWorker::new(cfg.compact.live_worker_num.max(1));
+            let mut live_worker = compact::worker::MergeWorker::new_with_execution_gate(
+                live_worker_num,
+                execution_gate.clone(),
+            );
             if let Err(e) = live_worker.run() {
                 log::error!("[COMPACTOR::JOB] start live merge worker error: {e}");
             }
@@ -524,7 +728,14 @@ async fn run_enrichment_table_merge() -> Result<(), anyhow::Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::live_lane_job_split;
+    use super::{
+        AutoMergeTopology, MIB, live_lane_job_split, resolve_auto_merge_concurrency,
+        resolve_auto_merge_topology,
+    };
+
+    fn gib(value: usize) -> usize {
+        value * 1024 * MIB
+    }
 
     #[test]
     fn recent_lane_splits_existing_live_capacity_only_when_valid() {
@@ -536,5 +747,115 @@ mod tests {
         assert_eq!(live_lane_job_split(2, 2, 2), (2, 0));
         assert_eq!(live_lane_job_split(2, 2, 24), (1, 1));
         assert_eq!(live_lane_job_split(7, 2, 24), (4, 3));
+    }
+
+    #[test]
+    fn production_limits_resolve_three_merges() {
+        let resolution = resolve_auto_merge_concurrency(16, gib(60), 4, gib(2), gib(8), 8192, 2048);
+
+        assert_eq!(resolution.per_merge_threads, 4);
+        assert_eq!(resolution.cpu_slots, 3);
+        assert_eq!(resolution.memory_slots, 4);
+        assert_eq!(resolution.total, 3);
+    }
+
+    #[test]
+    fn cpu_slots_bound_total_concurrency() {
+        let resolution = resolve_auto_merge_concurrency(32, gib(128), 0, gib(1), 0, 1024, 0);
+
+        assert_eq!(resolution.per_merge_threads, 8);
+        assert_eq!(resolution.cpu_slots, 3);
+        assert!(resolution.memory_slots > resolution.cpu_slots);
+        assert_eq!(resolution.total, 3);
+    }
+
+    #[test]
+    fn memory_slots_bound_total_concurrency() {
+        let resolution = resolve_auto_merge_concurrency(64, gib(20), 1, gib(4), 0, 4096, 4096);
+
+        assert_eq!(resolution.cpu_slots, 63);
+        assert_eq!(resolution.memory_slots, 2);
+        assert_eq!(resolution.total, 2);
+    }
+
+    #[test]
+    fn concurrency_never_falls_below_one() {
+        let resolution = resolve_auto_merge_concurrency(1, gib(1), 8, gib(8), 0, 8192, 2048);
+
+        assert_eq!(resolution.per_merge_threads, 1);
+        assert_eq!(resolution.cpu_slots, 1);
+        assert_eq!(resolution.memory_slots, 1);
+        assert_eq!(resolution.total, 1);
+    }
+
+    #[test]
+    fn larger_trace_target_controls_memory_slots() {
+        let trace_target = resolve_auto_merge_concurrency(64, gib(40), 1, gib(2), gib(8), 8192, 0);
+        let global_target = resolve_auto_merge_concurrency(64, gib(40), 1, gib(2), gib(1), 8192, 0);
+
+        assert_eq!(trace_target.target_file_size_bytes, gib(8));
+        assert_eq!(trace_target.memory_slots, 3);
+        assert_eq!(global_target.target_file_size_bytes, gib(2));
+        assert_eq!(global_target.memory_slots, 12);
+    }
+
+    #[test]
+    fn zero_segment_budget_reserves_forty_percent_of_memory() {
+        let resolution = resolve_auto_merge_concurrency(64, gib(60), 1, gib(8), 0, 0, 0);
+
+        assert_eq!(resolution.segment_budget_bytes, gib(24));
+        assert_eq!(resolution.memory_ceiling_bytes, gib(48));
+        assert_eq!(resolution.memory_slots, 3);
+    }
+
+    #[test]
+    fn configured_segment_budget_uses_the_builder_floor() {
+        let resolution = resolve_auto_merge_concurrency(4, gib(4), 1, 512 * MIB, 0, 1, 2048);
+
+        assert_eq!(resolution.segment_budget_bytes, 256 * MIB);
+        assert_eq!(resolution.memory_slots, 1);
+        assert_eq!(resolution.total, 1);
+    }
+
+    #[test]
+    fn auto_topology_shares_live_workers_with_valid_recent_lane() {
+        assert_eq!(
+            resolve_auto_merge_topology(3, true, true),
+            AutoMergeTopology {
+                backlog_workers: 1,
+                backlog_scheduler_slots: 1,
+                live_workers: 2,
+                hot_scheduler_slots: 1,
+                recent_scheduler_slots: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn auto_topology_uses_all_capacity_for_backlog_when_live_is_disabled() {
+        assert_eq!(
+            resolve_auto_merge_topology(3, false, true),
+            AutoMergeTopology {
+                backlog_workers: 3,
+                backlog_scheduler_slots: 3,
+                live_workers: 0,
+                hot_scheduler_slots: 0,
+                recent_scheduler_slots: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn auto_topology_total_one_still_schedules_hot_and_recent() {
+        assert_eq!(
+            resolve_auto_merge_topology(1, true, true),
+            AutoMergeTopology {
+                backlog_workers: 1,
+                backlog_scheduler_slots: 1,
+                live_workers: 1,
+                hot_scheduler_slots: 1,
+                recent_scheduler_slots: 1,
+            }
+        );
     }
 }

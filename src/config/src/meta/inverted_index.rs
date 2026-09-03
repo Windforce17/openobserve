@@ -96,11 +96,7 @@ impl std::fmt::Display for IndexOptimizeMode {
             IndexOptimizeMode::SimpleCount => write!(f, "count"),
             IndexOptimizeMode::SimpleCountField(field) => write!(f, "count(field: {field})"),
             IndexOptimizeMode::SimpleMinMax(field, is_max) => {
-                write!(
-                    f,
-                    "{}(field: {field})",
-                    if *is_max { "max" } else { "min" }
-                )
+                write!(f, "{}(field: {field})", if *is_max { "max" } else { "min" })
             }
             IndexOptimizeMode::SimpleHistogram(min_value, bucket_width, num_buckets, ts_offset) => {
                 write!(

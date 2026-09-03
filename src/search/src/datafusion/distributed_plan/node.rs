@@ -23,7 +23,6 @@ use datafusion::common::TableReference;
 use hashbrown::HashMap;
 use proto::cluster_rpc::{IndexInfo, KvItem, QueryIdentifier, SearchInfo, SuperClusterInfo};
 
-
 #[derive(Debug, Clone)]
 pub struct RemoteScanNodes {
     pub req: Request,

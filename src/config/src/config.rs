@@ -1892,19 +1892,6 @@ pub struct Common {
     )]
     pub vix_merge_kway_threads: usize,
     #[env_config(
-        name = "ZO_VIX_MERGE_TYPE_POLICY",
-        default = "legacy",
-        help = "Type target and column-derivation policy for VIX compaction rebuilds. 'legacy' \
-                keeps the current latest-schema target and requires derivation-equivalent input \
-                types; 'latest_schema' keeps that target and additionally admits Boolean/integer/\
-                finite-float to string-family casts. Reverse parsing and numeric narrowing remain \
-                on the _source fallback. When such a cast is admitted over complete columns, the \
-                opt-in mode rewrites both docs and _source to the authoritative string type so \
-                later heals and legacy rollback reproduce identical terms. Start dark and canary \
-                on compactor pods only."
-    )]
-    pub vix_merge_type_policy: String,
-    #[env_config(
         name = "ZO_VIX_REBUILD_CONCURRENCY",
         default = 0,
         help = "M12: process-wide admission for REBUILD-path compaction merges (decode + \
@@ -2767,6 +2754,12 @@ pub struct Limit {
 pub struct Compact {
     #[env_config(name = "ZO_COMPACT_ENABLED", default = true)]
     pub enabled: bool,
+    #[env_config(
+        name = "ZO_COMPACT_AUTO_MERGE_CONCURRENCY",
+        default = false,
+        help = "Opt in to resolving one deterministic process-wide merge concurrency at compactor startup from the cgroup CPU and memory limits, configured maximum merge size, Segment-WAL memory budget, and compaction download budget. Sizing uses configured maxima only; it does not react to runtime CPU/RSS feedback or per-batch byte estimates."
+    )]
+    pub auto_merge_concurrency: bool,
     #[env_config(
         name = "ZO_COMPACT_LEASE_GENERATION_ENABLED",
         default = false,
@@ -4726,19 +4719,6 @@ fn check_inverted_index_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
             cfg.common.vix_read_mode
         ));
     }
-    cfg.common.vix_merge_type_policy = cfg.common.vix_merge_type_policy.trim().to_lowercase();
-    if cfg.common.vix_merge_type_policy.is_empty() {
-        cfg.common.vix_merge_type_policy = "legacy".to_string();
-    }
-    if !matches!(
-        cfg.common.vix_merge_type_policy.as_str(),
-        "legacy" | "latest_schema"
-    ) {
-        return Err(anyhow::anyhow!(
-            "ZO_VIX_MERGE_TYPE_POLICY must be 'legacy' or 'latest_schema', got {:?}",
-            cfg.common.vix_merge_type_policy
-        ));
-    }
     if cfg.limit.inverted_index_result_cache_max_entries == 0 {
         cfg.limit.inverted_index_result_cache_max_entries = 100000;
     }
@@ -5466,7 +5446,6 @@ mod tests {
     #[test]
     fn test_check_inverted_index_config_defaults() {
         let mut cfg = Config::default();
-        cfg.common.vix_merge_type_policy.clear();
         cfg.limit.inverted_index_result_cache_max_entries = 0;
         cfg.limit.inverted_index_result_cache_max_entry_size = 0;
         cfg.limit.inverted_index_result_cache_max_size = 0;
@@ -5480,13 +5459,11 @@ mod tests {
         assert_eq!(cfg.limit.inverted_index_skip_threshold, 35);
         assert_eq!(cfg.limit.inverted_index_min_token_length, 2);
         assert_eq!(cfg.limit.inverted_index_max_token_length, 64);
-        assert_eq!(cfg.common.vix_merge_type_policy, "legacy");
     }
 
     #[test]
     fn test_check_inverted_index_config_preserves_existing() {
         let mut cfg = Config::default();
-        cfg.common.vix_merge_type_policy = " Latest_Schema ".to_string();
         cfg.limit.inverted_index_result_cache_max_entries = 5000;
         cfg.limit.inverted_index_min_token_length = 3;
         cfg.limit.inverted_index_max_token_length = 32;
@@ -5494,15 +5471,6 @@ mod tests {
         assert_eq!(cfg.limit.inverted_index_result_cache_max_entries, 5000);
         assert_eq!(cfg.limit.inverted_index_min_token_length, 3);
         assert_eq!(cfg.limit.inverted_index_max_token_length, 32);
-        assert_eq!(cfg.common.vix_merge_type_policy, "latest_schema");
-    }
-
-    #[test]
-    fn test_check_inverted_index_config_rejects_unknown_merge_type_policy() {
-        let mut cfg = Config::default();
-        cfg.common.vix_merge_type_policy = "guess".to_string();
-        let error = check_inverted_index_config(&mut cfg).unwrap_err();
-        assert!(error.to_string().contains("ZO_VIX_MERGE_TYPE_POLICY"));
     }
 
     #[test]

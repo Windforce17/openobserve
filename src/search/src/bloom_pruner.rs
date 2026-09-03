@@ -658,8 +658,7 @@ fn collect_decidable(
                     // all files (no per-field section there) — allow the
                     // per-group composite fallback where the key form can
                     // carry the field
-                    p.composite_fallback =
-                        composite_enabled && p.field.len() <= u16::MAX as usize;
+                    p.composite_fallback = composite_enabled && p.field.len() <= u16::MAX as usize;
                     p
                 })
                 .or_else(|| {
@@ -712,7 +711,7 @@ fn try_predicate(
                 field: field.clone(),
                 values: values.clone(),
                 composite: false,
-            composite_fallback: false,
+                composite_fallback: false,
             })
         }
         Condition::Or(left, right) => {
@@ -730,7 +729,7 @@ fn try_predicate(
                 field: lp.field,
                 values,
                 composite: false,
-            composite_fallback: false,
+                composite_fallback: false,
             })
         }
         _ => None,
@@ -1383,11 +1382,9 @@ mod tests {
                 .push_batch_with_source(&batch, &source, None)
                 .unwrap();
             let (data, index) = writer.finish().unwrap();
-            let reader = VixReader::open_with_index(
-                bytes::Bytes::from(data),
-                index.map(bytes::Bytes::from),
-            )
-            .unwrap();
+            let reader =
+                VixReader::open_with_index(bytes::Bytes::from(data), index.map(bytes::Bytes::from))
+                    .unwrap();
             assert_eq!(
                 reader.bloom_only_fields().collect::<Vec<_>>(),
                 ["trace_id"],
@@ -1432,10 +1429,7 @@ mod tests {
 
         // equality on the demoted field, NO configured bloom fields: the
         // composite alone decides — the holder kept, the covered miss dropped
-        let c = cond(vec![Condition::Equal(
-            "trace_id".into(),
-            "t-a-0003".into(),
-        )]);
+        let c = cond(vec![Condition::Equal("trace_id".into(), "t-a-0003".into())]);
         let kept = prune(
             "tid",
             "o",

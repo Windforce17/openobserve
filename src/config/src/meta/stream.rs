@@ -22,7 +22,7 @@ use arrow::{
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use hashbrown::HashMap;
 use proto::cluster_rpc;
-use roaring::RoaringBitmap;
+use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
 use utoipa::ToSchema;
 
@@ -338,6 +338,12 @@ impl RowIdBitmap {
             bit_util::set_bit(slice, id as usize);
         }
         BooleanBuffer::new(buffer.into(), 0, self.num_rows)
+    }
+    /// Clone the compressed row ids into the low (partition-zero) bitmap of
+    /// a 64-bit roaring treemap. Vortex's scan selection consumes this shape;
+    /// cloning the bitmap avoids expanding one `u64` allocation per match.
+    pub fn to_roaring_treemap(&self) -> RoaringTreemap {
+        RoaringTreemap::from_bitmaps([(0, self.rows.clone())])
     }
 
     /// Number of rows in the file (the bitmap's universe) — NOT the match
@@ -1505,10 +1511,9 @@ mod tests {
 
         // an UpdateStreamSettings payload naming the retired key parses too
         // (the settings API accepts-and-drops it)
-        let update: UpdateStreamSettings = json::from_str(
-            r#"{"column_store_fields": {"add": ["service"], "remove": []}}"#,
-        )
-        .unwrap();
+        let update: UpdateStreamSettings =
+            json::from_str(r#"{"column_store_fields": {"add": ["service"], "remove": []}}"#)
+                .unwrap();
         assert!(update.full_text_search_keys.add.is_empty());
     }
 
@@ -2063,6 +2068,27 @@ mod tests {
             sparse.runs().collect::<Vec<_>>(),
             dense.set_slices().collect::<Vec<_>>()
         );
+    }
+    #[test]
+    fn test_row_id_bitmap_roaring_treemap_equivalence() {
+        for ids in [
+            vec![1u32, 10, 10_000, 1_000_000],
+            (0..100_000u32).filter(|id| id % 3 != 0).collect(),
+        ] {
+            let bitmap = RowIdBitmap::from_row_ids(1_000_001, ids);
+            let treemap = bitmap.to_roaring_treemap();
+            assert_eq!(
+                treemap.iter().collect::<Vec<_>>(),
+                bitmap.iter().map(u64::from).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                treemap
+                    .bitmaps()
+                    .map(|(partition, _)| partition)
+                    .collect::<Vec<_>>(),
+                vec![0]
+            );
+        }
     }
 
     #[test]

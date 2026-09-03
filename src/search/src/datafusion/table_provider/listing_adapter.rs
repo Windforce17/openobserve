@@ -19,7 +19,7 @@ use arrow_schema::{SchemaRef, SortOptions};
 use config::{TIMESTAMP_COL_NAME, get_config};
 use datafusion::{
     catalog::{Session, TableProvider, memory::DataSourceExec},
-    common::{ColumnStatistics, Result},
+    common::{ColumnStatistics, DataFusionError, Result},
     datasource::{
         TableType,
         listing::{ListingTable, ListingTableConfig},
@@ -39,13 +39,28 @@ use crate::{
     index::IndexCondition,
 };
 
-#[derive(Debug)]
 pub struct ListingTableAdapter {
     listing_table: ListingTable,
+    listing_config: ListingTableConfig,
+    statistics_cache: Option<Arc<dyn FileStatisticsCache>>,
     trace_id: String,
     index_condition: Option<IndexCondition>,
     fst_fields: Vec<String>,
     timestamp_filter: Option<(i64, i64)>,
+}
+
+impl std::fmt::Debug for ListingTableAdapter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ListingTableAdapter")
+            .field("listing_table", &self.listing_table)
+            .field("listing_config", &self.listing_config)
+            .field("has_statistics_cache", &self.statistics_cache.is_some())
+            .field("trace_id", &self.trace_id)
+            .field("index_condition", &self.index_condition)
+            .field("fst_fields", &self.fst_fields)
+            .field("timestamp_filter", &self.timestamp_filter)
+            .finish()
+    }
 }
 
 impl ListingTableAdapter {
@@ -56,9 +71,11 @@ impl ListingTableAdapter {
         fst_fields: Vec<String>,
         timestamp_filter: Option<(i64, i64)>,
     ) -> Result<Self> {
-        let listing_table = ListingTable::try_new(config)?;
+        let listing_table = ListingTable::try_new(config.clone())?;
         Ok(Self {
             listing_table,
+            listing_config: config,
+            statistics_cache: None,
             trace_id,
             index_condition,
             fst_fields,
@@ -67,6 +84,7 @@ impl ListingTableAdapter {
     }
 
     pub fn with_cache(mut self, cache: Option<Arc<dyn FileStatisticsCache>>) -> Self {
+        self.statistics_cache = cache.clone();
         self.listing_table = self.listing_table.with_cache(cache);
         self
     }
@@ -103,12 +121,21 @@ impl TableProvider for ListingTableAdapter {
                 None
             };
 
+        let target_partitions = self.listing_table.options().target_partitions.max(1);
         let Some(index_condition) = index_condition else {
             // nothing to re-apply: one branch over every file
-            return match self
-                .scan_branch(state, projection, filters, limit, None, None)
-                .await?
-            {
+            let (plan, _) = self
+                .scan_branch(
+                    state,
+                    projection,
+                    filters,
+                    limit,
+                    None,
+                    None,
+                    target_partitions,
+                )
+                .await?;
+            return match plan {
                 Some(plan) => Ok(plan),
                 None => empty_scan(self.schema(), projection),
             };
@@ -116,16 +143,20 @@ impl TableProvider for ListingTableAdapter {
 
         // PER-FILE fallback blast radius: files the index answered EXACTLY
         // carry a row selection whose rows already satisfy the condition —
-        // they must not pay the re-applied filter (for schema-mixed fields
-        // the re-check materializes `_source` per row: one partial file used
-        // to poison a whole follower part, 60s vs 10s on a 12h histogram).
-        // Only files WITHOUT an exact selection (partial fields, skipped
-        // condition shapes, no index, eval errors) re-apply the condition —
-        // their (superset) selections still prune via the access plan.
-        let exact = self
-            .scan_branch(state, projection, filters, limit, None, Some(true))
+        // they must not pay the re-applied filter. Only files WITHOUT an
+        // exact selection re-apply the condition.
+        let (exact, exact_files) = self
+            .scan_branch(
+                state,
+                projection,
+                filters,
+                limit,
+                None,
+                Some(true),
+                target_partitions,
+            )
             .await?;
-        let fallback = self
+        let (fallback, fallback_files) = self
             .scan_branch(
                 state,
                 projection,
@@ -133,12 +164,50 @@ impl TableProvider for ListingTableAdapter {
                 limit,
                 Some(index_condition),
                 Some(false),
+                target_partitions,
             )
             .await?;
         match (exact, fallback) {
-            (Some(exact), Some(fallback)) => {
+            (Some(_), Some(_)) => {
+                let (exact_target, fallback_target) =
+                    allocate_branch_partitions(exact_files, fallback_files, target_partitions);
+                // Re-plan only mixed scans with their final shares. Listing
+                // is metadata-only here; avoiding 2x scan parallelism is
+                // worth the duplicate planning pass.
+                let (exact, _) = self
+                    .scan_branch(
+                        state,
+                        projection,
+                        filters,
+                        limit,
+                        None,
+                        Some(true),
+                        exact_target,
+                    )
+                    .await?;
+                let (fallback, _) = self
+                    .scan_branch(
+                        state,
+                        projection,
+                        filters,
+                        limit,
+                        Some(index_condition),
+                        Some(false),
+                        fallback_target,
+                    )
+                    .await?;
+                let exact = exact.ok_or_else(|| {
+                    DataFusionError::Internal(
+                        "exact scan branch disappeared during partition allocation".to_string(),
+                    )
+                })?;
+                let fallback = fallback.ok_or_else(|| {
+                    DataFusionError::Internal(
+                        "fallback scan branch disappeared during partition allocation".to_string(),
+                    )
+                })?;
                 log::info!(
-                    "[trace_id {}] [SCAN:NARROW] split scan: exact branch + fallback branch (re-applied filter on the fallback only)",
+                    "[trace_id {}] [SCAN:NARROW] split scan: exact branch ({exact_files} files/{exact_target} partitions) + fallback branch ({fallback_files} files/{fallback_target} partitions; re-applied filter on fallback only",
                     self.trace_id
                 );
                 Ok(UnionExec::try_new(vec![exact, fallback])?)
@@ -156,11 +225,30 @@ impl TableProvider for ListingTableAdapter {
     }
 }
 
+fn allocate_branch_partitions(
+    exact_files: usize,
+    fallback_files: usize,
+    target_partitions: usize,
+) -> (usize, usize) {
+    let target = target_partitions.max(1);
+    match (exact_files, fallback_files) {
+        (0, 0) => (0, 0),
+        (0, _) => (0, target),
+        (_, 0) => (target, 0),
+        _ if target == 1 => (1, 1),
+        _ => {
+            let total = exact_files as u128 + fallback_files as u128;
+            let proportional = ((target as u128 * exact_files as u128) / total) as usize;
+            let exact = proportional.clamp(1, target - 1);
+            (exact, target - exact)
+        }
+    }
+}
+
 impl ListingTableAdapter {
     /// One scan branch over the files matched by `keep_exact_selection`
-    /// (`None` = every file): the pre-split body of `scan`, with the
-    /// re-applied `index_condition` now an explicit parameter. Returns
-    /// `None` when the branch matches no files at all.
+    /// (`None` = every file), prepared with its assigned partition target.
+    /// Returns the plan and actual number of kept files.
     #[allow(clippy::too_many_arguments)]
     async fn scan_branch(
         &self,
@@ -170,7 +258,8 @@ impl ListingTableAdapter {
         limit: Option<usize>,
         index_condition: Option<&IndexCondition>,
         keep_exact_selection: Option<bool>,
-    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        target_partitions: usize,
+    ) -> Result<(Option<Arc<dyn ExecutionPlan>>, usize)> {
         let (parquet_projection, filter_projection) =
             if index_condition.is_some() || self.timestamp_filter.is_some() {
                 // get the projection for the filter
@@ -218,14 +307,22 @@ impl ListingTableAdapter {
                 filter_projection.map(|v| v.len()).unwrap_or(0)
             );
         }
-        let parquet_exec = self
-            .listing_table
+        let target_partitions = target_partitions.max(1);
+        let mut config = self.listing_config.clone();
+        let options = config.options.take().ok_or_else(|| {
+            DataFusionError::Internal(
+                "ListingTableAdapter requires configured listing options".to_string(),
+            )
+        })?;
+        config.options = Some(options.with_target_partitions(target_partitions));
+        let listing_table =
+            ListingTable::try_new(config)?.with_cache(self.statistics_cache.clone());
+        let parquet_exec = listing_table
             .scan(state, parquet_projection, filters, limit)
             .await?;
 
-        let order_by_time_desc = !self.listing_table.options().file_sort_order.is_empty();
+        let order_by_time_desc = !listing_table.options().file_sort_order.is_empty();
         let reverse = order_by_time_desc && parquet_exec.properties().output_ordering().is_none();
-        let target_partitions = self.listing_table.options().target_partitions;
         let (parquet_exec, kept_files) = prepare_file_scan_groups(
             &self.trace_id,
             state,
@@ -234,8 +331,9 @@ impl ListingTableAdapter {
             target_partitions,
             keep_exact_selection,
         );
-        if keep_exact_selection.is_some() && kept_files == Some(0) {
-            return Ok(None);
+        let kept_files = kept_files.unwrap_or(1);
+        if keep_exact_selection.is_some() && kept_files == 0 {
+            return Ok((None, 0));
         }
 
         let plan = apply_combined_filter(
@@ -247,7 +345,7 @@ impl ListingTableAdapter {
             filter_projection,
         )?;
 
-        Ok(Some(plan))
+        Ok((Some(plan), kept_files))
     }
 }
 
@@ -427,10 +525,14 @@ mod tests {
     };
     use arrow_schema::{DataType, Field, Schema};
     use config::{TIMESTAMP_COL_NAME, meta::stream::FileKey};
-    use datafusion::{physical_plan::collect, prelude::SessionContext};
+    use datafusion::{
+        physical_plan::{ExecutionPlan, collect},
+        prelude::SessionContext,
+    };
     use parquet::arrow::ArrowWriter;
     use vortex_index::SOURCE_COL_NAME;
 
+    use super::{UnionExec, allocate_branch_partitions};
     use crate::{
         datafusion::exec::{TableBuilder, create_runtime_env, create_session_config},
         index::{Condition, IndexCondition},
@@ -525,6 +627,10 @@ mod tests {
             .scan(&ctx.state(), Some(&projection), &[], None)
             .await
             .unwrap();
+        assert!(
+            plan.properties().output_partitioning().partition_count() <= 2,
+            "one nonempty branch must retain the table's full partition target"
+        );
         let batches = collect(plan, ctx.task_ctx()).await.unwrap();
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(rows, 2, "the extracted equality keeps the 2 chrome rows");
@@ -641,6 +747,18 @@ mod tests {
             .scan(&ctx.state(), Some(&projection), &[], None)
             .await
             .unwrap();
+        let union = plan.downcast_ref::<UnionExec>().expect("mixed scan union");
+        let children = union.children();
+        assert_eq!(children.len(), 2);
+        assert_eq!(
+            children
+                .iter()
+                .map(|child| { child.properties().output_partitioning().partition_count() })
+                .sum::<usize>(),
+            2,
+            "exact and fallback branches must share the configured target"
+        );
+
         let display = datafusion::physical_plan::displayable(plan.as_ref())
             .indent(false)
             .to_string();
@@ -654,5 +772,17 @@ mod tests {
         // exact file contributes its 2 selected rows (no re-filter), the
         // fallback file re-filters down to its 1 nexus row
         assert_eq!(rows, 3, "2 exact-selection rows + 1 re-filtered row");
+    }
+
+    #[test]
+    fn branch_partition_allocation_is_bounded_and_work_conserving() {
+        assert_eq!(allocate_branch_partitions(8, 2, 10), (8, 2));
+        assert_eq!(allocate_branch_partitions(9, 1, 4), (3, 1));
+        assert_eq!(allocate_branch_partitions(1, 9, 4), (1, 3));
+        assert_eq!(allocate_branch_partitions(0, 7, 4), (0, 4));
+        assert_eq!(allocate_branch_partitions(7, 0, 4), (4, 0));
+        // Two nonempty physical branches each require at least one
+        // partition; target=1 therefore uses the unavoidable 1+1 minimum.
+        assert_eq!(allocate_branch_partitions(1, 1, 1), (1, 1));
     }
 }

@@ -275,8 +275,7 @@ async fn evict_stale_sidecar_caches(put_items: &[FileKey]) {
         }
         crate::service::search::vix::reader_cache::GLOBAL_CACHE.remove(&item.key);
     }
-    let purged =
-        crate::service::search::vix::cache::GLOBAL_CACHE.remove_file_entries(core_keys);
+    let purged = crate::service::search::vix::cache::GLOBAL_CACHE.remove_file_entries(core_keys);
     if purged > 0 {
         log::debug!("[gRPC:Event] purged {purged} vix result-cache entries for updated files");
     }

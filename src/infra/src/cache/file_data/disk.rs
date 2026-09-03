@@ -1265,14 +1265,9 @@ async fn alloc_tmp_file_path() -> Result<TempFileGuard, anyhow::Error> {
 }
 
 // Write data to a temporary random file and return the file path
-async fn write_tmp_file(
-    file: &str,
-    data: Bytes,
-) -> Result<(String, TempFileGuard), anyhow::Error> {
+async fn write_tmp_file(file: &str, data: Bytes) -> Result<(String, TempFileGuard), anyhow::Error> {
     let tmp_file = alloc_tmp_file_path().await?;
-    if let Err(e) =
-        config::utils::async_file::put_file_contents(tmp_file.path(), &data).await
-    {
+    if let Err(e) = config::utils::async_file::put_file_contents(tmp_file.path(), &data).await {
         return Err(anyhow::anyhow!(
             "[FileData::Disk] write tmp file {}, failed: {}",
             tmp_file.path(),

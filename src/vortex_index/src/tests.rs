@@ -7003,6 +7003,81 @@ mod index_merge {
         }
     }
 
+    /// The production scratch-dir path streams the merged dictionary,
+    /// postings-list region, and closed terms batches to disk. Its output
+    /// must remain indistinguishable from the in-memory parallel path,
+    /// including plist pointer cells.
+    #[test]
+    fn spooled_index_merge_matches_in_memory_merge() {
+        let (schema, opts, batches, sources) = equivalence_inputs();
+        let readers: Vec<VixReader> = batches
+            .iter()
+            .zip(&sources)
+            .map(|(batch, source)| build_input(&schema, &opts, batch, source))
+            .collect();
+        let refs: Vec<&VixReader> = readers.iter().collect();
+        let sizes: Vec<usize> = batches.iter().map(RecordBatch::num_rows).collect();
+        let doc_maps = vec![
+            DocIdMap::Offset(0),
+            DocIdMap::Offset(sizes[0] as u32),
+            DocIdMap::Offset((sizes[0] + sizes[1]) as u32),
+        ];
+        let order: Vec<(usize, usize)> = (0..3)
+            .flat_map(|input| (0..sizes[input]).map(move |row| (input, row)))
+            .collect();
+        let merged_batch = interleave_batches(&schema, &batches, &order);
+        let merged_source = interleave_strings(&sources.iter().collect::<Vec<_>>(), &order);
+
+        let build = |term_spill_dir: Option<std::path::PathBuf>| {
+            let mut merged = VixWriter::new(
+                &schema,
+                VixWriterOptions {
+                    postings_plist_min_docs: 2,
+                    term_spill_dir,
+                    ..opts.clone()
+                },
+                false,
+            );
+            merged.merge_input_indexes(&refs, &doc_maps, 3).unwrap();
+            merged
+                .push_docs_rows_unindexed(
+                    &timestamps_of(&merged_batch),
+                    &cs_columns_of(&merged_batch, &["svc", "code"]),
+                    &merged_source,
+                    None,
+                )
+                .unwrap();
+            finish_open(merged)
+        };
+
+        let in_memory = build(None);
+        let spill_dir = tempfile::tempdir().unwrap();
+        let spill_path = spill_dir.path().join("created-on-demand");
+        let spooled = build(Some(spill_path.clone()));
+        assert!(spill_path.is_dir());
+        assert_eq!(
+            spooled.debug_all_terms().unwrap(),
+            in_memory.debug_all_terms().unwrap()
+        );
+        assert_eq!(spooled.partial_fields(), in_memory.partial_fields());
+        let rows: Vec<u64> = (0..spooled.row_count()).collect();
+        assert_eq!(
+            spooled.read_source(&rows).unwrap(),
+            in_memory.read_source(&rows).unwrap()
+        );
+        for query in [
+            exact("svc", "api"),
+            any_token("error"),
+            VixQuery::And(vec![exact("svc", "api"), any_token("error")]),
+        ] {
+            assert_eq!(eval_set(&spooled, &query), eval_set(&in_memory, &query));
+            assert_eq!(
+                spooled.count(&query).unwrap(),
+                in_memory.count(&query).unwrap()
+            );
+        }
+    }
+
     /// Field ids are remapped into the merged field table; a field the
     /// merged docs store under a type with NO term derivation (Timestamp
     /// here — numeric types keep their terms) loses its value terms and
@@ -7554,6 +7629,160 @@ mod index_merge {
         assert!(err.to_string().contains("first operation"), "{err}");
         let err = writer.finish().unwrap_err();
         assert!(err.to_string().contains("covers"), "{err}");
+    }
+}
+
+/// Offset-map postings fast path: shifting the first inline delta in-place
+/// must be byte-identical to the historical decode-all, add-offset,
+/// re-encode path across tail and bitpacked-block boundaries.
+mod postings_offset_shift {
+    use std::time::{Duration, Instant};
+
+    fn ids(count: usize) -> Vec<u32> {
+        (0..count)
+            .map(|index| 127 + u32::try_from(index).unwrap() * 3)
+            .collect()
+    }
+
+    fn decode_shifted_into(encoded: &[u8], doc_count: usize, offset: u32, shifted: &mut Vec<u32>) {
+        shifted.clear();
+        shifted.reserve(doc_count);
+        crate::postings::decode_each(encoded, doc_count, |doc| {
+            shifted.push(doc.checked_add(offset).expect("fixture does not overflow"));
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    fn decode_shifted(encoded: &[u8], doc_count: usize, offset: u32) -> Vec<u32> {
+        let mut shifted = Vec::with_capacity(doc_count);
+        decode_shifted_into(encoded, doc_count, offset, &mut shifted);
+        shifted
+    }
+
+    #[test]
+    fn shifted_inline_postings_match_decode_offset_encode() {
+        for count in [0, 1, 2, 127, 128, 129, 1_023, 1_024, 1_025, 2_057] {
+            let original_ids = ids(count);
+            let encoded = crate::postings::encode(&original_ids).unwrap();
+            let source_rows = original_ids.last().map_or(0, |last| u64::from(*last) + 1);
+            for offset in [0, 1, 129, 16_384] {
+                let expected_ids = decode_shifted(&encoded, count, offset);
+                let expected = crate::postings::encode(&expected_ids).unwrap();
+                let mut shifted = Vec::new();
+                crate::postings::shift_encoded_into(
+                    &encoded,
+                    count,
+                    offset,
+                    source_rows,
+                    &mut shifted,
+                )
+                .unwrap();
+                assert_eq!(
+                    shifted, expected,
+                    "inline mismatch for count={count}, offset={offset}"
+                );
+                if offset == 0 {
+                    assert_eq!(
+                        shifted, encoded,
+                        "zero offset must copy inline bytes exactly"
+                    );
+                }
+            }
+        }
+    }
+
+    fn median(samples: &mut [Duration]) -> Duration {
+        samples.sort_unstable();
+        samples[samples.len() / 2]
+    }
+
+    /// Manual release benchmark for the direct inline-codec substitution.
+    /// Legacy-first/new-first alternate across odd rounds, buffers are
+    /// reused on both paths, outputs are checked every round, and the
+    /// benchmark fails if shifting loses.
+    ///
+    /// `cargo test -p vortex_index --release bench_postings_offset_shift_codec
+    /// -- --ignored --nocapture`
+    #[test]
+    #[ignore = "manual release benchmark for offset postings shifting"]
+    fn bench_postings_offset_shift_codec() {
+        let doc_count = std::env::var("O2_VIX_OFFSET_CODEC_DOCS")
+            .map(|value| value.parse::<usize>().expect("positive integer doc count"))
+            .unwrap_or(1_000_000);
+        let rounds = std::env::var("O2_VIX_OFFSET_CODEC_ROUNDS")
+            .map(|value| {
+                value
+                    .parse::<usize>()
+                    .expect("positive integer round count")
+            })
+            .unwrap_or(9);
+        assert!(doc_count > 0, "doc count must be positive");
+        assert!(
+            rounds >= 3 && rounds % 2 == 1,
+            "round count must be odd and >= 3"
+        );
+        let original_ids = ids(doc_count);
+        let offset = 1_000_000u32;
+        original_ids
+            .last()
+            .copied()
+            .unwrap()
+            .checked_add(offset)
+            .expect("configured fixture overflows u32");
+        let source_rows = u64::from(*original_ids.last().unwrap()) + 1;
+        let encoded = crate::postings::encode(&original_ids).unwrap();
+        let mut legacy_times = Vec::with_capacity(rounds);
+        let mut shifted_times = Vec::with_capacity(rounds);
+        let mut legacy_ids = Vec::with_capacity(doc_count);
+        let mut legacy_output = Vec::new();
+        let mut shifted_output = Vec::new();
+
+        for round in 0..rounds {
+            for legacy in if round % 2 == 0 {
+                [true, false]
+            } else {
+                [false, true]
+            } {
+                if legacy {
+                    let started = Instant::now();
+                    decode_shifted_into(&encoded, doc_count, offset, &mut legacy_ids);
+                    crate::postings::encode_into(&legacy_ids, &mut legacy_output).unwrap();
+                    legacy_times.push(started.elapsed());
+                    std::hint::black_box(&legacy_output);
+                } else {
+                    let started = Instant::now();
+                    crate::postings::shift_encoded_into(
+                        &encoded,
+                        doc_count,
+                        offset,
+                        source_rows,
+                        &mut shifted_output,
+                    )
+                    .unwrap();
+                    shifted_times.push(started.elapsed());
+                    std::hint::black_box(&shifted_output);
+                }
+            }
+            assert_eq!(
+                shifted_output, legacy_output,
+                "inline bytes differ in round {round}"
+            );
+        }
+
+        let legacy = median(&mut legacy_times);
+        let shifted = median(&mut shifted_times);
+        println!(
+            "inline docs={doc_count} rounds={rounds} legacy={:.3}ms shifted={:.3}ms speedup={:.3}x bytes={}",
+            legacy.as_secs_f64() * 1_000.0,
+            shifted.as_secs_f64() * 1_000.0,
+            legacy.as_secs_f64() / shifted.as_secs_f64(),
+            shifted_output.len(),
+        );
+        assert!(
+            shifted <= legacy,
+            "inline shifted median {shifted:?} exceeded legacy {legacy:?}"
+        );
     }
 }
 
