@@ -268,6 +268,17 @@ pub async fn vix_search(
             &idx_optimize_mode,
             Some(IndexOptimizeMode::SimpleHistogram(..))
         );
+    // Indexed ALL multi-histograms can omit their semantically unused
+    // sidecar only on the zero-offset coordinate system. Indexless files
+    // remain on DataFusion, and nonzero offsets keep the conservative
+    // sidecar-backed path until extraction and collection coordinates agree.
+    let all_multi_histogram = condition_all
+        && matches!(
+            &idx_optimize_mode,
+            Some(IndexOptimizeMode::SimpleMultiHistogram(_, _, _, ts_offset, _))
+                if *ts_offset == 0
+        );
+    let data_only_all_histogram = all_histogram || all_multi_histogram;
     let data_only_capable = native_simple_select || native_histogram || all_histogram;
     let eval_files = file_list_map
         .values()
@@ -298,11 +309,11 @@ pub async fn vix_search(
         );
     }
     // Whole-sidecar caching and its metrics cover only evaluations that
-    // actually read `.vxi`. A WHERE-less histogram is data-only even when
-    // the file has an index sidecar.
+    // actually read `.vxi`. A WHERE-less histogram, including the grouped
+    // variant, is data-only even when the file has an index sidecar.
     let index_files = eval_files
         .iter()
-        .filter(|file| file.meta.index_size > 0 && !all_histogram)
+        .filter(|file| file.meta.index_size > 0 && !data_only_all_histogram)
         .cloned()
         .collect_vec();
     scan_stats.compressed_size = index_files.iter().map(|file| file.meta.index_size).sum();
@@ -501,12 +512,13 @@ pub async fn vix_search(
     // pay the data footer + sidecar footer/dictionary directory in one
     // bounded-concurrency wave. Remote-cold equality histograms use native
     // docs columns; equality histograms with local sidecars need no prefetch.
-    // ALL histograms first use file metadata and then the data-file zone
-    // table, so prefetching every sidecar would turn zero-read files into IO.
+    // ALL SimpleHistograms and zero-offset indexed ALL multi-histograms use
+    // only file metadata/zones/docs columns, so prefetching a sidecar would
+    // add IO that neither path consumes.
     let prefetch_enabled = read_mode == VixReadMode::Ranged
         && cfg.common.vix_query_prefetch
         && !native_histogram
-        && !all_histogram;
+        && !data_only_all_histogram;
     #[cfg(test)]
     let prefetch_enabled = tests::prefetch_override(trace_id).unwrap_or(prefetch_enabled);
     // wave bytes prefetched so far (all-files costs, paid once): the bail
@@ -702,8 +714,10 @@ pub async fn vix_search(
                     if bail_bytes_cap > 0
                         && idx_optimize_mode.is_some()
                         // Native SimpleSelect stays bounded by K, and an ALL
-                        // histogram uses metadata/zones. Bailing either to a
-                        // wide scan is strictly more expensive.
+                        // SimpleHistogram uses metadata/zones. MultiHistogram
+                        // still reads the breakdown column and must keep this
+                        // projected-cost bail. Bailing either exempt shape to
+                        // a wide scan is strictly more expensive.
                         && !native_simple_select
                         && !all_histogram
                         && files_evaluated >= BAIL_SAMPLE_FILES
@@ -1368,13 +1382,18 @@ async fn search_vix_index(
     };
     let cold_native_histogram =
         equality_histogram && !parsed_sidecar_available && !local_sidecar_available;
-    // An ALL histogram instead opens a VixReader without a sidecar: its
-    // eval(All) and zone collector are exact and avoid scanning `_source`.
+    // An ALL SimpleHistogram, and a zero-offset indexed ALL multi-histogram,
+    // can open a VixReader without a sidecar: eval(All) plus the
+    // timestamp/breakdown collectors are exact and avoid scanning `_source`.
     let data_only_all_histogram = condition.is_condition_all()
-        && matches!(
+        && (matches!(
             &idx_optimize_rule,
             Some(IndexOptimizeMode::SimpleHistogram(..))
-        );
+        ) || (parquet_file.meta.index_size > 0
+            && matches!(
+                &idx_optimize_rule,
+                Some(IndexOptimizeMode::SimpleMultiHistogram(_, _, _, 0, _))
+            )));
     if (parquet_file.meta.index_size <= 0 && !data_only_all_histogram) || cold_native_histogram {
         return search_vix_docs_optimized(
             trace_id,
@@ -1758,7 +1777,13 @@ async fn search_vix_docs_optimized(
                 "native equality evaluation of {task_key} field {task_field:?}: {error:#}"
             )
         })?;
-        Ok::<_, anyhow::Error>((result, row_count))
+        let column_absent = result.is_none()
+            && docs.columns_complete()
+            && !docs
+                .column_presence()
+                .iter()
+                .any(|(name, _)| name == &task_field);
+        Ok::<_, anyhow::Error>((result, row_count, column_absent))
     })
     .await
     .map_err(|error| {
@@ -1767,17 +1792,7 @@ async fn search_vix_docs_optimized(
         )
     })??;
 
-    let (Some(result), row_count) = evaluated else {
-        log::info!(
-            "[trace_id {trace_id}] search->vix: native docs file {key} lacks string-family \
-             column {field:?}; back to datafusion",
-        );
-        return Ok((
-            String::new(),
-            VixSearchResult::Skipped { percent: 100 },
-            true,
-        ));
-    };
+    let (result, row_count, column_absent) = evaluated;
     let expected_rows = u64::try_from(file.meta.records).map_err(|_| {
         anyhow::anyhow!(
             "[trace_id {trace_id}] native docs file {key} has negative record count {}",
@@ -1790,6 +1805,24 @@ async fn search_vix_docs_optimized(
              metadata records {expected_rows} for {key}"
         ));
     }
+    let Some(result) = result else {
+        if column_absent {
+            if !cache_key.is_empty() {
+                vix_result_cache::GLOBAL_CACHE.put(cache_key, CacheEntry::NoMatch);
+            }
+            return Ok((key, VixSearchResult::NoMatch, false));
+        }
+        log::info!(
+            "[trace_id {trace_id}] search->vix: native docs file {key} has a non-string or \
+             unproven-absent column {field:?}; back to datafusion",
+        );
+        return Ok((
+            String::new(),
+            VixSearchResult::Skipped { percent: 100 },
+            true,
+        ));
+    };
+
     let no_match = match &result {
         VixSearchResult::SelectCandidates { candidates, .. } => candidates.is_empty(),
         VixSearchResult::Histogram(histogram) => histogram.iter().all(|count| *count == 0),
@@ -2430,8 +2463,8 @@ fn guard_matched_rows(
 
 /// Build the cache entry for an evaluated result. `None` means the result
 /// cannot be represented as a reusable entry (a histogram evaluated without
-/// its `SimpleHistogram` rule — never produced in practice) and is simply
-/// not cached.
+/// its matching rule, or one whose arithmetic/grid is malformed) and is
+/// simply not cached.
 fn get_cache_entry(
     result: VixSearchResult,
     rule: Option<&IndexOptimizeMode>,
@@ -2469,7 +2502,35 @@ fn get_cache_entry(
             }
         }
         VixSearchResult::MultiHistogram(multi_histogram) => {
-            CacheEntry::MultiHistogram(multi_histogram)
+            // Store bucket starts in the raw timestamp domain so normalized
+            // zero-offset hits can be filtered safely while entries with
+            // nonzero offsets rematerialize their local bucket labels.
+            let Some(IndexOptimizeMode::SimpleMultiHistogram(
+                min_value,
+                max_value,
+                bucket_width,
+                ts_offset,
+                _,
+            )) = rule
+            else {
+                return None;
+            };
+            let width = i64::try_from((*bucket_width).max(1)).ok()?;
+            let raw_min = min_value.checked_sub(*ts_offset)?;
+            let raw_max = max_value.checked_sub(*ts_offset)?;
+            let phase = raw_min.rem_euclid(width);
+            let mut rows = Vec::with_capacity(multi_histogram.len());
+            for (bucket, value, count) in multi_histogram {
+                let raw_bucket = bucket.checked_sub(*ts_offset)?;
+                if raw_bucket < raw_min
+                    || raw_bucket >= raw_max
+                    || raw_bucket.rem_euclid(width) != phase
+                {
+                    return None;
+                }
+                rows.push((raw_bucket, value, count));
+            }
+            CacheEntry::MultiHistogram { width, phase, rows }
         }
         VixSearchResult::TopN(top_n) => CacheEntry::TopN(top_n),
         VixSearchResult::Distinct(distinct) => CacheEntry::Distinct(distinct),
@@ -2519,17 +2580,30 @@ pub fn generate_cache_key(
     use std::hash::{Hash, Hasher};
 
     let rule = match idx_optimize_rule {
-        // SimpleHistogram keys carry bucket width + PHASE, not the absolute
-        // window: entries store their own grid and reposition on read, so a
-        // sliding dashboard window (same width, same alignment) keeps
-        // hitting per-file entries instead of going cold every refresh.
-        // num_buckets stays out of the key for the same reason.
+        // Histogram keys carry bucket width + grid PHASE, not the absolute
+        // window, so same-alignment dashboard slides reuse per-file entries.
+        // SimpleMultiHistogram normalization is deliberately limited to
+        // zero-offset rules until extraction and collection use one
+        // coordinate system for nonzero offsets.
         Some(IndexOptimizeMode::SimpleHistogram(min_value, bucket_width, _, ts_offset)) => {
             let width = (*bucket_width).max(1) as i64;
             format!(
                 "h(p:{},b:{width})",
                 (min_value - ts_offset).rem_euclid(width)
             )
+        }
+        Some(IndexOptimizeMode::SimpleMultiHistogram(
+            min_value,
+            _,
+            bucket_width,
+            ts_offset,
+            breakdown_field,
+        )) if *ts_offset == 0 => {
+            // Use i128 arithmetic so even a malformed extreme rule still
+            // gets a stable, collision-free identity instead of overflowing.
+            let width = (*bucket_width).max(1);
+            let phase = i128::from(*min_value).rem_euclid(i128::from(width));
+            format!("mh(p:{phase},b:{width},f:{breakdown_field})")
         }
         Some(rule) => rule.to_rule_string(),
         None => "n".to_string(),
@@ -2699,6 +2773,75 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_multi_histogram_cache_key_normalizes_range_and_separates_grid_and_field() {
+        let file = create_file_key(1, 10);
+        let condition = equal_condition();
+        let key = |rule, clamp| generate_cache_key(&condition, &Some(rule), &file, clamp);
+        let base = IndexOptimizeMode::SimpleMultiHistogram(1000, 1400, 60, 0, "level".to_string());
+
+        // Zero-offset requests on the same grid share a key even when both
+        // absolute bounds move.
+        assert_eq!(
+            key(base.clone(), None),
+            key(
+                IndexOptimizeMode::SimpleMultiHistogram(1600, 2500, 60, 0, "level".to_string(),),
+                None,
+            ),
+        );
+        // Nonzero-offset rules retain the full legacy identity. In
+        // particular, same-raw-phase windows do not reuse one another.
+        let offset_a =
+            IndexOptimizeMode::SimpleMultiHistogram(1060, 1460, 60, 60, "level".to_string());
+        let offset_b =
+            IndexOptimizeMode::SimpleMultiHistogram(1660, 2500, 60, 60, "level".to_string());
+        assert_ne!(key(offset_a.clone(), None), key(offset_b, None));
+        assert!(key(offset_a.clone(), None).contains(&format!("_{}_", offset_a.to_rule_string())));
+        let offset_max_changed =
+            IndexOptimizeMode::SimpleMultiHistogram(1060, 1520, 60, 60, "level".to_string());
+        assert_ne!(
+            key(offset_a.clone(), None),
+            key(offset_max_changed, None),
+            "nonzero-offset max bounds retain their legacy separation"
+        );
+        assert_ne!(
+            key(base.clone(), None),
+            key(
+                IndexOptimizeMode::SimpleMultiHistogram(1001, 1400, 60, 0, "level".to_string(),),
+                None,
+            ),
+            "raw-grid phase must remain part of the key"
+        );
+        assert_ne!(
+            key(base.clone(), None),
+            key(
+                IndexOptimizeMode::SimpleMultiHistogram(1000, 1400, 120, 0, "level".to_string(),),
+                None,
+            ),
+            "bucket width must remain part of the key"
+        );
+        assert_ne!(
+            key(base.clone(), None),
+            key(
+                IndexOptimizeMode::SimpleMultiHistogram(1000, 1400, 60, 0, "service".to_string(),),
+                None,
+            ),
+            "breakdown field must remain part of the key"
+        );
+        assert_ne!(
+            key(base.clone(), Some((1000, 1100))),
+            key(base.clone(), Some((1060, 1160))),
+            "the effective boundary clamp stays in the outer key"
+        );
+
+        let count_rule = IndexOptimizeMode::SimpleCount;
+        let count_key = key(count_rule.clone(), None);
+        assert!(
+            count_key.contains(&format!("_{}_", count_rule.to_rule_string())),
+            "unrelated optimize modes retain their existing identity"
+        );
+    }
+
     /// Entries trim to the occupied buckets and reposition into any
     /// same-width/same-phase query grid via the cache get path.
     #[test]
@@ -2759,6 +2902,54 @@ mod tests {
         );
         // no rule at all (defensive): miss
         assert!(cache.get("k", None).is_none());
+    }
+
+    #[test]
+    fn test_multi_histogram_cache_entry_reuses_shifted_zero_offset_grid() {
+        let cache = vix_result_cache::VixResultCache::new(10);
+        let file = create_file_key(1, 10);
+        let condition = equal_condition();
+        let source_rule =
+            IndexOptimizeMode::SimpleMultiHistogram(100, 140, 10, 0, "level".to_string());
+        let entry = get_cache_entry(
+            VixSearchResult::MultiHistogram(vec![
+                (100, "outside-low".to_string(), 1),
+                (110, "a".to_string(), 2),
+                (120, "b".to_string(), 3),
+                (130, "outside-high".to_string(), 4),
+            ]),
+            Some(&source_rule),
+        )
+        .unwrap();
+        assert!(matches!(
+            &entry,
+            CacheEntry::MultiHistogram { width: 10, phase: 0, rows }
+                if rows == &vec![
+                    (100, "outside-low".to_string(), 1),
+                    (110, "a".to_string(), 2),
+                    (120, "b".to_string(), 3),
+                    (130, "outside-high".to_string(), 4),
+                ]
+        ));
+        let source_key = generate_cache_key(&condition, &Some(source_rule), &file, None);
+        cache.put(source_key, entry);
+
+        let shifted_rule =
+            IndexOptimizeMode::SimpleMultiHistogram(110, 130, 10, 0, "level".to_string());
+        let shifted_key = generate_cache_key(&condition, &Some(shifted_rule.clone()), &file, None);
+        assert!(matches!(
+            cache.get(&shifted_key, Some(&shifted_rule)),
+            Some(VixSearchResult::MultiHistogram(rows))
+                if rows == vec![(110, "a".to_string(), 2), (120, "b".to_string(), 3)]
+        ));
+
+        let nonzero_offset =
+            IndexOptimizeMode::SimpleMultiHistogram(170, 190, 10, 60, "level".to_string());
+        let nonzero_key = generate_cache_key(&condition, &Some(nonzero_offset), &file, None);
+        assert_ne!(
+            shifted_key, nonzero_key,
+            "nonzero-offset windows retain their full cache identity"
+        );
     }
 
     #[test]
@@ -2840,13 +3031,38 @@ mod tests {
         // a histogram without its rule is simply not cacheable
         assert!(get_cache_entry(VixSearchResult::Histogram(vec![1]), None).is_none());
 
-        let entry = get_cache_entry_none(VixSearchResult::MultiHistogram(vec![(
-            1,
-            "a".to_string(),
-            2,
-        )]));
+        let multi_rule = IndexOptimizeMode::SimpleMultiHistogram(1, 11, 10, 0, "level".to_string());
+        let entry = get_cache_entry(
+            VixSearchResult::MultiHistogram(vec![(1, "a".to_string(), 2)]),
+            Some(&multi_rule),
+        )
+        .unwrap();
+        assert!(matches!(
+            entry,
+            CacheEntry::MultiHistogram { width: 10, phase: 1, rows }
+                if rows == vec![(1, "a".to_string(), 2)]
+        ));
         assert!(
-            matches!(entry, CacheEntry::MultiHistogram(rows) if rows == vec![(1, "a".to_string(), 2)])
+            get_cache_entry(VixSearchResult::MultiHistogram(Vec::new()), None).is_none(),
+            "a multi-histogram without its rule is not cacheable"
+        );
+        assert!(
+            get_cache_entry(
+                VixSearchResult::MultiHistogram(vec![(2, "misaligned".to_string(), 1)]),
+                Some(&multi_rule),
+            )
+            .is_none(),
+            "a misaligned result must not enter the cache"
+        );
+        let overflowing_rule =
+            IndexOptimizeMode::SimpleMultiHistogram(i64::MIN, i64::MAX, 10, 1, "level".to_string());
+        assert!(
+            get_cache_entry(
+                VixSearchResult::MultiHistogram(Vec::new()),
+                Some(&overflowing_rule),
+            )
+            .is_none(),
+            "normalization overflow must not enter the cache"
         );
 
         let entry = get_cache_entry_none(VixSearchResult::TopN(vec![(vec!["a".to_string()], 2)]));
@@ -4317,6 +4533,7 @@ mod tests {
         writer
             .push_batch_with_source(&batch, &StringArray::from(sources), None)
             .unwrap();
+
         let (data, index) = writer.finish().unwrap();
         let index = index.expect("core file writer emits a sidecar");
         let account = infra::storage::get_account("org", key).unwrap_or_default();
@@ -4337,6 +4554,130 @@ mod tests {
                 records: rows,
                 compressed_size: data_len as i64,
                 index_size: index_len as i64,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+    /// Store only the data object for an ALL+SimpleMultiHistogram fixture.
+    /// Metadata can advertise the omitted sidecar so tests prove the indexed
+    /// zero-offset route never probes or opens it.
+    async fn store_data_only_multi_histogram_file(key: &str, advertise_index: bool) -> FileKey {
+        use arrow::{
+            array::{Int64Array, RecordBatch, StringArray},
+            datatypes::{DataType, Field, Schema},
+        };
+        use vortex_index::{VixWriter, VixWriterOptions};
+
+        let timestamps = vec![1_004i64, 1_003, 1_002, 1_001, 1_000];
+        let breakdowns = vec![Some(7i64), None, Some(8), Some(7), Some(8)];
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("code", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(timestamps.clone())),
+                Arc::new(Int64Array::from(breakdowns.clone())),
+            ],
+        )
+        .unwrap();
+        let sources = StringArray::from(
+            timestamps
+                .iter()
+                .zip(&breakdowns)
+                .map(|(timestamp, code)| match code {
+                    Some(code) => format!(r#"{{"_timestamp":{timestamp},"code":{code}}}"#),
+                    None => format!(r#"{{"_timestamp":{timestamp}}}"#),
+                })
+                .collect::<Vec<_>>(),
+        );
+        let mut writer = VixWriter::new(
+            &schema,
+            VixWriterOptions {
+                columns_complete: true,
+                ..Default::default()
+            },
+            false,
+        );
+        writer
+            .push_batch_with_source(&batch, &sources, None)
+            .unwrap();
+        let (data, index) = writer.finish().unwrap();
+        let index_len = index.expect("writer emits a sidecar").len();
+        let data_len = data.len();
+        let account = infra::storage::get_account("org", key).unwrap_or_default();
+        infra::storage::put(&account, key, bytes::Bytes::from(data))
+            .await
+            .expect("put data object");
+        FileKey {
+            key: key.to_string(),
+            account,
+            meta: FileMeta {
+                min_ts: 1_000,
+                max_ts: 1_004,
+                records: timestamps.len() as i64,
+                compressed_size: data_len as i64,
+                index_size: if advertise_index { index_len as i64 } else { 0 },
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// Store a native-equality fixture with a numeric `code` column. `ghost`
+    /// is absent from both the docs schema and the presence property.
+    async fn store_native_column_file(key: &str, columns_complete: bool) -> FileKey {
+        use arrow::{
+            array::{Int64Array, RecordBatch, StringArray},
+            datatypes::{DataType, Field, Schema},
+        };
+        use vortex_index::{VixWriter, VixWriterOptions};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("code", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1_002i64, 1_001, 1_000])),
+                Arc::new(Int64Array::from(vec![7i64, 8, 9])),
+            ],
+        )
+        .unwrap();
+        let sources = StringArray::from(vec![
+            r#"{"_timestamp":1002,"code":7}"#,
+            r#"{"_timestamp":1001,"code":8}"#,
+            r#"{"_timestamp":1000,"code":9}"#,
+        ]);
+        let mut writer = VixWriter::new(
+            &schema,
+            VixWriterOptions {
+                columns_complete,
+                ..Default::default()
+            },
+            false,
+        );
+        writer
+            .push_batch_with_source(&batch, &sources, None)
+            .unwrap();
+        let (data, _) = writer.finish().unwrap();
+        let data_len = data.len();
+        let account = infra::storage::get_account("org", key).unwrap_or_default();
+        infra::storage::put(&account, key, bytes::Bytes::from(data))
+            .await
+            .expect("put data object");
+        FileKey {
+            key: key.to_string(),
+            account,
+            meta: FileMeta {
+                min_ts: 1_000,
+                max_ts: 1_002,
+                records: 3,
+                compressed_size: data_len as i64,
+                index_size: 0,
                 ..Default::default()
             },
             ..Default::default()
@@ -5171,6 +5512,255 @@ mod tests {
                 .is_some_and(|reader| reader.has_index()),
             "local sidecar histogram must retain its parsed indexed reader"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_all_multi_histogram_routes_indexless_and_skips_zero_offset_sidecar() {
+        let indexed = store_data_only_multi_histogram_file(
+            "files/org/logs/all-multi-data-only/2026/01/01/00/indexed.vix",
+            true,
+        )
+        .await;
+        let indexless = store_data_only_multi_histogram_file(
+            "files/org/logs/all-multi-data-only/2026/01/01/00/indexless.vix",
+            false,
+        )
+        .await;
+        let condition = IndexCondition {
+            conditions: vec![Condition::All()],
+        };
+        let zero_offset =
+            IndexOptimizeMode::SimpleMultiHistogram(1_000, 1_010, 10, 0, "code".to_string());
+        let expected = vec![(1_000, "7".to_string(), 2), (1_000, "8".to_string(), 2)];
+        let fetch_stats = Arc::new(source::FetchStats::default());
+
+        // An indexed zero-offset ALL multi-histogram needs only the data
+        // object's docs columns. Its advertised but deliberately absent
+        // sidecar must not be opened in either read mode.
+        for read_mode in [VixReadMode::Ranged, VixReadMode::Cached] {
+            reader_cache::GLOBAL_CACHE.remove(&indexed.key);
+            vix_result_cache::GLOBAL_CACHE
+                .remove_file_entries(std::iter::once(indexed.key.as_str()));
+            let sidecar = config::vix_sidecar_key(&indexed.key).unwrap();
+            file_data::memory::remove(&sidecar).await.unwrap();
+            file_data::disk::remove(&sidecar).await.unwrap();
+
+            let (result_key, result, has_skipped) = search_vix_index(
+                "all-multi-zero-offset-direct",
+                (990, 1_010),
+                Some(condition.clone()),
+                Some(zero_offset.clone()),
+                &indexed,
+                read_mode,
+                false,
+                &fetch_stats,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(result_key, indexed.key);
+            assert!(!has_skipped);
+            let mut rows = match result {
+                VixSearchResult::MultiHistogram(rows) => rows,
+                other => panic!("expected data-only multi histogram, got {other:?}"),
+            };
+            rows.sort();
+            assert_eq!(rows, expected);
+            assert!(
+                !reader_cache::GLOBAL_CACHE.contains(&indexed.key),
+                "ALL multi-histogram reader must remain query-local"
+            );
+            assert!(!file_data::memory::exist(&sidecar).await);
+            assert!(!file_data::disk::exist(&sidecar).await);
+        }
+
+        // Indexless multi-histograms are never data-only eligible. Both the
+        // zero-offset shape and the existing nonzero extracted shape must
+        // decline to DataFusion when reached defensively.
+        for mode in [
+            zero_offset.clone(),
+            IndexOptimizeMode::SimpleMultiHistogram(1_050, 1_060, 10, 50, "code".to_string()),
+        ] {
+            let (key, result, has_skipped) = search_vix_index(
+                "all-multi-indexless-fallback",
+                (990, 1_010),
+                Some(condition.clone()),
+                Some(mode),
+                &indexless,
+                VixReadMode::Ranged,
+                false,
+                &fetch_stats,
+            )
+            .await
+            .unwrap();
+            assert!(key.is_empty());
+            assert!(matches!(result, VixSearchResult::Skipped { percent: 100 }));
+            assert!(has_skipped);
+        }
+
+        // The complete path evaluates only the indexed file and leaves the
+        // indexless file for DataFusion.
+        for file in [&indexed, &indexless] {
+            reader_cache::GLOBAL_CACHE.remove(&file.key);
+            vix_result_cache::GLOBAL_CACHE.remove_file_entries(std::iter::once(file.key.as_str()));
+        }
+        let sidecar = config::vix_sidecar_key(&indexed.key).unwrap();
+        file_data::memory::remove(&sidecar).await.unwrap();
+        file_data::disk::remove(&sidecar).await.unwrap();
+        let params = Arc::new(crate::types::QueryParams {
+            trace_id: "all-multi-zero-offset-outer".to_string(),
+            org_id: "org".to_string(),
+            stream: datafusion::sql::TableReference::from("t"),
+            stream_type: StreamType::Logs,
+            stream_name: "t".to_string(),
+            time_range: (990, 1_010),
+            work_group: None,
+            use_inverted_index: true,
+        });
+        let mut files = vec![indexed.clone(), indexless.clone()];
+        let (_, add_filter_back, result) =
+            vix_search(params, &mut files, Some(condition), Some(zero_offset))
+                .await
+                .unwrap();
+        assert!(add_filter_back);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].key, indexless.key);
+        let mut rows = match result {
+            MultiResult::MultiHistogram(rows) => rows,
+            other => panic!("expected indexed multi histogram, got {other:?}"),
+        };
+        rows.sort();
+        assert_eq!(rows, expected);
+        assert!(!reader_cache::GLOBAL_CACHE.contains(&indexed.key));
+        assert!(!reader_cache::GLOBAL_CACHE.contains(&indexless.key));
+        assert!(!file_data::memory::exist(&sidecar).await);
+        assert!(!file_data::disk::exist(&sidecar).await);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_indexless_multi_histogram_refuses_real_condition_and_missing_breakdown() {
+        let file = store_data_only_multi_histogram_file(
+            "files/org/logs/all-multi-data-only/2026/01/01/00/fallback.vix",
+            false,
+        )
+        .await;
+        let fetch_stats = Arc::new(source::FetchStats::default());
+        let real_condition = IndexCondition {
+            conditions: vec![Condition::Equal("code".to_string(), "7".to_string())],
+        };
+        let mode =
+            IndexOptimizeMode::SimpleMultiHistogram(1_050, 1_060, 10, 50, "code".to_string());
+        let (key, result, has_skipped) = search_vix_index(
+            "data-only-multi-real-condition",
+            (990, 1_010),
+            Some(real_condition),
+            Some(mode),
+            &file,
+            VixReadMode::Ranged,
+            false,
+            &fetch_stats,
+        )
+        .await
+        .unwrap();
+        assert!(key.is_empty());
+        assert!(matches!(result, VixSearchResult::Skipped { percent: 100 }));
+        assert!(has_skipped);
+
+        let all = IndexCondition {
+            conditions: vec![Condition::All()],
+        };
+        let missing_mode =
+            IndexOptimizeMode::SimpleMultiHistogram(1_050, 1_060, 10, 50, "ghost".to_string());
+        let (key, result, has_skipped) = search_vix_index(
+            "data-only-multi-missing-breakdown",
+            (990, 1_010),
+            Some(all),
+            Some(missing_mode),
+            &file,
+            VixReadMode::Ranged,
+            false,
+            &fetch_stats,
+        )
+        .await
+        .unwrap();
+        assert!(key.is_empty());
+        assert!(matches!(result, VixSearchResult::Skipped { percent: 100 }));
+        assert!(has_skipped);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_native_equality_distinguishes_absent_from_non_string_columns() {
+        let complete = store_native_column_file(
+            "files/org/logs/native-absence/2026/01/01/00/complete.vix",
+            true,
+        )
+        .await;
+        let incomplete = store_native_column_file(
+            "files/org/logs/native-absence/2026/01/01/00/incomplete.vix",
+            false,
+        )
+        .await;
+        let fetch_stats = Arc::new(source::FetchStats::default());
+        let mode = IndexOptimizeMode::SimpleSelect(10, false);
+        let absent = IndexCondition {
+            conditions: vec![Condition::Equal("ghost".to_string(), "value".to_string())],
+        };
+        let cache_key = format!("{}|native-complete-absent", complete.key);
+        vix_result_cache::GLOBAL_CACHE.remove_file_entries(std::iter::once(complete.key.as_str()));
+        let (key, result, has_skipped) = search_vix_docs_optimized(
+            "native-complete-absent",
+            &absent,
+            Some(mode.clone()),
+            &complete,
+            VixReadMode::Ranged,
+            &fetch_stats,
+            None,
+            cache_key.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(key, complete.key);
+        assert!(matches!(result, VixSearchResult::NoMatch));
+        assert!(!has_skipped);
+        assert!(matches!(
+            vix_result_cache::GLOBAL_CACHE.get(&cache_key, Some(&mode)),
+            Some(VixSearchResult::NoMatch)
+        ));
+
+        let (key, result, has_skipped) = search_vix_docs_optimized(
+            "native-incomplete-absent",
+            &absent,
+            Some(mode.clone()),
+            &incomplete,
+            VixReadMode::Ranged,
+            &fetch_stats,
+            None,
+            String::new(),
+        )
+        .await
+        .unwrap();
+        assert!(key.is_empty());
+        assert!(matches!(result, VixSearchResult::Skipped { percent: 100 }));
+        assert!(has_skipped);
+
+        let non_string = IndexCondition {
+            conditions: vec![Condition::Equal("code".to_string(), "7".to_string())],
+        };
+        let (key, result, has_skipped) = search_vix_docs_optimized(
+            "native-complete-non-string",
+            &non_string,
+            Some(mode),
+            &complete,
+            VixReadMode::Cached,
+            &fetch_stats,
+            None,
+            String::new(),
+        )
+        .await
+        .unwrap();
+        assert!(key.is_empty());
+        assert!(matches!(result, VixSearchResult::Skipped { percent: 100 }));
+        assert!(has_skipped);
     }
 }
 

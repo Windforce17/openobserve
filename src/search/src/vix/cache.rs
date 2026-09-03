@@ -58,8 +58,14 @@ pub enum CacheEntry {
         width: i64,
         counts: Vec<u64>,
     },
-    /// multi histogram optimization
-    MultiHistogram(Vec<(i64, String, u64)>),
+    /// multi histogram optimization, stored with absolute raw-timestamp
+    /// bucket starts so zero-offset sliding-window hits can be filtered and
+    /// exact nonzero-offset entries can rematerialize local bucket labels.
+    MultiHistogram {
+        width: i64,
+        phase: i64,
+        rows: Vec<(i64, String, u64)>,
+    },
     /// group-by top-n optimization
     TopN(Vec<(Vec<String>, u64)>),
     /// simple distinct optimization
@@ -72,9 +78,9 @@ pub enum CacheEntry {
 impl CacheEntry {
     /// Materialize the entry as the query's [`VixSearchResult`]. Histogram
     /// entries live on their own absolute grid and reposition into the
-    /// query's `SimpleHistogram` grid; `None` means the entry cannot serve
-    /// this query (grid mismatch — treat as a cache miss). Every other
-    /// variant converts unconditionally.
+    /// requesting histogram grid; `None` means the entry cannot serve this
+    /// query (grid mismatch — treat as a cache miss). Every other variant
+    /// converts unconditionally.
     fn into_result(self, rule: Option<&IndexOptimizeMode>) -> Option<VixSearchResult> {
         Some(match self {
             CacheEntry::RowIds(row_ids, row_group_size) => VixSearchResult::RowIdsSelection {
@@ -126,8 +132,38 @@ impl CacheEntry {
                 }
                 VixSearchResult::Histogram(out)
             }
-            CacheEntry::MultiHistogram(multi_histogram) => {
-                VixSearchResult::MultiHistogram(multi_histogram)
+            CacheEntry::MultiHistogram { width, phase, rows } => {
+                let Some(IndexOptimizeMode::SimpleMultiHistogram(
+                    min_value,
+                    max_value,
+                    bucket_width,
+                    ts_offset,
+                    _,
+                )) = rule
+                else {
+                    return None;
+                };
+                let q_width = i64::try_from((*bucket_width).max(1)).ok()?;
+                let raw_min = min_value.checked_sub(*ts_offset)?;
+                let raw_max = max_value.checked_sub(*ts_offset)?;
+                let q_phase = raw_min.rem_euclid(q_width);
+                if width != q_width || phase != q_phase {
+                    return None;
+                }
+
+                let mut out = Vec::with_capacity(rows.len());
+                for (raw_bucket, value, count) in rows {
+                    // Validate every cached row before filtering. A malformed
+                    // entry must miss rather than silently dropping a row
+                    // that belongs to a different grid.
+                    if raw_bucket.rem_euclid(q_width) != q_phase {
+                        return None;
+                    }
+                    if raw_bucket >= raw_min && raw_bucket < raw_max {
+                        out.push((raw_bucket.checked_add(*ts_offset)?, value, count));
+                    }
+                }
+                VixSearchResult::MultiHistogram(out)
             }
             CacheEntry::TopN(top_n) => VixSearchResult::TopN(top_n),
             CacheEntry::Distinct(distinct) => VixSearchResult::Distinct(distinct),
@@ -150,14 +186,14 @@ impl CacheEntry {
                     + std::mem::size_of::<Vec<u64>>()
                     + 2 * std::mem::size_of::<i64>()
             }
-            CacheEntry::MultiHistogram(multi_histogram) => {
-                multi_histogram
-                    .iter()
+            CacheEntry::MultiHistogram { rows, .. } => {
+                rows.iter()
                     .map(|(_, s, _)| {
                         s.capacity() + std::mem::size_of::<i64>() + std::mem::size_of::<u64>()
                     })
                     .sum::<usize>()
                     + std::mem::size_of::<Vec<(i64, String, u64)>>()
+                    + 2 * std::mem::size_of::<i64>()
             }
             CacheEntry::TopN(top_n) => {
                 top_n
@@ -650,10 +686,15 @@ mod tests {
 
         cache.put(
             "mhist".to_string(),
-            CacheEntry::MultiHistogram(vec![(1, "a".to_string(), 2)]),
+            CacheEntry::MultiHistogram {
+                width: 10,
+                phase: 1,
+                rows: vec![(1, "a".to_string(), 2)],
+            },
         );
+        let multi_rule = IndexOptimizeMode::SimpleMultiHistogram(1, 11, 10, 0, "level".to_string());
         assert!(matches!(
-            cache.get("mhist", None),
+            cache.get("mhist", Some(&multi_rule)),
             Some(VixSearchResult::MultiHistogram(rows)) if rows == vec![(1, "a".to_string(), 2)]
         ));
 
@@ -677,5 +718,57 @@ mod tests {
 
         // every fast-path entry reports a non-zero footprint
         assert!(cache.memory_size() > 0);
+    }
+
+    #[test]
+    fn test_multi_histogram_materialization_filters_and_rejects_bad_grid() {
+        let cache = VixResultCache::new(10);
+        cache.put(
+            "multi".to_string(),
+            CacheEntry::MultiHistogram {
+                width: 10,
+                phase: 0,
+                rows: vec![
+                    (0, "outside-low".to_string(), 1),
+                    (10, "a".to_string(), 2),
+                    (20, "b".to_string(), 3),
+                    (30, "outside-high".to_string(), 4),
+                ],
+            },
+        );
+
+        // A shifted zero-offset request keeps the same grid but narrows the
+        // absolute range. Only rows inside [10, 30) are returned.
+        let shifted = IndexOptimizeMode::SimpleMultiHistogram(10, 30, 10, 0, "level".to_string());
+        assert!(matches!(
+            cache.get("multi", Some(&shifted)),
+            Some(VixSearchResult::MultiHistogram(rows))
+                if rows == vec![(10, "a".to_string(), 2), (20, "b".to_string(), 3)]
+        ));
+
+        let wrong_phase =
+            IndexOptimizeMode::SimpleMultiHistogram(11, 31, 10, 0, "level".to_string());
+        let wrong_width =
+            IndexOptimizeMode::SimpleMultiHistogram(10, 30, 20, 0, "level".to_string());
+        assert!(cache.get("multi", Some(&wrong_phase)).is_none());
+        assert!(cache.get("multi", Some(&wrong_width)).is_none());
+        assert!(cache.get("multi", None).is_none());
+
+        cache.put(
+            "malformed".to_string(),
+            CacheEntry::MultiHistogram {
+                width: 10,
+                phase: 0,
+                rows: vec![(15, "misaligned".to_string(), 1)],
+            },
+        );
+        assert!(
+            cache.get("malformed", Some(&shifted)).is_none(),
+            "a malformed row must make the whole entry miss"
+        );
+
+        let overflowing =
+            IndexOptimizeMode::SimpleMultiHistogram(i64::MIN, i64::MAX, 10, 1, "level".to_string());
+        assert!(cache.get("multi", Some(&overflowing)).is_none());
     }
 }
