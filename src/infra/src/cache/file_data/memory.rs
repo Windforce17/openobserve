@@ -15,13 +15,14 @@
 
 use std::{
     cmp::{max, min},
+    future::Future,
     ops::Range,
     sync::LazyLock as Lazy,
 };
 
 use bytes::Bytes;
 use config::{
-    RwHashMap, get_config, is_local_disk_storage, metrics, spawn_pausable_job,
+    RwHashMap, get_config, metrics, spawn_pausable_job,
     utils::{
         hash::{Sum64, gxhash},
         time::BASE_TIME,
@@ -50,11 +51,21 @@ static DATA: Lazy<Vec<RwHashMap<String, Bytes>>> = Lazy::new(|| {
     data
 });
 
+type SpillEntry = (String, Bytes);
+
+#[derive(Default)]
+struct SetTransition {
+    evicted: Vec<SpillEntry>,
+    bypassed: Option<SpillEntry>,
+}
+
 pub struct FileData {
     cur_size: usize,
     data: CacheStrategy,
     #[cfg(test)]
     max_size: Option<usize>,
+    #[cfg(test)]
+    release_size: Option<usize>,
 }
 
 impl Default for FileData {
@@ -75,6 +86,8 @@ impl FileData {
             data: CacheStrategy::new(strategy),
             #[cfg(test)]
             max_size: None,
+            #[cfg(test)]
+            release_size: None,
         }
     }
 
@@ -84,6 +97,21 @@ impl FileData {
             cur_size: 0,
             data: CacheStrategy::new(strategy),
             max_size: Some(max_size),
+            release_size: Some(0),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_cache_strategy_and_limits(
+        strategy: &str,
+        max_size: usize,
+        release_size: usize,
+    ) -> FileData {
+        FileData {
+            cur_size: 0,
+            data: CacheStrategy::new(strategy),
+            max_size: Some(max_size),
+            release_size: Some(release_size),
         }
     }
 
@@ -107,41 +135,76 @@ impl FileData {
         Some(data.value().len())
     }
 
-    async fn set(&mut self, file: &str, data: Bytes) -> Result<(), anyhow::Error> {
-        let data_size = file.len() + data.len();
+    fn set(&mut self, file: &str, data: Bytes) -> Result<SetTransition, anyhow::Error> {
+        if self.data.contains_key(file) {
+            return Ok(SetTransition::default());
+        }
+
+        let data_size = file.len().saturating_add(data.len());
         #[cfg(test)]
         let max_size = self.max_size.unwrap_or(get_config().memory_cache.max_size);
         #[cfg(not(test))]
         let max_size = get_config().memory_cache.max_size;
-        if self.cur_size + data_size >= max_size {
-            log::info!("File memory cache is full, can't cache extra {data_size} bytes");
-            // cache is full, need release some space
-            let need_release_size = min(
-                self.cur_size,
-                max(get_config().memory_cache.release_size, data_size * 100),
+
+        // A single entry that cannot fit in an empty bucket must never enter
+        // memory. Return ownership so the caller can dispose of the
+        // best-effort cache fill after releasing the metadata lock.
+        if data_size > max_size {
+            log::info!(
+                "File memory cache bypassing {data_size} byte entry larger than {max_size} byte bucket"
             );
-            self.gc(need_release_size).await?;
+            return Ok(SetTransition {
+                bypassed: Some((file.to_string(), data)),
+                ..Default::default()
+            });
+        }
+
+        let required_release = self
+            .cur_size
+            .saturating_add(data_size)
+            .saturating_sub(max_size);
+        let evicted = if required_release > 0 {
+            #[cfg(test)]
+            let configured_release = self
+                .release_size
+                .unwrap_or(get_config().memory_cache.release_size);
+            #[cfg(not(test))]
+            let configured_release = get_config().memory_cache.release_size;
+            let release_target = min(self.cur_size, max(configured_release, required_release));
+            log::info!(
+                "File memory cache is full, releasing up to {release_target} bytes for {data_size} byte entry"
+            );
+            self.gc(release_target)
+        } else {
+            Vec::new()
+        };
+
+        // A corrupt/incomplete strategy must not turn a failed eviction into
+        // an over-capacity insertion.
+        if self.cur_size > max_size - data_size {
+            log::warn!(
+                "File memory cache could not release enough space; bypassing {data_size} byte entry"
+            );
+            return Ok(SetTransition {
+                evicted,
+                bypassed: Some((file.to_string(), data)),
+            });
         }
 
         self.cur_size += data_size;
         self.data.insert(file.to_string(), data_size);
-        // write file into cache
         let idx = get_bucket_idx(file);
         DATA[idx].insert(file.to_string(), data);
-        // metrics
-        let columns = file.split('/').collect::<Vec<&str>>();
-        if columns[0] == "files" {
-            metrics::QUERY_MEMORY_CACHE_FILES
-                .with_label_values(&[columns[1], columns[2]])
-                .inc();
-            metrics::QUERY_MEMORY_CACHE_USED_BYTES
-                .with_label_values(&[columns[1], columns[2]])
-                .add(data_size as i64);
-        }
-        Ok(())
+        update_metrics(file, data_size, true);
+
+        debug_assert!(self.cur_size <= max_size);
+        Ok(SetTransition {
+            evicted,
+            bypassed: None,
+        })
     }
 
-    async fn gc(&mut self, need_release_size: usize) -> Result<(), anyhow::Error> {
+    fn gc(&mut self, need_release_size: usize) -> Vec<SpillEntry> {
         log::info!(
             "File memory cache start gc {}/{}, need to release {} bytes",
             self.cur_size,
@@ -149,65 +212,37 @@ impl FileData {
             need_release_size
         );
         let mut release_size = 0;
-        loop {
-            let item = self.data.remove();
-            if item.is_none() {
+        let mut spills = Vec::new();
+        while release_size < need_release_size {
+            let Some((key, data_size)) = self.data.remove() else {
                 log::warn!("File memory cache is corrupt, it shouldn't be none");
                 break;
-            }
-            let (key, data_size) = item.unwrap();
-            // move the file from memory to disk cache
+            };
+
             let idx = get_bucket_idx(&key);
-            if let Some((key, data)) = DATA[idx].remove(&key)
-                && !is_local_disk_storage()
-            {
-                _ = super::disk::set(&key, data).await;
+            if let Some((key, data)) = DATA[idx].remove(&key) {
+                spills.push((key, data));
             }
-            // metrics
-            let columns = key.split('/').collect::<Vec<&str>>();
-            if columns[0] == "files" {
-                metrics::QUERY_MEMORY_CACHE_FILES
-                    .with_label_values(&[columns[1], columns[2]])
-                    .dec();
-                metrics::QUERY_MEMORY_CACHE_USED_BYTES
-                    .with_label_values(&[columns[1], columns[2]])
-                    .sub(data_size as i64);
-            }
+            self.cur_size -= data_size;
             release_size += data_size;
-            if release_size >= need_release_size {
-                break;
-            }
+            update_metrics(&key, data_size, false);
         }
-        self.cur_size -= release_size;
-        let _ = DATA.iter().map(|c| c.shrink_to_fit()).collect::<Vec<_>>();
         log::info!("File memory cache gc done, released {release_size} bytes");
-        Ok(())
+        spills
     }
 
-    async fn remove(&mut self, file: &str) -> Result<(), anyhow::Error> {
+    fn remove(&mut self, file: &str) -> bool {
         log::debug!("File memory cache remove file {file}");
 
         let Some((key, data_size)) = self.data.remove_key(file) else {
-            return Ok(());
+            return false;
         };
         self.cur_size -= data_size;
 
-        // remove file from data cache
         let idx = get_bucket_idx(&key);
         DATA[idx].remove(&key);
-
-        // metrics
-        let columns = key.split('/').collect::<Vec<&str>>();
-        if columns[0] == "files" {
-            metrics::QUERY_MEMORY_CACHE_FILES
-                .with_label_values(&[columns[1], columns[2]])
-                .dec();
-            metrics::QUERY_MEMORY_CACHE_USED_BYTES
-                .with_label_values(&[columns[1], columns[2]])
-                .sub(data_size as i64);
-        }
-
-        Ok(())
+        update_metrics(&key, data_size, false);
+        true
     }
 
     fn size(&self) -> usize {
@@ -221,6 +256,52 @@ impl FileData {
     fn is_empty(&self) -> bool {
         self.data.is_empty()
     }
+}
+
+fn update_metrics(file: &str, data_size: usize, added: bool) {
+    let mut columns = file.split('/');
+    if columns.next() != Some("files") {
+        return;
+    }
+    let (Some(org_id), Some(stream_type)) = (columns.next(), columns.next()) else {
+        return;
+    };
+    let files = metrics::QUERY_MEMORY_CACHE_FILES.with_label_values(&[org_id, stream_type]);
+    let bytes = metrics::QUERY_MEMORY_CACHE_USED_BYTES.with_label_values(&[org_id, stream_type]);
+    if added {
+        files.inc();
+        bytes.add(data_size as i64);
+    } else {
+        files.dec();
+        bytes.sub(data_size as i64);
+    }
+}
+
+async fn apply_set_transition(transition: SetTransition) -> Result<(), anyhow::Error> {
+    // Cache placement is best-effort. Dropping detached entries outside the
+    // metadata lock keeps both memory and disk-cache bounds intact and cannot
+    // resurrect a key after an invalidation. Object storage and any existing
+    // disk-cache entry remain authoritative.
+    drop(transition.evicted);
+    drop(transition.bypassed);
+    Ok(())
+}
+
+async fn set_with_spill<F, Fut>(
+    files: &RwLock<FileData>,
+    file: &str,
+    data: Bytes,
+    spill: F,
+) -> Result<(), anyhow::Error>
+where
+    F: FnOnce(SetTransition) -> Fut,
+    Fut: Future<Output = Result<(), anyhow::Error>>,
+{
+    let transition = {
+        let mut files = files.write().await;
+        files.set(file, data)?
+    };
+    spill(transition).await
 }
 
 pub async fn init() -> Result<(), anyhow::Error> {
@@ -337,11 +418,7 @@ pub async fn set(file: &str, data: Bytes) -> Result<(), anyhow::Error> {
         return Ok(());
     }
     let idx = get_bucket_idx(file);
-    let mut files = FILES[idx].write().await;
-    if files.exist(file).await {
-        return Ok(());
-    }
-    files.set(file, data).await
+    set_with_spill(&FILES[idx], file, data, apply_set_transition).await
 }
 
 #[inline]
@@ -351,7 +428,8 @@ pub async fn remove(file: &str) -> Result<(), anyhow::Error> {
     }
     let idx = get_bucket_idx(file);
     let mut files = FILES[idx].write().await;
-    files.remove(file).await
+    files.remove(file);
+    Ok(())
 }
 
 async fn gc() -> Result<(), anyhow::Error> {
@@ -361,14 +439,18 @@ async fn gc() -> Result<(), anyhow::Error> {
     }
 
     for file in FILES.iter() {
-        let r = file.read().await;
-        if r.cur_size + cfg.memory_cache.release_size < cfg.memory_cache.max_size {
-            continue;
-        }
-        drop(r);
-        let mut w = file.write().await;
-        w.gc(cfg.memory_cache.gc_size).await?;
-        drop(w);
+        let evicted = {
+            let mut files = file.write().await;
+            if files.cur_size.saturating_add(cfg.memory_cache.release_size)
+                < cfg.memory_cache.max_size
+            {
+                continue;
+            }
+            files.gc(cfg.memory_cache.gc_size)
+        };
+        // Periodic eviction deliberately does not demote to disk. Disk and
+        // remote storage remain authoritative, and no I/O follows this lock.
+        drop(evicted);
     }
 
     Ok(())
@@ -437,7 +519,7 @@ mod tests {
             let file_key = format!(
                 "files/default/logs/memory/2022/10/03/10/6982652937134804993_1_{i}.parquet"
             );
-            let resp = file_data.set(&file_key, content.clone()).await;
+            let resp = file_data.set(&file_key, content.clone());
             assert!(resp.is_ok());
         }
     }
@@ -449,10 +531,10 @@ mod tests {
         let file_key = "files/default/logs/memory/2022/10/03/10/6982652937134804993_2_1.parquet";
         let content = Bytes::from("Some text");
 
-        file_data.set(file_key, content.clone()).await.unwrap();
+        file_data.set(file_key, content.clone()).unwrap();
         assert_eq!(file_data.get(file_key, None).await.unwrap(), content);
 
-        file_data.set(file_key, content.clone()).await.unwrap();
+        file_data.set(file_key, content.clone()).unwrap();
         assert!(file_data.exist(file_key).await);
         assert_eq!(file_data.get(file_key, None).await.unwrap(), content);
         assert!(file_data.size() > 0);
@@ -465,10 +547,10 @@ mod tests {
         let file_key2 = "files/default/logs/memory/2022/10/03/10/6982652937134804993_3_2.parquet";
         let content = Bytes::from("Some text");
         // set one key
-        file_data.set(file_key1, content.clone()).await.unwrap();
+        file_data.set(file_key1, content.clone()).unwrap();
         assert_eq!(file_data.get(file_key1, None).await.unwrap(), content);
         // set another key, will release first key
-        file_data.set(file_key2, content.clone()).await.unwrap();
+        file_data.set(file_key2, content.clone()).unwrap();
         assert_eq!(file_data.get(file_key2, None).await.unwrap(), content);
         // get first key, should get error
         assert!(file_data.get(file_key1, None).await.is_none());
@@ -482,7 +564,7 @@ mod tests {
             let file_key = format!(
                 "files/default/logs/memory/2022/10/03/10/6982652937134804993_4_{i}.parquet"
             );
-            let resp = file_data.set(&file_key, content.clone()).await;
+            let resp = file_data.set(&file_key, content.clone());
             assert!(resp.is_ok());
         }
     }
@@ -494,10 +576,10 @@ mod tests {
         let file_key = "files/default/logs/memory/2022/10/03/10/6982652937134804993_5_1.parquet";
         let content = Bytes::from("Some text");
 
-        file_data.set(file_key, content.clone()).await.unwrap();
+        file_data.set(file_key, content.clone()).unwrap();
         assert_eq!(file_data.get(file_key, None).await.unwrap(), content);
 
-        file_data.set(file_key, content.clone()).await.unwrap();
+        file_data.set(file_key, content.clone()).unwrap();
         assert!(file_data.exist(file_key).await);
         assert_eq!(file_data.get(file_key, None).await.unwrap(), content);
         assert!(file_data.size() > 0);
@@ -510,10 +592,10 @@ mod tests {
         let file_key2 = "files/default/logs/memory/2022/10/03/10/6982652937134804993_6_2.parquet";
         let content = Bytes::from("Some text");
         // set one key
-        file_data.set(file_key1, content.clone()).await.unwrap();
+        file_data.set(file_key1, content.clone()).unwrap();
         assert_eq!(file_data.get(file_key1, None).await.unwrap(), content);
         // set another key, will release first key
-        file_data.set(file_key2, content.clone()).await.unwrap();
+        file_data.set(file_key2, content.clone()).unwrap();
         assert_eq!(file_data.get(file_key2, None).await.unwrap(), content);
         // get first key, should get error
         assert!(file_data.get(file_key1, None).await.is_none());
@@ -549,7 +631,7 @@ mod tests {
         let bucket_id = gxhash::new().sum64(&test_key);
         let bucket_id = (bucket_id as usize) % FILES.len();
         let mut file_data = FILES[bucket_id].write().await;
-        let _ = file_data.set(&test_key, content.clone()).await;
+        let _ = file_data.set(&test_key, content.clone());
         drop(file_data);
 
         // Get stats after adding data
@@ -582,7 +664,7 @@ mod tests {
             let bucket_id = gxhash::new().sum64(&file_key);
             let bucket_id = (bucket_id as usize) % FILES.len();
             let mut file_data = FILES[bucket_id].write().await;
-            let _ = file_data.set(&file_key, content.clone()).await;
+            let _ = file_data.set(&file_key, content.clone());
             drop(file_data);
         }
 
@@ -636,7 +718,7 @@ mod tests {
         let bucket_id = gxhash::new().sum64(&small_key);
         let bucket_id = (bucket_id as usize) % FILES.len();
         let mut file_data = FILES[bucket_id].write().await;
-        let _ = file_data.set(&small_key, small_content.clone()).await;
+        let _ = file_data.set(&small_key, small_content.clone());
         drop(file_data);
 
         // Add large data
@@ -645,7 +727,7 @@ mod tests {
         let bucket_id = gxhash::new().sum64(&large_key);
         let bucket_id = (bucket_id as usize) % FILES.len();
         let mut file_data = FILES[bucket_id].write().await;
-        let _ = file_data.set(&large_key, large_content.clone()).await;
+        let _ = file_data.set(&large_key, large_content.clone());
         drop(file_data);
 
         // Get stats after adding both small and large data
@@ -656,6 +738,190 @@ mod tests {
             small_key.len() + small_content.len() + large_key.len() + large_content.len();
         assert!(after_used >= initial_used + min_expected_increase);
         assert!(after_len >= initial_len + 2); // Added 2 items
+    }
+
+    fn bytes_for_entry_size(key: &str, entry_size: usize) -> Bytes {
+        assert!(entry_size >= key.len());
+        Bytes::from(vec![b'x'; entry_size - key.len()])
+    }
+
+    #[tokio::test]
+    async fn test_set_releases_only_bounded_space() {
+        let keys = ["bounded-a", "bounded-b", "bounded-c", "bounded-d"];
+        let mut file_data = FileData::with_cache_strategy_and_limits("fifo", 90, 10);
+
+        for key in &keys[..3] {
+            let transition = file_data.set(key, bytes_for_entry_size(key, 30)).unwrap();
+            assert!(transition.evicted.is_empty());
+            assert!(transition.bypassed.is_none());
+        }
+        assert_eq!(file_data.size(), 90);
+
+        let transition = file_data
+            .set(keys[3], bytes_for_entry_size(keys[3], 20))
+            .unwrap();
+
+        assert_eq!(transition.evicted.len(), 1);
+        assert_eq!(transition.evicted[0].0, keys[0]);
+        assert!(transition.bypassed.is_none());
+        assert_eq!(file_data.size(), 80);
+        assert_eq!(file_data.len(), 3);
+        assert!(!file_data.exist(keys[0]).await);
+        for key in &keys[1..] {
+            assert!(file_data.exist(key).await);
+            assert!(file_data.remove(key));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_set_honors_release_size_without_flushing_bucket() {
+        let keys = [
+            "release-size-00",
+            "release-size-01",
+            "release-size-02",
+            "release-size-03",
+            "release-size-04",
+            "release-size-05",
+            "release-size-06",
+            "release-size-07",
+            "release-size-08",
+            "release-size-09",
+            "release-size-10",
+        ];
+        let mut file_data = FileData::with_cache_strategy_and_limits("fifo", 300, 50);
+        for key in &keys[..10] {
+            let transition = file_data.set(key, bytes_for_entry_size(key, 30)).unwrap();
+            assert!(transition.evicted.is_empty());
+            assert!(transition.bypassed.is_none());
+        }
+
+        let transition = file_data
+            .set(keys[10], bytes_for_entry_size(keys[10], 30))
+            .unwrap();
+
+        // The 50-byte configured release is rounded up only by whole entries.
+        assert_eq!(transition.evicted.len(), 2);
+        assert!(transition.bypassed.is_none());
+        assert_eq!(file_data.size(), 270);
+        assert_eq!(file_data.len(), 9);
+        for key in &keys[2..] {
+            assert!(file_data.remove(key));
+        }
+    }
+
+    #[test]
+    fn test_oversized_entry_bypasses_memory_without_copying() {
+        let key = "oversized-entry";
+        let data = Bytes::from(vec![b'x'; 32]);
+        let data_ptr = data.as_ptr();
+        let mut file_data = FileData::with_cache_strategy_and_limits("fifo", 32, 8);
+
+        let transition = file_data.set(key, data).unwrap();
+
+        assert!(transition.evicted.is_empty());
+        let (bypassed_key, bypassed_data) = transition.bypassed.unwrap();
+        assert_eq!(bypassed_key, key);
+        assert_eq!(bypassed_data.as_ptr(), data_ptr);
+        assert_eq!(file_data.size(), 0);
+        assert_eq!(file_data.len(), 0);
+        assert!(!DATA[get_bucket_idx(key)].contains_key(key));
+    }
+
+    #[tokio::test]
+    async fn test_eviction_and_remove_keep_accounting_exact() {
+        let org_id = format!("memory-gc-accounting-{}", config::utils::time::now_micros());
+        let keys = [
+            format!("files/{org_id}/logs/a"),
+            format!("files/{org_id}/logs/b"),
+            format!("files/{org_id}/logs/c"),
+        ];
+        let payload = Bytes::from_static(b"accounting");
+        let entry_size = keys[0].len() + payload.len();
+        assert!(keys.iter().all(|key| key.len() == keys[0].len()));
+
+        let files_metric = metrics::QUERY_MEMORY_CACHE_FILES.with_label_values(&[&org_id, "logs"]);
+        let bytes_metric =
+            metrics::QUERY_MEMORY_CACHE_USED_BYTES.with_label_values(&[&org_id, "logs"]);
+        let initial_files = files_metric.get();
+        let initial_bytes = bytes_metric.get();
+        let mut file_data = FileData::with_cache_strategy_and_limits("fifo", entry_size * 2, 0);
+
+        let first = file_data.set(&keys[0], payload.clone()).unwrap();
+        let second = file_data.set(&keys[1], payload.clone()).unwrap();
+        assert!(first.evicted.is_empty() && first.bypassed.is_none());
+        assert!(second.evicted.is_empty() && second.bypassed.is_none());
+        assert_eq!(file_data.size(), entry_size * 2);
+        assert_eq!(file_data.len(), 2);
+        assert_eq!(files_metric.get(), initial_files + 2);
+        assert_eq!(bytes_metric.get(), initial_bytes + (entry_size * 2) as i64);
+
+        let transition = file_data.set(&keys[2], payload).unwrap();
+        assert_eq!(transition.evicted.len(), 1);
+        assert_eq!(transition.evicted[0].0, keys[0]);
+        assert!(transition.bypassed.is_none());
+        assert_eq!(file_data.size(), entry_size * 2);
+        assert_eq!(file_data.len(), 2);
+        assert_eq!(files_metric.get(), initial_files + 2);
+        assert_eq!(bytes_metric.get(), initial_bytes + (entry_size * 2) as i64);
+
+        assert!(file_data.remove(&keys[1]));
+        assert!(file_data.remove(&keys[2]));
+        assert_eq!(file_data.size(), 0);
+        assert_eq!(file_data.len(), 0);
+        assert_eq!(files_metric.get(), initial_files);
+        assert_eq!(bytes_metric.get(), initial_bytes);
+    }
+
+    #[tokio::test]
+    async fn test_reader_proceeds_while_slow_spill_is_outside_lock() {
+        let first_key = "slow-spill-a";
+        let second_key = "slow-spill-b";
+        let entry_size = first_key.len() + 16;
+        let cache = std::sync::Arc::new(RwLock::new(FileData::with_cache_strategy_and_limits(
+            "fifo", entry_size, 0,
+        )));
+        set_with_spill(
+            cache.as_ref(),
+            first_key,
+            Bytes::from(vec![b'a'; 16]),
+            |_| async { Ok(()) },
+        )
+        .await
+        .unwrap();
+
+        let (spill_started_tx, spill_started_rx) = tokio::sync::oneshot::channel();
+        let (finish_spill_tx, finish_spill_rx) = tokio::sync::oneshot::channel();
+        let writer_cache = cache.clone();
+        let writer = tokio::spawn(async move {
+            set_with_spill(
+                writer_cache.as_ref(),
+                second_key,
+                Bytes::from(vec![b'b'; 16]),
+                |transition| async move {
+                    assert_eq!(transition.evicted.len(), 1);
+                    assert_eq!(transition.evicted[0].0, first_key);
+                    assert!(transition.bypassed.is_none());
+                    spill_started_tx.send(()).unwrap();
+                    finish_spill_rx.await.unwrap();
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+        });
+
+        spill_started_rx.await.unwrap();
+        let exists = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            let files = cache.read().await;
+            files.exist(second_key).await
+        })
+        .await
+        .expect("reader blocked behind disk spill");
+        assert!(exists);
+
+        finish_spill_tx.send(()).unwrap();
+        writer.await.unwrap();
+        assert!(cache.write().await.remove(second_key));
     }
 
     #[test]
