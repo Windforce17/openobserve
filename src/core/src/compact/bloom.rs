@@ -24,10 +24,11 @@
 //!   term emission) — the assembler reads the blob (one ranged fetch) and TRANSPOSES its raw SBBF
 //!   blocks into the group `.bf`, never re-reading dictionaries or re-hashing values;
 //! - older files fall back to ONE full term-dictionary stream that hashes additive per-field values
-//!   plus composite values from term-capable fields admitted by the composite scope;
-//! - streams with neither additive `bloom_filter_fields` nor an enabled composite scope are stamped
-//!   with the NO_BLOOM sentinel so the queue drains (the pruner treats `bloom_ver <= 0` as "no
-//!   bloom", never forming a `.bf` path);
+//!   plus composite values from term-capable fields admitted by the explicit/broad composite scope
+//!   or the enabled semantic AUTO ID scope;
+//! - streams with neither additive `bloom_filter_fields` nor an enabled composite/AUTO ID scope are
+//!   stamped with the NO_BLOOM sentinel so the queue drains (the pruner treats `bloom_ver <= 0` as
+//!   "no bloom", never forming a `.bf` path);
 //! - files whose own bytes fail validation (a DETERMINISTIC failure — corrupt dictionary/terms/
 //!   bloom blob, or a checked build that refuses to publish) are stamped [`BLOOM_VER_UNBUILDABLE`]:
 //!   retrying can never succeed, so they leave the queue after one attempt instead of spinning
@@ -43,7 +44,7 @@
 use std::sync::Arc;
 
 use config::{get_config, meta::stream::FileKey, utils::time::now_micros};
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use infra::{
     bloom::{BloomWriter, FieldBloom},
     dist_lock,
@@ -95,6 +96,17 @@ pub async fn run() -> Result<(), anyhow::Error> {
         std::sync::atomic::Ordering::Relaxed,
     );
     let composite_scope = config::vix_bloom_composite_scope(&cfg);
+    let auto_id_scope =
+        cfg.common.vix_bloom_only_auto_id_only && cfg.common.vix_bloom_only_auto_ratio > 0.0;
+    let bloom_only_never = Arc::new(
+        cfg.common
+            .vix_bloom_only_never
+            .split(',')
+            .map(str::trim)
+            .filter(|field| !field.is_empty())
+            .map(str::to_owned)
+            .collect::<HashSet<_>>(),
+    );
     let (mut done, mut busy, mut failed) = (0usize, 0usize, 0usize);
     for (stream_key, date) in buckets {
         let Some((org_id, stream_type, stream_name)) = parse_stream_key(&stream_key) else {
@@ -108,6 +120,8 @@ pub async fn run() -> Result<(), anyhow::Error> {
             &date,
             cfg.common.vix_bloom_fpp,
             &composite_scope,
+            auto_id_scope,
+            &bloom_only_never,
         )
         .await
         {
@@ -149,6 +163,8 @@ async fn process_bucket(
     date: &str,
     fpp: f64,
     composite_scope: &config::VixBloomCompositeScope,
+    auto_id_scope: bool,
+    bloom_only_never: &Arc<HashSet<String>>,
 ) -> Result<bool, anyhow::Error> {
     let stream_type: config::meta::stream::StreamType = stream_type.into();
 
@@ -168,17 +184,39 @@ async fn process_bucket(
             return Ok(false);
         }
     };
-    let result =
-        process_bucket_locked(org_id, stream_type, stream_name, date, fpp, composite_scope).await;
+    let result = process_bucket_locked(
+        org_id,
+        stream_type,
+        stream_name,
+        date,
+        fpp,
+        composite_scope,
+        auto_id_scope,
+        bloom_only_never,
+    )
+    .await;
     dist_lock::unlock(&locker).await?;
     result.map(|_| true)
+}
+
+fn composite_scope_allows(
+    composite_scope: &config::VixBloomCompositeScope,
+    auto_id_scope: bool,
+    bloom_only_never: &HashSet<String>,
+    field: &str,
+) -> bool {
+    composite_scope.allows(field)
+        || (auto_id_scope
+            && !bloom_only_never.contains(field)
+            && vortex_index::is_id_like_field_name(field))
 }
 
 fn bloom_policy_enabled(
     bloom_fields: &[String],
     composite_scope: &config::VixBloomCompositeScope,
+    auto_id_scope: bool,
 ) -> bool {
-    !bloom_fields.is_empty() || composite_scope.enabled()
+    !bloom_fields.is_empty() || composite_scope.enabled() || auto_id_scope
 }
 
 async fn process_bucket_locked(
@@ -188,6 +226,8 @@ async fn process_bucket_locked(
     date: &str,
     fpp: f64,
     composite_scope: &config::VixBloomCompositeScope,
+    auto_id_scope: bool,
+    bloom_only_never: &Arc<HashSet<String>>,
 ) -> Result<(), anyhow::Error> {
     // re-check under the lock (another compactor may have built it)
     let files = infra::file_list::query_for_bloom(org_id, stream_type, stream_name, date).await?;
@@ -200,7 +240,7 @@ async fn process_bucket_locked(
     let bloom_fields = get_stream_setting_bloom_filter_fields(&stream_settings);
     // A selective composite scope needs no per-stream field config because
     // eligibility is file-specific.
-    if !bloom_policy_enabled(&bloom_fields, composite_scope) {
+    if !bloom_policy_enabled(&bloom_fields, composite_scope, auto_id_scope) {
         // nothing to build for this stream — drain the queue
         let ids: Vec<i64> = files.iter().map(|f| f.id).collect();
         infra::file_list::update_bloom_ver(&ids, BLOOM_VER_NOT_APPLICABLE).await?;
@@ -229,8 +269,18 @@ async fn process_bucket_locked(
         stream::iter(files.iter().cloned().map(|file| {
             let bloom_fields = bloom_fields.clone();
             let composite_scope = composite_scope;
+            let auto_id_scope = auto_id_scope;
+            let bloom_only_never = Arc::clone(bloom_only_never);
             async move {
-                let loaded = load_file_blooms(&file, &bloom_fields, fpp, composite_scope).await;
+                let loaded = load_file_blooms(
+                    &file,
+                    &bloom_fields,
+                    fpp,
+                    composite_scope,
+                    auto_id_scope,
+                    bloom_only_never,
+                )
+                .await;
                 (file.id, file.key, loaded)
             }
         }))
@@ -362,6 +412,8 @@ async fn load_file_blooms(
     bloom_fields: &[String],
     fpp: f64,
     composite_scope: &config::VixBloomCompositeScope,
+    auto_id_scope: bool,
+    bloom_only_never: Arc<HashSet<String>>,
 ) -> Result<LoadedBlooms, anyhow::Error> {
     let handle = tokio::runtime::Handle::current();
     let source: Arc<dyn vortex_index::VixRangeSource> = Arc::new(HealProbeRangeSource {
@@ -399,6 +451,8 @@ async fn load_file_blooms(
             &bloom_fields,
             fpp,
             &composite_scope,
+            auto_id_scope,
+            &bloom_only_never,
             &file_key,
             &FALLBACK_BUDGET,
         )
@@ -414,6 +468,8 @@ fn load_blooms_sync(
     bloom_fields: &[String],
     fpp: f64,
     composite_scope: &config::VixBloomCompositeScope,
+    auto_id_scope: bool,
+    bloom_only_never: &HashSet<String>,
     file_key: &str,
     budget: &std::sync::atomic::AtomicI64,
 ) -> Result<LoadedBlooms, anyhow::Error> {
@@ -425,6 +481,8 @@ fn load_blooms_sync(
                 bloom_fields,
                 fpp,
                 composite_scope,
+                auto_id_scope,
+                bloom_only_never,
                 file_key,
                 budget,
             );
@@ -445,11 +503,26 @@ fn load_blooms_sync(
     // Do not consume a fallback slot when this file has no COMPLETE requested
     // raw-string term source. Numeric/type-drifted and partial fields must
     // stay fail-open rather than seeding authoritative guards.
-    if !has_requested_term_capability(reader, bloom_fields, composite_scope, file_key)? {
+    if !has_requested_term_capability(
+        reader,
+        bloom_fields,
+        composite_scope,
+        auto_id_scope,
+        bloom_only_never,
+        file_key,
+    )? {
         return Ok(LoadedBlooms::FromBlob(Vec::new()));
     }
     budgeted_backfill(budget, || {
-        blooms_from_dictionary(reader, bloom_fields, fpp, composite_scope, file_key)
+        blooms_from_dictionary(
+            reader,
+            bloom_fields,
+            fpp,
+            composite_scope,
+            auto_id_scope,
+            bloom_only_never,
+            file_key,
+        )
     })
 }
 
@@ -464,6 +537,8 @@ fn retain_and_supplement_blob(
     bloom_fields: &[String],
     fpp: f64,
     composite_scope: &config::VixBloomCompositeScope,
+    auto_id_scope: bool,
+    bloom_only_never: &HashSet<String>,
     context: &str,
     budget: &std::sync::atomic::AtomicI64,
 ) -> Result<LoadedBlooms, anyhow::Error> {
@@ -479,7 +554,8 @@ fn retain_and_supplement_blob(
         .term_fields()
         .filter(|(_id, name)| {
             let additive = bloom_fields.iter().any(|field| field == name);
-            let scoped = composite_scope.allows(name);
+            let scoped =
+                composite_scope_allows(composite_scope, auto_id_scope, bloom_only_never, name);
             if !additive && !scoped {
                 return false;
             }
@@ -542,6 +618,18 @@ fn retain_and_supplement_blob(
             }
         }
     }
+    if auto_id_scope {
+        for field in reader.bloom_only_fields().filter(|field| {
+            vortex_index::is_id_like_field_name(field)
+                && !bloom_only_never.contains(*field)
+                && requested_without_source(field)
+        }) {
+            log::debug!(
+                "[COMPACTOR:BLOOM] {context}: AUTO ID field {field:?} has no retained guard \
+                 coverage and no dictionary source; leaving it fail-open"
+            );
+        }
+    }
     if missing.is_empty() {
         return Ok(LoadedBlooms::FromBlob(wanted));
     }
@@ -566,20 +654,35 @@ fn has_requested_term_capability(
     reader: &VixReader,
     bloom_fields: &[String],
     composite_scope: &config::VixBloomCompositeScope,
+    auto_id_scope: bool,
+    bloom_only_never: &HashSet<String>,
     context: &str,
 ) -> Result<bool, anyhow::Error> {
-    Ok(!requested_complete_term_pairs(reader, bloom_fields, composite_scope, context)?.is_empty())
+    Ok(!requested_complete_term_pairs(
+        reader,
+        bloom_fields,
+        composite_scope,
+        auto_id_scope,
+        bloom_only_never,
+        context,
+    )?
+    .is_empty())
 }
 
 fn requested_complete_term_pairs(
     reader: &VixReader,
     bloom_fields: &[String],
     composite_scope: &config::VixBloomCompositeScope,
+    auto_id_scope: bool,
+    bloom_only_never: &HashSet<String>,
     context: &str,
 ) -> Result<Vec<(u16, String)>, anyhow::Error> {
     let eligible = complete_raw_string_term_pairs(
         reader,
-        |name| bloom_fields.iter().any(|field| field == name) || composite_scope.allows(name),
+        |name| {
+            bloom_fields.iter().any(|field| field == name)
+                || composite_scope_allows(composite_scope, auto_id_scope, bloom_only_never, name)
+        },
         context,
     )?;
     if let config::VixBloomCompositeScope::Only(fields) = composite_scope {
@@ -595,7 +698,8 @@ fn requested_complete_term_pairs(
     Ok(eligible
         .into_iter()
         .filter(|(_id, name)| {
-            bloom_fields.iter().any(|field| field == name) || composite_scope.allows(name)
+            bloom_fields.iter().any(|field| field == name)
+                || composite_scope_allows(composite_scope, auto_id_scope, bloom_only_never, name)
         })
         .collect())
 }
@@ -753,23 +857,18 @@ fn blooms_from_dictionary(
     bloom_fields: &[String],
     fpp: f64,
     composite_scope: &config::VixBloomCompositeScope,
+    auto_id_scope: bool,
+    bloom_only_never: &HashSet<String>,
     context: &str,
 ) -> Result<Vec<vortex_index::bloom::FileBloom>, anyhow::Error> {
-    let eligible = complete_raw_string_term_pairs(
+    let eligible = requested_complete_term_pairs(
         reader,
-        |name| bloom_fields.iter().any(|field| field == name) || composite_scope.allows(name),
+        bloom_fields,
+        composite_scope,
+        auto_id_scope,
+        bloom_only_never,
         context,
     )?;
-    if let config::VixBloomCompositeScope::Only(fields) = composite_scope {
-        for field in fields {
-            if !eligible.iter().any(|(_id, name)| name == field) {
-                log::debug!(
-                    "[COMPACTOR:BLOOM] {context}: requested composite field {field:?} has no \
-                     complete raw-string term source; leaving it uncovered (fail-open)"
-                );
-            }
-        }
-    }
     let pairs = eligible
         .iter()
         .filter(|(_id, name)| bloom_fields.iter().any(|field| field == name))
@@ -777,7 +876,9 @@ fn blooms_from_dictionary(
         .collect();
     let composite_pairs = eligible
         .into_iter()
-        .filter(|(_id, name)| composite_scope.allows(name))
+        .filter(|(_id, name)| {
+            composite_scope_allows(composite_scope, auto_id_scope, bloom_only_never, name)
+        })
         .collect();
     blooms_from_pairs(reader, pairs, composite_pairs, fpp, context)
 }
@@ -860,15 +961,21 @@ mod tests {
     #[test]
     fn only_empty_additive_and_disabled_scope_are_not_applicable() {
         let disabled = composite_scope(false, "");
-        assert!(!bloom_policy_enabled(&[], &disabled));
+        assert!(!bloom_policy_enabled(&[], &disabled, false));
         assert!(bloom_policy_enabled(
             &["service_name".to_string()],
-            &disabled
+            &disabled,
+            false,
         ));
         assert!(bloom_policy_enabled(
             &[],
-            &composite_scope(false, "trace_id")
+            &composite_scope(false, "trace_id"),
+            false,
         ));
+        assert!(
+            bloom_policy_enabled(&[], &disabled, true),
+            "empty explicit scope remains active when AUTO ID scope is enabled"
+        );
     }
 
     /// Open one built (data, sidecar) pair.
@@ -907,6 +1014,47 @@ mod tests {
                 .iter()
                 .map(|v| format!("{{\"trace_id\":\"{v}\",\"service_name\":\"checkout\"}}")),
         );
+        let mut writer =
+            vortex_index::VixWriter::new(&schema, vortex_index::VixWriterOptions::default(), false);
+        writer
+            .push_batch_with_source(&batch, &source, None)
+            .unwrap();
+        writer.finish().unwrap()
+    }
+
+    /// A blob-less census-shaped file with genuine IDs beside the two
+    /// high-cardinality ordinary fields seen in production.
+    fn auto_id_backfill_file() -> (Vec<u8>, Option<Vec<u8>>) {
+        use std::sync::Arc;
+
+        use arrow::{
+            array::{ArrayRef, Int64Array, StringArray},
+            datatypes::{DataType, Field, Schema},
+            record_batch::RecordBatch,
+        };
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("reference.parent_trace_id", DataType::Utf8, true),
+            Field::new("event_id", DataType::Utf8, true),
+            Field::new("events", DataType::Utf8, true),
+            Field::new("span_duration_nano", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1_000i64, 1_001])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["parent-a", "parent-b"])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["event-a", "event-b"])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["events-a", "events-b"])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["100", "200"])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let source = StringArray::from_iter_values([
+            r#"{"reference.parent_trace_id":"parent-a","event_id":"event-a","events":"events-a","span_duration_nano":"100"}"#,
+            r#"{"reference.parent_trace_id":"parent-b","event_id":"event-b","events":"events-b","span_duration_nano":"200"}"#,
+        ]);
         let mut writer =
             vortex_index::VixWriter::new(&schema, vortex_index::VixWriterOptions::default(), false);
         writer
@@ -973,6 +1121,8 @@ mod tests {
             &["trace_id".to_string()],
             0.001,
             &composite_scope(false, ""),
+            false,
+            &HashSet::new(),
             "unit-test",
         )
         .unwrap();
@@ -1000,6 +1150,8 @@ mod tests {
                 &["span_id".to_string()],
                 0.001,
                 &composite_scope(false, ""),
+                false,
+                &HashSet::new(),
                 "unit-test",
             )
             .unwrap()
@@ -1082,6 +1234,8 @@ mod tests {
                 &["trace_id".to_string()],
                 0.001,
                 &composite_scope(false, ""),
+                false,
+                &HashSet::new(),
                 "unit-test",
             )
         })
@@ -1152,6 +1306,8 @@ mod tests {
             &["trace_id".to_string()],
             0.001,
             &composite_scope(false, ""),
+            false,
+            &HashSet::new(),
             "unit-test",
             &budget,
         )
@@ -1179,6 +1335,8 @@ mod tests {
             &["trace_id".to_string()],
             0.001,
             &composite_scope(false, ""),
+            false,
+            &HashSet::new(),
             "unit-test",
             &budget,
         )
@@ -1200,9 +1358,16 @@ mod tests {
 
         let reader = open_pair(backfill_file(&["trace-a", "trace-b"]));
         // no per-stream bloom fields at all — broad scope alone builds
-        let blooms =
-            blooms_from_dictionary(&reader, &[], 0.001, &composite_scope(true, ""), "unit-test")
-                .unwrap();
+        let blooms = blooms_from_dictionary(
+            &reader,
+            &[],
+            0.001,
+            &composite_scope(true, ""),
+            false,
+            &HashSet::new(),
+            "unit-test",
+        )
+        .unwrap();
         assert_eq!(blooms.len(), 1);
         assert_eq!(blooms[0].field, COMPOSITE_BLOOM_FIELD);
 
@@ -1254,6 +1419,8 @@ mod tests {
             &["service_name".to_string()],
             0.001,
             &scope,
+            false,
+            &HashSet::new(),
             "unit-test",
             &budget,
         )
@@ -1306,12 +1473,222 @@ mod tests {
             &[],
             0.001,
             &composite_scope(false, "span_id"),
+            false,
+            &HashSet::new(),
             "unit-test",
             &budget,
         )
         .unwrap();
         assert!(matches!(&loaded, LoadedBlooms::FromBlob(b) if b.is_empty()));
         assert_eq!(budget.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn auto_id_scope_backfills_only_semantic_id_fields() {
+        let reader = open_pair(auto_id_backfill_file());
+        let scope = composite_scope(false, "");
+        let never = HashSet::new();
+        let budget = std::sync::atomic::AtomicI64::new(1);
+        let loaded = load_blooms_sync(
+            &reader,
+            &[],
+            0.001,
+            &scope,
+            true,
+            &never,
+            "unit-test",
+            &budget,
+        )
+        .unwrap();
+        let LoadedBlooms::FromDict(blooms) = loaded else {
+            panic!("AUTO ID scope must trigger dictionary backfill");
+        };
+        assert_eq!(
+            budget.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the dictionary backfill consumes one slot"
+        );
+        let composite = blooms
+            .iter()
+            .find(|b| b.field == vortex_index::bloom::COMPOSITE_BLOOM_FIELD)
+            .expect("AUTO ID scope must build a composite");
+
+        assert!(composite_covers_field(
+            composite,
+            "reference.parent_trace_id"
+        ));
+        assert!(composite_covers_field(composite, "event_id"));
+        assert!(!composite_covers_field(composite, "events"));
+        assert!(!composite_covers_field(composite, "span_duration_nano"));
+        assert_eq!(
+            blooms.len(),
+            1,
+            "ordinary fields must not gain independent coverage either"
+        );
+
+        let never = HashSet::from(["event_id".to_string()]);
+        let denied =
+            blooms_from_dictionary(&reader, &[], 0.001, &scope, true, &never, "unit-test").unwrap();
+        let composite = denied
+            .iter()
+            .find(|b| b.field == vortex_index::bloom::COMPOSITE_BLOOM_FIELD)
+            .expect("the remaining semantic ID still builds");
+        assert!(composite_covers_field(
+            composite,
+            "reference.parent_trace_id"
+        ));
+        assert!(
+            !composite_covers_field(composite, "event_id"),
+            "NEVER must override semantic AUTO admission"
+        );
+    }
+
+    #[test]
+    fn disabled_auto_id_scope_remains_explicit_only() {
+        let reader = open_pair(auto_id_backfill_file());
+        let never = HashSet::new();
+        let explicit = composite_scope(false, "event_id");
+        let blooms =
+            blooms_from_dictionary(&reader, &[], 0.001, &explicit, false, &never, "unit-test")
+                .unwrap();
+        let composite = blooms
+            .iter()
+            .find(|b| b.field == vortex_index::bloom::COMPOSITE_BLOOM_FIELD)
+            .expect("the explicit field remains authoritative");
+        assert!(composite_covers_field(composite, "event_id"));
+        assert!(!composite_covers_field(
+            composite,
+            "reference.parent_trace_id"
+        ));
+        assert!(!composite_covers_field(composite, "events"));
+        assert!(!composite_covers_field(composite, "span_duration_nano"));
+
+        assert!(
+            blooms_from_dictionary(
+                &reader,
+                &[],
+                0.001,
+                &composite_scope(false, ""),
+                false,
+                &never,
+                "unit-test",
+            )
+            .unwrap()
+            .is_empty(),
+            "gate=false with no explicit fields must remain disabled"
+        );
+    }
+
+    #[test]
+    fn old_broad_blob_bits_do_not_authorize_ordinary_fields_in_auto_id_scope() {
+        let reader = open_pair(auto_id_backfill_file());
+        let never = HashSet::new();
+        let broad = blooms_from_dictionary(
+            &reader,
+            &[],
+            0.001,
+            &composite_scope(true, ""),
+            false,
+            &never,
+            "unit-test",
+        )
+        .unwrap();
+        let old_composite = broad
+            .iter()
+            .find(|b| b.field == vortex_index::bloom::COMPOSITE_BLOOM_FIELD)
+            .expect("broad historical blob");
+        assert!(composite_covers_field(old_composite, "events"));
+        assert!(composite_covers_field(old_composite, "span_duration_nano"));
+
+        let budget = std::sync::atomic::AtomicI64::new(0);
+        let loaded = retain_and_supplement_blob(
+            &reader,
+            broad.clone(),
+            &[],
+            0.001,
+            &composite_scope(false, ""),
+            true,
+            &never,
+            "unit-test",
+            &budget,
+        )
+        .unwrap();
+        assert!(matches!(loaded, LoadedBlooms::FromBlob(retained) if retained == broad));
+        assert!(composite_scope_allows(
+            &composite_scope(false, ""),
+            true,
+            &never,
+            "reference.parent_trace_id",
+        ));
+        assert!(composite_scope_allows(
+            &composite_scope(false, ""),
+            true,
+            &never,
+            "event_id",
+        ));
+        assert!(!composite_scope_allows(
+            &composite_scope(false, ""),
+            true,
+            &never,
+            "events",
+        ));
+        assert!(!composite_scope_allows(
+            &composite_scope(false, ""),
+            true,
+            &never,
+            "span_duration_nano",
+        ));
+    }
+
+    #[test]
+    fn auto_id_scope_supplements_missing_id_coverage_only() {
+        use std::sync::atomic::{AtomicI64, Ordering};
+
+        let reader = open_pair(auto_id_backfill_file());
+        let never = HashSet::new();
+        let old = blooms_from_dictionary(
+            &reader,
+            &[],
+            0.001,
+            &composite_scope(false, "event_id"),
+            false,
+            &never,
+            "unit-test",
+        )
+        .unwrap();
+        let old_composite = old[0].clone();
+        assert!(composite_covers_field(&old_composite, "event_id"));
+        assert!(!composite_covers_field(
+            &old_composite,
+            "reference.parent_trace_id"
+        ));
+
+        let budget = AtomicI64::new(1);
+        let loaded = retain_and_supplement_blob(
+            &reader,
+            old,
+            &[],
+            0.001,
+            &composite_scope(false, ""),
+            true,
+            &never,
+            "unit-test",
+            &budget,
+        )
+        .unwrap();
+        let LoadedBlooms::FromDict(supplemented) = loaded else {
+            panic!("missing semantic ID must trigger a safe dictionary supplement");
+        };
+        assert_eq!(budget.load(Ordering::Relaxed), 0);
+        assert!(supplemented.iter().any(|b| b == &old_composite));
+        let parent = supplemented
+            .iter()
+            .find(|b| b.field == "reference.parent_trace_id")
+            .expect("missing AUTO ID receives an independent per-field supplement");
+        assert!(file_bloom_might_contain(parent, b"parent-a"));
+        assert!(!file_bloom_might_contain(parent, b"absent"));
+        assert!(!supplemented.iter().any(|b| b.field == "events"));
+        assert!(!supplemented.iter().any(|b| b.field == "span_duration_nano"));
     }
 
     #[test]
@@ -1328,13 +1705,29 @@ mod tests {
             composite_scope(true, ""),
         ] {
             assert!(
-                !has_requested_term_capability(&reader, &[], &scope, "unit-test").unwrap(),
+                !has_requested_term_capability(
+                    &reader,
+                    &[],
+                    &scope,
+                    false,
+                    &HashSet::new(),
+                    "unit-test",
+                )
+                .unwrap(),
                 "numeric terms cannot satisfy selective or broad raw-string scope"
             );
             assert!(
-                blooms_from_dictionary(&reader, &[], 0.001, &scope, "unit-test")
-                    .unwrap()
-                    .is_empty(),
+                blooms_from_dictionary(
+                    &reader,
+                    &[],
+                    0.001,
+                    &scope,
+                    false,
+                    &HashSet::new(),
+                    "unit-test",
+                )
+                .unwrap()
+                .is_empty(),
                 "numeric canonical bytes must not seed composite guards"
             );
         }
@@ -1347,6 +1740,8 @@ mod tests {
             &["trace_id".to_string()],
             0.001,
             &composite_scope(false, ""),
+            false,
+            &HashSet::new(),
             "unit-test",
             &budget,
         )
@@ -1366,6 +1761,8 @@ mod tests {
             &["trace_id".to_string()],
             0.001,
             &composite_scope(false, ""),
+            false,
+            &HashSet::new(),
             "unit-test",
             &budget,
         )
@@ -1391,20 +1788,56 @@ mod tests {
         assert!(reader.partial_fields().contains("trace_id"));
 
         let selective = composite_scope(false, "trace_id");
-        assert!(!has_requested_term_capability(&reader, &[], &selective, "unit-test").unwrap());
         assert!(
-            blooms_from_dictionary(&reader, &[], 0.001, &selective, "unit-test")
-                .unwrap()
-                .is_empty(),
+            !has_requested_term_capability(
+                &reader,
+                &[],
+                &selective,
+                false,
+                &HashSet::new(),
+                "unit-test",
+            )
+            .unwrap()
+        );
+        assert!(
+            blooms_from_dictionary(
+                &reader,
+                &[],
+                0.001,
+                &selective,
+                false,
+                &HashSet::new(),
+                "unit-test",
+            )
+            .unwrap()
+            .is_empty(),
             "an incomplete requested ID must not seed selective guards"
         );
 
         // Broad mode may still cover other complete raw-string fields, but
         // the partial ID itself must remain unguarded.
         let broad = composite_scope(true, "");
-        assert!(has_requested_term_capability(&reader, &[], &broad, "unit-test").unwrap());
-        let broad_blooms =
-            blooms_from_dictionary(&reader, &[], 0.001, &broad, "unit-test").unwrap();
+        assert!(
+            has_requested_term_capability(
+                &reader,
+                &[],
+                &broad,
+                false,
+                &HashSet::new(),
+                "unit-test",
+            )
+            .unwrap()
+        );
+        let broad_blooms = blooms_from_dictionary(
+            &reader,
+            &[],
+            0.001,
+            &broad,
+            false,
+            &HashSet::new(),
+            "unit-test",
+        )
+        .unwrap();
         let composite = broad_blooms
             .iter()
             .find(|b| b.field == vortex_index::bloom::COMPOSITE_BLOOM_FIELD)
@@ -1417,6 +1850,8 @@ mod tests {
             &[],
             0.001,
             &composite_scope(false, "trace_id"),
+            false,
+            &HashSet::new(),
             "unit-test",
             &budget,
         )
@@ -1437,6 +1872,8 @@ mod tests {
             &["trace_id".to_string()],
             0.001,
             &composite_scope(false, ""),
+            false,
+            &HashSet::new(),
             "unit-test",
             &budget,
         )
@@ -1457,6 +1894,8 @@ mod tests {
             &[],
             0.001,
             &composite_scope(false, "trace_id"),
+            false,
+            &HashSet::new(),
             "unit-test",
         )
         .unwrap();
@@ -1473,6 +1912,8 @@ mod tests {
             &[],
             0.001,
             &composite_scope(false, "trace_id"),
+            false,
+            &HashSet::new(),
             "unit-test",
             &budget,
         )
@@ -1488,6 +1929,8 @@ mod tests {
             &[],
             0.001,
             &composite_scope(false, "trace_id,service_name"),
+            false,
+            &HashSet::new(),
             "unit-test",
             &budget,
         )
@@ -1523,6 +1966,8 @@ mod tests {
             &[],
             0.001,
             &composite_scope(false, "trace_id"),
+            false,
+            &HashSet::new(),
             "unit-test",
         )
         .unwrap();
@@ -1542,6 +1987,8 @@ mod tests {
             &[],
             0.001,
             &composite_scope(false, "trace_id,service_name"),
+            false,
+            &HashSet::new(),
             "unit-test",
             &budget,
         )
@@ -1571,6 +2018,8 @@ mod tests {
             &["trace_id".to_string()],
             0.001,
             &composite_scope(true, ""),
+            false,
+            &HashSet::new(),
             "unit-test",
             &budget,
         )
@@ -1636,6 +2085,8 @@ mod tests {
             &[],
             0.001,
             &composite_scope(false, "trace_id"),
+            false,
+            &HashSet::new(),
             "unit-test",
             &budget,
         )

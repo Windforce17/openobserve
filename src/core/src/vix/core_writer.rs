@@ -128,6 +128,9 @@ struct BatchCaps {
     /// ratio 0.5 / floor 65536, keep AUTO out of small-data tests). `None`
     /// in every production call.
     bloom_auto_override: Option<(f64, u64)>,
+    /// Test seam for `ZO_VIX_BLOOM_ONLY_AUTO_ID_ONLY`; `None` in every
+    /// production call.
+    bloom_auto_id_only_override: Option<bool>,
     /// Test seam: disable the #46 column-derived rebuild so a test can
     /// produce the SOURCE-derived output over the same inputs (the parity
     /// referee). `false` in every production call.
@@ -148,6 +151,7 @@ impl Default for BatchCaps {
             index_enabled_override: None,
             bloom_only_override: None,
             bloom_auto_override: None,
+            bloom_auto_id_only_override: None,
             force_source_derivation: false,
             force_decode: false,
         }
@@ -354,6 +358,15 @@ fn core_writer_options(
     index_enabled: bool,
 ) -> VixWriterOptions {
     let cfg = get_config();
+    core_writer_options_from_config(&cfg, fts_fields, bloom_fields, index_enabled)
+}
+
+fn core_writer_options_from_config(
+    cfg: &config::Config,
+    fts_fields: &[String],
+    bloom_fields: Vec<String>,
+    index_enabled: bool,
+) -> VixWriterOptions {
     vortex_index::configure_shared_cpu_executor(vix_cpu_executor_threads());
     VixWriterOptions {
         value_index_excluded_field_names: cfg
@@ -387,6 +400,7 @@ fn core_writer_options(
         // rule to its own term map at finish; merge plans ALSO apply it to
         // input dictionaries in build_merge_plan)
         bloom_only_auto_ratio: cfg.common.vix_bloom_only_auto_ratio,
+        bloom_only_auto_id_only: cfg.common.vix_bloom_only_auto_id_only,
         bloom_only_min_distinct: cfg.common.vix_bloom_only_min_distinct,
         bloom_fpp: cfg.common.vix_bloom_fpp,
         fts_field_names: fts_fields
@@ -932,6 +946,9 @@ fn single_file_build_opts(
     if let Some((ratio, floor)) = caps.bloom_auto_override {
         opts.bloom_only_auto_ratio = ratio;
         opts.bloom_only_min_distinct = floor;
+    }
+    if let Some(id_only) = caps.bloom_auto_id_only_override {
+        opts.bloom_only_auto_id_only = id_only;
     }
     let spool_min = get_config().common.vix_move_spool_min_bytes;
     if spool_min > 0 && input_original_bytes >= spool_min {
@@ -2575,6 +2592,12 @@ fn build_merge_plan(
     let index_enabled = caps
         .index_enabled_override
         .unwrap_or_else(|| vix_index_enabled(stream_type));
+    // Keep every Bloom merge-policy decision and the writer options on one
+    // reloadable config snapshot. Otherwise a false→true ID-only reload
+    // between planning and writer construction can carry a non-ID marker
+    // into `bloom_only_field_names`, where it is indistinguishable from an
+    // explicit field until the next heal.
+    let cfg = get_config();
     // docs columns available across inputs (name -> first stored type),
     // writer-managed columns excluded
     let mut available: Vec<(String, DataType)> = Vec::new();
@@ -2605,7 +2628,6 @@ fn build_merge_plan(
     // columns exist like every other field's, no column-store side effect
     // to manage.
     let bloom_only_names: Vec<String> = {
-        let cfg = get_config();
         let mut names: Vec<String> = cfg
             .common
             .vix_bloom_only_fields
@@ -2621,6 +2643,9 @@ fn build_merge_plan(
             cfg.common.vix_bloom_only_auto_ratio,
             cfg.common.vix_bloom_only_min_distinct,
         ));
+        let auto_id_only = caps
+            .bloom_auto_id_only_override
+            .unwrap_or(cfg.common.vix_bloom_only_auto_id_only);
         let merged_rows: u64 = sources
             .iter()
             .map(|source| match source {
@@ -2630,17 +2655,26 @@ fn build_merge_plan(
             .sum();
         if index_enabled && ratio > 0.0 {
             // M7 STICKY demotion: while AUTO is enabled, a field ANY input
-            // already marks bloom-only stays bloom-only. Demoted inputs hold
-            // no dictionary terms for it, so the count-driven AUTO below
-            // cannot re-derive the decision. AUTO=0 is deliberately different:
-            // it is an authoritative explicit-only policy, so old automatic
-            // markers are not carried and the compatibility check forces a
-            // rebuild that restores their term capability. Explicit fields
-            // remain bloom-only through `names`; the writer's never-list still
-            // wins during final resolution.
+            // already marks bloom-only stays bloom-only. Under the optional
+            // ID-only gate, only semantic ID markers remain sticky; fields
+            // still named explicitly were already retained in `names`.
+            // Demoted inputs hold no dictionary terms for the field, so the
+            // count-driven AUTO below cannot re-derive the decision.
+            // AUTO=0 is deliberately different: it is an authoritative
+            // explicit-only policy, so old automatic markers are not carried
+            // and the compatibility check forces a rebuild that restores
+            // their term capability. The writer's never-list still wins
+            // during final resolution.
             for source in sources {
                 if let MergeSource::Indexed(reader) = source {
-                    names.extend(reader.bloom_only_fields().map(str::to_string));
+                    names.extend(
+                        reader
+                            .bloom_only_fields()
+                            .filter(|name| {
+                                !auto_id_only || vortex_index::is_id_like_field_name(name)
+                            })
+                            .map(str::to_string),
+                    );
                 }
             }
         }
@@ -2692,6 +2726,7 @@ fn build_merge_plan(
                 merged_rows,
                 ratio,
                 floor,
+                auto_id_only,
                 &never,
                 "merge",
             ));
@@ -2733,14 +2768,18 @@ fn build_merge_plan(
         writer_fields.push(Field::new(name, data_type.clone(), true));
     }
     let writer_schema = Arc::new(Schema::new(writer_fields));
-    let mut opts = core_writer_options(fts_fields, bloom_fields.to_vec(), index_enabled);
+    let mut opts =
+        core_writer_options_from_config(&cfg, fts_fields, bloom_fields.to_vec(), index_enabled);
     opts.encode_threads = merge_threads();
     // #51b: k-way range parallelism (0 = min(available parallelism, 8),
     // capped by the merge thread budget inside merge_indexes)
-    opts.merge_kway_threads = get_config().common.vix_merge_kway_threads;
+    opts.merge_kway_threads = cfg.common.vix_merge_kway_threads;
     if let Some((ratio, floor)) = caps.bloom_auto_override {
         opts.bloom_only_auto_ratio = ratio;
         opts.bloom_only_min_distinct = floor;
+    }
+    if let Some(id_only) = caps.bloom_auto_id_only_override {
+        opts.bloom_only_auto_id_only = id_only;
     }
     // §4 completeness propagation: the output asserts all-present-columns
     // only when EVERY input did — an incomplete input's `_source` rows may
@@ -8244,6 +8283,172 @@ mod tests {
         assert!(
             matches!(classify(&rebuilt_pair).unwrap(), CoreFileStatus::Current),
             "the explicit ID demotions are desired and must not create a rebuild loop"
+        );
+    }
+
+    /// Turning on the AUTO ID-only gate is a policy migration while AUTO
+    /// remains enabled: stale ordinary-string markers must heal, semantic ID
+    /// markers remain sticky, and an ordinary field still named explicitly
+    /// remains bloom-only.
+    #[tokio::test]
+    async fn auto_id_only_heals_non_id_sticky_markers_but_keeps_ids_and_explicit() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+            Field::new("events", DataType::Utf8, true),
+            Field::new("span_duration_nano", DataType::Utf8, true),
+            Field::new("reference.parent_trace_id", DataType::Utf8, true),
+            Field::new("event_id", DataType::Utf8, true),
+        ]));
+        let rows = 8usize;
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(
+                    (0..rows).map(|row| 3_000 - row as i64).collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(StringArray::from(
+                    (0..rows)
+                        .map(|row| format!("event-payload-{row}"))
+                        .collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(StringArray::from(
+                    (0..rows)
+                        .map(|row| format!("duration-{row}"))
+                        .collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(StringArray::from(
+                    (0..rows)
+                        .map(|row| format!("parent-trace-{row}"))
+                        .collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(StringArray::from(
+                    (0..rows)
+                        .map(|row| format!("event-id-{row}"))
+                        .collect::<Vec<_>>(),
+                )) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let table = Arc::new(MemTable::try_new(Arc::clone(&schema), vec![vec![batch]]).unwrap());
+        let old = write_core_file_from_tables_with_caps(
+            "test-auto-id-only-migration-source",
+            StreamType::Logs,
+            Arc::clone(&schema),
+            vec![table],
+            &[],
+            &[],
+            false,
+            0,
+            BatchCaps {
+                bloom_auto_override: Some((0.01, 1)),
+                bloom_auto_id_only_override: Some(false),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let old_pair: BuiltPair = (
+            bytes::Bytes::from(old.data),
+            old.index.map(bytes::Bytes::from),
+        );
+        let mut old_bloom_only = open_pair(&old_pair)
+            .bloom_only_fields()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        old_bloom_only.sort_unstable();
+        assert_eq!(
+            old_bloom_only,
+            [
+                "event_id",
+                "events",
+                "reference.parent_trace_id",
+                "span_duration_nano",
+            ]
+            .map(str::to_string),
+            "precondition: legacy ratio-only AUTO demotes every qualifying string"
+        );
+
+        let latest_schema = schema.as_ref().clone();
+        let id_only = BatchCaps {
+            bloom_only_override: Some("span_duration_nano"),
+            // AUTO stays enabled, but no fresh count-based decision can
+            // qualify: this isolates sticky-marker filtering.
+            bloom_auto_override: Some((0.01, u64::MAX)),
+            bloom_auto_id_only_override: Some(true),
+            ..Default::default()
+        };
+        let classify = |pair: &BuiltPair| {
+            classify_core_file_with_caps(
+                StreamType::Logs,
+                "auto-id-only-migration.vix",
+                vortex_index::BytesRangeSource::new("auto-id-only-migration.vix", pair.0.clone()),
+                pair.1.as_ref().map(|index| {
+                    vortex_index::BytesRangeSource::new("auto-id-only-migration.vxi", index.clone())
+                }),
+                &latest_schema,
+                &[],
+                &[],
+                id_only,
+            )
+        };
+        match classify(&old_pair).unwrap() {
+            CoreFileStatus::NeedsRebuild(reason) => {
+                assert!(reason.contains("events"), "{reason}");
+                assert!(reason.contains("bloom-only"), "{reason}");
+            }
+            CoreFileStatus::Current => {
+                panic!("the stale ordinary-string AUTO marker must require a rebuild")
+            }
+        }
+
+        let inputs = vec![("auto-id-only-old.vix".to_string(), old_pair)];
+        let rebuilt = merge_core_files_with_caps(
+            StreamType::Logs,
+            &as_inputs(&inputs),
+            &latest_schema,
+            &[],
+            &[],
+            id_only,
+        )
+        .unwrap();
+        assert!(
+            !rebuilt.used_index_merge,
+            "removing a stale bloom-only marker requires source rebuild"
+        );
+        let rebuilt_reader = open_merged(&rebuilt);
+        assert!(rebuilt_reader.has_term_capability("events"));
+        assert_eq!(
+            matching_docs(&rebuilt_reader, &exact("events", "event-payload-3")).len(),
+            1
+        );
+        let mut rebuilt_bloom_only = rebuilt_reader
+            .bloom_only_fields()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        rebuilt_bloom_only.sort_unstable();
+        assert_eq!(
+            rebuilt_bloom_only,
+            [
+                "event_id",
+                "reference.parent_trace_id",
+                "span_duration_nano",
+            ]
+            .map(str::to_string)
+        );
+        assert!(
+            !rebuilt_reader.has_term_capability("span_duration_nano"),
+            "an explicit non-ID field remains authoritatively demoted"
+        );
+        assert!(!rebuilt_reader.has_term_capability("reference.parent_trace_id"));
+        assert!(!rebuilt_reader.has_term_capability("event_id"));
+
+        let rebuilt_pair: BuiltPair = (
+            bytes::Bytes::from(rebuilt.output.to_bytes().unwrap()),
+            rebuilt.index.clone().map(bytes::Bytes::from),
+        );
+        assert!(
+            matches!(classify(&rebuilt_pair).unwrap(), CoreFileStatus::Current),
+            "the migrated policy must converge without a rebuild loop"
         );
     }
 

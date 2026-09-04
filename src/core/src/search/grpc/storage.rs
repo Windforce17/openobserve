@@ -355,12 +355,28 @@ pub async fn check_bloom_filter(
         return Ok((0, false));
     };
     let composite_scope = config::vix_bloom_composite_scope(&cfg);
+    let auto_id_scope =
+        cfg.common.vix_bloom_only_auto_id_only && cfg.common.vix_bloom_only_auto_ratio > 0.0;
+    let auto_id_never = cfg
+        .common
+        .vix_bloom_only_never
+        .split(',')
+        .map(str::trim)
+        .filter(|field| !field.is_empty())
+        .map(str::to_owned)
+        .collect::<std::collections::HashSet<_>>();
 
     // Decide whether there is real Bloom work before transferring ownership
     // of the potentially large vector. In particular, ordinary predicates
     // outside a selective composite scope return without a second O(files)
     // clone and without recording a Bloom run.
-    if !bloom_pruner::is_applicable(index_condition, &bloom_indexed_fields, &composite_scope) {
+    if !bloom_pruner::is_applicable(
+        index_condition,
+        &bloom_indexed_fields,
+        &composite_scope,
+        auto_id_scope,
+        &auto_id_never,
+    ) {
         return Ok((0, false));
     }
 
@@ -376,6 +392,8 @@ pub async fn check_bloom_filter(
         index_condition,
         bloom_indexed_fields,
         &composite_scope,
+        auto_id_scope,
+        &auto_id_never,
     )
     .await;
 

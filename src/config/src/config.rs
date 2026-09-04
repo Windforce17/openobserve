@@ -1869,6 +1869,14 @@ pub struct Common {
     )]
     pub vix_bloom_only_auto_ratio: f64,
     #[env_config(
+        name = "ZO_VIX_BLOOM_ONLY_AUTO_ID_ONLY",
+        default = false,
+        help = "Restrict AUTO bloom-only demotion to semantic identifier field names. \
+                Explicit ZO_VIX_BLOOM_ONLY_FIELDS entries remain authoritative and are not \
+                gated. False preserves the legacy ratio-only AUTO behavior."
+    )]
+    pub vix_bloom_only_auto_id_only: bool,
+    #[env_config(
         name = "ZO_VIX_BLOOM_ONLY_MIN_DISTINCT",
         default = 65536,
         help = "Absolute distinct-term floor for the auto bloom-only demotion — small \

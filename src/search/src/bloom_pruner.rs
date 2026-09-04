@@ -107,9 +107,10 @@ fn bloom_prefetch_concurrency() -> usize {
 /// returned unchanged without touching any `.bf`.
 ///
 /// Additive stream bloom fields always probe their per-field sections and
-/// may fall back to the composite only when `composite_scope` allows them.
-/// Other fields are admitted only when the scope allows their composite
-/// fallback.
+/// may fall back to the composite when `composite_scope` allows them. In a
+/// selective scope, `auto_id_scope` additionally admits semantic ID fields
+/// not present in `auto_id_never`. Broad [`VixBloomCompositeScope::All`]
+/// remains unrestricted.
 ///
 /// `trace_id` is threaded through purely for logging.
 #[allow(clippy::too_many_arguments)]
@@ -122,9 +123,17 @@ pub async fn prune(
     index_condition: &IndexCondition,
     bloom_indexed_fields: Vec<String>,
     composite_scope: &VixBloomCompositeScope,
+    auto_id_scope: bool,
+    auto_id_never: &HashSet<String>,
 ) -> Vec<FileKey> {
     let bloom_indexed_fields = bloom_indexed_fields.into_iter().collect::<HashSet<_>>();
-    let predicates = collect_decidable(index_condition, &bloom_indexed_fields, composite_scope);
+    let predicates = collect_decidable(
+        index_condition,
+        &bloom_indexed_fields,
+        composite_scope,
+        auto_id_scope,
+        auto_id_never,
+    );
     if predicates.is_empty() {
         return files;
     }
@@ -612,6 +621,8 @@ pub fn is_applicable(
     cond: &IndexCondition,
     bloom_indexed_fields: &[String],
     composite_scope: &VixBloomCompositeScope,
+    auto_id_scope: bool,
+    auto_id_never: &HashSet<String>,
 ) -> bool {
     cond.conditions.iter().any(|condition| {
         let Some(field) = decidable_field(condition) else {
@@ -620,7 +631,7 @@ pub fn is_applicable(
         let additive = bloom_indexed_fields
             .iter()
             .any(|indexed| indexed.as_str() == field);
-        additive || composite_fallback_allowed(field, composite_scope)
+        additive || composite_fallback_allowed(field, composite_scope, auto_id_scope, auto_id_never)
     })
 }
 
@@ -634,29 +645,56 @@ pub fn is_applicable(
 /// (restricted to fields present in the schema). Those fields always use
 /// their per-field bloom and may use composite fallback only when
 /// `composite_scope` allows them. A field outside the additive set is admitted
-/// only when the scope allows its composite fallback.
+/// only when the broad, explicit, or AUTO-ID composite policy allows its
+/// fallback.
 fn collect_decidable(
     cond: &IndexCondition,
     bloom_indexed_fields: &HashSet<String>,
     composite_scope: &VixBloomCompositeScope,
+    auto_id_scope: bool,
+    auto_id_never: &HashSet<String>,
 ) -> Vec<Predicate> {
     cond.conditions
         .iter()
         .filter_map(|condition| {
             let field = decidable_field(condition)?;
             let additive = bloom_indexed_fields.contains(field);
-            if !additive && !composite_fallback_allowed(field, composite_scope) {
+            if !additive
+                && !composite_fallback_allowed(field, composite_scope, auto_id_scope, auto_id_never)
+            {
                 return None;
             }
-            admit_predicate(try_predicate(condition)?, additive, composite_scope)
+            admit_predicate(
+                try_predicate(condition)?,
+                additive,
+                composite_scope,
+                auto_id_scope,
+                auto_id_never,
+            )
         })
         .collect()
 }
 
 /// Whether policy and key encoding permit this field to use the composite
-/// section. Shared by the borrowed preflight and the owned prune plan.
-fn composite_fallback_allowed(field: &str, composite_scope: &VixBloomCompositeScope) -> bool {
-    field.len() <= u16::MAX as usize && composite_scope.allows(field)
+/// section. Broad scope intentionally remains any-field. Selective scope
+/// admits explicit names and, only when enabled by the query snapshot, ID-like
+/// names not blocked by the AUTO NEVER list.
+fn composite_fallback_allowed(
+    field: &str,
+    composite_scope: &VixBloomCompositeScope,
+    auto_id_scope: bool,
+    auto_id_never: &HashSet<String>,
+) -> bool {
+    field.len() <= u16::MAX as usize
+        && match composite_scope {
+            VixBloomCompositeScope::All => true,
+            VixBloomCompositeScope::Only(fields) => {
+                fields.contains(field)
+                    || (auto_id_scope
+                        && !auto_id_never.contains(field)
+                        && vortex_index::is_id_like_field_name(field))
+            }
+        }
 }
 
 /// Applies the shared additive/composite admission rule and records whether
@@ -665,8 +703,15 @@ fn admit_predicate(
     mut predicate: Predicate,
     additive: bool,
     composite_scope: &VixBloomCompositeScope,
+    auto_id_scope: bool,
+    auto_id_never: &HashSet<String>,
 ) -> Option<Predicate> {
-    let composite_fallback = composite_fallback_allowed(&predicate.field, composite_scope);
+    let composite_fallback = composite_fallback_allowed(
+        &predicate.field,
+        composite_scope,
+        auto_id_scope,
+        auto_id_never,
+    );
     if !additive && !composite_fallback {
         return None;
     }
@@ -753,18 +798,34 @@ mod tests {
         condition: &IndexCondition,
         additive_fields: &[&str],
         composite_scope: &VixBloomCompositeScope,
+        auto_id_scope: bool,
+        auto_id_never: &[&str],
         expected: bool,
     ) {
         let additive_vec = additive_fields
             .iter()
             .map(|field| field.to_string())
             .collect::<Vec<_>>();
+        let auto_id_never = fields(auto_id_never);
         assert_eq!(
-            is_applicable(condition, &additive_vec, composite_scope),
+            is_applicable(
+                condition,
+                &additive_vec,
+                composite_scope,
+                auto_id_scope,
+                &auto_id_never,
+            ),
             expected
         );
         assert_eq!(
-            !collect_decidable(condition, &fields(additive_fields), composite_scope).is_empty(),
+            !collect_decidable(
+                condition,
+                &fields(additive_fields),
+                composite_scope,
+                auto_id_scope,
+                &auto_id_never,
+            )
+            .is_empty(),
             expected,
             "borrowed preflight and owned prune planning must agree"
         );
@@ -775,7 +836,13 @@ mod tests {
     #[test]
     fn test_collect_equal_on_indexed_field() {
         let c = cond(vec![Condition::Equal("trace_id".into(), "abc".into())]);
-        let p = collect_decidable(&c, &fields(&["trace_id"]), &only_scope(&[]));
+        let p = collect_decidable(
+            &c,
+            &fields(&["trace_id"]),
+            &only_scope(&[]),
+            false,
+            &HashSet::new(),
+        );
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].field, "trace_id");
         assert_eq!(p[0].values, vec!["abc".to_string()]);
@@ -784,7 +851,16 @@ mod tests {
     #[test]
     fn test_collect_skips_non_indexed_field() {
         let c = cond(vec![Condition::Equal("body".into(), "abc".into())]);
-        assert!(collect_decidable(&c, &fields(&["trace_id"]), &only_scope(&[])).is_empty());
+        assert!(
+            collect_decidable(
+                &c,
+                &fields(&["trace_id"]),
+                &only_scope(&[]),
+                false,
+                &HashSet::new(),
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -794,7 +870,13 @@ mod tests {
             vec!["a".into(), "b".into()],
             false,
         )]);
-        let p = collect_decidable(&c, &fields(&["trace_id"]), &only_scope(&[]));
+        let p = collect_decidable(
+            &c,
+            &fields(&["trace_id"]),
+            &only_scope(&[]),
+            false,
+            &HashSet::new(),
+        );
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].values, vec!["a".to_string(), "b".to_string()]);
     }
@@ -802,13 +884,31 @@ mod tests {
     #[test]
     fn test_collect_skips_empty_and_negated_in() {
         let empty = cond(vec![Condition::In("trace_id".into(), vec![], false)]);
-        assert!(collect_decidable(&empty, &fields(&["trace_id"]), &only_scope(&[])).is_empty());
+        assert!(
+            collect_decidable(
+                &empty,
+                &fields(&["trace_id"]),
+                &only_scope(&[]),
+                false,
+                &HashSet::new(),
+            )
+            .is_empty()
+        );
         let negated = cond(vec![Condition::In(
             "trace_id".into(),
             vec!["a".into()],
             true,
         )]);
-        assert!(collect_decidable(&negated, &fields(&["trace_id"]), &only_scope(&[])).is_empty());
+        assert!(
+            collect_decidable(
+                &negated,
+                &fields(&["trace_id"]),
+                &only_scope(&[]),
+                false,
+                &HashSet::new(),
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -818,7 +918,16 @@ mod tests {
             Condition::Regex("trace_id".into(), "^abc.*".into()),
             Condition::StrMatch("trace_id".into(), "abc".into(), true),
         ]);
-        assert!(collect_decidable(&c, &fields(&["trace_id"]), &only_scope(&[])).is_empty());
+        assert!(
+            collect_decidable(
+                &c,
+                &fields(&["trace_id"]),
+                &only_scope(&[]),
+                false,
+                &HashSet::new(),
+            )
+            .is_empty()
+        );
     }
 
     // ---- same-field Or folding ----
@@ -831,7 +940,13 @@ mod tests {
             Box::new(Condition::Equal("trace_id".into(), "b".into())),
             Box::new(Condition::Equal("trace_id".into(), "a".into())),
         )]);
-        let p = collect_decidable(&c, &fields(&["trace_id"]), &only_scope(&[]));
+        let p = collect_decidable(
+            &c,
+            &fields(&["trace_id"]),
+            &only_scope(&[]),
+            false,
+            &HashSet::new(),
+        );
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].field, "trace_id");
         assert_eq!(p[0].values, vec!["a".to_string(), "b".to_string()]);
@@ -848,7 +963,13 @@ mod tests {
                 false,
             )),
         )]);
-        let p = collect_decidable(&c, &fields(&["trace_id"]), &only_scope(&[]));
+        let p = collect_decidable(
+            &c,
+            &fields(&["trace_id"]),
+            &only_scope(&[]),
+            false,
+            &HashSet::new(),
+        );
         assert_eq!(p.len(), 1);
         assert_eq!(
             p[0].values,
@@ -867,7 +988,13 @@ mod tests {
             Box::new(inner),
             Box::new(Condition::Equal("trace_id".into(), "3".into())),
         );
-        let p = collect_decidable(&cond(vec![outer]), &fields(&["trace_id"]), &only_scope(&[]));
+        let p = collect_decidable(
+            &cond(vec![outer]),
+            &fields(&["trace_id"]),
+            &only_scope(&[]),
+            false,
+            &HashSet::new(),
+        );
         assert_eq!(p.len(), 1);
         assert_eq!(
             p[0].values,
@@ -886,7 +1013,13 @@ mod tests {
                 false,
             )),
         )]);
-        let p = collect_decidable(&c, &fields(&["trace_id"]), &only_scope(&[]));
+        let p = collect_decidable(
+            &c,
+            &fields(&["trace_id"]),
+            &only_scope(&[]),
+            false,
+            &HashSet::new(),
+        );
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].values, vec!["a".to_string(), "b".to_string()]);
     }
@@ -900,7 +1033,14 @@ mod tests {
             Box::new(Condition::Equal("service".into(), "x".into())),
         )]);
         assert!(
-            collect_decidable(&c, &fields(&["trace_id", "service"]), &only_scope(&[]),).is_empty()
+            collect_decidable(
+                &c,
+                &fields(&["trace_id", "service"]),
+                &only_scope(&[]),
+                false,
+                &HashSet::new(),
+            )
+            .is_empty()
         );
     }
 
@@ -911,7 +1051,16 @@ mod tests {
             Box::new(Condition::Equal("trace_id".into(), "a".into())),
             Box::new(Condition::In("trace_id".into(), vec!["b".into()], true)),
         )]);
-        assert!(collect_decidable(&c, &fields(&["trace_id"]), &only_scope(&[])).is_empty());
+        assert!(
+            collect_decidable(
+                &c,
+                &fields(&["trace_id"]),
+                &only_scope(&[]),
+                false,
+                &HashSet::new(),
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -922,7 +1071,16 @@ mod tests {
             Box::new(Condition::Equal("body".into(), "a".into())),
             Box::new(Condition::Equal("body".into(), "b".into())),
         )]);
-        assert!(collect_decidable(&c, &fields(&["trace_id"]), &only_scope(&[])).is_empty());
+        assert!(
+            collect_decidable(
+                &c,
+                &fields(&["trace_id"]),
+                &only_scope(&[]),
+                false,
+                &HashSet::new(),
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -936,7 +1094,13 @@ mod tests {
             ),
             Condition::Equal("user_id".into(), "u-1".into()),
         ]);
-        let p = collect_decidable(&c, &fields(&["trace_id", "user_id"]), &only_scope(&[]));
+        let p = collect_decidable(
+            &c,
+            &fields(&["trace_id", "user_id"]),
+            &only_scope(&[]),
+            false,
+            &HashSet::new(),
+        );
         assert_eq!(p.len(), 2);
         let trace = p.iter().find(|p| p.field == "trace_id").unwrap();
         assert_eq!(trace.values, vec!["a".to_string(), "b".to_string()]);
@@ -953,7 +1117,13 @@ mod tests {
             Condition::NotEqual("body".into(), "noise".into()),
             Condition::Equal("user_id".into(), "u-1".into()),
         ]);
-        let p = collect_decidable(&c, &fields(&["trace_id", "user_id"]), &only_scope(&[]));
+        let p = collect_decidable(
+            &c,
+            &fields(&["trace_id", "user_id"]),
+            &only_scope(&[]),
+            false,
+            &HashSet::new(),
+        );
         assert_eq!(p.len(), 2);
         assert!(p.iter().any(|x| x.field == "trace_id"));
         assert!(p.iter().any(|x| x.field == "user_id"));
@@ -1039,22 +1209,35 @@ mod tests {
             "api".into(),
         )]);
 
-        let p = collect_decidable(&trace, &fields(&[]), &only_trace_id);
+        let p = collect_decidable(&trace, &fields(&[]), &only_trace_id, false, &HashSet::new());
         assert_eq!(p.len(), 1, "explicit Bloom-only field is admitted");
         assert!(p[0].composite_fallback);
         assert!(
-            collect_decidable(&infer, &fields(&[]), &only_trace_id).is_empty(),
+            collect_decidable(&infer, &fields(&[]), &only_trace_id, false, &HashSet::new(),)
+                .is_empty(),
             "selective scope rejects unrelated fields"
         );
 
-        let p = collect_decidable(&infer, &fields(&["infer_service_name"]), &only_trace_id);
+        let p = collect_decidable(
+            &infer,
+            &fields(&["infer_service_name"]),
+            &only_trace_id,
+            false,
+            &HashSet::new(),
+        );
         assert_eq!(p.len(), 1, "additive fields always remain decidable");
         assert!(
             !p[0].composite_fallback,
             "additive field outside the scope stays per-field only"
         );
 
-        let p = collect_decidable(&infer, &fields(&[]), &VixBloomCompositeScope::All);
+        let p = collect_decidable(
+            &infer,
+            &fields(&[]),
+            &VixBloomCompositeScope::All,
+            false,
+            &HashSet::new(),
+        );
         assert_eq!(p.len(), 1, "All preserves legacy any-field admission");
         assert!(p[0].composite_fallback);
     }
@@ -1068,10 +1251,42 @@ mod tests {
             "api".into(),
         )]);
 
-        assert_applicability_parity(&trace, &[], &only_trace_id, true);
-        assert_applicability_parity(&infer, &[], &only_trace_id, false);
-        assert_applicability_parity(&infer, &["infer_service_name"], &only_trace_id, true);
-        assert_applicability_parity(&infer, &[], &VixBloomCompositeScope::All, true);
+        assert_applicability_parity(&trace, &[], &only_trace_id, false, &[], true);
+        assert_applicability_parity(&infer, &[], &only_trace_id, false, &[], false);
+        assert_applicability_parity(
+            &infer,
+            &["infer_service_name"],
+            &only_trace_id,
+            false,
+            &[],
+            true,
+        );
+        assert_applicability_parity(&infer, &[], &VixBloomCompositeScope::All, false, &[], true);
+    }
+
+    #[test]
+    fn auto_id_scope_admission_matches_owned_planner() {
+        let selective = only_scope(&["trace_id"]);
+
+        for field in ["reference.parent_trace_id", "event_id"] {
+            let condition = cond(vec![Condition::Equal(field.into(), "abc".into())]);
+            assert_applicability_parity(&condition, &[], &selective, false, &[], false);
+            assert_applicability_parity(&condition, &[], &selective, true, &[], true);
+            assert_applicability_parity(&condition, &[], &selective, true, &[field], false);
+        }
+
+        for field in ["span_duration_nano", "events", "infer_service_name"] {
+            let condition = cond(vec![Condition::Equal(field.into(), "abc".into())]);
+            assert_applicability_parity(&condition, &[], &selective, true, &[], false);
+            assert_applicability_parity(
+                &condition,
+                &[],
+                &VixBloomCompositeScope::All,
+                false,
+                &[],
+                true,
+            );
+        }
     }
 
     #[test]
@@ -1102,10 +1317,10 @@ mod tests {
             true,
         )]);
 
-        assert_applicability_parity(&nested_same_field, &[], &broad, true);
-        assert_applicability_parity(&nested_mixed_fields, &[], &broad, false);
-        assert_applicability_parity(&empty_in, &["trace_id"], &broad, false);
-        assert_applicability_parity(&negated_in, &["trace_id"], &broad, false);
+        assert_applicability_parity(&nested_same_field, &[], &broad, false, &[], true);
+        assert_applicability_parity(&nested_mixed_fields, &[], &broad, false, &[], false);
+        assert_applicability_parity(&empty_in, &["trace_id"], &broad, false, &[], false);
+        assert_applicability_parity(&negated_in, &["trace_id"], &broad, false, &[], false);
     }
 
     #[test]
@@ -1125,7 +1340,14 @@ mod tests {
             std::ptr::eq(borrowed_field.as_ptr(), original_field.as_ptr()),
             "the shape preflight must return the condition's borrowed field"
         );
-        assert_applicability_parity(&condition, &[], &only_scope(&["trace_id"]), true);
+        assert_applicability_parity(
+            &condition,
+            &[],
+            &only_scope(&["trace_id"]),
+            false,
+            &[],
+            true,
+        );
     }
 
     /// Composite-section guard contract over REAL accumulator-built bytes:
@@ -1234,6 +1456,8 @@ mod tests {
             &c,
             vec!["trace_id".to_string()],
             &only_scope(&[]),
+            false,
+            &HashSet::new(),
         )
         .await;
         assert_eq!(kept.len(), files.len());
@@ -1253,6 +1477,8 @@ mod tests {
             &c,
             vec!["trace_id".to_string()],
             &only_scope(&[]),
+            false,
+            &HashSet::new(),
         )
         .await;
         assert_eq!(kept.len(), 1);
@@ -1271,49 +1497,49 @@ mod tests {
             &c,
             vec!["trace_id".to_string()],
             &only_scope(&[]),
+            false,
+            &HashSet::new(),
         )
         .await;
         assert_eq!(kept.len(), 1);
     }
 
     /// End-to-end policy check against a real old broad-composite `.bf`.
-    /// Selective mode admits only its explicit Bloom-only IDs, broad mode
-    /// preserves any-field behavior, and a mixed-era file without coverage
-    /// remains fail-open.
+    /// Selective AUTO-ID admits semantic IDs but not ordinary fields, the
+    /// gate-off and broad policies remain compatible, NEVER wins for semantic
+    /// admission, and a mixed-era file without coverage remains fail-open.
     #[tokio::test(flavor = "multi_thread")] // the disk-cache read path uses block_in_place
     async fn composite_scope_policy_against_old_broad_bytes() {
         use vortex_index::bloom::BloomHashAcc;
 
         let v1_key = |value: &[u8], id: u16| {
-            let mut k = value.to_vec();
-            k.push(0);
-            k.extend_from_slice(&id.to_be_bytes());
-            k
+            let mut key = value.to_vec();
+            key.push(0);
+            key.extend_from_slice(&id.to_be_bytes());
+            key
         };
-        let broad_composite =
-            |file_id: u64, trace_id: &str, infer_service_name: &str, span_duration_nano: &str| {
-                let mut acc = BloomHashAcc::default();
-                acc.enable_composite([
-                    (1u16, "trace_id".to_string()),
-                    (2u16, "infer_service_name".to_string()),
-                    (3u16, "span_duration_nano".to_string()),
-                ]);
-                for (id, value) in [
-                    (1u16, trace_id),
-                    (2u16, infer_service_name),
-                    (3u16, span_duration_nano),
-                ] {
-                    acc.observe(&v1_key(value.as_bytes(), id));
-                }
-                let blooms = acc.build(0.001);
-                assert_eq!(blooms.len(), 1);
-                infra::bloom::FieldBloom {
-                    field: blooms[0].field.clone(),
-                    file_id,
-                    n_items: blooms[0].n_items,
-                    bytes: blooms[0].bytes.clone(),
-                }
-            };
+        let broad_composite = |file_id: u64, values: [&str; 6]| {
+            let mut acc = BloomHashAcc::default();
+            acc.enable_composite([
+                (1u16, "trace_id".to_string()),
+                (2u16, "reference.parent_trace_id".to_string()),
+                (3u16, "event_id".to_string()),
+                (4u16, "infer_service_name".to_string()),
+                (5u16, "span_duration_nano".to_string()),
+                (6u16, "events".to_string()),
+            ]);
+            for (offset, value) in values.into_iter().enumerate() {
+                acc.observe(&v1_key(value.as_bytes(), offset as u16 + 1));
+            }
+            let blooms = acc.build(0.001);
+            assert_eq!(blooms.len(), 1);
+            infra::bloom::FieldBloom {
+                field: blooms[0].field.clone(),
+                file_id,
+                n_items: blooms[0].n_items,
+                bytes: blooms[0].bytes.clone(),
+            }
+        };
         let legacy_unrelated = |file_id: u64| {
             let mut acc = BloomHashAcc::from_pairs([(7u16, "legacy_other".to_string())]);
             acc.observe(&v1_key(b"legacy", 7));
@@ -1326,8 +1552,14 @@ mod tests {
             }
         };
         let blob = BloomWriter::serialize(vec![
-            broad_composite(301, "trace-a", "api-a", "100"),
-            broad_composite(302, "trace-b", "api-b", "200"),
+            broad_composite(
+                301,
+                ["trace-a", "parent-a", "event-a", "api-a", "100", "events-a"],
+            ),
+            broad_composite(
+                302,
+                ["trace-b", "parent-b", "event-b", "api-b", "200", "events-b"],
+            ),
             legacy_unrelated(303),
         ])
         .unwrap();
@@ -1342,55 +1574,139 @@ mod tests {
             .expect("local test object store accepts the .bf");
 
         let file = |id: i64, name: &str| {
-            let mut k = fk(&format!("files/o/logs/{stream}/{date}/{name}.parquet"), VER);
-            k.id = id;
-            k
+            let mut key = fk(&format!("files/o/logs/{stream}/{date}/{name}.parquet"), VER);
+            key.id = id;
+            key
         };
         let files = vec![file(301, "a"), file(302, "b"), file(303, "legacy")];
-        let only_trace_id = only_scope(&["trace_id"]);
+        let selective = only_scope(&["trace_id"]);
 
-        let c = cond(vec![Condition::Equal("trace_id".into(), "trace-a".into())]);
+        // Explicit scope remains authoritative even with AUTO-ID disabled.
+        let condition = cond(vec![Condition::Equal("trace_id".into(), "trace-a".into())]);
         let kept = prune(
             "tid",
             "o",
             StreamType::Logs,
             stream,
             files.clone(),
-            &c,
+            &condition,
             Vec::new(),
-            &only_trace_id,
+            &selective,
+            false,
+            &HashSet::new(),
         )
         .await;
         assert_eq!(
-            kept.iter().map(|f| f.id).collect::<Vec<_>>(),
+            kept.iter().map(|file| file.id).collect::<Vec<_>>(),
             vec![301, 303],
-            "Only(trace_id) prunes covered misses and keeps missing coverage"
+            "explicit scope prunes covered misses and keeps missing coverage"
         );
 
+        // Gate-off selective behavior is unchanged: non-explicit IDs do no
+        // Bloom work even when old broad composite bytes cover them.
         for (field, value) in [
-            ("infer_service_name", "api-a"),
-            ("span_duration_nano", "100"),
+            ("reference.parent_trace_id", "parent-a"),
+            ("event_id", "event-a"),
         ] {
-            let c = cond(vec![Condition::Equal(field.into(), value.into())]);
+            let condition = cond(vec![Condition::Equal(field.into(), value.into())]);
             let kept = prune(
                 "tid",
                 "o",
                 StreamType::Logs,
                 stream,
                 files.clone(),
-                &c,
+                &condition,
                 Vec::new(),
-                &only_trace_id,
+                &selective,
+                false,
+                &HashSet::new(),
             )
             .await;
             assert_eq!(
                 kept.len(),
                 files.len(),
-                "Only(trace_id) must never use old broad bytes for {field}"
+                "gate-off selective policy touched {field}"
             );
         }
 
-        let c = cond(vec![Condition::Equal(
+        // AUTO-ID extends selective composite admission only to semantic IDs.
+        for (field, value) in [
+            ("trace_id", "trace-a"),
+            ("reference.parent_trace_id", "parent-a"),
+            ("event_id", "event-a"),
+        ] {
+            let condition = cond(vec![Condition::Equal(field.into(), value.into())]);
+            let kept = prune(
+                "tid",
+                "o",
+                StreamType::Logs,
+                stream,
+                files.clone(),
+                &condition,
+                Vec::new(),
+                &selective,
+                true,
+                &HashSet::new(),
+            )
+            .await;
+            assert_eq!(
+                kept.iter().map(|file| file.id).collect::<Vec<_>>(),
+                vec![301, 303],
+                "AUTO-ID must prune covered misses and keep missing coverage for {field}"
+            );
+        }
+
+        for (field, value) in [
+            ("span_duration_nano", "100"),
+            ("events", "events-a"),
+            ("infer_service_name", "api-a"),
+        ] {
+            let condition = cond(vec![Condition::Equal(field.into(), value.into())]);
+            let kept = prune(
+                "tid",
+                "o",
+                StreamType::Logs,
+                stream,
+                files.clone(),
+                &condition,
+                Vec::new(),
+                &selective,
+                true,
+                &HashSet::new(),
+            )
+            .await;
+            assert_eq!(
+                kept.len(),
+                files.len(),
+                "AUTO-ID selective policy must never use old broad bytes for {field}"
+            );
+        }
+
+        let condition = cond(vec![Condition::Equal(
+            "reference.parent_trace_id".into(),
+            "parent-a".into(),
+        )]);
+        let kept = prune(
+            "tid",
+            "o",
+            StreamType::Logs,
+            stream,
+            files.clone(),
+            &condition,
+            Vec::new(),
+            &selective,
+            true,
+            &fields(&["reference.parent_trace_id"]),
+        )
+        .await;
+        assert_eq!(
+            kept.len(),
+            files.len(),
+            "NEVER must override semantic AUTO-ID admission"
+        );
+
+        // Broad All remains compatible with legacy any-field admission.
+        let condition = cond(vec![Condition::Equal(
             "infer_service_name".into(),
             "api-a".into(),
         )]);
@@ -1400,33 +1716,17 @@ mod tests {
             StreamType::Logs,
             stream,
             files.clone(),
-            &c,
+            &condition,
             Vec::new(),
             &VixBloomCompositeScope::All,
+            false,
+            &HashSet::new(),
         )
         .await;
         assert_eq!(
-            kept.iter().map(|f| f.id).collect::<Vec<_>>(),
+            kept.iter().map(|file| file.id).collect::<Vec<_>>(),
             vec![301, 303],
             "All preserves legacy any-field composite pruning"
-        );
-
-        let empty_scope = only_scope(&[]);
-        let kept = prune(
-            "tid",
-            "o",
-            StreamType::Logs,
-            stream,
-            files.clone(),
-            &c,
-            Vec::new(),
-            &empty_scope,
-        )
-        .await;
-        assert_eq!(
-            kept.len(),
-            files.len(),
-            "empty additive and composite scopes must do zero bloom work"
         );
     }
 
@@ -1538,6 +1838,8 @@ mod tests {
             &c,
             Vec::new(),
             &only_scope(&[]),
+            false,
+            &HashSet::new(),
         )
         .await;
         assert_eq!(kept.len(), 2, "out-of-scope demoted field is untouched");
@@ -1554,6 +1856,8 @@ mod tests {
             &c,
             Vec::new(),
             &only_trace_id,
+            false,
+            &HashSet::new(),
         )
         .await;
         let kept_ids: Vec<i64> = kept.iter().map(|f| f.id).collect();
@@ -1573,6 +1877,8 @@ mod tests {
             &c,
             Vec::new(),
             &only_trace_id,
+            false,
+            &HashSet::new(),
         )
         .await;
         assert!(kept.is_empty(), "covered misses drop every file");
@@ -1684,6 +1990,8 @@ mod tests {
                     &c,
                     vec!["trace_id".to_string()], // CONFIGURED field
                     &composite_scope,
+                    false,
+                    &HashSet::new(),
                 )
                 .await
                 .iter()
@@ -1736,6 +2044,8 @@ mod tests {
             &c,
             vec!["trace_id".to_string()],
             &only_scope(&[]),
+            false,
+            &HashSet::new(),
         )
         .await;
         assert_eq!(kept.len(), 1);
