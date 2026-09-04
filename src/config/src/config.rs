@@ -17,7 +17,7 @@ use std::{
     cmp::max,
     collections::BTreeMap,
     path::{Path, PathBuf},
-    sync::{Arc, LazyLock as Lazy},
+    sync::{Arc, LazyLock as Lazy, OnceLock},
 };
 
 use arc_swap::ArcSwap;
@@ -448,7 +448,27 @@ pub static NATS_KV_WATCH_MODULES: Lazy<HashSet<String>> = Lazy::new(|| {
         .collect()
 });
 
-pub static CONFIG: Lazy<ArcSwap<Config>> = Lazy::new(|| ArcSwap::from(Arc::new(init())));
+#[derive(Debug)]
+pub struct DatafusionMemoryPoolStartupConfig {
+    pub shared_query_pool: bool,
+    pub max_size: usize,
+    pub pool_type: String,
+}
+
+static DATAFUSION_MEMORY_POOL_STARTUP_CONFIG: OnceLock<DatafusionMemoryPoolStartupConfig> =
+    OnceLock::new();
+
+pub static CONFIG: Lazy<ArcSwap<Config>> = Lazy::new(|| {
+    let cfg = init();
+    DATAFUSION_MEMORY_POOL_STARTUP_CONFIG
+        .set(DatafusionMemoryPoolStartupConfig {
+            shared_query_pool: cfg.memory_cache.datafusion_shared_query_pool,
+            max_size: cfg.memory_cache.datafusion_max_size,
+            pool_type: cfg.memory_cache.datafusion_memory_pool.clone(),
+        })
+        .expect("DataFusion memory pool startup config initialized once");
+    ArcSwap::from(Arc::new(cfg))
+});
 static INSTANCE_ID: Lazy<RwHashMap<String, String>> = Lazy::new(Default::default);
 
 pub fn get_config() -> Arc<Config> {
@@ -458,6 +478,15 @@ pub fn get_config() -> Arc<Config> {
 pub fn refresh_config() -> Result<(), anyhow::Error> {
     CONFIG.store(Arc::new(init()));
     Ok(())
+}
+
+/// DataFusion query-pool settings captured atomically from the initial
+/// process configuration. Config refreshes cannot change these values.
+pub fn get_datafusion_memory_pool_startup_config() -> &'static DatafusionMemoryPoolStartupConfig {
+    Lazy::force(&CONFIG);
+    DATAFUSION_MEMORY_POOL_STARTUP_CONFIG
+        .get()
+        .expect("DataFusion memory pool startup config must accompany CONFIG")
 }
 
 pub fn cache_instance_id(instance_id: &str) {
@@ -3083,6 +3112,17 @@ pub struct MemoryCache {
     pub datafusion_max_size: usize,
     #[env_config(name = "ZO_MEMORY_CACHE_DATAFUSION_MEMORY_POOL", default = "")]
     pub datafusion_memory_pool: String,
+    /// When true, all non-merge query contexts in this process share one DataFusion memory
+    /// pool instead of receiving a full pool each. Defaults to false. The enabled flag and
+    /// the shared pool's `datafusion_max_size` and `datafusion_memory_pool` are captured
+    /// together at startup; changing them for shared queries requires a process restart.
+    /// Merge contexts always use their separate shared merge pool.
+    #[env_config(
+        name = "ZO_MEMORY_CACHE_DATAFUSION_SHARED_QUERY_POOL",
+        default = false,
+        help = "Share one process-wide DataFusion pool across non-merge queries. The flag and shared pool size/type are captured at startup; changes require restart. Merge contexts use a separate pool."
+    )]
+    pub datafusion_shared_query_pool: bool,
 }
 
 #[derive(Serialize, EnvConfig, Default)]
@@ -4250,6 +4290,16 @@ fn check_path_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
 }
 
 fn check_memory_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
+    let datafusion_memory_pool = cfg.memory_cache.datafusion_memory_pool.to_ascii_lowercase();
+    if !matches!(
+        datafusion_memory_pool.as_str(),
+        "" | "greedy" | "fair" | "none" | "off"
+    ) {
+        return Err(anyhow::anyhow!(
+            "ZO_MEMORY_CACHE_DATAFUSION_MEMORY_POOL must be one of greedy, fair, none, or off; got {:?}",
+            cfg.memory_cache.datafusion_memory_pool
+        ));
+    }
     let mem_total = sysinfo::get_memory_limit();
     cfg.limit.mem_total = mem_total;
     if cfg.memory_cache.max_size == 0 {
@@ -4809,6 +4859,17 @@ pub fn ensure_not_empty(s: &str, name: &str) -> Result<(), anyhow::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_datafusion_memory_pool_fails_config_check() {
+        let mut cfg = Config::init().unwrap();
+        cfg.memory_cache.datafusion_memory_pool = "invalid".to_string();
+        let err = check_memory_config(&mut cfg).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("ZO_MEMORY_CACHE_DATAFUSION_MEMORY_POOL")
+        );
+    }
 
     /// M11 launch defaults (OWNER 2026-08-18: "cache_latest_files default
     /// to true — we need cache latest files"): caching + merge-input

@@ -806,6 +806,13 @@ pub fn apply_core_stats_to_meta(
     Ok(())
 }
 
+fn core_write_context_builder(trace_id: &str) -> DataFusionContextBuilder<'_> {
+    DataFusionContextBuilder::new()
+        .trace_id(trace_id)
+        .sorted_by_time(true)
+        .shared_merge_pool(true)
+}
+
 /// Move-job producer: merge the WAL batches behind `tables` (same table
 /// providers the parquet path builds) into ONE core `.vix` file.
 ///
@@ -824,6 +831,7 @@ pub fn apply_core_stats_to_meta(
 /// and #42 L0-mode stream types build a column-store-only file. #42 files
 /// re-index when compaction merges them (merge plans resolve
 /// [`vix_index_enabled`]).
+
 #[allow(clippy::too_many_arguments)]
 pub async fn write_core_file_from_tables(
     trace_id: &str,
@@ -865,9 +873,7 @@ async fn write_core_file_from_tables_with_caps(
 ) -> Result<CoreFileResult, anyhow::Error> {
     let cfg = get_config();
     let sql = format!("SELECT * FROM tbl ORDER BY {TIMESTAMP_COL_NAME} DESC");
-    let ctx = DataFusionContextBuilder::new()
-        .trace_id(trace_id)
-        .sorted_by_time(true)
+    let ctx = core_write_context_builder(trace_id)
         .build(cfg.limit.datafusion_min_partition_num)
         .await?;
     let union_table = Arc::new(NewUnionTable::new(schema.clone(), tables));
@@ -5558,6 +5564,13 @@ mod tests {
     /// One fabricated file's (data, sidecar) bytes — what every test
     /// builder returns since the v3 split.
     type BuiltPair = (bytes::Bytes, Option<bytes::Bytes>);
+
+    #[test]
+    fn core_write_context_uses_shared_merge_pool() {
+        assert!(
+            core_write_context_builder("core-write-shared-merge-test").uses_shared_merge_pool()
+        );
+    }
 
     #[test]
     fn column_major_row_accounting_matches_scalar_reference() {
