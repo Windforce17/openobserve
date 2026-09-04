@@ -2367,8 +2367,9 @@ pub enum CoreFileStatus {
 /// `NeedsRebuild` fires on exactly the conditions the merge paths already
 /// enforce (no new probes):
 /// - [`VixWriter::check_merge_inputs`] rejects the file: tokenizer mismatch, fts/term marking
-///   mismatch vs the plan, a plan-fts field marked partial (the pre-fix oversize taint), or a
-///   partial field only a rebuild can re-index;
+///   mismatch vs the plan, a stale bloom-only marker where the current policy expects term
+///   capability, a plan-fts field marked partial (the pre-fix oversize taint), or a partial field
+///   only a rebuild can re-index;
 /// - [`VixWriter::merge_inputs_lacking_term_capability`] finds a term-planned field the file
 ///   carries without value terms (pre-numeric-value-terms files, fast-path-DEMOTED fields — the
 ///   index-merge fast path can only demote them again, never heal);
@@ -2400,6 +2401,29 @@ pub fn classify_core_file(
     fts_fields: &[String],
     bloom_fields: &[String],
 ) -> Result<CoreFileStatus, anyhow::Error> {
+    classify_core_file_with_caps(
+        stream_type,
+        key,
+        source,
+        index_source,
+        latest_schema,
+        fts_fields,
+        bloom_fields,
+        BatchCaps::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn classify_core_file_with_caps(
+    stream_type: StreamType,
+    key: &str,
+    source: Arc<dyn VixRangeSource>,
+    index_source: Option<Arc<dyn VixRangeSource>>,
+    latest_schema: &Schema,
+    fts_fields: &[String],
+    bloom_fields: &[String],
+    caps: BatchCaps,
+) -> Result<CoreFileStatus, anyhow::Error> {
     let reader = match VixReader::open_ranged_with_index(Arc::clone(&source), index_source) {
         Ok(reader) => reader,
         Err(index_error) => {
@@ -2420,7 +2444,7 @@ pub fn classify_core_file(
         latest_schema,
         fts_fields,
         bloom_fields,
-        BatchCaps::default(),
+        caps,
     );
     let MergeSource::Indexed(reader) = &sources[0] else {
         unreachable!("constructed as Indexed above");
@@ -2568,8 +2592,8 @@ fn build_merge_plan(
         }
     }
 
-    // #52: the full bloom-only list (config + test seam + STICKY input
-    // markers + merge-time AUTO from the inputs' dictionary block metas).
+    // #52: the full bloom-only list (explicit config + test seam, plus
+    // STICKY input markers and merge-time AUTO only while AUTO is enabled).
     // Purely an INDEX-side concept since v2 all-columns: demoted fields
     // lose dictionary/postings and keep bloom coverage — their docs
     // columns exist like every other field's, no column-store side effect
@@ -2598,16 +2622,16 @@ fn build_merge_plan(
                 _ => 0,
             })
             .sum();
-        if index_enabled {
-            // M7 STICKY demotion: a field ANY input already marks
-            // bloom-only stays bloom-only. Demoted inputs hold no
-            // dictionary terms for it, so the count-driven AUTO below can
-            // never re-derive the decision — without stickiness a second-
-            // generation merge would degrade the field to capability-less
-            // (bloom coverage lost) and the single-file sweep would
-            // rebuild → re-demote → rebuild forever. Un-demotion is the
-            // never-list (it wins at writer resolution) + the heal that
-            // then re-derives the terms.
+        if index_enabled && ratio > 0.0 {
+            // M7 STICKY demotion: while AUTO is enabled, a field ANY input
+            // already marks bloom-only stays bloom-only. Demoted inputs hold
+            // no dictionary terms for it, so the count-driven AUTO below
+            // cannot re-derive the decision. AUTO=0 is deliberately different:
+            // it is an authoritative explicit-only policy, so old automatic
+            // markers are not carried and the compatibility check forces a
+            // rebuild that restores their term capability. Explicit fields
+            // remain bloom-only through `names`; the writer's never-list still
+            // wins during final resolution.
             for source in sources {
                 if let MergeSource::Indexed(reader) = source {
                     names.extend(reader.bloom_only_fields().map(str::to_string));
@@ -7781,9 +7805,9 @@ mod tests {
     /// #52/M7 (1): a file demoted at FIRST ENCODE through the real move-job
     /// path carries the construction-demotion semantics — `bloom` marker,
     /// no dictionary values, composite coverage + guards, key terms intact,
-    /// the scan column readable for filter-back — and the single-file sweep
-    /// classifies it CURRENT under the default plan (sticky marker), never
-    /// looping rebuild → re-demote → rebuild.
+    /// the scan column readable for filter-back — and, while AUTO remains
+    /// enabled, the single-file sweep classifies it CURRENT by sticky marker
+    /// instead of looping rebuild → re-demote → rebuild.
     #[tokio::test]
     async fn auto_demotes_at_first_encode_and_classifies_current() {
         use vortex_index::bloom::{
@@ -7827,15 +7851,14 @@ mod tests {
             ));
         }
 
-        // classify under the DEFAULT plan (no caps seam): the sticky marker
-        // must make the demoted file Current — a NeedsRebuild here would be
-        // the rebuild → re-demote → rebuild loop
+        // Classify under AUTO>0 with a threshold that selects nothing: the
+        // sticky marker itself must make the demoted file Current.
         let latest_schema = Schema::new(vec![
             Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
             Field::new("svc", DataType::Utf8, true),
             Field::new("trace_id", DataType::Utf8, true),
         ]);
-        let status = classify_core_file(
+        let status = classify_core_file_with_caps(
             StreamType::Logs,
             "m7-demoted.vix",
             vortex_index::BytesRangeSource::new("m7-demoted.vix", built.0.clone()),
@@ -7846,6 +7869,10 @@ mod tests {
             &latest_schema,
             &[],
             &[],
+            BatchCaps {
+                bloom_auto_override: Some((0.5, u64::MAX)),
+                ..Default::default()
+            },
         )
         .unwrap();
         assert!(
@@ -7854,11 +7881,11 @@ mod tests {
         );
     }
 
-    /// #52/M7 (2): merging two demoted-at-birth inputs with AUTO OFF at
-    /// merge time keeps the demotion (STICKY marker) — fast path + docs
-    /// passthrough, `bloom` marker on the output, composite coverage
-    /// re-derived from the docs columns for BOTH inputs' values — and the
-    /// merged output classifies Current in turn.
+    /// #52/M7 (2): merging two demoted-at-birth inputs while AUTO remains
+    /// enabled keeps the demotion by STICKY marker even when the current
+    /// threshold would select nothing — fast path + docs passthrough,
+    /// `bloom` marker on the output, composite coverage re-derived from the
+    /// docs columns for BOTH inputs' values — and Current thereafter.
     #[tokio::test]
     async fn sticky_merge_of_demoted_inputs_keeps_bloom_only() {
         use vortex_index::bloom::{
@@ -7888,8 +7915,9 @@ mod tests {
             // reject every probe and wrongly drop the file)
             &["trace_id".to_string()],
             BatchCaps {
-                // AUTO fully OFF at merge: stickiness alone must carry
-                bloom_auto_override: Some((0.0, u64::MAX)),
+                // AUTO enabled, but this generation's threshold selects
+                // nothing: stickiness alone must carry the old marker.
+                bloom_auto_override: Some((0.5, u64::MAX)),
                 ..Default::default()
             },
         )
@@ -7938,7 +7966,7 @@ mod tests {
             bytes::Bytes::from(result.output.to_bytes().unwrap()),
             result.index.clone().map(bytes::Bytes::from),
         );
-        let status = classify_core_file(
+        let status = classify_core_file_with_caps(
             StreamType::Logs,
             "m7-merged.vix",
             vortex_index::BytesRangeSource::new("m7-merged.vix", merged_pair.0.clone()),
@@ -7949,6 +7977,10 @@ mod tests {
             &latest_schema,
             &[],
             &[],
+            BatchCaps {
+                bloom_auto_override: Some((0.5, u64::MAX)),
+                ..Default::default()
+            },
         )
         .unwrap();
         assert!(matches!(status, CoreFileStatus::Current));
@@ -7956,9 +7988,9 @@ mod tests {
 
     /// #52/M7 (3): a MIXED merge — one demoted-at-birth input + one legacy
     /// term-indexed input — converges on bloom-only: sticky drives the plan
-    /// (AUTO off), the legacy input's dictionary values are diverted into
-    /// the composite (never the output dictionary), and coverage spans BOTH
-    /// inputs' values.
+    /// while AUTO remains enabled but its threshold selects nothing; the
+    /// legacy input's dictionary values divert into the composite (never the
+    /// output dictionary), and coverage spans BOTH inputs' values.
     #[tokio::test]
     async fn mixed_merge_demoted_and_legacy_term_inputs_converges() {
         use vortex_index::bloom::{
@@ -8011,7 +8043,7 @@ mod tests {
             // — so demotion must suppress the section entirely
             &["trace_id".to_string()],
             BatchCaps {
-                bloom_auto_override: Some((0.0, u64::MAX)),
+                bloom_auto_override: Some((0.5, u64::MAX)),
                 ..Default::default()
             },
         )
@@ -8059,6 +8091,147 @@ mod tests {
                 composite_guard_key("trace_id", pr, &mut buf).unwrap()
             ));
         }
+    }
+
+    /// AUTO=0 is an authoritative explicit-only policy, not "stop making
+    /// new decisions but preserve every old one". A file written under AUTO
+    /// may therefore carry stale bloom-only markers on ordinary strings.
+    /// With AUTO disabled and only the ID fields explicit, classification
+    /// must request a rebuild, the dictionary fast path must refuse the
+    /// stale marker, and the rebuild must restore the ordinary field's term
+    /// capability while retaining exactly the desired ID demotions.
+    #[tokio::test]
+    async fn auto_zero_rebuilds_stale_demotions_to_explicit_only_policy() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+            Field::new("request_route", DataType::Utf8, true),
+            Field::new("trace_id", DataType::Utf8, true),
+            Field::new("span_id", DataType::Utf8, true),
+        ]));
+        let rows = 8usize;
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(
+                    (0..rows).map(|row| 2_000 - row as i64).collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(StringArray::from(
+                    (0..rows)
+                        .map(|row| format!("/old-auto/{row}"))
+                        .collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(StringArray::from(
+                    (0..rows)
+                        .map(|row| format!("trace-{row}"))
+                        .collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(StringArray::from(
+                    (0..rows)
+                        .map(|row| format!("span-{row}"))
+                        .collect::<Vec<_>>(),
+                )) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let table = Arc::new(MemTable::try_new(Arc::clone(&schema), vec![vec![batch]]).unwrap());
+        let old = write_core_file_from_tables_with_caps(
+            "test-auto-zero-migration-source",
+            StreamType::Logs,
+            Arc::clone(&schema),
+            vec![table],
+            &[],
+            &[],
+            false,
+            0,
+            BatchCaps {
+                bloom_auto_override: Some((0.5, 4)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let old_pair: BuiltPair = (
+            bytes::Bytes::from(old.data),
+            old.index.map(bytes::Bytes::from),
+        );
+        let old_reader = open_pair(&old_pair);
+        let mut old_bloom_only = old_reader.bloom_only_fields().collect::<Vec<_>>();
+        old_bloom_only.sort_unstable();
+        assert_eq!(
+            old_bloom_only,
+            ["request_route", "span_id", "trace_id"],
+            "precondition: the old AUTO policy demoted both IDs and the ordinary string"
+        );
+
+        let latest_schema = schema.as_ref().clone();
+        let explicit_only = BatchCaps {
+            bloom_only_override: Some("trace_id,span_id"),
+            bloom_auto_override: Some((0.0, u64::MAX)),
+            ..Default::default()
+        };
+        let classify = |pair: &BuiltPair| {
+            classify_core_file_with_caps(
+                StreamType::Logs,
+                "auto-zero-migration.vix",
+                vortex_index::BytesRangeSource::new("auto-zero-migration.vix", pair.0.clone()),
+                pair.1.as_ref().map(|index| {
+                    vortex_index::BytesRangeSource::new("auto-zero-migration.vxi", index.clone())
+                }),
+                &latest_schema,
+                &[],
+                &[],
+                explicit_only,
+            )
+        };
+        let status = classify(&old_pair).unwrap();
+        match status {
+            CoreFileStatus::NeedsRebuild(reason) => {
+                assert!(reason.contains("request_route"), "{reason}");
+                assert!(reason.contains("bloom-only"), "{reason}");
+            }
+            CoreFileStatus::Current => {
+                panic!("stale AUTO bloom-only marker must require a rebuild")
+            }
+        }
+
+        let inputs = vec![("auto-zero-old.vix".to_string(), old_pair)];
+        let rebuilt = merge_core_files_with_caps(
+            StreamType::Logs,
+            &as_inputs(&inputs),
+            &latest_schema,
+            &[],
+            &[],
+            explicit_only,
+        )
+        .unwrap();
+        assert!(
+            !rebuilt.used_index_merge,
+            "a stale bloom-only input must reject the dictionary fast path"
+        );
+        let rebuilt_reader = open_merged(&rebuilt);
+        assert!(
+            rebuilt_reader.has_term_capability("request_route"),
+            "the rebuild restores the ordinary field's term capability"
+        );
+        assert_eq!(
+            matching_docs(&rebuilt_reader, &exact("request_route", "/old-auto/3")).len(),
+            1,
+            "the restored term must answer exact probes"
+        );
+        let mut rebuilt_bloom_only = rebuilt_reader.bloom_only_fields().collect::<Vec<_>>();
+        rebuilt_bloom_only.sort_unstable();
+        assert_eq!(rebuilt_bloom_only, ["span_id", "trace_id"]);
+        assert!(!rebuilt_reader.has_term_capability("trace_id"));
+        assert!(!rebuilt_reader.has_term_capability("span_id"));
+
+        let rebuilt_pair: BuiltPair = (
+            bytes::Bytes::from(rebuilt.output.to_bytes().unwrap()),
+            rebuilt.index.clone().map(bytes::Bytes::from),
+        );
+        assert!(
+            matches!(classify(&rebuilt_pair).unwrap(), CoreFileStatus::Current),
+            "the explicit ID demotions are desired and must not create a rebuild loop"
+        );
     }
 
     /// M12 double-hash elimination predicate: an input whose DICTIONARY

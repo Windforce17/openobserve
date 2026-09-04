@@ -1284,6 +1284,9 @@ impl VixWriter {
     ///   dictionary is missing the skipped oversize values' tokens, and only a rebuild from
     ///   `_source` re-derives them (the rebuilt output drops the marking, un-tainting match_all for
     ///   the file),
+    /// - a field marked `bloom` in an input while the current plan expects term/fts capability:
+    ///   bloom-only inputs carry no value dictionary to merge, so only a rebuild can restore the
+    ///   plan's capability,
     /// - a field that is `partial` in an input **without** being value-indexed there while the
     ///   merge plan value-indexes it (the input's dictionary is missing values that only a rebuild
     ///   from `_source` can recover).
@@ -1319,6 +1322,18 @@ impl VixWriter {
             for entry in reader.field_entries() {
                 if self.value_index_excluded_fields.contains(&entry.name) {
                     continue;
+                }
+                if entry.has_type(FIELD_TYPE_BLOOM)
+                    && self
+                        .term_field_ids
+                        .get(&entry.name)
+                        .is_some_and(|id| !self.bloom_only.contains_key(id))
+                {
+                    return Err(format!(
+                        "field {:?} is bloom-only in input {position} but term-capable in the \
+                         merge plan — only a rebuild can restore its value terms",
+                        entry.name,
+                    ));
                 }
                 let input_term = entry.has_type(FIELD_TYPE_TERM);
                 let input_fts = entry.has_type(FIELD_TYPE_FTS);

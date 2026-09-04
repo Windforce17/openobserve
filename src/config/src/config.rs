@@ -268,6 +268,64 @@ pub fn is_vix_l0_index_off(stream_type: crate::meta::stream::StreamType) -> bool
     VIX_L0_INDEX_OFF_STREAM_TYPES.contains(&stream_type)
 }
 
+/// Fields whose equality terms may be written to and queried through the
+/// per-file composite Bloom section.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum VixBloomCompositeScope {
+    /// Every eligible term field participates.
+    All,
+    /// Only the named Bloom-only fields participate.
+    Only(HashSet<String>),
+}
+
+impl VixBloomCompositeScope {
+    /// Builds the effective scope from the broad switch and comma-separated
+    /// Bloom-only allow/deny lists.
+    pub fn new(broad: bool, explicit_fields: &str, never_fields: &str) -> Self {
+        if broad {
+            return Self::All;
+        }
+
+        let mut fields = explicit_fields
+            .split(',')
+            .map(str::trim)
+            .filter(|field| !field.is_empty())
+            .map(str::to_owned)
+            .collect::<HashSet<_>>();
+        for field in never_fields.split(',').map(str::trim) {
+            if !field.is_empty() {
+                fields.remove(field);
+            }
+        }
+        Self::Only(fields)
+    }
+
+    pub fn enabled(&self) -> bool {
+        match self {
+            Self::All => true,
+            Self::Only(fields) => !fields.is_empty(),
+        }
+    }
+
+    pub fn allows(&self, field: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Only(fields) => fields.contains(field),
+        }
+    }
+}
+
+/// Derives the effective composite Bloom policy from one configuration
+/// snapshot. Callers must pass the same snapshot they use for the rest of
+/// their operation so a config reload cannot mix old policy with new knobs.
+pub fn vix_bloom_composite_scope(cfg: &Config) -> VixBloomCompositeScope {
+    VixBloomCompositeScope::new(
+        cfg.common.vix_bloom_composite,
+        &cfg.common.vix_bloom_only_fields,
+        &cfg.common.vix_bloom_only_never,
+    )
+}
+
 pub static BLOOM_FILTER_DEFAULT_FIELDS: Lazy<Vec<String>> = Lazy::new(|| {
     let mut fields = get_config()
         .common
@@ -1740,14 +1798,15 @@ pub struct Common {
         name = "ZO_VIX_BLOOM_COMPOSITE",
         default = true,
         help = "#48: per-file COMPOSITE value bloom — one reserved section keyed by \
-                {field name}\\0{value} over EVERY term field, making equality on ANY field \
-                bloom-decidable (file-skip pruning over multi-day windows with ~8KiB reads per \
-                256-file .bf group). Adds one hash per distinct term at build/merge time and \
-                ~2 bytes per distinct term of blob size at the default FPP. Readers that \
-                predate the section ignore it; the pruner keeps files whose .bf lacks it \
-                (fail-open) — safe to enable per-side in any order. DEFAULT ON since v2 M7 \
-                (it is what serves equality on #52 bloom-only-demoted fields); set false to \
-                go dark."
+                {field name}\\0{value}. When true, it covers all eligible terms, making \
+                equality on any field bloom-decidable (file-skip pruning over multi-day \
+                windows with ~8KiB reads per 256-file .bf group). When false, broad \
+                any-field coverage is disabled, but fields explicitly listed in \
+                ZO_VIX_BLOOM_ONLY_FIELDS still use their selective composite unless excluded \
+                by ZO_VIX_BLOOM_ONLY_NEVER. Adds one hash per distinct included term at \
+                build/merge time and ~2 bytes per distinct term of blob size at the default \
+                FPP. Readers that predate the section ignore it; the pruner keeps files whose \
+                .bf lacks it (fail-open) — safe to enable per-side in any order."
     )]
     pub vix_bloom_composite: bool,
     #[env_config(
@@ -5889,5 +5948,73 @@ mod tests {
         let p = std::path::Path::new(r"C:\data\openobserve");
         let result = deverbatim(p);
         assert_eq!(result, r"C:\data\openobserve");
+    }
+
+    #[test]
+    fn vix_bloom_composite_broad_scope_is_all() {
+        let scope = VixBloomCompositeScope::new(true, "trace_id", "trace_id");
+
+        assert_eq!(scope, VixBloomCompositeScope::All);
+        assert!(scope.enabled());
+        assert!(scope.allows("any_field"));
+    }
+
+    #[test]
+    fn vix_bloom_composite_selective_scope_trims_and_deduplicates() {
+        let scope =
+            VixBloomCompositeScope::new(false, " trace_id,span_id,trace_id, , span_id ", "");
+        let VixBloomCompositeScope::Only(fields) = &scope else {
+            panic!("selective configuration must produce an Only scope");
+        };
+
+        assert_eq!(fields.len(), 2);
+        assert!(fields.contains("trace_id"));
+        assert!(fields.contains("span_id"));
+        assert!(scope.enabled());
+        assert!(scope.allows("trace_id"));
+        assert!(!scope.allows("service_name"));
+    }
+
+    #[test]
+    fn vix_bloom_composite_never_fields_are_subtracted() {
+        let scope =
+            VixBloomCompositeScope::new(false, " trace_id, span_id, service_name ", "span_id");
+        let VixBloomCompositeScope::Only(fields) = &scope else {
+            panic!("selective configuration must produce an Only scope");
+        };
+
+        assert_eq!(fields.len(), 2);
+        assert!(fields.contains("trace_id"));
+        assert!(fields.contains("service_name"));
+        assert!(!scope.allows("span_id"));
+    }
+
+    #[test]
+    fn vix_bloom_composite_empty_scope_is_disabled() {
+        let scope = VixBloomCompositeScope::new(false, " trace_id, trace_id ", " trace_id ");
+
+        assert_eq!(scope, VixBloomCompositeScope::Only(HashSet::new()));
+        assert!(!scope.enabled());
+        assert!(!scope.allows("trace_id"));
+    }
+
+    #[test]
+    fn vix_bloom_composite_scope_uses_the_supplied_snapshot() {
+        let mut selective = Config::default();
+        selective.common.vix_bloom_composite = false;
+        selective.common.vix_bloom_only_fields = "trace_id".to_string();
+
+        let mut broad = Config::default();
+        broad.common.vix_bloom_composite = true;
+        broad.common.vix_bloom_only_fields = "span_id".to_string();
+
+        assert_eq!(
+            vix_bloom_composite_scope(&selective),
+            VixBloomCompositeScope::Only(HashSet::from(["trace_id".to_string()]))
+        );
+        assert_eq!(
+            vix_bloom_composite_scope(&broad),
+            VixBloomCompositeScope::All
+        );
     }
 }
