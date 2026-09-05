@@ -36,7 +36,7 @@ use config::{
     },
 };
 use hashbrown::HashMap;
-use object_store::{GetOptions, GetResult, GetResultPayload, ObjectMeta};
+use object_store::{GetOptions, GetRange, GetResult, GetResultPayload, ObjectMeta};
 use tokio::sync::RwLock;
 
 use super::CacheStrategy;
@@ -162,6 +162,34 @@ pub struct FileData {
     multi_dir: Vec<String>,
     file_type: FileType,
     data: CacheStrategy,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FileGeneration {
+    size: u64,
+    e_tag: String,
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl FileGeneration {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+
+        Self {
+            size: metadata.len(),
+            e_tag: get_etag(metadata),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -413,27 +441,12 @@ impl FileData {
         Ok(())
     }
 
-    async fn remove(&mut self, file: &str) -> Result<(), anyhow::Error> {
-        log::debug!(
-            "[CacheType:{}] File disk cache remove file {file}",
-            self.file_type,
-        );
-
+    fn remove_index_entry(&mut self, file: &str) {
         let Some((key, data_size)) = self.data.remove_key(file) else {
-            return Ok(());
+            return;
         };
         self.cur_size -= data_size;
 
-        // delete file from local disk
-        let file_path = self.get_file_path(key.as_str());
-        if let Err(e) = tokio::fs::remove_file(&file_path).await {
-            log::error!(
-                "[CacheType:{}] File disk cache remove file: {file_path}, error: {e}",
-                self.file_type,
-            );
-        }
-
-        // metrics
         let columns = key.split('/').collect::<Vec<&str>>();
         if columns[0] == "files" {
             metrics::QUERY_DISK_CACHE_FILES
@@ -455,8 +468,73 @@ impl FileData {
                 .with_label_values(&[columns[1], columns[2], "aggregations"])
                 .sub(data_size as i64);
         }
+    }
 
-        Ok(())
+    /// Unlink a physical entry and update its index without an await point
+    /// between the two operations. If `expected` is supplied, only the exact
+    /// physical generation observed by the caller may be removed.
+    fn remove(
+        &mut self,
+        file: &str,
+        expected: Option<&FileGeneration>,
+    ) -> Result<bool, anyhow::Error> {
+        log::debug!(
+            "[CacheType:{}] File disk cache remove file {file}",
+            self.file_type,
+        );
+
+        let file_path = self.get_file_path(file);
+        match std::fs::metadata(&file_path) {
+            Ok(metadata) => {
+                if expected
+                    .is_some_and(|expected| FileGeneration::from_metadata(&metadata) != *expected)
+                {
+                    return Ok(false);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.remove_index_entry(file);
+                return Ok(true);
+            }
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "[CacheType:{}] File disk cache stat file {file_path} before removal error: {error}",
+                    self.file_type,
+                ));
+            }
+        }
+
+        match std::fs::remove_file(&file_path) {
+            Ok(()) => {
+                self.remove_index_entry(file);
+                Ok(true)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.remove_index_entry(file);
+                Ok(true)
+            }
+            Err(error) => Err(anyhow::anyhow!(
+                "[CacheType:{}] File disk cache remove file {file_path} error: {error}",
+                self.file_type,
+            )),
+        }
+    }
+
+    /// Clear an index entry only if the physical path is still absent. This
+    /// closes the failed-open/concurrent-fill race without unlinking the fill.
+    fn remove_index_if_missing(&mut self, file: &str) -> Result<bool, anyhow::Error> {
+        let file_path = self.get_file_path(file);
+        match std::fs::metadata(&file_path) {
+            Ok(_) => Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.remove_index_entry(file);
+                Ok(true)
+            }
+            Err(error) => Err(anyhow::anyhow!(
+                "[CacheType:{}] File disk cache stat file {file_path} before stale-index removal error: {error}",
+                self.file_type,
+            )),
+        }
     }
 
     fn choose_multi_dir(&self, file: &str) -> String {
@@ -543,6 +621,71 @@ fn get_file_reader(file: &str) -> Option<&FileData> {
     Some(files)
 }
 
+// `InvalidGetRange` is not part of the object-store API surface we rely on.
+// Preserve `as_range`'s validation order, then identify only the request
+// shapes that it reports as StartTooLarge.
+fn is_start_too_large(requested: &GetRange, size: u64) -> bool {
+    if requested.is_valid().is_err() {
+        return false;
+    }
+    match requested {
+        GetRange::Bounded(range) => range.start >= size,
+        GetRange::Offset(offset) => *offset >= size,
+        GetRange::Suffix(_) => false,
+    }
+}
+
+fn resolve_get_range(
+    file: &str,
+    requested: Option<&GetRange>,
+    size: u64,
+) -> object_store::Result<Range<u64>> {
+    match requested {
+        Some(range) => range.as_range(size).map_err(|source| {
+            if is_start_too_large(range, size) {
+                object_store::Error::NotFound {
+                    path: file.to_string(),
+                    source: Box::new(source),
+                }
+            } else {
+                object_store::Error::Precondition {
+                    path: file.to_string(),
+                    source: Box::new(source),
+                }
+            }
+        }),
+        None => Ok(0..size),
+    }
+}
+
+async fn remove_generation(file: &str, generation: &FileGeneration) -> Result<bool, anyhow::Error> {
+    let idx = get_bucket_idx(file);
+    let mut files = if file.starts_with("files") {
+        FILES[idx].write().await
+    } else if file.starts_with("results") {
+        RESULT_FILES[idx].write().await
+    } else if file.starts_with("aggregations") {
+        AGGREGATION_FILES[idx].write().await
+    } else {
+        RESULT_FILES[idx].write().await
+    };
+    files.remove(file, Some(generation))
+}
+
+async fn clear_index_if_missing(file: &str) -> Result<bool, anyhow::Error> {
+    let idx = get_bucket_idx(file);
+    let mut files = if file.starts_with("files") {
+        FILES[idx].write().await
+    } else if file.starts_with("results") {
+        RESULT_FILES[idx].write().await
+    } else if file.starts_with("aggregations") {
+        AGGREGATION_FILES[idx].write().await
+    } else {
+        RESULT_FILES[idx].write().await
+    };
+    files.remove_index_if_missing(file)
+}
+
 pub async fn get_opts(file: &str, options: GetOptions) -> object_store::Result<GetResult> {
     let Some(files) = get_file_reader(file) else {
         return Err(object_store::Error::NotFound {
@@ -551,26 +694,83 @@ pub async fn get_opts(file: &str, options: GetOptions) -> object_store::Result<G
         });
     };
     let path = PathBuf::from(files.get_file_path(file));
-    let (metadata, fp) = std::fs::File::open(&path)
-        .and_then(|f| Ok((f.metadata()?, f)))
-        .map_err(|e| object_store::Error::NotFound {
-            path: file.to_string(),
-            source: Box::new(e),
-        })?;
+    let (metadata, fp) = match std::fs::File::open(&path).and_then(|f| Ok((f.metadata()?, f))) {
+        Ok(opened) => opened,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Err(cleanup_error) = clear_index_if_missing(file).await {
+                log::error!(
+                    "File disk cache failed to clear missing physical entry {file}: {cleanup_error}"
+                );
+                return Err(object_store::Error::Generic {
+                    store: "disk cache",
+                    source: Box::new(std::io::Error::other(cleanup_error.to_string())),
+                });
+            }
+            return Err(object_store::Error::NotFound {
+                path: file.to_string(),
+                source: Box::new(error),
+            });
+        }
+        Err(error) => {
+            return Err(object_store::Error::NotFound {
+                path: file.to_string(),
+                source: Box::new(error),
+            });
+        }
+    };
 
+    let generation = FileGeneration::from_metadata(&metadata);
     let last_modified = last_modified(&metadata);
     let meta = ObjectMeta {
         location: file.into(),
         last_modified,
-        size: metadata.len(),
-        e_tag: Some(get_etag(&metadata)),
+        size: generation.size,
+        e_tag: Some(generation.e_tag.clone()),
         version: None,
     };
     options.check_preconditions(&meta)?;
 
-    let range = match options.range {
-        Some(r) => r.as_range(meta.size).unwrap(),
-        None => 0..meta.size,
+    let range = match resolve_get_range(file, options.range.as_ref(), meta.size) {
+        Ok(range) => range,
+        Err(error)
+            if options
+                .range
+                .as_ref()
+                .is_some_and(|range| is_start_too_large(range, meta.size)) =>
+        {
+            log::warn!(
+                "File disk cache entry is stale for {file}: requested {:?}, cached size {}; \
+                 evicting and falling back to object storage",
+                options.range,
+                meta.size
+            );
+            match remove_generation(file, &generation).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    log::debug!(
+                        "File disk cache preserved a newer generation of stale entry {file}"
+                    );
+                }
+                Err(remove_error) => {
+                    log::error!(
+                        "File disk cache failed to evict stale generation {file}: requested {:?}, \
+                         cached size {}: {remove_error}",
+                        options.range,
+                        meta.size
+                    );
+                    return Err(object_store::Error::Generic {
+                        store: "disk cache",
+                        source: Box::new(std::io::Error::other(format!(
+                            "failed to evict {file} after requested range {:?} exceeded cached \
+                             size {}: {remove_error}",
+                            options.range, meta.size
+                        ))),
+                    });
+                }
+            }
+            return Err(error);
+        }
+        Err(error) => return Err(error),
     };
 
     Ok(GetResult {
@@ -867,7 +1067,7 @@ pub async fn remove(file: &str) -> Result<(), anyhow::Error> {
     } else {
         RESULT_FILES[idx].write().await
     };
-    files.remove(file).await
+    files.remove(file, None).map(|_| ())
 }
 
 #[async_recursion]
@@ -1265,14 +1465,9 @@ async fn alloc_tmp_file_path() -> Result<TempFileGuard, anyhow::Error> {
 }
 
 // Write data to a temporary random file and return the file path
-async fn write_tmp_file(
-    file: &str,
-    data: Bytes,
-) -> Result<(String, TempFileGuard), anyhow::Error> {
+async fn write_tmp_file(file: &str, data: Bytes) -> Result<(String, TempFileGuard), anyhow::Error> {
     let tmp_file = alloc_tmp_file_path().await?;
-    if let Err(e) =
-        config::utils::async_file::put_file_contents(tmp_file.path(), &data).await
-    {
+    if let Err(e) = config::utils::async_file::put_file_contents(tmp_file.path(), &data).await {
         return Err(anyhow::anyhow!(
             "[FileData::Disk] write tmp file {}, failed: {}",
             tmp_file.path(),
@@ -1285,6 +1480,145 @@ async fn write_tmp_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn unique_disk_range_test_key(name: &str) -> String {
+        format!(
+            "aggregations/default/traces/disk-range-tests/{name}-{}.vxi",
+            config::ider::generate()
+        )
+    }
+
+    #[tokio::test]
+    async fn oversized_public_get_evicts_a_short_global_disk_entry() {
+        let file = unique_disk_range_test_key("stale");
+        set(&file, Bytes::from_static(b"short")).await.unwrap();
+        let path = get_file_path(&file).unwrap();
+        assert!(exist(&file).await);
+        assert!(Path::new(&path).is_file());
+
+        let error = match get_opts(
+            &file,
+            GetOptions {
+                range: Some(GetRange::Bounded(8..12)),
+                ..Default::default()
+            },
+        )
+        .await
+        {
+            Ok(_) => panic!("oversized stale-cache range unexpectedly succeeded"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(&error, object_store::Error::NotFound { .. }));
+        assert!(
+            error.to_string().contains("starting at 8")
+                && error.to_string().contains("only 5 bytes"),
+            "{error}"
+        );
+        assert!(!exist(&file).await);
+        assert!(!Path::new(&path).exists());
+    }
+
+    #[tokio::test]
+    async fn inconsistent_range_does_not_evict_the_disk_entry() {
+        let file = unique_disk_range_test_key("inconsistent");
+        set(&file, Bytes::from_static(b"short")).await.unwrap();
+        let path = get_file_path(&file).unwrap();
+
+        let error = match get_opts(
+            &file,
+            GetOptions {
+                range: Some(GetRange::Bounded(8..8)),
+                ..Default::default()
+            },
+        )
+        .await
+        {
+            Ok(_) => panic!("inconsistent range unexpectedly succeeded"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(&error, object_store::Error::Precondition { .. }));
+        assert!(exist(&file).await);
+        assert!(Path::new(&path).is_file());
+        remove(&file).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stale_readers_cannot_remove_a_same_size_newer_generation() {
+        let file = unique_disk_range_test_key("generation");
+        set(&file, Bytes::from_static(b"old")).await.unwrap();
+        let path = get_file_path(&file).unwrap();
+        let first_reader_file = std::fs::File::open(&path).unwrap();
+        let first_metadata = first_reader_file.metadata().unwrap();
+        let old_modified = first_metadata.modified().unwrap();
+        let first_stale_reader = FileGeneration::from_metadata(&first_metadata);
+        let second_reader_file = std::fs::File::open(&path).unwrap();
+        let second_stale_reader =
+            FileGeneration::from_metadata(&second_reader_file.metadata().unwrap());
+
+        assert!(remove_generation(&file, &first_stale_reader).await.unwrap());
+        drop(first_reader_file);
+        set(&file, Bytes::from_static(b"new")).await.unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old_modified))
+            .unwrap();
+        let new_generation = FileGeneration::from_metadata(&std::fs::metadata(&path).unwrap());
+        assert_eq!(first_stale_reader.size, new_generation.size);
+        assert_eq!(first_stale_reader.e_tag, new_generation.e_tag);
+        assert_ne!(first_stale_reader.inode, new_generation.inode);
+
+        assert!(
+            !remove_generation(&file, &second_stale_reader)
+                .await
+                .unwrap()
+        );
+        drop(second_reader_file);
+        assert!(exist(&file).await);
+        assert_eq!(get(&file, None).await.unwrap(), Bytes::from_static(b"new"));
+        remove(&file).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unlink_failure_retains_index_accounting_for_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let mut files = FileData::with_capacity_and_cache_strategy(FileType::Data, 1024, "lru");
+        files.root_dir = format!("{}/", root.path().display());
+        files.multi_dir.clear();
+        let file = "files/default/traces/unlink-failure.vxi";
+        let path = files.get_file_path(file);
+        std::fs::create_dir_all(&path).unwrap();
+        files.set_size(file, 17).unwrap();
+        let generation = FileGeneration::from_metadata(&std::fs::metadata(&path).unwrap());
+
+        let error = files.remove(file, Some(&generation)).unwrap_err();
+        assert!(error.to_string().contains("remove file"), "{error}");
+        assert!(files.data.contains_key(file));
+        assert_eq!(files.cur_size, 17);
+
+        std::fs::remove_dir(&path).unwrap();
+        assert!(files.remove_index_if_missing(file).unwrap());
+        assert!(!files.data.contains_key(file));
+        assert_eq!(files.cur_size, 0);
+    }
+
+    #[test]
+    fn disk_range_still_clamps_an_end_beyond_the_cached_file() {
+        assert_eq!(
+            resolve_get_range(
+                "files/default/traces/default/example.vxi",
+                Some(&GetRange::Bounded(4..20)),
+                10,
+            )
+            .unwrap(),
+            4..10
+        );
+    }
 
     #[tokio::test]
     async fn abandoned_temporary_file_is_removed_on_drop() {

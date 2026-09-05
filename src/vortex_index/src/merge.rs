@@ -30,9 +30,9 @@
 //!   the [`DocIdMap`]s. `doc_count` is the plain sum (doc-id spaces are disjoint). A term present
 //!   in every merged row is dense-elided (empty blob) against the *merged* row count; an input's
 //!   dense-elided postings are expanded through its map. When every contributing input maps by
-//!   constant offset the remapped lists concatenate in offset order without sorting (and a single
-//!   contributor at offset 0 reuses its encoded blob byte-for-byte); table maps decode, remap,
-//!   sort, and verify distinctness;
+//!   constant offset the remapped lists concatenate in offset order without sorting. A single
+//!   inline offset contributor reuses the encoding by shifting its first delta (offset zero copies
+//!   either representation verbatim); table maps decode, remap, sort, and verify distinctness;
 //! - runs the merge across up to `ZO_VIX_MERGE_KWAY_THREADS` workers by partitioning the OUTPUT key
 //!   space into ranges bounded by real remapped input keys ([`partition_bounds`]), each bound
 //!   translated into every input's own key space ([`translate_bound`]); each range produces one
@@ -43,12 +43,17 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     hash::BuildHasher,
+    path::Path,
+    sync::Arc,
 };
 
-use arrow::array::LargeBinaryArray;
+use arrow::{
+    array::LargeBinaryArray,
+    datatypes::{DataType, Field, Schema, SchemaRef},
+};
 
 use crate::{
-    container::{RowSelection, column_binary, column_u64, scan_blob},
+    container::{RowSelection, TermsBlobSpooler, column_binary, column_u64, scan_blob},
     error::{Result, VixError},
     postings,
     query::{KEY_FIELD_ID, split_key, write_composite},
@@ -359,8 +364,8 @@ impl<'r> RemappedTermStream<'r> {
 
 /// The merged index of [`merge_indexes`].
 pub(crate) struct MergedIndexResult {
-    /// The index blob bytes; `None` when the inputs carry no terms.
-    pub blobs: Option<crate::writer::IndexBlobs>,
+    /// Container-ready index blob payloads; `None` when the inputs carry no terms.
+    pub blobs: Option<crate::writer::IndexBlobParts>,
     pub term_count: u64,
     /// Per-file value-bloom hashes for the MERGED file (collected by the
     /// k-way workers over the deduplicated output terms).
@@ -381,6 +386,10 @@ pub(crate) struct MergedIndexResult {
 /// (`0` = `min(available_parallelism, 8)`, `1` = exactly one range — the
 /// sequential path through the same code), additionally capped by `threads`
 /// so it never exceeds the per-merge pool budget.
+///
+/// When `term_spill_dir` is set, the input term tables remain loaded while one
+/// unbounded range streams the output dictionary, plist, and closed terms
+/// batches through the spilled-rebuild spool machinery.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn merge_indexes<MapState, SetState>(
     inputs: &[&VixReader],
@@ -394,6 +403,7 @@ pub(crate) fn merge_indexes<MapState, SetState>(
     plist_min_docs: u32,
     threads: usize,
     kway_threads: usize,
+    term_spill_dir: Option<&Path>,
 ) -> Result<MergedIndexResult>
 where
     MapState: BuildHasher + Sync,
@@ -461,6 +471,61 @@ where
         tables.len(),
         started.elapsed()
     );
+    if let Some(spool_dir) = term_spill_dir {
+        let started = std::time::Instant::now();
+        let terms_schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("doc_count", DataType::UInt32, false),
+            Field::new("postings", DataType::Binary, false),
+        ]));
+        let mut spooler = TermsBlobSpooler::spawn(spool_dir, terms_schema)?;
+        let (sink, dropped) = merge_term_range(
+            inputs,
+            &tables,
+            doc_maps,
+            out_field_ids,
+            bloom_field_names,
+            composite_pairs,
+            bloom_only_fids,
+            total_rows,
+            postings_chunk_bytes,
+            plist_min_docs,
+            None,
+            None,
+            Some((spool_dir, &mut spooler)),
+        )?;
+        let parts = sink.into_spooled_parts()?;
+        for batch in parts.tail_batches {
+            spooler.push(batch)?;
+        }
+        let term_count = parts.term_count;
+        let bloom = parts.bloom;
+        let blobs = if term_count == 0 {
+            drop(spooler);
+            None
+        } else {
+            let terms = spooler.finish()?;
+            let mut index = crate::dict_blocks::IndexBuilder::new();
+            for (first_key, offset, first_ordinal) in &parts.dict_meta {
+                index.push_block(first_key, *offset, *first_ordinal)?;
+            }
+            Some(crate::writer::IndexBlobParts {
+                dict: index.finish(),
+                dict_blocks: parts.dict_blocks,
+                terms,
+                plist: parts.plist,
+            })
+        };
+        log::debug!(
+            "vix merge: spooled one-range term merge {:?} ({term_count} terms)",
+            started.elapsed()
+        );
+        return Ok(MergedIndexResult {
+            blobs,
+            bloom,
+            term_count,
+            dropped,
+        });
+    }
 
     // Over-partition (4 ranges per k-way worker) and let the workers pull
     // ranges off a shared cursor: the sampled bounds only approximate work
@@ -514,7 +579,9 @@ where
                             plist_min_docs,
                             lower,
                             upper,
-                        );
+                            None,
+                        )
+                        .and_then(|(sink, dropped)| Ok((sink.into_parts()?, dropped)));
                         let failed = result.is_err();
                         *slots[index].lock().expect("range slot poisoned") = Some(result);
                         if failed {
@@ -542,7 +609,7 @@ where
         }
         outputs
     } else {
-        vec![merge_term_range(
+        let (sink, dropped) = merge_term_range(
             inputs,
             &tables,
             doc_maps,
@@ -555,7 +622,9 @@ where
             plist_min_docs,
             None,
             None,
-        )?]
+            None,
+        )?;
+        vec![(sink.into_parts()?, dropped)]
     };
     let merged_at = started.elapsed();
 
@@ -566,6 +635,7 @@ where
         dropped.extend(part_dropped);
     }
     let (blobs, term_count, bloom) = crate::writer::write_index_blobs(parts, threads)?;
+    let blobs = blobs.map(crate::writer::IndexBlobParts::from);
     log::debug!(
         "vix merge: k-way term merge ({} ranges, {} workers) {merged_at:?}, dict/terms encode \
          {:?} ({term_count} terms)",
@@ -771,7 +841,8 @@ fn merge_term_range<MapState: BuildHasher, SetState: BuildHasher>(
     plist_min_docs: u32,
     lower: Option<&[u8]>,
     upper: Option<&[u8]>,
-) -> Result<(crate::writer::TermSinkParts, BTreeSet<String>)> {
+    mut spool: Option<(&Path, &mut TermsBlobSpooler)>,
+) -> Result<(crate::writer::TermSink, BTreeSet<String>)> {
     let bloom_pairs: Vec<(u16, String)> = bloom_field_names
         .iter()
         .filter_map(|n| out_field_ids.get(n).map(|id| (*id, n.clone())))
@@ -793,6 +864,9 @@ fn merge_term_range<MapState: BuildHasher, SetState: BuildHasher>(
     let mut sink = crate::writer::TermSink::new(postings_chunk_bytes)
         .with_bloom(bloom_acc)
         .with_plist_min_docs(plist_min_docs);
+    if let Some((spool_dir, _)) = spool.as_ref() {
+        sink = sink.with_spool(spool_dir)?;
+    }
     let mut streams: Vec<RemappedTermStream<'_>> = inputs
         .iter()
         .zip(tables)
@@ -896,6 +970,11 @@ fn merge_term_range<MapState: BuildHasher, SetState: BuildHasher>(
                 sink.push(&key, doc_count as u32, &blob)?;
             }
         }
+        if let Some((_, spooler)) = spool.as_mut() {
+            for batch in sink.take_closed_batches() {
+                spooler.push(batch)?;
+            }
+        }
 
         for &index in &contributors {
             alive[index] = streams[index].advance()?;
@@ -906,7 +985,7 @@ fn merge_term_range<MapState: BuildHasher, SetState: BuildHasher>(
     for stream in &streams {
         dropped.extend(stream.dropped_field_names().map(str::to_string));
     }
-    Ok((sink.into_parts()?, dropped))
+    Ok((sink, dropped))
 }
 
 /// Union the contributors' postings into `blob`, remapping doc ids through
@@ -926,33 +1005,44 @@ fn merge_postings(
     blob: &mut Vec<u8>,
     encode_scratch: &mut Vec<u8>,
 ) -> Result<()> {
-    // single contributor at offset 0: the cell's bytes are valid verbatim
-    // when input and output agree on the representation — inline blob for an
-    // inline output, resolved RECORD bytes (self-contained skip table +
-    // blob, doc ids unchanged) for a record output. A representation
-    // mismatch (inline input above the output threshold, or pointer input
-    // below it) falls through to the decode + re-encode path.
+    // A single constant-offset INLINE contributor can reuse the delta codec:
+    // only the first delta changes. Offset zero remains the direct byte-copy
+    // path for both inline and plist representations. Dense input cells,
+    // nonzero plist offsets, and representation changes retain the legacy
+    // decode/re-encode path.
     if let [index] = contributors
-        && let DocIdMap::Offset(0) = doc_maps[*index]
+        && let DocIdMap::Offset(offset) = doc_maps[*index]
     {
-        let input_doc_count = u64::from(tables[*index].doc_count(streams[*index].cur_ordinal));
+        let input_doc_count = tables[*index].doc_count(streams[*index].cur_ordinal);
         let encoded = tables[*index].postings_blob(streams[*index].cur_ordinal);
         if !encoded.is_empty() {
-            let input_pointer = inputs[*index].plist_pointer_cell(input_doc_count, encoded);
+            let input_rows = inputs[*index].row_count();
+            let input_pointer =
+                inputs[*index].plist_pointer_cell(u64::from(input_doc_count), encoded);
             match (as_record, input_pointer) {
                 (false, false) => {
-                    blob.extend_from_slice(encoded);
+                    if offset == 0 {
+                        blob.extend_from_slice(encoded);
+                    } else {
+                        postings::shift_encoded_into(
+                            encoded,
+                            input_doc_count as usize,
+                            offset,
+                            input_rows,
+                            blob,
+                        )?;
+                    }
                     return Ok(());
                 }
-                (true, true) => {
+                (true, true) if offset == 0 => {
                     let record = inputs[*index].plist_record_bytes(encoded)?;
                     blob.extend_from_slice(&record);
                     return Ok(());
                 }
-                _ => {} // representation mismatch: decode below
+                (true, true) => {} // measured slower than decode + encode_record
+                _ => {}            // representation mismatch: decode below
             }
         }
-        // dense-elided in the input: fall through and expand it
     }
 
     let all_offsets = contributors

@@ -55,11 +55,27 @@ impl Event for Eventer {
             .collect::<Vec<_>>();
         let cfg = get_config();
 
-        // M3 sidecar refresh (sidecar-only heal, DESIGN-V2 §5): an updated
-        // row keeps its data key but points at a REWRITTEN `.vxi` — evict
-        // the stale local copies before the download block re-fetches.
-        // Runs for EVERY querier — on-demand caches go stale exactly like
-        // cache_latest ones.
+        // Broadcast delivery can be out of order, so never upsert a put row
+        // into the distributed querier's file-list cache: an older G1 event
+        // could regress a newer G2 entry. Invalidate put rows so the next ID
+        // lookup reloads authoritative DB metadata. Deleted rows deliberately
+        // remain cached through the object-deletion grace: a leader may
+        // already have snapshotted their IDs for an in-flight follower
+        // request. In local mode LOCAL_CACHE is the SQLite authority itself,
+        // so deleting from it would delete the real row.
+        if LOCAL_NODE.is_querier() && !cfg.common.local_mode {
+            for item in &put_items {
+                infra::file_list::LOCAL_CACHE
+                    .remove(&item.key)
+                    .await
+                    .map_err(|e| {
+                        Status::internal(format!(
+                            "failed to invalidate local file-list cache row {}: {e}",
+                            item.key
+                        ))
+                    })?;
+            }
+        }
         if LOCAL_NODE.is_querier() {
             evict_stale_sidecar_caches(&put_items).await;
         }
@@ -126,12 +142,13 @@ impl Event for Eventer {
 
             // delete merge files
             if cfg.cache_latest_files.delete_merge_files && cfg.cache_latest_files.cache_parquet {
-                let del_items = merge_evict_keys(
-                    req.items
-                        .iter()
-                        .filter(|v| v.deleted)
-                        .map(|v| v.key.as_str()),
-                );
+                let deleted_items = req
+                    .items
+                    .iter()
+                    .filter(|v| v.deleted)
+                    .map(FileKey::from)
+                    .collect::<Vec<_>>();
+                let del_items = merge_evict_keys(deleted_items.iter());
                 infra::cache::file_data::delete::add(del_items);
             }
         }
@@ -170,14 +187,11 @@ impl Event for Eventer {
 }
 
 /// The download rows — `(id, account, key, size, max_ts)` — one broadcast
-/// enqueues on a caching querier (M11 default-on): each cacheable data file
-/// PLUS its `.vxi` index sidecar when the row records one (v2 semantics:
-/// `index_size` IS the sidecar object's exact size, `0` ⟺ no sidecar;
-/// non-`.vix` keys derive no sidecar). `cache_parquet=false` enqueues
-/// nothing. Undersized rows (`should_download`) and rows past the
-/// disk-cache max age skip WHOLE — safe for sidecar-only heals because the
-/// stale bytes were already evicted, so the next query fills on demand
-/// instead of reading stale cache.
+/// enqueues on a caching querier: each cacheable data file plus the immutable
+/// `.vxi` sidecar named by its generation when `index_size > 0`.
+/// `cache_parquet=false` enqueues nothing. Undersized rows
+/// (`should_download`) and rows past the disk-cache max age skip whole-object
+/// caching; a later query can fill the generation-addressed object on demand.
 fn collect_files_to_download(
     cache_parquet: bool,
     put_items: &[FileKey],
@@ -206,7 +220,7 @@ fn collect_files_to_download(
             item.meta.max_ts,
         ));
         if item.meta.index_size > 0
-            && let Some(sidecar) = config::vix_sidecar_key(&item.key)
+            && let Some(sidecar) = config::vix_sidecar_key(&item.key, item.meta.index_generation)
         {
             files_to_download.push((
                 item.id,
@@ -219,41 +233,38 @@ fn collect_files_to_download(
     }
     files_to_download
 }
-
-/// Cache keys a broadcast's DELETED rows evict (merge inputs the output
-/// replaced, retention deletes): each data key plus its `.vxi` sidecar key
-/// when derivable — a cheap no-op for keys never cached. Sidecar-only
-/// heals broadcast their row with `deleted=false`, so a heal can NEVER
-/// land here: the still-valid data bytes stay cached (M3 invariant, pinned
-/// by `m11_sidecar_only_heal_refreshes_sidecar_keeps_data`).
-fn merge_evict_keys<'a>(deleted_keys: impl Iterator<Item = &'a str>) -> Vec<String> {
-    deleted_keys
-        .flat_map(|k| std::iter::once(k.to_string()).chain(config::vix_sidecar_key(k)))
+/// Cache keys a broadcast's DELETED rows evict: each data key plus the
+/// active immutable sidecar named by metadata when `index_size > 0`.
+/// Generation zero derives the legacy canonical `.vxi` key; a positive
+/// no-sidecar drop state queues only the data object.
+fn merge_evict_keys<'a>(deleted_files: impl Iterator<Item = &'a FileKey>) -> Vec<String> {
+    deleted_files
+        .flat_map(|file| {
+            let sidecar = (file.meta.index_size > 0)
+                .then(|| config::vix_sidecar_key(&file.key, file.meta.index_generation))
+                .flatten();
+            std::iter::once(file.key.clone()).chain(sidecar)
+        })
         .collect()
 }
 
-/// M3 sidecar-only heal (DESIGN-V2 §5): a file-update broadcast re-uses the
-/// data key but points at a REWRITTEN `.vxi`, so locally cached sidecar
-/// bytes whose size disagrees with the row's `index_size` are stale — evict
-/// them from the disk + memory byte caches, and drop the memoized parsed
-/// reader (keyed by the DATA key; it holds pre-heal index state). All cheap
-/// no-ops for fresh adds: nothing is cached under a brand-new key.
-/// Staleness until this fires is CORRECT by design (docs unchanged — the
-/// old sidecar serves pre-heal results); this is the refresh.
-///
-/// M12: the per-file RESULT cache is purged too (`remove_file_entries`, one
-/// pass per broadcast) — an answer-changing heal must never keep serving
-/// pre-heal answers. The result-cache key also carries `index_size`, so
-/// even a purge missed here (node down at broadcast time) cannot serve a
-/// stale entry once the search path sees the healed row's meta; this sweep
-/// is the immediacy path AND frees the dead entries' budget.
+/// Validate cached bytes for the immutable sidecar named by each put event.
+/// A size mismatch under that exact generation is corrupt/stale cache data;
+/// other generations are different keys and remain available to in-flight
+/// FileKey snapshots. Parsed-reader and result caches are purged by logical
+/// data key so the broadcast releases every obsolete generation immediately;
+/// readers already held by active queries remain alive through their `Arc`.
 async fn evict_stale_sidecar_caches(put_items: &[FileKey]) {
     let mut core_keys: Vec<&str> = Vec::new();
     for item in put_items.iter() {
-        let Some(sidecar) = config::vix_sidecar_key(&item.key) else {
+        if config::FileFormat::from_extension(&item.key) != Some(config::FileFormat::Vix) {
+            continue;
+        }
+        core_keys.push(item.key.as_str());
+        crate::service::search::vix::reader_cache::GLOBAL_CACHE.remove(&item.key);
+        let Some(sidecar) = config::vix_sidecar_key(&item.key, item.meta.index_generation) else {
             continue;
         };
-        core_keys.push(item.key.as_str());
         let expected = item.meta.index_size;
         let disk_stale = disk::get_size(&sidecar)
             .await
@@ -273,10 +284,8 @@ async fn evict_stale_sidecar_caches(put_items: &[FileKey]) {
                 item.key
             );
         }
-        crate::service::search::vix::reader_cache::GLOBAL_CACHE.remove(&item.key);
     }
-    let purged =
-        crate::service::search::vix::cache::GLOBAL_CACHE.remove_file_entries(core_keys);
+    let purged = crate::service::search::vix::cache::GLOBAL_CACHE.remove_file_entries(core_keys);
     if purged > 0 {
         log::debug!("[gRPC:Event] purged {purged} vix result-cache entries for updated files");
     }
@@ -343,16 +352,17 @@ mod tests {
 
     use super::*;
 
-    /// M3 sidecar-only heal: an update broadcast whose row `index_size`
-    /// disagrees with the locally cached `.vxi` must EVICT the stale bytes;
-    /// a matching size must leave them cached (fresh adds stay no-ops).
+    /// A cached byte object is validated only against the exact immutable
+    /// sidecar generation named by the broadcast metadata.
     #[tokio::test]
     async fn evict_stale_sidecar_caches_drops_size_mismatched_bytes() {
         if !get_config().disk_cache.enabled {
             return; // nothing to cover without a byte cache
         }
         let key = "files/e2e/logs/healcache/2026/08/17/00/sidecar_evict_test.vix";
-        let sidecar = config::vix_sidecar_key(key).expect("core keys have sidecar keys");
+        let generation = 17;
+        let sidecar =
+            config::vix_sidecar_key(key, generation).expect("core keys have sidecar keys");
         let old = bytes::Bytes::from_static(b"pre-heal sidecar bytes");
 
         // stale: the row now advertises a different sidecar size
@@ -366,6 +376,7 @@ mod tests {
             key.to_string(),
             config::meta::stream::FileMeta {
                 index_size: old.len() as i64 + 7,
+                index_generation: generation,
                 ..Default::default()
             },
             false,
@@ -386,6 +397,7 @@ mod tests {
             key.to_string(),
             config::meta::stream::FileMeta {
                 index_size: old.len() as i64,
+                index_generation: generation,
                 ..Default::default()
             },
             false,
@@ -398,23 +410,23 @@ mod tests {
         let _ = disk::remove(&sidecar).await;
     }
 
-    /// M11 (a): a new-file broadcast on a caching querier enqueues BOTH the
-    /// `.vix` data object and its `.vxi` sidecar; `index_size` carries v2
-    /// semantics (the sidecar's exact object size, 0 = no sidecar) and
-    /// non-`.vix` keys never derive one.
+    /// Cache-latest enqueues the immutable sidecar key named by each FileKey
+    /// snapshot. Equal-sized generations remain distinct; zero is legacy.
     #[test]
     fn m11_new_file_event_enqueues_data_and_sidecar() {
-        let meta = |records: i64, index_size: i64| config::meta::stream::FileMeta {
-            records,
-            compressed_size: 4096,
-            index_size,
-            ..Default::default()
-        };
+        let meta =
+            |records: i64, index_size: i64, index_generation: i64| config::meta::stream::FileMeta {
+                records,
+                compressed_size: 4096,
+                index_size,
+                index_generation,
+                ..Default::default()
+            };
         let core = config::meta::stream::FileKey::new(
             7,
             "acct".to_string(),
             "files/org/logs/s1/2026/08/18/00/m11_new.vix".to_string(),
-            meta(1000, 512),
+            meta(1000, 512, 73),
             false,
         );
         let rows = collect_files_to_download(true, std::slice::from_ref(&core));
@@ -423,21 +435,35 @@ mod tests {
         assert_eq!(rows[0].3, 4096, "data row sized by compressed_size");
         assert_eq!(
             rows[1].2,
-            config::vix_sidecar_key(&core.key).unwrap(),
+            config::vix_sidecar_key(&core.key, core.meta.index_generation).unwrap(),
             "sidecar row derives the .vxi key"
         );
+        assert_eq!(rows[1].2, "files/org/logs/s1/2026/08/18/00/m11_new.73.vxi");
         assert_eq!(
             rows[1].3, 512,
             "sidecar row sized by index_size (v2: exact object size)"
         );
         assert_eq!(rows[1].0, core.id, "sidecar keeps the data row's file id");
 
-        // index_size == 0 ⟺ no sidecar exists: data row only
+        let mut next = core.clone();
+        next.meta.index_generation = 74;
+        let next_rows = collect_files_to_download(true, std::slice::from_ref(&next));
+        assert_ne!(
+            rows[1].2, next_rows[1].2,
+            "equal-sized generations must enqueue different immutable sidecars"
+        );
+        assert_eq!(
+            next_rows[1].2,
+            "files/org/logs/s1/2026/08/18/00/m11_new.74.vxi"
+        );
+
+        // A positive generation with index_size == 0 is an index-drop state:
+        // cache only the data row because there is no active sidecar.
         let no_sidecar = config::meta::stream::FileKey::new(
             8,
             "acct".to_string(),
             "files/org/logs/s1/2026/08/18/00/m11_plain.vix".to_string(),
-            meta(1000, 0),
+            meta(1000, 0, 75),
             false,
         );
         let rows = collect_files_to_download(true, std::slice::from_ref(&no_sidecar));
@@ -449,7 +475,7 @@ mod tests {
             9,
             "acct".to_string(),
             "files/org/logs/s1/2026/08/18/00/m11_legacy.parquet".to_string(),
-            meta(1000, 512),
+            meta(1000, 512, 76),
             false,
         );
         let rows = collect_files_to_download(true, std::slice::from_ref(&legacy));
@@ -460,7 +486,7 @@ mod tests {
             10,
             "acct".to_string(),
             "files/org/logs/s1/2026/08/18/00/m11_tiny.vix".to_string(),
-            meta(5, 512),
+            meta(5, 512, 77),
             false,
         );
         assert!(
@@ -469,61 +495,108 @@ mod tests {
         );
     }
 
-    /// M11 (b): a merge broadcast's deleted rows evict the input data keys
-    /// AND their `.vxi` sidecar keys; non-deleted rows never contribute.
+    /// Deleted events evict the active immutable sidecar named by their
+    /// metadata. Legacy generation zero keeps the canonical `.vxi` key, and
+    /// a positive index-drop generation has no sidecar to evict.
     #[test]
     fn m11_merge_event_evicts_inputs_with_sidecars() {
-        let keys = merge_evict_keys(
-            ["files/org/a/1.vix", "files/org/a/2.parquet"]
-                .iter()
-                .copied(),
-        );
+        let deleted = [
+            config::meta::stream::FileKey::new(
+                1,
+                String::new(),
+                "files/org/a/1.vix".to_string(),
+                config::meta::stream::FileMeta {
+                    index_size: 100,
+                    index_generation: 77,
+                    ..Default::default()
+                },
+                true,
+            ),
+            config::meta::stream::FileKey::new(
+                2,
+                String::new(),
+                "files/org/a/2.vix".to_string(),
+                config::meta::stream::FileMeta {
+                    index_size: 100,
+                    ..Default::default()
+                },
+                true,
+            ),
+            config::meta::stream::FileKey::new(
+                3,
+                String::new(),
+                "files/org/a/3.vix".to_string(),
+                config::meta::stream::FileMeta {
+                    index_generation: 88,
+                    ..Default::default()
+                },
+                true,
+            ),
+            config::meta::stream::FileKey::new(
+                4,
+                String::new(),
+                "files/org/a/4.parquet".to_string(),
+                config::meta::stream::FileMeta {
+                    index_size: 100,
+                    index_generation: 99,
+                    ..Default::default()
+                },
+                true,
+            ),
+        ];
         assert_eq!(
-            keys,
+            merge_evict_keys(deleted.iter()),
             vec![
                 "files/org/a/1.vix".to_string(),
-                "files/org/a/1.vxi".to_string(),
-                "files/org/a/2.parquet".to_string(),
-            ],
-            ".vix inputs evict both objects, legacy inputs just the data file"
+                "files/org/a/1.77.vxi".to_string(),
+                "files/org/a/2.vix".to_string(),
+                "files/org/a/2.vxi".to_string(),
+                "files/org/a/3.vix".to_string(),
+                "files/org/a/4.parquet".to_string(),
+            ]
         );
         assert!(
-            merge_evict_keys(std::iter::empty()).is_empty(),
+            merge_evict_keys(std::iter::empty::<&config::meta::stream::FileKey>()).is_empty(),
             "no deleted rows, nothing evicted"
         );
     }
 
-    /// M11 (c) — THE flip-sensitive case: a sidecar-only heal broadcast
-    /// (same data key, `deleted=false`, new `index_size`) must refresh the
-    /// sidecar WITHOUT touching still-valid cached data bytes. Eviction
-    /// hits only the stale `.vxi`; the re-enqueue lists both objects (the
-    /// downloader's disk::exist check no-ops the data row); and because the
-    /// heal row is a put, the merge-evict list can never contain it.
+    /// A heal publishes a new immutable generation. Broadcast handling may
+    /// evict corrupt bytes under the new key, but must leave the old key and
+    /// data bytes intact for queries holding the old FileKey snapshot.
     #[tokio::test]
-    async fn m11_sidecar_only_heal_refreshes_sidecar_keeps_data() {
+    async fn m11_sidecar_only_heal_refreshes_sidecar_keeps_old_generation_and_data() {
         if !get_config().disk_cache.enabled {
-            return; // nothing to cover without a byte cache
+            return;
         }
         let key = "files/e2e/logs/healcache/2026/08/18/00/m11_heal_keepdata.vix";
-        let sidecar = config::vix_sidecar_key(key).expect("core keys have sidecar keys");
+        let old_generation = 41;
+        let new_generation = 42;
+        let old_key = config::vix_sidecar_key(key, old_generation).unwrap();
+        let new_key = config::vix_sidecar_key(key, new_generation).unwrap();
         let data = bytes::Bytes::from_static(b"data bytes the heal must not touch");
         let old_sidecar = bytes::Bytes::from_static(b"pre-heal sidecar bytes");
         infra::cache::file_data::disk::set(key, data.clone())
             .await
             .unwrap();
-        infra::cache::file_data::disk::set(&sidecar, old_sidecar.clone())
+        infra::cache::file_data::disk::set(&old_key, old_sidecar.clone())
             .await
             .unwrap();
-        // M12: memoized per-file RESULT entries (any condition, any pre-heal
-        // index_size) must not survive the heal broadcast either
+        // Simulate corrupt/partial cache data under the newly published key.
+        infra::cache::file_data::disk::set(&new_key, old_sidecar.clone())
+            .await
+            .unwrap();
+
         let result_cache = &crate::service::search::vix::cache::GLOBAL_CACHE;
-        let pre_heal_result_key = format!("{key}|{}|deadbeef_n_full", old_sidecar.len());
+        let pre_heal_result_key = format!(
+            "{key}|{old_generation}|{}|deadbeef_n_full",
+            old_sidecar.len()
+        );
         result_cache.put(
             pre_heal_result_key.clone(),
             crate::service::search::vix::cache::CacheEntry::NoMatch,
         );
 
-        // the heal broadcast: same data key, rewritten sidecar (new size)
         let healed = config::meta::stream::FileKey::new(
             1,
             String::new(),
@@ -532,46 +605,39 @@ mod tests {
                 records: 1000,
                 compressed_size: data.len() as i64,
                 index_size: old_sidecar.len() as i64 + 9,
+                index_generation: new_generation,
                 ..Default::default()
             },
             false,
         );
 
         evict_stale_sidecar_caches(std::slice::from_ref(&healed)).await;
+        assert!(disk::exist(key).await, "data bytes remain cached");
         assert!(
-            disk::exist(key).await,
-            "sidecar-only heal must leave the cached DATA bytes untouched"
+            disk::exist(&old_key).await,
+            "an in-flight old snapshot must retain its immutable sidecar"
         );
         assert!(
-            !disk::exist(&sidecar).await,
-            "the stale sidecar bytes must be evicted"
+            !disk::exist(&new_key).await,
+            "size-mismatched bytes under the new generation are evicted"
         );
         assert!(
             result_cache.get(&pre_heal_result_key, None).is_none(),
-            "M12: the heal broadcast must purge the file's result-cache entries"
+            "broadcast purge covers every result generation of the logical file"
         );
 
-        // refresh: the caching block re-enqueues both objects, sidecar at
-        // its NEW size — the data row is a downloader no-op (still cached)
         let rows = collect_files_to_download(true, std::slice::from_ref(&healed));
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[1].2, sidecar);
+        assert_eq!(rows[1].2, new_key);
         assert_eq!(rows[1].3, old_sidecar.len() as i64 + 9);
-
-        // deleted=false ⟹ the delete_merge_files branch can never evict it
-        let evicted = merge_evict_keys(
-            std::slice::from_ref(&healed)
-                .iter()
-                .filter(|v| v.deleted)
-                .map(|v| v.key.as_str()),
-        );
         assert!(
-            evicted.is_empty(),
+            merge_evict_keys(std::slice::from_ref(&healed).iter().filter(|v| v.deleted)).is_empty(),
             "a heal put-row must never reach the evict list"
         );
 
         let _ = disk::remove(key).await;
-        let _ = disk::remove(&sidecar).await;
+        let _ = disk::remove(&old_key).await;
+        let _ = disk::remove(&new_key).await;
     }
 
     /// M11 (d): with the sub-flag off the collector enqueues nothing — the

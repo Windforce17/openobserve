@@ -106,13 +106,9 @@ fn jiter_json_get_float(json_data: Option<&str>, path: &[JsonPath]) -> Result<f6
             // numbers are represented by everything else in peek, hence doing it this way
             // LOCAL FORK PATCH (obs engine): `Peek::Minus` falls through to
             // `known_number`, which parses the sign (see json_get_int.rs).
-            Peek::Null
-            | Peek::True
-            | Peek::False
-            | Peek::Infinity
-            | Peek::NaN
-            | Peek::Array
-            | Peek::Object => get_err!(),
+            Peek::Null | Peek::True | Peek::False | Peek::Infinity | Peek::NaN | Peek::Array | Peek::Object => {
+                get_err!()
+            }
             _ => match jiter.known_number(peek)? {
                 NumberAny::Float(f) => Ok(f),
                 NumberAny::Int(int) => Ok(int.into()),

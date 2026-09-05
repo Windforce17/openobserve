@@ -97,7 +97,7 @@ pub async fn search(
         let (bloom_took, ok) = check_bloom_filter(
             query.clone(),
             &mut files,
-            index_condition.clone(),
+            index_condition.as_ref(),
             bloom_indexed_fields,
         )
         .await?;
@@ -339,40 +339,61 @@ fn vix_search_applicable(
             || matches!(idx_optimize_rule, Some(IndexOptimizeMode::SimpleSelect(..))))
 }
 
-/// Check bloom filter for the file list
+/// Prune the file list with per-field and policy-scoped composite blooms.
 #[tracing::instrument(name = "service:search:grpc:storage:check_bloom_filter", skip_all)]
 pub async fn check_bloom_filter(
     query: Arc<super::QueryParams>,
     file_list: &mut Vec<FileKey>,
-    index_condition: Option<IndexCondition>,
+    index_condition: Option<&IndexCondition>,
     bloom_indexed_fields: Vec<String>,
 ) -> Result<(usize, bool), Error> {
     let cfg = get_config();
-    // #48: with the composite section enabled, equality on ANY field is
-    // potentially bloom-decidable — an empty per-stream bloom-field config
-    // no longer short-circuits the prune.
-    if !cfg.common.bloom_filter_enabled
-        || file_list.is_empty()
-        || (bloom_indexed_fields.is_empty() && !cfg.common.vix_bloom_composite)
-        || index_condition.is_none()
-    {
+    if !cfg.common.bloom_filter_enabled || file_list.is_empty() {
+        return Ok((0, false));
+    }
+    let Some(index_condition) = index_condition else {
+        return Ok((0, false));
+    };
+    let composite_scope = config::vix_bloom_composite_scope(&cfg);
+    let auto_id_scope =
+        cfg.common.vix_bloom_only_auto_id_only && cfg.common.vix_bloom_only_auto_ratio > 0.0;
+    let auto_id_never = cfg
+        .common
+        .vix_bloom_only_never
+        .split(',')
+        .map(str::trim)
+        .filter(|field| !field.is_empty())
+        .map(str::to_owned)
+        .collect::<std::collections::HashSet<_>>();
+
+    // Decide whether there is real Bloom work before transferring ownership
+    // of the potentially large vector. In particular, ordinary predicates
+    // outside a selective composite scope return without a second O(files)
+    // clone and without recording a Bloom run.
+    if !bloom_pruner::is_applicable(
+        index_condition,
+        &bloom_indexed_fields,
+        &composite_scope,
+        auto_id_scope,
+        &auto_id_never,
+    ) {
         return Ok((0, false));
     }
 
     let start = std::time::Instant::now();
     let before_num = file_list.len();
-    // The pruner pulls the bloom-decidable predicates out of the
-    // IndexCondition itself; if none are decidable it returns the
-    // input untouched (no `.bf` is touched).
+    let files = std::mem::take(file_list);
     *file_list = bloom_pruner::prune(
         &query.trace_id,
         &query.org_id,
         query.stream_type,
         &query.stream_name,
-        file_list.to_vec(),
-        index_condition.as_ref().unwrap(),
+        files,
+        index_condition,
         bloom_indexed_fields,
-        cfg.common.vix_bloom_composite,
+        &composite_scope,
+        auto_id_scope,
+        &auto_id_never,
     )
     .await;
 

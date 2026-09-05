@@ -74,6 +74,7 @@ use datafusion::{
 use futures::{FutureExt, StreamExt};
 use object_store::{GetOptions, ObjectMeta, ObjectStore};
 use tokio_stream::wrappers::ReceiverStream;
+use vortex::scan::selection::Selection;
 use vortex_index::{
     BoundValue, ColumnBound, SOURCE_COL_NAME, TIMESTAMP_COL_NAME, VixDocs, VixRangeSource,
 };
@@ -557,6 +558,7 @@ impl FileSource for VixCoreSource {
             column_bounds: self.column_bounds.clone(),
             null_rejected_columns: self.null_rejected_columns.clone(),
             emit_ts_desc: self.emit_ts_desc,
+            batch_size: self.batch_size.unwrap_or(usize::MAX).max(1),
             object_store,
             projected_schema,
             timestamp_filter: self.timestamp_filter,
@@ -616,6 +618,8 @@ struct VixCoreOpener {
     /// §6.2: the table declares `_timestamp DESC` — concat files must
     /// stream through the k-way region merge.
     emit_ts_desc: bool,
+    /// Maximum logical output rows per emitted batch.
+    batch_size: usize,
     object_store: Arc<dyn ObjectStore>,
     /// The logical columns to produce, in output order.
     projected_schema: SchemaRef,
@@ -666,6 +670,7 @@ impl FileOpener for VixCoreOpener {
         let null_rejected_columns = self.null_rejected_columns.clone();
         let emit_ts_desc = self.emit_ts_desc;
         let memory_pool = self.memory_pool.clone();
+        let batch_size = self.batch_size;
         // Row selection from the inverted index, if any.
         let selection = file
             .extensions
@@ -805,6 +810,7 @@ impl FileOpener for VixCoreOpener {
                                 selection.as_deref(),
                                 timestamp_filter,
                                 &column_bounds,
+                                batch_size,
                                 &mut || {
                                     if let Some(reservation) =
                                         scan_reservation.lock().as_mut()
@@ -824,6 +830,7 @@ impl FileOpener for VixCoreOpener {
                             selection.as_deref(),
                             timestamp_filter,
                             &column_bounds,
+                            batch_size,
                             &mut send,
                         )
                     })
@@ -919,6 +926,7 @@ fn scan_core_file(
         selection,
         timestamp_filter,
         &[],
+        usize::MAX,
         on_batch,
     )
 }
@@ -932,13 +940,12 @@ fn scan_core_docs(
     selection: Option<&RowIdBitmap>,
     timestamp_filter: Option<(i64, i64)>,
     column_bounds: &[ColumnBound],
+    batch_size: usize,
     on_batch: &mut dyn FnMut(RecordBatch) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let plan = LogicalProjectionPlan::new(&docs, projected_schema)?;
-    let rows = selection.map(|bits| bits.iter().map(u64::from).collect::<Vec<u64>>());
-    if let Some(rows) = rows.as_ref()
-        && rows.is_empty()
-    {
+    let rows = selection.map(|bits| Selection::IncludeRoaring(bits.to_roaring_treemap()));
+    if selection.is_some_and(RowIdBitmap::is_empty) {
         // The index selected nothing (defensive: such files are usually
         // dropped from the file list before the scan).
         return Ok(());
@@ -951,14 +958,14 @@ fn scan_core_docs(
     } else {
         0
     };
-    docs.scan_docs_opts(
+    docs.scan_docs_selection_opts(
         Some(&plan.physical_projection),
         rows,
         timestamp_filter,
         column_bounds,
         None,
         decode_threads,
-        &mut |batch| on_batch(plan.project(&batch)?),
+        &mut |batch| emit_bounded_batch(plan.project(&batch)?, batch_size, on_batch),
     )
 }
 
@@ -974,25 +981,41 @@ fn scan_core_docs_merged(
     selection: Option<&RowIdBitmap>,
     timestamp_filter: Option<(i64, i64)>,
     column_bounds: &[ColumnBound],
+    batch_size: usize,
     on_region_open: &mut dyn FnMut() -> anyhow::Result<()>,
     on_batch: &mut dyn FnMut(RecordBatch) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let plan = LogicalProjectionPlan::new(&docs, projected_schema)?;
-    let rows = selection.map(|bits| bits.iter().map(u64::from).collect::<Vec<u64>>());
-    if let Some(rows) = rows.as_ref()
-        && rows.is_empty()
-    {
+    let rows = selection.map(|bits| Selection::IncludeRoaring(bits.to_roaring_treemap()));
+    if selection.is_some_and(RowIdBitmap::is_empty) {
         return Ok(());
     }
-    docs.scan_docs_ts_desc_merged(
+    docs.scan_docs_ts_desc_merged_selection(
         Some(&plan.physical_projection),
         rows,
         timestamp_filter,
         column_bounds,
         None,
         on_region_open,
-        &mut |batch| on_batch(plan.project(&batch)?),
+        &mut |batch| emit_bounded_batch(plan.project(&batch)?, batch_size, on_batch),
     )
+}
+
+/// Emit a logical batch in zero-copy slices no larger than `batch_size`.
+/// Empty batches retain their schema and are forwarded once.
+fn emit_bounded_batch(
+    batch: RecordBatch,
+    batch_size: usize,
+    on_batch: &mut dyn FnMut(RecordBatch) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    if batch.num_rows() == 0 {
+        return on_batch(batch);
+    }
+    let batch_size = batch_size.max(1);
+    for offset in (0..batch.num_rows()).step_by(batch_size) {
+        on_batch(batch.slice(offset, batch_size.min(batch.num_rows() - offset)))?;
+    }
+    Ok(())
 }
 
 /// The v2 per-file skip hook: `Some(tier)` when the file's FOOTER metadata
@@ -1032,9 +1055,7 @@ fn file_provably_skippable(
                 // absent from the columns list: only a columns-complete
                 // file proves the field never occurs in `_source` either
                 None => {
-                    if docs.columns_complete()
-                        && docs.schema().field_with_name(column).is_err()
-                    {
+                    if docs.columns_complete() && docs.schema().field_with_name(column).is_err() {
                         return Some("field-presence");
                     }
                 }
@@ -1355,9 +1376,24 @@ mod tests {
         ]);
         let threshold = 256 * 1024 * 1024;
 
-        assert!(should_use_ranged_scan(&narrow, false, 48 * 1024 * 1024, threshold));
-        assert!(!should_use_ranged_scan(&wide, false, 48 * 1024 * 1024, threshold));
-        assert!(should_use_ranged_scan(&wide, true, 48 * 1024 * 1024, threshold));
+        assert!(should_use_ranged_scan(
+            &narrow,
+            false,
+            48 * 1024 * 1024,
+            threshold
+        ));
+        assert!(!should_use_ranged_scan(
+            &wide,
+            false,
+            48 * 1024 * 1024,
+            threshold
+        ));
+        assert!(should_use_ranged_scan(
+            &wide,
+            true,
+            48 * 1024 * 1024,
+            threshold
+        ));
         assert!(should_use_ranged_scan(&wide, false, threshold, threshold));
     }
 
@@ -1481,6 +1517,195 @@ mod tests {
         })
         .unwrap();
         out
+    }
+    fn timestamp_values(batches: &[RecordBatch]) -> Vec<i64> {
+        batches
+            .iter()
+            .flat_map(|batch| {
+                let values = batch
+                    .column_by_name(TIMESTAMP_COL_NAME)
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .clone();
+                (0..values.len())
+                    .map(move |index| values.value(index))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn roaring_selection_sparse_and_dense_are_exact() {
+        let data = build_desc_core_file(100, "x");
+        let projected: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            TIMESTAMP_COL_NAME,
+            DataType::Int64,
+            false,
+        )]));
+        for (ids, expected) in [
+            (vec![0u32, 9], vec![100i64, 91]),
+            ((0..9u32).collect(), (92..=100i64).rev().collect()),
+        ] {
+            let selection = RowIdBitmap::from_row_ids(10, ids);
+            let batches = scan_all(data.clone(), Arc::clone(&projected), Some(&selection), None);
+            assert_eq!(timestamp_values(&batches), expected);
+        }
+    }
+
+    #[test]
+    fn logical_batches_respect_size_order_schema_and_empty_batches() {
+        let projected: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            TIMESTAMP_COL_NAME,
+            DataType::Int64,
+            false,
+        )]));
+        let mut ordinary = Vec::new();
+        scan_core_docs(
+            VixDocs::open(build_desc_core_file(100, "x")).unwrap(),
+            &projected,
+            None,
+            None,
+            &[],
+            3,
+            &mut |batch| {
+                ordinary.push(batch);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            ordinary.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            10
+        );
+        assert!(ordinary.iter().all(|batch| batch.num_rows() <= 3));
+        assert!(ordinary.iter().all(|batch| batch.schema() == projected));
+        assert_eq!(
+            timestamp_values(&ordinary),
+            (91..=100).rev().collect::<Vec<_>>()
+        );
+
+        let mut merged = Vec::new();
+        scan_core_docs_merged(
+            VixDocs::open(build_concat_core_file(&[(300, 5), (320, 5)], "x")).unwrap(),
+            &projected,
+            None,
+            None,
+            &[],
+            2,
+            &mut || Ok(()),
+            &mut |batch| {
+                merged.push(batch);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(merged.iter().all(|batch| batch.num_rows() <= 2));
+        assert!(merged.iter().all(|batch| batch.schema() == projected));
+        assert_eq!(
+            timestamp_values(&merged),
+            vec![320, 319, 318, 317, 316, 300, 299, 298, 297, 296]
+        );
+
+        let selected = RowIdBitmap::from_row_ids(10, [1u32, 6, 8]);
+        let mut selected_merged = Vec::new();
+        scan_core_docs_merged(
+            VixDocs::open(build_concat_core_file(&[(300, 5), (320, 5)], "x")).unwrap(),
+            &projected,
+            Some(&selected),
+            None,
+            &[],
+            2,
+            &mut || Ok(()),
+            &mut |batch| {
+                selected_merged.push(batch);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(timestamp_values(&selected_merged), vec![319, 317, 299]);
+        assert!(selected_merged.iter().all(|batch| batch.num_rows() <= 2));
+
+        let many_regions: Vec<(i64, usize)> =
+            (0..32).map(|region| (100 + region * 10, 1)).collect();
+        let sparse = RowIdBitmap::from_row_ids(32, [0u32, 15, 31]);
+        let mut sparse_merged = Vec::new();
+        scan_core_docs_merged(
+            VixDocs::open(build_concat_core_file(&many_regions, "x")).unwrap(),
+            &projected,
+            Some(&sparse),
+            None,
+            &[],
+            2,
+            &mut || Ok(()),
+            &mut |batch| {
+                sparse_merged.push(batch);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(timestamp_values(&sparse_merged), vec![410, 250, 100]);
+
+        let source = RecordBatch::try_new(
+            Arc::clone(&projected),
+            vec![Arc::new(Int64Array::from(vec![7, 6, 5, 4, 3, 2, 1]))],
+        )
+        .unwrap();
+        let mut slices = Vec::new();
+        emit_bounded_batch(source, 3, &mut |batch| {
+            slices.push(batch);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            slices.iter().map(RecordBatch::num_rows).collect::<Vec<_>>(),
+            vec![3, 3, 1]
+        );
+        assert_eq!(timestamp_values(&slices), vec![7, 6, 5, 4, 3, 2, 1]);
+
+        let empty = RecordBatch::new_empty(Arc::clone(&projected));
+        let mut emitted = Vec::new();
+        emit_bounded_batch(empty, 2, &mut |batch| {
+            emitted.push(batch);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].num_rows(), 0);
+        assert_eq!(emitted[0].schema(), projected);
+    }
+    #[test]
+    fn merged_callback_error_does_not_deadlock_region_producers() {
+        let data = build_concat_core_file(&[(300, 12), (400, 12), (500, 12)], "x");
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let projected: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+                TIMESTAMP_COL_NAME,
+                DataType::Int64,
+                false,
+            )]));
+            let result = scan_core_docs_merged(
+                VixDocs::open(data).unwrap(),
+                &projected,
+                None,
+                None,
+                &[],
+                1,
+                &mut || Ok(()),
+                &mut |_| anyhow::bail!("intentional downstream stop"),
+            )
+            .map_err(|error| format!("{error:#}"));
+            let _ = done_tx.send(result);
+        });
+        let result = done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("merged scan deadlocked after downstream callback error");
+        assert!(
+            result
+                .expect_err("callback error must propagate")
+                .contains("intentional downstream stop")
+        );
     }
 
     fn column_strings(batches: &[RecordBatch], name: &str) -> Vec<Option<String>> {
@@ -2121,7 +2346,10 @@ mod tests {
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
-            assert!(gone, "the stale file_list row of {key} must be reconciled away");
+            assert!(
+                gone,
+                "the stale file_list row of {key} must be reconciled away"
+            );
         }
         Ok(())
     }
@@ -2177,8 +2405,7 @@ mod tests {
         );
         // bare canonical key (ad-hoc listing)
         assert_eq!(
-            stale_row_cleanup_key(&Path::from("files/org/logs/s1/2021/01/02/00/a.vix"))
-                .as_deref(),
+            stale_row_cleanup_key(&Path::from("files/org/logs/s1/2021/01/02/00/a.vix")).as_deref(),
             Some("files/org/logs/s1/2021/01/02/00/a.vix")
         );
         // WAL-shaped path (thread_id + schema_key = 11 segments): ineligible
@@ -2190,13 +2417,14 @@ mod tests {
         );
         // non-.vix extensions: ineligible
         assert_eq!(
-            stale_row_cleanup_key(&Path::from(
-                "files/org/logs/s1/2021/01/02/00/a.parquet"
-            )),
+            stale_row_cleanup_key(&Path::from("files/org/logs/s1/2021/01/02/00/a.parquet")),
             None
         );
         // unrelated paths: ineligible
-        assert_eq!(stale_row_cleanup_key(&Path::from("results/org/x.json")), None);
+        assert_eq!(
+            stale_row_cleanup_key(&Path::from("results/org/x.json")),
+            None
+        );
     }
 
     /// #51c-c: one CONCAT-order core file — DESC `runs` (each `(newest,
@@ -2326,7 +2554,10 @@ mod tests {
     /// makes the source ordered-aware (M4: concat files k-way merge their
     /// regions) — `declare_sort && ordered_source` is the M4 declared
     /// table, `declare_sort && !ordered_source` is the pinned hazard.
-    async fn concat_order_by_ctx(declare_sort: bool, ordered_source: bool) -> Result<SessionContext> {
+    async fn concat_order_by_ctx(
+        declare_sort: bool,
+        ordered_source: bool,
+    ) -> Result<SessionContext> {
         let store = Arc::new(InMemory::new());
         // concat file: rows [300..296, 320..316] — the newest rows of the
         // TABLE live mid-file; a trusted per-file DESC order returns 300
@@ -2879,6 +3110,7 @@ mod review_tests {
             column_bounds: Vec::new(),
             null_rejected_columns: Vec::new(),
             emit_ts_desc: false,
+            batch_size: usize::MAX,
             object_store: Arc::clone(&store),
             projected_schema: logical_schema(),
             timestamp_filter: None,
@@ -3205,6 +3437,7 @@ mod ranged_tests {
             column_bounds: Vec::new(),
             null_rejected_columns: Vec::new(),
             emit_ts_desc: false,
+            batch_size: usize::MAX,
             object_store: Arc::clone(&store),
             projected_schema,
             timestamp_filter: None,
@@ -3267,10 +3500,18 @@ mod ranged_tests {
         let got = tokio::task::spawn_blocking(move || {
             let docs = VixDocs::open_ranged(source)?;
             let mut out = Vec::new();
-            scan_core_docs(docs, &projected, Some(&bits), None, &[], &mut |batch| {
-                out.push(batch);
-                Ok(())
-            })?;
+            scan_core_docs(
+                docs,
+                &projected,
+                Some(&bits),
+                None,
+                &[],
+                usize::MAX,
+                &mut |batch| {
+                    out.push(batch);
+                    Ok(())
+                },
+            )?;
             anyhow::Ok(out)
         })
         .await
@@ -3645,8 +3886,7 @@ mod m4_pruning_tests {
         // null-ACCEPTING shapes must NOT prune. Pinned on an HONEST
         // columns-complete file whose `ghost` really is all-NULL: a wrong
         // presence skip would return 0 where the truth is every row.
-        let ctx =
-            presence_ctx(vec![("data/honest.vix", build_presence_file(true, false))]).await?;
+        let ctx = presence_ctx(vec![("data/honest.vix", build_presence_file(true, false))]).await?;
         for sql in [
             "SELECT _timestamp FROM t WHERE ghost IS NULL",
             "SELECT _timestamp FROM t WHERE COALESCE(ghost, 'x') = 'x'",
@@ -3665,8 +3905,7 @@ mod m4_pruning_tests {
     /// keeps the json_get fallback: the same equality returns the rows.
     #[tokio::test]
     async fn incomplete_file_keeps_json_get_fallback() -> Result<()> {
-        let ctx =
-            presence_ctx(vec![("data/honest.vix", build_presence_file(false, true))]).await?;
+        let ctx = presence_ctx(vec![("data/honest.vix", build_presence_file(false, true))]).await?;
         assert_eq!(
             run_counting(&ctx, "SELECT _timestamp FROM t WHERE ghost = 'boo'").await?,
             4,
@@ -3683,11 +3922,8 @@ mod m4_pruning_tests {
         let docs = VixDocs::open(build_presence_file(false, true)).unwrap();
 
         // present only: native reference, _source NOT fetched
-        let present_only: SchemaRef = Arc::new(Schema::new(vec![Field::new(
-            "level",
-            DataType::Utf8,
-            true,
-        )]));
+        let present_only: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("level", DataType::Utf8, true)]));
         let plan = LogicalProjectionPlan::new(&docs, &present_only).unwrap();
         assert_eq!(plan.physical_projection, vec!["level"]);
 
@@ -3702,7 +3938,7 @@ mod m4_pruning_tests {
         assert_eq!(plan.physical_projection, vec!["level", SOURCE_COL_NAME]);
 
         let mut batches = Vec::new();
-        scan_core_docs(docs, &mixed, None, None, &[], &mut |batch| {
+        scan_core_docs(docs, &mixed, None, None, &[], usize::MAX, &mut |batch| {
             batches.push(batch);
             Ok(())
         })
@@ -3967,7 +4203,9 @@ pub fn inject_vix_scan_pruning(
                 return; // NOT IN rejects NULL but bounds nothing
             }
             if let Ok(field) = schema.field_with_name(column.name())
-                && values.iter().all(|v| value_matches_type(v, field.data_type()))
+                && values
+                    .iter()
+                    .all(|v| value_matches_type(v, field.data_type()))
                 && let (Some(min), Some(max)) = (
                     values.iter().cloned().reduce(|a, b| bound_min(a, b)),
                     values.iter().cloned().reduce(|a, b| bound_max(a, b)),
@@ -4004,7 +4242,10 @@ pub fn inject_vix_scan_pruning(
                     | FUZZY_MATCH_UDF_NAME
             );
             if null_rejecting
-                && let Some(column) = udf.args().first().and_then(|a| a.downcast_ref::<phys::Column>())
+                && let Some(column) = udf
+                    .args()
+                    .first()
+                    .and_then(|a| a.downcast_ref::<phys::Column>())
             {
                 out.reject_null(column.name());
             }

@@ -17,7 +17,7 @@ use std::{
     cmp::max,
     collections::BTreeMap,
     path::{Path, PathBuf},
-    sync::{Arc, LazyLock as Lazy},
+    sync::{Arc, LazyLock as Lazy, OnceLock},
 };
 
 use arc_swap::ArcSwap;
@@ -52,7 +52,7 @@ pub type RwAHashSet<K> = tokio::sync::RwLock<HashSet<K>>;
 pub type RwBTreeMap<K, V> = tokio::sync::RwLock<BTreeMap<K, V>>;
 
 // for DDL commands and migrations
-pub const DB_SCHEMA_VERSION: u64 = 51;
+pub const DB_SCHEMA_VERSION: u64 = 52;
 pub const DB_SCHEMA_KEY: &str = "/db_schema_version/";
 
 // global version variables
@@ -96,22 +96,24 @@ pub const FILE_EXT_ARROW: &str = ".arrow";
 pub const FILE_EXT_PARQUET: &str = ".parquet";
 pub const FILE_EXT_VORTEX: &str = ".vortex";
 pub const FILE_EXT_VIX: &str = ".vix";
-/// The per-file INDEX SIDECAR of a `.vix` data object (format v3): same key
-/// with the extension swapped, holding the inverted-index blobs. NOT a
-/// file_list-tracked data file, never a merge input by itself; its size is
-/// the data row's `index_size` column (`0` ⟺ no sidecar). Derive keys with
-/// [`vix_sidecar_key`] — never by ad-hoc string surgery.
+/// The per-file INDEX SIDECAR of a `.vix` data object (format v3). Generation
+/// zero uses the legacy extension-swapped key; healed generations use an
+/// immutable generation-suffixed key. Sidecars are not file-list data rows;
+/// `FileMeta::index_size == 0` means no active sidecar.
 pub const FILE_EXT_VXI: &str = ".vxi";
 
-/// The deterministic `.vxi` sidecar key of a `.vix` data-object key
-/// (extension swapped). Callers gate on `FileMeta::index_size > 0` for
-/// existence; this only derives the key. Non-`.vix` keys pass through
-/// with the extension appended-swapped semantics avoided: they return
-/// `None` (a sidecar exists only for core data files).
-pub fn vix_sidecar_key(data_key: &str) -> Option<String> {
-    data_key
-        .strip_suffix(FILE_EXT_VIX)
-        .map(|stem| format!("{stem}{FILE_EXT_VXI}"))
+/// Derive the immutable `.vxi` object key for one `.vix` data object and
+/// sidecar generation. Existing files use generation zero
+/// (`file.vix` -> `file.vxi`); healed generations are distinct objects
+/// (`file.vix`, generation 42 -> `file.42.vxi`). A negative generation is
+/// invalid and fails closed.
+pub fn vix_sidecar_key(data_key: &str, index_generation: i64) -> Option<String> {
+    let stem = data_key.strip_suffix(FILE_EXT_VIX)?;
+    match index_generation {
+        0 => Some(format!("{stem}{FILE_EXT_VXI}")),
+        1.. => Some(format!("{stem}.{index_generation}{FILE_EXT_VXI}")),
+        _ => None,
+    }
 }
 
 pub const QUERY_WITH_NO_LIMIT: i64 = -999;
@@ -268,6 +270,64 @@ pub fn is_vix_l0_index_off(stream_type: crate::meta::stream::StreamType) -> bool
     VIX_L0_INDEX_OFF_STREAM_TYPES.contains(&stream_type)
 }
 
+/// Fields whose equality terms may be written to and queried through the
+/// per-file composite Bloom section.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum VixBloomCompositeScope {
+    /// Every eligible term field participates.
+    All,
+    /// Only the named Bloom-only fields participate.
+    Only(HashSet<String>),
+}
+
+impl VixBloomCompositeScope {
+    /// Builds the effective scope from the broad switch and comma-separated
+    /// Bloom-only allow/deny lists.
+    pub fn new(broad: bool, explicit_fields: &str, never_fields: &str) -> Self {
+        if broad {
+            return Self::All;
+        }
+
+        let mut fields = explicit_fields
+            .split(',')
+            .map(str::trim)
+            .filter(|field| !field.is_empty())
+            .map(str::to_owned)
+            .collect::<HashSet<_>>();
+        for field in never_fields.split(',').map(str::trim) {
+            if !field.is_empty() {
+                fields.remove(field);
+            }
+        }
+        Self::Only(fields)
+    }
+
+    pub fn enabled(&self) -> bool {
+        match self {
+            Self::All => true,
+            Self::Only(fields) => !fields.is_empty(),
+        }
+    }
+
+    pub fn allows(&self, field: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Only(fields) => fields.contains(field),
+        }
+    }
+}
+
+/// Derives the effective composite Bloom policy from one configuration
+/// snapshot. Callers must pass the same snapshot they use for the rest of
+/// their operation so a config reload cannot mix old policy with new knobs.
+pub fn vix_bloom_composite_scope(cfg: &Config) -> VixBloomCompositeScope {
+    VixBloomCompositeScope::new(
+        cfg.common.vix_bloom_composite,
+        &cfg.common.vix_bloom_only_fields,
+        &cfg.common.vix_bloom_only_never,
+    )
+}
+
 pub static BLOOM_FILTER_DEFAULT_FIELDS: Lazy<Vec<String>> = Lazy::new(|| {
     let mut fields = get_config()
         .common
@@ -390,7 +450,27 @@ pub static NATS_KV_WATCH_MODULES: Lazy<HashSet<String>> = Lazy::new(|| {
         .collect()
 });
 
-pub static CONFIG: Lazy<ArcSwap<Config>> = Lazy::new(|| ArcSwap::from(Arc::new(init())));
+#[derive(Debug)]
+pub struct DatafusionMemoryPoolStartupConfig {
+    pub shared_query_pool: bool,
+    pub max_size: usize,
+    pub pool_type: String,
+}
+
+static DATAFUSION_MEMORY_POOL_STARTUP_CONFIG: OnceLock<DatafusionMemoryPoolStartupConfig> =
+    OnceLock::new();
+
+pub static CONFIG: Lazy<ArcSwap<Config>> = Lazy::new(|| {
+    let cfg = init();
+    DATAFUSION_MEMORY_POOL_STARTUP_CONFIG
+        .set(DatafusionMemoryPoolStartupConfig {
+            shared_query_pool: cfg.memory_cache.datafusion_shared_query_pool,
+            max_size: cfg.memory_cache.datafusion_max_size,
+            pool_type: cfg.memory_cache.datafusion_memory_pool.clone(),
+        })
+        .expect("DataFusion memory pool startup config initialized once");
+    ArcSwap::from(Arc::new(cfg))
+});
 static INSTANCE_ID: Lazy<RwHashMap<String, String>> = Lazy::new(Default::default);
 
 pub fn get_config() -> Arc<Config> {
@@ -400,6 +480,15 @@ pub fn get_config() -> Arc<Config> {
 pub fn refresh_config() -> Result<(), anyhow::Error> {
     CONFIG.store(Arc::new(init()));
     Ok(())
+}
+
+/// DataFusion query-pool settings captured atomically from the initial
+/// process configuration. Config refreshes cannot change these values.
+pub fn get_datafusion_memory_pool_startup_config() -> &'static DatafusionMemoryPoolStartupConfig {
+    Lazy::force(&CONFIG);
+    DATAFUSION_MEMORY_POOL_STARTUP_CONFIG
+        .get()
+        .expect("DataFusion memory pool startup config must accompany CONFIG")
 }
 
 pub fn cache_instance_id(instance_id: &str) {
@@ -580,11 +669,11 @@ pub enum FileFormat {
     Parquet,
     Vortex,
     /// Core-file format (v3): a `.vix` puffin DATA object carrying the
-    /// records (`docs` blob) plus a `.vxi` INDEX SIDECAR (same key,
-    /// extension swapped) carrying the inverted index — the sidecar exists
-    /// iff the file is indexed (`FileMeta::index_size > 0`) and is never a
-    /// data file itself. The unconditional format of logs/traces; never a
-    /// valid value for `ZO_FILE_FORMAT`.
+    /// records (`docs` blob) plus a generation-addressed `.vxi` INDEX
+    /// SIDECAR carrying the inverted index. The sidecar exists iff the file
+    /// is indexed (`FileMeta::index_size > 0`) and is never a data file
+    /// itself. The unconditional format of logs/traces; never a valid value
+    /// for `ZO_FILE_FORMAT`.
     Vix,
 }
 
@@ -1346,13 +1435,13 @@ pub struct Common {
         help = "M31a: the LATE LANE master switch. Rows whose hour partition is at \
                 least this many hours behind the current hour are LATE (late-arriving \
                 spans/logs): at ingest they buffer separately and ship as ALL-LATE \
-                segments (classifier: created_at - max_ts, no schema change), and the \
-                builder holds those segments from claiming until \
-                ZO_SEGMENT_LATE_CLAIM_HOLD_SECS so one build wave coalesces the whole \
-                fleet's late rows into one L0 file per (stream, hour) per wave — \
-                instead of one 1-record ~3KB file per hour per build batch (prod \
-                measured ~3.5k such files/h on traces alone, 85% into old hours). \
-                Rows stay queryable through the segment tail the entire hold. 0 = OFF \
+                segments (classifier: created_at - max_ts, no schema change). The builder \
+                assigns registrations to fixed ZO_SEGMENT_LATE_CLAIM_HOLD_SECS wall-clock \
+                cohorts and releases each cohort only when its boundary closes, so one \
+                fleet-wide build wave coalesces late rows into one L0 file per (stream, \
+                hour) unless decoded-size or exact-provenance limits require a split. Rows \
+                stay queryable through the segment tail while their cohort remains open. \
+                0 = OFF \
                 (exact pre-M31a behavior). Sane value: 2 (the previous hour is NOT \
                 late — hour-boundary rows keep today's path)."
     )]
@@ -1379,11 +1468,12 @@ pub struct Common {
     #[env_config(
         name = "ZO_SEGMENT_LATE_CLAIM_HOLD_SECS",
         default = 900,
-        help = "M31a: all-late segments become claimable only this many seconds after \
-                creation — the hold is what batches a fleet's late rows into one \
-                build wave. Must stay far under the raw-object S3 lifecycle (1d prod; \
-                the aging lane is the deeper backstop). Late segments stay query-\
-                visible through the segment tail while held."
+        help = "M31a: width in seconds of fixed wall-clock cohorts for all-late segments. \
+                A segment becomes buildable at the next cohort boundary, so the wait is \
+                in [0, width) rather than a rolling per-segment delay; a single cohort \
+                owner batches the fleet's late rows. Must stay far under the raw-object \
+                S3 lifecycle (1d prod). Late segments remain query-visible through the \
+                segment tail while their cohort is open. 0 closes immediately."
     )]
     pub segment_late_claim_hold_secs: u64,
     #[env_config(
@@ -1739,14 +1829,15 @@ pub struct Common {
         name = "ZO_VIX_BLOOM_COMPOSITE",
         default = true,
         help = "#48: per-file COMPOSITE value bloom — one reserved section keyed by \
-                {field name}\\0{value} over EVERY term field, making equality on ANY field \
-                bloom-decidable (file-skip pruning over multi-day windows with ~8KiB reads per \
-                256-file .bf group). Adds one hash per distinct term at build/merge time and \
-                ~2 bytes per distinct term of blob size at the default FPP. Readers that \
-                predate the section ignore it; the pruner keeps files whose .bf lacks it \
-                (fail-open) — safe to enable per-side in any order. DEFAULT ON since v2 M7 \
-                (it is what serves equality on #52 bloom-only-demoted fields); set false to \
-                go dark."
+                {field name}\\0{value}. When true, it covers all eligible terms, making \
+                equality on any field bloom-decidable (file-skip pruning over multi-day \
+                windows with ~8KiB reads per 256-file .bf group). When false, broad \
+                any-field coverage is disabled, but fields explicitly listed in \
+                ZO_VIX_BLOOM_ONLY_FIELDS still use their selective composite unless excluded \
+                by ZO_VIX_BLOOM_ONLY_NEVER. Adds one hash per distinct included term at \
+                build/merge time and ~2 bytes per distinct term of blob size at the default \
+                FPP. Readers that predate the section ignore it; the pruner keeps files whose \
+                .bf lacks it (fail-open) — safe to enable per-side in any order."
     )]
     pub vix_bloom_composite: bool,
     #[env_config(
@@ -1779,6 +1870,14 @@ pub struct Common {
                 DEFAULT 0.5 (the dev-proven value); 0 disables auto entirely."
     )]
     pub vix_bloom_only_auto_ratio: f64,
+    #[env_config(
+        name = "ZO_VIX_BLOOM_ONLY_AUTO_ID_ONLY",
+        default = false,
+        help = "Restrict AUTO bloom-only demotion to semantic identifier field names. \
+                Explicit ZO_VIX_BLOOM_ONLY_FIELDS entries remain authoritative and are not \
+                gated. False preserves the legacy ratio-only AUTO behavior."
+    )]
+    pub vix_bloom_only_auto_id_only: bool,
     #[env_config(
         name = "ZO_VIX_BLOOM_ONLY_MIN_DISTINCT",
         default = 65536,
@@ -1890,19 +1989,6 @@ pub struct Common {
                 (ZO_VIX_MERGE_THREAD_NUM), so it stacks with it rather than widening it."
     )]
     pub vix_merge_kway_threads: usize,
-    #[env_config(
-        name = "ZO_VIX_MERGE_TYPE_POLICY",
-        default = "legacy",
-        help = "Type target and column-derivation policy for VIX compaction rebuilds. 'legacy' \
-                keeps the current latest-schema target and requires derivation-equivalent input \
-                types; 'latest_schema' keeps that target and additionally admits Boolean/integer/\
-                finite-float to string-family casts. Reverse parsing and numeric narrowing remain \
-                on the _source fallback. When such a cast is admitted over complete columns, the \
-                opt-in mode rewrites both docs and _source to the authoritative string type so \
-                later heals and legacy rollback reproduce identical terms. Start dark and canary \
-                on compactor pods only."
-    )]
-    pub vix_merge_type_policy: String,
     #[env_config(
         name = "ZO_VIX_REBUILD_CONCURRENCY",
         default = 0,
@@ -2767,6 +2853,12 @@ pub struct Compact {
     #[env_config(name = "ZO_COMPACT_ENABLED", default = true)]
     pub enabled: bool,
     #[env_config(
+        name = "ZO_COMPACT_AUTO_MERGE_CONCURRENCY",
+        default = false,
+        help = "Opt in to resolving one deterministic process-wide merge concurrency at compactor startup from the cgroup CPU and memory limits, configured maximum merge size, Segment-WAL memory budget, and compaction download budget. Sizing uses configured maxima only; it does not react to runtime CPU/RSS feedback or per-batch byte estimates."
+    )]
+    pub auto_merge_concurrency: bool,
+    #[env_config(
         name = "ZO_COMPACT_LEASE_GENERATION_ENABLED",
         default = false,
         help = "Enable generation-fenced compactor merge and dump job claims after every node in the fleet has been upgraded."
@@ -3030,6 +3122,17 @@ pub struct MemoryCache {
     pub datafusion_max_size: usize,
     #[env_config(name = "ZO_MEMORY_CACHE_DATAFUSION_MEMORY_POOL", default = "")]
     pub datafusion_memory_pool: String,
+    /// When true, all non-merge query contexts in this process share one DataFusion memory
+    /// pool instead of receiving a full pool each. Defaults to false. The enabled flag and
+    /// the shared pool's `datafusion_max_size` and `datafusion_memory_pool` are captured
+    /// together at startup; changing them for shared queries requires a process restart.
+    /// Merge contexts always use their separate shared merge pool.
+    #[env_config(
+        name = "ZO_MEMORY_CACHE_DATAFUSION_SHARED_QUERY_POOL",
+        default = false,
+        help = "Share one process-wide DataFusion pool across non-merge queries. The flag and shared pool size/type are captured at startup; changes require restart. Merge contexts use a separate pool."
+    )]
+    pub datafusion_shared_query_pool: bool,
 }
 
 #[derive(Serialize, EnvConfig, Default)]
@@ -4197,6 +4300,16 @@ fn check_path_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
 }
 
 fn check_memory_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
+    let datafusion_memory_pool = cfg.memory_cache.datafusion_memory_pool.to_ascii_lowercase();
+    if !matches!(
+        datafusion_memory_pool.as_str(),
+        "" | "greedy" | "fair" | "none" | "off"
+    ) {
+        return Err(anyhow::anyhow!(
+            "ZO_MEMORY_CACHE_DATAFUSION_MEMORY_POOL must be one of greedy, fair, none, or off; got {:?}",
+            cfg.memory_cache.datafusion_memory_pool
+        ));
+    }
     let mem_total = sysinfo::get_memory_limit();
     cfg.limit.mem_total = mem_total;
     if cfg.memory_cache.max_size == 0 {
@@ -4725,19 +4838,6 @@ fn check_inverted_index_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
             cfg.common.vix_read_mode
         ));
     }
-    cfg.common.vix_merge_type_policy = cfg.common.vix_merge_type_policy.trim().to_lowercase();
-    if cfg.common.vix_merge_type_policy.is_empty() {
-        cfg.common.vix_merge_type_policy = "legacy".to_string();
-    }
-    if !matches!(
-        cfg.common.vix_merge_type_policy.as_str(),
-        "legacy" | "latest_schema"
-    ) {
-        return Err(anyhow::anyhow!(
-            "ZO_VIX_MERGE_TYPE_POLICY must be 'legacy' or 'latest_schema', got {:?}",
-            cfg.common.vix_merge_type_policy
-        ));
-    }
     if cfg.limit.inverted_index_result_cache_max_entries == 0 {
         cfg.limit.inverted_index_result_cache_max_entries = 100000;
     }
@@ -4769,6 +4869,17 @@ pub fn ensure_not_empty(s: &str, name: &str) -> Result<(), anyhow::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_datafusion_memory_pool_fails_config_check() {
+        let mut cfg = Config::init().unwrap();
+        cfg.memory_cache.datafusion_memory_pool = "invalid".to_string();
+        let err = check_memory_config(&mut cfg).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("ZO_MEMORY_CACHE_DATAFUSION_MEMORY_POOL")
+        );
+    }
 
     /// M11 launch defaults (OWNER 2026-08-18: "cache_latest_files default
     /// to true — we need cache latest files"): caching + merge-input
@@ -5155,6 +5266,21 @@ mod tests {
     }
 
     #[test]
+    fn test_vix_sidecar_key_is_generation_stable() {
+        let data = "files/default/traces/default/2026/09/03/09/file.vix";
+        assert_eq!(
+            vix_sidecar_key(data, 0).as_deref(),
+            Some("files/default/traces/default/2026/09/03/09/file.vxi")
+        );
+        assert_eq!(
+            vix_sidecar_key(data, 42).as_deref(),
+            Some("files/default/traces/default/2026/09/03/09/file.42.vxi")
+        );
+        assert_eq!(vix_sidecar_key(data, -1), None);
+        assert_eq!(vix_sidecar_key("file.parquet", 42), None);
+    }
+
+    #[test]
     fn test_file_format_for_ingester_stream() {
         assert_eq!(
             FileFormat::for_ingester_stream(StreamType::Metrics, FileFormat::Vortex),
@@ -5465,7 +5591,6 @@ mod tests {
     #[test]
     fn test_check_inverted_index_config_defaults() {
         let mut cfg = Config::default();
-        cfg.common.vix_merge_type_policy.clear();
         cfg.limit.inverted_index_result_cache_max_entries = 0;
         cfg.limit.inverted_index_result_cache_max_entry_size = 0;
         cfg.limit.inverted_index_result_cache_max_size = 0;
@@ -5479,13 +5604,11 @@ mod tests {
         assert_eq!(cfg.limit.inverted_index_skip_threshold, 35);
         assert_eq!(cfg.limit.inverted_index_min_token_length, 2);
         assert_eq!(cfg.limit.inverted_index_max_token_length, 64);
-        assert_eq!(cfg.common.vix_merge_type_policy, "legacy");
     }
 
     #[test]
     fn test_check_inverted_index_config_preserves_existing() {
         let mut cfg = Config::default();
-        cfg.common.vix_merge_type_policy = " Latest_Schema ".to_string();
         cfg.limit.inverted_index_result_cache_max_entries = 5000;
         cfg.limit.inverted_index_min_token_length = 3;
         cfg.limit.inverted_index_max_token_length = 32;
@@ -5493,15 +5616,6 @@ mod tests {
         assert_eq!(cfg.limit.inverted_index_result_cache_max_entries, 5000);
         assert_eq!(cfg.limit.inverted_index_min_token_length, 3);
         assert_eq!(cfg.limit.inverted_index_max_token_length, 32);
-        assert_eq!(cfg.common.vix_merge_type_policy, "latest_schema");
-    }
-
-    #[test]
-    fn test_check_inverted_index_config_rejects_unknown_merge_type_policy() {
-        let mut cfg = Config::default();
-        cfg.common.vix_merge_type_policy = "guess".to_string();
-        let error = check_inverted_index_config(&mut cfg).unwrap_err();
-        assert!(error.to_string().contains("ZO_VIX_MERGE_TYPE_POLICY"));
     }
 
     #[test]
@@ -5920,5 +6034,73 @@ mod tests {
         let p = std::path::Path::new(r"C:\data\openobserve");
         let result = deverbatim(p);
         assert_eq!(result, r"C:\data\openobserve");
+    }
+
+    #[test]
+    fn vix_bloom_composite_broad_scope_is_all() {
+        let scope = VixBloomCompositeScope::new(true, "trace_id", "trace_id");
+
+        assert_eq!(scope, VixBloomCompositeScope::All);
+        assert!(scope.enabled());
+        assert!(scope.allows("any_field"));
+    }
+
+    #[test]
+    fn vix_bloom_composite_selective_scope_trims_and_deduplicates() {
+        let scope =
+            VixBloomCompositeScope::new(false, " trace_id,span_id,trace_id, , span_id ", "");
+        let VixBloomCompositeScope::Only(fields) = &scope else {
+            panic!("selective configuration must produce an Only scope");
+        };
+
+        assert_eq!(fields.len(), 2);
+        assert!(fields.contains("trace_id"));
+        assert!(fields.contains("span_id"));
+        assert!(scope.enabled());
+        assert!(scope.allows("trace_id"));
+        assert!(!scope.allows("service_name"));
+    }
+
+    #[test]
+    fn vix_bloom_composite_never_fields_are_subtracted() {
+        let scope =
+            VixBloomCompositeScope::new(false, " trace_id, span_id, service_name ", "span_id");
+        let VixBloomCompositeScope::Only(fields) = &scope else {
+            panic!("selective configuration must produce an Only scope");
+        };
+
+        assert_eq!(fields.len(), 2);
+        assert!(fields.contains("trace_id"));
+        assert!(fields.contains("service_name"));
+        assert!(!scope.allows("span_id"));
+    }
+
+    #[test]
+    fn vix_bloom_composite_empty_scope_is_disabled() {
+        let scope = VixBloomCompositeScope::new(false, " trace_id, trace_id ", " trace_id ");
+
+        assert_eq!(scope, VixBloomCompositeScope::Only(HashSet::new()));
+        assert!(!scope.enabled());
+        assert!(!scope.allows("trace_id"));
+    }
+
+    #[test]
+    fn vix_bloom_composite_scope_uses_the_supplied_snapshot() {
+        let mut selective = Config::default();
+        selective.common.vix_bloom_composite = false;
+        selective.common.vix_bloom_only_fields = "trace_id".to_string();
+
+        let mut broad = Config::default();
+        broad.common.vix_bloom_composite = true;
+        broad.common.vix_bloom_only_fields = "span_id".to_string();
+
+        assert_eq!(
+            vix_bloom_composite_scope(&selective),
+            VixBloomCompositeScope::Only(HashSet::from(["trace_id".to_string()]))
+        );
+        assert_eq!(
+            vix_bloom_composite_scope(&broad),
+            VixBloomCompositeScope::All
+        );
     }
 }

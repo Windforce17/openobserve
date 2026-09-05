@@ -23,8 +23,8 @@ use config::{
     cluster::LOCAL_NODE,
     get_config, ider, is_local_disk_storage,
     meta::stream::{
-        FileKey, FileListDeleted, FileMeta, MergeStrategy, PartitionTimeLevel, StorageType,
-        StreamType,
+        FileKey, FileListBookKeepMode, FileListDeleted, FileMeta, MergeStrategy,
+        PartitionTimeLevel, StorageType, StreamType,
     },
     metrics,
     utils::{
@@ -1413,6 +1413,7 @@ pub async fn merge_files(
         flattened: false,
         index_size: 0,
         bloom_ver: 0,
+        ..Default::default()
     };
     if new_file_meta.records == 0 {
         return Err(anyhow::anyhow!("merge_files error: records is 0"));
@@ -1800,14 +1801,10 @@ async fn merge_core_group(
         cfg.compact.max_file_size as i64,
     );
 
-    // M3 SIDECAR-ONLY HEAL (DESIGN-V2 §5): a single-file healing batch
-    // rewrites ONLY the `.vxi` index sidecar — same sidecar key, data
-    // object untouched, the EXISTING file_list row updated in place — and
-    // commits no add/delete events at all. Only a heal that genuinely
-    // rewrites docs (degenerate-_timestamp cleansing; an oversize-skip set
-    // the data-side allowance cannot cover) falls through to the
-    // whole-file rebuild below. Classification reasons are unchanged
-    // (single_core_file_heal_reason); only the execution changed.
+    // A single-file healing batch rewrites only an immutable, uniquely
+    // generation-addressed `.vxi` sidecar. The data object remains untouched
+    // and CAS publication updates the existing file_list row. Only a heal
+    // that genuinely rewrites docs falls through to the whole-file rebuild.
     if force_rebuild && new_file_list.len() == 1 {
         let healed = sidecar_only_heal(
             thread_id,
@@ -1861,7 +1858,7 @@ async fn merge_core_group(
             // v3 split: the index sidecar is its own object; index_size is
             // its exact size and 0 means no sidecar (docs-only rebuild).
             let index_source: Option<Arc<dyn vortex_index::VixRangeSource>> =
-                config::vix_sidecar_key(&file.key)
+                config::vix_sidecar_key(&file.key, file.meta.index_generation)
                     .filter(|_| file.meta.index_size > 0)
                     .map(|sidecar_key| {
                         Arc::new(HealProbeRangeSource {
@@ -2165,12 +2162,12 @@ async fn merge_core_group(
     }
     drop(result.output);
 
-    // v3 split: upload the `.vxi` index sidecar AFTER the data object and
-    // BEFORE the file_list row commits — a crash in between leaves orphan
-    // objects without a row, exactly today's semantics. Same account as the
-    // data object (one logical file, one placement).
+    // Ordinary merge outputs always publish generation zero. The data object
+    // and canonical `.vxi` sidecar are uploaded before the file_list row
+    // commits, so a crash leaves only rowless generation-zero orphans.
+    new_file_meta.index_generation = 0;
     if let Some(index_bytes) = result.index {
-        let sidecar_key = config::vix_sidecar_key(&new_file_key)
+        let sidecar_key = config::vix_sidecar_key(&new_file_key, 0)
             .expect("merge outputs are .vix keys by construction");
         debug_assert_eq!(index_bytes.len() as u64, new_file_meta.index_size as u64);
         let buf = Bytes::from(index_bytes);
@@ -2186,28 +2183,9 @@ async fn merge_core_group(
     ))
 }
 
-/// Execute the M3 sidecar-only heal for ONE core file (DESIGN-V2 §5):
-/// rebuild the `.vxi` with current settings over the UNTOUCHED data
-/// object, overwrite the SAME sidecar key, and update the EXISTING
-/// file_list row (`index_size` + `bloom_ver = 0`) — no new file id, no
-/// data-key change, no data upload. Returns Ok(true) when healed in place
-/// (or the index-off heal dropped the sidecar), Ok(false) when the file
-/// genuinely needs the docs-rewriting rebuild.
-///
-/// Consistency: the row update carries NO job-ownership fence — unlike an
-/// add+delete commit it cannot duplicate or lose rows. Two racing healers
-/// write equivalent sidecars (same docs, same settings) and the row; the
-/// worst interleave leaves the row's `index_size` disagreeing with the
-/// object, which readers fail-open on and the next sweep re-classifies
-/// `NeedsRebuild` — convergent. Staleness is acceptable by design: docs
-/// are unchanged, so a reader briefly on the old cached sidecar serves
-/// pre-heal (correct) results; the broadcast below evicts/refreshes.
-///
-/// `.bf` flow: `bloom_ver = 0` + `index_size > 0` re-enters the file into
-/// the bloom assembler queue, which transposes the NEW sidecar's bloom
-/// blob into a fresh `.bf` chunk (the pruner treats `bloom_ver <= 0` as
-/// no-bloom meanwhile) — identical to how a freshly merged file enters
-/// the queue; bloom_ver semantics unchanged.
+/// Execute a sidecar-only heal for one core file. Rebuilt bytes always use a
+/// fresh immutable generation, and CAS publication atomically retires the
+/// previous sidecar.
 #[allow(clippy::too_many_arguments)]
 async fn sidecar_only_heal(
     thread_id: usize,
@@ -2227,6 +2205,7 @@ async fn sidecar_only_heal(
     };
 
     cancel.check("sidecar heal planning")?;
+    let cfg = get_config();
 
     let handle = tokio::runtime::Handle::current();
     let source: Arc<dyn vortex_index::VixRangeSource> = Arc::new(HealProbeRangeSource {
@@ -2236,18 +2215,18 @@ async fn sidecar_only_heal(
         handle: handle.clone(),
         cancel: Some(cancel.clone()),
     });
+    let previous_sidecar_key = config::vix_sidecar_key(&file.key, file.meta.index_generation)
+        .filter(|_| file.meta.index_size > 0);
     let index_source: Option<Arc<dyn vortex_index::VixRangeSource>> =
-        config::vix_sidecar_key(&file.key)
-            .filter(|_| file.meta.index_size > 0)
-            .map(|sidecar_key| {
-                Arc::new(HealProbeRangeSource {
-                    account: file.account.clone(),
-                    location: object_store::path::Path::from(sidecar_key.as_str()),
-                    size: file.meta.index_size as u64,
-                    handle,
-                    cancel: Some(cancel.clone()),
-                }) as Arc<dyn vortex_index::VixRangeSource>
-            });
+        previous_sidecar_key.as_ref().map(|sidecar_key| {
+            Arc::new(HealProbeRangeSource {
+                account: file.account.clone(),
+                location: object_store::path::Path::from(sidecar_key.as_str()),
+                size: file.meta.index_size as u64,
+                handle,
+                cancel: Some(cancel.clone()),
+            }) as Arc<dyn vortex_index::VixRangeSource>
+        });
     let input = (file.key.clone(), source, index_source);
     let rebuild_permit =
         acquire_vix_rebuild_memory(cancel, "sidecar rebuild memory admission").await?;
@@ -2273,9 +2252,21 @@ async fn sidecar_only_heal(
     let outcome = heal_join??;
     cancel.check("sidecar heal upload")?;
 
-    let sidecar_key = config::vix_sidecar_key(&file.key)
-        .ok_or_else(|| anyhow::anyhow!("healing batches carry .vix keys: {}", file.key))?;
-    let new_index_size = match outcome {
+    // Candidate cleanup and previous-generation retirement both wait beyond
+    // the longest configured reader lifetime; the ordinary deletion delay
+    // adds the final scheduling margin.
+    let limits = &cfg.limit;
+    let reader_timeout_secs = limits
+        .query_timeout
+        .max(limits.query_querier_timeout)
+        .max(limits.query_ingester_timeout)
+        .max(limits.search_job_timeout.max(0) as u64);
+    let reader_grace_micros = i64::try_from(reader_timeout_secs)
+        .unwrap_or(i64::MAX)
+        .saturating_mul(1_000_000);
+    let retired_at = config::utils::time::now_micros().saturating_add(reader_grace_micros);
+
+    let (new_index_size, new_generation, unpublished_sidecar_key) = match outcome {
         SidecarHealOutcome::NeedsDocsRewrite(reason) => {
             log::info!(
                 "[COMPACTOR:WORKER:{thread_id}] {org_id}/{stream_type}/{stream_name}: \
@@ -2288,62 +2279,124 @@ async fn sidecar_only_heal(
         SidecarHealOutcome::Rebuilt { index, stats } => {
             debug_assert_eq!(index.len() as u64, stats.index_size);
             let index_size = index.len() as i64;
-            // overwrite the SAME sidecar key (bounded retry). A crash after
-            // the PUT and before the row update leaves the row's index_size
-            // pointing into the new object at the old length: readers
-            // fail-open on the unreadable pair and the next sweep
-            // re-classifies NeedsRebuild — convergent, never corrupt (doc
-            // ids address the unchanged docs either way).
-            put_merged_output(
-                &file.account,
-                &sidecar_key,
-                Bytes::from(index),
-                compliance,
-                cancel,
-            )
-            .await?;
-            index_size
+            let index = Bytes::from(index);
+            const MAX_GENERATION_UPLOAD_ATTEMPTS: usize = 8;
+            let mut uploaded = None;
+            for attempt in 1..=MAX_GENERATION_UPLOAD_ATTEMPTS {
+                let generation = infra_file_list::stage_index_generation(file, retired_at).await?;
+                let sidecar_key =
+                    config::vix_sidecar_key(&file.key, generation).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "healing batch has invalid sidecar identity: {} generation {}",
+                            file.key,
+                            generation
+                        )
+                    })?;
+                match storage::put_if_absent(&file.account, &sidecar_key, index.clone(), compliance)
+                    .await
+                {
+                    Ok(()) => {
+                        uploaded = Some((generation, sidecar_key));
+                        break;
+                    }
+                    Err(object_store::Error::AlreadyExists { .. }) => {
+                        // This key was not created by the confirmed request.
+                        // Never delete a pre-existing object on a collision.
+                        // Retire only our exact reservation before retrying.
+                        infra_file_list::batch_remove_deleted(&[FileKey::new(
+                            generation,
+                            file.account.clone(),
+                            file.key.clone(),
+                            FileMeta::default(),
+                            false,
+                        )])
+                        .await?;
+                        log::warn!(
+                            "[COMPACTOR:WORKER:{thread_id}] immutable sidecar generation \
+                             collision for {sidecar_key} (attempt \
+                             {attempt}/{MAX_GENERATION_UPLOAD_ATTEMPTS}); minting another"
+                        );
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "[COMPACTOR:WORKER:{thread_id}] create-only upload outcome for \
+                             {sidecar_key} is not confirmed; the staged cleanup intent remains \
+                             armed and no metadata was published: {e}"
+                        );
+                        return Err(e.into());
+                    }
+                }
+            }
+            let (generation, sidecar_key) = uploaded.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "could not allocate a unique immutable sidecar key for {} after {} attempts",
+                    file.key,
+                    MAX_GENERATION_UPLOAD_ATTEMPTS
+                )
+            })?;
+            (index_size, generation, Some(sidecar_key))
         }
-        // Index-off policy heal: metadata-only. The row zeroes FIRST
-        // (readers gate the sidecar fetch on index_size), the object
-        // deletes after; a crash in between orphans a `.vxi` for the
-        // lifecycle GC.
-        SidecarHealOutcome::DropSidecar => 0,
+        // Generation remains the state identity even when no sidecar object
+        // is active, preventing an indexless ABA transition.
+        SidecarHealOutcome::DropSidecar => {
+            let generation = infra_file_list::stage_index_generation(file, retired_at).await?;
+            (0, generation, None)
+        }
     };
 
-    // Update the EXISTING row in place (remote, then the local mirror):
-    // index_size to the new sidecar's size and bloom_ver back to 0.
-    infra_file_list::update_index_size_for_heal(&file.key, new_index_size).await?;
-    if let Err(e) = infra_file_list::LOCAL_CACHE
-        .update_index_size_for_heal(&file.key, new_index_size)
-        .await
-    {
-        log::warn!(
-            "[COMPACTOR:WORKER:{thread_id}] sidecar heal local-cache update for {} failed: {e}",
+    // Finish publication after upload even if the merge lease is cancelled.
+    // CAS must consume the still-staged generation ticket; a cleanup claim
+    // or changed source row makes publication lose without exposing bytes.
+    // Start the old generation's grace after upload; time spent creating the
+    // replacement must not shorten an in-flight reader's remaining window.
+    let retired_at = config::utils::time::now_micros().saturating_add(reader_grace_micros);
+    let published =
+        infra_file_list::publish_index_generation(file, new_index_size, new_generation, retired_at)
+            .await?;
+    if !published {
+        if let Some(sidecar_key) = unpublished_sidecar_key.as_deref()
+            && let Err(delete_error) = storage::delete(&file.account, sidecar_key).await
+        {
+            log::warn!(
+                "[COMPACTOR:WORKER:{thread_id}] sidecar heal CAS loser {} could not be deleted \
+                 immediately; its staged cleanup intent remains armed: {delete_error}",
+                sidecar_key,
+            );
+        }
+        log::info!(
+            "[COMPACTOR:WORKER:{thread_id}] {org_id}/{stream_type}/{stream_name}: \
+             sidecar-only heal CAS lost for {} at generation {}; discarded unpublished \
+             generation {new_generation}",
             file.key,
+            file.meta.index_generation,
         );
+        return Ok(true);
     }
 
-    if new_index_size == 0
-        && let Err(e) = storage::del(vec![(file.account.as_str(), sidecar_key.as_str())]).await
-    {
-        log::warn!(
-            "[COMPACTOR:WORKER:{thread_id}] sidecar heal delete of {sidecar_key} failed \
-             (orphan .vxi, lifecycle GC covers it): {e}",
-        );
-    }
-
-    // Evict this node's own stale cache entries so later local ranged
-    // reads (probes, follow-up merges) see the new bytes.
-    let _ = file_data::disk::remove(&sidecar_key).await;
-    let _ = file_data::memory::remove(&sidecar_key).await;
-
-    // Broadcast the updated row: querier event handlers evict their cached
-    // sidecar bytes + the memoized reader and re-download (api event.rs).
     let mut updated = file.clone();
     updated.meta.index_size = new_index_size;
+    updated.meta.index_generation = new_generation;
     updated.meta.bloom_ver = 0;
     updated.deleted = false;
+
+    // Broadcast intentionally skips the publishing node. A combined
+    // compactor+querier must therefore invalidate its own metadata and VIX
+    // caches before notifying peers; otherwise follower requests on this
+    // process can keep resolving the retired generation.
+    if LOCAL_NODE.is_querier() {
+        if !cfg.common.local_mode
+            && let Err(e) = infra_file_list::LOCAL_CACHE.remove(&file.key).await
+        {
+            log::error!(
+                "[COMPACTOR:WORKER:{thread_id}] local file-list cache invalidation for {} \
+                 failed after generation publish: {e}",
+                file.key
+            );
+        }
+        ::search::vix::reader_cache::GLOBAL_CACHE.remove(&file.key);
+        ::search::vix::cache::GLOBAL_CACHE.remove_file_entries(std::iter::once(file.key.as_str()));
+    }
+
     if let Err(e) = db::file_list::broadcast::send(std::slice::from_ref(&updated)).await {
         log::error!(
             "[COMPACTOR:WORKER:{thread_id}] sidecar heal broadcast for {} failed: {e}",
@@ -2353,9 +2406,11 @@ async fn sidecar_only_heal(
 
     log::info!(
         "[COMPACTOR:WORKER:{thread_id}] {org_id}/{stream_type}/{stream_name}: healed {} \
-         sidecar-only: data key unchanged, index_size {} -> {new_index_size}, took {} ms",
+         sidecar-only: data key unchanged, index_size {} -> {new_index_size}, generation {} -> \
+         {new_generation}, took {} ms",
         file.key,
         file.meta.index_size,
+        file.meta.index_generation,
         start.elapsed().as_millis(),
     );
     Ok(true)
@@ -2485,7 +2540,7 @@ async fn single_core_file_heal_reason(
     // (index_size = its exact size; 0 = no sidecar, classify routes such
     // files to the rebuild)
     let index_source: Option<Arc<dyn vortex_index::VixRangeSource>> =
-        config::vix_sidecar_key(&file.key)
+        config::vix_sidecar_key(&file.key, file.meta.index_generation)
             .filter(|_| file.meta.index_size > 0)
             .map(|sidecar_key| {
                 Arc::new(HealProbeRangeSource {
@@ -2593,16 +2648,14 @@ async fn write_file_list(
 
     let del_items = events
         .iter()
-        .filter(|v| v.deleted)
-        .map(|v| FileListDeleted {
+        .filter(|event| event.deleted)
+        .map(|event| FileListDeleted {
             id: 0,
-            account: v.account.clone(),
-            file: v.key.clone(),
-            // vestigial always-false: the deleted-file sweeper derives
-            // the .vxi sidecar key from every .vix key unconditionally
-            // (compact::deleted), so the flag is never consulted
+            account: event.account.clone(),
+            file: event.key.clone(),
             index_file: false,
-            flattened: v.meta.flattened,
+            flattened: event.meta.flattened,
+            index_generation: event.meta.index_generation,
         })
         .collect::<Vec<_>>();
 
@@ -2620,16 +2673,50 @@ async fn write_file_list(
     let mut last_error: Option<infra::errors::Error> = None;
     let mut backoff = tokio::time::Duration::from_secs(1);
     let created_at = config::utils::time::now_micros();
-    for attempt in 1..=MAX_ATTEMPTS {
-        if attempt > 1 {
-            tokio::time::sleep(backoff).await;
-            backoff *= 2;
+    let delete_only = del_items.len() == events.len();
+    if delete_only {
+        // All-poison merges have no replacement output. Move their rows and
+        // exact sidecar generations into the deletion outbox in one
+        // transaction, so an outcome-ambiguous commit cannot lose cleanup.
+        match infra_file_list::retire_files(events, FileListBookKeepMode::Deleted, created_at).await
+        {
+            Ok(()) => success = true,
+            Err(e) => last_error = Some(e),
         }
-        if !mark_deleted_done {
-            if let Err(e) = infra::file_list::batch_process(events).await {
+    } else {
+        for attempt in 1..=MAX_ATTEMPTS {
+            if attempt > 1 {
+                tokio::time::sleep(backoff).await;
+                backoff *= 2;
+            }
+            if !mark_deleted_done {
+                if let Err(e) = infra::file_list::batch_process(events).await {
+                    let deterministic = e.is_deterministic_db_error();
+                    log::error!(
+                        "[COMPACTOR] batch_process to db failed (attempt \
+                         {attempt}/{MAX_ATTEMPTS}{}): {e}",
+                        if deterministic {
+                            ", deterministic — not retrying"
+                        } else {
+                            ""
+                        },
+                    );
+                    last_error = Some(e);
+                    if deterministic {
+                        break;
+                    }
+                    continue;
+                }
+                mark_deleted_done = true;
+            }
+            if !del_items.is_empty()
+                && let Err(e) =
+                    infra_file_list::batch_add_deleted(org_id, created_at, &del_items).await
+            {
                 let deterministic = e.is_deterministic_db_error();
                 log::error!(
-                    "[COMPACTOR] batch_process to db failed (attempt {attempt}/{MAX_ATTEMPTS}{}): {e}",
+                    "[COMPACTOR] batch_add_deleted to db failed (attempt \
+                     {attempt}/{MAX_ATTEMPTS}{}): {e}",
                     if deterministic {
                         ", deterministic — not retrying"
                     } else {
@@ -2642,28 +2729,9 @@ async fn write_file_list(
                 }
                 continue;
             }
-            mark_deleted_done = true;
+            success = true;
+            break;
         }
-        if !del_items.is_empty()
-            && let Err(e) = infra_file_list::batch_add_deleted(org_id, created_at, &del_items).await
-        {
-            let deterministic = e.is_deterministic_db_error();
-            log::error!(
-                "[COMPACTOR] batch_add_deleted to db failed (attempt {attempt}/{MAX_ATTEMPTS}{}): {e}",
-                if deterministic {
-                    ", deterministic — not retrying"
-                } else {
-                    ""
-                },
-            );
-            last_error = Some(e);
-            if deterministic {
-                break;
-            }
-            continue;
-        }
-        success = true;
-        break;
     }
 
     // handle dump_stats for file_list type streams
@@ -2759,7 +2827,7 @@ async fn cache_remote_files(files: &[FileKey]) -> Result<Vec<String>, anyhow::Er
             true,
         ));
         if file.meta.index_size > 0
-            && let Some(sidecar) = config::vix_sidecar_key(&file.key)
+            && let Some(sidecar) = config::vix_sidecar_key(&file.key, file.meta.index_generation)
         {
             objects.push((
                 file.account.clone(),
@@ -2925,6 +2993,7 @@ mod tests {
                 index_size: 0,
                 flattened: false,
                 bloom_ver: 0,
+                ..Default::default()
             },
             deleted: false,
             selection: None,

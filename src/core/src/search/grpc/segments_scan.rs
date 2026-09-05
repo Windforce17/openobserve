@@ -48,10 +48,10 @@
 //!   away while its segment was still inside the grace: e2e heal test, 2026-07-31.)
 //! - A candidate observed Pending/Building whose build commits between the two reads would be
 //!   served twice (segment + L0 rows in the snapshot). L0 filenames embed provenance for exactly
-//!   this race: `l0_{uuid-or-multi}_{minSegId}_{maxSegId}_{n}` with any extension; any candidate
-//!   whose id falls inside a snapshot `l0_` range is dropped ([`dedup_candidates`]). Only snapshot
-//!   members may suppress a candidate — an L0 registered after the snapshot names data this query
-//!   will not scan from files, so honoring it would open a gap.
+//!   this race: legacy/h1 keys encode inclusive segment-id ranges, while h2 keys encode the exact
+//!   contributing ids. [`dedup_candidates`] drops only candidates covered by that provenance. Only
+//!   snapshot provenance members may suppress a candidate — an L0 registered after the snapshot
+//!   names data this query will not scan from files, so honoring it would open a gap.
 //! - The ordering invariant additionally requires the `wal_segments` read and the file_list
 //!   snapshot read to be CAUSALLY CONSISTENT. Both run on the RO pool, and `CLIENT_RO == CLIENT` by
 //!   default: an empty `ZO_META_POSTGRES_RO_DSN` falls back to the RW DSN
@@ -72,7 +72,7 @@ use std::{
 };
 
 use arrow::array::{BooleanArray, Int64Array};
-use arrow_schema::Schema;
+use arrow_schema::{DataType, Schema};
 use config::{
     TIMESTAMP_COL_NAME, get_config, is_local_disk_storage,
     meta::{search::ScanStats, stream::StreamType},
@@ -87,12 +87,14 @@ use infra::{
     cache::file_data,
     errors::{Error, Result},
     file_list::{FileId, FileIdWithFile},
+    l0_provenance::{L0Provenance, parse_l0_provenance},
     wal_segments::{self, SegmentMeta},
 };
 
 use crate::service::search::{
     datafusion::table_provider::memtable::NewMemTable,
     index::{Condition, IndexCondition},
+    utils::AbortOnDrop,
 };
 
 /// Cap on segments one query ships per stream. Past this the builder is far
@@ -215,6 +217,15 @@ type SharedSegmentFetchCell = tokio::sync::OnceCell<SharedSegmentFetchResult>;
 
 static INFLIGHT_SEGMENT_FETCHES: LazyLock<DashMap<String, Arc<SharedSegmentFetchCell>>> =
     LazyLock::new(DashMap::new);
+/// Process-wide admission for CPU-heavy zstd/CRC/IPC decode work. Per-query
+/// limits alone let repeated cancelled searches leave an unbounded number of
+/// already-running `spawn_blocking` closures behind. Queued closures are
+/// aborted on drop below; this gate bounds the closures that can be running.
+static SEGMENT_DECODE_ADMISSION: LazyLock<Arc<tokio::sync::Semaphore>> = LazyLock::new(|| {
+    Arc::new(tokio::sync::Semaphore::new(
+        get_config().limit.cpu_num.max(1),
+    ))
+});
 
 struct InflightSegmentFetchCleanup {
     key: String,
@@ -280,6 +291,34 @@ impl FetchedSegment {
         )
     }
 }
+enum SegmentFetchWork {
+    SkippedBeforeFetch,
+    Fetched {
+        meta: SegmentMeta,
+        fetched: FetchedSegment,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    },
+}
+
+enum SegmentDecodeWork {
+    SkippedBeforeFetch,
+    SkippedBeforeDecode {
+        fetch_stats: SegmentFetchStats,
+        blocking_queue: Duration,
+    },
+    Scanned {
+        fetch_stats: SegmentFetchStats,
+        permit: tokio::sync::OwnedSemaphorePermit,
+        blocking_queue: Duration,
+        decode: Duration,
+        scanned: ScannedSegment,
+    },
+}
+
+#[inline]
+fn should_skip_by_top_n(can_skip_segments: bool, max_ts: i64, threshold: &AtomicI64) -> bool {
+    can_skip_segments && max_ts < threshold.load(Ordering::Acquire)
+}
 
 #[derive(Default)]
 struct SegmentScanTimings {
@@ -297,6 +336,22 @@ struct SegmentScanTimings {
     blocking_queue_max: Duration,
     decode_sum: Duration,
     decode_max: Duration,
+    format_sum: Duration,
+    format_max: Duration,
+    condition_sum: Duration,
+    condition_max: Duration,
+    projection_sum: Duration,
+    projection_max: Duration,
+    frames_seen: u64,
+    stream_frames: u64,
+    time_frames: u64,
+    ipc_frames: u64,
+    top_n_skipped_frames: u64,
+    exact_batches: u64,
+    whole_batches: u64,
+    dropped_batches: u64,
+    exact_rows_after_condition: u64,
+    whole_rows_retained: u64,
 }
 
 impl SegmentScanTimings {
@@ -320,6 +375,32 @@ impl SegmentScanTimings {
         self.blocking_queue_max = self.blocking_queue_max.max(blocking_queue);
         self.decode_sum += decode;
         self.decode_max = self.decode_max.max(decode);
+    }
+
+    fn record_profiled_decode(
+        &mut self,
+        blocking_queue: Duration,
+        decode: Duration,
+        scanned: &ScannedSegment,
+    ) {
+        self.record_decode(blocking_queue, decode);
+        self.condition_sum += scanned.condition_time;
+        self.condition_max = self.condition_max.max(scanned.condition_time);
+        self.projection_sum += scanned.projection_time;
+        self.projection_max = self.projection_max.max(scanned.projection_time);
+        let format = decode.saturating_sub(scanned.condition_time + scanned.projection_time);
+        self.format_sum += format;
+        self.format_max = self.format_max.max(format);
+        self.frames_seen += scanned.frames_seen;
+        self.stream_frames += scanned.stream_frames as u64;
+        self.time_frames += scanned.time_frames;
+        self.ipc_frames += scanned.ipc_frames;
+        self.top_n_skipped_frames += scanned.top_n_skipped_frames;
+        self.exact_batches += scanned.exact_batches;
+        self.whole_batches += scanned.whole_batches;
+        self.dropped_batches += scanned.dropped_batches;
+        self.exact_rows_after_condition += scanned.exact_rows_after_condition;
+        self.whole_rows_retained += scanned.whole_rows_retained;
     }
 
     fn apply_cache_stats(&self, scan_stats: &mut ScanStats) {
@@ -516,20 +597,16 @@ fn segment_permits(size: i64, budget_permits: usize) -> u32 {
         .min(u32::MAX as usize) as u32
 }
 
-/// Keep a bounded stage continuously full instead of waiting for fixed waves.
-/// Ordered stages preserve top-n threshold behavior; unordered stages avoid
-/// head-of-line blocking when result order has no semantic value.
-fn rolling_stage<S, F, T>(stream: S, concurrency: usize, ordered: bool) -> BoxStream<'static, T>
+/// Keep a bounded stage continuously full and yield completed work without a
+/// slow head blocking later ready items. Input admission remains newest-first
+/// for segment Top-N scans; the threshold proof is order-independent.
+fn rolling_stage<S, F, T>(stream: S, concurrency: usize) -> BoxStream<'static, T>
 where
     S: Stream<Item = F> + Send + 'static,
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
-    if ordered {
-        stream.buffered(concurrency.max(1)).boxed()
-    } else {
-        stream.buffer_unordered(concurrency.max(1)).boxed()
-    }
+    stream.buffer_unordered(concurrency.max(1)).boxed()
 }
 
 // ---------------------------------------------------------------------------
@@ -593,17 +670,82 @@ fn apply_query_cap(
     )
 }
 
+/// Compact provenance coverage projected from the exact file-list snapshot a
+/// query scans. Legacy/h1 ranges stay ranges; sparse h2 ids stay exact.
+#[derive(Debug, Clone, Default)]
+pub struct L0Coverage {
+    ranges: Vec<(i64, i64)>,
+    exact_ids: HashSet<i64>,
+}
+
+impl L0Coverage {
+    pub fn range_count(&self) -> usize {
+        self.ranges.len()
+    }
+
+    pub fn exact_id_count(&self) -> usize {
+        self.exact_ids.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.ranges.is_empty() && self.exact_ids.is_empty()
+    }
+
+    fn insert(&mut self, provenance: L0Provenance, candidate_ids: &[i64]) {
+        match provenance {
+            L0Provenance::Range(min, max) => self.ranges.push((min, max)),
+            L0Provenance::Exact(ids) => self.exact_ids.extend(
+                ids.into_iter()
+                    .filter(|id| candidate_ids.binary_search(id).is_ok()),
+            ),
+        }
+    }
+
+    fn compact(&mut self) {
+        self.ranges.sort_unstable();
+        let mut write = 0;
+        for read in 0..self.ranges.len() {
+            let (min, max) = self.ranges[read];
+            if write > 0 && min <= self.ranges[write - 1].1.saturating_add(1) {
+                self.ranges[write - 1].1 = self.ranges[write - 1].1.max(max);
+            } else {
+                self.ranges[write] = (min, max);
+                write += 1;
+            }
+        }
+        self.ranges.truncate(write);
+        let ranges = &self.ranges;
+        self.exact_ids.retain(|id| !range_contains(ranges, *id));
+    }
+
+    fn contains(&self, id: i64) -> bool {
+        self.exact_ids.contains(&id) || range_contains(&self.ranges, id)
+    }
+}
+
+fn range_contains(ranges: &[(i64, i64)], id: i64) -> bool {
+    let index = ranges.partition_point(|&(min, _)| min <= id);
+    index > 0 && id <= ranges[index - 1].1
+}
+
 /// Split one causally consistent file-list snapshot into the compact ids sent
-/// to followers and the L0 provenance ranges used to suppress duplicate
-/// segment candidates. Keeping both projections from one query removes the
-/// previous second file-list query and prevents its result from drifting past
-/// the snapshot the query actually scans.
-pub fn split_snapshot_file_ids(snapshot: Vec<FileIdWithFile>) -> (Vec<FileId>, Vec<(i64, i64)>) {
+/// to followers and the L0 provenance coverage used to suppress duplicate
+/// segment candidates. Exact h2 coverage is intersected with the bounded
+/// candidate set while decoding, so accumulated file provenance cannot expand
+/// query-leader memory beyond [`MAX_QUERY_SEGMENTS`].
+pub fn split_snapshot_file_ids(
+    snapshot: Vec<FileIdWithFile>,
+    candidates: &[SegmentMeta],
+) -> (Vec<FileId>, L0Coverage) {
+    let mut candidate_ids = candidates.iter().map(|meta| meta.id).collect::<Vec<_>>();
+    candidate_ids.sort_unstable();
+    candidate_ids.dedup();
+
     let mut files = Vec::with_capacity(snapshot.len());
-    let mut l0_ranges = Vec::new();
+    let mut coverage = L0Coverage::default();
     for row in snapshot {
-        if let Some(range) = parse_l0_range(&row.file) {
-            l0_ranges.push(range);
+        if let Some(provenance) = parse_l0_provenance(&row.file) {
+            coverage.insert(provenance, &candidate_ids);
         }
         files.push(FileId {
             id: row.id,
@@ -612,7 +754,8 @@ pub fn split_snapshot_file_ids(snapshot: Vec<FileIdWithFile>) -> (Vec<FileId>, V
             deleted: row.deleted,
         });
     }
-    (files, l0_ranges)
+    coverage.compact();
+    (files, coverage)
 }
 
 /// Leader seam, phase 2 — runs AFTER the file_list snapshot is fetched:
@@ -624,14 +767,14 @@ pub fn append_surviving(
     stream_type: StreamType,
     stream_name: &str,
     candidates: Vec<SegmentMeta>,
-    l0_ranges: &[(i64, i64)],
+    l0_coverage: &L0Coverage,
     files: &mut Vec<FileId>,
 ) -> Result<()> {
     if candidates.is_empty() {
         return Ok(());
     }
 
-    let survivors = dedup_candidates(candidates, l0_ranges);
+    let survivors = dedup_candidates(candidates, l0_coverage);
     if survivors.is_empty() {
         return Ok(());
     }
@@ -642,9 +785,10 @@ pub fn append_surviving(
         )));
     }
     log::info!(
-        "[trace_id {trace_id}] segments_scan: {org_id}/{stream_type}/{stream_name} appending {} segments ({} L0 ranges deduped) to the file id list",
+        "[trace_id {trace_id}] segments_scan: {org_id}/{stream_type}/{stream_name} appending {} segments ({} L0 ranges and {} exact L0 ids in snapshot coverage) to the file id list",
         survivors.len(),
-        l0_ranges.len(),
+        l0_coverage.range_count(),
+        l0_coverage.exact_id_count(),
     );
     files.reserve(survivors.len());
     for meta in &survivors {
@@ -671,42 +815,16 @@ fn pseudo_file_id(meta: &SegmentMeta) -> Result<FileId> {
     })
 }
 
-/// Parse the `(minSegId, maxSegId)` provenance range out of an L0 file key.
-///
-/// Filenames match `l0_{uuid-or-multi}_{minSegId}_{maxSegId}_{n}` with any
-/// extension. The middle part may itself contain `_`, so the numeric fields
-/// are taken from the END. Returns `None` for anything that does not parse
-/// cleanly — an unparsable name must never suppress a segment (dup is
-/// recoverable, a gap is not).
-fn parse_l0_range(key: &str) -> Option<(i64, i64)> {
-    let name = key.rsplit('/').next()?;
-    let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name);
-    let rest = stem.strip_prefix("l0_")?;
-    let mut parts = rest.rsplit('_');
-    let _n: u64 = parts.next()?.parse().ok()?;
-    let max: i64 = parts.next()?.parse().ok()?;
-    let min: i64 = parts.next()?.parse().ok()?;
-    // at least the {uuid-or-multi} field must remain
-    parts.next()?;
-    if min < 1 || max < min {
-        return None;
-    }
-    Some((min, max))
-}
-
-/// Drop every candidate whose id falls inside any registered L0 range — its
-/// rows are already served by files the query scans.
-fn dedup_candidates(candidates: Vec<SegmentMeta>, l0_ranges: &[(i64, i64)]) -> Vec<SegmentMeta> {
-    if l0_ranges.is_empty() {
+/// Drop every candidate covered by registered L0 provenance — its rows are
+/// already served by files the query scans. Exact h2 ids are looked up in a
+/// hash set, so candidate checks allocate nothing and numeric gaps survive.
+fn dedup_candidates(candidates: Vec<SegmentMeta>, coverage: &L0Coverage) -> Vec<SegmentMeta> {
+    if coverage.is_empty() {
         return candidates;
     }
     candidates
         .into_iter()
-        .filter(|c| {
-            !l0_ranges
-                .iter()
-                .any(|&(min, max)| c.id >= min && c.id <= max)
-        })
+        .filter(|candidate| !coverage.contains(candidate.id))
         .collect()
 }
 
@@ -730,19 +848,41 @@ pub fn split_pseudo_ids(ids: &[i64]) -> (Vec<i64>, Vec<i64>) {
     (file_ids, segment_ids)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct SegmentTopNPlan {
+    limit: usize,
+    can_skip_segments: bool,
+}
+
+impl SegmentTopNPlan {
+    pub(super) fn exact_desc(limit: usize) -> Option<Self> {
+        (limit > 0).then_some(Self {
+            limit,
+            can_skip_segments: true,
+        })
+    }
+
+    pub(super) fn trim_only(limit: usize) -> Option<Self> {
+        (limit > 0).then_some(Self {
+            limit,
+            can_skip_segments: false,
+        })
+    }
+}
+
 /// Follower seam: scan this node's assigned segments and return tables the
 /// existing union/exec path consumes alongside the storage tables.
 ///
 /// Any failure — an id that no longer resolves, a fetch error, a decode
 /// error — fails the WHOLE query: a silently missing segment is silent
 /// partial data, the exact prod bug class this design exists to kill.
-pub async fn search(
+pub(super) async fn search(
     query: Arc<super::QueryParams>,
     schema: Arc<Schema>,
     plan_schema: Arc<Schema>,
     segment_ids: &[i64],
     sorted_by_time: bool,
-    limit: Option<usize>,
+    top_n_plan: Option<SegmentTopNPlan>,
     index_condition: Option<IndexCondition>,
     fst_fields: Vec<String>,
 ) -> Result<(Vec<Arc<dyn TableProvider>>, ScanStats)> {
@@ -769,18 +909,11 @@ pub async fn search(
     let mut metas = resolve_assigned(segment_ids, rows, &query.org_id, &query.stream_name)?;
     let cache_type = segment_cache_type(&metas);
 
-    // `ORDER BY _timestamp DESC LIMIT n` scans (the UI default) only ever
-    // read the n newest matching rows — a running top-n timestamp threshold
-    // trims kept batches down to candidates. Newest-first processing locks
-    // the threshold immediately, and (for unconditioned scans) whole
-    // segments older than it skip fetch/decode entirely.
-    let mut top_n = sorted_by_time
-        .then(|| {
-            limit
-                .filter(|&n| n > 0)
-                .map(|n| TopNTimestamps::new(n, query.time_range))
-        })
-        .flatten();
+    // `ORDER BY _timestamp DESC LIMIT n` scans keep a running threshold from
+    // in-window rows proven to satisfy the complete predicate. File metadata
+    // stays newest-first for admission, while completion is unordered to
+    // avoid a slow object blocking already-ready work.
+    let mut top_n = top_n_plan.map(|plan| TopNTimestamps::new(plan.limit, query.time_range));
     if top_n.is_some() {
         metas.sort_by_key(|m| Reverse(m.max_ts));
     }
@@ -810,12 +943,11 @@ pub async fn search(
     }
     needed_columns.insert(TIMESTAMP_COL_NAME.to_string());
 
-    // Fetch and decode are independent rolling stages. The old fixed waves
-    // waited for the slowest GET+decode before submitting any work from the
-    // next wave. Ordered top-n scans still consume results newest-first so
-    // their threshold remains effective, but `buffered` keeps later fetches
-    // and decodes in flight. Other scans use unordered completion to avoid
-    // head-of-line blocking entirely.
+    // Fetch and decode are independent, bounded, unordered rolling stages.
+    // Metas are admitted newest-first, but a slow head must not block later
+    // cache hits or completed decodes. The exact Top-N threshold is
+    // monotonic and order-independent; current and later stages recheck it
+    // before paying remote/cache work, blocking decode, or frame IPC decode.
     //
     // Byte permits cover active reads, queued objects, and blocking decodes.
     // The permit enters spawn_blocking so cancellation cannot release its
@@ -824,10 +956,7 @@ pub async fn search(
     let decode_concurrency = get_config().common.segment_scan_decode_concurrency.max(1);
     let fetch_budget_permits = segment_fetch_budget_permits();
     let fetch_budget = Arc::new(tokio::sync::Semaphore::new(fetch_budget_permits));
-    let ordered = top_n.is_some();
-    let can_skip_by_top_n = index_condition
-        .as_ref()
-        .is_none_or(|condition| condition.is_condition_all());
+    let can_skip_by_top_n = top_n_plan.is_some_and(|plan| plan.can_skip_segments);
     let top_n_threshold = Arc::new(AtomicI64::new(i64::MIN));
     let needed_columns = Arc::new(needed_columns);
     let scan_fst_fields = Arc::new(fst_fields.clone());
@@ -843,8 +972,8 @@ pub async fn search(
             let top_n_threshold = Arc::clone(&top_n_threshold);
             let org_id = metric_org_id.clone();
             async move {
-                if can_skip_by_top_n && meta.max_ts < top_n_threshold.load(Ordering::Acquire) {
-                    return Ok::<_, Error>(None);
+                if should_skip_by_top_n(can_skip_by_top_n, meta.max_ts, &top_n_threshold) {
+                    return Ok::<_, Error>(SegmentFetchWork::SkippedBeforeFetch);
                 }
                 let permit_count = segment_permits(meta.size, fetch_budget_permits);
                 let permit = fetch_budget
@@ -855,6 +984,10 @@ pub async fn search(
                             "[SEGMENT:SCAN] compressed-byte fetch budget closed".to_string(),
                         )
                     })?;
+                if should_skip_by_top_n(can_skip_by_top_n, meta.max_ts, &top_n_threshold) {
+                    drop(permit);
+                    return Ok(SegmentFetchWork::SkippedBeforeFetch);
+                }
                 let fetched = match fetch_segment(&meta, cache_type).await {
                     Ok(fetched) => {
                         record_segment_cache_outcome(
@@ -869,127 +1002,283 @@ pub async fn search(
                         return Err(err);
                     }
                 };
-                Ok(Some((meta, fetched, permit)))
+                Ok(SegmentFetchWork::Fetched {
+                    meta,
+                    fetched,
+                    permit,
+                })
             }
         }
     });
-    let fetched = rolling_stage(fetches, fetch_concurrency, ordered);
+    let channel_capacity = fetch_concurrency.max(decode_concurrency);
+    let (fetch_tx, fetch_rx) =
+        tokio::sync::mpsc::channel::<Result<SegmentFetchWork>>(channel_capacity);
+    let producer_trace_id = query.trace_id.clone();
+    let mut fetch_producer = AbortOnDrop::new(
+        tokio::spawn(async move {
+            let mut fetches = rolling_stage(fetches, fetch_concurrency);
+            while let Some(result) = fetches.next().await {
+                let failed = result.is_err();
+                if fetch_tx.send(result).await.is_err() {
+                    break;
+                }
+                if failed {
+                    break;
+                }
+            }
+            Ok::<_, Error>(())
+        }),
+        format!("{producer_trace_id}-segment-fetch"),
+    );
+    let fetched = futures::stream::unfold(fetch_rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    });
 
     let consumer_query = Arc::clone(&query);
+    let segment_plan_schema = Arc::clone(&schema);
     let decoded_tasks = fetched.map({
         let needed_columns = Arc::clone(&needed_columns);
         let scan_fst_fields = Arc::clone(&scan_fst_fields);
         let scan_condition = Arc::clone(&scan_condition);
+        let top_n_threshold = Arc::clone(&top_n_threshold);
+        let segment_plan_schema = Arc::clone(&segment_plan_schema);
         move |result| {
             let query = Arc::clone(&consumer_query);
             let needed_columns = Arc::clone(&needed_columns);
             let scan_fst_fields = Arc::clone(&scan_fst_fields);
             let scan_condition = Arc::clone(&scan_condition);
+            let top_n_threshold = Arc::clone(&top_n_threshold);
+            let segment_plan_schema = Arc::clone(&segment_plan_schema);
             async move {
-                let Some((meta, fetched, permit)) = result? else {
-                    return Ok::<_, Error>(None);
+                let SegmentFetchWork::Fetched {
+                    meta,
+                    fetched,
+                    permit,
+                } = result?
+                else {
+                    return Ok::<_, Error>(SegmentDecodeWork::SkippedBeforeFetch);
                 };
                 let (bytes, fetch_stats) = fetched.into_parts();
-                let object_key = meta.object_key.clone();
-                let submitted = Instant::now();
-                let (permit, blocking_queue, decode, scanned) =
-                    tokio::task::spawn_blocking(move || {
-                        let blocking_queue = submitted.elapsed();
-                        let decode_started = Instant::now();
-                        let scanned = scan_segment_object(
-                            &bytes,
-                            &query.org_id,
-                            query.stream_type,
-                            &query.stream_name,
-                            query.time_range,
-                            scan_condition.as_ref().as_ref(),
-                            &scan_fst_fields,
-                            &needed_columns,
+                if should_skip_by_top_n(
+                    can_skip_by_top_n,
+                    meta.max_ts,
+                    &top_n_threshold,
+                ) {
+                    drop(permit);
+                    return Ok(SegmentDecodeWork::SkippedBeforeDecode {
+                        fetch_stats,
+                        blocking_queue: Duration::ZERO,
+                    });
+                }
+                let decode_admission = Arc::clone(&SEGMENT_DECODE_ADMISSION)
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| {
+                        Error::Message(
+                            "[SEGMENT:SCAN] process-wide decode admission closed".to_string(),
                         )
-                        .map_err(|e| {
-                            Error::Message(format!(
-                                "[SEGMENT:SCAN] decode segment object {object_key} failed: {e:#}"
-                            ))
-                        });
-                        (
+                    })?;
+                let object_key = meta.object_key.clone();
+                let decode_task_name =
+                    format!("{}-segment-decode-{}", query.trace_id, meta.id);
+                let submitted = Instant::now();
+                let blocking_handle = tokio::task::spawn_blocking(move || {
+                    let _decode_admission = decode_admission;
+                    let blocking_queue = submitted.elapsed();
+                    if should_skip_by_top_n(
+                        can_skip_by_top_n,
+                        meta.max_ts,
+                        &top_n_threshold,
+                    ) {
+                        return (
                             permit,
                             blocking_queue,
-                            decode_started.elapsed(),
-                            scanned,
-                        )
-                    })
-                    .await
+                            Duration::ZERO,
+                            Ok::<_, Error>(None),
+                        );
+                    }
+                    let decode_started = Instant::now();
+                    let scanned = scan_segment_object(
+                        &bytes,
+                        &query.org_id,
+                        query.stream_type,
+                        &query.stream_name,
+                        query.time_range,
+                        scan_condition.as_ref().as_ref(),
+                        &segment_plan_schema,
+                        &scan_fst_fields,
+                        &needed_columns,
+                        can_skip_by_top_n.then_some(top_n_threshold.as_ref()),
+                    )
+                    .map(Some)
                     .map_err(|e| {
+                        Error::Message(format!(
+                            "[SEGMENT:SCAN] decode segment object {object_key} failed: {e:#}"
+                        ))
+                    });
+                    (
+                        permit,
+                        blocking_queue,
+                        decode_started.elapsed(),
+                        scanned,
+                    )
+                });
+                let mut blocking_decode = AbortOnDrop::new(blocking_handle, decode_task_name);
+                let (permit, blocking_queue, decode, scanned) =
+                    blocking_decode.join().await.map_err(|e| {
                         Error::Message(format!(
                             "[SEGMENT:SCAN] decode task for segment object {} (id {}) did not complete: {e}",
                             meta.object_key, meta.id
                         ))
                     })?;
-                Ok(Some((
+                let Some(scanned) = scanned? else {
+                    drop(permit);
+                    return Ok(SegmentDecodeWork::SkippedBeforeDecode {
+                        fetch_stats,
+                        blocking_queue,
+                    });
+                };
+                Ok(SegmentDecodeWork::Scanned {
                     fetch_stats,
                     permit,
                     blocking_queue,
                     decode,
-                    scanned?,
-                )))
+                    scanned,
+                })
             }
         }
     });
-    let mut decoded = rolling_stage(decoded_tasks, decode_concurrency, ordered);
+    let mut decoded = rolling_stage(decoded_tasks, decode_concurrency);
 
-    let mut kept_batches: Vec<RecordBatch> = Vec::new();
+    let mut kept_exact_batches: Vec<RecordBatch> = Vec::new();
+    let mut kept_deferred_batches: Vec<RecordBatch> = Vec::new();
+    let mut kept_exact_bytes: usize = 0;
+    let mut kept_deferred_bytes: usize = 0;
     let mut kept_bytes: usize = 0;
+    let mut soft_budget_warned = false;
     let (scan_soft_budget, scan_hard_ceiling) = segment_scan_budgets();
     let mut zero_yield_stream_absent = 0usize;
     let mut zero_yield_time_pruned = 0usize;
+    let mut zero_yield_top_n_pruned = 0usize;
     let mut timings = SegmentScanTimings::default();
-    let mut skipped_by_top_n: usize = 0;
+    let mut skipped_before_fetch = 0usize;
+    let mut skipped_before_decode = 0usize;
     while let Some(result) = decoded.next().await {
-        let Some((fetch_stats, permit, blocking_queue, decode, scanned)) = result? else {
-            skipped_by_top_n += 1;
-            continue;
+        let (fetch_stats, permit, blocking_queue, decode, scanned) = match result? {
+            SegmentDecodeWork::SkippedBeforeFetch => {
+                skipped_before_fetch += 1;
+                continue;
+            }
+            SegmentDecodeWork::SkippedBeforeDecode {
+                fetch_stats,
+                blocking_queue,
+            } => {
+                timings.record_fetch(&fetch_stats);
+                timings.record_decode(blocking_queue, Duration::ZERO);
+                scan_stats.compressed_size += fetch_stats.compressed_size;
+                skipped_before_decode += 1;
+                continue;
+            }
+            SegmentDecodeWork::Scanned {
+                fetch_stats,
+                permit,
+                blocking_queue,
+                decode,
+                scanned,
+            } => (fetch_stats, permit, blocking_queue, decode, scanned),
         };
         timings.record_fetch(&fetch_stats);
-        timings.record_decode(blocking_queue, decode);
+        timings.record_profiled_decode(blocking_queue, decode, &scanned);
         scan_stats.compressed_size += fetch_stats.compressed_size;
         drop(permit);
         scan_stats.records += scanned.rows_examined;
         if scanned.stream_frames == 0 {
             zero_yield_stream_absent += 1;
-        } else if scanned.rows_examined == 0 {
+        } else if scanned.time_frames == 0 {
             zero_yield_time_pruned += 1;
+        } else if scanned.rows_examined == 0 && scanned.top_n_skipped_frames == scanned.time_frames
+        {
+            zero_yield_top_n_pruned += 1;
         }
-        for (is_exact, batch) in scanned.kept {
-            // Only exact matches feed the top-n threshold. Batches retained
-            // for downstream condition evaluation must remain untrimmed.
-            let batch = if is_exact {
-                match top_n.as_mut() {
-                    Some(top) => match trim_batch_to_top_n(batch, top)? {
-                        Some(batch) => batch,
-                        None => continue,
-                    },
-                    None => batch,
+        let threshold_before = top_n.as_ref().and_then(TopNTimestamps::threshold);
+        if let Some(top) = top_n.as_mut() {
+            for (is_exact, batch) in &scanned.kept {
+                if *is_exact {
+                    top.observe_batch(batch);
                 }
-            } else {
-                batch
-            };
-            push_within_budget(
-                &mut kept_batches,
-                &mut kept_bytes,
-                batch,
-                scan_soft_budget,
-                scan_hard_ceiling,
-                &query.org_id,
-                query.stream_type,
-                &query.stream_name,
-            )?;
+            }
         }
-        if let Some(threshold) = top_n.as_ref().and_then(TopNTimestamps::threshold) {
+        let top_state = top_n.as_ref().and_then(|top| {
+            top.threshold()
+                .map(|threshold| (threshold, top.window, top.n))
+        });
+        let threshold_advanced = top_state
+            .is_some_and(|(threshold, ..)| threshold_before.is_none_or(|old| threshold > old));
+        let mut appended_exact = false;
+        for (is_exact, batch) in scanned.kept {
+            // All Exact rows were observed above before any materialized batch
+            // can trip the hard budget. Both classes may now discard rows
+            // below the established threshold; Exact boundary ties are
+            // globally capped below.
+            let batch = if let Some((threshold, window, limit)) = top_state {
+                trim_batch_to_threshold(batch, threshold, window, limit)?
+            } else {
+                Some(batch)
+            };
+            let Some(batch) = batch else {
+                continue;
+            };
+            if is_exact {
+                kept_exact_bytes = kept_exact_bytes.saturating_add(batch.size());
+                kept_exact_batches.push(batch);
+                appended_exact = true;
+            } else {
+                kept_deferred_bytes = kept_deferred_bytes.saturating_add(batch.size());
+                kept_deferred_batches.push(batch);
+            }
+        }
+        if let Some((threshold, window, limit)) = top_state {
+            if threshold_advanced || appended_exact {
+                compact_exact_top_n(
+                    &mut kept_exact_batches,
+                    &mut kept_exact_bytes,
+                    threshold,
+                    window,
+                    limit,
+                )?;
+            }
+            if threshold_advanced {
+                trim_deferred_top_n(
+                    &mut kept_deferred_batches,
+                    &mut kept_deferred_bytes,
+                    threshold,
+                    window,
+                    limit,
+                )?;
+            }
             top_n_threshold.store(threshold, Ordering::Release);
         }
+        kept_bytes = kept_exact_bytes.saturating_add(kept_deferred_bytes);
+        check_retained_budget(
+            kept_bytes,
+            &mut soft_budget_warned,
+            scan_soft_budget,
+            scan_hard_ceiling,
+            &query.org_id,
+            query.stream_type,
+            &query.stream_name,
+        )?;
         tokio::task::coop::consume_budget().await;
     }
+    fetch_producer
+        .join()
+        .await
+        .map_err(|e| Error::Message(format!("[SEGMENT:SCAN] fetch producer failed: {e}")))??;
+    let skipped_by_top_n = skipped_before_fetch + skipped_before_decode;
+    scan_stats.querier_files = (metas_len - skipped_before_fetch) as i64;
     timings.apply_cache_stats(&mut scan_stats);
+    let mut kept_batches = kept_exact_batches;
+    kept_batches.extend(kept_deferred_batches);
     // scan_size for the segment branch = the bytes the query actually HELD
     // after prune/project/trim (what the budget guarded). Summing decoded
     // batch capacities double-counted the shared IPC body buffer per batch
@@ -1027,11 +1316,35 @@ pub async fn search(
         timings.decode_max.as_millis(),
         load_start.elapsed().as_millis(),
     );
+    log::info!(
+        "[trace_id {trace_id}] segments_scan profile: skips before-fetch/decode {}/{}, zero-yield top-n objects {}, frames seen/stream/time/ipc/top-n-skipped {}/{}/{}/{}/{}, batches exact/whole/dropped {}/{}/{}, rows exact-after-condition/whole-retained {}/{}, phase_ms format sum/max {}/{}, condition sum/max {}/{}, projection sum/max {}/{}",
+        skipped_before_fetch,
+        skipped_before_decode,
+        zero_yield_top_n_pruned,
+        timings.frames_seen,
+        timings.stream_frames,
+        timings.time_frames,
+        timings.ipc_frames,
+        timings.top_n_skipped_frames,
+        timings.exact_batches,
+        timings.whole_batches,
+        timings.dropped_batches,
+        timings.exact_rows_after_condition,
+        timings.whole_rows_retained,
+        timings.format_sum.as_millis(),
+        timings.format_max.as_millis(),
+        timings.condition_sum.as_millis(),
+        timings.condition_max.as_millis(),
+        timings.projection_sum.as_millis(),
+        timings.projection_max.as_millis(),
+    );
 
     if kept_batches.is_empty() {
         return Ok((vec![], scan_stats));
     }
 
+    let kept_batch_count = kept_batches.len();
+    let table_build_start = Instant::now();
     let tables = build_tables_from_batches(
         trace_id,
         kept_batches,
@@ -1041,6 +1354,12 @@ pub async fn search(
         fst_fields,
         query.time_range,
     )?;
+    log::info!(
+        "[trace_id {trace_id}] segments_scan profile: table build {} batches -> {} tables took {} ms",
+        kept_batch_count,
+        tables.len(),
+        table_build_start.elapsed().as_millis(),
+    );
     Ok((tables, scan_stats))
 }
 /// Direct segment-WAL path for a no-filter histogram. Matching frames whose
@@ -1061,10 +1380,6 @@ pub async fn search_histogram(
     ts_offset: i64,
 ) -> Result<(Vec<u64>, ScanStats)> {
     let trace_id = &query.trace_id;
-    let mut histogram = vec![0u64; num_buckets];
-    if segment_ids.is_empty() {
-        return Ok((histogram, ScanStats::new()));
-    }
     if segment_ids.len() > MAX_QUERY_SEGMENTS {
         return Err(Error::Message(format!(
             "[SEGMENT:SCAN] {}/{}/{}: assigned {} segments exceed the per-query cap {MAX_QUERY_SEGMENTS}",
@@ -1073,6 +1388,30 @@ pub async fn search_histogram(
             query.stream_name,
             segment_ids.len()
         )));
+    }
+    ingester::check_memory_circuit_breaker().map_err(|e| Error::ResourceError(e.to_string()))?;
+    let histogram_bytes = num_buckets
+        .checked_mul(std::mem::size_of::<u64>())
+        .ok_or_else(|| {
+            Error::ResourceError(format!(
+                "[SEGMENT:SCAN] histogram grid with {num_buckets} buckets overflows addressable memory"
+            ))
+        })?;
+    let (_, hard_budget) = segment_scan_budgets();
+    if histogram_bytes > hard_budget {
+        return Err(Error::ResourceError(format!(
+            "[SEGMENT:SCAN] histogram grid requires {histogram_bytes} bytes for {num_buckets} buckets, exceeding the per-query hard budget {hard_budget} bytes"
+        )));
+    }
+    let mut histogram = Vec::new();
+    histogram.try_reserve_exact(num_buckets).map_err(|e| {
+        Error::ResourceError(format!(
+            "[SEGMENT:SCAN] failed to reserve {histogram_bytes} bytes for {num_buckets} histogram buckets: {e}"
+        ))
+    })?;
+    histogram.resize(num_buckets, 0u64);
+    if segment_ids.is_empty() {
+        return Ok((histogram, ScanStats::new()));
     }
     let load_start = std::time::Instant::now();
 
@@ -1084,16 +1423,14 @@ pub async fn search_histogram(
     scan_stats.files = metas.len() as i64;
     scan_stats.querier_files = scan_stats.files;
 
-    ingester::check_memory_circuit_breaker().map_err(|e| Error::ResourceError(e.to_string()))?;
-
     // Fetch and decode are separate bounded stages. The old fixed waves
     // waited for the slowest GET+decode before submitting any work from the
     // next wave, amplifying small-object latency. The channel keeps fetches
     // moving while at most `decode_concurrency` blocking tasks consume prior
     // results. Byte permits cover active reads, queued objects, and objects
     // being decoded, so higher fetch concurrency cannot grow memory without
-    // bound. Dropping either future cancels all async reads; only already
-    // running spawn_blocking calls (bounded by decode_concurrency) finish.
+    // bound. Queued blocking decodes abort on cancellation; already-running
+    // decodes are bounded process-wide by [`SEGMENT_DECODE_ADMISSION`].
     let fetch_concurrency = get_config().common.segment_scan_fetch_concurrency.max(1);
     let decode_concurrency = get_config().common.segment_scan_decode_concurrency.max(1);
     let fetch_budget_permits = segment_fetch_budget_permits();
@@ -1160,47 +1497,59 @@ pub async fn search_histogram(
                 async move {
                     let (meta, fetched, permit) = result?;
                     let (bytes, fetch_stats) = fetched.into_parts();
-                let object_key = meta.object_key.clone();
-                    let submitted = Instant::now();
-                    let (permit, blocking_queue, decode, scanned) =
-                        tokio::task::spawn_blocking(move || {
-                            // The permit enters the blocking closure so query
-                            // cancellation cannot release byte accounting
-                            // while an orphaned decode still retains `bytes`.
-                            let blocking_queue = submitted.elapsed();
-                            let decode_started = Instant::now();
-                            let scanned = scan_segment_histogram(
-                        &bytes,
-                                &query.org_id,
-                                query.stream_type,
-                                &query.stream_name,
-                                query.time_range,
-                        min_value,
-                        bucket_width,
-                        num_buckets,
-                        ts_offset,
-                    )
-                    .map_err(|e| {
-                        Error::Message(format!(
-                            "[SEGMENT:SCAN] decode segment object {object_key} failed: {e:#}"
-                        ))
-                            });
-                            (
-                                permit,
-                                blocking_queue,
-                                decode_started.elapsed(),
-                                scanned,
+                    let decode_admission = Arc::clone(&SEGMENT_DECODE_ADMISSION)
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| {
+                            Error::Message(
+                                "[SEGMENT:SCAN] process-wide decode admission closed".to_string(),
                             )
-                })
-                .await
-                .map_err(|e| {
-                    Error::Message(format!(
-                        "[SEGMENT:SCAN] decode task for segment object {} (id {}) did not complete: {e}",
-                        meta.object_key, meta.id
-                    ))
+                        })?;
+                    let object_key = meta.object_key.clone();
+                    let decode_task_name =
+                        format!("{}-segment-histogram-decode-{}", query.trace_id, meta.id);
+                    let submitted = Instant::now();
+                    let blocking_handle = tokio::task::spawn_blocking(move || {
+                        let _decode_admission = decode_admission;
+                        // The permit enters the blocking closure so query
+                        // cancellation cannot release byte accounting while a
+                        // running decode still retains `bytes`.
+                        let blocking_queue = submitted.elapsed();
+                        let decode_started = Instant::now();
+                        let scanned = scan_segment_histogram(
+                            &bytes,
+                            &query.org_id,
+                            query.stream_type,
+                            &query.stream_name,
+                            query.time_range,
+                            min_value,
+                            bucket_width,
+                            num_buckets,
+                            ts_offset,
+                        )
+                        .map_err(|e| {
+                            Error::Message(format!(
+                                "[SEGMENT:SCAN] decode segment object {object_key} failed: {e:#}"
+                            ))
+                        });
+                        (
+                            permit,
+                            blocking_queue,
+                            decode_started.elapsed(),
+                            scanned,
+                        )
+                    });
+                    let mut blocking_decode =
+                        AbortOnDrop::new(blocking_handle, decode_task_name);
+                    let (permit, blocking_queue, decode, scanned) =
+                        blocking_decode.join().await.map_err(|e| {
+                            Error::Message(format!(
+                                "[SEGMENT:SCAN] decode task for segment object {} (id {}) did not complete: {e}",
+                                meta.object_key, meta.id
+                            ))
                         })?;
                     Ok::<_, Error>((fetch_stats, permit, blocking_queue, decode, scanned?))
-            }
+                }
             })
             .buffer_unordered(decode_concurrency);
         futures::pin_mut!(decoded);
@@ -1213,7 +1562,12 @@ pub async fn search_histogram(
             scan_stats.compressed_size += fetch_stats.compressed_size;
             drop(permit);
             scan_stats.records += scanned.rows_examined;
-            for (total, count) in histogram.iter_mut().zip(scanned.histogram) {
+            for (bucket, count) in scanned.histogram {
+                let Some(total) = histogram.get_mut(bucket) else {
+                    return Err(Error::Message(format!(
+                        "[SEGMENT:SCAN] decoded histogram bucket {bucket} exceeds grid length {num_buckets}"
+                    )));
+                };
                 *total = total.checked_add(count).ok_or_else(|| {
                     Error::Message("[SEGMENT:SCAN] histogram count overflow".to_string())
                 })?;
@@ -1258,13 +1612,13 @@ pub async fn search_histogram(
 
 #[derive(Debug)]
 struct ScannedHistogram {
-    histogram: Vec<u64>,
+    histogram: HashMap<usize, u64>,
     rows_examined: i64,
     #[cfg(test)]
     decoded_frames: usize,
 }
 
-/// Consume one segment into fixed histogram counters. `decode_segment_filtered`
+/// Consume one segment into sparse histogram counters. `decode_segment_filtered`
 /// still walks and CRC-checks every frame; returning false merely avoids IPC
 /// parsing for irrelevant or whole-frame-folded data.
 #[allow(clippy::too_many_arguments)]
@@ -1291,7 +1645,7 @@ fn scan_segment_histogram(
         )?;
     }
 
-    let histogram = std::cell::RefCell::new(vec![0u64; num_buckets]);
+    let histogram = std::cell::RefCell::new(HashMap::<usize, u64>::new());
     let rows_examined = std::cell::Cell::new(0i64);
     let selector_error = std::cell::RefCell::new(None::<anyhow::Error>);
     #[cfg(test)]
@@ -1327,12 +1681,13 @@ fn scan_segment_histogram(
                 ) {
                     Ok(Some(bucket)) => {
                         let mut counts = histogram.borrow_mut();
-                        let Some(count) = counts[bucket].checked_add(u64::from(info.rows)) else {
+                        let count = counts.entry(bucket).or_default();
+                        let Some(next) = count.checked_add(u64::from(info.rows)) else {
                             *selector_error.borrow_mut() =
                                 Some(anyhow::anyhow!("segment histogram bucket count overflow"));
                             return false;
                         };
-                        counts[bucket] = count;
+                        *count = next;
                         return false;
                     }
                     Ok(None) => {}
@@ -1380,7 +1735,8 @@ fn scan_segment_histogram(
                     num_buckets,
                     ts_offset,
                 )? {
-                    counts[bucket] = counts[bucket].checked_add(1).ok_or_else(|| {
+                    let count = counts.entry(bucket).or_default();
+                    *count = count.checked_add(1).ok_or_else(|| {
                         anyhow::anyhow!("segment histogram bucket count overflow")
                     })?;
                 }
@@ -1431,6 +1787,28 @@ struct ScannedSegment {
     /// zero examined rows means its frames missed the query window
     /// (object-level time bounds are coarser than per-stream ones).
     stream_frames: i64,
+    frames_seen: u64,
+    time_frames: u64,
+    ipc_frames: u64,
+    top_n_skipped_frames: u64,
+    exact_batches: u64,
+    whole_batches: u64,
+    dropped_batches: u64,
+    exact_rows_after_condition: u64,
+    whole_rows_retained: u64,
+    condition_time: Duration,
+    projection_time: Duration,
+}
+
+fn predicate_data_types_equivalent(batch_type: &DataType, plan_type: &DataType) -> bool {
+    batch_type == plan_type
+        || (matches!(
+            batch_type,
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+        ) && matches!(
+            plan_type,
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+        ))
 }
 
 /// Streaming scan of one segment object: inspect each frame's stream identity
@@ -1445,58 +1823,95 @@ fn scan_segment_object(
     stream_name: &str,
     time_range: (i64, i64),
     condition: Option<&IndexCondition>,
+    plan_schema: &Schema,
     fst_fields: &[String],
     needed_columns: &HashSet<String>,
+    top_n_threshold: Option<&AtomicI64>,
 ) -> anyhow::Result<ScannedSegment> {
     let mut out = ScannedSegment {
         rows_examined: 0,
         kept: Vec::new(),
         stream_frames: 0,
+        frames_seen: 0,
+        time_frames: 0,
+        ipc_frames: 0,
+        top_n_skipped_frames: 0,
+        exact_batches: 0,
+        whole_batches: 0,
+        dropped_batches: 0,
+        exact_rows_after_condition: 0,
+        whole_rows_retained: 0,
+        condition_time: Duration::ZERO,
+        projection_time: Duration::ZERO,
     };
+    let mut frames_seen = 0u64;
     let mut stream_frames = 0i64;
+    let mut time_frames = 0u64;
+    let mut top_n_skipped_frames = 0u64;
     segment_wal::format::decode_segment_filtered(
         bytes,
         |info| {
+            frames_seen += 1;
             let identity =
                 info.org == org_id && info.stream_type == stream_type && info.stream == stream_name;
-            if identity {
-                stream_frames += 1;
+            if !identity {
+                return false;
             }
-            identity && frame_time_overlaps(info.min_ts, info.max_ts, time_range)
+            stream_frames += 1;
+            if !frame_time_overlaps_half_open(info.min_ts, info.max_ts, time_range) {
+                return false;
+            }
+            time_frames += 1;
+            if top_n_threshold
+                .is_some_and(|threshold| info.max_ts < threshold.load(Ordering::Acquire))
+            {
+                top_n_skipped_frames += 1;
+                return false;
+            }
+            true
         },
         |frame| {
+            out.ipc_frames += 1;
             let batch = frame.batch;
             if batch.num_rows() == 0 {
                 return Ok(());
             }
             out.rows_examined += batch.num_rows() as i64;
-            // rows the condition can never match must not count against the
-            // scan budget (see prune_batch_by_condition), nor columns the
-            // plan can never read (project_batch_to_needed)
-            match prune_batch_by_condition(batch, condition, fst_fields) {
-                PrunedBatch::Dropped => {}
+            // Evaluate only conjuncts whose write-time types match the latest
+            // plan semantics. Safe conjuncts still narrow mixed-schema
+            // batches; any deferred conjunct classifies survivors as Whole.
+            let condition_started = Instant::now();
+            let pruned = prune_batch_by_condition(batch, condition, fst_fields, Some(plan_schema));
+            out.condition_time += condition_started.elapsed();
+            match pruned {
+                PrunedBatch::Dropped => out.dropped_batches += 1,
                 PrunedBatch::Exact(batch) => {
+                    out.exact_batches += 1;
+                    out.exact_rows_after_condition += batch.num_rows() as u64;
+                    let projection_started = Instant::now();
                     let batch = project_batch_to_needed(batch, needed_columns)
                         .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    out.projection_time += projection_started.elapsed();
                     out.kept.push((true, batch));
                 }
                 PrunedBatch::Whole(batch) => {
+                    out.whole_batches += 1;
+                    out.whole_rows_retained += batch.num_rows() as u64;
+                    let projection_started = Instant::now();
                     let batch = project_batch_to_needed(batch, needed_columns)
                         .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    out.projection_time += projection_started.elapsed();
                     out.kept.push((false, batch));
                 }
             }
             Ok(())
         },
     )?;
+    out.frames_seen = frames_seen;
     out.stream_frames = stream_frames;
+    out.time_frames = time_frames;
+    out.top_n_skipped_frames = top_n_skipped_frames;
     Ok(out)
-}
-
-/// File-overlap time semantics; `(0, 0)` means unbounded.
-fn frame_time_overlaps(frame_min: i64, frame_max: i64, time_range: (i64, i64)) -> bool {
-    let (min_ts, max_ts) = time_range;
-    !((min_ts, max_ts) != (0, 0) && (frame_min > max_ts || frame_max < min_ts))
 }
 
 /// Resolve assigned segment ids against the listed rows; every id must
@@ -1559,6 +1974,7 @@ fn prune_batch_by_condition(
     batch: RecordBatch,
     condition: Option<&IndexCondition>,
     fst_fields: &[String],
+    plan_schema: Option<&Schema>,
 ) -> PrunedBatch {
     use datafusion::physical_plan::ColumnarValue;
     let Some(condition) = condition else {
@@ -1583,13 +1999,23 @@ fn prune_batch_by_condition(
     let mut evaluable: Vec<&Condition> = Vec::with_capacity(condition.conditions.len());
     let mut skipped_conjunct = false;
     for cond in &condition.conditions {
-        let all_present = cond
-            .get_schema_fields(fst_fields)
-            .iter()
-            .all(|field| schema.index_of(field).is_ok());
-        if all_present {
+        let fields = cond.get_schema_fields(fst_fields);
+        let all_present = fields.iter().all(|field| schema.index_of(field).is_ok());
+        let types_match = all_present
+            && plan_schema.is_none_or(|plan_schema| {
+                fields.iter().all(|field| {
+                    let Ok(batch_field) = schema.field_with_name(field) else {
+                        return false;
+                    };
+                    let Ok(plan_field) = plan_schema.field_with_name(field) else {
+                        return false;
+                    };
+                    predicate_data_types_equivalent(batch_field.data_type(), plan_field.data_type())
+                })
+            });
+        if types_match {
             evaluable.push(cond);
-        } else if conjunct_is_false_without_its_field(cond) {
+        } else if !all_present && fields.len() == 1 && conjunct_is_false_without_its_field(cond) {
             return PrunedBatch::Dropped;
         } else {
             skipped_conjunct = true;
@@ -1685,7 +2111,9 @@ impl TopNTimestamps {
         Self {
             n,
             window,
-            heap: BinaryHeap::with_capacity(n + 1),
+            // `LIMIT` is user-controlled and can be huge. Grow only with rows
+            // actually observed instead of reserving O(limit) up front.
+            heap: BinaryHeap::new(),
         }
     }
 
@@ -1696,10 +2124,18 @@ impl TopNTimestamps {
             .flatten()
     }
 
+    fn observe_batch(&mut self, batch: &RecordBatch) {
+        let Ok(ts_idx) = batch.schema().index_of(TIMESTAMP_COL_NAME) else {
+            return;
+        };
+        let Some(ts) = batch.column(ts_idx).as_any().downcast_ref::<Int64Array>() else {
+            return;
+        };
+        self.observe(ts);
+    }
     fn observe(&mut self, ts: &Int64Array) {
-        let (start, end) = self.window;
         for v in ts.iter().flatten() {
-            if v < start || v >= end {
+            if !timestamp_inside_half_open(v, self.window) {
                 continue;
             }
             if self.heap.len() < self.n {
@@ -1713,35 +2149,39 @@ impl TopNTimestamps {
 }
 
 /// Trim a batch of KNOWN condition matches down to rows that can still be
-/// in the top-n newest of the query window (in the closed window and
-/// `_timestamp >= threshold`; ties kept — the plan's own sort+limit
-/// resolves them). Returns `None` when nothing survives. Batches without
-/// a readable `_timestamp` column pass through whole (defensive; the
-/// writer refuses timestamp-less rows).
+/// in the top-n newest of the query's half-open window: `_timestamp >=
+/// threshold`. Ties stay; the plan's own sort+limit resolves them. Returns
+/// `None` when nothing survives. Batches without a readable `_timestamp`
+/// column pass through whole (defensive; the writer refuses
+/// timestamp-less rows).
+#[cfg(test)]
 fn trim_batch_to_top_n(
     batch: RecordBatch,
     top: &mut TopNTimestamps,
 ) -> Result<Option<RecordBatch>> {
-    let Ok(ts_idx) = batch.schema().index_of(TIMESTAMP_COL_NAME) else {
-        return Ok(Some(batch));
-    };
-    let Some(ts) = batch
-        .column(ts_idx)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .cloned()
-    else {
-        return Ok(Some(batch));
-    };
-    top.observe(&ts);
+    top.observe_batch(&batch);
     let Some(threshold) = top.threshold() else {
         return Ok(Some(batch));
     };
-    let (start, end) = top.window;
-    let mask = BooleanArray::from_iter(
-        ts.iter()
-            .map(|v| Some(v.is_some_and(|v| v >= start && v <= end && v >= threshold))),
-    );
+    trim_batch_to_threshold(batch, threshold, top.window, top.n)
+}
+
+fn trim_batch_to_threshold(
+    batch: RecordBatch,
+    threshold: i64,
+    window: (i64, i64),
+    limit: usize,
+) -> Result<Option<RecordBatch>> {
+    let Ok(ts_idx) = batch.schema().index_of(TIMESTAMP_COL_NAME) else {
+        return Ok(Some(batch));
+    };
+    let Some(ts) = batch.column(ts_idx).as_any().downcast_ref::<Int64Array>() else {
+        return Ok(Some(batch));
+    };
+    let (start, end) = window;
+    let mask = BooleanArray::from_iter(ts.iter().map(|v| {
+        Some(v.is_some_and(|v| (window == (0, 0) || (v >= start && v < end)) && v >= threshold))
+    }));
     if mask.true_count() == batch.num_rows() {
         return Ok(Some(batch));
     }
@@ -1749,10 +2189,101 @@ fn trim_batch_to_top_n(
         Ok(trimmed) if trimmed.num_rows() == 0 => Ok(None),
         Ok(trimmed) => Ok(Some(trimmed)),
         Err(e) => Err(Error::Message(format!(
-            "[SEGMENT:SCAN] trimming a segment batch to the top-{} newest rows failed: {e}",
-            top.n
+            "[SEGMENT:SCAN] trimming a segment batch to the top-{limit} newest rows failed: {e}"
         ))),
     }
+}
+
+fn compact_exact_top_n(
+    batches: &mut Vec<RecordBatch>,
+    bytes: &mut usize,
+    threshold: i64,
+    window: (i64, i64),
+    limit: usize,
+) -> Result<()> {
+    let (start, end) = window;
+    let in_window = |value: i64| window == (0, 0) || (value >= start && value < end);
+    let mut above_threshold = 0usize;
+    for batch in batches.iter() {
+        let Ok(ts_idx) = batch.schema().index_of(TIMESTAMP_COL_NAME) else {
+            continue;
+        };
+        let Some(ts) = batch.column(ts_idx).as_any().downcast_ref::<Int64Array>() else {
+            continue;
+        };
+        above_threshold = above_threshold.saturating_add(
+            ts.iter()
+                .flatten()
+                .filter(|value| in_window(*value) && *value > threshold)
+                .count(),
+        );
+    }
+    debug_assert!(above_threshold <= limit);
+    let mut ties_remaining = limit.saturating_sub(above_threshold);
+    let previous_batches = std::mem::take(batches);
+    *bytes = 0;
+    for batch in previous_batches {
+        let Ok(ts_idx) = batch.schema().index_of(TIMESTAMP_COL_NAME) else {
+            *bytes = bytes.saturating_add(batch.size());
+            batches.push(batch);
+            continue;
+        };
+        let Some(ts) = batch.column(ts_idx).as_any().downcast_ref::<Int64Array>() else {
+            *bytes = bytes.saturating_add(batch.size());
+            batches.push(batch);
+            continue;
+        };
+        let mask = BooleanArray::from_iter(ts.iter().map(|value| {
+            Some(value.is_some_and(|value| {
+                if !in_window(value) || value < threshold {
+                    return false;
+                }
+                if value > threshold {
+                    return true;
+                }
+                if ties_remaining == 0 {
+                    return false;
+                }
+                ties_remaining -= 1;
+                true
+            }))
+        }));
+        let batch = if mask.true_count() == batch.num_rows() {
+            batch
+        } else {
+            match arrow::compute::filter_record_batch(&batch, &mask) {
+                Ok(batch) if batch.num_rows() == 0 => continue,
+                Ok(batch) => batch,
+                Err(e) => {
+                    return Err(Error::Message(format!(
+                        "[SEGMENT:SCAN] compacting exact top-{limit} candidates failed: {e}"
+                    )));
+                }
+            }
+        };
+        *bytes = bytes.saturating_add(batch.size());
+        batches.push(batch);
+    }
+    Ok(())
+}
+
+fn trim_deferred_top_n(
+    batches: &mut Vec<RecordBatch>,
+    bytes: &mut usize,
+    threshold: i64,
+    window: (i64, i64),
+    limit: usize,
+) -> Result<()> {
+    let previous_batches = std::mem::take(batches);
+    *bytes = 0;
+    for batch in previous_batches {
+        let Some(batch) = trim_batch_to_threshold(batch, threshold, window, limit)? else {
+            continue;
+        };
+        *bytes = bytes.saturating_add(batch.size());
+        batches.push(batch);
+    }
+    Ok(())
 }
 
 /// Drop every column the query can never read, BEFORE the batch counts
@@ -1819,9 +2350,34 @@ fn project_batch_to_needed(batch: RecordBatch, needed: &HashSet<String>) -> Resu
 /// per accumulator and keeps going (recent-data queries must not fail on a
 /// busy stream); crossing the hard ceiling is an error, never a truncation
 /// (a capped-off subset would be silent partial data).
+fn check_retained_budget(
+    kept_bytes: usize,
+    soft_budget_warned: &mut bool,
+    soft_budget: usize,
+    hard_ceiling: usize,
+    org_id: &str,
+    stream_type: StreamType,
+    stream_name: &str,
+) -> Result<()> {
+    if kept_bytes > hard_ceiling {
+        return Err(Error::Message(format!(
+            "[SEGMENT:SCAN] {org_id}/{stream_type}/{stream_name}: this query materialized {kept_bytes} bytes of not-yet-sealed live data, past the hard per-query ceiling {hard_ceiling} (half the pod's memory limit) — narrow the time range, add filters on always-present fields, or select fewer columns"
+        )));
+    }
+    if soft_budget > 0 && !*soft_budget_warned && kept_bytes > soft_budget {
+        *soft_budget_warned = true;
+        log::warn!(
+            "[SEGMENT:SCAN] {org_id}/{stream_type}/{stream_name}: live-data scan passed the soft budget {soft_budget} bytes (ZO_SEGMENT_SCAN_MAX_BYTES) and continues — hard stop at {hard_ceiling}; consider a narrower time range, filters on always-present fields, or fewer columns"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn push_within_budget(
     kept: &mut Vec<RecordBatch>,
     kept_bytes: &mut usize,
+    soft_budget_warned: &mut bool,
     batch: RecordBatch,
     soft_budget: usize,
     hard_ceiling: usize,
@@ -1829,19 +2385,17 @@ fn push_within_budget(
     stream_type: StreamType,
     stream_name: &str,
 ) -> Result<()> {
-    let prev_bytes = *kept_bytes;
-    *kept_bytes = prev_bytes.saturating_add(batch.size());
-    if *kept_bytes > hard_ceiling {
-        return Err(Error::Message(format!(
-            "[SEGMENT:SCAN] {org_id}/{stream_type}/{stream_name}: this query materialized {} bytes of not-yet-sealed live data, past the hard per-query ceiling {hard_ceiling} (half the pod's memory limit) — narrow the time range, add filters on always-present fields, or select fewer columns",
-            *kept_bytes
-        )));
-    }
-    if soft_budget > 0 && prev_bytes <= soft_budget && *kept_bytes > soft_budget {
-        log::warn!(
-            "[SEGMENT:SCAN] {org_id}/{stream_type}/{stream_name}: live-data scan passed the soft budget {soft_budget} bytes (ZO_SEGMENT_SCAN_MAX_BYTES) and continues — hard stop at {hard_ceiling}; consider a narrower time range, filters on always-present fields, or fewer columns"
-        );
-    }
+    let next_bytes = kept_bytes.saturating_add(batch.size());
+    check_retained_budget(
+        next_bytes,
+        soft_budget_warned,
+        soft_budget,
+        hard_ceiling,
+        org_id,
+        stream_type,
+        stream_name,
+    )?;
+    *kept_bytes = next_bytes;
     kept.push(batch);
     Ok(())
 }
@@ -1949,66 +2503,146 @@ mod tests {
         assert_eq!(segment_permits(i64::MAX, usize::MAX), u32::MAX);
     }
 
+    #[test]
+    fn segment_top_n_plan_separates_exact_skip_from_trim_only() {
+        let exact = SegmentTopNPlan::exact_desc(1000).unwrap();
+        assert_eq!(exact.limit, 1000);
+        assert!(exact.can_skip_segments);
+
+        let trim_only = SegmentTopNPlan::trim_only(1000).unwrap();
+        assert_eq!(trim_only.limit, 1000);
+        assert!(!trim_only.can_skip_segments);
+
+        assert!(SegmentTopNPlan::exact_desc(0).is_none());
+        assert!(SegmentTopNPlan::trim_only(0).is_none());
+    }
+
+    #[test]
+    fn segment_top_n_skip_is_strict_and_proof_gated() {
+        let threshold = AtomicI64::new(100);
+        assert!(should_skip_by_top_n(true, 99, &threshold));
+        assert!(!should_skip_by_top_n(true, 100, &threshold));
+        assert!(!should_skip_by_top_n(true, 101, &threshold));
+        assert!(!should_skip_by_top_n(false, 99, &threshold));
+    }
+
+    #[test]
+    fn schema_mismatch_defers_only_the_unsafe_conjunct() {
+        assert!(!predicate_data_types_equivalent(
+            &DataType::Float64,
+            &DataType::Utf8,
+        ));
+        assert!(predicate_data_types_equivalent(
+            &DataType::Utf8View,
+            &DataType::Utf8,
+        ));
+
+        let raw_schema = Arc::new(Schema::new(vec![
+            arrow_schema::Field::new("_timestamp", DataType::Int64, false),
+            arrow_schema::Field::new("service", DataType::Utf8, true),
+            arrow_schema::Field::new("code", DataType::Float64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            raw_schema,
+            vec![
+                Arc::new(Int64Array::from(vec![3, 2, 1])),
+                Arc::new(StringArray::from(vec!["temporal", "other", "temporal"])),
+                Arc::new(arrow::array::Float64Array::from(vec![38.0, 38.0, 39.0])),
+            ],
+        )
+        .unwrap();
+        let plan = Schema::new(vec![
+            arrow_schema::Field::new("_timestamp", DataType::Int64, false),
+            arrow_schema::Field::new("service", DataType::Utf8, true),
+            arrow_schema::Field::new("code", DataType::Utf8, true),
+        ]);
+        let mut condition = IndexCondition::new();
+        condition.add_condition(Condition::Equal(
+            "service".to_string(),
+            "temporal".to_string(),
+        ));
+        condition.add_condition(Condition::Equal("code".to_string(), "38".to_string()));
+
+        let PrunedBatch::Whole(pruned) =
+            prune_batch_by_condition(batch, Some(&condition), &[], Some(&plan))
+        else {
+            panic!("type-mismatched code must defer while service still prunes");
+        };
+        assert_eq!(pruned.num_rows(), 2);
+    }
+
     #[tokio::test]
     async fn rolling_stage_refills_before_the_slowest_item_finishes() {
-        async fn assert_refills(ordered: bool) {
-            let gates = Arc::new(
-                (0..3)
-                    .map(|_| Arc::new(tokio::sync::Notify::new()))
-                    .collect::<Vec<_>>(),
-            );
-            let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
-            let work = futures::stream::iter(0..3).map({
-                let gates = Arc::clone(&gates);
-                move |index| {
-                    let gate = Arc::clone(&gates[index]);
-                    let started_tx = started_tx.clone();
-                    async move {
-                        started_tx.send(index).unwrap();
-                        gate.notified().await;
-                        index
-                    }
+        let gates = Arc::new(
+            (0..3)
+                .map(|_| Arc::new(tokio::sync::Notify::new()))
+                .collect::<Vec<_>>(),
+        );
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let work = futures::stream::iter(0..3).map({
+            let gates = Arc::clone(&gates);
+            move |index| {
+                let gate = Arc::clone(&gates[index]);
+                let started_tx = started_tx.clone();
+                async move {
+                    started_tx.send(index).unwrap();
+                    gate.notified().await;
+                    index
                 }
-            });
-            let collector = tokio::spawn(rolling_stage(work, 2, ordered).collect::<Vec<usize>>());
-
-            let mut first_two = Vec::with_capacity(2);
-            for _ in 0..2 {
-                first_two.push(
-                    tokio::time::timeout(std::time::Duration::from_secs(1), started_rx.recv())
-                        .await
-                        .unwrap_or_else(|_| {
-                            panic!("initial rolling-stage window did not fill; ordered={ordered}")
-                        })
-                        .expect("started channel closed"),
-                );
             }
-            first_two.sort_unstable();
-            assert_eq!(first_two, vec![0, 1]);
+        });
+        let collector = tokio::spawn(rolling_stage(work, 2).collect::<Vec<usize>>());
 
-            // Item 1 deliberately remains blocked. Completing item 0 must
-            // start item 2 immediately; fixed waves would wait for item 1.
-            gates[0].notify_one();
-            let third =
+        let mut first_two = Vec::with_capacity(2);
+        for _ in 0..2 {
+            first_two.push(
                 tokio::time::timeout(std::time::Duration::from_secs(1), started_rx.recv())
                     .await
-                    .unwrap_or_else(|_| {
-                        panic!(
-                            "rolling stage waited for its slowest peer before refilling; ordered={ordered}"
-                        )
-                    })
-                    .expect("started channel closed");
-            assert_eq!(third, 2);
-
-            gates[1].notify_one();
-            gates[2].notify_one();
-            let mut completed = collector.await.expect("collector task failed");
-            completed.sort_unstable();
-            assert_eq!(completed, vec![0, 1, 2]);
+                    .expect("initial rolling-stage window did not fill")
+                    .expect("started channel closed"),
+            );
         }
+        first_two.sort_unstable();
+        assert_eq!(first_two, vec![0, 1]);
 
-        assert_refills(true).await;
-        assert_refills(false).await;
+        // Item 1 deliberately remains blocked. Completing item 0 must start
+        // item 2 immediately; fixed waves would wait for item 1.
+        gates[0].notify_one();
+        let third = tokio::time::timeout(std::time::Duration::from_secs(1), started_rx.recv())
+            .await
+            .expect("rolling stage waited for its slowest peer before refilling")
+            .expect("started channel closed");
+        assert_eq!(third, 2);
+
+        gates[1].notify_one();
+        gates[2].notify_one();
+        let mut completed = collector.await.expect("collector task failed");
+        completed.sort_unstable();
+        assert_eq!(completed, vec![0, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn unordered_rolling_stage_yields_ready_work_behind_a_slow_head() {
+        let slow = Arc::new(tokio::sync::Notify::new());
+        let work = futures::stream::iter(0..2).map({
+            let slow = Arc::clone(&slow);
+            move |index| {
+                let slow = Arc::clone(&slow);
+                async move {
+                    if index == 0 {
+                        slow.notified().await;
+                    }
+                    index
+                }
+            }
+        });
+        let mut stage = rolling_stage(work, 2);
+        let first = tokio::time::timeout(Duration::from_secs(1), stage.next())
+            .await
+            .expect("ready work was blocked behind the slow head");
+        assert_eq!(first, Some(1));
+        slow.notify_one();
+        assert_eq!(stage.next().await, Some(0));
     }
 
     #[test]
@@ -2111,11 +2745,17 @@ mod tests {
         // matching rows survive as KNOWN matches, everything else pruned
         // before budgeting
         let PrunedBatch::Exact(pruned) =
-            prune_batch_by_condition(batch.clone(), Some(&condition), &[])
+            prune_batch_by_condition(batch.clone(), Some(&condition), &[], None)
         else {
             panic!("evaluated condition must yield Exact");
         };
         assert_eq!(pruned.num_rows(), 2);
+        let mut top = TopNTimestamps::new(2, (0, 10));
+        let pruned = trim_batch_to_top_n(pruned, &mut top)
+            .unwrap()
+            .expect("exact equality rows should seed top-n");
+        assert_eq!(pruned.num_rows(), 2);
+        assert_eq!(top.threshold(), Some(2));
 
         // a condition nothing matches drops the batch entirely
         let mut miss = IndexCondition::new();
@@ -2124,13 +2764,14 @@ mod tests {
             "absent-value".to_string(),
         ));
         assert!(matches!(
-            prune_batch_by_condition(batch.clone(), Some(&miss), &[]),
+            prune_batch_by_condition(batch.clone(), Some(&miss), &[], None),
             PrunedBatch::Dropped
         ));
 
         // no condition: trivially Exact (all rows "match"; full scans are
         // still budget-guarded)
-        let PrunedBatch::Exact(whole) = prune_batch_by_condition(batch.clone(), None, &[]) else {
+        let PrunedBatch::Exact(whole) = prune_batch_by_condition(batch.clone(), None, &[], None)
+        else {
             panic!("no condition must yield Exact");
         };
         assert_eq!(whole.num_rows(), 4);
@@ -2151,7 +2792,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            prune_batch_by_condition(no_col.clone(), Some(&condition), &[]),
+            prune_batch_by_condition(no_col.clone(), Some(&condition), &[], None),
             PrunedBatch::Dropped
         ));
 
@@ -2161,7 +2802,7 @@ mod tests {
         let mut is_null = IndexCondition::new();
         is_null.add_condition(Condition::IsNull("trace_id".to_string()));
         let PrunedBatch::Whole(kept) =
-            prune_batch_by_condition(no_col.clone(), Some(&is_null), &[])
+            prune_batch_by_condition(no_col.clone(), Some(&is_null), &[], None)
         else {
             panic!("IS NULL on an absent field must stay Whole");
         };
@@ -2176,7 +2817,7 @@ mod tests {
             true,
         ));
         assert!(matches!(
-            prune_batch_by_condition(no_col, Some(&not_in), &[]),
+            prune_batch_by_condition(no_col, Some(&not_in), &[], None),
             PrunedBatch::Whole(_)
         ));
     }
@@ -2213,7 +2854,8 @@ mod tests {
             "temporal".to_string(),
         ));
         cond.add_condition(Condition::IsNull("wf_task_queue_name".to_string()));
-        let PrunedBatch::Whole(kept) = prune_batch_by_condition(batch.clone(), Some(&cond), &[])
+        let PrunedBatch::Whole(kept) =
+            prune_batch_by_condition(batch.clone(), Some(&cond), &[], None)
         else {
             panic!("partially evaluated condition must yield Whole");
         };
@@ -2227,7 +2869,7 @@ mod tests {
         ));
         cond_miss.add_condition(Condition::IsNull("wf_task_queue_name".to_string()));
         assert!(matches!(
-            prune_batch_by_condition(batch.clone(), Some(&cond_miss), &[]),
+            prune_batch_by_condition(batch.clone(), Some(&cond_miss), &[], None),
             PrunedBatch::Dropped
         ));
 
@@ -2245,7 +2887,7 @@ mod tests {
             "q1".to_string(),
         ));
         assert!(matches!(
-            prune_batch_by_condition(batch, Some(&cond_drop), &[]),
+            prune_batch_by_condition(batch, Some(&cond_drop), &[], None),
             PrunedBatch::Dropped
         ));
     }
@@ -2288,16 +2930,18 @@ mod tests {
         let budget = 64 * 1024; // far below one raw batch
         let mut kept = Vec::new();
         let mut kept_bytes = 0usize;
+        let mut soft_budget_warned = false;
         for needle_rows in [1usize, 2, 0] {
             let batch = make_batch(needle_rows);
             assert!(batch.get_array_memory_size() > budget, "test premise");
-            let batch = match prune_batch_by_condition(batch, Some(&condition), &[]) {
+            let batch = match prune_batch_by_condition(batch, Some(&condition), &[], None) {
                 PrunedBatch::Exact(b) | PrunedBatch::Whole(b) => b,
                 PrunedBatch::Dropped => continue,
             };
             push_within_budget(
                 &mut kept,
                 &mut kept_bytes,
+                &mut soft_budget_warned,
                 batch,
                 0,
                 budget,
@@ -2356,9 +3000,11 @@ mod tests {
         let budget = whole_size - 1;
         let mut kept = Vec::new();
         let mut kept_bytes = 0usize;
+        let mut soft_budget_warned = false;
         push_within_budget(
             &mut kept,
             &mut kept_bytes,
+            &mut soft_budget_warned,
             projected,
             0,
             budget,
@@ -2477,6 +3123,17 @@ mod tests {
             )
             .unwrap()
         };
+        let huge_limit = TopNTimestamps::new(usize::MAX, (0, i64::MAX));
+        assert_eq!(
+            huge_limit.heap.capacity(),
+            0,
+            "a user-controlled LIMIT must not reserve its capacity eagerly"
+        );
+        assert!(
+            !frame_time_overlaps_half_open(10, 10, (0, 10)),
+            "a frame beginning at the exclusive query end must not be decoded"
+        );
+        assert!(frame_time_overlaps_half_open(9, 10, (0, 10)));
         let mut top = TopNTimestamps::new(3, (0, i64::MAX));
 
         // newest segment first (the loop sorts metas by max_ts desc):
@@ -2546,6 +3203,93 @@ mod tests {
         let ts_old = Int64Array::from(vec![10i64, 20, 150]);
         older.observe(&ts_old);
         assert_eq!(older.threshold(), None, "only one in-window row observed");
+
+        let mut unbounded = TopNTimestamps::new(2, (0, 0));
+        unbounded.observe(&Int64Array::from(vec![-10, 20, 30]));
+        assert_eq!(
+            unbounded.threshold(),
+            Some(20),
+            "(0,0) follows the segment convention of an unbounded window",
+        );
+
+        let retrimmed = trim_batch_to_threshold(make((100..110).collect()), 108, (0, 0), 3)
+            .unwrap()
+            .expect("final threshold keeps its newest superset");
+        assert_eq!(retrimmed.num_rows(), 2);
+
+        let mut batches = vec![make((100..110).collect()), make((200..210).collect())];
+        let mut bytes = batches.iter().map(|batch| batch.size()).sum();
+        compact_exact_top_n(&mut batches, &mut bytes, 200, (0, 0), 10).unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 10);
+        let kept_ts = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert!(kept_ts.iter().flatten().all(|value| value >= 200));
+        let mut warned = false;
+        check_retained_budget(
+            bytes,
+            &mut warned,
+            0,
+            bytes,
+            "org",
+            StreamType::Traces,
+            "default",
+        )
+        .unwrap();
+
+        let mut deferred_batches = vec![make(vec![1, 2, 199, 200, 300])];
+        let mut deferred_bytes = deferred_batches[0].size();
+        trim_deferred_top_n(&mut deferred_batches, &mut deferred_bytes, 200, (0, 0), 10).unwrap();
+        let deferred_ts = deferred_batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values();
+        assert_eq!(
+            deferred_ts,
+            &[200, 300],
+            "a deferred condition batch keeps the threshold superset but drops obsolete rows"
+        );
+
+        let mut boundary_batches = vec![make(vec![5, 4, 10])];
+        let mut boundary_bytes = boundary_batches[0].size();
+        compact_exact_top_n(&mut boundary_batches, &mut boundary_bytes, 4, (0, 10), 2).unwrap();
+        let boundary_ts = boundary_batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values();
+
+        let mut stable_threshold_batches = vec![make(vec![101, 100, 100]), make(vec![200])];
+        let mut stable_threshold_bytes =
+            stable_threshold_batches.iter().map(RecordBatch::size).sum();
+        compact_exact_top_n(
+            &mut stable_threshold_batches,
+            &mut stable_threshold_bytes,
+            100,
+            (0, 0),
+            3,
+        )
+        .unwrap();
+        let mut stable_ts = stable_threshold_batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .iter()
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        stable_ts.sort_unstable();
+        assert_eq!(stable_ts, vec![100, 101, 200]);
+        assert_eq!(boundary_ts, &[5, 4]);
     }
 
     /// End-to-end shape of the fix: wide star batches stream oldest-last
@@ -2574,6 +3318,7 @@ mod tests {
         let mut top = TopNTimestamps::new(10, (0, i64::MAX));
         let mut kept = Vec::new();
         let mut kept_bytes = 0usize;
+        let mut soft_budget_warned = false;
         // 20 segments x 5000 rows, newest first; untrimmed this is ~28MB
         for seg in (0..20).rev() {
             let batch = make_batch(seg * 5_000, 5_000);
@@ -2584,6 +3329,7 @@ mod tests {
             push_within_budget(
                 &mut kept,
                 &mut kept_bytes,
+                &mut soft_budget_warned,
                 batch,
                 0,
                 budget,
@@ -2665,121 +3411,77 @@ mod tests {
         }
     }
 
-    // ---- provenance parsing ----
+    // ---- provenance dedup rule ----
 
     #[test]
-    fn parse_l0_range_valid_forms() {
-        // plain uuid middle, .vix extension, nested path
-        assert_eq!(
-            parse_l0_range(
-                "files/org1/logs/app1/2026/07/31/10/l0_7f9c24e5-1a2b-4c3d-8e9f-000000000001_2_9_3.vix"
-            ),
-            Some((2, 9))
-        );
-        // "multi" middle, other extension — extension-agnostic
-        assert_eq!(
-            parse_l0_range("files/o/logs/s/l0_multi_10_10_1.parquet"),
-            Some((10, 10))
-        );
-        // no extension at all
-        assert_eq!(parse_l0_range("l0_multi_5_7_2"), Some((5, 7)));
-        // middle containing underscores parses from the END
-        assert_eq!(
-            parse_l0_range("l0_node_a_b_100_200_4.vix"),
-            Some((100, 200))
-        );
-        // large ids
-        assert_eq!(
-            parse_l0_range("l0_x_9223372036854775806_9223372036854775807_1.vix"),
-            Some((9223372036854775806, 9223372036854775807))
-        );
-    }
-
-    #[test]
-    fn parse_l0_range_rejects_junk_without_panicking() {
-        for key in [
-            "",
-            "/",
-            "files/o/logs/s/1234.parquet",    // not l0_
-            "files/o/logs/s/al0_x_1_2_3.vix", // prefix not at start
-            "l0_2_9_3.vix",                   // missing uuid-or-multi field
-            "l0_x_2_9.vix",                   // missing {n}
-            "l0_x_a_9_3.vix",                 // non-numeric min
-            "l0_x_2_b_3.vix",                 // non-numeric max
-            "l0_x_2_9_c.vix",                 // non-numeric n
-            "l0_x_9_2_3.vix",                 // min > max
-            "l0_x_0_9_3.vix",                 // min < 1 (ids are >= 1)
-            "l0_x_-5_9_3.vix",                // negative min
-            "l0_x_2_9_3.",                    // trailing dot only
-            "l0__2_9_3",                      // empty middle is still a field
-        ] {
-            let got = parse_l0_range(key);
-            match key {
-                // empty middle part is tolerated shape-wise: 5 fields present
-                "l0__2_9_3" => assert_eq!(got, Some((2, 9)), "key {key:?}"),
-                "l0_x_2_9_3." => assert_eq!(got, Some((2, 9)), "key {key:?}"),
-                _ => assert_eq!(got, None, "key {key:?} must not parse"),
-            }
-        }
-    }
-
-    // ---- dedup rule ----
-
-    #[test]
-    fn dedup_drops_inside_keeps_outside_multiple_ranges() {
-        let candidates = vec![
-            seg_meta(1, 0, 10),
-            seg_meta(2, 0, 10), // == min of [2,9] -> dropped
-            seg_meta(5, 0, 10), // inside [2,9] -> dropped
-            seg_meta(9, 0, 10), // == max of [2,9] -> dropped
-            seg_meta(10, 0, 10),
-            seg_meta(15, 0, 10), // inside [15,15] -> dropped
-            seg_meta(16, 0, 10),
-        ];
-        let ranges = vec![(2, 9), (15, 15)];
-        let survivors = dedup_candidates(candidates, &ranges);
-        assert_eq!(
-            survivors.iter().map(|m| m.id).collect::<Vec<_>>(),
-            vec![1, 10, 16]
-        );
-    }
-
-    #[test]
-    fn dedup_with_no_ranges_keeps_everything() {
-        let candidates = vec![seg_meta(1, 0, 10), seg_meta(2, 0, 10)];
-        let survivors = dedup_candidates(candidates, &[]);
-        assert_eq!(survivors.len(), 2);
-    }
-
-    #[test]
-    fn snapshot_projection_keeps_ids_and_l0_ranges_from_the_same_rows() {
+    fn dedup_drops_legacy_ranges_but_only_exact_h2_ids() {
+        let candidates = [1, 2, 5, 9, 10, 20, 21, 22, 30, 31, 32]
+            .into_iter()
+            .map(|id| seg_meta(id, 0, 10))
+            .collect::<Vec<_>>();
+        let token = infra::l0_provenance::encode_exact_ids(&[20, 22, 99]).unwrap();
         let snapshot = vec![
             FileIdWithFile {
                 id: 100,
-                file: "files/o/logs/s/l0_u_2_9_3.vix".to_string(),
+                file: "files/o/logs/s/l0_h1_node_a_2_9_3.vix".to_string(),
                 records: 11,
                 original_size: 101,
                 deleted: false,
             },
             FileIdWithFile {
                 id: 101,
-                file: "files/o/logs/s/plain_file.parquet".to_string(),
+                file: format!("files/o/logs/s/l0_h2_{token}_3.vix"),
                 records: 12,
                 original_size: 102,
                 deleted: true,
             },
+            FileIdWithFile {
+                id: 102,
+                // A malformed h2 key must never suppress its apparent range.
+                file: "files/o/logs/s/l0_h2_30_32_3.vix".to_string(),
+                records: 13,
+                original_size: 103,
+                deleted: false,
+            },
         ];
-        let (files, ranges) = split_snapshot_file_ids(snapshot);
-        assert_eq!(ranges, vec![(2, 9)]);
-        assert_eq!(files.len(), 2);
+        let (files, coverage) = split_snapshot_file_ids(snapshot, &candidates);
+        assert_eq!(coverage.range_count(), 1);
+        assert_eq!(coverage.exact_id_count(), 2);
+        assert_eq!(files.len(), 3);
         assert_eq!(files[0].id, 100);
         assert_eq!(files[0].records, 11);
         assert_eq!(files[0].original_size, 101);
         assert!(!files[0].deleted);
-        assert_eq!(files[1].id, 101);
-        assert_eq!(files[1].records, 12);
-        assert_eq!(files[1].original_size, 102);
         assert!(files[1].deleted);
+
+        let survivors = dedup_candidates(candidates, &coverage);
+        assert_eq!(
+            survivors.iter().map(|meta| meta.id).collect::<Vec<_>>(),
+            vec![1, 10, 21, 30, 31, 32]
+        );
+    }
+
+    #[test]
+    fn coverage_compacts_ranges_and_exact_ids_already_inside_them() {
+        let mut coverage = L0Coverage::default();
+        let candidate_ids = [3, 9];
+        coverage.insert(L0Provenance::Range(5, 7), &candidate_ids);
+        coverage.insert(L0Provenance::Range(1, 4), &candidate_ids);
+        coverage.insert(L0Provenance::Exact(vec![3, 9]), &candidate_ids);
+        coverage.compact();
+        assert_eq!(coverage.range_count(), 1);
+        assert_eq!(coverage.exact_id_count(), 1);
+        assert!(coverage.contains(1));
+        assert!(coverage.contains(7));
+        assert!(!coverage.contains(8));
+        assert!(coverage.contains(9));
+    }
+
+    #[test]
+    fn dedup_with_empty_coverage_keeps_everything() {
+        let candidates = vec![seg_meta(1, 0, 10), seg_meta(2, 0, 10)];
+        let survivors = dedup_candidates(candidates, &L0Coverage::default());
+        assert_eq!(survivors.len(), 2);
     }
 
     // ---- pseudo id transport ----
@@ -2950,8 +3652,71 @@ mod tests {
         needed: &[&str],
     ) -> ScannedSegment {
         let needed: HashSet<String> = needed.iter().map(|s| s.to_string()).collect();
-        scan_segment_object(encoded, org, stype, stream, range, None, &[], &needed)
-            .expect("scan segment")
+        scan_segment_object(
+            encoded,
+            org,
+            stype,
+            stream,
+            range,
+            None,
+            &Schema::empty(),
+            &[],
+            &needed,
+            None,
+        )
+        .expect("scan segment")
+    }
+
+    #[test]
+    fn exact_top_n_threshold_skips_old_frame_before_ipc_decode() {
+        let header = SegmentHeader {
+            node_uuid: "node-top-n-frame-skip".to_string(),
+            seq: 1,
+            created_at: 1_700_000_000_000_000,
+        };
+        let frames = vec![
+            frame(
+                "org1",
+                StreamType::Traces,
+                "default",
+                100,
+                109,
+                ts_batch("value", &[100, 109], Some(&[1, 2])),
+            ),
+            frame(
+                "org1",
+                StreamType::Traces,
+                "default",
+                200,
+                209,
+                ts_batch("value", &[200, 209], Some(&[3, 4])),
+            ),
+        ];
+        let encoded = encode_segment(&header, &frames).unwrap();
+        let needed = HashSet::from_iter(["_timestamp".to_string(), "value".to_string()]);
+        let threshold = AtomicI64::new(150);
+        let scanned = scan_segment_object(
+            &encoded,
+            "org1",
+            StreamType::Traces,
+            "default",
+            (0, i64::MAX),
+            None,
+            &Schema::empty(),
+            &[],
+            &needed,
+            Some(&threshold),
+        )
+        .unwrap();
+
+        assert_eq!(scanned.frames_seen, 2);
+        assert_eq!(scanned.stream_frames, 2);
+        assert_eq!(scanned.time_frames, 2);
+        assert_eq!(scanned.top_n_skipped_frames, 1);
+        assert_eq!(scanned.ipc_frames, 1);
+        assert_eq!(scanned.rows_examined, 2);
+        assert_eq!(scanned.exact_rows_after_condition, 2);
+        assert_eq!(scanned.whole_rows_retained, 0);
     }
     #[test]
     fn histogram_filters_stream_and_window_and_folds_single_bucket_frames() {
@@ -3016,7 +3781,7 @@ mod tests {
         )
         .expect("scan histogram");
 
-        assert_eq!(scanned.histogram, vec![3, 0, 0]);
+        assert_eq!(scanned.histogram, HashMap::from([(0, 3)]));
         assert_eq!(
             scanned.rows_examined, 3,
             "foreign and out-of-window frame rows do not enter scan stats"
@@ -3079,7 +3844,7 @@ mod tests {
 
         assert_eq!(
             scanned.histogram,
-            vec![2, 1, 1],
+            HashMap::from([(0, 2), (1, 1), (2, 1)]),
             "100+109, 110, and 129 count once; 90 and the exclusive end 130 drop"
         );
         assert_eq!(
@@ -3128,7 +3893,7 @@ mod tests {
         )
         .expect("scan histogram");
 
-        assert_eq!(scanned.histogram, vec![2, 1]);
+        assert_eq!(scanned.histogram, HashMap::from([(0, 2), (1, 1)]));
         assert_eq!(scanned.rows_examined, 3);
         assert_eq!(
             scanned.decoded_frames, 0,
@@ -3279,12 +4044,14 @@ mod tests {
     fn push_within_budget_rejects_over_budget_and_keeps_nothing_extra() {
         let mut kept: Vec<RecordBatch> = Vec::new();
         let mut kept_bytes = 0usize;
+        let mut soft_budget_warned = false;
         let first = ts_batch("v", &[1, 2], Some(&[1, 2]));
         // budget admits exactly the first batch (exceed is strictly greater)
         let budget = first.size();
         push_within_budget(
             &mut kept,
             &mut kept_bytes,
+            &mut soft_budget_warned,
             first,
             0,
             budget,
@@ -3299,6 +4066,7 @@ mod tests {
         let err = push_within_budget(
             &mut kept,
             &mut kept_bytes,
+            &mut soft_budget_warned,
             ts_batch("v", &[3], Some(&[3])),
             0,
             budget,
@@ -3322,12 +4090,14 @@ mod tests {
     fn push_within_budget_soft_crossing_keeps_the_batch_and_continues() {
         let mut kept: Vec<RecordBatch> = Vec::new();
         let mut kept_bytes = 0usize;
+        let mut soft_budget_warned = false;
         let first = ts_batch("v", &[1, 2], Some(&[1, 2]));
         let soft = first.size(); // second push crosses the soft line
         for i in 0..3i64 {
             push_within_budget(
                 &mut kept,
                 &mut kept_bytes,
+                &mut soft_budget_warned,
                 ts_batch("v", &[i], Some(&[i])),
                 soft,
                 usize::MAX,
@@ -3340,6 +4110,7 @@ mod tests {
         push_within_budget(
             &mut kept,
             &mut kept_bytes,
+            &mut soft_budget_warned,
             first,
             soft,
             usize::MAX,
@@ -3496,8 +4267,10 @@ mod tests {
             "app1",
             (0, 0),
             None,
+            &Schema::empty(),
             &[],
             &needed,
+            None,
         )
         .unwrap_err();
         let msg = format!("{err:#}");

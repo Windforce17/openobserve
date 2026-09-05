@@ -60,10 +60,7 @@ fn main() -> anyhow::Result<()> {
             }
             match available.get(name) {
                 None => {
-                    available.insert(
-                        name.to_string(),
-                        (field.data_type().clone(), path.clone()),
-                    );
+                    available.insert(name.to_string(), (field.data_type().clone(), path.clone()));
                 }
                 Some((seen, first_file)) if seen != field.data_type() => {
                     flips += 1;

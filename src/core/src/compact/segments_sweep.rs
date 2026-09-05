@@ -484,7 +484,7 @@ where
                     // (sidecars have no file_list row of their own). Skipped
                     // when this key's data delete failed (the retry pass
                     // covers both).
-                    if !key_failed && let Some(sidecar) = config::vix_sidecar_key(key) {
+                    if !key_failed && let Some(sidecar) = config::vix_sidecar_key(key, 0) {
                         match delete_object(sidecar.clone()).await {
                             Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
                             Err(e) => {

@@ -37,19 +37,22 @@ pub(super) fn partition_vix_files(
     }
 }
 
-/// First wave size for [`best_first_waves`]: small enough that the common
-/// "newest files satisfy the limit" query touches a handful of files, with
-/// doubling keeping the worst case (a filter that never satisfies the
-/// limit) at O(log) sequential rounds over the old single-round layout.
-const FIRST_WAVE_SIZE: usize = 4;
+/// First wave size for [`best_first_waves`]. A 64-file wave lets deployments
+/// configured for 64-way VIX evaluation issue cold sidecar range reads
+/// immediately instead of serializing behind the former 4 → 8 → 16 ramp.
+/// This deliberately trades extra speculative reads in the common
+/// one-file-hit case for lower latency; the node-wide fetch gate still bounds
+/// aggregate object-store pressure.
+const FIRST_WAVE_SIZE: usize = 64;
 
 /// Best-first waves for the timestamp-ordered LIMIT shape (`SimpleSelect`):
 /// files sorted so the ones that can hold the best-ranked rows come first —
 /// by `max_ts` descending for `ORDER BY _timestamp DESC`, by `min_ts`
-/// ascending for ASC — then chunked into geometrically growing waves
-/// (doubling from [`FIRST_WAVE_SIZE`] up to `target_partitions`). Waves
-/// execute strictly in order and the pruner's early stop fires after the
-/// first wave whose candidates already outrank every remaining file.
+/// ascending for ASC — then chunked into waves starting at
+/// [`FIRST_WAVE_SIZE`] and growing up to
+/// `max(target_partitions, FIRST_WAVE_SIZE)`. Waves execute strictly in order
+/// and the pruner's early stop fires after the first wave
+/// whose candidates already outrank every remaining file.
 ///
 /// Overlapping file ranges only weaken the prune bound (the suffix fold in
 /// `group_suffix_bounds` stays correct); the former time-partition
@@ -107,41 +110,35 @@ mod tests {
         }
     }
 
-    fn keys(groups: &[Vec<FileKey>]) -> Vec<Vec<String>> {
-        groups
-            .iter()
-            .map(|group| group.iter().map(|file| file.key.clone()).collect())
-            .collect()
-    }
-
     #[test]
-    fn desc_waves_are_newest_first_and_double() {
-        let files: Vec<FileKey> = (0..20)
+    fn desc_waves_start_at_64_and_double() {
+        let files: Vec<FileKey> = (0..200)
             .map(|i| create_file_key(i * 10 + 1, i * 10 + 10))
             .collect();
         let groups = partition_vix_files(
             files.clone(),
             &Some(IndexOptimizeMode::SimpleSelect(10, false)),
-            8,
+            128,
         );
-        // sizes: 4, then 8 (doubled, capped at target_partitions), then 8
         assert_eq!(
             groups.iter().map(Vec::len).collect::<Vec<_>>(),
-            vec![4, 8, 8]
+            vec![64, 128, 8]
         );
-        // wave 0 holds the four newest files, newest first
-        assert_eq!(
-            keys(&groups)[0],
-            vec![
-                "file_191_200",
-                "file_181_190",
-                "file_171_180",
-                "file_161_170"
-            ]
-        );
-        // nothing lost or duplicated
+        assert_eq!(groups[0].first().unwrap().key, "file_1991_2000");
+        assert_eq!(groups[0].last().unwrap().key, "file_1361_1370");
         assert_eq!(groups.iter().map(Vec::len).sum::<usize>(), files.len());
-        // globally non-increasing max_ts across the flattened wave order
+        assert_eq!(
+            groups
+                .iter()
+                .flatten()
+                .map(|file| file.key.as_str())
+                .collect::<Vec<_>>(),
+            files
+                .iter()
+                .rev()
+                .map(|file| file.key.as_str())
+                .collect::<Vec<_>>(),
+        );
         let flat: Vec<i64> = groups.iter().flatten().map(|f| f.meta.max_ts).collect();
         assert!(flat.windows(2).all(|w| w[0] >= w[1]));
     }
@@ -151,46 +148,40 @@ mod tests {
     /// group, so the early stop could never fire).
     #[test]
     fn desc_waves_survive_overlapping_files() {
-        let files: Vec<FileKey> = (0..12)
-            .map(|i| create_file_key(i, 100 + i)) // heavily overlapping
-            .collect();
+        let files: Vec<FileKey> = (0..192).map(|i| create_file_key(i, 100 + i)).collect();
         let groups =
-            partition_vix_files(files, &Some(IndexOptimizeMode::SimpleSelect(10, false)), 4);
+            partition_vix_files(files, &Some(IndexOptimizeMode::SimpleSelect(10, false)), 64);
         assert_eq!(
             groups.iter().map(Vec::len).collect::<Vec<_>>(),
-            vec![4, 4, 4]
+            vec![64, 64, 64]
         );
-        // newest max_ts first even with overlap
-        assert_eq!(groups[0][0].key, "file_11_111");
+        assert_eq!(groups[0][0].key, "file_191_291");
     }
 
     #[test]
     fn asc_waves_are_oldest_first() {
-        let files: Vec<FileKey> = (0..6)
+        let files: Vec<FileKey> = (0..70)
             .map(|i| create_file_key(i * 10 + 1, i * 10 + 10))
             .collect();
         let groups =
-            partition_vix_files(files, &Some(IndexOptimizeMode::SimpleSelect(10, true)), 4);
-        assert_eq!(groups.iter().map(Vec::len).collect::<Vec<_>>(), vec![4, 2]);
-        assert_eq!(
-            keys(&groups)[0],
-            vec!["file_1_10", "file_11_20", "file_21_30", "file_31_40"]
-        );
+            partition_vix_files(files, &Some(IndexOptimizeMode::SimpleSelect(10, true)), 64);
+        assert_eq!(groups.iter().map(Vec::len).collect::<Vec<_>>(), vec![64, 6]);
+        assert_eq!(groups[0].first().unwrap().key, "file_1_10");
+        assert_eq!(groups[0].last().unwrap().key, "file_631_640");
         let flat: Vec<i64> = groups.iter().flatten().map(|f| f.meta.min_ts).collect();
         assert!(flat.windows(2).all(|w| w[0] <= w[1]));
     }
 
     #[test]
     fn small_target_partitions_never_shrinks_below_first_wave() {
-        let files: Vec<FileKey> = (0..10)
+        let files: Vec<FileKey> = (0..130)
             .map(|i| create_file_key(i * 10 + 1, i * 10 + 10))
             .collect();
         let groups =
             partition_vix_files(files, &Some(IndexOptimizeMode::SimpleSelect(10, false)), 1);
-        // cap = max(target_partitions, FIRST_WAVE_SIZE) = 4
         assert_eq!(
             groups.iter().map(Vec::len).collect::<Vec<_>>(),
-            vec![4, 4, 2]
+            vec![64, 64, 2]
         );
     }
 
@@ -218,14 +209,21 @@ mod tests {
             assert_eq!(groups[0].len(), 20, "mode {mode:?}");
         }
         assert!(partition_vix_files(Vec::new(), &None, 4).is_empty());
-        // SimpleSelect keeps its multi-wave pruning layout
+        // SimpleSelect keeps its multi-wave pruning layout once the input
+        // exceeds the 64-file first wave.
+        let select_files: Vec<FileKey> = (0..130)
+            .map(|i| create_file_key(i * 10 + 1, i * 10 + 10))
+            .collect();
         let groups = partition_vix_files(
-            files.clone(),
+            select_files.clone(),
             &Some(IndexOptimizeMode::SimpleSelect(10, false)),
-            4,
+            64,
         );
         assert!(groups.len() > 1);
-        assert_eq!(groups.iter().map(Vec::len).sum::<usize>(), files.len());
+        assert_eq!(
+            groups.iter().map(Vec::len).sum::<usize>(),
+            select_files.len()
+        );
     }
 
     #[test]

@@ -1744,16 +1744,13 @@ mod tests {
 
     /// Single-file healing through the REAL compaction job flow
     /// (`merge_by_stream` + the merge worker): a settled hour partition
-    /// holding exactly ONE core file — a shape merge grouping could never
-    /// touch — is probed against the current stream settings. A CURRENT
-    /// file is a NO-OP (job completes, file untouched, nothing written);
-    /// after a `full_text_search_keys` settings change (term-vs-fts marking
-    /// drift — a live heal trigger) the file heals SIDECAR-ONLY (M3,
-    /// DESIGN-V2 §5): the data object stays byte-identical under the SAME
-    /// key, only the `.vxi` is rewritten and the existing file_list row's
-    /// index_size updated — no add/delete events at all. Query results stay
-    /// identical, and a further job over the healed file is a no-op again
-    /// (healing converges: the sidecar bytes stop changing).
+    /// holding exactly ONE core file is probed against current settings. A
+    /// CURRENT file is a no-op. After a `full_text_search_keys` change, the
+    /// data object stays byte-identical while the rebuilt `.vxi` is published
+    /// under a fresh immutable generation and the existing file-list row is
+    /// atomically advanced. The previous sidecar remains available through
+    /// the reader grace period, query results stay identical, and a further
+    /// job over the healed file is a no-op again.
     async fn e2e_single_file_healing_compaction() {
         use chrono::TimeZone;
         use config::utils::time::hour_micros;
@@ -1945,6 +1942,12 @@ mod tests {
             assert_eq!(objs.len(), 1, "exactly ONE data object, got {objs:?}");
             objs.remove(0)
         };
+        let sidecar_object_path = |file: &config::meta::stream::FileKey| {
+            std::path::Path::new(&get_config().common.data_stream_dir).join(
+                config::vix_sidecar_key(&file.key, file.meta.index_generation)
+                    .expect("indexed core file has a valid sidecar generation"),
+            )
+        };
         // #42 L0 mode: the single file was WRITTEN index-off, so it is NOT
         // current under the indexed logs merge plan — the same sweep heals
         // it by attaching its FIRST `.vxi` sidecar (index_size 0 -> N)
@@ -1961,9 +1964,9 @@ mod tests {
                 after_noop[0].meta
             );
             assert_eq!(after_noop[0].meta.records, 6, "all rows preserved");
-            let sidecar_path = data_object_path().replace(".vix", ".vxi");
+            let sidecar_path = sidecar_object_path(&after_noop[0]);
             let sidecar_len = std::fs::metadata(&sidecar_path)
-                .unwrap_or_else(|e| panic!("healed sidecar {sidecar_path} must exist: {e}"))
+                .unwrap_or_else(|e| panic!("healed sidecar {sidecar_path:?} must exist: {e}"))
                 .len();
             assert_eq!(
                 sidecar_len as i64, after_noop[0].meta.index_size,
@@ -1986,11 +1989,12 @@ mod tests {
             );
         }
         let current_key = after_noop[0].key.clone();
-        // byte-identity anchors for Leg B: the data object must not change
-        // AT ALL across a sidecar-only heal; the sidecar must be REWRITTEN
+        let previous_generation = after_noop[0].meta.index_generation;
+        // Byte-identity anchors for Leg B: the data object must not change.
+        // The old immutable sidecar remains addressable through the grace.
         let data_bytes_before = std::fs::read(data_object_path()).unwrap();
-        let sidecar_path = data_object_path().replace(".vix", ".vxi");
-        let sidecar_before = std::fs::read(&sidecar_path).unwrap_or_default();
+        let sidecar_path_before = sidecar_object_path(&after_noop[0]);
+        let sidecar_before = std::fs::read(&sidecar_path_before).unwrap_or_default();
 
         // ---- Leg B: settings mark a field fts -> marking drift -> heal --
         let body_str = r#"{"full_text_search_keys":{"add":["service"],"remove":[]}}"#;
@@ -2045,12 +2049,16 @@ mod tests {
         let after_heal = query_partition().await;
         assert_eq!(after_heal.len(), 1, "healing must keep exactly one row");
         let healed_key = after_heal[0].key.clone();
-        // M3 SIDECAR-ONLY: the heal REWRITES the `.vxi` in place and
-        // updates the EXISTING row — no new file id, no data-key change,
-        // no data upload.
+        // Sidecar-only: publish a fresh immutable `.vxi` generation and
+        // atomically advance the EXISTING row — no new file id, data-key
+        // change, or data upload.
         assert_eq!(
             healed_key, current_key,
             "the sidecar-only heal must keep the data key"
+        );
+        assert_ne!(
+            after_heal[0].meta.index_generation, previous_generation,
+            "a heal must advance the immutable sidecar generation"
         );
         assert_eq!(after_heal[0].meta.records, 6, "all rows preserved");
         assert!(
@@ -2067,12 +2075,20 @@ mod tests {
             data_bytes_before, data_bytes_after,
             "the DATA OBJECT must stay byte-identical across a sidecar-only heal"
         );
-        let sidecar_after = std::fs::read(&sidecar_path)
-            .unwrap_or_else(|e| panic!("healed sidecar {sidecar_path} must exist: {e}"));
+        let sidecar_path_after = sidecar_object_path(&after_heal[0]);
+        assert_ne!(
+            sidecar_path_before, sidecar_path_after,
+            "old and new sidecars must have distinct object keys"
+        );
+        assert!(
+            sidecar_path_before.exists(),
+            "the old sidecar must remain readable during the retirement grace"
+        );
+        let sidecar_after = std::fs::read(&sidecar_path_after)
+            .unwrap_or_else(|e| panic!("healed sidecar {sidecar_path_after:?} must exist: {e}"));
         assert_ne!(
             sidecar_before, sidecar_after,
-            "the heal must have REWRITTEN the sidecar (fts marking drift changes its fields \
-             table)"
+            "fts marking drift must change the rebuilt sidecar bytes"
         );
         assert_eq!(
             sidecar_after.len() as i64,
@@ -2111,7 +2127,11 @@ mod tests {
             after_second[0].key, healed_key,
             "the healed file must classify current (no rebuild loop)"
         );
-        let sidecar_converged = std::fs::read(&sidecar_path).unwrap();
+        assert_eq!(
+            after_second[0].meta.index_generation, after_heal[0].meta.index_generation,
+            "convergence must not mint another generation"
+        );
+        let sidecar_converged = std::fs::read(&sidecar_path_after).unwrap();
         assert_eq!(
             sidecar_after, sidecar_converged,
             "convergence: a further sweep must not rewrite the sidecar again"

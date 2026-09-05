@@ -29,8 +29,7 @@ use arrow::{
 use vortex::{
     VortexSessionDefault,
     array::{ArrayRef, VortexSessionExecute},
-    arrow::ArrowSessionExt,
-    arrow::{FromArrowArray, FromArrowType},
+    arrow::{ArrowSessionExt, FromArrowArray, FromArrowType},
     dtype::DType,
     file::{VortexWriteOptions, WriteStrategyBuilder},
     io::{
@@ -324,7 +323,10 @@ fn main() {
     let files: usize = args.get(1).map(|s| s.parse().unwrap()).unwrap_or(30);
     let rows: usize = args.get(2).map(|s| s.parse().unwrap()).unwrap_or(131_072);
     let card: usize = args.get(3).map(|s| s.parse().unwrap()).unwrap_or(32_768);
-    let mode = args.get(4).cloned().unwrap_or_else(|| "default".to_string());
+    let mode = args
+        .get(4)
+        .cloned()
+        .unwrap_or_else(|| "default".to_string());
     let chunk_rows = 8192usize;
 
     let schema = Arc::new(Schema::new(vec![
@@ -377,7 +379,15 @@ fn main() {
                 .collect();
             handles.into_iter().map(|h| h.join().expect("join")).sum()
         } else {
-            write_one_file(&schema, f, rows, card, chunk_rows, &mode, shared_pool.as_ref())
+            write_one_file(
+                &schema,
+                f,
+                rows,
+                card,
+                chunk_rows,
+                &mode,
+                shared_pool.as_ref(),
+            )
         }
     };
 

@@ -656,7 +656,6 @@ pub async fn update_stream_settings(
             .extend(new_settings.full_text_search_keys.add);
     }
 
-
     // bloom_filter_fields: remove first, then add
     if !new_settings.bloom_filter_fields.remove.is_empty() {
         settings

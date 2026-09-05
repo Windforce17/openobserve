@@ -617,7 +617,8 @@ mod heartbeat_tests {
     /// status codes stay exact for fast queries (and grace 0 disables).
     #[tokio::test]
     async fn heartbeat_grace_passes_response_through() {
-        let res = with_oneshot_heartbeat(5, async { resp(StatusCode::TOO_MANY_REQUESTS, "x") }).await;
+        let res =
+            with_oneshot_heartbeat(5, async { resp(StatusCode::TOO_MANY_REQUESTS, "x") }).await;
         assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
         let res = with_oneshot_heartbeat(0, async { resp(StatusCode::BAD_REQUEST, "y") }).await;
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
@@ -642,7 +643,10 @@ mod heartbeat_tests {
             text.starts_with(' '),
             "heartbeat whitespace precedes the payload: {text:?}"
         );
-        assert!(text.trim_start().starts_with('{'), "payload intact: {text:?}");
+        assert!(
+            text.trim_start().starts_with('{'),
+            "payload intact: {text:?}"
+        );
         assert_eq!(text.trim_start(), r#"{"hits":[]}"#);
     }
 }

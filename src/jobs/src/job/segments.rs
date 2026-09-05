@@ -16,48 +16,19 @@
 //! Segment-WAL L0 builder (DESIGN-SEGMENT-WAL.md): turns uploaded segment
 //! objects into per-(stream, hour) L0 data files.
 //!
-//! Loop shape: wait until a FULL `ZO_SEGMENT_BUILD_BATCH` is claimable (or
-//! the oldest claimable segment is `ZO_SEGMENT_BUILD_MAX_WAIT_SECS` old —
-//! rows stay queryable through the segment tail while they wait, so the
-//! gate costs no freshness), claim the batch (leased), start the lease
-//! heartbeat AT CLAIM TIME (the compactor heartbeat-gap lesson: a heartbeat
-//! that covers only part of the job's life lets another node re-claim
-//! mid-work), fetch + decode each object with a small bounded concurrency
-//! (a segment that fails to fetch or decode is SKIPPED and left leased —
-//! the lease expires and it retries; it never blocks the rest of the
-//! batch), split each contiguous decoded ID run into independent
-//! `(stream, actual timestamp hour)` contribution sequences, cap each
-//! sequence on ITS OWN decoded bytes (`chunk_run_per_stream_hour`), homogenize
-//! each chunk's write-time schemas ONCE (this is the designed single place
-//! type-flips get resolved), validate that it still contains exactly its
-//! planned hour, and build ONE L0 file through the exact same single-file
-//! build the WAL mover uses (`write_core_file_from_tables` for logs/traces
-//! `.vix`, `merge_parquet_files` for everything else) so compaction and the
-//! query path stay completely unchanged. Before the FIRST upload, the batch's
-//! deterministic keys are written to the claimed rows' `l0_planned` (fenced
-//! by the lease; a short count discards the build with nothing uploaded), so
-//! a builder crash mid-upload always leaves a durable record naming its
-//! objects — the sweeper's GC collects them. Then all objects upload, and
-//! all produced files register AND the segments flip Built in ONE fenced
-//! `wal_segments::mark_built_with_files` transaction (which clears
-//! `l0_planned` in the same statement) — a builder crash can no longer land
-//! between registration and the flip, and a lost lease rolls the
-//! registration back whole.
+//! Successfully decoded segments are aggregated across nonconsecutive global
+//! WAL IDs by stream and actual timestamp hour. Each output is capped by its
+//! decoded Arrow bytes and by the bounded exact-provenance token. The
+//! deterministic `l0_h2_{token}_{hour}` key records precisely the sorted IDs
+//! that contributed rows, so a skipped or unrelated ID is never hidden from
+//! recent-data search. The Segment-WAL and VIX payload formats are unchanged.
 //!
-//! Provenance: L0 object keys are a pure function of (planner version,
-//! the stream/hour chunk's ids, stream, hour) —
-//! `l0_h1_{writer uuid|multi}_{chunk min id}_{chunk max id}_{hour index}` —
-//! and a chunk only ever spans CONSECUTIVE decoded ids. For every
-//! `(stream, hour)` present in a run, its
-//! chunk ranges tile that run's whole id span, so every id inside a
-//! registered key range is genuinely covered: a segment either contributed
-//! rows to that stream/hour or carried none. The leader dedups candidates
-//! PER STREAM against that stream's own registered `l0_` ranges. A skipped
-//! ID splits the runs around it, stays outside every range, and remains
-//! queryable as a segment. Any build/upload failure aborts the WHOLE batch
-//! before anything is registered, the segments stay leased, and
-//! the expired lease retries them; the retry's identical decode set
-//! re-produces identical keys, so uploads overwrite the same objects.
+//! Claims are leased and heartbeat-protected from claim through the fenced
+//! commit. Before the first upload, every deterministic output key is written
+//! to the claimed rows' `l0_planned`; all files then register and all decoded
+//! source segments flip Built in one transaction. A crash therefore leaves
+//! either a committed file or durable planned keys for the sweeper, and a
+//! retry reproduces the same object names.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -95,6 +66,7 @@ use config::{
 use futures::StreamExt;
 use hashbrown::HashMap;
 use infra::{
+    l0_provenance::encode_exact_ids,
     schema::{get_stream_setting_bloom_filter_fields, get_stream_setting_fts_fields},
     storage,
     wal_segments::{self, ClaimOrder, SegmentMeta},
@@ -112,10 +84,6 @@ use crate::service::{
 };
 
 const HOUR_MICROS: i64 = 3_600_000_000;
-// Object-key planner version. This separates the hour-aware schema planner
-// from pre-hour-aware builders during a fenced rolling handoff: different
-// planners must never upload incompatible data and sidecars to the same key.
-const L0_PLANNER_VERSION: &str = "h1";
 /// Claim poll interval while the backlog is empty; a full claim loops
 /// immediately so a backlog drains at build speed, not poll speed.
 const BUILDER_TICK_SECS: u64 = 5;
@@ -131,6 +99,38 @@ const BACKLOG_WARN_AGE_SECS: u64 = 600;
 /// The backlog check+warn runs at most this often — the claim loop passes
 /// every `BUILDER_TICK_SECS`, which would spam both the DB and the log.
 const BACKLOG_WARN_PERIOD: Duration = Duration::from_secs(60);
+const LATE_LOCK_WAIT_SECS: u64 = 1;
+const LATE_COHORT_LOCK_KEY: &str = "/segment_build/late";
+fn take_late_turn(fresh_due: &mut bool) -> bool {
+    !std::mem::take(fresh_due)
+}
+
+/// Single-owner lease for one immutable late cohort. Explicit release covers
+/// every normal exit; cancellation or process failure drops the NATS locker,
+/// whose keepalive then stops so its bounded server lease expires.
+struct LateCohortLock {
+    locker: Option<infra::dist_lock::Locker>,
+}
+
+impl LateCohortLock {
+    async fn acquire() -> Result<Self, anyhow::Error> {
+        let locker = tokio::time::timeout(
+            Duration::from_secs(LATE_LOCK_WAIT_SECS),
+            infra::dist_lock::lock(LATE_COHORT_LOCK_KEY, LATE_LOCK_WAIT_SECS),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("late cohort lock acquisition timed out after {LATE_LOCK_WAIT_SECS}s")
+        })??;
+        Ok(Self { locker })
+    }
+
+    async fn release(self) {
+        if let Err(e) = infra::dist_lock::unlock(&self.locker).await {
+            log::error!("[SEGMENT:BUILD] failed to release global late cohort lock: {e}");
+        }
+    }
+}
 /// M13 aging-lane cadence accumulator: per-mille of
 /// `ZO_SEGMENT_BUILD_AGE_LANE_RATIO` accumulated once per ENGAGED claim
 /// pass; each time it crosses a whole unit the pass claims oldest-first
@@ -366,6 +366,9 @@ async fn run_loop() -> Result<(), anyhow::Error> {
         LOCAL_NODE.uuid
     );
     let mut backlog = false;
+    // A completed/failed late pass always yields the next iteration to the
+    // fresh lane, even when the closed cohort needs multiple bounded claims.
+    let mut fresh_due = false;
     let mut last_backlog_check: Option<Instant> = None;
     loop {
         if is_offline() {
@@ -431,30 +434,57 @@ async fn run_loop() -> Result<(), anyhow::Error> {
         let lane_ratio = cfg.common.segment_build_age_lane_ratio;
         let lane_enabled = lane_secs > 0 && lane_ratio > 0.0;
         let mut claim_order = ClaimOrder::NewestFirst;
-        // M31a late lane: hold-expired ALL-LATE segments (the fleet's
-        // late-arriving rows, segregated at flush) claim as their OWN pass,
-        // oldest-first — one wave coalesces them into one L0 file per
-        // (stream, hour) instead of a sliver per build batch. Takes this
-        // tick INSTEAD of a fresh pass; late waves surface roughly once per
-        // hold window, so fresh starvation is not a real shape. The fresh
-        // gates below (claim floor / max-wait / byte budget) don't apply —
-        // the hold already did the batching.
-        let mut late_pass = false;
-        if cfg.common.segment_late_lane_hours > 0 {
-            match wal_segments::has_late_claimable().await {
-                Ok(true) => late_pass = true,
-                Ok(false) => {}
+        // Closed late cohorts are single-owner work. The fleet-global lane
+        // lock prevents an old-boundary owner and a new-boundary owner from
+        // draining the same older backlog concurrently. Capture the immutable
+        // boundary before locking, then use that same boundary for every claim
+        // and probe while the lock is held. A lock collision skips only this
+        // late attempt and falls through to the unchanged fresh lane below.
+        let allow_late = take_late_turn(&mut fresh_due);
+        let mut late_boundary = None;
+        let mut late_lock = None;
+        if allow_late
+            && let Some(boundary) = wal_segments::late_cohort_boundary(now_micros())
+            && wal_segments::has_late_claimable_before(boundary)
+                .await
+                .unwrap_or_else(|e| {
+                    log::error!("[SEGMENT:BUILD] late cohort probe failed: {e}");
+                    false
+                })
+        {
+            match LateCohortLock::acquire().await {
+                Ok(lock) => {
+                    // Recheck under ownership; another builder may have
+                    // drained the cohort while this node acquired the lock.
+                    match wal_segments::has_late_claimable_before(boundary).await {
+                        Ok(true) => {
+                            late_boundary = Some(boundary);
+                            late_lock = Some(lock);
+                            fresh_due = true;
+                            claim_order = ClaimOrder::LateOldestFirst;
+                            log::info!(
+                                "[SEGMENT:BUILD] late cohort {boundary}: claiming up to \
+                                 {effective_batch} segments oldest-first"
+                            );
+                        }
+                        Ok(false) => lock.release().await,
+                        Err(e) => {
+                            log::error!(
+                                "[SEGMENT:BUILD] late cohort {boundary} locked probe failed: {e}"
+                            );
+                            lock.release().await;
+                        }
+                    }
+                }
                 Err(e) => {
-                    log::error!("[SEGMENT:BUILD] has_late_claimable failed: {e}");
+                    log::debug!(
+                        "[SEGMENT:BUILD] late cohort {boundary} lock unavailable; running fresh \
+                         pass: {e}"
+                    );
                 }
             }
         }
-        if late_pass {
-            claim_order = ClaimOrder::LateOldestFirst;
-            log::info!(
-                "[SEGMENT:BUILD] late lane: claiming hold-expired all-late segments oldest-first"
-            );
-        } else if max_wait_secs > 0 || lane_enabled {
+        if late_boundary.is_none() && (max_wait_secs > 0 || lane_enabled) {
             // #50: cheap existence probe each tick; the count/min/SUM
             // aggregate runs only when something is claimable. Idle fleets
             // cost one indexed LIMIT-1 row per builder-second with zero
@@ -510,22 +540,39 @@ async fn run_loop() -> Result<(), anyhow::Error> {
                 }
             }
         }
-        let claim = match wal_segments::claim_pending_with_floor(
-            &LOCAL_NODE.uuid,
-            effective_batch,
-            min_batch,
-            lease_secs,
-            claim_order,
-        )
-        .await
-        {
+        let claim_result = if let Some(boundary) = late_boundary {
+            wal_segments::claim_late_cohort_with_floor(
+                &LOCAL_NODE.uuid,
+                effective_batch,
+                min_batch,
+                lease_secs,
+                boundary,
+            )
+            .await
+        } else {
+            wal_segments::claim_pending_with_floor(
+                &LOCAL_NODE.uuid,
+                effective_batch,
+                min_batch,
+                lease_secs,
+                claim_order,
+            )
+            .await
+        };
+        let claim = match claim_result {
             Ok(v) => v,
             Err(e) => {
                 log::error!("[SEGMENT:BUILD] claim_pending failed: {e}");
+                if let Some(lock) = late_lock.take() {
+                    lock.release().await;
+                }
                 continue;
             }
         };
         if claim.is_empty() {
+            if let Some(lock) = late_lock.take() {
+                lock.release().await;
+            }
             continue;
         }
         // Heartbeat covers the claim from THIS point to the end of the batch
@@ -567,6 +614,7 @@ async fn run_loop() -> Result<(), anyhow::Error> {
                 effective_batch,
                 lease_secs,
                 claim_order,
+                late_boundary,
                 (super_mb as i64) * 1024 * 1024,
                 super_secs,
             )
@@ -609,7 +657,7 @@ async fn run_loop() -> Result<(), anyhow::Error> {
             Ok(stats) => {
                 log::info!("[SEGMENT:BUILD] {stats}");
                 // a full claim means more may be pending: drain immediately
-                backlog = claim.len() >= effective_batch;
+                backlog = late_boundary.is_some() || claim.len() >= effective_batch;
             }
             Err(e) => {
                 // nothing was registered (registration and the Built flip
@@ -632,6 +680,9 @@ async fn run_loop() -> Result<(), anyhow::Error> {
                     );
                 }
             }
+        }
+        if let Some(lock) = late_lock.take() {
+            lock.release().await;
         }
     }
     log::info!("[SEGMENT:BUILD] node offline, L0 builder exiting");
@@ -685,8 +736,8 @@ fn is_resources_exhausted(e: &anyhow::Error) -> bool {
 /// M12 fix 2: shrink `claim` to its first half for the memory-backoff retry
 /// (floor 1 — callers gate on `len() > 1`), returning the DROPPED segment
 /// ids so the caller releases them for other builders. Keeping the FIRST
-/// half keeps ids contiguous-ish with the original claim order, so the
-/// retry's deterministic L0 keys stay a prefix of the failed attempt's plan.
+/// half preserves claim order while the retry deterministically replans its
+/// exact source-ID sets.
 fn halve_for_retry(claim: &mut Vec<SegmentMeta>) -> Vec<i64> {
     let keep = (claim.len() / 2).max(1);
     let dropped = claim[keep..].iter().map(|s| s.id).collect();
@@ -796,6 +847,7 @@ async fn accumulate_super_batch(
     effective_batch: usize,
     lease_secs: u64,
     claim_order: ClaimOrder,
+    late_boundary: Option<i64>,
     budget: i64,
     super_secs: u64,
 ) -> i64 {
@@ -809,19 +861,26 @@ async fn accumulate_super_batch(
         // satisfied by the batch as a whole — a full-batch floor here loses
         // the race against the tick cadence and seals with zero extensions
         // (.101 on dev: no accumulation ever).
-        let more = match wal_segments::claim_pending_with_floor(
-            node,
-            effective_batch,
-            1,
-            lease_secs,
-            // an aging pass extends oldest-first too: the union then drains
-            // a CONTIGUOUS aged band (adjacent old hours → fewer
-            // (stream, hour) output slices) instead of mixing the aged
-            // cohort with fresh arrivals
-            claim_order,
-        )
-        .await
-        {
+        let more_result = if let Some(boundary) = late_boundary {
+            wal_segments::claim_late_cohort_with_floor(
+                node,
+                effective_batch,
+                1,
+                lease_secs,
+                boundary,
+            )
+            .await
+        } else {
+            wal_segments::claim_pending_with_floor(
+                node,
+                effective_batch,
+                1,
+                lease_secs,
+                claim_order,
+            )
+            .await
+        };
+        let more = match more_result {
             Ok(v) => v,
             Err(e) => {
                 log::warn!("[SEGMENT:BUILD] super-batch extension claim failed: {e}");
@@ -830,15 +889,18 @@ async fn accumulate_super_batch(
         };
         if more.is_empty() {
             let claimable = if race_retries < EMPTY_CLAIM_RACE_RETRIES {
-                wal_segments::has_claimable(lease_secs)
-                    .await
-                    .unwrap_or_else(|e| {
-                        log::warn!(
-                            "[SEGMENT:BUILD] super-batch claimable probe failed (treating as \
-                             an arrival gap): {e}"
-                        );
-                        false
-                    })
+                let result = if let Some(boundary) = late_boundary {
+                    wal_segments::has_late_claimable_before(boundary).await
+                } else {
+                    wal_segments::has_claimable(lease_secs).await
+                };
+                result.unwrap_or_else(|e| {
+                    log::warn!(
+                        "[SEGMENT:BUILD] super-batch claimable probe failed (treating as \
+                         an arrival gap): {e}"
+                    );
+                    false
+                })
             } else {
                 false
             };
@@ -1033,9 +1095,9 @@ impl std::fmt::Display for BatchStats {
 }
 
 /// One claimed batch end-to-end: fetch/decode (per-segment skip on failure),
-/// split the decoded ids into contiguous runs, chunk each run per stream on
-/// the stream's own decoded bytes, build one L0 file per (stream chunk,
-/// hour), write the batch's deterministic keys to the claimed rows'
+/// aggregate every decoded contribution by stream/hour, chunk on decoded
+/// bytes and exact-provenance token length, build one L0 file per chunk, then
+/// write the batch's deterministic keys to the claimed rows'
 /// `l0_planned` (fenced; a SHORT count means the lease was lost and the
 /// build is discarded with NOTHING uploaded — an unplanned upload would be
 /// invisible to the GC forever), then upload every object, then commit
@@ -1140,15 +1202,14 @@ async fn process_claim(claim: &[SegmentMeta], node: &str) -> Result<BatchStats, 
     );
 
     let plan_timer = ObservedPhaseTimer::start("plan");
-    let meta_by_id: HashMap<i64, &SegmentMeta> = claim.iter().map(|m| (m.id, m)).collect();
 
     // Plan every `(stream, actual timestamp hour)` build first. Inputs are
-    // measured in DECODED arrow bytes — the compressed column `size`
-    // under-measured traces ~10x and OOM'd the pool (2026-07-31). The cap is
-    // independent per stream/hour inside each contiguous ID run, and is
-    // applied only after aggregating one segment's whole contribution. The
-    // plans are then executed with bounded concurrency; oversized
-    // contributions run with the whole budget to themselves.
+    // measured in DECODED Arrow bytes — the compressed column `size`
+    // under-measured traces ~10x and OOM'd the pool (2026-07-31). Both the
+    // byte cap and the exact-provenance token cap are independent per
+    // stream/hour and apply only after aggregating one segment's whole
+    // contribution. The plans are then executed with bounded concurrency;
+    // oversized contributions run with the whole budget to themselves.
     struct BuildPlan {
         key_parts: L0KeyParts,
         group: StreamGroup,
@@ -1168,39 +1229,27 @@ async fn process_claim(claim: &[SegmentMeta], node: &str) -> Result<BatchStats, 
                 .await,
         )
     };
-    for run in split_into_id_runs(decoded) {
-        for chunked in chunk_run_per_stream_hour(run, build_chunk_bytes)? {
-            let StreamChunks {
-                org,
-                stream_type,
-                stream,
+    for chunked in chunk_per_stream_hour(decoded, build_chunk_bytes)? {
+        let StreamChunks {
+            org,
+            stream_type,
+            stream,
+            hour_start_micros,
+            chunks,
+        } = chunked;
+        stream_keys.insert(format!("{org}/{stream_type}/{stream}"));
+        for chunk in chunks {
+            plans.push(BuildPlan {
+                key_parts: l0_key_parts(&chunk.source_ids)?,
+                group: StreamGroup {
+                    org: org.clone(),
+                    stream_type,
+                    stream: stream.clone(),
+                    batches: chunk.batches,
+                },
                 hour_start_micros,
-                chunks,
-            } = chunked;
-            stream_keys.insert(format!("{org}/{stream_type}/{stream}"));
-            for chunk in chunks {
-                // a run holds only DECODED ids and a chunk's range tiles a
-                // sub-span of its run, so every covered id resolves
-                let chunk_metas = (chunk.start_id..=chunk.end_id)
-                    .map(|id| {
-                        meta_by_id.get(&id).copied().ok_or_else(|| {
-                            anyhow!("chunk segment id {id} is missing from the claim")
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let key_parts = l0_key_parts(&chunk_metas)?;
-                plans.push(BuildPlan {
-                    key_parts,
-                    group: StreamGroup {
-                        org: org.clone(),
-                        stream_type,
-                        stream: stream.clone(),
-                        batches: chunk.batches,
-                    },
-                    hour_start_micros,
-                    decoded_bytes: chunk.decoded_bytes,
-                });
-            }
+                decoded_bytes: chunk.decoded_bytes,
+            });
         }
     }
     let planned_decoded_bytes = plans.iter().fold(0u64, |bytes, plan| {
@@ -1287,7 +1336,7 @@ async fn process_claim(claim: &[SegmentMeta], node: &str) -> Result<BatchStats, 
             log::warn!(
                 "[SEGMENT:BUILD] lease lost before upload: planned-keys write covered {planned} of {} \
                  claimed segments ({claim_ids:?}); build discarded, nothing uploaded — the lease \
-                 winner plans and uploads its own exact-run keys",
+                 winner plans and uploads its own exact-provenance keys",
                 claim_ids.len(),
             );
             return Ok(BatchStats {
@@ -1333,7 +1382,7 @@ async fn process_claim(claim: &[SegmentMeta], node: &str) -> Result<BatchStats, 
         if !committed {
             log::warn!(
                 "[SEGMENT:BUILD] lease lost: fenced commit flipped {flipped} of {} segments ({built_ids:?}); \
-                 registration rolled back whole, the lease winner registers its own exact-run keys",
+                 registration rolled back whole, the lease winner registers its own exact-provenance keys",
                 built_ids.len(),
             );
         }
@@ -1384,8 +1433,8 @@ fn build_concurrency() -> usize {
     get_config().common.segment_build_concurrency.max(1)
 }
 
-/// One `(stream, actual timestamp hour)` identity plus its byte-capped
-/// chunks out of one contiguous decoded run.
+/// One `(stream, actual timestamp hour)` identity plus its byte- and
+/// provenance-capped chunks from all successfully decoded segments.
 struct StreamChunks {
     org: String,
     stream_type: StreamType,
@@ -1394,12 +1443,9 @@ struct StreamChunks {
     chunks: Vec<StreamChunk>,
 }
 
-/// A consecutive sub-range of a run's ids plus one stream/hour's rows from
-/// exactly those segments; `[start_id, end_id]` becomes the file's
-/// provenance range.
+/// Rows contributed by an exact, sorted set of source segment IDs.
 struct StreamChunk {
-    start_id: i64,
-    end_id: i64,
+    source_ids: Vec<i64>,
     batches: Vec<RecordBatch>,
     decoded_bytes: usize,
 }
@@ -1564,26 +1610,33 @@ fn split_frame_by_actual_hour(
     Ok((org, stream_type, stream, split))
 }
 
-/// Chunk one CONTIGUOUS decoded run per `(stream, actual timestamp hour)`.
-/// Every segment's frames are first split by their real row timestamps, then
-/// all batches for one segment/stream/hour are aggregated before the cap
-/// decision. Thus a boundary can occur only between segment contributions;
-/// a single oversized contribution remains alone and nothing is skipped.
+/// Chunk all successfully decoded segments per `(stream, actual timestamp
+/// hour)`. Every frame is split by its real row timestamps, then all batches
+/// from one segment for one stream/hour are aggregated before either cap is
+/// checked. A single oversized contribution remains alone and no rows are
+/// skipped.
 ///
-/// Every emitted hour's ranges tile the run's WHOLE ID span: the first chunk
-/// begins at `run_first`, each successor begins immediately after its
-/// predecessor, and the tail seals at `run_last`. IDs without rows for that
-/// hour therefore extend provenance without opening gaps or crossing a
-/// missing decoded ID. The BTree maps make stream/hour and chunk order a pure
-/// function of the decoded run.
-fn chunk_run_per_stream_hour(
-    run: Vec<(i64, Vec<SegmentFrame>)>,
+/// Provenance contains exactly the sorted IDs that contributed rows to that
+/// output. Consequently sparse IDs can share one file safely: query coverage
+/// suppresses those exact segments rather than every ID in a numeric range.
+/// BTree maps make stream/hour and chunk order deterministic.
+fn chunk_per_stream_hour(
+    mut decoded: Vec<(i64, Vec<SegmentFrame>)>,
     max_decoded_bytes: usize,
 ) -> Result<Vec<StreamChunks>, anyhow::Error> {
-    let Some(run_first) = run.first().map(|(id, _)| *id) else {
-        return Ok(Vec::new());
-    };
-    let run_last = run.last().map(|(id, _)| *id).unwrap_or(run_first);
+    decoded.sort_unstable_by_key(|(id, _)| *id);
+    for pair in decoded.windows(2) {
+        if pair[0].0 <= 0 || pair[0].0 >= pair[1].0 {
+            return Err(anyhow!(
+                "decoded segment ids must be positive and strictly increasing: {} then {}",
+                pair[0].0,
+                pair[1].0
+            ));
+        }
+    }
+    if decoded.last().is_some_and(|(id, _)| *id <= 0) {
+        return Err(anyhow!("decoded segment ids must be positive"));
+    }
     let max_decoded_bytes = max_decoded_bytes.max(1);
 
     struct Accum {
@@ -1592,17 +1645,16 @@ fn chunk_run_per_stream_hour(
         stream: String,
         hour_start_micros: i64,
         done: Vec<StreamChunk>,
-        open_start: i64,
+        open_ids: Vec<i64>,
         open_batches: Vec<RecordBatch>,
         open_bytes: usize,
     }
-    // `(stream identity, hour)` ordering is deterministic.
     let mut accums: BTreeMap<(String, i64), Accum> = BTreeMap::new();
 
-    for (id, frames) in run {
-        // Aggregate THIS segment's entire contribution before deciding
-        // whether it fits. BTree order also removes dependence on frame
-        // interleaving while each contribution retains frame order.
+    for (id, frames) in decoded {
+        // Aggregate this segment's entire contribution before deciding
+        // whether it fits. BTree order removes frame-interleaving dependence
+        // while each contribution retains frame order.
         let mut segment_groups: BTreeMap<
             (String, i64),
             (String, StreamType, String, Vec<RecordBatch>, usize),
@@ -1630,21 +1682,27 @@ fn chunk_run_per_stream_hour(
                     stream,
                     hour_start_micros,
                     done: Vec::new(),
-                    open_start: run_first,
+                    open_ids: Vec::new(),
                     open_batches: Vec::new(),
                     open_bytes: 0,
                 });
-            if acc.open_bytes > 0
-                && acc.open_bytes.saturating_add(contribution_bytes) > max_decoded_bytes
-            {
+
+            acc.open_ids.push(id);
+            let candidate_token = encode_exact_ids(&acc.open_ids);
+            let byte_cap_reached = acc.open_ids.len() > 1
+                && acc.open_bytes.saturating_add(contribution_bytes) > max_decoded_bytes;
+            let token_cap_reached = candidate_token.is_err() && acc.open_ids.len() > 1;
+            if byte_cap_reached || token_cap_reached {
+                acc.open_ids.pop();
                 acc.done.push(StreamChunk {
-                    start_id: acc.open_start,
-                    // The caller split missing decoded IDs into another run.
-                    end_id: id - 1,
+                    source_ids: std::mem::take(&mut acc.open_ids),
                     batches: std::mem::take(&mut acc.open_batches),
                     decoded_bytes: std::mem::replace(&mut acc.open_bytes, 0),
                 });
-                acc.open_start = id;
+                acc.open_ids.push(id);
+                encode_exact_ids(&acc.open_ids)?;
+            } else {
+                candidate_token?;
             }
             acc.open_batches.extend(batches);
             acc.open_bytes = acc.open_bytes.saturating_add(contribution_bytes);
@@ -1653,53 +1711,24 @@ fn chunk_run_per_stream_hour(
 
     Ok(accums
         .into_values()
-        .filter_map(|acc| {
-            let Accum {
-                org,
-                stream_type,
-                stream,
-                hour_start_micros,
-                mut done,
-                open_start,
-                open_batches,
-                open_bytes,
-            } = acc;
-            if open_batches.is_empty() {
+        .filter_map(|mut acc| {
+            if acc.open_batches.is_empty() {
                 return None;
             }
-            done.push(StreamChunk {
-                start_id: open_start,
-                end_id: run_last,
-                batches: open_batches,
-                decoded_bytes: open_bytes,
+            acc.done.push(StreamChunk {
+                source_ids: acc.open_ids,
+                batches: acc.open_batches,
+                decoded_bytes: acc.open_bytes,
             });
             Some(StreamChunks {
-                org,
-                stream_type,
-                stream,
-                hour_start_micros,
-                chunks: done,
+                org: acc.org,
+                stream_type: acc.stream_type,
+                stream: acc.stream,
+                hour_start_micros: acc.hour_start_micros,
+                chunks: acc.done,
             })
         })
         .collect())
-}
-
-fn split_into_id_runs<T>(mut decoded: Vec<(i64, T)>) -> Vec<Vec<(i64, T)>> {
-    decoded.sort_unstable_by_key(|(id, _)| *id);
-    let mut runs: Vec<Vec<(i64, T)>> = Vec::new();
-    for (id, payload) in decoded {
-        match runs.last_mut() {
-            Some(run)
-                if run
-                    .last()
-                    .is_some_and(|(last, _)| last.checked_add(1) == Some(id)) =>
-            {
-                run.push((id, payload));
-            }
-            _ => runs.push(vec![(id, payload)]),
-        }
-    }
-    runs
 }
 
 struct StreamGroup {
@@ -1953,7 +1982,7 @@ async fn upload_built_file(built: BuiltL0File) -> Result<FileUploadTiming, anyho
     // only rowless orphans — the GC's derived-key delete collects them.
     let mut index_ms = 0;
     if let Some(index) = index {
-        let sidecar_key = config::vix_sidecar_key(&file.key)
+        let sidecar_key = config::vix_sidecar_key(&file.key, 0)
             .expect("core L0 outputs are .vix keys by construction");
         let index_started = Instant::now();
         let index_result = storage::put(&file.account, &sidecar_key, Bytes::from(index))
@@ -2070,43 +2099,25 @@ fn validate_stream_identity(org: &str, stream: &str) -> Result<(), anyhow::Error
     Ok(())
 }
 
-/// The chunk-constant parts of every L0 key: writer uuid (or `multi`) and
-/// the min/max DECODED segment id of one contiguous stream chunk (never the
-/// claim's — a claim-derived range would falsely cover skipped or foreign
-/// ids). Pure function of the chunk's members, so a re-claim that decodes
-/// the same set reproduces identical keys.
+/// Exact source-segment provenance for one deterministic L0 key. Member
+/// order is normalized here so retries reproduce the same key.
 #[derive(Debug, Clone, PartialEq)]
 struct L0KeyParts {
-    writer_uuid: String,
-    min_id: i64,
-    max_id: i64,
+    provenance_token: String,
 }
 
-fn l0_key_parts(run: &[&SegmentMeta]) -> Result<L0KeyParts, anyhow::Error> {
-    let mut ids = run.iter().map(|m| m.id);
-    let first = ids
-        .next()
-        .ok_or_else(|| anyhow!("l0_key_parts: empty run"))?;
-    let (min_id, max_id) = ids.fold((first, first), |(lo, hi), id| (lo.min(id), hi.max(id)));
-    let uuids: BTreeSet<&str> = run.iter().map(|m| m.node_uuid.as_str()).collect();
-    let writer_uuid = match uuids.iter().next() {
-        Some(uuid) if uuids.len() == 1 => (*uuid).to_string(),
-        _ => "multi".to_string(),
-    };
+fn l0_key_parts(ids: &[i64]) -> Result<L0KeyParts, anyhow::Error> {
+    let mut ids = ids.to_vec();
+    ids.sort_unstable();
     Ok(L0KeyParts {
-        writer_uuid,
-        min_id,
-        max_id,
+        provenance_token: encode_exact_ids(&ids)?,
     })
 }
 
-/// Deterministic, planner-versioned L0 object key:
-/// `files/{org}/{type}/{stream}/{YYYY/MM/DD/HH}/l0_h1_{uuid|multi}_{min}_{max}_{hour index}{ext}`.
-/// The version prevents mixed planner generations from overwriting one
-/// another during a lease handoff. The trailing hour index is
-/// hours-since-epoch — a pure function of the hour itself, so it can never
-/// shift between retries the way a positional bucket index would when a
-/// previously skipped segment adds an hour.
+/// Deterministic exact-provenance L0 object key:
+/// `files/{org}/{type}/{stream}/{YYYY/MM/DD/HH}/l0_h2_{token}_{hour index}{ext}`.
+/// The trailing hour index is hours-since-epoch — a pure function of the
+/// hour, so it cannot shift between retries when another segment appears.
 fn l0_object_key(
     org: &str,
     stream_type: StreamType,
@@ -2123,8 +2134,8 @@ fn l0_object_key(
     let date_path = dt.format("%Y/%m/%d/%H");
     let hour_index = hour_start_micros.div_euclid(HOUR_MICROS);
     Ok(format!(
-        "files/{org}/{stream_type}/{stream}/{date_path}/l0_{L0_PLANNER_VERSION}_{}_{}_{}_{hour_index}{extension}",
-        parts.writer_uuid, parts.min_id, parts.max_id
+        "files/{org}/{stream_type}/{stream}/{date_path}/l0_h2_{}_{hour_index}{extension}",
+        parts.provenance_token
     ))
 }
 
@@ -2529,7 +2540,7 @@ async fn build_one_file(
         || (stream_type == StreamType::Metrics
             && get_config().common.vix_metrics_core_file_enabled);
     let mut build_timing = L0FileBuildTiming::default();
-    let (buf, spooled_output, index_bytes, file_meta, file_format) = if use_core_file {
+    let (buf, spooled_output, index_bytes, mut file_meta, file_format) = if use_core_file {
         // M12: the bucket is already sorted `_timestamp` DESC (the stored
         // row order) and covers exactly this hour — the direct builder
         // needs no DataFusion plan, no repartition and no sort. The prod
@@ -2643,6 +2654,9 @@ async fn build_one_file(
             "{ctx}: L0 build for hour {hour_start} produced compressed_size 0; refusing to register"
         ));
     }
+    // L0 files are ordinary new outputs; only in-place heals publish a
+    // positive generation.
+    file_meta.index_generation = 0;
 
     let key = l0_object_key(
         org,
@@ -3351,6 +3365,29 @@ mod tests {
         assert_eq!(claim.len(), 1);
     }
 
+    #[test]
+    fn test_late_cohort_lock_contract_is_global_and_bounded() {
+        assert_eq!(LATE_COHORT_LOCK_KEY, "/segment_build/late");
+        assert_eq!(LATE_LOCK_WAIT_SECS, 1);
+    }
+
+    #[test]
+    fn test_late_turn_always_yields_one_fresh_pass() {
+        let mut fresh_due = false;
+        assert!(take_late_turn(&mut fresh_due));
+
+        // Once a late lock is acquired, the run loop sets fresh_due.
+        fresh_due = true;
+        assert!(
+            !take_late_turn(&mut fresh_due),
+            "the next pass must bypass late lock acquisition"
+        );
+        assert!(
+            take_late_turn(&mut fresh_due),
+            "late work becomes eligible again only after one fresh attempt"
+        );
+    }
+
     // ── M13 aging lane ────────────────────────────────────────────────────
 
     /// Engagement is a pure age comparison — engages exactly at the
@@ -3638,6 +3675,7 @@ mod tests {
             4,
             3600,
             ClaimOrder::NewestFirst,
+            None,
             16 * 1024, // budget: 16 segments' worth
             120,
         )
@@ -3679,7 +3717,7 @@ mod tests {
             .unwrap();
     }
 
-    // ── hour-aware contiguous-run planning ──────────────────────────────
+    // ── hour-aware exact-provenance planning ─────────────────────────────
 
     fn planner_frame(stream: &str, timestamps: Vec<i64>) -> SegmentFrame {
         let min_ts = timestamps.iter().copied().min().unwrap_or(0);
@@ -3703,7 +3741,7 @@ mod tests {
         }
     }
 
-    fn planner_shape(groups: &[StreamChunks]) -> Vec<(String, i64, Vec<(i64, i64)>, usize)> {
+    fn planner_shape(groups: &[StreamChunks]) -> Vec<(String, i64, Vec<Vec<i64>>, usize)> {
         groups
             .iter()
             .map(|group| {
@@ -3713,7 +3751,7 @@ mod tests {
                     group
                         .chunks
                         .iter()
-                        .map(|chunk| (chunk.start_id, chunk.end_id))
+                        .map(|chunk| chunk.source_ids.clone())
                         .collect(),
                     group
                         .chunks
@@ -3768,15 +3806,15 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
-        let planned = chunk_run_per_stream_hour(make_run(), cap).unwrap();
+        let planned = chunk_per_stream_hour(make_run(), cap).unwrap();
         assert_eq!(
             planner_shape(&planned),
             vec![
-                ("s".to_string(), T0, vec![(100, 103)], 10),
+                ("s".to_string(), T0, vec![vec![100, 101, 102, 103]], 10),
                 (
                     "s".to_string(),
                     T0 + HOUR_MICROS,
-                    vec![(100, 100), (101, 101), (102, 102), (103, 103)],
+                    vec![vec![100], vec![101], vec![102], vec![103]],
                     1024,
                 ),
             ],
@@ -3803,15 +3841,14 @@ mod tests {
             1034,
             "planning conserves every row exactly once"
         );
-        let deterministic_keys: BTreeSet<(String, i64, i64, i64)> = planned
+        let deterministic_keys: BTreeSet<(String, i64, Vec<i64>)> = planned
             .iter()
             .flat_map(|group| {
                 group.chunks.iter().map(|chunk| {
                     (
                         group.stream.clone(),
                         group.hour_start_micros,
-                        chunk.start_id,
-                        chunk.end_id,
+                        chunk.source_ids.clone(),
                     )
                 })
             })
@@ -3825,11 +3862,11 @@ mod tests {
             "one plan identity maps to exactly one deterministic key"
         );
 
-        let again = chunk_run_per_stream_hour(make_run(), cap).unwrap();
+        let again = chunk_per_stream_hour(make_run(), cap).unwrap();
         assert_eq!(
             planner_shape(&planned),
             planner_shape(&again),
-            "same decoded run must reproduce the same ordered hour/range plan"
+            "same decoded set must reproduce the same ordered hour/exact-ID plan"
         );
     }
 
@@ -3986,27 +4023,24 @@ mod tests {
     }
 
     #[test]
-    fn test_hour_planner_tiles_absent_ids_and_never_crosses_decoded_gap() {
+    fn test_sparse_ids_coalesce_by_stream_hour_with_exact_provenance() {
         let hour = T0 + 7;
-        let decoded = vec![
-            (4, vec![planner_frame("gappy", vec![hour; 2])]),
-            (5, Vec::new()),
-            (7, Vec::new()),
-            (8, vec![planner_frame("gappy", vec![hour; 2])]),
-        ];
-        let planned: Vec<StreamChunks> = split_into_id_runs(decoded)
-            .into_iter()
-            .flat_map(|run| chunk_run_per_stream_hour(run, usize::MAX).unwrap())
-            .collect();
+        let planned = chunk_per_stream_hour(
+            vec![
+                (8, vec![planner_frame("gappy", vec![hour; 2])]),
+                (5, Vec::new()),
+                (4, vec![planner_frame("gappy", vec![hour; 2])]),
+                (7, Vec::new()),
+            ],
+            usize::MAX,
+        )
+        .unwrap();
         assert_eq!(
             planner_shape(&planned),
-            vec![
-                ("gappy".to_string(), T0, vec![(4, 5)], 2),
-                ("gappy".to_string(), T0, vec![(7, 8)], 2),
-            ],
-            "absent IDs extend each run tail, while missing ID 6 splits provenance"
+            vec![("gappy".to_string(), T0, vec![vec![4, 8]], 4,)],
+            "nonconsecutive contributors share one safe exact-provenance output"
         );
-        assert!(chunk_run_per_stream_hour(Vec::new(), 1).unwrap().is_empty());
+        assert!(chunk_per_stream_hour(Vec::new(), 1).unwrap().is_empty());
     }
 
     #[test]
@@ -4014,7 +4048,7 @@ mod tests {
         let hour = T0 + 1;
         let first = planner_frame("s", vec![hour; 32]);
         let cap = first.batch.size() / 2;
-        let planned = chunk_run_per_stream_hour(
+        let planned = chunk_per_stream_hour(
             vec![
                 (10, vec![first]),
                 (11, vec![planner_frame("s", vec![hour; 2])]),
@@ -4024,68 +4058,70 @@ mod tests {
         .unwrap();
         assert_eq!(
             planner_shape(&planned),
-            vec![("s".to_string(), T0, vec![(10, 10), (11, 11)], 34)],
+            vec![("s".to_string(), T0, vec![vec![10], vec![11]], 34,)],
             "one contribution over the cap is retained alone and the tail still seals"
         );
     }
 
     #[test]
-    fn test_split_into_id_runs_shapes() {
-        // contiguity only — hour-aware byte capping happens inside each run
-        let runs = split_into_id_runs(vec![(2, "b"), (1, "a"), (3, "c")]);
+    fn test_provenance_token_cap_chunks_without_skipping_rows() {
+        let hour = T0 + 1;
+        let decoded = (1..=300)
+            .rev()
+            .map(|id| (id, vec![planner_frame("s", vec![hour])]))
+            .collect();
+        let planned = chunk_per_stream_hour(decoded, usize::MAX).unwrap();
+        let chunks = &planned[0].chunks;
         assert_eq!(
-            runs,
-            vec![vec![(1, "a"), (2, "b"), (3, "c")]],
-            "consecutive ids form one sorted run"
+            chunks
+                .iter()
+                .flat_map(|chunk| chunk.source_ids.iter().copied())
+                .collect::<Vec<_>>(),
+            (1..=300).collect::<Vec<_>>(),
+            "every source contribution is retained exactly once"
         );
-
-        // gap in the middle splits exactly there
-        let runs = split_into_id_runs(vec![(6, ()), (3, ()), (7, ()), (4, ())]);
-        assert_eq!(runs, vec![vec![(3, ()), (4, ())], vec![(6, ()), (7, ())]]);
-
-        // nothing decoded (all skipped) → no runs, no files
-        assert!(split_into_id_runs(Vec::<(i64, ())>::new()).is_empty());
-
-        // every id isolated → one singleton run each
-        let runs = split_into_id_runs(vec![(14, ()), (10, ()), (12, ())]);
-        assert_eq!(runs, vec![vec![(10, ())], vec![(12, ())], vec![(14, ())]]);
-
-        // i64::MAX must not overflow the contiguity probe
-        let runs = split_into_id_runs(vec![(i64::MAX, ()), (i64::MAX - 1, ())]);
-        assert_eq!(runs, vec![vec![(i64::MAX - 1, ()), (i64::MAX, ())]]);
+        assert!(
+            chunks.len() > 1,
+            "the exact-token cap must split this input"
+        );
+        assert!(chunks.iter().all(|chunk| {
+            encode_exact_ids(&chunk.source_ids)
+                .is_ok_and(|token| token.len() <= infra::l0_provenance::MAX_EXACT_TOKEN_LEN)
+        }));
+        assert_eq!(
+            chunks
+                .iter()
+                .flat_map(|chunk| &chunk.batches)
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            300
+        );
     }
 
     #[test]
-    fn test_l0_key_is_deterministic_and_parseable() {
-        // one contiguous decoded run 3..=5 (arrival order scrambled)
-        let m3 = seg_meta(3, "node-a", 1);
-        let m4 = seg_meta(4, "node-a", 2);
-        let m5 = seg_meta(5, "node-a", 3);
-        let parts = l0_key_parts(&[&m5, &m3, &m4]).unwrap();
-        assert_eq!(
-            parts,
-            L0KeyParts {
-                writer_uuid: "node-a".to_string(),
-                min_id: 3,
-                max_id: 5,
-            }
-        );
+    fn test_l0_key_is_deterministic_exact_and_parseable() {
+        let parts = l0_key_parts(&[8, 3, 5]).unwrap();
+        assert_eq!(parts, l0_key_parts(&[5, 8, 3]).unwrap());
+        assert!(l0_key_parts(&[]).is_err());
 
-        let hour11 = T0 + 11 * HOUR_MICROS; // 2021-01-01T11:00Z
+        let hour11 = T0 + 11 * HOUR_MICROS;
         let key =
             l0_object_key("default", StreamType::Logs, "app1", hour11, &parts, ".vix").unwrap();
+        let token = encode_exact_ids(&[3, 5, 8]).unwrap();
         assert_eq!(
             key,
             format!(
-                "files/default/logs/app1/2021/01/01/11/l0_h1_node-a_3_5_{}.vix",
+                "files/default/logs/app1/2021/01/01/11/l0_h2_{token}_{}.vix",
                 hour11 / HOUR_MICROS
             )
         );
-        // same decoded set → same key
-        let again =
+        assert_eq!(
+            infra::l0_provenance::parse_l0_provenance(&key),
+            Some(infra::l0_provenance::L0Provenance::Exact(vec![3, 5, 8]))
+        );
+        let retry =
             l0_object_key("default", StreamType::Logs, "app1", hour11, &parts, ".vix").unwrap();
-        assert_eq!(key, again);
-        // different hour → different key
+        assert_eq!(key, retry);
         let other = l0_object_key(
             "default",
             StreamType::Logs,
@@ -4096,89 +4132,15 @@ mod tests {
         )
         .unwrap();
         assert_ne!(key, other);
-        assert!(other.contains("/2021/01/01/12/"));
 
-        // member order must not matter
-        assert_eq!(parts, l0_key_parts(&[&m3, &m4, &m5]).unwrap());
-
-        // the key parses under the file_list convention
         let (stream_key, date_key, file_name) = parse_file_key_columns(&key).unwrap();
         assert_eq!(stream_key, "default/logs/app1");
         assert_eq!(date_key, "2021/01/01/11");
-        assert!(file_name.starts_with("l0_h1_node-a_3_5_"));
-
-        // the compaction-hint inverse agrees
-        let (org, stream_type, stream) = parse_l0_stream(&key).unwrap();
+        assert!(file_name.starts_with(&format!("l0_h2_{token}_")));
         assert_eq!(
-            (org.as_str(), stream_type, stream.as_str()),
-            ("default", StreamType::Logs, "app1")
+            parse_l0_stream(&key).unwrap(),
+            ("default".to_string(), StreamType::Logs, "app1".to_string())
         );
-    }
-
-    /// The provenance-gap fix: a skip INSIDE the claim splits the decoded
-    /// ids into runs whose key ranges exclude the skipped id, so the leader
-    /// dedup can never suppress the still-unbuilt segment.
-    #[test]
-    fn test_mid_claim_skip_yields_runs_excluding_the_skipped_id() {
-        // claim 3..=7 for one writer; id 5 fails to decode
-        let metas: Vec<SegmentMeta> = (3..=7).map(|id| seg_meta(id, "node-a", id)).collect();
-        let decoded: Vec<(i64, ())> = [7, 3, 6, 4].into_iter().map(|id| (id, ())).collect();
-
-        let runs = split_into_id_runs(decoded);
-        assert_eq!(runs.len(), 2, "the skip must split the claim in two");
-
-        let hour11 = T0 + 11 * HOUR_MICROS;
-        let mut keys = Vec::new();
-        for run in &runs {
-            let run_metas: Vec<&SegmentMeta> = run
-                .iter()
-                .map(|(id, _)| metas.iter().find(|m| m.id == *id).unwrap())
-                .collect();
-            let parts = l0_key_parts(&run_metas).unwrap();
-            // every id in [min, max] is a decoded member: 5 is outside
-            assert!(
-                parts.min_id > 5 || parts.max_id < 5,
-                "range [{}, {}] must exclude the skipped id",
-                parts.min_id,
-                parts.max_id
-            );
-            keys.push(
-                l0_object_key("default", StreamType::Logs, "app1", hour11, &parts, ".vix").unwrap(),
-            );
-        }
-        let hour_index = hour11 / HOUR_MICROS;
-        assert_eq!(
-            keys,
-            vec![
-                format!("files/default/logs/app1/2021/01/01/11/l0_h1_node-a_3_4_{hour_index}.vix"),
-                format!("files/default/logs/app1/2021/01/01/11/l0_h1_node-a_6_7_{hour_index}.vix"),
-            ]
-        );
-
-        // the same decoded set in another arrival order reproduces the keys
-        let decoded: Vec<(i64, ())> = [4, 6, 3, 7].into_iter().map(|id| (id, ())).collect();
-        let again: Vec<String> = split_into_id_runs(decoded)
-            .iter()
-            .map(|run| {
-                let run_metas: Vec<&SegmentMeta> = run
-                    .iter()
-                    .map(|(id, _)| metas.iter().find(|m| m.id == *id).unwrap())
-                    .collect();
-                let parts = l0_key_parts(&run_metas).unwrap();
-                l0_object_key("default", StreamType::Logs, "app1", hour11, &parts, ".vix").unwrap()
-            })
-            .collect();
-        assert_eq!(keys, again);
-    }
-
-    #[test]
-    fn test_l0_key_parts_multi_writer_and_empty_run() {
-        let m1 = seg_meta(1, "node-a", 1);
-        let m2 = seg_meta(2, "node-b", 1);
-        let parts = l0_key_parts(&[&m1, &m2]).unwrap();
-        assert_eq!(parts.writer_uuid, "multi");
-        assert_eq!((parts.min_id, parts.max_id), (1, 2));
-        assert!(l0_key_parts(&[]).is_err());
     }
 
     #[test]
@@ -4367,7 +4329,7 @@ mod tests {
         mine_a.sort_unstable();
         assert_eq!(mine_a, vec![id1, id2], "A must hold both segments");
 
-        // A's build output (deterministic exact-run keys)
+        // A's build output (deterministic exact-provenance keys)
         let org = unique_node("torg");
         let files = vec![
             l0_file_key(&org, "l0_w_1_2_447083"),
@@ -4507,11 +4469,7 @@ mod tests {
             stream: "app1".to_string(),
             batches: vec![b1, b2],
         };
-        let parts = L0KeyParts {
-            writer_uuid: "node-a".to_string(),
-            min_id: 1,
-            max_id: 2,
-        };
+        let parts = l0_key_parts(&[1, 2]).unwrap();
         let built = build_stream_files(group, &parts).await.unwrap();
         assert_eq!(built.files.len(), 2, "one L0 file per hour bucket");
         let files: Vec<FileKey> = built.files.iter().map(|b| b.file.clone()).collect();
@@ -4551,6 +4509,10 @@ mod tests {
                 "an indexed L0 build must upload its .vxi sidecar (index_size = its size): {}",
                 file.key
             );
+            assert_eq!(
+                file.meta.index_generation, 0,
+                "ordinary L0 outputs must remain on canonical generation zero"
+            );
             // the object was really uploaded, byte length matches the meta
             let bytes = storage::get_bytes(&file.account, &file.key)
                 .await
@@ -4563,7 +4525,7 @@ mod tests {
             );
             // v3 split: the sidecar uploaded too, with index_size = its
             // exact object length
-            let sidecar_key = config::vix_sidecar_key(&file.key).expect("L0 keys are .vix");
+            let sidecar_key = config::vix_sidecar_key(&file.key, 0).expect("L0 keys are .vix");
             let sidecar = storage::get_bytes(&file.account, &sidecar_key)
                 .await
                 .unwrap_or_else(|e| panic!("uploaded sidecar {sidecar_key} must exist: {e}"));
@@ -4626,11 +4588,7 @@ mod tests {
         assert_eq!(stats.flipped, 1, "fenced commit must flip the segment");
 
         let hour11 = T0 + 11 * HOUR_MICROS;
-        let parts = L0KeyParts {
-            writer_uuid: writer.clone(),
-            min_id: id,
-            max_id: id,
-        };
+        let parts = l0_key_parts(&[id]).unwrap();
         let key = l0_object_key(&org, StreamType::Logs, "app1", hour11, &parts, ".vix").unwrap();
         assert!(
             infra::file_list::contains(&key).await.unwrap(),
@@ -4677,11 +4635,7 @@ mod tests {
         assert_eq!(stats.flipped, 0, "discarded build must flip nothing");
 
         let hour11 = T0 + 11 * HOUR_MICROS;
-        let parts = L0KeyParts {
-            writer_uuid: writer.clone(),
-            min_id: id,
-            max_id: id,
-        };
+        let parts = l0_key_parts(&[id]).unwrap();
         let key = l0_object_key(&org, StreamType::Logs, "app1", hour11, &parts, ".vix").unwrap();
         assert!(
             storage::head("", &key).await.is_err(),

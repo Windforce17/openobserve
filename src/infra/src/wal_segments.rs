@@ -86,12 +86,12 @@ pub enum ClaimOrder {
     NewestFirst,
     /// `created_at ASC, id ASC` — the aging lane's starvation breaker.
     OldestFirst,
-    /// M31a late lane: hold-expired ALL-LATE segments only (classifier:
+    /// Closed-cohort ALL-LATE segments only (classifier:
     /// `created_at - max_ts` ≥ the lane width — no schema change), oldest
     /// first. Fresh lanes EXCLUDE these rows entirely while the lane is on;
-    /// this lane claims them after `ZO_SEGMENT_LATE_CLAIM_HOLD_SECS`, so one
-    /// build wave coalesces the fleet's late rows. Empty result while the
-    /// lane is off.
+    /// this lane releases a cohort only at fixed
+    /// `ZO_SEGMENT_LATE_CLAIM_HOLD_SECS` boundaries, so one build wave
+    /// coalesces the fleet's late rows. Empty result while the lane is off.
     LateOldestFirst,
 }
 
@@ -193,6 +193,37 @@ fn secs_to_micros(secs: u64) -> i64 {
     i64::try_from(secs)
         .unwrap_or(i64::MAX)
         .saturating_mul(1_000_000)
+}
+
+/// Start of the currently open late-segment cohort.
+///
+/// A late segment is eligible only when it was registered strictly before
+/// this boundary. Consequently every segment registered during one hold
+/// interval remains queryable in Segment-WAL, then becomes buildable
+/// together when the next boundary opens. `None` means the late lane is off;
+/// a zero hold closes the cohort immediately at `now_micros`.
+pub fn late_cohort_boundary(now_micros: i64) -> Option<i64> {
+    let cfg = config::get_config();
+    cohort_boundary(
+        now_micros,
+        cfg.common.segment_late_lane_hours,
+        cfg.common.segment_late_claim_hold_secs,
+    )
+}
+
+fn cohort_boundary(now_micros: i64, lane_hours: usize, hold_secs: u64) -> Option<i64> {
+    if lane_hours == 0 {
+        return None;
+    }
+    let hold_micros = secs_to_micros(hold_secs);
+    if hold_micros == 0 {
+        return Some(now_micros);
+    }
+    Some(
+        now_micros
+            .div_euclid(hold_micros)
+            .saturating_mul(hold_micros),
+    )
 }
 
 /// LIKE pattern matching the JSON-encoded array element exactly as [`add`]
@@ -333,11 +364,83 @@ pub async fn claim_pending_with_floor(
     let limit = i64::try_from(limit).unwrap_or(i64::MAX);
     let now = now_micros();
     let stale_before = now.saturating_sub(secs_to_micros(lease_timeout_secs));
-    let (late_lane, late_before) = late_lane_params(now);
+    let (late_lane, late_boundary) = late_lane_params(now);
     if use_postgres() {
-        postgres::claim_pending(node, limit, min_batch, now, stale_before, order, late_lane, late_before).await
+        postgres::claim_pending(
+            node,
+            limit,
+            min_batch,
+            now,
+            stale_before,
+            order,
+            late_lane,
+            late_boundary,
+        )
+        .await
     } else {
-        sqlite::claim_pending(node, limit, min_batch, now, stale_before, order, late_lane, late_before).await
+        sqlite::claim_pending(
+            node,
+            limit,
+            min_batch,
+            now,
+            stale_before,
+            order,
+            late_lane,
+            late_boundary,
+        )
+        .await
+    }
+}
+
+/// Claim all-late rows from one already-closed cohort.
+///
+/// `boundary` must be the value used to identify and lock this cohort. It is
+/// passed through unchanged so crossing a wall-clock cohort edge while
+/// waiting for the lock cannot release newer rows under the older lock.
+pub async fn claim_late_cohort_with_floor(
+    node: &str,
+    limit: usize,
+    min_batch: usize,
+    lease_timeout_secs: u64,
+    boundary: i64,
+) -> Result<Vec<SegmentMeta>> {
+    if node.is_empty() {
+        return Err(Error::Message(
+            "[WAL_SEGMENTS] claim_late_cohort: empty builder node".to_string(),
+        ));
+    }
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let min_batch = i64::try_from(min_batch.clamp(1, limit)).unwrap_or(1);
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let now = now_micros();
+    let stale_before = now.saturating_sub(secs_to_micros(lease_timeout_secs));
+    let (late_lane, _) = late_lane_params(now);
+    if use_postgres() {
+        postgres::claim_pending(
+            node,
+            limit,
+            min_batch,
+            now,
+            stale_before,
+            ClaimOrder::LateOldestFirst,
+            late_lane,
+            boundary,
+        )
+        .await
+    } else {
+        sqlite::claim_pending(
+            node,
+            limit,
+            min_batch,
+            now,
+            stale_before,
+            ClaimOrder::LateOldestFirst,
+            late_lane,
+            boundary,
+        )
+        .await
     }
 }
 
@@ -649,44 +752,52 @@ pub async fn get_by_ids(ids: &[i64]) -> Result<Vec<SegmentMeta>> {
 /// than `age_secs`. A growing count means builders are down or behind —
 /// exactly the silent-mover-backlog failure class this design replaces.
 pub async fn count_unbuilt_older_than(age_secs: u64) -> Result<i64> {
-    let cutoff = now_micros().saturating_sub(secs_to_micros(age_secs));
-    let (late_lane, late_before) = late_lane_params(now_micros());
-    if use_postgres() {
-        postgres::count_unbuilt_older_than(cutoff, late_lane, late_before).await
-    } else {
-        sqlite::count_unbuilt_older_than(cutoff, late_lane, late_before).await
-    }
-}
-
-/// M31a: `(lane_micros, hold_before)` — the all-late classifier width
-/// (`created_at - max_ts` at/over it = all-late segment) and the
-/// `created_at` cutoff at/under which a held segment becomes claimable by
-/// [`ClaimOrder::LateOldestFirst`]. `(0, i64::MAX)` while the lane is off —
-/// every predicate below degrades to today's behavior byte-for-byte.
-fn late_lane_params(now: i64) -> (i64, i64) {
-    let cfg = config::get_config();
-    let lane_hours = cfg.common.segment_late_lane_hours as i64;
-    if lane_hours <= 0 {
-        return (0, i64::MAX);
-    }
-    (
-        lane_hours.saturating_mul(3_600_000_000),
-        now.saturating_sub(secs_to_micros(cfg.common.segment_late_claim_hold_secs)),
-    )
-}
-
-/// M31a: the late lane's cheap existence probe — hold-expired all-late
-/// segments claimable RIGHT NOW. Always `false` while the lane is off.
-pub async fn has_late_claimable() -> Result<bool> {
     let now = now_micros();
-    let (late_lane, late_before) = late_lane_params(now);
+    let cutoff = now.saturating_sub(secs_to_micros(age_secs));
+    let (late_lane, late_boundary) = late_lane_params(now);
+    if use_postgres() {
+        postgres::count_unbuilt_older_than(cutoff, late_lane, late_boundary).await
+    } else {
+        sqlite::count_unbuilt_older_than(cutoff, late_lane, late_boundary).await
+    }
+}
+
+/// `(lane_micros, cohort_boundary)` for late-row predicates. The boundary is
+/// fixed for the entire configured hold interval; only rows with
+/// `created_at < cohort_boundary` are eligible. `(0, i64::MAX)` while the
+/// lane is off, so fresh-lane predicates retain their pre-lane behavior.
+fn late_lane_params(now_micros: i64) -> (i64, i64) {
+    let cfg = config::get_config();
+    let Some(boundary) = cohort_boundary(
+        now_micros,
+        cfg.common.segment_late_lane_hours,
+        cfg.common.segment_late_claim_hold_secs,
+    ) else {
+        return (0, i64::MAX);
+    };
+    let lane_hours = i64::try_from(cfg.common.segment_late_lane_hours).unwrap_or(i64::MAX);
+    (lane_hours.saturating_mul(3_600_000_000), boundary)
+}
+
+/// Cheap existence probe for all-late segments in the current closed cohort.
+/// Always `false` while the late lane is off.
+pub async fn has_late_claimable() -> Result<bool> {
+    let Some(boundary) = late_cohort_boundary(now_micros()) else {
+        return Ok(false);
+    };
+    has_late_claimable_before(boundary).await
+}
+
+/// Cheap existence probe pinned to the caller's locked cohort boundary.
+pub async fn has_late_claimable_before(boundary: i64) -> Result<bool> {
+    let (late_lane, _) = late_lane_params(now_micros());
     if late_lane <= 0 {
         return Ok(false);
     }
     if use_postgres() {
-        postgres::has_late_claimable(late_lane, late_before).await
+        postgres::has_late_claimable(late_lane, boundary).await
     } else {
-        sqlite::has_late_claimable(late_lane, late_before).await
+        sqlite::has_late_claimable(late_lane, boundary).await
     }
 }
 
@@ -855,7 +966,7 @@ RETURNING id;"#,
         stale_before: i64,
         order: ClaimOrder,
         late_lane: i64,
-        late_before: i64,
+        late_boundary: i64,
     ) -> Result<Vec<SegmentMeta>> {
         let pool = CLIENT.clone();
         DB_QUERY_NUMS.with_label_values(&["update", TABLE]).inc();
@@ -914,7 +1025,7 @@ RETURNING *;"#
                 sqlx::query_as(
                     r#"WITH candidates AS (
     SELECT id FROM wal_segments
-    WHERE status = $4 AND (created_at - max_ts) >= $5 AND created_at <= $6
+    WHERE status = $4 AND (created_at - max_ts) >= $5 AND created_at < $6
     ORDER BY created_at ASC, id ASC
     LIMIT $7
     FOR UPDATE SKIP LOCKED
@@ -930,7 +1041,7 @@ RETURNING *;"#,
                 .bind(now)
                 .bind(SegmentStatus::Pending as i16)
                 .bind(late_lane)
-                .bind(late_before)
+                .bind(late_boundary)
                 .bind(limit)
                 .bind(min_batch)
                 .fetch_all(&pool)
@@ -1267,21 +1378,21 @@ LIMIT $3;"#,
     pub(super) async fn count_unbuilt_older_than(
         cutoff: i64,
         late_lane: i64,
-        late_before: i64,
+        late_boundary: i64,
     ) -> Result<i64> {
         let pool = CLIENT_RO.clone();
         DB_QUERY_NUMS.with_label_values(&["select", TABLE]).inc();
-        // M31a: HELD all-late segments (younger than the claim hold) are
-        // parked on purpose — not backlog. Hold-EXPIRED ones still count:
-        // if the late lane stalls, this is the ops signal.
+        // All-late segments in the open cohort are parked on purpose, so
+        // they are not backlog. Closed-cohort rows still count, providing
+        // the ops signal if the late lane stalls.
         let count: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM wal_segments WHERE status != $1 AND created_at < $2 \
-             AND NOT ($3 > 0 AND (created_at - max_ts) >= $3 AND created_at > $4);",
+             AND NOT ($3 > 0 AND (created_at - max_ts) >= $3 AND created_at >= $4);",
         )
         .bind(SegmentStatus::Built as i16)
         .bind(cutoff)
         .bind(late_lane)
-        .bind(late_before)
+        .bind(late_boundary)
         .fetch_one(&pool)
         .await
         .map_err(|e| {
@@ -1309,16 +1420,16 @@ WHERE (status = $1 AND ($4 <= 0 OR (created_at - max_ts) < $4)) OR (status = $2 
         Ok(row.is_some())
     }
 
-    pub(super) async fn has_late_claimable(late_lane: i64, late_before: i64) -> Result<bool> {
+    pub(super) async fn has_late_claimable(late_lane: i64, late_boundary: i64) -> Result<bool> {
         let pool = CLIENT_RO.clone();
         DB_QUERY_NUMS.with_label_values(&["select", TABLE]).inc();
         let row: Option<(i64,)> = sqlx::query_as(
             r#"SELECT id FROM wal_segments
-WHERE status = $1 AND (created_at - max_ts) >= $2 AND created_at <= $3 LIMIT 1;"#,
+WHERE status = $1 AND (created_at - max_ts) >= $2 AND created_at < $3 LIMIT 1;"#,
         )
         .bind(SegmentStatus::Pending as i16)
         .bind(late_lane)
-        .bind(late_before)
+        .bind(late_boundary)
         .fetch_optional(&pool)
         .await
         .map_err(|e| Error::Message(format!("[WAL_SEGMENTS] has_late_claimable: {e}")))?;
@@ -1477,7 +1588,7 @@ ON CONFLICT (node_uuid, seq) DO NOTHING;"#,
         stale_before: i64,
         order: ClaimOrder,
         late_lane: i64,
-        late_before: i64,
+        late_boundary: i64,
     ) -> Result<Vec<SegmentMeta>> {
         if matches!(order, ClaimOrder::LateOldestFirst) && late_lane <= 0 {
             return Ok(Vec::new());
@@ -1501,12 +1612,12 @@ WHERE (status = $1 AND ($5 <= 0 OR (created_at - max_ts) < $5)) OR (status = $2 
 ORDER BY created_at ASC, id ASC
 LIMIT $4;"#
             }
-            // late lane: Pending-only (a crashed late claim's Building row
-            // recovers through the fresh lanes' stale arm); $3 is the
-            // hold cutoff here, $5 the lane width
+            // Late lane: Pending-only (a crashed late claim's Building row
+            // recovers through the fresh lanes' stale arm); $3 is the fixed
+            // cohort boundary here, $5 the lane width.
             ClaimOrder::LateOldestFirst => {
                 r#"SELECT * FROM wal_segments
-WHERE status = $1 AND (created_at - max_ts) >= $5 AND created_at <= $3
+WHERE status = $1 AND (created_at - max_ts) >= $5 AND created_at < $3
 ORDER BY created_at ASC, id ASC
 LIMIT $4;"#
             }
@@ -1517,7 +1628,7 @@ LIMIT $4;"#
             ))
         })?;
         let third = if matches!(order, ClaimOrder::LateOldestFirst) {
-            late_before
+            late_boundary
         } else {
             stale_before
         };
@@ -1900,17 +2011,17 @@ LIMIT $3;"#,
     pub(super) async fn count_unbuilt_older_than(
         cutoff: i64,
         late_lane: i64,
-        late_before: i64,
+        late_boundary: i64,
     ) -> Result<i64> {
         let pool = CLIENT_RO.clone();
         let count: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM wal_segments WHERE status != $1 AND created_at < $2 \
-             AND NOT ($3 > 0 AND (created_at - max_ts) >= $3 AND created_at > $4);",
+             AND NOT ($3 > 0 AND (created_at - max_ts) >= $3 AND created_at >= $4);",
         )
         .bind(SegmentStatus::Built as i16)
         .bind(cutoff)
         .bind(late_lane)
-        .bind(late_before)
+        .bind(late_boundary)
         .fetch_one(&pool)
         .await
         .map_err(|e| {
@@ -1937,15 +2048,15 @@ WHERE (status = $1 AND ($4 <= 0 OR (created_at - max_ts) < $4)) OR (status = $2 
         Ok(row.is_some())
     }
 
-    pub(super) async fn has_late_claimable(late_lane: i64, late_before: i64) -> Result<bool> {
+    pub(super) async fn has_late_claimable(late_lane: i64, late_boundary: i64) -> Result<bool> {
         let pool = CLIENT_RO.clone();
         let row: Option<(i64,)> = sqlx::query_as(
             r#"SELECT id FROM wal_segments
-WHERE status = $1 AND (created_at - max_ts) >= $2 AND created_at <= $3 LIMIT 1;"#,
+WHERE status = $1 AND (created_at - max_ts) >= $2 AND created_at < $3 LIMIT 1;"#,
         )
         .bind(SegmentStatus::Pending as i16)
         .bind(late_lane)
-        .bind(late_before)
+        .bind(late_boundary)
         .fetch_optional(&pool)
         .await
         .map_err(|e| Error::Message(format!("[WAL_SEGMENTS] has_late_claimable: {e}")))?;
@@ -2066,6 +2177,26 @@ mod tests {
 
     const T0: i64 = 1_700_000_000_000_000; // arbitrary healthy micros base
 
+    #[test]
+    fn late_cohort_boundary_stays_fixed_until_interval_closes() {
+        let hold_secs = 15 * 60;
+        let hold_micros = secs_to_micros(hold_secs);
+        let boundary = 4 * hold_micros;
+
+        assert_eq!(cohort_boundary(boundary, 0, hold_secs), None);
+        assert_eq!(cohort_boundary(boundary + 123, 2, 0), Some(boundary + 123));
+        assert_eq!(cohort_boundary(boundary, 2, hold_secs), Some(boundary));
+        assert_eq!(cohort_boundary(boundary + 1, 2, hold_secs), Some(boundary));
+        assert_eq!(
+            cohort_boundary(boundary + hold_micros - 1, 2, hold_secs),
+            Some(boundary)
+        );
+        assert_eq!(
+            cohort_boundary(boundary + hold_micros, 2, hold_secs),
+            Some(boundary + hold_micros)
+        );
+    }
+
     #[tokio::test]
     async fn test_add_is_idempotent_on_node_seq() {
         let _guard = setup().await;
@@ -2133,7 +2264,10 @@ mod tests {
         let mut zero_size = seg("node-bad", 4, T0, T0 + 1000, &["org1/logs/app1"]);
         zero_size.size = 0;
         let err = add(&zero_size).await.unwrap_err();
-        assert!(err.to_string().contains("non-positive object size"), "{err}");
+        assert!(
+            err.to_string().contains("non-positive object size"),
+            "{err}"
+        );
         assert!(err.is_deterministic_db_error(), "{err:?}");
 
         let mut no_node = seg("", 5, T0, T0 + 1000, &["org1/logs/app1"]);
@@ -2294,9 +2428,10 @@ mod tests {
         let reclaimed = claim_pending_with_floor("ol2", 10, 1, 60, ClaimOrder::OldestFirst)
             .await
             .unwrap();
-        assert_eq!(reclaimed.iter().map(|m| m.id).collect::<Vec<_>>(), vec![
-            ids[0]
-        ]);
+        assert_eq!(
+            reclaimed.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![ids[0]]
+        );
         assert_eq!(reclaimed[0].builder_node, "ol2");
     }
 
@@ -3193,94 +3328,199 @@ mod tests {
         assert_eq!(count_unbuilt_older_than(7200).await.unwrap(), 0);
     }
 
-    /// M31a late lane, tested against the sqlite impls with EXPLICIT lane
-    /// params (the pub wrappers read env-backed config, which tests cannot
-    /// toggle safely): fresh lanes exclude all-late rows, the late lane
-    /// claims exactly the hold-expired ones oldest-first, and the probes
-    /// mirror the claim predicates.
+    /// Backend-level late-lane predicate proof with explicit boundaries (the
+    /// public wrappers read process-global config): rows from one open cohort
+    /// stay parked throughout it, then release together at the next boundary.
     #[tokio::test]
-    async fn late_lane_hold_and_claim() {
+    async fn late_lane_releases_only_closed_cohorts() {
         let _guard = setup().await;
-        let now = now_micros();
-        let hour = 3_600_000_000_i64;
+        let minute = 60_000_000_i64;
+        let hour = 60 * minute;
+        let hold = 15 * minute;
+        let boundary = T0.div_euclid(hold) * hold;
+        let next_boundary = boundary + hold;
+        let following_boundary = next_boundary + hold;
         let lane = 2 * hour;
-        // fresh segment: max_ts ~ now
-        let fresh = add(&seg("late-node", 1, now - 1_000, now, &["o/logs/a"]))
-            .await
-            .unwrap();
-        // all-late, HELD: created_at is NOW (add stamps it), rows 3h old
-        let held = add(&seg("late-node", 2, now - 3 * hour, now - 3 * hour + 1, &["o/logs/a"]))
-            .await
-            .unwrap();
-        // all-late, hold-EXPIRED: same shape, created_at backdated 20min
-        let expired = add(&seg("late-node", 3, now - 5 * hour, now - 5 * hour + 1, &["o/logs/a"]))
-            .await
-            .unwrap();
-        raw_exec(&format!(
-            "UPDATE wal_segments SET created_at = {} WHERE id = {expired};",
-            now - 20 * 60 * 1_000_000
-        ))
-        .await;
-        let hold_before = now - 15 * 60 * 1_000_000; // 15min hold
+        let old_max_ts = boundary - 3 * hour;
 
-        // fresh lane excludes BOTH all-late rows
+        let fresh = add(&seg(
+            "late-node",
+            1,
+            boundary + minute,
+            boundary + minute,
+            &["o/logs/a"],
+        ))
+        .await
+        .unwrap();
+        let cohort_first = add(&seg(
+            "late-node",
+            2,
+            old_max_ts,
+            old_max_ts + 1,
+            &["o/logs/a"],
+        ))
+        .await
+        .unwrap();
+        let cohort_last = add(&seg(
+            "late-node",
+            3,
+            old_max_ts,
+            old_max_ts + 1,
+            &["o/logs/a"],
+        ))
+        .await
+        .unwrap();
+        let on_next_boundary = add(&seg(
+            "late-node",
+            4,
+            old_max_ts,
+            old_max_ts + 1,
+            &["o/logs/a"],
+        ))
+        .await
+        .unwrap();
+
+        force_created_at(fresh, boundary + minute).await;
+        force_created_at(cohort_first, boundary + minute).await;
+        force_created_at(cohort_last, next_boundary - 1).await;
+        force_created_at(on_next_boundary, next_boundary).await;
+
+        // Fresh claiming is unchanged: it takes the fresh row and excludes
+        // every Pending all-late row.
         let claimed = sqlite::claim_pending(
-            "builder-a", 10, 1, now, now - hour, ClaimOrder::NewestFirst, lane, hold_before,
+            "builder-a",
+            10,
+            1,
+            next_boundary - 1,
+            next_boundary - hour,
+            ClaimOrder::NewestFirst,
+            lane,
+            boundary,
         )
         .await
         .unwrap();
         assert_eq!(
             claimed.iter().map(|m| m.id).collect::<Vec<_>>(),
-            vec![fresh],
-            "fresh lane must skip all-late segments"
+            vec![fresh]
         );
+        mark_built(&[fresh], "builder-a").await.unwrap();
 
-        // probes mirror the predicates
+        // Advancing by seconds inside the cohort does not roll eligibility.
+        assert!(!sqlite::has_late_claimable(lane, boundary).await.unwrap());
+        assert_eq!(
+            sqlite::count_unbuilt_older_than(following_boundary, lane, boundary)
+                .await
+                .unwrap(),
+            0,
+            "open-cohort late rows are deliberately not backlog"
+        );
+        let still_held = sqlite::claim_pending(
+            "builder-b",
+            10,
+            1,
+            next_boundary - 1,
+            next_boundary - hour,
+            ClaimOrder::LateOldestFirst,
+            lane,
+            boundary,
+        )
+        .await
+        .unwrap();
+        assert!(still_held.is_empty());
+
+        // At the next boundary the whole prior cohort releases together.
+        // A row exactly on the boundary belongs to the new open cohort.
         assert!(
-            sqlite::has_late_claimable(lane, hold_before).await.unwrap(),
-            "hold-expired late row is late-claimable"
+            sqlite::has_late_claimable(lane, next_boundary)
+                .await
+                .unwrap()
         );
-        let (count, ..) = sqlite::claimable_stats(now - hour, lane).await.unwrap();
-        assert_eq!(count, 0, "claimable_stats excludes all-late (fresh already claimed)");
-
-        // late lane claims exactly the hold-expired row
-        let late = sqlite::claim_pending(
-            "builder-a", 10, 1, now, now - hour, ClaimOrder::LateOldestFirst, lane, hold_before,
+        assert_eq!(
+            sqlite::count_unbuilt_older_than(following_boundary, lane, next_boundary)
+                .await
+                .unwrap(),
+            2,
+            "backlog includes only the newly closed cohort"
+        );
+        let closed = sqlite::claim_pending(
+            "builder-b",
+            10,
+            1,
+            next_boundary,
+            next_boundary - hour,
+            ClaimOrder::LateOldestFirst,
+            lane,
+            next_boundary,
         )
         .await
         .unwrap();
         assert_eq!(
-            late.iter().map(|m| m.id).collect::<Vec<_>>(),
-            vec![expired],
-            "late lane claims only hold-expired all-late segments"
+            closed.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![cohort_first, cohort_last]
         );
-        // the HELD row is untouched by either lane
-        let rest = sqlite::claim_pending(
-            "builder-b", 10, 1, now, now - hour, ClaimOrder::LateOldestFirst, lane, hold_before,
-        )
-        .await
-        .unwrap();
-        assert!(rest.is_empty(), "held row stays parked: {rest:?}");
         assert!(
-            !sqlite::has_late_claimable(lane, hold_before).await.unwrap(),
-            "nothing late-claimable after the late claim"
+            !sqlite::has_late_claimable(lane, next_boundary)
+                .await
+                .unwrap(),
+            "strict-before keeps the boundary row parked"
         );
-        let _ = held;
 
-        // lane OFF (0) degrades byte-for-byte: the held+... all-late rows
-        // are ordinary pending rows again
+        let next = sqlite::claim_pending(
+            "builder-c",
+            10,
+            1,
+            following_boundary,
+            following_boundary - hour,
+            ClaimOrder::LateOldestFirst,
+            lane,
+            following_boundary,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            next.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![on_next_boundary],
+            "boundary row releases only when its own cohort closes"
+        );
+
+        // Lane-off behavior remains the pre-lane behavior.
+        let ordinary = add(&seg(
+            "late-node",
+            5,
+            old_max_ts,
+            old_max_ts + 1,
+            &["o/logs/a"],
+        ))
+        .await
+        .unwrap();
+        force_created_at(ordinary, following_boundary + 1).await;
         let all = sqlite::claim_pending(
-            "builder-c", 10, 1, now, now - hour, ClaimOrder::OldestFirst, 0, i64::MAX,
+            "builder-d",
+            10,
+            1,
+            following_boundary + 2,
+            following_boundary - hour,
+            ClaimOrder::OldestFirst,
+            0,
+            i64::MAX,
         )
         .await
         .unwrap();
-        assert_eq!(all.len(), 1, "lane off: the held row claims normally");
-        // LateOldestFirst with the lane off must claim nothing
-        let none = sqlite::claim_pending(
-            "builder-c", 10, 1, now, now - hour, ClaimOrder::LateOldestFirst, 0, i64::MAX,
-        )
-        .await
-        .unwrap();
-        assert!(none.is_empty());
+        assert_eq!(all.iter().map(|m| m.id).collect::<Vec<_>>(), vec![ordinary]);
+        assert!(
+            sqlite::claim_pending(
+                "builder-d",
+                10,
+                1,
+                following_boundary + 2,
+                following_boundary - hour,
+                ClaimOrder::LateOldestFirst,
+                0,
+                i64::MAX,
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
     }
 }

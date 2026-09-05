@@ -22,7 +22,7 @@ use arrow::{
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use hashbrown::HashMap;
 use proto::cluster_rpc;
-use roaring::RoaringBitmap;
+use roaring::{RoaringBitmap, RoaringTreemap};
 use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
 use utoipa::ToSchema;
 
@@ -339,6 +339,12 @@ impl RowIdBitmap {
         }
         BooleanBuffer::new(buffer.into(), 0, self.num_rows)
     }
+    /// Clone the compressed row ids into the low (partition-zero) bitmap of
+    /// a 64-bit roaring treemap. Vortex's scan selection consumes this shape;
+    /// cloning the bitmap avoids expanding one `u64` allocation per match.
+    pub fn to_roaring_treemap(&self) -> RoaringTreemap {
+        RoaringTreemap::from_bitmaps([(0, self.rows.clone())])
+    }
 
     /// Number of rows in the file (the bitmap's universe) — NOT the match
     /// count, which is [`Self::matched`].
@@ -445,6 +451,9 @@ impl FileKey {
 /// sum(compressed_size) + sum(index_size). `index_size > 0` doubles as the
 /// "this file has a usable index" marker (warmup, bloom queue, index
 /// eval eligibility).
+/// `index_generation == 0` addresses the legacy canonical sidecar; positive
+/// generations address immutable sidecars. Generation remains positive when
+/// a heal publishes an indexless state (`index_size == 0`).
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FileMeta {
     pub min_ts: i64, // microseconds
@@ -453,6 +462,8 @@ pub struct FileMeta {
     pub original_size: i64,
     pub compressed_size: i64,
     pub index_size: i64,
+    #[serde(default)]
+    pub index_generation: i64,
     #[serde(default)]
     pub bloom_ver: i64, // 0 = no .bf; otherwise = microsecond ts encoded in .bf filename
     pub flattened: bool,
@@ -494,11 +505,14 @@ pub struct FileListDeleted {
     pub id: i64,
     pub account: String,
     pub file: String,
-    /// Vestigial, always written false: the v3 `.vxi` sidecar delete is
-    /// UNCONDITIONAL — the sweeper derives the sidecar key from every
-    /// `.vix` key and tolerates NotFound (`compact::deleted`), so nothing
-    /// needs this flag. The column survives in the `file_list_deleted`
-    /// table schema only.
+    /// Sidecar generation for `.vix` data tombstones and staged sidecar
+    /// cleanup intents. Exact object-key tombstones carry generation zero.
+    pub index_generation: i64,
+    /// Positive-generation `true` marks a staged sidecar candidate: `file`
+    /// is the data key and `id == index_generation` is its publication
+    /// ticket. GC atomically converts it to an exact-key tombstone before
+    /// returning it. Other rows delete `file` normally and, for `.vix`,
+    /// its recorded active sidecar.
     pub index_file: bool,
     pub flattened: bool,
 }
@@ -782,6 +796,7 @@ impl From<&FileMeta> for cluster_rpc::FileMeta {
             original_size: req.original_size,
             compressed_size: req.compressed_size,
             index_size: req.index_size,
+            index_generation: req.index_generation,
         }
     }
 }
@@ -796,6 +811,7 @@ impl From<&cluster_rpc::FileMeta> for FileMeta {
             compressed_size: req.compressed_size,
             flattened: false,
             index_size: req.index_size,
+            index_generation: req.index_generation,
             bloom_ver: 0,
         }
     }
@@ -1505,10 +1521,9 @@ mod tests {
 
         // an UpdateStreamSettings payload naming the retired key parses too
         // (the settings API accepts-and-drops it)
-        let update: UpdateStreamSettings = json::from_str(
-            r#"{"column_store_fields": {"add": ["service"], "remove": []}}"#,
-        )
-        .unwrap();
+        let update: UpdateStreamSettings =
+            json::from_str(r#"{"column_store_fields": {"add": ["service"], "remove": []}}"#)
+                .unwrap();
         assert!(update.full_text_search_keys.add.is_empty());
     }
 
@@ -1522,6 +1537,7 @@ mod tests {
             compressed_size: 1,
             flattened: false,
             index_size: 0,
+            index_generation: 9,
             bloom_ver: 0,
         };
 
@@ -1540,6 +1556,7 @@ mod tests {
             original_size: 1000,
             compressed_size: 500,
             index_size: 50,
+            index_generation: 0,
             flattened: false,
             bloom_ver: 0,
         };
@@ -2016,6 +2033,7 @@ mod tests {
             original_size: 1024,
             compressed_size: 512,
             index_size: 0,
+            index_generation: 0,
             flattened: false,
             bloom_ver: 0,
         };
@@ -2063,6 +2081,27 @@ mod tests {
             sparse.runs().collect::<Vec<_>>(),
             dense.set_slices().collect::<Vec<_>>()
         );
+    }
+    #[test]
+    fn test_row_id_bitmap_roaring_treemap_equivalence() {
+        for ids in [
+            vec![1u32, 10, 10_000, 1_000_000],
+            (0..100_000u32).filter(|id| id % 3 != 0).collect(),
+        ] {
+            let bitmap = RowIdBitmap::from_row_ids(1_000_001, ids);
+            let treemap = bitmap.to_roaring_treemap();
+            assert_eq!(
+                treemap.iter().collect::<Vec<_>>(),
+                bitmap.iter().map(u64::from).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                treemap
+                    .bitmaps()
+                    .map(|(partition, _)| partition)
+                    .collect::<Vec<_>>(),
+                vec![0]
+            );
+        }
     }
 
     #[test]
@@ -2545,18 +2584,20 @@ mod tests {
             original_size: 4,
             compressed_size: 5,
             index_size: 6,
+            index_generation: 7,
             flattened: true,
             bloom_ver: 42,
         };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains("\"bloom_ver\":42"));
+        assert!(s.contains("\"index_generation\":7"));
         let parsed: FileMeta = serde_json::from_str(&s).unwrap();
         assert_eq!(parsed, m);
     }
 
     #[test]
-    fn test_file_meta_serde_json_legacy_without_bloom_ver_defaults_to_zero() {
-        // Old payloads written before bloom_ver was added must still deserialize.
+    fn test_file_meta_serde_json_legacy_fields_default_to_zero() {
+        // Old payloads written before generation/bloom fields were added remain readable.
         let legacy = r#"{
             "min_ts": 1,
             "max_ts": 2,
@@ -2568,6 +2609,7 @@ mod tests {
         }"#;
         let parsed: FileMeta = serde_json::from_str(legacy).unwrap();
         assert_eq!(parsed.bloom_ver, 0);
+        assert_eq!(parsed.index_generation, 0);
     }
 
     #[test]

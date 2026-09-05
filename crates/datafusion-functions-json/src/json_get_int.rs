@@ -108,13 +108,9 @@ fn jiter_json_get_int(json_data: Option<&str>, path: &[JsonPath]) -> Result<i64,
             // error made every negative number stored only in `_source`
             // extract as NULL (pinned by the engine's
             // review_negative_numbers_from_source_extract_as_null test).
-            Peek::Null
-            | Peek::True
-            | Peek::False
-            | Peek::Infinity
-            | Peek::NaN
-            | Peek::Array
-            | Peek::Object => get_err!(),
+            Peek::Null | Peek::True | Peek::False | Peek::Infinity | Peek::NaN | Peek::Array | Peek::Object => {
+                get_err!()
+            }
             _ => match jiter.known_int(peek)? {
                 NumberInt::Int(i) => Ok(i),
                 NumberInt::BigInt(_) => get_err!(),

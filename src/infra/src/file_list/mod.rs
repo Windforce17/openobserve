@@ -20,7 +20,10 @@ use config::{
     get_config,
     meta::{
         meta_store::MetaStore,
-        stream::{FileKey, FileListDeleted, FileMeta, PartitionTimeLevel, StreamStats, StreamType},
+        stream::{
+            FileKey, FileListBookKeepMode, FileListDeleted, FileMeta, PartitionTimeLevel,
+            StreamStats, StreamType,
+        },
     },
     utils::{parquet::parse_file_key_columns, time::second_micros},
 };
@@ -45,6 +48,24 @@ pub fn connect_local_cache() -> Box<dyn FileList> {
     Box::<sqlite::SqliteFileList>::default()
 }
 
+fn index_data_key_columns(file: &FileKey) -> Result<(String, String, String)> {
+    if file.meta.index_size < 0
+        || file.meta.index_generation < 0
+        || !file.key.starts_with("files/")
+        || !file.key.ends_with(config::FILE_EXT_VIX)
+        || file
+            .key
+            .split('/')
+            .any(|part| matches!(part, "" | "." | ".." | ".vix"))
+    {
+        return Err(Error::InvalidFileMeta(format!(
+            "invalid immutable index source: {}",
+            file.key
+        )));
+    }
+    parse_file_key_columns(&file.key).map_err(|e| Error::Message(e.to_string()))
+}
+
 #[async_trait]
 pub trait FileList: Sync + Send + 'static {
     async fn health_check(&self) -> Result<()>;
@@ -53,10 +74,20 @@ pub trait FileList: Sync + Send + 'static {
     async fn add(&self, account: &str, file: &str, meta: &FileMeta) -> Result<i64>;
     async fn add_history(&self, account: &str, file: &str, meta: &FileMeta) -> Result<i64>;
     async fn remove(&self, file: &str) -> Result<()>;
+    async fn retire_files(
+        &self,
+        expected: &[FileKey],
+        mode: FileListBookKeepMode,
+        created_at: i64,
+    ) -> Result<()>;
     async fn batch_add(&self, files: &[FileKey]) -> Result<()>;
     async fn batch_add_with_id(&self, files: &[FileKey]) -> Result<()>;
     async fn batch_add_history(&self, files: &[FileKey]) -> Result<()>;
-    async fn update_dump_records(&self, dump_file: &FileKey, dumped_ids: &[i64]) -> Result<()>;
+    async fn update_dump_records(
+        &self,
+        dump_file: &FileKey,
+        expected: &[(i64, i64, i64)],
+    ) -> Result<()>;
     async fn batch_process(&self, files: &[FileKey]) -> Result<()>;
     async fn batch_add_deleted(
         &self,
@@ -68,17 +99,23 @@ pub trait FileList: Sync + Send + 'static {
     async fn get(&self, file: &str) -> Result<FileMeta>;
     async fn contains(&self, file: &str) -> Result<bool>;
     async fn update_compressed_size(&self, file: &str, size: i64) -> Result<()>;
-    /// Sidecar-only heal (M3): point the EXISTING row at its rewritten
-    /// `.vxi` — set `index_size` to the new sidecar's byte size (0 = the
-    /// index-off heal deleted it) and reset `bloom_ver` to 0 so the file
-    /// re-enters the `.bf` assembler queue with its NEW bloom (the pruner
-    /// treats 0 as no-bloom meanwhile — fail-open). No new file id, no
-    /// data-key change, no other column touched.
-    async fn update_index_size_for_heal(&self, file: &str, index_size: i64) -> Result<()>;
-    /// Bulk-set `bloom_ver` for the given file_list ids. Used by the
-    /// post-merge bloom builder (enterprise `bloom::compact`).
-    /// Empty `ids` is a no-op.
-    async fn update_bloom_ver(&self, ids: &[i64], bloom_ver: i64) -> Result<()>;
+    /// Reserve a non-reusing positive generation in a staged cleanup intent.
+    /// Publication must consume this intent before cleanup claims it.
+    async fn stage_index_generation(&self, file: &FileKey, retired_at: i64) -> Result<i64>;
+    /// Atomically publish an immutable sidecar generation and enqueue the
+    /// previously active sidecar for delayed deletion. The expected identity
+    /// is read from `file.meta`; a stale snapshot or claimed intent returns false.
+    async fn publish_index_generation(
+        &self,
+        file: &FileKey,
+        new_index_size: i64,
+        new_generation: i64,
+        retired_at: i64,
+    ) -> Result<bool>;
+    /// Publish `bloom_ver` only for rows that still match the caller's
+    /// `(id, index_generation, index_size)` snapshot and remain pending.
+    /// Returns the number of rows updated.
+    async fn update_bloom_ver(&self, expected: &[(i64, i64, i64)], bloom_ver: i64) -> Result<u64>;
     /// Is `bloom_ver` still referenced by at least one live file_list row in
     /// this `(stream, date)` bucket? Used by the post-merge orphan cleanup to
     /// decide whether a `.bf` can be retired. `stream` is the combined
@@ -297,6 +334,15 @@ pub async fn remove(file: &str) -> Result<()> {
 }
 
 #[inline]
+pub async fn retire_files(
+    expected: &[FileKey],
+    mode: FileListBookKeepMode,
+    created_at: i64,
+) -> Result<()> {
+    CLIENT.retire_files(expected, mode, created_at).await
+}
+
+#[inline]
 pub async fn batch_add(files: &[FileKey]) -> Result<()> {
     CLIENT.batch_add(files).await
 }
@@ -312,11 +358,9 @@ pub async fn batch_process(files: &[FileKey]) -> Result<()> {
 }
 
 #[inline]
-pub async fn update_dump_records(dump_file: &FileKey, dumped_ids: &[i64]) -> Result<()> {
-    CLIENT.update_dump_records(dump_file, dumped_ids).await
+pub async fn update_dump_records(dump_file: &FileKey, expected: &[(i64, i64, i64)]) -> Result<()> {
+    CLIENT.update_dump_records(dump_file, expected).await
 }
-
-#[inline]
 pub async fn batch_add_deleted(
     org_id: &str,
     created_at: i64,
@@ -341,11 +385,11 @@ pub async fn contains(file: &str) -> Result<bool> {
 }
 
 #[inline]
-pub async fn update_bloom_ver(ids: &[i64], bloom_ver: i64) -> Result<()> {
-    if ids.is_empty() {
-        return Ok(());
+pub async fn update_bloom_ver(expected: &[(i64, i64, i64)], bloom_ver: i64) -> Result<u64> {
+    if expected.is_empty() {
+        return Ok(0);
     }
-    CLIENT.update_bloom_ver(ids, bloom_ver).await
+    CLIENT.update_bloom_ver(expected, bloom_ver).await
 }
 
 #[inline]
@@ -367,10 +411,31 @@ pub async fn update_compressed_size(file: &str, size: i64) -> Result<()> {
     CLIENT.update_compressed_size(file, size).await
 }
 
-/// See [`FileList::update_index_size_for_heal`].
-#[tracing::instrument(name = "infra:file_list:db:update_index_size_for_heal")]
-pub async fn update_index_size_for_heal(file: &str, index_size: i64) -> Result<()> {
-    CLIENT.update_index_size_for_heal(file, index_size).await
+/// See [`FileList::stage_index_generation`].
+#[tracing::instrument(
+    name = "infra:file_list:db:stage_index_generation",
+    skip_all,
+    fields(file = %file.key)
+)]
+pub async fn stage_index_generation(file: &FileKey, retired_at: i64) -> Result<i64> {
+    CLIENT.stage_index_generation(file, retired_at).await
+}
+
+/// See [`FileList::publish_index_generation`].
+#[tracing::instrument(
+    name = "infra:file_list:db:publish_index_generation",
+    skip_all,
+    fields(file = %file.key)
+)]
+pub async fn publish_index_generation(
+    file: &FileKey,
+    new_index_size: i64,
+    new_generation: i64,
+    retired_at: i64,
+) -> Result<bool> {
+    CLIENT
+        .publish_index_generation(file, new_index_size, new_generation, retired_at)
+        .await
 }
 
 #[inline]
@@ -741,16 +806,13 @@ pub async fn query_dump_stats_by_date_range(
         .await
 }
 
-/// Moves all of an org's `file_list` rows into `file_list_deleted` (used by
-/// `delete_by_org` in both backends — the SQL is identical, `$N` binds work
-/// for postgres and sqlite alike).
-///
-/// `index_file` is written as a vestigial false: the deleted-file sweeper
-/// (`compact::deleted`) derives the `.vxi` sidecar key from every `.vix`
-/// key unconditionally and tolerates NotFound, so the flag is never
-/// consulted for the v3 sidecar GC.
-pub(crate) const MOVE_FILE_LIST_TO_DELETED_SQL: &str = r#"INSERT INTO file_list_deleted (account, org, stream, date, file, index_file, flattened, created_at)
-       SELECT account, org, stream, date, file, false, flattened, $2
+/// SQLite's transactional org-removal statement. PostgreSQL uses a
+/// `DELETE ... RETURNING` CTE so generation capture and row removal are one
+/// statement; SQLite serializes writers for this INSERT-then-DELETE
+/// transaction. Data tombstones preserve `index_generation`, allowing the
+/// sweeper to derive the exact active immutable sidecar.
+pub(crate) const MOVE_FILE_LIST_TO_DELETED_SQL: &str = r#"INSERT INTO file_list_deleted (account, org, stream, date, file, index_generation, index_file, flattened, created_at)
+       SELECT account, org, stream, date, file, index_generation, false, flattened, $2
        FROM file_list WHERE org = $1;"#;
 
 /// Returns `(sum(original_size), sum(index_size))` for one org+account.
@@ -809,6 +871,12 @@ fn validate_time_range(time_range: (i64, i64)) -> Result<()> {
 /// legitimately carry a `(0, 0)` range.
 #[inline]
 pub(crate) fn validate_file_meta_for_add(key: &str, meta: &FileMeta) -> Result<()> {
+    if meta.index_generation < 0 {
+        return Err(Error::InvalidFileMeta(format!(
+            "negative index generation {} for file: {key}",
+            meta.index_generation,
+        )));
+    }
     if meta.records > 0 && (meta.min_ts <= 0 || meta.max_ts <= 0 || meta.min_ts > meta.max_ts) {
         return Err(Error::InvalidFileMeta(format!(
             "degenerate time range [{}, {}] for a {}-record file: {key}",
@@ -899,6 +967,8 @@ pub struct FileRecord {
     #[sqlx(default)]
     pub index_size: i64,
     #[sqlx(default)]
+    pub index_generation: i64,
+    #[sqlx(default)]
     pub bloom_ver: i64,
     #[sqlx(default)]
     pub flattened: bool,
@@ -930,6 +1000,7 @@ impl From<&FileRecord> for FileMeta {
             original_size: r.original_size,
             compressed_size: r.compressed_size,
             index_size: r.index_size,
+            index_generation: r.index_generation,
             bloom_ver: r.bloom_ver,
             flattened: r.flattened,
         }
@@ -979,6 +1050,9 @@ pub struct FileDeletedRecord {
     pub stream: String,
     pub date: String,
     pub file: String,
+    #[sqlx(default)]
+    pub index_generation: i64,
+    #[sqlx(default)]
     pub index_file: bool,
     pub flattened: bool,
 }
@@ -1143,6 +1217,18 @@ mod tests {
             assert!(err.is_deterministic_db_error());
             assert!(err.to_string().contains(key), "error names the file: {err}");
         }
+
+        let negative_generation = FileMeta {
+            min_ts: healthy.min_ts,
+            max_ts: healthy.max_ts,
+            records: healthy.records,
+            original_size: healthy.original_size,
+            index_generation: -1,
+            ..Default::default()
+        };
+        let err = validate_file_meta_for_add(key, &negative_generation)
+            .expect_err("negative generation must be rejected");
+        assert!(matches!(err, Error::InvalidFileMeta(_)));
     }
 
     // ── FileListJobStatus::from(i64) ──────────────────────────────────────────
@@ -1180,6 +1266,7 @@ mod tests {
             original_size: 102400,
             compressed_size: 51200,
             index_size: 1024,
+            index_generation: 44,
             bloom_ver: 0,
             flattened: true,
             updated_at: 9999,
@@ -1192,6 +1279,7 @@ mod tests {
         assert_eq!(meta.original_size, 102400);
         assert_eq!(meta.compressed_size, 51200);
         assert_eq!(meta.index_size, 1024);
+        assert_eq!(meta.index_generation, 44);
         assert!(meta.flattened);
     }
 
@@ -1213,6 +1301,7 @@ mod tests {
             original_size: 4096,
             compressed_size: 2048,
             index_size: 0,
+            index_generation: 0,
             bloom_ver: 0,
             flattened: false,
             updated_at: 0,
@@ -1249,17 +1338,19 @@ mod tests {
             original_size: 4,
             compressed_size: 5,
             index_size: 6,
+            index_generation: 12,
             bloom_ver: 1_715_000_000_000_000,
             flattened: false,
             updated_at: 0,
         };
         let meta = FileMeta::from(&record);
         assert_eq!(meta.bloom_ver, record.bloom_ver);
+        assert_eq!(meta.index_generation, record.index_generation);
     }
 
     #[test]
-    fn test_file_record_bloom_ver_default_is_zero() {
-        // sqlx::FromRow with #[sqlx(default)] should fall back to 0 for missing column.
+    fn test_file_record_generation_and_bloom_defaults_are_zero() {
+        // sqlx::FromRow defaults missing compatibility columns to zero.
         let record = FileRecord {
             id: 0,
             account: String::new(),
@@ -1274,6 +1365,7 @@ mod tests {
             original_size: 0,
             compressed_size: 0,
             index_size: 0,
+            index_generation: 0,
             bloom_ver: 0,
             flattened: false,
             updated_at: 0,
@@ -1282,6 +1374,7 @@ mod tests {
         // that downstream search code uses to fall back to the non-bloom path.
         let meta = FileMeta::from(&record);
         assert_eq!(meta.bloom_ver, 0);
+        assert_eq!(meta.index_generation, 0);
     }
 
     // ── From<&StatsRecord> for StreamStats ───────────────────────────────────

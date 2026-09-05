@@ -244,17 +244,16 @@ fn main() -> Result<(), anyhow::Error> {
             for b in 1..=builds {
                 let bucket = make_bucket(b, rows);
                 let bytes = bucket.get_array_memory_size();
-                let result =
-                    openobserve_core::vix::core_writer::write_core_file_from_sorted_batch(
-                        "m28-seg",
-                        stream_type,
-                        bucket,
-                        &fts,
-                        &bloom,
-                        false,
-                        bytes,
-                    )
-                    .await?;
+                let result = openobserve_core::vix::core_writer::write_core_file_from_sorted_batch(
+                    "m28-seg",
+                    stream_type,
+                    bucket,
+                    &fts,
+                    &bloom,
+                    false,
+                    bytes,
+                )
+                .await?;
                 let out = result.data.len();
                 // M28_DUMP=<dir>: persist each build's container bytes for
                 // byte-identity comparison across trees (sha256sum outside).

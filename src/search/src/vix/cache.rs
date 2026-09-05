@@ -13,9 +13,9 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-//! Per-file result cache for vix index searches, keyed by
-//! `condition hash + optimize-rule + file key` (`vix_result_cache_*`
-//! metrics).
+//! Per-file result cache for vix index searches. Identity includes condition,
+//! optimize rule, logical file key, immutable index generation, and exact
+//! index size (`vix_result_cache_*` metrics).
 
 use std::{
     collections::{HashSet, VecDeque},
@@ -58,8 +58,14 @@ pub enum CacheEntry {
         width: i64,
         counts: Vec<u64>,
     },
-    /// multi histogram optimization
-    MultiHistogram(Vec<(i64, String, u64)>),
+    /// multi histogram optimization, stored with absolute raw-timestamp
+    /// bucket starts so zero-offset sliding-window hits can be filtered and
+    /// exact nonzero-offset entries can rematerialize local bucket labels.
+    MultiHistogram {
+        width: i64,
+        phase: i64,
+        rows: Vec<(i64, String, u64)>,
+    },
     /// group-by top-n optimization
     TopN(Vec<(Vec<String>, u64)>),
     /// simple distinct optimization
@@ -72,9 +78,9 @@ pub enum CacheEntry {
 impl CacheEntry {
     /// Materialize the entry as the query's [`VixSearchResult`]. Histogram
     /// entries live on their own absolute grid and reposition into the
-    /// query's `SimpleHistogram` grid; `None` means the entry cannot serve
-    /// this query (grid mismatch — treat as a cache miss). Every other
-    /// variant converts unconditionally.
+    /// requesting histogram grid; `None` means the entry cannot serve this
+    /// query (grid mismatch — treat as a cache miss). Every other variant
+    /// converts unconditionally.
     fn into_result(self, rule: Option<&IndexOptimizeMode>) -> Option<VixSearchResult> {
         Some(match self {
             CacheEntry::RowIds(row_ids, row_group_size) => VixSearchResult::RowIdsSelection {
@@ -126,8 +132,38 @@ impl CacheEntry {
                 }
                 VixSearchResult::Histogram(out)
             }
-            CacheEntry::MultiHistogram(multi_histogram) => {
-                VixSearchResult::MultiHistogram(multi_histogram)
+            CacheEntry::MultiHistogram { width, phase, rows } => {
+                let Some(IndexOptimizeMode::SimpleMultiHistogram(
+                    min_value,
+                    max_value,
+                    bucket_width,
+                    ts_offset,
+                    _,
+                )) = rule
+                else {
+                    return None;
+                };
+                let q_width = i64::try_from((*bucket_width).max(1)).ok()?;
+                let raw_min = min_value.checked_sub(*ts_offset)?;
+                let raw_max = max_value.checked_sub(*ts_offset)?;
+                let q_phase = raw_min.rem_euclid(q_width);
+                if width != q_width || phase != q_phase {
+                    return None;
+                }
+
+                let mut out = Vec::with_capacity(rows.len());
+                for (raw_bucket, value, count) in rows {
+                    // Validate every cached row before filtering. A malformed
+                    // entry must miss rather than silently dropping a row
+                    // that belongs to a different grid.
+                    if raw_bucket.rem_euclid(q_width) != q_phase {
+                        return None;
+                    }
+                    if raw_bucket >= raw_min && raw_bucket < raw_max {
+                        out.push((raw_bucket.checked_add(*ts_offset)?, value, count));
+                    }
+                }
+                VixSearchResult::MultiHistogram(out)
             }
             CacheEntry::TopN(top_n) => VixSearchResult::TopN(top_n),
             CacheEntry::Distinct(distinct) => VixSearchResult::Distinct(distinct),
@@ -150,14 +186,14 @@ impl CacheEntry {
                     + std::mem::size_of::<Vec<u64>>()
                     + 2 * std::mem::size_of::<i64>()
             }
-            CacheEntry::MultiHistogram(multi_histogram) => {
-                multi_histogram
-                    .iter()
+            CacheEntry::MultiHistogram { rows, .. } => {
+                rows.iter()
                     .map(|(_, s, _)| {
                         s.capacity() + std::mem::size_of::<i64>() + std::mem::size_of::<u64>()
                     })
                     .sum::<usize>()
                     + std::mem::size_of::<Vec<(i64, String, u64)>>()
+                    + 2 * std::mem::size_of::<i64>()
             }
             CacheEntry::TopN(top_n) => {
                 top_n
@@ -276,13 +312,12 @@ impl VixResultCache {
         old
     }
 
-    /// M12 heal invalidation: remove EVERY entry belonging to the given data
-    /// file keys, returning how many were dropped. Keys lead the cache-key
-    /// layout (`{file key}|...`, see `generate_cache_key`), so this is one
-    /// prefix extraction + set lookup per live entry — one pass covers a
-    /// whole broadcast batch. Complements the `index_size` key component:
-    /// the size change already makes pre-heal entries unreachable; this
-    /// sweep frees their budget immediately instead of waiting out the FIFO.
+    /// Broadcast invalidation: remove EVERY generation belonging to the given
+    /// logical data file keys, returning how many were dropped. Keys lead the
+    /// cache-key layout (`{file key}|...`, see `generate_cache_key`), so this
+    /// is one prefix extraction + set lookup per live entry — one pass covers
+    /// a whole broadcast batch. Generation and size already make obsolete
+    /// entries unreachable; this sweep frees their budget immediately.
     /// Stale FIFO slots left behind pop harmlessly (same contract as
     /// overwrites).
     pub fn remove_file_entries<'a, I: IntoIterator<Item = &'a str>>(&self, file_keys: I) -> usize {
@@ -551,21 +586,21 @@ mod tests {
         assert!(cache.len() <= 1000);
     }
 
-    /// M12: `remove_file_entries` drops every entry whose cache key belongs
-    /// to a purged data file (prefix up to `'|'`), exactly accounts the
-    /// freed bytes, and leaves other files' entries untouched. Stale FIFO
+    /// `remove_file_entries` drops every generation whose cache key belongs
+    /// to a purged logical data file (prefix up to `'|'`), exactly accounts
+    /// the freed bytes, and leaves other files' entries untouched. Stale FIFO
     /// slots from the removals must pop harmlessly afterwards.
     #[test]
     fn test_remove_file_entries_purges_by_file_key() {
         let cache = VixResultCache::new(100);
         let healed = "files/org/logs/s1/2026/08/18/00/healed.vix";
         let other = "files/org/logs/s1/2026/08/18/00/other.vix";
-        // two conditions x two index_size versions for the healed file,
-        // one entry for the other file
-        cache.put(format!("{healed}|100|aaaa_n_full"), CacheEntry::Count(1));
-        cache.put(format!("{healed}|100|bbbb_n_full"), CacheEntry::NoMatch);
-        cache.put(format!("{healed}|164|aaaa_n_full"), CacheEntry::Count(2));
-        cache.put(format!("{other}|100|aaaa_n_full"), CacheEntry::Count(3));
+        // two conditions across equal-sized immutable generations, plus one
+        // differently sized generation and one entry for another file
+        cache.put(format!("{healed}|41|100|aaaa_n_full"), CacheEntry::Count(1));
+        cache.put(format!("{healed}|42|100|bbbb_n_full"), CacheEntry::NoMatch);
+        cache.put(format!("{healed}|43|164|aaaa_n_full"), CacheEntry::Count(2));
+        cache.put(format!("{other}|42|100|aaaa_n_full"), CacheEntry::Count(3));
 
         // unknown file: no-op
         assert_eq!(cache.remove_file_entries(["files/org/none.vix"]), 0);
@@ -576,30 +611,33 @@ mod tests {
         assert_eq!(cache.len(), 1);
         assert!(
             cache
-                .get(&format!("{healed}|100|aaaa_n_full"), None)
+                .get(&format!("{healed}|41|100|aaaa_n_full"), None)
                 .is_none()
         );
         assert!(
             cache
-                .get(&format!("{healed}|164|aaaa_n_full"), None)
+                .get(&format!("{healed}|43|164|aaaa_n_full"), None)
                 .is_none()
         );
         assert!(
             matches!(
-                cache.get(&format!("{other}|100|aaaa_n_full"), None),
+                cache.get(&format!("{other}|42|100|aaaa_n_full"), None),
                 Some(VixSearchResult::Count(3))
             ),
             "other files' entries stay"
         );
         assert_eq!(
             cache.memory_size(),
-            entry_footprint(&format!("{other}|100|aaaa_n_full"), &CacheEntry::Count(3)),
+            entry_footprint(
+                &format!("{other}|42|100|aaaa_n_full"),
+                &CacheEntry::Count(3)
+            ),
             "freed bytes must be given back exactly"
         );
 
         // the removals' stale FIFO slots pop harmlessly under pressure
         for i in 0..200 {
-            cache.put(format!("fill_{i}|0|k_n_full"), CacheEntry::Count(i));
+            cache.put(format!("fill_{i}|0|0|k_n_full"), CacheEntry::Count(i));
         }
         assert!(cache.len() <= 100);
     }
@@ -650,10 +688,15 @@ mod tests {
 
         cache.put(
             "mhist".to_string(),
-            CacheEntry::MultiHistogram(vec![(1, "a".to_string(), 2)]),
+            CacheEntry::MultiHistogram {
+                width: 10,
+                phase: 1,
+                rows: vec![(1, "a".to_string(), 2)],
+            },
         );
+        let multi_rule = IndexOptimizeMode::SimpleMultiHistogram(1, 11, 10, 0, "level".to_string());
         assert!(matches!(
-            cache.get("mhist", None),
+            cache.get("mhist", Some(&multi_rule)),
             Some(VixSearchResult::MultiHistogram(rows)) if rows == vec![(1, "a".to_string(), 2)]
         ));
 
@@ -677,5 +720,57 @@ mod tests {
 
         // every fast-path entry reports a non-zero footprint
         assert!(cache.memory_size() > 0);
+    }
+
+    #[test]
+    fn test_multi_histogram_materialization_filters_and_rejects_bad_grid() {
+        let cache = VixResultCache::new(10);
+        cache.put(
+            "multi".to_string(),
+            CacheEntry::MultiHistogram {
+                width: 10,
+                phase: 0,
+                rows: vec![
+                    (0, "outside-low".to_string(), 1),
+                    (10, "a".to_string(), 2),
+                    (20, "b".to_string(), 3),
+                    (30, "outside-high".to_string(), 4),
+                ],
+            },
+        );
+
+        // A shifted zero-offset request keeps the same grid but narrows the
+        // absolute range. Only rows inside [10, 30) are returned.
+        let shifted = IndexOptimizeMode::SimpleMultiHistogram(10, 30, 10, 0, "level".to_string());
+        assert!(matches!(
+            cache.get("multi", Some(&shifted)),
+            Some(VixSearchResult::MultiHistogram(rows))
+                if rows == vec![(10, "a".to_string(), 2), (20, "b".to_string(), 3)]
+        ));
+
+        let wrong_phase =
+            IndexOptimizeMode::SimpleMultiHistogram(11, 31, 10, 0, "level".to_string());
+        let wrong_width =
+            IndexOptimizeMode::SimpleMultiHistogram(10, 30, 20, 0, "level".to_string());
+        assert!(cache.get("multi", Some(&wrong_phase)).is_none());
+        assert!(cache.get("multi", Some(&wrong_width)).is_none());
+        assert!(cache.get("multi", None).is_none());
+
+        cache.put(
+            "malformed".to_string(),
+            CacheEntry::MultiHistogram {
+                width: 10,
+                phase: 0,
+                rows: vec![(15, "misaligned".to_string(), 1)],
+            },
+        );
+        assert!(
+            cache.get("malformed", Some(&shifted)).is_none(),
+            "a malformed row must make the whole entry miss"
+        );
+
+        let overflowing =
+            IndexOptimizeMode::SimpleMultiHistogram(i64::MIN, i64::MAX, 10, 1, "level".to_string());
+        assert!(cache.get("multi", Some(&overflowing)).is_none());
     }
 }

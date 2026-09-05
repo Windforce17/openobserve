@@ -1373,9 +1373,9 @@ mod tests {
         );
     }
 
-    /// #52 bloom-only: the demoted field contributes ZERO dictionary terms,
-    /// its values answer from the composite (with coverage guards), and the
-    /// indexed sibling field keeps exact index behavior.
+    /// #52 bloom-only: even with the any-term composite switch disabled, the
+    /// explicitly demoted field contributes ZERO dictionary terms, its values
+    /// answer from an ID-only composite, and ordinary sibling fields stay out.
     #[test]
     fn bloom_only_field_skips_dictionary_and_covers_composite() {
         use std::sync::Arc;
@@ -1407,7 +1407,7 @@ mod tests {
         let mut writer = crate::VixWriter::new(
             &schema,
             crate::VixWriterOptions {
-                bloom_composite: true,
+                bloom_composite: false,
                 bloom_only_field_names: vec!["trace_id".to_string()],
                 ..Default::default()
             },
@@ -1469,6 +1469,13 @@ mod tests {
                 composite_guard_key("trace_id", pr, &mut buf).unwrap()
             ));
         }
+        let svc_guard_hits = (0..COMPOSITE_GUARD_PROBES)
+            .filter(|&pr| probe(comp, composite_guard_key("svc", pr, &mut buf).unwrap()))
+            .count();
+        assert!(
+            svc_guard_hits < COMPOSITE_GUARD_PROBES as usize,
+            "disabled any-term composite must not claim ordinary-field coverage"
+        );
     }
 
     /// #52/M7: a field demoted by the FIRST-ENCODE AUTO rule (thresholds

@@ -1181,7 +1181,227 @@ pub(super) fn simple_multi_histogram(
     let raw_min = min_value - ts_offset;
     let raw_max = max_value - ts_offset;
     let per_bucket_limit = config::get_config().limit.query_default_limit.max(1) as usize;
+    let access = RowAccess::plan(bitmap);
 
+    // Dictionary codes avoid hashing and materializing a breakdown string
+    // for every matched row. Restrict this to true ALL reads: even a bitmap
+    // that is dense overall can cluster its matches into a few zone chunks,
+    // where the row-wise path retains much narrower I/O. A zoned file also
+    // retains range pruning unless every chunk is wholly covered by the
+    // query window.
+    let zones_fully_covered = reader.zone_chunks().is_none_or(|chunks| {
+        chunks
+            .iter()
+            .all(|chunk| chunk.ts_min >= raw_min && chunk.ts_max < raw_max)
+    });
+    if matches!(access, RowAccess::AllRows)
+        && zones_fully_covered
+        && let Some(rows) = dict_multi_histogram(
+            reader,
+            &access,
+            min_value,
+            raw_min,
+            raw_max,
+            width,
+            breakdown_field,
+            per_bucket_limit,
+            DEFAULT_DICT_MULTI_HISTOGRAM_LIMITS,
+        )?
+    {
+        return Ok(rows);
+    }
+
+    simple_multi_histogram_rowwise(
+        reader,
+        bitmap,
+        min_value,
+        raw_min,
+        raw_max,
+        width,
+        breakdown_field,
+        per_bucket_limit,
+    )
+}
+
+/// Fixed memory guard for the dictionary-coded collector. Crossing any
+/// bound falls back to the existing row-wise implementation; it never
+/// truncates results. The byte cap bounds owned copies independently of
+/// distinct count (dictionary values themselves may be large).
+#[derive(Clone, Copy)]
+struct DictMultiHistogramLimits {
+    max_values: usize,
+    max_value_bytes: usize,
+    max_groups: usize,
+}
+
+const DEFAULT_DICT_MULTI_HISTOGRAM_LIMITS: DictMultiHistogramLimits = DictMultiHistogramLimits {
+    max_values: 16 * 1024,
+    max_value_bytes: 8 * 1024 * 1024,
+    max_groups: 256 * 1024,
+};
+
+/// Dictionary-coded full-column implementation of
+/// [`simple_multi_histogram`]. Per-row work hashes only `(bucket, code)`;
+/// each referenced dictionary value is cast/stringified once per chunk and
+/// interned once across chunks. `Ok(None)` preserves the exact row-wise
+/// fallback when the reader cannot expose the column in dictionary form,
+/// the read is not ALL, or bounded owned metadata would be exceeded.
+#[allow(clippy::too_many_arguments)]
+fn dict_multi_histogram(
+    reader: &VixReader,
+    access: &RowAccess,
+    min_value: i64,
+    raw_min: i64,
+    raw_max: i64,
+    width: i64,
+    breakdown_field: &str,
+    per_bucket_limit: usize,
+    limits: DictMultiHistogramLimits,
+) -> anyhow::Result<Option<Vec<(i64, String, u64)>>> {
+    if !matches!(access, RowAccess::AllRows) {
+        return Ok(None);
+    }
+    let chunks = match reader.read_docs_column_dict(breakdown_field) {
+        Ok(chunks) => chunks,
+        Err(e) => {
+            log::debug!(
+                "search->vix: dictionary read of multi-histogram column {breakdown_field:?} \
+                 unavailable, using the string path: {e:#}"
+            );
+            return Ok(None);
+        }
+    };
+    let timestamps = read_timestamps(reader, None)?;
+    let mut value_ids: HashMap<String, usize> = HashMap::new();
+    let mut interned_value_bytes = 0usize;
+    let mut counts: HashMap<(i64, usize), u64> = HashMap::new();
+    let mut row_offset = 0usize;
+
+    for chunk in chunks {
+        // Bound a potentially allocating numeric/bool -> Utf8 cast before
+        // performing it. Per-chunk dictionaries may carry unreferenced
+        // entries, so this conservative guard prefers the exact fallback.
+        if chunk.values.len() > limits.max_values
+            || chunk.values.get_array_memory_size() > limits.max_value_bytes
+        {
+            log::debug!(
+                "search->vix: dictionary multi-histogram chunk dictionary exceeded {} values or \
+                 {} bytes, using the string path",
+                limits.max_values,
+                limits.max_value_bytes
+            );
+            return Ok(None);
+        }
+        let values = cast(&chunk.values, &DataType::Utf8).map_err(|e| {
+            anyhow::anyhow!("column {breakdown_field:?} cannot be read as strings: {e}")
+        })?;
+        let values = values
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| {
+                anyhow::anyhow!("column {breakdown_field:?} cannot be read as strings")
+            })?;
+        let mut chunk_counts: HashMap<(i64, u64), u64> = HashMap::new();
+        for i in 0..chunk.codes.len() {
+            let row = row_offset + i;
+            if timestamps.is_null(row) || chunk.codes.is_null(i) {
+                continue;
+            }
+            let ts = timestamps.value(row);
+            if ts < raw_min || ts >= raw_max {
+                continue;
+            }
+            let code = chunk.codes.value(i);
+            let Ok(code_idx) = usize::try_from(code) else {
+                continue;
+            };
+            if code_idx >= values.len() || values.is_null(code_idx) {
+                continue;
+            }
+            let bucket = min_value + ((ts - raw_min) / width) * width;
+            let key = (bucket, code);
+            if let Some(count) = chunk_counts.get_mut(&key) {
+                *count += 1;
+            } else {
+                if chunk_counts.len() >= limits.max_groups {
+                    log::debug!(
+                        "search->vix: dictionary multi-histogram chunk exceeded {} groups, using \
+                         the string path",
+                        limits.max_groups
+                    );
+                    return Ok(None);
+                }
+                chunk_counts.insert(key, 1);
+            }
+        }
+        for ((bucket, code), count) in chunk_counts {
+            let code = usize::try_from(code).expect("validated dictionary code");
+            let value = values.value(code);
+            let value_id = if let Some(&value_id) = value_ids.get(value) {
+                value_id
+            } else {
+                let Some(next_value_bytes) = interned_value_bytes.checked_add(value.len()) else {
+                    return Ok(None);
+                };
+                if value_ids.len() >= limits.max_values || next_value_bytes > limits.max_value_bytes
+                {
+                    log::debug!(
+                        "search->vix: dictionary multi-histogram exceeded {} values or {} owned \
+                         value bytes, using the string path",
+                        limits.max_values,
+                        limits.max_value_bytes
+                    );
+                    return Ok(None);
+                }
+                let value_id = value_ids.len();
+                value_ids.insert(value.to_string(), value_id);
+                interned_value_bytes = next_value_bytes;
+                value_id
+            };
+            let key = (bucket, value_id);
+            if let Some(total) = counts.get_mut(&key) {
+                *total += count;
+            } else {
+                if counts.len() >= limits.max_groups {
+                    log::debug!(
+                        "search->vix: dictionary multi-histogram exceeded {} groups, using the \
+                         string path",
+                        limits.max_groups
+                    );
+                    return Ok(None);
+                }
+                counts.insert(key, count);
+            }
+        }
+        row_offset += chunk.codes.len();
+    }
+    debug_assert_eq!(row_offset, timestamps.len());
+
+    let mut values = vec![String::new(); value_ids.len()];
+    for (value, value_id) in value_ids {
+        values[value_id] = value;
+    }
+    Ok(Some(group_dict_multi_histogram(
+        counts,
+        &values,
+        per_bucket_limit,
+    )))
+}
+
+/// Existing row-wise string semantics, retained both as the sparse/range-
+/// pruned fallback and as the differential-test oracle for the dictionary
+/// implementation.
+#[allow(clippy::too_many_arguments)]
+fn simple_multi_histogram_rowwise(
+    reader: &VixReader,
+    bitmap: &BooleanBuffer,
+    min_value: i64,
+    raw_min: i64,
+    raw_max: i64,
+    width: i64,
+    breakdown_field: &str,
+    per_bucket_limit: usize,
+) -> anyhow::Result<Vec<(i64, String, u64)>> {
     // Zone-map fast path: skip whole chunks with no matched rows, and whole
     // chunks whose `[ts_min, ts_max]` span falls entirely outside
     // `[raw_min, raw_max)` — neither can contribute a group. The breakdown
@@ -1267,6 +1487,34 @@ fn group_multi_histogram(
             terms
                 .into_iter()
                 .map(|(value, count)| (bucket, value.to_string(), count)),
+        );
+    }
+    results
+}
+
+/// Dictionary-code counterpart of [`group_multi_histogram`]. Sorting uses
+/// the interned strings, but strings are cloned only for the retained output
+/// rows after the per-bucket limit has been applied.
+fn group_dict_multi_histogram(
+    counts: HashMap<(i64, usize), u64>,
+    values: &[String],
+    per_bucket_limit: usize,
+) -> Vec<(i64, String, u64)> {
+    let mut buckets: HashMap<i64, Vec<(usize, u64)>> = HashMap::new();
+    for ((bucket, value_id), count) in counts {
+        buckets.entry(bucket).or_default().push((value_id, count));
+    }
+    let mut results = Vec::new();
+    let mut bucket_keys: Vec<i64> = buckets.keys().copied().collect();
+    bucket_keys.sort_unstable();
+    for bucket in bucket_keys {
+        let mut terms = buckets.remove(&bucket).expect("bucket key exists");
+        terms.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| values[a.0].cmp(&values[b.0])));
+        terms.truncate(per_bucket_limit);
+        results.extend(
+            terms
+                .into_iter()
+                .map(|(value_id, count)| (bucket, values[value_id].clone(), count)),
         );
     }
     results
@@ -1886,6 +2134,30 @@ mod tests {
 
     fn all_set(len: usize) -> BooleanBuffer {
         BooleanBuffer::new_set(len)
+    }
+
+    fn rowwise_multi_histogram_reference(
+        reader: &VixReader,
+        bitmap: &BooleanBuffer,
+        min_value: i64,
+        max_value: i64,
+        bucket_width: u64,
+        ts_offset: i64,
+        breakdown_field: &str,
+    ) -> Vec<(i64, String, u64)> {
+        let width = i64::try_from(bucket_width.max(1)).unwrap();
+        let per_bucket_limit = config::get_config().limit.query_default_limit.max(1) as usize;
+        simple_multi_histogram_rowwise(
+            reader,
+            bitmap,
+            min_value,
+            min_value - ts_offset,
+            max_value - ts_offset,
+            width,
+            breakdown_field,
+            per_bucket_limit,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -2631,12 +2903,20 @@ mod tests {
     /// = 1` blocks the zone table at the 64-row floor, so any dataset over ~64
     /// rows spans several chunks.
     fn build_zone_file(ts: &[i64], bd: &[Option<&str>]) -> (Vec<u8>, Option<Vec<u8>>) {
+        build_zone_file_with_chunk_bytes(ts, bd, 1)
+    }
+
+    fn build_zone_file_with_chunk_bytes(
+        ts: &[i64],
+        bd: &[Option<&str>],
+        docs_chunk_bytes: usize,
+    ) -> (Vec<u8>, Option<Vec<u8>>) {
         let schema = Arc::new(Schema::new(vec![
             Field::new("_timestamp", DataType::Int64, false),
             Field::new("bd", DataType::Utf8, true),
         ]));
         let opts = VixWriterOptions {
-            docs_chunk_bytes: 1,
+            docs_chunk_bytes,
             ..Default::default()
         };
         let batch = RecordBatch::try_new(
@@ -2659,6 +2939,36 @@ mod tests {
             .push_batch_with_source(&batch, &sources, None)
             .unwrap();
         writer.finish().unwrap()
+    }
+
+    fn build_numeric_zone_reader(ts: &[i64], values: &[Option<i64>]) -> VixReader {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("code", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(ts.to_vec())) as ArrayRef,
+                Arc::new(Int64Array::from(values.to_vec())),
+            ],
+        )
+        .unwrap();
+        let sources =
+            StringArray::from_iter_values(ts.iter().map(|ts| format!(r#"{{"_timestamp":{ts}}}"#)));
+        let mut writer = VixWriter::new(
+            &schema,
+            VixWriterOptions {
+                docs_chunk_bytes: 1,
+                ..Default::default()
+            },
+            false,
+        );
+        writer
+            .push_batch_with_source(&batch, &sources, None)
+            .unwrap();
+        let (data, index) = writer.finish().unwrap();
+        VixReader::open_with_index(bytes::Bytes::from(data), index.map(bytes::Bytes::from)).unwrap()
     }
 
     /// The zone-map reader and the decode-path reader (zone table stripped)
@@ -2825,6 +3135,409 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn assert_multi_matches_rowwise(
+        reader: &VixReader,
+        bitmap: &BooleanBuffer,
+        min_value: i64,
+        max_value: i64,
+        bucket_width: u64,
+        ts_offset: i64,
+        field: &str,
+        expect_dict: bool,
+        label: &str,
+    ) -> Vec<(i64, String, u64)> {
+        let access = RowAccess::plan(bitmap);
+        assert!(
+            !matches!(access, RowAccess::Rows(_)),
+            "{label} must exercise an ALL or dense-filtered plan"
+        );
+        let width = i64::try_from(bucket_width).unwrap();
+        let raw_min = min_value - ts_offset;
+        let raw_max = max_value - ts_offset;
+        assert!(
+            reader
+                .zone_chunks()
+                .unwrap()
+                .iter()
+                .all(|chunk| chunk.ts_min >= raw_min && chunk.ts_max < raw_max),
+            "{label} must exercise the fully-covered zone path"
+        );
+        let per_bucket_limit = config::get_config().limit.query_default_limit.max(1) as usize;
+        let dict = dict_multi_histogram(
+            reader,
+            &access,
+            min_value,
+            raw_min,
+            raw_max,
+            width,
+            field,
+            per_bucket_limit,
+            DEFAULT_DICT_MULTI_HISTOGRAM_LIMITS,
+        )
+        .unwrap();
+        let rowwise = rowwise_multi_histogram_reference(
+            reader,
+            bitmap,
+            min_value,
+            max_value,
+            bucket_width,
+            ts_offset,
+            field,
+        );
+        if expect_dict {
+            assert_eq!(
+                dict.as_ref(),
+                Some(&rowwise),
+                "{label}: dictionary vs row-wise"
+            );
+        } else {
+            assert!(
+                dict.is_none(),
+                "{label}: filtered reads must retain the row-wise path"
+            );
+        }
+        let optimized = simple_multi_histogram(
+            reader,
+            bitmap,
+            min_value,
+            max_value,
+            bucket_width,
+            ts_offset,
+            field,
+        )
+        .unwrap();
+        assert_eq!(optimized, rowwise, "{label}: public path vs row-wise");
+        optimized
+    }
+
+    /// Differential for the production path: multiple per-chunk string
+    /// dictionaries, null rows, exact lower/upper-adjacent timestamps and
+    /// internal bucket edges. ALL exercises dictionary codes; a dense
+    /// filtered bitmap proves the exact zone-aware row-wise fallback.
+    #[test]
+    fn test_dict_multi_histogram_string_matches_rowwise() {
+        // Exceed the writer's 65,536-row physical chunk ceiling: Vortex may
+        // coalesce tiny logical chunks up to ~1 MiB, so a 320-row fixture is
+        // not sufficient to prove cross-dictionary row-offset handling.
+        const ROWS: usize = 70_000;
+        const RAW_MIN: i64 = 10_000;
+        const RAW_MAX: i64 = RAW_MIN + ROWS as i64;
+        const OFFSET: i64 = 7;
+        const WIDTH: u64 = 4_096;
+        let ts: Vec<i64> = (RAW_MIN..RAW_MAX).rev().collect();
+        let terms = ["aa", "bb", "cc", "dd", "ee", "ff", "gg"];
+        let breakdown: Vec<Option<&str>> = (0..ROWS)
+            .map(|i| ((i + 3) % 19 != 0).then_some(terms[((i / 64) * 3 + i) % terms.len()]))
+            .collect();
+        let (data, index) = build_zone_file(&ts, &breakdown);
+        let data = bytes::Bytes::from(data);
+        let reader =
+            VixReader::open_with_index(data.clone(), index.map(bytes::Bytes::from)).unwrap();
+        let data_only = VixReader::open_with_index(data, None).unwrap();
+        assert!(
+            reader.read_docs_column_dict("bd").unwrap().len() > 1,
+            "fixture must contain multiple dictionaries"
+        );
+
+        for (label, bitmap, expect_dict) in [
+            ("all", BooleanBuffer::new_set(ROWS), true),
+            (
+                "dense-filtered",
+                BooleanBuffer::from_iter((0..ROWS).map(|i| i % 4 != 2)),
+                false,
+            ),
+        ] {
+            let rows = assert_multi_matches_rowwise(
+                &reader,
+                &bitmap,
+                RAW_MIN + OFFSET,
+                RAW_MAX + OFFSET,
+                WIDTH,
+                OFFSET,
+                "bd",
+                expect_dict,
+                label,
+            );
+            assert!(
+                rows.iter().any(|row| row.0 == RAW_MIN + OFFSET),
+                "{label}: lower-bound timestamp must be retained"
+            );
+            let final_bucket = RAW_MIN + OFFSET + ((ROWS as i64 - 1) / WIDTH as i64) * WIDTH as i64;
+            assert!(
+                rows.iter().any(|row| row.0 == final_bucket),
+                "{label}: upper-adjacent timestamp must reach the final bucket"
+            );
+            let expected = (0..ROWS)
+                .filter(|&i| bitmap.value(i) && breakdown[i].is_some())
+                .count() as u64;
+            assert_eq!(
+                rows.iter().map(|row| row.2).sum::<u64>(),
+                expected,
+                "{label}: nulls must not form groups"
+            );
+        }
+        assert!(!data_only.has_index());
+        assert_multi_matches_rowwise(
+            &data_only,
+            &BooleanBuffer::new_set(ROWS),
+            RAW_MIN + OFFSET,
+            RAW_MAX + OFFSET,
+            WIDTH,
+            OFFSET,
+            "bd",
+            true,
+            "all-data-only",
+        );
+        let sparse = BooleanBuffer::from_iter((0..ROWS).map(|i| i == 0));
+        let access = RowAccess::plan(&sparse);
+        assert!(matches!(access, RowAccess::Rows(_)));
+        assert!(
+            dict_multi_histogram(
+                &reader,
+                &access,
+                RAW_MIN + OFFSET,
+                RAW_MIN,
+                RAW_MAX,
+                WIDTH as i64,
+                "bd",
+                config::get_config().limit.query_default_limit.max(1) as usize,
+                DEFAULT_DICT_MULTI_HISTOGRAM_LIMITS,
+            )
+            .unwrap()
+            .is_none(),
+            "sparse point reads must not enter the dictionary path"
+        );
+        assert_eq!(
+            simple_multi_histogram(
+                &reader,
+                &sparse,
+                RAW_MIN + OFFSET,
+                RAW_MAX + OFFSET,
+                WIDTH,
+                OFFSET,
+                "bd",
+            )
+            .unwrap(),
+            rowwise_multi_histogram_reference(
+                &reader,
+                &sparse,
+                RAW_MIN + OFFSET,
+                RAW_MAX + OFFSET,
+                WIDTH,
+                OFFSET,
+                "bd",
+            ),
+        );
+    }
+
+    #[test]
+    fn test_dict_multi_histogram_metadata_caps_fall_back_exactly() {
+        let reader = build_reader();
+        let bitmap = BooleanBuffer::new_set(8);
+        let access = RowAccess::plan(&bitmap);
+        assert!(matches!(access, RowAccess::AllRows));
+        let per_bucket_limit = config::get_config().limit.query_default_limit.max(1) as usize;
+        let expected =
+            rowwise_multi_histogram_reference(&reader, &bitmap, 100, 108, 4, 0, "service");
+        let cases = [
+            (
+                "distinct-values",
+                DictMultiHistogramLimits {
+                    max_values: 1,
+                    ..DEFAULT_DICT_MULTI_HISTOGRAM_LIMITS
+                },
+            ),
+            (
+                "owned-value-bytes",
+                DictMultiHistogramLimits {
+                    max_value_bytes: 0,
+                    ..DEFAULT_DICT_MULTI_HISTOGRAM_LIMITS
+                },
+            ),
+            (
+                "groups",
+                DictMultiHistogramLimits {
+                    max_groups: 1,
+                    ..DEFAULT_DICT_MULTI_HISTOGRAM_LIMITS
+                },
+            ),
+        ];
+        for (label, limits) in cases {
+            let dict = dict_multi_histogram(
+                &reader,
+                &access,
+                100,
+                100,
+                108,
+                4,
+                "service",
+                per_bucket_limit,
+                limits,
+            )
+            .unwrap();
+            assert!(
+                dict.is_none(),
+                "{label}: cap crossing must request exact row-wise fallback"
+            );
+            let fallback = simple_multi_histogram_rowwise(
+                &reader,
+                &bitmap,
+                100,
+                100,
+                108,
+                4,
+                "service",
+                per_bucket_limit,
+            )
+            .unwrap();
+            assert_eq!(fallback, expected, "{label}: fallback must remain exact");
+        }
+    }
+
+    /// Numeric dictionary values take the same Utf8 cast as the row-wise
+    /// collector for ALL; dense filtered reads retain the row-wise path.
+    #[test]
+    fn test_dict_multi_histogram_numeric_matches_rowwise() {
+        // Numeric dictionary payloads are compact enough for Vortex to
+        // coalesce 70k rows into one physical chunk; this remains bounded
+        // while making the raw Int64 column exceed the coalescing target.
+        const ROWS: usize = 262_144;
+        const RAW_MIN: i64 = 20_000;
+        const RAW_MAX: i64 = RAW_MIN + ROWS as i64;
+        const OFFSET: i64 = -11;
+        const WIDTH: u64 = 65_536;
+        let ts: Vec<i64> = (RAW_MIN..RAW_MAX).rev().collect();
+        let values: Vec<Option<i64>> = (0..ROWS)
+            .map(|i| {
+                ((i + 5) % 23 != 0).then_some(match ((i / 64) + i) % 5 {
+                    0 => -7,
+                    1 => 0,
+                    2 => 200,
+                    3 => 404,
+                    _ => 503,
+                })
+            })
+            .collect();
+        let reader = build_numeric_zone_reader(&ts, &values);
+        assert!(
+            reader.read_docs_column_dict("code").unwrap().len() > 1,
+            "fixture must contain multiple numeric dictionaries"
+        );
+
+        for (label, bitmap, expect_dict) in [
+            ("numeric-all", BooleanBuffer::new_set(ROWS), true),
+            (
+                "numeric-dense-filtered",
+                BooleanBuffer::from_iter((0..ROWS).map(|i| i % 5 != 1)),
+                false,
+            ),
+        ] {
+            let rows = assert_multi_matches_rowwise(
+                &reader,
+                &bitmap,
+                RAW_MIN + OFFSET,
+                RAW_MAX + OFFSET,
+                WIDTH,
+                OFFSET,
+                "code",
+                expect_dict,
+                label,
+            );
+            assert!(
+                rows.iter().all(|row| row.1.parse::<i64>().is_ok()),
+                "{label}: numeric groups must use Utf8 cast output"
+            );
+            let expected = (0..ROWS)
+                .filter(|&i| bitmap.value(i) && values[i].is_some())
+                .count() as u64;
+            assert_eq!(
+                rows.iter().map(|row| row.2).sum::<u64>(),
+                expected,
+                "{label}: numeric nulls must not form groups"
+            );
+        }
+    }
+
+    /// Manual release-mode microbenchmark for the dense production shape.
+    /// The file build and initial parity check are excluded from timings.
+    #[test]
+    #[ignore = "manual release-mode microbenchmark"]
+    fn benchmark_dict_multi_histogram_against_rowwise() {
+        const ROWS: usize = 262_144;
+        const SAMPLES: usize = 7;
+        const RAW_MIN: i64 = 1_800_000_000_000_000;
+        const WIDTH: u64 = 30_000;
+        let ts: Vec<i64> = (RAW_MIN..RAW_MIN + ROWS as i64).rev().collect();
+        let terms = [
+            "api", "auth", "billing", "cache", "catalog", "checkout", "cron", "edge", "email",
+            "events", "gateway", "ingest", "jobs", "metrics", "search", "worker",
+        ];
+        let breakdown: Vec<Option<&str>> = (0..ROWS)
+            .map(|i| {
+                (i % 257 != 0).then_some(terms[((i / 4096) * 5 + i.wrapping_mul(13)) % terms.len()])
+            })
+            .collect();
+        let (data, _index) = build_zone_file_with_chunk_bytes(&ts, &breakdown, 64 * 1024);
+        let reader = VixReader::open_with_index(bytes::Bytes::from(data), None).unwrap();
+        assert!(!reader.has_index(), "benchmark must exercise data-only ALL");
+        let bitmap = BooleanBuffer::new_set(ROWS);
+        let min_value = RAW_MIN;
+        let max_value = RAW_MIN + ROWS as i64;
+        let dict_chunks = reader.read_docs_column_dict("bd").unwrap().len();
+        assert!(dict_chunks > 1, "benchmark requires multiple dictionaries");
+
+        let optimized =
+            simple_multi_histogram(&reader, &bitmap, min_value, max_value, WIDTH, 0, "bd").unwrap();
+        let rowwise = rowwise_multi_histogram_reference(
+            &reader, &bitmap, min_value, max_value, WIDTH, 0, "bd",
+        );
+        assert_eq!(optimized, rowwise, "benchmark parity");
+
+        let mut optimized_samples = Vec::with_capacity(SAMPLES);
+        let mut rowwise_samples = Vec::with_capacity(SAMPLES);
+        for sample in 0..SAMPLES {
+            if sample % 2 == 0 {
+                let started = std::time::Instant::now();
+                std::hint::black_box(
+                    simple_multi_histogram(&reader, &bitmap, min_value, max_value, WIDTH, 0, "bd")
+                        .unwrap(),
+                );
+                optimized_samples.push(started.elapsed());
+
+                let started = std::time::Instant::now();
+                std::hint::black_box(rowwise_multi_histogram_reference(
+                    &reader, &bitmap, min_value, max_value, WIDTH, 0, "bd",
+                ));
+                rowwise_samples.push(started.elapsed());
+            } else {
+                let started = std::time::Instant::now();
+                std::hint::black_box(rowwise_multi_histogram_reference(
+                    &reader, &bitmap, min_value, max_value, WIDTH, 0, "bd",
+                ));
+                rowwise_samples.push(started.elapsed());
+
+                let started = std::time::Instant::now();
+                std::hint::black_box(
+                    simple_multi_histogram(&reader, &bitmap, min_value, max_value, WIDTH, 0, "bd")
+                        .unwrap(),
+                );
+                optimized_samples.push(started.elapsed());
+            }
+        }
+        optimized_samples.sort_unstable();
+        rowwise_samples.sort_unstable();
+        let optimized_median = optimized_samples[SAMPLES / 2];
+        let rowwise_median = rowwise_samples[SAMPLES / 2];
+        println!(
+            "simple_multi_histogram rows={ROWS} dict_chunks={dict_chunks} samples={SAMPLES} \
+             optimized_median_us={} rowwise_median_us={} speedup={:.3} parity=true",
+            optimized_median.as_micros(),
+            rowwise_median.as_micros(),
+            rowwise_median.as_secs_f64() / optimized_median.as_secs_f64(),
+        );
     }
 
     /// Perf shape: an unfiltered histogram over a sorted file with buckets

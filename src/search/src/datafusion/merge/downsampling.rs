@@ -49,6 +49,12 @@ use crate::datafusion::{
 };
 
 const TIMESTAMP_ALIAS: &str = "_timestamp_alias";
+fn downsampling_context_builder() -> DataFusionContextBuilder<'static> {
+    DataFusionContextBuilder::new()
+        .trace_id("merge_parquet_files_with_downsampling")
+        .sorted_by_time(true)
+        .shared_merge_pool(true)
+}
 
 pub async fn merge_parquet_files_with_downsampling(
     schema: Arc<Schema>,
@@ -65,10 +71,8 @@ pub async fn merge_parquet_files_with_downsampling(
     log::debug!("merge_parquet_files_with_downsampling sql: {sql}");
 
     // create datafusion context
-    let ctx = DataFusionContextBuilder::new()
-        .trace_id("merge_parquet_files_with_downsampling")
-        .sorted_by_time(true)
-        .build(get_config().limit.datafusion_min_partition_num)
+    let ctx = downsampling_context_builder()
+        .build(cfg.limit.datafusion_min_partition_num)
         .await?;
     // register union table
     let union_table = Arc::new(NewUnionTable::new(schema.clone(), tables));
@@ -404,6 +408,11 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn downsampling_context_uses_shared_merge_pool() {
+        assert!(downsampling_context_builder().uses_shared_merge_pool());
     }
 
     #[test]

@@ -38,10 +38,7 @@ use config::{
 };
 use hashbrown::HashSet;
 use infra::{
-    schema::{
-        get_stream_setting_bloom_filter_fields,
-        get_stream_setting_fts_fields,
-    },
+    schema::{get_stream_setting_bloom_filter_fields, get_stream_setting_fts_fields},
     storage,
 };
 use ingester::WAL_PARQUET_METADATA;
@@ -1006,13 +1003,15 @@ async fn merge_files(
             && get_config().common.vix_metrics_core_file_enabled);
     type SpooledOutput = Option<crate::service::vix::core_writer::VixOutput>;
     type SidecarBytes = Option<Vec<u8>>;
-    let merge_result: Result<(Vec<u8>, SpooledOutput, SidecarBytes, FileMeta, FileFormat), anyhow::Error> =
-        if use_core_file {
-            let store_original = stream_settings
-                .as_ref()
-                .is_some_and(|settings| settings.store_original_data);
-            let bloom_filter_fields = get_stream_setting_bloom_filter_fields(&stream_settings);
-            crate::service::vix::core_writer::write_core_file_from_tables(
+    let merge_result: Result<
+        (Vec<u8>, SpooledOutput, SidecarBytes, FileMeta, FileFormat),
+        anyhow::Error,
+    > = if use_core_file {
+        let store_original = stream_settings
+            .as_ref()
+            .is_some_and(|settings| settings.store_original_data);
+        let bloom_filter_fields = get_stream_setting_bloom_filter_fields(&stream_settings);
+        crate::service::vix::core_writer::write_core_file_from_tables(
             &trace_id,
             stream_type,
             schema,
@@ -1089,40 +1088,40 @@ async fn merge_files(
                 FileFormat::Vix,
             ))
         })
-        } else {
-            merge::merge_parquet_files(
-                stream_type,
-                &stream_name,
-                schema,
-                tables,
-                &bloom_filter_fields,
-                new_file_meta,
-                true,
-                // ingester WAL move job: unchanged planning (single-partition
-                // sort covers the SEGMENT BUILDER (M13) and the COMPACTOR's
-                // metadata-class merges (M20b) only)
-                false,
-            )
-            .await
-            .map_err(anyhow::Error::from)
-            .map(|result| match result {
-                MergeParquetResult::Single {
-                    buf,
-                    file_meta,
-                    file_format,
-                } => (buf, None, None, file_meta, file_format),
-                MergeParquetResult::Multiple { .. } => {
-                    // ingester should not support multiple files, it will be handled in compactor
-                    // mode
-                    panic!("[INGESTER:JOB] merge_parquet_files error: multiple files");
-                }
-            })
-        };
+    } else {
+        merge::merge_parquet_files(
+            stream_type,
+            &stream_name,
+            schema,
+            tables,
+            &bloom_filter_fields,
+            new_file_meta,
+            true,
+            // ingester WAL move job: unchanged planning (single-partition
+            // sort covers the SEGMENT BUILDER (M13) and the COMPACTOR's
+            // metadata-class merges (M20b) only)
+            false,
+        )
+        .await
+        .map_err(anyhow::Error::from)
+        .map(|result| match result {
+            MergeParquetResult::Single {
+                buf,
+                file_meta,
+                file_format,
+            } => (buf, None, None, file_meta, file_format),
+            MergeParquetResult::Multiple { .. } => {
+                // ingester should not support multiple files, it will be handled in compactor
+                // mode
+                panic!("[INGESTER:JOB] merge_parquet_files error: multiple files");
+            }
+        })
+    };
 
     // clear session data
     crate::service::search::datafusion::storage::file_list::clear(&trace_id);
 
-    let (buf, spooled_output, index_bytes, new_file_meta, file_format) = match merge_result {
+    let (buf, spooled_output, index_bytes, mut new_file_meta, file_format) = match merge_result {
         Ok(v) => v,
         Err(e) => {
             log::error!(
@@ -1137,6 +1136,9 @@ async fn merge_files(
             "merge_parquet_files error: compressed_size is 0"
         ));
     }
+    // WAL-move files are ordinary new outputs; only sidecar-only heals use
+    // positive generations.
+    new_file_meta.index_generation = 0;
     let new_file_key = super::generate_ingester_storage_file_key(
         &org_id,
         stream_type,
@@ -1177,7 +1179,7 @@ async fn merge_files(
     // between leaves an orphan object without a row, today's semantics.
     // Same account/placement as its data object.
     if let Some(index) = index_bytes {
-        let sidecar_key = config::vix_sidecar_key(&new_file_key)
+        let sidecar_key = config::vix_sidecar_key(&new_file_key, 0)
             .expect("core-file move outputs are .vix keys");
         debug_assert_eq!(index.len() as i64, new_file_meta.index_size);
         let index = Bytes::from(index);

@@ -16,8 +16,21 @@
 use std::sync::Arc;
 
 use ::datafusion::{
-    common::tree_node::TreeNode, datasource::TableProvider, physical_plan::ExecutionPlan,
+    common::tree_node::TreeNode,
+    datasource::TableProvider,
+    logical_expr::Operator,
+    physical_expr::{
+        PhysicalExpr,
+        expressions::{BinaryExpr, Column, Literal},
+    },
+    physical_plan::{
+        ExecutionPlan,
+        filter::FilterExec,
+        limit::{GlobalLimitExec, LocalLimitExec},
+        projection::ProjectionExec,
+    },
     prelude::SessionContext,
+    scalar::ScalarValue,
 };
 use arrow_schema::{DataType, Schema};
 use config::{
@@ -254,6 +267,12 @@ pub async fn search(
         index_condition_ref.clone(),
         index_optimizer_rule_ref.clone(),
     )?;
+    let has_noncanonical_filter = plan_has_noncanonical_filter(
+        &physical_plan,
+        (req.search_info.start_time, req.search_info.end_time),
+    );
+    let has_row_dropping_limit = plan_has_row_dropping_limit(&physical_plan);
+    let has_transformed_timestamp = plan_transforms_timestamp(&physical_plan);
     let index_condition = { index_condition_ref.lock().clone() };
     let idx_optimize_rule = { index_optimizer_rule_ref.lock().clone() };
     // A WHERE-less aggregation (histogram/count over everything) derives no
@@ -520,7 +539,7 @@ pub async fn search(
                     ts_offset,
                 )),
                 Some(condition),
-            ) if condition.is_condition_all() => {
+            ) if condition.is_condition_all() && !has_noncanonical_filter => {
                 Some((*min_value, *bucket_width, *num_buckets, *ts_offset))
             }
             _ => None,
@@ -568,20 +587,21 @@ pub async fn search(
                 )
             );
         } else {
-            // The plan's LIMIT rides on the SimpleSelect optimizer rule, not
-            // the scan node. DESC only — ascending scans cannot use the
-            // top-n-newest segment trimming path.
-            let segment_limit = match &idx_optimize_rule {
-                Some(IndexOptimizeMode::SimpleSelect(n, false)) if *n > 0 => Some(*n),
-                _ => empty_exec.limit(),
-            };
+            let segment_top_n = segment_top_n_plan(
+                &idx_optimize_rule,
+                empty_exec.sorted_by_time(),
+                has_noncanonical_filter,
+                has_row_dropping_limit,
+                has_transformed_timestamp,
+                empty_exec.limit(),
+            );
             let (tbls, stats) = match super::segments_scan::search(
                 query_params.clone(),
                 latest_schema.clone(),
                 empty_exec.schema().clone(),
                 &segment_ids,
                 empty_exec.sorted_by_time(),
-                segment_limit,
+                segment_top_n,
                 index_condition.clone(),
                 fst_fields.clone(),
             )
@@ -869,6 +889,117 @@ fn apply_pushdowns_and_optimizations(
     Ok(physical_plan)
 }
 
+fn plan_has_noncanonical_filter(plan: &Arc<dyn ExecutionPlan>, time_range: (i64, i64)) -> bool {
+    plan.downcast_ref::<FilterExec>()
+        .is_some_and(|filter| !is_canonical_timestamp_filter(filter.predicate(), time_range))
+        || plan
+            .children()
+            .iter()
+            .any(|child| plan_has_noncanonical_filter(child, time_range))
+}
+
+fn is_canonical_timestamp_filter(
+    predicate: &Arc<dyn PhysicalExpr>,
+    time_range: (i64, i64),
+) -> bool {
+    fn visit(
+        expr: &Arc<dyn PhysicalExpr>,
+        time_range: (i64, i64),
+        lower_seen: &mut bool,
+        upper_seen: &mut bool,
+    ) -> bool {
+        let Some(binary) = expr.downcast_ref::<BinaryExpr>() else {
+            return false;
+        };
+        if binary.op() == &Operator::And {
+            return visit(binary.left(), time_range, lower_seen, upper_seen)
+                && visit(binary.right(), time_range, lower_seen, upper_seen);
+        }
+        let (Some(column), Some(literal)) = (
+            binary.left().downcast_ref::<Column>(),
+            binary.right().downcast_ref::<Literal>(),
+        ) else {
+            return false;
+        };
+        if column.name() != TIMESTAMP_COL_NAME {
+            return false;
+        }
+        let ScalarValue::Int64(Some(value)) = literal.value() else {
+            return false;
+        };
+        match (binary.op(), *value) {
+            (Operator::GtEq, value) if value == time_range.0 && !*lower_seen => {
+                *lower_seen = true;
+                true
+            }
+            (Operator::Lt, value) if value == time_range.1 && !*upper_seen => {
+                *upper_seen = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    let (mut lower_seen, mut upper_seen) = (false, false);
+    visit(predicate, time_range, &mut lower_seen, &mut upper_seen) && lower_seen && upper_seen
+}
+
+fn plan_has_row_dropping_limit(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    plan.downcast_ref::<GlobalLimitExec>().is_some()
+        || plan.downcast_ref::<LocalLimitExec>().is_some()
+        || plan
+            .children()
+            .iter()
+            .any(|child| plan_has_row_dropping_limit(child))
+}
+
+fn plan_transforms_timestamp(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    let transforms_here = plan
+        .downcast_ref::<ProjectionExec>()
+        .is_some_and(|projection| {
+            projection.expr().iter().any(|projection_expr| {
+                projection_expr.alias == TIMESTAMP_COL_NAME
+                    && !projection_expr
+                        .expr
+                        .downcast_ref::<Column>()
+                        .is_some_and(|column| column.name() == TIMESTAMP_COL_NAME)
+            })
+        });
+    transforms_here
+        || plan
+            .children()
+            .iter()
+            .any(|child| plan_transforms_timestamp(child))
+}
+
+/// Only post-optimizer descending SimpleSelect certifies that every non-time
+/// predicate is represented by `index_condition`. A raw scan-node limit may
+/// trim retained exact batches but cannot authorize whole-segment skipping.
+fn segment_top_n_plan(
+    idx_optimize_rule: &Option<IndexOptimizeMode>,
+    sorted_by_time: bool,
+    has_residual_filter: bool,
+    has_row_dropping_limit: bool,
+    has_transformed_timestamp: bool,
+    scan_limit: Option<usize>,
+) -> Option<super::segments_scan::SegmentTopNPlan> {
+    match idx_optimize_rule {
+        Some(IndexOptimizeMode::SimpleSelect(n, false))
+            if *n > 0
+                && sorted_by_time
+                && !has_residual_filter
+                && !has_row_dropping_limit
+                && !has_transformed_timestamp =>
+        {
+            super::segments_scan::SegmentTopNPlan::exact_desc(*n)
+        }
+        _ if sorted_by_time => {
+            scan_limit.and_then(super::segments_scan::SegmentTopNPlan::trim_only)
+        }
+        _ => None,
+    }
+}
+
 fn can_use_metadata_count(
     idx_optimize_rule: &Option<IndexOptimizeMode>,
     index_condition: Option<&IndexCondition>,
@@ -1071,9 +1202,11 @@ async fn handle_index_optimize(
 
     Ok((index_files, datafusion_files))
 }
+
 /// Whether an indexless core data file can answer this query exactly without
-/// a `.vxi` sidecar. The VIX evaluator has native docs-column equality paths,
-/// while Condition::All histograms need only file metadata/zones.
+/// a `.vxi` sidecar. Native docs-column equality supports SimpleHistogram
+/// and SimpleSelect; ALL multi-histograms remain on DataFusion until their
+/// extracted timestamp coordinates match collection semantics.
 fn data_only_vix_capable(
     idx_optimize_rule: &Option<IndexOptimizeMode>,
     index_condition: Option<&IndexCondition>,
@@ -1181,6 +1314,98 @@ mod tests {
         index::Condition,
     };
 
+    #[test]
+    fn canonical_timestamp_filter_rejects_additional_residuals() {
+        let timestamp = || Arc::new(Column::new(TIMESTAMP_COL_NAME, 0)) as Arc<dyn PhysicalExpr>;
+        let literal = |value| {
+            Arc::new(Literal::new(ScalarValue::Int64(Some(value)))) as Arc<dyn PhysicalExpr>
+        };
+        let lower = Arc::new(BinaryExpr::new(timestamp(), Operator::GtEq, literal(100)))
+            as Arc<dyn PhysicalExpr>;
+        let upper = Arc::new(BinaryExpr::new(timestamp(), Operator::Lt, literal(200)))
+            as Arc<dyn PhysicalExpr>;
+        let canonical = Arc::new(BinaryExpr::new(
+            Arc::clone(&lower),
+            Operator::And,
+            Arc::clone(&upper),
+        )) as Arc<dyn PhysicalExpr>;
+        assert!(is_canonical_timestamp_filter(&canonical, (100, 200)));
+
+        let stricter = Arc::new(BinaryExpr::new(timestamp(), Operator::Gt, literal(100)))
+            as Arc<dyn PhysicalExpr>;
+        let residual =
+            Arc::new(BinaryExpr::new(canonical, Operator::And, stricter)) as Arc<dyn PhysicalExpr>;
+        assert!(!is_canonical_timestamp_filter(&residual, (100, 200)));
+        assert!(!is_canonical_timestamp_filter(&lower, (100, 200)));
+    }
+
+    #[test]
+    fn segment_top_n_plan_requires_optimizer_proof_for_skipping() {
+        assert_eq!(
+            segment_top_n_plan(
+                &Some(IndexOptimizeMode::SimpleSelect(1000, false)),
+                true,
+                false,
+                false,
+                false,
+                Some(10),
+            ),
+            super::super::segments_scan::SegmentTopNPlan::exact_desc(1000),
+        );
+        assert_eq!(
+            segment_top_n_plan(
+                &Some(IndexOptimizeMode::SimpleSelect(1000, false)),
+                true,
+                true,
+                false,
+                false,
+                Some(1000),
+            ),
+            super::super::segments_scan::SegmentTopNPlan::trim_only(1000),
+        );
+        assert_eq!(
+            segment_top_n_plan(&None, true, false, false, false, Some(1000)),
+            super::super::segments_scan::SegmentTopNPlan::trim_only(1000),
+        );
+        assert_eq!(
+            segment_top_n_plan(
+                &Some(IndexOptimizeMode::SimpleSelect(1000, true)),
+                false,
+                false,
+                false,
+                false,
+                Some(1000),
+            ),
+            None,
+        );
+        assert_eq!(
+            segment_top_n_plan(&None, true, false, false, false, Some(0)),
+            None
+        );
+        assert_eq!(
+            segment_top_n_plan(
+                &Some(IndexOptimizeMode::SimpleSelect(1000, false)),
+                true,
+                false,
+                true,
+                false,
+                Some(1000),
+            ),
+            super::super::segments_scan::SegmentTopNPlan::trim_only(1000),
+        );
+        assert_eq!(
+            segment_top_n_plan(
+                &Some(IndexOptimizeMode::SimpleSelect(1000, false)),
+                true,
+                false,
+                false,
+                true,
+                Some(1000),
+            ),
+            super::super::segments_scan::SegmentTopNPlan::trim_only(1000),
+        );
+    }
+
     fn make_file(key: &str, min_ts: i64, max_ts: i64, index_size: i64) -> FileKey {
         FileKey {
             key: key.to_string(),
@@ -1247,19 +1472,39 @@ mod tests {
         assert!(index_files.is_empty());
         assert_eq!(datafusion.len(), 1);
     }
+
     #[test]
-    fn test_split_file_list_data_only_vix_when_capable() {
-        let files = vec![core_file(100, 200, 0)];
-        let (index_files, datafusion) = split_file_list_by_time_range(files, None, true);
-        assert_eq!(index_files.len(), 1);
-        assert!(datafusion.is_empty());
+    fn test_split_file_list_indexless_multi_histogram_goes_to_datafusion() {
+        let mode = Some(IndexOptimizeMode::SimpleMultiHistogram(
+            0,
+            20,
+            10,
+            0,
+            "service".to_string(),
+        ));
+        let mut all = IndexCondition::new();
+        all.add_condition(Condition::All());
+        let allow = data_only_vix_capable(&mode, Some(&all));
+        assert!(!allow);
+        let (index_files, datafusion) =
+            split_file_list_by_time_range(vec![core_file(100, 200, 0)], None, allow);
+        assert!(index_files.is_empty());
+        assert_eq!(datafusion.len(), 1);
+
+        let mut equality = IndexCondition::new();
+        equality.add_condition(Condition::Equal("service".to_string(), "api".to_string()));
+        assert!(!data_only_vix_capable(&mode, Some(&equality)));
     }
+
     #[test]
     fn test_data_only_vix_capability_is_query_shaped() {
         let mut all = IndexCondition::new();
         all.add_condition(Condition::All());
         let mut equality = IndexCondition::new();
         equality.add_condition(Condition::Equal("service".to_string(), "api".to_string()));
+        let mut all_plus_equality = IndexCondition::new();
+        all_plus_equality.add_condition(Condition::All());
+        all_plus_equality.add_condition(Condition::Equal("service".to_string(), "api".to_string()));
 
         assert!(data_only_vix_capable(
             &Some(IndexOptimizeMode::SimpleHistogram(0, 10, 2, 0)),
@@ -1268,6 +1513,36 @@ mod tests {
         assert!(data_only_vix_capable(
             &Some(IndexOptimizeMode::SimpleHistogram(0, 10, 2, 0)),
             Some(&equality),
+        ));
+        assert!(!data_only_vix_capable(
+            &Some(IndexOptimizeMode::SimpleMultiHistogram(
+                0,
+                20,
+                10,
+                0,
+                "service".to_string(),
+            )),
+            Some(&all),
+        ));
+        assert!(!data_only_vix_capable(
+            &Some(IndexOptimizeMode::SimpleMultiHistogram(
+                0,
+                20,
+                10,
+                0,
+                "service".to_string(),
+            )),
+            Some(&equality),
+        ));
+        assert!(!data_only_vix_capable(
+            &Some(IndexOptimizeMode::SimpleMultiHistogram(
+                0,
+                20,
+                10,
+                0,
+                "service".to_string(),
+            )),
+            Some(&all_plus_equality),
         ));
         assert!(data_only_vix_capable(
             &Some(IndexOptimizeMode::SimpleSelect(10, false)),

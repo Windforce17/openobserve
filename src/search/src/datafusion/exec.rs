@@ -13,11 +13,21 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::{cmp::max, num::NonZero, str::FromStr, sync::Arc};
+use std::{
+    cmp::max,
+    fmt,
+    num::NonZero,
+    str::FromStr,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use arrow_schema::Field;
 use config::{
     FileFormat, TIMESTAMP_COL_NAME, get_batch_size, get_config,
+    get_datafusion_memory_pool_startup_config,
     meta::{
         search::{Session as SearchSession, StorageType},
         stream::FileKey,
@@ -38,7 +48,8 @@ use datafusion::{
         cache::cache_manager::{CacheManagerConfig, FileStatisticsCache},
         context::SessionConfig,
         memory_pool::{
-            FairSpillPool, GreedyMemoryPool, MemoryPool, TrackConsumersPool, UnboundedMemoryPool,
+            FairSpillPool, GreedyMemoryPool, MemoryConsumer, MemoryLimit, MemoryPool,
+            MemoryReservation, TrackConsumersPool, UnboundedMemoryPool,
         },
         runtime_env::{RuntimeEnv, RuntimeEnvBuilder},
         session_state::SessionStateBuilder,
@@ -137,14 +148,13 @@ pub fn create_session_config(
     Ok(config)
 }
 
-/// Build the configured tracked pool (`TrackConsumersPool` over the
-/// `ZO_MEMORY_CACHE_DATAFUSION_MEMORY_POOL` type) with `memory_size` bytes.
-fn build_tracked_pool(memory_size: usize) -> Result<Arc<dyn MemoryPool>> {
-    let cfg = get_config();
-    let mem_pool = super::MemoryPoolType::from_str(&cfg.memory_cache.datafusion_memory_pool)
-        .map_err(|e| {
-            DataFusionError::Execution(format!("Invalid datafusion memory pool type: {e}"))
-        })?;
+/// Build a tracked pool (`TrackConsumersPool` over `memory_pool_type`) with
+/// `memory_size` bytes. Callers that require restart-stable settings pass a
+/// value captured from their startup snapshot rather than re-reading config.
+fn build_tracked_pool(memory_size: usize, memory_pool_type: &str) -> Result<Arc<dyn MemoryPool>> {
+    let mem_pool = super::MemoryPoolType::from_str(memory_pool_type).map_err(|e| {
+        DataFusionError::Execution(format!("Invalid datafusion memory pool type: {e}"))
+    })?;
     Ok(match mem_pool {
         super::MemoryPoolType::Greedy => {
             let pool = GreedyMemoryPool::new(memory_size);
@@ -162,7 +172,130 @@ fn build_tracked_pool(memory_size: usize) -> Result<Arc<dyn MemoryPool>> {
     })
 }
 
-/// M26: ONE process-wide memory pool shared by every `merge_parquet_files`
+/// A hard accounting limit around another memory pool.
+///
+/// Cooperative [`MemoryReservation::try_grow`] calls are atomically admitted
+/// against this wrapper's own limit before reaching the inner pool. DataFusion's
+/// infallible [`MemoryPool::grow`] contract must always succeed, so that path is
+/// tracked and delegated even when it exceeds the limit; hard enforcement
+/// therefore applies to cooperative `try_grow` reservations.
+#[derive(Debug)]
+struct LimitedMemoryPool {
+    label: &'static str,
+    limit: usize,
+    reserved: AtomicUsize,
+    inner: Arc<dyn MemoryPool>,
+}
+
+impl LimitedMemoryPool {
+    fn new(label: &'static str, limit: usize, inner: Arc<dyn MemoryPool>) -> Self {
+        Self {
+            label,
+            limit,
+            reserved: AtomicUsize::new(0),
+            inner,
+        }
+    }
+
+    fn reserve(&self, additional: usize) -> std::result::Result<(), usize> {
+        self.reserved
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |reserved| {
+                reserved
+                    .checked_add(additional)
+                    .filter(|new_reserved| *new_reserved <= self.limit)
+            })
+            .map(|_| ())
+    }
+}
+
+impl MemoryPool for LimitedMemoryPool {
+    fn name(&self) -> &str {
+        self.label
+    }
+
+    fn register(&self, consumer: &MemoryConsumer) {
+        self.inner.register(consumer);
+    }
+
+    fn unregister(&self, consumer: &MemoryConsumer) {
+        self.inner.unregister(consumer);
+    }
+
+    fn grow(&self, reservation: &MemoryReservation, additional: usize) {
+        self.reserved.fetch_add(additional, Ordering::Relaxed);
+        self.inner.grow(reservation, additional);
+    }
+
+    fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
+        self.inner.shrink(reservation, shrink);
+        self.reserved.fetch_sub(shrink, Ordering::Relaxed);
+    }
+
+    fn try_grow(&self, reservation: &MemoryReservation, additional: usize) -> Result<()> {
+        self.reserve(additional).map_err(|reserved| {
+            DataFusionError::ResourcesExhausted(format!(
+                "{} memory pool cannot reserve {additional} additional bytes: \
+                 {reserved} of {} bytes already reserved",
+                self.label, self.limit
+            ))
+        })?;
+        if let Err(e) = self.inner.try_grow(reservation, additional) {
+            self.reserved.fetch_sub(additional, Ordering::AcqRel);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    fn reserved(&self) -> usize {
+        self.reserved.load(Ordering::Acquire)
+    }
+
+    fn memory_limit(&self) -> MemoryLimit {
+        MemoryLimit::Finite(self.limit)
+    }
+}
+
+impl fmt::Display for LimitedMemoryPool {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}(used: {}, limit: {}, inner: {})",
+            self.label,
+            self.reserved(),
+            self.limit,
+            self.inner
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeMemoryPoolMode {
+    PerContext,
+    SharedQuery,
+    SharedMerge,
+}
+
+fn runtime_memory_pool_mode(
+    shared_merge_pool: bool,
+    shared_query_pool: bool,
+) -> RuntimeMemoryPoolMode {
+    if shared_merge_pool {
+        RuntimeMemoryPoolMode::SharedMerge
+    } else if shared_query_pool {
+        RuntimeMemoryPoolMode::SharedQuery
+    } else {
+        RuntimeMemoryPoolMode::PerContext
+    }
+}
+
+fn shared_query_global_limit() -> usize {
+    std::cmp::max(
+        DATAFUSION_MIN_MEM,
+        get_datafusion_memory_pool_startup_config().max_size,
+    )
+}
+
+/// ONE process-wide memory pool shared by every `merge_parquet_files`
 /// context (compactor merges and segment-builder L0 builds of flat/metadata
 /// streams). Sized once with the SAME `datafusion_max_size` semantics a
 /// single merge context used to get.
@@ -177,18 +310,49 @@ fn build_tracked_pool(memory_size: usize) -> Result<Arc<dyn MemoryPool>> {
 /// speed and OOM-killed it — the M26 "live per-job leak" signature. Sharing
 /// the pool bounds the AGGREGATE: concurrent merges now spill (correct,
 /// bounded, alive) instead of stacking fresh gigabytes (unbounded, dead).
-/// Query contexts are untouched.
-static SHARED_MERGE_POOL: std::sync::LazyLock<Result<Arc<dyn MemoryPool>>> =
+/// Query contexts use their own independently configured pool selection.
+static SHARED_MERGE_POOL: std::sync::LazyLock<Arc<dyn MemoryPool>> =
     std::sync::LazyLock::new(|| {
-        let memory_size = std::cmp::max(
-            DATAFUSION_MIN_MEM,
-            get_config().memory_cache.datafusion_max_size,
-        );
-        log::info!(
-            "[DATAFUSION] shared merge memory pool created: {} MB",
-            memory_size / (1024 * 1024)
-        );
-        build_tracked_pool(memory_size)
+        let cfg = get_config();
+        let memory_size = std::cmp::max(DATAFUSION_MIN_MEM, cfg.memory_cache.datafusion_max_size);
+        let memory_size_mib = memory_size / (1024 * 1024);
+        let pool = build_tracked_pool(memory_size, &cfg.memory_cache.datafusion_memory_pool)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "shared merge memory pool init failed at {memory_size_mib} MiB \
+                 with type {:?}: {e}",
+                    cfg.memory_cache.datafusion_memory_pool
+                )
+            });
+        log::info!("[DATAFUSION] shared merge memory pool created: {memory_size_mib} MiB");
+        pool
+    });
+
+/// ONE process-wide tracked memory pool shared by non-merge query contexts
+/// when `ZO_MEMORY_CACHE_DATAFUSION_SHARED_QUERY_POOL` is enabled. A hard
+/// [`LimitedMemoryPool`] wraps the configured pool so aggregate cooperative
+/// reservations cannot exceed `datafusion_max_size`, including FairSpillPool's
+/// late-consumer case. Merge contexts never use this pool.
+static SHARED_QUERY_POOL: std::sync::LazyLock<Arc<dyn MemoryPool>> =
+    std::sync::LazyLock::new(|| {
+        let settings = get_datafusion_memory_pool_startup_config();
+        let memory_size = shared_query_global_limit();
+        let memory_size_mib = memory_size / (1024 * 1024);
+        let tracked_pool =
+            build_tracked_pool(memory_size, &settings.pool_type).unwrap_or_else(|e| {
+                panic!(
+                    "shared query memory pool init failed at {memory_size_mib} MiB \
+                         with type {:?}: {e}",
+                    settings.pool_type
+                )
+            });
+        let pool: Arc<dyn MemoryPool> = Arc::new(LimitedMemoryPool::new(
+            "shared-query-global",
+            memory_size,
+            tracked_pool,
+        ));
+        log::info!("[DATAFUSION] shared query memory pool created: {memory_size_mib} MiB");
+        pool
     });
 
 pub async fn create_runtime_env(trace_id: &str, memory_limit: usize) -> Result<RuntimeEnv> {
@@ -200,6 +364,47 @@ async fn create_runtime_env_inner(
     memory_limit: usize,
     shared_merge_pool: bool,
 ) -> Result<RuntimeEnv> {
+    let mode = runtime_memory_pool_mode(
+        shared_merge_pool,
+        get_datafusion_memory_pool_startup_config().shared_query_pool,
+    );
+    create_runtime_env_with_pool_mode(trace_id, memory_limit, mode)
+}
+
+fn create_runtime_env_with_pool_mode(
+    trace_id: &str,
+    memory_limit: usize,
+    mode: RuntimeMemoryPoolMode,
+) -> Result<RuntimeEnv> {
+    let cfg = get_config();
+    let inner_pool = match mode {
+        RuntimeMemoryPoolMode::SharedMerge => Arc::clone(&SHARED_MERGE_POOL),
+        RuntimeMemoryPoolMode::SharedQuery => {
+            // Preserve the existing RuntimeEnv floor while enforcing any
+            // smaller enterprise workgroup quota below the global pool.
+            let local_limit = std::cmp::min(
+                std::cmp::max(DATAFUSION_MIN_MEM, memory_limit),
+                shared_query_global_limit(),
+            );
+            Arc::new(LimitedMemoryPool::new(
+                "shared-query-context",
+                local_limit,
+                Arc::clone(&SHARED_QUERY_POOL),
+            )) as Arc<dyn MemoryPool>
+        }
+        RuntimeMemoryPoolMode::PerContext => {
+            let memory_size = std::cmp::max(DATAFUSION_MIN_MEM, memory_limit);
+            build_tracked_pool(memory_size, &cfg.memory_cache.datafusion_memory_pool)?
+        }
+    };
+    create_runtime_env_with_inner_pool(trace_id, inner_pool, &cfg)
+}
+
+fn create_runtime_env_with_inner_pool(
+    trace_id: &str,
+    inner_pool: Arc<dyn MemoryPool>,
+    cfg: &config::Config,
+) -> Result<RuntimeEnv> {
     let object_store_registry = DefaultObjectStoreRegistry::new();
 
     let memory = super::storage::memory::FS::new();
@@ -210,7 +415,6 @@ async fn create_runtime_env_inner(
     let wal_url = url::Url::parse("wal:///").unwrap();
     object_store_registry.register_store(&wal_url, Arc::new(wal));
 
-    let cfg = get_config();
     let mut builder =
         RuntimeEnvBuilder::new().with_object_store_registry(Arc::new(object_store_registry));
     if cfg.limit.datafusion_file_stat_cache_max_size > 0 {
@@ -221,24 +425,10 @@ async fn create_runtime_env_inner(
         builder = builder.with_cache_manager(cache_config);
     }
 
-    let inner_pool = if shared_merge_pool {
-        match SHARED_MERGE_POOL.as_ref() {
-            Ok(pool) => Arc::clone(pool),
-            Err(e) => {
-                return Err(DataFusionError::Execution(format!(
-                    "shared merge memory pool init failed: {e}"
-                )));
-            }
-        }
-    } else {
-        let memory_size = std::cmp::max(DATAFUSION_MIN_MEM, memory_limit);
-        build_tracked_pool(memory_size)?
-    };
-    // per-context peak observability on top of the (possibly shared) pool:
-    // with the shared pool the logged peak is the POOL level at this
-    // context's grows — the pod-relevant number
+    // Peak observability stays per-context for shared queries because it wraps
+    // the local limiter. That limiter delegates to the process-wide hard cap.
+    // Merge contexts continue reporting their separate shared merge pool.
     let memory_pool = PeakMemoryPool::new(inner_pool, trace_id.to_string());
-
     builder = builder.with_memory_pool(Arc::new(memory_pool));
     builder.build()
 }
@@ -329,20 +519,33 @@ impl<'a> DataFusionContextBuilder<'a> {
     }
 
     /// M26: draw this context's DataFusion memory from the ONE process-wide
-    /// merge pool (see [`SHARED_MERGE_POOL`]) instead of a fresh full-size
-    /// per-context pool. Set by `merge_parquet_files` — compactor merges and
-    /// segment-builder L0 builds — so CONCURRENT merges share (and spill
-    /// against) one bounded budget rather than stacking `datafusion_max_size`
-    /// each. Query contexts keep their per-context pools.
+    /// merge pool (see [`SHARED_MERGE_POOL`]). Set by `merge_parquet_files`
+    /// for compactor merges and segment-builder L0 builds, so concurrent
+    /// merges share one bounded budget. This always selects the merge pool,
+    /// independently of whether non-merge queries use their opt-in shared
+    /// query pool or the default fresh per-context pools.
     pub fn shared_merge_pool(mut self, shared_merge_pool: bool) -> Self {
         self.shared_merge_pool = shared_merge_pool;
         self
     }
 
+    /// Reports whether this builder is pinned to the process-wide merge pool.
+    /// Merge-path constructors use this to assert their memory-pool routing.
+    #[doc(hidden)]
+    pub fn uses_shared_merge_pool(&self) -> bool {
+        self.shared_merge_pool
+    }
+
     pub async fn build(self, target_partitions: usize) -> Result<SessionContext, DataFusionError> {
         let cfg = get_config();
-        let (target_partitions, memory_size) =
-            (target_partitions, cfg.memory_cache.datafusion_max_size);
+        let startup_pool = get_datafusion_memory_pool_startup_config();
+        let memory_size = if !self.shared_merge_pool && startup_pool.shared_query_pool {
+            // Shared-query defaults are restart-only. Enterprise workgroups
+            // may lower this captured process limit below.
+            startup_pool.max_size
+        } else {
+            cfg.memory_cache.datafusion_max_size
+        };
         #[cfg(feature = "enterprise")]
         let (target_partitions, memory_size) = get_cpu_and_mem_limit(
             self.trace_id,
@@ -532,11 +735,20 @@ impl TableBuilder {
         let target_partitions = max(cfg.limit.datafusion_min_partition_num, target_partitions);
 
         #[cfg(feature = "enterprise")]
+        let memory_size = {
+            let startup_pool = get_datafusion_memory_pool_startup_config();
+            if startup_pool.shared_query_pool {
+                startup_pool.max_size
+            } else {
+                cfg.memory_cache.datafusion_max_size
+            }
+        };
+        #[cfg(feature = "enterprise")]
         let (target_partitions, _) = get_cpu_and_mem_limit(
             &session.id,
             session.work_group.clone(),
             target_partitions,
-            cfg.memory_cache.datafusion_max_size,
+            memory_size,
         )
         .await?;
 
@@ -870,7 +1082,12 @@ async fn partition_vix_files_by_row_order(
             if let Some(&class) = VIX_ROW_ORDER_MEMO.read().get(&file.key) {
                 return (file, class);
             }
-            if let Some(reader) = crate::vix::reader_cache::GLOBAL_CACHE.get(&file.key) {
+            let reader_key = crate::vix::reader_cache::ReaderCacheKey::new(
+                file.key.clone(),
+                file.meta.index_generation,
+                file.meta.index_size,
+            );
+            if let Some(reader) = crate::vix::reader_cache::GLOBAL_CACHE.get(&reader_key) {
                 let class = classify_vix_order(
                     reader.row_order().is_ts_desc(),
                     reader.ts_desc_row_ranges().map(|r| r.len()),
@@ -983,8 +1200,12 @@ mod tests {
 
     use arrow_schema::{DataType, Field, Schema};
     use config::get_config;
+    use datafusion::execution::memory_pool::{MemoryConsumer, MemoryLimit};
+    use parking_lot::Mutex;
 
     use super::*;
+
+    static SHARED_POOL_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn create_test_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
@@ -994,57 +1215,212 @@ mod tests {
         ]))
     }
 
-    /// M26 pin: every `shared_merge_pool(true)` context draws from ONE
-    /// process-wide pool — a reservation made through context A is visible
-    /// in context B's pool level, so concurrent merges are bounded in
-    /// AGGREGATE (48Gi compactors died stacking ~12.8GB per-context
-    /// metadata-merge pool fills, 2026-08-21). Default contexts keep
-    /// isolated per-context pools.
-    #[tokio::test]
-    async fn m26_merge_contexts_share_one_memory_pool() {
-        use datafusion::execution::memory_pool::MemoryConsumer;
+    #[test]
+    fn shared_query_runtime_envs_enforce_local_and_aggregate_caps() {
+        const GLOBAL_LIMIT: usize = DATAFUSION_MIN_MEM * 4;
+        const LOCAL_LIMIT: usize = DATAFUSION_MIN_MEM * 2;
+        let tracked: Arc<dyn MemoryPool> = Arc::new(TrackConsumersPool::new(
+            FairSpillPool::new(GLOBAL_LIMIT),
+            NonZero::new(20).unwrap(),
+        ));
+        let global_pool: Arc<dyn MemoryPool> = Arc::new(LimitedMemoryPool::new(
+            "test-query-global",
+            GLOBAL_LIMIT,
+            tracked,
+        ));
+        let local_a: Arc<dyn MemoryPool> = Arc::new(LimitedMemoryPool::new(
+            "test-query-local-a",
+            LOCAL_LIMIT,
+            Arc::clone(&global_pool),
+        ));
+        let local_b: Arc<dyn MemoryPool> = Arc::new(LimitedMemoryPool::new(
+            "test-query-local-b",
+            GLOBAL_LIMIT,
+            Arc::clone(&global_pool),
+        ));
+        let cfg = get_config();
+        let runtime_a =
+            create_runtime_env_with_inner_pool("shared-query-a", local_a, &cfg).unwrap();
+        let runtime_b =
+            create_runtime_env_with_inner_pool("shared-query-b", local_b, &cfg).unwrap();
+        let pool_a = Arc::clone(&runtime_a.memory_pool);
+        let pool_b = Arc::clone(&runtime_b.memory_pool);
+        assert!(LOCAL_LIMIT < GLOBAL_LIMIT);
+        assert!(matches!(
+            pool_a.memory_limit(),
+            MemoryLimit::Finite(limit) if limit == LOCAL_LIMIT
+        ));
+        assert!(matches!(
+            pool_b.memory_limit(),
+            MemoryLimit::Finite(limit) if limit == GLOBAL_LIMIT
+        ));
 
-        let ctx_a = DataFusionContextBuilder::new()
-            .trace_id("m26-shared-a")
-            .shared_merge_pool(true)
-            .build(2)
-            .await
-            .unwrap();
-        let ctx_b = DataFusionContextBuilder::new()
-            .trace_id("m26-shared-b")
-            .shared_merge_pool(true)
-            .build(2)
-            .await
-            .unwrap();
-        let pool_a = Arc::clone(&ctx_a.runtime_env().memory_pool);
-        let pool_b = Arc::clone(&ctx_b.runtime_env().memory_pool);
-
-        const GROW: usize = 64 * 1024 * 1024;
-        let base_b = pool_b.reserved();
-        let mut reservation = MemoryConsumer::new("m26-shared-pin").register(&pool_a);
-        reservation.grow(GROW);
-        assert!(
-            pool_b.reserved() >= base_b + GROW,
-            "a reservation through context A must be visible in context B's \
-             pool level: base={base_b}, now={}",
-            pool_b.reserved()
+        let reservation_a = MemoryConsumer::new("shared-query-cap-a").register(&pool_a);
+        reservation_a.try_grow(LOCAL_LIMIT).unwrap();
+        assert_eq!(
+            pool_a.reserved(),
+            LOCAL_LIMIT,
+            "PeakMemoryPool must report query-local reservations"
         );
 
-        // a DEFAULT context's pool is its own: the shared reservation must
-        // not appear there
-        let ctx_c = DataFusionContextBuilder::new()
-            .trace_id("m26-default-c")
-            .build(2)
-            .await
-            .unwrap();
-        let pool_c = Arc::clone(&ctx_c.runtime_env().memory_pool);
+        let reservation_b = MemoryConsumer::new("shared-query-cap-b").register(&pool_b);
+        reservation_b.try_grow(GLOBAL_LIMIT - LOCAL_LIMIT).unwrap();
+        assert_eq!(pool_b.reserved(), GLOBAL_LIMIT - LOCAL_LIMIT);
+        assert_eq!(global_pool.reserved(), GLOBAL_LIMIT);
+
         assert!(
-            pool_c.reserved() < GROW,
-            "default contexts must keep isolated per-context pools, got {}",
-            pool_c.reserved()
+            reservation_b.try_grow(1).is_err(),
+            "combined query reservations must not exceed the process cap"
         );
 
-        reservation.free();
+        drop(reservation_a);
+        reservation_b.try_grow(1).unwrap();
+        drop(reservation_b);
+        assert_eq!(pool_a.reserved(), 0);
+        assert_eq!(pool_b.reserved(), 0);
+        assert_eq!(global_pool.reserved(), 0);
+    }
+
+    #[test]
+    fn shared_query_runtime_envs_use_the_process_pool() {
+        const GROW: usize = 1024 * 1024;
+        let _guard = SHARED_POOL_TEST_LOCK.lock();
+        let runtime_a = create_runtime_env_with_pool_mode(
+            "shared-query-wiring-a",
+            DATAFUSION_MIN_MEM,
+            RuntimeMemoryPoolMode::SharedQuery,
+        )
+        .unwrap();
+        let runtime_b = create_runtime_env_with_pool_mode(
+            "shared-query-wiring-b",
+            DATAFUSION_MIN_MEM,
+            RuntimeMemoryPoolMode::SharedQuery,
+        )
+        .unwrap();
+        let pool_a = Arc::clone(&runtime_a.memory_pool);
+        let pool_b = Arc::clone(&runtime_b.memory_pool);
+        let global_baseline = SHARED_QUERY_POOL.reserved();
+
+        {
+            let reservation_a = MemoryConsumer::new("shared-query-wiring-a").register(&pool_a);
+            let reservation_b = MemoryConsumer::new("shared-query-wiring-b").register(&pool_b);
+            reservation_a.try_grow(GROW).unwrap();
+            reservation_b.try_grow(GROW).unwrap();
+            assert_eq!(pool_a.reserved(), GROW);
+            assert_eq!(pool_b.reserved(), GROW);
+            assert_eq!(
+                SHARED_QUERY_POOL.reserved(),
+                global_baseline + 2 * GROW,
+                "both production SharedQuery runtimes must delegate to the static process pool"
+            );
+        }
+
+        assert_eq!(pool_a.reserved(), 0);
+        assert_eq!(pool_b.reserved(), 0);
+        assert_eq!(SHARED_QUERY_POOL.reserved(), global_baseline);
+    }
+
+    #[test]
+    fn limited_pool_blocks_late_fair_spill_consumer_overcommit() {
+        const LIMIT: usize = 1024 * 1024;
+        let inner: Arc<dyn MemoryPool> = Arc::new(FairSpillPool::new(LIMIT));
+        let pool: Arc<dyn MemoryPool> =
+            Arc::new(LimitedMemoryPool::new("test-global", LIMIT, inner));
+        let reservation_a = MemoryConsumer::new("spillable-a")
+            .with_can_spill(true)
+            .register(&pool);
+        reservation_a.try_grow(LIMIT).unwrap();
+
+        let reservation_b = MemoryConsumer::new("spillable-b")
+            .with_can_spill(true)
+            .register(&pool);
+        assert!(
+            reservation_b.try_grow(LIMIT / 2).is_err(),
+            "a late FairSpill consumer must not push aggregate reservations over the cap"
+        );
+        assert!(pool.reserved() <= LIMIT);
+
+        drop(reservation_a);
+        reservation_b.try_grow(LIMIT / 2).unwrap();
+        drop(reservation_b);
+        assert_eq!(pool.reserved(), 0);
+    }
+
+    #[test]
+    fn limited_pool_rolls_back_when_inner_pool_rejects() {
+        const INNER_LIMIT: usize = 1024 * 1024;
+        let inner: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(INNER_LIMIT));
+        let pool: Arc<dyn MemoryPool> = Arc::new(LimitedMemoryPool::new(
+            "test-rollback",
+            INNER_LIMIT * 2,
+            inner,
+        ));
+        let reservation = MemoryConsumer::new("inner-rejection").register(&pool);
+        reservation.try_grow(INNER_LIMIT).unwrap();
+        assert!(reservation.try_grow(1).is_err());
+        assert_eq!(
+            pool.reserved(),
+            INNER_LIMIT,
+            "the outer reservation must roll back when the inner pool rejects"
+        );
+        drop(reservation);
+        assert_eq!(pool.reserved(), 0);
+    }
+
+    #[test]
+    fn unshared_query_runtime_envs_keep_independent_pools() {
+        let _guard = SHARED_POOL_TEST_LOCK.lock();
+        assert_eq!(
+            runtime_memory_pool_mode(false, false),
+            RuntimeMemoryPoolMode::PerContext
+        );
+        let runtime_a = create_runtime_env_with_pool_mode(
+            "unshared-query-a",
+            DATAFUSION_MIN_MEM,
+            RuntimeMemoryPoolMode::PerContext,
+        )
+        .unwrap();
+        let runtime_b = create_runtime_env_with_pool_mode(
+            "unshared-query-b",
+            DATAFUSION_MIN_MEM,
+            RuntimeMemoryPoolMode::PerContext,
+        )
+        .unwrap();
+        let pool_a = Arc::clone(&runtime_a.memory_pool);
+        let pool_b = Arc::clone(&runtime_b.memory_pool);
+        let baseline_a = pool_a.reserved();
+        let baseline_b = pool_b.reserved();
+
+        {
+            let reservation = MemoryConsumer::new("unshared-query-a").register(&pool_a);
+            reservation.try_grow(64 * 1024 * 1024).unwrap();
+            assert_eq!(pool_a.reserved(), baseline_a + 64 * 1024 * 1024);
+            assert_eq!(
+                pool_b.reserved(),
+                baseline_b,
+                "the default mode must preserve fresh per-context pools"
+            );
+        }
+
+        assert_eq!(pool_a.reserved(), baseline_a);
+        assert_eq!(pool_b.reserved(), baseline_b);
+    }
+
+    #[test]
+    fn merge_pool_selection_remains_separate_from_shared_queries() {
+        assert_eq!(
+            runtime_memory_pool_mode(false, true),
+            RuntimeMemoryPoolMode::SharedQuery
+        );
+        assert_eq!(
+            runtime_memory_pool_mode(true, false),
+            RuntimeMemoryPoolMode::SharedMerge
+        );
+        assert_eq!(
+            runtime_memory_pool_mode(true, true),
+            RuntimeMemoryPoolMode::SharedMerge,
+            "merge selection must take precedence over the query setting"
+        );
     }
 
     #[tokio::test]

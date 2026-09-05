@@ -490,6 +490,7 @@ async fn cmd_seed(
             original_size: (result.stats.row_count as i64) * 140,
             compressed_size: template.len() as i64,
             index_size: 0,
+            index_generation: 0,
             flattened: false,
             bloom_ver: 0,
         };
@@ -650,6 +651,7 @@ async fn cmd_seed_tli(
                 original_size: (rows_per_file as i64) * 110,
                 compressed_size: 0,
                 index_size: 0,
+                index_generation: 0,
                 flattened: false,
                 bloom_ver: 0,
             };

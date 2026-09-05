@@ -22,8 +22,8 @@ use config::{
     meta::{
         cluster::Role,
         stream::{
-            ALL_STREAM_TYPES, FileKey, FileListBookKeepMode, FileListDeleted, PartitionTimeLevel,
-            StreamType, TimeRange,
+            ALL_STREAM_TYPES, FileKey, FileListBookKeepMode, PartitionTimeLevel, StreamType,
+            TimeRange,
         },
     },
     utils::time::{BASE_TIME, HourFormat, day_micros, get_ymdh_from_micros, hour_micros},
@@ -35,7 +35,7 @@ use infra::{
 };
 use itertools::Itertools;
 
-use crate::service::{db, file_list, file_list_dump::generate_dump_stream_name};
+use crate::service::{db, file_list_dump::generate_dump_stream_name};
 
 pub(crate) async fn generate_jobs() -> Result<(), anyhow::Error> {
     let cfg = get_config();
@@ -536,21 +536,14 @@ pub async fn delete_from_file_list(
     stream_name: &str,
     time_range: (i64, i64),
 ) -> Result<(), anyhow::Error> {
-    let task_id = tokio::task::try_id()
-        .map(|id| id.to_string())
-        .unwrap_or_else(|| rand::random::<u64>().to_string());
-    let fake_trace_id = format!(
-        "delete_from_file_list-{}-{}-{}",
-        task_id, time_range.0, time_range.1
-    );
-    let files = file_list::query(
-        &fake_trace_id,
+    // Retention retires only authoritative live SQL rows here. Dump rows are
+    // handled by compact::dump immediately after this function returns.
+    let files = infra_file_list::query(
         org_id,
         stream_type,
         stream_name,
         PartitionTimeLevel::Unset,
-        time_range.0,
-        time_range.1,
+        time_range,
     )
     .await?;
     if files.is_empty() {
@@ -572,79 +565,52 @@ pub async fn delete_from_file_list(
     let mut hours_files = hours_files.into_iter().collect::<Vec<_>>();
     hours_files.sort_by(|(k1, _), (k2, _)| k1.cmp(k2));
 
-    // write file list to storage
-    write_file_list(org_id, hours_files).await?;
+    // Atomically retire each hour's live-row snapshot.
+    write_file_list(hours_files).await?;
 
     Ok(())
 }
 
-// write file list to db, all the files should be deleted
-async fn write_file_list(
-    org_id: &str,
-    hours_files: Vec<(String, Vec<FileKey>)>,
-) -> Result<(), anyhow::Error> {
+// Atomically retire live rows and apply the configured bookkeeping mode. The
+// metadata snapshot supplies the generation+size fence, so a concurrent heal
+// fails the stale retention attempt before any row or tombstone changes.
+async fn write_file_list(hours_files: Vec<(String, Vec<FileKey>)>) -> Result<(), anyhow::Error> {
+    const MAX_ATTEMPTS: usize = 5;
     let cfg = get_config();
+    let mode = FileListBookKeepMode::from(cfg.compact.file_list_deleted_mode.as_str());
     for (_, events) in hours_files {
-        // set to db, retry 5 times
-        let mut success = false;
         let created_at = Utc::now().timestamp_micros();
-        for _ in 0..5 {
-            // only store the file_list into history, don't delete files
-            if cfg
-                .compact
-                .file_list_deleted_mode
-                .eq(&FileListBookKeepMode::History.to_string())
-            {
-                let events = events
-                    .iter()
-                    .map(|v| FileKey {
-                        deleted: false,
-                        ..v.clone()
-                    })
-                    .collect::<Vec<_>>();
-                if let Err(e) = infra_file_list::batch_add_history(&events).await {
-                    log::error!("[COMPACTOR] file_list batch_add_history failed: {}", e);
+        let mut backoff = tokio::time::Duration::from_secs(1);
+        let mut retired = false;
+        for attempt in 1..=MAX_ATTEMPTS {
+            match infra_file_list::retire_files(&events, mode.clone(), created_at).await {
+                Ok(()) => {
+                    retired = true;
+                    break;
+                }
+                Err(e) if e.is_deterministic_db_error() => {
+                    log::warn!(
+                        "[COMPACTOR] retention snapshot conflict/non-retryable retirement error; \
+                         stopping stale attempt so the pass can requery: {e}"
+                    );
                     return Err(e.into());
                 }
-            }
-            // delete from file_list table
-            if let Err(e) = infra_file_list::batch_process(&events).await {
-                log::error!("[COMPACTOR] batch_delete to db failed, retrying: {e}");
-                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                continue;
-            }
-            // store to file_list_deleted table, pending delete
-            if cfg
-                .compact
-                .file_list_deleted_mode
-                .eq(&FileListBookKeepMode::Deleted.to_string())
-            {
-                let del_items = events
-                    .iter()
-                    .map(|v| FileListDeleted {
-                        id: 0,
-                        account: v.account.clone(),
-                        file: v.key.clone(),
-                        // vestigial always-false: the deleted-file sweeper
-                        // derives the .vxi sidecar key from every .vix key
-                        // unconditionally (compact::deleted)
-                        index_file: false,
-                        flattened: v.meta.flattened,
-                    })
-                    .collect::<Vec<_>>();
-                if let Err(e) =
-                    infra_file_list::batch_add_deleted(org_id, created_at, &del_items).await
-                {
-                    log::error!("[COMPACTOR] batch_add_deleted to db failed, retrying: {e}");
-                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                    continue;
+                Err(e) => {
+                    log::error!(
+                        "[COMPACTOR] atomic file retirement failed (attempt \
+                         {attempt}/{MAX_ATTEMPTS}): {e}"
+                    );
+                    if attempt < MAX_ATTEMPTS {
+                        tokio::time::sleep(backoff).await;
+                        backoff *= 2;
+                    }
                 }
             }
-            success = true;
-            break;
         }
-        if !success {
-            return Err(anyhow::anyhow!("[COMPACTOR] batch_write to db failed"));
+        if !retired {
+            return Err(anyhow::anyhow!(
+                "[COMPACTOR] atomic file retirement exhausted {MAX_ATTEMPTS} attempts"
+            ));
         }
     }
     Ok(())
@@ -733,15 +699,11 @@ mod tests {
 
     use super::*;
 
-    /// M19 — the headline lifecycle-consistency pin: engine retention on a
-    /// v2 stream removes the `.vix` DATA object, its `.vxi` INDEX SIDECAR,
-    /// and the file_list ROW, through the real production path:
-    /// `delete_from_file_list` (row delete + file_list_deleted bookkeeping,
-    /// mode "deleted" = the default) followed by the deferred-delete sweeper
-    /// (`compact::deleted::delete`), which derives the sidecar key
-    /// unconditionally. Sqlite file_list + local-disk object store.
+    /// Retention removes the data object and its active versioned sidecar
+    /// through the real production path: the deletion snapshot queues both
+    /// objects, then the deferred sweeper removes them after the grace.
     #[tokio::test]
-    async fn m19_retention_removes_v2_object_pair_and_row() {
+    async fn retention_removes_versioned_sidecar_and_data_row() {
         let _guard = crate::compact::jobs_test_support::setup().await;
         std::fs::create_dir_all(&get_config().common.data_stream_dir)
             .expect("create data_stream_dir for tests");
@@ -757,7 +719,9 @@ mod tests {
         // data timestamp: 2021-01-02T00:30:00Z — safely past ANY retention
         let ts = 1609547400000000_i64;
         let key = format!("files/{org}/logs/{stream}/2021/01/02/00/m19_pair.vix");
-        let sidecar = config::vix_sidecar_key(&key).expect("core keys derive sidecar keys");
+        let generation = 17;
+        let sidecar =
+            config::vix_sidecar_key(&key, generation).expect("core keys derive sidecar keys");
 
         // the object PAIR in the store
         infra::storage::put("", &key, bytes::Bytes::from_static(b"m19-data-object"))
@@ -772,21 +736,17 @@ mod tests {
         .expect("put sidecar object");
 
         // the live file_list row (index_size > 0 ⟺ the sidecar exists)
-        let file = FileKey::new(
-            0,
-            String::new(),
-            key.clone(),
-            config::meta::stream::FileMeta {
-                min_ts: ts,
-                max_ts: ts + 1000,
-                records: 10,
-                original_size: 1000,
-                compressed_size: 15,
-                index_size: 18,
-                ..Default::default()
-            },
-            false,
-        );
+        let mut meta = config::meta::stream::FileMeta {
+            min_ts: ts,
+            max_ts: ts + 1000,
+            records: 10,
+            original_size: 1000,
+            compressed_size: 15,
+            index_size: 18,
+            ..Default::default()
+        };
+        meta.index_generation = generation;
+        let file = FileKey::new(0, String::new(), key.clone(), meta, false);
         crate::compact::jobs_test_support::retry_busy("seed file_list row", || {
             infra_file_list::batch_add(std::slice::from_ref(&file))
         })
@@ -807,16 +767,20 @@ mod tests {
             "the file_list row must be gone the moment retention commits"
         );
         let pending = infra_file_list::list_deleted().await.expect("list_deleted");
-        assert!(
-            pending.iter().any(|d| d.file == key),
-            "the data key must be queued in file_list_deleted for the sweeper"
+        let pending_data = pending
+            .iter()
+            .find(|deleted| deleted.file == key)
+            .expect("the data key must be queued in file_list_deleted for the sweeper");
+        assert_eq!(
+            pending_data.index_generation, generation,
+            "the deletion snapshot must retain the active sidecar generation"
         );
         assert!(
             infra::storage::head("", &key).await.is_ok(),
             "objects survive the deferred-delete window (rows first, objects later)"
         );
 
-        // ── the deferred-delete sweeper: object PAIR deleted, queue drained
+        // ── the deferred-delete sweeper: both objects are deleted
         let time_max = config::utils::time::now_micros() + hour_micros(3);
         let swept = crate::compact::jobs_test_support::retry_busy("deleted::delete", || {
             crate::compact::deleted::delete(&org, time_max)
@@ -835,11 +799,11 @@ mod tests {
                 infra::storage::head("", &sidecar).await,
                 Err(object_store::Error::NotFound { .. })
             ),
-            "the .vxi index sidecar must be deleted alongside the data object"
+            "the active .vxi sidecar must be deleted alongside the data object"
         );
         let pending = infra_file_list::list_deleted().await.expect("list_deleted");
         assert!(
-            !pending.iter().any(|d| d.file == key),
+            !pending.iter().any(|deleted| deleted.file == key),
             "the file_list_deleted row must be drained after the sweep"
         );
     }

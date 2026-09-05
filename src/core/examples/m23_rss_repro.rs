@@ -531,7 +531,9 @@ fn make_wide_batch(
     rows: usize,
 ) -> (arrow::record_batch::RecordBatch, u64) {
     let namespaces: Vec<String> = (0..20).map(|i| format!("ns-team-{i}")).collect();
-    let pods: Vec<String> = (0..200).map(|i| format!("api-deploy-{i:03}-x{}", i % 7)).collect();
+    let pods: Vec<String> = (0..200)
+        .map(|i| format!("api-deploy-{i:03}-x{}", i % 7))
+        .collect();
     let containers: Vec<String> = (0..30).map(|i| format!("svc-checkout-{i}")).collect();
     let mut ts = Vec::with_capacity(rows);
     let mut message = Vec::with_capacity(rows);
@@ -666,7 +668,10 @@ async fn cmd_gen_wide(
     width: usize,
     interleave: bool,
 ) -> Result<(), anyhow::Error> {
-    anyhow::ensure!(width > WIDE_CORE_FIELDS, "width must exceed the {WIDE_CORE_FIELDS} core fields");
+    anyhow::ensure!(
+        width > WIDE_CORE_FIELDS,
+        "width must exceed the {WIDE_CORE_FIELDS} core fields"
+    );
     std::fs::create_dir_all(dir)?;
     let sparse_width = width - WIDE_CORE_FIELDS;
     let vocab = build_vocab();
@@ -798,7 +803,9 @@ fn make_batch(
     rows: usize,
 ) -> (arrow::record_batch::RecordBatch, u64) {
     let services: Vec<String> = (0..30).map(|i| format!("svc-checkout-{i}")).collect();
-    let pods: Vec<String> = (0..200).map(|i| format!("api-deploy-{i:03}-x{}", i % 7)).collect();
+    let pods: Vec<String> = (0..200)
+        .map(|i| format!("api-deploy-{i:03}-x{}", i % 7))
+        .collect();
     let mut ts = Vec::with_capacity(rows);
     let mut code = Vec::with_capacity(rows);
     let mut env = Vec::with_capacity(rows);
@@ -849,7 +856,11 @@ async fn cmd_gen(
     high_card: bool,
 ) -> Result<(), anyhow::Error> {
     std::fs::create_dir_all(dir)?;
-    let schema = if high_card { hc_schema() } else { logs_schema() };
+    let schema = if high_card {
+        hc_schema()
+    } else {
+        logs_schema()
+    };
     let vocab = build_vocab();
     let cdf = build_zipf_cdf();
     let fts = vec!["message".to_string()];
@@ -1242,7 +1253,10 @@ fn main() -> Result<(), anyhow::Error> {
     let mode = args.get(1).map(String::as_str);
     match mode {
         Some(gen_mode @ ("gen" | "gen-il" | "gen-hc")) => {
-            let dir = args.get(2).expect("gen <dir> <files> <rows_per_file>").clone();
+            let dir = args
+                .get(2)
+                .expect("gen <dir> <files> <rows_per_file>")
+                .clone();
             let files: usize = args.get(3).expect("files").parse()?;
             let rows: usize = args.get(4).expect("rows_per_file").parse()?;
             ensure_env_many(&[
@@ -1277,7 +1291,13 @@ fn main() -> Result<(), anyhow::Error> {
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?
-                .block_on(cmd_gen_wide(&dir, files, rows, width, gen_mode == "gen-wide-il"))
+                .block_on(cmd_gen_wide(
+                    &dir,
+                    files,
+                    rows,
+                    width,
+                    gen_mode == "gen-wide-il",
+                ))
         }
         Some(merge @ ("merge" | "merge-flip" | "merge-hc" | "merge-hc-flip")) => {
             let dir = args.get(2).expect("merge <dir> <out.vix>").clone();
@@ -1299,7 +1319,10 @@ fn main() -> Result<(), anyhow::Error> {
             )
         }
         Some(merge @ ("merge-wide" | "merge-wide-flip")) => {
-            let dir = args.get(2).expect("merge-wide <dir> <out.vix> <width>").clone();
+            let dir = args
+                .get(2)
+                .expect("merge-wide <dir> <out.vix> <width>")
+                .clone();
             let out = args.get(3).expect("out.vix").clone();
             let width: usize = args.get(4).expect("width").parse()?;
             ensure_env_many(&[

@@ -985,21 +985,73 @@ mod job_scheduler_tests {
     }
 }
 
+/// Process-wide admission gate for physical merge execution.
+///
+/// Multiple logical worker pools can share one gate so their combined merge
+/// concurrency never exceeds the startup-resolved capacity.
+pub struct MergeExecutionGate {
+    capacity: usize,
+    semaphore: Arc<Semaphore>,
+}
+
+impl MergeExecutionGate {
+    pub fn new(capacity: usize) -> Arc<Self> {
+        let capacity = capacity.max(1);
+        Arc::new(Self {
+            capacity,
+            semaphore: Arc::new(Semaphore::new(capacity)),
+        })
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub async fn acquire(
+        &self,
+        cancel: &MergeCancellation,
+    ) -> Result<OwnedSemaphorePermit, anyhow::Error> {
+        cancel.check("merge execution gate wait")?;
+        tokio::select! {
+            biased;
+            _ = wait_for_job_cancellation(cancel) => {
+                Err(anyhow::anyhow!(
+                    "compaction cancelled while waiting for merge execution capacity: job lease was lost or node is shutting down"
+                ))
+            }
+            permit = self.semaphore.clone().acquire_owned() => {
+                permit.map_err(|_| anyhow::anyhow!("merge execution gate is closed"))
+            }
+        }
+    }
+}
+
 /// MergeWorker is a worker that merges files
 pub struct MergeWorker {
     num: usize,
     rx: Arc<AsyncMutex<mpsc::Receiver<(MergeSender, MergeBatch)>>>,
     tx: mpsc::Sender<(MergeSender, MergeBatch)>,
+    execution_gate: Arc<MergeExecutionGate>,
 }
 
 impl MergeWorker {
     pub fn new(num: usize) -> Self {
+        let num = num.max(1);
+        Self::new_with_execution_gate(num, MergeExecutionGate::new(num))
+    }
+
+    pub fn new_with_execution_gate(num: usize, execution_gate: Arc<MergeExecutionGate>) -> Self {
         // keep the workers fed: a fat job submits hundreds of batches; a
         // capacity-1 channel serialized submission behind the slowest batch
         let num = num.max(1);
         let (tx, rx) = mpsc::channel::<(MergeSender, MergeBatch)>(num * 2);
         let rx = Arc::new(AsyncMutex::new(rx));
-        Self { num, rx, tx }
+        Self {
+            num,
+            rx,
+            tx,
+            execution_gate,
+        }
     }
 
     pub fn tx(&self) -> mpsc::Sender<(MergeSender, MergeBatch)> {
@@ -1009,6 +1061,7 @@ impl MergeWorker {
     pub fn run(&mut self) -> Result<(), anyhow::Error> {
         for thread_id in 0..self.num {
             let rx = self.rx.clone();
+            let execution_gate = self.execution_gate.clone();
             tokio::spawn(async move {
                 loop {
                     if is_offline() {
@@ -1032,7 +1085,29 @@ impl MergeWorker {
                                 }
                                 continue;
                             }
-                            match super::merge::merge_files(
+                            let permit = match execution_gate.acquire(&msg.cancel).await {
+                                Ok(permit) => permit,
+                                Err(e) => {
+                                    if let Err(send_error) = tx.send(Err(e)).await {
+                                        log::error!(
+                                            "[COMPACTOR:WORKER:{thread_id}] failed to report merge admission error for batch {}: {send_error}",
+                                            msg.batch_id,
+                                        );
+                                    }
+                                    continue;
+                                }
+                            };
+                            if let Err(e) = msg.cancel.check("merge execution start") {
+                                drop(permit);
+                                if let Err(send_error) = tx.send(Err(e)).await {
+                                    log::error!(
+                                        "[COMPACTOR:WORKER:{thread_id}] failed to report cancelled batch {}: {send_error}",
+                                        msg.batch_id,
+                                    );
+                                }
+                                continue;
+                            }
+                            let merge_result = super::merge::merge_files(
                                 thread_id,
                                 &msg.org_id,
                                 msg.stream_type,
@@ -1041,8 +1116,9 @@ impl MergeWorker {
                                 &msg.files,
                                 &msg.cancel,
                             )
-                            .await
-                            {
+                            .await;
+                            drop(permit);
+                            match merge_result {
                                 Ok((new_files, merged_files)) => {
                                     // merged_files is the EXACT deletable set;
                                     // dropping it here is what turned partial
@@ -1085,14 +1161,107 @@ mod merge_worker_tests {
     use super::*;
 
     #[test]
-    fn test_merge_worker_new_and_tx() {
-        let worker = MergeWorker::new(4);
+    fn private_gate_matches_normalized_worker_count() {
+        let worker = MergeWorker::new(0);
+        assert_eq!(worker.num, 1);
+        assert_eq!(worker.execution_gate.capacity(), 1);
         let tx = worker.tx();
         drop(tx);
     }
 
-    #[test]
-    fn test_merge_worker_new_single() {
-        let _worker = MergeWorker::new(1);
+    #[tokio::test]
+    async fn shared_gate_blocks_across_workers_until_capacity_is_released() {
+        let gate = MergeExecutionGate::new(1);
+        let first_worker = MergeWorker::new_with_execution_gate(2, gate.clone());
+        let second_worker = MergeWorker::new_with_execution_gate(3, gate.clone());
+        assert!(Arc::ptr_eq(&first_worker.execution_gate, &gate));
+        assert!(Arc::ptr_eq(&second_worker.execution_gate, &gate));
+        assert_eq!(gate.capacity(), 1);
+
+        let first_cancel = MergeCancellation::default();
+        let first_permit = first_worker
+            .execution_gate
+            .acquire(&first_cancel)
+            .await
+            .expect("first worker should acquire the only execution permit");
+
+        let started = Arc::new(Notify::new());
+        let waiter_started = started.clone();
+        let second_gate = second_worker.execution_gate.clone();
+        let second_cancel = MergeCancellation::default();
+        let mut second = tokio::spawn(async move {
+            waiter_started.notify_one();
+            second_gate.acquire(&second_cancel).await
+        });
+        started.notified().await;
+
+        assert!(
+            tokio::time::timeout(tokio::time::Duration::from_millis(25), &mut second)
+                .await
+                .is_err(),
+            "the second worker must block while the shared gate is full"
+        );
+
+        drop(first_permit);
+        let second_permit = tokio::time::timeout(tokio::time::Duration::from_secs(1), second)
+            .await
+            .expect("the second worker should make progress after permit release")
+            .expect("the second worker task should not panic")
+            .expect("the second worker should acquire the released permit");
+        assert_eq!(gate.semaphore.available_permits(), 0);
+        drop(second_permit);
+        assert_eq!(gate.semaphore.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_while_waiting_does_not_leak_a_permit() {
+        let gate = MergeExecutionGate::new(1);
+        let held = gate
+            .acquire(&MergeCancellation::default())
+            .await
+            .expect("initial permit should be available");
+
+        let cancel = MergeCancellation::default();
+        let waiter_cancel = cancel.clone();
+        let waiter_gate = gate.clone();
+        let started = Arc::new(Notify::new());
+        let waiter_started = started.clone();
+        let waiter = tokio::spawn(async move {
+            waiter_started.notify_one();
+            waiter_gate.acquire(&waiter_cancel).await
+        });
+        started.notified().await;
+        cancel.cancel();
+
+        let error = tokio::time::timeout(tokio::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("cancelled admission should return promptly")
+            .expect("the waiting task should not panic")
+            .expect_err("cancelled admission must not acquire a permit");
+        assert!(error.to_string().contains("cancelled"));
+        assert_eq!(gate.semaphore.available_permits(), 0);
+
+        drop(held);
+        assert_eq!(gate.semaphore.available_permits(), 1);
+        let recovered = tokio::time::timeout(
+            tokio::time::Duration::from_millis(100),
+            gate.acquire(&MergeCancellation::default()),
+        )
+        .await
+        .expect("capacity should remain usable after a cancelled waiter")
+        .expect("the recovered permit should be acquired");
+        drop(recovered);
+        assert_eq!(gate.semaphore.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn closed_gate_returns_an_explicit_error() {
+        let gate = MergeExecutionGate::new(1);
+        gate.semaphore.close();
+        let error = gate
+            .acquire(&MergeCancellation::default())
+            .await
+            .expect_err("a closed gate must reject admission");
+        assert_eq!(error.to_string(), "merge execution gate is closed");
     }
 }

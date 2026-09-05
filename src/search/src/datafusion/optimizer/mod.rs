@@ -39,10 +39,7 @@ use datafusion::{
     sql::TableReference,
 };
 use hashbrown::HashSet;
-use infra::schema::{
-    SchemaCache, get_stream_setting_fts_fields,
-    unwrap_stream_settings,
-};
+use infra::schema::{SchemaCache, get_stream_setting_fts_fields, unwrap_stream_settings};
 #[cfg(feature = "enterprise")]
 use {
     crate::datafusion::optimizer::context::generate_streaming_agg_rules,

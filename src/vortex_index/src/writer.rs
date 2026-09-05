@@ -121,22 +121,114 @@ fn is_string_family(data_type: &DataType) -> bool {
     )
 }
 
+const ID_MARKERS: [&[u8]; 4] = [b"id", b"uid", b"uuid", b"guid"];
+const COLLAPSED_ID_QUALIFIERS: [&[u8]; 18] = [
+    b"request",
+    b"trace",
+    b"span",
+    b"session",
+    b"user",
+    b"project",
+    b"device",
+    b"message",
+    b"event",
+    b"correlation",
+    b"transaction",
+    b"conversation",
+    b"agent",
+    b"model",
+    b"tool",
+    b"node",
+    b"pod",
+    b"container",
+];
+
+#[inline]
+fn is_id_marker(token: &[u8]) -> bool {
+    ID_MARKERS
+        .iter()
+        .any(|marker| token.eq_ignore_ascii_case(marker))
+}
+
+/// Whether the leaf after the final `.` is shaped like an identifier field.
+///
+/// Exact `id`/`uid`/`uuid`/`guid` tokens are recognized across `_`, `-`,
+/// and preserved camel-case boundaries. Fully collapsed names are accepted
+/// only when the marker follows one of the reviewed semantic qualifiers.
+/// The matcher is allocation-free and never normalizes the input into an
+/// owned lowercase string.
+#[inline]
+pub fn is_id_like_field_name(name: &str) -> bool {
+    let leaf = name.rsplit('.').next().unwrap_or(name).as_bytes();
+    if leaf.is_empty() {
+        return false;
+    }
+
+    let mut token_start = 0;
+    let mut i = 0;
+    while i <= leaf.len() {
+        if i == leaf.len() {
+            if is_id_marker(&leaf[token_start..i]) {
+                return true;
+            }
+            break;
+        }
+
+        let current = leaf[i];
+        if current == b'_' || current == b'-' {
+            if is_id_marker(&leaf[token_start..i]) {
+                return true;
+            }
+            token_start = i + 1;
+            i += 1;
+            continue;
+        }
+
+        let camel_boundary = i > token_start
+            && current.is_ascii_uppercase()
+            && (leaf[i - 1].is_ascii_lowercase()
+                || leaf[i - 1].is_ascii_digit()
+                || (leaf[i - 1].is_ascii_uppercase()
+                    && leaf.get(i + 1).is_some_and(u8::is_ascii_lowercase)));
+        if camel_boundary {
+            if is_id_marker(&leaf[token_start..i]) {
+                return true;
+            }
+            token_start = i;
+        }
+        i += 1;
+    }
+
+    COLLAPSED_ID_QUALIFIERS.iter().any(|qualifier| {
+        ID_MARKERS.iter().any(|marker| {
+            let suffix_len = qualifier.len() + marker.len();
+            leaf.len() >= suffix_len
+                && leaf[leaf.len() - suffix_len..leaf.len() - marker.len()]
+                    .eq_ignore_ascii_case(qualifier)
+                && leaf[leaf.len() - marker.len()..].eq_ignore_ascii_case(marker)
+        })
+    })
+}
+
 /// #52 AUTO bloom-only demotion — the ONE rule shared by its two call
 /// sites (M7): the merge planner (`build_merge_plan` in the core crate,
 /// counting distinct terms from the INPUT dictionaries) and the writer's
 /// own finish (first encode / rebuild, counting from the accumulated term
 /// map). A candidate whose distinct-value count clears the absolute
 /// `min_distinct` floor AND whose distinct/rows ratio clears `ratio` is
-/// demoted, unless named in `never`. `ratio <= 0` disables. Candidates are
-/// pre-filtered by the caller (string-family ∩ term plan − fts; the writer
-/// construction resolution re-checks for the merge site), so the numeric
-/// thresholds here are the whole decision. `site` labels the log line
-/// (`"merge"` / `"build"`). Returned names are sorted and deduplicated.
+/// demoted, unless named in `never`. When `id_only` is true, AUTO candidates
+/// must also pass [`is_id_like_field_name`]; explicit bloom-only fields do
+/// not flow through this resolver and remain authoritative. `ratio <= 0`
+/// disables AUTO. Candidates are pre-filtered by the caller (string-family
+/// ∩ term plan − fts; the writer construction resolution re-checks for the
+/// merge site). `site` labels the log line (`"merge"` / `"build"`). Returned
+/// names are sorted and deduplicated.
 pub fn resolve_auto_bloom_only<'a>(
     candidates: impl IntoIterator<Item = (&'a str, u64)>,
     rows: u64,
     ratio: f64,
     min_distinct: u64,
+    id_only: bool,
     never: &[String],
     site: &str,
 ) -> Vec<String> {
@@ -146,7 +238,8 @@ pub fn resolve_auto_bloom_only<'a>(
     let mut selected: Vec<String> = candidates
         .into_iter()
         .filter(|&(name, distinct)| {
-            distinct >= min_distinct
+            (!id_only || is_id_like_field_name(name))
+                && distinct >= min_distinct
                 && distinct as f64 / rows as f64 >= ratio
                 && !never.iter().any(|n| n == name)
         })
@@ -161,6 +254,111 @@ pub fn resolve_auto_bloom_only<'a>(
     selected.sort_unstable();
     selected.dedup();
     selected
+}
+
+#[cfg(test)]
+mod auto_bloom_only_tests {
+    use super::{
+        COLLAPSED_ID_QUALIFIERS, ID_MARKERS, is_id_like_field_name, resolve_auto_bloom_only,
+    };
+
+    #[test]
+    fn id_like_field_name_accepts_exact_tokens_and_reviewed_collapsed_names() {
+        for marker in ["id", "uid", "uuid", "guid"] {
+            for name in [
+                marker.to_string(),
+                format!("event_{marker}"),
+                format!("event-{marker}"),
+                format!("event{}", capitalize(marker)),
+                format!("reference.parent_trace_{marker}"),
+                format!("reference.parentTrace{}", capitalize(marker)),
+            ] {
+                assert!(is_id_like_field_name(&name), "{name}");
+            }
+        }
+
+        for qualifier in &COLLAPSED_ID_QUALIFIERS {
+            for marker in ID_MARKERS {
+                let mut name = String::from_utf8(qualifier.to_vec()).unwrap();
+                name.push_str(std::str::from_utf8(marker).unwrap());
+                assert!(is_id_like_field_name(&name), "{name}");
+            }
+        }
+
+        assert!(is_id_like_field_name("reference.parent_trace_id"));
+        assert!(is_id_like_field_name("event_id"));
+        assert!(is_id_like_field_name("traceID"));
+        assert!(is_id_like_field_name("HTTPTraceUUID"));
+        assert!(is_id_like_field_name("parenttraceid"));
+        assert!(is_id_like_field_name("customtraceid"));
+    }
+
+    #[test]
+    fn id_like_field_name_rejects_substrings_and_ordinary_fields() {
+        for name in [
+            "",
+            "valid",
+            "grid",
+            "paid",
+            "avoid",
+            "android",
+            "fluid",
+            "squid",
+            "languid",
+            "events",
+            "span_duration_nano",
+            "request_route",
+            "reference.id.value",
+            "event_identifier",
+            "trace_ids",
+            "randomid",
+            "identity",
+        ] {
+            assert!(!is_id_like_field_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn auto_id_only_filters_ratio_qualified_ordinary_strings() {
+        let candidates = [
+            ("span_duration_nano", 91),
+            ("events", 16),
+            ("reference.parent_trace_id", 15),
+            ("event_id", 4),
+        ];
+        assert_eq!(
+            resolve_auto_bloom_only(candidates, 100, 0.01, 1, true, &[], "test"),
+            ["event_id", "reference.parent_trace_id"].map(str::to_string)
+        );
+        assert_eq!(
+            resolve_auto_bloom_only(candidates, 100, 0.01, 1, false, &[], "test"),
+            [
+                "event_id",
+                "events",
+                "reference.parent_trace_id",
+                "span_duration_nano"
+            ]
+            .map(str::to_string)
+        );
+        assert_eq!(
+            resolve_auto_bloom_only(
+                candidates,
+                100,
+                0.01,
+                1,
+                true,
+                &["event_id".to_string()],
+                "test",
+            ),
+            ["reference.parent_trace_id"].map(str::to_string)
+        );
+    }
+
+    fn capitalize(value: &str) -> String {
+        let mut bytes = value.as_bytes().to_vec();
+        bytes[0].make_ascii_uppercase();
+        String::from_utf8(bytes).unwrap()
+    }
 }
 
 /// THE value policy for hashing one bloom-only field's docs-column values
@@ -464,6 +662,10 @@ pub struct VixWriterOptions {
     /// `0.0` (the crate default) disables; production wires
     /// `ZO_VIX_BLOOM_ONLY_AUTO_RATIO` (default-on in v2).
     pub bloom_only_auto_ratio: f64,
+    /// Restrict AUTO demotion to semantic identifier field names recognized
+    /// by [`is_id_like_field_name`]. Explicit `bloom_only_field_names`
+    /// remain authoritative and are not gated.
+    pub bloom_only_auto_id_only: bool,
     /// Absolute distinct-count floor for [`Self::bloom_only_auto_ratio`] —
     /// small files' noisy ratios must not demote real fields.
     pub bloom_only_min_distinct: u64,
@@ -674,6 +876,7 @@ impl Default for VixWriterOptions {
             bloom_only_field_names: Vec::new(),
             bloom_only_never: Vec::new(),
             bloom_only_auto_ratio: 0.0,
+            bloom_only_auto_id_only: false,
             bloom_only_min_distinct: 65536,
             bloom_fpp: crate::bloom::DEFAULT_FILE_BLOOM_FPP,
             postings_chunk_bytes: 128 * 1024,
@@ -910,9 +1113,9 @@ struct EncodedRunState {
 
 /// The output of [`VixWriter::merge_input_indexes`], consumed by `finish`.
 struct PrebuiltIndex {
-    /// The index blob bytes; `None` when the merged inputs have no terms
-    /// at all.
-    blobs: Option<IndexBlobs>,
+    /// Container-ready index blob payloads; `None` when the merged inputs
+    /// have no terms at all.
+    blobs: Option<IndexBlobParts>,
     term_count: u64,
     /// Per-file value-bloom hashes collected by the merge workers.
     bloom: crate::bloom::BloomHashAcc,
@@ -1284,6 +1487,9 @@ impl VixWriter {
     ///   dictionary is missing the skipped oversize values' tokens, and only a rebuild from
     ///   `_source` re-derives them (the rebuilt output drops the marking, un-tainting match_all for
     ///   the file),
+    /// - a field marked `bloom` in an input while the current plan expects term/fts capability:
+    ///   bloom-only inputs carry no value dictionary to merge, so only a rebuild can restore the
+    ///   plan's capability,
     /// - a field that is `partial` in an input **without** being value-indexed there while the
     ///   merge plan value-indexes it (the input's dictionary is missing values that only a rebuild
     ///   from `_source` can recover).
@@ -1319,6 +1525,18 @@ impl VixWriter {
             for entry in reader.field_entries() {
                 if self.value_index_excluded_fields.contains(&entry.name) {
                     continue;
+                }
+                if entry.has_type(FIELD_TYPE_BLOOM)
+                    && self
+                        .term_field_ids
+                        .get(&entry.name)
+                        .is_some_and(|id| !self.bloom_only.contains_key(id))
+                {
+                    return Err(format!(
+                        "field {:?} is bloom-only in input {position} but term-capable in the \
+                         merge plan — only a rebuild can restore its value terms",
+                        entry.name,
+                    ));
                 }
                 let input_term = entry.has_type(FIELD_TYPE_TERM);
                 let input_fts = entry.has_type(FIELD_TYPE_FTS);
@@ -1594,6 +1812,7 @@ impl VixWriter {
             self.opts.postings_plist_min_docs,
             threads,
             self.opts.merge_kway_threads,
+            self.opts.term_spill_dir.as_deref(),
         )?;
         for reader in inputs {
             self.partial_fields
@@ -2553,6 +2772,7 @@ impl VixWriter {
             ratio_rows,
             ratio,
             self.opts.bloom_only_min_distinct,
+            self.opts.bloom_only_auto_id_only,
             &self.opts.bloom_only_never,
             phase,
         );
@@ -3281,11 +3501,7 @@ impl VixWriter {
                         prebuilt.expected_rows
                     )));
                 }
-                (
-                    prebuilt.blobs.map(IndexBlobParts::from),
-                    prebuilt.term_count,
-                    prebuilt.bloom,
-                )
+                (prebuilt.blobs, prebuilt.term_count, prebuilt.bloom)
             }
             None => {
                 // #52/M7 first-encode AUTO demotion: with the full term map
