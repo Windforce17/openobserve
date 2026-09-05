@@ -52,7 +52,7 @@ pub type RwAHashSet<K> = tokio::sync::RwLock<HashSet<K>>;
 pub type RwBTreeMap<K, V> = tokio::sync::RwLock<BTreeMap<K, V>>;
 
 // for DDL commands and migrations
-pub const DB_SCHEMA_VERSION: u64 = 51;
+pub const DB_SCHEMA_VERSION: u64 = 52;
 pub const DB_SCHEMA_KEY: &str = "/db_schema_version/";
 
 // global version variables
@@ -96,22 +96,24 @@ pub const FILE_EXT_ARROW: &str = ".arrow";
 pub const FILE_EXT_PARQUET: &str = ".parquet";
 pub const FILE_EXT_VORTEX: &str = ".vortex";
 pub const FILE_EXT_VIX: &str = ".vix";
-/// The per-file INDEX SIDECAR of a `.vix` data object (format v3): same key
-/// with the extension swapped, holding the inverted-index blobs. NOT a
-/// file_list-tracked data file, never a merge input by itself; its size is
-/// the data row's `index_size` column (`0` ⟺ no sidecar). Derive keys with
-/// [`vix_sidecar_key`] — never by ad-hoc string surgery.
+/// The per-file INDEX SIDECAR of a `.vix` data object (format v3). Generation
+/// zero uses the legacy extension-swapped key; healed generations use an
+/// immutable generation-suffixed key. Sidecars are not file-list data rows;
+/// `FileMeta::index_size == 0` means no active sidecar.
 pub const FILE_EXT_VXI: &str = ".vxi";
 
-/// The deterministic `.vxi` sidecar key of a `.vix` data-object key
-/// (extension swapped). Callers gate on `FileMeta::index_size > 0` for
-/// existence; this only derives the key. Non-`.vix` keys pass through
-/// with the extension appended-swapped semantics avoided: they return
-/// `None` (a sidecar exists only for core data files).
-pub fn vix_sidecar_key(data_key: &str) -> Option<String> {
-    data_key
-        .strip_suffix(FILE_EXT_VIX)
-        .map(|stem| format!("{stem}{FILE_EXT_VXI}"))
+/// Derive the immutable `.vxi` object key for one `.vix` data object and
+/// sidecar generation. Existing files use generation zero
+/// (`file.vix` -> `file.vxi`); healed generations are distinct objects
+/// (`file.vix`, generation 42 -> `file.42.vxi`). A negative generation is
+/// invalid and fails closed.
+pub fn vix_sidecar_key(data_key: &str, index_generation: i64) -> Option<String> {
+    let stem = data_key.strip_suffix(FILE_EXT_VIX)?;
+    match index_generation {
+        0 => Some(format!("{stem}{FILE_EXT_VXI}")),
+        1.. => Some(format!("{stem}.{index_generation}{FILE_EXT_VXI}")),
+        _ => None,
+    }
 }
 
 pub const QUERY_WITH_NO_LIMIT: i64 = -999;
@@ -667,11 +669,11 @@ pub enum FileFormat {
     Parquet,
     Vortex,
     /// Core-file format (v3): a `.vix` puffin DATA object carrying the
-    /// records (`docs` blob) plus a `.vxi` INDEX SIDECAR (same key,
-    /// extension swapped) carrying the inverted index — the sidecar exists
-    /// iff the file is indexed (`FileMeta::index_size > 0`) and is never a
-    /// data file itself. The unconditional format of logs/traces; never a
-    /// valid value for `ZO_FILE_FORMAT`.
+    /// records (`docs` blob) plus a generation-addressed `.vxi` INDEX
+    /// SIDECAR carrying the inverted index. The sidecar exists iff the file
+    /// is indexed (`FileMeta::index_size > 0`) and is never a data file
+    /// itself. The unconditional format of logs/traces; never a valid value
+    /// for `ZO_FILE_FORMAT`.
     Vix,
 }
 
@@ -5261,6 +5263,21 @@ mod tests {
         assert_eq!(FileFormat::Parquet.extension(), ".parquet");
         assert_eq!(FileFormat::Vortex.extension(), ".vortex");
         assert_eq!(FileFormat::Vix.extension(), ".vix");
+    }
+
+    #[test]
+    fn test_vix_sidecar_key_is_generation_stable() {
+        let data = "files/default/traces/default/2026/09/03/09/file.vix";
+        assert_eq!(
+            vix_sidecar_key(data, 0).as_deref(),
+            Some("files/default/traces/default/2026/09/03/09/file.vxi")
+        );
+        assert_eq!(
+            vix_sidecar_key(data, 42).as_deref(),
+            Some("files/default/traces/default/2026/09/03/09/file.42.vxi")
+        );
+        assert_eq!(vix_sidecar_key(data, -1), None);
+        assert_eq!(vix_sidecar_key("file.parquet", 42), None);
     }
 
     #[test]

@@ -43,7 +43,11 @@
 
 use std::sync::Arc;
 
-use config::{get_config, meta::stream::FileKey, utils::time::now_micros};
+use config::{
+    get_config,
+    meta::stream::{FileKey, FileListDeleted},
+    utils::time::now_micros,
+};
 use hashbrown::{HashMap, HashSet};
 use infra::{
     bloom::{BloomWriter, FieldBloom},
@@ -241,13 +245,19 @@ async fn process_bucket_locked(
     // A selective composite scope needs no per-stream field config because
     // eligibility is file-specific.
     if !bloom_policy_enabled(&bloom_fields, composite_scope, auto_id_scope) {
-        // nothing to build for this stream — drain the queue
-        let ids: Vec<i64> = files.iter().map(|f| f.id).collect();
-        infra::file_list::update_bloom_ver(&ids, BLOOM_VER_NOT_APPLICABLE).await?;
+        // Nothing to build for this stream. Fence even sentinel stamps by the
+        // sidecar generation and size that were classified, so a concurrent
+        // heal remains pending at bloom_ver=0.
+        let expected: Vec<(i64, i64, i64)> = files
+            .iter()
+            .map(|file| (file.id, file.meta.index_generation, file.meta.index_size))
+            .collect();
+        let matched =
+            infra::file_list::update_bloom_ver(&expected, BLOOM_VER_NOT_APPLICABLE).await?;
         log::info!(
             "[COMPACTOR:BLOOM] {org_id}/{stream_type}/{stream_name}/{date}: no Bloom policy \
-             enabled, {} files marked not-applicable",
-            ids.len()
+             enabled, {matched}/{} files marked not-applicable",
+            expected.len()
         );
         return Ok(());
     }
@@ -265,7 +275,8 @@ async fn process_bucket_locked(
     // (multiple chunks per bucket are first-class in the format).
     const LOAD_CONCURRENCY: usize = 8;
     use futures::{StreamExt, stream};
-    let results: Vec<(i64, String, Result<LoadedBlooms, anyhow::Error>)> =
+    type BloomFence = (i64, i64, i64);
+    let results: Vec<(BloomFence, String, Result<LoadedBlooms, anyhow::Error>)> =
         stream::iter(files.iter().cloned().map(|file| {
             let bloom_fields = bloom_fields.clone();
             let composite_scope = composite_scope;
@@ -281,29 +292,33 @@ async fn process_bucket_locked(
                     bloom_only_never,
                 )
                 .await;
-                (file.id, file.key, loaded)
+                (
+                    (file.id, file.meta.index_generation, file.meta.index_size),
+                    file.key,
+                    loaded,
+                )
             }
         }))
         .buffer_unordered(LOAD_CONCURRENCY)
         .collect()
         .await;
-    let mut per_file: Vec<(i64, Vec<vortex_index::bloom::FileBloom>)> = Vec::new();
-    let mut not_applicable: Vec<i64> = Vec::new();
-    let mut unbuildable: Vec<i64> = Vec::new();
+    let mut per_file: Vec<(BloomFence, Vec<vortex_index::bloom::FileBloom>)> = Vec::new();
+    let mut not_applicable: Vec<BloomFence> = Vec::new();
+    let mut unbuildable: Vec<BloomFence> = Vec::new();
     let mut fallback_streams = 0usize;
     let mut deferred = 0usize;
-    for (id, key, result) in results {
+    for (fence, key, result) in results {
         match result {
             Ok(LoadedBlooms::FromBlob(blooms)) if blooms.is_empty() => {
-                not_applicable.push(id);
+                not_applicable.push(fence);
             }
-            Ok(LoadedBlooms::FromBlob(blooms)) => per_file.push((id, blooms)),
+            Ok(LoadedBlooms::FromBlob(blooms)) => per_file.push((fence, blooms)),
             Ok(LoadedBlooms::FromDict(blooms)) => {
                 fallback_streams += 1;
                 if blooms.is_empty() {
-                    not_applicable.push(id);
+                    not_applicable.push(fence);
                 } else {
-                    per_file.push((id, blooms));
+                    per_file.push((fence, blooms));
                 }
             }
             Ok(LoadedBlooms::Deferred) => deferred += 1,
@@ -312,7 +327,7 @@ async fn process_bucket_locked(
             // fallback-budget slot every pass. Stamp it out of the queue —
             // this log line therefore fires ONCE per file.
             Err(e) if vortex_index::bloom::is_unbuildable(&e) => {
-                unbuildable.push(id);
+                unbuildable.push(fence);
                 log::error!(
                     "[COMPACTOR:BLOOM] {key}: UNBUILDABLE bloom input, stamping \
                      bloom_ver={BLOOM_VER_UNBUILDABLE} (never retried; the pruner keeps \
@@ -329,39 +344,43 @@ async fn process_bucket_locked(
         }
     }
     let _ = deferred;
-    // stamp poison files BEFORE chunk building: a failure later in the pass
-    // must not leave them spinning in the queue for another round
-    if !unbuildable.is_empty() {
-        infra::file_list::update_bloom_ver(&unbuildable, BLOOM_VER_UNBUILDABLE).await?;
-    }
+    // Stamp poison files before chunk building. Only rows whose sidecar
+    // identity still matches are counted; healed rows remain pending.
+    let unbuildable_matched = if unbuildable.is_empty() {
+        0
+    } else {
+        infra::file_list::update_bloom_ver(&unbuildable, BLOOM_VER_UNBUILDABLE).await?
+    };
 
     // chunk by the per-field num_blocks signature (a field section of one
     // .bf must be block-uniform across its files)
-    let mut chunks: HashMap<Vec<(String, u32)>, Vec<(i64, Vec<vortex_index::bloom::FileBloom>)>> =
-        HashMap::new();
-    for (id, blooms) in per_file {
+    let mut chunks: HashMap<
+        Vec<(String, u32)>,
+        Vec<(BloomFence, Vec<vortex_index::bloom::FileBloom>)>,
+    > = HashMap::new();
+    for (fence, blooms) in per_file {
         let mut sig: Vec<(String, u32)> = blooms
             .iter()
             .map(|b| (b.field.clone(), b.num_blocks))
             .collect();
         sig.sort();
-        chunks.entry(sig).or_default().push((id, blooms));
+        chunks.entry(sig).or_default().push((fence, blooms));
     }
 
     let base_ver = now_micros();
     let mut chunk_idx: i64 = 0;
     let mut built = 0usize;
     for (_sig, mut chunk_files) in chunks {
-        chunk_files.sort_by_key(|(id, _)| *id);
+        chunk_files.sort_by_key(|(fence, _)| fence.0);
         for sub in chunk_files.chunks(MAX_FILES_PER_BF) {
             let bloom_ver = base_ver + chunk_idx;
             chunk_idx += 1;
             let mut field_blooms: Vec<FieldBloom> = Vec::new();
-            for (id, blooms) in sub {
+            for (fence, blooms) in sub {
                 for b in blooms {
                     field_blooms.push(FieldBloom {
                         field: b.field.clone(),
-                        file_id: *id as u64,
+                        file_id: fence.0 as u64,
                         n_items: b.n_items,
                         bytes: b.bytes.clone(),
                     });
@@ -373,20 +392,48 @@ async fn process_bucket_locked(
                 infra::bloom::path::bloom_path(org_id, stream_type, stream_name, date, bloom_ver);
             let account = infra::storage::get_account(org_id, &path).unwrap_or_default();
             infra::storage::put(&account, &path, bytes::Bytes::from(blob)).await?;
-            let ids: Vec<i64> = sub.iter().map(|(id, _)| *id).collect();
-            infra::file_list::update_bloom_ver(&ids, bloom_ver).await?;
-            built += ids.len();
+            let expected: Vec<BloomFence> = sub.iter().map(|(fence, _)| *fence).collect();
+            let matched = infra::file_list::update_bloom_ver(&expected, bloom_ver).await?;
+            if matched == 0
+                && let Err(delete_error) = infra::storage::delete(&account, &path).await
+            {
+                let tombstone = FileListDeleted {
+                    id: 0,
+                    account: account.clone(),
+                    file: path.clone(),
+                    index_generation: 0,
+                    index_file: false,
+                    flattened: false,
+                };
+                infra::file_list::batch_add_deleted(
+                    org_id,
+                    now_micros(),
+                    std::slice::from_ref(&tombstone),
+                )
+                .await
+                .map_err(|outbox_error| {
+                    anyhow::anyhow!(
+                        "unreferenced bloom {path} delete failed ({delete_error}) and cleanup \
+                         enqueue failed: {outbox_error}"
+                    )
+                })?;
+                log::warn!(
+                    "[COMPACTOR:BLOOM] unreferenced chunk {path} could not be deleted \
+                     immediately; queued for deferred cleanup: {delete_error}"
+                );
+            }
+            built += matched as usize;
         }
     }
-    if !not_applicable.is_empty() {
-        infra::file_list::update_bloom_ver(&not_applicable, BLOOM_VER_NOT_APPLICABLE).await?;
-    }
+    let not_applicable_matched = if not_applicable.is_empty() {
+        0
+    } else {
+        infra::file_list::update_bloom_ver(&not_applicable, BLOOM_VER_NOT_APPLICABLE).await?
+    };
     log::info!(
         "[COMPACTOR:BLOOM] {org_id}/{stream_type}/{stream_name}/{date}: built .bf for {built} \
-         files ({chunk_idx} chunks, {fallback_streams} dictionary fallbacks, {} not applicable, \
-         {} unbuildable) in {:?}",
-        not_applicable.len(),
-        unbuildable.len(),
+         files ({chunk_idx} chunks, {fallback_streams} dictionary fallbacks, \
+         {not_applicable_matched} not applicable, {unbuildable_matched} unbuildable) in {:?}",
         started.elapsed()
     );
     Ok(())
@@ -430,7 +477,7 @@ async fn load_file_blooms(
     // every file reaching here; index-less files keep their existing
     // sentinel path upstream.
     let index_source: Option<Arc<dyn vortex_index::VixRangeSource>> =
-        config::vix_sidecar_key(&file.key)
+        config::vix_sidecar_key(&file.key, file.meta.index_generation)
             .filter(|_| file.meta.index_size > 0)
             .map(|sidecar_key| {
                 Arc::new(HealProbeRangeSource {

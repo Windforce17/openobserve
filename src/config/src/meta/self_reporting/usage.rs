@@ -1049,6 +1049,7 @@ mod tests {
             compressed_size: 1024 * 1024,   // 1MB
             flattened: false,
             index_size: 0,
+            index_generation: 0,
             bloom_ver: 0,
         };
 

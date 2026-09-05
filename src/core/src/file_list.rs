@@ -18,7 +18,7 @@ use config::{
     get_config,
     meta::{
         search::ScanStats,
-        stream::{FileKey, PartitionTimeLevel, StreamType},
+        stream::{FileKey, FileListBookKeepMode, PartitionTimeLevel, StreamType},
     },
     metrics::{FILE_LIST_CACHE_HIT_COUNT, FILE_LIST_ID_SELECT_COUNT},
     utils::file::get_file_meta as util_get_file_meta,
@@ -325,29 +325,41 @@ pub fn calculate_local_files_size(files: &[String]) -> Result<u64> {
     Ok(size)
 }
 
-// Delete one parquet file and update the file list
+// Delete one parquet/core file and update the file list.
 pub async fn delete_parquet_file(account: &str, key: &str, file_list_only: bool) -> Result<()> {
-    // delete from file list in metastore
-    infra_file_list::batch_process(&[FileKey::new(
-        0,
-        account.to_string(),
-        key.to_string(),
-        Default::default(),
-        true,
-    )])
+    // Read the active generation before removing the row: a versioned sidecar
+    // key cannot be recovered from the data key alone.
+    // If the row is already gone, preserve the operation's idempotent legacy
+    // cleanup of the data/canonical pair without inventing a version.
+    let meta = match infra_file_list::get(key).await {
+        Ok(meta) => meta,
+        Err(get_error) => match infra_file_list::contains(key).await {
+            Ok(false) => {
+                if !file_list_only {
+                    let mut keys = vec![(account, key)];
+                    let canonical = config::vix_sidecar_key(key, 0);
+                    if let Some(sidecar) = canonical.as_deref() {
+                        keys.push((account, sidecar));
+                    }
+                    _ = storage::del(keys).await;
+                }
+                return Ok(());
+            }
+            Ok(true) | Err(_) => return Err(get_error),
+        },
+    };
+    let snapshot = FileKey::new(0, account.to_string(), key.to_string(), meta, true);
+    let mode = if file_list_only {
+        FileListBookKeepMode::None
+    } else {
+        FileListBookKeepMode::Deleted
+    };
+    infra_file_list::retire_files(
+        std::slice::from_ref(&snapshot),
+        mode,
+        config::utils::time::now_micros(),
+    )
     .await?;
-
-    // delete the object whether the file exists or not. v3 split: a `.vix`
-    // data key also gets its `.vxi` sidecar key deleted unconditionally
-    // (NotFound tolerated — storage::del swallows per-key not-found).
-    if !file_list_only {
-        let sidecar = config::vix_sidecar_key(key);
-        let mut keys = vec![(account, key)];
-        if let Some(sidecar) = sidecar.as_deref() {
-            keys.push((account, sidecar));
-        }
-        _ = storage::del(keys).await;
-    }
     Ok(())
 }
 
@@ -363,7 +375,7 @@ pub async fn update_compressed_size(key: &str, size: i64) -> Result<()> {
 mod tests {
     use config::meta::{
         search::ScanStats,
-        stream::{FileKey, FileMeta},
+        stream::{FileKey, FileListDeleted, FileMeta},
     };
 
     use super::*;
@@ -389,6 +401,7 @@ mod tests {
                 index_size,
                 flattened: false,
                 bloom_ver: 0,
+                ..Default::default()
             },
             deleted: false,
             selection: None,
@@ -397,47 +410,95 @@ mod tests {
         }
     }
 
-    /// M19: `delete_parquet_file(.., file_list_only=false)` on a v2 core
-    /// file removes the file_list ROW and BOTH objects — the `.vix` data
-    /// object and its derived `.vxi` index sidecar — and stays idempotent
-    /// when the objects are already gone (the merge input-reconciliation
-    /// arm calls it exactly then).
+    /// `delete_parquet_file(.., file_list_only=false)` atomically retires the
+    /// live row with a generation-aware deletion tombstone. The delayed
+    /// sweeper then removes the data object and exact active sidecar.
     #[tokio::test]
-    async fn m19_delete_parquet_file_removes_v2_object_pair_and_row() {
+    async fn delete_parquet_file_removes_active_generation_sidecar_and_row() {
         // shared sqlite tables: serialize on the crate-wide lock
         let _guard = crate::compact::jobs_test_support::setup().await;
         std::fs::create_dir_all(&get_config().common.data_stream_dir)
             .expect("create data_stream_dir for tests");
 
         let run = config::utils::time::now_micros();
-        let key = format!("files/m19dpforg{run}/logs/s1/2021/01/02/00/pair.vix");
-        let sidecar = config::vix_sidecar_key(&key).expect("core keys derive sidecar keys");
+        let org = format!("m19dpforg{run}");
+        let key = format!("files/{org}/logs/s1/2021/01/02/00/pair.vix");
         infra::storage::put("", &key, bytes::Bytes::from_static(b"data"))
             .await
             .expect("put data object");
-        infra::storage::put("", &sidecar, bytes::Bytes::from_static(b"sidecar"))
-            .await
-            .expect("put sidecar object");
-        let file = FileKey::new(
-            0,
-            String::new(),
-            key.clone(),
-            config::meta::stream::FileMeta {
-                min_ts: 1,
-                max_ts: 2,
-                records: 10,
-                original_size: 100,
-                compressed_size: 4,
-                index_size: 7,
-                ..Default::default()
-            },
-            false,
-        );
+        let meta = config::meta::stream::FileMeta {
+            min_ts: 1,
+            max_ts: 2,
+            records: 10,
+            original_size: 100,
+            compressed_size: 4,
+            index_size: 0,
+            ..Default::default()
+        };
+        let mut file = FileKey::new(0, String::new(), key.clone(), meta, false);
         crate::compact::jobs_test_support::retry_busy("seed file_list row", || {
             infra_file_list::batch_add(std::slice::from_ref(&file))
         })
         .await;
         assert!(infra_file_list::contains(&key).await.unwrap());
+        let staged_at = config::utils::time::now_micros();
+        let generation = infra_file_list::stage_index_generation(&file, staged_at)
+            .await
+            .unwrap();
+        let sidecar = config::vix_sidecar_key(&key, generation).unwrap();
+        infra::storage::put_if_absent("", &sidecar, bytes::Bytes::from_static(b"sidecar"), false)
+            .await
+            .unwrap();
+        assert!(
+            infra_file_list::publish_index_generation(&file, 7, generation, staged_at)
+                .await
+                .unwrap()
+        );
+        file.meta.index_generation = generation;
+        file.meta.index_size = 7;
+        let swept_intent = crate::compact::deleted::delete(
+            &org,
+            config::utils::time::now_micros() + config::utils::time::hour_micros(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(swept_intent, 0);
+        assert!(
+            infra::storage::head("", &sidecar).await.is_ok(),
+            "GC must not delete a staged candidate that became active"
+        );
+        assert!(infra_file_list::contains(&key).await.unwrap());
+
+        let orphan_generation = infra_file_list::stage_index_generation(&file, staged_at)
+            .await
+            .unwrap();
+        let orphan_sidecar = config::vix_sidecar_key(&key, orphan_generation).unwrap();
+        infra::storage::put(
+            "",
+            &orphan_sidecar,
+            bytes::Bytes::from_static(b"rowless candidate"),
+        )
+        .await
+        .unwrap();
+        let swept_orphan = crate::compact::deleted::delete(
+            &org,
+            config::utils::time::now_micros() + config::utils::time::hour_micros(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(swept_orphan, 1);
+        assert!(infra::storage::head("", &orphan_sidecar).await.is_err());
+        assert!(infra::storage::head("", &sidecar).await.is_ok());
+        assert!(
+            !infra_file_list::publish_index_generation(&file, 17, orphan_generation, staged_at,)
+                .await
+                .unwrap(),
+            "a publisher delayed beyond cleanup must not expose a deleted generation"
+        );
+        assert_eq!(
+            infra_file_list::get(&key).await.unwrap().index_generation,
+            generation
+        );
 
         crate::compact::jobs_test_support::retry_busy("delete_parquet_file", || {
             delete_parquet_file("", &key, false)
@@ -447,6 +508,19 @@ mod tests {
             !infra_file_list::contains(&key).await.unwrap(),
             "the file_list row must be removed"
         );
+        let pending = infra_file_list::list_deleted().await.unwrap();
+        let tombstone = pending
+            .iter()
+            .find(|entry| entry.file == key)
+            .expect("retired data row must have a deletion tombstone");
+        assert_eq!(tombstone.index_generation, generation);
+        let swept = crate::compact::deleted::delete(
+            &org,
+            config::utils::time::now_micros() + config::utils::time::hour_micros(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(swept, 1);
         assert!(
             infra::storage::head("", &key).await.is_err(),
             "the .vix data object must be deleted"

@@ -77,6 +77,8 @@ pub enum Error {
     Message(String),
     #[error("InvalidFileMeta# {0}")]
     InvalidFileMeta(String),
+    #[error("FileGenerationConflict# {0}")]
+    FileGenerationConflict(String),
     #[error("DuplicateName# {0}")]
     DuplicateName(String),
     #[error("ReadOnly# {0}")]
@@ -111,6 +113,8 @@ impl Error {
     ///
     /// - [`Error::InvalidFileMeta`] — our own pre-SQL validation (degenerate meta / unparseable
     ///   file key); the same input fails the same way forever,
+    /// - [`Error::FileGenerationConflict`] — an optimistic file snapshot lost its race; retrying
+    ///   that same snapshot cannot succeed and the caller must re-read,
     /// - SQLSTATE classes that depend only on the statement itself: `42` (syntax error or access
     ///   rule violation), `22` (data exception), `23` (integrity constraint violation), `0A`
     ///   (feature not supported),
@@ -122,7 +126,7 @@ impl Error {
     /// errors) stays retryable.
     pub fn is_deterministic_db_error(&self) -> bool {
         match self {
-            Error::InvalidFileMeta(_) => true,
+            Error::InvalidFileMeta(_) | Error::FileGenerationConflict(_) => true,
             Error::SqlxError(e) => match e {
                 sqlx::Error::Database(db) => db.code().is_some_and(|code| {
                     ["42", "22", "23", "0A"]
@@ -499,6 +503,11 @@ mod tests {
         assert!(sqlstate_error("0A000").is_deterministic_db_error());
         // our pre-SQL meta validation
         assert!(Error::InvalidFileMeta("min_ts is 0".to_string()).is_deterministic_db_error());
+        // an optimistic file-generation fence cannot succeed for the same stale snapshot
+        assert!(
+            Error::FileGenerationConflict("generation changed".to_string())
+                .is_deterministic_db_error()
+        );
         // decode/type mismatches are statement bugs
         assert!(
             Error::SqlxError(sqlx::Error::ColumnNotFound("min_ts".to_string()))

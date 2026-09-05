@@ -19,7 +19,8 @@ use async_trait::async_trait;
 use config::{
     get_config,
     meta::stream::{
-        FileKey, FileListDeleted, FileMeta, PartitionTimeLevel, StreamStats, StreamType,
+        FileKey, FileListBookKeepMode, FileListDeleted, FileMeta, PartitionTimeLevel, StreamStats,
+        StreamType,
     },
     utils::{
         parquet::parse_file_key_columns,
@@ -37,6 +38,13 @@ use crate::{
     errors::{Error, Result},
     file_list::FileRecord,
 };
+
+const PUBLISH_INDEX_GENERATION_SQL: &str = r#"
+UPDATE file_list
+SET index_size = $1, index_generation = $2, bloom_ver = 0, updated_at = $3
+WHERE stream = $4 AND date = $5 AND file = $6
+  AND index_size = $7 AND index_generation = $8;
+"#;
 
 pub struct SqliteFileList {}
 
@@ -91,6 +99,101 @@ impl super::FileList for SqliteFileList {
         Ok(())
     }
 
+    async fn retire_files(
+        &self,
+        expected: &[FileKey],
+        mode: FileListBookKeepMode,
+        created_at: i64,
+    ) -> Result<()> {
+        if expected.is_empty() {
+            return Ok(());
+        }
+        let client = CLIENT_RW.clone();
+        let client = client.lock().await;
+        let mut tx = client.begin().await?;
+        let mut retired = Vec::with_capacity(expected.len());
+        for chunk in expected.chunks(300) {
+            let mut query = QueryBuilder::<Sqlite>::new("DELETE FROM file_list WHERE ");
+            let mut clauses = query.separated(" OR ");
+            for file in chunk {
+                if file.id > 0 {
+                    clauses
+                        .push("(id = ")
+                        .push_bind_unseparated(file.id)
+                        .push_unseparated(" AND index_generation = ")
+                        .push_bind_unseparated(file.meta.index_generation)
+                        .push_unseparated(" AND index_size = ")
+                        .push_bind_unseparated(file.meta.index_size)
+                        .push_unseparated(")");
+                } else {
+                    let (stream_key, date_key, file_name) = parse_file_key_columns(&file.key)
+                        .map_err(|e| Error::Message(e.to_string()))?;
+                    clauses
+                        .push("(stream = ")
+                        .push_bind_unseparated(stream_key)
+                        .push_unseparated(" AND date = ")
+                        .push_bind_unseparated(date_key)
+                        .push_unseparated(" AND file = ")
+                        .push_bind_unseparated(file_name)
+                        .push_unseparated(" AND index_generation = ")
+                        .push_bind_unseparated(file.meta.index_generation)
+                        .push_unseparated(" AND index_size = ")
+                        .push_bind_unseparated(file.meta.index_size)
+                        .push_unseparated(")");
+                }
+            }
+            clauses.push_unseparated(
+                " RETURNING id, account, org, stream, date, file, deleted, min_ts, max_ts, \
+                 records, original_size, compressed_size, index_size, index_generation, \
+                 bloom_ver, flattened, updated_at",
+            );
+            retired.extend(
+                query
+                    .build_query_as::<super::FileRecord>()
+                    .fetch_all(&mut *tx)
+                    .await?,
+            );
+        }
+        if retired.len() != expected.len() {
+            tx.rollback().await?;
+            return Err(Error::FileGenerationConflict(format!(
+                "retirement expected {} rows but matched {}",
+                expected.len(),
+                retired.len()
+            )));
+        }
+
+        match mode {
+            FileListBookKeepMode::History => {
+                let keys = retired.iter().map(FileKey::from).collect::<Vec<_>>();
+                let rows = super::prepare_batch_add(&keys)?;
+                batch_add_with_tx(&mut tx, "file_list_history", &rows).await?;
+            }
+            FileListBookKeepMode::Deleted => {
+                for chunk in retired.chunks(100) {
+                    let mut query = QueryBuilder::<Sqlite>::new(
+                        "INSERT INTO file_list_deleted (account, org, stream, date, file, index_generation, index_file, flattened, created_at)",
+                    );
+                    query.push_values(chunk, |mut b, row| {
+                        b.push_bind(&row.account)
+                            .push_bind(&row.org)
+                            .push_bind(&row.stream)
+                            .push_bind(&row.date)
+                            .push_bind(&row.file)
+                            .push_bind(row.index_generation)
+                            .push_bind(false)
+                            .push_bind(row.flattened)
+                            .push_bind(created_at);
+                    });
+                    query.build().execute(&mut *tx).await?;
+                }
+            }
+            FileListBookKeepMode::None => {}
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn batch_add(&self, files: &[FileKey]) -> Result<()> {
         self.inner_batch_process("file_list", files).await
     }
@@ -107,20 +210,49 @@ impl super::FileList for SqliteFileList {
         self.inner_batch_process("file_list", files).await
     }
 
-    async fn update_dump_records(&self, file: &FileKey, dumped_ids: &[i64]) -> Result<()> {
+    async fn update_dump_records(
+        &self,
+        file: &FileKey,
+        expected: &[(i64, i64, i64)],
+    ) -> Result<()> {
         let client = CLIENT_RW.clone();
         let client = client.lock().await;
-        let mut tx = client.begin().await?;
-
-        // insert the dump file into file_list table
         let (stream_key, date_key, file_name) =
             parse_file_key_columns(&file.key).map_err(|e| Error::Message(e.to_string()))?;
         let org_id = stream_key[..stream_key.find('/').unwrap()].to_string();
         let meta = &file.meta;
         let now_ts = now_micros();
+        let mut tx = client.begin().await?;
 
-        if let Err(e) = sqlx::query(r#"INSERT INTO file_list (account, org, stream, date, file, deleted, min_ts, max_ts, records, original_size, compressed_size, index_size, bloom_ver, flattened, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15);"#)
+        let mut matched = 0;
+        for chunk in expected.chunks(300) {
+            let mut query = QueryBuilder::<Sqlite>::new("SELECT id FROM file_list WHERE ");
+            let mut clauses = query.separated(" OR ");
+            for (id, index_generation, index_size) in chunk {
+                clauses
+                    .push("(id = ")
+                    .push_bind_unseparated(*id)
+                    .push_unseparated(" AND index_generation = ")
+                    .push_bind_unseparated(*index_generation)
+                    .push_unseparated(" AND index_size = ")
+                    .push_bind_unseparated(*index_size)
+                    .push_unseparated(")");
+            }
+            matched += query.build().fetch_all(&mut *tx).await?.len();
+        }
+        if matched != expected.len() {
+            tx.rollback().await?;
+            return Err(Error::FileGenerationConflict(format!(
+                "dump expected {} source rows but matched {matched}",
+                expected.len()
+            )));
+        }
+
+        sqlx::query(
+            r#"INSERT INTO file_list
+               (account, org, stream, date, file, deleted, min_ts, max_ts, records, original_size, compressed_size, index_size, index_generation, bloom_ver, flattened, updated_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16);"#,
+        )
         .bind(&file.account)
         .bind(org_id)
         .bind(stream_key)
@@ -133,40 +265,36 @@ impl super::FileList for SqliteFileList {
         .bind(meta.original_size)
         .bind(meta.compressed_size)
         .bind(meta.index_size)
+        .bind(meta.index_generation)
         .bind(meta.bloom_ver)
         .bind(meta.flattened)
         .bind(now_ts)
         .execute(&mut *tx)
-        .await{
-            if let Err(e) = tx.rollback().await {
-                log::error!("[SQLITE] rollback file_list dump file update error: {e}");
-            }
-            return Err(e.into());
-        }
+        .await?;
 
-        // delete the dumped ids from file_list table
-        for chunk in dumped_ids.chunks(get_config().compact.file_list_deleted_batch_size) {
-            if chunk.is_empty() {
-                continue;
+        for chunk in expected.chunks(300) {
+            let mut query = QueryBuilder::<Sqlite>::new("DELETE FROM file_list WHERE ");
+            let mut clauses = query.separated(" OR ");
+            for (id, index_generation, index_size) in chunk {
+                clauses
+                    .push("(id = ")
+                    .push_bind_unseparated(*id)
+                    .push_unseparated(" AND index_generation = ")
+                    .push_bind_unseparated(*index_generation)
+                    .push_unseparated(" AND index_size = ")
+                    .push_bind_unseparated(*index_size)
+                    .push_unseparated(")");
             }
-            let ids = chunk
-                .iter()
-                .map(|id| id.to_string())
-                .collect::<Vec<String>>()
-                .join(",");
-            let query_str = format!("DELETE FROM file_list WHERE id IN ({ids})");
-            if let Err(e) = sqlx::query(&query_str).execute(&mut *tx).await {
-                if let Err(e) = tx.rollback().await {
-                    log::error!("[SQLITE] rollback file_list dump file update error: {e}");
-                }
-                return Err(e.into());
+            let deleted = query.build().execute(&mut *tx).await?.rows_affected() as usize;
+            if deleted != chunk.len() {
+                tx.rollback().await?;
+                return Err(Error::FileGenerationConflict(format!(
+                    "dump delete expected {} source rows but matched {deleted}",
+                    chunk.len()
+                )));
             }
         }
-
-        if let Err(e) = tx.commit().await {
-            log::error!("[SQLITE] transaction commit error for dump file update {e}");
-            return Err(e.into());
-        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -186,7 +314,7 @@ impl super::FileList for SqliteFileList {
             let client = client.lock().await;
             let mut tx = client.begin().await?;
             let mut query_builder: QueryBuilder<Sqlite> = QueryBuilder::new(
-                "INSERT INTO file_list_deleted (account, org, stream, date, file, index_file, flattened, created_at)",
+                "INSERT INTO file_list_deleted (account, org, stream, date, file, index_generation, index_file, flattened, created_at)",
             );
             query_builder.push_values(files, |mut b, item| {
                 let (stream_key, date_key, file_name) =
@@ -196,6 +324,7 @@ impl super::FileList for SqliteFileList {
                     .push_bind(stream_key)
                     .push_bind(date_key)
                     .push_bind(file_name)
+                    .push_bind(item.index_generation)
                     .push_bind(item.index_file)
                     .push_bind(item.flattened)
                     .push_bind(created_at);
@@ -273,7 +402,7 @@ impl super::FileList for SqliteFileList {
             parse_file_key_columns(file).map_err(|e| Error::Message(e.to_string()))?;
         let ret = sqlx::query_as::<_, super::FileRecord>(
             r#"
-SELECT min_ts, max_ts, records, original_size, compressed_size, index_size, bloom_ver, flattened, file, date
+SELECT min_ts, max_ts, records, original_size, compressed_size, index_size, index_generation, bloom_ver, flattened, file, date
     FROM file_list WHERE stream = $1 AND date = $2 AND file = $3;
             "#,
         )
@@ -320,43 +449,180 @@ SELECT min_ts, max_ts, records, original_size, compressed_size, index_size, bloo
         Ok(())
     }
 
-    async fn update_index_size_for_heal(&self, file: &str, index_size: i64) -> Result<()> {
+    async fn stage_index_generation(&self, file: &FileKey, retired_at: i64) -> Result<i64> {
+        let (stream_key, date_key, file_name) = super::index_data_key_columns(file)?;
+        let org_id = stream_key.split('/').next().unwrap();
         let client = CLIENT_RW.clone();
         let client = client.lock().await;
-        let (stream_key, date_key, file_name) =
-            parse_file_key_columns(file).map_err(|e| Error::Message(e.to_string()))?;
-        sqlx::query(
-            r#"UPDATE file_list SET index_size = $1, bloom_ver = 0 WHERE stream = $2 AND date = $3 AND file = $4;"#,
+        let mut tx = client.begin().await?;
+        let generation = sqlx::query(
+            r#"INSERT INTO file_list_deleted
+               (account, org, stream, date, file, index_generation, index_file, flattened, created_at)
+               VALUES ($1, $2, $3, $4, $5, 0, true, false, $6);"#,
         )
-        .bind(index_size)
-        .bind(stream_key)
-        .bind(date_key)
-        .bind(file_name)
-        .execute(&*client)
-        .await?;
-        Ok(())
+        .bind(&file.account)
+        .bind(org_id)
+        .bind(&stream_key)
+        .bind(&date_key)
+        .bind(&file_name)
+        .bind(retired_at)
+        .execute(&mut *tx)
+        .await?
+        .last_insert_rowid();
+        if generation <= 0 {
+            return Err(Error::InvalidFileMeta(
+                "invalid staged index identity".to_string(),
+            ));
+        }
+        sqlx::query("UPDATE file_list_deleted SET index_generation = id WHERE id = $1;")
+            .bind(generation)
+            .execute(&mut *tx)
+            .await?;
+        // A committed reservation is never reused, even after its row is
+        // removed. On uncertain COMMIT, return no generation to the uploader.
+        tx.commit().await?;
+        Ok(generation)
     }
 
-    async fn update_bloom_ver(&self, ids: &[i64], bloom_ver: i64) -> Result<()> {
-        if ids.is_empty() {
-            return Ok(());
+    async fn publish_index_generation(
+        &self,
+        file: &FileKey,
+        new_index_size: i64,
+        new_generation: i64,
+        retired_at: i64,
+    ) -> Result<bool> {
+        if new_index_size < 0 || new_generation <= 0 {
+            return Err(Error::InvalidFileMeta(format!(
+                "invalid index state size={new_index_size} generation={new_generation} for file: {}",
+                file.key
+            )));
+        }
+        if new_generation == file.meta.index_generation {
+            return Err(Error::InvalidFileMeta(format!(
+                "immutable index generation transition {} -> {new_generation} is invalid for {}",
+                file.meta.index_generation, file.key
+            )));
         }
         let client = CLIENT_RW.clone();
         let client = client.lock().await;
-        // Chunk in case of very long lists; SQLite caps placeholders at 999
-        // and we'd rather not blow it up unexpectedly.
-        for chunk in ids.chunks(900) {
-            let placeholders = std::iter::repeat_n("?", chunk.len())
-                .collect::<Vec<_>>()
-                .join(",");
-            let sql = format!("UPDATE file_list SET bloom_ver = ? WHERE id IN ({placeholders});");
-            let mut q = sqlx::query(&sql).bind(bloom_ver);
-            for id in chunk {
-                q = q.bind(*id);
-            }
-            q.execute(&*client).await?;
+        let (stream_key, date_key, file_name) = super::index_data_key_columns(file)?;
+        let mut tx = client.begin().await?;
+        // Serialize publication and cleanup through the staged ticket before
+        // updating metadata. A losing metadata CAS restores the ticket.
+        let consumed = sqlx::query(
+            r#"DELETE FROM file_list_deleted
+               WHERE id = $4 AND stream = $1 AND date = $2 AND file = $3
+                 AND index_generation = $4 AND index_file = true;"#,
+        )
+        .bind(&stream_key)
+        .bind(&date_key)
+        .bind(&file_name)
+        .bind(new_generation)
+        .execute(&mut *tx)
+        .await?;
+        if consumed.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(false);
         }
-        Ok(())
+        let result = sqlx::query(PUBLISH_INDEX_GENERATION_SQL)
+            .bind(new_index_size)
+            .bind(new_generation)
+            .bind(now_micros())
+            .bind(&stream_key)
+            .bind(&date_key)
+            .bind(&file_name)
+            .bind(file.meta.index_size)
+            .bind(file.meta.index_generation)
+            .execute(&mut *tx)
+            .await?;
+        if result.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        if file.meta.index_size > 0 && new_generation != file.meta.index_generation {
+            let retired_key = config::vix_sidecar_key(&file.key, file.meta.index_generation)
+                .ok_or_else(|| Error::Message(format!("invalid indexed file key: {}", file.key)))?;
+            let (retired_stream, retired_date, retired_file) =
+                parse_file_key_columns(&retired_key).map_err(|e| Error::Message(e.to_string()))?;
+            let org_id = retired_stream[..retired_stream.find('/').unwrap()].to_string();
+            sqlx::query(
+                r#"INSERT INTO file_list_deleted
+                   (account, org, stream, date, file, index_generation, index_file, flattened, created_at)
+                   VALUES ($1, $2, $3, $4, $5, 0, false, false, $6);"#,
+            )
+            .bind(&file.account)
+            .bind(org_id)
+            .bind(retired_stream)
+            .bind(retired_date)
+            .bind(retired_file)
+            .bind(retired_at)
+            .execute(&mut *tx)
+            .await?;
+        }
+        match tx.commit().await {
+            Ok(()) => Ok(true),
+            Err(commit_error) => {
+                match sqlx::query_as::<_, (i64, i64)>(
+                    r#"SELECT index_size, index_generation FROM file_list
+                       WHERE stream = $1 AND date = $2 AND file = $3;"#,
+                )
+                .bind(&stream_key)
+                .bind(&date_key)
+                .bind(&file_name)
+                .fetch_optional(&*client)
+                .await
+                {
+                    Ok(Some((size, generation)))
+                        if size == new_index_size && generation == new_generation =>
+                    {
+                        log::warn!(
+                            "[SQLITE] reconciled outcome-ambiguous sidecar generation commit \
+                             for {} at generation {new_generation}",
+                            file.key
+                        );
+                        Ok(true)
+                    }
+                    Ok(_) => Err(commit_error.into()),
+                    Err(reconcile_error) => {
+                        log::error!(
+                            "[SQLITE] sidecar generation commit for {} failed ambiguously and \
+                             reconciliation failed: {reconcile_error}",
+                            file.key
+                        );
+                        Err(commit_error.into())
+                    }
+                }
+            }
+        }
+    }
+
+    async fn update_bloom_ver(&self, expected: &[(i64, i64, i64)], bloom_ver: i64) -> Result<u64> {
+        if expected.is_empty() {
+            return Ok(0);
+        }
+        let client = CLIENT_RW.clone();
+        let client = client.lock().await;
+        let mut updated = 0;
+        for chunk in expected.chunks(300) {
+            let mut query = QueryBuilder::<Sqlite>::new("UPDATE file_list SET bloom_ver = ");
+            query
+                .push_bind(bloom_ver)
+                .push(" WHERE bloom_ver = 0 AND (");
+            let mut clauses = query.separated(" OR ");
+            for (id, index_generation, index_size) in chunk {
+                clauses
+                    .push("(id = ")
+                    .push_bind_unseparated(*id)
+                    .push_unseparated(" AND index_generation = ")
+                    .push_bind_unseparated(*index_generation)
+                    .push_unseparated(" AND index_size = ")
+                    .push_bind_unseparated(*index_size)
+                    .push_unseparated(")");
+            }
+            clauses.push_unseparated(")");
+            updated += query.build().execute(&*client).await?.rows_affected();
+        }
+        Ok(updated)
     }
 
     async fn bloom_ver_referenced(
@@ -383,7 +649,7 @@ SELECT min_ts, max_ts, records, original_size, compressed_size, index_size, bloo
     async fn list(&self) -> Result<Vec<FileKey>> {
         let pool = CLIENT_RO.clone();
         let ret = sqlx::query_as::<_, super::FileRecord>(
-            r#"SELECT id, account, stream, date, file, deleted, min_ts, max_ts, records, original_size, compressed_size, index_size, bloom_ver, flattened FROM file_list;"#,
+            r#"SELECT id, account, stream, date, file, deleted, min_ts, max_ts, records, original_size, compressed_size, index_size, index_generation, bloom_ver, flattened FROM file_list;"#,
         )
         .fetch_all(&pool)
         .await?;
@@ -405,7 +671,7 @@ SELECT min_ts, max_ts, records, original_size, compressed_size, index_size, bloo
         let max_ts_upper_bound = super::calculate_max_ts_upper_bound(time_end, stream_type);
         let ret = sqlx::query_as::<_, super::FileRecord>(
             r#"
-SELECT id, account, stream, date, file, min_ts, max_ts, records, original_size, compressed_size, index_size, bloom_ver, flattened
+SELECT id, account, stream, date, file, min_ts, max_ts, records, original_size, compressed_size, index_size, index_generation, bloom_ver, flattened
     FROM file_list
     WHERE stream = $1 AND max_ts >= $2 AND max_ts <= $3 AND min_ts <= $4;
                 "#,
@@ -445,7 +711,7 @@ SELECT id, account, stream, date, file, min_ts, max_ts, records, original_size, 
         let pool = CLIENT_RO.clone();
         let ret = sqlx::query_as::<_, super::FileRecord>(
                 r#"
-SELECT id, account, stream, date, file, min_ts, max_ts, records, original_size, compressed_size, index_size, bloom_ver, flattened
+SELECT id, account, stream, date, file, min_ts, max_ts, records, original_size, compressed_size, index_size, index_generation, bloom_ver, flattened
     FROM file_list
     WHERE stream = $1 AND date >= $2 AND date <= $3
         AND (original_size <= $4
@@ -517,7 +783,7 @@ SELECT id, account, stream, date, file, min_ts, max_ts, records, original_size, 
 
         let pool = CLIENT_RO.clone();
         let sql = r#"
-SELECT id, account, stream, date, file, records, index_size, compressed_size FROM file_list WHERE stream = $1 AND date = $2 AND index_size > 0 AND bloom_ver = 0;
+SELECT id, account, stream, date, file, records, index_size, index_generation, compressed_size FROM file_list WHERE stream = $1 AND date = $2 AND index_size > 0 AND bloom_ver = 0;
                 "#;
         let ret = sqlx::query_as::<_, super::FileRecord>(sql)
             .bind(stream_key)
@@ -568,7 +834,7 @@ SELECT stream, date FROM file_list WHERE index_size > 0 AND bloom_ver = 0 AND da
                 .collect::<Vec<String>>()
                 .join(",");
             let query_str = format!(
-                "SELECT id, account, stream, date, file, min_ts, max_ts, records, original_size, compressed_size, index_size, bloom_ver FROM file_list WHERE id IN ({ids})"
+                "SELECT id, account, stream, date, file, min_ts, max_ts, records, original_size, compressed_size, index_size, index_generation, bloom_ver FROM file_list WHERE id IN ({ids})"
             );
             let res = sqlx::query_as::<_, super::FileRecord>(&query_str)
                 .fetch_all(&pool)
@@ -797,31 +1063,62 @@ SELECT date
         if time_max == 0 {
             return Ok(Vec::new());
         }
-        let pool = CLIENT_RO.clone();
+        let client = CLIENT_RW.clone();
+        let client = client.lock().await;
+        let mut tx = client.begin_with("BEGIN IMMEDIATE").await?;
         let ret = sqlx::query_as::<_, super::FileDeletedRecord>(
-            r#"SELECT id, account, stream, date, file, index_file, flattened FROM file_list_deleted WHERE org = $1 AND created_at < $2 ORDER BY created_at ASC LIMIT $3;"#,
+            r#"SELECT id, account, stream, date, file, index_generation, index_file, flattened FROM file_list_deleted WHERE org = $1 AND created_at < $2 ORDER BY created_at ASC LIMIT $3;"#,
         )
         .bind(org_id)
         .bind(time_max)
         .bind(limit)
-        .fetch_all(&pool)
+        .fetch_all(&mut *tx)
         .await?;
-        Ok(ret
+        let mut items: Vec<FileListDeleted> = ret
             .iter()
             .map(|r| FileListDeleted {
                 id: r.id,
                 account: r.account.to_string(),
                 file: format!("files/{}/{}/{}", r.stream, r.date, r.file),
+                index_generation: r.index_generation,
                 index_file: r.index_file,
                 flattened: r.flattened,
             })
-            .collect())
+            .collect();
+        for item in &mut items {
+            if !item.index_file || item.index_generation == 0 {
+                continue;
+            }
+            let exact_key =
+                config::vix_sidecar_key(&item.file, item.index_generation).ok_or_else(|| {
+                    Error::InvalidFileMeta(format!("invalid staged sidecar: {}", item.file))
+                })?;
+            let (_, _, exact_file) =
+                parse_file_key_columns(&exact_key).map_err(|e| Error::Message(e.to_string()))?;
+            // The writer transaction fences publishers. Preserve the ID and
+            // created_at so failed object deletion retries the same exact key.
+            sqlx::query(
+                r#"UPDATE file_list_deleted
+                   SET file = $1, index_generation = 0, index_file = false, flattened = false
+                   WHERE id = $2;"#,
+            )
+            .bind(exact_file)
+            .bind(item.id)
+            .execute(&mut *tx)
+            .await?;
+            item.file = exact_key;
+            item.index_generation = 0;
+            item.index_file = false;
+            item.flattened = false;
+        }
+        tx.commit().await?;
+        Ok(items)
     }
 
     async fn list_deleted(&self) -> Result<Vec<FileListDeleted>> {
         let pool = CLIENT_RO.clone();
         let ret = sqlx::query_as::<_, super::FileDeletedRecord>(
-            r#"SELECT id, account, stream, date, file, index_file, flattened FROM file_list_deleted;"#,
+            r#"SELECT id, account, stream, date, file, index_generation, index_file, flattened FROM file_list_deleted;"#,
         )
         .fetch_all(&pool)
         .await?;
@@ -831,6 +1128,7 @@ SELECT date
                 id: r.id,
                 account: r.account.to_string(),
                 file: format!("files/{}/{}/{}", r.stream, r.date, r.file),
+                index_generation: r.index_generation,
                 index_file: r.index_file,
                 flattened: r.flattened,
             })
@@ -1688,8 +1986,8 @@ impl SqliteFileList {
         let client = client.lock().await;
         match  sqlx::query(
             format!(r#"
-INSERT INTO {table} (id, account, org, stream, date, file, deleted, min_ts, max_ts, records, original_size, compressed_size, index_size, bloom_ver, flattened, updated_at)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16);
+INSERT INTO {table} (id, account, org, stream, date, file, deleted, min_ts, max_ts, records, original_size, compressed_size, index_size, index_generation, bloom_ver, flattened, updated_at)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17);
         "#).as_str(),
     )
         .bind(id)
@@ -1705,6 +2003,7 @@ INSERT INTO {table} (id, account, org, stream, date, file, deleted, min_ts, max_
         .bind(meta.original_size)
         .bind(meta.compressed_size)
         .bind(meta.index_size)
+        .bind(meta.index_generation)
         .bind(meta.bloom_ver)
         .bind(meta.flattened)
         .bind(now_ts)
@@ -1740,59 +2039,39 @@ INSERT INTO {table} (id, account, org, stream, date, file, deleted, min_ts, max_
             return Err(e);
         }
 
-        // sort by file id and key to reduce locked table range
-        let mut del_items = files.iter().filter(|v| v.deleted).collect::<Vec<_>>();
-        del_items.sort_by(|v1, v2| match v1.id.cmp(&v2.id) {
-            std::cmp::Ordering::Equal => v1.key.cmp(&v2.key),
-            other => other,
-        });
-        let deleted_batch_size = get_config().compact.file_list_deleted_batch_size;
-        if !del_items.is_empty() {
-            let chunks = del_items.chunks(deleted_batch_size);
-            for files in chunks {
-                // get ids of the files
-                let mut ids = Vec::with_capacity(files.len());
-                for file in files {
-                    if file.id > 0 {
-                        ids.push(file.id.to_string());
-                        continue;
-                    }
-                    let (stream_key, date_key, file_name) = parse_file_key_columns(&file.key)
-                        .map_err(|e| Error::Message(e.to_string()))?;
-                    let query_res: std::result::Result<Option<i64>, sea_orm::SqlxError> = sqlx::query_scalar(
-                    r#"SELECT id FROM file_list WHERE stream = $1 AND date = $2 AND file = $3;"#,
-                    )
-                    .bind(stream_key)
-                    .bind(date_key)
-                    .bind(file_name)
-                    .fetch_one(&mut *tx)
-                    .await;
-                    match query_res {
-                        Ok(Some(v)) => ids.push(v.to_string()),
-                        Ok(None) => continue,
-                        Err(sqlx::Error::RowNotFound) => continue,
-                        Err(e) => {
-                            if let Err(e) = tx.rollback().await {
-                                log::error!(
-                                    "[SQLITE] rollback {table} batch process for delete error: {e}"
-                                );
-                            }
-                            return Err(e.into());
-                        }
-                    };
-                }
-                // delete files by ids
-                if !ids.is_empty() {
-                    let sql = format!("DELETE FROM file_list WHERE id IN({});", ids.join(","));
-                    if let Err(e) = sqlx::query(sql.as_str()).execute(&mut *tx).await {
-                        if let Err(e) = tx.rollback().await {
-                            log::error!(
-                                "[SQLITE] rollback {table} batch process for delete error: {e}"
-                            );
-                        }
-                        return Err(e.into());
-                    }
-                }
+        for file in files.iter().filter(|v| v.deleted) {
+            let result = if file.id > 0 {
+                sqlx::query(
+                    r#"DELETE FROM file_list
+                       WHERE id = $1 AND index_generation = $2 AND index_size = $3;"#,
+                )
+                .bind(file.id)
+                .bind(file.meta.index_generation)
+                .bind(file.meta.index_size)
+                .execute(&mut *tx)
+                .await?
+            } else {
+                let (stream_key, date_key, file_name) =
+                    parse_file_key_columns(&file.key).map_err(|e| Error::Message(e.to_string()))?;
+                sqlx::query(
+                    r#"DELETE FROM file_list
+                       WHERE stream = $1 AND date = $2 AND file = $3
+                         AND index_generation = $4 AND index_size = $5;"#,
+                )
+                .bind(stream_key)
+                .bind(date_key)
+                .bind(file_name)
+                .bind(file.meta.index_generation)
+                .bind(file.meta.index_size)
+                .execute(&mut *tx)
+                .await?
+            };
+            if result.rows_affected() != 1 {
+                tx.rollback().await?;
+                return Err(Error::FileGenerationConflict(format!(
+                    "delete lost metadata race for {} at generation {} size {}",
+                    file.key, file.meta.index_generation, file.meta.index_size
+                )));
             }
         }
 
@@ -1823,7 +2102,7 @@ pub(crate) async fn batch_add_with_tx(
     for chunk in rows.chunks(100) {
         let now_ts = now_micros();
         let mut query_builder: QueryBuilder<Sqlite> = QueryBuilder::new(
-            format!("INSERT INTO {table} (id, account, org, stream, date, file, deleted, min_ts, max_ts, records, original_size, compressed_size, index_size, bloom_ver, flattened, updated_at)").as_str(),
+            format!("INSERT INTO {table} (id, account, org, stream, date, file, deleted, min_ts, max_ts, records, original_size, compressed_size, index_size, index_generation, bloom_ver, flattened, updated_at)").as_str(),
         );
         query_builder.push_values(
             chunk,
@@ -1842,6 +2121,7 @@ pub(crate) async fn batch_add_with_tx(
                     .push_bind(item.meta.original_size)
                     .push_bind(item.meta.compressed_size)
                     .push_bind(item.meta.index_size)
+                    .push_bind(item.meta.index_generation)
                     .push_bind(item.meta.bloom_ver)
                     .push_bind(item.meta.flattened)
                     .push_bind(now_ts);
@@ -1874,6 +2154,7 @@ CREATE TABLE IF NOT EXISTS file_list
     original_size   BIGINT not null,
     compressed_size BIGINT not null,
     index_size      BIGINT not null,
+    index_generation BIGINT default 0 not null,
     bloom_ver       BIGINT default 0 not null,
     updated_at      BIGINT not null
 );
@@ -1900,6 +2181,7 @@ CREATE TABLE IF NOT EXISTS file_list_history
     original_size   BIGINT not null,
     compressed_size BIGINT not null,
     index_size      BIGINT not null,
+    index_generation BIGINT default 0 not null,
     bloom_ver       BIGINT default 0 not null,
     updated_at      BIGINT not null
 );
@@ -1918,6 +2200,7 @@ CREATE TABLE IF NOT EXISTS file_list_deleted
     stream     VARCHAR not null,
     date       VARCHAR not null,
     file       VARCHAR not null,
+    index_generation BIGINT default 0 not null,
     index_file BOOLEAN default false not null,
     flattened  BOOLEAN default false not null,
     created_at BIGINT not null
@@ -2013,6 +2296,13 @@ CREATE TABLE IF NOT EXISTS file_list_dump_stats
     let column = "index_file";
     let data_type = "BOOLEAN default false not null";
     add_column(&client, "file_list_deleted", column, data_type).await?;
+    add_column(
+        &client,
+        "file_list_deleted",
+        "index_generation",
+        "BIGINT default 0 not null",
+    )
+    .await?;
 
     // create col dumped for file_list_jobs for version <=0.14.0
     add_column(
@@ -2065,6 +2355,12 @@ CREATE TABLE IF NOT EXISTS file_list_dump_stats
         "BIGINT default 0 not null",
     )
     .await?;
+    // Immutable `.vxi` sidecar generation; legacy rows address generation 0.
+    let column = "index_generation";
+    let data_type = "BIGINT default 0 not null";
+    add_column(&client, "file_list", column, data_type).await?;
+    add_column(&client, "file_list_history", column, data_type).await?;
+
     add_column(
         &client,
         "file_list_jobs",
@@ -2345,6 +2641,7 @@ mod tests {
             compressed_size: 10000,
             flattened: false,
             index_size: 5000,
+            index_generation: 0,
             bloom_ver: 0,
         }
     }
@@ -2877,6 +3174,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_index_generation_migration_defaults_legacy_rows_to_zero() {
+        let pool = fresh_in_memory_pool().await;
+        create_legacy_file_list_table(&pool).await;
+        sqlx::query(
+            r#"INSERT INTO file_list
+               (account, org, stream, date, file, deleted, flattened, min_ts, max_ts,
+                records, original_size, compressed_size, index_size, updated_at)
+               VALUES ('a', 'o', 'o/logs/s', '2026/09/04/00', 'legacy.vix',
+                       false, false, 1, 2, 3, 4, 5, 6, 7);"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        crate::db::sqlite::add_column(
+            &pool,
+            "file_list",
+            "index_generation",
+            "BIGINT default 0 not null",
+        )
+        .await
+        .unwrap();
+        assert!(column_exists(&pool, "file_list", "index_generation").await);
+        let generation: i64 =
+            sqlx::query_scalar("SELECT index_generation FROM file_list WHERE file = 'legacy.vix';")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(generation, 0);
+    }
+
+    #[tokio::test]
     async fn test_legacy_rows_default_to_bloom_ver_zero_after_migration() {
         let pool = fresh_in_memory_pool().await;
         create_legacy_file_list_table(&pool).await;
@@ -3011,15 +3340,9 @@ mod tests {
     }
 
     // ── delete_by_org row move ───────────────────────────────────────────────
-    //
-    // `file_list` has no `index_file` column; the move statement writes a
-    // constant false (no file has a sibling index object). Regression test:
-    // an earlier revision selected a non-existent column and blew up at
-    // runtime, breaking org cleanup for every file type — keep the statement
-    // pinned to the real schema.
 
     #[tokio::test]
-    async fn test_move_file_list_to_deleted_writes_index_file_false() {
+    async fn test_move_file_list_to_deleted_preserves_generation() {
         let pool = fresh_in_memory_pool().await;
         // current-shape tables (subset of create_table used by the statement)
         sqlx::query(
@@ -3039,6 +3362,7 @@ mod tests {
                 original_size   BIGINT NOT NULL,
                 compressed_size BIGINT NOT NULL,
                 index_size      BIGINT DEFAULT 0 NOT NULL,
+                index_generation BIGINT DEFAULT 0 NOT NULL,
                 bloom_ver       BIGINT DEFAULT 0 NOT NULL,
                 updated_at      BIGINT DEFAULT 0 NOT NULL
             );
@@ -3056,6 +3380,7 @@ mod tests {
                 stream     VARCHAR NOT NULL,
                 date       VARCHAR NOT NULL,
                 file       VARCHAR NOT NULL,
+                index_generation BIGINT DEFAULT 0 NOT NULL,
                 index_file BOOLEAN DEFAULT false NOT NULL,
                 flattened  BOOLEAN DEFAULT false NOT NULL,
                 created_at BIGINT NOT NULL
@@ -3066,14 +3391,19 @@ mod tests {
         .await
         .unwrap();
 
-        // a core .vix (index embedded, index_size > 0) and a parquet
-        for (file, index_size) in [("1.vix", 100_i64), ("2.parquet", 0)] {
+        for (file, index_size, index_generation) in
+            [("1.vix", 100_i64, 77_i64), ("2.parquet", 0, 0)]
+        {
             sqlx::query(
-                r#"INSERT INTO file_list (account, org, stream, date, file, min_ts, max_ts, records, original_size, compressed_size, index_size)
-                   VALUES ('acc', 'org1', 'org1/logs/s1', '2024/02/16/16', $1, 1, 2, 10, 1000, 100, $2);"#,
+                r#"INSERT INTO file_list
+                   (account, org, stream, date, file, min_ts, max_ts, records,
+                    original_size, compressed_size, index_size, index_generation)
+                   VALUES ('acc', 'org1', 'org1/logs/s1', '2024/02/16/16',
+                           $1, 1, 2, 10, 1000, 100, $2, $3);"#,
             )
             .bind(file)
             .bind(index_size)
+            .bind(index_generation)
             .execute(&pool)
             .await
             .unwrap();
@@ -3086,8 +3416,9 @@ mod tests {
             .await
             .expect("move statement must be valid against the file_list schema");
 
-        let rows: Vec<(String, bool, i64)> = sqlx::query_as(
-            "SELECT file, index_file, created_at FROM file_list_deleted ORDER BY file;",
+        let rows: Vec<(String, i64, bool, i64)> = sqlx::query_as(
+            "SELECT file, index_generation, index_file, created_at \
+             FROM file_list_deleted ORDER BY file;",
         )
         .fetch_all(&pool)
         .await
@@ -3095,10 +3426,9 @@ mod tests {
         assert_eq!(
             rows,
             vec![
-                ("1.vix".to_string(), false, 123_456_789),
-                ("2.parquet".to_string(), false, 123_456_789),
+                ("1.vix".to_string(), 77, false, 123_456_789),
+                ("2.parquet".to_string(), 0, false, 123_456_789),
             ],
-            "index_file is a constant false for every file"
         );
     }
 
@@ -4139,5 +4469,398 @@ WHERE file_list_jobs.status = $5;"#;
             FileListJobStatus::Done as i64
         );
         raw_delete_jobs(&[id]).await;
+    }
+
+    #[tokio::test]
+    async fn test_generation_publish_before_gc_and_indexless_drop() {
+        let _guard = jobs_setup().await;
+        let list = SqliteFileList::new();
+        let nonce = now_micros();
+        let org = format!("generation-publish-{nonce}");
+        let mut file = create_test_file_key(
+            "default",
+            &format!("files/{org}/logs/source/2026/09/04/00/source.vix"),
+            false,
+        );
+        file.meta.index_size = 100;
+        file.id = list
+            .add(&file.account, &file.key, &file.meta)
+            .await
+            .unwrap();
+        let generation = list.stage_index_generation(&file, 1).await.unwrap();
+        assert!(generation > 0);
+        assert!(
+            list.publish_index_generation(&file, 120, generation, 1)
+                .await
+                .unwrap()
+        );
+
+        let retired = list.query_deleted(&org, 2, 100).await.unwrap();
+        assert_eq!(retired.len(), 1);
+        assert_eq!(
+            retired[0].file,
+            config::vix_sidecar_key(&file.key, 0).unwrap()
+        );
+        assert_eq!(
+            (retired[0].index_generation, retired[0].index_file),
+            (0, false)
+        );
+        file.meta.index_size = 120;
+        file.meta.index_generation = generation;
+
+        let drop_generation = list.stage_index_generation(&file, 1).await.unwrap();
+        assert!(drop_generation > generation);
+        assert!(
+            list.publish_index_generation(&file, 0, drop_generation, 1)
+                .await
+                .unwrap()
+        );
+        file.meta.index_size = 0;
+        file.meta.index_generation = drop_generation;
+        let stored = list.get(&file.key).await.unwrap();
+        assert_eq!(
+            (stored.index_size, stored.index_generation),
+            (0, drop_generation)
+        );
+
+        // Dumping can remove the authoritative row immediately after publish:
+        // no surviving winner intent may make its generation look orphaned.
+        let dump = create_test_file_key(
+            "default",
+            &format!("files/{org}/filelist/dump/2026/09/04/00/dump.parquet"),
+            false,
+        );
+        list.update_dump_records(&dump, &[(file.id, drop_generation, 0)])
+            .await
+            .unwrap();
+        let mut retired = list.query_deleted(&org, 2, 100).await.unwrap();
+        retired.sort_by(|a, b| a.file.cmp(&b.file));
+        let mut expected = vec![
+            config::vix_sidecar_key(&file.key, 0).unwrap(),
+            config::vix_sidecar_key(&file.key, generation).unwrap(),
+        ];
+        expected.sort();
+        assert_eq!(
+            retired
+                .iter()
+                .map(|item| item.file.clone())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert!(
+            retired
+                .iter()
+                .all(|item| item.index_generation == 0 && !item.index_file)
+        );
+        let high_water = retired
+            .iter()
+            .map(|item| item.id)
+            .max()
+            .unwrap()
+            .max(drop_generation);
+        let deleted = retired
+            .iter()
+            .map(|item| {
+                let mut key = create_test_file_key(&item.account, &item.file, true);
+                key.id = item.id;
+                key
+            })
+            .collect::<Vec<_>>();
+        list.batch_remove_deleted(&deleted).await.unwrap();
+        assert!(list.query_deleted(&org, 2, 100).await.unwrap().is_empty());
+        // Even with all of this org's tickets removed, its retired generations
+        // must not be reused by a later reservation.
+        let next_generation = list.stage_index_generation(&file, 1).await.unwrap();
+        assert!(next_generation > high_water);
+
+        let client = CLIENT_RW.clone();
+        let client = client.lock().await;
+        sqlx::query("DELETE FROM file_list WHERE org = $1")
+            .bind(&org)
+            .execute(&*client)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM file_list_deleted WHERE org = $1")
+            .bind(&org)
+            .execute(&*client)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_generation_gc_before_publish_fences_heal_and_drop() {
+        let _guard = jobs_setup().await;
+        let list = SqliteFileList::new();
+        let nonce = now_micros();
+        let org = format!("generation-claim-{nonce}");
+        let mut file = create_test_file_key(
+            "default",
+            &format!("files/{org}/logs/source/2026/09/04/00/source.vix"),
+            false,
+        );
+        file.meta.index_size = 100;
+        file.meta.bloom_ver = 123;
+        file.id = list
+            .add(&file.account, &file.key, &file.meta)
+            .await
+            .unwrap();
+        let original = list.get(&file.key).await.unwrap();
+
+        for new_size in [120, 0] {
+            let generation = list.stage_index_generation(&file, 1).await.unwrap();
+            let exact_key = config::vix_sidecar_key(&file.key, generation).unwrap();
+            let claimed = list.query_deleted(&org, 2, 100).await.unwrap();
+            let candidate = claimed.iter().find(|item| item.id == generation).unwrap();
+            assert_eq!(candidate.file, exact_key);
+            assert_eq!(
+                (candidate.index_generation, candidate.index_file),
+                (0, false)
+            );
+            assert!(
+                !list
+                    .publish_index_generation(&file, new_size, generation, 1)
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(list.get(&file.key).await.unwrap(), original);
+
+            // Failed object deletion does not release the publication fence:
+            // every retry gets the same ID and exact immutable candidate key.
+            let retry = list.query_deleted(&org, 2, 100).await.unwrap();
+            let candidate = retry.iter().find(|item| item.id == generation).unwrap();
+            assert_eq!(candidate.file, exact_key);
+            assert_eq!(
+                (candidate.index_generation, candidate.index_file),
+                (0, false)
+            );
+            assert!(
+                retry
+                    .iter()
+                    .all(|item| item.file != config::vix_sidecar_key(&file.key, 0).unwrap())
+            );
+        }
+
+        let client = CLIENT_RW.clone();
+        let client = client.lock().await;
+        sqlx::query("DELETE FROM file_list WHERE id = $1")
+            .bind(file.id)
+            .execute(&*client)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM file_list_deleted WHERE org = $1")
+            .bind(&org)
+            .execute(&*client)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_generation_fences_publication_bloom_dump_and_batch_delete() {
+        let _guard = jobs_setup().await;
+        let list = SqliteFileList::new();
+        let nonce = now_micros();
+        let mut first = create_test_file_key(
+            "default",
+            &format!("files/generation-tests/logs/source/2026/09/04/00/{nonce}-first.vix"),
+            false,
+        );
+        first.meta.index_size = 100;
+        let mut second = create_test_file_key(
+            "default",
+            &format!("files/generation-tests/logs/source/2026/09/04/00/{nonce}-second.vix"),
+            false,
+        );
+        second.meta.index_size = 200;
+        first.id = list
+            .add(&first.account, &first.key, &first.meta)
+            .await
+            .unwrap();
+        second.id = list
+            .add(&second.account, &second.key, &second.meta)
+            .await
+            .unwrap();
+
+        let first_generation = list.stage_index_generation(&first, nonce).await.unwrap();
+        assert!(
+            list.publish_index_generation(&first, 110, first_generation, nonce)
+                .await
+                .unwrap()
+        );
+        first.meta.index_size = 110;
+        first.meta.index_generation = first_generation;
+        let second_generation = list.stage_index_generation(&second, nonce).await.unwrap();
+        assert!(
+            list.publish_index_generation(&second, 220, second_generation, nonce)
+                .await
+                .unwrap()
+        );
+        let stale_generation = list.stage_index_generation(&second, nonce).await.unwrap();
+        assert!(
+            !list
+                .publish_index_generation(&second, 230, stale_generation, nonce + 1)
+                .await
+                .unwrap(),
+            "the stale generation-zero snapshot must lose its CAS"
+        );
+        let (stored, retired_count, candidate_count): ((i64, i64, i64, i64), i64, i64) = {
+            let client = CLIENT_RW.clone();
+            let client = client.lock().await;
+            let stored = sqlx::query_as(
+                "SELECT index_size, index_generation, bloom_ver, updated_at \
+                 FROM file_list WHERE id = $1",
+            )
+            .bind(second.id)
+            .fetch_one(&*client)
+            .await
+            .unwrap();
+            let (_, _, retired_file) =
+                parse_file_key_columns(&config::vix_sidecar_key(&second.key, 0).unwrap()).unwrap();
+            let retired_count = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM file_list_deleted WHERE org = 'generation-tests' AND file = $1",
+            )
+            .bind(retired_file)
+            .fetch_one(&*client)
+            .await
+            .unwrap();
+            let (_, candidate_date, candidate_file) = parse_file_key_columns(&second.key).unwrap();
+            let candidate_count = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM file_list_deleted \
+                 WHERE org = 'generation-tests' AND date = $1 AND file = $2 \
+                   AND index_generation = $3 AND index_file = true",
+            )
+            .bind(candidate_date)
+            .bind(candidate_file)
+            .bind(second_generation)
+            .fetch_one(&*client)
+            .await
+            .unwrap();
+            (stored, retired_count, candidate_count)
+        };
+        assert_eq!((stored.0, stored.1, stored.2), (220, second_generation, 0));
+        assert!(stored.3 > 0);
+        assert_eq!(retired_count, 1);
+        assert_eq!(
+            candidate_count, 0,
+            "winning publication must disarm its staged cleanup intent"
+        );
+        let cleanup = list
+            .query_deleted("generation-tests", nonce + 1, 100)
+            .await
+            .unwrap();
+        let loser = cleanup
+            .iter()
+            .find(|item| item.id == stale_generation)
+            .unwrap();
+        assert_eq!(
+            loser.file,
+            config::vix_sidecar_key(&second.key, stale_generation).unwrap()
+        );
+        assert_eq!((loser.index_generation, loser.index_file), (0, false));
+        assert!(
+            !cleanup.iter().any(|item| item.file
+                == config::vix_sidecar_key(&second.key, second_generation).unwrap())
+        );
+
+        assert_eq!(
+            list.update_bloom_ver(&[(second.id, 0, 200)], 123)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            list.update_bloom_ver(&[(second.id, second_generation, 220)], 123)
+                .await
+                .unwrap(),
+            1
+        );
+
+        let dump = create_test_file_key(
+            "default",
+            &format!("files/generation-tests/filelist/dump/2026/09/04/00/{nonce}-dump.parquet"),
+            false,
+        );
+        let stale_expected = [
+            (first.id, first.meta.index_generation, first.meta.index_size),
+            (
+                second.id,
+                second.meta.index_generation,
+                second.meta.index_size,
+            ),
+        ];
+        let err = list
+            .update_dump_records(&dump, &stale_expected)
+            .await
+            .expect_err("one stale source must reject the entire dump transaction");
+        assert!(matches!(err, Error::FileGenerationConflict(_)));
+
+        let mut replacement = create_test_file_key(
+            "default",
+            &format!("files/generation-tests/logs/source/2026/09/04/00/{nonce}-replacement.vix"),
+            false,
+        );
+        replacement.meta.index_size = 50;
+        let mut stale_delete = second.clone();
+        stale_delete.deleted = true;
+        let err = list
+            .batch_process(&[replacement.clone(), stale_delete])
+            .await
+            .expect_err("stale delete must roll back sibling adds");
+        assert!(matches!(err, Error::FileGenerationConflict(_)));
+
+        let (source_count, dump_count, replacement_count): (i64, i64, i64) = {
+            let client = CLIENT_RW.clone();
+            let client = client.lock().await;
+            let source_count =
+                sqlx::query_scalar("SELECT COUNT(*) FROM file_list WHERE id IN ($1, $2)")
+                    .bind(first.id)
+                    .bind(second.id)
+                    .fetch_one(&*client)
+                    .await
+                    .unwrap();
+            let (_, dump_date, dump_file) = parse_file_key_columns(&dump.key).unwrap();
+            let dump_count =
+                sqlx::query_scalar("SELECT COUNT(*) FROM file_list WHERE date = $1 AND file = $2")
+                    .bind(dump_date)
+                    .bind(dump_file)
+                    .fetch_one(&*client)
+                    .await
+                    .unwrap();
+            let (_, replacement_date, replacement_file) =
+                parse_file_key_columns(&replacement.key).unwrap();
+            let replacement_count =
+                sqlx::query_scalar("SELECT COUNT(*) FROM file_list WHERE date = $1 AND file = $2")
+                    .bind(replacement_date)
+                    .bind(replacement_file)
+                    .fetch_one(&*client)
+                    .await
+                    .unwrap();
+            (source_count, dump_count, replacement_count)
+        };
+        assert_eq!(source_count, 2);
+        assert_eq!(dump_count, 0);
+        assert_eq!(replacement_count, 0);
+
+        let err = list
+            .retire_files(
+                &[first.clone(), second.clone()],
+                FileListBookKeepMode::None,
+                nonce + 2,
+            )
+            .await
+            .expect_err("stale retirement must be all-or-nothing");
+        assert!(matches!(err, Error::FileGenerationConflict(_)));
+
+        let client = CLIENT_RW.clone();
+        let client = client.lock().await;
+        sqlx::query("DELETE FROM file_list WHERE id IN ($1, $2)")
+            .bind(first.id)
+            .bind(second.id)
+            .execute(&*client)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM file_list_deleted WHERE org = 'generation-tests'")
+            .execute(&*client)
+            .await
+            .unwrap();
     }
 }

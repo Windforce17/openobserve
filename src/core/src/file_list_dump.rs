@@ -15,7 +15,7 @@
 
 use std::sync::{Arc, LazyLock as Lazy};
 
-use arrow::array::{BooleanArray, Int64Array, RecordBatch, StringArray};
+use arrow::array::{Array, BooleanArray, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use config::{
     get_config, ider,
@@ -53,6 +53,7 @@ pub static FILE_LIST_SCHEMA: Lazy<Arc<Schema>> = Lazy::new(|| {
         Field::new("original_size", DataType::Int64, false),
         Field::new("compressed_size", DataType::Int64, false),
         Field::new("index_size", DataType::Int64, false),
+        Field::new("index_generation", DataType::Int64, false),
         Field::new("bloom_ver", DataType::Int64, false),
         Field::new("updated_at", DataType::Int64, false),
     ]))
@@ -90,6 +91,11 @@ pub fn record_batch_to_file_record(rb: RecordBatch) -> Vec<FileRecord> {
     get_col!(original_size_col, "original_size", Int64Array, rb);
     get_col!(compressed_size_col, "compressed_size", Int64Array, rb);
     get_col!(index_size_col, "index_size", Int64Array, rb);
+    // Generation is optional on read for legacy dumps and may be nullable
+    // after schema reconciliation. Both missing and null mean generation 0.
+    let index_generation_col = rb
+        .column_by_name("index_generation")
+        .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
     get_col!(updated_at_col, "updated_at", Int64Array, rb);
     // bloom_ver is OPTIONAL on read — dump parquets written before the
     // bloom-filter pruning layer was added don't have this column.
@@ -115,6 +121,10 @@ pub fn record_batch_to_file_record(rb: RecordBatch) -> Vec<FileRecord> {
             original_size: original_size_col.value(idx),
             compressed_size: compressed_size_col.value(idx),
             index_size: index_size_col.value(idx),
+            index_generation: index_generation_col
+                .filter(|c| !c.is_null(idx))
+                .map(|c| c.value(idx))
+                .unwrap_or(0),
             bloom_ver: bloom_ver_col.map(|c| c.value(idx)).unwrap_or(0),
             updated_at: updated_at_col.value(idx),
         };
@@ -948,53 +958,37 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].id, 7);
         assert_eq!(records[0].bloom_ver, 0);
+        assert_eq!(records[0].index_generation, 0);
     }
 
     #[test]
     fn test_generate_dump_stream_name() {
-        // Test with different stream types
         let result = generate_dump_stream_name(StreamType::Logs, "my_stream");
         assert_eq!(result, "my_stream_logs");
-
         let result = generate_dump_stream_name(StreamType::Metrics, "metric_stream");
         assert_eq!(result, "metric_stream_metrics");
-
         let result = generate_dump_stream_name(StreamType::Traces, "trace_stream");
         assert_eq!(result, "trace_stream_traces");
-
-        // Test with stream name containing special characters
         let result = generate_dump_stream_name(StreamType::Logs, "my-stream_2024");
         assert_eq!(result, "my-stream_2024_logs");
-
-        // Test with empty stream name
         let result = generate_dump_stream_name(StreamType::Logs, "");
         assert_eq!(result, "_logs");
     }
 
     #[test]
     fn test_file_list_schema() {
-        // Verify the schema has the expected fields
         let schema = FILE_LIST_SCHEMA.clone();
-
-        // 14 historical fields + bloom_ver + updated_at = 16
-        assert_eq!(schema.fields().len(), 16);
-
-        // Check key field names and types
+        assert_eq!(schema.fields().len(), 17);
         assert_eq!(schema.field(0).name(), "id");
         assert_eq!(schema.field(0).data_type(), &DataType::Int64);
-
         assert_eq!(schema.field(1).name(), "account");
         assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
-
         assert_eq!(schema.field(2).name(), "org");
         assert_eq!(schema.field(2).data_type(), &DataType::Utf8);
-
         assert_eq!(schema.field(3).name(), "stream");
         assert_eq!(schema.field(3).data_type(), &DataType::Utf8);
-
         assert_eq!(schema.field(6).name(), "deleted");
         assert_eq!(schema.field(6).data_type(), &DataType::Boolean);
-
         assert_eq!(schema.field(7).name(), "flattened");
         assert_eq!(schema.field(7).data_type(), &DataType::Boolean);
     }
@@ -1097,26 +1091,20 @@ mod tests {
 
     #[test]
     fn test_generate_dump_stream_name_with_various_stream_types() {
-        // Test all stream types
         let stream_types = vec![
             (StreamType::Logs, "logs"),
             (StreamType::Metrics, "metrics"),
             (StreamType::Traces, "traces"),
         ];
-
         for (stream_type, suffix) in stream_types {
             let result = generate_dump_stream_name(stream_type, "test");
-            assert_eq!(result, format!("test_{}", suffix));
+            assert_eq!(result, format!("test_{suffix}"));
         }
     }
 
     #[test]
     fn test_file_list_schema_field_ordering() {
         let schema = FILE_LIST_SCHEMA.clone();
-
-        // Verify the exact order of fields. `bloom_ver` was inserted
-        // between `index_size` and `updated_at` when the bloom-filter
-        // pruning layer landed.
         let expected_fields = vec![
             ("id", DataType::Int64),
             ("account", DataType::Utf8),
@@ -1132,10 +1120,10 @@ mod tests {
             ("original_size", DataType::Int64),
             ("compressed_size", DataType::Int64),
             ("index_size", DataType::Int64),
+            ("index_generation", DataType::Int64),
             ("bloom_ver", DataType::Int64),
             ("updated_at", DataType::Int64),
         ];
-
         for (i, (name, dtype)) in expected_fields.iter().enumerate() {
             assert_eq!(schema.field(i).name(), name);
             assert_eq!(schema.field(i).data_type(), dtype);
@@ -1158,13 +1146,10 @@ mod tests {
 
     #[test]
     fn test_record_batch_to_file_record_consistency() {
-        // Create batch twice and verify results are consistent
         let rb1 = create_test_record_batch();
         let rb2 = create_test_record_batch();
-
         let records1 = record_batch_to_file_record(rb1);
         let records2 = record_batch_to_file_record(rb2);
-
         assert_eq!(records1.len(), records2.len());
         for (r1, r2) in records1.iter().zip(records2.iter()) {
             assert_eq!(r1.id, r2.id);
@@ -1172,6 +1157,26 @@ mod tests {
             assert_eq!(r1.org, r2.org);
             assert_eq!(r1.stream, r2.stream);
         }
+    }
+
+    #[test]
+    fn test_record_batch_to_file_record_null_generation_defaults_to_zero() {
+        let legacy = create_test_record_batch();
+        let mut fields = legacy.schema().fields().iter().cloned().collect::<Vec<_>>();
+        fields.insert(
+            14,
+            Arc::new(Field::new("index_generation", DataType::Int64, true)),
+        );
+        let mut columns = legacy.columns().to_vec();
+        columns.insert(
+            14,
+            Arc::new(Int64Array::from(vec![Some(9), None, Some(11)])),
+        );
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+        let records = record_batch_to_file_record(batch);
+        assert_eq!(records[0].index_generation, 9);
+        assert_eq!(records[1].index_generation, 0);
+        assert_eq!(records[2].index_generation, 11);
     }
 
     #[test]

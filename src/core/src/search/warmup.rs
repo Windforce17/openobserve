@@ -134,6 +134,7 @@ pub async fn warm_recent_indexes() {
                     &file.key,
                     file.meta.compressed_size,
                     file.meta.index_size,
+                    file.meta.index_generation,
                 )
                 .await
                 {

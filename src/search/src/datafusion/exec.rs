@@ -1082,7 +1082,12 @@ async fn partition_vix_files_by_row_order(
             if let Some(&class) = VIX_ROW_ORDER_MEMO.read().get(&file.key) {
                 return (file, class);
             }
-            if let Some(reader) = crate::vix::reader_cache::GLOBAL_CACHE.get(&file.key) {
+            let reader_key = crate::vix::reader_cache::ReaderCacheKey::new(
+                file.key.clone(),
+                file.meta.index_generation,
+                file.meta.index_size,
+            );
+            if let Some(reader) = crate::vix::reader_cache::GLOBAL_CACHE.get(&reader_key) {
                 let class = classify_vix_order(
                     reader.row_order().is_ts_desc(),
                     reader.ts_desc_row_ranges().map(|r| r.len()),

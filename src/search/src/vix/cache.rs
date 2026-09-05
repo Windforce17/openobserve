@@ -13,9 +13,9 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-//! Per-file result cache for vix index searches, keyed by
-//! `condition hash + optimize-rule + file key` (`vix_result_cache_*`
-//! metrics).
+//! Per-file result cache for vix index searches. Identity includes condition,
+//! optimize rule, logical file key, immutable index generation, and exact
+//! index size (`vix_result_cache_*` metrics).
 
 use std::{
     collections::{HashSet, VecDeque},
@@ -312,13 +312,12 @@ impl VixResultCache {
         old
     }
 
-    /// M12 heal invalidation: remove EVERY entry belonging to the given data
-    /// file keys, returning how many were dropped. Keys lead the cache-key
-    /// layout (`{file key}|...`, see `generate_cache_key`), so this is one
-    /// prefix extraction + set lookup per live entry — one pass covers a
-    /// whole broadcast batch. Complements the `index_size` key component:
-    /// the size change already makes pre-heal entries unreachable; this
-    /// sweep frees their budget immediately instead of waiting out the FIFO.
+    /// Broadcast invalidation: remove EVERY generation belonging to the given
+    /// logical data file keys, returning how many were dropped. Keys lead the
+    /// cache-key layout (`{file key}|...`, see `generate_cache_key`), so this
+    /// is one prefix extraction + set lookup per live entry — one pass covers
+    /// a whole broadcast batch. Generation and size already make obsolete
+    /// entries unreachable; this sweep frees their budget immediately.
     /// Stale FIFO slots left behind pop harmlessly (same contract as
     /// overwrites).
     pub fn remove_file_entries<'a, I: IntoIterator<Item = &'a str>>(&self, file_keys: I) -> usize {
@@ -587,21 +586,21 @@ mod tests {
         assert!(cache.len() <= 1000);
     }
 
-    /// M12: `remove_file_entries` drops every entry whose cache key belongs
-    /// to a purged data file (prefix up to `'|'`), exactly accounts the
-    /// freed bytes, and leaves other files' entries untouched. Stale FIFO
+    /// `remove_file_entries` drops every generation whose cache key belongs
+    /// to a purged logical data file (prefix up to `'|'`), exactly accounts
+    /// the freed bytes, and leaves other files' entries untouched. Stale FIFO
     /// slots from the removals must pop harmlessly afterwards.
     #[test]
     fn test_remove_file_entries_purges_by_file_key() {
         let cache = VixResultCache::new(100);
         let healed = "files/org/logs/s1/2026/08/18/00/healed.vix";
         let other = "files/org/logs/s1/2026/08/18/00/other.vix";
-        // two conditions x two index_size versions for the healed file,
-        // one entry for the other file
-        cache.put(format!("{healed}|100|aaaa_n_full"), CacheEntry::Count(1));
-        cache.put(format!("{healed}|100|bbbb_n_full"), CacheEntry::NoMatch);
-        cache.put(format!("{healed}|164|aaaa_n_full"), CacheEntry::Count(2));
-        cache.put(format!("{other}|100|aaaa_n_full"), CacheEntry::Count(3));
+        // two conditions across equal-sized immutable generations, plus one
+        // differently sized generation and one entry for another file
+        cache.put(format!("{healed}|41|100|aaaa_n_full"), CacheEntry::Count(1));
+        cache.put(format!("{healed}|42|100|bbbb_n_full"), CacheEntry::NoMatch);
+        cache.put(format!("{healed}|43|164|aaaa_n_full"), CacheEntry::Count(2));
+        cache.put(format!("{other}|42|100|aaaa_n_full"), CacheEntry::Count(3));
 
         // unknown file: no-op
         assert_eq!(cache.remove_file_entries(["files/org/none.vix"]), 0);
@@ -612,30 +611,33 @@ mod tests {
         assert_eq!(cache.len(), 1);
         assert!(
             cache
-                .get(&format!("{healed}|100|aaaa_n_full"), None)
+                .get(&format!("{healed}|41|100|aaaa_n_full"), None)
                 .is_none()
         );
         assert!(
             cache
-                .get(&format!("{healed}|164|aaaa_n_full"), None)
+                .get(&format!("{healed}|43|164|aaaa_n_full"), None)
                 .is_none()
         );
         assert!(
             matches!(
-                cache.get(&format!("{other}|100|aaaa_n_full"), None),
+                cache.get(&format!("{other}|42|100|aaaa_n_full"), None),
                 Some(VixSearchResult::Count(3))
             ),
             "other files' entries stay"
         );
         assert_eq!(
             cache.memory_size(),
-            entry_footprint(&format!("{other}|100|aaaa_n_full"), &CacheEntry::Count(3)),
+            entry_footprint(
+                &format!("{other}|42|100|aaaa_n_full"),
+                &CacheEntry::Count(3)
+            ),
             "freed bytes must be given back exactly"
         );
 
         // the removals' stale FIFO slots pop harmlessly under pressure
         for i in 0..200 {
-            cache.put(format!("fill_{i}|0|k_n_full"), CacheEntry::Count(i));
+            cache.put(format!("fill_{i}|0|0|k_n_full"), CacheEntry::Count(i));
         }
         assert!(cache.len() <= 100);
     }

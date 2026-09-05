@@ -1982,7 +1982,7 @@ async fn upload_built_file(built: BuiltL0File) -> Result<FileUploadTiming, anyho
     // only rowless orphans — the GC's derived-key delete collects them.
     let mut index_ms = 0;
     if let Some(index) = index {
-        let sidecar_key = config::vix_sidecar_key(&file.key)
+        let sidecar_key = config::vix_sidecar_key(&file.key, 0)
             .expect("core L0 outputs are .vix keys by construction");
         let index_started = Instant::now();
         let index_result = storage::put(&file.account, &sidecar_key, Bytes::from(index))
@@ -2540,7 +2540,7 @@ async fn build_one_file(
         || (stream_type == StreamType::Metrics
             && get_config().common.vix_metrics_core_file_enabled);
     let mut build_timing = L0FileBuildTiming::default();
-    let (buf, spooled_output, index_bytes, file_meta, file_format) = if use_core_file {
+    let (buf, spooled_output, index_bytes, mut file_meta, file_format) = if use_core_file {
         // M12: the bucket is already sorted `_timestamp` DESC (the stored
         // row order) and covers exactly this hour — the direct builder
         // needs no DataFusion plan, no repartition and no sort. The prod
@@ -2654,6 +2654,9 @@ async fn build_one_file(
             "{ctx}: L0 build for hour {hour_start} produced compressed_size 0; refusing to register"
         ));
     }
+    // L0 files are ordinary new outputs; only in-place heals publish a
+    // positive generation.
+    file_meta.index_generation = 0;
 
     let key = l0_object_key(
         org,
@@ -4506,6 +4509,10 @@ mod tests {
                 "an indexed L0 build must upload its .vxi sidecar (index_size = its size): {}",
                 file.key
             );
+            assert_eq!(
+                file.meta.index_generation, 0,
+                "ordinary L0 outputs must remain on canonical generation zero"
+            );
             // the object was really uploaded, byte length matches the meta
             let bytes = storage::get_bytes(&file.account, &file.key)
                 .await
@@ -4518,7 +4525,7 @@ mod tests {
             );
             // v3 split: the sidecar uploaded too, with index_size = its
             // exact object length
-            let sidecar_key = config::vix_sidecar_key(&file.key).expect("L0 keys are .vix");
+            let sidecar_key = config::vix_sidecar_key(&file.key, 0).expect("L0 keys are .vix");
             let sidecar = storage::get_bytes(&file.account, &sidecar_key)
                 .await
                 .unwrap_or_else(|e| panic!("uploaded sidecar {sidecar_key} must exist: {e}"));

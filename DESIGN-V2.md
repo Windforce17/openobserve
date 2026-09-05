@@ -36,11 +36,10 @@ Three object classes per stream partition, replacing the single embedded
    footer (§4). No index bytes. Any vortex-capable reader can read the
    docs region.
 2. INDEX sidecar (one small puffin per data file): `dict_blocks`,
-   `terms`, optional `plist`, per-file `bloom`. Referenced from
-   file_list by an `index_ver`-style pointer column following the proven
-   `bloom_ver` pattern (sentinels for not-applicable/unbuildable, GC by
-   reference scan, fail-open on absence) — see
-   src/core/src/compact/bloom.rs:32,60 for the pattern being copied.
+   `terms`, optional `plist`, per-file `bloom`. `file_list.index_generation`
+   identifies the immutable sidecar object; generation zero is the legacy
+   canonical `.vxi`, while positive generations use a suffixed key.
+   `index_size` is the exact object length and existence marker.
 3. GROUP bloom `.bf`: unchanged. The per-file bloom blob keeps the exact
    SBBF block layout/hash so `.bf` assembly stays a byte transpose
    (src/vortex_index/src/bloom.rs:27) and dictionary walkers keep the
@@ -228,13 +227,32 @@ Field-major `{fid u16 BE}{token}` composite keys stay.
   across chunks under ZO_VIX_SCAN_DECODE_THREADS (measured, 16M rows:
   624ms → 206ms/4T → 167ms/16T; the knob previously had no effect on
   this shape).
-- Pointer semantics: `index_ver` column on file_list rows (bloom_ver
-  pattern: sentinels, referenced-scan GC, fail-open to filter-back scan
-  when absent/unreadable). A data file with no sidecar is always
-  queryable — index is an accelerator, never a correctness dependency.
-- Heals: rebuild terms (column-derived — the 5.4x-cheaper path is now
-  universal since every field is a column), write ONE new small object,
-  bump pointer. Data object untouched.
+- Pointer semantics: `(index_generation,index_size)` is one atomic
+  file-list identity. Generation zero addresses the legacy canonical
+  sidecar; every heal transition publishes a fresh positive
+  generation under a create-only immutable key. Missing/unreadable
+  sidecars fail open to the filter-back scan.
+- Heals: reserve a non-reusing database identity as the generation and a
+  staged cleanup ticket before uploading. Write the immutable sidecar,
+  then atomically consume the ticket and CAS the file-list row from the
+  expected generation+size to the new tuple while resetting `bloom_ver`.
+  The same transaction queues the previous exact key for delayed deletion.
+  GC converts expired unconsumed tickets to exact-key tombstones before
+  deleting bytes; a claimed generation can no longer be published.
+  Data bytes and the data key stay untouched.
+- Cutover: versioned sidecar healing is unconditional. Stop all
+  OpenObserve-binary workloads, wait for every old pod to exit, switch
+  all image aliases to the generation-aware release, then restore
+  replicas. No mixed-version window or environment gate is used.
+- Storage boundary: heals require atomic create-only writes. The pinned S3
+  backend uses a single conditional PUT; sidecars above its 5 GiB limit
+  fail without publication, rather than falling back to an overwrite.
+  Conditional multipart completion requires object-store backend support.
+- Cleanup bounds: old generations wait the configured reader lifetime from
+  publication plus the ordinary deletion delay. A client-selected timeout
+  beyond that bound may fall back to data scanning. Candidate tickets fence
+  late publication, but an uploader resumed after its ticket was swept can
+  still leave an orphan if it crashes after PUT and before loser cleanup.
 - L0: index-off stays the L0 default (#42 posture) — the sidecar appears
   at first compaction; fresh-data queries scan columns with §4 pruning.
 
@@ -429,9 +447,9 @@ M10 ships exactly that sampler (src/vortex_index/src/merge.rs
 
 ## 10. file_list / meta deltas
 
-- New column: `index_ver` (sidecar pointer, §5). `index_size` keeps
-  meaning "index bytes exist" for pruning-aware scheduling; `bloom_ver`
-  unchanged.
+- New column: `index_generation` (immutable sidecar pointer, §5).
+  `index_size` remains the exact active-sidecar size/existence marker;
+  `bloom_ver` remains the generation-fenced group-bloom pointer.
 - Registry diet (schema-version hash caching, field TTL/compaction) is
   REAL but SEPARATE — the meta registry still learns every field ever
   seen and costs O(width) per ingest request; file formats don't fix
@@ -493,10 +511,11 @@ Matrix, median-of-3, log-line verified per the standing gate rules
    f2d5b89bfe; disjoint counts + SIMD contains 20862c321f) and every
    query-path feature is present and wired on the v2 read path. Nothing
    needs folding in or re-deriving. Two findings superseded the
-   question: (a) CORRECTNESS — the per-file result cache keyed on
-   condition+file with no index-version component, so M3's sidecar-only
-   heals served stale answers; fixed in M12 by folding index_size into
-   the key plus a broadcast purge. (b) PERF — the unfiltered
+   question: (a) CORRECTNESS — sidecar-only heals need immutable object
+   generations because ranged readers load index blocks lazily. The
+   per-file reader and result caches are keyed by
+   `(data_key,index_generation,index_size)`, and broadcasts purge all
+   cached generations only as budget cleanup. (b) PERF — the unfiltered
    top-k/distinct dispatch preferred the docs column on a
    whole-FST-walk rationale that field-major spans obsoleted;
    re-decided cost-based in M13 (see the bench table in

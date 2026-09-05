@@ -324,7 +324,7 @@ pub async fn vix_search(
     let index_cache_entries = index_files
         .iter()
         .filter_map(|f| {
-            config::vix_sidecar_key(&f.key).map(|sidecar| {
+            config::vix_sidecar_key(&f.key, f.meta.index_generation).map(|sidecar| {
                 (
                     f.id,
                     f.account.clone(),
@@ -976,12 +976,12 @@ enum VixReaderInput {
     /// fallbacks).
     Bytes(bytes::Bytes, Option<bytes::Bytes>),
     /// Open over per-object range sources. `cache_key=None` keeps the parsed
-    /// reader query-local; `Some(DATA key)` memoizes one reader per logical
-    /// file in the shared reader cache.
+    /// reader query-local; `Some(identity)` memoizes one reader per immutable
+    /// sidecar generation in the shared reader cache.
     Ranged {
         source: Arc<dyn vortex_index::VixRangeSource>,
         index: Option<Arc<dyn vortex_index::VixRangeSource>>,
-        cache_key: Option<String>,
+        cache_key: Option<reader_cache::ReaderCacheKey>,
     },
     /// A previously parsed (memoized) reader — zero IO to open.
     Shared(Arc<VixReader>),
@@ -1043,17 +1043,19 @@ pub async fn warm_file(
     key: &str,
     compressed_size: i64,
     index_size: i64,
+    index_generation: i64,
 ) -> anyhow::Result<bool> {
     if !is_core_file(key) {
         return Ok(false);
     }
-    // nothing to warm without a sidecar — and a data-only reader memoized
-    // here would SHADOW the sidecar-ful open a later query needs (the
-    // reader cache is keyed on the data key), so never cache one
+    // Nothing to warm without a sidecar. Reader identity includes both the
+    // immutable sidecar generation and its exact-size compatibility witness.
     if index_size <= 0 {
         return Ok(false);
     }
-    if reader_cache::GLOBAL_CACHE.get(key).is_some() {
+    let reader_key =
+        reader_cache::ReaderCacheKey::new(key.to_string(), index_generation, index_size);
+    if reader_cache::GLOBAL_CACHE.get(&reader_key).is_some() {
         return Ok(false);
     }
     let Some(size) = u64::try_from(compressed_size).ok().filter(|s| *s > 0) else {
@@ -1067,23 +1069,22 @@ pub async fn warm_file(
         handle.clone(),
         None,
     ));
-    // v3 split: the dictionary lives in the `.vxi` sidecar — warm its
-    // footer + directory too (index_size is its exact object size)
-    let index = config::vix_sidecar_key(key)
-        .zip(u64::try_from(index_size).ok().filter(|s| *s > 0))
-        .map(|(sidecar_key, size)| {
-            Arc::new(source::LadderRangeSource::new(
-                account.to_string(),
-                &sidecar_key,
-                size,
-                handle,
-                None,
-            )) as Arc<dyn vortex_index::VixRangeSource>
-        });
+    // The dictionary lives in the generation-addressed `.vxi` sidecar.
+    // Invalid generations fail closed rather than warming a data-only reader.
+    let Some(sidecar_key) = config::vix_sidecar_key(key, index_generation) else {
+        return Ok(false);
+    };
+    let index = Some(Arc::new(source::LadderRangeSource::new(
+        account.to_string(),
+        &sidecar_key,
+        index_size as u64,
+        handle,
+        None,
+    )) as Arc<dyn vortex_index::VixRangeSource>);
     let input = VixReaderInput::Ranged {
         source,
         index,
-        cache_key: Some(key.to_string()),
+        cache_key: Some(reader_key),
     };
     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let reader = input.open()?;
@@ -1151,7 +1152,7 @@ async fn prefetch_cold_tails(
     };
     let (start_time, end_time) = time_range;
     let mut wave = PrefetchWave::default();
-    let mut planned: Vec<(String, String, u64, u64)> = Vec::new();
+    let mut planned: Vec<(String, reader_cache::ReaderCacheKey, String, u64, u64)> = Vec::new();
     let mut estimated = 0u64;
     for file in files {
         // mirror the eval's ranged-open eligibility (unknown sizes degrade
@@ -1165,7 +1166,12 @@ async fn prefetch_cold_tails(
         let Some(index_size) = u64::try_from(file.meta.index_size).ok().filter(|s| *s > 0) else {
             continue;
         };
-        if reader_cache::GLOBAL_CACHE.contains(&file.key) {
+        let reader_key = reader_cache::ReaderCacheKey::new(
+            file.key.clone(),
+            file.meta.index_generation,
+            file.meta.index_size,
+        );
+        if reader_cache::GLOBAL_CACHE.contains(&reader_key) {
             continue;
         }
         if result_cache_enabled && let Some(condition) = index_condition {
@@ -1190,9 +1196,14 @@ async fn prefetch_cold_tails(
             continue;
         }
         estimated += estimate;
+        let Some(sidecar_key) = config::vix_sidecar_key(&file.key, file.meta.index_generation)
+        else {
+            continue;
+        };
         planned.push((
             file.account.clone(),
-            file.key.clone(),
+            reader_key,
+            sidecar_key,
             compressed,
             index_size,
         ));
@@ -1205,11 +1216,11 @@ async fn prefetch_cold_tails(
         .fetches
         .load(std::sync::atomic::Ordering::Relaxed);
     let before_bytes = fetch_stats.bytes.load(std::sync::atomic::Ordering::Relaxed);
-    let opens = planned
-        .into_iter()
-        .map(|(account, key, compressed, index_size)| {
+    let opens = planned.into_iter().map(
+        |(account, reader_key, sidecar_key, compressed, index_size)| {
             let handle = handle.clone();
             let fetch_stats = Arc::clone(fetch_stats);
+            let key = reader_key.file().to_string();
             async move {
                 let source = Arc::new(LadderRangeSource::new(
                     account.clone(),
@@ -1218,19 +1229,17 @@ async fn prefetch_cold_tails(
                     handle.clone(),
                     Some(Arc::clone(&fetch_stats)),
                 ));
-                let index = config::vix_sidecar_key(&key).map(|sidecar_key| {
-                    Arc::new(LadderRangeSource::new(
-                        account,
-                        &sidecar_key,
-                        index_size,
-                        handle,
-                        Some(fetch_stats),
-                    )) as Arc<dyn vortex_index::VixRangeSource>
-                });
+                let index = Some(Arc::new(LadderRangeSource::new(
+                    account,
+                    &sidecar_key,
+                    index_size,
+                    handle,
+                    Some(fetch_stats),
+                )) as Arc<dyn vortex_index::VixRangeSource>);
                 let input = VixReaderInput::Ranged {
                     source,
                     index,
-                    cache_key: Some(key.clone()),
+                    cache_key: Some(reader_key),
                 };
                 // the ranged open blocks on its tail fetches: off the runtime
                 let opened = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
@@ -1253,7 +1262,8 @@ async fn prefetch_cold_tails(
                     }
                 }
             }
-        });
+        },
+    );
     StreamExt::collect::<Vec<()>>(stream::iter(opens).buffer_unordered(concurrency.max(1))).await;
     wave.fetches = fetch_stats
         .fetches
@@ -1295,6 +1305,11 @@ async fn search_vix_index(
         ));
     }
     let vix_file_name = parquet_file.key.clone();
+    let reader_key = reader_cache::ReaderCacheKey::new(
+        vix_file_name.clone(),
+        parquet_file.meta.index_generation,
+        parquet_file.meta.index_size,
+    );
 
     let condition: IndexCondition =
         index_condition.ok_or(anyhow::anyhow!("IndexCondition not found"))?;
@@ -1363,14 +1378,14 @@ async fn search_vix_index(
         );
     let parsed_sidecar_available = equality_histogram
         && reader_cache::GLOBAL_CACHE
-            .get(&vix_file_name)
+            .get(&reader_key)
             .is_some_and(|reader| reader.has_index());
     let local_sidecar_available = if equality_histogram
         && parquet_file.meta.index_size > 0
         && !parsed_sidecar_available
         && !all_index_sidecars_cached
     {
-        match config::vix_sidecar_key(&vix_file_name) {
+        match config::vix_sidecar_key(&vix_file_name, parquet_file.meta.index_generation) {
             Some(sidecar_key) => {
                 file_data::memory::exist(&sidecar_key).await
                     || file_data::disk::exist(&sidecar_key).await
@@ -1415,7 +1430,7 @@ async fn search_vix_index(
     // cache ladder (memory -> disk -> object storage).
     let reader_input = match read_mode {
         VixReadMode::Ranged => {
-            let cached_reader = reader_cache::GLOBAL_CACHE.get(&vix_file_name);
+            let cached_reader = reader_cache::GLOBAL_CACHE.get(&reader_key);
             if let Some(reader) = cached_reader.as_ref().filter(|reader| {
                 data_only_all_histogram || parquet_file.meta.index_size <= 0 || reader.has_index()
             }) {
@@ -1442,19 +1457,21 @@ async fn search_vix_index(
                             handle.clone(),
                             Some(Arc::clone(fetch_stats)),
                         )),
-                        index: config::vix_sidecar_key(&vix_file_name)
-                            .zip(u64::try_from(parquet_file.meta.index_size).ok())
-                            .filter(|(_, size)| *size > 0 && !data_only_all_histogram)
-                            .map(|(sidecar_key, size)| {
-                                Arc::new(LadderRangeSource::new(
-                                    file_account.clone(),
-                                    &sidecar_key,
-                                    size,
-                                    handle,
-                                    Some(Arc::clone(fetch_stats)),
-                                ))
-                                    as Arc<dyn vortex_index::VixRangeSource>
-                            }),
+                        index: config::vix_sidecar_key(
+                            &vix_file_name,
+                            parquet_file.meta.index_generation,
+                        )
+                        .zip(u64::try_from(parquet_file.meta.index_size).ok())
+                        .filter(|(_, size)| *size > 0 && !data_only_all_histogram)
+                        .map(|(sidecar_key, size)| {
+                            Arc::new(LadderRangeSource::new(
+                                file_account.clone(),
+                                &sidecar_key,
+                                size,
+                                handle,
+                                Some(Arc::clone(fetch_stats)),
+                            )) as Arc<dyn vortex_index::VixRangeSource>
+                        }),
                         // An ALL histogram already memoizes its compact exact
                         // result. Keeping thousands of data-only readers would
                         // retain decoded timestamp chunks and force the
@@ -1462,7 +1479,7 @@ async fn search_vix_index(
                         // resync on every cold file open; filtered queries
                         // cannot reuse those readers because they need the
                         // sidecar anyway.
-                        cache_key: (!data_only_all_histogram).then(|| vix_file_name.clone()),
+                        cache_key: (!data_only_all_histogram).then(|| reader_key.clone()),
                     })
             }
         }
@@ -1477,18 +1494,21 @@ async fn search_vix_index(
                 .map_err(|e| {
                     anyhow::anyhow!("failed to load vix data file {vix_file_name}: {e}")
                 })?;
-            let index_bytes = match config::vix_sidecar_key(&vix_file_name)
-                .filter(|_| parquet_file.meta.index_size > 0 && !data_only_all_histogram)
-            {
-                Some(sidecar_key) => Some(
-                    file_data::get(&file_account, &sidecar_key, None)
-                        .await
-                        .map_err(|e| {
-                            anyhow::anyhow!("failed to load vix index sidecar {sidecar_key}: {e}")
-                        })?,
-                ),
-                None => None,
-            };
+            let index_bytes =
+                match config::vix_sidecar_key(&vix_file_name, parquet_file.meta.index_generation)
+                    .filter(|_| parquet_file.meta.index_size > 0 && !data_only_all_histogram)
+                {
+                    Some(sidecar_key) => Some(
+                        file_data::get(&file_account, &sidecar_key, None)
+                            .await
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "failed to load vix index sidecar {sidecar_key}: {e}"
+                                )
+                            })?,
+                    ),
+                    None => None,
+                };
             VixReaderInput::Bytes(bytes, index_bytes)
         }
     };
@@ -2559,15 +2579,13 @@ fn get_cache_entry(
 /// filter. Clamping to the intersection maximizes reuse: any window with
 /// the same effective overlap shares the key.
 ///
-/// LAYOUT: `{file key}|{index_size}|{condition hash}_{rule}_{clamp}`.
+/// LAYOUT: `{file key}|{index_generation}|{index_size}|{condition hash}_{rule}_{clamp}`.
 /// - The FILE KEY leads so [`VixResultCache::remove_file_entries`] can purge every entry of a
-///   healed file by prefix (`'|'` never occurs in object keys, so the boundary is unambiguous).
-/// - `index_size` is the index VERSION component (M12): a sidecar-only heal (M3) rewrites the
-///   `.vxi` under a STABLE data key, and `index_size` is the sidecar's exact object size (v2
-///   semantics) — the same freshness witness the byte-cache eviction sweep uses — so a post-heal
-///   `FileKey` can never read a pre-heal entry. Both call sites (the main result key and the
-///   straddling-file bitmap memo) flow through here, preserving the documented memo/main-key
-///   identity.
+///   logical file by prefix (`'|'` never occurs in object keys, so the boundary is unambiguous).
+/// - `index_generation` is the immutable sidecar identity. `index_size` remains a compatibility
+///   witness, so neither a new equal-sized generation nor inconsistent metadata can reuse an old
+///   result. Both call sites (the main result key and the straddling-file bitmap memo) flow through
+///   here, preserving the documented memo/main-key identity.
 ///
 /// Pub for the openobserve-core heal e2e (the result cache is only
 /// CONSULTED here in the search crate, but heals happen core-side).
@@ -2615,8 +2633,9 @@ pub fn generate_cache_key(
         None => "full".to_string(),
     };
     format!(
-        "{}|{}|{:016x}_{rule}_{clamp}",
+        "{}|{}|{}|{:016x}_{rule}_{clamp}",
         parquet_file.key,
+        parquet_file.meta.index_generation,
         parquet_file.meta.index_size,
         hasher.finish(),
     )
@@ -2677,6 +2696,14 @@ mod tests {
         }
     }
 
+    fn reader_identity(file: &FileKey) -> reader_cache::ReaderCacheKey {
+        reader_cache::ReaderCacheKey::new(
+            file.key.clone(),
+            file.meta.index_generation,
+            file.meta.index_size,
+        )
+    }
+
     fn equal_condition() -> IndexCondition {
         let mut index_condition = IndexCondition::new();
         index_condition.add_condition(Condition::Equal("field1".to_string(), "value1".to_string()));
@@ -2705,36 +2732,50 @@ mod tests {
         assert!(result.contains("file_1_10"));
     }
 
-    /// M12 heal invalidation: the key carries `meta.index_size` as its index
-    /// VERSION — a sidecar-only heal rewrites the `.vxi` under a stable data
-    /// key, so the SAME (condition, rule, clamp, file key) with a different
-    /// `index_size` must produce a DIFFERENT key (the pre-heal entry becomes
-    /// unreachable even before the purge sweep evicts it). Applies to both
-    /// call sites — the main result key and the straddling bitmap memo
-    /// (rule `None`, clamp `None`) — which share this function.
+    /// Immutable sidecar generations are the primary result-cache identity;
+    /// exact size remains a compatibility witness. Equal-sized generations
+    /// must never share either the main result or straddling bitmap entry.
     #[test]
-    fn test_generate_cache_key_index_size_versions_the_key() {
+    fn test_generate_cache_key_uses_generation_and_size() {
         let condition = equal_condition();
-        let mut pre_heal = create_file_key(1, 10);
-        pre_heal.meta.index_size = 4096;
-        let mut post_heal = pre_heal.clone();
-        post_heal.meta.index_size = 5120;
+        let mut old = create_file_key(1, 10);
+        old.meta.index_generation = 41;
+        old.meta.index_size = 4096;
+        let mut new_same_size = old.clone();
+        new_same_size.meta.index_generation = 42;
+        let mut inconsistent_size = new_same_size.clone();
+        inconsistent_size.meta.index_size = 5120;
 
         for rule in [None, Some(IndexOptimizeMode::SimpleCount)] {
-            let key_pre = generate_cache_key(&condition, &rule, &pre_heal, None);
-            let key_post = generate_cache_key(&condition, &rule, &post_heal, None);
+            let old_key = generate_cache_key(&condition, &rule, &old, None);
+            let new_key = generate_cache_key(&condition, &rule, &new_same_size, None);
+            let inconsistent_key = generate_cache_key(&condition, &rule, &inconsistent_size, None);
             assert_ne!(
-                key_pre, key_post,
-                "an index_size change must change the cache key (rule {rule:?})"
+                old_key, new_key,
+                "equal-sized immutable generations must not share cache state (rule {rule:?})"
             );
-            // both keys still purge under the same file-key prefix
-            let prefix = format!("{}|", pre_heal.key);
-            assert!(key_pre.starts_with(&prefix) && key_post.starts_with(&prefix));
+            assert_ne!(
+                new_key, inconsistent_key,
+                "size remains a cache compatibility witness (rule {rule:?})"
+            );
+            let prefix = format!("{}|", old.key);
+            assert!(
+                old_key.starts_with(&prefix)
+                    && new_key.starts_with(&prefix)
+                    && inconsistent_key.starts_with(&prefix)
+            );
         }
-        // unchanged index_size keeps the key stable (cache reuse intact)
+        let cache = vix_result_cache::VixResultCache::new(4);
+        let old_key = generate_cache_key(&condition, &None, &old, None);
+        let new_key = generate_cache_key(&condition, &None, &new_same_size, None);
+        cache.put(old_key, CacheEntry::Count(7));
+        assert!(
+            cache.get(&new_key, None).is_none(),
+            "a cached old generation must miss for an equal-sized new generation"
+        );
         assert_eq!(
-            generate_cache_key(&condition, &None, &pre_heal, None),
-            generate_cache_key(&condition, &None, &pre_heal.clone(), None),
+            generate_cache_key(&condition, &None, &old, None),
+            generate_cache_key(&condition, &None, &old.clone(), None),
         );
     }
 
@@ -4537,7 +4578,7 @@ mod tests {
         let (data, index) = writer.finish().unwrap();
         let index = index.expect("core file writer emits a sidecar");
         let account = infra::storage::get_account("org", key).unwrap_or_default();
-        let sidecar_key = config::vix_sidecar_key(key).expect("core key has a sidecar key");
+        let sidecar_key = config::vix_sidecar_key(key, 0).expect("core key has a sidecar key");
         let (data_len, index_len) = (data.len(), index.len());
         infra::storage::put(&account, key, bytes::Bytes::from(data))
             .await
@@ -4703,7 +4744,7 @@ mod tests {
         }
         for file in &files {
             assert!(
-                !reader_cache::GLOBAL_CACHE.contains(&file.key),
+                !reader_cache::GLOBAL_CACHE.contains(&reader_identity(file)),
                 "test keys must start cold"
             );
         }
@@ -4733,7 +4774,7 @@ mod tests {
         );
         for file in &files {
             assert!(
-                reader_cache::GLOBAL_CACHE.contains(&file.key),
+                reader_cache::GLOBAL_CACHE.contains(&reader_identity(file)),
                 "wave must memoize {}",
                 file.key
             );
@@ -4764,7 +4805,7 @@ mod tests {
             "the wave must respect the eval-bail byte budget"
         );
         for file in &strapped {
-            assert!(!reader_cache::GLOBAL_CACHE.contains(&file.key));
+            assert!(!reader_cache::GLOBAL_CACHE.contains(&reader_identity(file)));
         }
     }
 
@@ -4843,7 +4884,7 @@ mod tests {
         assert_eq!(*on, (FILES * 10) as u64, "all rows are level=info");
         // the on-run leaves every reader memoized (wave or eval)
         for file in &files_master {
-            assert!(reader_cache::GLOBAL_CACHE.contains(&file.key));
+            assert!(reader_cache::GLOBAL_CACHE.contains(&reader_identity(file)));
         }
     }
 
@@ -4871,7 +4912,7 @@ mod tests {
             let (reader, mut file) =
                 build_select_file(&format!("files/org/logs/t/fanout-{i}.vix"), 1000);
             file.meta.compressed_size = 4096;
-            reader_cache::GLOBAL_CACHE.put(file.key.clone(), Arc::new(reader));
+            reader_cache::GLOBAL_CACHE.put(reader_identity(&file), Arc::new(reader));
             file_list.push(file);
         }
 
@@ -5190,6 +5231,7 @@ mod tests {
         .await;
         master.meta.index_size = 0;
         let key = master.key.clone();
+        let reader_key = reader_identity(&master);
         reader_cache::GLOBAL_CACHE.remove(&key);
         vix_result_cache::GLOBAL_CACHE.remove_file_entries(std::iter::once(key.as_str()));
         let params = Arc::new(crate::types::QueryParams {
@@ -5222,7 +5264,7 @@ mod tests {
             other => panic!("expected zone histogram, got {other:?}"),
         }
         assert!(
-            !reader_cache::GLOBAL_CACHE.contains(&key),
+            !reader_cache::GLOBAL_CACHE.contains(&reader_key),
             "ALL histogram must not retain its data-only reader"
         );
     }
@@ -5239,6 +5281,8 @@ mod tests {
         .await;
         let mut histogram_file = master.clone();
         histogram_file.meta.index_size = i64::MAX;
+        let histogram_reader_key = reader_identity(&histogram_file);
+        let master_reader_key = reader_identity(&master);
         let key = master.key.clone();
         reader_cache::GLOBAL_CACHE.remove(&key);
         vix_result_cache::GLOBAL_CACHE.remove_file_entries(std::iter::once(key.as_str()));
@@ -5272,7 +5316,7 @@ mod tests {
             other => panic!("expected zone histogram, got {other:?}"),
         }
         assert!(
-            !reader_cache::GLOBAL_CACHE.contains(&key),
+            !reader_cache::GLOBAL_CACHE.contains(&histogram_reader_key),
             "indexed ALL histogram must not retain its data-only reader"
         );
 
@@ -5298,7 +5342,7 @@ mod tests {
         assert!(matches!(equality_histogram, VixSearchResult::NoMatch));
         assert!(!has_skipped);
         assert!(
-            !reader_cache::GLOBAL_CACHE.contains(&key),
+            !reader_cache::GLOBAL_CACHE.contains(&master_reader_key),
             "equality histogram after ALL histogram must stay query-local"
         );
 
@@ -5326,7 +5370,7 @@ mod tests {
         assert!(!has_skipped);
         assert!(
             reader_cache::GLOBAL_CACHE
-                .get(&key)
+                .get(&master_reader_key)
                 .is_some_and(|reader| reader.has_index()),
             "a later filtered query must upgrade the cached reader with its sidecar"
         );
@@ -5349,7 +5393,8 @@ mod tests {
             "the fixture must remain eligible for the ordinary background downloader"
         );
         let key = master.key.clone();
-        let sidecar_key = config::vix_sidecar_key(&key).unwrap();
+        let sidecar_key = config::vix_sidecar_key(&key, master.meta.index_generation).unwrap();
+        let reader_key = reader_identity(&master);
         reader_cache::GLOBAL_CACHE.remove(&key);
         vix_result_cache::GLOBAL_CACHE.remove_file_entries(std::iter::once(key.as_str()));
         file_data::memory::remove(&sidecar_key).await.unwrap();
@@ -5395,7 +5440,7 @@ mod tests {
             "cold exact histograms must probe caches without enqueueing sidecar misses"
         );
         assert!(
-            !reader_cache::GLOBAL_CACHE.contains(&key),
+            !reader_cache::GLOBAL_CACHE.contains(&reader_key),
             "cold native histogram must not open or prefetch the sidecar"
         );
     }
@@ -5411,7 +5456,8 @@ mod tests {
         )
         .await;
         let key = master.key.clone();
-        let sidecar_key = config::vix_sidecar_key(&key).unwrap();
+        let sidecar_key = config::vix_sidecar_key(&key, master.meta.index_generation).unwrap();
+        let reader_key = reader_identity(&master);
         let sidecar = infra::storage::get(&master.account, &sidecar_key)
             .await
             .unwrap()
@@ -5462,7 +5508,7 @@ mod tests {
         );
         assert!(
             reader_cache::GLOBAL_CACHE
-                .get(&key)
+                .get(&reader_key)
                 .is_some_and(|reader| reader.has_index()),
             "check-only probing must preserve the cached-sidecar postings path"
         );
@@ -5479,6 +5525,7 @@ mod tests {
         )
         .await;
         let key = master.key.clone();
+        let reader_key = reader_identity(&master);
         reader_cache::GLOBAL_CACHE.remove(&key);
         vix_result_cache::GLOBAL_CACHE.remove_file_entries(std::iter::once(key.as_str()));
         let mut condition = IndexCondition::new();
@@ -5508,7 +5555,7 @@ mod tests {
         }
         assert!(
             reader_cache::GLOBAL_CACHE
-                .get(&key)
+                .get(&reader_key)
                 .is_some_and(|reader| reader.has_index()),
             "local sidecar histogram must retain its parsed indexed reader"
         );
@@ -5541,7 +5588,8 @@ mod tests {
             reader_cache::GLOBAL_CACHE.remove(&indexed.key);
             vix_result_cache::GLOBAL_CACHE
                 .remove_file_entries(std::iter::once(indexed.key.as_str()));
-            let sidecar = config::vix_sidecar_key(&indexed.key).unwrap();
+            let sidecar =
+                config::vix_sidecar_key(&indexed.key, indexed.meta.index_generation).unwrap();
             file_data::memory::remove(&sidecar).await.unwrap();
             file_data::disk::remove(&sidecar).await.unwrap();
 
@@ -5567,7 +5615,7 @@ mod tests {
             rows.sort();
             assert_eq!(rows, expected);
             assert!(
-                !reader_cache::GLOBAL_CACHE.contains(&indexed.key),
+                !reader_cache::GLOBAL_CACHE.contains(&reader_identity(&indexed)),
                 "ALL multi-histogram reader must remain query-local"
             );
             assert!(!file_data::memory::exist(&sidecar).await);
@@ -5604,7 +5652,7 @@ mod tests {
             reader_cache::GLOBAL_CACHE.remove(&file.key);
             vix_result_cache::GLOBAL_CACHE.remove_file_entries(std::iter::once(file.key.as_str()));
         }
-        let sidecar = config::vix_sidecar_key(&indexed.key).unwrap();
+        let sidecar = config::vix_sidecar_key(&indexed.key, indexed.meta.index_generation).unwrap();
         file_data::memory::remove(&sidecar).await.unwrap();
         file_data::disk::remove(&sidecar).await.unwrap();
         let params = Arc::new(crate::types::QueryParams {
@@ -5631,8 +5679,8 @@ mod tests {
         };
         rows.sort();
         assert_eq!(rows, expected);
-        assert!(!reader_cache::GLOBAL_CACHE.contains(&indexed.key));
-        assert!(!reader_cache::GLOBAL_CACHE.contains(&indexless.key));
+        assert!(!reader_cache::GLOBAL_CACHE.contains(&reader_identity(&indexed)));
+        assert!(!reader_cache::GLOBAL_CACHE.contains(&reader_identity(&indexless)));
         assert!(!file_data::memory::exist(&sidecar).await);
         assert!(!file_data::disk::exist(&sidecar).await);
     }
@@ -7398,8 +7446,15 @@ mod review_tests {
         // (ranged mode serves it with zero IO)
         let good_key = "files/org/logs/t/2024/01/01/00/wave_b_good_count.vix";
         let good_reader = Arc::new(svc_file(&[Some("api"), Some("db"), Some("api")]));
-        crate::vix::reader_cache::GLOBAL_CACHE.put(good_key.to_string(), Arc::clone(&good_reader));
         let good_file = agg_file_key(good_key, 3, 4096);
+        crate::vix::reader_cache::GLOBAL_CACHE.put(
+            crate::vix::reader_cache::ReaderCacheKey::new(
+                good_file.key.clone(),
+                good_file.meta.index_generation,
+                good_file.meta.index_size,
+            ),
+            Arc::clone(&good_reader),
+        );
 
         // BAD file: not cached anywhere, no such object in storage — every
         // read attempt (including the retry) fails
@@ -7441,8 +7496,15 @@ mod review_tests {
     async fn review_wave_b_skipped_condition_keeps_file_for_scan_branch() {
         let key = "files/org/logs/t/2024/01/01/00/wave_b_fts_skip.vix";
         let reader = Arc::new(fts_file(&["hello world", "goodbye world"]));
-        crate::vix::reader_cache::GLOBAL_CACHE.put(key.to_string(), Arc::clone(&reader));
         let file = agg_file_key(key, 2, 4096);
+        crate::vix::reader_cache::GLOBAL_CACHE.put(
+            crate::vix::reader_cache::ReaderCacheKey::new(
+                file.key.clone(),
+                file.meta.index_generation,
+                file.meta.index_size,
+            ),
+            Arc::clone(&reader),
+        );
 
         // equality on the fts field is skipped per file (tokens only, no
         // raw terms); the remaining conditions still evaluate — but the

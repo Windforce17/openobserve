@@ -13,7 +13,8 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use config::meta::stream::{FileKey, FileMeta};
+use config::meta::stream::{FileKey, FileListDeleted, FileMeta};
+use futures::{StreamExt, stream};
 use infra::{file_list as infra_file_list, storage};
 
 // Batch size for deleting files from file_list_deleted table
@@ -24,65 +25,57 @@ pub async fn delete(org_id: &str, time_max: i64) -> Result<i64, anyhow::Error> {
     if files.is_empty() {
         return Ok(0);
     }
-    let files_num = files.len() as i64;
+    let concurrency = config::get_config().limit.cpu_num.max(1);
+    let deleted = stream::iter(files.into_iter().map(delete_one))
+        .buffer_unordered(concurrency)
+        .filter_map(std::future::ready)
+        .collect::<Vec<_>>()
+        .await;
 
-    // delete files from storage. v3 sidecar split: every `.vix` data key
-    // gets its `.vxi` sidecar key deleted UNCONDITIONALLY alongside it —
-    // simplest correct option over consulting the vestigial
-    // `file_list_deleted.index_file` flag (which stays always-false):
-    // index-off files simply have no sidecar and the delete tolerates
-    // NotFound (`storage::del` already swallows per-key not-found).
-    let mut sidecar_keys: Vec<(String, String)> = Vec::new();
-    for file in &files {
-        if !ingester::is_wal_file(&file.file)
-            && let Some(sidecar) = config::vix_sidecar_key(&file.file)
-        {
-            sidecar_keys.push((file.account.clone(), sidecar));
-        }
+    if deleted.is_empty() {
+        return Ok(0);
     }
-    let mut del_keys: Vec<(&str, &str)> = files
-        .iter()
-        .filter_map(|file| {
-            if !ingester::is_wal_file(&file.file) {
-                Some((file.account.as_str(), file.file.as_str()))
-            } else {
-                None
-            }
-        })
-        .collect();
-    del_keys.extend(
-        sidecar_keys
-            .iter()
-            .map(|(account, key)| (account.as_str(), key.as_str())),
-    );
-    if let Err(e) = storage::del(del_keys).await {
-        // maybe the file already deleted, so we just skip the `not found` error
-        if !e.to_string().to_lowercase().contains("not found") {
-            log::error!("[COMPACTOR] delete files from storage failed: {e}");
-            return Err(e.into());
-        }
-    }
-
-    // delete files from file_list_deleted table
-    if let Err(e) = infra_file_list::batch_remove_deleted(
-        &files
-            .iter()
-            .map(|file| {
-                FileKey::new(
-                    file.id,
-                    file.account.clone(),
-                    file.file.clone(),
-                    FileMeta::default(),
-                    false,
-                )
-            })
-            .collect::<Vec<_>>(),
-    )
-    .await
-    {
+    if let Err(e) = infra_file_list::batch_remove_deleted(&deleted).await {
         log::error!("[COMPACTOR] delete files from table failed: {e}");
         return Err(e.into());
     }
 
-    Ok(files_num)
+    Ok(deleted.len() as i64)
+}
+
+async fn delete_one(file: FileListDeleted) -> Option<FileKey> {
+    let storage_deleted = if ingester::is_wal_file(&file.file) {
+        true
+    } else {
+        match storage::delete(&file.account, &file.file).await {
+            Ok(()) => {
+                if let Some(sidecar) = config::vix_sidecar_key(&file.file, file.index_generation) {
+                    match storage::delete(&file.account, &sidecar).await {
+                        Ok(()) => true,
+                        Err(e) => {
+                            log::error!(
+                                "[COMPACTOR] delete sidecar {sidecar} failed; retaining \
+                                 deletion row for retry: {e}"
+                            );
+                            false
+                        }
+                    }
+                } else {
+                    true
+                }
+            }
+            Err(e) => {
+                log::error!(
+                    "[COMPACTOR] delete object {} failed; retaining deletion row for retry: {e}",
+                    file.file
+                );
+                false
+            }
+        }
+    };
+    storage_deleted.then(|| completed_row(file))
+}
+
+fn completed_row(file: FileListDeleted) -> FileKey {
+    FileKey::new(file.id, file.account, file.file, FileMeta::default(), false)
 }

@@ -1121,7 +1121,7 @@ async fn merge_files(
     // clear session data
     crate::service::search::datafusion::storage::file_list::clear(&trace_id);
 
-    let (buf, spooled_output, index_bytes, new_file_meta, file_format) = match merge_result {
+    let (buf, spooled_output, index_bytes, mut new_file_meta, file_format) = match merge_result {
         Ok(v) => v,
         Err(e) => {
             log::error!(
@@ -1136,6 +1136,9 @@ async fn merge_files(
             "merge_parquet_files error: compressed_size is 0"
         ));
     }
+    // WAL-move files are ordinary new outputs; only sidecar-only heals use
+    // positive generations.
+    new_file_meta.index_generation = 0;
     let new_file_key = super::generate_ingester_storage_file_key(
         &org_id,
         stream_type,
@@ -1176,8 +1179,8 @@ async fn merge_files(
     // between leaves an orphan object without a row, today's semantics.
     // Same account/placement as its data object.
     if let Some(index) = index_bytes {
-        let sidecar_key =
-            config::vix_sidecar_key(&new_file_key).expect("core-file move outputs are .vix keys");
+        let sidecar_key = config::vix_sidecar_key(&new_file_key, 0)
+            .expect("core-file move outputs are .vix keys");
         debug_assert_eq!(index.len() as i64, new_file_meta.index_size);
         let index = Bytes::from(index);
         if cache_locally {

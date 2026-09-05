@@ -31,8 +31,8 @@ use futures::{StreamExt, TryStreamExt, stream::BoxStream};
 use hashbrown::HashMap;
 use object_store::{
     Attribute, AttributeValue, Attributes, GetOptions, GetResult, ListResult, MultipartUpload,
-    ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
-    WriteMultipart, path::Path,
+    ObjectMeta, ObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    Result, WriteMultipart, path::Path,
 };
 use parquet::file::metadata::{FooterTail, ParquetMetaDataReader};
 
@@ -333,6 +333,36 @@ pub async fn put_with_compliance(account: &str, file: &str, data: bytes::Bytes) 
     Ok(())
 }
 
+/// Atomically create an immutable object, returning
+/// [`object_store::Error::AlreadyExists`] rather than replacing existing
+/// bytes. Generation-addressed VIX sidecars use this so an identifier
+/// collision can never mutate another query's object.
+///
+/// This intentionally uses one conditional PUT instead of multipart upload:
+/// multipart completion has no portable create-only precondition across the
+/// supported object stores. VIX sidecars are already resident `Bytes`, so
+/// this adds no process-memory copy.
+pub async fn put_if_absent(
+    account: &str,
+    file: &str,
+    data: bytes::Bytes,
+    compliance: bool,
+) -> Result<()> {
+    let opts = PutOptions {
+        mode: PutMode::Create,
+        attributes: if compliance {
+            compliance_attributes()
+        } else {
+            Attributes::new()
+        },
+        ..Default::default()
+    };
+    MULTI_ACCOUNTS
+        .put_opts(account, &file.into(), data.into(), opts)
+        .await?;
+    Ok(())
+}
+
 async fn put_multipart_opts(
     account: &str,
     file: &str,
@@ -347,6 +377,16 @@ async fn put_multipart_opts(
     write.write(data.as_bytes());
     write.finish().await?;
     Ok(())
+}
+
+/// Delete one object and surface failures. Missing objects are already in
+/// the desired state. Retirement/outbox consumers use this instead of
+/// [`del`], whose legacy bulk contract logs per-object errors.
+pub async fn delete(account: &str, file: &str) -> Result<()> {
+    match MULTI_ACCOUNTS.delete(account, &Path::from(file)).await {
+        Ok(_) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 /// Delete files from the object store.

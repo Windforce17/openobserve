@@ -2151,17 +2151,18 @@ fn merge_core_files_rebuild_with_caps_and_cancellation(
 /// Outcome of a sidecar-only heal attempt over ONE stored core file
 /// ([`rebuild_core_file_sidecar`]).
 pub enum SidecarHealOutcome {
-    /// A fresh `.vxi` was built over the UNTOUCHED data object: upload it
-    /// to the SAME sidecar key and update the existing row's `index_size`.
+    /// A fresh `.vxi` was built over the UNTOUCHED data object. The caller
+    /// publishes it under a new immutable generation key and atomically
+    /// advances the existing file-list row.
     Rebuilt {
         index: Vec<u8>,
         stats: VixWriterStats,
     },
-    /// The current plan is index-off but the file carries a sidecar: the
-    /// heal is metadata-only — delete the `.vxi`, set `index_size = 0`.
-    /// (v2 all-columns files already materialize every present field as a
-    /// docs column, so the index-off direction needs no docs rewrite
-    /// either.)
+    /// The current plan is index-off but the file carries a sidecar. The
+    /// caller advances the row to a fresh no-sidecar generation and retires
+    /// the previous object after the reader grace period. (v2 all-columns
+    /// files already materialize every present field as a docs column, so
+    /// this direction needs no docs rewrite.)
     DropSidecar,
     /// This heal genuinely rewrites docs; route it to the whole-file
     /// rebuild (new data object + new row). The two arms today:
@@ -11004,6 +11005,7 @@ mod tests {
                     compressed_size: 0,
                     flattened: false,
                     index_size: 0,
+                    index_generation: 0,
                     bloom_ver: 0,
                 };
                 apply_core_stats_to_meta(&mut meta, 1, &result.stats, context).unwrap();
