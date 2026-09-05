@@ -22,7 +22,7 @@ use config::{get_config, is_local_disk_storage, meta::search::ScanStats};
 use hashbrown::HashMap;
 use infra::cache::{file_data, file_downloader};
 
-/// Whether cache misses should start the ordinary detached cache-fill path.
+/// Whether cache misses should try bounded, independently owned cache fills.
 ///
 /// Exact equality histograms can answer remote-cold files from narrow native
 /// docs columns, but still need the cache probe to prefer sidecars that are
@@ -134,8 +134,8 @@ pub(crate) async fn cache_files_with_policy(
     }
 
     // A check-only caller consumes the hit/miss counts and ScanStats above to
-    // retain its local-cache fast paths. Return before selecting a cache type,
-    // cloning missing keys/accounts, or spawning the detached enqueuer.
+    // retain its local-cache fast paths. Return before selecting a cache type
+    // or attempting optional warming admission.
     if !miss_policy.enqueue_misses() {
         return (file_data::CacheType::None, cache_hits, cache_misses);
     }
@@ -159,41 +159,46 @@ pub(crate) async fn cache_files_with_policy(
         return (file_data::CacheType::None, cache_hits, cache_misses);
     };
 
-    let trace_id = trace_id.to_string();
-    let files = files
-        .iter()
-        .filter_map(|(id, account, file, size, ts, records)| {
-            if cached_files.contains(file) || !file_downloader::should_download(*records) {
-                None
-            } else {
-                Some((*id, account.to_string(), file.to_string(), *size, *ts))
-            }
-        })
-        .collect::<Vec<_>>();
-    let file_type = file_type.to_string();
-    tokio::spawn(async move {
-        let files_num = files.len();
-        for (id, account, file, size, ts) in files {
-            if let Err(e) = file_downloader::queue_download(
-                trace_id.clone(),
-                id,
-                account,
-                file.clone(),
-                size,
-                ts,
-                cache_type,
-            )
+    let mut accepted = 0usize;
+    let mut accepted_bytes = 0u64;
+    let mut deduplicated = 0usize;
+    let mut skipped = 0usize;
+    let mut cached = 0usize;
+    let mut rejected = 0usize;
+    let mut rejected_bytes = 0u64;
+    for (id, account, file, size, ts, records) in files {
+        if cached_files.contains(file) {
+            cached += 1;
+            continue;
+        }
+        if !file_downloader::should_download(*records) {
+            skipped += 1;
+            continue;
+        }
+        // Borrow candidates directly: no detached producer or unsent Vec can
+        // survive this query. Only admitted workers have an independent lifetime.
+        match file_downloader::queue_download(trace_id, *id, account, file, *size, *ts, cache_type)
             .await
-            {
-                log::error!(
-                    "[trace_id {trace_id}] error in queuing file {file} for background download: {e}"
+        {
+            file_downloader::QueueDownloadOutcome::Accepted { bytes } => {
+                accepted += 1;
+                accepted_bytes = accepted_bytes.saturating_add(bytes as u64);
+            }
+            file_downloader::QueueDownloadOutcome::Deduplicated => deduplicated += 1,
+            file_downloader::QueueDownloadOutcome::Skipped => skipped += 1,
+            file_downloader::QueueDownloadOutcome::Cached => cached += 1,
+            file_downloader::QueueDownloadOutcome::Rejected(reason) => {
+                rejected += 1;
+                rejected_bytes = rejected_bytes.saturating_add((*size).max(0) as u64);
+                log::debug!(
+                    "[trace_id {trace_id}] search->storage: background download rejected file={file} size={size} reason={reason:?}"
                 );
             }
         }
-        log::info!(
-            "[trace_id {trace_id}] search->storage: successfully enqueued {files_num} files of {file_type} for background download into {cache_type:?}",
-        );
-    });
+    }
+    log::info!(
+        "[trace_id {trace_id}] search->storage: background download admission file_type={file_type} cache={cache_type:?} accepted={accepted} accepted_bytes={accepted_bytes} deduplicated={deduplicated} skipped={skipped} cached={cached} rejected={rejected} rejected_bytes={rejected_bytes}"
+    );
 
     if scan_stats.querier_memory_cached_files + scan_stats.querier_disk_cached_files < files_num / 2
     {
@@ -205,13 +210,7 @@ pub(crate) async fn cache_files_with_policy(
 
 #[cfg(test)]
 mod tests {
-    use super::{CacheMissPolicy, calc_target_partitions};
-
-    #[test]
-    fn check_only_cache_policy_never_enqueues_misses() {
-        assert!(!CacheMissPolicy::CheckOnly.enqueue_misses());
-        assert!(CacheMissPolicy::Enqueue.enqueue_misses());
-    }
+    use super::calc_target_partitions;
 
     #[test]
     fn target_partitions_interpolates_cache_ratio() {

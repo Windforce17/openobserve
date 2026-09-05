@@ -3,6 +3,38 @@
 Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
 (deleted 2026-07-29; full history in git). Keep THIS file current.
 
+## 2026-09-05 — exact VIX aggregates and bounded query IO (local verification)
+- Aggregate shortcuts require complete input and the original logical
+  column identity. Preserve NULL/absent groups and global winners; remove
+  per-file/per-bucket truncation. FILTER, DISTINCT, narrowing casts,
+  transformed timestamps, and residual predicates decline shortcuts rather
+  than returning row counts for a different SQL expression. Bare
+  passthrough projections and the requested date-bin origin remain valid.
+- Count-only dictionary scans avoid postings payloads. Optional
+  `dict_field_pages_v1` directories and field-aligned terms chunks bound
+  unrelated-vocabulary work; old files still use the legacy reader path.
+- Query-owned cancellation and separate process-wide fetch/evaluation
+  byte gates replace coarse sidecar-size admission. Reader ownership is
+  shared across native-only, schema, stats, and worker paths; immutable
+  encoded footer caches do not retain decoded trees or creator operations.
+  Cache publication is fallible before visibility, and size-growth
+  accounting is O(1). Background warming has bounded admission and owned
+  temporary-file cleanup.
+- Local proof: 293 VIX-library, 178 search-VIX, 41 optimizer, 116 cache,
+  5 event-admission, and 1 byte-budget configuration tests passed (14/4
+  pre-existing ignored tests in the first two groups).
+  A frozen 288,379-row/83-file corpus passed all 19 query contracts and
+  11 COUNT/timestamp boundary cases on both legacy and newly written
+  layouts. Old-binary reads of new field-page files preserved every
+  baseline pass/fail classification; no new format failures.
+- Actual HTTP disconnects closed all 14 cold-reader and 3 warm-reader
+  remote ranges, with correlated server abort logs, no later range starts,
+  and exact subsequent queries. The 2M-row metadata probe returned exact
+  counts at unrelated cardinalities 16, 65,536, 1M, and 2M.
+- No production deployment or Orbit change. Timings are local
+  current-state/warm measurements, not disk-cold or production speedups;
+  disabling the result cache does not disable file/VIX/OS caches.
+
 ## M31a — INGEST LATE LANE 2026-08-26 (ships as .124; the tiny-file source fix)
 - DESIGN DEVIATION from the DESIGN-MERGE.md §2 charter, for cause: the
   charter's per-segment pending-(stream,hour) pool has NO representation in

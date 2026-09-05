@@ -65,12 +65,13 @@ use crate::{
         BLOB_TAG_TERMS, BLOB_TYPE_BLOOM, BLOB_TYPE_DICT, BLOB_TYPE_DICT_BLOCKS, BLOB_TYPE_PLIST,
         BLOB_TYPE_STATS, BLOB_TYPE_TERMS, BlobPart, DICT_LAYOUT_BLOCKS, DocsBlobEncoder,
         FIELD_TYPE_BLOOM, FIELD_TYPE_CS, FIELD_TYPE_FTS, FIELD_TYPE_TERM, FieldEntry,
-        KEY_LAYOUT_FID_V2, PROP_COLUMNS, PROP_COLUMNS_COMPLETE, PROP_DICT_LAYOUT, PROP_FIELDS,
-        PROP_KEY_LAYOUT, PROP_OVERSIZE_SKIPS, PROP_PARTIAL_FIELDS, PROP_PLIST_MIN_DOCS,
-        PROP_ROW_COUNT, PROP_ROW_GROUP_SIZE, PROP_ROW_ORDER, PROP_ROW_REGIONS, PROP_TERM_COUNT,
-        PROP_TOKENIZER, PROP_VERSION, PROP_ZONE_MAP, ROW_ORDER_CONCAT, ROW_ORDER_TS_DESC,
-        TOKENIZER_ID, TermsBlobSpooler, VIX_FORMAT_VERSION, VixOutput, ZoneEntry,
-        addressable_strategy, build_container_parts, finish_streamed_container, write_vortex_blob,
+        KEY_LAYOUT_FID_V2, PROP_COLUMNS, PROP_COLUMNS_COMPLETE, PROP_DICT_FIELD_PAGES,
+        PROP_DICT_LAYOUT, PROP_FIELDS, PROP_KEY_LAYOUT, PROP_OVERSIZE_SKIPS, PROP_PARTIAL_FIELDS,
+        PROP_PLIST_MIN_DOCS, PROP_ROW_COUNT, PROP_ROW_GROUP_SIZE, PROP_ROW_ORDER, PROP_ROW_REGIONS,
+        PROP_TERM_COUNT, PROP_TOKENIZER, PROP_VERSION, PROP_ZONE_MAP, ROW_ORDER_CONCAT,
+        ROW_ORDER_TS_DESC, TOKENIZER_ID, TermsBlobSpooler, VIX_FORMAT_VERSION, VixOutput,
+        ZoneEntry, addressable_strategy, build_container_parts, finish_streamed_container,
+        write_vortex_blob,
     },
     error::{Result, VixError},
     merge::{self, DocIdMap},
@@ -3311,7 +3312,7 @@ impl VixWriter {
         encoder.signal_finish()?;
 
         let index_assemble_started = std::time::Instant::now();
-        let (blobs, term_count) = self.assemble_index_blobs(row_count)?;
+        let (blobs, term_count, dict_field_pages) = self.assemble_index_blobs(row_count)?;
         let index_assemble_ms = elapsed_millis_u64(index_assemble_started);
         let docs_finish_started = std::time::Instant::now();
         let (sink, docs_size) = encoder.join()?;
@@ -3431,7 +3432,8 @@ impl VixWriter {
         let data_container_ms = elapsed_millis_u64(data_container_started);
 
         let index_container_started = std::time::Instant::now();
-        let index_output = self.build_index_sidecar_container(row_count, term_count, blobs)?;
+        let index_output =
+            self.build_index_sidecar_container(row_count, term_count, blobs, dict_field_pages)?;
         let index_container_ms = elapsed_millis_u64(index_container_started);
         let index_size = index_output.as_ref().map_or(0, |bytes| bytes.len() as u64);
         let oversize_skipped: u64 = self.oversize_skips.values().sum();
@@ -3486,7 +3488,11 @@ impl VixWriter {
     fn assemble_index_blobs(
         &mut self,
         row_count: u64,
-    ) -> Result<(Vec<(&'static str, &'static str, BlobPart)>, u64)> {
+    ) -> Result<(
+        Vec<(&'static str, &'static str, BlobPart)>,
+        u64,
+        Option<crate::dict_blocks::DictFieldPages>,
+    )> {
         let (index_blobs, term_count, bloom_acc) = match self.merged_index.take() {
             Some(prebuilt) => {
                 if !self.terms.is_empty() {
@@ -3527,8 +3533,8 @@ impl VixWriter {
                 // re-encode was gone. Field-boundary bounds keep the dict
                 // region byte-identical (the sequential sink also cuts
                 // blocks at every field change) and the re-cutting assembly
-                // ([`write_index_blobs_recut`]) restores the terms blob's
-                // continuous row-block accumulation, so the sidecar is
+                // ([`write_index_blobs_recut`]) replays the terms blob's
+                // field-aligned row-block accumulation, so the sidecar is
                 // BYTE-IDENTICAL for any worker count (pinned R=1 vs R=8);
                 // per-range bloom accumulators merge by set union (the M12
                 // pattern, byte-identical SBBF).
@@ -3718,9 +3724,11 @@ impl VixWriter {
                             for (first_key, offset, first_ordinal) in &parts.dict_meta {
                                 index.push_block(first_key, *offset, *first_ordinal)?;
                             }
+                            let (dict, dict_field_pages) = index.finish_with_pages();
                             (
                                 Some(IndexBlobParts {
-                                    dict: index.finish(),
+                                    dict,
+                                    dict_field_pages,
                                     dict_blocks: parts.dict_blocks,
                                     terms,
                                     plist: parts.plist,
@@ -3736,6 +3744,8 @@ impl VixWriter {
         };
 
         let mut blobs: Vec<(&'static str, &'static str, BlobPart)> = Vec::new();
+        let mut directory = None;
+        let mut dict_field_pages = None;
         if let Some(index) = index_blobs {
             blobs.push((BLOB_TYPE_TERMS, BLOB_TAG_TERMS, index.terms));
             // The out-of-row postings region: RAW concatenated
@@ -3750,7 +3760,8 @@ impl VixWriter {
                 BLOB_TAG_DICT_BLOCKS,
                 index.dict_blocks,
             ));
-            blobs.push((BLOB_TYPE_DICT, BLOB_TAG_DICT, BlobPart::Mem(index.dict)));
+            directory = Some(index.dict);
+            dict_field_pages = Some(index.dict_field_pages);
         }
         // Per-file value blooms (byproduct of term emission, both paths).
         // #52: fold bloom-only values in for BOTH build and merge modes —
@@ -3777,7 +3788,13 @@ impl VixWriter {
             );
             blobs.push((BLOB_TYPE_BLOOM, BLOB_TAG_BLOOM, BlobPart::Mem(bloom_blob)));
         }
-        Ok((blobs, term_count))
+        // Explicit puffin offsets make physical order independent of lookup.
+        // Keep the small, universally used directory closer to the footer
+        // than bloom payloads, which may exceed the entire eager-tail budget.
+        if let Some(directory) = directory {
+            blobs.push((BLOB_TYPE_DICT, BLOB_TAG_DICT, BlobPart::Mem(directory)));
+        }
+        Ok((blobs, term_count, dict_field_pages))
     }
 
     /// Assemble the `.vxi` INDEX-sidecar container. Emitted IFF the file is
@@ -3792,6 +3809,7 @@ impl VixWriter {
         row_count: u64,
         term_count: u64,
         blobs: Vec<(&'static str, &'static str, BlobPart)>,
+        dict_field_pages: Option<crate::dict_blocks::DictFieldPages>,
     ) -> Result<Option<Vec<u8>>> {
         if !self.opts.index_enabled {
             debug_assert!(blobs.is_empty(), "an index-off writer produced index blobs");
@@ -3820,6 +3838,12 @@ impl VixWriter {
             // (container::require_supported_index_format).
             (PROP_KEY_LAYOUT.to_string(), KEY_LAYOUT_FID_V2.to_string()),
         ];
+        if let Some(pages) = dict_field_pages {
+            index_properties.push((
+                PROP_DICT_FIELD_PAGES.to_string(),
+                serde_json::to_string(&pages)?,
+            ));
+        }
         // Plist capability marker: written IFF the feature was enabled.
         // Present ⇒ pointer cells may exist and `doc_count >= threshold`
         // selects them; absent ⇒ every postings cell is inline. Written
@@ -3885,11 +3909,11 @@ impl VixWriter {
             .into());
         }
         let index_assemble_started = std::time::Instant::now();
-        let (blobs, term_count) = self.assemble_index_blobs(expected_rows)?;
+        let (blobs, term_count, dict_field_pages) = self.assemble_index_blobs(expected_rows)?;
         let index_assemble_ms = elapsed_millis_u64(index_assemble_started);
         let index_container_started = std::time::Instant::now();
         let container = self
-            .build_index_sidecar_container(expected_rows, term_count, blobs)?
+            .build_index_sidecar_container(expected_rows, term_count, blobs, dict_field_pages)?
             .expect("index-enabled writers always produce a sidecar");
         let index_container_ms = elapsed_millis_u64(index_container_started);
         let oversize_skipped: u64 = self.oversize_skips.values().sum();
@@ -4814,6 +4838,19 @@ impl TermSink {
     }
 
     pub(crate) fn push(&mut self, key: &[u8], doc_count: u32, blob: &[u8]) -> Result<()> {
+        let field_changed =
+            key.len() >= 2 && self.last_key.len() >= 2 && key[..2] != self.last_key[..2];
+        // A count projection must never decode another field's rows. Flush
+        // before appending the new field, including for zero-byte dense cells.
+        if field_changed {
+            flush_terms_batch(
+                &self.terms_schema,
+                &mut self.doc_counts,
+                &mut self.postings_builder,
+                &mut self.term_batches,
+            )?;
+            self.block_bytes = 0;
+        }
         self.bloom.observe(crate::query::bloom_canonical_key(
             key,
             &mut self.bloom_key_scratch,
@@ -4834,8 +4871,6 @@ impl TermSink {
         // Block cuts: at the byte target, and ALWAYS at a field boundary
         // (the composite key's first two bytes are the field id) — a block
         // never spans fields, so a field probe's block range is exact.
-        let field_changed =
-            key.len() >= 2 && self.last_key.len() >= 2 && key[..2] != self.last_key[..2];
         if !self.dict_block.is_empty()
             && (self.dict_block.raw_bytes() >= crate::dict_blocks::BLOCK_TARGET_BYTES
                 || field_changed)
@@ -4969,6 +5004,7 @@ pub(crate) struct TermSinkParts {
 /// their `Vec<u8>`s unchanged via `From<IndexBlobs>`.
 pub(crate) struct IndexBlobParts {
     pub(crate) dict: Vec<u8>,
+    pub(crate) dict_field_pages: crate::dict_blocks::DictFieldPages,
     pub(crate) dict_blocks: BlobPart,
     pub(crate) terms: BlobPart,
     pub(crate) plist: Option<BlobPart>,
@@ -4978,6 +5014,7 @@ impl From<IndexBlobs> for IndexBlobParts {
     fn from(blobs: IndexBlobs) -> Self {
         IndexBlobParts {
             dict: blobs.dict,
+            dict_field_pages: blobs.dict_field_pages,
             dict_blocks: BlobPart::Mem(blobs.dict_blocks),
             terms: BlobPart::Mem(blobs.terms),
             plist: blobs.plist.map(BlobPart::Mem),
@@ -4990,6 +5027,8 @@ pub(crate) struct IndexBlobs {
     /// The dictionary block INDEX (raw [`crate::dict_blocks`] index bytes,
     /// NOT a Vortex file).
     pub(crate) dict: Vec<u8>,
+    /// Fresh descriptors derived from the exact emitted index, never input metadata.
+    pub(crate) dict_field_pages: crate::dict_blocks::DictFieldPages,
     /// The dictionary BLOCKS region (raw concatenated encoded blocks).
     pub(crate) dict_blocks: Vec<u8>,
     pub(crate) terms: Vec<u8>,
@@ -5085,9 +5124,11 @@ pub(crate) fn write_index_blobs(
         addressable_strategy(),
         encode_threads,
     )?;
+    let (dict, dict_field_pages) = index.finish_with_pages();
     Ok((
         Some(IndexBlobs {
-            dict: index.finish(),
+            dict,
+            dict_field_pages,
             dict_blocks,
             terms: terms_blob,
             // non-empty ⇔ at least one pointer cell was pushed (a record is
@@ -5125,9 +5166,9 @@ fn push_sorted_shards(
 /// to the sequential one: [`TermSink::push`] cuts a dictionary block at
 /// every 2-byte field-id change, so a range starting at a field's first
 /// key begins a fresh block exactly where the sequential sink would — the
-/// concatenated dict-blocks region cannot differ. (The terms blob's
-/// row-block continuity is restored separately by
-/// [`write_index_blobs_recut`].) M10's output-keyspace invariants hold
+/// concatenated dict-blocks region cannot differ. The terms blob's
+/// field and byte boundaries are replayed separately by
+/// [`write_index_blobs_recut`]. M10's output-keyspace invariants hold
 /// trivially: there is ONE key space (the writer's own), and every bound
 /// is a real key in it. Empty when fewer than 2 field regions exist or
 /// `ranges <= 1` — the caller then runs the sequential path.
@@ -5161,7 +5202,7 @@ fn rebuild_partition_ranges(
 /// ordering backstop, dict/plist rebase and bloom merge, but the terms
 /// batches are RE-CUT — every part's `(doc_count, cell)` rows stream
 /// through one continuous accumulation that replays [`TermSink::push`]'s
-/// flush rule (`bytes-since-flush >= postings_chunk_bytes`), so the
+/// flush rule (field change or `bytes-since-flush >= postings_chunk_bytes`), so the
 /// row-block boundaries (and with them the terms blob's bytes) equal the
 /// single-sink sequential build EXACTLY for any range partitioning.
 /// Pointer cells rebase inline during the replay (same structural
@@ -5210,6 +5251,7 @@ pub(crate) fn write_index_blobs_recut(
     let mut doc_counts: Vec<u32> = Vec::new();
     let mut postings_builder = BinaryBuilder::new();
     let mut block_bytes = 0usize;
+    let mut last_field = None;
     for mut part in parts {
         bloom.merge(std::mem::take(&mut part.bloom));
         let plist_base = plist.len() as u64;
@@ -5218,6 +5260,10 @@ pub(crate) fn write_index_blobs_recut(
             index.push_block(first_key, blocks_base + offset, term_count + first_ordinal)?;
         }
         dict_blocks.extend_from_slice(&part.dict_blocks);
+        // Dictionary blocks never span fields. Their first keys and local
+        // ordinals locate every field fence without decoding keys or postings.
+        let mut block_fences = part.dict_meta.iter().peekable();
+        let mut ordinal = 0u64;
         for batch in &part.term_batches {
             let counts = batch
                 .column_by_name("doc_count")
@@ -5236,6 +5282,24 @@ pub(crate) fn write_index_blobs_recut(
                     )
                 })?;
             for row in 0..batch.num_rows() {
+                if block_fences
+                    .peek()
+                    .is_some_and(|(_, _, first_ordinal)| *first_ordinal == ordinal)
+                {
+                    let (first_key, ..) = block_fences.next().unwrap();
+                    let field = u16::from_be_bytes([first_key[0], first_key[1]]);
+                    if last_field.is_some_and(|previous| previous != field) {
+                        flush_terms_batch(
+                            &terms_schema,
+                            &mut doc_counts,
+                            &mut postings_builder,
+                            &mut term_batches,
+                        )?;
+                        block_bytes = 0;
+                    }
+                    last_field = Some(field);
+                }
+                ordinal += 1;
                 let doc_count = counts.value(row);
                 let cell = cells.value(row);
                 let rebased;
@@ -5288,9 +5352,11 @@ pub(crate) fn write_index_blobs_recut(
         addressable_strategy(),
         encode_threads,
     )?;
+    let (dict, dict_field_pages) = index.finish_with_pages();
     Ok((
         Some(IndexBlobs {
-            dict: index.finish(),
+            dict,
+            dict_field_pages,
             dict_blocks,
             terms: terms_blob,
             plist: (!plist.is_empty()).then_some(plist),
@@ -5499,6 +5565,171 @@ impl<'a> StringColumn<'a> {
 mod field_cut_tests {
     use super::*;
     use crate::query::write_composite;
+
+    /// Both dense (zero-byte) cells and a partial byte-cut batch must close
+    /// at a field fence. Recut uses directory ordinals, not input batches or
+    /// every dictionary-block boundary, to reproduce these addressable chunks.
+    #[test]
+    fn terms_chunks_and_recut_respect_field_fences() {
+        let encoded = postings::encode(&[1, 3]).unwrap();
+        let target = encoded.len() * 3;
+        let make_part = |fields: &[u16]| {
+            let mut sink = TermSink::new(target);
+            let mut key = Vec::new();
+            for &field in fields {
+                let count = match field {
+                    1 => 3,
+                    2 => 10,
+                    _ => 2,
+                };
+                for row in 0..count {
+                    // Field 2 crosses a dictionary-block boundary that is
+                    // NOT a terms-chunk boundary.
+                    let token = if field == 2 {
+                        format!("{row:02}{}", "x".repeat(8192))
+                    } else {
+                        format!("{row:02}")
+                    };
+                    write_composite(&mut key, token.as_bytes(), field);
+                    if field == 2 {
+                        sink.push(&key, 2, &encoded).unwrap();
+                    } else {
+                        sink.push(&key, 100, &[]).unwrap();
+                    }
+                }
+            }
+            sink.into_parts().unwrap()
+        };
+        let sequential = make_part(&[1, 2, 3]);
+        let counts: Vec<Vec<u32>> = sequential
+            .term_batches
+            .iter()
+            .map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<UInt32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(
+            counts,
+            vec![
+                vec![100; 3],
+                vec![2; 3],
+                vec![2; 3],
+                vec![2; 3],
+                vec![2],
+                vec![100; 2],
+            ]
+        );
+        let (expected, ..) = write_index_blobs(vec![sequential], 1).unwrap();
+        let expected = expected.unwrap();
+        for parts in [
+            vec![make_part(&[1, 2, 3])],
+            vec![make_part(&[1, 2]), make_part(&[3])],
+        ] {
+            let (recut, ..) = write_index_blobs_recut(parts, target, 1).unwrap();
+            let recut = recut.unwrap();
+            assert_eq!(recut.terms, expected.terms);
+            assert_eq!(recut.dict, expected.dict);
+            assert_eq!(recut.dict_blocks, expected.dict_blocks);
+        }
+    }
+
+    /// Input descriptors describe only each input's fields. Both resident
+    /// and spooled compaction must publish the newly combined directory,
+    /// exactly as rebuilding the merged rows does, and never on DATA.
+    #[test]
+    fn merged_field_pages_are_recomputed() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("a", DataType::Utf8, true),
+            Field::new("b", DataType::Utf8, true),
+        ]));
+        let timestamps = Int64Array::from(vec![200, 100]);
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(timestamps.clone()),
+                Arc::new(StringArray::from(vec![Some("left"), None])),
+                Arc::new(StringArray::from(vec![None, Some("right")])),
+            ],
+        )
+        .unwrap();
+        let source = StringArray::from(vec![r#"{"a":"left"}"#, r#"{"b":"right"}"#]);
+        let options = VixWriterOptions {
+            encode_threads: 1,
+            merge_kway_threads: 1,
+            ..Default::default()
+        };
+        let build = |batch: &RecordBatch, source: &StringArray| {
+            let mut writer = VixWriter::new(&schema, options.clone(), false);
+            writer.push_batch_with_source(batch, source, None).unwrap();
+            writer.finish().unwrap()
+        };
+        let pages = |index: &[u8]| {
+            puffin::reader::parse_puffin_footer_from_bytes(index)
+                .unwrap()
+                .properties[PROP_DICT_FIELD_PAGES]
+                .clone()
+        };
+        let (rebuilt_data, rebuilt_index) = build(&batch, &source);
+        let expected_pages = pages(rebuilt_index.as_ref().unwrap());
+        assert!(
+            !puffin::reader::parse_puffin_footer_from_bytes(&rebuilt_data)
+                .unwrap()
+                .properties
+                .contains_key(PROP_DICT_FIELD_PAGES)
+        );
+        let inputs: Vec<VixReader> = (0..2)
+            .map(|row| {
+                let (data, index) = build(&batch.slice(row, 1), &source.slice(row, 1));
+                assert_ne!(pages(index.as_ref().unwrap()), expected_pages);
+                VixReader::open_with_index(data.into(), index.map(Into::into)).unwrap()
+            })
+            .collect();
+        let references: Vec<&VixReader> = inputs.iter().collect();
+        let spool_dir = tempfile::tempdir().unwrap();
+        for spool in [false, true] {
+            let mut writer = VixWriter::new(
+                &schema,
+                VixWriterOptions {
+                    term_spill_dir: spool.then(|| spool_dir.path().to_path_buf()),
+                    ..options.clone()
+                },
+                false,
+            );
+            writer
+                .merge_input_indexes(&references, &[DocIdMap::Offset(0), DocIdMap::Offset(1)], 1)
+                .unwrap();
+            writer
+                .push_docs_rows_unindexed(&timestamps, &[], &source, None)
+                .unwrap();
+            let (data, index) = writer.finish().unwrap();
+            assert_eq!(pages(index.as_ref().unwrap()), expected_pages);
+            assert!(
+                !puffin::reader::parse_puffin_footer_from_bytes(&data)
+                    .unwrap()
+                    .properties
+                    .contains_key(PROP_DICT_FIELD_PAGES)
+            );
+            let reader = VixReader::open_with_index(data.into(), index.map(Into::into)).unwrap();
+            for (field, token) in [("a", "left"), ("b", "right")] {
+                assert_eq!(
+                    reader
+                        .count(&crate::VixQuery::Exact {
+                            field: field.to_string(),
+                            token: token.as_bytes().to_vec(),
+                        })
+                        .unwrap(),
+                    1
+                );
+            }
+        }
+    }
 
     /// Dictionary blocks never span a field boundary: the sink cuts the
     /// open block at every field change (and at the byte target), so a

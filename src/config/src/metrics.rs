@@ -1547,6 +1547,46 @@ pub static VIX_FETCH_BYTES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     .expect("Metric created")
 });
 
+/// Completed coalesced reads; backend retries/HTTP attempts are not counted.
+pub static VIX_PHYSICAL_READS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "vix_physical_reads_total",
+            "Completed VIX coalesced reads by actual source",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &["path", "source"],
+    )
+    .expect("Metric created")
+});
+
+pub static VIX_PHYSICAL_BYTES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "vix_physical_bytes_total",
+            "Completed VIX coalesced bytes including gaps by actual source",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &["path", "source"],
+    )
+    .expect("Metric created")
+});
+
+pub static VIX_FETCH_TIME_MICROS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "vix_fetch_time_micros_total",
+            "VIX range admission queue and active IO microseconds",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &["path", "phase"],
+    )
+    .expect("Metric created")
+});
+
 // metrics for the vix per-file result cache
 pub static VIX_RESULT_CACHE_MEMORY_USAGE: Lazy<IntGaugeVec> = Lazy::new(|| {
     IntGaugeVec::new(
@@ -2399,6 +2439,15 @@ fn register_metrics(registry: &Registry) {
         .expect("Metric registered");
     registry
         .register(Box::new(VIX_FETCH_BYTES_TOTAL.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(VIX_PHYSICAL_READS_TOTAL.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(VIX_PHYSICAL_BYTES_TOTAL.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(VIX_FETCH_TIME_MICROS_TOTAL.clone()))
         .expect("Metric registered");
 
     // metrics for the vix per-file result cache

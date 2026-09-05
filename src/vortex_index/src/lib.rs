@@ -100,14 +100,22 @@ pub use docs::{
     cmp_num_vs_bound, docs_widen_plan,
 };
 pub use error::VixError;
+/// Result of an index read, including caller-defined admission errors.
+pub type Result<T, E = VixError> = std::result::Result<T, E>;
 pub use merge::DocIdMap;
 pub use numeric::{
     canonical_bool_text, canonical_f32_text, canonical_f64_text, canonical_i64_text,
     canonical_number_text, canonical_u64_text, is_numeric_value_token, numeric_value_token,
 };
 pub use query::VixQuery;
-pub use reader::{DocsDictChunk, FieldValueCounts, PlistCursor, TermVisitor, VixReader, ZoneChunk};
-pub use source::{BytesRangeSource, VixRangeSource};
+pub use reader::{
+    DocsDictBatch, DocsDictChunk, FieldValueCounts, PlistCursor, ReaderMemoryObserver, TermVisitor,
+    VixReader, ZoneChunk,
+};
+pub use source::{
+    BytesRangeSource, VixRangeSource, VixReadOperation, check_read_cancelled, check_read_memory,
+    with_read_operation,
+};
 pub use stats::{
     ColumnChunkStat, ColumnChunkStats, DEFAULT_STATS_MAX_BYTES, DEFAULT_STATS_MIN_DENSITY,
     FileColumnStats, SpliceableStats, StatValue, validate_spliceable,

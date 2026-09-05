@@ -1087,12 +1087,10 @@ async fn partition_vix_files_by_row_order(
                 file.meta.index_generation,
                 file.meta.index_size,
             );
-            if let Some(reader) = crate::vix::reader_cache::GLOBAL_CACHE.get(&reader_key) {
-                let class = classify_vix_order(
-                    reader.row_order().is_ts_desc(),
-                    reader.ts_desc_row_ranges().map(|r| r.len()),
-                    reader.zone_chunks().is_some(),
-                );
+            if let Some((is_ts_desc, ts_desc_range_count, has_zone_chunks)) =
+                crate::vix::reader_cache::GLOBAL_CACHE.ordering(&reader_key)
+            {
+                let class = classify_vix_order(is_ts_desc, ts_desc_range_count, has_zone_chunks);
                 memo_vix_row_order(&file.key, class);
                 return (file, class);
             }
@@ -1107,7 +1105,6 @@ async fn partition_vix_files_by_row_order(
                 &file.key,
                 size,
                 handle,
-                None,
             ));
             let key = file.key.clone();
             let verdict = tokio::task::spawn_blocking(move || {

@@ -98,12 +98,13 @@ pub struct ColumnBound {
 use crate::{
     container::{
         BlobHandle, PROP_COLUMNS, PROP_ROW_COUNT, PROP_ROW_GROUP_SIZE, PROP_ROW_ORDER,
-        PROP_ZONE_MAP, RowOrder, RowSelection, VixContainer, blob_arrow_schema, parse_container,
-        parse_container_ranged, require_supported_data_format, scan_blob_encoded_chunks,
-        scan_blob_streaming,
+        PROP_ZONE_MAP, RowOrder, RowSelection, VixContainer, blob_arrow_schema_owned,
+        parse_container, parse_container_ranged, require_supported_data_format,
+        scan_blob_encoded_chunks, scan_blob_streaming,
     },
     error::{Result, VixError},
-    source::VixRangeSource,
+    reader::{RETAINED_BYTES_OVERHEAD, ReaderMemory, schema_memory_size, stats_memory_size},
+    source::{VixRangeSource, compact_bytes, current_reader_memory, enter_reader_memory},
     stats::SpliceableStats,
     writer::TIMESTAMP_COL_NAME,
 };
@@ -415,7 +416,6 @@ impl CandidateHeap {
 /// Scan handle over the `docs` blob of one `.vix` core file — held fully
 /// in memory or fetched by ranges on demand. Opening parses the puffin
 /// footer and the blob's arrow schema only.
-#[derive(Debug)]
 pub struct VixDocs {
     row_count: u64,
     row_group_size: usize,
@@ -455,6 +455,27 @@ pub struct VixDocs {
     /// (`columns_complete` property) — the license for absent-column file
     /// pruning. `false` when absent (fail-open).
     columns_complete: bool,
+    /// One ownership domain for retained bytes and concurrent metadata opens.
+    memory: Arc<ReaderMemory>,
+}
+
+impl std::fmt::Debug for VixDocs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VixDocs")
+            .field("row_count", &self.row_count)
+            .field("row_group_size", &self.row_group_size)
+            .field("docs_blob", &self.docs_blob)
+            .field("schema", &self.schema)
+            .field("row_order", &self.row_order)
+            .field("zone_ts_bounds", &self.zone_ts_bounds)
+            .field("column_presence", &self.column_presence)
+            .field("stats_blob", &self.stats_blob)
+            .field("row_regions", &self.row_regions)
+            .field("zone_chunks", &self.zone_chunks)
+            .field("decoded_stats", &self.decoded_stats)
+            .field("columns_complete", &self.columns_complete)
+            .finish()
+    }
 }
 
 impl VixDocs {
@@ -469,8 +490,12 @@ impl VixDocs {
     /// they touch. Blocks on fetches — call from a blocking thread, never
     /// on an async executor.
     pub fn open_ranged(source: Arc<dyn VixRangeSource>) -> anyhow::Result<Self> {
+        let memory = Arc::new(ReaderMemory::new());
+        let _scope = enter_reader_memory(Arc::clone(&memory));
+        let _pending =
+            memory.reserve(std::mem::size_of::<Self>().saturating_add(source.retained_bytes()))?;
         let container = parse_container_ranged(&source)?;
-        Ok(Self::from_container(container)?)
+        Ok(Self::from_container(container, false)?)
     }
 
     /// Open a data-only docs reader with the built-in compact tail probe.
@@ -480,19 +505,39 @@ impl VixDocs {
     /// object has no such tail-resident index payload, so fetching more than
     /// the default footer probe only adds cold-read amplification.
     pub fn open_ranged_data_only(source: Arc<dyn VixRangeSource>) -> anyhow::Result<Self> {
+        let memory = Arc::new(ReaderMemory::new());
+        let _scope = enter_reader_memory(Arc::clone(&memory));
+        let _pending =
+            memory.reserve(std::mem::size_of::<Self>().saturating_add(source.retained_bytes()))?;
         let container = crate::container::parse_container_ranged_with_tail(
             &source,
             crate::container::DEFAULT_TAIL_FETCH_BYTES,
         )?;
-        Ok(Self::from_container(container)?)
+        Ok(Self::from_container(container, false)?)
     }
 
     fn open_inner(data: Bytes) -> Result<Self> {
+        let memory = Arc::new(ReaderMemory::new());
+        let _scope = enter_reader_memory(Arc::clone(&memory));
+        // A shared slice may need a compact copy. Retain the complete input
+        // owner before the Puffin parser or native schema allocates anything.
+        let pending = memory.reserve(
+            data.len()
+                .saturating_mul(2)
+                .saturating_add(RETAINED_BYTES_OVERHEAD),
+        )?;
+        let data = compact_bytes(data);
+        memory.add(data.len().saturating_add(RETAINED_BYTES_OVERHEAD));
+        drop(pending);
         let container = parse_container(&data)?;
-        Self::from_container(container)
+        Self::from_container(container, true)
     }
 
-    fn from_container(container: VixContainer) -> Result<Self> {
+    fn from_container(mut container: VixContainer, whole_object: bool) -> Result<Self> {
+        let memory = current_reader_memory();
+        // Property-derived tables and native schema coexist with the cold
+        // envelope. Transfer their ownership before releasing its admission.
+        let _envelope = container.pending_memory.take();
         let properties = &container.properties;
         require_supported_data_format(properties)?;
         let row_count: u64 = properties
@@ -553,9 +598,46 @@ impl VixDocs {
         let docs_blob = container
             .docs
             .ok_or_else(|| VixError::Malformed("missing docs blob".to_string()))?;
-        // Footer/dtype only — on a ranged blob this fetches (and caches)
-        // the docs-blob Vortex footer; the scans reuse it.
-        let schema = Arc::new(blob_arrow_schema(&docs_blob)?);
+        let stats_blob = container.stats;
+        let mut retained = std::mem::size_of::<Self>()
+            + column_presence.capacity() * std::mem::size_of::<(String, Option<u64>)>()
+            + column_presence
+                .iter()
+                .map(|(name, _)| name.capacity())
+                .sum::<usize>()
+            + row_regions
+                .as_ref()
+                .map_or(0, |rows| rows.capacity() * std::mem::size_of::<u64>())
+            + zone_chunks.as_ref().map_or(0, |chunks| {
+                chunks.capacity() * std::mem::size_of::<crate::reader::ZoneChunk>()
+            });
+        let mut source_identity = None;
+        for blob in [Some(&docs_blob), stats_blob.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            match blob {
+                BlobHandle::Mem(bytes) if !whole_object => {
+                    retained += bytes.len() + RETAINED_BYTES_OVERHEAD;
+                }
+                BlobHandle::Mem(_) => {}
+                BlobHandle::Ranged(blob) => {
+                    let identity = Arc::as_ptr(&blob.source) as *const () as usize;
+                    if source_identity != Some(identity) {
+                        retained += blob.source.retained_bytes();
+                        source_identity = Some(identity);
+                    }
+                    blob.track_memory(Arc::clone(&memory));
+                }
+            }
+        }
+        memory.add(retained);
+        // Keep the native layout workspace alive until its Arrow schema has
+        // been published, and charge subsequent opens to the same tracker.
+        let (schema, _opening) = blob_arrow_schema_owned(&docs_blob)?;
+        let schema = Arc::new(schema);
+        memory.add(schema_memory_size(&schema));
+        let _admitted = memory.reserve(0)?;
         Ok(Self {
             row_count,
             row_group_size,
@@ -564,12 +646,20 @@ impl VixDocs {
             row_order,
             zone_ts_bounds,
             column_presence,
-            stats_blob: container.stats,
+            stats_blob,
             row_regions,
             zone_chunks,
             decoded_stats: std::sync::OnceLock::new(),
             columns_complete,
+            memory,
         })
+    }
+
+    fn enter_read(&self) -> Result<crate::source::ReaderMemoryScope> {
+        let scope = enter_reader_memory(Arc::clone(&self.memory));
+        // Includes retained ownership even when the operation returns without IO.
+        self.memory.reserve(0)?;
+        Ok(scope)
     }
 
     /// Per-column present-row counts (`columns` property; `None` count =
@@ -592,9 +682,23 @@ impl VixDocs {
     /// empty file) — such an input cannot feed a stats-preserving
     /// passthrough and must decode.
     pub fn spliceable_stats(&self) -> anyhow::Result<Option<SpliceableStats>> {
+        let _scope = self.enter_read()?;
         let Some(blob) = &self.stats_blob else {
             return Ok(None);
         };
+        let presence_bytes = self.column_presence.capacity()
+            * std::mem::size_of::<(String, Option<u64>)>()
+            + self
+                .column_presence
+                .iter()
+                .map(|(name, _)| name.capacity())
+                .sum::<usize>();
+        let _pending = self.memory.reserve(
+            crate::container::metadata_memory_bound(
+                usize::try_from(blob.len()).unwrap_or(usize::MAX),
+            )
+            .saturating_add(presence_bytes),
+        )?;
         let bytes = blob.bytes()?;
         let chunks = crate::stats::decode_stats_blob(&bytes)?;
         Ok(Some(SpliceableStats {
@@ -679,6 +783,7 @@ impl VixDocs {
         limit: usize,
         ascend: bool,
     ) -> anyhow::Result<Option<Vec<(i64, u32)>>> {
+        let _scope = self.enter_read()?;
         use arrow::datatypes::DataType;
 
         let Ok(field) = self.schema.field_with_name(column) else {
@@ -786,6 +891,7 @@ impl VixDocs {
         num_buckets: usize,
         ts_offset: i64,
     ) -> anyhow::Result<Option<Vec<u64>>> {
+        let _scope = self.enter_read()?;
         use arrow::datatypes::DataType;
 
         let Ok(field) = self.schema.field_with_name(column) else {
@@ -833,6 +939,7 @@ impl VixDocs {
     /// predicate column is needed and the result stays constant-memory.
     /// `Ok(None)` means the native column is absent or not string-family.
     pub fn eq_string_count(&self, column: &str, needle: &str) -> anyhow::Result<Option<u64>> {
+        let _scope = self.enter_read()?;
         use arrow::datatypes::DataType;
 
         let Ok(field) = self.schema.field_with_name(column) else {
@@ -858,26 +965,36 @@ impl VixDocs {
     /// The decoded per-column chunk-stats table (`stats` blob), fetched and
     /// parsed once per open handle. `None` = no blob / undecodable
     /// (fail-open: no per-column chunk pruning).
-    fn chunk_stats(&self) -> Option<&crate::stats::FileColumnStats> {
-        self.decoded_stats
-            .get_or_init(|| {
-                let blob = self.stats_blob.as_ref()?;
-                let bytes = match blob.bytes() {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        log::debug!("vix: stats blob unreadable, no chunk pruning: {e}");
-                        return None;
-                    }
-                };
-                match crate::stats::decode_stats_blob(&bytes) {
-                    Ok(stats) => Some(stats),
-                    Err(e) => {
-                        log::debug!("vix: stats blob undecodable, no chunk pruning: {e}");
-                        None
-                    }
-                }
-            })
-            .as_ref()
+    fn chunk_stats(&self) -> Result<Option<&crate::stats::FileColumnStats>> {
+        let _scope = self.enter_read()?;
+        if let Some(stats) = self.decoded_stats.get() {
+            return Ok(stats.as_ref());
+        }
+        let Some(blob) = self.stats_blob.as_ref() else {
+            return Ok(None);
+        };
+        let _pending = self
+            .memory
+            .reserve(crate::container::metadata_memory_bound(
+                usize::try_from(blob.len()).unwrap_or(usize::MAX),
+            ))?;
+        // IO, admission and cancellation are operation-local: never publish
+        // absence after a failed attempt and poison later healthy scans.
+        let bytes = blob.bytes()?;
+        let stats = match crate::stats::decode_stats_blob(&bytes) {
+            Ok(stats) => Some(stats),
+            Err(e) => {
+                log::debug!("vix: stats blob undecodable, no chunk pruning: {e}");
+                None
+            }
+        };
+        crate::check_read_cancelled()?;
+        let size = stats.as_ref().map_or(0, stats_memory_size);
+        if self.decoded_stats.set(stats).is_ok() {
+            self.memory.add(size);
+            self.memory.notify();
+        }
+        Ok(self.decoded_stats.get().and_then(Option::as_ref))
     }
 
     /// #51c-c: exact file-level `_timestamp` bounds `(min, max)` derived
@@ -909,6 +1026,7 @@ impl VixDocs {
     /// total_leaf_segment_bytes)` from the docs blob's vortex footer — the
     /// storage-side width diagnostic.
     pub fn leaf_report(&self) -> anyhow::Result<Vec<(String, u64, u64)>> {
+        let _scope = self.enter_read()?;
         use vortex::{
             VortexSessionDefault,
             io::{
@@ -921,7 +1039,7 @@ impl VixDocs {
         let runtime = SingleThreadRuntime::default();
         let session = VortexSession::default().with_handle(runtime.handle());
         let vxf = crate::container::open_blob(&runtime, &session, &self.docs_blob)
-            .map_err(|e| anyhow::anyhow!("open docs blob: {e}"))?;
+            .map_err(|e| anyhow::Error::new(e).context("open docs blob"))?;
         let footer = vxf.footer();
         let segmap = footer.segment_map().clone();
         let root = footer.layout().clone();
@@ -956,6 +1074,7 @@ impl VixDocs {
         column: &str,
         take_n: usize,
     ) -> anyhow::Result<Vec<String>> {
+        let _scope = self.enter_read()?;
         let mut out = Vec::new();
         let mut seen = 0usize;
         let column = column.to_string();
@@ -1006,6 +1125,7 @@ impl VixDocs {
     /// leaf segments within the DOCS BLOB (add the blob's container offset
     /// for file-absolute positions — Mem handles are blob-relative anyway).
     pub fn column_leaf_extents(&self, column: &str) -> anyhow::Result<Vec<(u64, u64)>> {
+        let _scope = self.enter_read()?;
         use vortex::{
             VortexSessionDefault,
             io::{
@@ -1018,7 +1138,7 @@ impl VixDocs {
         let runtime = SingleThreadRuntime::default();
         let session = VortexSession::default().with_handle(runtime.handle());
         let vxf = crate::container::open_blob(&runtime, &session, &self.docs_blob)
-            .map_err(|e| anyhow::anyhow!("open docs blob: {e}"))?;
+            .map_err(|e| anyhow::Error::new(e).context("open docs blob"))?;
         let footer = vxf.footer();
         let segmap = footer.segment_map().clone();
         let root = footer.layout().clone();
@@ -1050,6 +1170,7 @@ impl VixDocs {
     /// m25 worktree instrumentation: the vortex layout tree of one docs
     /// column (encodings + segment sizes), for the storage-bloat diagnosis.
     pub fn column_layout_tree(&self, column: &str) -> anyhow::Result<String> {
+        let _scope = self.enter_read()?;
         use vortex::{
             VortexSessionDefault,
             io::{
@@ -1061,7 +1182,7 @@ impl VixDocs {
         let runtime = SingleThreadRuntime::default();
         let session = VortexSession::default().with_handle(runtime.handle());
         let vxf = crate::container::open_blob(&runtime, &session, &self.docs_blob)
-            .map_err(|e| anyhow::anyhow!("open docs blob: {e}"))?;
+            .map_err(|e| anyhow::Error::new(e).context("open docs blob"))?;
         let root = vxf.footer().layout().clone();
         let names: Vec<std::sync::Arc<str>> = root.child_names().collect();
         let children = root
@@ -1116,6 +1237,7 @@ impl VixDocs {
         decode_threads: usize,
         on_batch: &mut dyn FnMut(RecordBatch) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
+        let _scope = self.enter_read()?;
         let selection = rows.map(|mut rows| {
             rows.sort_unstable();
             rows.dedup();
@@ -1143,6 +1265,7 @@ impl VixDocs {
         decode_threads: usize,
         on_batch: &mut dyn FnMut(RecordBatch) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
+        let _scope = self.enter_read()?;
         let names: Option<Vec<&str>> =
             projection.map(|cols| cols.iter().map(String::as_str).collect());
         if let Some(names) = names.as_deref() {
@@ -1194,7 +1317,7 @@ impl VixDocs {
         // vortex statistics. Point reads (index row selections) skip it:
         // vortex only touches the selected rows' chunks anyway.
         let pruned = if rows.is_none() {
-            self.pruned_scan_ranges(ts_range, bounds)
+            self.pruned_scan_ranges_inner(ts_range, bounds)?
         } else {
             None
         };
@@ -1273,6 +1396,7 @@ impl VixDocs {
         range: std::ops::Range<u64>,
         on_batch: &mut dyn FnMut(RecordBatch) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
+        let _scope = self.enter_read()?;
         let names: Option<Vec<&str>> =
             projection.map(|cols| cols.iter().map(String::as_str).collect());
         if let Some(names) = names.as_deref() {
@@ -1335,10 +1459,11 @@ impl VixDocs {
         bounds: &[ColumnBound],
         threads: usize,
     ) -> anyhow::Result<Option<Vec<u64>>> {
+        let _scope = self.enter_read()?;
         if self.row_count == 0 {
             return Ok(Some(Vec::new()));
         }
-        let ranges = match self.pruned_scan_ranges(ts_range, bounds) {
+        let ranges = match self.pruned_scan_ranges_inner(ts_range, bounds)? {
             Some(ranges) if ranges.is_empty() => return Ok(Some(Vec::new())),
             Some(ranges) => ranges,
             None => vec![0..self.row_count],
@@ -1366,10 +1491,20 @@ impl VixDocs {
                     .map(|group| {
                         let blob = &self.docs_blob;
                         let budget = &budget;
+                        let operation = crate::source::current_read_operation();
                         scope.spawn(move || {
-                            crate::container::eq_string_rows_ranges(
-                                blob, column, needle, group, budget,
-                            )
+                            let _scope = enter_reader_memory(Arc::clone(&self.memory));
+                            let read = || {
+                                crate::container::eq_string_rows_ranges(
+                                    blob, column, needle, group, budget,
+                                )
+                            };
+                            match operation {
+                                Some(operation) => {
+                                    crate::source::with_read_operation(operation, read)
+                                }
+                                None => read(),
+                            }
                         })
                     })
                     .collect();
@@ -1464,12 +1599,31 @@ impl VixDocs {
         ts_range: Option<(i64, i64)>,
         bounds: &[ColumnBound],
     ) -> Option<Vec<std::ops::Range<u64>>> {
+        // The public pruning hint is intentionally infallible. Read paths use
+        // the fallible variant so typed budget/cancellation errors survive.
+        self.pruned_scan_ranges_inner(ts_range, bounds)
+            .ok()
+            .flatten()
+    }
+
+    fn pruned_scan_ranges_inner(
+        &self,
+        ts_range: Option<(i64, i64)>,
+        bounds: &[ColumnBound],
+    ) -> Result<Option<Vec<std::ops::Range<u64>>>> {
+        let _scope = self.enter_read()?;
         if ts_range.is_none() && bounds.is_empty() {
-            return None;
+            return Ok(None);
         }
-        let zone = self.zone_chunks()?;
+        let Some(zone) = self.zone_chunks() else {
+            return Ok(None);
+        };
         // per-bound stats tables, validated to align 1:1 with the zone table
-        let stats = self.chunk_stats();
+        let stats = if bounds.is_empty() {
+            None
+        } else {
+            self.chunk_stats()?
+        };
         let tables: Vec<Option<&crate::stats::ColumnChunkStats>> = bounds
             .iter()
             .map(|bound| {
@@ -1479,7 +1633,7 @@ impl VixDocs {
             })
             .collect();
         if ts_range.is_none() && tables.iter().all(Option::is_none) {
-            return None; // no basis beyond the zone table itself
+            return Ok(None); // no basis beyond the zone table itself
         }
 
         let mut ranges: Vec<std::ops::Range<u64>> = Vec::new();
@@ -1510,9 +1664,9 @@ impl VixDocs {
             }
         }
         if !pruned_any {
-            return None; // everything survives: keep the single full scan
+            return Ok(None); // everything survives: keep the single full scan
         }
-        Some(ranges)
+        Ok(Some(ranges))
     }
 
     /// §6.2 piecewise-ordered read (M4): stream the selected rows in GLOBAL
@@ -1547,6 +1701,7 @@ impl VixDocs {
         on_region_open: &mut dyn FnMut() -> anyhow::Result<()>,
         on_batch: &mut dyn FnMut(RecordBatch) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
+        let _scope = self.enter_read()?;
         let selection = rows.map(|mut rows| {
             rows.sort_unstable();
             rows.dedup();
@@ -1574,6 +1729,7 @@ impl VixDocs {
         on_region_open: &mut dyn FnMut() -> anyhow::Result<()>,
         on_batch: &mut dyn FnMut(RecordBatch) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
+        let _scope = self.enter_read()?;
         use std::cmp::Reverse;
 
         let regions = self.ts_desc_row_ranges().ok_or_else(|| {
@@ -1625,7 +1781,7 @@ impl VixDocs {
             Selection(Selection, Option<std::ops::Range<u64>>),
         }
         let pruned = if rows.is_none() {
-            self.pruned_scan_ranges(ts_range, bounds)
+            self.pruned_scan_ranges_inner(ts_range, bounds)?
         } else {
             None
         };
@@ -1858,13 +2014,17 @@ impl VixDocs {
                         let region_work = cursor.work.take().expect("unopened cursor has work");
                         let scan_projection = scan_projection.clone();
                         let filter = filter.clone();
+                        let operation = crate::source::current_read_operation();
                         scope.spawn(move || {
-                            let names: Option<Vec<&str>> = scan_projection
-                                .as_ref()
-                                .map(|cols| cols.iter().map(String::as_str).collect());
-                            let run =
-                                |selection: RowSelection,
-                                 tx: &std::sync::mpsc::SyncSender<anyhow::Result<RecordBatch>>|
+                            let _scope = enter_reader_memory(Arc::clone(&self.memory));
+                            let read = || {
+                                let names: Option<Vec<&str>> = scan_projection
+                                    .as_ref()
+                                    .map(|cols| cols.iter().map(String::as_str).collect());
+                                let run = |selection: RowSelection,
+                                           tx: &std::sync::mpsc::SyncSender<
+                                    anyhow::Result<RecordBatch>,
+                                >|
                                  -> anyhow::Result<()> {
                                     scan_blob_streaming(
                                         docs_blob,
@@ -1883,21 +2043,30 @@ impl VixDocs {
                                     )?;
                                     Ok(())
                                 };
-                            let result = match region_work {
-                                RegionWork::Ranges(ranges) => ranges
-                                    .into_iter()
-                                    .try_for_each(|range| run(RowSelection::Range(range), &tx)),
-                                RegionWork::Selection(selection, range) => run(
-                                    match range {
-                                        Some(range) => RowSelection::VortexRange(selection, range),
-                                        None => RowSelection::Vortex(selection),
-                                    },
-                                    &tx,
-                                ),
+                                let result = match region_work {
+                                    RegionWork::Ranges(ranges) => ranges
+                                        .into_iter()
+                                        .try_for_each(|range| run(RowSelection::Range(range), &tx)),
+                                    RegionWork::Selection(selection, range) => run(
+                                        match range {
+                                            Some(range) => {
+                                                RowSelection::VortexRange(selection, range)
+                                            }
+                                            None => RowSelection::Vortex(selection),
+                                        },
+                                        &tx,
+                                    ),
+                                };
+                                if let Err(e) = result {
+                                    // consumer may be gone (limit/cancel): ignore
+                                    let _ = tx.send(Err(e));
+                                }
                             };
-                            if let Err(e) = result {
-                                // consumer may be gone (limit/cancel): ignore
-                                let _ = tx.send(Err(e));
+                            match operation {
+                                Some(operation) => {
+                                    crate::source::with_read_operation(operation, read)
+                                }
+                                None => read(),
                             }
                         });
                         cursor.rx = Some(rx);
@@ -1974,6 +2143,7 @@ impl VixDocs {
         &self,
         on_chunk: &mut dyn FnMut(EncodedDocsChunk) -> anyhow::Result<()>,
     ) -> anyhow::Result<u64> {
+        let _scope = self.enter_read()?;
         let canonicalized = scan_blob_encoded_chunks(&self.docs_blob, &mut |array, rows| {
             on_chunk(EncodedDocsChunk { array, rows }).map_err(VixError::Callback)
         })?;
@@ -1994,6 +2164,7 @@ impl VixDocs {
         hasher: &mut crate::BloomOnlyHasher,
         field: &str,
     ) -> anyhow::Result<crate::BloomEncodingCensus> {
+        let _scope = self.enter_read()?;
         let Some(mut sink) = hasher.raw_sink(field) else {
             return Ok(crate::BloomEncodingCensus::default());
         };
@@ -2011,6 +2182,7 @@ impl VixDocs {
     /// prune (no stats, non-numeric, or unknown column). A predicate that
     /// cannot match within these bounds may skip the WHOLE file.
     pub fn column_stats(&self, column: &str) -> anyhow::Result<Option<(NumScalar, NumScalar)>> {
+        let _scope = self.enter_read()?;
         Ok(crate::container::blob_column_stats(
             &self.docs_blob,
             column,
@@ -2208,5 +2380,414 @@ pub fn cmp_i128_vs_f64(a: i128, b: f64) -> Option<std::cmp::Ordering> {
             }
         }
         other => Some(other),
+    }
+}
+
+#[cfg(test)]
+mod memory_regressions {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use arrow::{
+        array::{Int64Array, StringArray},
+        datatypes::{DataType, Field, Schema},
+    };
+    use futures::{FutureExt, future::BoxFuture};
+
+    use super::*;
+    use crate::source::{VixReadOperation, with_read_operation};
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("docs ownership admission refused")]
+    struct OwnershipDenied;
+
+    struct Budget {
+        limit: usize,
+        peak: AtomicUsize,
+        cancelled: AtomicBool,
+    }
+
+    impl Budget {
+        fn new(limit: usize) -> Arc<Self> {
+            Arc::new(Self {
+                limit,
+                peak: AtomicUsize::new(0),
+                cancelled: AtomicBool::new(false),
+            })
+        }
+
+        fn peak(&self) -> usize {
+            self.peak.load(Ordering::Acquire)
+        }
+    }
+
+    impl VixReadOperation for Budget {
+        fn is_cancelled(&self) -> bool {
+            self.cancelled.load(Ordering::Acquire)
+        }
+
+        fn check_memory(&self, bytes: usize) -> Result<()> {
+            self.peak.fetch_max(bytes, Ordering::AcqRel);
+            if bytes > self.limit {
+                Err(VixError::Callback(OwnershipDenied.into()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    struct Source {
+        data: Bytes,
+        footer_start: u64,
+        native_reads: AtomicUsize,
+    }
+
+    impl Source {
+        fn new(data: Bytes) -> Arc<Self> {
+            let footer_start = data.len()
+                - puffin_payload(&data)
+                - puffin::FOOTER_SIZE as usize
+                - puffin::MAGIC_SIZE as usize;
+            Arc::new(Self {
+                data,
+                footer_start: footer_start as u64,
+                native_reads: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    impl VixRangeSource for Source {
+        fn len(&self) -> u64 {
+            self.data.len() as u64
+        }
+
+        fn retained_bytes(&self) -> usize {
+            self.data.len() + std::mem::size_of::<Self>() + RETAINED_BYTES_OVERHEAD
+        }
+
+        fn fetch(&self, range: std::ops::Range<u64>) -> BoxFuture<'static, anyhow::Result<Bytes>> {
+            if range.start < self.footer_start {
+                self.native_reads.fetch_add(1, Ordering::AcqRel);
+            }
+            futures::future::ready(Ok(self
+                .data
+                .slice(range.start as usize..range.end as usize)))
+            .boxed()
+        }
+    }
+
+    fn puffin_payload(data: &[u8]) -> usize {
+        let trailer = data.len() - puffin::FOOTER_SIZE as usize;
+        u32::from_le_bytes(data[trailer..trailer + 4].try_into().unwrap()) as usize
+    }
+
+    fn fixture() -> Bytes {
+        let schema = Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, false),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![
+                Arc::new(Int64Array::from_iter_values((1..=256).rev())),
+                Arc::new(StringArray::from(vec!["needle"; 256])),
+            ],
+        )
+        .unwrap();
+        let mut writer = crate::VixWriter::new(
+            &schema,
+            crate::VixWriterOptions {
+                encode_threads: 1,
+                docs_chunk_max_rows: 64,
+                ..Default::default()
+            },
+            false,
+        );
+        writer
+            .push_batch_with_source(&batch, &StringArray::from(vec!["{}"; 256]), None)
+            .unwrap();
+        let (data, _) = writer.finish().unwrap();
+        let container = parse_container(&Bytes::from(data)).unwrap();
+        let mut properties: Vec<_> = container.properties.into_iter().collect();
+        // Keep the native blobs outside the eager tail, so their first read
+        // is distinguishable from the two cold Puffin-envelope fetches.
+        properties.push(("padding".to_string(), "x".repeat(128 * 1024)));
+        let mut blobs = vec![(
+            crate::container::BLOB_TYPE_DOCS,
+            crate::container::BLOB_TAG_DOCS,
+            container.docs.unwrap().bytes().unwrap().to_vec(),
+        )];
+        if let Some(stats) = container.stats {
+            blobs.push((
+                crate::container::BLOB_TYPE_STATS,
+                crate::container::BLOB_TAG_STATS,
+                stats.bytes().unwrap().to_vec(),
+            ));
+        }
+        crate::container::build_container(properties, blobs)
+            .unwrap()
+            .into()
+    }
+
+    fn open(mode: usize, data: Bytes) -> VixDocs {
+        match mode {
+            0 => VixDocs::open(data),
+            1 => VixDocs::open_ranged(Source::new(data)),
+            _ => VixDocs::open_ranged_data_only(Source::new(data)),
+        }
+        .unwrap()
+    }
+
+    fn assert_denied(error: anyhow::Error) {
+        assert!(
+            error.chain().any(|cause| cause.is::<OwnershipDenied>()),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn cached_docs_admit_whole_input_and_envelope_together_before_parse() {
+        let data = fixture();
+        let input = data.len();
+        let metadata = crate::container::metadata_memory_bound(puffin_payload(&data));
+        let limit = input.max(metadata) + 1;
+        assert!(limit > input && limit > metadata && limit < input + metadata);
+        // Corrupt the first JSON byte without changing its advertised size.
+        // A typed admission error, rather than malformed JSON, proves refusal
+        // happened before the metadata parser allocated its output.
+        let mut corrupt = data.to_vec();
+        let payload_start = corrupt.len() - puffin::FOOTER_SIZE as usize - puffin_payload(&corrupt);
+        corrupt[payload_start] = b'!';
+        assert_denied(
+            with_read_operation(Budget::new(limit), || VixDocs::open(corrupt.into())).unwrap_err(),
+        );
+        assert_denied(
+            with_read_operation(Budget::new(limit), || VixDocs::open(data.clone())).unwrap_err(),
+        );
+
+        let adequate = Budget::new(64 * 1024 * 1024);
+        let docs = with_read_operation(adequate.clone(), || VixDocs::open(data)).unwrap();
+        assert_eq!(docs.eq_string_count("value", "needle").unwrap(), Some(256));
+        assert!(adequate.peak() > input + metadata);
+    }
+
+    #[test]
+    fn ranged_docs_keep_cold_envelope_admitted_through_native_open() {
+        let data = fixture();
+        for data_only in [false, true] {
+            let source = Source::new(data.clone());
+            let dynamic: Arc<dyn VixRangeSource> = source.clone();
+            let envelope = Budget::new(usize::MAX);
+            with_read_operation(envelope.clone(), || {
+                let memory = Arc::new(ReaderMemory::new());
+                let _scope = enter_reader_memory(Arc::clone(&memory));
+                let _source = memory
+                    .reserve(std::mem::size_of::<VixDocs>() + dynamic.retained_bytes())
+                    .unwrap();
+                let _container = crate::container::parse_container_ranged_with_tail(
+                    &dynamic,
+                    crate::container::DEFAULT_TAIL_FETCH_BYTES,
+                )
+                .unwrap();
+            });
+            let native = Budget::new(usize::MAX);
+            let container = crate::container::parse_container_ranged_with_tail(
+                &dynamic,
+                crate::container::DEFAULT_TAIL_FETCH_BYTES,
+            )
+            .unwrap();
+            let blob = container.docs.unwrap();
+            drop(container.pending_memory);
+            with_read_operation(native.clone(), || {
+                let memory = Arc::new(ReaderMemory::new());
+                let _scope = enter_reader_memory(memory);
+                let (_schema, _opening) = blob_arrow_schema_owned(&blob).unwrap();
+            });
+            let (n, m) = (envelope.peak(), native.peak());
+            let limit = n.max(m) + 1;
+            assert!(limit > n && limit > m && limit < n + m);
+            source.native_reads.store(0, Ordering::Release);
+            let error = with_read_operation(Budget::new(limit), || {
+                if data_only {
+                    VixDocs::open_ranged_data_only(dynamic.clone())
+                } else {
+                    VixDocs::open_ranged(dynamic.clone())
+                }
+            })
+            .unwrap_err();
+            assert_denied(error);
+            assert_eq!(
+                source.native_reads.load(Ordering::Acquire),
+                0,
+                "native metadata was fetched before overlapping ownership was admitted"
+            );
+
+            let docs = with_read_operation(Budget::new(64 * 1024 * 1024), || {
+                if data_only {
+                    VixDocs::open_ranged_data_only(dynamic)
+                } else {
+                    VixDocs::open_ranged(dynamic)
+                }
+            })
+            .unwrap();
+            assert_eq!(docs.eq_string_count("value", "needle").unwrap(), Some(256));
+        }
+    }
+
+    #[test]
+    fn docs_cached_metadata_refusal_and_cancellation_do_not_poison_later_operations() {
+        let data = fixture();
+        for mode in 0..3 {
+            let docs = open(mode, data.clone());
+            let baseline = Budget::new(usize::MAX);
+            assert_eq!(
+                with_read_operation(baseline.clone(), || docs
+                    .eq_string_count("missing", "needle"))
+                .unwrap(),
+                None
+            );
+            assert_denied(
+                with_read_operation(Budget::new(baseline.peak() - 1), || {
+                    docs.eq_string_count("missing", "needle")
+                })
+                .unwrap_err(),
+            );
+            let cancelled = Budget::new(usize::MAX);
+            cancelled.cancelled.store(true, Ordering::Release);
+            let error =
+                with_read_operation(cancelled, || docs.eq_string_count("missing", "needle"))
+                    .unwrap_err();
+            assert!(error.chain().any(|cause| matches!(
+                cause.downcast_ref::<VixError>(),
+                Some(VixError::Cancelled)
+            )));
+
+            let bound = ColumnBound {
+                column: "value".to_string(),
+                min: Some((BoundValue::Str("z".to_string()), true)),
+                max: None,
+            };
+            assert_denied(
+                with_read_operation(Budget::new(baseline.peak() + 1), || {
+                    docs.pruned_scan_ranges_inner(None, std::slice::from_ref(&bound))
+                })
+                .unwrap_err()
+                .into(),
+            );
+            assert!(docs.decoded_stats.get().is_none());
+            assert_eq!(docs.pruned_scan_ranges(None, &[bound]), Some(Vec::new()));
+            assert_eq!(docs.eq_string_count("value", "needle").unwrap(), Some(256));
+        }
+    }
+
+    #[test]
+    fn docs_repeated_streams_release_native_scratch_instead_of_charging_chunk_history() {
+        let data = fixture();
+        for mode in 0..3 {
+            let docs = open(mode, data.clone());
+            let projection = ["_timestamp".to_string()];
+            let scan = || {
+                let mut rows = 0;
+                docs.scan_docs(Some(&projection), None, None, &mut |batch| {
+                    rows += batch.num_rows();
+                    Ok(())
+                })
+                .unwrap();
+                assert_eq!(rows, 256);
+            };
+            let warm = Budget::new(usize::MAX);
+            with_read_operation(warm.clone(), scan);
+            let repeated = Budget::new(warm.peak() + 1);
+            for _ in 0..24 {
+                with_read_operation(repeated.clone(), scan);
+            }
+            let after = Budget::new(usize::MAX);
+            assert_eq!(
+                with_read_operation(after.clone(), || docs.eq_string_count("missing", "needle"))
+                    .unwrap(),
+                None
+            );
+            assert!(
+                after.peak() < repeated.limit,
+                "scan-local metadata leaked into the reader's retained ownership"
+            );
+        }
+    }
+
+    #[test]
+    fn docs_worker_threads_use_the_callers_ownership_and_cancellation_scope() {
+        let data = fixture();
+        for mode in 0..3 {
+            let docs = open(mode, data.clone());
+            let baseline = Budget::new(usize::MAX);
+            with_read_operation(baseline.clone(), || {
+                docs.eq_string_count("missing", "needle")
+            })
+            .unwrap();
+            assert_denied(
+                with_read_operation(Budget::new(baseline.peak() + 1), || {
+                    docs.eq_string_prepass("value", "absent", None, &[], 4)
+                })
+                .unwrap_err(),
+            );
+            assert_eq!(
+                docs.eq_string_prepass("value", "absent", None, &[], 4)
+                    .unwrap(),
+                Some(Vec::new())
+            );
+
+            let projection = ["_timestamp".to_string()];
+            assert_denied(
+                with_read_operation(Budget::new(baseline.peak() + 1), || {
+                    docs.scan_docs_ts_desc_merged_selection(
+                        Some(&projection),
+                        None,
+                        None,
+                        &[],
+                        None,
+                        &mut || Ok(()),
+                        &mut |_| panic!("refused native metadata must not yield a batch"),
+                    )
+                })
+                .unwrap_err(),
+            );
+            let mut rows = 0;
+            docs.scan_docs_ts_desc_merged_selection(
+                Some(&projection),
+                None,
+                None,
+                &[],
+                None,
+                &mut || Ok(()),
+                &mut |batch| {
+                    rows += batch.num_rows();
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(rows, 256);
+        }
+        let docs = open(0, data);
+        let operation = Budget::new(usize::MAX);
+        let error = with_read_operation(operation.clone(), || {
+            docs.scan_docs_ts_desc_merged_selection(
+                None,
+                None,
+                None,
+                &[],
+                None,
+                &mut || {
+                    // Cancel after parent admission but before the worker opens.
+                    operation.cancelled.store(true, Ordering::Release);
+                    Ok(())
+                },
+                &mut |_| panic!("cancelled worker must not yield a batch"),
+            )
+        })
+        .unwrap_err();
+        assert!(
+            error
+                .chain()
+                .any(|cause| matches!(cause.downcast_ref::<VixError>(), Some(VixError::Cancelled)))
+        );
     }
 }

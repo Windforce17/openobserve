@@ -25,6 +25,9 @@ use thiserror::Error;
 /// Errors produced while building or querying a `.vix` index.
 #[derive(Debug, Error)]
 pub enum VixError {
+    /// The current read operation was cancelled or its deadline expired.
+    #[error("vix read cancelled")]
+    Cancelled,
     /// The container or one of its blobs cannot be decoded.
     #[error("malformed .vix data: {0}")]
     Malformed(String),
@@ -61,10 +64,10 @@ pub enum VixError {
     /// Error while (de)serializing the JSON file properties.
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
-    /// Error surfaced by a caller-supplied scan callback (streaming scans
-    /// abort on the first callback failure and propagate it unchanged).
-    #[error(transparent)]
-    Callback(anyhow::Error),
+    /// Error surfaced by caller-supplied IO or scan callbacks. Preserve the
+    /// original error chain; streaming scans abort on the first failure.
+    #[error("{0}")]
+    Callback(#[source] anyhow::Error),
 }
 
 /// Crate-internal result alias.

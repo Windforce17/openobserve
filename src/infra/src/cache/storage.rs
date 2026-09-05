@@ -134,17 +134,9 @@ impl ObjectStoreExt for CacheFS {
     }
 
     async fn get_range(&self, account: &str, location: &Path, range: Range<u64>) -> Result<Bytes> {
-        if range.start > range.end {
-            return Err(crate::storage::Error::BadRange(location.to_string()).into());
-        }
-        let options = GetOptions {
-            range: Some(range.into()),
-            ..Default::default()
-        };
-        self.get_opts(account, location, options)
+        Ok(get_range_classified(account, location, range, None)
             .await?
-            .bytes()
-            .await
+            .bytes)
     }
 
     async fn get_ranges(
@@ -290,6 +282,185 @@ pub async fn get_ranges(
     DEFAULT.get_ranges(account, location, ranges).await
 }
 
+/// The tier that actually supplied a completed range, not a preflight cache
+/// membership guess (which can race eviction).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RangeSource {
+    Memory,
+    Disk,
+    Remote,
+    /// An arbitrary registered ObjectStore; its internal cache policy is unknown.
+    ObjectStore,
+}
+
+impl RangeSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Memory => "memory",
+            Self::Disk => "disk",
+            Self::Remote => "remote",
+            Self::ObjectStore => "object_store",
+        }
+    }
+}
+
+pub struct RangeRead {
+    pub bytes: Bytes,
+    pub source: RangeSource,
+}
+
+/// Execute one physical range through the same cache ladder as `get_opts`.
+/// Callers that batch/coalesce must admit each physical request themselves.
+pub async fn get_range_classified(
+    account: &str,
+    location: &Path,
+    range: Range<u64>,
+    owner: Option<std::sync::Arc<dyn Send + Sync>>,
+) -> Result<RangeRead> {
+    if range.start > range.end {
+        return Err(crate::storage::Error::BadRange(location.to_string()).into());
+    }
+    let max_bytes = range.end - range.start;
+    let file = location.as_ref();
+    let options = GetOptions {
+        range: Some(range.into()),
+        ..Default::default()
+    };
+    let cfg = config::get_config();
+    if cfg.memory_cache.enabled
+        && let Ok(result) = file_data::memory::get_opts(file, options.clone()).await
+    {
+        // A cache range is a slice of the whole-file owner. Arrow/Vortex may
+        // retain it long after cache eviction; detach partial hits so a tiny
+        // admitted range cannot keep that entire allocation alive. Metadata,
+        // not Bytes uniqueness, proves whether this is a whole-file hit.
+        let partial = result.range.start != 0 || result.range.end != result.meta.size;
+        let bytes = range_bytes_with_owner(result, owner, max_bytes).await?;
+        return Ok(RangeRead {
+            bytes: if partial {
+                Bytes::copy_from_slice(&bytes)
+            } else {
+                bytes
+            },
+            source: RangeSource::Memory,
+        });
+    }
+    if cfg.disk_cache.enabled
+        && let Ok(result) = file_data::disk::get_opts(file, options.clone()).await
+    {
+        return Ok(RangeRead {
+            bytes: range_bytes_with_owner(result, owner, max_bytes).await?,
+            source: RangeSource::Disk,
+        });
+    }
+    Ok(RangeRead {
+        bytes: range_bytes_with_owner(
+            storage::get_opts(account, file, options).await?,
+            owner,
+            max_bytes,
+        )
+        .await?,
+        source: RangeSource::Remote,
+    })
+}
+
+/// Keep admission alive inside non-preemptible local file IO even if its async
+/// waiter is cancelled. Remote streams remain cancellable by dropping the future.
+pub async fn range_bytes_with_owner(
+    result: GetResult,
+    owner: Option<std::sync::Arc<dyn Send + Sync>>,
+    max_bytes: u64,
+) -> Result<Bytes> {
+    let invalid_body = || object_store::Error::Generic {
+        store: "VIX admitted read",
+        source: Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "range response exceeds its admitted byte length",
+        )),
+    };
+    let limit = result
+        .range
+        .end
+        .checked_sub(result.range.start)
+        .filter(|&len| len <= max_bytes)
+        .and_then(|len| usize::try_from(len).ok())
+        .ok_or_else(invalid_body)?;
+    match result {
+        GetResult {
+            payload: object_store::GetResultPayload::File(mut file, path),
+            range,
+            ..
+        } => {
+            let task = tokio::task::spawn_blocking(move || {
+                use std::io::{Read, Seek, SeekFrom};
+                let _owner = owner;
+                let mut read = || -> std::io::Result<Bytes> {
+                    let len = usize::try_from(range.end - range.start)
+                        .map_err(|_| std::io::Error::other("range exceeds address space"))?;
+                    file.seek(SeekFrom::Start(range.start))?;
+                    let mut bytes = vec![0; len];
+                    file.read_exact(&mut bytes)?;
+                    Ok(Bytes::from(bytes))
+                };
+                read().map_err(|error| object_store::Error::Generic {
+                    store: "VIX admitted file read",
+                    source: Box::new(std::io::Error::new(
+                        error.kind(),
+                        format!("{}: {error}", path.display()),
+                    )),
+                })
+            });
+            struct AbortQueued(tokio::task::AbortHandle);
+            impl Drop for AbortQueued {
+                fn drop(&mut self) {
+                    self.0.abort();
+                }
+            }
+            // Abort prevents a not-yet-running blocking read from starting.
+            // Already-running reads retain `owner` until their actual completion.
+            let _abort_queued = AbortQueued(task.abort_handle());
+            task.await.map_err(|error| object_store::Error::Generic {
+                store: "VIX admitted file read",
+                source: Box::new(error),
+            })?
+        }
+        GetResult {
+            payload: object_store::GetResultPayload::Stream(mut stream),
+            ..
+        } => {
+            let _owner = owner;
+            let Some(first) = stream.next().await.transpose()? else {
+                return Ok(Bytes::new());
+            };
+            if first.len() > limit {
+                return Err(invalid_body());
+            }
+            let Some(second) = stream.next().await.transpose()? else {
+                return Ok(first);
+            };
+            if second.len() > limit - first.len() {
+                return Err(invalid_body());
+            }
+            // Preserve the single-chunk zero-copy path. On multiple chunks,
+            // reserve once and check before every append; Content-Length and
+            // Content-Range are untrusted hints, not permission to grow.
+            let mut bytes = Vec::with_capacity(limit);
+            bytes.extend_from_slice(&first);
+            bytes.extend_from_slice(&second);
+            drop(first);
+            drop(second);
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                if chunk.len() > limit - bytes.len() {
+                    return Err(invalid_body());
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok(Bytes::from(bytes))
+        }
+    }
+}
+
 pub async fn head(account: &str, location: &Path) -> Result<ObjectMeta> {
     DEFAULT.head(account, location).await
 }
@@ -301,6 +472,237 @@ mod tests {
     use bytes::Bytes;
 
     use super::*;
+
+    #[tokio::test]
+    async fn memory_partial_ranges_release_evicted_backing_owners() {
+        use std::sync::{Arc, Weak};
+        // Central cache validation enables this tier; never mutate process-wide
+        // cache configuration underneath concurrently running tests.
+        if !config::get_config().memory_cache.enabled {
+            return;
+        }
+        struct Allocation {
+            data: Vec<u8>,
+            _lifetime: Arc<()>,
+        }
+        impl AsRef<[u8]> for Allocation {
+            fn as_ref(&self) -> &[u8] {
+                &self.data
+            }
+        }
+        fn tracked(value: u8) -> (Bytes, Weak<()>) {
+            let lifetime = Arc::new(());
+            let weak = Arc::downgrade(&lifetime);
+            (
+                Bytes::from_owner(Allocation {
+                    data: vec![value; 64 * 1024],
+                    _lifetime: lifetime,
+                }),
+                weak,
+            )
+        }
+        let path = Path::from("files/vix-memory-owner/logs/stream/2026/09/05/00/range.vxi");
+        let (bytes, partial_owner) = tracked(b'p');
+        file_data::memory::set(path.as_ref(), bytes).await.unwrap();
+        let partial = get_range_classified("unused", &path, 11..15, None)
+            .await
+            .unwrap();
+        assert_eq!(partial.source, RangeSource::Memory);
+        assert_eq!(partial.bytes, Bytes::from_static(b"pppp"));
+        assert!(
+            partial_owner.upgrade().is_some(),
+            "cache still owns the full file"
+        );
+        file_data::memory::remove(path.as_ref()).await.unwrap();
+        assert!(
+            partial_owner.upgrade().is_none(),
+            "partial result retained the evicted whole-file owner"
+        );
+        assert_eq!(partial.bytes, Bytes::from_static(b"pppp"));
+
+        let (bytes, whole_owner) = tracked(b'w');
+        let original = bytes.as_ptr();
+        let size = bytes.len() as u64;
+        file_data::memory::set(path.as_ref(), bytes).await.unwrap();
+        let whole = get_range_classified("unused", &path, 0..size, None)
+            .await
+            .unwrap();
+        assert_eq!(whole.source, RangeSource::Memory);
+        assert_eq!(
+            whole.bytes.as_ptr(),
+            original,
+            "whole-file hits must remain zero-copy"
+        );
+        file_data::memory::remove(path.as_ref()).await.unwrap();
+        assert!(
+            whole_owner.upgrade().is_some(),
+            "whole-file result owns its admitted full allocation"
+        );
+        drop(whole);
+        assert!(whole_owner.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn admitted_stream_rejects_oversized_body_before_reading_more() {
+        let body = futures::stream::iter([
+            Ok(Bytes::from_static(b"12")),
+            Ok(Bytes::from_static(b"345")),
+        ])
+        .chain(futures::stream::once(async {
+            panic!("oversized response must stop before polling additional body");
+        }))
+        .boxed();
+        let result = GetResult {
+            payload: object_store::GetResultPayload::Stream(body),
+            range: 0..4,
+            meta: ObjectMeta {
+                location: Path::from("oversized-response"),
+                last_modified: *BASE_TIME,
+                size: 4,
+                e_tag: None,
+                version: None,
+            },
+            attributes: Default::default(),
+        };
+        assert!(range_bytes_with_owner(result, None, 4).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn admitted_stream_rejects_oversized_range_before_polling_body() {
+        let body = futures::stream::once(async {
+            panic!("unadmitted response metadata must be rejected before polling body");
+        })
+        .boxed();
+        let result = GetResult {
+            payload: object_store::GetResultPayload::Stream(body),
+            range: 0..5,
+            meta: ObjectMeta {
+                location: Path::from("oversized-range"),
+                last_modified: *BASE_TIME,
+                size: 5,
+                e_tag: None,
+                version: None,
+            },
+            attributes: Default::default(),
+        };
+        assert!(range_bytes_with_owner(result, None, 4).await.is_err());
+    }
+
+    #[test]
+    fn dropping_queued_file_read_aborts_it_and_releases_owner() {
+        use std::{
+            io::{Seek, Write},
+            sync::Arc,
+            time::Duration,
+        };
+
+        use futures::FutureExt;
+        struct Owner(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                let _ = self.0.take().unwrap().send(());
+            }
+        }
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"test").unwrap();
+        file.rewind().unwrap();
+        let result = GetResult {
+            payload: object_store::GetResultPayload::File(
+                file.as_file().try_clone().unwrap(),
+                file.path().to_owned(),
+            ),
+            range: 0..4,
+            meta: ObjectMeta {
+                location: Path::from("queued-read"),
+                last_modified: *BASE_TIME,
+                size: 4,
+                e_tag: None,
+                version: None,
+            },
+            attributes: Default::default(),
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let (started, ready) = std::sync::mpsc::channel();
+            let (release, blocked) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started.send(()).unwrap();
+                blocked.recv().unwrap();
+            });
+            ready.recv().unwrap();
+            let (owner, dropped) = tokio::sync::oneshot::channel();
+            let mut read =
+                range_bytes_with_owner(result, Some(Arc::new(Owner(Some(owner)))), 4).boxed();
+            assert!(futures::poll!(&mut read).is_pending());
+            drop(read);
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), dropped)
+                .await
+                .unwrap()
+                .unwrap();
+            // try_clone shares the file cursor. A detached queued read would
+            // have advanced it even though nobody awaited its result.
+            assert_eq!(file.stream_position().unwrap(), 0);
+        });
+    }
+
+    #[tokio::test]
+    async fn classified_ranges_report_the_tier_that_supplied_the_bytes() {
+        use object_store::ObjectStoreExt as _;
+        let org = "vix-range-classification";
+        let account = format!("{org}:default");
+        let path =
+            Path::from("files/vix-range-classification/logs/stream/2026/09/05/00/source.vxi");
+        let remote = object_store::memory::InMemory::new();
+        remote
+            .put(&path, Bytes::from_static(b"remote-value").into())
+            .await
+            .unwrap();
+        storage::add_account(org, Box::new(remote)).await;
+        file_data::memory::remove(path.as_ref()).await.unwrap();
+        file_data::disk::remove(path.as_ref()).await.unwrap();
+
+        let read = get_range_classified(&account, &path, 0..6, None)
+            .await
+            .unwrap();
+        assert_eq!(read.source, RangeSource::Remote);
+        assert_eq!(read.bytes, Bytes::from_static(b"remote"));
+
+        // Exercise enabled production tiers without mutating global config under
+        // concurrent tests. The central cache smoke enables both tiers.
+        if config::get_config().disk_cache.enabled {
+            file_data::disk::set(path.as_ref(), Bytes::from_static(b"disk--value"))
+                .await
+                .unwrap();
+            let read = get_range_classified(&account, &path, 0..6, None)
+                .await
+                .unwrap();
+            assert_eq!(read.source, RangeSource::Disk);
+            assert_eq!(read.bytes, Bytes::from_static(b"disk--"));
+        }
+        if config::get_config().memory_cache.enabled {
+            file_data::memory::set(path.as_ref(), Bytes::from_static(b"memory-value"))
+                .await
+                .unwrap();
+            let read = get_range_classified(&account, &path, 0..6, None)
+                .await
+                .unwrap();
+            assert_eq!(read.source, RangeSource::Memory);
+            assert_eq!(read.bytes, Bytes::from_static(b"memory"));
+        }
+        file_data::memory::remove(path.as_ref()).await.unwrap();
+        file_data::disk::remove(path.as_ref()).await.unwrap();
+        let read = get_range_classified(&account, &path, 0..6, None)
+            .await
+            .unwrap();
+        assert_eq!(read.source, RangeSource::Remote);
+        assert_eq!(read.bytes, Bytes::from_static(b"remote"));
+    }
 
     #[test]
     fn test_cache_fs_display() {
@@ -361,31 +763,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cache_fs_get_with_cache_hit() {
-        let cache_fs = CacheFS {};
-        let location = Path::from("test/file.txt");
-
-        // This test would require setting up cache data first
-        // For now, we test the basic structure
-        let result = cache_fs.get("default", &location).await;
-        // The result depends on whether the file exists in cache or storage
-        // This is a basic test to ensure the function doesn't panic
-        assert!(result.is_ok() || result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_cache_fs_get_opts_with_cache_hit() {
-        let cache_fs = CacheFS {};
-        let location = Path::from("test/file.txt");
-        let options = GetOptions::default();
-
-        let result = cache_fs.get_opts("default", &location, options).await;
-        // The result depends on whether the file exists in cache or storage
-        // This is a basic test to ensure the function doesn't panic
-        assert!(result.is_ok() || result.is_err());
-    }
-
-    #[tokio::test]
     async fn test_cache_fs_get_range_invalid() {
         let cache_fs = CacheFS {};
         let location = Path::from("test/file.txt");
@@ -395,29 +772,6 @@ mod tests {
         assert!(result.is_err());
         // Should return a BadRange error
         assert!(matches!(result.unwrap_err(), Error::Generic { .. }));
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_cache_fs_get_ranges() {
-        let cache_fs = CacheFS {};
-        let location = Path::from("test/file.txt");
-        let ranges = vec![Range { start: 0, end: 10 }, Range { start: 10, end: 20 }];
-
-        let result = cache_fs.get_ranges("default", &location, &ranges).await;
-        // The result depends on whether the file exists in cache
-        // This is a basic test to ensure the function doesn't panic
-        assert!(result.is_ok() || result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_cache_fs_head_with_cache_hit() {
-        let cache_fs = CacheFS {};
-        let location = Path::from("test/file.txt");
-
-        let result = cache_fs.head("default", &location).await;
-        // The result depends on whether the file exists in cache or storage
-        // This is a basic test to ensure the function doesn't panic
-        assert!(result.is_ok() || result.is_err());
     }
 
     #[tokio::test]
@@ -482,87 +836,5 @@ mod tests {
         let result = cache_fs.rename_if_not_exists("default", &from, &to).await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), Error::NotImplemented { .. }));
-    }
-
-    // Test the public functions that use the DEFAULT instance
-    #[tokio::test]
-    async fn test_get_function() {
-        let path = Path::from("test/file.txt");
-        let result = get("default", &path).await;
-        // The result depends on whether the file exists in cache or storage
-        // This is a basic test to ensure the function doesn't panic
-        assert!(result.is_ok() || result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_get_opts_function() {
-        let path = Path::from("test/file.txt");
-        let options = GetOptions::default();
-        let result = get_opts("default", &path, options).await;
-        // The result depends on whether the file exists in cache or storage
-        // This is a basic test to ensure the function doesn't panic
-        assert!(result.is_ok() || result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_get_range_function() {
-        let location = Path::from("test/file.txt");
-        let range = Range { start: 0, end: 10 };
-        let result = get_range("default", &location, range).await;
-        // The result depends on whether the file exists in cache
-        // This is a basic test to ensure the function doesn't panic
-        assert!(result.is_ok() || result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_head_function() {
-        let location = Path::from("test/file.txt");
-        let result = head("default", &location).await;
-        // The result depends on whether the file exists in cache or storage
-        // This is a basic test to ensure the function doesn't panic
-        assert!(result.is_ok() || result.is_err());
-    }
-
-    // Integration test for cache behavior
-    #[tokio::test]
-    async fn test_cache_fs_integration() {
-        let cache_fs = CacheFS {};
-        let location = Path::from("integration/test.txt");
-
-        // Test that the cache FS properly delegates to underlying storage
-        // when cache is not available
-        let get_result = cache_fs.get("default", &location).await;
-        let head_result = cache_fs.head("default", &location).await;
-
-        // Both should either succeed (if file exists in storage) or fail appropriately
-        // This tests the integration between cache and storage layers
-        assert!(get_result.is_ok() || get_result.is_err());
-        assert!(head_result.is_ok() || head_result.is_err());
-    }
-
-    // Test error handling for malformed paths
-    #[tokio::test]
-    async fn test_cache_fs_malformed_path() {
-        let cache_fs = CacheFS {};
-        let location = Path::from(""); // Empty path
-
-        let result = cache_fs.get("default", &location).await;
-        // Should handle empty paths gracefully
-        assert!(result.is_ok() || result.is_err());
-    }
-
-    // Test with different account names
-    #[tokio::test]
-    async fn test_cache_fs_different_accounts() {
-        let cache_fs = CacheFS {};
-        let location = Path::from("test/file.txt");
-
-        // Test with different account names
-        let result1 = cache_fs.get("account1", &location).await;
-        let result2 = cache_fs.get("account2", &location).await;
-
-        // Both should handle different accounts appropriately
-        assert!(result1.is_ok() || result1.is_err());
-        assert!(result2.is_ok() || result2.is_err());
     }
 }

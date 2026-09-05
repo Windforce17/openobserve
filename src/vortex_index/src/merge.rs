@@ -508,8 +508,10 @@ where
             for (first_key, offset, first_ordinal) in &parts.dict_meta {
                 index.push_block(first_key, *offset, *first_ordinal)?;
             }
+            let (dict, dict_field_pages) = index.finish_with_pages();
             Some(crate::writer::IndexBlobParts {
-                dict: index.finish(),
+                dict,
+                dict_field_pages,
                 dict_blocks: parts.dict_blocks,
                 terms,
                 plist: parts.plist,

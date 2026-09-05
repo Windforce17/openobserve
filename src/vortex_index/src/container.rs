@@ -31,9 +31,9 @@
 //!
 //! - the property/blob-tag constants and the `fields` property entry model,
 //! - writing/reading the puffin envelope over in-memory bytes ([`parse_container`]) or a ranged
-//!   source ([`parse_container_ranged`]: one 64 KiB tail fetch — plus a precise refetch when the
+//!   source ([`parse_container_ranged`]: one 64 KiB tail fetch — plus the missing prefix when the
 //!   footer payload exceeds the tail window — parses the puffin footer; blobs become byte windows
-//!   fetched on demand, except blobs already covered by the tail, which are sliced from it),
+//!   fetched on demand, reusing any suffix already covered by the tail),
 //! - synchronous helpers to write and scan the embedded Vortex files (vortex's async internals are
 //!   driven on a [`SingleThreadRuntime`], so the public crate API stays sync). A [`BlobHandle`]
 //!   scan opens in-memory blobs via `open_buffer` and ranged blobs via `open_read` over
@@ -45,13 +45,15 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use arrow::{
     array::{
-        Array, ArrayRef as ArrowArrayRef, LargeBinaryArray, StructArray, UInt32Array, UInt64Array,
+        Array, ArrayRef as ArrowArrayRef, Int64Array, LargeBinaryArray, StructArray, UInt32Array,
+        UInt64Array,
     },
     compute::cast,
     datatypes::{DataType, Field, Schema, SchemaRef},
     record_batch::RecordBatch,
 };
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
+use futures::future::BoxFuture;
 use puffin::{
     FOOTER_PAYLOAD_SIZE_SIZE, FOOTER_SIZE, MAGIC, MAGIC_SIZE, MIN_FILE_SIZE, PuffinMeta,
     reader::parse_puffin_footer_from_bytes, writer::PuffinBytesWriter,
@@ -63,7 +65,7 @@ use vortex::{
     arrow::{ArrowSessionExt, FromArrowArray, FromArrowType, ToArrowType},
     buffer::Buffer,
     compressor::BtrBlocksCompressorBuilder,
-    dtype::{DType, Field as DTypeField, FieldPath},
+    dtype::DType,
     expr::{root, select},
     file::{OpenOptionsSessionExt, VortexFile, VortexWriteOptions, WriteStrategyBuilder},
     io::{
@@ -74,8 +76,7 @@ use vortex::{
         LayoutStrategy,
         layouts::{
             chunked::writer::ChunkedLayoutStrategy, collect::CollectStrategy,
-            compressed::CompressingStrategy, flat::writer::FlatLayoutStrategy,
-            table::TableStrategy,
+            flat::writer::FlatLayoutStrategy, table::TableStrategy,
         },
     },
     scan::selection::Selection,
@@ -92,7 +93,7 @@ use crate::{
 /// and doubles as a window small blobs are sliced from for free.
 /// Default eager tail size; overridable via [`set_tail_fetch_size`]
 /// (`ZO_VIX_EAGER_TAIL_BYTES`). Sidecars lay their small, hot blobs
-/// (`dict` block index, `bloom`) LAST — nearest the footer — so a tail
+/// (`bloom`, then `dict` block index) LAST — nearest the footer — so a tail
 /// large enough to cover them turns a cold sidecar open + term eval into
 /// ONE ranged fetch. On prod, cold evals averaged ~8-9 GETs per file
 /// before this was tunable.
@@ -187,18 +188,26 @@ pub(crate) const PROP_COLUMNS: &str = "columns";
 /// (pre-plist format). The threshold gates by `doc_count`, which the reader
 /// always has alongside the cell, so no cell-sniffing is ever needed.
 pub(crate) const PROP_PLIST_MIN_DOCS: &str = "plist_min_docs";
-/// Declares how the `dict` blob's `fst` column is chunked — format
-/// self-description. Written as [`DICT_LAYOUT_CELLS`] by
-/// [`dict_strategy`]-era writers: one chunk per row-group cell,
-/// point-readable. When ABSENT the file predates lazy dict loading (its
-/// whole fst column is typically ONE chunk); readers behave identically
-/// either way — per-cell lazy loads with per-evaluation batching (on a
-/// one-chunk file each batch decodes that chunk once). Deliberately NOT a
-/// widen-to-all-cells switch: retaining every decoded cell would balloon
-/// touched readers to their full dictionaries and thrash the reader cache
-/// (measured on the 200M benchmark).
+/// Declares the dictionary layout; current writers use [`DICT_LAYOUT_BLOCKS`].
+///
+/// Historical cell-layout writers declared `"cells"`: the three small
+/// directory columns (`first_ordinal`, `term_min`, `term_max`) were collected
+/// into one compressed chunk each, while the `fst` column kept one
+/// independently compressed chunk per pushed batch (one row-group cell).
+/// Legacy readers loaded the directory at open and point-read only touched
+/// FST cells, batching those reads per evaluation.
+///
+/// An absent property predated lazy dictionary loading. The default
+/// BtrBlocks pipeline used 8Ki-row blocks without a byte bound, so a handful
+/// of multi-MB FST cells typically became one huge chunk. Legacy point reads
+/// decoded that entire chunk once per batch rather than retaining every
+/// decoded cell: doing so ballooned touched readers to their full dictionaries
+/// and thrashed the reader cache (measured on the 200M benchmark).
+/// Neither historical FST layout is supported by current readers.
 pub(crate) const PROP_DICT_LAYOUT: &str = "dict_layout";
-pub(crate) const DICT_LAYOUT_CELLS: &str = "cells";
+/// Optional field-to-restart-page directory for the unchanged block index.
+/// Written only on the INDEX object; older readers ignore this property.
+pub(crate) const PROP_DICT_FIELD_PAGES: &str = "dict_field_pages_v1";
 /// THE dictionary layout: the `dict` blob is a [`crate::dict_blocks`] block
 /// INDEX (restart-compressed first keys + per-block meta) and the
 /// `dict_blocks` blob holds the prefix-compressed key blocks it addresses.
@@ -441,6 +450,7 @@ impl std::fmt::Debug for BlobHandle {
 /// recognized blobs it carries — `docs` only for data objects, the index
 /// blobs for sidecars.
 pub(crate) struct VixContainer {
+    pub(crate) pending_memory: Option<crate::reader::PendingMemory>,
     pub properties: BTreeMap<String, String>,
     pub dict: Option<BlobHandle>,
     /// The dictionary blocks region (paired with `dict`, the block index).
@@ -497,6 +507,7 @@ fn container_from_meta(
     }
 
     Ok(VixContainer {
+        pending_memory: None,
         properties: meta.properties,
         dict,
         dict_blocks,
@@ -510,11 +521,153 @@ fn container_from_meta(
 
 /// Parse the puffin footer of `data` and slice out the `.vix` blobs.
 pub(crate) fn parse_container(data: &Bytes) -> Result<VixContainer> {
+    let memory = crate::source::current_reader_memory();
+    let payload = puffin_payload_size(data)?;
+    let pending = memory.reserve(metadata_memory_bound(payload))?;
     let meta = parse_puffin_footer_from_bytes(data)
         .map_err(|e| VixError::Malformed(format!("puffin footer: {e:#}")))?;
-    container_from_meta(meta, data.len() as u64, |range| {
+    let mut container = container_from_meta(meta, data.len() as u64, |range| {
         BlobHandle::Mem(data.slice(range.start as usize..range.end as usize))
-    })
+    })?;
+    container.pending_memory = Some(pending);
+    Ok(container)
+}
+
+/// Typed JSON, its strings, property-derived indexes and container handles.
+/// The bound is on encoded metadata, never on postings or the object size.
+pub(crate) fn metadata_memory_bound(encoded: usize) -> usize {
+    encoded.saturating_mul(64).saturating_add(64 * 1024)
+}
+
+fn puffin_payload_size(bytes: &[u8]) -> Result<usize> {
+    let start = bytes
+        .len()
+        .checked_sub(FOOTER_SIZE as usize)
+        .ok_or_else(|| VixError::Malformed("truncated puffin footer".to_string()))?;
+    Ok(u32::from_le_bytes(bytes[start..start + 4].try_into().unwrap()) as usize)
+}
+
+/// One compact, immutable interval from the eager tail. Only blobs crossing
+/// the probe boundary need this adapter; it never grows into a block cache.
+struct TailRangeSource {
+    source: Arc<dyn VixRangeSource>,
+    start: u64,
+    bytes: Bytes,
+}
+
+impl VixRangeSource for TailRangeSource {
+    fn len(&self) -> u64 {
+        self.source.len()
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.bytes
+            .len()
+            .saturating_add(self.source.retained_bytes())
+    }
+
+    fn describe(&self) -> String {
+        self.source.describe()
+    }
+
+    fn for_current_operation(&self) -> Option<Arc<dyn VixRangeSource>> {
+        self.source.for_current_operation().map(|source| {
+            Arc::new(Self {
+                source,
+                start: self.start,
+                bytes: self.bytes.clone(),
+            }) as Arc<dyn VixRangeSource>
+        })
+    }
+
+    fn fetch(&self, range: std::ops::Range<u64>) -> BoxFuture<'static, anyhow::Result<Bytes>> {
+        let future = self.fetch_many(vec![range]);
+        Box::pin(async move {
+            future
+                .await?
+                .pop()
+                .ok_or_else(|| anyhow::anyhow!("missing tail range result"))
+        })
+    }
+
+    fn fetch_many(
+        &self,
+        ranges: Vec<std::ops::Range<u64>>,
+    ) -> BoxFuture<'static, anyhow::Result<Vec<Bytes>>> {
+        let mut missing = Vec::new();
+        let end = self.start + self.bytes.len() as u64;
+        for range in &ranges {
+            if range.start > range.end || range.end > self.len() {
+                let message = format!("range {range:?} out of bounds for {}", self.describe());
+                return Box::pin(async move { Err(anyhow::anyhow!(message)) });
+            }
+            if range.is_empty() {
+                continue;
+            }
+            if range.start < self.start {
+                missing.push(range.start..range.end.min(self.start));
+            }
+            if range.end > end {
+                missing.push(range.start.max(end)..range.end);
+            }
+        }
+        // Bind before constructing the future, while the calling operation is
+        // in scope. Cached adapters never retain that operation themselves.
+        let source = self
+            .source
+            .for_current_operation()
+            .unwrap_or_else(|| Arc::clone(&self.source));
+        let future = if missing.is_empty() {
+            None
+        } else {
+            Some(source.fetch_many(missing.clone()))
+        };
+        let start = self.start;
+        let bytes = self.bytes.clone();
+        Box::pin(async move {
+            let fetched = match future {
+                Some(future) => future.await?,
+                None => Vec::new(),
+            };
+            anyhow::ensure!(
+                fetched.len() == missing.len(),
+                "tail fetch returned the wrong number of ranges"
+            );
+            for (data, range) in fetched.iter().zip(&missing) {
+                anyhow::ensure!(
+                    data.len() as u64 == range.end - range.start,
+                    "tail fetch returned a short range"
+                );
+            }
+            let mut fetched = fetched.into_iter();
+            let mut result = Vec::with_capacity(ranges.len());
+            for range in ranges {
+                if range.start == range.end {
+                    result.push(Bytes::new());
+                } else if range.start >= start && range.end <= end {
+                    result.push(
+                        bytes.slice((range.start - start) as usize..(range.end - start) as usize),
+                    );
+                } else if range.end <= start || range.start >= end {
+                    result.push(fetched.next().expect("validated missing range count"));
+                } else {
+                    let mut out = BytesMut::with_capacity((range.end - range.start) as usize);
+                    if range.start < start {
+                        out.extend_from_slice(&fetched.next().expect("validated prefix range"));
+                    }
+                    out.extend_from_slice(
+                        &bytes[(range.start.max(start) - start) as usize
+                            ..(range.end.min(end) - start) as usize],
+                    );
+                    if range.end > end {
+                        out.extend_from_slice(&fetched.next().expect("validated suffix range"));
+                    }
+                    result.push(out.freeze());
+                }
+            }
+            Ok(result)
+        })
+    }
 }
 
 /// Parse the puffin envelope of a ranged source: one tail fetch of up to
@@ -545,8 +698,16 @@ pub(crate) fn parse_container_ranged_with_tail(
 
     // Tail probe. The footer region is `HeadMagic[4] + payload + FOOTER_SIZE`
     // at the very end of the file; read the payload size out of the footer
-    // tail and refetch precisely when the probe fell short.
+    // tail and fetch only its missing prefix when the probe fell short.
     let mut tail_start = total.saturating_sub(eager_tail_bytes.max(MIN_FILE_SIZE));
+    let memory = crate::source::current_reader_memory();
+    // Tail buffers, compaction copies and at most seven recognized blob
+    // slices coexist until the container has been incorporated in the reader.
+    let tail_pending = memory.reserve(
+        usize::try_from(total - tail_start)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(9),
+    )?;
     let mut tail = block_fetch(source.as_ref(), tail_start..total)?;
     let footer_tail = &tail[tail.len() - FOOTER_SIZE as usize..];
     if footer_tail[(FOOTER_SIZE - MAGIC_SIZE) as usize..] != MAGIC {
@@ -566,25 +727,44 @@ pub(crate) fn parse_container_ranged_with_tail(
             "puffin footer payload of {payload_size} bytes exceeds the file size {total}"
         )));
     }
+    let pending = memory.reserve(metadata_memory_bound(
+        usize::try_from(footer_region).unwrap_or(usize::MAX),
+    ))?;
     if footer_region > tail.len() as u64 {
-        tail_start = total - footer_region;
-        tail = block_fetch(source.as_ref(), tail_start..total)?;
+        let footer_start = total - footer_region;
+        let prefix = block_fetch(source.as_ref(), footer_start..tail_start)?;
+        let mut complete = BytesMut::with_capacity(footer_region as usize);
+        complete.extend_from_slice(&prefix);
+        complete.extend_from_slice(&tail);
+        tail = complete.freeze();
+        tail_start = footer_start;
     }
 
     // The parser only looks at end-anchored offsets, so the fetched suffix
     // parses exactly like the whole file would.
     let meta = parse_puffin_footer_from_bytes(&tail)
         .map_err(|e| VixError::Malformed(format!("puffin footer: {e:#}")))?;
-    container_from_meta(meta, total, |range| {
+    let mut container = container_from_meta(meta, total, |range| {
         if range.start >= tail_start {
-            // Already fetched as part of the tail (tiny files): slice, free.
+            // Compact ownership: cache-ladder Bytes may pin the entire object.
             let start = (range.start - tail_start) as usize;
             let end = (range.end - tail_start) as usize;
-            BlobHandle::Mem(tail.slice(start..end))
+            BlobHandle::Mem(Bytes::copy_from_slice(&tail[start..end]))
+        } else if range.end > tail_start {
+            let source: Arc<dyn VixRangeSource> = Arc::new(TailRangeSource {
+                source: Arc::clone(source),
+                start: tail_start,
+                bytes: Bytes::copy_from_slice(&tail[..(range.end - tail_start) as usize]),
+            });
+            BlobHandle::Ranged(RangedBlob::new(source, range))
         } else {
             BlobHandle::Ranged(RangedBlob::new(Arc::clone(source), range))
         }
-    })
+    })?;
+    // Keep the tail/copy reservation through publication too. Combining the
+    // reservations is allocation-free and does not momentarily drop ownership.
+    container.pending_memory = Some(pending.merge(tail_pending));
+    Ok(container)
 }
 
 /// One produced blob awaiting container assembly: in memory (small blobs,
@@ -1105,9 +1285,9 @@ fn encode_docs_stream<W: std::io::Write + Unpin>(
 }
 
 /// The default compressed write strategy (BtrBlocks pipeline).
-/// `row_block_size == 0` keeps vortex's default. Production dict blobs moved
-/// to [`dict_strategy`]; this remains as the old-layout writer for tests
-/// that prove readers handle pre-lazy-dict files.
+/// `row_block_size == 0` keeps vortex's default. Retained as the legacy
+/// docs-compression baseline for tests comparing [`docs_strategy`]'s compact
+/// encodings and verifying stored-source round trips.
 #[cfg_attr(not(test), expect(dead_code))]
 pub(crate) fn compressed_strategy(row_block_size: usize) -> Arc<dyn LayoutStrategy> {
     let mut builder = WriteStrategyBuilder::default();
@@ -1115,36 +1295,6 @@ pub(crate) fn compressed_strategy(row_block_size: usize) -> Arc<dyn LayoutStrate
         builder = builder.with_row_block_size(row_block_size);
     }
     builder.build()
-}
-
-/// The write strategy of the `dict` blob, shaped for LAZY readers:
-///
-/// - the three small directory columns (`first_ordinal`, `term_min`, `term_max`) are collected into
-///   one compressed chunk each — the reader loads the whole directory at open with one or two small
-///   segment fetches,
-/// - the `fst` column keeps one chunk **per pushed batch** (the writer pushes one dict row per
-///   batch), each compressed individually — a reader point-reads exactly the row-group FSTs a query
-///   touches, the same pattern the `terms` blob uses for postings.
-///
-/// The default pipeline ([`compressed_strategy`], used before lazy dict
-/// loading landed) repartitions into 8Ki-ROW blocks with no byte bound, so a
-/// typical dict (a handful of multi-MB fst cells) became ONE huge chunk and
-/// any read decoded every FST. Readers handle both layouts — point reads on
-/// old files just decode the one big chunk.
-pub(crate) fn dict_strategy() -> Arc<dyn LayoutStrategy> {
-    let compress_then_flat: Arc<dyn LayoutStrategy> = Arc::new(CompressingStrategy::new(
-        FlatLayoutStrategy::default(),
-        BtrBlocksCompressorBuilder::default().with_compact().build(),
-    ));
-    let strategy = TableStrategy::new(
-        Arc::new(CollectStrategy::new(FlatLayoutStrategy::default())),
-        Arc::new(CollectStrategy::new(Arc::clone(&compress_then_flat))),
-    )
-    .with_field_writer(
-        FieldPath::from(DTypeField::Name("fst".into())),
-        Arc::new(ChunkedLayoutStrategy::new(compress_then_flat)),
-    );
-    Arc::new(strategy)
 }
 
 /// The write strategy of the `docs` blob: the BtrBlocks pipeline
@@ -1806,43 +1956,91 @@ fn write_vortex_blob_inner(
     Ok(buf)
 }
 
-/// Open one embedded Vortex file for scanning: in-memory blobs via
-/// `open_buffer`, ranged blobs via `open_read` over the blob window (the
-/// blob's Vortex footer is cached on the handle, so only the first open of a
-/// ranged blob fetches footer bytes — later opens perform zero IO until the
-/// scan requests data segments).
+/// Open one embedded Vortex file for scanning. Ranged handles cache only
+/// encoded footer bytes: every open constructs a private native footer and
+/// layout tree without repeating the underlying footer reads.
+/// Native file plus opening/layout workspace. Drop the native owners before
+/// releasing their pending reservation; streamed chunks never enter it.
+pub(crate) struct OpenedBlob {
+    file: VortexFile,
+    _pending: Option<crate::reader::PendingMemory>,
+}
+
+impl std::ops::Deref for OpenedBlob {
+    type Target = VortexFile;
+    fn deref(&self) -> &Self::Target {
+        &self.file
+    }
+}
+
 pub(crate) fn open_blob(
     runtime: &SingleThreadRuntime,
     session: &VortexSession,
     blob: &BlobHandle,
-) -> Result<VortexFile> {
+) -> Result<OpenedBlob> {
+    crate::check_read_cancelled()?;
     match blob {
-        BlobHandle::Mem(bytes) => Ok(session.open_options().open_buffer(bytes.clone())?),
-        BlobHandle::Ranged(ranged) => {
-            let mut options = session.open_options().with_file_size(ranged.len());
-            let had_footer = match ranged.footer() {
-                Some(footer) => {
-                    options = options.with_footer(footer);
-                    true
-                }
-                None => false,
-            };
-            let vxf = runtime.block_on(options.open_read(ranged.read_at()))?;
-            if !had_footer {
-                ranged.set_footer(vxf.footer().clone());
+        BlobHandle::Mem(bytes) => {
+            if crate::source::current_read_operation().is_none() {
+                return Ok(OpenedBlob {
+                    file: session.open_options().open_buffer(bytes.clone())?,
+                    _pending: None,
+                });
             }
-            Ok(vxf)
+            // Resolve metadata over bounded suffix reads, then retain the
+            // synchronous zero-copy segment source for the actual data scan.
+            // open_buffer alone hides its footer allocations from admission.
+            let source = Arc::new(crate::source::BytesRangeSource {
+                name: String::new(),
+                data: bytes.clone(),
+            });
+            let ranged = RangedBlob::new(source, 0..bytes.len() as u64);
+            let (read, opening) = ranged.opening_read_at();
+            let temporary = runtime.block_on(
+                session
+                    .open_options()
+                    .with_file_size(bytes.len() as u64)
+                    .open_read(read),
+            )?;
+            let pending = opening.finish();
+            let footer = temporary.footer().clone();
+            drop(temporary);
+            let file = session
+                .open_options()
+                .with_footer(footer)
+                .open_buffer(bytes.clone())?;
+            Ok(OpenedBlob {
+                file,
+                _pending: pending,
+            })
+        }
+        BlobHandle::Ranged(ranged) => {
+            let (read, opening) = ranged.opening_read_at();
+            let file = runtime.block_on(
+                session
+                    .open_options()
+                    .with_file_size(ranged.len())
+                    .open_read(read),
+            )?;
+            let pending = opening.finish();
+            Ok(OpenedBlob {
+                file,
+                _pending: pending,
+            })
         }
     }
 }
 
 /// Read the arrow schema of an embedded Vortex file without scanning any
 /// rows (footer/dtype only).
-pub(crate) fn blob_arrow_schema(blob: &BlobHandle) -> Result<Schema> {
+/// Keep native metadata admission alive through the caller's schema
+/// publication rather than dropping it at the return boundary.
+pub(crate) fn blob_arrow_schema_owned(blob: &BlobHandle) -> Result<(Schema, OpenedBlob)> {
     let runtime = SingleThreadRuntime::default();
     let session = VortexSession::default().with_handle(runtime.handle());
-    let vxf = open_blob(&runtime, &session, blob)?;
-    Ok(vxf.dtype().to_arrow_schema()?)
+    let file = open_blob(&runtime, &session, blob)?;
+    let schema = file.dtype().to_arrow_schema()?;
+    Ok((schema, file))
 }
 
 /// Row selection for [`scan_blob`].
@@ -1943,8 +2141,13 @@ pub(crate) fn scan_blob_streaming(
     scan = scan.with_some_limit(limit);
     let arrow_schema = scan.dtype()?.to_arrow_schema()?;
     let data_type = DataType::Struct(arrow_schema.fields().clone());
-    for array in scan.into_array_iter(&runtime)? {
-        on_batch(vortex_to_record_batch(&session, array?, &data_type)?)?;
+    let mut chunks = scan.into_array_iter(&runtime)?;
+    loop {
+        crate::check_read_cancelled()?;
+        let Some(array) = chunks.next() else { break };
+        let array = array?;
+        crate::check_read_cancelled()?;
+        on_batch(vortex_to_record_batch(&session, array, &data_type)?)?;
     }
     if let Some(pool) = pool {
         pool.shutdown_background();
@@ -2071,6 +2274,15 @@ pub fn region_row_ranges(regions: &[u64]) -> Vec<std::ops::Range<u64>> {
 /// value is not guaranteed to be referenced by any code.
 pub(crate) struct DictColumnChunk {
     pub codes: arrow::array::UInt64Array,
+    pub values: ArrowArrayRef,
+}
+
+/// One projected row window. Timestamp and dictionary arrays share the same
+/// row grid even when their physical column chunk boundaries differ.
+pub(crate) struct DictColumnBatch {
+    pub row_offset: u64,
+    pub timestamps: Option<Int64Array>,
+    pub codes: UInt64Array,
     pub values: ArrowArrayRef,
 }
 
@@ -2409,53 +2621,187 @@ pub(crate) fn count_eq_string_matches(
 /// consumers count codes and touch each distinct value once instead of
 /// hashing one string per row.
 pub(crate) fn scan_blob_dict_column(blob: &BlobHandle, name: &str) -> Result<Vec<DictColumnChunk>> {
-    use arrow::array::{cast::AsArray, types::UInt64Type};
-    use vortex::array::arrays::{Struct, struct_::StructArrayExt};
-
     let runtime = SingleThreadRuntime::default();
     let session = VortexSession::default().with_handle(runtime.handle());
     let vxf = open_blob(&runtime, &session, blob)?;
-    let scan = vxf.scan()?.with_projection(select(vec![name], root()));
-    // dictionary of the column's natural arrow type: values keep their
-    // stored type, consumers stringify them (once per distinct value)
-    let values_type = scan
-        .dtype()?
+    let mut chunks = Vec::new();
+    visit_vortex_dict_chunks(
+        &runtime,
+        &session,
+        &vxf,
+        name,
+        0..vxf.row_count(),
+        false,
+        &mut |batch| {
+            chunks.push(DictColumnChunk {
+                codes: batch.codes,
+                values: batch.values,
+            });
+            Ok(())
+        },
+    )?;
+    Ok(chunks)
+}
+
+/// Visit native projected chunks without retaining previous decoded batches.
+/// A single projection aligns timestamps and dictionary codes in stored row
+/// order. Returning an error stops the iterator and preserves its identity.
+pub(crate) fn visit_blob_dict_chunks(
+    blob: &BlobHandle,
+    name: &str,
+    range: std::ops::Range<u64>,
+    include_timestamps: bool,
+    visitor: &mut dyn FnMut(DictColumnBatch) -> anyhow::Result<()>,
+) -> Result<()> {
+    crate::check_read_cancelled()?;
+    let runtime = SingleThreadRuntime::default();
+    let session = VortexSession::default().with_handle(runtime.handle());
+    let vxf = open_blob(&runtime, &session, blob)?;
+    visit_vortex_dict_chunks(
+        &runtime,
+        &session,
+        &vxf,
+        name,
+        range,
+        include_timestamps,
+        visitor,
+    )
+}
+
+fn visit_vortex_dict_chunks(
+    runtime: &SingleThreadRuntime,
+    session: &VortexSession,
+    vxf: &VortexFile,
+    name: &str,
+    range: std::ops::Range<u64>,
+    include_timestamps: bool,
+    visitor: &mut dyn FnMut(DictColumnBatch) -> anyhow::Result<()>,
+) -> Result<()> {
+    use arrow::array::{cast::AsArray, types::UInt64Type};
+    use vortex::{
+        array::arrays::{Struct, struct_::StructArrayExt},
+        layout::scan::{scan_builder::referenced_field_masks, split_by::SplitBy},
+    };
+
+    if range.start > range.end || range.end > vxf.row_count() {
+        return Err(VixError::Malformed(format!(
+            "dictionary row range {range:?} exceeds {} rows",
+            vxf.row_count()
+        )));
+    }
+    crate::check_read_cancelled()?;
+    let mut columns = vec![name];
+    if include_timestamps && name != crate::writer::TIMESTAMP_COL_NAME {
+        columns.push(crate::writer::TIMESTAMP_COL_NAME);
+    }
+    let projection = select(columns, root());
+    let boundaries = {
+        let layout_reader = vxf.layout_reader()?;
+        let masks = referenced_field_masks(&projection, None, vxf.dtype())?;
+        SplitBy::Layout.splits(layout_reader.as_ref(), &range, &masks)?
+    };
+    let values_type = projection
+        .return_dtype(vxf.dtype())?
         .to_arrow_schema()?
         .field_with_name(name)
         .map_err(|_| VixError::Malformed(format!("blob is missing column {name:?}")))?
         .data_type()
         .clone();
     let dict_type = DataType::Dictionary(Box::new(DataType::UInt64), Box::new(values_type));
-    let mut chunks = Vec::new();
-    for array in scan.into_array_iter(&runtime)? {
-        let array = array?;
-        // the projected scan yields single-field struct chunks
-        let field = array
-            .as_typed::<Struct>()
-            .ok_or_else(|| {
+    let mut row_offset = range.start;
+    for window in boundaries.windows(2) {
+        crate::check_read_cancelled()?;
+        let window_end = window[1];
+        // Native scan execution registers all planned segment reads BEFORE
+        // task concurrency applies. Submit only one natural row window, not
+        // the whole file. A fresh layout reader also releases cached decoded
+        // dictionary values when this window finishes instead of accumulating
+        // the values from every preceding physical dictionary.
+        let scan = vxf.scan()?
+            .with_projection(projection.clone())
+            .with_row_range(window[0]..window_end)
+            .with_ordered(true)
+            // The outer projected natural grid already bounds this window.
+            .with_split_by(SplitBy::RowCount(usize::MAX));
+        let mut chunks = scan.into_array_iter(runtime)?;
+        loop {
+            crate::check_read_cancelled()?;
+            let Some(array) = chunks.next() else { break };
+            let array = array?;
+            crate::check_read_cancelled()?;
+            let chunk = array.as_typed::<Struct>().ok_or_else(|| {
                 VixError::Malformed("projected scan did not produce a struct array".to_string())
-            })?
-            .unmasked_field_by_name(name)
-            .map_err(|e| VixError::Malformed(format!("column {name:?}: {e}")))?
-            .clone();
-        let target = Field::new("", dict_type.clone(), field.dtype().is_nullable());
-        let mut ctx = session.create_execution_ctx();
-        let arrow_array = session
-            .arrow()
-            .execute_arrow(field, Some(&target), &mut ctx)?;
-        let dict = arrow_array
-            .as_dictionary_opt::<UInt64Type>()
-            .ok_or_else(|| {
-                VixError::Malformed(format!(
-                    "column {name:?} did not convert to a u64-keyed dictionary"
-                ))
             })?;
-        chunks.push(DictColumnChunk {
-            codes: dict.keys().clone(),
-            values: Arc::clone(dict.values()),
-        });
+            let field = chunk
+                .unmasked_field_by_name(name)
+                .map_err(|e| VixError::Malformed(format!("column {name:?}: {e}")))?
+                .clone();
+            let target = Field::new("", dict_type.clone(), field.dtype().is_nullable());
+            let mut ctx = session.create_execution_ctx();
+            let arrow_array = session
+                .arrow()
+                .execute_arrow(field, Some(&target), &mut ctx)?;
+            let dict = arrow_array
+                .as_dictionary_opt::<UInt64Type>()
+                .ok_or_else(|| {
+                    VixError::Malformed(format!(
+                        "column {name:?} did not convert to a u64-keyed dictionary"
+                    ))
+                })?;
+            let timestamps = if include_timestamps {
+                let field = chunk
+                    .unmasked_field_by_name(crate::writer::TIMESTAMP_COL_NAME)
+                    .map_err(|e| VixError::Malformed(format!("timestamp column: {e}")))?
+                    .clone();
+                let target = Field::new("", DataType::Int64, field.dtype().is_nullable());
+                let array = session
+                    .arrow()
+                    .execute_arrow(field, Some(&target), &mut ctx)?;
+                Some(
+                    array
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .cloned()
+                        .ok_or_else(|| {
+                            VixError::Malformed(
+                                "timestamp column did not convert to Int64".to_string(),
+                            )
+                        })?,
+                )
+            } else {
+                None
+            };
+            let rows = dict.len() as u64;
+            if rows > window_end - row_offset
+                || timestamps.as_ref().is_some_and(|ts| ts.len() != dict.len())
+            {
+                return Err(VixError::Malformed(
+                    "dictionary scan returned misaligned rows".to_string(),
+                ));
+            }
+            crate::check_read_cancelled()?;
+            visitor(DictColumnBatch {
+                row_offset,
+                timestamps,
+                codes: dict.keys().clone(),
+                values: Arc::clone(dict.values()),
+            })
+            .map_err(VixError::Callback)?;
+            row_offset += rows;
+        }
+        if row_offset != window_end {
+            return Err(VixError::Malformed(format!(
+                "dictionary window ended at row {row_offset}, expected {window_end}"
+            )));
+        }
     }
-    Ok(chunks)
+    if row_offset != range.end {
+        return Err(VixError::Malformed(format!(
+            "dictionary scan ended at row {row_offset}, expected {}",
+            range.end
+        )));
+    }
+    Ok(())
 }
 
 /// M17 item 2: per-chunk encoding class of the composite-bloom coverage

@@ -1763,18 +1763,31 @@ pub struct Common {
     )]
     pub vix_fetch_concurrency: usize,
     #[env_config(
-        name = "ZO_VIX_QUERY_PREFETCH",
-        default = true,
-        help = "Cold-open prefetch for ranged vix index evaluation (M14): before a file \
-                group is evaluated, files WITHOUT a memoized reader batch-fetch their \
-                eager footer tails (data object + index sidecar, the \
-                ZO_VIX_EAGER_TAIL_BYTES window) in one bounded-concurrency wave, so a \
-                multi-file cold query pays one parallel fetch ROUND instead of per-file \
-                sequential open rounds. Wave fetches respect ZO_VIX_FETCH_CONCURRENCY \
-                and count toward the ZO_VIX_EVAL_BAIL_BYTES budget. false = open lazily \
-                per file (the pre-M14 behavior)."
+        name = "ZO_VIX_FETCH_MAX_BYTES",
+        default = 0,
+        help = "Process-wide raw-byte ceiling for active VIX reads, complete batch \
+                accumulation and undelivered results. Delivered reader/scan buffers are \
+                governed by evaluation reservations and reader-cache accounting, not this \
+                fetch lease. 0 = min(memory/16, 256MiB), with a 16MiB floor capped at actual \
+                memory. Positive values are exact bytes, not MiB. Oversized requests fail safely."
     )]
-    pub vix_query_prefetch: bool,
+    pub vix_fetch_max_bytes: usize,
+    #[env_config(
+        name = "ZO_VIX_EVAL_MAX_BYTES",
+        default = 0,
+        help = "Process-wide raw-byte ceiling for declared VIX evaluation working-set \
+                reservations, not an absolute RSS bound. 0 = min(memory/8, 1GiB), with a \
+                64MiB floor capped at actual memory. Positive values are exact bytes, not MiB."
+    )]
+    pub vix_eval_max_bytes: usize,
+    #[env_config(
+        name = "ZO_CACHE_LATEST_FILES_DOWNLOAD_MAX_BYTES",
+        default = 0,
+        help = "Raw-byte ceiling for queued plus active background file downloads. \
+                0 = min(memory/8, 1GiB), with a 64MiB floor capped at actual memory. \
+                Positive values are exact bytes, not MiB; oversized fills are not queued."
+    )]
+    pub cache_latest_files_download_max_bytes: usize,
     #[env_config(
         name = "ZO_VIX_PLIST_MIN_DOCS",
         default = 0,
@@ -2746,12 +2759,12 @@ pub struct Limit {
     #[env_config(
         name = "ZO_VIX_READER_CACHE_MAX_SIZE",
         default = 0, // MB, default is 10% of total memory (no upper clamp)
-        help = "Maximum memory size in MB for the cache of parsed .vix readers (footer + \
-                properties + term-dictionary FSTs) on queriers. Unset (0) defaults to 10% of \
-                total memory with NO upper clamp — hosts serving many files should raise it \
-                further (dictionaries dominate; hot queries do zero dictionary IO only while \
-                their readers fit). Falls back to ZO_INVERTED_INDEX_FOOTER_CACHE_MAX_SIZE when \
-                that legacy knob is set explicitly and this one is not."
+        help = "Maximum accounted memory in MB for cached parsed .vix readers: properties, \
+                block dictionaries and retained encoded metadata, including growth after \
+                admission. Unset (0) defaults to 10% of total memory with no upper clamp. \
+                This is not a bound on active borrowed readers or process RSS. Falls back \
+                to ZO_INVERTED_INDEX_FOOTER_CACHE_MAX_SIZE when that legacy knob is set \
+                explicitly and this one is not."
     )]
     pub vix_reader_cache_max_size: usize,
     #[env_config(
@@ -4299,6 +4312,21 @@ fn check_path_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+fn normalize_vix_byte_budgets(cfg: &mut Config, memory: usize) {
+    let automatic = |divisor: usize, floor: usize, ceiling: usize| {
+        (memory / divisor).clamp(floor, ceiling).min(memory).max(1)
+    };
+    if cfg.common.vix_fetch_max_bytes == 0 {
+        cfg.common.vix_fetch_max_bytes = automatic(16, 16 << 20, 256 << 20);
+    }
+    if cfg.common.vix_eval_max_bytes == 0 {
+        cfg.common.vix_eval_max_bytes = automatic(8, 64 << 20, 1 << 30);
+    }
+    if cfg.common.cache_latest_files_download_max_bytes == 0 {
+        cfg.common.cache_latest_files_download_max_bytes = automatic(8, 64 << 20, 1 << 30);
+    }
+}
+
 fn check_memory_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
     let datafusion_memory_pool = cfg.memory_cache.datafusion_memory_pool.to_ascii_lowercase();
     if !matches!(
@@ -4312,6 +4340,7 @@ fn check_memory_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
     }
     let mem_total = sysinfo::get_memory_limit();
     cfg.limit.mem_total = mem_total;
+    normalize_vix_byte_budgets(cfg, mem_total);
     if cfg.memory_cache.max_size == 0 {
         if cfg.common.local_mode {
             cfg.memory_cache.max_size = mem_total / 4; // 25%
@@ -5518,6 +5547,22 @@ mod tests {
         cfg.nats.queue_max_size = 1;
         check_nats_config(&mut cfg).unwrap();
         assert_eq!(cfg.nats.queue_max_size, 1 * 1024 * 1024);
+    }
+
+    #[test]
+    fn vix_byte_budgets_respect_small_memory_and_exact_overrides() {
+        let mut cfg = Config::default();
+        normalize_vix_byte_budgets(&mut cfg, 4 << 20);
+        assert_eq!(cfg.common.vix_fetch_max_bytes, 4 << 20);
+        assert_eq!(cfg.common.vix_eval_max_bytes, 4 << 20);
+        assert_eq!(cfg.common.cache_latest_files_download_max_bytes, 4 << 20);
+        cfg.common.vix_fetch_max_bytes = 12345;
+        cfg.common.vix_eval_max_bytes = 23456;
+        cfg.common.cache_latest_files_download_max_bytes = 34567;
+        normalize_vix_byte_budgets(&mut cfg, 1 << 30);
+        assert_eq!(cfg.common.vix_fetch_max_bytes, 12345);
+        assert_eq!(cfg.common.vix_eval_max_bytes, 23456);
+        assert_eq!(cfg.common.cache_latest_files_download_max_bytes, 34567);
     }
 
     #[test]

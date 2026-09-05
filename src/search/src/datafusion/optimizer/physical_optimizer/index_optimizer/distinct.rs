@@ -23,15 +23,16 @@ use datafusion::{
     },
     physical_expr::{ScalarFunctionExpr, split_conjunction},
     physical_plan::{
-        ExecutionPlan, PhysicalExpr, aggregates::AggregateExec, filter::FilterExec,
-        projection::ProjectionExec, sorts::sort_preserving_merge::SortPreservingMergeExec,
+        ExecutionPlan, PhysicalExpr, aggregates::AggregateExec, expressions::Column,
+        filter::FilterExec, projection::ProjectionExec,
+        sorts::sort_preserving_merge::SortPreservingMergeExec,
     },
 };
 use hashbrown::HashSet;
 
 use crate::datafusion::optimizer::physical_optimizer::{
-    index_optimizer::utils::is_complex_plan,
-    utils::{get_column_name, is_column, is_only_timestamp_filter},
+    index_optimizer::utils::{is_complex_plan, raw_string_group_column},
+    utils::{get_column_name, is_only_timestamp_filter},
 };
 
 #[rustfmt::skip]
@@ -99,8 +100,8 @@ impl<'n> TreeNodeVisitor<'n> for SimpleDistinctVisitor {
             if let Some(fetch) = sort_merge.fetch()
                 && fetch > 0
                 && sort_merge.expr().len() == 1
-                && sort_merge.expr().iter().collect::<Vec<_>>().len() == 1
-                && is_column(&sort_merge.expr().first().expr)
+                && let Some(column) = sort_merge.expr().first().expr.downcast_ref::<Column>()
+                && column.index() == 0
             {
                 self.simple_distinct = Some((
                     "".to_string(), // Will be set when we find the group by field
@@ -119,10 +120,9 @@ impl<'n> TreeNodeVisitor<'n> for SimpleDistinctVisitor {
                 && aggregate.aggr_expr().is_empty()
                 && let Some((group_expr, _)) = aggregate.group_expr().expr().first()
             {
-                let column_name = get_column_name(group_expr);
-                let column_store = self.index_fields.contains(column_name);
-                if is_column(group_expr)
-                    && (column_store || self.unfiltered_index_fields.contains(column_name))
+                if let Some(column_name) = raw_string_group_column(group_expr, aggregate.input())
+                    && (self.index_fields.contains(column_name)
+                        || self.unfiltered_index_fields.contains(column_name))
                 {
                     // Update the simple_distinct with the correct field name
                     if let Some(simple_distinct) = &mut self.simple_distinct {
@@ -141,7 +141,9 @@ impl<'n> TreeNodeVisitor<'n> for SimpleDistinctVisitor {
         } else if let Some(projection) = node.downcast_ref::<ProjectionExec>() {
             // Check ProjectionExec for the structure: [index_field]
             let exprs = projection.expr();
-            if exprs.len() == 1 {
+            if exprs.len() == 1
+                && raw_string_group_column(&exprs[0].expr, projection.input()).is_some()
+            {
                 // First expression should be the index field
                 // We'll validate this in the AggregateExec
                 return Ok(TreeNodeRecursion::Continue);

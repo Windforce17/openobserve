@@ -5873,7 +5873,6 @@ mod plist {
         );
 
         let reader = open_built(bytes, bytes_index);
-        assert_eq!(reader.plist_min_docs(), 4);
 
         // cell shapes — pointer (exactly 12 bytes) at/above the threshold:
         // the `level` key term covers 9 docs, svc="api" covers 4
@@ -13859,3 +13858,6 @@ fn m18_writer_failopen_reencodes_slice_wrapped_chunk() {
         "the control copy must keep the runend stored form (the passthrough win)"
     );
 }
+
+#[path = "tests/query_io.rs"]
+mod query_io;

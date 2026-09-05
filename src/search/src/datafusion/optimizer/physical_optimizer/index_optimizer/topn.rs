@@ -22,15 +22,20 @@ use datafusion::{
         tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor},
     },
     physical_plan::{
-        ExecutionPlan, aggregates::AggregateExec, projection::ProjectionExec,
+        ExecutionPlan,
+        aggregates::{AggregateExec, AggregateInputMode},
+        expressions::Column,
+        projection::ProjectionExec,
         sorts::sort_preserving_merge::SortPreservingMergeExec,
     },
 };
 use hashbrown::HashSet;
 
 use crate::datafusion::optimizer::physical_optimizer::{
-    index_optimizer::utils::is_complex_plan,
-    utils::{get_column_name, is_column, is_count_rows_aggregate},
+    index_optimizer::utils::{
+        count_rows_input_is_original, is_complex_plan, raw_string_group_column,
+    },
+    utils::{get_column_name, is_count_rows_aggregate},
 };
 
 #[rustfmt::skip]
@@ -68,7 +73,7 @@ pub fn is_simple_topn(
     let mut visitor = SimpleTopnVisitor::new(index_fields, unfiltered_index_fields);
     let _ = plan.visit(&mut visitor);
     match visitor.simple_topn {
-        Some((fields, fetch, ascend)) if !fields.is_empty() => {
+        Some((fields, fetch, ascend)) if !fields.is_empty() && visitor.raw_count_proven => {
             Some(IndexOptimizeMode::SimpleTopN(fields, fetch, ascend))
         }
         _ => None,
@@ -81,6 +86,9 @@ struct SimpleTopnVisitor {
     unfiltered_index_fields: HashSet<String>,
     secondary_sort_columns: Vec<String>,
     projection_len: Option<usize>,
+    primary_sort_index: Option<usize>,
+    count_sort_validated: bool,
+    raw_count_proven: bool,
 }
 
 impl SimpleTopnVisitor {
@@ -91,6 +99,9 @@ impl SimpleTopnVisitor {
             unfiltered_index_fields,
             secondary_sort_columns: Vec::new(),
             projection_len: None,
+            primary_sort_index: None,
+            count_sort_validated: false,
+            raw_count_proven: false,
         }
     }
 
@@ -113,20 +124,18 @@ impl<'n> TreeNodeVisitor<'n> for SimpleTopnVisitor {
                 return self.reject();
             }
 
-            // the primary sort must be on the count(*) result, not on an index field
+            // Resolve the sort through projections to the actual aggregate slot;
+            // an output alias absent from index_fields is not proof of COUNT.
             let first_sort = sort_exprs.first();
-            if is_column(&first_sort.expr)
-                && self
-                    .index_fields
-                    .contains(get_column_name(&first_sort.expr))
-            {
+            let Some(column) = first_sort.expr.downcast_ref::<Column>() else {
                 return self.reject();
-            }
+            };
+            self.primary_sort_index = Some(column.index());
 
             // secondary sorts must be ASC columns; their names are validated against the
             // group by fields at the ProjectionExec
             for sort in sort_exprs.iter().skip(1) {
-                if sort.options.descending || !is_column(&sort.expr) {
+                if sort.options.descending || sort.expr.downcast_ref::<Column>().is_none() {
                     return self.reject();
                 }
                 self.secondary_sort_columns
@@ -142,7 +151,25 @@ impl<'n> TreeNodeVisitor<'n> for SimpleTopnVisitor {
             if !(2..=MAX_SIMPLE_TOPN_FIELDS + 1).contains(&exprs.len()) {
                 return self.reject();
             }
+            if exprs[..exprs.len() - 1]
+                .iter()
+                .any(|expr| raw_string_group_column(&expr.expr, projection.input()).is_none())
+            {
+                return self.reject();
+            }
             self.projection_len = Some(exprs.len());
+            if !self.count_sort_validated {
+                let Some(index) = self.primary_sort_index else {
+                    return self.reject();
+                };
+                let Some(column) = exprs
+                    .get(index)
+                    .and_then(|expr| expr.expr.downcast_ref::<Column>())
+                else {
+                    return self.reject();
+                };
+                self.primary_sort_index = Some(column.index());
+            }
 
             // secondary sorts must reference the group by fields (the leading projection aliases)
             let group_aliases: HashSet<&str> = exprs[..exprs.len() - 1]
@@ -161,10 +188,19 @@ impl<'n> TreeNodeVisitor<'n> for SimpleTopnVisitor {
             if !(1..=MAX_SIMPLE_TOPN_FIELDS).contains(&group_len)
                 || aggregate.aggr_expr().len() != 1
                 || !is_count_rows_aggregate(&aggregate.aggr_expr()[0])
+                || aggregate.filter_expr().iter().any(Option::is_some)
+                || !count_rows_input_is_original(aggregate)
                 // the projection (if any) should be exactly the group by fields + count(*)
                 || self.projection_len.is_some_and(|len| len != group_len + 1)
             {
                 return self.reject();
+            }
+            self.raw_count_proven |= aggregate.mode().input_mode() == AggregateInputMode::Raw;
+            if !self.count_sort_validated {
+                if self.primary_sort_index != Some(group_len) {
+                    return self.reject();
+                }
+                self.count_sort_validated = true;
             }
 
             // all group by fields must be eligible: column-store fields
@@ -173,10 +209,10 @@ impl<'n> TreeNodeVisitor<'n> for SimpleTopnVisitor {
             // when unfiltered and postings∩bitmap when conditioned
             let mut fields = Vec::with_capacity(group_len);
             for (group_expr, _) in aggregate.group_expr().expr().iter() {
-                let column_name = get_column_name(group_expr);
-                if !is_column(group_expr) {
+                let Some(column_name) = raw_string_group_column(group_expr, aggregate.input())
+                else {
                     return self.reject();
-                }
+                };
                 if !self.index_fields.contains(column_name)
                     && !(group_len == 1 && self.unfiltered_index_fields.contains(column_name))
                 {
@@ -280,6 +316,14 @@ mod tests {
             // Invalid case: sorting by key only (not count) should not optimize
             (
                 "select name, count(*) as cnt from t where match_all('error') group by name order by name limit 10",
+                None,
+            ),
+            (
+                "select name as key, count(*) as cnt from t where match_all('error') group by key order by key desc limit 1",
+                None,
+            ),
+            (
+                "select name as cnt, count(*) as name from t where match_all('error') group by cnt order by cnt desc limit 1",
                 None,
             ),
             // Valid case: different index field (id instead of name)
@@ -686,6 +730,18 @@ mod tests {
 
         // `status` is column-store, `name` only term-indexed
         let cases = vec![
+            (
+                "select name as key, count(*) as total from t group by key order by key desc limit 1",
+                None,
+            ),
+            (
+                "select name as key, count(*) as total from t group by key order by total desc limit 1",
+                Some(IndexOptimizeMode::SimpleTopN(
+                    vec!["name".to_owned()],
+                    1,
+                    false,
+                )),
+            ),
             // no filter: the term field is eligible
             (
                 "select name, count(*) as cnt from t group by name order by cnt desc limit 10",
@@ -742,34 +798,5 @@ mod tests {
                 "Failed for SQL: {sql}"
             );
         }
-    }
-
-    #[test]
-    fn test_simple_topn_visitor_initial_state() {
-        let fields = HashSet::from(["service".to_string()]);
-        let visitor = SimpleTopnVisitor::new(fields.clone(), HashSet::new());
-        assert!(visitor.simple_topn.is_none());
-        assert!(visitor.secondary_sort_columns.is_empty());
-        assert!(visitor.projection_len.is_none());
-        assert_eq!(visitor.index_fields, fields);
-    }
-
-    #[test]
-    fn test_simple_topn_visitor_empty_index_fields() {
-        let fields: HashSet<String> = HashSet::new();
-        let visitor = SimpleTopnVisitor::new(fields.clone(), HashSet::new());
-        assert!(visitor.simple_topn.is_none());
-        assert!(visitor.secondary_sort_columns.is_empty());
-        assert!(visitor.index_fields.is_empty());
-    }
-
-    #[test]
-    fn test_simple_topn_visitor_multiple_index_fields() {
-        let fields = HashSet::from(["service".to_string(), "host".to_string(), "pod".to_string()]);
-        let visitor = SimpleTopnVisitor::new(fields.clone(), HashSet::new());
-        assert_eq!(visitor.index_fields.len(), 3);
-        assert!(visitor.index_fields.contains("service"));
-        assert!(visitor.index_fields.contains("host"));
-        assert!(visitor.index_fields.contains("pod"));
     }
 }

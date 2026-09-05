@@ -26,7 +26,7 @@ use config::{
     utils::time::{day_micros, now_micros},
 };
 use futures::StreamExt;
-use hashbrown::{HashMap, HashSet};
+use hashbrown::HashSet;
 use proto::cluster_rpc::{SimpleFileList, event_client::EventClient};
 use tokio::sync::{
     Mutex,
@@ -36,47 +36,128 @@ use tonic::{codec::CompressionEncoding, metadata::MetadataValue};
 
 use crate::{cache::file_data, cluster};
 
-/// (trace_id, file_id, account, file, size, cache_type)
-type FileInfo = (String, i64, String, String, usize, file_data::CacheType);
+/// The result of optional background warming, not a claim that a download completed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QueueDownloadOutcome {
+    Accepted { bytes: usize },
+    Deduplicated,
+    Skipped,
+    Cached,
+    Rejected(DownloadRejection),
+}
 
-mod processing_files {
-    use hashbrown::HashSet;
-    use parking_lot::RwLock;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DownloadRejection {
+    InvalidSize,
+    TooLarge,
+    Full,
+    Closed,
+}
 
-    use super::*;
+#[derive(Default)]
+struct AdmissionState {
+    files: HashSet<Arc<str>>,
+    bytes: usize,
+}
 
-    static PROCESSING_FILES: Lazy<RwLock<HashSet<String>>> =
-        Lazy::new(|| RwLock::new(HashSet::new()));
+struct DownloadAdmission {
+    state: parking_lot::Mutex<AdmissionState>,
+    max_bytes: usize,
+    max_files: usize,
+}
 
-    pub fn is_processing(file_name: &str) -> bool {
-        PROCESSING_FILES.read().contains(file_name)
+impl DownloadAdmission {
+    fn new(max_bytes: usize, max_files: usize) -> Self {
+        Self {
+            state: parking_lot::Mutex::new(AdmissionState::default()),
+            max_bytes,
+            max_files,
+        }
     }
 
-    pub fn add(file_name: &str) {
-        PROCESSING_FILES.write().insert(file_name.to_string());
-    }
-
-    pub fn remove(file_name: &str) {
-        PROCESSING_FILES.write().remove(file_name);
+    fn reserve(
+        self: &Arc<Self>,
+        file: &str,
+        bytes: usize,
+    ) -> Result<DownloadReservation, QueueDownloadOutcome> {
+        let mut state = self.state.lock();
+        if state.files.contains(file) {
+            return Err(QueueDownloadOutcome::Deduplicated);
+        }
+        if bytes == 0 {
+            return Err(QueueDownloadOutcome::Rejected(
+                DownloadRejection::InvalidSize,
+            ));
+        }
+        if bytes > self.max_bytes {
+            return Err(QueueDownloadOutcome::Rejected(DownloadRejection::TooLarge));
+        }
+        if bytes > self.max_bytes - state.bytes || state.files.len() >= self.max_files {
+            return Err(QueueDownloadOutcome::Rejected(DownloadRejection::Full));
+        }
+        // Clone a key only after both byte and count admission. A single reservation
+        // covers cache probing, queueing and the actual worker, without a dedupe gap.
+        let file: Arc<str> = file.into();
+        state.files.insert(file.clone());
+        state.bytes += bytes;
+        Ok(DownloadReservation {
+            admission: self.clone(),
+            file,
+            bytes,
+            priority_metric: None,
+        })
     }
 }
 
-mod queued_files {
-    use hashbrown::HashSet;
-    use parking_lot::RwLock;
+struct DownloadReservation {
+    admission: Arc<DownloadAdmission>,
+    file: Arc<str>,
+    bytes: usize,
+    priority_metric: Option<bool>,
+}
 
-    use super::*;
-
-    static QUEUED_FILES: Lazy<RwLock<HashSet<String>>> = Lazy::new(|| RwLock::new(HashSet::new()));
-
-    /// Returns true if newly inserted (caller should enqueue), false if already present (skip).
-    pub fn try_add(file_name: &str) -> bool {
-        QUEUED_FILES.write().insert(file_name.to_string())
+impl DownloadReservation {
+    fn record_queue(&mut self, priority: bool) {
+        self.priority_metric = Some(priority);
+        if priority {
+            metrics::FILE_DOWNLOADER_PRIORITY_QUEUE_SIZE
+                .with_label_values::<&str>(&[])
+                .inc();
+        } else {
+            metrics::FILE_DOWNLOADER_NORMAL_QUEUE_SIZE
+                .with_label_values::<&str>(&[])
+                .inc();
+        }
     }
+}
 
-    pub fn remove(file_name: &str) {
-        QUEUED_FILES.write().remove(file_name);
+impl Drop for DownloadReservation {
+    fn drop(&mut self) {
+        {
+            let mut state = self.admission.state.lock();
+            state.files.remove(self.file.as_ref());
+            state.bytes -= self.bytes;
+        }
+        // Preserve the existing gauge's queued + active meaning, including on
+        // failed sends, worker cancellation and unwind.
+        match self.priority_metric {
+            Some(true) => metrics::FILE_DOWNLOADER_PRIORITY_QUEUE_SIZE
+                .with_label_values::<&str>(&[])
+                .dec(),
+            Some(false) => metrics::FILE_DOWNLOADER_NORMAL_QUEUE_SIZE
+                .with_label_values::<&str>(&[])
+                .dec(),
+            None => {}
+        }
     }
+}
+
+struct FileInfo {
+    trace_id: String,
+    id: i64,
+    account: String,
+    cache: file_data::CacheType,
+    reservation: Arc<DownloadReservation>,
 }
 
 struct DownloadQueue {
@@ -88,10 +169,17 @@ impl DownloadQueue {
     fn new(sender: Sender<FileInfo>, receiver: Arc<Mutex<Receiver<FileInfo>>>) -> Self {
         Self { sender, receiver }
     }
+
+    fn try_send(&self, item: FileInfo) -> Result<(), DownloadRejection> {
+        self.sender.try_send(item).map_err(|error| match error {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => DownloadRejection::Full,
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => DownloadRejection::Closed,
+        })
+    }
 }
 
 struct PriorityDownloadQueue {
-    stack: Mutex<VecDeque<FileInfo>>,
+    stack: parking_lot::Mutex<VecDeque<FileInfo>>,
     notify: tokio::sync::Notify,
     max_size: usize,
 }
@@ -99,15 +187,15 @@ struct PriorityDownloadQueue {
 impl PriorityDownloadQueue {
     fn new(max_size: usize) -> Self {
         Self {
-            stack: Mutex::new(VecDeque::with_capacity(max_size)),
+            stack: parking_lot::Mutex::new(VecDeque::with_capacity(max_size)),
             notify: tokio::sync::Notify::new(),
             max_size,
         }
     }
 
-    // Returns false if at cap — caller must remove from queued_files and skip metric inc.
-    async fn push(&self, file_info: FileInfo) -> bool {
-        let mut stack = self.stack.lock().await;
+    // New arrivals are rejected at capacity; accepted recent work remains LIFO.
+    fn push(&self, file_info: FileInfo) -> bool {
+        let mut stack = self.stack.lock();
         if stack.len() >= self.max_size {
             return false;
         }
@@ -124,7 +212,7 @@ impl PriorityDownloadQueue {
         loop {
             let notified = self.notify.notified();
             {
-                let mut stack = self.stack.lock().await;
+                let mut stack = self.stack.lock();
                 if let Some(item) = stack.pop_back() {
                     if !stack.is_empty() {
                         self.notify.notify_one();
@@ -146,123 +234,75 @@ static FILE_DOWNLOAD_CHANNEL: Lazy<DownloadQueue> = Lazy::new(|| {
 static PRIORITY_FILE_DOWNLOAD_CHANNEL: Lazy<PriorityDownloadQueue> =
     Lazy::new(|| PriorityDownloadQueue::new(FILE_DOWNLOAD_QUEUE_SIZE));
 
+static DOWNLOAD_ADMISSION: Lazy<Arc<DownloadAdmission>> = Lazy::new(|| {
+    Arc::new(DownloadAdmission::new(
+        get_config().common.cache_latest_files_download_max_bytes,
+        FILE_DOWNLOAD_QUEUE_SIZE * 2,
+    ))
+});
+
 pub async fn run() -> Result<(), anyhow::Error> {
     let cfg = get_config();
-    // worker tasks: handle normal queue download (FIFO via mpsc channel)
+    // Separate fixed worker pools preserve normal FIFO and recent-file LIFO
+    // service. Both pools share one queued + active object-byte budget.
     for thread in 0..cfg.limit.file_download_thread_num {
         let rx = FILE_DOWNLOAD_CHANNEL.receiver.clone();
         tokio::spawn(async move {
             loop {
                 let ret = rx.lock().await.recv().await;
-                match ret {
-                    None => {
-                        log::debug!("[FILE_CACHE_DOWNLOAD:JOB:NORMAL] Receiving channel is closed");
-                        break;
-                    }
-                    Some((trace_id, id, account, file, file_size, cache)) => {
-                        // transition: queued → not-queued (must run before any skip path)
-                        queued_files::remove(&file);
-
-                        // check if the file is already being downloaded
-                        if processing_files::is_processing(&file) {
-                            log::warn!(
-                                "[trace_id {trace_id}] [thread {thread}] search->storage: file {file} is already being downloaded, will skip it"
-                            );
-                            // update metrics
-                            metrics::FILE_DOWNLOADER_NORMAL_QUEUE_SIZE
-                                .with_label_values::<&str>(&[])
-                                .dec();
-                            continue;
-                        }
-
-                        // add the file to processing set
-                        processing_files::add(&file);
-
-                        // download the file
-                        match download_file(
-                            thread, &trace_id, id, &account, &file, file_size, cache,
-                        )
-                        .await
-                        {
-                            Ok(data_len) => {
-                                if data_len > 0 && data_len != file_size {
-                                    log::warn!(
-                                        "[FILE_CACHE_DOWNLOAD:JOB:NORMAL] download file {file} found size mismatch, expected: {file_size}, actual: {data_len}, will skip it",
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                log::error!(
-                                    "[FILE_CACHE_DOWNLOAD:JOB:NORMAL] download file {file} to cache {cache:?} err: {e}",
-                                );
-                            }
-                        }
-
-                        // remove the file from processing set
-                        processing_files::remove(&file);
-
-                        // update metrics
-                        metrics::FILE_DOWNLOADER_NORMAL_QUEUE_SIZE
-                            .with_label_values::<&str>(&[])
-                            .dec();
-                    }
-                }
+                let Some(file) = ret else {
+                    log::debug!("[FILE_CACHE_DOWNLOAD:JOB:NORMAL] Receiving channel is closed");
+                    break;
+                };
+                process_download(thread, file).await;
             }
         });
     }
-
-    // worker tasks: handle priority queue download (LIFO via VecDeque::pop_back)
     for thread in 0..cfg.limit.file_download_priority_queue_thread_num {
         tokio::spawn(async move {
             loop {
-                let (trace_id, id, account, file, file_size, cache) =
-                    PRIORITY_FILE_DOWNLOAD_CHANNEL.pop().await;
-
-                // transition: queued → not-queued (must run before any skip path)
-                queued_files::remove(&file);
-
-                // check if the file is already being downloaded
-                if processing_files::is_processing(&file) {
-                    log::warn!(
-                        "[trace_id {trace_id}] [thread {thread}] search->storage: file {file} is already being downloaded, will skip it"
-                    );
-                    metrics::FILE_DOWNLOADER_PRIORITY_QUEUE_SIZE
-                        .with_label_values::<&str>(&[])
-                        .dec();
-                    continue;
-                }
-
-                // add the file to processing set
-                processing_files::add(&file);
-
-                // download the file
-                match download_file(thread, &trace_id, id, &account, &file, file_size, cache).await
-                {
-                    Ok(data_len) => {
-                        if data_len > 0 && data_len != file_size {
-                            log::warn!(
-                                "[FILE_CACHE_DOWNLOAD:JOB:PRIORITY] download file {file} found size mismatch, expected: {file_size}, actual: {data_len}, will skip it",
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        log::error!(
-                            "[FILE_CACHE_DOWNLOAD:JOB:PRIORITY] download file {file} to cache {cache:?} err: {e}",
-                        );
-                    }
-                }
-
-                // remove the file from processing set
-                processing_files::remove(&file);
-
-                // update metrics
-                metrics::FILE_DOWNLOADER_PRIORITY_QUEUE_SIZE
-                    .with_label_values::<&str>(&[])
-                    .dec();
+                process_download(thread, PRIORITY_FILE_DOWNLOAD_CHANNEL.pop().await).await;
             }
         });
     }
     Ok(())
+}
+
+async fn process_download(thread: usize, file: FileInfo) {
+    let FileInfo {
+        trace_id,
+        id,
+        account,
+        cache,
+        reservation,
+    } = file;
+    let name = reservation.file.as_ref();
+    let size = reservation.bytes;
+    match download_file(
+        thread,
+        &trace_id,
+        id,
+        &account,
+        name,
+        size,
+        cache,
+        reservation.clone(),
+    )
+    .await
+    {
+        Ok(data_len) => {
+            if data_len > 0 && data_len != size {
+                log::warn!(
+                    "[FILE_CACHE_DOWNLOAD:JOB] download file {name} found size mismatch, expected: {size}, actual: {data_len}"
+                );
+            }
+        }
+        Err(e) => log::error!(
+            "[FILE_CACHE_DOWNLOAD:JOB] download file {name} to cache {cache:?} err: {e}"
+        ),
+    }
+    // Explicitly retain the byte charge and dedupe identity until IO finishes.
+    drop(reservation);
 }
 
 async fn download_file(
@@ -273,20 +313,30 @@ async fn download_file(
     file_name: &str,
     file_size: usize,
     cache_type: file_data::CacheType,
+    reservation: Arc<DownloadReservation>,
 ) -> Result<usize, anyhow::Error> {
     let cfg = get_config();
 
-    // download file from node
-    if cfg.cache_latest_files.download_from_node
-        && let Ok(ok) =
-            download_file_with_consistent_hash(file_id, account, file_name, file_size).await
-        && ok
-    {
-        return Ok(file_size);
+    // Peer lookup/download failure still permits the ordinary object-store
+    // fallback, but is observable rather than being silently discarded.
+    if cfg.cache_latest_files.download_from_node {
+        match download_file_with_consistent_hash(
+            file_id,
+            file_name,
+            cache_type,
+            reservation.clone(),
+        )
+        .await
+        {
+            Ok(true) => return Ok(file_size),
+            Ok(false) => {}
+            Err(error) => log::warn!(
+                "[FILE_CACHE_DOWNLOAD:JOB] peer download failed for {file_name}, falling back to object storage: {error}"
+            ),
+        }
     }
 
     // download from object store
-    let size = if file_size > 0 { Some(file_size) } else { None };
     let start = std::time::Instant::now();
     let ret = match cache_type {
         file_data::CacheType::Memory => {
@@ -296,14 +346,17 @@ async fn download_file(
                 disk_exists = file_data::disk::exist(file_name).await;
             }
             if !mem_exists && (cfg.memory_cache.skip_disk_check || !disk_exists) {
-                file_data::memory::download(account, file_name, size).await
+                let (data_len, data) =
+                    file_data::download_from_storage_exact(account, file_name, file_size).await?;
+                file_data::memory::set(file_name, data).await?;
+                Ok(data_len)
             } else {
                 Ok(0)
             }
         }
         file_data::CacheType::Disk => {
             if !file_data::disk::exist(file_name).await {
-                file_data::disk::download(account, file_name, size).await
+                file_data::disk::download_exact(account, file_name, file_size, reservation).await
             } else {
                 Ok(0)
             }
@@ -320,9 +373,9 @@ async fn download_file(
 
 async fn download_file_with_consistent_hash(
     file_id: i64,
-    account: &str,
     file_name: &str,
-    file_size: usize,
+    cache_type: file_data::CacheType,
+    reservation: Arc<DownloadReservation>,
 ) -> Result<bool, anyhow::Error> {
     let role_group = if LOCAL_NODE.is_interactive_querier() {
         RoleGroup::Interactive
@@ -342,65 +395,31 @@ async fn download_file_with_consistent_hash(
     let Some(node) = cluster::get_cached_node_by_name(&node_name).await else {
         return Ok(false);
     };
-    // download file from node
-    let Ok(failed) = download_from_node(
-        &node.grpc_addr,
-        &[(
-            file_id,
-            account.to_string(),
-            file_name.to_string(),
-            file_size as i64,
-            0,
-        )],
-    )
-    .await
-    else {
-        return Ok(false);
-    };
-    // failed is empty means download success
-    Ok(failed.is_empty())
+    download_from_node(&node.grpc_addr, file_name, cache_type, reservation).await
 }
 
-// download files from node and return download failed files
-// file: (account, file, size, ts)
-pub async fn download_from_node(
+/// Fetch one explicitly admitted object; no direct batch bypass of admission.
+async fn download_from_node(
     addr: &str,
-    files: &[(i64, String, String, i64, i64)],
-) -> Result<Vec<(i64, String, String, i64, i64)>, anyhow::Error> {
-    let start = std::time::Instant::now();
+    file: &str,
+    cache_type: file_data::CacheType,
+    reservation: Arc<DownloadReservation>,
+) -> Result<bool, anyhow::Error> {
     let cfg = get_config();
-    log::debug!(
-        "[FILE_CACHE_DOWNLOAD:gRPC] Download files from node start, files: {:?}",
-        files.len()
-    );
-
+    if reservation.bytes > (cfg.cache_latest_files.download_node_size * 1024 * 1024) as usize {
+        return Ok(false);
+    }
     let token: MetadataValue<_> = get_internal_grpc_token()
         .parse()
         .map_err(|_| anyhow::anyhow!("Invalid token"))?;
-
     let channel = crate::client::grpc::get_cached_channel(addr).await?;
     let client = EventClient::with_interceptor(channel, move |mut req: tonic::Request<()>| {
         req.metadata_mut().insert("authorization", token.clone());
         Ok(req)
     });
-
-    let file_size_map = files
-        .iter()
-        .filter_map(|(_, _, f, s, _)| {
-            if *s > cfg.cache_latest_files.download_node_size * 1024 * 1024 {
-                None
-            } else {
-                Some((f, *s as usize))
-            }
-        })
-        .collect::<HashMap<_, _>>();
-    if file_size_map.is_empty() {
-        return Ok(files.to_vec());
-    }
     let request = tonic::Request::new(SimpleFileList {
-        files: files.iter().map(|(_, _, f, ..)| f.to_string()).collect(),
+        files: vec![file.to_owned()],
     });
-
     let resp = client
         .send_compressed(CompressionEncoding::Gzip)
         .accept_compressed(CompressionEncoding::Gzip)
@@ -408,162 +427,104 @@ pub async fn download_from_node(
         .max_encoding_message_size(cfg.grpc.max_message_size * 1024 * 1024)
         .get_files(request)
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to get files from {addr}, {e}"))?;
-
-    let mut file_contents = HashMap::new();
-    let mut downloaded_files = HashSet::new();
-    let mut resp_stream = resp.into_inner();
-    while let Some(resp) = resp_stream.next().await {
-        let resp = match resp {
-            Ok(resp) => resp,
-            Err(err) => {
-                if err.code() == tonic::Code::NotFound {
-                    log::debug!(
-                        "[FILE_CACHE_DOWNLOAD:gRPC] Failed to download file {} from {}: file not found",
-                        err.message(),
-                        addr
-                    );
-                    continue;
-                }
+        .map_err(|error| anyhow::anyhow!("Failed to get file from {addr}: {error}"))?;
+    let mut data = bytes::BytesMut::new();
+    let mut stream = resp.into_inner();
+    while let Some(response) = stream.next().await {
+        let response = match response {
+            Ok(response) => response,
+            Err(error) if error.code() == tonic::Code::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        for content in response.entries {
+            if content.filename != file {
                 return Err(anyhow::anyhow!(
-                    "Failed to download file from {addr}, {err}"
+                    "peer {addr} returned unrequested file {}",
+                    content.filename
                 ));
             }
-        };
-        for content in resp.entries {
-            let entry = file_contents
-                .entry(content.filename.clone())
-                .or_insert(bytes::BytesMut::new());
-            entry.extend_from_slice(&content.content);
-            downloaded_files.insert(content.filename);
+            if content.content.len() > reservation.bytes.saturating_sub(data.len()) {
+                return Err(anyhow::anyhow!(
+                    "peer {addr} returned file {file} beyond registered size {}",
+                    reservation.bytes
+                ));
+            }
+            data.extend_from_slice(&content.content);
         }
     }
-
-    log::debug!(
-        "[FILE_CACHE_DOWNLOAD:gRPC] Successfully retrieved {} files from {} in {} ms",
-        downloaded_files.len(),
-        addr,
-        start.elapsed().as_millis()
-    );
-
-    // Cache the file contents
-    for (file, content) in file_contents {
-        let data = content.freeze();
-        if let Some(size) = file_size_map.get(&file)
-            && *size != data.len()
-        {
-            log::warn!(
-                "[FILE_CACHE_DOWNLOAD:gRPC] Failed to download file {} from {}: size mismatch, expected {} but got {}",
-                file,
-                addr,
-                size,
-                data.len()
-            );
-            downloaded_files.remove(&file);
-            continue;
-        }
-        if let Err(e) = file_data::set(&file, data).await {
-            log::error!("[FILE_CACHE_DOWNLOAD:gRPC] Failed to cache file {file}: {e}");
-            downloaded_files.remove(&file);
-        }
+    if data.len() != reservation.bytes {
+        return Err(anyhow::anyhow!(
+            "peer {addr} returned short file {file}: expected {}, got {}",
+            reservation.bytes,
+            data.len()
+        ));
     }
-
-    // Return list of failed files
-    let failed_files: Vec<_> = files
-        .iter()
-        .filter(|(_, f, ..)| !downloaded_files.contains(f))
-        .cloned()
-        .collect();
-
-    log::debug!(
-        "[FILE_CACHE_DOWNLOAD:gRPC] Failed to retrieve {} files from {} in {} ms",
-        failed_files.len(),
-        addr,
-        start.elapsed().as_millis()
-    );
-
-    Ok(failed_files)
+    let data = data.freeze();
+    match cache_type {
+        file_data::CacheType::Disk => {
+            file_data::disk::set_admitted(file, data, reservation).await?;
+            Ok(file_data::disk::exist(file).await)
+        }
+        file_data::CacheType::Memory => {
+            file_data::memory::set(file, data).await?;
+            Ok(file_data::memory::exist(file).await)
+        }
+        file_data::CacheType::None => Ok(false),
+    }
 }
 
+/// Try to admit independently owned warming. This never waits for queue capacity
+/// and retains no owned candidate data before byte/count admission. Cache probes
+/// may await, but their reservation is bounded and released on cancellation.
 pub async fn queue_download(
-    trace_id: String,
+    trace_id: &str,
     id: i64,
-    account: String,
-    file: String,
+    account: &str,
+    file: &str,
     size: i64,
     ts: i64,
     cache_type: file_data::CacheType,
-) -> Result<(), anyhow::Error> {
-    log::debug!(
-        "[FILE_CACHE_DOWNLOAD:JOB] [trace_id {trace_id}] enqueue file: {file}, size: {size}, ts: {ts}"
-    );
-
-    // files with data older than the cache max age are not worth caching: with
-    // time_lru they become the oldest bucket and are evicted first, so the
-    // download would be wasted work. Skip the queue and let the query read
-    // them directly from object storage.
-    if exceeds_cache_max_age(ts, cache_type) {
-        log::debug!(
-            "[FILE_CACHE_DOWNLOAD:JOB] [trace_id {trace_id}] skip file: {file}, data is older than the cache max age"
-        );
-        return Ok(());
+) -> QueueDownloadOutcome {
+    if cache_type == file_data::CacheType::None || exceeds_cache_max_age(ts, cache_type) {
+        return QueueDownloadOutcome::Skipped;
     }
-
+    let Ok(size) = usize::try_from(size) else {
+        return QueueDownloadOutcome::Rejected(DownloadRejection::InvalidSize);
+    };
+    let mut reservation = match DOWNLOAD_ADMISSION.reserve(file, size) {
+        Ok(reservation) => reservation,
+        Err(outcome) => return outcome,
+    };
     let cfg = get_config();
-
-    // skip if already queued or already being downloaded
-    if !queued_files::try_add(&file) {
-        return Ok(());
-    }
-    if processing_files::is_processing(&file) {
-        queued_files::remove(&file);
-        return Ok(());
-    }
-
-    if cfg.limit.file_download_enable_priority_queue
-        && should_prioritize_file(ts, cfg.limit.file_download_priority_queue_window_secs)
-    {
-        if PRIORITY_FILE_DOWNLOAD_CHANNEL
-            .push((
-                trace_id,
-                id,
-                account,
-                file.clone(),
-                size as usize,
-                cache_type,
-            ))
-            .await
-        {
-            metrics::FILE_DOWNLOADER_PRIORITY_QUEUE_SIZE
-                .with_label_values::<&str>(&[])
-                .inc();
-        } else {
-            queued_files::remove(&file);
-            log::warn!(
-                "[FILE_CACHE_DOWNLOAD:JOB] priority queue full ({FILE_DOWNLOAD_QUEUE_SIZE}), dropping file: {file}"
-            );
+    let cached = match cache_type {
+        file_data::CacheType::Memory => {
+            file_data::memory::exist(file).await
+                || (!cfg.memory_cache.skip_disk_check && file_data::disk::exist(file).await)
         }
-    } else {
-        if let Err(e) = FILE_DOWNLOAD_CHANNEL
-            .sender
-            .send((
-                trace_id,
-                id,
-                account,
-                file.clone(),
-                size as usize,
-                cache_type,
-            ))
-            .await
-        {
-            queued_files::remove(&file);
-            return Err(e.into());
-        }
-        metrics::FILE_DOWNLOADER_NORMAL_QUEUE_SIZE
-            .with_label_values::<&str>(&[])
-            .inc();
+        file_data::CacheType::Disk => file_data::disk::exist(file).await,
+        file_data::CacheType::None => unreachable!(),
+    };
+    if cached {
+        return QueueDownloadOutcome::Cached;
     }
-    Ok(())
+    let priority = cfg.limit.file_download_enable_priority_queue
+        && should_prioritize_file(ts, cfg.limit.file_download_priority_queue_window_secs);
+    reservation.record_queue(priority);
+    let item = FileInfo {
+        trace_id: trace_id.to_owned(),
+        id,
+        account: account.to_owned(),
+        cache: cache_type,
+        reservation: Arc::new(reservation),
+    };
+    if priority {
+        if !PRIORITY_FILE_DOWNLOAD_CHANNEL.push(item) {
+            return QueueDownloadOutcome::Rejected(DownloadRejection::Full);
+        }
+    } else if let Err(reason) = FILE_DOWNLOAD_CHANNEL.try_send(item) {
+        return QueueDownloadOutcome::Rejected(reason);
+    }
+    QueueDownloadOutcome::Accepted { bytes: size }
 }
 
 /// Returns true when the record count is unknown or the file contains enough
@@ -607,16 +568,18 @@ mod tests {
     use config::utils::time::{day_micros, hour_micros, now_micros};
 
     use super::{
-        FileInfo, PriorityDownloadQueue, exceeds_max_age, file_data, processing_files,
-        queued_files, should_download,
+        Arc, DownloadAdmission, DownloadQueue, DownloadRejection, FileInfo, Mutex,
+        PriorityDownloadQueue, QueueDownloadOutcome, exceeds_max_age, file_data, should_download,
     };
 
     #[test]
     fn test_should_download() {
         assert!(should_download(0));
-        assert!(!should_download(99));
-        assert!(should_download(100));
-        assert!(should_download(101));
+        let minimum = config::get_config().limit.file_download_min_records;
+        if minimum > 1 {
+            assert!(!should_download(minimum - 1));
+        }
+        assert!(should_download(minimum));
     }
 
     #[test]
@@ -646,105 +609,123 @@ mod tests {
         assert!(exceeds_max_age(thirty_days_ago, 3));
     }
 
-    #[test]
-    fn test_is_processing_false_initially() {
-        assert!(!processing_files::is_processing(
-            "unique_not_added_file_abc123.parquet"
-        ));
-    }
-
-    #[test]
-    fn test_add_and_is_processing() {
-        let name = "test_add_file_xyz999.parquet";
-        processing_files::add(name);
-        assert!(processing_files::is_processing(name));
-        processing_files::remove(name);
-    }
-
-    #[test]
-    fn test_remove_clears_processing() {
-        let name = "test_remove_file_qqq888.parquet";
-        processing_files::add(name);
-        processing_files::remove(name);
-        assert!(!processing_files::is_processing(name));
-    }
-
-    #[test]
-    fn test_normal_queue_cap_honored() {
-        let cap = 3;
-        let (tx, _rx) = tokio::sync::mpsc::channel::<FileInfo>(cap);
-
-        for i in 0..cap {
-            let result = tx.try_send((
-                format!("trace-{i}"),
-                i as i64,
-                "org".into(),
-                format!("file-{i}.parquet"),
-                1024,
-                file_data::CacheType::Disk,
-            ));
-            assert!(result.is_ok(), "send {i} should succeed under cap");
+    fn queued_item(admission: &Arc<DownloadAdmission>, file: &str, bytes: usize) -> FileInfo {
+        FileInfo {
+            trace_id: "queue-regression".into(),
+            id: 1,
+            account: "org".into(),
+            cache: file_data::CacheType::Disk,
+            reservation: Arc::new(admission.reserve(file, bytes).unwrap()),
         }
-
-        let overflow = tx.try_send((
-            "trace-overflow".into(),
-            99,
-            "org".into(),
-            "overflow.parquet".into(),
-            1024,
-            file_data::CacheType::Disk,
-        ));
-        assert!(overflow.is_err(), "send beyond cap must fail");
-    }
-
-    #[test]
-    fn test_queued_files_no_duplicates() {
-        let file = "dedup_test_unique_zz1234.parquet";
-
-        // first add succeeds
-        assert!(queued_files::try_add(file));
-        // same file rejected while already queued
-        assert!(!queued_files::try_add(file));
-
-        // after remove, can be queued again
-        queued_files::remove(file);
-        assert!(queued_files::try_add(file));
-
-        // cleanup
-        queued_files::remove(file);
     }
 
     #[tokio::test]
-    async fn test_priority_queue_cap_honored() {
-        let cap = 3;
-        let queue = PriorityDownloadQueue::new(cap);
-
-        // fill to cap — all succeed
-        for i in 0..cap {
-            let ok = queue
-                .push((
-                    format!("trace-{i}"),
-                    i as i64,
-                    "org".into(),
-                    format!("file-{i}.parquet"),
-                    1024,
-                    file_data::CacheType::Disk,
-                ))
-                .await;
-            assert!(ok, "push {i} should succeed under cap");
+    async fn stalled_normal_queue_rejects_without_retaining_candidates() {
+        let admission = Arc::new(DownloadAdmission::new(100, 10));
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let queue = DownloadQueue::new(tx, Arc::new(Mutex::new(rx)));
+        queue
+            .try_send(queued_item(&admission, "accepted", 40))
+            .unwrap();
+        for _ in 0..1000 {
+            // Reusing the rejected key must remain a capacity rejection, never
+            // a phantom duplicate left behind by a failed send.
+            let item = queued_item(&admission, "rejected", 40);
+            assert_eq!(queue.try_send(item), Err(DownloadRejection::Full));
         }
+        let active = queue.receiver.lock().await.recv().await.unwrap();
+        assert!(matches!(
+            admission.reserve("accepted", 40),
+            Err(QueueDownloadOutcome::Deduplicated)
+        ));
+        // Receiving is not completion: bytes remain charged while a worker
+        // owns the item even though the queue now has capacity.
+        assert!(matches!(
+            admission.reserve("too-much-active-work", 61),
+            Err(QueueDownloadOutcome::Rejected(DownloadRejection::Full))
+        ));
+        drop(active);
+        drop(admission.reserve("accepted", 100).unwrap());
+        queue.receiver.lock().await.close();
+        assert_eq!(
+            queue.try_send(queued_item(&admission, "closed", 100)),
+            Err(DownloadRejection::Closed)
+        );
+        drop(admission.reserve("closed", 100).unwrap());
+    }
 
-        // one more must be rejected
-        let overflow = queue
-            .push((
-                "trace-overflow".into(),
-                99,
-                "org".into(),
-                "overflow.parquet".into(),
-                1024,
-                file_data::CacheType::Disk,
+    #[tokio::test]
+    async fn priority_queue_is_bounded_lifo_and_shares_active_bytes() {
+        let admission = Arc::new(DownloadAdmission::new(100, 10));
+        let queue = PriorityDownloadQueue::new(2);
+        assert!(queue.push(queued_item(&admission, "older", 30)));
+        assert!(queue.push(queued_item(&admission, "newer", 30)));
+        for _ in 0..1000 {
+            assert!(!queue.push(queued_item(&admission, "rejected", 30)));
+        }
+        let newer = queue.pop().await;
+        assert_eq!(newer.reservation.file.as_ref(), "newer");
+        assert!(matches!(
+            admission.reserve("over-budget", 41),
+            Err(QueueDownloadOutcome::Rejected(DownloadRejection::Full))
+        ));
+        drop(newer);
+        let older = queue.pop().await;
+        assert_eq!(older.reservation.file.as_ref(), "older");
+        drop(older);
+        drop(admission.reserve("rejected", 100).unwrap());
+    }
+
+    #[test]
+    fn byte_and_count_admission_rejections_do_not_reserve_keys() {
+        let admission = Arc::new(DownloadAdmission::new(100, 1));
+        assert!(matches!(
+            admission.reserve("retry", 101),
+            Err(QueueDownloadOutcome::Rejected(DownloadRejection::TooLarge))
+        ));
+        assert!(matches!(
+            admission.reserve("retry", 0),
+            Err(QueueDownloadOutcome::Rejected(
+                DownloadRejection::InvalidSize
             ))
-            .await;
-        assert!(!overflow, "push beyond cap must return false");
+        ));
+        let first = admission.reserve("retry", 1).unwrap();
+        assert!(matches!(
+            admission.reserve("second", 1),
+            Err(QueueDownloadOutcome::Rejected(DownloadRejection::Full))
+        ));
+        drop(first);
+        drop(admission.reserve("second", 100).unwrap());
+    }
+
+    #[tokio::test]
+    async fn cancelled_active_worker_releases_bytes_and_dedupe() {
+        let admission = Arc::new(DownloadAdmission::new(100, 1));
+        let item = queued_item(&admission, "cancelled", 100);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let worker = tokio::spawn(async move {
+            let _item = item;
+            started_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.unwrap();
+        assert!(matches!(
+            admission.reserve("cancelled", 100),
+            Err(QueueDownloadOutcome::Deduplicated)
+        ));
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+        drop(admission.reserve("cancelled", 100).unwrap());
+    }
+
+    #[test]
+    fn failed_worker_unwind_releases_bytes_and_dedupe() {
+        let admission = Arc::new(DownloadAdmission::new(100, 1));
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _item = queued_item(&admission, "failed", 100);
+            panic!("simulated worker failure");
+        }));
+        assert!(failed.is_err());
+        drop(admission.reserve("failed", 100).unwrap());
     }
 }

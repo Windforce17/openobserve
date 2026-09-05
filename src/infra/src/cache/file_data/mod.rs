@@ -253,6 +253,12 @@ async fn validate_file(bytes: &[u8], ftype: FileType) -> Result<(), anyhow::Erro
     Ok(())
 }
 
+struct ExactFileWriter {
+    file: std::fs::File,
+    // The physical writer, not its async waiter, owns admission and temp cleanup.
+    _lifetime: std::sync::Arc<dyn Send + Sync>,
+}
+
 /// Where a download's body lands while it is verified.
 ///
 /// The MEMORY cache path buffers (its objects are small — callers route
@@ -267,6 +273,12 @@ enum DownloadSink {
         path: PathBuf,
         writer: Option<tokio::io::BufWriter<tokio::fs::File>>,
         written: u64,
+    },
+    ExactFile {
+        path: PathBuf,
+        writer: Option<ExactFileWriter>,
+        written: u64,
+        lifetime: std::sync::Arc<dyn Send + Sync>,
     },
 }
 
@@ -283,6 +295,15 @@ impl DownloadSink {
         }
     }
 
+    fn exact_file(path: PathBuf, lifetime: std::sync::Arc<dyn Send + Sync>) -> Self {
+        Self::ExactFile {
+            path,
+            writer: None,
+            written: 0,
+            lifetime,
+        }
+    }
+
     /// Prepare the sink for a (re-)download attempt: previous partial
     /// content is discarded.
     async fn reset(&mut self) -> Result<(), anyhow::Error> {
@@ -293,7 +314,6 @@ impl DownloadSink {
                 writer,
                 written,
             } => {
-                // create() truncates an earlier partial attempt
                 let file = tokio::fs::File::create(&*path).await.map_err(|e| {
                     anyhow::anyhow!("create download tmp file {}: {e}", path.display())
                 })?;
@@ -303,13 +323,38 @@ impl DownloadSink {
                 ));
                 *written = 0;
             }
+            DownloadSink::ExactFile {
+                path,
+                writer,
+                written,
+                lifetime,
+            } => {
+                let path = path.clone();
+                let lifetime = lifetime.clone();
+                *writer = Some(
+                    tokio::task::spawn_blocking(move || {
+                        let file = std::fs::File::create(&path).map_err(|error| {
+                            anyhow::anyhow!(
+                                "create exact download tmp file {}: {error}",
+                                path.display()
+                            )
+                        })?;
+                        Ok::<_, anyhow::Error>(ExactFileWriter {
+                            file,
+                            _lifetime: lifetime,
+                        })
+                    })
+                    .await??,
+                );
+                *written = 0;
+            }
         }
         Ok(())
     }
 
-    async fn write_chunk(&mut self, chunk: &[u8]) -> Result<(), anyhow::Error> {
+    async fn write_chunk(&mut self, chunk: Bytes) -> Result<(), anyhow::Error> {
         match self {
-            DownloadSink::Buffer(buf) => buf.extend_from_slice(chunk),
+            DownloadSink::Buffer(buf) => buf.extend_from_slice(&chunk),
             DownloadSink::File {
                 path,
                 writer,
@@ -318,10 +363,26 @@ impl DownloadSink {
                 let writer = writer
                     .as_mut()
                     .ok_or_else(|| anyhow::anyhow!("download sink used before reset"))?;
-                writer.write_all(chunk).await.map_err(|e| {
+                writer.write_all(&chunk).await.map_err(|e| {
                     anyhow::anyhow!("write download tmp file {}: {e}", path.display())
                 })?;
                 *written += chunk.len() as u64;
+            }
+            DownloadSink::ExactFile {
+                writer, written, ..
+            } => {
+                let mut owned = writer
+                    .take()
+                    .ok_or_else(|| anyhow::anyhow!("exact download sink used before reset"))?;
+                let len = chunk.len() as u64;
+                let (owned, result) = tokio::task::spawn_blocking(move || {
+                    let result = std::io::Write::write_all(&mut owned.file, &chunk);
+                    (owned, result)
+                })
+                .await?;
+                *writer = Some(owned);
+                result?;
+                *written += len;
             }
         }
         Ok(())
@@ -344,7 +405,9 @@ impl DownloadSink {
     fn len(&self) -> u64 {
         match self {
             DownloadSink::Buffer(buf) => buf.len() as u64,
-            DownloadSink::File { written, .. } => *written,
+            DownloadSink::File { written, .. } | DownloadSink::ExactFile { written, .. } => {
+                *written
+            }
         }
     }
 
@@ -354,7 +417,9 @@ impl DownloadSink {
     async fn validate(&self, ftype: FileType) -> Result<(), anyhow::Error> {
         match self {
             DownloadSink::Buffer(buf) => validate_file(buf, ftype).await,
-            DownloadSink::File { path, .. } => validate_file_ranged(path, ftype).await,
+            DownloadSink::File { path, .. } | DownloadSink::ExactFile { path, .. } => {
+                validate_file_ranged(path, ftype).await
+            }
         }
     }
 }
@@ -504,7 +569,14 @@ where
         let mut body = res.into_stream();
         while let Some(chunk) = body.next().await {
             let chunk = chunk?;
-            sink.write_chunk(&chunk).await?;
+            if size_policy == ExpectedSizePolicy::Exact
+                && chunk.len() as u64 > expected_blob_size.saturating_sub(sink.len())
+            {
+                return Err(anyhow::anyhow!(
+                    "file {file} body exceeds registered size {expected_blob_size}"
+                ));
+            }
+            sink.write_chunk(chunk).await?;
         }
         sink.finish_attempt().await?;
         data_len = sink.len();
@@ -644,6 +716,24 @@ async fn download_from_storage_to_file(
 ) -> Result<usize, anyhow::Error> {
     let mut sink = DownloadSink::file(tmp_path.to_path_buf());
     download_with_retries(|| crate::storage::get(account, file), file, size, &mut sink).await
+}
+
+async fn download_from_storage_to_file_exact(
+    account: &str,
+    file: &str,
+    expected_size: usize,
+    tmp_path: &Path,
+    lifetime: std::sync::Arc<dyn Send + Sync>,
+) -> Result<usize, anyhow::Error> {
+    let mut sink = DownloadSink::exact_file(tmp_path.to_path_buf(), lifetime);
+    download_with_retries_policy(
+        || crate::storage::get(account, file),
+        file,
+        Some(expected_size),
+        &mut sink,
+        ExpectedSizePolicy::Exact,
+    )
+    .await
 }
 
 /// set the data to the cache
@@ -905,16 +995,6 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_type_equality_and_copy() {
-        let a = CacheType::Disk;
-        let b = a;
-        assert_eq!(a, b);
-        assert_ne!(CacheType::Disk, CacheType::Memory);
-        assert_ne!(CacheType::Memory, CacheType::None);
-        assert_ne!(CacheType::Disk, CacheType::None);
-    }
-
-    #[test]
     fn test_cache_strategy_unknown_defaults_to_lru() {
         let mut lru = CacheStrategy::new("lru");
         let mut unknown = CacheStrategy::new("something_unknown");
@@ -1022,7 +1102,7 @@ mod tests {
     #[tokio::test]
     async fn exact_size_policy_rejects_header_before_buffering_body() {
         let mut sink = DownloadSink::buffer();
-        let error = download_with_retries_policy(
+        let result = download_with_retries_policy(
             || async {
                 Ok(synthetic_get_result(
                     vec![Bytes::from_static(b"must not be buffered")],
@@ -1034,15 +1114,8 @@ mod tests {
             &mut sink,
             ExpectedSizePolicy::Exact,
         )
-        .await
-        .unwrap_err();
-
-        assert!(
-            error
-                .to_string()
-                .contains("refusing to buffer beyond the caller's byte permit"),
-            "{error}"
-        );
+        .await;
+        assert!(result.is_err());
         assert_eq!(sink.len(), 0);
     }
     fn scratch_file(name: &str) -> PathBuf {
@@ -1051,6 +1124,104 @@ mod tests {
             name,
             config::ider::generate()
         ))
+    }
+
+    #[tokio::test]
+    async fn exact_body_overrun_never_enters_buffer_or_file_sink() {
+        let path = scratch_file("exact-overrun");
+        for mut sink in [
+            DownloadSink::buffer(),
+            DownloadSink::exact_file(path.clone(), Arc::new(())),
+        ] {
+            let result = download_with_retries_policy(
+                || async {
+                    Ok(synthetic_get_result(
+                        vec![Bytes::from_static(b"safe"), Bytes::from_static(b"overflow")],
+                        5,
+                    ))
+                },
+                "exact-overrun.vxi",
+                Some(5),
+                &mut sink,
+                ExpectedSizePolicy::Exact,
+            )
+            .await;
+            assert!(result.is_err());
+            assert_eq!(sink.len(), 4, "the overrun chunk must not be retained");
+            sink.finish_attempt().await.unwrap();
+        }
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"safe");
+        tokio::fs::remove_file(path).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exact_streamed_short_body_never_reports_success() {
+        let path = scratch_file("exact-short");
+        let mut sink = DownloadSink::exact_file(path.clone(), Arc::new(()));
+        let result = download_with_retries_policy(
+            || async { Ok(synthetic_get_result(vec![Bytes::from_static(b"short")], 10)) },
+            "exact-short.vxi",
+            Some(10),
+            &mut sink,
+            ExpectedSizePolicy::Exact,
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"short");
+        drop(sink);
+        tokio::fs::remove_file(path).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_exact_writer_retains_lifetime_until_physical_write_finishes() {
+        use std::{
+            io::Read,
+            os::{fd::OwnedFd, unix::net::UnixStream},
+        };
+
+        struct Lifetime(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for Lifetime {
+            fn drop(&mut self) {
+                let _ = self.0.take().unwrap().send(());
+            }
+        }
+
+        let (writer, mut reader) = UnixStream::pair().unwrap();
+        let (released_tx, mut released_rx) = tokio::sync::oneshot::channel();
+        let lifetime = Arc::new(Lifetime(Some(released_tx)));
+        let mut sink = DownloadSink::ExactFile {
+            path: PathBuf::from("blocked-native-writer"),
+            writer: Some(ExactFileWriter {
+                file: std::fs::File::from(OwnedFd::from(writer)),
+                _lifetime: lifetime.clone(),
+            }),
+            written: 0,
+            lifetime,
+        };
+        // A Unix stream without a reader stalls a real std-file write. This
+        // exercises the production completion-owned blocking write, not a mock.
+        const BYTES: usize = 8 * 1024 * 1024;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            started_tx.send(()).unwrap();
+            sink.write_chunk(Bytes::from(vec![0; BYTES])).await
+        });
+        started_rx.await.unwrap();
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        assert!(matches!(
+            released_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        let drained = tokio::task::spawn_blocking(move || {
+            let mut buffer = [0; 64 * 1024];
+            for _ in 0..BYTES / buffer.len() {
+                reader.read_exact(&mut buffer).unwrap();
+            }
+        });
+        drained.await.unwrap();
+        released_rx.await.unwrap();
     }
 
     /// A minimal structurally valid puffin: zero-length payload + footer

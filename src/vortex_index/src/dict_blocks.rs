@@ -187,10 +187,6 @@ impl BlockBuilder {
         self.count == 0
     }
 
-    pub(crate) fn count(&self) -> usize {
-        self.count
-    }
-
     /// Raw (uncompressed) key bytes pushed so far — the block-cut metric.
     pub(crate) fn raw_bytes(&self) -> usize {
         self.raw_bytes
@@ -228,6 +224,7 @@ impl BlockBuilder {
 /// Iterate every key of an encoded block in order. `on_key(position, key)`
 /// returns `false` to stop early.
 pub(crate) fn block_scan(block: &[u8], mut on_key: impl FnMut(usize, &[u8]) -> bool) -> Result<()> {
+    crate::source::check_read_cancelled()?;
     if block.is_empty() {
         return Ok(());
     }
@@ -251,6 +248,9 @@ pub(crate) fn block_scan(block: &[u8], mut on_key: impl FnMut(usize, &[u8]) -> b
     }
     index += 1;
     while pos < block.len() {
+        if index % 1024 == 0 {
+            crate::source::check_read_cancelled()?;
+        }
         let shared = read_varint(block, &mut pos)? as usize;
         let suffix_len = read_varint(block, &mut pos)? as usize;
         if shared > key.len() {
@@ -309,6 +309,74 @@ pub(crate) fn block_lower_bound(block: &[u8], target: &[u8]) -> Result<usize> {
 // index encode/parse
 // ---------------------------------------------------------------------------
 
+/// Optional field directory over the unchanged restart-page index encoding.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct DictFieldPages {
+    pub(crate) block_count: u64,
+    pub(crate) pages: Vec<DictFieldPage>,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct DictFieldPage {
+    pub(crate) field_id: u16,
+    pub(crate) first_block: u64,
+    pub(crate) block_end: u64,
+    pub(crate) keys_start: u64,
+    pub(crate) keys_end: u64,
+}
+
+impl DictFieldPages {
+    pub(crate) fn validate(&self, blob_len: u64) -> Result<()> {
+        let invalid = || VixError::Malformed("invalid dict field pages".to_string());
+        let count = self.block_count;
+        let interval = INDEX_RESTART_INTERVAL as u64;
+        let keys_base = count
+            .checked_mul(16)
+            .and_then(|n| n.checked_add(8))
+            .ok_or_else(invalid)?;
+        let restart_bytes = count
+            .div_ceil(interval)
+            .checked_mul(4)
+            .and_then(|n| n.checked_add(4))
+            .ok_or_else(invalid)?;
+        let keys_end = blob_len.checked_sub(restart_bytes).ok_or_else(invalid)?;
+        if count == 0 || keys_base >= keys_end || self.pages.is_empty() {
+            return Err(invalid());
+        }
+        let mut end = 0;
+        let mut previous: Option<&DictFieldPage> = None;
+        for page in &self.pages {
+            crate::source::check_read_cancelled()?;
+            if page.first_block != end
+                || page.block_end <= end
+                || page.block_end > count
+                || page.keys_start < keys_base
+                || page.keys_start >= page.keys_end
+                || page.keys_end > keys_end
+                || previous.is_some_and(|p| {
+                    p.field_id >= page.field_id
+                        || p.keys_start > page.keys_start
+                        || p.keys_end > page.keys_end
+                        || (p.first_block / interval == page.first_block / interval
+                            && p.keys_start != page.keys_start)
+                        || (p.block_end.div_ceil(interval) == page.block_end.div_ceil(interval)
+                            && p.keys_end != page.keys_end)
+                })
+                || (page.first_block == 0 && page.keys_start != keys_base)
+                || (page.block_end == count && page.keys_end != keys_end)
+            {
+                return Err(invalid());
+            }
+            end = page.block_end;
+            previous = Some(page);
+        }
+        if end != count {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+}
+
 /// Accumulates `(first_key, blocks_offset, first_ordinal)` triples while a
 /// sink flushes blocks, and serializes the index region.
 pub(crate) struct IndexBuilder {
@@ -316,6 +384,7 @@ pub(crate) struct IndexBuilder {
     fk_region: Vec<u8>,
     restarts: Vec<u32>,
     prev_key: Vec<u8>,
+    pages: Vec<DictFieldPage>,
 }
 
 impl IndexBuilder {
@@ -325,11 +394,8 @@ impl IndexBuilder {
             fk_region: Vec::new(),
             restarts: Vec::new(),
             prev_key: Vec::new(),
+            pages: Vec::new(),
         }
-    }
-
-    pub(crate) fn block_count(&self) -> usize {
-        self.metas.len()
     }
 
     /// Record one flushed block.
@@ -339,6 +405,21 @@ impl IndexBuilder {
         blocks_offset: u64,
         first_ordinal: u64,
     ) -> Result<()> {
+        let fid = first_key
+            .get(..2)
+            .ok_or_else(|| VixError::Malformed("dict first key lacks field id".to_string()))?;
+        let field_id = u16::from_be_bytes(fid.try_into().unwrap());
+        let block = self.metas.len() as u64;
+        match self.pages.last_mut() {
+            Some(page) if page.field_id == field_id => page.block_end = block + 1,
+            _ => self.pages.push(DictFieldPage {
+                field_id,
+                first_block: block,
+                block_end: block + 1,
+                keys_start: 0,
+                keys_end: 0,
+            }),
+        }
         if self.metas.len() % INDEX_RESTART_INTERVAL == 0 {
             let at = u32::try_from(self.fk_region.len())
                 .map_err(|_| VixError::Malformed("dict index region overflows u32".to_string()))?;
@@ -360,7 +441,7 @@ impl IndexBuilder {
     }
 
     /// Serialize the whole index blob.
-    pub(crate) fn finish(self) -> Vec<u8> {
+    pub(crate) fn finish_with_pages(mut self) -> (Vec<u8>, DictFieldPages) {
         let mut out = Vec::with_capacity(8 + self.metas.len() * 16 + self.fk_region.len() + 8);
         out.extend_from_slice(&(self.metas.len() as u64).to_le_bytes());
         for (off, ord) in &self.metas {
@@ -372,7 +453,24 @@ impl IndexBuilder {
             out.extend_from_slice(&r.to_le_bytes());
         }
         out.extend_from_slice(&(self.restarts.len() as u32).to_le_bytes());
-        out
+        let keys_base = 8 + self.metas.len() as u64 * 16;
+        for page in &mut self.pages {
+            page.keys_start = keys_base
+                + u64::from(self.restarts[page.first_block as usize / INDEX_RESTART_INTERVAL]);
+            let end_restart = (page.block_end as usize).div_ceil(INDEX_RESTART_INTERVAL);
+            page.keys_end = keys_base
+                + self
+                    .restarts
+                    .get(end_restart)
+                    .map_or(self.fk_region.len() as u64, |&offset| u64::from(offset));
+        }
+        (
+            out,
+            DictFieldPages {
+                block_count: self.metas.len() as u64,
+                pages: self.pages,
+            },
+        )
     }
 }
 
@@ -382,10 +480,19 @@ pub(crate) struct DictIndex {
     metas: Vec<(u64, u64)>,
     fk_region: Vec<u8>,
     restarts: Vec<u32>,
+    trailing: Option<(u64, u64)>,
+    field_blocks: std::ops::Range<usize>,
 }
 
 impl DictIndex {
+    pub(crate) fn memory_size(&self) -> usize {
+        self.metas.capacity() * std::mem::size_of::<(u64, u64)>()
+            + self.fk_region.capacity()
+            + self.restarts.capacity() * std::mem::size_of::<u32>()
+    }
+
     pub(crate) fn parse(data: &[u8]) -> Result<Self> {
+        crate::source::check_read_cancelled()?;
         let truncated = || VixError::Malformed("dict index truncated".to_string());
         let block_count =
             u64::from_le_bytes(data.get(0..8).ok_or_else(truncated)?.try_into().unwrap()) as usize;
@@ -395,6 +502,9 @@ impl DictIndex {
         let meta_bytes = data.get(8..meta_end).ok_or_else(truncated)?;
         let mut metas = Vec::with_capacity(block_count);
         for chunk in meta_bytes.chunks_exact(16) {
+            if metas.len() % 1024 == 0 {
+                crate::source::check_read_cancelled()?;
+            }
             metas.push((
                 u64::from_le_bytes(chunk[0..8].try_into().unwrap()),
                 u64::from_le_bytes(chunk[8..16].try_into().unwrap()),
@@ -411,6 +521,9 @@ impl DictIndex {
             .ok_or_else(truncated)?;
         let mut restarts = Vec::with_capacity(restart_count);
         for chunk in data[restarts_start..data.len() - 4].chunks_exact(4) {
+            if restarts.len() % 1024 == 0 {
+                crate::source::check_read_cancelled()?;
+            }
             restarts.push(u32::from_le_bytes(chunk.try_into().unwrap()));
         }
         let fk_region = data[meta_end..restarts_start].to_vec();
@@ -427,7 +540,119 @@ impl DictIndex {
             metas,
             fk_region,
             restarts,
+            trailing: None,
+            field_blocks: 0..block_count,
         })
+    }
+
+    /// Parse enclosing restart pages without inventing a new disk encoding.
+    /// Adjacent meta records validate both global boundaries of the slice.
+    pub(crate) fn parse_field(
+        directory: &DictFieldPages,
+        page: &DictFieldPage,
+        meta_bytes: &[u8],
+        keys: &[u8],
+        restart_bytes: &[u8],
+        blocks_len: u64,
+        term_count: u64,
+    ) -> Result<Self> {
+        let malformed = || VixError::Malformed("invalid dict field pages".to_string());
+        let interval = INDEX_RESTART_INTERVAL as u64;
+        let first = page.first_block / interval * interval;
+        let end = page
+            .block_end
+            .div_ceil(interval)
+            .saturating_mul(interval)
+            .min(directory.block_count);
+        let count = usize::try_from(end - first).map_err(|_| malformed())?;
+        let leading = usize::from(first > 0);
+        let expected_metas = leading + count + usize::from(end < directory.block_count);
+        if meta_bytes.len() != expected_metas * 16
+            || keys.len() as u64 != page.keys_end - page.keys_start
+            || restart_bytes.len() != count.div_ceil(INDEX_RESTART_INTERVAL) * 4
+        {
+            return Err(malformed());
+        }
+        let mut metas = Vec::with_capacity(count);
+        let mut previous = None;
+        let mut trailing = None;
+        for (i, chunk) in meta_bytes.chunks_exact(16).enumerate() {
+            crate::source::check_read_cancelled()?;
+            let meta = (
+                u64::from_le_bytes(chunk[..8].try_into().unwrap()),
+                u64::from_le_bytes(chunk[8..].try_into().unwrap()),
+            );
+            if meta.0 >= blocks_len
+                || meta.1 >= term_count
+                || previous.is_some_and(|p: (u64, u64)| p.0 >= meta.0 || p.1 >= meta.1)
+                || (first == 0 && i == 0 && meta != (0, 0))
+            {
+                return Err(malformed());
+            }
+            previous = Some(meta);
+            if i < leading {
+                // The preceding global block is not part of this local
+                // index, but its offset/ordinal constrain the first one.
+                continue;
+            }
+            if i == leading + count {
+                trailing = Some(meta);
+            } else {
+                metas.push(meta);
+            }
+        }
+        let keys_base = 8 + directory.block_count * 16;
+        let origin = page.keys_start - keys_base;
+        let mut restarts = Vec::with_capacity(restart_bytes.len() / 4);
+        for chunk in restart_bytes.chunks_exact(4) {
+            let global = u64::from(u32::from_le_bytes(chunk.try_into().unwrap()));
+            let offset = global.checked_sub(origin).ok_or_else(malformed)?;
+            if offset >= keys.len() as u64
+                || restarts.last().is_some_and(|&p| u64::from(p) >= offset)
+            {
+                return Err(malformed());
+            }
+            restarts.push(u32::try_from(offset).map_err(|_| malformed())?);
+        }
+        if restarts.first() != Some(&0) {
+            return Err(malformed());
+        }
+        let parsed = Self {
+            metas,
+            fk_region: keys.to_vec(),
+            restarts,
+            trailing,
+            field_blocks: (page.first_block - first) as usize..(page.block_end - first) as usize,
+        };
+        let mut seen = 0usize;
+        let mut valid = true;
+        let mut previous_key = Vec::new();
+        parsed.walk_first_keys(|b, key| {
+            let global = first + b as u64;
+            let slot = directory.pages.partition_point(|p| p.block_end <= global);
+            let expected = directory.pages.get(slot).map(|p| p.field_id.to_be_bytes());
+            if b != seen
+                || b >= count
+                || key.len() < 2
+                || expected.as_ref().map(|fid| fid.as_slice()) != key.get(..2)
+                || (!previous_key.is_empty() && previous_key.as_slice() >= key)
+            {
+                valid = false;
+                return false;
+            }
+            seen += 1;
+            previous_key.clear();
+            previous_key.extend_from_slice(key);
+            true
+        })?;
+        if !valid || seen != count {
+            return Err(malformed());
+        }
+        Ok(parsed)
+    }
+
+    pub(crate) fn field_blocks(&self) -> std::ops::Range<usize> {
+        self.field_blocks.clone()
     }
 
     pub(crate) fn block_count(&self) -> usize {
@@ -446,7 +671,7 @@ impl DictIndex {
         let end = if b + 1 < self.metas.len() {
             self.metas[b + 1].0
         } else {
-            blob_len
+            self.trailing.map_or(blob_len, |boundary| boundary.0)
         };
         start..end
     }
@@ -457,7 +682,7 @@ impl DictIndex {
         let next = if b + 1 < self.metas.len() {
             self.metas[b + 1].1
         } else {
-            term_count
+            self.trailing.map_or(term_count, |boundary| boundary.1)
         };
         next - first
     }
@@ -541,6 +766,7 @@ impl DictIndex {
     ) -> Result<()> {
         let mut stop = false;
         for r in 0..self.restarts.len() {
+            crate::source::check_read_cancelled()?;
             if stop {
                 break;
             }
@@ -553,6 +779,25 @@ impl DictIndex {
             })?;
         }
         Ok(())
+    }
+
+    /// Test an upper fence using resident first keys, before key-block IO.
+    pub(crate) fn block_starts_before(
+        &self,
+        b: usize,
+        bound: &[u8],
+        inclusive: bool,
+    ) -> Result<bool> {
+        let mut result = None;
+        self.walk_from_restart(b / INDEX_RESTART_INTERVAL, |block, key| {
+            if block == b {
+                result = Some(if inclusive { key <= bound } else { key < bound });
+                false
+            } else {
+                true
+            }
+        })?;
+        result.ok_or_else(|| VixError::Malformed("dict first key missing".into()))
     }
 
     /// The block that may contain `key`: the LAST block whose first key is
@@ -611,6 +856,7 @@ impl<'a> BlockIter<'a> {
     }
 
     pub(crate) fn next(&mut self) -> Result<Option<&[u8]>> {
+        crate::source::check_read_cancelled()?;
         if !self.started {
             self.started = true;
             if self.data.is_empty() {
@@ -656,6 +902,109 @@ impl<'a> BlockIter<'a> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn field_restart_slice_rejects_regressing_first_meta() {
+        let mut builder = IndexBuilder::new();
+        for block in 0..48u64 {
+            let mut key = (block as u16 / 16 + 1).to_be_bytes().to_vec();
+            key.extend_from_slice(format!("{block:04}").as_bytes());
+            builder.push_block(&key, block * 11, block).unwrap();
+        }
+        let (bytes, directory) = builder.finish_with_pages();
+        let page = &directory.pages[1]; // Exactly global blocks 16..32.
+        let metas = &bytes[8 + 15 * 16..8 + 33 * 16];
+        let keys = &bytes[page.keys_start as usize..page.keys_end as usize];
+        let restart_base = bytes.len() - 4 - 3 * 4;
+        let restarts = &bytes[restart_base + 4..restart_base + 8];
+        let parse = |metas: &[u8]| {
+            DictIndex::parse_field(&directory, page, metas, keys, restarts, 48 * 11, 48)
+        };
+        let valid = parse(metas).unwrap();
+        let first_key = b"\x00\x020016";
+        let block = valid.predecessor_block(first_key).unwrap().unwrap();
+        assert_eq!(valid.meta(block), (16 * 11, 16));
+
+        // The previous page still ends at ordinal 15. A locally increasing
+        // 7,17,18,... slice must not answer the queried key with ordinal 7.
+        let mut corrupt = metas.to_vec();
+        corrupt[16 + 8..16 + 16].copy_from_slice(&7u64.to_le_bytes());
+        assert!(parse(&corrupt).is_err());
+
+        // The byte-offset boundary requires the same cross-page check.
+        let mut corrupt = metas.to_vec();
+        corrupt[16..16 + 8].copy_from_slice(&(7u64 * 11).to_le_bytes());
+        assert!(parse(&corrupt).is_err());
+    }
+
+    #[test]
+    fn field_restart_slices_preserve_global_trailing_boundaries() {
+        let mut builder = IndexBuilder::new();
+        let mut block = 0u64;
+        for (fid, count) in [(1u16, 17), (2, 19), (3, 20)] {
+            for key in 0..count {
+                let mut composite = fid.to_be_bytes().to_vec();
+                composite.extend_from_slice(format!("{key:04}").as_bytes());
+                builder
+                    .push_block(&composite, block * 11, block * 3)
+                    .unwrap();
+                block += 1;
+            }
+        }
+        let (bytes, directory) = builder.finish_with_pages();
+        directory.validate(bytes.len() as u64).unwrap();
+        let full = DictIndex::parse(&bytes).unwrap();
+        let restart_base = bytes.len() - 4 - (block as usize).div_ceil(INDEX_RESTART_INTERVAL) * 4;
+        for page in &directory.pages {
+            let first = page.first_block as usize / INDEX_RESTART_INTERVAL * INDEX_RESTART_INTERVAL;
+            let end = (page.block_end as usize)
+                .div_ceil(INDEX_RESTART_INTERVAL)
+                .saturating_mul(INDEX_RESTART_INTERVAL)
+                .min(block as usize);
+            let metas = &bytes[8 + first.saturating_sub(1) * 16
+                ..8 + (end + usize::from(end < block as usize)) * 16];
+            let keys = &bytes[page.keys_start as usize..page.keys_end as usize];
+            let restarts = &bytes[restart_base + first / INDEX_RESTART_INTERVAL * 4
+                ..restart_base + end.div_ceil(INDEX_RESTART_INTERVAL) * 4];
+            let local = DictIndex::parse_field(
+                &directory,
+                page,
+                metas,
+                keys,
+                restarts,
+                block * 11,
+                block * 3,
+            )
+            .unwrap();
+            for b in 0..local.block_count() {
+                assert_eq!(local.meta(b), full.meta(first + b));
+                assert_eq!(
+                    local.block_range(b, block * 11),
+                    full.block_range(first + b, block * 11)
+                );
+                assert_eq!(local.block_key_count(b, block * 3), 3);
+            }
+            let mut wrong_identity = directory.clone();
+            wrong_identity
+                .pages
+                .iter_mut()
+                .find(|p| p.field_id == page.field_id)
+                .unwrap()
+                .field_id += 100;
+            assert!(
+                DictIndex::parse_field(
+                    &wrong_identity,
+                    page,
+                    metas,
+                    keys,
+                    restarts,
+                    block * 11,
+                    block * 3,
+                )
+                .is_err()
+            );
+        }
+    }
+
     fn keys(n: usize) -> Vec<Vec<u8>> {
         // realistic composite shape: {fid u16 BE}{token}, several fields
         let mut out: Vec<Vec<u8>> = Vec::new();
@@ -683,7 +1032,7 @@ mod tests {
                 first_ord = ord as u64;
             }
             bb.push(k).unwrap();
-            if bb.count() >= per_block {
+            if ord + 1 - first_ord as usize >= per_block {
                 let off = blocks.len() as u64;
                 let bytes = bb.finish();
                 index.push_block(&first_key, off, first_ord).unwrap();
@@ -696,7 +1045,7 @@ mod tests {
             index.push_block(&first_key, off, first_ord).unwrap();
             blocks.extend_from_slice(&bytes);
         }
-        (index.finish(), blocks)
+        (index.finish_with_pages().0, blocks)
     }
 
     #[test]

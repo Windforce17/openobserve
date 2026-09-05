@@ -19,6 +19,7 @@ use config::{TIMESTAMP_COL_NAME, meta::inverted_index::UNKNOWN_NAME};
 use datafusion::{
     common::{Result, tree_node::TreeNode},
     error::DataFusionError,
+    functions_aggregate::count::Count,
     logical_expr::Operator,
     physical_expr::{
         PhysicalExpr,
@@ -161,16 +162,21 @@ pub fn min_max_column_aggregate(expr: &AggregateFunctionExpr) -> Option<(String,
 }
 
 pub fn is_count_rows_aggregate(expr: &AggregateFunctionExpr) -> bool {
-    if expr.name() == "count(Int64(1))" {
-        return true;
-    }
-
-    if !expr.fun().name().eq_ignore_ascii_case("count") || expr.is_distinct() {
+    // The display/output name is not an aggregate identity. In particular, an
+    // alias named `count(Int64(1))` must not make another expression count rows.
+    if expr.fun().inner().downcast_ref::<Count>().is_none() || expr.is_distinct() {
         return false;
     }
-
     let args = expr.expressions();
-    args.len() == 1 && is_column(&args[0]) && get_column_name(&args[0]) == TIMESTAMP_COL_NAME
+    let [arg] = args.as_slice() else {
+        return false;
+    };
+    if let Some(literal) = arg.downcast_ref::<Literal>() {
+        return !literal.value().is_null();
+    }
+    // A cast can fail or introduce NULLs, even when its input is _timestamp.
+    arg.downcast_ref::<Column>()
+        .is_some_and(|column| column.name() == TIMESTAMP_COL_NAME)
 }
 
 pub fn is_value(expr: &Arc<dyn PhysicalExpr>) -> bool {
@@ -224,6 +230,44 @@ mod tests {
 
     fn col_expr(name: &str) -> Arc<dyn PhysicalExpr> {
         Arc::new(Column::new(name, 0))
+    }
+
+    #[test]
+    fn test_count_rows_requires_count_identity_and_uncast_nonnull_argument() -> Result<()> {
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::{
+            functions_aggregate::{count::count_udaf, sum::sum_udaf},
+            physical_expr::aggregate::AggregateExprBuilder,
+        };
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            TIMESTAMP_COL_NAME,
+            DataType::Int64,
+            false,
+        )]));
+        let timestamp = col_expr(TIMESTAMP_COL_NAME);
+        let cast: Arc<dyn PhysicalExpr> =
+            Arc::new(CastExpr::new(timestamp.clone(), DataType::Int8, None));
+        let null: Arc<dyn PhysicalExpr> = Arc::new(Literal::new(ScalarValue::Int64(None)));
+        for (arg, distinct, expected) in [
+            (int64_literal(1), false, true),
+            (timestamp, false, true),
+            (cast, false, false),
+            (null, false, false),
+            (int64_literal(1), true, false),
+        ] {
+            let aggregate = AggregateExprBuilder::new(count_udaf(), vec![arg])
+                .schema(schema.clone())
+                .alias("count(Int64(1))")
+                .with_distinct(distinct)
+                .build()?;
+            assert_eq!(is_count_rows_aggregate(&aggregate), expected);
+        }
+        let sum = AggregateExprBuilder::new(sum_udaf(), vec![int64_literal(1)])
+            .schema(schema)
+            .alias("count(Int64(1))")
+            .build()?;
+        assert!(!is_count_rows_aggregate(&sum));
+        Ok(())
     }
 
     #[test]

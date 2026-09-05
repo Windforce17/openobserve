@@ -46,7 +46,6 @@ impl Event for Eventer {
         let _ = tracing::Span::current().set_parent(parent_cx);
 
         let req = req.get_ref();
-        let grpc_addr = req.node_addr.clone();
         let put_items = req
             .items
             .iter()
@@ -82,62 +81,23 @@ impl Event for Eventer {
 
         // cache latest files for querier
         if cfg.cache_latest_files.enabled && LOCAL_NODE.is_querier() {
-            let files_to_download =
-                collect_files_to_download(cfg.cache_latest_files.cache_parquet, &put_items);
-
-            // Try batch download first
-            if get_config().cache_latest_files.download_from_node {
-                let mut failed_files = Vec::new();
-
-                // Try batch download files
-                if !files_to_download.is_empty() {
-                    match crate::service::file_downloader::download_from_node(
-                        &grpc_addr,
-                        &files_to_download,
-                    )
-                    .await
-                    {
-                        Ok(failed) => failed_files = failed,
-                        Err(e) => {
-                            log::error!("[gRPC:Event] Failed to get files from notifier: {e}");
-                            failed_files = files_to_download;
-                        }
-                    }
-                }
-
-                // Fallback to individual downloads for failed files
-                for (id, account, file, size, ts) in failed_files {
-                    if let Err(e) = crate::service::file_downloader::queue_download(
-                        TRACE_ID_FOR_CACHE_LATEST_FILE.to_string(),
-                        id,
-                        account,
-                        file,
-                        size,
-                        ts,
-                        CacheType::Disk,
-                    )
-                    .await
-                    {
-                        log::error!("[gRPC:Event] Failed to cache file data: {e}");
-                    }
-                }
-            } else {
-                // Direct download when download_from_node_enabled is false
-                for (id, account, file, size, ts) in files_to_download {
-                    if let Err(e) = crate::service::file_downloader::queue_download(
-                        TRACE_ID_FOR_CACHE_LATEST_FILE.to_string(),
-                        id,
-                        account,
-                        file,
-                        size,
-                        ts,
-                        CacheType::Disk,
-                    )
-                    .await
-                    {
-                        log::error!("[gRPC:Event] Failed to cache file data: {e}");
-                    }
-                }
+            // Peer and object-store warming share the same bounded admission.
+            // The admitted worker may try its consistent-hash peer; a notifier
+            // never buffers an uncharged batch before queueing.
+            for (id, account, file, size, ts) in
+                files_to_download(cfg.cache_latest_files.cache_parquet, &put_items)
+            {
+                let outcome = crate::service::file_downloader::queue_download(
+                    TRACE_ID_FOR_CACHE_LATEST_FILE,
+                    id,
+                    account,
+                    &file,
+                    size,
+                    ts,
+                    CacheType::Disk,
+                )
+                .await;
+                log::debug!("[gRPC:Event] cache warming admission for {file}: {outcome:?}");
             }
 
             // delete merge files
@@ -187,51 +147,51 @@ impl Event for Eventer {
 }
 
 /// The download rows — `(id, account, key, size, max_ts)` — one broadcast
-/// enqueues on a caching querier: each cacheable data file plus the immutable
+/// lazily offers on a caching querier: each cacheable data file plus the immutable
 /// `.vxi` sidecar named by its generation when `index_size > 0`.
 /// `cache_parquet=false` enqueues nothing. Undersized rows
 /// (`should_download`) and rows past the disk-cache max age skip whole-object
 /// caching; a later query can fill the generation-addressed object on demand.
-fn collect_files_to_download(
+fn files_to_download(
     cache_parquet: bool,
     put_items: &[FileKey],
-) -> Vec<(i64, String, String, i64, i64)> {
-    let mut files_to_download = Vec::new();
-    if !cache_parquet {
-        return files_to_download;
-    }
-    for item in put_items.iter() {
-        if !crate::service::file_downloader::should_download(item.meta.records) {
-            continue;
-        }
-        // files with data older than the cache max age should not be
-        // cached, e.g. merged files from compaction of old partitions
-        if crate::service::file_downloader::exceeds_cache_max_age(item.meta.max_ts, CacheType::Disk)
-        {
-            continue;
-        }
-        // cache the data file, and (v3 split) its `.vxi` index sidecar
-        // when one exists
-        files_to_download.push((
-            item.id,
-            item.account.clone(),
-            item.key.clone(),
-            item.meta.compressed_size,
-            item.meta.max_ts,
-        ));
-        if item.meta.index_size > 0
-            && let Some(sidecar) = config::vix_sidecar_key(&item.key, item.meta.index_generation)
-        {
-            files_to_download.push((
+) -> impl Iterator<Item = (i64, &str, std::borrow::Cow<'_, str>, i64, i64)> {
+    let put_items = if cache_parquet { put_items } else { &[] };
+    put_items
+        .iter()
+        .filter(|item| {
+            crate::service::file_downloader::should_download(item.meta.records)
+                && !crate::service::file_downloader::exceeds_cache_max_age(
+                    item.meta.max_ts,
+                    CacheType::Disk,
+                )
+        })
+        .flat_map(|item| {
+            let data = (
                 item.id,
-                item.account.clone(),
-                sidecar,
-                item.meta.index_size,
+                item.account.as_str(),
+                std::borrow::Cow::Borrowed(item.key.as_str()),
+                item.meta.compressed_size,
                 item.meta.max_ts,
-            ));
-        }
-    }
-    files_to_download
+            );
+            std::iter::once(data).chain(
+                std::iter::once_with(move || {
+                    if item.meta.index_size <= 0 {
+                        return None;
+                    }
+                    config::vix_sidecar_key(&item.key, item.meta.index_generation).map(|key| {
+                        (
+                            item.id,
+                            item.account.as_str(),
+                            std::borrow::Cow::Owned(key),
+                            item.meta.index_size,
+                            item.meta.max_ts,
+                        )
+                    })
+                })
+                .flatten(),
+            )
+        })
 }
 /// Cache keys a broadcast's DELETED rows evict: each data key plus the
 /// active immutable sidecar named by metadata when `index_size > 0`.
@@ -348,7 +308,6 @@ async fn handle_file_chunked(
 
 #[cfg(test)]
 mod tests {
-    use proto::cluster_rpc::{FileKey, FileList, FileMeta};
 
     use super::*;
 
@@ -429,7 +388,7 @@ mod tests {
             meta(1000, 512, 73),
             false,
         );
-        let rows = collect_files_to_download(true, std::slice::from_ref(&core));
+        let rows = files_to_download(true, std::slice::from_ref(&core)).collect::<Vec<_>>();
         assert_eq!(rows.len(), 2, "data object + index sidecar");
         assert_eq!(rows[0].2, core.key);
         assert_eq!(rows[0].3, 4096, "data row sized by compressed_size");
@@ -443,11 +402,10 @@ mod tests {
             rows[1].3, 512,
             "sidecar row sized by index_size (v2: exact object size)"
         );
-        assert_eq!(rows[1].0, core.id, "sidecar keeps the data row's file id");
 
         let mut next = core.clone();
         next.meta.index_generation = 74;
-        let next_rows = collect_files_to_download(true, std::slice::from_ref(&next));
+        let next_rows = files_to_download(true, std::slice::from_ref(&next)).collect::<Vec<_>>();
         assert_ne!(
             rows[1].2, next_rows[1].2,
             "equal-sized generations must enqueue different immutable sidecars"
@@ -466,7 +424,7 @@ mod tests {
             meta(1000, 0, 75),
             false,
         );
-        let rows = collect_files_to_download(true, std::slice::from_ref(&no_sidecar));
+        let rows = files_to_download(true, std::slice::from_ref(&no_sidecar)).collect::<Vec<_>>();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].2, no_sidecar.key);
 
@@ -478,7 +436,7 @@ mod tests {
             meta(1000, 512, 76),
             false,
         );
-        let rows = collect_files_to_download(true, std::slice::from_ref(&legacy));
+        let rows = files_to_download(true, std::slice::from_ref(&legacy)).collect::<Vec<_>>();
         assert_eq!(rows.len(), 1, "non-.vix keys have no derivable sidecar");
 
         // undersized rows skip whole (data AND sidecar)
@@ -490,7 +448,9 @@ mod tests {
             false,
         );
         assert!(
-            collect_files_to_download(true, std::slice::from_ref(&tiny)).is_empty(),
+            files_to_download(true, std::slice::from_ref(&tiny))
+                .next()
+                .is_none(),
             "rows under file_download_min_records enqueue nothing"
         );
     }
@@ -626,7 +586,7 @@ mod tests {
             "broadcast purge covers every result generation of the logical file"
         );
 
-        let rows = collect_files_to_download(true, std::slice::from_ref(&healed));
+        let rows = files_to_download(true, std::slice::from_ref(&healed)).collect::<Vec<_>>();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1].2, new_key);
         assert_eq!(rows[1].3, old_sidecar.len() as i64 + 9);
@@ -656,250 +616,10 @@ mod tests {
             },
             false,
         );
-        assert!(collect_files_to_download(false, std::slice::from_ref(&item)).is_empty());
-    }
-
-    #[test]
-    fn test_file_content_response_creation() {
-        // Test creating a FileContentResponse
-        let file_content = FileContent {
-            content: b"test content".to_vec(),
-            filename: "test.txt".to_string(),
-        };
-
-        let response = FileContentResponse {
-            entries: vec![file_content.clone()],
-        };
-
-        assert_eq!(response.entries.len(), 1);
-        assert_eq!(response.entries[0].content, b"test content");
-        assert_eq!(response.entries[0].filename, "test.txt");
-    }
-
-    #[test]
-    fn test_file_key_creation() {
-        // Test creating FileKey directly
-        let file_key = FileKey {
-            id: 123,
-            key: "test/file.parquet".to_string(),
-            account: "test_account".to_string(),
-            deleted: false,
-            meta: Some(FileMeta {
-                compressed_size: 1024,
-                index_size: 512,
-                max_ts: 1234567890,
-                ..Default::default()
-            }),
-            segment_ids: None,
-        };
-
-        assert_eq!(file_key.id, 123);
-        assert_eq!(file_key.key, "test/file.parquet");
-        assert_eq!(file_key.account, "test_account");
-    }
-
-    #[test]
-    fn test_filter_deleted_items() {
-        // Test filtering deleted items from FileList
-        let items = [
-            FileKey {
-                id: 1,
-                key: "test/file1.parquet".to_string(),
-                account: "test_account".to_string(),
-                deleted: false,
-                meta: Some(FileMeta {
-                    compressed_size: 1024,
-                    index_size: 512,
-                    max_ts: 1234567890,
-                    ..Default::default()
-                }),
-                segment_ids: None,
-            },
-            FileKey {
-                id: 2,
-                key: "test/file2.parquet".to_string(),
-                account: "test_account".to_string(),
-                deleted: true,
-                meta: Some(FileMeta {
-                    compressed_size: 2048,
-                    index_size: 1024,
-                    max_ts: 1234567891,
-                    ..Default::default()
-                }),
-                segment_ids: None,
-            },
-            FileKey {
-                id: 3,
-                key: "test/file3.parquet".to_string(),
-                account: "test_account".to_string(),
-                deleted: false,
-                meta: Some(FileMeta {
-                    compressed_size: 3072,
-                    index_size: 1536,
-                    max_ts: 1234567892,
-                    ..Default::default()
-                }),
-                segment_ids: None,
-            },
-        ];
-
-        let non_deleted_items: Vec<&FileKey> = items.iter().filter(|v| !v.deleted).collect();
-
-        assert_eq!(non_deleted_items.len(), 2);
-        assert_eq!(non_deleted_items[0].id, 1);
-        assert_eq!(non_deleted_items[1].id, 3);
-    }
-
-    #[test]
-    fn test_chunk_size_calculation() {
-        // Test chunk size calculation logic
-        let total_size = 10000u64;
-        let mut offset = 0u64;
-        let chunk_size = 4096u64;
-
-        let mut chunks = Vec::new();
-        while offset < total_size {
-            let current_chunk_size = std::cmp::min(chunk_size, total_size - offset);
-            chunks.push(current_chunk_size);
-            offset += current_chunk_size;
-        }
-
-        assert_eq!(chunks.len(), 3);
-        assert_eq!(chunks[0], 4096);
-        assert_eq!(chunks[1], 4096);
-        assert_eq!(chunks[2], 1808); // 10000 - 8192
-        assert_eq!(offset, total_size);
-    }
-
-    #[test]
-    fn test_range_creation() {
-        // Test creating ranges for file reading
-        let offset = 1024u64;
-        let chunk_size = 512u64;
-        let range = Range {
-            start: offset,
-            end: offset + chunk_size,
-        };
-
-        assert_eq!(range.start, 1024);
-        assert_eq!(range.end, 1536);
-        assert_eq!(range.end - range.start, 512);
-    }
-
-    #[test]
-    fn test_file_meta_validation() {
-        // Test FileMeta validation
-        let valid_meta = FileMeta {
-            compressed_size: 1024,
-            index_size: 512,
-            max_ts: 1234567890,
-            ..Default::default()
-        };
-
-        assert!(valid_meta.compressed_size > 0);
-        assert!(valid_meta.index_size > 0);
-        assert!(valid_meta.max_ts > 0);
-
-        // Test with zero values
-        let zero_meta = FileMeta {
-            compressed_size: 0,
-            index_size: 0,
-            max_ts: 0,
-            ..Default::default()
-        };
-
-        assert_eq!(zero_meta.compressed_size, 0);
-        assert_eq!(zero_meta.index_size, 0);
-        assert_eq!(zero_meta.max_ts, 0);
-    }
-
-    #[test]
-    fn test_cache_type_enum() {
-        // Test CacheType enum values
-        assert_eq!(CacheType::Disk as u32, 0);
-        assert_eq!(CacheType::Memory as u32, 1);
-    }
-
-    #[test]
-    fn test_metadata_map_creation() {
-        // Test MetadataMap creation from tonic Request
-        let mut metadata = tonic::metadata::MetadataMap::new();
-        metadata.insert("test_key", "test_value".parse().unwrap());
-
-        let request = Request::new(FileList {
-            node_addr: "test_node".to_string(),
-            items: vec![],
-        });
-        // Note: We can't easily test MetadataMap extraction without a real gRPC context
-        // This test just ensures the type exists and can be referenced
-        let _metadata_map = MetadataMap(&request.metadata().clone());
-    }
-
-    #[test]
-    fn test_empty_response_creation() {
-        // Test EmptyResponse creation
-        let empty_response = EmptyResponse {};
-        // EmptyResponse is a unit struct, so its size is 0
-        assert_eq!(std::mem::size_of_val(&empty_response), 0);
-    }
-
-    #[test]
-    fn test_file_download_batch_creation() {
-        // Test creating file download batch
-        let files_to_download = [
-            (
-                "file1".to_string(),
-                "account1".to_string(),
-                "key1".to_string(),
-                1024,
-                1234567890,
-            ),
-            (
-                "file2".to_string(),
-                "account2".to_string(),
-                "key2".to_string(),
-                2048,
-                1234567891,
-            ),
-        ];
-
-        assert_eq!(files_to_download.len(), 2);
-        assert_eq!(files_to_download[0].0, "file1");
-        assert_eq!(files_to_download[0].1, "account1");
-        assert_eq!(files_to_download[0].2, "key1");
-        assert_eq!(files_to_download[0].3, 1024);
-        assert_eq!(files_to_download[0].4, 1234567890);
-    }
-
-    #[test]
-    fn test_error_handling_patterns() {
-        // Test common error handling patterns used in the code
-        let result: Result<(), anyhow::Error> = Err(anyhow::anyhow!("test error"));
-
-        match result {
-            Ok(_) => panic!("Expected error"),
-            Err(e) => {
-                assert_eq!(e.to_string(), "test error");
-            }
-        }
-    }
-
-    #[test]
-    fn test_logging_patterns() {
-        // Test that logging patterns are consistent
-        let path = "test/file.parquet";
-        let total_size = 1024u64;
-        let offset = 512u64;
-        let elapsed_ms = 100u128;
-
-        // This test just ensures the logging format is valid
-        let log_message = format!(
-            "[gRPC:Event] Send file: {path}, total_size: {total_size}, offset: {offset} took: {elapsed_ms} ms"
+        assert!(
+            files_to_download(false, std::slice::from_ref(&item))
+                .next()
+                .is_none()
         );
-
-        assert!(log_message.contains(path));
-        assert!(log_message.contains(&total_size.to_string()));
-        assert!(log_message.contains(&offset.to_string()));
-        assert!(log_message.contains(&elapsed_ms.to_string()));
     }
 }

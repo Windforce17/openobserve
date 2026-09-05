@@ -21,12 +21,15 @@ use datafusion::{
         Result,
         tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor},
     },
-    physical_plan::{ExecutionPlan, aggregates::AggregateExec},
+    physical_plan::{
+        ExecutionPlan,
+        aggregates::{AggregateExec, AggregateInputMode},
+    },
 };
 use hashbrown::HashSet;
 
 use crate::datafusion::optimizer::physical_optimizer::{
-    index_optimizer::utils::is_complex_plan,
+    index_optimizer::utils::{count_rows_input_is_original, is_complex_plan},
     utils::{count_column_aggregate, is_count_rows_aggregate},
 };
 
@@ -56,7 +59,7 @@ pub fn is_simple_count(
 ) -> Option<IndexOptimizeMode> {
     let mut visitor = SimpleCountVisitor::new(index_fields);
     let _ = plan.visit(&mut visitor);
-    if visitor.failed { None } else { visitor.mode }
+    if visitor.failed || !visitor.raw_input_proven { None } else { visitor.mode }
 }
 
 struct SimpleCountVisitor<'a> {
@@ -64,6 +67,7 @@ struct SimpleCountVisitor<'a> {
     /// The mode every AggregateExec level agreed on so far.
     mode: Option<IndexOptimizeMode>,
     failed: bool,
+    raw_input_proven: bool,
 }
 
 impl<'a> SimpleCountVisitor<'a> {
@@ -72,6 +76,7 @@ impl<'a> SimpleCountVisitor<'a> {
             index_fields,
             mode: None,
             failed: true, // no AggregateExec seen yet
+            raw_input_proven: false,
         }
     }
 }
@@ -81,9 +86,12 @@ impl<'n> TreeNodeVisitor<'n> for SimpleCountVisitor<'_> {
 
     fn f_down(&mut self, node: &'n Self::Node) -> Result<TreeNodeRecursion> {
         if let Some(aggregate) = node.downcast_ref::<AggregateExec>() {
-            let derived = if aggregate.group_expr().is_empty() && aggregate.aggr_expr().len() == 1 {
+            let derived = if aggregate.group_expr().is_empty()
+                && aggregate.aggr_expr().len() == 1
+                && aggregate.filter_expr().iter().all(Option::is_none)
+            {
                 let expr = &aggregate.aggr_expr()[0];
-                if is_count_rows_aggregate(expr) {
+                if is_count_rows_aggregate(expr) && count_rows_input_is_original(aggregate) {
                     Some(IndexOptimizeMode::SimpleCount)
                 } else {
                     count_column_aggregate(expr)
@@ -99,6 +107,8 @@ impl<'n> TreeNodeVisitor<'n> for SimpleCountVisitor<'_> {
                 Some(mode) if self.mode.as_ref().is_none_or(|m| *m == mode) => {
                     self.mode = Some(mode);
                     self.failed = false;
+                    self.raw_input_proven |=
+                        aggregate.mode().input_mode() == AggregateInputMode::Raw;
                 }
                 _ => {
                     self.mode = None;

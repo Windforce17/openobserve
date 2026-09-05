@@ -112,17 +112,22 @@ pub static LOADING_FROM_DISK_DONE: Lazy<AtomicBool> = Lazy::new(|| AtomicBool::n
 /// Owns a disk-cache temporary path until it is renamed. Drop uses a
 /// synchronous unlink so cancellation at any await cannot strand
 /// segment-sized `.tmp` files until the next process restart.
+#[derive(Clone)]
 struct TempFileGuard {
-    path: String,
+    path: std::sync::Arc<TempFilePath>,
 }
+
+struct TempFilePath(String);
 
 impl TempFileGuard {
     fn new(path: String) -> Self {
-        Self { path }
+        Self {
+            path: std::sync::Arc::new(TempFilePath(path)),
+        }
     }
 
     fn path(&self) -> &str {
-        &self.path
+        &self.path.0
     }
 }
 
@@ -130,25 +135,25 @@ impl std::ops::Deref for TempFileGuard {
     type Target = str;
 
     fn deref(&self) -> &Self::Target {
-        &self.path
+        self.path()
     }
 }
 
 impl AsRef<std::ffi::OsStr> for TempFileGuard {
     fn as_ref(&self) -> &std::ffi::OsStr {
-        self.path.as_ref()
+        self.path().as_ref()
     }
 }
 
-impl Drop for TempFileGuard {
+impl Drop for TempFilePath {
     fn drop(&mut self) {
-        match std::fs::remove_file(&self.path) {
+        match std::fs::remove_file(&self.0) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
                 log::warn!(
                     "[FileData::Disk] remove abandoned temporary file {} failed: {error}",
-                    self.path
+                    self.0
                 );
             }
         }
@@ -1346,6 +1351,49 @@ pub async fn download(
     Ok(data_len)
 }
 
+/// Stream a background object under an exact registered-byte reservation.
+/// Header mismatches and body overruns fail before publication; the temporary
+/// path remains owned through every await, including cache publication.
+pub(crate) async fn download_exact(
+    account: &str,
+    file: &str,
+    expected_size: usize,
+    lifetime: std::sync::Arc<dyn Send + Sync>,
+) -> Result<usize, anyhow::Error> {
+    let tmp_file = alloc_tmp_file_path().await?;
+    let data_len = super::download_from_storage_to_file_exact(
+        account,
+        file,
+        expected_size,
+        std::path::Path::new(tmp_file.path()),
+        std::sync::Arc::new((lifetime.clone(), tmp_file.clone())),
+    )
+    .await?;
+    set_from_tmp_file(file, tmp_file, data_len)
+        .await
+        .map_err(|e| anyhow::anyhow!("set file {file} to disk cache failed: {e}"))?;
+    drop(lifetime);
+    Ok(data_len)
+}
+
+/// Publish an admitted peer response without detaching uncharged disk writes.
+pub(crate) async fn set_admitted(
+    file: &str,
+    data: Bytes,
+    lifetime: std::sync::Arc<dyn Send + Sync>,
+) -> Result<(), anyhow::Error> {
+    let tmp_file = alloc_tmp_file_path().await?;
+    let data_len = data.len();
+    let mut sink = super::DownloadSink::exact_file(
+        PathBuf::from(tmp_file.path()),
+        std::sync::Arc::new((lifetime.clone(), tmp_file.clone())),
+    );
+    sink.reset().await?;
+    sink.write_chunk(data).await?;
+    drop(sink);
+    set_from_tmp_file(file, tmp_file, data_len).await
+}
+
 fn get_bucket_idx(file: &str) -> usize {
     let cfg = get_config();
     if cfg.disk_cache.bucket_num <= 1 {
@@ -1486,6 +1534,54 @@ mod tests {
             "aggregations/default/traces/disk-range-tests/{name}-{}.vxi",
             config::ider::generate()
         )
+    }
+
+    #[tokio::test]
+    async fn cancelling_exact_stream_removes_the_owned_temporary_file() {
+        let path =
+            std::env::temp_dir().join(format!("o2-exact-cancel-{}", config::ider::generate()));
+        let worker_path = path.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let worker = tokio::spawn(async move {
+            let tmp = TempFileGuard::new(worker_path.to_string_lossy().into_owned());
+            let mut sink =
+                super::super::DownloadSink::exact_file(worker_path, std::sync::Arc::new(tmp));
+            let started_tx = parking_lot::Mutex::new(Some(started_tx));
+            super::super::download_with_retries_policy(
+                || {
+                    let started_tx = started_tx.lock().take();
+                    async move {
+                        let body = futures::stream::once(async move {
+                            // Polled only after the sink has created its temp file.
+                            started_tx.unwrap().send(()).unwrap();
+                            std::future::pending::<object_store::Result<Bytes>>().await
+                        });
+                        Ok(object_store::GetResult {
+                            payload: object_store::GetResultPayload::Stream(Box::pin(body)),
+                            meta: object_store::ObjectMeta {
+                                location: object_store::path::Path::from("cancelled.vxi"),
+                                last_modified: chrono::Utc::now(),
+                                size: 10,
+                                e_tag: None,
+                                version: None,
+                            },
+                            range: 0..10,
+                            attributes: Default::default(),
+                        })
+                    }
+                },
+                "cancelled.vxi",
+                Some(10),
+                &mut sink,
+                super::super::ExpectedSizePolicy::Exact,
+            )
+            .await
+        });
+        started_rx.await.unwrap();
+        assert!(path.exists());
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+        assert!(!path.exists());
     }
 
     #[tokio::test]

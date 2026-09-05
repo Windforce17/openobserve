@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-use config::{TIMESTAMP_COL_NAME, meta::inverted_index::IndexOptimizeMode};
+use config::meta::inverted_index::IndexOptimizeMode;
 use datafusion::{
     common::{
         Result,
@@ -25,17 +25,19 @@ use datafusion::{
     physical_expr::ScalarFunctionExpr,
     physical_plan::{
         ExecutionPlan, PhysicalExpr,
-        aggregates::AggregateExec,
+        aggregates::{AggregateExec, AggregateInputMode},
         expressions::{BinaryExpr, Literal},
-        projection::ProjectionExec,
     },
     scalar::ScalarValue,
 };
 use hashbrown::HashSet;
 
 use crate::datafusion::optimizer::physical_optimizer::{
-    index_optimizer::utils::is_complex_plan,
-    utils::{get_column_name, is_column, is_count_rows_aggregate},
+    index_optimizer::utils::{
+        count_rows_input_is_original, is_complex_plan, raw_string_group_column,
+        raw_timestamp_column,
+    },
+    utils::{is_column, is_count_rows_aggregate},
 };
 
 #[rustfmt::skip]
@@ -113,24 +115,20 @@ impl<'n> TreeNodeVisitor<'n> for SimpleHistogramVisitor {
             if aggregate.group_expr().expr().len() == 1
                 && aggregate.aggr_expr().len() == 1
                 && is_count_rows_aggregate(&aggregate.aggr_expr()[0])
+                && aggregate.filter_expr().iter().all(Option::is_none)
+                && aggregate.mode().input_mode() == AggregateInputMode::Raw
+                && count_rows_input_is_original(aggregate)
             {
                 // Check group by field
                 if let Some((group_expr, _)) = aggregate.group_expr().expr().first()
                     && let Some(func) = get_data_bin(group_expr)
                     && func.args().len() == 3
                     // check second argument is _timestamp (with an optional timezone shift)
-                    && let Some(ts_offset) = get_timestamp_offset(&func.args()[1])
+                    && let Some(ts_offset) = get_timestamp_offset(&func.args()[1], aggregate.input())
                 {
-                    let args = func.args();
-                    if let Some(histogram_interval) = get_histogram_interval(&args[0]) {
-                        let (start_time, end_time) = self.time_range;
-                        // round the bucket edges to even start
-                        let rounding_by = histogram_interval as i64;
-                        let min_value = start_time - start_time % rounding_by;
-                        let max_value = end_time;
-                        let num_buckets = ((max_value - min_value) as f64
-                            / histogram_interval as f64)
-                            .ceil() as usize;
+                    if let Some((min_value, _, histogram_interval, num_buckets)) =
+                        histogram_grid(func, self.time_range, ts_offset)
+                    {
                         self.simple_histogram =
                             Some((min_value, histogram_interval, num_buckets, ts_offset));
                         return Ok(TreeNodeRecursion::Continue);
@@ -138,17 +136,6 @@ impl<'n> TreeNodeVisitor<'n> for SimpleHistogramVisitor {
                 }
             }
             // If AggregateExec doesn't match SimpleHistogram pattern, stop visiting
-            self.simple_histogram = None;
-            return Ok(TreeNodeRecursion::Stop);
-        } else if let Some(projection) = node.downcast_ref::<ProjectionExec>() {
-            // Check ProjectionExec for the structure: [histogram(_timestamp), count(*)]
-            let exprs = projection.expr();
-            if exprs.len() == 2 {
-                // First expression should be the histogram(_timestamp), second should be count(*)
-                // We'll validate this in the AggregateExec
-                return Ok(TreeNodeRecursion::Continue);
-            }
-            // If projection doesn't have exactly 2 expressions, stop visiting
             self.simple_histogram = None;
             return Ok(TreeNodeRecursion::Stop);
         } else if is_complex_plan(node) {
@@ -174,29 +161,69 @@ fn get_data_bin(expr: &Arc<dyn PhysicalExpr>) -> Option<&ScalarFunctionExpr> {
 fn get_histogram_interval(expr: &Arc<dyn PhysicalExpr>) -> Option<u64> {
     let interval = expr.downcast_ref::<Literal>()?.value();
     match interval {
-        ScalarValue::IntervalMonthDayNano(Some(interval)) => {
-            // convert interval to nanoseconds
-            let microseconds = interval.nanoseconds / 1_000
-                + interval.days as i64 * 24 * 60 * 60 * 1_000_000
-                + interval.months as i64 * 30 * 24 * 60 * 60 * 1_000_000;
-            Some(microseconds as u64)
+        ScalarValue::IntervalMonthDayNano(Some(interval))
+            if interval.months == 0 && interval.nanoseconds % 1_000 == 0 =>
+        {
+            let microseconds = (interval.days as i64)
+                .checked_mul(86_400_000_000)?
+                .checked_add(interval.nanoseconds / 1_000)?;
+            (microseconds > 0).then_some(microseconds as u64)
         }
         _ => None,
     }
 }
 
+/// Resolve the actual date_bin phase without changing the public wire mode.
+/// Edges are local timestamps; filtering still uses the original query window.
+fn histogram_grid(
+    func: &ScalarFunctionExpr,
+    range: (i64, i64),
+    offset: i64,
+) -> Option<(i64, i64, u64, usize)> {
+    let width = get_histogram_interval(func.args().first()?)?;
+    let origin = match func.args().get(2)?.downcast_ref::<Literal>()?.value() {
+        ScalarValue::TimestampNanosecond(Some(value), None) if value % 1_000 == 0 => value / 1_000,
+        ScalarValue::TimestampMicrosecond(Some(value), None) => *value,
+        ScalarValue::TimestampMillisecond(Some(value), None) => value.checked_mul(1_000)?,
+        ScalarValue::TimestampSecond(Some(value), None) => value.checked_mul(1_000_000)?,
+        _ => return None,
+    };
+    let start = range.0.checked_add(offset)?;
+    let end = range.1.checked_add(offset)?;
+    if start >= end {
+        return None;
+    }
+    let width_i = i64::try_from(width).ok()?;
+    let min = start.checked_sub(start.checked_sub(origin)?.rem_euclid(width_i))?;
+    min.checked_sub(offset)?;
+    let span = u64::try_from(end.checked_sub(min)?).ok()?;
+    let buckets = usize::try_from(span.div_ceil(width)).ok()?;
+    // The simple histogram result itself is a dense accumulator.
+    if buckets > 256 * 1024 {
+        return None;
+    }
+    Some((min, end, width, buckets))
+}
+
 /// Returns the fixed timezone offset (µs east of UTC) carried by the date_bin source
 /// expression: `to_timestamp_micros(_timestamp)` yields 0 and
 /// `to_timestamp_micros(_timestamp + offset)` — the shape histogram() with a timezone
-/// rewrites to — yields the offset. None when the source is not the timestamp column.
-fn get_timestamp_offset(expr: &Arc<dyn PhysicalExpr>) -> Option<i64> {
+/// rewrites to — yields the offset. The timestamp must retain its original scan
+/// identity through the aggregate input, including any intervening projections.
+fn get_timestamp_offset(
+    expr: &Arc<dyn PhysicalExpr>,
+    input: &Arc<dyn ExecutionPlan>,
+) -> Option<i64> {
     let func = expr.downcast_ref::<ScalarFunctionExpr>()?;
+    if func.fun().name() != "to_timestamp_micros" || func.args().len() != 1 {
+        return None;
+    }
     let arg = func.args().first()?;
-    if get_column_name(arg) == TIMESTAMP_COL_NAME {
+    if raw_timestamp_column(arg, input) {
         return Some(0);
     }
     let bin = arg.downcast_ref::<BinaryExpr>()?;
-    if *bin.op() != Operator::Plus || get_column_name(bin.left()) != TIMESTAMP_COL_NAME {
+    if *bin.op() != Operator::Plus || !raw_timestamp_column(bin.left(), input) {
         return None;
     }
     match bin.right().downcast_ref::<Literal>()?.value() {
@@ -284,6 +311,9 @@ impl<'n> TreeNodeVisitor<'n> for SimpleMultiHistogramVisitor {
             if aggregate.group_expr().expr().len() == 2
                 && aggregate.aggr_expr().len() == 1
                 && is_count_rows_aggregate(&aggregate.aggr_expr()[0])
+                && aggregate.filter_expr().iter().all(Option::is_none)
+                && aggregate.mode().input_mode() == AggregateInputMode::Raw
+                && count_rows_input_is_original(aggregate)
             {
                 let groups = aggregate.group_expr().expr();
                 // One must be date_bin (histogram), the other must be an index field column
@@ -296,19 +326,18 @@ impl<'n> TreeNodeVisitor<'n> for SimpleMultiHistogramVisitor {
                     && db_idx != c_idx
                 {
                     let (col_expr, _) = &groups[c_idx];
-                    let column_name = get_column_name(col_expr);
-                    if self.index_fields.contains(column_name) {
+                    if let Some(column_name) = raw_string_group_column(col_expr, aggregate.input())
+                        && self.index_fields.contains(column_name)
+                    {
                         // Extract histogram parameters from the date_bin expression
                         let func = get_data_bin(&groups[db_idx].0).unwrap();
                         if func.args().len() == 3
-                            && let Some(ts_offset) = get_timestamp_offset(&func.args()[1])
+                            && let Some(ts_offset) =
+                                get_timestamp_offset(&func.args()[1], aggregate.input())
                         {
-                            let args = func.args();
-                            if let Some(histogram_interval) = get_histogram_interval(&args[0]) {
-                                let (start_time, end_time) = self.time_range;
-                                let rounding_by = histogram_interval as i64;
-                                let min_value = start_time - start_time % rounding_by;
-                                let max_value = end_time;
+                            if let Some((min_value, max_value, histogram_interval, _)) =
+                                histogram_grid(func, self.time_range, ts_offset)
+                            {
                                 self.simple_multi_histogram = Some((
                                     min_value,
                                     max_value,
@@ -323,14 +352,6 @@ impl<'n> TreeNodeVisitor<'n> for SimpleMultiHistogramVisitor {
                 }
             }
             // If AggregateExec doesn't match, stop visiting
-            self.simple_multi_histogram = None;
-            return Ok(TreeNodeRecursion::Stop);
-        } else if let Some(projection) = node.downcast_ref::<ProjectionExec>() {
-            // Projection should have 3 expressions: timestamp, breakdown, count
-            let exprs = projection.expr();
-            if exprs.len() == 3 {
-                return Ok(TreeNodeRecursion::Continue);
-            }
             self.simple_multi_histogram = None;
             return Ok(TreeNodeRecursion::Stop);
         } else if is_complex_plan(node) {
@@ -403,7 +424,7 @@ mod tests {
             (
                 "SELECT histogram(_timestamp, '1 minute', '+08:00') as ts, count(*) as cnt from t group by ts",
                 Some(IndexOptimizeMode::SimpleHistogram(
-                    1757401680000000,
+                    1757430480000000,
                     60000000,
                     16,
                     28800000000,
@@ -488,8 +509,8 @@ mod tests {
             (
                 "SELECT histogram(_timestamp, '1 minute', '-05:30') as ts, level, count(*) as cnt from t group by ts, level",
                 Some(IndexOptimizeMode::SimpleMultiHistogram(
-                    1757401680000000,
-                    1757402594060000,
+                    1757381880000000,
+                    1757382794060000,
                     60000000,
                     -19800000000,
                     "level".to_string(),
@@ -894,39 +915,93 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_simple_histogram_visitor_initial_state() {
-        let visitor = SimpleHistogramVisitor::new((1000, 2000));
-        assert!(visitor.simple_histogram.is_none());
-        assert_eq!(visitor.time_range, (1000, 2000));
+    #[tokio::test]
+    async fn test_date_bin_origin_and_negative_boundaries() -> Result<()> {
+        let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(2));
+        ctx.register_table("t", Arc::new(NewEmptyTable::new("t", ui_schema())))?;
+        for (interval, origin, range, min, buckets) in [
+            (
+                "1 hour",
+                "1970-01-01 00:30:00",
+                (21_600_000_000, 25_200_000_000),
+                19_800_000_000,
+                2,
+            ),
+            (
+                "7 seconds",
+                "1970-01-01 00:00:01",
+                (-1, 8_000_000),
+                -6_000_000,
+                2,
+            ),
+            (
+                "7 seconds",
+                "2001-01-01 00:00:00",
+                (0, 7_000_000),
+                -4_000_000,
+                2,
+            ),
+        ] {
+            let expression = format!(
+                "date_bin(INTERVAL '{interval}', to_timestamp_micros(_timestamp), TIMESTAMP '{origin}')"
+            );
+            let width = if interval == "1 hour" {
+                3_600_000_000
+            } else {
+                7_000_000
+            };
+            for breakdown in [false, true] {
+                let sql = if breakdown {
+                    format!(
+                        "SELECT {expression} AS b, level, count(*) AS n FROM t GROUP BY b, level"
+                    )
+                } else {
+                    format!("SELECT {expression} AS b, count(*) AS n FROM t GROUP BY b")
+                };
+                let logical = ctx.state().create_logical_plan(&sql).await?;
+                let physical = ctx.state().create_physical_plan(&logical).await?;
+                let partial = Arc::new(get_partial_aggregate_plan(physical).unwrap()) as _;
+                if breakdown {
+                    assert_eq!(
+                        is_simple_multi_histogram(
+                            partial,
+                            range,
+                            HashSet::from(["level".to_owned()])
+                        ),
+                        Some(IndexOptimizeMode::SimpleMultiHistogram(
+                            min,
+                            range.1,
+                            width,
+                            0,
+                            "level".to_owned()
+                        ))
+                    );
+                } else {
+                    assert_eq!(
+                        is_simple_histogram(partial, range),
+                        Some(IndexOptimizeMode::SimpleHistogram(min, width, buckets, 0))
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     #[test]
-    fn test_simple_histogram_visitor_zero_time_range() {
-        let visitor = SimpleHistogramVisitor::new((0, 0));
-        assert!(visitor.simple_histogram.is_none());
-        assert_eq!(visitor.time_range, (0, 0));
-    }
-
-    #[test]
-    fn test_simple_histogram_visitor_negative_time_range() {
-        let visitor = SimpleHistogramVisitor::new((-1000, -500));
-        assert_eq!(visitor.time_range, (-1000, -500));
-    }
-
-    #[test]
-    fn test_simple_multi_histogram_visitor_initial_state() {
-        let visitor =
-            SimpleMultiHistogramVisitor::new((1000, 2000), HashSet::from(["level".to_string()]));
-        assert!(visitor.simple_multi_histogram.is_none());
-        assert_eq!(visitor.time_range, (1000, 2000));
-        assert_eq!(visitor.index_fields.len(), 1);
-    }
-
-    #[test]
-    fn test_simple_multi_histogram_visitor_empty_index_fields() {
-        let visitor = SimpleMultiHistogramVisitor::new((1000, 2000), HashSet::new());
-        assert!(visitor.simple_multi_histogram.is_none());
-        assert!(visitor.index_fields.is_empty());
+    fn test_fixed_interval_refuses_unsupported_widths() {
+        use arrow::datatypes::IntervalMonthDayNano;
+        for (months, days, nanos, expected) in [
+            (0, 0, 0, None),
+            (0, 0, -1_000, None),
+            (0, 0, 1_001, None),
+            (1, 0, 0, None),
+            (0, 1, 1_000, Some(86_400_000_001)),
+        ] {
+            let expr: Arc<dyn PhysicalExpr> =
+                Arc::new(Literal::new(ScalarValue::IntervalMonthDayNano(Some(
+                    IntervalMonthDayNano::new(months, days, nanos),
+                ))));
+            assert_eq!(get_histogram_interval(&expr), expected);
+        }
     }
 }

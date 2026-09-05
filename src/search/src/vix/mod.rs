@@ -38,27 +38,27 @@
 //! [`collect`]) and the per-file results merge exactly like the aggregate
 //! semantics ([`MultiResultBuilder`]); SimpleSelect narrows the file list to
 //! the exact global top-N rows via the [`pruner`]. Unfiltered full-range
-//! single-field TopN/Distinct are answered from the term dictionary alone
-//! (`field_value_counts`), with docs-column and `_source` fallbacks per
-//! file.
+//! single-field TopN/Distinct try complete term-dictionary counts first,
+//! then stored columns; unsupported files retain the precise SQL scan.
 //!
 //! Only core data files (ending in `.vix`) enter this path. Their optional
 //! `.vxi` sidecar supplies term indexes; indexless core files can still serve
 //! query shapes that need only native docs columns, file metadata, or zones.
 //! Legacy `.parquet`/`.vortex` files remain on the DataFusion scan path.
 //!
-//! Per-file evaluation uses an owned `buffer_unordered` bounded by
-//! `ZO_VIX_SEARCH_CONCURRENCY` (default 4x CPU cores, capped at 64): each
-//! file's work is a few small — usually locally cached — range reads plus
-//! microseconds of CPU, so the sweet spot sits well above the core count.
-//! Only `SimpleSelect` partitions files into multiple groups (its global
-//! top-N prunes remaining groups between rounds); every other mode evaluates
-//! all files as one group.
+//! Per-file opening and evaluation form one owned, bounded pipeline. Ready
+//! files run without waiting for an all-files prefetch barrier. Process-wide
+//! execution and byte admission bound concurrent followers; operation-owned
+//! cancellation and accounting remain separate from shared immutable readers.
+//! Only `SimpleSelect` partitions files into multiple groups, so it can prune
+//! the remaining groups after each round.
 
 pub mod cache;
 mod collect;
 #[cfg(test)]
 mod dispatch_bench;
+#[cfg(test)]
+mod query_regressions;
 
 mod partition;
 mod pruner;
@@ -86,7 +86,7 @@ use hashbrown::HashMap;
 use infra::{cache::file_data, errors::Error};
 use itertools::Itertools;
 pub use result::{MinMaxValue, MultiResult, MultiResultBuilder, VixSearchResult};
-use vortex_index::{VixDocs, VixReader};
+use vortex_index::{VixDocs, VixRangeSource, VixReader};
 
 use self::{
     cache::{self as vix_result_cache, CacheEntry},
@@ -268,17 +268,9 @@ pub async fn vix_search(
             &idx_optimize_mode,
             Some(IndexOptimizeMode::SimpleHistogram(..))
         );
-    // Indexed ALL multi-histograms can omit their semantically unused
-    // sidecar only on the zero-offset coordinate system. Indexless files
-    // remain on DataFusion, and nonzero offsets keep the conservative
-    // sidecar-backed path until extraction and collection coordinates agree.
-    let all_multi_histogram = condition_all
-        && matches!(
-            &idx_optimize_mode,
-            Some(IndexOptimizeMode::SimpleMultiHistogram(_, _, _, ts_offset, _))
-                if *ts_offset == 0
-        );
-    let data_only_all_histogram = all_histogram || all_multi_histogram;
+    // Grouped ALL histograms may use exact sidecar value counts; only the
+    // ungrouped ALL histogram is deliberately data-only.
+    let data_only_all_histogram = all_histogram;
     let data_only_capable = native_simple_select || native_histogram || all_histogram;
     let eval_files = file_list_map
         .values()
@@ -308,9 +300,7 @@ pub async fn vix_search(
             eval_files.len(),
         );
     }
-    // Whole-sidecar caching and its metrics cover only evaluations that
-    // actually read `.vxi`. A WHERE-less histogram, including the grouped
-    // variant, is data-only even when the file has an index sidecar.
+    // Probe sidecars only for evaluations that can use them.
     let index_files = eval_files
         .iter()
         .filter(|file| file.meta.index_size > 0 && !data_only_all_histogram)
@@ -336,11 +326,12 @@ pub async fn vix_search(
             })
         })
         .collect_vec();
-    // A cold exact histogram reads the predicate/timestamp columns from the
-    // data object. Probe sidecar caches so already-local postings remain the
-    // preferred path, but do not detach whole-sidecar downloads for misses.
-    // Every other query class retains the ordinary cache-fill behavior.
-    let cache_miss_policy = if native_histogram {
+    // Aggregate queries keep cache hits but do not launch unconditional
+    // whole-sidecar downloads alongside their bounded foreground reads.
+    let cache_miss_policy = if idx_optimize_mode
+        .as_ref()
+        .is_some_and(|mode| !matches!(mode, IndexOptimizeMode::SimpleSelect(..)))
+    {
         CacheMissPolicy::CheckOnly
     } else {
         CacheMissPolicy::Enqueue
@@ -454,11 +445,13 @@ pub async fn vix_search(
     let index_parquet_files =
         partition_vix_files(eval_files, &idx_optimize_mode, target_partitions);
 
-    // Per-query index-fetch accounting (ranged mode): every range GET issued
-    // through sources THIS query opens ticks these counters. Fetches through
-    // readers memoized by an EARLIER query tick that query's counters (and
-    // always the global metrics) — hot readers cost ~0 fetches anyway.
+    // Every read is attributed to its active operation, including reads from
+    // shared readers created by an earlier query.
     let fetch_stats = Arc::new(source::FetchStats::default());
+    let operation = source::ReadOperation::new(Arc::clone(&fetch_stats), None);
+    let _operation_owner = operation.owner_guard();
+    let mut completed_file_bytes = 0u64;
+    let mut completed_files = 0usize;
 
     let mut no_more_files = false;
     let mut result_builder = MultiResultBuilder::new(&idx_optimize_mode, &index_parquet_files);
@@ -508,23 +501,6 @@ pub async fn vix_search(
         .sum();
     let bail_threshold = eval_bail_threshold(bail_bytes_cap, window_compressed_bytes);
 
-    // M14: query-shaped cold-open prefetch (ranged mode). Cold sidecar paths
-    // pay the data footer + sidecar footer/dictionary directory in one
-    // bounded-concurrency wave. Remote-cold equality histograms use native
-    // docs columns; equality histograms with local sidecars need no prefetch.
-    // ALL SimpleHistograms and zero-offset indexed ALL multi-histograms use
-    // only file metadata/zones/docs columns, so prefetching a sidecar would
-    // add IO that neither path consumes.
-    let prefetch_enabled = read_mode == VixReadMode::Ranged
-        && cfg.common.vix_query_prefetch
-        && !native_histogram
-        && !data_only_all_histogram;
-    #[cfg(test)]
-    let prefetch_enabled = tests::prefetch_override(trace_id).unwrap_or(prefetch_enabled);
-    // wave bytes prefetched so far (all-files costs, paid once): the bail
-    // projection adds them FLAT instead of multiplying them per sample file
-    let mut prefetched_bytes: u64 = 0;
-
     for (group_id, file_group) in index_parquet_files.into_iter().enumerate() {
         if no_more_files {
             // the simple-select limit is already satisfied: drop the rest
@@ -534,111 +510,80 @@ pub async fn vix_search(
             continue;
         }
 
-        if prefetch_enabled && !eval_bail.load(std::sync::atomic::Ordering::Relaxed) {
-            let wave_start = std::time::Instant::now();
-            let budget = bail_threshold
-                .saturating_sub(fetch_stats.bytes.load(std::sync::atomic::Ordering::Relaxed));
-            let wave = prefetch_cold_tails(
-                &file_group,
-                &index_condition,
-                &idx_optimize_mode,
-                time_range,
-                eval_concurrency,
-                &fetch_stats,
-                budget,
-            )
-            .await;
-            prefetched_bytes += wave.bytes;
-            if wave.cold > 0 {
-                log::info!(
-                    "[trace_id {trace_id}] search->vix: prefetch wave: group {group_id}, cold files {} of {}, prefetched {} ({} fetches, {}), took {} ms",
-                    wave.cold,
-                    file_group.len(),
-                    wave.prefetched,
-                    wave.fetches,
-                    bytes_to_human_readable(wave.bytes as f64),
-                    wave_start.elapsed().as_millis(),
-                );
-            }
-        }
-
-        // Buffer owned per-file futures instead of spawning detached tasks.
-        // Dropping the query cancels queued evaluations and async I/O; a
-        // blocking evaluation already running may still finish its CPU step.
+        // Opening and evaluation share a bounded per-file future: completed
+        // opens need not wait for unrelated cold files. Each file's counters
+        // are sampled only after it finishes, excluding unfinished lookahead.
         let tasks = file_group.into_iter().map(|file| {
             let trace_id = query.trace_id.to_string();
             let index_condition_clone = index_condition.clone();
             let idx_optimize_rule_clone = idx_optimize_mode.clone();
-            let fetch_stats = Arc::clone(&fetch_stats);
+            let file_stats = Arc::new(source::FetchStats::default());
+            let file_operation = operation.for_file(Arc::clone(&file_stats));
             let eval_bail = Arc::clone(&eval_bail);
-            AssertUnwindSafe(async move {
-                if eval_bail.load(std::sync::atomic::Ordering::Relaxed) {
-                    // The query tripped the projected-cost bail: this file
-                    // stays in the map for the scan branch, with its filter.
-                    return Ok((
-                        String::new(),
-                        VixSearchResult::Skipped { percent: 100 },
-                        true,
-                    ));
-                }
-                let mut ret = search_vix_index(
-                    &trace_id,
-                    time_range,
-                    index_condition_clone.clone(),
-                    idx_optimize_rule_clone.clone(),
-                    &file,
-                    read_mode,
-                    all_index_sidecars_cached,
-                    &fetch_stats,
-                )
-                .await;
-                // Retry transient failures once: the parsed reader is
-                // memoized, so a post-open failure re-issues only the failed
-                // range fetches. Deterministic per-file skips (every AND
-                // condition unbuildable for this file) never retry, and
-                // neither does a NOT-FOUND (M19: the object was deleted
-                // externally — S3 reads are strongly consistent, a second
-                // fetch returns the same 404; the file falls through to the
-                // scan branch, which degrades it to zero rows and removes
-                // the stale file_list row).
-                if let Err(e) = &ret
-                    && e.downcast_ref::<crate::index::AllConditionsSkipped>()
-                        .is_none()
-                    && !infra::storage::is_not_found_error(e)
-                {
-                    log::warn!(
-                        "[trace_id {trace_id}] search->vix: retrying file {} after error: {e:?}",
-                        file.key,
-                    );
-                    ret = search_vix_index(
+            async move {
+                let outcome = AssertUnwindSafe(async {
+                    if file_operation.is_cancelled() {
+                        return Err(vortex_index::VixError::Cancelled.into());
+                    }
+                    if eval_bail.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Ok((
+                            String::new(),
+                            VixSearchResult::Skipped { percent: 100 },
+                            true,
+                        ));
+                    }
+                    let mut ret = search_vix_index(
                         &trace_id,
                         time_range,
-                        index_condition_clone,
-                        idx_optimize_rule_clone,
+                        index_condition_clone.clone(),
+                        idx_optimize_rule_clone.clone(),
                         &file,
                         read_mode,
                         all_index_sidecars_cached,
-                        &fetch_stats,
+                        &file_operation,
                     )
                     .await;
-                }
-                match ret {
-                    Ok(ret) => Ok(ret),
-                    Err(e) => {
-                        log::error!(
-                            "[trace_id {trace_id}] search->vix: error filtering via index: {}, index_size: {}, error: {e:?}",
+                    if let Err(error) = &ret
+                        && !file_operation.is_cancelled()
+                        && !is_cancelled_read(error)
+                        && !requires_exact_scan(error)
+                        && error.downcast_ref::<crate::index::AllConditionsSkipped>().is_none()
+                        && !infra::storage::is_not_found_error(error)
+                    {
+                        log::warn!(
+                            "[trace_id {trace_id}] search->vix: retrying file {} after error: {error:?}",
                             file.key,
-                            file.meta.index_size,
                         );
-                        Err(e)
+                        ret = search_vix_index(
+                            &trace_id,
+                            time_range,
+                            index_condition_clone,
+                            idx_optimize_rule_clone,
+                            &file,
+                            read_mode,
+                            all_index_sidecars_cached,
+                            &file_operation,
+                        )
+                        .await;
                     }
-                }
-            })
-            .catch_unwind()
+                    if file_operation.is_cancelled() {
+                        return Err(vortex_index::VixError::Cancelled.into());
+                    }
+                    ret
+                })
+                .catch_unwind()
+                .await;
+                (
+                    outcome,
+                    file_stats.bytes.load(std::sync::atomic::Ordering::Relaxed),
+                )
+            }
         });
 
         let mut tasks = stream::iter(tasks).buffer_unordered(eval_concurrency);
-        while let Some(outcome) = tasks.next().await {
+        while let Some((outcome, file_bytes)) = tasks.next().await {
+            completed_files += 1;
+            completed_file_bytes = completed_file_bytes.saturating_add(file_bytes);
             let result = match outcome {
                 Ok(result) => result,
                 Err(payload) => {
@@ -659,6 +604,10 @@ pub async fn vix_search(
                     )));
                 }
             };
+            if operation.is_cancelled() || result.as_ref().err().is_some_and(is_cancelled_read) {
+                file_list.extend(file_list_map.into_values());
+                return Err(Error::Message("VIX query cancelled".to_string()));
+            }
             // Each result corresponds to a file in the file list
             match result {
                 Ok((file_name, result, has_skipped_conditions)) => {
@@ -724,16 +673,13 @@ pub async fn vix_search(
                         && files_evaluated < files_total
                         && !eval_bail.load(std::sync::atomic::Ordering::Relaxed)
                     {
-                        let bytes_so_far =
-                            fetch_stats.bytes.load(std::sync::atomic::Ordering::Relaxed);
-                        // M14: prefetched tail bytes are all-files costs
-                        // already paid in full — add them flat and project
-                        // only the per-file eval bytes (multiplying the wave
-                        // by files_total/sample would inflate quadratically)
-                        let eval_bytes = bytes_so_far.saturating_sub(prefetched_bytes);
-                        let projected = prefetched_bytes.saturating_add(
-                            eval_bytes / files_evaluated as u64 * files_total as u64,
-                        );
+                        // Only completed file operations enter the sample.
+                        // Bytes from another file still opening/evaluating
+                        // must not inflate the projected cost.
+                        let bytes_so_far = completed_file_bytes;
+                        let projected = ((bytes_so_far as u128 * files_total as u128)
+                            / completed_files.max(1) as u128)
+                            .min(u64::MAX as u128) as u64;
                         if projected > bail_threshold {
                             eval_bail.store(true, std::sync::atomic::Ordering::Relaxed);
                             is_add_filter_back = true;
@@ -827,16 +773,23 @@ pub async fn vix_search(
                     }
                 }
                 Err(e) => {
-                    log::error!(
-                        "[trace_id {trace_id}] search->vix: error filtering via index. Keep file to search, error: {e}"
-                    );
+                    if requires_exact_scan(&e) {
+                        log::debug!(
+                            "[trace_id {trace_id}] search->vix: exact aggregate scan required: {e}"
+                        );
+                    } else {
+                        log::error!(
+                            "[trace_id {trace_id}] search->vix: error filtering via index. Keep file to search, error: {e}"
+                        );
+                    }
                     is_add_filter_back = true;
                     // a deterministic per-file skip (every conjunct
                     // unservable — e.g. a lone condition on a partial field)
                     // is a whole-file skip for the bail accounting: a fleet
                     // of them must not be rediscovered file by file (#32)
-                    if e.downcast_ref::<crate::index::AllConditionsSkipped>()
-                        .is_some()
+                    if requires_exact_scan(&e)
+                        || e.downcast_ref::<crate::index::AllConditionsSkipped>()
+                            .is_some()
                     {
                         files_skipped += 1;
                         if idx_optimize_mode.is_none() {
@@ -875,15 +828,32 @@ pub async fn vix_search(
     // get the merged result; for simple select this finalizes the global top-N
     let multi_result = result_builder.build(trace_id, &mut file_list_map);
 
-    // actually-fetched index bytes for core files (ranged mode; cached mode
-    // downloads whole objects through the file cache instead). Repurposes
-    // idx_scan_size in THIS function's local ScanStats/log line: for core
-    // files the meaningful "index scan size" is the bytes the evaluation
-    // really fetched, not a per-file metadata sum.
+    // Returned range bytes include cache hits; they are not S3 traffic.
+    // Source-classified physical I/O is reported separately.
     let fetch_count = fetch_stats
         .fetches
         .load(std::sync::atomic::Ordering::Relaxed);
     scan_stats.idx_scan_size = fetch_stats.bytes.load(std::sync::atomic::Ordering::Relaxed) as i64;
+    let load =
+        |counter: &std::sync::atomic::AtomicU64| counter.load(std::sync::atomic::Ordering::Relaxed);
+    log::info!(
+        "[trace_id {trace_id}] search->vix: io_accounting logical_ranges={} logical_bytes={} completed_coalesced_reads={} completed_coalesced_bytes={} memory_reads={} memory_bytes={} disk_reads={} disk_bytes={} remote_reads={} remote_bytes={} unknown_store_reads={} unknown_store_bytes={} queue_us={} active_us={} evaluation_wait_us={}",
+        fetch_count,
+        scan_stats.idx_scan_size,
+        load(&fetch_stats.physical_fetches),
+        load(&fetch_stats.physical_bytes),
+        load(&fetch_stats.memory_fetches),
+        load(&fetch_stats.memory_bytes),
+        load(&fetch_stats.disk_fetches),
+        load(&fetch_stats.disk_bytes),
+        load(&fetch_stats.remote_fetches),
+        load(&fetch_stats.remote_bytes),
+        load(&fetch_stats.object_store_fetches),
+        load(&fetch_stats.object_store_bytes),
+        load(&fetch_stats.queue_micros),
+        load(&fetch_stats.active_micros),
+        load(&fetch_stats.evaluation_queue_micros),
+    );
 
     log::info!(
         "{}",
@@ -915,6 +885,131 @@ pub async fn vix_search(
         is_add_filter_back,
         multi_result,
     ))
+}
+
+fn requires_exact_scan(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.is::<collect::AggregateFallback>() || cause.is::<source::FetchBudgetExceeded>()
+    })
+}
+
+fn is_cancelled_read(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<vortex_index::VixError>(),
+            Some(vortex_index::VixError::Cancelled)
+        )
+    })
+}
+
+/// Bounded transient decoding/group workspace and mode-specific row buffers.
+/// Reader/index ownership is charged separately, before each real allocation.
+fn evaluation_working_bytes(
+    records: i64,
+    mode: Option<&IndexOptimizeMode>,
+    fully_covered: bool,
+) -> usize {
+    let rows = usize::try_from(records.max(0)).unwrap_or(usize::MAX);
+    // Evaluation/composition can retain the condition, timestamp and result
+    // bitmaps together even when the collector itself is chunk-streamed.
+    let bitmaps = rows.div_ceil(8).saturating_mul(4);
+    // A partial-window timestamp clamp is not yet wholly chunk-local:
+    // timestamp_range may retain all decoded timestamps and a growable
+    // boundary-row Vec<u64>. Do not charge this to fully covered metadata or
+    // dictionary-count answers, which never construct the clamp.
+    let clamp = if fully_covered {
+        0
+    } else {
+        rows.saturating_mul(24)
+    };
+    let collector_rows = match mode {
+        // Group collectors stream <=65,536-row chunks, including their sparse
+        // point lists. The fixed workspace below covers those and bounded group
+        // maps; charging a full-file string/code array would defeat streaming.
+        Some(IndexOptimizeMode::SimpleMultiHistogram(..))
+        | Some(IndexOptimizeMode::SimpleTopN(..))
+        | Some(IndexOptimizeMode::SimpleDistinct(..))
+        | Some(IndexOptimizeMode::SimpleCount)
+        | None => 0,
+        // Concat/unordered files can collect every matching row ID, decode
+        // every corresponding timestamp and hold all candidate tuples at once.
+        // A LIMIT-only reservation would undercount this real by-value path.
+        Some(IndexOptimizeMode::SimpleSelect(..)) => rows.saturating_mul(48),
+        // Histogram/count-field/min-max legacy fallbacks may read a full
+        // numeric column rather than only their zone/chunk metadata.
+        _ => rows.saturating_mul(16),
+    };
+    let row_bytes = bitmaps.saturating_add(clamp).saturating_add(collector_rows);
+    (32usize * 1024 * 1024).saturating_add(row_bytes)
+}
+
+/// Own the permit in actual blocking work. Dropping the waiter aborts a queued
+/// spawn; the root operation owner cancels running IO through both TLS scopes.
+async fn run_evaluation<T: Send + 'static>(
+    trace_id: &str,
+    operation: &Arc<source::ReadOperation>,
+    permit: source::EvaluationPermit,
+    work: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+) -> anyhow::Result<T> {
+    // Keep queued inputs before the permit in drop order as well: aborting a
+    // queued blocking task must release whole-object buffers before its charge.
+    struct AdmittedWork<F> {
+        work: Option<F>,
+        permit: source::EvaluationPermit,
+    }
+    let admitted = AdmittedWork {
+        work: Some(work),
+        permit,
+    };
+    let task_operation = Arc::clone(operation);
+    let mut task = crate::utils::AbortOnDrop::new(
+        tokio::task::spawn_blocking(move || {
+            let mut admitted = admitted;
+            task_operation.run_evaluation(&admitted.permit, || {
+                vortex_index::check_read_cancelled()?;
+                let result = admitted.work.take().expect("evaluation runs once")();
+                vortex_index::check_read_cancelled()?;
+                admitted.permit.check_refusal()?;
+                result
+            })
+        }),
+        trace_id,
+    );
+    tokio::select! {
+        biased;
+        _ = operation.cancelled() => Err(vortex_index::VixError::Cancelled.into()),
+        result = task.join() => match result {
+            Ok(result) => result,
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(error) => Err(error.into()),
+        },
+    }
+}
+
+async fn load_whole_object(
+    operation: &Arc<source::ReadOperation>,
+    account: &str,
+    key: &str,
+    size: i64,
+) -> anyhow::Result<bytes::Bytes> {
+    let size = u64::try_from(size)
+        .ok()
+        .filter(|size| *size > 0)
+        .ok_or(collect::AggregateFallback("unknown whole-object size"))?;
+    let source = LadderRangeSource::new(
+        account.to_owned(),
+        key,
+        size,
+        tokio::runtime::Handle::current(),
+    );
+    // Construct the future inside the operation scope so executor handoff
+    // captures the current file's accounting/cancellation, including cache hits.
+    let fetch = operation.run(|| source.fetch(0..size));
+    tokio::select! {
+        biased;
+        _ = operation.cancelled() => Err(vortex_index::VixError::Cancelled.into()),
+        result = fetch => result,
+    }
 }
 
 /// Raw output of the blocking index evaluation for one file.
@@ -982,33 +1077,37 @@ enum VixReaderInput {
         source: Arc<dyn vortex_index::VixRangeSource>,
         index: Option<Arc<dyn vortex_index::VixRangeSource>>,
         cache_key: Option<reader_cache::ReaderCacheKey>,
+        cached: Option<reader_cache::LockedReader>,
     },
-    /// A previously parsed (memoized) reader — zero IO to open.
-    Shared(Arc<VixReader>),
 }
 
 impl VixReaderInput {
     /// Open (or reuse) the reader. Blocking work: for ranged inputs, the
     /// two footer tails and dictionary-directory fetches (row-group FSTs
     /// load lazily during evaluation).
-    fn open(self) -> anyhow::Result<Arc<VixReader>> {
-        Ok(match self {
+    fn open(self) -> anyhow::Result<reader_cache::ReaderLease> {
+        match self {
             VixReaderInput::Bytes(bytes, index) => {
-                Arc::new(VixReader::open_with_index(bytes, index)?)
+                reader_cache::ReaderLease::private(VixReader::open_with_index(bytes, index)?)
             }
             VixReaderInput::Ranged {
                 source,
                 index,
                 cache_key,
+                cached,
             } => {
-                let reader = Arc::new(VixReader::open_ranged_with_index(source, index)?);
-                if let Some(cache_key) = cache_key {
-                    reader_cache::GLOBAL_CACHE.put(cache_key, Arc::clone(&reader));
+                if let Some(locked) = cached
+                    && let Some(lease) = locked.upgrade()?
+                {
+                    return Ok(lease);
                 }
-                reader
+                let reader = VixReader::open_ranged_with_index(source, index)?;
+                match cache_key {
+                    Some(key) => reader_cache::GLOBAL_CACHE.put(key, reader),
+                    None => reader_cache::ReaderLease::private(reader),
+                }
             }
-            VixReaderInput::Shared(reader) => reader,
-        })
+        }
     }
 }
 
@@ -1055,9 +1154,15 @@ pub async fn warm_file(
     }
     let reader_key =
         reader_cache::ReaderCacheKey::new(key.to_string(), index_generation, index_size);
-    if reader_cache::GLOBAL_CACHE.get(&reader_key).is_some() {
-        return Ok(false);
-    }
+    let cached = match reader_cache::GLOBAL_CACHE.get(&reader_key) {
+        Some(handle) => {
+            let Some(locked) = handle.try_lock() else {
+                return Ok(false);
+            };
+            Some(locked)
+        }
+        None => None,
+    };
     let Some(size) = u64::try_from(compressed_size).ok().filter(|s| *s > 0) else {
         return Ok(false);
     };
@@ -1067,7 +1172,6 @@ pub async fn warm_file(
         key,
         size,
         handle.clone(),
-        None,
     ));
     // The dictionary lives in the generation-addressed `.vxi` sidecar.
     // Invalid generations fail closed rather than warming a data-only reader.
@@ -1079,201 +1183,30 @@ pub async fn warm_file(
         &sidecar_key,
         index_size as u64,
         handle,
-        None,
     )) as Arc<dyn vortex_index::VixRangeSource>);
     let input = VixReaderInput::Ranged {
         source,
         index,
         cache_key: Some(reader_key),
+        cached: None,
     };
-    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+    let bytes = evaluation_working_bytes(0, None, true);
+    let Some(permit) = source::try_acquire_evaluation(bytes) else {
+        return Ok(false);
+    };
+    let operation = source::ReadOperation::new(Arc::new(source::FetchStats::default()), None);
+    let _owner = operation.owner_guard();
+    run_evaluation("vix-warm", &operation, permit, move || {
+        if let Some(locked) = cached
+            && locked.upgrade()?.is_some()
+        {
+            return Ok(false);
+        }
         let reader = input.open()?;
-        // pull the dictionary directory too: it rides the memoized reader,
-        // so term lookups on this file skip their first MB-class fetch
         let _ = reader.term_row_group_count();
-        Ok(())
+        Ok(true)
     })
     .await
-    .map_err(|e| anyhow::anyhow!("warmup open task: {e}"))??;
-    Ok(true)
-}
-
-/// M14 cold-open prefetch wave report (counts only — hot-path log
-/// discipline: never file lists).
-#[derive(Default)]
-struct PrefetchWave {
-    /// group files without a memoized reader (prefetch candidates)
-    cold: usize,
-    /// candidates actually opened by the wave (the rest hit the byte budget)
-    prefetched: usize,
-    /// range fetches the wave issued / bytes they returned
-    fetches: u64,
-    bytes: u64,
-}
-
-/// M14: batch-open a file group's COLD files (no memoized reader) over the
-/// ranged ladder in one bounded-concurrency wave, so their eager tail
-/// fetches — the data object's puffin footer plus the sidecar's footer and
-/// dictionary directory — overlap across FILES instead of serializing
-/// inside each eval task's open. Every opened reader is memoized in
-/// [`reader_cache::GLOBAL_CACHE`] (the shared open path does that), so the
-/// eval tasks find them `Shared` with zero open IO. Best-effort by design:
-/// per-file errors are dropped — the evaluation re-opens (and retries)
-/// exactly as before, and a prefetch failure can never fail the query.
-///
-/// Skipped files: warm readers, files whose per-file RESULT is already
-/// memoized (their evaluation never opens a reader — without this check a
-/// hot dashboard would re-fetch tails every refresh forever), and — once
-/// the wave's estimated bytes would exceed `byte_budget` (the eval-bail
-/// threshold minus bytes already fetched) — everything past the budget, so
-/// a prefetch can never trip the projected-cost bail on its own. Wave
-/// fetches acquire the global `ZO_VIX_FETCH_CONCURRENCY` permits like every
-/// other ladder fetch and tick the query's `fetch_stats`.
-#[allow(clippy::too_many_arguments)]
-async fn prefetch_cold_tails(
-    files: &[FileKey],
-    index_condition: &Option<IndexCondition>,
-    idx_optimize_mode: &Option<IndexOptimizeMode>,
-    time_range: (i64, i64),
-    concurrency: usize,
-    fetch_stats: &Arc<source::FetchStats>,
-    byte_budget: u64,
-) -> PrefetchWave {
-    let cfg = get_config();
-    // the eager tail window each ranged open fetches per object
-    // (ZO_VIX_EAGER_TAIL_BYTES; 0 = the vortex_index built-in 64 KiB)
-    let tail_bytes = match cfg.limit.vix_eager_tail_bytes {
-        0 => 64 * 1024,
-        v => v,
-    };
-    let result_cache_enabled = cfg.common.inverted_index_result_cache_enabled;
-    let Ok(handle) = tokio::runtime::Handle::try_current() else {
-        return PrefetchWave::default();
-    };
-    let (start_time, end_time) = time_range;
-    let mut wave = PrefetchWave::default();
-    let mut planned: Vec<(String, reader_cache::ReaderCacheKey, String, u64, u64)> = Vec::new();
-    let mut estimated = 0u64;
-    for file in files {
-        // mirror the eval's ranged-open eligibility (unknown sizes degrade
-        // to whole-object downloads there — nothing to prefetch)
-        let Some(compressed) = u64::try_from(file.meta.compressed_size)
-            .ok()
-            .filter(|s| *s > 0)
-        else {
-            continue;
-        };
-        let Some(index_size) = u64::try_from(file.meta.index_size).ok().filter(|s| *s > 0) else {
-            continue;
-        };
-        let reader_key = reader_cache::ReaderCacheKey::new(
-            file.key.clone(),
-            file.meta.index_generation,
-            file.meta.index_size,
-        );
-        if reader_cache::GLOBAL_CACHE.contains(&reader_key) {
-            continue;
-        }
-        if result_cache_enabled && let Some(condition) = index_condition {
-            let file_in_range = file.meta.min_ts >= start_time && file.meta.max_ts < end_time;
-            let time_clamp = if file_in_range {
-                None
-            } else {
-                Some((
-                    start_time.max(file.meta.min_ts),
-                    end_time.min(file.meta.max_ts + 1),
-                ))
-            };
-            let key = generate_cache_key(condition, idx_optimize_mode, file, time_clamp);
-            if vix_result_cache::GLOBAL_CACHE.contains(&key) {
-                continue;
-            }
-        }
-        wave.cold += 1;
-        let estimate = tail_bytes.min(compressed) + tail_bytes.min(index_size);
-        if estimated.saturating_add(estimate) > byte_budget {
-            // over budget: the remaining cold files open lazily in eval
-            continue;
-        }
-        estimated += estimate;
-        let Some(sidecar_key) = config::vix_sidecar_key(&file.key, file.meta.index_generation)
-        else {
-            continue;
-        };
-        planned.push((
-            file.account.clone(),
-            reader_key,
-            sidecar_key,
-            compressed,
-            index_size,
-        ));
-    }
-    if planned.is_empty() {
-        return wave;
-    }
-    wave.prefetched = planned.len();
-    let before_fetches = fetch_stats
-        .fetches
-        .load(std::sync::atomic::Ordering::Relaxed);
-    let before_bytes = fetch_stats.bytes.load(std::sync::atomic::Ordering::Relaxed);
-    let opens = planned.into_iter().map(
-        |(account, reader_key, sidecar_key, compressed, index_size)| {
-            let handle = handle.clone();
-            let fetch_stats = Arc::clone(fetch_stats);
-            let key = reader_key.file().to_string();
-            async move {
-                let source = Arc::new(LadderRangeSource::new(
-                    account.clone(),
-                    &key,
-                    compressed,
-                    handle.clone(),
-                    Some(Arc::clone(&fetch_stats)),
-                ));
-                let index = Some(Arc::new(LadderRangeSource::new(
-                    account,
-                    &sidecar_key,
-                    index_size,
-                    handle,
-                    Some(fetch_stats),
-                )) as Arc<dyn vortex_index::VixRangeSource>);
-                let input = VixReaderInput::Ranged {
-                    source,
-                    index,
-                    cache_key: Some(reader_key),
-                };
-                // the ranged open blocks on its tail fetches: off the runtime
-                let opened = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                    let reader = input.open()?;
-                    // pull the dictionary directory onto the memoized reader
-                    // too, so term lookups skip their first fetch (the
-                    // warm_file behavior; usually free — sidecars lay the
-                    // directory inside the eager tail)
-                    let _ = reader.term_row_group_count();
-                    Ok(())
-                })
-                .await;
-                match opened {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => log::debug!(
-                        "search->vix: prefetch open of {key} failed (eval will retry): {e:#}"
-                    ),
-                    Err(e) => {
-                        log::debug!("search->vix: prefetch open task of {key} failed: {e}")
-                    }
-                }
-            }
-        },
-    );
-    StreamExt::collect::<Vec<()>>(stream::iter(opens).buffer_unordered(concurrency.max(1))).await;
-    wave.fetches = fetch_stats
-        .fetches
-        .load(std::sync::atomic::Ordering::Relaxed)
-        .saturating_sub(before_fetches);
-    wave.bytes = fetch_stats
-        .bytes
-        .load(std::sync::atomic::Ordering::Relaxed)
-        .saturating_sub(before_bytes);
-    wave
 }
 
 /// Returns (file_key, result, has_skipped_conditions).
@@ -1286,8 +1219,11 @@ async fn search_vix_index(
     parquet_file: &FileKey,
     read_mode: VixReadMode,
     all_index_sidecars_cached: bool,
-    fetch_stats: &Arc<source::FetchStats>,
+    operation: &Arc<source::ReadOperation>,
 ) -> anyhow::Result<(String, VixSearchResult, bool)> {
+    if operation.is_cancelled() {
+        return Err(vortex_index::VixError::Cancelled.into());
+    }
     // test-only rendezvous proving the per-file fan-out really runs
     // concurrently (see `test_eval_fan_out_runs_files_concurrently`)
     #[cfg(test)]
@@ -1397,18 +1333,12 @@ async fn search_vix_index(
     };
     let cold_native_histogram =
         equality_histogram && !parsed_sidecar_available && !local_sidecar_available;
-    // An ALL SimpleHistogram, and a zero-offset indexed ALL multi-histogram,
-    // can open a VixReader without a sidecar: eval(All) plus the
-    // timestamp/breakdown collectors are exact and avoid scanning `_source`.
+    // Keep the sidecar for grouped ALL: exact one-bucket value counts need it.
     let data_only_all_histogram = condition.is_condition_all()
-        && (matches!(
+        && matches!(
             &idx_optimize_rule,
             Some(IndexOptimizeMode::SimpleHistogram(..))
-        ) || (parquet_file.meta.index_size > 0
-            && matches!(
-                &idx_optimize_rule,
-                Some(IndexOptimizeMode::SimpleMultiHistogram(_, _, _, 0, _))
-            )));
+        );
     if (parquet_file.meta.index_size <= 0 && !data_only_all_histogram) || cold_native_histogram {
         return search_vix_docs_optimized(
             trace_id,
@@ -1416,96 +1346,112 @@ async fn search_vix_index(
             idx_optimize_rule,
             parquet_file,
             read_mode,
-            fetch_stats,
+            operation,
             time_clamp,
             cache_key,
         )
         .await;
     }
 
-    // Resolve how the object reaches the reader. Ranged mode opens it over
-    // the range-capable cache ladder (memoizing the parsed reader for hot
-    // queries); it degrades to the whole-file download when the object size
-    // is unknown. Cached mode always downloads the whole object through the
-    // cache ladder (memory -> disk -> object storage).
+    let declared_bytes = evaluation_working_bytes(
+        parquet_file.meta.records,
+        idx_optimize_rule.as_ref(),
+        file_in_range,
+    );
+    // Queue on the cache entry without owning its reader or any eval capacity.
+    // Compatibility is immutable metadata copied into the weak lookup handle.
+    let cached = if matches!(read_mode, VixReadMode::Ranged) {
+        match reader_cache::GLOBAL_CACHE.get(&reader_key) {
+            Some(handle) if data_only_all_histogram || handle.has_index() => {
+                Some(handle.lock(operation).await?)
+            }
+            Some(_) => {
+                reader_cache::GLOBAL_CACHE.remove(&vix_file_name);
+                None
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+    let permit = source::acquire_evaluation(operation, declared_bytes).await?;
+    // Unknown sizes decline the shortcut; they never trigger an unbounded read.
     let reader_input = match read_mode {
         VixReadMode::Ranged => {
-            let cached_reader = reader_cache::GLOBAL_CACHE.get(&reader_key);
-            if let Some(reader) = cached_reader.as_ref().filter(|reader| {
-                data_only_all_histogram || parquet_file.meta.index_size <= 0 || reader.has_index()
-            }) {
-                Some(VixReaderInput::Shared(Arc::clone(reader)))
-            } else {
-                // `put` is first-writer-wins, so an incompatible data-only
-                // reader must leave before the sidecar-backed replacement
-                // opens. Existing users retain their Arc safely.
-                if cached_reader.is_some() {
-                    reader_cache::GLOBAL_CACHE.remove(&vix_file_name);
-                }
-                // v3 split: the data object's exact size is compressed_size;
-                // the optional `.vxi` sidecar is attached only when this
-                // file's metadata reports a positive index_size.
-                u64::try_from(parquet_file.meta.compressed_size)
-                    .ok()
-                    .filter(|size| *size > 0)
-                    .zip(tokio::runtime::Handle::try_current().ok())
-                    .map(|(size, handle)| VixReaderInput::Ranged {
-                        source: Arc::new(LadderRangeSource::new(
+            u64::try_from(parquet_file.meta.compressed_size)
+                .ok()
+                .filter(|size| *size > 0)
+                .zip(tokio::runtime::Handle::try_current().ok())
+                .map(|(size, handle)| VixReaderInput::Ranged {
+                    source: Arc::new(LadderRangeSource::new(
+                        file_account.clone(),
+                        &vix_file_name,
+                        size,
+                        handle.clone(),
+                    )),
+                    index: config::vix_sidecar_key(
+                        &vix_file_name,
+                        parquet_file.meta.index_generation,
+                    )
+                    .zip(u64::try_from(parquet_file.meta.index_size).ok())
+                    .filter(|(_, size)| *size > 0 && !data_only_all_histogram)
+                    .map(|(sidecar_key, size)| {
+                        Arc::new(LadderRangeSource::new(
                             file_account.clone(),
-                            &vix_file_name,
+                            &sidecar_key,
                             size,
-                            handle.clone(),
-                            Some(Arc::clone(fetch_stats)),
-                        )),
-                        index: config::vix_sidecar_key(
-                            &vix_file_name,
-                            parquet_file.meta.index_generation,
-                        )
-                        .zip(u64::try_from(parquet_file.meta.index_size).ok())
-                        .filter(|(_, size)| *size > 0 && !data_only_all_histogram)
-                        .map(|(sidecar_key, size)| {
-                            Arc::new(LadderRangeSource::new(
-                                file_account.clone(),
-                                &sidecar_key,
-                                size,
-                                handle,
-                                Some(Arc::clone(fetch_stats)),
-                            )) as Arc<dyn vortex_index::VixRangeSource>
-                        }),
-                        // An ALL histogram already memoizes its compact exact
-                        // result. Keeping thousands of data-only readers would
-                        // retain decoded timestamp chunks and force the
-                        // size-accounted reader cache through an O(entries)
-                        // resync on every cold file open; filtered queries
-                        // cannot reuse those readers because they need the
-                        // sidecar anyway.
-                        cache_key: (!data_only_all_histogram).then(|| reader_key.clone()),
-                    })
-            }
+                            handle,
+                        )) as Arc<dyn vortex_index::VixRangeSource>
+                    }),
+                    // An ALL histogram already memoizes its compact exact
+                    // result. Keeping thousands of data-only readers would
+                    // retain decoded timestamp chunks and force the
+                    // size-accounted reader cache through an O(entries)
+                    // resync on every cold file open; filtered queries
+                    // cannot reuse those readers because they need the
+                    // sidecar anyway.
+                    cache_key: (!data_only_all_histogram).then(|| reader_key.clone()),
+                    cached,
+                })
         }
         VixReadMode::Cached => None,
     };
     let reader_input = match reader_input {
         Some(input) => input,
         None => {
-            log::debug!("[trace_id {trace_id}] search->vix: load index file: {vix_file_name}");
-            let bytes = file_data::get(&file_account, &vix_file_name, None)
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!("failed to load vix data file {vix_file_name}: {e}")
-                })?;
+            if matches!(read_mode, VixReadMode::Ranged) {
+                return Err(collect::AggregateFallback("unknown ranged object size").into());
+            }
+            let data_size = usize::try_from(parquet_file.meta.compressed_size)
+                .map_err(|_| collect::AggregateFallback("invalid whole-object size"))?;
+            let index_size = if data_only_all_histogram {
+                0
+            } else {
+                usize::try_from(parquet_file.meta.index_size.max(0))
+                    .map_err(|_| collect::AggregateFallback("invalid whole-index size"))?
+            };
+            permit.reserve_owned(data_size.checked_add(index_size).ok_or(
+                collect::AggregateFallback("whole-object ownership overflow"),
+            )?)?;
+            let bytes = load_whole_object(
+                operation,
+                &file_account,
+                &vix_file_name,
+                parquet_file.meta.compressed_size,
+            )
+            .await?;
             let index_bytes =
                 match config::vix_sidecar_key(&vix_file_name, parquet_file.meta.index_generation)
                     .filter(|_| parquet_file.meta.index_size > 0 && !data_only_all_histogram)
                 {
                     Some(sidecar_key) => Some(
-                        file_data::get(&file_account, &sidecar_key, None)
-                            .await
-                            .map_err(|e| {
-                                anyhow::anyhow!(
-                                    "failed to load vix index sidecar {sidecar_key}: {e}"
-                                )
-                            })?,
+                        load_whole_object(
+                            operation,
+                            &file_account,
+                            &sidecar_key,
+                            parquet_file.meta.index_size,
+                        )
+                        .await?,
                     ),
                     None => None,
                 };
@@ -1528,7 +1474,8 @@ async fn search_vix_index(
     // the eval AND the cheap timestamp clamp per query.
     let bitmap_cache_key = (cfg.common.inverted_index_result_cache_enabled && !file_in_range)
         .then(|| generate_cache_key(&condition, &None, parquet_file, None));
-    let raw = tokio::task::spawn_blocking(move || -> anyhow::Result<RawVixResult> {
+    let file_range = Some((parquet_file.meta.min_ts, parquet_file.meta.max_ts));
+    let raw = run_evaluation(trace_id, operation, permit, move || {
         let reader = reader_input.open()?;
         evaluate_vix_index(
             &task_trace_id,
@@ -1537,10 +1484,11 @@ async fn search_vix_index(
             idx_optimize_rule,
             (start_time, end_time),
             file_in_range,
+            file_range,
             bitmap_cache_key,
         )
     })
-    .await??;
+    .await?;
 
     let key = parquet_file.key.to_string();
     let (result, has_skipped) = match raw {
@@ -1677,10 +1625,13 @@ async fn search_vix_docs_optimized(
     idx_optimize_rule: Option<IndexOptimizeMode>,
     file: &FileKey,
     read_mode: VixReadMode,
-    fetch_stats: &Arc<source::FetchStats>,
+    operation: &Arc<source::ReadOperation>,
     time_clamp: Option<(i64, i64)>,
     cache_key: String,
 ) -> anyhow::Result<(String, VixSearchResult, bool)> {
+    if operation.is_cancelled() {
+        return Err(vortex_index::VixError::Cancelled.into());
+    }
     match idx_optimize_rule.as_ref() {
         Some(IndexOptimizeMode::SimpleSelect(limit, _)) if *limit > 0 => {}
         Some(IndexOptimizeMode::SimpleHistogram(..)) => {}
@@ -1711,6 +1662,12 @@ async fn search_vix_docs_optimized(
         ));
     };
 
+    let declared_bytes = evaluation_working_bytes(
+        file.meta.records,
+        idx_optimize_rule.as_ref(),
+        time_clamp.is_none(),
+    );
+    let permit = source::acquire_evaluation(operation, declared_bytes).await?;
     let account = file.account.clone();
     let key = file.key.clone();
     let ranged = match read_mode {
@@ -1724,7 +1681,6 @@ async fn search_vix_docs_optimized(
                     &key,
                     size,
                     handle,
-                    Some(Arc::clone(fetch_stats)),
                 )))
             }),
         VixReadMode::Cached => None,
@@ -1732,18 +1688,17 @@ async fn search_vix_docs_optimized(
     let input = if let Some(input) = ranged {
         input
     } else {
-        let bytes = file_data::get(&account, &key, None)
-            .await
-            .map_err(|error| {
-                anyhow::anyhow!(
-                    "[trace_id {trace_id}] failed to load native docs vix data file {key} for \
-                     equality evaluation: {error}"
-                )
-            })?;
+        if matches!(read_mode, VixReadMode::Ranged) {
+            return Err(collect::AggregateFallback("unknown ranged object size").into());
+        }
+        permit.reserve_owned(
+            usize::try_from(file.meta.compressed_size)
+                .map_err(|_| collect::AggregateFallback("invalid whole-object size"))?,
+        )?;
+        let bytes = load_whole_object(operation, &account, &key, file.meta.compressed_size).await?;
         VixDocsInput::Bytes(bytes)
     };
 
-    let task_key = key.clone();
     let task_field = field.clone();
     let whole_file_bucket = fully_covered_file_histogram_bucket(
         file,
@@ -1751,10 +1706,8 @@ async fn search_vix_docs_optimized(
         idx_optimize_rule.as_ref(),
     )?;
     let task_mode = idx_optimize_rule.expect("supported optimize mode checked above");
-    let evaluated = tokio::task::spawn_blocking(move || {
-        let docs = input
-            .open()
-            .map_err(|error| anyhow::anyhow!("open native vix docs {task_key}: {error:#}"))?;
+    let evaluated = run_evaluation(trace_id, operation, permit, move || {
+        let docs = input.open()?;
         let row_count = docs.row_count();
         let row_group_size = u32::try_from(docs.row_group_size())
             .ok()
@@ -1791,12 +1744,7 @@ async fn search_vix_docs_optimized(
                 }
             }
             _ => unreachable!("unsupported optimize mode rejected before task spawn"),
-        }
-        .map_err(|error| {
-            anyhow::anyhow!(
-                "native equality evaluation of {task_key} field {task_field:?}: {error:#}"
-            )
-        })?;
+        }?;
         let column_absent = result.is_none()
             && docs.columns_complete()
             && !docs
@@ -1805,12 +1753,7 @@ async fn search_vix_docs_optimized(
                 .any(|(name, _)| name == &task_field);
         Ok::<_, anyhow::Error>((result, row_count, column_absent))
     })
-    .await
-    .map_err(|error| {
-        anyhow::anyhow!(
-            "[trace_id {trace_id}] native equality task for docs file {key} failed: {error}"
-        )
-    })??;
+    .await?;
 
     let (result, row_count, column_absent) = evaluated;
     let expected_rows = u64::try_from(file.meta.records).map_err(|_| {
@@ -1876,8 +1819,10 @@ fn evaluate_vix_index(
     idx_optimize_rule: Option<IndexOptimizeMode>,
     time_range: (i64, i64),
     file_in_range: bool,
+    file_range: Option<(i64, i64)>,
     bitmap_cache_key: Option<String>,
 ) -> anyhow::Result<RawVixResult> {
+    vortex_index::check_read_cancelled()?;
     let (start_time, end_time) = time_range;
 
     // WHOLE-FILE partial bail — match_all/fuzzy over a partial fts field
@@ -1923,6 +1868,36 @@ fn evaluate_vix_index(
         None
     };
 
+    let aggregate = idx_optimize_rule
+        .as_ref()
+        .is_some_and(|mode| !matches!(mode, IndexOptimizeMode::SimpleSelect(..)));
+    // Oversized raw values are omitted without marking the field partial.
+    // Refuse before query conversion: even an apparently empty posting result
+    // would otherwise remove a file containing matching oversized values.
+    if stats_eq.is_none()
+        && condition
+            .get_schema_fields(&[])
+            .iter()
+            .any(|field| reader.field_oversize_skips(field) != 0)
+    {
+        return Ok(RawVixResult::PartialFields);
+    }
+    if aggregate {
+        let group_fields: &[String] = match idx_optimize_rule.as_ref() {
+            Some(IndexOptimizeMode::SimpleTopN(fields, ..)) => fields,
+            Some(IndexOptimizeMode::SimpleDistinct(field, ..))
+            | Some(IndexOptimizeMode::SimpleMultiHistogram(.., field)) => {
+                std::slice::from_ref(field)
+            }
+            _ => &[],
+        };
+        if group_fields.iter().any(|field| {
+            reader.partial_fields().contains(field) || reader.field_oversize_skips(field) != 0
+        }) {
+            return Err(collect::AggregateFallback("incomplete aggregate grouping field").into());
+        }
+    }
+
     // #40 index-off route: a column-store-only file (`index=none`) can
     // answer NOTHING but condition-free evals — its dictionary is empty BY
     // DESIGN, so every absence proof is void. Bail the WHOLE file to the
@@ -1954,13 +1929,62 @@ fn evaluate_vix_index(
     };
     // M16 §4: the (single) skipped conjunct is served exactly by the stats
     // bitmap — the evaluation is no longer a weaker predicate
-    let has_skipped = has_skipped && stats_eq.is_none();
+    let has_skipped = (has_skipped || !condition.can_remove_filter()) && stats_eq.is_none();
+    if aggregate && has_skipped {
+        return Err(
+            collect::AggregateFallback("aggregate predicate requires residual filtering").into(),
+        );
+    }
 
-    // pilot fix B: an unfiltered (condition-all) full-range single-field
-    // TopN/Distinct is served index-only where possible — term-dictionary
-    // value counts first, docs column second, `_source` extraction last —
-    // so such a file never needs docs columns (and is never skipped).
-    // Multi-field TopN stays on the docs-column path.
+    // This answer precedes docs availability and posting evaluation. Only a
+    // whole-file single bucket and the entire ALL/positive same-field IN
+    // predicate can reuse raw value counts; all other shapes use exact rows.
+    if file_in_range
+        && !has_skipped
+        && let Some(file_range) = file_range
+        && let Some(IndexOptimizeMode::SimpleMultiHistogram(min, max, width, offset, field)) =
+            idx_optimize_rule.as_ref()
+    {
+        if let [crate::index::Condition::In(predicate_field, values, false)] =
+            condition.conditions.as_slice()
+            && predicate_field == field
+        {
+            if let Some(rows) = collect::single_bucket_value_counts(
+                reader, field, values, file_range, time_range, *min, *max, *width, *offset,
+            )? {
+                return Ok(RawVixResult::MultiHistogram {
+                    rows,
+                    has_skipped: false,
+                });
+            }
+        } else if condition.is_condition_all()
+            && file_range.0 <= file_range.1
+            && file_range.0 >= time_range.0
+            && file_range.1 < time_range.1
+            && *width > 0
+            && let Some(span) = max.checked_sub(*min).filter(|span| *span > 0)
+            && let Ok(buckets) = usize::try_from((span as u64).div_ceil(*width))
+            && let Some(bucket) =
+                histogram_range_bucket(file_range.0, file_range.1, *min, *width, buckets, *offset)?
+            && let Some(label) = i64::try_from(*width)
+                .ok()
+                .and_then(|width| width.checked_mul(bucket as i64))
+                .and_then(|delta| min.checked_add(delta))
+            && let Some(groups) = collect::unfiltered_top_n(reader, field, usize::MAX, false)?
+        {
+            let rows = groups
+                .into_iter()
+                .map(|(mut key, count)| (label, key.remove(0), count))
+                .collect();
+            return Ok(RawVixResult::MultiHistogram {
+                rows,
+                has_skipped: false,
+            });
+        }
+    }
+
+    // Complete single-field dictionary answers precede docs-column fallback;
+    // neither route may produce a truncated per-file aggregate.
     let single_group_field = match idx_optimize_rule.as_ref() {
         Some(IndexOptimizeMode::SimpleTopN(fields, ..)) if fields.len() == 1 => {
             Some(fields[0].clone())
@@ -2257,42 +2281,16 @@ fn evaluate_vix_index(
         }
         Some(IndexOptimizeMode::SimpleTopN(fields, limit, ascend)) => {
             if let Some(field) = &index_only_field {
-                // M13 dispatch (measured — bench table in ENGINE-BACKLOG
-                // M13): the dictionary serve streams the field's CONTIGUOUS
-                // doc_count ordinal range (field-major spans) into a bounded
-                // heap — O(distinct), tiny constants — while the docs column
-                // pays an O(rows) column decode plus a per-distinct-value
-                // map. On the 16M-row corpus the dictionary wins at BOTH
-                // extremes (30 distinct: 1.5ms vs 48ms; 16M distinct: 45ms
-                // vs 9.0s), so it goes FIRST whenever it can prove exact
-                // counts. (The old docs-column-first preference argued the
-                // dictionary "walks the whole FST" — stale since field-major
-                // spans made per-field ranges contiguous and #29 made the
-                // serve key-free.) Dictionary refusals fall through to the
-                // docs column (fts/partial/bloom-only-demoted detect in
-                // microseconds; only the rare mixed-typed/empty-string
-                // shape pays its doc_count range scan before refusing);
-                // files carrying neither re-parse `_source`.
-                let docs_available = collect::docs_column_available(reader, field)?;
+                // Complete bounded dictionary counts precede any docs probe.
                 if let Some(groups) = collect::unfiltered_top_n(reader, field, limit, ascend)? {
                     return Ok(RawVixResult::TopN {
                         groups,
                         has_skipped,
                     });
                 }
-                if !docs_available {
-                    // core files always carry `_source`: total, never skipped.
-                    // This is the expensive last resort (full `_source` JSON
-                    // re-parse of every row) — #29 lever 3 makes it visible
-                    log::info!(
-                        "[trace_id {trace_id}] search->vix: unfiltered topn on {field:?} \
-                         fell through to the _source re-parse (dict and docs column \
-                         both unavailable)",
-                    );
-                    let groups = collect::source_top_n(reader, field, limit, ascend)?;
-                    return Ok(RawVixResult::TopN {
-                        groups,
-                        has_skipped,
+                if !collect::docs_column_available(reader, field)? {
+                    return Ok(RawVixResult::MissingColumn {
+                        field: field.clone(),
                     });
                 }
                 // the dictionary refused; the docs column serves it below
@@ -2325,27 +2323,16 @@ fn evaluate_vix_index(
         }
         Some(IndexOptimizeMode::SimpleDistinct(field, limit, ascend)) => {
             if let Some(field) = &index_only_field {
-                // Same M13 dispatch as SimpleTopN: dictionary first — the
-                // head/tail keys ARE the answer (O(limit) key reads + an
-                // O(distinct) doc-count reconciliation; 13ms vs the docs
-                // column's 10.1s at 16M distinct on the bench corpus).
-                let docs_available = collect::docs_column_available(reader, field)?;
+                // Complete dictionary values precede any docs probe.
                 if let Some(values) = collect::unfiltered_distinct(reader, field, limit, ascend)? {
                     return Ok(RawVixResult::Distinct {
                         values,
                         has_skipped,
                     });
                 }
-                if !docs_available {
-                    log::info!(
-                        "[trace_id {trace_id}] search->vix: unfiltered distinct on {field:?} \
-                         fell through to the _source re-parse (dict and docs column \
-                         both unavailable)",
-                    );
-                    let values = collect::source_distinct(reader, field, limit, ascend)?;
-                    return Ok(RawVixResult::Distinct {
-                        values,
-                        has_skipped,
+                if !collect::docs_column_available(reader, field)? {
+                    return Ok(RawVixResult::MissingColumn {
+                        field: field.clone(),
                     });
                 }
                 // the dictionary refused; the docs column serves it below
@@ -3229,7 +3216,9 @@ mod tests {
                 Condition::Equal("level".to_string(), "info".to_string()),
             ],
         };
-        match evaluate_vix_index("t", &reader, &condition, None, (0, 1000), true, None).unwrap() {
+        match evaluate_vix_index("t", &reader, &condition, None, (0, 1000), true, None, None)
+            .unwrap()
+        {
             RawVixResult::Bitmap {
                 bitmap,
                 has_skipped,
@@ -3250,13 +3239,17 @@ mod tests {
                 "hello world".to_string(),
             )],
         };
-        assert!(evaluate_vix_index("t", &reader, &lone, None, (0, 1000), true, None).is_err());
+        assert!(
+            evaluate_vix_index("t", &reader, &lone, None, (0, 1000), true, None, None).is_err()
+        );
 
         // match_all over the fts tokens is unaffected by fix A
         let match_all = IndexCondition {
             conditions: vec![Condition::MatchAll("hello".to_string())],
         };
-        match evaluate_vix_index("t", &reader, &match_all, None, (0, 1000), true, None).unwrap() {
+        match evaluate_vix_index("t", &reader, &match_all, None, (0, 1000), true, None, None)
+            .unwrap()
+        {
             RawVixResult::Bitmap {
                 bitmap,
                 has_skipped,
@@ -3338,7 +3331,9 @@ mod tests {
                 Condition::Equal("level".to_string(), "info".to_string()),
             ],
         };
-        match evaluate_vix_index("t", &reader, &condition, None, (0, 1000), true, None).unwrap() {
+        match evaluate_vix_index("t", &reader, &condition, None, (0, 1000), true, None, None)
+            .unwrap()
+        {
             RawVixResult::Bitmap {
                 bitmap,
                 has_skipped,
@@ -3360,7 +3355,9 @@ mod tests {
                 "t-0001".to_string(),
             )],
         };
-        assert!(evaluate_vix_index("t", &reader, &lone, None, (0, 1000), true, None).is_err());
+        assert!(
+            evaluate_vix_index("t", &reader, &lone, None, (0, 1000), true, None, None).is_err()
+        );
     }
 
     /// Straddle bitmap cache: a window-straddling file's CONDITION bitmap is
@@ -3430,6 +3427,7 @@ mod tests {
             None,
             (99, 1000),
             false,
+            None,
             Some(key.clone()),
         )
         .unwrap();
@@ -3460,6 +3458,7 @@ mod tests {
             None,
             (99, 1000),
             false,
+            None,
             Some(key.clone()),
         )
         .unwrap();
@@ -3473,6 +3472,7 @@ mod tests {
             Some(IndexOptimizeMode::SimpleCount),
             (99, 1000),
             false,
+            None,
             Some(key.clone()),
         )
         .unwrap();
@@ -3491,6 +3491,7 @@ mod tests {
             None,
             (99, 1000),
             false,
+            None,
             Some(key_nm),
         )
         .unwrap();
@@ -3510,6 +3511,7 @@ mod tests {
             None,
             (99, 1000),
             false,
+            None,
             Some(key_bad.clone()),
         )
         .unwrap();
@@ -3655,6 +3657,7 @@ mod tests {
                         range,
                         in_range,
                         None,
+                        None,
                     )
                     .unwrap()
                     {
@@ -3684,6 +3687,7 @@ mod tests {
                             )),
                             range,
                             in_range,
+                            None,
                             None,
                         )
                         .unwrap()
@@ -3901,7 +3905,8 @@ mod tests {
         assert!(!reader.key_term_exists("client_id").unwrap());
 
         let expect_empty_bitmap = |condition: IndexCondition| {
-            match evaluate_vix_index("t", &reader, &condition, None, (0, 2000), true, None).unwrap()
+            match evaluate_vix_index("t", &reader, &condition, None, (0, 2000), true, None, None)
+                .unwrap()
             {
                 RawVixResult::Bitmap {
                     bitmap,
@@ -3953,6 +3958,7 @@ mod tests {
             (0, 2000),
             true,
             None,
+            None,
         )
         .unwrap()
         {
@@ -3970,6 +3976,7 @@ mod tests {
             Some(IndexOptimizeMode::SimpleCount),
             (0, 2000),
             true,
+            None,
             None,
         )
         .unwrap()
@@ -3989,7 +3996,9 @@ mod tests {
                 Box::new(Condition::Equal("level".into(), "info".into())),
             )],
         };
-        assert!(evaluate_vix_index("t", &reader, &mixed, None, (0, 2000), true, None).is_err());
+        assert!(
+            evaluate_vix_index("t", &reader, &mixed, None, (0, 2000), true, None, None).is_err()
+        );
     }
 
     /// Build one core file whose `svc` values are term-indexed but NOT
@@ -4056,51 +4065,31 @@ mod tests {
         (reader, file)
     }
 
-    /// Pilot fix B end-to-end: unfiltered full-range TopN/Distinct over a
-    /// field that is NOT column-stored. Both files serve from the term
-    /// dictionary (empty-string values are ordinary dictionary citizens
-    /// since the wave-A writer fix), and a partial-time-range evaluation
-    /// falls back per file (MissingColumn; the flight-side routing keeps
-    /// such files in the DataFusion branch).
+    /// Complete groups survive local limits; NULL-containing files refuse
+    /// the aggregate rather than silently omitting their SQL NULL group.
     #[test]
     fn test_unfiltered_topn_distinct_over_term_indexed_field() {
         let condition = IndexCondition {
             conditions: vec![Condition::All()],
         };
-        let (reader_a, _file_a) = build_term_only_file(
-            "file_a.vix",
+        let (reader, _) = build_term_only_file(
+            "complete.vix",
             1000,
-            &[
-                Some("api"),
-                Some("api"),
-                Some("db"),
-                Some("api"),
-                None,
-                Some("web"),
-            ],
+            &[Some("api"), Some("api"), Some(""), Some("db")],
         );
-        let (reader_b, _file_b) =
-            build_term_only_file("file_b.vix", 500, &[Some("api"), Some(""), Some("auth")]);
-
-        // both are dictionary-servable — the "" value is raw-indexed too
-        // (v2 all-columns: svc is ALSO a docs column; the dictionary serve
-        // is the path under test either way)
-        assert!(reader_a.field_value_counts("svc").unwrap().is_some());
-        assert!(reader_b.field_value_counts("svc").unwrap().is_some());
-        assert!(reader_a.has_column_store_field("svc"));
-        assert!(reader_b.has_column_store_field("svc"));
-
-        let full_range = (0i64, 2000i64);
-        let topn_rule = IndexOptimizeMode::SimpleTopN(vec!["svc".to_string()], 10, false);
-        let mut merged: Vec<(Vec<String>, u64)> = Vec::new();
-        for reader in [&reader_a, &reader_b] {
+        let (nullable, _) = build_term_only_file("nullable.vix", 1000, &[Some("api"), None]);
+        for rule in [
+            IndexOptimizeMode::SimpleTopN(vec!["svc".into()], 1, false),
+            IndexOptimizeMode::SimpleDistinct("svc".into(), 1, true),
+        ] {
             match evaluate_vix_index(
-                "t",
-                reader,
+                "complete",
+                &reader,
                 &condition,
-                Some(topn_rule.clone()),
-                full_range,
+                Some(rule.clone()),
+                (0, 2000),
                 true,
+                None,
                 None,
             )
             .unwrap()
@@ -4110,88 +4099,39 @@ mod tests {
                     has_skipped,
                 } => {
                     assert!(!has_skipped);
-                    merged.extend(groups);
+                    let totals: std::collections::BTreeMap<_, _> = groups
+                        .into_iter()
+                        .map(|(key, count)| (key[0].clone(), count))
+                        .collect();
+                    assert_eq!(
+                        totals,
+                        std::collections::BTreeMap::from([
+                            ("".to_owned(), 1),
+                            ("api".to_owned(), 2),
+                            ("db".to_owned(), 1)
+                        ])
+                    );
                 }
-                _ => panic!("expected TopN"),
-            }
-        }
-        // re-aggregate like the final DataFusion aggregate does
-        let mut totals: std::collections::BTreeMap<String, u64> = Default::default();
-        for (key, count) in merged {
-            *totals.entry(key[0].clone()).or_default() += count;
-        }
-        assert_eq!(
-            totals,
-            std::collections::BTreeMap::from([
-                ("".to_string(), 1),
-                ("api".to_string(), 4),
-                ("auth".to_string(), 1),
-                ("db".to_string(), 1),
-                ("web".to_string(), 1),
-            ])
-        );
-
-        // Distinct, asc and desc, over both serving paths
-        for (reader, ascend, expected) in [
-            (&reader_a, true, HashSet::from(["api".into(), "db".into()])),
-            (&reader_a, false, HashSet::from(["web".into(), "db".into()])),
-            (&reader_b, true, HashSet::from(["".into(), "api".into()])),
-            (
-                &reader_b,
-                false,
-                HashSet::from(["auth".into(), "api".into()]),
-            ),
-        ] {
-            let rule = IndexOptimizeMode::SimpleDistinct("svc".to_string(), 2, ascend);
-            match evaluate_vix_index("t", reader, &condition, Some(rule), full_range, true, None)
-                .unwrap()
-            {
                 RawVixResult::Distinct {
                     values,
                     has_skipped,
                 } => {
                     assert!(!has_skipped);
-                    assert_eq!(values, expected, "ascend={ascend}");
+                    assert_eq!(values, HashSet::from(["".into()]));
                 }
-                _ => panic!("expected Distinct"),
+                _ => panic!("complete string groups must be exact"),
             }
-        }
-
-        // a file only partially inside the range cannot use raw doc_counts
-        // (they include out-of-range docs) — the filtered dictionary path
-        // now serves it exactly: per value, postings ∩ the time bitmap.
-        // file_a stamps ts descending from 1000: api@1000, api@999, db@998,
-        // api@997, None@996, web@995 — [996, 1200) keeps api=3, db=1.
-        let narrow = (996i64, 1200i64);
-        match evaluate_vix_index(
-            "t",
-            &reader_a,
-            &condition,
-            Some(topn_rule),
-            narrow,
-            false,
-            None,
-        )
-        .unwrap()
-        {
-            RawVixResult::TopN {
-                groups,
-                has_skipped,
-            } => {
-                assert!(!has_skipped);
-                let totals: std::collections::BTreeMap<String, u64> = groups
-                    .into_iter()
-                    .map(|(key, count)| (key[0].clone(), count))
-                    .collect();
-                assert_eq!(
-                    totals,
-                    std::collections::BTreeMap::from([
-                        ("api".to_string(), 3),
-                        ("db".to_string(), 1),
-                    ])
-                );
-            }
-            _ => panic!("expected TopN via the filtered dictionary path"),
+            let result = evaluate_vix_index(
+                "nullable",
+                &nullable,
+                &condition,
+                Some(rule),
+                (0, 2000),
+                true,
+                None,
+                None,
+            );
+            assert!(result.as_ref().err().is_some_and(requires_exact_scan));
         }
     }
 
@@ -4274,64 +4214,24 @@ mod tests {
         };
         let full_range = (0i64, 2000i64);
 
-        // svc=api rows (indices 0,1,3,4) carry code_fn: handle, route,
-        // handle, None -> handle=2, route=1 (the api row without code_fn
-        // forms no group; web/render, None/orphan and db's handle are
-        // filtered out)
-        match evaluate_vix_index(
-            "t",
-            &reader,
-            &condition,
-            Some(IndexOptimizeMode::SimpleTopN(
-                vec!["code_fn".to_string()],
-                10,
-                false,
-            )),
-            full_range,
-            true,
-            None,
-        )
-        .unwrap()
-        {
-            RawVixResult::TopN {
-                groups,
-                has_skipped,
-            } => {
-                assert!(!has_skipped);
-                let totals: std::collections::BTreeMap<String, u64> = groups
-                    .into_iter()
-                    .map(|(key, count)| (key[0].clone(), count))
-                    .collect();
-                assert_eq!(
-                    totals,
-                    std::collections::BTreeMap::from([
-                        ("handle".to_string(), 2),
-                        ("route".to_string(), 1),
-                    ])
-                );
-            }
-            _ => panic!("expected TopN via the filtered dictionary path"),
-        }
-
-        // Distinct under the same condition: only values with an api hit,
-        // ascending/descending ends of the value order
-        for (ascend, expected) in [
-            (true, HashSet::from(["handle".to_string()])),
-            (false, HashSet::from(["route".to_string()])),
+        // The matched row without code_fn forms a SQL NULL group. It cannot
+        // disappear from either TopN or DISTINCT merely because VIX groups
+        // currently represent strings only.
+        for rule in [
+            IndexOptimizeMode::SimpleTopN(vec!["code_fn".into()], 1, false),
+            IndexOptimizeMode::SimpleDistinct("code_fn".into(), 1, true),
         ] {
-            let rule = IndexOptimizeMode::SimpleDistinct("code_fn".to_string(), 1, ascend);
-            match evaluate_vix_index("t", &reader, &condition, Some(rule), full_range, true, None)
-                .unwrap()
-            {
-                RawVixResult::Distinct {
-                    values,
-                    has_skipped,
-                } => {
-                    assert!(!has_skipped);
-                    assert_eq!(values, expected, "ascend={ascend}");
-                }
-                _ => panic!("expected Distinct via the filtered dictionary path"),
-            }
+            let result = evaluate_vix_index(
+                "nullable-filtered",
+                &reader,
+                &condition,
+                Some(rule),
+                full_range,
+                true,
+                None,
+                None,
+            );
+            assert!(result.as_ref().err().is_some_and(requires_exact_scan));
         }
     }
 
@@ -4461,6 +4361,7 @@ mod tests {
             (0, 2000),
             true,
             None,
+            None,
         )
         .unwrap()
         {
@@ -4480,6 +4381,7 @@ mod tests {
             (0, 999),
             false,
             None,
+            None,
         )
         .unwrap()
         {
@@ -4498,6 +4400,7 @@ mod tests {
             Some(IndexOptimizeMode::SimpleSelect(2, true)),
             (995, 2000),
             false,
+            None,
             None,
         )
         .unwrap()
@@ -4524,27 +4427,14 @@ mod tests {
             .map(|(_, barrier)| Arc::clone(barrier))
     }
 
-    /// Test-only M14 prefetch override, trace-id keyed like [`EVAL_GATE`] so
-    /// parallel tests never flip each other's behavior. `None` = the config
-    /// default governs.
-    static PREFETCH_GATE: parking_lot::Mutex<Option<(String, bool)>> =
-        parking_lot::Mutex::new(None);
-
-    pub(super) fn prefetch_override(trace_id: &str) -> Option<bool> {
-        let gate = PREFETCH_GATE.lock();
-        gate.as_ref()
-            .filter(|(prefix, _)| trace_id.starts_with(prefix))
-            .map(|(_, enabled)| *enabled)
-    }
-
     /// Build one small core file pair and PUT both objects into the real
     /// (local) object store, returning a FileKey with true object sizes —
-    /// the M14 prefetch tests drive the production ranged ladder against it.
+    /// used by the production ranged-ladder regressions.
     async fn store_core_file(key: &str, max_ts: i64) -> FileKey {
         store_core_file_with_rows(key, max_ts, 10).await
     }
 
-    async fn store_core_file_with_rows(key: &str, max_ts: i64, rows: usize) -> FileKey {
+    pub(super) async fn store_core_file_with_rows(key: &str, max_ts: i64, rows: usize) -> FileKey {
         use arrow::{
             array::{Int64Array, RecordBatch, StringArray},
             datatypes::{DataType, Field, Schema},
@@ -4725,95 +4615,8 @@ mod tests {
         }
     }
 
-    /// M14 pin, wave mechanics: a multi-file cold eval issues the tail
-    /// fetches as ONE wave — exactly two fetches per cold file (data tail +
-    /// sidecar tail; these tiny objects sit fully inside the eager tail, so
-    /// the dictionary-directory pull costs no extra fetch), every reader is
-    /// memoized, a second wave is a no-op, and the byte budget truncates.
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_prefetch_wave_batches_cold_tail_fetches() {
-        let mut files: Vec<FileKey> = Vec::new();
-        for i in 0..3 {
-            files.push(
-                store_core_file(
-                    &format!("files/org/logs/m14wave/2026/01/01/00/wave-{i}.vix"),
-                    1_000 + i,
-                )
-                .await,
-            );
-        }
-        for file in &files {
-            assert!(
-                !reader_cache::GLOBAL_CACHE.contains(&reader_identity(file)),
-                "test keys must start cold"
-            );
-        }
-        let condition = {
-            let mut c = IndexCondition::new();
-            c.add_condition(Condition::Equal("level".to_string(), "info".to_string()));
-            Some(c)
-        };
-        let mode = Some(IndexOptimizeMode::SimpleCount);
-
-        let stats = Arc::new(source::FetchStats::default());
-        let wave =
-            prefetch_cold_tails(&files, &condition, &mode, (0, 2_000), 8, &stats, u64::MAX).await;
-        assert_eq!(wave.cold, 3);
-        assert_eq!(wave.prefetched, 3);
-        assert_eq!(
-            wave.fetches, 6,
-            "one tail fetch per object, nothing else (no per-file rounds)"
-        );
-        let expected_bytes: u64 = files
-            .iter()
-            .map(|f| (f.meta.compressed_size + f.meta.index_size) as u64)
-            .sum();
-        assert_eq!(
-            wave.bytes, expected_bytes,
-            "tiny objects: the eager tail covers each object exactly"
-        );
-        for file in &files {
-            assert!(
-                reader_cache::GLOBAL_CACHE.contains(&reader_identity(file)),
-                "wave must memoize {}",
-                file.key
-            );
-        }
-
-        // idempotent: everything is warm now — zero cold, zero fetches
-        let wave =
-            prefetch_cold_tails(&files, &condition, &mode, (0, 2_000), 8, &stats, u64::MAX).await;
-        assert_eq!((wave.cold, wave.prefetched, wave.fetches), (0, 0, 0u64));
-
-        // byte budget: fresh cold files under a 1-byte budget stay unopened
-        let mut strapped: Vec<FileKey> = Vec::new();
-        for i in 0..2 {
-            strapped.push(
-                store_core_file(
-                    &format!("files/org/logs/m14wave/2026/01/01/01/budget-{i}.vix"),
-                    2_000 + i,
-                )
-                .await,
-            );
-        }
-        let wave =
-            prefetch_cold_tails(&strapped, &condition, &mode, (0, 4_000), 8, &stats, 1).await;
-        assert_eq!(wave.cold, 2);
-        assert_eq!(
-            (wave.prefetched, wave.fetches),
-            (0, 0u64),
-            "the wave must respect the eval-bail byte budget"
-        );
-        for file in &strapped {
-            assert!(!reader_cache::GLOBAL_CACHE.contains(&reader_identity(file)));
-        }
-    }
-
-    /// M14 pin, differential: vix_search over cold files produces IDENTICAL
-    /// results with the prefetch wave on and off, and the on-run leaves the
-    /// readers memoized.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_prefetch_on_off_results_identical() {
+    async fn test_repeated_cold_files_count_exactly_once() {
         const FILES: usize = 3;
         let mut files_master: Vec<FileKey> = Vec::new();
         for i in 0..FILES {
@@ -4842,14 +4645,13 @@ mod tests {
                 use_inverted_index: true,
             })
         };
-        let run = |trace: &'static str, enabled: bool, mut files: Vec<FileKey>| async move {
+        let run = |trace: &'static str, mut files: Vec<FileKey>| async move {
             // start truly cold: no memoized readers, no memoized results
             for file in &files {
                 reader_cache::GLOBAL_CACHE.remove(&file.key);
             }
             vix_result_cache::GLOBAL_CACHE
                 .remove_file_entries(files.iter().map(|f| f.key.as_str()));
-            *PREFETCH_GATE.lock() = Some((trace.to_string(), enabled));
             let result = vix_search(
                 params(trace),
                 &mut files,
@@ -4857,32 +4659,20 @@ mod tests {
                 Some(IndexOptimizeMode::SimpleCount),
             )
             .await;
-            *PREFETCH_GATE.lock() = None;
             let (_took, add_filter_back, result) = result.unwrap();
             (add_filter_back, result, files)
         };
 
-        let (off_afb, off_result, off_files) =
-            run("m14-diff-off", false, files_master.clone()).await;
-        let (on_afb, on_result, on_files) = run("m14-diff-on", true, files_master.clone()).await;
-        assert_eq!(
-            crate::file_cache::take_cache_miss_policy("m14-diff-off"),
-            Some(CacheMissPolicy::Enqueue),
-            "ordinary index queries must retain background cache-fill behavior"
-        );
-        assert_eq!(
-            crate::file_cache::take_cache_miss_policy("m14-diff-on"),
-            Some(CacheMissPolicy::Enqueue),
-            "enabling query-tail prefetch must not disable ordinary cache fills"
-        );
+        let (off_afb, off_result, off_files) = run("count-cold-first", files_master.clone()).await;
+        let (on_afb, on_result, on_files) = run("count-cold-repeat", files_master.clone()).await;
         assert_eq!(off_afb, on_afb);
         assert!(off_files.is_empty() && on_files.is_empty());
         let (MultiResult::Count(off), MultiResult::Count(on)) = (&off_result, &on_result) else {
             panic!("expected counts, got {off_result:?} / {on_result:?}");
         };
-        assert_eq!(off, on, "prefetch must not change results");
+        assert_eq!(off, on);
         assert_eq!(*on, (FILES * 10) as u64, "all rows are level=info");
-        // the on-run leaves every reader memoized (wave or eval)
+        // Completed evaluations leave reusable immutable readers.
         for file in &files_master {
             assert!(reader_cache::GLOBAL_CACHE.contains(&reader_identity(file)));
         }
@@ -4912,7 +4702,11 @@ mod tests {
             let (reader, mut file) =
                 build_select_file(&format!("files/org/logs/t/fanout-{i}.vix"), 1000);
             file.meta.compressed_size = 4096;
-            reader_cache::GLOBAL_CACHE.put(reader_identity(&file), Arc::new(reader));
+            drop(
+                reader_cache::GLOBAL_CACHE
+                    .put(reader_identity(&file), reader)
+                    .unwrap(),
+            );
             file_list.push(file);
         }
 
@@ -5334,7 +5128,7 @@ mod tests {
             &master,
             VixReadMode::Ranged,
             false,
-            &fetch_stats,
+            &source::ReadOperation::new(Arc::clone(&fetch_stats), None),
         )
         .await
         .unwrap();
@@ -5360,7 +5154,7 @@ mod tests {
             &master,
             VixReadMode::Ranged,
             false,
-            &fetch_stats,
+            &source::ReadOperation::new(Arc::clone(&fetch_stats), None),
         )
         .await
         .unwrap();
@@ -5377,8 +5171,7 @@ mod tests {
     }
 
     /// A cold indexed equality histogram must use the data-only native docs
-    /// path. Opening either the query-prefetch or ordinary sidecar path would
-    /// memoize a `VixReader`, which this regression detects.
+    /// path without opening the unrelated sidecar.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_cold_indexed_equality_histogram_skips_sidecar() {
         let master = store_core_file_with_rows(
@@ -5441,7 +5234,7 @@ mod tests {
         );
         assert!(
             !reader_cache::GLOBAL_CACHE.contains(&reader_key),
-            "cold native histogram must not open or prefetch the sidecar"
+            "cold native histogram must not open the sidecar"
         );
     }
 
@@ -5540,7 +5333,7 @@ mod tests {
             &master,
             VixReadMode::Ranged,
             true,
-            &fetch_stats,
+            &source::ReadOperation::new(Arc::clone(&fetch_stats), None),
         )
         .await
         .unwrap();
@@ -5562,7 +5355,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_all_multi_histogram_routes_indexless_and_skips_zero_offset_sidecar() {
+    async fn test_all_multi_histogram_keeps_missing_sidecar_and_indexless_files_for_scan() {
         let indexed = store_data_only_multi_histogram_file(
             "files/org/logs/all-multi-data-only/2026/01/01/00/indexed.vix",
             true,
@@ -5578,12 +5371,9 @@ mod tests {
         };
         let zero_offset =
             IndexOptimizeMode::SimpleMultiHistogram(1_000, 1_010, 10, 0, "code".to_string());
-        let expected = vec![(1_000, "7".to_string(), 2), (1_000, "8".to_string(), 2)];
         let fetch_stats = Arc::new(source::FetchStats::default());
 
-        // An indexed zero-offset ALL multi-histogram needs only the data
-        // object's docs columns. Its advertised but deliberately absent
-        // sidecar must not be opened in either read mode.
+        // Missing sidecars cannot be silently stripped from the grouped path.
         for read_mode in [VixReadMode::Ranged, VixReadMode::Cached] {
             reader_cache::GLOBAL_CACHE.remove(&indexed.key);
             vix_result_cache::GLOBAL_CACHE
@@ -5593,33 +5383,19 @@ mod tests {
             file_data::memory::remove(&sidecar).await.unwrap();
             file_data::disk::remove(&sidecar).await.unwrap();
 
-            let (result_key, result, has_skipped) = search_vix_index(
-                "all-multi-zero-offset-direct",
+            let error = search_vix_index(
+                "all-multi-missing-sidecar",
                 (990, 1_010),
                 Some(condition.clone()),
                 Some(zero_offset.clone()),
                 &indexed,
                 read_mode,
                 false,
-                &fetch_stats,
+                &source::ReadOperation::new(Arc::clone(&fetch_stats), None),
             )
             .await
-            .unwrap();
-
-            assert_eq!(result_key, indexed.key);
-            assert!(!has_skipped);
-            let mut rows = match result {
-                VixSearchResult::MultiHistogram(rows) => rows,
-                other => panic!("expected data-only multi histogram, got {other:?}"),
-            };
-            rows.sort();
-            assert_eq!(rows, expected);
-            assert!(
-                !reader_cache::GLOBAL_CACHE.contains(&reader_identity(&indexed)),
-                "ALL multi-histogram reader must remain query-local"
-            );
-            assert!(!file_data::memory::exist(&sidecar).await);
-            assert!(!file_data::disk::exist(&sidecar).await);
+            .unwrap_err();
+            assert!(infra::storage::is_not_found_error(&error));
         }
 
         // Indexless multi-histograms are never data-only eligible. Both the
@@ -5637,7 +5413,7 @@ mod tests {
                 &indexless,
                 VixReadMode::Ranged,
                 false,
-                &fetch_stats,
+                &source::ReadOperation::new(Arc::clone(&fetch_stats), None),
             )
             .await
             .unwrap();
@@ -5646,8 +5422,7 @@ mod tests {
             assert!(has_skipped);
         }
 
-        // The complete path evaluates only the indexed file and leaves the
-        // indexless file for DataFusion.
+        // Neither file can contribute an index aggregate; both must scan once.
         for file in [&indexed, &indexless] {
             reader_cache::GLOBAL_CACHE.remove(&file.key);
             vix_result_cache::GLOBAL_CACHE.remove_file_entries(std::iter::once(file.key.as_str()));
@@ -5671,18 +5446,17 @@ mod tests {
                 .await
                 .unwrap();
         assert!(add_filter_back);
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].key, indexless.key);
-        let mut rows = match result {
-            MultiResult::MultiHistogram(rows) => rows,
-            other => panic!("expected indexed multi histogram, got {other:?}"),
-        };
-        rows.sort();
-        assert_eq!(rows, expected);
-        assert!(!reader_cache::GLOBAL_CACHE.contains(&reader_identity(&indexed)));
-        assert!(!reader_cache::GLOBAL_CACHE.contains(&reader_identity(&indexless)));
-        assert!(!file_data::memory::exist(&sidecar).await);
-        assert!(!file_data::disk::exist(&sidecar).await);
+        assert_eq!(
+            files
+                .iter()
+                .map(|file| file.key.as_str())
+                .collect::<HashSet<_>>(),
+            HashSet::from([indexed.key.as_str(), indexless.key.as_str()])
+        );
+        match result {
+            MultiResult::MultiHistogram(rows) => assert!(rows.is_empty()),
+            other => panic!("expected empty index contribution, got {other:?}"),
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -5706,7 +5480,7 @@ mod tests {
             &file,
             VixReadMode::Ranged,
             false,
-            &fetch_stats,
+            &source::ReadOperation::new(Arc::clone(&fetch_stats), None),
         )
         .await
         .unwrap();
@@ -5727,7 +5501,7 @@ mod tests {
             &file,
             VixReadMode::Ranged,
             false,
-            &fetch_stats,
+            &source::ReadOperation::new(Arc::clone(&fetch_stats), None),
         )
         .await
         .unwrap();
@@ -5761,7 +5535,7 @@ mod tests {
             Some(mode.clone()),
             &complete,
             VixReadMode::Ranged,
-            &fetch_stats,
+            &source::ReadOperation::new(Arc::clone(&fetch_stats), None),
             None,
             cache_key.clone(),
         )
@@ -5781,7 +5555,7 @@ mod tests {
             Some(mode.clone()),
             &incomplete,
             VixReadMode::Ranged,
-            &fetch_stats,
+            &source::ReadOperation::new(Arc::clone(&fetch_stats), None),
             None,
             String::new(),
         )
@@ -5800,7 +5574,7 @@ mod tests {
             Some(mode),
             &complete,
             VixReadMode::Cached,
-            &fetch_stats,
+            &source::ReadOperation::new(Arc::clone(&fetch_stats), None),
             None,
             String::new(),
         )
@@ -5853,7 +5627,11 @@ mod ranged_parity_tests {
     /// `code` term-only, `http.status` only inside `_source` (with per-row
     /// incompressible padding so the file exceeds the 64 KiB tail window and
     /// the ranged reader really fetches blob windows).
-    fn build_parity_file() -> (Bytes, Bytes) {
+    pub(super) fn build_parity_file() -> (Bytes, Bytes) {
+        build_parity_file_with_plist(VixWriterOptions::default().postings_plist_min_docs)
+    }
+
+    pub(super) fn build_parity_file_with_plist(postings_plist_min_docs: u32) -> (Bytes, Bytes) {
         let rows = 3000usize;
         let schema = Arc::new(Schema::new(vec![
             Field::new("_timestamp", DataType::Int64, false),
@@ -5864,6 +5642,7 @@ mod ranged_parity_tests {
         let opts = VixWriterOptions {
             fts_field_names: vec!["level".to_string()],
             row_group_size: 512,
+            postings_plist_min_docs,
             ..Default::default()
         };
         let services = ["api", "auth", "db", "web"];
@@ -6149,6 +5928,7 @@ mod ranged_parity_tests {
                         range,
                         in_range,
                         None,
+                        None,
                     );
                     let ranged = evaluate_vix_index(
                         "parity-ranged",
@@ -6158,6 +5938,7 @@ mod ranged_parity_tests {
                         range,
                         in_range,
                         None,
+                        None,
                     );
                     let decode = evaluate_vix_index(
                         "parity-decode",
@@ -6166,6 +5947,7 @@ mod ranged_parity_tests {
                         rule.clone(),
                         range,
                         in_range,
+                        None,
                         None,
                     );
                     let render = |result: &anyhow::Result<RawVixResult>| match result {
@@ -6197,7 +5979,9 @@ mod ranged_parity_tests {
         // the same dictionary ranges
         let unknown = condition(vec![Condition::Equal("unknown_field".into(), "x".into())]);
         for reader in [&mem_reader, &ranged_reader] {
-            match evaluate_vix_index("p", reader, &unknown, None, full_range, true, None).unwrap() {
+            match evaluate_vix_index("p", reader, &unknown, None, full_range, true, None, None)
+                .unwrap()
+            {
                 RawVixResult::Bitmap {
                     bitmap,
                     has_skipped,
@@ -6214,11 +5998,19 @@ mod ranged_parity_tests {
         // (fts-only storage: tokens exist, raw whole values do not) errors
         // identically in both modes (the caller adds the filter back)
         let unservable = condition(vec![Condition::Equal("level".into(), "info".into())]);
-        let cached_err =
-            evaluate_vix_index("p", &mem_reader, &unservable, None, full_range, true, None)
-                .err()
-                .expect("all-skipped condition must error")
-                .to_string();
+        let cached_err = evaluate_vix_index(
+            "p",
+            &mem_reader,
+            &unservable,
+            None,
+            full_range,
+            true,
+            None,
+            None,
+        )
+        .err()
+        .expect("all-skipped condition must error")
+        .to_string();
         let ranged_err = evaluate_vix_index(
             "p",
             &ranged_reader,
@@ -6226,6 +6018,7 @@ mod ranged_parity_tests {
             None,
             full_range,
             true,
+            None,
             None,
         )
         .err()
@@ -6241,6 +6034,7 @@ mod ranged_parity_tests {
             None,
             full_range,
             true,
+            None,
             None,
         )
         .unwrap();
@@ -6349,6 +6143,7 @@ mod ranged_parity_tests {
             full,
             true,
             None,
+            None,
         )
         .unwrap()
         {
@@ -6367,6 +6162,7 @@ mod ranged_parity_tests {
             straddle,
             false,
             None,
+            None,
         )
         .unwrap()
         {
@@ -6384,6 +6180,7 @@ mod ranged_parity_tests {
             Some(IndexOptimizeMode::SimpleCountField("svc".into())),
             full,
             true,
+            None,
             None,
         )
         .unwrap()
@@ -6406,6 +6203,7 @@ mod ranged_parity_tests {
                 Some(IndexOptimizeMode::SimpleMinMax("code".into(), is_max)),
                 full,
                 true,
+                None,
                 None,
             )
             .unwrap()
@@ -6433,6 +6231,7 @@ mod ranged_parity_tests {
             )),
             full,
             true,
+            None,
             None,
         )
         .unwrap()
@@ -6470,6 +6269,7 @@ mod ranged_parity_tests {
             Some(IndexOptimizeMode::SimpleCount),
             full,
             true,
+            None,
             None,
         ) {
             Err(e) => e,
@@ -6530,6 +6330,7 @@ mod ranged_parity_tests {
             (0, 2_000),
             true,
             None,
+            None,
         )
         .unwrap()
         {
@@ -6545,6 +6346,7 @@ mod ranged_parity_tests {
             Some(IndexOptimizeMode::SimpleMinMax("ghost".into(), true)),
             (0, 2_000),
             true,
+            None,
             None,
         )
         .unwrap()
@@ -6567,6 +6369,7 @@ mod ranged_parity_tests {
                 Some(rule),
                 (0, 2_000),
                 true,
+                None,
                 None,
             )
             .unwrap()
@@ -6609,7 +6412,7 @@ mod review_tests {
 
     /// One-batch core file with a single structured string field `svc`
     /// (term-indexed, not column-stored).
-    fn svc_file(svcs: &[Option<&str>]) -> VixReader {
+    pub(super) fn svc_file(svcs: &[Option<&str>]) -> VixReader {
         let rows = svcs.len();
         let schema = Arc::new(Schema::new(vec![
             Field::new("_timestamp", DataType::Int64, false),
@@ -6717,6 +6520,7 @@ mod review_tests {
                 (0, 2000),
                 true,
                 None,
+                None,
             )
         };
 
@@ -6811,6 +6615,7 @@ mod review_tests {
                 None,
                 (999, 2000),
                 false,
+                None,
                 Some(key.to_string()),
             )
         };
@@ -6895,7 +6700,17 @@ mod review_tests {
 
     fn eval_bits(reader: &VixReader, conditions: Vec<Condition>) -> (Vec<usize>, bool) {
         let condition = IndexCondition { conditions };
-        match evaluate_vix_index("review", reader, &condition, None, (0, 2000), true, None).unwrap()
+        match evaluate_vix_index(
+            "review",
+            reader,
+            &condition,
+            None,
+            (0, 2000),
+            true,
+            None,
+            None,
+        )
+        .unwrap()
         {
             RawVixResult::Bitmap {
                 bitmap,
@@ -6999,14 +6814,18 @@ mod review_tests {
     /// non-ASCII text. Files stamped with the legacy `o2-v1` tokenizer
     /// property re-tokenize at their next compaction; ASCII behavior is
     /// identical either way.
+    /// Non-ASCII token conjunctions can be candidate supersets: the retained
+    /// scan predicate must reject separated tokens that are not the literal.
     #[test]
     fn review_finding_match_all_tokenizer_mismatch_on_non_ascii() {
-        let reader = fts_file(&[
+        let messages = [
             "用户admin登录",
             "plain admin login",
             "café latte",
             "size 中 large",
-        ]);
+            "caf é",
+        ];
+        let reader = fts_file(&messages);
 
         // the index contains the canonical tokens
         let any = |token: &str| VixQuery::TokenAnyField {
@@ -7027,7 +6846,7 @@ mod review_tests {
                 .unwrap()
                 .set_indices()
                 .collect::<Vec<_>>(),
-            vec![2]
+            vec![2, 4]
         );
 
         // ... and match_all tokenizes with the same function
@@ -7046,10 +6865,40 @@ mod review_tests {
             ]
         );
 
-        // match_all('café'): doc 2 matches (caf AND é)
+        // The two tokens also match separated text: do not remove the
+        // scan-side literal predicate or return its candidate count.
         let (rows, has_skipped) = eval_bits(&reader, vec![Condition::MatchAll("café".into())]);
-        assert_eq!(rows, vec![2]);
-        assert!(!has_skipped);
+        assert_eq!(rows, vec![2, 4]);
+        assert!(has_skipped);
+        let values: Arc<dyn arrow::array::Array> = if config::get_config().common.utf8_view_enabled
+        {
+            Arc::new(arrow::array::StringViewArray::from(messages.to_vec()))
+        } else {
+            Arc::new(StringArray::from(messages.to_vec()))
+        };
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "message",
+            values.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![values]).unwrap();
+        let selected = Condition::MatchAll("café".into())
+            .to_physical_expr(&schema, &["message".to_string()])
+            .unwrap()
+            .evaluate(&batch)
+            .unwrap()
+            .into_array(messages.len())
+            .unwrap();
+        let selected = selected
+            .as_any()
+            .downcast_ref::<arrow::array::BooleanArray>()
+            .unwrap();
+        assert_eq!(
+            rows.into_iter()
+                .filter(|&row| selected.value(row))
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
 
         // match_all('admin'): both the plain and the CJK-glued doc match
         let (rows, has_skipped) = eval_bits(&reader, vec![Condition::MatchAll("admin".into())]);
@@ -7060,12 +6909,12 @@ mod review_tests {
         let (rows, has_skipped) =
             eval_bits(&reader, vec![Condition::MatchAll("用户admin登录".into())]);
         assert_eq!(rows, vec![0]);
-        assert!(!has_skipped);
+        assert!(has_skipped);
 
         // a standalone CJK char (3 bytes >= min 2) is indexed AND queryable
         let (rows, has_skipped) = eval_bits(&reader, vec![Condition::MatchAll("中".into())]);
         assert_eq!(rows, vec![3]);
-        assert!(!has_skipped);
+        assert!(has_skipped);
     }
 
     /// FIXED (was a finding inherited in shape from the baseline
@@ -7223,6 +7072,7 @@ mod review_tests {
             (0, 2000),
             true,
             None,
+            None,
         )
         .unwrap()
         {
@@ -7246,6 +7096,7 @@ mod review_tests {
             )),
             (0, 2000),
             true,
+            None,
             None,
         )
         .unwrap()
@@ -7275,6 +7126,7 @@ mod review_tests {
             )),
             (0, 2000),
             true,
+            None,
             None,
         )
         .unwrap()
@@ -7309,6 +7161,7 @@ mod review_tests {
             (0, 2000),
             true,
             None,
+            None,
         )
         .unwrap()
         {
@@ -7331,6 +7184,7 @@ mod review_tests {
             )),
             (0, 2000),
             true,
+            None,
             None,
         )
         .unwrap()
@@ -7445,15 +7299,19 @@ mod review_tests {
         // GOOD file: its parsed reader is pre-seeded into the reader cache
         // (ranged mode serves it with zero IO)
         let good_key = "files/org/logs/t/2024/01/01/00/wave_b_good_count.vix";
-        let good_reader = Arc::new(svc_file(&[Some("api"), Some("db"), Some("api")]));
+        let good_reader = svc_file(&[Some("api"), Some("db"), Some("api")]);
         let good_file = agg_file_key(good_key, 3, 4096);
-        crate::vix::reader_cache::GLOBAL_CACHE.put(
-            crate::vix::reader_cache::ReaderCacheKey::new(
-                good_file.key.clone(),
-                good_file.meta.index_generation,
-                good_file.meta.index_size,
-            ),
-            Arc::clone(&good_reader),
+        drop(
+            crate::vix::reader_cache::GLOBAL_CACHE
+                .put(
+                    crate::vix::reader_cache::ReaderCacheKey::new(
+                        good_file.key.clone(),
+                        good_file.meta.index_generation,
+                        good_file.meta.index_size,
+                    ),
+                    good_reader,
+                )
+                .unwrap(),
         );
 
         // BAD file: not cached anywhere, no such object in storage — every
@@ -7495,15 +7353,19 @@ mod review_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn review_wave_b_skipped_condition_keeps_file_for_scan_branch() {
         let key = "files/org/logs/t/2024/01/01/00/wave_b_fts_skip.vix";
-        let reader = Arc::new(fts_file(&["hello world", "goodbye world"]));
+        let reader = fts_file(&["hello world", "goodbye world"]);
         let file = agg_file_key(key, 2, 4096);
-        crate::vix::reader_cache::GLOBAL_CACHE.put(
-            crate::vix::reader_cache::ReaderCacheKey::new(
-                file.key.clone(),
-                file.meta.index_generation,
-                file.meta.index_size,
-            ),
-            Arc::clone(&reader),
+        drop(
+            crate::vix::reader_cache::GLOBAL_CACHE
+                .put(
+                    crate::vix::reader_cache::ReaderCacheKey::new(
+                        file.key.clone(),
+                        file.meta.index_generation,
+                        file.meta.index_size,
+                    ),
+                    reader,
+                )
+                .unwrap(),
         );
 
         // equality on the fts field is skipped per file (tokens only, no
@@ -7557,6 +7419,7 @@ mod review_tests {
             None,
             (998, 1000),
             false,
+            None,
             None,
         )
         .unwrap()
@@ -7638,6 +7501,7 @@ mod review_tests {
                 rule,
                 (0, 2000),
                 true,
+                None,
                 None,
             )
         };
@@ -7729,7 +7593,7 @@ mod ui_histogram_differential_tests {
     const BREAKDOWN_FIELD: &str = "kubernetes.namespace.name";
 
     /// Deterministic rows: timestamps scattered over `[start, end)` (LCG),
-    /// breakdown values ns-a/ns-b/ns-c with a null every 11th row; when
+    /// non-null breakdown values ns-a/ns-b/ns-c for exact bucket-grid parity;
     /// `with_out_of_range` is set, extra rows land before `start` and at/after
     /// `end` (the partial-range file case).
     struct Rows {
@@ -7756,7 +7620,7 @@ mod ui_histogram_differential_tests {
         }
         let values = ["ns-a", "ns-b", "ns-c"];
         let ns: Vec<Option<String>> = (0..ts.len())
-            .map(|i| (i % 11 != 7).then(|| values[i % values.len()].to_string()))
+            .map(|i| Some(values[i % values.len()].to_string()))
             .collect();
         Rows { ts, ns }
     }
@@ -7916,6 +7780,7 @@ mod ui_histogram_differential_tests {
             eval_range,
             file_in_range,
             None,
+            None,
         )
         .unwrap();
 
@@ -7955,24 +7820,7 @@ mod ui_histogram_differential_tests {
                     .into_iter()
                     .map(|(bucket, value, count)| (bucket, Some(value), count))
                     .collect();
-                // fast-path contract: rows with a null breakdown form no
-                // group; the scan keeps a NULL group — assert it covers
-                // exactly the in-window null rows, then compare the rest
-                let (null_groups, mut scan): (Vec<_>, Vec<_>) =
-                    scan.into_iter().partition(|(_, value, _)| value.is_none());
-                let expected_null_rows = (0..rows.ts.len())
-                    .filter(|&i| {
-                        rows.ns[i].is_none()
-                            && rows.ts[i] >= eval_range.0
-                            && rows.ts[i] < eval_range.1
-                    })
-                    .count() as u64;
-                let null_total: u64 = null_groups.iter().map(|(_, _, count)| count).sum();
-                assert_eq!(
-                    null_total, expected_null_rows,
-                    "{context}: scan's NULL-breakdown group must cover exactly the in-window \
-                     null rows (dropped by the fast path per contract)"
-                );
+                let mut scan = scan;
                 fast.sort();
                 scan.sort();
                 assert_eq!(fast, scan, "{context}: fast path != DataFusion scan");

@@ -353,23 +353,32 @@ M10 ships exactly that sampler (src/vortex_index/src/merge.rs
 
 ## 7. S3 IO rules
 
-- Reads: ranged by default (footer/tail first, then touched segments);
-  remote downloads stream to disk cache, never `res.bytes()` whole-object
-  RAM transit (H3). A projected ranged read fetches ONLY the projected
-  columns' bytes — guaranteed by the §6.1 stripe layout on passthrough
-  outputs and pinned by fetch-accounting tests
-  (vortex_index tests::ranged::passthrough_{projection,needle}_fetch_budget).
-- M14 cold-open prefetch (`ZO_VIX_QUERY_PREFETCH`, default on): before a
-  file group evaluates, COLD files (no memoized reader) batch-fetch
-  their eager tails (data footer + sidecar footer/dict directory) in one
-  bounded-concurrency wave — one parallel fetch round instead of
-  per-file sequential open rounds. Wave fetches take the global
-  ZO_VIX_FETCH_CONCURRENCY permits, count toward the eval-bail byte
-  budget (added flat in the projection), and skip result-cache-answered
-  files; postings are never prefetched (need dict resolution).
-- One global in-flight byte budget per process across ALL pools (merge
-  workers, downloaders, scans). Concurrency knobs cap parallelism;
-  the byte budget caps memory. Both exist independently.
+- Query reads are ranged by default: Puffin envelopes and native footers
+  first, then selected payload columns. Footer read-ahead can include
+  adjacent bytes; projected-payload accounting is not a claim that every
+  fetched byte belongs to a selected column. Passthrough stripe coverage
+  remains pinned by the §6.1 ranged projection tests.
+- `ZO_VIX_QUERY_PREFETCH` pipelines bounded eager-tail batches with reader
+  opening/evaluation. The process-wide `ZO_VIX_FETCH_CONCURRENCY` and
+  `ZO_VIX_FETCH_MAX_BYTES` gates cover active reads, batch accumulation,
+  and undelivered results. Query cancellation reaches queued acquisition,
+  physical reads, and blocking native work; admission remains owned until
+  the corresponding work or buffer is released.
+- `ZO_VIX_EVAL_MAX_BYTES` governs simultaneous tracked reader and pending
+  native-metadata ownership. Reservations grow before allocation rather
+  than charging a multiple of the entire sidecar size. Cached readers
+  publish size changes to their separate byte-bounded LRU; queued users
+  hold weak handles. Native footer caches retain immutable encoded bytes,
+  not decoded layout trees or the operation that created them.
+- Background fills have separate queued-plus-active count/byte admission
+  (`ZO_CACHE_LATEST_FILES_DOWNLOAD_MAX_BYTES`). Best-effort producers do
+  not detach tasks that wait behind a full queue. Small admitted objects
+  may use memory; disk fills stream under a temporary-file owner that
+  cleans up on cancellation or error.
+- These are distinct ownership gates, not one shared budget across
+  scans, downloads, compaction, and Segment-WAL. They do not claim an
+  absolute process-RSS ceiling. The new `*_MAX_BYTES` settings use raw
+  bytes; reader-cache `*_MAX_SIZE` settings retain their MiB units.
 - M17 build admission: L0 building is byte-budgeted process-wide
   (`ZO_SEGMENT_BUILD_MEMORY_BUDGET_MB`, 0 = 40% of detected memory) —
   a claim reserves estimated decoded bytes (meta size × inflation EMA,
