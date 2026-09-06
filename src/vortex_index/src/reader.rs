@@ -100,6 +100,10 @@ use crate::{
     writer::{NON_INDEXED_COLS, SOURCE_COL_NAME, TIMESTAMP_COL_NAME},
 };
 
+/// Writer-verified raw-value term disjointness; legacy/ambiguous sidecars
+/// omit this proof and must retain postings unions.
+pub(crate) const RAW_VALUE_TERMS_DISJOINT_PROPERTY: &str = "raw_value_terms_disjoint_v1";
+
 /// Exact per-value document counts of one field, as returned by
 /// [`VixReader::field_value_counts`]: `(raw value bytes, doc_count)` pairs
 /// in ascending byte order.
@@ -533,6 +537,8 @@ pub struct VixReader {
     /// nothing — `key_term_exists`' absence proof and every capability
     /// derived from it are VOID for this reader.
     index_enabled: bool,
+    /// Only an exact writer proof permits summing distinct raw-value terms.
+    raw_value_terms_disjoint: bool,
     /// Fields fts-marked in THIS file (token-indexed): the taint domain for
     /// any-field token queries over `partial_fields`.
     fts_fields: HashSet<String>,
@@ -749,6 +755,12 @@ impl VixReader {
         // no term/fts/bloom capability, dictionary proofs void, column
         // routing synthesized from the data object's `columns` list.
         let index_enabled = index_container.is_some();
+        let raw_value_terms_disjoint = index_container.as_ref().is_some_and(|index| {
+            index
+                .properties
+                .get(RAW_VALUE_TERMS_DISJOINT_PROPERTY)
+                .is_some_and(|value| value == "true")
+        });
         let (fields, partial_fields, term_count, tokenizer, plist_min_docs, index_container) =
             match index_container {
                 Some(index) => {
@@ -925,6 +937,7 @@ impl VixReader {
             partial_fields,
             oversize_skips,
             index_enabled,
+            raw_value_terms_disjoint,
             fts_fields,
             tokenizer,
             dict_index: OnceLock::new(),
@@ -1116,6 +1129,12 @@ impl VixReader {
         self.term_field_ids.get(name).copied()
     }
 
+    /// Whether the writer certified at most one raw-value term per field/doc.
+    /// FTS tokens are not covered by this proof.
+    pub(crate) fn has_disjoint_value_terms(&self) -> bool {
+        self.raw_value_terms_disjoint
+    }
+
     /// Whether per-field value lookups (exact/in/str_match/regex/prefix on a
     /// named field) can be answered from this file: the field's entry carries
     /// the `term` capability. fts-only fields (new files: `types:["fts"]`)
@@ -1181,9 +1200,9 @@ impl VixReader {
         Ok(self.eval_query(query)?)
     }
 
-    /// Count matching documents. `All`, `Exact` and `KeyExists` avoid
-    /// decoding postings (`row_count` property / `doc_count` column);
-    /// everything else falls back to `eval(..).count_set_bits()`.
+    /// Count matching documents. Single terms use `doc_count` metadata;
+    /// writer-proven disjoint same-field value terms (including flat Exact
+    /// ORs) are summed. Other matches retain exact postings unions.
     pub fn count(&self, query: &VixQuery) -> anyhow::Result<u64> {
         self.prefetch_query_fsts(query)?;
         Ok(self.count_inner(query)?)
@@ -2273,6 +2292,84 @@ impl VixReader {
         Ok(self.read_docs_column_rows_inner(name, row_ids)?)
     }
 
+    /// Point-read aligned docs columns in the requested column and row order.
+    /// Names must be nonempty and distinct; rows must be ascending, unique,
+    /// in bounds, and contain at most 65,536 entries. Unlike the single-column
+    /// API, invalid ordering is rejected rather than silently normalized.
+    pub fn read_docs_columns_rows(&self, names: &[&str], row_ids: &[u64]) -> Result<RecordBatch> {
+        check_read_cancelled()?;
+        if names.is_empty()
+            || names
+                .iter()
+                .enumerate()
+                .any(|(i, name)| names[..i].contains(name))
+        {
+            return Err(VixError::InvalidQuery(
+                "docs point projection requires nonempty, distinct column names".into(),
+            ));
+        }
+        if row_ids.len() > 65_536 || row_ids.windows(2).any(|rows| rows[0] >= rows[1]) {
+            return Err(VixError::InvalidQuery(
+                "docs point projection requires at most 65536 ascending, unique rows".into(),
+            ));
+        }
+        self.check_row_bounds(row_ids)?;
+        let schema = self.docs_schema_inner()?;
+        let indices = names
+            .iter()
+            .map(|name| {
+                schema
+                    .index_of(name)
+                    .map_err(|_| VixError::ColumnNotFound((*name).to_string()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let projected_schema = Arc::new(schema.project(&indices)?);
+        if row_ids.is_empty() {
+            return Ok(RecordBatch::new_empty(projected_schema));
+        }
+        let _scope = self.memory.enter();
+        let mut batches = Vec::new();
+        let mut returned_rows = 0usize;
+        let result = scan_blob_streaming(
+            &self.docs_blob,
+            Some(names),
+            RowSelection::Indices(row_ids.to_vec()),
+            None,
+            None,
+            0,
+            &mut |batch| {
+                if batch.schema().fields() != projected_schema.fields() {
+                    return Err(VixError::Malformed(
+                        "docs point projection returned different columns or types".into(),
+                    ));
+                }
+                if batch.num_rows() > row_ids.len() - returned_rows {
+                    return Err(VixError::Malformed(
+                        "docs point projection returned more rows than requested".into(),
+                    ));
+                }
+                returned_rows += batch.num_rows();
+                batches.push(batch);
+                Ok(())
+            },
+        );
+        check_read_cancelled()?;
+        result?;
+        if returned_rows != row_ids.len() {
+            return Err(VixError::Malformed(format!(
+                "docs point projection returned {returned_rows} rows, expected {}",
+                row_ids.len()
+            )));
+        }
+        let batch = if batches.len() == 1 {
+            batches.into_iter().next().expect("one batch")
+        } else {
+            arrow::compute::concat_batches(&projected_schema, &batches)?
+        };
+        check_read_cancelled()?;
+        Ok(batch)
+    }
+
     /// Read one `docs`-blob column in **dictionary form**, chunk by chunk:
     /// each chunk exposes per-row `codes` into its `values` array (null code
     /// = null row) instead of one materialized value per row. Chunks that
@@ -3248,7 +3345,11 @@ impl VixReader {
         }
         match query {
             VixQuery::All => Ok(self.row_count),
-            VixQuery::And(_) | VixQuery::Or(_) | VixQuery::Not(_) => {
+            VixQuery::Or(subs) => match self.count_exact_in(subs)? {
+                Some(count) => Ok(count),
+                None => Ok(self.eval_query(query)?.count_set_bits() as u64),
+            },
+            VixQuery::And(_) | VixQuery::Not(_) => {
                 Ok(self.eval_query(query)?.count_set_bits() as u64)
             }
             // any leaf: resolve its term ordinals (FST-only); a single
@@ -3260,16 +3361,10 @@ impl VixReader {
                 match ordinals.len() {
                     0 => Ok(0),
                     1 => self.read_doc_count(ordinals.pop().expect("one ordinal")),
-                    // single-field leaves over a non-fts field: a document
-                    // carries exactly ONE value term of that field, so the
-                    // matched terms' doc sets are pairwise DISJOINT and the
-                    // count is the plain doc_count sum — no postings decode,
-                    // no bitmap. (fts token terms of one doc overlap, so fts
-                    // fields keep the union.) A 30-term prefix over 16M docs
-                    // drops from ~21ms of postings union to column point
-                    // reads.
+                    // Only writer-certified raw-value fields can be summed:
+                    // legacy source-driven files may contain duplicate keys.
                     _ if self.leaf_term_docs_are_disjoint(leaf) => {
-                        Ok(self.read_doc_counts(&ordinals)?.iter().sum())
+                        self.sum_disjoint_doc_counts(&ordinals)
                     }
                     _ => Ok(self.postings_union(ordinals)?.count_set_bits() as u64),
                 }
@@ -3277,14 +3372,62 @@ impl VixReader {
         }
     }
 
-    /// Whether a leaf's matched terms provably hold pairwise-disjoint doc
-    /// sets: the leaf is scoped to ONE named field and that field is not
-    /// fts-marked. Raw value terms are disjoint by construction (one value
-    /// per document per field — numeric-tagged terms included, a document's
-    /// value is either the string or the number); fts token terms are not.
+    /// A flat positive IN resolves point keys only, never scans a dictionary.
+    /// Deduplication is by ordinal so equivalent literal encodings cannot
+    /// count the same term twice. Unproven files still share one exact union,
+    /// even for one matched ordinal, to preserve postings validation.
+    fn count_exact_in(&self, subs: &[VixQuery]) -> Result<Option<u64>> {
+        let Some(VixQuery::Exact { field, .. }) = subs.first() else {
+            return Ok(None);
+        };
+        if !subs
+            .iter()
+            .all(|sub| matches!(sub, VixQuery::Exact { field: other, .. } if other == field))
+        {
+            return Ok(None);
+        }
+        let mut ordinals = Vec::with_capacity(subs.len());
+        for sub in subs {
+            check_read_cancelled()?;
+            ordinals.extend(self.collect_ordinals(sub)?);
+        }
+        ordinals.sort_unstable();
+        ordinals.dedup();
+        let count = match ordinals.as_slice() {
+            [] => 0,
+            _ if !self.partial_fields.contains(field)
+                && self.leaf_term_docs_are_disjoint(&subs[0]) =>
+            {
+                self.sum_disjoint_doc_counts(&ordinals)?
+            }
+            _ => self.postings_union(ordinals)?.count_set_bits() as u64,
+        };
+        Ok(Some(count))
+    }
+
+    fn sum_disjoint_doc_counts(&self, ordinals: &[u64]) -> Result<u64> {
+        self.read_doc_counts(ordinals)?
+            .into_iter()
+            .try_fold(0u64, |sum, count| {
+                check_read_cancelled()?;
+                sum.checked_add(count)
+                    .filter(|total| *total <= self.row_count)
+                    .ok_or_else(|| {
+                        VixError::Malformed("disjoint term counts exceed the file row count".into())
+                    })
+            })
+    }
+
+    /// Named non-FTS raw-value terms are pairwise disjoint only when the
+    /// writer certified that invariant. Schema presence alone is insufficient:
+    /// legacy source-driven writers accepted duplicate JSON keys.
     fn leaf_term_docs_are_disjoint(&self, leaf: &VixQuery) -> bool {
+        if !self.has_disjoint_value_terms() {
+            return false;
+        }
         let field = match leaf {
-            VixQuery::Prefix { field: Some(f), .. }
+            VixQuery::Exact { field: f, .. }
+            | VixQuery::Prefix { field: Some(f), .. }
             | VixQuery::Contains { field: Some(f), .. }
             | VixQuery::Regex { field: Some(f), .. } => f,
             _ => return false,

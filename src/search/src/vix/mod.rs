@@ -1958,18 +1958,9 @@ fn evaluate_vix_index(
                 });
             }
         } else if condition.is_condition_all()
-            && file_range.0 <= file_range.1
-            && file_range.0 >= time_range.0
-            && file_range.1 < time_range.1
-            && *width > 0
-            && let Some(span) = max.checked_sub(*min).filter(|span| *span > 0)
-            && let Ok(buckets) = usize::try_from((span as u64).div_ceil(*width))
-            && let Some(bucket) =
-                histogram_range_bucket(file_range.0, file_range.1, *min, *width, buckets, *offset)?
-            && let Some(label) = i64::try_from(*width)
-                .ok()
-                .and_then(|width| width.checked_mul(bucket as i64))
-                .and_then(|delta| min.checked_add(delta))
+            && let Some(label) = collect::single_bucket_histogram_label(
+                file_range, time_range, *min, *max, *width, *offset,
+            )?
             && let Some(groups) = collect::unfiltered_top_n(reader, field, usize::MAX, false)?
         {
             let rows = groups
@@ -2201,6 +2192,9 @@ fn evaluate_vix_index(
             breakdown_field,
         )) => {
             let bitmap = eval_bitmap(reader)?;
+            let complete_file_range = file_range.filter(|&(min, max)| {
+                file_in_range && min <= max && min >= time_range.0 && max < time_range.1
+            });
             let rows = collect::simple_multi_histogram(
                 reader,
                 &bitmap,
@@ -2209,6 +2203,7 @@ fn evaluate_vix_index(
                 bucket_width,
                 ts_offset,
                 &breakdown_field,
+                complete_file_range,
             )?;
             Ok(RawVixResult::MultiHistogram { rows, has_skipped })
         }

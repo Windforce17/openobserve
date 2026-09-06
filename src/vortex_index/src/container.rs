@@ -41,7 +41,7 @@
 //!   coalesced by vortex); the blob's Vortex footer is cached on the handle so only the first scan
 //!   of a blob pays the footer fetch.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{cell::RefCell, collections::BTreeMap, rc::Rc, sync::Arc};
 
 use arrow::{
     array::{
@@ -87,6 +87,168 @@ use crate::{
     error::{Result, VixError},
     source::{RangedBlob, VixRangeSource, block_fetch},
 };
+
+// Setup admission allowances, not payload/cache budgets or measured allocator
+// limits. Account native DashMap slabs separately from fixed builtin registry
+// maps, registration-time COW scratch and allocator overhead.
+const NATIVE_REGISTRY_FIXED_WORKSPACE: usize = 1024 * 1024;
+const NATIVE_SESSION_WORKSPACE: usize = 64 * 1024;
+
+fn native_registry_workspace() -> Result<usize> {
+    // Pinned DashMap defaults to next_power_of_two(4 * available_parallelism).
+    // Four registries use it; 256B per shard conservatively covers their padded
+    // lock/map headers. Like native initialization, this assumes stable host CPU
+    // availability (DashMap caches its initial shard count process-wide).
+    std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .checked_mul(4)
+        .and_then(usize::checked_next_power_of_two)
+        .and_then(|shards| shards.checked_mul(4 * 256))
+        .and_then(|slabs| slabs.checked_add(NATIVE_REGISTRY_FIXED_WORKSPACE))
+        .ok_or_else(|| VixError::Malformed("native registry workspace overflow".to_string()))
+}
+
+thread_local! {
+    static NATIVE_READ_REGISTRIES: RefCell<Option<Rc<NativeReadRegistries>>> = const { RefCell::new(None) };
+}
+
+pub(crate) struct NativeReadScope(Option<Rc<NativeReadRegistries>>);
+
+impl Drop for NativeReadScope {
+    fn drop(&mut self) {
+        // Drop the inner owners outside the TLS borrow (also safe on unwind).
+        let inner = NATIVE_READ_REGISTRIES.with(|slot| slot.replace(self.0.take()));
+        drop(inner);
+    }
+}
+
+pub(crate) fn enter_native_read_scope() -> NativeReadScope {
+    NativeReadScope(NATIVE_READ_REGISTRIES.with(|slot| slot.take()))
+}
+
+/// Only registries may cross scans. VortexSession::clone shares a mutable
+/// type-map, so rebinding its runtime would also rebind every outstanding file.
+/// Nor can SingleThreadRuntime be pooled: its unbounded launch queues can hold
+/// detached tasks after an early-aborted scan. Each scan gets both anew.
+struct NativeReadRegistries {
+    arrays: vortex::array::session::ArraySession,
+    kernels: vortex::array::optimizer::kernels::KernelSession,
+    dtypes: vortex::dtype::session::DTypeSession,
+    layouts: vortex::layout::session::LayoutSession,
+    scalars: vortex::scalar_fn::session::ScalarFnSession,
+    stats: vortex::array::stats::session::StatsSession,
+    aggregates: vortex::aggregate_fn::session::AggregateFnSession,
+    arrow: vortex::arrow::ArrowSession,
+    memory: Arc<crate::reader::ReaderMemory>,
+    workspace: usize,
+    _pending: crate::reader::PendingMemory,
+}
+
+impl NativeReadRegistries {
+    fn new(memory: Arc<crate::reader::ReaderMemory>) -> Result<Self> {
+        let workspace = native_registry_workspace()?;
+        let pending = memory.reserve(workspace)?;
+        // Match the builtin registry defaults in VortexSessionDefault without
+        // constructing its RuntimeSession, allocator or MultiFileSession cache.
+        let registries = Self {
+            arrays: Default::default(),
+            kernels: Default::default(),
+            dtypes: Default::default(),
+            layouts: Default::default(),
+            scalars: Default::default(),
+            stats: Default::default(),
+            aggregates: Default::default(),
+            arrow: Default::default(),
+            memory,
+            workspace,
+            _pending: pending,
+        };
+        // Registration is completed before publication. No schema/value input
+        // reaches this session, and read helpers only look up these shared maps.
+        vortex::file::register_default_encodings(&registries.session());
+        Ok(registries)
+    }
+
+    fn session(&self) -> VortexSession {
+        VortexSession::empty()
+            .with_some(self.dtypes.clone())
+            .with_some(self.arrays.clone())
+            .with_some(self.kernels.clone())
+            .with_some(self.layouts.clone())
+            .with_some(self.scalars.clone())
+            .with_some(self.stats.clone())
+            .with_some(self.aggregates.clone())
+            .with_some(self.arrow.clone())
+    }
+}
+
+/// Declared before the runtime/session so its admission survives both. No TLS
+/// borrow spans admission callbacks, native execution or a caller's visitor.
+struct NativeReadSetup {
+    registries: Rc<NativeReadRegistries>,
+    _pending: crate::reader::PendingMemory,
+    memory_scope: Option<crate::source::ReaderMemoryScope>,
+}
+
+impl NativeReadSetup {
+    fn new() -> Result<Self> {
+        crate::check_read_cancelled()?;
+        let mut registries = NATIVE_READ_REGISTRIES.with(|slot| slot.borrow().clone());
+        let (memory, memory_scope) = match crate::source::current_reader_memory_if_present() {
+            Some(memory) => (memory, None),
+            None => {
+                let memory = if let Some(registries) = &registries {
+                    Arc::clone(&registries.memory)
+                } else {
+                    // Admit genuinely new fallback tracker ownership before
+                    // allocating it; ordinary reader-scoped scans skip this.
+                    crate::check_read_memory(
+                        std::mem::size_of::<crate::reader::ReaderMemory>()
+                            + 2 * std::mem::size_of::<usize>(),
+                    )?;
+                    Arc::new(crate::reader::ReaderMemory::new())
+                };
+                // Footer and payload ownership must use the same tracker as
+                // setup, including calls made without an enclosing reader.
+                let scope = crate::source::enter_reader_memory(Arc::clone(&memory));
+                (memory, Some(scope))
+            }
+        };
+        if registries.is_none() {
+            let created = Rc::new(NativeReadRegistries::new(Arc::clone(&memory))?);
+            registries = Some(if crate::source::current_read_operation().is_some() {
+                NATIVE_READ_REGISTRIES
+                    .with(|slot| Rc::clone(slot.borrow_mut().get_or_insert(created)))
+            } else {
+                created
+            });
+        }
+        let registries = registries.expect("native registries initialized");
+        // Recheck the original owner as well as the active reader. An operation
+        // may switch readers; in that case conservatively include the shared
+        // registry envelope in the active reader's admission too.
+        let _recheck = registries.memory.reserve(0)?;
+        let bytes = NATIVE_SESSION_WORKSPACE
+            + if Arc::ptr_eq(&memory, &registries.memory) {
+                0
+            } else {
+                registries.workspace
+            };
+        let pending = memory.reserve(bytes)?;
+        Ok(Self {
+            registries,
+            _pending: pending,
+            memory_scope,
+        })
+    }
+
+    fn session(&self, handle: vortex::io::runtime::Handle) -> VortexSession {
+        self.registries
+            .session()
+            .with::<vortex::array::memory::MemorySession>()
+            .with_handle(handle)
+    }
+}
 
 /// Bytes fetched from the object tail when opening ranged: covers the puffin
 /// footer (a small JSON payload) in one read for all but pathological files,
@@ -1652,6 +1814,8 @@ pub(crate) fn scan_blob_encoded_chunks(
         validity::Validity,
     };
 
+    // This copy-to-writer visitor can export native arrays (including lazy
+    // dtype/session state), so it is not part of the Arrow-read template scope.
     let runtime = SingleThreadRuntime::default();
     let session = VortexSession::default().with_handle(runtime.handle());
     let vxf = open_blob(&runtime, &session, blob)?;
@@ -1963,7 +2127,11 @@ fn write_vortex_blob_inner(
 /// releasing their pending reservation; streamed chunks never enter it.
 pub(crate) struct OpenedBlob {
     file: VortexFile,
+    // Schema publication returns the opened file; keep its weak-handle runtime
+    // and setup admission alive until that file is dropped too.
+    _runtime: Option<SingleThreadRuntime>,
     _pending: Option<crate::reader::PendingMemory>,
+    _setup: Option<NativeReadSetup>,
 }
 
 impl std::ops::Deref for OpenedBlob {
@@ -1984,6 +2152,8 @@ pub(crate) fn open_blob(
             if crate::source::current_read_operation().is_none() {
                 return Ok(OpenedBlob {
                     file: session.open_options().open_buffer(bytes.clone())?,
+                    _runtime: None,
+                    _setup: None,
                     _pending: None,
                 });
             }
@@ -2011,6 +2181,8 @@ pub(crate) fn open_blob(
                 .open_buffer(bytes.clone())?;
             Ok(OpenedBlob {
                 file,
+                _runtime: None,
+                _setup: None,
                 _pending: pending,
             })
         }
@@ -2025,6 +2197,8 @@ pub(crate) fn open_blob(
             let pending = opening.finish();
             Ok(OpenedBlob {
                 file,
+                _runtime: None,
+                _setup: None,
                 _pending: pending,
             })
         }
@@ -2036,10 +2210,15 @@ pub(crate) fn open_blob(
 /// Keep native metadata admission alive through the caller's schema
 /// publication rather than dropping it at the return boundary.
 pub(crate) fn blob_arrow_schema_owned(blob: &BlobHandle) -> Result<(Schema, OpenedBlob)> {
+    let mut setup = NativeReadSetup::new()?;
     let runtime = SingleThreadRuntime::default();
-    let session = VortexSession::default().with_handle(runtime.handle());
-    let file = open_blob(&runtime, &session, blob)?;
+    let session = setup.session(runtime.handle());
+    let mut file = open_blob(&runtime, &session, blob)?;
     let schema = file.dtype().to_arrow_schema()?;
+    // Only owned reservations/runtime escape this helper, never its TLS scope.
+    drop(setup.memory_scope.take());
+    file._runtime = Some(runtime);
+    file._setup = Some(setup);
     Ok((schema, file))
 }
 
@@ -2089,6 +2268,12 @@ pub(crate) fn scan_blob_streaming(
     decode_threads: usize,
     on_batch: &mut dyn FnMut(RecordBatch) -> Result<()>,
 ) -> Result<()> {
+    crate::check_read_cancelled()?;
+    let setup = if decode_threads <= 1 {
+        Some(NativeReadSetup::new()?)
+    } else {
+        None
+    };
     // decode_threads > 1: give vortex a multi-thread handle so one big
     // file's chunks decode in parallel (we parallelize across files;
     // a single 4GB merged file used to decode on one core). Mirrors the
@@ -2113,7 +2298,10 @@ pub(crate) fn scan_blob_streaming(
         .map(|pool| TokioRuntime::new(pool.handle().clone()));
     let session = match &pool_runtime {
         Some(rt) => VortexSession::default().with_handle(rt.handle()),
-        None => VortexSession::default().with_handle(runtime.handle()),
+        None => setup
+            .as_ref()
+            .expect("single-thread setup")
+            .session(runtime.handle()),
     };
     let vxf = open_blob(&runtime, &session, blob)?;
     let mut scan = vxf.scan()?;
@@ -2170,8 +2358,9 @@ pub(crate) fn blob_column_stats(
     };
 
     use crate::docs::NumScalar;
+    let setup = NativeReadSetup::new()?;
     let runtime = SingleThreadRuntime::default();
-    let session = VortexSession::default().with_handle(runtime.handle());
+    let session = setup.session(runtime.handle());
     let vxf = open_blob(&runtime, &session, blob)?;
     let footer = vxf.footer();
     let Some(stats) = footer.statistics() else {
@@ -2351,8 +2540,9 @@ pub(crate) fn eq_string_rows_ranges(
         Dict, Struct, dict::DictArraySlotsExt, shared::SharedArrayExt, struct_::StructArrayExt,
     };
 
+    let setup = NativeReadSetup::new()?;
     let runtime = SingleThreadRuntime::default();
-    let session = VortexSession::default().with_handle(runtime.handle());
+    let session = setup.session(runtime.handle());
     let vxf = open_blob(&runtime, &session, blob)?;
     let mut out: Vec<u64> = Vec::new();
     // canonical string decode of one chunk (shared by the dict values read
@@ -2495,8 +2685,9 @@ pub(crate) fn scan_eq_string_candidates_range(
     if range.start >= range.end {
         return Ok(());
     }
+    let setup = NativeReadSetup::new()?;
     let runtime = SingleThreadRuntime::default();
-    let session = VortexSession::default().with_handle(runtime.handle());
+    let session = setup.session(runtime.handle());
     let vxf = open_blob(&runtime, &session, blob)?;
     let mut filter = eq(col(name), lit(needle.to_string()));
     if let Some((start, end)) = ts_range {
@@ -2590,8 +2781,9 @@ pub(crate) fn count_eq_string_matches(
     if range.start >= range.end {
         return Ok(0);
     }
+    let setup = NativeReadSetup::new()?;
     let runtime = SingleThreadRuntime::default();
-    let session = VortexSession::default().with_handle(runtime.handle());
+    let session = setup.session(runtime.handle());
     let vxf = open_blob(&runtime, &session, blob)?;
     let projection = pack([(ROW_ID_COL, row_idx())], Nullability::NonNullable);
     let scan = vxf
@@ -2621,8 +2813,9 @@ pub(crate) fn count_eq_string_matches(
 /// consumers count codes and touch each distinct value once instead of
 /// hashing one string per row.
 pub(crate) fn scan_blob_dict_column(blob: &BlobHandle, name: &str) -> Result<Vec<DictColumnChunk>> {
+    let setup = NativeReadSetup::new()?;
     let runtime = SingleThreadRuntime::default();
-    let session = VortexSession::default().with_handle(runtime.handle());
+    let session = setup.session(runtime.handle());
     let vxf = open_blob(&runtime, &session, blob)?;
     let mut chunks = Vec::new();
     visit_vortex_dict_chunks(
@@ -2654,8 +2847,9 @@ pub(crate) fn visit_blob_dict_chunks(
     visitor: &mut dyn FnMut(DictColumnBatch) -> anyhow::Result<()>,
 ) -> Result<()> {
     crate::check_read_cancelled()?;
+    let setup = NativeReadSetup::new()?;
     let runtime = SingleThreadRuntime::default();
-    let session = VortexSession::default().with_handle(runtime.handle());
+    let session = setup.session(runtime.handle());
     let vxf = open_blob(&runtime, &session, blob)?;
     visit_vortex_dict_chunks(
         &runtime,
@@ -2873,8 +3067,9 @@ pub(crate) fn hash_blob_column_bloom_encoded(
     };
 
     let mut census = BloomEncodingCensus::default();
+    let setup = NativeReadSetup::new()?;
     let runtime = SingleThreadRuntime::default();
-    let session = VortexSession::default().with_handle(runtime.handle());
+    let session = setup.session(runtime.handle());
     let vxf = open_blob(&runtime, &session, blob)?;
     let scan = vxf.scan()?.with_projection(select(vec![name], root()));
     // the decoded path hashes nothing for non-string columns

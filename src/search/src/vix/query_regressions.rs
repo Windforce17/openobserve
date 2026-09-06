@@ -307,6 +307,53 @@ fn extra_conjunct_cannot_reuse_whole_field_selected_counts() {
 }
 
 #[test]
+fn different_field_predicate_keeps_exact_groups_on_shifted_and_partial_grids() {
+    let (data, index) = ranged_parity_tests::build_parity_file();
+    let reader = VixReader::open_with_index(data, Some(index)).unwrap();
+    let mut condition = selected("svc", &["api"]);
+    condition
+        .conditions
+        .push(Condition::IsNotNull("level".to_owned()));
+    for (query, raw_min, raw_max, width, offset, covered) in [
+        ((997_000, 1_000_001), 997_000, 1_000_001, 10_000, 17, true),
+        ((997_000, 1_000_001), 997_000, 1_000_001, 1_000, 17, true),
+        ((998_000, 999_501), 998_000, 1_000_000, 10_000, 17, false),
+    ] {
+        let mut expected = scan_selected(
+            &reader,
+            "level",
+            &["info", "warn", "error"],
+            query,
+            raw_min,
+            width as i64,
+            Some(("svc", "api")),
+        );
+        for row in &mut expected {
+            row.0 += offset;
+        }
+        assert_eq!(
+            exact_groups(evaluate_vix_index(
+                "different-field-shifted-grid",
+                &reader,
+                &condition,
+                Some(IndexOptimizeMode::SimpleMultiHistogram(
+                    raw_min + offset,
+                    raw_max + offset,
+                    width,
+                    offset,
+                    "level".to_owned(),
+                )),
+                query,
+                covered,
+                Some((997_001, 1_000_000)),
+                None,
+            )),
+            expected,
+        );
+    }
+}
+
+#[test]
 fn oversize_partial_and_non_string_groups_require_precise_scan() {
     let oversized = "x".repeat(VixWriterOptions::default().max_raw_term_len + 1);
     let reader = review_tests::svc_file(&[Some("short"), Some(&oversized), Some("short")]);

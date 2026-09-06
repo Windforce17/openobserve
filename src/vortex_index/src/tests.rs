@@ -28,6 +28,267 @@ use rand::{RngExt, SeedableRng, rngs::StdRng};
 
 use crate::{VixQuery, VixReader, VixWriter, VixWriterOptions};
 
+mod native_read_context_regressions {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use super::*;
+    use crate::{
+        container::{BlobHandle, RowSelection, blob_column_stats, scan_blob_streaming},
+        error::VixError,
+        source::{VixReadOperation, enter_reader_memory, with_read_operation},
+    };
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("native read workspace refused")]
+    struct WorkspaceDenied;
+
+    struct Operation {
+        cancelled: AtomicBool,
+        limit: AtomicUsize,
+        peak: AtomicUsize,
+    }
+
+    impl Operation {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                cancelled: AtomicBool::new(false),
+                limit: AtomicUsize::new(64 * 1024 * 1024),
+                peak: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    impl VixReadOperation for Operation {
+        fn is_cancelled(&self) -> bool {
+            self.cancelled.load(Ordering::Acquire)
+        }
+
+        fn check_memory(&self, bytes: usize) -> crate::error::Result<()> {
+            self.peak.fetch_max(bytes, Ordering::AcqRel);
+            if bytes > self.limit.load(Ordering::Acquire) {
+                return Err(VixError::Callback(anyhow::Error::new(WorkspaceDenied)));
+            }
+            Ok(())
+        }
+    }
+
+    fn blob_bytes() -> Bytes {
+        let (data, _) = build_dataset_bytes(dataset_options());
+        crate::container::parse_container(&Bytes::from(data))
+            .unwrap()
+            .docs
+            .unwrap()
+            .bytes()
+            .unwrap()
+    }
+
+    fn timestamps(blob: &BlobHandle) -> Vec<i64> {
+        let mut result = Vec::new();
+        scan_blob_streaming(
+            blob,
+            Some(&["_timestamp"]),
+            RowSelection::All,
+            None,
+            None,
+            0,
+            &mut |batch| {
+                let values = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                result.extend(values.values().iter().copied());
+                Ok(())
+            },
+        )
+        .unwrap();
+        result
+    }
+
+    #[test]
+    fn native_admission_allows_operation_callback_reentry() {
+        struct Reentrant(AtomicBool);
+        impl VixReadOperation for Reentrant {
+            fn is_cancelled(&self) -> bool {
+                if !self.0.swap(true, Ordering::AcqRel) {
+                    let nested = Operation::new();
+                    nested.cancelled.store(true, Ordering::Release);
+                    with_read_operation(nested, || {
+                        assert!(matches!(
+                            crate::check_read_cancelled(),
+                            Err(VixError::Cancelled)
+                        ));
+                    });
+                }
+                false
+            }
+        }
+        let blob = BlobHandle::Mem(blob_bytes());
+        with_read_operation(Arc::new(Reentrant(AtomicBool::new(false))), || {
+            assert_eq!(timestamps(&blob), (1000..1010).collect::<Vec<_>>());
+        });
+    }
+
+    #[test]
+    fn nested_native_reads_restore_runtime_and_operation_after_unwind() {
+        let blob = BlobHandle::Mem(blob_bytes());
+        let outer = Operation::new();
+        let inner = Operation::new();
+        let memory = Arc::new(crate::reader::ReaderMemory::new());
+        let _memory_scope = enter_reader_memory(memory);
+        with_read_operation(outer.clone(), || {
+            let mut values = Vec::new();
+            scan_blob_streaming(
+                &blob,
+                Some(&["_timestamp"]),
+                RowSelection::All,
+                None,
+                None,
+                0,
+                &mut |batch| {
+                    // Same-scope reentry must not hold a RefCell borrow or
+                    // rebind the outstanding outer scan's native handle.
+                    assert!(blob_column_stats(&blob, "_timestamp")?.is_some());
+                    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        with_read_operation(inner.clone(), || {
+                            assert_eq!(timestamps(&blob), (1000..1010).collect::<Vec<_>>());
+                            inner.cancelled.store(true, Ordering::Release);
+                            assert!(matches!(
+                                blob_column_stats(&blob, "_timestamp"),
+                                Err(VixError::Cancelled)
+                            ));
+                            panic!("unwind inner native scope");
+                        });
+                    }));
+                    assert!(unwound.is_err());
+                    inner.cancelled.store(false, Ordering::Release);
+                    let column = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap();
+                    values.extend(column.values().iter().copied());
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(values, (1000..1010).collect::<Vec<_>>());
+            outer.cancelled.store(true, Ordering::Release);
+            assert!(matches!(
+                blob_column_stats(&blob, "_timestamp"),
+                Err(VixError::Cancelled)
+            ));
+        });
+        with_read_operation(Operation::new(), || {
+            assert_eq!(timestamps(&blob), (1000..1010).collect::<Vec<_>>());
+        });
+    }
+
+    #[test]
+    fn aborted_native_scans_release_payload_and_keep_workspace_bounded() {
+        struct Payload {
+            bytes: Vec<u8>,
+            dropped: Arc<AtomicBool>,
+        }
+        impl AsRef<[u8]> for Payload {
+            fn as_ref(&self) -> &[u8] {
+                &self.bytes
+            }
+        }
+        impl Drop for Payload {
+            fn drop(&mut self) {
+                self.dropped.store(true, Ordering::Release);
+            }
+        }
+        let bytes = blob_bytes();
+        let operation = Operation::new();
+        let memory = Arc::new(crate::reader::ReaderMemory::new());
+        let weak_memory = Arc::downgrade(&memory);
+        {
+            let _memory_scope = enter_reader_memory(memory);
+            with_read_operation(operation.clone(), || {
+                let warm = BlobHandle::Mem(bytes.clone());
+                assert_eq!(timestamps(&warm), (1000..1010).collect::<Vec<_>>());
+                operation
+                    .limit
+                    .store(operation.peak.load(Ordering::Acquire), Ordering::Release);
+                for _ in 0..24 {
+                    let dropped = Arc::new(AtomicBool::new(false));
+                    let blob = BlobHandle::Mem(Bytes::from_owner(Payload {
+                        bytes: bytes.to_vec(),
+                        dropped: dropped.clone(),
+                    }));
+                    let mut output = None;
+                    let error = scan_blob_streaming(
+                        &blob,
+                        Some(&["_timestamp"]),
+                        RowSelection::All,
+                        None,
+                        None,
+                        0,
+                        &mut |batch| {
+                            output = Some(Arc::downgrade(batch.column(0)));
+                            Err(VixError::Callback(anyhow::anyhow!("stop this scan")))
+                        },
+                    )
+                    .unwrap_err();
+                    assert!(matches!(error, VixError::Callback(_)));
+                    assert!(output.unwrap().upgrade().is_none());
+                    drop(blob);
+                    assert!(dropped.load(Ordering::Acquire));
+                    assert_eq!(timestamps(&warm), (1000..1010).collect::<Vec<_>>());
+                }
+                // Reuse must re-admit its ownership, not only check on creation.
+                operation.limit.store(0, Ordering::Release);
+                let error = blob_column_stats(&warm, "_timestamp").unwrap_err();
+                assert!(
+                    anyhow::Error::new(error)
+                        .chain()
+                        .any(|e| e.is::<WorkspaceDenied>())
+                );
+            });
+        }
+        // Neither the TLS template nor a detached task may pin its owner once
+        // the operation and reader-memory scopes have both gone away.
+        assert!(weak_memory.upgrade().is_none());
+    }
+
+    #[test]
+    fn unscoped_native_reads_admit_combined_workspace_without_leaking_scope() {
+        let blob = BlobHandle::Mem(blob_bytes());
+        let baseline = Operation::new();
+        {
+            let memory = Arc::new(crate::reader::ReaderMemory::new());
+            let _scope = enter_reader_memory(memory);
+            with_read_operation(baseline.clone(), || {
+                assert!(blob_column_stats(&blob, "_timestamp").unwrap().is_some());
+            });
+        }
+        let denied = Operation::new();
+        denied
+            .limit
+            .store(baseline.peak.load(Ordering::Acquire) - 1, Ordering::Release);
+        let error =
+            with_read_operation(denied, || blob_column_stats(&blob, "_timestamp")).unwrap_err();
+        assert!(
+            anyhow::Error::new(error)
+                .chain()
+                .any(|e| e.is::<WorkspaceDenied>())
+        );
+        assert!(crate::source::current_reader_memory_if_present().is_none());
+
+        with_read_operation(Operation::new(), || {
+            let (_schema, opened) = crate::container::blob_arrow_schema_owned(&blob).unwrap();
+            // An owned metadata guard can escape the helper, but its temporary
+            // TLS memory scope must not escape alongside it.
+            assert!(crate::source::current_reader_memory_if_present().is_none());
+            drop(opened);
+            assert_eq!(timestamps(&blob), (1000..1010).collect::<Vec<_>>());
+            assert!(crate::source::current_reader_memory_if_present().is_none());
+        });
+    }
+}
+
 fn bits_to_set(bits: &BooleanBuffer) -> BTreeSet<u32> {
     bits.iter()
         .enumerate()
@@ -13861,3 +14122,6 @@ fn m18_writer_failopen_reencodes_slice_wrapped_chunk() {
 
 #[path = "tests/query_io.rs"]
 mod query_io;
+
+#[path = "tests/disjoint_proof.rs"]
+mod disjoint_proof;

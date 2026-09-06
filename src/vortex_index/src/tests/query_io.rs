@@ -352,6 +352,379 @@ fn dictionary_visitor_preserves_clipped_rows_nulls_and_changing_codes() {
     }
 }
 
+#[test]
+fn point_projection_preserves_alignment_nulls_and_column_order() {
+    let data = changing_dictionary_data(3);
+    let rows = [1, 2, 4, 5, 8, 9, 11];
+    for ranged in [false, true] {
+        let reader = if ranged {
+            VixReader::open_ranged(LoggedSource::new(data.clone())).unwrap()
+        } else {
+            VixReader::open(data.clone()).unwrap()
+        };
+        // Reverse stored order, crossing dictionary boundaries and both
+        // null-code and null-dictionary-value rows.
+        let batch = reader
+            .read_docs_columns_rows(&["group", "_timestamp"], &rows)
+            .unwrap();
+        assert_eq!(batch.schema().field(0).name(), "group");
+        assert_eq!(batch.schema().field(1).name(), "_timestamp");
+        let groups = arrow::compute::cast(batch.column(0), &DataType::Utf8).unwrap();
+        let groups = groups.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(
+            groups.iter().collect::<Vec<_>>(),
+            vec![
+                Some(""),
+                None,
+                Some("beta"),
+                None,
+                Some("gamma"),
+                Some("alpha"),
+                Some("gamma")
+            ]
+        );
+        let timestamps = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(
+            timestamps.values().as_ref(),
+            rows.map(|row| 100 - row as i64)
+        );
+        let empty = reader
+            .read_docs_columns_rows(&["group", "_timestamp"], &[])
+            .unwrap();
+        assert_eq!(empty.num_rows(), 0);
+        assert_eq!(empty.schema(), batch.schema());
+        // The older API still normalizes unordered duplicate rows.
+        let legacy = reader
+            .read_docs_column_rows("_timestamp", &[9, 1, 9])
+            .unwrap();
+        let legacy = legacy.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(legacy.values().as_ref(), &[99, 91]);
+    }
+}
+
+#[test]
+fn point_projection_rejects_invalid_selection_and_cancelled_operations() {
+    let source = LoggedSource::new(changing_dictionary_data(3));
+    let reader = VixReader::open_ranged(source.clone()).unwrap();
+    for rows in [&[1, 1][..], &[2, 1], &[12]] {
+        assert!(reader.read_docs_columns_rows(&["group"], rows).is_err());
+    }
+    assert!(
+        reader
+            .read_docs_columns_rows(&["group"], &(0..65_537).collect::<Vec<_>>())
+            .is_err()
+    );
+    assert!(matches!(
+        reader.read_docs_columns_rows(&[], &[]),
+        Err(crate::VixError::InvalidQuery(_))
+    ));
+    assert!(matches!(
+        reader.read_docs_columns_rows(&["group", "group"], &[1]),
+        Err(crate::VixError::InvalidQuery(_))
+    ));
+    assert!(matches!(
+        reader.read_docs_columns_rows(&["group", "missing"], &[]),
+        Err(crate::VixError::ColumnNotFound(_))
+    ));
+    let before = source.ranges();
+    let cancelled = Arc::new(Operation(AtomicBool::new(true)));
+    let error = with_read_operation(cancelled, || {
+        reader.read_docs_columns_rows(&["group", "_timestamp"], &[0, 4])
+    })
+    .unwrap_err();
+    assert!(matches!(error, crate::VixError::Cancelled));
+    assert_eq!(source.ranges(), before);
+    let batch = reader
+        .read_docs_columns_rows(&["_timestamp"], &[0, 4])
+        .unwrap();
+    let values = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(values.values().as_ref(), &[100, 96]);
+}
+
+#[test]
+fn point_projection_accepts_full_bound_and_rejects_incomplete_docs() {
+    let rows = 65_536;
+    let schema = Schema::new(vec![
+        Field::new("_timestamp", DataType::Int64, false),
+        Field::new("_source", DataType::Utf8, false),
+    ]);
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![
+            Arc::new(Int64Array::from_iter_values(0..rows)),
+            Arc::new(StringArray::from(vec!["{}"; rows as usize])),
+        ],
+    )
+    .unwrap();
+    let blob =
+        container::write_vortex_blob(&schema, &[batch], container::addressable_strategy(), 1)
+            .unwrap();
+    let build = |declared_rows: i64| {
+        Bytes::from(
+            container::build_container(
+                vec![
+                    ("version".to_string(), "3".to_string()),
+                    ("row_count".to_string(), declared_rows.to_string()),
+                    ("columns".to_string(), "[\"_timestamp\"]".to_string()),
+                ],
+                vec![(
+                    container::BLOB_TYPE_DOCS,
+                    container::BLOB_TAG_DOCS,
+                    blob.clone(),
+                )],
+            )
+            .unwrap(),
+        )
+    };
+    let reader = VixReader::open(build(rows)).unwrap();
+    let row_ids: Vec<u64> = (0..rows as u64).collect();
+    let projected = reader
+        .read_docs_columns_rows(&["_timestamp"], &row_ids)
+        .unwrap();
+    let values = projected
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(values.values().as_ref(), &(0..rows).collect::<Vec<_>>());
+    // The container advertises one more row than the native docs actually
+    // contain. Point reads must not return a short, misaligned success.
+    let corrupt = VixReader::open(build(rows + 1)).unwrap();
+    assert!(
+        corrupt
+            .read_docs_columns_rows(&["_timestamp"], &[rows as u64 - 1, rows as u64])
+            .is_err()
+    );
+}
+
+#[test]
+fn exact_in_duplicate_source_keys_keeps_union_semantics() {
+    // Full-presence, nonnullable scalar docs do NOT prove term disjointness:
+    // the source-driven writer accepts duplicate JSON keys and does not give
+    // the stored column precedence over source-derived terms.
+    let schema = Schema::new(vec![
+        Field::new("_timestamp", DataType::Int64, false),
+        Field::new("group", DataType::Utf8, false),
+    ]);
+    let mut writer = VixWriter::new(&schema, VixWriterOptions::default(), false);
+    writer
+        .push_docs_rows(
+            &Int64Array::from(vec![3, 2, 1]),
+            &[(
+                "group".to_string(),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef,
+            )],
+            &StringArray::from(vec![
+                r#"{"group":"a","group":"b"}"#,
+                r#"{"group":"b"}"#,
+                r#"{"group":"c"}"#,
+            ]),
+            None,
+        )
+        .unwrap();
+    let (data, index) = writer.finish().unwrap();
+    for proof in [None, Some("false"), Some("TRUE"), Some("not-a-proof")] {
+        let index = repack_with_properties(index.clone().unwrap(), |properties| {
+            properties.retain(|(name, _)| name != crate::reader::RAW_VALUE_TERMS_DISJOINT_PROPERTY);
+            if let Some(proof) = proof {
+                properties.push((
+                    crate::reader::RAW_VALUE_TERMS_DISJOINT_PROPERTY.to_string(),
+                    proof.to_string(),
+                ));
+            }
+        });
+        let reader = open_built(data.clone(), Some(index));
+        let query = VixQuery::Or(vec![exact("group", "a"), exact("group", "b")]);
+        assert_eq!(reader.eval(&query).unwrap().count_set_bits(), 2);
+        assert_eq!(reader.count(&query).unwrap(), 2);
+        let duplicate = VixQuery::Or(vec![
+            exact("group", "b"),
+            exact("group", "a"),
+            exact("group", "b"),
+            exact("group", "missing"),
+        ]);
+        assert_eq!(reader.count(&duplicate).unwrap(), 2);
+        assert_eq!(reader.count(&prefix(Some("group"), "")).unwrap(), 3);
+    }
+}
+
+#[test]
+fn exact_in_counts_match_bitmap_for_typed_literals_and_overlapping_shapes() {
+    let reader = build_docs_dataset(false);
+    let queries = [
+        VixQuery::Or(vec![
+            exact("svc", "api"),
+            exact("svc", "auth"),
+            exact("svc", "api"),
+            exact("svc", "missing"),
+        ]),
+        VixQuery::Or(vec![
+            exact_numeric("code", "1"),
+            exact_numeric("code", "2"),
+            exact_numeric("code", "1"),
+        ]),
+        // Mixed-field predicates overlap on documents and must never sum.
+        VixQuery::Or(vec![exact("svc", "api"), exact("level", "error")]),
+        // FTS tokens overlap even within one field.
+        VixQuery::Or(vec![any_token("error"), any_token("db")]),
+        VixQuery::Or(vec![
+            exact("svc", "api"),
+            VixQuery::Or(vec![exact("svc", "api"), exact("svc", "auth")]),
+        ]),
+    ];
+    for query in queries {
+        assert_eq!(
+            reader.count(&query).unwrap(),
+            reader.eval(&query).unwrap().count_set_bits() as u64,
+            "{query:?}"
+        );
+    }
+    assert!(
+        reader
+            .count(&VixQuery::Or(vec![
+                exact("log", "error"),
+                exact("log", "db")
+            ]))
+            .is_err()
+    );
+}
+
+#[test]
+fn unproven_exact_in_one_ordinal_preserves_postings_corruption() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("_timestamp", DataType::Int64, false),
+        Field::new("group", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![3, 2, 1])),
+            Arc::new(StringArray::from(vec!["a", "a", "b"])),
+        ],
+    )
+    .unwrap();
+    let mut writer = VixWriter::new(
+        &schema,
+        VixWriterOptions {
+            postings_plist_min_docs: 1,
+            ..Default::default()
+        },
+        false,
+    );
+    writer
+        .push_batch_with_source(&batch, &StringArray::from(vec!["{}"; 3]), None)
+        .unwrap();
+    let (data, index) = writer.finish().unwrap();
+    let mut index = repack_with_properties(index.unwrap(), |properties| {
+        properties.retain(|(name, _)| name != crate::reader::RAW_VALUE_TERMS_DISJOINT_PROPERTY);
+    });
+    // Keep the dictionary and doc_count intact, but make the pointed-to
+    // postings records unreadable. A metadata-only count would hide this.
+    let plist = crate::test_support::blob_byte_range(&index, "plist").unwrap();
+    index[plist].fill(0xFF);
+    let reader = open_built(data, Some(index));
+    let query = VixQuery::Or(vec![exact("group", "a"), exact("group", "missing")]);
+    let bitmap_error = reader.eval(&query).unwrap_err();
+    let count_error = reader.count(&query).unwrap_err();
+    match (
+        bitmap_error.downcast_ref::<crate::VixError>(),
+        count_error.downcast_ref::<crate::VixError>(),
+    ) {
+        (Some(crate::VixError::Malformed(bitmap)), Some(crate::VixError::Malformed(count))) => {
+            assert_eq!(count, bitmap);
+        }
+        errors => panic!("expected matching postings corruption errors, got {errors:?}"),
+    }
+}
+
+#[test]
+fn certified_exact_in_avoids_ranged_postings_but_legacy_keeps_union() {
+    let rows = 131_072usize;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("_timestamp", DataType::Int64, false),
+        Field::new("group", DataType::Utf8, false),
+    ]));
+    let mut rng = StdRng::seed_from_u64(0x1_c0_017);
+    let groups: Vec<String> = (0..rows)
+        .map(|_| format!("g{:04}", rng.random_range(0..2048)))
+        .collect();
+    let expected = groups
+        .iter()
+        .filter(|value| matches!(value.as_str(), "g0000" | "g0001"))
+        .count();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from_iter_values((1..=rows as i64).rev())),
+            Arc::new(StringArray::from_iter_values(groups)),
+        ],
+    )
+    .unwrap();
+    let mut writer = VixWriter::new(
+        &schema,
+        VixWriterOptions {
+            postings_plist_min_docs: 8,
+            ..Default::default()
+        },
+        false,
+    );
+    writer
+        .push_batch_with_source(&batch, &StringArray::from(vec!["{}"; rows]), None)
+        .unwrap();
+    let (data, index) = writer.finish().unwrap();
+    let index = index.unwrap();
+    let query = VixQuery::Or(vec![
+        exact("group", "g0001"),
+        exact("group", "g0000"),
+        exact("group", "g0001"),
+        exact("group", "missing"),
+    ]);
+    for certified in [true, false] {
+        let index = if certified {
+            index.clone()
+        } else {
+            repack_with_properties(index.clone(), |properties| {
+                properties
+                    .retain(|(name, _)| name != crate::reader::RAW_VALUE_TERMS_DISJOINT_PROPERTY);
+            })
+        };
+        let index = Bytes::from(index);
+        let plist = blob_range(&index, "plist");
+        // The query targets early terms; enough plist lies outside the eager
+        // tail to distinguish metadata-only counts from real postings IO.
+        assert!(plist.end - plist.start > 256 * 1024);
+        let data_source = LoggedSource::new(Bytes::from(data.clone()));
+        let index_source = LoggedSource::new(index);
+        let reader =
+            VixReader::open_ranged_with_index(data_source.clone(), Some(index_source.clone()))
+                .unwrap();
+        data_source.ranges.lock().clear();
+        index_source.ranges.lock().clear();
+        assert_eq!(reader.count(&query).unwrap(), expected as u64);
+        let touched_plist = index_source
+            .ranges()
+            .iter()
+            .any(|range| range.start < plist.end && range.end > plist.start);
+        assert_eq!(touched_plist, !certified);
+        assert!(data_source.ranges().is_empty());
+        assert_eq!(reader.eval(&query).unwrap().count_set_bits(), expected);
+        assert!(
+            index_source
+                .ranges()
+                .iter()
+                .any(|range| { range.start < plist.end && range.end > plist.start })
+        );
+    }
+}
+
 #[derive(Debug)]
 struct VisitorStopped;
 impl std::fmt::Display for VisitorStopped {

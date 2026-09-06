@@ -81,7 +81,7 @@ use crate::{
     },
     postings,
     query::{KEY_FIELD_ID, MAX_REAL_FIELD_ID, write_composite},
-    reader::VixReader,
+    reader::{RAW_VALUE_TERMS_DISJOINT_PROPERTY, VixReader},
     spill,
     stats::{ColumnStatsFolder, SpliceableStats},
     term_accumulator::{SortedTermShard, TermAccumulator},
@@ -978,6 +978,8 @@ pub struct VixWriter {
     docs_schema: SchemaRef,
     /// Field-sharded term -> ascending doc ids (deduped on push).
     terms: TermAccumulator,
+    /// Proof over actual value-term insertions, independent of docs shape.
+    raw_value_incidence: RawValueIncidence,
     /// Reusable numeric-tag buffer (`\x01{canonical}`) fed to the layout
     /// composite builder.
     tag_scratch: Vec<u8>,
@@ -1123,6 +1125,53 @@ struct PrebuiltIndex {
     /// Sum of the inputs' row counts — the docs pushes must cover exactly
     /// this many rows.
     expected_rows: u64,
+}
+
+/// One high-water document id per bounded term field, reused across pushes
+/// and spills. Valid doc ids are strictly below `u32::MAX` (the row-count
+/// cap), leaving that value as the unseen sentinel. A repeated or rewound
+/// incidence permanently revokes the proof, even if postings deduplicate
+/// equal literals. Key terms and FTS tokens never enter this tracker.
+struct RawValueIncidence {
+    last_docs: Box<[u32]>,
+    disjoint: bool,
+}
+
+impl RawValueIncidence {
+    fn new(fields: usize) -> Self {
+        Self {
+            last_docs: vec![u32::MAX; fields].into_boxed_slice(),
+            disjoint: true,
+        }
+    }
+
+    #[inline]
+    fn observe(&mut self, field_id: u16, doc: u32) {
+        if !self.disjoint {
+            return;
+        }
+        let last = &mut self.last_docs[usize::from(field_id)];
+        if *last != u32::MAX && doc <= *last {
+            self.disjoint = false;
+        } else {
+            *last = doc;
+        }
+    }
+
+    fn certifies_rows(&self, row_count: u64) -> bool {
+        // A failed push can index rows before committing row_count. A
+        // shorter null-only retry need not observe another raw value, so
+        // monotonic incidence alone cannot rule out trailing postings.
+        self.disjoint
+            && self
+                .last_docs
+                .iter()
+                .all(|&doc| doc == u32::MAX || u64::from(doc) < row_count)
+    }
+
+    fn estimated_bytes(&self) -> usize {
+        std::mem::size_of_val(self.last_docs.as_ref())
+    }
 }
 
 impl VixWriter {
@@ -1314,6 +1363,7 @@ impl VixWriter {
             cs_fields,
             docs_schema,
             terms: TermAccumulator::new(term_field_count),
+            raw_value_incidence: RawValueIncidence::new(term_field_count),
             tag_scratch: Vec::new(),
             term_spill: None,
             partial_fields,
@@ -1419,7 +1469,7 @@ impl VixWriter {
     ///   raw-oversize/partial rules as the column-driven path. A string value whose key is not a
     ///   value-indexed field of the writer's schema cannot be indexed and marks the field `partial`
     ///   (scan fallback),
-    /// - numbers/bools emit the key term only (numeric columns are never term-indexed).
+    /// - finite numbers/bools additionally emit one tagged canonical value term for non-FTS fields.
     ///
     /// The stored `docs` row is assembled from the passed arrays:
     /// `timestamps` (non-null, one per row), the docs columns looked up by
@@ -1705,10 +1755,10 @@ impl VixWriter {
                 "doc id overflow: {total_rows} total rows exceed the u32 doc-id space"
             )));
         }
-        // Validate the maps: offset runs in bounds and disjoint, tables
-        // sized to their input and in bounds. Cross-input injectivity of
-        // table maps is proven lazily — a collision surfaces as a duplicate
-        // doc id when the affected postings merge.
+        // Validate offset runs globally, but table collisions only within
+        // each merged term's postings. Two DIFFERENT terms can still map
+        // to the same output doc; table maps therefore cannot carry the
+        // value-term disjointness proof without a separate global proof.
         let mut spans: Vec<(u64, u64)> = Vec::new();
         for (reader, map) in inputs.iter().zip(doc_maps) {
             let rows = reader.row_count();
@@ -1828,6 +1878,21 @@ impl VixWriter {
             }
         }
         self.partial_fields.extend(merged.dropped);
+        // The bounds/disjoint-span checks above prove that offset inputs
+        // occupy distinct document identities. Table maps are only checked
+        // per term by the merger, which cannot certify cross-term unions.
+        // Also guard FTS -> raw reinterpretation even if a public caller
+        // skipped check_merge_inputs: input FTS sets need not be disjoint.
+        self.raw_value_incidence.disjoint &= inputs.iter().all(|reader| {
+            reader.has_disjoint_value_terms()
+                && reader.field_entries().iter().all(|entry| {
+                    !entry.has_type(FIELD_TYPE_FTS)
+                        || !merge_term_field_ids.contains_key(&entry.name)
+                        || self.fts_fields.contains(&entry.name)
+                })
+        }) && doc_maps
+            .iter()
+            .all(|map| matches!(map, DocIdMap::Offset(_)));
         self.merged_index = Some(PrebuiltIndex {
             blobs: merged.blobs,
             term_count: merged.term_count,
@@ -2816,7 +2881,11 @@ impl VixWriter {
         } else {
             self.opts.term_spill_bytes
         };
-        if self.terms.estimated_bytes() < budget || self.terms.is_empty() {
+        let estimated_bytes = self
+            .terms
+            .estimated_bytes()
+            .saturating_add(self.raw_value_incidence.estimated_bytes());
+        if estimated_bytes < budget || self.terms.is_empty() {
             return Ok(());
         }
         if self.term_spill.is_none() {
@@ -2843,10 +2912,10 @@ impl VixWriter {
             // (arbitrary_precision) re-parses just the token, so
             // `canonical_number_text` sees exactly what the old whole-doc
             // parse carried — byte parity with the column-driven derivation
-            // is pinned by the differential tests. `_source` is
-            // engine-synthesized from a Map, so objects carry no duplicate
-            // keys (a hand-crafted duplicate would now index every
-            // occurrence instead of serde_json's last-wins).
+            // is pinned by the differential tests. Duplicate source keys
+            // remain accepted and every occurrence is indexed; actual
+            // value-term incidence, not a presumed Map origin, certifies
+            // whether metadata counts may be summed.
             for entry in sonic_rs::to_object_iter(text) {
                 let (key, value) = entry.map_err(|e| {
                     VixError::Writer(format!("_source of doc {doc} is not a JSON object: {e}"))
@@ -2930,6 +2999,7 @@ impl VixWriter {
                             // (distinct from null) and its fid-only composite
                             // key is valid, so `field = ''` answers from the
                             // index
+                            self.raw_value_incidence.observe(field_id, doc);
                             self.terms.push(field_id, value.as_bytes(), doc);
                         }
                     }
@@ -2964,6 +3034,7 @@ impl VixWriter {
                             *self.oversize_skips.entry(key.to_string()).or_default() += 1;
                             continue;
                         }
+                        self.raw_value_incidence.observe(field_id, doc);
                         push_numeric_term(
                             &mut self.terms,
                             &mut self.tag_scratch,
@@ -2982,6 +3053,7 @@ impl VixWriter {
                         // get_type read the token's first byte; the raw span
                         // is exactly `true`/`false`
                         let flag = value.as_bool().unwrap_or(false);
+                        self.raw_value_incidence.observe(field_id, doc);
                         push_numeric_term(
                             &mut self.terms,
                             &mut self.tag_scratch,
@@ -3146,6 +3218,7 @@ impl VixWriter {
                         // the empty string included: `""` is a value
                         // (distinct from null) and its fid-only composite key
                         // is valid, so `field = ''` answers from the index
+                        self.raw_value_incidence.observe(field_id, doc);
                         self.terms.push(field_id, value.as_bytes(), doc);
                     });
                 }
@@ -3169,6 +3242,7 @@ impl VixWriter {
                         return;
                     }
                     let doc = (first_doc + row as u64) as u32;
+                    self.raw_value_incidence.observe(field_id, doc);
                     push_numeric_term(&mut self.terms, &mut self.tag_scratch, &text, field_id, doc);
                 });
             } else {
@@ -3838,6 +3912,12 @@ impl VixWriter {
             // (container::require_supported_index_format).
             (PROP_KEY_LAYOUT.to_string(), KEY_LAYOUT_FID_V2.to_string()),
         ];
+        if self.raw_value_incidence.certifies_rows(row_count) {
+            index_properties.push((
+                RAW_VALUE_TERMS_DISJOINT_PROPERTY.to_string(),
+                "true".to_string(),
+            ));
+        }
         if let Some(pages) = dict_field_pages {
             index_properties.push((
                 PROP_DICT_FIELD_PAGES.to_string(),

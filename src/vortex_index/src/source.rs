@@ -70,10 +70,12 @@ pub fn with_read_operation<T>(operation: Arc<dyn VixReadOperation>, work: impl F
     struct Restore(Option<Arc<dyn VixReadOperation>>);
     impl Drop for Restore {
         fn drop(&mut self) {
-            READ_OPERATION.with(|slot| *slot.borrow_mut() = self.0.take());
+            let inner = READ_OPERATION.with(|slot| slot.replace(self.0.take()));
+            drop(inner);
         }
     }
     let _restore = Restore(READ_OPERATION.with(|slot| slot.replace(Some(operation))));
+    let _native_scope = crate::container::enter_native_read_scope();
     work()
 }
 
@@ -97,7 +99,7 @@ pub(crate) fn current_read_operation() -> Option<Arc<dyn VixReadOperation>> {
 
 /// Check the current synchronous operation without modifying shared state.
 pub fn check_read_cancelled() -> std::result::Result<(), VixError> {
-    if READ_OPERATION.with(|slot| slot.borrow().as_ref().is_some_and(|op| op.is_cancelled())) {
+    if current_read_operation().is_some_and(|op| op.is_cancelled()) {
         Err(VixError::Cancelled)
     } else {
         Ok(())
@@ -139,9 +141,12 @@ pub(crate) fn enter_reader_memory(memory: Arc<crate::reader::ReaderMemory>) -> R
     ReaderMemoryScope(READER_MEMORY.with(|slot| slot.replace(Some(memory))))
 }
 
+pub(crate) fn current_reader_memory_if_present() -> Option<Arc<crate::reader::ReaderMemory>> {
+    READER_MEMORY.with(|slot| slot.borrow().clone())
+}
+
 pub(crate) fn current_reader_memory() -> Arc<crate::reader::ReaderMemory> {
-    READER_MEMORY
-        .with(|slot| slot.borrow().clone())
+    current_reader_memory_if_present()
         .unwrap_or_else(|| Arc::new(crate::reader::ReaderMemory::new()))
 }
 

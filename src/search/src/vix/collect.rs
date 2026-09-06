@@ -1167,6 +1167,9 @@ fn chunk_single_bucket(
 
 /// Exact bounded histogram partials. NULL groups and unsupported stored types
 /// refuse to the scan because the public String wire key cannot represent them.
+/// `complete_file_range` is inclusive metadata coverage, supplied only after
+/// the caller proves the whole file lies inside the query's half-open window.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn simple_multi_histogram(
     reader: &VixReader,
     bitmap: &BooleanBuffer,
@@ -1175,6 +1178,7 @@ pub(super) fn simple_multi_histogram(
     bucket_width: u64,
     ts_offset: i64,
     breakdown_field: &str,
+    complete_file_range: Option<(i64, i64)>,
 ) -> anyhow::Result<Vec<(i64, String, u64)>> {
     if bitmap.count_set_bits() == 0 || min_value >= max_value {
         return Ok(Vec::new());
@@ -1189,6 +1193,32 @@ pub(super) fn simple_multi_histogram(
     let raw_max = max_value
         .checked_sub(ts_offset)
         .ok_or(AggregateFallback("histogram grid overflow"))?;
+    if let Some(file_range) = complete_file_range
+        && let Some(label) = single_bucket_histogram_label(
+            file_range,
+            (raw_min, raw_max),
+            min_value,
+            max_value,
+            bucket_width,
+            ts_offset,
+        )?
+        && reader
+            .docs_schema()?
+            .field_with_name(TIMESTAMP_COL_NAME)
+            .is_ok_and(|field| field.data_type() == &DataType::Int64 && !field.is_nullable())
+    {
+        // Keep the exact condition bitmap, including predicates on other
+        // fields. Only timestamps are redundant; whole-file totals are not.
+        let mut counts = GroupCounts::new(DEFAULT_DICT_MULTI_HISTOGRAM_LIMITS);
+        visit_selected_dict_chunks(reader, breakdown_field, bitmap, None, &mut |chunk, rows| {
+            fold_dict_chunk(&mut counts, chunk, bitmap, rows, None)
+        })?;
+        let mut rows = counts.finish();
+        for row in &mut rows {
+            row.0 = label;
+        }
+        return Ok(rows);
+    }
     dict_multi_histogram(
         reader,
         bitmap,
@@ -1329,12 +1359,27 @@ fn visit_selected_dict_chunks(
             if matched > 0 {
                 if matched.saturating_mul(POINT_READ_DENOMINATOR) <= selected.len() {
                     let rows: Vec<u64> = selected.set_indices().map(|i| start + i as u64).collect();
-                    let values = reader.read_docs_column_rows(field, &rows)?;
-                    let timestamps = if window.is_some() {
-                        Some(read_timestamps(reader, Some(&rows))?)
+                    let (values, timestamps) = if window.is_some() {
+                        let projected =
+                            reader.read_docs_columns_rows(&[field, TIMESTAMP_COL_NAME], &rows)?;
+                        if projected.num_rows() != rows.len() || projected.num_columns() != 2 {
+                            return Err(
+                                AggregateFallback("misaligned aggregate point projection").into()
+                            );
+                        }
+                        let timestamps = projected
+                            .column(1)
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .ok_or(AggregateFallback("unsupported aggregate timestamp type"))?
+                            .clone();
+                        (projected.column(0).clone(), Some(timestamps))
                     } else {
-                        None
+                        (reader.read_docs_column_rows(field, &rows)?, None)
                     };
+                    if values.len() != rows.len() || values.data_type() != data_type {
+                        return Err(AggregateFallback("misaligned aggregate point values").into());
+                    }
                     let batch = vortex_index::DocsDictBatch {
                         row_offset: start,
                         timestamps,
@@ -1426,6 +1471,23 @@ fn fold_dict_chunk(
     point_rows: Option<&[u64]>,
     grid: Option<(i64, i64, i64, i64)>,
 ) -> anyhow::Result<()> {
+    if point_rows.is_some_and(|rows| rows.len() != chunk.codes.len())
+        || chunk
+            .timestamps
+            .as_ref()
+            .is_some_and(|timestamps| timestamps.len() != chunk.codes.len())
+        || point_rows.map_or_else(
+            || {
+                chunk
+                    .row_offset
+                    .checked_add(chunk.codes.len() as u64)
+                    .is_none_or(|end| end > bitmap.len() as u64)
+            },
+            |rows| rows.iter().any(|row| *row >= bitmap.len() as u64),
+        )
+    {
+        return Err(AggregateFallback("misaligned aggregate dictionary rows").into());
+    }
     if chunk.values.len() > counts.limits.max_values
         || chunk.values.get_array_memory_size() > counts.limits.max_value_bytes
     {
@@ -1768,27 +1830,32 @@ fn complete_value_counts(
     Ok(Some(result))
 }
 
-/// Exact shortcut for a sole positive IN on this grouping field. Unlike TopN,
-/// NULL/absent values are safe here: IN rejects them. Select the globally
-/// requested literals from complete counts, not each file's local winners.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn single_bucket_value_counts(
-    reader: &VixReader,
-    field: &str,
-    values: &[String],
+/// Shared whole-file proof for metadata counts and exact bitmap collection.
+/// File bounds are inclusive; both the query and raw histogram window are
+/// half-open. A rounded-up final bucket must not widen either window.
+pub(super) fn single_bucket_histogram_label(
     file_range: (i64, i64),
     query_range: (i64, i64),
     min_value: i64,
     max_value: i64,
     bucket_width: u64,
     ts_offset: i64,
-) -> anyhow::Result<Option<Vec<(i64, String, u64)>>> {
+) -> anyhow::Result<Option<i64>> {
     if file_range.0 > file_range.1
         || file_range.0 < query_range.0
         || file_range.1 >= query_range.1
         || min_value >= max_value
         || bucket_width == 0
     {
+        return Ok(None);
+    }
+    let Some(raw_min) = min_value.checked_sub(ts_offset) else {
+        return Ok(None);
+    };
+    let Some(raw_max) = max_value.checked_sub(ts_offset) else {
+        return Ok(None);
+    };
+    if file_range.0 < raw_min || file_range.1 >= raw_max {
         return Ok(None);
     }
     let Some(span) = max_value
@@ -1811,10 +1878,39 @@ pub(super) fn single_bucket_value_counts(
     else {
         return Ok(None);
     };
-    let Some(label) = i64::try_from(bucket_width)
+    Ok(i64::try_from(bucket_width)
         .ok()
-        .and_then(|width| width.checked_mul(bucket as i64))
-        .and_then(|offset| min_value.checked_add(offset))
+        .and_then(|width| {
+            i64::try_from(bucket)
+                .ok()
+                .and_then(|bucket| width.checked_mul(bucket))
+        })
+        .and_then(|delta| min_value.checked_add(delta)))
+}
+
+/// Exact shortcut for a sole positive IN on this grouping field. Unlike TopN,
+/// NULL/absent values are safe here: IN rejects them. Select the globally
+/// requested literals from complete counts, not each file's local winners.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn single_bucket_value_counts(
+    reader: &VixReader,
+    field: &str,
+    values: &[String],
+    file_range: (i64, i64),
+    query_range: (i64, i64),
+    min_value: i64,
+    max_value: i64,
+    bucket_width: u64,
+    ts_offset: i64,
+) -> anyhow::Result<Option<Vec<(i64, String, u64)>>> {
+    let Some(label) = single_bucket_histogram_label(
+        file_range,
+        query_range,
+        min_value,
+        max_value,
+        bucket_width,
+        ts_offset,
+    )?
     else {
         return Ok(None);
     };
@@ -2263,7 +2359,7 @@ mod tests {
         let reader = build_reader();
         for field in ["level", "absent"] {
             assert!(
-                simple_multi_histogram(&reader, &all_set(8), 100, 108, 8, 0, field)
+                simple_multi_histogram(&reader, &all_set(8), 100, 108, 8, 0, field, None)
                     .unwrap_err()
                     .is::<AggregateFallback>()
             );
@@ -2307,7 +2403,8 @@ mod tests {
             let borrowed: Vec<_> = values.iter().map(|value| Some(value.as_str())).collect();
             let (reader, _) = zoned_and_decode(&ts, &borrowed);
             let rows =
-                simple_multi_histogram(&reader, &all_set(ts.len()), 100, 101, 1, 0, "bd").unwrap();
+                simple_multi_histogram(&reader, &all_set(ts.len()), 100, 101, 1, 0, "bd", None)
+                    .unwrap();
             for (_, value, count) in rows {
                 *merged.entry(value).or_default() += count;
             }
@@ -2338,15 +2435,106 @@ mod tests {
             BooleanBuffer::from_iter((0..ts.len()).map(|i| i == 0 || i == 4097)),
         ] {
             for reader in [&zoned, &unzoned] {
-                let expected = rowwise_multi_histogram_reference(
-                    reader, &bitmap, 42_000, 50_001, 100, 0, "bd",
-                );
-                assert_eq!(
-                    simple_multi_histogram(reader, &bitmap, 42_000, 50_001, 100, 0, "bd").unwrap(),
-                    expected
-                );
+                for (min, max, width, offset) in [
+                    (42_000, 50_001, 100, 0),    // partial window and bucket crossings
+                    (41_007, 50_008, 10_000, 7), // fully covered shifted single bucket
+                ] {
+                    let expected = rowwise_multi_histogram_reference(
+                        reader, &bitmap, min, max, width, offset, "bd",
+                    );
+                    assert_eq!(
+                        simple_multi_histogram(
+                            reader,
+                            &bitmap,
+                            min,
+                            max,
+                            width,
+                            offset,
+                            "bd",
+                            Some((41_809, 50_000)),
+                        )
+                        .unwrap(),
+                        expected
+                    );
+                }
             }
         }
+    }
+
+    #[test]
+    fn single_bucket_proof_preserves_query_and_raw_grid_domains() {
+        assert_eq!(
+            single_bucket_histogram_label((100, 107), (100, 108), 102, 110, 10, 2).unwrap(),
+            Some(102),
+        );
+        for (file, query, min, max, width, offset) in [
+            ((100, 107), (101, 108), 100, 110, 10, 0), // partial start
+            ((100, 107), (100, 107), 100, 110, 10, 0), // exclusive end
+            ((100, 107), (100, 108), 100, 108, 4, 0),  // crosses actual grid
+            ((100, 107), (100, 108), 102, 110, 10, 0), // shifted origin excludes rows
+            ((100, 107), (100, 108), 100, 108, 10, 1), // rounded final bucket exceeds raw max
+            ((100, 107), (100, 108), 100, 110, 0, 0),  // invalid width
+            ((100, 107), (100, 108), i64::MIN, 110, 10, 1), // origin overflow
+            ((107, 100), (100, 108), 100, 110, 10, 0), // inverted metadata
+        ] {
+            assert_eq!(
+                single_bucket_histogram_label(file, query, min, max, width, offset).unwrap(),
+                None,
+            );
+        }
+    }
+
+    #[test]
+    fn sparse_histogram_projection_keeps_nulls_and_selected_row_alignment() {
+        let ts: Vec<_> = (0..8192).map(|i| 50_000 - i).collect();
+        let mut values = vec![Some("unselected"); ts.len()];
+        values[17] = Some("early");
+        values[4097] = None;
+        values[8191] = Some("late");
+        let (reader, _) = zoned_and_decode(&ts, &values);
+        let selected = BooleanBuffer::from_iter((0..ts.len()).map(|i| i == 17 || i == 8191));
+        assert_eq!(
+            simple_multi_histogram(&reader, &selected, 41_000, 50_001, 1000, 0, "bd", None)
+                .unwrap(),
+            vec![
+                (41_000, "late".to_owned(), 1),
+                (49_000, "early".to_owned(), 1)
+            ],
+        );
+        let with_null =
+            BooleanBuffer::from_iter((0..ts.len()).map(|i| i == 17 || i == 4097 || i == 8191));
+        for (width, file_range) in [(1000, None), (10_000, Some((41_809, 50_000)))] {
+            assert!(
+                simple_multi_histogram(
+                    &reader, &with_null, 41_000, 50_001, width, 0, "bd", file_range,
+                )
+                .unwrap_err()
+                .is::<AggregateFallback>(),
+                "a selected NULL group must refuse, not shift adjacent values or disappear",
+            );
+        }
+    }
+
+    #[test]
+    fn dictionary_fold_refuses_misaligned_selected_rows() {
+        let chunk = vortex_index::DocsDictBatch {
+            row_offset: 0,
+            timestamps: Some(Int64Array::from(vec![100])),
+            codes: arrow::array::UInt64Array::from(vec![0, 1]),
+            values: Arc::new(StringArray::from(vec!["a", "b"])),
+        };
+        let mut counts = GroupCounts::new(DEFAULT_DICT_MULTI_HISTOGRAM_LIMITS);
+        assert!(
+            fold_dict_chunk(
+                &mut counts,
+                chunk,
+                &all_set(2),
+                Some(&[0, 1]),
+                Some((100, 100, 101, 1)),
+            )
+            .unwrap_err()
+            .is::<AggregateFallback>(),
+        );
     }
 
     #[test]
@@ -2589,7 +2777,7 @@ mod tests {
         let reader = build_reader();
         let bitmap = BooleanBuffer::from_iter((0..8).map(|i| i != 5));
         // width 4 over [100, 108): buckets 100 (ts 100..103) and 104 (ts 104..107)
-        let rows = simple_multi_histogram(&reader, &bitmap, 100, 108, 4, 0, "level").unwrap();
+        let rows = simple_multi_histogram(&reader, &bitmap, 100, 108, 4, 0, "level", None).unwrap();
         // bucket 100: docs 4..7 = info(103), null(102), info(101), error(100)
         // bucket 104: docs 0..3 = error(107), info(106), error(105), info(104)
         assert_eq!(
@@ -2602,7 +2790,7 @@ mod tests {
             ]
         );
         // [min, max) is half-open: max=104 drops the second bucket
-        let rows = simple_multi_histogram(&reader, &bitmap, 100, 104, 4, 0, "level").unwrap();
+        let rows = simple_multi_histogram(&reader, &bitmap, 100, 104, 4, 0, "level", None).unwrap();
         assert_eq!(
             rows,
             vec![(100, "info".to_string(), 2), (100, "error".to_string(), 1),]
@@ -2615,7 +2803,7 @@ mod tests {
         let bitmap = BooleanBuffer::from_iter((0..8).map(|i| i != 5));
         // local range [102, 110) with offset 2 = raw range [100, 108); keys
         // come back in local space
-        let rows = simple_multi_histogram(&reader, &bitmap, 102, 110, 4, 2, "level").unwrap();
+        let rows = simple_multi_histogram(&reader, &bitmap, 102, 110, 4, 2, "level", None).unwrap();
         assert_eq!(
             rows,
             vec![
@@ -2631,7 +2819,8 @@ mod tests {
     fn test_simple_multi_histogram_numeric_breakdown() {
         let reader = build_reader();
         let bitmap = all_set(8);
-        let error = simple_multi_histogram(&reader, &bitmap, 100, 108, 8, 0, "code").unwrap_err();
+        let error =
+            simple_multi_histogram(&reader, &bitmap, 100, 108, 8, 0, "code", None).unwrap_err();
         assert!(error.is::<AggregateFallback>());
     }
 
@@ -3304,11 +3493,11 @@ mod tests {
             ] {
                 for (bname, bitmap) in test_bitmaps(ts.len()) {
                     let mut z = simple_multi_histogram(
-                        &zoned, &bitmap, min_value, max_value, width, ts_offset, "bd",
+                        &zoned, &bitmap, min_value, max_value, width, ts_offset, "bd", None,
                     )
                     .unwrap();
                     let mut d = simple_multi_histogram(
-                        &decode, &bitmap, min_value, max_value, width, ts_offset, "bd",
+                        &decode, &bitmap, min_value, max_value, width, ts_offset, "bd", None,
                     )
                     .unwrap();
                     z.sort();
@@ -3372,6 +3561,7 @@ mod tests {
             bucket_width,
             ts_offset,
             field,
+            None,
         )
         .unwrap();
         assert_eq!(optimized, rowwise, "{label}: public path vs row-wise");
@@ -3466,6 +3656,7 @@ mod tests {
                 WIDTH,
                 OFFSET,
                 "bd",
+                None,
             )
             .unwrap(),
             rowwise_multi_histogram_reference(
@@ -3522,7 +3713,7 @@ mod tests {
     fn test_dict_multi_histogram_numeric_refuses() {
         let reader = build_numeric_zone_reader(&[100, 101], &[Some(200), None]);
         let error =
-            simple_multi_histogram(&reader, &all_set(2), 100, 102, 1, 0, "code").unwrap_err();
+            simple_multi_histogram(&reader, &all_set(2), 100, 102, 1, 0, "code", None).unwrap_err();
         assert!(error.is::<AggregateFallback>());
     }
 
@@ -3553,7 +3744,8 @@ mod tests {
         assert!(dict_chunks > 1, "benchmark requires multiple dictionaries");
 
         let optimized =
-            simple_multi_histogram(&reader, &bitmap, min_value, max_value, WIDTH, 0, "bd").unwrap();
+            simple_multi_histogram(&reader, &bitmap, min_value, max_value, WIDTH, 0, "bd", None)
+                .unwrap();
         let rowwise = rowwise_multi_histogram_reference(
             &reader, &bitmap, min_value, max_value, WIDTH, 0, "bd",
         );
@@ -3565,8 +3757,10 @@ mod tests {
             if sample % 2 == 0 {
                 let started = std::time::Instant::now();
                 std::hint::black_box(
-                    simple_multi_histogram(&reader, &bitmap, min_value, max_value, WIDTH, 0, "bd")
-                        .unwrap(),
+                    simple_multi_histogram(
+                        &reader, &bitmap, min_value, max_value, WIDTH, 0, "bd", None,
+                    )
+                    .unwrap(),
                 );
                 optimized_samples.push(started.elapsed());
 
@@ -3584,8 +3778,10 @@ mod tests {
 
                 let started = std::time::Instant::now();
                 std::hint::black_box(
-                    simple_multi_histogram(&reader, &bitmap, min_value, max_value, WIDTH, 0, "bd")
-                        .unwrap(),
+                    simple_multi_histogram(
+                        &reader, &bitmap, min_value, max_value, WIDTH, 0, "bd", None,
+                    )
+                    .unwrap(),
                 );
                 optimized_samples.push(started.elapsed());
             }

@@ -3,6 +3,50 @@
 Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
 (deleted 2026-07-29; full history in git). Keep THIS file current.
 
+## 2026-09-06 — native setup and exact sparse aggregation (local verification)
+- Native reads share only built-in registry templates within one read
+  operation. Sessions, memory/runtime state, and executors remain fresh;
+  decoded layouts, payloads, and cancellation state are not shared across
+  queries. Registry admission includes a CPU-scaled allowance; it is an
+  engineering estimate, not a universal allocator or RSS bound.
+- Sparse group/timestamp point reads use one aligned projection. A
+  single-bucket collector omits timestamps only with complete-file,
+  half-open-window, bucket-origin/offset, and non-null Int64 timestamp
+  proofs. Partial windows and cross-bucket files keep timestamp filtering.
+- Flat positive same-field exact OR deduplicates term ordinals and uses one
+  postings union unless authoritative index metadata certifies disjoint
+  raw-value terms. `raw_value_terms_disjoint_v1=true` permits doc-count
+  summation only for non-FTS, non-partial fields. Writer incidence tracking
+  revokes proof on repeated/rewound document IDs and requires every raw
+  incidence to lie within the committed output row range. This rejects
+  failed-longer/shorter-null-retry residue. Merges preserve proof only for
+  certified inputs with disjoint offset maps and no FTS reinterpretation.
+  Legacy files and unproven mappings remain on the exact union path.
+- Local proof: 315 VIX-library and 182 search-VIX tests passed (14/4
+  ignored), and the optimized server built successfully. The frozen
+  288,379-row/83-file corpus passed the 19 HTTP query contracts,
+  11 COUNT/timestamp cases, and timestamp-dependent sparse cross-bucket
+  and partial-window cases on both pre-change and newly written files.
+  All 83 new index sidecars carried the certificate; all old sidecars
+  and all new DATA footers lacked it.
+- Two measured blocks per binary produced 192 exact responses on
+  identical published file metadata. Warm sparse range reads fell from
+  10 to 5; dense full-window bytes fell from 64,168 to 39,896. These are
+  actual backing-store counters on local disk, not response scan-size
+  metadata or production S3 measurements. Parsed-reader and OS caches
+  remained warm; timings do not establish cold or production speedups.
+- A real heartbeat/client-gone cancellation preserved concurrent and
+  subsequent exact queries; search IO counters stayed unchanged after
+  the post-close settling snapshot. The native allocation probe covered
+  first-use order reversal, fresh setup, actual scans, early stop, and
+  repeated scans. Warm setups/scans and whole-operation teardown had zero
+  post-drop requested-byte deltas. First-use global initialization left
+  residuals in both constructor orders; the first native read left 88 bytes
+  in either order, so this does not prove zero first-use/global retention.
+- The preceding binary (`1dadd69a`) also passed all 19 query contracts
+  when reading the newly certified files.
+- No production deployment or Orbit change.
+
 ## 2026-09-05 — exact VIX aggregates and bounded query IO (local verification)
 - Aggregate shortcuts require complete input and the original logical
   column identity. Preserve NULL/absent groups and global winners; remove

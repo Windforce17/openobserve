@@ -72,7 +72,9 @@ pub enum DocIdMap {
     /// `new_id = old_id + offset` — the input's rows form one contiguous run.
     Offset(u32),
     /// `new_id = table[old_id]`; the table length must equal the input's row
-    /// count and the mapping must be injective across all inputs.
+    /// count and the mapping must be injective across all inputs. The merge
+    /// checks collisions within each term, not across different terms: this
+    /// caller contract alone is NOT a value-term disjointness certificate.
     Table(Vec<u32>),
 }
 
@@ -1122,7 +1124,8 @@ fn merge_postings(
 
 /// Return whether a fallback sort was needed. Strictly monotonic production
 /// table maps take the zero-sort path; permutations are sorted and overlapping
-/// maps are rejected.
+/// maps WITHIN THIS TERM are rejected. This says nothing about collisions
+/// between different terms, so it cannot authorize metadata count sums.
 fn ensure_sorted_unique(ids: &mut [u32]) -> Result<bool> {
     if ids.windows(2).all(|pair| pair[0] < pair[1]) {
         return Ok(false);
