@@ -61,52 +61,33 @@ pub async fn invalidate_cached_response_by_stream_min_ts(
     let stream_min_ts =
         infra::cache::stats::get_stream_stats(org_id, stream_name, stream_type).doc_time_min;
 
-    let filtered_responses = if histogram_interval > 0 {
-        // For histogram queries, a bucket is only stale when its ENTIRE interval
-        // is before stream_min_ts — i.e. (bucket_key + interval) <= stream_min_ts.
-        //
-        // Example (1-day interval):
-        //   stream_min_ts  = Apr 16 11:47  (first live document)
-        //   bucket "Apr 16" covers Apr 16 00:00 → Apr 17 00:00
-        //   Apr 17 00:00 > Apr 16 11:47  →  bucket still has live data → KEEP
-        //   bucket "Jan 16" covers Jan 16 00:00 → Jan 17 00:00
-        //   Jan 17 00:00 > Apr 16 11:47  →  NO → fully expired → DROP
-        //
-        // Trimming response_start_time to stream_min_ts is wrong here because
-        // stream_min_ts can fall mid-bucket, pushing the effective cache start
-        // past the bucket key and corrupting delta computation.
-        // Instead: drop individual stale buckets and leave response_start_time
-        // untouched so deltas are computed from the real cache boundary.
-        responses
-            .iter()
-            .cloned()
-            .filter_map(|mut meta| {
-                meta.cached_response.hits.retain(|hit| {
-                    let hit_ts = get_ts_value(&meta.ts_column, hit);
-                    hit_ts + histogram_interval > stream_min_ts
-                });
-                if meta.cached_response.hits.is_empty() {
-                    None
-                } else {
-                    meta.cached_response.total = meta.cached_response.hits.len();
-                    Some(meta)
+    let filtered_responses = responses
+        .iter()
+        .cloned()
+        .filter_map(|mut meta| {
+            // A histogram bucket straddling retention may include expired rows.
+            // Re-query it; do not reuse an aggregate that cannot be subtracted.
+            let mut retained_start = stream_min_ts;
+            if histogram_interval > 0 {
+                let remainder = retained_start.rem_euclid(histogram_interval);
+                if remainder != 0 {
+                    retained_start = retained_start.checked_add(histogram_interval - remainder)?;
                 }
-            })
-            .collect()
-    } else {
-        // For non-histogram queries, trim to stream_min_ts at the response level.
-        responses
-            .iter()
-            .filter(|meta| meta.response_end_time >= stream_min_ts)
-            .cloned()
-            .map(|mut meta| {
-                if meta.response_start_time < stream_min_ts {
-                    meta.response_start_time = stream_min_ts;
-                }
-                meta
-            })
-            .collect()
-    };
+            }
+            if retained_start >= meta.response_end_time {
+                return None;
+            }
+            if retained_start > meta.response_start_time {
+                meta.response_start_time = retained_start;
+                meta.cached_response
+                    .hits
+                    .retain(|hit| get_ts_value(&meta.ts_column, hit) >= retained_start);
+                meta.cached_response.total = meta.cached_response.hits.len();
+                meta.cached_response.size = meta.cached_response.hits.len() as i64;
+            }
+            Some(meta)
+        })
+        .collect();
 
     Ok(filtered_responses)
 }
@@ -247,11 +228,6 @@ pub async fn check_cache(
             Err(e) => log::error!("Error invalidating cached response by stream min ts: {e}"),
         }
 
-        let total_hits = cached_responses
-            .iter()
-            .map(|v| v.cached_response.total)
-            .sum::<usize>();
-
         let (deltas, updated_start_time, cache_duration) = calculate_deltas_multi(
             &cached_responses,
             req.query.start_time,
@@ -265,13 +241,11 @@ pub async fn check_cache(
             req.query.start_time = start_time;
         }
 
-        // Only consider it a full cache hit if we have enough records AND no time gaps
-        let deltas = if total_hits >= (sql.limit as usize) && deltas.is_empty() {
+        // v5 coverage is complete even when the interval contains fewer than
+        // LIMIT rows (or no rows after clipping).
+        if deltas.is_empty() {
             *should_exec_query = false;
-            vec![]
-        } else {
-            deltas
-        };
+        }
 
         for res in cached_responses {
             if res.has_cached_data {
@@ -280,15 +254,7 @@ pub async fn check_cache(
             }
         }
 
-        if !deltas.is_empty() {
-            let search_delta: Vec<QueryDelta> = deltas.to_vec();
-            if search_delta.is_empty() {
-                log::debug!("cached response found");
-                *should_exec_query = false;
-            } else {
-                multi_resp.deltas = search_delta;
-            }
-        }
+        multi_resp.deltas = deltas;
         multi_resp.cache_query_response = true;
         multi_resp.limit = sql.limit;
         multi_resp.ts_column = result_ts_col.to_string();
@@ -361,14 +327,7 @@ pub async fn check_cache(
                     *should_exec_query = false;
                 }
 
-                if cached_resp.cached_response.total == (sql.limit as usize)
-                    && cached_resp.response_end_time == req.query.end_time
-                {
-                    *should_exec_query = false;
-                    cached_resp.deltas = vec![];
-                } else {
-                    cached_resp.deltas = search_delta;
-                }
+                cached_resp.deltas = search_delta;
 
                 cached_resp.cached_response.took = start.elapsed().as_millis() as usize;
                 cached_resp
@@ -437,7 +396,7 @@ pub async fn get_cached_results(
             {
                 return false;
             }
-            m.start_time <= cache_req.q_end_time && m.end_time >= cache_req.q_start_time
+            m.start_time < cache_req.q_end_time && m.end_time > cache_req.q_start_time
         })
         .max_by_key(|result| select_cache_meta(result, &cache_req, &selection_strategy))
     {
@@ -465,7 +424,7 @@ pub async fn get_cached_results(
             return None;
         }
     };
-    let mut cached_response: Response = match json::from_str::<Response>(&data) {
+    let mut cached_response: Response = match json::from_slice::<Response>(&data) {
         Ok(v) => v,
         Err(e) => {
             log::error!("[trace_id {trace_id}] Error parsing cached response: {e:?}");
@@ -473,32 +432,11 @@ pub async fn get_cached_results(
         }
     };
 
-    // filter data based on request time range
-    let (hits_allowed_start_time, hits_allowed_end_time) =
-        (cache_req.q_start_time, cache_req.q_end_time);
-    let first_ts = get_ts_value(&cache_req.ts_column, cached_response.hits.first().unwrap());
-    let last_ts = get_ts_value(&cache_req.ts_column, cached_response.hits.last().unwrap());
-    let data_start_time = std::cmp::min(first_ts, last_ts);
-    let data_end_time = std::cmp::max(first_ts, last_ts);
-    // convert histogram interval to microseconds
-    let histogram_interval = cached_response.histogram_interval.unwrap_or_default() * 1_000_000;
-    // check if need to filter the data
-    if data_start_time < cache_req.q_start_time || data_end_time > cache_req.q_end_time {
-        cached_response.hits.retain(|hit| {
-            let hit_ts = get_ts_value(&cache_req.ts_column, hit);
-            hit_ts + histogram_interval < hits_allowed_end_time && hit_ts >= hits_allowed_start_time
-        });
-        // if the data is empty after filtering, return None
-        if cached_response.hits.is_empty() {
-            return None;
-        }
-        // reset the start and end time
-        let first_ts = get_ts_value(&cache_req.ts_column, cached_response.hits.first().unwrap());
-        let last_ts = get_ts_value(&cache_req.ts_column, cached_response.hits.last().unwrap());
-        matching_meta.start_time = std::cmp::min(first_ts, last_ts);
-        matching_meta.end_time = std::cmp::max(first_ts, last_ts) + histogram_interval;
+    // Coverage is an interval, not the extrema of the rows that happen to exist.
+    // Intersect it with the request, preserving empty covered portions as well.
+    if !clip_cached_response(&mut cached_response, &mut matching_meta, &cache_req) {
+        return None;
     }
-    cached_response.total = cached_response.hits.len();
 
     log::info!(
         "[CACHE RESULT {trace_id}] Get results from disk success for query key: {query_key} with time range {} - {} ",
@@ -519,39 +457,69 @@ pub async fn get_cached_results(
     })
 }
 
+fn clip_cached_response(
+    response: &mut Response,
+    meta: &mut ResultCacheMeta,
+    req: &CacheQueryRequest,
+) -> bool {
+    let original_range = (meta.start_time, meta.end_time);
+    meta.start_time = meta.start_time.max(req.q_start_time);
+    meta.end_time = meta.end_time.min(req.q_end_time);
+    if req.histogram_interval > 0 {
+        let remainder = meta.start_time.rem_euclid(req.histogram_interval);
+        if remainder != 0 {
+            let Some(start) = meta
+                .start_time
+                .checked_add(req.histogram_interval - remainder)
+            else {
+                return false;
+            };
+            meta.start_time = start;
+        }
+        meta.end_time -= meta.end_time.rem_euclid(req.histogram_interval);
+    }
+    if meta.start_time >= meta.end_time {
+        return false;
+    }
+    if original_range != (meta.start_time, meta.end_time) {
+        response.hits.retain(|hit| {
+            let ts = get_ts_value(&req.ts_column, hit);
+            meta.start_time <= ts && ts < meta.end_time
+        });
+    }
+    response.total = response.hits.len();
+    response.size = response.hits.len() as i64;
+    true
+}
+
 pub fn calculate_deltas(
     result_meta: &ResultCacheMeta,
     query_start_time: i64,
     query_end_time: i64,
-    histogram_interval: i64,
+    _histogram_interval: i64,
     deltas: &mut Vec<QueryDelta>,
 ) {
-    if query_start_time == result_meta.start_time && query_end_time == result_meta.end_time {
-        // If query start time and end time are the same as cache times, return results from cache
+    let start = result_meta.start_time.max(query_start_time);
+    let end = result_meta.end_time.min(query_end_time);
+    if start >= end {
+        if query_start_time < query_end_time {
+            deltas.push(QueryDelta {
+                delta_start_time: query_start_time,
+                delta_end_time: query_end_time,
+            });
+        }
         return;
     }
-
-    if query_end_time > result_meta.end_time {
-        // q end time : 11:00, r end time : 10:45
-        // for delta start time we need to add 1 microsecond to the end time
-        // because we will include the start_time, if we don't add 1 microsecond
-        // the start_time will be include in the next search, we will get duplicate data
-        let delta_start_time = if histogram_interval > 0 {
-            result_meta.end_time
-        } else {
-            result_meta.end_time + 1
-        };
-        deltas.push(QueryDelta {
-            delta_start_time,
-            delta_end_time: query_end_time,
-        });
-    }
-
-    if query_start_time < result_meta.start_time {
-        // q start time : 10:00, r start time : 10:15
+    if query_start_time < start {
         deltas.push(QueryDelta {
             delta_start_time: query_start_time,
-            delta_end_time: result_meta.start_time,
+            delta_end_time: start,
+        });
+    }
+    if end < query_end_time {
+        deltas.push(QueryDelta {
+            delta_start_time: end,
+            delta_end_time: query_end_time,
         });
     }
 }
@@ -612,10 +580,10 @@ pub async fn cache_results_to_disk(
     Ok(true)
 }
 
-pub async fn get_results(file_path: &str, file_name: &str) -> std::io::Result<String> {
+pub async fn get_results(file_path: &str, file_name: &str) -> std::io::Result<Bytes> {
     let file = format!("results/{file_path}/{file_name}");
     match disk::get(&file, None).await {
-        Some(v) => Ok(String::from_utf8(v.to_vec()).unwrap()),
+        Some(v) => Ok(v),
         None => Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "File not found",
@@ -911,56 +879,37 @@ fn calculate_deltas_multi(
     results: &[CachedQueryResponse],
     start_time: i64,
     end_time: i64,
-    is_aggregate: bool,
-    is_descending: bool,
-    histogram_interval: i64,
+    _is_aggregate: bool,
+    _is_descending: bool,
+    _histogram_interval: i64,
 ) -> (Vec<QueryDelta>, Option<i64>, i64) {
     let mut deltas = Vec::new();
     let mut cache_duration = 0_i64;
-
-    let mut current_start_time = end_time;
-    let mut current_end_time = end_time;
-
-    // sort the results by response end time descending
-    let mut results = results.to_vec();
-    results.sort_by_key(|k| std::cmp::Reverse(k.response_end_time));
+    let mut cursor = start_time;
+    // Sort only borrowed metadata, not complete cached JSON responses.
+    let mut results: Vec<_> = results.iter().collect();
+    results.sort_unstable_by_key(|meta| meta.response_start_time);
     for meta in results {
-        cache_duration += meta.response_end_time - meta.response_start_time;
-        current_start_time = meta.response_start_time;
-        calculate_deltas(
-            &ResultCacheMeta {
-                start_time: meta.response_start_time,
-                end_time: meta.response_end_time,
-                is_aggregate,
-                is_descending,
-            },
-            current_start_time,
-            current_end_time,
-            histogram_interval,
-            &mut deltas,
-        );
-        current_end_time = current_start_time;
+        let start = meta.response_start_time.max(start_time);
+        let end = meta.response_end_time.min(end_time);
+        if start >= end || end <= cursor {
+            continue;
+        }
+        if cursor < start {
+            deltas.push(QueryDelta {
+                delta_start_time: cursor,
+                delta_end_time: start,
+            });
+        }
+        cache_duration += end - start.max(cursor);
+        cursor = end;
     }
-
-    // Check if there is a gap at the start
-    if current_start_time > start_time {
-        calculate_deltas(
-            &ResultCacheMeta {
-                start_time: current_start_time,
-                end_time: current_end_time,
-                is_aggregate,
-                is_descending,
-            },
-            start_time,
-            current_end_time,
-            histogram_interval,
-            &mut deltas,
-        );
+    if cursor < end_time {
+        deltas.push(QueryDelta {
+            delta_start_time: cursor,
+            delta_end_time: end_time,
+        });
     }
-
-    deltas.sort(); // Sort the deltas to bring duplicates together
-    deltas.dedup(); // Remove consecutive duplicates
-
     (deltas, None, cache_duration)
 }
 
@@ -969,12 +918,9 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_schema::{Field, Schema};
-    use config::{
-        meta::{
-            search::{Query, Request, RequestEncoding, Response, ResponseTook, SearchEventType},
-            sql::OrderBy,
-        },
-        utils::time::now_micros,
+    use config::meta::{
+        search::{Query, Request, RequestEncoding, Response, SearchEventType},
+        sql::OrderBy,
     };
     use datafusion::common::TableReference;
     use infra::schema::{STREAM_SCHEMAS_LATEST, SchemaCache};
@@ -1043,122 +989,377 @@ mod tests {
         assert!(!should_delete_cache_file("path/2000_3000.json", &criteria));
     }
 
-    #[test]
-    fn test_calculate_deltas_multi_expected_intervals() {
-        let hit = serde_json::json!({
-            "hits":[{"breakdown_1":"EUR","x_axis_1":"2025-05-23T12:00:00","y_axis_1":106,"y_axis_2":106}]
-        });
-        let cached_response = CachedQueryResponse {
-            cached_response: Response {
-                took: 450,
-                took_detail: ResponseTook {
-                    total: 0,
-                    cache_took: 0,
-                    file_list_took: 4,
-                    wait_in_queue: 3,
-                    idx_took: 0,
-                    search_took: 37,
-                },
-                columns: vec![],
-                hits: vec![hit],
-                total: 101,
-                from: 0,
-                size: 280,
-                scan_files: 0,
-                cached_ratio: 100,
-                scan_size: 0,
-                idx_scan_size: 0,
-                scan_records: 34560,
-                response_type: "".to_string(),
-                trace_id: "".to_string(),
-                function_error: vec![],
-                is_partial: false,
-                histogram_interval: Some(3600),
-                new_start_time: None,
-                new_end_time: None,
-                result_cache_ratio: 33,
-                work_group: None,
-                order_by: Some(OrderBy::Asc),
-                order_by_metadata: vec![(String::from("x_axis_1"), OrderBy::Asc)],
-                converted_histogram_query: None,
-                is_histogram_eligible: None,
-                query_index: None,
-                peak_memory_usage: Some(1024000.0),
-                histogram_breakdown_field: None,
-            },
-            deltas: vec![],
-            has_cached_data: true,
-            cache_query_response: true,
-            response_start_time: 1747657200000000,
-            response_end_time: 1747659555000000,
-            ts_column: "x_axis_1".to_string(),
-            is_descending: false,
-            limit: -1,
+    fn boundary_context(timestamps: &[i64]) -> datafusion::prelude::SessionContext {
+        use arrow::{array::Int64Array, record_batch::RecordBatch};
+        use datafusion::datasource::MemTable;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_timestamp", arrow_schema::DataType::Int64, false),
+            Field::new("id", arrow_schema::DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(timestamps.to_vec())),
+                Arc::new(Int64Array::from_iter_values(0..timestamps.len() as i64)),
+            ],
+        )
+        .unwrap();
+        let ctx = datafusion::prelude::SessionContext::new();
+        ctx.register_table(
+            "seam_rows",
+            Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap()),
+        )
+        .unwrap();
+        ctx
+    }
+
+    async fn boundary_query(
+        ctx: &datafusion::prelude::SessionContext,
+        start: i64,
+        end: i64,
+        limit: i64,
+        descending: bool,
+        histogram: bool,
+    ) -> Response {
+        use arrow::array::Int64Array;
+
+        let projection = if histogram {
+            "CAST(floor(_timestamp / 1000000.0) AS BIGINT) * 1000000 AS _timestamp, count(*) AS id"
+        } else {
+            "_timestamp, id"
         };
-        let query_start_time = 1747657200000000;
-        let query_end_time = 1747659600000000;
-        let histogram_interval = 3600000000; // 1 hour in microseconds
+        let group_by = if histogram { "GROUP BY 1" } else { "" };
+        let direction = if descending { "DESC" } else { "ASC" };
+        let batches = ctx
+            .sql(&format!(
+                "SELECT {projection} FROM seam_rows WHERE _timestamp >= {start} \
+                 AND _timestamp < {end} {group_by} ORDER BY _timestamp {direction}, id ASC LIMIT {limit}"
+            ))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let mut hits = Vec::new();
+        for batch in batches {
+            let ts = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let ids = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            for row in 0..batch.num_rows() {
+                hits.push(serde_json::json!({"_timestamp": ts.value(row), "id": ids.value(row)}));
+            }
+        }
+        Response {
+            total: hits.len(),
+            size: hits.len() as i64,
+            hits,
+            histogram_interval: histogram.then_some(1),
+            ..Default::default()
+        }
+    }
 
-        let (deltas, ..) = calculate_deltas_multi(
-            &[cached_response],
-            query_start_time,
-            query_end_time,
-            true,
-            false,
-            histogram_interval,
+    // Exercise the writer's persisted payload, the reader's clipping, real SQL
+    // execution of every gap, and the final response consumed by the caller.
+    // Never normalize away missing/duplicate seam rows.
+    #[allow(clippy::too_many_arguments)]
+    async fn assert_boundary_output(
+        ctx: &datafusion::prelude::SessionContext,
+        windows: &[(i64, i64)],
+        query: (i64, i64),
+        limit: i64,
+        stable_end: i64,
+        descending: bool,
+        histogram: bool,
+        multi: bool,
+    ) {
+        let interval = if histogram { 1_000_000 } else { 0 };
+        let mut cached = Vec::new();
+        for &(start, end) in windows {
+            let mut response = boundary_query(ctx, start, end, limit, descending, histogram).await;
+            let Some((start_time, end_time)) = super::super::prepare_results_for_cache(
+                &mut response,
+                "_timestamp",
+                start,
+                end,
+                limit,
+                histogram,
+                descending,
+                false,
+                stable_end,
+            ) else {
+                continue;
+            };
+            let mut meta = ResultCacheMeta {
+                start_time,
+                end_time,
+                is_aggregate: histogram,
+                is_descending: descending,
+            };
+            let mut response = json::from_slice(&json::to_vec(&response).unwrap()).unwrap();
+            let request = CacheQueryRequest {
+                q_start_time: query.0,
+                q_end_time: query.1,
+                is_aggregate: histogram,
+                ts_column: "_timestamp".to_string(),
+                histogram_interval: interval,
+                is_descending: descending,
+                is_histogram_non_ts_order: false,
+            };
+            if clip_cached_response(&mut response, &mut meta, &request) {
+                cached.push(CachedQueryResponse {
+                    cached_response: response,
+                    response_start_time: meta.start_time,
+                    response_end_time: meta.end_time,
+                    has_cached_data: true,
+                    ..Default::default()
+                });
+            }
+        }
+        assert_eq!(
+            cached.len(),
+            windows.len(),
+            "regression must exercise cache coverage"
         );
-        println!("Deltas: {deltas:?}");
-
-        // All deltas should have start <= end
-        for delta in &deltas {
-            assert!(
-                delta.delta_start_time <= delta.delta_end_time,
-                "delta_start_time > delta_end_time: {delta:?}"
+        let deltas = if multi || cached.is_empty() {
+            calculate_deltas_multi(&cached, query.0, query.1, histogram, descending, interval).0
+        } else {
+            assert_eq!(cached.len(), 1);
+            let mut deltas = Vec::new();
+            calculate_deltas(
+                &ResultCacheMeta {
+                    start_time: cached[0].response_start_time,
+                    end_time: cached[0].response_end_time,
+                    is_aggregate: histogram,
+                    is_descending: descending,
+                },
+                query.0,
+                query.1,
+                interval,
+                &mut deltas,
+            );
+            deltas
+        };
+        let mut fresh = Vec::new();
+        for delta in deltas {
+            fresh.push(
+                boundary_query(
+                    ctx,
+                    delta.delta_start_time,
+                    delta.delta_end_time,
+                    limit,
+                    descending,
+                    histogram,
+                )
+                .await,
             );
         }
+        let actual = super::super::merge_response(
+            "cache-boundary-regression",
+            &mut cached.into_iter().map(|r| r.cached_response).collect(),
+            &mut fresh,
+            "_timestamp",
+            limit,
+            descending,
+            0,
+            vec![
+                (
+                    "_timestamp".to_string(),
+                    if descending {
+                        OrderBy::Desc
+                    } else {
+                        OrderBy::Asc
+                    },
+                ),
+                ("id".to_string(), OrderBy::Asc),
+            ],
+        );
+        let expected = boundary_query(ctx, query.0, query.1, limit, descending, histogram).await;
+        assert_eq!(
+            actual.hits, expected.hits,
+            "windows={windows:?}, query={query:?}, limit={limit}, descending={descending}, multi={multi}"
+        );
+        assert_eq!(actual.total, expected.total);
+    }
 
-        let expected_deltas = vec![QueryDelta {
-            delta_start_time: 1747659555000000,
-            delta_end_time: 1747659600000000,
-        }];
-        assert_eq!(deltas, expected_deltas);
+    #[tokio::test]
+    async fn test_cache_boundary_rows_match_uncached_sql() {
+        let ctx = boundary_context(&[
+            100, 200, 430, 430, 430, 500, 600, 700, 700, 700, 700, 800, 900,
+        ]);
+        for descending in [false, true] {
+            for multi in [false, true] {
+                // No cache, full cache, and an exhausted prefix with three rows
+                // exactly at its exclusive end.
+                for windows in [vec![], vec![(100, 900)], vec![(100, 430)]] {
+                    assert_boundary_output(
+                        &ctx,
+                        &windows,
+                        (100, 900),
+                        100,
+                        1000,
+                        descending,
+                        false,
+                        multi,
+                    )
+                    .await;
+                }
+                // Clipping must exclude every row at the new exclusive end.
+                assert_boundary_output(
+                    &ctx,
+                    &[(100, 900)],
+                    (200, 700),
+                    100,
+                    1000,
+                    descending,
+                    false,
+                    multi,
+                )
+                .await;
+                // An empty subwindow is still covered; row extrema cannot define coverage.
+                assert_boundary_output(
+                    &ctx,
+                    &[(100, 900)],
+                    (250, 400),
+                    100,
+                    1000,
+                    descending,
+                    false,
+                    multi,
+                )
+                .await;
+                // LIMIT lands inside a timestamp tie in either sort direction.
+                assert_boundary_output(
+                    &ctx,
+                    &[(100, 900)],
+                    (100, 1000),
+                    4,
+                    1000,
+                    descending,
+                    false,
+                    multi,
+                )
+                .await;
+                // The cache-delay cutoff has the same exclusive-end semantics.
+                assert_boundary_output(
+                    &ctx,
+                    &[(100, 900)],
+                    (100, 900),
+                    100,
+                    430,
+                    descending,
+                    false,
+                    multi,
+                )
+                .await;
+            }
+            assert_boundary_output(
+                &ctx,
+                &[(100, 430), (600, 800)],
+                (100, 1000),
+                100,
+                1000,
+                descending,
+                false,
+                true,
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cache_boundary_histograms_match_uncached_sql() {
+        let ctx = boundary_context(&[
+            0, 500_000, 1_000_000, 1_500_000, 2_000_000, 2_500_000, 3_000_000, 3_500_000,
+            4_000_000, 4_500_000,
+        ]);
+        for descending in [false, true] {
+            for multi in [false, true] {
+                // The last complete bucket ends exactly at the clipped query end.
+                assert_boundary_output(
+                    &ctx,
+                    &[(0, 5_000_000)],
+                    (1_000_000, 4_000_000),
+                    100,
+                    5_000_000,
+                    descending,
+                    true,
+                    multi,
+                )
+                .await;
+                // Partial request and delay buckets are re-queried, never split.
+                assert_boundary_output(
+                    &ctx,
+                    &[(500_000, 4_500_000)],
+                    (0, 5_000_000),
+                    100,
+                    3_500_000,
+                    descending,
+                    true,
+                    multi,
+                )
+                .await;
+                // A saturated terminal bucket must be fetched in its entirety.
+                assert_boundary_output(
+                    &ctx,
+                    &[(0, 4_000_000)],
+                    (0, 5_000_000),
+                    3,
+                    5_000_000,
+                    descending,
+                    true,
+                    multi,
+                )
+                .await;
+            }
+        }
     }
 
     #[test]
     fn test_get_ts_col_order_by() {
         let sql = Sql {
-            sql: "SELECT _timestamp, field1 FROM logs ORDER BY _timestamp DESC".to_string(),
-            is_complex: false,
-            org_id: "test_org".to_string(),
-            stream_type: StreamType::Logs,
-            stream_names: vec![TableReference::from("logs")],
-            has_match_all: false,
-            equal_items: hashbrown::HashMap::new(),
-            columns: {
-                let mut cols = hashbrown::HashMap::new();
-                let mut set = hashbrown::HashSet::new();
-                set.insert("_timestamp".to_string());
-                set.insert("field1".to_string());
-                cols.insert(TableReference::from("logs"), set);
-                cols
-            },
-            aliases: vec![("_timestamp".to_string(), "_timestamp".to_string())],
-            schemas: {
-                let mut schemas = hashbrown::HashMap::new();
-                schemas.insert(
-                    TableReference::from("logs"),
-                    Arc::new(SchemaCache::new(Schema::empty())),
-                );
-                schemas
-            },
-            limit: 100,
-            offset: 0,
+            metadata: Arc::new(crate::service::search::sql::SqlMetadata {
+                sql: "SELECT _timestamp, field1 FROM logs ORDER BY _timestamp DESC".to_string(),
+                is_complex: false,
+                org_id: "test_org".to_string(),
+                stream_type: StreamType::Logs,
+                stream_names: vec![TableReference::from("logs")],
+                has_match_all: false,
+                equal_items: hashbrown::HashMap::new(),
+                columns: {
+                    let mut cols = hashbrown::HashMap::new();
+                    let mut set = hashbrown::HashSet::new();
+                    set.insert("_timestamp".to_string());
+                    set.insert("field1".to_string());
+                    cols.insert(TableReference::from("logs"), set);
+                    cols
+                },
+                aliases: vec![("_timestamp".to_string(), "_timestamp".to_string())],
+                schemas: {
+                    let mut schemas = hashbrown::HashMap::new();
+                    schemas.insert(
+                        TableReference::from("logs"),
+                        Arc::new(SchemaCache::new(Schema::empty())),
+                    );
+                    schemas
+                },
+                limit: 100,
+                offset: 0,
+                group_by: vec![],
+                order_by: vec![("_timestamp".to_string(), OrderBy::Desc)],
+                histogram_interval: None,
+                timezone: None,
+                sorted_by_time: true,
+                pagination: Default::default(),
+            }),
             time_range: (0, 0),
-            group_by: vec![],
-            order_by: vec![("_timestamp".to_string(), OrderBy::Desc)],
-            histogram_interval: None,
-            timezone: None,
-            sorted_by_time: true,
             sampling_config: None,
         };
 
@@ -1170,97 +1371,65 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_invalidate_cached_response_by_stream_min_ts() {
-        let mock_stream_min_ts = now_micros() - 3600000000; // 1 hour ago
-
-        let responses = vec![
-            CachedQueryResponse {
-                cached_response: Response {
-                    took: 100,
-                    took_detail: ResponseTook::default(),
-                    columns: vec![],
-                    hits: vec![serde_json::json!({"timestamp":"2025-01-01T10:00:00Z"})],
-                    total: 1,
-                    from: 0,
-                    size: 10,
-                    scan_files: 1,
-                    cached_ratio: 100,
-                    scan_size: 1000,
-                    idx_scan_size: 1000,
-                    scan_records: 100,
-                    response_type: "".to_string(),
-                    trace_id: "".to_string(),
-                    function_error: vec![],
-                    is_partial: false,
-                    histogram_interval: None,
-                    new_start_time: None,
-                    new_end_time: None,
-                    result_cache_ratio: 100,
-                    work_group: None,
-                    order_by: None,
-                    order_by_metadata: vec![],
-                    converted_histogram_query: None,
-                    is_histogram_eligible: None,
-                    query_index: None,
-                    peak_memory_usage: Some(1024000.0),
-                    histogram_breakdown_field: None,
-                },
-                deltas: vec![],
-                has_cached_data: true,
-                cache_query_response: true,
-                response_start_time: mock_stream_min_ts - 7200000000, // 2 hours ago
-                response_end_time: mock_stream_min_ts - 3600000000,   // 1 hour ago
-                ts_column: "_timestamp".to_string(),
-                is_descending: true,
-                limit: 10,
+    async fn test_cache_boundary_retention_matches_live_histogram() {
+        let old = boundary_context(&[0, 500_000, 1_000_000, 1_500_000, 2_000_000, 2_500_000]);
+        let live = boundary_context(&[1_500_000, 2_000_000, 2_500_000]);
+        let response = boundary_query(&old, 0, 3_000_000, 100, false, true).await;
+        let cached = CachedQueryResponse {
+            cached_response: response,
+            response_start_time: 0,
+            response_end_time: 3_000_000,
+            ts_column: "_timestamp".to_string(),
+            has_cached_data: true,
+            ..Default::default()
+        };
+        let org = "cache_boundary_retention_regression";
+        infra::cache::stats::set_stream_stats(
+            org,
+            "histogram",
+            StreamType::Logs,
+            config::meta::stream::StreamStats {
+                doc_time_min: 1_500_000,
+                ..Default::default()
             },
-            CachedQueryResponse {
-                cached_response: Response {
-                    took: 100,
-                    took_detail: ResponseTook::default(),
-                    columns: vec![],
-                    hits: vec![serde_json::json!({"timestamp": "2025-01-01T11:00:00Z"})],
-                    total: 1,
-                    from: 0,
-                    size: 10,
-                    scan_files: 1,
-                    cached_ratio: 100,
-                    scan_size: 1000,
-                    idx_scan_size: 1000,
-                    scan_records: 100,
-                    response_type: "".to_string(),
-                    trace_id: "".to_string(),
-                    function_error: vec![],
-                    is_partial: false,
-                    histogram_interval: None,
-                    new_start_time: None,
-                    new_end_time: None,
-                    result_cache_ratio: 100,
-                    work_group: None,
-                    order_by: None,
-                    order_by_metadata: vec![],
-                    converted_histogram_query: None,
-                    is_histogram_eligible: None,
-                    query_index: None,
-                    peak_memory_usage: Some(1024000.0),
-                    histogram_breakdown_field: None,
-                },
-                deltas: vec![],
-                has_cached_data: true,
-                cache_query_response: true,
-                response_start_time: mock_stream_min_ts - 1800000000, // 30 minutes ago
-                response_end_time: mock_stream_min_ts + 1800000000,   // 30 minutes from now
-                ts_column: "_timestamp".to_string(),
-                is_descending: true,
-                limit: 10,
-            },
-        ];
-
-        let file_path = "test_org/logs/test_stream";
-        let result = invalidate_cached_response_by_stream_min_ts(file_path, &responses, 0).await;
-        assert!(result.is_ok());
-        let filtered_responses = result.unwrap();
-        assert_eq!(filtered_responses.len(), 2);
+        );
+        let retained = invalidate_cached_response_by_stream_min_ts(
+            &format!("{org}/logs/histogram"),
+            &[cached],
+            1_000_000,
+        )
+        .await;
+        infra::cache::stats::remove_stream_stats(org, "histogram", StreamType::Logs);
+        let retained = retained.unwrap();
+        assert_eq!(retained.len(), 1);
+        let deltas = calculate_deltas_multi(&retained, 0, 3_000_000, true, false, 1_000_000).0;
+        let mut fresh = Vec::new();
+        for delta in deltas {
+            fresh.push(
+                boundary_query(
+                    &live,
+                    delta.delta_start_time,
+                    delta.delta_end_time,
+                    100,
+                    false,
+                    true,
+                )
+                .await,
+            );
+        }
+        let actual = super::super::merge_response(
+            "retention-boundary",
+            &mut retained.into_iter().map(|r| r.cached_response).collect(),
+            &mut fresh,
+            "_timestamp",
+            100,
+            false,
+            0,
+            vec![],
+        );
+        let expected = boundary_query(&live, 0, 3_000_000, 100, false, true).await;
+        assert_eq!(actual.hits, expected.hits);
+        assert_eq!(actual.total, expected.total);
     }
 
     #[tokio::test]

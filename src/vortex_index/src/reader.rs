@@ -18,20 +18,13 @@
 //! [`VixReader::open`] parses the puffin envelope from in-memory bytes;
 //! [`VixReader::open_ranged`] parses it from a [`VixRangeSource`] instead
 //! (one tail fetch for the puffin footer — two when the footer payload
-//! exceeds the 64 KiB tail window). Both load only the dictionary
-//! DIRECTORY at open — the three small `(first_ordinal, term_min,
-//! term_max)` columns, KBs even for GB-scale files. The per-row-group
-//! `fst` cells (multi-MB each) load LAZILY, point-read from the `dict`
-//! blob the first time an operation touches their row group, and stay
-//! resident on the reader ([`VixReader::memory_size`] grows accordingly).
-//! Query evaluation resolves tokens to global term ordinals through the
-//! per-row-group FSTs (pruned via the `term_min`/`term_max` directory where
-//! the operation allows it — an exact-term probe loads at most ONE cell),
-//! then point-reads the matching `postings` rows from the `terms` blob and
-//! unions them into a per-document [`BooleanBuffer`]. On a ranged reader
-//! those point reads fetch only the chunks the ordinals live in (plus the
-//! blob's Vortex footer on the first access); the huge remainder of the
-//! object is never downloaded. Field-qualified operations use optional
+//! exceeds the 64 KiB tail window). Dictionary directories and encoded
+//! key blocks load lazily. Active point leaves resolve together by physical
+//! block offset, scanning each selected block once before releasing a bounded
+//! fetch batch. The reader retains only its bounded encoded-block cache,
+//! never a whole query's decoded dictionary. Matching global term ordinals
+//! select the `postings` rows that are unioned into a per-document bitmap.
+//! Field-qualified operations use optional
 //! field-page metadata to fetch only enclosing dictionary restart pages;
 //! legacy files retain the full-directory path. Unscoped pattern scans
 //! and [`VixReader::for_each_term`] still walk the complete dictionary.
@@ -277,6 +270,37 @@ impl Drop for PendingMemory {
     fn drop(&mut self) {
         self.memory.total.fetch_sub(self.bytes, Ordering::AcqRel);
     }
+}
+
+/// Temporary query ownership stays admitted until its value is discarded.
+struct Admitted<T> {
+    value: T,
+    _pending: PendingMemory,
+}
+
+impl<T> Admitted<Vec<T>> {
+    fn push(&mut self, value: T) -> Result<()> {
+        if self.value.len() == self.value.capacity() {
+            let capacity = self.value.capacity().max(4).saturating_mul(2);
+            // Keep the old allocation admitted throughout reallocation.
+            let pending = self
+                ._pending
+                .memory
+                .reserve(capacity.saturating_mul(std::mem::size_of::<T>()))?;
+            self.value.reserve_exact(capacity - self.value.len());
+            self._pending = pending;
+        }
+        self.value.push(value);
+        Ok(())
+    }
+}
+
+struct PointTarget {
+    offset: u64,
+    end: u64,
+    first_ordinal: u64,
+    field_id: u16,
+    leaf: usize,
 }
 
 /// A dense term's out-of-row postings opened for rank-based consumption:
@@ -564,7 +588,7 @@ pub struct VixReader {
         // without releasing any buckets. This table never shrinks.
         usize,
     )>,
-    /// The `dict` blob, kept for lazy FST-cell point reads (`None` when the
+    /// The `dict` blob, kept for lazy directory/page reads (`None` when the
     /// file has no terms).
     dict_blob: Option<BlobHandle>,
     terms_blob: Option<BlobHandle>,
@@ -1195,184 +1219,20 @@ impl VixReader {
     /// Evaluate a query into a bitmap with one bit per document
     /// (length == [`Self::row_count`]).
     pub fn eval(&self, query: &VixQuery) -> anyhow::Result<BooleanBuffer> {
+        let _pending = self.memory.reserve(0)?;
+        let result = self.eval_query(query, None)?;
         check_read_cancelled()?;
-        self.prefetch_query_fsts(query)?;
-        Ok(self.eval_query(query)?)
+        Ok(result)
     }
 
     /// Count matching documents. Single terms use `doc_count` metadata;
     /// writer-proven disjoint same-field value terms (including flat Exact
     /// ORs) are summed. Other matches retain exact postings unions.
     pub fn count(&self, query: &VixQuery) -> anyhow::Result<u64> {
-        self.prefetch_query_fsts(query)?;
-        Ok(self.count_inner(query)?)
-    }
-
-    /// Warm the dictionary for `query`: parse the index (one fetch) and
-    /// pull the blocks its POINT leaves resolve to into the block cache.
-    /// Range/pattern leaves fetch on demand during their walks.
-    ///
-    /// A query WITHOUT point leaves skips the dictionary INDEX load too:
-    /// `All`-condition evaluations (unconditioned SimpleSelect/TopN shapes)
-    /// were paying an MB-class fetch per ranged file for a structure they
-    /// never touch (#27).
-    fn prefetch_query_fsts(&self, query: &VixQuery) -> Result<()> {
-        crate::check_read_memory(self.memory_size())?;
-        if self.term_count == 0 || !Self::query_has_point_leaves(query) {
-            return Ok(());
-        }
-        if self.dict_field_pages.is_some() {
-            let prefetch = |key: &[u8], fid| -> Result<()> {
-                let index = self.field_index(fid)?;
-                if let Some(b) = index.predecessor_block(key)?
-                    && index.field_blocks().contains(&b)
-                {
-                    self.dict_block(index, b)?;
-                }
-                Ok(())
-            };
-            match query {
-                VixQuery::And(subs) | VixQuery::Or(subs) => {
-                    for sub in subs {
-                        self.prefetch_query_fsts(sub)?;
-                    }
-                }
-                VixQuery::Not(sub) => self.prefetch_query_fsts(sub)?,
-                VixQuery::Exact { field, token } => {
-                    if let Some(fid) = self.field_id(field) {
-                        prefetch(&self.composite(token, fid), fid)?;
-                    }
-                }
-                VixQuery::KeyExists { path } => {
-                    prefetch(&self.composite(path.as_bytes(), KEY_FIELD_ID), KEY_FIELD_ID)?;
-                }
-                VixQuery::TokenAnyField { token } => {
-                    for &fid in &self.indexed_field_ids {
-                        prefetch(&self.composite(token, fid), fid)?;
-                    }
-                }
-                _ => {}
-            }
-            return Ok(());
-        }
-        let index = self.dict_index()?;
-        let mut needed: Vec<usize> = Vec::new();
-        self.collect_query_block_needs(query, index, &mut needed)?;
-        needed.sort_unstable();
-        needed.dedup();
-        // ranged readers batch every MISSING block into one fetch_many
-        // round trip (the ladder/S3 issue one request); in-memory readers
-        // slice for free through dict_block
-        if let Some(BlobHandle::Ranged(ranged)) = self.dict_blocks_blob.as_ref() {
-            let blob_len = self.dict_blocks_len()?;
-            let missing: Vec<usize> = {
-                let cache = self.block_cache.lock();
-                needed
-                    .iter()
-                    .copied()
-                    .filter(|&b| !cache.0.contains_key(&(index.meta(b).0 as usize)))
-                    .collect()
-            };
-            if missing.len() > 1 {
-                let ranges: Vec<std::ops::Range<u64>> = missing
-                    .iter()
-                    .map(|&b| {
-                        let r = index.block_range(b, blob_len);
-                        ranged.range.start + r.start..ranged.range.start + r.end
-                    })
-                    .collect();
-                let fetch_bytes = ranges.iter().fold(0usize, |sum, range| {
-                    sum.saturating_add(
-                        usize::try_from(range.end.saturating_sub(range.start))
-                            .unwrap_or(usize::MAX),
-                    )
-                });
-                let _pending = self.memory.reserve(fetch_bytes.saturating_mul(2))?;
-                let fetched = crate::source::block_fetch_many(ranged.source.as_ref(), ranges)?;
-                let mut cache = self.block_cache.lock();
-                let result = missing.into_iter().zip(fetched).try_for_each(|(b, bytes)| {
-                    self.cache_dict_block(&mut cache, index.meta(b).0 as usize, &bytes)
-                });
-                drop(cache);
-                self.memory.notify();
-                result?;
-                return Ok(());
-            }
-        }
-        for b in needed {
-            self.dict_block(index, b)?;
-        }
-        Ok(())
-    }
-
-    /// Whether a query contains any POINT leaf (`Exact` / `KeyExists` /
-    /// `TokenAnyField`) — the only leaves [`Self::prefetch_query_fsts`] can
-    /// resolve to dictionary blocks up front. Range/pattern leaves walk
-    /// (and fetch) lazily; `All`/`Nothing` never touch the dictionary.
-    fn query_has_point_leaves(query: &VixQuery) -> bool {
-        match query {
-            VixQuery::Exact { .. }
-            | VixQuery::KeyExists { .. }
-            | VixQuery::TokenAnyField { .. } => true,
-            VixQuery::And(subs) | VixQuery::Or(subs) => {
-                subs.iter().any(Self::query_has_point_leaves)
-            }
-            VixQuery::Not(sub) => Self::query_has_point_leaves(sub),
-            VixQuery::All
-            | VixQuery::Nothing
-            | VixQuery::Prefix { .. }
-            | VixQuery::Contains { .. }
-            | VixQuery::Regex { .. }
-            | VixQuery::Fuzzy { .. } => false,
-        }
-    }
-
-    /// The dictionary blocks a query's POINT leaves resolve to, computed
-    /// from the resident index alone (no block reads). Unknown fields
-    /// contribute nothing; range/pattern leaves are omitted — their walks
-    /// fetch on demand.
-    fn collect_query_block_needs(
-        &self,
-        query: &VixQuery,
-        index: &crate::dict_blocks::DictIndex,
-        out: &mut Vec<usize>,
-    ) -> Result<()> {
+        let _pending = self.memory.reserve(0)?;
+        let result = self.count_inner(query, None)?;
         check_read_cancelled()?;
-        match query {
-            VixQuery::All | VixQuery::Nothing => {}
-            VixQuery::And(subs) | VixQuery::Or(subs) => {
-                for sub in subs {
-                    self.collect_query_block_needs(sub, index, out)?;
-                }
-            }
-            VixQuery::Not(sub) => self.collect_query_block_needs(sub, index, out)?,
-            VixQuery::Exact { field, token } => {
-                if let Some(field_id) = self.field_id(field)
-                    && let Some(b) = index.predecessor_block(&self.composite(token, field_id))?
-                {
-                    out.push(b);
-                }
-            }
-            VixQuery::KeyExists { path } => {
-                if let Some(b) =
-                    index.predecessor_block(&self.composite(path.as_bytes(), KEY_FIELD_ID))?
-                {
-                    out.push(b);
-                }
-            }
-            VixQuery::TokenAnyField { token } => {
-                for &fid in &self.indexed_field_ids {
-                    if let Some(b) = index.predecessor_block(&self.composite(token, fid))? {
-                        out.push(b);
-                    }
-                }
-            }
-            VixQuery::Prefix { .. }
-            | VixQuery::Contains { .. }
-            | VixQuery::Regex { .. }
-            | VixQuery::Fuzzy { .. } => {}
-        }
-        Ok(())
+        Ok(result)
     }
 
     /// Bitmap of documents whose `_timestamp` lies in `[min_micros, max_micros)`
@@ -1838,21 +1698,14 @@ impl VixReader {
         &self,
         query: &VixQuery,
     ) -> anyhow::Result<Option<PlistCursor>> {
+        let _pending = self.memory.reserve(0)?;
         if self.plist_min_docs == 0 || self.term_count == 0 {
             return Ok(None);
         }
-        let ordinals = match query {
-            VixQuery::All
-            | VixQuery::Nothing
-            | VixQuery::And(_)
-            | VixQuery::Or(_)
-            | VixQuery::Not(_) => return Ok(None),
-            leaf => {
-                self.prefetch_query_fsts(leaf)?;
-                self.collect_ordinals(leaf)?
-            }
+        let Some(ordinals) = self.cursor_ordinals(query, None)? else {
+            return Ok(None);
         };
-        let [ordinal] = ordinals[..] else {
+        let [ordinal] = ordinals.value[..] else {
             return Ok(None);
         };
         let terms_blob = self
@@ -3249,38 +3102,438 @@ impl VixReader {
         Ok(column)
     }
 
-    fn eval_query(&self, query: &VixQuery) -> Result<BooleanBuffer> {
+    fn query_vec<T>(&self, capacity: usize) -> Result<Admitted<Vec<T>>> {
+        let pending = self.memory.reserve(
+            capacity
+                .checked_mul(std::mem::size_of::<T>())
+                .ok_or_else(|| VixError::Malformed("query allocation overflow".into()))?,
+        )?;
+        Ok(Admitted {
+            value: Vec::with_capacity(capacity),
+            _pending: pending,
+        })
+    }
+
+    fn fulltext_scope(&self, names: &[String]) -> Result<Admitted<Vec<u16>>> {
+        let mut selected = self.query_vec(names.len())?;
+        for name in names {
+            check_read_cancelled()?;
+            if !self.fts_fields.contains(name) {
+                return Err(VixError::FieldNotIndexed(name.clone()));
+            }
+            selected.value.push(name.as_str());
+        }
+        selected.value.sort_unstable();
+        selected.value.dedup();
+        let mut fields = self.query_vec(selected.value.len())?;
+        if selected.value.is_empty() {
+            return Ok(fields);
+        }
+        for (fid, entry) in self.fields.iter().enumerate() {
+            check_read_cancelled()?;
+            if entry.has_type(FIELD_TYPE_FTS)
+                && selected.value.binary_search(&entry.name.as_str()).is_ok()
+            {
+                fields.push(
+                    u16::try_from(fid)
+                        .map_err(|_| VixError::Malformed("FTS field id overflow".into()))?,
+                )?;
+            }
+        }
+        check_read_cancelled()?;
+        Ok(fields)
+    }
+
+    fn cursor_ordinals(
+        &self,
+        query: &VixQuery,
+        scope: Option<&[u16]>,
+    ) -> Result<Option<Admitted<Vec<u64>>>> {
+        check_read_cancelled()?;
+        match query {
+            VixQuery::FullText { fields, query } => {
+                let fields = self.fulltext_scope(fields)?;
+                self.cursor_ordinals(query, Some(&fields.value))
+            }
+            VixQuery::All
+            | VixQuery::Nothing
+            | VixQuery::And(_)
+            | VixQuery::Or(_)
+            | VixQuery::Not(_) => Ok(None),
+            leaf => Ok(Some(self.collect_ordinals(leaf, scope)?)),
+        }
+    }
+
+    /// A stage consists only of adjacent compatible point leaves. AND keeps
+    /// named predicates individual, preserving missing-leaf short circuiting.
+    fn point_run_end(subs: &[VixQuery], start: usize, named: bool) -> Result<usize> {
+        let mut end = start;
+        while end < subs.len() {
+            check_read_cancelled()?;
+            let compatible = match (&subs[start], &subs[end]) {
+                (VixQuery::TokenAnyField { .. }, VixQuery::TokenAnyField { .. }) => true,
+                (VixQuery::Exact { field, .. }, VixQuery::Exact { field: other, .. }) => {
+                    named && field == other
+                }
+                _ => false,
+            };
+            if !compatible {
+                break;
+            }
+            end += 1;
+        }
+        Ok(end)
+    }
+
+    fn resolve_point_run(
+        &self,
+        subs: &[VixQuery],
+        scope: Option<&[u16]>,
+    ) -> Result<Admitted<Vec<Admitted<Vec<u64>>>>> {
+        let mut tokens = self.query_vec(subs.len())?;
+        for sub in subs {
+            check_read_cancelled()?;
+            match sub {
+                VixQuery::TokenAnyField { token } | VixQuery::Exact { token, .. } => {
+                    tokens.value.push(token.as_slice())
+                }
+                _ => return Err(VixError::InvalidQuery("non-point in point stage".into())),
+            }
+        }
+        match &subs[0] {
+            VixQuery::Exact { field, .. } => {
+                self.resolve_points(&tokens.value, &[self.require_field_id(field)?], false)
+            }
+            _ => self.resolve_points(
+                &tokens.value,
+                scope.unwrap_or(&self.indexed_field_ids),
+                scope.is_none(),
+            ),
+        }
+    }
+
+    /// Resolve borrowed tokens for an active stage, emitting ordinals only.
+    /// Field-major enumeration of sorted tokens gives physical-block order
+    /// even when different field pages use different local block numbers.
+    /// Plans stop at block boundaries after 4096 targets or 8 MiB of payload.
+    /// An indivisible larger block/target group is separately admitted, so
+    /// limits cannot prevent forward progress.
+    fn resolve_points(
+        &self,
+        tokens: &[&[u8]],
+        fields: &[u16],
+        broad: bool,
+    ) -> Result<Admitted<Vec<Admitted<Vec<u64>>>>> {
+        const BATCH_BYTES: u64 = 8 * 1024 * 1024;
+        const BATCH_TARGETS: usize = 4096;
+        let mut out = self.query_vec(tokens.len())?;
+        for _ in tokens {
+            check_read_cancelled()?;
+            out.value.push(self.query_vec::<u64>(0)?);
+        }
+        if self.term_count == 0 || fields.is_empty() || tokens.is_empty() {
+            return Ok(out);
+        }
+        let mut order = self.query_vec(tokens.len())?;
+        let mut key_capacity = 2usize;
+        for (leaf, token) in tokens.iter().enumerate() {
+            check_read_cancelled()?;
+            order.value.push(leaf);
+            key_capacity = key_capacity.max(
+                token
+                    .len()
+                    .checked_add(2)
+                    .ok_or_else(|| VixError::Malformed("point key size overflow".into()))?,
+            );
+        }
+        order
+            .value
+            .sort_unstable_by(|&a, &b| tokens[a].cmp(tokens[b]));
+        check_read_cancelled()?;
+        let mut key = self.query_vec(key_capacity)?;
+        let mut targets = self.query_vec::<PointTarget>(
+            fields.len().saturating_mul(tokens.len()).min(BATCH_TARGETS),
+        )?;
+        // Broad queries use one global directory, rather than loading every
+        // overlapping field page. Explicit scopes retain field-page isolation.
+        let global = if broad {
+            Some(self.dict_index()?)
+        } else {
+            None
+        };
+        let blob_len = self.dict_blocks_len()?;
+        let mut batch_bytes = 0u64;
+        for &fid in fields {
+            check_read_cancelled()?;
+            let index = match global {
+                Some(index) => index,
+                None => self.field_index(fid)?,
+            };
+            for &leaf in &order.value {
+                check_read_cancelled()?;
+                write_composite(&mut key.value, tokens[leaf], fid);
+                let Some(block) = index.predecessor_block(&key.value)? else {
+                    continue;
+                };
+                if !index.field_blocks().contains(&block) {
+                    continue;
+                }
+                let range = index.block_range(block, blob_len);
+                let length = range
+                    .end
+                    .checked_sub(range.start)
+                    .filter(|_| range.end <= blob_len)
+                    .ok_or_else(|| VixError::Malformed("invalid point block range".into()))?;
+                let new_block = targets
+                    .value
+                    .last()
+                    .is_none_or(|last| last.offset != range.start);
+                if let Some(last) = targets.value.last()
+                    && (last.offset > range.start
+                        || (last.offset == range.start
+                            && (last.end != range.end
+                                || last.first_ordinal != index.meta(block).1)))
+                {
+                    return Err(VixError::Malformed(
+                        "inconsistent point block directory".into(),
+                    ));
+                }
+                if new_block
+                    && !targets.value.is_empty()
+                    && (batch_bytes.saturating_add(length) > BATCH_BYTES
+                        || targets.value.len() >= BATCH_TARGETS)
+                {
+                    self.resolve_point_batch(&targets.value, tokens, &mut out.value)?;
+                    targets.value.clear();
+                    batch_bytes = 0;
+                }
+                if new_block {
+                    batch_bytes = batch_bytes.saturating_add(length);
+                }
+                targets.push(PointTarget {
+                    offset: range.start,
+                    end: range.end,
+                    first_ordinal: index.meta(block).1,
+                    field_id: fid,
+                    leaf,
+                })?;
+            }
+        }
+        if !targets.value.is_empty() {
+            self.resolve_point_batch(&targets.value, tokens, &mut out.value)?;
+        }
+        check_read_cancelled()?;
+        Ok(out)
+    }
+
+    fn resolve_point_batch(
+        &self,
+        targets: &[PointTarget],
+        tokens: &[&[u8]],
+        out: &mut [Admitted<Vec<u64>>],
+    ) -> Result<()> {
+        struct Block {
+            start: usize,
+            end: usize,
+            bytes: Option<Bytes>,
+        }
+        check_read_cancelled()?;
+        let mut block_count = 0usize;
+        let mut payload = 0usize;
+        let mut previous = None;
+        for target in targets {
+            check_read_cancelled()?;
+            if previous != Some(target.offset) {
+                block_count += 1;
+                payload = payload
+                    .checked_add(
+                        usize::try_from(target.end - target.offset)
+                            .map_err(|_| VixError::Malformed("point batch size overflow".into()))?,
+                    )
+                    .ok_or_else(|| VixError::Malformed("point batch size overflow".into()))?;
+                previous = Some(target.offset);
+            }
+        }
+        // Returned windows, detachment copies, and block_scan's single
+        // reconstructed key (capacity at most twice the encoded block).
+        // This also covers cached clones if another operation evicts them.
+        let _payload_pending = self.memory.reserve(
+            payload
+                .saturating_mul(4)
+                .saturating_add(block_count.saturating_mul(256)),
+        )?;
+        let mut blocks = self.query_vec::<Block>(block_count)?;
+        let mut runs = self.query_vec::<std::ops::Range<u64>>(block_count)?;
+        let mut next = 0;
+        while next < targets.len() {
+            check_read_cancelled()?;
+            let start = next;
+            let target = &targets[start];
+            while next < targets.len() && targets[next].offset == target.offset {
+                check_read_cancelled()?;
+                next += 1;
+            }
+            let bytes = match self.dict_blocks_blob.as_ref() {
+                Some(BlobHandle::Mem(bytes)) => {
+                    Some(bytes.slice(target.offset as usize..target.end as usize))
+                }
+                Some(BlobHandle::Ranged(_)) => self
+                    .block_cache
+                    .lock()
+                    .0
+                    .get(&(target.offset as usize))
+                    .cloned(),
+                None => return Err(VixError::Malformed("missing dict_blocks blob".into())),
+            };
+            if bytes.is_none() {
+                if let Some(run) = runs.value.last_mut()
+                    && run.end == target.offset
+                {
+                    run.end = target.end;
+                } else {
+                    runs.value.push(target.offset..target.end);
+                }
+            }
+            blocks.value.push(Block {
+                start,
+                end: next,
+                bytes,
+            });
+        }
+        let fetched = match self.dict_blocks_blob.as_ref() {
+            Some(BlobHandle::Ranged(blob)) if !runs.value.is_empty() => {
+                // Scalar-dispatched contiguous runs: no backend coalescer can
+                // turn gaps between selected blocks into an unbounded fetch.
+                let ranges = runs
+                    .value
+                    .iter()
+                    .map(|range| blob.range.start + range.start..blob.range.start + range.end)
+                    .collect();
+                crate::source::block_fetch_separate(blob.source.as_ref(), ranges)?
+                    .into_iter()
+                    .map(compact_bytes)
+                    .collect::<Vec<_>>()
+            }
+            _ => Vec::new(),
+        };
+        let mut run = 0;
+        for block in blocks.value {
+            check_read_cancelled()?;
+            let first = &targets[block.start];
+            let missing = block.bytes.is_none();
+            let bytes = match block.bytes {
+                Some(bytes) => bytes,
+                None => {
+                    while runs.value[run].end <= first.offset {
+                        check_read_cancelled()?;
+                        run += 1;
+                    }
+                    let base = runs.value[run].start;
+                    fetched[run].slice((first.offset - base) as usize..(first.end - base) as usize)
+                }
+            };
+            let mut wanted = block.start;
+            let mut failure = None;
+            crate::dict_blocks::block_scan(&bytes, |pos, key| {
+                if let Err(error) = check_read_cancelled() {
+                    failure = Some(error);
+                    return false;
+                }
+                let Some((token, fid)) = split_key(key) else {
+                    failure = Some(VixError::Malformed("invalid dictionary point key".into()));
+                    return false;
+                };
+                while wanted < block.end {
+                    let target = &targets[wanted];
+                    let ordering = (target.field_id, tokens[target.leaf]).cmp(&(fid, token));
+                    if ordering.is_gt() {
+                        break;
+                    }
+                    if let Err(error) = check_read_cancelled() {
+                        failure = Some(error);
+                        return false;
+                    }
+                    if ordering.is_eq() {
+                        let Some(ordinal) = first
+                            .first_ordinal
+                            .checked_add(pos as u64)
+                            .filter(|&ordinal| ordinal < self.term_count)
+                        else {
+                            failure =
+                                Some(VixError::Malformed("point ordinal out of range".into()));
+                            return false;
+                        };
+                        if let Err(error) = out[target.leaf].push(ordinal) {
+                            failure = Some(error);
+                            return false;
+                        }
+                    }
+                    wanted += 1;
+                }
+                wanted < block.end
+            })?;
+            if let Some(error) = failure {
+                return Err(error);
+            }
+            if missing {
+                let result = self.cache_dict_block(
+                    &mut self.block_cache.lock(),
+                    first.offset as usize,
+                    &bytes,
+                );
+                self.memory.notify();
+                result?;
+            }
+        }
+        check_read_cancelled()?;
+        Ok(())
+    }
+
+    fn eval_query(&self, query: &VixQuery, scope: Option<&[u16]>) -> Result<BooleanBuffer> {
         check_read_cancelled()?;
         let len = self.row_count as usize;
         if !self.index_enabled && !matches!(query, VixQuery::All) {
-            // insurance (#40): the routing layers keep conditions away from
-            // index-off files; a slipped call degrades safely — per-file
-            // eval errors leave the file on the scan branch, filter intact
             return Err(VixError::UnsupportedFormat(
                 "condition eval on a file opened without an index sidecar".to_string(),
             ));
         }
         match query {
+            VixQuery::FullText { fields, query } => {
+                let fields = self.fulltext_scope(fields)?;
+                self.eval_query(query, Some(&fields.value))
+            }
             VixQuery::All => Ok(BooleanBuffer::new_set(len)),
-            VixQuery::And(subs) => self.eval_and(subs),
+            VixQuery::And(subs) => self.eval_and(subs, scope),
             VixQuery::Or(subs) => {
                 let mut acc = BooleanBuffer::new_unset(len);
-                for sub in subs {
-                    acc = &acc | &self.eval_query(sub)?;
+                let mut next = 0;
+                while next < subs.len() {
+                    check_read_cancelled()?;
+                    let end = Self::point_run_end(subs, next, true)?;
+                    if end > next {
+                        let resolved = self.resolve_point_run(&subs[next..end], scope)?;
+                        for ordinals in resolved.value {
+                            acc = &acc | &self.postings_union(ordinals.value)?;
+                        }
+                        next = end;
+                    } else {
+                        acc = &acc | &self.eval_query(&subs[next], scope)?;
+                        next += 1;
+                    }
                 }
                 Ok(acc)
             }
-            VixQuery::Not(sub) => Ok(!&self.eval_query(sub)?),
+            VixQuery::Not(sub) => Ok(!&self.eval_query(sub, scope)?),
             leaf => {
-                let ordinals = self.collect_ordinals(leaf)?;
-                self.postings_union(ordinals)
+                let ordinals = self.collect_ordinals(leaf, scope)?;
+                self.postings_union(ordinals.value)
             }
         }
     }
 
     /// Evaluate an AND with leaf short-circuiting.
     ///
-    /// Leaf children resolve their term ordinals through the in-memory FSTs
+    /// Leaf children resolve their term ordinals through the dictionary
     /// first — **zero postings IO**. If any leaf matches no term the
     /// intersection is provably empty and no postings are ever read (the
     /// dominant case for needle-in-haystack compounds: a per-file miss of the
@@ -3288,32 +3541,57 @@ impl VixReader {
     /// leaves evaluate rarest-first (fewest matched terms), AND-ing with an
     /// early exit as soon as the accumulator goes empty; composite children
     /// (`And`/`Or`/`Not`) evaluate last. An empty child list is `All`.
-    fn eval_and(&self, subs: &[VixQuery]) -> Result<BooleanBuffer> {
+    fn eval_and(&self, subs: &[VixQuery], scope: Option<&[u16]>) -> Result<BooleanBuffer> {
         let len = self.row_count as usize;
-        let mut leaves: Vec<Vec<u64>> = Vec::new();
-        let mut composites: Vec<&VixQuery> = Vec::new();
-        for sub in subs {
+        let mut leaves = self.query_vec::<Admitted<Vec<u64>>>(subs.len())?;
+        let mut composites = self.query_vec::<&VixQuery>(subs.len())?;
+        let mut next = 0;
+        while next < subs.len() {
             check_read_cancelled()?;
-            match sub {
-                // AND identity: contributes nothing
-                VixQuery::All => {}
-                VixQuery::And(_) | VixQuery::Or(_) | VixQuery::Not(_) => composites.push(sub),
-                leaf => {
-                    let ordinals = self.collect_ordinals(leaf)?;
-                    if ordinals.is_empty() {
-                        // this leaf matches no document: the AND is empty
+            // Only adjacent active token leaves share planning. In particular,
+            // never prefetch through a narrow predicate or a boolean boundary.
+            let end = Self::point_run_end(subs, next, false)?;
+            if end > next {
+                let resolved = self.resolve_point_run(&subs[next..end], scope)?;
+                for ordinals in resolved.value {
+                    if ordinals.value.is_empty() {
                         return Ok(BooleanBuffer::new_unset(len));
                     }
-                    leaves.push(ordinals);
+                    leaves.value.push(ordinals);
+                }
+                next = end;
+                continue;
+            }
+            match &subs[next] {
+                VixQuery::All => {}
+                sub @ (VixQuery::And(_)
+                | VixQuery::Or(_)
+                | VixQuery::Not(_)
+                | VixQuery::FullText { .. }) => composites.value.push(sub),
+                leaf => {
+                    let ordinals = self.collect_ordinals(leaf, scope)?;
+                    if ordinals.value.is_empty() {
+                        return Ok(BooleanBuffer::new_unset(len));
+                    }
+                    leaves.value.push(ordinals);
                 }
             }
+            next += 1;
         }
         // fewest matched terms first: the cheapest selectivity proxy that
         // needs no doc_count reads (needles resolve to a single term)
-        leaves.sort_by_key(Vec::len);
+        {
+            let _pending = self.memory.reserve(
+                leaves
+                    .value
+                    .len()
+                    .saturating_mul(std::mem::size_of::<Admitted<Vec<u64>>>()),
+            )?;
+            leaves.value.sort_by_key(|ordinals| ordinals.value.len());
+        }
         let mut acc: Option<BooleanBuffer> = None;
-        for ordinals in leaves {
-            let bitmap = self.postings_union(ordinals)?;
+        for ordinals in leaves.value {
+            let bitmap = self.postings_union(ordinals.value)?;
             let next = match &acc {
                 Some(prev) => prev & &bitmap,
                 None => bitmap,
@@ -3323,8 +3601,8 @@ impl VixReader {
             }
             acc = Some(next);
         }
-        for sub in composites {
-            let bitmap = self.eval_query(sub)?;
+        for sub in composites.value {
+            let bitmap = self.eval_query(sub, scope)?;
             let next = match &acc {
                 Some(prev) => prev & &bitmap,
                 None => bitmap,
@@ -3337,36 +3615,41 @@ impl VixReader {
         Ok(acc.unwrap_or_else(|| BooleanBuffer::new_set(len)))
     }
 
-    fn count_inner(&self, query: &VixQuery) -> Result<u64> {
+    fn count_inner(&self, query: &VixQuery, scope: Option<&[u16]>) -> Result<u64> {
+        check_read_cancelled()?;
         if !self.index_enabled && !matches!(query, VixQuery::All) {
             return Err(VixError::UnsupportedFormat(
                 "condition count on a file opened without an index sidecar".to_string(),
             ));
         }
         match query {
+            VixQuery::FullText { fields, query } => {
+                let fields = self.fulltext_scope(fields)?;
+                self.count_inner(query, Some(&fields.value))
+            }
             VixQuery::All => Ok(self.row_count),
             VixQuery::Or(subs) => match self.count_exact_in(subs)? {
                 Some(count) => Ok(count),
-                None => Ok(self.eval_query(query)?.count_set_bits() as u64),
+                None => Ok(self.eval_query(query, scope)?.count_set_bits() as u64),
             },
             VixQuery::And(_) | VixQuery::Not(_) => {
-                Ok(self.eval_query(query)?.count_set_bits() as u64)
+                Ok(self.eval_query(query, scope)?.count_set_bits() as u64)
             }
-            // any leaf: resolve its term ordinals (FST-only); a single
+            // Any leaf: resolve its dictionary ordinals; a single
             // matched term is counted straight from the `doc_count` column
             // (exact — one term's postings hold distinct docs), multiple
             // terms may share documents and need the postings union
             leaf => {
-                let mut ordinals = self.collect_ordinals(leaf)?;
-                match ordinals.len() {
+                let mut ordinals = self.collect_ordinals(leaf, scope)?;
+                match ordinals.value.len() {
                     0 => Ok(0),
-                    1 => self.read_doc_count(ordinals.pop().expect("one ordinal")),
+                    1 => self.read_doc_count(ordinals.value.pop().expect("one ordinal")),
                     // Only writer-certified raw-value fields can be summed:
                     // legacy source-driven files may contain duplicate keys.
                     _ if self.leaf_term_docs_are_disjoint(leaf) => {
-                        self.sum_disjoint_doc_counts(&ordinals)
+                        self.sum_disjoint_doc_counts(&ordinals.value)
                     }
-                    _ => Ok(self.postings_union(ordinals)?.count_set_bits() as u64),
+                    _ => Ok(self.postings_union(ordinals.value)?.count_set_bits() as u64),
                 }
             }
         }
@@ -3386,21 +3669,22 @@ impl VixReader {
         {
             return Ok(None);
         }
-        let mut ordinals = Vec::with_capacity(subs.len());
-        for sub in subs {
+        let resolved = self.resolve_point_run(subs, None)?;
+        let mut ordinals = self.query_vec::<u64>(subs.len())?;
+        for leaf in resolved.value {
             check_read_cancelled()?;
-            ordinals.extend(self.collect_ordinals(sub)?);
+            ordinals.value.extend(leaf.value);
         }
-        ordinals.sort_unstable();
-        ordinals.dedup();
-        let count = match ordinals.as_slice() {
+        ordinals.value.sort_unstable();
+        ordinals.value.dedup();
+        let count = match ordinals.value.as_slice() {
             [] => 0,
             _ if !self.partial_fields.contains(field)
                 && self.leaf_term_docs_are_disjoint(&subs[0]) =>
             {
-                self.sum_disjoint_doc_counts(&ordinals)?
+                self.sum_disjoint_doc_counts(&ordinals.value)?
             }
-            _ => self.postings_union(ordinals)?.count_set_bits() as u64,
+            _ => self.postings_union(ordinals.value)?.count_set_bits() as u64,
         };
         Ok(Some(count))
     }
@@ -3439,51 +3723,66 @@ impl VixReader {
     }
 
     /// Resolve a leaf query to the global ordinals of its matching terms.
-    fn collect_ordinals(&self, query: &VixQuery) -> Result<Vec<u64>> {
+    fn collect_ordinals(
+        &self,
+        query: &VixQuery,
+        scope: Option<&[u16]>,
+    ) -> Result<Admitted<Vec<u64>>> {
+        check_read_cancelled()?;
+        match query {
+            VixQuery::Exact { field, token } => {
+                let fid = self.require_field_id(field)?;
+                let mut result = self.resolve_points(&[token], &[fid], false)?;
+                return Ok(result.value.pop().expect("one point leaf"));
+            }
+            VixQuery::KeyExists { path } => {
+                let mut result = self.resolve_points(&[path.as_bytes()], &[KEY_FIELD_ID], false)?;
+                return Ok(result.value.pop().expect("one point leaf"));
+            }
+            VixQuery::TokenAnyField { token } => {
+                let mut result = self.resolve_points(
+                    &[token],
+                    scope.unwrap_or(&self.indexed_field_ids),
+                    scope.is_none(),
+                )?;
+                return Ok(result.value.pop().expect("one point leaf"));
+            }
+            _ => {}
+        }
         match query {
             // the provably-empty query: a leaf matching no term, so `eval`
             // yields the all-zeros bitmap, `count` yields 0, and the AND
             // evaluator short-circuits on it like on any missing needle
-            VixQuery::Nothing => Ok(Vec::new()),
-            VixQuery::Exact { field, token } => {
-                let field_id = self.require_field_id(field)?;
-                let key = self.composite(token, field_id);
-                Ok(self.lookup_exact(&key)?.into_iter().collect())
-            }
-            VixQuery::KeyExists { path } => {
-                let key = self.composite(path.as_bytes(), KEY_FIELD_ID);
-                Ok(self.lookup_exact(&key)?.into_iter().collect())
-            }
-            // field-major: one exact seek per indexed field (key terms
-            // excluded by construction — KEY_FIELD_ID is not in the set)
-            VixQuery::TokenAnyField { token } => {
-                let mut ordinals = Vec::new();
-                for &fid in &self.indexed_field_ids {
-                    if let Some(ordinal) = self.lookup_exact(&self.composite(token, fid))? {
-                        ordinals.push(ordinal);
-                    }
-                }
-                Ok(ordinals)
-            }
+            VixQuery::Nothing => self.query_vec(0),
+            VixQuery::Exact { .. }
+            | VixQuery::KeyExists { .. }
+            | VixQuery::TokenAnyField { .. } => unreachable!("points resolved above"),
             // field-major: per-field contiguous ranges (one range when the
             // field is known)
             VixQuery::Prefix { field, prefix } => {
                 let field_filter = self.optional_field_id(field)?;
-                let mut ordinals = Vec::new();
-                let fids: Vec<u16> = match field_filter {
-                    Some(fid) => vec![fid],
-                    None => self.indexed_field_ids.clone(),
-                };
-                for fid in fids {
+                let mut ordinals = self.query_vec(0)?;
+                let named = field_filter.map(|fid| [fid]);
+                let fids = named
+                    .as_ref()
+                    .map(|fids| fids.as_slice())
+                    .unwrap_or_else(|| scope.unwrap_or(&self.indexed_field_ids));
+                for &fid in fids {
+                    check_read_cancelled()?;
                     let (lower, upper) = Self::v2_prefix_range(fid, prefix);
+                    let mut failure = None;
                     self.scan_key_range(&lower, Some((&upper, false)), |key, ordinal| {
                         if let Some((token, _)) = split_key(key)
                             && token.starts_with(prefix)
+                            && let Err(error) = ordinals.push(ordinal)
                         {
-                            ordinals.push(ordinal);
+                            failure = Some(error);
                         }
-                        true
+                        failure.is_none()
                     })?;
+                    if let Some(error) = failure {
+                        return Err(error);
+                    }
                 }
                 Ok(ordinals)
             }
@@ -3502,7 +3801,7 @@ impl VixReader {
                     // ASCII tokens (the norm) lowercase into the buffer;
                     // Unicode tokens keep the exact old fold semantics.
                     let mut lowered: Vec<u8> = Vec::new();
-                    self.scan_all_tokens(field_filter, |token| {
+                    self.scan_all_tokens(field_filter, scope, |token| {
                         if token.is_ascii() {
                             lowered.clear();
                             lowered.extend(token.iter().map(|b| b.to_ascii_lowercase()));
@@ -3517,14 +3816,16 @@ impl VixReader {
                     // one SIMD searcher for the whole scan, not a fresh
                     // scalar windows() pass per key
                     let finder = memchr::memmem::Finder::new(needle.as_slice());
-                    self.scan_all_tokens(field_filter, |token| finder.find(token).is_some())
+                    self.scan_all_tokens(field_filter, scope, |token| finder.find(token).is_some())
                 }
             }
             VixQuery::Regex { field, pattern } => {
                 let field_filter = self.optional_field_id(field)?;
                 let regex = Regex::new(pattern)
                     .map_err(|e| VixError::InvalidQuery(format!("regex {pattern:?}: {e}")))?;
-                self.scan_all_tokens(field_filter, |token| automaton_matches(&regex, token))
+                self.scan_all_tokens(field_filter, scope, |token| {
+                    automaton_matches(&regex, token)
+                })
             }
             VixQuery::Fuzzy { token, distance } => {
                 if *distance > 2 {
@@ -3535,13 +3836,17 @@ impl VixReader {
                 // transposition_cost_one = false mirrors the tantivy
                 // FuzzyTermQuery usage this replaces.
                 let dfa = LevenshteinAutomatonBuilder::new(*distance, false).build_dfa(token);
-                self.scan_all_tokens(None, |token| matches!(dfa.eval(token), Distance::Exact(_)))
+                self.scan_all_tokens(None, scope, |token| {
+                    matches!(dfa.eval(token), Distance::Exact(_))
+                })
             }
-            VixQuery::All | VixQuery::And(_) | VixQuery::Or(_) | VixQuery::Not(_) => {
-                Err(VixError::InvalidQuery(
-                    "internal: composite query treated as a term leaf".to_string(),
-                ))
-            }
+            VixQuery::All
+            | VixQuery::And(_)
+            | VixQuery::Or(_)
+            | VixQuery::Not(_)
+            | VixQuery::FullText { .. } => Err(VixError::InvalidQuery(
+                "internal: composite query treated as a term leaf".to_string(),
+            )),
         }
     }
 
@@ -3592,9 +3897,8 @@ impl VixReader {
         (lower, upper)
     }
 
-    /// Point lookup of one composite key via the row-group directory: the
-    /// directory prunes to at most ONE row group, whose FST is loaded on
-    /// first touch.
+    /// Resolve one composite key through its field directory and candidate
+    /// encoded block, without touching unrelated fields.
     fn lookup_exact(&self, key: &[u8]) -> Result<Option<u64>> {
         if self.term_count == 0 {
             return Ok(None);
@@ -3995,38 +4299,46 @@ impl VixReader {
         Ok(Some(keys))
     }
 
-    /// Walk every FST key, apply `matches` to the token part (keys without a
-    /// valid composite suffix — key terms, and TAGGED numeric/bool value
-    /// terms — are skipped) and collect matching ordinals. The tagged terms
+    /// Walk dictionary keys, apply `matches` to the token part, and collect
+    /// ordinals. Key markers and tagged numeric/bool terms are skipped.
+    /// The tagged terms
     /// are excluded because every caller is a string-shaped scan
     /// (`Contains`/`Regex`/`Fuzzy` over raw values and fts tokens): a
     /// substring/pattern hit inside a canonical number text is not a string
     /// match (the scan-side `json_get_str` projection maps those rows to
     /// NULL). Numeric probes are exact lookups built via
     /// [`crate::numeric::numeric_value_token`] and never come through here.
-    /// Whole-dictionary walk: every missing FST cell is batch-loaded first.
+    /// Explicit scopes walk only the selected field ranges.
     fn scan_all_tokens(
         &self,
         field_filter: Option<u16>,
+        scope: Option<&[u16]>,
         mut matches: impl FnMut(&[u8]) -> bool,
-    ) -> Result<Vec<u64>> {
-        // a known field: walk only that field's contiguous key range
-        // instead of the whole dictionary (field-major keys cluster by fid)
-        if let Some(fid) = field_filter {
-            let (lower, upper) = Self::v2_field_range(fid);
-            let mut ordinals = Vec::new();
-            self.scan_key_range(&lower, Some((&upper, false)), |key, ordinal| {
-                if let Some((token, _)) = split_key(key)
-                    && !is_numeric_value_token(token)
-                    && matches(token)
-                {
-                    ordinals.push(ordinal);
+    ) -> Result<Admitted<Vec<u64>>> {
+        let mut ordinals = self.query_vec(0)?;
+        let named = field_filter.map(|fid| [fid]);
+        if let Some(fields) = named.as_ref().map(|fids| fids.as_slice()).or(scope) {
+            for &fid in fields {
+                check_read_cancelled()?;
+                let (lower, upper) = Self::v2_field_range(fid);
+                let mut failure = None;
+                self.scan_key_range(&lower, Some((&upper, false)), |key, ordinal| {
+                    if let Some((token, _)) = split_key(key)
+                        && !is_numeric_value_token(token)
+                        && matches(token)
+                        && let Err(error) = ordinals.push(ordinal)
+                    {
+                        failure = Some(error);
+                    }
+                    failure.is_none()
+                })?;
+                if let Some(error) = failure {
+                    return Err(error);
                 }
-                true
-            })?;
+            }
+            check_read_cancelled()?;
             return Ok(ordinals);
         }
-        let mut ordinals = Vec::new();
         if self.term_count == 0 {
             return Ok(ordinals);
         }
@@ -4038,17 +4350,23 @@ impl VixReader {
             let range = index.block_range(b, blob_len);
             let block = &all[range.start as usize..range.end as usize];
             let first_ordinal = index.meta(b).1;
+            let mut failure = None;
             crate::dict_blocks::block_scan(block, |pos, key| {
                 if let Some((token, field_id)) = split_key(key)
                     && field_id != KEY_FIELD_ID
                     && !is_numeric_value_token(token)
                     && matches(token)
+                    && let Err(error) = ordinals.push(first_ordinal + pos as u64)
                 {
-                    ordinals.push(first_ordinal + pos as u64);
+                    failure = Some(error);
                 }
-                true
+                failure.is_none()
             })?;
+            if let Some(error) = failure {
+                return Err(error);
+            }
         }
+        check_read_cancelled()?;
         Ok(ordinals)
     }
 

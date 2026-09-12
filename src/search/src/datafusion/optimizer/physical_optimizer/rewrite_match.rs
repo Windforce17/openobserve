@@ -441,16 +441,15 @@ impl TreeNodeRewriter for AddFstFieldsToProjection {
             parquet_projection.sort();
             parquet_projection.dedup();
 
-            // based on filter schema, create new filter projection
-            let mut filter_projection = self
+            // Restore the ordered output schema, including repeated column slots.
+            // Only the scan-input projection above is a set.
+            let filter_projection = self
                 .filter_schema
                 .fields()
                 .iter()
                 .map(|f| schema.index_of(f.name()).unwrap())
                 .filter_map(|i| parquet_projection.iter().position(|f| *f == i))
                 .collect::<Vec<_>>();
-            filter_projection.sort();
-            filter_projection.dedup();
             self.filter_projection = Some(filter_projection);
 
             // create new NewEmptyExec with new projection
@@ -479,7 +478,10 @@ impl TreeNodeRewriter for AddFstFieldsToProjection {
 mod tests {
     use std::sync::Arc;
 
-    use arrow::array::{Array, Int64Array, StringArray, StringViewArray};
+    use arrow::{
+        array::{Array, Int64Array, StringArray, StringViewArray},
+        compute::concat_batches,
+    };
     use arrow_schema::DataType;
     use config::get_config;
     use datafusion::{
@@ -489,31 +491,14 @@ mod tests {
         },
         assert_batches_eq,
         catalog::MemTable,
+        datasource::memory::MemorySourceConfig,
         execution::{runtime_env::RuntimeEnvBuilder, session_state::SessionStateBuilder},
+        physical_plan::{collect, projection::ProjectionExec},
         prelude::{SessionConfig, SessionContext},
     };
 
     use super::*;
     use crate::datafusion::{table_provider::empty_table::NewEmptyTable, udf::match_all_udf};
-
-    #[test]
-    fn test_rewrite_match_physical_new_name() {
-        let rule = RewriteMatchPhysical::new(vec![]);
-        assert_eq!(rule.name(), "RewriteMatchAllRule");
-    }
-
-    #[test]
-    fn test_rewrite_match_physical_schema_check() {
-        let rule = RewriteMatchPhysical::new(vec![]);
-        assert!(rule.schema_check());
-    }
-
-    #[test]
-    fn test_rewrite_match_physical_new_with_fields() {
-        let fields = vec![("col1".to_string(), DataType::Utf8)];
-        let rule = RewriteMatchPhysical::new(fields);
-        assert_eq!(rule.name(), "RewriteMatchAllRule");
-    }
 
     #[tokio::test]
     async fn test_rewrite_match_physical() {
@@ -615,66 +600,176 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_column_index_update_with_match_all_and_str_match() {
+    async fn case_projection_fixture() -> (
+        SessionContext,
+        RecordBatch,
+        Arc<dyn ExecutionPlan>,
+        Vec<(String, DataType)>,
+    ) {
+        let string_type = if get_config().common.utf8_view_enabled {
+            DataType::Utf8View
+        } else {
+            DataType::Utf8
+        };
+        let strings = |values: Vec<&str>| -> Arc<dyn Array> {
+            if string_type == DataType::Utf8View {
+                Arc::new(StringViewArray::from(values))
+            } else {
+                Arc::new(StringArray::from(values))
+            }
+        };
+        // The read schema puts body before container, unlike the SELECT list.
+        // Row 1 can match only through message, which is absent from SELECT.
+        // Widening inserts message before container, requiring the CASE
+        // predicate's container index to move as well as its output position.
         let schema = Arc::new(Schema::new(vec![
             Field::new("_timestamp", DataType::Int64, false),
-            Field::new("msg", DataType::Utf8, false),
-            Field::new("error", DataType::Utf8, false),
-            Field::new("message", DataType::Utf8, false),
+            Field::new("body", string_type.clone(), false),
+            Field::new("message", string_type.clone(), false),
+            Field::new("k8s.container.name", string_type.clone(), false),
         ]));
-
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
+                strings(vec![
+                    "message-only body",
+                    "stream duration is zero",
+                    "stream duration is zero",
+                    "unmatched body",
+                ]),
+                strings(vec![
+                    "stream duration is zero",
+                    "second message",
+                    "stream duration is zero",
+                    "no matching phrase",
+                ]),
+                strings(vec!["llm-router", "llm-router", "api-worker", "llm-router"]),
+            ],
+        )
+        .unwrap();
         let fields = vec![
-            ("error".to_string(), DataType::Utf8),
-            ("msg".to_string(), DataType::Utf8),
-            ("message".to_string(), DataType::Utf8),
+            ("body".to_string(), string_type.clone()),
+            ("message".to_string(), string_type),
         ];
-
-        let state = SessionStateBuilder::new()
-            .with_config(SessionConfig::new())
-            .with_runtime_env(Arc::new(RuntimeEnvBuilder::new().build().unwrap()))
-            .with_default_features()
-            .with_physical_optimizer_rules(vec![Arc::new(RewriteMatchPhysical::new(
-                fields.clone(),
-            ))])
-            .build();
-        let ctx = SessionContext::new_with_state(state);
-        let provider = NewEmptyTable::new("t", schema).with_partitions(8);
-        ctx.register_table("t", Arc::new(provider)).unwrap();
+        // Keep the normal physical optimizer, including projection pushdown.
+        // RewriteMatchPhysical runs afterwards, before scan materialization.
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::new(NewEmptyTable::new("t", schema)))
+            .unwrap();
         ctx.register_udf(match_all_udf::MATCH_ALL_UDF.clone());
-        ctx.register_udf(crate::datafusion::udf::str_match_udf::STR_MATCH_UDF.clone());
+        let plan = ctx
+            .sql(
+                r#"SELECT _timestamp, "k8s.container.name", body
+                   FROM t
+                   WHERE CASE
+                       WHEN ("k8s.container.name" = 'llm-router'
+                             AND match_all('stream duration is zero'))
+                       THEN TRUE ELSE FALSE END"#,
+            )
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        (ctx, batch, plan, fields)
+    }
 
-        let sql =
-            "select count(*) from t where match_all('test') and str_match(message, 'success')";
-        let plan = ctx.state().create_logical_plan(sql).await.unwrap();
-        let physical_plan = ctx.state().create_physical_plan(&plan).await.unwrap();
+    async fn collect_rewritten_case(
+        ctx: &SessionContext,
+        batch: &RecordBatch,
+        plan: Arc<dyn ExecutionPlan>,
+        fields: Vec<(String, DataType)>,
+    ) -> Vec<RecordBatch> {
+        let plan = RewriteMatchPhysical::new(fields)
+            .optimize(plan, &ConfigOptions::default())
+            .unwrap();
+        // Materialize only after rewriting: a MemTable at planning time would
+        // bypass the NewEmptyExec branch that widens the input for FTS fields.
+        let plan = plan
+            .transform_up(|plan| {
+                if let Some(scan) = plan.downcast_ref::<NewEmptyExec>() {
+                    let input = MemorySourceConfig::try_new_exec(
+                        &[vec![batch.clone()]],
+                        scan.full_schema(),
+                        scan.projection().cloned(),
+                    )?;
+                    Ok(Transformed::yes(input as Arc<dyn ExecutionPlan>))
+                } else {
+                    Ok(Transformed::no(plan))
+                }
+            })
+            .unwrap()
+            .data;
+        collect(plan, ctx.task_ctx()).await.unwrap()
+    }
 
-        // Verify that all column indices in FilterExec match the input schema
-        let _ = physical_plan.apply(&mut |node: &Arc<dyn ExecutionPlan>| -> Result<TreeNodeRecursion> {
-            if let Some(filter) = node.downcast_ref::<FilterExec>() {
-                let input_schema = filter.input().schema();
-                let predicate = filter.predicate();
+    #[tokio::test]
+    async fn test_rewrite_match_case_preserves_output_order() {
+        let (ctx, batch, plan, fields) = case_projection_fixture().await;
+        let data = collect_rewritten_case(&ctx, &batch, plan, fields).await;
+        // Exact named values and row selection, not just the output schema:
+        // message-only matching must retain row 1; rows 3 and 4 must be absent.
+        let expected = batch.slice(0, 2).project(&[0, 3, 1]).unwrap();
+        assert_eq!(data[0].schema(), expected.schema());
+        assert_eq!(concat_batches(&expected.schema(), &data).unwrap(), expected);
+    }
 
-                // Traverse the predicate expression tree to find all Column references
-                let _ = predicate.apply(&mut |expr: &Arc<dyn PhysicalExpr>| -> Result<TreeNodeRecursion> {
-                    if let Some(column) = expr.downcast_ref::<Column>() {
-                        let column_name = column.name();
-                        let column_index = column.index();
-
-                        // Find the expected index in the input schema
-                        match input_schema.index_of(column_name) {
-                            Ok(expected_index) => {
-                                if column_index != expected_index {
-                                   panic!("Column '{column_name}' has index {column_index} in filter predicate but should be {expected_index} according to input schema");
-                                }
-                            }
-                            Err(_) => panic!("Column '{column_name}' with index {column_index} not found in input schema"),
-                        }
-                    }
-                    Ok(TreeNodeRecursion::Continue)
-                });
+    #[tokio::test]
+    async fn test_rewrite_match_case_preserves_repeated_output_slots() {
+        let (ctx, batch, plan, fields) = case_projection_fixture().await;
+        let mut case_filter = None;
+        plan.apply(|node| {
+            if let Some(filter) = node.downcast_ref::<FilterExec>()
+                && has_match_all_function(filter.predicate())
+            {
+                case_filter = Some((filter.predicate().clone(), filter.input().clone()));
+                return Ok(TreeNodeRecursion::Stop);
             }
             Ok(TreeNodeRecursion::Continue)
-        });
+        })
+        .unwrap();
+        let (predicate, input) = case_filter.expect("planned CASE filter");
+        let input_schema = input.schema();
+        let timestamp = input_schema.index_of("_timestamp").unwrap();
+        let body = input_schema.index_of("body").unwrap();
+        let container = input_schema.index_of("k8s.container.name").unwrap();
+        // SQL projection optimization can share a repeated SELECT expression.
+        // FilterExec also legally supports repeated output positions, consumed
+        // by positional parents. Build that equivalent duplicate-selection
+        // plan explicitly so deduplication cannot be masked by the optimizer.
+        // Slots are already in read order, isolating dedup from the swap bug.
+        let filter = Arc::new(
+            FilterExecBuilder::new(predicate, input)
+                .apply_projection(Some(vec![timestamp, body, container, container]))
+                .unwrap()
+                .build()
+                .unwrap(),
+        );
+        let expressions: Vec<(Arc<dyn PhysicalExpr>, String)> = vec![
+            (Arc::new(Column::new("_timestamp", 0)), "_timestamp".into()),
+            (Arc::new(Column::new("body", 1)), "body".into()),
+            (
+                Arc::new(Column::new("k8s.container.name", 2)),
+                "first_container".into(),
+            ),
+            (
+                Arc::new(Column::new("k8s.container.name", 3)),
+                "second_container".into(),
+            ),
+        ];
+        let plan = Arc::new(ProjectionExec::try_new(expressions, filter).unwrap());
+        let expected_schema = plan.schema();
+        let expected = RecordBatch::try_new(
+            expected_schema.clone(),
+            [0, 1, 3, 3]
+                .into_iter()
+                .map(|index| batch.column(index).slice(0, 2))
+                .collect(),
+        )
+        .unwrap();
+        let data = collect_rewritten_case(&ctx, &batch, plan, fields).await;
+        assert_eq!(data[0].schema(), expected_schema);
+        assert_eq!(concat_batches(&expected_schema, &data).unwrap(), expected);
     }
 }

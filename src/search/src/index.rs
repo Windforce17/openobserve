@@ -239,37 +239,20 @@ impl IndexCondition {
         }
     }
 
-    /// Whether the condition consults fts TOKENS of a partial field — the
-    /// only remaining WHOLE-FILE partial bail (#32).
-    ///
-    /// match_all/fuzzy conditions have no named-field granularity: they
-    /// probe fts tokens across fields, so a partial fts field (tokens
-    /// genuinely missing: field-id overflow, unindexable type drift, or a
-    /// pre-token-fix build — never oversize values, tokens are
-    /// length-independent) can silently hide matches and the file must
-    /// scan.
-    ///
-    /// Every NAMED-FIELD condition now handles partiality at CONJUNCT
-    /// granularity instead (#32): value-term lookups skip their conjunct
-    /// via [`FieldCap::Partial`] (superset-safe under the top-level AND
-    /// with the filter re-applied), and `IS [NOT] NULL` evaluates EXACTLY —
-    /// key terms are emitted under every partial cause (oversize value
-    /// path, the field-id-overflow path states it verbatim: "Their key
-    /// terms are still emitted", and the type-drift path — pinned by
-    /// writer tests). The prod incident this fixes: a 3-conjunct AND with
-    /// one `IS NULL` on a partial field spent 122-167s/follower opening
-    /// ~1531 files only to bail every one, while the other two conjuncts
-    /// were a 0.01% index needle.
-    pub fn uses_partial_fields(
-        &self,
-        partial_fields: &std::collections::HashSet<String>,
-        fts_fields: &std::collections::HashSet<String>,
-    ) -> bool {
-        !partial_fields.is_empty()
-            && self
-                .conditions
-                .iter()
-                .any(|condition| condition.uses_partial_fields(partial_fields, fts_fields))
+    /// Whether evaluation needs the query's active full-text field scope.
+    pub fn uses_full_text(&self) -> bool {
+        fn uses_full_text(condition: &Condition) -> bool {
+            match condition {
+                Condition::MatchAll(value) => !(value.is_empty() || value == "*"),
+                Condition::FuzzyMatchAll(value, _) => !value.is_empty(),
+                Condition::And(left, right) | Condition::Or(left, right) => {
+                    uses_full_text(left) || uses_full_text(right)
+                }
+                Condition::Not(inner) => uses_full_text(inner),
+                _ => false,
+            }
+        }
+        self.conditions.iter().any(uses_full_text)
     }
 
     // get the fields use for search in datafusion(for add filter back logical)
@@ -884,46 +867,6 @@ impl Condition {
                 left.never_false_when_null(null_fields) || right.never_false_when_null(null_fields)
             }
             Condition::Not(inner) => inner.never_true_when_null(null_fields),
-        }
-    }
-
-    /// Whether evaluating this condition would consult a field with skipped
-    /// terms. Any-field conditions (match_all/fuzzy) consult fts TOKENS
-    /// only, so they are tainted exactly by partial fields that are
-    /// fts-marked in this file — a partial mark on a non-fts field (an
-    /// oversize raw value elsewhere in the schema) cannot hide a token.
-    pub fn uses_partial_fields(
-        &self,
-        partial_fields: &std::collections::HashSet<String>,
-        fts_fields: &std::collections::HashSet<String>,
-    ) -> bool {
-        match self {
-            // #32: named-field value-term conditions no longer force the
-            // whole file to a scan — [`FieldCap::Partial`] skips just their
-            // conjunct in `to_vix_query` (superset + re-applied filter)
-            Condition::Equal(..)
-            | Condition::NotEqual(..)
-            | Condition::In(..)
-            | Condition::NumericCmp(..)
-            | Condition::Regex(..)
-            | Condition::StrMatch(..) => false,
-            // #32: IS [NOT] NULL consult only KEY terms, which the writer
-            // emits under every partial cause — they evaluate EXACTLY on
-            // partial files (invariant pinned by writer tests)
-            Condition::IsNotNull(_) | Condition::IsNull(_) => false,
-            Condition::MatchAll(value) => {
-                !(value.is_empty() || value == "*")
-                    && partial_fields.iter().any(|f| fts_fields.contains(f))
-            }
-            Condition::FuzzyMatchAll(value, _) => {
-                !value.is_empty() && partial_fields.iter().any(|f| fts_fields.contains(f))
-            }
-            Condition::All() => false,
-            Condition::Or(left, right) | Condition::And(left, right) => {
-                left.uses_partial_fields(partial_fields, fts_fields)
-                    || right.uses_partial_fields(partial_fields, fts_fields)
-            }
-            Condition::Not(condition) => condition.uses_partial_fields(partial_fields, fts_fields),
         }
     }
 
@@ -1871,97 +1814,6 @@ mod tests {
         assert_eq!(condition.to_query(), "NOT(field1=value1)");
     }
 
-    fn partial(fields: &[&str]) -> std::collections::HashSet<String> {
-        fields.iter().map(|f| f.to_string()).collect()
-    }
-
-    #[test]
-    fn test_uses_partial_fields_field_conditions() {
-        // #32: named-field conditions no longer force the WHOLE FILE to a
-        // scan — partiality is handled per conjunct via FieldCap::Partial
-        // (value-term lookups skip their conjunct; IS [NOT] NULL evaluates
-        // exactly via key terms). uses_partial_fields keeps only the
-        // match_all token taint.
-        let partial_fields = partial(&["log"]);
-        let no_fts = partial(&[]);
-        assert!(
-            !Condition::Equal("log".to_string(), "v".to_string())
-                .uses_partial_fields(&partial_fields, &no_fts)
-        );
-        assert!(
-            !Condition::StrMatch("log".to_string(), "v".to_string(), true)
-                .uses_partial_fields(&partial_fields, &no_fts)
-        );
-        assert!(
-            !Condition::Not(Box::new(Condition::In(
-                "log".to_string(),
-                vec!["v".to_string()],
-                false
-            )))
-            .uses_partial_fields(&partial_fields, &no_fts)
-        );
-        assert!(
-            !Condition::IsNull("log".to_string()).uses_partial_fields(&partial_fields, &no_fts)
-        );
-        assert!(
-            !Condition::IsNotNull("log".to_string()).uses_partial_fields(&partial_fields, &no_fts)
-        );
-    }
-
-    #[test]
-    fn test_uses_partial_fields_any_field_conditions() {
-        // match_all/fuzzy consult fts TOKENS: only a partial field that is
-        // fts-marked in the file can hide a token. "log" partial + fts:
-        let partial_fields = partial(&["log"]);
-        let fts = partial(&["log", "body"]);
-        assert!(Condition::MatchAll("err".to_string()).uses_partial_fields(&partial_fields, &fts));
-        assert!(
-            Condition::FuzzyMatchAll("err".to_string(), 1)
-                .uses_partial_fields(&partial_fields, &fts)
-        );
-        // trivially-true match_all never touches the term index
-        assert!(!Condition::MatchAll("*".to_string()).uses_partial_fields(&partial_fields, &fts));
-        assert!(!Condition::MatchAll(String::new()).uses_partial_fields(&partial_fields, &fts));
-        assert!(!Condition::All().uses_partial_fields(&partial_fields, &fts));
-
-        // a partial NON-fts field (oversize raw value elsewhere) cannot
-        // taint token queries — the .13-era 5.2s match_all regression:
-        // one such file forced a full row-store scan on every query
-        let non_fts_partial = partial(&["params.payload"]);
-        assert!(
-            !Condition::MatchAll("err".to_string()).uses_partial_fields(&non_fts_partial, &fts)
-        );
-        assert!(
-            !Condition::FuzzyMatchAll("err".to_string(), 1)
-                .uses_partial_fields(&non_fts_partial, &fts)
-        );
-        // value lookups no longer fall back WHOLE-FILE either (#32): they
-        // skip their conjunct via FieldCap::Partial
-        assert!(
-            !Condition::Equal("params.payload".to_string(), "v".to_string())
-                .uses_partial_fields(&non_fts_partial, &fts)
-        );
-    }
-
-    #[test]
-    fn test_index_condition_uses_partial_fields() {
-        // the whole-file taint survives only through match_all over a
-        // partial fts field (#32)
-        let mut index_condition = IndexCondition::new();
-        index_condition.add_condition(Condition::MatchAll("err".to_string()));
-
-        let fts = partial(&["log"]);
-        assert!(index_condition.uses_partial_fields(&partial(&["log"]), &fts));
-        assert!(!index_condition.uses_partial_fields(&partial(&["level"]), &fts));
-        // empty partial set: nothing to taint
-        assert!(!index_condition.uses_partial_fields(&partial(&[]), &fts));
-
-        // named-field conditions never whole-file taint
-        let mut named = IndexCondition::new();
-        named.add_condition(Condition::Equal("log".to_string(), "v".to_string()));
-        assert!(!named.uses_partial_fields(&partial(&["log"]), &fts));
-    }
-
     #[test]
     fn test_condition_can_remove_filter_equal() {
         let condition = Condition::Equal("field1".to_string(), "value1".to_string());
@@ -2836,10 +2688,6 @@ mod tests {
         // field bookkeeping matches the other per-field comparisons
         assert!(positive.term_index_fields().contains("code"));
         assert!(positive.get_schema_fields(&[]).contains("code"));
-        // #32: NumericCmp on a partial field skips at conjunct granularity
-        // (FieldCap::Partial), not whole-file
-        let partial: std::collections::HashSet<String> = ["code".to_string()].into_iter().collect();
-        assert!(!positive.uses_partial_fields(&partial, &Default::default()));
     }
 
     #[test]

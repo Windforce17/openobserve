@@ -14,12 +14,8 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::collections::HashSet;
-#[cfg(test)]
-use std::sync::LazyLock;
 
 use config::{get_config, is_local_disk_storage, meta::search::ScanStats};
-#[cfg(test)]
-use hashbrown::HashMap;
 use infra::cache::{file_data, file_downloader};
 
 /// Whether cache misses should try bounded, independently owned cache fills.
@@ -41,20 +37,58 @@ impl CacheMissPolicy {
     }
 }
 
-#[cfg(test)]
-static CACHE_MISS_POLICIES: LazyLock<parking_lot::Mutex<HashMap<String, CacheMissPolicy>>> =
-    LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
-
-#[cfg(test)]
-pub(crate) fn take_cache_miss_policy(trace_id: &str) -> Option<CacheMissPolicy> {
-    CACHE_MISS_POLICIES.lock().remove(trace_id)
-}
-
 /// Linear interpolation: cached_ratio=0 -> query_thread_num, cached_ratio=1 -> cpu_num.
 pub fn calc_target_partitions(cpu_num: usize, query_thread_num: usize, cached_ratio: f64) -> usize {
     (cpu_num as i64
         + ((query_thread_num as i64 - cpu_num as i64) as f64 * (1.0 - cached_ratio)) as i64)
         as usize
+}
+
+/// Select admission from the original cohort size, not each surviving file's
+/// size. Late sidecar warming must not evade the existing query-size gates.
+pub(crate) fn warm_cache_type(compressed_size: i64) -> file_data::CacheType {
+    let cfg = get_config();
+    if cfg.memory_cache.enabled && compressed_size < cfg.memory_cache.skip_size as i64 {
+        file_data::CacheType::Memory
+    } else if !is_local_disk_storage()
+        && cfg.disk_cache.enabled
+        && compressed_size < cfg.disk_cache.skip_size as i64
+    {
+        file_data::CacheType::Disk
+    } else {
+        file_data::CacheType::None
+    }
+}
+
+/// Admit only a sidecar the chosen foreground path actually used. The downloader
+/// retains its count/byte/dedup/age/size gates and independent admitted ownership.
+pub(crate) async fn warm_used_sidecar(
+    trace_id: &str,
+    file: &config::meta::stream::FileKey,
+    cache_type: file_data::CacheType,
+) {
+    if cache_type == file_data::CacheType::None
+        || file.meta.index_size <= 0
+        || !file_downloader::should_download(file.meta.records)
+    {
+        return;
+    }
+    let Some(key) = config::vix_sidecar_key(&file.key, file.meta.index_generation) else {
+        return;
+    };
+    let outcome = file_downloader::queue_download(
+        trace_id,
+        file.id,
+        &file.account,
+        &key,
+        file.meta.index_size,
+        file.meta.max_ts,
+        cache_type,
+    )
+    .await;
+    log::debug!(
+        "[trace_id {trace_id}] search->vix: used sidecar warm admission file={key} outcome={outcome:?}"
+    );
 }
 
 #[tracing::instrument(name = "service:search:grpc:storage:cache_files", skip_all)]
@@ -81,11 +115,6 @@ pub(crate) async fn cache_files_with_policy(
     file_type: &str,
     miss_policy: CacheMissPolicy,
 ) -> (file_data::CacheType, u64, u64) {
-    #[cfg(test)]
-    CACHE_MISS_POLICIES
-        .lock()
-        .insert(trace_id.to_string(), miss_policy);
-
     let mut cached_files = HashSet::with_capacity(files.len());
     let (mut cache_hits, mut cache_misses) = (0, 0);
 
@@ -145,17 +174,8 @@ pub(crate) async fn cache_files_with_policy(
         return (file_data::CacheType::Disk, cache_hits, cache_misses);
     }
 
-    let cfg = get_config();
-    let cache_type = if cfg.memory_cache.enabled
-        && scan_stats.compressed_size < cfg.memory_cache.skip_size as i64
-    {
-        file_data::CacheType::Memory
-    } else if !is_local_disk_storage()
-        && cfg.disk_cache.enabled
-        && scan_stats.compressed_size < cfg.disk_cache.skip_size as i64
-    {
-        file_data::CacheType::Disk
-    } else {
+    let cache_type = warm_cache_type(scan_stats.compressed_size);
+    if cache_type == file_data::CacheType::None {
         return (file_data::CacheType::None, cache_hits, cache_misses);
     };
 

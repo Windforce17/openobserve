@@ -195,6 +195,7 @@ fn positive_in_single_bucket_uses_counts_without_docs_or_postings_io() {
         true,
         Some((997_001, 1_000_000)),
         None,
+        None,
     ));
     assert_eq!(answer, expected);
     assert!(
@@ -247,6 +248,7 @@ fn cross_bucket_and_partial_windows_take_exact_row_path() {
             query,
             covered,
             file_bounds,
+            None,
             None,
         ));
         assert_eq!(
@@ -301,6 +303,7 @@ fn extra_conjunct_cannot_reuse_whole_field_selected_counts() {
             true,
             Some((997_001, 1_000_000)),
             None,
+            None,
         )),
         expected
     );
@@ -347,6 +350,7 @@ fn different_field_predicate_keeps_exact_groups_on_shifted_and_partial_grids() {
                 covered,
                 Some((997_001, 1_000_000)),
                 None,
+                None,
             )),
             expected,
         );
@@ -369,6 +373,7 @@ fn oversize_partial_and_non_string_groups_require_precise_scan() {
             (990, 1_010),
             true,
             Some((998, 1_000)),
+            None,
             None,
         ));
     }
@@ -395,6 +400,7 @@ fn oversize_partial_and_non_string_groups_require_precise_scan() {
         true,
         Some((997_001, 1_000_000)),
         None,
+        None,
     ));
 
     let numeric = VixReader::open_with_index(data, Some(index)).unwrap();
@@ -408,6 +414,7 @@ fn oversize_partial_and_non_string_groups_require_precise_scan() {
         (997_000, 1_000_001),
         true,
         Some((997_001, 1_000_000)),
+        None,
         None,
     ));
 }
@@ -520,6 +527,7 @@ async fn metadata_index_scan_and_segment_partials_own_each_file_once() {
         time_range: query_range,
         work_group: None,
         use_inverted_index: true,
+        full_text_fields: None,
     });
     let mut files = vec![metadata.clone(), indexed.clone(), fallback.clone()];
     let (_, add_filter_back, result) = vix_search(
@@ -611,8 +619,9 @@ async fn cancelled_file_operation_is_not_a_scan_fallback_or_reader_poison() {
         Some(mode("level", 990, 1_020, 10)),
         &file,
         VixReadMode::Ranged,
-        false,
+        SidecarAccess::check_only(false),
         &cancelled,
+        None,
     )
     .await
     .unwrap_err();
@@ -630,8 +639,9 @@ async fn cancelled_file_operation_is_not_a_scan_fallback_or_reader_poison() {
         Some(mode("level", 990, 1_020, 10)),
         &file,
         VixReadMode::Ranged,
-        false,
+        SidecarAccess::check_only(false),
         &live,
+        None,
     )
     .await
     .unwrap();
@@ -743,8 +753,9 @@ async fn sparse_gib_sidecar_count_and_topn_keep_exact_optimized_dispatch() {
             Some(rule.clone()),
             &file,
             VixReadMode::Ranged,
-            false,
+            SidecarAccess::check_only(false),
             &operation,
+            None,
         )
         .await
         .unwrap();
@@ -776,6 +787,7 @@ async fn sparse_gib_sidecar_count_and_topn_keep_exact_optimized_dispatch() {
             time_range: (990, 1_020),
             work_group: None,
             use_inverted_index: true,
+            full_text_fields: None,
         });
         let mut files = vec![file];
         let (_, add_filter_back, result) =
@@ -810,8 +822,9 @@ async fn cached_sparse_object_refuses_its_real_owner_before_any_fetch() {
         Some(IndexOptimizeMode::SimpleCount),
         &file,
         VixReadMode::Cached,
-        false,
+        SidecarAccess::check_only(false),
         &operation,
+        None,
     )
     .await
     .unwrap_err();
@@ -830,4 +843,442 @@ async fn cached_sparse_object_refuses_its_real_owner_before_any_fetch() {
         !operation.is_cancelled(),
         "budget refusal is not query cancellation"
     );
+}
+
+fn full_text_scope_fixture() -> (Bytes, Bytes, RecordBatch) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("_timestamp", DataType::Int64, false),
+        Field::new("active", DataType::Utf8, false),
+        Field::new("historical", DataType::Utf8, false),
+        Field::new("raw", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![100, 99, 98, 97, 96, 95, 94])),
+            Arc::new(StringArray::from(vec![
+                "needle hay",
+                "plain",
+                "alpha beta",
+                "alpha gap beta",
+                "beta alpha",
+                "alpha",
+                "plain",
+            ])),
+            Arc::new(StringArray::from(vec![
+                "plain",
+                "needle hay",
+                "plain",
+                "plain",
+                "plain",
+                "beta",
+                "alpha beta",
+            ])),
+            Arc::new(StringArray::from(vec!["needle"; 7])),
+        ],
+    )
+    .unwrap();
+    let mut writer = vortex_index::VixWriter::new(
+        &schema,
+        VixWriterOptions {
+            fts_field_names: vec!["active".into(), "historical".into()],
+            ..Default::default()
+        },
+        false,
+    );
+    writer
+        .push_batch_with_source(&batch, &StringArray::from(vec!["{}"; 7]), None)
+        .unwrap();
+    let (data, index) = writer.finish().unwrap();
+    (Bytes::from(data), Bytes::from(index.unwrap()), batch)
+}
+
+fn scoped_rows(
+    reader: &VixReader,
+    condition: &IndexCondition,
+    fields: &[String],
+) -> (Vec<usize>, bool) {
+    match evaluate_vix_index(
+        "active-fts-scope",
+        reader,
+        condition,
+        None,
+        (90, 110),
+        true,
+        Some((94, 100)),
+        None,
+        Some(fields),
+    )
+    .unwrap()
+    {
+        RawVixResult::Bitmap {
+            bitmap,
+            has_skipped,
+            ..
+        } => (bitmap.set_indices().collect(), has_skipped),
+        _ => panic!("expected scoped candidate rows"),
+    }
+}
+
+#[test]
+fn active_full_text_scope_ignores_historical_fields_and_preserves_named_predicates() {
+    let (data, index, _) = full_text_scope_fixture();
+    // A partial historical field is irrelevant when the current query no
+    // longer searches it. Exercise real ranged sources, not reader metadata
+    // copied into a pretend source of query scope.
+    let partial = test_support::repack_with_partial_fields(&index, &["historical"]).unwrap();
+    let reader = VixReader::open_ranged_with_index(
+        ObservedSource::new(data),
+        Some(ObservedSource::new(Bytes::from(partial))),
+    )
+    .unwrap();
+    let active = vec!["active".to_string()];
+    let condition = IndexCondition {
+        conditions: vec![Condition::MatchAll("needle".into())],
+    };
+    assert_eq!(scoped_rows(&reader, &condition, &active), (vec![0], false));
+    assert_eq!(scoped_rows(&reader, &condition, &[]), (vec![], false));
+    let mixed = IndexCondition {
+        conditions: vec![Condition::Or(
+            Box::new(Condition::MatchAll("needle".into())),
+            Box::new(Condition::Equal("raw".into(), "needle".into())),
+        )],
+    };
+    assert_eq!(
+        scoped_rows(&reader, &mixed, &active),
+        ((0..7).collect(), false)
+    );
+    assert_eq!(scoped_rows(&reader, &mixed, &[]), ((0..7).collect(), false));
+    let negated = IndexCondition {
+        conditions: vec![Condition::And(
+            Box::new(Condition::Not(Box::new(Condition::MatchAll(
+                "needle".into(),
+            )))),
+            Box::new(Condition::Equal("raw".into(), "needle".into())),
+        )],
+    };
+    assert_eq!(
+        scoped_rows(&reader, &negated, &active),
+        ((1..7).collect(), true)
+    );
+    assert_eq!(
+        scoped_rows(&reader, &negated, &[]),
+        ((0..7).collect(), true)
+    );
+    requires_scan(evaluate_vix_index(
+        "partial-active-fts",
+        &reader,
+        &condition,
+        Some(IndexOptimizeMode::SimpleCount),
+        (90, 110),
+        true,
+        Some((94, 100)),
+        None,
+        Some(&["historical".into()]),
+    ));
+}
+
+#[test]
+fn active_full_text_scope_requires_capability_or_exact_absence() {
+    let (data, index, _) = full_text_scope_fixture();
+    let reader = VixReader::open_with_index(data, Some(index)).unwrap();
+    let condition = IndexCondition {
+        conditions: vec![Condition::MatchAll("needle".into())],
+    };
+    // FTS-only fields are valid token sources even though raw equality is
+    // unservable. Raw-only fields cannot substitute their exact-value terms.
+    assert!(!reader.has_term_capability("active"));
+    assert!(reader.has_term_capability("raw"));
+    assert_eq!(
+        scoped_rows(&reader, &condition, &["active".into(), "absent".into()]),
+        (vec![0], false),
+    );
+    assert_eq!(
+        scoped_rows(&reader, &condition, &["absent".into()]),
+        (vec![], false)
+    );
+    for fields in [None, Some(vec!["active".into(), "raw".into()])] {
+        requires_scan(evaluate_vix_index(
+            "unknown-active-fts",
+            &reader,
+            &condition,
+            Some(IndexOptimizeMode::SimpleCount),
+            (90, 110),
+            true,
+            Some((94, 100)),
+            None,
+            fields.as_deref(),
+        ));
+    }
+    let partial = IndexCondition {
+        conditions: vec![
+            Condition::Equal("active".into(), "needle hay".into()),
+            Condition::MatchAll("needle".into()),
+        ],
+    };
+    assert_eq!(
+        scoped_rows(&reader, &partial, &["active".into()]),
+        (vec![0], true)
+    );
+}
+
+#[test]
+fn full_text_scope_separates_result_and_bitmap_cache_entries() {
+    let (data, index, _) = full_text_scope_fixture();
+    let reader = VixReader::open_with_index(data, Some(index)).unwrap();
+    let file = FileKey {
+        key: "files/org/logs/fts-scope/2026/01/01/00/cache.vix".into(),
+        meta: config::meta::stream::FileMeta {
+            min_ts: 94,
+            max_ts: 100,
+            records: 7,
+            index_size: 4096,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let condition = IndexCondition {
+        conditions: vec![Condition::MatchAll("needle".into())],
+    };
+    let active = vec!["active".to_string()];
+    let historical = vec!["historical".to_string()];
+    let cache = vix_result_cache::VixResultCache::new(8);
+    for rule in [None, Some(IndexOptimizeMode::SimpleCount)] {
+        let key = generate_cache_key(&condition, &rule, &file, None, Some(&active));
+        cache.put(key.clone(), CacheEntry::Count(1));
+        assert!(cache.get(&key, rule.as_ref()).is_some());
+        for scope in [None, Some(&[][..]), Some(historical.as_slice())] {
+            let other = generate_cache_key(&condition, &rule, &file, None, scope);
+            assert!(cache.get(&other, rule.as_ref()).is_none());
+        }
+    }
+    // Both fields carry the same token but select different documents.
+    assert_eq!(scoped_rows(&reader, &condition, &active), (vec![0], false));
+    assert_eq!(
+        scoped_rows(&reader, &condition, &historical),
+        (vec![1], false)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn multiword_full_text_refuses_native_aggregates_and_keeps_exact_residual_rows() {
+    let (data, index, batch) = full_text_scope_fixture();
+    let data_size = data.len() as i64;
+    let index_size = index.len() as i64;
+    let reader = VixReader::open_with_index(data, Some(index)).unwrap();
+    let scope = vec!["active".to_string(), "historical".to_string()];
+    let condition = IndexCondition {
+        conditions: vec![Condition::MatchAll("alpha beta".into())],
+    };
+    let (candidates, skipped) = scoped_rows(&reader, &condition, &scope);
+    assert!(skipped);
+    // Reordered, separated and cross-field tokens are only candidates.
+    assert_eq!(candidates, vec![2, 3, 4, 5, 6]);
+    for rule in [
+        IndexOptimizeMode::SimpleCount,
+        IndexOptimizeMode::SimpleHistogram(90, 10, 2, 0),
+    ] {
+        requires_scan(evaluate_vix_index(
+            "multiword-aggregate",
+            &reader,
+            &condition,
+            Some(rule),
+            (90, 110),
+            true,
+            Some((94, 100)),
+            None,
+            Some(&scope),
+        ));
+    }
+    let mask = arrow::array::BooleanArray::from(
+        (0..batch.num_rows())
+            .map(|row| candidates.contains(&row))
+            .collect::<Vec<_>>(),
+    );
+    let selected = arrow::compute::filter_record_batch(&batch, &mask).unwrap();
+    let ctx = SessionContext::new();
+    ctx.register_table(
+        "candidates",
+        Arc::new(MemTable::try_new(selected.schema(), vec![vec![selected]]).unwrap()),
+    )
+    .unwrap();
+    let batches = ctx.sql(
+        "SELECT _timestamp FROM candidates WHERE active LIKE '%alpha beta%' OR historical LIKE '%alpha beta%' ORDER BY _timestamp",
+    ).await.unwrap().collect().await.unwrap();
+    let timestamps: Vec<i64> = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect();
+    assert_eq!(timestamps, vec![94, 98]);
+
+    // Real dispatch must retain the entire file for the scan, contribute no
+    // aggregate candidates, and never label a residual selection exact.
+    let file = FileKey {
+        key: "files/org/logs/fts-scope/2026/01/01/00/multiword.vix".into(),
+        meta: config::meta::stream::FileMeta {
+            min_ts: 94,
+            max_ts: 100,
+            records: 7,
+            compressed_size: data_size,
+            index_size,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    reader_cache::GLOBAL_CACHE
+        .put(
+            reader_cache::ReaderCacheKey::new(file.key.clone(), 0, file.meta.index_size),
+            reader,
+        )
+        .unwrap();
+    let params = |fields| {
+        Arc::new(crate::types::QueryParams {
+            trace_id: "multiword-scope-dispatch".into(),
+            org_id: "org".into(),
+            stream: datafusion::sql::TableReference::from("fts-scope"),
+            stream_type: StreamType::Logs,
+            stream_name: "fts-scope".into(),
+            time_range: (90, 110),
+            work_group: None,
+            use_inverted_index: true,
+            full_text_fields: Some(fields),
+        })
+    };
+    for rule in [
+        IndexOptimizeMode::SimpleCount,
+        IndexOptimizeMode::SimpleHistogram(90, 10, 2, 0),
+    ] {
+        let mut files = vec![file.clone()];
+        let (_, filter_back, answer) = vix_search(
+            params(scope.clone()),
+            &mut files,
+            Some(condition.clone()),
+            Some(rule),
+        )
+        .await
+        .unwrap();
+        assert!(filter_back);
+        assert_eq!(
+            files.iter().map(|f| &f.key).collect::<Vec<_>>(),
+            vec![&file.key]
+        );
+        assert!(files[0].selection.is_none());
+        match answer {
+            MultiResult::Count(count) => assert_eq!(count, 0),
+            MultiResult::Histogram(buckets) => assert!(buckets.iter().all(|count| *count == 0)),
+            other => panic!("unexpected aggregate fallback: {other:?}"),
+        }
+    }
+    // A positive control must reach evaluation, not pass the fallback
+    // assertions through missing object metadata or unknown query scope.
+    let token = IndexCondition {
+        conditions: vec![Condition::MatchAll("needle".into())],
+    };
+    for (fields, expected) in [(vec!["active".to_string()], 1), (scope, 2)] {
+        let mut files = vec![file.clone()];
+        let (_, filter_back, answer) = vix_search(
+            params(fields),
+            &mut files,
+            Some(token.clone()),
+            Some(IndexOptimizeMode::SimpleCount),
+        )
+        .await
+        .unwrap();
+        assert!(!filter_back);
+        assert!(files.is_empty());
+        match answer {
+            MultiResult::Count(count) => assert_eq!(count, expected),
+            other => panic!("expected exact scoped token count: {other:?}"),
+        }
+    }
+    reader_cache::GLOBAL_CACHE.remove(&file.key);
+}
+
+#[test]
+fn full_text_capability_probe_preserves_source_cancellation() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct CancelSource {
+        bytes: Bytes,
+        footer_start: usize,
+        logical_len: u64,
+        cancel: AtomicBool,
+    }
+
+    impl VixRangeSource for CancelSource {
+        fn len(&self) -> u64 {
+            self.logical_len
+        }
+
+        fn fetch(&self, range: Range<u64>) -> BoxFuture<'static, anyhow::Result<Bytes>> {
+            let result = if self.cancel.load(Ordering::Relaxed) {
+                Err(vortex_index::VixError::Cancelled.into())
+            } else {
+                // Keep blob offsets unchanged, but place the real footer
+                // beyond a sparse zero gap so eager-tail bootstrap cannot
+                // turn the dictionary into a fully resident Mem blob.
+                let footer_offset =
+                    self.logical_len - (self.bytes.len() - self.footer_start) as u64;
+                let mut output = vec![0; (range.end - range.start) as usize];
+                for (offset, bytes) in [
+                    (0, &self.bytes[..self.footer_start]),
+                    (footer_offset, &self.bytes[self.footer_start..]),
+                ] {
+                    let start = range.start.max(offset);
+                    let end = range.end.min(offset + bytes.len() as u64);
+                    if start < end {
+                        output[(start - range.start) as usize..(end - range.start) as usize]
+                            .copy_from_slice(
+                                &bytes[(start - offset) as usize..(end - offset) as usize],
+                            );
+                    }
+                }
+                Ok(Bytes::from(output))
+            };
+            async move { result }.boxed()
+        }
+    }
+
+    let (data, index, _) = full_text_scope_fixture();
+    let payload_size =
+        u32::from_le_bytes(index[index.len() - 12..index.len() - 8].try_into().unwrap()) as usize;
+    let footer_start = index.len() - (4 + payload_size + 12);
+    let source = Arc::new(CancelSource {
+        bytes: index,
+        footer_start,
+        logical_len: 1 << 30,
+        cancel: AtomicBool::new(false),
+    });
+    let reader =
+        VixReader::open_ranged_with_index(ObservedSource::new(data), Some(source.clone())).unwrap();
+    source.cancel.store(true, Ordering::Relaxed);
+    let condition = IndexCondition {
+        conditions: vec![Condition::MatchAll("needle".into())],
+    };
+    // No operation TLS flag is set: the source's typed cancellation must
+    // survive capability probing rather than becoming an ordinary scan refusal.
+    let error = evaluate_vix_index(
+        "fts-probe-source-cancel",
+        &reader,
+        &condition,
+        Some(IndexOptimizeMode::SimpleCount),
+        (90, 110),
+        true,
+        Some((94, 100)),
+        None,
+        Some(&["raw".to_string()]),
+    )
+    .err()
+    .expect("source cancellation must escape scope validation");
+    assert!(is_cancelled_read(&error));
+    source.cancel.store(false, Ordering::Relaxed);
+    assert!(reader.key_term_exists("raw").unwrap());
 }

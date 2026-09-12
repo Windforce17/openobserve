@@ -168,10 +168,12 @@ pub async fn search(
         .await
         .unwrap_or(arrow_schema::Schema::empty());
     let stream_settings = unwrap_stream_settings(&db_schema);
-    let fst_fields = get_stream_setting_fts_fields(&stream_settings)
+    let mut fst_fields = get_stream_setting_fts_fields(&stream_settings)
         .into_iter()
         .filter(|v| latest_schema_map.contains_key(v))
         .collect_vec();
+    fst_fields.sort_unstable();
+    fst_fields.dedup();
     // the vix index term-indexes every string field's raw values and every
     // numeric/bool field's canonical value forms: filter/condition
     // extraction (IndexRule) is eligible for all of them (minus the internal
@@ -297,6 +299,7 @@ pub async fn search(
         stream_name: stream_name.to_string(),
         time_range: (req.search_info.start_time, req.search_info.end_time),
         work_group: work_group.clone(),
+        full_text_fields: Some(fst_fields.clone()),
         // Stream types in ZO_VIX_INDEX_DISABLED_STREAM_TYPES (#40, metrics
         // by default) never probe the index: their core files are
         // column-store only, so every query routes straight to the columnar
@@ -354,6 +357,41 @@ pub async fn search(
                     .build()
             )
         );
+
+        // Prune the hydrated persisted snapshot once, before any metadata,
+        // eager aggregate, or residual storage branch takes ownership.
+        if query_params.use_inverted_index
+            && !index_condition
+                .as_ref()
+                .is_some_and(IndexCondition::is_condition_all)
+        {
+            let before = file_list.len();
+            let (bloom_took, applied) = super::storage::check_bloom_filter(
+                query_params.clone(),
+                &mut file_list,
+                index_condition.as_ref(),
+                bloom_indexed_fields,
+            )
+            .await?;
+            if applied {
+                log::info!(
+                    "{}",
+                    search_inspector_fields(
+                        format!(
+                            "[trace_id {trace_id}] search->bloom: stream {org_id}/{stream_type}/{stream_name}, bloom filter reduced file_list from {before} to {} in {bloom_took} ms",
+                            file_list.len()
+                        ),
+                        SearchInspectorFieldsBuilder::new()
+                            .trace_id(trace_id.to_string())
+                            .node_name(LOCAL_NODE.name.clone())
+                            .component("flight persisted bloom filter".to_string())
+                            .search_role("follower".to_string())
+                            .duration(bloom_took)
+                            .build()
+                    )
+                );
+            }
+        }
 
         if use_metadata_count {
             let (metadata_files, scan_files) =
@@ -491,7 +529,6 @@ pub async fn search(
             file_stats_cache.clone(),
             index_condition.clone(),
             fst_fields.clone(),
-            bloom_indexed_fields.clone(),
             storage_idx_optimize_rule,
         )
         .await
@@ -1420,6 +1457,94 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bloom_survivors_remain_once_when_eager_aggregate_falls_back() {
+        use infra::bloom::{BloomBuilder, BloomWriter, path::bloom_path};
+        let stream = format!("bloom-aggregate-{}", config::ider::generate_trace_id());
+        let date = "2026/01/01/00";
+        let version = 1_234_567;
+        let mut builder = BloomBuilder::new();
+        // An empty Bloom proves no matches without probabilistic collisions.
+        builder.begin_with_blocks(1, "value", 1);
+        let present = builder.begin_with_blocks(2, "value", 1);
+        builder.insert(present, b"hit");
+        let path = bloom_path("test", StreamType::Logs, &stream, date, version);
+        let account = infra::storage::get_account("test", &path).unwrap_or_default();
+        infra::storage::put(
+            &account,
+            &path,
+            bytes::Bytes::from(BloomWriter::serialize(builder.finish()).unwrap()),
+        )
+        .await
+        .unwrap();
+        let condition = IndexCondition {
+            conditions: vec![Condition::Equal("value".into(), "hit".into())],
+        };
+        let files = (1..=3)
+            .map(|id| {
+                let mut file = make_file(
+                    &format!("files/test/logs/{stream}/{date}/{id}.vix"),
+                    10,
+                    20,
+                    1,
+                );
+                file.id = id;
+                file.account = account.clone();
+                // The third file has unavailable Bloom information and must survive.
+                file.meta.bloom_ver = if id == 3 { version + 1 } else { version };
+                file
+            })
+            .collect();
+        let files = crate::service::search::bloom_pruner::prune(
+            "bloom-aggregate",
+            "test",
+            StreamType::Logs,
+            &stream,
+            files,
+            &condition,
+            vec!["value".into()],
+            &config::VixBloomCompositeScope::All,
+            false,
+            &std::collections::HashSet::new(),
+        )
+        .await;
+        let mut rule = Some(IndexOptimizeMode::SimpleCount);
+        let (mut eager, mut residual) =
+            handle_index_optimize(&mut rule, files, (0, 30), &HashSet::new(), Some(&condition))
+                .await
+                .unwrap();
+        let params = Arc::new(QueryParams {
+            trace_id: "bloom-aggregate".into(),
+            org_id: "test".into(),
+            stream: TableReference::from(stream.as_str()),
+            stream_type: StreamType::Logs,
+            stream_name: stream,
+            time_range: (0, 30),
+            work_group: None,
+            use_inverted_index: true,
+            full_text_fields: None,
+        });
+        // Deliberately missing data/index objects force the real fail-open
+        // aggregate path, not a synthetic result or a mocked collector.
+        let (_, add_filter, _) = super::super::storage::vix_search(
+            params,
+            &mut eager,
+            Some(condition),
+            Some(IndexOptimizeMode::SimpleCount),
+        )
+        .await
+        .unwrap();
+        assert!(add_filter);
+        residual.append(&mut eager);
+        residual.sort_unstable_by_key(|file| file.id);
+        assert_eq!(
+            residual.iter().map(|file| file.id).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert_eq!(collect_stats(&residual).records, 20);
+        infra::storage::del(vec![(&account, &path)]).await.unwrap();
     }
 
     fn core_file(min_ts: i64, max_ts: i64, index_size: i64) -> FileKey {

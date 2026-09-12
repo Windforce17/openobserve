@@ -759,6 +759,7 @@ async fn generate_dump(
         selection: None,
         row_group_size: None,
         selection_exact: false,
+        native_predicate: Default::default(),
     };
 
     Ok(Some(dump_file))

@@ -56,6 +56,37 @@ pub trait VixReadOperation: Send + Sync {
     fn check_memory(&self, _owned_bytes: usize) -> Result<()> {
         Ok(())
     }
+
+    /// Execution policy is private to this operation, never to a cached reader.
+    fn scan_options(&self) -> crate::NativeScanOptions {
+        crate::NativeScanOptions::default()
+    }
+
+    /// Only callers with strong allocation ownership may queue conversions.
+    fn supports_conversion(&self) -> bool {
+        false
+    }
+
+    /// Reserve an additional, independently owned allocation before creating it.
+    /// The returned owner must remain alive until that allocation is released.
+    fn reserve_conversion(&self, _bytes: usize) -> Result<Box<dyn Send + Sync>> {
+        Err(VixError::Malformed(
+            "operation does not own conversion memory".to_string(),
+        ))
+    }
+
+    /// Transfer an admitted conversion's Arrow buffers to downstream owners
+    /// before its native envelope releases credits. Never called for unknown
+    /// inline backing trees.
+    fn own_conversion_output(
+        &self,
+        _batch: arrow::record_batch::RecordBatch,
+        _owner: Arc<dyn Send + Sync>,
+    ) -> Result<arrow::record_batch::RecordBatch> {
+        Err(VixError::Malformed(
+            "operation does not own downstream conversion buffers".to_string(),
+        ))
+    }
 }
 
 thread_local! {

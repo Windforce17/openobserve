@@ -26,4 +26,8 @@ pub struct QueryParams {
     pub time_range: (i64, i64),
     pub work_group: Option<String>,
     pub use_inverted_index: bool,
+    /// Current query FTS fields, sorted and deduplicated after latest-schema
+    /// filtering. `None` means unknown, not an empty scope: VIX must scan
+    /// rather than infer query semantics from a historical file's metadata.
+    pub full_text_fields: Option<Vec<String>>,
 }

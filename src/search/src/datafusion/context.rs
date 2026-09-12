@@ -60,7 +60,16 @@ impl SearchContextBuilder {
 
     pub async fn build(self, req: &Request, sql: &Arc<Sql>) -> Result<SessionContext> {
         let analyzer_rules = generate_analyzer_rules(sql);
-        let optimizer_rules = generate_optimizer_rules(sql);
+        // Persisted streaming aggregate states have a separate compatibility contract.
+        // Keep their original aggregates even when ordinary searches opt into sharing.
+        let allow_shared_percentiles = !req.streaming_output
+            && !self.contexts.iter().any(|context| {
+                matches!(
+                    context,
+                    PhysicalOptimizerContext::StreamingAggregation(Some(_))
+                )
+            });
+        let optimizer_rules = generate_optimizer_rules(sql, allow_shared_percentiles);
         let physical_optimizer_rules = generate_physical_optimizer_rules(req, sql, self.contexts);
         let mut ctx = DataFusionContextBuilder::new()
             .trace_id(&req.trace_id)

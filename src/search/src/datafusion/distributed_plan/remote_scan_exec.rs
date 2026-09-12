@@ -77,7 +77,7 @@ impl RemoteScanExec {
         let proto = get_physical_extension_codec();
         let physical_plan_bytes =
             physical_plan_to_bytes_with_extension_codec(input.clone(), &proto)?;
-        remote_scan_node.set_plan(physical_plan_bytes.to_vec());
+        remote_scan_node.set_plan(physical_plan_bytes);
 
         // get the node ids for enrich mode
         let mut node_ids = remote_scan_node
@@ -220,7 +220,7 @@ impl ExecutionPlan for RemoteScanExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        if children.is_empty() {
+        if children.is_empty() || Arc::ptr_eq(&children[0], &self.input) {
             return Ok(self);
         }
         let remote_scan = Self::new(children[0].clone(), self.remote_scan_node.clone())?
@@ -460,7 +460,7 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("col", DataType::Utf8, false)]));
         let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema));
         let node = RemoteScanNode {
-            nodes: vec![Arc::new(TestNode)],
+            nodes: vec![Arc::new(TestNode) as Arc<dyn config::meta::cluster::NodeInfo>].into(),
             opentelemetry_context: opentelemetry::Context::current(),
             query_identifier: Default::default(),
             search_infos: Default::default(),
@@ -471,50 +471,62 @@ mod tests {
     }
 
     #[test]
-    fn test_remote_scan_exec_name() {
-        let exec = make_remote_exec();
-        assert_eq!(ExecutionPlan::name(&exec), "RemoteScanExec");
+    fn rebuilt_remote_scan_dispatches_changed_child_and_preserves_query_state() -> Result<()> {
+        let mut exec = make_remote_exec().set_analyze();
+        exec.remote_scan_node.search_infos.file_id_list = vec![vec![-7, 11]].into();
+        *exec.partial_err.lock() = "existing partial error".to_string();
+        let exec = Arc::new(exec);
+        let original_schema = exec.schema();
+        let original_request = exec.remote_scan_node.get_flight_search_request(0);
+        let unchanged = exec.clone().with_new_children(vec![exec.input.clone()])?;
+        let unchanged = unchanged.downcast_ref::<RemoteScanExec>().unwrap();
+        assert_eq!(
+            unchanged
+                .remote_scan_node
+                .get_flight_search_request(0)
+                .search_info,
+            original_request.search_info
+        );
+
+        let changed_schema = Arc::new(Schema::new(vec![Field::new(
+            "new_col",
+            DataType::Int64,
+            true,
+        )]));
+        let changed_input: Arc<dyn ExecutionPlan> =
+            Arc::new(EmptyExec::new(changed_schema.clone()));
+        let rebuilt = exec.clone().with_new_children(vec![changed_input])?;
+        let rebuilt = rebuilt.downcast_ref::<RemoteScanExec>().unwrap();
+        let request = rebuilt.remote_scan_node.get_flight_search_request(0);
+        let ctx = datafusion::execution::context::SessionContext::new();
+        let decoded = datafusion_proto::bytes::physical_plan_from_bytes_with_extension_codec(
+            &request.search_info.plan,
+            &ctx.task_ctx(),
+            &get_physical_extension_codec(),
+        )?;
+        assert_eq!(decoded.schema(), changed_schema);
+        assert_eq!(rebuilt.schema(), changed_schema);
+        assert_eq!(request.search_info.file_id_list, vec![-7, 11]);
+        assert!(request.search_info.is_analyze);
+        assert_eq!(*rebuilt.partial_err.lock(), "existing partial error");
+        *rebuilt.partial_err.lock() = "later partial error".to_string();
+        assert_eq!(*exec.partial_err.lock(), "later partial error");
+        assert_eq!(exec.schema(), original_schema);
+        assert_eq!(
+            exec.remote_scan_node
+                .get_flight_search_request(0)
+                .search_info,
+            original_request.search_info
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_remote_scan_exec_children_len() {
-        let exec = make_remote_exec();
-        assert_eq!(exec.children().len(), 1);
-    }
-
-    #[test]
-    fn test_remote_scan_exec_as_any() {
-        let exec = make_remote_exec();
-        let exec_plan: &dyn ExecutionPlan = &exec;
-        assert!(exec_plan.downcast_ref::<RemoteScanExec>().is_some());
-    }
-
-    #[test]
-    fn test_remote_scan_exec_metrics_some() {
-        let exec = make_remote_exec();
-        assert!(exec.metrics().is_some());
-    }
-
-    #[test]
-    fn test_remote_scan_exec_partial_err_empty() {
-        let exec = make_remote_exec();
-        assert!(exec.partial_err().lock().is_empty());
-    }
-
-    #[test]
-    fn test_remote_scan_exec_set_analyze() {
-        let exec = make_remote_exec();
-        assert!(!exec.analyze());
-        let exec = exec.set_analyze();
-        assert!(exec.analyze());
-    }
-
-    #[test]
-    fn test_remote_scan_exec_with_partial_err() {
-        let exec = make_remote_exec();
-        let new_err = Arc::new(parking_lot::Mutex::new("pre-set".to_string()));
-        let exec = exec.with_partial_err(new_err.clone());
-        assert_eq!(*exec.partial_err().lock(), "pre-set");
+    fn changed_child_serialization_error_is_returned_during_rebuild() {
+        let exec = Arc::new(make_remote_exec());
+        // RemoteScanExec is a dispatch boundary, not a serializable follower operator.
+        let unsupported_child: Arc<dyn ExecutionPlan> = Arc::new(make_remote_exec());
+        assert!(exec.with_new_children(vec![unsupported_child]).is_err());
     }
 
     #[test]

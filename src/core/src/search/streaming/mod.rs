@@ -262,7 +262,7 @@ pub async fn process_search_stream_request(
 
     if req.query.from == 0 && !req.query.track_total_hits && req.query.streaming_id.is_none() {
         // check cache for the first page
-        let (c_resp, _should_exec_query) = match search_cache::prepare_cache_response(
+        let (c_resp, _should_exec_query, _) = match search_cache::prepare_cache_response(
             &trace_id,
             &org_id,
             stream_type,

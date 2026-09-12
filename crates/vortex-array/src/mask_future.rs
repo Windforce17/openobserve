@@ -1,18 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use std::future::Future;
-use std::ops::Range;
-use std::sync::Arc;
+use std::{future::Future, ops::Range, sync::Arc};
 
-use futures::FutureExt;
-use futures::TryFutureExt;
-use futures::future::BoxFuture;
-use futures::future::Shared;
-use vortex_error::SharedVortexResult;
-use vortex_error::VortexError;
-use vortex_error::VortexResult;
-use vortex_error::vortex_panic;
+use futures::{
+    FutureExt, TryFutureExt,
+    future::{BoxFuture, Shared},
+};
+use vortex_error::{SharedVortexResult, VortexError, VortexResult, vortex_panic};
 use vortex_mask::Mask;
 
 /// A future that resolves to a mask.
@@ -65,6 +60,11 @@ impl MaskFuture {
 
     /// Create a MaskFuture that resolves to a slice of the original mask.
     pub fn slice(&self, range: Range<usize>) -> Self {
+        // Chunked projections commonly request the entire mask. Preserve its
+        // shared lazy index cache instead of allocating one cache per column.
+        if range.start == 0 && range.end == self.len {
+            return self.clone();
+        }
         let inner = self.inner.clone();
         Self::new(range.len(), async move { Ok(inner.await?.slice(range)) })
     }

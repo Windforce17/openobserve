@@ -48,15 +48,12 @@ pub async fn search(
     _req_regions: Vec<String>,
     _req_clusters: Vec<String>,
     _need_super_cluster: bool,
+    sql: Arc<Sql>,
 ) -> Result<search::Response> {
     let start = std::time::Instant::now();
     let trace_id = req.trace_id.clone();
     let query_type = query.query_type.to_lowercase();
     let track_total_hits = query.track_total_hits;
-
-    // handle request time range
-    let meta = Sql::new_from_req(&req, &query).await?;
-    let sql = Arc::new(meta);
 
     // set this value to null & use it later on results ,
     // this being to avoid performance impact of query fn being applied during query
@@ -72,7 +69,7 @@ pub async fn search(
         _req_regions,
         _req_clusters,
         _need_super_cluster,
-        Some(sql.clone()),
+        sql.clone(),
     )
     .await;
 
@@ -93,6 +90,8 @@ pub async fn search(
         let batches_query_ref: Vec<&RecordBatch> = merge_batches.iter().collect();
         let mut json_rows = record_batches_to_json_rows(&batches_query_ref)
             .map_err(|e| Error::ErrorCode(ErrorCodes::ServerInternalError(e.to_string())))?;
+        drop(batches_query_ref);
+        drop(merge_batches);
 
         // Check if query limit exceeded, if so truncate and do not truncate if query is a limit
         // query
@@ -161,17 +160,13 @@ pub async fn search(
                             log::error!("[trace_id {trace_id}] Error applying vrl function: {e}");
                         }
 
-                        ret_val
-                            .as_array()
-                            .ok_or(Error::Message("Expected array".to_string()))?
-                            .iter()
-                            .filter_map(|v| {
-                                if !v.is_null() && v.is_object() {
-                                    flatten::flatten(v.clone()).ok()
-                                } else {
-                                    None
-                                }
-                            })
+                        let json::Value::Array(values) = ret_val else {
+                            return Err(Error::Message("Expected array".to_string()));
+                        };
+                        values
+                            .into_iter()
+                            .filter(|v| v.is_object())
+                            .filter_map(|v| flatten::flatten(v).ok())
                             .collect::<Vec<_>>()
                     } else {
                         let mut error = "".to_string();
@@ -249,17 +244,15 @@ pub async fn search(
         if use_query_fn {
             for source in sources {
                 if source.is_object() {
-                    result.add_hit(
-                        &flatten::flatten(source).map_err(|e| Error::Message(e.to_string()))?,
-                    );
+                    result
+                        .hits
+                        .push(flatten::flatten(source).map_err(|e| Error::Message(e.to_string()))?);
                 } else {
-                    result.add_hit(&source);
+                    result.hits.push(source);
                 }
             }
         } else {
-            for source in sources {
-                result.add_hit(&source);
-            }
+            result.hits = sources;
         }
     }
 
@@ -335,20 +328,13 @@ pub async fn search(
 // NOTE: careful use it, before enter it, should add trace_id to query_manager
 pub async fn search_inner(
     req: Request,
-    query: SearchQuery,
+    _query: SearchQuery,
     _req_regions: Vec<String>,
     _req_clusters: Vec<String>,
     _need_super_cluster: bool,
-    sql: Option<Arc<Sql>>,
+    sql: Arc<Sql>,
 ) -> Result<SearchResult> {
     let trace_id = req.trace_id.clone();
-    let sql = match sql {
-        Some(s) => s,
-        None => {
-            let meta = Sql::new_from_req(&req, &query).await?;
-            Arc::new(meta)
-        }
-    };
 
     #[cfg(feature = "enterprise")]
     let local_cluster_search = _req_regions == vec!["local"]
@@ -367,7 +353,7 @@ pub async fn search_inner(
             &trace_id,
             sql.clone(),
             req,
-            query,
+            _query,
             _req_regions,
             _req_clusters,
         )

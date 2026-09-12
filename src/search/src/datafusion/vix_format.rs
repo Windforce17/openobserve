@@ -23,9 +23,9 @@
 //!
 //! - a logical column that exists in the file's docs blob is read natively (cast to the registry
 //!   type when the stored type differs);
-//! - every other logical column is extracted as `json_get_{str|int|float|bool}(_source, '<literal
-//!   dotted name>')` (datafusion-functions-json) cast to the registry type — `_source` is fetched
-//!   only when at least one such column is referenced;
+//! - an absent ordinary field in a `columns_complete` file is a typed NULL; other missing fields
+//!   are extracted as `json_get_{str|int|float|bool}(_source, '<literal dotted name>')` cast to the
+//!   registry type; explicitly requested `_source` is always retained;
 //! - the per-file row selection produced by the inverted index ([`VixScanSelection`], attached by
 //!   `generate_access_plan`) and the query `_timestamp` range push down into the vortex scan of the
 //!   docs blob.
@@ -36,7 +36,15 @@
 //! `JsonSource` pattern (simple column selection in the opener, remainder
 //! expressions applied by [`ProjectionOpener`]).
 
-use std::{fmt, sync::Arc};
+use std::{
+    fmt,
+    num::NonZeroUsize,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Instant,
+};
 
 use arrow::{
     array::{Array, ArrayRef, Int64Array, RecordBatchOptions, StringArray, new_null_array},
@@ -56,18 +64,21 @@ use datafusion::{
             FileFormat as DataFusionFileFormat, file_compression_type::FileCompressionType,
         },
         listing::PartitionedFile,
-        physical_plan::{FileOpenFuture, FileOpener, FileScanConfig, FileSource},
+        physical_plan::{
+            FileGroup, FileOpenFuture, FileOpener, FileScanConfig, FileScanConfigBuilder,
+            FileSource,
+        },
         projection::{ProjectionOpener, SplitProjection},
         source::DataSourceExec,
         table_schema::TableSchema,
     },
-    execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation},
+    execution::memory_pool::{MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation},
     logical_expr::ScalarUDF,
     physical_expr::{PhysicalExpr, ScalarFunctionExpr, projection::ProjectionExprs},
     physical_plan::{
         ExecutionPlan,
         expressions::{CastExpr, Column, Literal},
-        metrics::ExecutionPlanMetricsSet,
+        metrics::{Count, CustomMetricValue, ExecutionPlanMetricsSet, MetricBuilder, MetricValue},
     },
     scalar::ScalarValue,
 };
@@ -80,7 +91,7 @@ use vortex_index::{
 };
 
 use super::vortex_support::VORTEX_RUNTIME;
-use crate::vix::source::{StoreRangeSource, VixReadMode, vix_read_mode};
+use crate::vix::source::{FetchStats, ReadOperation, StoreRangeSource, VixReadMode, vix_read_mode};
 
 /// File extension (without the dot) of core files.
 const VIX_EXT: &str = "vix";
@@ -91,7 +102,8 @@ const VIX_EXT: &str = "vix";
 /// compressed bitmap over the docs-blob rows; only the set rows are decoded.
 #[derive(Debug, Clone)]
 pub struct VixScanSelection {
-    pub row_ids: Arc<RowIdBitmap>,
+    pub row_ids: Option<Arc<RowIdBitmap>>,
+    pub native_predicate: config::meta::stream::NativePredicateStrategy,
 }
 
 /// DataFusion [`FileFormat`] for core `.vix` files.
@@ -123,6 +135,7 @@ pub struct VixCoreFormat {
     /// unordered stream. `false` (the default; the undeclared/concat table
     /// and every ad-hoc listing): scans stream in stored order.
     emit_ts_desc: bool,
+    scan_file_count: Option<NonZeroUsize>,
 }
 
 impl VixCoreFormat {
@@ -132,6 +145,7 @@ impl VixCoreFormat {
             column_bounds: Vec::new(),
             null_rejected_columns: Vec::new(),
             emit_ts_desc: false,
+            scan_file_count: None,
         }
     }
 
@@ -139,6 +153,11 @@ impl VixCoreFormat {
     /// (the declared-sort table): concat files k-way merge their regions.
     pub fn with_ordered_output(mut self, emit_ts_desc: bool) -> Self {
         self.emit_ts_desc = emit_ts_desc;
+        self
+    }
+
+    pub fn with_scan_file_count(mut self, count: Option<NonZeroUsize>) -> Self {
+        self.scan_file_count = count;
         self
     }
 }
@@ -279,6 +298,24 @@ fn spawn_stale_row_cleanup(handle: Option<&tokio::runtime::Handle>, key: String)
     }
 }
 
+/// An unknown-size registry entry needs a HEAD before listing. A vanished
+/// persisted DATA object has the same zero-row/reconciliation semantics there
+/// as at footer inference or scan time; WAL and other errors still propagate.
+pub(super) fn reconcile_missing_listing_object(
+    location: &object_store::path::Path,
+    error: &str,
+) -> bool {
+    if error_text_is_not_found(error)
+        && let Some(key) = stale_row_cleanup_key(location)
+    {
+        log::warn!("vix listing: object {location} is gone; removing its stale file_list row");
+        spawn_stale_row_cleanup(None, key);
+        true
+    } else {
+        false
+    }
+}
+
 /// `_timestamp` bounds of a non-empty docs blob.
 ///
 /// Sorted files (`row_order` ts_desc — every historical file and every
@@ -396,6 +433,28 @@ impl DataFusionFileFormat for VixCoreFormat {
         table_schema: SchemaRef,
         object: &ObjectMeta,
     ) -> Result<Statistics> {
+        // The request registry owns hydrated immutable snapshot facts. The
+        // ListingTable's existing bounded cache stores these WHOLE-file stats,
+        // exactly like footer-derived stats; selections never enter that cache.
+        // Only the canonical Int64 timestamp representation is qualified here.
+        // Other logical types retain the existing footer/cast path.
+        if let Ok(ts_index) = table_schema.index_of(TIMESTAMP_COL_NAME)
+            && table_schema.field(ts_index).data_type() == &DataType::Int64
+            && let Some(meta) =
+                super::storage::file_list::get_snapshot_statistics(object, &table_schema)
+            && let Some((min, max)) = timestamp_scalars(meta.min_ts, meta.max_ts, &DataType::Int64)
+        {
+            let mut statistics = Statistics::new_unknown(&table_schema);
+            statistics.num_rows = Precision::Exact(meta.records);
+            statistics.total_byte_size = Precision::Exact(meta.compressed_size);
+            statistics.column_statistics[ts_index] = ColumnStatistics {
+                null_count: Precision::Exact(0),
+                min_value: Precision::Exact(min),
+                max_value: Precision::Exact(max),
+                ..ColumnStatistics::default()
+            };
+            return Ok(statistics);
+        }
         let docs = match open_docs(store, object).await {
             Ok(docs) => docs,
             Err(e) => {
@@ -457,6 +516,43 @@ impl DataFusionFileFormat for VixCoreFormat {
         state: &dyn Session,
         mut conf: FileScanConfig,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        // Cached raw rows are not exact scan cardinality: selection/time
+        // predicates and missing-object reconciliation may remove rows.
+        let statistics = conf.statistics().to_inexact();
+        let groups = std::mem::take(&mut conf.file_groups)
+            .into_iter()
+            .map(|group| {
+                let group_statistics = group
+                    .file_statistics(None)
+                    .map(|statistics| Arc::new(statistics.clone().to_inexact()));
+                let group = FileGroup::new(
+                    group
+                        .into_inner()
+                        .into_iter()
+                        .map(|mut file| {
+                            if let Some(statistics) = &mut file.statistics {
+                                let statistics = Arc::make_mut(statistics);
+                                statistics.num_rows = statistics.num_rows.to_inexact();
+                                statistics.total_byte_size =
+                                    statistics.total_byte_size.to_inexact();
+                                for column in &mut statistics.column_statistics {
+                                    *column = std::mem::take(column).to_inexact();
+                                }
+                            }
+                            file
+                        })
+                        .collect(),
+                );
+                match group_statistics {
+                    Some(statistics) => group.with_statistics(statistics),
+                    None => group,
+                }
+            })
+            .collect();
+        conf = FileScanConfigBuilder::from(conf)
+            .with_file_groups(groups)
+            .with_statistics(statistics)
+            .build();
         // Thread the session memory pool into the source so the opener can
         // reserve the object/decode bytes it is about to hold — without
         // this the scan is invisible to the pool and can OOM the process
@@ -475,7 +571,8 @@ impl DataFusionFileFormat for VixCoreFormat {
             VixCoreSource::new(table_schema, self.timestamp_filter)
                 .with_column_bounds(self.column_bounds.clone())
                 .with_null_rejected_columns(self.null_rejected_columns.clone())
-                .with_ordered_output(self.emit_ts_desc),
+                .with_ordered_output(self.emit_ts_desc)
+                .with_scan_file_count(self.scan_file_count),
         )
     }
 }
@@ -500,6 +597,7 @@ pub struct VixCoreSource {
     /// Session memory pool (injected by `create_physical_plan`); the opener
     /// reserves its object/decode bytes against it.
     memory_pool: Option<Arc<dyn MemoryPool>>,
+    scan_file_count: Option<NonZeroUsize>,
 }
 
 impl VixCoreSource {
@@ -514,6 +612,7 @@ impl VixCoreSource {
             null_rejected_columns: Vec::new(),
             emit_ts_desc: false,
             memory_pool: None,
+            scan_file_count: None,
         }
     }
 
@@ -531,6 +630,11 @@ impl VixCoreSource {
         self.emit_ts_desc = emit_ts_desc;
         self
     }
+
+    fn with_scan_file_count(mut self, count: Option<NonZeroUsize>) -> Self {
+        self.scan_file_count = count;
+        self
+    }
 }
 
 impl fmt::Debug for VixCoreSource {
@@ -545,14 +649,40 @@ impl FileSource for VixCoreSource {
     fn create_file_opener(
         &self,
         object_store: Arc<dyn ObjectStore>,
-        _base_config: &FileScanConfig,
-        _partition: usize,
+        base_config: &FileScanConfig,
+        partition: usize,
     ) -> Result<Arc<dyn FileOpener>> {
         // The logical columns this scan must produce (simple column part of
         // the projection); remainder expressions are applied on top by the
         // ProjectionOpener.
         let file_schema = self.table_schema.file_schema();
         let projected_schema = Arc::new(file_schema.project(&self.projection.file_indices)?);
+        // Unsplit cohort prevents a large query split into tiny tables from
+        // borrowing a full pool per table. The candidate cohort is at most four
+        // files; final nonempty groups can only lower the requested 2/4 width.
+        let conversion_width = self.scan_file_count.and_then(|files| {
+            if files.get() > 4 {
+                return None;
+            }
+            let pool = vortex_index::shared_cpu_thread_count().ok()?;
+            if files.get() > pool / 2 {
+                return None;
+            }
+            let groups = base_config
+                .file_groups
+                .iter()
+                .filter(|group| !group.is_empty())
+                .count();
+            let active = files.get().max(groups);
+            let available = pool / active;
+            NonZeroUsize::new(if available >= 4 {
+                4
+            } else if available >= 2 {
+                2
+            } else {
+                0
+            })
+        });
 
         let opener = Arc::new(VixCoreOpener {
             column_bounds: self.column_bounds.clone(),
@@ -563,6 +693,9 @@ impl FileSource for VixCoreSource {
             projected_schema,
             timestamp_filter: self.timestamp_filter,
             memory_pool: self.memory_pool.clone(),
+            conversion_width,
+            metrics: self.metrics.clone(),
+            partition,
         }) as Arc<dyn FileOpener>;
 
         ProjectionOpener::try_new(self.projection.clone(), opener, file_schema)
@@ -627,6 +760,296 @@ struct VixCoreOpener {
     /// Session memory pool for the scan's reservation, when threaded through
     /// `VixCoreFormat::create_physical_plan`.
     memory_pool: Option<Arc<dyn MemoryPool>>,
+    conversion_width: Option<NonZeroUsize>,
+    metrics: ExecutionPlanMetricsSet,
+    partition: usize,
+}
+
+fn native_predicate_strategy(
+    strategy: config::meta::stream::NativePredicateStrategy,
+) -> vortex_index::NativePredicateStrategy {
+    use config::meta::stream::NativePredicateStrategy as Engine;
+    match strategy {
+        Engine::BoundedPrepass => vortex_index::NativePredicateStrategy::BoundedPrepass,
+        Engine::DirectResidual => vortex_index::NativePredicateStrategy::DirectResidual,
+        Engine::NativeStringEq => vortex_index::NativePredicateStrategy::NativeStringEq,
+    }
+}
+
+fn elapsed_ns(started: Instant) -> u64 {
+    started.elapsed().as_nanos().min(u64::MAX as u128) as u64
+}
+
+/// The operation, not its receiver, owns every non-cancellable allocation.
+/// Existing serial decode allowances remain allowances, not a claim about RSS.
+struct CoreScanOperation {
+    io: Arc<ReadOperation>,
+    reservation: Arc<parking_lot::Mutex<Option<MemoryReservation>>>,
+    reader_high_water: parking_lot::Mutex<usize>,
+    options: parking_lot::Mutex<vortex_index::NativeScanOptions>,
+    downstream_wait_ns: Count,
+    live_owned_bytes: Arc<AtomicUsize>,
+    peak_owned_bytes: AtomicUsize,
+    peak_reserved_bytes: Count,
+    metrics: ExecutionPlanMetricsSet,
+    partition: usize,
+    location: String,
+}
+
+impl CoreScanOperation {
+    fn reserve(&self, bytes: usize) -> Result<Arc<CoreMemoryCharge>> {
+        let reservation = self.reservation.lock();
+        let memory = reservation.as_ref().ok_or_else(|| {
+            DataFusionError::ResourcesExhausted("VIX conversion needs an owned memory pool".into())
+        })?;
+        memory.try_grow(bytes)?;
+        let live = self.live_owned_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        let previous_peak = self.peak_owned_bytes.fetch_max(live, Ordering::Relaxed);
+        if live > previous_peak {
+            self.peak_reserved_bytes.add(live - previous_peak);
+        }
+        Ok(Arc::new(CoreMemoryCharge {
+            reservation: Arc::clone(&self.reservation),
+            live: Arc::clone(&self.live_owned_bytes),
+            bytes,
+        }))
+    }
+}
+
+impl vortex_index::VixReadOperation for CoreScanOperation {
+    fn is_cancelled(&self) -> bool {
+        self.io.is_cancelled()
+    }
+
+    fn check_memory(&self, bytes: usize) -> vortex_index::Result<()> {
+        let mut high_water = self.reader_high_water.lock();
+        if bytes > *high_water {
+            if let Some(reservation) = self.reservation.lock().as_ref() {
+                reservation
+                    .try_grow(bytes - *high_water)
+                    .map_err(|error| vortex_index::VixError::Callback(error.into()))?;
+            }
+            *high_water = bytes;
+        }
+        Ok(())
+    }
+
+    fn scan_options(&self) -> vortex_index::NativeScanOptions {
+        self.options.lock().clone()
+    }
+
+    fn supports_conversion(&self) -> bool {
+        self.options.lock().conversion.is_some() && self.reservation.lock().is_some()
+    }
+
+    fn reserve_conversion(&self, bytes: usize) -> vortex_index::Result<Box<dyn Send + Sync>> {
+        self.reserve(bytes)
+            .map(|owner| Box::new(owner) as Box<dyn Send + Sync>)
+            .map_err(|error| vortex_index::VixError::Callback(error.into()))
+    }
+
+    fn own_conversion_output(
+        &self,
+        batch: RecordBatch,
+        owner: Arc<dyn Send + Sync>,
+    ) -> vortex_index::Result<RecordBatch> {
+        own_output_batch(batch, owner)
+            .map_err(|error| vortex_index::VixError::Callback(error.into()))
+    }
+}
+
+struct CoreMemoryCharge {
+    reservation: Arc<parking_lot::Mutex<Option<MemoryReservation>>>,
+    live: Arc<AtomicUsize>,
+    bytes: usize,
+}
+
+impl Drop for CoreMemoryCharge {
+    fn drop(&mut self) {
+        if let Some(reservation) = self.reservation.lock().as_ref() {
+            reservation.shrink(self.bytes);
+        }
+        self.live.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
+/// Preserve the complete admitted native owner, including backing hidden by
+/// Arrow/Bytes slices. Never infer parent allocation size from visible capacity.
+struct OwnedOutputBuffer {
+    _buffer: arrow::buffer::Buffer,
+    _charge: Arc<dyn Send + Sync>,
+}
+
+fn own_output_buffer(
+    buffer: arrow::buffer::Buffer,
+    charge: &Arc<dyn Send + Sync>,
+) -> arrow::buffer::Buffer {
+    let ptr = std::ptr::NonNull::new(buffer.as_ptr() as *mut u8).expect("Arrow buffer pointer");
+    let len = buffer.len();
+    let owner = Arc::new(std::panic::AssertUnwindSafe(OwnedOutputBuffer {
+        _buffer: buffer,
+        _charge: Arc::clone(charge),
+    }));
+    // SAFETY: owner retains the exact immutable allocation supplying ptr/len.
+    unsafe { arrow::buffer::Buffer::from_custom_allocation(ptr, len, owner) }
+}
+
+fn own_output_data(
+    data: arrow::array::ArrayData,
+    charge: &Arc<dyn Send + Sync>,
+) -> arrow::array::ArrayData {
+    let buffers = data
+        .buffers()
+        .iter()
+        .cloned()
+        .map(|buffer| own_output_buffer(buffer, charge))
+        .collect();
+    let children = data
+        .child_data()
+        .iter()
+        .cloned()
+        .map(|child| own_output_data(child, charge))
+        .collect();
+    let nulls = data.nulls().map(|nulls| {
+        let bits = nulls.inner();
+        let buffer = arrow::buffer::BooleanBuffer::new(
+            own_output_buffer(bits.inner().clone(), charge),
+            bits.offset(),
+            bits.len(),
+        );
+        // SAFETY: identical immutable bits preserve the existing null count.
+        unsafe { arrow::buffer::NullBuffer::new_unchecked(buffer, nulls.null_count()) }
+    });
+    // SAFETY: only allocation owners changed; bytes, types, offsets, child
+    // lengths and null validity remain identical to the valid input ArrayData.
+    unsafe {
+        data.into_builder()
+            .buffers(buffers)
+            .child_data(children)
+            .nulls(nulls)
+            .build_unchecked()
+    }
+}
+
+fn own_output_batch(batch: RecordBatch, charge: Arc<dyn Send + Sync>) -> Result<RecordBatch> {
+    // Full native admission transfers before envelope credits release. The
+    // conservative charge survives every downstream slice/clone and bounds
+    // opaque parents without attempting to reconstruct allocator capacity.
+    let columns = batch
+        .columns()
+        .iter()
+        .map(|column| arrow::array::make_array(own_output_data(column.to_data(), &charge)))
+        .collect();
+    Ok(RecordBatch::try_new_with_options(
+        batch.schema(),
+        columns,
+        &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+    )?)
+}
+
+/// Read the operation's fixed counters when DataFusion snapshots metrics.
+/// CPU leaves update only their budget: no external callback can run there.
+#[derive(Debug)]
+struct CoreNativeMetric {
+    budget: Option<Arc<vortex_index::ScanCpuBudget>>,
+    index: usize,
+    accumulated: AtomicUsize,
+}
+
+impl CoreNativeMetric {
+    fn register(
+        budget: &Arc<vortex_index::ScanCpuBudget>,
+        metrics: &ExecutionPlanMetricsSet,
+        partition: usize,
+        location: &str,
+    ) {
+        let names = [
+            "vix_conversion_submitted",
+            "vix_conversion_completed",
+            "vix_conversion_inline_fallbacks",
+            "vix_conversion_max_file_peak_jobs",
+            "vix_conversion_max_file_peak_bytes",
+            "vix_conversion_queue_wait_ns",
+            "vix_conversion_wall_ns",
+            "vix_conversion_callback_wall_ns",
+        ];
+        for (index, name) in names.into_iter().enumerate() {
+            MetricBuilder::new(metrics)
+                .with_partition(partition)
+                .with_new_label("file", location.to_string())
+                .build(MetricValue::Custom {
+                    name: name.into(),
+                    value: Arc::new(Self {
+                        budget: Some(Arc::clone(budget)),
+                        index,
+                        accumulated: AtomicUsize::new(0),
+                    }),
+                });
+        }
+    }
+}
+
+impl fmt::Display for CoreNativeMetric {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.as_usize())
+    }
+}
+
+impl CustomMetricValue for CoreNativeMetric {
+    fn new_empty(&self) -> Arc<dyn CustomMetricValue> {
+        Arc::new(Self {
+            budget: None,
+            index: self.index,
+            accumulated: AtomicUsize::new(0),
+        })
+    }
+
+    fn aggregate(&self, other: Arc<dyn CustomMetricValue>) {
+        let value = other.as_usize();
+        if matches!(self.index, 3 | 4) {
+            self.accumulated.fetch_max(value, Ordering::Relaxed);
+        } else {
+            let _ =
+                self.accumulated
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                        Some(current.saturating_add(value))
+                    });
+        }
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_usize(&self) -> usize {
+        let value = self.budget.as_ref().map_or(0, |budget| {
+            let snapshot = budget.snapshot();
+            [
+                snapshot.submitted as u64,
+                snapshot.completed as u64,
+                snapshot.inline_fallbacks as u64,
+                snapshot.peak_jobs as u64,
+                snapshot.peak_bytes as u64,
+                snapshot.queue_wait_ns,
+                snapshot.conversion_wall_ns,
+                snapshot.callback_wall_ns,
+            ][self.index]
+                .min(usize::MAX as u64) as usize
+        });
+        let accumulated = self.accumulated.load(Ordering::Relaxed);
+        if matches!(self.index, 3 | 4) {
+            value.max(accumulated)
+        } else {
+            value.saturating_add(accumulated)
+        }
+    }
+
+    fn is_eq(&self, other: &Arc<dyn CustomMetricValue>) -> bool {
+        other
+            .as_any()
+            .downcast_ref::<Self>()
+            .is_some_and(|other| self.index == other.index && self.as_usize() == other.as_usize())
+    }
 }
 
 /// How the opener reaches one object's docs blob.
@@ -671,11 +1094,20 @@ impl FileOpener for VixCoreOpener {
         let emit_ts_desc = self.emit_ts_desc;
         let memory_pool = self.memory_pool.clone();
         let batch_size = self.batch_size;
+        let conversion_width = self.conversion_width;
+        let metrics = self.metrics.clone();
+        let partition = self.partition;
+        let predicate = native_predicate_strategy(
+            file.extensions
+                .get::<VixScanSelection>()
+                .map(|selection| selection.native_predicate)
+                .unwrap_or_default(),
+        );
         // Row selection from the inverted index, if any.
         let selection = file
             .extensions
             .get::<VixScanSelection>()
-            .map(|s| Arc::clone(&s.row_ids));
+            .and_then(|s| s.row_ids.clone());
 
         Ok(async move {
             let location = file.object_meta.location.clone();
@@ -692,11 +1124,10 @@ impl FileOpener for VixCoreOpener {
             let wants_ranged =
                 docs_range_source(&store, &file.object_meta, ranged_wanted).is_some();
 
-            // Register the scan with the session memory pool BEFORE holding
-            // the bytes: whole-object scans reserve the object size, ranged
-            // point reads only their decode window; both add 2 chunks for
-            // the in-flight batch channel. Failure here is the pool's
-            // pushback (ResourcesExhausted), not an OOM later.
+            // Preserve the existing serial source/open/controller allowance
+            // before holding input. Writer chunk targets are not a decoded
+            // memory or RSS proof. Parallel conversion separately reserves its
+            // audited encoding workspace and transferable backing below.
             let chunk_bytes = {
                 let configured = config::get_config().common.vix_docs_chunk_bytes;
                 if configured > 0 {
@@ -706,8 +1137,7 @@ impl FileOpener for VixCoreOpener {
                 }
             };
             let estimate = if wants_ranged {
-                // fetched windows are chunk-granular; two more chunks cover
-                // the streamed batches in flight
+                // Existing ranged-controller and channel allowance only.
                 chunk_bytes.saturating_mul(4)
             } else {
                 usize::try_from(file.object_meta.size)
@@ -730,6 +1160,39 @@ impl FileOpener for VixCoreOpener {
                     None => None,
                 }));
             let scan_reservation = Arc::clone(&reservation);
+            let io_stats = Arc::new(FetchStats::for_source(
+                metrics.clone(), partition, location.to_string(),
+            ));
+            let io_operation = ReadOperation::new(Arc::clone(&io_stats), None);
+            let operation_owner = io_operation.owner_guard();
+            let operation = Arc::new(CoreScanOperation {
+                io: Arc::clone(&io_operation),
+                reservation: Arc::clone(&reservation),
+                reader_high_water: parking_lot::Mutex::new(estimate),
+                options: parking_lot::Mutex::new(vortex_index::NativeScanOptions {
+                    predicate,
+                    conversion: None,
+                }),
+                downstream_wait_ns: MetricBuilder::new(&metrics)
+                    .with_new_label("file", location.to_string())
+                    .counter("vix_downstream_wait_ns", partition),
+                live_owned_bytes: Arc::new(AtomicUsize::new(0)),
+                peak_owned_bytes: AtomicUsize::new(0),
+                peak_reserved_bytes: MetricBuilder::new(&metrics)
+                    .with_new_label("file", location.to_string())
+                    .counter("vix_conversion_file_peak_reserved_bytes_sum", partition),
+                metrics,
+                partition,
+                location: location.to_string(),
+            });
+            // This is an admission ceiling, not a decoded-size estimate. The
+            // encoding-tree proof decides whether each chunk fits it.
+            let conversion_bytes = memory_pool.as_ref().and_then(|pool| {
+                match pool.memory_limit() {
+                    MemoryLimit::Finite(bytes) => NonZeroUsize::new(bytes.saturating_sub(pool.reserved())),
+                    _ => None,
+                }
+            });
 
             // M19: when this file's object is gone from the store (deleted
             // externally, e.g. S3 lifecycle expiry) the scan DEGRADES — the
@@ -743,7 +1206,9 @@ impl FileOpener for VixCoreOpener {
             // `_source` scans below the configured threshold retain a
             // single whole-object get for cache locality.
             let input = match docs_range_source(&store, &file.object_meta, ranged_wanted) {
-                Some(source) => DocsInput::Ranged(source),
+                Some(source) => DocsInput::Ranged(io_operation.run(|| {
+                    source.for_current_operation().unwrap_or(source)
+                })),
                 None => {
                     let bytes = async {
                         store
@@ -782,6 +1247,9 @@ impl FileOpener for VixCoreOpener {
             let panic_location = location.clone();
             let handle = VORTEX_RUNTIME.spawn_blocking(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    io_operation.run(|| vortex_index::with_read_operation(
+                        operation.clone(),
+                        || {
                     input.open().and_then(|docs| {
                         // file-level skip: the predicate provably matches
                         // nothing in this file (footer metadata only — zero
@@ -795,9 +1263,30 @@ impl FileOpener for VixCoreOpener {
                             log::debug!("vix scan: skipped {location} ({tier})");
                             return Ok(());
                         }
+                        let pure_native_projection = !projected_schema.fields().is_empty()
+                            && projected_schema.fields().iter().all(|field| {
+                                docs.schema().field_with_name(field.name())
+                                    .is_ok_and(|stored| stored.data_type() == field.data_type())
+                                    && !matches!(field.name().as_str(), SOURCE_COL_NAME | config::ORIGINAL_DATA_COL_NAME)
+                            });
+                        if wants_ranged && selection.is_none() && pure_native_projection
+                            && (!emit_ts_desc || docs.row_order().is_ts_desc())
+                            && config::get_config().common.vix_scan_decode_threads <= 1
+                            && let (Some(width), Some(bytes)) = (conversion_width, conversion_bytes)
+                        {
+                            let budget = Arc::new(vortex_index::ScanCpuBudget::new(width, bytes));
+                            CoreNativeMetric::register(&budget, &operation.metrics,
+                                operation.partition, &operation.location);
+                            operation.options.lock().conversion = Some(budget);
+                        }
                         let mut send = |batch: RecordBatch| {
-                            tx.blocking_send(Ok(batch))
-                                .map_err(|_| anyhow::anyhow!("scan consumer dropped"))
+                            let started = Instant::now();
+                            let result = tx.blocking_send(Ok(batch))
+                                .map_err(|_| anyhow::anyhow!("scan consumer dropped"));
+                            operation.downstream_wait_ns.add(
+                                elapsed_ns(started).min(usize::MAX as u64) as usize,
+                            );
+                            result
                         };
                         // §6.2: under a declared-sort table a CONCAT file
                         // streams through the k-way region merge (its rows
@@ -834,7 +1323,36 @@ impl FileOpener for VixCoreOpener {
                             &mut send,
                         )
                     })
+                        },
+                    ))
                 }));
+                // This point is after the controller and every started CPU leaf
+                // have returned, including unwind/cancellation drains. Keep the
+                // exact registered location for query+file attribution: normal
+                // distributed plan rendering intentionally aggregates labels.
+                let conversion_budget = operation.options.lock().conversion.clone();
+                if let Some(budget) = conversion_budget {
+                    let snapshot = budget.snapshot();
+                    let outcome = match &result {
+                        Ok(Ok(())) => "ok",
+                        Ok(Err(_)) => "error",
+                        Err(_) => "panic",
+                    };
+                    log::info!(
+                        "vix conversion scan complete: location={:?}, outcome={}, cancelled={}, submitted={}, completed={}, inline_fallbacks={}, peak_jobs={}, peak_bytes={}, queue_wait_ns={}, conversion_wall_ns={}, callback_wall_ns={}, scope=controller_complete",
+                        operation.location,
+                        outcome,
+                        operation.io.is_cancelled(),
+                        snapshot.submitted,
+                        snapshot.completed,
+                        snapshot.inline_fallbacks,
+                        snapshot.peak_jobs,
+                        snapshot.peak_bytes,
+                        snapshot.queue_wait_ns,
+                        snapshot.conversion_wall_ns,
+                        snapshot.callback_wall_ns,
+                    );
+                }
                 match result {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => {
@@ -888,9 +1406,10 @@ impl FileOpener for VixCoreOpener {
                 }
             });
 
-            // The reservation lives exactly as long as the stream.
+            // Cancellation follows the receiver, while started CPU/IO work
+            // retains its own strong reservation until it actually exits.
             let stream = ReceiverStream::new(rx).map(move |item| {
-                let _hold = &reservation;
+                let _hold = (&reservation, &operation_owner);
                 item
             });
             Ok(stream.boxed())
@@ -1114,8 +1633,19 @@ impl LogicalProjectionPlan {
     fn new(docs: &VixDocs, projected_schema: &SchemaRef) -> anyhow::Result<Self> {
         let docs_schema = docs.schema();
 
-        // Split the logical columns into physical passthroughs and _source
-        // extractions.
+        // Missing ordinary fields need _source only without a per-file
+        // completeness proof. Reserved fields keep their existing semantics.
+        let proven_absent = |field: &Field| {
+            docs.columns_complete()
+                && !matches!(
+                    field.name().as_str(),
+                    TIMESTAMP_COL_NAME
+                        | SOURCE_COL_NAME
+                        | config::ORIGINAL_DATA_COL_NAME
+                        | config::ID_COL_NAME
+                )
+                && docs_schema.field_with_name(field.name()).is_err()
+        };
         let mut physical_projection: Vec<String> = Vec::new();
         let mut needs_source = false;
         for field in projected_schema.fields() {
@@ -1123,7 +1653,9 @@ impl LogicalProjectionPlan {
                 if !physical_projection.iter().any(|n| n == field.name()) {
                     physical_projection.push(field.name().clone());
                 }
-            } else {
+            } else if field.name() == TIMESTAMP_COL_NAME {
+                anyhow::bail!("docs blob is missing the {TIMESTAMP_COL_NAME:?} column");
+            } else if !proven_absent(field) {
                 needs_source = true;
             }
         }
@@ -1131,7 +1663,7 @@ impl LogicalProjectionPlan {
             physical_projection.push(SOURCE_COL_NAME.to_string());
         }
         if physical_projection.is_empty() {
-            // Zero-column scans (e.g. bare COUNT(*)) still need row counts;
+            // Zero-column and all-NULL scans still need row counts;
             // `_timestamp` is always present and cheap.
             physical_projection.push(TIMESTAMP_COL_NAME.to_string());
         }
@@ -1151,7 +1683,16 @@ impl LogicalProjectionPlan {
         let exprs = projected_schema
             .fields()
             .iter()
-            .map(|field| logical_column_expr(field, &scan_schema, &config_options))
+            .map(|field| {
+                if proven_absent(field) {
+                    Ok(
+                        Arc::new(Literal::new(ScalarValue::try_from(field.data_type())?))
+                            as Arc<dyn PhysicalExpr>,
+                    )
+                } else {
+                    logical_column_expr(field, &scan_schema, &config_options)
+                }
+            })
             .collect::<anyhow::Result<Vec<_>>>()?;
 
         Ok(Self {
@@ -1348,6 +1889,73 @@ pub fn derive_cs_column_from_source(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn admitted_output_owner_survives_slices_and_duplicate_columns() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Charge(Arc<AtomicUsize>);
+        impl Drop for Charge {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let released = Arc::new(AtomicUsize::new(0));
+        let charge: Arc<dyn Send + Sync> = Arc::new(Charge(Arc::clone(&released)));
+        let values: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("retained parent"),
+            None,
+            Some("last"),
+        ]));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("second", DataType::Utf8, true),
+            Field::new("first", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![values.clone(), values]).unwrap();
+        let owned = own_output_batch(batch, charge).unwrap();
+        assert_eq!(owned.num_columns(), 2);
+        assert_eq!(
+            owned
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(2),
+            "last"
+        );
+        assert_eq!(
+            owned
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "retained parent"
+        );
+        let null_slice = owned.slice(1, 1);
+        let retained_column = null_slice.column(1).clone();
+        drop(owned);
+        drop(null_slice);
+        assert!(retained_column.is_null(0));
+        assert_eq!(released.load(Ordering::SeqCst), 0);
+        drop(retained_column);
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn callback_unwind_releases_unpublished_output_owner() {
+        let owner = Arc::new(());
+        let weak = Arc::downgrade(&owner);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let batch = RecordBatch::try_from_iter([(
+                "value",
+                Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+            )])
+            .unwrap();
+            let _owned = own_output_batch(batch, owner).unwrap();
+            panic!("consumer panic");
+        }));
+        assert!(result.is_err());
+        assert!(weak.upgrade().is_none());
+    }
     use arrow::array::StringArray;
     use config::utils::vix::docs_blob_from_vix_bytes;
     use datafusion::{
@@ -2833,49 +3441,6 @@ mod review_tests {
         assert_eq!(derived_empty.data_type(), &DataType::Int64);
     }
 
-    /// Projection planning must not read `_source` when every requested
-    /// logical column exists natively in the docs blob, must add `_source`
-    /// exactly once for any number of extracted columns, and must fall back
-    /// to `_timestamp` for zero-column scans.
-    #[test]
-    fn review_source_read_only_when_needed() {
-        let docs = VixDocs::open(build_core_file()).unwrap();
-
-        // all physical (docs blob = _timestamp, code, _source): no _source
-        let physical_only: SchemaRef = Arc::new(Schema::new(vec![
-            Field::new("_timestamp", DataType::Int64, false),
-            Field::new("code", DataType::Int64, true),
-        ]));
-        let plan = LogicalProjectionPlan::new(&docs, &physical_only).unwrap();
-        assert_eq!(plan.physical_projection, vec!["_timestamp", "code"]);
-        assert!(
-            !plan
-                .physical_projection
-                .iter()
-                .any(|n| n == SOURCE_COL_NAME),
-            "SELECT of only physical columns must not fetch _source"
-        );
-
-        // two extracted columns: _source appended exactly once
-        let extracted: SchemaRef = Arc::new(Schema::new(vec![
-            Field::new("level", DataType::Utf8, true),
-            Field::new("http.status", DataType::Utf8, true),
-        ]));
-        let plan = LogicalProjectionPlan::new(&docs, &extracted).unwrap();
-        assert_eq!(
-            plan.physical_projection
-                .iter()
-                .filter(|n| n.as_str() == SOURCE_COL_NAME)
-                .count(),
-            1
-        );
-
-        // zero columns (COUNT(*)): row counts via _timestamp only
-        let empty: SchemaRef = Arc::new(Schema::empty());
-        let plan = LogicalProjectionPlan::new(&docs, &empty).unwrap();
-        assert_eq!(plan.physical_projection, vec![TIMESTAMP_COL_NAME]);
-    }
-
     /// The output columns must follow the REQUESTED projection order even
     /// when it differs from the docs-blob column order (guards the
     /// re-keying of the scanned batch against `scan_schema` by position).
@@ -2885,10 +3450,12 @@ mod review_tests {
         let projected: SchemaRef = Arc::new(Schema::new(vec![
             Field::new("code", DataType::Int64, true),
             Field::new("_timestamp", DataType::Int64, false),
+            Field::new("code", DataType::Int64, true),
         ]));
         let batches = scan_all(build_core_file(), projected, None, None);
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(rows, 4);
+        assert_eq!(batches[0].column(0), batches[0].column(2));
         let code = batches[0].column_by_name("code").unwrap();
         let code = code.as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(code.value(0), 200);
@@ -3115,6 +3682,9 @@ mod review_tests {
             projected_schema: logical_schema(),
             timestamp_filter: None,
             memory_pool: None,
+            conversion_width: None,
+            metrics: ExecutionPlanMetricsSet::new(),
+            partition: 0,
         };
         let mut file = PartitionedFile::new(path.to_string(), meta.size);
         file.object_meta = meta;
@@ -3346,6 +3916,7 @@ mod ranged_tests {
     #[derive(Debug)]
     struct RangeOnlyStore {
         inner: InMemory,
+        reads: std::sync::atomic::AtomicUsize,
     }
 
     impl std::fmt::Display for RangeOnlyStore {
@@ -3361,6 +3932,8 @@ mod ranged_tests {
             location: &Path,
             options: GetOptions,
         ) -> ObjectStoreResult<GetResult> {
+            self.reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if options.range.is_none() && !options.head {
                 return Err(ObjectStoreError::Generic {
                     store: "RangeOnlyStore",
@@ -3423,6 +3996,7 @@ mod ranged_tests {
         let data = build_core_file();
         let store: Arc<dyn ObjectStore> = Arc::new(RangeOnlyStore {
             inner: InMemory::new(),
+            reads: Default::default(),
         });
         let path = Path::from("stream/narrow.vix");
         store.put(&path, data.into()).await.unwrap();
@@ -3442,6 +4016,9 @@ mod ranged_tests {
             projected_schema,
             timestamp_filter: None,
             memory_pool: None,
+            conversion_width: None,
+            metrics: ExecutionPlanMetricsSet::new(),
+            partition: 0,
         };
         let mut file = PartitionedFile::new(path.to_string(), meta.size);
         file.object_meta = meta;
@@ -3466,6 +4043,7 @@ mod ranged_tests {
         let data = build_core_file();
         let store: Arc<dyn ObjectStore> = Arc::new(RangeOnlyStore {
             inner: InMemory::new(),
+            reads: Default::default(),
         });
         let path = Path::from("stream/f1.vix");
         store.put(&path, data.clone().into()).await.unwrap();
@@ -3532,6 +4110,248 @@ mod ranged_tests {
             stats.column_statistics[ts_index].min_value,
             Precision::Exact(ScalarValue::Int64(Some(1000)))
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn snapshot_statistics_skip_io_only_for_qualified_files() {
+        use config::meta::{
+            search::StorageType,
+            stream::{FileKey, FileMeta, FileSelection},
+        };
+        use datafusion::{
+            datasource::{
+                listing::{ListingOptions, ListingTableConfig, ListingTableUrl},
+                object_store::{DefaultObjectStoreRegistry, ObjectStoreRegistry},
+            },
+            execution::runtime_env::RuntimeEnvBuilder,
+            prelude::SessionContext,
+        };
+
+        use crate::datafusion::{
+            exec::create_session_config, storage::file_list,
+            table_provider::listing_adapter::ListingTableAdapter,
+        };
+
+        let fixture = rand::random::<u64>();
+        let data = build_core_file();
+        let counted_store = Arc::new(RangeOnlyStore {
+            inner: InMemory::new(),
+            reads: Default::default(),
+        });
+        let store: Arc<dyn ObjectStore> = counted_store.clone();
+        let state = datafusion::prelude::SessionContext::new().state();
+        let schema = logical_schema();
+        let format = VixCoreFormat::new(None);
+        let valid = FileMeta {
+            records: 4,
+            min_ts: 1000,
+            max_ts: 1003,
+            compressed_size: data.len() as i64,
+            ..Default::default()
+        };
+        for case in 0..13 {
+            let trace = format!("snapshot-stat-io-{fixture}-{case}");
+            let mut file = FileKey::new(
+                1,
+                "account".into(),
+                format!("files/default/logs/snapshot/2026/01/01/00/{fixture}-{case}.vix"),
+                valid.clone(),
+                false,
+            );
+            let mut storage_type = StorageType::Memory;
+            let mut inferred_schema = schema.clone();
+            match case {
+                0 => {
+                    file.with_selection(
+                        FileSelection::Rows(Arc::new(RowIdBitmap::from_row_ids(4, [0, 2, 3]))),
+                        None,
+                    );
+                    file.selection_exact = true;
+                }
+                1 => {
+                    file.meta.records = 0;
+                    file.meta.min_ts = 0;
+                    file.meta.max_ts = 0;
+                }
+                2 => file.meta.records = -1,
+                3 => {
+                    file.meta.records = 99;
+                    file.meta.max_ts = 999;
+                }
+                4 => {
+                    file.meta.records = 99;
+                    file.meta.min_ts = 0;
+                }
+                5 => {
+                    file.id = 0;
+                    file.meta.records = 99;
+                }
+                6 => {
+                    storage_type = StorageType::Wal;
+                    file.meta.records = 99;
+                }
+                7 => {
+                    file.meta.compressed_size = -1;
+                    file.meta.records = 99;
+                }
+                8 => {
+                    file.deleted = true;
+                    file.meta.records = 99;
+                }
+                9 => {
+                    file.meta.max_ts = i64::MAX;
+                    file.meta.records = 99;
+                }
+                10 => {
+                    file.meta.records = 99;
+                    let fields = schema
+                        .fields()
+                        .iter()
+                        .map(|field| {
+                            if field.name() == TIMESTAMP_COL_NAME {
+                                Arc::new(Field::new(TIMESTAMP_COL_NAME, DataType::Float64, false))
+                            } else {
+                                field.clone()
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    inferred_schema = Arc::new(Schema::new(fields));
+                }
+                11 => {
+                    file.meta.records = 99;
+                    let mut fields = schema.fields().to_vec();
+                    fields.push(Arc::new(Field::new("another_schema", DataType::Utf8, true)));
+                    inferred_schema = Arc::new(Schema::new(fields));
+                }
+                12 => file.meta = FileMeta::default(),
+                _ => unreachable!(),
+            }
+            let registered_schema = if case == 10 {
+                inferred_schema.clone()
+            } else {
+                schema.clone()
+            };
+            file_list::set(
+                &trace,
+                &trace,
+                "schema",
+                "vix",
+                vec![file],
+                storage_type,
+                registered_schema,
+            )
+            .await;
+            let objects = file_list::get(&format!("{trace}/schema=schema/format=vix")).unwrap();
+            let object = objects[0].clone();
+            store
+                .put(&object.location, data.clone().into())
+                .await
+                .unwrap();
+            let object = file_list::resolve_listing_object(object, store.as_ref())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(object.size, data.len() as u64);
+            let before = counted_store
+                .reads
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let statistics = format
+                .infer_stats(&state, &store, inferred_schema, &object)
+                .await
+                .unwrap();
+            assert_eq!(statistics.num_rows, Precision::Exact(4), "case {case}");
+            let reads = counted_store
+                .reads
+                .load(std::sync::atomic::Ordering::Relaxed)
+                - before;
+            if case == 0 {
+                assert_eq!(reads, 0, "qualified snapshot facts require no object read");
+                let ts = schema.index_of(TIMESTAMP_COL_NAME).unwrap();
+                assert_eq!(
+                    statistics.column_statistics[ts].min_value,
+                    Precision::Exact(ScalarValue::Int64(Some(1000)))
+                );
+                assert_eq!(
+                    statistics.column_statistics[ts].max_value,
+                    Precision::Exact(ScalarValue::Int64(Some(1003)))
+                );
+                // Whole-file facts must never answer COUNT after scan-time
+                // bitmap/time filtering: only row 1002 survives both here.
+                let registry = DefaultObjectStoreRegistry::new();
+                registry.register_store(&url::Url::parse("test:///").unwrap(), store.clone());
+                let runtime = RuntimeEnvBuilder::new()
+                    .with_object_store_registry(Arc::new(registry))
+                    .build()
+                    .unwrap();
+                // Registered objects live below request/account directories;
+                // use the production listing configuration rather than DF's
+                // default, which silently ignores these nested objects.
+                let ctx = SessionContext::new_with_config_rt(
+                    create_session_config(false, 1).unwrap(),
+                    Arc::new(runtime),
+                );
+                let options = ListingOptions::new(Arc::new(VixCoreFormat::new(Some((1001, 1003)))))
+                    .with_collect_stat(true);
+                let config = ListingTableConfig::new(
+                    ListingTableUrl::parse(format!("test:///{trace}/schema=schema/format=vix/"))
+                        .unwrap(),
+                )
+                .with_listing_options(options)
+                .with_schema(schema.clone());
+                let table = ListingTableAdapter::try_new(
+                    config,
+                    trace.clone(),
+                    None,
+                    vec![],
+                    Some((1001, 1003)),
+                    None,
+                )
+                .unwrap();
+                ctx.register_table("t", Arc::new(table)).unwrap();
+                let batches = ctx
+                    .sql("SELECT COUNT(*) FROM t")
+                    .await
+                    .unwrap()
+                    .collect()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    batches[0]
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .value(0),
+                    1
+                );
+                let batches = ctx
+                    .sql("SELECT _timestamp FROM t ORDER BY _timestamp")
+                    .await
+                    .unwrap()
+                    .collect()
+                    .await
+                    .unwrap();
+                let timestamps = batches
+                    .iter()
+                    .flat_map(|batch| {
+                        batch
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .unwrap()
+                            .values()
+                            .to_vec()
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(timestamps, vec![1002]);
+            } else {
+                assert!(
+                    reads > 0,
+                    "unproven case {case} must consult the real container"
+                );
+            }
+            file_list::clear(&trace);
+        }
     }
 }
 
@@ -3651,12 +4471,13 @@ mod m4_pruning_tests {
 
     use super::*;
 
-    /// One file with `_timestamp` + `level` columns (optionally stamped
-    /// `columns_complete`); `hidden` optionally smuggles a `ghost` field
-    /// into `_source` WITHOUT a column — the deliberate invariant violation
-    /// that makes a fired presence skip OBSERVABLE (a scan that reaches
-    /// json_get would find the values; a skipped file returns nothing).
+    /// Honest complete files have every ordinary field in their native schema;
+    /// incomplete files may carry `ghost` and a literal dotted key in _source.
     fn build_presence_file(complete: bool, hidden: bool) -> bytes::Bytes {
+        assert!(
+            !(complete && hidden),
+            "a complete fixture must not hide ordinary fields"
+        );
         let schema = Arc::new(Schema::new(vec![
             Field::new("_timestamp", DataType::Int64, false),
             Field::new("level", DataType::Utf8, true),
@@ -3671,7 +4492,7 @@ mod m4_pruning_tests {
             .iter()
             .map(|t| {
                 if hidden {
-                    format!(r#"{{"_timestamp":{t},"level":"info","ghost":"boo"}}"#)
+                    format!(r#"{{"_timestamp":{t},"level":"info","ghost":"boo","ghost.dotted":"literal"}}"#)
                 } else {
                     format!(r#"{{"_timestamp":{t},"level":"info"}}"#)
                 }
@@ -3842,18 +4663,13 @@ mod m4_pruning_tests {
         Ok(batches.iter().map(|b| b.num_rows()).sum())
     }
 
-    /// E2E §4 presence pruning through the injector + opener: the file is
-    /// stamped columns-complete BUT its `_source` secretly carries `ghost`
-    /// values (the deliberate lie that makes the skip observable). Every
-    /// null-rejecting shape returns 0 rows — json_get was never consulted —
-    /// while the null-ACCEPTING shapes return all rows, proving both the
-    /// skip and its exact null-semantics boundary.
+    /// Presence pruning and typed-NULL projection must agree on an honest
+    /// complete file, including null-accepting predicates and cross-field OR.
     #[tokio::test]
     async fn presence_pruning_e2e_null_semantics() -> Result<()> {
-        let ctx = presence_ctx(vec![("data/lying.vix", build_presence_file(true, true))]).await?;
+        let ctx = presence_ctx(vec![("data/honest.vix", build_presence_file(true, false))]).await?;
 
-        // null-rejecting shapes on the absent column: the presence skip
-        // fires BEFORE the scan could fall back to json_get(_source)
+        // Null-rejecting predicates cannot match a proven absent column.
         for sql in [
             "SELECT _timestamp FROM t WHERE ghost = 'boo'",
             "SELECT _timestamp FROM t WHERE ghost != 'x'",
@@ -3872,8 +4688,7 @@ mod m4_pruning_tests {
             );
         }
 
-        // OR across DIFFERENT columns never presence-prunes (intersection
-        // is empty): the rows survive through the json_get fallback branch
+        // A different column's OR arm still keeps the rows.
         assert_eq!(
             run_counting(
                 &ctx,
@@ -3886,7 +4701,6 @@ mod m4_pruning_tests {
         // null-ACCEPTING shapes must NOT prune. Pinned on an HONEST
         // columns-complete file whose `ghost` really is all-NULL: a wrong
         // presence skip would return 0 where the truth is every row.
-        let ctx = presence_ctx(vec![("data/honest.vix", build_presence_file(true, false))]).await?;
         for sql in [
             "SELECT _timestamp FROM t WHERE ghost IS NULL",
             "SELECT _timestamp FROM t WHERE COALESCE(ghost, 'x') = 'x'",
@@ -3921,21 +4735,11 @@ mod m4_pruning_tests {
     fn present_column_native_absent_column_json_get() {
         let docs = VixDocs::open(build_presence_file(false, true)).unwrap();
 
-        // present only: native reference, _source NOT fetched
-        let present_only: SchemaRef =
-            Arc::new(Schema::new(vec![Field::new("level", DataType::Utf8, true)]));
-        let plan = LogicalProjectionPlan::new(&docs, &present_only).unwrap();
-        assert_eq!(plan.physical_projection, vec!["level"]);
-
-        // absent column: _source fetched exactly once, extraction is NULL
-        // where _source lacks the key and the value where it has it
         let mixed: SchemaRef = Arc::new(Schema::new(vec![
             Field::new("level", DataType::Utf8, true),
             Field::new("ghost", DataType::Utf8, true),
             Field::new("never_anywhere", DataType::Utf8, true),
         ]));
-        let plan = LogicalProjectionPlan::new(&docs, &mixed).unwrap();
-        assert_eq!(plan.physical_projection, vec!["level", SOURCE_COL_NAME]);
 
         let mut batches = Vec::new();
         scan_core_docs(docs, &mixed, None, None, &[], usize::MAX, &mut |batch| {
@@ -3953,6 +4757,89 @@ mod m4_pruning_tests {
             assert_eq!(level.value(row), "info", "native column read");
             assert_eq!(ghost.value(row), "boo", "json_get extraction");
             assert!(never.is_null(row), "absent everywhere: NULL");
+        }
+    }
+
+    #[test]
+    fn complete_absence_preserves_types_slots_and_source() {
+        for complete in [true, false] {
+            let data = build_presence_file(complete, !complete);
+            let projected = Arc::new(Schema::new(vec![
+                Field::new("ghost.dotted", DataType::Utf8, true),
+                Field::new("level", DataType::Utf8, true),
+                Field::new(TIMESTAMP_COL_NAME, DataType::Float64, false),
+                Field::new("ghost.dotted", DataType::Utf8, true),
+                Field::new("missing_number", DataType::UInt64, true),
+                Field::new("_original", DataType::Utf8, true),
+                Field::new(SOURCE_COL_NAME, DataType::Utf8, true),
+            ]));
+            let mut batches = Vec::new();
+            scan_core_file(data.clone(), &projected, None, None, &mut |batch| {
+                batches.push(batch);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 4);
+            for batch in batches {
+                assert_eq!(batch.schema(), projected);
+                assert_eq!(batch.column(0), batch.column(3));
+                let dotted = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                let level = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                let timestamp = batch
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<arrow::array::Float64Array>()
+                    .unwrap();
+                let source = batch
+                    .column(6)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                for row in 0..batch.num_rows() {
+                    assert_eq!(dotted.is_null(row), complete);
+                    if !complete {
+                        assert_eq!(dotted.value(row), "literal");
+                    }
+                    assert_eq!(level.value(row), "info");
+                    assert_eq!(timestamp.value(row), 1000.0 - row as f64);
+                    assert!(batch.column(4).is_null(row));
+                    assert!(batch.column(5).is_null(row));
+                    let source: serde_json::Value =
+                        serde_json::from_str(source.value(row)).unwrap();
+                    assert_eq!(source["level"], "info");
+                }
+            }
+            if complete {
+                let nulls = Arc::new(Schema::new(vec![
+                    Field::new("absent", DataType::Utf8, true),
+                    Field::new("absent_uint", DataType::UInt64, true),
+                ]));
+                let mut rows = 0;
+                scan_core_file(data, &nulls, None, Some((998, 1000)), &mut |batch| {
+                    assert_eq!(batch.schema(), nulls);
+                    assert!(
+                        batch
+                            .columns()
+                            .iter()
+                            .all(|column| column.null_count() == batch.num_rows())
+                    );
+                    rows += batch.num_rows();
+                    Ok(())
+                })
+                .unwrap();
+                assert_eq!(
+                    rows, 2,
+                    "all-NULL projection retains filtered row cardinality"
+                );
+            }
         }
     }
 }

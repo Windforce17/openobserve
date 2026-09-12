@@ -59,7 +59,6 @@ pub async fn search(
     file_stat_cache: Option<Arc<dyn FileStatisticsCache>>,
     mut index_condition: Option<IndexCondition>,
     mut fst_fields: Vec<String>,
-    bloom_indexed_fields: Vec<String>,
     idx_optimize_rule: Option<IndexOptimizeMode>,
 ) -> super::SearchTable {
     let super::QueryParams {
@@ -92,46 +91,13 @@ pub async fn search(
     let condition_all = index_condition
         .as_ref()
         .is_some_and(IndexCondition::is_condition_all);
-    if *use_inverted_index && !condition_all {
-        // check bloom filter first
-        let (bloom_took, ok) = check_bloom_filter(
-            query.clone(),
-            &mut files,
-            index_condition.as_ref(),
-            bloom_indexed_fields,
-        )
-        .await?;
-        if ok {
-            log::info!(
-            "{}",
-            search_inspector_fields(
-                format!(
-                    "[trace_id {trace_id}] search->bloom: stream {org_id}/{stream_type}/{stream_name}, bloom filter reduced file_list num to {} in {bloom_took} ms",
-                    files.len(),
-                ),
-                SearchInspectorFieldsBuilder::new()
-                    .trace_id(trace_id.to_string())
-                    .node_name(LOCAL_NODE.name.clone())
-                    .component("storage bloom filter reduced file_list num".to_string())
-                    .search_role("follower".to_string())
-                    .duration(idx_took)
-                    .desc(format!(
-                        "bloom filter reduced file_list from {original_files_len} to {} in {bloom_took} ms",
-                        files.len(),
-                    ))
-                    .build()
-                )
-            );
-        }
-    }
 
     // The vix index also answers the no-filter SimpleSelect (bare
     // `SELECT * ORDER BY _timestamp LIMIT n`, condition ALL): its exact
     // `_timestamp` candidates prune the file list to the global top-N and
     // narrow the winners to row selections (file-level early termination +
     // row-level late materialization). Every other condition-ALL shape has
-    // nothing for the index to answer, and bloom above always needs real
-    // terms.
+    // nothing for the index to answer.
     let vix_applicable =
         vix_search_applicable(*use_inverted_index, condition_all, &idx_optimize_rule);
     if vix_applicable {

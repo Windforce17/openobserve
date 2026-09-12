@@ -16,5 +16,6 @@
 pub mod add_sort_and_limit;
 #[cfg(feature = "enterprise")]
 pub mod cipher;
+pub mod fuse_approx_percentiles;
 pub mod limit_join_right_side;
 pub mod rewrite_histogram;

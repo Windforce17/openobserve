@@ -166,7 +166,7 @@ async fn get_wal_batches(
     let mut physical_plan = ctx.state().create_physical_plan(plan).await?;
 
     let remote_scan_node = RemoteScanNode {
-        nodes: nodes.into_arc_vec(),
+        nodes: nodes.into_arc_vec().into(),
         opentelemetry_context: tracing::Span::current().context(),
         query_identifier: QueryIdentifier {
             trace_id: trace_id.to_string(),
@@ -177,8 +177,8 @@ async fn get_wal_batches(
             enrich_mode: false,
         },
         search_infos: SearchInfos {
-            plan: vec![],         // set in RemoteScanNode
-            file_id_list: vec![], // not needed for wal
+            plan: Default::default(),         // set in RemoteScanNode
+            file_id_list: Default::default(), // not needed for wal
             start_time: time_range.0,
             end_time: time_range.1,
             timeout: cfg.limit.query_timeout,

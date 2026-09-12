@@ -64,6 +64,7 @@ impl TableProvider for StorageProvider {
         let trace_id = self.trace_id.to_owned() + "-storage-" + stream_name;
         let ctx = storage::create_context(
             &trace_id,
+            &self.trace_id,
             org_id,
             stream_name,
             time_range,

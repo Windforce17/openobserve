@@ -282,9 +282,9 @@ pub enum FileSelection {
 /// Row ids matched by the inverted index for one data file, as a compressed
 /// (roaring) bitmap over the row-id universe `0..num_rows`.
 ///
-/// The vix skip guard caps every surviving selection at the skip threshold
-/// (~35% density) and the common needle case matches a handful of rows out
-/// of millions, so this form is typically orders of magnitude smaller than
+/// The vix skip guard caps evaluated bitmap selections at the skip threshold
+/// (~35% density); metadata-proven all-row answers use compact runs. The common
+/// needle case matches a handful of rows out of millions, so this is smaller than
 /// the dense one-bit-per-row `BooleanBuffer` it replaced (512 KB for a 4M-row
 /// file regardless of match count). That matters because values of this type
 /// are RESIDENT: they live in the vix result cache, on
@@ -300,6 +300,18 @@ pub struct RowIdBitmap {
 }
 
 impl RowIdBitmap {
+    /// A proven all-row answer, encoded as runs without a dense bitmap or
+    /// expanded row-id vector.
+    pub fn all_rows(num_rows: u32) -> Self {
+        let mut rows = RoaringBitmap::new();
+        rows.insert_range(0..num_rows);
+        rows.optimize();
+        Self {
+            rows,
+            num_rows: num_rows as usize,
+        }
+    }
+
     /// Compress a dense per-row match bitmap (one bit per row of the file).
     pub fn from_dense(bits: &BooleanBuffer) -> Self {
         let mut rows = RoaringBitmap::new();
@@ -393,6 +405,15 @@ impl RowIdBitmap {
     }
 }
 
+/// Request-local native predicate execution; never persisted or sent on the wire.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum NativePredicateStrategy {
+    #[default]
+    BoundedPrepass,
+    DirectResidual,
+    NativeStringEq,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct FileKey {
     pub id: i64,
@@ -407,6 +428,7 @@ pub struct FileKey {
     /// re-applied filter. A partial selection (some condition skipped) is a
     /// superset the re-applied filter narrows.
     pub selection_exact: bool,
+    pub native_predicate: NativePredicateStrategy,
 }
 
 impl FileKey {
@@ -420,6 +442,7 @@ impl FileKey {
             selection: None,
             row_group_size: None,
             selection_exact: false,
+            native_predicate: NativePredicateStrategy::default(),
         }
     }
 
@@ -433,6 +456,7 @@ impl FileKey {
             selection: None,
             row_group_size: None,
             selection_exact: false,
+            native_predicate: NativePredicateStrategy::default(),
         }
     }
 
@@ -841,6 +865,7 @@ impl From<&cluster_rpc::FileKey> for FileKey {
             selection: None,
             row_group_size: None,
             selection_exact: false,
+            native_predicate: NativePredicateStrategy::default(),
         }
     }
 }

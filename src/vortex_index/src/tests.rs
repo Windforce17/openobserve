@@ -14125,3 +14125,6 @@ mod query_io;
 
 #[path = "tests/disjoint_proof.rs"]
 mod disjoint_proof;
+
+#[path = "tests/dictionary_points.rs"]
+mod dictionary_points;

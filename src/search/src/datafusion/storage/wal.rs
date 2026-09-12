@@ -14,7 +14,7 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use async_trait::async_trait;
-use futures::{StreamExt, stream::BoxStream};
+use futures::{StreamExt, TryStreamExt, stream::BoxStream};
 use infra::storage;
 use object_store::{
     CopyOptions, Error, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
@@ -57,14 +57,16 @@ impl ObjectStore for FS {
             Ok(objects) => objects,
             Err(e) => {
                 log::error!("Error getting file list for wal storage: {e}");
-                vec![]
+                return futures::stream::empty().boxed();
             }
         };
-        let values = objects
-            .iter()
-            .map(|file| Ok(file.to_owned()))
-            .collect::<Vec<Result<ObjectMeta>>>();
-        futures::stream::iter(values).boxed()
+        futures::stream::unfold((objects, 0), |(objects, index)| async move {
+            let file = objects.get(index)?.clone();
+            let result = super::file_list::resolve_listing_object(file, &FS::new()).await;
+            Some((result, (objects, index + 1)))
+        })
+        .try_filter_map(|file| futures::future::ready(Ok(file)))
+        .boxed()
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {

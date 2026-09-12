@@ -287,6 +287,100 @@ mod tests {
         }
         assert_eq!(rows, 2);
     }
+
+    #[tokio::test]
+    async fn unprojected_scan_keeps_full_plan_and_complete_source() {
+        let plan = plan_schema(DataType::Utf8);
+        let table = NewMemTable::try_new(
+            raw_schema(),
+            vec![vec![raw_batch()]],
+            Arc::clone(&plan),
+            false,
+            None,
+            vec![],
+            (1500, 3000),
+        )
+        .unwrap();
+        let ctx = SessionContext::new();
+        let exec = table.scan(&ctx.state(), None, &[], None).await.unwrap();
+        let output_schema = exec.schema();
+        assert_eq!(
+            output_schema
+                .fields()
+                .iter()
+                .map(|field| (field.name(), field.data_type()))
+                .collect::<Vec<_>>(),
+            plan.fields()
+                .iter()
+                .map(|field| (field.name(), field.data_type()))
+                .collect::<Vec<_>>(),
+        );
+        let batches = collect(exec, ctx.task_ctx()).await.unwrap();
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 1);
+        let level = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::StringViewArray>()
+            .unwrap();
+        assert_eq!(level.value(0), "error");
+        let source = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let source: serde_json::Value = serde_json::from_str(source.value(0)).unwrap();
+        assert_eq!(source["service"], "svc-a");
+        assert!(source.get(vortex_index::SOURCE_COL_NAME).is_none());
+    }
+
+    #[tokio::test]
+    async fn output_projection_preserves_duplicates_order_and_empty_row_counts() {
+        let table = NewMemTable::try_new(
+            raw_schema(),
+            vec![vec![raw_batch()]],
+            raw_schema(),
+            false,
+            None,
+            vec![],
+            (0, 3000),
+        )
+        .unwrap();
+        let ctx = SessionContext::new();
+        let projection = vec![2, 1, 2];
+        let exec = table
+            .scan(&ctx.state(), Some(&projection), &[], None)
+            .await
+            .unwrap();
+        let batches = collect(exec, ctx.task_ctx()).await.unwrap();
+        let batch = &batches[0];
+        assert_eq!(batch.num_columns(), 3);
+        assert_eq!(batch.column(0), batch.column(2));
+        let services = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(
+            services.iter().collect::<Vec<_>>(),
+            vec![Some("svc-a"), Some("svc-b")]
+        );
+        let levels = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(levels.iter().collect::<Vec<_>>(), vec![Some("error"), None]);
+
+        let projection = vec![];
+        let exec = table
+            .scan(&ctx.state(), Some(&projection), &[], None)
+            .await
+            .unwrap();
+        let batches = collect(exec, ctx.task_ctx()).await.unwrap();
+        assert!(batches.iter().all(|batch| batch.num_columns() == 0));
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+    }
 }
 
 #[async_trait]
@@ -326,6 +420,8 @@ impl TableProvider for NewMemTable {
         }
         if let Some(v) = projection.as_ref() {
             needed.extend(v.iter().copied());
+        } else {
+            needed.extend(0..plan_schema.fields().len());
         }
         needed.sort();
         needed.dedup();

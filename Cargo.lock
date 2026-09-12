@@ -10127,6 +10127,8 @@ dependencies = [
  "config",
  "dashmap",
  "datafusion",
+ "datafusion-datasource",
+ "datafusion-functions-aggregate-common",
  "datafusion-functions-json",
  "datafusion-proto",
  "enrichment",
@@ -12913,8 +12915,6 @@ dependencies = [
 [[package]]
 name = "vortex-pco"
 version = "0.79.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1cc50372aaf9b114649d78f17ce2a1ccec318ca6000d988ed644ad195dbc7632"
 dependencies = [
  "pco",
  "prost 0.14.3",
@@ -13076,6 +13076,7 @@ dependencies = [
  "puffin",
  "rand 0.10.1",
  "rapidhash",
+ "roaring",
  "ryu",
  "serde",
  "serde_json",
@@ -13085,6 +13086,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "vortex",
+ "zstd",
 ]
 
 [[package]]

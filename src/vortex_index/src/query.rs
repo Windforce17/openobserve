@@ -101,7 +101,7 @@ pub(crate) fn bloom_canonical_key<'a>(key: &'a [u8], scratch: &'a mut Vec<u8>) -
 /// a scan-time filter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VixQuery {
-    /// The exact token in the given field (one FST point lookup).
+    /// The exact raw-value token in the given field (one dictionary point lookup).
     Exact { field: String, token: Vec<u8> },
     /// Tokens starting with `prefix`, in one field or (if `None`) any field.
     Prefix {
@@ -125,6 +125,14 @@ pub enum VixQuery {
     Fuzzy { token: String, distance: u8 },
     /// The exact token in *any* field (match_all plain-token semantics).
     TokenAnyField { token: Vec<u8> },
+    /// Evaluate unnamed text leaves only in these FTS-capable fields.
+    /// Named raw-value and key predicates retain their ordinary semantics.
+    /// The scope is local to this expression, including nested booleans;
+    /// an empty scope matches no unnamed text tokens.
+    FullText {
+        fields: Vec<String>,
+        query: Box<VixQuery>,
+    },
     /// Documents that have a non-null value at the flattened `path`
     /// (key-existence terms).
     KeyExists { path: String },

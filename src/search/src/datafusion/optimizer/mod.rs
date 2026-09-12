@@ -55,8 +55,9 @@ use crate::{
         analyze::remove_index_fields::RemoveIndexFieldsRule,
         context::PhysicalOptimizerContext,
         logical_optimizer::{
-            add_sort_and_limit::AddSortAndLimitRule, limit_join_right_side::LimitJoinRightSide,
-            rewrite_histogram::RewriteHistogram,
+            add_sort_and_limit::AddSortAndLimitRule,
+            fuse_approx_percentiles::FuseApproxPercentiles,
+            limit_join_right_side::LimitJoinRightSide, rewrite_histogram::RewriteHistogram,
         },
         physical_optimizer::{
             distribute_analyze::optimize_distribute_analyze,
@@ -81,7 +82,10 @@ pub fn generate_analyzer_rules(sql: &Sql) -> Vec<Arc<dyn AnalyzerRule + Send + S
     ))]
 }
 
-pub fn generate_optimizer_rules(sql: &Sql) -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
+pub fn generate_optimizer_rules(
+    sql: &Sql,
+    allow_shared_percentiles: bool,
+) -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
     let cfg = config::get_config();
     let limit = if sql.limit > config::QUERY_WITH_NO_LIMIT {
         if sql.limit > 0 {
@@ -147,6 +151,9 @@ pub fn generate_optimizer_rules(sql: &Sql) -> Vec<Arc<dyn OptimizerRule + Send +
     rules.push(Arc::new(CommonSubexprEliminate::new()));
     rules.push(Arc::new(EliminateGroupByConstant::new()));
     rules.push(Arc::new(OptimizeProjections::new()));
+    if cfg.common.feature_query_shared_percentiles && allow_shared_percentiles {
+        rules.push(Arc::new(FuseApproxPercentiles::new()));
+    }
 
     // *********** custom rules ***********
     // should after ExtractEquijoinPredicate and PushDownFilter, because LimitJoinRightSide will

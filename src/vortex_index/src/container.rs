@@ -2254,11 +2254,11 @@ pub(crate) fn scan_blob(
     Ok(batches)
 }
 
-/// Streaming variant of [`scan_blob`]: decoded chunks are handed to
-/// `on_batch` one at a time (memory stays bounded by one chunk), and an
-/// optional vortex filter `Expression` is pushed into the scan (zone-map
-/// pruned). Row selection and the filter compose: a row is produced only
-/// when it is selected *and* passes the filter.
+/// Streaming variant of [`scan_blob`]: callbacks remain ordered and serial.
+/// Operation-owned conversion may queue audited CPU leaves under count/byte
+/// admission; unsupported scans retain inline conversion. An optional Vortex
+/// filter is pushed into the scan (zone-map pruned). Selection and filtering
+/// compose: a row is produced only when selected and passing the filter.
 pub(crate) fn scan_blob_streaming(
     blob: &BlobHandle,
     projection: Option<&[&str]>,
@@ -2304,6 +2304,12 @@ pub(crate) fn scan_blob_streaming(
             .session(runtime.handle()),
     };
     let vxf = open_blob(&runtime, &session, blob)?;
+    let conversion_operation = crate::source::current_read_operation().filter(|operation| {
+        decode_threads <= 1
+            && matches!(&selection, RowSelection::All | RowSelection::Range(_))
+            && operation.supports_conversion()
+            && operation.scan_options().conversion.is_some()
+    });
     let mut scan = vxf.scan()?;
     if let Some(columns) = projection {
         scan = scan.with_projection(select(columns.to_vec(), root()));
@@ -2330,12 +2336,18 @@ pub(crate) fn scan_blob_streaming(
     let arrow_schema = scan.dtype()?.to_arrow_schema()?;
     let data_type = DataType::Struct(arrow_schema.fields().clone());
     let mut chunks = scan.into_array_iter(&runtime)?;
-    loop {
-        crate::check_read_cancelled()?;
-        let Some(array) = chunks.next() else { break };
-        let array = array?;
-        crate::check_read_cancelled()?;
-        on_batch(vortex_to_record_batch(&session, array, &data_type)?)?;
+    if let Some(operation) = conversion_operation {
+        crate::conversion::convert_chunks_ordered(
+            chunks, &session, &data_type, operation, on_batch,
+        )?;
+    } else {
+        loop {
+            crate::check_read_cancelled()?;
+            let Some(array) = chunks.next() else { break };
+            let array = array?;
+            crate::check_read_cancelled()?;
+            on_batch(vortex_to_record_batch(&session, array, &data_type)?)?;
+        }
     }
     if let Some(pool) = pool {
         pool.shutdown_background();

@@ -320,6 +320,7 @@ mod tests {
                 selection: None,
                 row_group_size: None,
                 selection_exact: false,
+                native_predicate: Default::default(),
             },
             FileKey {
                 id: 2,
@@ -330,6 +331,7 @@ mod tests {
                 selection: None,
                 row_group_size: None,
                 selection_exact: false,
+                native_predicate: Default::default(),
             },
         ];
 
@@ -361,6 +363,7 @@ mod tests {
                 selection: None,
                 row_group_size: None,
                 selection_exact: false,
+                native_predicate: Default::default(),
             });
 
             assert_eq!(queue.len(), initial_len + 1);
@@ -387,6 +390,7 @@ mod tests {
             selection: None,
             row_group_size: None,
             selection_exact: false,
+            native_predicate: Default::default(),
         }
     }
 

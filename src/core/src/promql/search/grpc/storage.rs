@@ -52,9 +52,13 @@ use crate::service::{
     },
 };
 
-#[tracing::instrument(name = "promql:search:grpc:storage:create_context", skip(trace_id))]
+#[tracing::instrument(
+    name = "promql:search:grpc:storage:create_context",
+    skip(trace_id, registry_owner)
+)]
 pub(crate) async fn create_context(
     trace_id: &str,
+    registry_owner: &str,
     org_id: &str,
     stream_name: &str,
     time_range: (i64, i64),
@@ -218,6 +222,7 @@ pub(crate) async fn create_context(
         time_range,
         work_group: None,
         use_inverted_index: true,
+        full_text_fields: None,
     });
 
     // search vix inverted index. Index-off stream types (#40 — metrics is
@@ -254,7 +259,8 @@ pub(crate) async fn create_context(
         target_partitions,
     };
 
-    let ctx = register_metrics_table(&session, schema.clone(), stream_name, files).await?;
+    let ctx = register_metrics_table(&session, registry_owner, schema.clone(), stream_name, files)
+        .await?;
 
     Ok(Some((
         ctx,

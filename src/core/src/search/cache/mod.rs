@@ -13,9 +13,9 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::str::FromStr;
+use std::{str::FromStr, sync::Arc};
 
-use chrono::{TimeZone, Utc};
+use chrono::Utc;
 #[cfg(feature = "vectorscan")]
 use config::meta::projections::ProjectionColumnMapping;
 use config::{
@@ -61,7 +61,7 @@ use crate::{
             cache::{cacher::check_cache, result_utils::extract_timestamp_range},
             init_vrl_runtime,
             inspector::{SearchInspectorFieldsBuilder, search_inspector_fields},
-            sql::RE_SELECT_FROM,
+            sql::{RE_HISTOGRAM, RE_SELECT_FROM, Sql, SqlPreparation},
         },
         self_reporting::{http_report_metrics, report_request_usage_stats},
     },
@@ -71,11 +71,11 @@ pub mod cacher;
 pub mod multi;
 pub mod result_utils;
 
-// Define cache version
-// v4: row-store-driven `SELECT *` — star hits are materialized from each
-// record's `_source` (full per-record field sets); v3 entries may hold
-// registry-truncated star hits and must not be served.
-const CACHE_VERSION: &str = "v4";
+// v5: every stored range is complete half-open coverage, including LIMIT ties
+// and full histogram buckets. v4 mixed exclusive request ends with inclusive
+// observed-row ends and could claim coverage for truncated results.
+// Retains v4's full per-record `_source` semantics for SELECT *.
+const CACHE_VERSION: &str = "v5";
 
 #[tracing::instrument(name = "service:search:cacher:search", skip_all)]
 #[allow(clippy::too_many_arguments)]
@@ -121,7 +121,7 @@ pub async fn search(
     }
 
     // Result caching check start
-    let (mut c_resp, should_exec_query) =
+    let (mut c_resp, should_exec_query, prepared) =
         prepare_cache_response(trace_id, org_id, stream_type, &mut req, use_cache).await?;
     let file_path = c_resp.file_path.clone();
 
@@ -157,6 +157,7 @@ pub async fn search(
     let cache_took = start.elapsed().as_millis() as usize;
     let mut results = Vec::new();
     let mut work_group_set = Vec::new();
+    let mut uncached_results_have_hits = false;
     let mut res = if !should_exec_query {
         // no need to search, just merge the cached response
         // TODO: which case we don't need to search?
@@ -182,13 +183,6 @@ pub async fn search(
             query_fn = Some(format!("{vrl_function} \n ."));
         }
         req.query.query_fn = query_fn;
-
-        for fn_name in functions::get_all_transform_keys(org_id).await {
-            if req.query.sql.contains(&format!("{fn_name}(")) {
-                req.query.uses_zo_fn = true;
-                break;
-            }
-        }
 
         c_resp.deltas.sort();
         c_resp.deltas.dedup();
@@ -239,6 +233,7 @@ pub async fn search(
                 format!("{trace_id}-{i}")
             };
             let user_id = user_id.clone();
+            let prepared = prepared.clone();
 
             let enter_span = tracing::span::Span::current();
             let guard_trace_id = trace_id.clone();
@@ -266,7 +261,15 @@ pub async fn search(
                             );
                         }
 
-                        SearchService::search(&trace_id, &org_id, stream_type, user_id, &req).await
+                        SearchService::search_impl(
+                            &trace_id,
+                            &org_id,
+                            stream_type,
+                            user_id,
+                            &req,
+                            Some(prepared),
+                        )
+                        .await
                     })
                     .instrument(enter_span),
                 ),
@@ -302,7 +305,9 @@ pub async fn search(
                 c_resp.order_by,
             )
         } else {
-            let mut reps = results[0].clone();
+            uncached_results_have_hits = results.first().is_some_and(|res| !res.hits.is_empty())
+                || results.last().is_some_and(|res| !res.hits.is_empty());
+            let mut reps = std::mem::take(&mut results[0]);
             sort_response(
                 c_resp.is_descending,
                 &mut reps,
@@ -461,25 +466,24 @@ pub async fn search(
         res.hits.len()
     );
     if should_cache_results
-        && (results.first().is_some_and(|res| !res.hits.is_empty())
+        && (uncached_results_have_hits
+            || results.first().is_some_and(|res| !res.hits.is_empty())
             || results.last().is_some_and(|res| !res.hits.is_empty()))
     {
-        // Determine if this is a non-timestamp histogram query
-        // Note: write_res.order_by_metadata contains the same ORDER BY info
+        // A histogram without timestamp-first ordering may be an arbitrary
+        // top-N subset even though the final response was sorted by timestamp.
         let is_histogram_non_ts_order = c_resp.histogram_interval > 0
-            && !res.order_by_metadata.is_empty()
-            && res
-                .order_by_metadata
-                .first()
-                .map(|(field, _)| field != &c_resp.ts_column)
-                .unwrap_or(false);
+            && prepared.order_by.first().is_none_or(|(field, _)| {
+                !result_utils::is_timestamp_field(field, &c_resp.ts_column)
+            });
 
         write_results(
             trace_id,
             &c_resp.ts_column,
             req.query.start_time,
             req.query.end_time,
-            deep_copy_response(&res),
+            c_resp.limit,
+            res.clone(),
             file_path,
             is_complex_query,
             c_resp.is_descending,
@@ -517,7 +521,7 @@ pub async fn prepare_cache_response(
     stream_type: StreamType,
     req: &mut search::Request,
     use_cache: bool,
-) -> Result<(MultiCachedQueryResponse, bool), Error> {
+) -> Result<(MultiCachedQueryResponse, bool, Arc<Sql>), Error> {
     let mut origin_sql = req.query.sql.clone();
     let is_complex_query = is_complex_query(&origin_sql).unwrap_or(true);
     let stream_name = match resolve_stream_names(&origin_sql) {
@@ -556,18 +560,27 @@ pub async fn prepare_cache_response(
         .as_ref()
         .and_then(|v| svix_ksuid::Ksuid::from_str(v).ok());
 
+    // Source-time coverage cannot be recovered from payloads transformed before
+    // caching: they may change timestamps, cardinality, or both. The SkipVRL
+    // result-array path is applied after cache merging and remains eligible.
+    for fn_name in functions::get_all_transform_keys(org_id).await {
+        if req.query.sql.contains(&format!("{fn_name}(")) {
+            req.query.uses_zo_fn = true;
+            break;
+        }
+    }
+    let has_pre_cache_transform = query_fn.as_ref().is_some_and(|value| !value.is_empty())
+        || req
+            .query
+            .action_id
+            .as_ref()
+            .is_some_and(|value| !value.is_empty())
+        || req.query.uses_zo_fn;
+
     // Parse SQL first to get metadata needed for normalization
     let query: SearchQuery = req.query.clone().into();
-    let sql = match crate::service::search::Sql::new(&query, org_id, stream_type, req.search_type)
-        .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            log::error!("Error parsing sql: {e}");
-            return Ok((MultiCachedQueryResponse::default(), true));
-        }
-    };
-
+    let preparation = SqlPreparation::new(&query, org_id, stream_type).await?;
+    let sql = preparation.finish(&query, org_id, stream_type, req.search_type, false)?;
     // Normalize histogram interval in SQL before computing hash
     // This ensures the hash is consistent regardless of when handle_histogram is called
     if is_complex_query && sql.histogram_interval.is_some() {
@@ -617,6 +630,7 @@ pub async fn prepare_cache_response(
 
     // Refine ts_column for non-complex queries with SELECT * or missing _timestamp
     // Also modify the SQL to add _timestamp to SELECT clause if missing
+    let mut added_timestamp = false;
     if !is_complex_query && origin_sql.contains('*') {
         ts_column = TIMESTAMP_COL_NAME.to_string();
     } else if !is_complex_query
@@ -633,11 +647,32 @@ pub async fn prepare_cache_response(
                 origin_sql.replacen(cap_str, &format!("{TIMESTAMP_COL_NAME},{cap_str}"), 1);
             req.query.sql = origin_sql.clone();
             ts_column = TIMESTAMP_COL_NAME.to_string();
+            added_timestamp = true;
         }
     }
 
     // Refine is_descending for histogram queries with non-timestamp ORDER BY
     is_descending = cacher::refine_is_descending_for_histogram(&sql, &ts_column, is_descending);
+    // Consult the original immutable AST, not the normalized execution SQL:
+    // normalization can replace function arguments but cannot certify their source.
+    let cache_limit = sql.cache_coverage_limit(&ts_column);
+    let histogram_coordinates_supported = sql.histogram_interval.is_none_or(|seconds| {
+        // RewriteHistogram bins against 2001-01-01 UTC. Our half-open bucket
+        // clipping uses Unix-aligned boundaries and unshifted source timestamps.
+        seconds.checked_mul(1_000_000).is_some_and(|interval| {
+            interval > 0 && 978_307_200_000_000_i64.rem_euclid(interval) == 0
+        }) && sql
+            .timezone
+            .as_deref()
+            .is_none_or(|zone| matches!(zone, "" | "UTC" | "Etc/UTC" | "Z" | "+00:00"))
+    });
+    // HTTP preserves an explicit SQL LIMIT, while streaming can truncate at
+    // positive request.size before writing this shared cache. Reject conflicting
+    // caps rather than treating the smaller delivered payload as exhausted.
+    let cache_eligible = !has_pre_cache_transform
+        && cache_limit
+            .is_some_and(|limit| req.query.size <= 0 || (limit >= 0 && limit <= req.query.size))
+        && histogram_coordinates_supported;
 
     // Compute the complete file path once for both branches
     let base_file_path = format!("{org_id}/{stream_type}/{stream_name}/{hashed_query}");
@@ -650,7 +685,7 @@ pub async fn prepare_cache_response(
 
     let mut should_exec_query = true;
 
-    let resp = if use_cache {
+    let mut resp = if use_cache && cache_eligible {
         // if cache is used, we need to check the cache
         check_cache(
             trace_id,
@@ -671,13 +706,40 @@ pub async fn prepare_cache_response(
             ts_column,
             is_aggregate: is_complex_query,
             is_descending,
-            order_by: sql.order_by,
+            order_by: sql.order_by.clone(),
             limit: sql.limit,
             file_path,
             ..Default::default()
         }
     };
-    Ok((resp, should_exec_query))
+    if cache_eligible && let Some(limit) = cache_limit {
+        // Merge and writer saturation must use the same actual executed cap;
+        // a SQL LIMIT can override a positive request size.
+        resp.limit = limit;
+    }
+    // Cache identity above deliberately uses pre-projection SQL. Finalize only
+    // the edits that actually reached execution (check_cache can return early).
+    let sql = if req.query.sql != query.sql {
+        let before = RE_HISTOGRAM.find(&query.sql).map(|m| m.as_str());
+        let after = RE_HISTOGRAM.find(&req.query.sql).map(|m| m.as_str());
+        let replacement = before.zip(after).filter(|(before, after)| before != after);
+        let mut final_query: SearchQuery = req.query.clone().into();
+        // Cache retention may advance req.start; interval selection belongs to
+        // the original full request, not the remaining cache gaps.
+        final_query.start_time = query.start_time;
+        final_query.end_time = query.end_time;
+        preparation.finish_cache(
+            &final_query,
+            org_id,
+            stream_type,
+            req.search_type,
+            replacement,
+            added_timestamp,
+        )?
+    } else {
+        sql
+    };
+    Ok((resp, should_exec_query, Arc::new(sql)))
 }
 
 // based on _timestamp of first record in config::meta::search::Response either add it in start
@@ -918,36 +980,9 @@ fn sort_response(
     });
 }
 
-/// Caches search results to disk after applying filtering and validation strategies.
-///
-/// # Caching Strategy
-///
-/// 1. **Remove incomplete records for histogram**:
-///    - Check the histogram interval, if the time range is not a multiple of the histogram
-///      interval, we need to remove the incomplete records: first & last record.
-///
-/// 2. **Remove Records with Discard Duration**:
-///    - Removes records that are older than the configured `discard_duration`.
-///    - The `discard_duration` is the time difference between the current time and the time when
-///      the record was created.
-///    - The `discard_duration` is configured by `ZO_CACHE_DELAY_SECS`.
-///
-/// 3. **Skip Caching for Empty or Insufficient Hits**:
-///    - If no hits remain after removing one, caching is skipped.
-///    - Logs a message: `"No hits found for caching, skipping caching."`
-///
-/// 4. **Discard Short Time Ranges**:
-///    - Skips caching if the difference between the first and last record timestamps is smaller
-///      than the configured `discard_duration`.
-///
-/// 5. **Adjust Cache Time Range**:
-///    - Adjusts the cache start and end times based on the smallest and largest timestamps:
-///      - `start_time = max(smallest_ts, req_query_start_time)`
-///      - `end_time = min(largest_ts, req_query_end_time)`
-///
-/// 6. **Cache to Disk**:
-///    - Saves the filtered response to a file named:
-///      `"<start_time>_<end_time>_<is_aggregate>_<is_descending>.json"`.
+/// Cache only complete half-open coverage. LIMIT-saturated results exclude the
+/// entire terminal timestamp group: other rows at that timestamp may be missing.
+/// Histogram coverage contains only complete buckets, including at the delay edge.
 #[tracing::instrument(name = "service:search:cache:write_results", skip_all)]
 #[allow(clippy::too_many_arguments)]
 pub async fn write_results(
@@ -955,6 +990,7 @@ pub async fn write_results(
     ts_column: &str,
     req_query_start_time: i64,
     req_query_end_time: i64,
+    limit: i64,
     mut res: config::meta::search::Response,
     file_path: String,
     is_aggregate: bool,
@@ -962,74 +998,23 @@ pub async fn write_results(
     clear_cache: bool,
     is_histogram_non_ts_order: bool,
 ) {
-    if res.hits.is_empty() {
-        return;
-    }
-
-    // 1. alignment time range for incomplete records for histogram
-    let mut accept_start_time = req_query_start_time;
-    let mut accept_end_time = req_query_end_time;
-    let mut need_adjust_end_time = false;
-    if is_aggregate
-        && let Some(interval) = res.histogram_interval
-        && interval > 0
-    {
-        let interval = interval * 1000 * 1000; // convert to microseconds
-        // next interval of start_time
-        if (accept_start_time % interval) != 0 {
-            accept_start_time = accept_start_time - (accept_start_time % interval) + interval;
-        }
-        // previous interval of end_time
-        if (accept_end_time % interval) != 0 {
-            need_adjust_end_time = true;
-            accept_end_time = accept_end_time - (accept_end_time % interval) - interval;
-        }
-    }
-
-    // 2. get the data time range, check if need to remove records with discard_duration
-    // For histogram queries with non-timestamp ORDER BY, we need to scan all hits
-    // to find actual min/max timestamps, since results may not be time-ordered
-    let is_time_ordered = !is_histogram_non_ts_order;
-    let (data_start_time, data_end_time) =
-        extract_timestamp_range(&res.hits, ts_column, is_time_ordered);
     let delay_ts = second_micros(get_config().limit.cache_delay_secs);
-    let mut accept_end_time =
-        std::cmp::min(Utc::now().timestamp_micros() - delay_ts, accept_end_time);
-    if data_start_time < accept_start_time || data_end_time > accept_end_time {
-        res.hits.retain(|hit| {
-            if let Some(hit_ts) = hit.get(ts_column)
-                && let Some(hit_ts_datetime) = convert_ts_value_to_datetime(hit_ts)
-            {
-                let item_ts = hit_ts_datetime.timestamp_micros();
-                // only keep the records within the accept time range
-                item_ts >= accept_start_time && item_ts <= accept_end_time
-            } else {
-                true
-            }
-        });
-        res.total = res.hits.len();
-        res.size = res.hits.len() as i64;
-    }
-
-    // 3. check if the hits is empty
-    if res.hits.is_empty() {
-        log::info!("[trace_id {trace_id}] No hits found for caching, skipping caching");
+    let Some((accept_start_time, accept_end_time)) = prepare_results_for_cache(
+        &mut res,
+        ts_column,
+        req_query_start_time,
+        req_query_end_time,
+        limit,
+        is_aggregate,
+        is_descending,
+        is_histogram_non_ts_order,
+        Utc::now().timestamp_micros() - delay_ts,
+    ) else {
         return;
-    }
-
-    // 4. check if the time range is less than discard_duration
-    if (accept_end_time - accept_start_time) < delay_ts {
+    };
+    if accept_end_time - accept_start_time < delay_ts {
         log::info!("[trace_id {trace_id}] Time range is too short for caching, skipping caching");
         return;
-    }
-
-    // 5. adjust the cache time range
-    if need_adjust_end_time
-        && is_aggregate
-        && let Some(interval) = res.histogram_interval
-        && interval > 0
-    {
-        accept_end_time += interval * 1000 * 1000;
     }
 
     // 6. cache to disk
@@ -1077,6 +1062,70 @@ pub async fn write_results(
             }
         }
     });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_results_for_cache(
+    res: &mut search::Response,
+    ts_column: &str,
+    start: i64,
+    end: i64,
+    limit: i64,
+    is_aggregate: bool,
+    is_descending: bool,
+    is_histogram_non_ts_order: bool,
+    stable_end: i64,
+) -> Option<(i64, i64)> {
+    if res.hits.is_empty() || res.is_partial || !res.function_error.is_empty() {
+        return None;
+    }
+    let interval = if is_aggregate {
+        res.histogram_interval
+            .unwrap_or_default()
+            .max(0)
+            .checked_mul(1_000_000)?
+    } else {
+        0
+    };
+    let mut start = start;
+    let mut end = end.min(stable_end);
+    if limit > 0 && res.hits.len() >= limit as usize {
+        // A non-time-ordered top-N says nothing about completeness anywhere
+        // in time. An exhausted histogram is still fully cacheable.
+        if is_histogram_non_ts_order {
+            return None;
+        }
+        let terminal_ts = get_ts_value(ts_column, res.hits.last()?);
+        if is_descending {
+            start = start.max(terminal_ts.checked_add(interval.max(1))?);
+        } else {
+            end = end.min(terminal_ts);
+        }
+    }
+    if interval > 0 {
+        let remainder = start.rem_euclid(interval);
+        if remainder != 0 {
+            start = start.checked_add(interval - remainder)?;
+        }
+        end = end.checked_sub(end.rem_euclid(interval))?;
+    }
+    if start >= end {
+        return None;
+    }
+    let (data_start, data_end) =
+        extract_timestamp_range(&res.hits, ts_column, !is_histogram_non_ts_order);
+    if data_start < start || data_end >= end {
+        res.hits.retain(|hit| {
+            let ts = get_ts_value(ts_column, hit);
+            start <= ts && ts < end
+        });
+    }
+    if res.hits.is_empty() {
+        return None;
+    }
+    res.total = res.hits.len();
+    res.size = res.hits.len() as i64;
+    Some((start, end))
 }
 
 pub fn apply_vrl_to_response(
@@ -1178,40 +1227,8 @@ pub fn apply_vrl_to_response(
     local_res.hits
 }
 
-fn convert_ts_value_to_datetime(ts_value: &serde_json::Value) -> Option<chrono::DateTime<Utc>> {
-    match ts_value {
-        // Handle the case where ts_value is a number (microseconds)
-        serde_json::Value::Number(num) => {
-            if let Some(micros) = num.as_i64() {
-                // Convert microseconds to DateTime<Utc>
-                chrono::DateTime::<Utc>::from_timestamp_micros(micros)
-            } else {
-                None
-            }
-        }
-        // Handle the case where ts_value is a string (ISO 8601 format)
-        serde_json::Value::String(ts_str) => {
-            // Parse the string timestamp into a NaiveDateTime
-            if let Ok(naive_dt) = chrono::NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%dT%H:%M:%S")
-            {
-                // Convert NaiveDateTime to DateTime<Utc>
-                Some(Utc.from_utc_datetime(&naive_dt))
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
-}
-
 pub fn is_result_array_skip_vrl(vrl_fn: &str) -> bool {
     RESULT_ARRAY_SKIP_VRL.is_match(vrl_fn)
-}
-
-// Helper function to create a deep copy of a Response
-fn deep_copy_response(res: &config::meta::search::Response) -> config::meta::search::Response {
-    let serialized = serde_json::to_string(res).expect("Failed to serialize response");
-    serde_json::from_str(&serialized).expect("Failed to deserialize response")
 }
 
 #[cfg(feature = "vectorscan")]
@@ -1288,37 +1305,6 @@ mod tests {
         }
         . = arr1_final"#;
         assert!(is_result_array_skip_vrl(query_fn));
-    }
-
-    #[test]
-    fn test_convert_ts_value_to_datetime_number() {
-        // 1_000_000 microseconds = 1 second after epoch
-        let val = serde_json::Value::Number(serde_json::Number::from(1_000_000i64));
-        let result = convert_ts_value_to_datetime(&val);
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().timestamp(), 1);
-    }
-
-    #[test]
-    fn test_convert_ts_value_to_datetime_string() {
-        let val = serde_json::Value::String("2024-01-15T10:30:00".to_string());
-        let result = convert_ts_value_to_datetime(&val);
-        assert!(result.is_some());
-        // 2024-01-15 00:00:00 UTC in seconds since epoch
-        assert!(result.unwrap().timestamp() > 0);
-    }
-
-    #[test]
-    fn test_convert_ts_value_to_datetime_invalid_string_returns_none() {
-        let val = serde_json::Value::String("not-a-date".to_string());
-        let result = convert_ts_value_to_datetime(&val);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_convert_ts_value_to_datetime_null_returns_none() {
-        let result = convert_ts_value_to_datetime(&serde_json::Value::Null);
-        assert!(result.is_none());
     }
 
     #[test]

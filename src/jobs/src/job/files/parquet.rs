@@ -987,6 +987,7 @@ async fn merge_files(
         .map(|f| f.meta.original_size.max(0) as usize)
         .sum();
     let tables = TableBuilder::new()
+        .registry_owner(trace_id.as_str())
         .sorted_by_time(true)
         .build(session, new_file_list, schema.clone())
         .await?;

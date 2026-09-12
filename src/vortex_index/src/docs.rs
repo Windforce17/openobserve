@@ -48,9 +48,9 @@ pub enum NumScalar {
 
 /// One bound value of a pushed-down range conjunct. Numeric values push
 /// into the vortex row filter AND prune chunks through the O2 stats blob;
-/// string values are STATS-ONLY (chunk/file pruning against the blob's
-/// conservative prefix bounds — never a row filter, the engine's own
-/// FilterExec re-applies the predicate).
+/// string values conservatively prune chunks/files. Only an explicitly selected
+/// native string-equality strategy also applies eligible stored-string equality
+/// as a row filter; the engine's FilterExec still re-applies the predicate.
 #[derive(Debug, Clone, PartialEq)]
 pub enum BoundValue {
     I64(i64),
@@ -108,6 +108,163 @@ use crate::{
     stats::SpliceableStats,
     writer::TIMESTAMP_COL_NAME,
 };
+
+/// A bounded, allocation-free preflight for a fragmented zone selection.
+struct PrunedSelectionPlan {
+    exclude: bool,
+    bytes: usize,
+}
+
+impl PrunedSelectionPlan {
+    const MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+    fn new(ranges: &[std::ops::Range<u64>], range_capacity: usize) -> Option<Self> {
+        if ranges.len() < 2 {
+            return None;
+        }
+        let metadata = u64::try_from(range_capacity).ok()?.checked_mul(2048)?;
+        if metadata > Self::MAX_BYTES {
+            return None;
+        }
+        let envelope = ranges.first()?.start..ranges.last()?.end;
+        let span = envelope.end.checked_sub(envelope.start)?;
+        let mut included = (0u64, 0u64);
+        let mut excluded = (0u64, 0u64);
+        let mut previous = envelope.start;
+        for range in ranges {
+            if range.start < previous || range.start >= range.end {
+                return None;
+            }
+            if previous < range.start {
+                excluded.0 = excluded.0.checked_add(range.start.checked_sub(previous)?)?;
+                excluded.1 = excluded
+                    .1
+                    .checked_add(Self::containers(previous, range.start)?)?;
+            }
+            included.0 = included
+                .0
+                .checked_add(range.end.checked_sub(range.start)?)?;
+            included.1 = included
+                .1
+                .checked_add(Self::containers(range.start, range.end)?)?;
+            previous = range.end;
+        }
+        if included.0.checked_add(excluded.0)? != span {
+            return None;
+        }
+        // Conservative selection heap/workspace bound, not serialized size:
+        // - 32 KiB per touched 64Ki-row container visit covers the retained roaring store and a
+        //   native intersection, array/run growth and conversion, container-vector slack and high32
+        //   BTree nodes.
+        // - 1 KiB per envelope container covers the native temporary range treemap (one run per
+        //   container, including tree/vector overhead).
+        // - twice the envelope bitmap bytes covers mask buffers and growth.
+        // - 16 bytes per included row covers index-vector capacity for either representation:
+        //   IncludeRoaring can build indices directly, while ExcludeRoaring's mixed bit masks can
+        //   lazily cache the same indices in downstream filtering kernels.
+        // - 2 KiB per input range capacity covers the existing range Vec, mixed-mask
+        //   objects/alignment and range/interval metadata. Natural splits are disjoint: each
+        //   retained mixed mask crosses a membership boundary, so there are at most twice as many
+        //   as input ranges.
+        // All-true/all-false masks retain no buffer. Temporary range treemaps
+        // and intersections are constructed serially by native task planning.
+        // Counting visits, not just distinct containers, also caps insert_range
+        // work when many intervals touch the same container.
+        let common = Self::containers(envelope.start, envelope.end)?
+            .checked_mul(1024)?
+            .checked_add(span.checked_add(7)?.checked_div(8)?.checked_mul(2)?)?
+            .checked_add(metadata)?
+            .checked_add(included.0.checked_mul(16)?)?
+            .checked_add(4096)?;
+        let cost = |(_, visits): (u64, u64)| {
+            common
+                .checked_add(visits.checked_mul(32 * 1024)?)
+                .filter(|bytes| *bytes <= Self::MAX_BYTES)
+        };
+        let include_cost = cost(included);
+        let exclude_cost = cost(excluded);
+        let (exclude, bytes) = match (include_cost, exclude_cost) {
+            (Some(a), Some(b)) if a < b => (false, a),
+            (_, Some(b)) => (true, b),
+            (Some(a), None) => (false, a),
+            (None, None) => return None,
+        };
+        Some(Self {
+            exclude,
+            bytes: usize::try_from(bytes).ok()?,
+        })
+    }
+
+    fn supports_type(dtype: &arrow::datatypes::DataType) -> bool {
+        use arrow::datatypes::DataType;
+
+        match dtype {
+            DataType::Null
+            | DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float16
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Timestamp(..)
+            | DataType::Date32
+            | DataType::Date64
+            | DataType::Time32(..)
+            | DataType::Time64(..)
+            | DataType::Duration(..)
+            | DataType::Interval(..)
+            | DataType::Decimal32(..)
+            | DataType::Decimal64(..)
+            | DataType::Decimal128(..)
+            | DataType::Decimal256(..)
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Utf8View
+            | DataType::Binary
+            | DataType::LargeBinary
+            | DataType::BinaryView => true,
+            DataType::Struct(fields) => fields
+                .iter()
+                .all(|field| Self::supports_type(field.data_type())),
+            // Lists can expand a parent-row selection into an element-domain
+            // mask. Its size is not bounded by the row-count reservation.
+            _ => false,
+        }
+    }
+
+    fn containers(start: u64, end: u64) -> Option<u64> {
+        (end.checked_sub(1)? >> 16)
+            .checked_sub(start >> 16)?
+            .checked_add(1)
+    }
+
+    fn selection(&self, ranges: &[std::ops::Range<u64>]) -> Result<Selection> {
+        let mut selected = roaring::RoaringTreemap::new();
+        let mut previous = ranges[0].start;
+        for range in ranges {
+            crate::check_read_cancelled()?;
+            if self.exclude {
+                if previous < range.start {
+                    selected.insert_range(previous..range.start);
+                }
+            } else {
+                selected.insert_range(range.clone());
+            }
+            previous = range.end;
+        }
+        Ok(if self.exclude {
+            Selection::ExcludeRoaring(selected)
+        } else {
+            Selection::IncludeRoaring(selected)
+        })
+    }
+}
 
 /// One already-encoded docs chunk streamed by
 /// [`VixDocs::scan_docs_encoded_chunks`] (#51c): a vortex struct array in
@@ -1275,7 +1432,25 @@ impl VixDocs {
                 }
             }
         }
-        let filter = self.build_scan_filter(ts_range, bounds);
+        let options = crate::source::current_read_operation()
+            .map(|operation| operation.scan_options())
+            .unwrap_or_default();
+        let mut filter = self.build_scan_filter(ts_range, bounds);
+        if options.predicate == crate::NativePredicateStrategy::NativeStringEq {
+            for (column, needle) in bounds
+                .iter()
+                .filter_map(|bound| self.string_eq_bound(bound))
+            {
+                let equality = vortex::expr::eq(
+                    get_item(column.to_string(), root()),
+                    lit(needle.to_string()),
+                );
+                filter = Some(match filter {
+                    Some(previous) => and(previous, equality),
+                    None => equality,
+                });
+            }
+        }
 
         // M15: dictionary-aware string-equality pre-pass. A pushed
         // `col = 'needle'` on a string column (min == max == Str, both
@@ -1289,7 +1464,8 @@ impl VixDocs {
         // redundant full-column pass. Exact by construction (byte equality on the
         // stored values), and the engine re-applies the predicate on
         // returned rows regardless.
-        if rows.is_none()
+        if options.predicate == crate::NativePredicateStrategy::BoundedPrepass
+            && rows.is_none()
             && let Some(eq) = bounds.iter().find_map(|bound| self.string_eq_bound(bound))
         {
             let (column, needle) = eq;
@@ -1336,10 +1512,45 @@ impl VixDocs {
             None => match pruned {
                 // provably nothing survives: zero data reads
                 Some(ranges) if ranges.is_empty() => {}
-                // a strict subset survives: one ranged scan per contiguous
-                // surviving run, in row order (ranges are ascending), with
-                // the remaining limit threaded through
+                // One native scan shares physical leaves across surviving
+                // runs. A single range needs no selection allocation; only a
+                // type/size guard falls back to the old streaming loop.
                 Some(ranges) => {
+                    if limit == Some(0) {
+                        return Ok(());
+                    }
+                    let bounded_projection = match names.as_deref() {
+                        Some(columns) => columns.iter().all(|name| {
+                            self.schema.field_with_name(name).is_ok_and(|field| {
+                                PrunedSelectionPlan::supports_type(field.data_type())
+                            })
+                        }),
+                        None => self
+                            .schema
+                            .fields()
+                            .iter()
+                            .all(|field| PrunedSelectionPlan::supports_type(field.data_type())),
+                    };
+                    if bounded_projection
+                        && let Some(plan) = PrunedSelectionPlan::new(&ranges, ranges.capacity())
+                    {
+                        // Declare the reservation first: it outlives selection
+                        // construction and the entire native iterator, including
+                        // callback/cancellation/IO error teardown.
+                        let _pending = self.memory.reserve(plan.bytes)?;
+                        let selection = plan.selection(&ranges)?;
+                        let envelope = ranges[0].start..ranges[ranges.len() - 1].end;
+                        scan_blob_streaming(
+                            &self.docs_blob,
+                            names.as_deref(),
+                            RowSelection::VortexRange(selection, envelope),
+                            filter,
+                            limit,
+                            decode_threads,
+                            &mut |batch| on_batch(batch).map_err(VixError::Callback),
+                        )?;
+                        return Ok(());
+                    }
                     let mut remaining = limit;
                     for range in ranges {
                         if remaining == Some(0) {
@@ -2406,6 +2617,160 @@ mod memory_regressions {
         cancelled: AtomicBool,
     }
 
+    struct PredicateOperation(crate::NativePredicateStrategy);
+
+    impl VixReadOperation for PredicateOperation {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+        fn scan_options(&self) -> crate::NativeScanOptions {
+            crate::NativeScanOptions {
+                predicate: self.0,
+                ..Default::default()
+            }
+        }
+    }
+
+    #[test]
+    fn native_predicate_strategies_preserve_residual_time_numeric_and_null_semantics() {
+        use arrow::array::Array;
+
+        use crate::NativePredicateStrategy::{BoundedPrepass, DirectResidual, NativeStringEq};
+        let schema = Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, true),
+            Field::new("n", DataType::Int64, false),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![
+                Arc::new(Int64Array::from(vec![8, 7, 6, 5, 4, 3, 2, 1])),
+                Arc::new(StringArray::from(vec![
+                    None,
+                    Some("hit"),
+                    Some("other"),
+                    Some("hit"),
+                    None,
+                    Some("hit"),
+                    Some("other"),
+                    Some("hit"),
+                ])),
+                Arc::new(Int64Array::from(vec![8, 7, 6, 5, 4, 3, 2, 1])),
+            ],
+        )
+        .unwrap();
+        let mut writer = crate::VixWriter::new(
+            &schema,
+            crate::VixWriterOptions {
+                encode_threads: 1,
+                columns_complete: true,
+                ..Default::default()
+            },
+            false,
+        );
+        writer
+            .push_batch_with_source(&batch, &StringArray::from(vec!["{}"; 8]), None)
+            .unwrap();
+        let (data, _) = writer.finish().unwrap();
+        let docs = VixDocs::open(Bytes::from(data)).unwrap();
+        let bounds = [
+            ColumnBound {
+                column: "value".into(),
+                min: Some((BoundValue::Str("hit".into()), true)),
+                max: Some((BoundValue::Str("hit".into()), true)),
+            },
+            ColumnBound {
+                column: "n".into(),
+                min: Some((BoundValue::I64(4), true)),
+                max: None,
+            },
+        ];
+        let projection = vec!["_timestamp".into(), "value".into(), "n".into()];
+        for strategy in [BoundedPrepass, DirectResidual, NativeStringEq] {
+            let operation: Arc<dyn VixReadOperation> = Arc::new(PredicateOperation(strategy));
+            let mut output = Vec::new();
+            with_read_operation(operation, || {
+                docs.scan_docs_opts(
+                    Some(&projection),
+                    None,
+                    Some((3, 7)),
+                    &bounds,
+                    None,
+                    0,
+                    &mut |batch| {
+                        let ts = batch
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .unwrap();
+                        let strings = arrow::compute::cast(batch.column(1), &DataType::Utf8)?;
+                        let value = strings.as_any().downcast_ref::<StringArray>().unwrap();
+                        let number = batch
+                            .column(2)
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .unwrap();
+                        for row in 0..batch.num_rows() {
+                            if strategy == NativeStringEq {
+                                assert!(!value.is_null(row) && value.value(row) == "hit");
+                            }
+                            // The SQL residual remains authoritative in every mode.
+                            if !value.is_null(row)
+                                && value.value(row) == "hit"
+                                && ts.value(row) >= 3
+                                && ts.value(row) < 7
+                                && number.value(row) >= 4
+                            {
+                                output.push(ts.value(row));
+                            }
+                        }
+                        Ok(())
+                    },
+                )
+            })
+            .unwrap();
+            assert_eq!(output, vec![5], "{strategy:?}");
+        }
+
+        // Non-equality and type-mismatched string hints remain stats-only.
+        // No OR/cast/fulltext proof is inferred from the native strategy.
+        for bound in [
+            ColumnBound {
+                column: "value".into(),
+                min: Some((BoundValue::Str("a".into()), true)),
+                max: Some((BoundValue::Str("z".into()), true)),
+            },
+            ColumnBound {
+                column: "n".into(),
+                min: Some((BoundValue::Str("5".into()), true)),
+                max: Some((BoundValue::Str("5".into()), true)),
+            },
+        ] {
+            let operation: Arc<dyn VixReadOperation> = Arc::new(PredicateOperation(NativeStringEq));
+            let mut timestamps = Vec::new();
+            with_read_operation(operation, || {
+                docs.scan_docs_opts(
+                    Some(&projection),
+                    None,
+                    Some((3, 7)),
+                    &[bound],
+                    None,
+                    0,
+                    &mut |batch| {
+                        let ts = batch
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .unwrap();
+                        timestamps.extend_from_slice(ts.values());
+                        Ok(())
+                    },
+                )
+            })
+            .unwrap();
+            assert_eq!(timestamps, vec![6, 5, 4, 3]);
+        }
+    }
     impl Budget {
         fn new(limit: usize) -> Arc<Self> {
             Arc::new(Self {

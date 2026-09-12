@@ -94,13 +94,24 @@ pub static SEARCH_SERVER: Lazy<Searcher> = Lazy::new(Searcher::new);
 
 // Please note: `query_fn` which is the vrl needs to be base64::decoded
 // when using this search
-#[tracing::instrument(name = "service:search:enter", skip_all)]
 pub async fn search(
     trace_id: &str,
     org_id: &str,
     stream_type: StreamType,
     user_id: Option<String>,
     in_req: &search::Request,
+) -> Result<search::Response, Error> {
+    search_impl(trace_id, org_id, stream_type, user_id, in_req, None).await
+}
+
+#[tracing::instrument(name = "service:search:enter", skip_all)]
+async fn search_impl(
+    trace_id: &str,
+    org_id: &str,
+    stream_type: StreamType,
+    user_id: Option<String>,
+    in_req: &search::Request,
+    prepared: Option<Arc<Sql>>,
 ) -> Result<search::Response, Error> {
     let start = std::time::Instant::now();
     let started_at = now_micros();
@@ -166,7 +177,10 @@ pub async fn search(
         request.set_local_mode(Some(v));
     }
     request.set_use_cache(in_req.use_cache);
-    let meta = Sql::new_from_req(&request, &query).await?;
+    let meta = match prepared {
+        Some(sql) => Arc::new(sql.bind(&query)),
+        None => Arc::new(Sql::new_from_req(&request, &query).await?),
+    };
 
     #[cfg(feature = "enterprise")]
     {
@@ -197,19 +211,27 @@ pub async fn search(
     }
 
     let span = tracing::span::Span::current();
+    let execution_sql = meta.clone();
     // Abort-on-drop: actix drops this handler future when the client
     // disconnects or cancels; the guard aborts the spawned search instead
     // of letting a detached JoinHandle run the query to completion.
-    let mut handle =
-        utils::AbortOnDrop::new(
-            tokio::task::spawn(
-                async move {
-                    cluster::http::search(request, query, req_regions, req_clusters, true).await
-                }
-                .instrument(span),
-            ),
-            trace_id.clone(),
-        );
+    let mut handle = utils::AbortOnDrop::new(
+        tokio::task::spawn(
+            async move {
+                cluster::http::search(
+                    request,
+                    query,
+                    req_regions,
+                    req_clusters,
+                    true,
+                    execution_sql,
+                )
+                .await
+            }
+            .instrument(span),
+        ),
+        trace_id.clone(),
+    );
     let res = match handle.join().await {
         Ok(Ok(res)) => Ok(res),
         Ok(Err(e)) => Err(e),

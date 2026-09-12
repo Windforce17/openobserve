@@ -3,6 +3,177 @@
 Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
 (deleted 2026-07-29; full history in git). Keep THIS file current.
 
+## 2026-09-08 — engine .166 production rollout and measured acceptance
+- Querier-only image `v0.93.0-vix-20260908.166`, source `0b076c91a9bf`,
+  deployed through GitOps PR #548 / merge `84107245f999`. The owner explicitly
+  authorized this PR's existing merge-rule exemption after normal merge was
+  rejected; repository rules were not changed. Ten queriers are Ready at
+  index digest `9692385ef3fd`, old ReplicaSets are zero and querier restarts
+  remain zero. Ingester/router .165 and compactor .160 are unchanged.
+- Production result caching remains disabled. Querier replacement Pods own
+  fresh generic ephemeral PVCs; v5 key isolation is not needed for this
+  specific rollout. It remains a format marker for retained-disk upgrades,
+  separate from the half-open coverage correction. No cache migration,
+  manual node scaling, scheduling relaxation or resource adjustment occurred.
+- Baseline completed 14/14 requests. Candidate initially completed eight
+  before a histogram timed out during Spot loss of the unchanged .165
+  ingester-3: all ten .166 queriers finished in about 2.1s, but the leader
+  lacked that receiver. CSI later detached/re-attached its retained EBS
+  volume automatically. A separate six-request recovery completed original
+  workload coverage; the interrupted phase remains recorded as failed.
+- Sealed service count/error totals are exactly 600,004,644 / 64,866.
+  Direct/residual controls preserve 72 histogram buckets and 100 ordered
+  row signatures. Recent direct/residual counts agree; the recent corpus
+  gained one error span. All successful requests are nonpartial/error-free.
+- Three-round observed medians: operations 6.585 to 4.262s; metrics 4.145
+  to 3.566s. Not every request improves: first metrics +55.12%, recovered
+  direct histogram +32.06%, and reported APM peak memory roughly +19–21%.
+  Compaction, Spot replacements, cache/placement changes and shared traffic
+  prevent attributing those deltas solely to the engine.
+- Approximate p99 values are not identical. Two exact-count rank diagnostics
+  show selected operation ranks shifting from 99.275–99.297% to
+  99.324–99.353% (worse current-corpus rank error); the selected metrics bucket
+  moves from 98.893% to 98.938–99.052% (closer to 99%). No arbitrary tolerance
+  or historical duration-multiset identity is claimed. An initial diagnostic
+  with redundant COUNT/cast-COUNT hit duplicate-field HTTP 400; that failure
+  is retained, and only the diagnostic SQL was simplified before the two
+  successful oracles. No baseline replay establishes it as a new regression.
+
+## 2026-09-08 — engine planning, ownership and bounded conversion (local verification)
+- Reuse trusted file statistics in the existing query-owned registry; clear
+  derived storage/WAL/schema registrations through an explicit root owner.
+  Plan exact-selection and residual branches once, project typed NULLs only
+  for complete-schema absence, and run applicable Bloom pruning before
+  eager index aggregates.
+- Prepared SQL shares immutable metadata but binds each delta's time range
+  separately. Dispatch matrices/plan bytes, owned validated Flight buffers,
+  TDigest input scratch and final JSON/cache ownership avoid redundant copies.
+- A proven single exact term can reject a file or answer all rows without
+  decoding postings. Dense refusal retains the existing bitmap threshold
+  and authoritative SQL residual; it is not a fitted global crossover.
+  Native string equality runs before final projection when eligible.
+  Whole-sidecar warming follows a cache miss and actual sidecar use.
+- Ordered Arrow conversion uses admitted CPU leaves, not waiting controllers
+  or IO jobs. Automatic parallelism requires at most four unsplit files,
+  spare worker capacity, a ranged unselected native projection and supported
+  bounded conversion trees; ordinary conversion remains the fallback.
+  PCO accessors are a narrow patch to pinned vortex-pco 0.79.0, not a format
+  change. Queue wait, conversion, callback/downstream work and bounded
+  in-flight state are recorded separately; they are not process RSS.
+- Recent Segment-WAL scans reuse query-local schema/predicate/projection
+  plans, select before final gathering, and retain Exact/Deferred provenance.
+  MemTable projection=None returns every output column.
+- Correctness found during integration: result-cache v5 records certified
+  half-open coverage. Gap fetches start at cached_end, preserving the row
+  exactly at a seam. Saturated timestamp ties and incomplete histogram
+  buckets remain uncovered; unsafe time axes, pagination, ordering and
+  pre-cache transforms bypass caching. Legacy v4 entries are not reused.
+- Actual local HTTP/gRPC/Flight proof passes 153 requests, plus the separate
+  17-request cache-boundary scenario. Both immutable VIX files complete
+  90 offloaded conversion leaves, peak four per file, with no inline
+  fallback or cancellation. Complete-query balanced warm runs preserve
+  every typed result and all p50/p95/p99 values: operations median
+  117.27 to 112.61 ms, metrics 71.15 to 69.08 ms, unfiltered wide aggregate
+  154.08 to 134.11 ms (four measured requests per source/workload).
+  Ranges overlap; these are local current-state observations, not production
+  speedups, cold-storage measurements or isolated optimization effects.
+- The same API runs report higher DataFusion peak reservations: operations
+  about 139 to 218 MB, metrics 134 to 213 MB, and wide 134 to 703–709 MB.
+  Reader high-water admission and conversion/output ownership now consume
+  pool headroom. These observations are not measured heap/RSS peaks; the
+  bounded concurrency benefit must be weighed against reservation pressure.
+- Final semantic gates pass: search 1,100, VIX 342, Flight 45, cache-boundary
+  SQL 3 and recent Segment-WAL 40 tests. Integration tests use actual
+  registered Parquet scans and production listing configuration; native
+  equality checks retained/pruned rows and SQL residual results rather
+  than private registry keys or fallback-key encoding.
+- A separate native two/six-file matrix passes 48 complete executions and
+  12 allocation diagnostics. Same-shape results, including every percentile,
+  are identical between sources; triplicated populations retain their own
+  unmasked percentile changes. Rust System live-allocation peak for the
+  wide two-file scan is 94.95 to 106.31 MiB, versus 103.23 to 100.43 MiB
+  for six files. Every diagnostic releases all pool reservations after
+  collection and teardown. These allocator observations exclude direct C
+  allocations and are neither production mimalloc nor scoped RSS peaks.
+- Graviton3 calibration preserves exact results across index, bounded
+  prepass, direct, native and native-exact paths. Warm local/memory favors
+  index for the two measured service densities; the pooled remote broker
+  favors direct. The broker still adds IPC/Python/cross-region overhead.
+  No universal density threshold, production resource/cache/concurrency
+  change, Orbit/frontend change, rollup, or production rollout is claimed.
+
+## 2026-09-07 — CASE/full-text output mapping corrected (.162, production verified)
+- `RewriteMatchPhysical` must restore the original filter output as an
+  ordered list, including repeated slots. Only the expanded scan-input
+  projection is a set. Removed output sort/dedup; input ordering and
+  predicate-index remapping remain unchanged. This prevents positional
+  parents from exchanging same-typed values or losing repeated columns.
+- The .161 production acceptance exposed container/body values exchanged
+  in CASE full-text rows. The faulty rewrite and its activation order were
+  unchanged from .160. No stored-data mutation or client-side field swap
+  was used as a remedy.
+- Source `1ef991a3f257` is a one-file correction on .161's `a7a1ea1617b4`.
+  Both new regressions failed before correction. The complete search suite
+  passed 1,076 tests (7 ignored); all three rewrite behavior tests passed
+  after strengthening the fixture so a hidden FTS input shifts the named
+  predicate's column index. Repeated output slots execute under positional
+  alias parents, rather than relying on schema-only assertions.
+- Production queriers now run `v0.93.0-vix-20260907.162`, via GitOps PR #543
+  and merge `6cb8adf9d6cb`. All ten updated/Ready/available pods match the
+  published digest; old ReplicaSets are zero and no restarts occurred.
+  Compactor, ingester and router remain .160; all other resource, cache,
+  ConfigMap and Secret state matches the validated 15-resource render.
+- Twelve bounded production requests returned HTTP 200, non-partial,
+  error-free and with result-cache ratio zero. Original LIMIT 50 and
+  LIMIT 10 direct/CASE projections now have identical ordered tuple hashes
+  without normalization; duplicate body aliases retain both correct slots.
+  The 20:04–20:05 UTC comparison returns 18,430 for both count and histogram.
+- The same 2026-09-06 20:00–20:10 UTC histogram returns 93,267/91,535 in its
+  two five-minute buckets, taking 2.786s first / 1.387s subsequent. These
+  are end-to-end current-state measurements with new pod-ephemeral caches,
+  not an isolated CPU or physical-disk benchmark. The .160 baseline timed
+  out at 45s; .161 had already restored residual filtering and query speed.
+- Separate known issue remains out of scope: table-qualified `_timestamp`
+  can trigger duplicate automatic timestamp insertion. The original CASE
+  acceptance queries use the valid literal projection and do not hit it.
+
+## 2026-09-07 — bounded dictionary points and active FTS scope (local verification)
+- Point evaluation consumes all active probes for a dictionary block in one
+  forward scan. Borrowed targets stream through 4,096-target/8 MiB batches,
+  splitting between blocks; indivisible larger groups require separate
+  admission. Contiguous fetch runs never coalesce across unrelated gaps.
+  The shared FIFO remains capped at 1,024 blocks; no format change or index
+  rebuild is required.
+- Removed eager whole-query dictionary prefetch. Narrow missing conjuncts
+  now avoid unrelated vocabulary reads. Planner, payload, and ordinal
+  ownership use the existing memory admission and cancellation scopes.
+- `QueryParams.full_text_fields` carries current settings/default fields
+  filtered against the latest schema. `VixQuery::FullText` scopes unnamed
+  text leaves without changing named raw predicates or generic any-field
+  semantics. Unknown scope or incomplete token capability retains the scan
+  branch; only exact absence permits omitting an active field. Result and
+  bitmap cache identities include the active scope.
+- Nonexact aggregates still require the SQL residual; token candidates are
+  not phrase counts. Typed source cancellation escapes capability probing.
+  CPU-leaf entry state is set outside `debug_assert!`, so the existing
+  nested-submission protection also executes in release builds.
+- Local proof: both root regressions fail on `ce1956e` (dictionary rereads
+  and 28.4 MB of unrelated reads for a missing narrow conjunction).
+  The fixed release VIX library passes 324 tests (14 ignored); the search
+  library passes 1,078 (7 ignored). The affected core test targets type-check.
+  Coverage includes wide dictionaries, legacy/current field directories,
+  malicious gap coalescing, bounded admission, cancellation/reuse, scope
+  changes, and exact residual/aggregate fallback ownership.
+- Two immutable production sidecars retain exactly 3,704/4,239 candidates;
+  complete enumeration of their 598,820/544,892 terms and postings agrees
+  with the exact candidate row IDs. Reused-reader logical ranges fall from
+  11,212/10,997 to 52/47 for generic queries, and 7/6 with explicit FTS scope.
+  Async local-file candidate evaluation falls from roughly 350 ms to 6 ms
+  generically and 1.1–1.3 ms with scope. These are warm-OS-cache component
+  measurements, not physical S3 requests or complete histogram latency:
+  residual data reads, timestamp bucketing, and distributed work are excluded.
+- No production deployment, configuration change, or full-day query replay.
+
 ## 2026-09-06 — native setup and exact sparse aggregation (local verification)
 - Native reads share only built-in registry templates within one read
   operation. Sessions, memory/runtime state, and executors remain fresh;

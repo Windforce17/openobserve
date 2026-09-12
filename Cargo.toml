@@ -238,6 +238,7 @@ exclude = [
     # dict-writer zero-progress guard; wired via [patch.crates-io] below.
     "crates/vortex-array",
     "crates/vortex-layout",
+    "crates/vortex-pco",
 ]
 members = [
     "src/api",
@@ -386,6 +387,7 @@ collapse = "0.1.2"
 cron = "0.15"
 dashmap = { version = "6.1", features = ["serde"] }
 datafusion = "54"
+datafusion-datasource = "54"
 datafusion-proto = "54"
 datafusion-functions-aggregate-common = "54"
 # Local checkout of the openobserve fork at rev 0df53d710425cc91cf109e77a050bbe1e374e4fe
@@ -568,6 +570,7 @@ zstd = "0.13"
 # compactor 35-50MB/s live-heap runaway). See each crate's VENDORED.md.
 vortex-array = { path = "crates/vortex-array" }
 vortex-layout = { path = "crates/vortex-layout" }
+vortex-pco = { path = "crates/vortex-pco" }
 datafusion = { git = "https://github.com/openobserve/datafusion", rev = "869ec1a70482e1a26c4ac2fde3e9fd5545c33d7b" }
 datafusion-catalog = { git = "https://github.com/openobserve/datafusion", rev = "869ec1a70482e1a26c4ac2fde3e9fd5545c33d7b" }
 datafusion-catalog-listing = { git = "https://github.com/openobserve/datafusion", rev = "869ec1a70482e1a26c4ac2fde3e9fd5545c33d7b" }

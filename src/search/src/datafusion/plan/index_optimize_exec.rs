@@ -707,6 +707,7 @@ mod tests {
             time_range: (0, 1000),
             work_group: None,
             use_inverted_index: false,
+            full_text_fields: None,
         })
     }
 
@@ -720,6 +721,7 @@ mod tests {
             selection: None,
             row_group_size: None,
             selection_exact: false,
+            native_predicate: Default::default(),
         }
     }
 

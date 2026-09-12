@@ -28,8 +28,9 @@
 //!   only the FST-cell/postings/docs chunks the query touches, through the range-capable cache
 //!   ladder (memory → disk → remote range GETs). Parsed readers are memoized in
 //!   [`reader_cache::GLOBAL_CACHE`] and keep their lazily loaded FST cells, so hot files skip even
-//!   the tail fetch. `cache_files` still enqueues whole-file background downloads — the DataFusion
-//!   scan of matched files and repeat queries are then served from the local cache.
+//!   the tail fetch. Optional whole-sidecar warming is admitted only after a result-cache miss and
+//!   chosen sidecar use; native-only and exact metadata answers do not launch unrelated
+//!   whole-sidecar downloads.
 //! - `cached`: the whole object is downloaded through the file cache ladder and opened in memory
 //!   (pre-F2 behavior).
 //!
@@ -76,7 +77,7 @@ use config::{
     meta::{
         inverted_index::IndexOptimizeMode,
         search::ScanStats,
-        stream::{FileKey, FileSelection, RowIdBitmap, StreamType},
+        stream::{FileKey, FileSelection, NativePredicateStrategy, RowIdBitmap, StreamType},
     },
     metrics::{self, QUERY_PARQUET_CACHE_RATIO_NODE},
     utils::size::bytes_to_human_readable,
@@ -94,7 +95,10 @@ use self::{
     source::{LadderRangeSource, VixReadMode, vix_read_mode},
 };
 use crate::{
-    file_cache::{CacheMissPolicy, cache_files_with_policy, calc_target_partitions},
+    file_cache::{
+        CacheMissPolicy, cache_files_with_policy, calc_target_partitions, warm_cache_type,
+        warm_used_sidecar,
+    },
     index::{FieldCap, IndexCondition},
     inspector::{SearchInspectorFieldsBuilder, search_inspector_fields},
     types::QueryParams,
@@ -326,17 +330,17 @@ pub async fn vix_search(
             })
         })
         .collect_vec();
-    // Aggregate queries keep cache hits but do not launch unconditional
-    // whole-sidecar downloads alongside their bounded foreground reads.
-    let cache_miss_policy = if idx_optimize_mode
+    // Probe once for accounting and access choice. Admissions happen only
+    // after an exact-result miss and a successful sidecar evaluation.
+    let warm_cache = if idx_optimize_mode
         .as_ref()
         .is_some_and(|mode| !matches!(mode, IndexOptimizeMode::SimpleSelect(..)))
     {
-        CacheMissPolicy::CheckOnly
+        file_data::CacheType::None
     } else {
-        CacheMissPolicy::Enqueue
+        warm_cache_type(scan_stats.compressed_size)
     };
-    let (cache_type, cache_hits, cache_misses) = cache_files_with_policy(
+    let (_, cache_hits, cache_misses) = cache_files_with_policy(
         &query.trace_id,
         &index_cache_entries
             .iter()
@@ -346,7 +350,7 @@ pub async fn vix_search(
             .collect_vec(),
         &mut scan_stats,
         "index",
-        cache_miss_policy,
+        CacheMissPolicy::CheckOnly,
     )
     .await;
 
@@ -363,6 +367,10 @@ pub async fn vix_search(
     // cache-index lookup for every file.
     let all_index_sidecars_cached =
         index_cache_entries.len() == index_files.len() && cache_misses == 0;
+    let sidecar_access = SidecarAccess {
+        all_cached: all_index_sidecars_cached,
+        warm_cache,
+    };
 
     let cached_ratio = if scan_stats.querier_files == 0 {
         0.0
@@ -371,11 +379,7 @@ pub async fn vix_search(
             / scan_stats.querier_files as f64
     };
 
-    let download_msg = if cache_type == file_data::CacheType::None {
-        "".to_string()
-    } else {
-        format!(" downloading others into {cache_type:?} in background,")
-    };
+    let download_msg = "";
     log::info!(
         "{}",
         search_inspector_fields(
@@ -517,6 +521,7 @@ pub async fn vix_search(
             let trace_id = query.trace_id.to_string();
             let index_condition_clone = index_condition.clone();
             let idx_optimize_rule_clone = idx_optimize_mode.clone();
+            let full_text_fields = query.full_text_fields.as_deref();
             let file_stats = Arc::new(source::FetchStats::default());
             let file_operation = operation.for_file(Arc::clone(&file_stats));
             let eval_bail = Arc::clone(&eval_bail);
@@ -527,21 +532,19 @@ pub async fn vix_search(
                     }
                     if eval_bail.load(std::sync::atomic::Ordering::Relaxed) {
                         return Ok((
-                            String::new(),
+                            file.key.clone(),
                             VixSearchResult::Skipped { percent: 100 },
                             true,
                         ));
                     }
-                    let mut ret = search_vix_index(
-                        &trace_id,
-                        time_range,
-                        index_condition_clone.clone(),
-                        idx_optimize_rule_clone.clone(),
-                        &file,
-                        read_mode,
-                        all_index_sidecars_cached,
-                        &file_operation,
-                    )
+                    let mut ret = search_vix_index(&trace_id,
+                    time_range,
+                    index_condition_clone.clone(),
+                    idx_optimize_rule_clone.clone(),
+                    &file,
+                    read_mode,
+                    sidecar_access,
+                    &file_operation, full_text_fields)
                     .await;
                     if let Err(error) = &ret
                         && !file_operation.is_cancelled()
@@ -554,16 +557,14 @@ pub async fn vix_search(
                             "[trace_id {trace_id}] search->vix: retrying file {} after error: {error:?}",
                             file.key,
                         );
-                        ret = search_vix_index(
-                            &trace_id,
-                            time_range,
-                            index_condition_clone,
-                            idx_optimize_rule_clone,
-                            &file,
-                            read_mode,
-                            all_index_sidecars_cached,
-                            &file_operation,
-                        )
+                        ret = search_vix_index(&trace_id,
+                        time_range,
+                        index_condition_clone,
+                        idx_optimize_rule_clone,
+                        &file,
+                        read_mode,
+                        sidecar_access,
+                        &file_operation, full_text_fields)
                         .await;
                     }
                     if file_operation.is_cancelled() {
@@ -576,12 +577,13 @@ pub async fn vix_search(
                 (
                     outcome,
                     file_stats.bytes.load(std::sync::atomic::Ordering::Relaxed),
+                    file.key,
                 )
             }
         });
 
         let mut tasks = stream::iter(tasks).buffer_unordered(eval_concurrency);
-        while let Some((outcome, file_bytes)) = tasks.next().await {
+        while let Some((outcome, file_bytes, evaluated_file)) = tasks.next().await {
             completed_files += 1;
             completed_file_bytes = completed_file_bytes.saturating_add(file_bytes);
             let result = match outcome {
@@ -616,7 +618,7 @@ pub async fn vix_search(
                     if has_skipped_conditions {
                         is_add_filter_back = true;
                     }
-                    if file_name.is_empty() {
+                    if matches!(result, VixSearchResult::Skipped { .. }) {
                         // no need inverted index for this file, need add filter back
                         is_add_filter_back = true;
                         files_skipped += 1;
@@ -656,9 +658,8 @@ pub async fn vix_search(
                         }
                         continue;
                     }
-                    // A named result came from a real evaluation: fold it
-                    // into the projected-cost sample (bailed files return
-                    // nameless above and never dilute the average).
+                    // Only completed evaluations enter the projected-cost sample;
+                    // typed skipped outcomes above never dilute the average.
                     files_evaluated += 1;
                     if bail_bytes_cap > 0
                         && idx_optimize_mode.is_some()
@@ -765,14 +766,15 @@ pub async fn vix_search(
                             result_builder.add_min_max(value);
                             file_list_map.remove(&file_name);
                         }
-                        VixSearchResult::Skipped { .. } => {
-                            // skipped results always come with an empty file
-                            // name and are handled before this match
-                            unreachable!("Skipped should not be returned with a file name");
-                        }
+                        VixSearchResult::Skipped { .. } => unreachable!("handled above"),
                     }
                 }
                 Err(e) => {
+                    if let Some(fallback) = e.downcast_ref::<AccessFallback>()
+                        && let Some(file) = file_list_map.get_mut(&evaluated_file)
+                    {
+                        file.native_predicate = fallback.native_predicate;
+                    }
                     if requires_exact_scan(&e) {
                         log::debug!(
                             "[trace_id {trace_id}] search->vix: exact aggregate scan required: {e}"
@@ -794,7 +796,9 @@ pub async fn vix_search(
                         files_skipped += 1;
                         if idx_optimize_mode.is_none() {
                             skip_give_up_budget = skip_give_up_budget.saturating_sub(1);
-                            total_row_ids_percent += 100;
+                            total_row_ids_percent += e
+                                .downcast_ref::<AccessFallback>()
+                                .map_or(100, |fallback| fallback.percent);
                             if skip_give_up_budget == 0 {
                                 let took = start.elapsed().as_millis() as usize;
                                 log::warn!(
@@ -889,7 +893,9 @@ pub async fn vix_search(
 
 fn requires_exact_scan(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
-        cause.is::<collect::AggregateFallback>() || cause.is::<source::FetchBudgetExceeded>()
+        cause.is::<collect::AggregateFallback>()
+            || cause.is::<source::FetchBudgetExceeded>()
+            || cause.is::<AccessFallback>()
     })
 }
 
@@ -1012,8 +1018,109 @@ async fn load_whole_object(
     }
 }
 
+#[derive(Clone, Copy)]
+struct SidecarAccess {
+    all_cached: bool,
+    warm_cache: file_data::CacheType,
+}
+
+impl SidecarAccess {
+    #[cfg(test)]
+    fn check_only(all_cached: bool) -> Self {
+        Self {
+            all_cached,
+            warm_cache: file_data::CacheType::None,
+        }
+    }
+}
+
+/// A proven refusal is retained with the file's identity through the follower
+/// pipeline. It is not an exact selection and cannot remove SQL residuals.
+#[derive(Debug, thiserror::Error)]
+#[error("access fallback: {reason:?}")]
+struct AccessFallback {
+    reason: AccessFallbackReason,
+    native_predicate: NativePredicateStrategy,
+    percent: usize,
+}
+
+#[derive(Debug)]
+enum AccessFallbackReason {
+    DenseExactTerm,
+}
+
+/// The count is metadata-only precisely because this is one validated named
+/// raw-value leaf. Generic AND/NOT/FTS counts may decode postings and never
+/// enter this decision. Boundary density is unknown until timestamp clamping.
+fn early_exact_access(
+    trace_id: &str,
+    reader: &VixReader,
+    condition: &IndexCondition,
+    records: i64,
+    fully_covered: bool,
+    mode: Option<&IndexOptimizeMode>,
+) -> anyhow::Result<Option<RawVixResult>> {
+    validate_row_alignment(records, reader.row_count())?;
+    if mode.is_some() || !condition.can_remove_filter() {
+        return Ok(None);
+    }
+    let [crate::index::Condition::Equal(field, value)] = condition.conditions.as_slice() else {
+        return Ok(None);
+    };
+    if !matches!(field_capability(trace_id, reader, field), FieldCap::Term)
+        || reader.field_oversize_skips(field) != 0
+    {
+        return Ok(None);
+    }
+    let count = reader.count(&vortex_index::VixQuery::Exact {
+        field: field.clone(),
+        token: value.as_bytes().to_vec(),
+    })?;
+    decide_exact_term(
+        count,
+        reader.row_count(),
+        fully_covered,
+        get_config().limit.inverted_index_skip_threshold,
+    )
+}
+
+/// One coherent decision from validated leaf evidence. The threshold is the
+/// existing bitmap give-up policy, not a fitted native/index crossover.
+fn decide_exact_term(
+    count: u64,
+    rows: u64,
+    fully_covered: bool,
+    bitmap_skip_threshold: usize,
+) -> anyhow::Result<Option<RawVixResult>> {
+    if count > rows {
+        anyhow::bail!("exact term count {count} exceeds file rows {rows}");
+    }
+    if count == 0 {
+        return Ok(Some(RawVixResult::ExactNoMatch));
+    }
+    if fully_covered
+        && count == rows
+        && let Ok(rows) = u32::try_from(rows)
+    {
+        return Ok(Some(RawVixResult::ExactAllRows(rows)));
+    }
+    let percent = count as f64 / rows as f64 * 100.0;
+    if fully_covered && bitmap_skip_threshold > 0 && percent > bitmap_skip_threshold as f64 {
+        return Err(AccessFallback {
+            reason: AccessFallbackReason::DenseExactTerm,
+            // SQL residuals remain authoritative for this scan strategy.
+            native_predicate: NativePredicateStrategy::DirectResidual,
+            percent: percent as usize,
+        }
+        .into());
+    }
+    Ok(None)
+}
+
 /// Raw output of the blocking index evaluation for one file.
 enum RawVixResult {
+    ExactNoMatch,
+    ExactAllRows(u32),
     /// a queried field has incomplete value terms (type drift, field-id
     /// overflow, source keys outside the term plan, or a legacy file's
     /// pre-2026-08-12 oversize taint): the index may miss documents, the
@@ -1021,9 +1128,14 @@ enum RawVixResult {
     PartialFields,
     /// a docs column the optimize mode reads is missing in this file (it
     /// predates the `column_store_fields` setting): scan fallback
-    MissingColumn { field: String },
+    MissingColumn {
+        field: String,
+    },
     /// simple count fast path
-    Count { count: u64, has_skipped: bool },
+    Count {
+        count: u64,
+        has_skipped: bool,
+    },
     /// per-row match bitmap (length == index row_count)
     Bitmap {
         bitmap: BooleanBuffer,
@@ -1218,8 +1330,9 @@ async fn search_vix_index(
     idx_optimize_rule: Option<IndexOptimizeMode>,
     parquet_file: &FileKey,
     read_mode: VixReadMode,
-    all_index_sidecars_cached: bool,
+    sidecar_access: SidecarAccess,
     operation: &Arc<source::ReadOperation>,
+    full_text_fields: Option<&[String]>,
 ) -> anyhow::Result<(String, VixSearchResult, bool)> {
     if operation.is_cancelled() {
         return Err(vortex_index::VixError::Cancelled.into());
@@ -1290,7 +1403,13 @@ async fn search_vix_index(
         // result depends on the applied timestamp filter, so its key pins
         // the effective clamp — deep-merged multi-hour files at the window
         // boundary are the most expensive evaluations we memoize.
-        cache_key = generate_cache_key(&condition, &idx_optimize_rule, parquet_file, time_clamp);
+        cache_key = generate_cache_key(
+            &condition,
+            &idx_optimize_rule,
+            parquet_file,
+            time_clamp,
+            full_text_fields,
+        );
         if let Some(result) =
             vix_result_cache::GLOBAL_CACHE.get(&cache_key, idx_optimize_rule.as_ref())
         {
@@ -1319,7 +1438,7 @@ async fn search_vix_index(
     let local_sidecar_available = if equality_histogram
         && parquet_file.meta.index_size > 0
         && !parsed_sidecar_available
-        && !all_index_sidecars_cached
+        && !sidecar_access.all_cached
     {
         match config::vix_sidecar_key(&vix_file_name, parquet_file.meta.index_generation) {
             Some(sidecar_key) => {
@@ -1329,7 +1448,7 @@ async fn search_vix_index(
             None => false,
         }
     } else {
-        equality_histogram && parquet_file.meta.index_size > 0 && all_index_sidecars_cached
+        equality_histogram && parquet_file.meta.index_size > 0 && sidecar_access.all_cached
     };
     let cold_native_histogram =
         equality_histogram && !parsed_sidecar_available && !local_sidecar_available;
@@ -1473,10 +1592,27 @@ async fn search_vix_index(
     // `!has_skipped` gate on the memo put in `evaluate_vix_index`) and let
     // the eval AND the cheap timestamp clamp per query.
     let bitmap_cache_key = (cfg.common.inverted_index_result_cache_enabled && !file_in_range)
-        .then(|| generate_cache_key(&condition, &None, parquet_file, None));
+        .then(|| generate_cache_key(&condition, &None, parquet_file, None, full_text_fields));
     let file_range = Some((parquet_file.meta.min_ts, parquet_file.meta.max_ts));
+    let full_text_fields = if condition.uses_full_text() {
+        full_text_fields.map(<[String]>::to_vec)
+    } else {
+        None
+    };
+    let file_records = parquet_file.meta.records;
+    let covered_for_access = file_in_range && parquet_file.meta.min_ts <= parquet_file.meta.max_ts;
     let raw = run_evaluation(trace_id, operation, permit, move || {
         let reader = reader_input.open()?;
+        if let Some(answer) = early_exact_access(
+            &task_trace_id,
+            &reader,
+            &condition,
+            file_records,
+            covered_for_access,
+            idx_optimize_rule.as_ref(),
+        )? {
+            return Ok(answer);
+        }
         evaluate_vix_index(
             &task_trace_id,
             &reader,
@@ -1486,34 +1622,47 @@ async fn search_vix_index(
             file_in_range,
             file_range,
             bitmap_cache_key,
+            full_text_fields.as_deref(),
         )
     })
     .await?;
+    if !operation.is_cancelled()
+        && !data_only_all_histogram
+        && !matches!(
+            &raw,
+            RawVixResult::ExactNoMatch
+                | RawVixResult::ExactAllRows(_)
+                | RawVixResult::PartialFields
+                | RawVixResult::MissingColumn { .. }
+        )
+    {
+        warm_used_sidecar(trace_id, parquet_file, sidecar_access.warm_cache).await;
+    }
 
     let key = parquet_file.key.to_string();
     let (result, has_skipped) = match raw {
+        RawVixResult::ExactNoMatch => (VixSearchResult::NoMatch, false),
         RawVixResult::PartialFields => {
             log::info!(
                 "[trace_id {trace_id}] search->vix: file: {}, query touches partial-indexed fields, back to datafusion",
                 parquet_file.key
             );
             // the whole file must be scanned: 100% of its rows stay candidates
-            return Ok((
-                String::new(),
-                VixSearchResult::Skipped { percent: 100 },
-                true,
-            ));
+            return Ok((key, VixSearchResult::Skipped { percent: 100 }, true));
         }
+        RawVixResult::ExactAllRows(rows) => (
+            VixSearchResult::RowIdsSelection {
+                row_ids: Arc::new(RowIdBitmap::all_rows(rows)),
+                row_group_size: None,
+            },
+            false,
+        ),
         RawVixResult::MissingColumn { field } => {
             log::info!(
                 "[trace_id {trace_id}] search->vix: file: {}, docs blob lacks column {field:?} needed by the optimize mode, back to datafusion",
                 parquet_file.key
             );
-            return Ok((
-                String::new(),
-                VixSearchResult::Skipped { percent: 100 },
-                true,
-            ));
+            return Ok((key, VixSearchResult::Skipped { percent: 100 }, true));
         }
         RawVixResult::Count { count, has_skipped } => {
             (VixSearchResult::Count(count as usize), has_skipped)
@@ -1527,7 +1676,7 @@ async fn search_vix_index(
             let matched = bitmap.count_set_bits();
             match guard_matched_rows(trace_id, parquet_file, matched, row_count)? {
                 Some(result) => {
-                    // NoMatch keeps its file key; Skipped goes back nameless
+                    // Every outcome retains its immutable file identity.
                     return match result {
                         VixSearchResult::NoMatch => {
                             // zero matches is deterministic per (condition,
@@ -1537,7 +1686,7 @@ async fn search_vix_index(
                             }
                             Ok((key, result, false))
                         }
-                        _ => Ok((String::new(), result, true)),
+                        _ => Ok((key, result, true)),
                     };
                 }
                 None => (
@@ -1642,7 +1791,7 @@ async fn search_vix_docs_optimized(
                 file.key,
             );
             return Ok((
-                String::new(),
+                file.key.clone(),
                 VixSearchResult::Skipped { percent: 100 },
                 true,
             ));
@@ -1656,7 +1805,7 @@ async fn search_vix_docs_optimized(
             file.key,
         );
         return Ok((
-            String::new(),
+            file.key.clone(),
             VixSearchResult::Skipped { percent: 100 },
             true,
         ));
@@ -1779,11 +1928,7 @@ async fn search_vix_docs_optimized(
             "[trace_id {trace_id}] search->vix: native docs file {key} has a non-string or \
              unproven-absent column {field:?}; back to datafusion",
         );
-        return Ok((
-            String::new(),
-            VixSearchResult::Skipped { percent: 100 },
-            true,
-        ));
+        return Ok((key, VixSearchResult::Skipped { percent: 100 }, true));
     };
 
     let no_match = match &result {
@@ -1821,19 +1966,52 @@ fn evaluate_vix_index(
     file_in_range: bool,
     file_range: Option<(i64, i64)>,
     bitmap_cache_key: Option<String>,
+    full_text_fields: Option<&[String]>,
 ) -> anyhow::Result<RawVixResult> {
     vortex_index::check_read_cancelled()?;
     let (start_time, end_time) = time_range;
 
-    // WHOLE-FILE partial bail — match_all/fuzzy over a partial fts field
-    // only (#32): those probe tokens with no named-field granularity, so a
-    // partial fts field can silently hide matches. Named-field conditions
-    // handle partiality per conjunct instead (FieldCap::Partial skips the
-    // conjunct, superset + re-applied filter; IS [NOT] NULL evaluates
-    // exactly via key terms).
-    if condition.uses_partial_fields(reader.partial_fields(), reader.fts_fields()) {
-        return Ok(RawVixResult::PartialFields);
-    }
+    // Validate the current query scope, never the historical file's whole
+    // FTS inventory. Missing capability cannot prove a missing match; only
+    // an exact key-term absence permits omitting an active field.
+    let full_text_fields = if condition.uses_full_text() {
+        let Some(fields) = full_text_fields else {
+            return Ok(RawVixResult::PartialFields);
+        };
+        if !reader.has_index() {
+            return Ok(RawVixResult::PartialFields);
+        }
+        let mut available = Vec::with_capacity(fields.len());
+        for field in fields {
+            vortex_index::check_read_cancelled()?;
+            if reader.partial_fields().contains(field) {
+                return Ok(RawVixResult::PartialFields);
+            }
+            if reader.fts_fields().contains(field) {
+                available.push(field.clone());
+            } else {
+                match reader.key_term_exists(field) {
+                    Ok(false) => {}
+                    Ok(true) => return Ok(RawVixResult::PartialFields),
+                    Err(error) => {
+                        vortex_index::check_read_cancelled()?;
+                        if is_cancelled_read(&error) {
+                            return Err(error);
+                        }
+                        log::warn!(
+                            "[trace_id {trace_id}] search->vix: FTS capability probe failed for {field:?}: {error}; keeping the scan fallback"
+                        );
+                        return Ok(RawVixResult::PartialFields);
+                    }
+                }
+            }
+        }
+        available.sort_unstable();
+        available.dedup();
+        Some(available)
+    } else {
+        None
+    };
 
     // M16 §4 chunk-decidable equality: a COUNT-SHAPED aggregate whose whole
     // condition is one numeric equality/IN conjunct the term index cannot
@@ -1926,6 +2104,13 @@ fn evaluate_vix_index(
         // so evaluate as condition-all with the override in eval_bitmap
         Err(_) if stats_eq.is_some() => (vortex_index::VixQuery::All, false),
         Err(e) => return Err(e),
+    };
+    let query = match full_text_fields {
+        Some(fields) => vortex_index::VixQuery::FullText {
+            fields,
+            query: Box::new(query),
+        },
+        None => query,
     };
     // M16 §4: the (single) skipped conjunct is served exactly by the stats
     // bitmap — the evaluation is no longer a weaker predicate
@@ -2428,6 +2613,13 @@ fn index_match_all_tokens(value: &str) -> Vec<String> {
     .collect()
 }
 
+fn validate_row_alignment(records: i64, row_count: u64) -> anyhow::Result<()> {
+    if u64::try_from(records).ok() != Some(row_count) {
+        anyhow::bail!("vix index row_count {row_count} does not match file records {records}");
+    }
+    Ok(())
+}
+
 /// Common guards for a matched-row bitmap: returns `Some(NoMatch)` when there
 /// is nothing to select, `Some(Skipped)` when the match count exceeds the
 /// skip threshold (the caller falls back to datafusion), and an error when
@@ -2438,6 +2630,7 @@ fn guard_matched_rows(
     matched: usize,
     row_count: u64,
 ) -> anyhow::Result<Option<VixSearchResult>> {
+    validate_row_alignment(parquet_file.meta.records, row_count)?;
     if matched == 0 || parquet_file.meta.records == 0 {
         return Ok(Some(VixSearchResult::NoMatch));
     }
@@ -2451,14 +2644,6 @@ fn guard_matched_rows(
         return Ok(Some(VixSearchResult::Skipped {
             percent: row_ids_percent as usize,
         }));
-    }
-    // out-of-range guard: the bitmap length (index row_count) must match the
-    // data file row count, otherwise row selection would be misaligned
-    if row_count != parquet_file.meta.records as u64 {
-        return Err(anyhow::anyhow!(
-            "vix index row_count {row_count} does not match file records {}",
-            parquet_file.meta.records,
-        ));
     }
     Ok(None)
 }
@@ -2552,7 +2737,7 @@ fn get_cache_entry(
 /// VALUE containing " AND " could collide with a different query and serve
 /// its cached result. Plain row-selection (no optimize rule) caches under
 /// the reserved rule tag "n" — its bitmap is a pure function of
-/// (condition, file), same as the optimize-mode results.
+/// (condition, active full-text scope, file), same as the optimize-mode results.
 ///
 /// `time_clamp`: `None` for a file fully covered by the query range (the
 /// result is time-independent, so the key reuses across shifted windows);
@@ -2560,6 +2745,8 @@ fn get_cache_entry(
 /// for straddling files, whose result depends on the applied timestamp
 /// filter. Clamping to the intersection maximizes reuse: any window with
 /// the same effective overlap shares the key.
+/// `full_text_fields` is the canonical current query scope, not the historical
+/// file's FTS inventory. Unknown and empty scopes have distinct identities.
 ///
 /// LAYOUT: `{file key}|{index_generation}|{index_size}|{condition hash}_{rule}_{clamp}`.
 /// - The FILE KEY leads so [`VixResultCache::remove_file_entries`] can purge every entry of a
@@ -2576,6 +2763,7 @@ pub fn generate_cache_key(
     idx_optimize_rule: &Option<IndexOptimizeMode>,
     parquet_file: &FileKey,
     time_clamp: Option<(i64, i64)>,
+    full_text_fields: Option<&[String]>,
 ) -> String {
     use std::hash::{Hash, Hasher};
 
@@ -2610,6 +2798,9 @@ pub fn generate_cache_key(
     };
     let mut hasher = std::hash::DefaultHasher::new();
     index_condition.hash(&mut hasher);
+    if index_condition.uses_full_text() {
+        full_text_fields.hash(&mut hasher);
+    }
     let clamp = match time_clamp {
         Some((start, end)) => format!("{start}-{end}"),
         None => "full".to_string(),
@@ -2692,28 +2883,6 @@ mod tests {
         index_condition
     }
 
-    #[test]
-    fn test_generate_cache_key_none_rule() {
-        // bitmap searches (no optimize rule) cache under the reserved "n" tag
-        let result = generate_cache_key(&equal_condition(), &None, &create_file_key(1, 10), None);
-        assert!(!result.is_empty());
-        assert!(result.contains("_n_"));
-        assert!(result.contains("file_1_10"));
-    }
-
-    #[test]
-    fn test_generate_cache_key_valid() {
-        let idx_optimize_rule = Some(config::meta::inverted_index::IndexOptimizeMode::SimpleCount);
-        let result = generate_cache_key(
-            &equal_condition(),
-            &idx_optimize_rule,
-            &create_file_key(1, 10),
-            None,
-        );
-        assert!(!result.is_empty());
-        assert!(result.contains("file_1_10"));
-    }
-
     /// Immutable sidecar generations are the primary result-cache identity;
     /// exact size remains a compatibility witness. Equal-sized generations
     /// must never share either the main result or straddling bitmap entry.
@@ -2729,9 +2898,10 @@ mod tests {
         inconsistent_size.meta.index_size = 5120;
 
         for rule in [None, Some(IndexOptimizeMode::SimpleCount)] {
-            let old_key = generate_cache_key(&condition, &rule, &old, None);
-            let new_key = generate_cache_key(&condition, &rule, &new_same_size, None);
-            let inconsistent_key = generate_cache_key(&condition, &rule, &inconsistent_size, None);
+            let old_key = generate_cache_key(&condition, &rule, &old, None, None);
+            let new_key = generate_cache_key(&condition, &rule, &new_same_size, None, None);
+            let inconsistent_key =
+                generate_cache_key(&condition, &rule, &inconsistent_size, None, None);
             assert_ne!(
                 old_key, new_key,
                 "equal-sized immutable generations must not share cache state (rule {rule:?})"
@@ -2748,16 +2918,16 @@ mod tests {
             );
         }
         let cache = vix_result_cache::VixResultCache::new(4);
-        let old_key = generate_cache_key(&condition, &None, &old, None);
-        let new_key = generate_cache_key(&condition, &None, &new_same_size, None);
+        let old_key = generate_cache_key(&condition, &None, &old, None, None);
+        let new_key = generate_cache_key(&condition, &None, &new_same_size, None, None);
         cache.put(old_key, CacheEntry::Count(7));
         assert!(
             cache.get(&new_key, None).is_none(),
             "a cached old generation must miss for an equal-sized new generation"
         );
         assert_eq!(
-            generate_cache_key(&condition, &None, &old, None),
-            generate_cache_key(&condition, &None, &old.clone(), None),
+            generate_cache_key(&condition, &None, &old, None, None),
+            generate_cache_key(&condition, &None, &old.clone(), None, None),
         );
     }
 
@@ -2773,7 +2943,7 @@ mod tests {
     fn test_histogram_cache_key_is_phase_aligned() {
         let file = create_file_key(1, 10);
         let condition = equal_condition();
-        let key = |rule| generate_cache_key(&condition, &Some(rule), &file, None);
+        let key = |rule| generate_cache_key(&condition, &Some(rule), &file, None, None);
 
         // 1000 % 60 == 1600 % 60: the window slid by 10 buckets, key holds
         assert_eq!(
@@ -2800,7 +2970,7 @@ mod tests {
     fn test_multi_histogram_cache_key_normalizes_range_and_separates_grid_and_field() {
         let file = create_file_key(1, 10);
         let condition = equal_condition();
-        let key = |rule, clamp| generate_cache_key(&condition, &Some(rule), &file, clamp);
+        let key = |rule, clamp| generate_cache_key(&condition, &Some(rule), &file, clamp, None);
         let base = IndexOptimizeMode::SimpleMultiHistogram(1000, 1400, 60, 0, "level".to_string());
 
         // Zero-offset requests on the same grid share a key even when both
@@ -2954,12 +3124,13 @@ mod tests {
                     (130, "outside-high".to_string(), 4),
                 ]
         ));
-        let source_key = generate_cache_key(&condition, &Some(source_rule), &file, None);
+        let source_key = generate_cache_key(&condition, &Some(source_rule), &file, None, None);
         cache.put(source_key, entry);
 
         let shifted_rule =
             IndexOptimizeMode::SimpleMultiHistogram(110, 130, 10, 0, "level".to_string());
-        let shifted_key = generate_cache_key(&condition, &Some(shifted_rule.clone()), &file, None);
+        let shifted_key =
+            generate_cache_key(&condition, &Some(shifted_rule.clone()), &file, None, None);
         assert!(matches!(
             cache.get(&shifted_key, Some(&shifted_rule)),
             Some(VixSearchResult::MultiHistogram(rows))
@@ -2968,7 +3139,7 @@ mod tests {
 
         let nonzero_offset =
             IndexOptimizeMode::SimpleMultiHistogram(170, 190, 10, 60, "level".to_string());
-        let nonzero_key = generate_cache_key(&condition, &Some(nonzero_offset), &file, None);
+        let nonzero_key = generate_cache_key(&condition, &Some(nonzero_offset), &file, None, None);
         assert_ne!(
             shifted_key, nonzero_key,
             "nonzero-offset windows retain their full cache identity"
@@ -3012,8 +3183,7 @@ mod tests {
 
         let mut empty_file = create_file_key(1, 10);
         empty_file.meta.records = 0;
-        let guarded = guard_matched_rows("test", &empty_file, 5, 1000).unwrap();
-        assert!(matches!(guarded, Some(VixSearchResult::NoMatch)));
+        assert!(guard_matched_rows("test", &empty_file, 5, 1000).is_err());
     }
 
     #[test]
@@ -3021,6 +3191,9 @@ mod tests {
         let file = create_file_key(1, 10); // records = 1000
         let result = guard_matched_rows("test", &file, 5, 999);
         assert!(result.is_err());
+        // Empty and dense results must not bypass the universe guard.
+        assert!(guard_matched_rows("test", &file, 0, 999).is_err());
+        assert!(guard_matched_rows("test", &file, 1000, 999).is_err());
     }
 
     #[test]
@@ -3150,6 +3323,133 @@ mod tests {
         (reader, file)
     }
 
+    #[test]
+    fn early_exact_access_preserves_no_match_boundaries_and_selective_conjuncts() {
+        let (reader, mut file) = build_select_file("early.vix", 100);
+        let equality = |value: &str| IndexCondition {
+            conditions: vec![Condition::Equal("level".into(), value.into())],
+        };
+        for covered in [false, true] {
+            assert!(matches!(
+                early_exact_access(
+                    "early",
+                    &reader,
+                    &equality("missing"),
+                    file.meta.records,
+                    covered,
+                    None
+                )
+                .unwrap(),
+                Some(RawVixResult::ExactNoMatch),
+            ));
+        }
+        // A dense whole-file leaf says nothing about density inside a boundary
+        // window, so retain real timestamp-clamped bitmap evaluation.
+        assert!(
+            early_exact_access(
+                "early",
+                &reader,
+                &equality("info"),
+                file.meta.records,
+                false,
+                None
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(matches!(
+            early_exact_access(
+                "early",
+                &reader,
+                &equality("info"),
+                file.meta.records,
+                true,
+                None
+            )
+            .unwrap(),
+            Some(RawVixResult::ExactAllRows(10)),
+        ));
+        let condition = IndexCondition {
+            conditions: vec![
+                Condition::Equal("level".into(), "info".into()),
+                Condition::Equal("level".into(), "missing".into()),
+            ],
+        };
+        assert!(
+            early_exact_access("early", &reader, &condition, file.meta.records, true, None)
+                .unwrap()
+                .is_none()
+        );
+        let RawVixResult::Bitmap { bitmap, .. } = evaluate_vix_index(
+            "early",
+            &reader,
+            &condition,
+            None,
+            (0, 101),
+            true,
+            None,
+            None,
+            None,
+        )
+        .unwrap() else {
+            panic!("selective conjunction must remain index-usable");
+        };
+        assert_eq!(bitmap.count_set_bits(), 0);
+        for condition in [
+            IndexCondition {
+                conditions: vec![Condition::MatchAll("info".into())],
+            },
+            IndexCondition {
+                conditions: vec![Condition::All()],
+            },
+            IndexCondition {
+                conditions: vec![Condition::IsNull("level".into())],
+            },
+        ] {
+            assert!(
+                early_exact_access("early", &reader, &condition, file.meta.records, true, None)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        file.meta.records += 1;
+        assert!(
+            early_exact_access(
+                "early",
+                &reader,
+                &equality("missing"),
+                file.meta.records,
+                true,
+                None
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn early_dense_access_returns_scan_not_an_exact_answer() {
+        let error = match decide_exact_term(36, 100, true, 35) {
+            Err(error) => error,
+            _ => panic!("dense leaf must retain residual scan"),
+        };
+        let fallback = error.downcast_ref::<AccessFallback>().unwrap();
+        assert_eq!(fallback.percent, 36);
+        assert_eq!(
+            fallback.native_predicate,
+            NativePredicateStrategy::DirectResidual
+        );
+        // Threshold equality is not a refusal, and full-file density may not
+        // choose the boundary strategy. An invalid count never proves a miss.
+        assert!(decide_exact_term(35, 100, true, 35).unwrap().is_none());
+        assert!(decide_exact_term(100, 100, false, 35).unwrap().is_none());
+        assert!(decide_exact_term(36, 100, true, 0).unwrap().is_none());
+        assert!(matches!(
+            decide_exact_term(100, 100, true, 35).unwrap(),
+            Some(RawVixResult::ExactAllRows(100))
+        ));
+        assert!(decide_exact_term(101, 100, true, 35).is_err());
+    }
+
     /// Pilot fix A read-side: equality on an fts field (tokens only, no raw
     /// values) is skipped per file with the filter added back — never a
     /// silent empty result.
@@ -3211,8 +3511,18 @@ mod tests {
                 Condition::Equal("level".to_string(), "info".to_string()),
             ],
         };
-        match evaluate_vix_index("t", &reader, &condition, None, (0, 1000), true, None, None)
-            .unwrap()
+        match evaluate_vix_index(
+            "t",
+            &reader,
+            &condition,
+            None,
+            (0, 1000),
+            true,
+            None,
+            None,
+            Some(&["message".to_string()]),
+        )
+        .unwrap()
         {
             RawVixResult::Bitmap {
                 bitmap,
@@ -3235,15 +3545,36 @@ mod tests {
             )],
         };
         assert!(
-            evaluate_vix_index("t", &reader, &lone, None, (0, 1000), true, None, None).is_err()
+            evaluate_vix_index(
+                "t",
+                &reader,
+                &lone,
+                None,
+                (0, 1000),
+                true,
+                None,
+                None,
+                Some(&["message".to_string()])
+            )
+            .is_err()
         );
 
         // match_all over the fts tokens is unaffected by fix A
         let match_all = IndexCondition {
             conditions: vec![Condition::MatchAll("hello".to_string())],
         };
-        match evaluate_vix_index("t", &reader, &match_all, None, (0, 1000), true, None, None)
-            .unwrap()
+        match evaluate_vix_index(
+            "t",
+            &reader,
+            &match_all,
+            None,
+            (0, 1000),
+            true,
+            None,
+            None,
+            Some(&["message".to_string()]),
+        )
+        .unwrap()
         {
             RawVixResult::Bitmap {
                 bitmap,
@@ -3326,8 +3657,18 @@ mod tests {
                 Condition::Equal("level".to_string(), "info".to_string()),
             ],
         };
-        match evaluate_vix_index("t", &reader, &condition, None, (0, 1000), true, None, None)
-            .unwrap()
+        match evaluate_vix_index(
+            "t",
+            &reader,
+            &condition,
+            None,
+            (0, 1000),
+            true,
+            None,
+            None,
+            None,
+        )
+        .unwrap()
         {
             RawVixResult::Bitmap {
                 bitmap,
@@ -3351,7 +3692,8 @@ mod tests {
             )],
         };
         assert!(
-            evaluate_vix_index("t", &reader, &lone, None, (0, 1000), true, None, None).is_err()
+            evaluate_vix_index("t", &reader, &lone, None, (0, 1000), true, None, None, None)
+                .is_err()
         );
     }
 
@@ -3424,6 +3766,7 @@ mod tests {
             false,
             None,
             Some(key.clone()),
+            Some(&["message".to_string()]),
         )
         .unwrap();
         assert_eq!(clamped_rows(raw), vec![0], "ts 98 is outside [99,1000)");
@@ -3455,6 +3798,7 @@ mod tests {
             false,
             None,
             Some(key.clone()),
+            Some(&["message".to_string()]),
         )
         .unwrap();
         assert_eq!(clamped_rows(raw), vec![0, 1], "poisoned bitmap must serve");
@@ -3469,6 +3813,7 @@ mod tests {
             false,
             None,
             Some(key.clone()),
+            Some(&["message".to_string()]),
         )
         .unwrap();
         match raw {
@@ -3488,6 +3833,7 @@ mod tests {
             false,
             None,
             Some(key_nm),
+            Some(&["message".to_string()]),
         )
         .unwrap();
         assert_eq!(clamped_rows(raw), Vec::<usize>::new());
@@ -3508,6 +3854,7 @@ mod tests {
             false,
             None,
             Some(key_bad.clone()),
+            Some(&["message".to_string()]),
         )
         .unwrap();
         assert_eq!(
@@ -3653,6 +4000,7 @@ mod tests {
                         in_range,
                         None,
                         None,
+                        Some(&["message".to_string()]),
                     )
                     .unwrap()
                     {
@@ -3684,6 +4032,7 @@ mod tests {
                             in_range,
                             None,
                             None,
+                            Some(&["message".to_string()]),
                         )
                         .unwrap()
                         {
@@ -3900,8 +4249,18 @@ mod tests {
         assert!(!reader.key_term_exists("client_id").unwrap());
 
         let expect_empty_bitmap = |condition: IndexCondition| {
-            match evaluate_vix_index("t", &reader, &condition, None, (0, 2000), true, None, None)
-                .unwrap()
+            match evaluate_vix_index(
+                "t",
+                &reader,
+                &condition,
+                None,
+                (0, 2000),
+                true,
+                None,
+                None,
+                None,
+            )
+            .unwrap()
             {
                 RawVixResult::Bitmap {
                     bitmap,
@@ -3954,6 +4313,7 @@ mod tests {
             true,
             None,
             None,
+            None,
         )
         .unwrap()
         {
@@ -3971,6 +4331,7 @@ mod tests {
             Some(IndexOptimizeMode::SimpleCount),
             (0, 2000),
             true,
+            None,
             None,
             None,
         )
@@ -3992,7 +4353,18 @@ mod tests {
             )],
         };
         assert!(
-            evaluate_vix_index("t", &reader, &mixed, None, (0, 2000), true, None, None).is_err()
+            evaluate_vix_index(
+                "t",
+                &reader,
+                &mixed,
+                None,
+                (0, 2000),
+                true,
+                None,
+                None,
+                None
+            )
+            .is_err()
         );
     }
 
@@ -4086,6 +4458,7 @@ mod tests {
                 true,
                 None,
                 None,
+                None,
             )
             .unwrap()
             {
@@ -4123,6 +4496,7 @@ mod tests {
                 Some(rule),
                 (0, 2000),
                 true,
+                None,
                 None,
                 None,
             );
@@ -4223,6 +4597,7 @@ mod tests {
                 Some(rule),
                 full_range,
                 true,
+                None,
                 None,
                 None,
             );
@@ -4357,6 +4732,7 @@ mod tests {
             true,
             None,
             None,
+            None,
         )
         .unwrap()
         {
@@ -4377,6 +4753,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         )
         .unwrap()
         {
@@ -4395,6 +4772,7 @@ mod tests {
             Some(IndexOptimizeMode::SimpleSelect(2, true)),
             (995, 2000),
             false,
+            None,
             None,
             None,
         )
@@ -4552,8 +4930,8 @@ mod tests {
         }
     }
 
-    /// Store a native-equality fixture with a numeric `code` column. `ghost`
-    /// is absent from both the docs schema and the presence property.
+    /// Store a native-equality fixture with a numeric `code` column. Incomplete
+    /// files also hide `ghost` in `_source`, outside the docs presence property.
     async fn store_native_column_file(key: &str, columns_complete: bool) -> FileKey {
         use arrow::{
             array::{Int64Array, RecordBatch, StringArray},
@@ -4575,7 +4953,11 @@ mod tests {
         .unwrap();
         let sources = StringArray::from(vec![
             r#"{"_timestamp":1002,"code":7}"#,
-            r#"{"_timestamp":1001,"code":8}"#,
+            if columns_complete {
+                r#"{"_timestamp":1001,"code":8}"#
+            } else {
+                r#"{"_timestamp":1001,"code":8,"ghost":"value"}"#
+            },
             r#"{"_timestamp":1000,"code":9}"#,
         ]);
         let mut writer = VixWriter::new(
@@ -4638,6 +5020,7 @@ mod tests {
                 time_range: (0, 10_000),
                 work_group: None,
                 use_inverted_index: true,
+                full_text_fields: None,
             })
         };
         let run = |trace: &'static str, mut files: Vec<FileKey>| async move {
@@ -4714,6 +5097,7 @@ mod tests {
             time_range: (0, 2000),
             work_group: None,
             use_inverted_index: true,
+            full_text_fields: None,
         });
         let mut condition = IndexCondition::new();
         condition.add_condition(Condition::Equal("level".to_string(), "info".to_string()));
@@ -4770,6 +5154,7 @@ mod tests {
                 time_range: (0, 2_000),
                 work_group: None,
                 use_inverted_index: true,
+                full_text_fields: None,
             });
             let mut condition = IndexCondition::new();
             condition.add_condition(Condition::Equal("level".to_string(), "info".to_string()));
@@ -4815,6 +5200,7 @@ mod tests {
             time_range: (990, 1_010),
             work_group: None,
             use_inverted_index: true,
+            full_text_fields: None,
         });
         let mut condition = IndexCondition::new();
         condition.add_condition(Condition::Equal("level".to_string(), "info".to_string()));
@@ -4866,6 +5252,7 @@ mod tests {
             time_range: (800, 1_500),
             work_group: None,
             use_inverted_index: true,
+            full_text_fields: None,
         });
         let mut condition = IndexCondition::new();
         condition.add_condition(Condition::Equal("level".to_string(), "info".to_string()));
@@ -4902,6 +5289,7 @@ mod tests {
             time_range: (990, 1_010),
             work_group: None,
             use_inverted_index: true,
+            full_text_fields: None,
         });
         let mut condition = IndexCondition::new();
         condition.add_condition(Condition::All());
@@ -4973,6 +5361,7 @@ mod tests {
             time_range: (ORIGIN, ORIGIN + WIDTH as i64 * BUCKETS as i64),
             work_group: None,
             use_inverted_index: true,
+            full_text_fields: None,
         });
         let mut condition = IndexCondition::new();
         condition.add_condition(Condition::All());
@@ -5032,6 +5421,7 @@ mod tests {
             time_range: (990, 1_010),
             work_group: None,
             use_inverted_index: true,
+            full_text_fields: None,
         });
         let mut condition = IndexCondition::new();
         condition.add_condition(Condition::All());
@@ -5084,6 +5474,7 @@ mod tests {
             time_range: (990, 1_010),
             work_group: None,
             use_inverted_index: true,
+            full_text_fields: None,
         });
         let mut condition = IndexCondition::new();
         condition.add_condition(Condition::All());
@@ -5122,8 +5513,9 @@ mod tests {
             Some(IndexOptimizeMode::SimpleHistogram(990, 5, 5, 0)),
             &master,
             VixReadMode::Ranged,
-            false,
+            SidecarAccess::check_only(false),
             &source::ReadOperation::new(Arc::clone(&fetch_stats), None),
+            None,
         )
         .await
         .unwrap();
@@ -5148,8 +5540,9 @@ mod tests {
             None,
             &master,
             VixReadMode::Ranged,
-            false,
+            SidecarAccess::check_only(false),
             &source::ReadOperation::new(Arc::clone(&fetch_stats), None),
+            None,
         )
         .await
         .unwrap();
@@ -5189,10 +5582,6 @@ mod tests {
         file_data::disk::remove(&sidecar_key).await.unwrap();
         assert!(!file_data::memory::exist(&sidecar_key).await);
         assert!(!file_data::disk::exist(&sidecar_key).await);
-        assert_eq!(
-            crate::file_cache::take_cache_miss_policy("cold-indexed-native-histogram"),
-            None
-        );
         let params = Arc::new(crate::types::QueryParams {
             trace_id: "cold-indexed-native-histogram".to_string(),
             org_id: "org".to_string(),
@@ -5202,6 +5591,7 @@ mod tests {
             time_range: (990, 1_010),
             work_group: None,
             use_inverted_index: true,
+            full_text_fields: None,
         });
         let mut condition = IndexCondition::new();
         condition.add_condition(Condition::Equal("level".to_string(), "info".to_string()));
@@ -5222,11 +5612,6 @@ mod tests {
             MultiResult::Histogram(histogram) => assert_eq!(histogram, vec![5, 5, 1, 0, 0]),
             other => panic!("expected native histogram, got {other:?}"),
         }
-        assert_eq!(
-            crate::file_cache::take_cache_miss_policy("cold-indexed-native-histogram"),
-            Some(CacheMissPolicy::CheckOnly),
-            "cold exact histograms must probe caches without enqueueing sidecar misses"
-        );
         assert!(
             !reader_cache::GLOBAL_CACHE.contains(&reader_key),
             "cold native histogram must not open the sidecar"
@@ -5260,7 +5645,6 @@ mod tests {
         assert!(file_data::disk::exist(&sidecar_key).await);
 
         let trace_id = "check-only-local-sidecar-histogram";
-        assert_eq!(crate::file_cache::take_cache_miss_policy(trace_id), None);
         let params = Arc::new(crate::types::QueryParams {
             trace_id: trace_id.to_string(),
             org_id: "org".to_string(),
@@ -5270,6 +5654,7 @@ mod tests {
             time_range: (990, 1_010),
             work_group: None,
             use_inverted_index: true,
+            full_text_fields: None,
         });
         let mut condition = IndexCondition::new();
         condition.add_condition(Condition::Equal("level".to_string(), "info".to_string()));
@@ -5290,10 +5675,6 @@ mod tests {
             MultiResult::Histogram(histogram) => assert_eq!(histogram, vec![4, 5, 1, 0, 0]),
             other => panic!("expected indexed histogram, got {other:?}"),
         }
-        assert_eq!(
-            crate::file_cache::take_cache_miss_policy(trace_id),
-            Some(CacheMissPolicy::CheckOnly)
-        );
         assert!(
             reader_cache::GLOBAL_CACHE
                 .get(&reader_key)
@@ -5327,8 +5708,9 @@ mod tests {
             Some(IndexOptimizeMode::SimpleHistogram(990, 5, 5, 0)),
             &master,
             VixReadMode::Ranged,
-            true,
+            SidecarAccess::check_only(true),
             &source::ReadOperation::new(Arc::clone(&fetch_stats), None),
+            None,
         )
         .await
         .unwrap();
@@ -5385,8 +5767,9 @@ mod tests {
                 Some(zero_offset.clone()),
                 &indexed,
                 read_mode,
-                false,
+                SidecarAccess::check_only(false),
                 &source::ReadOperation::new(Arc::clone(&fetch_stats), None),
+                None,
             )
             .await
             .unwrap_err();
@@ -5407,12 +5790,13 @@ mod tests {
                 Some(mode),
                 &indexless,
                 VixReadMode::Ranged,
-                false,
+                SidecarAccess::check_only(false),
                 &source::ReadOperation::new(Arc::clone(&fetch_stats), None),
+                None,
             )
             .await
             .unwrap();
-            assert!(key.is_empty());
+            assert_eq!(key, indexless.key);
             assert!(matches!(result, VixSearchResult::Skipped { percent: 100 }));
             assert!(has_skipped);
         }
@@ -5434,6 +5818,7 @@ mod tests {
             time_range: (990, 1_010),
             work_group: None,
             use_inverted_index: true,
+            full_text_fields: None,
         });
         let mut files = vec![indexed.clone(), indexless.clone()];
         let (_, add_filter_back, result) =
@@ -5474,12 +5859,13 @@ mod tests {
             Some(mode),
             &file,
             VixReadMode::Ranged,
-            false,
+            SidecarAccess::check_only(false),
             &source::ReadOperation::new(Arc::clone(&fetch_stats), None),
+            None,
         )
         .await
         .unwrap();
-        assert!(key.is_empty());
+        assert_eq!(key, file.key);
         assert!(matches!(result, VixSearchResult::Skipped { percent: 100 }));
         assert!(has_skipped);
 
@@ -5495,18 +5881,34 @@ mod tests {
             Some(missing_mode),
             &file,
             VixReadMode::Ranged,
-            false,
+            SidecarAccess::check_only(false),
             &source::ReadOperation::new(Arc::clone(&fetch_stats), None),
+            None,
         )
         .await
         .unwrap();
-        assert!(key.is_empty());
+        assert_eq!(key, file.key);
         assert!(matches!(result, VixSearchResult::Skipped { percent: 100 }));
         assert!(has_skipped);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_native_equality_distinguishes_absent_from_non_string_columns() {
+        use arrow::{
+            array::Int64Array,
+            datatypes::{DataType, Field, Schema},
+        };
+        use datafusion::{
+            datasource::listing::{
+                ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
+            },
+            physical_plan::collect,
+            prelude::{SessionConfig, SessionContext},
+        };
+        use object_store::{ObjectStoreExt, memory::InMemory, path::Path};
+
+        use crate::datafusion::vix_format::{VixCoreFormat, inject_vix_scan_pruning};
+
         let complete = store_native_column_file(
             "files/org/logs/native-absence/2026/01/01/00/complete.vix",
             true,
@@ -5517,67 +5919,113 @@ mod tests {
             false,
         )
         .await;
-        let fetch_stats = Arc::new(source::FetchStats::default());
-        let mode = IndexOptimizeMode::SimpleSelect(10, false);
-        let absent = IndexCondition {
-            conditions: vec![Condition::Equal("ghost".to_string(), "value".to_string())],
-        };
-        let cache_key = format!("{}|native-complete-absent", complete.key);
-        vix_result_cache::GLOBAL_CACHE.remove_file_entries(std::iter::once(complete.key.as_str()));
-        let (key, result, has_skipped) = search_vix_docs_optimized(
-            "native-complete-absent",
-            &absent,
-            Some(mode.clone()),
-            &complete,
-            VixReadMode::Ranged,
-            &source::ReadOperation::new(Arc::clone(&fetch_stats), None),
-            None,
-            cache_key.clone(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(key, complete.key);
-        assert!(matches!(result, VixSearchResult::NoMatch));
-        assert!(!has_skipped);
-        assert!(matches!(
-            vix_result_cache::GLOBAL_CACHE.get(&cache_key, Some(&mode)),
-            Some(VixSearchResult::NoMatch)
-        ));
+        for (file, field, needle, retained, expected) in [
+            (&complete, "ghost", "value", false, Some(vec![])),
+            (&incomplete, "ghost", "value", true, Some(vec![1_001])),
+            (&complete, "code", "8", true, Some(vec![1_001])),
+            (&complete, "code", "not-a-number", true, None),
+        ] {
+            let condition = IndexCondition {
+                conditions: vec![Condition::Equal(field.to_string(), needle.to_string())],
+            };
+            let params = Arc::new(crate::types::QueryParams {
+                trace_id: format!("native-equality-{field}-{needle}"),
+                org_id: "org".to_string(),
+                stream: datafusion::sql::TableReference::from("t"),
+                stream_type: StreamType::Logs,
+                stream_name: "t".to_string(),
+                time_range: (990, 1_010),
+                work_group: None,
+                use_inverted_index: true,
+                full_text_fields: None,
+            });
+            let mut files = vec![file.clone()];
+            let (_, add_filter_back, _) = vix_search(
+                params,
+                &mut files,
+                Some(condition),
+                Some(IndexOptimizeMode::SimpleSelect(1, false)),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                files
+                    .iter()
+                    .map(|file| file.key.as_str())
+                    .collect::<Vec<_>>(),
+                if retained {
+                    vec![file.key.as_str()]
+                } else {
+                    vec![]
+                },
+                "only proven absence may prune {field} = {needle:?}"
+            );
+            assert_eq!(add_filter_back, retained);
 
-        let (key, result, has_skipped) = search_vix_docs_optimized(
-            "native-incomplete-absent",
-            &absent,
-            Some(mode.clone()),
-            &incomplete,
-            VixReadMode::Ranged,
-            &source::ReadOperation::new(Arc::clone(&fetch_stats), None),
-            None,
-            String::new(),
-        )
-        .await
-        .unwrap();
-        assert!(key.is_empty());
-        assert!(matches!(result, VixSearchResult::Skipped { percent: 100 }));
-        assert!(has_skipped);
-
-        let non_string = IndexCondition {
-            conditions: vec![Condition::Equal("code".to_string(), "7".to_string())],
-        };
-        let (key, result, has_skipped) = search_vix_docs_optimized(
-            "native-complete-non-string",
-            &non_string,
-            Some(mode),
-            &complete,
-            VixReadMode::Cached,
-            &source::ReadOperation::new(Arc::clone(&fetch_stats), None),
-            None,
-            String::new(),
-        )
-        .await
-        .unwrap();
-        assert!(key.is_empty());
-        assert!(matches!(result, VixSearchResult::Skipped { percent: 100 }));
-        assert!(has_skipped);
+            // Scan exactly the surviving files and apply the residual only
+            // when requested by the public pruning contract. Both matches
+            // are below the first physical row, so dropping the residual or
+            // applying LIMIT before it produces the wrong timestamp.
+            let store = Arc::new(InMemory::new());
+            for file in &files {
+                let data = infra::storage::get_bytes(&file.account, &file.key)
+                    .await
+                    .unwrap();
+                store
+                    .put(&Path::from("data/file.vix"), data.into())
+                    .await
+                    .unwrap();
+            }
+            let ctx =
+                SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+            ctx.register_object_store(&url::Url::parse("test:///").unwrap(), store);
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("_timestamp", DataType::Int64, false),
+                Field::new("code", DataType::Int64, true),
+                Field::new("ghost", DataType::Utf8, true),
+            ]));
+            let config = ListingTableConfig::new(ListingTableUrl::parse("test:///data/").unwrap())
+                .with_listing_options(
+                    ListingOptions::new(Arc::new(VixCoreFormat::new(None))).with_collect_stat(true),
+                )
+                .with_schema(schema);
+            ctx.register_table("t", Arc::new(ListingTable::try_new(config).unwrap()))
+                .unwrap();
+            let residual = if add_filter_back {
+                format!(" WHERE {field} = '{needle}'")
+            } else {
+                String::new()
+            };
+            let rows = async {
+                let df = ctx
+                    .sql(&format!(
+                        "SELECT _timestamp FROM t{residual} ORDER BY _timestamp DESC LIMIT 1"
+                    ))
+                    .await?;
+                let plan = inject_vix_scan_pruning(df.create_physical_plan().await?)?;
+                let batches = collect(plan, ctx.task_ctx()).await?;
+                Ok::<_, datafusion::error::DataFusionError>(
+                    batches
+                        .iter()
+                        .flat_map(|batch| {
+                            batch
+                                .column(0)
+                                .as_any()
+                                .downcast_ref::<Int64Array>()
+                                .unwrap()
+                                .values()
+                                .iter()
+                                .copied()
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            }
+            .await;
+            match expected {
+                Some(expected) => assert_eq!(rows.unwrap(), expected),
+                None => assert!(rows.is_err(), "invalid numeric SQL must not become a miss"),
+            }
+        }
     }
 }
 
@@ -5710,6 +6158,8 @@ mod ranged_parity_tests {
     /// A deterministic, order-insensitive rendering of one evaluation result.
     fn fingerprint(raw: &RawVixResult) -> String {
         match raw {
+            RawVixResult::ExactNoMatch => "no-match".to_string(),
+            RawVixResult::ExactAllRows(rows) => format!("all-rows:{rows}"),
             RawVixResult::PartialFields => "partial-fields".to_string(),
             RawVixResult::MissingColumn { field } => format!("missing-column:{field}"),
             RawVixResult::Count { count, has_skipped } => format!("count:{count}:{has_skipped}"),
@@ -5924,6 +6374,7 @@ mod ranged_parity_tests {
                         in_range,
                         None,
                         None,
+                        Some(&["level".to_string()]),
                     );
                     let ranged = evaluate_vix_index(
                         "parity-ranged",
@@ -5934,6 +6385,7 @@ mod ranged_parity_tests {
                         in_range,
                         None,
                         None,
+                        Some(&["level".to_string()]),
                     );
                     let decode = evaluate_vix_index(
                         "parity-decode",
@@ -5944,6 +6396,7 @@ mod ranged_parity_tests {
                         in_range,
                         None,
                         None,
+                        Some(&["level".to_string()]),
                     );
                     let render = |result: &anyhow::Result<RawVixResult>| match result {
                         Ok(raw) => fingerprint(raw),
@@ -5974,8 +6427,18 @@ mod ranged_parity_tests {
         // the same dictionary ranges
         let unknown = condition(vec![Condition::Equal("unknown_field".into(), "x".into())]);
         for reader in [&mem_reader, &ranged_reader] {
-            match evaluate_vix_index("p", reader, &unknown, None, full_range, true, None, None)
-                .unwrap()
+            match evaluate_vix_index(
+                "p",
+                reader,
+                &unknown,
+                None,
+                full_range,
+                true,
+                None,
+                None,
+                Some(&["level".to_string()]),
+            )
+            .unwrap()
             {
                 RawVixResult::Bitmap {
                     bitmap,
@@ -6002,6 +6465,7 @@ mod ranged_parity_tests {
             true,
             None,
             None,
+            Some(&["level".to_string()]),
         )
         .err()
         .expect("all-skipped condition must error")
@@ -6015,6 +6479,7 @@ mod ranged_parity_tests {
             true,
             None,
             None,
+            Some(&["level".to_string()]),
         )
         .err()
         .expect("all-skipped condition must error")
@@ -6031,6 +6496,7 @@ mod ranged_parity_tests {
             true,
             None,
             None,
+            Some(&["level".to_string()]),
         )
         .unwrap();
         match probe {
@@ -6139,6 +6605,7 @@ mod ranged_parity_tests {
             true,
             None,
             None,
+            None,
         )
         .unwrap()
         {
@@ -6158,6 +6625,7 @@ mod ranged_parity_tests {
             false,
             None,
             None,
+            None,
         )
         .unwrap()
         {
@@ -6175,6 +6643,7 @@ mod ranged_parity_tests {
             Some(IndexOptimizeMode::SimpleCountField("svc".into())),
             full,
             true,
+            None,
             None,
             None,
         )
@@ -6198,6 +6667,7 @@ mod ranged_parity_tests {
                 Some(IndexOptimizeMode::SimpleMinMax("code".into(), is_max)),
                 full,
                 true,
+                None,
                 None,
                 None,
             )
@@ -6226,6 +6696,7 @@ mod ranged_parity_tests {
             )),
             full,
             true,
+            None,
             None,
             None,
         )
@@ -6264,6 +6735,7 @@ mod ranged_parity_tests {
             Some(IndexOptimizeMode::SimpleCount),
             full,
             true,
+            None,
             None,
             None,
         ) {
@@ -6326,6 +6798,7 @@ mod ranged_parity_tests {
             true,
             None,
             None,
+            None,
         )
         .unwrap()
         {
@@ -6341,6 +6814,7 @@ mod ranged_parity_tests {
             Some(IndexOptimizeMode::SimpleMinMax("ghost".into(), true)),
             (0, 2_000),
             true,
+            None,
             None,
             None,
         )
@@ -6364,6 +6838,7 @@ mod ranged_parity_tests {
                 Some(rule),
                 (0, 2_000),
                 true,
+                None,
                 None,
                 None,
             )
@@ -6516,6 +6991,7 @@ mod review_tests {
                 true,
                 None,
                 None,
+                None,
             )
         };
 
@@ -6587,7 +7063,7 @@ mod review_tests {
 
     /// The pre-clamp bitmap memo and the main result cache share a key for
     /// (condition, rule=None, file): both reduce to
-    /// `generate_cache_key(cond, &None, file, None)` when the file is fully
+    /// `generate_cache_key(cond, &None, file, None, None)` when the file is fully
     /// covered. The main hit path serves entries as EXACT — it has no reader
     /// open to re-derive `has_skipped` — so a SUPERSET bitmap memoized by a
     /// straddling-window eval would surface as final rows (extra rows) in a
@@ -6612,6 +7088,7 @@ mod review_tests {
                 false,
                 None,
                 Some(key.to_string()),
+                None,
             )
         };
 
@@ -6704,6 +7181,7 @@ mod review_tests {
             true,
             None,
             None,
+            Some(&["message".to_string()]),
         )
         .unwrap()
         {
@@ -6941,8 +7419,8 @@ mod review_tests {
                 Condition::Equal("c".into(), "d".into()),
             ],
         };
-        let key_crafted = generate_cache_key(&crafted, &rule, &file, None);
-        let key_two = generate_cache_key(&two, &rule, &file, None);
+        let key_crafted = generate_cache_key(&crafted, &rule, &file, None, None);
+        let key_two = generate_cache_key(&two, &rule, &file, None, None);
         assert!(!key_crafted.is_empty());
         assert!(!key_two.is_empty());
         // structurally different queries never share a key
@@ -6951,16 +7429,22 @@ mod review_tests {
         // same condition still hits the same key (cache stays useful)
         assert_eq!(
             key_two,
-            generate_cache_key(&two.clone(), &rule, &file, None)
+            generate_cache_key(&two.clone(), &rule, &file, None, None)
         );
         // ...and the key still separates rules and files
         let other_rule = Some(IndexOptimizeMode::SimpleDistinct("a".into(), 10, true));
-        assert_ne!(key_two, generate_cache_key(&two, &other_rule, &file, None));
+        assert_ne!(
+            key_two,
+            generate_cache_key(&two, &other_rule, &file, None, None)
+        );
         let other_file = FileKey {
             key: "files/org/logs/s/2.vix".to_string(),
             ..file.clone()
         };
-        assert_ne!(key_two, generate_cache_key(&two, &rule, &other_file, None));
+        assert_ne!(
+            key_two,
+            generate_cache_key(&two, &rule, &other_file, None, None)
+        );
     }
 
     /// Plain row-selection (no optimize rule) caches under the reserved "n"
@@ -6982,15 +7466,19 @@ mod review_tests {
             conditions: vec![Condition::Equal("a".into(), "b".into())],
         };
 
-        let plain = generate_cache_key(&condition, &None, &file, None);
+        let plain = generate_cache_key(&condition, &None, &file, None, None);
         assert!(!plain.is_empty());
-        assert_eq!(plain, generate_cache_key(&condition, &None, &file, None));
+        assert_eq!(
+            plain,
+            generate_cache_key(&condition, &None, &file, None, None)
+        );
         assert_ne!(
             plain,
             generate_cache_key(
                 &condition,
                 &Some(IndexOptimizeMode::SimpleCount),
                 &file,
+                None,
                 None
             )
         );
@@ -7026,15 +7514,15 @@ mod review_tests {
         };
         let rule = Some(IndexOptimizeMode::SimpleCount);
 
-        let full = generate_cache_key(&condition, &rule, &file, None);
-        let clamp_a = generate_cache_key(&condition, &rule, &file, Some((150, 201)));
-        let clamp_b = generate_cache_key(&condition, &rule, &file, Some((160, 201)));
+        let full = generate_cache_key(&condition, &rule, &file, None, None);
+        let clamp_a = generate_cache_key(&condition, &rule, &file, Some((150, 201)), None);
+        let clamp_b = generate_cache_key(&condition, &rule, &file, Some((160, 201)), None);
         assert_ne!(full, clamp_a);
         assert_ne!(clamp_a, clamp_b);
         // identical effective overlap -> identical key (cross-window reuse)
         assert_eq!(
             clamp_a,
-            generate_cache_key(&condition, &rule, &file, Some((150, 201)))
+            generate_cache_key(&condition, &rule, &file, Some((150, 201)), None)
         );
     }
 
@@ -7068,6 +7556,7 @@ mod review_tests {
             true,
             None,
             None,
+            None,
         )
         .unwrap()
         {
@@ -7091,6 +7580,7 @@ mod review_tests {
             )),
             (0, 2000),
             true,
+            None,
             None,
             None,
         )
@@ -7121,6 +7611,7 @@ mod review_tests {
             )),
             (0, 2000),
             true,
+            None,
             None,
             None,
         )
@@ -7157,6 +7648,7 @@ mod review_tests {
             true,
             None,
             None,
+            None,
         )
         .unwrap()
         {
@@ -7179,6 +7671,7 @@ mod review_tests {
             )),
             (0, 2000),
             true,
+            None,
             None,
             None,
         )
@@ -7264,6 +7757,7 @@ mod review_tests {
             time_range: (0, 2000),
             work_group: None,
             use_inverted_index: true,
+            full_text_fields: Some(vec!["message".to_string()]),
         })
     }
 
@@ -7416,6 +7910,7 @@ mod review_tests {
             false,
             None,
             None,
+            None,
         )
         .unwrap()
         {
@@ -7496,6 +7991,7 @@ mod review_tests {
                 rule,
                 (0, 2000),
                 true,
+                None,
                 None,
                 None,
             )
@@ -7774,6 +8270,7 @@ mod ui_histogram_differential_tests {
             Some(mode.clone()),
             eval_range,
             file_in_range,
+            None,
             None,
             None,
         )

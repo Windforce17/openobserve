@@ -556,7 +556,12 @@ pub async fn get_result_schema(
         && use_cache
         && let Some(interval) = sql.histogram_interval
     {
-        handle_histogram(&mut sql.sql, sql.time_range, interval);
+        let time_range = sql.time_range;
+        handle_histogram(
+            &mut Arc::make_mut(&mut sql.metadata).sql,
+            time_range,
+            interval,
+        );
     }
 
     let sql_arc = Arc::new(sql.clone());

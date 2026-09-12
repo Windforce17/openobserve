@@ -52,7 +52,7 @@ pub async fn write_results_to_cache(
     accumulated_results: &mut Vec<SearchResultType>,
     clear_cache: bool,
 ) -> Result<(), infra::errors::Error> {
-    if accumulated_results.is_empty() {
+    if !c_resp.cache_query_response || accumulated_results.is_empty() {
         return Ok(());
     }
 
@@ -75,6 +75,10 @@ pub async fn write_results_to_cache(
         }
     }
 
+    let is_histogram_non_ts_order = c_resp.histogram_interval > 0
+        && c_resp.order_by.first().is_none_or(|(field, _)| {
+            !cache::result_utils::is_timestamp_field(field, &c_resp.ts_column)
+        });
     let merged_response = cache::merge_response(
         &c_resp.trace_id,
         &mut cached_responses,
@@ -93,20 +97,14 @@ pub async fn write_results_to_cache(
         && !merged_response.hits.is_empty();
 
     if cfg.common.result_cache_enabled && should_cache_results {
-        // Determine if this is a non-timestamp histogram query for websocket streaming
-        let is_histogram_non_ts_order = c_resp.histogram_interval > 0
-            && !merged_response.order_by_metadata.is_empty()
-            && merged_response
-                .order_by_metadata
-                .first()
-                .map(|(field, _)| field != &c_resp.ts_column)
-                .unwrap_or(false);
+        // Preserve the execution ordering, not the post-merge display order.
 
         cache::write_results(
             &c_resp.trace_id,
             &c_resp.ts_column,
             start_time,
             end_time,
+            c_resp.limit,
             merged_response,
             c_resp.file_path.clone(),
             c_resp.is_aggregate,

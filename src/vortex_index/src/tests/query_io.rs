@@ -91,6 +91,395 @@ fn blob_range(data: &Bytes, tag: &str) -> Range<u64> {
         .get_offset(None)
 }
 
+/// Keep the writer's real 64-row zone/stats axis, but store each 1024-row
+/// projection chunk in one native leaf. This is the coalesced-merge shape:
+/// multiple pruning holes can share a physical leaf.
+fn fragmented_zone_data() -> Bytes {
+    let rows = 4096;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("_timestamp", DataType::Int64, false),
+        Field::new("duration", DataType::Int64, false),
+        Field::new("gate", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from_iter_values(
+                (0..rows).map(|row| 10_000 - row),
+            )),
+            Arc::new(Int64Array::from_iter_values(0..rows)),
+            Arc::new(StringArray::from_iter_values(
+                (0..rows).map(|row| if (row / 64) % 4 == 1 { "a" } else { "z" }),
+            )),
+        ],
+    )
+    .unwrap();
+    let mut writer = VixWriter::new(
+        &schema,
+        VixWriterOptions {
+            docs_chunk_max_rows: 64,
+            encode_threads: 1,
+            ..Default::default()
+        },
+        false,
+    );
+    writer
+        .push_batch_with_source(&batch, &StringArray::from(vec!["{}"; rows as usize]), None)
+        .unwrap();
+    let (data, _) = writer.finish().unwrap();
+    let parsed = container::parse_container(&Bytes::from(data)).unwrap();
+    let coarse: Vec<_> = (0..rows as usize)
+        .step_by(1024)
+        .map(|offset| batch.slice(offset, 1024))
+        .collect();
+    let native =
+        container::write_vortex_blob(&schema, &coarse, container::addressable_strategy(), 1)
+            .unwrap();
+    let mut properties: Vec<_> = parsed.properties.into_iter().collect();
+    // Keep every projected leaf outside the eager Puffin tail.
+    properties.push(("padding".into(), "x".repeat(128 * 1024)));
+    container::build_container(
+        properties,
+        vec![
+            (container::BLOB_TYPE_DOCS, container::BLOB_TAG_DOCS, native),
+            (
+                container::BLOB_TYPE_STATS,
+                container::BLOB_TAG_STATS,
+                parsed.stats.unwrap().bytes().unwrap().to_vec(),
+            ),
+        ],
+    )
+    .unwrap()
+    .into()
+}
+
+#[test]
+fn fragmented_zone_projection_reads_shared_leaves_once() {
+    use crate::docs::{BoundValue, ColumnBound};
+
+    let data = fragmented_zone_data();
+    let blob_start = blob_range(&data, container::BLOB_TAG_DOCS).start;
+    let source = LoggedSource::new(data);
+    let docs = crate::VixDocs::open_ranged(source.clone()).unwrap();
+    // A non-equality string bound isolates zone pruning from the separate
+    // dictionary equality prepass; string bounds are not native row filters.
+    let gate = ColumnBound {
+        column: "gate".into(),
+        min: Some((BoundValue::Str("m".into()), true)),
+        max: None,
+    };
+    let ranges = docs
+        .pruned_scan_ranges(None, std::slice::from_ref(&gate))
+        .unwrap();
+    let leaves = docs.column_leaf_extents("duration").unwrap();
+    assert_eq!(docs.zone_chunks().unwrap().len(), 64);
+    assert_eq!(leaves.len(), 4, "fixture must have coarse projected leaves");
+    assert!(ranges.len() > leaves.len());
+    let expected: Vec<i64> = (0..4096).filter(|row| (row / 64) % 4 != 1).collect();
+    let projection = ["duration".to_string(), "duration".to_string()];
+    source.ranges.lock().clear();
+    let mut got = Vec::new();
+    docs.scan_docs_opts(
+        Some(&projection),
+        None,
+        None,
+        &[gate.clone()],
+        None,
+        0,
+        &mut |batch| {
+            assert_eq!(batch.num_columns(), 2);
+            assert_eq!(batch.column(0), batch.column(1));
+            let values = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            got.extend(values.values().iter().copied());
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(got, expected, "holes must not be widened or rows reordered");
+    let reads = source.ranges();
+    for (offset, len) in leaves {
+        let leaf = blob_start + offset..blob_start + offset + len;
+        // The footer suffix cache may already cover part of a data leaf.
+        // Any remaining bytes fetched by this scan must not overlap.
+        let mut fetched: Vec<_> = reads
+            .iter()
+            .filter_map(|read| {
+                let start = read.start.max(leaf.start);
+                let end = read.end.min(leaf.end);
+                (start < end).then_some(start..end)
+            })
+            .collect();
+        fetched.sort_unstable_by_key(|range| range.start);
+        assert!(
+            fetched.windows(2).all(|pair| pair[0].end <= pair[1].start),
+            "projected leaf {leaf:?} must not be reread across fragmented zones; reads={reads:?}"
+        );
+    }
+
+    // The supported global limit crosses several holes. Numeric/timestamp
+    // filtering is exercised separately: native filter+limit is unsupported.
+    got.clear();
+    docs.scan_docs_opts(
+        Some(&projection[..1]),
+        None,
+        None,
+        &[gate.clone()],
+        Some(200),
+        0,
+        &mut |batch| {
+            let values = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            got.extend(values.values().iter().copied());
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(got, expected[..200]);
+    got.clear();
+    let numeric = ColumnBound {
+        column: "duration".into(),
+        min: Some((BoundValue::I64(117), false)),
+        max: Some((BoundValue::I64(2100), true)),
+    };
+    docs.scan_docs_opts(
+        Some(&projection[..1]),
+        None,
+        Some((8000, 9900)),
+        &[gate.clone(), numeric],
+        None,
+        0,
+        &mut |batch| {
+            let values = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            got.extend(values.values().iter().copied());
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        got,
+        expected
+            .iter()
+            .copied()
+            .filter(|row| *row > 117 && *row <= 2000)
+            .collect::<Vec<_>>()
+    );
+
+    // Refuse one admission only. Falling back after a real reservation error
+    // would then succeed, incorrectly hiding the caller's budget failure.
+    struct RejectGrowth {
+        baseline: AtomicUsize,
+        rejected: AtomicBool,
+    }
+    impl VixReadOperation for RejectGrowth {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+
+        fn check_memory(&self, bytes: usize) -> std::result::Result<(), crate::VixError> {
+            let baseline = self.baseline.fetch_min(bytes, Ordering::AcqRel);
+            if bytes > baseline && !self.rejected.swap(true, Ordering::AcqRel) {
+                return Err(crate::VixError::Callback(VisitorStopped.into()));
+            }
+            Ok(())
+        }
+    }
+    let operation = Arc::new(RejectGrowth {
+        baseline: AtomicUsize::new(usize::MAX),
+        rejected: AtomicBool::new(false),
+    });
+    let reads_before = source.ranges();
+    let error = with_read_operation(operation.clone(), || {
+        docs.scan_docs_opts(
+            Some(&projection[..1]),
+            None,
+            None,
+            &[gate.clone()],
+            None,
+            0,
+            &mut |_| panic!("refused selection admission must not deliver rows"),
+        )
+    })
+    .unwrap_err();
+    assert!(operation.rejected.load(Ordering::Acquire));
+    assert!(error.chain().any(|cause| cause.is::<VisitorStopped>()));
+    assert_eq!(source.ranges(), reads_before);
+
+    let error = docs
+        .scan_docs_opts(
+            Some(&projection[..1]),
+            None,
+            None,
+            &[gate.clone()],
+            None,
+            0,
+            &mut |_| Err(VisitorStopped.into()),
+        )
+        .unwrap_err();
+    assert!(error.chain().any(|cause| cause.is::<VisitorStopped>()));
+    let operation = Arc::new(Operation(AtomicBool::new(false)));
+    let mut calls = 0;
+    let error = with_read_operation(operation.clone(), || {
+        docs.scan_docs_opts(
+            Some(&projection[..1]),
+            None,
+            None,
+            &[gate.clone()],
+            None,
+            0,
+            &mut |_| {
+                calls += 1;
+                operation.0.store(true, Ordering::Release);
+                Ok(())
+            },
+        )
+    })
+    .unwrap_err();
+    assert!(error.chain().any(|cause| matches!(
+        cause.downcast_ref::<crate::VixError>(),
+        Some(crate::VixError::Cancelled)
+    )));
+    assert_eq!(calls, 1);
+    got.clear();
+    docs.scan_docs_opts(
+        Some(&projection[..1]),
+        None,
+        None,
+        &[gate],
+        None,
+        0,
+        &mut |batch| {
+            let values = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            got.extend(values.values().iter().copied());
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        got, expected,
+        "aborts must leave no stale selection or cancellation"
+    );
+}
+
+/// Constant native chunks let the public VixDocs API exercise its u64 row
+/// domain without constructing an Arrow array or row-id vector of that size.
+fn large_offset_zone_data(gap: u64) -> Bytes {
+    use vortex::{
+        VortexSessionDefault,
+        array::{
+            IntoArray,
+            arrays::{ConstantArray, StructArray},
+            validity::Validity,
+        },
+        file::VortexWriteOptions,
+        io::{
+            runtime::{BlockingRuntime, single::SingleThreadRuntime},
+            session::RuntimeSessionExt,
+        },
+        scalar::Scalar,
+        session::VortexSession,
+    };
+
+    let chunks = [(u64::from(u32::MAX) + 18, 0i64), (4, 11), (gap, 0), (4, 22)];
+    let arrays: Vec<_> = chunks
+        .iter()
+        .map(|(rows, marker)| {
+            let rows = usize::try_from(*rows).unwrap();
+            StructArray::try_new(
+                ["_timestamp", "marker"].into_iter().collect(),
+                vec![
+                    ConstantArray::new(Scalar::from(if *marker == 0 { 0i64 } else { 10i64 }), rows)
+                        .into_array(),
+                    ConstantArray::new(Scalar::from(*marker), rows).into_array(),
+                ],
+                rows,
+                Validity::NonNullable,
+            )
+            .unwrap()
+            .into_array()
+        })
+        .collect();
+    let runtime = SingleThreadRuntime::default();
+    let session = VortexSession::default().with_handle(runtime.handle());
+    let mut native = Vec::new();
+    let mut writer = VortexWriteOptions::new(session)
+        .with_strategy(container::addressable_strategy())
+        .blocking(&runtime)
+        .writer(&mut native, arrays[0].dtype().clone());
+    for array in arrays {
+        writer.push(array).unwrap();
+    }
+    writer.finish().unwrap();
+    let zones: Vec<_> = chunks
+        .iter()
+        .map(|(rows, marker)| {
+            let ts = if *marker == 0 { 0i64 } else { 10i64 };
+            (*rows, ts, ts)
+        })
+        .collect();
+    container::build_container(
+        vec![
+            ("version".into(), "3".into()),
+            (
+                "row_count".into(),
+                chunks.iter().map(|(rows, _)| rows).sum::<u64>().to_string(),
+            ),
+            ("row_order".into(), "concat".into()),
+            ("columns".into(), "[\"_timestamp\",\"marker\"]".into()),
+            ("zone_map".into(), serde_json::to_string(&zones).unwrap()),
+        ],
+        vec![(container::BLOB_TYPE_DOCS, container::BLOB_TAG_DOCS, native)],
+    )
+    .unwrap()
+    .into()
+}
+
+#[test]
+fn fragmented_zone_sparse_u64_and_huge_gap_stay_bounded() {
+    // The first case makes the sparse included side cheaper than expanding
+    // gap containers; the second must retain the streaming guard fallback.
+    // Both start above 2^32 and would lose the selected rows if narrowed.
+    for gap in [1 << 20, 1 << 40] {
+        let docs = crate::VixDocs::open(large_offset_zone_data(gap)).unwrap();
+        let first = u64::from(u32::MAX) + 18;
+        assert_eq!(
+            docs.pruned_scan_ranges(Some((10, 11)), &[]),
+            Some(vec![first..first + 4, first + 4 + gap..first + 8 + gap]),
+        );
+        let mut got = Vec::new();
+        docs.scan_docs(
+            Some(&["marker".to_string()]),
+            None,
+            Some((10, 11)),
+            &mut |batch| {
+                let values = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                got.extend(values.values().iter().copied());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(got, [11, 11, 11, 11, 22, 22, 22, 22]);
+    }
+}
+
 #[test]
 fn eager_tail_fetches_only_missing_blob_intervals() {
     let payload: Vec<u8> = (0..8192).map(|i| (i % 251) as u8).collect();

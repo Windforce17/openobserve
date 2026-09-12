@@ -64,8 +64,9 @@ pub static RE_SELECT_FROM: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)SELECT (.
 pub static RE_HISTOGRAM: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?i)histogram\(([^\)]*)\)").unwrap());
 
+/// Immutable metadata shared by all executions of one prepared query.
 #[derive(Clone, Debug)]
-pub struct Sql {
+pub struct SqlMetadata {
     pub sql: String,
     pub is_complex: bool,
     pub org_id: String,
@@ -79,13 +80,498 @@ pub struct Sql {
     pub schemas: HashMap<TableReference, Arc<SchemaCache>>,
     pub limit: i64,
     pub offset: i64,
-    pub time_range: (i64, i64),
     pub group_by: Vec<String>,
     pub order_by: Vec<(String, OrderBy)>,
     pub histogram_interval: Option<i64>,
     pub timezone: Option<String>,
     pub sorted_by_time: bool, // if only order by _timestamp
+    pub pagination: SqlPagination,
+}
+
+/// A shallow execution view; bounds and sampling belong to this execution.
+#[derive(Clone, Debug)]
+pub struct Sql {
+    pub metadata: Arc<SqlMetadata>,
+    pub time_range: (i64, i64),
     pub sampling_config: Option<proto::cluster_rpc::SamplingConfig>,
+}
+
+impl std::ops::Deref for Sql {
+    type Target = SqlMetadata;
+
+    fn deref(&self) -> &Self::Target {
+        &self.metadata
+    }
+}
+
+/// Parsed pagination and time-axis facts used only to certify cache coverage.
+/// Default is deliberately uncertified for metadata constructed without an AST.
+#[derive(Clone, Debug, Default)]
+pub struct SqlPagination {
+    root_limit: Option<i64>,
+    legacy_limit: Option<i64>,
+    cache_safe: bool,
+    timestamp_columns: Vec<String>,
+    has_explicit_order: bool,
+}
+
+impl SqlPagination {
+    fn from_statement(
+        statement: &mut sqlparser::ast::Statement,
+        legacy_limit: Option<i64>,
+        order_by: &[(String, OrderBy)],
+    ) -> Self {
+        let mut visitor = PaginationVisitor {
+            pagination: Self {
+                legacy_limit,
+                cache_safe: matches!(statement, sqlparser::ast::Statement::Query(_)),
+                ..Default::default()
+            },
+            depth: 0,
+            order_by,
+        };
+        let _ = statement.visit(&mut visitor);
+        visitor.pagination
+    }
+
+    fn execution_limit(&self, requested: i64) -> i64 {
+        if requested == -1 || requested == 0 {
+            self.legacy_limit.unwrap_or(requested)
+        } else {
+            requested
+        }
+    }
+}
+
+struct PaginationVisitor<'a> {
+    pagination: SqlPagination,
+    depth: usize,
+    order_by: &'a [(String, OrderBy)],
+}
+
+fn literal_row_count(expr: &sqlparser::ast::Expr) -> Option<i64> {
+    use sqlparser::ast::{Expr, Value, ValueWithSpan};
+    match expr {
+        Expr::Value(ValueWithSpan {
+            value: Value::Number(value, _),
+            ..
+        }) => value.parse::<i64>().ok().filter(|value| *value >= 0),
+        _ => None,
+    }
+}
+
+fn is_physical_timestamp(expr: &sqlparser::ast::Expr) -> bool {
+    use sqlparser::ast::Expr;
+    let ident = match expr {
+        Expr::Identifier(ident) => Some(ident),
+        Expr::CompoundIdentifier(idents) => idents.last(),
+        _ => None,
+    };
+    ident.is_some_and(|ident| {
+        if ident.quote_style.is_some() {
+            ident.value == TIMESTAMP_COL_NAME
+        } else {
+            ident.value.eq_ignore_ascii_case(TIMESTAMP_COL_NAME)
+        }
+    })
+}
+
+fn is_histogram_function(function: &sqlparser::ast::Function) -> bool {
+    function
+        .name
+        .0
+        .last()
+        .and_then(|part| part.as_ident())
+        .is_some_and(|ident| ident.value.eq_ignore_ascii_case("histogram"))
+}
+
+fn is_direct_cache_time(expr: &sqlparser::ast::Expr) -> bool {
+    use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, FunctionArguments};
+    if is_physical_timestamp(expr) {
+        return true;
+    }
+    matches!(expr,
+        Expr::Function(function) if is_histogram_function(function)
+            && matches!(&function.args,
+                FunctionArguments::List(arguments)
+                    if matches!(arguments.args.first(),
+                        Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(timestamp)))
+                            if is_physical_timestamp(timestamp)))
+    )
+}
+
+fn plain_cache_wildcard(options: &sqlparser::ast::WildcardAdditionalOptions) -> bool {
+    options.opt_ilike.is_none()
+        && options.opt_exclude.is_none()
+        && options.opt_except.is_none()
+        && options.opt_replace.is_none()
+        && options.opt_rename.is_none()
+        && options.opt_alias.is_none()
+}
+
+fn cache_timestamp_columns(select: &sqlparser::ast::Select) -> Vec<String> {
+    use sqlparser::ast::{SelectItem, SelectItemQualifiedWildcardKind};
+    let mut columns = Vec::new();
+    for item in &select.projection {
+        match item {
+            SelectItem::ExprWithAlias { expr, alias } if is_direct_cache_time(expr) => {
+                columns.push(alias.value.clone());
+            }
+            SelectItem::UnnamedExpr(expr) if is_physical_timestamp(expr) => {
+                columns.push(TIMESTAMP_COL_NAME.to_string());
+            }
+            SelectItem::Wildcard(options)
+            | SelectItem::QualifiedWildcard(
+                SelectItemQualifiedWildcardKind::ObjectName(_),
+                options,
+            ) if plain_cache_wildcard(options) => {
+                columns.push(TIMESTAMP_COL_NAME.to_string());
+            }
+            _ => {}
+        }
+    }
+    // A duplicate/overwritten output name is not a physical time-axis proof.
+    columns.retain(|column| {
+        select
+            .projection
+            .iter()
+            .filter(|item| match item {
+                SelectItem::ExprWithAlias { alias, .. } => alias.value == *column,
+                SelectItem::UnnamedExpr(expr) => {
+                    column == TIMESTAMP_COL_NAME && is_physical_timestamp(expr)
+                }
+                SelectItem::Wildcard(_)
+                | SelectItem::QualifiedWildcard(
+                    SelectItemQualifiedWildcardKind::ObjectName(_),
+                    _,
+                ) => column == TIMESTAMP_COL_NAME,
+                _ => false,
+            })
+            .count()
+            == 1
+    });
+    columns
+}
+
+impl sqlparser::ast::VisitorMut for PaginationVisitor<'_> {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, query: &mut sqlparser::ast::Query) -> std::ops::ControlFlow<()> {
+        use sqlparser::ast::{
+            Distinct, LimitClause, SelectItem, SelectItemQualifiedWildcardKind, SetExpr,
+            TableFactor,
+        };
+        let mut cap = None;
+        let mut safe = true;
+        match &query.limit_clause {
+            Some(LimitClause::LimitOffset {
+                limit,
+                offset,
+                limit_by,
+            }) => {
+                if let Some(limit) = limit {
+                    cap = literal_row_count(limit);
+                    safe &= cap.is_some();
+                }
+                safe &= offset
+                    .as_ref()
+                    .is_none_or(|offset| literal_row_count(&offset.value) == Some(0));
+                safe &= limit_by.is_empty();
+            }
+            Some(LimitClause::OffsetCommaLimit { offset, limit }) => {
+                cap = literal_row_count(limit);
+                safe &= cap.is_some() && literal_row_count(offset) == Some(0);
+            }
+            None => {}
+        }
+        // The pinned DataFusion planner rejects FETCH. Do not let a cache hit
+        // hide its normal NotImplemented error, even for a literal quantity.
+        safe &= query.fetch.is_none();
+        if self.depth == 0 && query.with.is_none() {
+            self.pagination.root_limit = cap;
+            if let Some(order) = &query.order_by {
+                use sqlparser::ast::{Expr, OrderByKind};
+                self.pagination.has_explicit_order = true;
+                // ColumnVisitor's referenced-field extraction is not an order
+                // proof: negation, positional/qualified references and casts can
+                // disagree with the direction consumed by cache sorting.
+                safe &= order.interpolate.is_none();
+                safe &= match &order.kind {
+                    OrderByKind::Expressions(expressions) => {
+                        expressions.first().is_some_and(|first| {
+                            if let Expr::Identifier(ident) = &first.expr {
+                                let direction = if first.options.asc.unwrap_or(true) {
+                                    OrderBy::Asc
+                                } else {
+                                    OrderBy::Desc
+                                };
+                                first.with_fill.is_none()
+                                    && self.order_by.first().is_some_and(|(field, order)| {
+                                        field == &ident.value && *order == direction
+                                    })
+                            } else {
+                                false
+                            }
+                        })
+                    }
+                    _ => false,
+                };
+            }
+            if let SetExpr::Select(select) = query.body.as_ref() {
+                safe &= select.top.is_none() && select.from.len() == 1;
+                // DISTINCT ON can retain a representative outside a later
+                // subrange while discarding a row inside it. Output timestamps
+                // therefore cannot certify the whole requested range.
+                safe &= !matches!(select.distinct, Some(Distinct::On(_)));
+                // Plain DISTINCT is time-local only when its deduplication key
+                // includes the physical timestamp, not merely a derived bucket.
+                if matches!(select.distinct, Some(Distinct::Distinct)) {
+                    safe &= select.projection.iter().any(|item| match item {
+                        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                            is_physical_timestamp(expr)
+                        }
+                        SelectItem::Wildcard(options)
+                        | SelectItem::QualifiedWildcard(
+                            SelectItemQualifiedWildcardKind::ObjectName(_),
+                            options,
+                        ) => plain_cache_wildcard(options),
+                        _ => false,
+                    });
+                }
+                // Window values and QUALIFY selections depend on rows outside
+                // a clipped subrange, even when their projected timestamp is physical.
+                safe &= select.qualify.is_none() && select.named_window.is_empty();
+                if let Some(source) = select.from.first() {
+                    safe &= source.joins.is_empty()
+                        && matches!(&source.relation, TableFactor::Table {
+                            alias, args: None, version: None, sample: None,
+                            json_path: None, with_ordinality: false, ..
+                        } if alias.as_ref().is_none_or(|alias| alias.columns.is_empty()));
+                }
+                if safe {
+                    self.pagination.timestamp_columns = cache_timestamp_columns(select);
+                }
+            } else {
+                safe = false;
+            }
+        } else {
+            // CTEs/subqueries/joins can synthesize an identically named time
+            // field. Without lineage, their output cannot certify scan coverage.
+            safe = false;
+        }
+        self.pagination.cache_safe &= safe;
+        self.depth += 1;
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(
+        &mut self,
+        _query: &mut sqlparser::ast::Query,
+    ) -> std::ops::ControlFlow<()> {
+        self.depth -= 1;
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, expr: &mut sqlparser::ast::Expr) -> std::ops::ControlFlow<()> {
+        use sqlparser::ast::{
+            Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Value, ValueWithSpan,
+        };
+        if let Expr::Function(function) = expr
+            && function.over.is_some()
+        {
+            self.pagination.cache_safe = false;
+        }
+        if let Expr::Function(function) = expr
+            && is_histogram_function(function)
+        {
+            if let FunctionArguments::List(arguments) = &function.args {
+                self.pagination.cache_safe &= matches!(arguments.args.first(),
+                    Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(timestamp)))
+                        if is_physical_timestamp(timestamp));
+                if let Some(timezone) = arguments.args.get(2) {
+                    self.pagination.cache_safe &= matches!(timezone,
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Value(ValueWithSpan {
+                            value: Value::SingleQuotedString(zone), ..
+                        }))) if matches!(zone.as_str(), "UTC" | "Etc/UTC" | "Z" | "+00:00")
+                    );
+                }
+            } else {
+                self.pagination.cache_safe = false;
+            }
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+}
+
+/// Retained only while cache preparation finishes rewriting the execution SQL.
+pub struct SqlPreparation {
+    statement: sqlparser::ast::Statement,
+    source: String,
+    stream_names: Vec<TableReference>,
+    schemas: HashMap<TableReference, Arc<SchemaCache>>,
+}
+
+impl SqlPreparation {
+    pub async fn new(
+        query: &SearchQuery,
+        org_id: &str,
+        stream_type: StreamType,
+    ) -> Result<Self, Error> {
+        let source = replace_o2_custom_patterns(&query.sql).unwrap_or_else(|_| query.sql.clone());
+        let stream_names = resolve_stream_names_with_type(&source)
+            .map_err(|e| Error::ErrorCode(ErrorCodes::SearchSQLNotValid(e.to_string())))?;
+        let mut schemas = HashMap::with_capacity(stream_names.len());
+        for stream in &stream_names {
+            let stream_name = stream.stream_name();
+            let schema =
+                infra::schema::get(org_id, &stream_name, stream.get_stream_type(stream_type))
+                    .await
+                    .unwrap_or_else(|_| Schema::empty());
+            if schema.fields().is_empty() {
+                return Err(Error::ErrorCode(ErrorCodes::SearchStreamNotFound(
+                    stream_name,
+                )));
+            }
+            schemas.insert(stream.clone(), Arc::new(SchemaCache::new(schema)));
+        }
+        let statement = Parser::parse_sql(&PostgreSqlDialect {}, &source)
+            .map_err(|e| Error::ErrorCode(ErrorCodes::SearchSQLNotValid(e.to_string())))?
+            .pop()
+            .unwrap();
+        Ok(Self {
+            statement,
+            source,
+            stream_names,
+            schemas,
+        })
+    }
+
+    pub fn finish(
+        &self,
+        query: &SearchQuery,
+        org_id: &str,
+        stream_type: StreamType,
+        search_event_type: Option<SearchEventType>,
+        extract_patterns: bool,
+    ) -> Result<Sql, Error> {
+        Sql::from_statement(
+            query,
+            org_id,
+            stream_type,
+            search_event_type,
+            extract_patterns,
+            self.statement.clone(),
+            self.stream_names.clone(),
+            self.schemas.clone(),
+        )
+    }
+
+    pub fn into_sql(
+        self,
+        query: &SearchQuery,
+        org_id: &str,
+        stream_type: StreamType,
+        search_event_type: Option<SearchEventType>,
+        extract_patterns: bool,
+    ) -> Result<Sql, Error> {
+        Sql::from_statement(
+            query,
+            org_id,
+            stream_type,
+            search_event_type,
+            extract_patterns,
+            self.statement,
+            self.stream_names,
+            self.schemas,
+        )
+    }
+
+    /// Mirror only the cache's actual textual edits before collecting finalized
+    /// metadata, retaining the parsed statement whenever the edit maps to its AST.
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish_cache(
+        mut self,
+        query: &SearchQuery,
+        org_id: &str,
+        stream_type: StreamType,
+        search_event_type: Option<SearchEventType>,
+        histogram_replacement: Option<(&str, &str)>,
+        add_timestamp: bool,
+    ) -> Result<Sql, Error> {
+        let mut reparse = add_timestamp;
+        if let Some((before, after)) = histogram_replacement
+            && !reparse
+        {
+            let replacement = Parser::new(&PostgreSqlDialect {})
+                .try_with_sql(after)
+                .and_then(|mut parser| parser.parse_expr());
+            if let Ok(sqlparser::ast::Expr::Function(replacement)) = replacement {
+                let mut matches = self.source.match_indices(before).peekable();
+                let mut location = sqlparser::tokenizer::Location::new(1, 1);
+                let mut locations = HashSet::new();
+                for (offset, ch) in self.source.char_indices() {
+                    if matches.peek().is_some_and(|(start, _)| *start == offset) {
+                        locations.insert(location);
+                        matches.next();
+                    }
+                    if ch == '\n' {
+                        location.line += 1;
+                        location.column = 1;
+                    } else {
+                        location.column += 1;
+                    }
+                }
+                reparse = locations.is_empty();
+                let mut visitor = CacheHistogramReplacement {
+                    locations,
+                    replacement,
+                };
+                let _ = self.statement.visit(&mut visitor);
+                reparse |= !visitor.locations.is_empty();
+            } else {
+                reparse = true;
+            }
+        }
+        if reparse {
+            // The legacy textual edits can touch comments/literals, nested calls
+            // or projection spelling that does not map to the retained AST.
+            // Parse the exact final text in that case; never guess an edit or
+            // suppress its syntax error. Loaded schemas are still reused, and
+            // no execution delta repeats this preparation.
+            let source =
+                replace_o2_custom_patterns(&query.sql).unwrap_or_else(|_| query.sql.clone());
+            self.statement = Parser::parse_sql(&PostgreSqlDialect {}, &source)
+                .map_err(|e| Error::ErrorCode(ErrorCodes::SearchSQLNotValid(e.to_string())))?
+                .pop()
+                .unwrap();
+        }
+        self.into_sql(query, org_id, stream_type, search_event_type, false)
+    }
+}
+
+struct CacheHistogramReplacement {
+    locations: HashSet<sqlparser::tokenizer::Location>,
+    replacement: sqlparser::ast::Function,
+}
+
+impl sqlparser::ast::VisitorMut for CacheHistogramReplacement {
+    type Break = ();
+
+    fn pre_visit_expr(&mut self, expr: &mut sqlparser::ast::Expr) -> std::ops::ControlFlow<()> {
+        use sqlparser::ast::Spanned;
+        let sqlparser::ast::Expr::Function(function) = expr else {
+            return std::ops::ControlFlow::Continue(());
+        };
+        // Match original source positions, not AST equality: the cache replaces
+        // identical textual occurrences, not every histogram call.
+        if self.locations.remove(&function.span().start) {
+            // Function spans exclude parentheses and can include FILTER/OVER.
+            // Replace the call's name/arguments only; retain those suffixes.
+            function.name = self.replacement.name.clone();
+            function.args = self.replacement.args.clone();
+        }
+        std::ops::ControlFlow::Continue(())
+    }
 }
 
 impl Sql {
@@ -113,33 +599,30 @@ impl Sql {
         search_event_type: Option<SearchEventType>,
         extract_patterns: bool,
     ) -> Result<Sql, Error> {
-        let sql = query.sql.clone();
+        SqlPreparation::new(query, org_id, stream_type)
+            .await?
+            .into_sql(
+                query,
+                org_id,
+                stream_type,
+                search_event_type,
+                extract_patterns,
+            )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_statement(
+        query: &SearchQuery,
+        org_id: &str,
+        stream_type: StreamType,
+        search_event_type: Option<SearchEventType>,
+        extract_patterns: bool,
+        mut statement: sqlparser::ast::Statement,
+        stream_names: Vec<TableReference>,
+        total_schemas: HashMap<TableReference, Arc<SchemaCache>>,
+    ) -> Result<Sql, Error> {
         let offset = query.from as i64;
         let mut limit = query.size as i64;
-        let sql = replace_o2_custom_patterns(&sql).unwrap_or(sql);
-
-        // 1. get table name
-        let stream_names = resolve_stream_names_with_type(&sql)
-            .map_err(|e| Error::ErrorCode(ErrorCodes::SearchSQLNotValid(e.to_string())))?;
-        let mut total_schemas = HashMap::with_capacity(stream_names.len());
-        for stream in stream_names.iter() {
-            let stream_name = stream.stream_name();
-            let stream_type = stream.get_stream_type(stream_type);
-            let schema = infra::schema::get(org_id, &stream_name, stream_type)
-                .await
-                .unwrap_or_else(|_| Schema::empty());
-            if schema.fields().is_empty() {
-                return Err(Error::ErrorCode(ErrorCodes::SearchStreamNotFound(
-                    stream_name,
-                )));
-            }
-            total_schemas.insert(stream.clone(), Arc::new(SchemaCache::new(schema)));
-        }
-
-        let mut statement = Parser::parse_sql(&PostgreSqlDialect {}, &sql)
-            .map_err(|e| Error::ErrorCode(ErrorCodes::SearchSQLNotValid(e.to_string())))?
-            .pop()
-            .unwrap();
 
         //********************Change the sql start*********************************//
         // 2. rewrite track_total_hits
@@ -221,6 +704,7 @@ impl Sql {
         {
             limit = n;
         }
+        let legacy_limit = column_visitor.limit;
 
         // 6. get match_all() value
         let mut match_visitor = MatchVisitor::new(&total_schemas);
@@ -303,32 +787,104 @@ impl Sql {
 
         // 13. replace the Utf8 to Utf8View type
         let final_schemas = finalize_schemas(&used_schemas);
+        let pagination = SqlPagination::from_statement(&mut statement, legacy_limit, &order_by);
 
         Ok(Sql {
-            sql: statement.to_string(),
-            is_complex,
-            org_id: org_id.to_string(),
-            stream_type,
-            stream_names,
-            has_match_all: match_visitor.has_match_all,
-            equal_items: partition_column_visitor.equal_items,
-            columns,
-            aliases,
-            schemas: final_schemas,
-            limit,
-            offset,
+            metadata: Arc::new(SqlMetadata {
+                sql: statement.to_string(),
+                is_complex,
+                org_id: org_id.to_string(),
+                stream_type,
+                stream_names,
+                has_match_all: match_visitor.has_match_all,
+                equal_items: partition_column_visitor.equal_items,
+                columns,
+                aliases,
+                schemas: final_schemas,
+                limit,
+                offset,
+                group_by,
+                order_by,
+                histogram_interval,
+                timezone,
+                sorted_by_time: need_sort_by_time,
+                pagination,
+            }),
             time_range: (query.start_time, query.end_time),
-            group_by,
-            order_by,
-            histogram_interval,
-            timezone,
-            sorted_by_time: need_sort_by_time,
             sampling_config: parse_sampling_config(
                 query,
                 histogram_interval,
                 (query.start_time, query.end_time),
                 extract_patterns,
             ),
+        })
+    }
+
+    /// Bind the finalized root metadata without widening the scan to histogram
+    /// buckets. The optimizer also uses this end for named-zone DST resolution.
+    pub fn bind(&self, query: &SearchQuery) -> Self {
+        let time_range = (query.start_time, query.end_time);
+        let limit = self.pagination.execution_limit(query.size as i64);
+        let offset = query.from as i64;
+        let mut metadata = self.metadata.clone();
+        if limit != self.limit || offset != self.offset {
+            let metadata = Arc::make_mut(&mut metadata);
+            metadata.limit = limit;
+            metadata.offset = offset;
+        }
+        Self {
+            metadata,
+            time_range,
+            sampling_config: parse_sampling_config(
+                query,
+                self.histogram_interval,
+                time_range,
+                false,
+            ),
+        }
+    }
+
+    /// Actual result cap for a zero-offset cacheable execution: `Some(-1)` is
+    /// unlimited, `Some(n >= 0)` is a finite cap, and `None` is uncertified.
+    /// A full page at this cap cannot prove complete time-range coverage.
+    pub fn cache_coverage_limit(&self, ts_column: &str) -> Option<i64> {
+        if !self.pagination.cache_safe
+            || self.offset != 0
+            || !self
+                .pagination
+                .timestamp_columns
+                .iter()
+                .any(|column| column == ts_column)
+        {
+            return None;
+        }
+        let default_cap = if self.limit > config::QUERY_WITH_NO_LIMIT && self.limit <= 0 {
+            Some(i64::try_from(get_config().limit.query_default_limit).ok()?)
+        } else {
+            None
+        };
+        // AddSortAndLimit preserves an existing SQL Limit rather than
+        // applying request.size again. HTTP's default-limit truncation is the
+        // only additional cap when sql.limit is in its default range.
+        let cap = self
+            .pagination
+            .root_limit
+            .or_else(|| (self.limit > 0).then_some(self.limit))
+            .or(default_cap);
+        if cap.is_some()
+            && !self.pagination.has_explicit_order
+            && self.histogram_interval.is_none()
+            && !(self.sorted_by_time && !self.is_complex)
+        {
+            // Unordered DISTINCT/GROUP BY results have no temporal prefix
+            // guarantee. Unordered histograms are handled by the writer's
+            // exhausted-only admission; ordinary rows have an injected DESC sort.
+            return None;
+        }
+        Some(match (cap, default_cap) {
+            (Some(cap), Some(default_cap)) => cap.min(default_cap),
+            (Some(cap), None) => cap,
+            (None, _) => -1,
         })
     }
 
@@ -617,5 +1173,536 @@ mod tests {
         // known fields (and internal columns) still parse
         let query = star_query(r#"SELECT * FROM "logs" WHERE level = 'x' AND _timestamp > 1"#);
         assert!(Sql::new(&query, org, StreamType::Logs, None).await.is_ok());
+    }
+
+    fn cache_preparation_fixture(query: &SearchQuery) -> SqlPreparation {
+        let schema = Arc::new(SchemaCache::new(Schema::new(vec![Field::new(
+            TIMESTAMP_COL_NAME,
+            DataType::Int64,
+            false,
+        )])));
+        SqlPreparation {
+            statement: Parser::parse_sql(&PostgreSqlDialect {}, &query.sql)
+                .unwrap()
+                .pop()
+                .unwrap(),
+            source: query.sql.clone(),
+            stream_names: vec![TableReference::bare("logs")],
+            schemas: HashMap::from([(TableReference::bare("logs"), schema)]),
+        }
+    }
+
+    fn cache_query_context(sql: &Sql, timestamps: &[i64]) -> datafusion::prelude::SessionContext {
+        use datafusion::{
+            arrow::{array::Int64Array, record_batch::RecordBatch},
+            prelude::SessionContext,
+        };
+
+        use crate::datafusion::{optimizer::generate_optimizer_rules, udf::histogram_udf};
+
+        let ctx = SessionContext::new();
+        ctx.register_udf(histogram_udf::HISTOGRAM_UDF.clone());
+        for rule in generate_optimizer_rules(sql, false) {
+            ctx.add_optimizer_rule(rule);
+        }
+        // The execution's table registration is half-open, independently of
+        // histogram alignment; retain boundary rows in the fixture to detect
+        // accidentally reusing the root range.
+        let values = timestamps
+            .iter()
+            .copied()
+            .filter(|ts| *ts >= sql.time_range.0 && *ts < sql.time_range.1)
+            .collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                TIMESTAMP_COL_NAME,
+                DataType::Int64,
+                false,
+            )])),
+            vec![Arc::new(Int64Array::from(values))],
+        )
+        .unwrap();
+        ctx.register_batch("logs", batch).unwrap();
+        ctx
+    }
+
+    async fn execute_cache_histogram(
+        sql: &Sql,
+        timestamps: &[i64],
+    ) -> Vec<config::utils::json::Map<String, config::utils::json::Value>> {
+        let ctx = cache_query_context(sql, timestamps);
+        let batches = ctx.sql(&sql.sql).await.unwrap().collect().await.unwrap();
+        config::utils::arrow::record_batches_to_json_rows(&batches.iter().collect::<Vec<_>>())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn finalized_histogram_binds_disjoint_dst_deltas_and_inline_bounds() {
+        let micros = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .unwrap()
+                .timestamp_micros()
+        };
+        let a = micros("2025-11-02T04:00:00Z");
+        let b = micros("2025-11-03T04:00:00Z");
+        let hour = 3_600_000_000;
+        let query = SearchQuery {
+            sql: format!(
+                "SELECT histogram(_timestamp, '1 day') AS bucket, count(*) AS n FROM logs WHERE _timestamp != {a} AND _timestamp != {b} GROUP BY bucket ORDER BY bucket"
+            ),
+            start_time: a - 2 * hour,
+            end_time: b + 2 * hour,
+            timezone: Some("America/New_York".to_string()),
+            size: -1,
+            ..Default::default()
+        };
+        let mut final_query = query.clone();
+        histogram::handle_histogram(&mut final_query.sql, (query.start_time, query.end_time), 0);
+        let before = RE_HISTOGRAM.find(&query.sql).unwrap().as_str();
+        let after = RE_HISTOGRAM.find(&final_query.sql).unwrap().as_str();
+        let root = cache_preparation_fixture(&query)
+            .finish_cache(
+                &final_query,
+                "cache_binding",
+                StreamType::Logs,
+                None,
+                Some((before, after)),
+                false,
+            )
+            .unwrap();
+        let rows = [a, a + hour / 2, a + hour, b, b + hour / 2, b + hour];
+        for start in [a, b] {
+            let delta = SearchQuery {
+                start_time: start,
+                end_time: start + hour,
+                ..final_query.clone()
+            };
+            let bound = root.bind(&delta);
+            let fresh = cache_preparation_fixture(&delta)
+                .into_sql(&delta, "cache_binding", StreamType::Logs, None, false)
+                .unwrap();
+            let result = execute_cache_histogram(&bound, &rows).await;
+            assert_eq!(result, execute_cache_histogram(&fresh, &rows).await);
+            assert_eq!(
+                result,
+                vec![
+                    config::utils::json::json!({
+                        "bucket": "2025-11-02T00:00:00", "n": 1
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone()
+                ]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn finalized_auto_histogram_keeps_full_range_width() {
+        let query = SearchQuery {
+            sql: "SELECT histogram(_timestamp) AS bucket, count(*) AS n FROM logs GROUP BY bucket ORDER BY bucket".to_string(),
+            start_time: 1_700_000_000_000_000,
+            end_time: 1_700_086_400_000_000,
+            size: -1,
+            ..Default::default()
+        };
+        let mut final_query = query.clone();
+        histogram::handle_histogram(&mut final_query.sql, (query.start_time, query.end_time), 0);
+        let root = cache_preparation_fixture(&query)
+            .finish_cache(
+                &final_query,
+                "auto_binding",
+                StreamType::Logs,
+                None,
+                Some((
+                    RE_HISTOGRAM.find(&query.sql).unwrap().as_str(),
+                    RE_HISTOGRAM.find(&final_query.sql).unwrap().as_str(),
+                )),
+                false,
+            )
+            .unwrap();
+        let delta = SearchQuery {
+            start_time: query.start_time + 17_000_000,
+            end_time: query.start_time + 137_000_000,
+            ..final_query.clone()
+        };
+        let rows = [
+            delta.start_time,
+            delta.start_time + 30_000_000,
+            delta.end_time,
+        ];
+        let fresh = cache_preparation_fixture(&delta)
+            .into_sql(&delta, "auto_binding", StreamType::Logs, None, false)
+            .unwrap();
+        let actual = execute_cache_histogram(&root.bind(&delta), &rows).await;
+        assert_eq!(actual, execute_cache_histogram(&fresh, &rows).await);
+        assert_eq!(
+            actual
+                .iter()
+                .map(|row| row["n"].as_u64().unwrap())
+                .sum::<u64>(),
+            2
+        );
+    }
+    #[test]
+    fn finalized_histogram_textual_rewrite_preserves_syntax_errors() {
+        let query = SearchQuery {
+            sql: "SELECT 'histogram(_timestamp)' AS text, histogram(_timestamp) AS bucket, count(*) FROM logs GROUP BY bucket".to_string(),
+            start_time: 1_700_000_000_000_000,
+            end_time: 1_700_086_400_000_000,
+            ..Default::default()
+        };
+        let mut final_query = query.clone();
+        histogram::handle_histogram(&mut final_query.sql, (query.start_time, query.end_time), 0);
+        let result = cache_preparation_fixture(&query).finish_cache(
+            &final_query,
+            "cache_syntax",
+            StreamType::Logs,
+            None,
+            Some((
+                RE_HISTOGRAM.find(&query.sql).unwrap().as_str(),
+                RE_HISTOGRAM.find(&final_query.sql).unwrap().as_str(),
+            )),
+            false,
+        );
+        assert!(matches!(
+            result,
+            Err(Error::ErrorCode(ErrorCodes::SearchSQLNotValid(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn cache_coverage_uses_executed_sql_limit_precedence() {
+        let rows = (1..=10).collect::<Vec<i64>>();
+        for (clause, size, expected) in [("LIMIT 3", 100, 3), ("LIMIT 7", 2, 7)] {
+            let query = SearchQuery {
+                sql: format!("SELECT _timestamp FROM logs ORDER BY _timestamp {clause}"),
+                size,
+                start_time: 0,
+                end_time: 100,
+                ..Default::default()
+            };
+            let sql = cache_preparation_fixture(&query)
+                .into_sql(&query, "cache_cap", StreamType::Logs, None, false)
+                .unwrap();
+            let result = execute_cache_histogram(&sql, &rows).await;
+            assert_eq!(result.len(), expected);
+            assert_eq!(
+                sql.cache_coverage_limit(TIMESTAMP_COL_NAME),
+                Some(expected as i64)
+            );
+            assert_eq!(
+                result.last().unwrap()[TIMESTAMP_COL_NAME].as_i64(),
+                Some(expected as i64)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cache_coverage_rebinds_changed_request_cap_and_offset() {
+        let query = SearchQuery {
+            sql: "SELECT _timestamp FROM logs ORDER BY _timestamp".to_string(),
+            size: 5,
+            start_time: 0,
+            end_time: 100,
+            ..Default::default()
+        };
+        let root = cache_preparation_fixture(&query)
+            .into_sql(&query, "cache_rebind", StreamType::Logs, None, false)
+            .unwrap();
+        let rows = (1..=10).collect::<Vec<i64>>();
+        let smaller = SearchQuery {
+            size: 2,
+            ..query.clone()
+        };
+        let bound = root.bind(&smaller);
+        assert_eq!(bound.cache_coverage_limit(TIMESTAMP_COL_NAME), Some(2));
+        let result = execute_cache_histogram(&bound, &rows).await;
+        assert_eq!(
+            result
+                .iter()
+                .map(|row| row[TIMESTAMP_COL_NAME].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        let offset = SearchQuery { from: 1, ..smaller };
+        let bound = root.bind(&offset);
+        assert_eq!(bound.cache_coverage_limit(TIMESTAMP_COL_NAME), None);
+        let result = execute_cache_histogram(&bound, &rows).await;
+        assert_eq!(
+            result
+                .iter()
+                .map(|row| row[TIMESTAMP_COL_NAME].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        // Binding never changes an already-running root execution.
+        assert_eq!(execute_cache_histogram(&root, &rows).await.len(), 5);
+    }
+
+    #[test]
+    fn cache_coverage_rejects_unproven_pagination_and_histogram_coordinates() {
+        for text in [
+            "SELECT _timestamp FROM logs LIMIT 3 OFFSET 1",
+            "SELECT _timestamp FROM logs LIMIT 3 OFFSET $1",
+            "SELECT _timestamp FROM logs LIMIT $1",
+            "SELECT _timestamp FROM logs FETCH FIRST $1 ROWS ONLY",
+            "SELECT _timestamp FROM logs ORDER BY _timestamp FETCH FIRST 3 ROWS WITH TIES",
+            "SELECT count(*) FROM (SELECT _timestamp FROM logs LIMIT 3) q",
+            "SELECT histogram(_timestamp, '1 day', 'America/New_York') FROM logs",
+        ] {
+            let query = SearchQuery {
+                sql: text.to_string(),
+                size: 100,
+                ..Default::default()
+            };
+            let sql = cache_preparation_fixture(&query)
+                .into_sql(&query, "cache_unsafe", StreamType::Logs, None, false)
+                .unwrap();
+            assert_eq!(sql.cache_coverage_limit(TIMESTAMP_COL_NAME), None, "{text}");
+        }
+        let query = SearchQuery {
+            sql: "SELECT _timestamp FROM logs LIMIT 3 OFFSET 0".to_string(),
+            size: 100,
+            ..Default::default()
+        };
+        let sql = cache_preparation_fixture(&query)
+            .into_sql(&query, "cache_zero_offset", StreamType::Logs, None, false)
+            .unwrap();
+        assert_eq!(sql.cache_coverage_limit(TIMESTAMP_COL_NAME), Some(3));
+    }
+
+    #[tokio::test]
+    async fn cache_coverage_bypasses_transformed_time_without_changing_results() {
+        let query = SearchQuery {
+            sql: "SELECT _timestamp + 10 AS _timestamp FROM logs ORDER BY _timestamp".to_string(),
+            size: 100,
+            start_time: 0,
+            end_time: 100,
+            ..Default::default()
+        };
+        let sql = cache_preparation_fixture(&query)
+            .into_sql(&query, "cache_transformed", StreamType::Logs, None, false)
+            .unwrap();
+        assert_eq!(sql.cache_coverage_limit(TIMESTAMP_COL_NAME), None);
+        let result = execute_cache_histogram(&sql, &[1, 2]).await;
+        assert_eq!(
+            result
+                .iter()
+                .map(|row| row[TIMESTAMP_COL_NAME].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![11, 12]
+        );
+    }
+
+    #[test]
+    fn cache_coverage_proves_the_selected_physical_time_axis() {
+        for (text, axis) in [
+            ("SELECT _timestamp AS event_time FROM logs", "event_time"),
+            (
+                "SELECT DISTINCT _timestamp AS event_time FROM logs ORDER BY event_time",
+                "event_time",
+            ),
+            (
+                "SELECT l._timestamp AS event_time FROM logs l",
+                "event_time",
+            ),
+            ("SELECT * FROM logs l", "_timestamp"),
+            ("SELECT 1 AS field FROM logs", "_timestamp"),
+            (
+                "SELECT histogram(_timestamp, '1 hour') AS bucket, count(*) FROM logs GROUP BY bucket",
+                "bucket",
+            ),
+        ] {
+            let query = SearchQuery {
+                sql: text.to_string(),
+                size: 100,
+                ..Default::default()
+            };
+            let sql = cache_preparation_fixture(&query)
+                .into_sql(&query, "cache_axis", StreamType::Logs, None, false)
+                .unwrap();
+            assert_eq!(sql.cache_coverage_limit(axis), Some(100), "{text}");
+            assert_eq!(sql.cache_coverage_limit("unrelated_output"), None);
+        }
+        for (text, axis) in [
+            ("SELECT DISTINCT _timestamp AS ts FROM logs LIMIT 2", "ts"),
+            (
+                "SELECT _timestamp AS ts FROM logs GROUP BY ts LIMIT 2",
+                "ts",
+            ),
+            (
+                "SELECT DISTINCT histogram(_timestamp, '1 hour') AS bucket FROM logs",
+                "bucket",
+            ),
+            (
+                "SELECT histogram(_timestamp + 10, '1 hour') AS bucket FROM logs",
+                "bucket",
+            ),
+            (
+                "SELECT histogram(_timestamp, '1 hour') + INTERVAL '1 hour' AS bucket FROM logs",
+                "bucket",
+            ),
+            (
+                "SELECT histogram(_timestamp, '1 day', 'America/New_York') AS bucket FROM logs",
+                "bucket",
+            ),
+            (
+                "SELECT _timestamp FROM (SELECT _timestamp FROM logs) q",
+                "_timestamp",
+            ),
+            (
+                "WITH q AS (SELECT _timestamp FROM logs) SELECT _timestamp FROM q",
+                "_timestamp",
+            ),
+            (
+                "SELECT a._timestamp FROM logs a JOIN logs b ON a._timestamp = b._timestamp",
+                "_timestamp",
+            ),
+            (
+                "SELECT *, _timestamp + 10 AS _timestamp FROM logs",
+                "_timestamp",
+            ),
+        ] {
+            let query = SearchQuery {
+                sql: text.to_string(),
+                size: 100,
+                ..Default::default()
+            };
+            let sql = cache_preparation_fixture(&query)
+                .into_sql(&query, "cache_axis_unsafe", StreamType::Logs, None, false)
+                .unwrap();
+            assert_eq!(sql.cache_coverage_limit(axis), None, "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn cache_coverage_rejects_cross_time_distinct_on_representatives() {
+        let query = SearchQuery {
+            sql: "SELECT DISTINCT ON (_timestamp % 2) _timestamp AS ts FROM logs".to_string(),
+            size: 10,
+            start_time: 0,
+            end_time: 10,
+            ..Default::default()
+        };
+        let sql = cache_preparation_fixture(&query)
+            .into_sql(&query, "cache_distinct_on", StreamType::Logs, None, false)
+            .unwrap();
+        let result = execute_cache_histogram(&sql, &[1, 3]).await;
+        assert_eq!(result.len(), 1);
+        let omitted = if result[0]["ts"].as_i64().unwrap() == 1 {
+            3
+        } else {
+            1
+        };
+        let narrow = SearchQuery {
+            start_time: omitted,
+            end_time: omitted + 1,
+            ..query
+        };
+        let narrow_result = execute_cache_histogram(&sql.bind(&narrow), &[1, 3]).await;
+        assert_eq!(
+            narrow_result
+                .iter()
+                .map(|row| row["ts"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![omitted]
+        );
+        assert_eq!(sql.cache_coverage_limit("ts"), None);
+    }
+
+    #[tokio::test]
+    async fn cache_coverage_rejects_window_values_that_change_in_subranges() {
+        let query = SearchQuery {
+            sql: "SELECT _timestamp AS ts, row_number() OVER (ORDER BY _timestamp) AS n FROM logs ORDER BY ts".to_string(),
+            size: 10,
+            start_time: 0,
+            end_time: 10,
+            ..Default::default()
+        };
+        let sql = cache_preparation_fixture(&query)
+            .into_sql(&query, "cache_window", StreamType::Logs, None, false)
+            .unwrap();
+        let result = execute_cache_histogram(&sql, &[1, 3]).await;
+        assert_eq!(
+            result
+                .iter()
+                .map(|row| (row["ts"].as_i64().unwrap(), row["n"].as_i64().unwrap()))
+                .collect::<Vec<_>>(),
+            vec![(1, 1), (3, 2)]
+        );
+        let narrow = SearchQuery {
+            start_time: 3,
+            end_time: 4,
+            ..query
+        };
+        let narrow_result = execute_cache_histogram(&sql.bind(&narrow), &[1, 3]).await;
+        assert_eq!(
+            narrow_result
+                .iter()
+                .map(|row| (row["ts"].as_i64().unwrap(), row["n"].as_i64().unwrap()))
+                .collect::<Vec<_>>(),
+            vec![(3, 1)]
+        );
+        assert_eq!(sql.cache_coverage_limit("ts"), None);
+    }
+
+    #[tokio::test]
+    async fn cache_coverage_requires_actual_leading_order_metadata_agreement() {
+        for (order, expected, certified) in [
+            ("-_timestamp ASC", vec![40, 30], false),
+            ("l._timestamp ASC", vec![10, 20], false),
+            ("1 DESC", vec![40, 30], false),
+            ("_timestamp DESC", vec![40, 30], true),
+        ] {
+            let query = SearchQuery {
+                sql: format!("SELECT _timestamp FROM logs l ORDER BY {order} LIMIT 2"),
+                size: 2,
+                start_time: 0,
+                end_time: 50,
+                ..Default::default()
+            };
+            let sql = cache_preparation_fixture(&query)
+                .into_sql(&query, "cache_ranking", StreamType::Logs, None, false)
+                .unwrap();
+            let result = execute_cache_histogram(&sql, &[10, 20, 30, 40]).await;
+            assert_eq!(
+                result
+                    .iter()
+                    .map(|row| row[TIMESTAMP_COL_NAME].as_i64().unwrap())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(
+                sql.cache_coverage_limit(TIMESTAMP_COL_NAME),
+                certified.then_some(2),
+                "{order}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cache_coverage_rejects_fetch_without_hiding_planner_error() {
+        let query = SearchQuery {
+            sql: "SELECT _timestamp FROM logs ORDER BY _timestamp FETCH FIRST 4 ROWS ONLY"
+                .to_string(),
+            size: 100,
+            start_time: 0,
+            end_time: 100,
+            ..Default::default()
+        };
+        let sql = cache_preparation_fixture(&query)
+            .into_sql(&query, "cache_fetch", StreamType::Logs, None, false)
+            .unwrap();
+        assert_eq!(sql.cache_coverage_limit(TIMESTAMP_COL_NAME), None);
+        let error = cache_query_context(&sql, &[1, 2, 3, 4, 5])
+            .sql(&sql.sql)
+            .await
+            .err()
+            .expect("FETCH must retain its planner error");
+        assert!(matches!(
+            error,
+            datafusion::common::DataFusionError::NotImplemented(_)
+        ));
     }
 }

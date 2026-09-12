@@ -65,19 +65,19 @@ use std::{
     collections::BinaryHeap,
     future::Future,
     sync::{
-        Arc, LazyLock,
+        Arc, LazyLock, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicI64, Ordering},
     },
     time::{Duration, Instant},
 };
 
-use arrow::array::{BooleanArray, Int64Array};
+use arrow::array::{Array, BooleanArray, Int64Array, UInt64Array};
 use arrow_schema::{DataType, Schema};
 use config::{
     TIMESTAMP_COL_NAME, get_config, is_local_disk_storage,
     meta::{search::ScanStats, stream::StreamType},
     metrics,
-    utils::record_batch_ext::{RecordBatchExt, concat_batches},
+    utils::record_batch_ext::{RecordBatchExt, compact_top_level_view_arrays, concat_batches},
 };
 use dashmap::{DashMap, mapref::entry::Entry};
 use datafusion::{arrow::record_batch::RecordBatch, datasource::TableProvider};
@@ -958,9 +958,12 @@ pub(super) async fn search(
     let fetch_budget = Arc::new(tokio::sync::Semaphore::new(fetch_budget_permits));
     let can_skip_by_top_n = top_n_plan.is_some_and(|plan| plan.can_skip_segments);
     let top_n_threshold = Arc::new(AtomicI64::new(i64::MIN));
-    let needed_columns = Arc::new(needed_columns);
-    let scan_fst_fields = Arc::new(fst_fields.clone());
-    let scan_condition = Arc::new(index_condition.clone());
+    let schema_plans = Arc::new(SegmentSchemaPlans::new(
+        index_condition.clone(),
+        Arc::clone(&schema),
+        fst_fields.clone(),
+        needed_columns,
+    ));
     let metric_org_id = query.org_id.clone();
     let metric_stream_type = query.stream_type;
 
@@ -1035,20 +1038,13 @@ pub(super) async fn search(
     });
 
     let consumer_query = Arc::clone(&query);
-    let segment_plan_schema = Arc::clone(&schema);
     let decoded_tasks = fetched.map({
-        let needed_columns = Arc::clone(&needed_columns);
-        let scan_fst_fields = Arc::clone(&scan_fst_fields);
-        let scan_condition = Arc::clone(&scan_condition);
+        let schema_plans = Arc::clone(&schema_plans);
         let top_n_threshold = Arc::clone(&top_n_threshold);
-        let segment_plan_schema = Arc::clone(&segment_plan_schema);
         move |result| {
             let query = Arc::clone(&consumer_query);
-            let needed_columns = Arc::clone(&needed_columns);
-            let scan_fst_fields = Arc::clone(&scan_fst_fields);
-            let scan_condition = Arc::clone(&scan_condition);
+            let schema_plans = Arc::clone(&schema_plans);
             let top_n_threshold = Arc::clone(&top_n_threshold);
-            let segment_plan_schema = Arc::clone(&segment_plan_schema);
             async move {
                 let SegmentFetchWork::Fetched {
                     meta,
@@ -1098,16 +1094,13 @@ pub(super) async fn search(
                         );
                     }
                     let decode_started = Instant::now();
-                    let scanned = scan_segment_object(
+                    let scanned = scan_segment_object_planned(
                         &bytes,
                         &query.org_id,
                         query.stream_type,
                         &query.stream_name,
                         query.time_range,
-                        scan_condition.as_ref().as_ref(),
-                        &segment_plan_schema,
-                        &scan_fst_fields,
-                        &needed_columns,
+                        &schema_plans,
                         can_skip_by_top_n.then_some(top_n_threshold.as_ref()),
                     )
                     .map(Some)
@@ -1277,8 +1270,7 @@ pub(super) async fn search(
     let skipped_by_top_n = skipped_before_fetch + skipped_before_decode;
     scan_stats.querier_files = (metas_len - skipped_before_fetch) as i64;
     timings.apply_cache_stats(&mut scan_stats);
-    let mut kept_batches = kept_exact_batches;
-    kept_batches.extend(kept_deferred_batches);
+    let kept_batch_count = kept_exact_batches.len() + kept_deferred_batches.len();
     // scan_size for the segment branch = the bytes the query actually HELD
     // after prune/project/trim (what the budget guarded). Summing decoded
     // batch capacities double-counted the shared IPC body buffer per batch
@@ -1292,7 +1284,7 @@ pub(super) async fn search(
         query.stream_name,
         metas_len - skipped_by_top_n,
         skipped_by_top_n,
-        kept_batches.len(),
+        kept_batch_count,
         scan_stats.records,
         scan_stats.original_size,
         zero_yield_stream_absent,
@@ -1339,21 +1331,31 @@ pub(super) async fn search(
         timings.projection_max.as_millis(),
     );
 
-    if kept_batches.is_empty() {
+    if kept_batch_count == 0 {
         return Ok((vec![], scan_stats));
     }
 
-    let kept_batch_count = kept_batches.len();
     let table_build_start = Instant::now();
-    let tables = build_tables_from_batches(
+    // Exact certifies only this reconstructed IndexCondition, not outer SQL
+    // residuals or timestamp filtering. Never merge its rows with Deferred.
+    let mut tables = build_tables_from_batches(
         trace_id,
-        kept_batches,
+        kept_exact_batches,
+        Arc::clone(&schema),
+        sorted_by_time,
+        None,
+        fst_fields.clone(),
+        query.time_range,
+    )?;
+    tables.extend(build_tables_from_batches(
+        trace_id,
+        kept_deferred_batches,
         schema,
         sorted_by_time,
         index_condition,
         fst_fields,
         query.time_range,
-    )?;
+    )?);
     log::info!(
         "[trace_id {trace_id}] segments_scan profile: table build {} batches -> {} tables took {} ms",
         kept_batch_count,
@@ -1775,7 +1777,7 @@ fn timestamp_inside_half_open(timestamp: i64, time_range: (i64, i64)) -> bool {
 
 /// One scanned segment object's contribution: rows examined (pre-prune, for
 /// stats) and the kept batches, each flagged `is_exact` (its surviving rows
-/// are KNOWN condition matches — see [`PrunedBatch`]) — trim-eligible
+/// are KNOWN IndexCondition matches — see [`SegmentSelection`]) — trim-eligible
 /// downstream.
 #[derive(Debug)]
 struct ScannedSegment {
@@ -1815,17 +1817,13 @@ fn predicate_data_types_equivalent(batch_type: &DataType, plan_type: &DataType) 
 /// and time range before IPC parsing, then run kept frames
 /// through condition prune + plan projection immediately, so peak memory is
 /// one frame plus its post-projection remnant — never the whole payload.
-#[allow(clippy::too_many_arguments)]
-fn scan_segment_object(
+fn scan_segment_object_planned(
     bytes: &[u8],
     org_id: &str,
     stream_type: StreamType,
     stream_name: &str,
     time_range: (i64, i64),
-    condition: Option<&IndexCondition>,
-    plan_schema: &Schema,
-    fst_fields: &[String],
-    needed_columns: &HashSet<String>,
+    schema_plans: &SegmentSchemaPlans,
     top_n_threshold: Option<&AtomicI64>,
 ) -> anyhow::Result<ScannedSegment> {
     let mut out = ScannedSegment {
@@ -1881,29 +1879,39 @@ fn scan_segment_object(
             // plan semantics. Safe conjuncts still narrow mixed-schema
             // batches; any deferred conjunct classifies survivors as Whole.
             let condition_started = Instant::now();
-            let pruned = prune_batch_by_condition(batch, condition, fst_fields, Some(plan_schema));
+            let plan = schema_plans.get(batch.schema());
+            let mut selection = plan.predicate.select(&batch);
             out.condition_time += condition_started.elapsed();
-            match pruned {
-                PrunedBatch::Dropped => out.dropped_batches += 1,
-                PrunedBatch::Exact(batch) => {
-                    out.exact_batches += 1;
-                    out.exact_rows_after_condition += batch.num_rows() as u64;
-                    let projection_started = Instant::now();
-                    let batch = project_batch_to_needed(batch, needed_columns)
-                        .map_err(|e| anyhow::anyhow!("{e}"))?;
-                    out.projection_time += projection_started.elapsed();
-                    out.kept.push((true, batch));
-                }
-                PrunedBatch::Whole(batch) => {
-                    out.whole_batches += 1;
-                    out.whole_rows_retained += batch.num_rows() as u64;
-                    let projection_started = Instant::now();
-                    let batch = project_batch_to_needed(batch, needed_columns)
-                        .map_err(|e| anyhow::anyhow!("{e}"))?;
-                    out.projection_time += projection_started.elapsed();
-                    out.kept.push((false, batch));
-                }
+            if selection.rows.is_empty() {
+                out.dropped_batches += 1;
+                return Ok(());
             }
+            let selected_rows = selection.rows.len(batch.num_rows()) as u64;
+            if selection.exact {
+                out.exact_batches += 1;
+                out.exact_rows_after_condition += selected_rows;
+            } else {
+                out.whole_batches += 1;
+                out.whole_rows_retained += selected_rows;
+            }
+            let projection_started = Instant::now();
+            // Only a published optimizer-certified threshold may precede
+            // the first gather; late coordinator re-trims remain necessary.
+            if selection.exact
+                && let Some(threshold) = top_n_threshold
+                && threshold.load(Ordering::Acquire) != i64::MIN
+            {
+                selection.rows.trim_to_threshold(
+                    &batch,
+                    threshold.load(Ordering::Acquire),
+                    time_range,
+                );
+            }
+            if !selection.rows.is_empty() {
+                let retained = plan.gather(batch, selection.rows)?;
+                out.kept.push((selection.exact, retained));
+            }
+            out.projection_time += projection_started.elapsed();
             Ok(())
         },
     )?;
@@ -1942,124 +1950,314 @@ fn resolve_assigned(
     Ok(metas)
 }
 
-/// Outcome of pruning one decoded batch against the index condition.
-/// The distinction matters downstream: only `Exact` batches — whose
-/// surviving rows are KNOWN condition matches — may feed top-n trimming;
-/// `Whole` batches are re-filtered by the provider and must pass through
-/// untrimmed.
+/// A bounded cache owned by one query. Schema equality includes column order,
+/// types and metadata; all other predicate/projection semantics are fixed here.
+/// Initialization happens outside the map lock, and no plan retains row data.
+const MAX_SEGMENT_SCHEMA_PLANS: usize = 64;
+type SegmentSchemaPlanCell = Arc<OnceLock<Arc<SegmentSchemaPlan>>>;
+
+struct SegmentSchemaPlans {
+    condition: Option<IndexCondition>,
+    plan_schema: Arc<Schema>,
+    fst_fields: Vec<String>,
+    needed: HashSet<String>,
+    plans: Mutex<HashMap<Arc<Schema>, SegmentSchemaPlanCell>>,
+}
+
+impl SegmentSchemaPlans {
+    fn new(
+        condition: Option<IndexCondition>,
+        plan_schema: Arc<Schema>,
+        fst_fields: Vec<String>,
+        needed: HashSet<String>,
+    ) -> Self {
+        Self {
+            condition,
+            plan_schema,
+            fst_fields,
+            needed,
+            plans: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn get(&self, schema: Arc<Schema>) -> Arc<SegmentSchemaPlan> {
+        let cell = {
+            let mut plans = self.plans.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(cell) = plans.get(&schema) {
+                Some(Arc::clone(cell))
+            } else if plans.len() < MAX_SEGMENT_SCHEMA_PLANS {
+                let cell = Arc::new(OnceLock::new());
+                plans.insert(Arc::clone(&schema), Arc::clone(&cell));
+                Some(cell)
+            } else {
+                None
+            }
+        };
+        let compile = || {
+            Arc::new(SegmentSchemaPlan::new(
+                &schema,
+                self.condition.as_ref(),
+                &self.fst_fields,
+                Some(&self.plan_schema),
+                &self.needed,
+            ))
+        };
+        match cell {
+            Some(cell) => Arc::clone(cell.get_or_init(compile)),
+            None => compile(),
+        }
+    }
+}
+
+enum SegmentPredicatePlan {
+    Empty,
+    All {
+        exact: bool,
+    },
+    Expr {
+        expr: Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+        exact: bool,
+    },
+}
+
+struct SegmentSchemaPlan {
+    predicate: SegmentPredicatePlan,
+    projection: Vec<usize>,
+    output_schema: Arc<Schema>,
+}
+
+impl SegmentSchemaPlan {
+    fn new(
+        schema: &Schema,
+        condition: Option<&IndexCondition>,
+        fst_fields: &[String],
+        plan_schema: Option<&Schema>,
+        needed: &HashSet<String>,
+    ) -> Self {
+        let all_fields = needed.contains(vortex_index::SOURCE_COL_NAME);
+        let projection: Vec<_> = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(_, field)| all_fields || needed.contains(field.name()))
+            .map(|(i, _)| i)
+            .collect();
+        let output_schema = Arc::new(schema.project(&projection).expect("raw schema ordinals"));
+        Self {
+            predicate: SegmentPredicatePlan::compile(schema, condition, fst_fields, plan_schema),
+            projection,
+            output_schema,
+        }
+    }
+
+    fn gather(
+        &self,
+        batch: RecordBatch,
+        rows: SegmentRows,
+    ) -> std::result::Result<RecordBatch, arrow_schema::ArrowError> {
+        if matches!(rows, SegmentRows::All) && self.projection.len() == batch.num_columns() {
+            return Ok(batch);
+        }
+        let row_count = rows.len(batch.num_rows());
+        let columns = if self.projection.is_empty() {
+            Vec::new()
+        } else {
+            let indices = match rows {
+                SegmentRows::All => UInt64Array::from_iter_values(0..batch.num_rows() as u64),
+                SegmentRows::Selected(indices) => indices,
+            };
+            self.projection
+                .iter()
+                .map(|&i| arrow::compute::take(batch.column(i).as_ref(), &indices, None))
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let retained = RecordBatch::try_new_with_options(
+            Arc::clone(&self.output_schema),
+            columns,
+            &arrow::array::RecordBatchOptions::new().with_row_count(Some(row_count)),
+        )?;
+        compact_top_level_view_arrays(retained, "segment scan gather")
+    }
+}
+
+enum SegmentRows {
+    All,
+    Selected(UInt64Array),
+}
+
+impl SegmentRows {
+    fn len(&self, all: usize) -> usize {
+        match self {
+            Self::All => all,
+            Self::Selected(rows) => rows.len(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        matches!(self, Self::Selected(rows) if rows.is_empty())
+    }
+
+    fn trim_to_threshold(&mut self, batch: &RecordBatch, threshold: i64, window: (i64, i64)) {
+        let Some(ts) = batch
+            .column_by_name(TIMESTAMP_COL_NAME)
+            .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+        else {
+            return;
+        };
+        let keep = |i: usize| {
+            !ts.is_null(i)
+                && (window == (0, 0) || (ts.value(i) >= window.0 && ts.value(i) < window.1))
+                && ts.value(i) >= threshold
+        };
+        let indices = match self {
+            Self::All => {
+                if (0..batch.num_rows()).all(keep) {
+                    return;
+                }
+                UInt64Array::from_iter_values(
+                    (0..batch.num_rows()).filter(|&i| keep(i)).map(|i| i as u64),
+                )
+            }
+            Self::Selected(rows) => {
+                if rows.values().iter().all(|&i| keep(i as usize)) {
+                    return;
+                }
+                UInt64Array::from_iter_values(
+                    rows.values().iter().copied().filter(|&i| keep(i as usize)),
+                )
+            }
+        };
+        *self = Self::Selected(indices);
+    }
+}
+
+struct SegmentSelection {
+    rows: SegmentRows,
+    exact: bool,
+}
+
+impl SegmentPredicatePlan {
+    fn compile(
+        schema: &Schema,
+        condition: Option<&IndexCondition>,
+        fst_fields: &[String],
+        plan_schema: Option<&Schema>,
+    ) -> Self {
+        let Some(condition) = condition else {
+            return Self::All { exact: true };
+        };
+        let mut evaluable = Vec::with_capacity(condition.conditions.len());
+        let mut exact = true;
+        for cond in &condition.conditions {
+            let fields = cond.get_schema_fields(fst_fields);
+            let all_present = fields.iter().all(|field| schema.index_of(field).is_ok());
+            let types_match = all_present
+                && plan_schema.is_none_or(|plan| {
+                    fields.iter().all(|field| {
+                        let Ok(raw) = schema.field_with_name(field) else {
+                            return false;
+                        };
+                        let Ok(planned) = plan.field_with_name(field) else {
+                            return false;
+                        };
+                        predicate_data_types_equivalent(raw.data_type(), planned.data_type())
+                    })
+                });
+            if types_match {
+                evaluable.push(cond.clone());
+            } else if !all_present && fields.len() == 1 && conjunct_is_false_without_its_field(cond)
+            {
+                return Self::Empty;
+            } else {
+                exact = false;
+            }
+        }
+        if evaluable.is_empty() {
+            return Self::All { exact: false };
+        }
+        let partial = IndexCondition {
+            conditions: evaluable,
+        };
+        match partial.to_physical_expr(schema, fst_fields) {
+            Ok(expr) => Self::Expr { expr, exact },
+            Err(_) => Self::All { exact: false },
+        }
+    }
+
+    fn select(&self, batch: &RecordBatch) -> SegmentSelection {
+        use datafusion::{physical_plan::ColumnarValue, scalar::ScalarValue};
+        let all = |exact| SegmentSelection {
+            rows: SegmentRows::All,
+            exact,
+        };
+        let empty = || SegmentSelection {
+            rows: SegmentRows::Selected(UInt64Array::from(Vec::<u64>::new())),
+            exact: false,
+        };
+        let (expr, exact) = match self {
+            Self::Empty => return empty(),
+            Self::All { exact } => return all(*exact),
+            Self::Expr { expr, exact } => (expr, *exact),
+        };
+        // Evaluation failures are batch-local, never cached as a schema verdict.
+        match expr.evaluate(batch) {
+            Ok(ColumnarValue::Scalar(ScalarValue::Boolean(Some(true)))) => all(exact),
+            Ok(ColumnarValue::Scalar(ScalarValue::Boolean(Some(false) | None))) => empty(),
+            Ok(ColumnarValue::Array(array)) => {
+                let Some(mask) = array.as_any().downcast_ref::<BooleanArray>() else {
+                    return all(false);
+                };
+                if mask.len() != batch.num_rows() {
+                    return all(false);
+                }
+                if mask.true_count() == batch.num_rows() {
+                    return all(exact);
+                }
+                SegmentSelection {
+                    rows: SegmentRows::Selected(UInt64Array::from_iter_values(
+                        mask.iter()
+                            .enumerate()
+                            .filter(|(_, value)| *value == Some(true))
+                            .map(|(i, _)| i as u64),
+                    )),
+                    exact,
+                }
+            }
+            _ => all(false),
+        }
+    }
+}
+
+#[cfg(test)]
 enum PrunedBatch {
-    /// The condition was fully evaluated here; every surviving row matches.
-    /// (Also the no-condition case: trivially, every row "matches".)
     Exact(RecordBatch),
-    /// The condition could not be evaluated on this batch's schema — kept
-    /// whole, the provider re-applies the filter downstream.
     Whole(RecordBatch),
-    /// No row of this batch can match.
     Dropped,
 }
 
-/// Prune a decoded segment batch down to the rows the query's index
-/// condition can match, BEFORE it counts against the scan budget. The
-/// budget is an OOM guard for the live backlog — without this prune a
-/// 3-row needle (`trace_id = X` over a wide range) died at 512MB of KEPT
-/// bytes purely because the stream was busy, while the rows it needed
-/// were a few KB. Conservative by construction:
-/// - conjuncts are handled per top-level AND member (see the body): absent fields DROP the batch
-///   only for positive null-rejecting predicates, everything else evaluates what it can and
-///   over-keeps;
-/// - evaluation errors keep the batch whole;
-/// - the provider downstream re-applies the condition uniformly, so pruning here only ever narrows
-///   what the budget must hold.
+#[cfg(test)]
 fn prune_batch_by_condition(
     batch: RecordBatch,
     condition: Option<&IndexCondition>,
     fst_fields: &[String],
     plan_schema: Option<&Schema>,
 ) -> PrunedBatch {
-    use datafusion::physical_plan::ColumnarValue;
-    let Some(condition) = condition else {
-        return PrunedBatch::Exact(batch);
-    };
-    // Schema-mixed segment batches may lack condition columns entirely (raw
-    // write-time schemas carry present fields only) — and `to_physical_expr`
-    // resolves columns with an infallible lookup (panic, not Err), so
-    // presence is checked HERE, per top-level AND conjunct:
-    // - every field present         => the conjunct joins the prune filter;
-    // - a null-rejecting predicate  => no row of this batch has the field, on an absent field the
-    //   conjunct is false everywhere, the whole AND is: DROP the batch (this is what keeps a shared
-    //   busy stream from blowing the budget on batches that provably cannot match — most batches of
-    //   other services lack the filtered field entirely);
-    // - anything else on an absent  => the conjunct is skipped here and left field (IsNull matches
-    //   to the downstream re-filter; pruning absent, Or may match via        with the REMAINING
-    //   conjuncts still another arm, negations          narrows what the budget must hold depend on
-    //   product null          (partially-pruned batches classify semantics, match_all may        as
-    //   Whole, never Exact: surviving hit a present fts field)        rows are NOT known full
-    //   matches and must stay out of top-n trimming).
-    let schema = batch.schema();
-    let mut evaluable: Vec<&Condition> = Vec::with_capacity(condition.conditions.len());
-    let mut skipped_conjunct = false;
-    for cond in &condition.conditions {
-        let fields = cond.get_schema_fields(fst_fields);
-        let all_present = fields.iter().all(|field| schema.index_of(field).is_ok());
-        let types_match = all_present
-            && plan_schema.is_none_or(|plan_schema| {
-                fields.iter().all(|field| {
-                    let Ok(batch_field) = schema.field_with_name(field) else {
-                        return false;
-                    };
-                    let Ok(plan_field) = plan_schema.field_with_name(field) else {
-                        return false;
-                    };
-                    predicate_data_types_equivalent(batch_field.data_type(), plan_field.data_type())
-                })
-            });
-        if types_match {
-            evaluable.push(cond);
-        } else if !all_present && fields.len() == 1 && conjunct_is_false_without_its_field(cond) {
-            return PrunedBatch::Dropped;
-        } else {
-            skipped_conjunct = true;
-        }
+    let needed = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    let plan = SegmentSchemaPlan::new(&batch.schema(), condition, fst_fields, plan_schema, &needed);
+    let selection = plan.predicate.select(&batch);
+    if selection.rows.is_empty() {
+        return PrunedBatch::Dropped;
     }
-    if evaluable.is_empty() {
-        return PrunedBatch::Whole(batch);
-    }
-    let classify = |batch: RecordBatch| {
-        if skipped_conjunct {
-            PrunedBatch::Whole(batch)
-        } else {
-            PrunedBatch::Exact(batch)
-        }
-    };
-    let partial = IndexCondition {
-        conditions: evaluable.into_iter().cloned().collect(),
-    };
-    let expr = match partial.to_physical_expr(schema.as_ref(), fst_fields) {
-        Ok(expr) => expr,
-        Err(_) => return PrunedBatch::Whole(batch),
-    };
-    let mask = match expr.evaluate(&batch) {
-        Ok(ColumnarValue::Array(array)) => array,
-        Ok(ColumnarValue::Scalar(scalar)) => {
-            // a constant verdict: keep or drop the whole batch (a FALSE
-            // verdict on the evaluated conjuncts falsifies the full AND
-            // even when other conjuncts were skipped)
-            return match scalar {
-                datafusion::scalar::ScalarValue::Boolean(Some(true)) => classify(batch),
-                _ => PrunedBatch::Dropped,
-            };
-        }
-        Err(_) => return PrunedBatch::Whole(batch),
-    };
-    let Some(mask) = mask.as_any().downcast_ref::<BooleanArray>() else {
-        return PrunedBatch::Whole(batch);
-    };
-    match arrow::compute::filter_record_batch(&batch, mask) {
-        // zero survivors of the evaluated conjuncts => zero survivors of
-        // the full AND, no matter what was skipped
-        Ok(filtered) if filtered.num_rows() == 0 => PrunedBatch::Dropped,
-        Ok(filtered) => classify(filtered),
-        Err(_) => PrunedBatch::Whole(batch),
+    let retained = plan.gather(batch, selection.rows).unwrap();
+    if selection.exact {
+        PrunedBatch::Exact(retained)
+    } else {
+        PrunedBatch::Whole(retained)
     }
 }
 
@@ -2166,6 +2364,21 @@ fn trim_batch_to_top_n(
     trim_batch_to_threshold(batch, threshold, top.window, top.n)
 }
 
+/// Late trims must detach view payloads as well as value/null ordinals.
+fn gather_masked_batch(
+    batch: &RecordBatch,
+    mask: &BooleanArray,
+) -> std::result::Result<RecordBatch, arrow_schema::ArrowError> {
+    let indices = UInt64Array::from_iter_values(
+        mask.iter()
+            .enumerate()
+            .filter(|(_, value)| *value == Some(true))
+            .map(|(i, _)| i as u64),
+    );
+    let retained = arrow::compute::take_record_batch(batch, &indices)?;
+    compact_top_level_view_arrays(retained, "segment scan late trim")
+}
+
 fn trim_batch_to_threshold(
     batch: RecordBatch,
     threshold: i64,
@@ -2185,7 +2398,7 @@ fn trim_batch_to_threshold(
     if mask.true_count() == batch.num_rows() {
         return Ok(Some(batch));
     }
-    match arrow::compute::filter_record_batch(&batch, &mask) {
+    match gather_masked_batch(&batch, &mask) {
         Ok(trimmed) if trimmed.num_rows() == 0 => Ok(None),
         Ok(trimmed) => Ok(Some(trimmed)),
         Err(e) => Err(Error::Message(format!(
@@ -2251,7 +2464,7 @@ fn compact_exact_top_n(
         let batch = if mask.true_count() == batch.num_rows() {
             batch
         } else {
-            match arrow::compute::filter_record_batch(&batch, &mask) {
+            match gather_masked_batch(&batch, &mask) {
                 Ok(batch) if batch.num_rows() == 0 => continue,
                 Ok(batch) => batch,
                 Err(e) => {
@@ -2286,61 +2499,11 @@ fn trim_deferred_top_n(
     Ok(())
 }
 
-/// Drop every column the query can never read, BEFORE the batch counts
-/// against the scan budget. Row counts are always preserved.
-///
-/// Two non-obvious points:
-/// - IPC stream decode slices ALL columns of a batch out of one message-body buffer, so
-///   `RecordBatch::project` alone would keep the whole decoded frame resident (and the budget
-///   accounting would lie). Batches that actually shed columns are therefore detached with a `take`
-///   gather copy — cheap, it only materializes the columns being kept.
-/// - a batch can project to ZERO columns (a pure `count(*)` plan against a frame with no surviving
-///   needed column); arrow preserves `num_rows` through empty projections, which is exactly what
-///   such plans consume.
+#[cfg(test)]
 fn project_batch_to_needed(batch: RecordBatch, needed: &HashSet<String>) -> Result<RecordBatch> {
-    // A plan that reads `_source` consumes WHOLE rows: that column is
-    // synthesized from every stored column whenever the batch does not
-    // materialize it (segment frames never do). Projecting such batches
-    // silently hollows out star hits to bare timestamps (e2e-caught), so
-    // they are kept whole and the budget guards them at full width.
-    if needed.contains(vortex_index::SOURCE_COL_NAME) {
-        return Ok(batch);
-    }
-    let schema = batch.schema();
-    let keep: Vec<usize> = schema
-        .fields()
-        .iter()
-        .enumerate()
-        .filter(|(_, f)| needed.contains(f.name().as_str()))
-        .map(|(i, _)| i)
-        .collect();
-    if keep.len() == schema.fields().len() {
-        return Ok(batch);
-    }
-    let projected = batch.project(&keep).map_err(|e| {
-        Error::Message(format!(
-            "[SEGMENT:SCAN] projecting a decoded segment batch to its needed columns failed: {e}"
-        ))
-    })?;
-    if keep.is_empty() {
-        return Ok(projected);
-    }
-    let indices = arrow::array::UInt32Array::from_iter_values(0..projected.num_rows() as u32);
-    let columns = projected
-        .columns()
-        .iter()
-        .map(|c| arrow::compute::take(c.as_ref(), &indices, None))
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| {
-            Error::Message(format!(
-                "[SEGMENT:SCAN] detaching a projected segment batch from its decode buffer failed: {e}"
-            ))
-        })?;
-    RecordBatch::try_new(projected.schema(), columns).map_err(|e| {
-        Error::Message(format!(
-            "[SEGMENT:SCAN] rebuilding a projected segment batch failed: {e}"
-        ))
-    })
+    let plan = SegmentSchemaPlan::new(&batch.schema(), None, &[], None, needed);
+    plan.gather(batch, SegmentRows::All)
+        .map_err(|e| Error::Message(e.to_string()))
 }
 
 /// Fold a kept batch into the accumulator, enforcing the scan byte budgets
@@ -2489,6 +2652,388 @@ fn group_by_batch_schema(batches: Vec<RecordBatch>) -> HashMap<Arc<Schema>, Vec<
 #[cfg(test)]
 mod tests {
     use arrow::array::{Int64Array, StringArray};
+
+    #[allow(clippy::too_many_arguments)]
+    fn scan_segment_object(
+        bytes: &[u8],
+        org_id: &str,
+        stream_type: StreamType,
+        stream_name: &str,
+        time_range: (i64, i64),
+        condition: Option<&IndexCondition>,
+        plan_schema: &Schema,
+        fst_fields: &[String],
+        needed: &HashSet<String>,
+        top_n_threshold: Option<&AtomicI64>,
+    ) -> anyhow::Result<ScannedSegment> {
+        let plans = SegmentSchemaPlans::new(
+            condition.cloned(),
+            Arc::new(plan_schema.clone()),
+            fst_fields.to_vec(),
+            needed.clone(),
+        );
+        scan_segment_object_planned(
+            bytes,
+            org_id,
+            stream_type,
+            stream_name,
+            time_range,
+            &plans,
+            top_n_threshold,
+        )
+    }
+
+    #[test]
+    fn worker_threshold_selection_keeps_ties_and_half_open_window() {
+        let batch = ts_batch("code", &[10, 20, 20, 30, 40], Some(&[1, 2, 3, 4, 5]));
+        let plans = SegmentSchemaPlans::new(
+            None,
+            batch.schema(),
+            vec![],
+            HashSet::from_iter(["_timestamp".to_string(), "code".to_string()]),
+        );
+        let encoded = encode_segment(
+            &SegmentHeader {
+                node_uuid: "threshold".into(),
+                seq: 1,
+                created_at: 1,
+            },
+            &[frame("org1", StreamType::Logs, "app1", 10, 40, batch)],
+        )
+        .unwrap();
+        let scanned = scan_segment_object_planned(
+            &encoded,
+            "org1",
+            StreamType::Logs,
+            "app1",
+            (10, 30),
+            &plans,
+            Some(&AtomicI64::new(20)),
+        )
+        .unwrap();
+        assert_eq!(scanned.exact_rows_after_condition, 5);
+        assert_eq!(scanned.kept.len(), 1);
+        let (exact, retained) = &scanned.kept[0];
+        assert!(*exact);
+        let timestamps = retained
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let codes = retained
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(timestamps.values().as_ref(), &[20, 20]);
+        assert_eq!(codes.values().as_ref(), &[2, 3]);
+    }
+
+    #[tokio::test]
+    async fn mixed_schema_proofs_preserve_filters_casts_missing_fields_and_source() {
+        let string_schema = Arc::new(Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("code", DataType::Utf8, true),
+            Field::new("old_field", DataType::Utf8, true),
+        ]));
+        let string_batch = RecordBatch::try_new(
+            Arc::clone(&string_schema),
+            vec![
+                Arc::new(Int64Array::from(vec![130, 140, 150])),
+                Arc::new(StringArray::from(vec![Some("200"), Some("404"), None])),
+                Arc::new(StringArray::from(vec!["retained", "rejected", "null"])),
+            ],
+        )
+        .unwrap();
+        let plan_schema = Arc::new(Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("code", DataType::Utf8, true),
+            Field::new(vortex_index::SOURCE_COL_NAME, DataType::Utf8, true),
+        ]));
+        let condition = IndexCondition {
+            conditions: vec![Condition::Equal("code".into(), "200".into())],
+        };
+        let plans = SegmentSchemaPlans::new(
+            Some(condition.clone()),
+            Arc::clone(&plan_schema),
+            vec![],
+            HashSet::from_iter([
+                "_timestamp".into(),
+                "code".into(),
+                vortex_index::SOURCE_COL_NAME.into(),
+            ]),
+        );
+        let frames = vec![
+            frame(
+                "org1",
+                StreamType::Logs,
+                "app1",
+                100,
+                120,
+                ts_batch("code", &[100, 120], Some(&[200, 404])),
+            ),
+            frame("org1", StreamType::Logs, "app1", 130, 150, string_batch),
+            frame(
+                "org1",
+                StreamType::Logs,
+                "app1",
+                160,
+                160,
+                ts_batch("absent_code", &[160], Some(&[200])),
+            ),
+        ];
+        let encoded = encode_segment(
+            &SegmentHeader {
+                node_uuid: "proofs".into(),
+                seq: 1,
+                created_at: 1,
+            },
+            &frames,
+        )
+        .unwrap();
+        let scanned = scan_segment_object_planned(
+            &encoded,
+            "org1",
+            StreamType::Logs,
+            "app1",
+            (0, 500),
+            &plans,
+            None,
+        )
+        .unwrap();
+        let mut exact = Vec::new();
+        let mut deferred = Vec::new();
+        for (is_exact, batch) in scanned.kept {
+            if is_exact {
+                exact.push(batch);
+            } else {
+                deferred.push(batch);
+            }
+        }
+        // Both paths are needed: the historical numeric frame cannot use the
+        // latest string predicate until MemTable casts it.
+        assert_eq!(exact.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        assert_eq!(deferred.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+        let mut tables = build_tables_from_batches(
+            "proofs",
+            exact,
+            Arc::clone(&plan_schema),
+            false,
+            None,
+            vec![],
+            (0, 500),
+        )
+        .unwrap();
+        tables.extend(
+            build_tables_from_batches(
+                "proofs",
+                deferred,
+                plan_schema,
+                false,
+                Some(condition),
+                vec![],
+                (0, 500),
+            )
+            .unwrap(),
+        );
+        let ctx = SessionContext::new();
+        let mut rows = Vec::new();
+        for table in tables {
+            let exec = table.scan(&ctx.state(), None, &[], None).await.unwrap();
+            for batch in collect(exec, ctx.task_ctx()).await.unwrap() {
+                let ts = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                let codes = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                let sources = batch
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                for i in 0..batch.num_rows() {
+                    let source: serde_json::Value = serde_json::from_str(sources.value(i)).unwrap();
+                    if ts.value(i) == 130 {
+                        assert_eq!(source["old_field"], "retained");
+                    }
+                    rows.push((ts.value(i), codes.value(i).to_string()));
+                }
+            }
+        }
+        rows.sort();
+        assert_eq!(rows, vec![(100, "200".into()), (130, "200".into())]);
+    }
+
+    #[test]
+    fn schema_plans_preserve_reordered_columns_and_cache_overflow_semantics() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("service", DataType::Utf8, true),
+            Field::new("other", DataType::Utf8, true),
+        ]));
+        let condition = IndexCondition {
+            conditions: vec![Condition::Equal("service".into(), "target".into())],
+        };
+        let plans = SegmentSchemaPlans::new(
+            Some(condition),
+            Arc::clone(&schema),
+            vec![],
+            HashSet::from_iter(["service".into()]),
+        );
+        for i in 0..MAX_SEGMENT_SCHEMA_PLANS + 2 {
+            let mut metadata = std::collections::HashMap::new();
+            metadata.insert("revision".into(), i.to_string());
+            let raw = RecordBatch::try_new(
+                Arc::new(schema.as_ref().clone().with_metadata(metadata)),
+                vec![
+                    Arc::new(StringArray::from(vec![Some("target"), None, Some("other")])),
+                    Arc::new(StringArray::from(vec!["wrong", "target", "target"])),
+                ],
+            )
+            .unwrap();
+            for batch in [raw.clone(), raw.project(&[1, 0]).unwrap()] {
+                let plan = plans.get(batch.schema());
+                let selection = plan.predicate.select(&batch);
+                assert!(selection.exact);
+                let output = plan.gather(batch, selection.rows).unwrap();
+                assert_eq!(output.num_rows(), 1);
+                assert_eq!(output.num_columns(), 1);
+                let values = output
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                assert_eq!(values.value(0), "target");
+            }
+        }
+    }
+
+    #[test]
+    fn selected_view_payloads_detach_and_zero_columns_keep_row_count() {
+        use arrow::array::{BinaryViewArray, StringViewArray};
+        let values: Vec<_> = (0..1024)
+            .map(|i| format!("{i:04}-{}", "x".repeat(1024)))
+            .collect();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("_timestamp", DataType::Int64, false),
+                Field::new("text", DataType::Utf8View, true),
+                Field::new("bytes", DataType::BinaryView, true),
+            ])),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..1024)),
+                Arc::new(StringViewArray::from_iter_values(
+                    values.iter().map(String::as_str),
+                )),
+                Arc::new(BinaryViewArray::from_iter_values(
+                    values.iter().map(|s| s.as_bytes()),
+                )),
+            ],
+        )
+        .unwrap();
+        let original_bytes = batch.size();
+        // `_source` requires both raw payload columns even though neither is
+        // advertised as an output column. Gather only the surviving rows.
+        let plan = SegmentSchemaPlan::new(
+            &batch.schema(),
+            None,
+            &[],
+            None,
+            &HashSet::from_iter([vortex_index::SOURCE_COL_NAME.to_string()]),
+        );
+        let output = plan
+            .gather(
+                batch.clone(),
+                SegmentRows::Selected(UInt64Array::from(vec![7, 7, 900])),
+            )
+            .unwrap();
+        assert_eq!(output.num_rows(), 3);
+        assert_eq!(output.num_columns(), 3);
+        let text = output
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringViewArray>()
+            .unwrap();
+        let binary = output
+            .column(2)
+            .as_any()
+            .downcast_ref::<BinaryViewArray>()
+            .unwrap();
+        assert_eq!(text.value(0), values[7]);
+        assert_eq!(text.value(1), values[7]);
+        assert_eq!(text.value(2), values[900]);
+        assert_eq!(binary.value(2), values[900].as_bytes());
+        assert!(
+            output.size() < original_bytes / 16,
+            "selected rows still pin original view buffers"
+        );
+        let empty = SegmentSchemaPlan::new(&batch.schema(), None, &[], None, &HashSet::new());
+        let output = empty
+            .gather(
+                batch,
+                SegmentRows::Selected(UInt64Array::from(vec![7, 900])),
+            )
+            .unwrap();
+        assert_eq!((output.num_columns(), output.num_rows()), (0, 2));
+    }
+
+    #[test]
+    fn predicate_nulls_errors_and_non_boolean_values_never_gain_exact_proof() {
+        use datafusion::{
+            logical_expr::Operator,
+            physical_expr::expressions::{BinaryExpr, Column, Literal},
+            scalar::ScalarValue,
+        };
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Int64,
+                false,
+            )])),
+            vec![Arc::new(Int64Array::from(vec![1, 2]))],
+        )
+        .unwrap();
+        let null = SegmentPredicatePlan::Expr {
+            expr: Arc::new(Literal::new(ScalarValue::Boolean(None))),
+            exact: true,
+        };
+        assert!(null.select(&batch).rows.is_empty());
+        let non_boolean = SegmentPredicatePlan::Expr {
+            expr: Arc::new(Literal::new(ScalarValue::Int64(Some(1)))),
+            exact: true,
+        };
+        let selected = non_boolean.select(&batch);
+        assert!(!selected.exact);
+        assert_eq!(selected.rows.len(batch.num_rows()), 2);
+        let expression = SegmentPredicatePlan::Expr {
+            expr: Arc::new(BinaryExpr::new(
+                Arc::new(BinaryExpr::new(
+                    Arc::new(Literal::new(ScalarValue::Int64(Some(1)))),
+                    Operator::Divide,
+                    Arc::new(Column::new("value", 0)),
+                )),
+                Operator::Gt,
+                Arc::new(Literal::new(ScalarValue::Int64(Some(0)))),
+            )),
+            exact: true,
+        };
+        let selected = expression.select(&batch);
+        assert!(selected.exact);
+        assert_eq!(selected.rows.len(batch.num_rows()), 1);
+        let invalid =
+            RecordBatch::try_new(batch.schema(), vec![Arc::new(Int64Array::from(vec![0, 2]))])
+                .unwrap();
+        let selected = expression.select(&invalid);
+        assert!(!selected.exact);
+        assert_eq!(selected.rows.len(invalid.num_rows()), 2);
+        let selected = expression.select(&batch);
+        assert!(selected.exact);
+        assert_eq!(selected.rows.len(batch.num_rows()), 1);
+    }
 
     #[test]
     fn segment_fetch_permits_are_bounded_and_never_zero() {

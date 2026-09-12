@@ -635,6 +635,7 @@ pub fn register_udf(ctx: &SessionContext, org_id: &str) -> Result<()> {
 
 pub async fn register_metrics_table(
     session: &SearchSession,
+    registry_owner: &str,
     schema: Arc<Schema>,
     table_name: &str,
     files: Vec<FileKey>,
@@ -646,6 +647,7 @@ pub async fn register_metrics_table(
         .await?;
 
     let tables = TableBuilder::new()
+        .registry_owner(registry_owner)
         .file_stat_cache(ctx.runtime_env().cache_manager.get_file_statistic_cache())
         .build(session.clone(), files, schema.clone())
         .await?;
@@ -663,6 +665,8 @@ pub struct TableBuilder {
     fst_fields: Vec<String>,
     timestamp_filter: Option<(i64, i64)>,
     collect_stat: bool,
+    scan_file_count: Option<std::num::NonZeroUsize>,
+    registry_owner: Option<String>,
 }
 
 impl Default for TableBuilder {
@@ -680,6 +684,8 @@ impl TableBuilder {
             fst_fields: vec![],
             timestamp_filter: None,
             collect_stat: true,
+            scan_file_count: None,
+            registry_owner: None,
         }
     }
 
@@ -717,6 +723,19 @@ impl TableBuilder {
     /// probe and scan only the unresolved files.
     pub fn collect_stat(mut self, collect_stat: bool) -> Self {
         self.collect_stat = collect_stat;
+        self
+    }
+
+    /// Unsplit residual cohort, before time/format/order table partitioning.
+    pub fn scan_file_count(mut self, count: Option<std::num::NonZeroUsize>) -> Self {
+        self.scan_file_count = count;
+        self
+    }
+
+    /// Root request owning every derived listing registration. Generic
+    /// callers that do not derive session ids retain their exact session id.
+    pub fn registry_owner(mut self, trace_id: impl Into<String>) -> Self {
+        self.registry_owner = Some(trace_id.into());
         self
     }
 
@@ -922,7 +941,9 @@ impl TableBuilder {
             // table additionally requires every scan to emit ts_desc — a
             // concat file routed here (proven regions) k-way merges (§6.2).
             FileFormat::Vix => Arc::new(
-                VixCoreFormat::new(self.timestamp_filter).with_ordered_output(declare_sort),
+                VixCoreFormat::new(self.timestamp_filter)
+                    .with_ordered_output(declare_sort)
+                    .with_scan_file_count(self.scan_file_count),
             ),
         };
 
@@ -949,28 +970,6 @@ impl TableBuilder {
         }
 
         let schema_key = schema.hash_key();
-        let format = prefix_token;
-        let trace_id = &session.id;
-        let prefix = match session.storage_type {
-            StorageType::Memory => {
-                file_list::set(trace_id, &schema_key, format, files).await;
-                format!("memory:///{trace_id}/schema={schema_key}/format={format}/",)
-            }
-            StorageType::Wal => {
-                file_list::set(trace_id, &schema_key, format, files).await;
-                format!("wal:///{trace_id}/schema={schema_key}/format={format}/",)
-            }
-        };
-        let prefix = match ListingTableUrl::parse(prefix) {
-            Ok(url) => url,
-            Err(e) => {
-                return Err(datafusion::error::DataFusionError::Execution(format!(
-                    "ListingTableUrl error: {e}",
-                )));
-            }
-        };
-
-        let mut config = ListingTableConfig::new(prefix).with_listing_options(listing_options);
         let timestamp_field = schema.field_with_name(TIMESTAMP_COL_NAME);
         let schema = if timestamp_field.is_ok() && timestamp_field.unwrap().is_nullable() {
             let new_fields = schema
@@ -992,18 +991,59 @@ impl TableBuilder {
         } else {
             schema
         };
+        let format = prefix_token;
+        let trace_id = &session.id;
+        let registry_owner = self.registry_owner.as_deref().unwrap_or(trace_id);
+        let prefix = match session.storage_type {
+            StorageType::Memory => {
+                file_list::set(
+                    trace_id,
+                    registry_owner,
+                    &schema_key,
+                    format,
+                    files,
+                    session.storage_type.clone(),
+                    Arc::clone(&schema),
+                )
+                .await;
+                format!("memory:///{trace_id}/schema={schema_key}/format={format}/",)
+            }
+            StorageType::Wal => {
+                file_list::set(
+                    trace_id,
+                    registry_owner,
+                    &schema_key,
+                    format,
+                    files,
+                    session.storage_type.clone(),
+                    Arc::clone(&schema),
+                )
+                .await;
+                format!("wal:///{trace_id}/schema={schema_key}/format={format}/",)
+            }
+        };
+        let prefix = match ListingTableUrl::parse(prefix) {
+            Ok(url) => url,
+            Err(e) => {
+                return Err(datafusion::error::DataFusionError::Execution(format!(
+                    "ListingTableUrl error: {e}",
+                )));
+            }
+        };
+
+        let mut config = ListingTableConfig::new(prefix).with_listing_options(listing_options);
         config = config.with_schema(schema);
         // the default adapter plus `_source` synthesis: a star-projected
         // `_source` column missing from a parquet file (WAL parquet,
         // pre-migration storage parquet) is synthesized per row from the
         // file's own columns instead of null-filled (DESIGN §5)
-        config = config.with_expr_adapter_factory(Arc::new(SourceSynthesizingExprAdapterFactory));
         let mut table = ListingTableAdapter::try_new(
             config,
             session.id.clone(),
             self.index_condition.clone(),
             self.fst_fields.clone(),
             self.timestamp_filter,
+            Some(Arc::new(SourceSynthesizingExprAdapterFactory)),
         )?;
         if self.file_stat_cache.is_some() {
             table = table.with_cache(self.file_stat_cache.clone());
@@ -1615,80 +1655,184 @@ mod tests {
     }
 
     mod integration_tests {
+        use arrow::{
+            array::{Int64Array, StringArray},
+            record_batch::RecordBatch,
+        };
         use config::meta::{
             search::{Session as SearchSession, StorageType},
             stream::{FileKey, FileMeta},
         };
+        use parquet::arrow::ArrowWriter;
 
         use super::*;
+
+        fn registry_scan_file(schema: &Arc<Schema>) -> (FileKey, std::path::PathBuf) {
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(vec![1000, 2000])),
+                    Arc::new(StringArray::from(vec!["first", "second"])),
+                    Arc::new(Int64Array::from(vec![10, 20])),
+                ],
+            )
+            .unwrap();
+            let mut bytes = Vec::new();
+            let mut writer = ArrowWriter::try_new(&mut bytes, schema.clone(), None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+            let key = format!("registry-owner-{}.parquet", rand::random::<u64>());
+            let wal_dir = &get_config().common.data_wal_dir;
+            std::fs::create_dir_all(wal_dir).unwrap();
+            let path = std::path::Path::new(wal_dir).join(&key);
+            std::fs::write(&path, &bytes).unwrap();
+            let mut file = FileKey::from_file_name(&key);
+            file.meta = FileMeta {
+                records: 2,
+                compressed_size: bytes.len() as i64,
+                min_ts: 1000,
+                max_ts: 2000,
+                ..Default::default()
+            };
+            (file, path)
+        }
+
+        fn use_registry_wal_fixture(ctx: &SessionContext) {
+            // Keep real registry-backed listing for both session types, but
+            // read the fixture from WAL rather than configuring remote storage.
+            ctx.runtime_env().register_object_store(
+                &url::Url::parse("memory:///").unwrap(),
+                Arc::new(crate::datafusion::storage::wal::FS::new()),
+            );
+        }
+
+        async fn scan_timestamps(ctx: &SessionContext, table: &str) -> Result<Vec<i64>> {
+            // A new consumer must enumerate the current registry, not reuse
+            // a previous query's immutable DataFusion listing-cache snapshot.
+            let provider = ctx.table_provider(table).await?;
+            let reader = DataFusionContextBuilder::new()
+                .trace_id("registry-owner-reader")
+                .build(2)
+                .await?;
+            use_registry_wal_fixture(&reader);
+            reader.register_table("t", provider)?;
+            let batches = reader
+                .sql("SELECT _timestamp FROM t ORDER BY _timestamp")
+                .await?
+                .collect()
+                .await?;
+            Ok(batches
+                .iter()
+                .flat_map(|batch| {
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .values()
+                        .to_vec()
+                })
+                .collect())
+        }
 
         #[tokio::test]
         async fn test_register_table_integration() -> Result<()> {
             let session = SearchSession {
-                id: "test-session".to_string(),
+                id: "metrics-registry-owner-storage-cpu".to_string(),
                 storage_type: StorageType::Memory,
                 target_partitions: 2,
                 work_group: None,
             };
 
             let schema = create_test_schema();
-            let files = vec![FileKey {
-                key: "test-file".to_string(),
-                meta: FileMeta::default(),
-                deleted: false,
-                account: "test_account".to_string(),
-                id: 1,
-                selection: None,
-                row_group_size: None,
-                selection_exact: false,
-            }];
+            let (file, path) = registry_scan_file(&schema);
 
-            let result = register_metrics_table(&session, schema, "test_table", files).await;
+            let ctx = register_metrics_table(
+                &session,
+                "metrics-registry-owner",
+                schema,
+                "test_table",
+                vec![file],
+            )
+            .await?;
+            assert_eq!(scan_timestamps(&ctx, "test_table").await?, vec![1000, 2000]);
 
-            // Should create context successfully
-            assert!(result.is_ok());
-            if let Ok(ctx) = result {
-                // Verify table is registered
-                assert!(
-                    ctx.catalog("datafusion")
-                        .unwrap()
-                        .schema("public")
-                        .unwrap()
-                        .table("test_table")
-                        .await
-                        .is_ok()
-                );
-            }
+            // PromQL completion/cancellation supplies the root, not the
+            // storage/stream-specific session used for listing registration.
+            file_list::clear("metrics-registry-owner");
+            assert_eq!(
+                scan_timestamps(&ctx, "test_table").await?,
+                Vec::<i64>::new()
+            );
+            std::fs::remove_file(path).unwrap();
 
             Ok(())
         }
 
         #[tokio::test]
         async fn test_table_builder_build_integration() -> Result<()> {
-            let session = SearchSession {
-                id: "test-session".to_string(),
-                storage_type: StorageType::Memory,
-                target_partitions: 2,
-                work_group: None,
-            };
-
+            let root = "builder-registry-owner";
             let schema = create_test_schema();
-            let files = vec![FileKey {
-                key: "test-file".to_string(),
-                meta: FileMeta::default(),
-                deleted: false,
-                account: "test_account".to_string(),
-                id: 1,
-                selection: None,
-                row_group_size: None,
-                selection_exact: false,
-            }];
+            let schema_key = schema.hash_key();
+            let (file, path) = registry_scan_file(&schema);
+            let ctx = DataFusionContextBuilder::new()
+                .trace_id(root)
+                .build(2)
+                .await?;
+            let mut table_names = Vec::new();
+            for (suffix, storage_type) in [
+                ("storage-true", StorageType::Memory),
+                ("wal-false", StorageType::Wal),
+                (schema_key.as_str(), StorageType::Wal),
+            ] {
+                let session = SearchSession {
+                    id: format!("{root}-{suffix}"),
+                    storage_type,
+                    target_partitions: 2,
+                    work_group: None,
+                };
+                let tables = TableBuilder::new()
+                    .registry_owner(root)
+                    .build(session, vec![file.clone()], schema.clone())
+                    .await?;
+                let name = format!("owned_{}", table_names.len());
+                ctx.register_table(
+                    name.as_str(),
+                    Arc::new(NewUnionTable::new(schema.clone(), tables)),
+                )?;
+                table_names.push(name);
+            }
+            // A raw caller with no explicit owner keeps its exact session id.
+            let neighbor = format!("{root}-neighbor");
+            let tables = TableBuilder::new()
+                .build(
+                    SearchSession {
+                        id: neighbor.clone(),
+                        storage_type: StorageType::Memory,
+                        target_partitions: 2,
+                        work_group: None,
+                    },
+                    vec![file],
+                    schema.clone(),
+                )
+                .await?;
+            ctx.register_table("neighbor", Arc::new(NewUnionTable::new(schema, tables)))?;
+            assert_eq!(
+                scan_timestamps(&ctx, &table_names[0]).await?,
+                vec![1000, 2000]
+            );
+            assert_eq!(scan_timestamps(&ctx, "neighbor").await?, vec![1000, 2000]);
 
-            let builder = TableBuilder::new().sorted_by_time(true);
-
-            let result = builder.build(session, files, schema).await;
-            assert!(result.is_ok());
-
+            // The flight cancellation/completion path supplies only the root.
+            // It must release every derived registration, even before scan.
+            file_list::clear(root);
+            for table in table_names {
+                assert_eq!(scan_timestamps(&ctx, &table).await?, Vec::<i64>::new());
+            }
+            assert_eq!(scan_timestamps(&ctx, "neighbor").await?, vec![1000, 2000]);
+            file_list::clear(&neighbor);
+            assert_eq!(scan_timestamps(&ctx, "neighbor").await?, Vec::<i64>::new());
+            std::fs::remove_file(path).unwrap();
             Ok(())
         }
     }

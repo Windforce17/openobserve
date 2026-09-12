@@ -15,6 +15,7 @@
 
 use arrow_schema::DataType;
 
+pub mod shared_percentile;
 pub mod summary_percentile;
 
 pub static NUMERICS: &[DataType] = &[

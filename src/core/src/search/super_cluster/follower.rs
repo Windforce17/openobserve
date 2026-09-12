@@ -261,8 +261,8 @@ pub async fn search(
     SEARCH_SERVER.add_file_stats(&trace_id, &scan_stats).await;
 
     let search_infos = SearchInfos {
-        plan: vec![],
-        file_id_list: partition_file_lists.clone(),
+        plan: Default::default(),
+        file_id_list: partition_file_lists.into(),
         start_time: req.time_range.as_ref().map(|x| x.0).unwrap_or(0),
         end_time: req.time_range.as_ref().map(|x| x.1).unwrap_or(0),
         timeout: req.timeout as u64,
@@ -439,7 +439,7 @@ mod tests {
         )?;
         let physical_plan: Arc<dyn ExecutionPlan> = Arc::new(partial_agg);
         let remote_scan_node = RemoteScanNode {
-            nodes: vec![Arc::new(TestNode)],
+            nodes: vec![Arc::new(TestNode) as Arc<dyn config::meta::cluster::NodeInfo>].into(),
             ..Default::default()
         };
 

@@ -12432,10 +12432,12 @@ mod tests {
                     ..Default::default()
                 };
                 // a pre-heal query memoized its (wrong-after-heal) answer
-                let key_pre = generate_cache_key(&condition, &None, &file(pre_index_size), None);
+                let key_pre =
+                    generate_cache_key(&condition, &None, &file(pre_index_size), None, None);
                 GLOBAL_CACHE.put(key_pre.clone(), CacheEntry::NoMatch);
                 // the SAME query against the healed row's meta: new key, miss
-                let key_post = generate_cache_key(&condition, &None, &file(post_index_size), None);
+                let key_post =
+                    generate_cache_key(&condition, &None, &file(post_index_size), None, None);
                 assert_ne!(
                     key_pre, key_post,
                     "{context}: post-heal queries must not share the pre-heal cache key"

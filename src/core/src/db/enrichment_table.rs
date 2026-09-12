@@ -124,8 +124,12 @@ pub async fn get_enrichment_table_data(
             .await;
     }
 
-    let result =
-        search_cluster::search_inner(request, search_query, regions, vec![], true, None).await;
+    let result = async {
+        let sql = crate::service::search::sql::Sql::new_from_req(&request, &search_query).await?;
+        search_cluster::search_inner(request, search_query, regions, vec![], true, Arc::new(sql))
+            .await
+    }
+    .await;
 
     #[cfg(feature = "enterprise")]
     {

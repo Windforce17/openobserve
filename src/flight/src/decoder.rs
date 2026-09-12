@@ -19,7 +19,6 @@ use arrow::{array::ArrayRef, buffer::Buffer, ipc::MessageHeader};
 use arrow_flight::{
     FlightData,
     error::{FlightError, Result},
-    utils::flight_data_to_arrow_batch,
 };
 use arrow_schema::{Schema, SchemaRef};
 use datafusion::parquet::data_type::AsBytes;
@@ -130,10 +129,22 @@ impl FlightDataDecoder {
                     ));
                 };
 
-                let batch = flight_data_to_arrow_batch(
-                    &data,
+                let batch_header = message.header_as_record_batch().ok_or_else(|| {
+                    FlightError::DecodeError(format!(
+                        "Error decoding ipc RecordBatch: {}",
+                        arrow::error::ArrowError::ParseError(
+                            "Unable to convert flight data header to a record batch".to_string(),
+                        )
+                    ))
+                })?;
+                let buffer = Buffer::from(data.data_body);
+                let batch = arrow::ipc::reader::read_record_batch(
+                    &buffer,
+                    batch_header,
                     Arc::clone(schema),
                     &self.dictionaries_by_field,
+                    None,
+                    &message.version(),
                 )
                 .map_err(|e| {
                     FlightError::DecodeError(format!("Error decoding ipc RecordBatch: {e}"))
@@ -186,19 +197,76 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::{
-        array::{ArrayRef, Int32Array, RecordBatch, StringArray},
+        array::{
+            ArrayRef, DictionaryArray, Int32Array, ListArray, RecordBatch, StringArray,
+            StringViewArray, types::Int32Type,
+        },
         ipc::{
-            MessageHeader,
+            CompressionType, MessageHeader,
             writer::{CompressionContext, DictionaryTracker, IpcDataGenerator, IpcWriteOptions},
         },
     };
     use arrow_flight::{FlightData, SchemaAsIpc};
     use arrow_schema::{DataType, Field, Schema};
     use config::meta::search::ScanStats;
+    use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
     use flatbuffers::FlatBufferBuilder;
 
     use super::*;
     use crate::common::CustomMessage;
+
+    fn create_test_decoder() -> FlightDataDecoder {
+        // extract_message is exercised directly; there are no transport frames to decode.
+        struct NoFrames;
+        impl tonic::codec::Decoder for NoFrames {
+            type Item = FlightData;
+            type Error = tonic::Status;
+
+            fn decode(
+                &mut self,
+                _: &mut tonic::codec::DecodeBuf<'_>,
+            ) -> std::result::Result<Option<Self::Item>, Self::Error> {
+                unreachable!("the test stream has no frames")
+            }
+        }
+
+        FlightDataDecoder::new(
+            Streaming::new_empty(NoFrames, tonic::body::Body::empty()),
+            None,
+            RemoteScanMetrics::new(0, &ExecutionPlanMetricsSet::new()),
+        )
+    }
+
+    fn encode_test_batch(batch: &RecordBatch, options: &IpcWriteOptions) -> Vec<FlightData> {
+        let data_gen = IpcDataGenerator::default();
+        let mut dictionary_tracker = DictionaryTracker::new(false);
+        // Match encode_chunk: schema encoding assigns the IDs used by batch encoding.
+        let _ = data_gen.schema_to_bytes_with_dictionary_tracker(
+            &batch.schema(),
+            &mut dictionary_tracker,
+            options,
+        );
+        let (dictionaries, batch) = data_gen
+            .encode(
+                batch,
+                &mut dictionary_tracker,
+                options,
+                &mut CompressionContext::default(),
+            )
+            .unwrap();
+        dictionaries
+            .into_iter()
+            .chain(std::iter::once(batch))
+            .map(Into::into)
+            .collect()
+    }
+
+    fn decode_test_batch(decoder: &mut FlightDataDecoder, data: FlightData) -> RecordBatch {
+        match decoder.extract_message(data).unwrap() {
+            Some(FlightMessage::RecordBatch(batch)) => batch,
+            other => panic!("Expected RecordBatch, got {other:?}"),
+        }
+    }
 
     fn create_test_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
@@ -307,29 +375,132 @@ mod tests {
     fn test_flight_data_record_batch_encoding_decoding() {
         let batch = create_test_record_batch();
         let options = IpcWriteOptions::default();
-        let data_gen = IpcDataGenerator::default();
-        let mut compress = CompressionContext::default();
-        let mut dictionary_tracker = DictionaryTracker::new(false);
-
-        let (_, encoded_batch) = data_gen
-            .encode(&batch, &mut dictionary_tracker, &options, &mut compress)
+        let mut decoder = create_test_decoder();
+        decoder
+            .extract_message(SchemaAsIpc::new(batch.schema().as_ref(), &options).into())
             .unwrap();
+        let decoded = decode_test_batch(
+            &mut decoder,
+            encode_test_batch(&batch, &options).pop().unwrap(),
+        );
+        drop(decoder);
+        assert_eq!(decoded, batch);
+    }
 
-        let flight_data: FlightData = encoded_batch.into();
+    #[test]
+    fn test_owned_body_alignment_compression_and_dictionary_lifetime() {
+        for compression in [None, Some(CompressionType::ZSTD)] {
+            for alignment in [0, 1] {
+                let options = IpcWriteOptions::default()
+                    .try_with_compression(compression)
+                    .unwrap();
+                let mut decoder = create_test_decoder();
+                let mut retained = Vec::new();
+                for label in ["first dictionary", "replacement dictionary"] {
+                    let columns: Vec<ArrayRef> = vec![
+                        Arc::new(DictionaryArray::<Int32Type>::from_iter([
+                            Some(label),
+                            None,
+                            Some(label),
+                        ])),
+                        Arc::new(StringViewArray::from(vec![
+                            Some(format!("{label}: externally stored view")),
+                            None,
+                            Some("inline".to_string()),
+                        ])),
+                        Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+                            Some(vec![Some(7), None, Some(-2)]),
+                            None,
+                            Some(vec![]),
+                        ])),
+                    ];
+                    let schema = Arc::new(Schema::new(
+                        columns
+                            .iter()
+                            .enumerate()
+                            .map(|(i, column)| {
+                                Field::new(format!("column_{i}"), column.data_type().clone(), true)
+                            })
+                            .collect::<Vec<_>>(),
+                    ));
+                    let expected = RecordBatch::try_new(schema, columns).unwrap();
+                    if retained.is_empty() {
+                        decoder
+                            .extract_message(
+                                SchemaAsIpc::new(expected.schema().as_ref(), &options).into(),
+                            )
+                            .unwrap();
+                    }
+                    // A fresh writer reuses the dictionary ID for the replacement values.
+                    let mut messages = encode_test_batch(&expected, &options);
+                    let mut data = messages.pop().unwrap();
+                    for dictionary in messages {
+                        assert!(decoder.extract_message(dictionary).unwrap().is_none());
+                    }
+                    // Exercise both aligned and misaligned slices of a larger owned allocation.
+                    let mut body = vec![0; data.data_body.len() + 8];
+                    let offset = (alignment + 8 - body.as_ptr() as usize % 8) % 8;
+                    let end = offset + data.data_body.len();
+                    body[offset..end].copy_from_slice(&data.data_body);
+                    data.data_body = bytes::Bytes::from(body).slice(offset..end);
+                    retained.push((decode_test_batch(&mut decoder, data), expected));
+                }
+                drop(decoder);
+                for (decoded, expected) in retained {
+                    assert_eq!(decoded, expected);
+                }
+            }
+        }
+    }
 
-        // Verify the flight data is properly formed
-        assert!(!flight_data.data_header.is_empty());
-        assert!(!flight_data.data_body.is_empty());
-
-        // Verify we can decode with the proper schema and empty dictionaries
-        let schema = batch.schema();
-        let dictionaries = std::collections::HashMap::new();
-        let decoded_batch =
-            arrow_flight::utils::flight_data_to_arrow_batch(&flight_data, schema, &dictionaries)
-                .unwrap();
-
-        assert_eq!(decoded_batch.num_rows(), 3);
-        assert_eq!(decoded_batch.num_columns(), 2);
+    #[test]
+    fn test_record_batch_protocol_and_missing_dictionary_errors_preserve_state() {
+        let values: ArrayRef = Arc::new(DictionaryArray::<Int32Type>::from_iter([
+            Some("retained"),
+            None,
+        ]));
+        let expected = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "dictionary",
+                values.data_type().clone(),
+                true,
+            )])),
+            vec![values],
+        )
+        .unwrap();
+        let options = IpcWriteOptions::default();
+        let mut messages = encode_test_batch(&expected, &options);
+        let batch = messages.pop().unwrap();
+        let mut decoder = create_test_decoder();
+        assert!(matches!(
+            decoder.extract_message(batch.clone()),
+            Err(FlightError::ProtocolError(_))
+        ));
+        decoder
+            .extract_message(SchemaAsIpc::new(expected.schema().as_ref(), &options).into())
+            .unwrap();
+        let mut builder = FlatBufferBuilder::new();
+        let mut header = arrow::ipc::MessageBuilder::new(&mut builder);
+        header.add_version(arrow::ipc::MetadataVersion::V5);
+        header.add_header_type(MessageHeader::RecordBatch);
+        let header = header.finish();
+        builder.finish(header, None);
+        assert!(matches!(
+            decoder.extract_message(
+                FlightData::new().with_data_header(builder.finished_data().to_vec())
+            ),
+            Err(FlightError::DecodeError(_))
+        ));
+        assert!(matches!(
+            decoder.extract_message(batch.clone()),
+            Err(FlightError::DecodeError(_))
+        ));
+        for dictionary in messages {
+            assert!(decoder.extract_message(dictionary).unwrap().is_none());
+        }
+        let decoded = decode_test_batch(&mut decoder, batch);
+        drop(decoder);
+        assert_eq!(decoded, expected);
     }
 
     #[test]
@@ -355,35 +526,18 @@ mod tests {
 
     #[test]
     fn test_invalid_json_in_app_metadata() {
-        // Test that invalid JSON in app_metadata would cause an error during deserialization
-        let invalid_json = b"invalid json";
-        let result = serde_json::from_slice::<CustomMessage>(invalid_json);
-        assert!(result.is_err());
-        let error_msg = result.unwrap_err().to_string();
-        assert!(error_msg.contains("expected"));
-    }
-
-    #[test]
-    fn test_flight_message_variants() {
-        // Test FlightMessage enum construction
-        let schema = create_test_schema();
-        let schema_message = FlightMessage::Schema(schema);
-
-        match schema_message {
-            FlightMessage::Schema(s) => {
-                assert_eq!(s.fields().len(), 2);
-            }
-            _ => panic!("Expected Schema variant"),
-        }
-
-        let batch = create_test_record_batch();
-        let batch_message = FlightMessage::RecordBatch(batch);
-
-        match batch_message {
-            FlightMessage::RecordBatch(b) => {
-                assert_eq!(b.num_rows(), 3);
-            }
-            _ => panic!("Expected RecordBatch variant"),
-        }
+        let mut data = create_custom_message_flight_data();
+        data.app_metadata = bytes::Bytes::from_static(b"invalid json");
+        let mut decoder = create_test_decoder();
+        assert!(matches!(
+            decoder.extract_message(data),
+            Err(FlightError::DecodeError(_))
+        ));
+        assert!(matches!(
+            decoder
+                .extract_message(create_custom_message_flight_data())
+                .unwrap(),
+            Some(FlightMessage::CustomMessage(CustomMessage::ScanStats(_)))
+        ));
     }
 }

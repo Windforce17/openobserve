@@ -186,6 +186,7 @@ mod tests {
             time_range: (0, 1000),
             work_group: None,
             use_inverted_index: true,
+            full_text_fields: None,
         })
     }
 

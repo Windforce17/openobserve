@@ -45,6 +45,56 @@ impl RecordBatchExt for RecordBatch {
     }
 }
 
+/// Compact top-level view payloads after a row gather. Arrow's take kernel
+/// copies view/null ordinals but retains all source payload buffers. Nested
+/// and dictionary backing remains shared and must still be memory-accounted.
+pub fn compact_top_level_view_arrays(
+    batch: RecordBatch,
+    ctx: &str,
+) -> Result<RecordBatch, ArrowError> {
+    if !batch.columns().iter().any(|column| {
+        matches!(
+            column.data_type(),
+            DataType::Utf8View | DataType::BinaryView
+        )
+    }) {
+        return Ok(batch);
+    }
+    let columns = batch
+        .columns()
+        .iter()
+        .map(|column| {
+            let compacted: ArrayRef = match column.data_type() {
+                DataType::Utf8View => Arc::new(
+                    column
+                        .as_any()
+                        .downcast_ref::<StringViewArray>()
+                        .ok_or_else(|| {
+                            ArrowError::ComputeError(format!("{ctx}: invalid Utf8View array"))
+                        })?
+                        .gc(),
+                ),
+                DataType::BinaryView => Arc::new(
+                    column
+                        .as_any()
+                        .downcast_ref::<arrow::array::BinaryViewArray>()
+                        .ok_or_else(|| {
+                            ArrowError::ComputeError(format!("{ctx}: invalid BinaryView array"))
+                        })?
+                        .gc(),
+                ),
+                _ => Arc::clone(column),
+            };
+            Ok(compacted)
+        })
+        .collect::<Result<Vec<_>, ArrowError>>()?;
+    RecordBatch::try_new_with_options(
+        batch.schema(),
+        columns,
+        &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+    )
+}
+
 // convert vrl values directly to record batch
 pub fn convert_vrl_to_record_batch(
     schema: &Arc<Schema>,

@@ -46,7 +46,7 @@ type CpuJob = Box<dyn FnOnce() + Send + 'static>;
 
 struct SharedCpuRuntime {
     threads: usize,
-    _executor: Arc<dyn Executor>,
+    _executor: Arc<SplitExecutor>,
     handle: Handle,
     _io_runtime: tokio::runtime::Runtime,
 }
@@ -82,7 +82,8 @@ impl CpuLeafPool {
                         };
                         let Ok(job) = job else { return };
                         IN_CPU_LEAF.with(|inside| {
-                            debug_assert!(!inside.replace(true));
+                            let was_inside = inside.replace(true);
+                            debug_assert!(!was_inside);
                             let _ = catch_unwind(AssertUnwindSafe(job));
                             inside.set(false);
                         });
@@ -192,11 +193,11 @@ fn build_runtime() -> Result<SharedCpuRuntime, String> {
         io: io_runtime.handle().clone(),
         cpu: CpuLeafPool::new(threads)?,
     });
-    let executor: Arc<dyn Executor> = concrete;
+    let executor: Arc<dyn Executor> = concrete.clone();
     let handle = Handle::new(Arc::downgrade(&executor));
     Ok(SharedCpuRuntime {
         threads,
-        _executor: executor,
+        _executor: concrete,
         handle,
         _io_runtime: io_runtime,
     })
@@ -210,8 +211,23 @@ pub fn shared_vortex_execution_handle() -> Result<Handle, VixError> {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn shared_cpu_thread_count() -> Result<usize, VixError> {
+/// Submit a non-abortable leaf. Its captured owners live until the closure exits,
+/// even when the controller abandons the result.
+pub(crate) fn submit_conversion(task: CpuJob) -> Result<(), VixError> {
+    shared_vortex_execution_handle()?;
+    match SHARED_CPU_RUNTIME.get().expect("runtime initialized") {
+        Ok(runtime) => {
+            // Do not use Handle::spawn_cpu: dropping its Task aborts queued work.
+            // Conversion controllers explicitly drain started work instead.
+            runtime._executor.cpu.submit(task);
+            Ok(())
+        }
+        Err(error) => Err(VixError::Writer(error.clone())),
+    }
+}
+
+/// Actual immutable width of the process-wide CPU leaf pool.
+pub fn shared_cpu_thread_count() -> Result<usize, VixError> {
     shared_vortex_execution_handle()?;
     match SHARED_CPU_RUNTIME.get().expect("runtime initialized") {
         Ok(runtime) => Ok(runtime.threads),

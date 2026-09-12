@@ -29,6 +29,29 @@ Local patches on top of 0.79.0:
    `builders::dict::test::zero_max_len_still_progresses`,
    `builders::dict::primitive::test::degenerate_constraints_still_progress`.
 
+4. `src/mask_future.rs` — `MaskFuture::slice`: an exact `0..len` slice
+   clones the shared future rather than creating a new `MaskValues` and lazy
+   index cache for each projected column. Partial slices and error propagation
+   are unchanged. A 64-bit allocator smoke with three full-window projections
+   of a 100,000-row mask retaining 75,000 rows reduced live allocation from
+   1,801,056 to 600,000 bytes; the partial-slice control remained unchanged.
+
+   This sharing is required by the bounded fragmented-zone scan selection in
+   `src/vortex_index/src/docs.rs`. Default Layout splits include every
+   referenced scalar/struct column boundary, so chunked filter/projection
+   readers request the full split mask. The scan reservation includes lazy
+   indices for both included and excluded selections. List-like projections
+   retain the original range-scan path: their internal mask copies and
+   element-domain expansion do not satisfy this row-domain bound. Preserve
+   these invariants together when upgrading Vortex.
+
+   Validation: the projected-leaf read-overlap regression fails on the old
+   per-range scan and passes with the bounded selection; VIX/search library
+   suites pass. Real APM-file comparisons retain counts, errors and all three
+   percentiles. Approximate percentile bits can still vary when an explicitly
+   clipped time window changes batch boundaries; compare against an
+   independent sorted-value oracle rather than assuming universal bit equality.
+
 Running this crate's own suite needs the features the published tarball's tests
 assume: `cargo test -p vortex-array --lib --features "_test-harness,table-display"`
 (3029 passed / 1 ignored, all green with the patch as of vendoring).

@@ -40,11 +40,10 @@ use std::{
 };
 
 use anyhow::{Context, anyhow};
+#[cfg(test)]
+use arrow::array::{BinaryViewArray, StringViewArray};
 use arrow::{
-    array::{
-        Array, ArrayRef, BinaryViewArray, BooleanArray, Int64Array, StringViewArray, UInt32Array,
-        new_null_array,
-    },
+    array::{Array, ArrayRef, BooleanArray, Int64Array, UInt32Array, new_null_array},
     compute::{cast, concat_batches, filter_record_batch, take_record_batch},
     record_batch::RecordBatch,
 };
@@ -58,7 +57,9 @@ use config::{
     meta::stream::{FileKey, FileMeta, StreamType},
     metrics,
     utils::{
-        record_batch_ext::{RecordBatchExt, sort_record_batch_by_column},
+        record_batch_ext::{
+            RecordBatchExt, compact_top_level_view_arrays, sort_record_batch_by_column,
+        },
         schema_ext::SchemaExt,
         time::now_micros,
     },
@@ -1471,47 +1472,6 @@ fn planning_scratch_bytes(decoded: &[(i64, Vec<SegmentFrame>)]) -> usize {
         .fold(0usize, |bytes, frame| {
             bytes.saturating_add(frame.batch.size())
         })
-}
-
-/// `take_record_batch` materializes fixed-width/classic variable-width
-/// arrays, but Arrow's Utf8View/BinaryView take kernel intentionally
-/// shallow-clones every source data buffer. GC top-level view arrays after
-/// selection so a tiny old-hour bucket owns only its retained non-inline
-/// values. Segment frames are flat record batches; nested reconstruction is
-/// deliberately outside this path.
-fn compact_top_level_view_arrays(
-    batch: RecordBatch,
-    ctx: &str,
-) -> Result<RecordBatch, anyhow::Error> {
-    let mut compacted = false;
-    let mut columns = Vec::with_capacity(batch.num_columns());
-    for column in batch.columns() {
-        let column: ArrayRef = match column.data_type() {
-            DataType::Utf8View => {
-                let view = column
-                    .as_any()
-                    .downcast_ref::<StringViewArray>()
-                    .ok_or_else(|| anyhow!("{ctx}: Utf8View column failed concrete downcast"))?;
-                compacted = true;
-                Arc::new(view.gc())
-            }
-            DataType::BinaryView => {
-                let view = column
-                    .as_any()
-                    .downcast_ref::<BinaryViewArray>()
-                    .ok_or_else(|| anyhow!("{ctx}: BinaryView column failed concrete downcast"))?;
-                compacted = true;
-                Arc::new(view.gc())
-            }
-            _ => Arc::clone(column),
-        };
-        columns.push(column);
-    }
-    if !compacted {
-        return Ok(batch);
-    }
-    RecordBatch::try_new(batch.schema(), columns)
-        .with_context(|| format!("{ctx}: rebuild batch after compacting view arrays"))
 }
 
 /// Partition one frame by the ACTUAL `_timestamp` values that the builder

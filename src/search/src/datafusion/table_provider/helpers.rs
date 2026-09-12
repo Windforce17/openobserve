@@ -47,28 +47,45 @@ use crate::{
 /// Fallback row-group size when a file's scan selection carries none.
 const LEGACY_ROW_GROUP_SIZE: usize = 1024 * 1024;
 
-/// Attach the access plan for this file as a typed [`PartitionedFile`] extension.
-pub fn generate_access_plan(file: &mut PartitionedFile) {
+/// Attach the access plan and report whether it enforces an exact selection.
+/// A missing/unsupported access plan must retain the residual predicate.
+pub fn generate_access_plan(file: &mut PartitionedFile) -> bool {
     let Some(storage::file_list::ScanSelection {
         selection,
         row_group_size,
-        exact: _,
+        exact,
+        native_predicate,
     }) = storage::file_list::get_scan_selection(file.path().as_ref())
     else {
-        return;
+        return false;
     };
 
     let Some(file_format) = FileFormat::from_extension(file.path().as_ref()) else {
-        return;
+        return false;
     };
-
-    match file_format {
+    if file_format == FileFormat::Vix {
+        let row_ids = match &selection {
+            Some(FileSelection::Rows(rows)) if !rows.selects_all() => Some(Arc::clone(rows)),
+            _ => None,
+        };
+        file.extensions.insert(VixScanSelection {
+            row_ids,
+            native_predicate,
+        });
+    }
+    let Some(selection) = selection else {
+        return false;
+    };
+    let applied = match file_format {
         FileFormat::Parquet => match selection {
             FileSelection::Rows(row_ids) => {
                 if let Some(access_plan) =
                     generate_parquet_access_plan(file, &row_ids, row_group_size)
                 {
                     file.extensions.insert(access_plan);
+                    true
+                } else {
+                    false
                 }
             }
             #[cfg(feature = "enterprise")]
@@ -81,34 +98,39 @@ pub fn generate_access_plan(file: &mut PartitionedFile) {
                         file.path().as_ref(),
                     );
                     file.extensions.insert_arc(access_plan);
+                    true
+                } else {
+                    false
                 }
             }
             #[cfg(not(feature = "enterprise"))]
-            FileSelection::RowGroups(_) => {}
+            FileSelection::RowGroups(_) => false,
         },
         FileFormat::Vortex => match selection {
             FileSelection::Rows(row_ids) => {
                 if let Some(access_plan) = generate_vortex_access_plan(&row_ids) {
                     file.extensions.insert(access_plan);
                 }
+                true
             }
-            // row-group sampling is parquet only; vortex falls back to a full scan
-            FileSelection::RowGroups(_) => {}
+            FileSelection::RowGroups(_) => false,
         },
-        // Core .vix files: the inverted-index bitmap is applied as a row
-        // selection on the docs-blob scan. The bitmap is aligned to the file
-        // itself (vix_search guards row_count == records), so no row-group
-        // mapping (and no LEGACY_ROW_GROUP_SIZE fallback) is involved.
+        // The bitmap universe is validated against the file by vix_search.
+        // Strategy-only extensions above do not prove selection exactness.
         FileFormat::Vix => match selection {
-            FileSelection::Rows(row_ids) => {
-                if !row_ids.selects_all() {
-                    file.extensions.insert(VixScanSelection { row_ids });
-                }
-            }
-            // row-group sampling is parquet only; core files run a full scan
-            FileSelection::RowGroups(_) => {}
+            FileSelection::Rows(_) => true,
+            FileSelection::RowGroups(_) => false,
         },
+    };
+    if applied && let Some(statistics) = &mut file.statistics {
+        let statistics = Arc::make_mut(statistics);
+        statistics.num_rows = statistics.num_rows.to_inexact();
+        statistics.total_byte_size = statistics.total_byte_size.to_inexact();
+        for column in &mut statistics.column_statistics {
+            *column = std::mem::take(column).to_inexact();
+        }
     }
+    applied && exact
 }
 
 fn generate_parquet_access_plan(
@@ -338,6 +360,61 @@ mod tests {
         stats.num_rows = Precision::Exact(num_rows);
         file.statistics = Some(Arc::new(stats));
         file
+    }
+
+    #[tokio::test]
+    async fn strategy_only_files_retain_residual_and_all_row_selections_prove_exactness() {
+        use config::meta::{
+            search::StorageType,
+            stream::{FileKey, NativePredicateStrategy},
+        };
+        let schema = Arc::new(Schema::empty());
+        let mut strategy_only = FileKey::from_file_name("strategy.vix");
+        strategy_only.native_predicate = NativePredicateStrategy::NativeStringEq;
+        // Even stale/excessively optimistic exactness cannot turn a strategy
+        // without a usable row selection into proof of the predicate.
+        strategy_only.selection_exact = true;
+        let mut all_rows = FileKey::from_file_name("all.vix");
+        all_rows.native_predicate = NativePredicateStrategy::DirectResidual;
+        all_rows.selection_exact = true;
+        all_rows.selection = Some(FileSelection::Rows(Arc::new(RowIdBitmap::from_row_ids(
+            3,
+            [0, 1, 2],
+        ))));
+        let mut selected = all_rows.clone();
+        selected.key = "selected.vix".into();
+        selected.selection = Some(FileSelection::Rows(Arc::new(RowIdBitmap::from_row_ids(
+            3,
+            [1],
+        ))));
+        storage::file_list::set(
+            "access-strategies",
+            "access-strategies",
+            "s",
+            "vix",
+            vec![strategy_only, all_rows, selected],
+            StorageType::Memory,
+            schema,
+        )
+        .await;
+        let objects = storage::file_list::get("access-strategies/schema=s/format=vix").unwrap();
+        for (object, exact, expected_rows) in [
+            (&objects[0], false, None),
+            (&objects[1], true, None),
+            (&objects[2], true, Some(vec![1])),
+        ] {
+            let mut file = PartitionedFile::new(object.location.to_string(), object.size);
+            assert_eq!(generate_access_plan(&mut file), exact);
+            let selection = file.extensions.get::<VixScanSelection>().unwrap();
+            assert_eq!(
+                selection
+                    .row_ids
+                    .as_ref()
+                    .map(|rows| rows.iter().collect::<Vec<_>>()),
+                expected_rows
+            );
+        }
+        storage::file_list::clear("access-strategies");
     }
 
     #[test]

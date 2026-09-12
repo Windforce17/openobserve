@@ -71,6 +71,7 @@
 pub mod bloom;
 mod clustered;
 mod container;
+mod conversion;
 mod cpu_executor;
 mod dict_blocks;
 mod docs;
@@ -94,7 +95,12 @@ pub use container::{
     BloomEncodingCensus, DEFAULT_TAIL_FETCH_BYTES, RowOrder, VixOutput, ZoneEntry,
     region_row_ranges, set_tail_fetch_size,
 };
-pub use cpu_executor::{configure_shared_cpu_executor, shared_vortex_execution_handle};
+pub use conversion::{
+    NativePredicateStrategy, NativeScanOptions, ScanCpuBudget, ScanCpuBudgetSnapshot,
+};
+pub use cpu_executor::{
+    configure_shared_cpu_executor, shared_cpu_thread_count, shared_vortex_execution_handle,
+};
 pub use docs::{
     BoundValue, ColumnBound, DocsWidenPlan, EncodedDocsChunk, NumScalar, VixDocs, cmp_i128_vs_f64,
     cmp_num_vs_bound, docs_widen_plan,

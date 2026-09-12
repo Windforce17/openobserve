@@ -60,8 +60,10 @@ where
             .with_metadata(Default::default()),
     );
 
+    let scan_file_count = std::num::NonZeroUsize::new(files.len());
     // Helper to create table with common configuration
     let create_table = |files: Vec<FileKey>, timestamp_filter: Option<(i64, i64)>| {
+        let registry_owner = query.trace_id.clone();
         let mut session = session.clone();
         // Note: avoid the files be replaced by the same session id in file_list::set
         session.id = format!("{}-{}", session.id, timestamp_filter.is_some());
@@ -73,7 +75,9 @@ where
 
         async move {
             let mut builder = TableBuilder::new()
+                .registry_owner(registry_owner)
                 .sorted_by_time(sorted_by_time)
+                .scan_file_count(scan_file_count)
                 .collect_stat(collect_stat)
                 .file_stat_cache(file_stat_cache)
                 .index_condition(index_condition)

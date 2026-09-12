@@ -28,6 +28,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use datafusion::physical_plan::metrics::{Count, ExecutionPlanMetricsSet, MetricBuilder};
 use futures::{FutureExt, StreamExt, TryStreamExt, future::BoxFuture};
 use infra::cache::storage::{RangeRead, RangeSource};
 use object_store::{ObjectStore, path::Path};
@@ -70,15 +71,83 @@ pub struct FetchStats {
     pub object_store_fetches: AtomicU64,
     pub object_store_bytes: AtomicU64,
     pub queue_micros: AtomicU64,
+    /// Time inside byte admission, including waits dropped on cancellation.
+    pub byte_queue_micros: AtomicU64,
+    /// Time inside enabled count admission, including cancelled waits.
+    pub count_queue_micros: AtomicU64,
     pub active_micros: AtomicU64,
     pub evaluation_queue_micros: AtomicU64,
+    source_metrics: Option<FetchSourceMetrics>,
+}
+
+#[derive(Debug)]
+struct FetchSourceMetrics {
+    counters: [Count; 4],
+    published: Mutex<[usize; 4]>,
+}
+
+impl FetchStats {
+    pub(crate) fn for_source(
+        metrics: ExecutionPlanMetricsSet,
+        partition: usize,
+        location: String,
+    ) -> Self {
+        let mut stats = Self::default();
+        stats.source_metrics = Some(FetchSourceMetrics {
+            counters: [
+                "vix_fetch_byte_admission_wait_ns",
+                "vix_fetch_count_admission_wait_ns",
+                "vix_fetch_queue_wall_ns",
+                "vix_fetch_active_wall_ns",
+            ]
+            .map(|name| {
+                MetricBuilder::new(&metrics)
+                    .with_new_label("file", location.clone())
+                    .counter(name, partition)
+            }),
+            published: Mutex::new([0; 4]),
+        });
+        stats
+    }
+
+    fn publish_source_metrics(&self) {
+        let Some(source) = &self.source_metrics else {
+            return;
+        };
+        // Serialize snapshots and publish monotonic deltas: concurrent read
+        // completions must neither double count nor overwrite newer totals.
+        // Registering counters at construction and updating on events makes
+        // completed waits visible before an early-LIMIT metrics snapshot.
+        let mut published = source.published.lock();
+        for ((counter, prior), micros) in source.counters.iter().zip(published.iter_mut()).zip([
+            &self.byte_queue_micros,
+            &self.count_queue_micros,
+            &self.queue_micros,
+            &self.active_micros,
+        ]) {
+            let nanos = micros.load(Ordering::Relaxed).saturating_mul(1000);
+            let current = nanos.min(usize::MAX as u64) as usize;
+            let delta = current.saturating_sub(*prior);
+            if delta != 0 {
+                counter.add(delta);
+                *prior = current;
+            }
+        }
+    }
+}
+
+impl Drop for FetchStats {
+    fn drop(&mut self) {
+        // ActiveFetch records its timer before releasing its stats owner.
+        self.publish_source_metrics();
+    }
 }
 
 thread_local! {
     static OPERATION: RefCell<Option<Arc<ReadOperation>>> = const { RefCell::new(None) };
 }
 
-pub(super) struct ReadOperation {
+pub(crate) struct ReadOperation {
     stats: Arc<FetchStats>,
     rollup: Option<Arc<FetchStats>>,
     stopped: watch::Sender<bool>,
@@ -87,7 +156,7 @@ pub(super) struct ReadOperation {
 }
 
 impl ReadOperation {
-    pub(super) fn new(stats: Arc<FetchStats>, deadline: Option<Instant>) -> Arc<Self> {
+    pub(crate) fn new(stats: Arc<FetchStats>, deadline: Option<Instant>) -> Arc<Self> {
         let (stopped, _) = watch::channel(false);
         Arc::new(Self {
             stats,
@@ -113,16 +182,18 @@ impl ReadOperation {
 
     fn record(&self, update: impl Fn(&FetchStats)) {
         update(&self.stats);
+        self.stats.publish_source_metrics();
         if let Some(rollup) = &self.rollup {
             update(rollup);
+            rollup.publish_source_metrics();
         }
     }
 
-    pub(super) fn owner_guard(self: &Arc<Self>) -> ReadOperationGuard {
+    pub(crate) fn owner_guard(self: &Arc<Self>) -> ReadOperationGuard {
         ReadOperationGuard(Arc::clone(self))
     }
 
-    pub(super) fn run<T>(self: &Arc<Self>, work: impl FnOnce() -> T) -> T {
+    pub(crate) fn run<T>(self: &Arc<Self>, work: impl FnOnce() -> T) -> T {
         struct Restore(Option<Arc<ReadOperation>>);
         impl Drop for Restore {
             fn drop(&mut self) {
@@ -158,7 +229,7 @@ impl ReadOperation {
         self.stopped.send_replace(true);
     }
 
-    pub(super) fn is_cancelled(&self) -> bool {
+    pub(crate) fn is_cancelled(&self) -> bool {
         *self.stopped.borrow()
             || self
                 .deadline
@@ -204,7 +275,7 @@ impl vortex_index::VixReadOperation for ReadOperation {
     }
 }
 
-pub(super) struct ReadOperationGuard(Arc<ReadOperation>);
+pub(crate) struct ReadOperationGuard(Arc<ReadOperation>);
 impl Drop for ReadOperationGuard {
     fn drop(&mut self) {
         self.0.cancel();
@@ -500,6 +571,39 @@ impl Drop for FetchTimer {
     }
 }
 
+/// Separate gate waits from the existing combined queue timer. Borrow the
+/// operation so instrumentation does not add an owner or extend its lifetime.
+/// Dropping a pending acquisition records its elapsed wait as well.
+struct FetchAdmissionTimer<'a> {
+    start: Instant,
+    path: &'static str,
+    operation: Option<&'a ReadOperation>,
+    bytes: bool,
+}
+impl Drop for FetchAdmissionTimer<'_> {
+    fn drop(&mut self) {
+        let elapsed = micros(self.start);
+        let phase = if self.bytes {
+            "byte_queue"
+        } else {
+            "count_queue"
+        };
+        config::metrics::VIX_FETCH_TIME_MICROS_TOTAL
+            .with_label_values(&[self.path, phase])
+            .inc_by(elapsed);
+        if let Some(operation) = self.operation {
+            operation.record(|stats| {
+                let counter = if self.bytes {
+                    &stats.byte_queue_micros
+                } else {
+                    &stats.count_queue_micros
+                };
+                counter.fetch_add(elapsed, Ordering::Relaxed);
+            });
+        }
+    }
+}
+
 /// Coalesce using the object_store gap policy, but never create a physical
 /// request larger than the process byte ceiling. The resulting total is the
 /// reservation: slices retain their coalesced owner, including gap bytes.
@@ -638,7 +742,18 @@ async fn physical_fetch(
         active: false,
     };
     let count = match FETCH_COUNT.as_ref() {
-        Some(gate) => Some(Arc::clone(gate).acquire_owned().await?),
+        Some(gate) => {
+            let gate = Arc::clone(gate);
+            let admission = FetchAdmissionTimer {
+                start: Instant::now(),
+                path,
+                operation: operation.map(Arc::as_ref),
+                bytes: false,
+            };
+            let permit = gate.acquire_owned().await?;
+            drop(admission);
+            Some(permit)
+        }
         None => None,
     };
     drop(queue);
@@ -690,7 +805,15 @@ fn spawn_ranges(
                 operation: operation.clone(),
                 active: false,
             };
-            let reservation = Arc::new(FETCH_BYTES.acquire(bytes).await?);
+            let admission = FetchAdmissionTimer {
+                start: Instant::now(),
+                path,
+                operation: operation.as_deref(),
+                bytes: true,
+            };
+            let permit = FETCH_BYTES.acquire(bytes).await?;
+            drop(admission);
+            let reservation = Arc::new(permit);
             drop(queue);
             // Each coalesced backend request gets its own count permit. There is
             // no outer batch permit that could deadlock subordinate admission.

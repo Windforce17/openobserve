@@ -15,23 +15,24 @@
 
 use std::sync::Arc;
 
-use arrow_schema::{SchemaRef, SortOptions};
+use arrow_schema::SchemaRef;
 use config::{TIMESTAMP_COL_NAME, get_config};
 use datafusion::{
-    catalog::{Session, TableProvider, memory::DataSourceExec},
+    catalog::{Session, TableProvider},
     common::{ColumnStatistics, DataFusionError, Result},
     datasource::{
         TableType,
         listing::{ListingTable, ListingTableConfig},
-        physical_plan::{FileGroup, FileScanConfig},
+        physical_plan::{FileGroup, FileScanConfig, FileScanConfigBuilder},
+        table_schema::TableSchema,
     },
     execution::cache::cache_manager::FileStatisticsCache,
     logical_expr::TableProviderFilterPushDown,
-    physical_expr::{LexOrdering, PhysicalSortExpr},
-    physical_plan::{ExecutionPlan, expressions::Column, union::UnionExec},
+    physical_expr_adapter::PhysicalExprAdapterFactory,
+    physical_plan::{ExecutionPlan, union::UnionExec},
     prelude::Expr,
 };
-use rayon::prelude::*;
+use datafusion_datasource::compute_all_files_statistics;
 use tonic::async_trait;
 
 use crate::{
@@ -41,8 +42,8 @@ use crate::{
 
 pub struct ListingTableAdapter {
     listing_table: ListingTable,
-    listing_config: ListingTableConfig,
-    statistics_cache: Option<Arc<dyn FileStatisticsCache>>,
+    file_schema: SchemaRef,
+    expr_adapter: Option<Arc<dyn PhysicalExprAdapterFactory>>,
     trace_id: String,
     index_condition: Option<IndexCondition>,
     fst_fields: Vec<String>,
@@ -53,8 +54,7 @@ impl std::fmt::Debug for ListingTableAdapter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ListingTableAdapter")
             .field("listing_table", &self.listing_table)
-            .field("listing_config", &self.listing_config)
-            .field("has_statistics_cache", &self.statistics_cache.is_some())
+            .field("file_schema", &self.file_schema)
             .field("trace_id", &self.trace_id)
             .field("index_condition", &self.index_condition)
             .field("fst_fields", &self.fst_fields)
@@ -70,12 +70,16 @@ impl ListingTableAdapter {
         index_condition: Option<IndexCondition>,
         fst_fields: Vec<String>,
         timestamp_filter: Option<(i64, i64)>,
+        expr_adapter: Option<Arc<dyn PhysicalExprAdapterFactory>>,
     ) -> Result<Self> {
-        let listing_table = ListingTable::try_new(config.clone())?;
+        let file_schema = config.file_schema.clone().ok_or_else(|| {
+            DataFusionError::Internal("ListingTableAdapter requires a file schema".to_string())
+        })?;
+        let listing_table = ListingTable::try_new(config)?;
         Ok(Self {
             listing_table,
-            listing_config: config,
-            statistics_cache: None,
+            file_schema,
+            expr_adapter,
             trace_id,
             index_condition,
             fst_fields,
@@ -84,7 +88,6 @@ impl ListingTableAdapter {
     }
 
     pub fn with_cache(mut self, cache: Option<Arc<dyn FileStatisticsCache>>) -> Self {
-        self.statistics_cache = cache.clone();
         self.listing_table = self.listing_table.with_cache(cache);
         self
     }
@@ -121,99 +124,106 @@ impl TableProvider for ListingTableAdapter {
                 None
             };
 
-        let target_partitions = self.listing_table.options().target_partitions.max(1);
-        let Some(index_condition) = index_condition else {
-            // nothing to re-apply: one branch over every file
-            let (plan, _) = self
-                .scan_branch(
+        // Enumerate once, with no raw-row LIMIT shortcut: membership, access
+        // plans, residuals and ordered winners have not been established yet.
+        let filter_refs = filters.iter().collect::<Vec<_>>();
+        let partition_filters = self
+            .listing_table
+            .supports_filters_pushdown(&filter_refs)?
+            .into_iter()
+            .zip(filters)
+            .filter_map(|(pushdown, filter)| {
+                matches!(pushdown, TableProviderFilterPushDown::Exact).then(|| filter.clone())
+            })
+            .collect::<Vec<_>>();
+        let listed = self
+            .listing_table
+            .list_files_for_scan(state, &partition_filters, None)
+            .await?;
+        let source_stats_idx = self.schema().index_of(vortex_index::SOURCE_COL_NAME).ok();
+        let mut exact_groups = Vec::new();
+        let mut fallback_groups = Vec::new();
+        let mut exact_files = 0;
+        let mut fallback_files = 0;
+        for group in listed.file_groups {
+            let mut exact = Vec::new();
+            let mut fallback = Vec::new();
+            for mut file in group.into_inner() {
+                let is_exact = generate_access_plan(&mut file);
+                // A synthesized parquet _source is not all-NULL even when
+                // its physical file schema lacks the column.
+                if let (Some(idx), Some(stats)) = (source_stats_idx, &mut file.statistics)
+                    && idx < stats.column_statistics.len()
+                {
+                    let stats = Arc::make_mut(stats);
+                    stats.column_statistics[idx] = ColumnStatistics::new_unknown();
+                }
+                if index_condition.is_none() || is_exact {
+                    exact.push(file);
+                    exact_files += 1;
+                } else {
+                    fallback.push(file);
+                    fallback_files += 1;
+                }
+            }
+            if !exact.is_empty() {
+                exact_groups.push(FileGroup::new(exact));
+            }
+            if !fallback.is_empty() {
+                fallback_groups.push(FileGroup::new(fallback));
+            }
+        }
+        let target = self.listing_table.options().target_partitions.max(1);
+        let (exact_target, fallback_target) =
+            allocate_branch_partitions(exact_files, fallback_files, target);
+        // Access/residual/time filters run below the outer SQL limit. Passing
+        // it to either unfiltered source could stop before a qualifying row.
+        let scan_limit = if self.index_condition.is_none()
+            && self.timestamp_filter.is_none()
+            && filters.is_empty()
+            && self.listing_table.options().file_sort_order.is_empty()
+            && exact_groups.iter().flat_map(|g| g.iter()).all(|file| {
+                file.statistics
+                    .as_ref()
+                    .is_some_and(|stats| stats.num_rows.is_exact() == Some(true))
+            }) {
+            limit
+        } else {
+            None
+        };
+        let mut plans = Vec::with_capacity(2);
+        if exact_files > 0 {
+            plans.push(
+                self.scan_branch(
                     state,
                     projection,
-                    filters,
-                    limit,
+                    scan_limit,
                     None,
-                    None,
-                    target_partitions,
+                    exact_groups,
+                    listed.grouped_by_partition,
+                    exact_target,
                 )
-                .await?;
-            return match plan {
-                Some(plan) => Ok(plan),
-                None => empty_scan(self.schema(), projection),
-            };
-        };
-
-        // PER-FILE fallback blast radius: files the index answered EXACTLY
-        // carry a row selection whose rows already satisfy the condition —
-        // they must not pay the re-applied filter. Only files WITHOUT an
-        // exact selection re-apply the condition.
-        let (exact, exact_files) = self
-            .scan_branch(
-                state,
-                projection,
-                filters,
-                limit,
-                None,
-                Some(true),
-                target_partitions,
-            )
-            .await?;
-        let (fallback, fallback_files) = self
-            .scan_branch(
-                state,
-                projection,
-                filters,
-                limit,
-                Some(index_condition),
-                Some(false),
-                target_partitions,
-            )
-            .await?;
-        match (exact, fallback) {
-            (Some(_), Some(_)) => {
-                let (exact_target, fallback_target) =
-                    allocate_branch_partitions(exact_files, fallback_files, target_partitions);
-                // Re-plan only mixed scans with their final shares. Listing
-                // is metadata-only here; avoiding 2x scan parallelism is
-                // worth the duplicate planning pass.
-                let (exact, _) = self
-                    .scan_branch(
-                        state,
-                        projection,
-                        filters,
-                        limit,
-                        None,
-                        Some(true),
-                        exact_target,
-                    )
-                    .await?;
-                let (fallback, _) = self
-                    .scan_branch(
-                        state,
-                        projection,
-                        filters,
-                        limit,
-                        Some(index_condition),
-                        Some(false),
-                        fallback_target,
-                    )
-                    .await?;
-                let exact = exact.ok_or_else(|| {
-                    DataFusionError::Internal(
-                        "exact scan branch disappeared during partition allocation".to_string(),
-                    )
-                })?;
-                let fallback = fallback.ok_or_else(|| {
-                    DataFusionError::Internal(
-                        "fallback scan branch disappeared during partition allocation".to_string(),
-                    )
-                })?;
-                log::info!(
-                    "[trace_id {}] [SCAN:NARROW] split scan: exact branch ({exact_files} files/{exact_target} partitions) + fallback branch ({fallback_files} files/{fallback_target} partitions; re-applied filter on fallback only",
-                    self.trace_id
-                );
-                Ok(UnionExec::try_new(vec![exact, fallback])?)
-            }
-            (Some(plan), None) | (None, Some(plan)) => Ok(plan),
-            (None, None) => empty_scan(self.schema(), projection),
+                .await?,
+            );
+        }
+        if fallback_files > 0 {
+            plans.push(
+                self.scan_branch(
+                    state,
+                    projection,
+                    None,
+                    index_condition,
+                    fallback_groups,
+                    listed.grouped_by_partition,
+                    fallback_target,
+                )
+                .await?,
+            );
+        }
+        match plans.len() {
+            0 => empty_scan(self.schema(), projection),
+            1 => Ok(plans.pop().unwrap()),
+            _ => Ok(UnionExec::try_new(plans)?),
         }
     }
 
@@ -246,20 +256,19 @@ fn allocate_branch_partitions(
 }
 
 impl ListingTableAdapter {
-    /// One scan branch over the files matched by `keep_exact_selection`
-    /// (`None` = every file), prepared with its assigned partition target.
-    /// Returns the plan and actual number of kept files.
+    /// Construct one nonempty branch from its final membership and partition
+    /// share. Listing, selection attachment and branch discovery are complete.
     #[allow(clippy::too_many_arguments)]
     async fn scan_branch(
         &self,
         state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        filters: &[Expr],
         limit: Option<usize>,
         index_condition: Option<&IndexCondition>,
-        keep_exact_selection: Option<bool>,
+        file_groups: Vec<FileGroup>,
+        grouped_by_partition: bool,
         target_partitions: usize,
-    ) -> Result<(Option<Arc<dyn ExecutionPlan>>, usize)> {
+    ) -> Result<Arc<dyn ExecutionPlan>> {
         let (parquet_projection, filter_projection) =
             if index_condition.is_some() || self.timestamp_filter.is_some() {
                 // get the projection for the filter
@@ -278,6 +287,8 @@ impl ListingTableAdapter {
                 // add requested projection columns
                 if let Some(v) = projection.as_ref() {
                     filter_projection.extend(v.iter().copied());
+                } else {
+                    filter_projection.extend(0..self.schema().fields().len());
                 }
                 filter_projection.sort();
                 filter_projection.dedup();
@@ -307,33 +318,97 @@ impl ListingTableAdapter {
                 filter_projection.map(|v| v.len()).unwrap_or(0)
             );
         }
-        let target_partitions = target_partitions.max(1);
-        let mut config = self.listing_config.clone();
-        let options = config.options.take().ok_or_else(|| {
-            DataFusionError::Internal(
-                "ListingTableAdapter requires configured listing options".to_string(),
+        let options = self.listing_table.options();
+        let mut file_groups = if grouped_by_partition {
+            file_groups
+        } else {
+            FileGroup::new(
+                file_groups
+                    .into_iter()
+                    .flat_map(|g| g.into_inner())
+                    .collect(),
             )
-        })?;
-        config.options = Some(options.with_target_partitions(target_partitions));
-        let listing_table =
-            ListingTable::try_new(config)?.with_cache(self.statistics_cache.clone());
-        let parquet_exec = listing_table
-            .scan(state, parquet_projection, filters, limit)
-            .await?;
-
-        let order_by_time_desc = !listing_table.options().file_sort_order.is_empty();
-        let reverse = order_by_time_desc && parquet_exec.properties().output_ordering().is_none();
-        let (parquet_exec, kept_files) = prepare_file_scan_groups(
-            &self.trace_id,
-            state,
-            parquet_exec,
-            reverse,
-            target_partitions,
-            keep_exact_selection,
-        );
-        let kept_files = kept_files.unwrap_or(1);
-        if keep_exact_selection.is_some() && kept_files == 0 {
-            return Ok((None, 0));
+            .split_files(target_partitions)
+        };
+        let output_ordering = self
+            .listing_table
+            .try_create_output_ordering(state.execution_props(), &file_groups)?;
+        let declared_order = !options.file_sort_order.is_empty();
+        if (declared_order
+            || state
+                .config_options()
+                .execution
+                .split_file_groups_by_statistics)
+            && let Some(ordering) = output_ordering.first()
+        {
+            match FileScanConfig::split_groups_by_statistics_with_target_partitions(
+                &self.schema(),
+                &file_groups,
+                ordering,
+                target_partitions,
+            ) {
+                Ok(groups) => file_groups = groups,
+                Err(error) if declared_order => {
+                    log::warn!(
+                        "[trace_id {}] failed to split file groups by statistics: {error}; reversing file groups",
+                        self.trace_id
+                    );
+                    file_groups = file_groups
+                        .into_iter()
+                        .map(|group| {
+                            let mut files = group.into_inner();
+                            files.reverse();
+                            FileGroup::new(files)
+                        })
+                        .collect();
+                }
+                Err(error) => log::debug!("failed to split file groups by statistics: {error}"),
+            }
+        }
+        let (file_groups, statistics) =
+            compute_all_files_statistics(file_groups, self.schema(), options.collect_stat, false)?;
+        let table_partition_cols = options
+            .table_partition_cols
+            .iter()
+            .map(|(name, _)| {
+                self.schema()
+                    .field_with_name(name)
+                    .map(|f| Arc::new(f.clone()))
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let file_source = options.format.file_source(TableSchema::new(
+            Arc::clone(&self.file_schema),
+            table_partition_cols,
+        ));
+        let object_store_url = self
+            .listing_table
+            .table_paths()
+            .first()
+            .ok_or_else(|| {
+                DataFusionError::Internal("listed files have no object store".to_string())
+            })?
+            .object_store();
+        let conf = FileScanConfigBuilder::new(object_store_url, file_source)
+            .with_file_groups(file_groups)
+            .with_statistics(statistics)
+            .with_constraints(
+                self.listing_table
+                    .constraints()
+                    .cloned()
+                    .unwrap_or_default(),
+            )
+            .with_projection_indices(parquet_projection.cloned())?
+            .with_limit(limit)
+            .with_output_ordering(output_ordering)
+            .with_expr_adapter(self.expr_adapter.clone())
+            .with_partitioned_by_file_group(grouped_by_partition)
+            .build();
+        let mut parquet_exec = options.format.create_physical_plan(state, conf).await?;
+        if !declared_order
+            && let Some(repartitioned) =
+                parquet_exec.repartitioned(target_partitions, state.config_options())?
+        {
+            parquet_exec = repartitioned;
         }
 
         let plan = apply_combined_filter(
@@ -345,7 +420,7 @@ impl ListingTableAdapter {
             filter_projection,
         )?;
 
-        Ok((Some(plan), kept_files))
+        Ok(plan)
     }
 }
 
@@ -361,160 +436,6 @@ fn empty_scan(
     )))
 }
 
-/// Rebuild a `DataSourceExec`'s file groups for the scan: re-split (or
-/// reverse) groups for `_timestamp` DESC output when `reverse` is set,
-/// attach the per-file access plans (index row selections) via
-/// [`generate_access_plan`], and repartition to `target_partitions`.
-fn prepare_file_scan_groups(
-    trace_id: &str,
-    state: &dyn Session,
-    plan: Arc<dyn ExecutionPlan>,
-    reverse: bool,
-    target_partitions: usize,
-    keep_exact_selection: Option<bool>,
-) -> (Arc<dyn ExecutionPlan>, Option<usize>) {
-    if let Some(data_source_exec) = plan.downcast_ref::<DataSourceExec>()
-        && let Some(config) = data_source_exec
-            .data_source()
-            .downcast_ref::<FileScanConfig>()
-    {
-        let mut file_groups = config.file_groups.clone();
-        // branch split: keep only the files whose index selection exactness
-        // matches (see ListingTableAdapter::scan)
-        if let Some(want_exact) = keep_exact_selection {
-            file_groups = file_groups
-                .into_iter()
-                .map(|group| {
-                    FileGroup::new(
-                        group
-                            .into_inner()
-                            .into_iter()
-                            .filter(|file| {
-                                super::super::storage::file_list::has_exact_scan_selection(
-                                    file.path().as_ref(),
-                                ) == want_exact
-                            })
-                            .collect(),
-                    )
-                })
-                .filter(|group| !group.is_empty())
-                .collect();
-        }
-
-        // `_source` is synthesized per row for files that do not store it
-        // (WAL parquet, pre-migration storage parquet). The listing-collected
-        // per-file statistics claim that column is ALL NULL (null_count ==
-        // num_rows — the schema-evolution convention for a column missing
-        // from the file), which lets the parquet opener constant-fold the
-        // projected `_source` column to a NULL literal BEFORE the
-        // synthesizing expr adapter runs — star hits then degrade to their
-        // physical columns only (the prod "3-field hit" bug). The claim is
-        // factually wrong for a synthesized column: downgrade it to unknown
-        // so nothing folds on it. Files that really store `_source` (.vix)
-        // go through VixCoreFormat, not this adapter path.
-        let source_stats_idx = config
-            .file_source()
-            .table_schema()
-            .table_schema()
-            .index_of(vortex_index::SOURCE_COL_NAME)
-            .ok();
-
-        if reverse {
-            let schema = config.file_source().table_schema().table_schema();
-            match schema.index_of(TIMESTAMP_COL_NAME) {
-                Ok(index) => {
-                    let sort_order = LexOrdering::new(vec![PhysicalSortExpr {
-                        expr: Arc::new(Column::new(TIMESTAMP_COL_NAME, index)),
-                        options: SortOptions {
-                            descending: true,
-                            nulls_first: false,
-                        },
-                    }]);
-                    if let Some(sort_order) = sort_order {
-                        match FileScanConfig::split_groups_by_statistics_with_target_partitions(
-                            schema,
-                            &file_groups,
-                            &sort_order,
-                            target_partitions,
-                        ) {
-                            Ok(new_file_groups) => {
-                                file_groups = new_file_groups;
-                            }
-                            Err(e) => {
-                                log::warn!(
-                                    "[trace_id {trace_id}] failed to split file groups by statistics: {e}, falling back to reversing file groups"
-                                );
-                                file_groups = file_groups
-                                    .into_iter()
-                                    .map(|file_group| {
-                                        let mut files = file_group.into_inner();
-                                        files.reverse();
-                                        FileGroup::new(files)
-                                    })
-                                    .collect();
-                            }
-                        }
-                    }
-                }
-                Err(_) => {
-                    log::warn!(
-                        "[trace_id {trace_id}] _timestamp column not found in schema, skipping split_groups_by_statistics"
-                    );
-                }
-            }
-        }
-
-        let start = std::time::Instant::now();
-        let new_file_groups: Vec<_> = file_groups
-            .into_par_iter()
-            .map(|file_group| {
-                let group: Vec<_> = file_group
-                    .into_inner()
-                    .into_iter()
-                    .map(|mut file| {
-                        generate_access_plan(&mut file);
-                        if let (Some(idx), Some(stats)) =
-                            (source_stats_idx, file.statistics.as_ref())
-                            && stats.column_statistics.len() > idx
-                        {
-                            let mut stats = stats.as_ref().clone();
-                            stats.column_statistics[idx] = ColumnStatistics::new_unknown();
-                            file.statistics = Some(Arc::new(stats));
-                        }
-                        file
-                    })
-                    .collect();
-                // TODO: check if we need statistics for FileGroup
-                // the statistics in FileGroup is used in ExecutionPlan::partition_statistics
-                FileGroup::new(group)
-            })
-            .collect();
-
-        let groups_len = new_file_groups.len();
-        let max_group_len = new_file_groups.iter().map(|g| g.len()).max().unwrap_or(0);
-        let files_nums = new_file_groups.iter().map(|g| g.len()).sum::<usize>();
-
-        log::info!(
-            "[trace_id {trace_id}] listing table adapter, target_partitions: {target_partitions}, file groups: {groups_len}, max group len: {max_group_len}, total files: {files_nums}, took: {} ms",
-            start.elapsed().as_millis() as usize,
-        );
-
-        let mut config = config.clone();
-        config.file_groups = new_file_groups;
-        let mut plan = Arc::new(DataSourceExec::new(Arc::new(config))) as Arc<dyn ExecutionPlan>;
-        // skip repartitioning when `reverse` is true, becuase it is already have many groups
-        if !reverse
-            && let Ok(Some(repartition_plan)) =
-                plan.repartitioned(target_partitions, state.config_options())
-        {
-            plan = repartition_plan;
-        }
-        return (plan, Some(files_nums));
-    }
-    // not a plain file scan: no per-file view, report the count as unknown
-    (plan, None)
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -525,14 +446,10 @@ mod tests {
     };
     use arrow_schema::{DataType, Field, Schema};
     use config::{TIMESTAMP_COL_NAME, meta::stream::FileKey};
-    use datafusion::{
-        physical_plan::{ExecutionPlan, collect},
-        prelude::SessionContext,
-    };
+    use datafusion::{physical_plan::collect, prelude::SessionContext};
     use parquet::arrow::ArrowWriter;
     use vortex_index::SOURCE_COL_NAME;
 
-    use super::{UnionExec, allocate_branch_partitions};
     use crate::{
         datafusion::exec::{TableBuilder, create_runtime_env, create_session_config},
         index::{Condition, IndexCondition},
@@ -668,6 +585,7 @@ mod tests {
         let file_schema = Arc::new(Schema::new(vec![
             Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
             Field::new("svc", DataType::Utf8, true),
+            Field::new("code", DataType::Int64, true),
         ]));
         let write_file = |rel: &str, svcs: [&str; 3]| {
             let batch = RecordBatch::try_new(
@@ -675,6 +593,7 @@ mod tests {
                 vec![
                     Arc::new(Int64Array::from(vec![3000i64, 2000, 1000])),
                     Arc::new(StringArray::from(svcs.to_vec())),
+                    Arc::new(Int64Array::from(vec![30i64, 20, 10])),
                 ],
             )
             .unwrap();
@@ -710,9 +629,26 @@ mod tests {
 
         // fallback file: no selection (the index skipped it) — the
         // re-applied condition must drop its non-matching rows
-        let fallback_file = write_file(
+        let mut fallback_file = write_file(
             "files/default/logs/split_scan_test/0/2026/01/01/00/fallback.parquet",
-            ["nexus", "other", "other"],
+            ["other", "nexus", "other"],
+        );
+        // The object exists on the real WAL store, but its registration has
+        // no trusted size/count. Listing must resolve its size rather than
+        // silently dropping it before the footer/scan can produce row 2000.
+        fallback_file.meta.compressed_size = 0;
+        fallback_file.meta.records = 0;
+        let mut partial_file = write_file(
+            "files/default/logs/split_scan_test/0/2026/01/01/00/partial.parquet",
+            ["nexus", "other", "nexus"],
+        );
+        partial_file.with_selection(
+            FileSelection::Rows(Arc::new(RowIdBitmap::from_row_ids(3, [1u32, 2]))),
+            None,
+        );
+        let empty_file = write_file(
+            "files/default/logs/split_scan_test/0/2026/01/01/00/first.parquet",
+            ["other", "other", "other"],
         );
 
         let mut index_condition = IndexCondition::new();
@@ -726,10 +662,11 @@ mod tests {
         };
         let tables = TableBuilder::new()
             .index_condition(Some(index_condition))
+            .timestamp_filter((1000, 3000))
             .fst_fields(vec![])
             .build(
                 session,
-                vec![exact_file, fallback_file],
+                vec![empty_file, exact_file, partial_file, fallback_file],
                 file_schema.clone(),
             )
             .await
@@ -742,47 +679,46 @@ mod tests {
             Arc::new(runtime),
         );
 
-        let projection = vec![file_schema.index_of(TIMESTAMP_COL_NAME).unwrap()];
+        // Reordered same-typed fields and duplicate output slots must not
+        // inherit the sorted/deduplicated physical fetch projection.
+        let projection = vec![2, 0, 2];
         let plan = tables[0]
-            .scan(&ctx.state(), Some(&projection), &[], None)
+            .scan(&ctx.state(), Some(&projection), &[], Some(1))
             .await
             .unwrap();
-        let union = plan.downcast_ref::<UnionExec>().expect("mixed scan union");
-        let children = union.children();
-        assert_eq!(children.len(), 2);
-        assert_eq!(
-            children
-                .iter()
-                .map(|child| { child.properties().output_partitioning().partition_count() })
-                .sum::<usize>(),
-            2,
-            "exact and fallback branches must share the configured target"
-        );
-
-        let display = datafusion::physical_plan::displayable(plan.as_ref())
-            .indent(false)
-            .to_string();
-        assert!(
-            display.contains("UnionExec"),
-            "exact + fallback files must split into a union: {display}"
-        );
 
         let batches = collect(plan, ctx.task_ctx()).await.unwrap();
-        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-        // exact file contributes its 2 selected rows (no re-filter), the
-        // fallback file re-filters down to its 1 nexus row
-        assert_eq!(rows, 3, "2 exact-selection rows + 1 re-filtered row");
-    }
+        let mut rows = Vec::new();
+        for batch in batches {
+            assert_eq!(
+                batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().as_str())
+                    .collect::<Vec<_>>(),
+                vec!["code", TIMESTAMP_COL_NAME, "code"]
+            );
+            let cols = batch
+                .columns()
+                .iter()
+                .map(|column| column.as_any().downcast_ref::<Int64Array>().unwrap())
+                .collect::<Vec<_>>();
+            for row in 0..batch.num_rows() {
+                rows.push((cols[0].value(row), cols[1].value(row), cols[2].value(row)));
+            }
+        }
+        rows.sort_unstable();
+        assert_eq!(rows, vec![(10, 1000, 10), (10, 1000, 10), (20, 2000, 20)]);
 
-    #[test]
-    fn branch_partition_allocation_is_bounded_and_work_conserving() {
-        assert_eq!(allocate_branch_partitions(8, 2, 10), (8, 2));
-        assert_eq!(allocate_branch_partitions(9, 1, 4), (3, 1));
-        assert_eq!(allocate_branch_partitions(1, 9, 4), (1, 3));
-        assert_eq!(allocate_branch_partitions(0, 7, 4), (0, 4));
-        assert_eq!(allocate_branch_partitions(7, 0, 4), (4, 0));
-        // Two nonempty physical branches each require at least one
-        // partition; target=1 therefore uses the unavoidable 1+1 minimum.
-        assert_eq!(allocate_branch_partitions(1, 1, 1), (1, 1));
+        let plan = tables[0].scan(&ctx.state(), None, &[], None).await.unwrap();
+        assert_eq!(
+            plan.schema(),
+            file_schema,
+            "None projects every table column"
+        );
+        let batches = collect(plan, ctx.task_ctx()).await.unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
+        crate::datafusion::storage::file_list::clear("split-scan-test");
     }
 }

@@ -15,6 +15,7 @@
 
 use std::sync::Arc;
 
+use bytes::Bytes;
 use config::{
     datafusion::request::{FlightSearchRequest, Request},
     meta::{cluster::NodeInfo, sql::TableReferenceExt},
@@ -26,8 +27,8 @@ use proto::cluster_rpc::{IndexInfo, KvItem, QueryIdentifier, SearchInfo, SuperCl
 #[derive(Debug, Clone)]
 pub struct RemoteScanNodes {
     pub req: Request,
-    pub nodes: Vec<Arc<dyn NodeInfo>>,
-    pub file_id_lists: HashMap<TableReference, Vec<Vec<i64>>>,
+    pub nodes: Arc<[Arc<dyn NodeInfo>]>,
+    pub file_id_lists: HashMap<TableReference, Arc<[Vec<i64>]>>,
     pub equal_keys: HashMap<TableReference, Vec<KvItem>>,
     pub is_leader: bool, // for super cluster
     pub opentelemetry_context: opentelemetry::Context,
@@ -47,8 +48,11 @@ impl RemoteScanNodes {
     ) -> Self {
         Self {
             req,
-            nodes,
-            file_id_lists,
+            nodes: nodes.into(),
+            file_id_lists: file_id_lists
+                .into_iter()
+                .map(|(table, partitions)| (table, partitions.into()))
+                .collect(),
             equal_keys,
             is_leader,
             opentelemetry_context,
@@ -67,12 +71,12 @@ impl RemoteScanNodes {
         };
 
         let search_infos = SearchInfos {
-            plan: vec![], // set in RemoteScanNode
+            plan: Bytes::new(), // set in RemoteScanNode
             file_id_list: self
                 .file_id_lists
                 .get(table_name)
-                .unwrap_or(&vec![])
-                .clone(),
+                .cloned()
+                .unwrap_or_default(),
             // Never widen this to a histogram bucket boundary: the follower
             // scan window must equal the requested range or bucket sums can
             // include records that count(*) excludes.
@@ -112,7 +116,7 @@ impl RemoteScanNodes {
 
 #[derive(Debug, Clone, Default)]
 pub struct RemoteScanNode {
-    pub nodes: Vec<Arc<dyn NodeInfo>>,
+    pub nodes: Arc<[Arc<dyn NodeInfo>]>,
     pub opentelemetry_context: opentelemetry::Context,
     pub query_identifier: QueryIdentifier,
     pub search_infos: SearchInfos,
@@ -131,17 +135,13 @@ impl RemoteScanNode {
     }
 
     pub fn is_file_list_empty(&self, partition: usize) -> bool {
-        let file_id_list = if self.search_infos.file_id_list.is_empty() {
-            vec![]
-        } else {
-            self.search_infos.file_id_list[partition].clone()
-        };
-        file_id_list.is_empty()
+        self.search_infos.file_id_list.is_empty()
+            || self.search_infos.file_id_list[partition].is_empty()
     }
 
     // used in RemoteScanExec
     // need to set plan before send to follow
-    pub fn set_plan(&mut self, plan: Vec<u8>) {
+    pub fn set_plan(&mut self, plan: Bytes) {
         self.search_infos.plan = plan;
     }
 
@@ -161,7 +161,7 @@ impl RemoteScanNode {
         opentelemetry_context: opentelemetry::Context,
     ) -> Self {
         Self {
-            nodes,
+            nodes: nodes.into(),
             opentelemetry_context,
             query_identifier: request.query_identifier.clone(),
             search_infos,
@@ -173,8 +173,8 @@ impl RemoteScanNode {
 
 #[derive(Debug, Clone, Default)]
 pub struct SearchInfos {
-    pub plan: Vec<u8>,
-    pub file_id_list: Vec<Vec<i64>>,
+    pub plan: Bytes,
+    pub file_id_list: Arc<[Vec<i64>]>,
     pub start_time: i64,
     pub end_time: i64,
     pub timeout: u64,
@@ -193,7 +193,7 @@ impl SearchInfos {
             self.file_id_list[partition].clone()
         };
         SearchInfo {
-            plan: self.plan.clone(),
+            plan: self.plan.to_vec(),
             file_id_list,
             start_time: self.start_time,
             end_time: self.end_time,
@@ -220,14 +220,14 @@ mod tests {
     #[test]
     fn test_is_file_list_empty_false_when_partition_has_files() {
         let mut node = RemoteScanNode::default();
-        node.search_infos.file_id_list = vec![vec![1, 2, 3]];
+        node.search_infos.file_id_list = vec![vec![1, 2, 3]].into();
         assert!(!node.is_file_list_empty(0));
     }
 
     #[test]
     fn test_is_file_list_empty_partition_with_empty_list() {
         let mut node = RemoteScanNode::default();
-        node.search_infos.file_id_list = vec![vec![1, 2], vec![]];
+        node.search_infos.file_id_list = vec![vec![1, 2], vec![]].into();
         assert!(!node.is_file_list_empty(0));
         assert!(node.is_file_list_empty(1));
     }
@@ -256,67 +256,70 @@ mod tests {
     }
 
     #[test]
-    fn test_search_infos_get_search_info_empty_file_list() {
-        let infos = SearchInfos {
-            file_id_list: vec![],
-            start_time: 100,
-            end_time: 200,
-            ..Default::default()
-        };
-        let info = infos.get_search_info(0);
-        assert!(info.file_id_list.is_empty());
-        assert_eq!(info.start_time, 100);
-        assert_eq!(info.end_time, 200);
-    }
+    fn dispatch_requests_keep_table_partition_assignment_and_private_overrides() {
+        let first = TableReference::from("first");
+        let second = TableReference::from("second");
+        let nodes = RemoteScanNodes::new(
+            Request::default(),
+            vec![],
+            HashMap::from([
+                (first.clone(), vec![vec![10, -20, 10], vec![], vec![-30]]),
+                (second.clone(), vec![vec![40], vec![50], vec![]]),
+            ]),
+            HashMap::new(),
+            false,
+            opentelemetry::Context::new(),
+            None,
+        );
+        let mut first_node = nodes.get_remote_node(&first);
+        first_node.set_plan(Bytes::from_static(&[1, 2, 3]));
+        let original = first_node.get_flight_search_request(0);
+        let mut dispatched = first_node.clone().get_flight_search_request(0);
+        dispatched.set_job_id("job-one".to_string());
+        dispatched.set_partition(2);
+        dispatched.query_identifier.enrich_mode = true;
+        dispatched.search_info.plan.clear();
+        dispatched.search_info.file_id_list.clear();
+        dispatched.search_info.timeout = 15;
+        dispatched.search_info.is_analyze = true;
+        dispatched
+            .index_info
+            .equal_keys
+            .push(KvItem::new("field", "value"));
+        dispatched.super_cluster_info.is_super_cluster = true;
 
-    #[test]
-    fn test_remote_scan_node_set_plan() {
-        let mut node = RemoteScanNode::default();
-        assert!(node.search_infos.plan.is_empty());
-        node.set_plan(vec![1, 2, 3]);
-        assert_eq!(node.search_infos.plan, vec![1u8, 2, 3]);
-    }
-
-    #[test]
-    fn test_get_flight_search_request_uses_query_identifier() {
-        let mut node = RemoteScanNode::default();
-        node.query_identifier.trace_id = "trace-abc".to_string();
-        node.search_infos.start_time = 100;
-        node.search_infos.end_time = 200;
-        let req = node.get_flight_search_request(0);
-        assert_eq!(req.query_identifier.trace_id, "trace-abc");
-    }
-
-    #[test]
-    fn test_get_flight_search_request_search_info_times() {
-        let mut node = RemoteScanNode::default();
-        node.search_infos.start_time = 500;
-        node.search_infos.end_time = 1000;
-        let req = node.get_flight_search_request(0);
-        assert_eq!(req.search_info.start_time, 500);
-        assert_eq!(req.search_info.end_time, 1000);
-    }
-
-    #[test]
-    fn test_search_infos_get_search_info_with_files() {
-        let infos = SearchInfos {
-            plan: vec![1, 2, 3],
-            file_id_list: vec![vec![10, 20, 30]],
-            start_time: 1000,
-            end_time: 2000,
-            timeout: 30,
-            use_cache: true,
-            histogram_interval: 60,
-            is_analyze: false,
-            ..Default::default()
-        };
-        let info = infos.get_search_info(0);
-        assert_eq!(info.plan, vec![1u8, 2, 3]);
-        assert_eq!(info.file_id_list, vec![10i64, 20, 30]);
-        assert_eq!(info.start_time, 1000);
-        assert_eq!(info.end_time, 2000);
-        assert_eq!(info.timeout, 30);
-        assert!(info.use_cache);
-        assert_eq!(info.histogram_interval, 60);
+        let retained = first_node.get_flight_search_request(0);
+        assert_eq!(retained.query_identifier, original.query_identifier);
+        assert_eq!(retained.search_info, original.search_info);
+        assert_eq!(retained.index_info, original.index_info);
+        assert_eq!(retained.super_cluster_info, original.super_cluster_info);
+        assert_eq!(original.search_info.file_id_list, vec![10, -20, 10]);
+        assert!(
+            first_node
+                .get_flight_search_request(1)
+                .search_info
+                .file_id_list
+                .is_empty()
+        );
+        assert_eq!(
+            first_node
+                .get_flight_search_request(2)
+                .search_info
+                .file_id_list,
+            vec![-30]
+        );
+        assert_eq!(
+            nodes
+                .get_remote_node(&second)
+                .get_flight_search_request(1)
+                .search_info
+                .file_id_list,
+            vec![50]
+        );
+        assert!(
+            nodes
+                .get_remote_node(&TableReference::from("absent"))
+                .is_file_list_empty(0)
+        );
     }
 }
