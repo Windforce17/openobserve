@@ -1251,7 +1251,7 @@ where
                 .files
                 .iter()
                 .all(|file| file.key.ends_with(config::FILE_EXT_VIX))
-            && indexed_trace_group_exceeds_global_rebuild_limit(
+            && indexed_group_exceeds_global_rebuild_limit(
                 batch.stream_type,
                 batch.files.iter().all(|file| file.meta.index_size > 0),
                 original_size,
@@ -1914,14 +1914,14 @@ async fn wait_for_merge_cancellation(cancel: &MergeCancellation) {
     }
 }
 #[inline]
-fn indexed_trace_group_exceeds_global_rebuild_limit(
+fn indexed_group_exceeds_global_rebuild_limit(
     stream_type: StreamType,
     all_inputs_indexed: bool,
     original_size: i64,
     compressed_size: i64,
     global_limit: i64,
 ) -> bool {
-    stream_type == StreamType::Traces
+    matches!(stream_type, StreamType::Logs | StreamType::Traces)
         && all_inputs_indexed
         && (original_size > global_limit || compressed_size > global_limit)
 }
@@ -1958,7 +1958,7 @@ async fn merge_core_group(
     let input_compressed_size = new_file_list.iter().fold(0_i64, |total, file| {
         total.saturating_add(file.meta.compressed_size)
     });
-    let exceeds_global_rebuild_limit = indexed_trace_group_exceeds_global_rebuild_limit(
+    let exceeds_global_rebuild_limit = indexed_group_exceeds_global_rebuild_limit(
         stream_type,
         all_inputs_indexed,
         new_file_meta.original_size,
@@ -1993,7 +1993,7 @@ async fn merge_core_group(
     }
     if force_rebuild && exceeds_global_rebuild_limit {
         return Err(anyhow::anyhow!(
-            "[COMPACTOR:WORKER:{thread_id}] refusing oversized indexed trace rebuild after \
+            "[COMPACTOR:WORKER:{thread_id}] refusing oversized indexed log/trace rebuild after \
              sidecar-only healing required a docs rewrite: inputs={}, original_size={}, \
              compressed_size={}, global_rebuild_limit={}",
             new_file_list.len(),
@@ -2054,7 +2054,7 @@ async fn merge_core_group(
         && new_file_list.len() > 1
         && new_file_meta.original_size < defer_below_bytes
         && new_file_list.iter().all(|f| f.meta.index_size == 0);
-    // The trace-only enlarged target is safe only on the indexed merge path.
+    // The enlarged log/trace target is safe only on the indexed merge path.
     // A normal-size batch may still rebuild to heal an incompatible input;
     // a batch above the global rebuild-safe ceiling must fail rather than
     // silently multiplying rebuild memory.
@@ -3191,39 +3191,44 @@ mod tests {
 
     #[tokio::test]
     async fn index_repair_plan_defers_only_incompatible_groups() {
-        let legacy = indexed_trace_batch(0, &["legacy-a.vix", "legacy-b.vix", "late.vix"], 600);
-        let compatible = indexed_trace_batch(1, &["current-a.vix", "current-b.vix"], 600);
-        let mut probed = Vec::new();
-        let (planned, replan) = queue_required_index_repairs(
-            vec![legacy, compatible.clone()],
-            1_000,
-            |file: FileKey| {
-                probed.push(file.key.clone());
-                ready(Ok(file
-                    .key
-                    .starts_with("legacy")
-                    .then(|| "missing duration terms".to_string())))
-            },
-        )
-        .await
-        .unwrap();
-        assert!(replan);
-        assert_eq!(probed.len(), 5);
-        assert_eq!(planned.len(), 3);
-        assert_eq!(planned[0].files[0].key, "legacy-a.vix");
-        assert_eq!(planned[1].files[0].key, "legacy-b.vix");
-        assert_eq!(planned[0].files.len(), 1);
-        assert_eq!(planned[1].files.len(), 1);
-        assert_eq!(planned[2].files, compatible.files);
-        for (id, batch) in planned.iter().enumerate() {
-            assert_eq!(
-                batch.batch_id, id,
-                "repair expansion must preserve result routing"
-            );
-            assert!(
-                batch.files.iter().all(|file| file.key != "late.vix"),
-                "the dependent merge must wait for a fresh file-list snapshot"
-            );
+        for stream_type in [StreamType::Logs, StreamType::Traces] {
+            let mut legacy =
+                indexed_trace_batch(0, &["legacy-a.vix", "legacy-b.vix", "late.vix"], 600);
+            let mut compatible = indexed_trace_batch(1, &["current-a.vix", "current-b.vix"], 600);
+            legacy.stream_type = stream_type;
+            compatible.stream_type = stream_type;
+            let mut probed = Vec::new();
+            let (planned, replan) = queue_required_index_repairs(
+                vec![legacy, compatible.clone()],
+                1_000,
+                |file: FileKey| {
+                    probed.push(file.key.clone());
+                    ready(Ok(file
+                        .key
+                        .starts_with("legacy")
+                        .then(|| "missing duration terms".to_string())))
+                },
+            )
+            .await
+            .unwrap();
+            assert!(replan);
+            assert_eq!(probed.len(), 5);
+            assert_eq!(planned.len(), 3);
+            assert_eq!(planned[0].files[0].key, "legacy-a.vix");
+            assert_eq!(planned[1].files[0].key, "legacy-b.vix");
+            assert_eq!(planned[0].files.len(), 1);
+            assert_eq!(planned[1].files.len(), 1);
+            assert_eq!(planned[2].files, compatible.files);
+            for (id, batch) in planned.iter().enumerate() {
+                assert_eq!(
+                    batch.batch_id, id,
+                    "repair expansion must preserve result routing"
+                );
+                assert!(
+                    batch.files.iter().all(|file| file.key != "late.vix"),
+                    "the dependent merge must wait for a fresh file-list snapshot"
+                );
+            }
         }
     }
 
@@ -3233,7 +3238,11 @@ mod tests {
             (StreamType::Traces, 64, 600, 100, 2),
             (StreamType::Traces, 64, 100, 600, 2),
             (StreamType::Traces, 64, 500, 500, 0),
-            (StreamType::Logs, 64, 600, 600, 0),
+            (StreamType::Logs, 64, 600, 100, 2),
+            (StreamType::Logs, 64, 100, 600, 2),
+            (StreamType::Logs, 64, 500, 500, 0),
+            (StreamType::Logs, 0, 600, 600, 0),
+            (StreamType::Metrics, 64, 600, 600, 0),
             (StreamType::Traces, 0, 600, 600, 0),
         ] {
             let mut batch = indexed_trace_batch(0, &["a.vix", "b.vix"], original);
@@ -3352,112 +3361,115 @@ mod tests {
     async fn index_repair_pass_requeues_until_fresh_generation_can_merge() {
         use crate::compact::jobs_test_support::{retry_busy, setup};
         let _guard = setup().await;
-        let offset = config::utils::time::now_micros();
-        let org = format!("indexrepair{offset}");
-        let node = "index-repair-test";
-        let id = retry_busy("add repair job", || {
-            infra_file_list::add_job(&org, StreamType::Traces, "default", offset)
-        })
-        .await;
-        let claim = async || {
-            retry_busy("claim repair job", || {
-                infra_file_list::get_pending_jobs(
-                    node,
-                    1,
-                    FileListJobOrder::EnqueueOldest,
-                    Some(offset),
-                    Some(offset + 1),
-                )
+        for stream_type in [StreamType::Logs, StreamType::Traces] {
+            let offset = config::utils::time::now_micros();
+            let org = format!("indexrepair{offset}");
+            let node = "index-repair-test";
+            let id = retry_busy("add repair job", || {
+                infra_file_list::add_job(&org, stream_type, "default", offset)
             })
-            .await
-        };
-        let first = claim().await.remove(0);
-        assert_eq!(first.id, id);
-        let batch = indexed_trace_batch(0, &["legacy.vix", "late.vix"], 600);
-        let probe = |file: FileKey| {
-            ready(Ok((file.key == "legacy.vix"
-                && file.meta.index_generation == 0)
-                .then(|| "missing duration terms".to_string())))
-        };
-        let (repairs, replan) = queue_required_index_repairs(vec![batch.clone()], 1_000, probe)
+            .await;
+            let claim = async || {
+                retry_busy("claim repair job", || {
+                    infra_file_list::get_pending_jobs(
+                        node,
+                        1,
+                        FileListJobOrder::EnqueueOldest,
+                        Some(offset),
+                        Some(offset + 1),
+                    )
+                })
+                .await
+            };
+            let first = claim().await.remove(0);
+            assert_eq!(first.id, id);
+            let mut batch = indexed_trace_batch(0, &["legacy.vix", "late.vix"], 600);
+            batch.stream_type = stream_type;
+            let probe = |file: FileKey| {
+                ready(Ok((file.key == "legacy.vix"
+                    && file.meta.index_generation == 0)
+                    .then(|| "missing duration terms".to_string())))
+            };
+            let (repairs, replan) = queue_required_index_repairs(vec![batch.clone()], 1_000, probe)
+                .await
+                .unwrap();
+            assert_eq!(repairs.len(), 1);
+            assert_eq!(repairs[0].files.len(), 1);
+            // Both successful in-place publication and a sidecar CAS loser
+            // return empty events. Neither completes the dependent merge.
+            assert!(build_commit_events(Vec::new(), &[]).is_empty());
+            complete_merge_pass(
+                id,
+                node,
+                first.lease_generation,
+                replan,
+                &MergeCancellation::default(),
+            )
             .await
             .unwrap();
-        assert_eq!(repairs.len(), 1);
-        assert_eq!(repairs[0].files.len(), 1);
-        // Both successful in-place publication and a sidecar CAS loser
-        // return empty events. Neither completes the dependent merge.
-        assert!(build_commit_events(Vec::new(), &[]).is_empty());
-        complete_merge_pass(
-            id,
-            node,
-            first.lease_generation,
-            replan,
-            &MergeCancellation::default(),
-        )
-        .await
-        .unwrap();
-        let second = claim().await.remove(0);
-        assert_eq!(second.id, id);
-        assert!(second.lease_generation > first.lease_generation);
-        for stale_replan in [true, false] {
-            let stale = MergeCancellation::default();
+            let second = claim().await.remove(0);
+            assert_eq!(second.id, id);
+            assert!(second.lease_generation > first.lease_generation);
+            for stale_replan in [true, false] {
+                let stale = MergeCancellation::default();
+                assert!(
+                    complete_merge_pass(id, node, first.lease_generation, stale_replan, &stale)
+                        .await
+                        .is_err()
+                );
+                assert!(stale.is_cancelled());
+            }
+            let cancelled = MergeCancellation::default();
+            cancelled.cancel();
             assert!(
-                complete_merge_pass(id, node, first.lease_generation, stale_replan, &stale)
+                complete_merge_pass(id, node, second.lease_generation, true, &cancelled)
                     .await
                     .is_err()
             );
-            assert!(stale.is_cancelled());
-        }
-        let cancelled = MergeCancellation::default();
-        cancelled.cancel();
-        assert!(
-            complete_merge_pass(id, node, second.lease_generation, true, &cancelled)
+            assert!(
+                infra_file_list::touch_job_lease(
+                    id,
+                    node,
+                    second.lease_generation,
+                    FileListJobStatus::Running
+                )
                 .await
-                .is_err()
-        );
-        assert!(
-            infra_file_list::touch_job_lease(
+                .unwrap(),
+                "stale/cancelled completions must leave the successor running"
+            );
+
+            let mut refreshed = batch;
+            refreshed.files[0].meta.index_generation = 1;
+            let (merges, replan) = queue_required_index_repairs(vec![refreshed], 1_000, probe)
+                .await
+                .unwrap();
+            assert!(!replan);
+            assert_eq!(merges[0].files.len(), 2);
+            assert_eq!(merges[0].files[0].meta.index_generation, 1);
+            complete_merge_pass(
                 id,
                 node,
                 second.lease_generation,
-                FileListJobStatus::Running
+                replan,
+                &MergeCancellation::default(),
             )
-            .await
-            .unwrap(),
-            "stale/cancelled completions must leave the successor running"
-        );
-
-        let mut refreshed = batch;
-        refreshed.files[0].meta.index_generation = 1;
-        let (merges, replan) = queue_required_index_repairs(vec![refreshed], 1_000, probe)
             .await
             .unwrap();
-        assert!(!replan);
-        assert_eq!(merges[0].files.len(), 2);
-        assert_eq!(merges[0].files[0].meta.index_generation, 1);
-        complete_merge_pass(
-            id,
-            node,
-            second.lease_generation,
-            replan,
-            &MergeCancellation::default(),
-        )
-        .await
-        .unwrap();
-        assert!(
-            claim().await.is_empty(),
-            "the completed merge must not be requeued"
-        );
-        assert!(
-            !infra_file_list::touch_job_lease(
-                id,
-                node,
-                second.lease_generation,
-                FileListJobStatus::Running
-            )
-            .await
-            .unwrap()
-        );
+            assert!(
+                claim().await.is_empty(),
+                "the completed merge must not be requeued"
+            );
+            assert!(
+                !infra_file_list::touch_job_lease(
+                    id,
+                    node,
+                    second.lease_generation,
+                    FileListJobStatus::Running
+                )
+                .await
+                .unwrap()
+            );
+        }
     }
 
     #[tokio::test]
@@ -3862,65 +3874,90 @@ mod tests {
     }
 
     #[test]
-    fn indexed_core_group_target_reduces_batches_without_widening_rebuilds() {
-        let files: Vec<FileKey> = (0..4)
-            .map(|i| create_file_key(&format!("f{i}.vix"), i, i + 1, 400))
+    fn indexed_log_group_target_combines_large_files_without_widening_rebuilds() {
+        const GIB: i64 = 1024 * 1024 * 1024;
+        let mut cfg = config::Config::default();
+        cfg.compact.max_file_size = GIB as usize;
+        cfg.compact.logs_indexed_max_file_size = 8 * GIB as usize;
+        let files: Vec<FileKey> = [3 * GIB, 3 * GIB, 2 * GIB, GIB]
+            .into_iter()
+            .enumerate()
+            .map(|(i, size)| {
+                let mut file = create_file_key(&format!("f{i}.vix"), i as i64, i as i64 + 1, size);
+                file.meta.index_size = 64;
+                file
+            })
             .collect();
-        let collect = |max_file_size| {
+        let collect = |files: &[FileKey], indexed| {
             let mut batches = Vec::new();
             group_files_into_batches(
                 &mut batches,
-                &files,
+                files,
                 "org",
-                StreamType::Traces,
+                StreamType::Logs,
                 "default",
-                "files/org/traces/default/2026/09/01/00",
-                max_file_size,
+                "files/org/logs/default/2026/09/01/00",
+                cfg.compact
+                    .max_file_size_for_merge(StreamType::Logs, indexed) as i64,
                 false,
                 &MergeStrategy::FileTime,
             );
             batches
         };
 
-        let rebuild_batches = collect(1_000);
-        assert_eq!(
-            rebuild_batches
-                .iter()
-                .map(|batch| batch.files.len())
-                .collect::<Vec<_>>(),
-            vec![2, 2]
-        );
-        let indexed_batches = collect(4_000);
+        let indexed_batches = collect(&files, true);
         assert_eq!(indexed_batches.len(), 1);
-        assert_eq!(indexed_batches[0].files.len(), 4);
+        assert_eq!(indexed_batches[0].files.len(), 3);
+        assert_eq!(
+            indexed_batches[0]
+                .files
+                .iter()
+                .map(|file| file.meta.original_size)
+                .sum::<i64>(),
+            8 * GIB
+        );
+        assert!(collect(&files, false).is_empty());
+
+        let indexless: Vec<FileKey> = (0..4)
+            .map(|i| create_file_key(&format!("small{i}.vix"), i, i + 1, GIB / 2))
+            .collect();
+        let rebuild_batches = collect(&indexless, false);
+        assert_eq!(rebuild_batches.len(), 2);
+        assert!(rebuild_batches.iter().all(|batch| batch.files.len() == 2));
     }
 
     #[test]
-    fn indexed_trace_strict_path_covers_original_and_compressed_caps() {
-        assert!(indexed_trace_group_exceeds_global_rebuild_limit(
-            StreamType::Traces,
+    fn indexed_strict_path_covers_log_and_trace_original_and_compressed_caps() {
+        for stream_type in [StreamType::Logs, StreamType::Traces] {
+            for (original, compressed, expected) in [
+                (1_200, 800, true),
+                (800, 1_200, true),
+                (1_000, 1_000, false),
+                (800, 800, false),
+            ] {
+                assert_eq!(
+                    indexed_group_exceeds_global_rebuild_limit(
+                        stream_type,
+                        true,
+                        original,
+                        compressed,
+                        1_000,
+                    ),
+                    expected,
+                    "{stream_type}/{original}/{compressed}"
+                );
+                assert!(!indexed_group_exceeds_global_rebuild_limit(
+                    stream_type,
+                    false,
+                    original,
+                    compressed,
+                    1_000,
+                ));
+            }
+        }
+        assert!(!indexed_group_exceeds_global_rebuild_limit(
+            StreamType::Metrics,
             true,
-            1_200,
-            800,
-            1_000,
-        ));
-        assert!(indexed_trace_group_exceeds_global_rebuild_limit(
-            StreamType::Traces,
-            true,
-            800,
-            1_200,
-            1_000,
-        ));
-        assert!(!indexed_trace_group_exceeds_global_rebuild_limit(
-            StreamType::Logs,
-            true,
-            1_200,
-            1_200,
-            1_000,
-        ));
-        assert!(!indexed_trace_group_exceeds_global_rebuild_limit(
-            StreamType::Traces,
-            false,
             1_200,
             1_200,
             1_000,

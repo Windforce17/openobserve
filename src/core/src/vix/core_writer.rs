@@ -13785,6 +13785,154 @@ mod tests {
         );
     }
 
+    /// An enlarged indexed log merge must repair legacy FTS sidecars before
+    /// retrying, without rewriting the data object or relaxing IndexedOnly.
+    #[tokio::test]
+    async fn indexed_log_merge_resumes_after_legacy_fts_sidecar_repair() {
+        let fields = vec![
+            Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+            Field::new("log", DataType::Utf8, true),
+        ];
+        let schema = Schema::new(fields.clone());
+        let fts = vec!["log".to_string()];
+        let old = build_core_file(
+            fields.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![100, 90])),
+                Arc::new(StringArray::from(vec!["café latte", "用户admin登录"])),
+            ],
+            &fts,
+            None,
+        );
+        // Reuse the legacy-tokenizer fixture: current writers cannot emit
+        // the retired tokenizer marker that makes this sidecar incompatible.
+        let legacy = (
+            old.0,
+            Some(bytes::Bytes::from(
+                vortex_index::test_support::repack_with_tokenizer_property(
+                    old.1.as_deref().expect("indexed log fixture"),
+                    "o2-v1",
+                )
+                .unwrap(),
+            )),
+        );
+        let current = build_core_file(
+            fields,
+            vec![
+                Arc::new(Int64Array::from(vec![80])),
+                Arc::new(StringArray::from(vec!["plain admin login"])),
+            ],
+            &fts,
+            None,
+        );
+        let mut inputs = vec![
+            ("legacy-log.vix".to_string(), legacy.clone()),
+            ("current-log.vix".to_string(), current),
+        ];
+        let caps = BatchCaps {
+            index_enabled_override: Some(true),
+            ..Default::default()
+        };
+        let strict_merge = |inputs: &[(String, BuiltPair)]| {
+            merge_core_files_with_caps_and_cancellation(
+                StreamType::Logs,
+                &as_inputs(inputs),
+                &schema,
+                &fts,
+                &[],
+                caps,
+                Some(VixMergeCancellation::new()),
+                true,
+            )
+        };
+        let error = format!("{:#}", strict_merge(&inputs).unwrap_err());
+        assert!(
+            error.contains(
+                "required indexed merge is not applicable; refusing a large full rebuild"
+            ),
+            "{error}"
+        );
+        assert!(error.contains("tokenizer"), "{error}");
+        assert!(error.contains("o2-v1"), "{error}");
+
+        let classify = |input: &MergeInput| {
+            classify_core_file_with_caps(
+                StreamType::Logs,
+                &input.0,
+                Arc::clone(&input.1),
+                input.2.clone(),
+                &schema,
+                &fts,
+                &[],
+                caps,
+            )
+            .unwrap()
+        };
+        let ranged = as_inputs(&inputs);
+        let CoreFileStatus::NeedsRebuild(reason) = classify(&ranged[0]) else {
+            panic!("the legacy tokenizer must be detected before a large log merge");
+        };
+        assert!(reason.contains("tokenizer"), "{reason}");
+        assert!(matches!(classify(&ranged[1]), CoreFileStatus::Current));
+        let reference =
+            merge_core_files_rebuild_with_caps(StreamType::Logs, &ranged, &schema, &fts, &[], caps)
+                .unwrap();
+
+        let repair = rebuild_core_file_sidecar_with_caps_and_cancellation(
+            StreamType::Logs,
+            &ranged[0],
+            &schema,
+            &fts,
+            &[],
+            caps,
+            Some(VixMergeCancellation::new()),
+        )
+        .unwrap();
+        let SidecarHealOutcome::Rebuilt { index, stats } = repair else {
+            panic!("legacy FTS must be repairable without a docs rewrite: {repair:?}");
+        };
+        assert_eq!(stats.docs_size, 0);
+        assert_eq!(stats.row_count, 2);
+        inputs[0].1.1 = Some(bytes::Bytes::from(index));
+        assert_eq!(inputs[0].1.0, legacy.0, "repair must preserve data bytes");
+        assert_ne!(inputs[0].1.1, legacy.1);
+        assert!(matches!(
+            classify(&as_inputs(&inputs)[0]),
+            CoreFileStatus::Current
+        ));
+        assert_eq!(
+            vortex_index::test_support::tokenizer_property(
+                inputs[0].1.1.as_deref().expect("healed sidecar"),
+            )
+            .unwrap(),
+            Some("o2-v2".to_string())
+        );
+
+        let merged = strict_merge(&inputs).unwrap();
+        assert!(merged.used_index_merge);
+        assert_eq!(merged.stats.row_count, 3);
+        let reader = open_merged(&merged);
+        assert_core_files_equivalent_logical_docs(
+            &reader,
+            &open_merged(&reference),
+            "strict indexed logs after FTS repair vs full rebuild",
+        );
+        assert_eq!(read_i64(&reader, TIMESTAMP_COL_NAME), vec![100, 90, 80]);
+        for (token, expected) in [
+            ("caf", vec![0]),
+            ("é", vec![0]),
+            ("admin", vec![1, 2]),
+            ("用", vec![1]),
+            ("café", vec![]),
+            ("用户admin登录", vec![]),
+        ] {
+            let query = VixQuery::TokenAnyField {
+                token: token.as_bytes().to_vec(),
+            };
+            assert_eq!(matching_docs(&reader, &query), expected, "token {token:?}");
+        }
+    }
+
     // ─── Adversarial-review probes (write path / merge / lifecycle audit,
     //     2026-07-23). Tests marked REVIEW FINDING reproduce a shipped
     //     behavior the review flagged; the rest pin invariants the review

@@ -53,6 +53,7 @@ fn resolve_auto_merge_concurrency(
     mem_total_bytes: usize,
     configured_vix_merge_threads: usize,
     max_file_size_bytes: usize,
+    logs_indexed_max_file_size_bytes: usize,
     traces_indexed_max_file_size_bytes: usize,
     configured_segment_budget_mb: usize,
     download_budget_mb: usize,
@@ -77,6 +78,7 @@ fn resolve_auto_merge_concurrency(
         .saturating_sub(segment_budget_bytes)
         .saturating_sub(download_budget_bytes);
     let target_file_size_bytes = max_file_size_bytes
+        .max(logs_indexed_max_file_size_bytes)
         .max(traces_indexed_max_file_size_bytes)
         .max(1);
     let memory_slots = (memory_remainder_bytes / target_file_size_bytes).max(1);
@@ -209,6 +211,7 @@ pub async fn run() -> Result<(), anyhow::Error> {
                 cfg.limit.mem_total,
                 cfg.common.vix_merge_thread_num,
                 cfg.compact.max_file_size,
+                cfg.compact.logs_indexed_max_file_size,
                 cfg.compact.traces_indexed_max_file_size,
                 cfg.common.segment_build_memory_budget_mb,
                 cfg.compact.download_budget_mb,
@@ -220,7 +223,7 @@ pub async fn run() -> Result<(), anyhow::Error> {
             );
             let live_job_num = topology.hot_scheduler_slots + topology.recent_scheduler_slots;
             log::info!(
-                "[COMPACTOR::JOB] auto merge concurrency: cgroup_cpu={} resolved_cpu={} role_divisor={} role_cpu={} cgroup_memory_mib={} configured_vix_merge_threads={} per_merge_threads={} configured_segment_budget_mib={} effective_segment_budget_mib={} download_budget_mib={} global_target_mib={} traces_indexed_target_mib={} effective_target_mib={} memory_ceiling_mib={} memory_remainder_mib={} cpu_slots={} memory_slots={} total={} backlog_workers={} backlog_scheduler_slots={} live_workers={} hot_scheduler_slots={} recent_scheduler_slots={}",
+                "[COMPACTOR::JOB] auto merge concurrency: cgroup_cpu={} resolved_cpu={} role_divisor={} role_cpu={} cgroup_memory_mib={} configured_vix_merge_threads={} per_merge_threads={} configured_segment_budget_mib={} effective_segment_budget_mib={} download_budget_mib={} global_target_mib={} logs_indexed_target_mib={} traces_indexed_target_mib={} effective_target_mib={} memory_ceiling_mib={} memory_remainder_mib={} cpu_slots={} memory_slots={} total={} backlog_workers={} backlog_scheduler_slots={} live_workers={} hot_scheduler_slots={} recent_scheduler_slots={}",
                 cfg.limit.real_cpu_num,
                 cfg.limit.cpu_num,
                 role_divisor,
@@ -232,6 +235,7 @@ pub async fn run() -> Result<(), anyhow::Error> {
                 resolution.segment_budget_bytes / MIB,
                 resolution.download_budget_bytes / MIB,
                 cfg.compact.max_file_size / MIB,
+                cfg.compact.logs_indexed_max_file_size / MIB,
                 cfg.compact.traces_indexed_max_file_size / MIB,
                 resolution.target_file_size_bytes / MIB,
                 resolution.memory_ceiling_bytes / MIB,
@@ -751,7 +755,8 @@ mod tests {
 
     #[test]
     fn production_limits_resolve_three_merges() {
-        let resolution = resolve_auto_merge_concurrency(16, gib(60), 4, gib(2), gib(8), 8192, 2048);
+        let resolution =
+            resolve_auto_merge_concurrency(16, gib(60), 4, gib(1), gib(8), gib(8), 8192, 2048);
 
         assert_eq!(resolution.per_merge_threads, 4);
         assert_eq!(resolution.cpu_slots, 3);
@@ -761,7 +766,7 @@ mod tests {
 
     #[test]
     fn cpu_slots_bound_total_concurrency() {
-        let resolution = resolve_auto_merge_concurrency(32, gib(128), 0, gib(1), 0, 1024, 0);
+        let resolution = resolve_auto_merge_concurrency(32, gib(128), 0, gib(1), 0, 0, 1024, 0);
 
         assert_eq!(resolution.per_merge_threads, 8);
         assert_eq!(resolution.cpu_slots, 3);
@@ -771,7 +776,7 @@ mod tests {
 
     #[test]
     fn memory_slots_bound_total_concurrency() {
-        let resolution = resolve_auto_merge_concurrency(64, gib(20), 1, gib(4), 0, 4096, 4096);
+        let resolution = resolve_auto_merge_concurrency(64, gib(20), 1, gib(4), 0, 0, 4096, 4096);
 
         assert_eq!(resolution.cpu_slots, 63);
         assert_eq!(resolution.memory_slots, 2);
@@ -780,7 +785,7 @@ mod tests {
 
     #[test]
     fn concurrency_never_falls_below_one() {
-        let resolution = resolve_auto_merge_concurrency(1, gib(1), 8, gib(8), 0, 8192, 2048);
+        let resolution = resolve_auto_merge_concurrency(1, gib(1), 8, gib(8), 0, 0, 8192, 2048);
 
         assert_eq!(resolution.per_merge_threads, 1);
         assert_eq!(resolution.cpu_slots, 1);
@@ -790,8 +795,10 @@ mod tests {
 
     #[test]
     fn larger_trace_target_controls_memory_slots() {
-        let trace_target = resolve_auto_merge_concurrency(64, gib(40), 1, gib(2), gib(8), 8192, 0);
-        let global_target = resolve_auto_merge_concurrency(64, gib(40), 1, gib(2), gib(1), 8192, 0);
+        let trace_target =
+            resolve_auto_merge_concurrency(64, gib(40), 1, gib(2), 0, gib(8), 8192, 0);
+        let global_target =
+            resolve_auto_merge_concurrency(64, gib(40), 1, gib(2), 0, gib(1), 8192, 0);
 
         assert_eq!(trace_target.target_file_size_bytes, gib(8));
         assert_eq!(trace_target.memory_slots, 3);
@@ -800,8 +807,16 @@ mod tests {
     }
 
     #[test]
+    fn larger_log_target_bounds_memory_slots_without_trace_override() {
+        let resolution = resolve_auto_merge_concurrency(64, gib(40), 1, gib(1), gib(8), 0, 8192, 0);
+        assert_eq!(resolution.target_file_size_bytes, gib(8));
+        assert_eq!(resolution.memory_slots, 3);
+        assert_eq!(resolution.total, 3);
+    }
+
+    #[test]
     fn zero_segment_budget_reserves_forty_percent_of_memory() {
-        let resolution = resolve_auto_merge_concurrency(64, gib(60), 1, gib(8), 0, 0, 0);
+        let resolution = resolve_auto_merge_concurrency(64, gib(60), 1, gib(8), 0, 0, 0, 0);
 
         assert_eq!(resolution.segment_budget_bytes, gib(24));
         assert_eq!(resolution.memory_ceiling_bytes, gib(48));
@@ -810,7 +825,7 @@ mod tests {
 
     #[test]
     fn configured_segment_budget_uses_the_builder_floor() {
-        let resolution = resolve_auto_merge_concurrency(4, gib(4), 1, 512 * MIB, 0, 1, 2048);
+        let resolution = resolve_auto_merge_concurrency(4, gib(4), 1, 512 * MIB, 0, 0, 1, 2048);
 
         assert_eq!(resolution.segment_budget_bytes, 256 * MIB);
         assert_eq!(resolution.memory_slots, 1);
