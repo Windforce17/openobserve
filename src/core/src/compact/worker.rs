@@ -682,7 +682,7 @@ impl JobScheduler {
                             .await
                             {
                                 log::error!(
-                                    "[COMPACTOR:SCHEDULER:{thread_id}] merge_by_stream [{}/{}/{}] job_id={} generation={} error: {e}",
+                                    "[COMPACTOR:SCHEDULER:{thread_id}] merge_by_stream [{}/{}/{}] job_id={} generation={} error: {e:#}",
                                     job.org_id,
                                     job.stream_type,
                                     job.stream_name,
@@ -1134,7 +1134,7 @@ impl MergeWorker {
                                 }
                                 Err(e) => {
                                     log::error!(
-                                        "[COMPACTOR:WORKER:{thread_id}] Error merging files: stream: {}/{}/{}, err: {}",
+                                        "[COMPACTOR:WORKER:{thread_id}] Error merging files: stream: {}/{}/{}, err: {:#}",
                                         msg.org_id,
                                         msg.stream_type,
                                         msg.stream_name,

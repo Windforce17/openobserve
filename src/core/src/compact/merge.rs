@@ -50,10 +50,7 @@ use infra::{
 };
 #[cfg(feature = "enterprise")]
 use o2_enterprise::enterprise::common::downsampling::get_largest_downsampling_rule;
-use tokio::{
-    sync::{Semaphore, mpsc},
-    task::JoinHandle,
-};
+use tokio::sync::{Semaphore, mpsc};
 use vortex_index::VixOutput;
 
 use super::worker::{MergeBatch, MergeCancellation, MergeSender};
@@ -80,6 +77,12 @@ enum MergeBatchReceive {
     Result(MergeBatchOutcome),
     Closed,
     Cancelled,
+}
+
+#[derive(Default)]
+struct MergePartitionOutcome {
+    orphan_blooms: Vec<i64>,
+    replan_required: bool,
 }
 
 async fn receive_merge_batch_result(
@@ -664,6 +667,11 @@ pub async fn merge_by_stream(
         partition.push(file.to_owned());
     }
 
+    let stream_settings = infra::schema::unwrap_stream_settings(&schema);
+    let bloom_filter_fields = get_stream_setting_bloom_filter_fields(&stream_settings);
+    let full_text_search_fields = get_stream_setting_fts_fields(&stream_settings);
+    let latest_schema = Arc::new(schema);
+
     // use multiple threads to merge
     let semaphore = std::sync::Arc::new(Semaphore::new(cfg.limit.file_merge_thread_num));
     let job_cancel = cancel.clone();
@@ -674,7 +682,10 @@ pub async fn merge_by_stream(
         let permit = semaphore.clone().acquire_owned().await.unwrap();
         let worker_tx = worker_tx.clone();
         let job_cancel = job_cancel.clone();
-        let task: JoinHandle<Result<Vec<i64>, anyhow::Error>> = tokio::task::spawn(async move {
+        let latest_schema = Arc::clone(&latest_schema);
+        let bloom_filter_fields = bloom_filter_fields.clone();
+        let full_text_search_fields = full_text_search_fields.clone();
+        let task = tokio::task::spawn(async move {
             job_cancel.check("partition planning")?;
             let cfg = get_config();
             let job_strategy = MergeStrategy::from(&cfg.compact.strategy);
@@ -756,7 +767,7 @@ pub async fn merge_by_stream(
                 && !skip_group_files
                 && !single_core_heal_candidate
             {
-                return Ok(vec![]);
+                return Ok(MergePartitionOutcome::default());
             }
 
             // group files need to merge
@@ -831,10 +842,37 @@ pub async fn merge_by_stream(
             if !is_incremental {
                 heal_candidates.extend(oversize_core_files.iter());
             }
-            for candidate in heal_candidates {
-                match single_core_file_heal_reason(&org_id, stream_type, &stream_name, candidate)
+            let mut heal_probe = |file: FileKey| {
+                let latest_schema = Arc::clone(&latest_schema);
+                let full_text_search_fields = full_text_search_fields.clone();
+                let bloom_filter_fields = bloom_filter_fields.clone();
+                let cancel = job_cancel.clone();
+                async move {
+                    single_core_file_heal_reason(
+                        stream_type,
+                        &file,
+                        latest_schema,
+                        full_text_search_fields,
+                        bloom_filter_fields,
+                        &cancel,
+                    )
                     .await
-                {
+                }
+            };
+            // Large indexed groups cannot fall back to a full rebuild.
+            // Repair incompatible inputs through the same bounded worker
+            // queue first, then re-claim the hour with fresh sidecar metadata.
+            for batch in &mut batch_groups {
+                batch.cancel = job_cancel.clone();
+            }
+            let (mut batch_groups, replan_required) = queue_required_index_repairs(
+                batch_groups,
+                cfg.compact.max_file_size as i64,
+                &mut heal_probe,
+            )
+            .await?;
+            for candidate in heal_candidates {
+                match heal_probe(candidate.clone()).await {
                     Ok(Some(reason)) => {
                         log::info!(
                             "[COMPACTOR] {org_id}/{stream_type}/{stream_name}: single-file \
@@ -848,7 +886,7 @@ pub async fn merge_by_stream(
                             stream_name: stream_name.clone(),
                             prefix: prefix.clone(),
                             files: vec![candidate.clone()],
-                            cancel: MergeCancellation::default(),
+                            cancel: job_cancel.clone(),
                         });
                     }
                     // current file: the no-op path — no batch, no docs IO
@@ -868,11 +906,7 @@ pub async fn merge_by_stream(
             }
 
             if batch_groups.is_empty() {
-                return Ok(vec![]); // no files need to merge
-            }
-
-            for batch in &mut batch_groups {
-                batch.cancel = job_cancel.clone();
+                return Ok(MergePartitionOutcome::default()); // no files need to merge
             }
 
             // send to worker
@@ -936,7 +970,7 @@ pub async fn merge_by_stream(
                 let (batch_id, new_files, merged_files) = match ret {
                     Ok(v) => v,
                     Err(e) => {
-                        log::error!("[COMPACTOR] merge files failed: {e}");
+                        log::error!("[COMPACTOR] merge files failed: {e:#}");
                         last_error = Some(e);
                         continue;
                     }
@@ -1074,7 +1108,10 @@ pub async fn merge_by_stream(
             if let Some(e) = last_error {
                 return Err(e);
             }
-            Ok(orphan_blooms)
+            Ok(MergePartitionOutcome {
+                orphan_blooms,
+                replan_required,
+            })
         });
         tasks.push(task);
     }
@@ -1087,13 +1124,17 @@ pub async fn merge_by_stream(
     // covers the re-claim race itself).
     let task_results = futures::future::join_all(tasks).await;
     let mut orphan_blooms = Vec::new();
+    let mut replan_required = false;
     let mut first_error: Option<anyhow::Error> = None;
     for task_result in task_results {
         match task_result {
-            Ok(Ok(blooms)) => orphan_blooms.extend(blooms),
+            Ok(Ok(outcome)) => {
+                orphan_blooms.extend(outcome.orphan_blooms);
+                replan_required |= outcome.replan_required;
+            }
             Ok(Err(e)) => {
                 log::error!(
-                    "[COMPACTOR] merge_by_stream [{org_id}/{stream_type}/{stream_name}] partition task failed: {e}"
+                    "[COMPACTOR] merge_by_stream [{org_id}/{stream_type}/{stream_name}] partition task failed: {e:#}"
                 );
                 if first_error.is_none() {
                     first_error = Some(e);
@@ -1115,24 +1156,23 @@ pub async fn merge_by_stream(
 
     let _ = (is_incremental, orphan_blooms);
 
-    cancel.check("job completion")?;
-    match infra_file_list::set_job_done_owned(job_id, &LOCAL_NODE.uuid, lease_generation).await {
-        Ok(true) => log::info!(
-            "[COMPACTOR] merge job completed job_id={job_id} generation={lease_generation} outcome=done elapsed_ms={}",
-            start.elapsed().as_millis(),
-        ),
-        Ok(false) => {
-            cancel.cancel();
-            return Err(anyhow::anyhow!(
-                "job {job_id} generation {lease_generation} lost ownership before completion"
-            ));
-        }
-        Err(e) => {
-            return Err(anyhow::anyhow!(
-                "set_job_done_owned failed for job {job_id} generation {lease_generation}: {e}"
-            ));
-        }
-    }
+    complete_merge_pass(
+        job_id,
+        &LOCAL_NODE.uuid,
+        lease_generation,
+        replan_required,
+        cancel,
+    )
+    .await?;
+    log::info!(
+        "[COMPACTOR] merge job completed job_id={job_id} generation={lease_generation} outcome={} elapsed_ms={}",
+        if replan_required {
+            "index_repair_replan"
+        } else {
+            "done"
+        },
+        start.elapsed().as_millis(),
+    );
 
     // metrics
     let time = start.elapsed().as_secs_f64();
@@ -1141,6 +1181,131 @@ pub async fn merge_by_stream(
         .inc_by(time);
 
     Ok(())
+}
+
+/// A sidecar repair publishes in place and returns no file-list events.
+/// Its dependent merge is still unfinished, even if another publisher won
+/// the sidecar CAS. Requeue under the lease fence and read fresh generations
+/// on the next claim; never execute the pre-repair batch snapshot.
+async fn complete_merge_pass(
+    job_id: i64,
+    node: &str,
+    lease_generation: i64,
+    replan_required: bool,
+    cancel: &MergeCancellation,
+) -> Result<(), anyhow::Error> {
+    cancel.check("job completion")?;
+    let (operation, result) = if replan_required {
+        (
+            "set_job_pending_owned",
+            infra_file_list::set_job_pending_owned(job_id, node, lease_generation).await,
+        )
+    } else {
+        (
+            "set_job_done_owned",
+            infra_file_list::set_job_done_owned(job_id, node, lease_generation).await,
+        )
+    };
+    match result {
+        Ok(true) => Ok(()),
+        Ok(false) => {
+            cancel.cancel();
+            Err(anyhow::anyhow!(
+                "job {job_id} generation {lease_generation} lost ownership before {operation}"
+            ))
+        }
+        Err(e) => Err(anyhow::anyhow!(
+            "{operation} failed for job {job_id} generation {lease_generation}: {e}"
+        )),
+    }
+}
+
+/// Preflight only groups that cannot safely use the full-rebuild fallback.
+/// Keep compatible groups runnable and replace each incompatible group with
+/// its singleton repairs. Probe failures are required-work errors, unlike
+/// the best-effort healing sweep of files outside merge groups.
+async fn queue_required_index_repairs<F, Fut>(
+    batches: Vec<MergeBatch>,
+    global_limit: i64,
+    mut heal_reason: F,
+) -> Result<(Vec<MergeBatch>, bool), anyhow::Error>
+where
+    F: FnMut(FileKey) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<String>, anyhow::Error>>,
+{
+    let mut planned = Vec::with_capacity(batches.len());
+    let mut replan_required = false;
+    for mut batch in batches {
+        let (original_size, compressed_size) =
+            batch
+                .files
+                .iter()
+                .fold((0_i64, 0_i64), |(original, compressed), file| {
+                    (
+                        original.saturating_add(file.meta.original_size),
+                        compressed.saturating_add(file.meta.compressed_size),
+                    )
+                });
+        let requires_indexed_merge = batch.files.len() > 1
+            && batch
+                .files
+                .iter()
+                .all(|file| file.key.ends_with(config::FILE_EXT_VIX))
+            && indexed_trace_group_exceeds_global_rebuild_limit(
+                batch.stream_type,
+                batch.files.iter().all(|file| file.meta.index_size > 0),
+                original_size,
+                compressed_size,
+                global_limit,
+            );
+        let mut repairs = Vec::new();
+        if requires_indexed_merge {
+            for file in &batch.files {
+                batch.cancel.check("required index repair probe")?;
+                let reason = match heal_reason(file.clone()).await {
+                    Ok(reason) => reason,
+                    Err(error) => {
+                        // Preflight runs before the worker's missing-input
+                        // recovery. Preserve that recovery here, with HEAD
+                        // confirming a missing DATA object before deletion.
+                        if storage::is_not_found_error(&error) {
+                            batch.cancel.check("missing repair input reconciliation")?;
+                            reconcile_missing_merge_inputs(std::slice::from_ref(file)).await;
+                        }
+                        return Err(error.context(format!(
+                            "required index repair probe of {} failed",
+                            file.key
+                        )));
+                    }
+                };
+                if let Some(reason) = reason {
+                    log::info!(
+                        "[COMPACTOR] {}/{}/{}: queueing index repair of {} before large indexed merge: {reason}",
+                        batch.org_id,
+                        batch.stream_type,
+                        batch.stream_name,
+                        file.key,
+                    );
+                    repairs.push(file.clone());
+                }
+            }
+        }
+        if repairs.is_empty() {
+            batch.batch_id = planned.len();
+            planned.push(batch);
+        } else {
+            replan_required = true;
+            batch.files.clear();
+            for file in repairs {
+                planned.push(MergeBatch {
+                    batch_id: planned.len(),
+                    files: vec![file],
+                    ..batch.clone()
+                });
+            }
+        }
+    }
+    Ok((planned, replan_required))
 }
 
 /// Cut `files` (already sorted by the job strategy) into merge batches
@@ -2506,27 +2671,21 @@ impl vortex_index::VixRangeSource for HealProbeRangeSource {
     }
 }
 
-/// Decide whether the single core file of a partition needs the healing
-/// rebuild: open it over ranged reads and classify it against the stream's
-/// CURRENT schema and settings (`core_writer::classify_core_file` — the
-/// same capability checks the merge paths enforce; the same settings
-/// resolution `merge_files` uses). `Ok(Some(reason))` enqueues the
-/// single-file batch; `Ok(None)` is the no-op path — the file is current,
-/// nothing is downloaded beyond container metadata, the job completes with
-/// no file_list change.
+/// Classify one core file against the stream schema/settings snapshot using
+/// the merge paths' capability checks. A repair reason schedules a singleton
+/// healing batch; a current file needs only container metadata reads. The
+/// caller decides whether this repair also defers a dependent merge.
 async fn single_core_file_heal_reason(
-    org_id: &str,
     stream_type: StreamType,
-    stream_name: &str,
     file: &FileKey,
+    latest_schema: Arc<Schema>,
+    full_text_search_fields: Vec<String>,
+    bloom_filter_fields: Vec<String>,
+    cancel: &MergeCancellation,
 ) -> Result<Option<String>, anyhow::Error> {
     use crate::service::vix::core_writer::{CoreFileStatus, classify_core_file};
 
-    let latest_schema = infra::schema::get(org_id, stream_name, stream_type).await?;
-    let stream_settings = infra::schema::unwrap_stream_settings(&latest_schema);
-    let bloom_filter_fields = get_stream_setting_bloom_filter_fields(&stream_settings);
-    let full_text_search_fields = get_stream_setting_fts_fields(&stream_settings);
-
+    cancel.check("index repair probe")?;
     let handle = tokio::runtime::Handle::current();
     let source: Arc<dyn vortex_index::VixRangeSource> = Arc::new(HealProbeRangeSource {
         account: file.account.clone(),
@@ -2534,7 +2693,7 @@ async fn single_core_file_heal_reason(
         // a .vix FileMeta's compressed_size is the exact DATA-object size
         size: file.meta.compressed_size as u64,
         handle: handle.clone(),
-        cancel: None,
+        cancel: Some(cancel.clone()),
     });
     // v3 split: the term dictionary lives in the `.vxi` sidecar
     // (index_size = its exact size; 0 = no sidecar, classify routes such
@@ -2548,11 +2707,11 @@ async fn single_core_file_heal_reason(
                     location: object_store::path::Path::from(sidecar_key.as_str()),
                     size: file.meta.index_size as u64,
                     handle,
-                    cancel: None,
+                    cancel: Some(cancel.clone()),
                 }) as Arc<dyn vortex_index::VixRangeSource>
             });
     let key = file.key.clone();
-    let status = tokio::task::spawn_blocking(move || {
+    let mut task = tokio::task::spawn_blocking(move || {
         classify_core_file(
             stream_type,
             &key,
@@ -2562,8 +2721,15 @@ async fn single_core_file_heal_reason(
             &full_text_search_fields,
             &bloom_filter_fields,
         )
-    })
-    .await??;
+    });
+    let status = tokio::select! {
+        result = &mut task => result,
+        _ = wait_for_merge_cancellation(cancel) => {
+            cancel.cancel();
+            task.await
+        }
+    }??;
+    cancel.check("index repair probe")?;
     Ok(match status {
         CoreFileStatus::Current => None,
         CoreFileStatus::NeedsRebuild(reason) => Some(reason),
@@ -2974,6 +3140,8 @@ fn sort_by_time_range(mut file_list: Vec<FileKey>) -> Vec<FileKey> {
 
 #[cfg(test)]
 mod tests {
+    use std::future::ready;
+
     use config::meta::stream::{FileKey, FileMeta};
 
     use super::*;
@@ -3000,6 +3168,313 @@ mod tests {
             row_group_size: None,
             selection_exact: false,
         }
+    }
+
+    fn indexed_trace_batch(batch_id: usize, keys: &[&str], size: i64) -> MergeBatch {
+        MergeBatch {
+            batch_id,
+            org_id: "org".to_string(),
+            stream_type: StreamType::Traces,
+            stream_name: "default".to_string(),
+            prefix: "files/org/traces/default/2026/09/01/00".to_string(),
+            files: keys
+                .iter()
+                .map(|key| {
+                    let mut file = create_file_key(key, 1, 2, size);
+                    file.meta.index_size = 64;
+                    file
+                })
+                .collect(),
+            cancel: MergeCancellation::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn index_repair_plan_defers_only_incompatible_groups() {
+        let legacy = indexed_trace_batch(0, &["legacy-a.vix", "legacy-b.vix", "late.vix"], 600);
+        let compatible = indexed_trace_batch(1, &["current-a.vix", "current-b.vix"], 600);
+        let mut probed = Vec::new();
+        let (planned, replan) = queue_required_index_repairs(
+            vec![legacy, compatible.clone()],
+            1_000,
+            |file: FileKey| {
+                probed.push(file.key.clone());
+                ready(Ok(file
+                    .key
+                    .starts_with("legacy")
+                    .then(|| "missing duration terms".to_string())))
+            },
+        )
+        .await
+        .unwrap();
+        assert!(replan);
+        assert_eq!(probed.len(), 5);
+        assert_eq!(planned.len(), 3);
+        assert_eq!(planned[0].files[0].key, "legacy-a.vix");
+        assert_eq!(planned[1].files[0].key, "legacy-b.vix");
+        assert_eq!(planned[0].files.len(), 1);
+        assert_eq!(planned[1].files.len(), 1);
+        assert_eq!(planned[2].files, compatible.files);
+        for (id, batch) in planned.iter().enumerate() {
+            assert_eq!(
+                batch.batch_id, id,
+                "repair expansion must preserve result routing"
+            );
+            assert!(
+                batch.files.iter().all(|file| file.key != "late.vix"),
+                "the dependent merge must wait for a fresh file-list snapshot"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn index_repair_preflight_respects_rebuild_limits() {
+        for (stream_type, index_size, original, compressed, expected_probes) in [
+            (StreamType::Traces, 64, 600, 100, 2),
+            (StreamType::Traces, 64, 100, 600, 2),
+            (StreamType::Traces, 64, 500, 500, 0),
+            (StreamType::Logs, 64, 600, 600, 0),
+            (StreamType::Traces, 0, 600, 600, 0),
+        ] {
+            let mut batch = indexed_trace_batch(0, &["a.vix", "b.vix"], original);
+            batch.stream_type = stream_type;
+            for file in &mut batch.files {
+                file.meta.index_size = index_size;
+                file.meta.compressed_size = compressed;
+            }
+            let mut probes = 0;
+            let (planned, replan) =
+                queue_required_index_repairs(vec![batch.clone()], 1_000, |_: FileKey| {
+                    probes += 1;
+                    ready(Ok(None))
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                probes, expected_probes,
+                "{stream_type}/{index_size}/{original}/{compressed}"
+            );
+            assert!(
+                !replan,
+                "compatible groups must proceed without a repair pass"
+            );
+            assert_eq!(planned.len(), 1);
+            assert_eq!(planned[0].files, batch.files);
+        }
+    }
+
+    #[tokio::test]
+    async fn index_repair_probe_error_prevents_dispatch() {
+        let result = queue_required_index_repairs(
+            vec![indexed_trace_batch(0, &["legacy.vix", "late.vix"], 600)],
+            1_000,
+            |_: FileKey| ready(Err(anyhow::anyhow!("object store unavailable"))),
+        )
+        .await;
+        let error = match result {
+            Err(error) => format!("{error:#}"),
+            Ok(_) => panic!("required preflight failure must fail the pass"),
+        };
+        assert!(error.contains("legacy.vix"), "{error}");
+        assert!(error.contains("object store unavailable"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn index_repair_preflight_reconciles_only_missing_data() {
+        use crate::compact::jobs_test_support::{retry_busy, setup};
+        let _guard = setup().await;
+        std::fs::create_dir_all(&get_config().common.data_stream_dir).unwrap();
+        let org = format!("repairmissing{}", config::utils::time::now_micros());
+        let gone = format!("files/{org}/traces/default/2026/09/01/00/gone.vix");
+        let present = format!("files/{org}/traces/default/2026/09/01/00/present.vix");
+        storage::put("", &present, Bytes::from_static(b"still-here"))
+            .await
+            .unwrap();
+        let mut batch = indexed_trace_batch(0, &[&gone, &present], 600);
+        for file in &mut batch.files {
+            file.account.clear();
+            file.meta.compressed_size = 4_096;
+        }
+        retry_busy("seed repair inputs", || {
+            infra_file_list::batch_add(&batch.files)
+        })
+        .await;
+        let schema = Arc::new(Schema::empty());
+        let cancel = MergeCancellation::default();
+        let result = queue_required_index_repairs(vec![batch.clone()], 1_000, |file: FileKey| {
+            let schema = Arc::clone(&schema);
+            let cancel = cancel.clone();
+            async move {
+                single_core_file_heal_reason(
+                    StreamType::Traces,
+                    &file,
+                    schema,
+                    vec![],
+                    vec![],
+                    &cancel,
+                )
+                .await
+            }
+        })
+        .await;
+        match result {
+            Err(error) => assert!(storage::is_not_found_error(&error), "{error:#}"),
+            Ok(_) => panic!("the missing input must requeue the job with a fresh snapshot"),
+        }
+        assert!(
+            !infra_file_list::contains(&gone).await.unwrap(),
+            "the stale row must not wedge every retry"
+        );
+        assert!(infra_file_list::contains(&present).await.unwrap());
+
+        // A sidecar 404 or a misleading error string must never delete a
+        // live data file: only the independent DATA HEAD can authorize it.
+        batch.files.swap(0, 1);
+        assert!(
+            queue_required_index_repairs(vec![batch], 1_000, |_: FileKey| {
+                ready(Err(anyhow::anyhow!("index sidecar not found")))
+            })
+            .await
+            .is_err()
+        );
+        assert!(infra_file_list::contains(&present).await.unwrap());
+        assert_eq!(
+            storage::get_bytes("", &present).await.unwrap().as_ref(),
+            b"still-here"
+        );
+        retry_busy("cleanup repair input", || {
+            file_list::delete_parquet_file("", &present, false)
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn index_repair_pass_requeues_until_fresh_generation_can_merge() {
+        use crate::compact::jobs_test_support::{retry_busy, setup};
+        let _guard = setup().await;
+        let offset = config::utils::time::now_micros();
+        let org = format!("indexrepair{offset}");
+        let node = "index-repair-test";
+        let id = retry_busy("add repair job", || {
+            infra_file_list::add_job(&org, StreamType::Traces, "default", offset)
+        })
+        .await;
+        let claim = async || {
+            retry_busy("claim repair job", || {
+                infra_file_list::get_pending_jobs(
+                    node,
+                    1,
+                    FileListJobOrder::EnqueueOldest,
+                    Some(offset),
+                    Some(offset + 1),
+                )
+            })
+            .await
+        };
+        let first = claim().await.remove(0);
+        assert_eq!(first.id, id);
+        let batch = indexed_trace_batch(0, &["legacy.vix", "late.vix"], 600);
+        let probe = |file: FileKey| {
+            ready(Ok((file.key == "legacy.vix"
+                && file.meta.index_generation == 0)
+                .then(|| "missing duration terms".to_string())))
+        };
+        let (repairs, replan) = queue_required_index_repairs(vec![batch.clone()], 1_000, probe)
+            .await
+            .unwrap();
+        assert_eq!(repairs.len(), 1);
+        assert_eq!(repairs[0].files.len(), 1);
+        // Both successful in-place publication and a sidecar CAS loser
+        // return empty events. Neither completes the dependent merge.
+        assert!(build_commit_events(Vec::new(), &[]).is_empty());
+        complete_merge_pass(
+            id,
+            node,
+            first.lease_generation,
+            replan,
+            &MergeCancellation::default(),
+        )
+        .await
+        .unwrap();
+        let second = claim().await.remove(0);
+        assert_eq!(second.id, id);
+        assert!(second.lease_generation > first.lease_generation);
+        for stale_replan in [true, false] {
+            let stale = MergeCancellation::default();
+            assert!(
+                complete_merge_pass(id, node, first.lease_generation, stale_replan, &stale)
+                    .await
+                    .is_err()
+            );
+            assert!(stale.is_cancelled());
+        }
+        let cancelled = MergeCancellation::default();
+        cancelled.cancel();
+        assert!(
+            complete_merge_pass(id, node, second.lease_generation, true, &cancelled)
+                .await
+                .is_err()
+        );
+        assert!(
+            infra_file_list::touch_job_lease(
+                id,
+                node,
+                second.lease_generation,
+                FileListJobStatus::Running
+            )
+            .await
+            .unwrap(),
+            "stale/cancelled completions must leave the successor running"
+        );
+
+        let mut refreshed = batch;
+        refreshed.files[0].meta.index_generation = 1;
+        let (merges, replan) = queue_required_index_repairs(vec![refreshed], 1_000, probe)
+            .await
+            .unwrap();
+        assert!(!replan);
+        assert_eq!(merges[0].files.len(), 2);
+        assert_eq!(merges[0].files[0].meta.index_generation, 1);
+        complete_merge_pass(
+            id,
+            node,
+            second.lease_generation,
+            replan,
+            &MergeCancellation::default(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            claim().await.is_empty(),
+            "the completed merge must not be requeued"
+        );
+        assert!(
+            !infra_file_list::touch_job_lease(
+                id,
+                node,
+                second.lease_generation,
+                FileListJobStatus::Running
+            )
+            .await
+            .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn index_repair_probe_stops_before_io_when_cancelled() {
+        let cancel = MergeCancellation::default();
+        cancel.cancel();
+        let error = single_core_file_heal_reason(
+            StreamType::Traces,
+            &create_file_key("missing.vix", 1, 2, 1),
+            Arc::new(Schema::empty()),
+            vec![],
+            vec![],
+            &cancel,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("cancelled"), "{error:#}");
     }
 
     #[tokio::test]
@@ -4143,6 +4618,12 @@ mod tests {
         // the running owner's fenced commit lands: one add + one delete
         let old_a = commit_test_file(&org, &stream, "old_a");
         let new_a = commit_test_file(&org, &stream, "new_a");
+        // Generation-fenced retirement requires a live input row, just as
+        // a real merge's file-list snapshot does.
+        retry_busy("seed owner input", || {
+            infra_file_list::batch_add(std::slice::from_ref(&old_a))
+        })
+        .await;
         let events_a = build_commit_events(vec![new_a.clone()], std::slice::from_ref(&old_a));
         let outcome = retry_busy("owner commit", || {
             commit_batch_if_owner(
@@ -4205,6 +4686,10 @@ mod tests {
         // zero file_list writes from the loser
         let old_b = commit_test_file(&org, &stream, "old_b");
         let new_b = commit_test_file(&org, &stream, "new_b");
+        retry_busy("seed successor input", || {
+            infra_file_list::batch_add(std::slice::from_ref(&old_b))
+        })
+        .await;
         let events_b = build_commit_events(vec![new_b.clone()], std::slice::from_ref(&old_b));
         let outcome = retry_busy("loser commit attempt", || {
             commit_batch_if_owner(
@@ -4226,6 +4711,12 @@ mod tests {
                 .await
                 .expect("contains"),
             "the loser's add must NOT land"
+        );
+        assert!(
+            infra_file_list::contains(&old_b.key)
+                .await
+                .expect("contains"),
+            "the loser's input must remain live for the new owner"
         );
         let deleted_rows = infra::file_list::list_deleted()
             .await
