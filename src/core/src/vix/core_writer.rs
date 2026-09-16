@@ -8453,6 +8453,207 @@ mod tests {
         );
     }
 
+    /// Large historical trace files can retain ordinary-field Bloom-only
+    /// markers after the ID-only policy changes. Repair their sidecars before
+    /// retrying a strict indexed merge with late L0s; the docs object and row
+    /// identities must survive both steps.
+    #[tokio::test]
+    async fn indexed_trace_merge_resumes_after_legacy_duration_sidecar_repair() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+            Field::new("span_duration_nano", DataType::Utf8, true),
+            Field::new("trace_id", DataType::Utf8, true),
+        ]));
+        // Scale only the AUTO distinct floor, keeping the real policy
+        // transition without allocating a multi-gigabyte trace fixture.
+        let legacy_caps = BatchCaps {
+            index_enabled_override: Some(true),
+            bloom_only_override: Some("trace_id"),
+            bloom_auto_override: Some((0.01, 1)),
+            bloom_auto_id_only_override: Some(false),
+            ..Default::default()
+        };
+        let current_caps = BatchCaps {
+            bloom_auto_id_only_override: Some(true),
+            ..legacy_caps
+        };
+        let build = |name: &'static str, timestamps: Vec<i64>, caps: BatchCaps| {
+            let schema = Arc::clone(&schema);
+            async move {
+                let durations = timestamps
+                    .iter()
+                    .map(|timestamp| (timestamp * 10).to_string())
+                    .collect::<Vec<_>>();
+                let trace_ids = timestamps
+                    .iter()
+                    .map(|timestamp| format!("trace-{timestamp}"))
+                    .collect::<Vec<_>>();
+                let batch = RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(Int64Array::from(timestamps)) as ArrayRef,
+                        Arc::new(StringArray::from(durations)),
+                        Arc::new(StringArray::from(trace_ids)),
+                    ],
+                )
+                .unwrap();
+                let table =
+                    Arc::new(MemTable::try_new(Arc::clone(&schema), vec![vec![batch]]).unwrap());
+                let built = write_core_file_from_tables_with_caps(
+                    name,
+                    StreamType::Traces,
+                    schema,
+                    vec![table],
+                    &[],
+                    &[],
+                    false,
+                    0,
+                    caps,
+                )
+                .await
+                .unwrap();
+                (
+                    bytes::Bytes::from(built.data),
+                    built.index.map(bytes::Bytes::from),
+                )
+            }
+        };
+        let historical_inputs = vec![
+            (
+                "old-a.vix".to_string(),
+                build("legacy-traces-a", vec![400, 200], legacy_caps).await,
+            ),
+            (
+                "old-b.vix".to_string(),
+                build("legacy-traces-b", vec![300, 100], legacy_caps).await,
+            ),
+        ];
+        let historical = merge_core_files_with_caps(
+            StreamType::Traces,
+            &as_inputs(&historical_inputs),
+            &schema,
+            &[],
+            &[],
+            legacy_caps,
+        )
+        .unwrap();
+        assert!(historical.used_index_merge);
+        assert!(
+            historical.concat_order,
+            "match the historical merged-file shape"
+        );
+        let historical_pair: BuiltPair = (
+            bytes::Bytes::from(historical.output.to_bytes().unwrap()),
+            historical.index.map(bytes::Bytes::from),
+        );
+        assert!(
+            open_pair(&historical_pair)
+                .bloom_only_fields()
+                .any(|field| field == "span_duration_nano")
+        );
+        let late_l0 = build("late-current-traces", vec![250], current_caps).await;
+        let mut inputs = vec![
+            ("historical.vix".to_string(), historical_pair.clone()),
+            ("late-l0.vix".to_string(), late_l0),
+        ];
+        let strict_merge = |inputs: &[(String, BuiltPair)]| {
+            merge_core_files_with_caps_and_cancellation(
+                StreamType::Traces,
+                &as_inputs(inputs),
+                &schema,
+                &[],
+                &[],
+                current_caps,
+                Some(VixMergeCancellation::new()),
+                true,
+            )
+        };
+        let error = strict_merge(&inputs).unwrap_err();
+        let error = format!("{error:#}");
+        assert!(
+            error.contains(
+                "required indexed merge is not applicable; refusing a large full rebuild"
+            ),
+            "{error}"
+        );
+        assert!(error.contains("span_duration_nano"), "{error}");
+        assert!(error.contains("bloom-only"), "{error}");
+
+        let classify = |pair: &BuiltPair| {
+            classify_core_file_with_caps(
+                StreamType::Traces,
+                "historical.vix",
+                vortex_index::BytesRangeSource::new("historical.vix", pair.0.clone()),
+                pair.1.as_ref().map(|index| {
+                    vortex_index::BytesRangeSource::new("historical.vxi", index.clone())
+                }),
+                &schema,
+                &[],
+                &[],
+                current_caps,
+            )
+            .unwrap()
+        };
+        let CoreFileStatus::NeedsRebuild(reason) = classify(&historical_pair) else {
+            panic!("the legacy duration index must be repairable before merging");
+        };
+        assert!(reason.contains("span_duration_nano"), "{reason}");
+        assert!(matches!(classify(&inputs[1].1), CoreFileStatus::Current));
+
+        let reference = merge_core_files_rebuild_with_caps(
+            StreamType::Traces,
+            &as_inputs(&inputs),
+            &schema,
+            &[],
+            &[],
+            current_caps,
+        )
+        .unwrap();
+        let outcome = rebuild_core_file_sidecar_with_caps_and_cancellation(
+            StreamType::Traces,
+            &as_inputs(&inputs)[0],
+            &schema,
+            &[],
+            &[],
+            current_caps,
+            Some(VixMergeCancellation::new()),
+        )
+        .unwrap();
+        let SidecarHealOutcome::Rebuilt { index, stats } = outcome else {
+            panic!("the capability migration must need only a sidecar: {outcome:?}");
+        };
+        assert_eq!(stats.docs_size, 0, "the repair must not rewrite data bytes");
+        assert_eq!(stats.row_count, 4);
+        let healed_pair = (historical_pair.0.clone(), Some(bytes::Bytes::from(index)));
+        assert_eq!(healed_pair.0, historical_pair.0);
+        assert_ne!(healed_pair.1, historical_pair.1);
+        assert!(matches!(classify(&healed_pair), CoreFileStatus::Current));
+        assert!(open_pair(&healed_pair).has_term_capability("span_duration_nano"));
+
+        inputs[0].1 = healed_pair;
+        let merged = strict_merge(&inputs).unwrap();
+        assert!(merged.used_index_merge);
+        assert_eq!(merged.stats.row_count, 5);
+        let reader = open_merged(&merged);
+        assert_core_files_equivalent_logical_docs(
+            &reader,
+            &open_merged(&reference),
+            "repaired indexed trace merge vs full rebuild",
+        );
+        let timestamps = read_i64(&reader, TIMESTAMP_COL_NAME);
+        let trace_ids = read_strings(&reader, "trace_id");
+        for timestamp in [400, 300, 250, 200, 100] {
+            let docs = matching_docs(
+                &reader,
+                &exact("span_duration_nano", &(timestamp * 10).to_string()),
+            );
+            assert_eq!(docs.len(), 1, "duration for timestamp {timestamp}");
+            let row = docs[0] as usize;
+            assert_eq!(timestamps[row], timestamp);
+            assert_eq!(trace_ids[row], Some(format!("trace-{timestamp}")));
+        }
+    }
+
     /// M12 double-hash elimination predicate: an input whose DICTIONARY
     /// fully covers a bloom-only output field (term capability, not
     /// partial) contributes its values through the k-way walk and must NOT
