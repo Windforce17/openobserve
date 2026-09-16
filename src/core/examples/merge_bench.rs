@@ -57,6 +57,20 @@
 //!
 //! Typical A/B: `gen` once, build this example at the old and new code,
 //! run `merge` with each binary into different outputs, `compare` them.
+//!
+//! Indexed logs capacity benchmark (synthetic data only):
+//!   gen-logs <dir> <file_number> <original_mib>
+//!       Generate ONE indexed, body-FTS log file per process. Its JSON
+//!       manifest records measured JSON bytes (excluding record newlines),
+//!       not an assumed bytes-per-row multiplier. Trim the final batch
+//!       so the corpus remains eligible for its original-size cap.
+//!   merge <dir> <out.vix> --indexed-only --stored-schema
+//!       Use the production entry point that refuses rebuild fallback.
+//!       Run each merge under `/usr/bin/time -l` on macOS (`-v` on Linux)
+//!       for process peak RSS, independently of generation/verification.
+//!   verify-logs <input_dir> <out.vix>
+//!       Check row multiset and all term document-count digests against
+//!       the input union, plus FTS postings against every decoded row.
 
 use std::{
     hash::{DefaultHasher, Hash, Hasher},
@@ -69,10 +83,23 @@ use arrow::{
     datatypes::{DataType, Field, Schema},
 };
 use datafusion::{catalog::TableProvider, datasource::MemTable};
-use vortex_index::{VixDocs, VixReader};
+use vortex_index::{VixDocs, VixQuery, VixReader};
+
+// Match the production allocator; system malloc retention can otherwise
+// dominate the large-merge RSS comparison.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 const TIMESTAMP_COL: &str = "_timestamp";
 const BATCH_ROWS: usize = 8192;
+const LOG_PROBES: [&str; 6] = [
+    "request",
+    "requestcompleted",
+    "upstreamtimeout",
+    "retryexhausted",
+    "healthprobe",
+    "absentvalidationtoken",
+];
 
 /// xorshift64* — deterministic, dependency-free.
 struct Rng(u64);
@@ -240,6 +267,199 @@ fn stream_settings() -> (Vec<String>, Vec<String>) {
     let fts: Vec<String> = vec![];
     let bloom: Vec<String> = vec!["trace_id".to_string()];
     (fts, bloom)
+}
+
+fn logs_schema() -> Arc<Schema> {
+    let mut fields = vec![Field::new(TIMESTAMP_COL, DataType::Int64, false)];
+    for name in [
+        "body",
+        "severity",
+        "service_name",
+        "k8s_namespace_name",
+        "k8s_pod_name",
+        "k8s_container_name",
+        "trace_id",
+        "request_id",
+    ] {
+        fields.push(Field::new(name, DataType::Utf8, true));
+    }
+    fields.push(Field::new("http_status_code", DataType::Int64, true));
+    Arc::new(Schema::new(fields))
+}
+
+fn make_logs_batch(
+    schema: &Arc<Schema>,
+    rng: &mut Rng,
+    file_number: usize,
+    offset: usize,
+) -> Result<arrow::record_batch::RecordBatch, anyhow::Error> {
+    const DETAILS: [&str; 8] = [
+        "upstream connection established; response headers received; payload decoded successfully",
+        "authorization policy evaluated; tenant quota checked; request context propagated",
+        "database transaction committed; connection returned to pool; replica state synchronized",
+        "cache lookup completed; object metadata validated; response compression enabled",
+        "worker task scheduled; queue partition selected; acknowledgement received from broker",
+        "distributed trace context attached; span attributes exported; metrics batch accepted",
+        "configuration revision verified; service discovery refreshed; endpoint health checked",
+        "storage object fetched; checksum verified; result serialization completed",
+    ];
+    let mut timestamps = Vec::with_capacity(BATCH_ROWS);
+    let mut strings: Vec<Vec<String>> = (0..8).map(|_| Vec::with_capacity(BATCH_ROWS)).collect();
+    let mut statuses = Vec::with_capacity(BATCH_ROWS);
+    for row in 0..BATCH_ROWS {
+        // One second per file leaves disjoint ranges for the intended
+        // 256 MiB inputs; fail below if a requested file would exceed it.
+        let row_number = offset + row;
+        anyhow::ensure!(
+            row_number < 1_000_000,
+            "log file exceeds its timestamp range"
+        );
+        timestamps.push(1_789_502_400_000_000 + file_number as i64 * 1_000_000 + row_number as i64);
+        let outcome = match rng.below(100) {
+            0 => "retryexhausted",
+            1 => "healthprobe",
+            2..=9 => "upstreamtimeout",
+            _ => "requestcompleted",
+        };
+        let status = if outcome == "upstreamtimeout" || outcome == "retryexhausted" {
+            503
+        } else {
+            200
+        };
+        let service = format!("api-service-{}", rng.below(30));
+        let trace = rng.hex(32);
+        let request = rng.hex(32);
+        let mut body = format!(
+            "request {outcome} service={service} method=POST route=/v1/resources/{} \
+             status={status} elapsed_ms={} trace_id={trace} request_id={request}; ",
+            rng.below(300),
+            rng.below(5000),
+        );
+        for _ in 0..(6 + rng.below(6)) {
+            body.push_str(DETAILS[rng.below(DETAILS.len() as u64) as usize]);
+            body.push_str("; ");
+        }
+        strings[0].push(body);
+        strings[1].push(if status == 503 { "ERROR" } else { "INFO" }.to_string());
+        strings[2].push(service.clone());
+        strings[3].push(["production", "platform", "observability"][rng.below(3) as usize].into());
+        strings[4].push(format!("{service}-deployment-{:04}", rng.below(200)));
+        strings[5].push(service);
+        strings[6].push(trace);
+        strings[7].push(request);
+        statuses.push(status);
+    }
+    let mut columns = vec![Arc::new(Int64Array::from(timestamps)) as ArrayRef];
+    columns.extend(
+        strings
+            .into_iter()
+            .map(|values| Arc::new(StringArray::from(values)) as ArrayRef),
+    );
+    columns.push(Arc::new(Int64Array::from(statuses)));
+    Ok(arrow::record_batch::RecordBatch::try_new(
+        Arc::clone(schema),
+        columns,
+    )?)
+}
+
+#[derive(Default)]
+struct ByteCounter(u64);
+
+impl std::io::Write for ByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 += bytes.len() as u64;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn json_original_bytes(batch: &arrow::record_batch::RecordBatch) -> anyhow::Result<u64> {
+    let mut writer = arrow_json::LineDelimitedWriter::new(ByteCounter::default());
+    writer.write(batch)?;
+    writer.finish()?;
+    // Ingestion counts JSON records without newline delimiters.
+    Ok(writer.into_inner().0 - batch.num_rows() as u64)
+}
+
+async fn cmd_gen_logs(dir: &str, file_number: usize, original_mib: u64) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        original_mib > 0 && original_mib <= 512,
+        "original_mib must be in 1..=512; generate bounded inputs in separate processes"
+    );
+    std::fs::create_dir_all(dir)?;
+    let path = std::path::Path::new(dir).join(format!("{file_number:04}.vix"));
+    anyhow::ensure!(
+        !path.exists() && !path.with_extension("vxi").exists(),
+        "refusing to overwrite {}",
+        path.display()
+    );
+    let schema = logs_schema();
+    let mut rng =
+        Rng(0x9E3779B97F4A7C15 ^ (file_number as u64 + 1).wrapping_mul(0xA24BAED4963EE407));
+    let mut batches = Vec::new();
+    let mut rows = 0usize;
+    let mut original_bytes = 0u64;
+    let target_bytes = original_mib * 1024 * 1024;
+    while original_bytes < target_bytes {
+        let mut batch = make_logs_batch(&schema, &mut rng, file_number, rows)?;
+        let mut batch_bytes = json_original_bytes(&batch)?;
+        let remaining = target_bytes - original_bytes;
+        let last_batch = batch_bytes > remaining;
+        if last_batch {
+            let keep = (remaining * batch.num_rows() as u64 / batch_bytes) as usize;
+            batch = batch.slice(0, keep);
+            batch_bytes = json_original_bytes(&batch)?;
+            while batch_bytes > remaining && batch.num_rows() > 0 {
+                batch = batch.slice(0, batch.num_rows() - 1);
+                batch_bytes = json_original_bytes(&batch)?;
+            }
+        }
+        rows += batch.num_rows();
+        original_bytes += batch_bytes;
+        batches.push(batch);
+        if last_batch {
+            break;
+        }
+    }
+    let table: Arc<dyn TableProvider> =
+        Arc::new(MemTable::try_new(Arc::clone(&schema), vec![batches])?);
+    let started = Instant::now();
+    let result = openobserve_core::vix::core_writer::write_core_file_from_tables(
+        &format!("merge-bench-logs-{file_number}"),
+        config::meta::stream::StreamType::Logs,
+        schema,
+        vec![table],
+        &["body".to_string()],
+        &["trace_id".to_string()],
+        false,
+        0,
+    )
+    .await?;
+    anyhow::ensure!(
+        result.stats.row_count == rows as u64 && result.dropped_rows == 0,
+        "log builder lost rows"
+    );
+    let index = result.index.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("log generation produced no index; check index-off environment")
+    })?;
+    std::fs::write(&path, &result.data)?;
+    std::fs::write(path.with_extension("vxi"), index)?;
+    let manifest = serde_json::json!({
+        "file": path.file_name().unwrap().to_string_lossy(),
+        "file_number": file_number, "rows": rows, "original_bytes": original_bytes,
+        "data_bytes": result.data.len(), "index_bytes": index.len(),
+        "terms": result.stats.term_count, "fts_fields": ["body"],
+        "build_seconds": started.elapsed().as_secs_f64(),
+    });
+    std::fs::write(
+        path.with_extension("json"),
+        serde_json::to_vec_pretty(&manifest)?,
+    )?;
+    eprintln!("gen-logs: {manifest}");
+    Ok(())
 }
 
 async fn cmd_gen(
@@ -415,35 +635,37 @@ fn load_inputs(
         .collect();
     paths.sort();
     anyhow::ensure!(!paths.is_empty(), "no .vix files in {dir:?}");
-    paths
-        .iter()
-        .map(|path| {
-            let name = path.file_name().unwrap().to_string_lossy().into_owned();
-            let file = std::fs::File::open(path)?;
-            let len = file.metadata()?.len();
-            let source: std::sync::Arc<dyn vortex_index::VixRangeSource> =
-                std::sync::Arc::new(FileRangeSource {
-                    name: name.clone(),
-                    file,
-                    len,
-                });
-            // v3 split: the index sidecar sits next to the data object
-            let index_path = path.with_extension("vxi");
-            let index: Option<std::sync::Arc<dyn vortex_index::VixRangeSource>> =
-                match std::fs::File::open(&index_path) {
-                    Ok(file) => {
-                        let len = file.metadata()?.len();
-                        Some(std::sync::Arc::new(FileRangeSource {
-                            name: format!("{name}.vxi"),
-                            file,
-                            len,
-                        }))
-                    }
-                    Err(_) => None,
-                };
-            Ok((name, source, index))
-        })
-        .collect()
+    paths.iter().map(|path| load_input(path)).collect()
+}
+
+fn load_input(
+    path: &std::path::Path,
+) -> anyhow::Result<openobserve_core::vix::core_writer::MergeInput> {
+    let source = |path: &std::path::Path| -> anyhow::Result<Arc<dyn vortex_index::VixRangeSource>> {
+        let file = std::fs::File::open(path)?;
+        let len = file.metadata()?.len();
+        Ok(Arc::new(FileRangeSource {
+            name: path.display().to_string(),
+            file,
+            len,
+        }))
+    };
+    let index = match source(&path.with_extension("vxi")) {
+        Ok(index) => Some(index),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            None
+        }
+        Err(error) => return Err(error),
+    };
+    Ok((
+        path.file_name().unwrap().to_string_lossy().into_owned(),
+        source(path)?,
+        index,
+    ))
 }
 
 /// Derive merge-time settings from the corpus files themselves (unchanged
@@ -550,7 +772,35 @@ fn cmd_merge(
     require_columns: bool,
     stored_schema: bool,
     stream_type: config::meta::stream::StreamType,
+    indexed_only: bool,
 ) -> Result<(), anyhow::Error> {
+    let out_path = std::path::Path::new(out);
+    for path in [out_path.to_path_buf(), out_path.with_extension("vxi")] {
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => anyhow::bail!("refusing to overwrite existing output {}", path.display()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "inspect output {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    let parent = out_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let canonical_output = std::fs::canonicalize(parent)?.join(
+        out_path
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("output must name a file"))?,
+    );
+    anyhow::ensure!(
+        !canonical_output.starts_with(std::fs::canonicalize(dir)?),
+        "output must be outside the input corpus: {}",
+        canonical_output.display()
+    );
     let mib = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
     let started = Instant::now();
     let inputs = load_inputs(dir)?;
@@ -573,7 +823,16 @@ fn cmd_merge(
     );
 
     let started = Instant::now();
-    let result = if rebuild {
+    let result = if indexed_only {
+        openobserve_core::vix::core_writer::merge_core_files_indexed_only_with_cancellation(
+            stream_type,
+            &inputs,
+            &latest_schema,
+            &fts,
+            &bloom,
+            &openobserve_core::vix::core_writer::VixMergeCancellation::new(),
+        )?
+    } else if rebuild {
         openobserve_core::vix::core_writer::merge_core_files_rebuild(
             stream_type,
             &inputs,
@@ -591,6 +850,10 @@ fn cmd_merge(
         )?
     };
     let merge_elapsed = started.elapsed();
+    anyhow::ensure!(
+        !indexed_only || result.used_index_merge,
+        "indexed-only benchmark did not use the index merge path"
+    );
     if require_columns {
         anyhow::ensure!(
             result.terms_from_columns,
@@ -891,6 +1154,181 @@ fn cmd_compare(
     Ok(())
 }
 
+#[derive(Debug, Default, PartialEq, Eq, serde::Serialize)]
+struct LogsDigest {
+    rows: u64,
+    row_hash_sum: u64,
+    row_hash_xor: u64,
+    term_documents: u64,
+    term_hash_sum: u64,
+    fts_counts: [u64; LOG_PROBES.len()],
+}
+
+impl LogsDigest {
+    fn add(&mut self, other: &Self) {
+        self.rows += other.rows;
+        self.row_hash_sum = self.row_hash_sum.wrapping_add(other.row_hash_sum);
+        self.row_hash_xor ^= other.row_hash_xor;
+        self.term_documents += other.term_documents;
+        self.term_hash_sum = self.term_hash_sum.wrapping_add(other.term_hash_sum);
+        for (sum, count) in self.fts_counts.iter_mut().zip(other.fts_counts) {
+            *sum += count;
+        }
+    }
+}
+
+/// A commutative digest permits merged dictionary terms to coalesce and
+/// documents to change order, while the probe bitmaps independently check
+/// that postings still point at the correct decoded rows. This is a
+/// probabilistic content check, not a cryptographic equality proof.
+fn logs_digest(
+    input: &openobserve_core::vix::core_writer::MergeInput,
+) -> anyhow::Result<(LogsDigest, Vec<String>)> {
+    let (name, data, index) = input;
+    anyhow::ensure!(index.is_some(), "{name}: missing index sidecar");
+    let reader = VixReader::open_ranged_with_index(Arc::clone(data), index.clone())?;
+    anyhow::ensure!(
+        reader.fts_fields().contains("body"),
+        "{name}: body lost FTS capability"
+    );
+    anyhow::ensure!(
+        reader.partial_fields().is_empty(),
+        "{name}: partial index fields {:?}",
+        reader.partial_fields()
+    );
+    let mut digest = LogsDigest::default();
+    reader.for_each_term(&mut |key, doc_count, postings| {
+        anyhow::ensure!(
+            postings.len() as u64 == doc_count,
+            "{name}: postings count differs from term metadata"
+        );
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        digest.term_documents += doc_count;
+        digest.term_hash_sum = digest
+            .term_hash_sum
+            .wrapping_add(hasher.finish().wrapping_mul(doc_count));
+        Ok(())
+    })?;
+    let probes = LOG_PROBES
+        .iter()
+        .map(|token| {
+            reader.eval(&VixQuery::TokenAnyField {
+                token: token.as_bytes().to_vec(),
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let docs = VixDocs::open_ranged(Arc::clone(data))?;
+    let mut columns: Vec<String> = docs
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.name().clone())
+        .collect();
+    columns.sort();
+    let body_index = columns
+        .iter()
+        .position(|name| name == "body")
+        .ok_or_else(|| anyhow::anyhow!("{name}: missing body column"))?;
+    docs.scan_docs(Some(&columns), None, None, &mut |batch| {
+        let values = columns
+            .iter()
+            .map(|name| {
+                let column = batch
+                    .column_by_name(name)
+                    .ok_or_else(|| anyhow::anyhow!("scan lost column {name}"))?;
+                Ok(arrow::compute::cast(column, &DataType::Utf8)?)
+            })
+            .collect::<anyhow::Result<Vec<ArrayRef>>>()?;
+        let bodies = values[body_index]
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| anyhow::anyhow!("body was not cast to Utf8"))?;
+        for row in 0..batch.num_rows() {
+            let mut hasher = DefaultHasher::new();
+            for column in &values {
+                hash_value_at(column, row, &mut hasher);
+            }
+            let hash = hasher.finish();
+            digest.row_hash_sum = digest.row_hash_sum.wrapping_add(hash);
+            digest.row_hash_xor ^= hash;
+            for (probe, (token, bitmap)) in LOG_PROBES.iter().zip(&probes).enumerate() {
+                let expected = bodies.value(row).contains(*token);
+                anyhow::ensure!(
+                    bitmap.value(digest.rows as usize) == expected,
+                    "{name}: FTS postings mismatch at row {} for {token}",
+                    digest.rows
+                );
+                digest.fts_counts[probe] += u64::from(expected);
+            }
+            digest.rows += 1;
+        }
+        Ok(())
+    })?;
+    anyhow::ensure!(
+        digest.rows == reader.row_count(),
+        "{name}: decoded row count differs from metadata"
+    );
+    // Raw composite keys contain field ids; require unchanged field order
+    // before comparing their count-weighted digests.
+    let mut shape = columns;
+    shape.extend(
+        reader
+            .term_field_names()
+            .into_iter()
+            .map(|name| format!("term:{name}")),
+    );
+    Ok((digest, shape))
+}
+
+fn cmd_verify_logs(dir: &str, out: &str) -> anyhow::Result<()> {
+    let inputs = load_inputs(dir)?;
+    let mut expected = LogsDigest::default();
+    let mut expected_shape = None;
+    let mut original_bytes = 0u64;
+    for input in &inputs {
+        let (digest, shape) = logs_digest(input)?;
+        let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(
+            std::path::Path::new(dir)
+                .join(&input.0)
+                .with_extension("json"),
+        )?)?;
+        anyhow::ensure!(
+            manifest["rows"].as_u64() == Some(digest.rows),
+            "{}: generated row count differs from manifest",
+            input.0
+        );
+        original_bytes += manifest["original_bytes"]
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("{}: manifest lacks original_bytes", input.0))?;
+        if let Some(expected_shape) = &expected_shape {
+            anyhow::ensure!(
+                &shape == expected_shape,
+                "{}: input schema/index field order differs",
+                input.0
+            );
+        } else {
+            expected_shape = Some(shape);
+        }
+        expected.add(&digest);
+        eprintln!("verified input {}: {} rows", input.0, digest.rows);
+    }
+    let (actual, shape) = logs_digest(&load_input(std::path::Path::new(out))?)?;
+    anyhow::ensure!(
+        Some(shape) == expected_shape,
+        "output schema/index field order differs"
+    );
+    anyhow::ensure!(
+        actual == expected,
+        "merged content/index differs: expected {expected:?}, actual {actual:?}"
+    );
+    eprintln!(
+        "verify-logs: {}",
+        serde_json::json!({ "input_files": inputs.len(), "original_bytes": original_bytes, "digest": actual, "fts_probes": LOG_PROBES })
+    );
+    Ok(())
+}
+
 /// Minimal stderr logger (O2_BENCH_DEBUG_LOG=1): surfaces the merge's
 /// `log::debug!` phase timings (term-table load, k-way ranges/workers,
 /// dict/terms encode, SBBF bloom build, index merge total).
@@ -918,8 +1356,42 @@ async fn main() -> Result<(), anyhow::Error> {
         }
     }
     let args: Vec<String> = std::env::args().collect();
+    let allowed_flags: &[&str] = match args.get(1).map(String::as_str) {
+        Some("gen") => &[
+            "--heal",
+            "--overlap",
+            "--narrow",
+            "--vary-schema",
+            "--type-drift",
+        ],
+        Some("merge") => &[
+            "--rebuild",
+            "--latest-status-code-utf8",
+            "--require-columns",
+            "--stored-schema",
+            "--traces",
+            "--indexed-only",
+        ],
+        Some("sidecar") => &["--stored-schema", "--traces"],
+        Some("compare") => &["--multiset", "--docs-only", "--ignore-source"],
+        _ => &[],
+    };
+    for flag in args.iter().skip(2).filter(|arg| arg.starts_with("--")) {
+        anyhow::ensure!(
+            allowed_flags.contains(&flag.as_str()),
+            "unsupported flag {flag} for {:?}",
+            args.get(1)
+        );
+    }
     let flag = |name: &str| args.iter().skip(2).any(|a| a == name);
     match args.get(1).map(String::as_str) {
+        Some("gen-logs") => {
+            anyhow::ensure!(
+                args.len() == 5,
+                "gen-logs <dir> <file_number> <original_mib> accepts no flags"
+            );
+            cmd_gen_logs(&args[2], args[3].parse()?, args[4].parse()?).await
+        }
         Some("gen") => {
             let dir = args.get(2).expect(
                 "gen <dir> <files> <rows_per_file> [--heal] [--overlap] [--vary-schema] \
@@ -944,9 +1416,13 @@ async fn main() -> Result<(), anyhow::Error> {
             .await
         }
         Some("merge") => {
+            anyhow::ensure!(
+                !flag("--indexed-only") || (!flag("--rebuild") && !flag("--require-columns")),
+                "--indexed-only cannot be combined with --rebuild or --require-columns"
+            );
             let dir = args.get(2).expect(
                 "merge <dir> <out.vix> [--rebuild] [--latest-status-code-utf8] \
-                 [--require-columns] [--stored-schema] [--traces]",
+                 [--require-columns] [--stored-schema] [--traces] [--indexed-only]",
             );
             let out = args.get(3).expect("out.vix");
             // #51c passthrough + #51c-c concatenation are the DEFAULT merge
@@ -964,7 +1440,15 @@ async fn main() -> Result<(), anyhow::Error> {
                 flag("--require-columns"),
                 flag("--stored-schema"),
                 stream_type,
+                flag("--indexed-only"),
             )
+        }
+        Some("verify-logs") => {
+            anyhow::ensure!(
+                args.len() == 4,
+                "verify-logs <input_dir> <out.vix> accepts no flags"
+            );
+            cmd_verify_logs(&args[2], &args[3])
         }
         Some("sidecar") => {
             let dir = args
@@ -996,8 +1480,10 @@ async fn main() -> Result<(), anyhow::Error> {
             eprintln!(
                 "usage: merge_bench gen <dir> <files> <rows_per_file> [--heal] [--overlap] \
                  [--vary-schema] [--type-drift] | \
+                 gen-logs <dir> <file_number> <original_mib> | \
                  merge <dir> <out.vix> [--rebuild] [--latest-status-code-utf8] \
-                 [--require-columns] [--stored-schema] [--traces] | \
+                 [--require-columns] [--stored-schema] [--traces] [--indexed-only] | \
+                 verify-logs <input_dir> <out.vix> | \
                  sidecar <dir> [--stored-schema] [--traces] | \
                  compare [--multiset] [--docs-only] [--ignore-source] <a.vix> <b.vix>"
             );

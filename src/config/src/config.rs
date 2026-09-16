@@ -2961,11 +2961,19 @@ pub struct Compact {
     #[env_config(name = "ZO_COMPACT_MAX_FILE_SIZE", default = 2048)] // MB
     pub max_file_size: usize,
     #[env_config(
+        name = "ZO_COMPACT_LOGS_INDEXED_MAX_FILE_SIZE",
+        default = 0,
+        help = "Max merged size in MB for indexed log .vix inputs (index_size > 0). 0 \
+                inherits ZO_COMPACT_MAX_FILE_SIZE; values below the global cap clamp to it. \
+                Index-less log rebuilds remain on the global cap."
+    )]
+    pub logs_indexed_max_file_size: usize,
+    #[env_config(
         name = "ZO_COMPACT_TRACES_INDEXED_MAX_FILE_SIZE",
         default = 0,
         help = "Max merged size in MB for indexed trace .vix inputs (index_size > 0). 0 \
                 inherits ZO_COMPACT_MAX_FILE_SIZE; values below the global cap clamp to it. \
-                Index-less trace rebuilds and every non-trace stream remain on the global cap."
+                Index-less trace rebuilds remain on the global cap."
     )]
     pub traces_indexed_max_file_size: usize,
     #[env_config(
@@ -3051,19 +3059,22 @@ pub struct Compact {
     pub retention_allowed_hours: String,
 }
 impl Compact {
-    /// Merge byte ceiling for one homogeneous file class. Only indexed trace
-    /// core files get the larger dictionary-passthrough target; index-less
-    /// trace rebuilds and every other class stay on the global target.
+    /// Merge byte ceiling for one homogeneous file class. Indexed log and
+    /// trace core files may use larger dictionary-passthrough targets;
+    /// index-less rebuilds and every other class stay on the global target.
     #[inline]
     pub fn max_file_size_for_merge(&self, stream_type: StreamType, indexed_core: bool) -> usize {
-        if indexed_core
-            && stream_type == StreamType::Traces
-            && self.traces_indexed_max_file_size > 0
-        {
-            self.traces_indexed_max_file_size
-        } else {
-            self.max_file_size
+        if indexed_core {
+            let indexed_target = match stream_type {
+                StreamType::Logs => self.logs_indexed_max_file_size,
+                StreamType::Traces => self.traces_indexed_max_file_size,
+                _ => 0,
+            };
+            if indexed_target > 0 {
+                return indexed_target;
+            }
         }
+        self.max_file_size
     }
 }
 
@@ -4654,13 +4665,17 @@ fn check_compact_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
     }
 
     // Convert compaction size limits from configured MB to runtime bytes.
-    // Indexed trace-core inputs have a separate higher ceiling because their
+    // Indexed log/trace-core inputs have separate higher ceilings because their
     // dictionary-passthrough merge does not pay the index-less rebuild's
     // input-proportional memory. Zero inherits the global ceiling.
     if cfg.compact.max_file_size < 1 {
         cfg.compact.max_file_size = 512;
     }
     cfg.compact.max_file_size *= 1024 * 1024;
+    if cfg.compact.logs_indexed_max_file_size > 0 {
+        cfg.compact.logs_indexed_max_file_size =
+            (cfg.compact.logs_indexed_max_file_size * 1024 * 1024).max(cfg.compact.max_file_size);
+    }
     if cfg.compact.traces_indexed_max_file_size > 0 {
         cfg.compact.traces_indexed_max_file_size =
             (cfg.compact.traces_indexed_max_file_size * 1024 * 1024).max(cfg.compact.max_file_size);
@@ -5724,6 +5739,7 @@ mod tests {
         cfg.compact.data_retention_days = 0;
         cfg.compact.interval = 0;
         cfg.compact.max_file_size = 0;
+        cfg.compact.logs_indexed_max_file_size = 0;
         cfg.compact.traces_indexed_max_file_size = 0;
         cfg.compact.delete_files_delay_hours = 0;
         cfg.compact.data_retention_interval = 0;
@@ -5737,6 +5753,7 @@ mod tests {
         check_compact_config(&mut cfg).unwrap();
         assert_eq!(cfg.compact.interval, 10);
         assert_eq!(cfg.compact.max_file_size, 512 * 1024 * 1024);
+        assert_eq!(cfg.compact.logs_indexed_max_file_size, 0);
         assert_eq!(cfg.compact.traces_indexed_max_file_size, 0);
         assert_eq!(
             cfg.compact
@@ -5775,6 +5792,38 @@ mod tests {
             cfg.compact.max_file_size_for_merge(StreamType::Logs, true),
             1024 * 1024 * 1024
         );
+    }
+
+    #[test]
+    fn test_log_indexed_compaction_target_preserves_rebuild_and_trace_limits() {
+        for (configured_logs, expected_logs) in [(0, 1024), (512, 1024), (8192, 8192)] {
+            let mut cfg = Config::default();
+            cfg.compact.max_file_size = 1024;
+            cfg.compact.logs_indexed_max_file_size = configured_logs;
+            cfg.compact.traces_indexed_max_file_size = 4096;
+            check_compact_config(&mut cfg).unwrap();
+
+            assert_eq!(
+                cfg.compact.max_file_size_for_merge(StreamType::Logs, true),
+                expected_logs * 1024 * 1024
+            );
+            assert_eq!(
+                cfg.compact
+                    .max_file_size_for_merge(StreamType::Traces, true),
+                4096 * 1024 * 1024
+            );
+            for stream_type in [StreamType::Logs, StreamType::Traces, StreamType::Metrics] {
+                assert_eq!(
+                    cfg.compact.max_file_size_for_merge(stream_type, false),
+                    1024 * 1024 * 1024
+                );
+            }
+            assert_eq!(
+                cfg.compact
+                    .max_file_size_for_merge(StreamType::Metrics, true),
+                1024 * 1024 * 1024
+            );
+        }
     }
 
     #[test]
