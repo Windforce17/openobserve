@@ -1422,6 +1422,91 @@ fn compact_single_partition_sort(stream_type: StreamType) -> bool {
     stream_type == StreamType::Metadata
 }
 
+/// The stream-level inputs a merge derives its output from: the current
+/// registry schema (column target types), the index field plan and the
+/// storage class. Loaded once per batch, before any input byte is read.
+struct MergeStreamSettings {
+    latest_schema: Arc<Schema>,
+    full_text_search_fields: Vec<String>,
+    bloom_filter_fields: Vec<String>,
+    storage_type: StorageType,
+}
+
+impl MergeStreamSettings {
+    async fn load(
+        org_id: &str,
+        stream_name: &str,
+        stream_type: StreamType,
+    ) -> Result<Self, anyhow::Error> {
+        let latest_schema = infra::schema::get(org_id, stream_name, stream_type).await?;
+        let stream_settings = infra::schema::unwrap_stream_settings(&latest_schema);
+        Ok(Self {
+            bloom_filter_fields: get_stream_setting_bloom_filter_fields(&stream_settings),
+            full_text_search_fields: get_stream_setting_fts_fields(&stream_settings),
+            storage_type: stream_settings
+                .map(|s| s.storage_type)
+                .unwrap_or(StorageType::Normal),
+            latest_schema: Arc::new(latest_schema),
+        })
+    }
+}
+
+/// Fold the inputs' file_list metadata into the merged output's provisional
+/// meta (the merge's own stats replace records/range after it runs).
+fn fold_merge_group_meta(files: &[FileKey]) -> Result<FileMeta, anyhow::Error> {
+    let (min_ts, max_ts, records, original_size) = files.iter().fold(
+        (i64::MAX, i64::MIN, 0, 0),
+        |(min_ts, max_ts, records, size), file| {
+            (
+                min_ts.min(file.meta.min_ts),
+                max_ts.max(file.meta.max_ts),
+                records + file.meta.records,
+                size + file.meta.original_size,
+            )
+        },
+    );
+    if records == 0 {
+        return Err(anyhow::anyhow!("merge_files error: records is 0"));
+    }
+    Ok(FileMeta {
+        min_ts: if min_ts == i64::MAX { 0 } else { min_ts },
+        max_ts: if max_ts == i64::MIN { 0 } else { max_ts },
+        records,
+        original_size,
+        compressed_size: 0,
+        flattened: false,
+        index_size: 0,
+        bloom_ver: 0,
+        ..Default::default()
+    })
+}
+
+/// Cache the merge inputs (and eligible VIX sidecars) whole in the disk
+/// cache under a bounded byte/request budget. Returns the keys of DATA
+/// objects found missing in the object store — their file_list rows are
+/// already removed. Kept as its own phase in production telemetry so
+/// object-store latency cannot masquerade as encoder cost.
+async fn prefetch_merge_inputs(
+    thread_id: usize,
+    files: &[FileKey],
+    is_core_group: bool,
+    start: std::time::Instant,
+    cancel: &MergeCancellation,
+) -> Result<Vec<String>, anyhow::Error> {
+    let prefetch_started = std::time::Instant::now();
+    let deleted_files = cache_remote_files(files).await?;
+    cancel.check("merge input prefetch")?;
+    metrics::COMPACT_VIX_PHASE_DURATION
+        .with_label_values(&["prefetch", if is_core_group { "core" } else { "flat" }])
+        .observe(prefetch_started.elapsed().as_secs_f64());
+    log::info!(
+        "[COMPACTOR:WORKER:{thread_id}] prefetched {} merge input data object(s) and eligible VIX sidecar(s), took: {} ms",
+        files.len(),
+        start.elapsed().as_millis()
+    );
+    Ok(deleted_files)
+}
+
 // merge small files into big file, upload to storage, returns the big file key and merged files
 // params:
 // - thread_id: the id of the thread
@@ -1520,29 +1605,39 @@ pub async fn merge_files(
         return Ok((Vec::new(), Vec::new()));
     }
 
-    // Cache merge inputs and VIX sidecars under a bounded byte/request
-    // budget. Keep this phase separate from merge CPU in production
-    // telemetry so object-store latency cannot masquerade as encoder cost.
-    let prefetch_started = std::time::Instant::now();
-    let deleted_files = cache_remote_files(&new_file_list).await?;
-    cancel.check("merge input prefetch")?;
-    metrics::COMPACT_VIX_PHASE_DURATION
-        .with_label_values(&["prefetch", if is_core_group { "core" } else { "flat" }])
-        .observe(prefetch_started.elapsed().as_secs_f64());
-    log::info!(
-        "[COMPACTOR:WORKER:{thread_id}] prefetched {} merge input data object(s) and eligible VIX sidecar(s), took: {} ms",
-        new_file_list.len(),
-        start.elapsed().as_millis()
-    );
+    // get latest version of schema
+    let settings = MergeStreamSettings::load(org_id, stream_name, stream_type).await?;
+
+    // core files: k-way merge by _timestamp without DataFusion, index
+    // rebuilt from _source with the current settings. The core path plans
+    // (and, for large indexed batches, refuses) BEFORE prefetching its
+    // inputs, so it owns the prefetch itself.
+    if is_core_group {
+        let new_file_meta = fold_merge_group_meta(&new_file_list)?;
+        return merge_core_group(
+            thread_id,
+            org_id,
+            stream_type,
+            stream_name,
+            prefix,
+            new_file_list,
+            new_file_meta,
+            settings,
+            is_single_core_heal,
+            cancel,
+            start,
+        )
+        .await;
+    }
+
+    // Flat files are read whole by the DataFusion merge: cache the inputs
+    // under a bounded byte/request budget first.
+    let deleted_files =
+        prefetch_merge_inputs(thread_id, &new_file_list, false, start, cancel).await?;
     if !deleted_files.is_empty() {
         new_file_list.retain(|f| !deleted_files.contains(&f.key));
     }
-    // (a heal whose only file was dropped as invalid has nothing left to
-    // rebuild — cache_remote_files already removed it from the file_list)
-    if new_file_list.len() <= 1
-        && !is_match_downsampling_rule
-        && !(is_single_core_heal && new_file_list.len() == 1)
-    {
+    if new_file_list.len() <= 1 && !is_match_downsampling_rule {
         // Not enough healthy inputs left to merge: return an EMPTY merged
         // set so the caller releases the batch with no file_list writes.
         // Returning the batch here used to commit a PURE DELETION of every
@@ -1554,68 +1649,13 @@ pub async fn merge_files(
     // From here on new_file_list is EXACTLY the input set the merge
     // consumes; the snapshot is what the caller may delete after commit.
     let retain_file_list = new_file_list.clone();
-
-    // get time range and stats for these files in a single iteration
-    let (min_ts, max_ts, total_records, new_file_size) = new_file_list.iter().fold(
-        (i64::MAX, i64::MIN, 0, 0),
-        |(min_ts, max_ts, records, size), file| {
-            (
-                min_ts.min(file.meta.min_ts),
-                max_ts.max(file.meta.max_ts),
-                records + file.meta.records,
-                size + file.meta.original_size,
-            )
-        },
-    );
-    let min_ts = if min_ts == i64::MAX { 0 } else { min_ts };
-    let max_ts = if max_ts == i64::MIN { 0 } else { max_ts };
-    let new_file_meta = FileMeta {
-        min_ts,
-        max_ts,
-        records: total_records,
-        original_size: new_file_size,
-        compressed_size: 0,
-        flattened: false,
-        index_size: 0,
-        bloom_ver: 0,
-        ..Default::default()
-    };
-    if new_file_meta.records == 0 {
-        return Err(anyhow::anyhow!("merge_files error: records is 0"));
-    }
-
-    // get latest version of schema
-    let latest_schema = infra::schema::get(org_id, stream_name, stream_type).await?;
-    let stream_settings = infra::schema::unwrap_stream_settings(&latest_schema);
-    let bloom_filter_fields = get_stream_setting_bloom_filter_fields(&stream_settings);
-    let full_text_search_fields = get_stream_setting_fts_fields(&stream_settings);
-    let storage_type = stream_settings
-        .map(|s| s.storage_type)
-        .unwrap_or(StorageType::Normal);
-    let latest_schema = Arc::new(latest_schema);
-
-    // core files: k-way merge by _timestamp without DataFusion, index
-    // rebuilt from _source with the current settings
-    if is_core_group {
-        return merge_core_group(
-            thread_id,
-            org_id,
-            stream_type,
-            stream_name,
-            prefix,
-            new_file_list,
-            retain_file_list,
-            new_file_meta,
-            latest_schema,
-            full_text_search_fields,
-            bloom_filter_fields,
-            storage_type,
-            is_single_core_heal,
-            cancel,
-            start,
-        )
-        .await;
-    }
+    let new_file_meta = fold_merge_group_meta(&new_file_list)?;
+    let MergeStreamSettings {
+        latest_schema,
+        bloom_filter_fields,
+        storage_type,
+        ..
+    } = settings;
 
     // read schema from parquet file and group files by schema
     let mut schemas = HashMap::new();
@@ -1913,6 +1953,36 @@ async fn wait_for_merge_cancellation(cancel: &MergeCancellation) {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
     }
 }
+
+/// Run one CPU-bound merge phase on a blocking thread. `spawn_blocking`
+/// cannot be force-aborted once running: on job cancellation the shared VIX
+/// token makes the phase leave at its next bounded boundary, and the task is
+/// awaited so shutdown never detaches a CPU-heavy merge.
+async fn run_merge_phase<T, F>(cancel: &MergeCancellation, phase: F) -> Result<T, anyhow::Error>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, anyhow::Error> + Send + 'static,
+{
+    let mut task = tokio::task::spawn_blocking(phase);
+    let joined = tokio::select! {
+        result = &mut task => result,
+        _ = wait_for_merge_cancellation(cancel) => {
+            cancel.cancel();
+            task.await
+        }
+    };
+    joined?
+}
+
+/// The typed refusal of a required indexed merge anywhere in `error`'s
+/// cause chain (the merge phases add context on top of it).
+pub(crate) fn find_indexed_merge_refusal(
+    error: &anyhow::Error,
+) -> Option<&crate::service::vix::core_writer::IndexedMergeRefused> {
+    error.chain().find_map(|cause| {
+        cause.downcast_ref::<crate::service::vix::core_writer::IndexedMergeRefused>()
+    })
+}
 #[inline]
 fn indexed_group_exceeds_global_rebuild_limit(
     stream_type: StreamType,
@@ -1931,6 +2001,13 @@ fn indexed_group_exceeds_global_rebuild_limit(
 /// parquet compaction; the CPU-bound k-way merge + index rebuild
 /// (`vix::core_writer::merge_core_files`) runs on a blocking thread.
 ///
+/// Phase order for an ordinary group: PLAN over the inputs' footers (ranged
+/// reads, a few hundred KiB per input) — which is where a large indexed
+/// batch is refused if its fast path cannot apply — then PREFETCH the whole
+/// inputs into the disk cache, then EXECUTE. Prefetching first cost the
+/// fleet its whole-object downloads on every refused batch (85% of merge
+/// attempts during the 2026-09-17 type-widening storm).
+///
 /// `force_rebuild` marks a single-file healing batch. Its sidecar-only repair
 /// runs first; a required docs rewrite may use the full rebuild only while
 /// both input byte measures fit the global rebuild-safe ceiling.
@@ -1941,19 +2018,41 @@ async fn merge_core_group(
     stream_type: StreamType,
     stream_name: &str,
     prefix: &str,
-    new_file_list: Vec<FileKey>,
-    retain_file_list: Vec<FileKey>,
+    mut new_file_list: Vec<FileKey>,
     mut new_file_meta: FileMeta,
-    latest_schema: Arc<Schema>,
-    full_text_search_fields: Vec<String>,
-    bloom_filter_fields: Vec<String>,
-    storage_type: StorageType,
+    settings: MergeStreamSettings,
     force_rebuild: bool,
     cancel: &MergeCancellation,
     start: std::time::Instant,
 ) -> Result<(Vec<FileKey>, Vec<FileKey>), anyhow::Error> {
+    use crate::service::vix::core_writer::{CoreMergeAttempt, CoreMergeMode};
+
     let cfg = get_config();
     cancel.check("core merge planning")?;
+    let MergeStreamSettings {
+        latest_schema,
+        full_text_search_fields,
+        bloom_filter_fields,
+        storage_type,
+    } = settings;
+    let compliance = cfg.s3.feature_force_infrequent_access && storage_type.is_compliance();
+
+    if force_rebuild {
+        // A healing batch reads its single input whole (derivation scan):
+        // prefetch first. A heal whose only file vanished has nothing left
+        // to rebuild — cache_remote_files already removed it from the
+        // file_list.
+        let deleted_files =
+            prefetch_merge_inputs(thread_id, &new_file_list, true, start, cancel).await?;
+        if !deleted_files.is_empty() {
+            new_file_list.retain(|f| !deleted_files.contains(&f.key));
+        }
+        if new_file_list.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        new_file_meta = fold_merge_group_meta(&new_file_list)?;
+    }
+
     let all_inputs_indexed = new_file_list.iter().all(|file| file.meta.index_size > 0);
     let input_compressed_size = new_file_list.iter().fold(0_i64, |total, file| {
         total.saturating_add(file.meta.compressed_size)
@@ -1980,7 +2079,7 @@ async fn merge_core_group(
             Arc::clone(&latest_schema),
             full_text_search_fields.clone(),
             bloom_filter_fields.clone(),
-            cfg.s3.feature_force_infrequent_access && storage_type.is_compliance(),
+            compliance,
             cancel,
             start,
         )
@@ -2004,11 +2103,12 @@ async fn merge_core_group(
     }
 
     // The merge reads its inputs by RANGE through the cache ladder
-    // (memory/disk cache first — cache_remote_files just filled the disk
-    // cache — with transparent remote fallback if the cache evicts a file
-    // mid-merge): input files are never materialized whole in memory. The
-    // ranged source is the healing probe's, fetch-metered under `compact`;
-    // for `.vix` files `compressed_size` is the exact object size.
+    // (memory/disk cache first — the prefetch below fills the disk cache
+    // before the heavy phases — with transparent remote fallback if the
+    // cache evicts a file mid-merge): input files are never materialized
+    // whole in memory. The ranged source is the healing probe's,
+    // fetch-metered under `compact`; for `.vix` files `compressed_size` is
+    // the exact object size.
     let handle = tokio::runtime::Handle::current();
     let inputs: Vec<crate::service::vix::core_writer::MergeInput> = new_file_list
         .iter()
@@ -2060,24 +2160,14 @@ async fn merge_core_group(
     // silently multiplying rebuild memory.
     let require_indexed_merge = !force_rebuild && exceeds_global_rebuild_limit;
 
-    // Known rebuilds acquire memory before their blocking controller starts.
-    // Automatic merges that discover a rebuild acquire memory before starting
-    // the fallback controller below.
-    let force_rebuild_permit = if force_rebuild {
-        Some(acquire_vix_rebuild_memory(cancel, "forced rebuild memory admission").await?)
-    } else {
-        None
-    };
     let merge_started = std::time::Instant::now();
-    cancel.check("core merge controller phase")?;
     let vix_cancellation = cancel.vix_token();
-    let mut merge_task = tokio::task::spawn_blocking(move || {
-        use crate::service::vix::core_writer::{CoreMergeAttempt, CoreMergeMode};
-
-        if force_rebuild {
-            let permit = force_rebuild_permit.ok_or_else(|| {
-                anyhow::anyhow!("forced core rebuild started without memory admission")
-            })?;
+    let first_attempt: Result<CoreMergeAttempt, anyhow::Error> = if force_rebuild {
+        // Known rebuilds acquire memory before their blocking controller
+        // starts.
+        let permit = acquire_vix_rebuild_memory(cancel, "forced rebuild memory admission").await?;
+        cancel.check("core merge controller phase")?;
+        run_merge_phase(cancel, move || {
             crate::service::vix::core_writer::merge_core_files_rebuild_admitted_with_cancellation(
                 stream_type,
                 &inputs,
@@ -2088,60 +2178,84 @@ async fn merge_core_group(
                 permit,
             )
             .map(CoreMergeAttempt::Complete)
+        })
+        .await
+    } else {
+        let mode = if index_deferred {
+            CoreMergeMode::IndexDeferred
+        } else if require_indexed_merge {
+            CoreMergeMode::IndexedOnly
         } else {
-            let mode = if index_deferred {
-                CoreMergeMode::IndexDeferred
-            } else if require_indexed_merge {
-                CoreMergeMode::IndexedOnly
-            } else {
-                CoreMergeMode::Automatic
-            };
-            crate::service::vix::core_writer::try_merge_core_files_with_cancellation(
-                stream_type,
-                inputs,
-                latest_schema,
-                full_text_search_fields,
-                bloom_filter_fields,
-                vix_cancellation,
-                mode,
-            )
-        }
-    });
-    let merge_join = tokio::select! {
-        result = &mut merge_task => result,
-        _ = wait_for_merge_cancellation(cancel) => {
-            // `spawn_blocking` cannot be force-aborted once running. The
-            // shared token makes it leave at the next bounded VIX boundary;
-            // await it so shutdown never detaches a CPU-heavy merge.
-            cancel.cancel();
-            merge_task.await
+            CoreMergeMode::Automatic
+        };
+        // PLAN: footers only. A refused large indexed batch returns here,
+        // before any whole-object download.
+        cancel.check("core merge preflight")?;
+        let preflight = {
+            let latest_schema = Arc::clone(&latest_schema);
+            let vix_cancellation = vix_cancellation.clone();
+            run_merge_phase(cancel, move || {
+                crate::service::vix::core_writer::preflight_core_merge(
+                    stream_type,
+                    inputs,
+                    latest_schema,
+                    full_text_search_fields,
+                    bloom_filter_fields,
+                    vix_cancellation,
+                    mode,
+                )
+            })
+            .await
+        };
+        match preflight {
+            Err(error) => Err(error),
+            Ok(preflight) => {
+                // PREFETCH: the heavy phases read every input byte, and a
+                // whole-object download into the disk cache beats thousands
+                // of ranged GETs. An input that vanished meanwhile has lost
+                // its file_list row already; the planned state covers the
+                // full set, so the retry re-plans over the survivors.
+                let deleted_files =
+                    prefetch_merge_inputs(thread_id, &new_file_list, true, start, cancel).await?;
+                if !deleted_files.is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "{} merge input object(s) vanished during prefetch ({:?}); their \
+                         file_list rows were removed, the job retry claims only survivors",
+                        deleted_files.len(),
+                        deleted_files,
+                    ));
+                }
+                // EXECUTE (fast path, or a prepared rebuild continuation).
+                cancel.check("core merge controller phase")?;
+                run_merge_phase(cancel, move || {
+                    crate::service::vix::core_writer::execute_core_merge(preflight)
+                })
+                .await
+            }
         }
     };
-    let first_attempt = merge_join?;
+    // From here on new_file_list is EXACTLY the input set the merge
+    // consumes; the snapshot is what the caller may delete after commit.
+    let retain_file_list = new_file_list;
 
     let merge_result = match first_attempt {
-        Ok(crate::service::vix::core_writer::CoreMergeAttempt::Complete(result)) => Ok(result),
-        Ok(crate::service::vix::core_writer::CoreMergeAttempt::NeedsRebuild(prepared)) => {
+        Ok(CoreMergeAttempt::Complete(result)) => Ok(result),
+        Ok(CoreMergeAttempt::NeedsRebuild(prepared)) => {
+            // Automatic merges that discover a rebuild acquire memory before
+            // starting the fallback controller.
             let rebuild_permit = if prepared.requires_memory_admission() {
                 Some(acquire_vix_rebuild_memory(cancel, "fallback rebuild memory admission").await?)
             } else {
                 None
             };
             cancel.check("fallback rebuild controller phase")?;
-            let mut rebuild_task = tokio::task::spawn_blocking(move || {
+            run_merge_phase(cancel, move || {
                 crate::service::vix::core_writer::execute_prepared_core_rebuild(
                     prepared,
                     rebuild_permit,
                 )
-            });
-            let rebuild_join = tokio::select! {
-                result = &mut rebuild_task => result,
-                _ = wait_for_merge_cancellation(cancel) => {
-                    cancel.cancel();
-                    rebuild_task.await
-                }
-            };
-            rebuild_join?
+            })
+            .await
         }
         Err(error) => Err(error),
     };
@@ -2149,6 +2263,23 @@ async fn merge_core_group(
     let result = match merge_result {
         Ok(result) => result,
         Err(e) => {
+            if let Some(refused) = find_indexed_merge_refusal(&e) {
+                // Input-bound: the same batch fails identically until a heal
+                // or a settings change touches its inputs. Count it (the
+                // worker backs the job off on this error class) and name
+                // the inputs once, at warn — the batch-level ERROR follows.
+                metrics::COMPACT_MERGE_REFUSED
+                    .with_label_values(&[org_id, stream_type.as_str(), stream_name])
+                    .inc();
+                log::warn!(
+                    "[COMPACTOR:WORKER:{thread_id}] {org_id}/{stream_type}/{stream_name}: \
+                     required indexed merge refused before any docs read over {} inputs under \
+                     {prefix} ({:#}); the job backs off before retrying",
+                    retain_file_list.len(),
+                    refused.reason(),
+                );
+                return Err(e);
+            }
             // M19: a mid-merge range fetch hitting an externally deleted
             // object (S3 lifecycle expiry) would otherwise fail EVERY retry
             // of this job forever — the not-found path above only runs when
@@ -2267,7 +2398,6 @@ async fn merge_core_group(
     // upload streams from the spool file and the merged multi-GB object
     // never resides in RAM; the spool deletes when `result.output` drops.
     let account = storage::get_account(org_id, &new_file_key).unwrap_or_default();
-    let compliance = cfg.s3.feature_force_infrequent_access && storage_type.is_compliance();
     let cache_locally = cfg.cache_latest_files.enabled
         && cfg.cache_latest_files.cache_parquet
         && cfg.cache_latest_files.download_from_node;

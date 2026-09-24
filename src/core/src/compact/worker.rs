@@ -689,15 +689,47 @@ impl JobScheduler {
                                     job.job_id,
                                     job.lease_generation,
                                 );
-                                match infra::file_list::set_job_pending_owned(
-                                    job.job_id,
-                                    &config::cluster::LOCAL_NODE.uuid,
-                                    job.lease_generation,
-                                )
-                                .await
-                                {
+                                // An input-bound refusal fails identically on
+                                // every retry until a heal or a settings
+                                // change touches the inputs: park the job for
+                                // the configured backoff instead of
+                                // re-claiming it on the next cycle (the
+                                // 2026-09-17 storm re-ran refused hours ~250
+                                // times each). Everything else retries at
+                                // once, as before.
+                                let backoff_secs =
+                                    if super::merge::find_indexed_merge_refusal(&e).is_some() {
+                                        config::get_config().compact.refusal_backoff_secs
+                                    } else {
+                                        0
+                                    };
+                                let (outcome, released) = if backoff_secs > 0 {
+                                    let not_before = config::utils::time::now_micros()
+                                        + (backoff_secs as i64).saturating_mul(1_000_000);
+                                    (
+                                        "refused_backoff",
+                                        infra::file_list::set_job_pending_owned_not_before(
+                                            job.job_id,
+                                            &config::cluster::LOCAL_NODE.uuid,
+                                            job.lease_generation,
+                                            not_before,
+                                        )
+                                        .await,
+                                    )
+                                } else {
+                                    (
+                                        "retry",
+                                        infra::file_list::set_job_pending_owned(
+                                            job.job_id,
+                                            &config::cluster::LOCAL_NODE.uuid,
+                                            job.lease_generation,
+                                        )
+                                        .await,
+                                    )
+                                };
+                                match released {
                                     Ok(true) => log::info!(
-                                        "[COMPACTOR] merge job released job_id={} generation={} outcome=retry",
+                                        "[COMPACTOR] merge job released job_id={} generation={} outcome={outcome} backoff_secs={backoff_secs}",
                                         job.job_id,
                                         job.lease_generation,
                                     ),

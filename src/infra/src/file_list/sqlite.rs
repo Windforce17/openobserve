@@ -1525,6 +1525,7 @@ WHERE id IN (
     SELECT id
     FROM file_list_jobs
     WHERE status = $4
+      AND updated_at <= $3
       AND ($5 IS NULL OR offsets >= $5)
       AND ($6 IS NULL OR offsets < $6)
     ORDER BY {order_sql}
@@ -1610,15 +1611,28 @@ WHERE id = $2 AND node = $3 AND lease_generation = $4 AND status = $5;"#,
     }
 
     async fn set_job_pending_owned(&self, id: i64, node: &str, generation: i64) -> Result<bool> {
+        self.set_job_pending_owned_not_before(id, node, generation, now_micros())
+            .await
+    }
+
+    async fn set_job_pending_owned_not_before(
+        &self,
+        id: i64,
+        node: &str,
+        generation: i64,
+        not_before: i64,
+    ) -> Result<bool> {
         let client = CLIENT_RW.clone();
         let client = client.lock().await;
+        // `updated_at` is the pending FIFO clock (see get_pending_jobs): a
+        // future instant hides the row from claims until then.
         let ret = sqlx::query(
             r#"UPDATE file_list_jobs
 SET status = $1, node = '', updated_at = $2, pending_after_dump = false
 WHERE id = $3 AND node = $4 AND lease_generation = $5 AND status = $6;"#,
         )
         .bind(super::FileListJobStatus::Pending)
-        .bind(now_micros())
+        .bind(not_before)
         .bind(id)
         .bind(node)
         .bind(generation)

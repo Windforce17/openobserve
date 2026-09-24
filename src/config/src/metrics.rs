@@ -692,6 +692,25 @@ pub static COMPACT_DROPPED_ZERO_TS_ROWS: Lazy<IntCounterVec> = Lazy::new(|| {
     )
     .expect("Metric created")
 });
+/// Merge batches the indexed fast path refused for an input-bound reason
+/// (no readable sidecar, a dictionary the field plan cannot merge, poison
+/// rows) — retried only after the refusal backoff. A non-zero rate is the
+/// signal that an hour is wedged behind inputs only a heal can fix.
+pub static COMPACT_MERGE_REFUSED: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "compact_merge_refused_total",
+            "Core merge batches refused by the required indexed fast path (input-bound, \
+             backed off before retry)."
+                .to_owned()
+                + HELP_SUFFIX,
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &["organization", "stream_type", "stream"],
+    )
+    .expect("Metric created")
+});
 /// Low-cardinality VIX compaction phase latency.  Keep stream/field names
 /// out of labels: production wide streams would otherwise turn the
 /// observability intended to diagnose compaction into another hot path.
@@ -2212,6 +2231,9 @@ fn register_metrics(registry: &Registry) {
         .register(Box::new(COMPACT_DROPPED_ZERO_TS_ROWS.clone()))
         .expect("Metric registered");
     registry
+        .register(Box::new(COMPACT_MERGE_REFUSED.clone()))
+        .expect("Metric registered");
+    registry
         .register(Box::new(COMPACT_VIX_PHASE_DURATION.clone()))
         .expect("Metric registered");
     registry
@@ -2751,6 +2773,7 @@ mod tests {
         let _ = COMPACT_MERGED_BYTES.clone();
         let _ = COMPACT_PENDING_JOBS.clone();
         let _ = COMPACT_DROPPED_ZERO_TS_ROWS.clone();
+        let _ = COMPACT_MERGE_REFUSED.clone();
         let _ = COMPACT_VIX_PHASE_DURATION.clone();
         let _ = SEGMENT_BUILD_PHASE_DURATION.clone();
         let _ = STREAM_STATS_SCAN_DURATION.clone();

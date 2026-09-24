@@ -1654,6 +1654,41 @@ enum IndexedMergeFailure {
     /// a rebuild would fail the same way.
     Fatal(anyhow::Error),
 }
+
+/// A large indexed batch ([`CoreMergeMode::IndexedOnly`]) whose fast path
+/// does not apply. The reason is a property of the INPUTS — a missing or
+/// unreadable sidecar, a dictionary the current field plan cannot merge,
+/// poison rows only a rebuild can drop — so retrying the same batch cannot
+/// succeed until the inputs change (a heal, a settings change). The
+/// compactor recognizes this type and backs the job off instead of
+/// re-claiming it every cycle.
+#[derive(Debug)]
+pub struct IndexedMergeRefused {
+    reason: anyhow::Error,
+}
+
+impl IndexedMergeRefused {
+    fn new(reason: anyhow::Error) -> anyhow::Error {
+        anyhow::Error::new(Self { reason })
+    }
+
+    /// The fast path's own rejection.
+    pub fn reason(&self) -> &anyhow::Error {
+        &self.reason
+    }
+}
+
+impl std::fmt::Display for IndexedMergeRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("required indexed merge is not applicable; refusing a large full rebuild")
+    }
+}
+
+impl std::error::Error for IndexedMergeRefused {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.reason.as_ref())
+    }
+}
 /// Strategy requested by the compactor's first CPU phase.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CoreMergeMode {
@@ -1859,11 +1894,35 @@ pub fn merge_core_files_index_deferred_with_cancellation(
         false,
     )
 }
-/// Run the compactor's planning/indexed phase while owning all inputs. A
-/// fallback returns a continuation instead of entering rebuild admission
-/// while the caller still owns CPU capacity.
+/// The compactor's first CPU phase: open every input (footers and sidecar
+/// tails only), build the merge plan and — for [`CoreMergeMode::IndexedOnly`]
+/// — prove the indexed fast path applies BEFORE any docs bytes are read.
+/// Everything the caller must do between planning and execution (whole-object
+/// prefetch into the disk cache, memory admission) happens on this owned
+/// state; [`execute_core_merge`] resumes it. All fields are private so
+/// execution can only resume through that entry point.
+pub struct CoreMergePreflight {
+    inputs: Vec<MergeInput>,
+    preflight: InternalPreflight,
+}
+
+struct InternalPreflight {
+    sources: Vec<MergeSource>,
+    plan: MergePlan,
+    require_indexed_merge: bool,
+}
+
+/// Plan a compactor merge and, under [`CoreMergeMode::IndexedOnly`], refuse
+/// it while the refusal is still cheap. Every input is opened through its
+/// ranged source (puffin tails + native footers, a few hundred KiB per
+/// input); no docs column is read here. A large indexed batch that cannot
+/// take the fast path — an input with no readable sidecar, a dictionary the
+/// current field plan cannot merge — errors out of this call, so the caller
+/// never prefetches multi-GB inputs for a merge that would be refused after
+/// the download (the 2026-09-17 refusal storm: 85% of fleet merge attempts
+/// were exactly that, each paying its whole-object prefetch first).
 #[allow(clippy::too_many_arguments)]
-pub fn try_merge_core_files_with_cancellation(
+pub fn preflight_core_merge(
     stream_type: StreamType,
     inputs: Vec<MergeInput>,
     latest_schema: Arc<Schema>,
@@ -1871,7 +1930,7 @@ pub fn try_merge_core_files_with_cancellation(
     bloom_fields: Vec<String>,
     cancellation: VixMergeCancellation,
     mode: CoreMergeMode,
-) -> Result<CoreMergeAttempt, anyhow::Error> {
+) -> Result<CoreMergePreflight, anyhow::Error> {
     let (caps, require_indexed_merge) = match mode {
         CoreMergeMode::Automatic => (BatchCaps::default(), false),
         CoreMergeMode::IndexedOnly => (BatchCaps::default(), true),
@@ -1883,7 +1942,7 @@ pub fn try_merge_core_files_with_cancellation(
             false,
         ),
     };
-    match attempt_core_merge(
+    let preflight = preflight_core_merge_inner(
         stream_type,
         &inputs,
         latest_schema.as_ref(),
@@ -1892,7 +1951,27 @@ pub fn try_merge_core_files_with_cancellation(
         caps,
         Some(cancellation),
         require_indexed_merge,
-    )? {
+    )?;
+    Ok(CoreMergePreflight { inputs, preflight })
+}
+
+/// Whether the planned merge builds a term index (and therefore owns the
+/// memory-heavy footprint if it has to rebuild).
+impl CoreMergePreflight {
+    pub fn index_enabled(&self) -> bool {
+        self.preflight.plan.opts.index_enabled
+    }
+}
+
+/// Run the planned merge: the indexed fast path when it applies, otherwise
+/// a prepared rebuild continuation (never under `IndexedOnly`, which errors
+/// instead). Synchronous and CPU/IO-bound — call it on a blocking thread
+/// after the inputs are prefetched.
+pub fn execute_core_merge(
+    preflight: CoreMergePreflight,
+) -> Result<CoreMergeAttempt, anyhow::Error> {
+    let CoreMergePreflight { inputs, preflight } = preflight;
+    match execute_core_merge_inner(&inputs, preflight)? {
         InternalCoreMergeAttempt::Complete(result) => Ok(CoreMergeAttempt::Complete(result)),
         InternalCoreMergeAttempt::NeedsRebuild { sources, plan } => {
             let requires_memory_admission = plan.opts.index_enabled;
@@ -1906,6 +1985,29 @@ pub fn try_merge_core_files_with_cancellation(
     }
 }
 
+/// [`preflight_core_merge`] + [`execute_core_merge`] in one call, for callers
+/// that have nothing to do between planning and execution.
+#[allow(clippy::too_many_arguments)]
+pub fn try_merge_core_files_with_cancellation(
+    stream_type: StreamType,
+    inputs: Vec<MergeInput>,
+    latest_schema: Arc<Schema>,
+    fts_fields: Vec<String>,
+    bloom_fields: Vec<String>,
+    cancellation: VixMergeCancellation,
+    mode: CoreMergeMode,
+) -> Result<CoreMergeAttempt, anyhow::Error> {
+    execute_core_merge(preflight_core_merge(
+        stream_type,
+        inputs,
+        latest_schema,
+        fts_fields,
+        bloom_fields,
+        cancellation,
+        mode,
+    )?)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn attempt_core_merge(
     stream_type: StreamType,
@@ -1917,6 +2019,30 @@ fn attempt_core_merge(
     cancellation: Option<VixMergeCancellation>,
     require_indexed_merge: bool,
 ) -> Result<InternalCoreMergeAttempt, anyhow::Error> {
+    let preflight = preflight_core_merge_inner(
+        stream_type,
+        inputs,
+        latest_schema,
+        fts_fields,
+        bloom_fields,
+        caps,
+        cancellation,
+        require_indexed_merge,
+    )?;
+    execute_core_merge_inner(inputs, preflight)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn preflight_core_merge_inner(
+    stream_type: StreamType,
+    inputs: &[MergeInput],
+    latest_schema: &Schema,
+    fts_fields: &[String],
+    bloom_fields: &[String],
+    caps: BatchCaps,
+    cancellation: Option<VixMergeCancellation>,
+    require_indexed_merge: bool,
+) -> Result<InternalPreflight, anyhow::Error> {
     let started = std::time::Instant::now();
     let sources = open_merge_sources(inputs, cancellation.as_ref())?;
     log::debug!(
@@ -1934,7 +2060,59 @@ fn attempt_core_merge(
     );
     plan.cancellation = cancellation;
     plan.check_cancel("post-plan")?;
+    if require_indexed_merge {
+        prequalify_indexed_merge(inputs, &sources, &plan)?;
+    }
+    Ok(InternalPreflight {
+        sources,
+        plan,
+        require_indexed_merge,
+    })
+}
 
+/// Every refusal an `IndexedOnly` merge can raise from metadata alone,
+/// raised here — before any docs column is read and before the caller
+/// prefetches the inputs. Mirrors the fast path's own gates
+/// ([`merge_core_files_indexed`] → `check_merge_inputs`); the data-dependent
+/// ones (degenerate `_timestamp` rows, a malformed postings block) can still
+/// refuse during execution.
+fn prequalify_indexed_merge(
+    inputs: &[MergeInput],
+    sources: &[MergeSource],
+    plan: &MergePlan,
+) -> Result<(), anyhow::Error> {
+    let mut readers: Vec<&VixReader> = Vec::with_capacity(sources.len());
+    for (source, (key, ..)) in sources.iter().zip(inputs) {
+        match source {
+            MergeSource::Indexed(reader) => readers.push(reader.as_ref()),
+            MergeSource::DocsOnly(_) => {
+                return Err(IndexedMergeRefused::new(anyhow::anyhow!(
+                    "input {key} has no readable index sidecar"
+                )));
+            }
+        }
+    }
+    if plan.opts.index_enabled {
+        // the probe writer only materializes the field plan (no encoder
+        // thread, no rows); the execution phase constructs its own
+        let probe = VixWriter::new(&plan.writer_schema, plan.opts.clone(), plan.store_original);
+        if let Err(reason) = probe.check_merge_inputs(&readers) {
+            return Err(IndexedMergeRefused::new(anyhow::anyhow!(reason)));
+        }
+    }
+    Ok(())
+}
+
+fn execute_core_merge_inner(
+    inputs: &[MergeInput],
+    preflight: InternalPreflight,
+) -> Result<InternalCoreMergeAttempt, anyhow::Error> {
+    let InternalPreflight {
+        sources,
+        plan,
+        require_indexed_merge,
+    } = preflight;
+    plan.check_cancel("pre-execute")?;
     let readers: Option<Vec<&VixReader>> = sources
         .iter()
         .map(|source| match source {
@@ -1948,9 +2126,7 @@ fn attempt_core_merge(
             Err(IndexedMergeFailure::Fatal(error)) => return Err(error),
             Err(IndexedMergeFailure::Fallback(reason)) => {
                 if require_indexed_merge {
-                    return Err(reason.context(
-                        "required indexed merge is not applicable; refusing a large full rebuild",
-                    ));
+                    return Err(IndexedMergeRefused::new(reason));
                 }
                 log::warn!(
                     "merge_core_files: index merge not applicable, rebuilding terms from \
@@ -1959,10 +2135,9 @@ fn attempt_core_merge(
             }
         }
     } else if require_indexed_merge {
-        return Err(anyhow::anyhow!(
-            "required indexed merge is not applicable: one or more inputs has no readable index \
-             sidecar; refusing a large full rebuild"
-        ));
+        return Err(IndexedMergeRefused::new(anyhow::anyhow!(
+            "one or more inputs has no readable index sidecar"
+        )));
     }
     Ok(InternalCoreMergeAttempt::NeedsRebuild { sources, plan })
 }
@@ -3180,36 +3355,44 @@ fn concat_doc_id_offsets(
     Ok(offsets)
 }
 
-/// #51c-c: qualify the ENTIRE input set for a concatenation-order fast-path
-/// merge and build its writer (docs passthrough + concat row order — the
-/// encoder strategy is fixed at spawn, so the writer must be born concat).
-/// Requires EVERY input to pass the per-input #51c qualification
-/// (all-or-nothing): concatenation trades the sorted-file contract for the
-/// chunk copy, so if any input would decode anyway the trade buys nothing —
-/// the caller keeps today's sorted interleave (or, when a concat INPUT
-/// forces concatenation regardless, falls back to the rebuild, whose forced
-/// concatenation decodes unqualified inputs).
-fn qualify_concat_fast_path(
+/// #51c-c: plan a concatenation-order fast-path merge over the input set and
+/// build its writer (docs passthrough + concat row order — the encoder
+/// strategy is fixed at spawn, so the writer must be born concat). Returns
+/// the writer, the concatenation order, and the per-input #51c qualification
+/// misses (`(input index, reason)`); the caller decides what a miss means:
+/// concatenation trades the sorted-file contract for the chunk copy, so over
+/// SORTED inputs a single miss keeps today's sorted interleave, while an
+/// input that is itself concat-ordered forces concatenation regardless and
+/// the unqualified inputs simply decode in place (the same per-input
+/// fallback the disjoint copy has always taken).
+fn plan_concat_fast_path(
     inputs: &[MergeInput],
     readers: &[&VixReader],
     plan: &MergePlan,
     timestamps: &[Int64Array],
-) -> Result<(VixWriter, Vec<usize>), String> {
+) -> (VixWriter, Vec<usize>, Vec<(usize, String)>) {
     let mut writer_opts = plan.opts.clone();
     writer_opts.docs_passthrough = true;
     writer_opts.concat_row_order = true;
     let writer = VixWriter::new(&plan.writer_schema, writer_opts, plan.store_original);
-    for (index, reader) in readers.iter().enumerate() {
-        if let Err(reason) =
+    let disqualified: Vec<(usize, String)> = readers
+        .iter()
+        .enumerate()
+        .filter_map(|(index, reader)| {
             qualify_passthrough_input(reader, timestamps[index].len() as u64, &writer)
-        {
-            return Err(format!(
-                "input {} does not qualify for the docs passthrough: {reason}",
-                inputs[index].0
-            ));
-        }
-    }
-    Ok((writer, concat_input_order(inputs, timestamps)))
+                .err()
+                .map(|reason| {
+                    (
+                        index,
+                        format!(
+                            "input {} does not qualify for the docs passthrough: {reason}",
+                            inputs[index].0
+                        ),
+                    )
+                })
+        })
+        .collect();
+    (writer, concat_input_order(inputs, timestamps), disqualified)
 }
 
 /// The index-merge fast path (see [`merge_core_files`]).
@@ -3282,42 +3465,56 @@ fn merge_core_files_indexed(
     // #51c-c concatenation order — the DEFAULT for OVERLAPPING inputs
     // (where the sorted interleave decodes everything) and for merges
     // containing a concat input (which forces it): store the inputs
-    // back-to-back, unlocking the chunk copy. All-or-nothing per-input
-    // qualification; a miss keeps the sorted interleave (or, with a concat
-    // input, hands the merge to the rebuild's forced concatenation, which
-    // decodes unqualified inputs).
+    // back-to-back, unlocking the chunk copy. Over sorted inputs the
+    // qualification is all-or-nothing (a miss keeps the sorted interleave —
+    // if any input decodes anyway, the trade buys nothing). A concat INPUT
+    // forces concatenation regardless: its unqualified inputs decode in
+    // place inside the concat copy (the per-input fallback the disjoint copy
+    // always had) instead of handing the WHOLE merge to a rebuild — which a
+    // large indexed batch is not allowed to take, so one type-flipped or
+    // stats-less input used to refuse the batch forever.
     let mut concat: Option<(VixWriter, Vec<usize>)> = None;
     if offsets.is_none() {
-        let disqualified = if plan.caps.force_decode {
+        if plan.caps.force_decode {
             // test seam: the fast path's concat requires the chunk copy —
             // a merge containing a concat INPUT still must concatenate,
             // through the rebuild's forced (decoding) concatenation
-            Some("force_decode test seam".to_string())
-        } else {
-            match qualify_concat_fast_path(inputs, readers, plan, &timestamps) {
-                Ok(qualified) => {
-                    log::debug!(
-                        "vix merge: {} overlapping inputs take the #51c-c concatenation order \
-                         (all passthrough-qualified)",
-                        inputs.len(),
-                    );
-                    concat = Some(qualified);
-                    None
-                }
-                Err(reason) => Some(reason),
-            }
-        };
-        if let Some(reason) = disqualified {
             if let Some(key) = concat_input {
                 return Err(Fallback(anyhow::anyhow!(
                     "input {key} is concatenation-order but the concat fast path is \
-                     disqualified ({reason}); the rebuild's forced concatenation handles it"
+                     disqualified (force_decode test seam); the rebuild's forced concatenation \
+                     handles it"
                 )));
             }
             log::debug!(
-                "vix merge: concatenation order disqualified ({reason}); interleaving as \
-                 today"
+                "vix merge: concatenation order disqualified (force_decode test seam); \
+                 interleaving as today"
             );
+        } else {
+            let (writer, order, disqualified) =
+                plan_concat_fast_path(inputs, readers, plan, &timestamps);
+            if disqualified.is_empty() {
+                log::debug!(
+                    "vix merge: {} overlapping inputs take the #51c-c concatenation order \
+                     (all passthrough-qualified)",
+                    inputs.len(),
+                );
+                concat = Some((writer, order));
+            } else if let Some(key) = concat_input {
+                log::info!(
+                    "vix merge: input {key} forces the concatenation order; {} of {} inputs do \
+                     not qualify for the docs passthrough and decode in place (first: {})",
+                    disqualified.len(),
+                    inputs.len(),
+                    disqualified[0].1,
+                );
+                concat = Some((writer, order));
+            } else {
+                log::debug!(
+                    "vix merge: concatenation order disqualified ({}); interleaving as today",
+                    disqualified[0].1
+                );
+            }
         }
     }
 
@@ -9029,9 +9226,10 @@ mod tests {
         // input B stores an EXTRA column ("extra"): the union plan output
         // includes it — pre-M17 that DISQUALIFIED the narrower input A;
         // the widen plan now null-synthesizes "extra" for A's chunks, so A
-        // copies too. Input C stores `code` at a FLIPPED width (Int32 vs
-        // the plan's Int64) — a genuine re-encode the widen plan refuses —
-        // and is the one input that must keep the decode path.
+        // copies too. Input C stores `code` as UInt64 while the plan types
+        // it Int64 — a flip the widen plan has no SAFE cast for (u64 → i64
+        // can overflow; a genuine widening would cast in place) — and is
+        // the one input that must keep the decode path.
         let mut extra_fields = passthrough_fields();
         extra_fields.push(Field::new("extra", DataType::Utf8, true));
         let ts_b = [800i64, 750, 700];
@@ -9054,7 +9252,7 @@ mod tests {
             None,
         );
         let mut flip_fields = passthrough_fields();
-        flip_fields[4] = Field::new("code", DataType::Int32, true);
+        flip_fields[4] = Field::new("code", DataType::UInt64, true);
         let file_c = build_core_file(
             flip_fields,
             vec![
@@ -9062,7 +9260,10 @@ mod tests {
                 Arc::new(StringArray::from(vec![Some("error c row 0"), None])),
                 Arc::new(StringArray::from(vec![Some("svc-c-0"); 2])),
                 Arc::new(StringArray::from(vec![Some("prod"); 2])),
-                Arc::new(arrow::array::Int32Array::from(vec![Some(301), Some(302)])),
+                Arc::new(arrow::array::UInt64Array::from(vec![
+                    Some(301u64),
+                    Some(302),
+                ])),
             ],
             &fts,
             None,
@@ -9087,8 +9288,8 @@ mod tests {
         assert!(fast.used_index_merge);
         assert_eq!(
             fast.docs_passthrough_inputs, 2,
-            "the union-widened input copies alongside the identical one; only the width-flipped \
-             input decodes (M17 per-input fail-open)"
+            "the union-widened input copies alongside the identical one; only the unsafely \
+             flipped (u64 → i64) input decodes (M17 per-input fail-open)"
         );
 
         let rebuild = merge_core_files_rebuild_with_caps(
@@ -9135,7 +9336,7 @@ mod tests {
         // the flipped input's code values were CAST to the plan width by
         // the decode path
         let code = read_i64(&fast_reader, "code");
-        assert_eq!(&code[7..], &[301, 302], "Int32 -> Int64 cast image");
+        assert_eq!(&code[7..], &[301, 302], "UInt64 -> Int64 cast image");
         // zone coverage still exact over the mixed (spliced + folded) table
         let zone = fast_reader.zone_chunks().expect("zone table");
         assert_eq!(
@@ -9500,17 +9701,17 @@ mod tests {
         }
     }
 
-    /// #51c HEAL (b), v2 rescope: a docs-schema DIFFERENCE still falls back
-    /// to the full decode+rebuild. Union schemas make a shrink impossible
-    /// (the plan preserves every input column), so the surviving
-    /// non-additive case is a TYPE CHANGE: the current stream schema types
-    /// a column differently than the file stores it — the plan's target
-    /// type differs, the output dtype differs, and the input must decode
-    /// (cast) instead of copying chunks. The same input under an agreeing
-    /// schema passes through — proving the gate, not the harness, makes
-    /// the call.
+    /// #51c HEAL (b), v2 rescope: a docs-schema TYPE CHANGE against the
+    /// current stream schema. A registry WIDENING (the file stores `code`
+    /// Int64, the registry now types it Utf8) keeps the chunk copy — the
+    /// widen plan casts that one column per chunk, so the heal still passes
+    /// through and the stored column is the cast image. A type change the
+    /// plan has no safe cast for (Int64 → Boolean) still falls back to the
+    /// full decode+rebuild, and the same input under an agreeing schema
+    /// passes through untouched — the gate, not the harness, makes the
+    /// call.
     #[test]
-    fn heal_docs_passthrough_type_change_falls_back() {
+    fn heal_docs_passthrough_type_change_casts_or_falls_back() {
         let fts = vec!["log".to_string()];
         let fields = vec![
             Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
@@ -9539,22 +9740,45 @@ mod tests {
                 .unwrap()
         };
 
-        // type-flipped plan: the registry types `code` Utf8 while the file
-        // stores Int64 — the output stores Utf8, so the chunks cannot copy
-        let mut flipped_fields = fields.clone();
-        flipped_fields[3] = Field::new("code", DataType::Utf8, true);
-        let flipped = heal(&Schema::new(flipped_fields));
+        // widened plan: the registry types `code` Utf8 while the file stores
+        // Int64 — the copy casts that column, everything else copies encoded
+        let mut widened_fields = fields.clone();
+        widened_fields[3] = Field::new("code", DataType::Utf8, true);
+        let widened = heal(&Schema::new(widened_fields));
+        assert_eq!(
+            widened.docs_passthrough_inputs, 1,
+            "a widening heal keeps the chunk copy (the cast rides inside it)"
+        );
+        let widened_reader = open_merged(&widened);
+        assert_eq!(
+            read_strings(&widened_reader, "code"),
+            vec![Some("500".to_string()), None, Some("503".to_string())],
+            "the copy casts the column to the plan type"
+        );
+        assert_eq!(read_i64(&widened_reader, TIMESTAMP_COL_NAME).len(), 3);
+
+        // unsafe flip: Int64 → Boolean has no widening cast, so the input
+        // decodes and the rebuild's normalize cast produces the column
+        let mut bool_fields = fields.clone();
+        bool_fields[3] = Field::new("code", DataType::Boolean, true);
+        let flipped = heal(&Schema::new(bool_fields));
         assert_eq!(
             flipped.docs_passthrough_inputs, 0,
-            "a type-changing heal must fall back to the full rebuild"
+            "a type change without a widening cast must fall back to the full rebuild"
         );
         let flipped_reader = open_merged(&flipped);
+        let code = flipped_reader.read_docs_column("code").unwrap();
+        let code = code
+            .as_any()
+            .downcast_ref::<arrow::array::BooleanArray>()
+            .expect("rebuild stores the plan type");
         assert_eq!(
-            read_strings(&flipped_reader, "code"),
-            vec![Some("500".to_string()), None, Some("503".to_string())],
+            (0..code.len())
+                .map(|i| (!code.is_null(i)).then(|| code.value(i)))
+                .collect::<Vec<_>>(),
+            vec![Some(true), None, Some(true)],
             "the rebuild casts the column to the plan type"
         );
-        assert_eq!(read_i64(&flipped_reader, TIMESTAMP_COL_NAME).len(), 3);
 
         // sanity: the SAME input under the agreeing schema does copy
         let identical = heal(&Schema::new(fields));
@@ -10085,19 +10309,17 @@ mod tests {
         );
     }
 
-    /// #51c-c (b): the FAST path's concat order engages only when EVERY
-    /// input passes the passthrough qualification (all-or-nothing) — one
-    /// unqualifiable input keeps the whole merge on the sorted interleave
-    /// (equivalent to the rebuild). Since M17 widens schema-subset inputs,
-    /// the disqualifier here is a genuine TYPE-WIDTH FLIP (`code` stored
-    /// Int32 vs the plan's Int64 — a real re-encode the widen plan
-    /// refuses). Union-only differences no longer disqualify anything.
+    /// #51c-c (b): an input storing a column at a NARROWER numeric width
+    /// than the plan (`code` Int32 vs the registry's Int64) no longer
+    /// disqualifies the concat copy — the widen plan casts exactly that
+    /// column per chunk while every other column copies encoded. Numeric
+    /// widening keeps the input's tagged value terms query-compatible, so
+    /// the merged index keeps `code`'s term capability and the output is
+    /// content-equivalent to the sorted rebuild oracle.
     #[test]
-    fn concat_merge_requires_all_inputs_qualified() {
+    fn concat_merge_casts_widened_numeric_input() {
         let fts = vec!["log".to_string()];
         let latest_schema = Schema::new(passthrough_fields());
-        // input B stores `code` at a flipped width: the plan targets Int64
-        // (latest schema), so B's chunks cannot copy
         let mut flip_fields = passthrough_fields();
         flip_fields[4] = Field::new("code", DataType::Int32, true);
         let ts_b = [990i64, 780, 710];
@@ -10123,7 +10345,7 @@ mod tests {
                 "pa.vix".to_string(),
                 passthrough_file(&[1000, 900, 800, 700], "a"),
             ),
-            ("pb-extra.vix".to_string(), file_b),
+            ("pb-narrow.vix".to_string(), file_b),
         ];
 
         let fast = merge_core_files(
@@ -10135,11 +10357,11 @@ mod tests {
         )
         .unwrap();
         assert!(fast.used_index_merge);
-        assert!(
-            !fast.concat_order,
-            "one unqualified input must keep the sorted interleave"
+        assert!(fast.concat_order, "overlap = concat order (the default)");
+        assert_eq!(
+            fast.docs_passthrough_inputs, 2,
+            "the narrower input copies through the widen-cast plan"
         );
-        assert_eq!(fast.docs_passthrough_inputs, 0, "interleave never copies");
 
         let rebuild = merge_core_files_rebuild_with_caps(
             StreamType::Logs,
@@ -10152,11 +10374,381 @@ mod tests {
         .unwrap();
         let fast_reader = open_merged(&fast);
         let rebuild_reader = open_merged(&rebuild);
-        assert_eq!(fast_reader.row_order(), RowOrder::TsDesc);
-        assert_core_files_equivalent(&fast_reader, &rebuild_reader, "disqualified concat");
-        // ... and the interleaved output really is globally sorted
-        let ts = read_i64(&fast_reader, TIMESTAMP_COL_NAME);
-        assert!(ts.windows(2).all(|pair| pair[0] >= pair[1]), "global DESC");
+        assert_eq!(fast_reader.row_order(), RowOrder::Concat);
+        let code_field = fast_reader
+            .docs_schema()
+            .unwrap()
+            .field_with_name("code")
+            .unwrap()
+            .clone();
+        assert_eq!(
+            code_field.data_type(),
+            &DataType::Int64,
+            "cast to the plan type"
+        );
+        assert!(
+            fast_reader.has_term_capability("code"),
+            "numeric widening keeps the tagged value terms usable"
+        );
+        assert_core_files_content_equivalent(
+            &fast_reader,
+            &rebuild_reader,
+            "widened numeric concat vs rebuild",
+        );
+    }
+
+    /// The 2026-09-17 production shape: a large indexed batch whose plan
+    /// types a field as TEXT (the registry widened it) over an input that
+    /// stores it as a NUMBER, with a concat-ordered input forcing the
+    /// concatenation path. Under `IndexedOnly` (no rebuild allowed) this
+    /// refused forever. Now the numeric input's column casts per chunk
+    /// inside the copy, the merge completes on the fast path, the merged
+    /// column is text, and — because the input's tagged numeric terms cannot
+    /// answer raw string probes against the widened values — `code` is
+    /// DEMOTED (filter-back) rather than claimed exactly. Everything else
+    /// stays content-equivalent to the sorted rebuild oracle.
+    #[test]
+    fn indexed_only_concat_merge_widens_numeric_to_text() {
+        let fts = vec!["log".to_string()];
+        // gen-1: two overlapping numeric-`code` files → a concat-ordered
+        // output (the input that forces concatenation downstream)
+        let numeric_schema = Schema::new(passthrough_fields());
+        let gen1 = merge_core_files(
+            StreamType::Logs,
+            &as_inputs(&[
+                (
+                    "pa.vix".to_string(),
+                    passthrough_file(&[1000, 900, 800, 700], "a"),
+                ),
+                (
+                    "pb.vix".to_string(),
+                    passthrough_file(&[950, 850, 750], "b"),
+                ),
+            ]),
+            &numeric_schema,
+            &fts,
+            &[],
+        )
+        .unwrap();
+        assert!(gen1.concat_order && gen1.docs_passthrough_inputs == 2);
+        let concat_pair: BuiltPair = (
+            bytes::Bytes::from(gen1.output.to_bytes().unwrap()),
+            gen1.index.clone().map(bytes::Bytes::from),
+        );
+        assert_eq!(open_pair(&concat_pair).row_order(), RowOrder::Concat);
+
+        // the registry widened `code` to text; a fresh file already stores it so
+        let mut text_fields = passthrough_fields();
+        text_fields[4] = Field::new("code", DataType::Utf8, true);
+        let latest_schema = Schema::new(text_fields.clone());
+        let ts_c = [985i64, 735];
+        let fresh = build_core_file(
+            text_fields,
+            vec![
+                Arc::new(Int64Array::from(ts_c.to_vec())),
+                Arc::new(StringArray::from(vec![Some("error c row 0"), None])),
+                Arc::new(StringArray::from(vec![Some("svc-c-0"), Some("svc-c-1")])),
+                Arc::new(StringArray::from(vec![Some("prod"); 2])),
+                Arc::new(StringArray::from(vec![Some("beta"), Some("9000")])),
+            ],
+            &fts,
+            None,
+        );
+        let gen2_inputs = vec![
+            ("gen1-concat.vix".to_string(), concat_pair.clone()),
+            ("fresh-text.vix".to_string(), fresh.clone()),
+        ];
+
+        let strict = try_merge_core_files_with_cancellation(
+            StreamType::Logs,
+            as_inputs(&gen2_inputs),
+            Arc::new(latest_schema.clone()),
+            fts.clone(),
+            Vec::new(),
+            VixMergeCancellation::new(),
+            CoreMergeMode::IndexedOnly,
+        )
+        .expect("a widening cast is not a refusal");
+        let fast = match strict {
+            CoreMergeAttempt::Complete(result) => result,
+            CoreMergeAttempt::NeedsRebuild(_) => panic!("IndexedOnly never yields a rebuild"),
+        };
+        assert!(fast.used_index_merge);
+        assert!(fast.concat_order, "the concat input forces concatenation");
+        assert_eq!(
+            fast.docs_passthrough_inputs, 2,
+            "the numeric input copies with its `code` column cast per chunk"
+        );
+
+        let fast_reader = open_merged(&fast);
+        let code_field = fast_reader
+            .docs_schema()
+            .unwrap()
+            .field_with_name("code")
+            .unwrap()
+            .clone();
+        assert!(
+            matches!(
+                code_field.data_type(),
+                DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+            ),
+            "widened to text, got {:?}",
+            code_field.data_type()
+        );
+        assert!(
+            !fast_reader.has_term_capability("code"),
+            "tagged numeric terms cannot serve raw string probes: the field is demoted"
+        );
+        assert!(
+            fast_reader.has_term_capability("svc"),
+            "unrelated fields keep their capability"
+        );
+
+        // the sorted rebuild oracle over the same inputs
+        let rebuild = merge_core_files_rebuild_with_caps(
+            StreamType::Logs,
+            &as_inputs(&gen2_inputs),
+            &latest_schema,
+            &fts,
+            &[],
+            oracle_caps(),
+        )
+        .unwrap();
+        let rebuild_reader = open_merged(&rebuild);
+        assert!(
+            rebuild_reader.has_term_capability("code"),
+            "the rebuild re-derives raw string terms from the cast column"
+        );
+        // row contents agree (the cast values read back as their decimal
+        // text, exactly like the rebuild's normalize cast)
+        let mut fast_rows = docs_row_contents(&fast_reader);
+        let mut rebuild_rows = docs_row_contents(&rebuild_reader);
+        fast_rows.sort();
+        rebuild_rows.sort();
+        assert_eq!(fast_rows, rebuild_rows, "row multisets");
+        let code_values: Vec<Option<String>> = {
+            let column = arrow::compute::cast(
+                &fast_reader.read_docs_column("code").unwrap(),
+                &DataType::Utf8,
+            )
+            .unwrap();
+            let column = column.as_any().downcast_ref::<StringArray>().unwrap();
+            (0..column.len())
+                .map(|i| (!column.is_null(i)).then(|| column.value(i).to_string()))
+                .collect()
+        };
+        let mut present: Vec<&str> = code_values.iter().flatten().map(String::as_str).collect();
+        present.sort_unstable();
+        present.dedup();
+        // gen-1 rows carried `code` = 200 + row for rows r % 5 != 2 (files
+        // a: 4 rows, b: 3 rows) → decimal text after the cast; the fresh
+        // text file contributes its own strings verbatim
+        assert_eq!(
+            present,
+            ["200", "201", "203", "9000", "beta"],
+            "cast values read back as decimal text next to the stored strings"
+        );
+        assert_eq!(
+            code_values.iter().filter(|value| value.is_none()).count(),
+            2,
+            "nulls survive the cast (one per gen-1 input at r % 5 == 2)"
+        );
+        // every query the demoted field does not own answers identically
+        for query in [
+            exact("svc", "svc-a-0"),
+            exact("svc", "svc-c-1"),
+            key_exists("code"),
+            key_exists("svc"),
+        ] {
+            assert_eq!(
+                contents_of(&fast_rows, &matching_docs(&fast_reader, &query)),
+                contents_of(&rebuild_rows, &matching_docs(&rebuild_reader, &query)),
+                "query {query:?} by content"
+            );
+        }
+    }
+
+    /// `IndexedOnly` refusals surface from the PREFLIGHT — planning over
+    /// footers only — so the compactor can refuse a large batch before
+    /// prefetching its inputs: the refusal is the typed
+    /// [`IndexedMergeRefused`] and no byte below the data object's tail
+    /// window was ever read.
+    #[test]
+    fn indexed_only_refusal_happens_in_preflight_without_docs_reads() {
+        let fields = || {
+            vec![
+                Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
+                Field::new("svc", DataType::Utf8, true),
+                Field::new("body", DataType::Utf8, true),
+            ]
+        };
+        // big enough that the docs blob lies far below the tail probe:
+        // incompressible per-row payloads (a compressible fixture shrinks
+        // into the tail window and proves nothing)
+        let n = 60_000usize;
+        let noise = |i: usize| {
+            let mut state =
+                0x9E37_79B9_7F4A_7C15u64 ^ (i as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            (0..12)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    format!("{state:016x}")
+                })
+                .collect::<String>()
+        };
+        let make = |fts: &[String], salt: &str| {
+            build_core_file(
+                fields(),
+                vec![
+                    Arc::new(Int64Array::from(
+                        (0..n).map(|i| 5_000_000 - i as i64).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        (0..n)
+                            .map(|i| Some(format!("svc-{salt}-{}", i % 13)))
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        (0..n)
+                            .map(|i| Some(format!("{salt} payload {i:08} {}", noise(i))))
+                            .collect::<Vec<_>>(),
+                    )),
+                ],
+                fts,
+                None,
+            )
+        };
+        // capability conflict: `svc` is fts in one input, term in the other
+        let with_fts = make(&["svc".to_string()], "a");
+        let plain = make(&[], "b");
+        assert!(
+            with_fts.0.len() > 2 * 1024 * 1024,
+            "fixture must dwarf the tail probe ({} bytes)",
+            with_fts.0.len()
+        );
+        let counted: Vec<(
+            String,
+            Arc<LowestOffsetRangeSource>,
+            Option<Arc<dyn VixRangeSource>>,
+        )> = [("a.vix", with_fts), ("b.vix", plain)]
+            .into_iter()
+            .map(|(key, (data, index))| {
+                let counter = Arc::new(LowestOffsetRangeSource::new(
+                    vortex_index::BytesRangeSource::new(key, data),
+                ));
+                let index = index
+                    .map(|bytes| vortex_index::BytesRangeSource::new(format!("{key}.vxi"), bytes));
+                (key.to_string(), counter, index)
+            })
+            .collect();
+        let inputs: Vec<MergeInput> = counted
+            .iter()
+            .map(|(key, counter, index)| {
+                (
+                    key.clone(),
+                    Arc::clone(counter) as Arc<dyn VixRangeSource>,
+                    index.clone(),
+                )
+            })
+            .collect();
+
+        let error = preflight_core_merge(
+            StreamType::Logs,
+            inputs,
+            Arc::new(Schema::new(fields())),
+            Vec::new(),
+            Vec::new(),
+            VixMergeCancellation::new(),
+            CoreMergeMode::IndexedOnly,
+        )
+        .err()
+        .expect("the fts/term conflict must refuse under IndexedOnly");
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.downcast_ref::<IndexedMergeRefused>().is_some()),
+            "refusals are typed for the compactor's backoff: {error:#}"
+        );
+        assert!(
+            format!("{error:#}").contains(
+                "required indexed merge is not applicable; refusing a large full rebuild"
+            ),
+            "{error:#}"
+        );
+        for (key, counter, _) in &counted {
+            let len = counter.len();
+            let lowest = counter.lowest_fetched_start();
+            assert!(
+                lowest >= len.saturating_sub(1024 * 1024),
+                "{key}: preflight must read only the tail window (lowest fetched offset {lowest} \
+                 of {len} bytes)"
+            );
+        }
+
+        // the same inputs under Automatic still resolve to a rebuild
+        // continuation (the conflict is a fallback, not a fatal error)
+        let attempt = try_merge_core_files_with_cancellation(
+            StreamType::Logs,
+            counted
+                .iter()
+                .map(|(key, counter, index)| {
+                    (
+                        key.clone(),
+                        Arc::clone(counter) as Arc<dyn VixRangeSource>,
+                        index.clone(),
+                    )
+                })
+                .collect(),
+            Arc::new(Schema::new(fields())),
+            Vec::new(),
+            Vec::new(),
+            VixMergeCancellation::new(),
+            CoreMergeMode::Automatic,
+        )
+        .unwrap();
+        assert!(matches!(attempt, CoreMergeAttempt::NeedsRebuild(_)));
+    }
+
+    /// A range source that records the lowest byte offset any fetch touched
+    /// (the docs blob sits at the front of a `.vix` object, the puffin
+    /// footer at its tail).
+    struct LowestOffsetRangeSource {
+        inner: Arc<dyn VixRangeSource>,
+        lowest_start: std::sync::atomic::AtomicU64,
+    }
+
+    impl LowestOffsetRangeSource {
+        fn new(inner: Arc<dyn VixRangeSource>) -> Self {
+            Self {
+                inner,
+                lowest_start: std::sync::atomic::AtomicU64::new(u64::MAX),
+            }
+        }
+
+        fn lowest_fetched_start(&self) -> u64 {
+            self.lowest_start.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl VixRangeSource for LowestOffsetRangeSource {
+        fn len(&self) -> u64 {
+            self.inner.len()
+        }
+
+        fn fetch(
+            &self,
+            range: std::ops::Range<u64>,
+        ) -> futures::future::BoxFuture<'static, anyhow::Result<bytes::Bytes>> {
+            self.lowest_start
+                .fetch_min(range.start, std::sync::atomic::Ordering::SeqCst);
+            self.inner.fetch(range)
+        }
+
+        fn describe(&self) -> String {
+            self.inner.describe()
+        }
     }
 
     /// #51c-c (c): a concat-order OUTPUT re-entering a later merge is
@@ -10731,14 +11323,14 @@ mod tests {
         );
     }
 
-    /// M17 gen-1 encode-once (b): per-input fail-open. An input whose
-    /// stored column type FLIPPED against the merge target (a genuine
-    /// re-encode) decodes at its concatenated position while every other
-    /// input still copies — a qualification miss no longer forfeits the
-    /// whole copy (pre-M17: any miss = every byte re-encoded). Content
-    /// stays equivalent to the full-decode oracle.
+    /// M17 gen-1 encode-once (b): an input whose stored column type was
+    /// WIDENED by the registry (Int64 stored, Utf8 planned) still copies —
+    /// the widen plan casts exactly that column per chunk while the rest of
+    /// the input's chunks copy encoded, and the terms derive from the
+    /// normalized (cast) scan. Content stays equivalent to the full-decode
+    /// oracle and the stored column is the cast image.
     #[tokio::test]
-    async fn gen1_docs_copy_type_flip_fails_open_per_input() {
+    async fn gen1_docs_copy_casts_widened_input_column() {
         let fts: Vec<String> = Vec::new();
         let build_l0 = |name: &'static str, fields: Vec<Field>, columns: Vec<ArrayRef>| async move {
             let schema = Arc::new(Schema::new(fields));
@@ -10806,8 +11398,8 @@ mod tests {
         let mixed = merge_with(BatchCaps::default());
         assert!(!mixed.used_index_merge);
         assert_eq!(
-            mixed.docs_passthrough_inputs, 1,
-            "the type-flipped input must fail open to the decode path; the clean input copies"
+            mixed.docs_passthrough_inputs, 2,
+            "the type-widened input copies through the cast plan alongside the clean input"
         );
         let oracle = merge_with(oracle_caps());
         assert_eq!(oracle.docs_passthrough_inputs, 0);
@@ -10816,8 +11408,8 @@ mod tests {
             &open_merged(&oracle),
             "type-flip fail-open vs decode rebuild",
         );
-        // the flipped input's values were CAST to the target type by the
-        // decode path — verify the stored column is the cast image
+        // the widened input's values were CAST to the target type inside the
+        // copy — verify the stored column is the cast image
         let reader = open_merged(&mixed);
         let mut codes = read_strings(&reader, "code");
         codes.sort();

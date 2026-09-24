@@ -276,6 +276,17 @@ pub trait FileList: Sync + Send + 'static {
         expected_status: FileListJobStatus,
     ) -> Result<bool>;
     async fn set_job_pending_owned(&self, id: i64, node: &str, generation: i64) -> Result<bool>;
+    /// [`Self::set_job_pending_owned`] with the row's FIFO clock
+    /// (`updated_at`) stamped `not_before` micros: the pending claim skips
+    /// rows whose clock lies in the future, so the job is not re-claimed
+    /// before that instant. Used to back off input-bound refusals.
+    async fn set_job_pending_owned_not_before(
+        &self,
+        id: i64,
+        node: &str,
+        generation: i64,
+        not_before: i64,
+    ) -> Result<bool>;
     async fn set_job_done_owned(&self, id: i64, node: &str, generation: i64) -> Result<bool>;
     async fn check_running_jobs(&self, before_date: i64) -> Result<()>;
     async fn clean_done_jobs(&self, before_date: i64) -> Result<()>;
@@ -750,6 +761,18 @@ pub async fn touch_job_lease(
 #[inline]
 pub async fn set_job_pending_owned(id: i64, node: &str, generation: i64) -> Result<bool> {
     CLIENT.set_job_pending_owned(id, node, generation).await
+}
+
+#[inline]
+pub async fn set_job_pending_owned_not_before(
+    id: i64,
+    node: &str,
+    generation: i64,
+    not_before: i64,
+) -> Result<bool> {
+    CLIENT
+        .set_job_pending_owned_not_before(id, node, generation, not_before)
+        .await
 }
 
 #[inline]

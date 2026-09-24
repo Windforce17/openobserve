@@ -1829,6 +1829,7 @@ WHERE id IN (
     SELECT id
     FROM file_list_jobs
     WHERE status = $4
+      AND updated_at <= $3
       AND ($5::BIGINT IS NULL OR offsets >= $5)
       AND ($6::BIGINT IS NULL OR offsets < $6)
     ORDER BY {order_sql}
@@ -1914,17 +1915,37 @@ WHERE id = $2 AND node = $3 AND lease_generation = $4 AND status = $5;"#,
     }
 
     async fn set_job_pending_owned(&self, id: i64, node: &str, generation: i64) -> Result<bool> {
+        self.set_job_pending_owned_not_before(
+            id,
+            node,
+            generation,
+            config::utils::time::now_micros(),
+        )
+        .await
+    }
+
+    async fn set_job_pending_owned_not_before(
+        &self,
+        id: i64,
+        node: &str,
+        generation: i64,
+        not_before: i64,
+    ) -> Result<bool> {
         let pool = CLIENT.clone();
         DB_QUERY_NUMS
             .with_label_values(&["update", "file_list_jobs"])
             .inc();
+        // `updated_at` is the pending FIFO clock (see get_pending_jobs): a
+        // future instant hides the row from claims until then. Only the
+        // pending claim reads the clock of a PENDING row — the stale-lease
+        // sweep and the done-cleanup look at running/done rows.
         let ret = sqlx::query(
             r#"UPDATE file_list_jobs
 SET status = $1, node = '', updated_at = $2, pending_after_dump = false
 WHERE id = $3 AND node = $4 AND lease_generation = $5 AND status = $6;"#,
         )
         .bind(super::FileListJobStatus::Pending)
-        .bind(config::utils::time::now_micros())
+        .bind(not_before)
         .bind(id)
         .bind(node)
         .bind(generation)

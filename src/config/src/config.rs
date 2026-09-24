@@ -3041,6 +3041,15 @@ pub struct Compact {
     )]
     pub job_run_timeout: i64,
     #[env_config(
+        name = "ZO_COMPACT_REFUSAL_BACKOFF_SECS",
+        default = 1800, // 30 minutes
+        help = "A merge job whose required indexed fast path was refused for an input-bound reason \
+                (no readable sidecar, dictionaries the field plan cannot merge) returns to pending \
+                no earlier than this many seconds later instead of being re-claimed on the next \
+                cycle. 0 retries immediately."
+    )]
+    pub refusal_backoff_secs: u64,
+    #[env_config(
         name = "ZO_COMPACT_JOB_CLEAN_WAIT_TIME",
         default = 7200, // 2 hours
         help = "Clean the jobs which are finished more than this time"

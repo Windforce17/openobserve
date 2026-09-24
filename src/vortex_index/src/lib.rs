@@ -102,8 +102,8 @@ pub use cpu_executor::{
     configure_shared_cpu_executor, shared_cpu_thread_count, shared_vortex_execution_handle,
 };
 pub use docs::{
-    BoundValue, ColumnBound, DocsWidenPlan, EncodedDocsChunk, NumScalar, VixDocs, cmp_i128_vs_f64,
-    cmp_num_vs_bound, docs_widen_plan,
+    BoundValue, ColumnBound, DocsTypeFlip, DocsWidenPlan, EncodedDocsChunk, NumScalar, VixDocs,
+    cmp_i128_vs_f64, cmp_num_vs_bound, docs_type_flips, docs_widen_plan, widening_cast_supported,
 };
 pub use error::VixError;
 /// Result of an index read, including caller-defined admission errors.

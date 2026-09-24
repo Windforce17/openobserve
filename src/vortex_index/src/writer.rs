@@ -1574,7 +1574,9 @@ impl VixWriter {
                 ));
             }
             for entry in reader.field_entries() {
-                if self.value_index_excluded_fields.contains(&entry.name) {
+                if self.value_index_excluded_fields.contains(&entry.name)
+                    || self.demoted_fields.contains(&entry.name)
+                {
                     continue;
                 }
                 if entry.has_type(FIELD_TYPE_BLOOM)
@@ -1622,6 +1624,7 @@ impl VixWriter {
                 if !value_indexed
                     && self.term_field_ids.contains_key(name)
                     && !self.value_index_excluded_fields.contains(name)
+                    && !self.demoted_fields.contains(name)
                 {
                     return Err(format!(
                         "field {name:?} is partial and not value-indexed in input {position}, \
@@ -1654,7 +1657,8 @@ impl VixWriter {
         }
         let mut lacking = Vec::new();
         for name in &self.term_fields {
-            if self.value_index_excluded_fields.contains(name) {
+            if self.value_index_excluded_fields.contains(name) || self.demoted_fields.contains(name)
+            {
                 continue;
             }
             if self.fts_fields.contains(name) {
@@ -1818,6 +1822,49 @@ impl VixWriter {
                  demoting it in the merged fields table (filter-back until a rebuild)"
             );
             self.demoted_fields.insert(name);
+        }
+        // Registry type widening: an input that stores a term-planned field
+        // under a DIFFERENT type than this writer's docs schema carries value
+        // terms of the STORED type. Numeric widenings (an integer that became
+        // a float, a narrower integer) keep their canonical tagged terms
+        // query-compatible — numeric probes cover every spelling — but a
+        // number or boolean the output now stores as TEXT is probed as a raw
+        // string term the input dictionary never held. The docs passthrough
+        // casts the column to the widened type, so such lookups would
+        // silently miss the input's rows: demote the field exactly like a
+        // capability gap (filter-back until a rebuild re-derives its terms
+        // from the widened column).
+        for reader in inputs {
+            let input_schema = reader.docs_schema().map_err(|e| {
+                VixError::Writer(format!(
+                    "merge input docs schema is unreadable, cannot check type widening: {e:#}"
+                ))
+            })?;
+            for flip in crate::docs::docs_type_flips(&input_schema, &self.docs_schema) {
+                if !flip.breaks_value_terms()
+                    || !self.term_field_ids.contains_key(&flip.name)
+                    || self.demoted_fields.contains(&flip.name)
+                {
+                    continue;
+                }
+                if self.fts_fields.contains(&flip.name) {
+                    return Err(VixError::Writer(format!(
+                        "field {:?} is stored as {} in an input but the merged output stores \
+                         {} and full-text plans it; its tokens cannot be merged without a \
+                         rebuild",
+                        flip.name, flip.stored, flip.target
+                    )));
+                }
+                log::info!(
+                    "vix merge: field {:?} is stored as {} in an input but the merged output \
+                     stores {} (type widening); demoting it in the merged fields table \
+                     (filter-back until a rebuild)",
+                    flip.name,
+                    flip.stored,
+                    flip.target
+                );
+                self.demoted_fields.insert(flip.name);
+            }
         }
 
         // #52: per-field bloom sections track only NON-demoted bloom fields

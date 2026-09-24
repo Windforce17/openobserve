@@ -298,37 +298,63 @@ impl std::fmt::Debug for EncodedDocsChunk {
     }
 }
 
+/// Where one OUTPUT docs column of a widened chunk comes from.
+enum WidenSource {
+    /// The input column at this position, stored encoded form kept verbatim.
+    Move(usize),
+    /// The input column at this position, decoded and cast to the output's
+    /// arrow type (a registry type widening: the input stored the field
+    /// under a narrower type than the current stream schema). Only this
+    /// column decodes; the re-encode happens in the writer's decoded-chunk
+    /// path.
+    Cast {
+        index: usize,
+        from: arrow::datatypes::DataType,
+        to: arrow::datatypes::DataType,
+    },
+    /// Absent from the input: an all-null constant of the output dtype.
+    Null,
+}
+
 /// M17 (gen-1 encode-once): how one passthrough input's encoded docs chunks
-/// widen to the merge OUTPUT's docs schema without decoding anything.
+/// widen to the merge OUTPUT's docs schema.
 ///
 /// v2 all-present-columns files carry per-file schema UNIONS, so a
 /// multi-input merge's output schema is almost always a strict superset of
 /// each input's — the historical passthrough required exact schema identity
 /// and every gen-1 rebuild re-encoded every byte over it. A widen plan maps
 /// each OUTPUT column to the input column holding it, or to a synthesized
-/// all-null column (a [`vortex constant`] — it encodes to ~nothing); shared
-/// columns must match at the STORED (vortex) dtype exactly, same as the
-/// identity check. [`Self::widen`] then rebuilds each scanned struct chunk
-/// in output shape: moved field arrays stay in their stored encoded form
-/// (the whole point), null columns are constants, and the writer's
-/// encoded-run dtype check still guards the result.
+/// all-null column (a [`vortex constant`] — it encodes to ~nothing).
+/// [`Self::widen`] then rebuilds each scanned struct chunk in output shape:
+/// moved field arrays stay in their stored encoded form (the whole point),
+/// null columns are constants, and the writer's encoded-run dtype check
+/// still guards the result.
 ///
-/// NEVER a re-encode: a schema pair this plan cannot express (a shared
-/// column with a different stored dtype — a genuine type flip) refuses at
-/// construction and the caller falls open to the decode path for that
-/// input, counted in the merge summary.
+/// A shared column whose STORED dtype differs from the output's is a
+/// registry type widening (a field ingested as a number before the stream
+/// schema widened it to a string, an integer that became a float). Such a
+/// column takes a [`WidenSource::Cast`]: that one column decodes and casts
+/// per chunk while every other column still copies — the same arrow cast
+/// the decode path applies, so the two arms store identical values. Only a
+/// dtype pair the cast allowlist ([`widening_cast_supported`]) rejects
+/// refuses at construction; the caller then falls open to the decode path
+/// for that input, counted in the merge summary.
 pub struct DocsWidenPlan {
-    /// Output field position -> input field position; `None` = synthesize
-    /// an all-null constant of the output field's dtype.
-    mapping: Vec<Option<usize>>,
+    /// Output field position -> source of that column.
+    mapping: Vec<WidenSource>,
     /// Output struct shape for chunk reassembly.
     names: vortex::dtype::FieldNames,
     dtypes: Vec<vortex::dtype::DType>,
+    /// Output field names, parallel to `mapping` (diagnostics).
+    output_names: Vec<String>,
     /// Expected input struct field count (chunk sanity check).
     input_fields: usize,
     /// Input == output at the stored-dtype level: [`Self::widen`] is a
     /// zero-cost passthrough.
     identity: bool,
+    /// Execution session for the cast columns' canonicalization; `None`
+    /// when the plan casts nothing.
+    cast_session: Option<vortex::session::VortexSession>,
 }
 
 impl std::fmt::Debug for DocsWidenPlan {
@@ -337,19 +363,118 @@ impl std::fmt::Debug for DocsWidenPlan {
             .field("identity", &self.identity)
             .field("input_fields", &self.input_fields)
             .field("output_fields", &self.mapping.len())
-            .field(
-                "null_synthesized",
-                &self.mapping.iter().filter(|m| m.is_none()).count(),
-            )
+            .field("null_synthesized", &self.null_columns())
+            .field("cast", &self.cast_columns().collect::<Vec<_>>())
             .finish()
     }
+}
+
+/// Whether a stored column of arrow type `from` may be cast to the output
+/// type `to` inside the docs passthrough. The allowlist mirrors the stream
+/// schema's own widening rules — every conflict widens to a string, and
+/// integers widen to floats — and nothing else: a cast that could lose or
+/// reinterpret values (string → number, float → integer, anything → bool)
+/// is refused, so the input takes the decode path exactly as before.
+pub fn widening_cast_supported(
+    from: &arrow::datatypes::DataType,
+    to: &arrow::datatypes::DataType,
+) -> bool {
+    use arrow::datatypes::DataType;
+    let integer = |data_type: &DataType| {
+        matches!(
+            data_type,
+            DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::UInt8
+                | DataType::UInt16
+                | DataType::UInt32
+                | DataType::UInt64
+        )
+    };
+    let float = |data_type: &DataType| matches!(data_type, DataType::Float32 | DataType::Float64);
+    let string = |data_type: &DataType| {
+        matches!(
+            data_type,
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+        )
+    };
+    if from == to {
+        return false;
+    }
+    let allowed = (string(to) && (integer(from) || float(from) || *from == DataType::Boolean))
+        || (*to == DataType::Float64 && (integer(from) || *from == DataType::Float32))
+        || (*to == DataType::Int64
+            && matches!(
+                from,
+                DataType::Int8
+                    | DataType::Int16
+                    | DataType::Int32
+                    | DataType::UInt8
+                    | DataType::UInt16
+                    | DataType::UInt32
+            ));
+    allowed && arrow::compute::can_cast_types(from, to)
+}
+
+/// One column `input` and `output` both store under DIFFERENT stored
+/// (vortex) dtypes — a field a merge writes at a widened type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocsTypeFlip {
+    pub name: String,
+    /// The input's stored arrow type.
+    pub stored: arrow::datatypes::DataType,
+    /// The output's arrow type.
+    pub target: arrow::datatypes::DataType,
+}
+
+impl DocsTypeFlip {
+    /// Whether the input's value terms cannot serve lookups against the
+    /// widened column. Numeric widenings keep their canonical tagged terms
+    /// query-compatible (`38` stays `38`; a float-typed probe covers both
+    /// the `38` and `38.0` spellings), but a number or boolean widened to
+    /// TEXT is probed as a raw string term the input dictionary never held.
+    pub fn breaks_value_terms(&self) -> bool {
+        let string = |data_type: &arrow::datatypes::DataType| {
+            matches!(
+                data_type,
+                arrow::datatypes::DataType::Utf8
+                    | arrow::datatypes::DataType::LargeUtf8
+                    | arrow::datatypes::DataType::Utf8View
+            )
+        };
+        string(&self.target) && !string(&self.stored)
+    }
+}
+
+/// The columns `input` and `output` both store under DIFFERENT stored
+/// (vortex) dtypes, in output field order.
+pub fn docs_type_flips(
+    input: &arrow::datatypes::Schema,
+    output: &arrow::datatypes::Schema,
+) -> Vec<DocsTypeFlip> {
+    use vortex::{arrow::FromArrowType, dtype::DType};
+    output
+        .fields()
+        .iter()
+        .filter_map(|field| {
+            let theirs = input.field_with_name(field.name()).ok()?;
+            (DType::from_arrow(theirs) != DType::from_arrow(field.as_ref())).then(|| DocsTypeFlip {
+                name: field.name().clone(),
+                stored: theirs.data_type().clone(),
+                target: field.data_type().clone(),
+            })
+        })
+        .collect()
 }
 
 /// Build the widen plan from one input's docs schema to the output writer's
 /// docs schema (see [`DocsWidenPlan`]). `Err` carries the human reason the
 /// input must take the decode path instead:
 ///
-/// - a shared column whose stored (vortex) dtype differs — type widening is a real re-encode;
+/// - a shared column whose stored (vortex) dtype differs and is not a supported widening cast
+///   ([`widening_cast_supported`]);
 /// - an input column ABSENT from the output — impossible when the output schema is the union of the
 ///   inputs' (refused defensively);
 /// - an output column missing from the input that is NOT nullable — nothing can null-fill it
@@ -358,43 +483,61 @@ pub fn docs_widen_plan(
     input: &arrow::datatypes::Schema,
     output: &arrow::datatypes::Schema,
 ) -> std::result::Result<DocsWidenPlan, String> {
-    use vortex::{arrow::FromArrowType, dtype::DType};
+    use vortex::{VortexSessionDefault, arrow::FromArrowType, dtype::DType};
     let out_dtype = DType::from_arrow(output);
     let Some(struct_fields) = out_dtype.as_struct_fields_opt() else {
         return Err("output docs schema is not a struct dtype".to_string());
     };
     let names = struct_fields.names().clone();
     let dtypes: Vec<DType> = struct_fields.fields().collect();
+    let output_names: Vec<String> = output
+        .fields()
+        .iter()
+        .map(|field| field.name().clone())
+        .collect();
     let identity = DType::from_arrow(input) == out_dtype;
     if identity {
         return Ok(DocsWidenPlan {
-            mapping: (0..output.fields().len()).map(Some).collect(),
+            mapping: (0..output.fields().len()).map(WidenSource::Move).collect(),
             names,
             dtypes,
+            output_names,
             input_fields: input.fields().len(),
             identity: true,
+            cast_session: None,
         });
     }
     // by-name mapping: input schemas keep writer order (_timestamp, sorted
     // cs fields, _source, _original) but the reassembly is positional in
     // OUTPUT order, so only name+dtype identity matters per column
-    let mut mapping: Vec<Option<usize>> = Vec::with_capacity(output.fields().len());
+    let mut mapping: Vec<WidenSource> = Vec::with_capacity(output.fields().len());
     let mut used = 0usize;
+    let mut casts = 0usize;
     for (position, field) in output.fields().iter().enumerate() {
         match input.index_of(field.name()) {
             Ok(index) => {
-                let theirs = DType::from_arrow(input.field(index));
-                if theirs != dtypes[position] {
+                let stored = input.field(index);
+                let theirs = DType::from_arrow(stored);
+                used += 1;
+                if theirs == dtypes[position] {
+                    mapping.push(WidenSource::Move(index));
+                } else if widening_cast_supported(stored.data_type(), field.data_type()) {
+                    casts += 1;
+                    mapping.push(WidenSource::Cast {
+                        index,
+                        from: stored.data_type().clone(),
+                        to: field.data_type().clone(),
+                    });
+                } else {
                     return Err(format!(
-                        "docs column {:?} stores dtype {} but the output stores {} — type \
-                         widening is a re-encode, not a chunk copy",
+                        "docs column {:?} stores dtype {} but the output stores {} — no \
+                         supported widening cast, so the column is a re-encode, not a chunk \
+                         copy",
                         field.name(),
                         theirs,
                         dtypes[position]
                     ));
                 }
-                used += 1;
-                mapping.push(Some(index));
             }
             Err(_) => {
                 if !dtypes[position].is_nullable() {
@@ -404,7 +547,7 @@ pub fn docs_widen_plan(
                         field.name()
                     ));
                 }
-                mapping.push(None);
+                mapping.push(WidenSource::Null);
             }
         }
     }
@@ -425,8 +568,10 @@ pub fn docs_widen_plan(
         mapping,
         names,
         dtypes,
+        output_names,
         input_fields: input.fields().len(),
         identity: false,
+        cast_session: (casts > 0).then(vortex::session::VortexSession::default),
     })
 }
 
@@ -439,17 +584,29 @@ impl DocsWidenPlan {
     /// Output columns synthesized as all-null constants (for the merge
     /// summary accounting).
     pub fn null_columns(&self) -> usize {
-        if self.identity {
-            0
-        } else {
-            self.mapping.iter().filter(|m| m.is_none()).count()
-        }
+        self.mapping
+            .iter()
+            .filter(|source| matches!(source, WidenSource::Null))
+            .count()
+    }
+
+    /// Output columns decoded and cast to a widened type per chunk (the
+    /// input stored them under a narrower type than the output).
+    pub fn cast_columns(&self) -> impl Iterator<Item = &str> + '_ {
+        self.mapping
+            .iter()
+            .zip(&self.output_names)
+            .filter_map(|(source, name)| {
+                matches!(source, WidenSource::Cast { .. }).then_some(name.as_str())
+            })
     }
 
     /// Rebuild one scanned encoded chunk in the OUTPUT struct shape: moved
     /// columns keep their stored encoded arrays verbatim, missing columns
-    /// become all-null constants of the output dtype (encode to ~nothing).
-    /// Chunk-level surgery only — no column data is ever decoded here.
+    /// become all-null constants of the output dtype (encode to ~nothing),
+    /// and cast columns decode + cast to the output type (the writer's
+    /// decoded-chunk path re-encodes exactly those). No other column data is
+    /// ever decoded here.
     pub fn widen(&self, chunk: EncodedDocsChunk) -> anyhow::Result<EncodedDocsChunk> {
         use vortex::{
             array::{
@@ -463,13 +620,9 @@ impl DocsWidenPlan {
             return Ok(chunk);
         }
         let rows = chunk.rows;
-        let sa = chunk
-            .array
-            .as_typed::<Struct>()
-            .ok_or_else(|| {
-                VixError::Malformed("encoded docs chunk is not a struct array".to_string())
-            })?
-            .clone();
+        let sa = chunk.array.as_typed::<Struct>().ok_or_else(|| {
+            VixError::Malformed("encoded docs chunk is not a struct array".to_string())
+        })?;
         let input_fields = sa.unmasked_fields();
         if input_fields.len() != self.input_fields {
             return Err(VixError::Malformed(format!(
@@ -483,25 +636,74 @@ impl DocsWidenPlan {
             .mapping
             .iter()
             .zip(&self.dtypes)
-            .map(|(source, dtype)| match source {
-                Some(index) => {
-                    let field = input_fields[*index].clone();
-                    if field.dtype() != dtype {
-                        return Err(VixError::Malformed(format!(
-                            "widen plan mapped a column of dtype {} into an output slot of \
-                             dtype {dtype}",
-                            field.dtype()
-                        )));
+            .zip(&self.output_names)
+            .map(|((source, dtype), name)| {
+                let field = match source {
+                    WidenSource::Move(index) => input_fields[*index].clone(),
+                    WidenSource::Cast { index, from, to } => {
+                        self.cast_column(name, input_fields[*index].clone(), from, to, dtype)?
                     }
-                    Ok(field)
+                    WidenSource::Null => {
+                        return Ok(
+                            ConstantArray::new(Scalar::null(dtype.clone()), rows).into_array()
+                        );
+                    }
+                };
+                if field.dtype() != dtype {
+                    return Err(VixError::Malformed(format!(
+                        "widen plan mapped column {name:?} of dtype {} into an output slot of \
+                         dtype {dtype}",
+                        field.dtype()
+                    )));
                 }
-                None => Ok(ConstantArray::new(Scalar::null(dtype.clone()), rows).into_array()),
+                Ok(field)
             })
             .collect::<Result<_>>()?;
         let array = StructArray::try_new(self.names.clone(), fields, rows, Validity::NonNullable)
             .map_err(|e| VixError::Malformed(format!("widen docs chunk: {e}")))?
             .into_array();
         Ok(EncodedDocsChunk { array, rows })
+    }
+
+    /// Decode one stored column window to arrow, cast it to the output
+    /// arrow type and hand it back as a canonical (decoded-family) vortex
+    /// array — the compress branch of the passthrough write strategy stores
+    /// it exactly like a decoded push would.
+    fn cast_column(
+        &self,
+        name: &str,
+        field: vortex::array::ArrayRef,
+        from: &arrow::datatypes::DataType,
+        to: &arrow::datatypes::DataType,
+        dtype: &vortex::dtype::DType,
+    ) -> Result<vortex::array::ArrayRef> {
+        use vortex::{
+            array::VortexSessionExecute,
+            arrow::{ArrowSessionExt, FromArrowArray},
+        };
+        let session = self.cast_session.as_ref().ok_or_else(|| {
+            VixError::Malformed(format!(
+                "widen plan casts column {name:?} without an execution session"
+            ))
+        })?;
+        let mut ctx = session.create_execution_ctx();
+        let target = arrow::datatypes::Field::new("", from.clone(), field.dtype().is_nullable());
+        let decoded = session
+            .arrow()
+            .execute_arrow(field, Some(&target), &mut ctx)
+            .map_err(|e| {
+                VixError::Malformed(format!("decode docs column {name:?} for widening: {e}"))
+            })?;
+        let cast = arrow::compute::cast(decoded.as_ref(), to).map_err(|e| {
+            VixError::Malformed(format!(
+                "cast docs column {name:?} from {from} to {to} for widening: {e}"
+            ))
+        })?;
+        vortex::array::ArrayRef::from_arrow(cast.as_ref(), dtype.is_nullable()).map_err(|e| {
+            VixError::Malformed(format!(
+                "re-import cast docs column {name:?} as {dtype}: {e}"
+            ))
+        })
     }
 }
 

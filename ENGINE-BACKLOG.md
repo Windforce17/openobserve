@@ -3,6 +3,56 @@
 Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
 (deleted 2026-07-29; full history in git). Keep THIS file current.
 
+## 2026-09-24 — compactor refusal storm: plan-before-prefetch, widening casts, refusal backoff (.169 candidate)
+- Production evidence (Orbit, 2026-09-24 07:00–08:00Z, 16 compactors × 3 slots):
+  15,641 prefetches (68,776 s ≈ 19 slot-hours/h), 13,307 failed batches
+  (85%), 1,806 merges, 532 sidecar heals. Every sampled failure was
+  `required indexed merge is not applicable; refusing a large full rebuild`
+  over a registry type widening — logs/default `after`/`quantity` f64→utf8,
+  traces/default `gen_ai.usage.total_tokens` i64→utf8 — raised AFTER the
+  whole-object prefetch (2–10 objects, 1–30 s each). Jobs re-pended at once
+  and were re-claimed every cycle (`generation=266` observed); onset
+  2026-09-17 ~13:00Z with the .168 guarded-indexed-target rollout.
+- Chain: `build_merge_plan` types output columns from the registry; the
+  concat qualification was all-or-nothing per input and `docs_widen_plan`
+  refused any stored-dtype difference; a concat-ordered input forced
+  concatenation, so the miss became a rebuild fallback that `IndexedOnly`
+  (indexed groups > 1 GiB original) must refuse; `cache_remote_files` ran
+  before planning; failure was not persisted.
+- Fix, format-neutral:
+  - `DocsWidenPlan` casts a widened column per chunk (`widening_cast_supported`:
+    number/bool → string family, integer → Float64, narrower integers → Int64;
+    the same arrow cast the decode path applies). Other columns still copy
+    encoded; unsupported pairs (narrowing, → bool) still take the decode path.
+  - Merge-mode writer demotes term-planned fields whose input stored type is
+    non-string while the output is text (`DocsTypeFlip::breaks_value_terms`):
+    the input's tagged numeric terms cannot answer raw string probes against
+    the cast values, so the field is filter-back until a heal re-derives it.
+    Numeric widenings keep capability (canonical tagged terms stay
+    query-compatible; `NumericCmp` probes the int and float spellings).
+  - A concat-ordered input no longer turns a per-input qualification miss
+    into a whole-merge fallback: the concat copy proceeds and unqualified
+    inputs decode in place (the disjoint copy's existing per-input fallback).
+  - `preflight_core_merge` / `execute_core_merge` split the compactor's CPU
+    phase: `IndexedOnly` refusals (no readable sidecar, `check_merge_inputs`)
+    are raised from footers alone, typed as `IndexedMergeRefused`;
+    `merge_core_group` runs PLAN → PREFETCH → EXECUTE (healing batches still
+    prefetch first). Refusals count in `compact_merge_refused_total`.
+  - A job whose failure chain carries `IndexedMergeRefused` re-pends with
+    `updated_at = now + ZO_COMPACT_REFUSAL_BACKOFF_SECS` (default 1800); the
+    pending claim now filters `updated_at <= now` (postgres + sqlite). Other
+    errors retry immediately as before.
+- Verification: vortex_index 343 tests; core `vix::core_writer` + `compact::`
+  272 tests incl. new `concat_merge_casts_widened_numeric_input`,
+  `indexed_only_concat_merge_widens_numeric_to_text` (the production shape
+  completes on the fast path under `IndexedOnly`, `code` demoted, rows equal
+  to the rebuild oracle) and
+  `indexed_only_refusal_happens_in_preflight_without_docs_reads` (lowest
+  fetched offset stays inside the tail window of a multi-MB input); infra
+  file_list 62 tests. Known residual, unchanged: the rebuild path derives a
+  widened field's terms from `_source` (tagged numeric), so raw string probes
+  on it miss numeric-origin rows — pre-existing type-widening semantics.
+
 ## 2026-09-08 — engine .166 production rollout and measured acceptance
 - Querier-only image `v0.93.0-vix-20260908.166`, source `0b076c91a9bf`,
   deployed through GitOps PR #548 / merge `84107245f999`. The owner explicitly

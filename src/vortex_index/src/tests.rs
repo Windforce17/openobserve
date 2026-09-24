@@ -13037,14 +13037,67 @@ fn m17_docs_widen_plan_edges() {
     assert!(!widen.is_identity());
     assert_eq!(widen.null_columns(), 2, "code + region synthesize");
 
-    // type flip: a shared column stored under a different dtype refuses
+    // narrowing flip: a shared column stored under a WIDER dtype than the
+    // output (string → int) has no widening cast and refuses
     let flip = docs_widen_plan(
         &Schema::new(vec![ts(), Field::new("code", DataType::Utf8, true), src()]),
         &output,
     );
     assert!(
-        flip.unwrap_err().contains("type widening is a re-encode"),
-        "type flips must refuse"
+        flip.unwrap_err().contains("no supported widening cast"),
+        "narrowing type flips must refuse"
+    );
+
+    // widening flip: a number stored where the output has text casts per
+    // chunk instead of refusing (the registry widened the field)
+    let widened_output = Schema::new(vec![
+        ts(),
+        Field::new("code", DataType::Utf8, true),
+        Field::new("ratio", DataType::Float64, true),
+        src(),
+    ]);
+    let cast = docs_widen_plan(
+        &Schema::new(vec![
+            ts(),
+            Field::new("code", DataType::Int64, true),
+            Field::new("ratio", DataType::Int64, true),
+            src(),
+        ]),
+        &widened_output,
+    )
+    .expect("widening casts are planned, not refused");
+    assert!(!cast.is_identity());
+    assert_eq!(cast.null_columns(), 0);
+    assert_eq!(cast.cast_columns().collect::<Vec<_>>(), ["code", "ratio"]);
+    let flips = crate::docs_type_flips(
+        &Schema::new(vec![
+            ts(),
+            Field::new("code", DataType::Int64, true),
+            Field::new("ratio", DataType::Int64, true),
+            src(),
+        ]),
+        &widened_output,
+    );
+    assert_eq!(
+        flips
+            .iter()
+            .map(|flip| (flip.name.as_str(), flip.breaks_value_terms()))
+            .collect::<Vec<_>>(),
+        [("code", true), ("ratio", false)],
+        "type flips are reported by output field order; only a widening to TEXT breaks the \
+         input's tagged numeric value terms"
+    );
+    assert!(
+        crate::docs_type_flips(
+            &Schema::new(vec![
+                ts(),
+                Field::new("code", DataType::Utf8View, true),
+                src()
+            ]),
+            &widened_output,
+        )
+        .is_empty(),
+        "string representation differences are not type flips"
     );
 
     // an input column the output would drop refuses
@@ -13190,6 +13243,144 @@ fn m17_widen_chunks_roundtrip() {
     for (i, value) in svc_values.iter().enumerate() {
         assert_eq!(value, &format!("svc-{}", i % 7));
     }
+}
+
+/// Type-widening chunk surgery: an input storing `code` as Int64 and
+/// `ratio` as Int64 widens into an output typing them Utf8 / Float64. The
+/// cast columns read back as the arrow cast of the stored values (the same
+/// cast the decode path applies), nulls survive, and the untouched columns
+/// still copy byte-for-byte.
+#[test]
+fn widen_chunks_cast_roundtrip() {
+    use arrow::{
+        array::{Float64Array, Int64Array, StringArray},
+        datatypes::{DataType, Field, Schema},
+        record_batch::RecordBatch,
+    };
+
+    use crate::{VixDocs, docs_widen_plan};
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(crate::TIMESTAMP_COL_NAME, DataType::Int64, false),
+        Field::new("code", DataType::Int64, true),
+        Field::new("ratio", DataType::Int64, true),
+        Field::new("svc", DataType::Utf8, true),
+    ]));
+    let n = 4096;
+    let code = |i: usize| (i % 5 != 0).then_some(i as i64 * 7 - 3);
+    let ratio = |i: usize| (i % 3 != 0).then_some(i as i64);
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(
+                (0..n).map(|i| 1_000_000 - i as i64).collect::<Vec<_>>(),
+            )) as _,
+            Arc::new(Int64Array::from((0..n).map(code).collect::<Vec<_>>())) as _,
+            Arc::new(Int64Array::from((0..n).map(ratio).collect::<Vec<_>>())) as _,
+            Arc::new(StringArray::from(
+                (0..n).map(|i| format!("svc-{}", i % 7)).collect::<Vec<_>>(),
+            )) as _,
+        ],
+    )
+    .unwrap();
+    let source: StringArray = (0..n)
+        .map(|i| Some(format!("{{\"svc\":\"svc-{}\"}}", i % 7)))
+        .collect();
+    let mut writer = VixWriter::new(
+        &schema,
+        VixWriterOptions {
+            index_enabled: false,
+            ..Default::default()
+        },
+        false,
+    );
+    writer
+        .push_batch_with_source(&batch, &source, None)
+        .unwrap();
+    let (data, _) = writer.finish().unwrap();
+    let docs = VixDocs::open(Bytes::from(data)).unwrap();
+
+    let out_construction = Schema::new(vec![
+        Field::new(crate::TIMESTAMP_COL_NAME, DataType::Int64, false),
+        Field::new("code", DataType::Utf8, true),
+        Field::new("ratio", DataType::Float64, true),
+        Field::new("svc", DataType::Utf8, true),
+    ]);
+    let mut out = VixWriter::new(
+        &out_construction,
+        VixWriterOptions {
+            index_enabled: false,
+            docs_passthrough: true,
+            ..Default::default()
+        },
+        false,
+    );
+    let plan = docs_widen_plan(docs.schema(), out.docs_schema()).unwrap();
+    assert!(!plan.is_identity());
+    assert_eq!(plan.null_columns(), 0);
+    assert_eq!(plan.cast_columns().collect::<Vec<_>>(), ["code", "ratio"]);
+
+    let stats = docs
+        .spliceable_stats()
+        .unwrap()
+        .expect("input carries spliceable stats");
+    let zone: Vec<crate::ZoneEntry> = docs
+        .zone_chunks()
+        .expect("zone table")
+        .iter()
+        .map(|z| (z.row_count, z.ts_min, z.ts_max))
+        .collect();
+    out.begin_docs_encoded_run(
+        n as u64,
+        1_000_000 - (n as i64 - 1),
+        1_000_000,
+        &zone,
+        &stats,
+        Some(&[n as u64]),
+    )
+    .unwrap();
+    docs.scan_docs_encoded_chunks(&mut |chunk| out.push_docs_encoded_chunk(plan.widen(chunk)?))
+        .unwrap();
+    out.finish_docs_encoded_run().unwrap();
+    let (widened_bytes, _) = out.finish().unwrap();
+    let widened = VixDocs::open(Bytes::from(widened_bytes)).unwrap();
+    assert_eq!(widened.row_count(), n as u64);
+
+    let batches = widened
+        .read_docs(
+            Some(&["code".to_string(), "ratio".to_string(), "svc".to_string()]),
+            None,
+            None,
+        )
+        .unwrap();
+    let mut row = 0usize;
+    for batch in &batches {
+        let codes =
+            arrow::compute::cast(batch.column_by_name("code").unwrap(), &DataType::Utf8).unwrap();
+        let codes = codes.as_any().downcast_ref::<StringArray>().unwrap();
+        let ratios = batch
+            .column_by_name("ratio")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("ratio widened to Float64");
+        let svcs =
+            arrow::compute::cast(batch.column_by_name("svc").unwrap(), &DataType::Utf8).unwrap();
+        let svcs = svcs.as_any().downcast_ref::<StringArray>().unwrap();
+        for i in 0..batch.num_rows() {
+            match code(row) {
+                Some(value) => assert_eq!(codes.value(i), value.to_string(), "row {row}"),
+                None => assert!(codes.is_null(i), "row {row}: null code survives the cast"),
+            }
+            match ratio(row) {
+                Some(value) => assert_eq!(ratios.value(i), value as f64, "row {row}"),
+                None => assert!(ratios.is_null(i), "row {row}: null ratio survives the cast"),
+            }
+            assert_eq!(svcs.value(i), format!("svc-{}", row % 7), "row {row}");
+            row += 1;
+        }
+    }
+    assert_eq!(row, n);
 }
 
 // ---------- M17 item 4: parallel rebuild index-blob build ----------
