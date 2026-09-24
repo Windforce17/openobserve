@@ -718,6 +718,12 @@ pub struct VixWriterOptions {
     /// granule and one DECOMPRESSION unit per matched-row point read.
     /// Values below the 64-row floor are raised to the floor.
     pub docs_chunk_max_rows: usize,
+    /// #51c passthrough layout writer: RESIDENT decoded bytes it may hold
+    /// across ALL columns' open coalescing runs before closing the runs at
+    /// or above a 1/(4n) share of it; closed runs are admitted to the CPU
+    /// pool under half this value on top. `0` = the built-in default
+    /// ([`crate::clustered::COALESCE_TOTAL_BYTES`]).
+    pub docs_resident_budget: u64,
     /// Minimum full-text token length in **bytes** (clamped to `>= 2`;
     /// see [`crate::o2_tokenize`]).
     pub min_token_len: usize,
@@ -885,6 +891,7 @@ impl Default for VixWriterOptions {
             row_group_size: 0,
             docs_chunk_bytes: DEFAULT_DOCS_CHUNK_BYTES,
             docs_chunk_max_rows: DEFAULT_DOCS_CHUNK_MAX_ROWS,
+            docs_resident_budget: 0,
             min_token_len: 2,
             max_token_len: 64,
             encode_threads: 0,
@@ -2496,6 +2503,7 @@ impl VixWriter {
             self.opts.output_spool_dir.clone(),
             self.opts.docs_passthrough,
             Arc::clone(&self.docs_failopen_chunks),
+            self.opts.docs_resident_budget,
         )?;
         for batch in std::mem::take(&mut self.sample_batches) {
             folder.fold(&batch)?;

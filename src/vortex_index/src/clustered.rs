@@ -67,13 +67,14 @@ use std::sync::{
 
 use async_trait::async_trait;
 use futures::StreamExt;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use vortex::{
     array::{
         ArrayContext, ArrayRef, Canonical, IntoArray, VortexSessionExecute,
         arrays::{ChunkedArray, StructArray, struct_::StructArrayExt},
     },
     dtype::DType,
-    error::{VortexResult, vortex_bail},
+    error::{VortexExpect, VortexResult, vortex_bail, vortex_err},
     io::{runtime::Handle, session::RuntimeSessionExt},
     layout::{
         IntoLayout, LayoutChildren, LayoutRef, LayoutStrategy,
@@ -127,6 +128,32 @@ pub(crate) const COALESCE_MAX_BYTES: u64 = 4 << 20;
 /// above the threshold and are never decoded.
 pub(crate) const COALESCE_MAX_ENCODED_BYTES: u64 = 16 * 1024;
 
+/// Writer-wide residency budget, in RESIDENT decoded bytes, for the open
+/// coalescing runs of ALL columns together. Every pushed struct chunk adds
+/// one window to every column, so the per-column caps above bound each run
+/// but not their sum: a 2,400-column logs union filling 128Ki-row runs in
+/// lockstep held ~3 GB of canonical windows (16 B/row string views alone),
+/// and since every column crosses its row cap on the same struct chunk the
+/// close was a storm of ~1,500 concat tasks holding another ~3 GB while the
+/// CPU pool drained them — three such merges OOMKilled 60 GiB compactors
+/// (2026-09-24). When the pending sum crosses this budget every run holding
+/// at least a 1/(4n) share of it closes at the same row boundary (equal
+/// rows per leaf, so dictionary-friendly columns keep runs as long as any
+/// other), sparse columns below that floor keep coalescing to their caps,
+/// and since the exempt runs sum to at most a quarter of the budget a close
+/// always frees the rest. Closes are admitted through
+/// [`INFLIGHT_TOTAL_BYTES`], so the storm drains at the pool's pace.
+pub(crate) const COALESCE_TOTAL_BYTES: u64 = 512 << 20;
+
+/// Writer-wide cap on the RESIDENT bytes of closed runs still waiting for
+/// (or inside) their concat+compress on the CPU pool. Admission awaits
+/// here, so a close storm drains at the pool's pace instead of queueing
+/// every part at once; released when the CPU leaf returns.
+pub(crate) const INFLIGHT_TOTAL_BYTES: u64 = 512 << 20;
+
+/// [`INFLIGHT_TOTAL_BYTES`] is accounted in permits of this many bytes.
+const INFLIGHT_UNIT: u64 = 64 * 1024;
+
 /// In-memory [`LayoutChildren`] over an owned child vec (vortex's own
 /// `OwnedLayoutChildren` is crate-private).
 #[derive(Clone)]
@@ -169,6 +196,8 @@ pub(crate) struct ClusteredDocsStrategy {
     stripe_bytes: u64,
     coalesce_max_rows: usize,
     coalesce_max_bytes: u64,
+    coalesce_total_bytes: u64,
+    inflight_total_bytes: u64,
 }
 
 impl ClusteredDocsStrategy {
@@ -179,6 +208,8 @@ impl ClusteredDocsStrategy {
             stripe_bytes: STRIPE_BYTES,
             coalesce_max_rows: COALESCE_MAX_ROWS,
             coalesce_max_bytes: COALESCE_MAX_BYTES,
+            coalesce_total_bytes: COALESCE_TOTAL_BYTES,
+            inflight_total_bytes: INFLIGHT_TOTAL_BYTES,
         }
     }
 
@@ -194,6 +225,18 @@ impl ClusteredDocsStrategy {
         self.stripe_bytes = stripe_bytes;
         self.coalesce_max_rows = coalesce_max_rows;
         self.coalesce_max_bytes = coalesce_max_bytes;
+        self
+    }
+
+    /// The writer-wide pending ([`COALESCE_TOTAL_BYTES`]) and in-flight
+    /// ([`INFLIGHT_TOTAL_BYTES`]) residency budgets, in bytes.
+    pub(crate) fn with_resident_budgets(
+        mut self,
+        coalesce_total_bytes: u64,
+        inflight_total_bytes: u64,
+    ) -> Self {
+        self.coalesce_total_bytes = coalesce_total_bytes;
+        self.inflight_total_bytes = inflight_total_bytes;
         self
     }
 }
@@ -226,25 +269,38 @@ struct ColumnState {
     pending: Vec<(ArrayRef, u64, bool)>,
     pending_rows: usize,
     pending_bytes: u64,
+    /// RESIDENT bytes of the run's non-constant parts (post-compaction
+    /// nbytes) — the writer-wide [`COALESCE_TOTAL_BYTES`] input. Constants
+    /// hold no buffers and merge into one constant at close, so they never
+    /// count here.
+    pending_decoded_bytes: u64,
 }
 
 impl ColumnState {
-    fn take_pending(&mut self) -> Option<ChunkWork> {
+    /// Close the run: the work plus its RESIDENT bytes (the in-flight
+    /// admission charge).
+    fn take_pending(&mut self) -> Option<(ChunkWork, u64)> {
         self.pending_rows = 0;
         self.pending_bytes = 0;
+        let resident = std::mem::take(&mut self.pending_decoded_bytes);
         match self.pending.len() {
             0 => None,
             1 => {
                 let (chunk, raw, decoded) = self.pending.pop().expect("len 1");
-                Some(ChunkWork::Ready(chunk, decoded.then_some(raw)))
+                Some((ChunkWork::Ready(chunk, decoded.then_some(raw)), resident))
             }
             _ => {
                 let parts = std::mem::take(&mut self.pending);
                 let raw: u64 = parts.iter().map(|(_, raw, _)| raw).sum();
-                Some(ChunkWork::Concat(
-                    parts.into_iter().map(|(chunk, ..)| chunk).collect(),
-                    raw,
-                ))
+                if let Some(constant) = merge_constant_run(&parts) {
+                    // a run of equal constants (the widen plan's null
+                    // synthesis for a column an input lacks) is one longer
+                    // constant — never materialized row by row
+                    return Some((ChunkWork::Ready(constant, Some(raw)), resident));
+                }
+                let work =
+                    ChunkWork::Concat(parts.into_iter().map(|(chunk, ..)| chunk).collect(), raw);
+                Some((work, resident))
             }
         }
     }
@@ -268,12 +324,15 @@ impl ColumnState {
         max_rows: usize,
         max_bytes: u64,
         exec_ctx: &mut vortex::array::ExecutionCtx,
-    ) -> [Option<ChunkWork>; 2] {
+    ) -> [Option<(ChunkWork, u64)>; 2] {
         let raw = chunk.nbytes();
         let decoded = is_decoded_root(&chunk);
         if !decoded && raw > COALESCE_MAX_ENCODED_BYTES {
             // encoded passthrough chunk: never merged, never reordered
-            return [self.take_pending(), Some(ChunkWork::Ready(chunk, None))];
+            return [
+                self.take_pending(),
+                Some((ChunkWork::Ready(chunk, None), raw)),
+            ];
         }
         let rows = chunk.len();
         // compact-for-residence AFTER the accounting snapshot (value-
@@ -299,9 +358,32 @@ impl ColumnState {
         };
         self.pending_rows += rows;
         self.pending_bytes += bytes;
+        if chunk.as_constant().is_none() {
+            self.pending_decoded_bytes += chunk.nbytes();
+        }
         self.pending.push((chunk, raw, decoded));
         [flushed, None]
     }
+}
+
+/// One constant array spanning a whole run of constants of the SAME scalar
+/// (`None` unless every part is such a constant). The widen plan
+/// synthesizes an all-null constant per chunk for every union column an
+/// input lacks — thousands of columns wide on sparse log unions — and
+/// concatenating those through canonicalization would materialize 16 B/row
+/// views per column for nothing.
+fn merge_constant_run(parts: &[(ArrayRef, u64, bool)]) -> Option<ArrayRef> {
+    use vortex::array::arrays::ConstantArray;
+    let (first, ..) = parts.first()?;
+    let scalar = first.as_constant()?;
+    let mut len = 0usize;
+    for (part, ..) in parts {
+        if part.as_constant()? != scalar {
+            return None;
+        }
+        len += part.len();
+    }
+    Some(ConstantArray::new(scalar, len).into_array())
 }
 
 /// M25: decoded chunks below this size skip compact-for-residence (the copy
@@ -351,8 +433,65 @@ impl OutputRatio {
     }
 }
 
+type ChunkTask = vortex::io::runtime::Task<VortexResult<LayoutRef>>;
+
+/// The per-writer leaf submission context: everything a chunk write needs
+/// plus the in-flight admission semaphore ([`INFLIGHT_TOTAL_BYTES`]).
+struct LeafWriter<'a> {
+    handle: &'a Handle,
+    session: &'a VortexSession,
+    ctx: &'a ArrayContext,
+    segment_sink: &'a SegmentSinkRef,
+    compressor: &'a Arc<dyn CompressorPlugin>,
+    flat: &'a FlatLayoutStrategy,
+    ratio: &'a Arc<OutputRatio>,
+    field_dtypes: &'a [DType],
+    inflight: Arc<Semaphore>,
+    inflight_units: u64,
+}
+
+impl LeafWriter<'_> {
+    /// Admit `resident` bytes against the in-flight budget (awaiting CPU
+    /// leaves to return when it is spent; one work is never charged more
+    /// than the whole budget, so an oversized chunk still proceeds alone),
+    /// then spawn the leaf write in row order behind the column's earlier
+    /// tasks.
+    async fn submit(
+        &self,
+        index: usize,
+        field_ptr: &mut SequencePointer,
+        tasks: &mut Vec<ChunkTask>,
+        work: ChunkWork,
+        resident: u64,
+    ) -> VortexResult<()> {
+        let units = resident
+            .div_ceil(INFLIGHT_UNIT)
+            .clamp(1, self.inflight_units);
+        let permit = Arc::clone(&self.inflight)
+            .acquire_many_owned(u32::try_from(units).vortex_expect("in-flight units fit u32"))
+            .await
+            .map_err(|_| vortex_err!("in-flight leaf budget closed"))?;
+        tasks.push(spawn_chunk_write(
+            self.handle,
+            self.session,
+            self.ctx,
+            self.segment_sink,
+            self.compressor,
+            self.flat,
+            self.ratio,
+            field_ptr,
+            &self.field_dtypes[index],
+            work,
+            permit,
+        ));
+        Ok(())
+    }
+}
+
 /// Concatenate/compress one chunk on the CPU pool, then write it as one
-/// flat leaf under the pre-minted stripe-ordered sequence id.
+/// flat leaf under the pre-minted stripe-ordered sequence id. `permit` is
+/// the work's in-flight admission; it rides into the CPU leaf and drops
+/// with the parts once the compressed chunk exists.
 #[allow(clippy::too_many_arguments)]
 fn spawn_chunk_write(
     handle: &Handle,
@@ -365,6 +504,7 @@ fn spawn_chunk_write(
     field_ptr: &mut SequencePointer,
     field_dtype: &DType,
     work: ChunkWork,
+    permit: OwnedSemaphorePermit,
 ) -> vortex::io::runtime::Task<VortexResult<LayoutRef>> {
     let mut chunk_ptr = field_ptr.advance().descend();
     let sequence_id = chunk_ptr.advance();
@@ -382,6 +522,7 @@ fn spawn_chunk_write(
         let cpu_dtype = field_dtype.clone();
         let (array, decoded_raw) = h
             .spawn_cpu(move || -> VortexResult<(ArrayRef, u64)> {
+                let _permit = permit;
                 let mut exec = cpu_session.create_execution_ctx();
                 // M25: the ratio-observation raw bytes ride in the work (the
                 // AS-PUSHED nbytes) — the resident arrays may be compacted,
@@ -443,12 +584,24 @@ impl LayoutStrategy for ClusteredDocsStrategy {
 
         let handle = session.handle();
         let ratio = Arc::new(OutputRatio::default());
-        type ChunkTask = vortex::io::runtime::Task<VortexResult<LayoutRef>>;
         // per column: spawned chunk-layout tasks, in row order
         let mut column_tasks: Vec<Vec<ChunkTask>> = (0..nfields).map(|_| Vec::new()).collect();
         let mut column_rows: Vec<u64> = vec![0; nfields];
         let mut columns: Vec<ColumnState> = (0..nfields).map(|_| ColumnState::default()).collect();
         let mut total_rows: u64 = 0;
+        let inflight_units = (self.inflight_total_bytes / INFLIGHT_UNIT).max(1);
+        let leaf = LeafWriter {
+            handle: &handle,
+            session,
+            ctx: &ctx,
+            segment_sink: &segment_sink,
+            compressor: &self.compressor,
+            flat: &self.flat,
+            ratio: &ratio,
+            field_dtypes: &field_dtypes,
+            inflight: Arc::new(Semaphore::new(inflight_units as usize)),
+            inflight_units,
+        };
 
         // Open stripe: the first pushed chunk's sequence id is descended
         // into per-column branch pointers (physical order [stripe, column,
@@ -484,6 +637,7 @@ impl LayoutStrategy for ClusteredDocsStrategy {
                 parked_ids.push(sequence_id);
             }
             total_rows += chunk.len() as u64;
+            let mut pending_total: u64 = 0;
             for (index, field) in fields.iter().enumerate() {
                 column_rows[index] += field.len() as u64;
                 // M25: root-keyed like the routing below — a decoded root
@@ -501,20 +655,17 @@ impl LayoutStrategy for ClusteredDocsStrategy {
                     self.coalesce_max_bytes,
                     &mut exec,
                 );
-                for work in works.into_iter().flatten() {
-                    column_tasks[index].push(spawn_chunk_write(
-                        &handle,
-                        session,
-                        &ctx,
-                        &segment_sink,
-                        &self.compressor,
-                        &self.flat,
-                        &ratio,
+                for (work, resident) in works.into_iter().flatten() {
+                    leaf.submit(
+                        index,
                         &mut field_ptrs[index],
-                        &field_dtypes[index],
+                        &mut column_tasks[index],
                         work,
-                    ));
+                        resident,
+                    )
+                    .await?;
                 }
+                pending_total += columns[index].pending_decoded_bytes;
             }
             let estimated = stripe_encoded as f64 + stripe_decoded_raw as f64 * ratio.ratio();
             if estimated >= self.stripe_bytes as f64 {
@@ -522,19 +673,15 @@ impl LayoutStrategy for ClusteredDocsStrategy {
                 // its sequence branches so the next stripe's (greater) ids
                 // can reach the sink
                 for index in 0..nfields {
-                    if let Some(work) = columns[index].take_pending() {
-                        column_tasks[index].push(spawn_chunk_write(
-                            &handle,
-                            session,
-                            &ctx,
-                            &segment_sink,
-                            &self.compressor,
-                            &self.flat,
-                            &ratio,
+                    if let Some((work, resident)) = columns[index].take_pending() {
+                        leaf.submit(
+                            index,
                             &mut field_ptrs[index],
-                            &field_dtypes[index],
+                            &mut column_tasks[index],
                             work,
-                        ));
+                            resident,
+                        )
+                        .await?;
                     }
                 }
                 field_ptrs.clear();
@@ -542,25 +689,43 @@ impl LayoutStrategy for ClusteredDocsStrategy {
                 parked_ids.clear();
                 stripe_encoded = 0;
                 stripe_decoded_raw = 0;
+            } else if pending_total > self.coalesce_total_bytes {
+                // writer-wide residency (COALESCE_TOTAL_BYTES): close every
+                // run at or above the 1/(4n) floor, mid-stripe, at this one
+                // row boundary. Constant parts hold no buffers and merge into
+                // one constant at close, so they never count and never trip
+                // this.
+                let floor = (self.coalesce_total_bytes / (4 * nfields.max(1) as u64)).max(1);
+                for index in 0..nfields {
+                    if columns[index].pending_decoded_bytes < floor {
+                        continue;
+                    }
+                    if let Some((work, resident)) = columns[index].take_pending() {
+                        leaf.submit(
+                            index,
+                            &mut field_ptrs[index],
+                            &mut column_tasks[index],
+                            work,
+                            resident,
+                        )
+                        .await?;
+                    }
+                }
             }
         }
         // final (partial) stripe: `_stripe_root` drops at scope end,
         // releasing the sequence branch
         if let Some(_stripe_root) = stripe_ptr.take() {
             for index in 0..nfields {
-                if let Some(work) = columns[index].take_pending() {
-                    column_tasks[index].push(spawn_chunk_write(
-                        &handle,
-                        session,
-                        &ctx,
-                        &segment_sink,
-                        &self.compressor,
-                        &self.flat,
-                        &ratio,
+                if let Some((work, resident)) = columns[index].take_pending() {
+                    leaf.submit(
+                        index,
                         &mut field_ptrs[index],
-                        &field_dtypes[index],
+                        &mut column_tasks[index],
                         work,
-                    ));
+                        resident,
+                    )
+                    .await?;
                 }
             }
             field_ptrs.clear();
@@ -787,6 +952,61 @@ mod tests {
                 "column {name}: 16x500 rows under a 2000-row cap must make 4 leaves"
             );
         }
+        assert_roundtrip(&blob, &batches);
+    }
+
+    /// Writer-wide residency: when the open runs' resident sum crosses the
+    /// total budget, the heavy column closes early (finer leaves) while the
+    /// narrow column, under the floor, keeps coalescing to its row cap. A one-unit
+    /// in-flight budget serializes every leaf admission behind the previous
+    /// CPU leaf — the starved path must complete (no deadlock on the
+    /// single-thread driver) and the rows must round-trip.
+    #[test]
+    fn total_budget_closes_heaviest_runs_first() {
+        // 16 batches x 500 rows: `a` is 4,000 B/chunk (at most 16,000 B
+        // pending under its 2000-row cap), `b` (64-char strings) 40,000
+        // B/chunk; a 128 KiB budget trips on `b` alone and its 16 KiB floor
+        // (budget / 4n) exempts `a` at every trip
+        let schema = Arc::new(fixture_schema());
+        let batches: Vec<RecordBatch> = (0..16)
+            .map(|batch| {
+                let base = (batch * 500) as i64;
+                let a: Vec<i64> = (0..500).map(|i| base + i).collect();
+                let b: Vec<String> = a.iter().map(|v| format!("{v:064}")).collect();
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(Int64Array::from(a)) as ArrowArrayRef,
+                        Arc::new(StringArray::from(b)) as ArrowArrayRef,
+                    ],
+                )
+                .unwrap()
+            })
+            .collect();
+        let strategy: Arc<dyn LayoutStrategy> = Arc::new(
+            ClusteredDocsStrategy::new(
+                |chunk: &ArrayRef,
+                 _ctx: &mut vortex::array::ExecutionCtx|
+                 -> VortexResult<ArrayRef> { Ok(chunk.clone()) },
+            )
+            .with_budgets(u64::MAX, 2000, u64::MAX)
+            .with_resident_budgets(128 * 1024, INFLIGHT_UNIT),
+        );
+        let blob = crate::container::write_vortex_blob(&schema, &batches, strategy, 0).unwrap();
+        let columns = column_leaf_extents(&blob);
+        let (_, a_extents) = &columns[0];
+        let (_, b_extents) = &columns[1];
+        assert_eq!(
+            a_extents.len(),
+            4,
+            "the narrow column stays below the floor and keeps its row-cap leaves"
+        );
+        assert!(
+            b_extents.len() > 4,
+            "the heavy column must close before its row cap once the writer-wide budget \
+             trips, got {} leaves",
+            b_extents.len()
+        );
         assert_roundtrip(&blob, &batches);
     }
 

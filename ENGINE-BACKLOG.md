@@ -3,6 +3,57 @@
 Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
 (deleted 2026-07-29; full history in git). Keep THIS file current.
 
+## 2026-09-24 — compactor OOMKills: passthrough docs writer residency was width-scaled (.170 candidate)
+- Production evidence: after the .170-candidate compaction-policy rollout to
+  30 compactors, 5 pods were `OOMKilled`/evicted at the 60 GiB limit within
+  ~1h; a live pod sat at 43 GB with three concurrent logs/default merges of
+  ~0.6–0.9 GB-original inputs whose log lines were only "field X widened".
+  Reproduced locally on 5 real inputs of `logs/default/2026/08/29/01`
+  (3.75 GB original, 393k rows, 3,029-column union, 160 MiB compressed):
+  `merge_bench merge --indexed-only --stored-schema` peaked at 5.83 GB RSS
+  for a 113 MiB output; widening was irrelevant (5.85 GB with 12 widened
+  columns, 5.83 GB without).
+- Chain, all in `ClusteredDocsStrategy` (`src/vortex_index/src/clustered.rs`):
+  every pushed struct chunk adds one decoded window to every column's open
+  coalescing run; the per-column caps (128Ki rows / 4 MiB) bound one run but
+  never their sum, so ~1,500 decoded string columns held ~3 GB of canonical
+  16 B/row views; all columns crossed the row cap on the same struct chunk,
+  so the close was a storm of ~1,500 concat tasks spawned without
+  backpressure holding another ~3 GB while the CPU pool drained them; the
+  widen plan's per-chunk all-null constants (1,461 per chunk here) were
+  concatenated through canonicalization into materialized null arrays.
+  M25's compact-for-residence cannot help (views dominate); forcing it on
+  every window made it worse (8.4 GB).
+- Fix, format-neutral (readers see per-column `ChunkedLayout`s exactly as
+  before; row multiset + digests equal to the pre-fix output):
+  - writer-wide pending budget `COALESCE_TOTAL_BYTES` (resident post-compaction
+    bytes of non-constant parts): when exceeded, every run holding ≥ 1/(4n)
+    of it closes at that row boundary (equal rows per leaf — flush-by-heaviest
+    fragmented dictionary-friendly columns, +16% bytes on `log.file.path`);
+    sparse columns below the floor keep coalescing to their caps; exempt runs
+    sum to ≤ budget/4 so a close always frees the rest;
+  - in-flight admission `INFLIGHT_TOTAL_BYTES` (tokio semaphore, 64 KiB
+    units, permit dropped inside the CPU leaf): a close storm drains at the
+    pool's pace instead of queueing every part at once;
+  - a run of equal constants closes as ONE longer `ConstantArray`
+    (`merge_constant_run`), never materialized row by row.
+  - knob `ZO_VIX_DOCS_RESIDENT_BUDGET_MB` (default 1024) → pending budget;
+    in-flight = half; plumbed `VixWriterOptions::docs_resident_budget` →
+    `DocsBlobEncoder::spawn` → `docs_passthrough_strategy`.
+- Measured on the same inputs (RSS / wall / docs blob / leaves / footer):
+  baseline 5.83 GB / 3.78 s / 113.2 MiB / 15.2k / 0.9 MiB;
+  budget 512 MiB 1.93 GB / 4.02 s / 112.4 / 37.2k / 1.9;
+  **1 GiB (default) 2.62 GB / 3.68 s / 112.2 / 25.3k / 1.4**;
+  2 GiB 4.26 GB / 3.60 s / 111.8 / 17.5k / 1.0. Peak per merge is now
+  ~1.5× the knob plus base, independent of row count and width.
+  `merge_bench leaves <file.vix>` prints the per-column leaf census.
+- Verification: vortex_index 344 tests incl. new
+  `clustered::total_budget_closes_heaviest_runs_first` (heavy column closes
+  early, narrow column keeps row-cap leaves, one-unit in-flight budget
+  completes on the single-thread driver, rows round-trip); core
+  `vix::core_writer` + `compact::` suites; `merge_bench compare --multiset`
+  pre-fix vs post-fix outputs equivalent.
+
 ## 2026-09-24 — compactor refusal storm: plan-before-prefetch, widening casts, refusal backoff (.169 candidate)
 - Production evidence (Orbit, 2026-09-24 07:00–08:00Z, 16 compactors × 3 slots):
   15,641 prefetches (68,776 s ≈ 19 slot-hours/h), 13,307 failed batches

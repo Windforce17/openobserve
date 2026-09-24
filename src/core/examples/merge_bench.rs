@@ -681,6 +681,7 @@ fn derive_schema(
     inputs: &[openobserve_core::vix::core_writer::MergeInput],
     status_code_utf8: bool,
     stored_schema: bool,
+    widen_utf8: &[String],
 ) -> (Schema, Vec<String>) {
     let registry = spans_schema();
     let mut fts: Vec<String> = Vec::new();
@@ -731,6 +732,14 @@ fn derive_schema(
             }
         }
     }
+    // `--widen-utf8=a,b`: the production registry types these fields Utf8
+    // while the inputs store them under a narrower (numeric/bool) type — the
+    // 2026-09-24 logs/default shape whose merges cast inside the chunk copy.
+    for field in &mut latest_fields {
+        if widen_utf8.iter().any(|name| name == field.name()) {
+            *field = Field::new(field.name(), DataType::Utf8, true);
+        }
+    }
     (Schema::new(latest_fields), fts)
 }
 
@@ -773,6 +782,7 @@ fn cmd_merge(
     stored_schema: bool,
     stream_type: config::meta::stream::StreamType,
     indexed_only: bool,
+    widen_utf8: &[String],
 ) -> Result<(), anyhow::Error> {
     let out_path = std::path::Path::new(out);
     for path in [out_path.to_path_buf(), out_path.with_extension("vxi")] {
@@ -810,7 +820,7 @@ fn cmd_merge(
         .sum();
     let load_elapsed = started.elapsed();
 
-    let (latest_schema, fts) = derive_schema(&inputs, status_code_utf8, stored_schema);
+    let (latest_schema, fts) = derive_schema(&inputs, status_code_utf8, stored_schema, widen_utf8);
     let bloom = if stream_type == config::meta::stream::StreamType::Traces {
         vec!["trace_id".to_string(), "span_id".to_string()]
     } else {
@@ -903,6 +913,37 @@ fn cmd_merge(
     Ok(())
 }
 
+/// Docs-blob layout census of one `.vix`: leaf (flat segment) counts and
+/// bytes per column, aggregated — the storage-side cost of the writer's
+/// coalescing/residency budgets (finer leaves = more footer + per-leaf
+/// encoding overhead).
+fn cmd_leaves(path: &str) -> Result<(), anyhow::Error> {
+    let (_, data, _) = load_input(std::path::Path::new(path))?;
+    let docs = VixDocs::open_ranged(data)?;
+    let mut report = docs.leaf_report()?;
+    let columns = report.len();
+    let leaves: u64 = report.iter().map(|(_, leaves, _)| leaves).sum();
+    let bytes: u64 = report.iter().map(|(_, _, bytes)| bytes).sum();
+    report.sort_by_key(|(_, leaves, bytes)| std::cmp::Reverse((*leaves, *bytes)));
+    let rows = docs.row_count();
+    eprintln!(
+        "leaves: {path}  rows={rows}  columns={columns}  leaves={leaves}  leaf_bytes={:.1} MiB  \
+         docs_blob={:.1} MiB  leaves/column={:.1}  rows/leaf(mean)={:.0}",
+        bytes as f64 / (1024.0 * 1024.0),
+        docs.docs_blob_len() as f64 / (1024.0 * 1024.0),
+        leaves as f64 / columns.max(1) as f64,
+        (rows as f64 * columns as f64) / leaves.max(1) as f64,
+    );
+    for (name, leaves, bytes) in report.iter().take(12) {
+        eprintln!(
+            "  {name:<40} leaves={leaves:<6} bytes={:>10.1} KiB  rows/leaf={:.0}",
+            *bytes as f64 / 1024.0,
+            rows as f64 / (*leaves).max(1) as f64
+        );
+    }
+    Ok(())
+}
+
 fn cmd_sidecar(
     dir: &str,
     stored_schema: bool,
@@ -916,7 +957,7 @@ fn cmd_sidecar(
         inputs.len()
     );
     let load_elapsed = started.elapsed();
-    let (latest_schema, fts) = derive_schema(&inputs, false, stored_schema);
+    let (latest_schema, fts) = derive_schema(&inputs, false, stored_schema, &[]);
     let bloom = if stream_type == config::meta::stream::StreamType::Traces {
         vec!["trace_id".to_string(), "span_id".to_string()]
     } else {
@@ -1373,16 +1414,26 @@ async fn main() -> Result<(), anyhow::Error> {
             "--indexed-only",
         ],
         Some("sidecar") => &["--stored-schema", "--traces"],
+        Some("leaves") => &[],
         Some("compare") => &["--multiset", "--docs-only", "--ignore-source"],
         _ => &[],
     };
     for flag in args.iter().skip(2).filter(|arg| arg.starts_with("--")) {
         anyhow::ensure!(
-            allowed_flags.contains(&flag.as_str()),
+            allowed_flags.contains(&flag.as_str())
+                || (args.get(1).map(String::as_str) == Some("merge")
+                    && flag.starts_with("--widen-utf8=")),
             "unsupported flag {flag} for {:?}",
             args.get(1)
         );
     }
+    let widen_utf8: Vec<String> = args
+        .iter()
+        .skip(2)
+        .filter_map(|arg| arg.strip_prefix("--widen-utf8="))
+        .flat_map(|list| list.split(',').map(str::trim).map(str::to_string))
+        .filter(|name| !name.is_empty())
+        .collect();
     let flag = |name: &str| args.iter().skip(2).any(|a| a == name);
     match args.get(1).map(String::as_str) {
         Some("gen-logs") => {
@@ -1422,7 +1473,8 @@ async fn main() -> Result<(), anyhow::Error> {
             );
             let dir = args.get(2).expect(
                 "merge <dir> <out.vix> [--rebuild] [--latest-status-code-utf8] \
-                 [--require-columns] [--stored-schema] [--traces] [--indexed-only]",
+                 [--require-columns] [--stored-schema] [--traces] [--indexed-only] \
+                 [--widen-utf8=field,...]",
             );
             let out = args.get(3).expect("out.vix");
             // #51c passthrough + #51c-c concatenation are the DEFAULT merge
@@ -1441,6 +1493,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 flag("--stored-schema"),
                 stream_type,
                 flag("--indexed-only"),
+                &widen_utf8,
             )
         }
         Some("verify-logs") => {
@@ -1449,6 +1502,10 @@ async fn main() -> Result<(), anyhow::Error> {
                 "verify-logs <input_dir> <out.vix> accepts no flags"
             );
             cmd_verify_logs(&args[2], &args[3])
+        }
+        Some("leaves") => {
+            anyhow::ensure!(args.len() == 3, "leaves <file.vix> accepts no flags");
+            cmd_leaves(&args[2])
         }
         Some("sidecar") => {
             let dir = args

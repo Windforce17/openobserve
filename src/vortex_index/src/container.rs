@@ -1205,6 +1205,8 @@ impl DocsBlobEncoder {
     /// [`Self::push_encoded`] are written without recompression, arrow
     /// batches still compress as usual (sliced to `rows_per_chunk` windows
     /// here, since the passthrough strategy has no repartition step).
+    /// `resident_budget` bounds that strategy's resident decoded bytes
+    /// ([`crate::writer::VixWriterOptions::docs_resident_budget`]).
     pub(crate) fn spawn(
         schema: Arc<Schema>,
         rows_per_chunk: usize,
@@ -1212,6 +1214,7 @@ impl DocsBlobEncoder {
         spool_dir: Option<std::path::PathBuf>,
         docs_passthrough: bool,
         fail_open: Arc<std::sync::atomic::AtomicU64>,
+        resident_budget: u64,
     ) -> Result<Self> {
         let (tx, rx) = std::sync::mpsc::sync_channel(2);
         let handle = std::thread::Builder::new()
@@ -1224,6 +1227,7 @@ impl DocsBlobEncoder {
                     spool_dir,
                     docs_passthrough,
                     fail_open,
+                    resident_budget,
                     &rx,
                 )
             })
@@ -1303,6 +1307,7 @@ impl DocsBlobEncoder {
 
 /// The worker body: encode received batches into a `MAGIC`-prefixed buffer.
 /// Parallel writers share the process CPU executor.
+#[allow(clippy::too_many_arguments)]
 fn run_docs_encoder(
     schema: &Schema,
     rows_per_chunk: usize,
@@ -1310,6 +1315,7 @@ fn run_docs_encoder(
     spool_dir: Option<std::path::PathBuf>,
     docs_passthrough: bool,
     fail_open: Arc<std::sync::atomic::AtomicU64>,
+    resident_budget: u64,
     rx: &std::sync::mpsc::Receiver<DocsEncodeMsg>,
 ) -> Result<(ContainerSink, u64)> {
     let runtime = SingleThreadRuntime::default();
@@ -1325,6 +1331,7 @@ fn run_docs_encoder(
                     rows_per_chunk,
                     docs_passthrough,
                     Arc::clone(&fail_open),
+                    resident_budget,
                     rx,
                     &mut *buf,
                 )?;
@@ -1342,6 +1349,7 @@ fn run_docs_encoder(
                     rows_per_chunk,
                     docs_passthrough,
                     Arc::clone(&fail_open),
+                    resident_budget,
                     rx,
                     &mut counting,
                 )?;
@@ -1372,6 +1380,7 @@ fn encode_docs_stream<W: std::io::Write + Unpin>(
     rows_per_chunk: usize,
     docs_passthrough: bool,
     fail_open: Arc<std::sync::atomic::AtomicU64>,
+    resident_budget: u64,
     rx: &std::sync::mpsc::Receiver<DocsEncodeMsg>,
     sink: &mut W,
 ) -> Result<()> {
@@ -1384,7 +1393,7 @@ fn encode_docs_stream<W: std::io::Write + Unpin>(
     let mut options = VortexWriteOptions::new(session);
     if docs_passthrough {
         options = options
-            .with_strategy(docs_passthrough_strategy(fail_open))
+            .with_strategy(docs_passthrough_strategy(fail_open, resident_budget))
             .with_file_statistics(Vec::new());
     } else {
         options = options.with_strategy(docs_strategy(rows_per_chunk));
@@ -1579,6 +1588,7 @@ fn is_decoded_node(node: &ArrayRef) -> bool {
 /// paid one round trip per chunk). See the `clustered` module docs.
 pub(crate) fn docs_passthrough_strategy(
     fail_open: Arc<std::sync::atomic::AtomicU64>,
+    resident_budget: u64,
 ) -> Arc<dyn LayoutStrategy> {
     use vortex::array::{Canonical, ExecutionCtx, IntoArray};
     let compressor = BtrBlocksCompressorBuilder::default().with_compact().build();
@@ -1608,9 +1618,14 @@ pub(crate) fn docs_passthrough_strategy(
             let canonical = chunk.clone().execute::<Canonical>(ctx)?.into_array();
             compressor.compress(&canonical, ctx)
         };
-    Arc::new(crate::clustered::ClusteredDocsStrategy::new(
-        compress_or_pass,
-    ))
+    let strategy = crate::clustered::ClusteredDocsStrategy::new(compress_or_pass);
+    Arc::new(if resident_budget > 0 {
+        // the in-flight admission is half the pending budget (one merge's
+        // docs writer holds about 1.5x the knob)
+        strategy.with_resident_budgets(resident_budget, (resident_budget / 2).max(1))
+    } else {
+        strategy
+    })
 }
 
 /// M18: whether every node of `array`'s tree carries an encoding the vortex

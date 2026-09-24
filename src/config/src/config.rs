@@ -1957,6 +1957,18 @@ pub struct Common {
     )]
     pub vix_docs_chunk_max_rows: usize,
     #[env_config(
+        name = "ZO_VIX_DOCS_RESIDENT_BUDGET_MB",
+        default = 1024,
+        help = "Compaction merge docs writer: RESIDENT decoded bytes (MiB) the passthrough \
+                layout writer may hold across ALL columns' open coalescing runs before it \
+                closes the runs holding at least a 1/(4n) share of it; closed runs are \
+                admitted to the CPU pool under a further budget of half this value, so \
+                one merge's docs writer holds about 1.5x this. Lower = less memory per \
+                merge, finer leaves (more per-column chunks) on wide schemas; higher = \
+                longer runs up to the per-column caps. 0 = the built-in 1024."
+    )]
+    pub vix_docs_resident_budget_mb: usize,
+    #[env_config(
         name = "ZO_VIX_STATS_MIN_DENSITY",
         default = 0.1,
         help = "H2 pay-as-you-go per-column chunk stats: presence-density threshold (present \
