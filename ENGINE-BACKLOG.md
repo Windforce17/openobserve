@@ -3,7 +3,7 @@
 Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
 (deleted 2026-07-29; full history in git). Keep THIS file current.
 
-## 2026-09-24 — compactor OOMKills: passthrough docs writer residency was width-scaled (.170 candidate)
+## 2026-09-24 — compactor OOMKills: passthrough docs writer residency was width-scaled (.170, live)
 - Production evidence: after the .170-candidate compaction-policy rollout to
   30 compactors, 5 pods were `OOMKilled`/evicted at the 60 GiB limit within
   ~1h; a live pod sat at 43 GB with three concurrent logs/default merges of
@@ -53,6 +53,27 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
   completes on the single-thread driver, rows round-trip); core
   `vix::core_writer` + `compact::` suites; `merge_bench compare --multiset`
   pre-fix vs post-fix outputs equivalent.
+- Production (compactor `.170`, release `66fde116d7da`, GitOps PR #559 /
+  `a8ad4b252c9a`, 30/30 pods 17:22Z): three workers completing 4–6-input,
+  3.5–4.3 GB-original logs/default passthrough merges every ~15 s hold the
+  pod's process RSS (`zo_node_memory_usage`) at **2.2–7.1 GB** across a
+  2.5-minute merge-only window (pre-fix: 43 GB with three such merges).
+  40 minutes in: zero OOMKilled, zero merge-related restarts (three `Error`
+  restarts are the known NATS-connect-at-startup panic, `nats.rs:604`; one
+  pod was replaced after its spot node went NotReady). `kubectl top`
+  shows 24–39 GB working set on these pods — that is page cache of the
+  prefetched inputs, not heap.
+- Residual, separate subsystem: the co-located Segment-WAL builder
+  (`src/jobs/src/job/segments.rs`) still spikes each pod's RSS to
+  **31–36 GB** on its batches (63–94 segments, 2.2–4.7M rows, 14–26 L0
+  files of 1.1–1.6 GB original built ~6 wide: `file_build_sum_ms` 175–275 s
+  in 30–44 s wall). `ZO_SEGMENT_BUILD_MEMORY_BUDGET_MB=8192` admits by
+  DECODED input bytes only; the per-build writer residency (vortex default
+  `docs_strategy` repartition buffers per column x wide traces/logs unions,
+  plus term tables) is unaccounted and width-scaled — the same class of
+  problem this entry fixed for the passthrough writer. Under the 60 GiB
+  limit today only because merges dropped to ≤ 7 GB; the builder's own
+  bound is the next item.
 
 ## 2026-09-24 — compactor refusal storm: plan-before-prefetch, widening casts, refusal backoff (.169 candidate)
 - Production evidence (Orbit, 2026-09-24 07:00–08:00Z, 16 compactors × 3 slots):
