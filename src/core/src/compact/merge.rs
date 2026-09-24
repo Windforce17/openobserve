@@ -24,7 +24,7 @@ use config::{
     get_config, ider, is_local_disk_storage,
     meta::stream::{
         FileKey, FileListBookKeepMode, FileListDeleted, FileMeta, MergeStrategy,
-        PartitionTimeLevel, StorageType, StreamType,
+        PartitionTimeLevel, StorageType, StreamSettings, StreamType,
     },
     metrics,
     utils::{
@@ -218,6 +218,47 @@ pub async fn generate_job_by_stream(
     Ok(())
 }
 
+/// Retention of `stream` in days as the merge sweeps see it: the stream's own
+/// setting when set, else the global default; `None` when retention is off
+/// (nothing ever expires).
+fn stream_retention_days(stream_settings: &StreamSettings) -> Option<i64> {
+    let days = if stream_settings.data_retention > 0 {
+        stream_settings.data_retention
+    } else {
+        get_config().compact.data_retention_days
+    };
+    (days > 0).then_some(days)
+}
+
+/// The oldest closed hour still worth merging: data that retention deletes
+/// within `skip_days` is gone before its merged output would serve many
+/// queries, so re-merging it only costs compactor capacity
+/// (`ZO_COMPACT_OLD_DATA_SKIP_EXPIRING_DAYS`). `None` when the policy is off,
+/// wider than the retention itself, or the stream never expires.
+fn merge_worth_floor_micros(now: i64, retention_days: Option<i64>, skip_days: i64) -> Option<i64> {
+    let retention_days = retention_days?;
+    if skip_days <= 0 || skip_days >= retention_days {
+        return None;
+    }
+    let worth_days = retention_days - skip_days;
+    Some(now - Duration::try_days(worth_days)?.num_microseconds()?)
+}
+
+/// Whether the closed hour starting at `offset` lies entirely below the
+/// merge-worth floor (and so is skipped by the sweeps and the executor).
+fn hour_below_merge_worth_floor(offset: i64, floor: Option<i64>) -> bool {
+    floor.is_some_and(|floor| offset + hour_micros(1) <= floor)
+}
+
+/// Clamp a sweep window start to the merge-worth floor.
+fn clamp_sweep_start(start_time: i64, now: i64, retention_days: Option<i64>) -> i64 {
+    let skip_days = get_config().compact.old_data_skip_expiring_days;
+    match merge_worth_floor_micros(now, retention_days, skip_days) {
+        Some(floor) => start_time.max(floor),
+        None => start_time,
+    }
+}
+
 /// Generate merging job by stream
 /// 1. get old data by hour
 /// 2. check if other node is processing
@@ -278,11 +319,18 @@ pub async fn generate_old_data_job_by_stream(
 
     // get old data by hour, `offset - cfg.compact.old_data_min_hours hours` as old data
     let end_time = offset - hour_micros(cfg.compact.old_data_min_hours);
-    let start_time = end_time
-        - Duration::try_days(stream_data_retention_days)
-            .unwrap()
-            .num_microseconds()
-            .unwrap();
+    let start_time = clamp_sweep_start(
+        end_time
+            - Duration::try_days(stream_data_retention_days)
+                .unwrap()
+                .num_microseconds()
+                .unwrap(),
+        config::utils::time::now_micros(),
+        stream_retention_days(&stream_settings),
+    );
+    if start_time >= end_time {
+        return Ok(());
+    }
     let hours = infra_file_list::query_old_data_hours(
         org_id,
         stream_type,
@@ -404,11 +452,14 @@ pub async fn generate_merge_debt_job_by_stream(
         newest_hour -= hour_micros(1);
     }
     let end_time = newest_hour + hour_micros(1) - 1;
-    let start_time = now
-        - Duration::try_days(retention_days)
+    let start_time = clamp_sweep_start(
+        now - Duration::try_days(retention_days)
             .unwrap()
             .num_microseconds()
-            .unwrap();
+            .unwrap(),
+        now,
+        stream_retention_days(&stream_settings),
+    );
     if start_time >= end_time {
         return Ok(0);
     }
@@ -572,23 +623,7 @@ pub async fn merge_by_stream(
     let schema = infra::schema::get(org_id, stream_name, stream_type).await?;
     cancel.check("stream schema lookup")?;
     if schema == Schema::empty() {
-        match infra_file_list::set_job_done_owned(job_id, &LOCAL_NODE.uuid, lease_generation).await
-        {
-            Ok(true) => log::info!(
-                "[COMPACTOR] merge job completed job_id={job_id} generation={lease_generation} outcome=deleted_stream"
-            ),
-            Ok(false) => {
-                cancel.cancel();
-                return Err(anyhow::anyhow!(
-                    "job {job_id} generation {lease_generation} lost ownership on deleted-stream completion"
-                ));
-            }
-            Err(e) => {
-                return Err(anyhow::anyhow!(
-                    "set_job_done_owned failed for job {job_id} generation {lease_generation}: {e}"
-                ));
-            }
-        }
+        complete_job_without_work(job_id, lease_generation, "deleted_stream", cancel).await?;
         return Ok(());
     }
 
@@ -602,6 +637,28 @@ pub async fn merge_by_stream(
     // sealed output exactly once. The scheduled hour-end pass seals whatever is left.
     let offset = offset - offset % hour_micros(1);
     let is_incremental = !super::is_past_hour(offset);
+
+    // A closed hour about to expire under retention is not worth merging
+    // (ZO_COMPACT_OLD_DATA_SKIP_EXPIRING_DAYS): the sweeps no longer enqueue
+    // such hours, and a job enqueued before the policy (or before the hour
+    // aged into the window) completes here without touching its files.
+    if !is_incremental {
+        let stream_settings = infra::schema::unwrap_stream_settings(&schema).unwrap_or_default();
+        let floor = merge_worth_floor_micros(
+            config::utils::time::now_micros(),
+            stream_retention_days(&stream_settings),
+            cfg.compact.old_data_skip_expiring_days,
+        );
+        if hour_below_merge_worth_floor(offset, floor) {
+            log::info!(
+                "[COMPACTOR] merge_by_stream [{org_id}/{stream_type}/{stream_name}] hour {} expires \
+                 within ZO_COMPACT_OLD_DATA_SKIP_EXPIRING_DAYS; completing job {job_id} without work",
+                offset_time_string(offset),
+            );
+            complete_job_without_work(job_id, lease_generation, "near_expiry", cancel).await?;
+            return Ok(());
+        }
+    }
 
     // check offset
     let partition_time_level = get_partition_time_level(stream_type);
@@ -1181,6 +1238,41 @@ pub async fn merge_by_stream(
         .inc_by(time);
 
     Ok(())
+}
+
+/// Complete a claimed merge job that has nothing to do (deleted stream,
+/// near-expiry hour) under the lease fence. Lost ownership cancels the job
+/// and errors, exactly like a lost lease mid-merge.
+async fn complete_job_without_work(
+    job_id: i64,
+    lease_generation: i64,
+    outcome: &'static str,
+    cancel: &MergeCancellation,
+) -> Result<(), anyhow::Error> {
+    match infra_file_list::set_job_done_owned(job_id, &LOCAL_NODE.uuid, lease_generation).await {
+        Ok(true) => {
+            log::info!(
+                "[COMPACTOR] merge job completed job_id={job_id} generation={lease_generation} outcome={outcome}"
+            );
+            Ok(())
+        }
+        Ok(false) => {
+            cancel.cancel();
+            Err(anyhow::anyhow!(
+                "job {job_id} generation {lease_generation} lost ownership on {outcome} completion"
+            ))
+        }
+        Err(e) => Err(anyhow::anyhow!(
+            "set_job_done_owned failed for job {job_id} generation {lease_generation}: {e}"
+        )),
+    }
+}
+
+/// `YYYY/MM/DD/HH` of an hour-aligned microsecond offset (log rendering).
+fn offset_time_string(offset: i64) -> String {
+    Utc.timestamp_nanos(offset * 1000)
+        .format("%Y/%m/%d/%H")
+        .to_string()
 }
 
 /// A sidecar repair publishes in place and returns no file-list events.
@@ -3318,6 +3410,40 @@ mod tests {
                 .collect(),
             cancel: MergeCancellation::default(),
         }
+    }
+
+    /// Near-expiry skip: the floor is `now - (retention - skip)`; an hour
+    /// is skipped only when it ends at or before the floor, so the hour that
+    /// straddles the floor still merges. Off when the policy is 0, wider than
+    /// the retention, or the stream never expires.
+    #[test]
+    fn merge_worth_floor_skips_only_hours_fully_below_it() {
+        let day = hour_micros(24);
+        let now = 1_800_000_000_000_000_i64 + 17 * hour_micros(1) + 900_000_000;
+        // retention 30d, skip 7d → floor 23 days before now
+        let floor = merge_worth_floor_micros(now, Some(30), 7).expect("policy on");
+        assert_eq!(floor, now - 23 * day);
+        let floor_hour = floor - floor % hour_micros(1);
+        assert!(
+            hour_below_merge_worth_floor(floor_hour - hour_micros(1), Some(floor)),
+            "the hour ending before the floor is skipped"
+        );
+        assert!(
+            !hour_below_merge_worth_floor(floor_hour, Some(floor)),
+            "the hour containing the floor still merges"
+        );
+        assert!(!hour_below_merge_worth_floor(now - day, Some(floor)));
+        assert!(!hour_below_merge_worth_floor(now - 29 * day, None));
+
+        // sweep windows clamp their start to the floor and never move it later
+        assert_eq!((now - 30 * day).max(floor), floor);
+        assert_eq!((now - 10 * day).max(floor), now - 10 * day);
+
+        // policy off / invalid / infinite retention
+        assert_eq!(merge_worth_floor_micros(now, Some(30), 0), None);
+        assert_eq!(merge_worth_floor_micros(now, Some(30), 30), None);
+        assert_eq!(merge_worth_floor_micros(now, Some(7), 10), None);
+        assert_eq!(merge_worth_floor_micros(now, None, 7), None);
     }
 
     #[tokio::test]

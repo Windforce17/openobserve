@@ -305,7 +305,8 @@ pub fn live_claim_floor(now_micros: i64, lookback_hours: i64) -> i64 {
 pub enum MergeLane {
     /// All pending jobs, oldest enqueue first.
     All,
-    /// Jobs strictly before the recent-history floor, oldest enqueue/requeue first.
+    /// Jobs strictly before the recent-history floor: oldest enqueue/requeue
+    /// first, or newest hour first under `ZO_COMPACT_BACKLOG_NEWEST_FIRST`.
     Backlog { before: i64 },
     /// Closed historical jobs in `[from, before)`, oldest enqueue/requeue first.
     Recent { from: i64, before: i64 },
@@ -318,7 +319,11 @@ impl MergeLane {
         match self {
             Self::All => (FileListJobOrder::EnqueueOldest, None, None, "all"),
             Self::Backlog { before } => (
-                FileListJobOrder::EnqueueOldest,
+                if get_config().compact.backlog_newest_first {
+                    FileListJobOrder::OffsetNewest
+                } else {
+                    FileListJobOrder::EnqueueOldest
+                },
                 None,
                 Some(before),
                 "backlog",

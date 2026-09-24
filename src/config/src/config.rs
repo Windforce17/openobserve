@@ -2998,6 +2998,23 @@ pub struct Compact {
     pub old_data_min_hours: i64,
     #[env_config(name = "ZO_COMPACT_OLD_DATA_MIN_FILES", default = 10)] // files
     pub old_data_min_files: i64,
+    #[env_config(
+        name = "ZO_COMPACT_OLD_DATA_SKIP_EXPIRING_DAYS",
+        default = 0,
+        help = "Closed hours whose data expires under the stream's retention within this many \
+                days are not merge debt: the sweeps skip them and an already-enqueued merge job \
+                for such an hour completes without work. Re-merging data that is about to be \
+                deleted only costs compactor capacity. 0 = merge everything inside the window."
+    )]
+    pub old_data_skip_expiring_days: i64,
+    #[env_config(
+        name = "ZO_COMPACT_BACKLOG_NEWEST_FIRST",
+        default = false,
+        help = "Claim backlog-lane merge jobs newest hour first instead of oldest enqueue \
+                first. Recent history is what queries touch; oldest-first spends the lane on \
+                hours closest to retention expiry."
+    )]
+    pub backlog_newest_first: bool,
     #[env_config(name = "ZO_COMPACT_DELETE_FILES_DELAY_HOURS", default = 2)] // hours
     pub delete_files_delay_hours: i64,
     #[env_config(name = "ZO_COMPACT_BLOCKED_ORGS", default = "")] // use comma to split
