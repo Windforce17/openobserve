@@ -412,9 +412,13 @@ impl ByteGate {
 
 /// How long a synchronous growth may wait for released bytes before it is
 /// refused. Releases arrive continuously (evaluations finish in tens of ms),
-/// so a waiter that needs less than the headroom is served quickly; the cap
-/// bounds the pathological case of every admitted lease growing at once.
-const GROWTH_WAIT: Duration = Duration::from_secs(2);
+/// so a waiter that needs less than the headroom is served quickly. The cap
+/// bounds the pathological case of every admitted lease growing at once —
+/// and it is paid by the QUERY as a straggler follower, so it stays well
+/// under the cost of the fallback it avoids (a one-file DataFusion scan,
+/// 30–300 ms): at 2 s, 0.2 % of file evaluations timing out made most
+/// 500-file queries 2 s slower (prod 2026-09-25).
+const GROWTH_WAIT: Duration = Duration::from_millis(500);
 
 struct BytePermit {
     gate: Arc<ByteGate>,

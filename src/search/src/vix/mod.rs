@@ -991,13 +991,13 @@ fn evaluation_working_bytes(
     // Evaluation/composition can retain the condition, timestamp and result
     // bitmaps together even when the collector itself is chunk-streamed.
     let bitmaps = rows.div_ceil(8).saturating_mul(4);
-    // Native docs helpers apply their window clamp inside chunk-streamed
-    // scans that may retain decoded timestamps and a boundary-row Vec<u64>.
-    // The index reader path passes `fully_covered = true`: its clamp is
-    // charged at the point of use by [`clamped_timestamp_bitmap`], sized
-    // from the file's zone table instead of the whole-column worst case
-    // (declaring 24 B/row for every straddling file starved the evaluation
-    // budget under fan-out and pushed 20–40 % of files to the scan branch).
+    // A partial-window timestamp clamp is not yet wholly chunk-local:
+    // timestamp_range may retain all decoded timestamps and a growable
+    // boundary-row Vec<u64>. Declared here, at admission, on purpose: it is
+    // the one large PREDICTABLE growth, and admission queues (never
+    // refuses) while mid-evaluation growth shares a small headroom and
+    // refuses after a short wait. Fully covered metadata/dictionary-count
+    // answers never construct the clamp and declare nothing for it.
     let clamp = if fully_covered {
         0
     } else {
@@ -1022,35 +1022,6 @@ fn evaluation_working_bytes(
     };
     let row_bytes = bitmaps.saturating_add(clamp).saturating_add(collector_rows);
     (32usize * 1024 * 1024).saturating_add(row_bytes)
-}
-
-/// Bytes [`VixReader::timestamp_range`] allocates for `[start, end)` on
-/// this file: the result bitmap plus, for the rows it decodes (a zone
-/// table's boundary chunks, or every row without one), the boundary-row
-/// `Vec<u64>` and the decoded `i64` timestamps.
-fn timestamp_clamp_bytes(reader: &VixReader, start_time: i64, end_time: i64) -> usize {
-    let rows = usize::try_from(reader.row_count()).unwrap_or(usize::MAX);
-    let decoded = reader
-        .timestamp_range_boundary_rows(start_time, end_time)
-        .map_or(rows, |boundary| {
-            usize::try_from(boundary).unwrap_or(usize::MAX)
-        });
-    rows.div_ceil(8).saturating_add(decoded.saturating_mul(16))
-}
-
-/// The window clamp bitmap, admitted against the evaluation budget for
-/// exactly what this file decodes before any of it is allocated.
-fn clamped_timestamp_bitmap(
-    reader: &VixReader,
-    start_time: i64,
-    end_time: i64,
-) -> anyhow::Result<BooleanBuffer> {
-    vortex_index::check_read_memory(
-        reader
-            .memory_size()
-            .saturating_add(timestamp_clamp_bytes(reader, start_time, end_time)),
-    )?;
-    reader.timestamp_range(start_time, end_time)
 }
 
 /// Own the permit in actual blocking work. Dropping the waiter aborts a queued
@@ -1580,11 +1551,14 @@ async fn search_vix_index(
         .await;
     }
 
-    // The straddling `_timestamp` clamp is charged where it runs
-    // (`clamped_timestamp_bitmap`), sized from the file's zone table; the
-    // declaration covers only what every evaluation retains.
-    let declared_bytes =
-        evaluation_working_bytes(parquet_file.meta.records, idx_optimize_rule.as_ref(), true);
+    // The straddling `_timestamp` clamp is declared at admission (a
+    // predictable, possibly large growth must queue behind the gate, not
+    // compete for the growth headroom mid-evaluation).
+    let declared_bytes = evaluation_working_bytes(
+        parquet_file.meta.records,
+        idx_optimize_rule.as_ref(),
+        file_in_range,
+    );
     // Queue on the cache entry without owning its reader or any eval capacity.
     // Compatibility is immutable metadata copied into the weak lookup handle.
     let cached = if matches!(read_mode, VixReadMode::Ranged) {
@@ -2328,7 +2302,7 @@ fn evaluate_vix_index(
         if let Some(stats_bitmap) = &stats_eq {
             let mut bitmap = stats_bitmap.clone();
             if !file_in_range {
-                bitmap = &bitmap & &clamped_timestamp_bitmap(reader, start_time, end_time)?;
+                bitmap = &bitmap & &reader.timestamp_range(start_time, end_time)?;
             }
             return Ok(bitmap);
         }
@@ -2369,7 +2343,7 @@ fn evaluate_vix_index(
             }
         };
         if !file_in_range {
-            bitmap = &bitmap & &clamped_timestamp_bitmap(reader, start_time, end_time)?;
+            bitmap = &bitmap & &reader.timestamp_range(start_time, end_time)?;
         }
         Ok(bitmap)
     };
