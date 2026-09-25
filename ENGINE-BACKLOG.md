@@ -82,6 +82,26 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
   cost at 30 pods. Rollback gate stays: RSS > 40 GB or any OOMKilled →
   CHUNK_MB 128. Restore 8192 once the L0 writer's residency is charged to
   the budget in code.
+- `.173` (13:46Z, GitOps PR #564 / `9e34575fc025`, + `ZO_VIX_EVAL_MAX_BYTES`
+  4 GiB on queriers): `.172`'s 2 s growth wait had become the dominant
+  straggler — 151 `vix_eval_growth_timeouts_total` in 3 h (~0.2 % of ~73k
+  file evaluations, 1:1 with `budget_refused`), each stalling its QUERY 2 s
+  where the old instant refusal cost a 30–300 ms one-file scan (logs count
+  1 h warm 2,315 ms with one follower at idx 2,023). Admitted evaluations
+  grow at once against a 128 MiB shared headroom. Fix: the straddling clamp
+  is declared at admission again (predictable growth queues, never competes
+  for headroom; point-of-use charge + `timestamp_range_boundary_rows`
+  removed), GROWTH_WAIT 2 s → 500 ms, budget 1 → 4 GiB (queriers at 6.5 GB
+  RSS of 24 GiB). Battery on the 20-minute-old `.173` fleet: 0 growth
+  timeouts; latencies NOT comparable (each roll resets ephemeral caches;
+  O2 hit `MemoryCircuitBreakerError` in the same window and swung 2×).
+- After `CHUNK_MB` 512 (11:45Z): traces L0s 1.2–1.3 GB, logs L0s ~2.6 GB;
+  the 1 h traces window fell from 2,110 files (1,848 L0) at 11:10Z to 1,171
+  (680 L0) at 13:50Z while the merge lanes drain the brake-period flood
+  (hour 11: 2,262 → 395 L0; hour 12: 2,098 → 202; all 90 slots busy,
+  ~240 traces merges / 45 min on hours 11–14). Scan-branch APM 1 h tracked
+  the file count: 2,815 → 1,880 ms (13:10Z). Definitive `.173` numbers need
+  the L0 flood drained and caches warm (~15:30Z).
 - Remaining gap, logs count 1 h: every follower answers all 33–46 files
   from the index in 2 ms; follower time is now the Segment-WAL tail scan
   alone (63–319 ms, the straggler `fetch-wait 562 ms` on 6 remote
