@@ -1242,8 +1242,10 @@ async fn handle_index_optimize(
 
 /// Whether an indexless core data file can answer this query exactly without
 /// a `.vxi` sidecar. Native docs-column equality supports SimpleHistogram
-/// and SimpleSelect; ALL multi-histograms remain on DataFusion until their
-/// extracted timestamp coordinates match collection semantics.
+/// and SimpleSelect; unfiltered SimpleHistogram/SimpleCount need only the
+/// data object's row count, zone table and `_timestamp` chunks. ALL
+/// multi-histograms remain on DataFusion until their extracted timestamp
+/// coordinates match collection semantics.
 fn data_only_vix_capable(
     idx_optimize_rule: &Option<IndexOptimizeMode>,
     index_condition: Option<&IndexCondition>,
@@ -1255,6 +1257,7 @@ fn data_only_vix_capable(
         Some(IndexOptimizeMode::SimpleHistogram(..)) => {
             condition.is_condition_all() || condition.single_equal_term().is_some()
         }
+        Some(IndexOptimizeMode::SimpleCount) => condition.is_condition_all(),
         Some(IndexOptimizeMode::SimpleSelect(limit, _)) if *limit > 0 => {
             condition.single_equal_term().is_some()
         }
@@ -1676,6 +1679,20 @@ mod tests {
         assert!(!data_only_vix_capable(
             &Some(IndexOptimizeMode::SimpleSelect(10, false)),
             Some(&all),
+        ));
+        // an unfiltered count needs only data-side metadata; any predicate
+        // (even a single equality) needs the sidecar's terms
+        assert!(data_only_vix_capable(
+            &Some(IndexOptimizeMode::SimpleCount),
+            Some(&all),
+        ));
+        assert!(!data_only_vix_capable(
+            &Some(IndexOptimizeMode::SimpleCount),
+            Some(&equality),
+        ));
+        assert!(!data_only_vix_capable(
+            &Some(IndexOptimizeMode::SimpleCount),
+            Some(&all_plus_equality),
         ));
         assert!(!data_only_vix_capable(
             &Some(IndexOptimizeMode::SimpleHistogram(0, 10, 2, 0)),
