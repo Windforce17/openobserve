@@ -268,7 +268,7 @@ impl vortex_index::VixReadOperation for ReadOperation {
         }
         if let Some(memory) = self.evaluation.as_ref().and_then(Weak::upgrade) {
             memory
-                .check(owned_bytes)
+                .check(owned_bytes, &|| self.is_cancelled())
                 .map_err(vortex_index::VixError::Callback)?;
         }
         Ok(())
@@ -314,26 +314,59 @@ impl std::fmt::Display for FetchBudgetExceeded {
 impl std::error::Error for FetchBudgetExceeded {}
 
 /// Exact-byte reservations, without rounding or the u32 limit of acquire_many.
+///
+/// Admission packs leases up to `limit - growth_headroom`; the headroom is
+/// spendable only by GROWTH of an already admitted lease ([`BytePermit::
+/// resize`]), which may wait briefly for releases. Without it, admissions
+/// filled the gate to the byte and every mid-evaluation growth was refused —
+/// a refusal that turned index-answerable files into DataFusion scans
+/// (20–100 % of straddling files under fan-out on the 2026-09-25 batteries).
 struct ByteGate {
     limit: usize,
+    growth_headroom: usize,
     used: Mutex<usize>,
     changed: Notify,
+    /// Wakes synchronous growth waiters on release.
+    released: parking_lot::Condvar,
+    released_lock: parking_lot::Mutex<()>,
     waiters: tokio::sync::Mutex<()>,
 }
 impl ByteGate {
+    /// A gate whose leases never grow: admissions may use every byte.
     fn new(limit: usize) -> Arc<Self> {
+        Self::with_growth_headroom(limit, 0)
+    }
+    /// A gate whose leases grow after admission: `headroom` bytes stay free
+    /// for growth while any lease is held.
+    fn with_growth_headroom(limit: usize, headroom: usize) -> Arc<Self> {
+        let limit = limit.max(1);
         Arc::new(Self {
-            limit: limit.max(1),
+            limit,
+            growth_headroom: headroom.min(limit / 2),
             used: Mutex::new(0),
             changed: Notify::new(),
+            released: parking_lot::Condvar::new(),
+            released_lock: parking_lot::Mutex::new(()),
             waiters: tokio::sync::Mutex::new(()),
         })
+    }
+    /// Bytes an admission may take: the headroom stays free for growth
+    /// unless the gate is idle (one oversized lease always admits alone).
+    fn admissible(&self, used: usize, bytes: usize) -> bool {
+        if used == 0 {
+            return bytes <= self.limit;
+        }
+        bytes
+            <= self
+                .limit
+                .saturating_sub(self.growth_headroom)
+                .saturating_sub(used)
     }
     fn try_acquire(self: &Arc<Self>, bytes: usize) -> Option<BytePermit> {
         // Optional background work must not jump ahead of queued foreground work.
         let _queue = self.waiters.try_lock().ok()?;
         let mut used = self.used.lock();
-        if bytes > self.limit - *used {
+        if !self.admissible(*used, bytes) {
             return None;
         }
         *used += bytes;
@@ -358,7 +391,7 @@ impl ByteGate {
             changed.as_mut().enable();
             {
                 let mut used = self.used.lock();
-                if bytes <= self.limit - *used {
+                if self.admissible(*used, bytes) {
                     *used += bytes;
                     return Ok(BytePermit {
                         gate: Arc::clone(self),
@@ -369,14 +402,26 @@ impl ByteGate {
             changed.await;
         }
     }
+    fn release(&self, bytes: usize) {
+        *self.used.lock() -= bytes;
+        self.changed.notify_waiters();
+        let _guard = self.released_lock.lock();
+        self.released.notify_all();
+    }
 }
+
+/// How long a synchronous growth may wait for released bytes before it is
+/// refused. Releases arrive continuously (evaluations finish in tens of ms),
+/// so a waiter that needs less than the headroom is served quickly; the cap
+/// bounds the pathological case of every admitted lease growing at once.
+const GROWTH_WAIT: Duration = Duration::from_secs(2);
+
 struct BytePermit {
     gate: Arc<ByteGate>,
     bytes: usize,
 }
 impl BytePermit {
-    /// Atomic, nonblocking high-water growth. Never wait while holding a lease:
-    /// two admitted readers must not deadlock trying to upgrade each other.
+    /// Atomic, nonblocking high-water growth.
     fn try_resize(&mut self, bytes: usize) -> anyhow::Result<()> {
         if bytes <= self.bytes {
             return Ok(());
@@ -394,11 +439,46 @@ impl BytePermit {
         self.bytes = bytes;
         Ok(())
     }
+    /// High-water growth that waits (on a blocking thread) for releases up to
+    /// [`GROWTH_WAIT`], polling `cancelled` between wakeups. A delta larger
+    /// than the whole gate is refused at once.
+    fn resize(
+        &mut self,
+        bytes: usize,
+        wait: Duration,
+        cancelled: &dyn Fn() -> bool,
+    ) -> anyhow::Result<()> {
+        if bytes <= self.bytes {
+            return Ok(());
+        }
+        let deadline = Instant::now() + wait;
+        loop {
+            let refused = match self.try_resize(bytes) {
+                Ok(()) => return Ok(()),
+                Err(error) => error,
+            };
+            if bytes - self.bytes > self.gate.limit || cancelled() {
+                return Err(refused);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                config::metrics::VIX_EVAL_GROWTH_TIMEOUTS_TOTAL
+                    .with_label_values::<&str>(&[])
+                    .inc();
+                return Err(refused);
+            }
+            // wait for a release (or 100 ms, to re-check cancellation)
+            let mut guard = self.gate.released_lock.lock();
+            let _ = self
+                .gate
+                .released
+                .wait_for(&mut guard, (deadline - now).min(Duration::from_millis(100)));
+        }
+    }
 }
 impl Drop for BytePermit {
     fn drop(&mut self) {
-        *self.gate.used.lock() -= self.bytes;
-        self.gate.changed.notify_waiters();
+        self.gate.release(self.bytes);
     }
 }
 
@@ -408,8 +488,10 @@ static FETCH_COUNT: LazyLock<Option<Arc<Semaphore>>> = LazyLock::new(|| {
     let count = config::get_config().common.vix_fetch_concurrency;
     (count > 0).then(|| Arc::new(Semaphore::new(count)))
 });
-static EVAL_BYTES: LazyLock<Arc<ByteGate>> =
-    LazyLock::new(|| ByteGate::new(evaluation_byte_budget()));
+static EVAL_BYTES: LazyLock<Arc<ByteGate>> = LazyLock::new(|| {
+    let budget = evaluation_byte_budget();
+    ByteGate::with_growth_headroom(budget, budget / 8)
+});
 static EVAL_COUNT: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
     Arc::new(Semaphore::new(
         config::get_config().limit.vix_search_concurrency.max(1),
@@ -431,10 +513,15 @@ struct EvaluationMemory {
     workspace: usize,
     bytes: Mutex<BytePermit>,
     refusal: Mutex<Option<FetchBudgetExceeded>>,
+    /// How long a growth may wait for released bytes (see [`GROWTH_WAIT`]).
+    growth_wait: Duration,
 }
 
 impl EvaluationMemory {
-    fn check(&self, owned_bytes: usize) -> anyhow::Result<()> {
+    /// Admit `owned_bytes` of reader ownership on top of the workspace,
+    /// waiting briefly for headroom (see [`BytePermit::resize`]). A refusal
+    /// is sticky: the evaluation's result is discarded and the file scans.
+    fn check(&self, owned_bytes: usize, cancelled: &dyn Fn() -> bool) -> anyhow::Result<()> {
         let mut refusal = self.refusal.lock();
         if let Some(error) = *refusal {
             return Err(error.into());
@@ -449,7 +536,7 @@ impl EvaluationMemory {
                     budget: bytes.gate.limit,
                 })
             })
-            .and_then(|required| bytes.try_resize(required));
+            .and_then(|required| bytes.resize(required, self.growth_wait, cancelled));
         if let Err(error) = &result {
             *refusal = error.downcast_ref::<FetchBudgetExceeded>().copied();
         }
@@ -459,7 +546,7 @@ impl EvaluationMemory {
 
 impl EvaluationPermit {
     pub(super) fn reserve_owned(&self, owned_bytes: usize) -> anyhow::Result<()> {
-        self.memory.check(owned_bytes)
+        self.memory.check(owned_bytes, &|| false)
     }
 
     pub(super) fn check_refusal(&self) -> anyhow::Result<()> {
@@ -479,6 +566,7 @@ pub(super) fn try_acquire_evaluation(bytes: usize) -> Option<EvaluationPermit> {
             workspace: bytes,
             bytes: Mutex::new(permit),
             refusal: Mutex::new(None),
+            growth_wait: GROWTH_WAIT,
         }),
     })
 }
@@ -503,6 +591,7 @@ pub(super) async fn acquire_evaluation(
             let permit = EVAL_BYTES.acquire(bytes).await?;
             Ok(EvaluationPermit { _count: count, memory: Arc::new(EvaluationMemory {
                 workspace: bytes, bytes: Mutex::new(permit), refusal: Mutex::new(None),
+                growth_wait: GROWTH_WAIT,
             }) })
         } => result,
     };
@@ -1014,18 +1103,83 @@ mod tests {
         count: &Arc<Semaphore>,
         workspace: usize,
     ) -> EvaluationPermit {
+        evaluation_fixture_waiting(gate, count, workspace, Duration::from_millis(50))
+    }
+
+    fn evaluation_fixture_waiting(
+        gate: &Arc<ByteGate>,
+        count: &Arc<Semaphore>,
+        workspace: usize,
+        growth_wait: Duration,
+    ) -> EvaluationPermit {
         EvaluationPermit {
             _count: Arc::clone(count).try_acquire_owned().unwrap(),
             memory: Arc::new(EvaluationMemory {
                 workspace,
                 bytes: Mutex::new(gate.try_acquire(workspace).unwrap()),
                 refusal: Mutex::new(None),
+                growth_wait,
             }),
         }
     }
 
+    /// Growth that cannot be served immediately WAITS for a release instead
+    /// of refusing: a sibling evaluation finishing frees the bytes and the
+    /// waiter proceeds with its exact charge. Cancellation ends the wait at
+    /// once, and the admission headroom stays free for growth while any
+    /// lease is held.
     #[test]
-    fn evaluation_growth_is_nonblocking_absolute_and_released_with_its_owner() {
+    fn evaluation_growth_waits_for_releases_and_honours_cancellation() {
+        let gate = ByteGate::with_growth_headroom(32, 4);
+        let count = Arc::new(Semaphore::new(3));
+        // admissions stop at limit - headroom = 28 while the gate is busy
+        let first = evaluation_fixture_waiting(&gate, &count, 8, Duration::from_secs(5));
+        let second = evaluation_fixture(&gate, &count, 20);
+        assert!(gate.try_acquire(1).is_none(), "headroom is not admissible");
+        assert_eq!(*gate.used.lock(), 28);
+        // growth of 4 fits the headroom immediately
+        first.reserve_owned(4).unwrap();
+        assert_eq!(*gate.used.lock(), 32);
+        // growth of 12 more must wait for `second` to finish
+        let waiter = {
+            let memory = Arc::clone(&first.memory);
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                let result = memory.check(16, &|| false);
+                (result, started.elapsed())
+            })
+        };
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(!waiter.is_finished(), "12 bytes cannot be served yet");
+        drop(second);
+        let (result, waited) = waiter.join().unwrap();
+        result.unwrap();
+        assert!(waited >= Duration::from_millis(50), "waited {waited:?}");
+        assert_eq!(*gate.used.lock(), 8 + 16, "grew to workspace + owned");
+        assert!(first.check_refusal().is_ok());
+
+        // a cancelled operation stops waiting at once and is refused
+        let cancelled = std::sync::atomic::AtomicBool::new(false);
+        let third = evaluation_fixture_waiting(&gate, &count, 4, Duration::from_secs(30));
+        cancelled.store(true, Ordering::Relaxed);
+        let started = Instant::now();
+        let refused = third
+            .memory
+            .check(100, &|| cancelled.load(Ordering::Relaxed))
+            .unwrap_err();
+        assert!(refused.is::<FetchBudgetExceeded>());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(third.check_refusal().is_err(), "refusal stays sticky");
+        drop(third);
+        drop(first);
+        assert_eq!(*gate.used.lock(), 0);
+    }
+
+    /// Growth beyond what a full gate can ever release within the grace
+    /// period is refused after the wait: the delta never leaks, the refusal
+    /// is sticky, and the permit's bytes go back with their owner.
+    #[test]
+    fn evaluation_growth_refused_after_wait_is_absolute_and_released_with_its_owner() {
         let gate = ByteGate::new(32);
         let count = Arc::new(Semaphore::new(2));
         let first = ReadOperation::new(Arc::new(FetchStats::default()), None);

@@ -1663,6 +1663,21 @@ pub static VIX_RESULT_CACHE_HITS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
 /// `budget_refused` rate means the evaluation byte budget is starving the
 /// fast path under fan-out; `skipped_condition`/`partial_fields` are query
 /// shapes the index cannot serve exactly.
+/// Evaluation-budget growths that waited the full grace period without
+/// released bytes and were refused (the file then scans). Non-zero means the
+/// budget is undersized for the concurrency, not merely contended.
+pub static VIX_EVAL_GROWTH_TIMEOUTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "vix_eval_growth_timeouts_total",
+            "VIX evaluation budget growths refused after the wait grace period",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &[],
+    )
+    .expect("Metric created")
+});
 pub static VIX_FAST_PATH_FALLBACK_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     IntCounterVec::new(
         Opts::new(
@@ -2503,6 +2518,9 @@ fn register_metrics(registry: &Registry) {
         .register(Box::new(VIX_RESULT_CACHE_HITS_TOTAL.clone()))
         .expect("Metric registered");
     registry
+        .register(Box::new(VIX_EVAL_GROWTH_TIMEOUTS_TOTAL.clone()))
+        .expect("Metric registered");
+    registry
         .register(Box::new(VIX_FAST_PATH_FALLBACK_TOTAL.clone()))
         .expect("Metric registered");
 
@@ -2894,6 +2912,7 @@ mod tests {
         let _ = VIX_RESULT_CACHE_REQUESTS_TOTAL.clone();
         let _ = VIX_RESULT_CACHE_HITS_TOTAL.clone();
         let _ = VIX_FAST_PATH_FALLBACK_TOTAL.clone();
+        let _ = VIX_EVAL_GROWTH_TIMEOUTS_TOTAL.clone();
         let _ = BYTES_CACHE_MEMORY_SIZE.clone();
         let _ = BYTES_CACHE_ENTRY_COUNT.clone();
         let _ = BYTES_CACHE_GC_TIME.clone();
