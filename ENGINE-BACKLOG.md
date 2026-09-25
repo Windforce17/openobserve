@@ -3,6 +3,67 @@
 Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
 (deleted 2026-07-29; full history in git). Keep THIS file current.
 
+## 2026-09-25 — aggregate gap vs O2: data-only counts, waiting growth, un-droppable warming (.171 → .172)
+- Fix round for the root cause below (`root cause of "still slower than
+  O2"`). Querier release line `release/vix-20260925-172` = the .166 snapshot
+  (`0b076c91a`) + three commits, so the prod delta is exactly this work
+  (vix-arch `3351e3188`, `a510385ec`, `8564a7035`):
+  - `SimpleCount` over condition ALL evaluates data-only like the ALL
+    histogram (row_count, zone table, docs `_timestamp` chunks — all
+    data-side); the follower gate `data_only_vix_capable` admits index-less
+    L0 files to it. Regression `unfiltered_straddling_count_never_opens_the_
+    sidecar` runs with the sidecar object deleted.
+  - The straddling clamp is charged at its point of use
+    (`clamped_timestamp_bitmap`, boundary rows × 16 B + bitmap from the zone
+    table) instead of 24 B/row declared before open.
+  - Fast-path fallbacks are tallied per follower by reason (`fast path
+    fallbacks N (reason: n, …)` at info) and in `vix_fast_path_fallback_total`.
+  - The latest-files downloader bounds ACTIVE bytes only; queued fills are
+    count-bounded and wait for headroom (`DownloadReservation::activate`)
+    instead of being rejected — a broadcast burst used to drop every fill
+    past ~4 objects of the 1 GiB budget, permanently (60 % lifetime sidecar
+    miss rate).
+- `.171` (first two items) on fresh pods exposed the real fallback cause at
+  once: `fast path fallbacks 236 (budget_refused: 236)` — 100 % of files.
+  `ByteGate::acquire` packed the evaluation budget to the last byte and
+  `try_resize` refused any growth while queued evaluations waited; a
+  refusal is sticky (`check_refusal`) and turns an index-answerable file
+  into a DataFusion scan. Moving the clamp from declaration to growth made
+  the pre-existing 20–40 % refusal rate universal.
+- `.172` adds waiting growth: `ByteGate::with_growth_headroom` keeps 1/8 of
+  the evaluation budget for growth (admissions stop at limit − headroom; an
+  idle gate admits one oversized lease), `BytePermit::resize` waits on a
+  condvar for releases up to 2 s polling cancellation, then refuses
+  (`vix_eval_growth_timeouts_total`). The fetch gate is unchanged.
+- Verification: search 1,102 tests, infra downloader 11, api event 5, core
+  flight 17; `.166` baseline battery at 09:10Z for the A/B (obs warm / O2
+  warm: count 1 h 906/539, 1-min hist 1 h 1,890/764, count 24 h 771/483,
+  logs count 24 h 748/203, logs 30-min hist 24 h 3,589/699, logs count 1 h
+  268/102).
+- `.172` live 10:08Z (GitOps PR #562 / `47ea8db37b62`, 10/10 queriers; the 3
+  restarts are the NATS-connect-at-startup panic `nats.rs:604`). Battery on
+  4-minute-old pods, sealed windows ending 10:10Z, obs warm / O2 warm
+  (baseline `.166` ratio → `.172` ratio):
+  traces count 1 h 768/676 (1.68× → **1.14×**); 1-min histogram 1 h
+  478/738 (2.47× → **0.65×**); 5-min histogram 3 h + service 1,055/1,101
+  (1.05× → 0.96×); count 24 h 656/793 (1.60× → **0.83×**); logs count 24 h
+  206/272 (3.68× → **0.76×**); logs 30-min histogram 24 h 826/786 (5.13× →
+  **1.05×**); logs count 1 h 528/119 (2.63× → 4.44×, see below). All 200,
+  no partial, equal buckets. Warm runs: **zero** fast-path fallbacks; the
+  99 `budget_refused` fleet-wide came from cold r1 runs on empty caches
+  (79 of 2,331 files on an 18 s all-remote logs histogram), where
+  evaluations hold permits for seconds and the 2 s growth wait expires —
+  the intended fail-safe. Cold r1 on brand-new pods is remote-bound
+  (logs 24 h histogram 18.2 s) until the disk cache fills; the downloader
+  change is what shortens that, not measurable in a 4-minute-old fleet.
+- Remaining gap, logs count 1 h: every follower answers all 33–46 files
+  from the index in 2 ms; follower time is now the Segment-WAL tail scan
+  alone (63–319 ms, the straggler `fetch-wait 562 ms` on 6 remote
+  segments; leader total 442 = max follower + 100). O2 answers its live
+  tail from ingester memory in 2 ms. Next item: take the segment tail off
+  the follower critical path (leader-side ingester/segment lane, or
+  memory-resident open-hour segments on their owning follower).
+
 ## 2026-09-24 — compactor OOMKills: passthrough docs writer residency was width-scaled (.170, live)
 - Production evidence: after the .170-candidate compaction-policy rollout to
   30 compactors, 5 pods were `OOMKilled`/evicted at the 60 GiB limit within
