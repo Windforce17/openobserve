@@ -74,6 +74,43 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
   problem this entry fixed for the passthrough writer. Under the 60 GiB
   limit today only because merges dropped to ≤ 7 GB; the builder's own
   bound is the next item.
+- 2026-09-25 04:30Z follow-up (11 h on .170): merge backlog DRAINED —
+  `file_list_jobs` 0 pending / 13 running / 850 done (was 1,092 pending);
+  logs/default debt 38 h / 76 files / 0.004 TB (was 457 h / 156,195 files /
+  190 TB); merged volume 54.6 TB/h in the first hour tapering to 5–8 TB/h
+  as work ran out (10–15 of 90 slot-hours busy). Every logs/default day is
+  now terminal ~4 GB outputs. Zero merge errors since 20:00Z.
+  Residual heal treadmill: each demoted-widened-field output gets one
+  sidecar heal — measured locally on a 3.6 GB-original / 460k-row / 3,194-
+  field output: 4.1 s, 1.41 GB peak; 2–9k/h tapering; serialized behind the
+  1-slot rebuild gate (workers wait 10–35 s), harmless with an empty queue.
+- Builder OOM attribution + brake: all five OOMKills on .170 (09-24 19:12 ×2,
+  09-25 02:12, 02:23, 02:39) followed `[SEGMENT:BUILD] super-batch: 67–94
+  segments / 257–365 MB` by 10–40 s; merges in flight were ordinary
+  passthrough merges. GitOps PR #560 (`81c5152a4921`) applied the
+  configmap's documented brake `ZO_SEGMENT_BUILD_CHUNK_MB` 512 → 128 on
+  compactors (env-rev `2026-09-25-segment-chunk-128`): the same 89-segment
+  super-batches now build 41–47 L0s and the fleet-wide max process RSS in
+  the first sample is 17.1 GB (was 31–36 GB with 60 GiB excursions). Cost:
+  traces L0s average ~290 MB original (were 1.1–1.6 GB), ~1,400 L0 files in
+  the open hour until the recent lane merges them (2 h settlement); the
+  1-minute traces histogram over the freshest hour went from 1.6× to 5.1×
+  O2 while 1 h count (1.26×), top-N (0.6×) and logs top-50 (0.65×) held or
+  improved. Owner-approved sequence: brake now, then bound the L0 writer's
+  residency in code (same class as the passthrough fix) and restore 512.
+- Query battery 09-25 04:25Z sealed windows, obs warm / O2 warm: traces
+  count 1 h 1,127/335 ms (3.4×), 1-min histogram 1 h 886/565 (1.6×), 5-min
+  histogram 3 h + service 1,721/819 (2.1×), top-50 15 m 757/886 (0.85×), APM
+  ops 1 h 689/1,646 (0.42×), count 24 h 926/270 (3.4×; O2 now complete);
+  logs top-50 1 h 1,504/383 (3.9×, cold 11.7 s from index-less L0s: `16 of
+  17 files cannot produce exact vix candidates`), logs count 24 h 776/285
+  (2.7×), logs match_all('error') count 1 h 257/193 (1.3×), logs 30-min
+  histogram 24 h 2,395/635 (3.8×). All HTTP 200, no partial, equal bucket
+  counts; per-hour traces counts obs/O2 = 1.007–1.019 for the last 8 sealed
+  hours. Dominant obs phases unchanged: per-file sidecar evaluation
+  (`index fetches: 233 (30 MB) 1.2 s` per follower, `IndexOptimizeExec over
+  1,251 core files`, 13,354 files/24 h traces) plus the remote segment tail
+  on cold runs (`cache memory/disk/remote 0/0/60`, fetch-wait 10.8 s sum).
 
 ## 2026-09-24 — compactor refusal storm: plan-before-prefetch, widening casts, refusal backoff (.169 candidate)
 - Production evidence (Orbit, 2026-09-24 07:00–08:00Z, 16 compactors × 3 slots):
