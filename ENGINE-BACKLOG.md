@@ -111,6 +111,45 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
   (`index fetches: 233 (30 MB) 1.2 s` per follower, `IndexOptimizeExec over
   1,251 core files`, 13,354 files/24 h traces) plus the remote segment tail
   on cold runs (`cache memory/disk/remote 0/0/60`, fetch-wait 10.8 s sum).
+- 2026-09-25 05:50Z root cause of "still slower than O2" on aggregates:
+  **window edges, not data volume.** Same traces `count(*)`, warm, obs/O2:
+  hour-aligned 03:00–04:00 **116 / 151 ms** (obs faster; 505 files, 0 index
+  fetches — counts come from file_list `records`); offset 03:25–04:25
+  **475 / 559 ms** and 1,127 / 335 in the 04:38Z battery. Every real query is
+  offset ("last 1h" ends at now) and 449 of the window's 667 files straddle
+  an edge (merged recent-lane outputs span ~35 min; 243 straddle the start,
+  175 the end). For those the fork reads sidecar footer+zone table and the
+  boundary chunks' `_timestamp` through ranged reads: 728 fetches / 115 MB
+  fleet-wide for one 1h count. When the bytes are local that costs 18–35 ms
+  per follower (9 of 10 followers, `remote_reads=0`); the query time is the
+  10-way fan-out max(), and the slowest follower is always the one reading
+  from S3: pod `hmttz` (15 min old, empty ephemeral cache, 8/50 sidecars
+  cached) did 48 remote GETs, idx 318 ms, setup 403 ms → total 469 ms vs
+  ~230 ms without it; at 04:38Z every follower was at 15–19 % cached for
+  the freshest hour (download lag) and idx took 108–408 ms per follower.
+  Mechanisms that keep the bytes remote: (a) `get_range_classified`
+  (infra/cache/storage.rs) is memory→disk→remote with NO write-back, so a
+  ranged read never warms anything; (b) whole-file sidecar warming is the
+  broadcast downloader (1 GiB queued+active budget, no retry on reject),
+  which lags the freshest hour and restarts from zero on pod replacement;
+  (c) `zo_vix_reader_cache` is full at 867 entries / 2.15 GB (≈2.5 MB
+  accounted per reader for KBs of useful metadata), 35 % hit rate; (d)
+  lifetime sidecar disk-cache miss rate on a 17-day-old querier is 60 %
+  (3,325 hit / 5,080 miss). O2 evaluates the same straddling files with
+  tantivy's `_timestamp` fast field from a 100 % local-disk index (its cold
+  pod r-5, 0 % cached, was likewise its straggler at 546 ms).
+  Secondary obs-only costs per follower: segment-WAL tail scan 78–113 ms
+  (266 open-hour segments; O2 ingesters answer from memory in 2 ms); 96 of
+  the 449 straddling files (21 %) leave the SimpleCount fast path for a
+  DataFusion `_timestamp` scan (27–58 ms here, ~300 ms at 04:38Z) — the
+  reason is only logged at debug (`exact aggregate scan required`), likely
+  candidate: `EVAL_BYTES` growth refusal (`try_resize`) under 64-way
+  contention (`evaluation_wait_us` 68–167 ms on the affected followers,
+  0 on the follower with zero fallbacks). Leader dispatch overhead 12–135 ms.
+  Fix direction: retain per-(file, generation) footer+zone metadata in a
+  memory cache charged by real bytes; write ranged sidecar reads back to
+  the disk cache; make the fast-path fallback reason observable; keep the
+  segment tail off the follower critical path.
 
 ## 2026-09-24 — compactor refusal storm: plan-before-prefetch, widening casts, refusal backoff (.169 candidate)
 - Production evidence (Orbit, 2026-09-24 07:00–08:00Z, 16 compactors × 3 slots):
