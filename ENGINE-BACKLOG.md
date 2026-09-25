@@ -56,6 +56,18 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
   the intended fail-safe. Cold r1 on brand-new pods is remote-bound
   (logs 24 h histogram 18.2 s) until the disk cache fills; the downloader
   change is what shortens that, not measurable in a 4-minute-old fleet.
+- 11:10Z re-run on 66-minute-old pods, obs `.166` warm → `.172` warm: count
+  1 h 906 → 532 ms, 1-min hist 1 h 1,890 → 665, 5-min hist 3 h + service
+  2,084 → 746, top-50 15 m 757 → 385, count 24 h 771 → 493, logs top-50 1 h
+  1,504 → 1,109, logs count 24 h 748 → 403, logs 30-min hist 24 h 3,589 →
+  390, logs count 1 h 268 → 307. APM ops 1 h 689 → 2,815 is NOT the query
+  change: same `skip vix search` → DataFusion scan path at 92–96 % disk
+  cache on both, but 263–320 files per follower vs 100–140 — the traces
+  1 h window holds 2,110 files (1,848 L0) vs 617 (1 L0) at 04:38Z, the
+  builder brake's open-hour L0 multiplication (settles in the 2 h recent
+  lane; reverts with the L0-writer residency fix + `CHUNK_MB` 512).
+  Cold r1 on `.172` is not comparable to `.166`'s weeks-warm pods (empty
+  ephemeral caches: logs 24 h histogram 11.0 s cold).
 - Remaining gap, logs count 1 h: every follower answers all 33–46 files
   from the index in 2 ms; follower time is now the Segment-WAL tail scan
   alone (63–319 ms, the straggler `fetch-wait 562 ms` on 6 remote
