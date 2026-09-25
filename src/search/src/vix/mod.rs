@@ -272,10 +272,12 @@ pub async fn vix_search(
             &idx_optimize_mode,
             Some(IndexOptimizeMode::SimpleHistogram(..))
         );
-    // Grouped ALL histograms may use exact sidecar value counts; only the
-    // ungrouped ALL histogram is deliberately data-only.
-    let data_only_all_histogram = all_histogram;
-    let data_only_capable = native_simple_select || native_histogram || all_histogram;
+    // Unfiltered histogram AND count evaluate from the data object alone
+    // (row_count, zone table, docs `_timestamp` chunks); grouped ALL keeps
+    // the sidecar for exact one-bucket value counts.
+    let data_only_all_aggregate = all_histogram
+        || (condition_all && matches!(&idx_optimize_mode, Some(IndexOptimizeMode::SimpleCount)));
+    let data_only_capable = native_simple_select || native_histogram || data_only_all_aggregate;
     let eval_files = file_list_map
         .values()
         .filter(|file| is_core_file(&file.key) && (file.meta.index_size > 0 || data_only_capable))
@@ -307,7 +309,7 @@ pub async fn vix_search(
     // Probe sidecars only for evaluations that can use them.
     let index_files = eval_files
         .iter()
-        .filter(|file| file.meta.index_size > 0 && !data_only_all_histogram)
+        .filter(|file| file.meta.index_size > 0 && !data_only_all_aggregate)
         .cloned()
         .collect_vec();
     scan_stats.compressed_size = index_files.iter().map(|file| file.meta.index_size).sum();
@@ -487,6 +489,10 @@ pub async fn vix_search(
     // follower opening ~1531 files that all bailed). Counts nameless
     // Skipped results AND per-file AllConditionsSkipped errors.
     let mut files_skipped: usize = 0;
+    // Files handed to the scan branch under an optimize mode, by reason —
+    // one summary line per follower (the per-file lines stay at debug) and
+    // `vix_fast_path_fallback_total`.
+    let mut fallbacks = FallbackTally::default();
     // plain row-id searches give up outright after this many skipped files
     let mut skip_give_up_budget = cfg.limit.cpu_num;
     let mut total_row_ids_percent = 0usize;
@@ -622,6 +628,9 @@ pub async fn vix_search(
                         // no need inverted index for this file, need add filter back
                         is_add_filter_back = true;
                         files_skipped += 1;
+                        if idx_optimize_mode.is_some() {
+                            fallbacks.record("skipped_file");
+                        }
                         // Skip-threshold give-up: only for plain row-id
                         // searches. Under an optimize mode earlier files may
                         // already be answered AND removed from the map —
@@ -664,12 +673,12 @@ pub async fn vix_search(
                     if bail_bytes_cap > 0
                         && idx_optimize_mode.is_some()
                         // Native SimpleSelect stays bounded by K, and an ALL
-                        // SimpleHistogram uses metadata/zones. MultiHistogram
+                        // histogram/count uses metadata/zones. MultiHistogram
                         // still reads the breakdown column and must keep this
                         // projected-cost bail. Bailing either exempt shape to
                         // a wide scan is strictly more expensive.
                         && !native_simple_select
-                        && !all_histogram
+                        && !data_only_all_aggregate
                         && files_evaluated >= BAIL_SAMPLE_FILES
                         && files_evaluated < files_total
                         && !eval_bail.load(std::sync::atomic::Ordering::Relaxed)
@@ -710,9 +719,10 @@ pub async fn vix_search(
                                 | VixSearchResult::MinMax(..)
                         )
                     {
-                        log::info!(
+                        log::debug!(
                             "[trace_id {trace_id}] search->vix: file: {file_name}, aggregate fast path skipped a condition, keep file for the scan branch",
                         );
+                        fallbacks.record("skipped_condition");
                         continue;
                     }
                     match result {
@@ -779,10 +789,16 @@ pub async fn vix_search(
                         log::debug!(
                             "[trace_id {trace_id}] search->vix: exact aggregate scan required: {e}"
                         );
+                        if idx_optimize_mode.is_some() {
+                            fallbacks.record(fallback_reason(&e));
+                        }
                     } else {
                         log::error!(
                             "[trace_id {trace_id}] search->vix: error filtering via index. Keep file to search, error: {e}"
                         );
+                        if idx_optimize_mode.is_some() {
+                            fallbacks.record("error");
+                        }
                     }
                     is_add_filter_back = true;
                     // a deterministic per-file skip (every conjunct
@@ -859,6 +875,11 @@ pub async fn vix_search(
         load(&fetch_stats.evaluation_queue_micros),
     );
 
+    if !fallbacks.is_empty() {
+        log::info!(
+            "[trace_id {trace_id}] search->vix: fast path fallbacks {fallbacks} of {files_total} files (mode {idx_optimize_mode:?})",
+        );
+    }
     log::info!(
         "{}",
         search_inspector_fields(
@@ -899,6 +920,57 @@ fn requires_exact_scan(error: &anyhow::Error) -> bool {
     })
 }
 
+/// The stable reason label of an evaluation error that moved a file to the
+/// scan branch (the `reason` label of `vix_fast_path_fallback_total`).
+fn fallback_reason(error: &anyhow::Error) -> &'static str {
+    for cause in error.chain() {
+        if let Some(fallback) = cause.downcast_ref::<collect::AggregateFallback>() {
+            return fallback.0;
+        }
+        if cause.is::<source::FetchBudgetExceeded>() {
+            return "budget_refused";
+        }
+        if cause.is::<AccessFallback>() {
+            return "dense_exact_term";
+        }
+    }
+    "other"
+}
+
+/// Per-follower fallback counts by reason (see [`fallback_reason`]).
+#[derive(Default)]
+struct FallbackTally(Vec<(&'static str, usize)>);
+
+impl FallbackTally {
+    fn record(&mut self, reason: &'static str) {
+        metrics::VIX_FAST_PATH_FALLBACK_TOTAL
+            .with_label_values(&[reason])
+            .inc();
+        match self.0.iter_mut().find(|(name, _)| *name == reason) {
+            Some((_, count)) => *count += 1,
+            None => self.0.push((reason, 1)),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl std::fmt::Display for FallbackTally {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let total: usize = self.0.iter().map(|(_, count)| count).sum();
+        write!(f, "{total} (")?;
+        for (index, (reason, count)) in self.0.iter().enumerate() {
+            if index > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "{reason}: {count}")?;
+        }
+        write!(f, ")")
+    }
+}
+
 fn is_cancelled_read(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         matches!(
@@ -919,10 +991,13 @@ fn evaluation_working_bytes(
     // Evaluation/composition can retain the condition, timestamp and result
     // bitmaps together even when the collector itself is chunk-streamed.
     let bitmaps = rows.div_ceil(8).saturating_mul(4);
-    // A partial-window timestamp clamp is not yet wholly chunk-local:
-    // timestamp_range may retain all decoded timestamps and a growable
-    // boundary-row Vec<u64>. Do not charge this to fully covered metadata or
-    // dictionary-count answers, which never construct the clamp.
+    // Native docs helpers apply their window clamp inside chunk-streamed
+    // scans that may retain decoded timestamps and a boundary-row Vec<u64>.
+    // The index reader path passes `fully_covered = true`: its clamp is
+    // charged at the point of use by [`clamped_timestamp_bitmap`], sized
+    // from the file's zone table instead of the whole-column worst case
+    // (declaring 24 B/row for every straddling file starved the evaluation
+    // budget under fan-out and pushed 20–40 % of files to the scan branch).
     let clamp = if fully_covered {
         0
     } else {
@@ -947,6 +1022,35 @@ fn evaluation_working_bytes(
     };
     let row_bytes = bitmaps.saturating_add(clamp).saturating_add(collector_rows);
     (32usize * 1024 * 1024).saturating_add(row_bytes)
+}
+
+/// Bytes [`VixReader::timestamp_range`] allocates for `[start, end)` on
+/// this file: the result bitmap plus, for the rows it decodes (a zone
+/// table's boundary chunks, or every row without one), the boundary-row
+/// `Vec<u64>` and the decoded `i64` timestamps.
+fn timestamp_clamp_bytes(reader: &VixReader, start_time: i64, end_time: i64) -> usize {
+    let rows = usize::try_from(reader.row_count()).unwrap_or(usize::MAX);
+    let decoded = reader
+        .timestamp_range_boundary_rows(start_time, end_time)
+        .map_or(rows, |boundary| {
+            usize::try_from(boundary).unwrap_or(usize::MAX)
+        });
+    rows.div_ceil(8).saturating_add(decoded.saturating_mul(16))
+}
+
+/// The window clamp bitmap, admitted against the evaluation budget for
+/// exactly what this file decodes before any of it is allocated.
+fn clamped_timestamp_bitmap(
+    reader: &VixReader,
+    start_time: i64,
+    end_time: i64,
+) -> anyhow::Result<BooleanBuffer> {
+    vortex_index::check_read_memory(
+        reader
+            .memory_size()
+            .saturating_add(timestamp_clamp_bytes(reader, start_time, end_time)),
+    )?;
+    reader.timestamp_range(start_time, end_time)
 }
 
 /// Own the permit in actual blocking work. Dropping the waiter aborts a queued
@@ -1452,13 +1556,17 @@ async fn search_vix_index(
     };
     let cold_native_histogram =
         equality_histogram && !parsed_sidecar_available && !local_sidecar_available;
-    // Keep the sidecar for grouped ALL: exact one-bucket value counts need it.
-    let data_only_all_histogram = condition.is_condition_all()
+    // Unfiltered histogram/count answers come from the DATA object alone:
+    // `row_count` and the zone table are data-side properties and the
+    // straddling clamp decodes docs `_timestamp` chunks — the sidecar adds
+    // nothing but its (often remote) footer probe. Grouped ALL keeps the
+    // sidecar: exact one-bucket value counts need it.
+    let data_only_all_aggregate = condition.is_condition_all()
         && matches!(
             &idx_optimize_rule,
-            Some(IndexOptimizeMode::SimpleHistogram(..))
+            Some(IndexOptimizeMode::SimpleHistogram(..)) | Some(IndexOptimizeMode::SimpleCount)
         );
-    if (parquet_file.meta.index_size <= 0 && !data_only_all_histogram) || cold_native_histogram {
+    if (parquet_file.meta.index_size <= 0 && !data_only_all_aggregate) || cold_native_histogram {
         return search_vix_docs_optimized(
             trace_id,
             &condition,
@@ -1472,16 +1580,16 @@ async fn search_vix_index(
         .await;
     }
 
-    let declared_bytes = evaluation_working_bytes(
-        parquet_file.meta.records,
-        idx_optimize_rule.as_ref(),
-        file_in_range,
-    );
+    // The straddling `_timestamp` clamp is charged where it runs
+    // (`clamped_timestamp_bitmap`), sized from the file's zone table; the
+    // declaration covers only what every evaluation retains.
+    let declared_bytes =
+        evaluation_working_bytes(parquet_file.meta.records, idx_optimize_rule.as_ref(), true);
     // Queue on the cache entry without owning its reader or any eval capacity.
     // Compatibility is immutable metadata copied into the weak lookup handle.
     let cached = if matches!(read_mode, VixReadMode::Ranged) {
         match reader_cache::GLOBAL_CACHE.get(&reader_key) {
-            Some(handle) if data_only_all_histogram || handle.has_index() => {
+            Some(handle) if data_only_all_aggregate || handle.has_index() => {
                 Some(handle.lock(operation).await?)
             }
             Some(_) => {
@@ -1513,7 +1621,7 @@ async fn search_vix_index(
                         parquet_file.meta.index_generation,
                     )
                     .zip(u64::try_from(parquet_file.meta.index_size).ok())
-                    .filter(|(_, size)| *size > 0 && !data_only_all_histogram)
+                    .filter(|(_, size)| *size > 0 && !data_only_all_aggregate)
                     .map(|(sidecar_key, size)| {
                         Arc::new(LadderRangeSource::new(
                             file_account.clone(),
@@ -1529,7 +1637,7 @@ async fn search_vix_index(
                     // resync on every cold file open; filtered queries
                     // cannot reuse those readers because they need the
                     // sidecar anyway.
-                    cache_key: (!data_only_all_histogram).then(|| reader_key.clone()),
+                    cache_key: (!data_only_all_aggregate).then(|| reader_key.clone()),
                     cached,
                 })
         }
@@ -1543,7 +1651,7 @@ async fn search_vix_index(
             }
             let data_size = usize::try_from(parquet_file.meta.compressed_size)
                 .map_err(|_| collect::AggregateFallback("invalid whole-object size"))?;
-            let index_size = if data_only_all_histogram {
+            let index_size = if data_only_all_aggregate {
                 0
             } else {
                 usize::try_from(parquet_file.meta.index_size.max(0))
@@ -1561,7 +1669,7 @@ async fn search_vix_index(
             .await?;
             let index_bytes =
                 match config::vix_sidecar_key(&vix_file_name, parquet_file.meta.index_generation)
-                    .filter(|_| parquet_file.meta.index_size > 0 && !data_only_all_histogram)
+                    .filter(|_| parquet_file.meta.index_size > 0 && !data_only_all_aggregate)
                 {
                     Some(sidecar_key) => Some(
                         load_whole_object(
@@ -1627,7 +1735,7 @@ async fn search_vix_index(
     })
     .await?;
     if !operation.is_cancelled()
-        && !data_only_all_histogram
+        && !data_only_all_aggregate
         && !matches!(
             &raw,
             RawVixResult::ExactNoMatch
@@ -2220,7 +2328,7 @@ fn evaluate_vix_index(
         if let Some(stats_bitmap) = &stats_eq {
             let mut bitmap = stats_bitmap.clone();
             if !file_in_range {
-                bitmap = &bitmap & &reader.timestamp_range(start_time, end_time)?;
+                bitmap = &bitmap & &clamped_timestamp_bitmap(reader, start_time, end_time)?;
             }
             return Ok(bitmap);
         }
@@ -2261,7 +2369,7 @@ fn evaluate_vix_index(
             }
         };
         if !file_in_range {
-            bitmap = &bitmap & &reader.timestamp_range(start_time, end_time)?;
+            bitmap = &bitmap & &clamped_timestamp_bitmap(reader, start_time, end_time)?;
         }
         Ok(bitmap)
     };

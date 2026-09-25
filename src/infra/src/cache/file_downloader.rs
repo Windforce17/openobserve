@@ -56,12 +56,18 @@ pub enum DownloadRejection {
 
 #[derive(Default)]
 struct AdmissionState {
+    /// Queued and active keys: the dedupe identity and the count bound.
     files: HashSet<Arc<str>>,
-    bytes: usize,
+    /// Object bytes of downloads a worker currently OWNS. Queued items hold
+    /// no object bytes (disk fills stream to a temp file; a memory fill
+    /// buffers only while active), so only active work is byte-bounded.
+    active_bytes: usize,
 }
 
 struct DownloadAdmission {
     state: parking_lot::Mutex<AdmissionState>,
+    /// Wakes workers waiting for active-byte headroom.
+    released: tokio::sync::Notify,
     max_bytes: usize,
     max_files: usize,
 }
@@ -70,11 +76,18 @@ impl DownloadAdmission {
     fn new(max_bytes: usize, max_files: usize) -> Self {
         Self {
             state: parking_lot::Mutex::new(AdmissionState::default()),
+            released: tokio::sync::Notify::new(),
             max_bytes,
             max_files,
         }
     }
 
+    /// Admit a key into the queue: dedupe + count bound + the one size that
+    /// can never activate. Byte headroom is a worker-side wait
+    /// ([`DownloadReservation::activate`]), never an enqueue rejection — a
+    /// broadcast burst used to drop every fill past ~4 objects of a 1 GiB
+    /// budget, and dropped fills were never retried, so those sidecars
+    /// stayed remote for every later query.
     fn reserve(
         self: &Arc<Self>,
         file: &str,
@@ -92,20 +105,29 @@ impl DownloadAdmission {
         if bytes > self.max_bytes {
             return Err(QueueDownloadOutcome::Rejected(DownloadRejection::TooLarge));
         }
-        if bytes > self.max_bytes - state.bytes || state.files.len() >= self.max_files {
+        if state.files.len() >= self.max_files {
             return Err(QueueDownloadOutcome::Rejected(DownloadRejection::Full));
         }
-        // Clone a key only after both byte and count admission. A single reservation
-        // covers cache probing, queueing and the actual worker, without a dedupe gap.
+        // Clone a key only after admission. A single reservation covers cache
+        // probing, queueing and the actual worker, without a dedupe gap.
         let file: Arc<str> = file.into();
         state.files.insert(file.clone());
-        state.bytes += bytes;
         Ok(DownloadReservation {
             admission: self.clone(),
             file,
             bytes,
+            active: std::sync::atomic::AtomicBool::new(false),
             priority_metric: None,
         })
+    }
+
+    fn try_activate(&self, bytes: usize) -> bool {
+        let mut state = self.state.lock();
+        if bytes > self.max_bytes - state.active_bytes {
+            return false;
+        }
+        state.active_bytes += bytes;
+        true
     }
 }
 
@@ -113,10 +135,31 @@ struct DownloadReservation {
     admission: Arc<DownloadAdmission>,
     file: Arc<str>,
     bytes: usize,
+    /// Set once a worker owns the download and its bytes are charged.
+    active: std::sync::atomic::AtomicBool,
     priority_metric: Option<bool>,
 }
 
 impl DownloadReservation {
+    /// Charge this download's bytes against the active budget, waiting for
+    /// headroom released by finishing downloads. Idempotent.
+    async fn activate(&self) {
+        if self.active.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        loop {
+            // register before checking so a release between the check and
+            // the await cannot be missed
+            let released = self.admission.released.notified();
+            if self.admission.try_activate(self.bytes) {
+                self.active
+                    .store(true, std::sync::atomic::Ordering::Release);
+                return;
+            }
+            released.await;
+        }
+    }
+
     fn record_queue(&mut self, priority: bool) {
         self.priority_metric = Some(priority);
         if priority {
@@ -136,8 +179,11 @@ impl Drop for DownloadReservation {
         {
             let mut state = self.admission.state.lock();
             state.files.remove(self.file.as_ref());
-            state.bytes -= self.bytes;
+            if self.active.load(std::sync::atomic::Ordering::Acquire) {
+                state.active_bytes -= self.bytes;
+            }
         }
+        self.admission.released.notify_waiters();
         // Preserve the existing gauge's queued + active meaning, including on
         // failed sends, worker cancellation and unwind.
         match self.priority_metric {
@@ -278,6 +324,9 @@ async fn process_download(thread: usize, file: FileInfo) {
     } = file;
     let name = reservation.file.as_ref();
     let size = reservation.bytes;
+    // Queued items hold no object bytes; the byte budget bounds what workers
+    // hold. Wait here (behind earlier activations) instead of rejecting.
+    reservation.activate().await;
     match download_file(
         thread,
         &trace_id,
@@ -638,13 +687,15 @@ mod tests {
             admission.reserve("accepted", 40),
             Err(QueueDownloadOutcome::Deduplicated)
         ));
-        // Receiving is not completion: bytes remain charged while a worker
-        // owns the item even though the queue now has capacity.
-        assert!(matches!(
-            admission.reserve("too-much-active-work", 61),
-            Err(QueueDownloadOutcome::Rejected(DownloadRejection::Full))
-        ));
+        // Receiving is not completion: bytes stay charged while a worker owns
+        // the item even though the queue now has capacity — but that only
+        // gates ACTIVATION of later work, never its admission to the queue.
+        active.reservation.activate().await;
+        let later = admission.reserve("too-much-active-work", 61).unwrap();
+        assert!(!admission.try_activate(later.bytes));
         drop(active);
+        assert!(admission.try_activate(later.bytes));
+        drop(later);
         drop(admission.reserve("accepted", 100).unwrap());
         queue.receiver.lock().await.close();
         assert_eq!(
@@ -665,15 +716,51 @@ mod tests {
         }
         let newer = queue.pop().await;
         assert_eq!(newer.reservation.file.as_ref(), "newer");
-        assert!(matches!(
-            admission.reserve("over-budget", 41),
-            Err(QueueDownloadOutcome::Rejected(DownloadRejection::Full))
-        ));
+        newer.reservation.activate().await;
+        // a queued 71-byte fill waits for the 30 active bytes, and wakes on
+        // their release without polling
+        let waiting = queued_item(&admission, "over-budget", 71);
+        assert!(!admission.try_activate(waiting.reservation.bytes));
+        let waiter = {
+            let reservation = Arc::clone(&waiting.reservation);
+            tokio::spawn(async move { reservation.activate().await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
         drop(newer);
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("activation wakes on release")
+            .unwrap();
+        assert!(
+            waiting
+                .reservation
+                .active
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
         let older = queue.pop().await;
         assert_eq!(older.reservation.file.as_ref(), "older");
         drop(older);
+        drop(waiting);
         drop(admission.reserve("rejected", 100).unwrap());
+    }
+
+    /// Queue admission never rejects on byte headroom: a burst larger than
+    /// the whole budget queues in full (bounded by count) and drains as
+    /// workers release active bytes.
+    #[tokio::test]
+    async fn bursts_beyond_the_byte_budget_queue_instead_of_dropping() {
+        let admission = Arc::new(DownloadAdmission::new(100, 10));
+        let burst: Vec<FileInfo> = (0..8)
+            .map(|index| queued_item(&admission, &format!("burst-{index}"), 60))
+            .collect();
+        assert_eq!(admission.state.lock().files.len(), 8);
+        assert_eq!(admission.state.lock().active_bytes, 0);
+        burst[0].reservation.activate().await;
+        assert!(!admission.try_activate(60));
+        drop(burst);
+        assert_eq!(admission.state.lock().active_bytes, 0);
+        assert!(admission.state.lock().files.is_empty());
     }
 
     #[test]

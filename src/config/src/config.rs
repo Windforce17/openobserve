@@ -1785,9 +1785,11 @@ pub struct Common {
     #[env_config(
         name = "ZO_CACHE_LATEST_FILES_DOWNLOAD_MAX_BYTES",
         default = 0,
-        help = "Raw-byte ceiling for queued plus active background file downloads. \
-                0 = min(memory/8, 1GiB), with a 64MiB floor capped at actual memory. \
-                Positive values are exact bytes, not MiB; oversized fills are not queued."
+        help = "Raw-byte ceiling for ACTIVE background file downloads (objects a worker \
+                currently owns; queued fills hold no object bytes and are bounded by \
+                count). 0 = min(memory/8, 1GiB), with a 64MiB floor capped at actual \
+                memory. Positive values are exact bytes, not MiB; a single object larger \
+                than the ceiling is not queued."
     )]
     pub cache_latest_files_download_max_bytes: usize,
     #[env_config(

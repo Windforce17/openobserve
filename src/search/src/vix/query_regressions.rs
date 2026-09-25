@@ -808,6 +808,81 @@ async fn sparse_gib_sidecar_count_and_topn_keep_exact_optimized_dispatch() {
     }
 }
 
+/// An unfiltered COUNT over a window-straddling file is answered from the
+/// data object alone (row_count + zone table + boundary `_timestamp`
+/// chunks): with the sidecar object physically ABSENT the evaluation still
+/// returns the exact clamped count, and the file leaves the scan list.
+/// Sidecar footer probes were the one remote read a warm count paid on
+/// every follower whose disk cache lagged the freshest hour.
+#[tokio::test(flavor = "multi_thread")]
+async fn unfiltered_straddling_count_never_opens_the_sidecar() {
+    use std::sync::atomic::Ordering;
+    let key = "files/org/logs/data-only-count/2026/01/01/00/straddle.vix";
+    // rows carry _timestamp 1_000..=1_009 (max_ts - i for i in 0..10)
+    let file = tests::store_core_file_with_rows(key, 1_009, 10).await;
+    let sidecar = config::vix_sidecar_key(key, file.meta.index_generation).unwrap();
+    assert!(file.meta.index_size > 0, "fixture must advertise a sidecar");
+    infra::storage::del(vec![(file.account.as_str(), sidecar.as_str())])
+        .await
+        .unwrap();
+    assert!(
+        infra::storage::head(&file.account, &sidecar).await.is_err(),
+        "the sidecar must be gone so any probe fails loudly"
+    );
+    reader_cache::GLOBAL_CACHE.remove(key);
+
+    let condition = IndexCondition {
+        conditions: vec![Condition::All()],
+    };
+    // [1_004, 1_020) straddles the file's start: rows 1_004..=1_009 = 6
+    let stats = Arc::new(source::FetchStats::default());
+    let operation = source::ReadOperation::new(Arc::clone(&stats), None);
+    let (_, answer, skipped) = search_vix_index(
+        "data-only-count",
+        (1_004, 1_020),
+        Some(condition.clone()),
+        Some(IndexOptimizeMode::SimpleCount),
+        &file,
+        VixReadMode::Ranged,
+        SidecarAccess::check_only(false),
+        &operation,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(!skipped);
+    assert!(matches!(answer, VixSearchResult::Count(6)), "{answer:?}");
+    assert!(stats.bytes.load(Ordering::Relaxed) > 0);
+
+    let query = Arc::new(crate::types::QueryParams {
+        trace_id: "data-only-count-search".to_owned(),
+        org_id: "org".to_owned(),
+        stream: datafusion::sql::TableReference::from("t"),
+        stream_type: StreamType::Logs,
+        stream_name: "t".to_owned(),
+        time_range: (1_004, 1_020),
+        work_group: None,
+        use_inverted_index: true,
+        full_text_fields: None,
+    });
+    let mut files = vec![file.clone()];
+    let (_, add_filter_back, result) = vix_search(
+        query,
+        &mut files,
+        Some(condition),
+        Some(IndexOptimizeMode::SimpleCount),
+    )
+    .await
+    .unwrap();
+    assert!(!add_filter_back);
+    assert!(
+        files.is_empty(),
+        "the answered file must not also be scanned"
+    );
+    assert!(matches!(result, MultiResult::Count(6)), "{result:?}");
+    let _ = infra::storage::del(vec![(file.account.as_str(), key)]).await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn cached_sparse_object_refuses_its_real_owner_before_any_fetch() {
     use std::sync::atomic::Ordering;

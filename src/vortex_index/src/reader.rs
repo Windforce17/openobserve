@@ -1247,6 +1247,24 @@ impl VixReader {
         Ok(self.timestamp_range_inner(min_micros, max_micros)?)
     }
 
+    /// Rows [`Self::timestamp_range`] will DECODE for `[min_micros,
+    /// max_micros)`: the rows of zone chunks a range edge cuts through. `None`
+    /// when the file has no zone table (the clamp then decodes every row).
+    pub fn timestamp_range_boundary_rows(&self, min_micros: i64, max_micros: i64) -> Option<u64> {
+        let chunks = self.zone_map.as_deref()?;
+        Some(
+            chunks
+                .iter()
+                .filter(|chunk| {
+                    let outside = chunk.ts_max < min_micros || chunk.ts_min >= max_micros;
+                    let inside = chunk.ts_min >= min_micros && chunk.ts_max < max_micros;
+                    !outside && !inside
+                })
+                .map(|chunk| chunk.row_count)
+                .sum(),
+        )
+    }
+
     /// Read one column-store column across all documents (from the `docs`
     /// blob).
     pub fn read_column(&self, name: &str) -> anyhow::Result<ArrowArrayRef> {

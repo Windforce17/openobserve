@@ -1658,6 +1658,23 @@ pub static VIX_RESULT_CACHE_HITS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     )
     .expect("Metric created")
 });
+/// Files an index-optimized aggregate could not answer from the VIX index
+/// and handed to the DataFusion scan branch instead, by reason. A non-zero
+/// `budget_refused` rate means the evaluation byte budget is starving the
+/// fast path under fan-out; `skipped_condition`/`partial_fields` are query
+/// shapes the index cannot serve exactly.
+pub static VIX_FAST_PATH_FALLBACK_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "vix_fast_path_fallback_total",
+            "Files an index-optimized query moved to the scan branch, by reason",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &["reason"],
+    )
+    .expect("Metric created")
+});
 
 pub static QUERY_AGGREGATION_CACHE_BYTES: Lazy<IntGaugeVec> = Lazy::new(|| {
     IntGaugeVec::new(
@@ -2485,6 +2502,9 @@ fn register_metrics(registry: &Registry) {
     registry
         .register(Box::new(VIX_RESULT_CACHE_HITS_TOTAL.clone()))
         .expect("Metric registered");
+    registry
+        .register(Box::new(VIX_FAST_PATH_FALLBACK_TOTAL.clone()))
+        .expect("Metric registered");
 
     // metrics for generic bytes cache
     registry
@@ -2873,6 +2893,7 @@ mod tests {
         let _ = VIX_RESULT_CACHE_GC_TOTAL.clone();
         let _ = VIX_RESULT_CACHE_REQUESTS_TOTAL.clone();
         let _ = VIX_RESULT_CACHE_HITS_TOTAL.clone();
+        let _ = VIX_FAST_PATH_FALLBACK_TOTAL.clone();
         let _ = BYTES_CACHE_MEMORY_SIZE.clone();
         let _ = BYTES_CACHE_ENTRY_COUNT.clone();
         let _ = BYTES_CACHE_GC_TIME.clone();
