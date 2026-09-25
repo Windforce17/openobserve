@@ -68,6 +68,20 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
   lane; reverts with the L0-writer residency fix + `CHUNK_MB` 512).
   Cold r1 on `.172` is not comparable to `.166`'s weeks-warm pods (empty
   ephemeral caches: logs 24 h histogram 11.0 s cold).
+- 11:45Z owner decision: `ZO_SEGMENT_BUILD_CHUNK_MB` back to **512** with the
+  compactor `ZO_SEGMENT_BUILD_MEMORY_BUDGET_MB` **8192 → 4096** (GitOps PR
+  #563 / `e7008c70da07`, env-rev `2026-09-25-segment-chunk-512-budget-4096`).
+  Rationale: builder memory = concurrent builds × per-build residency, and
+  the budget admits decoded bytes, so halving it halves concurrent 512 MiB
+  builds. 37-minute gate: max process RSS **19.4 GB** (128 brake: 17.8;
+  512/8192: 31–36 with 60 GiB excursions), **0 OOMKilled**, 4 restarts all
+  the NATS startup panic; L0s since the roll average 1,186 MB (355 L0 in the
+  partial hour vs 2,800 in hour 11); builder backlog healthy (111 pending,
+  oldest 9 min; 677 claimed, oldest 2 min; `admit_ms=0`). Build parallelism
+  per batch dropped (build_sum/wall ~1–4 vs ~6) with no visible backlog
+  cost at 30 pods. Rollback gate stays: RSS > 40 GB or any OOMKilled →
+  CHUNK_MB 128. Restore 8192 once the L0 writer's residency is charged to
+  the budget in code.
 - Remaining gap, logs count 1 h: every follower answers all 33–46 files
   from the index in 2 ms; follower time is now the Segment-WAL tail scan
   alone (63–319 ms, the straggler `fetch-wait 562 ms` on 6 remote
