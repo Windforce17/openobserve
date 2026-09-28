@@ -628,6 +628,25 @@ pub static BLOOM_PRUNE_DURATION: Lazy<HistogramVec> = Lazy::new(|| {
     .expect("Metric created")
 });
 
+// Search-side per-file bloom probes: files no group `.bf` covered yet,
+// tested against the bloom blob in their own sidecar (`bloom_pruner` stage
+// 2). `outcome` ∈ dropped (proven absent), hit (every predicate maybe),
+// no_info (a predicate had no filter in the file), no_blob (sidecar without a
+// bloom blob), no_sidecar (index-off file), failed (open/fetch error, kept),
+// timed_out (stage deadline, kept).
+pub static VIX_FILE_BLOOM_PROBE_FILES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "vix_file_bloom_probe_files_total",
+            "Files without a group .bf probed against their own sidecar bloom, by outcome",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &["outcome"],
+    )
+    .expect("Metric created")
+});
+
 // compactor stats
 pub static COMPACT_USED_TIME: Lazy<CounterVec> = Lazy::new(|| {
     CounterVec::new(
@@ -2279,6 +2298,9 @@ fn register_metrics(registry: &Registry) {
     registry
         .register(Box::new(BLOOM_PRUNE_DURATION.clone()))
         .expect("Metric registered");
+    registry
+        .register(Box::new(VIX_FILE_BLOOM_PROBE_FILES_TOTAL.clone()))
+        .expect("Metric registered");
 
     // stream stats aggregation metrics
     registry
@@ -2913,6 +2935,7 @@ mod tests {
         let _ = VIX_RESULT_CACHE_HITS_TOTAL.clone();
         let _ = VIX_FAST_PATH_FALLBACK_TOTAL.clone();
         let _ = VIX_EVAL_GROWTH_TIMEOUTS_TOTAL.clone();
+        let _ = VIX_FILE_BLOOM_PROBE_FILES_TOTAL.clone();
         let _ = BYTES_CACHE_MEMORY_SIZE.clone();
         let _ = BYTES_CACHE_ENTRY_COUNT.clone();
         let _ = BYTES_CACHE_GC_TIME.clone();

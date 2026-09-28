@@ -69,6 +69,7 @@
 //! unknown blobs are ignored, so the envelopes tolerate additions.
 
 pub mod bloom;
+pub mod bloom_probe;
 mod clustered;
 mod container;
 mod conversion;
@@ -91,6 +92,7 @@ pub mod test_support;
 mod tokenizer;
 mod writer;
 
+pub use bloom_probe::{FileBloomProbe, FileBloomSection};
 pub use container::{
     BloomEncodingCensus, DEFAULT_TAIL_FETCH_BYTES, RowOrder, VixOutput, ZoneEntry,
     region_row_ranges, set_tail_fetch_size,

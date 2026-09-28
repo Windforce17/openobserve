@@ -13,14 +13,17 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-//! Search-side bloom prune layer — transposed (block-major) read.
+//! Search-side bloom prune layer — transposed (block-major) read, then
+//! per-file probes for the files no group `.bf` covers yet.
 //!
 //! Given a candidate `Vec<FileKey>` and the query's `IndexCondition`,
 //! this module pulls the bloom-decidable predicates out of it
 //! ([`collect_decidable`]) and then:
 //!
 //! 1. Splits files into "has bloom" (`bloom_ver != 0`) and "no bloom" (`bloom_ver == 0`). The
-//!    latter pass through untouched.
+//!    latter are probed against the bloom blob inside their own sidecar ([`file_probe`]): the open
+//!    hour, fresh merge outputs and late stragglers — everything the assembler has not stamped yet
+//!    — prune file by file instead of falling through to the scan.
 //! 2. Groups "has bloom" files by `(date, bloom_ver)` so all files sharing a `.bf` are tested with
 //!    one footer fetch.
 //! 3. For each group, fetches **one block row per `(predicate, value)`** — a single contiguous `M ×
@@ -32,7 +35,9 @@
 //!    a predicate, AND across predicates).
 //!
 //! Any failure (fetch, parse, schema mismatch) **falls back to "keep
-//! all"** for the affected group — bloom is performance, not correctness.
+//! all"** for the affected group or file — bloom is performance, not correctness.
+
+mod file_probe;
 
 use std::collections::{HashMap, HashSet};
 
@@ -150,22 +155,47 @@ pub async fn prune(
             with_bloom.push(f);
         }
     }
-    if with_bloom.is_empty() {
-        log::warn!(
+    let concurrency = bloom_prefetch_concurrency();
+
+    // 1b. No `.bf` yet: probe each file's own sidecar bloom (fail-open).
+    let without_bloom_total = without_bloom.len();
+    let kept_without_bloom = if without_bloom.is_empty() {
+        without_bloom
+    } else {
+        let outcome =
+            file_probe::probe_files(trace_id, without_bloom, predicates, concurrency).await;
+        log::info!(
             "[trace_id {trace_id}] search->bloom: stream {org_id}/{stream_type}/{stream_name}, \
-             all {total_input} files have bloom_ver=0 — no `.bf` covers any of them. \
-             Likely causes: compactor hasn't built `.bf` for this hour yet, or these files \
-             produced no blooms (target field not indexed at build time, or \
-             index_size=0). Falling through, no pruning applied."
+             per-file blooms: probed={without_bloom_total}, dropped={}, kept={} (hit={}, \
+             no_info={}, no_blob={}, no_sidecar={}, failed={}, timed_out={}), took: {} ms",
+            outcome.dropped,
+            outcome.kept.len(),
+            outcome.hit,
+            outcome.no_info,
+            outcome.no_blob,
+            outcome.no_sidecar,
+            outcome.failed,
+            outcome.timed_out,
+            outcome.took.as_millis()
         );
-        return without_bloom;
+        outcome.kept
+    };
+    if with_bloom.is_empty() {
+        log::info!(
+            "[trace_id {trace_id}] search->bloom: stream {org_id}/{stream_type}/{stream_name}, \
+             all {total_input} files have bloom_ver=0 — no `.bf` covers any of them (the \
+             compactor has not stamped this hour yet, or the files carry no blooms); \
+             per-file blooms kept {}",
+            kept_without_bloom.len()
+        );
+        return kept_without_bloom;
     }
     log::info!(
         "[trace_id {trace_id}] search->bloom: stream {org_id}/{stream_type}/{stream_name}, \
          input={total_input} (with_bloom={}, without_bloom={}), \
          predicates=[{}]",
         with_bloom.len(),
-        without_bloom.len(),
+        without_bloom_total,
         predicates
             .iter()
             .map(|p| format!("{}({})", p.field, p.values.len()))
@@ -213,7 +243,7 @@ pub async fn prune(
     //    check_block per target. Outer concurrency is config-driven.
     let total_groups = specs.len();
     let with_bloom_ref = &with_bloom;
-    let concurrency = bloom_prefetch_concurrency();
+    // (the outer concurrency, `bloom_prefetch_concurrency()`, is shared with stage 1b)
     let results: Vec<(Group, GroupResult)> = stream::iter(specs)
         .map(|spec| async move {
             let group = spec.group.clone();
@@ -273,7 +303,7 @@ pub async fn prune(
         }
     }
 
-    let mut kept = without_bloom;
+    let mut kept = kept_without_bloom;
     let mut kept_no_info = 0usize;
     let mut kept_predicate_hit = 0usize;
     let mut dropped = 0usize;
@@ -2092,5 +2122,157 @@ mod tests {
         let r = BloomReader::parse_suffix(big, total).expect("parse with precise footer suffix");
         assert!(r.column_index("trace_id", 0).is_some());
         assert!(r.column_index("trace_id", 299).is_some());
+    }
+
+    /// Stage 1b: files the assembler has not stamped (`bloom_ver = 0`) prune
+    /// through the bloom blob in their OWN sidecar — the prod shape of the
+    /// open hour (`trace_id` demoted to bloom-only, values in the composite
+    /// section). Holder kept, covered misses dropped, IN = OR within the
+    /// predicate, index-less and blob-less files kept, scope respected, and
+    /// the section table memoized across queries.
+    #[tokio::test(flavor = "multi_thread")] // the cache-ladder read path uses block_in_place
+    async fn files_without_bf_prune_via_their_own_sidecar_bloom() {
+        use std::sync::Arc;
+
+        use arrow::{
+            array::{ArrayRef, Int64Array, RecordBatch, StringArray},
+            datatypes::{DataType, Field, Schema},
+        };
+        use vortex_index::{VixWriter, VixWriterOptions};
+
+        let sidecar = |salt: &str, opts: VixWriterOptions| -> Vec<u8> {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("_timestamp", DataType::Int64, false),
+                Field::new("trace_id", DataType::Utf8, true),
+            ]));
+            let ids: Vec<String> = (0..64).map(|i| format!("t-{salt}-{i:04}")).collect();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(
+                        (0..64i64).map(|i| 1_000 + i).collect::<Vec<_>>(),
+                    )) as ArrayRef,
+                    Arc::new(StringArray::from(
+                        ids.iter().map(String::as_str).collect::<Vec<_>>(),
+                    )) as ArrayRef,
+                ],
+            )
+            .unwrap();
+            let source = StringArray::from_iter_values(
+                ids.iter().map(|t| format!(r#"{{"trace_id":"{t}"}}"#)),
+            );
+            let mut writer = VixWriter::new(&schema, opts, false);
+            writer
+                .push_batch_with_source(&batch, &source, None)
+                .unwrap();
+            let (_, index) = writer.finish().unwrap();
+            index.expect("indexed build emits a sidecar")
+        };
+        let demoted = || VixWriterOptions {
+            bloom_only_field_names: vec!["trace_id".to_string()],
+            ..Default::default()
+        };
+        // a sidecar with NO bloom blob (pre-capability shape): term-indexed
+        // trace_id, every bloom source off
+        let bloomless = || VixWriterOptions {
+            bloom_field_names: Vec::new(),
+            bloom_only_field_names: Vec::new(),
+            bloom_composite: false,
+            ..Default::default()
+        };
+
+        let date = "2026/05/08/15";
+        let stream = "s-file-probe";
+        let dir = format!("files/o/traces/{stream}/{date}");
+        let file = |id: i64, name: &str, index_size: usize| {
+            let key = format!("{dir}/{name}.vix");
+            let mut k = fk(&key, 0);
+            k.id = id;
+            k.account = infra::storage::get_account("o", &key).unwrap_or_default();
+            k.meta.index_size = index_size as i64;
+            k
+        };
+        let a_index = sidecar("a", demoted());
+        let b_index = sidecar("b", demoted());
+        let c_index = sidecar("c", bloomless());
+        let a = file(501, "a", a_index.len());
+        let b = file(502, "b", b_index.len());
+        let index_less = file(503, "l0-index-off", 0);
+        let blob_less = file(504, "pre-capability", c_index.len());
+        for (f, index) in [(&a, a_index), (&b, b_index), (&blob_less, c_index)] {
+            let sidecar_key = config::vix_sidecar_key(&f.key, 0).unwrap();
+            infra::storage::put(&f.account, &sidecar_key, bytes::Bytes::from(index))
+                .await
+                .expect("local test object store accepts the sidecar");
+        }
+        let files = vec![a.clone(), b.clone(), index_less.clone(), blob_less.clone()];
+        let ids = |kept: &[FileKey]| {
+            let mut ids: Vec<i64> = kept.iter().map(|f| f.id).collect();
+            ids.sort_unstable();
+            ids
+        };
+        let only_trace_id = only_scope(&["trace_id"]);
+        let run = |files: Vec<FileKey>, c: IndexCondition, scope: VixBloomCompositeScope| async move {
+            prune(
+                "tid",
+                "o",
+                StreamType::Traces,
+                stream,
+                files,
+                &c,
+                Vec::new(),
+                &scope,
+                false,
+                &HashSet::new(),
+            )
+            .await
+        };
+
+        // holder kept; the covered miss drops; no sidecar / no blob stay
+        let c = cond(vec![Condition::Equal("trace_id".into(), "t-a-0003".into())]);
+        let kept = run(files.clone(), c, only_trace_id.clone()).await;
+        assert_eq!(ids(&kept), vec![501, 503, 504], "holder + fail-open files");
+
+        // an absent value: both covered files drop, fail-open files stay
+        let c = cond(vec![Condition::Equal(
+            "trace_id".into(),
+            "t-nowhere".into(),
+        )]);
+        let kept = run(files.clone(), c, only_trace_id.clone()).await;
+        assert_eq!(ids(&kept), vec![503, 504]);
+
+        // IN is OR within the predicate: b holds one of the values
+        let c = cond(vec![Condition::In(
+            "trace_id".into(),
+            vec!["t-b-0001".into(), "t-nowhere".into()],
+            false,
+        )]);
+        let kept = run(files.clone(), c, only_trace_id.clone()).await;
+        assert_eq!(ids(&kept), vec![502, 503, 504]);
+
+        // AND across predicates: a second conjunct on a field the file never
+        // covered is "no info" and cannot rescue a covered miss
+        let c = cond(vec![
+            Condition::Equal("trace_id".into(), "t-a-0003".into()),
+            Condition::Equal("span_id".into(), "anything".into()),
+        ]);
+        let kept = run(files.clone(), c, only_scope(&["trace_id", "span_id"])).await;
+        assert_eq!(ids(&kept), vec![501, 503, 504]);
+
+        // out of scope: the demoted field is not bloom-decidable, nothing moves
+        let c = cond(vec![Condition::Equal(
+            "trace_id".into(),
+            "t-nowhere".into(),
+        )]);
+        let kept = run(files.clone(), c, only_scope(&[])).await;
+        assert_eq!(kept.len(), 4);
+
+        // the section tables of the opened sidecars are memoized (a, b, and
+        // the blob-less sidecar as a negative entry)
+        assert!(
+            file_probe::probe_cache_len() >= 3,
+            "probe cache holds the opened sidecars, len {}",
+            file_probe::probe_cache_len()
+        );
     }
 }

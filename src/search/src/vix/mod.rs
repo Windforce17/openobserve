@@ -792,6 +792,22 @@ pub async fn vix_search(
                         if idx_optimize_mode.is_some() {
                             fallbacks.record(fallback_reason(&e));
                         }
+                    } else if e
+                        .downcast_ref::<crate::index::AllConditionsSkipped>()
+                        .is_some()
+                    {
+                        // Deterministic per-file capability outcome: no
+                        // conjunct is servable by this file's term index
+                        // (bloom-only / fts-only / partial fields). The scan
+                        // branch with the filter re-applied IS the designed
+                        // answer — not an error, and not the `error` reason
+                        // that monitoring reads as a broken index.
+                        log::debug!(
+                            "[trace_id {trace_id}] search->vix: {evaluated_file} unservable by the index, scanning with the filter re-applied: {e}"
+                        );
+                        if idx_optimize_mode.is_some() {
+                            fallbacks.record("unservable");
+                        }
                     } else {
                         log::error!(
                             "[trace_id {trace_id}] search->vix: error filtering via index. Keep file to search, error: {e}"
