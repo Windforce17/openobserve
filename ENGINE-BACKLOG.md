@@ -177,6 +177,16 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     Fresh-pod cold caches produced 32 growth timeouts / `budget_refused` in
     the first 10 min (the known cold pattern; recheck warm). No
     `error filtering via index`, no `ResourcesExhausted`.
+    Warm re-measure 20:02–20:17Z (100 min after the roll): traces/default
+    45 lookups, probed 2,686 → dropped 2,670, hit 16, no_info 0; stage p50
+    **188 ms** / p90 421 ms / max 777 ms (≈ 3 ms per file — the open hour
+    keeps landing sidecars each pod opens once); logs/default 55 lookups,
+    probed 2,402 → no_sidecar 1,596 (index-off L0s), no_info 700 (auto-id
+    predicates such as `user.id`/`user_id`/`sandbox_id` on files whose
+    composite does not cover them), p50 18 ms. The cold-pod no_info burst
+    (1,509 on traces 19:33–20:03Z, p50 384 ms) came from those auto-id
+    lookups; not worth restricting the stage to explicit fields at 18 ms
+    warm. Growth timeouts flat at 53 since 20:03Z (fresh-pod cold caches).
   - Compactor: 30/30 at 18:42:23Z (1 restart = `nats.rs:604`), lease
     recovery done 18:58Z (90 running / 30 nodes). `.bf` passes: **27 passes,
     median 395 s, max 445 s (was 2,958–6,227 s), busy 258 of 8,100
