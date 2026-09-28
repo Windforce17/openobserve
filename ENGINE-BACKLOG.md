@@ -3,6 +3,166 @@
 Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
 (deleted 2026-07-29; full history in git). Keep THIS file current.
 
+## 2026-09-28 — `.173` definitive numbers; needle lookups full-scanned the unstamped hours (fix: per-file sidecar bloom probes + a settled-only `.bf` queue)
+- Fleet at 14:52Z, 3 days undisturbed: queriers 10/10 `.173` (7 pods 3 d,
+  two node-churn replacements 24 h / 8 h; `restartCount` 0), RSS 6.6–8.9 GB
+  of 24 GiB. Compactors 30/30 `.170` (CHUNK_MB 512 / budget 4096 since 09-25
+  11:45Z): **0 OOMKilled in 3 d**, max RSS 19.7 GiB (33 % of 60 GiB, 53 % of
+  the 40 GB gate), median 7.7 GiB; 6 restarts = 5× the `nats.rs:604`
+  NATS-connect-at-startup panic + 1 node-level `Unknown`.
+- Gate counters (`/metrics` 14:56Z): `vix_eval_growth_timeouts_total` **14 in
+  3 d** (151 in 3 h on `.172`), `budget_refused` **0**, `aggregate chunk
+  dictionary budget exceeded` 1; `reason="error"` 674 = ONE signature,
+  `AllConditionsSkipped` (`index.rs:234`: every conjunct unservable —
+  `trace_id`/`user_id`/`body` not term-indexed, or OR-mixes over absent
+  session-id fields), 100 % of it one 09-27 04:43–06:08Z UI burst (813
+  tallied on 10 pods − the 2 replaced pods = 674). Growth timeouts emit only
+  the counter (`source.rs:462`; the `exact aggregate scan required` line is
+  debug), so the 14 cannot be placed in time.
+- Battery 14:57–15:01Z (sealed windows ending 14:45Z, `use_cache=false`, obs
+  warm / O2 warm; O2 itself degraded: `MemoryCircuitBreakerError` on 7 of 20
+  requests, querier-3 OOMKilled 09:59Z, so ratios flatter obs): traces count
+  1 h **531/535 (0.99×)**, count 24 h 612/965, 1-min hist 1 h 664/700, 5-min
+  hist 3 h + service 446/2,619, top-50 15 m 587/772, APM ops 1 h 1,695/2,670;
+  logs count 1 h **594/289 (2.06×)**, logs count 24 h 772/408, logs 30-min
+  hist 24 h 912/1,435 (alias `hb`: `bucket` is a real logs column on BOTH
+  systems, so `AS bucket … GROUP BY bucket` is a planner error on both, not a
+  fork fault), logs top-50 1 h 1,484/691. All obs 200, no partial, **zero
+  fallbacks and zero growth timeouts in every warm run**. obs absolute vs
+  `.172` 11:10Z: T1/T3 same, T4 −40 %, T2 +24 %, T5 +52 %, L1 +93 %, L2
+  +92 %, L3 +134 %, L4 +34 % — every regression is a tail-scan or
+  DataFusion-scan shape. Cold r1 is 1.8–3.5× r2 with `idx_took` 655–2,252 →
+  22–356 ms: r1 pays the index-evaluation cache, not the file cache.
+- Attribution: logs count 1 h — all 547 files index-answered in 2–4 ms per
+  follower, stream 0 ms, **100 % of follower time is `segments_scan`**: 523
+  segments loaded, 443 (85 %) zero-yield *time-pruned after fetch+decode*
+  (`skips before-fetch/decode 0/0`); leader 583 = slowest follower 564 + 16
+  file_list + 3. logs count 24 h — 6,580 files index-answered in 36–53 ms,
+  segments_scan 180–586 ms, 72 % zero-yield; the follower with 0 remote
+  segments is the fastest (234 vs 657). logs top-50 — `SELECT *` over
+  index-less L0s (813–859 ms) behind a 481–580 ms segments_scan in setup.
+  APM ops — index evaluated then abandoned on all 10 followers (`too many
+  row_ids, avg percent 35.8–37.3`), column scan of 108–173 files per
+  follower (293–1,673 ms; parquet cache 74–85 %, sidecar 60–72 % on r2). The
+  24-hour-old follower was the slowest in every shape; leader wall = that
+  follower + ≤ 100 ms.
+- `file_list` (14:58/15:09/15:20Z): the 09-25 flood is gone — hours 11–14 of
+  09-25 at **0/0/0/1 L0** (479–562 files each, all > 2 GiB); every closed
+  hour ≥ 3 h old at 0–1 L0 (traces) / 0 index-less (logs), max file ≈ 4.29
+  GB; 30-day debt 0.04–0.08 TB, minutes old. But the 1 h traces window is
+  **stationary at ~1,000 files / ~700 L0** (1,060/727 → 937/650 → 1,005/695
+  over 22 min; 09-25 13:50Z's 1,171/680 was already this regime; weeks-warm
+  617/1 is not reachable by draining): the open hour holds the last ≈ 30 min
+  of production as ≈ 600 × 1.5 GB L0s (merge lags production ≈ 30 min), the
+  previous hour drains its large L0s in 1.2–1.9 h, closed hours receive
+  ≈ 300 tiny stragglers each for ≈ 3 h. Builder healthy: ≈ 470 segments/min,
+  ≈ 2 GB/min, build latency 100–120 s, pending < 0.2 GB;
+  `unbuilt_older_10m` flat at 46–51 for 4 h (a floor no claim selects —
+  undiagnosed).
+- Tiny L0s are structural (compactor logs 14:27–15:27Z: 6,951 L0 built,
+  **1,434 = 20.6 % ≤ 10 records**, 2,421 < 1 MB). (1) Fresh lane, 1,018/h:
+  `buffer.rs:194` routes a frame late only when the frame-level `max_ts <
+  now − 2 h`, and `chunk_per_stream_hour` (`segments.rs:1623`) emits one L0
+  per (stream, actual hour), so a 69-segment batch carrying 2 rows for
+  H−1/H−2 emits a 2-record L0 for that hour (387 at H−1, 532 at H−2; all 315
+  fresh batches emitted ≥ 1). (2) The 15-min late-cohort builds, 2/h: 142–143
+  all-late segments totalling 1 MB fan into 297–472 per-hour files (416
+  tiny/h). A producer replay at 15:00–15:10Z put KB-sized stragglers into
+  ~230 weeks-old hours (data 1–22 d old) and each made its hour debt again:
+  the backlog lane rewrote 354 GB traces + 246 GB k8s_prod_public_logs +
+  194 GB logs/default of 1–1.5 GB residuals in 20 min to absorb ≈ 4 MB (debt
+  hours 7 → 212 → 157; pending jobs 108 → 264 → 186, 90 slots busy). M31a's
+  file-count poison one layer down: the late lane coalesces segments, not
+  hours.
+- Merge health (12:10–15:10Z): 10,324 merges, **0** failures / refusals /
+  lease losses / panics. Hour 14: 3,694 merges / 11,727 inputs / 6.95 TB,
+  **199.6 MB/s active** (indexed 222.4 = 2.2× the `.145` reference; every
+  lane × type ≥ 1.5×), 9.7 concurrent; 485 of 830 backlog-traces merges were
+  pairwise merges of < 100 MB files for 09-07…09-24. 116 INFO `type
+  widening` (`tools` Float64→Utf8) — demotions, not failures.
+- **Needle lookups over the recent hours full-scanned.** From 15:05Z the UI
+  trace views (`SELECT * FROM "default" WHERE trace_id = '…' ORDER BY
+  _timestamp ASC LIMIT 5000` on traces + `LIMIT 2000` on logs, 1–3 h
+  windows) scanned 2.46–2.73 TB in 12.6–25.7 s per lookup for ≤ 23 rows,
+  15,740 ERROR lines by 15:44Z, and the **first two `ResourcesExhausted` on
+  `.173`** (15:31Z, 15:32Z: 12.73 of 12.88 GB pool reserved). Controlled A/B
+  17:10Z, 1 h window `[16:00, 17:00)`, one trace id, 1 hit on both: obs
+  6,984 / 10,070 ms scanning **1.74 TB / 386 M rows**; O2 720 / 617 ms
+  scanning **286 MB / 251 k rows** (`idx_took` 341–455 ms = upstream's
+  default secondary index: `_DEFAULT_BLOOM_FILTER_FIELDS = ["trace_id",
+  "session_id"]` folded into the index defaults; invisible in stream
+  settings). Anatomy per follower (trace `01a0e893…`, 3 h): leader `.bf`
+  prune 948 ms — `with_bloom=138 → 1 kept`, `without_bloom=134 → all kept`
+  (`no_bloom=131`); VIX eval 378 ms — `fast path fallbacks 121 (error: 64,
+  skipped_file: 57) of 121`; Segment-WAL tail 94 segments / 1.2 M rows /
+  `kept 0` in the 3.6 s setup; DataFusion 121 files (9.9 GB compressed) ≈ 7 s.
+  `_source` is NOT decoded for non-matching rows: `inject_vix_scan_pruning`
+  turns the equality into `ColumnBound{min=max=Str}` and the default
+  `BoundedPrepass` runs `eq_string_prepass` (docs.rs:1669) on the `trace_id`
+  column alone, point-reading the projection for hits — the 7 s is the
+  column decode over ~110 M rows per follower (a near-unique column: the
+  dictionary IS the column). Pruning, not scanning, was the lever.
+- Root cause: three facts stacked. (1) `trace_id` is bloom-only by design
+  (`ZO_VIX_BLOOM_ONLY_FIELDS`; #52), so `field_capability` reports `FtsOnly`
+  → `AllConditionsSkipped` for every file. (2) Every indexed `.vix` already
+  writes a per-file bloom blob holding those values (composite section,
+  `bloom.rs`: "a byproduct of term emission"), and the group `.bf` is only
+  its hour-level transpose — but the query side never read the blob, only
+  `.bf` (`bloom_ver > 0`). (3) The `.bf` assembler never reaches the recent
+  hours: `query_bloom_pending_buckets` excludes the open hour, every merge
+  output resets `bloom_ver = 0` (merge.rs:2766), and — measured — one pass
+  ran **2,958–6,227 s** for 300 attempted buckets (79–107 processed, 193–221
+  "busy elsewhere"), because the two live traces hours held 2,100 of the
+  3,200 pending files in 2 of 646 buckets: at the head of the date-DESC list,
+  the winner fetched ~1,000 blobs under one lock while 29 compactors timed
+  out on it, then the L0s merged away and re-pended. SQL is not the cost
+  (`query_for_bloom` 0.04 ms, buckets 60 ms).
+- Fix, this commit set (vix-arch; not yet released):
+  - `vortex_index::bloom_probe::FileBloomProbe` — sidecar footer → bloom
+    blob section table (headers only, sliding 4 KiB window, bodies never
+    read) → `probe(field, values, composite_fallback)`: one batched fetch of
+    the addressed 32-byte SBBF blocks (guards + values), same key derivation
+    as the pruner (`composite_value_key` / `composite_guard_key`), `None`
+    (keep) for partial fields, uncovered composites, missing sections.
+  - `bloom_pruner` stage 1b (`file_probe.rs`): files with `bloom_ver <= 0`
+    and a sidecar are probed on the follower before the group pass, under
+    `bloom_prefetch_concurrency()`, a 2 s stage deadline and a 64 MiB
+    byte-bounded LRU of section tables (a `None` entry remembers blob-less
+    sidecars). Dropped files never reach the eval loop, so no fallback
+    tally, no skip-rate bail, no ERROR line. New counter
+    `vix_file_bloom_probe_files_total{outcome}`; the `search->bloom` line
+    gains `per-file blooms: probed/dropped/kept (hit, no_info, no_blob,
+    no_sidecar, failed, timed_out)`. Index-less logs L0s
+    (`ZO_VIX_L0_INDEX_OFF_STREAM_TYPES=logs`) stay `no_sidecar` — the logs
+    side of a needle lookup still scans until the L0s merge (P3 below).
+  - `AllConditionsSkipped` in the eval loop is a deterministic capability
+    outcome: logged at debug with reason `unservable`, no longer
+    `reason="error"` at ERROR level (15,740 lines in 40 min).
+  - Compactor `compact::bloom::run`: the queue stops at the live merge lane
+    (`settled_hour_cutoff(now, ZO_COMPACT_LIVE_LOOKBACK_HOURS)` → `date <
+    now − 2 h`), and each node walks its 300-bucket batch in a shuffled
+    order. The recent hours are the querier's job (stage 1b) until they
+    settle; the pass log line carries `settled before <hour>`.
+  - Verification: vortex_index `bloom_probe` 4 tests (real sidecar with
+    demoted `trace_id`: inserted values hit through the composite, < 2 %
+    false positives, policy off → None, unknown field → None; ranged
+    header walk == in-memory parser; partial section untrusted; blob-less
+    sidecar → None); search `bloom_pruner` 31 tests incl. the end-to-end
+    `files_without_bf_prune_via_their_own_sidecar_bloom` over sidecars
+    fetched through the cache ladder (holder kept, covered miss dropped, IN
+    = OR, AND across predicates, index-less + blob-less kept, scope
+    respected, section tables memoized); `vix::` 189 tests; openobserve-core
+    `compact::bloom` 19 tests. Prod A/B to redo after the querier release:
+    target ≤ 2 s for the 3 h lookup (setup 3.6 s incl. the tail), the
+    `no_bloom` count → 0 on traces, and `ResourcesExhausted` gone.
+- Still open from the plan: P2 Segment-WAL tail pre-fetch pruning (registry
+  per-stream min/max + tiny bloom; the 85 % zero-yield is the whole
+  logs-count residual AND 2 s of every needle lookup); P3 bloom-only sidecar
+  for logs L0s (measure builder CPU under the CHUNK_MB 512 brake first);
+  P4 a scan-branch byte budget returning `is_partial` (the O2
+  `MemoryCircuitBreaker` equivalent) for non-id predicates (`body = '…'`,
+  `user_id IN (…)`) that no bloom can prune.
+
 ## 2026-09-25 — aggregate gap vs O2: data-only counts, waiting growth, un-droppable warming (.171 → .172)
 - Fix round for the root cause below (`root cause of "still slower than
   O2"`). Querier release line `release/vix-20260925-172` = the .166 snapshot
