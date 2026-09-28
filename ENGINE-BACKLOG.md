@@ -155,13 +155,64 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     `compact::bloom` 19 tests. Prod A/B to redo after the querier release:
     target ≤ 2 s for the 3 h lookup (setup 3.6 s incl. the tail), the
     `no_bloom` count → 0 on traces, and `ResourcesExhausted` gone.
-- Still open from the plan: P2 Segment-WAL tail pre-fetch pruning (registry
-  per-stream min/max + tiny bloom; the 85 % zero-yield is the whole
-  logs-count residual AND 2 s of every needle lookup); P3 bloom-only sidecar
-  for logs L0s (measure builder CPU under the CHUNK_MB 512 brake first);
-  P4 a scan-branch byte budget returning `is_partial` (the O2
-  `MemoryCircuitBreaker` equivalent) for non-id predicates (`body = '…'`,
-  `user_id IN (…)`) that no bloom can prune.
+- **Rolled 2026-09-28 as `v0.93.0-vix-20260928.174`** = vix-arch `c62938595`
+  (ECR index `sha256:9a1b0a25…`, binary `e621edf0…`), the first image every
+  role shares (owner call: converge, the `.165`/`.170`/`.173` lineages had
+  drifted 11k lines apart in `vortex_index`). GitOps PRs #565 querier
+  18:36Z, #566 compactor 18:41Z, #567 ingester/router 19:11Z (STS one pod
+  at a time, 600 s grace).
+  - Querier: 10/10 at 18:37:49Z, 0 restarts. Same trace id, same 1 h
+    window `[17:20, 18:20)`, 1 hit: `.173` 10,442 / 11,600 ms scanning
+    **2.23 TB / 500 M rows** → `.174` cold 3,336, warm **1,743 / 1,690 ms**
+    scanning **1.5 GB / 502 k rows** (O2 1,049 ms; its other run tripped
+    `MemoryCircuitBreakerError`). Per follower `input=154 (with_bloom=6,
+    without_bloom=148)` → `per-file blooms: probed=148, dropped=148` (the
+    holder's follower `kept=1 (hit=1)`, 292–331 ms cold), scan branch
+    `load files 1` (69 MB compressed), `fast path fallbacks 1 (unservable:
+    1)`. Fleet counters after 10 min: `file_bloom_probe` dropped 5,070 /
+    hit 3 / no_sidecar 2,247 (logs index-off L0s — P3) / failed 0 /
+    timed_out 0. Residual 1.7 s = leader `get file_list` 440 ms (fresh
+    pods, file_list cache cold; 16–27 ms on warm pods) + follower setup
+    640–700 ms (probe ~300 cold + segment tail 69–83 segments `kept 0`).
+    Fresh-pod cold caches produced 32 growth timeouts / `budget_refused` in
+    the first 10 min (the known cold pattern; recheck warm). No
+    `error filtering via index`, no `ResourcesExhausted`.
+  - Compactor: 30/30 at 18:42:23Z (1 restart = `nats.rs:604`), lease
+    recovery done 18:58Z (90 running / 30 nodes). `.bf` passes: **27 passes,
+    median 395 s, max 445 s (was 2,958–6,227 s), busy 258 of 8,100
+    attempted (3 %, was 65–74 %)**; the remaining ~1.3 s/bucket is the
+    serial lock+query+unlock walk of 300 buckets. Candidate window
+    `[19:00, 19:10)`: 1,214 merges / 17,501 inputs / 1.46 TB, indexed active
+    **206.7 MB/s** (baseline 222.4, same band; overall 146.9 with 490
+    metrics merges of 14,983 tiny inputs), 0 OOM, max RSS 13.6 GB. 3
+    failures / 2,161 merges in 30 min: 2 metrics `open core file` on an S3
+    **503 SlowDown** burst 19:00–19:01 (48 `get_opts` errors — 30 cold
+    compactors claiming at once) + 1 known `refusing a large full rebuild`.
+  - Ingester/router: router at 19:1xZ; ingesters 4→3→2 by 19:41Z, 1 and 0
+    following. ingester-3 19:39:30Z: 4 × 503 `segment buffer full: 536 MB of
+    536 MB — object storage flushes are behind` (`aws_waf_log`, 2,296 records
+    for the client to retry) while 2 of 5 ingesters were out of rotation —
+    open item #64's shape, roll-time only so far.
+- P4 shipped in code as **`.175` = vix-arch `aca0a11c2`** (querier-only
+  change; image built, ECR push pending an SSO re-login):
+  `ZO_STORAGE_SCAN_MAX_BYTES` (default 0) caps the follower's storage scan
+  branch by Σ `compressed_size` in `storage::search` before any IO, keeps
+  the NEWEST files that fit (≥ 1), re-measures `scan_stats`, and ships a
+  `StorageScanShortfall` message through `PartialErrRefEarly` so the leader
+  reports `is_partial=true` + `function_error` naming skipped files/bytes
+  and the coverage boundary (`SegmentShortfall`'s shape; leader untouched:
+  `decoder_stream.rs` → `ScanStatsVisitor`). Counter
+  `query_storage_scan_capped_total{organization,stream_type}`. Prod value 4
+  GiB in `querier-deployment.yaml` (the incident's 9.9 GB compressed per
+  follower ≈ the whole 12.9 GB pool; 4 GiB leaves room for two concurrent
+  wide scans). Tests: `search::grpc::storage::tests` 4 (newest prefix +
+  message, no-op within budget / off, ≥ 1 file kept).
+- Still open: P2 Segment-WAL tail pre-fetch pruning (registry per-stream
+  min/max + tiny bloom; the 85 % zero-yield is the whole logs-count residual
+  AND ~0.4–2 s of every needle lookup); P3 bloom-only sidecar for logs L0s
+  (2,247 `no_sidecar` probes in 10 min — measure builder CPU under the
+  CHUNK_MB 512 brake first); `.bf` pass parallelism (300 serial bucket
+  attempts ≈ 6 min).
 
 ## 2026-09-25 — aggregate gap vs O2: data-only counts, waiting growth, un-droppable warming (.171 → .172)
 - Fix round for the root cause below (`root cause of "still slower than
