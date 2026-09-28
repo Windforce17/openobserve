@@ -87,12 +87,29 @@ pub async fn run() -> Result<(), anyhow::Error> {
     if !cfg.common.bloom_filter_enabled {
         return Ok(());
     }
-    // exclude the still-open hour: it re-pends on every fresh file and
-    // would hog the head of the date-DESC queue forever
-    let current_hour = config::utils::time::now().format("%Y/%m/%d/%H").to_string();
-    let buckets =
-        infra::file_list::query_bloom_pending_buckets(&current_hour, cfg.compact.bloom_build_batch)
-            .await?;
+    // Only SETTLED hours: the open hour and the live merge lane
+    // (`ZO_COMPACT_LIVE_LOOKBACK_HOURS`) churn — their L0s merge away within
+    // the lane and every merge output re-pends at `bloom_ver = 0`, so a `.bf`
+    // built there is rebuilt several times and mostly orphaned. Measured
+    // 2026-09-28: the two live traces hours held 2,100 of 3,200 pending
+    // files in 2 of 646 buckets; sitting at the head of the date-DESC queue
+    // they turned every pass into an hour of blob fetches under one lock
+    // while 29 other compactors timed out on it. The query side probes those
+    // files' own sidecars (`bloom_pruner::file_probe`) until they settle.
+    let settled_before =
+        settled_hour_cutoff(config::utils::time::now(), cfg.compact.live_lookback_hours);
+    let mut buckets = infra::file_list::query_bloom_pending_buckets(
+        &settled_before,
+        cfg.compact.bloom_build_batch,
+    )
+    .await?;
+    // Every compactor runs this pass on the same cadence over the same
+    // date-DESC list; walking it in a node-local order keeps them from
+    // queueing on the same bucket lock and lets one pass cover the batch.
+    {
+        use rand::{SeedableRng, rngs::StdRng, seq::SliceRandom};
+        buckets.shuffle(&mut StdRng::seed_from_u64(rand::random()));
+    }
     let total = buckets.len();
     let started = std::time::Instant::now();
     FALLBACK_BUDGET.store(
@@ -142,11 +159,19 @@ pub async fn run() -> Result<(), anyhow::Error> {
     if total > 0 {
         log::info!(
             "[COMPACTOR:BLOOM] pass: {done}/{total} buckets processed ({busy} busy elsewhere, \
-             {failed} failed) in {:?}",
+             {failed} failed) in {:?}, settled before {settled_before}",
             started.elapsed()
         );
     }
     Ok(())
+}
+
+/// The `date` (`YYYY/MM/DD/HH`) before which hours count as settled for the
+/// `.bf` queue: `now − live_lookback_hours`, floored to the hour. A lookback
+/// of 0 excludes only the open hour (the pre-2026-09-28 behavior).
+fn settled_hour_cutoff(now: chrono::DateTime<chrono::Utc>, live_lookback_hours: i64) -> String {
+    let lookback = chrono::Duration::hours(live_lookback_hours.max(0));
+    (now - lookback).format("%Y/%m/%d/%H").to_string()
 }
 
 fn parse_stream_key(stream_key: &str) -> Option<(String, String, String)> {
@@ -986,6 +1011,24 @@ fn finish_backfill_acc(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `.bf` queue stops at the live merge lane: `now − lookback`
+    /// floored to the hour, so a `date < cutoff` query excludes exactly the
+    /// hours whose files still churn; lookback 0 excludes only the open hour.
+    #[test]
+    fn settled_hour_cutoff_floors_to_the_lane_boundary() {
+        use chrono::TimeZone;
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 9, 28, 17, 43, 21)
+            .unwrap();
+        assert_eq!(settled_hour_cutoff(now, 2), "2026/09/28/15");
+        assert_eq!(settled_hour_cutoff(now, 0), "2026/09/28/17");
+        // negative lookbacks clamp to the open-hour exclusion
+        assert_eq!(settled_hour_cutoff(now, -5), "2026/09/28/17");
+        // crossing a day boundary
+        let early = chrono::Utc.with_ymd_and_hms(2026, 9, 29, 0, 10, 0).unwrap();
+        assert_eq!(settled_hour_cutoff(early, 2), "2026/09/28/22");
+    }
 
     fn composite_scope(broad: bool, explicit_fields: &str) -> config::VixBloomCompositeScope {
         config::VixBloomCompositeScope::new(broad, explicit_fields, "")
