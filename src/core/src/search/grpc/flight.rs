@@ -90,11 +90,23 @@ use crate::service::{
     },
 };
 
+/// Follower search: the session, the physical plan, the scan stats, and —
+/// when `ZO_STORAGE_SCAN_MAX_BYTES` truncated the storage scan branch — the
+/// partial-results message the caller must ship to the leader before the
+/// first batch.
 #[tracing::instrument(name = "service:search:grpc:flight:do_get::search", skip_all, fields(org_id = req.query_identifier.org_id))]
 pub async fn search(
     trace_id: &str,
     req: &FlightSearchRequest,
-) -> Result<(SessionContext, Arc<dyn ExecutionPlan>, ScanStats), Error> {
+) -> Result<
+    (
+        SessionContext,
+        Arc<dyn ExecutionPlan>,
+        ScanStats,
+        Option<String>,
+    ),
+    Error,
+> {
     let cfg = get_config();
 
     let org_id = req.query_identifier.org_id.to_string();
@@ -329,6 +341,8 @@ pub async fn search(
     let mut index_file_list = Vec::new();
     // the precomputed aggregate fast-path result over index_file_list
     let mut index_result: Option<MultiResult> = None;
+    // set when ZO_STORAGE_SCAN_MAX_BYTES truncated the storage scan branch
+    let mut storage_shortfall: Option<String> = None;
     if !parquet_file_ids.is_empty() {
         let (mut file_list, file_list_took) = get_file_list_by_ids(
             &trace_id,
@@ -520,7 +534,7 @@ pub async fn search(
                 Some(IndexOptimizeMode::SimpleHistogram(..))
             ));
         let storage_search_start = std::time::Instant::now();
-        let (tbls, stats, _) = match super::storage::search(
+        let (tbls, stats, shortfall) = match super::storage::search(
             query_params.clone(),
             latest_schema.clone(),
             &file_list,
@@ -561,6 +575,7 @@ pub async fn search(
         );
         tables.extend(tbls);
         scan_stats.add(&stats);
+        storage_shortfall = shortfall.map(|s| s.message());
     }
 
     // Scan assigned segment-WAL objects (negative ticket ids). Errors MUST
@@ -835,7 +850,7 @@ pub async fn search(
         )
     );
 
-    Ok((ctx, physical_plan, scan_stats))
+    Ok((ctx, physical_plan, scan_stats, storage_shortfall))
 }
 
 #[allow(clippy::too_many_arguments)]

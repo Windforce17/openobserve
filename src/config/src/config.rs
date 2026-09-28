@@ -2337,6 +2337,12 @@ pub struct Limit {
         help = "Soft per-query budget (bytes) on not-yet-sealed live data one segment scan may keep; crossing it logs a warning and the query CONTINUES (0 disables the warning). The hard stop is half the pod's cgroup memory limit."
     )]
     pub segment_scan_max_bytes: usize,
+    #[env_config(
+        name = "ZO_STORAGE_SCAN_MAX_BYTES",
+        default = 0,
+        help = "Per follower query, the most compressed bytes the storage scan branch (files the index could not answer or prune) may open. Past it the NEWEST files that fit are scanned and the response is marked partial with a message naming the skipped files and bytes — instead of reserving the whole shared DataFusion pool for one needle lookup. 0 disables the cap."
+    )]
+    pub storage_scan_max_bytes: usize,
     #[env_config(name = "ZO_MEM_PERSIST_INTERVAL", default = 2)] // seconds
     pub mem_persist_interval: u64,
     #[env_config(name = "ZO_WAL_WRITE_BUFFER_SIZE", default = 16384)] // 16 KB

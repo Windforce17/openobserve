@@ -647,6 +647,21 @@ pub static VIX_FILE_BLOOM_PROBE_FILES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| 
     .expect("Metric created")
 });
 
+// Follower storage scan branch capped by ZO_STORAGE_SCAN_MAX_BYTES: the
+// query kept the newest files within the budget and was marked partial.
+pub static QUERY_STORAGE_SCAN_CAPPED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "query_storage_scan_capped_total",
+            "Follower queries whose storage scan branch exceeded ZO_STORAGE_SCAN_MAX_BYTES and was truncated (partial result)",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &["organization", "stream_type"],
+    )
+    .expect("Metric created")
+});
+
 // compactor stats
 pub static COMPACT_USED_TIME: Lazy<CounterVec> = Lazy::new(|| {
     CounterVec::new(
@@ -2301,6 +2316,9 @@ fn register_metrics(registry: &Registry) {
     registry
         .register(Box::new(VIX_FILE_BLOOM_PROBE_FILES_TOTAL.clone()))
         .expect("Metric registered");
+    registry
+        .register(Box::new(QUERY_STORAGE_SCAN_CAPPED_TOTAL.clone()))
+        .expect("Metric registered");
 
     // stream stats aggregation metrics
     registry
@@ -2936,6 +2954,7 @@ mod tests {
         let _ = VIX_FAST_PATH_FALLBACK_TOTAL.clone();
         let _ = VIX_EVAL_GROWTH_TIMEOUTS_TOTAL.clone();
         let _ = VIX_FILE_BLOOM_PROBE_FILES_TOTAL.clone();
+        let _ = QUERY_STORAGE_SCAN_CAPPED_TOTAL.clone();
         let _ = BYTES_CACHE_MEMORY_SIZE.clone();
         let _ = BYTES_CACHE_ENTRY_COUNT.clone();
         let _ = BYTES_CACHE_GC_TIME.clone();

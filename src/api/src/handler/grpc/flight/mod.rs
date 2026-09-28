@@ -159,7 +159,7 @@ impl FlightService for FlightServiceImpl {
         );
 
         // prepare dataufion context
-        let (ctx, plan, lock, scan_stats) = match result {
+        let (ctx, plan, lock, scan_stats, storage_shortfall) = match result {
             Ok(v) => v,
             Err(e) => {
                 clear_session_data(&trace_id);
@@ -215,7 +215,22 @@ impl FlightService for FlightServiceImpl {
         let scan_stats_ref = get_scan_stats(&plan);
         let metrics_ref = get_cluster_metrics(&plan);
         let peak_memory_ref = get_peak_memory(&plan);
-        let partial_err_ref = get_partial_err(&plan);
+        // A storage scan branch truncated by ZO_STORAGE_SCAN_MAX_BYTES is a
+        // partial result the leader must learn about even if the stream later
+        // dies: merge it into the early partial-error message.
+        let partial_err_ref = match (get_partial_err(&plan), storage_shortfall) {
+            (Some(existing), Some(shortfall)) => {
+                let mut guard = existing.lock();
+                if !guard.is_empty() {
+                    guard.push_str("; ");
+                }
+                guard.push_str(&shortfall);
+                drop(guard);
+                Some(existing)
+            }
+            (None, Some(shortfall)) => Some(Arc::new(parking_lot::Mutex::new(shortfall))),
+            (existing, None) => existing,
+        };
 
         // One stream per output partition so they encode in parallel
         let streams =
@@ -340,6 +355,8 @@ type PlanResult = (
     Arc<dyn datafusion::physical_plan::ExecutionPlan>,
     Option<DeferredLock>,
     ScanStats,
+    // partial-results message of a truncated storage scan branch
+    Option<String>,
 );
 
 #[cfg(feature = "enterprise")]
@@ -351,10 +368,11 @@ async fn get_ctx_and_physical_plan(
     if req.super_cluster_info.is_super_cluster {
         let (ctx, physical_plan, lock, scan_stats) =
             crate::service::search::super_cluster::follower::search(trace_id, req).await?;
-        Ok((ctx, physical_plan, Some(lock), scan_stats))
+        Ok((ctx, physical_plan, Some(lock), scan_stats, None))
     } else {
-        let (ctx, physical_plan, scan_stats) = grpcFlight::search(trace_id, req).await?;
-        Ok((ctx, physical_plan, None, scan_stats))
+        let (ctx, physical_plan, scan_stats, storage_shortfall) =
+            grpcFlight::search(trace_id, req).await?;
+        Ok((ctx, physical_plan, None, scan_stats, storage_shortfall))
     }
 }
 
@@ -364,8 +382,9 @@ async fn get_ctx_and_physical_plan(
     trace_id: &str,
     req: &FlightSearchRequest,
 ) -> Result<PlanResult, infra::errors::Error> {
-    let (ctx, physical_plan, scan_stats) = grpcFlight::search(trace_id, req).await?;
-    Ok((ctx, physical_plan, None, scan_stats))
+    let (ctx, physical_plan, scan_stats, storage_shortfall) =
+        grpcFlight::search(trace_id, req).await?;
+    Ok((ctx, physical_plan, None, scan_stats, storage_shortfall))
 }
 
 fn clear_session_data(trace_id: &str) {

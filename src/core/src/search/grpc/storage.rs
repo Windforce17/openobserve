@@ -28,8 +28,7 @@ use config::{
     metrics::{self, QUERY_PARQUET_CACHE_RATIO_NODE},
     utils::size::bytes_to_human_readable,
 };
-use datafusion::execution::cache::cache_manager::FileStatisticsCache;
-use hashbrown::HashSet;
+use datafusion::{datasource::TableProvider, execution::cache::cache_manager::FileStatisticsCache};
 use infra::{
     cache::file_data,
     errors::{Error, ErrorCodes},
@@ -47,6 +46,99 @@ use crate::service::{
     },
 };
 
+/// Storage-branch search result: the registered tables, the scan stats of
+/// the files actually opened, and the shortfall when
+/// `ZO_STORAGE_SCAN_MAX_BYTES` truncated the file set.
+pub type StorageSearchTable = infra::errors::Result<(
+    Vec<Arc<dyn TableProvider>>,
+    ScanStats,
+    Option<StorageScanShortfall>,
+)>;
+
+/// Files the storage scan branch skipped because the query's compressed
+/// bytes exceeded `ZO_STORAGE_SCAN_MAX_BYTES`. Reported through the standard
+/// partial-results channel (`is_partial` + message), like
+/// [`super::segments_scan::SegmentShortfall`]: degraded and honest beats a
+/// follower that reserves the whole shared DataFusion pool for one lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageScanShortfall {
+    pub stream: String,
+    pub skipped_files: usize,
+    pub skipped_bytes: usize,
+    pub kept_files: usize,
+    pub kept_bytes: usize,
+    pub budget: usize,
+    /// `max_ts` of the oldest kept file (µs): results are complete from here
+    /// to the end of the range and exclude older data.
+    pub oldest_kept_ts: i64,
+}
+
+impl StorageScanShortfall {
+    pub fn message(&self) -> String {
+        format!(
+            "storage scan budget: {} files ({}) of {} were skipped — the scan branch of this \
+             query on {} exceeded ZO_STORAGE_SCAN_MAX_BYTES ({}); results cover the NEWEST {} \
+             files ({}) from {} onward and exclude older unindexed data — narrow the time range \
+             or filter on an indexed field",
+            self.skipped_files,
+            bytes_to_human_readable(self.skipped_bytes as f64),
+            self.skipped_files + self.kept_files,
+            self.stream,
+            bytes_to_human_readable(self.budget as f64),
+            self.kept_files,
+            bytes_to_human_readable(self.kept_bytes as f64),
+            chrono::DateTime::<chrono::Utc>::from_timestamp_micros(self.oldest_kept_ts)
+                .map(|t| t.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+                .unwrap_or_else(|| self.oldest_kept_ts.to_string()),
+        )
+    }
+}
+
+/// Keep the NEWEST files whose compressed bytes fit `budget` (always at least
+/// one), in `max_ts` DESC order, and report the rest. Newest-first because a
+/// scan-branch flood means the index could not prune a wide window: the
+/// recent end is what the query most likely wants, and the caller sees
+/// exactly where the coverage stops.
+fn apply_storage_scan_cap(
+    files: &mut Vec<FileKey>,
+    stream: &str,
+    budget: usize,
+) -> Option<StorageScanShortfall> {
+    if budget == 0 {
+        return None;
+    }
+    let total: usize = files
+        .iter()
+        .map(|f| f.meta.compressed_size.max(0) as usize)
+        .sum();
+    if total <= budget {
+        return None;
+    }
+    files.sort_unstable_by(|a, b| b.meta.max_ts.cmp(&a.meta.max_ts).then(b.id.cmp(&a.id)));
+    let mut kept_bytes = 0usize;
+    let mut kept = 0usize;
+    for file in files.iter() {
+        let bytes = file.meta.compressed_size.max(0) as usize;
+        if kept > 0 && kept_bytes + bytes > budget {
+            break;
+        }
+        kept_bytes += bytes;
+        kept += 1;
+    }
+    let oldest_kept_ts = files[kept - 1].meta.max_ts;
+    let skipped_files = files.len() - kept;
+    files.truncate(kept);
+    Some(StorageScanShortfall {
+        stream: stream.to_string(),
+        skipped_files,
+        skipped_bytes: total - kept_bytes,
+        kept_files: kept,
+        kept_bytes,
+        budget,
+        oldest_kept_ts,
+    })
+}
+
 /// search in remote object storage
 #[tracing::instrument(name = "service:search:grpc:storage", skip_all, fields(org_id = query.org_id, stream_name = query.stream_name))]
 #[allow(clippy::too_many_arguments)]
@@ -60,7 +152,7 @@ pub async fn search(
     mut index_condition: Option<IndexCondition>,
     mut fst_fields: Vec<String>,
     idx_optimize_rule: Option<IndexOptimizeMode>,
-) -> super::SearchTable {
+) -> StorageSearchTable {
     let super::QueryParams {
         trace_id,
         org_id,
@@ -74,7 +166,7 @@ pub async fn search(
     log::info!("[trace_id {trace_id}] search->storage: enter");
     let mut files = file_list.to_vec();
     if files.is_empty() {
-        return Ok((vec![], ScanStats::default(), HashSet::new()));
+        return Ok((vec![], ScanStats::default(), None));
     }
     let original_files_len = files.len();
     log::info!(
@@ -163,6 +255,32 @@ pub async fn search(
         scan_stats.original_size,
         scan_stats.compressed_size
     );
+
+    // Per-query byte budget on the scan branch (ZO_STORAGE_SCAN_MAX_BYTES):
+    // decided here, before any IO or plan, from the file_list sizes already
+    // in hand. The kept set is re-measured so scan_stats describe what runs.
+    let stream_key = format!("{org_id}/{stream_type}/{stream_name}");
+    let scan_shortfall =
+        apply_storage_scan_cap(&mut files, &stream_key, cfg.limit.storage_scan_max_bytes);
+    if let Some(shortfall) = &scan_shortfall {
+        scan_stats = match file_list::calculate_files_size(&files).await {
+            Ok(size) => size,
+            Err(err) => {
+                log::error!("[trace_id {trace_id}] calculate files size error: {err}",);
+                return Err(Error::ErrorCode(ErrorCodes::ServerInternalError(
+                    "calculate files size error".to_string(),
+                )));
+            }
+        };
+        metrics::QUERY_STORAGE_SCAN_CAPPED_TOTAL
+            .with_label_values(&[org_id.as_str(), stream_type.as_str()])
+            .inc();
+        log::warn!(
+            "[trace_id {trace_id}] search->storage: {} (kept compressed_size {})",
+            shortfall.message(),
+            scan_stats.compressed_size
+        );
+    }
 
     // check memory circuit breaker
     ingester::check_memory_circuit_breaker().map_err(|e| Error::ResourceError(e.to_string()))?;
@@ -289,7 +407,7 @@ pub async fn search(
                 .build()
         )
     );
-    Ok((tables, scan_stats, HashSet::new()))
+    Ok((tables, scan_stats, scan_shortfall))
 }
 
 /// Whether the vix index step runs for this query shape: any real (non-ALL)
@@ -399,5 +517,75 @@ mod tests {
         // inverted index off: never applicable
         assert!(!vix_search_applicable(false, false, &select));
         assert!(!vix_search_applicable(false, true, &select));
+    }
+
+    fn file(id: i64, max_ts: i64, compressed: i64) -> FileKey {
+        let mut f = FileKey::from_file_name(&format!("files/o/traces/s/2026/09/28/17/{id}.vix"));
+        f.id = id;
+        f.meta.max_ts = max_ts;
+        f.meta.min_ts = max_ts - 1_000;
+        f.meta.compressed_size = compressed;
+        f
+    }
+
+    /// The cap keeps the NEWEST files that fit and reports the rest, so the
+    /// answer is complete from the oldest kept file onward.
+    #[test]
+    fn storage_scan_cap_keeps_newest_prefix_and_reports_the_rest() {
+        // insertion order is deliberately not time order
+        let mut files = vec![
+            file(1, 100, 40),
+            file(2, 400, 40),
+            file(3, 200, 40),
+            file(4, 300, 40),
+        ];
+        let shortfall = apply_storage_scan_cap(&mut files, "o/traces/s", 100).expect("over budget");
+        assert_eq!(
+            files.iter().map(|f| f.id).collect::<Vec<_>>(),
+            vec![2, 4],
+            "newest two fit the budget"
+        );
+        assert_eq!(
+            shortfall,
+            StorageScanShortfall {
+                stream: "o/traces/s".to_string(),
+                skipped_files: 2,
+                skipped_bytes: 80,
+                kept_files: 2,
+                kept_bytes: 80,
+                budget: 100,
+                oldest_kept_ts: 300,
+            }
+        );
+        let message = shortfall.message();
+        assert!(message.contains("2 files"), "{message}");
+        assert!(message.contains("NEWEST 2 files"), "{message}");
+        assert!(
+            message.contains("1970-01-01T00:00:00Z"),
+            "µs 300 formats: {message}"
+        );
+    }
+
+    /// Within budget or disabled: untouched, no shortfall, order preserved.
+    #[test]
+    fn storage_scan_cap_is_a_no_op_within_budget_or_when_off() {
+        let original = vec![file(1, 100, 40), file(2, 400, 40)];
+        let mut files = original.clone();
+        assert_eq!(apply_storage_scan_cap(&mut files, "s", 80), None);
+        assert_eq!(files, original);
+        let mut files = original.clone();
+        assert_eq!(apply_storage_scan_cap(&mut files, "s", 0), None);
+        assert_eq!(files, original);
+    }
+
+    /// A single file larger than the budget still runs: the cap bounds the
+    /// set, it never empties it (an empty scan would be a silent blackout).
+    #[test]
+    fn storage_scan_cap_always_keeps_at_least_the_newest_file() {
+        let mut files = vec![file(1, 100, 500), file(2, 200, 500)];
+        let shortfall = apply_storage_scan_cap(&mut files, "s", 10).unwrap();
+        assert_eq!(files.iter().map(|f| f.id).collect::<Vec<_>>(), vec![2]);
+        assert_eq!((shortfall.kept_files, shortfall.skipped_files), (1, 1));
+        assert_eq!(shortfall.kept_bytes, 500);
     }
 }
