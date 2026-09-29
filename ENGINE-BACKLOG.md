@@ -300,6 +300,30 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     stream AND the page is newest-first. The residual zero-yield is the
     ≤ 1 s outward rounding plus segments whose stream range touches the
     window edge.
+  - Health check 10:10–10:22Z (35–40 min on `.177`): 49/49 pods Running,
+    0 restarts, 0 `segment buffer full`, ingesters 85,559 requests / 15 min
+    all 2xx, 226–848 segments shipped per ingester per 10 min (p50 210–278
+    ms, max ≤ 565 ms). Pipeline: pending 29, oldest 9 s, building 752,
+    built-retained 31,630 (1 h), sweeper 21,643 deleted / 15 min, 0 L0
+    orphans; builders 6,237 built / 2 skipped / 0 gone in 15 min — the 2
+    skips were S3 **`503 SlowDown`** GETs on fresh-ingester segment keys
+    (10 retries / 5.8 s), rebuilt 8 min later; that signature runs 1–11/h
+    for days (not new). `file_list_jobs` 0 pending / 21 running. DB: 0
+    statements > 1 s, 252 connections, 1,798 MB. Querier memory: kubelet
+    `rss` 7.8–10.2 GiB (yesterday's 6.6–8.9 on 3-day-warm pods) while
+    `kubectl top`'s working set reads 16–21 GiB and `usage` sits at the
+    24 GiB limit — the difference is file page cache from the disk-cache
+    fill (542 GiB written per pod in 40 min), reclaimable, not OOM
+    exposure. `Resources exhausted` (12 GiB shared pool) 1 + 16 in the two
+    hours vs 6–295/h over the previous day — unchanged. Battery vs O2
+    (window ending 10:05Z, cold/warm): logs count 1 h 483/153 vs 70 ms;
+    `SELECT * LIMIT 50` 1,243/389 vs 1,125/226; traces count 24 h
+    2,100/533 vs 4,676/1,033 (complete on both); traces top-5 services 1 h
+    7,707/747 vs 218/228 (the known aggregate gap, cold sidecars); needle
+    1 h 1,577/1,153 vs 222/101 (cold pods; 351–398 ms at 09:57Z). Logs
+    histogram with alias `b`/`x` fails ONLY because `b`, `x` (and `bucket`)
+    are real columns in obs logs/default — **22,263 fields vs O2's 6,204**;
+    with a non-colliding alias 767 vs 225 ms. Verdict: healthy.
 - Left open from the audit: item 6 (`pg_stat_statements` reset for a clean
   window — do after a day of `.177`), item 7 (`file_list_deleted` hourly
   lease UPDATE; `stage_index_generation` INSERT+UPDATE), item 8 (`meta` reads
