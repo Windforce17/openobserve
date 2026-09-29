@@ -508,6 +508,33 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
        counts/percentiles (10 % coverage on the 6 h p99). Fix: apply the
        cap only to row-returning LIMIT shapes (`SimpleSelect`); aggregates
        over unindexed files run whole (admission-bounded) or fail loudly.
+- **2026-09-30 — owner decisions: keep the scan cap ONLY for `SELECT … LIMIT
+  n`; pool size unchanged; `.bf` chunking by the three configured bloom-only
+  fields (`trace_id, span_id, reference.parent_span_id`) is the agreed fix
+  direction.** Shipped as two releases (both vix-arch, both `COLUMNS`-safe):
+  - `.178` = `2d7b35536` (all roles, GitOps #574, 16:54–16:57Z, 0 restarts):
+    `storage.rs::scan_cap_budget` returns the configured budget only for
+    `SimpleSelect(n > 0)`; **but the call site still passed the raw config
+    value** — a rejected multi-op edit dropped that hunk, the resulting
+    `unused variable` warning was filtered out of the build log, and the
+    prod check showed aggregates still `partial`. Lesson recorded.
+  - `.179` = `c6042f579` (querier-only, GitOps #575, 17:10–17:12Z, 0
+    restarts): the one-line wiring. Verified on 10/10 `.179` queriers with
+    the motivating queries (`use_cache=false`, cold/warm):
+    - logs `WHERE service_name='llm-router'` count 24 h: **`partial=false`**,
+      175,315,666 rows (O2 177,705,749 on a 0.4 % larger record set — corpus
+      difference, not truncation), 3,351 / 1,045 ms vs O2 330 / 434 ms — the
+      residual is the ~105 index-off logs L0 files scanned in full (the L0
+      cheap-index item).
+    - traces `p99 by service` 6 h: **`partial=false`**, 2.63 B rows scanned
+      (was 210 M), vida-bizserver p99 **251.5 ms vs O2 251.2 ms** (was 228 /
+      180 ms on 10 % of the rows), 5,157 / 3,760 ms vs O2 4,357 / error.
+    - logs `SELECT * WHERE body='<absent>' ORDER BY _timestamp DESC LIMIT 50`
+      6 h: still capped (`partial=true`, "266 files (17.99 GB) of 343 were
+      skipped"), 8.7–20 s cold after the roll.
+    - During the last pod's replacement one run of each aggregate returned
+      `partial=true` with `connect to gRPC node error` — the roll, not the
+      cap; clean on the settled fleet.
 
 ## 2026-09-28 — `.173` definitive numbers; needle lookups full-scanned the unstamped hours (fix: per-file sidecar bloom probes + a settled-only `.bf` queue)
 - Fleet at 14:52Z, 3 days undisturbed: queriers 10/10 `.173` (7 pods 3 d,
