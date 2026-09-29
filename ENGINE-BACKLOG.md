@@ -235,6 +235,76 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
   no statement > 1 s, `slow statement` 100/10 min (ingester 8, compactor 71,
   querier 21) vs 2,349 at the peak and ~700 during the drain; commit
   latency 0.4–0.8 ms outside the :00 minute.
+- **`.177` rolled 2026-09-29 = vix-arch `27df623dc`** (ECR index
+  `sha256:6a019132…`, binary `39da83d1…`; GitOps #572 querier 09:41Z, #573
+  compactor + ingester/router 09:44Z; every role on `.177` by 09:48:27Z, 0
+  restarts, 0 `segment buffer full`). Contents = the P2 v2 spec above plus
+  audit items 1–5:
+  - `cbfd5cf63` settings cache keeps confirmed misses (`Option<SystemSetting>`).
+  - `6b5f9b9a9` `file_list` delete-by-id carries `date` (1 partition instead
+    of 147 in `EXPLAIN`); `drop_empty_partitions` parses with `NaiveDate`
+    and cuts at `data_retention_days + 1` — upstream has the same bug
+    (`93764d3ea`, still in upstream/main).
+  - `27df623dc` `wal_segments.stream_ranges` (offset-seconds JSON, outward
+    rounding), uploader `FoldedMeta`, querier `prune_and_cap` (fail-open,
+    full-page shortfall kept), `query_unbuilt` newest-first; PG probes
+    reshaped: `has_claimable` = UNION ALL of two `ORDER BY` + `LIMIT 1`
+    index probes, `has_late_claimable` `ORDER BY created_at`, status
+    literals inlined, `status <> 2` spelled `status < 2 OR status > 2`;
+    `(status, updated_at)` index added, `object_key_idx` removed from
+    `create_indexes`. Tests: infra `wal_segments` 29 (5 new: outward
+    rounding + clamp, malformed decode, `range_for` alignment, `add`
+    validation, sqlite round trip + poisoned column fails open),
+    segment_wal uploader 7, core segments_scan 42 (2 new prune tests), jobs
+    segments 37.
+  - DDL done by hand under `lock_timeout 3 s`, each first try: 09:00:39Z
+    `ADD COLUMN stream_ranges`, `CREATE INDEX CONCURRENTLY
+    wal_segments_status_updated_at_idx`, `REINDEX INDEX CONCURRENTLY` ×4
+    (42–146 MB → 0.75–2 MB each); 09:48:52Z `DROP INDEX CONCURRENTLY
+    wal_segments_object_key_idx` after the roll. `wal_segments` total
+    **595 MB → 53 MB**. Also 08:54Z `DROP DATABASE obs20260803` (12 GB) and
+    `obs20260817` (1.1 GB) — 0 connections, no secret/configmap/GitOps
+    reference; 08:57Z the ten 0-row `file_list_p_202608{19..28}` partitions
+    (`count(*)` = 0 re-checked before each): `file_list` 157 → 147
+    partitions, 4,345 → 1,421 MB; our database 5,151 → **2,227 MB**.
+  - Statement plans, `PREPARE` + `EXPLAIN ANALYZE` on prod with the exact
+    new texts (generic plan, buffers old → new): `has_claimable` 2,468 → 215
+    (9,134 → 226 with nothing claimable), `has_late_claimable` 1,335 → 2,
+    `claimable_stats` 1,235 → 197, `count_unbuilt_older_than` 9,134 → 81,
+    `list_expired` 9,134 + sort → 135 incremental sort, `list_l0_orphan_rows`
+    9,134 → 73, `query_unbuilt` 14,125 + temp files / 56 ms → 1,287 / 3 ms.
+  - DB, 5-min windows before (09:22Z) → after (09:50Z): `wal_segments` seq
+    scans **10.4/s → 0.09/s** (233 k → 2.8 k rows/s), its SELECTs 16/s at
+    **2,022 → 103 buffers/call, 5.1 → 1.8 ms**; `system_settings` statement
+    **107/s → 0**; whole-DB commits 225 → 110/s, buffer hits 86 k → 25 k/s;
+    row writes unchanged (169 ins / 77 upd / 128 del per s; `wal_segments`
+    8.9 / 43 / 8.3). CloudWatch through the roll: CommitLatency 0.34–0.57 ms
+    (one 2.7 ms minute at 09:52Z), WriteIOPS 1.2–2.2 k, CPU 21–36 %. The
+    remaining compactor `slow statement`s (59/10 min) are all upstream's
+    `SELECT id, module, key1 … FROM meta` at ~4.1 s (audit item 8).
+  - Ranges: 5,815 rows carried them by 09:58Z, 0 misaligned / inverted /
+    out-of-segment across 141 k pairs, max `hi` overshoot 0.99 s; 76 streams
+    per segment on average, 131 B stored, rows 1,265 B with vs 1,031 B
+    without (inline, TOAST unchanged at 5.6 MB). Geometry: a segment spans
+    1.2 h p50 / 1.8 h p90 while a stream's own range inside it is seconds
+    wide (p90 < 0.01 h) — one late frame stretches every segment over every
+    recent window.
+  - **Tail effect** (same battery, `[end−1 h, end)` with `end` 10–15 min in
+    the past, `use_cache=false`, leader `candidates` / follower loaded →
+    zero-yield; pre = `.175` at 09:26Z, post = `.177` at 09:57Z with 837 of
+    851 unbuilt rows ranged): logs count 1 h **595 → 49 candidates, 93 % →
+    16 % zero-yield**, warm 965–990 → **138–165 ms**; traces count 1 h **692
+    → 205, 71 % → 4 %**, warm 1,050–1,602 → **278–285 ms**; traces needle
+    1 h **701 → 217, 70 % → 4 %**, warm 1,504–1,581 → **351–398 ms**. Better
+    than `.176` measured (52 / 19 %, 198 / 8 %) because the offsets are per
+    stream AND the page is newest-first. The residual zero-yield is the
+    ≤ 1 s outward rounding plus segments whose stream range touches the
+    window edge.
+- Left open from the audit: item 6 (`pg_stat_statements` reset for a clean
+  window — do after a day of `.177`), item 7 (`file_list_deleted` hourly
+  lease UPDATE; `stage_index_generation` INSERT+UPDATE), item 8 (`meta` reads
+  4 s), Performance Insights (owner call). Pool size stays as is (owner
+  call, 2026-09-29).
 
 ## 2026-09-28 — `.173` definitive numbers; needle lookups full-scanned the unstamped hours (fix: per-file sidecar bloom probes + a settled-only `.bf` queue)
 - Fleet at 14:52Z, 3 days undisturbed: queriers 10/10 `.173` (7 pods 3 d,
