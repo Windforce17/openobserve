@@ -55,6 +55,15 @@ use crate::errors::{Error, Result};
 pub const SEGMENT_KEY_PREFIX: &str = "wal_segments/";
 
 const TABLE: &str = "wal_segments";
+/// Every row read names its columns. `SELECT *` / `RETURNING *` in a
+/// sqlx-cached prepared statement pins the result descriptor; the moment a
+/// boot-time `add_column` lands on the table, every OTHER pod's cached plan
+/// fails with `cached plan must not change result type` until its connection
+/// recycles (`max_lifetime` 1,800 s) — 2026-09-29 09:00–09:29Z: 1,810 such
+/// errors, ~330 failed searches (`query_unbuilt`), sweeper and claim stalls.
+/// An explicit list keeps the descriptor stable across column additions.
+/// `l0_planned` is deliberately absent: it is read by its own statement.
+const COLUMNS: &str = "id, node_uuid, seq, object_key, min_ts, max_ts, size, streams, stream_ranges, status, builder_node, created_at, updated_at";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(i16)]
@@ -1142,7 +1151,7 @@ UPDATE wal_segments
 SET status = $1, builder_node = $2, updated_at = $3
 WHERE id IN (SELECT id FROM candidates)
   AND (SELECT count(*) FROM candidates) >= $7
-RETURNING *;"#
+RETURNING {COLUMNS};"#
             )
         };
         let mut rows: Vec<SegmentRow> = match order {
@@ -1168,7 +1177,7 @@ RETURNING *;"#
                 if late_lane <= 0 {
                     return Ok(Vec::new());
                 }
-                sqlx::query_as(
+                let sql = format!(
                     r#"WITH candidates AS (
     SELECT id FROM wal_segments
     WHERE status = $4 AND (created_at - max_ts) >= $5 AND created_at < $6
@@ -1180,18 +1189,19 @@ UPDATE wal_segments
 SET status = $1, builder_node = $2, updated_at = $3
 WHERE id IN (SELECT id FROM candidates)
   AND (SELECT count(*) FROM candidates) >= $8
-RETURNING *;"#,
-                )
-                .bind(SegmentStatus::Building as i16)
-                .bind(node)
-                .bind(now)
-                .bind(SegmentStatus::Pending as i16)
-                .bind(late_lane)
-                .bind(late_boundary)
-                .bind(limit)
-                .bind(min_batch)
-                .fetch_all(&pool)
-                .await
+RETURNING {COLUMNS};"#
+                );
+                sqlx::query_as(&sql)
+                    .bind(SegmentStatus::Building as i16)
+                    .bind(node)
+                    .bind(now)
+                    .bind(SegmentStatus::Pending as i16)
+                    .bind(late_lane)
+                    .bind(late_boundary)
+                    .bind(limit)
+                    .bind(min_batch)
+                    .fetch_all(&pool)
+                    .await
             }
         }
         .map_err(|e| Error::Message(format!("[WAL_SEGMENTS] claim_pending node={node}: {e}")))?;
@@ -1466,7 +1476,7 @@ WHERE id = $3 AND status != $4 AND l0_planned != '' AND updated_at < $5;"#,
         // over-cap policy, instead of the oldest page (the pre-2026-09-29
         // `min_ts ASC` cut the newest segments exactly when a backlog existed).
         let sql = format!(
-            r#"SELECT * FROM wal_segments
+            r#"SELECT {COLUMNS} FROM wal_segments
 WHERE max_ts >= $1 AND min_ts <= $2 AND streams LIKE $3 ESCAPE '\'
   AND (status < {built} OR status > {built} OR (status = {built} AND updated_at >= $4))
 ORDER BY max_ts DESC, id DESC
@@ -1495,7 +1505,7 @@ LIMIT $5;"#,
         // literal status + `(status, updated_at)`: an ordered index scan that
         // stops after `limit` rows instead of a full scan and sort
         let sql = format!(
-            r#"SELECT * FROM wal_segments
+            r#"SELECT {COLUMNS} FROM wal_segments
 WHERE status = {built} AND updated_at < $1
 ORDER BY updated_at ASC, id ASC
 LIMIT $2;"#,
@@ -1527,7 +1537,7 @@ LIMIT $2;"#,
         let pool = CLIENT_RO.clone();
         DB_QUERY_NUMS.with_label_values(&["select", TABLE]).inc();
         let sql = format!(
-            "SELECT * FROM wal_segments WHERE id IN ({}) ORDER BY min_ts ASC, id ASC;",
+            "SELECT {COLUMNS} FROM wal_segments WHERE id IN ({}) ORDER BY min_ts ASC, id ASC;",
             ids_csv(ids)
         );
         let rows: Vec<SegmentRow> = sqlx::query_as(&sql)
@@ -1800,27 +1810,27 @@ ON CONFLICT (node_uuid, seq) DO NOTHING;"#,
         // The two lane SQL texts differ ONLY in the ORDER BY direction
         // (M13 aging lane); predicate and floor semantics are shared.
         let select_sql = match order {
-            ClaimOrder::NewestFirst => {
-                r#"SELECT * FROM wal_segments
+            ClaimOrder::NewestFirst => format!(
+                r#"SELECT {COLUMNS} FROM wal_segments
 WHERE (status = $1 AND ($5 <= 0 OR (created_at - max_ts) < $5)) OR (status = $2 AND updated_at < $3)
 ORDER BY created_at DESC, id DESC
 LIMIT $4;"#
-            }
-            ClaimOrder::OldestFirst => {
-                r#"SELECT * FROM wal_segments
+            ),
+            ClaimOrder::OldestFirst => format!(
+                r#"SELECT {COLUMNS} FROM wal_segments
 WHERE (status = $1 AND ($5 <= 0 OR (created_at - max_ts) < $5)) OR (status = $2 AND updated_at < $3)
 ORDER BY created_at ASC, id ASC
 LIMIT $4;"#
-            }
+            ),
             // Late lane: Pending-only (a crashed late claim's Building row
             // recovers through the fresh lanes' stale arm); $3 is the fixed
             // cohort boundary here, $5 the lane width.
-            ClaimOrder::LateOldestFirst => {
-                r#"SELECT * FROM wal_segments
+            ClaimOrder::LateOldestFirst => format!(
+                r#"SELECT {COLUMNS} FROM wal_segments
 WHERE status = $1 AND (created_at - max_ts) >= $5 AND created_at < $3
 ORDER BY created_at ASC, id ASC
 LIMIT $4;"#
-            }
+            ),
         };
         let mut tx = client.begin().await.map_err(|e| {
             Error::Message(format!(
@@ -1832,7 +1842,7 @@ LIMIT $4;"#
         } else {
             stale_before
         };
-        let rows: Vec<SegmentRow> = match sqlx::query_as(select_sql)
+        let rows: Vec<SegmentRow> = match sqlx::query_as(&select_sql)
             .bind(SegmentStatus::Pending as i16)
             .bind(SegmentStatus::Building as i16)
             .bind(third)
@@ -1884,7 +1894,7 @@ LIMIT $4;"#
             ClaimOrder::OldestFirst | ClaimOrder::LateOldestFirst => "ASC",
         };
         let sql = format!(
-            "SELECT * FROM wal_segments WHERE id IN ({csv}) ORDER BY created_at {dir}, id {dir};"
+            "SELECT {COLUMNS} FROM wal_segments WHERE id IN ({csv}) ORDER BY created_at {dir}, id {dir};"
         );
         let rows: Vec<SegmentRow> = match sqlx::query_as(&sql).fetch_all(&mut *tx).await {
             Ok(v) => v,
@@ -2144,43 +2154,47 @@ WHERE id = $3 AND status != $4 AND l0_planned != '' AND updated_at < $5;"#,
         limit: i64,
     ) -> Result<Vec<SegmentMeta>> {
         let pool = CLIENT_RO.clone();
-        let rows: Vec<SegmentRow> = sqlx::query_as(
-            r#"SELECT * FROM wal_segments
+        let sql = format!(
+            r#"SELECT {COLUMNS} FROM wal_segments
 WHERE max_ts >= $1 AND min_ts <= $2 AND streams LIKE $3 ESCAPE '\'
   AND (status != $4 OR (status = $4 AND updated_at >= $5))
 ORDER BY max_ts DESC, id DESC
-LIMIT $6;"#,
-        )
-        .bind(start)
-        .bind(end)
-        .bind(pattern)
-        .bind(SegmentStatus::Built as i16)
-        .bind(include_built_after)
-        .bind(limit)
-        .fetch_all(&pool)
-        .await
-        .map_err(|e| {
-            Error::Message(format!(
-                "[WAL_SEGMENTS] query_unbuilt pattern={pattern} range=({start}, {end}): {e}"
-            ))
-        })?;
+LIMIT $6;"#
+        );
+        let rows: Vec<SegmentRow> = sqlx::query_as(&sql)
+            .bind(start)
+            .bind(end)
+            .bind(pattern)
+            .bind(SegmentStatus::Built as i16)
+            .bind(include_built_after)
+            .bind(limit)
+            .fetch_all(&pool)
+            .await
+            .map_err(|e| {
+                Error::Message(format!(
+                    "[WAL_SEGMENTS] query_unbuilt pattern={pattern} range=({start}, {end}): {e}"
+                ))
+            })?;
         rows_into_metas(rows)
     }
 
     pub(super) async fn list_expired(cutoff: i64, limit: i64) -> Result<Vec<SegmentMeta>> {
         let pool = CLIENT_RO.clone();
-        let rows: Vec<SegmentRow> = sqlx::query_as(
-            r#"SELECT * FROM wal_segments
+        let sql = format!(
+            r#"SELECT {COLUMNS} FROM wal_segments
 WHERE status = $1 AND updated_at < $2
 ORDER BY updated_at ASC, id ASC
-LIMIT $3;"#,
-        )
-        .bind(SegmentStatus::Built as i16)
-        .bind(cutoff)
-        .bind(limit)
-        .fetch_all(&pool)
-        .await
-        .map_err(|e| Error::Message(format!("[WAL_SEGMENTS] list_expired cutoff={cutoff}: {e}")))?;
+LIMIT $3;"#
+        );
+        let rows: Vec<SegmentRow> = sqlx::query_as(&sql)
+            .bind(SegmentStatus::Built as i16)
+            .bind(cutoff)
+            .bind(limit)
+            .fetch_all(&pool)
+            .await
+            .map_err(|e| {
+                Error::Message(format!("[WAL_SEGMENTS] list_expired cutoff={cutoff}: {e}"))
+            })?;
         rows_into_metas(rows)
     }
 
@@ -2198,7 +2212,7 @@ LIMIT $3;"#,
     pub(super) async fn get_by_ids(ids: &[i64]) -> Result<Vec<SegmentMeta>> {
         let pool = CLIENT_RO.clone();
         let sql = format!(
-            "SELECT * FROM wal_segments WHERE id IN ({}) ORDER BY min_ts ASC, id ASC;",
+            "SELECT {COLUMNS} FROM wal_segments WHERE id IN ({}) ORDER BY min_ts ASC, id ASC;",
             ids_csv(ids)
         );
         let rows: Vec<SegmentRow> = sqlx::query_as(&sql)
