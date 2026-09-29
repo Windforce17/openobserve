@@ -470,6 +470,44 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     after each roll); (4) span-metric pre-aggregation for percentiles; the
     tail prefetch (#2) and the straggler merge lane (#3) drop to after these
     — real but 0.1–1 s.
+  - **Corrections after a second look (12:30Z), three findings:**
+    1. The 24 h needle's seconds are NOT the fallback scan. Re-run 4,902 ms:
+       per follower the `.bf` bucket stage took **2.3–3.9 s** ("bloom
+       filter reduced file_list from 1,352 to 1 in 3,907 ms") because the
+       bucketing has degenerated to **one `.bf` object per file**:
+       traces/default hours 09-28 18Z…09-29 08Z show `files = stamped =
+       distinct bloom_ver` (534/533/533 …). `compact::bloom` chunks by the
+       per-field `(field, num_blocks)` signature and the AUTO-ID bloom-only
+       fields vary per file, so every file is its own chunk (the comment
+       says "a couple of chunks at most"). 874 group fetches per follower
+       (footer + row ranges each) instead of ~24. Per-file probes for the
+       ~480 unstamped recent files: 515 ms. The FP fallback scans (1–2
+       files of 140–330 MB compressed, disk-cached, column-pruned) are
+       **97–699 ms**, not 4 s. Fix: chunk `.bf` only by the configured
+       bloom-only fields' signature (pad or ragged per-file `num_blocks` in
+       the footer), 256 files per chunk → ~55 objects per 24 h → bucket
+       stage ~150 ms; FPP 1e-5 stays a separate, smaller lever.
+    2. top-5 services 24 h is read-count bound, not bandwidth: per follower
+       ~1,300 files → **~14 k index range reads (~10.6 per file), ~600 MB**;
+       90 %-disk-cached followers 2.3–3.3 s ≈ 5 k IOPS against the gp3
+       volume's **provisioned 4,096 IOPS** (class `gp3-1024`: iops 4096,
+       throughput 1024 MB/s) → IOPS-throttled even warm; cold followers
+       [INFERENCE] 14 k remote GETs at `ZO_VIX_SEARCH_CONCURRENCY=64` ×
+       ~65 ms ≈ 14 s. Levers: coalesce a file's needed index sections
+       into 1–2 ranges (→ ~1.3 k reads), higher-IOPS/instance-store cache,
+       persistent cache across rolls, fewer files.
+    3. `ZO_STORAGE_SCAN_MAX_BYTES` (P4, `.175`, `storage.rs::
+       apply_storage_scan_cap`): applied to EVERY scan-branch file set by
+       Σ `compressed_size` before IO, keeps the newest files, flags
+       `partial` + message, `QUERY_STORAGE_SCAN_CAPPED_TOTAL`. It was
+       added for `SELECT * … LIMIT 50` on logs whose L0s are index-off
+       (6 h scan = 6.58 TB / 18.7 s and pool exhaustion) — the scan branch
+       downloads whole files into the disk cache before DataFusion streams
+       them, so "streaming" bounds neither wall time nor the download
+       volume. It is shape-blind: the same cap silently truncates
+       counts/percentiles (10 % coverage on the 6 h p99). Fix: apply the
+       cap only to row-returning LIMIT shapes (`SimpleSelect`); aggregates
+       over unindexed files run whole (admission-bounded) or fail loudly.
 
 ## 2026-09-28 — `.173` definitive numbers; needle lookups full-scanned the unstamped hours (fix: per-file sidecar bloom probes + a settled-only `.bf` queue)
 - Fleet at 14:52Z, 3 days undisturbed: queriers 10/10 `.173` (7 pods 3 d,
