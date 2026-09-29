@@ -3953,6 +3953,7 @@ mod tests {
             builder_node: String::new(),
             created_at: min_ts,
             updated_at: min_ts,
+            stream_ranges: Vec::new(),
         }
     }
 
