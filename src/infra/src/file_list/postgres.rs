@@ -2417,15 +2417,35 @@ INSERT INTO {table} (account, org, stream, date, file, deleted, min_ts, max_ts, 
                 .with_label_values(&["delete_id", "file_list"])
                 .inc();
             let result = if file.id > 0 {
-                sqlx::query(
-                    r#"DELETE FROM file_list
-                       WHERE id = $1 AND index_generation = $2 AND index_size = $3;"#,
-                )
-                .bind(file.id)
-                .bind(file.meta.index_generation)
-                .bind(file.meta.index_size)
-                .execute(&mut *tx)
-                .await?
+                // `date` is the partition key: without it this probes every
+                // daily partition's id index (157 partitions, 1,181 buffers per
+                // call on prod, 2026-09-29). Keys that do not parse keep the
+                // unpruned statement — never a silent skip.
+                match parse_file_key_columns(&file.key) {
+                    Ok((_, date_key, _)) => {
+                        sqlx::query(
+                            r#"DELETE FROM file_list
+                               WHERE date = $1 AND id = $2 AND index_generation = $3 AND index_size = $4;"#,
+                        )
+                        .bind(date_key)
+                        .bind(file.id)
+                        .bind(file.meta.index_generation)
+                        .bind(file.meta.index_size)
+                        .execute(&mut *tx)
+                        .await?
+                    }
+                    Err(_) => {
+                        sqlx::query(
+                            r#"DELETE FROM file_list
+                               WHERE id = $1 AND index_generation = $2 AND index_size = $3;"#,
+                        )
+                        .bind(file.id)
+                        .bind(file.meta.index_generation)
+                        .bind(file.meta.index_size)
+                        .execute(&mut *tx)
+                        .await?
+                    }
+                }
             } else {
                 let (stream_key, date_key, file_name) =
                     parse_file_key_columns(&file.key).map_err(|e| Error::Message(e.to_string()))?;
@@ -3862,12 +3882,15 @@ async fn run_maintenance_inner(pool: &sqlx::Pool<Postgres>) -> Result<()> {
 
 async fn drop_empty_partitions(pool: &sqlx::Pool<Postgres>) -> Result<()> {
     let cfg = get_config();
-    let safety_days = std::cmp::max(
-        cfg.limit.ingest_allowed_upto / 24 + 1,
-        cfg.compact.data_retention_days,
-    );
-    let today = Utc::now();
-    let cutoff_date = today - Duration::days(safety_days);
+    // Only days whose rows retention has already removed are candidates: a
+    // day older than `data_retention_days` cannot hold live data, and a late
+    // row for such a day is retention's next victim whether it lands in a
+    // recreated partition or in `file_list_default`. The former cutoff
+    // (`ingest_allowed_upto / 24 + 1` = 366 days on prod) kept a year of empty
+    // partitions — 124 of 157, 2.99 GB of index pages — every one of which the
+    // unpruned statements had to open (2026-09-29).
+    let safety_days = cfg.compact.data_retention_days.max(0) + 1;
+    let cutoff_date = (Utc::now() - Duration::days(safety_days)).date_naive();
 
     let tables = ["file_list", "file_list_history", "file_list_dump_stats"];
     for table in &tables {
@@ -3900,11 +3923,12 @@ ORDER BY c.relname
                 continue;
             }
 
-            // Parse date
-            let Ok(partition_date) = DateTime::parse_from_str(date_str, "%Y%m%d") else {
+            // Parse date. `DateTime::parse_from_str` needs an offset in the
+            // input and rejected every `YYYYMMDD` name with `NotEnough`, so
+            // this loop had never dropped a partition (prod logs, 2026-09-29).
+            let Ok(partition_date) = NaiveDate::parse_from_str(date_str, "%Y%m%d") else {
                 continue;
             };
-            let partition_date = partition_date.with_timezone(&Utc);
 
             // Skip partitions newer than cutoff
             if partition_date >= cutoff_date {
