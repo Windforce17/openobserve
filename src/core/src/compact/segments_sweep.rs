@@ -723,7 +723,6 @@ mod tests {
             builder_node: String::new(),
             created_at: 0,
             updated_at: 0,
-            stream_ranges: Vec::new(),
         };
         let id = wal_segments::add(&meta)
             .await

@@ -55,8 +55,6 @@ use crate::errors::{Error, Result};
 pub const SEGMENT_KEY_PREFIX: &str = "wal_segments/";
 
 const TABLE: &str = "wal_segments";
-/// Per-(segment, stream) time ranges — see [`SegmentMeta::stream_ranges`].
-const STREAMS_TABLE: &str = "wal_segment_streams";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(i16)]
@@ -113,17 +111,6 @@ pub struct SegmentMeta {
     pub builder_node: String,
     pub created_at: i64,
     pub updated_at: i64,
-    /// WRITE-SIDE ONLY: per-stream `(stream key, min_ts, max_ts)` of the
-    /// frames the segment carries, stored in `wal_segment_streams` by
-    /// [`add`]. `min_ts`/`max_ts` above span every stream, so a query for one
-    /// stream used to fetch and decode every segment any late frame of
-    /// another stream stretched into its window (85 % zero-yield on prod);
-    /// [`query_unbuilt`] prunes by the per-stream range when a row exists and
-    /// keeps today's whole-segment behavior when it does not (rows
-    /// registered before this column shipped). Rows read back from the
-    /// table leave it empty.
-    #[serde(default)]
-    pub stream_ranges: Vec<(String, i64, i64)>,
 }
 
 /// Raw row as stored — `streams` is the JSON text, `status` the raw smallint.
@@ -178,7 +165,6 @@ impl SegmentRow {
             builder_node: self.builder_node,
             created_at: self.created_at,
             updated_at: self.updated_at,
-            stream_ranges: Vec::new(),
         })
     }
 }
@@ -297,24 +283,6 @@ fn validate_for_add(meta: &SegmentMeta) -> Result<()> {
             "[WAL_SEGMENTS] add object_key={}: degenerate time range [{}, {}]",
             meta.object_key, meta.min_ts, meta.max_ts
         )));
-    }
-    // per-stream ranges must be exact-or-conservative: a range that
-    // understates a stream would hide its rows from queries (the ONLY way
-    // this feature can lose data), so every range must sit inside the
-    // segment range and name a stream the segment carries
-    for (stream, min_ts, max_ts) in &meta.stream_ranges {
-        if !meta.streams.iter().any(|s| s == stream) {
-            return Err(Error::InvalidFileMeta(format!(
-                "[WAL_SEGMENTS] add object_key={}: stream range for {stream:?} names a stream the segment does not carry",
-                meta.object_key
-            )));
-        }
-        if *min_ts <= 0 || max_ts < min_ts || *min_ts < meta.min_ts || *max_ts > meta.max_ts {
-            return Err(Error::InvalidFileMeta(format!(
-                "[WAL_SEGMENTS] add object_key={}: degenerate stream range {stream:?} [{min_ts}, {max_ts}] outside [{}, {}]",
-                meta.object_key, meta.min_ts, meta.max_ts
-            )));
-        }
     }
     Ok(())
 }
@@ -713,13 +681,6 @@ pub async fn object_keys_under(prefix: &str) -> Result<Vec<String>> {
 /// still visible — see DESIGN-SEGMENT-WAL.md dup/gap rules). Ordered by
 /// `min_ts`, then id; at most `limit` rows (callers pass one more than their
 /// own cap so an over-limit backlog stays detectable).
-///
-/// Overlap is decided per STREAM when the segment registered its per-stream
-/// range (`wal_segment_streams`): a segment whose frames for this stream lie
-/// outside the window is not returned, however far another stream's late
-/// frames stretched the segment's own `min_ts`/`max_ts`. Segments without a
-/// per-stream row (registered by an older image) keep the whole-segment
-/// overlap — the pre-2026-09-29 behavior, never a silent drop.
 pub async fn query_unbuilt(
     org: &str,
     stream_type: &str,
@@ -739,41 +700,12 @@ pub async fn query_unbuilt(
     }
     let limit = i64::try_from(limit).unwrap_or(i64::MAX);
     let pattern = stream_like_pattern(org, stream_type, stream)?;
-    let stream_key = format!("{org}/{stream_type}/{stream}");
     if use_postgres() {
-        postgres::query_unbuilt(
-            start,
-            end,
-            &pattern,
-            &stream_key,
-            include_built_after_micros,
-            limit,
-        )
-        .await
+        postgres::query_unbuilt(start, end, &pattern, include_built_after_micros, limit).await
     } else {
-        sqlite::query_unbuilt(
-            start,
-            end,
-            &pattern,
-            &stream_key,
-            include_built_after_micros,
-            limit,
-        )
-        .await
+        sqlite::query_unbuilt(start, end, &pattern, include_built_after_micros, limit).await
     }
 }
-
-/// The shared `query_unbuilt` statement. `s.*` keeps the row shape of every
-/// other read; the LEFT JOIN resolves at most one range row per segment
-/// (primary key `(segment_id, stream)`), and a missing row keeps the
-/// whole-segment overlap already enforced on `s`.
-const QUERY_UNBUILT_SQL: &str = r#"SELECT s.* FROM wal_segments s
-LEFT JOIN wal_segment_streams r ON r.segment_id = s.id AND r.stream = $6
-WHERE s.max_ts >= $1 AND s.min_ts <= $2 AND s.streams LIKE $3 ESCAPE '\'
-  AND (s.status != $4 OR (s.status = $4 AND s.updated_at >= $5))
-  AND (r.segment_id IS NULL OR (r.max_ts >= $1 AND r.min_ts <= $2))
-ORDER BY s.min_ts ASC, s.id ASC
-LIMIT $7;"#;
 
 /// Built segments whose lease timestamp (`updated_at`, i.e. build-completion
 /// time) is older than `built_before_secs` — sweeper input, oldest first.
@@ -950,33 +882,6 @@ CREATE TABLE IF NOT EXISTS wal_segments
                 Error::Message(format!("[WAL_SEGMENTS] add l0_planned column failed: {e}"))
             })?;
 
-        // Per-stream time ranges (2026-09-29): one row per (segment, stream).
-        // ON DELETE CASCADE is load-bearing for the mixed-version window —
-        // the sweeper of an OLDER image deletes segment rows without knowing
-        // this table, and the database still removes the side rows.
-        DB_QUERY_NUMS
-            .with_label_values(&["create", STREAMS_TABLE])
-            .inc();
-        sqlx::query(
-            r#"
-CREATE TABLE IF NOT EXISTS wal_segment_streams
-(
-    segment_id BIGINT NOT NULL REFERENCES wal_segments(id) ON DELETE CASCADE,
-    stream     TEXT   NOT NULL,
-    min_ts     BIGINT NOT NULL,
-    max_ts     BIGINT NOT NULL,
-    PRIMARY KEY (segment_id, stream)
-);
-        "#,
-        )
-        .execute(&pool)
-        .await
-        .map_err(|e| {
-            Error::Message(format!(
-                "[WAL_SEGMENTS] create table {STREAMS_TABLE} failed: {e}"
-            ))
-        })?;
-
         create_indexes().await
     }
 
@@ -994,73 +899,11 @@ CREATE TABLE IF NOT EXISTS wal_segment_streams
         for (idx, unique, fields) in indices {
             create_index(IndexStatement::new(idx, TABLE, unique, fields)).await?;
         }
-        // the per-stream join probes `(segment_id, stream)` through the
-        // primary key; a stream-led index keeps the hash-side alternative
-        // (all rows of ONE stream) an index range instead of a table scan
-        create_index(IndexStatement::new(
-            "wal_segment_streams_stream_idx",
-            STREAMS_TABLE,
-            false,
-            &["stream", "segment_id"],
-        ))
-        .await?;
         Ok(())
     }
 
     pub(super) async fn add(meta: &SegmentMeta, streams_json: &str) -> Result<i64> {
         let pool = CLIENT.clone();
-        let id = add_segment_row(&pool, meta, streams_json).await?;
-        if !meta.stream_ranges.is_empty() {
-            add_stream_ranges(&pool, id, meta).await?;
-        }
-        Ok(id)
-    }
-
-    /// One multi-row INSERT of the per-stream ranges; `ON CONFLICT DO
-    /// NOTHING` keeps the idempotent-retry contract of [`add`] (a retry
-    /// after a crash between the two statements re-sends the same rows).
-    async fn add_stream_ranges(
-        pool: &sqlx::Pool<sqlx::Postgres>,
-        id: i64,
-        meta: &SegmentMeta,
-    ) -> Result<()> {
-        DB_QUERY_NUMS
-            .with_label_values(&["insert", STREAMS_TABLE])
-            .inc();
-        let mut sql = String::from(
-            "INSERT INTO wal_segment_streams (segment_id, stream, min_ts, max_ts) VALUES ",
-        );
-        for i in 0..meta.stream_ranges.len() {
-            if i > 0 {
-                sql.push_str(", ");
-            }
-            let base = i * 3;
-            sql.push_str(&format!(
-                "($1, ${}, ${}, ${})",
-                base + 2,
-                base + 3,
-                base + 4
-            ));
-        }
-        sql.push_str(" ON CONFLICT (segment_id, stream) DO NOTHING;");
-        let mut query = sqlx::query(&sql).bind(id);
-        for (stream, min_ts, max_ts) in &meta.stream_ranges {
-            query = query.bind(stream).bind(min_ts).bind(max_ts);
-        }
-        query.execute(pool).await.map_err(|e| {
-            Error::Message(format!(
-                "[WAL_SEGMENTS] add object_key={} id={id}: stream ranges insert failed: {e}",
-                meta.object_key
-            ))
-        })?;
-        Ok(())
-    }
-
-    async fn add_segment_row(
-        pool: &sqlx::Pool<sqlx::Postgres>,
-        meta: &SegmentMeta,
-        streams_json: &str,
-    ) -> Result<i64> {
         let now = now_micros();
         DB_QUERY_NUMS.with_label_values(&["insert", TABLE]).inc();
         let inserted: Option<i64> = sqlx::query_scalar(
@@ -1080,7 +923,7 @@ RETURNING id;"#,
         .bind(SegmentStatus::Pending as i16)
         .bind(now)
         .bind(now)
-        .fetch_optional(pool)
+        .fetch_optional(&pool)
         .await
         .map_err(|e| {
             Error::Message(format!(
@@ -1098,7 +941,7 @@ RETURNING id;"#,
             sqlx::query_scalar("SELECT id FROM wal_segments WHERE node_uuid = $1 AND seq = $2;")
                 .bind(&meta.node_uuid)
                 .bind(meta.seq)
-                .fetch_optional(pool)
+                .fetch_optional(&pool)
                 .await
                 .map_err(|e| {
                     Error::Message(format!(
@@ -1461,27 +1304,31 @@ WHERE id = $3 AND status != $4 AND l0_planned != '' AND updated_at < $5;"#,
         start: i64,
         end: i64,
         pattern: &str,
-        stream_key: &str,
         include_built_after: i64,
         limit: i64,
     ) -> Result<Vec<SegmentMeta>> {
         let pool = CLIENT_RO.clone();
         DB_QUERY_NUMS.with_label_values(&["select", TABLE]).inc();
-        let rows: Vec<SegmentRow> = sqlx::query_as(QUERY_UNBUILT_SQL)
-            .bind(start)
-            .bind(end)
-            .bind(pattern)
-            .bind(SegmentStatus::Built as i16)
-            .bind(include_built_after)
-            .bind(stream_key)
-            .bind(limit)
-            .fetch_all(&pool)
-            .await
-            .map_err(|e| {
-                Error::Message(format!(
-                    "[WAL_SEGMENTS] query_unbuilt pattern={pattern} range=({start}, {end}): {e}"
-                ))
-            })?;
+        let rows: Vec<SegmentRow> = sqlx::query_as(
+            r#"SELECT * FROM wal_segments
+WHERE max_ts >= $1 AND min_ts <= $2 AND streams LIKE $3 ESCAPE '\'
+  AND (status != $4 OR (status = $4 AND updated_at >= $5))
+ORDER BY min_ts ASC, id ASC
+LIMIT $6;"#,
+        )
+        .bind(start)
+        .bind(end)
+        .bind(pattern)
+        .bind(SegmentStatus::Built as i16)
+        .bind(include_built_after)
+        .bind(limit)
+        .fetch_all(&pool)
+        .await
+        .map_err(|e| {
+            Error::Message(format!(
+                "[WAL_SEGMENTS] query_unbuilt pattern={pattern} range=({start}, {end}): {e}"
+            ))
+        })?;
         rows_into_metas(rows)
     }
 
@@ -1658,27 +1505,6 @@ CREATE TABLE IF NOT EXISTS wal_segments
                 .map_err(|e| {
                     Error::Message(format!("[WAL_SEGMENTS] add l0_planned column failed: {e}"))
                 })?;
-            // per-stream time ranges (2026-09-29); sqlite may run without
-            // `PRAGMA foreign_keys`, so `delete` removes side rows explicitly
-            sqlx::query(
-                r#"
-CREATE TABLE IF NOT EXISTS wal_segment_streams
-(
-    segment_id BIGINT NOT NULL,
-    stream     TEXT   NOT NULL,
-    min_ts     BIGINT NOT NULL,
-    max_ts     BIGINT NOT NULL,
-    PRIMARY KEY (segment_id, stream)
-);
-        "#,
-            )
-            .execute(&*client)
-            .await
-            .map_err(|e| {
-                Error::Message(format!(
-                    "[WAL_SEGMENTS] create table {STREAMS_TABLE} failed: {e}"
-                ))
-            })?;
             // lock released before create_index (it takes the same lock)
         }
 
@@ -1695,13 +1521,6 @@ CREATE TABLE IF NOT EXISTS wal_segment_streams
         for (idx, unique, fields) in indices {
             create_index(IndexStatement::new(idx, TABLE, unique, fields)).await?;
         }
-        create_index(IndexStatement::new(
-            "wal_segment_streams_stream_idx",
-            STREAMS_TABLE,
-            false,
-            &["stream", "segment_id"],
-        ))
-        .await?;
         Ok(())
     }
 
@@ -1735,49 +1554,29 @@ ON CONFLICT (node_uuid, seq) DO NOTHING;"#,
                 meta.object_key, meta.node_uuid, meta.seq
             ))
         })?;
-        let id = if ret.rows_affected() > 0 {
-            ret.last_insert_rowid()
-        } else {
-            // conflicted: idempotent retry after a crash between PUT and
-            // register — return the existing row's id
-            let existing: Option<i64> = sqlx::query_scalar(
-                "SELECT id FROM wal_segments WHERE node_uuid = $1 AND seq = $2;",
-            )
-            .bind(&meta.node_uuid)
-            .bind(meta.seq)
-            .fetch_optional(&*client)
-            .await
-            .map_err(|e| {
-                Error::Message(format!(
-                    "[WAL_SEGMENTS] add object_key={}: post-conflict lookup (node_uuid={}, seq={}) failed: {e}",
-                    meta.object_key, meta.node_uuid, meta.seq
-                ))
-            })?;
-            existing.ok_or_else(|| {
-                Error::Message(format!(
-                    "[WAL_SEGMENTS] add object_key={}: conflict on (node_uuid={}, seq={}) but the existing row disappeared (concurrent delete?)",
-                    meta.object_key, meta.node_uuid, meta.seq
-                ))
-            })?
-        };
-        for (stream, min_ts, max_ts) in &meta.stream_ranges {
-            sqlx::query(
-                "INSERT INTO wal_segment_streams (segment_id, stream, min_ts, max_ts) VALUES ($1, $2, $3, $4) ON CONFLICT (segment_id, stream) DO NOTHING;",
-            )
-            .bind(id)
-            .bind(stream)
-            .bind(min_ts)
-            .bind(max_ts)
-            .execute(&*client)
-            .await
-            .map_err(|e| {
-                Error::Message(format!(
-                    "[WAL_SEGMENTS] add object_key={} id={id}: stream range insert failed: {e}",
-                    meta.object_key
-                ))
-            })?;
+        if ret.rows_affected() > 0 {
+            return Ok(ret.last_insert_rowid());
         }
-        Ok(id)
+        // conflicted: idempotent retry after a crash between PUT and register —
+        // return the existing row's id
+        let existing: Option<i64> =
+            sqlx::query_scalar("SELECT id FROM wal_segments WHERE node_uuid = $1 AND seq = $2;")
+                .bind(&meta.node_uuid)
+                .bind(meta.seq)
+                .fetch_optional(&*client)
+                .await
+                .map_err(|e| {
+                    Error::Message(format!(
+                        "[WAL_SEGMENTS] add object_key={}: post-conflict lookup (node_uuid={}, seq={}) failed: {e}",
+                        meta.object_key, meta.node_uuid, meta.seq
+                    ))
+                })?;
+        existing.ok_or_else(|| {
+            Error::Message(format!(
+                "[WAL_SEGMENTS] add object_key={}: conflict on (node_uuid={}, seq={}) but the existing row disappeared (concurrent delete?)",
+                meta.object_key, meta.node_uuid, meta.seq
+            ))
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2141,26 +1940,30 @@ WHERE id = $3 AND status != $4 AND l0_planned != '' AND updated_at < $5;"#,
         start: i64,
         end: i64,
         pattern: &str,
-        stream_key: &str,
         include_built_after: i64,
         limit: i64,
     ) -> Result<Vec<SegmentMeta>> {
         let pool = CLIENT_RO.clone();
-        let rows: Vec<SegmentRow> = sqlx::query_as(QUERY_UNBUILT_SQL)
-            .bind(start)
-            .bind(end)
-            .bind(pattern)
-            .bind(SegmentStatus::Built as i16)
-            .bind(include_built_after)
-            .bind(stream_key)
-            .bind(limit)
-            .fetch_all(&pool)
-            .await
-            .map_err(|e| {
-                Error::Message(format!(
-                    "[WAL_SEGMENTS] query_unbuilt pattern={pattern} range=({start}, {end}): {e}"
-                ))
-            })?;
+        let rows: Vec<SegmentRow> = sqlx::query_as(
+            r#"SELECT * FROM wal_segments
+WHERE max_ts >= $1 AND min_ts <= $2 AND streams LIKE $3 ESCAPE '\'
+  AND (status != $4 OR (status = $4 AND updated_at >= $5))
+ORDER BY min_ts ASC, id ASC
+LIMIT $6;"#,
+        )
+        .bind(start)
+        .bind(end)
+        .bind(pattern)
+        .bind(SegmentStatus::Built as i16)
+        .bind(include_built_after)
+        .bind(limit)
+        .fetch_all(&pool)
+        .await
+        .map_err(|e| {
+            Error::Message(format!(
+                "[WAL_SEGMENTS] query_unbuilt pattern={pattern} range=({start}, {end}): {e}"
+            ))
+        })?;
         rows_into_metas(rows)
     }
 
@@ -2184,19 +1987,8 @@ LIMIT $3;"#,
     pub(super) async fn delete(ids: &[i64]) -> Result<()> {
         let client = CLIENT_RW.clone();
         let client = client.lock().await;
-        let csv = ids_csv(ids);
-        // no FK cascade guaranteed on sqlite: side rows first, then the rows
-        sqlx::query(&format!(
-            "DELETE FROM wal_segment_streams WHERE segment_id IN ({csv});"
-        ))
-        .execute(&*client)
-        .await
-        .map_err(|e| {
-            Error::Message(format!(
-                "[WAL_SEGMENTS] delete stream ranges ids={ids:?}: {e}"
-            ))
-        })?;
-        sqlx::query(&format!("DELETE FROM wal_segments WHERE id IN ({csv});"))
+        let sql = format!("DELETE FROM wal_segments WHERE id IN ({});", ids_csv(ids));
+        sqlx::query(&sql)
             .execute(&*client)
             .await
             .map_err(|e| Error::Message(format!("[WAL_SEGMENTS] delete ids={ids:?}: {e}")))?;
@@ -2335,22 +2127,7 @@ mod tests {
             builder_node: String::new(),
             created_at: 0,
             updated_at: 0,
-            stream_ranges: Vec::new(),
         }
-    }
-
-    /// `seg` plus per-stream ranges (the shape every 2026-09-29+ ingester
-    /// registers); the whole-segment range is the hull of the stream ranges.
-    fn seg_ranged(node: &str, seq: i64, ranges: &[(&str, i64, i64)]) -> SegmentMeta {
-        let min_ts = ranges.iter().map(|r| r.1).min().unwrap();
-        let max_ts = ranges.iter().map(|r| r.2).max().unwrap();
-        let streams: Vec<&str> = ranges.iter().map(|r| r.0).collect();
-        let mut meta = seg(node, seq, min_ts, max_ts, &streams);
-        meta.stream_ranges = ranges
-            .iter()
-            .map(|(s, lo, hi)| (s.to_string(), *lo, *hi))
-            .collect();
-        meta
     }
 
     async fn raw_exec(sql: &str) {
@@ -3050,143 +2827,6 @@ mod tests {
             hits.iter().any(|m| m.id == id_d),
             "unbuilt rows unaffected by grace"
         );
-    }
-
-    /// Per-stream ranges: a segment whose OWN range overlaps the window only
-    /// because another stream's late frames stretched it is not returned for
-    /// the stream whose frames sit outside the window; rows without ranges
-    /// (older ingesters) keep the whole-segment overlap; ranges survive the
-    /// idempotent re-registration; `delete` removes them.
-    #[tokio::test]
-    async fn test_query_unbuilt_prunes_by_per_stream_range_and_fails_open_without_one() {
-        let _guard = setup().await;
-        // R: logs frames at [T0+9000, T0+9500], a LATE traces frame at
-        // [T0+100, T0+200] stretches the segment to [T0+100, T0+9500]
-        let id_r = add(&seg_ranged(
-            "node-r",
-            1,
-            &[
-                ("org1/logs/app1", T0 + 9000, T0 + 9500),
-                ("org1/traces/http", T0 + 100, T0 + 200),
-            ],
-        ))
-        .await
-        .unwrap();
-        // L: same segment range, registered by an older image (no ranges)
-        let id_l = add(&seg(
-            "node-r",
-            2,
-            T0 + 100,
-            T0 + 9500,
-            &["org1/logs/app1", "org1/traces/http"],
-        ))
-        .await
-        .unwrap();
-        // I: ranged, logs frames inside the window
-        let id_i = add(&seg_ranged(
-            "node-r",
-            3,
-            &[("org1/logs/app1", T0 + 1000, T0 + 2000)],
-        ))
-        .await
-        .unwrap();
-
-        // logs window [T0, T0+3000): R's logs range is outside → pruned; L
-        // has no range → whole-segment overlap keeps it; I overlaps
-        let hits = query_unbuilt("org1", "logs", "app1", (T0, T0 + 3000), 0, 1000)
-            .await
-            .unwrap();
-        assert_eq!(
-            hits.iter().map(|m| m.id).collect::<Vec<_>>(),
-            vec![id_l, id_i],
-            "ranged segment pruned by its logs range, legacy row kept, in-range kept"
-        );
-        // traces window [T0, T0+3000): R's traces range IS inside
-        let hits = query_unbuilt("org1", "traces", "http", (T0, T0 + 3000), 0, 1000)
-            .await
-            .unwrap();
-        assert_eq!(
-            hits.iter().map(|m| m.id).collect::<Vec<_>>(),
-            vec![id_r, id_l]
-        );
-        // logs window covering R's logs frames: R returned
-        let hits = query_unbuilt("org1", "logs", "app1", (T0 + 9000, T0 + 9999), 0, 1000)
-            .await
-            .unwrap();
-        assert_eq!(
-            hits.iter().map(|m| m.id).collect::<Vec<_>>(),
-            vec![id_r, id_l],
-            "both segments start at T0+100: ordered by id, R registered first"
-        );
-        // inclusive edges mirror the whole-segment predicate: max_ts >= start
-        // and min_ts <= end
-        let hits = query_unbuilt("org1", "logs", "app1", (T0 + 9500, T0 + 9500), 0, 1000)
-            .await
-            .unwrap();
-        assert!(
-            hits.iter().any(|m| m.id == id_r),
-            "edge-inclusive on max_ts"
-        );
-        let hits = query_unbuilt("org1", "logs", "app1", (T0 + 9501, T0 + 9999), 0, 1000)
-            .await
-            .unwrap();
-        assert!(
-            !hits.iter().any(|m| m.id == id_r),
-            "one past max_ts excludes"
-        );
-
-        // idempotent re-registration (crash between PUT and register) keeps
-        // exactly one range row per stream and the same verdicts
-        let again = add(&seg_ranged(
-            "node-r",
-            1,
-            &[
-                ("org1/logs/app1", T0 + 9000, T0 + 9500),
-                ("org1/traces/http", T0 + 100, T0 + 200),
-            ],
-        ))
-        .await
-        .unwrap();
-        assert_eq!(again, id_r);
-        assert_eq!(raw_range_rows(id_r).await, 2);
-        let hits = query_unbuilt("org1", "logs", "app1", (T0, T0 + 3000), 0, 1000)
-            .await
-            .unwrap();
-        assert!(!hits.iter().any(|m| m.id == id_r));
-
-        // delete removes the side rows with the segment
-        delete(&[id_r]).await.unwrap();
-        assert_eq!(raw_range_rows(id_r).await, 0);
-    }
-
-    /// `add` rejects ranges that could hide rows: a stream the segment does
-    /// not carry, a range outside the segment's own, a degenerate range.
-    #[tokio::test]
-    async fn test_add_rejects_unsafe_stream_ranges() {
-        let _guard = setup().await;
-        let mut meta = seg("node-v", 1, T0 + 100, T0 + 200, &["o/logs/s"]);
-        meta.stream_ranges = vec![("o/logs/other".to_string(), T0 + 100, T0 + 200)];
-        assert!(matches!(add(&meta).await, Err(Error::InvalidFileMeta(_))));
-        meta.stream_ranges = vec![("o/logs/s".to_string(), T0 + 50, T0 + 200)];
-        assert!(matches!(add(&meta).await, Err(Error::InvalidFileMeta(_))));
-        meta.stream_ranges = vec![("o/logs/s".to_string(), T0 + 100, T0 + 250)];
-        assert!(matches!(add(&meta).await, Err(Error::InvalidFileMeta(_))));
-        meta.stream_ranges = vec![("o/logs/s".to_string(), T0 + 150, T0 + 120)];
-        assert!(matches!(add(&meta).await, Err(Error::InvalidFileMeta(_))));
-        // the exact hull is accepted
-        meta.stream_ranges = vec![("o/logs/s".to_string(), T0 + 100, T0 + 200)];
-        let id = add(&meta).await.unwrap();
-        assert_eq!(raw_range_rows(id).await, 1);
-    }
-
-    async fn raw_range_rows(segment_id: i64) -> i64 {
-        let client = crate::db::sqlite::CLIENT_RW.clone();
-        let client = client.lock().await;
-        sqlx::query_scalar("SELECT count(*) FROM wal_segment_streams WHERE segment_id = $1;")
-            .bind(segment_id)
-            .fetch_one(&*client)
-            .await
-            .expect("count range rows")
     }
 
     #[tokio::test]

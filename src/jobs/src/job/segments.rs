@@ -2662,7 +2662,6 @@ mod tests {
             builder_node: String::new(),
             created_at: T0,
             updated_at: T0,
-            stream_ranges: Vec::new(),
         }
     }
 
@@ -4160,7 +4159,6 @@ mod tests {
             builder_node: String::new(),
             created_at: 0,
             updated_at: 0,
-            stream_ranges: Vec::new(),
         }
     }
 
