@@ -329,6 +329,90 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
   lease UPDATE; `stage_index_generation` INSERT+UPDATE), item 8 (`meta` reads
   4 s), Performance Insights (owner call). Pool size stays as is (owner
   call, 2026-09-29).
+- **Incident, self-inflicted, found in the 11:30Z review: `cached plan must
+  not change result type`, 09:00–09:24Z.** The pre-applied `ALTER TABLE
+  wal_segments ADD COLUMN stream_ranges` (09:00:39Z) changed the result
+  descriptor of every `SELECT * FROM wal_segments` / `RETURNING *` prepared
+  statement cached by the sqlx pools of the pods still on `.174`/`.175`;
+  PostgreSQL then rejects the re-planned statement until the connection is
+  recycled (`max_lifetime` 1,800 s) or the pod restarts (`.177` roll
+  09:41–09:48Z). Counted from logs: **1,810 errors** (compactor 1,041,
+  querier 662, ingester 107 — ingesters run the builder loop too); **331
+  searches failed** with `http->search: err … query_unbuilt … cached plan`
+  (09:00 24, 09:05 79, 09:10 177, 09:15 49, 09:20 2 — the majority of the
+  ~540 searches in that window, HTTP 500 to the caller); builder
+  `claim_pending` failed 572× and `super-batch extension claim` 41× on the
+  affected connections (other connections kept claiming; unbuilt peaked
+  ~1k and drained by 10:15Z); sweeper `list_expired` 530 failed passes
+  ("rows kept for next tick", retention delayed ≤ 30 min). Zero
+  recurrence after 09:24Z. The 10:10Z health check missed it because it
+  looked at the last 30 min only. Not the DDL's fault alone: the fork's own
+  boot-time `add_column` would have done the same to every other pod
+  during the rolling deploy. Fix `c794e94f5` (vix-arch, not yet released):
+  every row-reading statement in `wal_segments.rs` names its columns
+  (`COLUMNS`, both backends) so a column addition leaves the descriptor
+  unchanged; upstream's `file_list`/`scheduler`/`pipeline` still use
+  `SELECT *`, exposed only at upstream upgrades. Rule from now on: schema
+  changes on tables read by long-lived pools ship WITH the pods that read
+  them (boot-time `add_column`, no pre-apply), and the reads must not use
+  `*`.
+- **Open-items review (11:30Z), evidence per item:**
+  1. Trace-by-id full scan — **structurally closed** since `.174` (per-file
+     sidecar bloom probes): needle 1 h today scans 263 k records (was
+     500 M), followers `probed=1,179 dropped=1,178 kept=1`, scan branch 2
+     files; 3 h `probed=3,014 kept=3`. Residual = probe cost ∝ file count
+     (0.2–0.4 ms/file warm, ~3 ms cold): 514 ms warm / 1.1 s cold vs O2
+     100–220 ms. P3 (bloom-only sidecar for logs L0s, `no_sidecar`) still
+     open — today `no_sidecar=0` on traces; logs needles still full-scan
+     index-off L0s.
+  2. Segment-WAL tail on the follower critical path — **mitigated by
+     `.177`, not removed**: logs count 1 h candidates 595 → 96 (87 loaded
+     across 10 followers, 776 rows, 1 time-pruned), setup p50 81 ms but the
+     straggler follower 380 ms, and the tail still sits inside `follower
+     search setup` before the scan, so the slowest follower's tail is the
+     leader's floor. Next lever if it matters: overlap the tail fetch with
+     the file scan instead of serialising it in setup.
+  3. Fragmented L0 — **still structural**: last 3 closed hours 2,010 L0
+     files, **752 < 1 MB, 196 with ≤ 2 records** (each builder batch writes
+     ~280 files across ~265 streams, avg 15 k rows/file; late lane adds the
+     2-record ones). Merge absorbs them within ~2 h (hours 07/08 are all
+     > 32 MB, 0 tiny; hour 09 still 187 + 551 small; merge debt hours = 0)
+     so the cost is confined to the recent window: the 1 h traces window
+     carries ~1,270 files, ~550 tiny, and every needle/aggregate pays a
+     probe or an open per file. Fix is in the builder (accumulate small
+     streams across batches / per-stream size floor), not in merge.
+  4. Builder memory — **open in code, stable in prod**: `CHUNK_MB 512` /
+     `BUDGET 4096` unchanged; the budget still admits decoded input +
+     planning scratch + per-plan decoded bytes only; the writer's output
+     residency (`BuiltL0File.buf`, spooled to disk only when large) is
+     unaccounted, so "restore 8192" stays blocked on that accounting.
+     Compactors today max RSS 11.0 GB / avg 5.7 GB of 60 GiB, 0 OOMKilled
+     since 09-25.
+  5. Compaction vs DB — **mostly closed today**: deadlocks 2 in the whole
+     37-day window (both 09-28 16Z), `pool timed out` 731/24 h of which 690
+     were the `.176` incident and 38 on 09-28 16Z, 0 since the `.177` roll;
+     `merge job offset error` / `failed to commit` 0 in 24 h; the 94 s
+     (reported as 174 s elsewhere) `DELETE FROM file_list WHERE id = $1`
+     is partition-pruned in `.177` (1 partition vs 147 in `EXPLAIN`); the
+     remaining ≥ 4 s statements are upstream's `meta` reads (audit item 8)
+     and `pg_advisory_xact_lock` waits. New finding: `retire_files`
+     (`file_list/postgres.rs:145`) builds `DELETE FROM file_list WHERE (id
+     = … AND …) OR … RETURNING …` in 300-arm chunks without `date` — 47
+     variants, 3,346 calls, **10 k–61 k buffers per call**, 8–51 ms; 26 s
+     total in 37 d, so low priority, same one-line fix (add `date =` to
+     the `id > 0` arm).
+  6. Query anomalies, 24 h: `Resources exhausted` (12 GiB shared pool)
+     892 total, bursty (295 at 09-28 17Z, 230 at 02Z, 83 at 08Z, 52 at
+     10Z) — unchanged by `.177`, the wide `SELECT *` shapes; the per-query
+     `ZO_STORAGE_SCAN_MAX_BYTES` cap bounds one follower but ten concurrent
+     wide queries still saturate the pool. `Search field not found:
+     trace_id` **1,311/24 h ≈ 55/h steady** and `_all` 118/24 h are client
+     queries against streams lacking the column (HTTP 400, upstream's
+     20004 behaviour, no SQL logged at 400 so the caller is unidentified —
+     Orbit's log correlation is the likely source); `GROUP BY` planning
+     errors 99/24 h are alias collisions with real columns (`SELECT error,
+     COUNT(*) …` on logs where `error` is a column) — user SQL, 400s, and
+     the 22,263-field logs schema makes collisions likely.
 
 ## 2026-09-28 — `.173` definitive numbers; needle lookups full-scanned the unstamped hours (fix: per-file sidecar bloom probes + a settled-only `.bf` queue)
 - Fleet at 14:52Z, 3 days undisturbed: queriers 10/10 `.173` (7 pods 3 d,
