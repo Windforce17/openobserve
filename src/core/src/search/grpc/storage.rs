@@ -94,6 +94,21 @@ impl StorageScanShortfall {
     }
 }
 
+/// The cap applies ONLY to row-returning `LIMIT` shapes — the optimizer's
+/// `SimpleSelect(n > 0, _)`. Truncating the scan branch to the newest files
+/// leaves "the newest n matching rows" what it is for a log search; for a
+/// count, histogram, percentile or GROUP BY it silently changes the number
+/// (2026-09-29: a 6 h `p99 by service` covered 10 % of its rows, a 24 h
+/// filtered count came back 1.5 % short, both flagged `partial` and both
+/// wrong). Aggregates run the whole scan branch, bounded by memory admission,
+/// or fail loudly — never a truncated value. Owner decision 2026-09-30.
+fn scan_cap_budget(idx_optimize_rule: &Option<IndexOptimizeMode>, configured: usize) -> usize {
+    match idx_optimize_rule {
+        Some(IndexOptimizeMode::SimpleSelect(limit, _)) if *limit > 0 => configured,
+        _ => 0,
+    }
+}
+
 /// Keep the NEWEST files whose compressed bytes fit `budget` (always at least
 /// one), in `max_ts` DESC order, and report the rest. Newest-first because a
 /// scan-branch flood means the index could not prune a wide window: the
@@ -192,6 +207,10 @@ pub async fn search(
     // nothing for the index to answer.
     let vix_applicable =
         vix_search_applicable(*use_inverted_index, condition_all, &idx_optimize_rule);
+    let scan_cap = scan_cap_budget(
+        &idx_optimize_rule,
+        get_config().limit.storage_scan_max_bytes,
+    );
     if vix_applicable {
         // check vix inverted index
         (idx_took, is_add_filter_back, ..) = vix_search(
@@ -517,6 +536,42 @@ mod tests {
         // inverted index off: never applicable
         assert!(!vix_search_applicable(false, false, &select));
         assert!(!vix_search_applicable(false, true, &select));
+    }
+
+    #[test]
+    fn scan_cap_applies_only_to_row_returning_limit_shapes() {
+        let budget = 4 << 30;
+        assert_eq!(
+            scan_cap_budget(&Some(IndexOptimizeMode::SimpleSelect(50, false)), budget),
+            budget
+        );
+        assert_eq!(
+            scan_cap_budget(&Some(IndexOptimizeMode::SimpleSelect(50, true)), budget),
+            budget
+        );
+        // a LIMIT 0 select drops every row anyway: nothing to protect
+        assert_eq!(
+            scan_cap_budget(&Some(IndexOptimizeMode::SimpleSelect(0, false)), budget),
+            0
+        );
+        // aggregates and unclassified plans: never truncated
+        assert_eq!(
+            scan_cap_budget(&Some(IndexOptimizeMode::SimpleCount), budget),
+            0
+        );
+        assert_eq!(
+            scan_cap_budget(
+                &Some(IndexOptimizeMode::SimpleHistogram(0, 1, 1, 0)),
+                budget
+            ),
+            0
+        );
+        assert_eq!(scan_cap_budget(&None, budget), 0);
+        // disabled stays disabled
+        assert_eq!(
+            scan_cap_budget(&Some(IndexOptimizeMode::SimpleSelect(50, false)), 0),
+            0
+        );
     }
 
     fn file(id: i64, max_ts: i64, compressed: i64) -> FileKey {
