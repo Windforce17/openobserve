@@ -577,6 +577,14 @@ pub async fn create_table() -> Result<()> {
     Ok(())
 }
 
+/// Retry window for the first NATS connection. A pod that starts while the
+/// NATS endpoint is still resolving (every rollout: 1–5 restarts per roll,
+/// `nats.rs:604` panics 2026-09-25/28) gets a few seconds of retries with
+/// backoff before the process still fails loudly.
+const CONNECT_RETRIES: u32 = 12;
+const CONNECT_RETRY_BASE: Duration = Duration::from_millis(500);
+const CONNECT_RETRY_CAP: Duration = Duration::from_secs(5);
+
 pub async fn connect() -> async_nats::Client {
     let cfg = get_config();
     if cfg.common.print_key_config {
@@ -597,13 +605,41 @@ pub async fn connect() -> async_nats::Client {
         .split(',')
         .map(|a| a.parse().unwrap())
         .collect::<Vec<ServerAddr>>();
-    match async_nats::connect_with_options(addrs.clone(), opts).await {
-        Ok(client) => client,
-        Err(e) => {
-            log::error!("NATS connect failed for address(es): {addrs:?}, err: {e}");
-            panic!("NATS connect failed");
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        match async_nats::connect_with_options(addrs.clone(), opts.clone()).await {
+            Ok(client) => {
+                if attempt > 1 {
+                    log::warn!("NATS connected to {addrs:?} after {attempt} attempts");
+                }
+                return client;
+            }
+            Err(e) if attempt < CONNECT_RETRIES => {
+                let delay = connect_retry_delay(attempt);
+                log::warn!(
+                    "NATS connect to {addrs:?} failed (attempt {attempt}/{CONNECT_RETRIES}), retrying in {delay:?}: {e}"
+                );
+                tokio::time::sleep(delay).await;
+            }
+            Err(e) => {
+                log::error!(
+                    "NATS connect failed for address(es): {addrs:?} after {attempt} attempts, err: {e}"
+                );
+                panic!("NATS connect failed");
+            }
         }
     }
+}
+
+/// Exponential backoff from `CONNECT_RETRY_BASE`, capped at
+/// `CONNECT_RETRY_CAP`: 0.5, 1, 2, 4, 5, 5, … seconds (≈ 45 s over the
+/// window), long enough for a NATS pod or its endpoint to come up during a
+/// rollout without turning a real outage into a silent hang.
+fn connect_retry_delay(attempt: u32) -> Duration {
+    CONNECT_RETRY_BASE
+        .saturating_mul(1u32 << attempt.saturating_sub(1).min(16))
+        .min(CONNECT_RETRY_CAP)
 }
 
 async fn keys(kv: &jetstream::kv::Store, prefix: &str) -> Result<Vec<String>> {
@@ -943,6 +979,22 @@ mod tests {
         assert!(!use_kv_watcher("/super_cluster_kv_nodes/"));
         assert!(!use_kv_watcher("/super_cluster_kv_clusters/"));
         assert!(!use_kv_watcher("/other_prefix/"));
+    }
+
+    /// The startup retry window: doubling from 0.5 s, capped at 5 s, and
+    /// long enough in total (≈ 45 s over `CONNECT_RETRIES`) to outlast a
+    /// NATS endpoint coming up during a rollout.
+    #[test]
+    fn connect_retry_backoff_doubles_then_caps() {
+        assert_eq!(connect_retry_delay(1), Duration::from_millis(500));
+        assert_eq!(connect_retry_delay(2), Duration::from_secs(1));
+        assert_eq!(connect_retry_delay(3), Duration::from_secs(2));
+        assert_eq!(connect_retry_delay(4), Duration::from_secs(4));
+        assert_eq!(connect_retry_delay(5), CONNECT_RETRY_CAP);
+        assert_eq!(connect_retry_delay(60), CONNECT_RETRY_CAP);
+        let total: Duration = (1..CONNECT_RETRIES).map(connect_retry_delay).sum();
+        assert!(total >= Duration::from_secs(40), "{total:?}");
+        assert!(total <= Duration::from_secs(60), "{total:?}");
     }
 
     #[test]
