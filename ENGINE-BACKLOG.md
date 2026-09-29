@@ -187,6 +187,17 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     (1,509 on traces 19:33–20:03Z, p50 384 ms) came from those auto-id
     lookups; not worth restricting the stage to explicit fields at 18 ms
     warm. Growth timeouts flat at 53 since 20:03Z (fresh-pod cold caches).
+  - **`.175` rolled 05:03Z (GitOps #568, querier-only)** with
+    `ZO_STORAGE_SCAN_MAX_BYTES=4 GiB`. Same 6 h `SELECT * … WHERE body =
+    '<absent>' LIMIT 50` (logs, `[22:40, 04:40)`): `.174` **18.7 s, 6.58 TB /
+    604 M rows, `is_partial=false`** → `.175` 11.0 s cold / **2.5 s warm,
+    1.65 TB / 152 M rows, `is_partial=true`**, `function_error` per follower
+    `storage scan budget: 149 files (10.50 GB) of 206 were skipped … results
+    cover the NEWEST 57 files (3.98 GB) from 2026-09-29T02:13:49Z onward`.
+    `query_storage_scan_capped_total` 30 logs + 10 traces after the two
+    runs (each follower counts once; the traces counts are the traces
+    table of the same star query). Needle lookup unaffected: 1 h trace id,
+    47 hits, 2,178 cold / 1,191 ms warm, `is_partial=false`. 0 restarts.
   - Compactor: 30/30 at 18:42:23Z (1 restart = `nats.rs:604`), lease
     recovery done 18:58Z (90 running / 30 nodes). `.bf` passes: **27 passes,
     median 395 s, max 445 s (was 2,958–6,227 s), busy 258 of 8,100
@@ -203,8 +214,8 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     536 MB — object storage flushes are behind` (`aws_waf_log`, 2,296 records
     for the client to retry) while 2 of 5 ingesters were out of rotation —
     open item #64's shape, roll-time only so far.
-- P4 shipped in code as **`.175` = vix-arch `aca0a11c2`** (querier-only
-  change; image built, ECR push pending an SSO re-login):
+- P4 shipped as **`.175` = vix-arch `aca0a11c2`** (querier-only change; ECR
+  index `sha256:0337b985…`, live 05:03Z — evidence above):
   `ZO_STORAGE_SCAN_MAX_BYTES` (default 0) caps the follower's storage scan
   branch by Σ `compressed_size` in `storage::search` before any IO, keeps
   the NEWEST files that fit (≥ 1), re-measures `scan_stats`, and ships a
