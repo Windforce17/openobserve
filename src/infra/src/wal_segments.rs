@@ -107,6 +107,11 @@ pub struct SegmentMeta {
     /// JSON array of "org/stream_type/stream" identities present in the
     /// segment — pruning input for query and build.
     pub streams: Vec<String>,
+    /// Each stream's own `[min_ts, max_ts]` (micros), aligned with `streams`;
+    /// empty = unknown (registered before the column existed or by an older
+    /// ingester) and readers keep the segment. Stored as second offsets from
+    /// `min_ts` rounded outward — see [`encode_stream_ranges`].
+    pub stream_ranges: Vec<(i64, i64)>,
     pub status: SegmentStatus,
     pub builder_node: String,
     pub created_at: i64,
@@ -125,6 +130,7 @@ struct SegmentRow {
     max_ts: i64,
     size: i64,
     streams: String,
+    stream_ranges: String,
     status: i16,
     builder_node: String,
     created_at: i64,
@@ -152,6 +158,26 @@ impl SegmentRow {
                 self.id, self.object_key
             ))
         })?;
+        let stream_ranges = if self.stream_ranges.is_empty() {
+            Vec::new()
+        } else {
+            match decode_stream_ranges(&self.stream_ranges, self.min_ts, self.max_ts, streams.len())
+            {
+                Some(ranges) => ranges,
+                None => {
+                    // ranges are a pruning hint: a bad hint must never hide
+                    // the segment, so the row falls back to whole-segment
+                    // overlap and says so once per read
+                    log::warn!(
+                        "[WAL_SEGMENTS] row id={} object_key={} has malformed stream_ranges ({} bytes); pruning disabled for it",
+                        self.id,
+                        self.object_key,
+                        self.stream_ranges.len()
+                    );
+                    Vec::new()
+                }
+            }
+        };
         Ok(SegmentMeta {
             id: self.id,
             node_uuid: self.node_uuid,
@@ -161,6 +187,7 @@ impl SegmentRow {
             max_ts: self.max_ts,
             size: self.size,
             streams,
+            stream_ranges,
             status,
             builder_node: self.builder_node,
             created_at: self.created_at,
@@ -171,6 +198,80 @@ impl SegmentRow {
 
 fn rows_into_metas(rows: Vec<SegmentRow>) -> Result<Vec<SegmentMeta>> {
     rows.into_iter().map(SegmentRow::into_meta).collect()
+}
+
+impl SegmentMeta {
+    /// This stream's own `[min_ts, max_ts]` when the row carries ranges;
+    /// `None` means unknown and the caller MUST keep the segment (fail open).
+    pub fn range_for(&self, stream: &str) -> Option<(i64, i64)> {
+        if self.stream_ranges.len() != self.streams.len() {
+            return None;
+        }
+        let idx = self.streams.iter().position(|s| s == stream)?;
+        self.stream_ranges.get(idx).copied()
+    }
+}
+
+/// Granularity of the stored per-stream offsets.
+const RANGE_UNIT_MICROS: i64 = 1_000_000;
+
+/// Per-stream ranges travel INSIDE the segment row as second offsets from the
+/// row's `min_ts`, rounded OUTWARD: `[[lo_s, hi_s], …]` aligned with the
+/// sorted `streams` array. Offsets compress where exact micros do not (40
+/// streams: ~300 B stored vs 1,460 B — the difference between a tuple that
+/// stays inline and one that TOASTs, measured 2026-09-29), and outward
+/// rounding means a reconstructed range can only over-include: a wrongly kept
+/// segment costs one zero-yield fetch, a wrongly pruned one loses data. Empty
+/// input encodes as `""` (unknown). The side-table design this replaces
+/// (`.176`) stalled the shared meta DB with 570 child rows/s.
+fn encode_stream_ranges(ranges: &[(i64, i64)], min_ts: i64) -> String {
+    use std::fmt::Write as _;
+    if ranges.is_empty() {
+        return String::new();
+    }
+    let mut out = String::with_capacity(ranges.len() * 12 + 2);
+    out.push('[');
+    for (i, (lo, hi)) in ranges.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let lo_s = u64::try_from(lo.saturating_sub(min_ts)).unwrap_or(0) / RANGE_UNIT_MICROS as u64;
+        let hi_s = u64::try_from(hi.saturating_sub(min_ts))
+            .unwrap_or(0)
+            .div_ceil(RANGE_UNIT_MICROS as u64);
+        // writing to a String cannot fail
+        let _ = write!(out, "[{lo_s},{hi_s}]");
+    }
+    out.push(']');
+    out
+}
+
+/// Inverse of [`encode_stream_ranges`]: `None` for anything that is not a
+/// well-formed array of `expected` non-decreasing pairs. `hi` is clamped to
+/// the segment's `max_ts` (the ceil can overshoot it by < 1 s; the true
+/// stream max never exceeds it).
+fn decode_stream_ranges(
+    raw: &str,
+    min_ts: i64,
+    max_ts: i64,
+    expected: usize,
+) -> Option<Vec<(i64, i64)>> {
+    let pairs: Vec<(u64, u64)> = serde_json::from_str(raw).ok()?;
+    if pairs.len() != expected {
+        return None;
+    }
+    let mut out = Vec::with_capacity(pairs.len());
+    for (lo_s, hi_s) in pairs {
+        let lo = min_ts.saturating_add(i64::try_from(lo_s).ok()?.saturating_mul(RANGE_UNIT_MICROS));
+        let hi = min_ts
+            .saturating_add(i64::try_from(hi_s).ok()?.saturating_mul(RANGE_UNIT_MICROS))
+            .min(max_ts);
+        if lo > hi {
+            return None;
+        }
+        out.push((lo, hi));
+    }
+    Some(out)
 }
 
 fn use_postgres() -> bool {
@@ -284,6 +385,24 @@ fn validate_for_add(meta: &SegmentMeta) -> Result<()> {
             meta.object_key, meta.min_ts, meta.max_ts
         )));
     }
+    if !meta.stream_ranges.is_empty() {
+        if meta.stream_ranges.len() != meta.streams.len() {
+            return Err(Error::InvalidFileMeta(format!(
+                "[WAL_SEGMENTS] add object_key={}: {} stream ranges for {} streams",
+                meta.object_key,
+                meta.stream_ranges.len(),
+                meta.streams.len()
+            )));
+        }
+        for (stream, (lo, hi)) in meta.streams.iter().zip(&meta.stream_ranges) {
+            if *lo < meta.min_ts || *hi > meta.max_ts || lo > hi {
+                return Err(Error::InvalidFileMeta(format!(
+                    "[WAL_SEGMENTS] add object_key={}: stream {stream} range [{lo}, {hi}] outside the segment range [{}, {}]",
+                    meta.object_key, meta.min_ts, meta.max_ts
+                )));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -311,10 +430,11 @@ pub async fn add(meta: &SegmentMeta) -> Result<i64> {
             meta.object_key
         ))
     })?;
+    let ranges_json = encode_stream_ranges(&meta.stream_ranges, meta.min_ts);
     if use_postgres() {
-        postgres::add(meta, &streams_json).await
+        postgres::add(meta, &streams_json, &ranges_json).await
     } else {
-        sqlite::add(meta, &streams_json).await
+        sqlite::add(meta, &streams_json, &ranges_json).await
     }
 }
 
@@ -864,6 +984,7 @@ CREATE TABLE IF NOT EXISTS wal_segments
     status       SMALLINT     default 0 not null,
     builder_node VARCHAR(64)  default '' not null,
     l0_planned   TEXT         default '' not null,
+    stream_ranges TEXT        default '' not null,
     created_at   BIGINT       not null,
     updated_at   BIGINT       not null
 );
@@ -881,18 +1002,38 @@ CREATE TABLE IF NOT EXISTS wal_segments
             .map_err(|e| {
                 Error::Message(format!("[WAL_SEGMENTS] add l0_planned column failed: {e}"))
             })?;
+        // per-stream ranges (2026-09-29): same idempotent path; PG ≥ 11 adds a
+        // constant-default column without rewriting the table
+        add_column(TABLE, "stream_ranges", "TEXT NOT NULL DEFAULT ''")
+            .await
+            .map_err(|e| {
+                Error::Message(format!(
+                    "[WAL_SEGMENTS] add stream_ranges column failed: {e}"
+                ))
+            })?;
 
         create_indexes().await
     }
 
+    // `wal_segments_object_key_idx` (UNIQUE on object_key) is gone on purpose:
+    // object_key is `wal_segments/{node_uuid}/{seq}`, the identity
+    // `node_seq_idx` already enforces, and it was never read (0 index scans,
+    // 192 MB, 96 % deleted pages on prod 2026-09-29) while costing every
+    // insert/non-HOT update/delete one more index write. Existing deployments
+    // drop it by hand (`DROP INDEX CONCURRENTLY`); `(status, updated_at)` is
+    // the lease/sweep index the probes below are shaped around.
     async fn create_indexes() -> Result<()> {
         let indices: Vec<(&str, bool, &[&str])> = vec![
             ("wal_segments_node_seq_idx", true, &["node_uuid", "seq"]),
-            ("wal_segments_object_key_idx", true, &["object_key"]),
             (
                 "wal_segments_status_created_at_idx",
                 false,
                 &["status", "created_at"],
+            ),
+            (
+                "wal_segments_status_updated_at_idx",
+                false,
+                &["status", "updated_at"],
             ),
             ("wal_segments_max_ts_idx", false, &["max_ts"]),
         ];
@@ -902,14 +1043,18 @@ CREATE TABLE IF NOT EXISTS wal_segments
         Ok(())
     }
 
-    pub(super) async fn add(meta: &SegmentMeta, streams_json: &str) -> Result<i64> {
+    pub(super) async fn add(
+        meta: &SegmentMeta,
+        streams_json: &str,
+        ranges_json: &str,
+    ) -> Result<i64> {
         let pool = CLIENT.clone();
         let now = now_micros();
         DB_QUERY_NUMS.with_label_values(&["insert", TABLE]).inc();
         let inserted: Option<i64> = sqlx::query_scalar(
             r#"INSERT INTO wal_segments
-    (node_uuid, seq, object_key, min_ts, max_ts, size, streams, status, builder_node, created_at, updated_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, '', $9, $10)
+    (node_uuid, seq, object_key, min_ts, max_ts, size, streams, status, builder_node, created_at, updated_at, stream_ranges)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, '', $9, $10, $11)
 ON CONFLICT (node_uuid, seq) DO NOTHING
 RETURNING id;"#,
         )
@@ -923,6 +1068,7 @@ RETURNING id;"#,
         .bind(SegmentStatus::Pending as i16)
         .bind(now)
         .bind(now)
+        .bind(ranges_json)
         .fetch_optional(&pool)
         .await
         .map_err(|e| {
@@ -1228,22 +1374,26 @@ RETURNING *;"#,
     pub(super) async fn list_l0_orphan_rows(cutoff: i64, limit: i64) -> Result<Vec<(i64, String)>> {
         let pool = CLIENT_RO.clone();
         DB_QUERY_NUMS.with_label_values(&["select", TABLE]).inc();
-        sqlx::query_as(
+        // status is inlined: bound as a parameter the generic plan estimates
+        // one third of the table per status and full-scans; the literal reads
+        // the MCV list and takes `(status, updated_at)` (2026-09-29)
+        let sql = format!(
             r#"SELECT id, l0_planned FROM wal_segments
-WHERE status != $1 AND l0_planned != '' AND updated_at < $2
+WHERE (status < {built} OR status > {built}) AND l0_planned != '' AND updated_at < $1
 ORDER BY updated_at ASC, id ASC
-LIMIT $3;"#,
-        )
-        .bind(SegmentStatus::Built as i16)
-        .bind(cutoff)
-        .bind(limit)
-        .fetch_all(&pool)
-        .await
-        .map_err(|e| {
-            Error::Message(format!(
-                "[WAL_SEGMENTS] list_l0_orphan_rows cutoff={cutoff}: {e}"
-            ))
-        })
+LIMIT $2;"#,
+            built = SegmentStatus::Built as i16
+        );
+        sqlx::query_as(&sql)
+            .bind(cutoff)
+            .bind(limit)
+            .fetch_all(&pool)
+            .await
+            .map_err(|e| {
+                Error::Message(format!(
+                    "[WAL_SEGMENTS] list_l0_orphan_rows cutoff={cutoff}: {e}"
+                ))
+            })
     }
 
     pub(super) async fn gc_arm_l0_orphan(
@@ -1309,44 +1459,56 @@ WHERE id = $3 AND status != $4 AND l0_planned != '' AND updated_at < $5;"#,
     ) -> Result<Vec<SegmentMeta>> {
         let pool = CLIENT_RO.clone();
         DB_QUERY_NUMS.with_label_values(&["select", TABLE]).inc();
-        let rows: Vec<SegmentRow> = sqlx::query_as(
+        // `status <> Built` spelled as two ranges so the literal keeps an
+        // index path (BitmapOr on `(status, created_at)`), and the built-grace
+        // arm takes `(status, updated_at)`. Newest-first: the LIMIT page keeps
+        // the segments a recent-window query needs, matching the caller's
+        // over-cap policy, instead of the oldest page (the pre-2026-09-29
+        // `min_ts ASC` cut the newest segments exactly when a backlog existed).
+        let sql = format!(
             r#"SELECT * FROM wal_segments
 WHERE max_ts >= $1 AND min_ts <= $2 AND streams LIKE $3 ESCAPE '\'
-  AND (status != $4 OR (status = $4 AND updated_at >= $5))
-ORDER BY min_ts ASC, id ASC
-LIMIT $6;"#,
-        )
-        .bind(start)
-        .bind(end)
-        .bind(pattern)
-        .bind(SegmentStatus::Built as i16)
-        .bind(include_built_after)
-        .bind(limit)
-        .fetch_all(&pool)
-        .await
-        .map_err(|e| {
-            Error::Message(format!(
-                "[WAL_SEGMENTS] query_unbuilt pattern={pattern} range=({start}, {end}): {e}"
-            ))
-        })?;
+  AND (status < {built} OR status > {built} OR (status = {built} AND updated_at >= $4))
+ORDER BY max_ts DESC, id DESC
+LIMIT $5;"#,
+            built = SegmentStatus::Built as i16
+        );
+        let rows: Vec<SegmentRow> = sqlx::query_as(&sql)
+            .bind(start)
+            .bind(end)
+            .bind(pattern)
+            .bind(include_built_after)
+            .bind(limit)
+            .fetch_all(&pool)
+            .await
+            .map_err(|e| {
+                Error::Message(format!(
+                    "[WAL_SEGMENTS] query_unbuilt pattern={pattern} range=({start}, {end}): {e}"
+                ))
+            })?;
         rows_into_metas(rows)
     }
 
     pub(super) async fn list_expired(cutoff: i64, limit: i64) -> Result<Vec<SegmentMeta>> {
         let pool = CLIENT_RO.clone();
         DB_QUERY_NUMS.with_label_values(&["select", TABLE]).inc();
-        let rows: Vec<SegmentRow> = sqlx::query_as(
+        // literal status + `(status, updated_at)`: an ordered index scan that
+        // stops after `limit` rows instead of a full scan and sort
+        let sql = format!(
             r#"SELECT * FROM wal_segments
-WHERE status = $1 AND updated_at < $2
+WHERE status = {built} AND updated_at < $1
 ORDER BY updated_at ASC, id ASC
-LIMIT $3;"#,
-        )
-        .bind(SegmentStatus::Built as i16)
-        .bind(cutoff)
-        .bind(limit)
-        .fetch_all(&pool)
-        .await
-        .map_err(|e| Error::Message(format!("[WAL_SEGMENTS] list_expired cutoff={cutoff}: {e}")))?;
+LIMIT $2;"#,
+            built = SegmentStatus::Built as i16
+        );
+        let rows: Vec<SegmentRow> = sqlx::query_as(&sql)
+            .bind(cutoff)
+            .bind(limit)
+            .fetch_all(&pool)
+            .await
+            .map_err(|e| {
+                Error::Message(format!("[WAL_SEGMENTS] list_expired cutoff={cutoff}: {e}"))
+            })?;
         rows_into_metas(rows)
     }
 
@@ -1385,54 +1547,73 @@ LIMIT $3;"#,
         // All-late segments in the open cohort are parked on purpose, so
         // they are not backlog. Closed-cohort rows still count, providing
         // the ops signal if the late lane stalls.
-        let count: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM wal_segments WHERE status != $1 AND created_at < $2 \
-             AND NOT ($3 > 0 AND (created_at - max_ts) >= $3 AND created_at >= $4);",
-        )
-        .bind(SegmentStatus::Built as i16)
-        .bind(cutoff)
-        .bind(late_lane)
-        .bind(late_boundary)
-        .fetch_one(&pool)
-        .await
-        .map_err(|e| {
-            Error::Message(format!(
-                "[WAL_SEGMENTS] count_unbuilt_older_than cutoff={cutoff}: {e}"
-            ))
-        })?;
+        let sql = format!(
+            "SELECT count(*) FROM wal_segments WHERE (status < {built} OR status > {built}) AND created_at < $1 \
+             AND NOT ($2 > 0 AND (created_at - max_ts) >= $2 AND created_at >= $3);",
+            built = SegmentStatus::Built as i16
+        );
+        let count: i64 = sqlx::query_scalar(&sql)
+            .bind(cutoff)
+            .bind(late_lane)
+            .bind(late_boundary)
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| {
+                Error::Message(format!(
+                    "[WAL_SEGMENTS] count_unbuilt_older_than cutoff={cutoff}: {e}"
+                ))
+            })?;
         Ok(count)
     }
 
     pub(super) async fn has_claimable(stale_before: i64, late_lane: i64) -> Result<bool> {
         let pool = CLIENT_RO.clone();
         DB_QUERY_NUMS.with_label_values(&["select", TABLE]).inc();
-        let row: Option<(i64,)> = sqlx::query_as(
-            r#"SELECT id FROM wal_segments
-WHERE (status = $1 AND ($4 <= 0 OR (created_at - max_ts) < $4)) OR (status = $2 AND updated_at < $3) LIMIT 1;"#,
-        )
-        .bind(SegmentStatus::Pending as i16)
-        .bind(SegmentStatus::Building as i16)
-        .bind(stale_before)
-        .bind(late_lane)
-        .fetch_optional(&pool)
-        .await
-        .map_err(|e| Error::Message(format!("[WAL_SEGMENTS] has_claimable: {e}")))?;
+        // Two ordered LIMIT-1 index probes instead of one OR'd `LIMIT 1`: the
+        // planner priced that as an early-exit seq scan (expected to hit
+        // within a dozen rows) while the qualifying rows sat at the end of the
+        // heap — 2,468 of 9,134 pages per probe, 3/s fleet-wide, and the
+        // whole heap whenever nothing was claimable (2026-09-29). ORDER BY on
+        // the `(status, X)` index keys makes the index scan the only sane plan.
+        let sql = format!(
+            r#"SELECT id FROM (
+    (SELECT id FROM wal_segments
+     WHERE status = {pending} AND ($2 <= 0 OR (created_at - max_ts) < $2)
+     ORDER BY created_at ASC LIMIT 1)
+    UNION ALL
+    (SELECT id FROM wal_segments
+     WHERE status = {building} AND updated_at < $1
+     ORDER BY updated_at ASC LIMIT 1)
+) AS probe LIMIT 1;"#,
+            pending = SegmentStatus::Pending as i16,
+            building = SegmentStatus::Building as i16
+        );
+        let row: Option<(i64,)> = sqlx::query_as(&sql)
+            .bind(stale_before)
+            .bind(late_lane)
+            .fetch_optional(&pool)
+            .await
+            .map_err(|e| Error::Message(format!("[WAL_SEGMENTS] has_claimable: {e}")))?;
         Ok(row.is_some())
     }
 
     pub(super) async fn has_late_claimable(late_lane: i64, late_boundary: i64) -> Result<bool> {
         let pool = CLIENT_RO.clone();
         DB_QUERY_NUMS.with_label_values(&["select", TABLE]).inc();
-        let row: Option<(i64,)> = sqlx::query_as(
+        // ORDER BY on the index key (see `has_claimable`); `created_at < $2`
+        // is the index range, the lag expression the heap filter
+        let sql = format!(
             r#"SELECT id FROM wal_segments
-WHERE status = $1 AND (created_at - max_ts) >= $2 AND created_at < $3 LIMIT 1;"#,
-        )
-        .bind(SegmentStatus::Pending as i16)
-        .bind(late_lane)
-        .bind(late_boundary)
-        .fetch_optional(&pool)
-        .await
-        .map_err(|e| Error::Message(format!("[WAL_SEGMENTS] has_late_claimable: {e}")))?;
+WHERE status = {pending} AND (created_at - max_ts) >= $1 AND created_at < $2
+ORDER BY created_at ASC LIMIT 1;"#,
+            pending = SegmentStatus::Pending as i16
+        );
+        let row: Option<(i64,)> = sqlx::query_as(&sql)
+            .bind(late_lane)
+            .bind(late_boundary)
+            .fetch_optional(&pool)
+            .await
+            .map_err(|e| Error::Message(format!("[WAL_SEGMENTS] has_late_claimable: {e}")))?;
         Ok(row.is_some())
     }
 
@@ -1442,23 +1623,24 @@ WHERE status = $1 AND (created_at - max_ts) >= $2 AND created_at < $3 LIMIT 1;"#
     ) -> Result<(i64, i64, i64)> {
         let pool = CLIENT_RO.clone();
         DB_QUERY_NUMS.with_label_values(&["select", TABLE]).inc();
-        let row: (i64, i64, i64) = sqlx::query_as(
-            // CAST is load-bearing: postgres sum(bigint) yields NUMERIC,
-            // which sqlx cannot decode as i64 — without it every
-            // claimable_stats call fails on prod meta, the build loop
-            // fails OPEN, and the #44 claim gate is silently bypassed
-            // (live sliver storm, 2026-08-13; unit tests run sqlite only
-            // and never executed this statement on postgres).
+        // CAST is load-bearing: postgres sum(bigint) yields NUMERIC,
+        // which sqlx cannot decode as i64 — without it every
+        // claimable_stats call fails on prod meta, the build loop
+        // fails OPEN, and the #44 claim gate is silently bypassed
+        // (live sliver storm, 2026-08-13; unit tests run sqlite only
+        // and never executed this statement on postgres).
+        let sql = format!(
             r#"SELECT count(*), coalesce(min(created_at), 0), CAST(coalesce(sum(size), 0) AS BIGINT) FROM wal_segments
-WHERE (status = $1 AND ($4 <= 0 OR (created_at - max_ts) < $4)) OR (status = $2 AND updated_at < $3);"#,
-        )
-        .bind(SegmentStatus::Pending as i16)
-        .bind(SegmentStatus::Building as i16)
-        .bind(stale_before)
-        .bind(late_lane)
-        .fetch_one(&pool)
-        .await
-        .map_err(|e| Error::Message(format!("[WAL_SEGMENTS] claimable_stats: {e}")))?;
+WHERE (status = {pending} AND ($2 <= 0 OR (created_at - max_ts) < $2)) OR (status = {building} AND updated_at < $1);"#,
+            pending = SegmentStatus::Pending as i16,
+            building = SegmentStatus::Building as i16
+        );
+        let row: (i64, i64, i64) = sqlx::query_as(&sql)
+            .bind(stale_before)
+            .bind(late_lane)
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| Error::Message(format!("[WAL_SEGMENTS] claimable_stats: {e}")))?;
         Ok(row)
     }
 }
@@ -1489,6 +1671,7 @@ CREATE TABLE IF NOT EXISTS wal_segments
     status       SMALLINT     default 0 not null,
     builder_node VARCHAR(64)  default '' not null,
     l0_planned   TEXT         default '' not null,
+    stream_ranges TEXT        default '' not null,
     created_at   BIGINT       not null,
     updated_at   BIGINT       not null
 );
@@ -1505,16 +1688,28 @@ CREATE TABLE IF NOT EXISTS wal_segments
                 .map_err(|e| {
                     Error::Message(format!("[WAL_SEGMENTS] add l0_planned column failed: {e}"))
                 })?;
+            add_column(&client, TABLE, "stream_ranges", "TEXT NOT NULL DEFAULT ''")
+                .await
+                .map_err(|e| {
+                    Error::Message(format!(
+                        "[WAL_SEGMENTS] add stream_ranges column failed: {e}"
+                    ))
+                })?;
             // lock released before create_index (it takes the same lock)
         }
 
+        // same index set as postgres (object_key_idx dropped, see there)
         let indices: Vec<(&str, bool, &[&str])> = vec![
             ("wal_segments_node_seq_idx", true, &["node_uuid", "seq"]),
-            ("wal_segments_object_key_idx", true, &["object_key"]),
             (
                 "wal_segments_status_created_at_idx",
                 false,
                 &["status", "created_at"],
+            ),
+            (
+                "wal_segments_status_updated_at_idx",
+                false,
+                &["status", "updated_at"],
             ),
             ("wal_segments_max_ts_idx", false, &["max_ts"]),
         ];
@@ -1524,7 +1719,11 @@ CREATE TABLE IF NOT EXISTS wal_segments
         Ok(())
     }
 
-    pub(super) async fn add(meta: &SegmentMeta, streams_json: &str) -> Result<i64> {
+    pub(super) async fn add(
+        meta: &SegmentMeta,
+        streams_json: &str,
+        ranges_json: &str,
+    ) -> Result<i64> {
         let now = now_micros();
         let client = CLIENT_RW.clone();
         let client = client.lock().await;
@@ -1532,8 +1731,8 @@ CREATE TABLE IF NOT EXISTS wal_segments
         // in-process writer, so insert + lookup is atomic here
         let ret = sqlx::query(
             r#"INSERT INTO wal_segments
-    (node_uuid, seq, object_key, min_ts, max_ts, size, streams, status, builder_node, created_at, updated_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, '', $9, $10)
+    (node_uuid, seq, object_key, min_ts, max_ts, size, streams, status, builder_node, created_at, updated_at, stream_ranges)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, '', $9, $10, $11)
 ON CONFLICT (node_uuid, seq) DO NOTHING;"#,
         )
         .bind(&meta.node_uuid)
@@ -1546,6 +1745,7 @@ ON CONFLICT (node_uuid, seq) DO NOTHING;"#,
         .bind(SegmentStatus::Pending as i16)
         .bind(now)
         .bind(now)
+        .bind(ranges_json)
         .execute(&*client)
         .await
         .map_err(|e| {
@@ -1948,7 +2148,7 @@ WHERE id = $3 AND status != $4 AND l0_planned != '' AND updated_at < $5;"#,
             r#"SELECT * FROM wal_segments
 WHERE max_ts >= $1 AND min_ts <= $2 AND streams LIKE $3 ESCAPE '\'
   AND (status != $4 OR (status = $4 AND updated_at >= $5))
-ORDER BY min_ts ASC, id ASC
+ORDER BY max_ts DESC, id DESC
 LIMIT $6;"#,
         )
         .bind(start)
@@ -2123,6 +2323,7 @@ mod tests {
             max_ts,
             size: 1024,
             streams: streams.iter().map(|s| s.to_string()).collect(),
+            stream_ranges: Vec::new(),
             status: SegmentStatus::Pending,
             builder_node: String::new(),
             created_at: 0,
@@ -2725,8 +2926,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             hits.iter().map(|m| m.id).collect::<Vec<_>>(),
-            vec![id_a, id_d],
-            "expected exact-token, in-range segments ordered by min_ts"
+            vec![id_d, id_a],
+            "expected exact-token, in-range segments newest (max_ts) first"
         );
 
         // wide range picks up C too
@@ -2735,16 +2936,17 @@ mod tests {
             .unwrap();
         assert_eq!(
             hits.iter().map(|m| m.id).collect::<Vec<_>>(),
-            vec![id_a, id_d, id_c]
+            vec![id_c, id_d, id_a]
         );
 
-        // LIMIT truncates after the (min_ts, id) ordering; 0 short-circuits
+        // LIMIT keeps the NEWEST page of the (max_ts DESC, id DESC) ordering —
+        // the page a recent-window query needs under backlog; 0 short-circuits
         let hits = query_unbuilt("org1", "logs", "app1", (T0, T0 + 10_000), 0, 2)
             .await
             .unwrap();
         assert_eq!(
             hits.iter().map(|m| m.id).collect::<Vec<_>>(),
-            vec![id_a, id_d],
+            vec![id_c, id_d],
             "limit must keep the first rows of the same ordering"
         );
         assert!(
@@ -2770,7 +2972,7 @@ mod tests {
                 .iter()
                 .map(|m| m.id)
                 .collect::<Vec<_>>(),
-            vec![id_a, id_d]
+            vec![id_d, id_a]
         );
         assert!(
             !query_unbuilt("org1", "logs", "app1", (T0 + 2001, T0 + 3000), 0, 1000)
@@ -3522,5 +3724,164 @@ mod tests {
             .unwrap()
             .is_empty()
         );
+    }
+
+    // ---- per-stream ranges (P2 v2, 2026-09-29) ------------------------------
+
+    #[test]
+    fn stream_ranges_round_outward_and_clamp_to_the_segment() {
+        let min_ts = T0;
+        let max_ts = T0 + 3_600_000_000;
+        // lo 1.9 s in -> floor 1 s; hi 2.1 s in -> ceil 3 s; exact seconds stay
+        let ranges = vec![
+            (T0 + 1_900_000, T0 + 2_100_000),
+            (T0, T0 + 3_600_000_000),
+            (T0 + 5_000_000, T0 + 5_000_000),
+        ];
+        let raw = encode_stream_ranges(&ranges, min_ts);
+        assert_eq!(raw, "[[1,3],[0,3600],[5,5]]");
+        let decoded = decode_stream_ranges(&raw, min_ts, max_ts, 3).unwrap();
+        // every reconstructed range CONTAINS the original (never narrower)
+        for ((lo, hi), (dlo, dhi)) in ranges.iter().zip(&decoded) {
+            assert!(dlo <= lo && dhi >= hi, "{decoded:?} must cover {ranges:?}");
+        }
+        assert_eq!(decoded[0], (T0 + 1_000_000, T0 + 3_000_000));
+        // the ceil never pushes hi past the segment's own max_ts
+        let raw = encode_stream_ranges(&[(T0 + 100, max_ts)], min_ts);
+        assert_eq!(raw, "[[0,3600]]");
+        assert_eq!(
+            decode_stream_ranges(&raw, min_ts, max_ts, 1).unwrap(),
+            vec![(T0, max_ts)]
+        );
+        // unknown encodes as empty text
+        assert_eq!(encode_stream_ranges(&[], min_ts), "");
+    }
+
+    #[test]
+    fn stream_ranges_decode_rejects_anything_malformed() {
+        let (lo, hi) = (T0, T0 + 10_000_000);
+        assert!(decode_stream_ranges("", lo, hi, 1).is_none());
+        assert!(
+            decode_stream_ranges("[[0,1]]", lo, hi, 2).is_none(),
+            "count mismatch"
+        );
+        assert!(
+            decode_stream_ranges("[[3,1]]", lo, hi, 1).is_none(),
+            "lo > hi"
+        );
+        assert!(
+            decode_stream_ranges("[[0]]", lo, hi, 1).is_none(),
+            "not a pair"
+        );
+        assert!(
+            decode_stream_ranges("[[-1,1]]", lo, hi, 1).is_none(),
+            "negative"
+        );
+        assert!(decode_stream_ranges("{\"a\":1}", lo, hi, 1).is_none());
+        assert!(decode_stream_ranges("garbage", lo, hi, 1).is_none());
+    }
+
+    #[test]
+    fn range_for_is_none_unless_aligned() {
+        let mut m = seg("n", 1, T0, T0 + 9_000_000, &["o/logs/a", "o/logs/b"]);
+        assert_eq!(m.range_for("o/logs/a"), None, "no ranges -> unknown");
+        m.stream_ranges = vec![(T0, T0 + 1_000_000), (T0 + 5_000_000, T0 + 9_000_000)];
+        assert_eq!(m.range_for("o/logs/a"), Some((T0, T0 + 1_000_000)));
+        assert_eq!(
+            m.range_for("o/logs/b"),
+            Some((T0 + 5_000_000, T0 + 9_000_000))
+        );
+        assert_eq!(m.range_for("o/logs/zzz"), None, "absent stream");
+        m.stream_ranges.pop();
+        assert_eq!(m.range_for("o/logs/a"), None, "misaligned -> unknown");
+    }
+
+    #[tokio::test]
+    async fn add_rejects_ranges_that_do_not_fit_the_segment() {
+        let _guard = setup().await;
+        let mut m = seg("n-r", 1, T0, T0 + 9_000_000, &["o/logs/a", "o/logs/b"]);
+        m.stream_ranges = vec![(T0, T0 + 1_000_000)];
+        assert!(
+            matches!(add(&m).await, Err(Error::InvalidFileMeta(_))),
+            "count"
+        );
+        m.stream_ranges = vec![(T0 - 1, T0 + 1_000_000), (T0, T0 + 9_000_000)];
+        assert!(
+            matches!(add(&m).await, Err(Error::InvalidFileMeta(_))),
+            "lo < min_ts"
+        );
+        m.stream_ranges = vec![(T0, T0 + 1_000_000), (T0, T0 + 9_000_001)];
+        assert!(
+            matches!(add(&m).await, Err(Error::InvalidFileMeta(_))),
+            "hi > max_ts"
+        );
+        m.stream_ranges = vec![(T0 + 2_000_000, T0 + 1_000_000), (T0, T0 + 9_000_000)];
+        assert!(
+            matches!(add(&m).await, Err(Error::InvalidFileMeta(_))),
+            "lo > hi"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_ranges_survive_add_and_query_and_old_rows_stay_unknown() {
+        let _guard = setup().await;
+        // one segment carrying ranges: logs frames early, traces frames late
+        let mut with = seg(
+            "n-rt",
+            1,
+            T0,
+            T0 + 3_600_000_000,
+            &["org1/logs/app1", "org1/traces/spans"],
+        );
+        with.stream_ranges = vec![
+            (T0 + 1_500_000, T0 + 2_500_000),
+            (T0 + 3_000_000_000, T0 + 3_600_000_000),
+        ];
+        let id_with = add(&with).await.unwrap();
+        // one registered without ranges (older ingester)
+        let id_without = add(&seg("n-rt", 2, T0, T0 + 3_600_000_000, &["org1/logs/app1"]))
+            .await
+            .unwrap();
+
+        let hits = query_unbuilt("org1", "logs", "app1", (T0, T0 + 3_600_000_000), 0, 100)
+            .await
+            .unwrap();
+        let by_id = |id: i64| hits.iter().find(|m| m.id == id).unwrap();
+        // outward rounding: [1.5 s, 2.5 s] -> [1 s, 3 s]
+        assert_eq!(
+            by_id(id_with).range_for("org1/logs/app1"),
+            Some((T0 + 1_000_000, T0 + 3_000_000))
+        );
+        assert_eq!(
+            by_id(id_with).range_for("org1/traces/spans"),
+            Some((T0 + 3_000_000_000, T0 + 3_600_000_000))
+        );
+        assert_eq!(by_id(id_without).range_for("org1/logs/app1"), None);
+
+        // the SQL itself still selects by whole-segment overlap: pruning by
+        // the stream's own range is the caller's job (segments_scan)
+        let late_window = query_unbuilt(
+            "org1",
+            "logs",
+            "app1",
+            (T0 + 3_000_000_000, T0 + 3_600_000_000),
+            0,
+            100,
+        )
+        .await
+        .unwrap();
+        assert!(late_window.iter().any(|m| m.id == id_with));
+
+        // a poisoned column fails OPEN: the row is returned with no ranges
+        raw_exec(&format!(
+            "UPDATE wal_segments SET stream_ranges = '[[9' WHERE id = {id_with};"
+        ))
+        .await;
+        let hits = query_unbuilt("org1", "logs", "app1", (T0, T0 + 3_600_000_000), 0, 100)
+            .await
+            .unwrap();
+        let poisoned = hits.iter().find(|m| m.id == id_with).unwrap();
+        assert!(poisoned.stream_ranges.is_empty());
+        assert_eq!(poisoned.range_for("org1/logs/app1"), None);
     }
 }

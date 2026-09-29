@@ -719,6 +719,7 @@ mod tests {
             max_ts: T0 + 1000,
             size: 128,
             streams: vec!["org1/logs/app1".to_string()],
+            stream_ranges: Vec::new(),
             status: SegmentStatus::Pending,
             builder_node: String::new(),
             created_at: 0,

@@ -640,11 +640,45 @@ pub async fn list_candidates(
     )
     .await?;
     let stream = format!("{org_id}/{stream_type}/{stream_name}");
-    let (candidates, shortfall) = apply_query_cap(candidates, &stream);
+    let (candidates, shortfall) = prune_and_cap(candidates, &stream, time_range);
     if let Some(sf) = &shortfall {
         log::warn!("[SEGMENT:SCAN] {}", sf.message());
     }
     Ok((candidates, shortfall))
+}
+
+/// Drop the segments whose OWN range for `stream` misses the query window,
+/// then apply the cap. The SQL selects by whole-segment overlap; a segment
+/// shared by many streams spans the union of their frames, so for one stream
+/// most of those rows are fetched for nothing (85 % zero-yield on the logs
+/// tail, 2026-09). Rows without ranges (`range_for` = `None`) are kept: unknown
+/// fails open. The page is sized BEFORE pruning — a full page means unbuilt
+/// rows beyond it were never inspected, so the shortfall is reported even when
+/// pruning brings the kept set under the cap.
+fn prune_and_cap(
+    mut candidates: Vec<SegmentMeta>,
+    stream: &str,
+    (start, end): (i64, i64),
+) -> (Vec<SegmentMeta>, Option<SegmentShortfall>) {
+    let fetched = candidates.len();
+    candidates.retain(|m| {
+        m.range_for(stream)
+            .is_none_or(|(lo, hi)| hi >= start && lo <= end)
+    });
+    let pruned = fetched - candidates.len();
+    if pruned > 0 {
+        log::debug!(
+            "[SEGMENT:SCAN] {stream}: {pruned} of {fetched} unbuilt segments pruned by their own stream range"
+        );
+    }
+    let (kept, shortfall) = apply_query_cap(candidates, stream);
+    let shortfall = shortfall.or_else(|| {
+        (fetched > MAX_QUERY_SEGMENTS).then(|| SegmentShortfall {
+            skipped: fetched - MAX_QUERY_SEGMENTS,
+            stream: stream.to_string(),
+        })
+    });
+    (kept, shortfall)
 }
 
 /// Keep the NEWEST [`MAX_QUERY_SEGMENTS`] candidates and report the rest as
@@ -3939,6 +3973,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn prune_keeps_unknown_and_overlapping_ranges_and_drops_disjoint_ones() {
+        let stream = "org1/logs/app1";
+        let with_range = |id: i64, lo: i64, hi: i64| {
+            let mut m = seg_meta(id, 0, 1_000);
+            m.stream_ranges = vec![(lo, hi)];
+            m
+        };
+        let candidates = vec![
+            seg_meta(1, 0, 1_000),     // no ranges: unknown -> kept
+            with_range(2, 350, 450),   // inside the window
+            with_range(3, 0, 300),     // hi == start: boundary overlap kept
+            with_range(4, 600, 900),   // lo == end: boundary overlap kept
+            with_range(5, 0, 299),     // ends just before the window
+            with_range(6, 601, 1_000), // starts just after the window
+            with_range(7, 0, 1_000),   // covers the window
+        ];
+        let (kept, sf) = prune_and_cap(candidates, stream, (300, 600));
+        assert_eq!(
+            kept.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 7],
+            "disjoint ranges pruned, unknown and touching ranges kept"
+        );
+        assert!(sf.is_none(), "under the cap and a short page: no shortfall");
+
+        // a range for ANOTHER stream must not prune this one (misaligned ->
+        // unknown -> kept)
+        let mut foreign = seg_meta(8, 0, 1_000);
+        foreign.streams = vec!["org1/logs/other".to_string()];
+        foreign.stream_ranges = vec![(0, 10)];
+        let (kept, _) = prune_and_cap(vec![foreign], stream, (300, 600));
+        assert_eq!(kept.len(), 1);
+    }
+
+    #[test]
+    fn prune_still_reports_a_full_page_as_a_shortfall() {
+        let stream = "org1/logs/app1";
+        // a full SQL page (cap + 1) where pruning drops half: the kept set is
+        // far under the cap, yet rows beyond the page were never seen
+        let candidates: Vec<SegmentMeta> = (1..=(MAX_QUERY_SEGMENTS as i64 + 1))
+            .map(|i| {
+                let mut m = seg_meta(i, 0, 1_000);
+                m.stream_ranges = vec![if i % 2 == 0 { (0, 10) } else { (400, 500) }];
+                m
+            })
+            .collect();
+        let (kept, sf) = prune_and_cap(candidates, stream, (300, 600));
+        // odd ids 1..=10_001 survive: 5,001 rows, far under the cap
+        assert_eq!(kept.len(), MAX_QUERY_SEGMENTS / 2 + 1);
+        let sf = sf.expect("full page must still report a shortfall");
+        assert_eq!(sf.skipped, 1);
+        assert_eq!(sf.stream, stream);
+    }
+
     fn seg_meta(id: i64, min_ts: i64, max_ts: i64) -> SegmentMeta {
         SegmentMeta {
             id,
@@ -3949,6 +4037,7 @@ mod tests {
             max_ts,
             size: 1024,
             streams: vec!["org1/logs/app1".to_string()],
+            stream_ranges: Vec::new(),
             status: wal_segments::SegmentStatus::Pending,
             builder_node: String::new(),
             created_at: min_ts,

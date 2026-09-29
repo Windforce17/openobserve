@@ -22,7 +22,7 @@
 //! turning appends into 503s is the designed backpressure.
 
 use std::{
-    collections::BTreeSet,
+    collections::BTreeMap,
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
@@ -186,7 +186,12 @@ async fn ship(frames: Vec<SegmentFrame>) -> Result<(), anyhow::Error> {
     let object_key = segment_object_key(&header.node_uuid, header.seq);
 
     let frame_count = frames.len();
-    let (min_ts, max_ts, streams) = fold_frame_meta(&frames);
+    let FoldedMeta {
+        min_ts,
+        max_ts,
+        streams,
+        stream_ranges,
+    } = fold_frame_meta(&frames);
     let stream_count = streams.len();
 
     // zstd over up to the whole buffer cap — keep it off the async workers.
@@ -226,6 +231,7 @@ async fn ship(frames: Vec<SegmentFrame>) -> Result<(), anyhow::Error> {
         size: i64::try_from(size)
             .map_err(|_| anyhow!("segment {object_key}: size {size} overflows i64"))?,
         streams,
+        stream_ranges,
         status: SegmentStatus::Pending,
         builder_node: String::new(),
         created_at: now,
@@ -346,26 +352,40 @@ fn segment_object_key(node_uuid: &str, seq: u64) -> String {
     format!("wal_segments/{node_uuid}/{seq:020}")
 }
 
+/// Registration metadata folded across the segment's frames.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FoldedMeta {
+    min_ts: i64,
+    max_ts: i64,
+    /// Sorted, deduped "org/stream_type/stream" identities.
+    streams: Vec<String>,
+    /// Each stream's own `[min_ts, max_ts]`, aligned with `streams`: the
+    /// querier prunes segments by the range of the ONE stream it reads, not
+    /// by the whole-segment range a late frame of another stream stretched
+    /// (85 % of the segments a logs query fetched yielded nothing, 2026-09).
+    stream_ranges: Vec<(i64, i64)>,
+}
+
 /// Fold registration metadata across the segment's frames: min/max ts (with
-/// i64::MAX/MIN identities — never in-band "unset" markers) and the sorted,
-/// deduped "org/stream_type/stream" identities.
+/// i64::MAX/MIN identities — never in-band "unset" markers), the sorted,
+/// deduped "org/stream_type/stream" identities, and each stream's own range.
 ///
-/// `min_ts` is clamped to at least 1: registration validation rejects a
-/// non-positive `min_ts` as degenerate, and one frame carrying a zero (epoch
-/// default) or negative timestamp must not make the whole segment
-/// unregistrable. Over-inclusive time-range pruning is harmless; a wedged
-/// segment is not.
-fn fold_frame_meta(frames: &[SegmentFrame]) -> (i64, i64, Vec<String>) {
+/// `min_ts` (whole-segment and per-stream) is clamped to at least 1:
+/// registration validation rejects a non-positive `min_ts` as degenerate,
+/// and one frame carrying a zero (epoch default) or negative timestamp must
+/// not make the whole segment unregistrable. Over-inclusive time-range
+/// pruning is harmless; a wedged segment is not.
+fn fold_frame_meta(frames: &[SegmentFrame]) -> FoldedMeta {
     let mut min_ts = i64::MAX;
     let mut max_ts = i64::MIN;
-    let mut streams = BTreeSet::new();
+    let mut ranges: BTreeMap<String, (i64, i64)> = BTreeMap::new();
     for frame in frames {
         min_ts = min_ts.min(frame.min_ts);
         max_ts = max_ts.max(frame.max_ts);
-        streams.insert(format!(
-            "{}/{}/{}",
-            frame.org, frame.stream_type, frame.stream
-        ));
+        let key = format!("{}/{}/{}", frame.org, frame.stream_type, frame.stream);
+        let range = ranges.entry(key).or_insert((i64::MAX, i64::MIN));
+        range.0 = range.0.min(frame.min_ts);
+        range.1 = range.1.max(frame.max_ts);
     }
     if min_ts <= 0 {
         log::warn!(
@@ -374,7 +394,20 @@ fn fold_frame_meta(frames: &[SegmentFrame]) -> (i64, i64, Vec<String>) {
         );
         min_ts = 1;
     }
-    (min_ts, max_ts, streams.into_iter().collect())
+    let streams: Vec<String> = ranges.keys().cloned().collect();
+    // BTreeMap iteration order == `streams` order, so the pairs stay aligned;
+    // a stream's frames all fit inside the segment fold by construction, and
+    // the same clamp keeps `lo >= min_ts` after clamping.
+    let stream_ranges = ranges
+        .into_values()
+        .map(|(lo, hi)| (lo.max(1), hi))
+        .collect();
+    FoldedMeta {
+        min_ts,
+        max_ts,
+        streams,
+        stream_ranges,
+    }
 }
 
 #[cfg(test)]
@@ -427,43 +460,55 @@ mod tests {
             frame("org2", StreamType::Traces, "spans", 5, 7),
             frame("org1", StreamType::Metrics, "cpu", 3, 4),
         ];
-        let (min_ts, max_ts, streams) = fold_frame_meta(&frames);
+        let folded = fold_frame_meta(&frames);
         // a positive fold is passed through unclamped
-        assert_eq!(min_ts, 3);
-        assert_eq!(max_ts, 20);
+        assert_eq!(folded.min_ts, 3);
+        assert_eq!(folded.max_ts, 20);
         // sorted and deduped
         assert_eq!(
-            streams,
+            folded.streams,
             vec![
                 "org1/logs/app1".to_string(),
                 "org1/metrics/cpu".to_string(),
                 "org2/traces/spans".to_string(),
             ]
         );
+        // per-stream ranges: each stream's own frames only, aligned with
+        // `streams` — the traces stream does NOT inherit the logs frames'
+        // [3, 20] the whole-segment range carries
+        assert_eq!(folded.stream_ranges, vec![(3, 20), (3, 4), (5, 7)]);
     }
 
     #[test]
     fn fold_meta_clamps_non_positive_min_ts_to_one() {
         // one epoch-default frame among normal ones: the registration
-        // validator rejects min_ts <= 0, so the fold must never emit it
+        // validator rejects min_ts <= 0, so the fold must never emit it —
+        // for the segment AND for the stream that carried the bad frame
         let frames = vec![
             frame("org1", StreamType::Logs, "app1", 0, 7),
             frame("org1", StreamType::Logs, "app1", 10, 20),
+            frame("org2", StreamType::Traces, "spans", 5, 7),
         ];
+        let folded = fold_frame_meta(&frames);
+        assert_eq!((folded.min_ts, folded.max_ts), (1, 20));
         assert_eq!(
-            fold_frame_meta(&frames),
-            (1, 20, vec!["org1/logs/app1".to_string()])
+            folded.streams,
+            vec![
+                "org1/logs/app1".to_string(),
+                "org2/traces/spans".to_string()
+            ]
         );
+        assert_eq!(folded.stream_ranges, vec![(1, 20), (5, 7)]);
 
         // negative folds clamp the same way
         let frames = vec![frame("org1", StreamType::Logs, "app1", -5, 20)];
-        let (min_ts, max_ts, _) = fold_frame_meta(&frames);
-        assert_eq!((min_ts, max_ts), (1, 20));
+        let folded = fold_frame_meta(&frames);
+        assert_eq!((folded.min_ts, folded.max_ts), (1, 20));
+        assert_eq!(folded.stream_ranges, vec![(1, 20)]);
 
         // min_ts == 1 is already valid: no clamp
         let frames = vec![frame("org1", StreamType::Logs, "app1", 1, 2)];
-        let (min_ts, ..) = fold_frame_meta(&frames);
-        assert_eq!(min_ts, 1);
+        assert_eq!(fold_frame_meta(&frames).min_ts, 1);
     }
 
     #[test]
