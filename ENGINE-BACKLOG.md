@@ -3,6 +3,107 @@
 Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
 (deleted 2026-07-29; full history in git). Keep THIS file current.
 
+## 2026-09-29 — P2 shipped as `.176` and rolled back within 30 min: the per-stream side table stalled the shared meta DB (commit latency 40–60×, ingest 503s); ranges must live in the segment row
+- What shipped (vix-arch `013c45010` + NATS retry `76fe754b5`, image
+  `v0.93.0-vix-20260929.176`, GitOps #569 querier 06:15Z / #570 rest, all
+  roles live 06:21Z): a `wal_segment_streams (segment_id FK ON DELETE
+  CASCADE, stream, min_ts, max_ts)` side table, pkey `(segment_id, stream)`
+  + index `(stream, segment_id)`; the ingester registers each segment as
+  two autocommit statements (`INSERT wal_segments … RETURNING id`, then one
+  multi-row `INSERT wal_segment_streams … ON CONFLICT DO NOTHING`, ~67
+  rows/segment); the querier's `query_unbuilt` LEFT JOINs the range row
+  for its stream (fail-open when absent).
+- The pruning itself worked, measured on the same shapes before/after
+  (leader-appended segments → loaded / zero-yield / `segments_scan` sum):
+  logs count 1 h `.175` 329 loaded, **89 % zero-yield**, 1,469 ms →
+  `.176` 52 loaded, 19 %, 680 ms; traces count 1 h 381 / 56 % / 1,742 ms →
+  198 / 8 % / 1,189 ms; traces needle 1 h 218 loaded / 8 %. Wall times
+  `logs count 1 h` r1/r2/r3 1,476 / 180 / 453 ms, traces count 2,281 /
+  455 / 469 ms, needle 2,256 / 577 / 765 ms (measured 06:20–06:32Z while
+  the incident below was already building — treat as indicative only).
+- Incident (all UTC; Orbit `k8s_prod_ops_logs`, fields are dotted now:
+  `"k8s.namespace.name"='obs'`): `slow statement` WARNs per 10 min were
+  0–137 for the 7 h before (mostly compactor claims), then 06:20 **875**,
+  06:30 **1,801**, 06:40 **2,349**; ingester `segment buffer full` 503s
+  0 for 7 h → 06:30 1,328 → **06:40 145,762** (ingester-4 1,014 lines in
+  3 min, ingester-2 44; each line one rejected write request — client
+  retries/drops not measurable from here). `INSERT wal_segment_streams`
+  2.3–5.8 s then 80 s, `INSERT wal_segments` 1.8–3.8 s, builder claim CTE
+  and `has_claimable` **63–85 s**, `query_unbuilt` `EXPLAIN ANALYZE`
+  **Planning 16,710 ms** / execution 6,540 ms with every buffer a shared
+  hit (Gather Merge over a Parallel Seq Scan of the whole `wal_segments`
+  heap: 9,596 outer rows, 13,408 buffers per call). `pg_stat_activity`
+  waits: `LWLock:BufferContent` on `wal_segments` and
+  **`IO:AuroraStorageLogAllocate`**; connections 440 → 723. Unbuilt
+  segments 7,120 at 06:34.
+- Aurora writer `obs-prod-2` (PostgreSQL 17.9, db.r7g.xlarge, Performance
+  Insights OFF, `pg_stat_wal` unsupported), CloudWatch 1-min: CPU
+  **28–39 % throughout** (one 75 % minute at 06:25) — not CPU-bound;
+  **WriteIOPS 1.1 k → 5.0–5.9 k sustained** 06:30–06:45 (the DB already
+  bursts to 8.5 k at the top of every hour, 12–13 k at 07:00 during the
+  drain); **CommitLatency 0.5 ms → 19.8 / 4.9 / 31.1 ms** at 06:30 /
+  06:40 / 06:45. Mechanism: log-allocation stall on the writer → every
+  frequent committer (claims, heartbeats, registration) queues; heap/index
+  buffer locks are held across the stalled `XLogInsert`, hence the
+  BufferContent waits; ingester registration serialises the uploader, so
+  the 512 MB segment buffer fills and appends 503.
+- Rollback: GitOps #571 merged 06:45:30Z (querier → `.175`, compactor /
+  ingester / router → `.174`), Argo synced 06:45:34Z, compactors and
+  queriers replaced by 06:47, ingesters (STS, one at a time) 4/5 by 06:49,
+  5/5 by 06:56. At 06:47:42 no statement > 2 s; 06:50 bucket 70 slow
+  statements / 15 503s;
+  07:02 unbuilt 1,232 (40 pending), `segment buffer full` 0 on every pod
+  for 10 min, CommitLatency 0.4–0.8 ms, 0 new restarts. Slow statements
+  stay ~700/10 min (mostly compactor claims) while the 7 k backlog drains
+  at 1,192 building at once — recheck after the drain. Correction to the
+  #571 commit message: `wal_segments` heap is 71 MB; the "595 MB" is the
+  total with its 480 MB of indexes — no evidence the heap grew.
+- Cascade exposure closed 07:05:02Z: the `.174` sweeper (`retain` 3,600 s)
+  would have reached the `.176` cohort (13,341 Built segments, built
+  06:19–07:00Z, all 1,155,931 side rows) at ~07:19Z and the DB-level `ON
+  DELETE CASCADE` would have deleted ~480 child rows/s for ~40 min on the
+  same DB. `ALTER TABLE wal_segment_streams DROP CONSTRAINT
+  wal_segment_streams_segment_id_fkey` under `lock_timeout 2 s` succeeded
+  first try (0 RI triggers left on `wal_segments`, no stalled statement).
+  The table stays for diagnosis, unused by `.174`/`.175`; **`DROP TABLE
+  wal_segment_streams` (365 MB total) at a quiet minute** — instant,
+  catalog-only.
+- Source: `013c45010` reverted on vix-arch (`70d37e3c6`); the NATS retry
+  stays. HEAD is releasable again.
+- Why the write side tipped: baseline (post-rollback, 90 s window) whole-DB
+  325 commits/s and 1,288 row writes/s; `wal_segments` alone 8.5 ins / 36
+  upd (13 HOT → ~23 non-HOT/s, each rewriting **5 indexes**) / 8 del per
+  second, **10 seq scans/s** (26 M lifetime, 731 G tuples read — the
+  `has_claimable`/claim shapes `status = $1 AND ($4 <= 0 OR …)` never use
+  `status_created_at_idx`), 176 M lifetime updates on 28 k live rows,
+  480 MB of indexes incl. `wal_segments_object_key_idx` **192 MB, 0 scans
+  ever**. `.176` added ~570 side rows/s (+44 % of all row writes) with 2
+  index entries each, 67 scattered `(stream, segment_id)` insert points
+  per statement (`stream_idx` 177 MB at ~40 % fill after 1.15 M rows) and
+  an FK KEY SHARE lock on each fresh parent row. The 4–5× WriteIOPS jump
+  is larger than the row count alone explains; Aurora's per-record /
+  per-commit log accounting can't be attributed further without PI.
+- Design decision (P2, second attempt): **no new rows, tables, indexes or
+  FKs in the meta DB per segment.** Carry the per-stream `[min_ts,
+  max_ts]` inside the existing `wal_segments.streams` JSON (one row write,
+  no extra index maintenance; the row is ~905 B today), keep
+  `query_unbuilt`'s SQL exactly as `.175` and prune stream-absent /
+  time-disjoint segments in the querier from the JSON before any fetch
+  (the `LIMIT` cap then counts pruned rows — raise it or accept the
+  shortfall path). Older rows without ranges fail open, as before. Before
+  any release that touches the meta DB again: enable Performance Insights
+  on `obs-prod-2` (free 7-day tier) so top-SQL-by-load exists, and take the
+  `pg_stat_user_tables`/`pg_stat_user_indexes` deltas over a 5-min window
+  as the acceptance gate (row writes/s, seq scans/s, CommitLatency).
+- Pre-existing meta-DB debt exposed (separate items, in order): drop the
+  never-read `wal_segments_object_key_idx` (−1/5 of every non-HOT update's
+  index cost, −192 MB) after confirming it isn't a UNIQUE constraint the
+  ingester relies on; make `has_claimable`/claim index-able (split the `$4
+  <= 0 OR` into two statements or a partial index on `status`) — 10 full
+  heap scans/s of a 71 MB heap is the floor of every claim; the hourly
+  8–13 k WriteIOPS burst (attribute: `file_list` hour job vs `l0_planned`
+  marking).
+
 ## 2026-09-28 — `.173` definitive numbers; needle lookups full-scanned the unstamped hours (fix: per-file sidecar bloom probes + a settled-only `.bf` queue)
 - Fleet at 14:52Z, 3 days undisturbed: queriers 10/10 `.173` (7 pods 3 d,
   two node-churn replacements 24 h / 8 h; `restartCount` 0), RSS 6.6–8.9 GB
@@ -228,12 +329,12 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
   follower ≈ the whole 12.9 GB pool; 4 GiB leaves room for two concurrent
   wide scans). Tests: `search::grpc::storage::tests` 4 (newest prefix +
   message, no-op within budget / off, ≥ 1 file kept).
-- Still open: P2 Segment-WAL tail pre-fetch pruning (registry per-stream
-  min/max + tiny bloom; the 85 % zero-yield is the whole logs-count residual
-  AND ~0.4–2 s of every needle lookup); P3 bloom-only sidecar for logs L0s
-  (2,247 `no_sidecar` probes in 10 min — measure builder CPU under the
-  CHUNK_MB 512 brake first); `.bf` pass parallelism (300 serial bucket
-  attempts ≈ 6 min).
+- Still open: P2 Segment-WAL tail pre-fetch pruning — shipped as `.176`
+  and rolled back the same morning (meta-DB write stall; see the
+  2026-09-29 section: ranges go inside the segment row next); P3
+  bloom-only sidecar for logs L0s (2,247 `no_sidecar` probes in 10 min —
+  measure builder CPU under the CHUNK_MB 512 brake first); `.bf` pass
+  parallelism (300 serial bucket attempts ≈ 6 min).
 
 ## 2026-09-25 — aggregate gap vs O2: data-only counts, waiting growth, un-droppable warming (.171 → .172)
 - Fix round for the root cause below (`root cause of "still slower than
