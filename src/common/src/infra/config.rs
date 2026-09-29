@@ -94,8 +94,12 @@ pub static ORG_STATUS_CACHE: Lazy<Arc<RwHashMap<String, OrgStatus>>> =
 
 /// System settings cache
 /// Key format: "{scope}:{org_id}:{user_id}:{setting_key}" where org_id/user_id can be "_" if not
-/// applicable
-pub static SYSTEM_SETTINGS: Lazy<Arc<RwAHashMap<String, SystemSetting>>> =
+/// applicable. `None` is a confirmed miss: a key the database does not hold.
+/// Misses are cached because the hot paths ask for settings that are usually
+/// absent (trace ingest reads the Gen-AI agent mapping per request — 79
+/// meta-DB round trips/s on prod for zero rows, 2026-09-29); the watch loop's
+/// Put/Delete events replace or drop the entry like any other value.
+pub static SYSTEM_SETTINGS: Lazy<Arc<RwAHashMap<String, Option<SystemSetting>>>> =
     Lazy::new(|| Arc::new(tokio::sync::RwLock::new(HashMap::new())));
 
 #[cfg(test)]

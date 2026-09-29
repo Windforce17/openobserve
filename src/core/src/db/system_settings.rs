@@ -50,9 +50,10 @@ pub async fn get(
 ) -> Result<Option<SystemSetting>> {
     let cache_k = cache_key(scope, org_id, user_id, key);
 
-    // Check cache first
-    if let Some(setting) = SYSTEM_SETTINGS.read().await.get(&cache_k) {
-        return Ok(Some(setting.clone()));
+    // Check cache first — a cached `None` is a confirmed miss and answers
+    // without a round trip.
+    if let Some(entry) = SYSTEM_SETTINGS.read().await.get(&cache_k) {
+        return Ok(entry.clone());
     }
 
     // Get from database
@@ -60,10 +61,11 @@ pub async fn get(
         .await
         .map_err(|e| infra::errors::Error::Message(e.to_string()))?;
 
-    // Cache the result if found
-    if let Some(ref s) = setting {
-        SYSTEM_SETTINGS.write().await.insert(cache_k, s.clone());
-    }
+    // Cache hit and miss alike; `set`/`delete` and the watch loop keep it current.
+    SYSTEM_SETTINGS
+        .write()
+        .await
+        .insert(cache_k, setting.clone());
 
     Ok(setting)
 }
@@ -156,7 +158,7 @@ pub async fn set(setting: &SystemSetting) -> Result<SystemSetting> {
     SYSTEM_SETTINGS
         .write()
         .await
-        .insert(cache_k.clone(), result.clone());
+        .insert(cache_k.clone(), Some(result.clone()));
 
     // Emit event to update cache on other cluster nodes
     let event_key = format!("{}{}", SYSTEM_SETTINGS_WATCHER_PREFIX, cache_k);
@@ -278,7 +280,7 @@ pub async fn cache() -> Result<()> {
             setting.user_id.as_deref(),
             &setting.setting_key,
         );
-        cache.insert(cache_k, setting);
+        cache.insert(cache_k, Some(setting));
     }
     log::info!("System settings cached");
     Ok(())
@@ -341,10 +343,13 @@ pub async fn watch() -> Result<()> {
                         SYSTEM_SETTINGS
                             .write()
                             .await
-                            .insert(cache_k.to_string(), setting);
+                            .insert(cache_k.to_string(), Some(setting));
                         log::debug!("Updated system setting in cache: {}", cache_k);
                     }
                     Ok(None) => {
+                        // Put event but no row: drop any cached value or miss so
+                        // the next read re-fetches instead of trusting either.
+                        SYSTEM_SETTINGS.write().await.remove(cache_k);
                         log::warn!("System setting not found in db: {}", cache_k);
                     }
                     Err(e) => {
