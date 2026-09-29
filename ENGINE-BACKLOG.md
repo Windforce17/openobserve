@@ -413,6 +413,63 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
      errors 99/24 h are alias collisions with real columns (`SELECT error,
      COUNT(*) …` on logs where `error` is a column) — user SQL, 400s, and
      the 22,263-field logs schema makes collisions likely.
+- **Long-window battery 12:00Z (owner challenge: "our queries are not 1 h
+  windows") — what actually costs seconds.** Executed query windows from the
+  result-cache deltas (373 in 60 min): ≤ 15 min 34 %, ≤ 1 h 47 %, ≤ 6 h
+  15 %, ≤ 24 h 3 %, > 7 d 1 % (deltas understate dashboard windows; the
+  `file id snapshot` proxy: 62 % ≤ ~1 h of files, 28 % ≤ ~4 h, 9 % ≤ ~20 h).
+  The segment tail is NOT smaller on long windows — every window touching
+  "now" carries the whole unbuilt set (avg 849–1,037 candidates on the
+  ≥ 2 k-file queries; follower `segments_scan` p90 464 ms logs / 1,310 ms
+  traces, max 5.5 s over 90 min of prod) — but it is a fixed 0.1–1.3 s tax,
+  ms-level next to the items below. `[end−24 h, end)` / `[end−6 h, end)`,
+  `use_cache=false`, obs cold/warm vs O2 cold/warm (ms):
+  - logs count 24 h 631/309 vs 5,041/1,174; logs histogram 30 m 3,459/305
+    vs 3,819/3,283; logs `SELECT * LIMIT 50` 482/520 vs 6,142/770; traces
+    count 1,171/830 vs E400/1,551; traces histogram 30 m 4,946/546 vs
+    9,260/6,874 — obs ahead on every unfiltered shape.
+  - **logs `WHERE service_name='llm-router'` count 24 h: 7,668/1,800 vs
+    1,767/1,398, and obs is `partial=true`** (171,430,052 vs O2's complete
+    173,982,812). Attribution: the index answered 1,017 merged files in
+    126 ms (`found count: 16,224,108`); the **105 index-off L0 files**
+    (`ZO_VIX_L0_INDEX_OFF_STREAM_TYPES=logs`, 198 GB original / 4.85 GB
+    compressed on one follower) went to the scan branch and tripped
+    `ZO_STORAGE_SCAN_MAX_BYTES` (23 skipped). Every filtered logs
+    aggregate whose window reaches the last ~2 h pays this and may be
+    truncated. Lever: a cheap L0 index profile for logs (value index for
+    low-cardinality fields such as `service_name`/`level`, blooms for
+    auto-ids, no body FTS) — the P3 measurement, now with a correctness
+    motive; or shorten the L0→merge lag.
+  - **traces `approx_percentile_cont(duration, 0.99)` by service 6 h:
+    1,559/2,439 vs 6,789/E400, obs `partial=true` — 335 of 403 files
+    skipped, the answer covers the NEWEST 68 files (3.93 GB) ≈ 10 % of the
+    rows** (vida-bizserver count 82.5 M vs O2 861 M; p99 228 vs 195 ms).
+    Scan-bound by nature (1 TB original / 6 h); O2 is complete at 3.8 s or
+    errors. Only pre-aggregation fixes this class (per-file span-metric
+    sketches: count + duration digest per service, emitted by builder/merge,
+    read instead of rows) — an APM feature, not a tuning.
+  - **traces top-5 services 24 h cold 15,359 ms** (warm 837 vs O2
+    3,726/2,855): index eval max 14,192 ms with **125,293 index fetches**
+    across the followers — the disk cache is empty after every roll and the
+    24 h aggregate touches ~13 k files' sidecars. Levers: persistent disk
+    cache across restarts or a boot-time warm of the last N hours' index
+    objects (`cache_latest_files` already owns the file→node mapping); fewer
+    files per hour helps linearly.
+  - **traces needle 24 h 4,421/4,198 vs O2 E400/930**: blooms probed 4,094,
+    kept 7 for an absent id (FPP 0.001 → ~4 expected false positives), and
+    each kept file falls to `fast path fallbacks 1 (unservable: 1)` = a full
+    scan of a 3.1 GB-original file because `trace_id` is bloom-only (no
+    posting list). Cheapest lever in the whole list: `ZO_VIX_BLOOM_FPP`
+    0.001 → 1e-5 for the bloom-only fields (+~70 % bloom bytes, sidecars are
+    small; `bloom_ver` bump lets the `.bf` pass regenerate existing files):
+    expected FPs 4 → 0.04 per 24 h needle, i.e. ~4 s → ~0.5 s. Second lever:
+    per-zone blooms so a hit scans one zone, not the file.
+  - Re-ranking after this: (1) bloom FPP for bloom-only fields; (2) logs L0
+    cheap index (correctness + 1.4–7.7 s → ~0.2 s on filtered logs
+    aggregates); (3) disk cache persistence / boot warm (cold 15 s → ~1 s
+    after each roll); (4) span-metric pre-aggregation for percentiles; the
+    tail prefetch (#2) and the straggler merge lane (#3) drop to after these
+    — real but 0.1–1 s.
 
 ## 2026-09-28 — `.173` definitive numbers; needle lookups full-scanned the unstamped hours (fix: per-file sidecar bloom probes + a settled-only `.bf` queue)
 - Fleet at 14:52Z, 3 days undisturbed: queriers 10/10 `.173` (7 pods 3 d,
