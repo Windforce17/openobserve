@@ -65,9 +65,9 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
   same DB. `ALTER TABLE wal_segment_streams DROP CONSTRAINT
   wal_segment_streams_segment_id_fkey` under `lock_timeout 2 s` succeeded
   first try (0 RI triggers left on `wal_segments`, no stalled statement).
-  The table stays for diagnosis, unused by `.174`/`.175`; **`DROP TABLE
-  wal_segment_streams` (365 MB total) at a quiet minute** — instant,
-  catalog-only.
+  `DROP TABLE wal_segment_streams` (365 MB) ran 07:19:45Z under
+  `lock_timeout 2 s`, first try, with 0 statements referencing it and every
+  live image predating `013c45010` (36× `.174`, 10× `.175`); DB 5,217 MB.
 - Source: `013c45010` reverted on vix-arch (`70d37e3c6`); the NATS retry
   stays. HEAD is releasable again.
 - Why the write side tipped: baseline (post-rollback, 90 s window) whole-DB
@@ -83,26 +83,158 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
   an FK KEY SHARE lock on each fresh parent row. The 4–5× WriteIOPS jump
   is larger than the row count alone explains; Aurora's per-record /
   per-commit log accounting can't be attributed further without PI.
-- Design decision (P2, second attempt): **no new rows, tables, indexes or
-  FKs in the meta DB per segment.** Carry the per-stream `[min_ts,
-  max_ts]` inside the existing `wal_segments.streams` JSON (one row write,
-  no extra index maintenance; the row is ~905 B today), keep
-  `query_unbuilt`'s SQL exactly as `.175` and prune stream-absent /
-  time-disjoint segments in the querier from the JSON before any fetch
-  (the `LIMIT` cap then counts pruned rows — raise it or accept the
-  shortfall path). Older rows without ranges fail open, as before. Before
-  any release that touches the meta DB again: enable Performance Insights
-  on `obs-prod-2` (free 7-day tier) so top-SQL-by-load exists, and take the
-  `pg_stat_user_tables`/`pg_stat_user_indexes` deltas over a 5-min window
-  as the acceptance gate (row writes/s, seq scans/s, CommitLatency).
-- Pre-existing meta-DB debt exposed (separate items, in order): drop the
-  never-read `wal_segments_object_key_idx` (−1/5 of every non-HOT update's
-  index cost, −192 MB) after confirming it isn't a UNIQUE constraint the
-  ingester relies on; make `has_claimable`/claim index-able (split the `$4
-  <= 0 OR` into two statements or a partial index on `status`) — 10 full
-  heap scans/s of a 71 MB heap is the floor of every claim; the hourly
-  8–13 k WriteIOPS burst (attribute: `file_list` hour job vs `l0_planned`
-  marking).
+- Design decision (P2, second attempt — the `v2` spec below): **no new
+  rows, tables, indexes or FKs in the meta DB per segment**; one extra
+  unindexed column on the existing row, the `.175` SQL untouched, pruning
+  in the querier.
+  - Schema: `wal_segments.stream_ranges TEXT NOT NULL DEFAULT ''` via the
+    idempotent `add_column` on boot (PG 11+ ADD COLUMN with a constant
+    default is catalog-only, no rewrite; take it under `lock_timeout`).
+    Value: JSON array aligned with the sorted `streams` array,
+    `[[lo_s, hi_s], …]` with `lo_s = floor((stream_min − min_ts)/1e6)`,
+    `hi_s = ceil((stream_max − min_ts)/1e6)` — second-granularity offsets
+    rounded OUTWARD, so reconstruction `min_ts + lo_s·1e6 … min_ts +
+    hi_s·1e6` can only over-include (a wrongly kept segment is today's
+    zero-yield; a wrongly pruned one is missing data). Measured on prod
+    with a temp table: 40 streams → ~480 B raw, ~300 B stored; a row is
+    1,051 B avg today, `streams` 2,193 B raw → 543 B stored, so the tuple
+    stays inline (< the 2 KB TOAST threshold). Exact-micros pairs would be
+    1,460 B stored (random digits don't compress) and push rows to TOAST —
+    rejected. `''` = unknown = fail open (old rows, old ingesters).
+  - Ingester (`segment_wal::uploader::fold_frame_meta`): reuse the reverted
+    `FoldedMeta { min_ts, max_ts, streams, stream_ranges }` fold (per-stream
+    min/max over that stream's frames only, `lo.max(1)` clamp; its 4 tests
+    are in `013c45010`), serialize offsets, bind ONE more parameter on the
+    existing single-row `INSERT … ON CONFLICT (node_uuid, seq) DO NOTHING
+    RETURNING id`. Zero extra statements, rows or index entries.
+    `validate_for_add`: `stream_ranges` empty or `len == streams.len()`,
+    each `lo <= hi`, `min_ts <= lo`, `hi <= max_ts`.
+  - Row decode: `SegmentRow.stream_ranges: String` →
+    `SegmentMeta.stream_ranges: Vec<(i64, i64)>` (micros, reconstructed);
+    `SegmentMeta::range_for(stream) -> Option<(i64, i64)>` = `None` when
+    the column is empty or malformed (log once, fail open).
+  - Querier (`segments_scan::list_candidates`): after `query_unbuilt`,
+    `retain(|m| m.range_for(stream).is_none_or(|(lo, hi)| hi >= start &&
+    lo <= end))`, then `apply_query_cap`. The SQL `LIMIT MAX_QUERY_SEGMENTS
+    + 1` still counts pre-prune rows: when the SQL page is full, report a
+    shortfall regardless of the post-prune count (honest, rare — unbuilt
+    is ≤ 1,200 during a drain, 7 k at this morning's worst, cap 10,000).
+    Fix the direction while there: `ORDER BY min_ts ASC` keeps the OLDEST
+    page and cuts the newest segments exactly when a backlog exists, then
+    `apply_query_cap` keeps "the newest" of that page — make the SQL
+    `ORDER BY max_ts DESC, id DESC` so both agree (sqlite too).
+  - Mixed versions: old querier `SELECT *` into `FromRow` ignores the extra
+    column; old ingester writes `''`; new querier on old rows fails open;
+    every role's boot adds the column, so no ordering constraint.
+  - Gates (before/after, same 5-min windows): `pg_stat_user_tables`
+    wal_segments ins/upd/del per second unchanged (8.5 / 36 / 8 today),
+    heap growth ≤ +40 %, CloudWatch CommitLatency ≤ 1 ms and WriteIOPS
+    flat outside the :00 minute; `segments_scan` on logs count 1 h from
+    329 loaded / 89 % zero-yield toward `.176`'s 52 / 19 %; traces count
+    381 / 56 % → 198 / 8 %; no decode errors. Roll querier first (reads
+    only), then ingester (writes), compactor last.
+- Meta-DB audit 07:05–08:10Z (our database `obs20260818` on the shared
+  cluster `obs-prod`; read-only apart from creating the `pg_stat_statements`
+  and `pgstattuple` extension views in our DB — the library was already in
+  `shared_preload_libraries`, so 37 days of per-statement stats since
+  2026-08-23 03:03Z were waiting). Findings, ranked by evidence:
+  1. **`system_settings` lookup, 252.7 M calls in 37 d = 79/s, 0 rows
+     ever** (21 % of every statement in our DB, 2 blocks each). Trace ingest
+     calls `db::system_settings::get_gen_ai_agent_mapping_config` twice per
+     request path (`core/traces/mod.rs:562, 1149`) and `db::system_settings::get`
+     caches only positive results ("Cache the result if found"), so a
+     setting that does not exist is a DB round trip per request. Fix: cache
+     the miss too (the `watch()` Put/Delete events already refresh or drop
+     keys, so a tombstone is safe). Zero-risk, −79 statements/s.
+  2. **`DELETE FROM file_list WHERE id = $1 AND index_generation = $2 AND
+     index_size = $3`** (`file_list/postgres.rs:2421`): 6.9 M calls, 3.9 ms,
+     **1,181 blocks per call** = probing all 157 partitions' id indexes
+     (the sampler shows every `file_list_p_*` partition, empty ones
+     included, taking ~3,140 idx scans/min at 08:00Z). Add `AND date = $4`
+     (the caller has `file.key`; the `id <= 0` branch already binds `date`)
+     → one partition, ~10 blocks. 447 min of DB time / 8.2 G blocks in 37 d.
+  3. **`drop_empty_partitions` has never dropped anything**:
+     `DateTime::parse_from_str(date_str, "%Y%m%d")` requires an offset and
+     returns `Err(NotEnough)` for every name (probed locally; prod logs 7 d:
+     `maintenance: completed` 4, `reindexing` 28, `dropping empty
+     partition` **0**). Even fixed, `safety_days = max(ingest_allowed_upto/24
+     + 1 = 366, retention 30)` keeps a year of empties. Today: `file_list`
+     157 partitions / 4,341 MB, **124 empty holding 2,993 MB** (the ten
+     08-19…08-28 partitions hold ~2.98 GB with 0 live rows; 114 stray
+     96 kB ones from 2025-08…2026-05). Late rows for a dropped day fall into
+     `file_list_default` by design (`ensure_file_list_partition` keeps
+     writing to DEFAULT when creation is blocked), so dropping an empty
+     partition past `data_retention_days` is safe. Fix: `NaiveDate::
+     parse_from_str`, cutoff = retention + 1 day; one-time manual `DROP
+     TABLE` of the ten big empties now (−2.98 GB, −10 partitions to open per
+     unpruned plan).
+  4. **`wal_segments` probes on generic plans**: `has_claimable` (9.97 M
+     calls, 555 blocks/call; live `EXPLAIN` = Seq Scan LIMIT 1 reading 2,468
+     of 9,134 heap pages while 23 rows qualify, all 9,134 when none does),
+     `has_late_claimable` (8.26 M calls, 1,335 blocks/call, 497 min),
+     `count_unbuilt_older_than` (`status != 2` → Seq Scan 9,134 blocks,
+     1.44 M calls), `list_l0_orphan_rows` (same), `list_expired` (Seq Scan
+     + sort, 30 sweepers × 1/min), `query_unbuilt` (`status != $4 OR (… >=
+     $5)` with `$5 = i64::MAX` always → Parallel Seq Scan 14 k blocks per
+     query per stream). The aggregate `claimable_stats` with the SAME
+     predicate plans as BitmapOr over `status_created_at_idx` (1,235
+     blocks, 1.2 ms) because there is no `LIMIT 1` tempting an early-exit
+     seq scan. Fixes, all SQL-text only: inline the `SegmentStatus`
+     constants (the planner then uses the MCV `{2,1,0}` even in a generic
+     plan) and write `status IN (0, 1)` instead of `status != 2`; drop the
+     tick-path `has_claimable`, `claimable_stats` is cheaper than the probe;
+     `has_late_claimable` → `status = 0 AND created_at < $3` index range +
+     heap filter. Expect `seq_scan` on wal_segments from 10/s to ~1/s.
+  5. **`wal_segments` indexes are 96 % deleted pages** (pgstatindex:
+     `object_key_idx` 192 MB = 878 leaf pages live / 23,708 deleted,
+     `node_seq_idx` 146 MB = 622 / 18,027, `max_ts_idx` 53 MB, `status_
+     created_at_idx` 46 MB, `pkey` 42 MB; heap 71 MB = 37.7 % live, 60.7 %
+     free — page fullness is NOT why 63 % of updates are non-HOT; the
+     status flips are). `object_key_idx` is UNIQUE on
+     `wal_segments/{node_uuid}/{seq:020}`, i.e. the same identity
+     `node_seq_idx` already enforces, 0 scans ever → `DROP INDEX
+     CONCURRENTLY` (−1 of 5 index writes on 8.5 ins + 23 non-HOT upd + 8 del
+     per second) and remove it from `create_indexes`; `REINDEX INDEX
+     CONCURRENTLY` the other four once (→ ~5 MB each) and add them to the
+     daily `reindex_non_partitioned_tables` list, which today covers only
+     `file_list_deleted` and `file_list_jobs`.
+  6. Historical, already gone: the pre-late-lane claim CTE `status = $4 OR
+     (status = $1 AND updated_at < $5)` is still #1 by total time in the
+     37-day window (965 k calls × 88 ms, **28,560 blocks/call**, 23.7 h);
+     the live shape costs 1,041 blocks / 3.8 ms. Reset `pg_stat_statements`
+     after the fixes so the window is clean.
+  7. Hourly WriteIOPS burst = `file_list_deleted` at :00 (sampler
+     08:00–08:01Z: 16,713 UPDATE + 16,713 DELETE + 2,828 INSERT per minute vs
+     698 writes/min baseline; WriteIOPS 1.4 k → 14.2 k / 13.7 k for two
+     minutes, CommitLatency 0.5 → 1.6 ms, CPU 58 %). That is upstream's
+     `query_deleted` lease (`UPDATE … SET created_at = now` on an indexed
+     column, so every row is a non-HOT update × 3 indexes) followed by the
+     row deletes, run by one node at the top of the hour. Bounded and
+     harmless alone; it stacked on the `.176` stall at 07:00. Optional:
+     spread the batches or lease with `FOR UPDATE SKIP LOCKED` instead of
+     the `created_at` bump. `stage_index_generation` also does INSERT +
+     `UPDATE SET index_generation = id` per row (19.7 M updates = one per
+     insert) — fold into one statement with `nextval`.
+  8. `meta` reads: `SELECT … FROM meta WHERE 1=1 AND module = $1 AND key1 =
+     $2 AND (key2 = $3 OR key2 LIKE $4)` 520 k calls × **140 ms mean, max
+     267 s**, only 139 blocks/call, 1.8 rows/call — time is in TOAST
+     decompression/transfer of large values (stream schemas), not I/O.
+     Upstream shape; note only.
+  9. `file_list_jobs`: `INSERT … ON CONFLICT DO NOTHING` 25.4 M calls for
+     1.14 M rows (95 % no-ops, 8/s) + the existence `SELECT` 35.7 M calls
+     (11/s); 0.01–0.27 ms each — round-trip noise, not load.
+  10. Cluster housekeeping (owner decisions, not done): databases
+      `obs20260803` (**12 GB**) and `obs20260817` (1.1 GB) have 0
+      connections and no activity — 13 GB of the cluster's 25 GB; our
+      pods hold 324–353 connections (343 idle; pool max = min(cpu×4, 32)
+      per pool per process, idle timeout 600 s) vs O2's 186 — `ZO_META_
+      CONNECTION_POOL_MAX_SIZE=8` on router/ingester/querier would shed
+      ~150 idle backends (~1 GB of the r7g.xlarge's 32 GB); Performance
+      Insights is still off (free 7-day tier, no restart).
+- Recovery state 08:09Z: unbuilt 1,047 (951 Building = 30 builders × 32),
+  no statement > 1 s, `slow statement` 100/10 min (ingester 8, compactor 71,
+  querier 21) vs 2,349 at the peak and ~700 during the drain; commit
+  latency 0.4–0.8 ms outside the :00 minute.
 
 ## 2026-09-28 — `.173` definitive numbers; needle lookups full-scanned the unstamped hours (fix: per-file sidecar bloom probes + a settled-only `.bf` queue)
 - Fleet at 14:52Z, 3 days undisturbed: queriers 10/10 `.173` (7 pods 3 d,
