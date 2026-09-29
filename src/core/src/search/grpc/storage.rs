@@ -275,12 +275,12 @@ pub async fn search(
         scan_stats.compressed_size
     );
 
-    // Per-query byte budget on the scan branch (ZO_STORAGE_SCAN_MAX_BYTES):
-    // decided here, before any IO or plan, from the file_list sizes already
-    // in hand. The kept set is re-measured so scan_stats describe what runs.
+    // Per-query byte budget on the scan branch (ZO_STORAGE_SCAN_MAX_BYTES),
+    // row-returning LIMIT shapes only (`scan_cap_budget`): decided here,
+    // before any IO or plan, from the file_list sizes already in hand. The
+    // kept set is re-measured so scan_stats describe what runs.
     let stream_key = format!("{org_id}/{stream_type}/{stream_name}");
-    let scan_shortfall =
-        apply_storage_scan_cap(&mut files, &stream_key, cfg.limit.storage_scan_max_bytes);
+    let scan_shortfall = apply_storage_scan_cap(&mut files, &stream_key, scan_cap);
     if let Some(shortfall) = &scan_shortfall {
         scan_stats = match file_list::calculate_files_size(&files).await {
             Ok(size) => size,
