@@ -166,10 +166,54 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
   key-terms block + `doc_count` leaves ≤ 256 KiB when the footer is
   resident, handed to the Vortex scan via a pre-seeded segment cache);
   `dict` field-index probes folded into one batch. Targets: count 5 → 3
-  round trips (2 on new-layout files), top-N 7 → 3 (2). `io_accounting`
-  now logs `round_trips` (`a3ad367ff`) so the effect is measurable in prod.
-  Inline `doc_count` in dictionary blocks (2 round trips for everything,
-  format change) stays as the follow-up.
+  round trips (2 on new-layout files), top-N 7 → 3 (2).
+- **`.181` shipped (vix-arch `244a05746`, image `ceebcf8c…`): queriers
+  13:26–13:27Z (GitOps #579), compactors 13:38Z (#580), 0 restarts.**
+  Reader side (every existing file): parallel `.vix`/`.vxi` tails, the
+  field-scoped prefetch bundle (key-block run ≤ 1 MiB, key-terms block,
+  terms Vortex footer when not resident, `doc_count` leaves ≤ 256 KiB
+  served through an operation-scoped overlay `PrefetchedWindows` — same
+  thread-local pattern as `EXACT_RANGES`), `field_index` probes in one
+  wave. Writer side (compactor only for now — merge outputs + logs L0
+  heals are nearly every long-lived sidecar; ingester L0 sidecars follow
+  with the next converged release): blob order `[plist?][dict_blocks]
+  [bloom?][terms][dict][footer]`, terms footer inside the 256 KiB tail.
+  Tests: depth 3/2 (legacy/new) for both shapes, parity, fetch counts never
+  grow; vortex_index 351, search vix 189, core_writer+bloom 102, segments
+  37 green. Known cost: a bloom small enough to have sat in the tail pays
+  its 4 KiB header read on cold needle probes (traces blooms are MBs —
+  unaffected).
+  - **Cold-vs-cold A/B, both at 0 % disk cache (the rolls wipe the
+    ephemeral cache), `ZO_VIX_SEARCH_CONCURRENCY` 64, same 7 d window:**
+    traces count `service_name='nexus-service'` **85.0 → 59.9 s (−30 %)**;
+    traces top-10 `span_kind` **90.8 → 55.5 s (−39 %)**; logs count svc
+    **51.6 → 39.4 s (−24 %)**. All `partial=false`, identical counts.
+  - What the `io_accounting` line shows now (per follower, traces count):
+    47,715 remote reads (was 63,608), active IO 4,874 s = **~100 ms per
+    read** (baseline 82 ms at 63k reads); gate/admission waits ≈ 0. Reads
+    per file 7.0 (count) / 9.5 (top-N — the leaf prefetch adds concurrent
+    reads while removing depth). The label `round_trips` I added counts
+    `fetch_many` calls, which the new waves issue concurrently — renamed
+    `fetch_batches` (`6ac31a866`); sequential depth is not directly
+    observable in prod yet.
+  - **Per-read S3 latency is the remaining wall.** Raw range GETs of 87 KB
+    from the ops host (same region, boto3, 256-connection pool): 16-parallel
+    p50 27 ms / 449 req/s; 64-parallel p50 53 ms, p90 91 ms / 579 req/s —
+    latency scales with per-host parallelism and per-host throughput
+    saturates. Queriers show the same shape: ~1,000 reads/s per pod at
+    80–100 in flight and 70–104 ms per read, whether 64 or 192 files are
+    evaluated. So after `.181` the cold cost is **reads × ~1 ms
+    (per-pod request-rate ceiling)**, not depth: 47k reads ≈ 50 s. Levers
+    in order: (1) fewer reads per file — inline `doc_count` in the
+    dictionary blocks (drops the terms footer + leaf reads: 7 → ~3–4 per
+    file), a bigger eager tail for the new layout (1 MiB swallows `dict` +
+    terms footer + the tail of `dict_blocks` for small fields: −1–2 reads
+    at +5 GB per 7 d query), whole-sidecar caching for hot streams; (2)
+    find the per-host ceiling — S3 pins a client to one front-end IP per
+    resolved address; spreading connections across resolved IPs or a
+    per-AZ endpoint is the usual fix (unmeasured here); (3) persistent
+    evaluation/reader caches across restarts so 7 d windows are not cold
+    after every roll (today's three restarts each wiped 45 % → 0 %).
 
 ## 2026-09-29 — P2 shipped as `.176` and rolled back within 30 min: the per-stream side table stalled the shared meta DB (commit latency 40–60×, ingest 503s); ranges must live in the segment row
 - What shipped (vix-arch `013c45010` + NATS retry `76fe754b5`, image
