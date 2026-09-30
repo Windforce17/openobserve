@@ -250,6 +250,57 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     reads at zero depth (the tail is fetched in parallel with the sidecar
     tail). The metadata tier (`.183`) keeps that tail, so repeated queries
     get the saving anyway.
+- **Owner (16:0xZ): "concurrent queries seem to hang — can you reproduce?"
+  Reproduced, attributed, fixed in `.183` (vix-arch `261251626`, GitOps
+  #582, queriers 18:40–18:42Z with `ZO_VIX_FETCH_CONCURRENCY` 256 → 512).**
+  No real user traffic reaches `obs-router` (17 h of router access logs
+  hold only the batteries; Orbit is served by the O2 cluster), so the repro
+  is synthetic: 11 dashboard-shaped 24 h queries (filtered counts,
+  filtered histograms, top-N) fired at once, plus one small 1 h query every
+  2 s (`/tmp/burst_small.py` on ops).
+  - **Before (`.182`): small queries 0.5 s solo → 7.8 / 15.4 / 20.6 /
+    23.9 s during the burst (15–48×), all inside `idx_took`; repeat run:
+    avg 2.1 s, max 13.2 s.** Two mechanisms, both invisible to
+    `took_detail` (`wait_in_queue` = 0):
+    1. **Per-file serialization across queries.** `reader_cache::
+       GLOBAL_CACHE` guarded each cached reader with an exclusive
+       `tokio::sync::Mutex` taken BEFORE evaluation admission
+       (`ReaderHandle::lock`, reader_cache.rs:91–104): every query
+       evaluating the same recent file waited for the previous query's
+       evaluation of that file. A 1 h histogram's follower spent 13.6 s in
+       `follower search setup` with 5 range reads and 1.6 s of
+       `evaluation_wait_us` — the other 12 s was this mutex. Dashboards
+       over the same hours are exactly this pattern.
+    2. **FIFO slot semaphore with full fan-out.** Each query fanned out to
+       all 192 evaluation slots; a newcomer's 40 acquires queued behind
+       ~2,000 pending heavy ones.
+  - Fix (a) shared leases: counted, granted immediately, each charging the
+    reader's footprint to its own operation (`&VixReader` use is Mutex/
+    OnceLock/thread-local safe); (b) `source::FairShare`: a query's
+    in-flight evaluations are capped at `max(8, slots / active_evaluating_
+    queries)`, so a newcomer raises `active` and incumbents free slots
+    within one evaluation (a lone query still owns every slot).
+  - **After (`.183`, same burst, fresh pods): small avg 1.04 s, max 2.5 s
+    (≤ 3.5× solo, no outlier); heavy 24 h queries avg 33 s vs 24 s
+    (they now share fairly and were cold).** Cold 7 d battery unchanged
+    (17.6 / 21.7 / 14.3 s vs 16.9 / 20.7 / 12.7 — the fetch-gate raise
+    bought nothing measurable; S3 cold-object latency ~100 ms/read is the
+    floor). RSS 6.8–7.7 GiB, 0 restarts; 13 growth timeouts during the
+    burst (legacy 32 MiB shapes — filtered histograms — competing for the
+    4 GiB gate at 192 slots; 6 in the `.182` burst).
+  - **Metadata tier (also in `.183`) is inert as shipped.** A real prod
+    traces reader (`/tmp/prodvix`, 1,101 fields) opens at **667 KB** before
+    any evaluation, reaches 787 KB after count + top-k, and `demote()`
+    frees **13.8 KB**; the logs reader (2,586 fields) opens at 1,388 KB,
+    demote frees 30 KB. The weight is the metadata itself: raw footer JSON
+    kept after parsing (`dict_field_pages_v1` 98/233 KB, `fields` 55/136
+    KB, `columns` 27/68 KB), the 256 KiB + 64 KiB tail allocations kept
+    alive by `Bytes` slices, and parsed per-field tables. Prod confirms:
+    after `.183` the cache still holds 1,839 readers in 2.15 GB and a
+    second 7 d query with a new condition reads 6.6 ranges/file (cold: 7).
+    Diet in progress for `.184`: drop parsed-out JSON, copy only referenced
+    slices out of the tails, compact field tables — target ≤ 300 KB traces
+    / ≤ 600 KB logs so 2 GiB holds one follower's 7 d.
 
 ## 2026-09-29 — P2 shipped as `.176` and rolled back within 30 min: the per-stream side table stalled the shared meta DB (commit latency 40–60×, ingest 503s); ranges must live in the segment row
 - What shipped (vix-arch `013c45010` + NATS retry `76fe754b5`, image
