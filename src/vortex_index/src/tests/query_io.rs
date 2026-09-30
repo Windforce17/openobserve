@@ -603,6 +603,15 @@ fn oversized_footer_fetches_prefix_once_and_rejects_corruption() {
 /// Explicit dictionary batches guarantee changing values/code assignments;
 /// the real Vortex writer stores these as separate addressable leaves.
 fn changing_dictionary_data(chunk_count: usize) -> Bytes {
+    changing_dictionary_data_padded(chunk_count, 0)
+}
+
+/// [`changing_dictionary_data`] with `pad` incompressible bytes carried by
+/// each row's `_source` payload: large enough fixtures outgrow the Vortex
+/// footer initial-read window, so a scan's data segments are not all
+/// swallowed by the open's initial read (the abort-bound test needs early
+/// chunks' segments to cost IO the visitor may or may not trigger).
+fn changing_dictionary_data_padded(chunk_count: usize, pad: usize) -> Bytes {
     let value_type = DataType::Dictionary(Box::new(DataType::UInt64), Box::new(DataType::Utf8));
     let schema = Schema::new(vec![
         Field::new("_timestamp", DataType::Int64, false),
@@ -628,7 +637,13 @@ fn changing_dictionary_data(chunk_count: usize) -> Bytes {
                         (0..4).map(|row| 100 - (chunk * 4 + row) as i64),
                     )),
                     Arc::new(group),
-                    Arc::new(StringArray::from(vec!["{}"; 4])),
+                    Arc::new(StringArray::from(vec![
+                        format!(
+                            "{{\"p\":\"{}\"}}",
+                            "x".repeat(pad)
+                        );
+                        4
+                    ])),
                 ],
             )
             .unwrap()
@@ -1405,9 +1420,13 @@ fn memory_observer_can_reenter_schema_without_deadlocking() {
 #[test]
 fn visitor_abort_does_not_read_every_projected_chunk() {
     // More stored leaves than the bounded native worker lookahead, even on
-    // large build hosts. Tiny leaves keep the regression fixture inexpensive.
+    // large build hosts. Tiny leaves keep the regression fixture
+    // inexpensive. Each row carries 2 KiB of padding so the fixture
+    // outgrows the 256 KiB Vortex footer initial-read window: a small
+    // fixture would be swallowed whole by the one-read footer's
+    // initial-read cache and the abort could never save bytes.
     let chunks = std::thread::available_parallelism().unwrap().get() * 8 + 64;
-    let data = changing_dictionary_data(chunks);
+    let data = changing_dictionary_data_padded(chunks, 2048);
     let read = |abort: bool| {
         let source = LoggedSource::new(data.clone());
         // A deliberately small probe prevents a tiny fixture from being

@@ -306,6 +306,15 @@ const PREFETCH_FIELD_BLOCKS_MAX_BYTES: u64 = 1024 * 1024;
 /// evaluation; wider spans read their leaves on demand.
 const PREFETCH_DOC_COUNT_MAX_BYTES: u64 = 256 * 1024;
 
+/// Whole-`dict` promotion bound: a ranged `dict` (block index) blob up to
+/// this many bytes is fetched WHOLE in one read on the first field/dict
+/// index need and retained for the reader's lifetime (metadata — every
+/// later index build slices it with zero IO, including after `demote`).
+/// Prod `dict` blobs are 100-200 KB. Above the bound (merged sidecars with
+/// millions of terms), builds keep today's windowed probes so a single
+/// tiny field lookup never pays a multi-MB fetch.
+pub(crate) const DICT_RESIDENT_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
 /// Cold read plan (D1): a point lookup (one exact term, an IN list) fetches
 /// its field's `doc_count` leaves ahead only when they fit one concurrent
 /// wave, so the bundle never costs more round trips than the leaf read it
@@ -624,6 +633,12 @@ pub struct VixReader {
     /// The `dict` blob, kept for lazy directory/page reads (`None` when the
     /// file has no terms).
     dict_blob: Option<BlobHandle>,
+    /// The promoted whole `dict` blob: one read fetched on the first index
+    /// need when the ranged blob is not fully resident in the eager tail,
+    /// kept for the reader's lifetime (see [`DICT_RESIDENT_MAX_BYTES`]).
+    /// Metadata like `dict_blob` itself — retained through `demote()` —
+    /// so every later field/dict index build slices it with zero IO.
+    dict_resident: OnceLock<Bytes>,
     terms_blob: Option<BlobHandle>,
     docs_blob: BlobHandle,
     /// The per-file value-bloom blob (`None` on files written before the
@@ -709,6 +724,14 @@ impl std::ops::Deref for FieldIndexRef<'_> {
             FieldIndexRef::Field(index) => index,
         }
     }
+}
+
+/// How an index build obtains the `dict` bytes it needs: the resident
+/// whole blob (slices are zero-copy), or the ranged handle of a blob over
+/// [`DICT_RESIDENT_MAX_BYTES`] whose builds keep today's windowed probes.
+enum DictBytes<'a> {
+    Resident(Bytes),
+    Windowed(&'a crate::source::RangedBlob),
 }
 impl VixReader {
     /// Open a core file from its complete DATA-object bytes, WITHOUT an
@@ -1063,6 +1086,7 @@ impl VixReader {
                 0,
             )),
             dict_blob,
+            dict_resident: OnceLock::new(),
             terms_blob,
             docs_blob,
             bloom_blob,
@@ -1371,16 +1395,19 @@ impl VixReader {
     /// Release every lazily built, re-fetchable structure the reader holds
     /// and return the bytes released: the parsed whole-dictionary index and
     /// the per-field restart-page indexes (all re-derivable from the
-    /// retained `dict` blob — the block index bytes stay resident — with
-    /// zero IO), the FIFO dictionary `block_cache` payloads (re-fetched
-    /// per block through the ordinary ranged path), and the eager-tail
-    /// prefixes of ranged sources (re-trimmed to each blob's Vortex
-    /// footer window; the released data prefix re-fetches on demand). The
-    /// puffin footer properties, the `fields`/`dict_field_pages`
-    /// structures, the zone table, and the retained Vortex footer windows
-    /// all stay, so the next evaluation of a different condition pays
-    /// zero tail/footer/directory fetches and re-fetches only its own
-    /// blocks, leaves and postings.
+    /// retained `dict` blob — the block index bytes stay resident, either
+    /// in memory or as the promoted [`Self::dict_resident`] buffer, which
+    /// is metadata and deliberately KEPT — with zero IO), the FIFO
+    /// dictionary `block_cache` payloads (re-fetched per block through the
+    /// ordinary ranged path), and the eager-tail prefixes of ranged sources
+    /// (re-trimmed to each blob's postscript-sized Vortex footer window;
+    /// the released data prefix re-fetches on demand). The puffin footer
+    /// properties, the `fields`/`dict_field_pages` structures, the zone
+    /// table, the retained Vortex footer windows and the promoted dict
+    /// buffer all stay, so the next evaluation of a different condition
+    /// pays zero tail/footer/directory fetches and re-fetches only its own
+    /// blocks, leaves and postings. The released byte count never includes
+    /// the resident dict buffer.
     ///
     /// The decoded docs schema and chunk stats are deliberately KEPT: they
     /// are per-reader metadata whose re-derivation would cost a docs-blob
@@ -1545,9 +1572,11 @@ impl VixReader {
                 .unwrap_or(usize::MAX)
                 .saturating_mul(3),
         )?;
-        let bytes = match blob {
-            BlobHandle::Mem(bytes) => bytes.clone(),
-            BlobHandle::Ranged(ranged) => {
+        let bytes = match self.dict_bytes_for_index(blob)? {
+            DictBytes::Resident(bytes) => bytes,
+            // Over the promotion bound: fetch, parse, drop — exactly
+            // today's whole-blob read, never retained.
+            DictBytes::Windowed(ranged) => {
                 crate::source::block_fetch(ranged.source.as_ref(), ranged.range.clone())?
             }
         };
@@ -1663,12 +1692,14 @@ impl VixReader {
         // Prefix reconstruction uses at most the enclosing encoded key region,
         // in addition to fetched windows and the three retained typed arrays.
         let _pending = self.memory.reserve(encoded.saturating_mul(8))?;
-        let parts = match blob {
-            BlobHandle::Mem(bytes) => ranges
+        let parts = match self.dict_bytes_for_index(blob)? {
+            DictBytes::Resident(bytes) => ranges
                 .into_iter()
                 .map(|range| bytes.slice(range.start as usize..range.end as usize))
                 .collect(),
-            BlobHandle::Ranged(blob) => crate::source::block_fetch_separate(
+            // Over the promotion bound: the five disjoint windows go out
+            // as ONE wave of concurrent exact reads, exactly as before.
+            DictBytes::Windowed(blob) => crate::source::block_fetch_separate(
                 blob.source.as_ref(),
                 ranges
                     .into_iter()
@@ -1705,6 +1736,60 @@ impl VixReader {
         };
         drop(indexes);
         Ok(FieldIndexRef::Field(index))
+    }
+    /// Resolve the `dict` blob bytes an index build reads: in-memory or
+    /// already-promoted blobs slice free; a ranged blob within
+    /// [`DICT_RESIDENT_MAX_BYTES`] is fetched WHOLE in one read, compacted
+    /// and retained on the first need, so every later build (including
+    /// after `demote`) slices it with zero IO instead of re-probing the
+    /// object per window. A larger ranged blob — merged sidecars with
+    /// millions of terms — returns the windowed handle, keeping today's
+    /// five-probe build.
+    fn dict_bytes_for_index<'a>(&'a self, blob: &'a BlobHandle) -> Result<DictBytes<'a>> {
+        if let Some(bytes) = self.dict_resident.get() {
+            return Ok(DictBytes::Resident(bytes.clone()));
+        }
+        match blob {
+            BlobHandle::Mem(bytes) => Ok(DictBytes::Resident(bytes.clone())),
+            BlobHandle::Ranged(ranged) if ranged.len() > DICT_RESIDENT_MAX_BYTES => {
+                Ok(DictBytes::Windowed(ranged))
+            }
+            BlobHandle::Ranged(ranged) => self.promote_dict(ranged),
+        }
+    }
+
+    /// Fetch the whole ranged `dict` blob in ONE read, compact it and
+    /// retain it for the reader's lifetime, accounting the buffer through
+    /// [`ReaderMemory`]. Two concurrent first needs may both fetch
+    /// (identical bytes); the `set` loser drops its copy — exactly one
+    /// buffer is retained and charged.
+    fn promote_dict(&self, ranged: &crate::source::RangedBlob) -> Result<DictBytes<'_>> {
+        if let Some(bytes) = self.dict_resident.get() {
+            return Ok(DictBytes::Resident(bytes.clone()));
+        }
+        let len = usize::try_from(ranged.len()).unwrap_or(usize::MAX);
+        // The fetched buffer, its compact copy, and the retained owner.
+        let _pending = self.memory.reserve(
+            len.saturating_mul(2)
+                .saturating_add(RETAINED_BYTES_OVERHEAD),
+        )?;
+        let bytes = compact_bytes(crate::source::block_fetch(
+            ranged.source.as_ref(),
+            ranged.range.clone(),
+        )?);
+        if self.dict_resident.set(bytes.clone()).is_ok() {
+            self.memory.add(len + RETAINED_BYTES_OVERHEAD);
+            self.memory.notify();
+            Ok(DictBytes::Resident(bytes))
+        } else {
+            // Lost the race: the winner retained identical content.
+            Ok(DictBytes::Resident(
+                self.dict_resident
+                    .get()
+                    .expect("race winner set it")
+                    .clone(),
+            ))
+        }
     }
 
     /// Total byte length of the dictionary blocks region.
@@ -5819,7 +5904,19 @@ mod tests {
                 reader.field_value_counts("source").unwrap(),
                 Some(expected.clone())
             );
-            for range in dict_source.reads.lock().iter() {
+            // The first field_index need fetches the whole dict blob in ONE
+            // read (<= DICT_RESIDENT_MAX_BYTES) and retains it; the reads
+            // below may include that promoted whole-blob fetch once.
+            let dict_reads = dict_source.reads.lock().clone();
+            let mut promoted: Option<Range<u64>> = None;
+            for range in dict_reads.iter() {
+                if range.start == 0 && range.end == dict_bytes.len() as u64 {
+                    assert!(
+                        promoted.replace(range.clone()).is_none(),
+                        "the whole dict is fetched at most once"
+                    );
+                    continue;
+                }
                 assert!(
                     allowed_directory
                         .iter()
@@ -5922,6 +6019,89 @@ mod tests {
         assert!(
             count_bytes[1] <= count_bytes[0] + 4096,
             "warm counts amplified with unrelated vocabulary: {count_bytes:?}"
+        );
+    }
+
+    /// The [`DICT_RESIDENT_MAX_BYTES`] guard: a ranged `dict` blob OVER the
+    /// bound keeps today's windowed five-probe build — the whole blob is
+    /// never fetched — and the field index still answers correctly. The
+    /// over-bound blob is a valid dict grown by zero padding inserted just
+    /// before its trailing footer (the restart table is addressed from the
+    /// blob end, so it shifts with the padding and every fetched window
+    /// still lands on real bytes); it is swapped in AFTER open, so the
+    /// open-time directory validation (which requires a tightly packed
+    /// blob) has already accepted the original shape.
+    #[test]
+    fn oversized_dict_keeps_windowed_probes() {
+        use arrow::datatypes::Schema;
+        const ROWS: usize = 4096;
+        const VALUES: [&str; 4] = ["a", "b", "c", "d"];
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("source", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from_iter_values(
+                    (0..ROWS).map(|i| (ROWS - i) as i64),
+                )),
+                Arc::new(StringArray::from_iter_values(
+                    (0..ROWS).map(|i| VALUES[i % VALUES.len()]),
+                )),
+            ],
+        )
+        .unwrap();
+        let mut writer = crate::VixWriter::new(&schema, crate::VixWriterOptions::default(), false);
+        writer
+            .push_batch_with_source(&batch, &StringArray::from(vec!["{}"; ROWS]), None)
+            .unwrap();
+        let (data, index) = writer.finish().unwrap();
+        let data = Bytes::from(data);
+        let index = Bytes::from(index.expect("indexed fixture"));
+
+        let mut reader = VixReader::open_with_index(data.clone(), Some(index.clone())).unwrap();
+        let dict_bytes = reader.dict_blob.as_ref().unwrap().bytes().unwrap();
+        // Grow the dict past the promotion bound, padding before the footer.
+        let padding = DICT_RESIDENT_MAX_BYTES as usize - dict_bytes.len() + 4096;
+        let mut grown = Vec::with_capacity(dict_bytes.len() + padding);
+        grown.extend_from_slice(&dict_bytes[..dict_bytes.len() - 4]);
+        grown.extend(std::iter::repeat_n(0u8, padding));
+        grown.extend_from_slice(&dict_bytes[dict_bytes.len() - 4..]);
+        assert!(grown.len() as u64 > DICT_RESIDENT_MAX_BYTES);
+        let grown = Bytes::from(grown);
+        let source = Arc::new(RecordingSource {
+            bytes: grown.clone(),
+            reads: Mutex::new(Vec::new()),
+        });
+        reader.dict_blob = Some(BlobHandle::Ranged(crate::source::RangedBlob::new(
+            source.clone(),
+            0..grown.len() as u64,
+        )));
+        let expect = VixReader::open_with_index(data, Some(index)).unwrap();
+
+        let query = VixQuery::Exact {
+            field: "source".into(),
+            token: b"a".to_vec(),
+        };
+        assert_eq!(reader.count(&query).unwrap(), expect.count(&query).unwrap());
+        let reads = source.reads.lock();
+        assert!(
+            reads
+                .iter()
+                .all(|read| read.end - read.start < grown.len() as u64),
+            "an over-bound dict must never be fetched whole: {reads:?}"
+        );
+        assert!(
+            reads.len() >= 5,
+            "the windowed build still pays its five probes: {reads:?}"
+        );
+        // Each probe is a small window, nowhere near the promotion bound.
+        assert!(
+            reads
+                .iter()
+                .all(|read| read.end - read.start <= 1024 * 1024),
+            "windowed probes must stay window-sized: {reads:?}"
         );
     }
 

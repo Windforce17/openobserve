@@ -726,9 +726,21 @@ impl RangedBlob {
         self.footer.ranges.get().is_some()
     }
 
-    /// Absolute window of the initial Vortex footer read an open performs
-    /// (`vortex-file`'s postscript-sized suffix, clamped to the blob).
+    /// Absolute window of the initial Vortex footer read an open performs:
+    /// [`VORTEX_FOOTER_INITIAL_READ_BYTES`] from the blob end, clamped to
+    /// the blob. The open's single read then covers the postscript AND the
+    /// layout of prod-sized terms/docs blobs — no `NeedMoreData` prefix
+    /// follow-up — and the field-scoped prefetch fetches this same window
+    /// so a cold open costs no extra round trip.
     pub(crate) fn footer_window(&self) -> Range<u64> {
+        self.range.end - self.len().min(VORTEX_FOOTER_INITIAL_READ_BYTES)..self.range.end
+    }
+
+    /// Absolute window a demoted reader must keep servable without IO:
+    /// the postscript-sized suffix only. The retained footer state
+    /// ([`FooterState`]) already serves every later open, so demotion
+    /// trims the eager tail to exactly the same window it does today.
+    fn retained_footer_window(&self) -> Range<u64> {
         self.range.end - self.len().min(VORTEX_FOOTER_READ_BYTES)..self.range.end
     }
 
@@ -736,7 +748,7 @@ impl RangedBlob {
     /// blob's Vortex footer window, release retained eager-tail data
     /// bytes. Returns the released bytes (0 when nothing changed).
     pub(crate) fn trim_retained_tail(&mut self) -> usize {
-        let window = self.footer_window();
+        let window = self.retained_footer_window();
         let before = self.source.retained_bytes();
         let Some(trimmed) = self.source.trim_retained_tail(window) else {
             return 0;
@@ -889,11 +901,22 @@ impl OpeningMemory {
         state.pending.take()
     }
 }
-/// Bytes `vortex-file` reads from the end of a blob to open it (its maximum
-/// postscript plus the EOF marker) — the window an eager tail or a prefetch
-/// bundle must cover for a Vortex open to cost no IO.
+/// The postscript-sized suffix of a blob (its maximum postscript plus the
+/// EOF marker): the minimum window a Vortex open reads, and the window a
+/// demoted reader keeps servable through the eager tail (see
+/// [`RangedBlob::trim_retained_tail`]).
 pub(crate) const VORTEX_FOOTER_READ_BYTES: u64 =
     vortex::file::MAX_POSTSCRIPT_SIZE as u64 + vortex::file::EOF_SIZE as u64;
+
+/// The initial footer read an open performs and the field-scoped prefetch
+/// bundle fetches: one 256 KiB suffix read covers the postscript AND the
+/// serialized layout of prod-sized terms/docs blobs, eliminating the
+/// sequential `NeedMoreData` prefix read the 64 KiB postscript window paid
+/// (39-167 KB on prod sidecars). Clamped to the blob length; a blob whose
+/// whole footer window lies inside the eager tail still opens without IO.
+/// Byte cost, not a format: only the fetched window grows — the retained
+/// footer state stores whatever the open read.
+pub(crate) const VORTEX_FOOTER_INITIAL_READ_BYTES: u64 = 256 * 1024;
 
 /// [`VortexReadAt`] over a byte window of a [`VixRangeSource`]: every read
 /// adds the window base offset and goes through `fetch`.

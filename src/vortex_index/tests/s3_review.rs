@@ -228,12 +228,16 @@ fn s3_review_open_is_directory_only_and_blocks_load_lazily() {
         "same-block probe must be dictionary-free: {hot_fetches} fetches / {hot_bytes} bytes"
     );
 
-    // A needle in a DIFFERENT key block loads exactly one more block.
+    // A needle in a DIFFERENT key block loads exactly one more block. Its
+    // memory delta is the honest per-block cost: the FIRST probe also paid
+    // the one-time metadata promotion (whole dict block index + terms
+    // footer window, retained across demotion).
     let (_f1, b1) = (fetch_count(), byte_count());
     let bitmap = reader.eval(&probe("svc-00079999-abcdefgh")).unwrap();
     assert_eq!(bitmap.count_set_bits(), 1);
+    let after_second_block = reader.memory_size();
     assert!(
-        reader.memory_size() > after_first_probe,
+        after_second_block > after_first_probe,
         "a probe in a new key block must grow resident dictionary bytes"
     );
     assert!(byte_count() - b1 < 768 * 1024);
@@ -256,8 +260,8 @@ fn s3_review_open_is_directory_only_and_blocks_load_lazily() {
     // Resident dictionary-block accounting is the honest lazy metric (fetch
     // bytes mix in terms-blob reads and read coalescing): one point lookup
     // loads one of more than 20 key blocks.
-    let one_cell = after_first_probe - open_memory;
-    let all_cells = full_memory - open_memory;
+    let one_cell = after_second_block - after_first_probe;
+    let all_cells = full_memory - after_first_probe;
     assert!(
         one_cell * 10 <= all_cells,
         "one lazily loaded key block ({one_cell}B) must be a small fraction of the whole \

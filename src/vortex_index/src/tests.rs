@@ -4413,6 +4413,9 @@ mod ranged {
         bytes: AtomicU64,
         batch_calls: AtomicUsize,
         clock: Arc<DepthClock>,
+        /// Every fetched range, in fetch order (test assertions on WHICH
+        /// object regions were read, not just how much).
+        ranges: parking_lot::Mutex<Vec<Range<u64>>>,
     }
 
     impl CountingSource {
@@ -4427,6 +4430,7 @@ mod ranged {
                 bytes: AtomicU64::new(0),
                 batch_calls: AtomicUsize::new(0),
                 clock,
+                ranges: parking_lot::Mutex::new(Vec::new()),
             })
         }
 
@@ -4442,6 +4446,36 @@ mod ranged {
         /// once per range, like the trait's default chaining).
         fn batch_calls(&self) -> usize {
             self.batch_calls.load(Ordering::SeqCst)
+        }
+
+        /// Whether any recorded fetch range intersects `range`.
+        fn read_ranges_touch(&self, range: Range<u64>) -> bool {
+            self.ranges
+                .lock()
+                .iter()
+                .any(|read| read.start < range.end && range.start < read.end)
+        }
+
+        /// Whether a single recorded fetch covers `range` entirely.
+        fn read_ranges_cover(&self, range: Range<u64>) -> bool {
+            self.ranges
+                .lock()
+                .iter()
+                .any(|read| read.start <= range.start && range.end <= read.end)
+        }
+
+        /// Whether exactly one recorded fetch covers `range` entirely.
+        fn read_ranges_cover_once(&self, range: Range<u64>) -> bool {
+            self.ranges
+                .lock()
+                .iter()
+                .filter(|read| read.start <= range.start && range.end <= read.end)
+                .count()
+                == 1
+        }
+
+        fn clear_reads(&self) {
+            self.ranges.lock().clear();
         }
 
         /// Sequential depth: the longest chain of dependent round trips so
@@ -4468,6 +4502,7 @@ mod ranged {
             self.batch_calls.fetch_add(1, Ordering::SeqCst);
             let depth = self.clock.completed.load(Ordering::SeqCst) + 1;
             self.clock.max.fetch_max(depth, Ordering::SeqCst);
+            self.ranges.lock().extend(ranges.iter().cloned());
             let out: anyhow::Result<Vec<Bytes>> = ranges
                 .into_iter()
                 .map(|range| {
@@ -4801,6 +4836,9 @@ mod ranged {
     ///       + zone map: len × sizeof(ZoneChunk)
     ///       + row regions: len × sizeof(u64)
     ///       + dict field pages: len × sizeof(DictFieldPage)
+    ///       + the resident `dict` blob (the in-memory tail slice on this fixture; a
+    ///         straddling/outside dict is promoted lazily on the first index need and only then
+    ///         charged, so a FRESH reader never carries it)
     ///       + the tail-window bytes a straddling blob must keep servable
     ///       + blob footer-state cells (2 pointers per ranged blob)
     ///       + the ReaderMemory cell itself
@@ -4896,10 +4934,15 @@ mod ranged {
     /// Cold read plan, exact-term count (`count(*) WHERE level='warn'`):
     /// old layout `[terms][dict_blocks][dict]` = tails ∥, bundle[terms
     /// footer + key block], doc_count leaf = 3 round trips; new layout
-    /// `[dict_blocks][terms][dict]` puts the terms footer in the tail, so
-    /// the bundle carries the block AND the field's doc_count leaves =
-    /// 2 round trips. A field whose doc_count span exceeds the leaf cap
-    /// (`svc`, 100k terms) keeps the leaf round trip on both layouts.
+    /// `[dict_blocks][terms][dict]` = tails ∥, bundle[terms footer + key
+    /// block], doc_count leaf = 3 round trips too — the one-read Vortex
+    /// footer (`VORTEX_FOOTER_INITIAL_READ_BYTES`, 256 KiB) is wider than
+    /// the eager tail's coverage beyond `terms.end`, so the footer window
+    /// travels in the bundle and the leaves read in their own wave (the
+    /// pre-widening plan folded tail-resident 65,535 B footers into the
+    /// bundle, but paid a sequential NeedMoreData prefix read on
+    /// prod-sized blobs instead). A field whose doc_count span exceeds the
+    /// leaf cap (`svc`, 100k terms) keeps the same shape on both layouts.
     #[test]
     fn cold_exact_count_round_trips_old_and_new_layout() {
         let (data, index) = build_large_core_file();
@@ -4932,7 +4975,10 @@ mod ranged {
             old.depth, 3,
             "old layout: tails, bundle[footer+block], leaf"
         );
-        assert_eq!(new.depth, 2, "new layout: tails, bundle[block+leaves]");
+        assert_eq!(
+            new.depth, 3,
+            "new layout: tails, bundle[footer window + block], leaf"
+        );
         assert!(
             new.fetches <= old.fetches,
             "{} > {}",
@@ -4970,8 +5016,13 @@ mod ranged {
     /// Cold read plan, grouped top-N (`GROUP BY level ORDER BY count LIMIT
     /// 10`): old layout = tails ∥, bundle[terms footer + key-terms block +
     /// field block run], leaves[key ordinal + value spans] = 3 round trips;
-    /// new layout folds the leaves into the bundle = 2. Results equal the
-    /// whole-file reader's.
+    /// new layout = tails ∥, bundle[terms footer window + blocks], leaves
+    /// = 3 round trips too — the one-read Vortex footer window (256 KiB)
+    /// is wider than the eager tail's coverage beyond `terms.end`, so it
+    /// travels in the bundle instead of the pre-widening tail-resident
+    /// 65,535 B footer (which folded the leaves into the bundle but paid a
+    /// sequential NeedMoreData prefix read on prod-sized blobs). Results
+    /// equal the whole-file reader's.
     #[test]
     fn cold_top_k_round_trips_old_and_new_layout() {
         let (data, index) = build_large_core_file();
@@ -5002,21 +5053,35 @@ mod ranged {
             old.depth, 3,
             "old layout: tails, bundle[footer+blocks], leaves"
         );
-        assert_eq!(new.depth, 2, "new layout: tails, bundle[blocks+leaves]");
+        assert_eq!(
+            new.depth, 3,
+            "new layout: tails, bundle[footer window + blocks], leaves"
+        );
+        // The new layout may pay one more FETCH than the old one here: its
+        // terms footer window (256 KiB) extends past the tail's coverage
+        // beyond terms.end, so the leaf planning that the old layout folds
+        // into its own footer fetch becomes a separate window fetch. Bytes
+        // still favor the new layout (329 KB vs 590 KB here); the
+        // round-trip DEPTH is the latency contract and stays equal.
         assert!(
-            new.fetches <= old.fetches,
-            "{} > {}",
+            new.fetches <= old.fetches + 1,
+            "{} > {} + 1",
             new.fetches,
             old.fetches
         );
     }
 
-    /// D2: with the new blob order the terms blob's Vortex footer (its last
-    /// 65,535 bytes) lies inside the production eager tail, so opening the
-    /// terms blob — footer parse + doc_count leaf map — costs ZERO fetches
-    /// beyond the two tail probes. The legacy order pays one fetch for it.
+    /// D2, post footer-widening: the terms blob's Vortex footer open is ONE
+    /// fetch on BOTH layouts — the initial read window
+    /// (`VORTEX_FOOTER_INITIAL_READ_BYTES`, 256 KiB) covers the postscript
+    /// AND the layout, replacing the postscript-sized read plus a
+    /// sequential `NeedMoreData` prefix read that prod-sized terms blobs
+    /// paid. The tail still serves whatever part of the window it covers
+    /// (the new layout's dict + puffin footer sit between the terms blob
+    /// and the file end), so the open fetches only the tail-missing prefix;
+    /// a fully tail-covered window (small files) fetches nothing.
     #[test]
-    fn new_layout_terms_footer_is_tail_resident() {
+    fn terms_footer_open_is_one_read_on_both_layouts() {
         let (data, index) = build_large_core_file();
         let terms = crate::test_support::blob_byte_range(&index, "terms").unwrap();
         let dict = crate::test_support::blob_byte_range(&index, "dict").unwrap();
@@ -5024,16 +5089,24 @@ mod ranged {
         assert!(dict.start == terms.end, "dict must directly follow terms");
         assert!(
             footer_window as u64 + crate::source::VORTEX_FOOTER_READ_BYTES <= PROD_SIDECAR_TAIL,
-            "dict + puffin footer ({footer_window} B) + 65,535 must fit the tail"
+            "dict + puffin footer ({footer_window} B) + 65,535 fits the tail: the \
+             pre-widening footer window was tail-resident on the new layout"
+        );
+        assert!(
+            footer_window as u64 + crate::source::VORTEX_FOOTER_INITIAL_READ_BYTES
+                > PROD_SIDECAR_TAIL,
+            "the 256 KiB initial window extends past the tail's coverage beyond \
+             terms.end: the open pays exactly one prefix fetch on the new layout"
         );
 
         for (name, sidecar, expected_fetches) in [
-            ("new", index.clone(), 0usize),
+            ("new", index.clone(), 1usize),
             ("legacy", repack_legacy_sidecar_order(&index), 1usize),
         ] {
             let source = PairSource::new(data.clone(), sidecar);
             let ranged = source.open_with_tail(PROD_SIDECAR_TAIL);
             let before = source.fetches();
+            let before_bytes = source.bytes();
             let terms_blob = ranged.terms_blob_for_tests().expect("indexed fixture");
             assert!(
                 matches!(terms_blob, crate::container::BlobHandle::Ranged(_)),
@@ -5052,12 +5125,89 @@ mod ranged {
                 ranged.term_count(),
                 "{name}: leaves cover every ordinal"
             );
+            let fetches = source.fetches() - before;
             assert_eq!(
-                source.fetches() - before,
-                expected_fetches,
-                "{name}: terms footer open fetches"
+                fetches, expected_fetches,
+                "{name}: terms footer open fetches (one-read footer)"
+            );
+            assert!(
+                (source.bytes() - before_bytes) <= crate::source::VORTEX_FOOTER_INITIAL_READ_BYTES,
+                "{name}: the open fetches at most the initial window"
             );
         }
+    }
+
+    /// Whole-`dict` promotion (D3): a reader whose `dict` blob is NOT
+    /// resident in the eager tail fetches the WHOLE blob in ONE read on the
+    /// first index need and retains it (metadata); after `demote()` — which
+    /// keeps the resident buffer — a different term's count re-fetches ONLY
+    /// its own key block and doc_count leaf, never the dict again and never
+    /// the terms footer window (the retained footer state serves it).
+    #[test]
+    fn dict_promoted_once_and_survives_demote_without_dict_io() {
+        let (data, index) = build_large_core_file();
+        let dict = crate::test_support::blob_byte_range(&index, "dict").unwrap();
+        let terms = crate::test_support::blob_byte_range(&index, "terms").unwrap();
+        let dict_range = dict.start as u64..dict.end as u64;
+        // The terms footer window (one-read Vortex footer, clamped to the
+        // blob): the cold plan fetches exactly this suffix once.
+        let terms_len = (terms.end - terms.start) as u64;
+        let footer_window = terms.end as u64
+            - terms_len.min(crate::source::VORTEX_FOOTER_INITIAL_READ_BYTES)
+            ..terms.end as u64;
+
+        // A tail covering ONLY the puffin footer past the dict: the dict is
+        // fully outside the tail (the prod straddle/outside shapes).
+        let tail = (index.len() - dict.end) as u64;
+        let source = PairSource::new(data.clone(), index.clone());
+        let mut reader = source.open_with_tail(tail);
+        let mem = VixReader::open_with_index(data, Some(index)).unwrap();
+
+        // (a) cold count: exactly ONE dict read — the whole blob, promoted.
+        let query = exact("level", "warn");
+        let expect = mem.count(&query).unwrap();
+        source.index.clear_reads();
+        let before = source.index.fetches();
+        assert_eq!(reader.count(&query).unwrap(), expect);
+        let cold_fetches = source.index.fetches() - before;
+        assert!(
+            source.index.read_ranges_cover_once(dict_range.clone()),
+            "the dict must be fetched whole in exactly one read"
+        );
+        // The whole cold count: promoted dict + terms footer window + key
+        // block + doc_count leaf = 4 reads (open's tail reads excluded).
+        assert_eq!(
+            cold_fetches, 4,
+            "cold count should be dict + footer + block + leaf, used {cold_fetches}"
+        );
+
+        // (b) demote: the resident dict buffer is KEPT (metadata), parsed
+        // indexes drop; a different term's count pays ONLY its own block
+        // and leaf reads — never the dict, never the terms footer window.
+        let warm = reader.memory_size();
+        let released = reader.demote();
+        assert!(
+            released > 0 && reader.memory_size() < warm,
+            "demotion must release the parsed structures ({released} bytes)"
+        );
+        let query = exact("svc", "svc_000007");
+        let expect = mem.count(&query).unwrap();
+        source.index.clear_reads();
+        let before = source.index.fetches();
+        assert_eq!(reader.count(&query).unwrap(), expect);
+        let warm_fetches = source.index.fetches() - before;
+        assert_eq!(
+            warm_fetches, 2,
+            "a demoted reader re-fetches only its block and leaf, used {warm_fetches}"
+        );
+        assert!(
+            !source.index.read_ranges_touch(dict_range.clone()),
+            "no demoted-count read may touch the dict range"
+        );
+        assert!(
+            !source.index.read_ranges_touch(footer_window.clone()),
+            "no demoted-count read may touch the terms footer window"
+        );
     }
 
     /// #27: a condition-ALL evaluation must not touch the dictionary at

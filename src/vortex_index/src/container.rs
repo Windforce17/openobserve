@@ -2354,6 +2354,13 @@ pub(crate) fn open_blob(
             let temporary = runtime.block_on(
                 session
                     .open_options()
+                    // One 256 KiB suffix read instead of the postscript
+                    // window + a NeedMoreData prefix follow-up (two
+                    // sequential reads on prod-sized blobs).
+                    .with_initial_read_size(
+                        usize::try_from(crate::source::VORTEX_FOOTER_INITIAL_READ_BYTES)
+                            .expect("constant fits usize"),
+                    )
                     .with_file_size(bytes.len() as u64)
                     .open_read(read),
             )?;
@@ -2376,6 +2383,13 @@ pub(crate) fn open_blob(
             let file = runtime.block_on(
                 session
                     .open_options()
+                    // One 256 KiB suffix read instead of the postscript
+                    // window + a NeedMoreData prefix follow-up (two
+                    // sequential reads on prod-sized blobs).
+                    .with_initial_read_size(
+                        usize::try_from(crate::source::VORTEX_FOOTER_INITIAL_READ_BYTES)
+                            .expect("constant fits usize"),
+                    )
                     .with_file_size(ranged.len())
                     .open_read(read),
             )?;
