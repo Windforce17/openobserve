@@ -2573,6 +2573,15 @@ fn register_metrics(registry: &Registry) {
         .register(Box::new(VIX_READER_CACHE_MISSES_TOTAL.clone()))
         .expect("Metric registered");
     registry
+        .register(Box::new(VIX_READER_CACHE_TIER_ENTRIES.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(VIX_READER_CACHE_TIER_BYTES.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(VIX_READER_CACHE_DEMOTIONS_TOTAL.clone()))
+        .expect("Metric registered");
+    registry
         .register(Box::new(VIX_FETCH_COUNT_TOTAL.clone()))
         .expect("Metric registered");
     registry
@@ -2989,6 +2998,9 @@ mod tests {
         let _ = VIX_READER_CACHE_MEMORY_BYTES.clone();
         let _ = VIX_READER_CACHE_HITS_TOTAL.clone();
         let _ = VIX_READER_CACHE_MISSES_TOTAL.clone();
+        let _ = VIX_READER_CACHE_TIER_ENTRIES.clone();
+        let _ = VIX_READER_CACHE_TIER_BYTES.clone();
+        let _ = VIX_READER_CACHE_DEMOTIONS_TOTAL.clone();
         let _ = VIX_FETCH_COUNT_TOTAL.clone();
         let _ = VIX_FETCH_BYTES_TOTAL.clone();
         let _ = VIX_RESULT_CACHE_MEMORY_USAGE.clone();
