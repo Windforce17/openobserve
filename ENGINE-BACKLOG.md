@@ -535,6 +535,54 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     - During the last pod's replacement one run of each aggregate returned
       `partial=true` with `connect to gRPC node error` — the roll, not the
       cap; clean on the settled fleet.
+- **2026-09-30 05:00–08:00Z — the L0 scan path, the "2 h lag" and what the
+  merge pipeline really does (owner review; corrections to earlier numbers).**
+  - Volumes, last 24 h: traces/default 42.4 TB original / 1,893 GB compressed
+    / 9.1 B rows (12,861 files); logs/default 38.1 TB / 931 GB / 3.4 B rows
+    (12,502 files). Per hour ≈ 1.8 TB traces, 1.6 TB logs original — the
+    "260 GB/h" quoted earlier was a 45-min slice of one hour's merge output.
+    L0 landing now: logs 1,208/h at **p50 2.69 GB** original; traces 750/h at
+    **p50 312 MB** (straddling slices + CHUNK 512 on wide rows).
+  - L0 scan path is fine: `ZO_VIX_READ_MODE=ranged` is on, the filtered 24 h
+    logs count scans 36–55 L0 per follower (1.8–2.5 GB compressed) in
+    **91–230 ms** of DataFusion time (one 729 ms straggler = 21 % uncached
+    files on S3 range reads); the cold 3.1 s of that query is `idx_took`
+    (1,120 indexed files × ~10 index reads). A cheap L0 index would save
+    0.2–0.8 s warm on this shape — not the root fix. The retired cap also
+    measured Σ `compressed_size` while ranged scans read one column.
+  - The lag (logs/default, 05:14Z): open hour 95 % of rows still in L0; at
+    close+14 min 61 %; close+74 min 1.1 %; 0 by close+130 min. The live lane
+    starts ~9 min into the hour. The bound is scheduling: one job per
+    (stream, hour) on one node, `ZO_COMPACT_LIVE_WORKER_NUM=1` (auto
+    concurrency resolves the rest), 4.2 merges/min ≈ 8.3 L0/min arrival.
+  - What actually happens to logs bytes (last 60 min): **560 L0 healed IN
+    PLACE** (`single-file healing rebuild … re-derives every term from
+    _source`, sidecar-only, data object untouched, 1.29 TB) vs 231 merged
+    outputs (0.64 TB rewritten, 311/348 merges are 2-input passthrough of
+    already-indexed ~2.5 GB files toward the 4,096 MB `LOGS_INDEXED` target
+    — a 1.6× size gain for a full rewrite). Traces: **1,294 merges/h, 1,041
+    of them 2-input, all passthrough, output p50 3.0 GB, 13 s each, 3.45 TB
+    rewritten per hour on 1.8 TB ingested (≈ 2 generations per byte)**.
+    Cause: `is_incremental = !is_past_hour(offset)` — the open hour seals
+    only full groups ("each file merged exactly once"), but a CLOSED hour
+    seals whatever ≥ 2 candidates each 10 s pass finds while stragglers
+    keep arriving for ~2 h → a pairwise cascade. Two targets (`MAX_FILE_SIZE`
+    1024 "rebuild-safe" for index-less groups, `*_INDEXED_MAX_FILE_SIZE`
+    4096 for passthrough) add a second generation by design, while heal
+    already rebuilds 2.7 GB index-less L0s routinely — the 1024 ceiling is
+    not actually protecting anything.
+  - Proposal (owner: "one config, merge once"): (1) one target
+    `ZO_COMPACT_MAX_FILE_SIZE=4096`, delete `LOGS_/TRACES_INDEXED_MAX_FILE_SIZE`
+    and `max_file_size_for_merge`; files > 50 % of target are done (the debt
+    line already says so), so 2.7 GB logs L0s are healed once and never
+    re-merged; (2) keep the incremental "seal full groups only, carry the
+    remainder" rule for `LATE_LANE_HOURS` after close and do ONE sweep-up
+    seal after that — kills the pairwise cascade (traces 1,294 → ~150
+    merges/h, rewrite 3.45 → ~1 TB/h); (3) delete
+    `ZO_VIX_MERGE_INDEX_DEFER_BELOW_MB` (creates index-less merged outputs
+    that need a second heal); (4) later, bigger L0s via CHUNK_MB so traces
+    L0s are not 312 MB. Net: one size knob, one index build per byte, the
+    lag becomes the heal/merge scheduling latency only.
 
 ## 2026-09-28 — `.173` definitive numbers; needle lookups full-scanned the unstamped hours (fix: per-file sidecar bloom probes + a settled-only `.bf` queue)
 - Fleet at 14:52Z, 3 days undisturbed: queriers 10/10 `.173` (7 pods 3 d,
