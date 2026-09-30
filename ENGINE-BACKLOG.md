@@ -343,6 +343,62 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     bytes, are the ceiling, so probably worth it; unmeasured; (3) logs
     footers are 369 KB of JSON (`dict_field_pages_v1` 233 KB for 2,586
     fields) — a binary property encoding would halve the tail need.
+- **`.185` shipped (vix-arch `71c03c3c6`, GitOps #584, queriers 21:10–21:12Z,
+  reader cache 3 GiB).** Prod, fresh pods: cold 7 d filtered traces count
+  16.0 s, top-10 `span_status` 19.4 s, logs count svc 12.1 s (`.184`: 18.1 /
+  21.9 / 13.0); reads per file logs 8.0 → 6.3, traces 5.2 → 4.9 (in prod the
+  256 KiB tail already served part of the dict probes). **The cached-reader
+  path still does not pay off in prod**: back-to-back 7 d traces counts got
+  933 reader-cache hits over 14k lookups — demoted entries average 595 KB
+  (198 KB metadata + 184 KB dict + ~257 KB retained terms-footer window),
+  3 GiB holds 5.2k readers, one follower's 7 d traces share is 7k files,
+  and a sequential scan over a working set larger than the LRU thrashes.
+  Measured on the prod files (agent, partial, reverted before commit): the
+  Vortex footer bytes actually consumed are **105 KB traces / 233 KB logs**
+  of the 256 KiB window — trimming to the consumed suffix (vortex-file's
+  `FooterDeserializer` returns the first consumed offset from the postscript
+  alone; a retained parsed `Footer` is not an option because its layout
+  tree pins the opening session's runtime) takes a demoted traces reader to
+  ~490 KB, so 3 GiB ≈ 6.5k and 4 GiB ≈ 8.7k readers. Alternatively drop the
+  resident dict from the metadata tier (one 184 KB read per file on a hit
+  instead of five probes) → ~306 KB per reader. Not shipped tonight: the
+  change touched `OpeningMemory`/`open_blob` wiring and was half done at the
+  deadline; the tree is at `.185`.
+- **Full battery on `.185` at 21:21Z (pods 10 min old, cold caches; obs
+  r1/r2 vs O2, ms, all `partial=false`):** 1 h — traces count 1,116/677 vs
+  168, hist 1,038/508 vs 172, top-10 15 m 968/307 vs 108, logs count 897/290
+  vs 343, logs count svc 1,228/533 vs 105, logs `SELECT * LIMIT 50` 396/231
+  vs O2 error. 24 h — traces count 837/391 vs 1,176, hist 785/288 vs 6,153,
+  top-10 7,211/346 vs 1,528, p99 by service 12,470/11,280 vs 19,065, logs
+  count 1,095/318 vs O2 error, logs count svc 1,426/476 vs 2,764, `SELECT *`
+  933/378 vs 2,609. 7 d — traces count 1,676/1,152 vs 11,191, hist 1,171/720
+  vs 37,865, **top-10 26,624/1,626 vs 24,174** (was 51.9 s cold at 11:34Z),
+  logs count 1,653/917 vs 46,417, **logs count svc 14,817/926 vs 63,038**
+  (was 32.9 s), `SELECT *` 1,682/1,031 vs 6,883. Cold 1 h shapes on fresh
+  pods are 1 s (index-evaluation cache cold), warm 0.3–0.7 s; O2 is faster
+  only on warm 1 h shapes and on `logs count svc 1 h`.
+- **State at 22:02Z for the 10:00 check-in:** queriers 10/10 `.185`
+  (RSS 7.8–9.0 GiB, 0 restarts), compactors 30/30 `.181` (0 OOM; last hour:
+  traces 427 live merges avg 3.6 inputs / 1.36 TB, logs 127 merges + 612
+  heals; logs hour 20 at close+62 min: 0 index-less of 558 files), ingesters
+  and router `.178`. vix-arch is 12 commits ahead of `origin/vix-arch`, none
+  pushed; release branches `.180`–`.185` exist locally. Scratch helpers on
+  ops: `/tmp/obsq173.py` (existing), `/tmp/qb182.py`, `/tmp/qb_all.py`,
+  `/tmp/conc.py`, `/tmp/burst.py`, `/tmp/burst_small.py`.
+  - Today's chain, cold 7 d filtered traces count per follower: `.179` 85.0 s
+    (5 sequential S3 round trips/file × ~100 ms cold-object latency, 64
+    files in flight) → `.181` 59.9 s (2–3 round trips) → `.182` 16.9 s
+    (measured 4 MiB admission instead of 32 MiB, 192 files in flight) →
+    `.185` 16.0 s (fewer reads; the ~1,000 range-GETs/s per pod ceiling
+    now bounds it). Concurrent dashboards no longer stall small queries
+    (max 1.7–2.5 s vs 24 s).
+  - Next, in order of evidence: (1) finish the footer-window trim (or drop
+    the resident dict) and take the reader cache to 4 GiB so a follower's
+    7 d traces share fits — then a second long-window query costs 2
+    reads/file; (2) declare the filtered-histogram workspace from a
+    measurement (33 `budget_refused` full scans across four bursts); (3)
+    `ZO_VIX_EAGER_TAIL_BYTES` 512 KiB for traces-shaped sidecars; (4)
+    binary footer properties for the 2,586-field logs schema (369 KB JSON).
 
 ## 2026-09-29 — P2 shipped as `.176` and rolled back within 30 min: the per-stream side table stalled the shared meta DB (commit latency 40–60×, ingest 503s); ranges must live in the segment row
 - What shipped (vix-arch `013c45010` + NATS retry `76fe754b5`, image
