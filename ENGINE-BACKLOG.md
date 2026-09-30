@@ -134,6 +134,42 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     (2) coalesce the per-file read chain into one or two ranged reads
     (sidecar footer already names the dictionary/posting offsets); (3)
     persist the evaluation cache across restarts. None of this is `.180`.
+- **Lever (1) tried and reverted, 11:58–12:14Z (GitOps #577 → #578):
+  `ZO_VIX_SEARCH_CONCURRENCY` 64 → 192 did not raise cold evaluation
+  throughput.** Cold-vs-cold on the same 7 d window (the roll wiped the
+  ephemeral disk cache, so "after" had 0 % sidecars cached vs 45 % before):
+  filtered traces count 42.5 s → 59.6–61.8 s, top-10 services 51.9 → 70.7 s.
+  The `io_accounting` line explains it: 49k remote range reads, active IO
+  4,518–5,415 s (**75–102 ms per read vs ~53 ms at 64**), and
+  **evaluation admission wait 5,501–6,675 s** — each eval declares 32 MiB
+  (`evaluation_working_bytes`: fixed workspace + bitmaps; the clamp is 0
+  for fully covered files), so the 4 GiB `ZO_VIX_EVAL_MAX_BYTES` admits
+  only ~120 of the 192 and the rest queue; per-pod reads/s stayed ~1,000
+  either way; CPU 3.7 of 16 cores. Side effects: 31 growth timeouts =
+  31 `budget_refused` fallbacks (full scans) on one pod in 12 min (0 in 3
+  days at 64 on `.173`). Raising the eval budget to fit 192 would add ~4 GiB
+  transient on pods that reach 19 GiB RSS of a 24 GiB limit — not taken.
+  Conclusion: the cold cost is **sequential round trips per file × S3
+  latency**; fan-out cannot buy it back. Read-chain map (scout, verified
+  file:line): filtered count = `.vix` tail 64 KiB → `.vxi` tail 256 KiB →
+  [dict field index, 2 depths, only when `dict` is not tail-resident] →
+  predecessor key block → terms-blob Vortex footer 65,535 B → `doc_count`
+  leaf = **5 sequential round trips**; grouped top-N adds the key-terms
+  block, the key ordinal's leaf, the field boundary blocks and the field's
+  leaf ranges = **~7**. Sidecar order today `[terms][plist][dict_blocks]
+  [bloom][dict][footer]`: the Vortex footer sits at the END of the FIRST
+  blob, unreachable by any tail over-fetch. Building (`.181`, in progress):
+  parallel tails; writer reorder `[…][terms][dict][footer]` so the Vortex
+  footer rides in the 256 KiB tail (readers locate blobs by tag — no format
+  change, new files only); a field-scoped prefetch bundle (Vortex footer
+  when not resident + the field's contiguous key-block run ≤ 1 MiB + the
+  key-terms block + `doc_count` leaves ≤ 256 KiB when the footer is
+  resident, handed to the Vortex scan via a pre-seeded segment cache);
+  `dict` field-index probes folded into one batch. Targets: count 5 → 3
+  round trips (2 on new-layout files), top-N 7 → 3 (2). `io_accounting`
+  now logs `round_trips` (`a3ad367ff`) so the effect is measurable in prod.
+  Inline `doc_count` in dictionary blocks (2 round trips for everything,
+  format change) stays as the follow-up.
 
 ## 2026-09-29 — P2 shipped as `.176` and rolled back within 30 min: the per-stream side table stalled the shared meta DB (commit latency 40–60×, ingest 503s); ranges must live in the segment row
 - What shipped (vix-arch `013c45010` + NATS retry `76fe754b5`, image
