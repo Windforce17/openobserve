@@ -561,6 +561,27 @@ impl EvaluationPermit {
     }
 }
 
+/// Test-only: a permit on a private gate sized at exactly `budget`, with
+/// the given workspace pre-reserved. Proves a declaration covers a real
+/// evaluation without relying on the process-wide gate's spare capacity.
+#[cfg(test)]
+pub(super) fn try_acquire_evaluation_under(
+    budget: usize,
+    workspace: usize,
+) -> Option<EvaluationPermit> {
+    let count = Arc::clone(&EVAL_COUNT).try_acquire_owned().ok()?;
+    let permit = ByteGate::new(budget).try_acquire(workspace)?;
+    Some(EvaluationPermit {
+        _count: count,
+        memory: Arc::new(EvaluationMemory {
+            workspace,
+            bytes: Mutex::new(permit),
+            refusal: Mutex::new(None),
+            growth_wait: GROWTH_WAIT,
+        }),
+    })
+}
+
 pub(super) fn try_acquire_evaluation(bytes: usize) -> Option<EvaluationPermit> {
     let count = Arc::clone(&EVAL_COUNT).try_acquire_owned().ok()?;
     let permit = EVAL_BYTES.try_acquire(bytes)?;

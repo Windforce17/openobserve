@@ -1653,6 +1653,14 @@ fn dict_group_counts(
         .collect())
 }
 
+/// The configured cap on collected groups (TopN/Distinct/MultiHistogram
+/// collectors): the admission workspace's per-group allowance multiplies
+/// exactly this, so the declaration and the collectors' own refusal
+/// budget stay in lockstep.
+pub(super) fn topn_group_cap() -> usize {
+    top_n_limits().max_groups
+}
+
 fn top_n_limits() -> DictMultiHistogramLimits {
     let cap = config::get_config()
         .limit

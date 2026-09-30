@@ -1000,12 +1000,43 @@ fn is_cancelled_read(error: &anyhow::Error) -> bool {
     })
 }
 
+/// Eager-tail decode slack of one ranged open: the data object's 64 KiB
+/// probe and the sidecar's 256 KiB tail can be held fetched, parsed and
+/// copied at the same time (`DEFAULT_TAIL_FETCH_BYTES` / prod sidecar tail).
+const EVAL_TAIL_TRANSIENT_BYTES: usize = (64 + 256) * 1024;
+/// Cap of one evaluation's prefetch bundles: field key blocks stay under
+/// 1 MiB and doc_count leaves under 256 KiB
+/// (`PREFETCH_FIELD_BLOCKS_MAX_BYTES` / `PREFETCH_DOC_COUNT_MAX_BYTES`).
+const EVAL_PREFETCH_CAP_BYTES: usize = (1024 + 256) * 1024;
+/// Vortex footer of the terms blob (postscript `u16::MAX - 8` plus the EOF
+/// marker): fetched and retained before the first dictionary scan.
+const EVAL_TERMS_FOOTER_BYTES: usize = 65_535;
+/// Fixed workspace of one native scan session
+/// (`NATIVE_SESSION_WORKSPACE` in container.rs).
+const EVAL_SESSION_BYTES: usize = 64 * 1024;
+/// Hash-map edge, heap slot and result-tuple allowance per collected group
+/// (key + value + count + growth slack), sized over the 100k-row fixture's
+/// measured per-entry footprint.
+const EVAL_GROUP_ENTRY_BYTES: usize = 256;
+/// Safety factor over the measured fixed peak of an index-only evaluation
+/// (tails + prefetch + footer + collector on the parity fixtures).
+const EVAL_INDEX_ONLY_SAFETY: usize = 2;
+
 /// Bounded transient decoding/group workspace and mode-specific row buffers.
 /// Reader/index ownership is charged separately, before each real allocation.
+///
+/// `index_only` marks evaluations proven (see [`index_only_evaluation`]) to
+/// answer from the term dictionary and `doc_count` metadata alone: no docs
+/// chunk is ever decoded, so instead of the streaming workspace they declare
+/// only the fixed fetch/parse slack plus their bounded group collector —
+/// low single-digit MiB instead of 32 MiB, which multiplied by per-pod
+/// fan-out decided how many evaluations the byte gate admitted (prod
+/// 2026-09-30: ~120 admitted, the rest queued behind `evaluation_wait_us`).
 fn evaluation_working_bytes(
     records: i64,
     mode: Option<&IndexOptimizeMode>,
     fully_covered: bool,
+    index_only: bool,
 ) -> usize {
     let rows = usize::try_from(records.max(0)).unwrap_or(usize::MAX);
     // Evaluation/composition can retain the condition, timestamp and result
@@ -1040,8 +1071,94 @@ fn evaluation_working_bytes(
         // numeric column rather than only their zone/chunk metadata.
         _ => rows.saturating_mul(16),
     };
+    if index_only {
+        // No docs chunk is decoded: the real transient footprint is the
+        // eager tails, the prefetch bundle caps, the terms footer, one scan
+        // session and the bounded group collector (complete value counts /
+        // doc_count sums never materialise per-row data). Bitmaps stay
+        // declared: an AND/NOT composition or a skipped conjunct still
+        // evaluates postings into per-file bitmaps.
+        let groups = match mode {
+            Some(IndexOptimizeMode::SimpleTopN(..))
+            | Some(IndexOptimizeMode::SimpleDistinct(..))
+            | Some(IndexOptimizeMode::SimpleMultiHistogram(..)) => {
+                collect::topn_group_cap().saturating_add(1)
+            }
+            _ => 0,
+        };
+        let fixed = EVAL_TAIL_TRANSIENT_BYTES
+            .saturating_add(EVAL_PREFETCH_CAP_BYTES)
+            .saturating_add(EVAL_TERMS_FOOTER_BYTES)
+            .saturating_add(EVAL_SESSION_BYTES)
+            .saturating_add(groups.saturating_mul(EVAL_GROUP_ENTRY_BYTES))
+            .saturating_add(bitmaps);
+        return fixed.saturating_mul(EVAL_INDEX_ONLY_SAFETY);
+    }
     let row_bytes = bitmaps.saturating_add(clamp).saturating_add(collector_rows);
     (32usize * 1024 * 1024).saturating_add(row_bytes)
+}
+
+/// Whether this evaluation provably answers from the term dictionary and
+/// `doc_count` metadata alone — no docs chunk is ever decoded, so admission
+/// may use the small index-only workspace. Decided from admission-time
+/// facts only (mode, condition, coverage); anything reader-dependent keeps
+/// the streaming workspace and may decode 65,536-row docs chunks.
+fn index_only_evaluation(
+    mode: Option<&IndexOptimizeMode>,
+    condition: Option<&IndexCondition>,
+    fully_covered: bool,
+    file_range: Option<(i64, i64)>,
+    time_range: (i64, i64),
+) -> bool {
+    let Some(mode) = mode else {
+        return false;
+    };
+    if !fully_covered {
+        return false;
+    }
+    let Some(condition) = condition else {
+        return false;
+    };
+    match mode {
+        // Dictionary count: any condition the index serves counts postings
+        // and doc_count only. A sole numeric equality/IN may instead be
+        // decided by chunk stats, which decodes docs chunks
+        // (collect::stats_eq_bitmap) — that shape keeps the streaming
+        // workspace.
+        IndexOptimizeMode::SimpleCount => condition.single_numeric_eq().is_none(),
+        // Complete dictionary answers precede any docs probe only for a
+        // condition-all single-field group (collect::unfiltered_top_n /
+        // unfiltered_distinct); conditioned or tuple-keyed groups stream
+        // docs chunks.
+        IndexOptimizeMode::SimpleTopN(fields, ..) => {
+            fields.len() == 1 && condition.is_condition_all()
+        }
+        IndexOptimizeMode::SimpleDistinct(..) => condition.is_condition_all(),
+        // The sole positive IN on the grouping field with a provable
+        // single-bucket label is served by complete value counts
+        // (collect::single_bucket_value_counts); any other breakdown
+        // streams docs chunks.
+        IndexOptimizeMode::SimpleMultiHistogram(min, max, width, offset, field) => {
+            let [crate::index::Condition::In(predicate_field, _, false)] =
+                condition.conditions.as_slice()
+            else {
+                return false;
+            };
+            if predicate_field != field {
+                return false;
+            }
+            let Some(file_range) = file_range else {
+                return false;
+            };
+            matches!(
+                collect::single_bucket_histogram_label(
+                    file_range, time_range, *min, *max, *width, *offset,
+                ),
+                Ok(Some(_))
+            )
+        }
+        _ => false,
+    }
 }
 
 /// Own the permit in actual blocking work. Dropping the waiter aborts a queued
@@ -1397,7 +1514,9 @@ pub async fn warm_file(
         cache_key: Some(reader_key),
         cached: None,
     };
-    let bytes = evaluation_working_bytes(0, None, true);
+    // Warming only opens the ranged reader and parses metadata; it is
+    // best-effort background work, so keep the conservative workspace.
+    let bytes = evaluation_working_bytes(0, None, true, false);
     let Some(permit) = source::try_acquire_evaluation(bytes) else {
         return Ok(false);
     };
@@ -1573,11 +1692,23 @@ async fn search_vix_index(
 
     // The straddling `_timestamp` clamp is declared at admission (a
     // predictable, possibly large growth must queue behind the gate, not
-    // compete for the growth headroom mid-evaluation).
+    // compete for the growth headroom mid-evaluation). Dictionary-only
+    // count/top-N/distinct/IN answers declare the small index-only
+    // workspace instead — the admission gate then fits several times more
+    // concurrent evaluations (prod 2026-09-30: 32 MiB per evaluation
+    // admitted only ~120 of a 4 GiB gate while 192 slots waited).
+    let index_only = index_only_evaluation(
+        idx_optimize_rule.as_ref(),
+        Some(&condition),
+        file_in_range,
+        Some((parquet_file.meta.min_ts, parquet_file.meta.max_ts)),
+        time_range,
+    );
     let declared_bytes = evaluation_working_bytes(
         parquet_file.meta.records,
         idx_optimize_rule.as_ref(),
         file_in_range,
+        index_only,
     );
     // Queue on the cache entry without owning its reader or any eval capacity.
     // Compatibility is immutable metadata copied into the weak lookup handle.
@@ -1913,10 +2044,14 @@ async fn search_vix_docs_optimized(
         ));
     };
 
+    // The native docs helper streams `_timestamp`/equality columns chunk by
+    // chunk (SimpleSelect may also materialise candidates), so it always
+    // keeps the streaming workspace.
     let declared_bytes = evaluation_working_bytes(
         file.meta.records,
         idx_optimize_rule.as_ref(),
         time_clamp.is_none(),
+        false,
     );
     let permit = source::acquire_evaluation(operation, declared_bytes).await?;
     let account = file.account.clone();
@@ -6151,7 +6286,7 @@ mod ranged_parity_tests {
 
     /// Plain in-memory range source (ready futures), standing in for the
     /// infra cache ladder.
-    struct MemRangeSource(Bytes);
+    pub(super) struct MemRangeSource(pub(super) Bytes);
 
     impl VixRangeSource for MemRangeSource {
         fn len(&self) -> u64 {
@@ -6258,7 +6393,7 @@ mod ranged_parity_tests {
     }
 
     /// A deterministic, order-insensitive rendering of one evaluation result.
-    fn fingerprint(raw: &RawVixResult) -> String {
+    pub(super) fn fingerprint(raw: &RawVixResult) -> String {
         match raw {
             RawVixResult::ExactNoMatch => "no-match".to_string(),
             RawVixResult::ExactAllRows(rows) => format!("all-rows:{rows}"),
@@ -6950,6 +7085,497 @@ mod ranged_parity_tests {
                 other => panic!("expected missing-column, got {}", fingerprint(&other)),
             }
         }
+    }
+}
+
+// =====================================================================
+// Admission workspace tests — the shape-aware `evaluation_working_bytes`
+// declaration, its byte breakdown, and the completion guarantee that a
+// gate sized at exactly the declaration plus the fixture's owned bytes
+// runs an index-only evaluation without growth waits or refusals.
+// =====================================================================
+#[cfg(test)]
+mod workspace_tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use bytes::Bytes;
+
+    use super::*;
+    use crate::{
+        index::{Condition, IndexCondition},
+        vix::ranged_parity_tests::{MemRangeSource, build_parity_file, fingerprint},
+    };
+
+    /// Peak absolute reader ownership (retained + pending) observed through
+    /// the operation bridge — the number `EvaluationMemory::check` sees.
+    #[derive(Default)]
+    struct PeakOwnership {
+        peak: AtomicUsize,
+    }
+    impl vortex_index::VixReadOperation for PeakOwnership {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+        fn check_memory(&self, owned_bytes: usize) -> vortex_index::Result<()> {
+            self.peak.fetch_max(owned_bytes, Ordering::AcqRel);
+            Ok(())
+        }
+    }
+
+    fn condition_all() -> IndexCondition {
+        let mut c = IndexCondition::new();
+        c.add_condition(Condition::All());
+        c
+    }
+
+    fn in_condition(field: &str, values: &[&str]) -> IndexCondition {
+        let mut c = IndexCondition::new();
+        c.add_condition(Condition::In(
+            field.to_string(),
+            values.iter().map(|v| v.to_string()).collect(),
+            false,
+        ));
+        c
+    }
+
+    /// A 100k-row no-null fixture mirroring vortex_index's
+    /// `build_large_core_file`: one distinct `svc` value per row (100k
+    /// unique terms), `level` cycling three values. The group collectors
+    /// answer without scan refusals on it (no NULL/missing values).
+    fn build_large_no_null_file() -> (Bytes, Bytes) {
+        use arrow::{
+            array::{Int64Array, RecordBatch, StringArray},
+            datatypes::{DataType, Field, Schema},
+        };
+
+        let rows = 100_000usize;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("svc", DataType::Utf8, false),
+            Field::new("level", DataType::Utf8, false),
+        ]));
+        let ts: Vec<i64> = (0..rows as i64).map(|i| 1_000_000 + i).collect();
+        let svc: Vec<String> = (0..rows).map(|i| format!("svc_{i:06}")).collect();
+        let levels = ["info", "warn", "error"];
+        let level: Vec<&str> = (0..rows).map(|i| levels[i % levels.len()]).collect();
+        let sources: Vec<String> = (0..rows)
+            .map(|i| {
+                format!(
+                    "{{\"_timestamp\":{},\"svc\":\"{}\",\"level\":\"{}\"}}",
+                    ts[i], svc[i], level[i]
+                )
+            })
+            .collect();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(ts)),
+                Arc::new(StringArray::from_iter_values(
+                    svc.iter().map(String::as_str),
+                )),
+                Arc::new(StringArray::from(level)),
+            ],
+        )
+        .unwrap();
+        let mut writer =
+            vortex_index::VixWriter::new(&schema, vortex_index::VixWriterOptions::default(), false);
+        writer
+            .push_batch_with_source(
+                &batch,
+                &StringArray::from_iter_values(sources.iter().map(String::as_str)),
+                None,
+            )
+            .unwrap();
+        let (data, index) = writer.finish().unwrap();
+        (
+            Bytes::from(data),
+            Bytes::from(index.expect("indexed fixture has a sidecar")),
+        )
+    }
+
+    /// The fixture as a ranged (data, sidecar) pair.
+    fn ranged_reader(data: Bytes, index: Bytes) -> VixReader {
+        VixReader::open_ranged_with_index(
+            Arc::new(MemRangeSource(data)) as _,
+            Some(Arc::new(MemRangeSource(index)) as _),
+        )
+        .unwrap()
+    }
+
+    /// Evaluate one index-only shape over a ranged reader while tracking
+    /// the peak owned bytes, and return (result, peak owned bytes).
+    fn measure(
+        data: &Bytes,
+        index: &Bytes,
+        condition: &IndexCondition,
+        mode: Option<IndexOptimizeMode>,
+        rows: i64,
+        label: &str,
+    ) -> (RawVixResult, usize) {
+        let probe = Arc::new(PeakOwnership::default());
+        let result = vortex_index::with_read_operation(
+            Arc::clone(&probe) as Arc<dyn vortex_index::VixReadOperation>,
+            || {
+                let reader = ranged_reader(data.clone(), index.clone());
+                evaluate_vix_index(
+                    "measure",
+                    &reader,
+                    condition,
+                    mode,
+                    (0, 2_000_000),
+                    true,
+                    Some((1_000_000, 1_000_000 + rows)),
+                    None,
+                    None,
+                )
+            },
+        )
+        .unwrap_or_else(|error| panic!("{label} measurement failed: {error:#}"));
+        (result, probe.peak.load(Ordering::Acquire))
+    }
+
+    /// Per-shape declaration table: each arm asserts the documented
+    /// breakdown, not a magic total.
+    #[test]
+    fn index_only_declarations_match_their_byte_breakdowns() {
+        let count = IndexOptimizeMode::SimpleCount;
+        let top_n = IndexOptimizeMode::SimpleTopN(vec!["svc".into()], 10, false);
+        let distinct = IndexOptimizeMode::SimpleDistinct("svc".into(), 10, false);
+        let in_multi =
+            IndexOptimizeMode::SimpleMultiHistogram(0, 2_000_000, 60_000_000, 0, "level".into());
+
+        // every index-only shape shares the same fixed components
+        let fixed = EVAL_TAIL_TRANSIENT_BYTES
+            + EVAL_PREFETCH_CAP_BYTES
+            + EVAL_TERMS_FOOTER_BYTES
+            + EVAL_SESSION_BYTES;
+        let bitmaps = 3000usize.div_ceil(8) * 4;
+        let groups = collect::topn_group_cap() + 1;
+
+        // SimpleCount: fixed components + bitmaps only (no group collector)
+        assert_eq!(
+            evaluation_working_bytes(3000, Some(&count), true, true),
+            (fixed + bitmaps) * EVAL_INDEX_ONLY_SAFETY
+        );
+        // group shapes add the bounded collector
+        for mode in [&top_n, &distinct, &in_multi] {
+            assert_eq!(
+                evaluation_working_bytes(3000, Some(mode), true, true),
+                (fixed + groups * EVAL_GROUP_ENTRY_BYTES + bitmaps) * EVAL_INDEX_ONLY_SAFETY
+            );
+        }
+        // the same shapes on a straddling file keep the clamp declaration
+        for mode in [&count, &top_n] {
+            let straddling = evaluation_working_bytes(3000, Some(mode), false, false);
+            assert_eq!(
+                straddling,
+                32 * 1024 * 1024 + 3000usize.div_ceil(8) * 4 + 3000 * 24
+            );
+        }
+    }
+
+    /// The eligibility gate itself: exact-term count, condition-all top-N /
+    /// distinct, and the sole positive IN on the grouped field qualify;
+    /// straddling files, conditioned groups, numeric-eq counts and every
+    /// streaming shape do not.
+    #[test]
+    fn index_only_eligibility_covers_only_metadata_answers() {
+        let count = IndexOptimizeMode::SimpleCount;
+        let top_n = IndexOptimizeMode::SimpleTopN(vec!["svc".into()], 10, false);
+        let tuple_top_n =
+            IndexOptimizeMode::SimpleTopN(vec!["svc".into(), "level".into()], 10, false);
+        let distinct = IndexOptimizeMode::SimpleDistinct("svc".into(), 10, false);
+        let in_multi =
+            IndexOptimizeMode::SimpleMultiHistogram(0, 2_000_000, 60_000_000, 0, "level".into());
+        let equal = {
+            let mut c = IndexCondition::new();
+            c.add_condition(Condition::Equal("svc".into(), "api".into()));
+            c
+        };
+        let all = condition_all();
+        let ins = in_condition("level", &["info", "warn"]);
+        let numeric_eq = {
+            let mut c = IndexCondition::new();
+            c.add_condition(Condition::NumericCmp(
+                "code".into(),
+                vec!["200".into()],
+                false,
+                crate::index::NumericKind::Int,
+            ));
+            c
+        };
+        let file_range = Some((1_000_000 - 2999, 1_000_000));
+        let in_range = (0, 2_000_000);
+
+        // qualified
+        assert!(index_only_evaluation(
+            Some(&count),
+            Some(&equal),
+            true,
+            file_range,
+            in_range
+        ));
+        assert!(index_only_evaluation(
+            Some(&top_n),
+            Some(&all),
+            true,
+            file_range,
+            in_range
+        ));
+        assert!(index_only_evaluation(
+            Some(&distinct),
+            Some(&all),
+            true,
+            file_range,
+            in_range
+        ));
+        assert!(index_only_evaluation(
+            Some(&in_multi),
+            Some(&ins),
+            true,
+            file_range,
+            in_range
+        ));
+        // straddling file: nothing qualifies
+        assert!(!index_only_evaluation(
+            Some(&count),
+            Some(&equal),
+            false,
+            file_range,
+            in_range
+        ));
+        // conditioned/tuple groups stream docs chunks
+        assert!(!index_only_evaluation(
+            Some(&top_n),
+            Some(&equal),
+            true,
+            file_range,
+            in_range
+        ));
+        assert!(!index_only_evaluation(
+            Some(&tuple_top_n),
+            Some(&all),
+            true,
+            file_range,
+            in_range
+        ));
+        // numeric-eq count may decode docs chunks (chunk-stats route)
+        assert!(!index_only_evaluation(
+            Some(&count),
+            Some(&numeric_eq),
+            true,
+            file_range,
+            in_range
+        ));
+        // IN on another field: the breakdown streams docs chunks
+        let other_field = in_condition("svc", &["api"]);
+        assert!(!index_only_evaluation(
+            Some(&in_multi),
+            Some(&other_field),
+            true,
+            file_range,
+            in_range
+        ));
+        // select/histogram/none never qualify
+        let select = IndexOptimizeMode::SimpleSelect(10, false);
+        let histogram = IndexOptimizeMode::SimpleHistogram(0, 60_000_000, 10, 0);
+        assert!(!index_only_evaluation(
+            Some(&select),
+            Some(&all),
+            true,
+            file_range,
+            in_range
+        ));
+        assert!(!index_only_evaluation(
+            Some(&histogram),
+            Some(&all),
+            true,
+            file_range,
+            in_range
+        ));
+        assert!(!index_only_evaluation(
+            None,
+            Some(&all),
+            true,
+            file_range,
+            in_range
+        ));
+    }
+
+    /// MEASUREMENT (reported in the assignment): peak owned bytes and the
+    /// declared workspace per shape on the 3000-row parity fixture. The
+    /// assertions bound the measured peaks so a regression in the read
+    /// plan's ownership shows up here.
+    #[test]
+    fn measured_peaks_complete_under_exact_gates() {
+        // Count answers on the 3000-row parity fixture (exact-term count);
+        // group collectors need a no-null fixture (NULL/missing values
+        // legitimately refuse the dictionary fast paths).
+        let parity = build_parity_file();
+        let large = build_large_no_null_file();
+        let all = condition_all();
+        let equal = {
+            let mut c = IndexCondition::new();
+            c.add_condition(Condition::Equal("svc".into(), "api".into()));
+            c
+        };
+        let ins = in_condition("level", &["info", "warn"]);
+
+        // (fixture, rows, condition, mode)
+        #[allow(clippy::type_complexity)]
+        let shapes: Vec<(&(Bytes, Bytes), i64, &IndexCondition, IndexOptimizeMode)> = vec![
+            // exact-term count on the parity fixture
+            (&parity, 3000, &equal, IndexOptimizeMode::SimpleCount),
+            // condition-all groups over the 100k-row/100k-distinct-svc
+            // fixture, grouped on the 3-value field (the prod trace shape;
+            // grouping on the 100k-distinct field exceeds the group cap and
+            // legitimately scans instead)
+            (
+                &large,
+                100_000,
+                &all,
+                IndexOptimizeMode::SimpleTopN(vec!["level".into()], 10, false),
+            ),
+            (
+                &large,
+                100_000,
+                &all,
+                IndexOptimizeMode::SimpleDistinct("level".into(), 10, false),
+            ),
+            // sole positive IN on the grouped field (large fixture; the
+            // parity fixture declares `level` fts-only, so an IN on it is
+            // skipped there and correctly never rides the fast path)
+            (
+                &large,
+                100_000,
+                &ins,
+                IndexOptimizeMode::SimpleMultiHistogram(
+                    0,
+                    2_000_000,
+                    60_000_000,
+                    0,
+                    "level".into(),
+                ),
+            ),
+        ];
+        for ((data, index), rows, condition, mode) in shapes {
+            let name = mode.to_rule_string();
+            // every shape here is an admitted index-only evaluation
+            assert!(index_only_evaluation(
+                Some(&mode),
+                Some(condition),
+                true,
+                Some((1_000_000, 1_000_000 + rows)),
+                (0, 2_000_000)
+            ));
+            let declared = evaluation_working_bytes(rows, Some(&mode), true, true);
+            assert!(
+                declared < 8 * 1024 * 1024,
+                "{name} declaration {declared} is not a small workspace"
+            );
+            // first measure the shape's owned peak, then complete it under
+            // a private gate sized at EXACTLY declaration + owned peak: no
+            // spare capacity exists, so any transient the declaration does
+            // not cover would be refused (or wait) here. This is the
+            // completion proof the assignment asks for.
+            let (raw, owned) = measure(data, index, condition, Some(mode.clone()), rows, &name);
+            assert!(
+                !matches!(
+                    raw,
+                    RawVixResult::PartialFields | RawVixResult::MissingColumn { .. }
+                ),
+                "{name} must answer, got {}",
+                fingerprint(&raw)
+            );
+            let permit = source::try_acquire_evaluation_under(declared + owned, declared)
+                .expect("exact gate admits its own declaration");
+            let operation =
+                source::ReadOperation::new(Arc::new(source::FetchStats::default()), None);
+            let started = std::time::Instant::now();
+            let result = operation
+                .run_evaluation(&permit, || {
+                    let reader = ranged_reader(data.clone(), index.clone());
+                    evaluate_vix_index(
+                        "exact-gate",
+                        &reader,
+                        condition,
+                        Some(mode.clone()),
+                        (0, 2_000_000),
+                        true,
+                        Some((1_000_000, 1_000_000 + rows)),
+                        None,
+                        None,
+                    )
+                })
+                .unwrap();
+            assert!(
+                !matches!(
+                    result,
+                    RawVixResult::PartialFields | RawVixResult::MissingColumn { .. }
+                ),
+                "{name} must answer under the exact gate, got {}",
+                fingerprint(&result)
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_millis(500),
+                "{name} completion must not hit the 500 ms growth wait"
+            );
+            assert!(permit.check_refusal().is_ok(), "{name}: no sticky refusal");
+        }
+    }
+
+    /// COMPLETION (prod shape): the 100k-row large fixture's condition-all
+    /// top-N completes under the process gate without growth waits and
+    /// without sticky refusal — the declaration must never turn into more
+    /// refusals than the 32 MiB workspace did.
+    #[test]
+    fn index_only_eval_completes_under_process_gate_without_refusal() {
+        let (data, index) = build_large_no_null_file();
+        let rows = 100_000i64;
+        let all = condition_all();
+        let top_n = IndexOptimizeMode::SimpleTopN(vec!["level".into()], 10, false);
+        let declared = evaluation_working_bytes(rows, Some(&top_n), true, true);
+        let operation = source::ReadOperation::new(Arc::new(source::FetchStats::default()), None);
+        let permit = source::try_acquire_evaluation(declared)
+            .expect("declaration must fit the process evaluation gate");
+        let started = std::time::Instant::now();
+        let result = operation
+            .run_evaluation(&permit, || {
+                let reader = ranged_reader(data.clone(), index.clone());
+                evaluate_vix_index(
+                    "completion",
+                    &reader,
+                    &all,
+                    Some(top_n.clone()),
+                    (0, 2_000_000),
+                    true,
+                    Some((1_000_000, 1_000_000 + rows)),
+                    None,
+                    None,
+                )
+            })
+            .unwrap();
+        assert!(matches!(result, RawVixResult::TopN { .. }));
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "completion must not hit the 500 ms growth wait"
+        );
+        assert!(permit.check_refusal().is_ok(), "no sticky refusal");
+    }
+
+    /// A straddling file still declares the clamp: the streaming workspace
+    /// with rows*24 must appear in the declaration of every shape.
+    #[test]
+    fn straddling_files_keep_the_clamp_declaration() {
+        let count = IndexOptimizeMode::SimpleCount;
+        let rows = 100_000i64;
+        let declared = evaluation_working_bytes(rows, Some(&count), false, false);
+        let clamp = 100_000usize * 24;
+        let bitmaps = 100_000usize.div_ceil(8) * 4;
+        assert_eq!(declared, 32 * 1024 * 1024 + clamp + bitmaps);
     }
 }
 
