@@ -301,6 +301,48 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     Diet in progress for `.184`: drop parsed-out JSON, copy only referenced
     slices out of the tails, compact field tables — target ≤ 300 KB traces
     / ≤ 600 KB logs so 2 GiB holds one follower's 7 d.
+- **`.184` shipped (vix-arch `30432cce2`, GitOps #583, queriers 19:56–19:58Z):
+  reader metadata diet.** Fresh ranged reader on the prod pairs: traces
+  667 → **198 KB**, logs 1,388 → **394 KB** (−70 %): footer JSON dropped
+  after parsing, tail allocations released, `FieldEntry.types` as a u16
+  flag set with byte-identical serde, per-field indexes built lazily, the
+  name→id map replaced by a probe over `fields`, serde over-reservation
+  trimmed. No wire-format change, fetch budgets unchanged, vortex_index
+  356 / search vix 198 / core_writer 102 / segments 37 green. Prod after
+  the roll: reader cache 1,839 → **5,461 entries** in 2.15 GB (1,077 full
+  at 537 MB + 4,384 metadata-only at 1.61 GB ≈ 367 KB each); burst repro
+  still clean (small avg 0.88 s, max 1.7 s; RSS 7.9–8.9 GiB).
+  - **But a cache hit still cost ~5 reads/file.** Read-counting the prod
+    files locally (throwaway probe, deleted): a cold exact-term count was
+    **9 reads** — 5 tiny dict field-index probes (8 B, 288 B, 294 B, 4 B,
+    4 B; one wave, five S3 requests), one key block, the terms Vortex
+    footer **plus a sequential `NeedMoreData` prefix** (39 KB traces /
+    167 KB logs; the layout exceeds Vortex's 65,535 B initial window), one
+    `doc_count` leaf. A demoted reader paid **7**: the dict blob (184–197
+    KB) straddles the 256 KiB eager tail (footer JSON alone is 154–369 KB
+    on these schemas), so every field-index rebuild re-probed it. Prod
+    confirmed: back-to-back 7 d traces counts, 80 % reader-cache hits,
+    5.3 → 5.1 reads/file.
+  - `.185` (vix-arch `71c03c3c6`): the dict block index is read ONCE (one
+    184–197 KB request when not resident and ≤ 4 MiB) and kept as metadata
+    across demotion; the terms footer's initial read is 256 KiB. Prod
+    files: **cold count 9 → 4 reads, demoted count 7 → 2**, identical
+    counts. Demoted reader ~645 KB traces / ~855 KB logs, so the reader
+    cache goes 2 → 3 GiB in the same roll (`ZO_VIX_READER_CACHE_MAX_SIZE`
+    3072; RSS 8–9 GiB of 24 today; 4 GiB once a day of RSS is seen).
+    Expected: cold 7 d evaluation ≈ −40 % requests; a second long-window
+    query over cached files ≈ 2 reads/file (−70 %).
+  - Still open, evidence-backed: (1) `budget_refused` fallbacks under
+    bursts (33 across four 13-query bursts, 6–9 per heavy query per
+    follower, hitting `SimpleCount`/`SimpleTopN`/`SimpleHistogram` alike) —
+    the 4 GiB eval gate fills when filtered histograms (still 32 MiB
+    declared) run 16-wide next to everything else; measure their peak and
+    declare it, or raise the gate; (2) `ZO_VIX_EAGER_TAIL_BYTES` 256 → 512
+    KiB would put footer JSON + dict inside the tail for traces (443 KB),
+    saving the dict read on cold opens at +256 KB per file — requests, not
+    bytes, are the ceiling, so probably worth it; unmeasured; (3) logs
+    footers are 369 KB of JSON (`dict_field_pages_v1` 233 KB for 2,586
+    fields) — a binary property encoding would halve the tail need.
 
 ## 2026-09-29 — P2 shipped as `.176` and rolled back within 30 min: the per-stream side table stalled the shared meta DB (commit latency 40–60×, ingest 503s); ranges must live in the segment row
 - What shipped (vix-arch `013c45010` + NATS retry `76fe754b5`, image
