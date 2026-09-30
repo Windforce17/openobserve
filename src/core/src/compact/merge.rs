@@ -631,18 +631,29 @@ pub async fn merge_by_stream(
         "[COMPACTOR] merge_by_stream [{org_id}/{stream_type}/{stream_name}] offset: {offset}"
     );
 
-    // A job whose offset hour has not yet fully passed is an incremental round on the
-    // still-open current hour (enqueued by the ingester, see service::compact::incremental):
-    // only seal full-size groups and carry the remainder, so each file is merged into a
-    // sealed output exactly once. The scheduled hour-end pass seals whatever is left.
+    // Three ages of an hour (2026-09-30):
+    // - OPEN (`!is_past_hour(offset)`): the ingester enqueues incremental rounds; only full-size
+    //   groups seal, the remainder carries.
+    // - CLOSED BUT UNSETTLED: stragglers keep landing for the late-lane window
+    //   (`ZO_SEGMENT_LATE_LANE_HOURS`; trace spans are stamped with their start time and reported
+    //   at their end). Sealing "whatever ≥ 2 files each 10 s pass finds" here produced a pairwise
+    //   cascade — traces 1,294 merges/h, 1,041 of them 2-input, 3.45 TB rewritten per 1.8 TB
+    //   ingested. So the same full-group rule holds, with one exception: a below-target remainder
+    //   of at least [`MIN_PARTIAL_FAN_IN`] files seals (tiny stragglers coalesce cheaply; two 1.5
+    //   GB files wait).
+    // - SETTLED: one sweep-up seals whatever is left, exactly once.
+    // Healing (the index for index-less files, sidecar-only) does not wait
+    // for any of this: see the heal-candidate rules in the partition plan.
     let offset = offset - offset % hour_micros(1);
-    let is_incremental = !super::is_past_hour(offset);
+    let is_open_hour = !super::is_past_hour(offset);
+    let is_settled =
+        super::is_past_hour(offset + hour_micros(cfg.common.segment_late_lane_hours as i64));
 
     // A closed hour about to expire under retention is not worth merging
     // (ZO_COMPACT_OLD_DATA_SKIP_EXPIRING_DAYS): the sweeps no longer enqueue
     // such hours, and a job enqueued before the policy (or before the hour
     // aged into the window) completes here without touching its files.
-    if !is_incremental {
+    if !is_open_hour {
         let stream_settings = infra::schema::unwrap_stream_settings(&schema).unwrap_or_default();
         let floor = merge_worth_floor_micros(
             config::utils::time::now_micros(),
@@ -674,17 +685,18 @@ pub async fn merge_by_stream(
             offset_time.format("%Y/%m/%d/%H").to_string(),
         )
     };
-    // Non-incremental (closed-hour) jobs fetch full-size files too: they
-    // are excluded from merge grouping below, but the healing probe must
-    // see them — a corrupt ~max_file_size output is otherwise unreachable
-    // by any merge forever (prod 2026-07-29).
+    // Every round fetches full-size files too: they are excluded from merge
+    // grouping below, but the healing probe must see them — index-less L0s
+    // above the half-target line are final in size and get their index the
+    // moment they land (a corrupt ~max_file_size output is otherwise
+    // unreachable by any merge forever, prod 2026-07-29).
     let files = file_list::query_for_merge(
         org_id,
         stream_type,
         stream_name,
         &date_start,
         &date_end,
-        !is_incremental,
+        true,
     )
     .await
     .map_err(|e| anyhow::anyhow!("query file list failed: {e}"))?;
@@ -747,158 +759,41 @@ pub async fn merge_by_stream(
             let cfg = get_config();
             let job_strategy = MergeStrategy::from(&cfg.compact.strategy);
 
-            // Core files (.vix) and flat data files (parquet/vortex) never
-            // merge together. Indexed core files split again: their
-            // dictionary-passthrough path has a separate, larger byte target,
-            // while flat and index-less groups retain the rebuild-safe global
-            // target. Full-size files stay outside grouping; core files among
-            // them remain healing-probe candidates below.
-            let (core_files, flat_candidates): (Vec<FileKey>, Vec<FileKey>) = files_with_size
-                .into_iter()
-                .partition(|f| f.key.ends_with(config::FILE_EXT_VIX));
-            // M31: sidecar-HOMOGENEOUS core grouping — never mix indexed
-            // and index-less core files in one group. A mixed group rejects
-            // the dictionary fast path then rebuilds every input.
-            let (plain_candidates, indexed_candidates): (Vec<FileKey>, Vec<FileKey>) =
-                core_files.into_iter().partition(|f| f.meta.index_size == 0);
-            let global_cutoff = cfg.compact.max_file_size as i64 * 95 / 100;
-            let indexed_cutoff =
-                cfg.compact.max_file_size_for_merge(stream_type, true) as i64 * 95 / 100;
-            let (_oversize_flat, mut flat_files): (Vec<FileKey>, Vec<FileKey>) = flat_candidates
-                .into_iter()
-                .partition(|f| f.meta.original_size > global_cutoff);
-            let (plain_oversize, mut plain_core): (Vec<FileKey>, Vec<FileKey>) = plain_candidates
-                .into_iter()
-                .partition(|f| f.meta.original_size > global_cutoff);
-            let (indexed_oversize, mut indexed_core): (Vec<FileKey>, Vec<FileKey>) =
-                indexed_candidates
-                    .into_iter()
-                    .partition(|f| f.meta.original_size > indexed_cutoff);
-            let oversize_core_files: Vec<FileKey> =
-                plain_oversize.into_iter().chain(indexed_oversize).collect();
-            // sort by file size
-            for files in [&mut flat_files, &mut plain_core, &mut indexed_core] {
-                match job_strategy {
-                    MergeStrategy::FileSize => {
-                        files.sort_by_key(|k| k.meta.original_size);
-                    }
-                    MergeStrategy::FileTime => {
-                        files.sort_by_key(|k| k.meta.min_ts);
-                    }
-                    MergeStrategy::TimeRange => {
-                        *files = sort_by_time_range(std::mem::take(files));
-                    }
-                }
-            }
-            let core_total = plain_core.len() + indexed_core.len();
-
             // downsampling applies to metrics only, which are never core files
             #[cfg(feature = "enterprise")]
-            let skip_group_files = stream_type == StreamType::Metrics
-                && !flat_files.is_empty()
-                && get_largest_downsampling_rule(
-                    &stream_name,
-                    flat_files.iter().map(|f| f.meta.max_ts).max().unwrap(),
-                )
-                .is_some();
-
+            let downsampling = stream_type == StreamType::Metrics
+                && files_with_size
+                    .iter()
+                    .filter(|f| !f.key.ends_with(config::FILE_EXT_VIX))
+                    .map(|f| f.meta.max_ts)
+                    .max()
+                    .is_some_and(|max_ts| {
+                        get_largest_downsampling_rule(&stream_name, max_ts).is_some()
+                    });
             #[cfg(not(feature = "enterprise"))]
-            let skip_group_files = false;
+            let downsampling = false;
 
-            // A partition holding exactly ONE core file can never form a
-            // >= 2 merge group, so a file with outdated index capabilities
-            // (fts-tainted partial field, missing numeric value terms,
-            // missing configured docs columns) would keep them forever —
-            // only a rebuild heals it. Such files are probed cheaply below
-            // (container metadata / fields table over ranged reads; a
-            // current file stays a NO-OP with no docs download and no
-            // file_list change) and enqueued as a single-file healing batch
-            // when outdated. Skipped in incremental rounds: the hour is
-            // still open, more files are coming, and the hour-end pass
-            // probes once.
-            let single_core_heal_candidate = core_total == 1 && !is_incremental;
-
-            if flat_files.len() <= 1
-                && core_total <= 1
-                && oversize_core_files.is_empty()
-                && !skip_group_files
-                && !single_core_heal_candidate
-            {
-                return Ok(MergePartitionOutcome::default());
-            }
-
-            // group files need to merge
-            let mut batch_groups = Vec::new();
-            if skip_group_files {
-                batch_groups.push(MergeBatch {
-                    batch_id: 0,
-                    org_id: org_id.clone(),
-                    stream_type,
-                    stream_name: stream_name.clone(),
-                    prefix: prefix.clone(),
-                    files: flat_files.clone(),
-                    cancel: MergeCancellation::default(),
-                });
-            } else {
-                group_files_into_batches(
-                    &mut batch_groups,
-                    &flat_files,
-                    &org_id,
-                    stream_type,
-                    &stream_name,
-                    &prefix,
-                    cfg.compact.max_file_size as i64,
-                    is_incremental,
-                    &job_strategy,
-                );
-            }
-            group_files_into_batches(
-                &mut batch_groups,
-                &plain_core,
+            let PartitionPlan {
+                mut batch_groups,
+                heal_candidates,
+            } = plan_partition(
+                files_with_size,
                 &org_id,
                 stream_type,
                 &stream_name,
                 &prefix,
                 cfg.compact.max_file_size as i64,
-                is_incremental,
+                HourAge {
+                    open: is_open_hour,
+                    settled: is_settled,
+                },
+                downsampling,
                 &job_strategy,
             );
-            group_files_into_batches(
-                &mut batch_groups,
-                &indexed_core,
-                &org_id,
-                stream_type,
-                &stream_name,
-                &prefix,
-                cfg.compact.max_file_size_for_merge(stream_type, true) as i64,
-                is_incremental,
-                &job_strategy,
-            );
+            if batch_groups.is_empty() && heal_candidates.is_empty() {
+                return Ok(MergePartitionOutcome::default());
+            }
 
-            // Healing probe candidates: the lone file of a single-file
-            // partition, PLUS every core file batching left out (a file at
-            // ~max_file_size never joins a >= 2 group, so a defective one —
-            // e.g. an unreadable dictionary — would otherwise stay broken
-            // forever). Probes are container-metadata cheap and run only in
-            // non-incremental rounds.
-            let mut heal_candidates: Vec<&FileKey> = Vec::new();
-            if single_core_heal_candidate {
-                heal_candidates.extend(plain_core.first().or(indexed_core.first()));
-            } else if !is_incremental {
-                let batched: std::collections::HashSet<&str> = batch_groups
-                    .iter()
-                    .flat_map(|b| b.files.iter().map(|f| f.key.as_str()))
-                    .collect();
-                heal_candidates.extend(
-                    plain_core
-                        .iter()
-                        .chain(indexed_core.iter())
-                        .filter(|f| !batched.contains(f.key.as_str())),
-                );
-            }
-            if !is_incremental {
-                heal_candidates.extend(oversize_core_files.iter());
-            }
             let mut heal_probe = |file: FileKey| {
                 let latest_schema = Arc::clone(&latest_schema);
                 let full_text_search_fields = full_text_search_fields.clone();
@@ -942,7 +837,7 @@ pub async fn merge_by_stream(
                             stream_type,
                             stream_name: stream_name.clone(),
                             prefix: prefix.clone(),
-                            files: vec![candidate.clone()],
+                            files: vec![candidate],
                             cancel: job_cancel.clone(),
                         });
                     }
@@ -1211,7 +1106,7 @@ pub async fn merge_by_stream(
         return Err(e);
     }
 
-    let _ = (is_incremental, orphan_blooms);
+    let _ = orphan_blooms;
 
     complete_merge_pass(
         job_id,
@@ -1400,13 +1295,153 @@ where
     Ok((planned, replan_required))
 }
 
+/// Where an hour stands in its life: open (the ingester still enqueues
+/// incremental rounds), closed but unsettled (stragglers land for
+/// `ZO_SEGMENT_LATE_LANE_HOURS`), or settled (the one sweep-up round).
+#[derive(Clone, Copy, Debug)]
+struct HourAge {
+    open: bool,
+    settled: bool,
+}
+
+/// One partition's plan for a round: the merge batches and the files whose
+/// index state gets a healing probe.
+#[derive(Default)]
+struct PartitionPlan {
+    batch_groups: Vec<MergeBatch>,
+    heal_candidates: Vec<FileKey>,
+}
+
+/// Classify one partition's files (pure - no IO) into merge batches and
+/// healing-probe candidates.
+///
+/// - Core files (`.vix`) and flat data files (parquet/vortex) never merge together, and core groups
+///   are sidecar-homogeneous: indexed and index-less core files never share a group (a mixed group
+///   rejects the dictionary fast path and rebuilds every input).
+/// - ONE byte target for every class (`ZO_COMPACT_MAX_FILE_SIZE`). Above half of it a file is FINAL
+///   (2026-09-30, "one config, merge once"): the debt line (`ZO_COMPACT_OLD_DATA_MIN_FILES` over
+///   files <= target/2) already treats it as done, so it never joins a merge group - its bytes are
+///   rewritten and indexed at most once.
+/// - Healing probes (container-metadata cheap; a current file is a no-op): index-less final files
+///   every round - the index is the only thing they still need and it is built sidecar-only,
+///   without rewriting the data (waiting for the closed-hour pass here was the "2 h lag": logs L0s
+///   landed at 2.7 GB and stayed unindexed until 75-130 min after close); on settled rounds also
+///   every indexed final file (a defective one - e.g. an unreadable dictionary - is otherwise
+///   unreachable by any merge forever) and every sub-half core file batching left out; and, once
+///   the hour is closed, a partition's lone core file (it can never form a >= 2 group, so outdated
+///   index capabilities would keep it forever).
+/// - `downsampling` (enterprise metrics rule): every sub-half flat file forms one batch regardless
+///   of size.
+#[allow(clippy::too_many_arguments)]
+fn plan_partition(
+    files_with_size: Vec<FileKey>,
+    org_id: &str,
+    stream_type: StreamType,
+    stream_name: &str,
+    prefix: &str,
+    max_file_size: i64,
+    age: HourAge,
+    downsampling: bool,
+    job_strategy: &MergeStrategy,
+) -> PartitionPlan {
+    let (core_files, flat_candidates): (Vec<FileKey>, Vec<FileKey>) = files_with_size
+        .into_iter()
+        .partition(|f| f.key.ends_with(config::FILE_EXT_VIX));
+    let (plain_candidates, indexed_candidates): (Vec<FileKey>, Vec<FileKey>) =
+        core_files.into_iter().partition(|f| f.meta.index_size == 0);
+    let final_size_floor = max_file_size / 2;
+    let (_final_flat, mut flat_files): (Vec<FileKey>, Vec<FileKey>) = flat_candidates
+        .into_iter()
+        .partition(|f| f.meta.original_size > final_size_floor);
+    let (final_plain, mut plain_core): (Vec<FileKey>, Vec<FileKey>) = plain_candidates
+        .into_iter()
+        .partition(|f| f.meta.original_size > final_size_floor);
+    let (final_indexed, mut indexed_core): (Vec<FileKey>, Vec<FileKey>) = indexed_candidates
+        .into_iter()
+        .partition(|f| f.meta.original_size > final_size_floor);
+    let final_core_files: Vec<FileKey> = final_plain.into_iter().chain(final_indexed).collect();
+
+    for files in [&mut flat_files, &mut plain_core, &mut indexed_core] {
+        match job_strategy {
+            MergeStrategy::FileSize => {
+                files.sort_by_key(|k| k.meta.original_size);
+            }
+            MergeStrategy::FileTime => {
+                files.sort_by_key(|k| k.meta.min_ts);
+            }
+            MergeStrategy::TimeRange => {
+                *files = sort_by_time_range(std::mem::take(files));
+            }
+        }
+    }
+    let core_total = plain_core.len() + indexed_core.len();
+    let single_core_heal_candidate = core_total == 1 && !age.open;
+
+    let mut plan = PartitionPlan::default();
+    if downsampling && !flat_files.is_empty() {
+        plan.batch_groups.push(MergeBatch {
+            batch_id: 0,
+            org_id: org_id.to_string(),
+            stream_type,
+            stream_name: stream_name.to_string(),
+            prefix: prefix.to_string(),
+            files: std::mem::take(&mut flat_files),
+            cancel: MergeCancellation::default(),
+        });
+    }
+    for files in [&flat_files, &plain_core, &indexed_core] {
+        group_files_into_batches(
+            &mut plan.batch_groups,
+            files,
+            org_id,
+            stream_type,
+            stream_name,
+            prefix,
+            max_file_size,
+            age.settled,
+            job_strategy,
+        );
+    }
+
+    if single_core_heal_candidate {
+        plan.heal_candidates
+            .extend(plain_core.into_iter().chain(indexed_core));
+    } else if age.settled {
+        let batched: std::collections::HashSet<&str> = plan
+            .batch_groups
+            .iter()
+            .flat_map(|b| b.files.iter().map(|f| f.key.as_str()))
+            .collect();
+        let left_out: Vec<FileKey> = plain_core
+            .iter()
+            .chain(indexed_core.iter())
+            .filter(|f| !batched.contains(f.key.as_str()))
+            .cloned()
+            .collect();
+        plan.heal_candidates.extend(left_out);
+    }
+    plan.heal_candidates.extend(
+        final_core_files
+            .into_iter()
+            .filter(|f| age.settled || f.meta.index_size == 0),
+    );
+    plan
+}
+
+/// A below-target remainder in an UNSETTLED hour seals only when it holds at
+/// least this many files: tiny stragglers (7-row late slices, 600+/h on
+/// traces) coalesce cheaply while two 1.5 GB files wait for the sweep-up
+/// instead of starting a pairwise cascade. Amplification on the tiny files is
+/// bounded by log₈ of their count and their bytes are negligible.
+const MIN_PARTIAL_FAN_IN: usize = 8;
+
 /// Cut `files` (already sorted by the job strategy) into merge batches
-/// bounded by the supplied class-specific `max_file_size` and
-/// `compact.max_group_files`, appending them to `batch_groups`. Indexed core
-/// callers pass the larger dictionary-passthrough target; flat/index-less
-/// callers pass the global rebuild-safe target. In incremental mode the
-/// below-budget trailing remainder is carried to the next round instead of
-/// being sealed (see `merge_by_stream`). Lists of one file produce no batch.
+/// bounded by `max_file_size` (one target for every class) and
+/// `compact.max_group_files`, appending them to `batch_groups`. A full group
+/// always seals. The below-budget trailing remainder seals when the hour is
+/// `settled` (the straggler window has passed — see `merge_by_stream`) or
+/// when it already holds [`MIN_PARTIAL_FAN_IN`] files; otherwise it carries
+/// to the next round. Lists of one file produce no batch.
 #[allow(clippy::too_many_arguments)]
 fn group_files_into_batches(
     batch_groups: &mut Vec<MergeBatch>,
@@ -1416,7 +1451,7 @@ fn group_files_into_batches(
     stream_name: &str,
     prefix: &str,
     max_file_size: i64,
-    is_incremental: bool,
+    settled: bool,
     job_strategy: &MergeStrategy,
 ) {
     let cfg = get_config();
@@ -1449,9 +1484,9 @@ fn group_files_into_batches(
                 // first singleton, so the hour was rediscovered forever but
                 // never produced a batch. Retain the smaller singleton
                 // across an interleaver; once a second small file arrives it
-                // forms a real batch. Incremental hours keep their original
+                // forms a real batch. Unsettled hours keep their original
                 // adjacency behavior to avoid premature sealing.
-                if !is_incremental
+                if settled
                     && *job_strategy == MergeStrategy::FileTime
                     && new_file_list.first().is_some_and(|current| {
                         current.meta.original_size <= file.meta.original_size
@@ -1480,11 +1515,11 @@ fn group_files_into_batches(
         new_file_list.push(file.clone());
     }
     // The trailing batch is always below max_file_size (the loop flushes a group
-    // only when adding the next file would exceed it). In incremental mode we do
-    // NOT seal this remainder: more files will arrive in the still-open hour, and
-    // sealing now would force re-merging it later (write amplification). Carry it
-    // to the next round; the scheduled hour-end pass seals whatever is left.
-    if new_file_list.len() > 1 && !is_incremental {
+    // only when adding the next file would exceed it). Until the hour is settled
+    // more files will arrive, and sealing a small remainder now would force
+    // re-merging it later (write amplification): carry it, unless it is already
+    // MIN_PARTIAL_FAN_IN files wide. The settled sweep-up seals whatever is left.
+    if new_file_list.len() > 1 && (settled || new_file_list.len() >= MIN_PARTIAL_FAN_IN) {
         batch_groups.push(MergeBatch {
             batch_id: batch_groups.len(),
             org_id: org_id.to_string(),
@@ -1654,8 +1689,6 @@ pub async fn merge_files(
     // >= 2 guards and the size budget — the rebuilt output replaces the
     // input at roughly its own size, so the group-size cap does not apply.
     let is_single_core_heal = is_core_group && files_with_size.len() == 1;
-    let is_indexed_core_group =
-        is_core_group && files_with_size.iter().all(|file| file.meta.index_size > 0);
 
     if files_with_size.len() <= 1 && !is_match_downsampling_rule && !is_single_core_heal {
         return Ok((Vec::new(), Vec::new()));
@@ -1665,9 +1698,7 @@ pub async fn merge_files(
     let mut new_compressed_file_size = 0;
     let mut new_file_list = Vec::new();
     let cfg = get_config();
-    let max_file_size = cfg
-        .compact
-        .max_file_size_for_merge(stream_type, is_indexed_core_group) as i64;
+    let max_file_size = cfg.compact.max_file_size as i64;
     for file in files_with_size.iter() {
         if (new_file_size + file.meta.original_size > max_file_size
             || new_compressed_file_size + file.meta.compressed_size > max_file_size
@@ -2230,26 +2261,9 @@ async fn merge_core_group(
         })
         .collect();
 
-    // M31 index-defer policy: a NON-FINAL group — every input index-less
-    // (L0s and previously deferred outputs; the homogeneous grouping cuts
-    // groups that way) summing under the configured line — writes a
-    // column-store-only output: its index would be discarded by the next
-    // hop anyway. Never for healing batches (their whole point is building
-    // the index) and never when any input already carries a sidecar (a
-    // deferred output over it would DROP that capability).
-    let defer_below_bytes = cfg
-        .common
-        .vix_merge_index_defer_below_mb
-        .saturating_mul(1024 * 1024) as i64;
-    let index_deferred = !force_rebuild
-        && defer_below_bytes > 0
-        && new_file_list.len() > 1
-        && new_file_meta.original_size < defer_below_bytes
-        && new_file_list.iter().all(|f| f.meta.index_size == 0);
-    // The enlarged log/trace target is safe only on the indexed merge path.
-    // A normal-size batch may still rebuild to heal an incompatible input;
-    // a batch above the global rebuild-safe ceiling must fail rather than
-    // silently multiplying rebuild memory.
+    // A group whose indexed inputs exceed the target on either byte measure
+    // (only a healing single file can) must not fall back to a full rebuild:
+    // it either merges through the dictionary passthrough or is refused above.
     let require_indexed_merge = !force_rebuild && exceeds_global_rebuild_limit;
 
     let merge_started = std::time::Instant::now();
@@ -2273,9 +2287,7 @@ async fn merge_core_group(
         })
         .await
     } else {
-        let mode = if index_deferred {
-            CoreMergeMode::IndexDeferred
-        } else if require_indexed_merge {
+        let mode = if require_indexed_merge {
             CoreMergeMode::IndexedOnly
         } else {
             CoreMergeMode::Automatic
@@ -4021,28 +4033,7 @@ mod tests {
             .map(|i| create_file_key(&format!("f{i:04}.vix"), 1000 + i as i64, 2000, 1024))
             .collect();
 
-        // closed hour (non-incremental): everything seals, cut at the width
-        let mut batches = Vec::new();
-        group_files_into_batches(
-            &mut batches,
-            &files,
-            "org",
-            StreamType::Logs,
-            "s1",
-            "files/org/logs/s1/2026/08/24/00",
-            cfg.compact.max_file_size as i64,
-            false,
-            &MergeStrategy::FileTime,
-        );
-        assert_eq!(batches.len(), 3, "2 full width batches + sealed remainder");
-        assert_eq!(batches[0].files.len(), width);
-        assert_eq!(batches[1].files.len(), width);
-        assert_eq!(batches[2].files.len(), 44);
-        let total: usize = batches.iter().map(|b| b.files.len()).sum();
-        assert_eq!(total, n, "a closed hour dispatches every file exactly once");
-
-        // incremental (open hour): full-width groups seal, the below-width
-        // trailing remainder carries to the next round
+        // settled hour: everything seals, cut at the width
         let mut batches = Vec::new();
         group_files_into_batches(
             &mut batches,
@@ -4055,7 +4046,51 @@ mod tests {
             true,
             &MergeStrategy::FileTime,
         );
-        assert_eq!(batches.len(), 2, "incremental keeps the trailing remainder");
+        assert_eq!(batches.len(), 3, "2 full width batches + sealed remainder");
+        assert_eq!(batches[0].files.len(), width);
+        assert_eq!(batches[1].files.len(), width);
+        assert_eq!(batches[2].files.len(), 44);
+        let total: usize = batches.iter().map(|b| b.files.len()).sum();
+        assert_eq!(
+            total, n,
+            "a settled hour dispatches every file exactly once"
+        );
+
+        // unsettled hour: full-width groups seal; a 44-file remainder is
+        // wide enough (>= MIN_PARTIAL_FAN_IN) to seal too
+        let mut batches = Vec::new();
+        group_files_into_batches(
+            &mut batches,
+            &files,
+            "org",
+            StreamType::Logs,
+            "s1",
+            "files/org/logs/s1/2026/08/24/00",
+            cfg.compact.max_file_size as i64,
+            false,
+            &MergeStrategy::FileTime,
+        );
+        assert_eq!(batches.len(), 3, "a wide remainder seals even unsettled");
+
+        // unsettled hour with a narrow remainder: it carries to the next round
+        let narrow: Vec<FileKey> = files[..2 * width + MIN_PARTIAL_FAN_IN - 1].to_vec();
+        let mut batches = Vec::new();
+        group_files_into_batches(
+            &mut batches,
+            &narrow,
+            "org",
+            StreamType::Logs,
+            "s1",
+            "files/org/logs/s1/2026/08/24/00",
+            cfg.compact.max_file_size as i64,
+            false,
+            &MergeStrategy::FileTime,
+        );
+        assert_eq!(
+            batches.len(),
+            2,
+            "unsettled keeps a narrow trailing remainder"
+        );
         assert!(batches.iter().all(|b| b.files.len() == width));
     }
 
@@ -4087,7 +4122,7 @@ mod tests {
             "s1",
             "files/org/logs/s1/2026/08/24/00",
             1_024,
-            false,
+            true,
             &MergeStrategy::FileTime,
         );
         assert_eq!(batches.len(), 1);
@@ -4121,31 +4156,22 @@ mod tests {
             "s1",
             "files/org/logs/s1/2026/08/24/00",
             1_024,
-            true,
+            false,
             &MergeStrategy::FileTime,
         );
         assert!(
             incremental.is_empty(),
-            "open-hour adjacency and trailing-remainder behavior stays unchanged"
+            "unsettled adjacency and trailing-remainder behavior stays unchanged"
         );
     }
 
+    /// One target for every class: indexed and index-less groups cut at the
+    /// same byte ceiling, so a byte is merged toward the final size once.
     #[test]
-    fn indexed_log_group_target_combines_large_files_without_widening_rebuilds() {
+    fn one_target_groups_indexed_and_index_less_alike() {
         const GIB: i64 = 1024 * 1024 * 1024;
-        let mut cfg = config::Config::default();
-        cfg.compact.max_file_size = GIB as usize;
-        cfg.compact.logs_indexed_max_file_size = 8 * GIB as usize;
-        let files: Vec<FileKey> = [3 * GIB, 3 * GIB, 2 * GIB, GIB]
-            .into_iter()
-            .enumerate()
-            .map(|(i, size)| {
-                let mut file = create_file_key(&format!("f{i}.vix"), i as i64, i as i64 + 1, size);
-                file.meta.index_size = 64;
-                file
-            })
-            .collect();
-        let collect = |files: &[FileKey], indexed| {
+        let target = 8 * GIB;
+        let collect = |files: &[FileKey]| {
             let mut batches = Vec::new();
             group_files_into_batches(
                 &mut batches,
@@ -4154,33 +4180,210 @@ mod tests {
                 StreamType::Logs,
                 "default",
                 "files/org/logs/default/2026/09/01/00",
-                cfg.compact
-                    .max_file_size_for_merge(StreamType::Logs, indexed) as i64,
-                false,
+                target,
+                true,
                 &MergeStrategy::FileTime,
             );
             batches
         };
+        for indexed in [true, false] {
+            let files: Vec<FileKey> = [3 * GIB, 3 * GIB, 2 * GIB, GIB]
+                .into_iter()
+                .enumerate()
+                .map(|(i, size)| {
+                    let mut file =
+                        create_file_key(&format!("f{i}.vix"), i as i64, i as i64 + 1, size);
+                    file.meta.index_size = if indexed { 64 } else { 0 };
+                    file
+                })
+                .collect();
+            let batches = collect(&files);
+            assert_eq!(batches.len(), 1, "indexed={indexed}");
+            assert_eq!(batches[0].files.len(), 3);
+            assert_eq!(
+                batches[0]
+                    .files
+                    .iter()
+                    .map(|file| file.meta.original_size)
+                    .sum::<i64>(),
+                8 * GIB
+            );
+        }
+    }
 
-        let indexed_batches = collect(&files, true);
-        assert_eq!(indexed_batches.len(), 1);
-        assert_eq!(indexed_batches[0].files.len(), 3);
-        assert_eq!(
-            indexed_batches[0]
-                .files
-                .iter()
-                .map(|file| file.meta.original_size)
-                .sum::<i64>(),
-            8 * GIB
-        );
-        assert!(collect(&files, false).is_empty());
-
-        let indexless: Vec<FileKey> = (0..4)
-            .map(|i| create_file_key(&format!("small{i}.vix"), i, i + 1, GIB / 2))
+    /// Unsettled hours seal a below-target remainder only once it is
+    /// MIN_PARTIAL_FAN_IN wide: two half-target files wait for the sweep-up,
+    /// eight tiny stragglers coalesce now.
+    #[test]
+    fn unsettled_remainder_needs_the_fan_in_floor() {
+        let target = 4_096;
+        let collect = |files: &[FileKey], settled: bool| {
+            let mut batches = Vec::new();
+            group_files_into_batches(
+                &mut batches,
+                files,
+                "org",
+                StreamType::Traces,
+                "default",
+                "files/org/traces/default/2026/09/30/03",
+                target,
+                settled,
+                &MergeStrategy::FileTime,
+            );
+            batches
+        };
+        let pair: Vec<FileKey> = (0..2)
+            .map(|i| create_file_key(&format!("big{i}.vix"), i, i + 1, 1_500))
             .collect();
-        let rebuild_batches = collect(&indexless, false);
-        assert_eq!(rebuild_batches.len(), 2);
-        assert!(rebuild_batches.iter().all(|batch| batch.files.len() == 2));
+        assert!(collect(&pair, false).is_empty(), "two 1.5 GB files wait");
+        assert_eq!(
+            collect(&pair, true).len(),
+            1,
+            "the settled sweep-up seals them"
+        );
+
+        let tiny = |n: i64| -> Vec<FileKey> {
+            (0..n)
+                .map(|i| create_file_key(&format!("tiny{i}.vix"), i, i + 1, 1))
+                .collect()
+        };
+        assert!(
+            collect(&tiny(MIN_PARTIAL_FAN_IN as i64 - 1), false).is_empty(),
+            "below the floor the stragglers carry"
+        );
+        let sealed = collect(&tiny(MIN_PARTIAL_FAN_IN as i64), false);
+        assert_eq!(sealed.len(), 1);
+        assert_eq!(sealed[0].files.len(), MIN_PARTIAL_FAN_IN);
+    }
+
+    fn core_file(name: &str, i: i64, original_size: i64, index_size: i64) -> FileKey {
+        let mut file = create_file_key(&format!("{name}.vix"), i, i + 1, original_size);
+        file.meta.index_size = index_size;
+        file
+    }
+
+    fn plan(files: Vec<FileKey>, stream_type: StreamType, age: HourAge) -> PartitionPlan {
+        const MIB: i64 = 1024 * 1024;
+        plan_partition(
+            files,
+            "org",
+            stream_type,
+            "default",
+            "files/org/logs/default/2026/09/30/03",
+            4096 * MIB,
+            age,
+            false,
+            &MergeStrategy::FileTime,
+        )
+    }
+
+    const OPEN: HourAge = HourAge {
+        open: true,
+        settled: false,
+    };
+    const UNSETTLED: HourAge = HourAge {
+        open: false,
+        settled: false,
+    };
+    const SETTLED: HourAge = HourAge {
+        open: false,
+        settled: true,
+    };
+
+    fn keys(files: &[FileKey]) -> Vec<&str> {
+        files.iter().map(|f| f.key.as_str()).collect()
+    }
+
+    /// A file above half the target is final: never grouped, and if it is
+    /// index-less it is healed in place from the first round it is seen -
+    /// the prod logs L0 (p50 2.7 GB) must not wait for the hour to close nor
+    /// be rewritten toward the target with a smaller neighbour.
+    #[test]
+    fn final_size_index_less_files_heal_instead_of_merging() {
+        const MIB: i64 = 1024 * 1024;
+        let files = || {
+            vec![
+                core_file("l0-big", 0, 2_700 * MIB, 0),
+                core_file("l0-small", 1, 1_000 * MIB, 0),
+            ]
+        };
+        let open = plan(files(), StreamType::Logs, OPEN);
+        assert!(open.batch_groups.is_empty(), "2.7 GB is final, 1 GB waits");
+        assert_eq!(
+            keys(&open.heal_candidates),
+            ["l0-big.vix"],
+            "the final L0 heals while the hour is still open"
+        );
+        for age in [UNSETTLED, SETTLED] {
+            let closed = plan(files(), StreamType::Logs, age);
+            assert!(closed.batch_groups.is_empty(), "{age:?}: never grouped");
+            assert_eq!(
+                keys(&closed.heal_candidates),
+                ["l0-small.vix", "l0-big.vix"],
+                "{age:?}: once closed, the 1 GB file is the lone sub-half core file - probed \
+                 in place rather than rewritten with the final one"
+            );
+        }
+
+        // an already indexed final file is probed only by the sweep-up
+        let indexed = |age| {
+            plan(
+                vec![core_file("done", 0, 3_000 * MIB, 64)],
+                StreamType::Logs,
+                age,
+            )
+        };
+        assert!(indexed(UNSETTLED).heal_candidates.is_empty());
+        assert_eq!(keys(&indexed(SETTLED).heal_candidates), ["done.vix"]);
+    }
+
+    /// Sub-half files of one class group toward the single target; the
+    /// traces L0 shape (indexed at L0, p50 312 MB) fills one 4 GiB group.
+    #[test]
+    fn sub_half_files_group_toward_the_single_target() {
+        const MIB: i64 = 1024 * 1024;
+        let traces: Vec<FileKey> = (0..20)
+            .map(|i| core_file(&format!("t{i}"), i, 312 * MIB, MIB))
+            .collect();
+        let traces_plan = plan(traces, StreamType::Traces, UNSETTLED);
+        assert_eq!(
+            traces_plan.batch_groups.len(),
+            1,
+            "13 x 312 MB fill the 4 GiB group; 7 wait"
+        );
+        assert_eq!(traces_plan.batch_groups[0].files.len(), 13);
+        assert!(traces_plan.heal_candidates.is_empty());
+
+        // index-less and indexed core files never share a group
+        let mixed: Vec<FileKey> = (0..4)
+            .map(|i| core_file(&format!("m{i}"), i, 500 * MIB, i % 2 * MIB))
+            .collect();
+        let mixed_plan = plan(mixed, StreamType::Logs, SETTLED);
+        assert_eq!(mixed_plan.batch_groups.len(), 2);
+        for batch in &mixed_plan.batch_groups {
+            let indexed: std::collections::HashSet<bool> =
+                batch.files.iter().map(|f| f.meta.index_size > 0).collect();
+            assert_eq!(indexed.len(), 1, "sidecar-homogeneous groups");
+        }
+    }
+
+    /// A partition's lone core file is probed once the hour has closed.
+    #[test]
+    fn lone_core_file_is_probed_after_the_hour_closes() {
+        const MIB: i64 = 1024 * 1024;
+        let lone = |age| {
+            plan(
+                vec![core_file("lone", 0, 100 * MIB, 8)],
+                StreamType::Logs,
+                age,
+            )
+        };
+        assert!(
+            lone(OPEN).heal_candidates.is_empty(),
+            "more files are coming"
+        );
+        assert_eq!(keys(&lone(UNSETTLED).heal_candidates), ["lone.vix"]);
+        assert_eq!(keys(&lone(SETTLED).heal_candidates), ["lone.vix"]);
     }
 
     #[test]

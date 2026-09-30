@@ -1701,9 +1701,6 @@ pub enum CoreMergeMode {
     /// Refuse every rebuild fallback. Used by batches above the safe rebuild
     /// size ceiling.
     IndexedOnly,
-    /// Produce a column-store-only intermediate; its final index is built by
-    /// a later merge or terminal heal.
-    IndexDeferred,
 }
 
 /// The first CPU phase either finishes the merge or returns owned state for a
@@ -1847,56 +1844,6 @@ pub fn merge_core_files_indexed_only_with_cancellation(
     )
 }
 
-/// M31: [`merge_core_files`] with the index build DEFERRED — the output is
-/// COLUMN-STORE-ONLY (`index=None`, `index_size` 0), the copy-shape merge:
-/// no dictionary/postings/bloom work, no rebuild-gate admission. For
-/// non-final merge groups whose output will provably be merged again (the
-/// compactor's `ZO_VIX_MERGE_INDEX_DEFER_BELOW_MB` policy); the index is
-/// built once, at the group that crosses the line (or by the single-file
-/// heal on a terminal leftover).
-pub fn merge_core_files_index_deferred(
-    stream_type: StreamType,
-    inputs: &[MergeInput],
-    latest_schema: &Schema,
-    fts_fields: &[String],
-    bloom_fields: &[String],
-) -> Result<MergedCoreFile, anyhow::Error> {
-    merge_core_files_with_caps(
-        stream_type,
-        inputs,
-        latest_schema,
-        fts_fields,
-        bloom_fields,
-        BatchCaps {
-            index_enabled_override: Some(false),
-            ..BatchCaps::default()
-        },
-    )
-}
-
-/// [`merge_core_files_index_deferred`] with cooperative cancellation.
-pub fn merge_core_files_index_deferred_with_cancellation(
-    stream_type: StreamType,
-    inputs: &[MergeInput],
-    latest_schema: &Schema,
-    fts_fields: &[String],
-    bloom_fields: &[String],
-    cancellation: &VixMergeCancellation,
-) -> Result<MergedCoreFile, anyhow::Error> {
-    merge_core_files_with_caps_and_cancellation(
-        stream_type,
-        inputs,
-        latest_schema,
-        fts_fields,
-        bloom_fields,
-        BatchCaps {
-            index_enabled_override: Some(false),
-            ..BatchCaps::default()
-        },
-        Some(cancellation.clone()),
-        false,
-    )
-}
 /// The compactor's first CPU phase: open every input (footers and sidecar
 /// tails only), build the merge plan and — for [`CoreMergeMode::IndexedOnly`]
 /// — prove the indexed fast path applies BEFORE any docs bytes are read.
@@ -1937,13 +1884,6 @@ pub fn preflight_core_merge(
     let (caps, require_indexed_merge) = match mode {
         CoreMergeMode::Automatic => (BatchCaps::default(), false),
         CoreMergeMode::IndexedOnly => (BatchCaps::default(), true),
-        CoreMergeMode::IndexDeferred => (
-            BatchCaps {
-                index_enabled_override: Some(false),
-                ..BatchCaps::default()
-            },
-            false,
-        ),
     };
     let preflight = preflight_core_merge_inner(
         stream_type,
@@ -11611,57 +11551,6 @@ mod tests {
             &open_merged(&drifted_source_forced),
             "column-vs-source under string-representation drift",
         );
-
-        // M31: the DEFERRED merge over the same index-off inputs writes a
-        // COLUMN-STORE-ONLY output (the copy-shape non-final hop): no
-        // index, no derivation, docs columns intact and L0-read semantics.
-        let deferred = merge_core_files_index_deferred(
-            StreamType::Logs,
-            &as_inputs(&l0_inputs),
-            &latest_schema,
-            &fts,
-            &[],
-        )
-        .unwrap();
-        assert!(deferred.index.is_none(), "deferred output has no sidecar");
-        assert_eq!(deferred.stats.index_size, 0);
-        assert!(!deferred.terms_from_columns, "no term derivation ran");
-        let deferred_reader = open_merged(&deferred);
-        assert!(!deferred_reader.has_index());
-        assert_eq!(deferred_reader.row_count(), healed_reader.row_count());
-        for field in ["log", "svc", "code", "ok", ID_COL_NAME] {
-            assert!(
-                deferred_reader.read_docs_column(field).is_ok(),
-                "{field:?} must be a docs column on the deferred output"
-            );
-        }
-        assert!(deferred_reader.eval(&exact("svc", "api")).is_err());
-        // the FINAL hop over deferred outputs then heals to indexed exactly
-        // like L0s do (same index-less class): parity against the indexed
-        // control ensures the deferred generation lost nothing.
-        let deferred_pair = vec![(
-            "deferred-a.vix".to_string(),
-            (
-                bytes::Bytes::from(deferred.output.to_bytes().unwrap()),
-                None,
-            ),
-        )];
-        let finalized = merge_core_files_rebuild_with_caps(
-            StreamType::Logs,
-            &as_inputs(&deferred_pair),
-            &latest_schema,
-            &fts,
-            &[],
-            BatchCaps::default(),
-        )
-        .unwrap();
-        assert!(finalized.stats.index_size > 0, "final hop builds the index");
-        assert!(finalized.terms_from_columns, "final hop takes the #46 arm");
-        assert_core_files_equivalent(
-            &open_merged(&finalized),
-            &healed_reader,
-            "deferred-then-finalized vs direct heal",
-        );
     }
 
     /// LIVE-SHAPE regression (image .8 zero-ts merge outputs): an event-time
@@ -13785,40 +13674,6 @@ mod tests {
             &open_merged(&reference),
             "prepared rebuild",
         );
-    }
-
-    #[test]
-    fn prepared_index_deferred_merge_needs_no_rebuild_memory() {
-        let fields = vec![
-            Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
-            Field::new("svc", DataType::Utf8, true),
-        ];
-        let pair = build_poisoned_core_file(
-            fields.clone(),
-            vec![
-                Arc::new(Int64Array::from(vec![100, 0])),
-                Arc::new(StringArray::from(vec!["api", "db"])),
-            ],
-            &[],
-        );
-        let inputs = vec![("deferred-poison.vix".to_string(), pair)];
-        let attempt = try_merge_core_files_with_cancellation(
-            StreamType::Logs,
-            as_inputs(&inputs),
-            Arc::new(Schema::new(fields)),
-            Vec::new(),
-            Vec::new(),
-            VixMergeCancellation::new(),
-            CoreMergeMode::IndexDeferred,
-        )
-        .unwrap();
-        let CoreMergeAttempt::NeedsRebuild(prepared) = attempt else {
-            panic!("a deferred merge that must cleanse rows must resume through the copy rebuild");
-        };
-        assert!(!prepared.requires_memory_admission());
-        let output = execute_prepared_core_rebuild(prepared, None).unwrap();
-        assert!(output.index.is_none());
-        assert_eq!(output.stats.index_size, 0);
     }
 
     /// Manual timing harness over REAL core files (compaction-shaped data).
