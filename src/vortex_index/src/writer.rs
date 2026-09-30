@@ -3608,11 +3608,13 @@ impl VixWriter {
     /// Assembles the SIDECAR blob list (format "3": the data object carries
     /// ONLY `docs`; every index blob lives in the `.vxi` sidecar). Empty
     /// dict/terms tables are omitted entirely; the reader treats a missing
-    /// `dict`/`terms` pair as "no terms". Blob order clusters the small,
-    /// hot blobs (`dict` block index, `bloom`) at the TAIL, next to the
-    /// footer, so the eager tail fetch of a cold sidecar open covers them
-    /// in one read. Readers locate blobs by tag, so order carries no
-    /// meaning.
+    /// `dict`/`terms` pair as "no terms". Blob order clusters the hot tail
+    /// `[plist?][dict_blocks][bloom?][terms][dict][footer]`: the `dict`
+    /// block index sits next to the footer, and `terms` directly before it so
+    /// the terms blob's Vortex footer (its last 65,535 bytes) also lands in
+    /// the eager tail whenever `dict + puffin footer + 65,535 <= tail` — a
+    /// cold sidecar open then parses both footers from ONE ranged fetch.
+    /// Readers locate blobs by tag, so order carries no meaning for them.
     #[allow(clippy::type_complexity)]
     fn assemble_index_blobs(
         &mut self,
@@ -3874,9 +3876,9 @@ impl VixWriter {
 
         let mut blobs: Vec<(&'static str, &'static str, BlobPart)> = Vec::new();
         let mut directory = None;
+        let mut terms = None;
         let mut dict_field_pages = None;
         if let Some(index) = index_blobs {
-            blobs.push((BLOB_TYPE_TERMS, BLOB_TAG_TERMS, index.terms));
             // The out-of-row postings region: RAW concatenated
             // `encode_record` bytes (pointer-addressed, deliberately not a
             // Vortex file), present only when at least one pointer cell
@@ -3889,6 +3891,7 @@ impl VixWriter {
                 BLOB_TAG_DICT_BLOCKS,
                 index.dict_blocks,
             ));
+            terms = Some(index.terms);
             directory = Some(index.dict);
             dict_field_pages = Some(index.dict_field_pages);
         }
@@ -3918,8 +3921,12 @@ impl VixWriter {
             blobs.push((BLOB_TYPE_BLOOM, BLOB_TAG_BLOOM, BlobPart::Mem(bloom_blob)));
         }
         // Explicit puffin offsets make physical order independent of lookup.
-        // Keep the small, universally used directory closer to the footer
-        // than bloom payloads, which may exceed the entire eager-tail budget.
+        // `terms` goes right before the small, universally used directory so
+        // its Vortex footer shares the eager tail with `dict`; bloom payloads
+        // (which may exceed the entire tail budget) stay further out.
+        if let Some(terms) = terms {
+            blobs.push((BLOB_TYPE_TERMS, BLOB_TAG_TERMS, terms));
+        }
         if let Some(directory) = directory {
             blobs.push((BLOB_TYPE_DICT, BLOB_TAG_DICT, BlobPart::Mem(directory)));
         }

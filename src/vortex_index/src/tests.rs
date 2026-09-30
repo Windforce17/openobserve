@@ -1759,8 +1759,9 @@ fn container_properties_match_spec() {
     );
 
     // Blob split: the data object carries ONLY `docs`; the sidecar carries
-    // the index blobs with the small, hot ones (`dict`) at the tail next
-    // to the footer. Readers locate blobs by tag/offset, never by position.
+    // the index blobs with the hot tail `[.. terms][dict]` next to the footer
+    // (the terms blob's own Vortex footer then shares the eager tail with
+    // the block index). Readers locate blobs by tag/offset, never by position.
     let tags = |meta: &puffin::PuffinMeta| -> Vec<(String, String)> {
         meta.blobs
             .iter()
@@ -1777,11 +1778,11 @@ fn container_properties_match_spec() {
     assert_eq!(
         tags(&index_meta),
         vec![
-            ("o2-vix-terms-v1".to_string(), "terms".to_string()),
             (
                 "o2-vix-dictblocks-v1".to_string(),
                 "dict_blocks".to_string()
             ),
+            ("o2-vix-terms-v1".to_string(), "terms".to_string()),
             ("o2-vix-dict-v2".to_string(), "dict".to_string()),
         ]
     );
@@ -4364,10 +4365,12 @@ fn docs_blob_zstd_beats_round1_by_4x() {
 mod ranged {
     use std::{
         ops::Range,
+        pin::Pin,
         sync::{
             Arc,
             atomic::{AtomicU64, AtomicUsize, Ordering},
         },
+        task::{Context, Poll},
     };
 
     use futures::{FutureExt, future::BoxFuture};
@@ -4375,22 +4378,55 @@ mod ranged {
     use super::*;
     use crate::{VixDocs, VixRangeSource};
 
-    /// In-memory mock object: serves ranges from `Bytes` (ready futures) and
-    /// counts every fetch and every fetched byte.
+    /// Critical-path round-trip clock shared by the sources of one object
+    /// pair: a batch issued while nothing has completed since the deepest
+    /// finished batch sits at that depth + 1, so concurrent batches share a
+    /// depth and dependent ones stack. Mock futures yield once before
+    /// resolving so "in flight" is observable to the clock.
+    #[derive(Default)]
+    struct DepthClock {
+        completed: AtomicUsize,
+        max: AtomicUsize,
+    }
+
+    /// Resolves on its second poll: models one latency unit.
+    struct YieldOnce(bool);
+
+    impl Future for YieldOnce {
+        type Output = ();
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            if self.0 {
+                Poll::Ready(())
+            } else {
+                self.0 = true;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+    }
+
+    /// In-memory mock object: serves ranges from `Bytes` and counts every
+    /// fetch, every fetched byte, every batch and the sequential depth.
     struct CountingSource {
         data: Bytes,
         fetches: AtomicUsize,
         bytes: AtomicU64,
         batch_calls: AtomicUsize,
+        clock: Arc<DepthClock>,
     }
 
     impl CountingSource {
         fn new(data: Bytes) -> Arc<Self> {
+            Self::with_clock(data, Arc::new(DepthClock::default()))
+        }
+
+        fn with_clock(data: Bytes, clock: Arc<DepthClock>) -> Arc<Self> {
             Arc::new(Self {
                 data,
                 fetches: AtomicUsize::new(0),
                 bytes: AtomicU64::new(0),
                 batch_calls: AtomicUsize::new(0),
+                clock,
             })
         }
 
@@ -4407,6 +4443,12 @@ mod ranged {
         fn batch_calls(&self) -> usize {
             self.batch_calls.load(Ordering::SeqCst)
         }
+
+        /// Sequential depth: the longest chain of dependent round trips so
+        /// far (wall time in units of one fetch latency).
+        fn depth(&self) -> usize {
+            self.clock.max.load(Ordering::SeqCst)
+        }
     }
 
     impl VixRangeSource for CountingSource {
@@ -4415,15 +4457,8 @@ mod ranged {
         }
 
         fn fetch(&self, range: Range<u64>) -> BoxFuture<'static, anyhow::Result<Bytes>> {
-            self.fetches.fetch_add(1, Ordering::SeqCst);
-            self.bytes
-                .fetch_add(range.end - range.start, Ordering::SeqCst);
-            let out = if range.end <= self.data.len() as u64 && range.start <= range.end {
-                Ok(self.data.slice(range.start as usize..range.end as usize))
-            } else {
-                Err(anyhow::anyhow!("range {range:?} out of bounds"))
-            };
-            async move { out }.boxed()
+            let batch = self.fetch_many(vec![range]);
+            async move { Ok(batch.await?.remove(0)) }.boxed()
         }
 
         fn fetch_many(
@@ -4431,15 +4466,26 @@ mod ranged {
             ranges: Vec<Range<u64>>,
         ) -> BoxFuture<'static, anyhow::Result<Vec<Bytes>>> {
             self.batch_calls.fetch_add(1, Ordering::SeqCst);
-            // same behavior as the trait default (each range ticks
-            // `fetches` via `fetch`), plus the round-trip counter above
-            let futs: Vec<_> = ranges.into_iter().map(|r| self.fetch(r)).collect();
+            let depth = self.clock.completed.load(Ordering::SeqCst) + 1;
+            self.clock.max.fetch_max(depth, Ordering::SeqCst);
+            let out: anyhow::Result<Vec<Bytes>> = ranges
+                .into_iter()
+                .map(|range| {
+                    self.fetches.fetch_add(1, Ordering::SeqCst);
+                    self.bytes
+                        .fetch_add(range.end - range.start, Ordering::SeqCst);
+                    if range.end <= self.data.len() as u64 && range.start <= range.end {
+                        Ok(self.data.slice(range.start as usize..range.end as usize))
+                    } else {
+                        Err(anyhow::anyhow!("range {range:?} out of bounds"))
+                    }
+                })
+                .collect();
+            let clock = Arc::clone(&self.clock);
             Box::pin(async move {
-                let mut out = Vec::with_capacity(futs.len());
-                for fut in futs {
-                    out.push(fut.await?);
-                }
-                Ok(out)
+                YieldOnce(false).await;
+                clock.completed.fetch_max(depth, Ordering::SeqCst);
+                out
             })
         }
 
@@ -4525,7 +4571,8 @@ mod ranged {
 
     /// Per-object counting sources of one (data, sidecar) pair. The
     /// aggregate counters keep the pre-split budget assertions meaningful:
-    /// a fetch is a fetch, whichever object it hits.
+    /// a fetch is a fetch, whichever object it hits; both objects share one
+    /// depth clock so concurrent tail probes count as one round trip.
     struct PairSource {
         data: Arc<CountingSource>,
         index: Arc<CountingSource>,
@@ -4533,9 +4580,10 @@ mod ranged {
 
     impl PairSource {
         fn new(data: Bytes, index: Bytes) -> Self {
+            let clock = Arc::new(DepthClock::default());
             Self {
-                data: CountingSource::new(data),
-                index: CountingSource::new(index),
+                data: CountingSource::with_clock(data, Arc::clone(&clock)),
+                index: CountingSource::with_clock(index, clock),
             }
         }
 
@@ -4543,6 +4591,16 @@ mod ranged {
             VixReader::open_ranged_with_index(
                 Arc::clone(&self.data) as Arc<dyn VixRangeSource>,
                 Some(Arc::clone(&self.index) as Arc<dyn VixRangeSource>),
+            )
+            .unwrap()
+        }
+
+        /// Open with an explicit sidecar eager tail (production runs 256 KiB).
+        fn open_with_tail(&self, index_tail_bytes: u64) -> VixReader {
+            VixReader::open_ranged_with_index_tail(
+                Arc::clone(&self.data) as Arc<dyn VixRangeSource>,
+                Some(Arc::clone(&self.index) as Arc<dyn VixRangeSource>),
+                index_tail_bytes,
             )
             .unwrap()
         }
@@ -4558,6 +4616,51 @@ mod ranged {
         fn batch_calls(&self) -> usize {
             self.data.batch_calls() + self.index.batch_calls()
         }
+
+        /// Sequential depth across both objects (shared clock).
+        fn depth(&self) -> usize {
+            self.data.depth()
+        }
+    }
+
+    /// The sidecar re-packed in the pre-D2 blob order
+    /// `[terms][plist?][dict_blocks][bloom?][dict]` — every blob byte-for-byte
+    /// the same, only the physical placement differs — so the read plan can
+    /// be measured against files already in the fleet.
+    fn repack_legacy_sidecar_order(index: &Bytes) -> Bytes {
+        use crate::container::{
+            BLOB_TAG_BLOOM, BLOB_TAG_DICT, BLOB_TAG_DICT_BLOCKS, BLOB_TAG_PLIST, BLOB_TAG_TERMS,
+            BLOB_TYPE_BLOOM, BLOB_TYPE_DICT, BLOB_TYPE_DICT_BLOCKS, BLOB_TYPE_PLIST,
+            BLOB_TYPE_TERMS, BlobHandle, build_container, parse_container,
+        };
+        let container = parse_container(index).unwrap();
+        let properties: Vec<(String, String)> = container
+            .properties
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        let mem = |handle: Option<BlobHandle>| match handle {
+            Some(BlobHandle::Mem(bytes)) => Some(bytes.to_vec()),
+            Some(BlobHandle::Ranged(_)) => unreachable!("parsed from memory"),
+            None => None,
+        };
+        let mut blobs = Vec::new();
+        if let Some(terms) = mem(container.terms) {
+            blobs.push((BLOB_TYPE_TERMS, BLOB_TAG_TERMS, terms));
+        }
+        if let Some(plist) = mem(container.plist) {
+            blobs.push((BLOB_TYPE_PLIST, BLOB_TAG_PLIST, plist));
+        }
+        if let Some(blocks) = mem(container.dict_blocks) {
+            blobs.push((BLOB_TYPE_DICT_BLOCKS, BLOB_TAG_DICT_BLOCKS, blocks));
+        }
+        if let Some(bloom) = mem(container.bloom) {
+            blobs.push((BLOB_TYPE_BLOOM, BLOB_TAG_BLOOM, bloom));
+        }
+        if let Some(dict) = mem(container.dict) {
+            blobs.push((BLOB_TYPE_DICT, BLOB_TAG_DICT, dict));
+        }
+        Bytes::from(build_container(properties, blobs).unwrap())
     }
 
     /// Cold open + exact-term point lookup: the Arch.md budget. Open is a
@@ -4624,6 +4727,213 @@ mod ranged {
             source.bytes(),
             file_size
         );
+    }
+
+    /// Production sidecar eager tail (`ZO_VIX_EAGER_TAIL_BYTES` on the obs
+    /// queriers); the plan below is stated for it.
+    const PROD_SIDECAR_TAIL: u64 = 256 * 1024;
+
+    /// One cold (open + evaluate) run over a fixture layout: the sequential
+    /// depth, the range count and the bytes it cost.
+    struct ColdCost {
+        depth: usize,
+        fetches: usize,
+        batches: usize,
+        bytes: u64,
+    }
+
+    fn cold_cost<T: PartialEq + std::fmt::Debug>(
+        data: &Bytes,
+        index: &Bytes,
+        expect: &T,
+        evaluate: impl Fn(&VixReader) -> T,
+    ) -> ColdCost {
+        let source = PairSource::new(data.clone(), index.clone());
+        let ranged = source.open_with_tail(PROD_SIDECAR_TAIL);
+        assert_eq!(
+            source.depth(),
+            1,
+            "both tails must go out in one round trip"
+        );
+        assert_eq!(source.fetches(), 2, "open is exactly the two tail probes");
+        assert_eq!(
+            &evaluate(&ranged),
+            expect,
+            "ranged result must match the whole-file reader"
+        );
+        ColdCost {
+            depth: source.depth(),
+            fetches: source.fetches(),
+            batches: source.batch_calls(),
+            bytes: source.bytes(),
+        }
+    }
+
+    /// Cold read plan, exact-term count (`count(*) WHERE level='warn'`):
+    /// old layout `[terms][dict_blocks][dict]` = tails ∥, bundle[terms
+    /// footer + key block], doc_count leaf = 3 round trips; new layout
+    /// `[dict_blocks][terms][dict]` puts the terms footer in the tail, so
+    /// the bundle carries the block AND the field's doc_count leaves =
+    /// 2 round trips. A field whose doc_count span exceeds the leaf cap
+    /// (`svc`, 100k terms) keeps the leaf round trip on both layouts.
+    #[test]
+    fn cold_exact_count_round_trips_old_and_new_layout() {
+        let (data, index) = build_large_core_file();
+        let legacy = repack_legacy_sidecar_order(&index);
+        assert_ne!(legacy, index, "the writer must now emit the new blob order");
+        let mem = VixReader::open_with_index(data.clone(), Some(index.clone())).unwrap();
+
+        let query = exact("level", "warn");
+        let expect = mem.count(&query).unwrap();
+        assert_eq!(expect, 33_333);
+        let old = cold_cost(&data, &legacy, &expect, |reader| {
+            reader.count(&query).unwrap()
+        });
+        let new = cold_cost(&data, &index, &expect, |reader| {
+            reader.count(&query).unwrap()
+        });
+        eprintln!(
+            "[cold exact count level] old: depth={} fetches={} batches={} bytes={} | new: depth={} \
+             fetches={} batches={} bytes={}",
+            old.depth,
+            old.fetches,
+            old.batches,
+            old.bytes,
+            new.depth,
+            new.fetches,
+            new.batches,
+            new.bytes
+        );
+        assert_eq!(
+            old.depth, 3,
+            "old layout: tails, bundle[footer+block], leaf"
+        );
+        assert_eq!(new.depth, 2, "new layout: tails, bundle[block+leaves]");
+        assert!(
+            new.fetches <= old.fetches,
+            "{} > {}",
+            new.fetches,
+            old.fetches
+        );
+
+        let wide = exact("svc", "svc_090909");
+        let expect = mem.count(&wide).unwrap();
+        assert_eq!(expect, 1);
+        let old = cold_cost(&data, &legacy, &expect, |reader| {
+            reader.count(&wide).unwrap()
+        });
+        let new = cold_cost(&data, &index, &expect, |reader| {
+            reader.count(&wide).unwrap()
+        });
+        eprintln!(
+            "[cold exact count svc] old: depth={} fetches={} bytes={} | new: depth={} fetches={} \
+             bytes={}",
+            old.depth, old.fetches, old.bytes, new.depth, new.fetches, new.bytes
+        );
+        assert_eq!(old.depth, 3);
+        assert_eq!(
+            new.depth, 3,
+            "leaves over the cap read on demand: one more round trip"
+        );
+        assert!(
+            new.fetches <= old.fetches,
+            "{} > {}",
+            new.fetches,
+            old.fetches
+        );
+    }
+
+    /// Cold read plan, grouped top-N (`GROUP BY level ORDER BY count LIMIT
+    /// 10`): old layout = tails ∥, bundle[terms footer + key-terms block +
+    /// field block run], leaves[key ordinal + value spans] = 3 round trips;
+    /// new layout folds the leaves into the bundle = 2. Results equal the
+    /// whole-file reader's.
+    #[test]
+    fn cold_top_k_round_trips_old_and_new_layout() {
+        let (data, index) = build_large_core_file();
+        let legacy = repack_legacy_sidecar_order(&index);
+        let mem = VixReader::open_with_index(data.clone(), Some(index.clone())).unwrap();
+        let expect = mem
+            .field_value_top_k("level", 10, false)
+            .unwrap()
+            .expect("level is dictionary-eligible");
+        assert_eq!(expect.0.len(), 3);
+        let evaluate = |reader: &VixReader| reader.field_value_top_k("level", 10, false).unwrap();
+        let expect = Some(expect);
+        let old = cold_cost(&data, &legacy, &expect, evaluate);
+        let new = cold_cost(&data, &index, &expect, evaluate);
+        eprintln!(
+            "[cold top-k level] old: depth={} fetches={} batches={} bytes={} | new: depth={} \
+             fetches={} batches={} bytes={}",
+            old.depth,
+            old.fetches,
+            old.batches,
+            old.bytes,
+            new.depth,
+            new.fetches,
+            new.batches,
+            new.bytes
+        );
+        assert_eq!(
+            old.depth, 3,
+            "old layout: tails, bundle[footer+blocks], leaves"
+        );
+        assert_eq!(new.depth, 2, "new layout: tails, bundle[blocks+leaves]");
+        assert!(
+            new.fetches <= old.fetches,
+            "{} > {}",
+            new.fetches,
+            old.fetches
+        );
+    }
+
+    /// D2: with the new blob order the terms blob's Vortex footer (its last
+    /// 65,535 bytes) lies inside the production eager tail, so opening the
+    /// terms blob — footer parse + doc_count leaf map — costs ZERO fetches
+    /// beyond the two tail probes. The legacy order pays one fetch for it.
+    #[test]
+    fn new_layout_terms_footer_is_tail_resident() {
+        let (data, index) = build_large_core_file();
+        let terms = crate::test_support::blob_byte_range(&index, "terms").unwrap();
+        let dict = crate::test_support::blob_byte_range(&index, "dict").unwrap();
+        let footer_window = index.len() - terms.end;
+        assert!(dict.start == terms.end, "dict must directly follow terms");
+        assert!(
+            footer_window as u64 + crate::source::VORTEX_FOOTER_READ_BYTES <= PROD_SIDECAR_TAIL,
+            "dict + puffin footer ({footer_window} B) + 65,535 must fit the tail"
+        );
+
+        for (name, sidecar, expected_fetches) in [
+            ("new", index.clone(), 0usize),
+            ("legacy", repack_legacy_sidecar_order(&index), 1usize),
+        ] {
+            let source = PairSource::new(data.clone(), sidecar);
+            let ranged = source.open_with_tail(PROD_SIDECAR_TAIL);
+            let before = source.fetches();
+            let terms_blob = ranged.terms_blob_for_tests().expect("indexed fixture");
+            assert!(
+                matches!(terms_blob, crate::container::BlobHandle::Ranged(_)),
+                "{name}: the terms blob must stay a ranged window"
+            );
+            let leaves = crate::container::blob_column_leaves(terms_blob, "doc_count")
+                .unwrap()
+                .expect("terms blob has a mappable doc_count column");
+            assert!(
+                leaves.len() > 1,
+                "{name}: fixture spans several terms chunks"
+            );
+            assert_eq!(leaves[0].rows.start, 0);
+            assert_eq!(
+                leaves.last().unwrap().rows.end,
+                ranged.term_count(),
+                "{name}: leaves cover every ordinal"
+            );
+            assert_eq!(
+                source.fetches() - before,
+                expected_fetches,
+                "{name}: terms footer open fetches"
+            );
+        }
     }
 
     /// #27: a condition-ALL evaluation must not touch the dictionary at

@@ -93,6 +93,92 @@ thread_local! {
     static READ_OPERATION: RefCell<Option<Arc<dyn VixReadOperation>>> = const { RefCell::new(None) };
     static EXACT_RANGES: Cell<bool> = const { Cell::new(false) };
     static READER_MEMORY: RefCell<Option<Arc<crate::reader::ReaderMemory>>> = const { RefCell::new(None) };
+    /// Windows prefetched for ONE ranged blob (identified by its footer
+    /// state) by the operation running on this thread.
+    static PREFETCHED: RefCell<Option<(usize, Arc<PrefetchedWindows>)>> = const { RefCell::new(None) };
+}
+
+/// Byte windows of one blob's object fetched ahead of the scans that need
+/// them (the field-scoped prefetch bundle): absolute source offsets, kept
+/// sorted and non-overlapping. The IO bridge serves any read lying fully
+/// inside a window without touching the source. Operation-scoped — registered
+/// for one blob through [`RangedBlob::prefetch_scope`], never reader state.
+pub(crate) struct PrefetchedWindows {
+    windows: parking_lot::RwLock<Vec<(Range<u64>, Bytes)>>,
+}
+
+impl PrefetchedWindows {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            windows: parking_lot::RwLock::new(Vec::new()),
+        })
+    }
+
+    /// Register `bytes` as the content of `range`, merging with adjacent or
+    /// overlapping windows so a coalesced read over neighbours stays covered.
+    pub(crate) fn add(&self, range: Range<u64>, bytes: Bytes) {
+        debug_assert_eq!(bytes.len() as u64, range.end - range.start);
+        if range.is_empty() {
+            return;
+        }
+        let mut windows = self.windows.write();
+        let first = windows.partition_point(|(window, _)| window.end < range.start);
+        let last = windows.partition_point(|(window, _)| window.start <= range.end);
+        if first == last {
+            windows.insert(first, (range, bytes));
+            return;
+        }
+        // Every drained neighbour touches `range`, and neighbours are pairwise
+        // disjoint, so in start order each part begins at or before the bytes
+        // stitched so far — the union is one gap-free window.
+        let mut parts: Vec<(Range<u64>, Bytes)> = windows.drain(first..last).collect();
+        parts.push((range, bytes));
+        parts.sort_by_key(|(window, _)| window.start);
+        let start = parts[0].0.start;
+        let end = parts
+            .iter()
+            .map(|(window, _)| window.end)
+            .max()
+            .expect("at least the new window");
+        let mut merged = BytesMut::with_capacity((end - start) as usize);
+        let mut offset = start;
+        for (window, data) in parts {
+            if window.end <= offset {
+                continue;
+            }
+            debug_assert!(window.start <= offset, "prefetch windows must touch");
+            merged.extend_from_slice(&data[(offset - window.start) as usize..]);
+            offset = window.end;
+        }
+        debug_assert_eq!(offset, end);
+        windows.insert(first, (start..end, merged.freeze()));
+    }
+
+    /// The bytes of `range` when a single window covers all of it.
+    pub(crate) fn covering(&self, range: &Range<u64>) -> Option<Bytes> {
+        let windows = self.windows.read();
+        let index = windows
+            .partition_point(|(window, _)| window.start <= range.start)
+            .checked_sub(1)?;
+        let (window, bytes) = &windows[index];
+        (range.end <= window.end).then(|| {
+            bytes.slice((range.start - window.start) as usize..(range.end - window.start) as usize)
+        })
+    }
+
+    pub(crate) fn covers(&self, range: &Range<u64>) -> bool {
+        range.is_empty() || self.covering(range).is_some()
+    }
+}
+
+/// Restores the previously registered prefetch when dropped.
+pub(crate) struct PrefetchScope(Option<(usize, Arc<PrefetchedWindows>)>);
+
+impl Drop for PrefetchScope {
+    fn drop(&mut self) {
+        let inner = PREFETCHED.with(|slot| slot.replace(self.0.take()));
+        drop(inner);
+    }
 }
 
 /// Run synchronous work with operation-local cancellation, restoring the
@@ -254,6 +340,11 @@ impl VixRangeSource for BytesRangeSource {
     fn retained_bytes(&self) -> usize {
         self.data.len() + self.name.capacity() + std::mem::size_of::<Self>()
     }
+
+    fn resident(&self, range: Range<u64>) -> Option<Bytes> {
+        (range.start <= range.end && range.end <= self.data.len() as u64)
+            .then(|| self.data.slice(range.start as usize..range.end as usize))
+    }
 }
 
 pub trait VixRangeSource: Send + Sync + 'static {
@@ -302,6 +393,13 @@ pub trait VixRangeSource: Send + Sync + 'static {
     fn describe(&self) -> String {
         "<vix range source>".to_string()
     }
+
+    /// Bytes of `range` this source already holds in memory (an eager tail
+    /// probe, an in-memory object), so a planner can skip IO for them.
+    /// Default: nothing resident.
+    fn resident(&self, _range: Range<u64>) -> Option<Bytes> {
+        None
+    }
 }
 
 /// Block the current thread on one `fetch_many` and validate every returned
@@ -347,42 +445,108 @@ pub(crate) fn block_fetch_many(
     Ok(all)
 }
 
+/// Block the current thread on two independent fetches of two objects
+/// issued concurrently — ONE round trip for a data/sidecar tail pair — and
+/// validate both lengths (same blocking-thread contract as [`block_fetch`]).
+pub(crate) fn block_fetch_pair(
+    first: &dyn VixRangeSource,
+    first_range: Range<u64>,
+    second: &dyn VixRangeSource,
+    second_range: Range<u64>,
+) -> Result<(Bytes, Bytes)> {
+    let mut fetched = block_fetch_bundle(vec![
+        (first, vec![first_range]),
+        (second, vec![second_range]),
+    ])?
+    .into_iter();
+    let mut next = || {
+        fetched
+            .next()
+            .and_then(|mut batch| batch.pop())
+            .expect("bundle validated two single-range batches")
+    };
+    Ok((next(), next()))
+}
+
+/// Concurrent range fetches one operation keeps in flight against one
+/// object: the vortex IO bridge's `concurrency`, and the fan-out of the
+/// scalar/bundle helpers below. Reads issued within one such wave cost one
+/// round trip of latency together.
+pub(crate) const FETCH_CONCURRENCY: usize = 8;
+
 /// Fetch planned disjoint metadata windows concurrently without offering
 /// their gaps to a downstream `fetch_many` coalescer.
 pub(crate) fn block_fetch_separate(
     source: &dyn VixRangeSource,
     ranges: Vec<Range<u64>>,
 ) -> Result<Vec<Bytes>> {
+    Ok(block_fetch_bundle(
+        ranges
+            .into_iter()
+            .map(|range| (source, vec![range]))
+            .collect(),
+    )?
+    .into_iter()
+    .map(|mut batch| batch.remove(0))
+    .collect())
+}
+
+/// Block the current thread on several `fetch_many` batches — each on its
+/// own source, each free to be gap-coalesced by that source's backend, all
+/// issued concurrently (up to [`FETCH_CONCURRENCY`] in flight) — so one
+/// round trip carries a coalescable batch AND exact windows that must never
+/// be offered to a coalescer (a single-range batch). Results are positional
+/// per batch and every length is validated.
+pub(crate) fn block_fetch_bundle(
+    batches: Vec<(&dyn VixRangeSource, Vec<Range<u64>>)>,
+) -> Result<Vec<Vec<Bytes>>> {
     use futures::{StreamExt, TryStreamExt};
     check_read_cancelled()?;
-    for range in &ranges {
-        if range.start > range.end || range.end > source.len() {
-            return Err(VixError::Malformed(format!(
-                "range {}..{} out of bounds for {} ({} bytes)",
-                range.start,
-                range.end,
-                source.describe(),
-                source.len(),
-            )));
+    for (source, ranges) in &batches {
+        for range in ranges {
+            if range.start > range.end || range.end > source.len() {
+                return Err(VixError::Malformed(format!(
+                    "range {}..{} out of bounds for {} ({} bytes)",
+                    range.start,
+                    range.end,
+                    source.describe(),
+                    source.len(),
+                )));
+            }
         }
     }
-    let bound = source.for_current_operation();
-    let source = bound.as_deref().unwrap_or(source);
-    let reads = futures::stream::iter(ranges.into_iter().map(|range| async move {
-        check_read_cancelled()?;
-        let expected = (range.end - range.start) as usize;
-        let bytes = source.fetch(range).await.map_err(fetch_error)?;
-        check_read_cancelled()?;
-        if bytes.len() != expected {
-            return Err(VixError::Malformed(format!(
-                "fetch of {} returned {} bytes, expected {expected}",
-                source.describe(),
-                bytes.len(),
-            )));
-        }
-        Ok(bytes)
-    }))
-    .buffered(4)
+    let bound: Vec<Option<Arc<dyn VixRangeSource>>> = batches
+        .iter()
+        .map(|(source, _)| source.for_current_operation())
+        .collect();
+    let reads = futures::stream::iter(batches.into_iter().zip(&bound).map(
+        |((source, ranges), bound)| async move {
+            let source = bound.as_deref().unwrap_or(source);
+            check_read_cancelled()?;
+            let expected: Vec<usize> = ranges.iter().map(|r| (r.end - r.start) as usize).collect();
+            let all = source.fetch_many(ranges).await.map_err(fetch_error)?;
+            check_read_cancelled()?;
+            if all.len() != expected.len() {
+                return Err(VixError::Malformed(format!(
+                    "batched fetch of {} returned {} ranges, expected {}",
+                    source.describe(),
+                    all.len(),
+                    expected.len()
+                )));
+            }
+            for (bytes, expected) in all.iter().zip(&expected) {
+                if bytes.len() != *expected {
+                    return Err(VixError::Malformed(format!(
+                        "batched fetch of {} returned {} bytes for a {expected}-byte range",
+                        source.describe(),
+                        bytes.len()
+                    )));
+                }
+            }
+            Ok(all)
+        },
+    ))
+    .buffered(FETCH_CONCURRENCY)
     .try_collect();
     futures::executor::block_on(reads)
 }
@@ -535,6 +699,47 @@ impl RangedBlob {
         self.range.end - self.range.start
     }
 
+    /// Identity of this blob for operation-scoped prefetch registration:
+    /// the footer state is unique per blob handle and stable for its life.
+    fn prefetch_id(&self) -> usize {
+        Arc::as_ptr(&self.footer) as *const () as usize
+    }
+
+    /// Register `windows` for reads of THIS blob on the current thread until
+    /// the returned scope drops (nested scopes restore their predecessor).
+    pub(crate) fn prefetch_scope(&self, windows: Arc<PrefetchedWindows>) -> PrefetchScope {
+        PrefetchScope(PREFETCHED.with(|slot| slot.replace(Some((self.prefetch_id(), windows)))))
+    }
+
+    /// Whether an open already retained this blob's encoded Vortex footer.
+    pub(crate) fn footer_cached(&self) -> bool {
+        self.footer.ranges.get().is_some()
+    }
+
+    /// Absolute window of the initial Vortex footer read an open performs
+    /// (`vortex-file`'s postscript-sized suffix, clamped to the blob).
+    pub(crate) fn footer_window(&self) -> Range<u64> {
+        self.range.end - self.len().min(VORTEX_FOOTER_READ_BYTES)..self.range.end
+    }
+
+    /// Whether the footer window is servable without IO: retained by an
+    /// earlier open, held by the source (eager tail), or prefetched on this
+    /// thread.
+    pub(crate) fn footer_resident(&self) -> bool {
+        if self.footer_cached() {
+            return true;
+        }
+        let window = self.footer_window();
+        if self.source.resident(window.clone()).is_some() {
+            return true;
+        }
+        PREFETCHED.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .is_some_and(|(id, windows)| *id == self.prefetch_id() && windows.covers(&window))
+        })
+    }
+
     /// Attached during reader construction, before the reader is shared.
     pub(crate) fn track_memory(&self, memory: Arc<crate::reader::ReaderMemory>) {
         if self.footer.memory.set(Arc::clone(&memory)).is_ok() {
@@ -557,6 +762,12 @@ impl RangedBlob {
             footer: Arc::clone(&self.footer),
             exact_ranges: EXACT_RANGES.with(Cell::get),
             opening_memory: None,
+            prefetched: PREFETCHED.with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .filter(|(id, _)| *id == self.prefetch_id())
+                    .map(|(_, windows)| Arc::clone(windows))
+            }),
         }
     }
 
@@ -655,6 +866,12 @@ impl OpeningMemory {
         state.pending.take()
     }
 }
+/// Bytes `vortex-file` reads from the end of a blob to open it (its maximum
+/// postscript plus the EOF marker) — the window an eager tail or a prefetch
+/// bundle must cover for a Vortex open to cost no IO.
+pub(crate) const VORTEX_FOOTER_READ_BYTES: u64 =
+    vortex::file::MAX_POSTSCRIPT_SIZE as u64 + vortex::file::EOF_SIZE as u64;
+
 /// [`VortexReadAt`] over a byte window of a [`VixRangeSource`]: every read
 /// adds the window base offset and goes through `fetch`.
 #[derive(Clone)]
@@ -665,11 +882,14 @@ pub(crate) struct BlobReadAt {
     footer: Arc<FooterState>,
     exact_ranges: bool,
     opening_memory: Option<Arc<OpeningMemory>>,
+    /// Operation-scoped windows registered for this blob, consulted before
+    /// the retained footer and the source.
+    prefetched: Option<Arc<PrefetchedWindows>>,
 }
 
 impl VortexReadAt for BlobReadAt {
     fn concurrency(&self) -> usize {
-        8
+        FETCH_CONCURRENCY
     }
 
     /// Count-only scans merge adjacent segments without fetching intervening
@@ -727,13 +947,21 @@ impl VortexReadAt for BlobReadAt {
         let source = Arc::clone(&self.source);
         let footer = Arc::clone(&self.footer);
         let opening_memory = self.opening_memory.clone();
+        let prefetched = self.prefetched.clone();
         async move {
             if operation.as_ref().is_some_and(|op| op.is_cancelled()) {
                 return Err(vortex_err!(External: VixError::Cancelled));
             }
-            let bytes =
-                fetch_footer_range(source.as_ref(), &footer, start..end, operation.as_deref())
-                    .await?;
+            let bytes = match prefetched
+                .as_ref()
+                .and_then(|windows| windows.covering(&(start..end)))
+            {
+                Some(bytes) => bytes,
+                None => {
+                    fetch_footer_range(source.as_ref(), &footer, start..end, operation.as_deref())
+                        .await?
+                }
+            };
             if operation.as_ref().is_some_and(|op| op.is_cancelled()) {
                 return Err(vortex_err!(External: VixError::Cancelled));
             }

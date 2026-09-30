@@ -81,7 +81,7 @@ use crate::{
         PROP_OVERSIZE_SKIPS, PROP_PARTIAL_FIELDS, PROP_PLIST_MIN_DOCS, PROP_ROW_COUNT,
         PROP_ROW_GROUP_SIZE, PROP_ROW_ORDER, PROP_TERM_COUNT, PROP_TOKENIZER, PROP_ZONE_MAP,
         RowOrder, RowSelection, VixContainer, ZoneEntry, column_binary, column_u32, column_u64,
-        parse_container, parse_container_ranged, parse_container_ranged_with_tail,
+        parse_container, parse_container_pair_ranged, parse_container_ranged_with_tail,
         require_supported_data_format, require_supported_index_format, scan_blob,
         scan_blob_dict_column, scan_blob_streaming, visit_blob_dict_chunks,
     },
@@ -293,6 +293,34 @@ impl<T> Admitted<Vec<T>> {
         self.value.push(value);
         Ok(())
     }
+}
+
+/// Cold read plan (D1): a field's contiguous dictionary key-block run is
+/// fetched whole in the field-scoped bundle up to this many bytes; a wider
+/// run contributes only the predecessor blocks of the keys being resolved,
+/// as the point lookups would fetch on their own.
+const PREFETCH_FIELD_BLOCKS_MAX_BYTES: u64 = 1024 * 1024;
+
+/// Cold read plan (D1): the `doc_count` leaves of a field's ordinal span are
+/// fetched ahead of the count scans up to this many leaf bytes per
+/// evaluation; wider spans read their leaves on demand.
+const PREFETCH_DOC_COUNT_MAX_BYTES: u64 = 256 * 1024;
+
+/// Cold read plan (D1): a point lookup (one exact term, an IN list) fetches
+/// its field's `doc_count` leaves ahead only when they fit one concurrent
+/// wave, so the bundle never costs more round trips than the leaf read it
+/// replaces. Range scans (top-k) read every leaf of their span regardless.
+const PREFETCH_LEAF_CONCURRENCY: usize = crate::source::FETCH_CONCURRENCY;
+
+/// Operation-scoped state of one field-scoped prefetch over the terms blob:
+/// the overlay the IO bridge consults, its admission, and the lazily mapped
+/// `doc_count` leaf table (`None` until the footer is resident; `Some(None)`
+/// for a layout the planner does not understand).
+struct FieldPrefetch {
+    windows: Arc<crate::source::PrefetchedWindows>,
+    leaves: Option<Option<Vec<crate::container::ColumnLeaf>>>,
+    pending: Option<PendingMemory>,
+    _scope: crate::source::PrefetchScope,
 }
 
 struct PointTarget {
@@ -690,13 +718,24 @@ impl VixReader {
     /// Open a core file over a ranged DATA source plus an optional ranged
     /// INDEX-sidecar source, fetching only what queries touch: each object's
     /// puffin footer (one 64 KiB tail fetch, two for oversized footers) is
-    /// parsed at open; the small dictionary DIRECTORY, the per-row-group
-    /// `fst` cells and all `terms`/`docs`/`bloom` reads load lazily at chunk
-    /// granularity from their own source. Blocks on fetches — call from a
-    /// blocking thread, never on an async executor.
+    /// parsed at open — the two tails go out in ONE round trip — the small
+    /// dictionary DIRECTORY, the per-row-group `fst` cells and all
+    /// `terms`/`docs`/`bloom` reads load lazily at chunk granularity from
+    /// their own source. Blocks on fetches — call from a blocking thread,
+    /// never on an async executor.
     pub fn open_ranged_with_index(
         source: Arc<dyn VixRangeSource>,
         index: Option<Arc<dyn VixRangeSource>>,
+    ) -> anyhow::Result<Self> {
+        Self::open_ranged_with_index_tail(source, index, crate::container::tail_fetch_size())
+    }
+
+    /// [`Self::open_ranged_with_index`] with an explicit sidecar eager-tail
+    /// size (the data object always uses the built-in 64 KiB probe).
+    pub(crate) fn open_ranged_with_index_tail(
+        source: Arc<dyn VixRangeSource>,
+        index: Option<Arc<dyn VixRangeSource>>,
+        index_tail_bytes: u64,
     ) -> anyhow::Result<Self> {
         let memory = Arc::new(ReaderMemory::new());
         let _scope = memory.enter();
@@ -705,10 +744,20 @@ impl VixReader {
                 .saturating_add(source.retained_bytes())
                 .saturating_add(index.as_ref().map_or(0, |source| source.retained_bytes())),
         )?;
-        let container = parse_container_ranged_with_tail(&source, DEFAULT_TAIL_FETCH_BYTES)?;
-        let index_container = match &index {
-            Some(source) => Some(parse_container_ranged(source)?),
-            None => None,
+        let (container, index_container) = match &index {
+            Some(index) => {
+                let (container, index_container) = parse_container_pair_ranged(
+                    &source,
+                    DEFAULT_TAIL_FETCH_BYTES,
+                    index,
+                    index_tail_bytes,
+                )?;
+                (container, Some(index_container))
+            }
+            None => (
+                parse_container_ranged_with_tail(&source, DEFAULT_TAIL_FETCH_BYTES)?,
+                None,
+            ),
         };
         Ok(Self::from_containers(container, index_container, false, 0)?)
     }
@@ -1414,9 +1463,12 @@ impl VixReader {
         Ok(self.dict_index.get().expect("set just above"))
     }
 
-    /// A field index owns only its enclosing restart pages. Disjoint slices
-    /// use scalar reads: a range-source ladder must not merge across the
-    /// unrelated global meta/first-key arrays between them.
+    /// A field index owns only its enclosing restart pages. Its five disjoint
+    /// slices (header, metas, keys page, restarts, footer) go out as ONE wave
+    /// of concurrent exact reads — one round trip on a cold sidecar instead
+    /// of the two sequential probes a header-first validation would cost —
+    /// and never as one batch: a range-source ladder must not merge across
+    /// the unrelated global meta/first-key arrays between them.
     fn field_index(&self, field_id: u16) -> Result<&crate::dict_blocks::DictIndex> {
         check_read_cancelled()?;
         crate::check_read_memory(self.memory_size())?;
@@ -1441,34 +1493,8 @@ impl VixReader {
             BlobHandle::Mem(bytes) => bytes.len() as u64,
             BlobHandle::Ranged(blob) => blob.len(),
         };
-        let fetch = |ranges: Vec<std::ops::Range<u64>>| -> Result<Vec<Bytes>> {
-            check_read_cancelled()?;
-            match blob {
-                BlobHandle::Mem(bytes) => Ok(ranges
-                    .into_iter()
-                    .map(|range| bytes.slice(range.start as usize..range.end as usize))
-                    .collect()),
-                BlobHandle::Ranged(blob) => crate::source::block_fetch_separate(
-                    blob.source.as_ref(),
-                    ranges
-                        .into_iter()
-                        .map(|range| blob.range.start + range.start..blob.range.start + range.end)
-                        .collect(),
-                ),
-            }
-        };
-        let _header_pending = self.memory.reserve(128)?;
-        let header_footer = fetch(vec![0..8, len - 4..len])?;
-        let (header, footer) = (&header_footer[0], &header_footer[1]);
         let interval = crate::dict_blocks::INDEX_RESTART_INTERVAL as u64;
         let restart_count = directory.block_count.div_ceil(interval);
-        if u64::from_le_bytes(header[..].try_into().unwrap()) != directory.block_count
-            || u64::from(u32::from_le_bytes(footer[..].try_into().unwrap())) != restart_count
-        {
-            return Err(VixError::Malformed(
-                "dict field pages header mismatch".to_string(),
-            ));
-        }
         let first = page.first_block / interval * interval;
         let end = page
             .block_end
@@ -1478,9 +1504,11 @@ impl VixReader {
         let meta_end = (end + u64::from(end < directory.block_count)) * 16 + 8;
         let restart_base = len - 4 - restart_count * 4;
         let ranges = vec![
+            0..8,
             8 + first.saturating_sub(1) * 16..meta_end,
             page.keys_start..page.keys_end,
             restart_base + first / interval * 4..restart_base + end.div_ceil(interval) * 4,
+            len - 4..len,
         ];
         let encoded = ranges.iter().try_fold(0usize, |sum, range| {
             let length = range
@@ -1494,8 +1522,28 @@ impl VixReader {
         // Prefix reconstruction uses at most the enclosing encoded key region,
         // in addition to fetched windows and the three retained typed arrays.
         let _pending = self.memory.reserve(encoded.saturating_mul(8))?;
-        let parts = fetch(ranges)?;
-        let (metas, keys, restarts) = (&parts[0], &parts[1], &parts[2]);
+        let parts = match blob {
+            BlobHandle::Mem(bytes) => ranges
+                .into_iter()
+                .map(|range| bytes.slice(range.start as usize..range.end as usize))
+                .collect(),
+            BlobHandle::Ranged(blob) => crate::source::block_fetch_separate(
+                blob.source.as_ref(),
+                ranges
+                    .into_iter()
+                    .map(|range| blob.range.start + range.start..blob.range.start + range.end)
+                    .collect(),
+            )?,
+        };
+        let (header, metas, keys, restarts, footer) =
+            (&parts[0], &parts[1], &parts[2], &parts[3], &parts[4]);
+        if u64::from_le_bytes(header[..].try_into().unwrap()) != directory.block_count
+            || u64::from(u32::from_le_bytes(footer[..].try_into().unwrap())) != restart_count
+        {
+            return Err(VixError::Malformed(
+                "dict field pages header mismatch".to_string(),
+            ));
+        }
         let parsed = crate::dict_blocks::DictIndex::parse_field(
             directory,
             page,
@@ -1656,6 +1704,323 @@ impl VixReader {
             }
             None => Err(VixError::Malformed("missing dict_blocks blob".to_string())),
         }
+    }
+
+    /// Start a field-scoped prefetch for one evaluation: an operation-scoped
+    /// overlay over the terms blob's reads that the bundles below fill.
+    /// `None` when the terms blob is in memory — nothing to fetch ahead.
+    fn begin_prefetch(&self) -> Option<FieldPrefetch> {
+        let Some(BlobHandle::Ranged(terms)) = self.terms_blob.as_ref() else {
+            return None;
+        };
+        let windows = crate::source::PrefetchedWindows::new();
+        Some(FieldPrefetch {
+            _scope: terms.prefetch_scope(Arc::clone(&windows)),
+            windows,
+            leaves: None,
+            pending: None,
+        })
+    }
+
+    /// Stage 1 of the cold read plan: ONE round trip carrying everything
+    /// whose offset the resident metadata already fixes for `targets`
+    /// (`(field id, composite key)` pairs resolved on that field's index):
+    /// each paged field's contiguous key block run (or just the predecessor
+    /// blocks of its keys when the run exceeds
+    /// [`PREFETCH_FIELD_BLOCKS_MAX_BYTES`] or the field has no page) as one
+    /// batch on the blocks blob, the terms blob's Vortex footer window when
+    /// it is not resident, and — when the footer IS resident — the
+    /// `doc_count` leaves of each paged field's ordinal span, each leaf an
+    /// exact window (count metadata is interleaved with postings; no gap is
+    /// ever offered to a coalescer). `max_leaves` bounds the leaves a point
+    /// lookup fetches ahead so it never pays more waves than its own read.
+    /// The lookups that follow then find their blocks in the cache and their
+    /// terms reads in the overlay.
+    fn prefetch_field_bundle(
+        &self,
+        prefetch: &mut FieldPrefetch,
+        targets: &[(u16, &[u8])],
+        max_leaves: Option<usize>,
+    ) -> Result<()> {
+        check_read_cancelled()?;
+        let Some(BlobHandle::Ranged(terms)) = self.terms_blob.as_ref() else {
+            return Ok(());
+        };
+        let Some(BlobHandle::Ranged(blocks_blob)) = self.dict_blocks_blob.as_ref() else {
+            return Ok(());
+        };
+        if self.term_count == 0 || targets.is_empty() {
+            return Ok(());
+        }
+        let blob_len = self.dict_blocks_len()?;
+        let mut fields: Vec<u16> = Vec::with_capacity(targets.len());
+        for &(fid, _) in targets {
+            if !fields.contains(&fid) {
+                fields.push(fid);
+            }
+        }
+        struct Run<'a> {
+            index: &'a crate::dict_blocks::DictIndex,
+            blocks: Range<usize>,
+            bytes: Range<u64>,
+        }
+        // Key block runs: one gap-coalescable batch on the blocks blob.
+        let mut runs: Vec<Run<'_>> = Vec::new();
+        let mut spans: Vec<Range<u64>> = Vec::with_capacity(fields.len());
+        for fid in fields {
+            check_read_cancelled()?;
+            let paged = self.dict_field_pages.as_ref().is_some_and(|directory| {
+                directory
+                    .pages
+                    .binary_search_by_key(&fid, |page| page.field_id)
+                    .is_ok()
+            });
+            let index = self.field_index(fid)?;
+            let blocks = index.field_blocks();
+            if blocks.is_empty() {
+                continue;
+            }
+            let run = index.block_range(blocks.start, blob_len).start
+                ..index.block_range(blocks.end - 1, blob_len).end;
+            let whole_run = paged && run.end - run.start <= PREFETCH_FIELD_BLOCKS_MAX_BYTES;
+            let mut wanted: Vec<usize> = if whole_run {
+                blocks.clone().collect()
+            } else {
+                let mut wanted = Vec::new();
+                for (_, key) in targets.iter().filter(|(field, _)| *field == fid) {
+                    if let Some(block) = index.predecessor_block(key)?
+                        && blocks.contains(&block)
+                    {
+                        wanted.push(block);
+                    }
+                }
+                wanted.sort_unstable();
+                wanted.dedup();
+                wanted
+            };
+            {
+                let cache = self.block_cache.lock();
+                wanted.retain(|&b| !cache.0.contains_key(&(index.meta(b).0 as usize)));
+            }
+            if whole_run && let (Some(&first), Some(&last)) = (wanted.first(), wanted.last()) {
+                // One range per field: re-reading a cached block in the
+                // middle costs bytes within the cap, never another range.
+                wanted = (first..=last).collect();
+            }
+            for b in wanted {
+                let bytes = index.block_range(b, blob_len);
+                match runs.last_mut() {
+                    Some(last)
+                        if std::ptr::eq(last.index, index)
+                            && last.blocks.end == b
+                            && last.bytes.end == bytes.start =>
+                    {
+                        last.blocks.end = b + 1;
+                        last.bytes.end = bytes.end;
+                    }
+                    _ => runs.push(Run {
+                        index,
+                        blocks: b..b + 1,
+                        bytes,
+                    }),
+                }
+            }
+            if paged {
+                let last = blocks.end - 1;
+                spans.push(
+                    index.meta(blocks.start).1
+                        ..index.meta(last).1 + index.block_key_count(last, self.term_count),
+                );
+            }
+        }
+        // Terms windows: the footer when not resident, else the leaves.
+        let footer_window = (!terms.footer_resident()).then(|| terms.footer_window());
+        let leaf_windows = match footer_window {
+            Some(_) => Vec::new(),
+            None => self.plan_leaf_windows(prefetch, terms, &spans, max_leaves)?,
+        };
+        if runs.is_empty() && footer_window.is_none() && leaf_windows.is_empty() {
+            return Ok(());
+        }
+        let mut batches: Vec<(&dyn VixRangeSource, Vec<Range<u64>>)> =
+            Vec::with_capacity(2 + leaf_windows.len());
+        if !runs.is_empty() {
+            batches.push((
+                blocks_blob.source.as_ref(),
+                runs.iter()
+                    .map(|run| {
+                        blocks_blob.range.start + run.bytes.start
+                            ..blocks_blob.range.start + run.bytes.end
+                    })
+                    .collect(),
+            ));
+        }
+        if let Some(window) = &footer_window {
+            batches.push((terms.source.as_ref(), vec![window.clone()]));
+        }
+        for window in &leaf_windows {
+            batches.push((terms.source.as_ref(), vec![window.clone()]));
+        }
+        let total = batches
+            .iter()
+            .flat_map(|(_, ranges)| ranges)
+            .map(|range| usize::try_from(range.end - range.start).unwrap_or(usize::MAX))
+            .fold(0usize, usize::saturating_add);
+        // Fetched slices, their compact copies and the cached block copies.
+        let _transient = self.memory.reserve(total.saturating_mul(3))?;
+        let mut fetched = crate::source::block_fetch_bundle(batches)?.into_iter();
+        if !runs.is_empty() {
+            let blocks = fetched.next().expect("blocks batch");
+            let mut cache = self.block_cache.lock();
+            for (run, bytes) in runs.iter().zip(&blocks) {
+                check_read_cancelled()?;
+                for b in run.blocks.clone() {
+                    let block = run.index.block_range(b, blob_len);
+                    let slice = bytes.slice(
+                        (block.start - run.bytes.start) as usize
+                            ..(block.end - run.bytes.start) as usize,
+                    );
+                    self.cache_dict_block(&mut cache, block.start as usize, &slice)?;
+                }
+            }
+            drop(cache);
+            self.memory.notify();
+        }
+        if let Some(window) = footer_window {
+            let bytes = fetched.next().expect("footer batch");
+            self.retain_prefetched(prefetch, window, &bytes[0])?;
+        }
+        for (window, bytes) in leaf_windows.into_iter().zip(fetched) {
+            self.retain_prefetched(prefetch, window, &bytes[0])?;
+        }
+        Ok(())
+    }
+
+    /// Stage 2 of the cold read plan: once the ordinals an evaluation will
+    /// count are known and the terms footer is resident, fetch every
+    /// `doc_count` leaf they touch in ONE round trip (exact windows, up to
+    /// the bridge concurrency at a time), so the scans that follow perform
+    /// no IO. A no-op when the footer would still cost a round trip (the
+    /// scan then pays exactly that one) or the windows are already covered.
+    fn prefetch_doc_count_leaves(
+        &self,
+        prefetch: &mut FieldPrefetch,
+        spans: &[Range<u64>],
+    ) -> Result<()> {
+        check_read_cancelled()?;
+        let Some(BlobHandle::Ranged(terms)) = self.terms_blob.as_ref() else {
+            return Ok(());
+        };
+        if !terms.footer_resident() {
+            return Ok(());
+        }
+        let windows = self.plan_leaf_windows(prefetch, terms, spans, None)?;
+        if windows.is_empty() {
+            return Ok(());
+        }
+        let total = windows
+            .iter()
+            .map(|range| usize::try_from(range.end - range.start).unwrap_or(usize::MAX))
+            .fold(0usize, usize::saturating_add);
+        let _transient = self.memory.reserve(total.saturating_mul(2))?;
+        let fetched = crate::source::block_fetch_bundle(
+            windows
+                .iter()
+                .map(|window| {
+                    (
+                        terms.source.as_ref() as &dyn VixRangeSource,
+                        vec![window.clone()],
+                    )
+                })
+                .collect(),
+        )?;
+        for (window, bytes) in windows.into_iter().zip(fetched) {
+            self.retain_prefetched(prefetch, window, &bytes[0])?;
+        }
+        Ok(())
+    }
+
+    /// The absolute, not-yet-resident `doc_count` leaf windows of the terms
+    /// blob covering `spans` (ordinal ranges), admitted span by span in order
+    /// while the running total stays within [`PREFETCH_DOC_COUNT_MAX_BYTES`]
+    /// and, when `max_leaves` is given, that many windows. Requires a
+    /// resident terms footer (the leaf map comes from it without IO); an
+    /// unmappable layout plans nothing.
+    fn plan_leaf_windows(
+        &self,
+        prefetch: &mut FieldPrefetch,
+        terms: &crate::source::RangedBlob,
+        spans: &[Range<u64>],
+        max_leaves: Option<usize>,
+    ) -> Result<Vec<Range<u64>>> {
+        if spans.iter().all(Range::is_empty) {
+            return Ok(Vec::new());
+        }
+        if prefetch.leaves.is_none() {
+            let terms_blob = self
+                .terms_blob
+                .as_ref()
+                .ok_or_else(|| VixError::Malformed("missing terms blob".to_string()))?;
+            let _scope = self.memory.enter();
+            prefetch.leaves = Some(crate::container::blob_column_leaves(
+                terms_blob,
+                "doc_count",
+            )?);
+        }
+        let Some(leaves) = prefetch.leaves.as_ref().and_then(Option::as_ref) else {
+            return Ok(Vec::new());
+        };
+        let mut planned: Vec<Range<u64>> = Vec::new();
+        let mut planned_bytes = 0u64;
+        for span in spans.iter().filter(|span| !span.is_empty()) {
+            check_read_cancelled()?;
+            let first = leaves.partition_point(|leaf| leaf.rows.end <= span.start);
+            let mut candidate: Vec<Range<u64>> = Vec::new();
+            let mut candidate_bytes = 0u64;
+            for leaf in leaves[first..]
+                .iter()
+                .take_while(|leaf| leaf.rows.start < span.end)
+            {
+                let window =
+                    terms.range.start + leaf.bytes.start..terms.range.start + leaf.bytes.end;
+                if prefetch.windows.covers(&window)
+                    || terms.source.resident(window.clone()).is_some()
+                    || planned.contains(&window)
+                    || candidate.contains(&window)
+                {
+                    continue;
+                }
+                candidate_bytes += window.end - window.start;
+                candidate.push(window);
+            }
+            if planned_bytes + candidate_bytes > PREFETCH_DOC_COUNT_MAX_BYTES
+                || max_leaves.is_some_and(|max| planned.len() + candidate.len() > max)
+            {
+                continue;
+            }
+            planned_bytes += candidate_bytes;
+            planned.extend(candidate);
+        }
+        planned.sort_unstable_by_key(|window| window.start);
+        Ok(planned)
+    }
+
+    /// Admit and register one prefetched window for the operation's lifetime.
+    fn retain_prefetched(
+        &self,
+        prefetch: &mut FieldPrefetch,
+        window: Range<u64>,
+        bytes: &Bytes,
+    ) -> Result<()> {
+        let pending = self
+            .memory
+            .reserve(bytes.len().saturating_add(RETAINED_BYTES_OVERHEAD))?;
+        prefetch.pending = Some(match prefetch.pending.take() {
+            Some(previous) => previous.merge(pending),
+            None => pending,
+        });
+        prefetch.windows.add(window, compact_bytes(bytes.clone()));
+        Ok(())
     }
 
     /// The raw `tokenizer` file property (merge compatibility checks).
@@ -2516,18 +2881,59 @@ impl VixReader {
         {
             return Ok(None);
         }
-        let field_docs = match self.lookup_exact(&self.composite(field.as_bytes(), KEY_FIELD_ID))? {
-            Some(ordinal) => self.read_doc_count(ordinal)?,
-            None => 0,
-        };
+        // Cold read plan, stage 1: the key-terms block, the value field's key
+        // block run, the terms footer (unless resident) and — when it is —
+        // both ordinal spans' doc_count leaves, in one batch.
+        let key = self.composite(field.as_bytes(), KEY_FIELD_ID);
+        let value_field = self.field_id(field);
+        let mut prefetch = self.begin_prefetch();
+        if let Some(prefetch) = prefetch.as_mut() {
+            let mut targets: Vec<(u16, Vec<u8>)> = vec![(KEY_FIELD_ID, key.clone())];
+            if let Some(field_id) = value_field {
+                // The boundary keys `string_value_ordinal_ranges` probes on
+                // this field's index (the upper fence names the next field
+                // but resolves to this field's last block).
+                let (lower, upper) = Self::v2_field_range(field_id);
+                let (num_lower, num_upper) =
+                    Self::v2_prefix_range(field_id, &[crate::numeric::NUMERIC_TERM_TAG]);
+                targets.extend(
+                    [lower.to_vec(), num_lower, num_upper, upper.to_vec()]
+                        .into_iter()
+                        .map(|key| (field_id, key)),
+                );
+            }
+            let targets: Vec<(u16, &[u8])> = targets
+                .iter()
+                .map(|(field, key)| (*field, key.as_slice()))
+                .collect();
+            self.prefetch_field_bundle(prefetch, &targets, None)?;
+        }
+        let key_ordinal = self.lookup_exact(&key)?;
         // The oversize-skip allowance: skipped values have key terms but no
         // value term, so they legitimately account for a shortfall — the
         // served top-k then omits them (the 2026-08-12 trade).
         let skips = self.field_oversize_skips(field);
-        let Some(field_id) = self.field_id(field) else {
+        let Some(field_id) = value_field else {
+            let field_docs = match key_ordinal {
+                Some(ordinal) => self.read_doc_count(ordinal)?,
+                None => 0,
+            };
             return Ok((field_docs == skips).then(|| (Vec::new(), false)));
         };
         let ranges = self.string_value_ordinal_ranges(field_id)?;
+        // Stage 2: every doc_count leaf the counts below touch, in one batch
+        // (a no-op when stage 1 already covered them).
+        if let Some(prefetch) = prefetch.as_mut() {
+            let mut spans: Vec<Range<u64>> = ranges.to_vec();
+            if let Some(ordinal) = key_ordinal {
+                spans.insert(0, ordinal..ordinal + 1);
+            }
+            self.prefetch_doc_count_leaves(prefetch, &spans)?;
+        }
+        let field_docs = match key_ordinal {
+            Some(ordinal) => self.read_doc_count(ordinal)?,
+            None => 0,
+        };
         let total_strings: u64 = ranges.iter().map(|r| r.end - r.start).sum();
         if total_strings == 0 {
             // no string value terms at all: exact iff every doc carrying
@@ -3640,6 +4046,13 @@ impl VixReader {
             // (exact — one term's postings hold distinct docs), multiple
             // terms may share documents and need the postings union
             leaf => {
+                // Cold read plan: fetch the leaf's key block(s), the terms
+                // footer and (when it is resident) the field's doc_count
+                // leaves in one batch before the point lookup below.
+                let mut prefetch = self.begin_prefetch();
+                if let Some(prefetch) = prefetch.as_mut() {
+                    self.prefetch_point_leaf(prefetch, leaf)?;
+                }
                 let mut ordinals = self.collect_ordinals(leaf, scope)?;
                 match ordinals.value.len() {
                     0 => Ok(0),
@@ -3669,6 +4082,20 @@ impl VixReader {
         {
             return Ok(None);
         }
+        let mut prefetch = self.begin_prefetch();
+        if let Some(prefetch) = prefetch.as_mut()
+            && let Some(fid) = self.field_id(field)
+        {
+            let keys: Vec<Vec<u8>> = subs
+                .iter()
+                .filter_map(|sub| match sub {
+                    VixQuery::Exact { token, .. } => Some(self.composite(token, fid)),
+                    _ => None,
+                })
+                .collect();
+            let targets: Vec<(u16, &[u8])> = keys.iter().map(|key| (fid, key.as_slice())).collect();
+            self.prefetch_field_bundle(prefetch, &targets, Some(PREFETCH_LEAF_CONCURRENCY))?;
+        }
         let resolved = self.resolve_point_run(subs, None)?;
         let mut ordinals = self.query_vec::<u64>(subs.len())?;
         for leaf in resolved.value {
@@ -3687,6 +4114,27 @@ impl VixReader {
             _ => self.postings_union(ordinals.value)?.count_set_bits() as u64,
         };
         Ok(Some(count))
+    }
+
+    /// The stage-1 bundle for one point leaf: the composite key of an exact
+    /// value term or a key-exists path. Other leaves scan dictionaries and
+    /// plan nothing ahead.
+    fn prefetch_point_leaf(&self, prefetch: &mut FieldPrefetch, leaf: &VixQuery) -> Result<()> {
+        let (fid, key) = match leaf {
+            VixQuery::Exact { field, token } => match self.field_id(field) {
+                Some(fid) => (fid, self.composite(token, fid)),
+                None => return Ok(()),
+            },
+            VixQuery::KeyExists { path } => {
+                (KEY_FIELD_ID, self.composite(path.as_bytes(), KEY_FIELD_ID))
+            }
+            _ => return Ok(()),
+        };
+        self.prefetch_field_bundle(
+            prefetch,
+            &[(fid, key.as_slice())],
+            Some(PREFETCH_LEAF_CONCURRENCY),
+        )
     }
 
     fn sum_disjoint_doc_counts(&self, ordinals: &[u64]) -> Result<u64> {
@@ -4706,6 +5154,11 @@ pub(crate) type DebugTerm = (Vec<u8>, u64, std::collections::BTreeSet<u32>);
 
 #[cfg(test)]
 impl VixReader {
+    /// Test-only: the `terms` blob handle (read-plan tests open it directly).
+    pub(crate) fn terms_blob_for_tests(&self) -> Option<&BlobHandle> {
+        self.terms_blob.as_ref()
+    }
+
     /// Test-only: every composite term of the file — raw key bytes,
     /// `doc_count` and the decoded doc-id set — in global ordinal order.
     /// The workhorse of extraction-parity assertions.

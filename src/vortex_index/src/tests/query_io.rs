@@ -1253,16 +1253,19 @@ fn indexed_reader() -> (Arc<VixReader>, Arc<LoggedSource>, Arc<LoggedSource>) {
     (reader, data, index)
 }
 
+/// The blob directly before the `dict` directory (`terms` since the D2 blob
+/// order; `bloom` before it) straddles the eager tail: the directory must
+/// still be sliced from the one tail probe, never fetched a second time.
 #[test]
-fn directory_after_large_bloom_avoids_another_directory_fetch() {
+fn directory_after_large_terms_blob_avoids_another_directory_fetch() {
     let (_, bytes) = &*INDEXED;
     let directory = blob_range(bytes, BLOB_TAG_DICT);
-    let bloom = blob_range(bytes, container::BLOB_TAG_BLOOM);
-    assert_eq!(bloom.end, directory.start);
+    let terms = blob_range(bytes, container::BLOB_TAG_TERMS);
+    assert_eq!(terms.end, directory.start);
     let tail = bytes.len() as u64 - directory.start;
     assert!(
-        bloom.end - bloom.start > tail,
-        "fixture Bloom must exceed directory plus footer"
+        terms.end - terms.start > tail,
+        "fixture terms blob must exceed directory plus footer"
     );
     let source = LoggedSource::new(bytes.clone());
     let parsed = ranged_container(&source, tail);

@@ -253,12 +253,14 @@ impl NativeReadSetup {
 /// Bytes fetched from the object tail when opening ranged: covers the puffin
 /// footer (a small JSON payload) in one read for all but pathological files,
 /// and doubles as a window small blobs are sliced from for free.
+///
 /// Default eager tail size; overridable via [`set_tail_fetch_size`]
-/// (`ZO_VIX_EAGER_TAIL_BYTES`). Sidecars lay their small, hot blobs
-/// (`bloom`, then `dict` block index) LAST — nearest the footer — so a tail
-/// large enough to cover them turns a cold sidecar open + term eval into
-/// ONE ranged fetch. On prod, cold evals averaged ~8-9 GETs per file
-/// before this was tunable.
+/// (`ZO_VIX_EAGER_TAIL_BYTES`). Sidecars lay their small, hot blobs LAST —
+/// nearest the footer: the `dict` block index, and directly before it the
+/// `terms` blob whose own Vortex footer (its last 65,535 bytes) then shares
+/// the tail — so a tail large enough to cover them turns a cold sidecar open
+/// plus term eval into ONE ranged fetch. On prod, cold evals averaged ~8-9
+/// GETs per file before this was tunable.
 pub const DEFAULT_TAIL_FETCH_BYTES: u64 = 64 * 1024;
 static TAIL_FETCH_OVERRIDE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -268,7 +270,7 @@ pub fn set_tail_fetch_size(bytes: u64) {
     TAIL_FETCH_OVERRIDE.store(bytes, std::sync::atomic::Ordering::Relaxed);
 }
 
-fn tail_fetch_size() -> u64 {
+pub(crate) fn tail_fetch_size() -> u64 {
     match TAIL_FETCH_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
         0 => DEFAULT_TAIL_FETCH_BYTES,
         v => v.max(MIN_FILE_SIZE),
@@ -732,6 +734,14 @@ impl VixRangeSource for TailRangeSource {
         self.source.describe()
     }
 
+    fn resident(&self, range: std::ops::Range<u64>) -> Option<Bytes> {
+        let end = self.start + self.bytes.len() as u64;
+        (range.start <= range.end && self.start <= range.start && range.end <= end).then(|| {
+            self.bytes
+                .slice((range.start - self.start) as usize..(range.end - self.start) as usize)
+        })
+    }
+
     fn for_current_operation(&self) -> Option<Arc<dyn VixRangeSource>> {
         self.source.for_current_operation().map(|source| {
             Arc::new(Self {
@@ -851,82 +861,145 @@ pub(crate) fn parse_container_ranged_with_tail(
     source: &Arc<dyn VixRangeSource>,
     eager_tail_bytes: u64,
 ) -> Result<VixContainer> {
-    let total = source.len();
-    if total < MIN_FILE_SIZE {
-        return Err(VixError::Malformed(format!(
-            "file too small to be a puffin container: {total} bytes"
-        )));
-    }
+    let probe = TailProbe::plan(source, eager_tail_bytes)?;
+    let tail = block_fetch(source.as_ref(), probe.range())?;
+    probe.finish(tail)
+}
 
-    // Tail probe. The footer region is `HeadMagic[4] + payload + FOOTER_SIZE`
-    // at the very end of the file; read the payload size out of the footer
-    // tail and fetch only its missing prefix when the probe fell short.
-    let mut tail_start = total.saturating_sub(eager_tail_bytes.max(MIN_FILE_SIZE));
-    let memory = crate::source::current_reader_memory();
-    // Tail buffers, compaction copies and at most seven recognized blob
-    // slices coexist until the container has been incorporated in the reader.
-    let tail_pending = memory.reserve(
-        usize::try_from(total - tail_start)
-            .unwrap_or(usize::MAX)
-            .saturating_mul(9),
+/// Parse a DATA object and its INDEX sidecar with their two independent tail
+/// probes issued in ONE round trip (each probe's optional footer-prefix
+/// follow-up stays a separate, rare read). Same result as parsing the two
+/// containers one after the other.
+pub(crate) fn parse_container_pair_ranged(
+    data: &Arc<dyn VixRangeSource>,
+    data_tail_bytes: u64,
+    index: &Arc<dyn VixRangeSource>,
+    index_tail_bytes: u64,
+) -> Result<(VixContainer, VixContainer)> {
+    let data_probe = TailProbe::plan(data, data_tail_bytes)?;
+    let index_probe = TailProbe::plan(index, index_tail_bytes)?;
+    let (data_tail, index_tail) = crate::source::block_fetch_pair(
+        data.as_ref(),
+        data_probe.range(),
+        index.as_ref(),
+        index_probe.range(),
     )?;
-    let mut tail = block_fetch(source.as_ref(), tail_start..total)?;
-    let footer_tail = &tail[tail.len() - FOOTER_SIZE as usize..];
-    if footer_tail[(FOOTER_SIZE - MAGIC_SIZE) as usize..] != MAGIC {
-        return Err(VixError::Malformed(format!(
-            "puffin footer magic mismatch in {}",
-            source.describe()
-        )));
-    }
-    let payload_size = u64::from(u32::from_le_bytes(
-        footer_tail[..FOOTER_PAYLOAD_SIZE_SIZE as usize]
-            .try_into()
-            .expect("fixed 4-byte slice"),
-    ));
-    let footer_region = MAGIC_SIZE + payload_size + FOOTER_SIZE;
-    if footer_region > total {
-        return Err(VixError::Malformed(format!(
-            "puffin footer payload of {payload_size} bytes exceeds the file size {total}"
-        )));
-    }
-    let pending = memory.reserve(metadata_memory_bound(
-        usize::try_from(footer_region).unwrap_or(usize::MAX),
-    ))?;
-    if footer_region > tail.len() as u64 {
-        let footer_start = total - footer_region;
-        let prefix = block_fetch(source.as_ref(), footer_start..tail_start)?;
-        let mut complete = BytesMut::with_capacity(footer_region as usize);
-        complete.extend_from_slice(&prefix);
-        complete.extend_from_slice(&tail);
-        tail = complete.freeze();
-        tail_start = footer_start;
+    Ok((
+        data_probe.finish(data_tail)?,
+        index_probe.finish(index_tail)?,
+    ))
+}
+
+/// One planned eager-tail probe of a ranged container: the tail window and
+/// its memory admission, separated from the fetch so several probes can share
+/// one round trip.
+struct TailProbe<'a> {
+    source: &'a Arc<dyn VixRangeSource>,
+    total: u64,
+    tail_start: u64,
+    memory: Arc<crate::reader::ReaderMemory>,
+    tail_pending: crate::reader::PendingMemory,
+}
+
+impl<'a> TailProbe<'a> {
+    fn plan(source: &'a Arc<dyn VixRangeSource>, eager_tail_bytes: u64) -> Result<Self> {
+        let total = source.len();
+        if total < MIN_FILE_SIZE {
+            return Err(VixError::Malformed(format!(
+                "file too small to be a puffin container: {total} bytes"
+            )));
+        }
+        // Tail probe. The footer region is `HeadMagic[4] + payload + FOOTER_SIZE`
+        // at the very end of the file; `finish` reads the payload size out of
+        // the footer tail and fetches only its missing prefix when the probe
+        // fell short.
+        let tail_start = total.saturating_sub(eager_tail_bytes.max(MIN_FILE_SIZE));
+        let memory = crate::source::current_reader_memory();
+        // Tail buffers, compaction copies and at most seven recognized blob
+        // slices coexist until the container has been incorporated in the reader.
+        let tail_pending = memory.reserve(
+            usize::try_from(total - tail_start)
+                .unwrap_or(usize::MAX)
+                .saturating_mul(9),
+        )?;
+        Ok(Self {
+            source,
+            total,
+            tail_start,
+            memory,
+            tail_pending,
+        })
     }
 
-    // The parser only looks at end-anchored offsets, so the fetched suffix
-    // parses exactly like the whole file would.
-    let meta = parse_puffin_footer_from_bytes(&tail)
-        .map_err(|e| VixError::Malformed(format!("puffin footer: {e:#}")))?;
-    let mut container = container_from_meta(meta, total, |range| {
-        if range.start >= tail_start {
-            // Compact ownership: cache-ladder Bytes may pin the entire object.
-            let start = (range.start - tail_start) as usize;
-            let end = (range.end - tail_start) as usize;
-            BlobHandle::Mem(Bytes::copy_from_slice(&tail[start..end]))
-        } else if range.end > tail_start {
-            let source: Arc<dyn VixRangeSource> = Arc::new(TailRangeSource {
-                source: Arc::clone(source),
-                start: tail_start,
-                bytes: Bytes::copy_from_slice(&tail[..(range.end - tail_start) as usize]),
-            });
-            BlobHandle::Ranged(RangedBlob::new(source, range))
-        } else {
-            BlobHandle::Ranged(RangedBlob::new(Arc::clone(source), range))
+    fn range(&self) -> std::ops::Range<u64> {
+        self.tail_start..self.total
+    }
+
+    fn finish(self, mut tail: Bytes) -> Result<VixContainer> {
+        let Self {
+            source,
+            total,
+            mut tail_start,
+            memory,
+            tail_pending,
+        } = self;
+        let footer_tail = &tail[tail.len() - FOOTER_SIZE as usize..];
+        if footer_tail[(FOOTER_SIZE - MAGIC_SIZE) as usize..] != MAGIC {
+            return Err(VixError::Malformed(format!(
+                "puffin footer magic mismatch in {}",
+                source.describe()
+            )));
         }
-    })?;
-    // Keep the tail/copy reservation through publication too. Combining the
-    // reservations is allocation-free and does not momentarily drop ownership.
-    container.pending_memory = Some(pending.merge(tail_pending));
-    Ok(container)
+        let payload_size = u64::from(u32::from_le_bytes(
+            footer_tail[..FOOTER_PAYLOAD_SIZE_SIZE as usize]
+                .try_into()
+                .expect("fixed 4-byte slice"),
+        ));
+        let footer_region = MAGIC_SIZE + payload_size + FOOTER_SIZE;
+        if footer_region > total {
+            return Err(VixError::Malformed(format!(
+                "puffin footer payload of {payload_size} bytes exceeds the file size {total}"
+            )));
+        }
+        let pending = memory.reserve(metadata_memory_bound(
+            usize::try_from(footer_region).unwrap_or(usize::MAX),
+        ))?;
+        if footer_region > tail.len() as u64 {
+            let footer_start = total - footer_region;
+            let prefix = block_fetch(source.as_ref(), footer_start..tail_start)?;
+            let mut complete = BytesMut::with_capacity(footer_region as usize);
+            complete.extend_from_slice(&prefix);
+            complete.extend_from_slice(&tail);
+            tail = complete.freeze();
+            tail_start = footer_start;
+        }
+
+        // The parser only looks at end-anchored offsets, so the fetched suffix
+        // parses exactly like the whole file would.
+        let meta = parse_puffin_footer_from_bytes(&tail)
+            .map_err(|e| VixError::Malformed(format!("puffin footer: {e:#}")))?;
+        let mut container = container_from_meta(meta, total, |range| {
+            if range.start >= tail_start {
+                // Compact ownership: cache-ladder Bytes may pin the entire object.
+                let start = (range.start - tail_start) as usize;
+                let end = (range.end - tail_start) as usize;
+                BlobHandle::Mem(Bytes::copy_from_slice(&tail[start..end]))
+            } else if range.end > tail_start {
+                let source: Arc<dyn VixRangeSource> = Arc::new(TailRangeSource {
+                    source: Arc::clone(source),
+                    start: tail_start,
+                    bytes: Bytes::copy_from_slice(&tail[..(range.end - tail_start) as usize]),
+                });
+                BlobHandle::Ranged(RangedBlob::new(source, range))
+            } else {
+                BlobHandle::Ranged(RangedBlob::new(Arc::clone(source), range))
+            }
+        })?;
+        // Keep the tail/copy reservation through publication too. Combining the
+        // reservations is allocation-free and does not momentarily drop ownership.
+        container.pending_memory = Some(pending.merge(tail_pending));
+        Ok(container)
+    }
 }
 
 /// One produced blob awaiting container assembly: in memory (small blobs,
@@ -2368,6 +2441,102 @@ pub(crate) fn scan_blob_streaming(
         pool.shutdown_background();
     }
     Ok(())
+}
+
+/// One stored leaf of a column: the rows it holds and the byte window a
+/// scan reads for it (blob-relative, start aligned down like vortex's IO
+/// coalescer does, so the window equals the read the scan will issue).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ColumnLeaf {
+    pub rows: std::ops::Range<u64>,
+    pub bytes: std::ops::Range<u64>,
+}
+
+/// Every stored leaf of top-level `column`, in row order, from the layout
+/// tree alone (footer metadata — no data reads; a ranged blob whose footer
+/// is resident opens without IO). Same layout-kind-agnostic walk as
+/// [`column_leaf_boundaries`]; `Ok(None)` for shapes outside that contract
+/// or an absent column, which callers treat as "cannot plan ahead".
+pub(crate) fn blob_column_leaves(
+    blob: &BlobHandle,
+    column: &str,
+) -> Result<Option<Vec<ColumnLeaf>>> {
+    use vortex::layout::LayoutChildType;
+
+    fn collect(
+        layout: &vortex::layout::LayoutRef,
+        base: u64,
+        segments: &[vortex::file::SegmentSpec],
+        align: u64,
+        out: &mut Vec<ColumnLeaf>,
+    ) -> bool {
+        let types: Vec<LayoutChildType> = layout.child_types().collect();
+        let mut row_children: Vec<(u64, vortex::layout::LayoutRef)> = Vec::new();
+        let mut transparent = 0usize;
+        for (index, ty) in types.iter().enumerate() {
+            let child_base = match ty {
+                LayoutChildType::Chunk((_, offset)) => base + offset,
+                LayoutChildType::Transparent(_) => {
+                    transparent += 1;
+                    base
+                }
+                LayoutChildType::Auxiliary(_) => continue,
+                LayoutChildType::Field(_) => return false,
+            };
+            let Ok(child) = layout.child(index) else {
+                return false;
+            };
+            row_children.push((child_base, child));
+        }
+        if transparent > 1 || (transparent == 1 && row_children.len() > 1) {
+            return false;
+        }
+        if row_children.is_empty() {
+            let rows = base..base + layout.row_count();
+            for id in layout.segment_ids() {
+                let Some(segment) = segments.get(*id as usize) else {
+                    return false;
+                };
+                let start = segment.offset - segment.offset % align;
+                out.push(ColumnLeaf {
+                    rows: rows.clone(),
+                    bytes: start..segment.offset + u64::from(segment.length),
+                });
+            }
+            return true;
+        }
+        row_children
+            .into_iter()
+            .all(|(child_base, child)| collect(&child, child_base, segments, align, out))
+    }
+
+    let setup = NativeReadSetup::new()?;
+    let runtime = SingleThreadRuntime::default();
+    let session = setup.session(runtime.handle());
+    let vxf = open_blob(&runtime, &session, blob)?;
+    let footer = vxf.footer();
+    let root = footer.layout().clone();
+    let Some(index) = root.child_names().position(|name| name.as_ref() == column) else {
+        return Ok(None);
+    };
+    if !matches!(root.child_type(index), LayoutChildType::Field(_)) {
+        return Ok(None);
+    }
+    let Ok(child) = root.child(index) else {
+        return Ok(None);
+    };
+    let segments = footer.segment_map();
+    let align = segments
+        .iter()
+        .map(|segment| *segment.alignment as u64)
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let mut leaves = Vec::new();
+    if !collect(&child, 0, segments, align, &mut leaves) {
+        return Ok(None);
+    }
+    Ok(Some(leaves))
 }
 
 /// File-level `(min, max)` of one numeric column, straight from the vortex
