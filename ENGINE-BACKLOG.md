@@ -214,6 +214,42 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     per-AZ endpoint is the usual fix (unmeasured here); (3) persistent
     evaluation/reader caches across restarts so 7 d windows are not cold
     after every roll (today's three restarts each wiped 45 % → 0 %).
+- **`.182` shipped (vix-arch `518f7f42f`, GitOps #581, queriers 15:40–15:42Z,
+  0 restarts) with `ZO_VIX_SEARCH_CONCURRENCY` 64 → 192.** Owner ruled out
+  boot warm-up and `doc_count` inlining; the remaining lever was making
+  fan-out effective. Root cause of the 11:58Z failure confirmed in code:
+  `evaluation_working_bytes` pre-reserved a flat 32 MiB workspace per
+  evaluation (plus bitmaps/clamp), so the 4 GiB gate (3.5 GiB after the
+  budget/8 growth headroom) admitted ~112. `.182` declares the measured
+  footprint for admission-time-provable index-only, fully-covered shapes
+  (`SimpleCount` except the chunk-stats numeric route; condition-all
+  single-field `SimpleTopN`/`SimpleDistinct`; single-bucket IN
+  `SimpleMultiHistogram`): 2 × (tails 320 KiB + prefetch caps 1.25 MiB +
+  terms footer 64 KiB + native session 64 KiB) + bitmaps + 256 B × 1,001
+  group entries = **4.11 MiB count / 4.59 MiB top-N at 770k rows → ~800
+  admitted**; every other shape keeps the old declaration. Measured owned
+  peaks ride on top unchanged (1.93 MiB exact count, 5.5 MiB top-N on the
+  100k-row fixture); each eligible shape completes under a private gate of
+  exactly declaration + owned with no growth wait. `search vix` 194 tests.
+  - **Cold-vs-cold A/B (after-state colder: fresh pods, 0 % caches), same
+    7 d window, `.181`@64 → `.182`@192:** traces count `service_name=
+    'e2b-api'` **41.6 → 16.9 s (−59 %)**; traces top-10 `span_status`
+    **54.7 → 20.7 s (−62 %)**; logs count svc **30.0 → 12.7 s (−58 %)**.
+    Versus this morning's `.179` numbers (85.0 / 90.8 / 51.6 s): **−80 %**.
+    `evaluation_wait_us` 5,500 s → ~1 s per query; active S3 latency
+    unchanged at ~96 ms/read despite 2.5× the in-flight reads; CPU ~3
+    cores of 16; no growth timeouts, no `budget_refused`.
+  - New binding limit: the 256-wide `ZO_VIX_FETCH_CONCURRENCY` gate —
+    `queue_us` 690 / 859 / 312 s per query (≈ 19 ms per read on top of
+    96 ms active). Raise to 512 with the next querier roll (`.183`), not
+    alone — each roll costs a cold cache.
+  - Lazy data-container open (skip the `.vix` 64 KiB tail for index-only
+    evaluations, −1 read/file) assessed and deferred: `from_containers`
+    consumes row_count/row_group_size/zone_map/row_order/row_regions/
+    columns/stats at construction — a deep reader refactor for ~15 % of
+    reads at zero depth (the tail is fetched in parallel with the sidecar
+    tail). The metadata tier (`.183`) keeps that tail, so repeated queries
+    get the saving anyway.
 
 ## 2026-09-29 — P2 shipped as `.176` and rolled back within 30 min: the per-stream side table stalled the shared meta DB (commit latency 40–60×, ingest 503s); ranges must live in the segment row
 - What shipped (vix-arch `013c45010` + NATS retry `76fe754b5`, image
