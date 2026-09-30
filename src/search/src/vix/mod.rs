@@ -872,10 +872,13 @@ pub async fn vix_search(
     scan_stats.idx_scan_size = fetch_stats.bytes.load(std::sync::atomic::Ordering::Relaxed) as i64;
     let load =
         |counter: &std::sync::atomic::AtomicU64| counter.load(std::sync::atomic::Ordering::Relaxed);
+    // `batches` = `fetch_many` calls = object-store round trips; cold index
+    // evaluation is bound by round trips × latency, not by bytes.
     log::info!(
-        "[trace_id {trace_id}] search->vix: io_accounting logical_ranges={} logical_bytes={} completed_coalesced_reads={} completed_coalesced_bytes={} memory_reads={} memory_bytes={} disk_reads={} disk_bytes={} remote_reads={} remote_bytes={} unknown_store_reads={} unknown_store_bytes={} queue_us={} active_us={} evaluation_wait_us={}",
+        "[trace_id {trace_id}] search->vix: io_accounting logical_ranges={} logical_bytes={} round_trips={} completed_coalesced_reads={} completed_coalesced_bytes={} memory_reads={} memory_bytes={} disk_reads={} disk_bytes={} remote_reads={} remote_bytes={} unknown_store_reads={} unknown_store_bytes={} queue_us={} active_us={} evaluation_wait_us={}",
         fetch_count,
         scan_stats.idx_scan_size,
+        load(&fetch_stats.batches),
         load(&fetch_stats.physical_fetches),
         load(&fetch_stats.physical_bytes),
         load(&fetch_stats.memory_fetches),
