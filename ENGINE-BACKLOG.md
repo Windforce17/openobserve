@@ -3,6 +3,105 @@
 Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
 (deleted 2026-07-29; full history in git). Keep THIS file current.
 
+## 2026-09-30 — `.180` compactor: one merge target, files above half of it final, settled-based sealing; the per-class targets and the index-defer knob are gone
+- Implements the 05:00–08:00Z owner proposal ("one config, merge once")
+  below. vix-arch `b5046389b`, image `v0.93.0-vix-20260930.180`
+  (binary `310d4cc0…`, OCI index `bfbfe707…`), GitOps #576 (`51b8d9be`),
+  compactors 30/30 at 09:27–09:28Z, 0 restarts, `obs-env-rev
+  2026-09-30-one-merge-target-4096`. Other roles untouched (the ingester's
+  only reader of `ZO_COMPACT_MAX_FILE_SIZE` takes `min(512 MB on-disk cut,
+  it)`).
+- Engine (`compact/merge.rs`, `vix/core_writer.rs`, `config.rs`,
+  `file_list/{postgres,sqlite}.rs`, `jobs/compactor.rs`):
+  - ONE byte target for every file class: `ZO_COMPACT_MAX_FILE_SIZE`
+    (prod 1024 → **4096**). Deleted `ZO_COMPACT_LOGS_INDEXED_MAX_FILE_SIZE`,
+    `ZO_COMPACT_TRACES_INDEXED_MAX_FILE_SIZE`, `Compact::
+    max_file_size_for_merge`, the two-target `query_for_merge` SQL and the
+    per-class inputs of the auto merge-concurrency resolver (startup line
+    on `.180`: `target_mib=4096 memory_slots=10 cpu_slots=3 total=3
+    live_workers=2 backlog_workers=1` — unchanged capacity, the old
+    formula already took `max(1024, 4096, 4096)`).
+  - Files above HALF the target (2 GiB) are FINAL: `plan_partition` never
+    groups them (the debt line `ZO_COMPACT_OLD_DATA_MIN_FILES` over files
+    ≤ target/2 already treated them as done), so a byte is rewritten and
+    indexed at most once. Index-less final files are healed in place
+    (sidecar-only) the round they are seen — open hour included; that was
+    the 75–130 min "2 h lag" of logs L0s (p50 2.5 GiB).
+  - Three ages of an hour replace `is_incremental = !is_past_hour`: OPEN
+    and CLOSED-BUT-UNSETTLED (until close + `ZO_SEGMENT_LATE_LANE_HOURS`
+    = 2 h) seal only full groups and carry the remainder — a below-target
+    remainder seals early only once it holds `MIN_PARTIAL_FAN_IN` = 8
+    files (tiny late slices coalesce; two 1.5 GB files wait); SETTLED runs
+    one sweep-up. A partition's lone sub-half core file is still probed
+    from the first closed pass. Indexed final files are probed on settled
+    rounds only (defective-file guard).
+  - `ZO_VIX_MERGE_INDEX_DEFER_BELOW_MB` / `CoreMergeMode::IndexDeferred`
+    removed (deferred outputs were index-less merged files needing a second
+    heal). Only a healing single file above the target hits the
+    indexed-only guard now.
+  - Tests: `plan_partition` unit tests (finality, sidecar-homogeneous
+    groups, fan-in floor, lone-file probe), grouping tests rewritten for
+    settled/unsettled, resolver/config/file_list tests collapsed to one
+    target. `compact::merge::tests` 52/52.
+- Baseline `.178`, 08:50–09:20Z (kubectl logs, all 30 pods): traces
+  **1,219 merges / 60 min, 970 two-input, output p50 2.88 GB, 3.14 TB
+  rewritten, all passthrough**; logs 459 merges (425 two-input, p50 2.38
+  GB, 1.19 TB, 391 passthrough / 68 rebuild) + 398 heals.
+- First 15 min on `.180`: the open logs/default hour 09 was planned by one
+  pod — 198 index-less final L0s probed (`file carries no index sidecar…`,
+  ~1 s per probe) and 11 full groups of 2–5 sub-half L0s → 3.6–4.1 GB
+  rebuild outputs (`index_merge: false`, ~45 s each), all draining through
+  that pod's `live_workers=2` (shared with the recent lane). The hour's
+  throughput ceiling is one pod's live workers — the "one job per (stream,
+  hour) on one node" bound named on 09-30; the next lever is per-hour
+  parallelism, not the sealing rule.
+- **Clean-hour window 10:09–11:09Z (hour 10 is the first fully-`.180`
+  hour), kubectl logs of all 30 pods, attribution by output hour:**
+  - traces live hours: **712 merges** (hour 10: 428, avg 2.6 inputs — the
+    L0s are ~1.5 GB, so 2–3 fill a 4 GiB group — **1 sub-half output**, 1.46
+    TB rewritten against ~1.7 TB landed = **one generation**; `.178`
+    rewrote 3.14 TB/h, ≈1.75 generations). Hours 08/09 tails: 41 sub-half
+    outputs of 10–4 inputs at ~0 TB — the fan-in floor coalescing tiny
+    stragglers, as intended. Plus 697 two-input merges (0.23 TB) from the
+    one-time settled sweep-up of old hours' leftovers (finite historical
+    debt; each old hour visited once).
+  - logs live hours: 135 merges (hour 10: 81, avg 3.7 inputs, 0 sub-half,
+    0.29 TB) + **955 heals/h** (p50 6.1 s, sidecar-only) — 0.39 TB rewritten
+    vs `.178`'s 1.19 TB/h: the finals are indexed in place instead of
+    re-paired.
+  - Lag (file_list at 11:09Z): logs hour 10 at close+9 min **149 index-less
+    of 606 files** (`.178` at close+14 min: 61 % of rows); hour 09 at
+    close+69 min 12 of 556; hour 08 0. Traces hour 09 at close+69 min: 503
+    files (15 small, 1 mid, 487 final) — the settled shape (~480) reached
+    within an hour of close; hour 10 at close+9 min 578 (49 small, 50 mid).
+  - Fleet: RSS p50 5.7 GiB / max 15.3 GiB, 0 restarts, 0 OOMKilled, no merge
+    failures or refusals; ERROR lines were the querier restart's cluster
+    health-check churn and 7 S3 GET retries. `file_list_jobs` running
+    75/90, pending 671 (the sweep-up enqueued old hours).
+- Owner asked at 10:15Z whether queries got slower and restarted the
+  queriers (10:18Z; RSS had been 18.5–19.1 GiB per pod since `.179`, 8–14
+  GiB after). Battery evidence, obs r1/r2 vs O2, `use_cache=false`:
+  - during the restart (10:15–10:18Z): 57.8 s / 33 s / 15 s obs failures
+    (`error decoding response body`) — the roll itself;
+  - 5 min after (cold): traces count 1 h 5.2 / 5.6 s, all `idx_took`
+    (sidecars refetched into empty caches), hist 7.4 → 0.9 s;
+  - **30 min after (warm, 10:48Z, window 09:35–10:35Z): traces count 1 h
+    1,459 / 430 ms (O2 787), hist 794 / 357 (O2 8,741), top-10 15 m 2,088 /
+    674 (O2 1,186), logs count 1 h 1,005 / 396 (O2 289), logs count svc
+    1,477 / 511 (O2 114), logs `SELECT * LIMIT 50` 2,493 / 1,141 (O2
+    1,117)** — at or better than the 09-28 `.173` references (531 / 664 /
+    446 / 2,315 ms). No `.180` query regression measured. Pre-restart
+    querier logs 09:00–10:17Z: no `MemoryCircuitBreaker`, no growth
+    timeouts; ERRORs were user SQL field errors plus 4 `.vxi NotFound`
+    (file merged away between file_list read and sidecar fetch,
+    fail-open). Node churn the same morning: NATS pods `Drifted` at 09:33Z
+    and 10:20Z, two compactors + one querier replaced ~09:52Z (Karpenter).
+  - What `.180` does change for queries: closed-but-unsettled hours hold
+    more files until their full groups form (traces hour 09 at close+75 min
+    had 879 files vs ~480 settled; at close+69 min the next hour had 503).
+    Index-heavy shapes over the last 1–2 h pay linearly for that; the
+    warm battery did not show it above noise.
+
 ## 2026-09-29 — P2 shipped as `.176` and rolled back within 30 min: the per-stream side table stalled the shared meta DB (commit latency 40–60×, ingest 503s); ranges must live in the segment row
 - What shipped (vix-arch `013c45010` + NATS retry `76fe754b5`, image
   `v0.93.0-vix-20260929.176`, GitOps #569 querier 06:15Z / #570 rest, all
