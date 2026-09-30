@@ -101,6 +101,39 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     had 879 files vs ~480 settled; at close+69 min the next hour had 503).
     Index-heavy shapes over the last 1–2 h pay linearly for that; the
     warm battery did not show it above noise.
+- **24 h / 7 d battery 11:34–11:41Z (window end 11:20Z, queriers 76 min
+  old, `use_cache=false`, obs r1/r2 vs O2, ms; every answer
+  `partial=false`, row counts within 1.2 % of O2 = corpus difference):**
+  - 24 h: traces count 1,272/507 vs 1,530; hist 1 h 804/448 vs 6,889; top-10
+    services 3,907/1,069 vs 9,732; `approx_percentile_cont(duration,0.99)`
+    by service 9,164/8,913 vs 21,199 (scan-bound, 8.8 B rows, now complete
+    thanks to `.179`); logs count 1,454/744 vs 4,875; **logs count
+    `service_name='llm-router'` 9,606/913 vs 2,352**; logs `SELECT * LIMIT
+    50` 1,165/292 vs 2,570.
+  - 7 d: traces count 2,415/892 vs 31,510; hist 6 h 1,076/543 vs 33,420;
+    **top-10 services 51,895/1,633 vs 24,034**; logs count 1,313/608 vs
+    30,460; **logs count svc 32,962/1,258 vs 38,933**; logs `SELECT * LIMIT
+    50` 1,851/929 vs 7,959.
+  - Attribution of the three cold outliers (follower logs, per follower):
+    traces top-10 7 d — 6,920 index files, **60,207 index fetches (5.26
+    GB) in 49.5 s**, `follower search setup` 49.8 s, scan 0.7 s; logs svc
+    7 d — 4,726 files, 29,471 fetches (2.12 GB), 26.9 s; logs svc 24 h —
+    ~1,200 files, ~14,000 fetches (750 MB), 8.0 s. r2 of the same query:
+    33 / 2 / ~200 fetches → 1.1 s / 0.27 s / 0.23 s (the per-file
+    evaluation cache, not the disk cache: `disk cached` was 45 % / 20 %
+    both times). Arithmetic: `eval_concurrency` 64 files in parallel
+    (`ZO_VIX_SEARCH_CONCURRENCY`), ~8.7 sequential range reads per file
+    (footer → dictionary → postings/zone counts, 87 KB avg), ≈ 53 ms per
+    remote read → 6,920 × 8.7 × 53 ms / 64 ≈ 50 s. Cold GROUP BY / filtered
+    aggregates cost **≈ 7 ms per index file per follower**, linear in file
+    count; the global fetch gate (`ZO_VIX_FETCH_CONCURRENCY` 256) is 75 %
+    idle during it (64 files × 1 read in flight). Levers, cheapest first:
+    (1) `ZO_VIX_SEARCH_CONCURRENCY` 64 → 192–256 for remote-cold
+    evaluation (the gate still caps S3 in-flight at 256; the code's
+    "request storm" guard was written for 5 followers at 16 in-flight);
+    (2) coalesce the per-file read chain into one or two ranged reads
+    (sidecar footer already names the dictionary/posting offsets); (3)
+    persist the evaluation cache across restarts. None of this is `.180`.
 
 ## 2026-09-29 — P2 shipped as `.176` and rolled back within 30 min: the per-stream side table stalled the shared meta DB (commit latency 40–60×, ingest 503s); ranges must live in the segment row
 - What shipped (vix-arch `013c45010` + NATS retry `76fe754b5`, image
