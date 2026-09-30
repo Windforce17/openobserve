@@ -510,6 +510,8 @@ pub async fn vix_search(
         .map(|file| file.meta.compressed_size.max(0) as u64)
         .sum();
     let bail_threshold = eval_bail_threshold(bail_bytes_cap, window_compressed_bytes);
+    // One evaluating query against the node's slots for the whole fan-out.
+    let fair_share = source::FairShare::enter();
 
     for (group_id, file_group) in index_parquet_files.into_iter().enumerate() {
         if no_more_files {
@@ -531,6 +533,7 @@ pub async fn vix_search(
             let file_stats = Arc::new(source::FetchStats::default());
             let file_operation = operation.for_file(Arc::clone(&file_stats));
             let eval_bail = Arc::clone(&eval_bail);
+            let fair_share = Arc::clone(&fair_share);
             async move {
                 let outcome = AssertUnwindSafe(async {
                     if file_operation.is_cancelled() {
@@ -543,6 +546,10 @@ pub async fn vix_search(
                             true,
                         ));
                     }
+                    // Hold one of this query's fair-share slots for the whole
+                    // open + evaluation, so a query never pins more of the
+                    // node's evaluation slots than its share.
+                    let _fair_slot = fair_share.admit().await;
                     let mut ret = search_vix_index(&trace_id,
                     time_range,
                     index_condition_clone.clone(),

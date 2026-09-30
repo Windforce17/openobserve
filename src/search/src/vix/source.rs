@@ -502,6 +502,94 @@ static EVAL_COUNT: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
     ))
 });
 
+/// Evaluations a query keeps in flight regardless of how many queries share
+/// the node: below this the per-file S3 chains of a small query would not
+/// overlap at all.
+const MIN_FAIR_SHARE: usize = 8;
+/// How long a waiter sleeps before re-reading its share (another query may
+/// have finished, raising it) when no completion woke it.
+const FAIR_SHARE_RECHECK: Duration = Duration::from_millis(20);
+
+/// Queries currently evaluating index files on this node.
+static ACTIVE_EVALUATING_QUERIES: LazyLock<Arc<std::sync::atomic::AtomicUsize>> =
+    LazyLock::new(|| Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+
+/// One query's share of the node's evaluation slots (`ZO_VIX_SEARCH_CONCURRENCY`).
+///
+/// The slot semaphore is FIFO: a query fanning out 192 files enqueues 192
+/// acquires, and a 40-file query arriving behind eleven such dashboards
+/// waited 8–24 s for its 0.5 s of work (prod 2026-09-30). Capping every
+/// query at `max(MIN_FAIR_SHARE, slots / active_queries)` keeps the queue
+/// short: a newcomer raises `active`, the incumbents stop acquiring above
+/// their new share, and slots free within one evaluation.
+pub(super) struct FairShare {
+    slots: usize,
+    active: Arc<std::sync::atomic::AtomicUsize>,
+    in_flight: std::sync::atomic::AtomicUsize,
+    released: Notify,
+}
+
+/// Guard of one admitted evaluation; dropping it wakes the next waiter.
+pub(super) struct FairSlot(Arc<FairShare>);
+
+impl Drop for FairSlot {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::AcqRel);
+        self.0.released.notify_one();
+    }
+}
+
+impl Drop for FairShare {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl FairShare {
+    /// Register one evaluating query against the node-wide slot count.
+    pub(super) fn enter() -> Arc<Self> {
+        Self::enter_with(
+            config::get_config().limit.vix_search_concurrency.max(1),
+            Arc::clone(&ACTIVE_EVALUATING_QUERIES),
+        )
+    }
+
+    fn enter_with(slots: usize, active: Arc<std::sync::atomic::AtomicUsize>) -> Arc<Self> {
+        active.fetch_add(1, Ordering::AcqRel);
+        Arc::new(Self {
+            slots,
+            active,
+            in_flight: std::sync::atomic::AtomicUsize::new(0),
+            released: Notify::new(),
+        })
+    }
+
+    /// This query's current cap on concurrent evaluations.
+    pub(super) fn share(&self) -> usize {
+        let active = self.active.load(Ordering::Acquire).max(1);
+        (self.slots / active).max(MIN_FAIR_SHARE)
+    }
+
+    /// Wait until this query is below its share, then hold one evaluation.
+    pub(super) async fn admit(self: &Arc<Self>) -> FairSlot {
+        loop {
+            let share = self.share();
+            let current = self.in_flight.load(Ordering::Acquire);
+            if current < share
+                && self
+                    .in_flight
+                    .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                return FairSlot(Arc::clone(self));
+            }
+            // A release may land between the check and the wait; the timeout
+            // also picks up shares raised by queries that finished.
+            let _ = tokio::time::timeout(FAIR_SHARE_RECHECK, self.released.notified()).await;
+        }
+    }
+}
+
 pub(super) fn evaluation_byte_budget() -> usize {
     config::get_config().common.vix_eval_max_bytes.max(1)
 }
@@ -1146,6 +1234,66 @@ mod tests {
                 growth_wait,
             }),
         }
+    }
+
+    /// A lone query owns every slot; a second query halves both shares, and
+    /// an incumbent above its new share waits until one of its own
+    /// evaluations finishes, while the newcomer is admitted at once.
+    #[tokio::test(start_paused = true)]
+    async fn fair_share_splits_slots_between_active_queries() {
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let first = FairShare::enter_with(16, Arc::clone(&active));
+        assert_eq!(first.share(), 16);
+        let mut held: Vec<FairSlot> = Vec::new();
+        for _ in 0..12 {
+            held.push(first.admit().await);
+        }
+
+        let second = FairShare::enter_with(16, Arc::clone(&active));
+        assert_eq!(first.share(), 8);
+        assert_eq!(second.share(), 8);
+        // the newcomer gets its share immediately
+        let mut newcomer = Vec::new();
+        for _ in 0..8 {
+            newcomer.push(
+                tokio::time::timeout(Duration::from_millis(1), second.admit())
+                    .await
+                    .expect("newcomer admitted without waiting"),
+            );
+        }
+        // the incumbent (12 in flight > share 8) is held back ...
+        let blocked = tokio::spawn({
+            let first = Arc::clone(&first);
+            async move { first.admit().await }
+        });
+        tokio::time::advance(FAIR_SHARE_RECHECK * 3).await;
+        assert!(
+            !blocked.is_finished(),
+            "incumbent above its share must wait"
+        );
+        // ... until it drops below the share: releasing 5 leaves 7 < 8
+        held.truncate(7);
+        tokio::time::advance(FAIR_SHARE_RECHECK * 2).await;
+        let _slot = blocked.await.unwrap();
+        assert_eq!(first.in_flight.load(Ordering::Acquire), 8);
+
+        // the second query finishing restores the first's full share
+        drop(newcomer);
+        drop(second);
+        assert_eq!(active.load(Ordering::Acquire), 1);
+        assert_eq!(first.share(), 16);
+    }
+
+    /// Many queries never starve each other below the minimum share.
+    #[test]
+    fn fair_share_keeps_a_minimum_under_heavy_sharing() {
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let shares: Vec<_> = (0..40)
+            .map(|_| FairShare::enter_with(192, Arc::clone(&active)))
+            .collect();
+        assert_eq!(shares[0].share(), MIN_FAIR_SHARE);
+        drop(shares);
+        assert_eq!(active.load(Ordering::Acquire), 0);
     }
 
     /// Growth that cannot be served immediately WAITS for a release instead
