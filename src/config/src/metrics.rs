@@ -1572,6 +1572,50 @@ pub static VIX_READER_CACHE_MISSES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     .expect("Metric created")
 });
 
+/// Reader-cache entries by tier: label `tier` = `full` (lazy structures
+/// retained) or `metadata` (demoted; only per-file metadata retained).
+pub static VIX_READER_CACHE_TIER_ENTRIES: Lazy<IntGaugeVec> = Lazy::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            "vix_reader_cache_tier_entries",
+            "Number of parsed .vix readers held by the reader cache, by tier \
+             (full vs metadata-only demoted)",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &["tier"],
+    )
+    .expect("Metric created")
+});
+
+/// Reader-cache retained bytes by tier: label `tier` = `full` or `metadata`.
+pub static VIX_READER_CACHE_TIER_BYTES: Lazy<IntGaugeVec> = Lazy::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            "vix_reader_cache_tier_memory_bytes",
+            "Retained reader bytes held by the reader cache, by tier (full vs \
+             metadata-only demoted)",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &["tier"],
+    )
+    .expect("Metric created")
+});
+
+pub static VIX_READER_CACHE_DEMOTIONS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "vix_reader_cache_demotions_total",
+            "Total number of readers demoted from full to metadata-only by the \
+             reader cache",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &[],
+    )
+    .expect("Metric created")
+});
 // metrics for .vix range fetches (label `path`: `search` = index evaluation
 // through the cache ladder, `scan` = the DataFusion docs scan)
 pub static VIX_FETCH_COUNT_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {

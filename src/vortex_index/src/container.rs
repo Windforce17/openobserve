@@ -730,6 +730,27 @@ impl VixRangeSource for TailRangeSource {
             .saturating_add(self.source.retained_bytes())
     }
 
+    /// Metadata-only replacement for reader demotion: keep only the
+    /// supplied footer window of the retained tail (re-sliced, never
+    /// grown), release the eager prefix — query-specific block/leaf
+    /// bytes re-fetched on demand through the ranged paths.
+    fn trim_retained_tail(&self, keep: std::ops::Range<u64>) -> Option<Arc<dyn VixRangeSource>> {
+        if keep.start < self.start || keep.end > self.start + self.bytes.len() as u64 {
+            return None;
+        }
+        let bytes = self
+            .bytes
+            .slice((keep.start - self.start) as usize..(keep.end - self.start) as usize);
+        if bytes.len() == self.bytes.len() {
+            return None;
+        }
+        Some(Arc::new(Self {
+            source: Arc::clone(&self.source),
+            start: keep.start,
+            bytes,
+        }) as _)
+    }
+
     fn describe(&self) -> String {
         self.source.describe()
     }

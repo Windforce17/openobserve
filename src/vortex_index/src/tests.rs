@@ -4729,6 +4729,64 @@ mod ranged {
         );
     }
 
+    /// Demotion parity: after a full cold evaluation (indexes + blocks
+    /// resident), `demote()` releases them; the very next evaluation of a
+    /// DIFFERENT condition must answer identically to a fresh reader and
+    /// pay ZERO tail/footer fetches (only its own blocks/leaves). This is
+    /// the metadata-tier contract: demoted readers are cold-except-
+    /// metadata.
+    #[test]
+    fn demoted_reader_parity_without_metadata_fetches() {
+        let (data, index) = build_large_core_file();
+        let mem = VixReader::open_with_index(data.clone(), Some(index.clone())).unwrap();
+        let source = PairSource::new(data, index);
+        let reader = source.open_with_tail(PROD_SIDECAR_TAIL);
+
+        // Warm every metadata + index structure with one exact term.
+        assert_eq!(
+            reader
+                .eval(&exact("svc", "svc_042424"))
+                .unwrap()
+                .count_set_bits(),
+            1
+        );
+        let warm = reader.memory_size();
+        let mut reader = reader;
+        let released = reader.demote();
+        assert!(
+            released > 0 && reader.memory_size() < warm,
+            "demotion must release the lazy structures ({released} bytes)"
+        );
+
+        // A different condition: identical answer, zero tail/footer
+        // fetches. Blocks and leaves are re-fetched (data reads).
+        let before = source.fetches();
+        let before_bytes = source.bytes();
+        let query = exact("svc", "svc_000007");
+        let got = reader.eval(&query).unwrap();
+        assert_eq!(
+            bits_to_set(&got),
+            bits_to_set(&mem.eval(&query).unwrap()),
+            "demoted reader must answer identically"
+        );
+        assert!(
+            source.fetches() > before,
+            "a demoted reader must still fetch its own blocks"
+        );
+        assert!(
+            (source.bytes() - before_bytes) < 4 * 1024 * 1024,
+            "the re-fetch is block-granular, not a whole-tail re-download"
+        );
+
+        // Second post-demotion query on another field exercises the
+        // per-field index rebuild path (OnceLock re-population).
+        let query = exact("level", "warn");
+        assert_eq!(
+            reader.eval(&query).unwrap().count_set_bits(),
+            mem.eval(&query).unwrap().count_set_bits()
+        );
+    }
+
     /// Production sidecar eager tail (`ZO_VIX_EAGER_TAIL_BYTES` on the obs
     /// queriers); the plan below is stated for it.
     const PROD_SIDECAR_TAIL: u64 = 256 * 1024;

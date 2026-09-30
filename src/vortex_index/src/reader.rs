@@ -673,7 +673,6 @@ pub struct VixReader {
     /// (`columns_complete` property). `false` when absent (fail-open).
     columns_complete: bool,
 }
-
 impl VixReader {
     /// Open a core file from its complete DATA-object bytes, WITHOUT an
     /// index sidecar: the reader carries no term/bloom capability — every
@@ -1322,6 +1321,88 @@ impl VixReader {
     /// Admission refusal or cancellation leaves the observer unregistered.
     pub fn observe_memory(&self, observer: Weak<dyn ReaderMemoryObserver>) -> Result<()> {
         self.memory.observe(observer)
+    }
+
+    /// Release every lazily built, re-fetchable structure the reader holds
+    /// and return the bytes released: the parsed whole-dictionary index and
+    /// the per-field restart-page indexes (all re-derivable from the
+    /// retained `dict` blob — the block index bytes stay resident — with
+    /// zero IO), the FIFO dictionary `block_cache` payloads (re-fetched
+    /// per block through the ordinary ranged path), and the eager-tail
+    /// prefixes of ranged sources (re-trimmed to each blob's Vortex
+    /// footer window; the released data prefix re-fetches on demand). The
+    /// puffin footer properties, the `fields`/`dict_field_pages`
+    /// structures, the zone table, and the retained Vortex footer windows
+    /// all stay, so the next evaluation of a different condition pays
+    /// zero tail/footer/directory fetches and re-fetches only its own
+    /// blocks, leaves and postings.
+    ///
+    /// The decoded docs schema and chunk stats are deliberately KEPT: they
+    /// are per-reader metadata whose re-derivation would cost a docs-blob
+    /// footer or `stats`-blob fetch (a metadata read) on the next
+    /// group-by-shaped evaluation.
+    ///
+    /// Requires exclusive access — the caller must hold the sole `Arc`,
+    /// which is also the no-outstanding-lease gate the reader cache demotes
+    /// under: no concurrent evaluation can race the `OnceLock::take`s or
+    /// the source swaps. No observer callback runs here; the demoting
+    /// cache reconciles its own accounting under its state lock (calling
+    /// `notify` would deadlock it). Returns `0` for a reader with no
+    /// droppable state (nothing lazily built yet); such a reader is
+    /// already metadata-sized.
+    pub fn demote(&mut self) -> usize {
+        let mut released = 0usize;
+        // Cached dictionary blocks: payload bytes plus the FIFO/table
+        // allocation high-water charged through `cache_dict_block`.
+        {
+            let mut cache = self.block_cache.lock();
+            let table_high_water = cache.2;
+            let queue_bytes = cache.1.capacity() * std::mem::size_of::<usize>();
+            for (_, bytes) in cache.0.drain() {
+                released += bytes.len() + RETAINED_BYTES_OVERHEAD;
+            }
+            released += table_high_water + queue_bytes;
+            *cache = (
+                std::collections::HashMap::new(),
+                std::collections::VecDeque::new(),
+                0,
+            );
+        }
+        // The parsed whole-dictionary index: one zero-IO rebuild (a `dict`
+        // blob slice plus parse) away through `dict_index`.
+        if let Some(index) = self.dict_index.take() {
+            released += index.memory_size();
+        }
+        // Per-field restart-page indexes: each rebuilds from the retained
+        // `dict` blob through `field_index` (five zero-IO slices + parse).
+        for slot in &mut self.field_indexes {
+            if let Some(index) = slot.take() {
+                released += index.memory_size();
+            }
+        }
+        // Eager-tail prefixes retained by ranged sources: keep only each
+        // blob's Vortex footer window (metadata re-used by every open),
+        // release the data prefix. Tails fully inside their blob stay.
+        for blob in [
+            Some(&mut self.docs_blob),
+            self.dict_blob.as_mut(),
+            self.dict_blocks_blob.as_mut(),
+            self.terms_blob.as_mut(),
+            self.bloom_blob.as_mut(),
+            self.plist_blob.as_mut(),
+            self.stats_blob.as_mut(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let BlobHandle::Ranged(ranged) = blob {
+                released += ranged.trim_retained_tail();
+            }
+        }
+        if released > 0 {
+            self.memory.subtract(released);
+        }
+        released
     }
 
     fn initialize_memory(&self, owned_bytes: usize, whole_objects: bool) {

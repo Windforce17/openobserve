@@ -362,6 +362,16 @@ pub trait VixRangeSource: Send + Sync + 'static {
         0
     }
 
+    /// A replacement of this source that retains only `keep` (a blob's
+    /// Vortex footer window), releasing eagerly retained data bytes.
+    /// `None` (the default) when this source retains nothing releasable.
+    /// Called when the owning reader is demoted to a metadata-only cache
+    /// tier: released bytes are re-fetched through the normal ranged
+    /// paths on first use.
+    fn trim_retained_tail(&self, _keep: Range<u64>) -> Option<Arc<dyn VixRangeSource>> {
+        None
+    }
+
     /// Whether the object is empty.
     fn is_empty(&self) -> bool {
         self.len() == 0
@@ -720,6 +730,19 @@ impl RangedBlob {
     /// (`vortex-file`'s postscript-sized suffix, clamped to the blob).
     pub(crate) fn footer_window(&self) -> Range<u64> {
         self.range.end - self.len().min(VORTEX_FOOTER_READ_BYTES)..self.range.end
+    }
+
+    /// Demote the underlying source to metadata-only retention: keep the
+    /// blob's Vortex footer window, release retained eager-tail data
+    /// bytes. Returns the released bytes (0 when nothing changed).
+    pub(crate) fn trim_retained_tail(&mut self) -> usize {
+        let window = self.footer_window();
+        let before = self.source.retained_bytes();
+        let Some(trimmed) = self.source.trim_retained_tail(window) else {
+            return 0;
+        };
+        self.source = trimmed;
+        before.saturating_sub(self.source.retained_bytes())
     }
 
     /// Whether the footer window is servable without IO: retained by an

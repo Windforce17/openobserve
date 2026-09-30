@@ -32,15 +32,31 @@
 //! Prometheus: `vix_reader_cache_entries`, `vix_reader_cache_memory_bytes`,
 //! `vix_reader_cache_{hits,misses}_total`.
 
-use std::sync::{Arc, LazyLock as Lazy, Weak};
+use std::sync::{
+    Arc, LazyLock as Lazy, Weak,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use config::metrics;
 use hashlink::LruCache;
-use tokio::sync::{Mutex as OperationMutex, OwnedMutexGuard};
 use vortex_index::{ReaderMemoryObserver, VixReader};
 
 pub static GLOBAL_CACHE: Lazy<VixReaderCache> =
     Lazy::new(|| VixReaderCache::new(config::get_config().limit.vix_reader_cache_max_size));
+
+/// Fraction of [`struct@VixReaderCache`]'s byte budget reserved for full
+/// (non-demoted) readers. Entries beyond it are demoted to the
+/// metadata-only tier instead of evicted: a demoted reader keeps every
+/// per-file metadata read free (puffin footer, `fields`, zone map, Vortex
+/// footer windows, eager tails) and re-fetches only its query-specific
+/// blocks/leaves, so a whole 7-day GROUP BY window fits the cache instead
+/// of ~1.5 days. Hot files (refreshed by lookups) stay full; the LRU tail
+/// degrades to metadata, not to a cold reopen. Measured on the prod
+/// composition (2026-09-30: 1.39 MB per cached reader, 98.7 % of a 7 d
+/// window's ~6,900 files missed), a quarter of the budget keeps ~4x more
+/// full readers than today's full-only LRU while leaving 3/4 of the
+/// budget for the long metadata tail.
+const HOT_BUDGET_FRACTION: usize = 4;
 
 /// Immutable sidecar identity for one logical data file.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -68,18 +84,42 @@ impl ReaderCacheKey {
     }
 }
 
+/// The reader tier of one cache entry. `Full` readers retain every lazily
+/// built structure (dictionary indexes, cached blocks); `Metadata` readers
+/// have been demoted — they still answer every query, but re-fetch their
+/// blocks/leaves through the normal paths on first use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tier {
+    Full,
+    Metadata,
+}
+
+impl Tier {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Metadata => "metadata",
+        }
+    }
+}
+
 struct CachedReader {
     reader: Arc<VixReader>,
-    operation: Arc<OperationMutex<()>>,
+    /// Outstanding shared leases on this entry. Zero means the cache owns
+    /// the reader exclusively — the gate for demotion and the fast path
+    /// for eviction.
+    leases: Arc<AtomicUsize>,
+    tier: Tier,
     accounted: usize,
     observer: Arc<MemoryObserver>,
 }
 
-/// Waiting handles never own reader allocations. A cache eviction can destroy
-/// the reader even with arbitrarily many operations queued on its mutex.
+/// Waiting handles never own reader allocations. A cache eviction can
+/// destroy the reader even with arbitrarily many operations queued behind
+/// a lease release.
 pub(super) struct ReaderHandle {
     reader: Weak<VixReader>,
-    operation: Arc<OperationMutex<()>>,
+    leases: Arc<AtomicUsize>,
     has_index: bool,
 }
 
@@ -88,35 +128,42 @@ impl ReaderHandle {
         self.has_index
     }
 
+    /// Grant a shared lease immediately. Leases on the same cached reader
+    /// overlap freely: concurrent evaluations of the same file are safe
+    /// because every mutable reader structure is mutex- or OnceLock-
+    /// protected, and each lease charges its own operation's memory budget
+    /// through `check_read_memory` (double-counting across concurrent ops
+    /// is intended — conservative admission). Cancellation is checked
+    /// before granting, so a cancelled operation never opens a reader.
     pub(super) async fn lock(
         self,
         operation: &Arc<super::source::ReadOperation>,
     ) -> anyhow::Result<LockedReader> {
-        let guard = tokio::select! {
-            biased;
-            _ = operation.cancelled() => return Err(vortex_index::VixError::Cancelled.into()),
-            guard = self.operation.lock_owned() => guard,
-        };
+        if operation.is_cancelled() {
+            return Err(vortex_index::VixError::Cancelled.into());
+        }
         Ok(LockedReader {
             reader: self.reader,
-            guard,
+            leases: Some(self.leases),
         })
     }
 
     pub(super) fn try_lock(self) -> Option<LockedReader> {
-        let guard = self.operation.try_lock_owned().ok()?;
         Some(LockedReader {
             reader: self.reader,
-            guard,
+            leases: Some(self.leases),
         })
     }
 }
 
-/// The mutex is acquired before CPU/byte admission. Upgrade only after that
-/// admission, inside the operation scope, and immediately charge the footprint.
+/// The lease grant happens before CPU/byte admission. Upgrade only after
+/// that admission, inside the operation scope, and immediately charge the
+/// footprint. Counting the lease on upgrade (not on lock) keeps the
+/// demotion gate exact: an admission-refused operation never pins the
+/// reader, and a lease whose reader was evicted upgrades to `None`.
 pub(super) struct LockedReader {
     reader: Weak<VixReader>,
-    guard: OwnedMutexGuard<()>,
+    leases: Option<Arc<AtomicUsize>>,
 }
 
 impl LockedReader {
@@ -124,20 +171,22 @@ impl LockedReader {
         let Some(reader) = self.reader.upgrade() else {
             return Ok(None);
         };
-        let lease = ReaderLease {
-            reader,
-            guard: self.guard,
-        };
+        let leases = self.leases.clone();
+        if let Some(count) = &leases {
+            count.fetch_add(1, Ordering::AcqRel);
+        }
+        let lease = ReaderLease { reader, leases };
         vortex_index::check_read_memory(lease.memory_size())?;
         Ok(Some(lease))
     }
 }
 
-/// Field order is intentional: release the last reader owner before unlocking
-/// the next operation, and before the enclosing evaluation releases its permit.
+/// Field order is intentional: release the last reader owner before the
+/// lease counter drops, and before the enclosing evaluation releases its
+/// permit.
 pub(super) struct ReaderLease {
     reader: Arc<VixReader>,
-    guard: OwnedMutexGuard<()>,
+    leases: Option<Arc<AtomicUsize>>,
 }
 
 impl std::ops::Deref for ReaderLease {
@@ -147,14 +196,19 @@ impl std::ops::Deref for ReaderLease {
     }
 }
 
+impl Drop for ReaderLease {
+    fn drop(&mut self) {
+        if let Some(count) = &self.leases {
+            count.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
 impl ReaderLease {
     pub(super) fn private(reader: VixReader) -> anyhow::Result<Self> {
-        let guard = Arc::new(OperationMutex::new(()))
-            .try_lock_owned()
-            .expect("new reader mutex is uncontended");
         let lease = Self {
             reader: Arc::new(reader),
-            guard,
+            leases: None,
         };
         vortex_index::check_read_memory(lease.memory_size())?;
         Ok(lease)
@@ -165,10 +219,29 @@ type ReaderLru = LruCache<ReaderCacheKey, CachedReader>;
 
 struct CacheState {
     lru: ReaderLru,
+    /// Cache-owned bytes: every entry's accounted weight, full or demoted.
     total: usize,
+    /// Bytes of full (non-demoted) entries only, for the hot budget.
+    hot: usize,
+    /// Entry count per tier, maintained alongside the byte totals so gauge
+    /// publication stays O(1).
+    full_entries: usize,
+    metadata_entries: usize,
+    demotions: usize,
 }
 
 impl CacheState {
+    fn new() -> Self {
+        Self {
+            lru: LruCache::new_unbounded(),
+            total: 0,
+            hot: 0,
+            full_entries: 0,
+            metadata_entries: 0,
+            demotions: 0,
+        }
+    }
+
     fn update_gauges(&self) {
         metrics::VIX_READER_CACHE_ENTRIES
             .with_label_values::<&str>(&[])
@@ -176,12 +249,91 @@ impl CacheState {
         metrics::VIX_READER_CACHE_MEMORY_BYTES
             .with_label_values::<&str>(&[])
             .set(self.total as i64);
+        metrics::VIX_READER_CACHE_TIER_ENTRIES
+            .with_label_values(&[Tier::Full.label()])
+            .set(self.full_entries as i64);
+        metrics::VIX_READER_CACHE_TIER_ENTRIES
+            .with_label_values(&[Tier::Metadata.label()])
+            .set(self.metadata_entries as i64);
+        metrics::VIX_READER_CACHE_TIER_BYTES
+            .with_label_values(&[Tier::Full.label()])
+            .set(self.hot as i64);
+        metrics::VIX_READER_CACHE_TIER_BYTES
+            .with_label_values(&[Tier::Metadata.label()])
+            .set(self.total.saturating_sub(self.hot) as i64);
     }
 }
 
 struct CacheInner {
     state: parking_lot::Mutex<CacheState>,
     max_bytes: usize,
+    /// Byte budget for full readers: `max_bytes / HOT_BUDGET_FRACTION`.
+    hot_bytes: usize,
+}
+
+impl CacheInner {
+    /// Demote LRU-first full entries while the hot budget is exceeded.
+    /// An entry is demotable only when the cache owns the reader solely —
+    /// `Arc::get_mut` proves sole strong AND weak ownership, which means
+    /// no lease is outstanding (every live lease holds a strong Arc; a
+    /// cached-out handle holds a Weak that would fail `get_mut`). A busy
+    /// entry is skipped and the scan stops when no full entry is
+    /// demotable; enforcement retries on the next mutation.
+    fn demote_overflow(&self, state: &mut CacheState) {
+        while state.hot > self.hot_bytes {
+            let Some(key) = state
+                .lru
+                .iter()
+                .find(|(_, entry)| {
+                    entry.tier == Tier::Full && Arc::strong_count(&entry.reader) == 1
+                })
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            let Some(entry) = state.lru.peek_mut(&key) else {
+                continue;
+            };
+            let released = Arc::get_mut(&mut entry.reader).map_or(0, |reader| reader.demote());
+            let shrink = entry.accounted.min(released);
+            // The entry leaves the full tier entirely: its remaining
+            // accounted weight moves out of the hot budget even when
+            // nothing lazily built was releasable (the reader was already
+            // metadata-sized when full).
+            state.hot -= entry.accounted;
+            entry.accounted -= shrink;
+            entry.tier = Tier::Metadata;
+            state.total -= shrink;
+            state.full_entries -= 1;
+            state.metadata_entries += 1;
+            state.demotions += 1;
+            metrics::VIX_READER_CACHE_DEMOTIONS_TOTAL
+                .with_label_values::<&str>(&[])
+                .inc();
+        }
+    }
+
+    /// Evict LRU-first until `extra` bytes fit the total budget, like the
+    /// pre-tier loop. Evicted entries are returned for destruction after
+    /// the state lock drops (never under it).
+    fn evict_overflow(&self, state: &mut CacheState, extra: usize) -> Vec<CachedReader> {
+        let mut evicted = Vec::new();
+        while state.total > self.max_bytes - extra {
+            let Some((_, entry)) = state.lru.remove_lru() else {
+                break;
+            };
+            match entry.tier {
+                Tier::Full => {
+                    state.hot -= entry.accounted;
+                    state.full_entries -= 1;
+                }
+                Tier::Metadata => state.metadata_entries -= 1,
+            }
+            state.total -= entry.accounted;
+            evicted.push(entry);
+        }
+        evicted
+    }
 }
 
 /// One admission, not just one key: a delayed callback cannot charge a
@@ -209,6 +361,13 @@ impl ReaderMemoryObserver for MemoryObserver {
         let current = reader_bytes.checked_add(self.overhead);
         let Some(current) = current.filter(|size| *size <= cache.max_bytes) else {
             let entry = state.lru.remove(&self.key).unwrap();
+            match entry.tier {
+                Tier::Full => {
+                    state.hot -= entry.accounted;
+                    state.full_entries -= 1;
+                }
+                Tier::Metadata => state.metadata_entries -= 1,
+            }
             state.total -= entry.accounted;
             evicted.push(entry);
             state.update_gauges();
@@ -227,6 +386,13 @@ impl ReaderMemoryObserver for MemoryObserver {
         // when the configured budget is usize::MAX. No reader calls under lock.
         while state.total > cache.max_bytes - delta {
             let (_, entry) = state.lru.remove_lru().unwrap();
+            match entry.tier {
+                Tier::Full => {
+                    state.hot -= entry.accounted;
+                    state.full_entries -= 1;
+                }
+                Tier::Metadata => state.metadata_entries -= 1,
+            }
             state.total -= entry.accounted;
             removed_self = std::ptr::eq(Arc::as_ptr(&entry.observer), self);
             evicted.push(entry);
@@ -235,9 +401,29 @@ impl ReaderMemoryObserver for MemoryObserver {
             }
         }
         if !removed_self {
-            state.lru.peek_mut(&self.key).unwrap().accounted = current;
+            let demoted = state
+                .lru
+                .peek(&self.key)
+                .is_some_and(|entry| entry.tier == Tier::Metadata);
+            let entry = state.lru.peek_mut(&self.key).unwrap();
+            entry.accounted = current;
+            if demoted {
+                // Regrowth after demotion rebuilt full-tier structures
+                // (indexes, blocks); the entry re-enters the hot budget so
+                // demotion can release them again under pressure.
+                entry.tier = Tier::Full;
+                state.metadata_entries -= 1;
+                state.full_entries += 1;
+                state.hot += current;
+            } else {
+                state.hot += delta;
+            }
             state.total += delta;
         }
+        // Growth may push full readers past the hot budget: demote before
+        // returning (the growing entry itself holds a lease and is never
+        // demotable here).
+        cache.demote_overflow(&mut state);
         state.update_gauges();
         drop(state);
         drop(evicted);
@@ -250,7 +436,7 @@ fn entry_overhead(key: &ReaderCacheKey) -> usize {
     key.memory_size()
         + std::mem::size_of::<CachedReader>()
         + std::mem::size_of::<MemoryObserver>()
-        + std::mem::size_of::<OperationMutex<()>>()
+        + std::mem::size_of::<AtomicUsize>()
         + 4 * std::mem::size_of::<usize>()
 }
 
@@ -261,8 +447,9 @@ fn entry_overhead(key: &ReaderCacheKey) -> usize {
 /// Shared readers are conservatively charged once per admitted key, retaining
 /// each admission's observed high-water weight even if reader storage shrinks.
 /// Growth callbacks enforce the budget before returning; they never refresh LRU.
-/// Get/put/notification bookkeeping is O(1), plus O(entries actually evicted).
-/// Logical-file invalidation alone walks the LRU to find all generations.
+/// Get/put/notification bookkeeping is O(1), plus O(entries actually demoted
+/// or evicted). Logical-file invalidation alone walks the LRU to find all
+/// generations.
 pub struct VixReaderCache {
     inner: Arc<CacheInner>,
 }
@@ -271,11 +458,9 @@ impl VixReaderCache {
     pub fn new(max_bytes: usize) -> Self {
         Self {
             inner: Arc::new(CacheInner {
-                state: parking_lot::Mutex::new(CacheState {
-                    lru: LruCache::new_unbounded(),
-                    total: 0,
-                }),
+                state: parking_lot::Mutex::new(CacheState::new()),
                 max_bytes,
+                hot_bytes: max_bytes / HOT_BUDGET_FRACTION,
             }),
         }
     }
@@ -290,7 +475,7 @@ impl VixReaderCache {
             .get_mut(key)
             .map(|entry| ReaderHandle {
                 reader: Arc::downgrade(&entry.reader),
-                operation: Arc::clone(&entry.operation),
+                leases: Arc::clone(&entry.leases),
                 has_index: entry.reader.has_index(),
             });
         match &found {
@@ -320,7 +505,7 @@ impl VixReaderCache {
         })
     }
 
-    /// Publish only an already operation-locked cold reader. Duplicate opens
+    /// Publish an already operation-admitted cold reader. Duplicate opens
     /// stay private; they cannot mutate the winner through an escaping Arc.
     pub(super) fn put(
         &self,
@@ -328,12 +513,9 @@ impl VixReaderCache {
         reader: VixReader,
     ) -> anyhow::Result<ReaderLease> {
         let lease = ReaderLease::private(reader)?;
-        self.put_and_observe(
-            key,
-            Arc::clone(&lease.reader),
-            Arc::clone(OwnedMutexGuard::mutex(&lease.guard)),
-            |reader, observer| reader.observe_memory(Arc::downgrade(&observer)),
-        )?;
+        self.put_and_observe(key, Arc::clone(&lease.reader), |reader, observer| {
+            reader.observe_memory(Arc::downgrade(&observer))
+        })?;
         Ok(lease)
     }
 
@@ -341,7 +523,6 @@ impl VixReaderCache {
         &self,
         key: ReaderCacheKey,
         reader: Arc<VixReader>,
-        operation: Arc<OperationMutex<()>>,
         subscribe: impl FnOnce(&VixReader, Arc<dyn ReaderMemoryObserver>) -> vortex_index::Result<()>,
     ) -> vortex_index::Result<()> {
         if self.inner.max_bytes == 0 || self.inner.state.lock().lru.contains_key(&key) {
@@ -369,21 +550,23 @@ impl VixReaderCache {
             if state.lru.contains_key(&key) {
                 return Ok(());
             }
-            while state.total > self.inner.max_bytes - size {
-                let (_, entry) = state.lru.remove_lru().unwrap();
-                state.total -= entry.accounted;
-                evicted.push(entry);
-            }
+            evicted.extend(self.inner.evict_overflow(&mut state, size));
             state.total += size;
+            state.hot += size;
+            state.full_entries += 1;
             state.lru.insert(
                 key,
                 CachedReader {
                     reader: Arc::clone(&reader),
-                    operation,
+                    leases: Arc::new(AtomicUsize::new(0)),
+                    tier: Tier::Full,
                     accounted: size,
                     observer: Arc::clone(&observer),
                 },
             );
+            // A new admission can push older full readers past the hot
+            // budget; the new entry is MRU and demoted last.
+            self.inner.demote_overflow(&mut state);
             state.update_gauges();
         }
         drop(evicted);
@@ -405,6 +588,13 @@ impl VixReaderCache {
             .collect::<Vec<_>>();
         for key in doomed {
             if let Some(entry) = state.lru.remove(&key) {
+                match entry.tier {
+                    Tier::Full => {
+                        state.hot -= entry.accounted;
+                        state.full_entries -= 1;
+                    }
+                    Tier::Metadata => state.metadata_entries -= 1,
+                }
                 state.total -= entry.accounted;
                 removed.push(entry);
             }
@@ -445,12 +635,9 @@ mod tests {
     // exists only here; production insertion consumes a private VixReader.
     impl VixReaderCache {
         fn put_fixture(&self, key: ReaderCacheKey, reader: Arc<VixReader>) {
-            self.put_and_observe(
-                key,
-                reader,
-                Arc::new(OperationMutex::new(())),
-                |reader, observer| reader.observe_memory(Arc::downgrade(&observer)),
-            )
+            self.put_and_observe(key, reader, |reader, observer| {
+                reader.observe_memory(Arc::downgrade(&observer))
+            })
             .unwrap();
         }
     }
@@ -488,8 +675,11 @@ mod tests {
         )
     }
 
+    /// Shared leases: eviction destroys a reader once no lease pins it,
+    /// handles never pin readers, a cancelled operation's lock fails
+    /// without cancelling the others, and expired handles reopen.
     #[tokio::test]
-    async fn queued_operations_never_pin_evicted_reader_growth() {
+    async fn shared_leases_never_pin_evicted_reader_growth() {
         let cache = VixReaderCache::new(usize::MAX);
         let key = ReaderCacheKey::new("queued-growth.vix".to_owned(), 7, 100);
         let operation = super::super::source::ReadOperation::new(
@@ -512,45 +702,70 @@ mod tests {
                 )
             })
             .unwrap();
-        assert!(
-            cache.get(&key).unwrap().try_lock().is_none(),
-            "cold insertion must already be locked"
-        );
+        // Handles are weak; the published reader still has the cold lease.
         let first = cache.get(&key).unwrap();
         let weak = first.reader.clone();
         let second = cache.get(&key).unwrap();
+        // A cancelled operation's lock fails fast; unrelated operations run.
         let cancelled = super::super::source::ReadOperation::new(
             Arc::new(super::super::source::FetchStats::default()),
             None,
         );
-        let cancelled_wait = cache.get(&key).unwrap().lock(&cancelled);
-        let first_wait = first.lock(&operation);
-        let second_wait = second.lock(&operation);
-        tokio::pin!(cancelled_wait, first_wait, second_wait);
-        assert!(futures::poll!(&mut cancelled_wait).is_pending());
-        assert!(futures::poll!(&mut first_wait).is_pending());
-        assert!(futures::poll!(&mut second_wait).is_pending());
         cancelled.cancel();
         assert!(
-            matches!(cancelled_wait.await, Err(error) if super::super::is_cancelled_read(&error))
+            matches!(
+                cache.get(&key).unwrap().lock(&cancelled).await,
+                Err(error) if super::super::is_cancelled_read(&error)
+            ),
+            "cancelled operations must not acquire leases"
         );
+        let first_locked = first.try_lock().unwrap();
+        let second_locked = second.try_lock().unwrap();
         assert!(!operation.is_cancelled());
 
-        // Retain lazy index growth only in the active, admitted lease. Neither
-        // queued future may keep these allocations alive after eviction.
+        // Overlapping upgrades on one entry both count and both work.
         let before = lease.memory_size();
-        operation.run_evaluation(&permit, || {
-            assert_eq!(
-                lease
-                    .eval(&vortex_index::VixQuery::Exact {
-                        field: "level".to_owned(),
-                        token: b"a".to_vec(),
-                    })
-                    .unwrap()
-                    .count_set_bits(),
-                1
-            );
-        });
+        let first_lease = first_locked.upgrade().unwrap().unwrap();
+        let second_lease = second_locked.upgrade().unwrap().unwrap();
+        assert_eq!(
+            cache
+                .inner
+                .state
+                .lock()
+                .lru
+                .peek(&key)
+                .unwrap()
+                .leases
+                .load(Ordering::Acquire),
+            2
+        );
+        let query = vortex_index::VixQuery::Exact {
+            field: "level".to_owned(),
+            token: b"a".to_vec(),
+        };
+        assert_eq!(
+            first_lease.eval(&query).unwrap().count_set_bits()
+                + second_lease.eval(&query).unwrap().count_set_bits(),
+            2
+        );
+        drop(first_lease);
+        drop(second_lease);
+        assert_eq!(
+            cache
+                .inner
+                .state
+                .lock()
+                .lru
+                .peek(&key)
+                .unwrap()
+                .leases
+                .load(Ordering::Acquire),
+            0,
+            "lease count must return to zero"
+        );
+
+        // The first lazy index build grew the reader: the second eval
+        // reuses it, and no handle may keep it alive after eviction.
         assert!(
             lease.memory_size() > before,
             "fixture must retain lazy index growth"
@@ -558,13 +773,13 @@ mod tests {
         cache.remove(key.file());
         drop(lease);
         drop(permit);
-        assert!(weak.upgrade().is_none(), "waiters pinned an evicted reader");
-        let first_locked = first_wait.await.unwrap();
+        assert!(weak.upgrade().is_none(), "handles pinned an evicted reader");
+        // The eviction of a removed entry already dropped the reader; a
+        // fresh lookup must miss (the next open republishes cold).
         assert!(
-            first_locked.upgrade().unwrap().is_none(),
-            "expired handles must reopen"
+            cache.get(&key).is_none(),
+            "expired entries must reopen cold"
         );
-        assert!(second_wait.await.unwrap().upgrade().unwrap().is_none());
     }
 
     #[test]
@@ -655,21 +870,16 @@ mod tests {
         probe.remove(key.file());
         let cache = VixReaderCache::new(budget);
         cache
-            .put_and_observe(
-                key.clone(),
-                Arc::clone(&reader),
-                Arc::new(OperationMutex::new(())),
-                |reader, observer| {
-                    // Lazy growth during registration must be included in the initial
-                    // publication weight, even though callbacks cannot find an entry yet.
-                    let query = vortex_index::VixQuery::Exact {
-                        field: "level".to_string(),
-                        token: b"a".to_vec(),
-                    };
-                    assert_eq!(reader.eval(&query).unwrap().count_set_bits(), 1);
-                    reader.observe_memory(Arc::downgrade(&observer))
-                },
-            )
+            .put_and_observe(key.clone(), Arc::clone(&reader), |reader, observer| {
+                // Lazy growth during registration must be included in the initial
+                // publication weight, even though callbacks cannot find an entry yet.
+                let query = vortex_index::VixQuery::Exact {
+                    field: "level".to_string(),
+                    token: b"a".to_vec(),
+                };
+                assert_eq!(reader.eval(&query).unwrap().count_set_bits(), 1);
+                reader.observe_memory(Arc::downgrade(&observer))
+            })
             .unwrap();
         assert_eq!(cache.memory_size(), 0);
         assert!(!cache.contains(&key));
@@ -743,24 +953,19 @@ mod tests {
                 });
                 let mut winner_bytes = 0;
                 let error = cache
-                    .put_and_observe(
-                        key.clone(),
-                        Arc::clone(&reader),
-                        Arc::new(OperationMutex::new(())),
-                        |reader, observer| {
-                            assert!(
-                                !cache.contains(&key),
-                                "subscription must precede publication"
-                            );
-                            if publish_winner {
-                                cache.put_fixture(key.clone(), Arc::clone(&winner));
-                                winner_bytes = cache.memory_size();
-                            }
-                            vortex_index::with_read_operation(operation.clone(), || {
-                                reader.observe_memory(Arc::downgrade(&observer))
-                            })
-                        },
-                    )
+                    .put_and_observe(key.clone(), Arc::clone(&reader), |reader, observer| {
+                        assert!(
+                            !cache.contains(&key),
+                            "subscription must precede publication"
+                        );
+                        if publish_winner {
+                            cache.put_fixture(key.clone(), Arc::clone(&winner));
+                            winner_bytes = cache.memory_size();
+                        }
+                        vortex_index::with_read_operation(operation.clone(), || {
+                            reader.observe_memory(Arc::downgrade(&observer))
+                        })
+                    })
                     .unwrap_err();
                 assert!(operation.refused.load(Ordering::Acquire));
                 let error = anyhow::Error::new(error);
@@ -863,16 +1068,11 @@ mod tests {
             let first = &first;
             let handle = scope.spawn(move || {
                 cache
-                    .put_and_observe(
-                        key.clone(),
-                        Arc::clone(first),
-                        Arc::new(OperationMutex::new(())),
-                        |reader, observer| {
-                            worker_barrier.wait();
-                            worker_barrier.wait();
-                            reader.observe_memory(Arc::downgrade(&observer))
-                        },
-                    )
+                    .put_and_observe(key.clone(), Arc::clone(first), |reader, observer| {
+                        worker_barrier.wait();
+                        worker_barrier.wait();
+                        reader.observe_memory(Arc::downgrade(&observer))
+                    })
                     .unwrap();
             });
             barrier.wait();
@@ -901,20 +1101,15 @@ mod tests {
         let key = ReaderCacheKey::new("file-a".to_string(), 7, 100);
         let cache = VixReaderCache::new(usize::MAX);
         cache
-            .put_and_observe(
-                key.clone(),
-                Arc::clone(&reader),
-                Arc::new(OperationMutex::new(())),
-                |reader, observer| {
-                    cache.remove(key.file());
-                    cache.put_fixture(key.clone(), Arc::clone(&replacement));
-                    let accounted = cache.memory_size();
-                    reader.observe_memory(Arc::downgrade(&observer))?;
-                    observer.memory_changed(usize::MAX);
-                    assert_eq!(cache.memory_size(), accounted);
-                    Ok(())
-                },
-            )
+            .put_and_observe(key.clone(), Arc::clone(&reader), |reader, observer| {
+                cache.remove(key.file());
+                cache.put_fixture(key.clone(), Arc::clone(&replacement));
+                let accounted = cache.memory_size();
+                reader.observe_memory(Arc::downgrade(&observer))?;
+                observer.memory_changed(usize::MAX);
+                assert_eq!(cache.memory_size(), accounted);
+                Ok(())
+            })
             .unwrap();
         assert!(Weak::ptr_eq(
             &cache.get(&key).unwrap().reader,
@@ -951,6 +1146,121 @@ mod tests {
         let before = cache.memory_size();
         cache.remove("never-cached.vix");
         assert_eq!(cache.memory_size(), before);
+    }
+
+    /// The two budgets: fill past the hot budget and entries are DEMOTED
+    /// (metadata tier, still cached, shrunk), not evicted; pass the total
+    /// budget and only then do entries evict. A demoted entry is
+    /// byte-accounted at its shrunk weight.
+    #[test]
+    fn hot_budget_demotes_before_total_budget_evict() {
+        let fresh = || {
+            let (data, index) = reader_files(["a", "b"]);
+            VixReader::open_with_index(bytes::Bytes::from(data), index.map(bytes::Bytes::from))
+                .unwrap()
+        };
+        let key = |file: &str| ReaderCacheKey::new(file.to_string(), 7, 100);
+        let probe = fresh();
+        let entry_size = probe.memory_size() + entry_overhead(&key("file-0"));
+        drop(probe);
+        // Total budget fits 6 entries; the hot budget (1/4) fits 1.
+        let cache = VixReaderCache::new(entry_size * 6);
+        for i in 0..5 {
+            cache.put(key(&format!("file-{i}")), fresh()).unwrap();
+        }
+        let (entries, metadata, full, demotions) = {
+            let state = cache.inner.state.lock();
+            (
+                state.full_entries + state.metadata_entries,
+                state.metadata_entries,
+                state.full_entries,
+                state.demotions,
+            )
+        };
+        assert_eq!(entries, 5);
+        assert!(metadata > 0, "overflow past hot must demote");
+        assert!(full >= 1, "the hot budget still holds readers");
+        assert!(cache.memory_size() <= entry_size * 6);
+        assert_eq!(demotions, metadata);
+        // Demoted entries are still cached: a lookup hits and uses them.
+        let lease = cache
+            .get(&key("file-0"))
+            .unwrap()
+            .try_lock()
+            .unwrap()
+            .upgrade()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            lease
+                .eval(&vortex_index::VixQuery::Exact {
+                    field: "level".to_owned(),
+                    token: b"a".to_vec()
+                })
+                .unwrap()
+                .count_set_bits(),
+            1
+        );
+
+        // Past the TOTAL budget, entries evict LRU-first.
+        for i in 5..12 {
+            cache.put(key(&format!("file-{i}")), fresh()).unwrap();
+        }
+        assert!(cache.len() <= 6, "total budget must evict");
+        assert!(cache.memory_size() <= entry_size * 6);
+    }
+
+    /// An outstanding lease blocks demotion: the entry stays full while a
+    /// lease holds the reader, and the hot budget skips it.
+    #[test]
+    fn outstanding_lease_blocks_demotion() {
+        let fresh = || {
+            let (data, index) = reader_files(["a", "b"]);
+            VixReader::open_with_index(bytes::Bytes::from(data), index.map(bytes::Bytes::from))
+                .unwrap()
+        };
+        let key = |file: &str| ReaderCacheKey::new(file.to_string(), 7, 100);
+        let probe = fresh();
+        let entry_size = probe.memory_size() + entry_overhead(&key("file-0"));
+        drop(probe);
+        let cache = VixReaderCache::new(entry_size * 16);
+        cache.put(key("file-0"), fresh()).unwrap();
+        // Hold a lease on file-0 BEFORE any pressure exists. The lease's
+        // strong Arc blocks the sole-ownership demotion gate.
+        let lease = cache
+            .get(&key("file-0"))
+            .unwrap()
+            .try_lock()
+            .unwrap()
+            .upgrade()
+            .unwrap()
+            .unwrap();
+        for i in 1..8 {
+            cache.put(key(&format!("file-{i}")), fresh()).unwrap();
+        }
+        let state = cache.inner.state.lock();
+        let leased = state.lru.peek(&key("file-0")).unwrap();
+        assert_eq!(
+            leased.tier,
+            Tier::Full,
+            "an outstanding lease must block demotion"
+        );
+        assert_eq!(leased.leases.load(Ordering::Acquire), 1);
+        drop(state);
+        drop(lease);
+        // The next enforcement (a put) demotes it once free.
+        cache.put(key("file-8"), fresh()).unwrap();
+        assert_eq!(
+            cache
+                .inner
+                .state
+                .lock()
+                .lru
+                .peek(&key("file-0"))
+                .unwrap()
+                .tier,
+            Tier::Metadata
+        );
     }
 
     #[test]
