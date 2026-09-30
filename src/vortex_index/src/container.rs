@@ -58,7 +58,6 @@ use puffin::{
     FOOTER_PAYLOAD_SIZE_SIZE, FOOTER_SIZE, MAGIC, MAGIC_SIZE, MIN_FILE_SIZE, PuffinMeta,
     reader::parse_puffin_footer_from_bytes, writer::PuffinBytesWriter,
 };
-use serde::{Deserialize, Serialize};
 use vortex::{
     VortexSessionDefault,
     array::{ArrayRef, VortexSessionExecute},
@@ -508,15 +507,92 @@ pub(crate) const FIELD_TYPE_BLOOM: &str = "bloom";
 /// One entry of the `fields` file property. For term-indexed fields the array
 /// index equals the field id; column-store-only entries (e.g. `_timestamp`)
 /// are appended after all term entries.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// The wire form keeps its JSON string array (`types:["term",...]`) — only
+/// the resident representation changed: a 1-byte flag set instead of a
+/// `Vec<String>` (on the measured prod files those headers were ~2-4x the
+/// field names themselves).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct FieldEntry {
     pub name: String,
-    pub types: Vec<String>,
+    pub types: FieldTypeFlags,
+}
+
+/// Resident form of a `fields` entry's type list. Custom serde keeps the
+/// on-disk JSON identical (an array of `"term"`/`"fts"`/`"cs"`/`"bloom"`
+/// strings, in the writer's emission order). A wire marker this reader does
+/// not know deserializes to no bits — the exact semantics every older
+/// string-matching reader gave it ("not value-indexed") — and no production
+/// path re-serializes a foreign entry: the writer emits `fields` entries
+/// only from its own merge plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct FieldTypeFlags(pub(crate) u16);
+
+impl FieldTypeFlags {
+    pub(crate) const TERM: Self = Self(1 << 0);
+    pub(crate) const FTS: Self = Self(1 << 1);
+    pub(crate) const CS: Self = Self(1 << 2);
+    pub(crate) const BLOOM: Self = Self(1 << 3);
+
+    fn from_wire(ty: &str) -> Self {
+        Self(match ty {
+            FIELD_TYPE_TERM => Self::TERM.0,
+            FIELD_TYPE_FTS => Self::FTS.0,
+            FIELD_TYPE_CS => Self::CS.0,
+            FIELD_TYPE_BLOOM => Self::BLOOM.0,
+            _ => 0,
+        })
+    }
+
+    fn has(self, ty: &str) -> bool {
+        self.0 & Self::from_wire(ty).0 != 0
+    }
+
+    fn wire_bits(self) -> impl Iterator<Item = &'static str> {
+        [
+            (Self::TERM.0, FIELD_TYPE_TERM),
+            (Self::FTS.0, FIELD_TYPE_FTS),
+            (Self::CS.0, FIELD_TYPE_CS),
+            (Self::BLOOM.0, FIELD_TYPE_BLOOM),
+        ]
+        .into_iter()
+        .filter(move |(bit, _)| self.0 & bit != 0)
+        .map(|(_, ty)| ty)
+    }
+}
+
+impl serde::Serialize for FieldTypeFlags {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.wire_bits())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for FieldTypeFlags {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = FieldTypeFlags;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a list of field type strings")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut flags = 0u16;
+                while let Some(ty) = seq.next_element::<String>()? {
+                    flags |= FieldTypeFlags::from_wire(&ty).0;
+                }
+                Ok(FieldTypeFlags(flags))
+            }
+        }
+        deserializer.deserialize_seq(V)
+    }
 }
 
 impl FieldEntry {
     pub fn has_type(&self, ty: &str) -> bool {
-        self.types.iter().any(|t| t == ty)
+        self.types.has(ty)
     }
 }
 

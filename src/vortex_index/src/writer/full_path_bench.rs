@@ -39,7 +39,10 @@ use vortex::{
 };
 
 use super::*;
-use crate::{BytesRangeSource, VixDocs, VixRangeSource};
+use crate::{
+    BytesRangeSource, VixDocs, VixRangeSource,
+    container::{FIELD_TYPE_BLOOM, FIELD_TYPE_CS, FIELD_TYPE_FTS, FIELD_TYPE_TERM},
+};
 
 const EXCLUDED_VALUE_FIELDS: [&str; 2] = ["start_time", "end_time"];
 const RAW_TERM_MAX: usize = 65_532;
@@ -770,13 +773,13 @@ fn assert_variant_capabilities(
             .iter()
             .find(|entry| entry.name == field)
             .expect("field table names were checked");
-        assert!(entry.types.iter().any(|kind| kind == FIELD_TYPE_CS));
+        assert!(entry.has_type(FIELD_TYPE_CS));
         if variant.excludes_times() {
-            assert!(!entry.types.iter().any(|kind| {
-                kind == FIELD_TYPE_TERM || kind == FIELD_TYPE_FTS || kind == FIELD_TYPE_BLOOM
-            }));
+            assert!(!entry.has_type(FIELD_TYPE_TERM));
+            assert!(!entry.has_type(FIELD_TYPE_FTS));
+            assert!(!entry.has_type(FIELD_TYPE_BLOOM));
         } else {
-            assert!(entry.types.iter().any(|kind| kind == FIELD_TYPE_TERM));
+            assert!(entry.has_type(FIELD_TYPE_TERM));
         }
         assert_eq!(
             output.key_exists(field)?,

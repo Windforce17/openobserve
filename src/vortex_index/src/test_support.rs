@@ -27,9 +27,9 @@ use bytes::Bytes;
 use crate::container::{
     BLOB_TAG_BLOOM, BLOB_TAG_DICT, BLOB_TAG_DICT_BLOCKS, BLOB_TAG_DOCS, BLOB_TAG_PLIST,
     BLOB_TAG_TERMS, BLOB_TYPE_BLOOM, BLOB_TYPE_DICT, BLOB_TYPE_DICT_BLOCKS, BLOB_TYPE_DOCS,
-    BLOB_TYPE_PLIST, BLOB_TYPE_TERMS, BlobHandle, FIELD_TYPE_FTS, FIELD_TYPE_TERM, FieldEntry,
-    PROP_FIELDS, PROP_PARTIAL_FIELDS, PROP_ROW_ORDER, PROP_TOKENIZER, PROP_ZONE_MAP,
-    build_container, parse_container,
+    BLOB_TYPE_PLIST, BLOB_TYPE_TERMS, BlobHandle, FieldEntry, FieldTypeFlags, PROP_FIELDS,
+    PROP_PARTIAL_FIELDS, PROP_ROW_ORDER, PROP_TOKENIZER, PROP_ZONE_MAP, build_container,
+    parse_container,
 };
 
 /// Re-pack ONE object's container with its properties transformed by
@@ -195,11 +195,9 @@ pub fn repack_dropping_field_term_capability(index: &[u8], field: &str) -> anyho
             .iter_mut()
             .find(|candidate| candidate.name == field)
             .ok_or_else(|| anyhow::anyhow!("field {field:?} has no fields-table entry"))?;
-        let before = target.types.len();
-        target
-            .types
-            .retain(|ty| ty != FIELD_TYPE_TERM && ty != FIELD_TYPE_FTS);
-        if target.types.len() == before {
+        let before = target.types;
+        target.types.0 &= !(FieldTypeFlags::TERM.0 | FieldTypeFlags::FTS.0);
+        if target.types == before {
             anyhow::bail!("field {field:?} claims no term/fts capability to drop");
         }
         entry.1 = serde_json::to_string(&fields)?;

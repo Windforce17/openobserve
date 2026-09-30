@@ -64,7 +64,7 @@ use crate::{
         BLOB_TAG_BLOOM, BLOB_TAG_DICT, BLOB_TAG_DICT_BLOCKS, BLOB_TAG_PLIST, BLOB_TAG_STATS,
         BLOB_TAG_TERMS, BLOB_TYPE_BLOOM, BLOB_TYPE_DICT, BLOB_TYPE_DICT_BLOCKS, BLOB_TYPE_PLIST,
         BLOB_TYPE_STATS, BLOB_TYPE_TERMS, BlobPart, DICT_LAYOUT_BLOCKS, DocsBlobEncoder,
-        FIELD_TYPE_BLOOM, FIELD_TYPE_CS, FIELD_TYPE_FTS, FIELD_TYPE_TERM, FieldEntry,
+        FIELD_TYPE_BLOOM, FIELD_TYPE_FTS, FIELD_TYPE_TERM, FieldEntry, FieldTypeFlags,
         KEY_LAYOUT_FID_V2, PROP_COLUMNS, PROP_COLUMNS_COMPLETE, PROP_DICT_FIELD_PAGES,
         PROP_DICT_LAYOUT, PROP_FIELDS, PROP_KEY_LAYOUT, PROP_OVERSIZE_SKIPS, PROP_PARTIAL_FIELDS,
         PROP_PLIST_MIN_DOCS, PROP_ROW_COUNT, PROP_ROW_GROUP_SIZE, PROP_ROW_ORDER, PROP_ROW_REGIONS,
@@ -4131,33 +4131,34 @@ impl VixWriter {
     /// but claims no lookup capability — an empty `types` list unless it is
     /// also column-stored.
     fn field_entries(&self) -> Vec<FieldEntry> {
+        let types_of = |name: &str| {
+            let mut types = if self.fts_fields.contains(name) {
+                FieldTypeFlags::FTS
+            } else if self.demoted_fields.contains(name)
+                || self.value_index_excluded_fields.contains(name)
+            {
+                FieldTypeFlags::default()
+            } else if self
+                .term_field_ids
+                .get(name)
+                .is_some_and(|id| self.bloom_only.contains_key(id))
+            {
+                // #52: values in the composite bloom + docs columns only
+                FieldTypeFlags::BLOOM
+            } else {
+                FieldTypeFlags::TERM
+            };
+            if self.cs_fields.contains(name) {
+                types.0 |= FieldTypeFlags::CS.0;
+            }
+            types
+        };
         let mut entries: Vec<FieldEntry> = self
             .term_fields
             .iter()
-            .map(|name| {
-                let mut types = if self.fts_fields.contains(name) {
-                    vec![FIELD_TYPE_FTS.to_string()]
-                } else if self.demoted_fields.contains(name)
-                    || self.value_index_excluded_fields.contains(name)
-                {
-                    Vec::new()
-                } else if self
-                    .term_field_ids
-                    .get(name)
-                    .is_some_and(|id| self.bloom_only.contains_key(id))
-                {
-                    // #52: values in the composite bloom + docs columns only
-                    vec![FIELD_TYPE_BLOOM.to_string()]
-                } else {
-                    vec![FIELD_TYPE_TERM.to_string()]
-                };
-                if self.cs_fields.contains(name) {
-                    types.push(FIELD_TYPE_CS.to_string());
-                }
-                FieldEntry {
-                    name: name.clone(),
-                    types,
-                }
+            .map(|name| FieldEntry {
+                name: name.clone(),
+                types: types_of(name),
             })
             .collect();
         for field in self.docs_schema.fields() {
@@ -4170,7 +4171,7 @@ impl VixWriter {
             }
             entries.push(FieldEntry {
                 name: name.clone(),
-                types: vec![FIELD_TYPE_CS.to_string()],
+                types: FieldTypeFlags::CS,
             });
         }
         entries

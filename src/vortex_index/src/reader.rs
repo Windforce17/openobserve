@@ -572,7 +572,6 @@ pub struct VixReader {
     term_count: u64,
     row_group_size: usize,
     fields: Vec<FieldEntry>,
-    term_field_ids: HashMap<String, u16>,
     /// Field ids that own dictionary keys in this file (term/fts-typed
     /// entries, ascending). Any-field operations enumerate these for
     /// per-field point seeks/ranges (field-major keys cluster by fid).
@@ -604,7 +603,13 @@ pub struct VixReader {
     dict_index: OnceLock<crate::dict_blocks::DictIndex>,
     /// Validated optional field descriptors and their lazily retained indexes.
     dict_field_pages: Option<crate::dict_blocks::DictFieldPages>,
-    field_indexes: Vec<OnceLock<crate::dict_blocks::DictIndex>>,
+    /// Lazily built per-field restart-page indexes (field id -> parsed
+    /// index), populated on first use and drained by demotion. Nothing is
+    /// allocated until a field is actually evaluated: a page table with
+    /// thousands of entries costs one empty map at open, not one
+    /// `OnceLock<DictIndex>` slot per field (112 B each — the dominant
+    /// metadata cost of a fresh ranged reader on wide prod files).
+    field_indexes: Mutex<HashMap<u16, Arc<crate::dict_blocks::DictIndex>>>,
     /// The dictionary BLOCKS region handle (raw concatenated blocks).
     dict_blocks_blob: Option<BlobHandle>,
     /// Recently fetched dictionary blocks: immutable blob byte offset ->
@@ -672,6 +677,38 @@ pub struct VixReader {
     /// §4: the file asserts the all-present-columns invariant
     /// (`columns_complete` property). `false` when absent (fail-open).
     columns_complete: bool,
+}
+
+/// One resolved dictionary index for a field-qualified operation: the
+/// shared whole-dictionary index (no field pages) or the field's own
+/// retained restart-page index. Derefs to [`crate::dict_blocks::DictIndex`]
+/// so call sites are agnostic; the `Arc` keeps a map entry alive for the
+/// reference's lifetime even if [`VixReader::demote`] drains the map
+/// concurrently (it cannot — demotion requires exclusive access — but the
+/// clone also keeps the guard-free read path honest).
+enum FieldIndexRef<'a> {
+    Global(&'a crate::dict_blocks::DictIndex),
+    Field(Arc<crate::dict_blocks::DictIndex>),
+}
+
+impl FieldIndexRef<'_> {
+    /// Another handle to the same index (shares the per-field `Arc`).
+    fn clone_ref(&self) -> Self {
+        match self {
+            FieldIndexRef::Global(index) => FieldIndexRef::Global(index),
+            FieldIndexRef::Field(index) => FieldIndexRef::Field(Arc::clone(index)),
+        }
+    }
+}
+
+impl std::ops::Deref for FieldIndexRef<'_> {
+    type Target = crate::dict_blocks::DictIndex;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            FieldIndexRef::Global(index) => index,
+            FieldIndexRef::Field(index) => index,
+        }
+    }
 }
 impl VixReader {
     /// Open a core file from its complete DATA-object bytes, WITHOUT an
@@ -812,11 +849,14 @@ impl VixReader {
                 row_count,
             )
         };
-        let column_presence = properties
+        let mut column_presence = properties
             .get(PROP_COLUMNS)
             .map(|raw| crate::stats::parse_columns_prop(raw))
             .transpose()?
             .unwrap_or_default();
+        // serde's deserializer over-reserves; the entry list is final, so
+        // release the slack (on wide prod files this was ~40% of the table).
+        column_presence.shrink_to_fit();
         let columns_complete = properties
             .get(crate::container::PROP_COLUMNS_COMPLETE)
             .is_some_and(|v| v == "true");
@@ -833,7 +873,7 @@ impl VixReader {
                 .get(RAW_VALUE_TERMS_DISJOINT_PROPERTY)
                 .is_some_and(|value| value == "true")
         });
-        let (fields, partial_fields, term_count, tokenizer, plist_min_docs, index_container) =
+        let (mut fields, partial_fields, term_count, tokenizer, plist_min_docs, index_container) =
             match index_container {
                 Some(index) => {
                     let index_props = &index.properties;
@@ -892,7 +932,7 @@ impl VixReader {
                         .into_iter()
                         .map(|(name, _)| FieldEntry {
                             name,
-                            types: vec![FIELD_TYPE_CS.to_string()],
+                            types: crate::container::FieldTypeFlags::CS,
                         })
                         .collect();
                     (fields, HashSet::new(), 0, None, 0, None)
@@ -907,6 +947,10 @@ impl VixReader {
             .filter(|entry| entry.has_type(FIELD_TYPE_FTS))
             .map(|entry| entry.name.clone())
             .collect();
+        // The JSON deserializer over-reserves the parsed tables; they are
+        // final at open, so release the slack before the reader is charged
+        // for them (wide prod files: fields cap 2x len).
+        fields.shrink_to_fit();
 
         // Entries typed `term` or `fts` own their positional field id
         // (their value terms / tokens carry it as the composite fid prefix).
@@ -915,7 +959,6 @@ impl VixReader {
         // value lookups; their tokens are reachable through the any-field
         // scans, which never consult the map.
         let mut indexed_field_ids = Vec::new();
-        let mut term_field_ids = HashMap::new();
         for (index, entry) in fields.iter().enumerate() {
             if entry.has_type(FIELD_TYPE_TERM) || entry.has_type(FIELD_TYPE_FTS) {
                 let id = u16::try_from(index).map_err(|_| {
@@ -928,12 +971,10 @@ impl VixReader {
                         "field id 0xFFFF is reserved for key terms".to_string(),
                     ));
                 }
-                if entry.has_type(FIELD_TYPE_TERM) {
-                    term_field_ids.insert(entry.name.clone(), id);
-                }
                 indexed_field_ids.push(id);
             }
         }
+        indexed_field_ids.shrink_to_fit();
 
         let mut dict_blob = None;
         let mut dict_blocks_blob = None;
@@ -960,7 +1001,7 @@ impl VixReader {
                     .properties
                     .get(crate::container::PROP_DICT_FIELD_PAGES)
                 {
-                    let pages =
+                    let mut pages =
                         serde_json::from_str::<crate::dict_blocks::DictFieldPages>(property)
                             .map_err(|e| {
                                 VixError::Malformed(format!("invalid dict field pages: {e}"))
@@ -971,6 +1012,7 @@ impl VixReader {
                         None => 0,
                     };
                     pages.validate(blob_len)?;
+                    pages.pages.shrink_to_fit();
                     dict_field_pages = Some(pages);
                 }
                 dict_blob = Some(
@@ -1004,7 +1046,6 @@ impl VixReader {
             term_count,
             row_group_size,
             fields,
-            term_field_ids,
             indexed_field_ids,
             partial_fields,
             oversize_skips,
@@ -1013,9 +1054,7 @@ impl VixReader {
             fts_fields,
             tokenizer,
             dict_index: OnceLock::new(),
-            field_indexes: (0..dict_field_pages.as_ref().map_or(0, |p| p.pages.len()))
-                .map(|_| OnceLock::new())
-                .collect(),
+            field_indexes: Mutex::new(HashMap::new()),
             dict_field_pages,
             dict_blocks_blob,
             block_cache: Mutex::new((
@@ -1198,7 +1237,11 @@ impl VixReader {
     /// in this file, if any. fts-only fields (tokens, no raw values) return
     /// `None`: per-field value lookups on them must fall back to a scan.
     pub fn field_id(&self, name: &str) -> Option<u16> {
-        self.term_field_ids.get(name).copied()
+        self.fields
+            .iter()
+            .enumerate()
+            .find(|(_, entry)| entry.name == name && entry.has_type(FIELD_TYPE_TERM))
+            .and_then(|(index, _)| u16::try_from(index).ok())
     }
 
     /// Whether the writer certified at most one raw-value term per field/doc.
@@ -1214,7 +1257,9 @@ impl VixReader {
     /// add-filter-back path. Legacy files marking a field `["term","fts"]`
     /// keep the capability.
     pub fn has_term_capability(&self, name: &str) -> bool {
-        self.term_field_ids.contains_key(name)
+        self.fields
+            .iter()
+            .any(|entry| entry.name == name && entry.has_type(FIELD_TYPE_TERM))
     }
 
     /// Whether the file knows the field at all (term-indexed *or*
@@ -1375,10 +1420,8 @@ impl VixReader {
         }
         // Per-field restart-page indexes: each rebuilds from the retained
         // `dict` blob through `field_index` (five zero-IO slices + parse).
-        for slot in &mut self.field_indexes {
-            if let Some(index) = slot.take() {
-                released += index.memory_size();
-            }
+        for (_, index) in self.field_indexes.lock().drain() {
+            released += index.memory_size();
         }
         // Eager-tail prefixes retained by ranged sources: keep only each
         // blob's Vortex footer window (metadata re-used by every open),
@@ -1414,18 +1457,12 @@ impl VixReader {
                 0
             };
         bytes += self.fields.capacity() * std::mem::size_of::<FieldEntry>();
-        for field in &self.fields {
-            bytes += field.name.capacity()
-                + field.types.capacity() * std::mem::size_of::<String>()
-                + field.types.iter().map(String::capacity).sum::<usize>();
-        }
+        bytes += self
+            .fields
+            .iter()
+            .map(|field| field.name.capacity())
+            .sum::<usize>();
         bytes += self.indexed_field_ids.capacity() * std::mem::size_of::<u16>();
-        bytes += hash_table_bytes::<(String, u16)>(self.term_field_ids.capacity())
-            + self
-                .term_field_ids
-                .keys()
-                .map(String::capacity)
-                .sum::<usize>();
         bytes += hash_table_bytes::<(String, u64)>(self.oversize_skips.capacity())
             + self
                 .oversize_skips
@@ -1451,8 +1488,9 @@ impl VixReader {
             .row_regions
             .as_ref()
             .map_or(0, |v| v.capacity() * std::mem::size_of::<u64>());
-        bytes += self.field_indexes.capacity()
-            * std::mem::size_of::<OnceLock<crate::dict_blocks::DictIndex>>();
+        bytes += hash_table_bytes::<(u16, Arc<crate::dict_blocks::DictIndex>)>(
+            self.field_indexes.lock().capacity(),
+        );
         bytes += self.dict_field_pages.as_ref().map_or(0, |p| {
             p.pages.capacity() * std::mem::size_of::<crate::dict_blocks::DictFieldPage>()
         });
@@ -1550,21 +1588,43 @@ impl VixReader {
     /// of the two sequential probes a header-first validation would cost —
     /// and never as one batch: a range-source ladder must not merge across
     /// the unrelated global meta/first-key arrays between them.
-    fn field_index(&self, field_id: u16) -> Result<&crate::dict_blocks::DictIndex> {
+    fn field_index(&self, field_id: u16) -> Result<FieldIndexRef<'_>> {
         check_read_cancelled()?;
         crate::check_read_memory(self.memory_size())?;
         let Some(directory) = &self.dict_field_pages else {
-            return self.dict_index();
+            return Ok(FieldIndexRef::Global(self.dict_index()?));
         };
+        if directory
+            .pages
+            .binary_search_by_key(&field_id, |p| p.field_id)
+            .is_err()
+        {
+            return Ok(FieldIndexRef::Global(self.dict_index()?));
+        }
+        {
+            let indexes = self.field_indexes.lock();
+            if let Some(index) = indexes.get(&field_id) {
+                return Ok(FieldIndexRef::Field(Arc::clone(index)));
+            }
+        }
+        self.build_field_index(field_id)
+    }
+
+    /// Fetch, parse and retain one field's restart-page index. Two
+    /// concurrent first evaluations may both parse (identical results; the
+    /// loser's insert is a no-op), exactly like the previous per-slot
+    /// `OnceLock` race.
+    fn build_field_index(&self, field_id: u16) -> Result<FieldIndexRef<'_>> {
+        let directory = self
+            .dict_field_pages
+            .as_ref()
+            .expect("caller checked the page directory");
         let Ok(slot) = directory
             .pages
             .binary_search_by_key(&field_id, |p| p.field_id)
         else {
-            return self.dict_index();
+            return Ok(FieldIndexRef::Global(self.dict_index()?));
         };
-        if let Some(index) = self.field_indexes[slot].get() {
-            return Ok(index);
-        }
         let page = &directory.pages[slot];
         let blob = self
             .dict_blob
@@ -1625,7 +1685,7 @@ impl VixReader {
                 "dict field pages header mismatch".to_string(),
             ));
         }
-        let parsed = crate::dict_blocks::DictIndex::parse_field(
+        let parsed = Arc::new(crate::dict_blocks::DictIndex::parse_field(
             directory,
             page,
             metas,
@@ -1633,13 +1693,18 @@ impl VixReader {
             restarts,
             self.dict_blocks_len()?,
             self.term_count,
-        )?;
-        let size = parsed.memory_size();
-        if self.field_indexes[slot].set(parsed).is_ok() {
-            self.memory.add(size);
-            self.memory.notify();
-        }
-        Ok(self.field_indexes[slot].get().expect("set just above"))
+        )?);
+        let mut indexes = self.field_indexes.lock();
+        let index: Arc<crate::dict_blocks::DictIndex> = match indexes.entry(field_id) {
+            std::collections::hash_map::Entry::Occupied(existing) => Arc::clone(existing.get()),
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                self.memory.add(parsed.memory_size());
+                self.memory.notify();
+                slot.insert(Arc::clone(&parsed)).clone()
+            }
+        };
+        drop(indexes);
+        Ok(FieldIndexRef::Field(index))
     }
 
     /// Total byte length of the dictionary blocks region.
@@ -1841,7 +1906,13 @@ impl VixReader {
             }
         }
         struct Run<'a> {
-            index: &'a crate::dict_blocks::DictIndex,
+            /// The resolved index (shared or per-field), owned by the run:
+            /// an `Arc` clone for field pages, a plain borrow for the
+            /// whole-directory reader. Kept alive here so the fetch below
+            /// can read `block_range` after the resolution loop ends.
+            index: FieldIndexRef<'a>,
+            /// Identity of `index` for the adjacent-run merge below.
+            index_ptr: *const crate::dict_blocks::DictIndex,
             blocks: Range<usize>,
             bytes: Range<u64>,
         }
@@ -1857,7 +1928,8 @@ impl VixReader {
                     .is_ok()
             });
             let index = self.field_index(fid)?;
-            let blocks = index.field_blocks();
+            let index_ptr: *const crate::dict_blocks::DictIndex = &*index;
+            let blocks = index.field_blocks().clone();
             if blocks.is_empty() {
                 continue;
             }
@@ -1892,7 +1964,7 @@ impl VixReader {
                 let bytes = index.block_range(b, blob_len);
                 match runs.last_mut() {
                     Some(last)
-                        if std::ptr::eq(last.index, index)
+                        if std::ptr::eq(last.index_ptr, index_ptr)
                             && last.blocks.end == b
                             && last.bytes.end == bytes.start =>
                     {
@@ -1900,7 +1972,8 @@ impl VixReader {
                         last.bytes.end = bytes.end;
                     }
                     _ => runs.push(Run {
-                        index,
+                        index: index.clone_ref(),
+                        index_ptr,
                         blocks: b..b + 1,
                         bytes,
                     }),
@@ -2326,7 +2399,7 @@ impl VixReader {
     /// value-indexed in this file (the bloom backfill's key for filtering
     /// composite keys by field).
     pub fn term_field_id(&self, name: &str) -> Option<u16> {
-        self.term_field_ids.get(name).copied()
+        self.field_id(name)
     }
 
     /// Every value-term field of this file as `(field id, name)` pairs —
@@ -2334,7 +2407,10 @@ impl VixReader {
     /// FTS and key fields are excluded by construction (the map only holds
     /// `term`-typed entries).
     pub fn term_fields(&self) -> impl Iterator<Item = (u16, &str)> + '_ {
-        self.term_field_ids.iter().map(|(n, id)| (*id, n.as_str()))
+        self.fields.iter().enumerate().filter_map(|(index, entry)| {
+            (entry.has_type(FIELD_TYPE_TERM) && index <= usize::from(u16::MAX))
+                .then_some((index as u16, entry.name.as_str()))
+        })
     }
 
     /// #52: APPROXIMATE distinct-term count per value-term field, from the
@@ -2344,7 +2420,14 @@ impl VixReader {
     /// boundary — callers gate decisions on ratios plus a large absolute
     /// floor, where block granularity is noise. Returns `(name, count)`.
     pub fn term_counts_by_field(&self) -> Result<Vec<(String, u64)>> {
-        if self.term_count() == 0 || self.term_field_ids.is_empty() {
+        if self.term_count() == 0 {
+            return Ok(Vec::new());
+        }
+        if !self
+            .fields
+            .iter()
+            .any(|entry| entry.has_type(FIELD_TYPE_TERM))
+        {
             return Ok(Vec::new());
         }
         let index = self.dict_index()?;
@@ -3752,9 +3835,13 @@ impl VixReader {
         let mut batch_bytes = 0u64;
         for &fid in fields {
             check_read_cancelled()?;
-            let index = match global {
+            let field_index;
+            let index: &crate::dict_blocks::DictIndex = match global {
                 Some(index) => index,
-                None => self.field_index(fid)?,
+                None => {
+                    field_index = self.field_index(fid)?;
+                    &field_index
+                }
             };
             for &leaf in &order.value {
                 check_read_cancelled()?;
@@ -4435,6 +4522,7 @@ impl VixReader {
         let (_, fid) =
             split_key(key).ok_or_else(|| VixError::Malformed("invalid composite key".into()))?;
         let index = self.field_index(fid)?;
+        let index: &crate::dict_blocks::DictIndex = &index;
         let Some(b) = index.predecessor_block(key)? else {
             return Ok(None);
         };
@@ -4469,6 +4557,7 @@ impl VixReader {
         let (_, fid) =
             split_key(lower).ok_or_else(|| VixError::Malformed("invalid composite key".into()))?;
         let index = self.field_index(fid)?;
+        let index: &crate::dict_blocks::DictIndex = &index;
         let bounds = index.field_blocks();
         let start = index
             .predecessor_block(lower)?
@@ -4727,6 +4816,7 @@ impl VixReader {
         }
         let index = self.field_index(field_id)?;
         let (lower, upper) = Self::v2_field_range(field_id);
+        let index: &crate::dict_blocks::DictIndex = &index;
         let field_start = self.ordinal_lower_bound(index, &lower)?;
         let field_end = self.ordinal_lower_bound(index, &upper)?;
         let (num_lower, num_upper) =
@@ -4758,6 +4848,7 @@ impl VixReader {
         }
         debug_assert!(ordinals.windows(2).all(|w| w[0] < w[1]));
         let index = self.field_index(field_id)?;
+        let index: &crate::dict_blocks::DictIndex = &index;
         let block_count = index.block_count();
         // block of each ordinal: last block whose first_ordinal <= ordinal
         let block_of = |ordinal: u64| -> usize {
@@ -5302,6 +5393,86 @@ impl VixReader {
             }
         }
         Ok(result)
+    }
+
+    /// Test-only: the documented metadata floor a FRESH reader is allowed
+    /// to retain (see the budget test in `tests.rs` for the formula). A
+    /// generous upper bound — it charges full key-set bucket bytes and
+    /// every per-blob footer cell, plus slack for allocator headers — so
+    /// `memory_size()` of a fresh reader must come in at or below it.
+    pub(crate) fn debug_metadata_floor_for_tests(&self) -> usize {
+        let mut floor = std::mem::size_of::<Self>();
+        floor += self.fields.len() * std::mem::size_of::<FieldEntry>();
+        floor += self.fields.iter().map(|f| f.name.len()).sum::<usize>();
+        floor += self.indexed_field_ids.len() * std::mem::size_of::<u16>();
+        for set in [&self.partial_fields, &self.fts_fields] {
+            floor += hash_table_bytes::<String>(set.capacity());
+            floor += set.iter().map(String::capacity).sum::<usize>();
+        }
+        floor += hash_table_bytes::<(String, u64)>(self.oversize_skips.capacity());
+        floor += self
+            .oversize_skips
+            .keys()
+            .map(String::capacity)
+            .sum::<usize>();
+        floor += self.tokenizer.as_ref().map_or(0, String::capacity);
+        floor += self.column_presence.len() * std::mem::size_of::<(String, Option<u64>)>();
+        floor += self
+            .column_presence
+            .iter()
+            .map(|(name, _)| name.len())
+            .sum::<usize>();
+        floor += self
+            .zone_map
+            .as_ref()
+            .map_or(0, |v| v.len() * std::mem::size_of::<ZoneChunk>());
+        floor += self
+            .row_regions
+            .as_ref()
+            .map_or(0, |v| v.len() * std::mem::size_of::<u64>());
+        floor += self.dict_field_pages.as_ref().map_or(0, |p| {
+            p.pages.len() * std::mem::size_of::<crate::dict_blocks::DictFieldPage>()
+        });
+        // per-field index map: empty at open, charge a bucket allowance for
+        // the guard cell itself
+        floor += std::mem::size_of::<
+            parking_lot::Mutex<HashMap<u16, Arc<crate::dict_blocks::DictIndex>>>,
+        >();
+        floor += hash_table_bytes::<(u16, Arc<crate::dict_blocks::DictIndex>)>(0);
+        // ranged blob footer-state cells (2 usize-class fields each) and
+        // any retained tail window of a straddling blob
+        let mut sources = std::collections::HashSet::new();
+        for blob in [
+            Some(&self.docs_blob),
+            self.dict_blob.as_ref(),
+            self.dict_blocks_blob.as_ref(),
+            self.terms_blob.as_ref(),
+            self.bloom_blob.as_ref(),
+            self.plist_blob.as_ref(),
+            self.stats_blob.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            match blob {
+                BlobHandle::Mem(bytes) => {
+                    floor += bytes.len() + RETAINED_BYTES_OVERHEAD;
+                }
+                BlobHandle::Ranged(blob) => {
+                    floor += std::mem::size_of::<crate::source::RangedBlob>()
+                        + 2 * std::mem::size_of::<usize>()
+                        + std::mem::size_of::<std::sync::Arc<dyn crate::source::VixRangeSource>>();
+                    if sources.insert(Arc::as_ptr(&blob.source) as *const () as usize) {
+                        floor += blob.source.retained_bytes();
+                    }
+                }
+            }
+        }
+        // ReaderMemory cell + guard cell + retained-tail bookkeeping slack
+        floor += std::mem::size_of::<ReaderMemory>() + 8 * std::mem::size_of::<usize>();
+        // allocator header slack for every retained allocation above
+        floor += 512;
+        floor
     }
 }
 

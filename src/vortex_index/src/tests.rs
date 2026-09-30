@@ -4787,6 +4787,72 @@ mod ranged {
         );
     }
 
+    /// Fresh-reader metadata budget (the `.184` metadata diet): a freshly
+    /// opened ranged reader must already sit at its metadata floor — the
+    /// formula the reader is allowed to retain at open, everything else
+    /// (per-field index slots, field-id maps, per-type string tables) must
+    /// stay unallocated until a query touches it.
+    ///
+    /// floor = reader struct
+    ///       + fields: len × sizeof(FieldEntry) + Σ name bytes
+    ///       + indexed field ids: len × sizeof(u16)
+    ///       + fts/partial/oversize key sets (Σ name bytes + bucket bytes)
+    ///       + column presence: len × sizeof(entry) + Σ name bytes
+    ///       + zone map: len × sizeof(ZoneChunk)
+    ///       + row regions: len × sizeof(u64)
+    ///       + dict field pages: len × sizeof(DictFieldPage)
+    ///       + the tail-window bytes a straddling blob must keep servable
+    ///       + blob footer-state cells (2 pointers per ranged blob)
+    ///       + the ReaderMemory cell itself
+    /// (the fixture has no `plist`/`bloom` blobs and its `terms`/`docs`
+    /// tails sit fully inside the blob, so the tail term is 0 here)
+    #[test]
+    fn fresh_ranged_reader_metadata_budget_formula() {
+        let (data, index) = build_large_core_file();
+        let source = PairSource::new(data, index);
+        let reader = source.open_with_tail(PROD_SIDECAR_TAIL);
+
+        let footer_meta = crate::reader::VixReader::debug_metadata_floor_for_tests(&reader);
+        let fresh = reader.memory_size();
+        eprintln!("[fresh budget] fresh={fresh} formula={footer_meta}");
+        assert!(
+            fresh <= footer_meta,
+            "a fresh ranged reader must retain only the documented metadata \
+             floor: {fresh} > {footer_meta}"
+        );
+    }
+
+    /// Opening from the eager tail must not retain the tail allocation: a
+    /// `Bytes` slice of the fetched tail would pin the whole eager window
+    /// (256 KiB in production); the diet requires each tail-resident blob
+    /// to own a compact copy of only its own bytes. A fresh reader's size
+    /// must therefore stay near the sum of the blobs it actually holds —
+    /// not the eager tail it was sliced from.
+    #[test]
+    fn fresh_reader_does_not_retain_eager_tail_allocation() {
+        let (data, index) = build_large_core_file();
+        let source = PairSource::new(data.clone(), index.clone());
+        // 256 KiB tails dwarf this fixture's sidecar: a retained slice
+        // would exceed the sum-of-retained-blobs bound by >100 KiB.
+        let reader = source.open_with_tail(256 * 1024);
+        let fresh = reader.memory_size();
+        let tail_total = (data.len() + index.len()).min(2 * 256 * 1024) as usize;
+        assert!(
+            fresh < tail_total,
+            "fresh reader ({fresh} B) retains a whole-tail slice \
+             (eager window {tail_total} B)"
+        );
+        // And the in-memory open of the same pair — which owns whole
+        // objects — must dwarf the ranged fresh reader's metadata floor.
+        let mem = VixReader::open_with_index(data, Some(index)).unwrap();
+        assert!(
+            mem.memory_size() > fresh,
+            "the ranged fresh size ({fresh}) should be far below the \
+             whole-object open ({})",
+            mem.memory_size()
+        );
+    }
+
     /// Production sidecar eager tail (`ZO_VIX_EAGER_TAIL_BYTES` on the obs
     /// queriers); the plan below is stated for it.
     const PROD_SIDECAR_TAIL: u64 = 256 * 1024;
