@@ -23,7 +23,8 @@
 //! or another get/put. Sized by `ZO_VIX_READER_CACHE_MAX_SIZE` (default 10% of
 //! RAM, no upper clamp; falls back to the inverted-index footer-cache knob
 //! `ZO_INVERTED_INDEX_FOOTER_CACHE_MAX_SIZE` when only that one is set).
-//! Eviction is LRU (a get refreshes the entry). Reader identity includes the
+//! Admission is by REUSE DISTANCE (see [`VixReaderCache`]); eviction within
+//! the cache is LRU (a get refreshes the entry). Reader identity includes the
 //! logical data key plus the immutable sidecar generation and its exact size:
 //! generation prevents equal-sized heals from sharing parsed state, while
 //! size remains a compatibility witness. Broadcast invalidation can still
@@ -118,6 +119,11 @@ struct CachedReader {
     tier: Tier,
     accounted: usize,
     observer: Arc<MemoryObserver>,
+    /// Lookup clock value of the latest demand access (`CacheState::lookups`).
+    last_lookup: u64,
+    /// Lookups between the two latest demand accesses, once there have been
+    /// two: the admission evidence (see `CacheInner::admit`).
+    reuse: Option<u64>,
 }
 
 /// Waiting handles never own reader allocations. A cache eviction can
@@ -224,102 +230,16 @@ impl ReaderLease {
 type ReaderLru = LruCache<ReaderCacheKey, CachedReader>;
 
 /// Fraction of the byte budget forming the admission WINDOW: every newly
-/// published reader lands here first (plain LRU among newcomers) and only
+/// published reader lands here first (FIFO among newcomers) and only
 /// competes for the main cache when the window overflows. A burst of panels
 /// over the same new files hits the window; a one-off scan streams through
 /// it without disturbing the main cache.
 const WINDOW_FRACTION: usize = 16;
 
-/// Expected bytes per cached reader (prod 2026-10-01 `.189`: 3.22 GB over
-/// 3,100 entries, ~1.04 MB with the 768 KiB eager tails). Sizes the
-/// frequency sketch and its reset period only - the byte budgets stay
-/// exact.
-const SKETCH_ENTRY_BYTES: usize = 1024 * 1024;
-
-/// Approximate access frequency of every key looked up, hit or miss, with
-/// four 4-bit counters per key (a count-min sketch, Caffeine's TinyLFU
-/// shape). All counters halve once `sample_size` lookups have been
-/// recorded, so a file nobody asked about since the last reset decays to
-/// 0 and a newcomer can displace it.
-struct FrequencySketch {
-    table: Vec<u64>,
-    mask: u64,
-    size: u64,
-    sample_size: u64,
-}
-
-impl FrequencySketch {
-    const SEEDS: [u64; 4] = [
-        0xc3a5_c85c_97cb_3127,
-        0xb492_b66f_be98_f273,
-        0x9ae1_6a3b_2f90_404f,
-        0xcbf2_9ce4_8422_2325,
-    ];
-
-    /// Sketch size bounds in 64-bit words (16 counters each). The floor
-    /// (8 KiB) keeps collision-driven over-estimates negligible for small
-    /// caches - four counters per key over 16k counters; the ceiling
-    /// (2 MiB) keeps a `usize::MAX` budget from sizing the sketch, and
-    /// 262k words already cover 32x the entries a 4 GiB cache holds.
-    const MIN_WORDS: usize = 1 << 10;
-    const MAX_WORDS: usize = 1 << 18;
-
-    /// Reset period bounds, in lookups. Halving every ten lookups per
-    /// cached entry (Caffeine's rule) is what lets popularity DECAY: a
-    /// burst of 7 d scans must not leave its files out-ranking the
-    /// dashboards' files for long. At prod's ~4k entries that is ~40k
-    /// lookups - six 7 d passes or ~30 dashboard queries, about half an
-    /// hour of traffic.
-    const MIN_SAMPLE: u64 = 10_000;
-    const MAX_SAMPLE: u64 = 1_000_000;
-
-    fn new(expected_entries: usize) -> Self {
-        let len = expected_entries
-            .clamp(Self::MIN_WORDS, Self::MAX_WORDS)
-            .next_power_of_two();
-        Self {
-            table: vec![0; len],
-            mask: (len - 1) as u64,
-            size: 0,
-            sample_size: (10 * expected_entries as u64).clamp(Self::MIN_SAMPLE, Self::MAX_SAMPLE),
-        }
-    }
-
-    /// Table slot and nibble shift of counter `i` for `hash`.
-    fn slot(&self, hash: u64, i: usize) -> (usize, u32) {
-        let mut h = hash
-            .wrapping_add(Self::SEEDS[i])
-            .wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        h ^= h >> 29;
-        ((h & self.mask) as usize, ((h >> 59) as u32 & 15) * 4)
-    }
-
-    fn frequency(&self, hash: u64) -> u8 {
-        (0..4)
-            .map(|i| {
-                let (slot, shift) = self.slot(hash, i);
-                ((self.table[slot] >> shift) & 0xF) as u8
-            })
-            .min()
-            .unwrap_or(0)
-    }
-
-    fn increment(&mut self, hash: u64) {
-        for i in 0..4 {
-            let (slot, shift) = self.slot(hash, i);
-            if (self.table[slot] >> shift) & 0xF < 15 {
-                self.table[slot] += 1 << shift;
-            }
-        }
-        self.size += 1;
-        if self.size >= self.sample_size {
-            for word in &mut self.table {
-                *word = (*word >> 1) & 0x7777_7777_7777_7777;
-            }
-            self.size /= 2;
-        }
-    }
-}
+/// Extra non-resident history entries kept beyond `2 x` the resident count,
+/// so small caches (tests, tiny budgets) still remember a scan's worth of
+/// rejected files.
+const HISTORY_SLACK: usize = 1024;
 
 fn key_hash(key: &ReaderCacheKey) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -328,8 +248,16 @@ fn key_hash(key: &ReaderCacheKey) -> u64 {
     hasher.finish()
 }
 
+/// Access history of a file that is NOT resident (never admitted, rejected
+/// or evicted): what the next publish needs to compute its reuse distance.
+#[derive(Clone, Copy)]
+struct History {
+    last_lookup: u64,
+    reuse: Option<u64>,
+}
+
 struct CacheState {
-    /// Newcomers, LRU among themselves; bounded by `CacheInner::window_bytes`.
+    /// Newcomers, FIFO among themselves; bounded by `CacheInner::window_bytes`.
     window: ReaderLru,
     /// Admitted readers, LRU; `total` (window + main) is bounded by `max_bytes`.
     main: ReaderLru,
@@ -345,11 +273,17 @@ struct CacheState {
     metadata_entries: usize,
     demotions: usize,
     rejections: usize,
-    sketch: FrequencySketch,
+    /// Demand lookups so far (`get`, hit or miss): the clock that recency,
+    /// reuse distance and victim age are measured on.
+    lookups: u64,
+    /// Non-resident files by key hash, LRU among themselves; bounded to
+    /// `2 x len() + HISTORY_SLACK`. Lets a file rejected or evicted a
+    /// moment ago prove its reuse distance when it is asked for again.
+    history: LruCache<u64, History>,
 }
 
 impl CacheState {
-    fn new(max_bytes: usize) -> Self {
+    fn new() -> Self {
         Self {
             window: LruCache::new_unbounded(),
             main: LruCache::new_unbounded(),
@@ -360,7 +294,8 @@ impl CacheState {
             metadata_entries: 0,
             demotions: 0,
             rejections: 0,
-            sketch: FrequencySketch::new(max_bytes / SKETCH_ENTRY_BYTES),
+            lookups: 0,
+            history: LruCache::new_unbounded(),
         }
     }
 
@@ -384,12 +319,56 @@ impl CacheState {
         }
     }
 
-    /// Refresh the LRU position of `key` in whichever segment holds it.
+    /// A demand access of a resident `key`: record its recency and reuse
+    /// distance, and refresh its LRU position in main. The window is FIFO:
+    /// a hit there does not extend the newcomer's residency, so every
+    /// newcomer gets the same chance to show a reuse before it is spilled,
+    /// and the one spilled is always the one that has had that chance the
+    /// longest.
     fn touch(&mut self, key: &ReaderCacheKey) -> Option<&mut CachedReader> {
-        if self.main.contains_key(key) {
+        let now = self.lookups;
+        let entry = if self.main.contains_key(key) {
             self.main.get_mut(key)
         } else {
-            self.window.get_mut(key)
+            self.window.peek_mut(key)
+        }?;
+        entry.reuse = Some(now - entry.last_lookup);
+        entry.last_lookup = now;
+        Some(entry)
+    }
+
+    /// A demand access of a NON-resident `key`: remember it, so the publish
+    /// that follows (or a later one) knows its reuse distance.
+    fn record_miss(&mut self, hash: u64) {
+        let now = self.lookups;
+        let reuse = self.history.get(&hash).map(|h| now - h.last_lookup);
+        self.history.insert(
+            hash,
+            History {
+                last_lookup: now,
+                reuse,
+            },
+        );
+        self.trim_history();
+    }
+
+    /// A resident leaves the cache (rejected, evicted or shed): keep its
+    /// recency so a prompt re-request can prove its reuse distance.
+    fn remember(&mut self, key: &ReaderCacheKey, entry: &CachedReader) {
+        self.history.insert(
+            key_hash(key),
+            History {
+                last_lookup: entry.last_lookup,
+                reuse: entry.reuse,
+            },
+        );
+        self.trim_history();
+    }
+
+    fn trim_history(&mut self) {
+        let cap = 2 * self.len() + HISTORY_SLACK;
+        while self.history.len() > cap {
+            self.history.remove_lru();
         }
     }
 
@@ -416,6 +395,15 @@ impl CacheState {
         if in_window {
             self.window_total -= entry.accounted;
         }
+    }
+
+    /// The eviction victim: the main LRU front, with its age in lookups
+    /// (lookups since its last demand access).
+    fn victim(&self) -> Option<(ReaderCacheKey, u64)> {
+        self.main
+            .iter()
+            .next()
+            .map(|(key, entry)| (key.clone(), self.lookups - entry.last_lookup))
     }
 
     fn update_gauges(&self) {
@@ -501,40 +489,64 @@ impl CacheInner {
     /// Last resort after growth of an already-cached reader that demotion
     /// could not absorb: evict LRU-first, main before window, until `total`
     /// fits the hard budget less `extra`. Not an admission decision, so no
-    /// frequency comparison applies. Evicted entries are returned for
+    /// reuse comparison applies. Evicted entries are returned for
     /// destruction after the state lock drops (never under it).
     fn evict_for_growth(&self, state: &mut CacheState, extra: usize) -> Vec<CachedReader> {
         let mut evicted = Vec::new();
         while state.total > self.max_bytes.saturating_sub(extra) {
-            let (entry, in_window) = match state.main.remove_lru() {
-                Some((_, entry)) => (entry, false),
+            let (key, entry, in_window) = match state.main.remove_lru() {
+                Some((key, entry)) => (key, entry, false),
                 None => match state.window.remove_lru() {
-                    Some((_, entry)) => (entry, true),
+                    Some((key, entry)) => (key, entry, true),
                     None => break,
                 },
             };
             state.forget(&entry, in_window);
+            state.remember(&key, &entry);
             evicted.push(entry);
         }
         evicted
     }
 
     /// Insert a newcomer: into the window, then spill the window's LRU into
-    /// the main cache under TinyLFU admission - a candidate displaces the
-    /// main LRU victim only while its lookup frequency is strictly higher.
-    /// A repeated scan larger than the cache therefore keeps a STABLE subset
-    /// (every later scan hits it) instead of churning the whole cache, while
-    /// files looked up repeatedly (dashboards over the same hours) always
-    /// earn their way in. Rejected candidates are returned for destruction
-    /// after the lock drops.
+    /// the main cache under REUSE-DISTANCE admission. A spilled candidate
+    /// displaces the main LRU victim only while the candidate's reuse
+    /// distance (lookups between its two latest demand accesses - a window
+    /// hit, or a re-request after a rejection/eviction still in `history`)
+    /// is strictly shorter than the victim's age (lookups since its last
+    /// access). That is LRU's own keep/evict judgement applied to the
+    /// newcomer, so:
+    /// - a file asked for once (a one-off scan's) has no reuse distance and never displaces
+    ///   anything - it lives in the window only;
+    /// - a scan repeated over more files than fit keeps a STABLE subset: on the next pass every
+    ///   candidate's reuse distance is the whole pass, never shorter than the age of a resident the
+    ///   pass has touched;
+    /// - a file asked for again within a dashboard's refresh interval (new hourly files, a set
+    ///   evicted by a scan) displaces residents nobody has asked for that long - exactly when plain
+    ///   LRU would have kept it.
+    ///
+    /// Rejected candidates are returned for destruction after the lock drops.
     fn admit(
         &self,
         state: &mut CacheState,
         key: ReaderCacheKey,
-        entry: CachedReader,
+        mut entry: CachedReader,
     ) -> Vec<CachedReader> {
         let mut dropped = Vec::new();
         let size = entry.accounted;
+        // Carry the non-resident history (the lookup that missed, and its
+        // distance from the one before) into the entry.
+        let now = state.lookups;
+        match state.history.remove(&key_hash(&key)) {
+            Some(history) => {
+                entry.last_lookup = history.last_lookup;
+                entry.reuse = history.reuse;
+            }
+            None => {
+                entry.last_lookup = now;
+                entry.reuse = None;
+            }
+        }
         state.total += size;
         state.hot += size;
         state.full_entries += 1;
@@ -551,19 +563,18 @@ impl CacheInner {
             // readers grow when a lookup rebuilds their lazily built state,
             // so growth is absorbed by demoting other full readers instead
             // of evicting entries the next pass of a scan needs.
-            let candidate_hash = key_hash(&candidate_key);
             let mut admitted = true;
             while state.total > self.admission_bytes() {
-                let Some((victim_key, _)) = state.main.iter().next() else {
+                let Some((victim_key, victim_age)) = state.victim() else {
                     // nothing to compete with: a lone entry may use the
                     // whole hard budget, more does not fit at all
                     admitted = state.total <= self.max_bytes;
                     break;
                 };
-                let victim_frequency = state.sketch.frequency(key_hash(victim_key));
-                if state.sketch.frequency(candidate_hash) > victim_frequency {
-                    let (_, victim) = state.main.remove_lru().expect("victim present");
+                if candidate.reuse.is_some_and(|reuse| reuse < victim_age) {
+                    let victim = state.main.remove(&victim_key).expect("victim present");
                     state.forget(&victim, false);
+                    state.remember(&victim_key, &victim);
                     dropped.push(victim);
                 } else {
                     admitted = false;
@@ -574,6 +585,7 @@ impl CacheInner {
                 state.main.insert(candidate_key, candidate);
             } else {
                 state.forget(&candidate, false);
+                state.remember(&candidate_key, &candidate);
                 state.rejections += 1;
                 metrics::VIX_READER_CACHE_REJECTIONS_TOTAL
                     .with_label_values::<&str>(&[])
@@ -670,8 +682,9 @@ fn entry_overhead(key: &ReaderCacheKey) -> usize {
 }
 
 /// A size-bounded, scan-resistant cache of parsed readers keyed by immutable
-/// sidecar identity: an admission window plus a TinyLFU-filtered main LRU,
-/// with a hot/metadata tier split inside main.
+/// sidecar identity: an admission window plus a main LRU guarded by
+/// reuse-distance admission (`CacheInner::admit`), with a hot/metadata tier
+/// split inside main.
 ///
 /// The budget/gauges describe cache-owned reader weights plus entry metadata,
 /// not process RSS: active Arc users may pin evicted readers until they finish.
@@ -689,7 +702,7 @@ impl VixReaderCache {
     pub fn new(max_bytes: usize) -> Self {
         Self {
             inner: Arc::new(CacheInner {
-                state: parking_lot::Mutex::new(CacheState::new(max_bytes)),
+                state: parking_lot::Mutex::new(CacheState::new()),
                 max_bytes,
                 hot_bytes: max_bytes / HOT_BUDGET_FRACTION,
                 window_bytes: max_bytes / WINDOW_FRACTION,
@@ -697,17 +710,23 @@ impl VixReaderCache {
         }
     }
 
-    /// Get a parsed reader, refreshing its LRU position. Every lookup, hit
-    /// or miss, is recorded in the frequency sketch that drives admission.
+    /// A DEMAND access: get a parsed reader, refreshing its LRU position
+    /// and recency. Every lookup, hit or miss, advances the lookup clock
+    /// that admission measures reuse distance and victim age on - so call
+    /// it once per file per query; probes use [`Self::peek`].
     pub(super) fn get(&self, key: &ReaderCacheKey) -> Option<ReaderHandle> {
         let found = {
             let mut state = self.inner.state.lock();
-            state.sketch.increment(key_hash(key));
-            state.touch(key).map(|entry| ReaderHandle {
+            state.lookups += 1;
+            let found = state.touch(key).map(|entry| ReaderHandle {
                 reader: Arc::downgrade(&entry.reader),
                 leases: Arc::clone(&entry.leases),
                 has_index: entry.reader.has_index(),
-            })
+            });
+            if found.is_none() {
+                state.record_miss(key_hash(key));
+            }
+            found
         };
         match &found {
             Some(_) => metrics::VIX_READER_CACHE_HITS_TOTAL
@@ -725,9 +744,22 @@ impl VixReaderCache {
         self.inner.state.lock().contains_key(key)
     }
 
-    /// Copy immutable ordering facts without pinning or exposing a reader.
+    /// A NON-demand access (warming, planning probes): the handle if the
+    /// reader is resident, without refreshing LRU, recency, the lookup
+    /// clock or hit/miss metrics. A query's own use of the file is the one
+    /// `get` that counts.
+    pub(super) fn peek(&self, key: &ReaderCacheKey) -> Option<ReaderHandle> {
+        self.inner.state.lock().peek(key).map(|entry| ReaderHandle {
+            reader: Arc::downgrade(&entry.reader),
+            leases: Arc::clone(&entry.leases),
+            has_index: entry.reader.has_index(),
+        })
+    }
+
+    /// Copy immutable ordering facts without pinning or exposing a reader;
+    /// a planning probe, not a demand access.
     pub fn ordering(&self, key: &ReaderCacheKey) -> Option<(bool, Option<usize>, bool)> {
-        self.inner.state.lock().touch(key).map(|entry| {
+        self.inner.state.lock().peek(key).map(|entry| {
             (
                 entry.reader.row_order().is_ts_desc(),
                 entry.reader.ts_desc_row_ranges().map(|ranges| ranges.len()),
@@ -739,7 +771,7 @@ impl VixReaderCache {
     /// Publish an already operation-admitted cold reader. Duplicate opens
     /// stay private; they cannot mutate the winner through an escaping Arc.
     /// The reader may be REJECTED by admission (returned lease still valid):
-    /// a one-off scan's files do not displace frequently used ones.
+    /// a one-off scan's files do not displace recently reused ones.
     pub(super) fn put(
         &self,
         key: ReaderCacheKey,
@@ -792,6 +824,8 @@ impl VixReaderCache {
                     tier: Tier::Full,
                     accounted: size,
                     observer: Arc::clone(&observer),
+                    last_lookup: 0,
+                    reuse: None,
                 },
             );
             // A new admission can push older full readers past the hot
@@ -1039,18 +1073,18 @@ mod tests {
             assert!(cache.get(&key(&format!("file-{i}"))).is_none());
             cache.put_fixture(key(&format!("file-{i}")), Arc::clone(&reader));
         }
-        // A newcomer seen exactly as often as the LRU victim is REJECTED:
+        // A newcomer asked for once has no reuse distance and is REJECTED:
         // one-off scans never churn the cache.
         assert!(cache.get(&key("file-2")).is_none());
         cache.put_fixture(key("file-2"), Arc::clone(&reader));
         assert!(cache.contains(&key("file-0")));
         assert!(
             !cache.contains(&key("file-2")),
-            "equal frequency does not displace"
+            "a single lookup does not displace"
         );
         assert_eq!(cache.inner.state.lock().rejections, 1);
-        // Looked up again (now more frequent than the untouched victim), it
-        // evicts the oldest entry to fit.
+        // Asked for again (a reuse distance shorter than the untouched
+        // victim's age), it evicts the oldest entry to fit.
         assert!(cache.get(&key("file-2")).is_none());
         cache.put_fixture(key("file-2"), Arc::clone(&reader));
         assert!(cache.get(&key("file-0")).is_none());
@@ -1391,7 +1425,8 @@ mod tests {
     /// byte-accounted at its shrunk weight.
     /// Scan resistance: a repeated sequential scan over a working set 1.6x
     /// the cache (prod: a 7 d query over ~6,900 files per follower against
-    /// ~4,200 cached readers) keeps a STABLE subset under TinyLFU admission.
+    /// ~4,200 cached readers) keeps a STABLE subset under reuse-distance
+    /// admission.
     /// Plain LRU gets 0 hits on every pass after the first (each miss evicts
     /// the entry the scan needs next); here the second and third passes hit
     /// the admitted subset, and entries looked up often (a dashboard's
@@ -1433,20 +1468,123 @@ mod tests {
         );
         assert!(cache.memory_size() <= entry_size * capacity);
 
-        // A frequently used file (a dashboard panel's, looked up more often
-        // than the scan has touched any of its files) earns admission over
-        // the scan's files and then survives further scans.
+        // A dashboard panel's file, asked for again a few lookups later
+        // (a reuse distance far shorter than the scan's), earns admission
+        // over the scan's files; refreshed during the next pass, it is
+        // never the scan's victim.
         let hot = ReaderCacheKey::new("dashboard-file".to_string(), 7, 100);
-        for _ in 0..6 {
-            assert!(cache.get(&hot).is_none());
+        assert!(cache.get(&hot).is_none());
+        for i in 0..4 {
+            assert!(cache.get(&key(i)).is_some());
         }
+        assert!(cache.get(&hot).is_none());
         cache.put_fixture(hot.clone(), Arc::clone(&reader));
-        assert!(cache.contains(&hot), "a frequent newcomer must be admitted");
-        pass(&cache);
         assert!(
-            cache.get(&hot).is_some(),
-            "a frequent entry must survive a scan"
+            cache.contains(&hot),
+            "a re-requested newcomer must be admitted"
         );
+        for i in 0..working_set {
+            if i % 16 == 8 {
+                assert!(
+                    cache.get(&hot).is_some(),
+                    "a refreshed entry must survive a scan"
+                );
+            }
+            if cache.get(&key(i)).is_none() {
+                cache.put_fixture(key(i), Arc::clone(&reader));
+            }
+        }
+        assert!(cache.get(&hot).is_some());
+    }
+
+    /// The production shape the policy exists for: dashboards over the
+    /// recent day's files (a few replaced by merge output between queries),
+    /// 7 d scans over a superset too large to fit, dashboards again.
+    /// Recent files must survive scans, and a brand-new file must cost
+    /// exactly one miss - never a run of rejections.
+    #[test]
+    fn dashboards_survive_scans_and_new_files_cost_one_miss() {
+        let reader = small_reader();
+        let key = |i: usize| ReaderCacheKey::new(format!("f-{i}"), 7, 100);
+        let entry_size = reader.memory_size() + entry_overhead(&key(0));
+        // admission budget 45 entries, window 3; recent 12 of a 60-file scan
+        let cache = VixReaderCache::new(entry_size * 60);
+        let mut next_id = 1_000_000usize;
+        let mut recent: std::collections::VecDeque<usize> = (0..12)
+            .map(|_| {
+                next_id += 1;
+                next_id
+            })
+            .collect();
+        let old: Vec<usize> = (0..48).collect();
+        let mut seen = std::collections::HashSet::new();
+        // lookup + publish-on-miss: (hits, misses on files seen before, misses on new files)
+        let mut pass = |cache: &VixReaderCache, files: &[usize]| -> (usize, usize, usize) {
+            let (mut hits, mut repeat_misses, mut new_misses) = (0, 0, 0);
+            for &i in files {
+                if cache.get(&key(i)).is_some() {
+                    hits += 1;
+                } else {
+                    if seen.insert(i) {
+                        new_misses += 1;
+                    } else {
+                        repeat_misses += 1;
+                    }
+                    cache.put_fixture(key(i), Arc::clone(&reader));
+                }
+            }
+            (hits, repeat_misses, new_misses)
+        };
+        let dashboards = |recent: &std::collections::VecDeque<usize>| -> Vec<usize> {
+            recent.iter().rev().copied().collect()
+        };
+        let scan = |recent: &std::collections::VecDeque<usize>| -> Vec<usize> {
+            let mut files = dashboards(recent);
+            files.extend(old.iter().rev());
+            files
+        };
+        let mut turnover = |recent: &mut std::collections::VecDeque<usize>| {
+            recent.pop_front();
+            next_id += 1;
+            recent.push_back(next_id);
+        };
+
+        for i in 0..3 {
+            if i > 0 {
+                turnover(&mut recent);
+            }
+            pass(&cache, &dashboards(&recent));
+        }
+        // Repeated scans keep a stable subset that includes the recent files.
+        let mut previous = 0;
+        for i in 0..4 {
+            let (hits, ..) = pass(&cache, &scan(&recent));
+            assert!(
+                hits >= previous,
+                "scan {i}: stable subset eroded {previous} -> {hits}"
+            );
+            assert!(hits >= recent.len(), "scan {i}: recent files lost");
+            previous = hits;
+        }
+        assert!(
+            previous >= 36,
+            "stable subset too small: {previous} of 45 admitted"
+        );
+        // Dashboards after the scans: only the one new file per query misses.
+        for i in 0..6 {
+            turnover(&mut recent);
+            let (hits, repeat_misses, new_misses) = pass(&cache, &dashboards(&recent));
+            assert_eq!(
+                (hits, repeat_misses, new_misses),
+                (recent.len() - 1, 0, 1),
+                "dashboard query {i} after scans"
+            );
+        }
+        // One more scan, then dashboards: the recent set is still resident.
+        pass(&cache, &scan(&recent));
+        let (hits, repeat_misses, new_misses) = pass(&cache, &dashboards(&recent));
+        assert_eq!((hits, repeat_misses, new_misses), (recent.len(), 0, 0));
+        assert!(cache.memory_size() <= entry_size * 60);
     }
 
     /// Newcomers get a brief residency in the window even before they are
@@ -1530,8 +1668,8 @@ mod tests {
             1
         );
 
-        // Past the ADMISSION budget, newcomers no more frequent than the LRU
-        // victim are rejected rather than churning the cache; the budget
+        // Past the ADMISSION budget, newcomers asked for once (no reuse
+        // distance) are rejected rather than churning the cache; the budget
         // holds either way.
         for i in 5..12 {
             assert!(cache.get(&key(&format!("file-{i}"))).is_none());
@@ -1599,8 +1737,8 @@ mod tests {
         cache.put_fixture(key("file-1"), Arc::clone(&reader));
         // touch file-0: it becomes the most recently used
         assert!(cache.get(&key("file-0")).is_some());
-        // a third entry, looked up often enough to be admitted, evicts the
-        // LRU victim file-1, NOT the refreshed file-0
+        // a third entry, asked for twice in a row (a short reuse distance),
+        // evicts the LRU victim file-1, NOT the refreshed file-0
         for _ in 0..2 {
             assert!(cache.get(&key("file-2")).is_none());
         }
@@ -1697,7 +1835,7 @@ mod tests {
                     for generation in 8..(8 + cache.inner.max_bytes / size + 2) {
                         let other_key =
                             ReaderCacheKey::new("other-file".to_string(), generation as i64, 100);
-                        // frequent enough to be admitted over the victim
+                        // a reuse distance shorter than the victim's age
                         for _ in 0..2 {
                             assert!(cache.get(&other_key).is_none());
                         }

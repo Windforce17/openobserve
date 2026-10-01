@@ -1485,7 +1485,9 @@ pub async fn warm_file(
     }
     let reader_key =
         reader_cache::ReaderCacheKey::new(key.to_string(), index_generation, index_size);
-    let cached = match reader_cache::GLOBAL_CACHE.get(&reader_key) {
+    // Warming is not the query's demand access of this file (that `get`
+    // already happened); a probe keeps the cache's recency clock honest.
+    let cached = match reader_cache::GLOBAL_CACHE.peek(&reader_key) {
         Some(handle) => {
             let Some(locked) = handle.try_lock() else {
                 return Ok(false);
@@ -1654,7 +1656,7 @@ async fn search_vix_index(
         );
     let parsed_sidecar_available = equality_histogram
         && reader_cache::GLOBAL_CACHE
-            .get(&reader_key)
+            .peek(&reader_key)
             .is_some_and(|reader| reader.has_index());
     let local_sidecar_available = if equality_histogram
         && parquet_file.meta.index_size > 0
