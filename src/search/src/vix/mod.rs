@@ -283,20 +283,25 @@ pub async fn vix_search(
         .filter(|file| is_core_file(&file.key) && (file.meta.index_size > 0 || data_only_capable))
         .cloned()
         .collect_vec();
-    // Evaluate in a DETERMINISTIC order, oldest file first (keys embed the
-    // hour path), instead of the map's per-query random order. The reader
-    // cache admits by reuse distance: a scan repeated over more files than
-    // fit keeps a stable subset only if every pass visits the files in the
-    // same order - a random order turns each pass's reuse distances into
-    // noise and churned a quarter of the resident set per pass (prod
-    // 2026-10-01 `.192`: 17 % hits on repeated 7 d traces counts; `.193`,
-    // ordered: 55 %). Oldest first because older hours are merged into the
-    // large files and the newest hours are the small L0 flood: with
-    // `eval_concurrency` files in flight, the long evaluations must lead or
-    // they form a serial tail (newest-first `.193`: the same 7 d counts
-    // took 1.4-1.7x longer than the random order). `buffer_unordered`
-    // below still evaluates `eval_concurrency` files at a time.
-    eval_files.sort_unstable_by(|a, b| a.key.cmp(&b.key));
+    // Evaluate in a DETERMINISTIC but time-MIXED order: by a fixed hash of
+    // the key, not the map's per-query random order and not time order.
+    // Deterministic, because the reader cache admits by reuse distance: a
+    // scan repeated over more files than fit keeps a stable subset only if
+    // every pass visits the files in the same order - a random order turns
+    // each pass's reuse distances into noise and churned a quarter of the
+    // resident set per pass (prod 2026-10-01 `.192`: 17 % hits on repeated
+    // 7 d traces counts; ordered `.193`/`.194`: 55 % / 40 %). Time-mixed,
+    // because the skip-rate bail-out below judges the whole condition from
+    // the first `eval_concurrency` files: in hour order that sample is one
+    // hour, and a service absent from the window's oldest hour sent 6.8k
+    // files to the scan branch (`.194`: a 7 d count took 90-98 s instead of
+    // ~20). `buffer_unordered` still evaluates `eval_concurrency` at a time.
+    eval_files.sort_unstable_by_key(|file| {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        file.key.hash(&mut hasher);
+        hasher.finish()
+    });
     if native_histogram {
         let mut one_bucket_files = 0usize;
         for file in &eval_files {
