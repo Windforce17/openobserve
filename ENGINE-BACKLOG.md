@@ -455,6 +455,99 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     dict residency (keep ≤ 256 KB, re-read larger ones: +1 read on those
     files) would roughly double 7 d capacity; (3) `budget_refused` under
     bursts (filtered histograms still declare 32 MiB).
+- **2026-10-01 09:30–13:30Z — reader-cache admission (`.188` → `.195`):
+  frequency admission starved new files; reuse-distance admission + a
+  deterministic evaluation order.** Probe = one fresh pod, A: three 24 h
+  traces counts (new terms, ~1,250 files), B: six 7 d counts (never-seen
+  terms, ~7.4k files), C: 24 h counts again; per-query reader-cache
+  hits/misses/rejections from the pod's `/metrics`.
+  - `.188` (vix-arch `d2dc7439c`, #587, 09:32Z): W-TinyLFU — 1/16 LRU
+    window, 4-bit count-min sketch, a spilled candidate displaces the main
+    LRU victim only when strictly more frequent. Repeated 7 d: 1 → 28 →
+    30 → 28 → 31 % hits — identical to `.187` plain LRU (7, 28, 29, 27,
+    29, 28): LRU was never 0 % here because the HashMap gave every pass a
+    different order and the cache holds ~55 % of the set.
+  - `.189` (`83f79c645`, #588, 09:59Z): growth of a hit reader demotes other
+    full readers before evicting (LRU-first growth eviction was shedding
+    the entries the pass needed next). Repeated 7 d: 1 → 14 → 36 → 40 →
+    43 %. `.190` (`03a8e43aa`, #589, 10:26Z): sketch reset period 10× the
+    expected entries (Caffeine's rule), so popularity decays in ~30 min.
+  - **The regression `.189`/`.190` introduced:** dashboards after a 7 d
+    scan — hits 82 / misses 1,132 / **rejections 1,011**, then 152/1,058/
+    1,057, 161/1,043/984, 224/980/681, 618/589/427: five queries and still
+    not back; an untouched `.190` pod at 11:13Z rejected 82 of a 24 h
+    query's 85 misses with no scan at all (34.6k rejections in 30 min on
+    one pod). Cause (reproduced in a local simulation with 6 new files per
+    dashboard query — hits slid 122 → 68/122): under strict TinyLFU a file
+    asked for the FIRST time while main is full has frequency 1 and never
+    beats a resident with ≥ 1, and this hot set is continuously replaced
+    by new files (ingest L0s, merge output). Frequency ties cannot tell
+    "new file every dashboard needs" from "one-off scan file"; plain LRU
+    admitted both at once.
+  - `.191` (`04cffe6d6`, #590, 11:25Z): **reuse-distance admission.** A
+    spilled candidate displaces the main LRU victim only while the lookups
+    between its two latest demand accesses (a window hit, or a re-request
+    found in a bounded non-resident history) are strictly fewer than the
+    victim's age — LRU's own keep/evict judgement applied to the newcomer
+    (LIRS's IRR-vs-recency test). A once-asked file lives in the window
+    only; a scan repeated over more files than fit carries a whole pass as
+    reuse distance and never beats a resident the pass touched (stable
+    subset); a file asked for again within a dashboard interval displaces
+    residents idle that long. Sketch + decay gone; the window is FIFO (a
+    hit no longer extends residency, so every newcomer gets the same
+    chance to show a reuse); non-demand accesses (`warm_file`, the
+    equality-histogram sidecar probe, planner `ordering`) are `peek`s and
+    no longer count as lookups/hits. Regression test
+    `dashboards_survive_scans_and_new_files_cost_one_miss`. Prod: A 732
+    hits/547 misses → 1,277/5 → 1,282/0, 0 rejections; C after six scans
+    16/1,270 (1,112 rejected) → 176/1,109 → **1,283/2 → 100 %** (two
+    queries, vs never within five). Repeated 7 d fell to 1 → 4 → 14 → 13 →
+    13 → 13 %.
+  - `.192` (`9de86d6e3`, #591, 11:56Z): growth eviction sheds the window
+    before main; `vix_reader_cache_evictions_total{reason=admission|
+    growth_window|growth_main}`; history 4× entries. Counters: growth
+    evictions **0** in every pass (not the churn); admission evictions
+    2.3–3.4k per 7 d pass with hits flat at 17–19 %. Cause: `eval_files`
+    came from a `HashMap`, so each pass visited the files in a different
+    random order — every candidate's reuse distance is then noise against
+    the victims' ages and ~a quarter of the resident set churns per pass.
+  - `.193` (`e50c10968`, #592, 12:28Z): deterministic newest-first order.
+    Repeated 7 d: **17 → 49 → 52 → 54 → 55 → 55 %** (admission evictions
+    0 / 523 / 2 / 60 / 16 / 3 — pass 2 reclaims stale residents, then
+    nothing moves); C after six scans **98 % → 100 % at once** (the recent
+    day's files are inside the stable set); A 2 → 97 → 100 %. But the 7 d
+    walls grew 1.4–1.7× (causeway 10.9/13.5 → 18.6 s, manus-node-admin
+    13.8/16.4 → 22.3 s, nexus 10.8/12.5 → 18.0 s): newest first puts the
+    small L0s first and the large merged files last, a serial tail behind
+    the 32-way evaluation.
+  - `.194` (`0804b08ef`, #593, 12:51Z): oldest-first. Repeated 7 d 16 → 26
+    → 37 → 39 → 40 → 40 % (the oldest hours are the large merged files:
+    ~3,150 entries fit vs ~4,100 newest-first), C 100 % at once, walls back
+    to the random order's (causeway 14.0 s, manus-node-admin 17.7 s, nexus
+    13.9 s) — **except the first pass: 90 s on pod 1, 98 s on pod 2 (idx
+    47–49 s).** Follower: `skip-rate bail-out: 31 of 32 sampled files
+    skipped the index whole-file — remaining files go to the scan branch`,
+    `is_add_filter_back: true, file_num: 6798`, 68.6M rows scanned. The
+    bail-out judges the whole condition from the first `eval_concurrency`
+    files; in hour order that sample is ONE hour, and a service absent
+    from the window's oldest hour condemned 6.8k files to the scan branch.
+    Newest-first has the mirror bias (a service that stopped recently).
+  - **`.195` (`3a7e0c678`, #594, 13:20Z, live): evaluation order = a fixed
+    hash of the key** — deterministic across passes (the stable subset the
+    admission rule needs) and time-mixed (the bail-out sample is as
+    representative as the old random order). Fresh pod: A 53 → 100 →
+    100 %; repeated 7 d **17 → 31 → 51 → 51 → 51 → 51 %** with admission
+    evictions 0 / 2,011 / 0 / 0 / 1 / 3 (pass 2 reclaims stale residents,
+    then the set is frozen), walls 22.8 / 12.1 / 16.2 / 12.2 / 20.1 /
+    20.7 s (= the random order's; 0 bail-outs); C after six scans **99 →
+    100 % at once**, 0 rejections. Repeated-7 d hits by version, pass 6:
+    `.187` LRU 28 · `.188` TinyLFU 28 · `.190` 43 · `.191` 13 · `.192` 17 ·
+    `.193` 55 · `.194` 40 · `.195` 51 %; dashboards after a scan: `.190`
+    five queries and not back, `.195` the next query.
+  - What this does not change: 7 d scans still cost 28–38k remote index
+    reads per pod (4.2–5.7 reads per cold evaluation), and the reader-cache
+    hit rate moves the wall little; the dashboards' 24 h sets are what the
+    cache carries. RSS 7.9–9.3 GiB, 0 restarts throughout.
 
 ## 2026-09-29 — P2 shipped as `.176` and rolled back within 30 min: the per-stream side table stalled the shared meta DB (commit latency 40–60×, ingest 503s); ranges must live in the segment row
 - What shipped (vix-arch `013c45010` + NATS retry `76fe754b5`, image
