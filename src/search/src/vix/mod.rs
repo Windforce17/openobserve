@@ -278,11 +278,22 @@ pub async fn vix_search(
     let data_only_all_aggregate = all_histogram
         || (condition_all && matches!(&idx_optimize_mode, Some(IndexOptimizeMode::SimpleCount)));
     let data_only_capable = native_simple_select || native_histogram || data_only_all_aggregate;
-    let eval_files = file_list_map
+    let mut eval_files = file_list_map
         .values()
         .filter(|file| is_core_file(&file.key) && (file.meta.index_size > 0 || data_only_capable))
         .cloned()
         .collect_vec();
+    // Evaluate in a DETERMINISTIC order, newest file first (keys embed the
+    // hour path), instead of the map's per-query random order. The reader
+    // cache admits by reuse distance: a scan repeated over more files than
+    // fit keeps a stable prefix only if every pass visits the files in the
+    // same order - a random order turns each pass's reuse distances into
+    // noise and churned a quarter of the resident set per pass (prod
+    // 2026-10-01 `.192`: 17 % hits on repeated 7 d traces counts vs 43 % with
+    // a stable set). Newest first also puts the recent day's files - the
+    // dashboards' working set - into that prefix. `buffer_unordered`
+    // below still evaluates `eval_concurrency` files at a time.
+    eval_files.sort_unstable_by(|a, b| b.key.cmp(&a.key));
     if native_histogram {
         let mut one_bucket_files = 0usize;
         for file in &eval_files {
