@@ -230,10 +230,11 @@ type ReaderLru = LruCache<ReaderCacheKey, CachedReader>;
 /// it without disturbing the main cache.
 const WINDOW_FRACTION: usize = 16;
 
-/// Expected bytes per cached reader (prod 2026-10-01: demoted readers ~490
-/// KB on L0 files, ~840 KB on the merged mix). Sizes the frequency sketch
-/// and its reset period only - the byte budgets stay exact.
-const SKETCH_ENTRY_BYTES: usize = 512 * 1024;
+/// Expected bytes per cached reader (prod 2026-10-01 `.189`: 3.22 GB over
+/// 3,100 entries, ~1.04 MB with the 768 KiB eager tails). Sizes the
+/// frequency sketch and its reset period only - the byte budgets stay
+/// exact.
+const SKETCH_ENTRY_BYTES: usize = 1024 * 1024;
 
 /// Approximate access frequency of every key looked up, hit or miss, with
 /// four 4-bit counters per key (a count-min sketch, Caffeine's TinyLFU
@@ -263,6 +264,15 @@ impl FrequencySketch {
     const MIN_WORDS: usize = 1 << 10;
     const MAX_WORDS: usize = 1 << 18;
 
+    /// Reset period bounds, in lookups. Halving every ten lookups per
+    /// cached entry (Caffeine's rule) is what lets popularity DECAY: a
+    /// burst of 7 d scans must not leave its files out-ranking the
+    /// dashboards' files for long. At prod's ~4k entries that is ~40k
+    /// lookups - six 7 d passes or ~30 dashboard queries, about half an
+    /// hour of traffic.
+    const MIN_SAMPLE: u64 = 10_000;
+    const MAX_SAMPLE: u64 = 1_000_000;
+
     fn new(expected_entries: usize) -> Self {
         let len = expected_entries
             .clamp(Self::MIN_WORDS, Self::MAX_WORDS)
@@ -271,7 +281,7 @@ impl FrequencySketch {
             table: vec![0; len],
             mask: (len - 1) as u64,
             size: 0,
-            sample_size: 10 * len as u64,
+            sample_size: (10 * expected_entries as u64).clamp(Self::MIN_SAMPLE, Self::MAX_SAMPLE),
         }
     }
 
