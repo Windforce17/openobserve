@@ -441,6 +441,12 @@ struct CacheInner {
 }
 
 impl CacheInner {
+    /// Bytes newcomers may fill: the budget minus the hot tier reserved for
+    /// growth of cached readers.
+    fn admission_bytes(&self) -> usize {
+        self.max_bytes.saturating_sub(self.hot_bytes)
+    }
+
     /// Demote LRU-first until the full tier fits the hot budget. Only a
     /// reader with no outstanding lease AND no outstanding handle can be
     /// demoted: `Arc::get_mut` proves sole strong AND weak ownership, which
@@ -482,13 +488,14 @@ impl CacheInner {
         }
     }
 
-    /// Make room for `extra` bytes of GROWTH of an already-cached reader:
-    /// evict LRU-first, main before window. Growth is not an admission
-    /// decision, so no frequency comparison applies. Evicted entries are
-    /// returned for destruction after the state lock drops (never under it).
+    /// Last resort after growth of an already-cached reader that demotion
+    /// could not absorb: evict LRU-first, main before window, until `total`
+    /// fits the hard budget less `extra`. Not an admission decision, so no
+    /// frequency comparison applies. Evicted entries are returned for
+    /// destruction after the state lock drops (never under it).
     fn evict_for_growth(&self, state: &mut CacheState, extra: usize) -> Vec<CachedReader> {
         let mut evicted = Vec::new();
-        while state.total > self.max_bytes - extra {
+        while state.total > self.max_bytes.saturating_sub(extra) {
             let (entry, in_window) = match state.main.remove_lru() {
                 Some((_, entry)) => (entry, false),
                 None => match state.window.remove_lru() {
@@ -529,13 +536,18 @@ impl CacheInner {
             };
             state.window_total -= candidate.accounted;
             // The window is a cap, not a reservation: main may use whatever
-            // the window does not, so the whole budget stays usable.
+            // the window does not. Admission stops at the ADMISSION budget
+            // (`max_bytes - hot_bytes`): the hot budget is where cached
+            // readers grow when a lookup rebuilds their lazily built state,
+            // so growth is absorbed by demoting other full readers instead
+            // of evicting entries the next pass of a scan needs.
             let candidate_hash = key_hash(&candidate_key);
             let mut admitted = true;
-            while state.total > self.max_bytes {
+            while state.total > self.admission_bytes() {
                 let Some((victim_key, _)) = state.main.iter().next() else {
-                    // an empty main cannot fit the candidate at all
-                    admitted = false;
+                    // nothing to compete with: a lone entry may use the
+                    // whole hard budget, more does not fit at all
+                    admitted = state.total <= self.max_bytes;
                     break;
                 };
                 let victim_frequency = state.sketch.frequency(key_hash(victim_key));
@@ -600,13 +612,13 @@ impl ReaderMemoryObserver for MemoryObserver {
             return;
         }
         let delta = current - entry.accounted;
-        // Reserve room before adding the delta, avoiding usize overflow even
-        // when the configured budget is usize::MAX. No reader calls under lock.
-        evicted.extend(cache.evict_for_growth(&mut state, delta));
-        let removed_self = evicted
-            .iter()
-            .any(|entry| std::ptr::eq(Arc::as_ptr(&entry.observer), self));
-        if !removed_self {
+        // Growth lives in the hot tier: account it, shrink OTHER full readers
+        // first (demotion releases their lazily built state, LRU-first), and
+        // evict only what demotion could not absorb. A scan's second pass
+        // regrows every entry it hits; evicting for that growth would throw
+        // away the entries the pass needs next (prod 2026-10-01: 29 % hits
+        // on repeats with LRU-first growth eviction).
+        {
             let in_window = state.window.contains_key(&self.key);
             let entry = state.peek_mut(&self.key).unwrap();
             let demoted = entry.tier == Tier::Metadata;
@@ -622,15 +634,15 @@ impl ReaderMemoryObserver for MemoryObserver {
             } else {
                 state.hot += delta;
             }
-            state.total += delta;
+            state.total = state.total.saturating_add(delta);
             if in_window {
-                state.window_total += delta;
+                state.window_total = state.window_total.saturating_add(delta);
             }
         }
-        // Growth may push full readers past the hot budget: demote before
-        // returning (the growing entry itself holds a lease and is never
-        // demoted underneath its user).
+        // The growing entry itself holds a lease and is never demoted
+        // underneath its user.
         cache.demote_overflow(&mut state);
+        evicted.extend(cache.evict_for_growth(&mut state, 0));
         state.update_gauges();
         drop(state);
         drop(evicted);
@@ -1010,8 +1022,8 @@ mod tests {
         let key = |file: &str| ReaderCacheKey::new(file.to_string(), 7, 100);
         let entry_size = reader.memory_size() + entry_overhead(&key("file-0"));
 
-        // room for roughly two entries
-        let cache = VixReaderCache::new(entry_size * 2 + entry_size / 2);
+        // admission room for roughly two entries (a quarter is the hot tier)
+        let cache = VixReaderCache::new(entry_size * 7 / 2);
         // production shape: a lookup (miss) precedes every publish
         for i in 0..2 {
             assert!(cache.get(&key(&format!("file-{i}"))).is_none());
@@ -1397,11 +1409,13 @@ mod tests {
         assert_eq!(pass(&cache), 0, "cold pass");
         let second = pass(&cache);
         let third = pass(&cache);
-        // The admitted subset (about capacity minus the window) hits on every
-        // later pass and the hit set does not shrink.
+        // The admitted subset (the admission budget: capacity less the hot
+        // tier reserved for growth) hits on every later pass and the hit set
+        // does not shrink.
+        let admission = capacity - capacity / HOT_BUDGET_FRACTION;
         assert!(
-            second * 10 >= capacity * 8,
-            "second pass must hit most of the capacity: {second} of {capacity}"
+            second * 10 >= admission * 8,
+            "second pass must hit most of the admission budget: {second} of {admission}"
         );
         assert!(
             third >= second,
@@ -1464,9 +1478,12 @@ mod tests {
         let probe = fresh();
         let entry_size = probe.memory_size() + entry_overhead(&key("file-0"));
         drop(probe);
-        // Total budget fits 6 entries; the hot budget (1/4) fits 1.
-        let cache = VixReaderCache::new(entry_size * 6);
+        // Total budget fits 8 entries; the hot budget (1/4) fits 2, so the
+        // admission budget fits 6. Production shape: a lookup precedes each
+        // publish.
+        let cache = VixReaderCache::new(entry_size * 8);
         for i in 0..5 {
+            assert!(cache.get(&key(&format!("file-{i}"))).is_none());
             cache.put(key(&format!("file-{i}")), fresh()).unwrap();
         }
         let (entries, metadata, full, demotions) = {
@@ -1503,12 +1520,16 @@ mod tests {
             1
         );
 
-        // Past the TOTAL budget, entries evict LRU-first.
+        // Past the ADMISSION budget, newcomers no more frequent than the LRU
+        // victim are rejected rather than churning the cache; the budget
+        // holds either way.
         for i in 5..12 {
+            assert!(cache.get(&key(&format!("file-{i}"))).is_none());
             cache.put(key(&format!("file-{i}")), fresh()).unwrap();
         }
-        assert!(cache.len() <= 6, "total budget must evict");
-        assert!(cache.memory_size() <= entry_size * 6);
+        assert!(cache.len() <= 7, "admission budget must bound the cache");
+        assert!(cache.inner.state.lock().rejections >= 5);
+        assert!(cache.memory_size() <= entry_size * 8);
     }
 
     /// An outstanding lease blocks demotion: the entry stays full while a
@@ -1562,7 +1583,7 @@ mod tests {
         let reader = small_reader();
         let key = |file: &str| ReaderCacheKey::new(file.to_string(), 7, 100);
         let entry_size = reader.memory_size() + entry_overhead(&key("file-0"));
-        let cache = VixReaderCache::new(entry_size * 2 + entry_size / 2);
+        let cache = VixReaderCache::new(entry_size * 7 / 2);
 
         cache.put_fixture(key("file-0"), Arc::clone(&reader));
         cache.put_fixture(key("file-1"), Arc::clone(&reader));
