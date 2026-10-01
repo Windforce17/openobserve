@@ -1603,6 +1603,20 @@ pub static VIX_READER_CACHE_TIER_BYTES: Lazy<IntGaugeVec> = Lazy::new(|| {
     .expect("Metric created")
 });
 
+pub static VIX_READER_CACHE_REJECTIONS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "vix_reader_cache_rejections_total",
+            "Readers the reader cache declined to admit: the candidate's lookup \
+             frequency did not exceed the LRU victim's (TinyLFU admission)",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &[],
+    )
+    .expect("Metric created")
+});
+
 pub static VIX_READER_CACHE_DEMOTIONS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     IntCounterVec::new(
         Opts::new(
@@ -2582,6 +2596,9 @@ fn register_metrics(registry: &Registry) {
         .register(Box::new(VIX_READER_CACHE_DEMOTIONS_TOTAL.clone()))
         .expect("Metric registered");
     registry
+        .register(Box::new(VIX_READER_CACHE_REJECTIONS_TOTAL.clone()))
+        .expect("Metric registered");
+    registry
         .register(Box::new(VIX_FETCH_COUNT_TOTAL.clone()))
         .expect("Metric registered");
     registry
@@ -3001,6 +3018,7 @@ mod tests {
         let _ = VIX_READER_CACHE_TIER_ENTRIES.clone();
         let _ = VIX_READER_CACHE_TIER_BYTES.clone();
         let _ = VIX_READER_CACHE_DEMOTIONS_TOTAL.clone();
+        let _ = VIX_READER_CACHE_REJECTIONS_TOTAL.clone();
         let _ = VIX_FETCH_COUNT_TOTAL.clone();
         let _ = VIX_FETCH_BYTES_TOTAL.clone();
         let _ = VIX_RESULT_CACHE_MEMORY_USAGE.clone();

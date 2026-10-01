@@ -223,8 +223,108 @@ impl ReaderLease {
 
 type ReaderLru = LruCache<ReaderCacheKey, CachedReader>;
 
+/// Fraction of the byte budget forming the admission WINDOW: every newly
+/// published reader lands here first (plain LRU among newcomers) and only
+/// competes for the main cache when the window overflows. A burst of panels
+/// over the same new files hits the window; a one-off scan streams through
+/// it without disturbing the main cache.
+const WINDOW_FRACTION: usize = 16;
+
+/// Expected bytes per cached reader (prod 2026-10-01: demoted readers ~490
+/// KB on L0 files, ~840 KB on the merged mix). Sizes the frequency sketch
+/// and its reset period only - the byte budgets stay exact.
+const SKETCH_ENTRY_BYTES: usize = 512 * 1024;
+
+/// Approximate access frequency of every key looked up, hit or miss, with
+/// four 4-bit counters per key (a count-min sketch, Caffeine's TinyLFU
+/// shape). All counters halve once `sample_size` lookups have been
+/// recorded, so a file nobody asked about since the last reset decays to
+/// 0 and a newcomer can displace it.
+struct FrequencySketch {
+    table: Vec<u64>,
+    mask: u64,
+    size: u64,
+    sample_size: u64,
+}
+
+impl FrequencySketch {
+    const SEEDS: [u64; 4] = [
+        0xc3a5_c85c_97cb_3127,
+        0xb492_b66f_be98_f273,
+        0x9ae1_6a3b_2f90_404f,
+        0xcbf2_9ce4_8422_2325,
+    ];
+
+    /// Sketch size bounds in 64-bit words (16 counters each). The floor
+    /// (8 KiB) keeps collision-driven over-estimates negligible for small
+    /// caches - four counters per key over 16k counters; the ceiling
+    /// (2 MiB) keeps a `usize::MAX` budget from sizing the sketch, and
+    /// 262k words already cover 32x the entries a 4 GiB cache holds.
+    const MIN_WORDS: usize = 1 << 10;
+    const MAX_WORDS: usize = 1 << 18;
+
+    fn new(expected_entries: usize) -> Self {
+        let len = expected_entries
+            .clamp(Self::MIN_WORDS, Self::MAX_WORDS)
+            .next_power_of_two();
+        Self {
+            table: vec![0; len],
+            mask: (len - 1) as u64,
+            size: 0,
+            sample_size: 10 * len as u64,
+        }
+    }
+
+    /// Table slot and nibble shift of counter `i` for `hash`.
+    fn slot(&self, hash: u64, i: usize) -> (usize, u32) {
+        let mut h = hash
+            .wrapping_add(Self::SEEDS[i])
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        h ^= h >> 29;
+        ((h & self.mask) as usize, ((h >> 59) as u32 & 15) * 4)
+    }
+
+    fn frequency(&self, hash: u64) -> u8 {
+        (0..4)
+            .map(|i| {
+                let (slot, shift) = self.slot(hash, i);
+                ((self.table[slot] >> shift) & 0xF) as u8
+            })
+            .min()
+            .unwrap_or(0)
+    }
+
+    fn increment(&mut self, hash: u64) {
+        for i in 0..4 {
+            let (slot, shift) = self.slot(hash, i);
+            if (self.table[slot] >> shift) & 0xF < 15 {
+                self.table[slot] += 1 << shift;
+            }
+        }
+        self.size += 1;
+        if self.size >= self.sample_size {
+            for word in &mut self.table {
+                *word = (*word >> 1) & 0x7777_7777_7777_7777;
+            }
+            self.size /= 2;
+        }
+    }
+}
+
+fn key_hash(key: &ReaderCacheKey) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hasher);
+    hasher.finish()
+}
+
 struct CacheState {
-    lru: ReaderLru,
+    /// Newcomers, LRU among themselves; bounded by `CacheInner::window_bytes`.
+    window: ReaderLru,
+    /// Admitted readers, LRU; `total` (window + main) is bounded by `max_bytes`.
+    main: ReaderLru,
+    /// Accounted bytes in `window` (the rest of `total` is `main`).
+    window_total: usize,
     /// Cache-owned bytes: every entry's accounted weight, full or demoted.
     total: usize,
     /// Bytes of full (non-demoted) entries only, for the hot budget.
@@ -234,24 +334,84 @@ struct CacheState {
     full_entries: usize,
     metadata_entries: usize,
     demotions: usize,
+    rejections: usize,
+    sketch: FrequencySketch,
 }
 
 impl CacheState {
-    fn new() -> Self {
+    fn new(max_bytes: usize) -> Self {
         Self {
-            lru: LruCache::new_unbounded(),
+            window: LruCache::new_unbounded(),
+            main: LruCache::new_unbounded(),
+            window_total: 0,
             total: 0,
             hot: 0,
             full_entries: 0,
             metadata_entries: 0,
             demotions: 0,
+            rejections: 0,
+            sketch: FrequencySketch::new(max_bytes / SKETCH_ENTRY_BYTES),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.window.len() + self.main.len()
+    }
+
+    fn contains_key(&self, key: &ReaderCacheKey) -> bool {
+        self.main.contains_key(key) || self.window.contains_key(key)
+    }
+
+    fn peek(&self, key: &ReaderCacheKey) -> Option<&CachedReader> {
+        self.main.peek(key).or_else(|| self.window.peek(key))
+    }
+
+    fn peek_mut(&mut self, key: &ReaderCacheKey) -> Option<&mut CachedReader> {
+        if self.main.contains_key(key) {
+            self.main.peek_mut(key)
+        } else {
+            self.window.peek_mut(key)
+        }
+    }
+
+    /// Refresh the LRU position of `key` in whichever segment holds it.
+    fn touch(&mut self, key: &ReaderCacheKey) -> Option<&mut CachedReader> {
+        if self.main.contains_key(key) {
+            self.main.get_mut(key)
+        } else {
+            self.window.get_mut(key)
+        }
+    }
+
+    /// Remove `key` from its segment, keeping every total consistent.
+    fn remove(&mut self, key: &ReaderCacheKey) -> Option<CachedReader> {
+        let (entry, in_window) = match self.main.remove(key) {
+            Some(entry) => (entry, false),
+            None => (self.window.remove(key)?, true),
+        };
+        self.forget(&entry, in_window);
+        Some(entry)
+    }
+
+    /// Account the departure of `entry` (already detached from its segment).
+    fn forget(&mut self, entry: &CachedReader, in_window: bool) {
+        match entry.tier {
+            Tier::Full => {
+                self.hot -= entry.accounted;
+                self.full_entries -= 1;
+            }
+            Tier::Metadata => self.metadata_entries -= 1,
+        }
+        self.total -= entry.accounted;
+        if in_window {
+            self.window_total -= entry.accounted;
         }
     }
 
     fn update_gauges(&self) {
         metrics::VIX_READER_CACHE_ENTRIES
             .with_label_values::<&str>(&[])
-            .set(self.lru.len() as i64);
+            .set(self.len() as i64);
         metrics::VIX_READER_CACHE_MEMORY_BYTES
             .with_label_values::<&str>(&[])
             .set(self.total as i64);
@@ -275,20 +435,23 @@ struct CacheInner {
     max_bytes: usize,
     /// Byte budget for full readers: `max_bytes / HOT_BUDGET_FRACTION`.
     hot_bytes: usize,
+    /// Byte cap of the admission window: `max_bytes / WINDOW_FRACTION`. A
+    /// cap, not a reservation - main uses whatever the window leaves.
+    window_bytes: usize,
 }
 
 impl CacheInner {
-    /// Demote LRU-first full entries while the hot budget is exceeded.
-    /// An entry is demotable only when the cache owns the reader solely —
-    /// `Arc::get_mut` proves sole strong AND weak ownership, which means
-    /// no lease is outstanding (every live lease holds a strong Arc; a
-    /// cached-out handle holds a Weak that would fail `get_mut`). A busy
+    /// Demote LRU-first until the full tier fits the hot budget. Only a
+    /// reader with no outstanding lease AND no outstanding handle can be
+    /// demoted: `Arc::get_mut` proves sole strong AND weak ownership, which
+    /// is exactly "no lease, no handle in flight" (a `ReaderHandle` handed
+    /// out by `get` holds a Weak that would fail `get_mut`). A busy
     /// entry is skipped and the scan stops when no full entry is
     /// demotable; enforcement retries on the next mutation.
     fn demote_overflow(&self, state: &mut CacheState) {
         while state.hot > self.hot_bytes {
             let Some(key) = state
-                .lru
+                .main
                 .iter()
                 .find(|(_, entry)| {
                     entry.tier == Tier::Full && Arc::strong_count(&entry.reader) == 1
@@ -297,7 +460,7 @@ impl CacheInner {
             else {
                 break;
             };
-            let Some(entry) = state.lru.peek_mut(&key) else {
+            let Some(entry) = state.main.peek_mut(&key) else {
                 continue;
             };
             let released = Arc::get_mut(&mut entry.reader).map_or(0, |reader| reader.demote());
@@ -319,26 +482,84 @@ impl CacheInner {
         }
     }
 
-    /// Evict LRU-first until `extra` bytes fit the total budget, like the
-    /// pre-tier loop. Evicted entries are returned for destruction after
-    /// the state lock drops (never under it).
-    fn evict_overflow(&self, state: &mut CacheState, extra: usize) -> Vec<CachedReader> {
+    /// Make room for `extra` bytes of GROWTH of an already-cached reader:
+    /// evict LRU-first, main before window. Growth is not an admission
+    /// decision, so no frequency comparison applies. Evicted entries are
+    /// returned for destruction after the state lock drops (never under it).
+    fn evict_for_growth(&self, state: &mut CacheState, extra: usize) -> Vec<CachedReader> {
         let mut evicted = Vec::new();
         while state.total > self.max_bytes - extra {
-            let Some((_, entry)) = state.lru.remove_lru() else {
-                break;
+            let (entry, in_window) = match state.main.remove_lru() {
+                Some((_, entry)) => (entry, false),
+                None => match state.window.remove_lru() {
+                    Some((_, entry)) => (entry, true),
+                    None => break,
+                },
             };
-            match entry.tier {
-                Tier::Full => {
-                    state.hot -= entry.accounted;
-                    state.full_entries -= 1;
-                }
-                Tier::Metadata => state.metadata_entries -= 1,
-            }
-            state.total -= entry.accounted;
+            state.forget(&entry, in_window);
             evicted.push(entry);
         }
         evicted
+    }
+
+    /// Insert a newcomer: into the window, then spill the window's LRU into
+    /// the main cache under TinyLFU admission - a candidate displaces the
+    /// main LRU victim only while its lookup frequency is strictly higher.
+    /// A repeated scan larger than the cache therefore keeps a STABLE subset
+    /// (every later scan hits it) instead of churning the whole cache, while
+    /// files looked up repeatedly (dashboards over the same hours) always
+    /// earn their way in. Rejected candidates are returned for destruction
+    /// after the lock drops.
+    fn admit(
+        &self,
+        state: &mut CacheState,
+        key: ReaderCacheKey,
+        entry: CachedReader,
+    ) -> Vec<CachedReader> {
+        let mut dropped = Vec::new();
+        let size = entry.accounted;
+        state.total += size;
+        state.hot += size;
+        state.full_entries += 1;
+        state.window_total += size;
+        state.window.insert(key, entry);
+        while state.window_total > self.window_bytes {
+            let Some((candidate_key, candidate)) = state.window.remove_lru() else {
+                break;
+            };
+            state.window_total -= candidate.accounted;
+            // The window is a cap, not a reservation: main may use whatever
+            // the window does not, so the whole budget stays usable.
+            let candidate_hash = key_hash(&candidate_key);
+            let mut admitted = true;
+            while state.total > self.max_bytes {
+                let Some((victim_key, _)) = state.main.iter().next() else {
+                    // an empty main cannot fit the candidate at all
+                    admitted = false;
+                    break;
+                };
+                let victim_frequency = state.sketch.frequency(key_hash(victim_key));
+                if state.sketch.frequency(candidate_hash) > victim_frequency {
+                    let (_, victim) = state.main.remove_lru().expect("victim present");
+                    state.forget(&victim, false);
+                    dropped.push(victim);
+                } else {
+                    admitted = false;
+                    break;
+                }
+            }
+            if admitted {
+                state.main.insert(candidate_key, candidate);
+            } else {
+                state.forget(&candidate, false);
+                state.rejections += 1;
+                metrics::VIX_READER_CACHE_REJECTIONS_TOTAL
+                    .with_label_values::<&str>(&[])
+                    .inc();
+                dropped.push(candidate);
+            }
+        }
+        dropped
     }
 }
 
@@ -358,7 +579,7 @@ impl ReaderMemoryObserver for MemoryObserver {
         // Declare detached owners before the guard, including for early returns.
         let mut evicted = Vec::new();
         let mut state = cache.state.lock();
-        let Some(entry) = state.lru.peek(&self.key) else {
+        let Some(entry) = state.peek(&self.key) else {
             return;
         };
         if !std::ptr::eq(Arc::as_ptr(&entry.observer), self) {
@@ -366,15 +587,7 @@ impl ReaderMemoryObserver for MemoryObserver {
         }
         let current = reader_bytes.checked_add(self.overhead);
         let Some(current) = current.filter(|size| *size <= cache.max_bytes) else {
-            let entry = state.lru.remove(&self.key).unwrap();
-            match entry.tier {
-                Tier::Full => {
-                    state.hot -= entry.accounted;
-                    state.full_entries -= 1;
-                }
-                Tier::Metadata => state.metadata_entries -= 1,
-            }
-            state.total -= entry.accounted;
+            let entry = state.remove(&self.key).unwrap();
             evicted.push(entry);
             state.update_gauges();
             drop(state);
@@ -387,31 +600,16 @@ impl ReaderMemoryObserver for MemoryObserver {
             return;
         }
         let delta = current - entry.accounted;
-        let mut removed_self = false;
         // Reserve room before adding the delta, avoiding usize overflow even
         // when the configured budget is usize::MAX. No reader calls under lock.
-        while state.total > cache.max_bytes - delta {
-            let (_, entry) = state.lru.remove_lru().unwrap();
-            match entry.tier {
-                Tier::Full => {
-                    state.hot -= entry.accounted;
-                    state.full_entries -= 1;
-                }
-                Tier::Metadata => state.metadata_entries -= 1,
-            }
-            state.total -= entry.accounted;
-            removed_self = std::ptr::eq(Arc::as_ptr(&entry.observer), self);
-            evicted.push(entry);
-            if removed_self {
-                break;
-            }
-        }
+        evicted.extend(cache.evict_for_growth(&mut state, delta));
+        let removed_self = evicted
+            .iter()
+            .any(|entry| std::ptr::eq(Arc::as_ptr(&entry.observer), self));
         if !removed_self {
-            let demoted = state
-                .lru
-                .peek(&self.key)
-                .is_some_and(|entry| entry.tier == Tier::Metadata);
-            let entry = state.lru.peek_mut(&self.key).unwrap();
+            let in_window = state.window.contains_key(&self.key);
+            let entry = state.peek_mut(&self.key).unwrap();
+            let demoted = entry.tier == Tier::Metadata;
             entry.accounted = current;
             if demoted {
                 // Regrowth after demotion rebuilt full-tier structures
@@ -425,10 +623,13 @@ impl ReaderMemoryObserver for MemoryObserver {
                 state.hot += delta;
             }
             state.total += delta;
+            if in_window {
+                state.window_total += delta;
+            }
         }
         // Growth may push full readers past the hot budget: demote before
         // returning (the growing entry itself holds a lease and is never
-        // demotable here).
+        // demoted underneath its user).
         cache.demote_overflow(&mut state);
         state.update_gauges();
         drop(state);
@@ -446,16 +647,18 @@ fn entry_overhead(key: &ReaderCacheKey) -> usize {
         + 4 * std::mem::size_of::<usize>()
 }
 
-/// A size-bounded LRU of parsed readers keyed by immutable sidecar identity.
+/// A size-bounded, scan-resistant cache of parsed readers keyed by immutable
+/// sidecar identity: an admission window plus a TinyLFU-filtered main LRU,
+/// with a hot/metadata tier split inside main.
 ///
 /// The budget/gauges describe cache-owned reader weights plus entry metadata,
 /// not process RSS: active Arc users may pin evicted readers until they finish.
 /// Shared readers are conservatively charged once per admitted key, retaining
 /// each admission's observed high-water weight even if reader storage shrinks.
 /// Growth callbacks enforce the budget before returning; they never refresh LRU.
-/// Get/put/notification bookkeeping is O(1), plus O(entries actually demoted
-/// or evicted). Logical-file invalidation alone walks the LRU to find all
-/// generations.
+/// Get/put/notification bookkeeping is O(1), plus O(entries actually demoted,
+/// evicted or rejected). Logical-file invalidation alone walks both segments
+/// to find all generations.
 pub struct VixReaderCache {
     inner: Arc<CacheInner>,
 }
@@ -464,26 +667,26 @@ impl VixReaderCache {
     pub fn new(max_bytes: usize) -> Self {
         Self {
             inner: Arc::new(CacheInner {
-                state: parking_lot::Mutex::new(CacheState::new()),
+                state: parking_lot::Mutex::new(CacheState::new(max_bytes)),
                 max_bytes,
                 hot_bytes: max_bytes / HOT_BUDGET_FRACTION,
+                window_bytes: max_bytes / WINDOW_FRACTION,
             }),
         }
     }
 
-    /// Get a parsed reader, refreshing its LRU position.
+    /// Get a parsed reader, refreshing its LRU position. Every lookup, hit
+    /// or miss, is recorded in the frequency sketch that drives admission.
     pub(super) fn get(&self, key: &ReaderCacheKey) -> Option<ReaderHandle> {
-        let found = self
-            .inner
-            .state
-            .lock()
-            .lru
-            .get_mut(key)
-            .map(|entry| ReaderHandle {
+        let found = {
+            let mut state = self.inner.state.lock();
+            state.sketch.increment(key_hash(key));
+            state.touch(key).map(|entry| ReaderHandle {
                 reader: Arc::downgrade(&entry.reader),
                 leases: Arc::clone(&entry.leases),
                 has_index: entry.reader.has_index(),
-            });
+            })
+        };
         match &found {
             Some(_) => metrics::VIX_READER_CACHE_HITS_TOTAL
                 .with_label_values::<&str>(&[])
@@ -497,12 +700,12 @@ impl VixReaderCache {
 
     /// Probe an immutable sidecar without refreshing LRU or hit/miss metrics.
     pub fn contains(&self, key: &ReaderCacheKey) -> bool {
-        self.inner.state.lock().lru.contains_key(key)
+        self.inner.state.lock().contains_key(key)
     }
 
     /// Copy immutable ordering facts without pinning or exposing a reader.
     pub fn ordering(&self, key: &ReaderCacheKey) -> Option<(bool, Option<usize>, bool)> {
-        self.inner.state.lock().lru.get_mut(key).map(|entry| {
+        self.inner.state.lock().touch(key).map(|entry| {
             (
                 entry.reader.row_order().is_ts_desc(),
                 entry.reader.ts_desc_row_ranges().map(|ranges| ranges.len()),
@@ -513,6 +716,8 @@ impl VixReaderCache {
 
     /// Publish an already operation-admitted cold reader. Duplicate opens
     /// stay private; they cannot mutate the winner through an escaping Arc.
+    /// The reader may be REJECTED by admission (returned lease still valid):
+    /// a one-off scan's files do not displace frequently used ones.
     pub(super) fn put(
         &self,
         key: ReaderCacheKey,
@@ -531,7 +736,7 @@ impl VixReaderCache {
         reader: Arc<VixReader>,
         subscribe: impl FnOnce(&VixReader, Arc<dyn ReaderMemoryObserver>) -> vortex_index::Result<()>,
     ) -> vortex_index::Result<()> {
-        if self.inner.max_bytes == 0 || self.inner.state.lock().lru.contains_key(&key) {
+        if self.inner.max_bytes == 0 || self.inner.state.lock().contains_key(&key) {
             return Ok(());
         }
         let overhead = entry_overhead(&key);
@@ -549,18 +754,15 @@ impl VixReaderCache {
         if size > self.inner.max_bytes {
             return Ok(());
         }
-        let mut evicted = Vec::new();
+        let dropped;
         {
             let mut state = self.inner.state.lock();
             // Another cold open may have published while we subscribed.
-            if state.lru.contains_key(&key) {
+            if state.contains_key(&key) {
                 return Ok(());
             }
-            evicted.extend(self.inner.evict_overflow(&mut state, size));
-            state.total += size;
-            state.hot += size;
-            state.full_entries += 1;
-            state.lru.insert(
+            dropped = self.inner.admit(
+                &mut state,
                 key,
                 CachedReader {
                     reader: Arc::clone(&reader),
@@ -575,7 +777,7 @@ impl VixReaderCache {
             self.inner.demote_overflow(&mut state);
             state.update_gauges();
         }
-        drop(evicted);
+        drop(dropped);
         // Catch growth between the sizing snapshot and publication without
         // invoking reader callbacks under the map lock.
         observer.memory_changed(reader.memory_size());
@@ -588,20 +790,14 @@ impl VixReaderCache {
         let mut removed = Vec::new();
         let mut state = self.inner.state.lock();
         let doomed = state
-            .lru
+            .main
             .iter()
-            .filter_map(|(key, _)| (key.file() == file).then(|| key.clone()))
+            .chain(state.window.iter())
+            .filter(|(key, _)| key.file() == file)
+            .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
         for key in doomed {
-            if let Some(entry) = state.lru.remove(&key) {
-                match entry.tier {
-                    Tier::Full => {
-                        state.hot -= entry.accounted;
-                        state.full_entries -= 1;
-                    }
-                    Tier::Metadata => state.metadata_entries -= 1,
-                }
-                state.total -= entry.accounted;
+            if let Some(entry) = state.remove(&key) {
                 removed.push(entry);
             }
         }
@@ -613,11 +809,11 @@ impl VixReaderCache {
     }
 
     pub fn len(&self) -> usize {
-        self.inner.state.lock().lru.len()
+        self.inner.state.lock().len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.inner.state.lock().lru.is_empty()
+        self.inner.state.lock().len() == 0
     }
 
     pub fn memory_size(&self) -> usize {
@@ -738,7 +934,6 @@ mod tests {
                 .inner
                 .state
                 .lock()
-                .lru
                 .peek(&key)
                 .unwrap()
                 .leases
@@ -761,7 +956,6 @@ mod tests {
                 .inner
                 .state
                 .lock()
-                .lru
                 .peek(&key)
                 .unwrap()
                 .leases
@@ -801,7 +995,7 @@ mod tests {
             if touch_growing {
                 assert!(cache.get(&first).is_some());
             }
-            let observer = Arc::clone(&cache.inner.state.lock().lru.peek(&first).unwrap().observer);
+            let observer = Arc::clone(&cache.inner.state.lock().peek(&first).unwrap().observer);
             let growth = cache.inner.max_bytes - cache.memory_size() + 1;
             observer.memory_changed(reader.memory_size() + growth);
             assert_eq!(cache.contains(&first), touch_growing);
@@ -818,10 +1012,25 @@ mod tests {
 
         // room for roughly two entries
         let cache = VixReaderCache::new(entry_size * 2 + entry_size / 2);
-        for i in 0..3 {
+        // production shape: a lookup (miss) precedes every publish
+        for i in 0..2 {
+            assert!(cache.get(&key(&format!("file-{i}"))).is_none());
             cache.put_fixture(key(&format!("file-{i}")), Arc::clone(&reader));
         }
-        // the oldest entry was evicted to fit the third
+        // A newcomer seen exactly as often as the LRU victim is REJECTED:
+        // one-off scans never churn the cache.
+        assert!(cache.get(&key("file-2")).is_none());
+        cache.put_fixture(key("file-2"), Arc::clone(&reader));
+        assert!(cache.contains(&key("file-0")));
+        assert!(
+            !cache.contains(&key("file-2")),
+            "equal frequency does not displace"
+        );
+        assert_eq!(cache.inner.state.lock().rejections, 1);
+        // Looked up again (now more frequent than the untouched victim), it
+        // evicts the oldest entry to fit.
+        assert!(cache.get(&key("file-2")).is_none());
+        cache.put_fixture(key("file-2"), Arc::clone(&reader));
         assert!(cache.get(&key("file-0")).is_none());
         assert!(cache.get(&key("file-1")).is_some());
         assert!(cache.get(&key("file-2")).is_some());
@@ -1034,7 +1243,7 @@ mod tests {
         let key = ReaderCacheKey::new("file-a".to_string(), 7, 100);
         let cache = VixReaderCache::new(usize::MAX);
         cache.put_fixture(key.clone(), Arc::clone(&reader));
-        let observer = Arc::clone(&cache.inner.state.lock().lru.peek(&key).unwrap().observer);
+        let observer = Arc::clone(&cache.inner.state.lock().peek(&key).unwrap().observer);
         let initial = reader.memory_size();
         observer.memory_changed(initial + 1024);
         let grown = cache.memory_size();
@@ -1158,6 +1367,92 @@ mod tests {
     /// (metadata tier, still cached, shrunk), not evicted; pass the total
     /// budget and only then do entries evict. A demoted entry is
     /// byte-accounted at its shrunk weight.
+    /// Scan resistance: a repeated sequential scan over a working set 1.6x
+    /// the cache (prod: a 7 d query over ~6,900 files per follower against
+    /// ~4,200 cached readers) keeps a STABLE subset under TinyLFU admission.
+    /// Plain LRU gets 0 hits on every pass after the first (each miss evicts
+    /// the entry the scan needs next); here the second and third passes hit
+    /// the admitted subset, and entries looked up often (a dashboard's
+    /// files) displace one-time scan files.
+    #[test]
+    fn repeated_scan_larger_than_the_cache_keeps_a_stable_subset() {
+        let reader = small_reader();
+        let key = |i: usize| ReaderCacheKey::new(format!("scan-{i}"), 7, 100);
+        let entry_size = reader.memory_size() + entry_overhead(&key(0));
+        let capacity = 40usize;
+        let working_set = 64usize;
+        let cache = VixReaderCache::new(entry_size * capacity);
+        // every evaluation: lookup, and publish on a miss
+        let pass = |cache: &VixReaderCache| -> usize {
+            let mut hits = 0;
+            for i in 0..working_set {
+                if cache.get(&key(i)).is_some() {
+                    hits += 1;
+                } else {
+                    cache.put_fixture(key(i), Arc::clone(&reader));
+                }
+            }
+            hits
+        };
+        assert_eq!(pass(&cache), 0, "cold pass");
+        let second = pass(&cache);
+        let third = pass(&cache);
+        // The admitted subset (about capacity minus the window) hits on every
+        // later pass and the hit set does not shrink.
+        assert!(
+            second * 10 >= capacity * 8,
+            "second pass must hit most of the capacity: {second} of {capacity}"
+        );
+        assert!(
+            third >= second,
+            "the stable subset must not erode: {third} < {second}"
+        );
+        assert!(cache.memory_size() <= entry_size * capacity);
+
+        // A frequently used file (a dashboard panel's, looked up more often
+        // than the scan has touched any of its files) earns admission over
+        // the scan's files and then survives further scans.
+        let hot = ReaderCacheKey::new("dashboard-file".to_string(), 7, 100);
+        for _ in 0..6 {
+            assert!(cache.get(&hot).is_none());
+        }
+        cache.put_fixture(hot.clone(), Arc::clone(&reader));
+        assert!(cache.contains(&hot), "a frequent newcomer must be admitted");
+        pass(&cache);
+        assert!(
+            cache.get(&hot).is_some(),
+            "a frequent entry must survive a scan"
+        );
+    }
+
+    /// Newcomers get a brief residency in the window even before they are
+    /// frequent: a burst of panels over the same new files hits it.
+    #[test]
+    fn window_serves_bursts_over_new_files_before_admission() {
+        let reader = small_reader();
+        let key = |i: usize| ReaderCacheKey::new(format!("w-{i}"), 7, 100);
+        let entry_size = reader.memory_size() + entry_overhead(&key(0));
+        // window cap = 1/16 of 64 entries = 4 entries
+        let cache = VixReaderCache::new(entry_size * 64);
+        // fill main with one-time files so admission is contested
+        for i in 100..164 {
+            assert!(cache.get(&key(i)).is_none());
+            cache.put_fixture(key(i), Arc::clone(&reader));
+        }
+        // panel 1 publishes two new files; panel 2 re-reads them at once
+        for i in 0..2 {
+            assert!(cache.get(&key(i)).is_none());
+            cache.put_fixture(key(i), Arc::clone(&reader));
+        }
+        for i in 0..2 {
+            assert!(
+                cache.get(&key(i)).is_some(),
+                "window hit for a fresh newcomer"
+            );
+        }
+        assert!(cache.memory_size() <= entry_size * 64);
+    }
+
     #[test]
     fn hot_budget_demotes_before_total_budget_evict() {
         let fresh = || {
@@ -1245,7 +1540,7 @@ mod tests {
             cache.put(key(&format!("file-{i}")), fresh()).unwrap();
         }
         let state = cache.inner.state.lock();
-        let leased = state.lru.peek(&key("file-0")).unwrap();
+        let leased = state.peek(&key("file-0")).unwrap();
         assert_eq!(
             leased.tier,
             Tier::Full,
@@ -1257,14 +1552,7 @@ mod tests {
         // The next enforcement (a put) demotes it once free.
         cache.put(key("file-8"), fresh()).unwrap();
         assert_eq!(
-            cache
-                .inner
-                .state
-                .lock()
-                .lru
-                .peek(&key("file-0"))
-                .unwrap()
-                .tier,
+            cache.inner.state.lock().peek(&key("file-0")).unwrap().tier,
             Tier::Metadata
         );
     }
@@ -1280,7 +1568,11 @@ mod tests {
         cache.put_fixture(key("file-1"), Arc::clone(&reader));
         // touch file-0: it becomes the most recently used
         assert!(cache.get(&key("file-0")).is_some());
-        // inserting a third entry now evicts file-1, NOT file-0
+        // a third entry, looked up often enough to be admitted, evicts the
+        // LRU victim file-1, NOT the refreshed file-0
+        for _ in 0..2 {
+            assert!(cache.get(&key("file-2")).is_none());
+        }
         cache.put_fixture(key("file-2"), Arc::clone(&reader));
         assert!(
             cache.get(&key("file-0")).is_some(),
@@ -1372,15 +1664,18 @@ mod tests {
                     let other = small_reader();
                     let size = other.memory_size() + entry_overhead(&key);
                     for generation in 8..(8 + cache.inner.max_bytes / size + 2) {
-                        cache.put_fixture(
-                            ReaderCacheKey::new("other-file".to_string(), generation as i64, 100),
-                            Arc::clone(&other),
-                        );
+                        let other_key =
+                            ReaderCacheKey::new("other-file".to_string(), generation as i64, 100);
+                        // frequent enough to be admitted over the victim
+                        for _ in 0..2 {
+                            assert!(cache.get(&other_key).is_none());
+                        }
+                        cache.put_fixture(other_key, Arc::clone(&other));
                     }
                 }
                 "growth" => {
                     let observer =
-                        Arc::clone(&cache.inner.state.lock().lru.peek(&key).unwrap().observer);
+                        Arc::clone(&cache.inner.state.lock().peek(&key).unwrap().observer);
                     observer.memory_changed(usize::MAX);
                 }
                 "remove" => cache.remove(key.file()),
