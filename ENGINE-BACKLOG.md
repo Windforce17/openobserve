@@ -399,6 +399,62 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     measurement (33 `budget_refused` full scans across four bursts); (3)
     `ZO_VIX_EAGER_TAIL_BYTES` 512 KiB for traces-shaped sidecars; (4)
     binary footer properties for the 2,586-field logs schema (369 KB JSON).
+- **2026-10-01 05:00–07:10Z — cache optimization round 2 (`.186`, `.187`),
+  owner: "继续执行缓存优化".** Prod measurement first (`/tmp/cache_probe*.py`
+  on ops: per-query reader-cache hits/misses/demotions on one pod + the
+  follower's `io_accounting`):
+  - **The metadata tier works for the realistic case.** Repeated 24 h
+    filtered traces counts over ~1,250 files per follower: 99–100 % reader
+    hits, **1.1–1.8 reads/file** (block + leaf; 1 when the key block is
+    still cached), 1.6–2.8 s wall vs 7–40 s cold earlier in the day; once
+    the per-file result cache is warm the same dashboards are 0.8–0.9 s
+    (counts) / 2.4 s (top-N) with ~40 reader lookups.
+  - **Top-N on a warm reader cost 10 reads/file**: `prefetch_field_bundle`
+    pushed the KEY field's whole ordinal span into the leaf plan — 1,100+
+    composite keys with large postings = 7 `doc_count` leaves per file,
+    identical for every field, never used (only one key ordinal is). Fixed
+    (`1c52bf5ea`): prod files 10 → 4 (traces), 8 → 4 (logs).
+  - **The 7 d case still thrashes**: a demoted reader on the real 7 d mix
+    averages **~840 KB** (merged 1.5–4 GB files carry much bigger dict block
+    indexes than the 125 MB L0 sample's 184 KB), so 4 GiB holds ~4.2k of
+    the ~6.9k traces files per follower → 26–38 % hits, 3.6–4.7 reads/file
+    on repeats (vs 4.7–6.0 cold). Fitting 7 d needs ~6–7 GiB — RSS is
+    10–11 GiB of 24 with the 4 GiB cache (memory cache 4 GiB, DataFusion
+    pool cap 12 GiB), so not taken. 7 d queries are ~1 % of traffic.
+  - `.186` (vix-arch `73cf6d387`, #585, 06:14Z, cache 3 → 4 GiB): top-N key
+    span fix; terms Vortex footer retained as its consumed suffix (vortex's
+    `FooterDeserializer` reports the first consumed offset from the
+    postscript alone; a retained parsed `Footer` would pin the opening
+    session) — demoted traces reader 645 → 488 KB on the sample file,
+    logs 856 → 826 KB; hot tier 1/8 (reverted in `.187`: it demoted the
+    recent day's readers every query — 1.8 vs 1.1–1.6 reads/file — and no
+    split fits 7 d anyway).
+  - `.187` (vix-arch `3ae68b6fd`, #586, 06:53Z) + `ZO_VIX_EAGER_TAIL_BYTES`
+    256 → **768 KiB**, data tail 64 → 128 KiB: measured on the prod files,
+    the sidecar footer JSON (154 / 369 KB) + dict index (184 / 197 KB) +
+    terms footer now ride in ONE tail read, and the logs data footer
+    (71 KB) no longer needs a prefix read. **Cold exact count per file:
+    traces 6 → 4.7, logs 8 → 4.6 reads** (prod `io_accounting`, fresh
+    pods); cold 7 d battery 14.7 / 18.1 / 10.8 s (`.185`: 16.0 / 19.4 /
+    12.1; `.179` this time yesterday: 85 / 91 / 52). +512 KB per cold open
+    (11.2 GB logical for a 7 d traces count; requests, not bytes, are the
+    ceiling). RSS 10.1–11.1 GiB, 0 restarts; burst repro small avg 0.37 s /
+    max 1.25 s.
+  - Noted for the owner: `ZO_WARMUP_CACHE_HOURS=24` (since `.86`) already
+    runs a boot warm-up — each fresh querier prefetches its ~2.2–2.8k-file
+    share of the last 24 h (82–154 s after start, ~30 req/s). Queries
+    issued during that window compete with it (two followers showed 2.6–
+    2.9 s setup vs 1.4–1.7 on the others). The owner rejected *adding*
+    warm-up; whether to keep this one is their call — it is a configmap
+    knob (`0` disables).
+  - Next, evidence-backed: (1) scan-resistant eviction for the metadata
+    tier — a repeated 7 d scan over a working set 1.6× the cache gets
+    26–38 % hits under LRU; protecting entries that have been hit once
+    (evict zero-hit LRU first) would converge to ~60 %; (2) the dict block
+    index dominates demoted-reader bytes on merged files — a size-capped
+    dict residency (keep ≤ 256 KB, re-read larger ones: +1 read on those
+    files) would roughly double 7 d capacity; (3) `budget_refused` under
+    bursts (filtered histograms still declare 32 MiB).
 
 ## 2026-09-29 — P2 shipped as `.176` and rolled back within 30 min: the per-stream side table stalled the shared meta DB (commit latency 40–60×, ingest 503s); ranges must live in the segment row
 - What shipped (vix-arch `013c45010` + NATS retry `76fe754b5`, image
