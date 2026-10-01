@@ -50,17 +50,19 @@ pub static GLOBAL_CACHE: Lazy<VixReaderCache> =
 /// per-file metadata read free (puffin footer, `fields`, zone map, the
 /// dict block index, the terms Vortex footer) and re-fetches only its
 /// query-specific blocks/leaves (2 reads for an exact count, 4 for a
-/// top-N, vs 7-8 cold), so a whole 7-day window fits the cache. Hot files
-/// (refreshed by lookups) stay full; the LRU tail degrades to metadata,
-/// not to a cold reopen. Measured 2026-10-01 on prod `.185` (3 GiB
-/// budget): full readers ~740 KB (1,035 of them at the quarter budget),
-/// demoted ~645 KB traces / ~855 KB logs; a 24 h window is ~1,300 files
-/// per follower and a 7 d traces window ~7,000. A full reader saves one
-/// more read than a demoted one (its cached key blocks), so an eighth of
-/// the budget - ~700 full readers at 4 GiB, half a recent day - keeps the
-/// most-recent dashboards' files full while 7/8 of the budget holds the
-/// 7 d metadata tail.
-const HOT_BUDGET_FRACTION: usize = 8;
+/// top-N, vs 5-8 cold); a full reader also keeps its key blocks and
+/// prefetched leaves (1 read). Hot files (refreshed by lookups) stay
+/// full; the LRU tail degrades to metadata, not to a cold reopen.
+///
+/// Measured 2026-10-01 on prod (4 GiB budget): a 24 h traces window is
+/// ~1,250 files per follower; full readers ~800 KB, demoted ~840 KB on the
+/// 7 d traces mix (merged files carry bigger dict indexes than the 490 KB
+/// L0 sample), so no budget fits a 7 d window as metadata (5.9 GB) and
+/// repeated 7 d scans thrash whatever the split. A quarter for full
+/// readers (~1,300 at 4 GiB) keeps a recent day's dashboards at 1 read
+/// per file; at an eighth the same dashboards demoted every query and
+/// paid 2 (measured 1.8 vs 1.1-1.6 reads per evaluation).
+const HOT_BUDGET_FRACTION: usize = 4;
 
 /// Immutable sidecar identity for one logical data file.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]

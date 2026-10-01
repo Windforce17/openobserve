@@ -5704,11 +5704,13 @@ mod ranged {
 
     /// Data-only opens must not inherit the wider sidecar tail. Both probes
     /// parse the same container in one request, while the compact probe saves
-    /// exactly 192 KiB on a production-sized data object.
+    /// the difference between the prod sidecar tail (768 KiB) and the data
+    /// tail (128 KiB) on a production-sized data object.
     #[test]
     fn data_only_tail_probe_avoids_sidecar_read_amplification() {
+        const SIDECAR_TAIL: u64 = 768 * 1024;
         let (data, _index) = build_large_core_file();
-        assert!(data.len() > 256 * 1024);
+        assert!(data.len() as u64 > SIDECAR_TAIL);
 
         let compact = CountingSource::new(data.clone());
         let compact_dyn: Arc<dyn VixRangeSource> = compact.clone();
@@ -5720,13 +5722,16 @@ mod ranged {
 
         let sidecar_sized = CountingSource::new(data);
         let sidecar_dyn: Arc<dyn VixRangeSource> = sidecar_sized.clone();
-        crate::container::parse_container_ranged_with_tail(&sidecar_dyn, 256 * 1024).unwrap();
+        crate::container::parse_container_ranged_with_tail(&sidecar_dyn, SIDECAR_TAIL).unwrap();
 
         assert_eq!(compact.fetches(), 1);
         assert_eq!(sidecar_sized.fetches(), 1);
         assert_eq!(compact.bytes(), crate::DEFAULT_TAIL_FETCH_BYTES);
-        assert_eq!(sidecar_sized.bytes(), 256 * 1024);
-        assert_eq!(sidecar_sized.bytes() - compact.bytes(), 192 * 1024);
+        assert_eq!(sidecar_sized.bytes(), SIDECAR_TAIL);
+        assert_eq!(
+            sidecar_sized.bytes() - compact.bytes(),
+            SIDECAR_TAIL - crate::DEFAULT_TAIL_FETCH_BYTES
+        );
     }
 
     /// A one-bucket equality needs only the predicate column. The general

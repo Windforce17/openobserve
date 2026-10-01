@@ -170,11 +170,13 @@ fn s3_review_open_is_directory_only_and_blocks_load_lazily() {
     )
     .unwrap();
     // open is FOOTER-ONLY (one tail per object): the dictionary index
-    // parses lazily on the first dictionary touch, blocks fetch per lookup
+    // parses lazily on the first dictionary touch, blocks fetch per lookup.
+    // Two eager tails (data + sidecar at the default size) plus at most a
+    // footer-prefix follow-up.
     let open_fetches = fetch_count();
     let open_bytes = byte_count();
     assert!(
-        open_bytes < 2 * (64 * 1024) + 96 * 1024,
+        open_bytes < 2 * vortex_index::DEFAULT_TAIL_FETCH_BYTES + 96 * 1024,
         "open must fetch only the two tail windows: {open_bytes} bytes"
     );
     assert!(

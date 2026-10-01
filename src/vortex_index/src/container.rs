@@ -249,18 +249,20 @@ impl NativeReadSetup {
     }
 }
 
-/// Bytes fetched from the object tail when opening ranged: covers the puffin
-/// footer (a small JSON payload) in one read for all but pathological files,
-/// and doubles as a window small blobs are sliced from for free.
+/// Bytes fetched from the DATA object's tail when opening ranged: the puffin
+/// footer (`columns`, `zone_map`, `row_*` properties) plus the `stats` blob.
+/// Measured 2026-10-01 on prod core files: the traces footer is 30 KB, the
+/// logs footer 71 KB (`columns` alone 68 KB for a 2,586-field schema) - at
+/// 64 KiB every logs open paid a second, sequential prefix read. 128 KiB
+/// covers both in one request; requests, not bytes, bound a cold query.
 ///
-/// Default eager tail size; overridable via [`set_tail_fetch_size`]
-/// (`ZO_VIX_EAGER_TAIL_BYTES`). Sidecars lay their small, hot blobs LAST —
-/// nearest the footer: the `dict` block index, and directly before it the
-/// `terms` blob whose own Vortex footer (its last 65,535 bytes) then shares
-/// the tail — so a tail large enough to cover them turns a cold sidecar open
-/// plus term eval into ONE ranged fetch. On prod, cold evals averaged ~8-9
-/// GETs per file before this was tunable.
-pub const DEFAULT_TAIL_FETCH_BYTES: u64 = 64 * 1024;
+/// Also the default eager tail for sidecars, overridable via
+/// [`set_tail_fetch_size`] (`ZO_VIX_EAGER_TAIL_BYTES`; prod runs 768 KiB
+/// so the sidecar footer JSON, the `dict` block index and the `terms`
+/// blob's Vortex footer all ride in the one tail read). Sidecars lay their
+/// small, hot blobs LAST - nearest the footer: `dict`, and directly before
+/// it `terms` whose own Vortex footer then shares the tail.
+pub const DEFAULT_TAIL_FETCH_BYTES: u64 = 128 * 1024;
 static TAIL_FETCH_OVERRIDE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Set the eager tail fetch size for ranged opens (bytes; 0 keeps the
