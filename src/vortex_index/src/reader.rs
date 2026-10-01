@@ -2064,7 +2064,11 @@ impl VixReader {
                     }),
                 }
             }
-            if paged {
+            // The key field (every field's composite key) is only ever probed
+            // for ONE ordinal; its whole span is 1,100+ keys with large postings
+            // spread over many row blocks (7 leaves per file on prod traces).
+            // Stage 2 fetches that one leaf once the ordinal is known.
+            if paged && fid != KEY_FIELD_ID {
                 let last = blocks.end - 1;
                 spans.push(
                     index.meta(blocks.start).1
