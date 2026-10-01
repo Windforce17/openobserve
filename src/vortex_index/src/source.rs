@@ -42,7 +42,9 @@ use vortex::{
     array::buffer::BufferHandle,
     buffer::{Alignment, ByteBuffer},
     error::{VortexResult, vortex_err},
+    file::{DeserializeStep, Footer},
     io::{CoalesceConfig, VortexReadAt},
+    session::VortexSession,
 };
 
 use crate::error::{Result, VixError};
@@ -616,6 +618,28 @@ impl FooterState {
                 .map(|(_, bytes)| bytes.len() + 4 * std::mem::size_of::<usize>())
                 .sum::<usize>()
     }
+
+    /// The retained footer window `[start, blob_end)`: the recorded
+    /// ranges are one contiguous suffix (the open's initial read plus any
+    /// `NeedMoreData` prefixes, trimmed to what the parse consumes). The
+    /// window's length is exactly what a later open must pass to
+    /// `VortexOpenOptions::with_initial_read_size` so its initial suffix
+    /// read is served entirely from `ranges` — zero fetches, no
+    /// `NeedMoreData` prefix. `None` when nothing is cached yet or the
+    /// recorded ranges are not a contiguous suffix ending at the blob end
+    /// (only contrived non-open recordings; callers then keep today's
+    /// 256 KiB-window behaviour).
+    fn window(&self, blob_end: u64) -> Option<Range<u64>> {
+        let ranges = self.ranges.get()?;
+        let mut start = blob_end;
+        for (range, _) in ranges.iter().rev() {
+            if range.end != start {
+                return None;
+            }
+            start = range.start;
+        }
+        (start < blob_end).then(|| start..blob_end)
+    }
 }
 
 /// Reuse every covered byte, including a request that only partly overlaps
@@ -728,29 +752,64 @@ impl RangedBlob {
 
     /// Absolute window of the initial Vortex footer read an open performs:
     /// [`VORTEX_FOOTER_INITIAL_READ_BYTES`] from the blob end, clamped to
-    /// the blob. The open's single read then covers the postscript AND the
-    /// layout of prod-sized terms/docs blobs — no `NeedMoreData` prefix
-    /// follow-up — and the field-scoped prefetch fetches this same window
-    /// so a cold open costs no extra round trip.
+    /// the blob — or, once an open retained this blob's footer, exactly the
+    /// RETAINED suffix ([`FooterState::window`], at most the initial
+    /// window). Planning (`prefetch_field_bundle`, tail-residency checks)
+    /// must fetch what is actually retained: the retained state serves a
+    /// later open with `with_initial_read_size(retained_len)`, so no path
+    /// ever re-fetches the footer of an opened blob.
     pub(crate) fn footer_window(&self) -> Range<u64> {
+        self.footer
+            .window(self.range.end)
+            .unwrap_or_else(|| self.initial_footer_window())
+    }
+
+    /// The uncached initial-read window: a suffix read of up to
+    /// [`VORTEX_FOOTER_INITIAL_READ_BYTES`] bytes.
+    fn initial_footer_window(&self) -> Range<u64> {
         self.range.end - self.len().min(VORTEX_FOOTER_INITIAL_READ_BYTES)..self.range.end
     }
 
+    /// Byte length a later open passes to
+    /// `VortexOpenOptions::with_initial_read_size` (vortex hard-floors it at
+    /// `MAX_POSTSCRIPT_SIZE + EOF`): the retained window once cached, else
+    /// [`VORTEX_FOOTER_INITIAL_READ_BYTES`].
+    pub(crate) fn footer_initial_read_bytes(&self) -> u64 {
+        self.footer
+            .window(self.range.end)
+            .map_or(VORTEX_FOOTER_INITIAL_READ_BYTES, |window| {
+                window.end - window.start
+            })
+    }
+
     /// Absolute window a demoted reader must keep servable without IO:
-    /// the postscript-sized suffix only. The retained footer state
-    /// ([`FooterState`]) already serves every later open, so demotion
-    /// trims the eager tail to exactly the same window it does today.
-    fn retained_footer_window(&self) -> Range<u64> {
-        self.range.end - self.len().min(VORTEX_FOOTER_READ_BYTES)..self.range.end
+    /// the RETAINED footer window of an opened blob (its exact bounds are
+    /// published for tests and planning), else the postscript-sized
+    /// eager-tail suffix. An opened blob's footer state serves this whole
+    /// window with zero IO.
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub(crate) fn retained_footer_window(&self) -> Range<u64> {
+        self.footer.window(self.range.end).unwrap_or_else(|| {
+            self.range.end - self.len().min(VORTEX_FOOTER_READ_BYTES)..self.range.end
+        })
     }
 
     /// Demote the underlying source to metadata-only retention: keep the
-    /// blob's Vortex footer window, release retained eager-tail data
-    /// bytes. Returns the released bytes (0 when nothing changed).
+    /// blob's Vortex footer window servable, release retained eager-tail
+    /// data bytes. Returns the released bytes (0 when nothing changed).
+    ///
+    /// An OPENED blob keeps nothing in the source: the retained footer
+    /// state serves the whole footer window (data bytes re-fetch on
+    /// demand, the demote contract). An unopened blob keeps the
+    /// postscript-sized suffix through the eager tail, exactly as before.
     pub(crate) fn trim_retained_tail(&mut self) -> usize {
-        let window = self.retained_footer_window();
+        let keep = if self.footer_cached() {
+            self.range.end..self.range.end
+        } else {
+            self.range.end - self.len().min(VORTEX_FOOTER_READ_BYTES)..self.range.end
+        };
         let before = self.source.retained_bytes();
-        let Some(trimmed) = self.source.trim_retained_tail(window) else {
+        let Some(trimmed) = self.source.trim_retained_tail(keep) else {
             return 0;
         };
         self.source = trimmed;
@@ -758,13 +817,14 @@ impl RangedBlob {
     }
 
     /// Whether the footer window is servable without IO: retained by an
-    /// earlier open, held by the source (eager tail), or prefetched on this
-    /// thread.
+    /// earlier open (the cached window always covers the initial read a
+    /// later open performs — they are the same suffix), held by the source
+    /// (eager tail), or prefetched on this thread.
     pub(crate) fn footer_resident(&self) -> bool {
         if self.footer_cached() {
             return true;
         }
-        let window = self.footer_window();
+        let window = self.initial_footer_window();
         if self.source.resident(window.clone()).is_some() {
             return true;
         }
@@ -810,6 +870,7 @@ impl RangedBlob {
         let opening = Arc::new(OpeningMemory {
             memory: self.reader_memory(),
             footer: Arc::clone(&self.footer),
+            blob_end: self.range.end,
             state: parking_lot::Mutex::new(OpeningState {
                 active: true,
                 pending: None,
@@ -845,6 +906,9 @@ impl fmt::Debug for RangedBlob {
 pub(crate) struct OpeningMemory {
     memory: Arc<crate::reader::ReaderMemory>,
     footer: Arc<FooterState>,
+    /// Absolute end offset of the blob: the retained footer window is a
+    /// suffix `[consumed_start, blob_end)`.
+    blob_end: u64,
     state: parking_lot::Mutex<OpeningState>,
 }
 
@@ -890,21 +954,110 @@ impl OpeningMemory {
         let mut ranges = std::mem::take(&mut state.ranges);
         if !ranges.is_empty() {
             ranges.sort_unstable_by_key(|(range, _)| range.start);
-            let retained = FooterState::retained_bytes(&ranges);
-            if self.footer.ranges.set(ranges).is_ok()
+            // Trim the fetched window to the single suffix the Vortex
+            // footer parse actually consumes: [consumed_start, blob_end)
+            // with consumed_start = min(dtype?, layout, stats?, footer)
+            // segment offset from the postscript, floored at the
+            // postscript-sized suffix a Vortex open's initial read is
+            // hard-floored to. The retained window then serves every later
+            // open's initial read in full (see
+            // [`RangedBlob::footer_initial_read_bytes`]) while the unused
+            // prefix of the 256 KiB window is released. Any parse failure
+            // keeps the whole recorded window — today's behaviour.
+            let retained = Self::trim_to_consumed_suffix(&ranges, self.blob_end).unwrap_or(ranges);
+            if self.footer.ranges.set(retained.clone()).is_ok()
                 && let Some(memory) = self.footer.memory.get()
             {
-                memory.add(retained);
+                memory.add(FooterState::retained_bytes(&retained));
                 memory.notify();
             }
         }
         state.pending.take()
     }
+
+    /// Coalesce the open's recorded ranges into the single consumed suffix
+    /// `[consumed_start, blob_end)`, `None` on any postscript parse error
+    /// (the caller keeps the recorded window unchanged then). The recorded
+    /// ranges are suffix-shaped (the open's initial read plus any
+    /// `NeedMoreData` prefixes), so the trim only drops an unused PREFIX.
+    fn trim_to_consumed_suffix(
+        ranges: &[(Range<u64>, Bytes)],
+        blob_end: u64,
+    ) -> Option<Vec<(Range<u64>, Bytes)>> {
+        let (tail_range, tail) = ranges.last()?;
+        // The open must have read through the blob end (EOF marker).
+        if tail_range.end != blob_end {
+            return None;
+        }
+        let eof = vortex::file::EOF_SIZE;
+        let tail = tail.as_ref();
+        if tail.len() < eof {
+            return None;
+        }
+        // EOF record: [version u16][ps_size u16][magic 4]; the postscript
+        // flatbuffer sits directly before it.
+        let ps_len = u16::from_le_bytes(
+            tail[tail.len() - eof + 2..tail.len() - eof + 4]
+                .try_into()
+                .ok()?,
+        ) as usize;
+        if tail.len() < ps_len + eof {
+            return None;
+        }
+        // Drive vortex's own deserializer over the postscript+EOF suffix:
+        // the FIRST step either errors (corrupt postscript — keep the
+        // window) or reports `NeedMoreData { offset }` — exactly the first
+        // consumed byte (min of the dtype/layout/stats/footer segment
+        // offsets, no segment parsing). `Done` cannot occur for a
+        // well-formed blob (the segments precede the postscript).
+        let ps_eof = ByteBuffer::copy_from(&tail[tail.len() - ps_len - eof..]);
+        let mut deserializer =
+            Footer::deserializer(ps_eof, VortexSession::empty()).with_size(blob_end);
+        let consumed_start = match deserializer.deserialize() {
+            Ok(DeserializeStep::NeedMoreData { offset, .. }) => offset,
+            _ => return None,
+        };
+        // Floor at the postscript-sized suffix (vortex hard-floors an
+        // open's initial read to MAX_POSTSCRIPT_SIZE + EOF) and clamp into
+        // the recorded window: never retain bytes the open did not read.
+        let floor = blob_end.saturating_sub(VORTEX_FOOTER_READ_BYTES);
+        let window_start = ranges.first()?.0.start;
+        let start = consumed_start.min(floor).max(window_start);
+        if !(window_start <= start && start < blob_end) {
+            return None;
+        }
+        // Copy the suffix out of the recorded windows (they may be several
+        // adjacent ranges); a gap before `blob_end` keeps the full window.
+        let mut suffix = BytesMut::with_capacity((blob_end - start) as usize);
+        let mut offset = start;
+        for (range, bytes) in ranges {
+            if range.end <= offset {
+                continue;
+            }
+            if range.start > offset {
+                return None;
+            }
+            let end = range.end.min(blob_end);
+            suffix.extend_from_slice(
+                &bytes[(offset - range.start) as usize..(end - range.start) as usize],
+            );
+            offset = end;
+        }
+        if offset != blob_end {
+            return None;
+        }
+        let bytes = compact_bytes(suffix.freeze());
+        debug_assert_eq!(bytes.len() as u64, blob_end - start);
+        Some(vec![(start..blob_end, bytes)])
+    }
 }
+
 /// The postscript-sized suffix of a blob (its maximum postscript plus the
-/// EOF marker): the minimum window a Vortex open reads, and the window a
+/// EOF marker): the minimum window a Vortex open reads (its hard floor on
+/// `initial_read_size`) and — for a blob never opened — the window a
 /// demoted reader keeps servable through the eager tail (see
-/// [`RangedBlob::trim_retained_tail`]).
+/// [`RangedBlob::trim_retained_tail`]; an OPENED blob's retained footer
+/// state supersedes the tail copy entirely).
 pub(crate) const VORTEX_FOOTER_READ_BYTES: u64 =
     vortex::file::MAX_POSTSCRIPT_SIZE as u64 + vortex::file::EOF_SIZE as u64;
 
@@ -914,8 +1067,9 @@ pub(crate) const VORTEX_FOOTER_READ_BYTES: u64 =
 /// sequential `NeedMoreData` prefix read the 64 KiB postscript window paid
 /// (39-167 KB on prod sidecars). Clamped to the blob length; a blob whose
 /// whole footer window lies inside the eager tail still opens without IO.
-/// Byte cost, not a format: only the fetched window grows — the retained
-/// footer state stores whatever the open read.
+/// Byte cost, not a format: only the FETCHED window grows — the retained
+/// footer state stores just the consumed suffix of it (see
+/// [`OpeningMemory::finish`]).
 pub(crate) const VORTEX_FOOTER_INITIAL_READ_BYTES: u64 = 256 * 1024;
 
 /// [`VortexReadAt`] over a byte window of a [`VixRangeSource`]: every read

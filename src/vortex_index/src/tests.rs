@@ -5210,6 +5210,100 @@ mod ranged {
         );
     }
 
+    /// Footer-trim contract: after the first terms-blob open the retained
+    /// footer state is the single CONSUMED suffix
+    /// `[max(min(dtype?, layout, stats?, footer) segment offset, blob_end - 65,535), blob_end)`
+    /// — at most the 256 KiB initial window, and exactly the window a
+    /// later open's `with_initial_read_size` read covers, so:
+    /// (a) the retained bytes equal that suffix (not the whole fetched
+    /// window) and the blob's `footer_window()` reports the RETAINED
+    /// bounds (planning never re-fetches what is retained);
+    /// (b) a second open of the same blob performs ZERO fetches.
+    #[test]
+    fn retained_terms_footer_is_consumed_suffix_and_reopens_without_io() {
+        let (data, index) = build_large_core_file();
+        let source = PairSource::new(data, index);
+        let reader = source.open_with_tail(PROD_SIDECAR_TAIL);
+        let terms_blob = reader.terms_blob_for_tests().expect("indexed fixture");
+        let crate::container::BlobHandle::Ranged(terms) = terms_blob else {
+            panic!("the terms blob must be a ranged window");
+        };
+
+        // First open: fetches exactly the initial window (the tail serves
+        // whatever prefix it covers).
+        let before = source.index.fetches();
+        let schema_reader =
+            crate::container::blob_arrow_schema_owned(terms_blob).expect("open terms blob");
+        let consumed_fetches = source.index.fetches() - before;
+        assert!(
+            consumed_fetches <= 1,
+            "the open performs at most one footer-window fetch, used {consumed_fetches}"
+        );
+        drop(schema_reader);
+
+        // The retained state is one range: the consumed suffix.
+        let retained = terms.retained_footer_window();
+        assert_eq!(
+            retained.end, terms.range.end,
+            "the suffix ends at the blob end"
+        );
+        assert!(
+            retained.end - retained.start <= crate::source::VORTEX_FOOTER_INITIAL_READ_BYTES,
+            "the retained window is at most the initial window"
+        );
+        assert!(
+            retained.end - retained.start >= crate::source::VORTEX_FOOTER_READ_BYTES,
+            "the retained window is floored at the postscript-sized suffix"
+        );
+
+        // A second open of the SAME blob: zero fetches, no NeedMoreData.
+        source.index.clear_reads();
+        let before = source.index.fetches();
+        let scan_reader =
+            crate::container::blob_arrow_schema_owned(terms_blob).expect("reopen terms blob");
+        drop(scan_reader);
+        assert_eq!(
+            source.index.fetches() - before,
+            0,
+            "a second open must be served entirely from the retained footer"
+        );
+    }
+
+    /// Footer-trim fail-open: the trim only runs on a SUCCESSFUL postscript
+    /// parse. A corrupt EOF record fails the open at the magic check — no
+    /// footer state is retained at all, so no bogus suffix can ever be
+    /// committed, and the blob's servable window stays the postscript-sized
+    /// suffix (today's behaviour).
+    #[test]
+    fn corrupt_postscript_keeps_the_full_fetched_footer_window() {
+        let (data, index) = build_large_core_file();
+        // Corrupt the terms blob's OWN Vortex EOF record (the last 4
+        // bytes of the blob, inside the sidecar) so only the terms-blob
+        // open fails at the postscript parse; the sidecar's puffin
+        // footer stays intact.
+        let terms = crate::test_support::blob_byte_range(&index, "terms").unwrap();
+        let mut corrupt = index.to_vec();
+        corrupt[terms.end - 4..terms.end].copy_from_slice(b"JUNK");
+        let source = PairSource::new(data, Bytes::from(corrupt));
+        let reader = source.open_with_tail(PROD_SIDECAR_TAIL);
+        let terms_blob = reader.terms_blob_for_tests().expect("indexed fixture");
+        let crate::container::BlobHandle::Ranged(terms) = terms_blob else {
+            panic!("the terms blob must be a ranged window");
+        };
+        let result = crate::container::blob_arrow_schema_owned(terms_blob);
+        assert!(result.is_err(), "a corrupt magic must fail the open");
+        assert!(
+            !terms.footer_cached(),
+            "a failed open retains no footer state"
+        );
+        let window = terms.retained_footer_window();
+        assert_eq!(
+            window.end - window.start,
+            crate::source::VORTEX_FOOTER_READ_BYTES.min(terms.len()),
+            "an unopened blob's servable window stays the postscript-sized suffix"
+        );
+    }
+
     /// #27: a condition-ALL evaluation must not touch the dictionary at
     /// all — the unconditioned SimpleSelect/TopN shapes were paying an
     /// MB-class dict-index fetch per ranged file for a structure the query

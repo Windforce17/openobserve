@@ -547,8 +547,13 @@ fn cached_native_footer_counts_ownership_without_retaining_creator_operation() {
         .map(|range| (range.end - range.start) as usize)
         .sum();
     assert!(encoded_bytes > 0);
+    // The footer trim keeps only the CONSUMED suffix of what the open read
+    // ([min(dtype/layout/stats/footer segment offset), blob end), floored
+    // at the postscript-sized suffix), so the retained ownership may be
+    // smaller than the fetched bytes — but it must be nonzero (encoded
+    // footer counted) and bounded by the fetch plus the range directory.
     assert!(
-        memory.size() >= baseline + encoded_bytes,
+        memory.size() > baseline,
         "encoded footer omitted from ownership"
     );
     assert!(
@@ -605,10 +610,19 @@ fn cached_native_footer_counts_ownership_without_retaining_creator_operation() {
             .sum();
         assert_eq!(sum, (ROWS * CHUNKS * (CHUNKS - 1) / 2) as i64);
     });
+    // The retained-footer contract: warm scans never re-fetch the RETAINED
+    // window (the consumed suffix). Bytes the trim deliberately released
+    // (the unused prefix of the initial window) may be re-fetched.
+    let retained_window = match &blob {
+        BlobHandle::Ranged(ranged) => ranged.retained_footer_window(),
+        BlobHandle::Mem(_) => unreachable!("ranged blob"),
+    };
     assert!(
-        source.reads.lock().iter().all(|read| footer_reads
+        source
+            .reads
+            .lock()
             .iter()
-            .all(|footer| { read.end <= footer.start || footer.end <= read.start })),
+            .all(|read| { read.end <= retained_window.start || retained_window.end <= read.start }),
         "warm scan fetched bytes already retained by the footer cache"
     );
     assert_eq!(

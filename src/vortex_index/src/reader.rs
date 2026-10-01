@@ -1450,9 +1450,11 @@ impl VixReader {
         for (_, index) in self.field_indexes.lock().drain() {
             released += index.memory_size();
         }
-        // Eager-tail prefixes retained by ranged sources: keep only each
-        // blob's Vortex footer window (metadata re-used by every open),
-        // release the data prefix. Tails fully inside their blob stay.
+        // Eager-tail prefixes retained by ranged sources: keep each
+        // blob's Vortex footer window servable (the RETAINED footer state
+        // of an opened blob — which already serves every later open with
+        // zero IO — or, when never opened, the postscript-sized eager-tail
+        // suffix), release the rest of the retained data prefix.
         for blob in [
             Some(&mut self.docs_blob),
             self.dict_blob.as_mut(),

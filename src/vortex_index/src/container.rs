@@ -2356,10 +2356,12 @@ pub(crate) fn open_blob(
                     .open_options()
                     // One 256 KiB suffix read instead of the postscript
                     // window + a NeedMoreData prefix follow-up (two
-                    // sequential reads on prod-sized blobs).
+                    // sequential reads on prod-sized blobs); once an open
+                    // retained this blob's footer, exactly the RETAINED
+                    // window, which it then serves in full — zero fetches.
                     .with_initial_read_size(
-                        usize::try_from(crate::source::VORTEX_FOOTER_INITIAL_READ_BYTES)
-                            .expect("constant fits usize"),
+                        usize::try_from(ranged.footer_initial_read_bytes())
+                            .expect("footer window fits usize"),
                     )
                     .with_file_size(bytes.len() as u64)
                     .open_read(read),
@@ -2385,10 +2387,12 @@ pub(crate) fn open_blob(
                     .open_options()
                     // One 256 KiB suffix read instead of the postscript
                     // window + a NeedMoreData prefix follow-up (two
-                    // sequential reads on prod-sized blobs).
+                    // sequential reads on prod-sized blobs); once an open
+                    // retained this blob's footer, exactly the RETAINED
+                    // window, which it then serves in full — zero fetches.
                     .with_initial_read_size(
-                        usize::try_from(crate::source::VORTEX_FOOTER_INITIAL_READ_BYTES)
-                            .expect("constant fits usize"),
+                        usize::try_from(ranged.footer_initial_read_bytes())
+                            .expect("footer window fits usize"),
                     )
                     .with_file_size(ranged.len())
                     .open_read(read),
