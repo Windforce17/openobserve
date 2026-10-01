@@ -1607,12 +1607,28 @@ pub static VIX_READER_CACHE_REJECTIONS_TOTAL: Lazy<IntCounterVec> = Lazy::new(||
     IntCounterVec::new(
         Opts::new(
             "vix_reader_cache_rejections_total",
-            "Readers the reader cache declined to admit: the candidate's lookup \
-             frequency did not exceed the LRU victim's (TinyLFU admission)",
+            "Readers the reader cache declined to admit: the candidate had no reuse \
+             distance shorter than the LRU victim's age (reuse-distance admission)",
         )
         .namespace(NAMESPACE)
         .const_labels(create_const_labels()),
         &[],
+    )
+    .expect("Metric created")
+});
+
+pub static VIX_READER_CACHE_EVICTIONS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "vix_reader_cache_evictions_total",
+            "Resident readers the reader cache evicted, by reason: `admission` (a \
+             candidate with a shorter reuse distance displaced the LRU victim), \
+             `growth_window` / `growth_main` (a cached reader's growth exceeded \
+             the budget after demotion; the window is shed before main)",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &["reason"],
     )
     .expect("Metric created")
 });
@@ -2599,6 +2615,9 @@ fn register_metrics(registry: &Registry) {
         .register(Box::new(VIX_READER_CACHE_REJECTIONS_TOTAL.clone()))
         .expect("Metric registered");
     registry
+        .register(Box::new(VIX_READER_CACHE_EVICTIONS_TOTAL.clone()))
+        .expect("Metric registered");
+    registry
         .register(Box::new(VIX_FETCH_COUNT_TOTAL.clone()))
         .expect("Metric registered");
     registry
@@ -3019,6 +3038,7 @@ mod tests {
         let _ = VIX_READER_CACHE_TIER_BYTES.clone();
         let _ = VIX_READER_CACHE_DEMOTIONS_TOTAL.clone();
         let _ = VIX_READER_CACHE_REJECTIONS_TOTAL.clone();
+        let _ = VIX_READER_CACHE_EVICTIONS_TOTAL.clone();
         let _ = VIX_FETCH_COUNT_TOTAL.clone();
         let _ = VIX_FETCH_BYTES_TOTAL.clone();
         let _ = VIX_RESULT_CACHE_MEMORY_USAGE.clone();

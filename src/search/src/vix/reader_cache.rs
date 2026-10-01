@@ -31,7 +31,8 @@
 //! purge every generation belonging to one logical data file.
 //!
 //! Prometheus: `vix_reader_cache_entries`, `vix_reader_cache_memory_bytes`,
-//! `vix_reader_cache_{hits,misses}_total`.
+//! `vix_reader_cache_{hits,misses,rejections,demotions}_total`,
+//! `vix_reader_cache_evictions_total{reason}`.
 
 use std::sync::{
     Arc, LazyLock as Lazy, Weak,
@@ -236,9 +237,12 @@ type ReaderLru = LruCache<ReaderCacheKey, CachedReader>;
 /// it without disturbing the main cache.
 const WINDOW_FRACTION: usize = 16;
 
-/// Extra non-resident history entries kept beyond `2 x` the resident count,
-/// so small caches (tests, tiny budgets) still remember a scan's worth of
-/// rejected files.
+/// Non-resident history size: `HISTORY_PER_ENTRY x` the resident count plus
+/// a slack so small caches (tests, tiny budgets) still remember a scan's
+/// worth of rejected files. A 7 d traces pass rejects ~6k files per pod
+/// (~3.4k resident); its files must still be remembered on the next pass,
+/// with other streams' traffic in between.
+const HISTORY_PER_ENTRY: usize = 4;
 const HISTORY_SLACK: usize = 1024;
 
 fn key_hash(key: &ReaderCacheKey) -> u64 {
@@ -277,8 +281,9 @@ struct CacheState {
     /// reuse distance and victim age are measured on.
     lookups: u64,
     /// Non-resident files by key hash, LRU among themselves; bounded to
-    /// `2 x len() + HISTORY_SLACK`. Lets a file rejected or evicted a
-    /// moment ago prove its reuse distance when it is asked for again.
+    /// `HISTORY_PER_ENTRY x len() + HISTORY_SLACK`. Lets a file rejected
+    /// or evicted a moment ago prove its reuse distance when it is asked
+    /// for again.
     history: LruCache<u64, History>,
 }
 
@@ -366,7 +371,7 @@ impl CacheState {
     }
 
     fn trim_history(&mut self) {
-        let cap = 2 * self.len() + HISTORY_SLACK;
+        let cap = HISTORY_PER_ENTRY * self.len() + HISTORY_SLACK;
         while self.history.len() > cap {
             self.history.remove_lru();
         }
@@ -487,22 +492,34 @@ impl CacheInner {
     }
 
     /// Last resort after growth of an already-cached reader that demotion
-    /// could not absorb: evict LRU-first, main before window, until `total`
-    /// fits the hard budget less `extra`. Not an admission decision, so no
-    /// reuse comparison applies. Evicted entries are returned for
-    /// destruction after the state lock drops (never under it).
+    /// could not absorb: evict until `total` fits the hard budget less
+    /// `extra` - the WINDOW first (newcomers that have not shown a reuse
+    /// yet; during a scan, its own fresh opens), then main LRU-first. A
+    /// scan's second pass regrows every entry it hits; shedding main for
+    /// that growth threw away the entries the pass needed next (prod
+    /// 2026-10-01 `.191`: repeated 7 d passes plateaued at 13 % hits and
+    /// the recent day's files were gone after six passes). Not an admission
+    /// decision, so no reuse comparison applies. Evicted entries are
+    /// returned for destruction after the state lock drops (never under it).
     fn evict_for_growth(&self, state: &mut CacheState, extra: usize) -> Vec<CachedReader> {
         let mut evicted = Vec::new();
         while state.total > self.max_bytes.saturating_sub(extra) {
-            let (key, entry, in_window) = match state.main.remove_lru() {
-                Some((key, entry)) => (key, entry, false),
-                None => match state.window.remove_lru() {
-                    Some((key, entry)) => (key, entry, true),
+            let (key, entry, in_window) = match state.window.remove_lru() {
+                Some((key, entry)) => (key, entry, true),
+                None => match state.main.remove_lru() {
+                    Some((key, entry)) => (key, entry, false),
                     None => break,
                 },
             };
             state.forget(&entry, in_window);
             state.remember(&key, &entry);
+            metrics::VIX_READER_CACHE_EVICTIONS_TOTAL
+                .with_label_values(&[if in_window {
+                    "growth_window"
+                } else {
+                    "growth_main"
+                }])
+                .inc();
             evicted.push(entry);
         }
         evicted
@@ -575,6 +592,9 @@ impl CacheInner {
                     let victim = state.main.remove(&victim_key).expect("victim present");
                     state.forget(&victim, false);
                     state.remember(&victim_key, &victim);
+                    metrics::VIX_READER_CACHE_EVICTIONS_TOTAL
+                        .with_label_values(&["admission"])
+                        .inc();
                     dropped.push(victim);
                 } else {
                     admitted = false;
