@@ -637,6 +637,33 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     rows from docs (or a per-field bloom/prefix probe), and let dictionary
     windows fetch in parallel (`plan_ranges` coalesces touching ranges into
     one GET, so parallelism needs a prefetch, not bigger batches).
+  - **Cache rebalance (GitOps #596, queriers 09:40Z):** owner asked whether a
+    ~10 GB footer/reader cache would pay. Data: ≥26 h queries are 9 % of
+    queries but 79 % of file evaluations (12 h: <2 h 893 q / 0.26 M files;
+    2–26 h 457 / 1.19 M; 26–80 h 71 / 1.28 M; 80–200 h 44 / 2.12 M; ≥200 h
+    18 / 2.07 M); a reader hit removes ~2.7 of 4.7 reads per file plus the
+    footer parse; 7 d traces ≈ 7k files ≈ 5.9 GB per follower, 7 d of all
+    streams ≈ 17 GB; the memory file cache held 18 logs data files / 1.9 GB
+    and served 0 of the sampled index reads. Done within the 24 Gi limit:
+    `ZO_VIX_READER_CACHE_MAX_SIZE` 4096 → **6144**, `ZO_MEMORY_CACHE_MAX_SIZE`
+    4096 → **2048** (128 MiB buckets still fit those files; 1024 would not).
+    4 min after the roll: reader 4.7–5.9 GB / 5,355–7,192 entries per pod,
+    memcache 0–1 GB, RSS 9.7–13.1 GiB. A 10 GiB cache needs a 32 Gi limit:
+    nodes are 64 GiB m8g.4xlarge shared with a compactor (RSS ≤ 22.7 Gi,
+    OOM gate 40) — only with anti-affinity or a dedicated node group.
+  - **Compactor progress (subagent, two psql snapshots 10.5 min apart +
+    Orbit):** keeping up. 24 h: 296,814 merges / 92.8 TB merged vs 78.5 TB
+    arrived (1.18×), 124 MB/s active, 3 failures, 0 refusals, 0 restarts;
+    79–88 of 90 slots busy (free_slots=0 on 71 % of claims), CPU 6.8 % /
+    mem 18 % of limits; ~500 jobs/h drained, oldest pending offset
+    advancing (2026-09-13 17:00). Live/recent lanes: every closed hour of
+    traces/logs settles within 2–3 h, max 737 files/h. The agent flagged
+    ~23k "unscheduled debt hours" in ~300 `default/metrics/*` streams (one
+    lone 1.7 MB index-less .vix per stream-hour since 09-28 15:00) — a
+    false positive: `ZO_VIX_INDEX_DISABLED_STREAM_TYPES=metrics`, so the
+    sweep's lone-unindexed clause is off for metrics by design
+    (`merge.rs:343/475`); one file per hour with no index wanted is the
+    terminal state, not debt.
 
 ## 2026-09-29 — P2 shipped as `.176` and rolled back within 30 min: the per-stream side table stalled the shared meta DB (commit latency 40–60×, ingest 503s); ranges must live in the segment row
 - What shipped (vix-arch `013c45010` + NATS retry `76fe754b5`, image
