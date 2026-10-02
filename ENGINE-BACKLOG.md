@@ -664,6 +664,31 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     sweep's lone-unindexed clause is off for metrics by design
     (`merge.rs:343/475`); one file per hour with no index wanted is the
     terminal state, not debt.
+  - **Compactor consolidation (GitOps #597, rolled 11:42–11:43Z): 30 → 18
+    pods, same 90 merge slots.** The fleet was slot-bound (79–88 of 90
+    busy) at 7 % CPU / 18 % memory; slots are auto-derived per pod as
+    `cpu_slots = (cpu_limit − merge_threads) / merge_threads` (3 at
+    16C/4 threads; memory_slots 10). Change: `ZO_VIX_MERGE_THREAD_NUM` 2
+    (compactor-only env override; configmap stays 4), CPU limit 16 → 12 →
+    5 slots per pod (startup log: `role_cpu=12 threads=2 cpu_slots=5
+    mem_slots=10 total=5 backlog=1 live=4 hot=2 recent=2`), 18 × 5 = 90;
+    backlog workers 30 → 18, live 60 → 72. 16C with 2 threads would have
+    been 7 slots ≈ 48 GiB peak RSS (measured ~6 GiB per busy slot + ~6
+    fixed) — past the 40 GiB gate; 5 ≈ 36. Old pods released their claims
+    within ~40 s (rollout done 11:43:09Z, 0 stale leases).
+  - First 27 min: jobs done +329 / 15 min then ~507/h (= the pre-roll
+    ~500/h — slot-bound as designed), running 84–87, pending 477 → 48 →
+    331 (the periodic old-data sweep re-enqueue, oldest 09-21 16:00),
+    0 stale. L0 builders: 54 % busy on 18 pods (29 % on 30), segments
+    built 25.7k/h vs 23.6k/h before, `wal_segments` pending 126–144 with
+    oldest 10–14 min (was 74 / 6 min) — the lane with the least headroom
+    now; the gate for it is pending age growing hour over hour. Fleet
+    CPU 38–44 cores on 18 pods (max 8.1 on one pod of 12), memory 113–120
+    Gi (max 12.9 Gi per pod, fresh). Nodes: 69 → 64 within 30 min
+    (Karpenter consolidating the 12 compactor-free nodes; 1 draining).
+    24 h rollback gates unchanged: merged/arrived < 1.0, oldest pending
+    offset not advancing, any pod RSS > 40 GiB, or wal_segments pending
+    age rising → replicas 30 (slot settings may stay).
 
 ## 2026-09-29 — P2 shipped as `.176` and rolled back within 30 min: the per-stream side table stalled the shared meta DB (commit latency 40–60×, ingest 503s); ranges must live in the segment row
 - What shipped (vix-arch `013c45010` + NATS retry `76fe754b5`, image
