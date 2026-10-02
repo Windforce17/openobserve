@@ -4675,12 +4675,26 @@ impl VixReader {
         if start > last {
             return Ok(());
         }
-        let span = self.load_dict_block_span(index, start, last)?;
+        // The walk streams the field's blocks in preload windows (8 MiB
+        // each, `load_dict_block_span`): when the current window runs out,
+        // the next one is loaded from the block at hand. Falling back to one
+        // round trip per 64 KiB block past the first window made a substring
+        // match over a wide field a serial read chain (prod 2026-10-02,
+        // apisix `str_match(request.body)`: ~500 MiB of dictionary per file
+        // as 7,996 sequential single-block fetches, 45 s for two files).
+        let mut span = self.load_dict_block_span(index, start, last)?;
         for b in start..=last {
             check_read_cancelled()?;
             let block = match span.as_ref().and_then(|blocks| blocks.get(&b)) {
                 Some(bytes) => bytes.clone(),
-                None => self.dict_block(index, b)?,
+                None => {
+                    span = self.load_dict_block_span(index, b, last)?;
+                    match span.as_ref().and_then(|blocks| blocks.get(&b)) {
+                        Some(bytes) => bytes.clone(),
+                        // cached already, or a lone block: the plain cached read
+                        None => self.dict_block(index, b)?,
+                    }
+                }
             };
             let first_ordinal = index.meta(b).1;
             let mut done = false;
@@ -4710,9 +4724,9 @@ impl VixReader {
     /// Bulk-load the missing dictionary blocks of `start..=last` for one
     /// range walk (ranged readers only; in-memory readers slice for free).
     /// Runs of consecutive missing blocks resolve through ONE
-    /// `block_fetch_many`, retaining at most 8 MiB across the entire batch.
-    /// Remaining blocks use ordinary cached reads. Small spans are also
-    /// published to the shared block cache.
+    /// `block_fetch_many`, retaining at most 8 MiB across the entire batch;
+    /// `scan_key_range` calls again from the first block past the window.
+    /// Small spans are also published to the shared block cache.
     fn load_dict_block_span(
         &self,
         index: &crate::dict_blocks::DictIndex,

@@ -144,6 +144,95 @@ fn build_multi_rg_file() -> (Bytes, Bytes) {
     )
 }
 
+/// A substring match (`Contains`) walks a field's whole dictionary. Over a
+/// ranged source that walk must stream the blocks in large preload windows,
+/// not fall back to one round trip per 64 KiB block once the first window
+/// is spent (prod 2026-10-02: ~500 MiB of `request.body` dictionary per
+/// file as 7,996 sequential single-block fetches, 45 s for two files).
+#[test]
+fn contains_walk_streams_the_dictionary_in_large_windows() {
+    // ~600k high-entropy terms (no shared prefix to compress away): the
+    // field's dictionary spans well over one 8 MiB preload window.
+    let rows = 600_000usize;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("_timestamp", DataType::Int64, false),
+        Field::new("body", DataType::Utf8, true),
+    ]));
+    let ts: Vec<i64> = (0..rows as i64).map(|i| 1_000_000 - i).collect();
+    let body: Vec<String> = (0..rows)
+        .map(|i| {
+            let h = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            format!("{h:016x}{:016x}", h.rotate_left(29) ^ i as u64)
+        })
+        .collect();
+    let needle = body[123_456].as_bytes()[4..20].to_vec();
+    let sources: Vec<String> = (0..rows)
+        .map(|i| format!(r#"{{"_timestamp":{},"body":"{}"}}"#, ts[i], body[i]))
+        .collect();
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(ts)),
+            Arc::new(StringArray::from(
+                body.iter().map(String::as_str).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap();
+    let mut writer = VixWriter::new(&schema, VixWriterOptions::default(), false);
+    writer
+        .push_batch_with_source(
+            &batch,
+            &StringArray::from(sources.iter().map(String::as_str).collect::<Vec<_>>()),
+            None,
+        )
+        .unwrap();
+    let (data, index) = writer.finish().unwrap();
+    let (data, index) = (Bytes::from(data), Bytes::from(index.unwrap()));
+    let window = 8u64 * 1024 * 1024;
+    assert!(
+        index.len() as u64 > 2 * window,
+        "the sidecar ({}) must span several preload windows",
+        index.len()
+    );
+
+    let dsource = CountingSource::new(data);
+    let isource = CountingSource::new(index);
+    let reader = VixReader::open_ranged_with_index(
+        Arc::clone(&dsource) as Arc<dyn VixRangeSource>,
+        Some(Arc::clone(&isource) as Arc<dyn VixRangeSource>),
+    )
+    .unwrap();
+    let (f0, b0) = (isource.fetch_count(), isource.byte_count());
+    let bitmap = reader
+        .eval(&VixQuery::Contains {
+            field: Some("body".to_string()),
+            needle,
+            case_insensitive: false,
+        })
+        .unwrap();
+    assert!(bitmap.count_set_bits() >= 1);
+    let fetches = isource.fetch_count() - f0;
+    let bytes = isource.byte_count() - b0;
+    let windows = bytes.div_ceil(window) as usize;
+    // every window is one read; a handful more for the directory/postings
+    assert!(
+        fetches <= windows + 8,
+        "dictionary walk fell back to per-block reads: {fetches} fetches for {bytes} bytes \
+         ({windows} windows of 8 MiB)"
+    );
+    let max_read = isource
+        .take_log()
+        .iter()
+        .map(|r| r.end - r.start)
+        .max()
+        .unwrap_or(0);
+    assert!(
+        max_read >= window / 2,
+        "largest read {max_read} B: windows not used"
+    );
+}
+
 /// The post-fix open/eval profile: a ranged open loads only the small
 /// dictionary DIRECTORY, an exact-term probe loads exactly the ONE key block
 /// the directory selects, a second probe in the same block is dictionary-IO
