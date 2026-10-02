@@ -548,6 +548,95 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     reads per pod (4.2–5.7 reads per cold evaluation), and the reader-cache
     hit rate moves the wall little; the dashboards' 24 h sets are what the
     cache carries. RSS 7.9–9.3 GiB, 0 restarts throughout.
+- **2026-10-02 07:00–08:30Z — cluster review (12 h on `.195`); the `.192`
+  window eviction was a steady-state regression; `.196`/`.197`.** Three
+  read-only sweeps (k8s/psql, Orbit errors, Orbit query lines) + probes.
+  - Fleet: 49/49 pods Running, 0 restarts, 0 OOMKilled; querier RSS
+    13.9–17.6 GiB of 24, compactor max 22.7 of 60; Argo Synced/Healthy =
+    master tip. Backlog healthy (pending 677 → 116 in 3 min, 0 stale
+    claims, no hour > 638 files in 12 h). Compactors: 135,872 merges /
+    1 failed (S3 503 after 10 retries) / 127.5 MB/s active. Compactor
+    `5gkkl` died 03:23Z (fleet health-check burst, no OOM/panic in logs —
+    [INFERENCE] node replacement), replaced by `7vldr`. Ingester-1/-2
+    readiness-probe timeouts (×4, ×17) at 06:28/07:14Z, self-recovered.
+  - Queries, last 12 h (1,197 `search->result` lines, all `.195`) vs the
+    previous 12 h (725, rollout-contaminated): p50 1,170 vs 2,429 ms,
+    p95 10.6 vs 22.7 s, p99 34.7 vs 36.3 s, max 58 vs 98 s; 0 5xx/429, 0
+    partials, 0 queue waits. The p99 tail is a family of 150–750 h
+    `SELECT *`/`match_all` scans over 60–130k files (skip-rate bail-outs
+    123 → 808 with the volume; `cannot produce exact vix candidates` 584
+    → 2,605 lines). New WARN class: `[SEGMENT:SCAN] live-data scan passed
+    the soft budget 512 MiB and continues` ×292 (logs/default; informational).
+    3 `disk.rs:1510` `canonicalize().unwrap()` panics on the `job_runtime`
+    thread during the `.195` rollout minute only (tmp dir racing a restart).
+  - **Regression found by the sweep:** every querier's reader cache pinned
+    at 4.0 GiB with ~1,870 entries, fleet hit rate 35 %, **2.84 M
+    `growth_window` evictions against 3.18 M misses**. Steady-state probe
+    (18 h pod): a 24 h traces dashboard = **1 % reader hits**, 1,217 misses,
+    all 1,217 newcomers evicted inside the same query; a second query with a
+    new term, the same. Two defects: (1) `admit` never enforced the hard
+    budget — a publish on a full cache left `total` above `max_bytes` until
+    the next growth callback, and `.192`'s growth eviction shed the WINDOW
+    first, i.e. the newcomers (the `.192` hypothesis — growth evictions
+    churning the stable set — was disproved by its own counters the same
+    day, but the change stayed); fresh-pod probes never showed it because a
+    fresh cache is not full. (2) Growth charges are high-water marks (the
+    reader's FIFO block-cache shrink is ignored for ordering safety) and
+    demotion subtracted only what `demote()` released — ghost bytes: **2.29
+    MB accounted per demoted reader vs ~0.84 MB real** (3.23 GB / 1,409
+    metadata entries).
+  - `.196` (vix-arch `2e784f482`, not rolled; folded into `.197`): the
+    window's bytes are RESERVED (`main_bytes = max - window`); one `enforce`
+    path (demote hot overflow → trim main LRU-first to its share, reason
+    `overflow` → spill the window's FIFO front through reuse-distance
+    admission) runs on publish and on growth; the admission line is the
+    same `max - window` (the old `max - hot` line left the top quarter of
+    the budget unused once demotion capped the hot tier — prod pods sat at
+    3.0–3.3 GB of 4.29). Demotion resyncs `accounted` to
+    `reader.memory_size() + overhead`. Tests
+    `full_cache_growth_never_evicts_the_window`,
+    `demotion_resyncs_accounted_bytes_to_the_reader`;
+    `vix_reader_cache_evictions_total{reason}` = `admission` | `overflow`.
+  - **Owner question: why did
+    `SELECT date_bin(1 minute), response.status, count(*), max(latency) FROM
+    apisix WHERE request.uri = '…ReportServiceAccess' AND str_match(
+    request.body, 'S77x77…')` over 5 minutes of 2026-09-22 take 45.8 s
+    (trace `01a0fabaabd17442aef2358b807facd7`)?** Two subagents (logs +
+    code): 2 straddling 3.4 M-row files (17 GB data, 1.70 GB sidecars), one
+    follower (`5nbkd`); `str_match` → `VixQuery::Contains` → a full walk of
+    the field's dictionary (`scan_all_tokens` → `scan_key_range`): no FST/
+    prefix shortcut for substrings, no time pruning before the walk (the
+    `_timestamp` clamp is applied AFTER `eval`), and `eval_and` collects
+    ordinals for every leaf before any selectivity ordering, so the cheap
+    `request.uri` equality cannot bound it; `idx_optimize_mode = None`
+    (two group keys + `max()`), so the 512 MiB projected-cost bail never
+    applies. The read pattern was the killer: `load_dict_block_span`
+    preloaded only the FIRST 8 MiB window of the field and then fell back to
+    `dict_block` — **one 64 KiB ranged read per block, serially: 15,992
+    fetches (= logical_ranges = fetch_batches), 964 MB, ~1.5 reads in
+    flight, 45.3 s of the 45.8 s**; 13,442 of the reads came from the local
+    disk cache (an aborted earlier attempt had warmed it) and still cost
+    ~4 ms each in the chain. `request.body` is near-unique per row
+    (`ZO_VIX_MAX_RAW_TERM_LENGTH=65532`), ~500 MiB of dictionary per file.
+  - `.197` (vix-arch `5f43f869f`, #595, **live 08:17Z**, = `.196` + the
+    walk fix): `scan_key_range` reloads the next 8 MiB window from the block
+    at hand (test: 600k high-entropy terms, 18.7 MB of blocks — 171 fetches
+    before, ≤ 11 after). Cold re-run of the same shape on an untouched
+    window (03:30–03:35Z, 2 files, 6.96 M records): **62 fetches per file,
+    19.5 s** (was ~8,000 / 45.8 s); the rest is 880 MB of dictionary at one
+    S3 GET at a time (~24 MB/s). Reader cache on a FULL cache (warm-up fills
+    it in 3 min; 5,000–6,300 entries in 4.29 GB vs 1,870): dashboards after
+    scans 74 → 46 → 76 → **100 %** and stay (was 1 % forever); 7 d repeats
+    71–83 % at best under concurrent traffic (`.195`: 51 %); newest-hour
+    queries 96–100 %. RSS 12.2–13.5 GiB on fresh pods (the cache now really
+    holds 4.3 GB of readers). Steady-state fleet hit rate: re-check after
+    several hours (counters since 08:17Z; `overflow` evictions should stay
+    near zero outside scans).
+  - Still open for the `str_match` shape (design, not a patch): resolve the
+    cheap `Exact` postings first and check the substring on the surviving
+    rows from docs (or a per-field bloom/prefix probe), and let dictionary
+    windows fetch in parallel (`plan_ranges` coalesces touching ranges into
+    one GET, so parallelism needs a prefetch, not bigger batches).
 
 ## 2026-09-29 — P2 shipped as `.176` and rolled back within 30 min: the per-stream side table stalled the shared meta DB (commit latency 40–60×, ingest 503s); ranges must live in the segment row
 - What shipped (vix-arch `013c45010` + NATS retry `76fe754b5`, image
