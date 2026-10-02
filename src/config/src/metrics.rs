@@ -1623,8 +1623,8 @@ pub static VIX_READER_CACHE_EVICTIONS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| 
             "vix_reader_cache_evictions_total",
             "Resident readers the reader cache evicted, by reason: `admission` (a \
              candidate with a shorter reuse distance displaced the LRU victim), \
-             `growth_window` / `growth_main` (a cached reader's growth exceeded \
-             the budget after demotion; the window is shed before main)",
+             `overflow` (main trimmed LRU-first to its share of the budget after \
+             demotion could not absorb a cached reader's growth)",
         )
         .namespace(NAMESPACE)
         .const_labels(create_const_labels()),
