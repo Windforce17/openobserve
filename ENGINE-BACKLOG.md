@@ -811,6 +811,76 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     route not pushed); `ssh ops` has `kubectl` (ctx `Prod-ops`) and
     `aws s3` read access — querier pods are distroless, read their PVC
     via `kubectl debug node/… --profile=general --image=busybox`.
+- **2026-10-05 13:12Z — `.198` querier rollout (the change above):
+  `release/vix-20261005-198` `f46889a29` = `.197` + vix-arch
+  `60641baae` (clean cherry-pick, byte-identical to the dev checkout);
+  image OCI index `78d031f2…`, arm64 manifest `91239477…`, binary
+  `d7da7925…`; GitOps #599 (`d9ef553d`, querier line only, server
+  dry-run clean); Argo Synced 13:12:50Z, rollout done 13:14:06Z, 10/10
+  pods on the new digest, 0 restarts, RSS 14.9–18.4 GiB of 24 after 40
+  min; no new error class (`ResourcesExhausted` from the DataFusion pool
+  ran at the same rate before). Ingester/router stay `.178`, compactor
+  `.181`. Rollback: `.197`.**
+  - Battery (ops `/tmp/obsq.py`, `use_cache=false`, ONE sealed 48 h
+    window ending 12:35Z for both legs; baseline pods hours-warm, `.198`
+    pods brand-new = empty disk/reader caches). `A48` = the report's
+    family as a 1 h UI histogram: `match_all('server_status:
+    DEPLOY_STATUS_SUCCESS') AND service_name='cfworkers-deploy-cloudrun-
+    worker' [AND body='Sending deploy callback']`.
+
+    | query | `.197` r1 / r2 | `.198` r1 / r2 | `.198` idx_took r2 |
+    |---|---|---|---|
+    | A48 body (hist+count) | 86.1 / 81.9 s | 54.3 s (first ever, all remote) · 39.3 / 37.3 s | 44–52 s → **0.46 s** |
+    | A48 no body | 69.1 / 67.9 s | 29.9 / 35.5 s | 35–37 s → 0.22 s |
+    | A48 `DEPLOY_STATUS_FAILED` (cold query, warm disk) | — | 49.6 / 21.0 s | 37.8 → 5.7 s |
+    | B48 `svc+body LIMIT 1000` | 14.7 / 7.5 s, **partial=true, 40 hits** | 14.1 / 2.3 s, complete, 83 hits | 6.0 → 0.34 s |
+    | C24 `match_all('buildkitd.sock') LIMIT 500` | 10.3 / 5.9 s | 12.5 / 2.3 s | 4.0 → 0.13 s |
+    | L24 hist `match_all('error') AND svc` | 6.2 / 1.5 s | 10.1 / 1.0 s | 0.57 → 0.14 s |
+    | T1h traces count | 2.3 / 0.75 s | 1.8 / 0.53 s | — |
+
+    r1 of the small queries is slower on `.198` only because the pods were
+    minutes old (all-remote); every r2 is faster. B48's baseline answer was
+    INCOMPLETE (`is_partial`, 40 rows): `.198` keeps 45–63 files per
+    follower instead of 95–101 (the body tokens prune) and returns the
+    full 83 rows.
+  - Per-follower index phase (Orbit `io_accounting` / `reduced file_list`,
+    10 followers, median / max):
+
+    | run | idx s med / max | logical ranges per follower | remote | `queue` med | `active` med | `wait` med |
+    |---|---|---|---|---|---|---|
+    | `.197` A48 body r1 (warm pods) | 19.7 / 44.2 | 33.8k | 54.5 GB (+24 GB disk) | 51 s | 1,417 s | 1,606 s |
+    | `.197` A48 body r2 | 18.5 / 52.2 | 32.5k | 53.0 GB | 318 s | 1,101 s | 1,807 s |
+    | `.198` A48 body first run (fresh pods, 0 % disk) | 22.0 / **24.6** | 43.0k (physical 37.1k) | **27.6 GB** | 1 s | 2,245 s | 2,376 s |
+    | `.198` A48 body r2 (superset memo) | 0.2 / 0.5 | 12 | 0 | 0 | 0 | 0 |
+    | `.198` A48 FAILED r1 (cold query, warm disk) | 10.5 / 37.8 | 28.6k (770 of 2,300 files kept) | 0 (11.5 GB disk) | **1,751 s** | 113 s | 1,002 s |
+
+    Reading: (a) a fully cold `.198` evaluation costs about the same wall
+    as a 25 %-disk-warm `.197` one at half the remote bytes and a much
+    tighter follower spread (max 24.6 vs 44–52 s); (b) the index phase of
+    a REPEAT is gone (0.2 s) — the superset memo serves every file; (c)
+    the `FAILED` family now eliminates 2/3 of the files exactly (absent
+    token → NoMatch, cached); (d) what remains on a cold query is
+    admission, not IO: `wait` (EVAL gate, 32 MiB per row-id evaluation)
+    and, on warm disk, `queue` (the per-pod 512 fetch permits shared with
+    other tenants' remote reads — the straggler pod `gtdbf` queued 8,358 s
+    against 131 s of active IO). Physical reads per follower rose ~10 %
+    (37.1k vs ~33.8k: skip-group windows and the 16 KiB plist gap keep
+    small ranges separate) while bytes halved; candidate rows per follower
+    are unchanged (~10k) because for this family the body tokens imply the
+    match_all tokens.
+  - Counters on the new pods after the battery: `fast_path_fallback_total`
+    = `residual filtering` ~1,000 + `skipped_file` ~10k per pod (the
+    aggregate pass still bails and falls to the row-id pass, as designed),
+    `eval_growth_timeouts_total` 3 and 9 on two pods (cold all-remote
+    runs), no `budget_refused`; result cache ~65 % hits.
+  - Next (in order): (1) plist windows back to the ladder's default
+    coalescing and `SMALL_RECORD_BYTES` = 1 MiB so header+group reads
+    only pay off on multi-MiB records (fewer physical reads, one wave for
+    sub-MiB records); (2) row-id evaluations declare the index-only
+    workspace instead of 32 MiB (the `wait` column); (3) `ZO_VIX_EAGER_
+    TAIL_BYTES` 1 MiB (one round trip per cold file); (4) residual
+    filtering inside the index for aggregates (removes the second pass
+    and the 30–60 s scan that now dominates A48).
 
 ## 2026-09-29 — P2 shipped as `.176` and rolled back within 30 min: the per-stream side table stalled the shared meta DB (commit latency 40–60×, ingest 503s); ranges must live in the segment row
 - What shipped (vix-arch `013c45010` + NATS retry `76fe754b5`, image
