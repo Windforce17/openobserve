@@ -903,10 +903,11 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     so no aggregate over it ever uses the fast path and its 30–60 s scan
     is now the whole A48 cost**; top-N over match_all → `NULL aggregate
     group requires scan`; `min/max(_timestamp) WHERE svc = x` → no
-    optimizer rule (two aggregates). Owner question: are multi-word
-    `match_all` semantics "every token present"? If so the token AND is
-    exact (the index tokenizer is the writer's) and the fast path can
-    answer those histograms without a scan.
+    optimizer rule (two aggregates). Owner (10-05): **by design** — a
+    multi-word `match_all` is a phrase/substring predicate in SQL (the
+    `is_alphanumeric` gate), so the token AND is a superset and the scan
+    must re-apply it; the index-side lever is residual filtering (next
+    item 4), not a semantics change.
   - Organic traffic 13:15–14:15Z (battery traces excluded) is NOT yet
     comparable to the pre-window: index phase p50 131 vs 736 ms, but
     totals p50 3.3 vs 1.4 s — every pod's 2000 GiB disk cache and reader
