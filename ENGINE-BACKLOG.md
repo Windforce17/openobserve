@@ -989,6 +989,71 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     svc + body, svc only, rare token, absent token, deploy only; 1 M-row
     synthetic too) — the row-id workspace is tail/prefetch/footer slack
     + bitmaps, not 32 MiB; that is `.200`'s declaration.
+- **2026-10-05 16:49Z — `.200` querier rollout (next item 2 + the result
+  cache entry cap): `release/vix-20261005-200` `bbee37dcb` = `.199` +
+  vix-arch `0ff363ad9` (clean cherry-pick, byte-identical); image OCI
+  index `48768e1e…`, arm64 manifest `7a3b9ed1…`, binary `9d007b65…`;
+  GitOps #601 (`0073c475`: querier tag + querier-only
+  `ZO_INVERTED_INDEX_RESULT_CACHE_MAX_ENTRIES=1500000`, rendered diff =
+  those two lines); RS `5f97c86f96` 16:49:04Z, Argo Healthy 16:50:59Z,
+  10/10 pods 16:49:09–16:50:31Z, 0 restarts, RSS 8.1–10.6 GiB of 24 after
+  10 min (fresh). Rollback: `.199`, drop the env line.**
+  - Engine (`search/src/vix/mod.rs`, `evaluation_working_bytes`): a plain
+    row-id evaluation (`mode == None`) declares `EVAL_ROW_ID_WORKSPACE_
+    BYTES` = **12 MiB** + bitmaps (+ the straddling clamp) instead of the
+    32 MiB streaming-collector workspace, which only aggregate collectors
+    keep. Basis: the measured +199…+281 KB owned growth per evaluation
+    above, with a 40× margin for the fetched-but-unretained tail/prefetch
+    buffers; 192 slots × 12 MiB = 2.3 GiB of the 4 GiB gate (`ZO_VIX_EVAL_
+    MAX_BYTES`) vs 192 × 32 MiB = 6 GiB before. Test `row_id_evaluations_
+    declare_the_measured_workspace` pins the 192-slot fit; workspace_tests
+    23/23.
+  - Battery, fresh `.200` pods (empty caches, all remote) vs the same leg
+    on fresh `.199` pods three hours earlier — the only apples-to-apples
+    cold comparison. A48 body per follower (10 followers, Orbit
+    `io_accounting`): EVAL-gate **`wait` 1,519–1,633 s → 468–983 s
+    (−57 %)**, `active` 1,662–1,853 → 1,869–2,486 s (more concurrent IO,
+    each read slower), follower index phase 13.1–13.8 s → **8.6 med / 15.4
+    max** (one straggler; eight of ten under 10.6 s), leader `idx_took`
+    19.0 → 15.4 s, wall 55.9 → 49.3 s. Reads per file are UNCHANGED at
+    13.1 (309,839 fetches / 23,593 files, 26.4 GB) — `.200` changed
+    admission only. Other cold r1 index phases (`.199` → `.200`, leader
+    ms): A48 pending token 26,663 → 12,978; `IN(3) AND match_all` count
+    21,383 → 9,917; hist `svc = x` 23,488 → 9,272; `body = 'error'` dense
+    18,397 → 9,180; L24 hist 9,247 → 7,521; B48 10,704 → 7,510; C24 7,544
+    → 6,131; traces APM 4,163 → 3,653. Hits identical on every shape,
+    no `is_partial`, no errors (26 rows).
+  - Memo: A48 body r2 (11 queries later) → **0–37 fetches per follower**
+    (132 total, 0.6 % of files — the files whose follower changed between
+    runs), idx 142–1,860 ms (`.199` r2: 2,356–2,600 fetches, 3,832 ms).
+    `zo_vix_result_cache_memory_usage` 213 MB after the battery (`.199`
+    sat at 27 MB against the 100,000-entry cap); hits 158k of 331k
+    requests fleet-wide including the cold r1 misses. The repeat's wall
+    is 34 s = the residual scan, all of it.
+  - Counters 15 min in (fleet sums): `eval_growth_timeouts_total` 0 and
+    `fast_path_fallback_total{budget_refused}` 0 (`.199` at the same age:
+    72 / 12 — the lower declaration did NOT trade admission for growth
+    refusals); fallbacks `skipped_file` 150,553 + `aggregate predicate
+    requires residual filtering` 12,403 + `unservable` 1,280 (the new
+    item-11 reason: FTS-only equality dropped from the index conjunct).
+  - Organic, fresh pods vs fresh pods (`/tmp/pop.py`, battery excluded):
+    `.200` 16:52–17:06Z (n = 28) vs `.199` 16:17–16:42Z (n = 73): ALL p50
+    938 vs 1,294 ms, p90 10.8 vs 16.8 s, max 15.4 vs 26.7 s;
+    `agg+match_all` 5.5 vs 11.2 s, `hist+eq` 4.9 vs 11.8 s. Low n —
+    re-run with warm caches (2–3 h) before judging.
+  - Not changed: `ZO_VIX_EAGER_TAIL_BYTES` stays 768 KiB (7 sampled
+    sidecars, 42–466 MB; only the measured apisix file overshoots the tail
+    by 35 KB = one extra cold round trip). Decide from a cold-open count
+    on `.200`, not from the sample. Item 6 (warming the aggregate pass)
+    stays dropped: disk-cache churn risk, and the memo covers repeats.
+  - Next (in order): (a) **round trips per file** — 13.1 reads per file
+    for a 9-leaf AND; batch every leaf's dictionary lookup into one wave
+    and every leaf's postings into one wave (target ≤ 4 waves/file). The
+    `active` rise under the higher admission says the per-pod GET rate
+    (~3k/s during the index phase) is the ceiling now, so fewer reads is
+    the lever, not more concurrency. (b) Item 4, residual filtering inside
+    the index for aggregates: the 30–40 s scan is 65–70 % of a cold A48
+    and 100 % of a repeat. (c) Then the eager-tail decision.
 
 ## 2026-09-29 — P2 shipped as `.176` and rolled back within 30 min: the per-stream side table stalled the shared meta DB (commit latency 40–60×, ingest 503s); ranges must live in the segment row
 - What shipped (vix-arch `013c45010` + NATS retry `76fe754b5`, image
