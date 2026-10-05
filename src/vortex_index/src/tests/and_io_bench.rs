@@ -449,12 +449,14 @@ fn and_io_bench() {
             ""
         );
         counters.reset();
+        let owned_before = reader.memory_size();
         let started = Instant::now();
         let got = bits_to_set(&reader.eval(&query).unwrap());
         let eval_ms = started.elapsed().as_secs_f64() * 1e3;
+        let owned_after = reader.memory_size();
         let (b, r, by, pby, mp) = counters.snapshot();
         eprintln!(
-            "{:<28} {:>7} {:>7} {:>10} {:>10} {:>8.1} {:>6.1} {:>6} {:>8}",
+            "{:<28} {:>7} {:>7} {:>10} {:>10} {:>8.1} {:>6.1} {:>6} {:>8}  owned {} -> {} (+{} KB)",
             format!("{name} [eval]"),
             b,
             r,
@@ -463,7 +465,10 @@ fn and_io_bench() {
             eval_ms,
             eval_ms / latency.as_secs_f64() / 1e3,
             mp,
-            got.len()
+            got.len(),
+            owned_before / 1024,
+            owned_after / 1024,
+            owned_after.saturating_sub(owned_before) / 1024
         );
         if std::env::var("VIX_BENCH_LOG").is_ok() {
             for (i, (src, ranges)) in counters.log.lock().iter().enumerate() {
