@@ -212,11 +212,20 @@ fn build() -> Fixture {
     }
 }
 
+/// The fixture's dense records are 100–150 KB — below the production
+/// whole-record threshold (1 MiB), so the header + skip-group path is
+/// exercised by lowering it to 16 KiB here. The threshold's own effect is
+/// covered by `whole_record_threshold_reads_small_records_in_one_wave`.
 fn open(fixture: &Fixture) -> (VixReader, Arc<LoggedSource>) {
+    open_with_threshold(fixture, 16 * 1024)
+}
+
+fn open_with_threshold(fixture: &Fixture, threshold: u64) -> (VixReader, Arc<LoggedSource>) {
     let data = LoggedSource::new(fixture.data.clone());
     let index = LoggedSource::new(fixture.index.clone());
-    let reader =
+    let mut reader =
         VixReader::open_ranged_with_index_tail(data, Some(index.clone()), INDEX_TAIL).unwrap();
+    reader.set_partial_record_min_bytes(threshold);
     index.calls.lock().clear();
     (reader, index)
 }
@@ -530,4 +539,32 @@ fn scoped_fulltext_children_flatten_into_one_plan() {
         "one point wave"
     );
     assert!(index.calls_in(&fixture.terms).is_empty());
+}
+
+/// At the production threshold (`PARTIAL_RECORD_MIN_BYTES`, 1 MiB) the
+/// fixture's 100–150 KB dense records are read whole in ONE plist wave even
+/// when a rare narrow leaf bounds the accumulator to six rows — the
+/// request-count-bound regime object storage lives in — and the answer is
+/// unchanged.
+#[test]
+fn whole_record_threshold_reads_small_records_in_one_wave() {
+    let fixture = build();
+    let memory =
+        VixReader::open_with_index(fixture.data.clone(), Some(fixture.index.clone())).unwrap();
+    let query = fulltext(VixQuery::And(vec![
+        exact("svc", "svc-rare"),
+        any_token("alpha"),
+        any_token("beta"),
+    ]));
+    let expected = bits_to_set(&memory.eval(&query).unwrap());
+    let (reader, index) = open_with_threshold(&fixture, crate::reader::PARTIAL_RECORD_MIN_BYTES);
+    assert_eq!(bits_to_set(&reader.eval(&query).unwrap()), expected);
+    let plist = index.calls_in(&fixture.plist);
+    assert_eq!(plist.len(), 1, "one whole-record wave, got {plist:?}");
+    let full = record_len(&fixture.alpha_log) + record_len(&fixture.beta_log);
+    assert!(
+        bytes_of(&plist) >= full,
+        "both dense records read whole: {} < {full}",
+        bytes_of(&plist)
+    );
 }

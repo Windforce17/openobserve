@@ -179,15 +179,31 @@ impl IndexCondition {
     //   — into index tokens — the canonical `vortex_index::o2_tokenize` (via
     //   `vix::index_match_all_tokens`), the same function the writer indexes
     //   with.
+    //
+    //   `fulltext_servable = false` means this file cannot evaluate full-text
+    //   predicates at all (an active full-text field exists as a column but
+    //   is not token-indexed here, so the index would MISS rows matching only
+    //   in that column — the opposite of a superset): every condition that
+    //   uses full text is skipped (`has_skipped`) and the exact conjuncts
+    //   still narrow the file, instead of the whole file going to the scan.
     pub fn to_vix_query(
         &self,
         trace_id: &str,
         field_cap: &dyn Fn(&str) -> FieldCap,
         tokenize: &dyn Fn(&str) -> Vec<String>,
+        fulltext_servable: bool,
     ) -> anyhow::Result<(VixQuery, bool)> {
         let mut has_skipped = false;
         let mut queries: Vec<VixQuery> = Vec::with_capacity(self.conditions.len());
         for condition in &self.conditions {
+            if !fulltext_servable && condition.uses_full_text() {
+                log::info!(
+                    "[trace_id {trace_id}] to_vix_query: skipping full-text condition {}, an active full-text field is not token-indexed in this file",
+                    condition.to_query()
+                );
+                has_skipped = true;
+                continue;
+            }
             // classify the fields this condition looks up in the per-file
             // term index
             let fields = condition.term_index_fields();
@@ -277,18 +293,7 @@ impl IndexCondition {
 
     /// Whether evaluation needs the query's active full-text field scope.
     pub fn uses_full_text(&self) -> bool {
-        fn uses_full_text(condition: &Condition) -> bool {
-            match condition {
-                Condition::MatchAll(value) => !(value.is_empty() || value == "*"),
-                Condition::FuzzyMatchAll(value, _) => !value.is_empty(),
-                Condition::And(left, right) | Condition::Or(left, right) => {
-                    uses_full_text(left) || uses_full_text(right)
-                }
-                Condition::Not(inner) => uses_full_text(inner),
-                _ => false,
-            }
-        }
-        self.conditions.iter().any(uses_full_text)
+        self.conditions.iter().any(Condition::uses_full_text)
     }
 
     // get the fields use for search in datafusion(for add filter back logical)
@@ -796,6 +801,21 @@ impl Condition {
             // the scan-side filter repairs the null-row semantics
             Condition::Not(condition) => VixQuery::Not(Box::new(condition.to_vix_query(tokenize)?)),
         })
+    }
+
+    /// Whether this condition evaluates full-text tokens (match_all /
+    /// fuzzy_match_all, at any nesting), i.e. needs the active full-text
+    /// field scope and every one of those fields token-indexed in the file.
+    pub fn uses_full_text(&self) -> bool {
+        match self {
+            Condition::MatchAll(value) => !(value.is_empty() || value == "*"),
+            Condition::FuzzyMatchAll(value, _) => !value.is_empty(),
+            Condition::And(left, right) | Condition::Or(left, right) => {
+                left.uses_full_text() || right.uses_full_text()
+            }
+            Condition::Not(inner) => inner.uses_full_text(),
+            _ => false,
+        }
     }
 
     /// The field-scoped token SUPERSET of an equality / positive IN on a
@@ -2052,7 +2072,7 @@ mod tests {
         cond.add_condition(Condition::Equal("B".into(), "b".into()));
 
         let (query, has_skipped) = cond
-            .to_vix_query("test", &indexed(&["A", "B"]), &tok)
+            .to_vix_query("test", &indexed(&["A", "B"]), &tok, true)
             .expect("query build should succeed");
         assert!(!has_skipped, "no field is missing, should not skip");
         assert_eq!(query, VixQuery::And(vec![exact("A", "a"), exact("B", "b")]));
@@ -2097,7 +2117,9 @@ mod tests {
         // gate it
         let mut lone = IndexCondition::new();
         lone.add_condition(Condition::IsNotNull("B".into()));
-        let (query, has_skipped) = lone.to_vix_query("test", &indexed(&["A"]), &tok).unwrap();
+        let (query, has_skipped) = lone
+            .to_vix_query("test", &indexed(&["A"]), &tok, true)
+            .unwrap();
         assert!(!has_skipped);
         assert_eq!(
             query,
@@ -2180,7 +2202,7 @@ mod tests {
         cond.add_condition(Condition::Equal("B".into(), "b".into()));
 
         let (query, has_skipped) = cond
-            .to_vix_query("test", &indexed(&["A"]), &tok)
+            .to_vix_query("test", &indexed(&["A"]), &tok, true)
             .expect("query build should succeed even when a field is missing");
         assert!(has_skipped, "missing field B should be reported as skipped");
         // Only A should be referenced; B was dropped.
@@ -2195,7 +2217,7 @@ mod tests {
         cond.add_condition(Condition::Equal("A".into(), "a".into()));
         cond.add_condition(Condition::Equal("B".into(), "b".into()));
 
-        let result = cond.to_vix_query("test", &indexed(&["other_field"]), &tok);
+        let result = cond.to_vix_query("test", &indexed(&["other_field"]), &tok, true);
         assert!(
             result.is_err(),
             "should return error when all fields are missing"
@@ -2208,7 +2230,7 @@ mod tests {
         let mut cond = IndexCondition::new();
         cond.add_condition(Condition::Equal("B".into(), "b".into()));
 
-        let result = cond.to_vix_query("test", &indexed(&["A"]), &tok);
+        let result = cond.to_vix_query("test", &indexed(&["A"]), &tok, true);
         assert!(
             result.is_err(),
             "should return error when the only field is missing"
@@ -2226,7 +2248,9 @@ mod tests {
         ));
         cond.add_condition(Condition::Equal("A".into(), "a2".into()));
 
-        let (query, has_skipped) = cond.to_vix_query("test", &indexed(&["A"]), &tok).unwrap();
+        let (query, has_skipped) = cond
+            .to_vix_query("test", &indexed(&["A"]), &tok, true)
+            .unwrap();
         assert!(has_skipped);
         assert_eq!(query, exact("A", "a2"));
     }
@@ -2242,7 +2266,7 @@ mod tests {
         let mut lone = IndexCondition::new();
         lone.add_condition(Condition::Equal("B".into(), "b".into()));
         let (query, has_skipped) = lone
-            .to_vix_query("test", &absent_unless(&["A"]), &tok)
+            .to_vix_query("test", &absent_unless(&["A"]), &tok, true)
             .expect("absent-field conditions must evaluate, not error");
         assert!(!has_skipped, "an absent field is exact, not a skip");
         assert_eq!(query, VixQuery::Nothing);
@@ -2268,7 +2292,7 @@ mod tests {
                 conditions: vec![condition.clone()],
             };
             let (query, has_skipped) = cond
-                .to_vix_query("test", &absent_unless(&["A"]), &tok)
+                .to_vix_query("test", &absent_unless(&["A"]), &tok, true)
                 .unwrap_or_else(|e| panic!("{condition:?} must evaluate: {e}"));
             assert!(!has_skipped, "{condition:?} must not skip");
             assert_eq!(query, VixQuery::Nothing, "{condition:?}");
@@ -2284,7 +2308,7 @@ mod tests {
         cond.add_condition(Condition::Equal("B".into(), "b".into()));
         cond.add_condition(Condition::Equal("A".into(), "a".into()));
         let (query, has_skipped) = cond
-            .to_vix_query("test", &absent_unless(&["A"]), &tok)
+            .to_vix_query("test", &absent_unless(&["A"]), &tok, true)
             .unwrap();
         assert!(!has_skipped);
         assert_eq!(
@@ -2314,7 +2338,7 @@ mod tests {
             let lone = IndexCondition {
                 conditions: vec![condition.clone()],
             };
-            let result = lone.to_vix_query("test", &absent_unless(&["A"]), &tok);
+            let result = lone.to_vix_query("test", &absent_unless(&["A"]), &tok, true);
             assert!(
                 result.is_err(),
                 "{condition:?} alone must skip (AllConditionsSkipped)"
@@ -2324,7 +2348,7 @@ mod tests {
             with_term.add_condition(condition.clone());
             with_term.add_condition(Condition::Equal("A".into(), "a2".into()));
             let (query, has_skipped) = with_term
-                .to_vix_query("test", &absent_unless(&["A"]), &tok)
+                .to_vix_query("test", &absent_unless(&["A"]), &tok, true)
                 .unwrap();
             assert!(has_skipped, "{condition:?} must report the skip");
             assert_eq!(query, exact("A", "a2"));
@@ -2348,10 +2372,10 @@ mod tests {
             Box::new(Condition::Equal("F".into(), "f".into())),
             Box::new(Condition::Equal("B".into(), "b".into())),
         ));
-        assert!(cond.to_vix_query("test", &caps, &tok).is_err());
+        assert!(cond.to_vix_query("test", &caps, &tok, true).is_err());
 
         cond.add_condition(Condition::Equal("A".into(), "a".into()));
-        let (query, has_skipped) = cond.to_vix_query("test", &caps, &tok).unwrap();
+        let (query, has_skipped) = cond.to_vix_query("test", &caps, &tok, true).unwrap();
         assert!(has_skipped);
         assert_eq!(query, exact("A", "a"));
     }
@@ -2386,7 +2410,7 @@ mod tests {
             "Sending deploy deploy callback".into(),
         ));
         cond.add_condition(Condition::Equal("svc".into(), "x".into()));
-        let (query, has_skipped) = cond.to_vix_query("test", &caps, &tok).unwrap();
+        let (query, has_skipped) = cond.to_vix_query("test", &caps, &tok, true).unwrap();
         assert!(has_skipped, "a token superset is not the exact predicate");
         assert_eq!(
             query,
@@ -2404,7 +2428,7 @@ mod tests {
         // is eliminated when its tokens are absent
         let mut lone = IndexCondition::new();
         lone.add_condition(Condition::Equal("body".into(), "needle".into()));
-        let (query, has_skipped) = lone.to_vix_query("test", &caps, &tok).unwrap();
+        let (query, has_skipped) = lone.to_vix_query("test", &caps, &tok, true).unwrap();
         assert!(has_skipped);
         assert_eq!(query, scoped(token("needle")));
 
@@ -2415,7 +2439,7 @@ mod tests {
             vec!["aa bb".into(), "cc".into()],
             false,
         ));
-        let (query, has_skipped) = list.to_vix_query("test", &caps, &tok).unwrap();
+        let (query, has_skipped) = list.to_vix_query("test", &caps, &tok, true).unwrap();
         assert!(has_skipped);
         assert_eq!(
             query,
@@ -2440,14 +2464,69 @@ mod tests {
             let mut cond = IndexCondition::new();
             cond.add_condition(condition.clone());
             assert!(
-                cond.to_vix_query("test", &caps, &tok).is_err(),
+                cond.to_vix_query("test", &caps, &tok, true).is_err(),
                 "{condition:?} alone must skip (AllConditionsSkipped)"
             );
             cond.add_condition(Condition::Equal("svc".into(), "x".into()));
-            let (query, has_skipped) = cond.to_vix_query("test", &caps, &tok).unwrap();
+            let (query, has_skipped) = cond.to_vix_query("test", &caps, &tok, true).unwrap();
             assert!(has_skipped, "{condition:?} must report the skip");
             assert_eq!(query, exact("svc", "x"), "{condition:?}");
         }
+    }
+
+    /// A file whose active full-text scope is only partly token-indexed
+    /// cannot evaluate ANY full-text predicate (its index would miss rows
+    /// matching in the unindexed column): with `fulltext_servable = false`
+    /// every condition using match_all — bare, nested in OR/NOT, fuzzy — is
+    /// skipped with `has_skipped`, the exact conjuncts still build the
+    /// query, and a lone full-text condition is AllConditionsSkipped.
+    /// Token supersets of fts-field equalities are not full-text predicates
+    /// and stay.
+    #[test]
+    fn test_to_vix_query_unservable_fulltext_skips_only_fulltext_conditions() {
+        let caps = |name: &str| match name {
+            "body" => FieldCap::Tokens,
+            _ => FieldCap::Term,
+        };
+        let mut cond = IndexCondition::new();
+        cond.add_condition(Condition::MatchAll("deploy status".into()));
+        cond.add_condition(Condition::Or(
+            Box::new(Condition::MatchAll("xyz".into())),
+            Box::new(Condition::Equal("svc".into(), "y".into())),
+        ));
+        cond.add_condition(Condition::Not(Box::new(Condition::FuzzyMatchAll(
+            "abc".into(),
+            1,
+        ))));
+        cond.add_condition(Condition::Equal("svc".into(), "x".into()));
+        cond.add_condition(Condition::Equal("body".into(), "needle".into()));
+        let (query, has_skipped) = cond.to_vix_query("test", &caps, &tok, false).unwrap();
+        assert!(has_skipped);
+        assert_eq!(
+            query,
+            VixQuery::And(vec![
+                exact("svc", "x"),
+                VixQuery::FullText {
+                    fields: vec!["body".to_string()],
+                    query: Box::new(VixQuery::TokenAnyField {
+                        token: b"needle".to_vec(),
+                    }),
+                },
+            ])
+        );
+        // the same conditions evaluate full text when the scope is servable
+        let (query, _) = cond.to_vix_query("test", &caps, &tok, true).unwrap();
+        assert!(matches!(&query, VixQuery::And(subs) if subs.len() == 5));
+
+        let mut lone = IndexCondition::new();
+        lone.add_condition(Condition::MatchAll("deploy".into()));
+        assert!(lone.to_vix_query("test", &caps, &tok, false).is_err());
+        // `match_all('*')` / empty are condition-all, never full text
+        let mut all = IndexCondition::new();
+        all.add_condition(Condition::MatchAll("*".into()));
+        let (query, has_skipped) = all.to_vix_query("test", &caps, &tok, false).unwrap();
+        assert!(!has_skipped);
+        assert_eq!(query, VixQuery::All);
     }
 
     #[test]

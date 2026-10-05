@@ -575,3 +575,71 @@ fn and_io_probe() {
         );
     }
 }
+
+/// For every `<name>.vxi.tail` in `VIX_TAIL_DIR` (the last N bytes of a
+/// sidecar, paired with the object's full size in `sample.txt` lines
+/// `<key> <size>`), report how many trailing bytes a cold open needs
+/// tail-resident: the puffin footer, the `dict` blob and the `terms` blob's
+/// 256 KiB vortex footer window. Compare against `ZO_VIX_EAGER_TAIL_BYTES`.
+#[test]
+#[ignore = "diagnostic; run with VIX_TAIL_DIR set"]
+fn eager_tail_probe() {
+    let dir = std::env::var("VIX_TAIL_DIR").expect("VIX_TAIL_DIR");
+    let sizes: std::collections::HashMap<String, u64> =
+        std::fs::read_to_string(format!("{dir}/sample.txt"))
+            .unwrap()
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.split_whitespace();
+                let key = parts.next()?;
+                let size: u64 = parts.next()?.parse().ok()?;
+                Some((key.rsplit('/').next()?.to_string(), size))
+            })
+            .collect();
+    let mut entries: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".vxi.tail"))
+        .collect();
+    entries.sort_by_key(|e| e.file_name());
+    eprintln!(
+        "{:<30} {:>11} {:>8} {:>8} {:>8} {:>9}",
+        "sidecar", "size", "footer", "dict", "fields", "need_tail"
+    );
+    for entry in entries {
+        let name = entry
+            .file_name()
+            .to_string_lossy()
+            .trim_end_matches(".tail")
+            .to_string();
+        let tail = std::fs::read(entry.path()).unwrap();
+        let size = sizes[&name];
+        let tail_start = size - tail.len() as u64;
+        let meta = puffin::reader::parse_puffin_footer_from_bytes(&tail).unwrap();
+        // blob offsets are absolute file offsets; the parser only needs the
+        // suffix, so re-base nothing — just read the directory
+        let blob = |tag: &str| {
+            meta.blobs
+                .iter()
+                .find(|b| b.properties.get("blob_tag").is_some_and(|t| t == tag))
+                .map(|b| b.get_offset(None))
+        };
+        let terms = blob(crate::container::BLOB_TAG_TERMS).expect("terms blob");
+        let dict = blob("dict").expect("dict blob");
+        let footer_len = size - dict.end;
+        let fields = meta
+            .properties
+            .get("fields")
+            .map(|f| f.matches("\"name\"").count())
+            .unwrap_or(0);
+        let need = size
+            - (terms.end
+                - crate::source::VORTEX_FOOTER_INITIAL_READ_BYTES.min(terms.end - terms.start));
+        let _ = tail_start;
+        eprintln!(
+            "{name:<30} {size:>11} {footer_len:>8} {:>8} {fields:>8} {need:>9}{}",
+            dict.end - dict.start,
+            if need > 768 * 1024 { "  > 768 KiB" } else { "" }
+        );
+    }
+}

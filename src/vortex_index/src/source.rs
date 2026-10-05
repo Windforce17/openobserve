@@ -796,36 +796,66 @@ impl RangedBlob {
         self.footer.ranges.get().is_some()
     }
 
-    /// Absolute window of the initial Vortex footer read an open performs:
-    /// [`VORTEX_FOOTER_INITIAL_READ_BYTES`] from the blob end, clamped to
-    /// the blob — or, once an open retained this blob's footer, exactly the
-    /// RETAINED suffix ([`FooterState::window`], at most the initial
-    /// window). Planning (`prefetch_field_bundle`, tail-residency checks)
-    /// must fetch what is actually retained: the retained state serves a
-    /// later open with `with_initial_read_size(retained_len)`, so no path
-    /// ever re-fetches the footer of an opened blob.
+    /// Absolute window of the initial Vortex footer read an open performs
+    /// ([`Self::footer_initial_read_bytes`] from the blob end) — or, once an
+    /// open retained this blob's footer, exactly the RETAINED suffix
+    /// ([`FooterState::window`], at most the initial window). Planning
+    /// (`prefetch_field_bundle`, tail-residency checks) must fetch what is
+    /// actually retained: the retained state serves a later open with
+    /// `with_initial_read_size(retained_len)`, so no path ever re-fetches
+    /// the footer of an opened blob.
     pub(crate) fn footer_window(&self) -> Range<u64> {
         self.footer
             .window(self.range.end)
-            .unwrap_or_else(|| self.initial_footer_window())
-    }
-
-    /// The uncached initial-read window: a suffix read of up to
-    /// [`VORTEX_FOOTER_INITIAL_READ_BYTES`] bytes.
-    fn initial_footer_window(&self) -> Range<u64> {
-        self.range.end - self.len().min(VORTEX_FOOTER_INITIAL_READ_BYTES)..self.range.end
+            .unwrap_or_else(|| self.range.end - self.footer_initial_read_bytes()..self.range.end)
     }
 
     /// Byte length a later open passes to
     /// `VortexOpenOptions::with_initial_read_size` (vortex hard-floors it at
-    /// `MAX_POSTSCRIPT_SIZE + EOF`): the retained window once cached, else
-    /// [`VORTEX_FOOTER_INITIAL_READ_BYTES`].
+    /// `MAX_POSTSCRIPT_SIZE + EOF`): the retained window once cached; else
+    /// the longest suffix of up to [`VORTEX_FOOTER_INITIAL_READ_BYTES`] the
+    /// source already holds (the eager tail), as long as it covers the
+    /// postscript — a sidecar whose `dict` and puffin footer push the
+    /// `terms` footer a few tens of KB past the 768 KiB tail then opens
+    /// from the resident bytes and pays a prefix read only when the layout
+    /// really is larger (vortex `NeedMoreData`), instead of one unconditional
+    /// 256 KiB remote read; else the full initial window (one remote read
+    /// either way, so take everything).
     pub(crate) fn footer_initial_read_bytes(&self) -> u64 {
-        self.footer
-            .window(self.range.end)
-            .map_or(VORTEX_FOOTER_INITIAL_READ_BYTES, |window| {
-                window.end - window.start
-            })
+        if let Some(window) = self.footer.window(self.range.end) {
+            return window.end - window.start;
+        }
+        let full = self.len().min(VORTEX_FOOTER_INITIAL_READ_BYTES);
+        if self
+            .source
+            .resident(self.range.end - full..self.range.end)
+            .is_some()
+        {
+            return full;
+        }
+        // probe shrinking suffixes down to the postscript-sized minimum
+        const STEP: u64 = 32 * 1024;
+        let floor = self.len().min(VORTEX_FOOTER_READ_BYTES);
+        let mut size = full.saturating_sub(STEP) / STEP * STEP;
+        while size >= floor {
+            if self
+                .source
+                .resident(self.range.end - size..self.range.end)
+                .is_some()
+            {
+                return size;
+            }
+            size -= STEP;
+        }
+        if floor < full
+            && self
+                .source
+                .resident(self.range.end - floor..self.range.end)
+                .is_some()
+        {
+            return floor;
+        }
+        full
     }
 
     /// Absolute window a demoted reader must keep servable without IO:
@@ -870,7 +900,7 @@ impl RangedBlob {
         if self.footer_cached() {
             return true;
         }
-        let window = self.initial_footer_window();
+        let window = self.footer_window();
         if self.source.resident(window.clone()).is_some() {
             return true;
         }

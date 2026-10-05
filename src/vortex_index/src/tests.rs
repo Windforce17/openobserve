@@ -4934,15 +4934,13 @@ mod ranged {
     /// Cold read plan, exact-term count (`count(*) WHERE level='warn'`):
     /// old layout `[terms][dict_blocks][dict]` = tails ∥, bundle[terms
     /// footer + key block], doc_count leaf = 3 round trips; new layout
-    /// `[dict_blocks][terms][dict]` = tails ∥, bundle[terms footer + key
-    /// block], doc_count leaf = 3 round trips too — the one-read Vortex
-    /// footer (`VORTEX_FOOTER_INITIAL_READ_BYTES`, 256 KiB) is wider than
-    /// the eager tail's coverage beyond `terms.end`, so the footer window
-    /// travels in the bundle and the leaves read in their own wave (the
-    /// pre-widening plan folded tail-resident 65,535 B footers into the
-    /// bundle, but paid a sequential NeedMoreData prefix read on
-    /// prod-sized blobs instead). A field whose doc_count span exceeds the
-    /// leaf cap (`svc`, 100k terms) keeps the same shape on both layouts.
+    /// `[dict_blocks][terms][dict]` = tails ∥, bundle[key block], doc_count
+    /// leaf = 2 round trips — the terms blob's Vortex footer opens from the
+    /// tail-resident suffix (the adaptive initial read shrinks the 256 KiB
+    /// window to what the eager tail covers beyond `terms.end`, which holds
+    /// the postscript and the serialized layout), so no footer window
+    /// travels in the bundle. A field whose doc_count span exceeds the leaf
+    /// cap (`svc`, 100k terms) keeps the same shape on both layouts.
     #[test]
     fn cold_exact_count_round_trips_old_and_new_layout() {
         let (data, index) = build_large_core_file();
@@ -4976,8 +4974,8 @@ mod ranged {
             "old layout: tails, bundle[footer+block], leaf"
         );
         assert_eq!(
-            new.depth, 3,
-            "new layout: tails, bundle[footer window + block], leaf"
+            new.depth, 2,
+            "new layout: tails, bundle[block], leaf — the footer is tail-resident"
         );
         assert!(
             new.fetches <= old.fetches,
@@ -5003,7 +5001,8 @@ mod ranged {
         assert_eq!(old.depth, 3);
         assert_eq!(
             new.depth, 3,
-            "leaves over the cap read on demand: one more round trip"
+            "leaves over the cap read on demand: one more round trip (the \
+             footer is tail-resident, the span is what costs the wave)"
         );
         assert!(
             new.fetches <= old.fetches,
@@ -5016,13 +5015,10 @@ mod ranged {
     /// Cold read plan, grouped top-N (`GROUP BY level ORDER BY count LIMIT
     /// 10`): old layout = tails ∥, bundle[terms footer + key-terms block +
     /// field block run], leaves[key ordinal + value spans] = 3 round trips;
-    /// new layout = tails ∥, bundle[terms footer window + blocks], leaves
-    /// = 3 round trips too — the one-read Vortex footer window (256 KiB)
-    /// is wider than the eager tail's coverage beyond `terms.end`, so it
-    /// travels in the bundle instead of the pre-widening tail-resident
-    /// 65,535 B footer (which folded the leaves into the bundle but paid a
-    /// sequential NeedMoreData prefix read on prod-sized blobs). Results
-    /// equal the whole-file reader's.
+    /// new layout = tails ∥, bundle[blocks], leaves = 2 round trips — the
+    /// terms footer opens from the tail-resident suffix (adaptive initial
+    /// read), so no footer window travels in the bundle. Results equal the
+    /// whole-file reader's.
     #[test]
     fn cold_top_k_round_trips_old_and_new_layout() {
         let (data, index) = build_large_core_file();
@@ -5054,32 +5050,30 @@ mod ranged {
             "old layout: tails, bundle[footer+blocks], leaves"
         );
         assert_eq!(
-            new.depth, 3,
-            "new layout: tails, bundle[footer window + blocks], leaves"
+            new.depth, 2,
+            "new layout: tails, bundle[blocks], leaves — the footer is tail-resident"
         );
-        // The new layout may pay one more FETCH than the old one here: its
-        // terms footer window (256 KiB) extends past the tail's coverage
-        // beyond terms.end, so the leaf planning that the old layout folds
-        // into its own footer fetch becomes a separate window fetch. Bytes
-        // still favor the new layout (329 KB vs 590 KB here); the
-        // round-trip DEPTH is the latency contract and stays equal.
         assert!(
-            new.fetches <= old.fetches + 1,
-            "{} > {} + 1",
+            new.fetches <= old.fetches && new.bytes < old.bytes,
+            "new {} fetches / {} B vs old {} / {}",
             new.fetches,
-            old.fetches
+            new.bytes,
+            old.fetches,
+            old.bytes
         );
     }
 
-    /// D2, post footer-widening: the terms blob's Vortex footer open is ONE
-    /// fetch on BOTH layouts — the initial read window
-    /// (`VORTEX_FOOTER_INITIAL_READ_BYTES`, 256 KiB) covers the postscript
-    /// AND the layout, replacing the postscript-sized read plus a
-    /// sequential `NeedMoreData` prefix read that prod-sized terms blobs
-    /// paid. The tail still serves whatever part of the window it covers
-    /// (the new layout's dict + puffin footer sit between the terms blob
-    /// and the file end), so the open fetches only the tail-missing prefix;
-    /// a fully tail-covered window (small files) fetches nothing.
+    /// D2 + adaptive footer read: the terms blob's Vortex footer open is
+    /// ONE fetch on the legacy layout and ZERO on the new one. The initial
+    /// read window is the longest tail-resident suffix of up to
+    /// `VORTEX_FOOTER_INITIAL_READ_BYTES` (256 KiB) that still covers the
+    /// postscript: on the new layout the dict + puffin footer sit between
+    /// the terms blob and the file end, the tail covers the postscript AND
+    /// the serialized layout, so the open reads nothing (a layout larger
+    /// than the resident suffix would pay exactly one `NeedMoreData` prefix
+    /// read — the pre-adaptive cost — never more). The legacy layout's
+    /// terms blob sits before `dict_blocks`, outside the tail: one 256 KiB
+    /// read.
     #[test]
     fn terms_footer_open_is_one_read_on_both_layouts() {
         let (data, index) = build_large_core_file();
@@ -5090,17 +5084,17 @@ mod ranged {
         assert!(
             footer_window as u64 + crate::source::VORTEX_FOOTER_READ_BYTES <= PROD_SIDECAR_TAIL,
             "dict + puffin footer ({footer_window} B) + 65,535 fits the tail: the \
-             pre-widening footer window was tail-resident on the new layout"
+             postscript-sized suffix of the terms blob is tail-resident"
         );
         assert!(
             footer_window as u64 + crate::source::VORTEX_FOOTER_INITIAL_READ_BYTES
                 > PROD_SIDECAR_TAIL,
-            "the 256 KiB initial window extends past the tail's coverage beyond \
-             terms.end: the open pays exactly one prefix fetch on the new layout"
+            "the full 256 KiB window extends past the tail's coverage beyond \
+             terms.end: the adaptive read must shrink to the resident suffix"
         );
 
         for (name, sidecar, expected_fetches) in [
-            ("new", index.clone(), 1usize),
+            ("new", index.clone(), 0usize),
             ("legacy", repack_legacy_sidecar_order(&index), 1usize),
         ] {
             let source = PairSource::new(data.clone(), sidecar);

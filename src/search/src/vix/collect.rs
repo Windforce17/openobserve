@@ -3029,8 +3029,9 @@ mod tests {
         let (query, has_skipped) = condition
             .to_vix_query(
                 "test",
-                &|field| super::super::field_capability("test", &reader, field),
+                &|field| super::super::field_capability(&reader, field),
                 &super::super::index_match_all_tokens,
+                true,
             )
             .unwrap();
         assert!(!has_skipped);
@@ -3048,8 +3049,9 @@ mod tests {
         let (query, has_skipped) = condition
             .to_vix_query(
                 "test",
-                &|field| super::super::field_capability("test", &reader, field),
+                &|field| super::super::field_capability(&reader, field),
                 &super::super::index_match_all_tokens,
+                true,
             )
             .unwrap();
         assert!(!has_skipped);
@@ -3077,8 +3079,9 @@ mod tests {
             let (query, has_skipped) = index_condition
                 .to_vix_query(
                     "test",
-                    &|field| super::super::field_capability("test", &reader, field),
+                    &|field| super::super::field_capability(&reader, field),
                     &super::super::index_match_all_tokens,
+                    true,
                 )
                 .unwrap_or_else(|e| panic!("{condition:?} must evaluate: {e}"));
             assert!(!has_skipped, "{condition:?} must not skip");
@@ -3098,8 +3101,9 @@ mod tests {
         let (query, has_skipped) = index_condition
             .to_vix_query(
                 "test",
-                &|field| super::super::field_capability("test", &reader, field),
+                &|field| super::super::field_capability(&reader, field),
                 &super::super::index_match_all_tokens,
+                true,
             )
             .unwrap();
         assert!(!has_skipped);
@@ -3115,8 +3119,9 @@ mod tests {
         let (query, has_skipped) = index_condition
             .to_vix_query(
                 "test",
-                &|field| super::super::field_capability("test", &reader, field),
+                &|field| super::super::field_capability(&reader, field),
                 &super::super::index_match_all_tokens,
+                true,
             )
             .unwrap();
         assert!(!has_skipped);
@@ -3262,8 +3267,9 @@ mod tests {
         }
         .to_vix_query(
             "test",
-            &|field| super::super::field_capability("test", &reader, field),
+            &|field| super::super::field_capability(&reader, field),
             &super::super::index_match_all_tokens,
+            true,
         )
         .unwrap();
         assert_eq!(reader.count(&query).unwrap(), 3);

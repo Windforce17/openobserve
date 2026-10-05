@@ -1291,7 +1291,6 @@ enum AccessFallbackReason {
 /// raw-value leaf. Generic AND/NOT/FTS counts may decode postings and never
 /// enter this decision. Boundary density is unknown until timestamp clamping.
 fn early_exact_access(
-    trace_id: &str,
     reader: &VixReader,
     condition: &IndexCondition,
     records: i64,
@@ -1305,7 +1304,7 @@ fn early_exact_access(
     let [crate::index::Condition::Equal(field, value)] = condition.conditions.as_slice() else {
         return Ok(None);
     };
-    if !matches!(field_capability(trace_id, reader, field), FieldCap::Term)
+    if !matches!(field_capability(reader, field), FieldCap::Term)
         || reader.field_oversize_skips(field) != 0
     {
         return Ok(None);
@@ -1876,7 +1875,6 @@ async fn search_vix_index(
     let raw = run_evaluation(trace_id, operation, permit, move || {
         let reader = reader_input.open()?;
         if let Some(answer) = early_exact_access(
-            &task_trace_id,
             &reader,
             &condition,
             file_records,
@@ -2265,8 +2263,19 @@ fn evaluate_vix_index(
     let (start_time, end_time) = time_range;
 
     // Validate the current query scope, never the historical file's whole
-    // FTS inventory. Missing capability cannot prove a missing match; only
-    // an exact key-term absence permits omitting an active field.
+    // FTS inventory — from the footer's field table (every docs column with
+    // its index capability; zero IO). The scan re-applies full-text
+    // predicates per COLUMN: a scope field that is not a column of this
+    // file is NULL in every scanned row and can match nothing, so it is
+    // simply omitted; a scope field that IS a column but is not token-
+    // indexed here (the full-text configuration grew after the file was
+    // written) can match rows the index never sees, so no full-text
+    // predicate is servable for this file (`fulltext_servable = false`:
+    // those conjuncts skip, the exact conjuncts still narrow or eliminate
+    // the file — previously the WHOLE file went to the scan before any
+    // other conjunct was consulted). A partial field keeps that whole-file
+    // bail: its value terms are incomplete.
+    let mut fulltext_servable = true;
     let full_text_fields = if condition.uses_full_text() {
         let Some(fields) = full_text_fields else {
             return Ok(RawVixResult::PartialFields);
@@ -2276,27 +2285,16 @@ fn evaluate_vix_index(
         }
         let mut available = Vec::with_capacity(fields.len());
         for field in fields {
-            vortex_index::check_read_cancelled()?;
             if reader.partial_fields().contains(field) {
                 return Ok(RawVixResult::PartialFields);
             }
             if reader.fts_fields().contains(field) {
                 available.push(field.clone());
-            } else {
-                match reader.key_term_exists(field) {
-                    Ok(false) => {}
-                    Ok(true) => return Ok(RawVixResult::PartialFields),
-                    Err(error) => {
-                        vortex_index::check_read_cancelled()?;
-                        if is_cancelled_read(&error) {
-                            return Err(error);
-                        }
-                        log::warn!(
-                            "[trace_id {trace_id}] search->vix: FTS capability probe failed for {field:?}: {error}; keeping the scan fallback"
-                        );
-                        return Ok(RawVixResult::PartialFields);
-                    }
-                }
+            } else if reader.has_field(field) {
+                log::info!(
+                    "[trace_id {trace_id}] search->vix: full-text field {field:?} is a column of this file but not token-indexed; full-text conjuncts are skipped for it"
+                );
+                fulltext_servable = false;
             }
         }
         available.sort_unstable();
@@ -2324,7 +2322,7 @@ fn evaluate_vix_index(
     ) && let Some((field, values, kind)) =
         condition.single_numeric_eq()
         && !matches!(
-            field_capability(trace_id, reader, field),
+            field_capability(reader, field),
             FieldCap::Term | FieldCap::Absent
         ) {
         let served = collect::stats_eq_bitmap(reader, field, values, kind)?;
@@ -2388,8 +2386,9 @@ fn evaluate_vix_index(
     // the canonical index tokenizer (the writer's).
     let (query, has_skipped) = match condition.to_vix_query(
         trace_id,
-        &|field| field_capability(trace_id, reader, field),
+        &|field| field_capability(reader, field),
         &index_match_all_tokens,
+        fulltext_servable,
     ) {
         Ok(built) => built,
         // M16 §4: the whole condition is ONE skipped conjunct
@@ -2398,12 +2397,15 @@ fn evaluate_vix_index(
         Err(_) if stats_eq.is_some() => (vortex_index::VixQuery::All, false),
         Err(e) => return Err(e),
     };
+    // the active scope wraps the query only while full-text leaves are
+    // evaluated; token supersets of fts-field equalities carry their own
+    // single-field scope
     let query = match full_text_fields {
-        Some(fields) => vortex_index::VixQuery::FullText {
+        Some(fields) if fulltext_servable => vortex_index::VixQuery::FullText {
             fields,
             query: Box::new(query),
         },
-        None => query,
+        _ => query,
     };
     // M16 §4: the (single) skipped conjunct is served exactly by the stats
     // bitmap — the evaluation is no longer a weaker predicate
@@ -2858,28 +2860,31 @@ fn evaluate_vix_index(
 }
 
 /// Per-file capability of a named field for term-index lookups (the closure
-/// [`IndexCondition::to_vix_query`] classifies conditions with):
+/// [`IndexCondition::to_vix_query`] classifies conditions with), decided from
+/// the footer's field table alone — every docs column of the file with its
+/// index capability — so classification costs no IO:
 ///
 /// - [`FieldCap::Term`] — the field's raw whole values are term-indexed in this file: conditions on
 ///   it map to index queries directly.
 /// - [`FieldCap::Tokens`] — the field is full-text indexed in this file (token terms, no whole
 ///   values): equality / IN narrow to the value's tokens as a superset with the filter re-applied;
-///   other shapes skip. Decided from the field table, no dictionary probe.
-/// - [`FieldCap::Absent`] — the key-term dictionary probe proves NO document carries the field
-///   (`VixReader::key_term_exists` is false ⇒ NULL in every row): never-TRUE-on-NULL conditions
-///   become [`vortex_index::VixQuery::Nothing`], eliminating the file exactly instead of scanning
-///   it.
-/// - [`FieldCap::Unservable`] — everything else: the file carries the field but the term index
-///   cannot serve predicates on it (column-store/numeric storage, internal columns), or the probe
-///   itself failed. The condition is skipped and the DataFusion filter re-applied — never a silent
-///   miss.
-fn field_capability(trace_id: &str, reader: &VixReader, field: &str) -> FieldCap {
+///   other shapes skip.
+/// - [`FieldCap::Absent`] — the field is not a column of this file. The scan evaluates named
+///   predicates per column, and a column the file lacks is NULL in every row, so never-TRUE-on-NULL
+///   conditions become [`vortex_index::VixQuery::Nothing`], eliminating the file exactly instead of
+///   scanning it. (The former key-term dictionary probe answered the stricter "does any document
+///   carry the flattened path" — one extra cold round trip per file, and a path that is not a
+///   column cannot match in the scan anyway.)
+/// - [`FieldCap::Unservable`] — the column exists but the term index cannot serve predicates on it
+///   (column-store/numeric storage, bloom-only demoted, internal columns). The condition is skipped
+///   and the DataFusion filter re-applied — never a silent miss.
+fn field_capability(reader: &VixReader, field: &str) -> FieldCap {
     // #40 defense in depth: a column-store-only file (index=none) proves
-    // NOTHING through its dictionary — key_term_exists' absence proof is
-    // void, so an index-off file must never classify a field Absent (that
-    // would eliminate the file and silently drop its rows). Unservable keeps
-    // the scan fallback with the filter re-applied. (The whole-file bail in
-    // evaluate_vix_index normally fires first; this guards direct callers.)
+    // NOTHING through its index metadata, so it must never classify a field
+    // Absent (that would eliminate the file and silently drop its rows).
+    // Unservable keeps the scan fallback with the filter re-applied. (The
+    // whole-file bail in evaluate_vix_index normally fires first; this
+    // guards direct callers.)
     if !reader.has_index() {
         return FieldCap::Unservable;
     }
@@ -2894,16 +2899,10 @@ fn field_capability(trace_id: &str, reader: &VixReader, field: &str) -> FieldCap
     if reader.fts_fields().contains(field) {
         return FieldCap::Tokens;
     }
-    match reader.key_term_exists(field) {
-        Ok(false) => FieldCap::Absent,
-        Ok(true) => FieldCap::Unservable,
-        Err(e) => {
-            log::warn!(
-                "[trace_id {trace_id}] search->vix: key-term probe failed for field {field:?}: {e}; keeping the scan fallback"
-            );
-            FieldCap::Unservable
-        }
+    if reader.has_field(field) {
+        return FieldCap::Unservable;
     }
+    FieldCap::Absent
 }
 
 /// The match_all tokenizer for index queries: the SINGLE canonical tokenizer
@@ -3652,7 +3651,6 @@ mod tests {
         for covered in [false, true] {
             assert!(matches!(
                 early_exact_access(
-                    "early",
                     &reader,
                     &equality("missing"),
                     file.meta.records,
@@ -3666,27 +3664,12 @@ mod tests {
         // A dense whole-file leaf says nothing about density inside a boundary
         // window, so retain real timestamp-clamped bitmap evaluation.
         assert!(
-            early_exact_access(
-                "early",
-                &reader,
-                &equality("info"),
-                file.meta.records,
-                false,
-                None
-            )
-            .unwrap()
-            .is_none()
+            early_exact_access(&reader, &equality("info"), file.meta.records, false, None)
+                .unwrap()
+                .is_none()
         );
         assert!(matches!(
-            early_exact_access(
-                "early",
-                &reader,
-                &equality("info"),
-                file.meta.records,
-                true,
-                None
-            )
-            .unwrap(),
+            early_exact_access(&reader, &equality("info"), file.meta.records, true, None).unwrap(),
             Some(RawVixResult::ExactAllRows(10)),
         ));
         let condition = IndexCondition {
@@ -3696,7 +3679,7 @@ mod tests {
             ],
         };
         assert!(
-            early_exact_access("early", &reader, &condition, file.meta.records, true, None)
+            early_exact_access(&reader, &condition, file.meta.records, true, None)
                 .unwrap()
                 .is_none()
         );
@@ -3727,22 +3710,15 @@ mod tests {
             },
         ] {
             assert!(
-                early_exact_access("early", &reader, &condition, file.meta.records, true, None)
+                early_exact_access(&reader, &condition, file.meta.records, true, None)
                     .unwrap()
                     .is_none()
             );
         }
         file.meta.records += 1;
         assert!(
-            early_exact_access(
-                "early",
-                &reader,
-                &equality("missing"),
-                file.meta.records,
-                true,
-                None
-            )
-            .is_err()
+            early_exact_access(&reader, &equality("missing"), file.meta.records, true, None)
+                .is_err()
         );
     }
 
@@ -4290,8 +4266,9 @@ mod tests {
             let (query, has_skipped) = condition
                 .to_vix_query(
                     "t",
-                    &|field| field_capability("t", &plist_file, field),
+                    &|field| field_capability(&plist_file, field),
                     &index_match_all_tokens,
+                    true,
                 )
                 .unwrap();
             assert!(!has_skipped);
@@ -4509,8 +4486,9 @@ mod tests {
         let (query, _) = condition
             .to_vix_query(
                 "b",
-                &|field| field_capability("b", &reader, field),
+                &|field| field_capability(&reader, field),
                 &index_match_all_tokens,
+                true,
             )
             .unwrap();
         let cursor = reader.single_term_plist_cursor(&query).unwrap().unwrap();
@@ -8019,6 +7997,142 @@ mod review_tests {
             VixReader::open_with_index(bytes::Bytes::from(data), index.map(bytes::Bytes::from))
                 .unwrap()
         }
+    }
+
+    /// The active full-text scope is validated from the field table, not a
+    /// dictionary probe. A scope field the file has no column for is
+    /// omitted (the scan cannot match on it either); a scope field that is
+    /// a plain column here — not token-indexed — makes full-text
+    /// unservable for the file: the match_all conjunct is skipped
+    /// (`has_skipped`) while `svc = …` still narrows, and eliminates the
+    /// file exactly when it matches nothing. Previously the whole file went
+    /// to the scan (`PartialFields`) before any other conjunct was seen.
+    #[test]
+    fn partially_indexed_fulltext_scope_skips_the_fulltext_conjunct_only() {
+        // `message` is fts-indexed, `log` is a raw column (term-indexed, NOT
+        // fts), `svc` a term field; `body` is no column of this file
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("svc", DataType::Utf8, true),
+            Field::new("message", DataType::Utf8, true),
+            Field::new("log", DataType::Utf8, true),
+        ]));
+        let ts = vec![1000i64, 999, 998, 997];
+        let svc = vec![Some("a"), Some("a"), Some("b"), Some("b")];
+        let message = vec!["hello world", "goodbye", "hello again", "nothing"];
+        let log = vec!["x hello", "y", "z", "w"];
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(ts.clone())),
+                Arc::new(StringArray::from(svc.clone())),
+                Arc::new(StringArray::from(message.clone())),
+                Arc::new(StringArray::from(log.clone())),
+            ],
+        )
+        .unwrap();
+        let sources: Vec<String> = (0..4)
+            .map(|i| {
+                format!(
+                    r#"{{"_timestamp":{},"svc":"{}","message":{},"log":{}}}"#,
+                    ts[i],
+                    svc[i].unwrap(),
+                    serde_json::to_string(message[i]).unwrap(),
+                    serde_json::to_string(log[i]).unwrap()
+                )
+            })
+            .collect();
+        let mut writer = VixWriter::new(
+            &schema,
+            VixWriterOptions {
+                fts_field_names: vec!["message".to_string()],
+                ..Default::default()
+            },
+            false,
+        );
+        writer
+            .push_batch_with_source(&batch, &StringArray::from(sources), None)
+            .unwrap();
+        let (data, index) = writer.finish().unwrap();
+        let reader =
+            VixReader::open_with_index(bytes::Bytes::from(data), index.map(bytes::Bytes::from))
+                .unwrap();
+        assert!(reader.has_field("log") && !reader.fts_fields().contains("log"));
+        assert!(!reader.has_field("body"));
+        let eval = |conditions: Vec<Condition>, scope: &[&str]| {
+            let scope: Vec<String> = scope.iter().map(|s| s.to_string()).collect();
+            evaluate_vix_index(
+                "scope",
+                &reader,
+                &IndexCondition { conditions },
+                None,
+                (0, 2000),
+                true,
+                None,
+                None,
+                Some(&scope),
+            )
+            .unwrap()
+        };
+        let rows = |raw: RawVixResult| match raw {
+            RawVixResult::Bitmap {
+                bitmap,
+                has_skipped,
+                ..
+            } => (bitmap.set_indices().collect::<Vec<_>>(), has_skipped),
+            _ => panic!("expected a bitmap"),
+        };
+
+        // scope {message, body}: body is no column → omitted, match_all is
+        // exact over message (rows 0 and 2 carry `hello`)
+        let (hits, has_skipped) = rows(eval(
+            vec![Condition::MatchAll("hello".into())],
+            &["message", "body"],
+        ));
+        assert_eq!(hits, vec![0, 2]);
+        assert!(!has_skipped);
+
+        // scope {message, log}: log is an unindexed column → full text is
+        // unservable; `svc = a` alone narrows (superset: rows 0, 1)
+        let (hits, has_skipped) = rows(eval(
+            vec![
+                Condition::MatchAll("hello".into()),
+                Condition::Equal("svc".into(), "a".into()),
+            ],
+            &["message", "log"],
+        ));
+        assert_eq!(hits, vec![0, 1]);
+        assert!(has_skipped, "the skipped match_all re-applies in the scan");
+
+        // ... and an exact conjunct that matches nothing eliminates the file
+        let (hits, has_skipped) = rows(eval(
+            vec![
+                Condition::MatchAll("hello".into()),
+                Condition::Equal("svc".into(), "zzz".into()),
+            ],
+            &["message", "log"],
+        ));
+        assert!(hits.is_empty());
+        assert!(has_skipped);
+
+        // a lone match_all with an unservable scope: every conjunct skipped,
+        // the deterministic AllConditionsSkipped path (file to the scan)
+        assert!(
+            evaluate_vix_index(
+                "scope",
+                &reader,
+                &IndexCondition {
+                    conditions: vec![Condition::MatchAll("hello".into())]
+                },
+                None,
+                (0, 2000),
+                true,
+                None,
+                None,
+                Some(&["message".to_string(), "log".to_string()]),
+            )
+            .is_err()
+        );
     }
 
     fn eval_bits(reader: &VixReader, conditions: Vec<Condition>) -> (Vec<usize>, bool) {

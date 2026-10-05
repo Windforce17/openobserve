@@ -295,6 +295,16 @@ impl<T> Admitted<Vec<T>> {
     }
 }
 
+/// Out-of-row postings records at or below this size are always read whole,
+/// in one request. Object storage charges per request (~30 ms, one fetch
+/// permit) far more than per byte: the header + skip-group shape costs a
+/// second wave and one request per touched group, so it only pays off on
+/// multi-MiB lists (a dense token of a multi-million-row file), where the
+/// groups a small accumulator touches are a tiny fraction. Prod `.198` cold
+/// runs: partial reads of 100–400 KB records halved the bytes but raised
+/// physical reads per follower ~10 % with no wall gain.
+pub(crate) const PARTIAL_RECORD_MIN_BYTES: u64 = 1024 * 1024;
+
 /// One terms-table cell as read by the batched AND intersection.
 enum TermCell {
     /// `doc_count == 0`: nothing to decode.
@@ -676,6 +686,10 @@ pub struct VixReader {
     /// blob — the ONLY pointer-vs-inline discriminator, cell bytes are
     /// never sniffed. `0` ⇒ every cell is inline (pre-plist file).
     plist_min_docs: u32,
+    /// Out-of-row records at or below this size are always read whole (see
+    /// [`PARTIAL_RECORD_MIN_BYTES`]); tests lower it to exercise the
+    /// header + skip-group path on small fixtures.
+    partial_record_min_bytes: u64,
     /// Arrow schema of the `docs` blob, loaded eagerly on in-memory readers
     /// and on first docs access on ranged readers.
     docs_schema: OnceLock<SchemaRef>,
@@ -1113,6 +1127,7 @@ impl VixReader {
             bloom_blob,
             plist_blob,
             plist_min_docs,
+            partial_record_min_bytes: PARTIAL_RECORD_MIN_BYTES,
             docs_schema: OnceLock::new(),
             memory: crate::source::current_reader_memory(),
             column_presence,
@@ -1352,6 +1367,13 @@ impl VixReader {
     /// The file's fts-marked field names (token-indexed fields).
     pub fn fts_fields(&self) -> &HashSet<String> {
         &self.fts_fields
+    }
+
+    /// Test-only: lower the whole-record read threshold so a small fixture
+    /// exercises the skip-header + group path of the AND intersection.
+    #[cfg(test)]
+    pub(crate) fn set_partial_record_min_bytes(&mut self, bytes: u64) {
+        self.partial_record_min_bytes = bytes;
     }
 
     /// Evaluate a query into a bitmap with one bit per document
@@ -4441,18 +4463,17 @@ impl VixReader {
         &self,
         leaves: Admitted<Vec<Admitted<Vec<u64>>>>,
     ) -> Result<Option<BooleanBuffer>> {
-        /// Records at or below this size are always read whole: a header
-        /// probe would not save a meaningful amount of bytes.
-        const SMALL_RECORD_BYTES: u64 = 16 * 1024;
+        let small_record_bytes = self.partial_record_min_bytes;
         /// Partial reads need the accumulator bound to be at most this
         /// fraction of the record's skip groups (expected touched share
         /// ≈ 1 − e^(−bound/groups) ≤ 22%).
         const PARTIAL_GROUP_RATIO: u64 = 4;
-        /// Plist windows are fetched sparsely: the backend may merge windows
-        /// separated by at most this many bytes (a few untouched skip groups,
-        /// a neighbouring small record), never the unrelated records or the
-        /// record body between selected groups.
-        const PLIST_FETCH_GAP_BYTES: u64 = 16 * 1024;
+        /// Plist windows of one wave coalesce with the storage default (1 MiB
+        /// gap): neighbouring whole records and the touched groups of one
+        /// record merge into one request. Selected groups of a multi-MiB
+        /// record stay separate only when more than 1 MiB of untouched
+        /// groups lies between them — the cases partial reads exist for.
+        const PLIST_FETCH_GAP_BYTES: u64 = 1024 * 1024;
 
         let len = self.row_count as usize;
         let bitmap_bytes = len.div_ceil(8);
@@ -4677,7 +4698,7 @@ impl VixReader {
                     .div_ceil(postings::SKIP_STRIDE) as u64;
                 let first = position == 0 && acc.is_none();
                 let full = first
-                    || record_len <= SMALL_RECORD_BYTES
+                    || record_len <= small_record_bytes
                     || bound.saturating_mul(PARTIAL_GROUP_RATIO) > entries;
                 let fetch = if full {
                     window.0..window.1
