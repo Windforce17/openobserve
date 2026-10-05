@@ -75,20 +75,28 @@ pub enum FieldCap {
     /// (`VixReader::has_term_capability`): conditions on it map to index
     /// queries directly.
     Term,
-    /// The file carries the field, but not as raw value terms — fts-only
-    /// (tokens), column-store/numeric storage, or an internal column. The
-    /// index cannot decide conditions on it: skip them and re-apply the
-    /// DataFusion filter (`has_skipped`).
-    FtsOnly,
+    /// The field is full-text indexed in this file (`VixReader::fts_fields`):
+    /// its values are token-indexed, never whole values. An equality / IN
+    /// on it maps to the field-scoped AND of the value's tokens — a SUPERSET
+    /// of the exact predicate, so the condition still counts as skipped
+    /// (`has_skipped`, DataFusion filter re-applied) but the index narrows
+    /// the candidates and an absent token eliminates the file exactly.
+    /// Every other shape on the field is skipped like [`FieldCap::Unservable`].
+    Tokens,
+    /// The file carries the field, but the term index cannot decide
+    /// conditions on it: column-store/numeric storage, an internal column,
+    /// or a failed probe. Skip them and re-apply the DataFusion filter
+    /// (`has_skipped`).
+    Unservable,
     /// The field's value terms are INCOMPLETE in this file (the writer
     /// skipped at least one value: oversize raw value, field-id overflow,
     /// type drift — `partial_fields`). Value-term lookups may miss
-    /// documents, so conditions on it are skipped like [`FieldCap::FtsOnly`]
-    /// — at CONJUNCT granularity, which is superset-safe under the
-    /// top-level AND with the filter re-applied (#32; the old whole-file
-    /// bail burned minutes discovering per-file ineligibility). Key terms
-    /// are complete even on partial fields, so `IS [NOT] NULL` never
-    /// consults this capability.
+    /// documents, so conditions on it are skipped like
+    /// [`FieldCap::Unservable`] — at CONJUNCT granularity, which is
+    /// superset-safe under the top-level AND with the filter re-applied
+    /// (#32; the old whole-file bail burned minutes discovering per-file
+    /// ineligibility). Key terms are complete even on partial fields, so
+    /// `IS [NOT] NULL` never consults this capability.
     Partial,
     /// No document of this file carries the field at all (no key term in
     /// the dictionary): it is NULL in every row. Conditions that can never
@@ -139,12 +147,21 @@ impl IndexCondition {
     // Returns (query, has_skipped):
     //   has_skipped = true means some conditions were skipped because the
     //   index of this file cannot decide them — the field is carried by the
-    //   file but not raw-value term-indexed ([`FieldCap::FtsOnly`]: an fts
-    //   field's values are token-indexed only, never whole values; numeric /
-    //   column-store-only storage), or an absent field appears in a shape
-    //   whose truth does not hinge on it alone (e.g. OR with a servable
-    //   predicate). The caller must keep the DataFusion filter so that the
-    //   skipped predicates are still evaluated.
+    //   file but not raw-value term-indexed ([`FieldCap::Unservable`]:
+    //   numeric / column-store-only storage; [`FieldCap::Tokens`] in a
+    //   shape other than equality / IN), or an absent field appears in a
+    //   shape whose truth does not hinge on it alone (e.g. OR with a
+    //   servable predicate). The caller must keep the DataFusion filter so
+    //   that the skipped predicates are still evaluated.
+    //
+    //   An equality / IN on a [`FieldCap::Tokens`] field is NOT dropped:
+    //   it maps to the field-scoped AND of the value's index tokens
+    //   ([`Condition::fts_superset_query`]). Every row equal to the value
+    //   carries all of its tokens, so the bitmap is a SUPERSET of the exact
+    //   predicate — `has_skipped` is still set (filter re-applied), but the
+    //   candidates shrink from "every row of the other conjuncts" to the
+    //   rows that contain the whole phrase, and a value whose tokens are
+    //   absent from the file eliminates it exactly (and cacheably).
     //
     //   A field reported [`FieldCap::Absent`] is NULL in every row of the
     //   file (no key term), so a condition that can never be TRUE on
@@ -155,11 +172,13 @@ impl IndexCondition {
     //   file without a scan.
     //
     //   `field_cap` reports the per-file capability
-    //   (`vix::field_capability`, backed by `VixReader::has_term_capability`
-    //   and the `VixReader::key_term_exists` dictionary probe).
-    //   `tokenize` turns a match_all value into index tokens — the canonical
-    //   `vortex_index::o2_tokenize` (via `vix::index_match_all_tokens`), the
-    //   same function the writer indexes with.
+    //   (`vix::field_capability`, backed by `VixReader::has_term_capability`,
+    //   `VixReader::fts_fields` and the `VixReader::key_term_exists`
+    //   dictionary probe).
+    //   `tokenize` turns a match_all value — or an fts-field equality value
+    //   — into index tokens — the canonical `vortex_index::o2_tokenize` (via
+    //   `vix::index_match_all_tokens`), the same function the writer indexes
+    //   with.
     pub fn to_vix_query(
         &self,
         trace_id: &str,
@@ -173,11 +192,19 @@ impl IndexCondition {
             // term index
             let fields = condition.term_index_fields();
             let mut unservable: Option<(&String, &str)> = None;
+            let mut token_superset: Option<VixQuery> = None;
             let mut absent: HashSet<String> = HashSet::new();
             for field in &fields {
                 match field_cap(field) {
                     FieldCap::Term => {}
-                    FieldCap::FtsOnly => {
+                    FieldCap::Tokens => {
+                        match condition.fts_superset_query(field, tokenize) {
+                            Some(query) => token_superset = Some(query),
+                            None => unservable = Some((field, "token-indexed only")),
+                        }
+                        break;
+                    }
+                    FieldCap::Unservable => {
                         unservable = Some((field, "not term-indexed"));
                         break;
                     }
@@ -189,6 +216,15 @@ impl IndexCondition {
                         absent.insert(field.clone());
                     }
                 }
+            }
+            if let Some(query) = token_superset {
+                log::info!(
+                    "[trace_id {trace_id}] to_vix_query: condition {} is on a token-indexed field in this file, narrowing it to the value's tokens (superset, filter re-applied)",
+                    condition.to_query()
+                );
+                queries.push(query);
+                has_skipped = true;
+                continue;
             }
             if let Some((missing, why)) = unservable {
                 log::info!(
@@ -760,6 +796,57 @@ impl Condition {
             // the scan-side filter repairs the null-row semantics
             Condition::Not(condition) => VixQuery::Not(Box::new(condition.to_vix_query(tokenize)?)),
         })
+    }
+
+    /// The field-scoped token SUPERSET of an equality / positive IN on a
+    /// token-indexed field ([`FieldCap::Tokens`]): `field = v` becomes
+    /// `FullText { [field], And(tokens(v)) }`, `field IN (..)` the OR of the
+    /// per-value shapes. Every row whose value equals `v` carries all of
+    /// `v`'s index tokens (the writer tokenizes values with this same
+    /// function), so the bitmap contains every exact match and the caller
+    /// re-applies the exact filter. `None` for every other shape — the
+    /// value tokenizes to nothing (no narrowing possible), a negation or
+    /// nested boolean (NOT of a superset is not a superset), substring /
+    /// regex / numeric comparisons — which keep the plain skip.
+    pub fn fts_superset_query(
+        &self,
+        field: &str,
+        tokenize: &dyn Fn(&str) -> Vec<String>,
+    ) -> Option<VixQuery> {
+        fn tokens_and(value: &str, tokenize: &dyn Fn(&str) -> Vec<String>) -> Option<VixQuery> {
+            let mut tokens: Vec<String> = tokenize(value);
+            tokens.sort_unstable();
+            tokens.dedup();
+            let mut leaves: Vec<VixQuery> = tokens
+                .into_iter()
+                .map(|token| VixQuery::TokenAnyField {
+                    token: token.into_bytes(),
+                })
+                .collect();
+            match leaves.len() {
+                0 => None,
+                1 => leaves.pop(),
+                _ => Some(VixQuery::And(leaves)),
+            }
+        }
+        let scoped = |query: VixQuery| VixQuery::FullText {
+            fields: vec![field.to_string()],
+            query: Box::new(query),
+        };
+        match self {
+            Condition::Equal(f, value) if f == field => tokens_and(value, tokenize).map(scoped),
+            Condition::In(f, values, false) if f == field => {
+                let per_value: Option<Vec<VixQuery>> = values
+                    .iter()
+                    .map(|value| tokens_and(value, tokenize))
+                    .collect();
+                per_value.map(|mut shapes| match shapes.len() {
+                    1 => scoped(shapes.pop().expect("one value")),
+                    _ => scoped(VixQuery::Or(shapes)),
+                })
+            }
+            _ => None,
+        }
     }
 
     /// Fields the condition looks up in the per-file term index. A file that
@@ -1919,15 +2006,15 @@ mod tests {
     }
 
     /// A per-file capability check over a fixed list of term-indexed
-    /// fields; everything else reports [`FieldCap::FtsOnly`] (carried by the
-    /// file but not raw-value servable — the skip + filter-back path, the
+    /// fields; everything else reports [`FieldCap::Unservable`] (carried by
+    /// the file but not raw-value servable — the skip + filter-back path, the
     /// exact behavior of the old boolean closure).
     fn indexed(fields: &'static [&'static str]) -> impl Fn(&str) -> FieldCap {
         move |name: &str| {
             if fields.contains(&name) {
                 FieldCap::Term
             } else {
-                FieldCap::FtsOnly
+                FieldCap::Unservable
             }
         }
     }
@@ -2244,13 +2331,15 @@ mod tests {
         }
     }
 
-    /// FtsOnly still wins over Absent for the same condition: the file
-    /// carries the fts field's rows, so the condition must be re-checked by
-    /// the scan even when another referenced field is absent.
+    /// A token-indexed field inside a nested shape (OR with an absent
+    /// field) still skips the whole condition: the token superset exists
+    /// only for a bare equality / IN conjunct, and the file carries the fts
+    /// field's rows, so the scan must re-check it even when the other
+    /// referenced field is absent.
     #[test]
-    fn test_to_vix_query_fts_only_beats_absent_within_a_condition() {
+    fn test_to_vix_query_tokens_in_nested_shape_beats_absent_within_a_condition() {
         let caps = |name: &str| match name {
-            "F" => FieldCap::FtsOnly,
+            "F" => FieldCap::Tokens,
             "B" => FieldCap::Absent,
             _ => FieldCap::Term,
         };
@@ -2265,6 +2354,100 @@ mod tests {
         let (query, has_skipped) = cond.to_vix_query("test", &caps, &tok).unwrap();
         assert!(has_skipped);
         assert_eq!(query, exact("A", "a"));
+    }
+
+    /// Equality / positive IN on a token-indexed field narrows to the
+    /// field-scoped AND of the value's tokens — a superset (`has_skipped`
+    /// stays set) that still eliminates files lacking a token. Every other
+    /// shape on the field, and a value with no index tokens, keeps the plain
+    /// skip.
+    #[test]
+    fn test_to_vix_query_tokens_field_equality_narrows_to_token_superset() {
+        // the canonical index tokenizer (what prod wires in), so the
+        // expectations below are the real prod shapes
+        let tok = |value: &str| vortex_index::o2_tokenize(value, 2, 64).collect::<Vec<_>>();
+        let caps = |name: &str| match name {
+            "body" => FieldCap::Tokens,
+            _ => FieldCap::Term,
+        };
+        let scoped = |query: VixQuery| VixQuery::FullText {
+            fields: vec!["body".to_string()],
+            query: Box::new(query),
+        };
+        let token = |value: &str| VixQuery::TokenAnyField {
+            token: value.as_bytes().to_vec(),
+        };
+
+        // body = 'Sending deploy callback' AND svc = 'x': tokens, sorted and
+        // deduplicated, scoped to body; the exact conjunct stays
+        let mut cond = IndexCondition::new();
+        cond.add_condition(Condition::Equal(
+            "body".into(),
+            "Sending deploy deploy callback".into(),
+        ));
+        cond.add_condition(Condition::Equal("svc".into(), "x".into()));
+        let (query, has_skipped) = cond.to_vix_query("test", &caps, &tok).unwrap();
+        assert!(has_skipped, "a token superset is not the exact predicate");
+        assert_eq!(
+            query,
+            VixQuery::And(vec![
+                scoped(VixQuery::And(vec![
+                    token("callback"),
+                    token("deploy"),
+                    token("sending"),
+                ])),
+                exact("svc", "x"),
+            ])
+        );
+
+        // a lone equality is served (no AllConditionsSkipped): the file
+        // is eliminated when its tokens are absent
+        let mut lone = IndexCondition::new();
+        lone.add_condition(Condition::Equal("body".into(), "needle".into()));
+        let (query, has_skipped) = lone.to_vix_query("test", &caps, &tok).unwrap();
+        assert!(has_skipped);
+        assert_eq!(query, scoped(token("needle")));
+
+        // IN: OR of the per-value shapes
+        let mut list = IndexCondition::new();
+        list.add_condition(Condition::In(
+            "body".into(),
+            vec!["aa bb".into(), "cc".into()],
+            false,
+        ));
+        let (query, has_skipped) = list.to_vix_query("test", &caps, &tok).unwrap();
+        assert!(has_skipped);
+        assert_eq!(
+            query,
+            scoped(VixQuery::Or(vec![
+                VixQuery::And(vec![token("aa"), token("bb")]),
+                token("cc"),
+            ]))
+        );
+
+        // shapes without a superset keep the skip: NOT IN, !=, str_match,
+        // regex, a value that tokenizes to nothing (punctuation only, or
+        // below the minimum token length), an IN with such a value
+        for condition in [
+            Condition::In("body".into(), vec!["aa".into()], true),
+            Condition::NotEqual("body".into(), "aa".into()),
+            Condition::StrMatch("body".into(), "aa".into(), true),
+            Condition::Regex("body".into(), "aa.*".into()),
+            Condition::Equal("body".into(), "!!".into()),
+            Condition::Equal("body".into(), "a".into()),
+            Condition::In("body".into(), vec!["aa".into(), "!!".into()], false),
+        ] {
+            let mut cond = IndexCondition::new();
+            cond.add_condition(condition.clone());
+            assert!(
+                cond.to_vix_query("test", &caps, &tok).is_err(),
+                "{condition:?} alone must skip (AllConditionsSkipped)"
+            );
+            cond.add_condition(Condition::Equal("svc".into(), "x".into()));
+            let (query, has_skipped) = cond.to_vix_query("test", &caps, &tok).unwrap();
+            assert!(has_skipped, "{condition:?} must report the skip");
+            assert_eq!(query, exact("svc", "x"), "{condition:?}");
+        }
     }
 
     #[test]

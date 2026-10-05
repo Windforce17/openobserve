@@ -865,6 +865,26 @@ impl VixRangeSource for TailRangeSource {
         &self,
         ranges: Vec<std::ops::Range<u64>>,
     ) -> BoxFuture<'static, anyhow::Result<Vec<Bytes>>> {
+        self.fetch_many_through(ranges, None)
+    }
+
+    fn fetch_many_sparse(
+        &self,
+        ranges: Vec<std::ops::Range<u64>>,
+        max_gap: u64,
+    ) -> BoxFuture<'static, anyhow::Result<Vec<Bytes>>> {
+        self.fetch_many_through(ranges, Some(max_gap))
+    }
+}
+
+impl TailRangeSource {
+    /// Serve tail-resident bytes locally and forward the rest to the inner
+    /// source in one batch, keeping a caller's sparse gap bound.
+    fn fetch_many_through(
+        &self,
+        ranges: Vec<std::ops::Range<u64>>,
+        max_gap: Option<u64>,
+    ) -> BoxFuture<'static, anyhow::Result<Vec<Bytes>>> {
         let mut missing = Vec::new();
         let end = self.start + self.bytes.len() as u64;
         for range in &ranges {
@@ -891,7 +911,10 @@ impl VixRangeSource for TailRangeSource {
         let future = if missing.is_empty() {
             None
         } else {
-            Some(source.fetch_many(missing.clone()))
+            Some(match max_gap {
+                Some(max_gap) => source.fetch_many_sparse(missing.clone(), max_gap),
+                None => source.fetch_many(missing.clone()),
+            })
         };
         let start = self.start;
         let bytes = self.bytes.clone();
@@ -2524,6 +2547,15 @@ pub(crate) fn scan_blob_streaming(
         RowSelection::Indices(mut indices) => {
             indices.sort_unstable();
             indices.dedup();
+            // Bound the scan to the touched span. Without a row range vortex
+            // plans one "exact" split per ≤4,000-row cluster of indices and
+            // reads EVERY chunk inside it; with a row range it splits at
+            // chunk boundaries and skips chunks whose mask is all-false, so
+            // two ordinals a few chunks apart cost two chunk reads, not the
+            // whole span between them.
+            if let (Some(&first), Some(&last)) = (indices.first(), indices.last()) {
+                scan = scan.with_row_range(first..last + 1);
+            }
             scan = scan.with_row_indices(Buffer::from(indices));
         }
         RowSelection::Range(range) => {

@@ -844,6 +844,163 @@ pub fn for_each_in_range(
     }
 }
 
+/// Exact byte length of the skip-table header of a record holding
+/// `doc_count` ids — known from the terms table alone, so a reader can fetch
+/// a record's header before (or instead of) its postings body.
+pub(crate) fn record_header_len_for(doc_count: usize) -> usize {
+    4 + (doc_count / BLOCK_LEN).div_ceil(SKIP_STRIDE) * 8
+}
+
+/// One run of consecutive skip groups `[first_group, end_group)` of a plist
+/// record and its record-relative byte window. `first_group == None` is the
+/// headless shape (a record with no full-block group: one vint tail).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GroupWindow {
+    pub(crate) first_group: Option<usize>,
+    pub(crate) end_group: usize,
+    pub(crate) range: Range<usize>,
+}
+
+/// Plan the skip groups that can hold any of `ids` (ascending), merging
+/// adjacent groups into one window: the intersection-driven read shape where
+/// a small accumulator selects a few groups of a long common-term list.
+pub(crate) fn plan_groups(
+    header: &[u8],
+    record_len: usize,
+    doc_count: usize,
+    ids: impl IntoIterator<Item = u32>,
+) -> Result<Vec<GroupWindow>> {
+    let table = RecordTable::parse(header, record_len, doc_count)?;
+    let mut windows: Vec<GroupWindow> = Vec::new();
+    if doc_count == 0 {
+        return Ok(windows);
+    }
+    if table.entries == 0 {
+        if ids.into_iter().next().is_some() {
+            windows.push(GroupWindow {
+                first_group: None,
+                end_group: 0,
+                range: table.header_len..record_len,
+            });
+        }
+        return Ok(windows);
+    }
+    let mut last_group = None;
+    for id in ids {
+        // the group holding `id`: the last whose first doc id is <= id
+        let Some(group) = table.group_before(id.saturating_add(1)) else {
+            continue;
+        };
+        if last_group == Some(group) {
+            continue;
+        }
+        last_group = Some(group);
+        let range = table.group_record_range(group);
+        match windows.last_mut() {
+            Some(window) if window.end_group == group => {
+                window.end_group = group + 1;
+                window.range.end = range.end;
+            }
+            _ => windows.push(GroupWindow {
+                first_group: Some(group),
+                end_group: group + 1,
+                range,
+            }),
+        }
+    }
+    Ok(windows)
+}
+
+/// Decode every id of the groups in `window` from exactly its planned bytes,
+/// ascending. The window's first group reseeds from its skip entry, so a
+/// group decodes without the ids before it.
+pub(crate) fn for_each_in_groups(
+    header: &[u8],
+    record_len: usize,
+    doc_count: usize,
+    window: &GroupWindow,
+    bytes: &[u8],
+    mut on_doc: impl FnMut(u32) -> Result<()>,
+) -> Result<()> {
+    let table = RecordTable::parse(header, record_len, doc_count)?;
+    if bytes.len() != window.range.len() {
+        return Err(VixError::Malformed(format!(
+            "plist group window is {} bytes, expected {}",
+            bytes.len(),
+            window.range.len()
+        )));
+    }
+    let (first_block, mut prev, mut seeded, group_first) = match window.first_group {
+        Some(group) => {
+            if group >= table.entries || window.end_group > table.entries {
+                return Err(VixError::Malformed(
+                    "plist group window exceeds the skip table".to_string(),
+                ));
+            }
+            (
+                group * SKIP_STRIDE,
+                0u32,
+                group == 0,
+                table.entry_first(group),
+            )
+        }
+        None => (0, 0u32, true, 0),
+    };
+    let last_block = (window.end_group * SKIP_STRIDE).min(table.full_blocks);
+    let include_tail = window.end_group >= table.entries;
+    let packer = BitPacker4x::new();
+    let mut deltas = [0u32; BLOCK_LEN];
+    let mut pos = 0usize;
+    for _ in first_block..last_block {
+        let num_bits = *bytes.get(pos).ok_or_else(|| truncated("block bit width"))?;
+        pos += 1;
+        if num_bits > 32 {
+            return Err(VixError::Malformed(format!(
+                "postings block bit width {num_bits} exceeds 32"
+            )));
+        }
+        if num_bits == 0 {
+            deltas.fill(0);
+        } else {
+            let packed_len = num_bits as usize * BLOCK_LEN / 8;
+            let packed = bytes
+                .get(pos..pos + packed_len)
+                .ok_or_else(|| truncated("bitpacked block"))?;
+            packer.decompress(packed, &mut deltas, num_bits);
+            pos += packed_len;
+        }
+        for (i, &delta) in deltas.iter().enumerate() {
+            if !seeded && i == 0 {
+                prev = group_first;
+                seeded = true;
+            } else {
+                prev = advance(prev, delta)?;
+            }
+            on_doc(prev)?;
+        }
+    }
+    if include_tail {
+        for _ in 0..doc_count % BLOCK_LEN {
+            let (delta, used) = read_vint(bytes.get(pos..).unwrap_or_default())?;
+            pos += used;
+            if !seeded {
+                prev = group_first;
+                seeded = true;
+            } else {
+                prev = advance(prev, delta)?;
+            }
+            on_doc(prev)?;
+        }
+    }
+    if pos != bytes.len() {
+        return Err(VixError::Malformed(format!(
+            "plist group window has {} trailing bytes",
+            bytes.len() - pos
+        )));
+    }
+    Ok(())
+}
+
 /// Byte length of an out-of-row postings POINTER CELL: `[u64 LE offset]
 /// [u32 LE len]` addressing an [`encode_record`] region inside the `plist`
 /// blob. A terms-table cell is a pointer cell exactly when the term's
@@ -1134,5 +1291,140 @@ mod tests {
         assert!(decode_all(&[0x80, 0x80, 0x80, 0x80, 0x80], 1).is_err());
         // A 5-byte vint with too-high payload bits (would overflow u32).
         assert!(decode_all(&[0x80, 0x80, 0x80, 0x80, 0x10], 1).is_err());
+    }
+
+    /// [`plan_groups`] + [`for_each_in_groups`] implement the
+    /// intersection-driven partial read: for any probe set, the planned
+    /// windows decode to exactly the groups holding a probe (never fewer —
+    /// every probe that IS in the list is produced — and never a group no
+    /// probe falls in), adjacent groups merge into one window, and the
+    /// header length is known from `doc_count` alone. Covers headless
+    /// records, group-aligned ids, probes before the first id / past the
+    /// last id, and the vint tail.
+    #[test]
+    fn test_group_windows_match_naive_everywhere() {
+        let mut state = 0xA24BAED4963EE407u64;
+        let mut next = move |bound: u32| -> u32 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % u64::from(bound.max(1))) as u32
+        };
+        let group_len = BLOCK_LEN * super::SKIP_STRIDE;
+        let shapes: Vec<usize> = vec![
+            1,
+            127,
+            128,
+            1023,
+            1024,
+            1025,
+            group_len * 3,
+            group_len * 3 + 77,
+            group_len * 6 + 1,
+        ];
+        for n in shapes {
+            for dense in [true, false] {
+                let mut ids = Vec::with_capacity(n);
+                let mut cur = 0u32;
+                for _ in 0..n {
+                    cur += 1 + if dense { next(3) } else { next(50_000) };
+                    ids.push(cur);
+                }
+                let record = encode_record(&ids).unwrap();
+                let header_len = record_header_len(&record).unwrap();
+                assert_eq!(record_header_len_for(n), header_len, "n={n}");
+                let header = &record[..header_len];
+                let groups = (n / BLOCK_LEN).div_ceil(super::SKIP_STRIDE);
+                // naive group of an id: index of the group whose first id <= id
+                let group_of = |id: u32| -> Option<usize> {
+                    if groups == 0 {
+                        return Some(0);
+                    }
+                    (0..groups).rev().find(|&g| ids[g * group_len] <= id)
+                };
+                // probe sets: single ids, group-aligned ids, out-of-list
+                // probes, and random mixes (ids that are and are not in the list)
+                let mut probe_sets: Vec<Vec<u32>> = vec![vec![], vec![ids[0]], vec![ids[n - 1]]];
+                if ids[0] > 0 {
+                    probe_sets.push(vec![ids[0] - 1]);
+                }
+                probe_sets.push(vec![ids[n - 1] + 1, u32::MAX]);
+                probe_sets.push((0..groups).map(|g| ids[g * group_len]).collect());
+                for _ in 0..8 {
+                    let count = 1 + next(40) as usize;
+                    let mut probes: Vec<u32> = (0..count)
+                        .map(|_| {
+                            if next(2) == 0 {
+                                ids[next(n as u32) as usize]
+                            } else {
+                                next(ids[n - 1] + 10)
+                            }
+                        })
+                        .collect();
+                    probes.sort_unstable();
+                    probes.dedup();
+                    probe_sets.push(probes);
+                }
+                for probes in probe_sets {
+                    let windows =
+                        plan_groups(header, record.len(), n, probes.iter().copied()).unwrap();
+                    let expected_groups: Vec<usize> = {
+                        let mut touched: Vec<usize> =
+                            probes.iter().filter_map(|&p| group_of(p)).collect();
+                        touched.sort_unstable();
+                        touched.dedup();
+                        touched
+                    };
+                    // windows are disjoint, ascending, merged, and cover
+                    // exactly the touched groups
+                    let mut planned_groups = Vec::new();
+                    for pair in windows.windows(2) {
+                        assert!(pair[0].end_group < pair[1].first_group.unwrap());
+                        assert!(pair[0].range.end <= pair[1].range.start);
+                    }
+                    let mut decoded_all = Vec::new();
+                    for window in &windows {
+                        let first = window.first_group.unwrap_or(0);
+                        planned_groups.extend(first..window.end_group.max(first + 1));
+                        let mut decoded = Vec::new();
+                        for_each_in_groups(
+                            header,
+                            record.len(),
+                            n,
+                            window,
+                            &record[window.range.clone()],
+                            |id| {
+                                decoded.push(id);
+                                Ok(())
+                            },
+                        )
+                        .unwrap();
+                        // the window decodes exactly its groups' ids
+                        let start = first * group_len;
+                        let end = if window.end_group >= groups {
+                            n
+                        } else {
+                            window.end_group * group_len
+                        };
+                        assert_eq!(
+                            decoded,
+                            ids[start.min(n)..end],
+                            "n={n} dense={dense} window={window:?}"
+                        );
+                        decoded_all.extend(decoded);
+                    }
+                    assert_eq!(
+                        planned_groups, expected_groups,
+                        "n={n} dense={dense} probes={probes:?}"
+                    );
+                    // every probe present in the list is produced
+                    for probe in &probes {
+                        if ids.binary_search(probe).is_ok() {
+                            assert!(decoded_all.contains(probe), "n={n} probe={probe}");
+                        }
+                    }
+                }
+            }
+        }
     }
 }

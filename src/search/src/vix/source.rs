@@ -806,13 +806,15 @@ impl Drop for FetchAdmissionTimer<'_> {
     }
 }
 
-/// Coalesce using the object_store gap policy, but never create a physical
-/// request larger than the process byte ceiling. The resulting total is the
-/// reservation: slices retain their coalesced owner, including gap bytes.
+/// Coalesce using the object_store gap policy capped at `max_gap`, but never
+/// create a physical request larger than the process byte ceiling. The
+/// resulting total is the reservation: slices retain their coalesced owner,
+/// including gap bytes.
 fn plan_ranges(
     ranges: &[Range<u64>],
     size: u64,
     budget: usize,
+    max_gap: u64,
 ) -> anyhow::Result<(Vec<Range<u64>>, usize)> {
     // Bound bookkeeping as well as payload. Duplicated/empty ranges must not
     // admit an unbounded Vec of Bytes behind a tiny coalesced byte total.
@@ -864,12 +866,12 @@ fn plan_ranges(
     }
     // Spend only spare budget on coalescing gaps. A batch whose payload fits
     // must split backend requests rather than fail because optional gaps do not.
+    let max_gap = max_gap.min(object_store::OBJECT_STORE_COALESCE_DEFAULT);
     let mut coalesced: Vec<Range<u64>> = Vec::with_capacity(physical.len());
     for range in physical {
         if let Some(last) = coalesced.last_mut() {
             let gap = range.start - last.end;
-            if gap <= object_store::OBJECT_STORE_COALESCE_DEFAULT && gap <= (budget - bytes) as u64
-            {
+            if gap <= max_gap && gap <= (budget - bytes) as u64 {
                 last.end = range.end;
                 bytes += gap as usize;
                 continue;
@@ -996,11 +998,12 @@ fn spawn_ranges(
     backend: Backend,
     size: u64,
     ranges: Vec<Range<u64>>,
+    max_gap: u64,
 ) -> BoxFuture<'static, anyhow::Result<Vec<Bytes>>> {
     let (mut tx, rx) = tokio::sync::oneshot::channel();
     handle.spawn(async move {
         let work = async {
-            let (physical, bytes) = plan_ranges(&ranges, size, FETCH_BYTES.limit)?;
+            let (physical, bytes) = plan_ranges(&ranges, size, FETCH_BYTES.limit, max_gap)?;
             let queue = FetchTimer {
                 start: Instant::now(),
                 path,
@@ -1129,6 +1132,13 @@ impl VixRangeSource for LadderRangeSource {
         &self,
         ranges: Vec<Range<u64>>,
     ) -> BoxFuture<'static, anyhow::Result<Vec<Bytes>>> {
+        self.fetch_many_sparse(ranges, object_store::OBJECT_STORE_COALESCE_DEFAULT)
+    }
+    fn fetch_many_sparse(
+        &self,
+        ranges: Vec<Range<u64>>,
+        max_gap: u64,
+    ) -> BoxFuture<'static, anyhow::Result<Vec<Bytes>>> {
         spawn_ranges(
             &self.handle,
             "search",
@@ -1136,6 +1146,7 @@ impl VixRangeSource for LadderRangeSource {
             self.backend.clone(),
             self.size,
             ranges,
+            max_gap,
         )
     }
     fn describe(&self) -> String {
@@ -1188,6 +1199,13 @@ impl VixRangeSource for StoreRangeSource {
         &self,
         ranges: Vec<Range<u64>>,
     ) -> BoxFuture<'static, anyhow::Result<Vec<Bytes>>> {
+        self.fetch_many_sparse(ranges, object_store::OBJECT_STORE_COALESCE_DEFAULT)
+    }
+    fn fetch_many_sparse(
+        &self,
+        ranges: Vec<Range<u64>>,
+        max_gap: u64,
+    ) -> BoxFuture<'static, anyhow::Result<Vec<Bytes>>> {
         spawn_ranges(
             &self.handle,
             "scan",
@@ -1195,6 +1213,7 @@ impl VixRangeSource for StoreRangeSource {
             self.backend.clone(),
             self.size,
             ranges,
+            max_gap,
         )
     }
     fn describe(&self) -> String {
@@ -1499,14 +1518,26 @@ mod tests {
         assert_eq!(operation.stats.bytes.load(Ordering::Relaxed), 7);
         assert_eq!(operation.stats.physical_fetches.load(Ordering::Relaxed), 1);
         assert_eq!(operation.stats.physical_bytes.load(Ordering::Relaxed), 9);
+        let default_gap = object_store::OBJECT_STORE_COALESCE_DEFAULT;
         assert!(
-            plan_ranges(&[0..11], 11, 10)
+            plan_ranges(&[0..11], 11, 10, default_gap)
                 .unwrap_err()
                 .is::<FetchBudgetExceeded>()
         );
         let overhead =
             2 * (2 * std::mem::size_of::<Bytes>() + 3 * std::mem::size_of::<Range<u64>>());
-        let (physical, bytes) = plan_ranges(&[20..22, 0..2], 22, overhead + 4).unwrap();
+        let (physical, bytes) =
+            plan_ranges(&[20..22, 0..2], 22, overhead + 4, default_gap).unwrap();
+        assert_eq!(physical, vec![0..2, 20..22]);
+        assert_eq!(bytes, overhead + 4);
+        // with budget to spare the default policy bridges the 18-byte gap
+        // into one physical read; a sparse bound narrower than the gap keeps
+        // the two windows separate and charges no gap bytes
+        let (physical, bytes) =
+            plan_ranges(&[20..22, 0..2], 22, overhead + 64, default_gap).unwrap();
+        assert_eq!(physical, vec![0..22]);
+        assert_eq!(bytes, overhead + 22);
+        let (physical, bytes) = plan_ranges(&[20..22, 0..2], 22, overhead + 64, 16).unwrap();
         assert_eq!(physical, vec![0..2, 20..22]);
         assert_eq!(bytes, overhead + 4);
     }

@@ -1660,6 +1660,17 @@ async fn search_vix_index(
                 .inc();
             return Ok((parquet_file.key.to_string(), result, false));
         }
+        // A memoized SUPERSET (a previous `has_skipped` evaluation of this
+        // condition on this file) is reusable the same way it was produced:
+        // as candidates with the filter re-applied.
+        if let Some(result) = vix_result_cache::GLOBAL_CACHE
+            .get(&superset_cache_key(&cache_key), idx_optimize_rule.as_ref())
+        {
+            metrics::VIX_RESULT_CACHE_HITS_TOTAL
+                .with_label_values::<&str>(&[])
+                .inc();
+            return Ok((parquet_file.key.to_string(), result, true));
+        }
     }
 
     // A remote-cold equality histogram uses the native docs helper: reading
@@ -2015,11 +2026,28 @@ async fn search_vix_index(
     };
 
     if !cache_key.is_empty()
-        && !has_skipped
         && result.get_memory_size() < cfg.limit.inverted_index_result_cache_max_entry_size
-        && let Some(entry) = get_cache_entry(result.clone(), idx_optimize_rule_for_cache.as_ref())
     {
-        vix_result_cache::GLOBAL_CACHE.put(cache_key, entry);
+        if !has_skipped {
+            if let Some(entry) =
+                get_cache_entry(result.clone(), idx_optimize_rule_for_cache.as_ref())
+            {
+                vix_result_cache::GLOBAL_CACHE.put(cache_key, entry);
+            }
+        } else if let VixSearchResult::RowIdsSelection {
+            row_ids,
+            row_group_size,
+        } = &result
+        {
+            // the only has_skipped shape (aggregates fall back instead):
+            // memoize the candidate rows under the superset key, so the
+            // repeat of a residual-filtered query re-applies the filter to
+            // cached candidates instead of re-reading postings
+            vix_result_cache::GLOBAL_CACHE.put(
+                superset_cache_key(&cache_key),
+                CacheEntry::RowIds(Arc::clone(row_ids), *row_group_size),
+            );
+        }
     }
     Ok((key, result, has_skipped))
 }
@@ -2471,12 +2499,14 @@ fn evaluate_vix_index(
     // The pre-clamp condition bitmap is time-independent; for straddling
     // files it is memoized under `bitmap_cache_key` so a sliding window
     // re-clamps a cached bitmap instead of re-decoding dense postings.
-    // EXACT bitmaps only: the clamp-free no-rule key is byte-identical to
-    // the MAIN result-cache key of a covered-file no-rule query on the same
-    // (condition, file), and the main hit path serves entries as exact —
-    // it has no reader open to re-derive `has_skipped`. A superset bitmap
-    // memoized here would surface there as final rows (extra rows,
-    // silently); superset evals just recompute per window instead.
+    // The clamp-free no-rule key is byte-identical to the MAIN result-cache
+    // key of a covered-file no-rule query on the same (condition, file),
+    // and the main hit path serves entries under it as exact — so EXACT
+    // bitmaps memoize under the key itself and SUPERSET bitmaps (this
+    // evaluation has `has_skipped`) under `superset_cache_key`, which the
+    // main path serves with the filter re-applied (#34). A superset
+    // evaluation may re-clamp either memo (exact ⊆ superset of itself); an
+    // exact evaluation only the exact one.
     let eval_bitmap = |reader: &VixReader| -> anyhow::Result<BooleanBuffer> {
         // M16 §4: the chunk-stats-decided equality bitmap replaces the index
         // evaluation outright (exact by construction); only the window
@@ -2489,27 +2519,32 @@ fn evaluate_vix_index(
             }
             return Ok(bitmap);
         }
-        let cached: Option<BooleanBuffer> = bitmap_cache_key.as_deref().and_then(|key| {
-            match vix_result_cache::GLOBAL_CACHE.get(key, None) {
-                Some(VixSearchResult::RowIdsSelection { row_ids, .. })
-                    if row_ids.num_rows() == reader.row_count() as usize =>
-                {
-                    // materialize the dense form for the eval pipeline; for
-                    // the sparse sets the cache holds this is cheaper than
-                    // the full-buffer deep clone it replaced
-                    Some(row_ids.to_dense())
-                }
-                Some(VixSearchResult::NoMatch) => {
-                    Some(BooleanBuffer::new_unset(reader.row_count() as usize))
-                }
-                _ => None,
+        let memo = |key: &str| match vix_result_cache::GLOBAL_CACHE.get(key, None) {
+            Some(VixSearchResult::RowIdsSelection { row_ids, .. })
+                if row_ids.num_rows() == reader.row_count() as usize =>
+            {
+                // materialize the dense form for the eval pipeline; for
+                // the sparse sets the cache holds this is cheaper than
+                // the full-buffer deep clone it replaced
+                Some(row_ids.to_dense())
             }
+            Some(VixSearchResult::NoMatch) => {
+                Some(BooleanBuffer::new_unset(reader.row_count() as usize))
+            }
+            _ => None,
+        };
+        let cached: Option<BooleanBuffer> = bitmap_cache_key.as_deref().and_then(|key| {
+            memo(key).or_else(|| {
+                has_skipped
+                    .then(|| memo(&superset_cache_key(key)))
+                    .flatten()
+            })
         });
         let mut bitmap = match cached {
             Some(bitmap) => bitmap,
             None => {
                 let bitmap = reader.eval(&query)?;
-                if !has_skipped && let Some(key) = bitmap_cache_key.as_deref() {
+                if let Some(key) = bitmap_cache_key.as_deref() {
                     let entry = CacheEntry::RowIds(
                         Arc::new(RowIdBitmap::from_dense(&bitmap)),
                         row_group_size,
@@ -2519,7 +2554,12 @@ fn evaluate_vix_index(
                             .limit
                             .inverted_index_result_cache_max_entry_size
                     {
-                        vix_result_cache::GLOBAL_CACHE.put(key.to_string(), entry);
+                        let key = if has_skipped {
+                            superset_cache_key(key)
+                        } else {
+                            key.to_string()
+                        };
+                        vix_result_cache::GLOBAL_CACHE.put(key, entry);
                     }
                 }
                 bitmap
@@ -2822,23 +2862,26 @@ fn evaluate_vix_index(
 ///
 /// - [`FieldCap::Term`] — the field's raw whole values are term-indexed in this file: conditions on
 ///   it map to index queries directly.
+/// - [`FieldCap::Tokens`] — the field is full-text indexed in this file (token terms, no whole
+///   values): equality / IN narrow to the value's tokens as a superset with the filter re-applied;
+///   other shapes skip. Decided from the field table, no dictionary probe.
 /// - [`FieldCap::Absent`] — the key-term dictionary probe proves NO document carries the field
 ///   (`VixReader::key_term_exists` is false ⇒ NULL in every row): never-TRUE-on-NULL conditions
 ///   become [`vortex_index::VixQuery::Nothing`], eliminating the file exactly instead of scanning
 ///   it.
-/// - [`FieldCap::FtsOnly`] — everything else: the file carries the field but the term index cannot
-///   serve exact-value predicates on it (fts tokens only, column-store/numeric storage, internal
-///   columns), or the probe itself failed. The condition is skipped and the DataFusion filter
-///   re-applied — never a silent miss.
+/// - [`FieldCap::Unservable`] — everything else: the file carries the field but the term index
+///   cannot serve predicates on it (column-store/numeric storage, internal columns), or the probe
+///   itself failed. The condition is skipped and the DataFusion filter re-applied — never a silent
+///   miss.
 fn field_capability(trace_id: &str, reader: &VixReader, field: &str) -> FieldCap {
     // #40 defense in depth: a column-store-only file (index=none) proves
     // NOTHING through its dictionary — key_term_exists' absence proof is
     // void, so an index-off file must never classify a field Absent (that
-    // would eliminate the file and silently drop its rows). FtsOnly keeps
+    // would eliminate the file and silently drop its rows). Unservable keeps
     // the scan fallback with the filter re-applied. (The whole-file bail in
     // evaluate_vix_index normally fires first; this guards direct callers.)
     if !reader.has_index() {
-        return FieldCap::FtsOnly;
+        return FieldCap::Unservable;
     }
     // partial first: the field may HAVE terms (they are just incomplete),
     // so trusting has_term_capability here would silently miss documents
@@ -2848,14 +2891,17 @@ fn field_capability(trace_id: &str, reader: &VixReader, field: &str) -> FieldCap
     if reader.has_term_capability(field) {
         return FieldCap::Term;
     }
+    if reader.fts_fields().contains(field) {
+        return FieldCap::Tokens;
+    }
     match reader.key_term_exists(field) {
         Ok(false) => FieldCap::Absent,
-        Ok(true) => FieldCap::FtsOnly,
+        Ok(true) => FieldCap::Unservable,
         Err(e) => {
             log::warn!(
                 "[trace_id {trace_id}] search->vix: key-term probe failed for field {field:?}: {e}; keeping the scan fallback"
             );
-            FieldCap::FtsOnly
+            FieldCap::Unservable
         }
     }
 }
@@ -3077,6 +3123,15 @@ pub fn generate_cache_key(
         parquet_file.meta.index_size,
         hasher.finish(),
     )
+}
+
+/// The result-cache key of the SUPERSET memo of `key`: the row set a
+/// `has_skipped` evaluation produced (every match plus rows the skipped
+/// conjuncts would have removed). Kept apart from the exact key so a
+/// superset can never serve as final rows (#34); a hit under this key
+/// always returns with the filter re-applied.
+pub fn superset_cache_key(key: &str) -> String {
+    format!("{key}|superset")
 }
 
 /// Whether a stream data file is a core file (the object itself is the
@@ -3715,11 +3770,12 @@ mod tests {
         assert!(decide_exact_term(101, 100, true, 35).is_err());
     }
 
-    /// Pilot fix A read-side: equality on an fts field (tokens only, no raw
-    /// values) is skipped per file with the filter added back — never a
-    /// silent empty result.
+    /// Equality on an fts field (tokens only, no raw values) narrows to the
+    /// field-scoped AND of the value's tokens per file — a superset with the
+    /// filter added back — never a silent empty result and never the exact
+    /// answer.
     #[test]
-    fn test_equality_on_fts_field_falls_back_per_file() {
+    fn test_equality_on_fts_field_narrows_to_token_superset_per_file() {
         use arrow::{
             array::{Int64Array, RecordBatch, StringArray},
             datatypes::{DataType, Field, Schema},
@@ -3768,8 +3824,9 @@ mod tests {
         assert!(!reader.has_term_capability("message"));
         assert!(reader.has_term_capability("level"));
 
-        // mixed condition: the fts equality is skipped, the term field
-        // still narrows the file
+        // mixed condition: the fts equality narrows to rows whose message
+        // carries both `hello` and `world` (row 0; row 2 has only `hello`),
+        // the term field narrows further; still a superset (filter re-applied)
         let condition = IndexCondition {
             conditions: vec![
                 Condition::Equal("message".to_string(), "hello world".to_string()),
@@ -3794,35 +3851,44 @@ mod tests {
                 has_skipped,
                 ..
             } => {
-                assert!(has_skipped, "fts equality must be skipped, not answered");
-                assert_eq!(bitmap.set_indices().collect::<Vec<_>>(), vec![0, 2]);
+                assert!(has_skipped, "a token superset is not the exact equality");
+                assert_eq!(bitmap.set_indices().collect::<Vec<_>>(), vec![0]);
             }
             _ => panic!("expected a bitmap"),
         }
 
-        // a lone fts-field equality builds no per-file query at all: the
-        // evaluation errors and the caller keeps the file for the scan with
-        // the filter re-applied (add-filter-back)
+        // a lone fts-field equality is served the same way: `world again`
+        // has no row carrying both tokens, so the file is eliminated —
+        // exactly, though still flagged as a superset evaluation
         let lone = IndexCondition {
             conditions: vec![Condition::Equal(
                 "message".to_string(),
-                "hello world".to_string(),
+                "world again".to_string(),
             )],
         };
-        assert!(
-            evaluate_vix_index(
-                "t",
-                &reader,
-                &lone,
-                None,
-                (0, 1000),
-                true,
-                None,
-                None,
-                Some(&["message".to_string()])
-            )
-            .is_err()
-        );
+        match evaluate_vix_index(
+            "t",
+            &reader,
+            &lone,
+            None,
+            (0, 1000),
+            true,
+            None,
+            None,
+            Some(&["message".to_string()]),
+        )
+        .unwrap()
+        {
+            RawVixResult::Bitmap {
+                bitmap,
+                has_skipped,
+                ..
+            } => {
+                assert!(has_skipped);
+                assert_eq!(bitmap.count_set_bits(), 0);
+            }
+            _ => panic!("expected a bitmap"),
+        }
 
         // match_all over the fts tokens is unaffected by fix A
         let match_all = IndexCondition {
@@ -6717,14 +6783,15 @@ mod ranged_parity_tests {
             }
         }
 
-        // a condition referencing ONLY a carried-but-unservable field
-        // (fts-only storage: tokens exist, raw whole values do not) errors
-        // identically in both modes (the caller adds the filter back)
-        let unservable = condition(vec![Condition::Equal("level".into(), "info".into())]);
-        let cached_err = evaluate_vix_index(
+        // a condition referencing ONLY a carried-but-not-value-indexed field
+        // (fts-only storage: tokens exist, raw whole values do not) narrows
+        // to the field-scoped token superset identically in both modes
+        // (has_skipped: the caller adds the filter back)
+        let tokens_only = condition(vec![Condition::Equal("level".into(), "info".into())]);
+        let superset = |reader: &VixReader| match evaluate_vix_index(
             "p",
-            &mem_reader,
-            &unservable,
+            reader,
+            &tokens_only,
             None,
             full_range,
             true,
@@ -6732,24 +6799,21 @@ mod ranged_parity_tests {
             None,
             Some(&["level".to_string()]),
         )
-        .err()
-        .expect("all-skipped condition must error")
-        .to_string();
-        let ranged_err = evaluate_vix_index(
-            "p",
-            &ranged_reader,
-            &unservable,
-            None,
-            full_range,
-            true,
-            None,
-            None,
-            Some(&["level".to_string()]),
-        )
-        .err()
-        .expect("all-skipped condition must error")
-        .to_string();
-        assert_eq!(cached_err, ranged_err);
+        .unwrap()
+        {
+            RawVixResult::Bitmap {
+                bitmap,
+                has_skipped,
+                ..
+            } => {
+                assert!(has_skipped, "a token superset is never served as exact");
+                bitmap.set_indices().collect::<Vec<_>>()
+            }
+            other => panic!("expected a superset bitmap, got {}", fingerprint(&other)),
+        };
+        let cached_rows = superset(&mem_reader);
+        assert!(!cached_rows.is_empty(), "the fixture carries `info` levels");
+        assert_eq!(cached_rows, superset(&ranged_reader));
 
         // sanity: the battery had real matches, not a wall of empty bitmaps
         let probe = evaluate_vix_index(
@@ -7631,8 +7695,8 @@ mod review_tests {
     use vortex_index::{VixQuery, VixReader, VixWriter, VixWriterOptions};
 
     use super::{
-        MultiResult, RawVixResult, VixSearchResult, evaluate_vix_index, generate_cache_key,
-        pruner::SimpleSelectPruner, vix_result_cache,
+        CacheEntry, MultiResult, RawVixResult, RowIdBitmap, VixSearchResult, evaluate_vix_index,
+        generate_cache_key, pruner::SimpleSelectPruner, superset_cache_key, vix_result_cache,
     };
     use crate::index::{Condition, IndexCondition};
 
@@ -7820,13 +7884,15 @@ mod review_tests {
     /// The pre-clamp bitmap memo and the main result cache share a key for
     /// (condition, rule=None, file): both reduce to
     /// `generate_cache_key(cond, &None, file, None, None)` when the file is fully
-    /// covered. The main hit path serves entries as EXACT — it has no reader
-    /// open to re-derive `has_skipped` — so a SUPERSET bitmap memoized by a
-    /// straddling-window eval would surface as final rows (extra rows) in a
-    /// later covered-window query with the same condition. Pin: superset
-    /// bitmaps are never memoized; exact ones still are.
+    /// covered. The main hit path serves entries under that key as EXACT —
+    /// it has no reader open to re-derive `has_skipped` — so a SUPERSET
+    /// bitmap must never land under it (#34). Pin: a superset eval memoizes
+    /// under `superset_cache_key` only, an exact eval under the key itself;
+    /// a later superset eval of the same shape re-clamps the superset memo
+    /// (the planted memo is served instead of a fresh evaluation) while an
+    /// exact eval ignores it.
     #[test]
-    fn superset_bitmap_is_never_memoized_under_the_collision_key() {
+    fn superset_bitmap_memoizes_under_its_own_key_only() {
         // rows ts 1000, 999, 998, 997; payload is partial (unknown-key
         // values, no term field)
         let reader = partial_payload_file(
@@ -7847,43 +7913,72 @@ mod review_tests {
                 None,
             )
         };
-
-        let key_sup = "superset-memo-collision-sup";
-        match straddle(
+        let superset_shape = || {
             vec![
                 Condition::Equal("svc".into(), "a".into()),
                 Condition::Equal("payload".into(), "ok".into()),
-            ],
-            key_sup,
-        )
-        .unwrap()
-        {
-            RawVixResult::Bitmap { has_skipped, .. } => {
-                assert!(has_skipped, "fixture must produce a superset eval");
-            }
+            ]
+        };
+        let rows = |raw: RawVixResult| match raw {
+            RawVixResult::Bitmap {
+                bitmap,
+                has_skipped,
+                ..
+            } => (bitmap.set_indices().collect::<Vec<_>>(), has_skipped),
             _ => panic!("expected a bitmap"),
-        }
+        };
+
+        let key_sup = "superset-memo-collision-sup";
+        let (clamped, has_skipped) = rows(straddle(superset_shape(), key_sup).unwrap());
+        assert!(has_skipped, "fixture must produce a superset eval");
+        assert_eq!(clamped, vec![0, 1], "svc=a rows inside [999, 2000)");
         assert!(
             vix_result_cache::GLOBAL_CACHE.get(key_sup, None).is_none(),
-            "a memoized superset bitmap would serve as EXACT on the main \
-             cache-hit path — it must never be stored"
+            "a superset bitmap under the exact key would serve as EXACT on \
+             the main cache-hit path — it must never be stored there"
         );
-
-        // control: the exact residue of the same shape still memoizes
-        let key_exact = "superset-memo-collision-exact";
-        match straddle(vec![Condition::Equal("svc".into(), "a".into())], key_exact).unwrap() {
-            RawVixResult::Bitmap { has_skipped, .. } => {
-                assert!(!has_skipped, "control eval must be exact");
+        match vix_result_cache::GLOBAL_CACHE.get(&superset_cache_key(key_sup), None) {
+            Some(VixSearchResult::RowIdsSelection { row_ids, .. }) => {
+                assert_eq!(
+                    row_ids.iter().collect::<Vec<_>>(),
+                    vec![0, 1],
+                    "the pre-clamp superset (svc=a) under the superset key"
+                );
             }
-            _ => panic!("expected a bitmap"),
+            other => panic!("superset memo missing: {other:?}"),
         }
-        assert!(
-            matches!(
-                vix_result_cache::GLOBAL_CACHE.get(key_exact, None),
-                Some(VixSearchResult::RowIdsSelection { .. })
-            ),
-            "exact pre-clamp bitmaps must keep memoizing"
+
+        // a superset eval re-clamps the superset memo: plant a different
+        // set and observe it served
+        vix_result_cache::GLOBAL_CACHE.put(
+            superset_cache_key(key_sup),
+            CacheEntry::RowIds(Arc::new(RowIdBitmap::from_row_ids(4, [1u32, 3])), None),
         );
+        let (clamped, has_skipped) = rows(straddle(superset_shape(), key_sup).unwrap());
+        assert!(has_skipped);
+        assert_eq!(clamped, vec![1], "row 3 (ts 997) is clamped away");
+
+        // an exact eval of a shape sharing the key never reads the superset
+        // memo: it evaluates, and memoizes under the exact key
+        let key_exact = "superset-memo-collision-exact";
+        vix_result_cache::GLOBAL_CACHE.put(
+            superset_cache_key(key_exact),
+            CacheEntry::RowIds(Arc::new(RowIdBitmap::from_row_ids(4, [3u32])), None),
+        );
+        let (clamped, has_skipped) =
+            rows(straddle(vec![Condition::Equal("svc".into(), "a".into())], key_exact).unwrap());
+        assert!(!has_skipped, "control eval must be exact");
+        assert_eq!(
+            clamped,
+            vec![0, 1],
+            "evaluated, not served from the superset memo"
+        );
+        match vix_result_cache::GLOBAL_CACHE.get(key_exact, None) {
+            Some(VixSearchResult::RowIdsSelection { row_ids, .. }) => {
+                assert_eq!(row_ids.iter().collect::<Vec<_>>(), vec![0, 1]);
+            }
+            other => panic!("exact pre-clamp bitmaps must keep memoizing: {other:?}"),
+        }
     }
 
     /// One-batch core file with a full-text field `message` (tokens only).

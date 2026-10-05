@@ -295,6 +295,27 @@ impl<T> Admitted<Vec<T>> {
     }
 }
 
+/// One terms-table cell as read by the batched AND intersection.
+enum TermCell {
+    /// `doc_count == 0`: nothing to decode.
+    Empty,
+    /// Dense elision (`doc_count == row_count`, empty blob): all rows.
+    Dense,
+    /// In-row postings blob (rare term): decodes with no further IO.
+    Inline { doc_count: u64, blob: Bytes },
+    /// Out-of-row record addressed by a plist pointer cell (`offset, end`).
+    Pointer { doc_count: u64, window: (u64, u64) },
+}
+
+/// One AND leaf after the terms scan: the union-position of each of its
+/// cells, its summed `doc_count` (selectivity estimate), and whether any
+/// cell lives out-of-row.
+struct LeafPlan {
+    cells: Vec<usize>,
+    docs: u64,
+    pointer: bool,
+}
+
 /// Cold read plan (D1): a field's contiguous dictionary key-block run is
 /// fetched whole in the field-scoped bundle up to this many bytes; a wider
 /// run contributes only the predecessor blocks of the keys being resolved,
@@ -3825,8 +3846,8 @@ impl VixReader {
         }
     }
 
-    /// A stage consists only of adjacent compatible point leaves. AND keeps
-    /// named predicates individual, preserving missing-leaf short circuiting.
+    /// A stage consists only of adjacent compatible point leaves (the OR and
+    /// count paths; AND plans every leaf class in one wave instead).
     fn point_run_end(subs: &[VixQuery], start: usize, named: bool) -> Result<usize> {
         let mut end = start;
         while end < subs.len() {
@@ -3885,6 +3906,20 @@ impl VixReader {
         fields: &[u16],
         broad: bool,
     ) -> Result<Admitted<Vec<Admitted<Vec<u64>>>>> {
+        self.resolve_points_in(tokens, fields, broad, |_, _| true)
+    }
+
+    /// [`Self::resolve_points`] where `admit(leaf, field)` selects which of
+    /// `fields` each token leaf is looked up in — one dictionary wave for
+    /// leaves of different scopes (named `field = v` points, token leaves
+    /// under several `FullText` scopes).
+    fn resolve_points_in(
+        &self,
+        tokens: &[&[u8]],
+        fields: &[u16],
+        broad: bool,
+        admit: impl Fn(usize, u16) -> bool,
+    ) -> Result<Admitted<Vec<Admitted<Vec<u64>>>>> {
         const BATCH_BYTES: u64 = 8 * 1024 * 1024;
         const BATCH_TARGETS: usize = 4096;
         let mut out = self.query_vec(tokens.len())?;
@@ -3936,6 +3971,9 @@ impl VixReader {
             };
             for &leaf in &order.value {
                 check_read_cancelled()?;
+                if !admit(leaf, fid) {
+                    continue;
+                }
                 write_composite(&mut key.value, tokens[leaf], fid);
                 let Some(block) = index.predecessor_block(&key.value)? else {
                     continue;
@@ -4196,78 +4234,148 @@ impl VixReader {
         }
     }
 
-    /// Evaluate an AND with leaf short-circuiting.
+    /// Evaluate an AND with leaf short-circuiting and batched IO.
     ///
-    /// Leaf children resolve their term ordinals through the dictionary
-    /// first — **zero postings IO**. If any leaf matches no term the
-    /// intersection is provably empty and no postings are ever read (the
-    /// dominant case for needle-in-haystack compounds: a per-file miss of the
-    /// rare term must not pay the common term's postings decode). Remaining
-    /// leaves evaluate rarest-first (fewest matched terms), AND-ing with an
-    /// early exit as soon as the accumulator goes empty; composite children
-    /// (`And`/`Or`/`Not`) evaluate last. An empty child list is `All`.
+    /// Nested `And`s — including field-scoped `FullText { And(..) }`
+    /// children, which carry their own token scope — are flattened so every
+    /// conjunct of the predicate plans together. Leaves resolve their term
+    /// ordinals through the dictionary first, **zero postings IO**, in three
+    /// waves: every named point leaf (`field = v`, key existence) in one
+    /// batched block read, then every token leaf of every scope in one
+    /// batched read, then dictionary-walking leaves (prefix/regex/fuzzy/
+    /// contains) one by one. A leaf matching no term ends the evaluation
+    /// before the next wave, so a per-file miss of the selective predicate
+    /// never pays the token dictionary, and a missing token never pays any
+    /// postings read. The surviving leaves intersect through
+    /// [`Self::intersect_leaves`]: ONE terms-table read for all ordinals,
+    /// `doc_count`-ordered evaluation, and at most two batched plist waves.
+    /// Composite children (`Or`/`Not`, other `FullText` shapes) evaluate
+    /// last. An empty child list is `All`.
     fn eval_and(&self, subs: &[VixQuery], scope: Option<&[u16]>) -> Result<BooleanBuffer> {
         let len = self.row_count as usize;
-        let mut leaves = self.query_vec::<Admitted<Vec<u64>>>(subs.len())?;
-        let mut composites = self.query_vec::<&VixQuery>(subs.len())?;
-        let mut next = 0;
-        while next < subs.len() {
-            check_read_cancelled()?;
-            // Only adjacent active token leaves share planning. In particular,
-            // never prefetch through a narrow predicate or a boolean boundary.
-            let end = Self::point_run_end(subs, next, false)?;
-            if end > next {
-                let resolved = self.resolve_point_run(&subs[next..end], scope)?;
-                for ordinals in resolved.value {
-                    if ordinals.value.is_empty() {
-                        return Ok(BooleanBuffer::new_unset(len));
-                    }
-                    leaves.value.push(ordinals);
-                }
-                next = end;
-                continue;
+        // scopes[0] is the inherited scope; flattened `FullText` children
+        // append theirs and reference it by index
+        let mut scopes = self.query_vec::<Admitted<Vec<u16>>>(1)?;
+        let mut flat = self.query_vec::<(&VixQuery, usize)>(subs.len())?;
+        self.flatten_and(subs, 0, &mut flat, &mut scopes)?;
+        let scope_of = |index: usize| -> Option<&[u16]> {
+            if index == 0 {
+                scope
+            } else {
+                Some(scopes.value[index - 1].value.as_slice())
             }
-            match &subs[next] {
+        };
+        let mut leaves = self.query_vec::<Admitted<Vec<u64>>>(flat.value.len())?;
+        let mut composites = self.query_vec::<(&VixQuery, usize)>(flat.value.len())?;
+        let mut points = self.query_vec::<&VixQuery>(flat.value.len())?;
+        let mut tokens = self.query_vec::<(&[u8], usize)>(flat.value.len())?;
+        let mut scans = self.query_vec::<(&VixQuery, usize)>(flat.value.len())?;
+        for &(sub, scope_index) in flat.value.iter() {
+            check_read_cancelled()?;
+            match sub {
                 VixQuery::All => {}
-                sub @ (VixQuery::And(_)
+                VixQuery::Nothing => return Ok(BooleanBuffer::new_unset(len)),
+                VixQuery::Exact { .. } | VixQuery::KeyExists { .. } => points.push(sub)?,
+                VixQuery::TokenAnyField { token } => {
+                    tokens.push((token.as_slice(), scope_index))?
+                }
+                VixQuery::And(_)
                 | VixQuery::Or(_)
                 | VixQuery::Not(_)
-                | VixQuery::FullText { .. }) => composites.value.push(sub),
-                leaf => {
-                    let ordinals = self.collect_ordinals(leaf, scope)?;
-                    if ordinals.value.is_empty() {
-                        return Ok(BooleanBuffer::new_unset(len));
+                | VixQuery::FullText { .. } => {
+                    composites.push((sub, scope_index))?;
+                }
+                scan => scans.push((scan, scope_index))?,
+            }
+        }
+        // wave 1: named point leaves, one block fetch for all of them
+        if !points.value.is_empty() {
+            let mut keys = self.query_vec::<&[u8]>(points.value.len())?;
+            let mut fids = self.query_vec::<u16>(points.value.len())?;
+            for sub in points.value.iter() {
+                check_read_cancelled()?;
+                let (token, fid) = match sub {
+                    VixQuery::Exact { field, token } => {
+                        (token.as_slice(), self.require_field_id(field)?)
                     }
-                    leaves.value.push(ordinals);
+                    VixQuery::KeyExists { path } => (path.as_bytes(), KEY_FIELD_ID),
+                    _ => unreachable!("points hold Exact and KeyExists only"),
+                };
+                keys.push(token)?;
+                fids.push(fid)?;
+            }
+            let mut fields = self.query_vec::<u16>(fids.value.len())?;
+            for &fid in fids.value.iter() {
+                fields.push(fid)?;
+            }
+            fields.value.sort_unstable();
+            fields.value.dedup();
+            let resolved =
+                self.resolve_points_in(&keys.value, &fields.value, false, |leaf, fid| {
+                    fids.value[leaf] == fid
+                })?;
+            for ordinals in resolved.value {
+                if ordinals.value.is_empty() {
+                    return Ok(BooleanBuffer::new_unset(len));
+                }
+                leaves.push(ordinals)?;
+            }
+        }
+        // wave 2: every token leaf of every scope, one block fetch
+        if !tokens.value.is_empty() {
+            let mut keys = self.query_vec::<&[u8]>(tokens.value.len())?;
+            let mut fields = self.query_vec::<u16>(0)?;
+            let mut broad = false;
+            for &(token, scope_index) in tokens.value.iter() {
+                check_read_cancelled()?;
+                keys.push(token)?;
+                match scope_of(scope_index) {
+                    None => broad = true,
+                    Some(fids) => {
+                        for &fid in fids {
+                            fields.push(fid)?;
+                        }
+                    }
                 }
             }
-            next += 1;
-        }
-        // fewest matched terms first: the cheapest selectivity proxy that
-        // needs no doc_count reads (needles resolve to a single term)
-        {
-            let _pending = self.memory.reserve(
-                leaves
-                    .value
-                    .len()
-                    .saturating_mul(std::mem::size_of::<Admitted<Vec<u64>>>()),
-            )?;
-            leaves.value.sort_by_key(|ordinals| ordinals.value.len());
-        }
-        let mut acc: Option<BooleanBuffer> = None;
-        for ordinals in leaves.value {
-            let bitmap = self.postings_union(ordinals.value)?;
-            let next = match &acc {
-                Some(prev) => prev & &bitmap,
-                None => bitmap,
-            };
-            if next.count_set_bits() == 0 {
-                return Ok(next);
+            if broad {
+                for &fid in &self.indexed_field_ids {
+                    fields.push(fid)?;
+                }
             }
-            acc = Some(next);
+            fields.value.sort_unstable();
+            fields.value.dedup();
+            let resolved = self.resolve_points_in(
+                &keys.value,
+                &fields.value,
+                broad,
+                |leaf, fid| match scope_of(tokens.value[leaf].1) {
+                    None => true,
+                    Some(fids) => fids.binary_search(&fid).is_ok(),
+                },
+            )?;
+            for ordinals in resolved.value {
+                if ordinals.value.is_empty() {
+                    return Ok(BooleanBuffer::new_unset(len));
+                }
+                leaves.push(ordinals)?;
+            }
         }
-        for sub in composites.value {
-            let bitmap = self.eval_query(sub, scope)?;
+        // wave 3: prefix / regex / fuzzy / contains walk dictionary ranges —
+        // only once every cheaper leaf proved present
+        for &(scan, scope_index) in scans.value.iter() {
+            let ordinals = self.collect_ordinals(scan, scope_of(scope_index))?;
+            if ordinals.value.is_empty() {
+                return Ok(BooleanBuffer::new_unset(len));
+            }
+            leaves.push(ordinals)?;
+        }
+        let mut acc = self.intersect_leaves(leaves)?;
+        if acc.as_ref().is_some_and(|acc| acc.count_set_bits() == 0) {
+            return Ok(acc.expect("checked"));
+        }
+        for &(sub, scope_index) in composites.value.iter() {
+            let bitmap = self.eval_query(sub, scope_of(scope_index))?;
             let next = match &acc {
                 Some(prev) => prev & &bitmap,
                 None => bitmap,
@@ -4278,6 +4386,490 @@ impl VixReader {
             acc = Some(next);
         }
         Ok(acc.unwrap_or_else(|| BooleanBuffer::new_set(len)))
+    }
+
+    /// Splice nested `And` children into one conjunct list, preserving
+    /// order. A `FullText { fields, query }` child whose query is an `And`
+    /// or a single token leaf is spliced too, under its own resolved scope
+    /// (appended to `scopes`; index = position + 1, 0 being the inherited
+    /// scope); other `FullText` shapes stay composite.
+    fn flatten_and<'q>(
+        &self,
+        subs: &'q [VixQuery],
+        scope_index: usize,
+        out: &mut Admitted<Vec<(&'q VixQuery, usize)>>,
+        scopes: &mut Admitted<Vec<Admitted<Vec<u16>>>>,
+    ) -> Result<()> {
+        for sub in subs {
+            check_read_cancelled()?;
+            match sub {
+                VixQuery::And(inner) => self.flatten_and(inner, scope_index, out, scopes)?,
+                VixQuery::FullText { fields, query }
+                    if matches!(
+                        query.as_ref(),
+                        VixQuery::And(_) | VixQuery::TokenAnyField { .. }
+                    ) =>
+                {
+                    scopes.push(self.fulltext_scope(fields)?)?;
+                    let inner_scope = scopes.value.len();
+                    match query.as_ref() {
+                        VixQuery::And(inner) => {
+                            self.flatten_and(inner, inner_scope, out, scopes)?
+                        }
+                        leaf => out.push((leaf, inner_scope))?,
+                    }
+                }
+                other => out.push((other, scope_index))?,
+            }
+        }
+        Ok(())
+    }
+
+    /// Intersect resolved AND leaves. `None` when no leaf constrains the
+    /// result (no leaves, or only dense-elided terms).
+    ///
+    /// IO shape per file, independent of the leaf count: one terms-table
+    /// scan over the union of all ordinals (every leaf's `doc_count` and
+    /// cell), then wave A — the full records of the rarest out-of-row leaf
+    /// plus, for the others, either the full record (small, or dense
+    /// relative to the accumulator bound) or just its skip-table header —
+    /// then wave B — only the skip groups the accumulator can still touch.
+    /// Inline cells (rare terms) decode from the terms scan with no further
+    /// IO and are applied first, so a rare token or value shrinks the
+    /// accumulator before any dense list is read.
+    fn intersect_leaves(
+        &self,
+        leaves: Admitted<Vec<Admitted<Vec<u64>>>>,
+    ) -> Result<Option<BooleanBuffer>> {
+        /// Records at or below this size are always read whole: a header
+        /// probe would not save a meaningful amount of bytes.
+        const SMALL_RECORD_BYTES: u64 = 16 * 1024;
+        /// Partial reads need the accumulator bound to be at most this
+        /// fraction of the record's skip groups (expected touched share
+        /// ≈ 1 − e^(−bound/groups) ≤ 22%).
+        const PARTIAL_GROUP_RATIO: u64 = 4;
+        /// Plist windows are fetched sparsely: the backend may merge windows
+        /// separated by at most this many bytes (a few untouched skip groups,
+        /// a neighbouring small record), never the unrelated records or the
+        /// record body between selected groups.
+        const PLIST_FETCH_GAP_BYTES: u64 = 16 * 1024;
+
+        let len = self.row_count as usize;
+        let bitmap_bytes = len.div_ceil(8);
+        let mut leaves = leaves;
+        for leaf in leaves.value.iter_mut() {
+            leaf.value.sort_unstable();
+            leaf.value.dedup();
+            for &ordinal in &leaf.value {
+                if ordinal >= self.term_count {
+                    return Err(VixError::OrdinalOutOfRange {
+                        ordinal,
+                        term_count: self.term_count,
+                    });
+                }
+            }
+        }
+        // identical leaves (`status AND status`) evaluate once, and a leaf
+        // whose ordinals are a subset of another's implies it under AND
+        // (the same token under a narrower `FullText` scope): the wider
+        // leaf is dropped without reading its extra postings
+        leaves.value.sort_by(|a, b| a.value.cmp(&b.value));
+        leaves.value.dedup_by(|a, b| a.value == b.value);
+        let implied: Vec<bool> = leaves
+            .value
+            .iter()
+            .enumerate()
+            .map(|(wide, candidate)| {
+                leaves.value.iter().enumerate().any(|(narrow, subset)| {
+                    narrow != wide
+                        && subset.value.len() < candidate.value.len()
+                        && subset
+                            .value
+                            .iter()
+                            .all(|ordinal| candidate.value.binary_search(ordinal).is_ok())
+                })
+            })
+            .collect();
+        let mut keep = implied.iter();
+        leaves
+            .value
+            .retain(|_| !*keep.next().expect("one flag per leaf"));
+        if leaves.value.is_empty() {
+            return Ok(None);
+        }
+
+        // one terms-table read for every ordinal of every leaf
+        let mut union = self.query_vec::<u64>(leaves.value.iter().map(|l| l.value.len()).sum())?;
+        for leaf in &leaves.value {
+            for &ordinal in &leaf.value {
+                union.push(ordinal)?;
+            }
+        }
+        union.value.sort_unstable();
+        union.value.dedup();
+        let terms_blob = self
+            .terms_blob
+            .as_ref()
+            .ok_or_else(|| VixError::Malformed("missing terms blob".to_string()))?;
+        let _scope = self.memory.enter();
+        // Point cells of leaves from different fields sit far apart in the
+        // field-major terms table; with the object-store gap policy (1 MiB)
+        // the untouched chunks between them would be fetched too. A small
+        // gap merges each touched chunk's adjacent `doc_count` + `postings`
+        // segments into one request and nothing else, so the scan stays
+        // one wave (≤ 8 chunks in flight) at the touched chunks' bytes.
+        const TERMS_POINT_GAP_BYTES: u64 = 16 * 1024;
+        let batches = crate::source::with_coalesce_distance(TERMS_POINT_GAP_BYTES, || {
+            scan_blob(
+                terms_blob,
+                Some(&["doc_count", "postings"]),
+                RowSelection::Indices(union.value.clone()),
+            )
+        })?;
+        let mut cells = self.query_vec::<TermCell>(union.value.len())?;
+        let mut inline_bytes = 0usize;
+        for batch in &batches {
+            check_read_cancelled()?;
+            let doc_counts = column_u64(batch, "doc_count")?;
+            let postings = column_binary(batch, "postings")?;
+            for (row, &doc_count) in doc_counts.iter().enumerate() {
+                if doc_count > self.row_count {
+                    return Err(VixError::Malformed(format!(
+                        "doc_count {doc_count} exceeds row_count {}",
+                        self.row_count
+                    )));
+                }
+                let blob = postings.value(row);
+                let cell = if doc_count == 0 {
+                    TermCell::Empty
+                } else if blob.is_empty() {
+                    if doc_count != self.row_count {
+                        return Err(VixError::Malformed(format!(
+                            "empty postings blob for a term with doc_count {doc_count} != \
+                             row_count {} (not dense-elided, so corrupt)",
+                            self.row_count
+                        )));
+                    }
+                    TermCell::Dense
+                } else if self.plist_pointer_cell(doc_count, blob) {
+                    let (offset, end) = self.plist_pointer_window(blob)?;
+                    TermCell::Pointer {
+                        doc_count,
+                        window: (offset, end),
+                    }
+                } else {
+                    inline_bytes += blob.len();
+                    let _pending = self.memory.reserve(blob.len())?;
+                    TermCell::Inline {
+                        doc_count,
+                        blob: Bytes::copy_from_slice(blob),
+                    }
+                };
+                cells.push(cell)?;
+            }
+        }
+        let _inline = self.memory.reserve(inline_bytes)?;
+        if cells.value.len() != union.value.len() {
+            return Err(VixError::Malformed(format!(
+                "terms point read returned {} rows, expected {}",
+                cells.value.len(),
+                union.value.len()
+            )));
+        }
+
+        // per leaf: its cells, its docs estimate; dense leaves constrain
+        // nothing; a leaf of only empty cells empties the intersection
+        let mut plans = self.query_vec::<LeafPlan>(leaves.value.len())?;
+        for leaf in &leaves.value {
+            let mut plan = LeafPlan {
+                cells: Vec::with_capacity(leaf.value.len()),
+                docs: 0,
+                pointer: false,
+            };
+            let mut dense = false;
+            for &ordinal in &leaf.value {
+                let index = union
+                    .value
+                    .binary_search(&ordinal)
+                    .expect("leaf ordinal is in the union");
+                match &cells.value[index] {
+                    TermCell::Dense => dense = true,
+                    TermCell::Empty => {}
+                    TermCell::Inline { doc_count, .. } => plan.docs += doc_count,
+                    TermCell::Pointer { doc_count, .. } => {
+                        plan.docs += doc_count;
+                        plan.pointer = true;
+                    }
+                }
+                plan.cells.push(index);
+            }
+            if dense {
+                continue;
+            }
+            if plan.docs == 0 {
+                return Ok(Some(BooleanBuffer::new_unset(len)));
+            }
+            plans.push(plan)?;
+        }
+        if plans.value.is_empty() {
+            return Ok(None);
+        }
+        // rarest first: the exact selectivity, not the matched-term count
+        plans.value.sort_by_key(|plan| plan.docs);
+
+        let _bitmaps = self.memory.reserve(bitmap_bytes.saturating_mul(2))?;
+        let mut acc: Option<BooleanBuffer> = None;
+        let and_into = |acc: &mut Option<BooleanBuffer>, bitmap: BooleanBuffer| -> bool {
+            let next = match acc.as_ref() {
+                Some(prev) => prev & &bitmap,
+                None => bitmap,
+            };
+            let empty = next.count_set_bits() == 0;
+            *acc = Some(next);
+            empty
+        };
+
+        // phase 1: inline-only leaves — zero further IO
+        let mut pending = Vec::with_capacity(plans.value.len());
+        for plan in plans.value.iter() {
+            if plan.pointer {
+                pending.push(plan);
+                continue;
+            }
+            let mut builder = BooleanBufferBuilder::new(len);
+            builder.append_n(len, false);
+            for &index in &plan.cells {
+                if let TermCell::Inline { doc_count, blob } = &cells.value[index] {
+                    self.decode_postings_into(blob, *doc_count, &mut builder)?;
+                }
+            }
+            if and_into(&mut acc, builder.finish()) {
+                return Ok(acc);
+            }
+        }
+        if pending.is_empty() {
+            return Ok(acc);
+        }
+
+        // phase 2 / wave A: the rarest out-of-row leaf whole; every other
+        // record whole when small or dense relative to the accumulator
+        // bound, else only its skip-table header
+        let bound = match &acc {
+            Some(acc) => acc.count_set_bits() as u64,
+            None => pending[0].docs,
+        };
+        let mut wave_a: Vec<std::ops::Range<u64>> = Vec::new();
+        // (plan index in `pending`, cell index, full?) in wave A order; a
+        // cell shared by several leaves (the same token under two scopes)
+        // is fetched once
+        let mut wave_a_slots: Vec<(usize, usize, bool)> = Vec::new();
+        let mut planned: HashSet<usize> = HashSet::new();
+        for (position, plan) in pending.iter().enumerate() {
+            for &index in &plan.cells {
+                let TermCell::Pointer { doc_count, window } = &cells.value[index] else {
+                    continue;
+                };
+                if !planned.insert(index) {
+                    continue;
+                }
+                let record_len = window.1 - window.0;
+                let entries = (*doc_count as usize / postings::BLOCK_LEN)
+                    .div_ceil(postings::SKIP_STRIDE) as u64;
+                let first = position == 0 && acc.is_none();
+                let full = first
+                    || record_len <= SMALL_RECORD_BYTES
+                    || bound.saturating_mul(PARTIAL_GROUP_RATIO) > entries;
+                let fetch = if full {
+                    window.0..window.1
+                } else {
+                    window.0..window.0 + postings::record_header_len_for(*doc_count as usize) as u64
+                };
+                wave_a.push(fetch);
+                wave_a_slots.push((position, index, full));
+            }
+        }
+        let fetched_a = self.plist_windows_batch(&wave_a, PLIST_FETCH_GAP_BYTES)?;
+        let mut record_of: HashMap<usize, Bytes> = HashMap::with_capacity(wave_a_slots.len());
+        let mut header_of: HashMap<usize, Bytes> = HashMap::new();
+        for ((_, index, full), bytes) in wave_a_slots.iter().zip(fetched_a) {
+            if *full {
+                record_of.insert(*index, bytes);
+            } else {
+                header_of.insert(*index, bytes);
+            }
+        }
+        // leaves complete after wave A apply now, rarest first
+        let mut partial_leaves = Vec::new();
+        for plan in pending.iter() {
+            if plan.cells.iter().any(|index| header_of.contains_key(index)) {
+                partial_leaves.push(plan);
+                continue;
+            }
+            let mut builder = BooleanBufferBuilder::new(len);
+            builder.append_n(len, false);
+            for &index in &plan.cells {
+                match &cells.value[index] {
+                    TermCell::Inline { doc_count, blob } => {
+                        self.decode_postings_into(blob, *doc_count, &mut builder)?;
+                    }
+                    TermCell::Pointer { doc_count, .. } => {
+                        let record = &record_of[&index];
+                        let blob = postings::record_blob(record)?;
+                        self.decode_postings_into(blob, *doc_count, &mut builder)?;
+                    }
+                    TermCell::Empty | TermCell::Dense => {}
+                }
+            }
+            if and_into(&mut acc, builder.finish()) {
+                return Ok(acc);
+            }
+        }
+        if partial_leaves.is_empty() {
+            return Ok(acc);
+        }
+
+        // phase 3 / wave B: the skip groups the accumulator can still touch,
+        // across every partial record, in one batched fetch
+        let acc_bits = acc.as_ref().expect("partial reads follow a full leaf");
+        let mut wave_b: Vec<std::ops::Range<u64>> = Vec::new();
+        // per partial cell: its planned windows and their slots in wave B
+        let mut group_plans: HashMap<usize, Vec<(postings::GroupWindow, usize)>> = HashMap::new();
+        for plan in &partial_leaves {
+            for &index in &plan.cells {
+                if group_plans.contains_key(&index) {
+                    continue;
+                }
+                let Some(header) = header_of.get(&index) else {
+                    continue;
+                };
+                let TermCell::Pointer { doc_count, window } = &cells.value[index] else {
+                    unreachable!("headers are fetched for pointer cells only");
+                };
+                let record_len = (window.1 - window.0) as usize;
+                let windows = postings::plan_groups(
+                    header,
+                    record_len,
+                    *doc_count as usize,
+                    acc_bits.set_indices().map(|row| row as u32),
+                )?;
+                let mut slots = Vec::with_capacity(windows.len());
+                for group in windows {
+                    wave_b.push(
+                        window.0 + group.range.start as u64..window.0 + group.range.end as u64,
+                    );
+                    slots.push((group, wave_b.len() - 1));
+                }
+                group_plans.insert(index, slots);
+            }
+        }
+        let fetched_b = self.plist_windows_batch(&wave_b, PLIST_FETCH_GAP_BYTES)?;
+        for plan in partial_leaves {
+            let mut builder = BooleanBufferBuilder::new(len);
+            builder.append_n(len, false);
+            for &index in &plan.cells {
+                match &cells.value[index] {
+                    TermCell::Inline { doc_count, blob } => {
+                        self.decode_postings_into(blob, *doc_count, &mut builder)?;
+                    }
+                    TermCell::Pointer { doc_count, window } => {
+                        if let Some(record) = record_of.get(&index) {
+                            let blob = postings::record_blob(record)?;
+                            self.decode_postings_into(blob, *doc_count, &mut builder)?;
+                            continue;
+                        }
+                        let header = &header_of[&index];
+                        let record_len = (window.1 - window.0) as usize;
+                        for (group, slot) in &group_plans[&index] {
+                            let mut decoded = 0usize;
+                            postings::for_each_in_groups(
+                                header,
+                                record_len,
+                                *doc_count as usize,
+                                group,
+                                &fetched_b[*slot],
+                                |doc| {
+                                    if decoded % 4096 == 0 {
+                                        check_read_cancelled()?;
+                                    }
+                                    decoded += 1;
+                                    if u64::from(doc) >= self.row_count {
+                                        return Err(VixError::Malformed(format!(
+                                            "postings doc id {doc} out of range (row_count {})",
+                                            self.row_count
+                                        )));
+                                    }
+                                    builder.set_bit(doc as usize, true);
+                                    Ok(())
+                                },
+                            )?;
+                        }
+                    }
+                    TermCell::Empty | TermCell::Dense => {}
+                }
+            }
+            if and_into(&mut acc, builder.finish()) {
+                return Ok(acc);
+            }
+        }
+        Ok(acc)
+    }
+
+    /// Decode one inline cell or stripped record blob into `builder`.
+    fn decode_postings_into(
+        &self,
+        blob: &[u8],
+        doc_count: u64,
+        builder: &mut BooleanBufferBuilder,
+    ) -> Result<()> {
+        let mut decoded = 0usize;
+        postings::decode_each(blob, doc_count as usize, |doc| {
+            if decoded % 4096 == 0 {
+                check_read_cancelled()?;
+            }
+            decoded += 1;
+            if u64::from(doc) >= self.row_count {
+                return Err(VixError::Malformed(format!(
+                    "postings doc id {doc} out of range (row_count {})",
+                    self.row_count
+                )));
+            }
+            builder.set_bit(doc as usize, true);
+            Ok(())
+        })
+    }
+
+    /// Fetch plist-blob byte windows in one batched round trip (records,
+    /// skip headers or skip-group runs alike); positional. Backend
+    /// coalescing is bounded by `max_gap`: the windows are sparse by
+    /// construction and must not drag in the records or record bodies
+    /// between them.
+    fn plist_windows_batch(
+        &self,
+        windows: &[std::ops::Range<u64>],
+        max_gap: u64,
+    ) -> Result<Vec<Bytes>> {
+        if windows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let handle = self.plist_blob.as_ref().ok_or_else(|| {
+            VixError::Malformed("postings pointer cell in a file without a plist blob".to_string())
+        })?;
+        match handle {
+            BlobHandle::Mem(bytes) => Ok(windows
+                .iter()
+                .map(|window| bytes.slice(window.start as usize..window.end as usize))
+                .collect()),
+            BlobHandle::Ranged(ranged) => crate::source::block_fetch_many_sparse(
+                ranged.source.as_ref(),
+                windows
+                    .iter()
+                    .map(|window| {
+                        ranged.range.start + window.start..ranged.range.start + window.end
+                    })
+                    .collect(),
+                max_gap,
+            ),
+        }
     }
 
     fn count_inner(&self, query: &VixQuery, scope: Option<&[u16]>) -> Result<u64> {

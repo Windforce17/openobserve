@@ -15002,3 +15002,9 @@ mod disjoint_proof;
 
 #[path = "tests/dictionary_points.rs"]
 mod dictionary_points;
+
+#[path = "tests/and_io_bench.rs"]
+mod and_io_bench;
+
+#[path = "tests/and_intersection.rs"]
+mod and_intersection;

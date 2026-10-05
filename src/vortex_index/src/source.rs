@@ -93,7 +93,9 @@ pub trait VixReadOperation: Send + Sync {
 
 thread_local! {
     static READ_OPERATION: RefCell<Option<Arc<dyn VixReadOperation>>> = const { RefCell::new(None) };
-    static EXACT_RANGES: Cell<bool> = const { Cell::new(false) };
+    /// Scan-local override of the vortex coalescing gap (`None` = the
+    /// object-store default of 1 MiB).
+    static COALESCE_DISTANCE: Cell<Option<u64>> = const { Cell::new(None) };
     static READER_MEMORY: RefCell<Option<Arc<crate::reader::ReaderMemory>>> = const { RefCell::new(None) };
     /// Windows prefetched for ONE ranged blob (identified by its footer
     /// state) by the operation running on this thread.
@@ -200,15 +202,23 @@ pub fn with_read_operation<T>(operation: Arc<dyn VixReadOperation>, work: impl F
 
 /// Count metadata is physically interleaved with large postings segments.
 /// Coalesce adjacent count reads, but never pay for an unrequested gap.
-/// The flag is captured by the ephemeral IO bridge, not cached footers.
+/// The setting is captured by the ephemeral IO bridge, not cached footers.
 pub(crate) fn with_exact_range_reads<T>(work: impl FnOnce() -> T) -> T {
-    struct Restore(bool);
+    with_coalesce_distance(0, work)
+}
+
+/// Run `work` with vortex segment coalescing limited to gaps of at most
+/// `distance` bytes: point reads of a few cells spread over a blob merge
+/// each chunk's adjacent column segments into one request without
+/// fetching the untouched chunks between them.
+pub(crate) fn with_coalesce_distance<T>(distance: u64, work: impl FnOnce() -> T) -> T {
+    struct Restore(Option<u64>);
     impl Drop for Restore {
         fn drop(&mut self) {
-            EXACT_RANGES.with(|slot| slot.set(self.0));
+            COALESCE_DISTANCE.with(|slot| slot.set(self.0));
         }
     }
-    let _restore = Restore(EXACT_RANGES.with(|slot| slot.replace(true)));
+    let _restore = Restore(COALESCE_DISTANCE.with(|slot| slot.replace(Some(distance))));
     work()
 }
 
@@ -400,6 +410,18 @@ pub trait VixRangeSource: Send + Sync + 'static {
         })
     }
 
+    /// [`VixRangeSource::fetch_many`] for sparse windows: a coalescing
+    /// backend must not merge two ranges across a gap wider than `max_gap`
+    /// bytes. The default ignores the bound (correct, but a coalescing
+    /// source then fetches the gaps too).
+    fn fetch_many_sparse(
+        &self,
+        ranges: Vec<Range<u64>>,
+        _max_gap: u64,
+    ) -> BoxFuture<'static, anyhow::Result<Vec<Bytes>>> {
+        self.fetch_many(ranges)
+    }
+
     /// A short description of the object (e.g. its storage path), used in
     /// error messages.
     fn describe(&self) -> String {
@@ -420,6 +442,26 @@ pub(crate) fn block_fetch_many(
     source: &dyn VixRangeSource,
     ranges: Vec<Range<u64>>,
 ) -> Result<Vec<Bytes>> {
+    block_fetch_many_with(source, ranges, None)
+}
+
+/// [`block_fetch_many`] for SPARSE windows: the backend may still merge
+/// neighbouring ranges into one physical read, but never across a gap wider
+/// than `max_gap` bytes — skip-group windows selected inside a long postings
+/// record must not silently re-fetch the record between them.
+pub(crate) fn block_fetch_many_sparse(
+    source: &dyn VixRangeSource,
+    ranges: Vec<Range<u64>>,
+    max_gap: u64,
+) -> Result<Vec<Bytes>> {
+    block_fetch_many_with(source, ranges, Some(max_gap))
+}
+
+fn block_fetch_many_with(
+    source: &dyn VixRangeSource,
+    ranges: Vec<Range<u64>>,
+    max_gap: Option<u64>,
+) -> Result<Vec<Bytes>> {
     check_read_cancelled()?;
     for range in &ranges {
         if range.start > range.end || range.end > source.len() {
@@ -435,7 +477,11 @@ pub(crate) fn block_fetch_many(
     let expected: Vec<usize> = ranges.iter().map(|r| (r.end - r.start) as usize).collect();
     let bound = source.for_current_operation();
     let source = bound.as_deref().unwrap_or(source);
-    let all = futures::executor::block_on(source.fetch_many(ranges)).map_err(fetch_error)?;
+    let fetch = match max_gap {
+        Some(max_gap) => source.fetch_many_sparse(ranges, max_gap),
+        None => source.fetch_many(ranges),
+    };
+    let all = futures::executor::block_on(fetch).map_err(fetch_error)?;
     check_read_cancelled()?;
     if all.len() != expected.len() {
         return Err(VixError::Malformed(format!(
@@ -855,7 +901,7 @@ impl RangedBlob {
             range: self.range.clone(),
             operation: current_read_operation(),
             footer: Arc::clone(&self.footer),
-            exact_ranges: EXACT_RANGES.with(Cell::get),
+            coalesce_distance: COALESCE_DISTANCE.with(Cell::get),
             opening_memory: None,
             prefetched: PREFETCHED.with(|slot| {
                 slot.borrow()
@@ -1080,7 +1126,7 @@ pub(crate) struct BlobReadAt {
     range: Range<u64>,
     operation: Option<Arc<dyn VixReadOperation>>,
     footer: Arc<FooterState>,
-    exact_ranges: bool,
+    coalesce_distance: Option<u64>,
     opening_memory: Option<Arc<OpeningMemory>>,
     /// Operation-scoped windows registered for this blob, consulted before
     /// the retained footer and the source.
@@ -1096,8 +1142,8 @@ impl VortexReadAt for BlobReadAt {
     /// postings; ordinary scans retain the object-storage coalescing policy.
     fn coalesce_config(&self) -> Option<CoalesceConfig> {
         let mut config = CoalesceConfig::object_storage();
-        if self.exact_ranges {
-            config.distance = 0;
+        if let Some(distance) = self.coalesce_distance {
+            config.distance = distance;
         }
         Some(config)
     }

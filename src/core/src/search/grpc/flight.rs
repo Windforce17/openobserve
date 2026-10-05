@@ -194,8 +194,8 @@ pub async fn search(
     // serve =/!=/IN/IS NOT NULL with value-normalized literals). Even for
     // files written before numeric value terms existed, eligibility alone
     // pays: the per-file capability probe classifies files without the key
-    // as Absent (eliminated — no IO) and files with it as FtsOnly (skip +
-    // filter-back) instead of bypassing the index entirely. Float16 is
+    // as Absent (eliminated — no IO) and files with it as Unservable (skip
+    // + filter-back) instead of bypassing the index entirely. Float16 is
     // excluded: ingest never produces it and the filter-back literal
     // reconstruction does not support it.
     let index_fields: HashMap<String, DataType> = latest_schema
