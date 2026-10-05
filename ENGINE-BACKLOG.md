@@ -917,6 +917,78 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     0 GB scan, 15–23 s = cold per-file opens). Re-run `/tmp/pop.py` and
     the regression battery after the caches have had 2–3 h before
     judging the scan-side classes.
+- **2026-10-05 16:15Z — `.199` querier rollout (next items 1 + 3 + a
+  new 11): `release/vix-20261005-199` `485dbd13f` = `.198` + vix-arch
+  `9bee06e3a` (clean cherry-pick, byte-identical); image OCI index
+  `13e31359…`, arm64 manifest `1f1afa57…`, binary `76cd4ca3…`; GitOps
+  #600 (`87a9559a`, querier line only, server dry-run clean); RS
+  `57b8bfd6fc` 16:15:27Z, 10/10 pods 16:15:31–16:16:47Z, 0 restarts,
+  RSS 14.3–17.2 GiB of 24 after 15 min. Rollback: `.198`.**
+  - Engine (vortex_index 362 / search 1119 tests; worktree identical):
+    (1) plist reads are REQUEST-BOUND again — the skip-group window
+    rides the ladder's default coalescing and `SMALL_RECORD_BYTES` = 1
+    MiB, so header+group reads only pay off on multi-MiB records and a
+    sub-MiB record is one wave; (3) the data object opens with a
+    tail-sized footer read (`ZO_VIX_EAGER_TAIL_BYTES`, prod 768 KiB)
+    instead of the 64 KiB probe + `NeedMoreData` second trip; (11) field
+    capability is answered from the tail-resident field table with zero
+    IO, and an FTS-only field's equality (`body = '…'`) is dropped from
+    the index conjunct as unservable (`has_skipped`, superset, memoised)
+    instead of being probed per file.
+  - Battery (same `/tmp/obsq.py` plan as `.198`, 48 h window re-anchored
+    to 16:10Z; pre-leg on 3 h-warm `.198` pods, post-leg on brand-new
+    `.199` pods — empty disk/reader caches, r1 all remote). wall / idx ms:
+
+    | query | `.198` r1 · r2 | `.199` r1 · r2 | hits |
+    |---|---|---|---|
+    | A48 body | 49,741 / 17,568 · 36,071 / 381 | 55,861 / 18,977 · 53,192 / 3,832 | 49 / 49 |
+    | A48 no body | 51,894 / 17,862 · 29,571 / 301 | 54,670 / 17,305 · 55,918 / 1,446 | 49 / 49 |
+    | A48 pending token (never seen) | 16,779 / — · 3,370 / 1,860 | 29,264 / 26,663 · 2,944 / 391 | 0 / 0 |
+    | B48 `svc+body LIMIT 1000` | 8,557 / 5,318 · 4,997 / 350 | 12,640 / 10,704 · 6,453 / 3,207 | 90 / 90 |
+    | C24 `match_all('buildkitd.sock') LIMIT 500` | 8,868 / 4,004 · 4,536 / 182 | 11,674 / 7,544 · 8,092 / 1,414 | 500 / 500 |
+    | L24 hist `match_all('error') AND svc` | 12,051 / 10,541 · 1,550 / 159 | 10,975 / 9,247 · 4,038 / 849 | 49 / 49 |
+    | `IN(3) AND match_all` count 24 h | 2,981 / 2,297 · 1,398 / 157 | 23,884 / 21,383 · 4,103 / 1,048 | 1 / 1 |
+    | `body = 'error'` dense LIMIT 50 | 6,520 / 1,942 · 4,772 / 294 | 26,955 / 18,397 · 10,977 / 855 | 0 / 0 |
+    | hist `svc = x` 24 h | 2,623 / 2,090 · 892 / 319 | 24,637 / 23,488 · 630 / 207 | 49 / 49 |
+    | `str_match` 24 h (scan-bound) | 6,267 / 45 · 5,644 / 51 | 6,445 / 30 · 14,321 / 1,231 | 1 / 1 |
+
+    The r1 columns are not a code comparison (warm vs empty pods — the
+    24 h shapes at 18–23 s of index time are per-file cold opens, same as
+    `.198` at 13:15Z). What IS comparable is the fully cold A48 body
+    first run, `.198` fresh pods vs `.199` fresh pods, per follower
+    (Orbit `io_accounting`): physical reads **37.1k → 26.0–28.4k**
+    (−25 %, ~13 per file), remote bytes **~2.76 → 2.1–2.5 GB** (−10–15
+    %), follower index phase **22.0 med / 24.6 max → 13.1–13.8 s**,
+    leader `idx_took` 44–52 → 19 s. The wall did not move (54 → 56 s)
+    because the 35–40 s residual scan dominates (item 4). `active` 1,662–
+    1,853 s and `wait` 1,519–1,633 s per follower are unchanged: the EVAL
+    gate (32 MiB per row-id evaluation, ~120 of 192 slots admitted) is
+    now the index-phase bound (item 2 → `.200`).
+  - The superset memo works but is being EVICTED BY COUNT: back-to-back
+    A48 ×3 on `.199` → idx 407 / 494 / 393 ms, 0 fetches; the battery's r2
+    (12 queries later) → 3,832 ms, exactly 1.0 fetch per file (2,356–
+    2,600 per follower, ~100 MB). The per-file result cache is capped by
+    the configmap at 100,000 ENTRIES / 512 MB; a 48 h logs query inserts
+    ~2,300 per follower per pass (two passes when the aggregate pass
+    bails), so ~20 distinct queries FIFO the whole cache while its bytes
+    sit at 27 MB (`zo_vix_result_cache_memory_usage`; hits 16,369 of
+    47,135 requests on one pod). `entry_footprint` already counts both
+    key copies (~300 B per NoMatch / sparse entry) → raise the entry cap
+    to 1.5 M (querier env) and let the unchanged 512 MB be the bound.
+  - Counters 15 min after the rollout (fleet sums): `eval_growth_
+    timeouts_total` 72 (cold all-remote battery; `.198` had 3 + 9 after
+    its), `fast_path_fallback_total{budget_refused}` **12** (`.198`: 0 —
+    watch on `.200`, where more evaluations are admitted concurrently);
+    0 restarts, no new error class.
+  - Organic 16:17–16:50Z vs `.198` 15:35–16:10Z (`/tmp/pop.py`): index
+    phase p50 1,388 vs 463 ms, `groupby+eq` 5.2 vs 0.45 s — the empty
+    caches again; not a verdict. Re-run after 2–3 h.
+  - Per-evaluation owned-memory growth, measured in `and_io_bench` on the
+    two prod sidecars (`VIX_BENCH_LOG`, `reader.memory_size()` before →
+    after): **+199…+281 KB per evaluation** for every shape (match_all +
+    svc + body, svc only, rare token, absent token, deploy only; 1 M-row
+    synthetic too) — the row-id workspace is tail/prefetch/footer slack
+    + bitmaps, not 32 MiB; that is `.200`'s declaration.
 
 ## 2026-09-29 — P2 shipped as `.176` and rolled back within 30 min: the per-stream side table stalled the shared meta DB (commit latency 40–60×, ingest 503s); ranges must live in the segment row
 - What shipped (vix-arch `013c45010` + NATS retry `76fe754b5`, image
