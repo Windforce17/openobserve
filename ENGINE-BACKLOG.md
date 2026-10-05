@@ -689,6 +689,128 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     24 h rollback gates unchanged: merged/arrived < 1.0, oldest pending
     offset not advancing, any pod RSS > 40 GiB, or wal_segments pending
     age rising → replicas 30 (slot settings may stay).
+- **2026-10-05 — VIX slow-read root cause (10-04 report) verified; AND
+  evaluation re-planned, fts-field equality narrowed to tokens, superset
+  results memoized (vix-arch, local verification; not rolled).** The
+  report (`vix_slow_read_root_cause_2026-10-04.md`) was checked line by
+  line against HEAD and Orbit: every claim holds (line numbers off by
+  1–6). Trace `01a1044bc69e…` follower `c3dInns`: pass 1 (SimpleHistogram)
+  bails after 32 skips at 14 MB, pass 2 (row-id) `logical_ranges=123,001
+  / 29.65 GB / remote 21.35 GB / active 3,885 s / evaluation_wait 4,930
+  s`, 8,101 of 8,197 files kept, 45.1 s index + 13.5 s scan. Corrections
+  to the report: a wave can carry up to 8×10 physical reads (the
+  "one read in flight" mechanism is approximate; the 3.5 + 2×leaves fit
+  is right); the fixed per-file cost is tails(1) + the **`body`
+  `key_term_exists` probe (1, unaccounted)** + service_name block(1) +
+  token block(1), not "dict directory"; `to_vix_query` emits NESTED
+  `And([And(tokens), Exact(service_name)])`, so service_name's postings
+  were always read before a token miss could short-circuit; row-id mode
+  does have the 35 % density give-up (`guard_matched_rows`), just no
+  byte-projected bail; aggregate passes never warm sidecars
+  (`warm_cache = None`).
+  - **Found while reproducing (not in the report):** vortex 0.79's
+    `with_row_indices` without a row range plans one "exact" split per
+    ≤4,000-row cluster and the ChunkedReader reads EVERY chunk inside it
+    — the terms table's row blocks hold <100 rows each, so a token present
+    in two FTS fields (ordinals ~90 chunks apart) read **12.3 MB** per
+    leaf on a 1 M-row fixture. `scan_blob_streaming` now always pairs
+    `Indices` with `with_row_range(first..last+1)` → 134 KB (two chunks).
+    Whether prod sidecars hit the same span depends on the dictionary
+    layout; the fix only reduces reads.
+  - `VixReader::eval_and` rewritten (`reader.rs`): nested `And`s and
+    field-scoped `FullText { And(..) }` children flatten into one plan with
+    per-leaf scope; dictionary IO is three waves — all named points
+    (`field = v`, key existence) in one `resolve_points_in` batch, then
+    every token leaf of every scope in one batch, then prefix/regex/fuzzy
+    scans — each wave short-circuiting on an empty leaf;
+    `intersect_leaves` then issues ONE terms-table scan over the union of
+    ordinals (every leaf's `doc_count`), drops duplicate and
+    subset-implied leaves (`status AND status`; `deploy` under the body
+    scope implies `deploy` under the all-FTS scope), applies inline (rare)
+    cells first, and reads plist records in ≤2 batched waves: wave A =
+    full records for the rarest leaf / small records / records dense
+    relative to the accumulator bound (`bound × 4 > skip groups`), skip
+    headers otherwise; wave B = only the skip groups the accumulator can
+    touch (`postings::plan_groups` / `for_each_in_groups`, new).
+    Plist windows go through the new `VixRangeSource::fetch_many_sparse
+    (max_gap = 16 KiB)` → `LadderRangeSource` caps gap coalescing (the
+    default 1 MiB policy would re-fetch whole records between selected
+    groups). Tests: `tests/and_intersection.rs` (parity + IO-wave
+    contract), `postings::test_group_windows_match_naive_everywhere`.
+  - Harness `tests/and_io_bench.rs` (`cargo test -p vortex_index
+    --release --lib and_io_bench -- --ignored --nocapture`; 1 M rows,
+    40 services, `plist_min_docs=8192`, 768 KiB tail, 20 ms per round
+    trip; `VIX_BENCH_FILE=x.vix VIX_BENCH_FTS=… VIX_BENCH_QUERY=…
+    VIX_BENCH_SERVICE=…` runs a real sidecar). `match_all('server_status:
+    DEPLOY_STATUS_SUCCESS') AND service_name = X`: **14 batches / 20.4
+    waves / 63 MB → 5 / 5.0 / 1.18 MB**; `absent token + svc` 4 → 2
+    batches; `rare 2 tokens + svc` 6 → 5. With the body conjunct (below)
+    the full prod shape is **6 batches / 6.2 waves / 331 KB (6 candidate
+    rows)** vs the pre-change 14 / 20 / 63 MB + a 470-row superset.
+  - Query layer (`index.rs`, `vix/mod.rs`): `FieldCap::FtsOnly` split into
+    `Tokens` (file marks the field fts — decided from the field table, no
+    `key_term_exists` probe: one wave per cold file saved) and
+    `Unservable`. `body = 'Sending deploy callback'` on a `Tokens` field
+    no longer drops the conjunct: `Condition::fts_superset_query` maps
+    equality / positive IN to `FullText { [body], And(tokens) }` — a
+    SUPERSET (`has_skipped` stays, filter re-applied) that shrinks the
+    candidates from "every row of the other conjuncts" to rows carrying
+    the phrase's tokens and eliminates files lacking a token exactly
+    (NoMatch, cached). Negations / nested shapes / str_match / regex /
+    values with no tokens keep the skip. Aggregates still fall back
+    (`has_skipped`), so the SimpleHistogram pass still goes to the row-id
+    pass; the pass is now cheap and cacheable.
+  - Result cache: `has_skipped` `RowIdsSelection` results and the
+    straddling-file pre-clamp bitmap memo are stored under
+    `superset_cache_key(key)` (`{key}|superset`); the main lookup falls
+    back to it and returns `add_filter_back = true`; the memo read uses it
+    only when the current evaluation is itself a superset. The exact key
+    never holds a superset (#34 test rewritten:
+    `superset_bitmap_memoizes_under_its_own_key_only`). Repeats of the
+    `DEPLOY_STATUS_SUCCESS` family (98.8 % of files with candidates, 115–
+    175 GB remote per run) become cache hits.
+  - **Prod-file A/B (same harness, 20 ms/round trip; file
+    `default/logs/default/2026/10/02/12/75117742571525980165575`, 112 MB
+    data + 42 MB sidecar fetched through `ops`, 471k rows, 2,232 fields,
+    FTS `body,content,data,error,message`, 127 `service_name` values; in
+    this file `server` is dense in body (153k rows) and `status`/`deploy`/
+    `success` rare (190–828), the opposite mix of the fixture):**
+
+    | query | HEAD `e48a58c07` | this change |
+    |---|---|---|
+    | `match_all(server_status:DEPLOY_STATUS_SUCCESS) AND svc=cfworkers-deploy-cloudrun-worker AND body=Sending deploy callback` (8 hits) | 17 batches / 16.1 waves / 5.64 MB | 14 / **7.4 / 0.67 MB** |
+    | same without `body` | 14 / 12.5 / 5.22 MB | 14 / 7.1 / 0.53 MB |
+    | `svc=llm-router` (0 hits) | 15 / 13.9 / 5.25 MB | 13 / 6.4 / 0.70 MB |
+
+    HEAD re-reads the same 934 KB terms span once PER LEAF (4×) plus a
+    1.2 MB one — the vortex split issue × leaf count — and decodes the
+    whole 122 KB `server` record; now the terms cells come in one wave of
+    5 chunk reads (`with_coalesce_distance(16 KiB)`: each touched chunk's
+    adjacent `doc_count`+`postings` segments merge, the untouched chunks
+    between them do not — exact ranges alone cost +1 wave because 12
+    segment reads exceed the 8-in-flight limit), `server` is read as a
+    1.2 KB skip header + seven ~800 B groups, and the rare inline tokens
+    end `llm-router` before any plist wave. Per-file remote bytes 5.2–5.6
+    MB → 0.5–0.7 MB (−88 %), serial depth −50–55 %.
+  - **Config finding from the real sidecar:** the terms blob's vortex
+    footer (`43853120+35276`) starts 35 KB BEFORE the 768 KiB eager tail
+    (`dict` 200 KB + terms footer + puffin footer of 2,232 fields ≈ 802
+    KiB), so every cold open of this file pays one extra round trip for
+    it. `ZO_VIX_EAGER_TAIL_BYTES=1048576` (+256 KiB per cold sidecar tail)
+    would make it tail-resident; verify on a few more files before
+    changing the fleet value.
+  - Not done / next: (1) residual filtering INSIDE the index for
+    aggregates (decode the `body` column for the ≤ N candidate rows and
+    make the bitmap exact — removes the second pass and the 13.5 s scan;
+    report P1); (2) row-id evaluations still declare 32 MiB
+    (`evaluation_working_bytes`) — the admission gate change needs a prod
+    memory measurement like `.182`'s; (3) one dev querier A/B
+    (`io_accounting` `fetch_batches`/file, `logical_bytes`/file,
+    `evaluation_wait_us`) before rollout. Workstation note: WARP is up but
+    the EKS endpoint 172.31.125.77 is ENETUNREACH locally (private-network
+    route not pushed); `ssh ops` has `kubectl` (ctx `Prod-ops`) and
+    `aws s3` read access — querier pods are distroless, read their PVC
+    via `kubectl debug node/… --profile=general --image=busybox`.
 
 ## 2026-09-29 — P2 shipped as `.176` and rolled back within 30 min: the per-stream side table stalled the shared meta DB (commit latency 40–60×, ingest 503s); ranges must live in the segment row
 - What shipped (vix-arch `013c45010` + NATS retry `76fe754b5`, image
