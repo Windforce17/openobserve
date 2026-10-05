@@ -1047,6 +1047,22 @@ const EVAL_GROUP_ENTRY_BYTES: usize = 256;
 /// Safety factor over the measured fixed peak of an index-only evaluation
 /// (tails + prefetch + footer + collector on the parity fixtures).
 const EVAL_INDEX_ONLY_SAFETY: usize = 2;
+/// Transient workspace of a plain row-id evaluation (`mode == None`): no
+/// docs chunk is decoded (the straddling clamp is declared separately), so
+/// the peak is the AND intersection's fetched postings/terms cells plus
+/// their decode buffers. Measured 2026-10-05 on a prod `default/logs/
+/// default` merged sidecar (471k rows, 2,232 fields) and the 1 M-row bench
+/// fixture: 0.6–1.3 MB fetched + ≤ 0.3 MB owned growth per evaluation; the
+/// largest list a 30 M-row file can hand the rarest leaf is a few MiB. The
+/// former 32 MiB (the streaming-collector workspace) let a 4 GiB gate admit
+/// ~120 of 192 slots — prod `.198`: `evaluation_wait_us` median 2,376 s
+/// per follower on a cold 48 h query — while 192 × 12 MiB = 2.25 GiB fits
+/// under the admissible 7/8 with a third to spare. Owned growth is charged
+/// on top (ReaderMemory), unchanged.
+const EVAL_ROW_ID_WORKSPACE_BYTES: usize = 12 * 1024 * 1024;
+/// Transient workspace of a streaming aggregate collector: one decoded
+/// ≤ 65,536-row docs chunk with its arrow buffers, plus bounded group maps.
+const EVAL_STREAMING_WORKSPACE_BYTES: usize = 32 * 1024 * 1024;
 
 /// Bounded transient decoding/group workspace and mode-specific row buffers.
 /// Reader/index ownership is charged separately, before each real allocation.
@@ -1121,7 +1137,11 @@ fn evaluation_working_bytes(
         return fixed.saturating_mul(EVAL_INDEX_ONLY_SAFETY);
     }
     let row_bytes = bitmaps.saturating_add(clamp).saturating_add(collector_rows);
-    (32usize * 1024 * 1024).saturating_add(row_bytes)
+    let workspace = match mode {
+        None => EVAL_ROW_ID_WORKSPACE_BYTES,
+        Some(_) => EVAL_STREAMING_WORKSPACE_BYTES,
+    };
+    workspace.saturating_add(row_bytes)
 }
 
 /// Whether this evaluation provably answers from the term dictionary and
@@ -7646,6 +7666,39 @@ mod workspace_tests {
         let clamp = 100_000usize * 24;
         let bitmaps = 100_000usize.div_ceil(8) * 4;
         assert_eq!(declared, 32 * 1024 * 1024 + clamp + bitmaps);
+    }
+
+    /// Row-id evaluations (`mode == None`) declare the measured 12 MiB
+    /// transient workspace (+ bitmaps, + the clamp when straddling), not the
+    /// 32 MiB streaming-collector workspace: with the prod gate
+    /// (`ZO_VIX_EVAL_MAX_BYTES` 4 GiB, 1/8 growth headroom) all 192 search
+    /// slots admit at once for a 2 M-row file instead of ~120.
+    #[test]
+    fn row_id_evaluations_declare_the_measured_workspace() {
+        let rows = 2_000_000i64;
+        let bitmaps = 2_000_000usize.div_ceil(8) * 4;
+        let covered = evaluation_working_bytes(rows, None, true, false);
+        assert_eq!(covered, EVAL_ROW_ID_WORKSPACE_BYTES + bitmaps);
+        let straddling = evaluation_working_bytes(rows, None, false, false);
+        assert_eq!(
+            straddling,
+            EVAL_ROW_ID_WORKSPACE_BYTES + bitmaps + 2_000_000usize * 24
+        );
+        // aggregate collectors keep the streaming workspace
+        let streaming =
+            evaluation_working_bytes(rows, Some(&IndexOptimizeMode::SimpleCount), true, false);
+        assert_eq!(streaming, EVAL_STREAMING_WORKSPACE_BYTES + bitmaps);
+        let gate = 4usize << 30;
+        let admissible = gate - gate / 8;
+        assert!(
+            192 * covered <= admissible,
+            "192 row-id evaluations ({}) must fit the admissible gate share ({admissible})",
+            192 * covered
+        );
+        assert!(
+            192 * streaming > admissible,
+            "the streaming workspace is the one that did not fit"
+        );
     }
 }
 
