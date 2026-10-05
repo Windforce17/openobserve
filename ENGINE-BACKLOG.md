@@ -881,6 +881,41 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     TAIL_BYTES` 1 MiB (one round trip per cold file); (4) residual
     filtering inside the index for aggregates (removes the second pass
     and the 30–60 s scan that now dominates A48).
+  - **Regression check, 13:40Z window (`/tmp/vixab/battery_reg_198.jsonl`;
+    pods 30–45 min old).** 16 other shapes, r1 → r2 wall (index / scan):
+    logs `SELECT * LIMIT 50` 1 h 4.7 → 3.5 s (0.1 / 3.3); `count(*)` 24 h
+    0.9 → 0.6 s; `str_match(body,…)` 24 h 6.2 → 5.6 s (0.04 / 5.5,
+    scan-bound as before); `match_all('deplo*')` 10.7 → 2.8 s; `IN(3) AND
+    match_all` count 10.9 → 1.8 s; `(a OR b) AND match_all` count 10.1 →
+    3.0 s; `body = 'error'` (the new Tokens path on a dense token, LIMIT
+    50) 12.2 → 6.0 s (7.6 → 0.46 index, 5.4 scan); `re_match(body,…)` 6 h
+    42 s both (index 0 — regex on an fts field is a full scan on every
+    version); `hist(svc = x)` 24 h 8.7 → 2.0 s; traces count 1 h 2.6 →
+    1.0 s, svc histogram 3 h 2.7 → 1.1 s, APM group-by 1 h 5.0 → 3.6 s.
+    Every warm index phase ≤ 2.3 s; cold r1 index phases 6–9 s on 24 h
+    windows are the empty reader/disk caches of the new pods.
+  - Four aggregate shapes scan 10–20 s after a sub-second index phase;
+    the follower fallback reasons are all pre-existing: `match_all('deploy
+    status')` histogram and `match_all(..) AND svc != x` count →
+    `aggregate predicate requires residual filtering` because
+    `Condition::MatchAll(v).can_remove_filter() = is_alphanumeric(v)` —
+    **every multi-word match_all (space, `:`, `_`) is treated as inexact,
+    so no aggregate over it ever uses the fast path and its 30–60 s scan
+    is now the whole A48 cost**; top-N over match_all → `NULL aggregate
+    group requires scan`; `min/max(_timestamp) WHERE svc = x` → no
+    optimizer rule (two aggregates). Owner question: are multi-word
+    `match_all` semantics "every token present"? If so the token AND is
+    exact (the index tokenizer is the writer's) and the fast path can
+    answer those histograms without a scan.
+  - Organic traffic 13:15–14:15Z (battery traces excluded) is NOT yet
+    comparable to the pre-window: index phase p50 131 vs 736 ms, but
+    totals p50 3.3 vs 1.4 s — every pod's 2000 GiB disk cache and reader
+    cache restarted empty at 13:14Z (A48 r2 data-file disk ratio 1–25 %
+    vs 23–29 % on `.197`), plus a 355-query `select+eq` burst at
+    13:15–13:45 and wide-window needle `select+match_all`s (38 h,
+    0 GB scan, 15–23 s = cold per-file opens). Re-run `/tmp/pop.py` and
+    the regression battery after the caches have had 2–3 h before
+    judging the scan-side classes.
 
 ## 2026-09-29 — P2 shipped as `.176` and rolled back within 30 min: the per-stream side table stalled the shared meta DB (commit latency 40–60×, ingest 503s); ranges must live in the segment row
 - What shipped (vix-arch `013c45010` + NATS retry `76fe754b5`, image
