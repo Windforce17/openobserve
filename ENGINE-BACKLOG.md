@@ -1132,6 +1132,70 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     initial read for data objects and a larger in-flight window would make
     the residual 3 waves instead of 4; the per-file `to_vix_query` lines
     are debug now (were ~4,500 INFO lines per follower per 48 h query).
+- **2026-10-06 08:44Z — `.201` querier rollout, ROLLED BACK 08:58Z (12 min
+  live): the in-index residual filter regressed cold index time on
+  production file geometry.** GitOps #602 (`634d2683`), image OCI index
+  `28a613d8…`, arm64 manifest `0e29246d…`, binary `dc35b548…`; RS
+  `67cf467c66` 08:44:20Z, Healthy 08:46:29Z, 10/10, 0 restarts. Rollback
+  #603 (`e1f30678`) Healthy 08:57:59Z, 10/10 `.200`. Results stayed
+  CORRECT throughout (every battery row's hits identical to `.200`).
+  - Battery on the fresh `.201` pods (`ops:/tmp/battery_post201.jsonl`,
+    20 rows before the rollback) vs the `.200` pre-leg, wall / idx /
+    scan ms: A48 body **71,272 / 65,359 / 5,601** (pre 49,403 / 18,424 /
+    30,883); A48 no body 80,408 / 74,105 / 5,797 (40,130 / 13,125 /
+    26,791); A48 pending 37,312 / 36,447 (17,189 / 16,813); B48 31,641 /
+    30,748 (7,535 / 7,018); L24 hist 18,884 / 18,608 (10,250 / 10,037);
+    `IN+match_all` 17,887 / 17,653 (22,432 / 22,125); `str_match` 13,733
+    (22,874). The scan phase did collapse (30.9 → 5.6 s); the index
+    phase tripled, and not only for residual shapes.
+  - Per follower on A48 r1 (Orbit): fast path answered only **118–124 of
+    ~2,300 files**; fallbacks `residual: too many candidate chunks`
+    81–115 and `budget_refused` 17–43 — the refusals counted as skips,
+    the skip-rate bail fired (`skipped_file` 24,134 fleet-wide), the
+    remaining files went through the row-id pass + scan as before, so the
+    aggregate pass was pure added cost. Index-phase remote IO **6.0–7.6
+    GB / 43–48k reads per follower** (`.200`: 2.1–2.6 GB / 28–31k),
+    `active` 3,948–4,291 s, gate `wait` 1,958–3,040 s; fleet counters
+    `eval_growth_timeouts_total` 323, `budget_refused` 323, `residual:
+    too many candidate chunks` 3,695, `too many candidate rows` 16.
+  - Why the sidecar bench did not predict it: the 118 MB sample has
+    7,250-row chunks and 28–500 KB `body` chunk segments; production
+    merged files have **65,536-row chunks** (~230 per 4 GiB file) with
+    multi-MB string segments, and A48's ~9 candidates per file land in
+    ~9 distinct chunks — above the 8-chunk cap for most files. A
+    residual that did run cost **~110 reads / ~27 MB per file**: ≤ 8
+    chunks × 7 full-text columns × ~2 segments, issued under the index
+    phase's 16 KiB coalescing policy (meant for terms cells), decoding
+    65k-row string chunks under 192-way concurrency — hence the budget
+    refusals and growth timeouts. The scan branch pays ~3 requests /
+    ~9 MB per file for the same rows (1 MiB ladder coalescing, 63
+    partitions, DataFusion's pool absorbing the decode memory).
+  - Also seen: (1) every rollout starts a download storm — `zo_file_
+    downloader_normal_queue_size` 10,007 → **92,657** right after the
+    `.201` pods came up (each new pod enqueues its 24 h warm-up,
+    `ZO_WARMUP_CACHE_HOURS=24`; ~1.5 TB fleet-wide), so every "fresh
+    pods, cold caches" battery of 10-05/10-06 ran against a saturated
+    downloader — measure ≥ 1 h after a rollout, or pause the downloader
+    on one pod for the A/B. (2) A `.200` pod (`5f97c86f96-ftkhr`) was
+    EVICTED at 04:51Z by node memory pressure (kubelet: "node was low on
+    resource: memory", exit 137), not a querier OOM; replaced
+    automatically. One querier per m8g.4xlarge node — check what else
+    shares those nodes.
+  - State: vix-arch keeps both commits (the residual is correct and
+    tested; it is not in a shipped image). `.200` is prod. Redesign
+    before any re-rollout of the residual: (a) progressive columns —
+    single-column conjuncts first (`body = v` eliminates nearly every
+    candidate), the multi-column `match_all` disjunction only for
+    survivors; (b) docs reads under the ladder's default 1 MiB
+    coalescing, not the index policy; (c) a bytes-aware cap
+    (chunk × column segments, from the layout) instead of a chunk count;
+    (d) declared/bounded residual memory — a 65k-row string chunk decode
+    is tens of MB, so either a residual semaphore or the gate must know;
+    (e) a prod-geometry fixture in the bench (65,536-row chunks, ~1 KB
+    bodies, 2,000+ columns) as the acceptance gate. The dictionary-wave
+    merge (`76abfc1e4`) is independent and unmeasured in prod (the
+    battery was dominated by the residual); ship it with the redesign,
+    not alone — a rollout costs a 1.5 TB storm.
 
 ## 2026-09-29 — P2 shipped as `.176` and rolled back within 30 min: the per-stream side table stalled the shared meta DB (commit latency 40–60×, ingest 503s); ranges must live in the segment row
 - What shipped (vix-arch `013c45010` + NATS retry `76fe754b5`, image
