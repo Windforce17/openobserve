@@ -1196,6 +1196,51 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     merge (`76abfc1e4`) is independent and unmeasured in prod (the
     battery was dominated by the residual); ship it with the redesign,
     not alone — a rollout costs a 1.5 TB storm.
+- **2026-10-06 09:2xZ — `.202` ingester/router hot patch (metrics
+  ingest valve), carried onto vix-arch as `655c94aa2`.** GitOps #604
+  (`d617360`): `ZO_INGEST_METRICS_DROP="true"` in obs-env + ingester/
+  router alias `.178` → `v0.93.0-vix-20261006.202` (`release/vix-
+  20261006-202` `2a0c819ad` = `.178` + the valve, nothing else). The
+  valve acks every metrics ingest entry point (OTLP gRPC/HTTP, remote-
+  write, `_json`) with its normal success response before parsing; default
+  off. Cause: the e2b `service-metrics` collectors went 27× on 10-05
+  13:00Z (42M → 1,147M records/h, 467 streams), ingesters pinned at HPA
+  max. The commit was NOT on vix-arch (a `.178`-based branch), so the next
+  ingester/router image cut from vix-arch would have dropped it silently —
+  cherry-picked clean (24 lines, core check ok). Rollout at 09:40Z: sts
+  ordered, `-4/-3/-2` on `.202`, `-1` draining, `-0` (the 11.4-core pod
+  still taking the flood) next; the old pods take minutes to flush their
+  WAL. Compactor stays `.181`, querier `.200`.
+- **2026-10-06 — warm-up and downloader, measured (owner question: "turn
+  the 24 h warm-up off, warm on demand?").** Keep `ZO_WARMUP_CACHE_HOURS=
+  24`: it is metadata-only — each fresh pod opened its ring share of
+  2,401–2,962 sidecar footer tails in 89–113 s (`[WARMUP] done`, 0
+  failed) and left the downloader queue at 0; it is what makes a post-
+  roll index phase warm. The 1.5 TB "storm" is the SCAN branch's whole-
+  file downloads (`cache_files` enqueues every data file a query touches:
+  2,219 files / 148 GB per follower per cold 48 h query), and it buys
+  nothing measurable: on 14 h-old pods only 3–33 % of that window's
+  files were still on disk (newer downloads evict them), and the two
+  followers with the MOST disk-cached files had the slowest scan phase
+  (32.8 / 27.9 s vs 12–13 s). A/B on the same fresh pods, downloader
+  idle vs busy (never-seen 48 h windows): per-GET **80.6 vs 76.4 ms** —
+  the downloader does not slow queries; ~80 ms is S3's own latency at
+  ~300 concurrent range GETs per pod (bastion single-threaded 64 KiB
+  range GET p50 33 / p90 105 ms). Follower index phase on fresh `.200`
+  pods: 5.6–6.4 s median / 6.9–12.2 s max. Candidate: `ZO_DISK_CACHE_
+  MAX_AGE_DAYS=2` (now 0 = unlimited) so ad-hoc historical queries read
+  S3 directly instead of enqueuing 148 GB each; a querier env line, next
+  rollout.
+  - **The scan phase is decode-bound, not IO-bound**: 12–33 s per
+    follower with DataFusion peak 4–6 GiB, independent of disk-cache
+    hits — 65,536-row string chunks × 9 projected columns decoded for a
+    few candidate rows per file. That is why `.201` (the same decode moved
+    into the index phase, under its concurrency and 16 KiB coalescing) got
+    worse, and why the lever is decoding LESS: progressive single-column
+    residual (`body = v` first, the multi-column `match_all` only for
+    survivors), smaller docs row groups for new files (8,192 vs 65,536 —
+    compression cost to measure), and the disk-hit-slower anomaly to
+    explain (pool throttling?).
 
 ## 2026-09-29 — P2 shipped as `.176` and rolled back within 30 min: the per-stream side table stalled the shared meta DB (commit latency 40–60×, ingest 503s); ranges must live in the segment row
 - What shipped (vix-arch `013c45010` + NATS retry `76fe754b5`, image
