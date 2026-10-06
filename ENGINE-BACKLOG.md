@@ -1254,6 +1254,84 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     survivors), smaller docs row groups for new files (8,192 vs 65,536 —
     compression cost to measure), and the disk-hit-slower anomaly to
     explain (pool throttling?).
+- **2026-10-06 — the gate was charging phantom memory: footer parses ×64.
+  Fixed with measured bounds; residual redesigned; `.203` candidate =
+  `.200` + dictionary wave + residual + valve (vix-arch `e502a996d`,
+  `84e84980d`; release `release/vix-20261006-203`, byte-identical).**
+  - Measured with a counting global allocator on two production pairs
+    (`vortex_index/examples/residual_alloc_probe.rs`; `VixReader::
+    memory_peak()` is the new gate-visible high-water mark):
+
+    | step | real heap peak | gate charge before | after |
+    |---|---|---|---|
+    | ranged open, both puffin footers (2,233-col logs) | 1.08 MB | 29.2 MB | 6.1 MB |
+    | same, 539-col apisix (571 MB data) | 0.43 MB | 11.1 MB | 3.7 MB |
+    | row-id eval (dict + terms + plist) | 2.5 MB | — | — |
+    | detached docs footer, 996 KB window | 4.6 MB | +36.8 MB | +4.5 MB |
+    | same, apisix 476 KB window | 2.3 MB | +21 MB | +4.5 MB |
+    | stats blob decode 139 KB / 1,021 KB | 1.1 / 8.7 MB | 8.9 / 65 MB | 2.2 / 16.4 MB |
+    | 8 rows × body column / × 7 columns | 2.8 / 4.6 MB | not charged | not charged |
+
+    `metadata_memory_bound(encoded) = encoded × 64 + 64 KiB` was applied
+    to every puffin footer, every Vortex footer open and every stats
+    decode: a 14–27× over-charge, held as PENDING for the few ms a parse
+    runs. Every ranged open grew its lease by ~30 MB (192 slots → 5.6 GB
+    of transient demand on a 4 GiB gate — the `wait` column of every
+    battery since `.198`), and `.201`'s residual added +37 MB per file on
+    top of a 32 MiB declaration → 111 × 37 MB against the 512 MiB growth
+    headroom = the 500 ms `GROWTH_WAIT`s, 323 timeouts/refusals, ~25
+    effective concurrency. Now `footer_memory_bound` ×8 (puffin ≤ 2.2×,
+    Vortex 4.6–4.8× measured → 1.7× margin) and `stats_memory_bound` ×16
+    (7.9–8.5× measured → 1.9× margin). The decode of point-read columns
+    is not reserved at all (vortex conversion path) — the residual's only
+    gate cost is its footer.
+  - Declarations: SimpleCount / SimpleHistogram over a bitmap decode no
+    docs column → row-id workspace 12 MiB + `EVAL_RESIDUAL_BYTES` 8 MiB
+    (the 1 MiB detached footer read × 8) = 20.2 MiB with bitmaps; a
+    histogram whose file span lies in ONE bucket of the grid (the UI
+    case: 1 h buckets, files spanning minutes) declares no `_timestamp`
+    column (it never decodes one — `file_span` is an admission input
+    now); streaming collectors keep 32 + 8 MiB. Growth per evaluation
+    (`EVAL_GROWTH_ALLOWANCE_BYTES` 12 MiB, measured 6.1 open / 10.6
+    residual) is charged on top by design, so the real demand is slots ×
+    (declared + growth): row-id 192 × 18 MB = 3.5 GB, residual histogram
+    ~130–177 × 31 MB.
+  - Residual (`search/src/vix/residual.rs`): `to_vix_query_detailed`
+    returns a `ConjunctVerdict` per conjunct (Exact / Superset / Phrase /
+    Skipped; `to_vix_query`'s `has_skipped` unchanged) and only non-Exact
+    conjuncts are re-evaluated — `service_name = x`, decided by the
+    postings, is never read again. Conjuncts run narrowest-first over the
+    surviving rows, ONE read each: `body = v` over the superset rows (3
+    reads, 250 KB on the sample), then the `match_all` disjunction over
+    all present full-text columns of the survivors in one batch (~2 MB;
+    column-by-column saved bytes but cost a ~80 ms round trip per
+    column). The detached docs handle memoises every fetched window
+    (`PrefetchedWindows::recording`) and opens its footer in ONE 1 MiB
+    read (`DETACHED_DOCS_FOOTER_READ_BYTES`; was 256 KiB + `NeedMoreData`).
+    Skipping all-NULL columns via chunk stats was measured and dropped:
+    the data `stats` blob starts 74 KB / 954 KB before the 128 KiB data
+    tail on both files, so a cold stats decode is its own round trip.
+  - Per cold file now (prod sample, `prod_file_residual_histogram_cost`):
+    open 1 → dictionary 1 → terms 1 → plist 1 → docs footer 1 → body 1 →
+    fts columns 1 = **7 waves**, 26 reads, 4.0 MB, gate peak 10.4 MB
+    (`.201`: 9–10 waves, 20 reads, 2.85 MB, gate peak 66 MB; `.200`: 5
+    waves + the 30 s scan phase). Model for a cold A48 at ~150
+    concurrency: 2,337 / 150 × 7 × 83 ms ≈ 9 s, no scan phase; repeat
+    ≈ 0.5 s (exact memo). Bytes per follower ≈ 9.4 GB vs 2.5 + 26 GB
+    today.
+  - Acceptance (the fan-out evidence `.201` lacked):
+    `prod_file_residual_fanout_under_the_gate` runs as many concurrent
+    residual histograms of the prod file as the REAL gate admits
+    (`ZO_VIX_EVAL_MAX_BYTES=4 GiB`, 192 slots → **177 admitted**): all 177
+    exact, **0 growth timeouts**, wall 308 ms, max reader peak 10.4 MB.
+    `residual_refined_histogram_completes_inside_its_declaration` pins
+    the per-evaluation invariant (completes under declared + allowance
+    with no growth wait; peak ≤ allowance) on a ranged > 1 MiB docs
+    fixture. vortex_index 364, search 1122 + 2 ignored probes.
+  - Not changed, worth knowing: the row-id workspace (12 MiB) is still
+    well above the measured real peak (2.5 MB) and the owned reservations
+    already cover most of it — lowering it needs a measurement on a
+    30 M-row file's dense postings, not a guess.
 
 ## 2026-09-29 — P2 shipped as `.176` and rolled back within 30 min: the per-stream side table stalled the shared meta DB (commit latency 40–60×, ingest 503s); ranges must live in the segment row
 - What shipped (vix-arch `013c45010` + NATS retry `76fe754b5`, image
