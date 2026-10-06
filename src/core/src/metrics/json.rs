@@ -95,6 +95,11 @@ pub async fn ingest(
     body: Bytes,
     user: crate::common::meta::ingestion::IngestUser,
 ) -> Result<IngestionResponse> {
+    // ZO_INGEST_METRICS_DROP: acknowledge and discard before parsing the body.
+    if get_config().common.ingest_metrics_drop {
+        return Ok(IngestionResponse::new(http::StatusCode::OK.into(), vec![]));
+    }
+
     // check system resource
     if let Err(e) = check_ingestion_allowed(org_id, StreamType::Metrics, stream_name).await {
         // we do not want to log trial period expired errors

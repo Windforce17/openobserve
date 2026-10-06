@@ -2090,6 +2090,15 @@ pub struct Common {
     pub show_stream_dates_doc_num: bool,
     #[env_config(name = "ZO_INGEST_BLOCKED_STREAMS", default = "")] // use comma to split
     pub blocked_streams: String,
+    #[env_config(
+        name = "ZO_INGEST_METRICS_DROP",
+        default = false,
+        help = "Emergency valve: every metrics ingest request (OTLP gRPC/HTTP, Prometheus \
+                remote-write, /ingest/metrics/_json) is acknowledged with its normal success \
+                response and the payload is discarded before parsing or writing. Senders see \
+                200 and do not retry; nothing reaches the WAL, schema, or file_list."
+    )]
+    pub ingest_metrics_drop: bool,
     #[env_config(name = "ZO_REPORT_USER_NAME", default = "")]
     pub report_user_name: String,
     #[env_config(name = "ZO_REPORT_USER_PASSWORD", default = "")]

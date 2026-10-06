@@ -136,6 +136,11 @@ pub async fn handle_otlp_request(
     req_type: OtlpRequestType,
     user: crate::common::meta::ingestion::IngestUser,
 ) -> Result<HttpResponse, anyhow::Error> {
+    // ZO_INGEST_METRICS_DROP: acknowledge and discard before any parsing or admission work.
+    if get_config().common.ingest_metrics_drop {
+        return format_response(ExportMetricsPartialSuccess::default(), req_type);
+    }
+
     // check system resource
     if let Err(e) = check_ingestion_allowed(org_id, StreamType::Metrics, None).await {
         // we do not want to log trial period expired errors

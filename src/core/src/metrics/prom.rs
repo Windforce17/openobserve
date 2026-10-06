@@ -76,6 +76,11 @@ pub async fn remote_write(
     body: Bytes,
     user: IngestUser,
 ) -> std::result::Result<(), anyhow::Error> {
+    // ZO_INGEST_METRICS_DROP: acknowledge and discard before decompressing or decoding.
+    if get_config().common.ingest_metrics_drop {
+        return Ok(());
+    }
+
     // check system resource
     check_ingestion_allowed(org_id, StreamType::Metrics, None).await?;
 
