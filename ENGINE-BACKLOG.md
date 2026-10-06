@@ -1332,6 +1332,26 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     well above the measured real peak (2.5 MB) and the owned reservations
     already cover most of it — lowering it needs a measurement on a
     30 M-row file's dense postings, not a guess.
+  - **Querier instability on `.200` today is co-location, not the
+    engine**: 2 OOMKills (09:51Z, 10:13Z) + 3 kubelet evictions, every
+    eviction message "Container querier was using 15.8–16.3 GiB, request
+    is 10Gi, has larger consumption of memory". 8 of 10 querier nodes
+    (61 GiB allocatable) also carry an `obs-compactor` (24 Gi request /
+    60 Gi limit, 4–20 GiB RSS since the 18 × 5-slot consolidation) and 2
+    an o2 querier (52 Gi limit) — 136–156 GiB of limits per node. The
+    querier's 10 Gi request makes it the designated victim; each eviction
+    is a fresh pod with an empty 2 TB disk cache + reader cache (and a
+    warm-up storm). Fix in PR #605 with the `.203` image (one rollout):
+    request 10 Gi → **18 Gi** (steady RSS 14–17 GiB), so the over-request
+    compactor — a restartable merge — is evicted instead. Compactor +
+    querier requests (42 Gi) still fit one node; a hard querier↔compactor
+    anti-affinity would need 28 nodes on a 21-node pool (Karpenter spot) —
+    the next step if evictions continue.
+  - `.203` image built from `release/vix-20261006-203` `f611d2743`:
+    binary `0fa9920f…`, OCI index `61539218…`, arm64 manifest
+    `6c9d14f4…`, pushed. GitOps PR #605 (image + request) is OPEN, NOT
+    merged — rollout timing after a same-day rollback is the owner's call;
+    post-leg battery ≥ 1 h after the rollout.
 
 ## 2026-09-29 — P2 shipped as `.176` and rolled back within 30 min: the per-stream side table stalled the shared meta DB (commit latency 40–60×, ingest 503s); ranges must live in the segment row
 - What shipped (vix-arch `013c45010` + NATS retry `76fe754b5`, image
