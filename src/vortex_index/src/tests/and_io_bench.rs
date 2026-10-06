@@ -29,8 +29,10 @@ use rand::{RngExt, SeedableRng, rngs::StdRng};
 use super::{any_token, bits_to_set, exact};
 use crate::{VixQuery, VixRangeSource, VixReader, VixWriter, VixWriterOptions};
 
-/// One `fetch_many` call: which object and which ranges.
-type Call = (&'static str, Vec<Range<u64>>);
+/// One `fetch_many` call: which object, which ranges, and when it was
+/// issued (ms since the last `reset`) — batches issued within one latency
+/// of each other overlap, i.e. share a wave.
+type Call = (&'static str, Vec<Range<u64>>, f64);
 
 #[derive(Default)]
 struct Counters {
@@ -41,6 +43,7 @@ struct Counters {
     in_flight: AtomicUsize,
     max_in_flight: AtomicUsize,
     log: parking_lot::Mutex<Vec<Call>>,
+    started: parking_lot::Mutex<Option<Instant>>,
 }
 
 impl Counters {
@@ -60,6 +63,7 @@ impl Counters {
         self.physical_bytes.store(0, Ordering::Release);
         self.max_in_flight.store(0, Ordering::Release);
         self.log.lock().clear();
+        *self.started.lock() = Some(Instant::now());
     }
 }
 
@@ -97,7 +101,15 @@ impl VixRangeSource for LatencySource {
         max_gap: u64,
     ) -> BoxFuture<'static, anyhow::Result<Vec<Bytes>>> {
         let counters = Arc::clone(&self.counters);
-        counters.log.lock().push((self.name, ranges.clone()));
+        let issued_ms = counters
+            .started
+            .lock()
+            .map(|s| s.elapsed().as_secs_f64() * 1e3)
+            .unwrap_or(0.0);
+        counters
+            .log
+            .lock()
+            .push((self.name, ranges.clone(), issued_ms));
         counters.batches.fetch_add(1, Ordering::AcqRel);
         counters.ranges.fetch_add(ranges.len(), Ordering::AcqRel);
         counters.bytes.fetch_add(
@@ -471,12 +483,15 @@ fn and_io_bench() {
             owned_after.saturating_sub(owned_before) / 1024
         );
         if std::env::var("VIX_BENCH_LOG").is_ok() {
-            for (i, (src, ranges)) in counters.log.lock().iter().enumerate() {
+            for (i, (src, ranges, issued_ms)) in counters.log.lock().iter().enumerate() {
                 let sizes: Vec<String> = ranges
                     .iter()
                     .map(|r| format!("{}+{}", r.start, r.end - r.start))
                     .collect();
-                eprintln!("    batch {i:>2} {src:<5} {}", sizes.join(" "));
+                eprintln!(
+                    "    batch {i:>2} @{issued_ms:>6.1}ms {src:<5} {}",
+                    sizes.join(" ")
+                );
             }
         }
         assert_eq!(got, expected, "{name}: ranged result must match memory");

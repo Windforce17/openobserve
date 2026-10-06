@@ -415,8 +415,9 @@ fn and_intersection_parity_and_io_waves() {
     );
     assert!(bytes_of(&plist) * 8 < full, "{}", bytes_of(&plist));
 
-    // a missing narrow leaf short-circuits before any token dictionary,
-    // terms or postings read
+    // a missing narrow leaf short-circuits before any terms or postings
+    // read: the one dictionary wave carries the svc probe and the token
+    // blocks together, the miss ends the plan right after it
     let (reader, index) = open(&fixture);
     let missing = fulltext(VixQuery::And(vec![
         VixQuery::And(vec![any_token("alpha"), any_token("beta")]),
@@ -428,7 +429,7 @@ fn and_intersection_parity_and_io_waves() {
     assert_eq!(
         index.calls.lock().len(),
         1,
-        "exactly the svc dictionary probe"
+        "exactly the one dictionary wave"
     );
 
     // an absent token short-circuits after the dictionary: no terms scan
@@ -503,11 +504,11 @@ fn scoped_fulltext_children_flatten_into_one_plan() {
             .collect::<Vec<_>>(),
         vec![50_000, 150_000]
     );
-    // waves: svc dictionary block, one token block fetch for beta/needle
-    // (outer scope) + alpha/needle (log scope), one terms scan, plist
+    // waves: ONE dictionary wave for the svc point, beta/needle (outer
+    // scope) and alpha/needle (log scope) together, one terms scan, plist
     // waves — never a second dictionary wave for the inner scope
     let dict = index.calls_in(&fixture.dict_blocks);
-    assert_eq!(dict.len(), 2, "svc points, then every token leaf: {dict:?}");
+    assert_eq!(dict.len(), 1, "points and every token leaf: {dict:?}");
     assert_eq!(index.calls_in(&fixture.terms).len(), 1);
 
     // the scoped leaf is honoured: alpha@extra rows are not candidates. A
@@ -524,8 +525,8 @@ fn scoped_fulltext_children_flatten_into_one_plan() {
     assert_eq!(got, bits_to_set(&memory.eval(&scoped).unwrap()));
     assert!(only_extra.iter().all(|row| !got.contains(row)));
 
-    // two named points resolve in ONE dictionary wave and a missing one
-    // still short-circuits before any token read
+    // two named points and a token resolve in ONE dictionary wave and a
+    // missing point still short-circuits before any terms read
     let (reader, index) = open(&fixture);
     let two_points = fulltext(VixQuery::And(vec![
         exact("svc", "svc-big"),
@@ -538,6 +539,50 @@ fn scoped_fulltext_children_flatten_into_one_plan() {
         1,
         "one point wave"
     );
+    assert!(index.calls_in(&fixture.terms).is_empty());
+}
+
+/// Unscoped tokens (a bare `match_all`, the global directory) and a named
+/// point share the dictionary wave too when the token plan is small: one
+/// `dict_blocks` call carrying both, the point looked up in its own field
+/// only (`alpha` as a token of `svc` must not leak), and the result equal
+/// to the whole-file reader's. A cold file then costs exactly three
+/// dependent waves after the open: dictionary, terms table, plist records.
+#[test]
+fn broad_tokens_and_points_share_the_dictionary_wave() {
+    let fixture = build();
+    let memory =
+        VixReader::open_with_index(fixture.data.clone(), Some(fixture.index.clone())).unwrap();
+    let query = VixQuery::And(vec![
+        any_token("alpha"),
+        any_token("beta"),
+        exact("svc", "svc-big"),
+    ]);
+    let expected = bits_to_set(&memory.eval(&query).unwrap());
+    assert!(!expected.is_empty());
+    let (reader, index) = open(&fixture);
+    assert_eq!(bits_to_set(&reader.eval(&query).unwrap()), expected);
+    let dict = index.calls_in(&fixture.dict_blocks);
+    assert_eq!(
+        dict.len(),
+        1,
+        "one dictionary wave for point + tokens: {dict:?}"
+    );
+    assert_eq!(index.calls_in(&fixture.terms).len(), 1, "one terms scan");
+    assert_eq!(index.calls_in(&fixture.plist).len(), 1, "one plist wave");
+    assert_eq!(
+        index.calls.lock().len(),
+        3,
+        "dictionary, terms, plist — nothing else: {:?}",
+        index.calls.lock()
+    );
+
+    // the point still decides alone: a missing svc under broad tokens ends
+    // the plan after that single wave
+    let (reader, index) = open(&fixture);
+    let missing = VixQuery::And(vec![any_token("alpha"), exact("svc", "svc-missing")]);
+    assert_eq!(reader.eval(&missing).unwrap().count_set_bits(), 0);
+    assert_eq!(index.calls.lock().len(), 1);
     assert!(index.calls_in(&fixture.terms).is_empty());
 }
 

@@ -305,6 +305,16 @@ impl<T> Admitted<Vec<T>> {
 /// physical reads per follower ~10 % with no wall gain.
 pub(crate) const PARTIAL_RECORD_MIN_BYTES: u64 = 1024 * 1024;
 
+/// An AND's token dictionary blocks up to this size ride in the SAME
+/// round trip as its named point leaves (`field = v`); above it the points
+/// go first, so a missing selective point spares the token blocks. Prod
+/// `.200` cold runs: each round trip costs ~80 ms of object-store latency
+/// per file and the per-file index time is round trips × that; the
+/// production shape — a handful of tokens scoped to the FTS fields — plans
+/// ~5 blocks / 40 KB, an unscoped match_all over a 1,000-field schema plans
+/// megabytes (one block per field).
+pub(crate) const MERGED_POINT_WAVE_MAX_BYTES: u64 = 256 * 1024;
+
 /// One terms-table cell as read by the batched AND intersection.
 enum TermCell {
     /// `doc_count == 0`: nothing to decode.
@@ -363,6 +373,7 @@ struct FieldPrefetch {
     _scope: crate::source::PrefetchScope,
 }
 
+#[derive(Clone, Copy)]
 struct PointTarget {
     offset: u64,
     end: u64,
@@ -3949,8 +3960,78 @@ impl VixReader {
             check_read_cancelled()?;
             out.value.push(self.query_vec::<u64>(0)?);
         }
+        let mut targets = self.query_vec::<PointTarget>(
+            fields.len().saturating_mul(tokens.len()).min(BATCH_TARGETS),
+        )?;
+        let mut batch_bytes = 0u64;
+        self.walk_point_targets(tokens, fields, broad, &admit, |target, length| {
+            let new_block = targets
+                .value
+                .last()
+                .is_none_or(|last| last.offset != target.offset);
+            if new_block
+                && !targets.value.is_empty()
+                && (batch_bytes.saturating_add(length) > BATCH_BYTES
+                    || targets.value.len() >= BATCH_TARGETS)
+            {
+                self.resolve_point_batch(&targets.value, tokens, &mut out.value)?;
+                targets.value.clear();
+                batch_bytes = 0;
+            }
+            if new_block {
+                batch_bytes = batch_bytes.saturating_add(length);
+            }
+            targets.push(target)?;
+            Ok(true)
+        })?;
+        if !targets.value.is_empty() {
+            self.resolve_point_batch(&targets.value, tokens, &mut out.value)?;
+        }
+        check_read_cancelled()?;
+        Ok(out)
+    }
+
+    /// Bytes of distinct dictionary blocks the point wave over `tokens` ×
+    /// `fields` would fetch — the plan [`Self::resolve_points_in`]
+    /// executes, sized without IO (the directory is tail-resident). Stops
+    /// counting once past `cap`, so a wide-schema broad plan costs a few
+    /// directory probes, not a full walk.
+    fn planned_point_bytes(
+        &self,
+        tokens: &[&[u8]],
+        fields: &[u16],
+        broad: bool,
+        admit: &impl Fn(usize, u16) -> bool,
+        cap: u64,
+    ) -> Result<u64> {
+        let mut bytes = 0u64;
+        let mut last_offset = None;
+        self.walk_point_targets(tokens, fields, broad, admit, |target, length| {
+            if last_offset != Some(target.offset) {
+                bytes = bytes.saturating_add(length);
+                last_offset = Some(target.offset);
+            }
+            Ok(bytes <= cap)
+        })?;
+        Ok(bytes)
+    }
+
+    /// Walk the dictionary directory for every admitted `(token, field)`
+    /// pair and hand each planned block target, with its block length, to
+    /// `visit` in non-decreasing block order (field-major enumeration of
+    /// sorted tokens gives physical-block order even when different field
+    /// pages use different local block numbers). `visit` returns `false`
+    /// to stop the walk. No IO: the directory is the tail-resident `dict`.
+    fn walk_point_targets(
+        &self,
+        tokens: &[&[u8]],
+        fields: &[u16],
+        broad: bool,
+        admit: &impl Fn(usize, u16) -> bool,
+        mut visit: impl FnMut(PointTarget, u64) -> Result<bool>,
+    ) -> Result<()> {
         if self.term_count == 0 || fields.is_empty() || tokens.is_empty() {
-            return Ok(out);
+            return Ok(());
         }
         let mut order = self.query_vec(tokens.len())?;
         let mut key_capacity = 2usize;
@@ -3969,9 +4050,6 @@ impl VixReader {
             .sort_unstable_by(|&a, &b| tokens[a].cmp(tokens[b]));
         check_read_cancelled()?;
         let mut key = self.query_vec(key_capacity)?;
-        let mut targets = self.query_vec::<PointTarget>(
-            fields.len().saturating_mul(tokens.len()).min(BATCH_TARGETS),
-        )?;
         // Broad queries use one global directory, rather than loading every
         // overlapping field page. Explicit scopes retain field-page isolation.
         let global = if broad {
@@ -3980,7 +4058,7 @@ impl VixReader {
             None
         };
         let blob_len = self.dict_blocks_len()?;
-        let mut batch_bytes = 0u64;
+        let mut last: Option<PointTarget> = None;
         for &fid in fields {
             check_read_cancelled()?;
             let field_index;
@@ -4009,46 +4087,30 @@ impl VixReader {
                     .checked_sub(range.start)
                     .filter(|_| range.end <= blob_len)
                     .ok_or_else(|| VixError::Malformed("invalid point block range".into()))?;
-                let new_block = targets
-                    .value
-                    .last()
-                    .is_none_or(|last| last.offset != range.start);
-                if let Some(last) = targets.value.last()
-                    && (last.offset > range.start
-                        || (last.offset == range.start
-                            && (last.end != range.end
-                                || last.first_ordinal != index.meta(block).1)))
-                {
-                    return Err(VixError::Malformed(
-                        "inconsistent point block directory".into(),
-                    ));
-                }
-                if new_block
-                    && !targets.value.is_empty()
-                    && (batch_bytes.saturating_add(length) > BATCH_BYTES
-                        || targets.value.len() >= BATCH_TARGETS)
-                {
-                    self.resolve_point_batch(&targets.value, tokens, &mut out.value)?;
-                    targets.value.clear();
-                    batch_bytes = 0;
-                }
-                if new_block {
-                    batch_bytes = batch_bytes.saturating_add(length);
-                }
-                targets.push(PointTarget {
+                let target = PointTarget {
                     offset: range.start,
                     end: range.end,
                     first_ordinal: index.meta(block).1,
                     field_id: fid,
                     leaf,
-                })?;
+                };
+                if let Some(last) = last
+                    && (last.offset > target.offset
+                        || (last.offset == target.offset
+                            && (last.end != target.end
+                                || last.first_ordinal != target.first_ordinal)))
+                {
+                    return Err(VixError::Malformed(
+                        "inconsistent point block directory".into(),
+                    ));
+                }
+                last = Some(target);
+                if !visit(target, length)? {
+                    return Ok(());
+                }
             }
         }
-        if !targets.value.is_empty() {
-            self.resolve_point_batch(&targets.value, tokens, &mut out.value)?;
-        }
-        check_read_cancelled()?;
-        Ok(out)
+        Ok(())
     }
 
     fn resolve_point_batch(
@@ -4261,18 +4323,22 @@ impl VixReader {
     /// Nested `And`s — including field-scoped `FullText { And(..) }`
     /// children, which carry their own token scope — are flattened so every
     /// conjunct of the predicate plans together. Leaves resolve their term
-    /// ordinals through the dictionary first, **zero postings IO**, in three
-    /// waves: every named point leaf (`field = v`, key existence) in one
-    /// batched block read, then every token leaf of every scope in one
-    /// batched read, then dictionary-walking leaves (prefix/regex/fuzzy/
-    /// contains) one by one. A leaf matching no term ends the evaluation
-    /// before the next wave, so a per-file miss of the selective predicate
-    /// never pays the token dictionary, and a missing token never pays any
-    /// postings read. The surviving leaves intersect through
-    /// [`Self::intersect_leaves`]: ONE terms-table read for all ordinals,
-    /// `doc_count`-ordered evaluation, and at most two batched plist waves.
-    /// Composite children (`Or`/`Not`, other `FullText` shapes) evaluate
-    /// last. An empty child list is `All`.
+    /// ordinals through the dictionary first, **zero postings IO**, in two
+    /// waves: every named point leaf (`field = v`, key existence) AND every
+    /// token leaf of every scope in ONE batched block read, then
+    /// dictionary-walking leaves (prefix/regex/fuzzy/contains) one by one.
+    /// Points and tokens share the wave on purpose: on a cold file every
+    /// round trip costs the full object-store latency (~80 ms on the prod
+    /// queriers, the per-file index time is waves × that), and the
+    /// selective point leaf — one `service_name` — is present in nearly
+    /// every merged file, so a points-first wave bought nothing there and
+    /// cost one trip per file; the rare absent-point file pays only the
+    /// token leaves' small block reads, never a wave. A leaf matching no
+    /// term ends the evaluation before any postings read. The surviving
+    /// leaves intersect through [`Self::intersect_leaves`]: ONE terms-table
+    /// read for all ordinals, `doc_count`-ordered evaluation, and at most
+    /// two batched plist waves. Composite children (`Or`/`Not`, other
+    /// `FullText` shapes) evaluate last. An empty child list is `All`.
     fn eval_and(&self, subs: &[VixQuery], scope: Option<&[u16]>) -> Result<BooleanBuffer> {
         let len = self.row_count as usize;
         // scopes[0] is the inherited scope; flattened `FullText` children
@@ -4310,31 +4376,85 @@ impl VixReader {
                 scan => scans.push((scan, scope_index))?,
             }
         }
-        // wave 1: named point leaves, one block fetch for all of them
-        if !points.value.is_empty() {
-            let mut keys = self.query_vec::<&[u8]>(points.value.len())?;
-            let mut fids = self.query_vec::<u16>(points.value.len())?;
-            for sub in points.value.iter() {
-                check_read_cancelled()?;
-                let (token, fid) = match sub {
-                    VixQuery::Exact { field, token } => {
-                        (token.as_slice(), self.require_field_id(field)?)
+        // wave 1: the named point leaves and the token leaves of every scope.
+        // Both plans are sized from the tail-resident directory first (no
+        // IO); when the token blocks are small — the production shape: a few
+        // tokens scoped to the FTS fields, ~5 blocks — points and tokens go
+        // out in ONE block fetch. A large token plan (an unscoped match_all
+        // over a wide schema reads a block per field) keeps the points-first
+        // order, so a missing selective point still spares all of it.
+        let point_count = points.value.len();
+        let mut point_keys = self.query_vec::<&[u8]>(point_count)?;
+        let mut point_fids = self.query_vec::<u16>(point_count)?;
+        let mut point_fields = self.query_vec::<u16>(point_count)?;
+        for sub in points.value.iter() {
+            check_read_cancelled()?;
+            let (token, fid) = match sub {
+                VixQuery::Exact { field, token } => {
+                    (token.as_slice(), self.require_field_id(field)?)
+                }
+                VixQuery::KeyExists { path } => (path.as_bytes(), KEY_FIELD_ID),
+                _ => unreachable!("points hold Exact and KeyExists only"),
+            };
+            point_keys.push(token)?;
+            point_fids.push(fid)?;
+            point_fields.push(fid)?;
+        }
+        point_fields.value.sort_unstable();
+        point_fields.value.dedup();
+        let mut token_keys = self.query_vec::<&[u8]>(tokens.value.len())?;
+        let mut token_fields = self.query_vec::<u16>(0)?;
+        let mut broad = false;
+        for &(token, scope_index) in tokens.value.iter() {
+            check_read_cancelled()?;
+            token_keys.push(token)?;
+            match scope_of(scope_index) {
+                None => broad = true,
+                Some(fids) => {
+                    for &fid in fids {
+                        token_fields.push(fid)?;
                     }
-                    VixQuery::KeyExists { path } => (path.as_bytes(), KEY_FIELD_ID),
-                    _ => unreachable!("points hold Exact and KeyExists only"),
-                };
-                keys.push(token)?;
-                fids.push(fid)?;
+                }
             }
-            let mut fields = self.query_vec::<u16>(fids.value.len())?;
-            for &fid in fids.value.iter() {
+        }
+        if broad {
+            for &fid in &self.indexed_field_ids {
+                token_fields.push(fid)?;
+            }
+        }
+        token_fields.value.sort_unstable();
+        token_fields.value.dedup();
+        let token_admit = |leaf: usize, fid: u16| match scope_of(tokens.value[leaf].1) {
+            None => true,
+            Some(fids) => fids.binary_search(&fid).is_ok(),
+        };
+        let merged = point_count > 0
+            && !tokens.value.is_empty()
+            && self.planned_point_bytes(
+                &token_keys.value,
+                &token_fields.value,
+                broad,
+                &token_admit,
+                MERGED_POINT_WAVE_MAX_BYTES,
+            )? <= MERGED_POINT_WAVE_MAX_BYTES;
+        if merged {
+            let mut keys = self.query_vec::<&[u8]>(point_count + tokens.value.len())?;
+            for &key in point_keys.value.iter().chain(token_keys.value.iter()) {
+                keys.push(key)?;
+            }
+            let mut fields =
+                self.query_vec::<u16>(point_fields.value.len() + token_fields.value.len())?;
+            for &fid in point_fields.value.iter().chain(token_fields.value.iter()) {
                 fields.push(fid)?;
             }
             fields.value.sort_unstable();
             fields.value.dedup();
             let resolved =
-                self.resolve_points_in(&keys.value, &fields.value, false, |leaf, fid| {
-                    fids.value[leaf] == fid
+                self.resolve_points_in(&keys.value, &fields.value, broad, |leaf, fid| match leaf
+                    .checked_sub(point_count)
+                {
+                    None => point_fids.value[leaf] == fid,
+                    Some(token) => token_admit(token, fid),
                 })?;
             for ordinals in resolved.value {
                 if ordinals.value.is_empty() {
@@ -4342,48 +4462,37 @@ impl VixReader {
                 }
                 leaves.push(ordinals)?;
             }
-        }
-        // wave 2: every token leaf of every scope, one block fetch
-        if !tokens.value.is_empty() {
-            let mut keys = self.query_vec::<&[u8]>(tokens.value.len())?;
-            let mut fields = self.query_vec::<u16>(0)?;
-            let mut broad = false;
-            for &(token, scope_index) in tokens.value.iter() {
-                check_read_cancelled()?;
-                keys.push(token)?;
-                match scope_of(scope_index) {
-                    None => broad = true,
-                    Some(fids) => {
-                        for &fid in fids {
-                            fields.push(fid)?;
-                        }
+        } else {
+            if point_count > 0 {
+                let resolved = self.resolve_points_in(
+                    &point_keys.value,
+                    &point_fields.value,
+                    false,
+                    |leaf, fid| point_fids.value[leaf] == fid,
+                )?;
+                for ordinals in resolved.value {
+                    if ordinals.value.is_empty() {
+                        return Ok(BooleanBuffer::new_unset(len));
                     }
+                    leaves.push(ordinals)?;
                 }
             }
-            if broad {
-                for &fid in &self.indexed_field_ids {
-                    fields.push(fid)?;
+            if !tokens.value.is_empty() {
+                let resolved = self.resolve_points_in(
+                    &token_keys.value,
+                    &token_fields.value,
+                    broad,
+                    token_admit,
+                )?;
+                for ordinals in resolved.value {
+                    if ordinals.value.is_empty() {
+                        return Ok(BooleanBuffer::new_unset(len));
+                    }
+                    leaves.push(ordinals)?;
                 }
-            }
-            fields.value.sort_unstable();
-            fields.value.dedup();
-            let resolved = self.resolve_points_in(
-                &keys.value,
-                &fields.value,
-                broad,
-                |leaf, fid| match scope_of(tokens.value[leaf].1) {
-                    None => true,
-                    Some(fids) => fids.binary_search(&fid).is_ok(),
-                },
-            )?;
-            for ordinals in resolved.value {
-                if ordinals.value.is_empty() {
-                    return Ok(BooleanBuffer::new_unset(len));
-                }
-                leaves.push(ordinals)?;
             }
         }
-        // wave 3: prefix / regex / fuzzy / contains walk dictionary ranges —
+        // wave 2: prefix / regex / fuzzy / contains walk dictionary ranges —
         // only once every cheaper leaf proved present
         for &(scan, scope_index) in scans.value.iter() {
             let ordinals = self.collect_ordinals(scan, scope_of(scope_index))?;
