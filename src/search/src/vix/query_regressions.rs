@@ -248,6 +248,161 @@ fn prod_file_residual_histogram_cost() {
     }
 }
 
+/// Fan-out against the REAL process evaluation gate (`ZO_VIX_EVAL_MAX_BYTES`
+/// / `ZO_VIX_SEARCH_CONCURRENCY` as the test process sees them): as many
+/// concurrent residual-refined histograms of the A48 shape over
+/// `VIX_BENCH_FILE` as the gate admits for the declaration, each a fresh
+/// ranged reader with its own 1 ms-latency source. Reports admitted
+/// concurrency, wall, growth timeouts and refusals — the `.201` failure
+/// mode (111 admitted, each growing past its lease into 500 ms waits)
+/// shows up here as timeouts/refusals and a wall far above
+/// `rounds × waves × latency`. `VIX_BENCH_FANOUT` overrides the count.
+#[test]
+#[ignore = "diagnostic; run with VIX_BENCH_FILE set"]
+fn prod_file_residual_fanout_under_the_gate() {
+    let path = std::env::var("VIX_BENCH_FILE").expect("VIX_BENCH_FILE");
+    let data = Bytes::from(std::fs::read(&path).unwrap());
+    let index =
+        Bytes::from(std::fs::read(std::path::Path::new(&path).with_extension("vxi")).unwrap());
+    let latency = std::time::Duration::from_millis(1);
+    let service = std::env::var("VIX_BENCH_SERVICE")
+        .unwrap_or_else(|_| "cfworkers-deploy-cloudrun-worker".to_string());
+    let phrase = std::env::var("VIX_BENCH_QUERY")
+        .unwrap_or_else(|_| "server_status:DEPLOY_STATUS_SUCCESS".to_string());
+    let body =
+        std::env::var("VIX_BENCH_BODY").unwrap_or_else(|_| "Sending deploy callback".to_string());
+    let fts: Vec<String> = std::env::var("VIX_BENCH_FTS")
+        .unwrap_or_else(|_| "body,content,data,error,message".to_string())
+        .split(',')
+        .map(str::to_string)
+        .collect();
+    let condition = Arc::new(IndexCondition {
+        conditions: vec![
+            Condition::MatchAll(phrase),
+            Condition::Equal("service_name".to_string(), service),
+            Condition::Equal("body".to_string(), body),
+        ],
+    });
+    let memory = VixReader::open_with_index(data.clone(), Some(index.clone())).unwrap();
+    let rows = memory.row_count() as i64;
+    let (ts_min, ts_max) = memory
+        .zone_chunks()
+        .map(|chunks| {
+            chunks.iter().fold((i64::MAX, i64::MIN), |(lo, hi), c| {
+                (lo.min(c.ts_min), hi.max(c.ts_max))
+            })
+        })
+        .expect("prod files carry a zone map");
+    drop(memory);
+    let hour = 3_600_000_000u64;
+    let min_value = ts_min - ts_min.rem_euclid(hour as i64);
+    let buckets = ((ts_max - min_value) as u64 / hour + 1) as usize;
+    let mode = IndexOptimizeMode::SimpleHistogram(min_value, hour, buckets, 0);
+    let range = (min_value, min_value + (buckets as i64) * hour as i64);
+    let declared = evaluation_working_bytes(rows, Some(&mode), true, false, Some((ts_min, ts_max)));
+    let budget = source::evaluation_byte_budget();
+    let admissible = budget - budget / 8;
+    let slots = config::get_config().limit.vix_search_concurrency.max(1);
+    let fanout: usize = std::env::var("VIX_BENCH_FANOUT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or((admissible / declared).min(slots).max(1));
+    eprintln!(
+        "gate {} MiB (admissible {} MiB), slots {slots}, declared {} KiB -> fan-out {fanout}",
+        budget >> 20,
+        admissible >> 20,
+        declared >> 10
+    );
+    let timeouts_before = config::metrics::VIX_EVAL_GROWTH_TIMEOUTS_TOTAL
+        .with_label_values::<&str>(&[])
+        .get();
+    let fts = Arc::new(fts);
+    let started = std::time::Instant::now();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(8)
+        .enable_all()
+        .build()
+        .unwrap();
+    let outcomes: Vec<(bool, bool, u128, usize)> = rt.block_on(async {
+        let mut handles = Vec::with_capacity(fanout);
+        for _ in 0..fanout {
+            let (data, index, condition, fts, mode) = (
+                data.clone(),
+                index.clone(),
+                Arc::clone(&condition),
+                Arc::clone(&fts),
+                mode.clone(),
+            );
+            handles.push(tokio::spawn(async move {
+                let operation =
+                    source::ReadOperation::new(Arc::new(source::FetchStats::default()), None);
+                let queued = std::time::Instant::now();
+                let permit = source::acquire_evaluation(&operation, declared)
+                    .await
+                    .unwrap();
+                let waited = queued.elapsed().as_millis();
+                let data_src = LatencySource::new(data, latency);
+                let index_src = LatencySource::new(index, latency);
+                let result = run_evaluation("fanout", &operation, permit, move || {
+                    let reader = VixReader::open_ranged_with_index(
+                        data_src as Arc<dyn VixRangeSource>,
+                        Some(index_src as Arc<dyn VixRangeSource>),
+                    )?;
+                    let result = evaluate_vix_index(
+                        "fanout",
+                        &reader,
+                        &condition,
+                        Some(mode),
+                        range,
+                        true,
+                        Some((ts_min, ts_max)),
+                        None,
+                        Some(&fts),
+                    )?;
+                    let exact = matches!(
+                        result,
+                        RawVixResult::Histogram {
+                            has_skipped: false,
+                            ..
+                        }
+                    );
+                    anyhow::Ok((exact, reader.memory_peak()))
+                })
+                .await;
+                match result {
+                    Ok((exact, peak)) => (true, exact, waited, peak),
+                    Err(error) => {
+                        eprintln!("evaluation failed: {error:#}");
+                        (false, false, waited, 0)
+                    }
+                }
+            }));
+        }
+        let mut out = Vec::with_capacity(fanout);
+        for handle in handles {
+            out.push(handle.await.unwrap());
+        }
+        out
+    });
+    let wall = started.elapsed();
+    let timeouts = config::metrics::VIX_EVAL_GROWTH_TIMEOUTS_TOTAL
+        .with_label_values::<&str>(&[])
+        .get()
+        - timeouts_before;
+    let ok = outcomes.iter().filter(|o| o.0).count();
+    let exact = outcomes.iter().filter(|o| o.1).count();
+    let max_wait = outcomes.iter().map(|o| o.2).max().unwrap_or(0);
+    let max_peak = outcomes.iter().map(|o| o.3).max().unwrap_or(0);
+    eprintln!(
+        "fan-out {fanout}: ok {ok}, exact {exact}, wall {:.0} ms, max admission wait {max_wait} ms, growth timeouts {timeouts}, max reader peak {} KB",
+        wall.as_secs_f64() * 1e3,
+        max_peak / 1024
+    );
+    assert_eq!(ok, fanout, "every evaluation must complete");
+    assert_eq!(exact, fanout, "every evaluation must be refined exactly");
+    assert_eq!(timeouts, 0, "no evaluation may hit the growth wait");
+}
+
 fn selected(field: &str, values: &[&str]) -> IndexCondition {
     IndexCondition {
         conditions: vec![Condition::In(
