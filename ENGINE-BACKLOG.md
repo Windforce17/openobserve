@@ -1352,6 +1352,38 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     `6c9d14f4…`, pushed. GitOps PR #605 (image + request) is OPEN, NOT
     merged — rollout timing after a same-day rollback is the owner's call;
     post-leg battery ≥ 1 h after the rollout.
+- **2026-10-06 13:04Z — `.203` querier rollout (owner: "直接上然后测试").**
+  GitOps #605 (`91dd9763`: image + memory request 18Gi); RS rolled
+  13:04–13:07Z, 10/10 `.203` Running/Ready at 13:07:16Z (Pending pods
+  placed within a minute, no Karpenter wait), 0 restarts, requests 18Gi
+  on all 10, RSS 8.3–10.1 GiB fresh. Rollback: `.200`.
+  - Pre-leg on 4 h-warm `.200` pods (`ops:/tmp/battery_pre203_on200.
+    jsonl`, 48 h window ending 13:00Z): A48 body **38.2 s** (idx 14.7 /
+    scan 23.4) → repeat **23.8 s** (idx 0.4 / scan 23.3); A48 no body
+    32.4 → 20.7 s; B48 8.9 → 1.0 s; hist eq 24 h 7.4 → 0.2 s.
+  - Smoke on the fresh `.203` pods 13:07–13:09Z, INSIDE the post-roll
+    download storm (queue 27k, per-GET 95–120 ms vs ~83 normally): A48
+    body **33.4 s** (idx 30.0 / scan 3.3) → repeat **2.8 s** (idx 1.4 /
+    scan 1.1); A48 no body 28.9 → 2.6 s; B48 14.2 → 1.1 s; hist eq 7.9 →
+    0.2 s. Hits identical to the pre-leg on every shape (48 / 48 / 110 /
+    48), no partial.
+  - Aggregate pass per follower (A48 body r1, Orbit `io_accounting`): idx
+    18.4–30.0 s, **2,444–2,694 files of which 87–120 fell back**
+    (`residual: too many candidate chunks`, ~4 %; those 100 took the
+    scan branch in 3.3 s), **19.6 reads / 3.1 MB per file** (bench 26 /
+    4.0), 7.3–8.3 GB per follower, gate `wait` 1,132–1,911 s ≈ 0.5 s per
+    file (the gate is shared with the 24 h warm-up still running at
+    13:07 and organic traffic → ~90 effective concurrent evaluations, not
+    177). Fleet counters after the smoke: `eval_growth_timeouts_total`
+    **2**, `budget_refused` **2** (`.201`: 323 / 323), `residual: too many
+    candidate chunks` 4,280, no other residual refusal.
+  - Reading: the scan phase is gone (23 s → 1–3 s) and repeats are 8×
+    faster; the cold index phase is where `.200`'s was at the same pod
+    age (storm-bound per-GET). Post-leg scheduled 14:01Z (`ops:/tmp/
+    battery_post203.jsonl`) once the storm drains; organic comparison
+    after that. Candidate follow-ups from the counters: RESIDUAL_MAX_
+    CHUNKS 8 → 16 (the 4 % whose ~9 candidates land in > 8 chunks; one
+    more segment per chunk in the same wave).
 
 ## 2026-09-29 — P2 shipped as `.176` and rolled back within 30 min: the per-stream side table stalled the shared meta DB (commit latency 40–60×, ingest 503s); ranges must live in the segment row
 - What shipped (vix-arch `013c45010` + NATS retry `76fe754b5`, image
