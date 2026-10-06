@@ -1384,6 +1384,49 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     after that. Candidate follow-ups from the counters: RESIDUAL_MAX_
     CHUNKS 8 → 16 (the 4 % whose ~9 candidates land in > 8 chunks; one
     more segment per chunk in the same wave).
+  - **Post-leg 14:01Z, pods 1 h old (`ops:/tmp/battery_post203.jsonl`)
+    vs the warm-`.200` pre-leg, wall / idx / scan ms, hits identical on
+    every row:**
+
+    | query | `.200` warm r1 · r2 | `.203` r1 · r2 |
+    |---|---|---|
+    | A48 body | 38,153 / 14,673 / 23,362 · 23,798 / 392 / 23,342 | 1,939 / 636 / 1,226 (memo from the 13:07 smoke) · 1,327 / 507 / 744 |
+    | A48 no body | 32,400 / 11,894 / 20,379 · 20,742 / 658 / 20,020 | 1,565 / 626 / 875 (memo) · 2,077 / 1,073 / 930 |
+    | A48 pending token | 13,715 / 13,376 · 548 | **9,655 / 9,474** (cold) · 420 |
+    | B48 | 8,880 / 8,273 · 954 | 1,026 / 212 (memo) · 925 |
+    | C24 | 4,615 / 4,545 · 319 | **1,200 / 1,068** (cold) · 481 |
+    | L24 hist | 6,519 / 6,331 · 400 | **5,368 / 5,225** (cold) · 318 |
+    | `IN(3)+match_all` count | 9,525 / 9,367 · 489 | **7,127 / 6,996** (cold) · 276 |
+    | `body = 'error'` dense | 10,073 / 7,514 / 2,516 · 2,763 | **6,435 / 4,484 / 1,899** (cold) · 2,347 |
+    | hist eq 24 h | 7,394 / 7,312 · 223 | 224 (memo) · 238 |
+    | `str_match` 24 h (scan-bound) | 5,122 · 4,104 | 4,939 · 5,782 |
+    | traces APM 1 h | 2,579 · 1,474 | 2,803 · 1,165 |
+
+    The smoked shapes' r1 are exact-memo hits (the result cache now holds
+    the superset shapes as exact); the never-smoked cold shapes are 18–74
+    % faster on 1 h-old pods than on 4 h-warm `.200` pods.
+  - **Truly cold A48 on `.203`** (never-seen 48 h window ending 10-04
+    00:00Z, 14:08Z, downloader queue back at 40k from the post-leg's own
+    windows): wall **31.9 s** (idx 29.0 / scan 2.8) → repeat **4.3 s**.
+    Per follower: **9 of 10 finish the exact aggregate in 11.9–16.6 s**
+    (19.2 reads / 2.8 MB per file, 96 % files exact, per-GET 38–44 ms
+    with ~35 % disk hits, gate `wait` 0.3–0.45 s per file); the wall is
+    one straggler at 28.8 s whose pod spent **4,905 s in the fetch-permit
+    queue** (`queue_us`; the other nine 38–861 s) — the background
+    downloader on that pod (40k queued whole-file downloads) competing
+    for the 512 fetch permits. That is the downloader's measured cost:
+    not per-GET latency (10-06 A/B: 80.6 vs 76.4 ms) but permit
+    contention on the pod with the deepest queue, +16 s on this query's
+    wall. `ZO_DISK_CACHE_MAX_AGE_DAYS=2` (stop whole-file downloads for
+    ad-hoc historical windows) is now justified by a number.
+  - Organic 13:20–14:25Z on `.203` vs 11:30–12:55Z on warm `.200`
+    (`/tmp/pop.py`, n = 87 vs 90): index phase ALL p50 **270 vs 651 ms**,
+    p90 3.3 vs 6.4 s, max 36 vs 59 s; `select+match_all` p50 155 vs 872
+    ms; `select+eq` 257 vs 462 ms. Different class mixes — indicative.
+  - Health 1.5 h in: 0 restarts, RSS 10.3–11.8 GiB, fleet
+    `eval_growth_timeouts_total` 2, `budget_refused` 2 (both from the
+    13:07 smoke inside the warm-up), no evictions (request 18Gi on all
+    10). `.203` stays.
 
 ## 2026-09-29 — P2 shipped as `.176` and rolled back within 30 min: the per-stream side table stalled the shared meta DB (commit latency 40–60×, ingest 503s); ranges must live in the segment row
 - What shipped (vix-arch `013c45010` + NATS retry `76fe754b5`, image
