@@ -1427,6 +1427,35 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     `eval_growth_timeouts_total` 2, `budget_refused` 2 (both from the
     13:07 smoke inside the warm-up), no evictions (request 18Gi on all
     10). `.203` stays.
+  - **Checked and cleared: `select+eq` total p50 1.6 s on `.203` vs 0.46 s
+    on `.200`** (organic 14:00–14:40 vs 11:30–12:10). The class is
+    `trace_id = x LIMIT 5000` lookups; the two populations differ: the
+    `.200` sample was 109 lookups with ≤ 10-minute windows (~400 files,
+    bloom phase 0.5 s), the `.203` sample 41 + 25 lookups with **24 h
+    windows** (1,250–1,390 files per follower, 1,000+ `.bf` groups) — a
+    caller-pattern change in the afternoon. Like for like, 24 h `default/
+    traces` lookups on `.200` (10-06 03:00–05:00Z, pods 11 h warm, no
+    battery): **p50 6.1 s / p90 7.9 s**; on `.203` 14:20–14:55Z (pods 1–2
+    h old, downloader at 78k): 8.1 / 10.9 s — the fresh-pod tax (cold
+    `BLOOM_FOOTER_CACHE`, fetch-permit contention), not the engine. Index
+    time inside those lookups is 3–174 ms per follower.
+  - **Where a warm 24 h trace lookup's 6 s go (next target, not the VIX
+    index)**: per follower, the bloom phase takes **1.2–4.3 s** — ~1,000
+    `(date, bloom_ver)` groups for ~1,250 input files, one block-row range
+    GET per group, i.e. the `.bf` grouping covers ~1.3 files per bloom on
+    `default/traces` (13k files/day) and a needle lookup costs ~1,000 GETs
+    per follower, 10k per query; then the WAL `segments_scan` decodes
+    **0.8–1.0 M records per follower** (100–122 segments) for one trace_id
+    (0.4–1.7 s); the leader waits for the slowest follower. Levers: one
+    `.bf` per stream-hour (24 groups instead of 1,000) in the assembler,
+    and a per-segment bloom or needle index for the WAL scan.
+  - Downloader note: the queue did NOT drain after the battery — 27k →
+    7k (13:27Z) → 40k (14:08, the post-leg's windows) → **78k at 14:54Z
+    with no battery running**: on fresh pods organic queries over the
+    empty 2 TB caches enqueue files faster than they download (10 × the
+    10k per-pod cap, saturated). Permit contention (`queue_us`) is a
+    steady-state tax until the caches fill; `ZO_DISK_CACHE_MAX_AGE_DAYS=2`
+    remains the candidate.
 
 ## 2026-09-29 — P2 shipped as `.176` and rolled back within 30 min: the per-stream side table stalled the shared meta DB (commit latency 40–60×, ingest 503s); ranges must live in the segment row
 - What shipped (vix-arch `013c45010` + NATS retry `76fe754b5`, image
