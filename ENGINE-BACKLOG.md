@@ -1148,28 +1148,36 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     `IN+match_all` 17,887 / 17,653 (22,432 / 22,125); `str_match` 13,733
     (22,874). The scan phase did collapse (30.9 → 5.6 s); the index
     phase tripled, and not only for residual shapes.
-  - Per follower on A48 r1 (Orbit): fast path answered only **118–124 of
-    ~2,300 files**; fallbacks `residual: too many candidate chunks`
-    81–115 and `budget_refused` 17–43 — the refusals counted as skips,
-    the skip-rate bail fired (`skipped_file` 24,134 fleet-wide), the
-    remaining files went through the row-id pass + scan as before, so the
-    aggregate pass was pure added cost. Index-phase remote IO **6.0–7.6
-    GB / 43–48k reads per follower** (`.200`: 2.1–2.6 GB / 28–31k),
-    `active` 3,948–4,291 s, gate `wait` 1,958–3,040 s; fleet counters
-    `eval_growth_timeouts_total` 323, `budget_refused` 323, `residual:
-    too many candidate chunks` 3,695, `too many candidate rows` 16.
-  - Why the sidecar bench did not predict it: the 118 MB sample has
-    7,250-row chunks and 28–500 KB `body` chunk segments; production
-    merged files have **65,536-row chunks** (~230 per 4 GiB file) with
-    multi-MB string segments, and A48's ~9 candidates per file land in
-    ~9 distinct chunks — above the 8-chunk cap for most files. A
-    residual that did run cost **~110 reads / ~27 MB per file**: ≤ 8
-    chunks × 7 full-text columns × ~2 segments, issued under the index
-    phase's 16 KiB coalescing policy (meant for terms cells), decoding
-    65k-row string chunks under 192-way concurrency — hence the budget
-    refusals and growth timeouts. The scan branch pays ~3 requests /
-    ~9 MB per file for the same rows (1 MiB ladder coalescing, 63
-    partitions, DataFusion's pool absorbing the decode memory).
+  - Per follower on A48 r1 (raw follower log, re-read 10-06 10:xxZ —
+    the first reading of this entry misparsed the attribution and was
+    wrong): the aggregate pass **answered 2,224 of 2,337 files exactly**
+    (histogram hits 9,025, correct); only 113 fell back (`residual: too
+    many candidate chunks` 96, `budget_refused` 17) and the scan branch
+    handled those 118 files in 3 s. The regression is the pass's
+    THROUGHPUT: **46,577 reads / 6.2 GB in 65 s = 19.9 reads / 2.85 MB
+    per file — exactly what the sample bench predicted** (12 index + 2
+    docs-footer + ~6 chunk reads; 1.1 + 1.0 + 0.7 MB). Per-read latency
+    92 ms (`active` 4,291 s), so ~8 serial waves ≈ 0.7 s per file, and
+    65 s wall for 2,337 files means only **~25 evaluations were doing IO
+    at any moment** while ~100 held slots: gate `wait` 3,040 s = 1.3 s
+    per file of admission queueing, plus growth waits inside the
+    evaluation (fleet `eval_growth_timeouts_total` 323, `budget_refused`
+    323). Aggregate modes declare the 32 MiB streaming workspace (3.5
+    GiB admissible / 32 MiB = 111 slots, vs 192 for the row-id pass's 12
+    MiB), and every residual grows its lease further (the detached docs
+    open's 1 MB footer window and the decoded chunks are reserved through
+    the reader's memory → `permit.resize`), 111 × several MB > the 512
+    MiB growth headroom → 500 ms `GROWTH_WAIT`s and refusals. Decode CPU
+    is the other suspect: 7 projected columns × ≤ 8 chunks × 7k rows
+    per file ≈ 50 MB decoded per file, ~117 GB per follower.
+  - What was NOT the cause (corrections): prod `logs/default` files are
+    **120–130 MB** (`aws s3 ls` 10-03/12, 10-05/12), the same geometry
+    as the 118 MB sample (7,248-row chunks from the 16 MiB byte clamp),
+    not 4 GiB / 65,536-row chunks; the residual's docs reads ran under
+    the default 1 MiB coalescing (the 16 KiB policy is scoped to the
+    terms-cell read); the skip-rate bail did not fire. The sample bench
+    was predictive per file; what it cannot show is admission under
+    fan-out — that needs a local many-file run against the real gate.
   - Also seen: (1) every rollout starts a download storm — `zo_file_
     downloader_normal_queue_size` 10,007 → **92,657** right after the
     `.201` pods came up (each new pod enqueues its 24 h warm-up,
@@ -1183,19 +1191,24 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     shares those nodes.
   - State: vix-arch keeps both commits (the residual is correct and
     tested; it is not in a shipped image). `.200` is prod. Redesign
-    before any re-rollout of the residual: (a) progressive columns —
-    single-column conjuncts first (`body = v` eliminates nearly every
-    candidate), the multi-column `match_all` disjunction only for
-    survivors; (b) docs reads under the ladder's default 1 MiB
-    coalescing, not the index policy; (c) a bytes-aware cap
-    (chunk × column segments, from the layout) instead of a chunk count;
-    (d) declared/bounded residual memory — a 65k-row string chunk decode
-    is tens of MB, so either a residual semaphore or the gate must know;
-    (e) a prod-geometry fixture in the bench (65,536-row chunks, ~1 KB
-    bodies, 2,000+ columns) as the acceptance gate. The dictionary-wave
-    merge (`76abfc1e4`) is independent and unmeasured in prod (the
-    battery was dominated by the residual); ship it with the redesign,
-    not alone — a rollout costs a 1.5 TB storm.
+    before any re-rollout, in the order of the measured causes: (a)
+    admission — bitmap collectors (SimpleCount / SimpleHistogram over a
+    bitmap, zone-fold) decode no docs column and must declare the row-id
+    workspace (12 MiB) plus a MEASURED residual allowance, not the 32 MiB
+    streaming workspace, and the residual's own reservations must fit
+    that allowance so the growth path is not used; (b) progressive
+    columns — single-column conjuncts first (`body = v`), then the
+    `match_all` disjunction column by column for the rows still
+    undecided (a row is TRUE at its first matching column), so A48 decodes
+    1 column instead of 7 and reads 1–2 chunk segments instead of ~6;
+    (c) the docs footer in ONE round trip (the detached open's initial
+    read sized for a 2,000-column layout, ~1 MB, instead of 256 KiB +
+    `NeedMoreData`), −1 wave per file at the same bytes; (d) acceptance =
+    a local many-copies run of the sample under the real `EVAL_BYTES`
+    gate measuring admitted concurrency and growth refusals, not only the
+    per-file bench. The dictionary-wave merge (`76abfc1e4`) is
+    independent and unmeasured in prod (the battery was dominated by the
+    residual); ship it with the redesign, not alone.
 - **2026-10-06 09:2xZ — `.202` ingester/router hot patch (metrics
   ingest valve), carried onto vix-arch as `655c94aa2`.** GitOps #604
   (`d617360`): `ZO_INGEST_METRICS_DROP="true"` in obs-env + ingester/
