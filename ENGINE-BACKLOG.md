@@ -1054,6 +1054,84 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     the lever, not more concurrency. (b) Item 4, residual filtering inside
     the index for aggregates: the 30–40 s scan is 65–70 % of a cold A48
     and 100 % of a repeat. (c) Then the eager-tail decision.
+- **2026-10-06 — `.201` engine: one dictionary wave for points + tokens,
+  residual filtering INSIDE the index for aggregates (next items (a) and
+  (b) above). vix-arch `76abfc1e4` + `4530dd8d3` (+ bench `b1a44670f`),
+  `release/vix-20261006-201` `4a3aa2851` = `.200` + those, byte-identical;
+  image binary `dc35b548…`, arm64 image id `28a613d8…` (ECR push pending
+  the `eks-prod` SSO login). vortex_index 364 / search 1121 tests.**
+  - **Where the time really went on `.200` (facts, not the report's
+    model).** Per-GET latency on the pod is ~83 ms (`active` 2,468 s /
+    29,893 fetches on the slowest follower) with only 0.5–12 % of it in
+    the fetch-permit queue; a cold file's index time is round trips ×
+    that: open 1 + dictionary 2 + terms cells 1 + plist record 1 = 5
+    waves ≈ 0.44 s/file, 35 rounds of 64 (eval_concurrency per query is
+    192 in prod, `ZO_VIX_SEARCH_CONCURRENCY`) = 15 s. The scan phase
+    (32–54 s) is per-file too: `VixDocs::open_ranged` re-reads every
+    file's docs footer (256 KiB probe + a 759 KB `NeedMoreData` layout on
+    the 118 MB sample, 2–3 MB on 4 GiB files, two round trips) and
+    decodes the predicate columns' chunks — **~26 GB / 6.7k requests per
+    follower for 9,846 candidate rows** (`zo_storage_read_bytes` delta on
+    one pod across a never-seen cold A48: +28.9 GB / +36.7k requests, of
+    which the index phase is ~2.5 GB / 30k), under DataFusion's 63
+    partitions. Both passes paid for the same `has_skipped` superset, and
+    the repeat paid the scan again because a superset never memoises as
+    exact (`.200` r2: idx 0.6 s, scan 28 s).
+  - Also found: each querier runs a permanent background downloader —
+    `zo_file_downloader_normal_queue_size` 10,007 on a 13 h-old pod, pod
+    RX **5.56 TB in 13 h (~120–150 MB/s continuously)**, disk cache 997
+    GB of 1.5 TB; every cold 48 h query enqueues ~148 GB of whole-file
+    downloads per follower (`background download admission … accepted=
+    2219 accepted_bytes=148 GB`). It shares the S3 client and the node NIC
+    with query reads. Not changed here; it is the first suspect for the
+    83 ms per GET and worth its own measurement (pause it on one pod, time
+    the same cold query).
+  - Engine (a), `vortex_index/reader.rs`: `eval_and` sizes the token
+    dictionary plan from the tail-resident directory first (IO-free
+    `walk_point_targets` / `planned_point_bytes`); up to
+    `MERGED_POINT_WAVE_MAX_BYTES` = 256 KiB (the prod shape plans ~5
+    blocks / 40 KB) the named point leaves and every token leaf go out in
+    ONE block fetch; a large plan (an unscoped match_all over a 1,000-field
+    schema reads a block per field) keeps points-first, so the wide-schema
+    guard holds. Prod sidecar `and_io_bench` (1 ms latency): A48 4 → 3
+    eval waves, same 12 reads / bytes; absent-token shapes 2 → 1.
+  - Engine (b), `search/src/vix/residual.rs`: an aggregate over a
+    superset bitmap point-reads the candidates' predicate columns through
+    `VixReader::detached_docs` (the docs footer lives in the detached
+    handle and drops with it — the cached reader's ~1 MB metadata tier is
+    untouched; test `detached_docs_point_read_retains_nothing_in_the_
+    reader`) and evaluates the WHOLE condition with
+    `IndexCondition::to_physical_expr` — the scan branch's own expression,
+    identical semantics by construction (`match_all` = `ILIKE '%v%'` over
+    the present full-text columns, `_` wildcard included). The collectors
+    run on the exact bitmap, the per-file result memoises as exact, the
+    file never reaches the scan. Bounds: 4,096 candidates / 8 docs chunks
+    per file, string-typed columns only, Regex/NumericCmp refused — every
+    refusal is the old fallback with a counted reason (`residual: …`).
+    Query-side shortcuts (`reader.count(&query)`, single-term plist
+    cursors) are off under a refinement. Prod sidecar
+    (`prod_file_residual_histogram_cost`): superset 8 → exact 8 rows,
+    index 4 waves + docs footer 2 + chunks 2 = **~9 waves / 4.2 MB per
+    cold file**, no second pass, no scan phase. Model for a cold A48: ~9
+    × 83 ms ≈ 0.7 s/file, 2,300 files / 192 ≈ 12 rounds ≈ 9 s total vs
+    49–64 s; repeats ≈ 0.5 s (exact memo).
+  - Contract change (tests rewritten, not re-pinned): `multiword_full_
+    text_aggregates_are_refined_to_the_exact_residual_rows` and
+    `review_wave_b_skipped_condition_is_refined_to_the_exact_count`
+    replace the two tests that asserted "multi-word match_all / fts
+    equality aggregates refuse and go to the scan"; expected rows come
+    from DataFusion's own `LIKE` evaluation of the candidates.
+  - Pre-leg battery on `.200` pods 14 h old (`ops:/tmp/battery_pre201_
+    on200.jsonl`, the 48 h window re-anchored): the window's entries are
+    out of both caches again — A48 r1 49.4 s (idx 18.4 / scan 30.9), r2
+    29.0 s (idx 0.6 / scan 28.3); `IN+match_all` 22.4 s (idx 22.1);
+    hist eq 10.9 s (idx 10.8); `str_match` 24 h 22.9 s (scan 21.6).
+  - Visible next steps from the same traces: the docs footer open is 2
+    round trips (256 KiB probe then the layout) and the candidate chunks
+    come in 2 waves (13 segment reads > the 8-in-flight limit) — a 1 MiB
+    initial read for data objects and a larger in-flight window would make
+    the residual 3 waves instead of 4; the per-file `to_vix_query` lines
+    are debug now (were ~4,500 INFO lines per follower per 48 h query).
 
 ## 2026-09-29 — P2 shipped as `.176` and rolled back within 30 min: the per-stream side table stalled the shared meta DB (commit latency 40–60×, ingest 503s); ranges must live in the segment row
 - What shipped (vix-arch `013c45010` + NATS retry `76fe754b5`, image
