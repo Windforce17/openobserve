@@ -1064,6 +1064,30 @@ const EVAL_ROW_ID_WORKSPACE_BYTES: usize = 12 * 1024 * 1024;
 /// Transient workspace of a streaming aggregate collector: one decoded
 /// ≤ 65,536-row docs chunk with its arrow buffers, plus bounded group maps.
 const EVAL_STREAMING_WORKSPACE_BYTES: usize = 32 * 1024 * 1024;
+/// Allowance for the in-index residual filter an aggregate may run on a
+/// superset predicate (`residual.rs`): its only gate-visible reservation
+/// is the detached docs footer open — `footer_memory_bound` (×8) of a
+/// ≤ 1 MB footer window on 2,000-column production files; the point-read
+/// decode itself is not reserved (measured 2.8–4.6 MB real peak for one
+/// column, `examples/residual_alloc_probe.rs`). Declared at admission so the
+/// residual never takes the growth path: on `.201` 111 admitted aggregates
+/// each growing by the then ×64 footer charge (~37 MB) against the 512 MiB
+/// headroom serialised the whole pass through 500 ms growth waits.
+const EVAL_RESIDUAL_BYTES: usize = 8 * 1024 * 1024;
+/// What one evaluation GROWS its lease by beyond the declaration: the
+/// reader-owned bytes (retained metadata plus every pending reservation at
+/// its peak) the gate charges on top. Measured with the per-reader
+/// high-water mark (`VixReader::memory_peak`, `examples/residual_alloc_
+/// probe.rs`, 2026-10-06) on production files under the ×8 footer bound:
+/// ranged open 6.1 MB (2,233-column logs) / 3.7 MB (539-column apisix), a
+/// residual-refined histogram 10.6 MB — the detached docs footer's 1 MiB
+/// read charged ×8 on top of the open. Slots × (declared + this) is the
+/// gate's real demand: 192 × (12.2 + 12) MiB = 4.5 GiB for row-id passes
+/// (the growth beyond 3.5 GiB of admissions is served from the free
+/// 0.5 GiB headroom as evaluations finish), ~130 concurrent residual
+/// histograms at (20.2 + 12) MiB. Not an admission input: the invariant
+/// pinned by `residual_refined_histogram_completes_inside_its_declaration`.
+const EVAL_GROWTH_ALLOWANCE_BYTES: usize = 12 * 1024 * 1024;
 
 /// Bounded transient decoding/group workspace and mode-specific row buffers.
 /// Reader/index ownership is charged separately, before each real allocation.
@@ -1080,6 +1104,7 @@ fn evaluation_working_bytes(
     mode: Option<&IndexOptimizeMode>,
     fully_covered: bool,
     index_only: bool,
+    file_span: Option<(i64, i64)>,
 ) -> usize {
     let rows = usize::try_from(records.max(0)).unwrap_or(usize::MAX);
     // Evaluation/composition can retain the condition, timestamp and result
@@ -1110,6 +1135,23 @@ fn evaluation_working_bytes(
         // every corresponding timestamp and hold all candidate tuples at once.
         // A LIMIT-only reservation would undercount this real by-value path.
         Some(IndexOptimizeMode::SimpleSelect(..)) => rows.saturating_mul(48),
+        // A file whose whole span lies in ONE bucket of the grid never
+        // decodes `_timestamp`: the whole-file bucket answers from the
+        // count, and a bitmap fold finds no chunk straddling an edge. Prod
+        // UI histograms (1 h buckets over files spanning minutes) are this
+        // case almost always; a file crossing an edge keeps the full-column
+        // bound below (boundary rows × 8 B id + 8 B timestamp, legacy files
+        // without a zone map decode every matched timestamp).
+        Some(IndexOptimizeMode::SimpleHistogram(min_value, width, buckets, offset))
+            if file_span.is_some_and(|(lo, hi)| {
+                collect::histogram_range_bucket(lo, hi, *min_value, *width, *buckets, *offset)
+                    .ok()
+                    .flatten()
+                    .is_some()
+            }) =>
+        {
+            0
+        }
         // Histogram/count-field/min-max legacy fallbacks may read a full
         // numeric column rather than only their zone/chunk metadata.
         _ => rows.saturating_mul(16),
@@ -1140,7 +1182,13 @@ fn evaluation_working_bytes(
     let row_bytes = bitmaps.saturating_add(clamp).saturating_add(collector_rows);
     let workspace = match mode {
         None => EVAL_ROW_ID_WORKSPACE_BYTES,
-        Some(_) => EVAL_STREAMING_WORKSPACE_BYTES,
+        // bitmap collectors: the count and the zone-folded histogram decode
+        // no docs column (boundary chunks' `_timestamp` only) — the row-id
+        // workspace plus the residual allowance, not the streaming one
+        Some(IndexOptimizeMode::SimpleCount) | Some(IndexOptimizeMode::SimpleHistogram(..)) => {
+            EVAL_ROW_ID_WORKSPACE_BYTES.saturating_add(EVAL_RESIDUAL_BYTES)
+        }
+        Some(_) => EVAL_STREAMING_WORKSPACE_BYTES.saturating_add(EVAL_RESIDUAL_BYTES),
     };
     workspace.saturating_add(row_bytes)
 }
@@ -1565,7 +1613,7 @@ pub async fn warm_file(
     };
     // Warming only opens the ranged reader and parses metadata; it is
     // best-effort background work, so keep the conservative workspace.
-    let bytes = evaluation_working_bytes(0, None, true, false);
+    let bytes = evaluation_working_bytes(0, None, true, false, None);
     let Some(permit) = source::try_acquire_evaluation(bytes) else {
         return Ok(false);
     };
@@ -1769,6 +1817,7 @@ async fn search_vix_index(
         idx_optimize_rule.as_ref(),
         file_in_range,
         index_only,
+        Some((parquet_file.meta.min_ts, parquet_file.meta.max_ts)),
     );
     // Queue on the cache entry without owning its reader or any eval capacity.
     // Compatibility is immutable metadata copied into the weak lookup handle.
@@ -2128,6 +2177,7 @@ async fn search_vix_docs_optimized(
         idx_optimize_rule.as_ref(),
         time_clamp.is_none(),
         false,
+        Some((file.meta.min_ts, file.meta.max_ts)),
     );
     let permit = source::acquire_evaluation(operation, declared_bytes).await?;
     let account = file.account.clone();
@@ -2410,7 +2460,7 @@ fn evaluate_vix_index(
     // back); fields NO document carries evaluate to the exact empty result
     // (the file is eliminated, not scanned). match_all values tokenize with
     // the canonical index tokenizer (the writer's).
-    let (query, has_skipped) = match condition.to_vix_query(
+    let (query, verdicts) = match condition.to_vix_query_detailed(
         trace_id,
         &|field| field_capability(reader, field),
         &index_match_all_tokens,
@@ -2420,9 +2470,22 @@ fn evaluate_vix_index(
         // M16 §4: the whole condition is ONE skipped conjunct
         // (AllConditionsSkipped) — but the stats bitmap serves it exactly,
         // so evaluate as condition-all with the override in eval_bitmap
-        Err(_) if stats_eq.is_some() => (vortex_index::VixQuery::All, false),
+        Err(_) if stats_eq.is_some() => (
+            vortex_index::VixQuery::All,
+            vec![crate::index::ConjunctVerdict::Exact; condition.conditions.len()],
+        ),
         Err(e) => return Err(e),
     };
+    // the conjuncts the index did not answer exactly (skipped, token
+    // superset, or a phrase whose token AND is a superset): what the row-id
+    // contract re-applies downstream and the aggregate residual re-evaluates
+    let inexact: Vec<usize> = verdicts
+        .iter()
+        .enumerate()
+        .filter(|(_, verdict)| **verdict != crate::index::ConjunctVerdict::Exact)
+        .map(|(index, _)| index)
+        .collect();
+    let has_skipped = !inexact.is_empty();
     // the active scope wraps the query only while full-text leaves are
     // evaluated; token supersets of fts-field equalities carry their own
     // single-field scope
@@ -2435,7 +2498,7 @@ fn evaluate_vix_index(
     };
     // M16 §4: the (single) skipped conjunct is served exactly by the stats
     // bitmap — the evaluation is no longer a weaker predicate
-    let has_skipped = (has_skipped || !condition.can_remove_filter()) && stats_eq.is_none();
+    let has_skipped = has_skipped && stats_eq.is_none();
     // A superset under an aggregate mode is refined to the exact match set
     // in the index phase (`residual`, below the bitmap memo) — the file
     // falls to the scan branch only when the refinement is refused.
@@ -2607,7 +2670,13 @@ fn evaluate_vix_index(
     // is the pre-existing scan-branch fallback, with the reason counted.
     let residual: Option<BooleanBuffer> = if aggregate && has_skipped {
         let superset = superset_bitmap(reader)?;
-        match residual::refine_superset(reader, condition, scope_full_text_fields, &superset)? {
+        match residual::refine_superset(
+            reader,
+            condition,
+            &inexact,
+            scope_full_text_fields,
+            &superset,
+        )? {
             Ok(exact) => {
                 log::debug!(
                     "[trace_id {trace_id}] search->vix: residual filter kept {} of {} candidate rows",
@@ -4155,14 +4224,15 @@ mod tests {
             .unwrap();
         assert_eq!(superset.count_set_bits(), 3);
         assert_eq!(
-            residual::refine_superset_within(&reader, &equality, &fts, &superset, 2, 8)
+            residual::refine_superset_within(&reader, &equality, &[0], &fts, &superset, 2, 8)
                 .unwrap()
                 .unwrap_err(),
             residual::Refusal::TooManyRows(3)
         );
-        let exact = residual::refine_superset_within(&reader, &equality, &fts, &superset, 3, 8)
-            .unwrap()
-            .unwrap();
+        let exact =
+            residual::refine_superset_within(&reader, &equality, &[0], &fts, &superset, 3, 8)
+                .unwrap()
+                .unwrap();
         assert_eq!(exact.set_indices().collect::<Vec<_>>(), vec![0]);
     }
 
@@ -7598,24 +7668,35 @@ mod workspace_tests {
 
         // SimpleCount: fixed components + bitmaps only (no group collector)
         assert_eq!(
-            evaluation_working_bytes(3000, Some(&count), true, true),
+            evaluation_working_bytes(3000, Some(&count), true, true, None),
             (fixed + bitmaps) * EVAL_INDEX_ONLY_SAFETY
         );
         // group shapes add the bounded collector
         for mode in [&top_n, &distinct, &in_multi] {
             assert_eq!(
-                evaluation_working_bytes(3000, Some(mode), true, true),
+                evaluation_working_bytes(3000, Some(mode), true, true, None),
                 (fixed + groups * EVAL_GROUP_ENTRY_BYTES + bitmaps) * EVAL_INDEX_ONLY_SAFETY
             );
         }
-        // the same shapes on a straddling file keep the clamp declaration
-        for mode in [&count, &top_n] {
-            let straddling = evaluation_working_bytes(3000, Some(mode), false, false);
-            assert_eq!(
-                straddling,
-                32 * 1024 * 1024 + 3000usize.div_ceil(8) * 4 + 3000 * 24
-            );
-        }
+        // the same shapes on a straddling file keep the clamp declaration:
+        // the bitmap count on the row-id workspace, top-N on the streaming
+        // one, both with the residual allowance
+        let straddling_count = evaluation_working_bytes(3000, Some(&count), false, false, None);
+        assert_eq!(
+            straddling_count,
+            EVAL_ROW_ID_WORKSPACE_BYTES
+                + EVAL_RESIDUAL_BYTES
+                + 3000usize.div_ceil(8) * 4
+                + 3000 * 24
+        );
+        let straddling_top_n = evaluation_working_bytes(3000, Some(&top_n), false, false, None);
+        assert_eq!(
+            straddling_top_n,
+            EVAL_STREAMING_WORKSPACE_BYTES
+                + EVAL_RESIDUAL_BYTES
+                + 3000usize.div_ceil(8) * 4
+                + 3000 * 24
+        );
     }
 
     /// The eligibility gate itself: exact-term count, condition-all top-N /
@@ -7812,7 +7893,7 @@ mod workspace_tests {
                 Some((1_000_000, 1_000_000 + rows)),
                 (0, 2_000_000)
             ));
-            let declared = evaluation_working_bytes(rows, Some(&mode), true, true);
+            let declared = evaluation_working_bytes(rows, Some(&mode), true, true, None);
             assert!(
                 declared < 8 * 1024 * 1024,
                 "{name} declaration {declared} is not a small workspace"
@@ -7878,7 +7959,7 @@ mod workspace_tests {
         let rows = 100_000i64;
         let all = condition_all();
         let top_n = IndexOptimizeMode::SimpleTopN(vec!["level".into()], 10, false);
-        let declared = evaluation_working_bytes(rows, Some(&top_n), true, true);
+        let declared = evaluation_working_bytes(rows, Some(&top_n), true, true, None);
         let operation = source::ReadOperation::new(Arc::new(source::FetchStats::default()), None);
         let permit = source::try_acquire_evaluation(declared)
             .expect("declaration must fit the process evaluation gate");
@@ -7907,38 +7988,231 @@ mod workspace_tests {
         assert!(permit.check_refusal().is_ok(), "no sticky refusal");
     }
 
-    /// A straddling file still declares the clamp: the streaming workspace
-    /// with rows*24 must appear in the declaration of every shape.
+    /// The `.201` failure mode, pinned: a residual-refined aggregate must
+    /// complete inside its DECLARATION — a private gate sized at exactly
+    /// the declared bytes admits it and nothing it does afterwards may need
+    /// the growth path (which waits 500 ms and refuses). The file is
+    /// ranged, 200k rows with an fts field, its docs blob larger than the
+    /// detached open's 1 MiB initial read, so the open charges the full
+    /// `footer_memory_bound`; the condition is an fts-field equality (a
+    /// token superset) so the residual actually runs and point-reads the
+    /// column.
+    #[test]
+    fn residual_refined_histogram_completes_inside_its_declaration() {
+        use arrow::{
+            array::{Int64Array, RecordBatch, StringArray},
+            datatypes::{DataType, Field, Schema},
+        };
+        use vortex_index::{VixWriter, VixWriterOptions};
+
+        let rows = 200_000usize;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("level", DataType::Utf8, false),
+            Field::new("message", DataType::Utf8, false),
+        ]));
+        let opts = VixWriterOptions {
+            fts_field_names: vec!["message".to_string()],
+            ..Default::default()
+        };
+        let mut writer = VixWriter::new(&schema, opts, false);
+        let ts: Vec<i64> = (0..rows as i64).map(|i| 1_000_000 + i * 10).collect();
+        let level: Vec<&str> = (0..rows)
+            .map(|i| if i % 3 == 0 { "info" } else { "warn" })
+            .collect();
+        // every 20,000th row holds the phrase; rows 10 apart hold its tokens
+        // reordered (the superset the index returns, the residual rejects)
+        let message: Vec<String> = (0..rows)
+            .map(|i| {
+                if i % 20_000 == 0 {
+                    "deploy callback sent".to_string()
+                } else if i % 20_000 == 10 {
+                    "sent callback deploy".to_string()
+                } else {
+                    format!(
+                        "worker {i} heartbeat ok payload-{:08x}-{:08x}",
+                        i * 2654435761u64 as usize,
+                        i ^ 0x5bd1e995
+                    )
+                }
+            })
+            .collect();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(ts.clone())),
+                Arc::new(StringArray::from(level.clone())),
+                Arc::new(StringArray::from(message.clone())),
+            ],
+        )
+        .unwrap();
+        let sources: Vec<String> = (0..rows)
+            .map(|i| {
+                format!(
+                    r#"{{"_timestamp":{},"level":"{}","message":{}}}"#,
+                    ts[i],
+                    level[i],
+                    serde_json::to_string(&message[i]).unwrap()
+                )
+            })
+            .collect();
+        writer
+            .push_batch_with_source(&batch, &StringArray::from(sources), None)
+            .unwrap();
+        let (data, index) = writer.finish().unwrap();
+        let (data, index) = (Bytes::from(data), Bytes::from(index.unwrap()));
+        assert!(
+            data.len() as u64 > 2 * vortex_index::DETACHED_DOCS_FOOTER_READ_BYTES,
+            "the docs object must exceed the detached initial read ({} B)",
+            data.len()
+        );
+
+        let condition = IndexCondition {
+            conditions: vec![
+                Condition::Equal("message".into(), "deploy callback sent".into()),
+                Condition::Equal("level".into(), "info".into()),
+            ],
+        };
+        let mode = IndexOptimizeMode::SimpleHistogram(1_000_000, 500_000, 4, 0);
+        // the file spans all four buckets: boundary chunks decode their
+        // timestamps, so the declaration carries the rows*16 column bound
+        let span = Some((ts[0], ts[rows - 1]));
+        let declared = evaluation_working_bytes(rows as i64, Some(&mode), true, false, span);
+        assert_eq!(
+            declared,
+            EVAL_ROW_ID_WORKSPACE_BYTES + EVAL_RESIDUAL_BYTES + rows.div_ceil(8) * 4 + rows * 16
+        );
+        // The gate charges reader-owned bytes (retained + pending: tails,
+        // footer windows, dictionary blocks) ON TOP of the declaration, so
+        // every evaluation grows. What must hold is that the growth stays
+        // under EVAL_GROWTH_ALLOWANCE_BYTES, so `slots × (declared +
+        // allowance)` fits the gate and no growth ever waits: a private
+        // gate of exactly that size admits the evaluation and completes it
+        // without the 500 ms growth wait or a refusal. `.201` grew each
+        // residual by ~37 MB (the then ×64 footer charge) against this.
+        let budget = declared + EVAL_GROWTH_ALLOWANCE_BYTES;
+        let permit = source::try_acquire_evaluation_under(budget, declared)
+            .expect("the declaration admits on a gate of its size plus the growth allowance");
+        let operation = source::ReadOperation::new(Arc::new(source::FetchStats::default()), None);
+        let fts = ["message".to_string()];
+        let started = std::time::Instant::now();
+        let (result, owned_peak) = operation
+            .run_evaluation(&permit, || {
+                let reader = ranged_reader(data.clone(), index.clone());
+                let result = evaluate_vix_index(
+                    "residual-under-declaration",
+                    &reader,
+                    &condition,
+                    Some(mode.clone()),
+                    (1_000_000, 1_000_000 + rows as i64 * 10),
+                    true,
+                    Some((1_000_000, 1_000_000 + (rows as i64 - 1) * 10)),
+                    None,
+                    Some(&fts),
+                )?;
+                anyhow::Ok((result, reader.memory_peak()))
+            })
+            .unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "completion must not hit the 500 ms growth wait"
+        );
+        assert!(permit.check_refusal().is_ok(), "no sticky refusal");
+        assert!(
+            owned_peak <= EVAL_GROWTH_ALLOWANCE_BYTES,
+            "reader-owned peak {owned_peak} B must stay under the growth allowance"
+        );
+        match result {
+            RawVixResult::Histogram {
+                histogram,
+                has_skipped,
+            } => {
+                assert!(!has_skipped, "refined in the index phase");
+                // phrase rows 0, 20k, …, 180k; `info` = i % 3 == 0 → rows
+                // 0, 60k, 120k, 180k; buckets of 50k rows (500,000 µs)
+                assert_eq!(histogram, vec![1, 1, 1, 1]);
+            }
+            other => panic!("expected an exact histogram, got {other:?}"),
+        }
+    }
+
+    /// A straddling file still declares the clamp: rows*24 must appear in
+    /// the declaration of every shape.
     #[test]
     fn straddling_files_keep_the_clamp_declaration() {
         let count = IndexOptimizeMode::SimpleCount;
         let rows = 100_000i64;
-        let declared = evaluation_working_bytes(rows, Some(&count), false, false);
+        let declared = evaluation_working_bytes(rows, Some(&count), false, false, None);
         let clamp = 100_000usize * 24;
         let bitmaps = 100_000usize.div_ceil(8) * 4;
-        assert_eq!(declared, 32 * 1024 * 1024 + clamp + bitmaps);
+        assert_eq!(
+            declared,
+            EVAL_ROW_ID_WORKSPACE_BYTES + EVAL_RESIDUAL_BYTES + clamp + bitmaps
+        );
     }
 
     /// Row-id evaluations (`mode == None`) declare the measured 12 MiB
-    /// transient workspace (+ bitmaps, + the clamp when straddling), not the
-    /// 32 MiB streaming-collector workspace: with the prod gate
-    /// (`ZO_VIX_EVAL_MAX_BYTES` 4 GiB, 1/8 growth headroom) all 192 search
-    /// slots admit at once for a 2 M-row file instead of ~120.
+    /// transient workspace (+ bitmaps, + the clamp when straddling); the
+    /// bitmap collectors (count, zone-folded histogram) declare it plus the
+    /// residual allowance; only streaming collectors (top-N, distinct,
+    /// multi-histogram, count-field, min-max) declare the 32 MiB workspace.
+    /// With the prod gate (`ZO_VIX_EVAL_MAX_BYTES` 4 GiB, 1/8 growth
+    /// headroom) all 192 search slots admit at once for row-id evaluations
+    /// of a 2 M-row file and ≥ 170 for a residual-capable count/histogram —
+    /// `.201` admitted ~111 aggregates and grew each one past its lease.
     #[test]
     fn row_id_evaluations_declare_the_measured_workspace() {
         let rows = 2_000_000i64;
         let bitmaps = 2_000_000usize.div_ceil(8) * 4;
-        let covered = evaluation_working_bytes(rows, None, true, false);
+        let covered = evaluation_working_bytes(rows, None, true, false, None);
         assert_eq!(covered, EVAL_ROW_ID_WORKSPACE_BYTES + bitmaps);
-        let straddling = evaluation_working_bytes(rows, None, false, false);
+        let straddling = evaluation_working_bytes(rows, None, false, false, None);
         assert_eq!(
             straddling,
             EVAL_ROW_ID_WORKSPACE_BYTES + bitmaps + 2_000_000usize * 24
         );
-        // aggregate collectors keep the streaming workspace
-        let streaming =
-            evaluation_working_bytes(rows, Some(&IndexOptimizeMode::SimpleCount), true, false);
-        assert_eq!(streaming, EVAL_STREAMING_WORKSPACE_BYTES + bitmaps);
+        let bitmap_count = evaluation_working_bytes(
+            rows,
+            Some(&IndexOptimizeMode::SimpleCount),
+            true,
+            false,
+            None,
+        );
+        assert_eq!(
+            bitmap_count,
+            EVAL_ROW_ID_WORKSPACE_BYTES + EVAL_RESIDUAL_BYTES + bitmaps
+        );
+        // a histogram file inside ONE bucket of the grid decodes no
+        // timestamp; one crossing an edge keeps the rows*16 column bound
+        let hist = IndexOptimizeMode::SimpleHistogram(0, 3_600_000_000, 48, 0);
+        let single_bucket =
+            evaluation_working_bytes(rows, Some(&hist), true, false, Some((10, 3_000_000_000)));
+        assert_eq!(single_bucket, bitmap_count);
+        let crossing = evaluation_working_bytes(
+            rows,
+            Some(&hist),
+            true,
+            false,
+            Some((3_599_000_000, 3_601_000_000)),
+        );
+        assert_eq!(crossing, bitmap_count + 2_000_000usize * 16);
+        let unknown_span = evaluation_working_bytes(rows, Some(&hist), true, false, None);
+        assert_eq!(unknown_span, crossing);
+        let streaming = evaluation_working_bytes(
+            rows,
+            Some(&IndexOptimizeMode::SimpleTopN(
+                vec!["svc".into()],
+                10,
+                false,
+            )),
+            true,
+            false,
+            None,
+        );
+        assert_eq!(
+            streaming,
+            EVAL_STREAMING_WORKSPACE_BYTES + EVAL_RESIDUAL_BYTES + bitmaps
+        );
         let gate = 4usize << 30;
         let admissible = gate - gate / 8;
         assert!(
@@ -7947,8 +8221,13 @@ mod workspace_tests {
             192 * covered
         );
         assert!(
+            170 * bitmap_count <= admissible,
+            "170 residual-capable counts ({}) must fit the admissible gate share ({admissible})",
+            170 * bitmap_count
+        );
+        assert!(
             192 * streaming > admissible,
-            "the streaming workspace is the one that did not fit"
+            "the streaming workspace is the one that does not fit"
         );
     }
 }

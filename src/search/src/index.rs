@@ -105,6 +105,25 @@ pub enum FieldCap {
     Absent,
 }
 
+/// How the per-file index serves one conjunct of an [`IndexCondition`]
+/// (see [`IndexCondition::to_vix_query_detailed`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConjunctVerdict {
+    /// The query answers it exactly: a term-indexed field, or an absence
+    /// proof (`Nothing`).
+    Exact,
+    /// In the query, but as the superset of its tokens (an equality on a
+    /// token-indexed field): the filter is re-applied.
+    Superset,
+    /// In the query as its token AND, which is a superset of the SQL
+    /// substring predicate by construction (a multi-word `match_all`,
+    /// [`Condition::can_remove_filter`] false).
+    Phrase,
+    /// Not in the query at all (the file cannot serve it): the filter is
+    /// re-applied.
+    Skipped,
+}
+
 // note the condition in IndexCondition is connection by AND operator
 #[derive(Default, Clone, Hash, Eq, PartialEq)]
 pub struct IndexCondition {
@@ -193,7 +212,34 @@ impl IndexCondition {
         tokenize: &dyn Fn(&str) -> Vec<String>,
         fulltext_servable: bool,
     ) -> anyhow::Result<(VixQuery, bool)> {
-        let mut has_skipped = false;
+        let (query, verdicts) =
+            self.to_vix_query_detailed(trace_id, field_cap, tokenize, fulltext_servable)?;
+        Ok((
+            query,
+            verdicts.iter().any(|verdict| {
+                matches!(
+                    verdict,
+                    ConjunctVerdict::Skipped | ConjunctVerdict::Superset
+                )
+            }),
+        ))
+    }
+
+    /// [`Self::to_vix_query`] with the per-conjunct verdict (one per entry of
+    /// `self.conditions`, in order). The row-id contract re-applies the
+    /// filter when any conjunct is `Skipped` or `Superset` (that is
+    /// `to_vix_query`'s `has_skipped`); an aggregate residual re-evaluates
+    /// every conjunct that is not [`ConjunctVerdict::Exact`] — including
+    /// [`ConjunctVerdict::Phrase`], whose index form is in the query but is a
+    /// superset by construction.
+    pub fn to_vix_query_detailed(
+        &self,
+        trace_id: &str,
+        field_cap: &dyn Fn(&str) -> FieldCap,
+        tokenize: &dyn Fn(&str) -> Vec<String>,
+        fulltext_servable: bool,
+    ) -> anyhow::Result<(VixQuery, Vec<ConjunctVerdict>)> {
+        let mut exact = Vec::with_capacity(self.conditions.len());
         let mut queries: Vec<VixQuery> = Vec::with_capacity(self.conditions.len());
         for condition in &self.conditions {
             if !fulltext_servable && condition.uses_full_text() {
@@ -201,7 +247,7 @@ impl IndexCondition {
                     "[trace_id {trace_id}] to_vix_query: skipping full-text condition {}, an active full-text field is not token-indexed in this file",
                     condition.to_query()
                 );
-                has_skipped = true;
+                exact.push(ConjunctVerdict::Skipped);
                 continue;
             }
             // classify the fields this condition looks up in the per-file
@@ -239,14 +285,14 @@ impl IndexCondition {
                     condition.to_query()
                 );
                 queries.push(query);
-                has_skipped = true;
+                exact.push(ConjunctVerdict::Superset);
                 continue;
             }
             if let Some((missing, why)) = unservable {
                 log::debug!(
                     "[trace_id {trace_id}] to_vix_query: skipping condition, field {missing} is {why} in this file"
                 );
-                has_skipped = true;
+                exact.push(ConjunctVerdict::Skipped);
                 continue;
             }
             if !absent.is_empty() {
@@ -259,6 +305,7 @@ impl IndexCondition {
                         "[trace_id {trace_id}] to_vix_query: condition on absent field(s) {absent:?} matches nothing in this file"
                     );
                     queries.push(VixQuery::Nothing);
+                    exact.push(ConjunctVerdict::Exact);
                     continue;
                 }
                 // mixed shape (e.g. OR of an absent-field predicate with a
@@ -267,27 +314,34 @@ impl IndexCondition {
                 log::info!(
                     "[trace_id {trace_id}] to_vix_query: skipping condition, absent field(s) {absent:?} appear in a shape the index cannot decide"
                 );
-                has_skipped = true;
+                exact.push(ConjunctVerdict::Skipped);
                 continue;
             }
             match condition.to_vix_query(tokenize) {
                 Ok(query) => {
                     queries.push(query);
+                    // the index form of a multi-word match_all is the token
+                    // AND: a superset of the substring predicate
+                    exact.push(if condition.can_remove_filter() {
+                        ConjunctVerdict::Exact
+                    } else {
+                        ConjunctVerdict::Phrase
+                    });
                 }
                 Err(e) => {
                     log::info!(
                         "[trace_id {trace_id}] to_vix_query: skipping condition due to error: {e}"
                     );
-                    has_skipped = true;
+                    exact.push(ConjunctVerdict::Skipped);
                 }
             }
         }
         if queries.is_empty() {
             Err(anyhow::Error::new(AllConditionsSkipped))
         } else if queries.len() == 1 {
-            Ok((queries.pop().unwrap(), has_skipped))
+            Ok((queries.pop().unwrap(), exact))
         } else {
-            Ok((VixQuery::And(queries), has_skipped))
+            Ok((VixQuery::And(queries), exact))
         }
     }
 

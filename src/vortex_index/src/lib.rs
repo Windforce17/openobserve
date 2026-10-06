@@ -117,8 +117,8 @@ pub use numeric::{
 };
 pub use query::VixQuery;
 pub use reader::{
-    DocsDictBatch, DocsDictChunk, DocsPointReader, FieldValueCounts, PlistCursor,
-    ReaderMemoryObserver, TermVisitor, VixReader, ZoneChunk,
+    DETACHED_DOCS_FOOTER_READ_BYTES, DocsDictBatch, DocsDictChunk, DocsPointReader,
+    FieldValueCounts, PlistCursor, ReaderMemoryObserver, TermVisitor, VixReader, ZoneChunk,
 };
 pub use source::{
     BytesRangeSource, VixRangeSource, VixReadOperation, check_read_cancelled, check_read_memory,

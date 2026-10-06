@@ -137,21 +137,27 @@ pub(crate) struct ReaderMemory {
     bytes: AtomicUsize,
     /// Retained bytes plus all simultaneously pending allocations.
     total: AtomicUsize,
+    /// High-water mark of `total`: the most this reader ever asked its
+    /// admission gate for at one moment (what a declaration must cover).
+    peak: AtomicUsize,
     observers: Mutex<Vec<Weak<dyn ReaderMemoryObserver>>>,
 }
 
 impl ReaderMemory {
     pub(crate) fn new() -> Self {
+        let base = std::mem::size_of::<Self>() + 2 * std::mem::size_of::<usize>();
         Self {
-            bytes: AtomicUsize::new(std::mem::size_of::<Self>() + 2 * std::mem::size_of::<usize>()),
-            total: AtomicUsize::new(std::mem::size_of::<Self>() + 2 * std::mem::size_of::<usize>()),
+            bytes: AtomicUsize::new(base),
+            total: AtomicUsize::new(base),
+            peak: AtomicUsize::new(base),
             observers: Mutex::new(Vec::new()),
         }
     }
 
     pub(crate) fn add(&self, bytes: usize) {
         self.bytes.fetch_add(bytes, Ordering::AcqRel);
-        self.total.fetch_add(bytes, Ordering::AcqRel);
+        let total = self.total.fetch_add(bytes, Ordering::AcqRel) + bytes;
+        self.peak.fetch_max(total, Ordering::AcqRel);
     }
 
     fn subtract(&self, bytes: usize) {
@@ -161,6 +167,10 @@ impl ReaderMemory {
 
     fn size(&self) -> usize {
         self.bytes.load(Ordering::Acquire)
+    }
+
+    fn peak(&self) -> usize {
+        self.peak.load(Ordering::Acquire)
     }
 
     pub(crate) fn reserve(self: &Arc<Self>, bytes: usize) -> Result<PendingMemory> {
@@ -178,6 +188,7 @@ impl ReaderMemory {
                 total.checked_add(bytes)
             })
             .map_err(|_| VixError::Malformed("reader memory size overflow".to_string()))?;
+        self.peak.fetch_max(previous + bytes, Ordering::AcqRel);
         let pending = PendingMemory {
             memory: Arc::clone(self),
             bytes,
@@ -314,6 +325,15 @@ pub(crate) const PARTIAL_RECORD_MIN_BYTES: u64 = 1024 * 1024;
 /// ~5 blocks / 40 KB, an unscoped match_all over a 1,000-field schema plans
 /// megabytes (one block per field).
 pub(crate) const MERGED_POINT_WAVE_MAX_BYTES: u64 = 256 * 1024;
+
+/// Initial footer read of a detached docs open ([`VixReader::detached_docs`]):
+/// the docs blob's Vortex layout grows with columns × chunks — 996 KB on a
+/// 2,233-column / 65-chunk production file, 476 KB on a 539-column /
+/// ~230-chunk one — so the 256 KiB default costs a second `NeedMoreData`
+/// round trip on exactly the files the residual filter runs on. 1 MiB covers
+/// both in one trip; a smaller blob is clamped, a larger layout still pays
+/// the one prefix read.
+pub const DETACHED_DOCS_FOOTER_READ_BYTES: u64 = 1024 * 1024;
 
 /// One terms-table cell as read by the batched AND intersection.
 enum TermCell {
@@ -784,11 +804,15 @@ enum DictBytes<'a> {
 /// [`VixReader::detached_docs`]): the footer window its opens consume lives
 /// in this value only. The schema is computed on first use from that
 /// footer (a fallible, blob-dependent read, hence the cell), then shared by
-/// the point reads.
+/// the point reads. Every byte range a read fetches is kept in `windows`
+/// for the handle's lifetime, so a later read of the same chunk segments
+/// (the next conjunct of a progressive residual, same column) is served
+/// without IO.
 pub struct DocsPointReader<'a> {
     reader: &'a VixReader,
     blob: BlobHandle,
     schema: OnceLock<SchemaRef>,
+    windows: Arc<crate::source::PrefetchedWindows>,
 }
 
 impl DocsPointReader<'_> {
@@ -812,6 +836,10 @@ impl DocsPointReader<'_> {
     ) -> anyhow::Result<RecordBatch> {
         check_read_cancelled()?;
         let schema = self.schema()?;
+        let _memo = match &self.blob {
+            BlobHandle::Ranged(ranged) => Some(ranged.prefetch_scope(Arc::clone(&self.windows))),
+            BlobHandle::Mem(_) => None,
+        };
         Ok(self
             .reader
             .read_columns_rows_from(&self.blob, &schema, names, row_ids)?)
@@ -1298,7 +1326,7 @@ impl VixReader {
         let blob = self.stats_blob.as_ref()?;
         let _pending = self
             .memory
-            .reserve(crate::container::metadata_memory_bound(
+            .reserve(crate::container::stats_memory_bound(
                 usize::try_from(blob.len()).unwrap_or(usize::MAX),
             ))
             .ok()?;
@@ -1476,6 +1504,20 @@ impl VixReader {
     /// time. Shared source ownership is conservatively charged per reader.
     pub fn memory_size(&self) -> usize {
         self.memory.size()
+    }
+
+    /// High-water mark of retained + pending bytes: the most this reader
+    /// asked its admission gate for at one moment since it was opened.
+    pub fn memory_peak(&self) -> usize {
+        self.memory.peak()
+    }
+
+    /// Encoded size of the `stats` blob, when the file carries one.
+    pub fn stats_blob_len(&self) -> Option<u64> {
+        self.stats_blob.as_ref().map(|blob| match blob {
+            BlobHandle::Mem(bytes) => bytes.len() as u64,
+            BlobHandle::Ranged(ranged) => ranged.len(),
+        })
     }
 
     /// Subscribe to current size and committed growth. The caller owns the
@@ -2869,28 +2911,34 @@ impl VixReader {
     }
 
     /// A docs-blob handle for bounded point reads that leaves NO trace in
-    /// this reader. Opening the docs blob consumes its Vortex footer (the
-    /// 256 KiB initial read plus a `NeedMoreData` prefix on wide, many-chunk
-    /// files — 1–3 MB on merged production files) and a reader retains that
-    /// window for later opens; a cached reader's metadata tier is sized for
-    /// ~1 MB per file, so a per-file residual read through `docs_blob` would
-    /// cut the reader cache's file coverage by two thirds. The handle
-    /// returned here owns its own footer state and drops it with itself;
-    /// repeats of the same predicate are served by the exact result memo one
-    /// layer up, so the footer is re-read only for new predicates — what the
-    /// scan branch's private open paid for every query before.
+    /// this reader. Opening the docs blob consumes its Vortex footer (~1 MB
+    /// on wide, many-chunk production files: 2,233 columns × 65 chunks of
+    /// segment map) and a reader retains that window for later opens; a
+    /// cached reader's metadata tier is sized for ~1 MB per file, so a
+    /// per-file residual read through `docs_blob` would cut the reader
+    /// cache's file coverage by two thirds. The handle returned here owns
+    /// its own footer state and drops it with itself; repeats of the same
+    /// predicate are served by the exact result memo one layer up, so the
+    /// footer is re-read only for new predicates — what the scan branch's
+    /// private open paid for every query before. The first open reads
+    /// [`DETACHED_DOCS_FOOTER_READ_BYTES`] at once: one round trip instead
+    /// of the 256 KiB probe + `NeedMoreData` prefix, the same bytes.
     pub fn detached_docs(&self) -> DocsPointReader<'_> {
         let blob = match &self.docs_blob {
             BlobHandle::Mem(bytes) => BlobHandle::Mem(bytes.clone()),
-            BlobHandle::Ranged(ranged) => BlobHandle::Ranged(crate::source::RangedBlob::new(
-                Arc::clone(&ranged.source),
-                ranged.range.clone(),
-            )),
+            BlobHandle::Ranged(ranged) => {
+                BlobHandle::Ranged(crate::source::RangedBlob::with_initial_read(
+                    Arc::clone(&ranged.source),
+                    ranged.range.clone(),
+                    DETACHED_DOCS_FOOTER_READ_BYTES,
+                ))
+            }
         };
         DocsPointReader {
             reader: self,
             blob,
             schema: OnceLock::new(),
+            windows: crate::source::PrefetchedWindows::recording(),
         }
     }
 

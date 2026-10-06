@@ -91,9 +91,13 @@ impl Refusal {
 }
 
 /// Refine the superset `bitmap` of `condition` on `reader` to the exact
-/// match set, or say why not. `fts_fields` is the query's full-text scope
-/// (the stream's full-text fields, exactly what the scan's `match_all`
-/// rebuild would read); fields the file does not store are dropped from the
+/// match set, or say why not. `inexact` indexes the conjuncts of
+/// `condition.conditions` the index did not answer exactly
+/// ([`crate::index::ConjunctVerdict`] other than `Exact`): only those are
+/// re-evaluated — a term-indexed equality the postings already decided is
+/// never read again. `fts_fields` is the query's full-text scope (the
+/// stream's full-text fields, exactly what the scan's `match_all` rebuild
+/// would read); fields the file does not store are dropped from the
 /// disjunction — a column absent from the file is NULL in every row, and
 /// `IS NOT NULL AND ... LIKE` is false on NULL, so the disjunct contributes
 /// nothing either way.
@@ -103,12 +107,14 @@ impl Refusal {
 pub(super) fn refine_superset(
     reader: &VixReader,
     condition: &IndexCondition,
+    inexact: &[usize],
     fts_fields: &[String],
     bitmap: &BooleanBuffer,
 ) -> anyhow::Result<Result<BooleanBuffer, Refusal>> {
     refine_superset_within(
         reader,
         condition,
+        inexact,
         fts_fields,
         bitmap,
         RESIDUAL_MAX_ROWS,
@@ -120,13 +126,14 @@ pub(super) fn refine_superset(
 pub(super) fn refine_superset_within(
     reader: &VixReader,
     condition: &IndexCondition,
+    inexact: &[usize],
     fts_fields: &[String],
     bitmap: &BooleanBuffer,
     max_rows: usize,
     max_chunks: usize,
 ) -> anyhow::Result<Result<BooleanBuffer, Refusal>> {
     let candidates = bitmap.count_set_bits();
-    if candidates == 0 {
+    if candidates == 0 || inexact.is_empty() {
         return Ok(Ok(bitmap.clone()));
     }
     if candidates > max_rows {
@@ -137,7 +144,11 @@ pub(super) fn refine_superset_within(
     if chunks > max_chunks {
         return Ok(Err(Refusal::TooManyChunks(chunks)));
     }
-    if !condition.conditions.iter().all(residual_supported_shape) {
+    let conjuncts: Vec<&Condition> = inexact
+        .iter()
+        .filter_map(|&index| condition.conditions.get(index))
+        .collect();
+    if !conjuncts.iter().all(|c| residual_supported_shape(c)) {
         return Ok(Err(Refusal::UnsupportedCondition));
     }
 
@@ -151,40 +162,85 @@ pub(super) fn refine_superset_within(
         .filter(|field| schema.index_of(field).is_ok())
         .cloned()
         .collect();
-    if condition.uses_full_text() && present_fts.is_empty() {
+    let uses_full_text = conjuncts.iter().any(|c| c.uses_full_text());
+    if uses_full_text && present_fts.is_empty() {
         return Ok(Err(Refusal::NoFullTextColumn));
     }
-    let mut names: Vec<String> = condition
-        .get_schema_fields(&present_fts)
-        .into_iter()
+    let mut plan: Vec<(&Condition, Vec<String>)> = conjuncts
+        .iter()
+        .filter(|c| !matches!(c, Condition::All()))
+        .map(|c| {
+            let mut fields: Vec<String> = c.get_schema_fields(&present_fts).into_iter().collect();
+            fields.sort_unstable();
+            (*c, fields)
+        })
         .collect();
-    names.sort_unstable();
-    if names.is_empty() {
-        // a condition over no column (`All`) is exact by construction
+    if plan.iter().all(|(_, fields)| fields.is_empty()) {
+        // conjuncts over no column (`All`) are exact by construction
         return Ok(Ok(bitmap.clone()));
     }
-    for name in &names {
-        match schema.index_of(name) {
-            Ok(index) if is_string_type(schema.field(index).data_type()) => {}
-            _ => return Ok(Err(Refusal::UnsupportedColumn(name.clone()))),
+    for (_, fields) in &plan {
+        for name in fields {
+            match schema.index_of(name) {
+                Ok(index) if is_string_type(schema.field(index).data_type()) => {}
+                _ => return Ok(Err(Refusal::UnsupportedColumn(name.clone()))),
+            }
         }
     }
-    let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+
+    // Progressive evaluation, one read per conjunct. Conjuncts run
+    // narrowest-first (fewest columns), each only over the rows still
+    // alive: the single-column equality (`body = v`) decodes one column
+    // for the superset rows and eliminates most of them; the multi-column
+    // `match_all` disjunction then reads every present full-text column of
+    // the survivors in ONE batch — one round trip for a few rows' segments
+    // (~2 MB on a 2,233-column production file) beats a column-by-column
+    // walk that saves bytes but pays a ~80 ms round trip per column.
+    // Semantics are the scan branch's exactly: the expression is
+    // `to_physical_expr` of the same conjunct over the same present
+    // columns (`IS NOT NULL AND ILIKE` per column, OR across columns), AND
+    // across conjuncts, NULL never TRUE.
+    plan.sort_by_key(|(_, fields)| fields.len());
+
+    let mut alive = rows;
+    for (conjunct, fields) in &plan {
+        if alive.is_empty() {
+            break;
+        }
+        let columns: Vec<&str> = fields.iter().map(String::as_str).collect();
+        let Some(yes) = evaluate_rows(&docs, conjunct, &present_fts, &columns, &alive)? else {
+            return Ok(Err(Refusal::UnsupportedCondition));
+        };
+        alive = yes;
+    }
 
     let mut exact = BooleanBufferBuilder::new(bitmap.len());
     exact.append_n(bitmap.len(), false);
+    for row in alive {
+        exact.set_bit(row as usize, true);
+    }
+    Ok(Ok(exact.finish()))
+}
+
+/// Evaluate one conjunct over `rows` (ascending), reading only `columns`
+/// (`fst_scope` is the full-text scope the physical rebuild sees). Returns
+/// the rows that evaluate TRUE, or `None` when the conjunct has no physical
+/// form over these columns.
+fn evaluate_rows(
+    docs: &vortex_index::DocsPointReader<'_>,
+    conjunct: &Condition,
+    fst_scope: &[String],
+    columns: &[&str],
+    rows: &[u64],
+) -> anyhow::Result<Option<Vec<u64>>> {
+    let mut yes = Vec::new();
     for window in rows.chunks(65_536) {
-        let batch = docs.read_columns_rows(&name_refs, window)?;
-        let expr = match condition.to_physical_expr(batch.schema().as_ref(), &present_fts) {
-            Ok(expr) => expr,
-            Err(_) => return Ok(Err(Refusal::UnsupportedCondition)),
+        let batch = docs.read_columns_rows(columns, window)?;
+        let Ok(expr) = conjunct.to_physical_expr(batch.schema().as_ref(), fst_scope) else {
+            return Ok(None);
         };
         match expr.evaluate(&batch)? {
-            ColumnarValue::Scalar(ScalarValue::Boolean(Some(true))) => {
-                for &row in window {
-                    exact.set_bit(row as usize, true);
-                }
-            }
+            ColumnarValue::Scalar(ScalarValue::Boolean(Some(true))) => yes.extend(window),
             ColumnarValue::Scalar(_) => {}
             ColumnarValue::Array(array) => {
                 let mask = array
@@ -202,13 +258,13 @@ pub(super) fn refine_superset_within(
                 }
                 for (i, &row) in window.iter().enumerate() {
                     if mask.is_valid(i) && mask.value(i) {
-                        exact.set_bit(row as usize, true);
+                        yes.push(row);
                     }
                 }
             }
         }
     }
-    Ok(Ok(exact.finish()))
+    Ok(Some(yes))
 }
 
 /// Distinct docs chunks the sorted `rows` fall in (zone map when the file

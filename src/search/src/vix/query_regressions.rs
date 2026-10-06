@@ -199,10 +199,12 @@ fn prod_file_residual_histogram_cost() {
         let total_batches = data_src.log.lock().len() + index_src.log.lock().len();
         let total_bytes = data_src.bytes_read() + index_src.bytes_read();
         eprintln!(
-            "open: {open_batches} batches, {open_bytes} B, {opened_at:.1} ms | eval: {} batches, {} B, {eval_ms:.1} ms (~{:.1} waves)",
+            "open: {open_batches} batches, {open_bytes} B, {opened_at:.1} ms | eval: {} batches, {} B, {eval_ms:.1} ms (~{:.1} waves) | reader owned {} KB, gate peak {} KB",
             total_batches - open_batches,
             total_bytes - open_bytes,
-            eval_ms / latency.as_secs_f64() / 1e3
+            eval_ms / latency.as_secs_f64() / 1e3,
+            reader.memory_size() / 1024,
+            reader.memory_peak() / 1024,
         );
         for (src, log) in [("data", &data_src.log), ("index", &index_src.log)] {
             for (issued, ranges) in log.lock().iter() {

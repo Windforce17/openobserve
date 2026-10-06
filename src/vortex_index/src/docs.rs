@@ -1053,10 +1053,8 @@ impl VixDocs {
                 .map(|(name, _)| name.capacity())
                 .sum::<usize>();
         let _pending = self.memory.reserve(
-            crate::container::metadata_memory_bound(
-                usize::try_from(blob.len()).unwrap_or(usize::MAX),
-            )
-            .saturating_add(presence_bytes),
+            crate::container::stats_memory_bound(usize::try_from(blob.len()).unwrap_or(usize::MAX))
+                .saturating_add(presence_bytes),
         )?;
         let bytes = blob.bytes()?;
         let chunks = crate::stats::decode_stats_blob(&bytes)?;
@@ -1332,11 +1330,9 @@ impl VixDocs {
         let Some(blob) = self.stats_blob.as_ref() else {
             return Ok(None);
         };
-        let _pending = self
-            .memory
-            .reserve(crate::container::metadata_memory_bound(
-                usize::try_from(blob.len()).unwrap_or(usize::MAX),
-            ))?;
+        let _pending = self.memory.reserve(crate::container::stats_memory_bound(
+            usize::try_from(blob.len()).unwrap_or(usize::MAX),
+        ))?;
         // IO, admission and cancellation are operation-local: never publish
         // absence after a failed attempt and poison later healthy scans.
         let bytes = blob.bytes()?;
@@ -3115,7 +3111,7 @@ mod memory_regressions {
     fn cached_docs_admit_whole_input_and_envelope_together_before_parse() {
         let data = fixture();
         let input = data.len();
-        let metadata = crate::container::metadata_memory_bound(puffin_payload(&data));
+        let metadata = crate::container::footer_memory_bound(puffin_payload(&data));
         let limit = input.max(metadata) + 1;
         assert!(limit > input && limit > metadata && limit < input + metadata);
         // Corrupt the first JSON byte without changing its advertised size.

@@ -765,7 +765,7 @@ fn container_from_meta(
 pub(crate) fn parse_container(data: &Bytes) -> Result<VixContainer> {
     let memory = crate::source::current_reader_memory();
     let payload = puffin_payload_size(data)?;
-    let pending = memory.reserve(metadata_memory_bound(payload))?;
+    let pending = memory.reserve(footer_memory_bound(payload))?;
     let meta = parse_puffin_footer_from_bytes(data)
         .map_err(|e| VixError::Malformed(format!("puffin footer: {e:#}")))?;
     let mut container = container_from_meta(meta, data.len() as u64, |range| {
@@ -775,10 +775,28 @@ pub(crate) fn parse_container(data: &Bytes) -> Result<VixContainer> {
     Ok(container)
 }
 
-/// Typed JSON, its strings, property-derived indexes and container handles.
-/// The bound is on encoded metadata, never on postings or the object size.
-pub(crate) fn metadata_memory_bound(encoded: usize) -> usize {
-    encoded.saturating_mul(64).saturating_add(64 * 1024)
+/// Admission bound of a FOOTER parse — puffin JSON (properties, `fields`,
+/// `columns`, zone map) or a blob's Vortex footer (postscript, layout,
+/// segment map) — on its encoded size: the typed output, its strings and
+/// the compact copies that coexist with the input until the parse lands.
+/// Measured with a counting allocator on production files (2026-10-06,
+/// `examples/residual_alloc_probe.rs`): ranged open of both puffin footers
+/// 490 KB of tails → 1.08 MB peak (2.2×); docs Vortex footer 996 KB window
+/// / 2,233 columns → 4.6 MB (4.6×), 476 KB / 539 columns → 2.3 MB (4.8×).
+/// ×8 keeps a 1.7× margin on the worst case. The previous ×64 charged a
+/// 2,000-column docs footer 65 MB and every ranged open ~30 MB for the few
+/// ms the parse ran — phantom demand that put 111 concurrent evaluations
+/// through the 500 ms growth wait and refused them (`.201`, 2026-10-06).
+pub(crate) fn footer_memory_bound(encoded: usize) -> usize {
+    encoded.saturating_mul(8).saturating_add(64 * 1024)
+}
+
+/// Admission bound of a `stats` blob decode on its encoded size: per-column
+/// per-chunk min/max strings and presence counts. Measured (same probe):
+/// 139 KB → 1.1 MB peak (7.9×), 1,021 KB → 8.7 MB (8.5×); ×16 keeps a
+/// 1.9× margin.
+pub(crate) fn stats_memory_bound(encoded: usize) -> usize {
+    encoded.saturating_mul(16).saturating_add(64 * 1024)
 }
 
 fn puffin_payload_size(bytes: &[u8]) -> Result<usize> {
@@ -1083,7 +1101,7 @@ impl<'a> TailProbe<'a> {
                 "puffin footer payload of {payload_size} bytes exceeds the file size {total}"
             )));
         }
-        let pending = memory.reserve(metadata_memory_bound(
+        let pending = memory.reserve(footer_memory_bound(
             usize::try_from(footer_region).unwrap_or(usize::MAX),
         ))?;
         if footer_region > tail.len() as u64 {

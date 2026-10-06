@@ -109,13 +109,32 @@ thread_local! {
 /// for one blob through [`RangedBlob::prefetch_scope`], never reader state.
 pub(crate) struct PrefetchedWindows {
     windows: parking_lot::RwLock<Vec<(Range<u64>, Bytes)>>,
+    /// A recording set also ABSORBS every range the bridge fetches while it
+    /// is registered, so later scans on the same handle re-read nothing
+    /// (the detached docs handle of a residual filter: one conjunct's
+    /// column fetch serves the next conjunct's). Bounded by the caller's
+    /// read plan; never reader state.
+    records: bool,
 }
 
 impl PrefetchedWindows {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             windows: parking_lot::RwLock::new(Vec::new()),
+            records: false,
         })
+    }
+
+    /// A set that records what is fetched under it (see `records`).
+    pub(crate) fn recording() -> Arc<Self> {
+        Arc::new(Self {
+            windows: parking_lot::RwLock::new(Vec::new()),
+            records: true,
+        })
+    }
+
+    pub(crate) fn records(&self) -> bool {
+        self.records
     }
 
     /// Register `bytes` as the content of `range`, merging with adjacent or
@@ -649,6 +668,10 @@ pub(crate) struct RangedBlob {
     /// Absolute byte range of the blob inside the source object.
     pub range: Range<u64>,
     footer: Arc<FooterState>,
+    /// Initial footer read of the first open, when the caller knows the
+    /// layout is larger than [`VORTEX_FOOTER_INITIAL_READ_BYTES`] (the docs
+    /// blob of a wide file); `None` = the adaptive default.
+    initial_read: Option<u64>,
 }
 
 struct FooterState {
@@ -771,6 +794,23 @@ impl RangedBlob {
                 ranges: OnceLock::new(),
                 memory: OnceLock::new(),
             }),
+            initial_read: None,
+        }
+    }
+
+    /// [`Self::new`] whose first open reads `initial_read` bytes of footer
+    /// (clamped to the blob) instead of the adaptive default — one round
+    /// trip for a layout the caller knows to be larger than the default
+    /// window (a 2,000-column docs blob's layout is ~1 MB: 256 KiB probe +
+    /// `NeedMoreData` prefix = two trips, the same bytes).
+    pub fn with_initial_read(
+        source: Arc<dyn VixRangeSource>,
+        range: Range<u64>,
+        initial_read: u64,
+    ) -> Self {
+        Self {
+            initial_read: Some(initial_read),
+            ..Self::new(source, range)
         }
     }
 
@@ -824,6 +864,9 @@ impl RangedBlob {
     pub(crate) fn footer_initial_read_bytes(&self) -> u64 {
         if let Some(window) = self.footer.window(self.range.end) {
             return window.end - window.start;
+        }
+        if let Some(initial) = self.initial_read {
+            return self.len().min(initial);
         }
         let full = self.len().min(VORTEX_FOOTER_INITIAL_READ_BYTES);
         if self
@@ -1003,7 +1046,7 @@ impl OpeningMemory {
         }
         let pending = self
             .memory
-            .reserve_with(crate::container::metadata_memory_bound(length), |owned| {
+            .reserve_with(crate::container::footer_memory_bound(length), |owned| {
                 check_operation_memory(operation, owned)
             })?;
         state.pending = Some(match state.pending.take() {
@@ -1234,8 +1277,19 @@ impl VortexReadAt for BlobReadAt {
             {
                 Some(bytes) => bytes,
                 None => {
-                    fetch_footer_range(source.as_ref(), &footer, start..end, operation.as_deref())
-                        .await?
+                    let bytes = fetch_footer_range(
+                        source.as_ref(),
+                        &footer,
+                        start..end,
+                        operation.as_deref(),
+                    )
+                    .await?;
+                    // a recording window set keeps what this scan fetched for
+                    // the scans that follow it on the same handle
+                    if let Some(windows) = prefetched.as_ref().filter(|w| w.records()) {
+                        windows.add(start..end, bytes.clone());
+                    }
+                    bytes
                 }
             };
             if operation.as_ref().is_some_and(|op| op.is_cancelled()) {
