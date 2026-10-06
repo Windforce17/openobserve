@@ -331,6 +331,99 @@ fn absent_query() -> VixQuery {
     ]))
 }
 
+/// What the scan branch pays per file for the residual filter: point-read
+/// the candidate rows of the A48 shape (`VIX_BENCH_FILE`) through the
+/// latency source and report batches / reads / bytes / waves for the
+/// `body` column alone and for the scan's full re-apply projection.
+#[test]
+#[ignore = "diagnostic; run with VIX_BENCH_FILE set"]
+fn candidate_row_point_read_cost() {
+    let path = std::env::var("VIX_BENCH_FILE").expect("VIX_BENCH_FILE");
+    let data = Bytes::from(std::fs::read(&path).unwrap());
+    let index =
+        Bytes::from(std::fs::read(std::path::Path::new(&path).with_extension("vxi")).unwrap());
+    let latency = Duration::from_millis(1);
+    let service = std::env::var("VIX_BENCH_SERVICE").unwrap_or_else(|_| TARGET_SERVICE.to_string());
+    let match_all = std::env::var("VIX_BENCH_QUERY")
+        .unwrap_or_else(|_| "server_status:DEPLOY_STATUS_SUCCESS".to_string());
+    let tokens: Vec<VixQuery> = crate::o2_tokenize(&match_all, 2, 64)
+        .map(|t| any_token(&t))
+        .collect();
+    let query = fulltext(VixQuery::And(vec![
+        VixQuery::And(tokens),
+        exact("service_name", &service),
+    ]));
+    let memory = VixReader::open_with_index(data.clone(), Some(index.clone())).unwrap();
+    let rows: Vec<u64> = bits_to_set(&memory.eval(&query).unwrap())
+        .into_iter()
+        .map(u64::from)
+        .collect();
+    eprintln!(
+        "rows={} chunks={:?} candidates={} {:?}",
+        memory.row_count(),
+        memory.zone_chunks().map(|z| z.len()),
+        rows.len(),
+        &rows[..rows.len().min(8)]
+    );
+    let projections: [&[&str]; 3] = [
+        &["body"],
+        &["_timestamp", "body", "service_name"],
+        &[
+            "_timestamp",
+            "body",
+            "content",
+            "data",
+            "error",
+            "message",
+            "service_name",
+        ],
+    ];
+    for (label, selected) in [("1 row", &rows[..1]), ("all candidates", &rows[..])] {
+        for projection in projections {
+            let counters = Arc::new(Counters::default());
+            let data_src = Arc::new(LatencySource {
+                name: "data",
+                bytes: data.clone(),
+                latency,
+                counters: Arc::clone(&counters),
+            });
+            let index_src = Arc::new(LatencySource {
+                name: "index",
+                bytes: index.clone(),
+                latency,
+                counters: Arc::clone(&counters),
+            });
+            let reader =
+                VixReader::open_ranged_with_index_tail(data_src, Some(index_src), 768 * 1024)
+                    .unwrap();
+            counters.reset();
+            let started = Instant::now();
+            let batch = reader.read_docs_columns_rows(projection, selected).unwrap();
+            let ms = started.elapsed().as_secs_f64() * 1e3;
+            let (b, r, by, _pby, mp) = counters.snapshot();
+            eprintln!(
+                "{label:<15} cols={:<2} rows={:<4} batches={b:>3} reads={r:>3} bytes={by:>10} ({:.1} MB) waves={:.1} max_par={mp}",
+                projection.len(),
+                batch.num_rows(),
+                by as f64 / 1e6,
+                ms / latency.as_secs_f64() / 1e3,
+            );
+            if std::env::var("VIX_BENCH_LOG").is_ok() {
+                for (i, (src, ranges, issued_ms)) in counters.log.lock().iter().enumerate() {
+                    let sizes: Vec<String> = ranges
+                        .iter()
+                        .map(|r| format!("{}+{}", r.start, r.end - r.start))
+                        .collect();
+                    eprintln!(
+                        "    batch {i:>2} @{issued_ms:>6.1}ms {src:<5} {}",
+                        sizes.join(" ")
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// `VIX_BENCH_FILE=/path/to/file.vix` measures a real (e.g. prod) file and
 /// its `.vxi` sidecar instead of the synthetic fixture; `VIX_BENCH_QUERY`
 /// then supplies the match_all text and `VIX_BENCH_SERVICE` the

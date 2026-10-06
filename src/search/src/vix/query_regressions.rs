@@ -65,6 +65,187 @@ impl VixRangeSource for ObservedSource {
     }
 }
 
+/// `ObservedSource` with a simulated per-request latency and issue-time
+/// log, so dependent round trips ("waves") of a whole evaluation can be
+/// read off: batches issued within one latency of each other overlap.
+struct LatencySource {
+    bytes: Bytes,
+    latency: std::time::Duration,
+    started: std::time::Instant,
+    log: parking_lot::Mutex<Vec<(f64, Vec<Range<u64>>)>>,
+}
+
+impl LatencySource {
+    fn new(bytes: Bytes, latency: std::time::Duration) -> Arc<Self> {
+        Arc::new(Self {
+            bytes,
+            latency,
+            started: std::time::Instant::now(),
+            log: parking_lot::Mutex::new(Vec::new()),
+        })
+    }
+
+    fn bytes_read(&self) -> u64 {
+        self.log
+            .lock()
+            .iter()
+            .flat_map(|(_, ranges)| ranges.iter().map(|r| r.end - r.start))
+            .sum()
+    }
+}
+
+impl VixRangeSource for LatencySource {
+    fn len(&self) -> u64 {
+        self.bytes.len() as u64
+    }
+
+    fn fetch(&self, range: Range<u64>) -> BoxFuture<'static, anyhow::Result<Bytes>> {
+        let many = self.fetch_many(vec![range]);
+        async move { Ok(many.await?.remove(0)) }.boxed()
+    }
+
+    fn fetch_many(
+        &self,
+        ranges: Vec<Range<u64>>,
+    ) -> BoxFuture<'static, anyhow::Result<Vec<Bytes>>> {
+        self.log
+            .lock()
+            .push((self.started.elapsed().as_secs_f64() * 1e3, ranges.clone()));
+        let out: Vec<Bytes> = ranges
+            .iter()
+            .map(|r| self.bytes.slice(r.start as usize..r.end as usize))
+            .collect();
+        let latency = self.latency;
+        let (tx, rx) = futures::channel::oneshot::channel();
+        std::thread::spawn(move || {
+            std::thread::sleep(latency);
+            let _ = tx.send(out);
+        });
+        async move { Ok(rx.await.expect("latency thread")) }.boxed()
+    }
+}
+
+/// Diagnostic: the aggregate fast path WITH in-index residual filtering on
+/// a real file pair (`VIX_BENCH_FILE` + its `.vxi`), through a 1 ms
+/// latency source. Prints the superset size, the exact count and, per
+/// phase, the batches / bytes / dependent waves — the per-file cost model
+/// a cold production query pays (`VIX_BENCH_QUERY`, `VIX_BENCH_SERVICE`,
+/// `VIX_BENCH_BODY`, `VIX_BENCH_FTS` as in `and_io_bench`).
+#[test]
+#[ignore = "diagnostic; run with VIX_BENCH_FILE set"]
+fn prod_file_residual_histogram_cost() {
+    let path = std::env::var("VIX_BENCH_FILE").expect("VIX_BENCH_FILE");
+    let data = Bytes::from(std::fs::read(&path).unwrap());
+    let index =
+        Bytes::from(std::fs::read(std::path::Path::new(&path).with_extension("vxi")).unwrap());
+    let latency = std::time::Duration::from_millis(1);
+    let service = std::env::var("VIX_BENCH_SERVICE")
+        .unwrap_or_else(|_| "cfworkers-deploy-cloudrun-worker".to_string());
+    let phrase = std::env::var("VIX_BENCH_QUERY")
+        .unwrap_or_else(|_| "server_status:DEPLOY_STATUS_SUCCESS".to_string());
+    let body =
+        std::env::var("VIX_BENCH_BODY").unwrap_or_else(|_| "Sending deploy callback".to_string());
+    let fts: Vec<String> = std::env::var("VIX_BENCH_FTS")
+        .unwrap_or_else(|_| "body,content,data,error,message".to_string())
+        .split(',')
+        .map(str::to_string)
+        .collect();
+    let condition = IndexCondition {
+        conditions: vec![
+            Condition::MatchAll(phrase),
+            Condition::Equal("service_name".to_string(), service),
+            Condition::Equal("body".to_string(), body),
+        ],
+    };
+    let memory = VixReader::open_with_index(data.clone(), Some(index.clone())).unwrap();
+    let (ts_min, ts_max) = memory
+        .zone_chunks()
+        .map(|chunks| {
+            chunks.iter().fold((i64::MAX, i64::MIN), |(lo, hi), c| {
+                (lo.min(c.ts_min), hi.max(c.ts_max))
+            })
+        })
+        .expect("prod files carry a zone map");
+    let hour = 3_600_000_000u64;
+    let min_value = ts_min - ts_min.rem_euclid(hour as i64);
+    let buckets = ((ts_max - min_value) as u64 / hour + 1) as usize;
+    let mode = IndexOptimizeMode::SimpleHistogram(min_value, hour, buckets, 0);
+    let range = (min_value, min_value + (buckets as i64) * hour as i64);
+
+    let open_and_eval = |rule: Option<IndexOptimizeMode>| {
+        let data_src = LatencySource::new(data.clone(), latency);
+        let index_src = LatencySource::new(index.clone(), latency);
+        let reader = VixReader::open_ranged_with_index(
+            data_src.clone() as Arc<dyn VixRangeSource>,
+            Some(index_src.clone() as Arc<dyn VixRangeSource>),
+        )
+        .unwrap();
+        let opened_at = data_src.started.elapsed().as_secs_f64() * 1e3;
+        let open_batches = data_src.log.lock().len() + index_src.log.lock().len();
+        let open_bytes = data_src.bytes_read() + index_src.bytes_read();
+        let started = std::time::Instant::now();
+        let result = evaluate_vix_index(
+            "bench",
+            &reader,
+            &condition,
+            rule,
+            range,
+            true,
+            Some((ts_min, ts_max)),
+            None,
+            Some(&fts),
+        );
+        let eval_ms = started.elapsed().as_secs_f64() * 1e3;
+        let total_batches = data_src.log.lock().len() + index_src.log.lock().len();
+        let total_bytes = data_src.bytes_read() + index_src.bytes_read();
+        eprintln!(
+            "open: {open_batches} batches, {open_bytes} B, {opened_at:.1} ms | eval: {} batches, {} B, {eval_ms:.1} ms (~{:.1} waves)",
+            total_batches - open_batches,
+            total_bytes - open_bytes,
+            eval_ms / latency.as_secs_f64() / 1e3
+        );
+        for (src, log) in [("data", &data_src.log), ("index", &index_src.log)] {
+            for (issued, ranges) in log.lock().iter() {
+                let sizes: Vec<String> = ranges
+                    .iter()
+                    .map(|r| format!("{}+{}", r.start, r.end - r.start))
+                    .collect();
+                eprintln!("    @{issued:>7.1}ms {src:<5} {}", sizes.join(" "));
+            }
+        }
+        result
+    };
+
+    eprintln!("== row-id pass (superset bitmap) ==");
+    match open_and_eval(None).unwrap() {
+        RawVixResult::Bitmap {
+            bitmap,
+            has_skipped,
+            ..
+        } => eprintln!(
+            "superset rows={} has_skipped={has_skipped}",
+            bitmap.count_set_bits()
+        ),
+        other => eprintln!("unexpected {other:?}"),
+    }
+    eprintln!("== aggregate pass (residual-refined histogram) ==");
+    match open_and_eval(Some(mode)).unwrap() {
+        RawVixResult::Histogram {
+            histogram,
+            has_skipped,
+        } => eprintln!(
+            "exact rows={} has_skipped={has_skipped} buckets={buckets} non-empty={:?}",
+            histogram.iter().sum::<u64>(),
+            histogram
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| **c > 0)
+                .collect::<Vec<_>>()
+        ),
+        other => eprintln!("unexpected {other:?}"),
+    }
+}
+
 fn selected(field: &str, values: &[&str]) -> IndexCondition {
     IndexCondition {
         conditions: vec![Condition::In(
@@ -1135,8 +1316,15 @@ fn full_text_scope_separates_result_and_bitmap_cache_entries() {
     );
 }
 
+/// Item 4 (2026-10-06): a multi-word `match_all` aggregate is a SUPERSET at
+/// the token level (reordered, separated and cross-field tokens are only
+/// candidates) and used to refuse the native aggregate for the scan
+/// branch. It is now refined in the index phase: the candidates' full-text
+/// columns are point-read and the same `LIKE` disjunction the scan applies
+/// decides them, so the count and histogram are EXACT and the file never
+/// reaches the scan. The expected rows come from DataFusion itself.
 #[tokio::test(flavor = "multi_thread")]
-async fn multiword_full_text_refuses_native_aggregates_and_keeps_exact_residual_rows() {
+async fn multiword_full_text_aggregates_are_refined_to_the_exact_residual_rows() {
     let (data, index, batch) = full_text_scope_fixture();
     let data_size = data.len() as i64;
     let index_size = index.len() as i64;
@@ -1146,24 +1334,49 @@ async fn multiword_full_text_refuses_native_aggregates_and_keeps_exact_residual_
         conditions: vec![Condition::MatchAll("alpha beta".into())],
     };
     let (candidates, skipped) = scoped_rows(&reader, &condition, &scope);
-    assert!(skipped);
+    assert!(skipped, "row-id searches keep the superset contract");
     // Reordered, separated and cross-field tokens are only candidates.
     assert_eq!(candidates, vec![2, 3, 4, 5, 6]);
-    for rule in [
-        IndexOptimizeMode::SimpleCount,
-        IndexOptimizeMode::SimpleHistogram(90, 10, 2, 0),
-    ] {
-        requires_scan(evaluate_vix_index(
-            "multiword-aggregate",
-            &reader,
-            &condition,
-            Some(rule),
-            (90, 110),
-            true,
-            Some((94, 100)),
-            None,
-            Some(&scope),
-        ));
+    match evaluate_vix_index(
+        "multiword-aggregate",
+        &reader,
+        &condition,
+        Some(IndexOptimizeMode::SimpleCount),
+        (90, 110),
+        true,
+        Some((94, 100)),
+        None,
+        Some(&scope),
+    )
+    .unwrap()
+    {
+        RawVixResult::Count { count, has_skipped } => {
+            assert_eq!(count, 2, "rows 94 and 98 hold the phrase");
+            assert!(!has_skipped);
+        }
+        other => panic!("expected an exact count, got {other:?}"),
+    }
+    match evaluate_vix_index(
+        "multiword-aggregate",
+        &reader,
+        &condition,
+        Some(IndexOptimizeMode::SimpleHistogram(90, 10, 2, 0)),
+        (90, 110),
+        true,
+        Some((94, 100)),
+        None,
+        Some(&scope),
+    )
+    .unwrap()
+    {
+        RawVixResult::Histogram {
+            histogram,
+            has_skipped,
+        } => {
+            assert_eq!(histogram, vec![2, 0], "both phrase rows fall in [90, 100)");
+            assert!(!has_skipped);
+        }
+        other => panic!("expected an exact histogram, got {other:?}"),
     }
     let mask = arrow::array::BooleanArray::from(
         (0..batch.num_rows())
@@ -1194,8 +1407,8 @@ async fn multiword_full_text_refuses_native_aggregates_and_keeps_exact_residual_
         .collect();
     assert_eq!(timestamps, vec![94, 98]);
 
-    // Real dispatch must retain the entire file for the scan, contribute no
-    // aggregate candidates, and never label a residual selection exact.
+    // Real dispatch answers the file from the fast path — nothing left for
+    // the scan, no filter added back — with DataFusion's own row set.
     let file = FileKey {
         key: "files/org/logs/fts-scope/2026/01/01/00/multiword.vix".into(),
         meta: config::meta::stream::FileMeta {
@@ -1240,16 +1453,14 @@ async fn multiword_full_text_refuses_native_aggregates_and_keeps_exact_residual_
         )
         .await
         .unwrap();
-        assert!(filter_back);
-        assert_eq!(
-            files.iter().map(|f| &f.key).collect::<Vec<_>>(),
-            vec![&file.key]
-        );
-        assert!(files[0].selection.is_none());
+        assert!(!filter_back, "the refined aggregate is exact");
+        assert!(files.is_empty(), "the file is answered, not scanned");
         match answer {
-            MultiResult::Count(count) => assert_eq!(count, 0),
-            MultiResult::Histogram(buckets) => assert!(buckets.iter().all(|count| *count == 0)),
-            other => panic!("unexpected aggregate fallback: {other:?}"),
+            MultiResult::Count(count) => assert_eq!(count, timestamps.len() as u64),
+            MultiResult::Histogram(buckets) => {
+                assert_eq!(buckets, vec![timestamps.len() as u64, 0])
+            }
+            other => panic!("unexpected aggregate answer: {other:?}"),
         }
     }
     // A positive control must reach evaluation, not pass the fallback

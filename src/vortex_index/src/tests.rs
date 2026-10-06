@@ -4891,6 +4891,61 @@ mod ranged {
         );
     }
 
+    /// A residual point read goes through [`VixReader::detached_docs`]: the
+    /// docs-blob footer its open consumes (hundreds of KB to MBs on wide
+    /// production files) must stay in the detached handle — the cached
+    /// reader's size and its own `docs_blob` footer state are untouched —
+    /// while the read itself is correct and does reach the data object. The
+    /// reader's own `read_docs_columns_rows` keeps retaining (it is what the
+    /// collectors' repeated reads rely on).
+    #[test]
+    fn detached_docs_point_read_retains_nothing_in_the_reader() {
+        use crate::container::BlobHandle;
+
+        let (data, index) = build_large_core_file();
+        let whole = VixReader::open_with_index(data.clone(), Some(index.clone())).unwrap();
+        let rows = [7u64, 4_242, 99_999];
+        let expect = whole
+            .read_docs_columns_rows(&["svc", "level"], &rows)
+            .unwrap();
+
+        let source = PairSource::new(data, index);
+        let reader = source.open_with_tail(PROD_SIDECAR_TAIL);
+        let fresh = reader.memory_size();
+        let fetches_before = source.data.fetches();
+        let docs = reader.detached_docs();
+        let got = docs.read_columns_rows(&["svc", "level"], &rows).unwrap();
+        assert_eq!(
+            got, expect,
+            "detached point read must match the whole-file reader"
+        );
+        assert!(
+            source.data.fetches() > fetches_before,
+            "the detached read reaches the data object"
+        );
+        drop(docs);
+        assert_eq!(
+            reader.memory_size(),
+            fresh,
+            "a detached read must not grow the cached reader"
+        );
+        let BlobHandle::Ranged(docs_blob) = reader.docs_blob_for_tests() else {
+            panic!("ranged open keeps a ranged docs blob");
+        };
+        assert!(
+            !docs_blob.footer_cached(),
+            "the reader's own docs footer state stays empty"
+        );
+
+        // the reader-owned read is the retaining one, as before
+        let via_reader = reader
+            .read_docs_columns_rows(&["svc", "level"], &rows)
+            .unwrap();
+        assert_eq!(via_reader, expect);
+        assert!(docs_blob.footer_cached());
+        assert!(reader.memory_size() > fresh);
+    }
+
     /// Production sidecar eager tail (`ZO_VIX_EAGER_TAIL_BYTES` on the obs
     /// queriers); the plan below is stated for it.
     const PROD_SIDECAR_TAIL: u64 = 256 * 1024;

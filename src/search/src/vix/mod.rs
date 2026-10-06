@@ -64,6 +64,7 @@ mod query_regressions;
 mod partition;
 mod pruner;
 pub mod reader_cache;
+mod residual;
 mod result;
 pub mod source;
 
@@ -1375,6 +1376,7 @@ fn decide_exact_term(
 }
 
 /// Raw output of the blocking index evaluation for one file.
+#[derive(Debug)]
 enum RawVixResult {
     ExactNoMatch,
     ExactAllRows(u32),
@@ -2296,6 +2298,10 @@ fn evaluate_vix_index(
     // other conjunct was consulted). A partial field keeps that whole-file
     // bail: its value terms are incomplete.
     let mut fulltext_servable = true;
+    // the query's full-text scope as given (every scope field, token-indexed
+    // here or not): what the scan branch's `match_all` rebuild reads, so
+    // what the in-index residual filter must read too
+    let scope_full_text_fields: &[String] = full_text_fields.unwrap_or(&[]);
     let full_text_fields = if condition.uses_full_text() {
         let Some(fields) = full_text_fields else {
             return Ok(RawVixResult::PartialFields);
@@ -2430,11 +2436,9 @@ fn evaluate_vix_index(
     // M16 §4: the (single) skipped conjunct is served exactly by the stats
     // bitmap — the evaluation is no longer a weaker predicate
     let has_skipped = (has_skipped || !condition.can_remove_filter()) && stats_eq.is_none();
-    if aggregate && has_skipped {
-        return Err(
-            collect::AggregateFallback("aggregate predicate requires residual filtering").into(),
-        );
-    }
+    // A superset under an aggregate mode is refined to the exact match set
+    // in the index phase (`residual`, below the bitmap memo) — the file
+    // falls to the scan branch only when the refinement is refused.
 
     // This answer precedes docs availability and posting evaluation. Only a
     // whole-file single bucket and the entire ALL/positive same-field IN
@@ -2529,7 +2533,7 @@ fn evaluate_vix_index(
     // main path serves with the filter re-applied (#34). A superset
     // evaluation may re-clamp either memo (exact ⊆ superset of itself); an
     // exact evaluation only the exact one.
-    let eval_bitmap = |reader: &VixReader| -> anyhow::Result<BooleanBuffer> {
+    let superset_bitmap = |reader: &VixReader| -> anyhow::Result<BooleanBuffer> {
         // M16 §4: the chunk-stats-decided equality bitmap replaces the index
         // evaluation outright (exact by construction); only the window
         // clamp still applies. Deliberately outside the bitmap memo — the
@@ -2593,12 +2597,50 @@ fn evaluate_vix_index(
         Ok(bitmap)
     };
 
+    // Residual filtering in the index phase: an aggregate over a superset
+    // bitmap point-reads the candidates' predicate columns and evaluates
+    // the whole condition on them (the scan branch's own physical
+    // expression), so the collectors below run on the EXACT match set and
+    // the file's result memoises as exact. The superset itself was just
+    // memoised under the superset key by `superset_bitmap`. A refused
+    // refinement (too many candidates, a column this file cannot serve)
+    // is the pre-existing scan-branch fallback, with the reason counted.
+    let residual: Option<BooleanBuffer> = if aggregate && has_skipped {
+        let superset = superset_bitmap(reader)?;
+        match residual::refine_superset(reader, condition, scope_full_text_fields, &superset)? {
+            Ok(exact) => {
+                log::debug!(
+                    "[trace_id {trace_id}] search->vix: residual filter kept {} of {} candidate rows",
+                    exact.count_set_bits(),
+                    superset.count_set_bits(),
+                );
+                Some(exact)
+            }
+            Err(refusal) => return Err(collect::AggregateFallback(refusal.reason()).into()),
+        }
+    } else {
+        None
+    };
+    let has_skipped = has_skipped && residual.is_none();
+    // every arm below reads the match set through this: the refined exact
+    // bitmap when there is one, else the (exact, memoised) index bitmap
+    let eval_bitmap = |reader: &VixReader| -> anyhow::Result<BooleanBuffer> {
+        match &residual {
+            Some(exact) => Ok(exact.clone()),
+            None => superset_bitmap(reader),
+        }
+    };
+    // the query-side shortcuts (`reader.count(&query)`, single-term plist
+    // cursors) count the INDEX query; under a refinement that is the
+    // superset, so they are off — like under the stats-decided bitmap
+    let query_is_exact = stats_eq.is_none() && residual.is_none();
+
     match idx_optimize_rule {
         Some(IndexOptimizeMode::SimpleCount) => {
-            let count = if stats_eq.is_some() {
-                // M16 §4: the stats-decided bitmap IS the predicate (the
-                // dictionary `count(&query)` would count the weaker
-                // conjunct-skipped query)
+            let count = if !query_is_exact {
+                // the stats-decided or residual-refined bitmap IS the
+                // predicate (the dictionary `count(&query)` would count the
+                // weaker conjunct-skipped query)
                 eval_bitmap(reader)?.count_set_bits() as u64
             } else if file_in_range {
                 reader.count(&query)?
@@ -2647,7 +2689,7 @@ fn evaluate_vix_index(
                     ts_offset,
                 )?
             {
-                let count = if stats_eq.is_some() {
+                let count = if !query_is_exact {
                     eval_bitmap(reader)?.count_set_bits() as u64
                 } else {
                     reader.count(&query)?
@@ -2664,7 +2706,8 @@ fn evaluate_vix_index(
             // decode (stage 4 of the plist design). The grid IS the query
             // window, so out-of-window rows drop identically to the
             // time-clamped bitmap path.
-            if !has_skipped
+            if query_is_exact
+                && !has_skipped
                 && reader.zone_chunks().is_some()
                 && let Some(cursor) = reader.single_term_plist_cursor(&query)?
             {
@@ -2738,7 +2781,7 @@ fn evaluate_vix_index(
                     Ok(RawVixResult::MissingColumn { field })
                 };
             }
-            let count = if condition.is_condition_all() && stats_eq.is_none() {
+            let count = if condition.is_condition_all() && query_is_exact {
                 collect::count_field(
                     reader,
                     &field,
@@ -2771,7 +2814,7 @@ fn evaluate_vix_index(
                 // owns the cast semantics — never answer from prefix bounds
                 return Ok(RawVixResult::MissingColumn { field });
             };
-            let value = if condition.is_condition_all() && stats_eq.is_none() {
+            let value = if condition.is_condition_all() && query_is_exact {
                 collect::min_max_field(
                     reader,
                     &field,
@@ -3913,6 +3956,214 @@ mod tests {
             }
             _ => panic!("expected a bitmap"),
         }
+    }
+
+    /// Item 4 (2026-10-06): an aggregate over a SUPERSET predicate — an
+    /// fts-field equality narrowed to its tokens, a multi-word `match_all`
+    /// whose token AND is weaker than the SQL substring — is answered
+    /// exactly in the index phase: the candidates' predicate columns are
+    /// point-read and the whole condition re-evaluated with the scan
+    /// branch's physical expression. No `AggregateFallback`, `has_skipped`
+    /// false (the result memoises as exact), counts equal to what the scan
+    /// would have produced.
+    #[test]
+    fn test_aggregate_superset_is_refined_in_the_index_phase() {
+        use arrow::{
+            array::{Int64Array, RecordBatch, StringArray},
+            datatypes::{DataType, Field, Schema},
+        };
+        use vortex_index::{VixWriter, VixWriterOptions};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("level", DataType::Utf8, true),
+            Field::new("message", DataType::Utf8, true),
+        ]));
+        let opts = VixWriterOptions {
+            fts_field_names: vec!["message".to_string()],
+            ..Default::default()
+        };
+        let mut writer = VixWriter::new(&schema, opts, false);
+        let ts = vec![100i64, 99, 98, 97, 96];
+        let levels = vec![
+            Some("info"),
+            Some("error"),
+            Some("info"),
+            Some("info"),
+            Some("info"),
+        ];
+        // rows 0, 2, 3 carry both tokens of "hello world" (the superset);
+        // only row 0 EQUALS it, only rows 0 and 3 CONTAIN the phrase
+        let messages = vec![
+            Some("hello world"),
+            Some("goodbye world"),
+            Some("world hello"),
+            Some("hello world again"),
+            None,
+        ];
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(ts.clone())),
+                Arc::new(StringArray::from(levels)),
+                Arc::new(StringArray::from(messages)),
+            ],
+        )
+        .unwrap();
+        let sources: Vec<String> = ts
+            .iter()
+            .map(|t| format!(r#"{{"_timestamp":{t}}}"#))
+            .collect();
+        writer
+            .push_batch_with_source(&batch, &StringArray::from(sources), None)
+            .unwrap();
+        let reader = {
+            let (data, index) = writer.finish().unwrap();
+            VixReader::open_with_index(bytes::Bytes::from(data), index.map(bytes::Bytes::from))
+                .unwrap()
+        };
+        let fts = ["message".to_string()];
+
+        // fts-field equality + term equality: the superset has 3 rows, the
+        // exact count is 1
+        let equality = IndexCondition {
+            conditions: vec![
+                Condition::Equal("message".to_string(), "hello world".to_string()),
+                Condition::Equal("level".to_string(), "info".to_string()),
+            ],
+        };
+        match evaluate_vix_index(
+            "t",
+            &reader,
+            &equality,
+            Some(IndexOptimizeMode::SimpleCount),
+            (0, 1000),
+            true,
+            None,
+            None,
+            Some(&fts),
+        )
+        .unwrap()
+        {
+            RawVixResult::Count { count, has_skipped } => {
+                assert_eq!(count, 1, "only row 0 equals the value");
+                assert!(!has_skipped, "the refined result is exact");
+            }
+            other => panic!("expected an exact count, got {other:?}"),
+        }
+
+        // multi-word match_all is a substring predicate: rows 0 and 3 hold
+        // "hello world", row 2 ("world hello") only the tokens
+        let phrase = IndexCondition {
+            conditions: vec![
+                Condition::MatchAll("hello world".to_string()),
+                Condition::Equal("level".to_string(), "info".to_string()),
+            ],
+        };
+        assert!(!phrase.can_remove_filter());
+        match evaluate_vix_index(
+            "t",
+            &reader,
+            &phrase,
+            Some(IndexOptimizeMode::SimpleHistogram(0, 10, 11, 0)),
+            (0, 1000),
+            true,
+            None,
+            None,
+            Some(&fts),
+        )
+        .unwrap()
+        {
+            RawVixResult::Histogram {
+                histogram,
+                has_skipped,
+            } => {
+                let mut expected = vec![0u64; 11];
+                expected[10] = 1; // ts 100
+                expected[9] = 1; // ts 97
+                assert_eq!(histogram, expected);
+                assert!(!has_skipped);
+            }
+            other => panic!("expected an exact histogram, got {other:?}"),
+        }
+
+        // a superset that eliminates every candidate is exact-empty, and the
+        // plain row-id path is untouched (still the superset, still flagged)
+        let none = IndexCondition {
+            conditions: vec![
+                Condition::Equal("message".to_string(), "world hello".to_string()),
+                Condition::Equal("level".to_string(), "error".to_string()),
+            ],
+        };
+        match evaluate_vix_index(
+            "t",
+            &reader,
+            &none,
+            Some(IndexOptimizeMode::SimpleCount),
+            (0, 1000),
+            true,
+            None,
+            None,
+            Some(&fts),
+        )
+        .unwrap()
+        {
+            RawVixResult::Count { count, has_skipped } => {
+                assert_eq!(count, 0);
+                assert!(!has_skipped);
+            }
+            other => panic!("expected an exact count, got {other:?}"),
+        }
+        match evaluate_vix_index(
+            "t",
+            &reader,
+            &equality,
+            None,
+            (0, 1000),
+            true,
+            None,
+            None,
+            Some(&fts),
+        )
+        .unwrap()
+        {
+            RawVixResult::Bitmap {
+                bitmap,
+                has_skipped,
+                ..
+            } => {
+                assert!(has_skipped, "row-id searches keep the superset contract");
+                assert_eq!(bitmap.set_indices().collect::<Vec<_>>(), vec![0, 2, 3]);
+            }
+            other => panic!("expected a bitmap, got {other:?}"),
+        }
+
+        // the refinement is bounded: past the candidate cap the file keeps
+        // the scan-branch fallback (refused, not wrong)
+        let superset = reader
+            .eval(
+                &equality
+                    .to_vix_query(
+                        "t",
+                        &|field| field_capability(&reader, field),
+                        &index_match_all_tokens,
+                        true,
+                    )
+                    .unwrap()
+                    .0,
+            )
+            .unwrap();
+        assert_eq!(superset.count_set_bits(), 3);
+        assert_eq!(
+            residual::refine_superset_within(&reader, &equality, &fts, &superset, 2, 8)
+                .unwrap()
+                .unwrap_err(),
+            residual::Refusal::TooManyRows(3)
+        );
+        let exact = residual::refine_superset_within(&reader, &equality, &fts, &superset, 3, 8)
+            .unwrap()
+            .unwrap();
+        assert_eq!(exact.set_indices().collect::<Vec<_>>(), vec![0]);
     }
 
     /// #52/M7: equality on a field the writer AUTO-demoted to bloom-only at
@@ -8853,12 +9104,15 @@ mod review_tests {
         }
     }
 
-    /// Fix 3 degradation: an aggregate fast-path result computed with a
-    /// SKIPPED condition (here: equality on an fts-only field) would answer
-    /// a weaker predicate — the file must be kept for the scan branch
-    /// instead of contributing an overcount.
+    /// Item 4 (2026-10-06): an aggregate fast-path result over a SKIPPED
+    /// condition (here: equality on an fts-only field, a token superset)
+    /// is refined in the index phase — the candidates' columns are
+    /// point-read and the whole condition re-evaluated — so the file is
+    /// answered EXACTLY instead of being kept for the scan branch. Before
+    /// this the Count would have been an overcount and the file went back
+    /// with the filter.
     #[tokio::test(flavor = "multi_thread")]
-    async fn review_wave_b_skipped_condition_keeps_file_for_scan_branch() {
+    async fn review_wave_b_skipped_condition_is_refined_to_the_exact_count() {
         let key = "files/org/logs/t/2024/01/01/00/wave_b_fts_skip.vix";
         let reader = fts_file(&["hello world", "goodbye world"]);
         let file = agg_file_key(key, 2, 4096);
@@ -8875,9 +9129,9 @@ mod review_tests {
                 .unwrap(),
         );
 
-        // equality on the fts field is skipped per file (tokens only, no
-        // raw terms); the remaining conditions still evaluate — but the
-        // Count would be an overcount, so the file must go to the scan
+        // both rows carry `world`; the fts-field equality narrows to its
+        // tokens (`hello`, `world`: row 0 only) and is still a superset by
+        // contract — the residual filter proves row 0 equals the value
         let condition = IndexCondition {
             conditions: vec![
                 Condition::Equal("message".into(), "hello world".into()),
@@ -8886,7 +9140,7 @@ mod review_tests {
         };
         let mut files = vec![file];
         let (_took, add_filter_back, result) = super::vix_search(
-            query_params("wave-b-skip-degrade"),
+            query_params("wave-b-skip-refined"),
             &mut files,
             Some(condition),
             Some(IndexOptimizeMode::SimpleCount),
@@ -8894,16 +9148,13 @@ mod review_tests {
         .await
         .unwrap();
 
-        assert!(add_filter_back);
-        assert_eq!(
-            files.len(),
-            1,
-            "the file with the skipped condition must be kept for the scan"
+        assert!(!add_filter_back, "the refined aggregate is exact");
+        assert!(
+            files.is_empty(),
+            "the file is answered by the fast path, nothing goes to the scan"
         );
         match result {
-            MultiResult::Count(count) => {
-                assert_eq!(count, 0, "no partial contribution may be recorded")
-            }
+            MultiResult::Count(count) => assert_eq!(count, 1, "row 0 alone equals the value"),
             other => panic!("expected Count, got {other:?}"),
         }
     }

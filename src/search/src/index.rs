@@ -197,7 +197,7 @@ impl IndexCondition {
         let mut queries: Vec<VixQuery> = Vec::with_capacity(self.conditions.len());
         for condition in &self.conditions {
             if !fulltext_servable && condition.uses_full_text() {
-                log::info!(
+                log::debug!(
                     "[trace_id {trace_id}] to_vix_query: skipping full-text condition {}, an active full-text field is not token-indexed in this file",
                     condition.to_query()
                 );
@@ -234,7 +234,7 @@ impl IndexCondition {
                 }
             }
             if let Some(query) = token_superset {
-                log::info!(
+                log::debug!(
                     "[trace_id {trace_id}] to_vix_query: condition {} is on a token-indexed field in this file, narrowing it to the value's tokens (superset, filter re-applied)",
                     condition.to_query()
                 );
@@ -243,7 +243,7 @@ impl IndexCondition {
                 continue;
             }
             if let Some((missing, why)) = unservable {
-                log::info!(
+                log::debug!(
                     "[trace_id {trace_id}] to_vix_query: skipping condition, field {missing} is {why} in this file"
                 );
                 has_skipped = true;

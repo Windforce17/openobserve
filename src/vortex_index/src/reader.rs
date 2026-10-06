@@ -779,6 +779,45 @@ enum DictBytes<'a> {
     Resident(Bytes),
     Windowed(&'a crate::source::RangedBlob),
 }
+
+/// A docs-blob handle detached from its [`VixReader`]'s retained state (see
+/// [`VixReader::detached_docs`]): the footer window its opens consume lives
+/// in this value only. The schema is computed on first use from that
+/// footer (a fallible, blob-dependent read, hence the cell), then shared by
+/// the point reads.
+pub struct DocsPointReader<'a> {
+    reader: &'a VixReader,
+    blob: BlobHandle,
+    schema: OnceLock<SchemaRef>,
+}
+
+impl DocsPointReader<'_> {
+    /// The docs blob's arrow schema (one footer open on first call).
+    pub fn schema(&self) -> anyhow::Result<SchemaRef> {
+        if let Some(schema) = self.schema.get() {
+            return Ok(Arc::clone(schema));
+        }
+        let _scope = self.reader.memory.enter();
+        check_read_cancelled()?;
+        let (schema, _opening) = crate::container::blob_arrow_schema_owned(&self.blob)?;
+        let schema = Arc::new(schema);
+        Ok(Arc::clone(self.schema.get_or_init(|| schema)))
+    }
+
+    /// [`VixReader::read_docs_columns_rows`] through the detached handle.
+    pub fn read_columns_rows(
+        &self,
+        names: &[&str],
+        row_ids: &[u64],
+    ) -> anyhow::Result<RecordBatch> {
+        check_read_cancelled()?;
+        let schema = self.schema()?;
+        Ok(self
+            .reader
+            .read_columns_rows_from(&self.blob, &schema, names, row_ids)?)
+    }
+}
+
 impl VixReader {
     /// Open a core file from its complete DATA-object bytes, WITHOUT an
     /// index sidecar: the reader carries no term/bloom capability — every
@@ -2825,6 +2864,43 @@ impl VixReader {
     /// API, invalid ordering is rejected rather than silently normalized.
     pub fn read_docs_columns_rows(&self, names: &[&str], row_ids: &[u64]) -> Result<RecordBatch> {
         check_read_cancelled()?;
+        let schema = self.docs_schema_inner()?;
+        self.read_columns_rows_from(&self.docs_blob, &schema, names, row_ids)
+    }
+
+    /// A docs-blob handle for bounded point reads that leaves NO trace in
+    /// this reader. Opening the docs blob consumes its Vortex footer (the
+    /// 256 KiB initial read plus a `NeedMoreData` prefix on wide, many-chunk
+    /// files — 1–3 MB on merged production files) and a reader retains that
+    /// window for later opens; a cached reader's metadata tier is sized for
+    /// ~1 MB per file, so a per-file residual read through `docs_blob` would
+    /// cut the reader cache's file coverage by two thirds. The handle
+    /// returned here owns its own footer state and drops it with itself;
+    /// repeats of the same predicate are served by the exact result memo one
+    /// layer up, so the footer is re-read only for new predicates — what the
+    /// scan branch's private open paid for every query before.
+    pub fn detached_docs(&self) -> DocsPointReader<'_> {
+        let blob = match &self.docs_blob {
+            BlobHandle::Mem(bytes) => BlobHandle::Mem(bytes.clone()),
+            BlobHandle::Ranged(ranged) => BlobHandle::Ranged(crate::source::RangedBlob::new(
+                Arc::clone(&ranged.source),
+                ranged.range.clone(),
+            )),
+        };
+        DocsPointReader {
+            reader: self,
+            blob,
+            schema: OnceLock::new(),
+        }
+    }
+
+    fn read_columns_rows_from(
+        &self,
+        blob: &BlobHandle,
+        schema: &SchemaRef,
+        names: &[&str],
+        row_ids: &[u64],
+    ) -> Result<RecordBatch> {
         if names.is_empty()
             || names
                 .iter()
@@ -2841,7 +2917,6 @@ impl VixReader {
             ));
         }
         self.check_row_bounds(row_ids)?;
-        let schema = self.docs_schema_inner()?;
         let indices = names
             .iter()
             .map(|name| {
@@ -2858,7 +2933,7 @@ impl VixReader {
         let mut batches = Vec::new();
         let mut returned_rows = 0usize;
         let result = scan_blob_streaming(
-            &self.docs_blob,
+            blob,
             Some(names),
             RowSelection::Indices(row_ids.to_vec()),
             None,
@@ -6156,6 +6231,12 @@ impl VixReader {
     /// Test-only: the `terms` blob handle (read-plan tests open it directly).
     pub(crate) fn terms_blob_for_tests(&self) -> Option<&BlobHandle> {
         self.terms_blob.as_ref()
+    }
+
+    /// Test-only: the `docs` blob handle (retention tests inspect its
+    /// footer state).
+    pub(crate) fn docs_blob_for_tests(&self) -> &BlobHandle {
+        &self.docs_blob
     }
 
     /// Test-only: every composite term of the file — raw key bytes,
