@@ -1456,6 +1456,59 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     10k per-pod cap, saturated). Permit contention (`queue_us`) is a
     steady-state tax until the caches fill; `ZO_DISK_CACHE_MAX_AGE_DAYS=2`
     remains the candidate.
+- **2026-10-07 — `str_match` on a large-dictionary field: verify the
+  candidates' column instead of walking the field's whole dictionary
+  (owner question: "字符串匹配的性能不是很高"). Working tree on top of
+  `.203`'s `e48a58c07`; vortex_index 370 tests.**
+  - The shape: `str_match(request.uri, 'thirdparty_webhook/email') AND
+    str_match_ignore_case(request.body, 'asagent1')` on `apisix`, 33
+    distinct runs on 10-06 (6 h windows). Both conjuncts are `Contains`
+    leaves → dictionary WALKS (`scan_all_tokens`): every distinct value of
+    the field is read and tested. Per-field dictionary split of a prod
+    pair (`75128600352533422088ead`, 10-05 12Z, tail-only probe): sidecar
+    460 MB, `dict_blocks` 312 MB of which **`request.body` 243.8 MB**,
+    `request.uri` 8.2 MB, 535 term fields. The uri leaf is selective (90
+    rows over 6 h) and short-circuits most files before the body walk;
+    on every file where it matches, the body walk read ~244 MB (~3,700
+    64 KiB blocks) to decide a handful of rows.
+  - Change (reader, `eval_and` wave 2): a `Contains`/`Regex` leaf on a
+    named term field whose dictionary is ≥ `ZO_VIX_WALK_VERIFY_MIN_BYTES`
+    (16 MiB; 0 = always walk) is HELD BACK; after the cheaper leaves
+    intersect, the candidates' values of that field are point-read from
+    the docs column (detached handle: 1 MiB footer + the touched chunks'
+    segments, one concurrent wave) and tested with the SAME matcher the
+    walk uses (`WalkMatcher`, shared by both routes — raw-value term ==
+    whole column value, nulls match neither way). Zero-IO cost model
+    decides per file: walk = min(blocks × 64 KiB, block share of the
+    `dict_blocks` blob); verify = 1 MiB + Σ touched chunks' dictionary
+    share (≥ 64 KiB each); verify only when verify × 2 ≤ walk and verify
+    ≤ 64 MiB (the segments grow the eval byte-gate lease; a refusal would
+    scan the file). Declined → the walk as before (+2–3 round trips: the
+    held leaf intersects separately). Lone walks, legacy files without a
+    field page directory, fts fields (never term-typed) are untouched.
+  - A/B on a prod `apisix` pair (`7512849656796176384cce7`, 10-05 12Z,
+    284 MB + 230 MB, 828,379 rows, 197 docs chunks, `request.body`
+    dictionary 124.0 MB exact / 90.2 MB estimated), `walk_verify_bench`,
+    20 ms simulated latency, bits identical to the in-memory eval on
+    every row; uri leaf as a `Contains` like prod:
+
+    | uri needle → candidates (chunks) | walk route bytes · waves | verify route bytes · waves |
+    |---|---|---|
+    | `thirdparty_webhook/email` → 0 | 5.8 MB · 2.7 | 5.8 MB · 2.8 (short-circuit, no walk either way) |
+    | `wdp_cc4cce…` → 16 (13 / 197) | 133.5 MB · 31.6 | **12.5 MB · 9.4** |
+    | `thirdparty_webhook` → 48 (44 / 197) | 133.5 MB · 29.5 | **27.4 MB · 10.0** (estimate 21.6 MB) |
+    | `preview/resolve` → 3,100 (196 / 197) | 133.5 MB · 29.9 | 134.2 MB · 32.8 (declined → walk) |
+
+    Of the verify route's bytes 6.2 MB is the uri walk itself (8 MB
+    dictionary, 125 blocks, paid on every file) — the remaining per-file
+    floor of this shape; a substring on a path-like field has no other
+    index route. Synthetic regression `tests/walk_verify.rs` (40k-row,
+    10.4 MB near-unique dictionary): verified route 4.0 MB vs walk 10.4 MB,
+    identical bits for ci/cs `Contains` and `Regex`; broad and lone
+    conjuncts keep the walk; threshold 0 / oversize keeps the walk.
+  - Not changed: the `.203` rollout above stays; this ships as the next
+    querier release after a 1 h A/B on one pod (`ZO_VIX_WALK_VERIFY_MIN_
+    BYTES=0` is the in-place rollback).
 
 ## 2026-09-29 — P2 shipped as `.176` and rolled back within 30 min: the per-stream side table stalled the shared meta DB (commit latency 40–60×, ingest 503s); ranges must live in the segment row
 - What shipped (vix-arch `013c45010` + NATS retry `76fe754b5`, image
