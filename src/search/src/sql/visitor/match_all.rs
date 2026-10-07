@@ -17,7 +17,7 @@ use std::{ops::ControlFlow, sync::Arc};
 
 use datafusion::sql::{TableReference, planner::object_name_to_table_reference};
 use hashbrown::HashMap;
-use infra::schema::{SchemaCache, get_stream_setting_fts_fields};
+use infra::schema::{SchemaCache, resolve_stream_fts_fields};
 use sqlparser::ast::{Expr, FunctionArguments, Query, TableFactor, VisitorMut, visit_expressions};
 
 use crate::datafusion::udf::{
@@ -42,7 +42,12 @@ impl MatchVisitor {
         let mut has_fst_fields = HashMap::new();
         for (table_name, schema) in total_schemas {
             let stream_settings = infra::schema::unwrap_stream_settings(schema.schema());
-            let fts_fields = get_stream_setting_fts_fields(&stream_settings);
+            // concrete schema fields the fts keys designate — an explicit
+            // key `body` designates `request.body` too
+            let fts_fields = resolve_stream_fts_fields(
+                &stream_settings,
+                schema.schema().fields().iter().map(|f| f.name().as_str()),
+            );
             // check if schema don't have full text search field
             if fts_fields
                 .into_iter()

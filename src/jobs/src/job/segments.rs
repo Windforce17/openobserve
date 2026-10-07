@@ -68,7 +68,7 @@ use futures::StreamExt;
 use hashbrown::HashMap;
 use infra::{
     l0_provenance::encode_exact_ids,
-    schema::{get_stream_setting_bloom_filter_fields, get_stream_setting_fts_fields},
+    schema::{get_stream_setting_bloom_filter_fields, resolve_stream_fts_fields},
     storage,
     wal_segments::{self, ClaimOrder, SegmentMeta},
 };
@@ -2487,7 +2487,12 @@ async fn build_one_file(
     };
 
     let bloom_fields = get_stream_setting_bloom_filter_fields(stream_settings);
-    let fts_fields = get_stream_setting_fts_fields(stream_settings);
+    // resolve fts keys to the CONCRETE fields of the schema in hand — an
+    // explicit key `body` designates `request.body` too
+    let fts_fields = resolve_stream_fts_fields(
+        stream_settings,
+        union.fields().iter().map(|f| f.name().as_str()),
+    );
     let store_original = stream_settings
         .as_ref()
         .is_some_and(|settings| settings.store_original_data);

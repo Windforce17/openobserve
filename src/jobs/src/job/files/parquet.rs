@@ -37,10 +37,7 @@ use config::{
     },
 };
 use hashbrown::HashSet;
-use infra::{
-    schema::{get_stream_setting_bloom_filter_fields, get_stream_setting_fts_fields},
-    storage,
-};
+use infra::{schema::get_stream_setting_bloom_filter_fields, storage};
 use ingester::WAL_PARQUET_METADATA;
 use tokio::{
     fs::remove_file,
@@ -958,7 +955,6 @@ async fn merge_files(
     // get latest version of schema
     let stream_settings = infra::schema::unwrap_stream_settings(&latest_schema);
     let bloom_filter_fields = get_stream_setting_bloom_filter_fields(&stream_settings);
-    let full_text_search_fields = get_stream_setting_fts_fields(&stream_settings);
 
     // we shouldn't use the latest schema, because there are too many fields, we need read schema
     // from files only get the fields what we need
@@ -967,6 +963,18 @@ async fn merge_files(
         let file_schema = read_schema_from_file(&(&wal_dir.join(&file.key)).into()).await?;
         shared_fields.extend(file_schema.fields().iter().cloned());
     }
+    // resolve fts keys to the CONCRETE fields this merge actually writes —
+    // the union WAL schema (file fields) plus the registry schema, so an
+    // explicit key `body` designates `request.body` whether or not this batch
+    // of files carries the column yet
+    let full_text_search_fields = infra::schema::resolve_stream_fts_fields(
+        &stream_settings,
+        shared_fields
+            .iter()
+            .map(|f| f.name().as_str())
+            .chain(latest_schema.fields().iter().map(|f| f.name().as_str())),
+    );
+
     // use the shared fields to create a new schema and with empty metadata
     let mut fields = shared_fields.into_iter().collect::<Vec<_>>();
     fields.sort_by(|a, b| a.name().cmp(b.name()));

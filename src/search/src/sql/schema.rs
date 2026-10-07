@@ -22,7 +22,7 @@ use config::{
 };
 use datafusion::{arrow::datatypes::Schema, common::TableReference};
 use hashbrown::{HashMap, HashSet};
-use infra::schema::{SchemaCache, get_stream_setting_fts_fields, unwrap_stream_settings};
+use infra::schema::{SchemaCache, resolve_stream_fts_fields, unwrap_stream_settings};
 use vortex_index::SOURCE_COL_NAME;
 
 pub fn generate_select_star_schema(
@@ -153,7 +153,12 @@ pub fn generate_row_store_star_fields(
     }
     // match_all needs the full-text fields bound in the plan
     if need_fst_fields {
-        for field in get_stream_setting_fts_fields(&stream_settings) {
+        // concrete schema fields the fts keys designate — an explicit key
+        // `body` designates `request.body` too
+        for field in resolve_stream_fts_fields(
+            &stream_settings,
+            schema.schema().fields().iter().map(|f| f.name().as_str()),
+        ) {
             push(&field, &mut fields, &mut names);
         }
     }
@@ -183,7 +188,12 @@ pub fn generate_schema_fields(
     // 3. add field from full text search
     if has_match_all {
         let stream_settings = infra::schema::unwrap_stream_settings(schema.schema());
-        let fts_fields = get_stream_setting_fts_fields(&stream_settings);
+        // concrete schema fields the fts keys designate — an explicit key
+        // `body` designates `request.body` too
+        let fts_fields = resolve_stream_fts_fields(
+            &stream_settings,
+            schema.schema().fields().iter().map(|f| f.name().as_str()),
+        );
         for fts_field in fts_fields {
             if schema.field_with_name(&fts_field).is_none() {
                 continue;

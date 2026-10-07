@@ -57,8 +57,7 @@ use hashbrown::{HashMap, HashSet};
 use infra::{
     errors::{Error, ErrorCodes},
     schema::{
-        get_stream_setting_bloom_filter_fields, get_stream_setting_fts_fields,
-        unwrap_stream_settings,
+        get_stream_setting_bloom_filter_fields, resolve_stream_fts_fields, unwrap_stream_settings,
     },
 };
 use itertools::Itertools;
@@ -180,10 +179,14 @@ pub async fn search(
         .await
         .unwrap_or(arrow_schema::Schema::empty());
     let stream_settings = unwrap_stream_settings(&db_schema);
-    let mut fst_fields = get_stream_setting_fts_fields(&stream_settings)
-        .into_iter()
-        .filter(|v| latest_schema_map.contains_key(v))
-        .collect_vec();
+    // concrete fields of the PLAN full_schema the fts keys designate — an
+    // explicit key `body` designates `request.body` too; resolving against
+    // the plan schema keeps fst_fields ⊆ full_schema for the downstream
+    // index_of(..).unwrap() in rewrite_match.rs
+    let mut fst_fields = resolve_stream_fts_fields(
+        &stream_settings,
+        latest_schema.fields().iter().map(|f| f.name().as_str()),
+    );
     fst_fields.sort_unstable();
     fst_fields.dedup();
     // the vix index term-indexes every string field's raw values and every
