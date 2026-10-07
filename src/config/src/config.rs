@@ -2378,6 +2378,12 @@ pub struct Limit {
     )]
     pub vix_eager_tail_bytes: u64,
     #[env_config(
+        name = "ZO_VIX_WALK_VERIFY_MIN_BYTES",
+        default = 16777216,
+        help = "A str_match / regex conjunct on a term-indexed field normally walks the field's whole dictionary per file. When that dictionary is at least this many bytes (16 MiB) and the query's other conjuncts leave few candidate rows, the reader verifies the candidates' column values instead (docs footer + their chunks, one batched read). 0 = always walk."
+    )]
+    pub vix_walk_verify_min_bytes: u64,
+    #[env_config(
         name = "ZO_WARMUP_CACHE_HOURS",
         default = 0,
         help = "Queriers prefetch the .vix index metadata (footer + directory tail) for THEIR consistent-hash share of the last N hours' files right after coming online, so post-roll cold starts serve index queries warm (0 = off). Best-effort background task; never blocks readiness."

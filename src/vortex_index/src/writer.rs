@@ -5660,14 +5660,14 @@ impl NumericColumn {
 }
 
 /// Typed view over the three arrow string-array flavors.
-enum StringColumn<'a> {
+pub(crate) enum StringColumn<'a> {
     Utf8(&'a StringArray),
     LargeUtf8(&'a LargeStringArray),
     Utf8View(&'a StringViewArray),
 }
 
 impl<'a> StringColumn<'a> {
-    fn try_new(array: &'a dyn Array) -> Option<Self> {
+    pub(crate) fn try_new(array: &'a dyn Array) -> Option<Self> {
         match array.data_type() {
             DataType::Utf8 => array.as_any().downcast_ref().map(Self::Utf8),
             DataType::LargeUtf8 => array.as_any().downcast_ref().map(Self::LargeUtf8),
@@ -5695,7 +5695,7 @@ impl<'a> StringColumn<'a> {
     }
 
     /// The value at `row`, or `None` when null.
-    fn value(&self, row: usize) -> Option<&'a str> {
+    pub(crate) fn value(&self, row: usize) -> Option<&'a str> {
         match self {
             Self::Utf8(array) => array.is_valid(row).then(|| array.value(row)),
             Self::LargeUtf8(array) => array.is_valid(row).then(|| array.value(row)),

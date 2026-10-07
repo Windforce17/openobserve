@@ -335,6 +335,45 @@ pub(crate) const MERGED_POINT_WAVE_MAX_BYTES: u64 = 256 * 1024;
 /// the one prefix read.
 pub const DETACHED_DOCS_FOOTER_READ_BYTES: u64 = 1024 * 1024;
 
+/// Most candidate rows a docs point read takes
+/// ([`VixReader::read_docs_columns_rows`]); a held-back walk with more
+/// candidates walks its dictionary.
+const DOCS_POINT_READ_MAX_ROWS: usize = 65_536;
+
+/// Column verification must be estimated at no more than this fraction of
+/// the dictionary walk it replaces (`1/2`): headroom for the estimate's
+/// errors — prefix compression that shrinks the encoded dictionary below
+/// the raw-key block target, column encodings fatter than their distinct
+/// bytes — so a verified leaf is never the slower route by a wide margin.
+const WALK_VERIFY_MARGIN: u64 = 2;
+
+/// Most bytes one verification may be estimated at, whatever the walk
+/// would cost: the fetched segments stay owned by the detached docs handle
+/// until the leaf is decided, and that ownership grows the evaluation's
+/// byte-gate lease (`EvaluationMemory::check` in the search layer) — a
+/// growth the gate may refuse under fan-out, which turns the file into a
+/// scan. The walk streams through a bounded block cache instead. 64 MiB
+/// is ~100 production chunks of a near-unique body column.
+const WALK_VERIFY_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Least bytes one touched docs chunk is charged in the verification
+/// estimate — one dictionary block's worth, the walk's own read unit — so
+/// a chunk whose dictionary share rounds to nothing still costs a read.
+/// Measured 2026-10-07 on a prod `apisix` pair (828k rows, 197 chunks of
+/// ~4,200 rows): `request.body` segments were 180 KB–2.8 MB per touched
+/// chunk against a 630 KB dictionary-share estimate, so the share, not a
+/// floor, carries the estimate on production chunk sizes.
+const DOCS_SEGMENT_MIN_BYTES: u64 = crate::dict_blocks::BLOCK_TARGET_BYTES as u64;
+
+/// A wave-2 leaf held back from its dictionary walk (see
+/// [`VixReader::walk_verify_plan`]).
+pub(crate) struct WalkPlan<'q> {
+    /// The walked term field's name — the docs column verification reads.
+    pub(crate) field: &'q str,
+    /// Estimated bytes the walk would read (see [`VixReader::walk_verify_plan`]).
+    pub(crate) walk_bytes: u64,
+}
+
 /// One terms-table cell as read by the batched AND intersection.
 enum TermCell {
     /// `doc_count == 0`: nothing to decode.
@@ -721,6 +760,11 @@ pub struct VixReader {
     /// [`PARTIAL_RECORD_MIN_BYTES`]); tests lower it to exercise the
     /// header + skip-group path on small fixtures.
     partial_record_min_bytes: u64,
+    /// A whole-field dictionary walk at least this large is a candidate
+    /// for column verification (see [`Self::eval_and`]); `0` disables.
+    /// Taken from [`crate::container::walk_verify_min_bytes`] at open;
+    /// tests lower it so small fixtures reach the path.
+    walk_verify_min_bytes: u64,
     /// Arrow schema of the `docs` blob, loaded eagerly on in-memory readers
     /// and on first docs access on ranged readers.
     docs_schema: OnceLock<SchemaRef>,
@@ -818,6 +862,10 @@ pub struct DocsPointReader<'a> {
 impl DocsPointReader<'_> {
     /// The docs blob's arrow schema (one footer open on first call).
     pub fn schema(&self) -> anyhow::Result<SchemaRef> {
+        Ok(self.schema_inner()?)
+    }
+
+    fn schema_inner(&self) -> Result<SchemaRef> {
         if let Some(schema) = self.schema.get() {
             return Ok(Arc::clone(schema));
         }
@@ -834,15 +882,18 @@ impl DocsPointReader<'_> {
         names: &[&str],
         row_ids: &[u64],
     ) -> anyhow::Result<RecordBatch> {
+        Ok(self.read_columns_rows_inner(names, row_ids)?)
+    }
+
+    fn read_columns_rows_inner(&self, names: &[&str], row_ids: &[u64]) -> Result<RecordBatch> {
         check_read_cancelled()?;
-        let schema = self.schema()?;
+        let schema = self.schema_inner()?;
         let _memo = match &self.blob {
             BlobHandle::Ranged(ranged) => Some(ranged.prefetch_scope(Arc::clone(&self.windows))),
             BlobHandle::Mem(_) => None,
         };
-        Ok(self
-            .reader
-            .read_columns_rows_from(&self.blob, &schema, names, row_ids)?)
+        self.reader
+            .read_columns_rows_from(&self.blob, &schema, names, row_ids)
     }
 }
 
@@ -1206,6 +1257,7 @@ impl VixReader {
             plist_blob,
             plist_min_docs,
             partial_record_min_bytes: PARTIAL_RECORD_MIN_BYTES,
+            walk_verify_min_bytes: crate::container::walk_verify_min_bytes(),
             docs_schema: OnceLock::new(),
             memory: crate::source::current_reader_memory(),
             column_presence,
@@ -1447,11 +1499,40 @@ impl VixReader {
         &self.fts_fields
     }
 
+    /// Exact encoded dictionary bytes of one term-indexed field — the span
+    /// of its `dict_blocks` pages — what a dictionary WALK of that field
+    /// (`Contains`, `Regex`) reads. Costs the field's page index when it is
+    /// not resident yet (one small fetch wave; the walk needs it too); the
+    /// zero-IO planning estimate is [`Self::walk_verify_plan`]'s. `None` for
+    /// a field without term capability or a file without a field page
+    /// directory (legacy whole-dictionary files).
+    pub fn field_dictionary_bytes(&self, name: &str) -> Option<u64> {
+        let fid = self.field_id(name)?;
+        self.dict_field_pages.as_ref()?;
+        let index = self.field_index(fid).ok()?;
+        let blob_len = self.dict_blocks_len().ok()?;
+        let blocks = index.field_blocks();
+        if blocks.is_empty() {
+            return Some(0);
+        }
+        let start = index.block_range(blocks.start, blob_len).start;
+        let end = index.block_range(blocks.end - 1, blob_len).end;
+        Some(end.saturating_sub(start))
+    }
+
     /// Test-only: lower the whole-record read threshold so a small fixture
     /// exercises the skip-header + group path of the AND intersection.
     #[cfg(test)]
     pub(crate) fn set_partial_record_min_bytes(&mut self, bytes: u64) {
         self.partial_record_min_bytes = bytes;
+    }
+
+    /// Test-only: lower the dictionary size from which a whole-field walk
+    /// is verified against the column instead, so a small fixture reaches
+    /// the path (`0` disables it for the walk-vs-verify equivalence runs).
+    #[cfg(test)]
+    pub(crate) fn set_walk_verify_min_bytes(&mut self, bytes: u64) {
+        self.walk_verify_min_bytes = bytes;
     }
 
     /// Evaluate a query into a bitmap with one bit per document
@@ -4460,8 +4541,12 @@ impl VixReader {
     /// term ends the evaluation before any postings read. The surviving
     /// leaves intersect through [`Self::intersect_leaves`]: ONE terms-table
     /// read for all ordinals, `doc_count`-ordered evaluation, and at most
-    /// two batched plist waves. Composite children (`Or`/`Not`, other
-    /// `FullText` shapes) evaluate last. An empty child list is `All`.
+    /// two batched plist waves. A walk over a LARGE field dictionary is
+    /// held out of that intersection and decided afterwards on the
+    /// intersection's few candidate rows from the docs column
+    /// ([`Self::walk_verify_plan`], [`Self::verify_walk_leaf`]). Composite
+    /// children (`Or`/`Not`, other `FullText` shapes) evaluate last. An
+    /// empty child list is `All`.
     fn eval_and(&self, subs: &[VixQuery], scope: Option<&[u16]>) -> Result<BooleanBuffer> {
         let len = self.row_count as usize;
         // scopes[0] is the inherited scope; flattened `FullText` children
@@ -4616,8 +4701,19 @@ impl VixReader {
             }
         }
         // wave 2: prefix / regex / fuzzy / contains walk dictionary ranges —
-        // only once every cheaper leaf proved present
+        // only once every cheaper leaf proved present. A whole-field walk
+        // whose dictionary is large (`walk_verify_plan`) is held back: once
+        // the other leaves have intersected, the few rows they leave are
+        // VERIFIED against the field's docs column instead of walking every
+        // distinct value of the field (`verify_walk_leaf`); the walk stays
+        // the route when the candidates are many or there are none to
+        // narrow by.
+        let mut held = self.query_vec::<(&VixQuery, usize, WalkPlan<'_>)>(scans.value.len())?;
         for &(scan, scope_index) in scans.value.iter() {
+            if let Some(plan) = self.walk_verify_plan(scan) {
+                held.push((scan, scope_index, plan))?;
+                continue;
+            }
             let ordinals = self.collect_ordinals(scan, scope_of(scope_index))?;
             if ordinals.value.is_empty() {
                 return Ok(BooleanBuffer::new_unset(len));
@@ -4627,6 +4723,39 @@ impl VixReader {
         let mut acc = self.intersect_leaves(leaves)?;
         if acc.as_ref().is_some_and(|acc| acc.count_set_bits() == 0) {
             return Ok(acc.expect("checked"));
+        }
+        // smallest dictionary first: when nothing else narrows, the cheapest
+        // walk supplies the candidates the larger ones are verified against
+        held.value.sort_by_key(|(_, _, plan)| plan.walk_bytes);
+        for (scan, scope_index, plan) in held.value.iter() {
+            let verified = match &acc {
+                Some(candidates) => self.verify_walk_leaf(scan, plan, candidates)?,
+                None => None,
+            };
+            let bitmap = match verified {
+                Some(bitmap) => bitmap,
+                None => {
+                    let ordinals = self.collect_ordinals(scan, scope_of(*scope_index))?;
+                    if ordinals.value.is_empty() {
+                        return Ok(BooleanBuffer::new_unset(len));
+                    }
+                    let mut leaf = self.query_vec(1)?;
+                    leaf.push(ordinals)?;
+                    match self.intersect_leaves(leaf)? {
+                        Some(bitmap) => bitmap,
+                        // only dense-elided terms: the leaf constrains nothing
+                        None => continue,
+                    }
+                }
+            };
+            let next = match &acc {
+                Some(prev) => prev & &bitmap,
+                None => bitmap,
+            };
+            if next.count_set_bits() == 0 {
+                return Ok(next);
+            }
+            acc = Some(next);
         }
         for &(sub, scope_index) in composites.value.iter() {
             let bitmap = self.eval_query(sub, scope_of(scope_index))?;
@@ -4640,6 +4769,187 @@ impl VixReader {
             acc = Some(next);
         }
         Ok(acc.unwrap_or_else(|| BooleanBuffer::new_set(len)))
+    }
+
+    /// Whether a wave-2 leaf is a whole-field dictionary walk large enough
+    /// to hold back for column verification: `Contains` / `Regex` on a
+    /// named term field whose estimated dictionary bytes reach
+    /// `walk_verify_min_bytes`. Zero IO: the estimate is the SMALLER of two
+    /// readings of the tail-resident field directory — the field's block
+    /// count at the raw-key block target (an upper bound of the encoded
+    /// bytes the walk reads; prefix compression only shrinks blocks), and
+    /// its block share of the `dict_blocks` blob length (exact when fields
+    /// compress alike) — so the walk is never credited with more cost than
+    /// either reading supports. Legacy files without a field page directory
+    /// and fields the walk rejects anyway are not candidates.
+    pub(crate) fn walk_verify_plan<'q>(&self, leaf: &'q VixQuery) -> Option<WalkPlan<'q>> {
+        if self.walk_verify_min_bytes == 0 {
+            return None;
+        }
+        let field = match leaf {
+            VixQuery::Contains {
+                field: Some(field), ..
+            }
+            | VixQuery::Regex {
+                field: Some(field), ..
+            } => field.as_str(),
+            _ => return None,
+        };
+        let fid = self.field_id(field)?;
+        let directory = self.dict_field_pages.as_ref()?;
+        let slot = directory
+            .pages
+            .binary_search_by_key(&fid, |page| page.field_id)
+            .ok()?;
+        let page = &directory.pages[slot];
+        let blocks = page.block_end.saturating_sub(page.first_block);
+        let raw = blocks.saturating_mul(crate::dict_blocks::BLOCK_TARGET_BYTES as u64);
+        let share = (u128::from(self.dict_blocks_len().ok()?) * u128::from(blocks)
+            / u128::from(directory.block_count.max(1))) as u64;
+        let walk_bytes = raw.min(share);
+        (walk_bytes >= self.walk_verify_min_bytes).then_some(WalkPlan { field, walk_bytes })
+    }
+
+    /// Decide the held-back walk `leaf` for the `candidates` the cheaper
+    /// conjuncts left by reading THEIR values of the walked field from the
+    /// docs column, instead of every distinct value of the field from the
+    /// dictionary: `Some(bitmap)` of the candidates whose value matches
+    /// (exact — a raw-value term is the row's whole column value, and both
+    /// routes apply the same [`WalkMatcher`]; a value the writer skipped as
+    /// oversize has no term, so only this route can match it — the query
+    /// layer bails such files out before either route), or `None` when the
+    /// walk is the better or only route: more candidates than one point
+    /// read takes, no zone table to size their chunks, an estimated read
+    /// over [`WALK_VERIFY_MAX_BYTES`] or over half the dictionary, or the
+    /// field not stored as a string docs column.
+    ///
+    /// Cost model, zero IO until the decision: the walk reads the field's
+    /// dictionary (`plan.walk_bytes`, every distinct value once, in
+    /// hundreds of block fetches on a large field); verification reads the
+    /// docs footer ([`DETACHED_DOCS_FOOTER_READ_BYTES`], one round trip)
+    /// plus the touched chunks' segments of ONE column, concurrently
+    /// ([`Self::verify_column_bytes`]): per chunk the dictionary's share of
+    /// its rows — distinct bytes are what a string column stores whether
+    /// its values repeat (dictionary-encoded chunks) or not (near-unique
+    /// bodies) — at least one read's worth each. Measured 2026-10-07 on a
+    /// prod `apisix` pair: 16 candidates in 13 of 197 chunks verified in
+    /// 12.5 MB / 8 waves against a 133.5 MB / 26-wave walk, identical bits.
+    fn verify_walk_leaf(
+        &self,
+        leaf: &VixQuery,
+        plan: &WalkPlan<'_>,
+        candidates: &BooleanBuffer,
+    ) -> Result<Option<BooleanBuffer>> {
+        check_read_cancelled()?;
+        let count = candidates.count_set_bits();
+        if count == 0 || count > DOCS_POINT_READ_MAX_ROWS {
+            return Ok(None);
+        }
+        let mut rows = self.query_vec::<u64>(count)?;
+        for row in candidates.set_indices() {
+            rows.push(row as u64)?;
+        }
+        let Some(column_bytes) = self.verify_column_bytes(&rows.value, plan.walk_bytes) else {
+            return Ok(None);
+        };
+        let verify_bytes = DETACHED_DOCS_FOOTER_READ_BYTES.saturating_add(column_bytes);
+        let verify = verify_bytes <= WALK_VERIFY_MAX_BYTES
+            && verify_bytes.saturating_mul(WALK_VERIFY_MARGIN) <= plan.walk_bytes;
+        log::debug!(
+            "vix: {} dictionary walk of {:?} ({} bytes) for {count} candidate rows: column \
+             verification estimated at {verify_bytes} bytes",
+            if verify { "verifying" } else { "keeping" },
+            plan.field,
+            plan.walk_bytes,
+        );
+        if !verify {
+            return Ok(None);
+        }
+        let docs = self.detached_docs();
+        let schema = docs.schema_inner()?;
+        let Ok(index) = schema.index_of(plan.field) else {
+            return Ok(None);
+        };
+        if !matches!(
+            schema.field(index).data_type(),
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+        ) {
+            return Ok(None);
+        }
+        let batch = docs.read_columns_rows_inner(&[plan.field], &rows.value)?;
+        let values =
+            crate::writer::StringColumn::try_new(batch.column(0).as_ref()).ok_or_else(|| {
+                VixError::Malformed(format!(
+                    "docs column {:?} is not a string array",
+                    plan.field
+                ))
+            })?;
+        let mut matcher = WalkMatcher::new(leaf)?.expect("walking leaf");
+        let len = self.row_count as usize;
+        let mut out = BooleanBufferBuilder::new(len);
+        out.append_n(len, false);
+        for (position, &row) in rows.value.iter().enumerate() {
+            // a null value has no raw term: the walk never matches it either
+            if values
+                .value(position)
+                .is_some_and(|value| matcher.matches(value.as_bytes()))
+            {
+                out.set_bit(row as usize, true);
+            }
+        }
+        check_read_cancelled()?;
+        Ok(Some(out.finish()))
+    }
+
+    /// Estimated bytes a point read of the ascending `rows` decodes from
+    /// one column whose whole dictionary is `walk_bytes`: per docs chunk
+    /// the rows fall in (zone table, else the fixed row group size), the
+    /// dictionary's share of that chunk's rows, at least
+    /// [`DOCS_SEGMENT_MIN_BYTES`]. `None` when the file sizes its chunks by
+    /// neither.
+    pub(crate) fn verify_column_bytes(&self, rows: &[u64], walk_bytes: u64) -> Option<u64> {
+        let share = |chunk_rows: u64| -> u64 {
+            let bytes = (u128::from(walk_bytes) * u128::from(chunk_rows)
+                / u128::from(self.row_count.max(1))) as u64;
+            bytes.max(DOCS_SEGMENT_MIN_BYTES)
+        };
+        if let Some(chunks) = self.zone_chunks() {
+            let mut total = 0u64;
+            let mut next = 0usize;
+            for chunk in chunks {
+                let end = chunk.row_offset + chunk.row_count;
+                let start = next;
+                while next < rows.len() && rows[next] < end {
+                    next += 1;
+                }
+                if next > start {
+                    total = total.saturating_add(share(chunk.row_count));
+                }
+                if next == rows.len() {
+                    break;
+                }
+            }
+            if next < rows.len() {
+                // rows past the zone table's coverage: one more chunk's worth
+                total =
+                    total.saturating_add(share(chunks.last().map_or(0, |chunk| chunk.row_count)));
+            }
+            return Some(total);
+        }
+        let group = self.row_group_size() as u64;
+        if group == 0 {
+            return None;
+        }
+        let mut total = 0u64;
+        let mut last = None;
+        for &row in rows {
+            let chunk = row / group;
+            if last != Some(chunk) {
+                total = total.saturating_add(share(group.min(self.row_count - chunk * group)));
+                last = Some(chunk);
+            }
+        }
+        Some(total)
     }
 
     /// Splice nested `And` children into one conjunct list, preserving
@@ -5338,46 +5648,10 @@ impl VixReader {
                 }
                 Ok(ordinals)
             }
-            VixQuery::Contains {
-                field,
-                needle,
-                case_insensitive,
-            } => {
+            VixQuery::Contains { field, .. } | VixQuery::Regex { field, .. } => {
                 let field_filter = self.optional_field_id(field)?;
-                if *case_insensitive {
-                    let needle = String::from_utf8_lossy(needle).to_lowercase();
-                    let finder = memchr::memmem::Finder::new(needle.as_bytes());
-                    // reused per-token buffer: the old per-key
-                    // from_utf8_lossy + to_lowercase allocated twice for
-                    // EVERY dictionary key (32M allocs on a 16M-key field).
-                    // ASCII tokens (the norm) lowercase into the buffer;
-                    // Unicode tokens keep the exact old fold semantics.
-                    let mut lowered: Vec<u8> = Vec::new();
-                    self.scan_all_tokens(field_filter, scope, |token| {
-                        if token.is_ascii() {
-                            lowered.clear();
-                            lowered.extend(token.iter().map(|b| b.to_ascii_lowercase()));
-                            finder.find(&lowered).is_some()
-                        } else {
-                            String::from_utf8_lossy(token)
-                                .to_lowercase()
-                                .contains(&needle)
-                        }
-                    })
-                } else {
-                    // one SIMD searcher for the whole scan, not a fresh
-                    // scalar windows() pass per key
-                    let finder = memchr::memmem::Finder::new(needle.as_slice());
-                    self.scan_all_tokens(field_filter, scope, |token| finder.find(token).is_some())
-                }
-            }
-            VixQuery::Regex { field, pattern } => {
-                let field_filter = self.optional_field_id(field)?;
-                let regex = Regex::new(pattern)
-                    .map_err(|e| VixError::InvalidQuery(format!("regex {pattern:?}: {e}")))?;
-                self.scan_all_tokens(field_filter, scope, |token| {
-                    automaton_matches(&regex, token)
-                })
+                let mut matcher = WalkMatcher::new(query)?.expect("walking leaf");
+                self.scan_all_tokens(field_filter, scope, |token| matcher.matches(token))
             }
             VixQuery::Fuzzy { token, distance } => {
                 if *distance > 2 {
@@ -6561,6 +6835,79 @@ fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
     memchr::memmem::find(haystack, needle).is_some()
+}
+
+/// The per-value predicate of a whole-field dictionary walk (`Contains`,
+/// `Regex`), shared by the dictionary walk ([`VixReader::collect_ordinals`])
+/// and the column verification ([`VixReader::verify_walk_leaf`]) so both
+/// paths decide every value identically — a raw-value term IS the row's
+/// whole column value.
+enum WalkMatcher {
+    /// One SIMD searcher for the whole scan, not a fresh scalar `windows()`
+    /// pass per key.
+    Contains(memchr::memmem::Finder<'static>),
+    /// Case-insensitive: ASCII values (the norm) lowercase into the reused
+    /// buffer — the old per-key `from_utf8_lossy` + `to_lowercase` allocated
+    /// twice for EVERY dictionary key (32M allocs on a 16M-key field);
+    /// Unicode values keep the exact old fold semantics.
+    ContainsFolded {
+        finder: memchr::memmem::Finder<'static>,
+        needle: String,
+        lowered: Vec<u8>,
+    },
+    Regex(Regex),
+}
+
+impl WalkMatcher {
+    /// The matcher of a walking leaf; `None` for every other shape.
+    fn new(leaf: &VixQuery) -> Result<Option<Self>> {
+        Ok(Some(match leaf {
+            VixQuery::Contains {
+                needle,
+                case_insensitive: false,
+                ..
+            } => Self::Contains(memchr::memmem::Finder::new(needle.as_slice()).into_owned()),
+            VixQuery::Contains {
+                needle,
+                case_insensitive: true,
+                ..
+            } => {
+                let needle = String::from_utf8_lossy(needle).to_lowercase();
+                Self::ContainsFolded {
+                    finder: memchr::memmem::Finder::new(needle.as_bytes()).into_owned(),
+                    needle,
+                    lowered: Vec::new(),
+                }
+            }
+            VixQuery::Regex { pattern, .. } => Self::Regex(
+                Regex::new(pattern)
+                    .map_err(|e| VixError::InvalidQuery(format!("regex {pattern:?}: {e}")))?,
+            ),
+            _ => return Ok(None),
+        }))
+    }
+
+    fn matches(&mut self, value: &[u8]) -> bool {
+        match self {
+            Self::Contains(finder) => finder.find(value).is_some(),
+            Self::ContainsFolded {
+                finder,
+                needle,
+                lowered,
+            } => {
+                if value.is_ascii() {
+                    lowered.clear();
+                    lowered.extend(value.iter().map(|b| b.to_ascii_lowercase()));
+                    finder.find(lowered).is_some()
+                } else {
+                    String::from_utf8_lossy(value)
+                        .to_lowercase()
+                        .contains(needle.as_str())
+                }
+            }
+            Self::Regex(regex) => automaton_matches(regex, value),
+        }
+    }
 }
 
 /// Run a [`tantivy_fst::Automaton`] over `input` (anchored full match).

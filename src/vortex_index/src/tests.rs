@@ -15057,3 +15057,6 @@ mod and_io_bench;
 
 #[path = "tests/and_intersection.rs"]
 mod and_intersection;
+
+#[path = "tests/walk_verify.rs"]
+mod walk_verify;

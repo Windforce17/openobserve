@@ -278,6 +278,33 @@ pub(crate) fn tail_fetch_size() -> u64 {
     }
 }
 
+/// Default [`walk_verify_min_bytes`]: a whole-field dictionary walk
+/// (`str_match` / regex on a term-indexed field) whose field dictionary is
+/// at least this large may be answered by VERIFYING the candidate rows'
+/// column values instead (see `VixReader::eval_and`), when the cheaper
+/// conjuncts leave few candidates. Below it the walk is a handful of
+/// block fetches and the verification's docs-footer round trip would not
+/// pay for itself. Measured 2026-10-07 on a prod `apisix` pair: the
+/// `request.body` dictionary is 243.8 MB of a 460 MB sidecar, walked whole
+/// per file by `str_match_ignore_case(request.body, ...)` although the
+/// `request.uri` conjunct left ~0.6 candidate rows per file.
+pub const DEFAULT_WALK_VERIFY_MIN_BYTES: u64 = 16 * 1024 * 1024;
+static WALK_VERIFY_MIN_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(DEFAULT_WALK_VERIFY_MIN_BYTES);
+
+/// Set the dictionary size from which a whole-field walk is a candidate
+/// for column verification (bytes; 0 disables verification — every walk
+/// reads its dictionary). Called once at process init from the engine
+/// config (`ZO_VIX_WALK_VERIFY_MIN_BYTES`); readers opened afterwards
+/// carry the value.
+pub fn set_walk_verify_min_bytes(bytes: u64) {
+    WALK_VERIFY_MIN_BYTES.store(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn walk_verify_min_bytes() -> u64 {
+    WALK_VERIFY_MIN_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Blob tag (puffin blob property `blob_tag`) of the dictionary blob.
 pub(crate) const BLOB_TAG_DICT: &str = "dict";
 /// Blob tag of the terms (doc_count + postings) blob.

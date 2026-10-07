@@ -756,3 +756,233 @@ fn eager_tail_probe() {
         );
     }
 }
+
+/// The `str_match` shape on a real file (`VIX_BENCH_FILE` + sidecar): a
+/// selective conjunct on `VIX_BENCH_POINT_FIELD` (`Contains` of
+/// `VIX_BENCH_POINT_VALUE`, or an equality with `VIX_BENCH_POINT_MODE=exact`)
+/// AND a `Contains` of `VIX_BENCH_WALK_NEEDLE` (case-insensitive) on the
+/// large-dictionary `VIX_BENCH_WALK_FIELD` — prod's `str_match(request.uri,
+/// ...) AND str_match_ignore_case(request.body, ...)` on `apisix`. Runs the AND with
+/// the dictionary walk forced (threshold 0) and with column verification
+/// (`VIX_BENCH_WALK_VERIFY_MIN`, default 16 MiB), plus each conjunct alone,
+/// reporting batches / ranges / bytes / physical bytes / waves per route;
+/// both routes must agree with the in-memory evaluation.
+#[test]
+#[ignore = "benchmark harness; run explicitly with --ignored --nocapture"]
+fn walk_verify_bench() {
+    let path = std::env::var("VIX_BENCH_FILE").expect("VIX_BENCH_FILE");
+    let data = Bytes::from(std::fs::read(&path).expect("VIX_BENCH_FILE readable"));
+    let sidecar = std::path::Path::new(&path).with_extension("vxi");
+    let index = Bytes::from(std::fs::read(&sidecar).expect("sidecar .vxi next to VIX_BENCH_FILE"));
+    let latency = Duration::from_millis(
+        std::env::var("VIX_BENCH_LATENCY_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20),
+    );
+    let point_field =
+        std::env::var("VIX_BENCH_POINT_FIELD").unwrap_or_else(|_| "request.uri".into());
+    let point_value = std::env::var("VIX_BENCH_POINT_VALUE")
+        .unwrap_or_else(|_| "thirdparty_webhook/email".into());
+    let walk_field =
+        std::env::var("VIX_BENCH_WALK_FIELD").unwrap_or_else(|_| "request.body".into());
+    let needle = std::env::var("VIX_BENCH_WALK_NEEDLE").unwrap_or_else(|_| "asagent1".into());
+    let verify_min: u64 = std::env::var("VIX_BENCH_WALK_VERIFY_MIN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(16 * 1024 * 1024);
+    let memory = VixReader::open_with_index(data.clone(), Some(index.clone())).unwrap();
+    eprintln!(
+        "rows={} terms={} data={} MB index={} MB latency={:?} {walk_field} dictionary={:?} bytes",
+        memory.row_count(),
+        memory.term_count(),
+        data.len() / (1 << 20),
+        index.len() / (1 << 20),
+        latency,
+        memory.field_dictionary_bytes(&walk_field),
+    );
+    // prod's uri conjunct is itself a `str_match` (a `Contains` walk of the
+    // small uri dictionary); `VIX_BENCH_POINT_MODE=exact` makes it an equality
+    let point = match std::env::var("VIX_BENCH_POINT_MODE").as_deref() {
+        Ok("exact") => exact(&point_field, &point_value),
+        _ => VixQuery::Contains {
+            field: Some(point_field.clone()),
+            needle: point_value.as_bytes().to_vec(),
+            case_insensitive: false,
+        },
+    };
+    let walk = VixQuery::Contains {
+        field: Some(walk_field.clone()),
+        needle: needle.as_bytes().to_vec(),
+        case_insensitive: true,
+    };
+    // the verification's decision inputs: candidates of the point leaf and
+    // the docs chunks they fall in
+    {
+        let candidates = memory.eval(&point).unwrap();
+        let chunks = memory.zone_chunks().unwrap_or(&[]);
+        let touched = chunks
+            .iter()
+            .filter(|c| {
+                (c.row_offset..c.row_offset + c.row_count).any(|row| candidates.value(row as usize))
+            })
+            .count();
+        let rows: Vec<u64> = candidates.set_indices().map(|r| r as u64).collect();
+        let plan = memory.walk_verify_plan(&walk);
+        eprintln!(
+            "point leaf: {} candidate rows in {touched} of {} docs chunks; walk estimate {:?} \
+             bytes, verification estimate {:?} bytes (+{} footer)",
+            rows.len(),
+            chunks.len(),
+            plan.as_ref().map(|p| p.walk_bytes),
+            plan.as_ref()
+                .and_then(|p| memory.verify_column_bytes(&rows, p.walk_bytes)),
+            crate::reader::DETACHED_DOCS_FOOTER_READ_BYTES,
+        );
+    }
+    eprintln!(
+        "{:<34} {:>7} {:>7} {:>11} {:>11} {:>8} {:>6} {:>6} {:>8}",
+        "query", "batches", "ranges", "bytes", "physical", "ms", "waves", "maxpar", "hits"
+    );
+    for (name, query, threshold) in [
+        ("point only", point.clone(), 0u64),
+        ("walk only", walk.clone(), 0),
+        (
+            "point AND walk [walk]",
+            VixQuery::And(vec![point.clone(), walk.clone()]),
+            0,
+        ),
+        (
+            "point AND walk [verify]",
+            VixQuery::And(vec![point.clone(), walk.clone()]),
+            verify_min,
+        ),
+    ] {
+        let expected = bits_to_set(&memory.eval(&query).unwrap());
+        let counters = Arc::new(Counters::default());
+        let data_src = Arc::new(LatencySource {
+            name: "data",
+            bytes: data.clone(),
+            latency,
+            counters: Arc::clone(&counters),
+        });
+        let index_src = Arc::new(LatencySource {
+            name: "index",
+            bytes: index.clone(),
+            latency,
+            counters: Arc::clone(&counters),
+        });
+        // prod runs ZO_VIX_EAGER_TAIL_BYTES=768 KiB
+        let mut reader =
+            VixReader::open_ranged_with_index_tail(data_src, Some(index_src), 768 * 1024).unwrap();
+        reader.set_walk_verify_min_bytes(threshold);
+        counters.reset();
+        let started = Instant::now();
+        let got = bits_to_set(&reader.eval(&query).unwrap());
+        let eval_ms = started.elapsed().as_secs_f64() * 1e3;
+        let (b, r, by, pby, mp) = counters.snapshot();
+        eprintln!(
+            "{:<34} {:>7} {:>7} {:>11} {:>11} {:>8.1} {:>6.1} {:>6} {:>8}",
+            name,
+            b,
+            r,
+            by,
+            pby,
+            eval_ms,
+            eval_ms / latency.as_secs_f64() / 1e3,
+            mp,
+            got.len(),
+        );
+        if std::env::var("VIX_BENCH_LOG").is_ok() {
+            for (i, (src, ranges, issued_ms)) in counters.log.lock().iter().enumerate() {
+                let total: u64 = ranges.iter().map(|r| r.end - r.start).sum();
+                eprintln!(
+                    "    batch {i:>3} @{issued_ms:>7.1}ms {src:<5} {} ranges {total} bytes first {}+{}",
+                    ranges.len(),
+                    ranges.first().map_or(0, |r| r.start),
+                    ranges.first().map_or(0, |r| r.end - r.start),
+                );
+            }
+        }
+        assert_eq!(got, expected, "{name}: ranged result must match memory");
+    }
+}
+
+/// Values of `VIX_BENCH_POINT_FIELD` in `VIX_BENCH_FILE` by doc count
+/// (top, median, a few rare), and how many of the field's rows' bodies
+/// contain `VIX_BENCH_WALK_NEEDLE` — to pick realistic point values for
+/// `walk_verify_bench`.
+#[test]
+#[ignore = "diagnostic; run with VIX_BENCH_FILE set"]
+fn walk_verify_probe() {
+    let path = std::env::var("VIX_BENCH_FILE").expect("VIX_BENCH_FILE");
+    let data = Bytes::from(std::fs::read(&path).unwrap());
+    let index =
+        Bytes::from(std::fs::read(std::path::Path::new(&path).with_extension("vxi")).unwrap());
+    let reader = VixReader::open_with_index(data, Some(index)).unwrap();
+    let point_field =
+        std::env::var("VIX_BENCH_POINT_FIELD").unwrap_or_else(|_| "request.uri".into());
+    let needle = std::env::var("VIX_BENCH_WALK_NEEDLE").unwrap_or_else(|_| "asagent1".into());
+    let fid = reader
+        .field_id(&point_field)
+        .expect("point field is term-indexed");
+    let mut values: Vec<(u64, String)> = Vec::new();
+    reader
+        .for_each_term(&mut |key, doc_count, _ids| {
+            let (token, f) = crate::query::split_key(key).unwrap();
+            if f == fid {
+                values.push((doc_count, String::from_utf8_lossy(token).into_owned()));
+            }
+            Ok(())
+        })
+        .unwrap();
+    values.sort_unstable_by(|a, b| b.cmp(a));
+    eprintln!(
+        "{point_field}: {} distinct values, rows={}",
+        values.len(),
+        reader.row_count()
+    );
+    for (count, value) in values.iter().take(8) {
+        eprintln!("  top    {count:>8} {value}");
+    }
+    for pick in [values.len() / 4, values.len() / 2, values.len() * 3 / 4] {
+        if let Some((count, value)) = values.get(pick) {
+            eprintln!("  mid    {count:>8} {value}");
+        }
+    }
+    for (count, value) in values.iter().rev().take(4) {
+        eprintln!("  rare   {count:>8} {value}");
+    }
+    let walk_field =
+        std::env::var("VIX_BENCH_WALK_FIELD").unwrap_or_else(|_| "request.body".into());
+    let hits = reader
+        .eval(&VixQuery::Contains {
+            field: Some(walk_field.clone()),
+            needle: needle.as_bytes().to_vec(),
+            case_insensitive: true,
+        })
+        .unwrap();
+    eprintln!(
+        "{walk_field} contains {needle:?} (ci): {} rows",
+        hits.count_set_bits()
+    );
+    // substring selectivity of candidate point needles (prod's uri conjunct
+    // is a `str_match`, i.e. a `Contains`, not an equality)
+    let probes = std::env::var("VIX_BENCH_POINT_PROBES").unwrap_or_else(|_| {
+        "thirdparty_webhook/email,thirdparty_webhook,preview/resolve,batch_create_event_v2,get_quotas"
+            .into()
+    });
+    for probe in probes.split(',') {
+        let hits = reader
+            .eval(&VixQuery::Contains {
+                field: Some(point_field.clone()),
+                needle: probe.as_bytes().to_vec(),
+                case_insensitive: false,
+            })
+            .unwrap();
+        eprintln!(
+            "{point_field} contains {probe:?}: {} rows",
+            hits.count_set_bits()
+        );
+    }
+}

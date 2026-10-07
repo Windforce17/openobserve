@@ -267,9 +267,13 @@ async fn main() -> Result<(), anyhow::Error> {
             }
 
             // one-time engine tunables from config (#39: fetch reduction —
-            // a bigger eager tail turns cold small-file opens into one GET)
+            // a bigger eager tail turns cold small-file opens into one GET;
+            // large-dictionary str_match walks verify candidates instead)
             openobserve::service::search::vix::set_tail_fetch_size(
                 config::get_config().limit.vix_eager_tail_bytes,
+            );
+            openobserve::service::search::vix::set_walk_verify_min_bytes(
+                config::get_config().limit.vix_walk_verify_min_bytes,
             );
 
             // ingester init

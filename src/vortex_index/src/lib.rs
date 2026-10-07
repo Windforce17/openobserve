@@ -94,8 +94,8 @@ mod writer;
 
 pub use bloom_probe::{FileBloomProbe, FileBloomSection};
 pub use container::{
-    BloomEncodingCensus, DEFAULT_TAIL_FETCH_BYTES, RowOrder, VixOutput, ZoneEntry,
-    region_row_ranges, set_tail_fetch_size,
+    BloomEncodingCensus, DEFAULT_TAIL_FETCH_BYTES, DEFAULT_WALK_VERIFY_MIN_BYTES, RowOrder,
+    VixOutput, ZoneEntry, region_row_ranges, set_tail_fetch_size, set_walk_verify_min_bytes,
 };
 pub use conversion::{
     NativePredicateStrategy, NativeScanOptions, ScanCpuBudget, ScanCpuBudgetSnapshot,

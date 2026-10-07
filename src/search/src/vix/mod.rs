@@ -1548,7 +1548,7 @@ impl VixDocsInput {
     }
 }
 
-pub use vortex_index::set_tail_fetch_size;
+pub use vortex_index::{set_tail_fetch_size, set_walk_verify_min_bytes};
 
 /// Warm one core `.vix` file's index metadata into the caches (#39 GAP 2):
 /// opens the ranged reader — which eager-fetches the footer tail through
