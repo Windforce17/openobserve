@@ -1644,3 +1644,191 @@ async fn multiword_full_text_aggregates_are_refined_to_the_exact_residual_rows()
     }
     reader_cache::GLOBAL_CACHE.remove(&file.key);
 }
+
+/// Diagnostic: the `str_match` shape on a REAL `apisix` pair re-indexed
+/// with `request.body` as a FULL-TEXT field and no token dropped
+/// (`VIX_BENCH_FILE` = the original `.vix`; its `request.uri` /
+/// `request.body` / `_timestamp` columns are re-written into a fresh pair
+/// with `fts_field_names = [request.body]`, `max_token_len = 65532`). Runs
+/// `str_match(request.uri, VIX_BENCH_POINT_VALUE) AND
+/// str_match_ignore_case(request.body, VIX_BENCH_WALK_NEEDLE)` as a row-id
+/// query (token superset, filter re-applied downstream) and as a count
+/// (residual-refined, exact), plus the LONE body `str_match` — the case the
+/// `.204` walk-vs-verify could not help — printing index batches / bytes /
+/// waves per pass through a 20 ms latency source, and the exact rows from an
+/// in-memory column scan for comparison.
+#[test]
+#[ignore = "diagnostic; run with VIX_BENCH_FILE set"]
+fn prod_file_str_match_on_fts_body_cost() {
+    use arrow::array::StringArray;
+
+    let path = std::env::var("VIX_BENCH_FILE").expect("VIX_BENCH_FILE");
+    let point_value =
+        std::env::var("VIX_BENCH_POINT_VALUE").unwrap_or_else(|_| "thirdparty_webhook".into());
+    let needle = std::env::var("VIX_BENCH_WALK_NEEDLE").unwrap_or_else(|_| "asagent1".into());
+    let source_data = Bytes::from(std::fs::read(&path).unwrap());
+    let source_index =
+        Bytes::from(std::fs::read(std::path::Path::new(&path).with_extension("vxi")).unwrap());
+    let source = VixReader::open_with_index(source_data, Some(source_index)).unwrap();
+    let column = |name: &str| -> Arc<dyn Array> {
+        let column = source.read_docs_column(name).unwrap();
+        arrow::compute::cast(&column, &DataType::Utf8).unwrap()
+    };
+    let ts = source.read_docs_column("_timestamp").unwrap();
+    let uri = column("request.uri");
+    let body = column("request.body");
+    let rows = ts.len();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("_timestamp", DataType::Int64, false),
+        Field::new("request.uri", DataType::Utf8, true),
+        Field::new("request.body", DataType::Utf8, true),
+    ]));
+    let started = std::time::Instant::now();
+    let mut writer = vortex_index::VixWriter::new(
+        &schema,
+        VixWriterOptions {
+            fts_field_names: vec!["request.body".to_string()],
+            max_token_len: 65532,
+            ..Default::default()
+        },
+        false,
+    );
+    let sources = StringArray::from(vec!["{}"; rows]);
+    let batch =
+        RecordBatch::try_new(Arc::clone(&schema), vec![ts, uri.clone(), body.clone()]).unwrap();
+    writer
+        .push_batch_with_source(&batch, &sources, None)
+        .unwrap();
+    let (data, index) = writer.finish().unwrap();
+    let (data, index) = (Bytes::from(data), Bytes::from(index.unwrap()));
+    eprintln!(
+        "re-indexed {rows} rows in {:.1} s: data {} MB, sidecar {} MB (source pair {} MB)",
+        started.elapsed().as_secs_f64(),
+        data.len() / (1 << 20),
+        index.len() / (1 << 20),
+        source.memory_size() / (1 << 20),
+    );
+    let memory = VixReader::open_with_index(data.clone(), Some(index.clone())).unwrap();
+    assert!(memory.fts_fields().contains("request.body"));
+    assert!(
+        memory.fts_tokens_complete("request.body"),
+        "{:?}",
+        memory.fts_long_token_skips()
+    );
+    eprintln!(
+        "request.body token dictionary {:?} bytes (source raw-value dictionary {:?} bytes); long-token skips {:?}",
+        memory.field_dictionary_bytes("request.body"),
+        source.field_dictionary_bytes("request.body"),
+        memory.fts_long_token_skips(),
+    );
+
+    // ground truth from the columns
+    let uri_values = uri.as_any().downcast_ref::<StringArray>().unwrap();
+    let body_values = body.as_any().downcast_ref::<StringArray>().unwrap();
+    let lower_needle = needle.to_lowercase();
+    let truth = |want_uri: bool| -> Vec<usize> {
+        (0..rows)
+            .filter(|&i| {
+                (!want_uri
+                    || (uri_values.is_valid(i) && uri_values.value(i).contains(&point_value)))
+                    && body_values.is_valid(i)
+                    && body_values.value(i).to_lowercase().contains(&lower_needle)
+            })
+            .collect()
+    };
+    let (ts_min, ts_max) = memory
+        .zone_chunks()
+        .expect("zone table")
+        .iter()
+        .fold((i64::MAX, i64::MIN), |(lo, hi), c| {
+            (lo.min(c.ts_min), hi.max(c.ts_max))
+        });
+    let range = (ts_min, ts_max + 1);
+    let latency = std::time::Duration::from_millis(20);
+    let run = |label: &str,
+               condition: &IndexCondition,
+               rule: Option<IndexOptimizeMode>,
+               expect: &[usize]| {
+        let data_src = LatencySource::new(data.clone(), latency);
+        let index_src = LatencySource::new(index.clone(), latency);
+        let reader = VixReader::open_ranged_with_index(
+            data_src.clone() as Arc<dyn VixRangeSource>,
+            Some(index_src.clone() as Arc<dyn VixRangeSource>),
+        )
+        .unwrap();
+        let open_batches = data_src.log.lock().len() + index_src.log.lock().len();
+        let open_bytes = data_src.bytes_read() + index_src.bytes_read();
+        let started = std::time::Instant::now();
+        let result = evaluate_vix_index(
+            "bench", &reader, condition, rule, range, true, None, None, None,
+        );
+        let eval_ms = started.elapsed().as_secs_f64() * 1e3;
+        let batches = data_src.log.lock().len() + index_src.log.lock().len() - open_batches;
+        let bytes = data_src.bytes_read() + index_src.bytes_read() - open_bytes;
+        let data_bytes = data_src.bytes_read();
+        let outcome = match result {
+            // an aggregate over a superset too wide to refine in the index
+            // phase falls back to the scan branch — the designed refusal
+            Err(error) => format!("fallback: {error}"),
+            Ok(RawVixResult::Bitmap {
+                bitmap,
+                has_skipped,
+                ..
+            }) => {
+                let got: Vec<usize> = bitmap.set_indices().collect();
+                let exact_rows = expect.iter().filter(|r| got.contains(r)).count();
+                format!(
+                    "superset rows={} (contains all {} exact rows: {}) has_skipped={has_skipped}",
+                    got.len(),
+                    expect.len(),
+                    exact_rows == expect.len()
+                )
+            }
+            Ok(RawVixResult::Count { count, has_skipped }) => {
+                format!(
+                    "count={count} (exact {}) has_skipped={has_skipped}",
+                    expect.len()
+                )
+            }
+            Ok(other) => format!("unexpected {other:?}"),
+        };
+        eprintln!(
+            "{label:<44} eval {batches:>3} batches {bytes:>11} B ({data_bytes:>9} B data) {eval_ms:>7.1} ms ~{:>4.1} waves | {outcome}",
+            eval_ms / latency.as_secs_f64() / 1e3
+        );
+    };
+    let and = IndexCondition {
+        conditions: vec![
+            Condition::StrMatch("request.uri".to_string(), point_value.clone(), true),
+            Condition::StrMatch("request.body".to_string(), needle.clone(), false),
+        ],
+    };
+    let lone = IndexCondition {
+        conditions: vec![Condition::StrMatch(
+            "request.body".to_string(),
+            needle.clone(),
+            false,
+        )],
+    };
+    let both = truth(true);
+    let body_only = truth(false);
+    eprintln!(
+        "ground truth: uri+body {} rows, body alone {} rows",
+        both.len(),
+        body_only.len()
+    );
+    run("uri AND body: row ids (SELECT)", &and, None, &both);
+    run(
+        "uri AND body: count (residual exact)",
+        &and,
+        Some(IndexOptimizeMode::SimpleCount),
+        &both,
+    );
+    run("body alone: row ids (SELECT)", &lone, None, &body_only);
+    run(
+        "body alone: count (residual exact)",
+        &lone,
+        Some(IndexOptimizeMode::SimpleCount),
+        &body_only,
+    );
+}
