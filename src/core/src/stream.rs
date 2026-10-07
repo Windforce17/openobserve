@@ -442,22 +442,13 @@ pub async fn save_stream_settings(
 
     // ---- 2. FTS ∩ Bloom = ∅ (resolved) ----
     // (FTS ∩ ColumnStore overlap is allowed — the two are orthogonal.)
-    // an explicit fts key designates a field by the key-match rule, so the
-    // conflict check must match the same way: key `body` conflicts with a
-    // bloom/filter field `request.body` too
-    let fts_matches = |field: &str| {
-        settings
-            .full_text_search_keys
-            .iter()
-            .any(|key| infra::schema::fts_key_matches(key, field))
-    };
-    if let Some(name) = bloom_set.iter().find(|f| fts_matches(f)) {
+    if let Some(name) = fts_set.intersection(&bloom_set).next() {
         return Ok(MetaHttpResponse::bad_request(format!(
             "field [{name}] cannot be both full text search and bloom filter"
         )));
     }
     // ---- 3. Partition keys disjoint from FTS / ColumnStore / Bloom (resolved) ----
-    if let Some(name) = pk_set.iter().find(|f| fts_matches(f)) {
+    if let Some(name) = pk_set.intersection(&fts_set).next() {
         return Ok(MetaHttpResponse::bad_request(format!(
             "partition key [{name}] cannot also be a full text search field"
         )));
@@ -470,7 +461,7 @@ pub async fn save_stream_settings(
 
     // check if the partition key is a full text search field
     for key in settings.partition_keys.iter() {
-        if fts_matches(&key.field) {
+        if fts_set.contains(&key.field) {
             return Ok(MetaHttpResponse::bad_request(format!(
                 "field [{}] can't be used for partition key",
                 key.field
@@ -738,9 +729,8 @@ pub async fn update_stream_settings(
                     "count and {TIMESTAMP_COL_NAME} are reserved fields and cannot be added"
                 )));
             }
-            // we ignore full text search fields — matched by key rule, so an
-            // explicit key `body` also excludes `request.body`
-            if infra::schema::is_stream_fts_field(&Some(settings.clone()), f) {
+            // we ignore full text search fields
+            if settings.full_text_search_keys.contains(f) {
                 continue;
             }
             let record = DistinctFieldRecord::new(

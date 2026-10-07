@@ -337,11 +337,6 @@ pub fn get_partition_time_level(stream_type: StreamType) -> PartitionTimeLevel {
     }
 }
 
-/// The stream's full-text search KEYS: explicit `full_text_search_keys` ∪ the
-/// config defaults (`SQL_FULL_TEXT_SEARCH_FIELDS`). This is a KEY list, not
-/// the concrete schema fields — the field-level truth is
-/// [`resolve_stream_fts_fields`]/[`is_stream_fts_field`], which map keys to
-/// real (dotted) field names.
 pub fn get_stream_setting_fts_fields(settings: &Option<StreamSettings>) -> Vec<String> {
     let default_fields = SQL_FULL_TEXT_SEARCH_FIELDS.clone();
     match settings {
@@ -354,80 +349,6 @@ pub fn get_stream_setting_fts_fields(settings: &Option<StreamSettings>) -> Vec<S
         }
         None => default_fields,
     }
-}
-
-/// Does the full-text search KEY `key` designate `field_name`? Equal, or the
-/// key equals the LAST `.`-segment of the (dotted, flattened) field name:
-/// `body` matches `request.body` and `response.body`, but NOT
-/// `body.__cursor`, `callback_data.data.task_id`, `content_length` or
-/// `request.body_size` — the key must equal the final segment as a whole.
-pub fn fts_key_matches(key: &str, field_name: &str) -> bool {
-    key == field_name
-        || field_name
-            .rsplit_once('.')
-            .is_some_and(|(_, last)| key == last)
-}
-
-/// Resolve the stream's full-text search keys to the CONCRETE schema field
-/// names they designate: a name is included when it EQUALS a config default
-/// key ([`SQL_FULL_TEXT_SEARCH_FIELDS`], exact as before) OR an EXPLICIT
-/// stream key (`full_text_search_keys`) matches it by [`fts_key_matches`].
-/// Defaults stay exact because segment-matching `data`/`log`/`message` would
-/// make hundreds of nested fields full-text on wide streams (measured on
-/// prod `default`: +388 fields); explicit keys are an operator's intent
-/// (`body` => `request.body`). This is the field-level truth consumers
-/// should use in place of the key list [`get_stream_setting_fts_fields`]
-/// returns. Sorted and deduped — the shape consumers expect.
-pub fn resolve_stream_fts_fields<'a>(
-    settings: &Option<StreamSettings>,
-    field_names: impl IntoIterator<Item = &'a str>,
-) -> Vec<String> {
-    let defaults: hashbrown::HashSet<&str> = SQL_FULL_TEXT_SEARCH_FIELDS
-        .iter()
-        .map(String::as_str)
-        .collect();
-    let explicit: hashbrown::HashSet<&str> = settings
-        .as_ref()
-        .map(|settings| {
-            settings
-                .full_text_search_keys
-                .iter()
-                .map(String::as_str)
-                .collect()
-        })
-        .unwrap_or_default();
-    // O(F + K): keys sit in HashSets, each name's last segment is computed once
-    let mut fields: Vec<String> = field_names
-        .into_iter()
-        .filter(|name| {
-            defaults.contains(*name)
-                || explicit.contains(*name)
-                || name
-                    .rsplit_once('.')
-                    .is_some_and(|(_, last)| explicit.contains(last))
-        })
-        .map(str::to_string)
-        .collect();
-    fields.sort();
-    fields.dedup();
-    fields
-}
-
-/// The same rule as [`resolve_stream_fts_fields`] for one field name — for
-/// schema-less sites that hold the settings but not the schema.
-pub fn is_stream_fts_field(settings: &Option<StreamSettings>, field_name: &str) -> bool {
-    if SQL_FULL_TEXT_SEARCH_FIELDS
-        .iter()
-        .any(|default| default == field_name)
-    {
-        return true;
-    }
-    settings.as_ref().is_some_and(|settings| {
-        settings
-            .full_text_search_keys
-            .iter()
-            .any(|key| fts_key_matches(key, field_name))
-    })
 }
 
 /// String-family fields in `schema` that the `.vix` all-fields index
@@ -1278,100 +1199,6 @@ mod tests {
         // Verify no duplicates
         let unique_count = fields.iter().collect::<hashbrown::HashSet<_>>().len();
         assert_eq!(unique_count, fields.len());
-    }
-
-    #[test]
-    fn test_fts_key_matches() {
-        // key equals the whole name
-        assert!(fts_key_matches("body", "body"));
-        assert!(fts_key_matches("request.body", "request.body"));
-        // key equals the LAST `.`-segment
-        assert!(fts_key_matches("body", "request.body"));
-        assert!(fts_key_matches("body", "response.body"));
-        assert!(fts_key_matches("task_id", "callback_data.data.task_id"));
-        // NOT a prefix/middle-segment or partial match
-        assert!(!fts_key_matches("body", "body.__cursor"));
-        assert!(!fts_key_matches("data", "callback_data.data.x"));
-        assert!(!fts_key_matches("content", "content_length"));
-        assert!(!fts_key_matches("body", "request.body_size"));
-        assert!(!fts_key_matches("bod", "request.body"));
-        // internal-ish segments never match a whole different name
-        assert!(!fts_key_matches("data", "callback_data.data.task_id"));
-    }
-
-    fn fts_test_settings() -> StreamSettings {
-        StreamSettings {
-            full_text_search_keys: vec!["body".to_string()],
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn test_resolve_stream_fts_fields_explicit_key_matches_subfields() {
-        let settings = fts_test_settings();
-        let fields = resolve_stream_fts_fields(
-            &Some(settings),
-            [
-                "request.body",
-                "response.body",
-                "body",
-                "body.__cursor",
-                "request.body_size",
-                "content_length",
-                "other",
-            ],
-        );
-        // explicit `body` picks `request.body`, `response.body` and `body`
-        // but NOT `body.__cursor` / `request.body_size`
-        assert_eq!(fields, vec!["body", "request.body", "response.body"]);
-    }
-
-    #[test]
-    fn test_resolve_stream_fts_fields_defaults_exact_only() {
-        // config defaults (e.g. `data`) match only the EXACT field name, never
-        // a nested sub-field
-        let settings = StreamSettings::default();
-        assert!(SQL_FULL_TEXT_SEARCH_FIELDS.contains(&"data".to_string()));
-        let fields = resolve_stream_fts_fields(
-            &Some(settings),
-            ["data", "callback_data.data.x", "request.data"],
-        );
-        assert_eq!(fields, vec!["data"]);
-
-        // None settings: defaults resolve exact, explicit keys absent
-        let fields = resolve_stream_fts_fields(&None, ["data", "request.data"]);
-        assert_eq!(fields, vec!["data"]);
-    }
-
-    #[test]
-    fn test_resolve_stream_fts_fields_sorted_and_deduped() {
-        let settings = StreamSettings {
-            full_text_search_keys: vec!["body".to_string()],
-            ..Default::default()
-        };
-        // `body` is BOTH a config default and an explicit key here — the
-        // resolved list must stay deduped and sorted
-        let fields = resolve_stream_fts_fields(
-            &Some(settings),
-            ["message", "request.body", "log", "log", "body"],
-        );
-        assert_eq!(fields, vec!["body", "log", "message", "request.body"]);
-    }
-
-    #[test]
-    fn test_is_stream_fts_field() {
-        let settings = Some(fts_test_settings());
-        assert!(is_stream_fts_field(&settings, "body"));
-        assert!(is_stream_fts_field(&settings, "request.body"));
-        assert!(!is_stream_fts_field(&settings, "body.__cursor"));
-        assert!(!is_stream_fts_field(&settings, "request.body_size"));
-        // config default: exact only
-        assert!(is_stream_fts_field(&settings, "data"));
-        assert!(!is_stream_fts_field(&settings, "callback_data.data.x"));
-        // None settings: defaults still apply
-        assert!(is_stream_fts_field(&None, "message"));
-        assert!(!is_stream_fts_field(&None, "request.message"));
-        assert!(!is_stream_fts_field(&None, "request.body"));
     }
 
     #[test]

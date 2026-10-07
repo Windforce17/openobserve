@@ -39,7 +39,7 @@ use datafusion::{
     sql::TableReference,
 };
 use hashbrown::HashSet;
-use infra::schema::{SchemaCache, resolve_stream_fts_fields, unwrap_stream_settings};
+use infra::schema::{SchemaCache, get_stream_setting_fts_fields, unwrap_stream_settings};
 #[cfg(feature = "enterprise")]
 use {
     crate::datafusion::optimizer::context::generate_streaming_agg_rules,
@@ -251,12 +251,7 @@ fn stream_column_store_fields(schema: &SchemaCache) -> HashSet<String> {
 /// check is the correctness backstop.
 fn stream_term_index_fields(schema: &SchemaCache) -> HashSet<String> {
     let settings = unwrap_stream_settings(schema.schema());
-    // concrete schema fields the fts keys designate — an explicit key
-    // `body` designates `request.body` too
-    let fts_fields = resolve_stream_fts_fields(
-        &settings,
-        schema.schema().fields().iter().map(|f| f.name().as_str()),
-    );
+    let fts_fields = get_stream_setting_fts_fields(&settings);
     schema
         .schema()
         .fields()

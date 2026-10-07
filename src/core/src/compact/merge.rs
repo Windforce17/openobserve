@@ -43,7 +43,8 @@ use infra::{
     file_list::{self as infra_file_list, FileListJobStatus},
     runtime::DATAFUSION_RUNTIME,
     schema::{
-        get_partition_time_level, get_stream_setting_bloom_filter_fields, unwrap_stream_created_at,
+        get_partition_time_level, get_stream_setting_bloom_filter_fields,
+        get_stream_setting_fts_fields, unwrap_stream_created_at,
     },
     storage,
 };
@@ -735,15 +736,10 @@ pub async fn merge_by_stream(
         partition.push(file.to_owned());
     }
 
-    let latest_schema = Arc::new(schema);
-    let stream_settings = infra::schema::unwrap_stream_settings(&latest_schema);
+    let stream_settings = infra::schema::unwrap_stream_settings(&schema);
     let bloom_filter_fields = get_stream_setting_bloom_filter_fields(&stream_settings);
-    // resolve fts keys to the CONCRETE registry schema fields — an explicit
-    // key `body` designates `request.body` too
-    let full_text_search_fields = infra::schema::resolve_stream_fts_fields(
-        &stream_settings,
-        latest_schema.fields().iter().map(|f| f.name().as_str()),
-    );
+    let full_text_search_fields = get_stream_setting_fts_fields(&stream_settings);
+    let latest_schema = Arc::new(schema);
 
     // use multiple threads to merge
     let semaphore = std::sync::Arc::new(Semaphore::new(cfg.limit.file_merge_thread_num));
@@ -1569,20 +1565,15 @@ impl MergeStreamSettings {
         stream_name: &str,
         stream_type: StreamType,
     ) -> Result<Self, anyhow::Error> {
-        let latest_schema = Arc::new(infra::schema::get(org_id, stream_name, stream_type).await?);
+        let latest_schema = infra::schema::get(org_id, stream_name, stream_type).await?;
         let stream_settings = infra::schema::unwrap_stream_settings(&latest_schema);
         Ok(Self {
             bloom_filter_fields: get_stream_setting_bloom_filter_fields(&stream_settings),
-            // resolve fts keys to the CONCRETE registry schema fields — an
-            // explicit key `body` designates `request.body` too
-            full_text_search_fields: infra::schema::resolve_stream_fts_fields(
-                &stream_settings,
-                latest_schema.fields().iter().map(|f| f.name().as_str()),
-            ),
+            full_text_search_fields: get_stream_setting_fts_fields(&stream_settings),
             storage_type: stream_settings
                 .map(|s| s.storage_type)
                 .unwrap_or(StorageType::Normal),
-            latest_schema,
+            latest_schema: Arc::new(latest_schema),
         })
     }
 }

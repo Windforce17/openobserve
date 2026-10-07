@@ -26,7 +26,7 @@ use config::{
 use futures::future::join_all;
 use hashbrown::HashMap;
 use infra::{
-    schema::is_stream_fts_field,
+    schema::get_stream_setting_fts_fields,
     table::{
         self,
         distinct_values::{DistinctFieldRecord, OriginType},
@@ -216,10 +216,10 @@ async fn update_distinct_variables(
                 .unwrap_or_default();
             let mut _new_added = false;
 
-            let _fts_settings = Some(stream_settings.clone());
+            let _fts = get_stream_setting_fts_fields(&Some(stream_settings.clone()));
             for f in fields.iter() {
                 // we ignore full text search no matter what
-                if is_stream_fts_field(&_fts_settings, f) {
+                if _fts.contains(f) {
                     continue;
                 }
 
