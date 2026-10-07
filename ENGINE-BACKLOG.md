@@ -1641,14 +1641,35 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     memoised (the TopN's repeat 3.0 s → 0.27 s), dense needles neither gain
     nor lose, and the SELECT shape stays truncated for a reason that is NOT
     the index. Two follow-ups fall out of the numbers:
-    - **(A) scan-cap accounting.** `apply_storage_scan_cap` (`grpc/
-      storage.rs`) charges every file left after the index step at its
-      whole `compressed_size`, even when the index narrowed it to a row
-      selection the scan branch will late-materialise. With supersets on
-      370 files that is 21 GB "planned" for a few hundred rows of actual
-      reads → `is_partial`. Charge row-selected files by their selected
-      share (rows / records × compressed_size, with a per-file floor) and
-      the SELECT completes.
+    - **(A) scan-cap accounting — tried as `.206`, ROLLED BACK (16:36–
+      16:43Z, owner: "可以执行，但是要注意是否会有回归").** `apply_storage_
+      scan_cap` charges every file left after the index step at its whole
+      `compressed_size`, even when the index narrowed it to a row selection
+      the scan branch late-materialises; `.206` (vix-arch `5c60cb69c`,
+      reverted `093e34801`; release `6d2d13af2`, ECR `.206` index
+      `sha256:32371b28c1c8…`; GitOps #613 → rollback #614) charged
+      row-selected files by their point-read cost (2 MiB footer + one chunk
+      share per touched chunk) and bounded dense shapes at 10 × LIMIT
+      candidate rows. Pre (`.205` warm) → post (`.206`, 2-minute-old pods),
+      `ops:/tmp/battery_pre206_on205.jsonl` / `battery_post206.jsonl`,
+      windows ending 15:00Z: service + `str_match(body,'Sending deploy
+      callback')` 24 h SELECT LIMIT 100 — kept 110 → 219 of 1,435 files,
+      still `is_partial`, warm repeat **2.6 → 8.2 s** (scan 2.4 → 4.9 s);
+      `str_match(body, …)` 6 h — kept 126 → 168 of 485, repeat 2.6 → 2.5 s;
+      `str_match(error, …)` 24 h — not capped either way, 2 hits. The
+      diagnosis was wrong in its unit: the scan branch costs **~20 ms per
+      FILE** (footer open + plan + first segment) whatever the bytes — 126
+      whole files took 2.4 s, 210 row-selected files 4.9 s — so admitting
+      more files for the same partial LIMIT answer only lengthens the scan
+      phase, and the whole-file byte budget was accidentally the right
+      proxy (files are similar in size). What completes a LIMIT answer fast
+      is **(C) newest-first early termination**: evaluate/verify files in
+      `max_ts` order and stop once `limit` rows are in hand that are newer
+      than every remaining file's `max_ts` (the condition-ALL SimpleSelect
+      already prunes to the global top-N this way); for supersets that
+      needs the exact per-file hit set first — the residual verification
+      the aggregates use, run newest-first with a stop. Until then the cap
+      stays as it was.
     - **(B) the first-run `Contains` walk.** `southamerica-east1` → `Contains
       (southamerica)` + `Prefix(east1)`: the Contains leaf walked the `error`
       token dictionary of all ~370 files (5.6 GB, 2.8 s) although the Prefix
