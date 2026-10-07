@@ -1555,85 +1555,71 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     with `str_match(body)` then served by candidate verification from the
     other conjuncts; (5) a trigram index for substring search on chosen
     fields — the only route that makes a LONE `str_match` cheap.
-- **2026-10-07 — built, NOT shipped: `str_match` on a full-text field served
-  through its tokens; a stream's explicit `full_text_search_keys` designate
-  dotted sub-fields (owner: "full_text_search_keys 改为包含…只要带body都可以
-  走FTS了; 优化引擎部分的str_match"; trigram deferred).** vix-arch
-  `d7bdb4936` + `7a15e40bf` + `4a389a10d` + `180af217b`. vortex_index 374,
-  infra schema 43, search index 100 / vix 207, workspace check clean.
+- **2026-10-07 — built, NOT shipped: `str_match` on a full-text field is
+  served through its tokens (owner: "优化引擎部分的str_match"; trigram
+  deferred).** vix-arch `7a15e40bf` → `25efaed88` (search side only after
+  the owner's simplification below). vortex_index 370, infra schema 38,
+  search index 99 / vix 207, workspace check clean.
   - Facts that shaped it: apisix has NO full-text field (`full_text_
     search_keys: []`, files `fts={}`, `match_all()` is rejected by the
     planner) — its `request.body` index is RAW values (202,840 distinct of
     828k rows, 135.6 MB raw / 124 MB encoded on pair `7512849656796176384
-    cce7`); tokenized it would be 578,496 distinct tokens / **8.4 MB**, 18.1
-    M postings. The tokenizer DROPS alphanumeric runs ≥ 64 bytes (tantivy
-    `RemoveLongFilter` port, `ZO_INVERTED_INDEX_MAX_TOKEN_LENGTH`, prod
-    default 64): **3.9 % of request.body rows** (2.5 % of uri) carry such a
-    run (JWTs, base64; p50 114 B, max 2,720 B). A substring needle can hide
-    inside a dropped run, so a token-based narrowing of `str_match` is a
-    true superset ONLY when the file dropped nothing for that field —
-    `match_all` already has this hole today (its scan semantics is `ILIKE
-    '%v%'`, its index narrowing is the token AND).
-  - Writer/reader: every new sidecar stamps `fts_long_token_skips`
-    (`{field: count}`, every fts field, zero included; merges SUM, any
-    legacy input ⇒ property omitted = unknown; rebuild from `_source`
-    re-derives); `VixReader::fts_tokens_complete(field)` = fts ∧ present ∧
-    0. Legacy files: never servable through tokens (scan as today).
-  - Search (`Condition::fts_str_match_superset_query`): on a
-    `FieldCap::Tokens` field with complete tokens, the needle is split by
-    the tokenizer's own run rules — first run `Contains` (the row's token
-    may extend left), last run `Prefix` (may extend right), interior runs
-    and standalone non-ASCII chars exact `TokenAnyField`, runs < min token
-    length not required, single run ⇒ lone `Contains` — under
-    `FullText{[field]}`, verdict `Superset` (filter re-applied; aggregates
-    refine in the index via the existing residual, refused above 4,096
-    candidates as before).
-  - Key rule (`infra::schema::fts_key_matches` / `resolve_stream_fts_
-    fields` / `is_stream_fts_field`): an EXPLICIT stream key matches a
-    field equal to it or whose LAST dot-segment equals it (`body` ⇒
-    `request.body`, `response.body`; not `body.__cursor`, `request.body_
-    size`, `content_length`); config defaults stay exact — segment-matching
-    them would make +388 nested fields full-text on prod `default`
-    (`callback_data.data.*` 159, `*.body` 104, …) and +181 on apisix (169
-    `_safedog_*.log` scanner junk); substring matching would add 1,129 /
-    596 (`content_length`…). Resolved to concrete names at the producers
-    (ingester L0 against the batch schema, WAL mover against WAL ∪
-    registry, compactor merge/heal against the registry) and the planner
-    (leader against the registry schema, follower against the plan
-    schema); leader and follower must ship together.
+    cce7`); tokenized it is 578,496 distinct tokens / **8.4 MB**, 18.1 M
+    postings. The tokenizer DROPS alphanumeric runs ≥ 64 bytes (tantivy
+    `RemoveLongFilter` port, `ZO_INVERTED_INDEX_MAX_TOKEN_LENGTH` = 64):
+    **3.9 % of request.body rows** (2.5 % of uri) carry such a run (JWTs,
+    base64; p50 114 B, max 2,720 B), so a needle hiding inside one is not
+    found through tokens — the same blind spot `match_all` has today (scan
+    semantics `ILIKE '%v%'`, index narrowing = token AND).
+  - **Owner decisions (2026-10-07):** `match_all` and `str_match` may be
+    inexact; the 64-byte cap stays (index-build throughput). Hence NO
+    per-file long-token accounting (`fts_long_token_skips` + `VixReader::
+    fts_tokens_complete`, built in `d7bdb4936`/`7a15e40bf`, removed in
+    `25efaed88`) — no writer change at all. And the explicit-key
+    segment rule for `full_text_search_keys` (`body` ⇒ `request.body`,
+    `4a389a10d`) was REVERTED (`cd8d5858c`): on prod data it is not worth
+    it — `default` would gain +388 nested full-text fields (`callback_data.
+    data.*` 159, `*.body` 104…), apisix +181 of which 169 are `request.
+    querystring._safedog_*.log` scanner junk nobody searches. Keys stay
+    exact; `request.body` is added to the full-text index by naming it
+    (stream setting `full_text_search_keys: ["request.body"]`).
+  - What remains (search layer, `Condition::fts_str_match_superset_query` +
+    `str_match_token_superset`): on a `FieldCap::Tokens` field a `str_match`
+    / `str_match_ignore_case` is no longer skipped (whole-file scan) — the
+    needle is split by the tokenizer's own run rules: first run `Contains`
+    (the row's token may extend left), last run `Prefix` (may extend
+    right), interior runs and standalone non-ASCII chars exact
+    `TokenAnyField`, runs < min token length not required, single run ⇒
+    lone `Contains` — under `FullText{[field]}`, verdict `Superset` (filter
+    re-applied; aggregates refine in the index via the existing residual,
+    refused above 4,096 candidates as before).
   - Real-data smoke (`search::vix::query_regressions::prod_file_str_match_
     on_fts_body_cost`: the local apisix pair re-indexed with `request.body`
-    fts, max token 65532 ⇒ skips `{request.body: 0}`; 20 ms latency; row
-    ids vs an in-memory column scan as ground truth):
+    fts at the 64-byte cap; 20 ms latency; row ids vs an in-memory column
+    scan as ground truth, misses inside dropped tokens counted):
 
     | needle | truth (uri∧body / body) | lone body SELECT superset · index bytes · waves | uri∧body SELECT · bytes · waves | counts |
     |---|---|---|---|---|
-    | `asagent1` | 0 / 0 | 0 · **8.4 MB** · 3.5 (raw walk was 124 MB · 27) | 0 · 14.4 MB · 8 | exact 0 / 0 |
-    | `locale` | 4 / 46,870 | 46,870 (= truth) · 10.0 MB · 4.9 | 4 (= truth) · 16.0 MB · 9.5 | uri∧body exact 4 (2.3 MB column); lone → `residual: too many candidate rows` → scan |
-    | `task_status` | 0 / 0 | 6,452 (tokens `task`+`status` co-occur) · 15.0 MB · 9.5 | 1 · 20.9 MB · 12.6 | uri∧body exact 0; lone → fallback |
+    | `asagent1` | 0 / 0 | 0 · **7.1 MB** · 2.0 (raw walk was 124 MB · 27) | 0 · 13.0 MB · 6.3 | exact 0 / 0 |
+    | `locale` | 4 / 46,870 | 46,870 (all true rows, 0 missed) · 8.7 MB · 3.8 | 4 (all) · 14.6 MB · 8.2 | uri∧body exact 4 (2.3 MB column); lone → `residual: too many candidate rows` → scan |
+    | `task_status` | 0 / 0 | 6,452 (`task`+`status` co-occur) · 13.6 MB · 8.1 | 1 · 19.5 MB · 11.3 | uri∧body exact 0; lone → fallback |
 
-    Every superset contained every true row. The lone `str_match` — the
-    case `.204`'s walk-vs-verify cannot help — goes from a 124 MB raw walk
-    to 8–15 MB of token dictionary per file; the uri∧body shape reads
-    14–21 MB (uri walk 6 MB + body token walk; the scoped token `Contains`
-    is not yet eligible for `.204`'s hold-back since it has no named
-    field — next refinement, together with footer-exact column sizes).
-  - **To ship (not done; owner's call on sequencing):** (a) images for ALL
-    roles — the property is stamped by ingester L0 builds and compactor
-    merges/rebuilds, the key rule runs in producers AND planner, the
-    str_match path in queriers; ingester/compactor are on the `.202`/`.181`
-    lineages, so this is a converged vix-arch release (the
-    `openobserve-converged-all-roles-release` procedure); (b) `ZO_INVERTED_
-    INDEX_MAX_TOKEN_LENGTH=65532` in `obs-env` for every role (writers stop
-    dropping; queriers tokenize `match_all` the same way) — +3.6 MB of body
-    tokens per apisix file; (c) apisix stream settings `full_text_search_
-    keys: ["body"]` ⇒ `request.body` (+ `request.headers.body`, `request.
-    querystring.body`) become fts in new files; existing apisix files
+    The lone `str_match` — the case `.204`'s walk-vs-verify cannot help —
+    goes from a 124 MB raw walk to 7–14 MB of token dictionary per file.
+    The uri∧body shape reads 13–20 MB (uri walk 6 MB + body token walk):
+    the scoped token `Contains` is not yet eligible for `.204`'s hold-back
+    (no named field) — next refinement, with footer-exact column sizes.
+  - **To ship (owner's go pending):** querier-only image (the change is
+    query-side; no writer or planner change left) → then apisix stream
+    settings `full_text_search_keys: ["request.body"]` (exact name) via the
+    settings API: new apisix files index `request.body` as tokens (sidecar
+    −124 MB + ~30 MB), `match_all` becomes valid on apisix, existing files
     classify `NeedsRebuild` (`term` in input, `fts` in plan) and the
-    compactor re-tokenizes them from `_source` — a bounded heal wave (~320
-    files/day of retention), during which `match_all`/`str_match` on those
-    files take the scan path; `request.body = '<json>'` becomes a token
-    superset on rebuilt files.
+    `.181` compactor re-tokenizes them from `_source` — a bounded heal wave
+    (~320 files/day of retention) during which `match_all`/`str_match` on
+    those files take the scan path; `request.body = '<json>'` becomes a
+    token superset on rebuilt files. Order matters: the querier first, or
+    `str_match(request.body)` on new files would be a whole-file scan.
 
 ## 2026-09-29 — P2 shipped as `.176` and rolled back within 30 min: the per-stream side table stalled the shared meta DB (commit latency 40–60×, ingest 503s); ranges must live in the segment row
 - What shipped (vix-arch `013c45010` + NATS retry `76fe754b5`, image
