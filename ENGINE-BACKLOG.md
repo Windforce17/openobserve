@@ -1506,9 +1506,55 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     10.4 MB near-unique dictionary): verified route 4.0 MB vs walk 10.4 MB,
     identical bits for ci/cs `Contains` and `Regex`; broad and lone
     conjuncts keep the walk; threshold 0 / oversize keeps the walk.
-  - Not changed: the `.203` rollout above stays; this ships as the next
-    querier release after a 1 h A/B on one pod (`ZO_VIX_WALK_VERIFY_MIN_
-    BYTES=0` is the in-place rollback).
+  - **Shipped as `.204` (owner: "这种思路是对的。执行把。").** vix-arch
+    `6560a9db1` (engine) + `dce1ad09b` (backlog); release worktree
+    `release/vix-20261007-204` `d9bd66721` = `.203`'s `f611d2743` + those
+    two cherry-picks, source byte-identical to vix-arch (vortex_index
+    370/370 in the worktree); image binary `7f4624728e14…`, ECR
+    `v0.93.0-vix-20261007.204` OCI index `sha256:1a42abacf6a9…`
+    (linux/arm64 `3b4719104227…`). GitOps #609 (`ce848d1`, kustomization
+    only, server dry-run clean); RS `6f8564c57b` rolled 09:31–09:33Z,
+    10/10 Running/Ready, 0 restarts, Synced/Healthy; RSS 6.4–10.7 GiB
+    fresh. Rollback: `.203`; in-place off switch
+    `ZO_VIX_WALK_VERIFY_MIN_BYTES=0`.
+  - **Pre/post on the same sealed window (10-07 01:00–07:00Z, `ops:/tmp/
+    battery_pre204_on203.jsonl` 08:5xZ on 10 h-warm `.203` pods, mostly
+    disk hits; `ops:/tmp/battery_post204.jsonl` 09:34Z on 2-minute-old
+    `.204` pods, 100 % remote reads). Hits identical (0 / 0 / 1 row), no
+    partial. Index bytes = Σ follower `io_accounting` logical bytes:**
+
+    | query (6 h) | `.203` r1 wall · idx · index bytes · ranges | `.203` r2 | `.204` r1 (cold remote) | `.204` r2 |
+    |---|---|---|---|---|
+    | prod: `str_match(uri,'thirdparty_webhook/email') AND str_match_ignore_case(body,'asagent1')` | 10.0 s · 9,991 ms · **20.05 GB** · 3,527 | 367 ms | 4.1 s · 3,707 ms · **1.64 GB** · 1,499 | **98 ms** |
+    | wide: uri needle `thirdparty_webhook` (15,803 uri rows) | 9.7 s · 9,626 ms · **35.8 GB** · 5,180 | 654 ms | 7.4 s · 7,417 ms · **5.69 GB** · 2,881 | **43 ms** |
+    | `count(*)` uri only (185 rows) | 690 ms · 524 ms · 665 MB · 258 | — | 345 ms · 302 ms | — |
+
+    Per follower the prod query fell from 1.3–3.7 GB / 243–604 ranges to
+    121–269 MB / 106–262 ranges (12.2× fewer bytes, 2.4× fewer ranges);
+    the wide one from 2.2–4.6 GB to 0.39–0.88 GB (6.3×). The 185 uri rows
+    are spread over most of the window's ~80 files (20–30 per hour), so
+    on `.203` nearly every file walked the body dictionary; on `.204` they
+    verify 1–3 candidate rows each. The wide shape's remaining 5.7 GB is
+    the files where ~200 candidates touch most chunks (declined → walk,
+    by design) plus the uri walks. Fleet counters 09:35Z: `residual:*`
+    0, no `budget_refused` / `eval_growth_timeouts` series; `skipped_file`
+    12k–40k per pod in 3 min of organic traffic — the next class
+    (`str_match` on fts-only fields is skipped → scan, see below).
+  - **Beyond this (owner question "还有其他办法优化这种查询速度吗"):**
+    (1) order the remaining walks cheapest-first by the same zero-IO
+    estimate (today SQL order; only matters for two sub-16 MiB walks in
+    the wrong order); (2) `str_match` on an fts field (`default/logs`
+    `body`) is SKIPPED today → whole-file scan (`skipped_file` above):
+    walk the token dictionary (a far smaller vocabulary than raw values)
+    as a superset and verify candidates — the same mechanism; (3)
+    anchored shapes (`LIKE '/thirdparty_webhook/email%'`) map to a
+    `Prefix` range instead of the 8 MB uri walk, the per-file floor that
+    is left; (4) stop raw-indexing `request.body` (1.6 M distinct ~150 B
+    values per file serve only `body = '<whole json>'`): bloom-only or
+    fts would cut the apisix sidecar ~53 % and every merge/build with it,
+    with `str_match(body)` then served by candidate verification from the
+    other conjuncts; (5) a trigram index for substring search on chosen
+    fields — the only route that makes a LONE `str_match` cheap.
 
 ## 2026-09-29 — P2 shipped as `.176` and rolled back within 30 min: the per-stream side table stalled the shared meta DB (commit latency 40–60×, ingest 503s); ranges must live in the segment row
 - What shipped (vix-arch `013c45010` + NATS retry `76fe754b5`, image
