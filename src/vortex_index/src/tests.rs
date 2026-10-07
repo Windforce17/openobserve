@@ -15060,6 +15060,3 @@ mod and_intersection;
 
 #[path = "tests/walk_verify.rs"]
 mod walk_verify;
-
-#[path = "tests/fts_long_token_skips.rs"]
-mod fts_long_token_skips;

@@ -1646,17 +1646,19 @@ async fn multiword_full_text_aggregates_are_refined_to_the_exact_residual_rows()
 }
 
 /// Diagnostic: the `str_match` shape on a REAL `apisix` pair re-indexed
-/// with `request.body` as a FULL-TEXT field and no token dropped
+/// with `request.body` as a FULL-TEXT field at the production token cap
 /// (`VIX_BENCH_FILE` = the original `.vix`; its `request.uri` /
 /// `request.body` / `_timestamp` columns are re-written into a fresh pair
-/// with `fts_field_names = [request.body]`, `max_token_len = 65532`). Runs
+/// with `fts_field_names = [request.body]`, `max_token_len = 64`). Runs
 /// `str_match(request.uri, VIX_BENCH_POINT_VALUE) AND
 /// str_match_ignore_case(request.body, VIX_BENCH_WALK_NEEDLE)` as a row-id
 /// query (token superset, filter re-applied downstream) and as a count
 /// (residual-refined, exact), plus the LONE body `str_match` — the case the
 /// `.204` walk-vs-verify could not help — printing index batches / bytes /
 /// waves per pass through a 20 ms latency source, and the exact rows from an
-/// in-memory column scan for comparison.
+/// in-memory column scan for comparison — including how many true rows the
+/// token superset MISSES (needles inside tokens the cap dropped: the
+/// accepted inexactness of full-text search here).
 #[test]
 #[ignore = "diagnostic; run with VIX_BENCH_FILE set"]
 fn prod_file_str_match_on_fts_body_cost() {
@@ -1688,7 +1690,7 @@ fn prod_file_str_match_on_fts_body_cost() {
         &schema,
         VixWriterOptions {
             fts_field_names: vec!["request.body".to_string()],
-            max_token_len: 65532,
+            max_token_len: 64,
             ..Default::default()
         },
         false,
@@ -1710,16 +1712,9 @@ fn prod_file_str_match_on_fts_body_cost() {
     );
     let memory = VixReader::open_with_index(data.clone(), Some(index.clone())).unwrap();
     assert!(memory.fts_fields().contains("request.body"));
-    assert!(
-        memory.fts_tokens_complete("request.body"),
-        "{:?}",
-        memory.fts_long_token_skips()
-    );
     eprintln!(
-        "request.body token dictionary {:?} bytes (source raw-value dictionary {:?} bytes); long-token skips {:?}",
-        memory.field_dictionary_bytes("request.body"),
+        "source raw-value dictionary of request.body: {:?} bytes",
         source.field_dictionary_bytes("request.body"),
-        memory.fts_long_token_skips(),
     );
 
     // ground truth from the columns
@@ -1776,12 +1771,13 @@ fn prod_file_str_match_on_fts_body_cost() {
                 ..
             }) => {
                 let got: Vec<usize> = bitmap.set_indices().collect();
-                let exact_rows = expect.iter().filter(|r| got.contains(r)).count();
+                let found = expect.iter().filter(|r| got.contains(r)).count();
                 format!(
-                    "superset rows={} (contains all {} exact rows: {}) has_skipped={has_skipped}",
+                    "superset rows={} (covers {found} of {} true rows; {} missed inside dropped \
+                     tokens) has_skipped={has_skipped}",
                     got.len(),
                     expect.len(),
-                    exact_rows == expect.len()
+                    expect.len() - found
                 )
             }
             Ok(RawVixResult::Count { count, has_skipped }) => {

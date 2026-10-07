@@ -3032,7 +3032,6 @@ mod tests {
                 &|field| super::super::field_capability(&reader, field),
                 &super::super::index_match_all_tokens,
                 true,
-                &|_| false,
             )
             .unwrap();
         assert!(!has_skipped);
@@ -3053,7 +3052,6 @@ mod tests {
                 &|field| super::super::field_capability(&reader, field),
                 &super::super::index_match_all_tokens,
                 true,
-                &|_| false,
             )
             .unwrap();
         assert!(!has_skipped);
@@ -3084,7 +3082,6 @@ mod tests {
                     &|field| super::super::field_capability(&reader, field),
                     &super::super::index_match_all_tokens,
                     true,
-                    &|_| false,
                 )
                 .unwrap_or_else(|e| panic!("{condition:?} must evaluate: {e}"));
             assert!(!has_skipped, "{condition:?} must not skip");
@@ -3107,7 +3104,6 @@ mod tests {
                 &|field| super::super::field_capability(&reader, field),
                 &super::super::index_match_all_tokens,
                 true,
-                &|_| false,
             )
             .unwrap();
         assert!(!has_skipped);
@@ -3126,7 +3122,6 @@ mod tests {
                 &|field| super::super::field_capability(&reader, field),
                 &super::super::index_match_all_tokens,
                 true,
-                &|_| false,
             )
             .unwrap();
         assert!(!has_skipped);
@@ -3275,7 +3270,6 @@ mod tests {
             &|field| super::super::field_capability(&reader, field),
             &super::super::index_match_all_tokens,
             true,
-            &|_| false,
         )
         .unwrap();
         assert_eq!(reader.count(&query).unwrap(), 3);

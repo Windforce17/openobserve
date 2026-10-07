@@ -363,18 +363,6 @@ pub(crate) const PROP_PARTIAL_FIELDS: &str = "partial_fields";
 /// dictionary merges SUM inputs' maps so merged files keep serving.
 pub(crate) const PROP_OVERSIZE_SKIPS: &str = "oversize_skips";
 pub(crate) const PROP_TOKENIZER: &str = "tokenizer";
-/// INDEX-sidecar property: per-field count of full-text tokens the writer
-/// DROPPED for exceeding its `max_token_len` (JSON object `{"field":
-/// count}`, every fts field present, zero included). Its PRESENCE means
-/// the writer accounted for long tokens; a legacy sidecar without it may
-/// have dropped any number of them silently (the tantivy
-/// `RemoveLongFilter` port, 64 bytes). A substring predicate (`str_match`)
-/// can only be narrowed through a field's TOKENS when none was dropped —
-/// the needle may hide inside a dropped token — so the query layer serves
-/// it from the token dictionary only on files where this property says
-/// `0` for the field (`VixReader::fts_tokens_complete`). Dictionary merges
-/// SUM inputs' maps and omit the property when any input lacks it.
-pub(crate) const PROP_FTS_LONG_TOKEN_SKIPS: &str = "fts_long_token_skips";
 /// DATA-object docs-column field list (format "3"): a JSON array of the
 /// docs blob's columns minus the reserved `_source`/`_original` columns —
 /// the file's field-presence declaration, readable without the sidecar

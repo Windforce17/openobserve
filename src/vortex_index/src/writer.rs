@@ -66,12 +66,12 @@ use crate::{
         BLOB_TYPE_STATS, BLOB_TYPE_TERMS, BlobPart, DICT_LAYOUT_BLOCKS, DocsBlobEncoder,
         FIELD_TYPE_BLOOM, FIELD_TYPE_FTS, FIELD_TYPE_TERM, FieldEntry, FieldTypeFlags,
         KEY_LAYOUT_FID_V2, PROP_COLUMNS, PROP_COLUMNS_COMPLETE, PROP_DICT_FIELD_PAGES,
-        PROP_DICT_LAYOUT, PROP_FIELDS, PROP_FTS_LONG_TOKEN_SKIPS, PROP_KEY_LAYOUT,
-        PROP_OVERSIZE_SKIPS, PROP_PARTIAL_FIELDS, PROP_PLIST_MIN_DOCS, PROP_ROW_COUNT,
-        PROP_ROW_GROUP_SIZE, PROP_ROW_ORDER, PROP_ROW_REGIONS, PROP_TERM_COUNT, PROP_TOKENIZER,
-        PROP_VERSION, PROP_ZONE_MAP, ROW_ORDER_CONCAT, ROW_ORDER_TS_DESC, TOKENIZER_ID,
-        TermsBlobSpooler, VIX_FORMAT_VERSION, VixOutput, ZoneEntry, addressable_strategy,
-        build_container_parts, finish_streamed_container, write_vortex_blob,
+        PROP_DICT_LAYOUT, PROP_FIELDS, PROP_KEY_LAYOUT, PROP_OVERSIZE_SKIPS, PROP_PARTIAL_FIELDS,
+        PROP_PLIST_MIN_DOCS, PROP_ROW_COUNT, PROP_ROW_GROUP_SIZE, PROP_ROW_ORDER, PROP_ROW_REGIONS,
+        PROP_TERM_COUNT, PROP_TOKENIZER, PROP_VERSION, PROP_ZONE_MAP, ROW_ORDER_CONCAT,
+        ROW_ORDER_TS_DESC, TOKENIZER_ID, TermsBlobSpooler, VIX_FORMAT_VERSION, VixOutput,
+        ZoneEntry, addressable_strategy, build_container_parts, finish_streamed_container,
+        write_vortex_blob,
     },
     error::{Result, VixError},
     merge::{self, DocIdMap},
@@ -85,7 +85,7 @@ use crate::{
     spill,
     stats::{ColumnStatsFolder, SpliceableStats},
     term_accumulator::{SortedTermShard, TermAccumulator},
-    tokenizer::o2_tokenize_counting,
+    tokenizer::o2_tokenize,
 };
 
 /// The timestamp column: never term-indexed, always stored (as `i64`)
@@ -951,13 +951,6 @@ pub struct VixWriterStats {
     /// for the skipped literals themselves may silently miss — observability
     /// for that trade lives in this counter.
     pub oversize_skipped: u64,
-    /// Full-text tokens the writer DROPPED for exceeding
-    /// [`VixWriterOptions::max_token_len`] (total across fts fields; the
-    /// per-field counts are the `fts_long_token_skips` sidecar property).
-    /// A dropped token cannot hide a `match_all` term (the search side
-    /// drops it identically), but it CAN hide a substring needle inside
-    /// the dropped run — the count is the observability for that hole.
-    pub fts_long_token_skipped: u64,
     /// Smallest `_timestamp` among the stored rows (`0` for an empty file).
     /// Computed from the actual data the writer stored — the authoritative
     /// source for `FileMeta::min_ts` (never trust upstream footer stats).
@@ -1008,16 +1001,6 @@ pub struct VixWriter {
     /// dictionary-serve reconciliation can treat the shortfall as an exact
     /// allowance; total reported via [`VixWriterStats::oversize_skipped`].
     oversize_skips: BTreeMap<String, u64>,
-    /// Per-field count of full-text tokens DROPPED for exceeding
-    /// [`VixWriterOptions::max_token_len`] — stamped as the INDEX-sidecar
-    /// `fts_long_token_skips` property (every fts field present, zero
-    /// included, so its presence certifies the writer accounted for long
-    /// drops). `None` in merge mode when any input lacked the property
-    /// (unknown drops ⇒ the output must not claim accounting either) —
-    /// mirrored to the sidecar by OMITTING the property there; a rebuild
-    /// from `_source` re-derives the map from its own counting. Total
-    /// reported via [`VixWriterStats::fts_long_token_skipped`].
-    fts_long_token_skips: Option<BTreeMap<String, u64>>,
     /// Docs batches buffered while the chunk-size sample is still open
     /// ([`DOCS_ENCODE_SAMPLE_BYTES`]); once the streaming encoder starts
     /// this stays empty.
@@ -1375,10 +1358,6 @@ impl VixWriter {
         }
         let docs_schema = Arc::new(Schema::new(docs_fields));
         let term_field_count = term_fields.len();
-        // Every fts field starts at 0 so the sidecar property always lists
-        // the full fts plan (presence == accounting done).
-        let fts_long_token_skips: BTreeMap<String, u64> =
-            fts_fields.iter().map(|name| (name.clone(), 0)).collect();
 
         Self {
             opts,
@@ -1396,7 +1375,6 @@ impl VixWriter {
             term_spill: None,
             partial_fields,
             oversize_skips: BTreeMap::new(),
-            fts_long_token_skips: Some(fts_long_token_skips),
             sample_batches: Vec::new(),
             sample_bytes: 0,
             docs_encoder: None,
@@ -1953,24 +1931,6 @@ impl VixWriter {
                 *self.oversize_skips.entry(field.clone()).or_default() += count;
             }
         }
-        // Long-token accounting across the merge: the merged dictionary
-        // carries exactly the inputs' tokens, so the merged file's
-        // accounting is the SUM of the inputs' maps — but ONLY when every
-        // input carries the property. Any input lacking it (legacy
-        // sidecar, or index-off) makes the merged drops unknowable, so the
-        // output must not claim accounting either: `None` omits the
-        // property, and the reader treats the field as never-complete. A
-        // rebuild from `_source` re-derives the map from its own counting.
-        self.fts_long_token_skips = inputs.iter().try_fold(
-            std::mem::take(&mut self.fts_long_token_skips).unwrap_or_default(),
-            |mut sum, reader| {
-                let skips = reader.fts_long_token_skips()?;
-                for (field, count) in skips {
-                    *sum.entry(field.clone()).or_default() += count;
-                }
-                Some(sum)
-            },
-        );
         self.partial_fields.extend(merged.dropped);
         // The bounds/disjoint-span checks above prove that offset inputs
         // occupy distinct document identities. Table maps are only checked
@@ -3078,26 +3038,10 @@ impl VixWriter {
                             // `max_raw_term_len` (a RAW-term bound) never
                             // applies, oversize values still tokenize, and
                             // the field never degrades to `partial_fields`.
-                            let mut long_drops: u64 = 0;
-                            let mut on_long_drop = |_| long_drops += 1;
-                            for token in o2_tokenize_counting(
-                                value,
-                                self.opts.min_token_len,
-                                self.opts.max_token_len,
-                                &mut on_long_drop,
-                            ) {
-                                self.terms.push(field_id, token.as_bytes(), doc);
-                            }
-                            // long-token accounting: identical to the
-                            // column-driven path, so rebuilds re-derive it.
-                            // `None` (a merge over a legacy input already
-                            // made the drops unknown) stays `None`: counting
-                            // only this writer's rows must not claim
-                            // knowledge of the merged input's.
-                            if long_drops > 0
-                                && let Some(skips) = &mut self.fts_long_token_skips
+                            for token in
+                                o2_tokenize(value, self.opts.min_token_len, self.opts.max_token_len)
                             {
-                                *skips.entry(key.to_string()).or_default() += long_drops;
+                                self.terms.push(field_id, token.as_bytes(), doc);
                             }
                         } else if value.len() > self.opts.max_raw_term_len {
                             // oversize raw value: skipped WITHOUT degrading
@@ -3283,28 +3227,14 @@ impl VixWriter {
                     // the field never degrades to `partial_fields` (which
                     // would cost whole-file match_all filter-backs — the
                     // live regression this fixed).
-                    // Long-token accounting is folded after the loop: the
-                    // closure cannot borrow `self` while `for_each_present`
-                    // holds `strings` (borrowed from the batch, not self).
-                    let mut long_drops: u64 = 0;
                     strings.for_each_present(|row, value| {
                         let doc = (first_doc + row as u64) as u32;
-                        let mut on_long_drop = |_| long_drops += 1;
-                        for token in o2_tokenize_counting(
-                            value,
-                            self.opts.min_token_len,
-                            self.opts.max_token_len,
-                            &mut on_long_drop,
-                        ) {
+                        for token in
+                            o2_tokenize(value, self.opts.min_token_len, self.opts.max_token_len)
+                        {
                             self.terms.push(field_id, token.as_bytes(), doc);
                         }
                     });
-                    // `None` (unknown after a legacy merge input) stays `None`
-                    if long_drops > 0
-                        && let Some(skips) = &mut self.fts_long_token_skips
-                    {
-                        *skips.entry(field_name.clone()).or_default() += long_drops;
-                    }
                 } else if self.bloom_only.contains_key(&field_id) {
                     // #52 bloom-only: values hash into the composite key
                     // form, no dictionary entries. Oversize inherits #41.
@@ -3662,10 +3592,6 @@ impl VixWriter {
             index_size,
             docs_size,
             oversize_skipped,
-            fts_long_token_skipped: self
-                .fts_long_token_skips
-                .as_ref()
-                .map_or(0, |skips| skips.values().sum()),
             min_ts,
             max_ts,
             timings,
@@ -4072,17 +3998,6 @@ impl VixWriter {
                 self.opts.postings_plist_min_docs.to_string(),
             ));
         }
-        // Long-token accounting: ALWAYS stamped on new sidecars (even `{}`)
-        // — presence certifies the writer counted every token it dropped
-        // for length, so the reader can trust token-based narrowings on
-        // files where every fts field's count is 0. `None` (a merge over an
-        // input that lacked the property) OMITS it: unknown drops.
-        if let Some(skips) = &self.fts_long_token_skips {
-            index_properties.push((
-                PROP_FTS_LONG_TOKEN_SKIPS.to_string(),
-                serde_json::to_string(skips)?,
-            ));
-        }
         Ok(Some(build_container_parts(index_properties, blobs)?))
     }
 
@@ -4150,10 +4065,6 @@ impl VixWriter {
             index_size: container.len() as u64,
             docs_size: 0,
             oversize_skipped,
-            fts_long_token_skipped: self
-                .fts_long_token_skips
-                .as_ref()
-                .map_or(0, |skips| skips.values().sum()),
             min_ts: 0,
             max_ts: 0,
             timings: VixWriterTimings {

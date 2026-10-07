@@ -2465,7 +2465,6 @@ fn evaluate_vix_index(
         &|field| field_capability(reader, field),
         &index_match_all_tokens,
         fulltext_servable,
-        &|field| reader.fts_tokens_complete(field),
     ) {
         Ok(built) => built,
         // M16 §4: the whole condition is ONE skipped conjunct
@@ -3001,9 +3000,9 @@ fn evaluate_vix_index(
 ///   it map to index queries directly.
 /// - [`FieldCap::Tokens`] — the field is full-text indexed in this file (token terms, no whole
 ///   values): equality / IN narrow to the value's tokens as a superset with the filter re-applied;
-///   `str_match` narrows to the needle's decomposed token leaves the same way when the file's
-///   tokens for the field are complete (`VixReader::fts_tokens_complete`), else skips; other shapes
-///   skip.
+///   `str_match` narrows to the needle's decomposed token leaves the same way (a needle inside a
+///   token the tokenizer dropped for length is the token index's accepted miss, as for
+///   `match_all`); other shapes skip.
 /// - [`FieldCap::Absent`] — the field is not a column of this file. The scan evaluates named
 ///   predicates per column, and a column the file lacks is NULL in every row, so never-TRUE-on-NULL
 ///   conditions become [`vortex_index::VixQuery::Nothing`], eliminating the file exactly instead of
@@ -4030,14 +4029,12 @@ mod tests {
         }
     }
 
-    /// `str_match` on an fts field whose tokens this file indexes
-    /// completely narrows to the needle's decomposed token leaves — the
-    /// rows containing the needle (inside a token, standalone, or inside a
-    /// long token) survive, with `has_skipped` (superset, filter
-    /// re-applied).
-    // requires fts_long_token_skips stamping (writer side, in flight):
-    // without the property the reader reports the tokens incomplete and
-    // the conjunct keeps the plain skip
+    /// `str_match` on an fts field narrows to the needle's decomposed token
+    /// leaves — the rows containing the needle inside a token or as a token
+    /// survive, with `has_skipped` (superset, filter re-applied). The row
+    /// whose covering token exceeds the tokenizer's length cap is the
+    /// index's accepted miss (owner call 2026-10-07: inexact full-text
+    /// results, the 64-byte cap stays) — exactly what `match_all` does.
     #[test]
     fn test_str_match_on_fts_field_narrows_to_token_superset_per_file() {
         use arrow::{
@@ -4052,15 +4049,13 @@ mod tests {
         ]));
         let opts = VixWriterOptions {
             fts_field_names: vec!["body".to_string()],
-            // nothing dropped: the 79-byte token is indexed whole
-            max_token_len: 128,
+            // the production cap: a 79-byte token is dropped by the writer
+            max_token_len: 64,
             ..Default::default()
         };
         let mut writer = VixWriter::new(&schema, opts, false);
         let needle = "asagent1";
-        // the needle hidden inside a 79-byte token: indexed whole only
-        // because max_token_len is raised, and found only because the
-        // writer stamped zero long-token drops (fts_tokens_complete)
+        // the needle hidden inside a 79-byte token the tokenizer drops
         let long = format!("zz{needle}{}", "x".repeat(70));
         let bodies = vec![
             Some("xxasagent1yy"),        // needle inside a token
@@ -4091,15 +4086,11 @@ mod tests {
                 .unwrap()
         };
         assert!(reader.fts_fields().contains("body"));
-        assert!(
-            reader.fts_tokens_complete("body"),
-            "the writer must stamp fts_long_token_skips for this file"
-        );
 
-        // the needle's rows survive the decomposition: inside a token, as
-        // a standalone token, and inside the 79-byte token (whole only
-        // because the file's tokens are complete); the split-token row and
-        // the unrelated row are absent
+        // the needle's rows survive the decomposition: inside a token and
+        // as a standalone token; the split-token row and the unrelated row
+        // are absent, and so is the long-token row — its token was never
+        // indexed (the accepted miss)
         let condition = IndexCondition {
             conditions: vec![Condition::StrMatch(
                 "body".to_string(),
@@ -4128,10 +4119,11 @@ mod tests {
                 assert!(has_skipped, "the token decomposition is a superset");
                 assert_eq!(
                     bitmap.set_indices().collect::<Vec<_>>(),
-                    vec![0, 1, 4],
-                    "rows with the needle inside a token (0, 4) or as a token (1) \
+                    vec![0, 1],
+                    "rows with the needle inside a token (0) or as a token (1) \
                      survive; the split-token row (2) does not carry the needle in \
-                     any single token, the unrelated row (3) matches nothing"
+                     any single token, the unrelated row (3) matches nothing, and \
+                     the long-token row (4) is the token index's accepted miss"
                 );
             }
             other => panic!("expected a bitmap, got {other:?}"),
@@ -4328,7 +4320,6 @@ mod tests {
                         &|field| field_capability(&reader, field),
                         &index_match_all_tokens,
                         true,
-                        &|field| reader.fts_tokens_complete(field),
                     )
                     .unwrap()
                     .0,
@@ -4722,7 +4713,6 @@ mod tests {
                     &|field| field_capability(&plist_file, field),
                     &index_match_all_tokens,
                     true,
-                    &|_| false,
                 )
                 .unwrap();
             assert!(!has_skipped);
@@ -4943,7 +4933,6 @@ mod tests {
                 &|field| field_capability(&reader, field),
                 &index_match_all_tokens,
                 true,
-                &|_| false,
             )
             .unwrap();
         let cursor = reader.single_term_plist_cursor(&query).unwrap().unwrap();

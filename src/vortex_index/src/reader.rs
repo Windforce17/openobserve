@@ -78,10 +78,10 @@ use crate::{
     container::{
         BlobHandle, DEFAULT_TAIL_FETCH_BYTES, DICT_LAYOUT_BLOCKS, FIELD_TYPE_BLOOM, FIELD_TYPE_CS,
         FIELD_TYPE_FTS, FIELD_TYPE_TERM, FieldEntry, PROP_COLUMNS, PROP_DICT_LAYOUT, PROP_FIELDS,
-        PROP_FTS_LONG_TOKEN_SKIPS, PROP_OVERSIZE_SKIPS, PROP_PARTIAL_FIELDS, PROP_PLIST_MIN_DOCS,
-        PROP_ROW_COUNT, PROP_ROW_GROUP_SIZE, PROP_ROW_ORDER, PROP_TERM_COUNT, PROP_TOKENIZER,
-        PROP_ZONE_MAP, RowOrder, RowSelection, VixContainer, ZoneEntry, column_binary, column_u32,
-        column_u64, parse_container, parse_container_pair_ranged, parse_container_ranged_with_tail,
+        PROP_OVERSIZE_SKIPS, PROP_PARTIAL_FIELDS, PROP_PLIST_MIN_DOCS, PROP_ROW_COUNT,
+        PROP_ROW_GROUP_SIZE, PROP_ROW_ORDER, PROP_TERM_COUNT, PROP_TOKENIZER, PROP_ZONE_MAP,
+        RowOrder, RowSelection, VixContainer, ZoneEntry, column_binary, column_u32, column_u64,
+        parse_container, parse_container_pair_ranged, parse_container_ranged_with_tail,
         require_supported_data_format, require_supported_index_format, scan_blob,
         scan_blob_dict_column, scan_blob_streaming, visit_blob_dict_chunks,
     },
@@ -693,11 +693,6 @@ pub struct VixReader {
     /// oversize values keep serving (counts omit those values — the
     /// 2026-08-12 trade); any other shortfall still refuses.
     oversize_skips: HashMap<String, u64>,
-    /// Per-field count of full-text tokens the writer dropped for length
-    /// (the sidecar's `fts_long_token_skips` property); `None` on a legacy
-    /// sidecar that did not account for them (see
-    /// [`Self::fts_tokens_complete`]).
-    fts_long_token_skips: Option<HashMap<String, u64>>,
     /// `false` = opened WITHOUT an index sidecar (#40/#42 index-off files
     /// have none; a caller may also open data-only): the dictionary proves
     /// nothing — `key_term_exists`' absence proof and every capability
@@ -1065,92 +1060,71 @@ impl VixReader {
                 .get(RAW_VALUE_TERMS_DISJOINT_PROPERTY)
                 .is_some_and(|value| value == "true")
         });
-        let (
-            mut fields,
-            partial_fields,
-            term_count,
-            tokenizer,
-            plist_min_docs,
-            fts_long_token_skips,
-            index_container,
-        ) = match index_container {
-            Some(index) => {
-                let index_props = &index.properties;
-                require_supported_index_format(index_props)?;
-                // Pairing guard: a sidecar carries the doc-id space of
-                // exactly one data object — a mismatched pair would make
-                // the postings misaddress the stored rows.
-                let index_rows = u64_prop(index_props, PROP_ROW_COUNT)?;
-                if index_rows != row_count {
-                    return Err(VixError::Malformed(format!(
-                        "index sidecar covers {index_rows} rows but the data object stores \
+        let (mut fields, partial_fields, term_count, tokenizer, plist_min_docs, index_container) =
+            match index_container {
+                Some(index) => {
+                    let index_props = &index.properties;
+                    require_supported_index_format(index_props)?;
+                    // Pairing guard: a sidecar carries the doc-id space of
+                    // exactly one data object — a mismatched pair would make
+                    // the postings misaddress the stored rows.
+                    let index_rows = u64_prop(index_props, PROP_ROW_COUNT)?;
+                    if index_rows != row_count {
+                        return Err(VixError::Malformed(format!(
+                            "index sidecar covers {index_rows} rows but the data object stores \
                              {row_count} — mispaired objects"
-                    )));
+                        )));
+                    }
+                    let fields: Vec<FieldEntry> =
+                        serde_json::from_str(required_prop(index_props, PROP_FIELDS)?)?;
+                    let partial_fields: HashSet<String> =
+                        serde_json::from_str(required_prop(index_props, PROP_PARTIAL_FIELDS)?)?;
+                    let term_count = u64_prop(index_props, PROP_TERM_COUNT)?;
+                    let tokenizer = index_props.get(PROP_TOKENIZER).cloned();
+                    // Out-of-row postings capability: the property present ⇒
+                    // pointer cells may exist and `doc_count >=
+                    // plist_min_docs` selects them; absent ⇒ every cell is
+                    // inline. The blob itself may legitimately be absent even
+                    // with the property set (no term crossed the threshold),
+                    // so its existence is checked only when a pointer cell is
+                    // actually resolved.
+                    let plist_min_docs: u32 = match index_props.get(PROP_PLIST_MIN_DOCS) {
+                        None => 0,
+                        Some(raw) => raw.parse().map_err(|_| {
+                            VixError::Malformed(format!(
+                                "property {PROP_PLIST_MIN_DOCS:?} is not an integer: {raw:?}"
+                            ))
+                        })?,
+                    };
+                    (
+                        fields,
+                        partial_fields,
+                        term_count,
+                        tokenizer,
+                        plist_min_docs,
+                        Some(index),
+                    )
                 }
-                let fields: Vec<FieldEntry> =
-                    serde_json::from_str(required_prop(index_props, PROP_FIELDS)?)?;
-                let partial_fields: HashSet<String> =
-                    serde_json::from_str(required_prop(index_props, PROP_PARTIAL_FIELDS)?)?;
-                let term_count = u64_prop(index_props, PROP_TERM_COUNT)?;
-                let tokenizer = index_props.get(PROP_TOKENIZER).cloned();
-                // Long-token accounting: present ⇒ the writer counted
-                // every token it dropped for length (zero included);
-                // absent ⇒ legacy, unknown drops.
-                let fts_long_token_skips: Option<HashMap<String, u64>> = match index_props
-                    .get(PROP_FTS_LONG_TOKEN_SKIPS)
-                {
-                    Some(raw) => Some(serde_json::from_str(raw).map_err(|e| {
-                        VixError::Malformed(format!(
-                            "property {PROP_FTS_LONG_TOKEN_SKIPS:?} is not a field-count map: {e}"
-                        ))
-                    })?),
-                    None => None,
-                };
-                // Out-of-row postings capability: the property present ⇒
-                // pointer cells may exist and `doc_count >=
-                // plist_min_docs` selects them; absent ⇒ every cell is
-                // inline. The blob itself may legitimately be absent even
-                // with the property set (no term crossed the threshold),
-                // so its existence is checked only when a pointer cell is
-                // actually resolved.
-                let plist_min_docs: u32 = match index_props.get(PROP_PLIST_MIN_DOCS) {
-                    None => 0,
-                    Some(raw) => raw.parse().map_err(|_| {
-                        VixError::Malformed(format!(
-                            "property {PROP_PLIST_MIN_DOCS:?} is not an integer: {raw:?}"
-                        ))
-                    })?,
-                };
-                (
-                    fields,
-                    partial_fields,
-                    term_count,
-                    tokenizer,
-                    plist_min_docs,
-                    fts_long_token_skips,
-                    Some(index),
-                )
-            }
-            None => {
-                // No sidecar: synthesize column-store-only field entries
-                // from the data object's docs-column list, which is
-                // exactly what an index-off file's `fields` property
-                // carried before the split (no term/fts/bloom types, so
-                // no capability is ever claimed). Entries are
-                // `[name, present_rows]` pairs since the H2 stats
-                // extension (plain names on M1 files).
-                let columns =
-                    crate::stats::parse_columns_prop(required_prop(properties, PROP_COLUMNS)?)?;
-                let fields = columns
-                    .into_iter()
-                    .map(|(name, _)| FieldEntry {
-                        name,
-                        types: crate::container::FieldTypeFlags::CS,
-                    })
-                    .collect();
-                (fields, HashSet::new(), 0, None, 0, None, None)
-            }
-        };
+                None => {
+                    // No sidecar: synthesize column-store-only field entries
+                    // from the data object's docs-column list, which is
+                    // exactly what an index-off file's `fields` property
+                    // carried before the split (no term/fts/bloom types, so
+                    // no capability is ever claimed). Entries are
+                    // `[name, present_rows]` pairs since the H2 stats
+                    // extension (plain names on M1 files).
+                    let columns =
+                        crate::stats::parse_columns_prop(required_prop(properties, PROP_COLUMNS)?)?;
+                    let fields = columns
+                        .into_iter()
+                        .map(|(name, _)| FieldEntry {
+                            name,
+                            types: crate::container::FieldTypeFlags::CS,
+                        })
+                        .collect();
+                    (fields, HashSet::new(), 0, None, 0, None)
+                }
+            };
         // The file's fts-marked field set, resolved once: any-field token
         // queries consult it to decide whether a partial field can actually
         // hide tokens (readers are memoized, so this is per-open, not
@@ -1262,7 +1236,6 @@ impl VixReader {
             indexed_field_ids,
             partial_fields,
             oversize_skips,
-            fts_long_token_skips,
             index_enabled,
             raw_value_terms_disjoint,
             fts_fields,
@@ -1521,27 +1494,6 @@ impl VixReader {
         self.oversize_skips.get(field).copied().unwrap_or(0)
     }
 
-    /// Per-field count of full-text tokens the writer dropped for exceeding
-    /// its `max_token_len` (the `fts_long_token_skips` sidecar property);
-    /// `None` on a legacy sidecar that did not account for them.
-    pub fn fts_long_token_skips(&self) -> Option<&HashMap<String, u64>> {
-        self.fts_long_token_skips.as_ref()
-    }
-
-    /// Whether EVERY alphanumeric run of `field`'s values is in the token
-    /// dictionary: the field is token-indexed here and the writer counted
-    /// zero length-dropped tokens for it. Only then is a substring predicate
-    /// on the field (`str_match`) safely narrowed through its tokens — a
-    /// needle may hide inside a dropped token, so an unaccounted (legacy)
-    /// or non-zero count keeps the scan-side filter authoritative.
-    pub fn fts_tokens_complete(&self, field: &str) -> bool {
-        self.fts_fields.contains(field)
-            && self
-                .fts_long_token_skips
-                .as_ref()
-                .is_some_and(|skips| skips.get(field).copied().unwrap_or(0) == 0)
-    }
-
     /// The file's fts-marked field names (token-indexed fields).
     pub fn fts_fields(&self) -> &HashSet<String> {
         &self.fts_fields
@@ -1762,10 +1714,6 @@ impl VixReader {
                 .keys()
                 .map(String::capacity)
                 .sum::<usize>();
-        if let Some(skips) = &self.fts_long_token_skips {
-            bytes += hash_table_bytes::<(String, u64)>(skips.capacity())
-                + skips.keys().map(String::capacity).sum::<usize>();
-        }
         for set in [&self.partial_fields, &self.fts_fields] {
             bytes += hash_table_bytes::<String>(set.capacity())
                 + set.iter().map(String::capacity).sum::<usize>();

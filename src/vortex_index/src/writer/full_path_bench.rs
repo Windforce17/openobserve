@@ -321,31 +321,10 @@ fn emit_direct_dict(
                 .expect("CSR excludes null dictionary values");
             key_docs.extend_from_slice(docs);
             if writer.fts_fields.contains(field_name) {
-                let mut long_drops: u64 = 0;
-                let mut on_long_drop = |_| long_drops += 1;
-                let tokens: BTreeSet<Vec<u8>> = o2_tokenize_counting(
-                    value,
-                    writer.opts.min_token_len,
-                    writer.opts.max_token_len,
-                    &mut on_long_drop,
-                )
-                .map(|token| token.as_bytes().to_vec())
-                .collect();
-                if long_drops > 0 {
-                    let counter = writer
-                        .fts_long_token_skips
-                        .get_or_insert_with(BTreeMap::new)
-                        .entry(field_name.to_string())
-                        .or_default();
-                    *counter = counter.checked_add(long_drops).with_context(|| {
-                        format!(
-                            "variant={} field={} chunk={} phase=fts_long_token_count overflow",
-                            variant.label(),
-                            field_name,
-                            chunk
-                        )
-                    })?;
-                }
+                let tokens: BTreeSet<Vec<u8>> =
+                    o2_tokenize(value, writer.opts.min_token_len, writer.opts.max_token_len)
+                        .map(|token| token.as_bytes().to_vec())
+                        .collect();
                 for token in tokens {
                     terms.entry(token).or_default().extend_from_slice(docs);
                 }
