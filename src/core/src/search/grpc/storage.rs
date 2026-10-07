@@ -23,7 +23,7 @@ use config::{
     meta::{
         inverted_index::IndexOptimizeMode,
         search::{ScanStats, StorageType},
-        stream::{FileKey, FileSelection},
+        stream::FileKey,
     },
     metrics::{self, QUERY_PARQUET_CACHE_RATIO_NODE},
     utils::size::bytes_to_human_readable,
@@ -109,121 +109,36 @@ fn scan_cap_budget(idx_optimize_rule: &Option<IndexOptimizeMode>, configured: us
     }
 }
 
-/// The docs footer a late-materialising point read opens first (Vortex
-/// layout: columns × chunks; ~1 MB on the widest production files — the
-/// index phase's `DETACHED_DOCS_FOOTER_READ_BYTES` is sized from the same
-/// measurement). Charged once per row-selected file; deliberately above the
-/// measurement so the estimate errs towards the cap.
-const SCAN_FOOTER_BYTES_ESTIMATE: usize = 2 * 1024 * 1024;
-
-/// Bytes the scan branch will read from `file`, as the cap charges them:
-/// the whole compressed object for a file it SCANS — no index selection, a
-/// row-group selection, or a selection the index proved covers every row —
-/// and for a ROW selection the late-materialisation estimate: the docs
-/// footer plus one chunk's share of the object per touched chunk (every
-/// projected column of the chunk is decoded, so a chunk costs its average
-/// compressed share: `compressed_size / chunks`, chunks from the writer's
-/// uncompressed chunk budget `chunk_bytes` over `original_size`, at least
-/// `records / 65,536`), never more than the object itself. Before this the
-/// cap charged a 500 MB file narrowed to three rows as 500 MB, so a
-/// `str_match` SELECT over a few hundred files was truncated to the newest
-/// ~60 (`is_partial`) although the scan branch would have read a few MB per
-/// file. A file whose metadata cannot size the chunks (`records` or
-/// `original_size` 0, legacy entries) is charged whole.
-fn scan_branch_bytes(file: &FileKey, chunk_bytes: usize) -> usize {
-    let compressed = file.meta.compressed_size.max(0) as usize;
-    let Some(FileSelection::Rows(rows)) = &file.selection else {
-        return compressed;
-    };
-    if rows.selects_all() {
-        return compressed;
-    }
-    let records = file.meta.records.max(0) as usize;
-    let original = file.meta.original_size.max(0) as usize;
-    if records == 0 || original == 0 || chunk_bytes == 0 {
-        return compressed;
-    }
-    let chunks = original
-        .div_ceil(chunk_bytes)
-        .max(records.div_ceil(65_536))
-        .max(1);
-    let touched = (rows.matched() as usize).min(chunks);
-    let per_chunk = compressed.div_ceil(chunks);
-    SCAN_FOOTER_BYTES_ESTIMATE
-        .saturating_add(touched.saturating_mul(per_chunk))
-        .min(compressed)
-}
-
-/// Candidate rows the cap admits per requested row once it engages
-/// ([`apply_storage_scan_cap`]): the newest files are admitted until their
-/// index-selected rows reach `CANDIDATE_ROWS_PER_LIMIT × limit`. The
-/// selected rows are the only rows the scan branch examines, so for a
-/// dense predicate (a phrase whose tokens occur everywhere: ~12 candidates
-/// per file over thousands of files) this bounds the work at about what
-/// the whole-file budget admitted before — ten times the requested rows
-/// is enough for the newest `limit` true matches unless more than 90 % of
-/// the candidates are false positives — while a selective predicate (a
-/// few candidates in a few hundred files) never reaches it and is admitted
-/// in full by its true byte cost.
-const CANDIDATE_ROWS_PER_LIMIT: usize = 10;
-
-/// Bound the scan branch of a row-returning `LIMIT` query.
-///
-/// Engages only when the files' WHOLE compressed bytes exceed `budget` —
-/// exactly when the cap engaged before, so a query that was never
-/// truncated is untouched. Then the NEWEST files are kept (`max_ts` DESC,
-/// always at least one) while their charged bytes ([`scan_branch_bytes`]:
-/// whole for a file the branch scans, the point-read estimate for a row
-/// selection) fit `budget` and, for row-selected files, their selected
-/// rows stay under `CANDIDATE_ROWS_PER_LIMIT × limit` (`limit` 0 = no row
-/// bound); the rest is reported. Newest-first because a scan-branch flood
-/// means the index could not prune a wide window: the recent end is what
-/// the query most likely wants, and the caller sees exactly where the
-/// coverage stops. When every file fits there is no shortfall.
+/// Keep the NEWEST files whose compressed bytes fit `budget` (always at least
+/// one), in `max_ts` DESC order, and report the rest. Newest-first because a
+/// scan-branch flood means the index could not prune a wide window: the
+/// recent end is what the query most likely wants, and the caller sees
+/// exactly where the coverage stops.
 fn apply_storage_scan_cap(
     files: &mut Vec<FileKey>,
     stream: &str,
     budget: usize,
-    chunk_bytes: usize,
-    limit: usize,
 ) -> Option<StorageScanShortfall> {
     if budget == 0 {
         return None;
     }
-    let whole: usize = files
+    let total: usize = files
         .iter()
         .map(|f| f.meta.compressed_size.max(0) as usize)
         .sum();
-    if whole <= budget {
+    if total <= budget {
         return None;
     }
-    let total: usize = files
-        .iter()
-        .map(|f| scan_branch_bytes(f, chunk_bytes))
-        .sum();
     files.sort_unstable_by(|a, b| b.meta.max_ts.cmp(&a.meta.max_ts).then(b.id.cmp(&a.id)));
-    let candidate_budget = limit.saturating_mul(CANDIDATE_ROWS_PER_LIMIT);
     let mut kept_bytes = 0usize;
-    let mut kept_candidates = 0usize;
     let mut kept = 0usize;
     for file in files.iter() {
-        let bytes = scan_branch_bytes(file, chunk_bytes);
-        let candidates = match &file.selection {
-            Some(FileSelection::Rows(rows)) if !rows.selects_all() => rows.matched() as usize,
-            _ => 0,
-        };
-        if kept > 0
-            && (kept_bytes + bytes > budget
-                || (candidate_budget > 0 && candidates > 0 && kept_candidates >= candidate_budget))
-        {
+        let bytes = file.meta.compressed_size.max(0) as usize;
+        if kept > 0 && kept_bytes + bytes > budget {
             break;
         }
         kept_bytes += bytes;
-        kept_candidates += candidates;
         kept += 1;
-    }
-    if kept == files.len() {
-        return None;
     }
     let oldest_kept_ts = files[kept - 1].meta.max_ts;
     let skipped_files = files.len() - kept;
@@ -296,10 +211,6 @@ pub async fn search(
         &idx_optimize_rule,
         get_config().limit.storage_scan_max_bytes,
     );
-    let scan_cap_limit = match &idx_optimize_rule {
-        Some(IndexOptimizeMode::SimpleSelect(limit, _)) => *limit,
-        _ => 0,
-    };
     if vix_applicable {
         // check vix inverted index
         (idx_took, is_add_filter_back, ..) = vix_search(
@@ -369,13 +280,7 @@ pub async fn search(
     // before any IO or plan, from the file_list sizes already in hand. The
     // kept set is re-measured so scan_stats describe what runs.
     let stream_key = format!("{org_id}/{stream_type}/{stream_name}");
-    let scan_shortfall = apply_storage_scan_cap(
-        &mut files,
-        &stream_key,
-        scan_cap,
-        cfg.common.vix_docs_chunk_bytes,
-        scan_cap_limit,
-    );
+    let scan_shortfall = apply_storage_scan_cap(&mut files, &stream_key, scan_cap);
     if let Some(shortfall) = &scan_shortfall {
         scan_stats = match file_list::calculate_files_size(&files).await {
             Ok(size) => size,
@@ -689,8 +594,7 @@ mod tests {
             file(3, 200, 40),
             file(4, 300, 40),
         ];
-        let shortfall =
-            apply_storage_scan_cap(&mut files, "o/traces/s", 100, 0, 0).expect("over budget");
+        let shortfall = apply_storage_scan_cap(&mut files, "o/traces/s", 100).expect("over budget");
         assert_eq!(
             files.iter().map(|f| f.id).collect::<Vec<_>>(),
             vec![2, 4],
@@ -722,10 +626,10 @@ mod tests {
     fn storage_scan_cap_is_a_no_op_within_budget_or_when_off() {
         let original = vec![file(1, 100, 40), file(2, 400, 40)];
         let mut files = original.clone();
-        assert_eq!(apply_storage_scan_cap(&mut files, "s", 80, 0, 0), None);
+        assert_eq!(apply_storage_scan_cap(&mut files, "s", 80), None);
         assert_eq!(files, original);
         let mut files = original.clone();
-        assert_eq!(apply_storage_scan_cap(&mut files, "s", 0, 0, 0), None);
+        assert_eq!(apply_storage_scan_cap(&mut files, "s", 0), None);
         assert_eq!(files, original);
     }
 
@@ -734,161 +638,9 @@ mod tests {
     #[test]
     fn storage_scan_cap_always_keeps_at_least_the_newest_file() {
         let mut files = vec![file(1, 100, 500), file(2, 200, 500)];
-        let shortfall = apply_storage_scan_cap(&mut files, "s", 10, 0, 0).unwrap();
+        let shortfall = apply_storage_scan_cap(&mut files, "s", 10).unwrap();
         assert_eq!(files.iter().map(|f| f.id).collect::<Vec<_>>(), vec![2]);
         assert_eq!((shortfall.kept_files, shortfall.skipped_files), (1, 1));
         assert_eq!(shortfall.kept_bytes, 500);
-    }
-
-    /// A row-selected file is charged what its point read will cost — the
-    /// footer plus one chunk share per touched chunk — never the whole
-    /// object; files the branch scans whole (no selection, every row,
-    /// row-group sampling, unsizable metadata) stay charged whole.
-    #[test]
-    fn scan_branch_bytes_charges_row_selections_by_touched_chunks() {
-        use config::meta::stream::RowIdBitmap;
-        const MIB: usize = 1024 * 1024;
-        // 500 MB object, 1,000,000 rows, 1,600 MiB uncompressed = 100 chunks
-        // of 16 MiB => 5 MB of compressed bytes per chunk
-        let mut f = file(1, 100, 500 * MIB as i64);
-        f.meta.records = 1_000_000;
-        f.meta.original_size = 1_600 * MIB as i64;
-        assert_eq!(
-            scan_branch_bytes(&f, 16 * MIB),
-            500 * MIB,
-            "no selection: whole"
-        );
-
-        let rows = |ids: &[u32]| {
-            Some(FileSelection::Rows(Arc::new(RowIdBitmap::from_row_ids(
-                1_000_000,
-                ids.iter().copied(),
-            ))))
-        };
-        f.selection = rows(&[7, 400_000, 999_999]);
-        assert_eq!(
-            scan_branch_bytes(&f, 16 * MIB),
-            SCAN_FOOTER_BYTES_ESTIMATE + 3 * 5 * MIB,
-            "three rows: footer + three chunk shares"
-        );
-        // more rows than chunks: every chunk, still capped at the object
-        f.selection = rows(&(0..200u32).map(|i| i * 4_000).collect::<Vec<_>>());
-        assert_eq!(
-            scan_branch_bytes(&f, 16 * MIB),
-            (SCAN_FOOTER_BYTES_ESTIMATE + 100 * 5 * MIB).min(500 * MIB)
-        );
-        // the row ceiling sizes chunks when rows, not bytes, bound them:
-        // 1,000,000 rows / 65,536 = 16 chunks even though 1,600 MiB / 1 GiB = 2
-        f.selection = rows(&[1]);
-        assert_eq!(
-            scan_branch_bytes(&f, 1024 * MIB),
-            SCAN_FOOTER_BYTES_ESTIMATE + 500 * MIB / 16
-        );
-        // every row selected: the branch scans it whole
-        f.selection = Some(FileSelection::Rows(Arc::new(RowIdBitmap::all_rows(
-            1_000_000,
-        ))));
-        assert_eq!(scan_branch_bytes(&f, 16 * MIB), 500 * MIB);
-        // unsizable metadata: charged whole
-        f.selection = rows(&[1]);
-        f.meta.records = 0;
-        assert_eq!(scan_branch_bytes(&f, 16 * MIB), 500 * MIB);
-        f.meta.records = 1_000_000;
-        assert_eq!(scan_branch_bytes(&f, 0), 500 * MIB, "chunk budget 0: whole");
-        // a selection larger than the object's compressed size never charges
-        // more than the object (tiny file, two rows)
-        let mut tiny = file(2, 100, 1024);
-        tiny.meta.records = 10;
-        tiny.meta.original_size = 4096;
-        tiny.selection = rows(&[0, 9]);
-        assert_eq!(scan_branch_bytes(&tiny, 16 * MIB), 1024);
-    }
-
-    /// Hundreds of files the index narrowed to a few rows each fit the budget
-    /// that used to admit a handful: the cap now truncates by what the scan
-    /// branch reads, whole-file scans still count whole.
-    #[test]
-    fn storage_scan_cap_fits_row_selected_files_by_their_point_read_cost() {
-        use config::meta::stream::RowIdBitmap;
-        const MIB: usize = 1024 * 1024;
-        // 300 files of 50 MiB (15 GiB whole: the cap engages), 1,600 MiB
-        // uncompressed = 100 chunks of 16 MiB => 0.5 MiB per chunk
-        let with_rows = |rows: u32| -> Vec<FileKey> {
-            (0..300)
-                .map(|i| {
-                    let mut f = file(i, 1_000 + i, 50 * MIB as i64);
-                    f.meta.records = 1_000_000;
-                    f.meta.original_size = 1_600 * MIB as i64;
-                    f.selection = Some(FileSelection::Rows(Arc::new(RowIdBitmap::from_row_ids(
-                        1_000_000,
-                        (0..rows).map(|r| r * (1_000_000 / rows)),
-                    ))));
-                    f
-                })
-                .collect()
-        };
-        // selective: 2 candidates per file, 300 x (2 MiB + 2 x 0.5 MiB) =
-        // 900 MiB < 4 GiB and 600 candidates < 10 x 100 => every file kept,
-        // no shortfall (before: whole bytes admitted the newest 81)
-        let mut files = with_rows(2);
-        assert_eq!(
-            apply_storage_scan_cap(&mut files, "s", 4 * 1024 * MIB, 16 * MIB, 100),
-            None
-        );
-        assert_eq!(files.len(), 300);
-        // dense: 40 candidates per file reach 10 x LIMIT after 25 files
-        // although the bytes (22 MiB each) would admit 186 — bounded work,
-        // newest first, the rest reported
-        let mut files = with_rows(40);
-        let shortfall =
-            apply_storage_scan_cap(&mut files, "s", 4 * 1024 * MIB, 16 * MIB, 100).unwrap();
-        assert_eq!(files.len(), 25);
-        assert_eq!((shortfall.kept_files, shortfall.skipped_files), (25, 275));
-        assert_eq!(files[0].meta.max_ts, 1_299, "newest first");
-        assert_eq!(shortfall.oldest_kept_ts, 1_275);
-        assert_eq!(shortfall.kept_bytes, 25 * 22 * MIB);
-        // no LIMIT bound (0): the charged bytes alone decide => 186 fit
-        let mut files = with_rows(40);
-        let shortfall =
-            apply_storage_scan_cap(&mut files, "s", 4 * 1024 * MIB, 16 * MIB, 0).unwrap();
-        assert_eq!(files.len(), 186);
-        assert_eq!(shortfall.kept_files, 186);
-        // the same 300 files scanned whole (no selection): the newest 81
-        // fit 4 GiB, exactly as before
-        let mut whole: Vec<FileKey> = (0..300)
-            .map(|i| file(i, 1_000 + i, 50 * MIB as i64))
-            .collect();
-        let shortfall =
-            apply_storage_scan_cap(&mut whole, "s", 4 * 1024 * MIB, 16 * MIB, 100).unwrap();
-        assert_eq!(whole.len(), 81);
-        assert_eq!((shortfall.kept_files, shortfall.skipped_files), (81, 219));
-        assert_eq!(whole[0].meta.max_ts, 1_299, "newest first");
-    }
-
-    /// A set whose WHOLE bytes fit the budget is never touched, whatever its
-    /// candidate count: the cap engages exactly where it engaged before.
-    #[test]
-    fn storage_scan_cap_never_engages_within_the_whole_file_budget() {
-        use config::meta::stream::RowIdBitmap;
-        const MIB: usize = 1024 * 1024;
-        let original: Vec<FileKey> = (0..50)
-            .map(|i| {
-                let mut f = file(i, 1_000 + i, 60 * MIB as i64);
-                f.meta.records = 1_000_000;
-                f.meta.original_size = 1_600 * MIB as i64;
-                f.selection = Some(FileSelection::Rows(Arc::new(RowIdBitmap::from_row_ids(
-                    1_000_000,
-                    (0..500u32).map(|i| i * 2_000),
-                ))));
-                f
-            })
-            .collect();
-        let mut files = original.clone();
-        // 50 x 60 MiB = 3 GiB whole < 4 GiB although 25,000 candidates >> 10 x 100
-        assert_eq!(
-            apply_storage_scan_cap(&mut files, "s", 4 * 1024 * MIB, 16 * MIB, 100),
-            None
-        );
-        assert_eq!(files, original);
     }
 }
