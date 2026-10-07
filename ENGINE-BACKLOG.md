@@ -1555,11 +1555,12 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     with `str_match(body)` then served by candidate verification from the
     other conjuncts; (5) a trigram index for substring search on chosen
     fields — the only route that makes a LONE `str_match` cheap.
-- **2026-10-07 — built, NOT shipped: `str_match` on a full-text field is
-  served through its tokens (owner: "优化引擎部分的str_match"; trigram
-  deferred).** vix-arch `7a15e40bf` → `25efaed88` (search side only after
-  the owner's simplification below). vortex_index 370, infra schema 38,
-  search index 99 / vix 207, workspace check clean.
+- **2026-10-07 — SHIPPED as `.205` (15:20Z): `str_match` on a full-text
+  field is served through its tokens (owner: "优化引擎部分的str_match";
+  trigram deferred); apisix `request.body` made full-text (15:24Z).**
+  vix-arch `7a15e40bf` → `edb28d316` (search side only after the owner's
+  simplification below). vortex_index 370, infra schema 38, search index
+  99 / vix 207, workspace check clean.
   - Facts that shaped it: apisix has NO full-text field (`full_text_
     search_keys: []`, files `fts={}`, `match_all()` is rejected by the
     planner) — its `request.body` index is RAW values (202,840 distinct of
@@ -1609,17 +1610,66 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     The uri∧body shape reads 13–20 MB (uri walk 6 MB + body token walk):
     the scoped token `Contains` is not yet eligible for `.204`'s hold-back
     (no named field) — next refinement, with footer-exact column sizes.
-  - **To ship (owner's go pending):** querier-only image (the change is
-    query-side; no writer or planner change left) → then apisix stream
-    settings `full_text_search_keys: ["request.body"]` (exact name) via the
-    settings API: new apisix files index `request.body` as tokens (sidecar
-    −124 MB + ~30 MB), `match_all` becomes valid on apisix, existing files
-    classify `NeedsRebuild` (`term` in input, `fts` in plan) and the
-    `.181` compactor re-tokenizes them from `_source` — a bounded heal wave
-    (~320 files/day of retention) during which `match_all`/`str_match` on
-    those files take the scan path; `request.body = '<json>'` becomes a
-    token superset on rebuilt files. Order matters: the querier first, or
-    `str_match(request.body)` on new files would be a whole-file scan.
+  - **Rollout.** `release/vix-20261007-205` `c17995b62` = `.204` + the
+    vix-arch source delta (4 files, all `src/search`; tree byte-identical to
+    vix-arch); image binary `0397d96f6d26…`, ECR `v0.93.0-vix-20261007.205`
+    index `sha256:9242cb185caa…` (arm64 `404ecfc93229…`); GitOps #612
+    (`f5de794`, kustomization only, server dry-run clean, admin merge like
+    #609); RS `78dfd6597f` rolled 15:18–15:20Z, 10/10 Ready, 0 restarts,
+    Synced/Healthy. Rollback: `.204`. Then `PUT /api/default/streams/
+    apisix/settings?type=logs {"full_text_search_keys":{"add":["request.
+    body"]}}` at 15:24:09Z (200; the first read-back was the cached `[]`,
+    propagated within 20 s). Verified: the merged sidecar `7513622220774604
+    800d610.vxi` written 15:32Z carries `request.body` with `types:["fts",
+    "cs"]`; compactors 18/18, 0 restarts, RSS 5–27 GiB, apisix merges and
+    L0 builds flowing (L0 sidecars arrive with the compactor heal as
+    usual).
+  - **Pre/post on the same sealed window (10-07 07:00–13:00Z, `ops:/tmp/
+    battery_pre205_on204.jsonl` 15:0xZ on 5.5 h-warm `.204` pods; `ops:/tmp/
+    battery_post205.jsonl` 15:21Z on 1-minute-old `.205` pods, all-remote).
+    Hits identical on every row. wall · idx · scan ms:**
+
+    | 6 h query | `.204` r1 · r2 | `.205` r1 · r2 | index bytes pre → post |
+    |---|---|---|---|
+    | `str_match(error,'southamerica-east1')` TopN by pc_id (fts `error`) | 3,967 (439/3,495) · 3,029 (45/2,960) | **3,082 (2,804/164) · 267 (36/147)** | 325 MB → 5.6 GB (the `southamerica` Contains walk over every file's `error` token dictionary); scan phase gone; pre: 366/366 files fell back (`unservable` 208 + `skipped_file` 158), post: 0 fallbacks |
+    | `SELECT * … str_match(body,'Sending deploy callback') LIMIT 100` | 6,042 (38/5,965) · 4,622 | 6,848 (5,434/1,392) · **1,591** | 0 → 1.45 GB; **still `is_partial`** on both: the scan cap kept 63 of 399 files (pre) / 63 of 370 (post) — see follow-up (A) |
+    | `count(*) … str_match_ignore_case(body,'deploy callback')` | 4,273 · 4,452 | 4,709 (857/3,829) · 3,560 | dense tokens: the superset exceeds `RESIDUAL_MAX_ROWS` per file → scan as before (+ the index work) |
+    | `match_all('deploy callback')` count (unchanged path) | 6,613 | 4,491 | — |
+    | apisix prod shape (unchanged until its files turn fts) | 1,931 · 423 | 2,135 · 66 | — |
+
+    Reading: selective needles on fts fields are now index-served and
+    memoised (the TopN's repeat 3.0 s → 0.27 s), dense needles neither gain
+    nor lose, and the SELECT shape stays truncated for a reason that is NOT
+    the index. Two follow-ups fall out of the numbers:
+    - **(A) scan-cap accounting.** `apply_storage_scan_cap` (`grpc/
+      storage.rs`) charges every file left after the index step at its
+      whole `compressed_size`, even when the index narrowed it to a row
+      selection the scan branch will late-materialise. With supersets on
+      370 files that is 21 GB "planned" for a few hundred rows of actual
+      reads → `is_partial`. Charge row-selected files by their selected
+      share (rows / records × compressed_size, with a per-file floor) and
+      the SELECT completes.
+    - **(B) the first-run `Contains` walk.** `southamerica-east1` → `Contains
+      (southamerica)` + `Prefix(east1)`: the Contains leaf walked the `error`
+      token dictionary of all ~370 files (5.6 GB, 2.8 s) although the Prefix
+      alone leaves few candidates. Extend `.204`'s hold-back to SCOPED
+      `Contains` leaves (field from the single-field scope, token-level
+      matcher: any alphanumeric run of the value contains the lowercased
+      run) so the cheap leaves narrow first and the Contains is verified on
+      the candidates' column; gate lone single-run walks on the token
+      dictionary's size vs the file (a high-entropy body's token dictionary
+      can rival the column scan).
+    - Not a regression: `k8s_prod_ops_logs` (Orbit's own `str_match(body,
+      trace_id)` lookups, 8.5 s / 13 h) runs with `idx_took = 0` — that
+      stream never enters the index phase; its 6–11 s are the plain scan
+      before and after.
+  - What the apisix setting changes: new apisix files index `request.body`
+    as tokens (sidecar −124 MB raw dictionary, +~30 MB tokens/postings),
+    `match_all` is valid on apisix, existing files classify `NeedsRebuild`
+    (`term` in input, `fts` in plan) and the `.181` compactor re-tokenizes
+    them from `_source` — a bounded heal wave (~320 files/day of retention)
+    during which `match_all`/`str_match` on those files take the scan path;
+    `request.body = '<json>'` becomes a token superset on rebuilt files.
 
 ## 2026-09-29 — P2 shipped as `.176` and rolled back within 30 min: the per-stream side table stalled the shared meta DB (commit latency 40–60×, ingest 503s); ranges must live in the segment row
 - What shipped (vix-arch `013c45010` + NATS retry `76fe754b5`, image
