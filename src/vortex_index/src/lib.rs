@@ -128,7 +128,7 @@ pub use stats::{
     ColumnChunkStat, ColumnChunkStats, DEFAULT_STATS_MAX_BYTES, DEFAULT_STATS_MIN_DENSITY,
     FileColumnStats, SpliceableStats, StatValue, validate_spliceable,
 };
-pub use tokenizer::o2_tokenize;
+pub use tokenizer::{o2_tokenize, o2_tokenize_counting};
 pub use writer::{
     BloomOnlyHasher, DEFAULT_DOCS_CHUNK_BYTES, DEFAULT_DOCS_CHUNK_MAX_ROWS, ID_COL_NAME,
     ORIGINAL_DATA_COL_NAME, RawValueSink, SOURCE_COL_NAME, SOURCE_RENAMED_COL_NAME,

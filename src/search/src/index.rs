@@ -81,7 +81,15 @@ pub enum FieldCap {
     /// of the exact predicate, so the condition still counts as skipped
     /// (`has_skipped`, DataFusion filter re-applied) but the index narrows
     /// the candidates and an absent token eliminates the file exactly.
-    /// Every other shape on the field is skipped like [`FieldCap::Unservable`].
+    /// A `str_match` on it is served the same way — the field-scoped AND of
+    /// the needle's token-level leaves
+    /// ([`Condition::fts_str_match_superset_query`]) — but ONLY when this
+    /// file's tokens for the field are complete (`fts_substring_servable`:
+    /// every token the writer's tokenizer produced is indexed, none dropped
+    /// for length), so the needle cannot hide inside a dropped token; a file
+    /// with dropped tokens (or a legacy sidecar without the accounting)
+    /// skips it like [`FieldCap::Unservable`]. Every other shape on the
+    /// field is skipped like [`FieldCap::Unservable`].
     Tokens,
     /// The file carries the field, but the term index cannot decide
     /// conditions on it: column-store/numeric storage, an internal column,
@@ -112,8 +120,10 @@ pub enum ConjunctVerdict {
     /// The query answers it exactly: a term-indexed field, or an absence
     /// proof (`Nothing`).
     Exact,
-    /// In the query, but as the superset of its tokens (an equality on a
-    /// token-indexed field): the filter is re-applied.
+    /// In the query, but as a superset (the token AND of an equality / IN
+    /// on a token-indexed field, or the token-decomposed superset of a
+    /// `str_match` on one whose tokens are complete): the filter is
+    /// re-applied.
     Superset,
     /// In the query as its token AND, which is a superset of the SQL
     /// substring predicate by construction (a multi-word `match_all`,
@@ -168,10 +178,10 @@ impl IndexCondition {
     //   index of this file cannot decide them — the field is carried by the
     //   file but not raw-value term-indexed ([`FieldCap::Unservable`]:
     //   numeric / column-store-only storage; [`FieldCap::Tokens`] in a
-    //   shape other than equality / IN), or an absent field appears in a
-    //   shape whose truth does not hinge on it alone (e.g. OR with a
-    //   servable predicate). The caller must keep the DataFusion filter so
-    //   that the skipped predicates are still evaluated.
+    //   shape other than equality / IN / str_match), or an absent field
+    //   appears in a shape whose truth does not hinge on it alone (e.g. OR
+    //   with a servable predicate). The caller must keep the DataFusion
+    //   filter so that the skipped predicates are still evaluated.
     //
     //   An equality / IN on a [`FieldCap::Tokens`] field is NOT dropped:
     //   it maps to the field-scoped AND of the value's index tokens
@@ -181,6 +191,20 @@ impl IndexCondition {
     //   candidates shrink from "every row of the other conjuncts" to the
     //   rows that contain the whole phrase, and a value whose tokens are
     //   absent from the file eliminates it exactly (and cacheably).
+    //
+    //   A `str_match` / `str_match_ignore_case` on a [`FieldCap::Tokens`]
+    //   field is served the same way when the file's tokens for the field
+    //   are COMPLETE (`fts_substring_servable(field)`: the writer indexed
+    //   every token, dropping none for length — `VixReader::
+    //   fts_tokens_complete`): it maps to the field-scoped AND of the
+    //   needle's token-level leaves ([`Condition::
+    //   fts_str_match_superset_query`]). A matching row's token sequence
+    //   contains a substring equal to the needle, so its tokens satisfy the
+    //   decomposition: the interior ASCII runs are whole tokens of the row,
+    //   and the boundary runs are prefixes of the row's boundary tokens.
+    //   Files whose tokens are incomplete (or legacy, unaccounted) skip it
+    //   like [`FieldCap::Unservable`] — a needle hiding inside a dropped
+    //   long token must not silently vanish.
     //
     //   A field reported [`FieldCap::Absent`] is NULL in every row of the
     //   file (no key term), so a condition that can never be TRUE on
@@ -198,6 +222,9 @@ impl IndexCondition {
     //   — into index tokens — the canonical `vortex_index::o2_tokenize` (via
     //   `vix::index_match_all_tokens`), the same function the writer indexes
     //   with.
+    //   `fts_substring_servable` reports whether this file's tokens for an
+    //   fts field are complete (`&|_| false` when no reader is at hand, which
+    //   disables the str_match superset).
     //
     //   `fulltext_servable = false` means this file cannot evaluate full-text
     //   predicates at all (an active full-text field exists as a column but
@@ -211,9 +238,15 @@ impl IndexCondition {
         field_cap: &dyn Fn(&str) -> FieldCap,
         tokenize: &dyn Fn(&str) -> Vec<String>,
         fulltext_servable: bool,
+        fts_substring_servable: &dyn Fn(&str) -> bool,
     ) -> anyhow::Result<(VixQuery, bool)> {
-        let (query, verdicts) =
-            self.to_vix_query_detailed(trace_id, field_cap, tokenize, fulltext_servable)?;
+        let (query, verdicts) = self.to_vix_query_detailed(
+            trace_id,
+            field_cap,
+            tokenize,
+            fulltext_servable,
+            fts_substring_servable,
+        )?;
         Ok((
             query,
             verdicts.iter().any(|verdict| {
@@ -238,6 +271,7 @@ impl IndexCondition {
         field_cap: &dyn Fn(&str) -> FieldCap,
         tokenize: &dyn Fn(&str) -> Vec<String>,
         fulltext_servable: bool,
+        fts_substring_servable: &dyn Fn(&str) -> bool,
     ) -> anyhow::Result<(VixQuery, Vec<ConjunctVerdict>)> {
         let mut exact = Vec::with_capacity(self.conditions.len());
         let mut queries: Vec<VixQuery> = Vec::with_capacity(self.conditions.len());
@@ -260,7 +294,18 @@ impl IndexCondition {
                 match field_cap(field) {
                     FieldCap::Term => {}
                     FieldCap::Tokens => {
-                        match condition.fts_superset_query(field, tokenize) {
+                        // equality / IN narrow to the value's tokens; a
+                        // str_match narrows to the needle's decomposed
+                        // token leaves, but only on a file whose tokens for
+                        // the field are complete — otherwise the needle may
+                        // hide inside a token the writer dropped
+                        let superset =
+                            condition.fts_superset_query(field, tokenize).or_else(|| {
+                                fts_substring_servable(field)
+                                    .then(|| condition.fts_str_match_superset_query(field))
+                                    .flatten()
+                            });
+                        match superset {
                             Some(query) => token_superset = Some(query),
                             None => unservable = Some((field, "token-indexed only")),
                         }
@@ -923,6 +968,29 @@ impl Condition {
         }
     }
 
+    /// The field-scoped token SUPERSET of a `str_match` /
+    /// `str_match_ignore_case` on a token-indexed field
+    /// ([`FieldCap::Tokens`]) whose tokens this file indexes completely
+    /// (`fts_substring_servable`): `FullText { [field], And(leaves) }`
+    /// where the leaves come from [`str_match_token_superset`]. A row whose
+    /// value contains the needle contains a token substring covering it,
+    /// so its tokens satisfy the leaves and the bitmap is a superset of
+    /// the SQL substring predicate — the caller re-applies the exact
+    /// filter (`case_sensitive` does not change the leaves). `None` for
+    /// every other shape (and for a needle whose runs all fall below the
+    /// minimum token length) — the plain skip.
+    pub fn fts_str_match_superset_query(&self, field: &str) -> Option<VixQuery> {
+        match self {
+            Condition::StrMatch(f, needle, _) if f == field => {
+                str_match_token_superset(needle, min_token_len()).map(|query| VixQuery::FullText {
+                    fields: vec![field.to_string()],
+                    query: Box::new(query),
+                })
+            }
+            _ => None,
+        }
+    }
+
     /// Fields the condition looks up in the per-file term index. A file that
     /// is missing any of them cannot evaluate this condition (the condition
     /// is skipped and the DataFusion filter is added back). match_all-style
@@ -1553,6 +1621,123 @@ fn _is_blank_or_alphanumeric(s: &str) -> bool {
         .all(|c| c.is_ascii_whitespace() || c.is_ascii_alphanumeric())
 }
 
+/// The configured minimum full-text token length, clamped to the tokenizer's
+/// floor of 2 bytes (shorter runs are never indexed).
+fn min_token_len() -> usize {
+    get_config().limit.inverted_index_min_token_length.max(2)
+}
+
+/// The token-level SUPERSET of `str_match(field, needle)` on a full-text
+/// (token-indexed) field whose tokens are COMPLETE in the file (the caller
+/// gates on `fts_substring_servable`): an AND of leaves over the needle's
+/// runs — maximal ASCII alphanumeric segments — mirroring exactly how the
+/// writer's tokenizer splits the row's value:
+///
+/// - an interior run (bounded on both sides by a delimiter inside the needle, or by any non-ASCII
+///   alphanumeric char, which is always its own standalone token) must appear as an exact token of
+///   the row: [`VixQuery::TokenAnyField`];
+/// - the first run, when the needle STARTS with an ASCII alphanumeric char (the row's token may
+///   extend to the left), is a substring of the row's first token: [`VixQuery::Contains`] over the
+///   token dictionary;
+/// - the last run, when the needle ENDS with an ASCII alphanumeric char (the row's token may extend
+///   to the right), prefixes the row's last token: [`VixQuery::Prefix`], a cheap dictionary range;
+/// - a single-run needle is one `Contains`.
+///
+/// A row whose value contains the needle contains it inside a contiguous
+/// run of the row's tokens, and since every token of the field is indexed
+/// (completeness), each leaf matches — the AND is a superset of the SQL
+/// substring predicate and the caller re-applies the exact filter. Runs
+/// shorter than `min_token_len` bytes are never indexed and are DROPPED
+/// from the requirements (they match nothing in the index, but requiring
+/// them would lose rows whose only trace is a short token); long runs are
+/// kept — completeness guarantees they were indexed. Lowercase with
+/// `str::to_lowercase` (the tokenizer lowercases survivors); case
+/// sensitivity does not change the superset. `None` when no leaf remains
+/// (a needle of only delimiters or only sub-minimum runs): the caller
+/// keeps the plain skip.
+fn str_match_token_superset(needle: &str, min_token_len: usize) -> Option<VixQuery> {
+    fn push_ascii(
+        leaves: &mut Vec<VixQuery>,
+        run: &str,
+        starts_needle: bool,
+        ends_needle: bool,
+        min_token_len: usize,
+    ) {
+        if run.len() < min_token_len {
+            // never indexed (the tokenizer's length floor): requiring it
+            // would lose rows whose only trace of the needle is the short
+            // run, so drop the requirement entirely
+            return;
+        }
+        let token = run.to_lowercase().into_bytes();
+        // a run at the needle's start may extend LEFT inside the row's
+        // token (a dictionary Contains); a run at the needle's end may
+        // extend RIGHT (a cheap dictionary Prefix range); an interior run
+        // is delimited inside the needle, so the row tokenizes it exactly
+        leaves.push(if starts_needle {
+            VixQuery::Contains {
+                field: None,
+                needle: token,
+                case_insensitive: false,
+            }
+        } else if ends_needle {
+            VixQuery::Prefix {
+                field: None,
+                prefix: token,
+            }
+        } else {
+            VixQuery::TokenAnyField { token }
+        });
+    }
+
+    // carve the needle into runs exactly like o2_tokenize splits the row's
+    // value: maximal ASCII alphanumeric segments, every non-ASCII
+    // alphanumeric char a standalone run, everything else a delimiter
+    let mut leaves: Vec<VixQuery> = Vec::new();
+    let mut run_start: Option<usize> = None;
+    for (index, ch) in needle.char_indices() {
+        if ch.is_ascii_alphanumeric() {
+            if run_start.is_none() {
+                run_start = Some(index);
+            }
+            continue;
+        }
+        if let Some(start) = run_start.take() {
+            push_ascii(
+                &mut leaves,
+                &needle[start..index],
+                start == 0,
+                false,
+                min_token_len,
+            );
+        }
+        if !ch.is_ascii() && ch.is_alphanumeric() {
+            // a non-ASCII alphanumeric char is its own complete token
+            // wherever it sits — even at the needle's boundaries
+            let run = &needle[index..index + ch.len_utf8()];
+            if run.len() >= min_token_len {
+                leaves.push(VixQuery::TokenAnyField {
+                    token: run.to_lowercase().into_bytes(),
+                });
+            }
+        }
+    }
+    if let Some(start) = run_start.take() {
+        push_ascii(
+            &mut leaves,
+            &needle[start..],
+            start == 0,
+            true,
+            min_token_len,
+        );
+    }
+    match leaves.len() {
+        0 => None,
+        1 => leaves.pop(),
+        _ => Some(VixQuery::And(leaves)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -2126,7 +2311,7 @@ mod tests {
         cond.add_condition(Condition::Equal("B".into(), "b".into()));
 
         let (query, has_skipped) = cond
-            .to_vix_query("test", &indexed(&["A", "B"]), &tok, true)
+            .to_vix_query("test", &indexed(&["A", "B"]), &tok, true, &|_| false)
             .expect("query build should succeed");
         assert!(!has_skipped, "no field is missing, should not skip");
         assert_eq!(query, VixQuery::And(vec![exact("A", "a"), exact("B", "b")]));
@@ -2172,7 +2357,7 @@ mod tests {
         let mut lone = IndexCondition::new();
         lone.add_condition(Condition::IsNotNull("B".into()));
         let (query, has_skipped) = lone
-            .to_vix_query("test", &indexed(&["A"]), &tok, true)
+            .to_vix_query("test", &indexed(&["A"]), &tok, true, &|_| false)
             .unwrap();
         assert!(!has_skipped);
         assert_eq!(
@@ -2256,7 +2441,7 @@ mod tests {
         cond.add_condition(Condition::Equal("B".into(), "b".into()));
 
         let (query, has_skipped) = cond
-            .to_vix_query("test", &indexed(&["A"]), &tok, true)
+            .to_vix_query("test", &indexed(&["A"]), &tok, true, &|_| false)
             .expect("query build should succeed even when a field is missing");
         assert!(has_skipped, "missing field B should be reported as skipped");
         // Only A should be referenced; B was dropped.
@@ -2271,7 +2456,7 @@ mod tests {
         cond.add_condition(Condition::Equal("A".into(), "a".into()));
         cond.add_condition(Condition::Equal("B".into(), "b".into()));
 
-        let result = cond.to_vix_query("test", &indexed(&["other_field"]), &tok, true);
+        let result = cond.to_vix_query("test", &indexed(&["other_field"]), &tok, true, &|_| false);
         assert!(
             result.is_err(),
             "should return error when all fields are missing"
@@ -2284,7 +2469,7 @@ mod tests {
         let mut cond = IndexCondition::new();
         cond.add_condition(Condition::Equal("B".into(), "b".into()));
 
-        let result = cond.to_vix_query("test", &indexed(&["A"]), &tok, true);
+        let result = cond.to_vix_query("test", &indexed(&["A"]), &tok, true, &|_| false);
         assert!(
             result.is_err(),
             "should return error when the only field is missing"
@@ -2303,7 +2488,7 @@ mod tests {
         cond.add_condition(Condition::Equal("A".into(), "a2".into()));
 
         let (query, has_skipped) = cond
-            .to_vix_query("test", &indexed(&["A"]), &tok, true)
+            .to_vix_query("test", &indexed(&["A"]), &tok, true, &|_| false)
             .unwrap();
         assert!(has_skipped);
         assert_eq!(query, exact("A", "a2"));
@@ -2320,7 +2505,7 @@ mod tests {
         let mut lone = IndexCondition::new();
         lone.add_condition(Condition::Equal("B".into(), "b".into()));
         let (query, has_skipped) = lone
-            .to_vix_query("test", &absent_unless(&["A"]), &tok, true)
+            .to_vix_query("test", &absent_unless(&["A"]), &tok, true, &|_| false)
             .expect("absent-field conditions must evaluate, not error");
         assert!(!has_skipped, "an absent field is exact, not a skip");
         assert_eq!(query, VixQuery::Nothing);
@@ -2346,7 +2531,7 @@ mod tests {
                 conditions: vec![condition.clone()],
             };
             let (query, has_skipped) = cond
-                .to_vix_query("test", &absent_unless(&["A"]), &tok, true)
+                .to_vix_query("test", &absent_unless(&["A"]), &tok, true, &|_| false)
                 .unwrap_or_else(|e| panic!("{condition:?} must evaluate: {e}"));
             assert!(!has_skipped, "{condition:?} must not skip");
             assert_eq!(query, VixQuery::Nothing, "{condition:?}");
@@ -2362,7 +2547,7 @@ mod tests {
         cond.add_condition(Condition::Equal("B".into(), "b".into()));
         cond.add_condition(Condition::Equal("A".into(), "a".into()));
         let (query, has_skipped) = cond
-            .to_vix_query("test", &absent_unless(&["A"]), &tok, true)
+            .to_vix_query("test", &absent_unless(&["A"]), &tok, true, &|_| false)
             .unwrap();
         assert!(!has_skipped);
         assert_eq!(
@@ -2392,7 +2577,7 @@ mod tests {
             let lone = IndexCondition {
                 conditions: vec![condition.clone()],
             };
-            let result = lone.to_vix_query("test", &absent_unless(&["A"]), &tok, true);
+            let result = lone.to_vix_query("test", &absent_unless(&["A"]), &tok, true, &|_| false);
             assert!(
                 result.is_err(),
                 "{condition:?} alone must skip (AllConditionsSkipped)"
@@ -2402,7 +2587,7 @@ mod tests {
             with_term.add_condition(condition.clone());
             with_term.add_condition(Condition::Equal("A".into(), "a2".into()));
             let (query, has_skipped) = with_term
-                .to_vix_query("test", &absent_unless(&["A"]), &tok, true)
+                .to_vix_query("test", &absent_unless(&["A"]), &tok, true, &|_| false)
                 .unwrap();
             assert!(has_skipped, "{condition:?} must report the skip");
             assert_eq!(query, exact("A", "a2"));
@@ -2426,10 +2611,15 @@ mod tests {
             Box::new(Condition::Equal("F".into(), "f".into())),
             Box::new(Condition::Equal("B".into(), "b".into())),
         ));
-        assert!(cond.to_vix_query("test", &caps, &tok, true).is_err());
+        assert!(
+            cond.to_vix_query("test", &caps, &tok, true, &|_| false)
+                .is_err()
+        );
 
         cond.add_condition(Condition::Equal("A".into(), "a".into()));
-        let (query, has_skipped) = cond.to_vix_query("test", &caps, &tok, true).unwrap();
+        let (query, has_skipped) = cond
+            .to_vix_query("test", &caps, &tok, true, &|_| false)
+            .unwrap();
         assert!(has_skipped);
         assert_eq!(query, exact("A", "a"));
     }
@@ -2464,7 +2654,9 @@ mod tests {
             "Sending deploy deploy callback".into(),
         ));
         cond.add_condition(Condition::Equal("svc".into(), "x".into()));
-        let (query, has_skipped) = cond.to_vix_query("test", &caps, &tok, true).unwrap();
+        let (query, has_skipped) = cond
+            .to_vix_query("test", &caps, &tok, true, &|_| false)
+            .unwrap();
         assert!(has_skipped, "a token superset is not the exact predicate");
         assert_eq!(
             query,
@@ -2482,7 +2674,9 @@ mod tests {
         // is eliminated when its tokens are absent
         let mut lone = IndexCondition::new();
         lone.add_condition(Condition::Equal("body".into(), "needle".into()));
-        let (query, has_skipped) = lone.to_vix_query("test", &caps, &tok, true).unwrap();
+        let (query, has_skipped) = lone
+            .to_vix_query("test", &caps, &tok, true, &|_| false)
+            .unwrap();
         assert!(has_skipped);
         assert_eq!(query, scoped(token("needle")));
 
@@ -2493,7 +2687,9 @@ mod tests {
             vec!["aa bb".into(), "cc".into()],
             false,
         ));
-        let (query, has_skipped) = list.to_vix_query("test", &caps, &tok, true).unwrap();
+        let (query, has_skipped) = list
+            .to_vix_query("test", &caps, &tok, true, &|_| false)
+            .unwrap();
         assert!(has_skipped);
         assert_eq!(
             query,
@@ -2518,14 +2714,229 @@ mod tests {
             let mut cond = IndexCondition::new();
             cond.add_condition(condition.clone());
             assert!(
-                cond.to_vix_query("test", &caps, &tok, true).is_err(),
+                cond.to_vix_query("test", &caps, &tok, true, &|_| false)
+                    .is_err(),
                 "{condition:?} alone must skip (AllConditionsSkipped)"
             );
             cond.add_condition(Condition::Equal("svc".into(), "x".into()));
-            let (query, has_skipped) = cond.to_vix_query("test", &caps, &tok, true).unwrap();
+            let (query, has_skipped) = cond
+                .to_vix_query("test", &caps, &tok, true, &|_| false)
+                .unwrap();
             assert!(has_skipped, "{condition:?} must report the skip");
             assert_eq!(query, exact("svc", "x"), "{condition:?}");
         }
+    }
+
+    /// The token-level decomposition of a `str_match` needle
+    /// ([`str_match_token_superset`]): the needle's ASCII runs carved
+    /// exactly like the writer's tokenizer, boundary runs relaxed
+    /// (Contains / Prefix), interior runs and non-ASCII alphanumeric chars
+    /// exact tokens, sub-minimum runs dropped, everything lowercased.
+    #[test]
+    fn test_str_match_token_superset_decomposition() {
+        let token = |value: &str| VixQuery::TokenAnyField {
+            token: value.as_bytes().to_vec(),
+        };
+        let contains = |value: &str| VixQuery::Contains {
+            field: None,
+            needle: value.as_bytes().to_vec(),
+            case_insensitive: false,
+        };
+        let prefix = |value: &str| VixQuery::Prefix {
+            field: None,
+            prefix: value.as_bytes().to_vec(),
+        };
+        let and = |leaves: Vec<VixQuery>| VixQuery::And(leaves);
+
+        // one bare run: a plain Contains (the row's token may extend both
+        // ways)
+        assert_eq!(
+            str_match_token_superset("asagent1", 2),
+            Some(contains("asagent1"))
+        );
+
+        // interior run bounded both sides: exact token; first run
+        // (needle starts alphanumeric): Contains; last run (needle ends
+        // alphanumeric): Prefix
+        assert_eq!(
+            str_match_token_superset("deploy callback", 2),
+            Some(and(vec![contains("deploy"), prefix("callback")]))
+        );
+        assert_eq!(
+            str_match_token_superset("Sending deploy callback.", 2),
+            Some(and(vec![
+                contains("sending"),
+                token("deploy"),
+                // the trailing `.` bounds the last run, so it is an
+                // exact token, not a Prefix
+                token("callback"),
+            ]))
+        );
+
+        // a non-ASCII alphanumeric char is a standalone token wherever it
+        // sits, so it makes BOTH neighboring ASCII runs interior
+        assert_eq!(
+            str_match_token_superset("用户admin", 2),
+            Some(and(vec![token("用"), token("户"), prefix("admin"),]))
+        );
+
+        // short runs are dropped from the requirements (they are not
+        // indexed): " x" leaves nothing, "as x y1" keeps the two long runs
+        assert_eq!(str_match_token_superset(" x", 2), None);
+        assert_eq!(
+            str_match_token_superset("as x y1", 2),
+            Some(and(vec![contains("as"), prefix("y1")]))
+        );
+
+        // case-insensitive by construction: the needle is lowercased like
+        // the indexed tokens; a needle of only delimiters narrows nothing
+        assert_eq!(
+            str_match_token_superset("Deploy CALLBACK", 2),
+            Some(and(vec![contains("deploy"), prefix("callback"),]))
+        );
+        assert_eq!(str_match_token_superset(" !! ", 2), None);
+
+        // a custom minimum token length drops longer runs too
+        assert_eq!(str_match_token_superset("ab cde", 3), Some(prefix("cde")));
+        // long runs are NOT dropped (the file's tokens are complete when
+        // this runs at all)
+        let long = "x".repeat(70);
+        assert_eq!(str_match_token_superset(&long, 2), Some(contains(&long)));
+    }
+
+    /// A `str_match` on a token-indexed field whose tokens this file
+    /// indexes completely narrows to the needle's decomposed token leaves
+    /// (verdict `Superset`, filter re-applied); an incomplete file (or a
+    /// legacy sidecar without the accounting) keeps the plain skip.
+    #[test]
+    fn test_to_vix_query_tokens_field_str_match_narrows_when_complete() {
+        let caps = |name: &str| match name {
+            "body" => FieldCap::Tokens,
+            _ => FieldCap::Term,
+        };
+        let scoped = |query: VixQuery| VixQuery::FullText {
+            fields: vec!["body".to_string()],
+            query: Box::new(query),
+        };
+
+        // servable: the decomposition scoped to the field, Superset verdict
+        let mut cond = IndexCondition::new();
+        cond.add_condition(Condition::StrMatch(
+            "body".into(),
+            "deploy callback".into(),
+            true,
+        ));
+        cond.add_condition(Condition::Equal("svc".into(), "x".into()));
+        let (query, verdicts) = cond
+            .to_vix_query_detailed("test", &caps, &tok, true, &|field: &str| field == "body")
+            .unwrap();
+        assert_eq!(
+            query,
+            VixQuery::And(vec![
+                scoped(VixQuery::And(vec![
+                    VixQuery::Contains {
+                        field: None,
+                        needle: b"deploy".to_vec(),
+                        case_insensitive: false,
+                    },
+                    VixQuery::Prefix {
+                        field: None,
+                        prefix: b"callback".to_vec(),
+                    },
+                ])),
+                exact("svc", "x"),
+            ])
+        );
+        assert_eq!(
+            verdicts,
+            vec![ConjunctVerdict::Superset, ConjunctVerdict::Exact]
+        );
+
+        // case sensitivity does not change the leaves (verification
+        // re-applies the exact predicate)
+        let mut insensitive = IndexCondition::new();
+        insensitive.add_condition(Condition::StrMatch(
+            "body".into(),
+            "Deploy CALLBACK".into(),
+            false,
+        ));
+        let (query, verdicts) = insensitive
+            .to_vix_query_detailed("test", &caps, &tok, true, &|field: &str| field == "body")
+            .unwrap();
+        assert_eq!(
+            query,
+            scoped(VixQuery::And(vec![
+                VixQuery::Contains {
+                    field: None,
+                    needle: b"deploy".to_vec(),
+                    case_insensitive: false,
+                },
+                VixQuery::Prefix {
+                    field: None,
+                    prefix: b"callback".to_vec(),
+                },
+            ]))
+        );
+        assert_eq!(verdicts, vec![ConjunctVerdict::Superset]);
+
+        // a needle whose runs are all sub-minimum: no narrowing possible
+        let mut short = IndexCondition::new();
+        short.add_condition(Condition::StrMatch("body".into(), " x".into(), true));
+        assert!(
+            short
+                .to_vix_query_detailed("test", &caps, &tok, true, &|_| true)
+                .is_err(),
+            "a needle with no indexable runs skips (AllConditionsSkipped)"
+        );
+
+        // not servable (incomplete tokens / legacy sidecar): the skip from
+        // before, the conjunct is absent from the query
+        let mut cond = IndexCondition::new();
+        cond.add_condition(Condition::StrMatch("body".into(), "deploy".into(), true));
+        cond.add_condition(Condition::Equal("svc".into(), "x".into()));
+        let (query, verdicts) = cond
+            .to_vix_query_detailed("test", &caps, &tok, true, &|_| false)
+            .unwrap();
+        assert_eq!(query, exact("svc", "x"));
+        assert_eq!(
+            verdicts,
+            vec![ConjunctVerdict::Skipped, ConjunctVerdict::Exact]
+        );
+
+        // and alone it is AllConditionsSkipped, as before
+        let mut lone = IndexCondition::new();
+        lone.add_condition(Condition::StrMatch("body".into(), "deploy".into(), true));
+        assert!(
+            lone.to_vix_query("test", &caps, &tok, true, &|_| false)
+                .is_err()
+        );
+    }
+
+    /// The str_match superset only applies to the field whose tokens are
+    /// complete: another Tokens field in the same condition keeps the skip.
+    #[test]
+    fn test_to_vix_query_tokens_field_str_match_scoped_per_field() {
+        let caps = |name: &str| match name {
+            "body" => FieldCap::Tokens,
+            "note" => FieldCap::Tokens,
+            _ => FieldCap::Term,
+        };
+        let mut cond = IndexCondition::new();
+        cond.add_condition(Condition::StrMatch("body".into(), "deploy".into(), true));
+        cond.add_condition(Condition::StrMatch("note".into(), "deploy".into(), true));
+        cond.add_condition(Condition::Equal("svc".into(), "x".into()));
+        let (query, verdicts) = cond
+            .to_vix_query_detailed("test", &caps, &tok, true, &|field| field == "body")
+            .unwrap();
+        assert_eq!(
+            verdicts,
+            vec![
+                ConjunctVerdict::Superset,
+                ConjunctVerdict::Skipped,
+                ConjunctVerdict::Exact,
+            ]
+        );
+        assert!(matches!(&query, VixQuery::And(subs) if subs.len() == 2));
     }
 
     /// A file whose active full-text scope is only partly token-indexed
@@ -2554,7 +2965,9 @@ mod tests {
         ))));
         cond.add_condition(Condition::Equal("svc".into(), "x".into()));
         cond.add_condition(Condition::Equal("body".into(), "needle".into()));
-        let (query, has_skipped) = cond.to_vix_query("test", &caps, &tok, false).unwrap();
+        let (query, has_skipped) = cond
+            .to_vix_query("test", &caps, &tok, false, &|_| false)
+            .unwrap();
         assert!(has_skipped);
         assert_eq!(
             query,
@@ -2569,16 +2982,23 @@ mod tests {
             ])
         );
         // the same conditions evaluate full text when the scope is servable
-        let (query, _) = cond.to_vix_query("test", &caps, &tok, true).unwrap();
+        let (query, _) = cond
+            .to_vix_query("test", &caps, &tok, true, &|_| false)
+            .unwrap();
         assert!(matches!(&query, VixQuery::And(subs) if subs.len() == 5));
 
         let mut lone = IndexCondition::new();
         lone.add_condition(Condition::MatchAll("deploy".into()));
-        assert!(lone.to_vix_query("test", &caps, &tok, false).is_err());
+        assert!(
+            lone.to_vix_query("test", &caps, &tok, false, &|_| false)
+                .is_err()
+        );
         // `match_all('*')` / empty are condition-all, never full text
         let mut all = IndexCondition::new();
         all.add_condition(Condition::MatchAll("*".into()));
-        let (query, has_skipped) = all.to_vix_query("test", &caps, &tok, false).unwrap();
+        let (query, has_skipped) = all
+            .to_vix_query("test", &caps, &tok, false, &|_| false)
+            .unwrap();
         assert!(!has_skipped);
         assert_eq!(query, VixQuery::All);
     }

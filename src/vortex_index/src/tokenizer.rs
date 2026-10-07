@@ -66,12 +66,43 @@ const MAX_TOKEN_LENGTH: usize = 64;
 /// maximum is exclusive (mirroring tantivy's `RemoveLongFilter`). The
 /// filter applies to the original bytes; lowercasing happens after, exactly
 /// like the tantivy pipeline order.
-pub fn o2_tokenize(text: &str, min_len: usize, max_len: usize) -> impl Iterator<Item = String> {
+pub fn o2_tokenize(text: &str, min_len: usize, max_len: usize) -> std::vec::IntoIter<String> {
+    let mut no_long_drops = |_| {};
+    o2_tokenize_counting(text, min_len, max_len, &mut no_long_drops)
+}
+
+/// [`o2_tokenize`] plus WRITE-SIDE accounting: every token dropped for
+/// exceeding the exclusive `max_len` is reported through `on_long_drop`
+/// (the dropped token's byte length) — the counts feed the
+/// `fts_long_token_skips` sidecar property, whose presence certifies the
+/// writer accounted for dropped long tokens (see
+/// [`crate::container::PROP_FTS_LONG_TOKEN_SKIPS`]). The search side keeps
+/// calling [`o2_tokenize`]; the emitted tokens are IDENTICAL.
+///
+/// SHORT (`< min_len`) drops are deliberately NOT reported: the property
+/// guards token-based Narrowings of substring conditions, and those apply
+/// only to needles whose alphanumeric runs reach the `min_len` bound — a
+/// dropped 1-byte run cannot hide such a needle (the search side drops it
+/// too, both sides by the same filter), so counting it would widen the
+/// accounting without ever changing an answer. Only LONG drops can hide a
+/// needle the dictionary then cannot find.
+pub fn o2_tokenize_counting(
+    text: &str,
+    min_len: usize,
+    max_len: usize,
+    on_long_drop: &mut dyn FnMut(usize),
+) -> std::vec::IntoIter<String> {
     let min = min_len.max(MIN_TOKEN_LENGTH);
     let max = max_len.max(MAX_TOKEN_LENGTH);
-    let keep = |token: &str| token.len() >= min && token.len() < max;
 
     let mut tokens: Vec<String> = Vec::new();
+    let mut emit = |token: &str, tokens: &mut Vec<String>| {
+        if token.len() >= max {
+            on_long_drop(token.len());
+        } else if token.len() >= min {
+            tokens.push(token.to_lowercase());
+        }
+    };
     let mut run_start: Option<usize> = None;
     for (index, ch) in text.char_indices() {
         if ch.is_ascii_alphanumeric() {
@@ -82,24 +113,15 @@ pub fn o2_tokenize(text: &str, min_len: usize, max_len: usize) -> impl Iterator<
         }
         // any other char ends the current ASCII run
         if let Some(start) = run_start.take() {
-            let token = &text[start..index];
-            if keep(token) {
-                tokens.push(token.to_lowercase());
-            }
+            emit(&text[start..index], &mut tokens);
         }
         if !ch.is_ascii() && ch.is_alphanumeric() {
             // one token per non-ASCII alphanumeric char (2..=4 bytes)
-            let token = &text[index..index + ch.len_utf8()];
-            if keep(token) {
-                tokens.push(token.to_lowercase());
-            }
+            emit(&text[index..index + ch.len_utf8()], &mut tokens);
         }
     }
     if let Some(start) = run_start {
-        let token = &text[start..];
-        if keep(token) {
-            tokens.push(token.to_lowercase());
-        }
+        emit(&text[start..], &mut tokens);
     }
     tokens.into_iter()
 }

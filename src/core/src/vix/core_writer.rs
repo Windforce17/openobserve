@@ -15005,6 +15005,7 @@ mod tests {
             index_size: 128,
             docs_size: 512,
             oversize_skipped: 0,
+            fts_long_token_skipped: 0,
             min_ts: 1_700_000_000_000_000,
             max_ts: 1_700_000_400_000_000,
             timings: Default::default(),

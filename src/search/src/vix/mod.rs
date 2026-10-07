@@ -2465,6 +2465,7 @@ fn evaluate_vix_index(
         &|field| field_capability(reader, field),
         &index_match_all_tokens,
         fulltext_servable,
+        &|field| reader.fts_tokens_complete(field),
     ) {
         Ok(built) => built,
         // M16 §4: the whole condition is ONE skipped conjunct
@@ -3000,7 +3001,9 @@ fn evaluate_vix_index(
 ///   it map to index queries directly.
 /// - [`FieldCap::Tokens`] — the field is full-text indexed in this file (token terms, no whole
 ///   values): equality / IN narrow to the value's tokens as a superset with the filter re-applied;
-///   other shapes skip.
+///   `str_match` narrows to the needle's decomposed token leaves the same way when the file's
+///   tokens for the field are complete (`VixReader::fts_tokens_complete`), else skips; other shapes
+///   skip.
 /// - [`FieldCap::Absent`] — the field is not a column of this file. The scan evaluates named
 ///   predicates per column, and a column the file lacks is NULL in every row, so never-TRUE-on-NULL
 ///   conditions become [`vortex_index::VixQuery::Nothing`], eliminating the file exactly instead of
@@ -4027,6 +4030,114 @@ mod tests {
         }
     }
 
+    /// `str_match` on an fts field whose tokens this file indexes
+    /// completely narrows to the needle's decomposed token leaves — the
+    /// rows containing the needle (inside a token, standalone, or inside a
+    /// long token) survive, with `has_skipped` (superset, filter
+    /// re-applied).
+    // requires fts_long_token_skips stamping (writer side, in flight):
+    // without the property the reader reports the tokens incomplete and
+    // the conjunct keeps the plain skip
+    #[test]
+    fn test_str_match_on_fts_field_narrows_to_token_superset_per_file() {
+        use arrow::{
+            array::{Int64Array, RecordBatch, StringArray},
+            datatypes::{DataType, Field, Schema},
+        };
+        use vortex_index::{VixWriter, VixWriterOptions};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("body", DataType::Utf8, true),
+        ]));
+        let opts = VixWriterOptions {
+            fts_field_names: vec!["body".to_string()],
+            // nothing dropped: the 79-byte token is indexed whole
+            max_token_len: 128,
+            ..Default::default()
+        };
+        let mut writer = VixWriter::new(&schema, opts, false);
+        let needle = "asagent1";
+        // the needle hidden inside a 79-byte token: indexed whole only
+        // because max_token_len is raised, and found only because the
+        // writer stamped zero long-token drops (fts_tokens_complete)
+        let long = format!("zz{needle}{}", "x".repeat(70));
+        let bodies = vec![
+            Some("xxasagent1yy"),        // needle inside a token
+            Some("asagent1 standalone"), // needle as a token
+            Some("asagent 1 split"),     // needle split across tokens
+            Some("unrelated words"),     // no needle
+            Some(long.as_str()),         // needle inside a long token
+        ];
+        let ts: Vec<i64> = (0..bodies.len() as i64).rev().map(|i| 100 - i).collect();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(ts.clone())),
+                Arc::new(StringArray::from(bodies)),
+            ],
+        )
+        .unwrap();
+        let sources: Vec<String> = ts
+            .iter()
+            .map(|t| format!(r#"{{"_timestamp":{t}}}"#))
+            .collect();
+        writer
+            .push_batch_with_source(&batch, &StringArray::from(sources), None)
+            .unwrap();
+        let reader = {
+            let (data, index) = writer.finish().unwrap();
+            VixReader::open_with_index(bytes::Bytes::from(data), index.map(bytes::Bytes::from))
+                .unwrap()
+        };
+        assert!(reader.fts_fields().contains("body"));
+        assert!(
+            reader.fts_tokens_complete("body"),
+            "the writer must stamp fts_long_token_skips for this file"
+        );
+
+        // the needle's rows survive the decomposition: inside a token, as
+        // a standalone token, and inside the 79-byte token (whole only
+        // because the file's tokens are complete); the split-token row and
+        // the unrelated row are absent
+        let condition = IndexCondition {
+            conditions: vec![Condition::StrMatch(
+                "body".to_string(),
+                needle.to_string(),
+                true,
+            )],
+        };
+        match evaluate_vix_index(
+            "t",
+            &reader,
+            &condition,
+            None,
+            (0, 1000),
+            true,
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        {
+            RawVixResult::Bitmap {
+                bitmap,
+                has_skipped,
+                ..
+            } => {
+                assert!(has_skipped, "the token decomposition is a superset");
+                assert_eq!(
+                    bitmap.set_indices().collect::<Vec<_>>(),
+                    vec![0, 1, 4],
+                    "rows with the needle inside a token (0, 4) or as a token (1) \
+                     survive; the split-token row (2) does not carry the needle in \
+                     any single token, the unrelated row (3) matches nothing"
+                );
+            }
+            other => panic!("expected a bitmap, got {other:?}"),
+        }
+    }
+
     /// Item 4 (2026-10-06): an aggregate over a SUPERSET predicate — an
     /// fts-field equality narrowed to its tokens, a multi-word `match_all`
     /// whose token AND is weaker than the SQL substring — is answered
@@ -4217,6 +4328,7 @@ mod tests {
                         &|field| field_capability(&reader, field),
                         &index_match_all_tokens,
                         true,
+                        &|field| reader.fts_tokens_complete(field),
                     )
                     .unwrap()
                     .0,
@@ -4610,6 +4722,7 @@ mod tests {
                     &|field| field_capability(&plist_file, field),
                     &index_match_all_tokens,
                     true,
+                    &|_| false,
                 )
                 .unwrap();
             assert!(!has_skipped);
@@ -4830,6 +4943,7 @@ mod tests {
                 &|field| field_capability(&reader, field),
                 &index_match_all_tokens,
                 true,
+                &|_| false,
             )
             .unwrap();
         let cursor = reader.single_term_plist_cursor(&query).unwrap().unwrap();
