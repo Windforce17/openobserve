@@ -1691,6 +1691,134 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     them from `_source` — a bounded heal wave (~320 files/day of retention)
     during which `match_all`/`str_match` on those files take the scan path;
     `request.body = '<json>'` becomes a token superset on rebuilt files.
+- **2026-10-08 — SHIPPED as `.207` (09:46Z): a superset LIMIT select is
+  refined to exact candidates in the index phase, so the pruner's
+  newest-first early stop applies — follow-up (C) above.** vix-arch
+  `57c23260d` (on `036d484d7`); `release/vix-20261008-207` `bb3ad5793` =
+  `.205` + that one commit (4 files, all `src/search` + an 8-line
+  `VixReader::docs_blob_len`); ECR `v0.93.0-vix-20261008.207` index
+  `sha256:d06e3b0f7b3f…`; GitOps #616 (querier line only) merged 09:45:36Z,
+  RS `596f797c7b` 09:45:54Z, 10/10 Ready 09:47Z, 0 restarts, Synced/
+  Healthy. Rollback: `newTag: v0.93.0-vix-20261007.205`. Gates: release
+  worktree vortex_index 370 / search 1129, core release check clean.
+  - **Mechanism.** `evaluate_vix_index` runs `residual::refine_superset`
+    for a `SimpleSelect` with `has_skipped` exactly as it has for the
+    aggregates since `.203`, under a new `residual::Shape::Select`: the
+    touched-chunk cap is byte-derived (`RESIDUAL_SELECT_MAX_BYTES` 64 MiB /
+    the file's average whole-chunk bytes, never below the aggregate's
+    `RESIDUAL_MAX_CHUNKS` 8 — 33 chunks on 2 MB `default/logs` chunks, 8 on
+    16 MiB ones; the production family `service AND str_match(body)` touches
+    14 of 57 chunks for 17 rows, refused by 8, admitted here for ~0.3 MB of
+    `body` segments), and the point reads go through the reader's OWN docs
+    handle (its footer is opened once for the refinement and the select
+    arm's `_timestamp` read — the aggregate keeps the detached handle). A
+    refined file returns exact `SelectCandidates`, so the best-first waves
+    stop once the newest files hold `limit` verified rows and the remaining
+    files are never opened; a refused select keeps the superset-to-scan
+    contract (row ids, filter re-applied) and counts `zo_vix_fast_path_
+    fallback_total{reason}`. The aggregate path is byte-identical in
+    behaviour (`Shape::Aggregate`). Prod pair `7513624602493386752aa3a`
+    (415k rows, 57 chunks): the service+body select went 6 batches /
+    1.0 MB superset → 14 batches / 3.0 MB exact (17 candidates), footer and
+    `_timestamp` batches shared with the select arm.
+  - **Pre/post battery, fixed windows (24 h = 10-07 08:00Z → 10-08 08:00Z,
+    6 h = 02:00–08:00Z), `ops:/tmp/battery_pre207_on205.jsonl` 09:29–09:35Z
+    on 18 h-warm `.205` pods; `battery_post207_smoke.jsonl` 09:48Z on
+    1-minute-old `.207` pods; `battery_post207.jsonl` 10:50Z (+1 h);
+    `battery_post207_3h_clean.jsonl` 12:54Z (+3 h). Every roll starts the
+    fleet at 0 % disk cache (the querier `data` volume is a generic
+    ephemeral PVC — all 10 pods logged `Loading disk cache done, total
+    files: 0`), and the querier nodes are spot `m7g.8xlarge`: three pods
+    were replaced during the day (`h7sxs` → `l5x4r` 09:54Z after
+    `NodeNotReady`; `qk9nh`/`spdpx` → `qtg4b`/`tcp4f` 11:18Z), each one
+    cold again. At +3 h the sidecars of the 24 h window are 99–100 % disk
+    cached on every pod, the DATA files of the scan-branch set 80–85 % on
+    the 09:46Z pods but 3–5 % on `l5x4r`/`tcp4f` (1.1–1.4 TB pulled per
+    pod, downloader normal queues pinned at the 10k cap on all 10 pods —
+    production traffic, not this window, fills them). Hits identical on
+    every row; the DESC top-100 was checked against the exact-path ground
+    truth (0 predicate violations, `count(*)` over `[min, end]` = 100 — the
+    upstream O2 answer for the same shape misses 31 of the true newest
+    100). wall (idx / scan) ms:**
+
+    | query | `.205` warm | `.207` +1 min, cold | `.207` +1 h | `.207` +3 h |
+    |---|---|---|---|---|
+    | service + `str_match(body,'Sending deploy callback')` 24 h SELECT LIMIT 100 DESC | 13,185 (12,123/1,018) **partial** | 2,541 (1,349/1,097) exact | 2,031 (1,276/704) exact | **1,233** (450/725) exact |
+    | … repeat | 1,858 (193/1,615) partial | 867 | 683 | 738 |
+    | … ASC | 11,390 (10,215/1,130) partial | 2,272 | 1,438 | **991** (19/924) |
+    | `str_match(body, …)` 24 h SELECT | 8,904 (8,135/728) partial | 889 (9/839) exact | 741 (28/632) exact | **622** (21/561) exact |
+    | `body = '…'` 24 h SELECT | 11,101 (10,038/1,014) partial | 1,587 (593/821) exact | 1,719 exact | **1,312** (383/866) exact |
+    | `str_match(body, …)` 6 h SELECT · repeat | 2,441 · 902 partial | 1,327 · 841 | 1,131 · 660 | **795 · 462** |
+    | dense-token 6 h SELECT | 2,949 (2,501/427) partial | 954 | 1,014 | **811** (141/650) |
+    | control: service-only 24 h SELECT (condition-ALL) | 647 (484/117) | 1,063 (427/595) | 837 (288/478) | 1,098 (207/845) |
+    | control: `str_match(error,'southamerica-east1')` 24 h SELECT, 6 hits | 5,926 (5,731/154) | 10,358 (10,223/96) | 9,781 (9,676/43) | **659** (441/183) |
+    | control: histogram service + body 24 h | 8,990 (5,503/3,445) | 14,011 (8,551/5,390) | 13,250 (9,512/3,675) | 9,839 (**3,633**/6,131) |
+    | control: count service + body 24 h | 6,523 (4,268/2,213) | 11,239 (8,213/2,976) | 7,133 (1,923/5,160) | 13,686 (4,683/8,959) |
+    | control: apisix 6 h · repeat | 2,473 · 1,044 | 2,174 · 869 | 1,612 · 42 | 37 · 53 |
+
+    The target family is exact (`is_partial` gone, so the repeat is a
+    result-cache hit) and faster — the 24 h shapes 6–12× at +1 h, the 6 h
+    shapes 2–3×; the index phase of the lone `str_match(body)` select fell
+    from 8.1 s to 9–28 ms (first wave only).
+    The four slower controls are the cold fleet, attributed per follower,
+    and the +3 h leg settles each one:
+    - **histogram / count: the skip-rate bail (#32) fired — on 5 of 9
+      followers at +1 min (`29–32 of 32 sampled files skipped`), on `l5x4r`
+      alone at +1 h, on none of the warm `.205` followers and on none at
+      +3 h.** The aggregate residual refuses a file BEFORE any docs IO
+      (candidate rows → touched chunks from the resident zone table,
+      `residual.rs:242-249`) while an accepted refinement pays ≥ 1 docs
+      round trip, so on a cold cache the first 32 completions are the
+      refusals: a 28 % refusal rate (395–442 of ~1,400–1,530 files per
+      follower, the same on `.205`) samples as ≥ 90 %, and every remaining
+      file goes to the scan branch — 1,220–1,401 files "cannot produce
+      exact vix candidates" per bailed follower vs ~400 on the others.
+      Code path unchanged by `.207`; the sampling bias is the bug — **(D)
+      below**. At +3 h the histogram's INDEX phase is faster than `.205`
+      (3.6 vs 5.5 s; 1,650–1,840 ranges / 150–230 MB per follower at 0–4 %
+      remote) and what remains above `.205` is the SCAN phase over the
+      same ~400 fallback files per follower (6.1 vs 3.4 s; count 9.0 vs
+      2.2 s): their data is 80–85 % disk cached on the 09:46Z pods and
+      3–5 % on `l5x4r`/`tcp4f` — the 10-way fan-out waits for the pod
+      reading 30 GB of compressed data from S3. The count's two 11:18Z
+      pods also re-read the index phase (7.5k ranges / 1.7 GB each at 32 %
+      remote vs 900 / 150 MB on the eight pods that still held the
+      histogram's memoised bitmaps).
+    - **`str_match(error, …)`**: per follower `.205` 1,340–1,540 ranges /
+      8–10 MB (a dictionary probe per file against reader-cached footers,
+      0.5–5.7 s, the tail of it `evaluation_wait` on the byte gate) vs
+      `.207` +1 min 2,950–4,140 ranges / 0.7–1.2 GB at 100 % remote,
+      ~100 ms per GET (every file a cold open: 768 KiB eager tail + dict
+      block); at +1 h the nine warm followers did 155–370 ranges / 28–93 MB
+      in 1.4–5.2 s and `l5x4r` 4,211 ranges / 1.15 GB / 9.7 s = the query;
+      **at +3 h 659 ms (441/183), 9× under `.205`**. A second-order `.207`
+      effect kept this shape colder in the first hour: the superset
+      selects that run earlier in the battery used to open every file of
+      the 24 h window (pre-warming the reader cache for the lone
+      `str_match`); now they stop after the newest wave.
+    - service-only select: index 484 → 207–288 ms, scan 117 → 478–845 ms —
+      the scan's data reads on the data-cold followers (`8psd5`/`qtg4b`
+      the only ones with remote index reads at +3 h) [per-row data IO not
+      attributed].
+    - Verdict: **keep `.207`**. At +3 h the 24 h target shapes are 8–14×
+      under `.205`, the 6 h ones 3–3.6×, all exact; the controls' index
+      phases are under `.205` except the count's (4.7 vs 4.3 s: the two
+      11:18Z pods' 1.7 GB re-read); the residual scan-phase gap is the
+      spot-churned data cache. A first 12:50Z run of the +3 h battery
+      collided with a stale copy of itself (two writers on one file —
+      discarded; `battery_post207_3h_clean.jsonl` is the leg).
+  - **(D) follow-up — the skip-rate bail samples completion order.** It
+    judges the condition from the first `BAIL_SAMPLE_FILES` (32) files to
+    COMPLETE, and completion order is latency-biased toward the cheapest
+    outcome (a zero-IO refusal, an unservable file) whenever the cache is
+    cold — exactly when a wrong bail costs most (a whole-window scan on a
+    cold fleet). Judge instead on the first 32 tasks in submission order
+    (already time-mixed since `.195`), i.e. hold the verdict until those
+    32 have all reported. Not shipped; the `.207` numbers above are the
+    evidence.
+  - **(B) stays open** (scoped `Contains` hold-back for `str_match(error,
+    …)`-style lone needles on fts fields): its first-run cost is the walk
+    plus, now, the cold opens no earlier query pre-pays.
 
 ## 2026-09-29 — P2 shipped as `.176` and rolled back within 30 min: the per-stream side table stalled the shared meta DB (commit latency 40–60×, ingest 503s); ranges must live in the segment row
 - What shipped (vix-arch `013c45010` + NATS retry `76fe754b5`, image
