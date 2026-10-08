@@ -1601,6 +1601,14 @@ impl VixReader {
         })
     }
 
+    /// Encoded size of the `docs` blob (every stored column, all chunks).
+    pub fn docs_blob_len(&self) -> u64 {
+        match &self.docs_blob {
+            BlobHandle::Mem(bytes) => bytes.len() as u64,
+            BlobHandle::Ranged(ranged) => ranged.len(),
+        }
+    }
+
     /// Subscribe to current size and committed growth. The caller owns the
     /// observer strongly for exactly the lifetime of its cache identity.
     /// Admission refusal or cancellation leaves the observer unregistered.

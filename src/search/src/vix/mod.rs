@@ -2499,9 +2499,10 @@ fn evaluate_vix_index(
     // M16 §4: the (single) skipped conjunct is served exactly by the stats
     // bitmap — the evaluation is no longer a weaker predicate
     let has_skipped = has_skipped && stats_eq.is_none();
-    // A superset under an aggregate mode is refined to the exact match set
-    // in the index phase (`residual`, below the bitmap memo) — the file
-    // falls to the scan branch only when the refinement is refused.
+    // A superset under an aggregate or LIMIT-select mode is refined to the
+    // exact match set in the index phase (`residual`, below the bitmap
+    // memo) — an aggregate falls to the scan branch when the refinement is
+    // refused, a select keeps its superset candidates for the scan.
 
     // This answer precedes docs availability and posting evaluation. Only a
     // whole-file single bucket and the entire ALL/positive same-field IN
@@ -2668,14 +2669,30 @@ fn evaluate_vix_index(
     // memoised under the superset key by `superset_bitmap`. A refused
     // refinement (too many candidates, a column this file cannot serve)
     // is the pre-existing scan-branch fallback, with the reason counted.
-    let residual: Option<BooleanBuffer> = if aggregate && has_skipped {
+    //
+    // A LIMIT select is refined the same way: exact per-file candidates are
+    // what the best-first waves and the pruner's early stop run on, so a
+    // superset select (a `str_match` / equality on a token-indexed field)
+    // stops after the newest files hold `limit` verified rows instead of
+    // sending every file's candidates to a scan that must see them all
+    // before its TopK can answer. A refused select keeps today's superset
+    // contract — the candidate rows go to the scan branch with the filter
+    // re-applied — and the refusal is counted as a fast-path fallback.
+    let select = matches!(idx_optimize_rule, Some(IndexOptimizeMode::SimpleSelect(..)));
+    let residual: Option<BooleanBuffer> = if (aggregate || select) && has_skipped {
         let superset = superset_bitmap(reader)?;
+        let shape = if select {
+            residual::Shape::Select
+        } else {
+            residual::Shape::Aggregate
+        };
         match residual::refine_superset(
             reader,
             condition,
             &inexact,
             scope_full_text_fields,
             &superset,
+            shape,
         )? {
             Ok(exact) => {
                 log::debug!(
@@ -2685,7 +2702,20 @@ fn evaluate_vix_index(
                 );
                 Some(exact)
             }
-            Err(refusal) => return Err(collect::AggregateFallback(refusal.reason()).into()),
+            Err(refusal) if aggregate => {
+                return Err(collect::AggregateFallback(refusal.reason()).into());
+            }
+            Err(refusal) => {
+                log::debug!(
+                    "[trace_id {trace_id}] search->vix: select keeps the superset of {} candidate rows: {}",
+                    superset.count_set_bits(),
+                    refusal.reason(),
+                );
+                metrics::VIX_FAST_PATH_FALLBACK_TOTAL
+                    .with_label_values(&[refusal.reason()])
+                    .inc();
+                None
+            }
         }
     } else {
         None
@@ -2727,8 +2757,10 @@ fn evaluate_vix_index(
             Ok(RawVixResult::Count { count, has_skipped })
         }
         Some(IndexOptimizeMode::SimpleSelect(limit, ascend)) if !has_skipped => {
-            // exact candidates only when no condition was skipped: every
-            // candidate row must survive a re-applied filter
+            // exact candidates only: no condition skipped, or the skipped
+            // ones refined by the residual above — every candidate row
+            // survives the filter, so the pruner may count it. A refused
+            // superset select falls to the row-id arm below.
             let bitmap = eval_bitmap(reader)?;
             let candidates = collect::simple_select(reader, &bitmap, limit, ascend)?;
             Ok(RawVixResult::SelectCandidates {
@@ -4327,15 +4359,32 @@ mod tests {
             .unwrap();
         assert_eq!(superset.count_set_bits(), 3);
         assert_eq!(
-            residual::refine_superset_within(&reader, &equality, &[0], &fts, &superset, 2, 8)
-                .unwrap()
-                .unwrap_err(),
+            residual::refine_superset_within(
+                &reader,
+                &equality,
+                &[0],
+                &fts,
+                &superset,
+                2,
+                8,
+                residual::Shape::Aggregate,
+            )
+            .unwrap()
+            .unwrap_err(),
             residual::Refusal::TooManyRows(3)
         );
-        let exact =
-            residual::refine_superset_within(&reader, &equality, &[0], &fts, &superset, 3, 8)
-                .unwrap()
-                .unwrap();
+        let exact = residual::refine_superset_within(
+            &reader,
+            &equality,
+            &[0],
+            &fts,
+            &superset,
+            3,
+            8,
+            residual::Shape::Aggregate,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(exact.set_indices().collect::<Vec<_>>(), vec![0]);
     }
 

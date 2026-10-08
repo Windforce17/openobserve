@@ -35,23 +35,74 @@
 //! run on it unchanged, the per-file result memoises as exact, and the scan
 //! branch never sees the file.
 //!
+//! A LIMIT select (`SimpleSelect`) is refined for the same reason: its
+//! best-first waves and early stop ([`super::pruner`]) only count EXACT
+//! candidates, so a superset select used to send every file's candidate
+//! rows to a scan whose TopK had to see all of them. Refined, the newest
+//! files' verified rows satisfy the limit and the remaining files are never
+//! opened. A refused select keeps its superset candidates for the scan.
+//! The two shapes differ in two bounded ways ([`Shape`]): the touched-chunk
+//! cap and the docs handle the point reads go through.
+//!
 //! Bounded on purpose: a superset that is most of the file (a dense token,
 //! a value present in every row) would make the refinement a column scan of
 //! the file under the index phase's concurrency, so above
-//! [`RESIDUAL_MAX_ROWS`] candidates or [`RESIDUAL_MAX_CHUNKS`] touched docs
-//! chunks the file keeps today's fallback. Only string-typed predicate
-//! columns qualify: numeric drift rows carry scan-side coercions this path
-//! does not reproduce.
+//! [`RESIDUAL_MAX_ROWS`] candidates or the shape's touched-chunk cap
+//! ([`RESIDUAL_MAX_CHUNKS`], [`select_chunk_cap`]) the file keeps today's
+//! fallback. Only string-typed predicate columns qualify: numeric drift
+//! rows carry scan-side coercions this path does not reproduce.
 
 use arrow::{
-    array::{Array, BooleanArray, BooleanBufferBuilder},
+    array::{Array, BooleanArray, BooleanBufferBuilder, RecordBatch},
     buffer::BooleanBuffer,
 };
-use arrow_schema::DataType;
+use arrow_schema::{DataType, SchemaRef};
 use datafusion::{physical_plan::ColumnarValue, scalar::ScalarValue};
-use vortex_index::VixReader;
+use vortex_index::{DocsPointReader, VixReader};
 
 use crate::index::{Condition, IndexCondition};
+
+/// The optimize-mode family a refinement serves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Shape {
+    /// Count / histogram / top-N: every file of the window is refined (no
+    /// early stop), so the chunk cap is the fixed [`RESIDUAL_MAX_CHUNKS`],
+    /// and the point reads go through a DETACHED docs handle — its footer
+    /// window dies with the refinement instead of being retained per file
+    /// in the reader cache ([`VixReader::detached_docs`]); the collectors
+    /// mostly fold the exact rows through the zone table without opening
+    /// the docs blob themselves.
+    Aggregate,
+    /// `ORDER BY _timestamp LIMIT n`: only the best-first waves the early
+    /// stop needs are refined, under [`select_chunk_cap`], and the point
+    /// reads go through the reader's OWN docs blob — the select arm reads
+    /// the exact candidates' `_timestamp` through it right after, so the
+    /// footer (1.4 MB, two round trips on a wide production file) is
+    /// opened once for both instead of a detached open AND a retained one.
+    Select,
+}
+
+/// The docs handle a refinement's point reads go through (see [`Shape`]).
+enum Docs<'a> {
+    Detached(DocsPointReader<'a>),
+    Retained(&'a VixReader),
+}
+
+impl Docs<'_> {
+    fn schema(&self) -> anyhow::Result<SchemaRef> {
+        match self {
+            Docs::Detached(docs) => docs.schema(),
+            Docs::Retained(reader) => reader.docs_schema(),
+        }
+    }
+
+    fn read_columns_rows(&self, names: &[&str], rows: &[u64]) -> anyhow::Result<RecordBatch> {
+        match self {
+            Docs::Detached(docs) => docs.read_columns_rows(names, rows),
+            Docs::Retained(reader) => Ok(reader.read_docs_columns_rows(names, rows)?),
+        }
+    }
+}
 
 /// Most candidate rows a superset may hold to be refined in the index phase.
 /// The production family this serves (`match_all(phrase) AND service AND
@@ -59,9 +110,50 @@ use crate::index::{Condition, IndexCondition};
 /// ~4 per file over 2,300 files per follower.
 pub(super) const RESIDUAL_MAX_ROWS: usize = 4096;
 
-/// Most docs chunks the candidates may touch: each one is a column read of
-/// a few MB on merged files, in the one round trip the point read costs.
+/// Most docs chunks an aggregate's candidates may touch: each one is a
+/// column read of a few MB on merged files, in the one round trip the point
+/// read costs — and every file of the window pays it, aggregates have no
+/// early stop.
 pub(super) const RESIDUAL_MAX_CHUNKS: usize = 8;
+
+/// Byte budget behind [`select_chunk_cap`]: the WHOLE-chunk bytes (every
+/// stored column) the touched chunks of a LIMIT select's candidates may
+/// sum to. A loose upper bound of what the refinement reads — it decodes
+/// only the predicate columns' segments of those chunks (`body` measured
+/// at ~1 % of a merged `default/logs` chunk: 20 KB of 2.0 MB) — that needs
+/// no footer: the docs blob's length over its chunk count.
+pub(super) const RESIDUAL_SELECT_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Most docs chunks a LIMIT select's candidates may touch: the chunks
+/// [`RESIDUAL_SELECT_MAX_BYTES`] covers at this file's average chunk size,
+/// never below [`RESIDUAL_MAX_CHUNKS`]. A select refines only the
+/// best-first waves its early stop needs, and a row-selected file the
+/// refinement does not verify is scanned for ALL its projected columns on
+/// the same chunks — so the per-file bound follows the memory the point
+/// read may hold, not the fixed aggregate count: 2 MB chunks (a merged
+/// `default/logs` file, 7k rows each) admit 33, 16 MiB chunks the
+/// aggregate's 8. The production family (`service AND str_match(body)`,
+/// 17 rows in 14 of 57 chunks per file) is refused by the aggregate cap
+/// and admitted here for ~0.3 MB of `body` segments per file.
+pub(super) fn select_chunk_cap(reader: &VixReader) -> usize {
+    let chunks = match reader.zone_chunks() {
+        Some(chunks) => chunks.len() as u64,
+        None => {
+            let group = reader.row_group_size() as u64;
+            if group == 0 {
+                return RESIDUAL_MAX_CHUNKS;
+            }
+            reader.row_count().div_ceil(group)
+        }
+    };
+    if chunks == 0 {
+        return RESIDUAL_MAX_CHUNKS;
+    }
+    let avg_chunk_bytes = (reader.docs_blob_len() / chunks).max(1);
+    usize::try_from(RESIDUAL_SELECT_MAX_BYTES / avg_chunk_bytes)
+        .unwrap_or(usize::MAX)
+        .max(RESIDUAL_MAX_CHUNKS)
+}
 
 /// Why a superset was not refined; the caller falls back to the scan branch
 /// exactly as before and the reason reaches the fast-path fallback counter.
@@ -102,6 +194,9 @@ impl Refusal {
 /// `IS NOT NULL AND ... LIKE` is false on NULL, so the disjunct contributes
 /// nothing either way.
 ///
+/// `shape` picks the touched-chunk cap and the docs handle (see
+/// [`Shape`]).
+///
 /// `Ok(Ok(exact))` is a bitmap of the reader's row count; an empty superset
 /// is returned as-is (exact already). Errors are read/evaluation failures.
 pub(super) fn refine_superset(
@@ -110,7 +205,12 @@ pub(super) fn refine_superset(
     inexact: &[usize],
     fts_fields: &[String],
     bitmap: &BooleanBuffer,
+    shape: Shape,
 ) -> anyhow::Result<Result<BooleanBuffer, Refusal>> {
+    let max_chunks = match shape {
+        Shape::Aggregate => RESIDUAL_MAX_CHUNKS,
+        Shape::Select => select_chunk_cap(reader),
+    };
     refine_superset_within(
         reader,
         condition,
@@ -118,11 +218,13 @@ pub(super) fn refine_superset(
         fts_fields,
         bitmap,
         RESIDUAL_MAX_ROWS,
-        RESIDUAL_MAX_CHUNKS,
+        max_chunks,
+        shape,
     )
 }
 
 /// [`refine_superset`] with explicit candidate-row and touched-chunk caps.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn refine_superset_within(
     reader: &VixReader,
     condition: &IndexCondition,
@@ -131,6 +233,7 @@ pub(super) fn refine_superset_within(
     bitmap: &BooleanBuffer,
     max_rows: usize,
     max_chunks: usize,
+    shape: Shape,
 ) -> anyhow::Result<Result<BooleanBuffer, Refusal>> {
     let candidates = bitmap.count_set_bits();
     if candidates == 0 || inexact.is_empty() {
@@ -153,9 +256,13 @@ pub(super) fn refine_superset_within(
     }
 
     // the docs-blob footer — the one cost the scan branch paid per file
-    // too — through a handle the cached reader does not retain (see
-    // `VixReader::detached_docs`)
-    let docs = reader.detached_docs();
+    // too: detached for an aggregate (the cached reader does not retain
+    // it), the reader's own for a select (opened once with the select
+    // arm's `_timestamp` read)
+    let docs = match shape {
+        Shape::Aggregate => Docs::Detached(reader.detached_docs()),
+        Shape::Select => Docs::Retained(reader),
+    };
     let schema = docs.schema()?;
     let present_fts: Vec<String> = fts_fields
         .iter()
@@ -227,7 +334,7 @@ pub(super) fn refine_superset_within(
 /// the rows that evaluate TRUE, or `None` when the conjunct has no physical
 /// form over these columns.
 fn evaluate_rows(
-    docs: &vortex_index::DocsPointReader<'_>,
+    docs: &Docs<'_>,
     conjunct: &Condition,
     fst_scope: &[String],
     columns: &[&str],

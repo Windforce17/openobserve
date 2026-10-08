@@ -1259,6 +1259,14 @@ async fn cached_sparse_object_refuses_its_real_owner_before_any_fetch() {
 }
 
 fn full_text_scope_fixture() -> (Bytes, Bytes, RecordBatch) {
+    full_text_scope_fixture_at(0)
+}
+
+/// [`full_text_scope_fixture`] with every `_timestamp` shifted by
+/// `ts_offset`: rows at `ts_offset + 100 ..= ts_offset + 94`, the phrase
+/// `alpha beta` held exactly by the rows at `+98` (active) and `+94`
+/// (historical), while `+97`, `+96`, `+95` only carry its tokens.
+fn full_text_scope_fixture_at(ts_offset: i64) -> (Bytes, Bytes, RecordBatch) {
     let schema = Arc::new(Schema::new(vec![
         Field::new("_timestamp", DataType::Int64, false),
         Field::new("active", DataType::Utf8, false),
@@ -1268,7 +1276,12 @@ fn full_text_scope_fixture() -> (Bytes, Bytes, RecordBatch) {
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![
-            Arc::new(Int64Array::from(vec![100, 99, 98, 97, 96, 95, 94])),
+            Arc::new(Int64Array::from(
+                [100i64, 99, 98, 97, 96, 95, 94]
+                    .iter()
+                    .map(|ts| ts + ts_offset)
+                    .collect::<Vec<_>>(),
+            )),
             Arc::new(StringArray::from(vec![
                 "needle hay",
                 "plain",
@@ -1643,6 +1656,570 @@ async fn multiword_full_text_aggregates_are_refined_to_the_exact_residual_rows()
         }
     }
     reader_cache::GLOBAL_CACHE.remove(&file.key);
+}
+
+/// A superset select (the phrase's token AND is weaker than the substring)
+/// is refined in the index phase to EXACT candidates: the pruner may count
+/// them, the winners carry an exact selection, and no filter is added back.
+#[test]
+fn superset_select_is_refined_to_exact_candidates() {
+    let (data, index, _) = full_text_scope_fixture();
+    let reader = VixReader::open_with_index(data, Some(index)).unwrap();
+    let scope = vec!["active".to_string(), "historical".to_string()];
+    let condition = IndexCondition {
+        conditions: vec![Condition::MatchAll("alpha beta".into())],
+    };
+    let (candidates, skipped) = scoped_rows(&reader, &condition, &scope);
+    assert!(skipped);
+    assert_eq!(candidates, vec![2, 3, 4, 5, 6], "five token candidates");
+    let select = |limit, ascend| match evaluate_vix_index(
+        "superset-select",
+        &reader,
+        &condition,
+        Some(IndexOptimizeMode::SimpleSelect(limit, ascend)),
+        (90, 110),
+        true,
+        Some((94, 100)),
+        None,
+        Some(&scope),
+    )
+    .unwrap()
+    {
+        RawVixResult::SelectCandidates { candidates, .. } => candidates,
+        other => panic!("expected exact select candidates, got {other:?}"),
+    };
+    // only the two rows holding the phrase survive, newest first
+    assert_eq!(select(10, false), vec![(98, 2), (94, 6)]);
+    assert_eq!(select(1, false), vec![(98, 2)]);
+    assert_eq!(select(1, true), vec![(94, 6)]);
+}
+
+/// End to end over 70 files in time order, `LIMIT 2 DESC` on the superset
+/// phrase: the first wave (the 64 newest files) holds verified rows that
+/// outrank every remaining file, so the 6 oldest files are dropped before
+/// they are opened — they are unopenable here (no object size) and would
+/// otherwise keep the file list and force the filter back. The winners are
+/// the newest file's two phrase rows, as an exact selection.
+#[tokio::test(flavor = "multi_thread")]
+async fn superset_select_stops_after_the_wave_that_satisfies_the_limit() {
+    const FILES: i64 = 70;
+    const UNOPENABLE: i64 = 6;
+    let scope = vec!["active".to_string(), "historical".to_string()];
+    let condition = IndexCondition {
+        conditions: vec![Condition::MatchAll("alpha beta".into())],
+    };
+    let key = |i: i64| format!("files/org/logs/fts-select-prune/2026/01/01/00/f{i:03}.vix");
+    let mut files = Vec::new();
+    for i in 0..FILES {
+        let offset = i * 1_000;
+        let (data, index, _) = full_text_scope_fixture_at(offset);
+        let openable = i >= UNOPENABLE;
+        let file = FileKey {
+            key: key(i),
+            meta: config::meta::stream::FileMeta {
+                min_ts: offset + 94,
+                max_ts: offset + 100,
+                records: 7,
+                // the oldest files carry no object size: opening them is a
+                // deterministic refusal, so they must never be reached
+                compressed_size: if openable { data.len() as i64 } else { 0 },
+                index_size: index.len() as i64,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        if openable {
+            let reader = VixReader::open_with_index(data, Some(index)).unwrap();
+            reader_cache::GLOBAL_CACHE
+                .put(
+                    reader_cache::ReaderCacheKey::new(file.key.clone(), 0, file.meta.index_size),
+                    reader,
+                )
+                .unwrap();
+        }
+        files.push(file);
+    }
+    let params = Arc::new(crate::types::QueryParams {
+        trace_id: "superset-select-prune".into(),
+        org_id: "org".into(),
+        stream: datafusion::sql::TableReference::from("fts-select-prune"),
+        stream_type: StreamType::Logs,
+        stream_name: "fts-select-prune".into(),
+        time_range: (0, FILES * 1_000 + 1_000),
+        work_group: None,
+        use_inverted_index: true,
+        full_text_fields: Some(scope),
+    });
+    let (_, filter_back, answer) = vix_search(
+        params,
+        &mut files,
+        Some(condition),
+        Some(IndexOptimizeMode::SimpleSelect(2, false)),
+    )
+    .await
+    .unwrap();
+    for i in 0..FILES {
+        reader_cache::GLOBAL_CACHE.remove(&key(i));
+    }
+    assert!(!filter_back, "every evaluated file answered exactly");
+    assert!(matches!(answer, MultiResult::SimpleSelect(_)), "{answer:?}");
+    assert_eq!(
+        files.len(),
+        1,
+        "only the newest file holds winners: {files:?}"
+    );
+    let newest = &files[0];
+    assert_eq!(newest.key, key(FILES - 1));
+    assert!(newest.selection_exact);
+    match &newest.selection {
+        Some(FileSelection::Rows(rows)) => {
+            assert_eq!(
+                rows.iter().collect::<Vec<_>>(),
+                vec![2, 6],
+                "the two phrase rows"
+            );
+        }
+        other => panic!("expected an exact row selection, got {other:?}"),
+    }
+}
+
+/// A superset wider than the residual's row cap is refused: the select
+/// keeps today's contract (candidate rows to the scan, filter re-applied)
+/// instead of turning the index phase into a column scan of the file.
+#[test]
+fn dense_superset_select_keeps_the_superset_contract() {
+    let rows = residual::RESIDUAL_MAX_ROWS + 8;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("_timestamp", DataType::Int64, false),
+        Field::new("body", DataType::Utf8, false),
+    ]));
+    // every row carries both tokens; only the first holds the phrase
+    let body: Vec<&str> = (0..rows)
+        .map(|i| {
+            if i == 0 {
+                "alpha beta"
+            } else {
+                "alpha gap beta"
+            }
+        })
+        .collect();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(
+                (0..rows as i64).map(|i| 1_000_000 - i).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(body)),
+        ],
+    )
+    .unwrap();
+    let mut writer = vortex_index::VixWriter::new(
+        &schema,
+        VixWriterOptions {
+            fts_field_names: vec!["body".into()],
+            ..Default::default()
+        },
+        false,
+    );
+    writer
+        .push_batch_with_source(&batch, &StringArray::from(vec!["{}"; rows]), None)
+        .unwrap();
+    let (data, index) = writer.finish().unwrap();
+    let reader =
+        VixReader::open_with_index(Bytes::from(data), Some(Bytes::from(index.unwrap()))).unwrap();
+    let scope = vec!["body".to_string()];
+    let condition = IndexCondition {
+        conditions: vec![Condition::MatchAll("alpha beta".into())],
+    };
+    match evaluate_vix_index(
+        "dense-superset-select",
+        &reader,
+        &condition,
+        Some(IndexOptimizeMode::SimpleSelect(10, false)),
+        (0, 2_000_000),
+        true,
+        Some((1_000_000 - rows as i64 + 1, 1_000_000)),
+        None,
+        Some(&scope),
+    )
+    .unwrap()
+    {
+        RawVixResult::Bitmap {
+            bitmap,
+            has_skipped,
+            ..
+        } => {
+            assert!(has_skipped, "the refused select stays a superset");
+            assert_eq!(bitmap.count_set_bits(), rows);
+        }
+        other => panic!("expected the superset row-id result, got {other:?}"),
+    }
+}
+
+/// The production select family's geometry: a few candidate rows spread
+/// over more docs chunks than the aggregate cap admits (17 rows in 14 of
+/// 57 chunks on a merged `default/logs` file). The aggregate falls back on
+/// those files; the select's cap follows the file's chunk size, so the
+/// same superset is refined to exact candidates — and the retained docs
+/// footer serves both the refinement and the candidates' `_timestamp`.
+#[test]
+fn sparse_superset_select_is_refined_past_the_aggregate_chunk_cap() {
+    const CHUNK_ROWS: usize = 64;
+    const CHUNKS: usize = 16;
+    const SPREAD: usize = 12;
+    let rows = CHUNK_ROWS * CHUNKS;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("_timestamp", DataType::Int64, false),
+        Field::new("body", DataType::Utf8, false),
+    ]));
+    // one candidate row at the head of each of the first SPREAD chunks:
+    // the even ones hold the phrase, the odd ones only its tokens
+    let body: Vec<&str> = (0..rows)
+        .map(|i| match (i % CHUNK_ROWS, i / CHUNK_ROWS) {
+            (0, chunk) if chunk < SPREAD && chunk % 2 == 0 => "alpha beta",
+            (0, chunk) if chunk < SPREAD => "alpha gap beta",
+            _ => "noise",
+        })
+        .collect();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(
+                (0..rows as i64).map(|i| 1_000_000 - i).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(body)),
+        ],
+    )
+    .unwrap();
+    let mut writer = vortex_index::VixWriter::new(
+        &schema,
+        VixWriterOptions {
+            fts_field_names: vec!["body".into()],
+            docs_chunk_bytes: 1, // the 64-row chunk floor: CHUNK_ROWS per docs chunk
+            ..Default::default()
+        },
+        false,
+    );
+    writer
+        .push_batch_with_source(&batch, &StringArray::from(vec!["{}"; rows]), None)
+        .unwrap();
+    let (data, index) = writer.finish().unwrap();
+    let reader =
+        VixReader::open_with_index(Bytes::from(data), Some(Bytes::from(index.unwrap()))).unwrap();
+    assert_eq!(
+        reader.zone_chunks().map(<[_]>::len),
+        Some(CHUNKS),
+        "one zone chunk per 64-row docs chunk"
+    );
+    assert!(
+        residual::select_chunk_cap(&reader) >= SPREAD,
+        "small chunks: the select cap admits the spread"
+    );
+    let scope = vec!["body".to_string()];
+    let condition = IndexCondition {
+        conditions: vec![Condition::MatchAll("alpha beta".into())],
+    };
+    let (candidates, skipped) = scoped_rows(&reader, &condition, &scope);
+    assert!(skipped, "the phrase is a token superset");
+    assert_eq!(candidates.len(), SPREAD, "one candidate per touched chunk");
+    let evaluate = |rule| {
+        evaluate_vix_index(
+            "sparse-superset-select",
+            &reader,
+            &condition,
+            Some(rule),
+            (0, 2_000_000),
+            true,
+            Some((1_000_000 - rows as i64 + 1, 1_000_000)),
+            None,
+            Some(&scope),
+        )
+    };
+    // the aggregate is refused by its fixed chunk cap: scan-branch fallback
+    let error = evaluate(IndexOptimizeMode::SimpleCount).unwrap_err();
+    assert_eq!(
+        error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<collect::AggregateFallback>())
+            .map(|fallback| fallback.0),
+        Some("residual: too many candidate chunks"),
+        "{error:?}"
+    );
+    // the select is refined: exactly the phrase rows, newest first
+    match evaluate(IndexOptimizeMode::SimpleSelect(100, false)).unwrap() {
+        RawVixResult::SelectCandidates { candidates, .. } => {
+            let expected: Vec<(i64, u32)> = (0..SPREAD)
+                .step_by(2)
+                .map(|chunk| {
+                    let row = (chunk * CHUNK_ROWS) as u32;
+                    (1_000_000 - row as i64, row)
+                })
+                .collect();
+            assert_eq!(*candidates, expected);
+        }
+        other => panic!("expected exact select candidates, got {other:?}"),
+    }
+}
+
+/// Diagnostic: the production superset LIMIT-select shape on a REAL
+/// `default/logs` pair (`VIX_BENCH_FILE` = the `.vix`, its `.vxi` alongside;
+/// `body` full-text indexed, `service_name` term-indexed as in prod):
+/// `service_name = VIX_BENCH_SERVICE AND str_match(body, VIX_BENCH_PHRASE)
+/// ORDER BY _timestamp DESC LIMIT 100`, plus the lone body `str_match`.
+/// Each pass opens a fresh ranged reader through a 20 ms latency source and
+/// prints index batches / bytes / dependent waves / ms: the row-id pass is
+/// what every file paid before (its superset then went to the scan), the
+/// select pass is the residual-refined exact candidate set the pruner can
+/// stop on. Ground truth comes from the columns. Without
+/// `VIX_BENCH_SERVICE` the most frequent service among the phrase rows is
+/// used, and the top services of the file are printed.
+#[test]
+#[ignore = "diagnostic; run with VIX_BENCH_FILE set"]
+fn prod_file_superset_select_cost() {
+    use arrow::array::StringArray;
+
+    let path = std::env::var("VIX_BENCH_FILE").expect("VIX_BENCH_FILE");
+    let phrase =
+        std::env::var("VIX_BENCH_PHRASE").unwrap_or_else(|_| "Sending deploy callback".into());
+    let limit: usize = std::env::var("VIX_BENCH_LIMIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100);
+    let data = Bytes::from(std::fs::read(&path).unwrap());
+    let index =
+        Bytes::from(std::fs::read(std::path::Path::new(&path).with_extension("vxi")).unwrap());
+    let memory = VixReader::open_with_index(data.clone(), Some(index.clone())).unwrap();
+    assert!(
+        memory.fts_fields().contains("body"),
+        "body must be full-text indexed"
+    );
+    let column = |name: &str| -> StringArray {
+        let column = memory.read_docs_column(name).unwrap();
+        arrow::compute::cast(&column, &DataType::Utf8)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .clone()
+    };
+    let service = column("service_name");
+    let body = column("body");
+    let rows = body.len();
+    let phrase_rows: Vec<usize> = (0..rows)
+        .filter(|&i| body.is_valid(i) && body.value(i).contains(&phrase))
+        .collect();
+    let mut by_service: BTreeMap<&str, usize> = BTreeMap::new();
+    for i in 0..rows {
+        if service.is_valid(i) {
+            *by_service.entry(service.value(i)).or_default() += 1;
+        }
+    }
+    let mut top: Vec<(&str, usize)> = by_service.iter().map(|(k, v)| (*k, *v)).collect();
+    top.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+    eprintln!(
+        "{rows} rows, {} services (top: {:?}), {} rows hold the phrase {phrase:?}",
+        by_service.len(),
+        &top[..top.len().min(6)],
+        phrase_rows.len(),
+    );
+    let service_value = std::env::var("VIX_BENCH_SERVICE").unwrap_or_else(|_| {
+        let mut among: BTreeMap<&str, usize> = BTreeMap::new();
+        for &i in &phrase_rows {
+            if service.is_valid(i) {
+                *among.entry(service.value(i)).or_default() += 1;
+            }
+        }
+        among
+            .into_iter()
+            .max_by_key(|&(_, n)| n)
+            .map(|(s, _)| s.to_string())
+            .unwrap_or_else(|| top[0].0.to_string())
+    });
+    let service_rows = (0..rows)
+        .filter(|&i| service.is_valid(i) && service.value(i) == service_value)
+        .count();
+    let both: Vec<usize> = phrase_rows
+        .iter()
+        .copied()
+        .filter(|&i| service.is_valid(i) && service.value(i) == service_value)
+        .collect();
+    eprintln!(
+        "service {service_value:?}: {service_rows} rows, {} of them hold the phrase",
+        both.len()
+    );
+    let (ts_min, ts_max) = memory
+        .zone_chunks()
+        .expect("zone table")
+        .iter()
+        .fold((i64::MAX, i64::MIN), |(lo, hi), c| {
+            (lo.min(c.ts_min), hi.max(c.ts_max))
+        });
+    let range = (ts_min, ts_max + 1);
+    let scope = vec!["body".to_string()];
+    let latency = std::time::Duration::from_millis(20);
+    let run = |label: &str,
+               condition: &IndexCondition,
+               rule: Option<IndexOptimizeMode>,
+               truth: &[usize]| {
+        let data_src = LatencySource::new(data.clone(), latency);
+        let index_src = LatencySource::new(index.clone(), latency);
+        let reader = VixReader::open_ranged_with_index(
+            data_src.clone() as Arc<dyn VixRangeSource>,
+            Some(index_src.clone() as Arc<dyn VixRangeSource>),
+        )
+        .unwrap();
+        let open_batches = data_src.log.lock().len() + index_src.log.lock().len();
+        let open_data_batches = data_src.log.lock().len();
+        let open_bytes = data_src.bytes_read() + index_src.bytes_read();
+        let started = std::time::Instant::now();
+        let result = evaluate_vix_index(
+            "bench",
+            &reader,
+            condition,
+            rule,
+            range,
+            true,
+            None,
+            None,
+            Some(&scope),
+        );
+        let eval_ms = started.elapsed().as_secs_f64() * 1e3;
+        let batches = data_src.log.lock().len() + index_src.log.lock().len() - open_batches;
+        let bytes = data_src.bytes_read() + index_src.bytes_read() - open_bytes;
+        let data_bytes = data_src.bytes_read();
+        // the data-blob reads of the evaluation, in issue order: `t ms:
+        // bytes` — footer opens (hundreds of KB) tell apart from the
+        // candidates' column segments (tens of KB per chunk)
+        let data_batches: Vec<String> = data_src
+            .log
+            .lock()
+            .iter()
+            .skip(open_data_batches)
+            .map(|(at, ranges)| {
+                format!(
+                    "{:.0}ms:{}B",
+                    at * 1e3,
+                    ranges.iter().map(|r| r.end - r.start).sum::<u64>()
+                )
+            })
+            .collect();
+        let outcome = match result {
+            Err(error) => format!("fallback: {error}"),
+            Ok(RawVixResult::Bitmap {
+                bitmap,
+                has_skipped,
+                ..
+            }) => {
+                let got: Vec<usize> = bitmap.set_indices().collect();
+                let found = truth.iter().filter(|r| got.contains(r)).count();
+                // why a select stayed a superset: the refinement's verdict
+                // under the aggregate cap and under the select cap, with
+                // the chunk geometry both are decided on (zero IO)
+                let inexact: Vec<usize> = (0..condition.conditions.len())
+                    .filter(|&i| matches!(condition.conditions[i], Condition::StrMatch(..)))
+                    .collect();
+                let describe = |verdict: Result<BooleanBuffer, residual::Refusal>| match verdict {
+                    Ok(exact) => format!("refinable ({} exact rows)", exact.count_set_bits()),
+                    Err(refusal) => format!("REFUSED {refusal:?}"),
+                };
+                let aggregate = describe(
+                    residual::refine_superset(
+                        &memory,
+                        condition,
+                        &inexact,
+                        &scope,
+                        &bitmap,
+                        residual::Shape::Aggregate,
+                    )
+                    .unwrap(),
+                );
+                let select_cap = residual::select_chunk_cap(&memory);
+                let select = describe(
+                    residual::refine_superset(
+                        &memory,
+                        condition,
+                        &inexact,
+                        &scope,
+                        &bitmap,
+                        residual::Shape::Select,
+                    )
+                    .unwrap(),
+                );
+                let chunks = memory.zone_chunks().map_or(0, |z| z.len() as u64);
+                let verdict = format!(
+                    "aggregate cap {}: {aggregate}; select cap {select_cap}: {select} | {chunks} zone chunks of {} rows, {} B avg (docs blob {} B)",
+                    residual::RESIDUAL_MAX_CHUNKS,
+                    memory.row_count() / chunks.max(1),
+                    memory.docs_blob_len() / chunks.max(1),
+                    memory.docs_blob_len(),
+                );
+                format!(
+                    "superset rows={} (covers {found} of {} true rows) has_skipped={has_skipped}; {verdict}",
+                    got.len(),
+                    truth.len(),
+                )
+            }
+            Ok(RawVixResult::SelectCandidates { candidates, .. }) => {
+                let all_true = candidates
+                    .iter()
+                    .all(|&(_, row)| truth.contains(&(row as usize)));
+                format!(
+                    "exact candidates={} (limit {limit}, {} true rows in file, all candidates true: {all_true})",
+                    candidates.len(),
+                    truth.len(),
+                )
+            }
+            Ok(other) => format!("unexpected {other:?}"),
+        };
+        eprintln!(
+            "{label:<40} eval {batches:>3} batches {bytes:>11} B ({data_bytes:>9} B data) {eval_ms:>7.1} ms ~{:>4.1} waves | {outcome}\n{:<40}      data batches: {}",
+            eval_ms / latency.as_secs_f64() / 1e3,
+            "",
+            data_batches.join(" "),
+        );
+    };
+    let and = IndexCondition {
+        conditions: vec![
+            Condition::Equal("service_name".to_string(), service_value.clone()),
+            Condition::StrMatch("body".to_string(), phrase.clone(), false),
+        ],
+    };
+    let lone = IndexCondition {
+        conditions: vec![Condition::StrMatch(
+            "body".to_string(),
+            phrase.clone(),
+            false,
+        )],
+    };
+    let service_only = IndexCondition {
+        conditions: vec![Condition::Equal(
+            "service_name".to_string(),
+            service_value.clone(),
+        )],
+    };
+    let service_truth: Vec<usize> = (0..rows)
+        .filter(|&i| service.is_valid(i) && service.value(i) == service_value)
+        .collect();
+    run(
+        "service only: select (exact baseline)",
+        &service_only,
+        Some(IndexOptimizeMode::SimpleSelect(limit, false)),
+        &service_truth,
+    );
+    run("service AND body: row ids (today)", &and, None, &both);
+    run(
+        "service AND body: select (refined)",
+        &and,
+        Some(IndexOptimizeMode::SimpleSelect(limit, false)),
+        &both,
+    );
+    run("body alone: row ids (today)", &lone, None, &phrase_rows);
+    run(
+        "body alone: select (refined)",
+        &lone,
+        Some(IndexOptimizeMode::SimpleSelect(limit, false)),
+        &phrase_rows,
+    );
 }
 
 /// Diagnostic: the `str_match` shape on a REAL `apisix` pair re-indexed
