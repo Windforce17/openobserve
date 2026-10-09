@@ -1819,6 +1819,56 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
   - **(B) stays open** (scoped `Contains` hold-back for `str_match(error,
     …)`-style lone needles on fts fields): its first-run cost is the walk
     plus, now, the cold opens no earlier query pre-pays.
+  - **Correctness leg (13:27–13:46Z, strictly sequential, one request in
+    flight).** Oracle = the same cluster with the predicate rewritten so
+    the index optimizer cannot extract it (`strpos(col, v) > 0`,
+    `length(col) = n`, `lower(col)`: `is_expr_valid_for_index` rejects
+    function-wrapped columns and non-Eq operators, so the whole window
+    goes through the DataFusion scan, `idx_took = 0`), over the edge
+    window of each select's own answer (DESC: `[min_ts(result), end)`,
+    ASC the mirror; capped at 2 h), compared as multisets of full rows,
+    ties at the 100th row allowed. `ops:/tmp/correct207.py`,
+    `correct207b.py`, outputs `correct207*.out`.
+    - LIMIT 100 selects, all exact (99 strictly-inside rows + the tie
+      row, 0 extra, 0 missing, 0 predicate violations; the `use_cache`
+      fill and hit returned identical rows): svc + `str_match(body)` 24 h
+      DESC and ASC; `str_match(body)` 6 h / 24 h; `body = '…'` 24 h;
+      dense `str_match(body, 'error')` 6 h (refused superset → scan,
+      still exact); `str_match(error, 'southamerica-east1')` 24 h (6
+      rows in 24 h, both in the 2 h oracle window present); svc-only
+      control; svc AND NOT `str_match(body)` (`body IS NOT NULL` on both
+      sides); svc AND (`str_match(body, P)` OR `str_match(body, 'Callback
+      sent via kafka')`); apisix `str_match_ignore_case(request.body,
+      'agent')` 6 h DESC. The battery's apisix shape (`asagent1`) has 0
+      rows in the window on the oracle too.
+    - Aggregates vs the full-scan oracle: `count(*)` svc + phrase 1 h
+      4,095 = 4,095; `body = P` 1 h 6,530 = 6,530; `str_match(body, P)`
+      1 h 6,530 = 6,530; `str_match(error, …)` 2 h 2 = 2; histogram 30 min
+      × 4 buckets 2 h identical (1,696 / 1,835 / 2,014 / 2,081).
+    - 24 h `count(*)` svc + phrase: obs 116,182 vs upstream O2 116,183.
+      Bisected hour → 10 min → minute: `[1791375900, 1791375960)` s has
+      obs index 83 = obs index-free scan 83, O2 84 — the extra row
+      (`_timestamp 1791375921176687`) exists only in O2's data; a
+      cross-cluster ingestion difference, not a query defect. (O2 itself
+      answers `str_match(body, …)` selects partial with 0 rows and its
+      1 h count 1,612 vs the true 6,530 — the known upstream gap; `error`
+      / `request.uri` are not fields there.)
+    - **One MISMATCH, pre-existing, not `.207`:** apisix
+      `str_match(request.uri, 'thirdparty_webhook') AND
+      str_match_ignore_case(request.body, 'agent')` 6 h **ASC** returned
+      100 rows flagged partial, `function_error` = "storage scan budget:
+      9 files (3.81 GB) of 17 were skipped … results cover the NEWEST 8
+      files from 03:05:53Z onward"; the oracle has 386 rows older than
+      obs's 100th row — the cap (`apply_storage_scan_cap`, owner decision
+      2026-09-30) kept the newest files regardless of `SimpleSelect`'s
+      direction, so an ASC select's "first 100" came from the wrong end
+      (`.205` behaves the same: the dense `agent` superset is refused and
+      the whole branch is scanned on both). Fixed on vix-arch: the cap
+      now keeps the files at the ORDER BY end (DESC newest by `max_ts`,
+      ASC oldest by `min_ts`), the shortfall message says which
+      (`OLDEST n files … up to <edge> … exclude newer`), unit tests for
+      both directions; the prod default `ZO_STORAGE_SCAN_MAX_BYTES` =
+      4 GiB is unchanged. Not released.
 
 ## 2026-09-29 — P2 shipped as `.176` and rolled back within 30 min: the per-stream side table stalled the shared meta DB (commit latency 40–60×, ingest 503s); ranges must live in the segment row
 - What shipped (vix-arch `013c45010` + NATS retry `76fe754b5`, image
