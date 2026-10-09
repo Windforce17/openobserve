@@ -68,60 +68,96 @@ pub struct StorageScanShortfall {
     pub kept_files: usize,
     pub kept_bytes: usize,
     pub budget: usize,
-    /// `max_ts` of the oldest kept file (µs): results are complete from here
-    /// to the end of the range and exclude older data.
-    pub oldest_kept_ts: i64,
+    /// Which end of the range the kept files come from: `false` = the
+    /// newest files (`ORDER BY _timestamp DESC`), `true` = the oldest
+    /// (`ASC`).
+    pub ascend: bool,
+    /// Where the coverage stops (µs). DESC: `max_ts` of the oldest kept
+    /// file — results are complete from here to the end of the range. ASC:
+    /// `min_ts` of the newest kept file — complete from the start of the
+    /// range up to here.
+    pub kept_edge_ts: i64,
 }
 
 impl StorageScanShortfall {
     pub fn message(&self) -> String {
+        let edge = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(self.kept_edge_ts)
+            .map(|t| t.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+            .unwrap_or_else(|| self.kept_edge_ts.to_string());
+        let kept_bytes = bytes_to_human_readable(self.kept_bytes as f64);
+        let coverage = if self.ascend {
+            format!(
+                "results cover the OLDEST {} files ({kept_bytes}) up to {edge} and exclude newer \
+                 unindexed data",
+                self.kept_files
+            )
+        } else {
+            format!(
+                "results cover the NEWEST {} files ({kept_bytes}) from {edge} onward and exclude \
+                 older unindexed data",
+                self.kept_files
+            )
+        };
         format!(
             "storage scan budget: {} files ({}) of {} were skipped — the scan branch of this \
-             query on {} exceeded ZO_STORAGE_SCAN_MAX_BYTES ({}); results cover the NEWEST {} \
-             files ({}) from {} onward and exclude older unindexed data — narrow the time range \
-             or filter on an indexed field",
+             query on {} exceeded ZO_STORAGE_SCAN_MAX_BYTES ({}); {coverage} — narrow the time \
+             range or filter on an indexed field",
             self.skipped_files,
             bytes_to_human_readable(self.skipped_bytes as f64),
             self.skipped_files + self.kept_files,
             self.stream,
             bytes_to_human_readable(self.budget as f64),
-            self.kept_files,
-            bytes_to_human_readable(self.kept_bytes as f64),
-            chrono::DateTime::<chrono::Utc>::from_timestamp_micros(self.oldest_kept_ts)
-                .map(|t| t.format("%Y-%m-%dT%H:%M:%SZ").to_string())
-                .unwrap_or_else(|| self.oldest_kept_ts.to_string()),
         )
     }
 }
 
+/// The scan branch byte budget of one query and the end of the time range
+/// its kept files come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScanCap {
+    budget: usize,
+    /// `ORDER BY _timestamp ASC`: keep the OLDEST files — the select's rows
+    /// are at the old end of the range, so newest-first truncation would
+    /// hand back rows that are not the first n (2026-10-08: a 6 h apisix
+    /// ASC select kept the newest 8 of 17 files and returned rows from
+    /// 03:05Z while 386 older rows matched).
+    ascend: bool,
+}
+
 /// The cap applies ONLY to row-returning `LIMIT` shapes — the optimizer's
-/// `SimpleSelect(n > 0, _)`. Truncating the scan branch to the newest files
-/// leaves "the newest n matching rows" what it is for a log search; for a
-/// count, histogram, percentile or GROUP BY it silently changes the number
-/// (2026-09-29: a 6 h `p99 by service` covered 10 % of its rows, a 24 h
-/// filtered count came back 1.5 % short, both flagged `partial` and both
-/// wrong). Aggregates run the whole scan branch, bounded by memory admission,
-/// or fail loudly — never a truncated value. Owner decision 2026-09-30.
-fn scan_cap_budget(idx_optimize_rule: &Option<IndexOptimizeMode>, configured: usize) -> usize {
+/// `SimpleSelect(n > 0, _)`. Truncating the scan branch to the files at the
+/// ORDER BY end leaves "the newest (oldest) n matching rows" what it is for
+/// a log search; for a count, histogram, percentile or GROUP BY it silently
+/// changes the number (2026-09-29: a 6 h `p99 by service` covered 10 % of
+/// its rows, a 24 h filtered count came back 1.5 % short, both flagged
+/// `partial` and both wrong). Aggregates run the whole scan branch, bounded
+/// by memory admission, or fail loudly — never a truncated value. Owner
+/// decision 2026-09-30. `None` when the shape is not capped or the cap is
+/// disabled (`configured == 0`).
+fn scan_cap_for(idx_optimize_rule: &Option<IndexOptimizeMode>, configured: usize) -> Option<ScanCap> {
     match idx_optimize_rule {
-        Some(IndexOptimizeMode::SimpleSelect(limit, _)) if *limit > 0 => configured,
-        _ => 0,
+        Some(IndexOptimizeMode::SimpleSelect(limit, ascend)) if *limit > 0 && configured > 0 => {
+            Some(ScanCap {
+                budget: configured,
+                ascend: *ascend,
+            })
+        }
+        _ => None,
     }
 }
 
-/// Keep the NEWEST files whose compressed bytes fit `budget` (always at least
-/// one), in `max_ts` DESC order, and report the rest. Newest-first because a
-/// scan-branch flood means the index could not prune a wide window: the
-/// recent end is what the query most likely wants, and the caller sees
-/// exactly where the coverage stops.
+/// Keep the files at the ORDER BY end whose compressed bytes fit the budget
+/// (always at least one) — newest first by `max_ts` for DESC, oldest first
+/// by `min_ts` for ASC — and report the rest. A scan-branch flood means the
+/// index could not prune a wide window: the end the select ranks from is
+/// what the query wants, and the caller sees exactly where the coverage
+/// stops.
 fn apply_storage_scan_cap(
     files: &mut Vec<FileKey>,
     stream: &str,
-    budget: usize,
+    cap: Option<ScanCap>,
 ) -> Option<StorageScanShortfall> {
-    if budget == 0 {
-        return None;
-    }
+    let ScanCap { budget, ascend } = cap?;
     let total: usize = files
         .iter()
         .map(|f| f.meta.compressed_size.max(0) as usize)
@@ -129,7 +165,11 @@ fn apply_storage_scan_cap(
     if total <= budget {
         return None;
     }
-    files.sort_unstable_by(|a, b| b.meta.max_ts.cmp(&a.meta.max_ts).then(b.id.cmp(&a.id)));
+    if ascend {
+        files.sort_unstable_by(|a, b| a.meta.min_ts.cmp(&b.meta.min_ts).then(a.id.cmp(&b.id)));
+    } else {
+        files.sort_unstable_by(|a, b| b.meta.max_ts.cmp(&a.meta.max_ts).then(b.id.cmp(&a.id)));
+    }
     let mut kept_bytes = 0usize;
     let mut kept = 0usize;
     for file in files.iter() {
@@ -140,7 +180,11 @@ fn apply_storage_scan_cap(
         kept_bytes += bytes;
         kept += 1;
     }
-    let oldest_kept_ts = files[kept - 1].meta.max_ts;
+    // every skipped file lies entirely beyond this edge (sorted by the
+    // bound that faces the skipped side), so the kept set is complete on
+    // the near side of it
+    let edge = &files[kept - 1].meta;
+    let kept_edge_ts = if ascend { edge.min_ts } else { edge.max_ts };
     let skipped_files = files.len() - kept;
     files.truncate(kept);
     Some(StorageScanShortfall {
@@ -150,7 +194,8 @@ fn apply_storage_scan_cap(
         kept_files: kept,
         kept_bytes,
         budget,
-        oldest_kept_ts,
+        ascend,
+        kept_edge_ts,
     })
 }
 
@@ -207,7 +252,7 @@ pub async fn search(
     // nothing for the index to answer.
     let vix_applicable =
         vix_search_applicable(*use_inverted_index, condition_all, &idx_optimize_rule);
-    let scan_cap = scan_cap_budget(
+    let scan_cap = scan_cap_for(
         &idx_optimize_rule,
         get_config().limit.storage_scan_max_bytes,
     );
@@ -276,7 +321,7 @@ pub async fn search(
     );
 
     // Per-query byte budget on the scan branch (ZO_STORAGE_SCAN_MAX_BYTES),
-    // row-returning LIMIT shapes only (`scan_cap_budget`): decided here,
+    // row-returning LIMIT shapes only (`scan_cap_for`): decided here,
     // before any IO or plan, from the file_list sizes already in hand. The
     // kept set is re-measured so scan_stats describe what runs.
     let stream_key = format!("{org_id}/{stream_type}/{stream_name}");
@@ -541,36 +586,43 @@ mod tests {
     #[test]
     fn scan_cap_applies_only_to_row_returning_limit_shapes() {
         let budget = 4 << 30;
+        let cap = |ascend| {
+            Some(ScanCap {
+                budget,
+                ascend,
+            })
+        };
         assert_eq!(
-            scan_cap_budget(&Some(IndexOptimizeMode::SimpleSelect(50, false)), budget),
-            budget
+            scan_cap_for(&Some(IndexOptimizeMode::SimpleSelect(50, false)), budget),
+            cap(false)
         );
+        // the direction travels with the budget: an ASC select keeps the OLD end
         assert_eq!(
-            scan_cap_budget(&Some(IndexOptimizeMode::SimpleSelect(50, true)), budget),
-            budget
+            scan_cap_for(&Some(IndexOptimizeMode::SimpleSelect(50, true)), budget),
+            cap(true)
         );
         // a LIMIT 0 select drops every row anyway: nothing to protect
         assert_eq!(
-            scan_cap_budget(&Some(IndexOptimizeMode::SimpleSelect(0, false)), budget),
-            0
+            scan_cap_for(&Some(IndexOptimizeMode::SimpleSelect(0, false)), budget),
+            None
         );
         // aggregates and unclassified plans: never truncated
         assert_eq!(
-            scan_cap_budget(&Some(IndexOptimizeMode::SimpleCount), budget),
-            0
+            scan_cap_for(&Some(IndexOptimizeMode::SimpleCount), budget),
+            None
         );
         assert_eq!(
-            scan_cap_budget(
+            scan_cap_for(
                 &Some(IndexOptimizeMode::SimpleHistogram(0, 1, 1, 0)),
                 budget
             ),
-            0
+            None
         );
-        assert_eq!(scan_cap_budget(&None, budget), 0);
+        assert_eq!(scan_cap_for(&None, budget), None);
         // disabled stays disabled
         assert_eq!(
-            scan_cap_budget(&Some(IndexOptimizeMode::SimpleSelect(50, false)), 0),
-            0
+            scan_cap_for(&Some(IndexOptimizeMode::SimpleSelect(50, false)), 0),
+            None
         );
     }
 
@@ -583,8 +635,13 @@ mod tests {
         f
     }
 
-    /// The cap keeps the NEWEST files that fit and reports the rest, so the
-    /// answer is complete from the oldest kept file onward.
+    fn cap(budget: usize, ascend: bool) -> Option<ScanCap> {
+        Some(ScanCap { budget, ascend })
+    }
+
+    /// DESC: the cap keeps the NEWEST files that fit and reports the rest,
+    /// so the answer is complete from the oldest kept file's `max_ts`
+    /// onward.
     #[test]
     fn storage_scan_cap_keeps_newest_prefix_and_reports_the_rest() {
         // insertion order is deliberately not time order
@@ -594,7 +651,8 @@ mod tests {
             file(3, 200, 40),
             file(4, 300, 40),
         ];
-        let shortfall = apply_storage_scan_cap(&mut files, "o/traces/s", 100).expect("over budget");
+        let shortfall =
+            apply_storage_scan_cap(&mut files, "o/traces/s", cap(100, false)).expect("over budget");
         assert_eq!(
             files.iter().map(|f| f.id).collect::<Vec<_>>(),
             vec![2, 4],
@@ -609,16 +667,52 @@ mod tests {
                 kept_files: 2,
                 kept_bytes: 80,
                 budget: 100,
-                oldest_kept_ts: 300,
+                ascend: false,
+                kept_edge_ts: 300,
             }
         );
         let message = shortfall.message();
         assert!(message.contains("2 files"), "{message}");
         assert!(message.contains("NEWEST 2 files"), "{message}");
-        assert!(
-            message.contains("1970-01-01T00:00:00Z"),
-            "µs 300 formats: {message}"
+        assert!(message.contains("from 1970-01-01T00:00:00Z onward"), "{message}");
+        assert!(message.contains("exclude older"), "{message}");
+    }
+
+    /// ASC: the select ranks from the OLD end, so the cap keeps the oldest
+    /// files that fit (by `min_ts`), and the answer is complete from the
+    /// start of the range up to the newest kept file's `min_ts`.
+    #[test]
+    fn storage_scan_cap_keeps_oldest_prefix_for_ascending_selects() {
+        let mut files = vec![
+            file(1, 10_100, 40),
+            file(2, 10_400, 40),
+            file(3, 10_200, 40),
+            file(4, 10_300, 40),
+        ];
+        let shortfall =
+            apply_storage_scan_cap(&mut files, "o/traces/s", cap(100, true)).expect("over budget");
+        assert_eq!(
+            files.iter().map(|f| f.id).collect::<Vec<_>>(),
+            vec![1, 3],
+            "oldest two fit the budget"
         );
+        assert_eq!(
+            shortfall,
+            StorageScanShortfall {
+                stream: "o/traces/s".to_string(),
+                skipped_files: 2,
+                skipped_bytes: 80,
+                kept_files: 2,
+                kept_bytes: 80,
+                budget: 100,
+                ascend: true,
+                kept_edge_ts: 9_200,
+            }
+        );
+        let message = shortfall.message();
+        assert!(message.contains("OLDEST 2 files"), "{message}");
+        assert!(message.contains("up to 1970-01-01T00:00:00Z"), "{message}");
+        assert!(message.contains("exclude newer"), "{message}");
     }
 
     /// Within budget or disabled: untouched, no shortfall, order preserved.
@@ -626,21 +720,29 @@ mod tests {
     fn storage_scan_cap_is_a_no_op_within_budget_or_when_off() {
         let original = vec![file(1, 100, 40), file(2, 400, 40)];
         let mut files = original.clone();
-        assert_eq!(apply_storage_scan_cap(&mut files, "s", 80), None);
+        assert_eq!(apply_storage_scan_cap(&mut files, "s", cap(80, false)), None);
         assert_eq!(files, original);
         let mut files = original.clone();
-        assert_eq!(apply_storage_scan_cap(&mut files, "s", 0), None);
+        assert_eq!(apply_storage_scan_cap(&mut files, "s", cap(80, true)), None);
+        assert_eq!(files, original);
+        let mut files = original.clone();
+        assert_eq!(apply_storage_scan_cap(&mut files, "s", None), None);
         assert_eq!(files, original);
     }
 
     /// A single file larger than the budget still runs: the cap bounds the
     /// set, it never empties it (an empty scan would be a silent blackout).
+    /// The one kept file is the one at the ORDER BY end.
     #[test]
-    fn storage_scan_cap_always_keeps_at_least_the_newest_file() {
+    fn storage_scan_cap_always_keeps_at_least_the_edge_file() {
         let mut files = vec![file(1, 100, 500), file(2, 200, 500)];
-        let shortfall = apply_storage_scan_cap(&mut files, "s", 10).unwrap();
+        let shortfall = apply_storage_scan_cap(&mut files, "s", cap(10, false)).unwrap();
         assert_eq!(files.iter().map(|f| f.id).collect::<Vec<_>>(), vec![2]);
         assert_eq!((shortfall.kept_files, shortfall.skipped_files), (1, 1));
         assert_eq!(shortfall.kept_bytes, 500);
+        let mut files = vec![file(1, 100, 500), file(2, 200, 500)];
+        let shortfall = apply_storage_scan_cap(&mut files, "s", cap(10, true)).unwrap();
+        assert_eq!(files.iter().map(|f| f.id).collect::<Vec<_>>(), vec![1]);
+        assert_eq!(shortfall.kept_edge_ts, 100 - 1_000);
     }
 }

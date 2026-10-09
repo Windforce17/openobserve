@@ -2331,7 +2331,7 @@ pub struct Limit {
     #[env_config(
         name = "ZO_STORAGE_SCAN_MAX_BYTES",
         default = 0,
-        help = "Per follower query, the most compressed bytes the storage scan branch (files the index could not answer or prune) may open. Past it the NEWEST files that fit are scanned and the response is marked partial with a message naming the skipped files and bytes — instead of reserving the whole shared DataFusion pool for one needle lookup. 0 disables the cap."
+        help = "Per follower query, the most compressed bytes the storage scan branch (files the index could not answer or prune) may open, for ORDER BY _timestamp LIMIT selects only. Past it the files at the ORDER BY end that fit (newest for DESC, oldest for ASC) are scanned and the response is marked partial with a message naming the skipped files and bytes — instead of reserving the whole shared DataFusion pool for one needle lookup. 0 disables the cap."
     )]
     pub storage_scan_max_bytes: usize,
     #[env_config(name = "ZO_MEM_PERSIST_INTERVAL", default = 2)] // seconds
