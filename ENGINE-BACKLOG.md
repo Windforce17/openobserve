@@ -1868,7 +1868,28 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
       ASC oldest by `min_ts`), the shortfall message says which
       (`OLDEST n files … up to <edge> … exclude newer`), unit tests for
       both directions; the prod default `ZO_STORAGE_SCAN_MAX_BYTES` =
-      4 GiB is unchanged. Not released.
+      4 GiB is unchanged.
+- **2026-10-09 — SHIPPED as `.208` (08:02Z): the storage scan cap keeps
+  the files at the ORDER BY end.** `release/vix-20261009-208 f31f41d1c` =
+  `.207` + vix-arch `e2291157f` (byte-identical cherry-pick, querier
+  only; GitOps #618, Argo Synced/Healthy 08:04:14Z, 10/10 pods on the new
+  image by 08:03:40Z). `ZO_STORAGE_SCAN_MAX_BYTES` stays 4 GiB; the only
+  behaviour change is which files an over-budget `SimpleSelect` scan
+  branch keeps — `ascend` now travels with the budget (`ScanCap`), ASC
+  sorts by `min_ts` and keeps the oldest, the shortfall says `OLDEST n
+  files … up to <newest kept min_ts> … exclude newer`.
+  - Post-roll check (08:04–08:07Z, sequential, cold fleet, same oracle
+    method): the apisix 6 h **ASC** shape is now **exact** against the
+    index-free scan (99 strictly inside + the tie row, 0 extra, 0
+    missing; yesterday 286 missing), still flagged partial with
+    "13 files (5.37 GB) of 23 were skipped … results cover the OLDEST 10
+    files (3.88 GB) up to 2026-10-08T04:21:59Z and exclude newer unindexed
+    data" — its 100th row is at 02:29Z, inside the covered edge. The DESC
+    twin, svc + `str_match(body)` 24 h DESC/ASC and `body = '…'` 24 h
+    DESC are unchanged and exact; `use_cache` fill/hit identical rows on
+    all five. `ops:/tmp/post208.py`, `post208.out`.
+  - Cost of the roll, as before: generic ephemeral `data` PVC → every pod
+    restarts at 0 % disk cache; the 24 h sidecars re-warm over ~3 h.
 
 ## 2026-09-29 — P2 shipped as `.176` and rolled back within 30 min: the per-stream side table stalled the shared meta DB (commit latency 40–60×, ingest 503s); ranges must live in the segment row
 - What shipped (vix-arch `013c45010` + NATS retry `76fe754b5`, image
