@@ -1890,6 +1890,100 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     all five. `ops:/tmp/post208.py`, `post208.out`.
   - Cost of the roll, as before: generic ephemeral `data` PVC → every pod
     restarts at 0 % disk cache; the 24 h sidecars re-warm over ~3 h.
+- **2026-10-10 — block-granular disk cache tier (vix-arch, NOT shipped;
+  off by default behind `ZO_DISK_CACHE_BLOCK_ENABLED`).** Owner question:
+  why a cold 24 h query re-reads the same footers/postings on every run
+  while the pods run a 2000 Gi disk cache. Answer from the 10-09 counters
+  (`.work/slowq/notes.md`): the whole-file tiers only fill through the
+  background downloader, which the query gates (`cache_files_with_policy`:
+  `warm_cache_type` skip-size, `files_num / 2` hit floor, admission
+  `accepted=0 deduplicated=1393`), and when it does fill it moves the
+  WHOLE object — the 24 h llm-router scan read 18.5 GB in 48,419 range
+  GETs and the post-query fill moved 133.6 GB in 60 s (+123 GB disk for
+  1,577 files) for a query that touches 2–3 % of a `.vix` data file and
+  ~2 % of a sidecar. Nothing between "cache the whole 100–300 MB file"
+  and "cache nothing" existed.
+  - **Design** (`infra/cache/file_data/block.rs`, new): one sparse file per
+    object under `<data_cache_dir>/blocks/<key>`, bytes mirrored at
+    identical offsets, a checksummed presence-bitmap trailer at
+    `align_up(object_size, 4096)` rewritten by a 1 s-coalescing background
+    flusher (`fdatasync` data, then trailer); bits are set only after the
+    data write returned, so a persisted bit implies durable data and a torn
+    trailer discards the entry instead of lying. Reads that miss both
+    whole-file tiers (`storage.rs` `get_range_classified_with` /
+    `Storage::get_opts` / `get_ranges`) go through `block_tier` when the key
+    is `files/…` and `admits(total_bytes)` (a request larger than half a
+    bucket is passed straight to the store); missing blocks are fetched
+    as runs (gaps ≤ 1 MiB of present blocks re-fetched to save a GET, like
+    the object_store coalescer), 10 concurrent fills per request, written
+    through and served; a warm range is one `pread`. `get_ranges` fills all
+    ranges' missing blocks together so a block shared by two ranges moves
+    once. Eviction is the configured strategy (`time_lru` in prod) per
+    bucket with `evicting` CAS so one sweep runs at a time; a whole-file
+    `set`/`remove` of the same key drops the block entry (`disk.rs`
+    `set_from_tmp_file`, `delete.rs`). Startup `load` rebuilds the index
+    from trailers.
+  - **Locking.** Bucket indexes are `parking_lot::RwLock` touched only for
+    O(1) map ops, never across IO or `await`; `pread`/`pwrite`/unlink run
+    on the blocking pool. The whole-file tier is the opposite: `set` →
+    `gc` runs `tokio::fs::remove_file` per victim under the bucket's
+    `tokio::RwLock` WRITE guard (`disk.rs:294-304` + `361-447`,
+    `release_size` = 10 % of a bucket = ~3 GB per sweep at 500 GB / 16
+    buckets), which blocks every `exist()` (the per-file check in
+    `file_cache.rs:127`, run for ~1,450 files per follower per query) and
+    every other `set` on that bucket for the sweep; warm `get_opts` /
+    `get_ranges` go through the lock-free `FILES_READER`, so they are not
+    blocked. The 2000 Gi auto size (`max_size` 0 → 50 % of the volume,
+    capped 500 GB) also means prod gc runs seldom — the exposure is the
+    `check file cache took` warn at > 1 s, already in the code.
+  - **Config** (`config.rs`): `ZO_DISK_CACHE_BLOCK_SIZE` (bytes, power of
+    two 4 KiB..=64 MiB, default **64 KiB**), `ZO_DISK_CACHE_BLOCK_MAX_SIZE`
+    (MB, 0 = 25 % of `ZO_DISK_CACHE_MAX_SIZE`, carved out BEFORE the
+    derived whole-file sizes — release/skip/result/aggregation — are
+    computed, then split per bucket like the rest). Metrics:
+    `QUERY_DISK_BLOCK_CACHE_{USED_BYTES,FILES}`, request results
+    hit/partial/miss, bytes by source. `search->vix: io_accounting` gains
+    `block_reads= block_bytes= remote_physical_bytes=` (bytes actually
+    moved from object storage incl. block-alignment over-fetch; `FetchStats`
+    in `vix/source.rs`, `RangeSource::Block`).
+  - **Replay on two prod pairs** (throwaway `infra/tests/block_replay.rs`
+    harness, deleted; drove the real tier with the real read pattern:
+    cold open (data + index footers) → index eval → docs open → narrow
+    projection → `SELECT * LIMIT 100`): logs `…52aa3a` 109 MiB `.vix` +
+    37.6 MiB `.vxi` (415 k rows, 2,581 columns, 5 FTS fields; `Q1` =
+    `service_name` × the most frequent message's tokens, 144 k rows
+    matched) and apisix `…84cce7` 285 + 230 MiB (828 k rows, 527 columns,
+    no FTS, `str_match` shape, 175 k rows matched).
+    | step (64 KiB blocks, logs pair) | logical | moved from S3 | GETs |
+    |---|---|---|---|
+    | cold open, both footers | 0.88 MiB | 0.98 MiB (1.12×) | 2 |
+    | index eval, cold | 1.26 MiB / 16 ranges | 3.00 MiB (2.38×) | 13 |
+    | docs open, warm | 1.54 MiB | 0 | 0 |
+    | narrow projection | 0.32 MiB | 0.39 MiB | 6 |
+    | open + eval warm, fresh reader | 2.14 MiB / 18 ranges | 0 (15/15 hits) | 0 |
+    | `SELECT *` LIMIT 100, cold | 21.8 MiB | 22.0 MiB (1.01×) | 2 |
+    | **total** | 30.2 MiB | **31.9 MiB = 1.05×, 21.7 % of the pair** | 26 |
+    Footprint on disk 30.9 MiB in 2 entries vs 146.9 MiB for the
+    whole-file tier (apisix pair: 33.1 MiB = 6.4 % vs 515 MiB; total moved
+    0.91× logical because `get_ranges` dedups shared blocks). Block-size
+    sweep, bytes moved vs the uncached fetch (coalescing gaps separated
+    from alignment over-fetch): 16 KiB 1.01–1.03×, 32 KiB ~1.05×, 64 KiB
+    1.07–1.22× (the index eval is the only step that over-fetches: 2.4×
+    on 1.3 MiB of small postings reads), 128 KiB 1.15×, 256 KiB 1.3–2.0×;
+    the whole-file tier moves 30–55×. 64 KiB is the default: the bitmap of
+    a 300 MB object is 600 B and the eval over-fetch is 2 MB per file.
+  - **Tests**: `block.rs` unit tests (block arithmetic, last-block clip,
+    concurrent fills of one object, restart recovery from trailers,
+    eviction accounting, corrupt trailer discard) + `storage.rs` ladder
+    tests (block tier serves whole-file misses by block, results/ keys and
+    over-budget requests bypass, past-the-end NotFound parity).
+    `cargo test -p infra --lib cache::` 146/146; clippy clean on the
+    touched files (the `PI` errors are upstream `meta/promql` tests).
+  - **Rollout plan**: dev first with `ZO_DISK_CACHE_BLOCK_ENABLED=true`
+    (default size/budget), watch `block_reads`/`remote_physical_bytes` on
+    a repeated cold 24 h shape and `QUERY_DISK_BLOCK_CACHE_USED_BYTES`;
+    prod querier only, same knob. The background downloader stays as is —
+    the tier sits behind it, so a fully downloaded file still wins.
 
 ## 2026-09-29 — P2 shipped as `.176` and rolled back within 30 min: the per-stream side table stalled the shared meta DB (commit latency 40–60×, ingest 503s); ranges must live in the segment row
 - What shipped (vix-arch `013c45010` + NATS retry `76fe754b5`, image
