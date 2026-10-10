@@ -347,19 +347,40 @@ impl std::fmt::Display for EvaluationMemoryExhausted {
 impl std::error::Error for EvaluationMemoryExhausted {}
 
 /// Exact-byte reservations, without rounding or the u32 limit of acquire_many.
-/// Admission is FIFO and may fill the gate to the byte; a lease grows after
-/// admission by waiting for releases ([`BytePermit::resize`]).
+/// Admission may fill the gate to the byte. With room and nobody queued it is
+/// one check under the occupancy lock; once an acquirer has to wait, later
+/// arrivals queue behind it FIFO until the queue drains. Taking the FIFO
+/// mutex for every admission made admission a lock convoy on busy workers -
+/// each handoff waits for the woken task to be scheduled, so with ample room
+/// 600 admitters saw a 0.96 ms mean admission wait beside 5 ms CPU slices
+/// (0.00 ms with this fast path). A lease grows after admission by waiting
+/// for releases ([`BytePermit::resize`]).
 struct ByteGate {
     limit: usize,
-    used: Mutex<usize>,
+    state: Mutex<Occupancy>,
     changed: Notify,
     /// Wakes synchronous growth waiters on release.
     released: parking_lot::Condvar,
     released_lock: parking_lot::Mutex<()>,
+    /// The FIFO: its holder is the head of the queue, awaiting `changed`.
     waiters: tokio::sync::Mutex<()>,
     /// Publish occupancy as `vix_eval_memory_bytes`, the number that sizes
     /// `ZO_VIX_EVAL_MAX_BYTES`.
     published: bool,
+}
+#[derive(Default)]
+struct Occupancy {
+    used: usize,
+    /// Acquirers holding or queued on `waiters`. While nonzero, a newcomer
+    /// that would fit still queues, so released bytes reach the head.
+    queued: usize,
+}
+/// Leaves the queue on every exit from the FIFO section, cancellation included.
+struct Queued<'a>(&'a ByteGate);
+impl Drop for Queued<'_> {
+    fn drop(&mut self) {
+        self.0.state.lock().queued -= 1;
+    }
 }
 impl ByteGate {
     fn new(limit: usize) -> Arc<Self> {
@@ -371,7 +392,7 @@ impl ByteGate {
     fn build(limit: usize, published: bool) -> Arc<Self> {
         Arc::new(Self {
             limit: limit.max(1),
-            used: Mutex::new(0),
+            state: Mutex::new(Occupancy::default()),
             changed: Notify::new(),
             released: parking_lot::Condvar::new(),
             released_lock: parking_lot::Mutex::new(()),
@@ -401,31 +422,51 @@ impl ByteGate {
             }
             .into());
         }
+        if let Some(permit) = self.admit_or_enqueue(bytes) {
+            return Ok(permit);
+        }
+        let _queued = Queued(self);
         let _queue = self.waiters.lock().await;
         loop {
             // Register before checking capacity; notify_waiters cannot be lost.
             let changed = self.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            {
-                let mut used = self.used.lock();
-                if bytes <= self.limit - *used {
-                    *used += bytes;
-                    self.publish(*used);
-                    return Ok(BytePermit {
-                        gate: Arc::clone(self),
-                        bytes,
-                    });
-                }
+            if let Some(permit) = self.admit(bytes) {
+                return Ok(permit);
             }
             changed.await;
         }
     }
+    /// Admit when there is room and nobody is queued; otherwise enrol the
+    /// caller in the queue under the same lock, so no later arrival can take
+    /// the bytes it waits for.
+    fn admit_or_enqueue(self: &Arc<Self>, bytes: usize) -> Option<BytePermit> {
+        let mut state = self.state.lock();
+        if state.queued == 0 && bytes <= self.limit - state.used {
+            return Some(self.charge(&mut state, bytes));
+        }
+        state.queued += 1;
+        None
+    }
+    /// The head of the queue admits as soon as there is room.
+    fn admit(self: &Arc<Self>, bytes: usize) -> Option<BytePermit> {
+        let mut state = self.state.lock();
+        (bytes <= self.limit - state.used).then(|| self.charge(&mut state, bytes))
+    }
+    fn charge(self: &Arc<Self>, state: &mut Occupancy, bytes: usize) -> BytePermit {
+        state.used += bytes;
+        self.publish(state.used);
+        BytePermit {
+            gate: Arc::clone(self),
+            bytes,
+        }
+    }
     fn release(&self, bytes: usize) {
         let used = {
-            let mut used = self.used.lock();
-            *used -= bytes;
-            *used
+            let mut state = self.state.lock();
+            state.used -= bytes;
+            state.used
         };
         self.publish(used);
         self.changed.notify_waiters();
@@ -454,15 +495,15 @@ impl BytePermit {
             return Ok(());
         }
         let delta = bytes - self.bytes;
-        let mut used = self.gate.used.lock();
-        if delta > self.gate.limit - *used {
+        let mut state = self.gate.state.lock();
+        if delta > self.gate.limit - state.used {
             return Err(EvaluationMemoryExhausted {
                 requested: bytes,
                 limit: self.gate.limit,
             });
         }
-        *used += delta;
-        self.gate.publish(*used);
+        state.used += delta;
+        self.gate.publish(state.used);
         self.bytes = bytes;
         Ok(())
     }
@@ -1335,12 +1376,12 @@ mod tests {
         let count = Arc::new(Semaphore::new(3));
         let first = evaluation_fixture_waiting(&pool, &count, Duration::from_secs(5));
         let second = evaluation_fixture(&pool, &count);
-        assert_eq!(*pool.used.lock(), 0, "admission charges nothing");
+        assert_eq!(pool.state.lock().used, 0, "admission charges nothing");
         first.reserve_owned(8).unwrap();
         second.reserve_owned(20).unwrap();
-        assert_eq!(*pool.used.lock(), 28);
+        assert_eq!(pool.state.lock().used, 28);
         first.reserve_owned(4).unwrap();
-        assert_eq!(*pool.used.lock(), 28, "a smaller report is not a shrink");
+        assert_eq!(pool.state.lock().used, 28, "a smaller report is not a shrink");
         // growth to 16 (8 more) must wait for `second` to finish
         let waiter = {
             let memory = Arc::clone(&first.memory);
@@ -1356,7 +1397,7 @@ mod tests {
         let (result, waited) = waiter.join().unwrap();
         result.unwrap();
         assert!(waited >= Duration::from_millis(50), "waited {waited:?}");
-        assert_eq!(*pool.used.lock(), 16, "grew to the reported ownership");
+        assert_eq!(pool.state.lock().used, 16, "grew to the reported ownership");
         assert!(first.check_refusal().is_ok());
 
         // a cancelled operation stops waiting at once; that is not a refusal
@@ -1382,7 +1423,7 @@ mod tests {
         assert!(third.check_refusal().is_err(), "refusal stays sticky");
         drop(third);
         drop(first);
-        assert_eq!(*pool.used.lock(), 0);
+        assert_eq!(pool.state.lock().used, 0);
     }
 
     /// Growth beyond what a full pool releases within the grace period is
@@ -1406,7 +1447,7 @@ mod tests {
         });
         live.run_evaluation(&live_permit, || vortex_index::check_read_memory(16))
             .unwrap();
-        assert_eq!(*pool.used.lock(), 24);
+        assert_eq!(pool.state.lock().used, 24);
         let worked = std::sync::atomic::AtomicBool::new(false);
         let refused: anyhow::Result<()> = first.run_evaluation(&first_permit, || {
             vortex_index::check_read_memory(17)?;
@@ -1421,7 +1462,7 @@ mod tests {
         );
         assert!(!worked.load(Ordering::Relaxed));
         assert_eq!(
-            *pool.used.lock(),
+            pool.state.lock().used,
             24,
             "refused growth must not leak its delta"
         );
@@ -1432,7 +1473,7 @@ mod tests {
         first.cancel();
         drop(first_permit);
         assert_eq!(
-            *pool.used.lock(),
+            pool.state.lock().used,
             16,
             "operation clones cannot own working permits"
         );
@@ -1441,12 +1482,12 @@ mod tests {
         live.run_evaluation(&live_permit, || vortex_index::check_read_memory(32))
             .unwrap();
         assert_eq!(
-            *pool.used.lock(),
+            pool.state.lock().used,
             32,
             "another operation remains usable after a refusal"
         );
         drop(live_permit);
-        assert_eq!(*pool.used.lock(), 0);
+        assert_eq!(pool.state.lock().used, 0);
         assert_eq!(count.available_permits(), 2);
     }
 
@@ -1468,9 +1509,9 @@ mod tests {
                 started.elapsed() < Duration::from_millis(50),
                 "nothing a release could serve: no wait"
             );
-            assert_eq!(*pool.used.lock(), 8);
+            assert_eq!(pool.state.lock().used, 8);
             drop(permit);
-            assert_eq!(*pool.used.lock(), 0);
+            assert_eq!(pool.state.lock().used, 0);
         }
     }
 
@@ -1585,10 +1626,37 @@ mod tests {
         assert!(futures::poll!(&mut wait).is_pending());
         drop(owner);
         assert!(wait.await.is_err());
-        assert_eq!(*gate.used.lock(), 8);
+        assert_eq!(gate.state.lock().used, 8);
+        assert_eq!(
+            gate.state.lock().queued,
+            0,
+            "a cancelled wait leaves the queue, or every later admission queues"
+        );
         drop(held);
         let restored = gate.acquire(8).await.unwrap();
         assert_eq!(restored.bytes, 8);
+    }
+
+    /// With an acquirer queued, a newcomer that would fit still waits behind
+    /// it: released bytes reach the head of the queue, not the latest arrival.
+    #[tokio::test]
+    async fn queued_acquirer_is_served_before_a_fitting_newcomer() {
+        let gate = ByteGate::new(8);
+        let held = gate.acquire(8).await.unwrap();
+        let mut head = Box::pin(gate.acquire(6));
+        assert!(futures::poll!(&mut head).is_pending());
+        drop(held);
+        let mut newcomer = Box::pin(gate.acquire(2));
+        assert!(
+            futures::poll!(&mut newcomer).is_pending(),
+            "a newcomer must not overtake the queue"
+        );
+        let head = head.await.unwrap();
+        assert_eq!(head.bytes, 6);
+        let newcomer = newcomer.await.unwrap();
+        assert_eq!(newcomer.bytes, 2);
+        assert_eq!(gate.state.lock().used, 8);
+        assert_eq!(gate.state.lock().queued, 0);
     }
 
     #[tokio::test]
