@@ -2077,17 +2077,33 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
   - **Why the eval phase leaves the pipe idle (owner question "突发没有用
     尽是不是不够的,尤其是 IO").** Yes, and the limiter is the slot count ×
     chain depth, not IO capacity:
-    - Probe (throwaway test on the depth-clock `PairSource`, prod-shaped
-      1 M-row file, `postings_plist_min_docs` 8192, 768 KiB tail): cold
-      `AND` of 3 exact leaves = open 1 round trip (2 tail GETs, 896 KB) +
-      3 round trips (6–7 GETs, 66–350 KB) = **4 serial waves, 8–9 GETs per
-      file** — prod's 7.5–9.4 reads/file. Wave 2 is three sub-KB headers
-      at the `dict_blocks`/`terms` boundary (69 B directory, 633 B
-      trailer, 756 B terms header) that the tail does not cover; wave 3
-      the key block (135 KB); wave 4 the leaves' plist records (56–88 KB
-      each, one batch). The GROUP BY runs row-id + DataFusion scan: the
-      docs-window distinct path (5–43 serial waves/file) is NOT in prod's
-      read counts.
+    - Probe (`and_io_bench::group_by_shape_probe`, throwaway, since
+      removed: 1 M rows, fields `service_name`/`label.llm_model`/
+      `label.task_type` low-cardinality + `label.session_id` 1 M distinct,
+      `plist_min_docs` 8192, 768 KiB tail, 20 ms depth clock): cold `AND`
+      of the 3 exact leaves = open 1 round trip (2 tail GETs, 896 KB) + 3
+      round trips = **4 serial waves, 8 GETs per file** — prod's 7.5–9.4
+      reads/file. Attributed: wave 2 = the leaves' **dictionary key
+      blocks** (`dict_blocks+0` 78 B for `llm_model`, `dict_blocks+29.6M`
+      154 B for `task_type`+`service_name`, 2 concurrent
+      `block_fetch_separate` runs); wave 3 = the **terms chunk** holding
+      `llm_model`'s cells (`terms+8`, doc_count leaf 260 B + postings leaf
+      612 B, coalesced); wave 4 = the 3 plist records (56–89 KB, one
+      batch). The chain per exact leaf is key block → cell (doc_count +
+      plist pointer, by ordinal) → plist record. Wave 3 exists only for
+      fields whose terms chunk is outside the eager tail: the tail covers
+      the LAST ~760 KB of the terms blob = the highest field ids. Field
+      ids are name order (`label.llm_model`=0, `label.session_id`=1,
+      `label.task_type`=2, `service_name`=3), so `service_name` and
+      `task_type` cells are tail-resident and free (`svc` alone = 2 eval
+      waves), `label.llm_model`'s sit 11 MB away behind the session-id
+      chunks and cost the extra round trip. Which fields pay is a byte
+      order accident. The writer closes a terms chunk at every field
+      change (`writer.rs` flush rule), so a low-cardinality field's chunk
+      is its own and tiny (876 B here); a session-id chunk is 176 + 307 KB.
+      Session-id point lookup on an absent key: 0 GETs (directory proof).
+      The GROUP BY runs row-id + DataFusion scan: the docs-window distinct
+      path (5–43 serial waves/file) is NOT in prod's read counts.
     - Model: eval ≈ ⌈files/192⌉ × 4 × 80 ms = 7.3 × 0.32 = 2.3 s per
       follower (measured 2.6–3.3; the 10 followers' eval times fit
       ~2.1 ms/file linearly). In flight = 192 slots × ~1.7 GETs/wave ≈ 330.
@@ -2104,18 +2120,44 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
       from this VPC at ~30 ms/connection; the evaluator sees 80 ms at any
       concurrency. Not EBS, not S3 push-back, not the pod limit. Needs a
       per-stage timer (issue → first byte → body → fill done) on one pod.
-    - Levers, in order: (1) `ZO_VIX_SEARCH_CONCURRENCY` 192 → 384 (+
-      `ZO_VIX_FETCH_CONCURRENCY` 512 → 1024, in flight would reach ~660;
-      the 4 GiB eval gate admits 341 row-id evals at 12 MiB declared —
-      raise to 6 GiB or accept 341; blocking pool 512 vs 384 evals + ~660
-      IoJobs → `ZO_GRPC_RUNTIME_BLOCKING_WORKER_NUM` 1536). Expected −50 %
-      eval phase (−1.2 s of 12.8 here; a 7 d cold count, 6,900 files ≈
-      11.5 → 5.8 s). Watch: S3 503/SlowDown (fleet 40k → 80k GET/s),
-      CFS throttled periods, RSS. (2) Writer: fold the wave-2 boundary
-      headers into the tail-resident region → 3 waves, −25 % for new
-      files. (3) Close the 30 → 80 ms gap: halves the phase with no S3
-      risk. After the CPU fix the scan phase (3.4–6 s + the ~100 GB/pod
-      whole-file back-fill at 650 MB/s for 3 min) is the larger half.
+    - Levers, in order: (1) `ZO_VIX_SEARCH_CONCURRENCY` up. **Conservative
+      step SHIPPED: 192 → 256 with `ZO_VIX_FETCH_CONCURRENCY` 512 → 768
+      (GitOps #621, merged 08:44Z; rolls the queriers).** 256 keeps the
+      eval gate non-binding (341 row-id admits) and the gRPC blocking pool
+      (512) at ~270 long-held threads. Expected in flight ~440, eval phase
+      −25 % (7 d cold count 11.5 → 8.6 s). Next step if S3 503s, the fetch
+      queue phase, CFS throttling and RSS stay clean: 320–384 WITH
+      `ZO_VIX_EVAL_MAX_BYTES` 6 GiB and `ZO_GRPC_RUNTIME_BLOCKING_WORKER_NUM`
+      1024 (384 → in flight ~660, fleet 40k → 80k GET/s, −50 %).
+      (2) Cut the per-leaf chain one level. Two versions:
+      (2a) reader-only, no format change: in `eval_and`'s point wave
+      (`resolve_point_batch`) the predecessor block of every exact target
+      is known from the resident directory, hence the block's ordinal
+      range (`meta(b).1 .. + block_key_count`), hence the terms chunk
+      leaves (doc_count + postings, adjacent) a present key's cell must
+      be in — fetch them in the SAME wave as the key block through the
+      existing `PrefetchedWindows` overlay (`terms.prefetch_scope`), under
+      a byte cap (speculate when the covering leaves are ≤ ~64 KB, i.e.
+      low-cardinality fields: hundreds of bytes; skip session-id/token
+      chunks of 130–480 KB where absence is common and the waste real).
+      Exact-leaf shapes (GROUP BY / label filters) → 3 waves for EVERY
+      existing file, ships as a querier image. Bytes: +0 for present keys
+      (the chunk is read anyway), +chunk for absent ones. Does not help
+      `match_all` token shapes (large chunks, absence common).
+      (2b) additive format: the writer emits a tail-resident hot table
+      (key → doc_count + plist pointer) for every field whose whole key
+      set fits ~4 KB; readers with it go open → plist = **2 waves** for
+      small-field exact leaves (−50 % on this shape), new/recompacted
+      files only. Backward compatible without a version bump: unknown
+      blob tags and properties are skipped (`container_from_meta`
+      `_ => continue`). (2a) and (2b) compose (old files via 2a). The only
+      way below 4 waves for token shapes besides concurrency is cells in
+      the dictionary blocks (pointer cells beside the key, +12 B/key) —
+      a real layout change, not planned.
+      (3) Close the 30 → 80 ms gap: halves the phase with no S3 risk;
+      needs the per-stage timer first. After the CPU fix the scan phase
+      (3.4–6 s + the ~100 GB/pod whole-file back-fill at 650 MB/s for
+      3 min) is the larger half.
 
 ## 2026-09-29 — P2 shipped as `.176` and rolled back within 30 min: the per-stream side table stalled the shared meta DB (commit latency 40–60×, ingest 503s); ranges must live in the segment row
 - What shipped (vix-arch `013c45010` + NATS retry `76fe754b5`, image
