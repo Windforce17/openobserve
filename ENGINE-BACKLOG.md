@@ -2122,13 +2122,53 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
       per-stage timer (issue → first byte → body → fill done) on one pod.
     - Levers, in order: (1) `ZO_VIX_SEARCH_CONCURRENCY` up. **Conservative
       step SHIPPED: 192 → 256 with `ZO_VIX_FETCH_CONCURRENCY` 512 → 768
-      (GitOps #621, merged 08:44Z; rolls the queriers).** 256 keeps the
-      eval gate non-binding (341 row-id admits) and the gRPC blocking pool
-      (512) at ~270 long-held threads. Expected in flight ~440, eval phase
-      −25 % (7 d cold count 11.5 → 8.6 s). Next step if S3 503s, the fetch
-      queue phase, CFS throttling and RSS stay clean: 320–384 WITH
-      `ZO_VIX_EVAL_MAX_BYTES` 6 GiB and `ZO_GRPC_RUNTIME_BLOCKING_WORKER_NUM`
-      1024 (384 → in flight ~660, fleet 40k → 80k GET/s, −50 %).
+      (GitOps #621, merged 08:44Z, rolled 08:46Z).** Expected in flight
+      ~440, eval −25 %. **Measured (08:50Z cold, same shape, 13.3k files;
+      and 09:01Z on a day-old, never-cached window, 14.2k bigger merged
+      files): the slots are NOT what binds any more — the eval byte gate
+      is.** Effective concurrent evaluations (`slots − Σ evaluation_wait
+      / eval phase`, the gate-side mirror of `acquire_evaluation`): 192
+      slots → 184–191 (wait 1.5–26 s per follower); 256 slots → 203–224
+      on the recent window (wait 69–256 s) and a flat **175–180** on the
+      day-old window (wait 252–437 s). Arithmetic: `ZO_VIX_EVAL_MAX_BYTES`
+      4 GiB with `budget/8` growth headroom admits 3.5 GiB; a row-id eval
+      declares 12.2 MiB and grows ~4–5 MiB (recent files) / ~8 MiB (older
+      merged files, bigger dict index + tails) → 3,572 MiB / 16.6 ≈ 215,
+      / 20.2 ≈ 177. So on big-file windows the 192-slot fleet was already
+      gate-bound. Results: eval phase median 2.91 → 2.79 s (best 2.60 →
+      2.15), in flight 324 → 325 (unchanged, as the gate predicts),
+      per-read latency flat 80 → 77 ms, fetch count gate (768) queue
+      0.0 ms/read everywhere, no growth timeouts, no refusals, CFS
+      throttling ≤ 0.4 %, RSS of the new pods 8–11 GiB at 35 min. Follower
+      median wall 10.8 → 9.8 s (scan phase 7.5 → 6.7 s), but the leader's
+      total went 12.8 → 14.7 s on two stragglers (14.2 / 14.5 s vs 12.7):
+      `rrn4b` — slowest in all five runs (93–103 ms/read vs 75–85 fleet),
+      the only pod queueing on the FETCH byte gate (`ZO_VIX_FETCH_MAX_BYTES`
+      unset = 256 MiB ceiling, no headroom, shared by search and scan;
+      85 ms/read, 933 s in the one query — Little's law: slower fetches
+      hold the same bytes longer, and ~210 concurrent opens × 896 KB tail
+      ≈ 190–230 MB already sit at the gate), on a 16-vCPU m7g.4xlarge
+      shared with `o2-openobserve-ingester-3`, `o2-nats-0`, `obs-nats-2`,
+      `obs-compactor`; and `9244q` (highest gate wait, slowest scan).
+      Three LIMIT shapes ran 1 min after the roll on still-warming pods
+      (svc+phrase 2.6 → 6.1 s with eval unchanged at 0.85–1.3 s/follower;
+      setup-minus-eval ~1 s and scan 1.2–2.8 s carried it); on the day-old
+      window 25 min later they were 1.77 / 0.62 / 1.09 s (pre-roll 2.63 /
+      0.68 / 1.21) — no eval regression. **Next step: not more slots —
+      relieve the gates.** `ZO_VIX_EVAL_MAX_BYTES` 4 → 6 GiB (admissible
+      5.25 GiB → ≥ 256 evals at 20 MiB) and `ZO_VIX_FETCH_MAX_BYTES` 256 →
+      512 MiB (the open wave of 256 × 896 KB stops saturating it). Real
+      memory cost is slot-bounded, not budget-bounded: the 12.2 MiB
+      declaration is 6–10× the measured 1–2 MB fetched workspace, growth
+      is charged exactly, so going 212 → 256 running evals adds ≈ 44–79 ×
+      ~10 MB ≈ 0.5–0.8 GiB transient plus ≤ 256 MiB in-flight fetch bytes.
+      Against the ceiling: querier RSS peaked 20.6 GiB (working set
+      23.4 of 24 GiB) in the last 24 h, routinely 17–18 GiB — so pair it
+      with a rollback trigger (RSS > 21 GiB on any pod) and do NOT raise
+      slots in the same change. Expected: eval 2.8 → ~2.3 s (recent) and
+      3.7 → ~2.6 s (older windows); the scan phase stays the larger half.
+      Only after that, slots 320–384 with `ZO_GRPC_RUNTIME_BLOCKING_WORKER_NUM`
+      1024 (384 → in flight ~660, fleet 40k → 80k GET/s).
       (2) Cut the per-leaf chain one level. Two versions:
       (2a) reader-only, no format change: in `eval_and`'s point wave
       (`resolve_point_batch`) the predecessor block of every exact target
