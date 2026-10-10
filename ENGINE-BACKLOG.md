@@ -2336,22 +2336,38 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     15.8 / 16.8 s. With 4× the room and half the in-flight reads
     (≤ 274 × ~0.8 MB ≈ 220 MB ≪ 1 GiB) every fetch still queued tens of
     ms, so the queue was never waiting for bytes.
-  - Why "cold" numbers moved anyway (confound, resolved): the file set
-    was identical both runs (14,151 files, 33.4 GB of sidecars, same
-    condition and row-id mode) but logical bytes/file fell 921 → 480 KB.
-    The battery's first two shapes open every sidecar of the window and
-    `warm_used_sidecar` queues each for a whole-file download, so the
-    third shape (GROUP BY) meets a remote/disk MIX that depends on how far
-    that back-fill got: 0 % at 11:24Z (post-roll download storm → 100 %
-    remote, 768 KiB tail + 8 reads per open = 921 KB), 12.7 % at the
-    start of `fetch1g_d3` and rising during it (480 KB/file), 100 % on
-    the reverted generation at 13:48Z (`revert_d3`: 0 remote MB,
-    160–198 MB disk per follower, 7.3 reads/file at 1.7–3.7 ms, eval
-    median 2.02 s = CPU-bound decode, slot wait 71–270 s from organic
-    load). The volume is a generic ephemeral PVC (dies with the pod), so
-    this is the back-fill, not persistence. **The GROUP BY shape in this
-    battery is not a cold-remote measurement; run it first on a
-    never-queried window, or compare fetch-phase metrics.**
+  - Why "cold" numbers moved anyway (confound, mostly explained): the
+    file set was identical both runs (14,151 files, 33.4 GB of sidecars,
+    same condition and row-id mode) but logical bytes/file fell
+    921 → 503 KB. The battery's first two shapes open every sidecar of
+    the window and `warm_used_sidecar` queues each for a whole-file
+    download, so the third shape (GROUP BY) meets a remote/disk MIX that
+    depends on how far that back-fill got: 0 % at 11:24Z (post-roll
+    download storm → 100 % remote, 768 KiB tail + 8 reads per open =
+    921 KB), 12.7 % at the start of `fetch1g_d3` and rising during its
+    10 s (the mix alone predicts ~800 KB/file, so part of the drop is
+    unexplained), 100 % on the reverted generation at 13:48Z
+    (`revert_d3`: 0 remote MB, 160–198 MB disk per follower, 7.3
+    reads/file at 1.7–3.7 ms, eval median 2.02 s = CPU-bound decode,
+    slot wait 71–270 s from organic load). The volume is a generic
+    ephemeral PVC (dies with the pod), so this is the back-fill, not
+    persistence. Accounting note: `remMB` is `remote_bytes` only; a range
+    served by the block tier's read-through (remote GET → sparse file →
+    pread) lands in `block_bytes` (`blkMB`), so cold totals are
+    remote + block (the `.210` "1.3 GB remote" was a run where the block
+    tier served 6 MB). **The GROUP BY shape in this battery is not a
+    cold-remote measurement; run it first on a never-queried window, or
+    compare fetch-phase metrics.**
+  - Pre-`.211` baseline done that way (`pre211_d6` 13:58Z, `.210`
+    reverted generation 43 min old, window 10-03 10:00Z → 10-04 10:00Z
+    never queried, GROUP BY first; 988–1,155 files per follower, 23–27 GB
+    of sidecars): 0 disk MB, **9.0 reads/file, remote 152–191 MB + block
+    read-through 794–930 MB per follower (~1.0 MB/file)**, in flight 259
+    (160–290), 63–92 ms/read, **`queue_us`/read 16–125 ms** (4kcqm 69,
+    nnbtz 125 → eval 4.70 / 4.46 s; the rest 16–53 → 2.3–2.8 s), eval
+    median **2.57 s**, eff 248–254, slot wait 5–39 s, scan 5.1–6.7 s,
+    leader 11.5 s. Post-`.211` repeats this exact window on fresh pods
+    (the back-fill lives on the old pods' ephemeral volumes).
   - RSS: 1 GiB generation at 17 min 14.8–20.3 GiB working set (9p4q8
     20.3, jm9gd 19.3; 23.7 GiB peak per the revert PR) vs `.210` pods
     8–15 GiB at equal age — but an ExtractService scan storm
