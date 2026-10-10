@@ -66,8 +66,14 @@ pub struct FetchStats {
     pub memory_bytes: AtomicU64,
     pub disk_fetches: AtomicU64,
     pub disk_bytes: AtomicU64,
+    /// Ranges every block of which the disk block tier held.
+    pub block_fetches: AtomicU64,
+    pub block_bytes: AtomicU64,
     pub remote_fetches: AtomicU64,
     pub remote_bytes: AtomicU64,
+    /// Bytes actually moved from object storage: `remote_bytes` plus the
+    /// block-alignment over-fetch of block-tier fills.
+    pub remote_physical_bytes: AtomicU64,
     pub object_store_fetches: AtomicU64,
     pub object_store_bytes: AtomicU64,
     pub queue_micros: AtomicU64,
@@ -736,6 +742,7 @@ fn record_physical(path: &'static str, operation: Option<&Arc<ReadOperation>>, r
             let (count, size) = match read.source {
                 RangeSource::Memory => (&stats.memory_fetches, &stats.memory_bytes),
                 RangeSource::Disk => (&stats.disk_fetches, &stats.disk_bytes),
+                RangeSource::Block => (&stats.block_fetches, &stats.block_bytes),
                 RangeSource::Remote => (&stats.remote_fetches, &stats.remote_bytes),
                 RangeSource::ObjectStore => {
                     (&stats.object_store_fetches, &stats.object_store_bytes)
@@ -743,6 +750,9 @@ fn record_physical(path: &'static str, operation: Option<&Arc<ReadOperation>>, r
             };
             count.fetch_add(1, Ordering::Relaxed);
             size.fetch_add(bytes, Ordering::Relaxed);
+            stats
+                .remote_physical_bytes
+                .fetch_add(read.remote_physical_bytes, Ordering::Relaxed);
         });
     }
 }
@@ -921,6 +931,7 @@ impl Backend {
                 )
                 .await?,
                 source: RangeSource::ObjectStore,
+                remote_physical_bytes: 0,
             },
         })
     }

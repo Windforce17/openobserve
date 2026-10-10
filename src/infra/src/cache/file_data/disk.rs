@@ -1023,12 +1023,20 @@ async fn set_from_tmp_file(
         return Ok(());
     }
     let ret = files.set(file, tmp_file.path(), data_size).await;
+    drop(files);
 
     let set_took = start.elapsed().as_millis() as usize;
     if set_took > 100 {
         log::info!("disk->cache: set file {file} took: {set_took} ms");
     }
 
+    if ret.is_ok()
+        && file.starts_with("files")
+        && let Some(blocks) = super::block::global()
+    {
+        // The whole file now serves every range; its block entry is redundant.
+        blocks.remove(file);
+    }
     ret
 }
 

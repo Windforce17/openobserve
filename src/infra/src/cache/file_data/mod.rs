@@ -13,6 +13,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+pub mod block;
 pub mod delete;
 pub mod disk;
 pub mod memory;
@@ -190,6 +191,7 @@ impl CacheStrategy {
 
 pub async fn init() -> Result<(), anyhow::Error> {
     disk::init().await?;
+    block::init().await?;
     memory::init().await?;
     Ok(())
 }

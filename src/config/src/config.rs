@@ -3203,6 +3203,24 @@ pub struct DiskCache {
     pub max_age_days: i64,
     #[env_config(name = "ZO_DISK_CACHE_MULTI_DIR", default = "")] // dir1,dir2,dir3...
     pub multi_dir: String,
+    /// Block-granular tier behind the whole-file disk cache: range reads
+    /// that miss both whole-file tiers are served from / written through
+    /// to block-aligned sparse files, so a query caches only the bytes it
+    /// touched instead of the whole object (a `.vix` scan touches 2-3% of
+    /// a data file, an index evaluation ~2% of a sidecar).
+    #[env_config(name = "ZO_DISK_CACHE_BLOCK_ENABLED", default = false)]
+    pub block_enabled: bool,
+    /// Bytes; power of two in 4 KiB..=64 MiB. Smaller blocks fetch less
+    /// around a read at the price of a larger per-entry bitmap. Replayed on
+    /// prod files (cold open + index eval + narrow projection), bytes moved
+    /// vs the uncached fetch: 16 KiB 1.01-1.03x, 64 KiB 1.07-1.22x,
+    /// 256 KiB 1.3-2.0x; the whole-file tier moves 30-55x.
+    #[env_config(name = "ZO_DISK_CACHE_BLOCK_SIZE", default = 65536)]
+    pub block_size: usize,
+    /// MB, carved out of ZO_DISK_CACHE_MAX_SIZE when the tier is enabled;
+    /// 0 = 25% of it.
+    #[env_config(name = "ZO_DISK_CACHE_BLOCK_MAX_SIZE", default = 0)]
+    pub block_max_size: usize,
 }
 
 #[derive(Serialize, EnvConfig, Default)]
@@ -4576,6 +4594,33 @@ fn check_disk_cache_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
         cfg.disk_cache.max_size *= 1024 * 1024;
     }
 
+    // The block tier shares the volume with the whole-file tier: carve its
+    // budget out of max_size BEFORE the derived whole-file sizes (release,
+    // skip, result, aggregation) are computed from it.
+    if cfg.disk_cache.block_enabled {
+        let block_size = cfg.disk_cache.block_size;
+        if !block_size.is_power_of_two() || !(4096..=64 * 1024 * 1024).contains(&block_size) {
+            return Err(anyhow::anyhow!(
+                "ZO_DISK_CACHE_BLOCK_SIZE must be a power of two between 4096 and 67108864, got {block_size}"
+            ));
+        }
+        if cfg.disk_cache.block_max_size == 0 {
+            cfg.disk_cache.block_max_size = cfg.disk_cache.max_size / 4; // 25%
+        } else {
+            cfg.disk_cache.block_max_size *= 1024 * 1024;
+        }
+        if cfg.disk_cache.block_max_size >= cfg.disk_cache.max_size {
+            return Err(anyhow::anyhow!(
+                "ZO_DISK_CACHE_BLOCK_MAX_SIZE ({} MB) must be smaller than the disk cache size ({} MB)",
+                cfg.disk_cache.block_max_size / 1024 / 1024,
+                cfg.disk_cache.max_size / 1024 / 1024
+            ));
+        }
+        cfg.disk_cache.max_size -= cfg.disk_cache.block_max_size;
+    } else {
+        cfg.disk_cache.block_max_size = 0;
+    }
+
     if cfg.disk_cache.result_max_size == 0 {
         cfg.disk_cache.result_max_size = cfg.disk_cache.max_size / 10; // 10%
         if cfg.disk_cache.result_max_size > 1024 * 1024 * 1024 * 20 {
@@ -4657,6 +4702,7 @@ fn check_disk_cache_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
     cfg.disk_cache.aggregation_max_size /= cfg.disk_cache.bucket_num;
     cfg.disk_cache.release_size /= cfg.disk_cache.bucket_num;
     cfg.disk_cache.gc_size /= cfg.disk_cache.bucket_num;
+    cfg.disk_cache.block_max_size /= cfg.disk_cache.bucket_num;
 
     Ok(())
 }
@@ -4926,6 +4972,64 @@ mod tests {
             err.to_string()
                 .contains("ZO_MEMORY_CACHE_DATAFUSION_MEMORY_POOL")
         );
+    }
+
+    /// The block tier's budget is carved out of the disk cache BEFORE the
+    /// whole-file sizes (skip, release) derive from it, so they follow the
+    /// budget the whole-file tier actually has; both budgets then split per
+    /// bucket. Off, the whole-file tier keeps everything.
+    #[test]
+    fn disk_cache_block_budget_is_carved_before_derived_sizes() {
+        let mib = 1024 * 1024;
+        let cache_dir = std::env::temp_dir().join("o2-config-block-budget-test");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let cache_dir = format!("{}/", cache_dir.display());
+        let base = || {
+            let mut cfg = Config::init().unwrap();
+            cfg.common.data_cache_dir = cache_dir.clone();
+            cfg.disk_cache.max_size = 1024; // MB
+            cfg.disk_cache.bucket_num = 4;
+            cfg.disk_cache.skip_size = 0;
+            cfg.disk_cache.release_size = 0;
+            cfg.disk_cache.block_enabled = true;
+            cfg.disk_cache.block_size = 65536;
+            cfg.disk_cache.block_max_size = 0;
+            cfg
+        };
+
+        let mut cfg = base();
+        check_disk_cache_config(&mut cfg).unwrap();
+        assert_eq!(cfg.disk_cache.block_max_size, 256 * mib / 4, "25 % default");
+        assert_eq!(cfg.disk_cache.max_size, 768 * mib / 4);
+        assert_eq!(
+            cfg.disk_cache.skip_size,
+            768 * mib / 2,
+            "derived from the remainder"
+        );
+        assert_eq!(cfg.disk_cache.release_size, 768 * mib / 10 / 4);
+
+        let mut cfg = base();
+        cfg.disk_cache.block_max_size = 100; // MB, explicit
+        check_disk_cache_config(&mut cfg).unwrap();
+        assert_eq!(cfg.disk_cache.block_max_size, 100 * mib / 4);
+        assert_eq!(cfg.disk_cache.max_size, 924 * mib / 4);
+
+        let mut cfg = base();
+        cfg.disk_cache.block_enabled = false;
+        cfg.disk_cache.block_max_size = 100;
+        check_disk_cache_config(&mut cfg).unwrap();
+        assert_eq!(cfg.disk_cache.block_max_size, 0, "off: no budget");
+        assert_eq!(cfg.disk_cache.max_size, 1024 * mib / 4);
+
+        let mut cfg = base();
+        cfg.disk_cache.block_size = 3 * 4096;
+        let err = check_disk_cache_config(&mut cfg).unwrap_err();
+        assert!(err.to_string().contains("ZO_DISK_CACHE_BLOCK_SIZE"));
+
+        let mut cfg = base();
+        cfg.disk_cache.block_max_size = 1024; // the whole cache
+        let err = check_disk_cache_config(&mut cfg).unwrap_err();
+        assert!(err.to_string().contains("ZO_DISK_CACHE_BLOCK_MAX_SIZE"));
     }
 
     /// M11 launch defaults (OWNER 2026-08-18: "cache_latest_files default

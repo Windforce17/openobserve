@@ -437,6 +437,63 @@ pub static QUERY_DISK_CACHE_FILES: Lazy<IntGaugeVec> = Lazy::new(|| {
     .expect("Metric created")
 });
 
+// querier disk block cache stats (block-granular tier behind the whole-file
+// disk cache; see infra::cache::file_data::block)
+pub static QUERY_DISK_BLOCK_CACHE_USED_BYTES: Lazy<IntGaugeVec> = Lazy::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            "query_disk_block_cache_used_bytes",
+            "Querier disk block cache used bytes (present blocks).".to_owned() + HELP_SUFFIX,
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &["organization", "stream_type"],
+    )
+    .expect("Metric created")
+});
+pub static QUERY_DISK_BLOCK_CACHE_FILES: Lazy<IntGaugeVec> = Lazy::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            "query_disk_block_cache_files",
+            "Querier disk block cache entries (objects with at least one block).".to_owned()
+                + HELP_SUFFIX,
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &["organization", "stream_type"],
+    )
+    .expect("Metric created")
+});
+/// `outcome`: `hit` = every block present, `partial` = some fetched,
+/// `miss` = all fetched (cold object or cold region).
+pub static QUERY_DISK_BLOCK_CACHE_REQUESTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "query_disk_block_cache_requests_total",
+            "Range reads served through the disk block cache by outcome",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &["outcome"],
+    )
+    .expect("Metric created")
+});
+/// `source`: `block` = logical bytes served from present blocks, `remote` =
+/// bytes fetched from object storage for fills (block-aligned, so >= the
+/// logical miss bytes).
+pub static QUERY_DISK_BLOCK_CACHE_BYTES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "query_disk_block_cache_bytes_total",
+            "Bytes moved through the disk block cache by source",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &["source"],
+    )
+    .expect("Metric created")
+});
+
 // querier disk result cache stats
 pub static QUERY_DISK_RESULT_CACHE_USED_BYTES: Lazy<IntGaugeVec> = Lazy::new(|| {
     IntGaugeVec::new(
@@ -2305,6 +2362,18 @@ fn register_metrics(registry: &Registry) {
         .expect("Metric registered");
     registry
         .register(Box::new(QUERY_DISK_CACHE_FILES.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(QUERY_DISK_BLOCK_CACHE_USED_BYTES.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(QUERY_DISK_BLOCK_CACHE_FILES.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(QUERY_DISK_BLOCK_CACHE_REQUESTS_TOTAL.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(QUERY_DISK_BLOCK_CACHE_BYTES_TOTAL.clone()))
         .expect("Metric registered");
     registry
         .register(Box::new(QUERY_DISK_RESULT_CACHE_USED_BYTES.clone()))

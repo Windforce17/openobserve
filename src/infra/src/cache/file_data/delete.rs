@@ -32,6 +32,9 @@ impl Queue {
                     if let Err(e) = super::disk::remove(&file).await {
                         log::error!("[CACHE:FILE_DATA] Failed to delete file: {e}");
                     }
+                    if let Some(blocks) = super::block::global() {
+                        blocks.remove(&file);
+                    }
                     tokio::task::consume_budget().await;
                 }
             }

@@ -20,8 +20,9 @@ use bytes::Bytes;
 use config::utils::time::BASE_TIME;
 use futures::{StreamExt, stream::BoxStream};
 use object_store::{
-    Error, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result, path::Path,
+    Error, GetOptions, GetRange, GetResult, GetResultPayload, ListResult, MultipartUpload,
+    ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
+    path::Path,
 };
 
 use crate::{
@@ -129,6 +130,10 @@ impl ObjectStoreExt for CacheFS {
         if let Ok(res) = file_data::get_opts(account, &path, options.clone(), false).await {
             return Ok(res);
         }
+        let blocks = file_data::block::global().map(|blocks| blocks.as_ref());
+        if let Some(res) = block_get_opts(account, &path, &options, blocks).await? {
+            return Ok(res);
+        }
         // default to storage
         storage::get_opts(account, &path, options).await
     }
@@ -153,6 +158,10 @@ impl ObjectStoreExt for CacheFS {
         // disk cache → one File::open + N preads. Falls back to remote on
         // cache miss (which itself does batched ranges per backend).
         if let Ok(v) = file_data::get_ranges_opts(account, &path, ranges, false).await {
+            return Ok(v);
+        }
+        let blocks = file_data::block::global().map(|blocks| blocks.as_ref());
+        if let Some(v) = block_get_ranges(account, &path, ranges, blocks).await? {
             return Ok(v);
         }
 
@@ -288,6 +297,9 @@ pub async fn get_ranges(
 pub enum RangeSource {
     Memory,
     Disk,
+    /// Every block of the range was present in the disk block tier.
+    Block,
+    /// Fetched from object storage, including block-tier misses and partials.
     Remote,
     /// An arbitrary registered ObjectStore; its internal cache policy is unknown.
     ObjectStore,
@@ -298,15 +310,21 @@ impl RangeSource {
         match self {
             Self::Memory => "memory",
             Self::Disk => "disk",
+            Self::Block => "block",
             Self::Remote => "remote",
             Self::ObjectStore => "object_store",
         }
     }
 }
 
+#[derive(Debug)]
 pub struct RangeRead {
     pub bytes: Bytes,
     pub source: RangeSource,
+    /// Bytes this read moved from object storage: the range itself for a
+    /// plain remote read, the block-aligned fill for a block-tier miss or
+    /// partial (>= the logical miss), 0 for cache hits.
+    pub remote_physical_bytes: u64,
 }
 
 /// Execute one physical range through the same cache ladder as `get_opts`.
@@ -317,13 +335,24 @@ pub async fn get_range_classified(
     range: Range<u64>,
     owner: Option<std::sync::Arc<dyn Send + Sync>>,
 ) -> Result<RangeRead> {
+    let blocks = file_data::block::global().map(|blocks| blocks.as_ref());
+    get_range_classified_with(account, location, range, owner, blocks).await
+}
+
+async fn get_range_classified_with(
+    account: &str,
+    location: &Path,
+    range: Range<u64>,
+    owner: Option<std::sync::Arc<dyn Send + Sync>>,
+    blocks: Option<&file_data::block::BlockCache>,
+) -> Result<RangeRead> {
     if range.start > range.end {
         return Err(crate::storage::Error::BadRange(location.to_string()).into());
     }
     let max_bytes = range.end - range.start;
     let file = location.as_ref();
     let options = GetOptions {
-        range: Some(range.into()),
+        range: Some(range.clone().into()),
         ..Default::default()
     };
     let cfg = config::get_config();
@@ -343,6 +372,7 @@ pub async fn get_range_classified(
                 bytes
             },
             source: RangeSource::Memory,
+            remote_physical_bytes: 0,
         });
     }
     if cfg.disk_cache.enabled
@@ -351,17 +381,147 @@ pub async fn get_range_classified(
         return Ok(RangeRead {
             bytes: range_bytes_with_owner(result, owner, max_bytes).await?,
             source: RangeSource::Disk,
+            remote_physical_bytes: 0,
         });
     }
+    if let Some(blocks) = block_tier(blocks, file, max_bytes) {
+        let fetch = block_fetcher(account.to_string(), file.to_string());
+        let read = blocks.read_through(file, range, owner, &fetch).await?;
+        return Ok(RangeRead {
+            bytes: read.bytes,
+            source: if read.outcome == file_data::block::Outcome::Hit {
+                RangeSource::Block
+            } else {
+                RangeSource::Remote
+            },
+            remote_physical_bytes: read.remote_bytes,
+        });
+    }
+    let bytes = range_bytes_with_owner(
+        storage::get_opts(account, file, options).await?,
+        owner,
+        max_bytes,
+    )
+    .await?;
     Ok(RangeRead {
-        bytes: range_bytes_with_owner(
-            storage::get_opts(account, file, options).await?,
-            owner,
-            max_bytes,
-        )
-        .await?,
+        remote_physical_bytes: bytes.len() as u64,
+        bytes,
         source: RangeSource::Remote,
     })
+}
+
+/// The block tier, when it is on, `file` is a stored data file and a request
+/// of `total_bytes` is small enough for it.
+fn block_tier<'a>(
+    blocks: Option<&'a file_data::block::BlockCache>,
+    file: &str,
+    total_bytes: u64,
+) -> Option<&'a file_data::block::BlockCache> {
+    blocks.filter(|blocks| file.starts_with("files/") && blocks.admits(total_bytes))
+}
+
+/// Object-storage fetch for the block tier: block-aligned ranges, clipped by
+/// the store at the object end; the object size rides along from the
+/// response metadata.
+fn block_fetcher(
+    account: String,
+    file: String,
+) -> impl Fn(Range<u64>) -> file_data::block::FetchFuture + Sync {
+    move |range: Range<u64>| {
+        let account = account.clone();
+        let file = file.clone();
+        Box::pin(async move {
+            let options = GetOptions {
+                range: Some(GetRange::Bounded(range.clone())),
+                ..Default::default()
+            };
+            let result = storage::get_opts(&account, &file, options).await?;
+            let object_size = result.meta.size;
+            let bytes = range_bytes_with_owner(result, None, range.end - range.start).await?;
+            Ok(file_data::block::Fetched { bytes, object_size })
+        })
+    }
+}
+
+/// `get_ranges` through the block tier: every range's missing blocks are
+/// fetched together, so blocks shared by several ranges move once.
+async fn block_get_ranges(
+    account: &str,
+    file: &str,
+    ranges: &[Range<u64>],
+    blocks: Option<&file_data::block::BlockCache>,
+) -> Result<Option<Vec<Bytes>>> {
+    let total = ranges.iter().map(|r| r.end.saturating_sub(r.start)).sum();
+    let Some(blocks) = block_tier(blocks, file, total) else {
+        return Ok(None);
+    };
+    let fetch = block_fetcher(account.to_string(), file.to_string());
+    Ok(Some(
+        blocks
+            .read_through_many(file, ranges, None, &fetch)
+            .await?
+            .bytes,
+    ))
+}
+
+/// `get_opts` through the block tier: plain range reads only (no
+/// conditional headers, versions or HEAD). A relative range needs the
+/// object size, which the tier knows once it holds any block of the object.
+async fn block_get_opts(
+    account: &str,
+    file: &str,
+    options: &GetOptions,
+    blocks: Option<&file_data::block::BlockCache>,
+) -> Result<Option<GetResult>> {
+    if options.if_match.is_some()
+        || options.if_none_match.is_some()
+        || options.if_modified_since.is_some()
+        || options.if_unmodified_since.is_some()
+        || options.version.is_some()
+        || options.head
+    {
+        return Ok(None);
+    }
+    let Some(blocks) = blocks.filter(|_| file.starts_with("files/")) else {
+        return Ok(None);
+    };
+    let range = match &options.range {
+        Some(GetRange::Bounded(range)) => range.clone(),
+        Some(relative) => match blocks.object_size(file) {
+            Some(size) => relative.as_range(size).map_err(|e| Error::Generic {
+                store: "disk block cache",
+                source: Box::new(e),
+            })?,
+            None => return Ok(None),
+        },
+        None => return Ok(None),
+    };
+    if range.start > range.end || !blocks.admits(range.end - range.start) {
+        return Ok(None);
+    }
+    let fetch = block_fetcher(account.to_string(), file.to_string());
+    let read = blocks
+        .read_through(file, range.clone(), None, &fetch)
+        .await?;
+    let end = range.start + read.bytes.len() as u64;
+    Ok(Some(GetResult {
+        payload: GetResultPayload::Stream(
+            futures::stream::once(futures::future::ready(Ok(read.bytes))).boxed(),
+        ),
+        meta: ObjectMeta {
+            location: Path::from(file),
+            last_modified: *BASE_TIME,
+            size: read.object_size,
+            e_tag: Some(format!(
+                "{:x}-{:x}",
+                BASE_TIME.timestamp_micros(),
+                read.object_size
+            )),
+            version: None,
+        },
+        range: range.start..end,
+        attributes: Default::default(),
+    }))
 }
 
 /// Keep admission alive inside non-preemptible local file IO even if its async
@@ -702,6 +862,116 @@ mod tests {
             .unwrap();
         assert_eq!(read.source, RangeSource::Remote);
         assert_eq!(read.bytes, Bytes::from_static(b"remote"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn block_tier_serves_whole_file_misses_by_block() {
+        use object_store::ObjectStoreExt as _;
+        let org = "vix-block-tier";
+        let account = format!("{org}:default");
+        let path = Path::from("files/vix-block-tier/logs/stream/2026/09/05/00/source.vix");
+        // 300 000 bytes: 4 full 64 KiB blocks and a 37 856-byte tail block.
+        let data: Vec<u8> = (0..300_000u32).map(|i| (i % 253) as u8).collect();
+        let data = Bytes::from(data);
+        let remote = object_store::memory::InMemory::new();
+        remote.put(&path, data.clone().into()).await.unwrap();
+        storage::add_account(org, Box::new(remote)).await;
+        file_data::memory::remove(path.as_ref()).await.unwrap();
+        file_data::disk::remove(path.as_ref()).await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let blocks = file_data::block::BlockCache::new(
+            dir.path().to_path_buf(),
+            64 * 1024,
+            1 << 30,
+            64 * 1024,
+            "time_lru",
+            1,
+        );
+
+        // Cold: a 10-byte read fetches one aligned block and reports remote.
+        let read = get_range_classified_with(&account, &path, 100..110, None, Some(&blocks))
+            .await
+            .unwrap();
+        assert_eq!(read.source, RangeSource::Remote);
+        assert_eq!(read.bytes, data.slice(100..110));
+        assert_eq!(read.remote_physical_bytes, 64 * 1024);
+        assert_eq!(blocks.object_size(path.as_ref()), Some(300_000));
+
+        // Warm: same block, no remote bytes, classified as the block tier.
+        let read = get_range_classified_with(&account, &path, 0..65_536, None, Some(&blocks))
+            .await
+            .unwrap();
+        assert_eq!(read.source, RangeSource::Block);
+        assert_eq!(read.bytes, data.slice(0..65_536));
+        assert_eq!(read.remote_physical_bytes, 0);
+
+        // Tail block through get_ranges, clipped at the object end; the
+        // request end past EOF follows `GetRange::as_range`.
+        let ranges = [262_144..262_154, 299_990..400_000, 0..4];
+        let bytes = block_get_ranges(&account, path.as_ref(), &ranges, Some(&blocks))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(bytes[0], data.slice(262_144..262_154));
+        assert_eq!(bytes[1], data.slice(299_990..300_000));
+        assert_eq!(bytes[2], data.slice(0..4));
+        assert_eq!(blocks.stats().1, 65_536 + (300_000 - 262_144));
+
+        // Suffix read through get_opts resolves against the learned size.
+        let suffix = GetOptions {
+            range: Some(GetRange::Suffix(16)),
+            ..Default::default()
+        };
+        let result = block_get_opts(&account, path.as_ref(), &suffix, Some(&blocks))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.range, 299_984..300_000);
+        assert_eq!(result.meta.size, 300_000);
+        assert_eq!(result.bytes().await.unwrap(), data.slice(299_984..300_000));
+
+        // Conditional requests, non-data keys and oversized requests bypass.
+        let conditional = GetOptions {
+            range: Some(GetRange::Bounded(0..4)),
+            if_match: Some("x".into()),
+            ..Default::default()
+        };
+        assert!(
+            block_get_opts(&account, path.as_ref(), &conditional, Some(&blocks))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let small: Range<u64> = 0..4;
+        assert!(
+            block_get_ranges(
+                &account,
+                "results/x/y",
+                std::slice::from_ref(&small),
+                Some(&blocks)
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        let huge: Range<u64> = 0..(1 << 30);
+        assert!(
+            block_get_ranges(
+                &account,
+                path.as_ref(),
+                std::slice::from_ref(&huge),
+                Some(&blocks)
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+
+        // A start past the end is NotFound, like the store itself.
+        let err = get_range_classified_with(&account, &path, 300_000..300_010, None, Some(&blocks))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::NotFound { .. }), "{err}");
     }
 
     #[test]

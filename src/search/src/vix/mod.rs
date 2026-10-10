@@ -903,7 +903,7 @@ pub async fn vix_search(
     // one wave each count once, so this bounds sequential depth from above
     // and is not itself the round-trip count.
     log::info!(
-        "[trace_id {trace_id}] search->vix: io_accounting logical_ranges={} logical_bytes={} fetch_batches={} completed_coalesced_reads={} completed_coalesced_bytes={} memory_reads={} memory_bytes={} disk_reads={} disk_bytes={} remote_reads={} remote_bytes={} unknown_store_reads={} unknown_store_bytes={} queue_us={} active_us={} evaluation_wait_us={}",
+        "[trace_id {trace_id}] search->vix: io_accounting logical_ranges={} logical_bytes={} fetch_batches={} completed_coalesced_reads={} completed_coalesced_bytes={} memory_reads={} memory_bytes={} disk_reads={} disk_bytes={} block_reads={} block_bytes={} remote_reads={} remote_bytes={} remote_physical_bytes={} unknown_store_reads={} unknown_store_bytes={} queue_us={} active_us={} evaluation_wait_us={}",
         fetch_count,
         scan_stats.idx_scan_size,
         load(&fetch_stats.batches),
@@ -913,8 +913,11 @@ pub async fn vix_search(
         load(&fetch_stats.memory_bytes),
         load(&fetch_stats.disk_fetches),
         load(&fetch_stats.disk_bytes),
+        load(&fetch_stats.block_fetches),
+        load(&fetch_stats.block_bytes),
         load(&fetch_stats.remote_fetches),
         load(&fetch_stats.remote_bytes),
+        load(&fetch_stats.remote_physical_bytes),
         load(&fetch_stats.object_store_fetches),
         load(&fetch_stats.object_store_bytes),
         load(&fetch_stats.queue_micros),
