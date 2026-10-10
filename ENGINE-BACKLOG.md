@@ -2037,6 +2037,30 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     tier on disk; a ≥ 1 h steady-state check (hit ratio, used bytes, GC
     behaviour of the 1,125,000 MiB whole-file tier under the new split)
     is the next measurement.
+  - **Owner question (07:00Z): "21 s for 7.5 GB — is it the network?"
+    No.** Trace `01a1246d0cd8707386d8e6393caf9f71` (cold llm-router
+    24 h GROUP BY, 13,804 files, 10 followers on 10 nodes): 7 followers
+    finished at +10 s (index eval 2.5–3.1 s for 1.0–1.4 GB physical =
+    3.3–3.9 Gbps/pod, ~330 reads in flight × 80 ms = ~4k range GETs/s/pod
+    — Little's-law bound, not bandwidth), `t8kbc`/`8mqgd` at +13 s,
+    `nj85h` alone at +21 s (eval 8.2 s, stream 12.8 s). NICs (EC2 API):
+    m7g.8xlarge 15 Gbps dedicated; m7g/m8g/r8g.4xlarge 7.5 Gbps baseline /
+    15 burst, EBS 625 MB/s baseline. Node RX never exceeded 5.9 Gbps,
+    steal 0 %. The straggler's node `ip-172-31-196-174` (m7g.4xlarge,
+    16 vCPU) was 98–100 % busy for ≥ 6 h: `openobserve/o2-openobserve-
+    ingester-6` (req 2 / lim 14) at 8–13.5 cores + `obs-compactor` 2–3
+    cores; the querier (req 2) got 1.2 cores. Same mechanism as the
+    10-07 finding; the ingester was rescheduled off the node at ~07:03Z.
+  - **Whole-file downloader churn.** Every pod pulls a flat ~4.9 Gbps for
+    ~4 min after the query regardless of NIC — `file_download_thread_num`
+    = cpu/2 = 8 workers × one S3 stream each; on the 4xlarge nodes the
+    EBS write sits at 650–697 MB/s, i.e. at the 625 MB/s instance
+    baseline. The query read 13.65 GB of index bytes but queued the
+    13,804 touched files (~925 GB, ~92 GB/pod) into the 1,125,000 MiB
+    whole-file tier; fleet RX 06:00–07:05Z ≈ 4.07 TB, whole tier
+    90–129 → 345–393 GiB/pod in the hour. `ZO_DISK_CACHE_SKIP_SIZE` is
+    unset (→ 50 % of max, never skips). Decision pending: skip whole-file
+    warming for large files now that the block tier serves partial reads.
 
 ## 2026-09-29 — P2 shipped as `.176` and rolled back within 30 min: the per-stream side table stalled the shared meta DB (commit latency 40–60×, ingest 503s); ranges must live in the segment row
 - What shipped (vix-arch `013c45010` + NATS retry `76fe754b5`, image
