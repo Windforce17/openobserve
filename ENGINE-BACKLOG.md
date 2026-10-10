@@ -2198,10 +2198,12 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
       needs the per-stage timer first. After the CPU fix the scan phase
       (3.4–6 s + the ~100 GB/pod whole-file back-fill at 650 MB/s for
       3 min) is the larger half.
-- **2026-10-10 — eval admission redesigned (vix-arch, unshipped): the
-  declared byte gate is gone — slots admit by count, `ZO_VIX_EVAL_MAX_BYTES`
-  is a pool for MEASURED memory, and the fetch byte gate is split
-  search/scan.** The 256-slot measurement above showed the eval byte gate
+- **2026-10-10 — eval admission redesigned, SHIPPED as `.210` (release
+  `0867ac793` = `.209` + vix-arch `904a3109d`, GitOps #622 merged 11:09Z,
+  all 10 queriers on the tag and ready 11:11:54Z): the declared byte gate
+  is gone — slots admit by count, `ZO_VIX_EVAL_MAX_BYTES` is a pool for
+  MEASURED memory, and the fetch byte gate is split search/scan.** The
+  256-slot measurement above showed the eval byte gate
   binding (175–224 effective of 256) because every row-id evaluation
   declared 12.2 MiB against the 3.5 GiB admissible budget while its
   measured growth was 4–8 MiB. The lever listed there (`ZO_VIX_EVAL_MAX_
@@ -2244,13 +2246,80 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     gate is full), and a fetch queued on bytes issuing no IO when
     cancelled; `config` budget/concurrency/metrics tests 3/0.
   - Rollout (querier image, no config change: 4 GiB pool, fetch gate
-    unset = 256 MiB per side): watch `vix_eval_memory_bytes` (expect
-    ≤ 2 GiB at 256 slots), `pool_exhausted` = 0, the RSS > 21 GiB
-    rollback trigger above. Expected: `evaluation_wait_us` → ~0 and
-    effective evaluations = 256 on both windows, i.e. the eval phase
-    2.8 → ~2.3 s (recent) / 3.7 → ~2.6 s (older) the 6 GiB raise was
-    sized for; the scan phase stays the larger half, so (2a)/(3) above
-    remain the next engine levers.
+    unset = 256 MiB per side). Battery `ops:/tmp/evalgate.py <END_us>
+    <label>` (4 cold shapes, `use_cache=false`; samples the fleet's
+    `zo_vix_eval_memory_bytes` at 2 Hz during the runs, snapshots the
+    fallback / growth / fetch-phase counters around them, attributes every
+    follower from pod logs: `eff_evals = slots − Σ evaluation_wait / eval`,
+    `inflight = Σ active / eval`, reads/file, ms/read, `queue_us`/read,
+    remote/disk/block MB; raw lines in `/tmp/evalgate_<label>.json`).
+    - Pre-leg `.209` 10:57Z, window 10-06 10:00Z → 10-07 10:00Z (3-day-old),
+      fleet 2.2 h old (restarted 08:44Z for #621). llm-router 24 h GROUP
+      BY: eval phase median **1.79 s** (1.42–3.32), 7.9 reads/file served
+      from DISK (290–470 MB/follower, 1.7–2.3 ms/read, in flight median
+      13), **gate wait 32–350 s per follower, effective evaluations
+      134–236 (median 199)**; scan phase 6.2–7.7 s, leader 11.2 s. The
+      three LIMIT shapes: eval 0.61 / 0.18 / 0.33 s (svc+phrase remote
+      85 MB + disk 31 MB, 0.4 reads/file at 40 ms), eff 253–256.
+    - Post-leg 1 `.210` 11:24Z, same window, pods 12 min old (0 % disk
+      cache, download storm). GROUP BY: **eff 253–256 (median 255), slot
+      wait 2.8–16.9 s** (`evaluation_wait_us` is slot wait only from
+      here; the wait is real contention with concurrent prod queries),
+      in flight **313** (188–350), 9.3 reads/file all REMOTE
+      (1.3 GB/follower) at 89 ms/read, eval median 3.68 s (3.23–6.77),
+      scan 5.5–8.2 s, leader 15.1 s. LIMIT shapes eval 0.82 / 0.15 /
+      0.35 s (svc+phrase remote 166 MB at 75 ms/read, in flight 66).
+      Pool gauge max during the battery **1.3–2.7 GiB per pod** (8 of 10
+      at 2.4–2.7 GiB ≈ 10.5 MiB per running evaluation on cold merged
+      files — above the 4–8 MiB growth the io_accounting delta suggested,
+      65 % of the pool); `pool_exhausted` 0, growth timeouts 0.
+    - Post-leg 2 `.210` 12:14Z (1 h after the roll). Repeat on the 10-06
+      window: every shape's eval 0.00–0.15 s with ZERO reads (the per-file
+      result memo serves the repeat; GROUP BY leader 5.9 s = scan 2.6–5.6 s
+      from disk) — a repeat is not a warm-IO measurement. Cold 10-05
+      window (4-day-old): GROUP BY eff 253–255, slot wait 1.8–17.3 s,
+      in flight **321** (182–360), 9.3 reads/file remote at **95 ms**,
+      eval median **3.57 s** (3.30–6.90), scan 6.4–8.8 s, leader 15.8 s;
+      svc+phrase eval 1.03 s (remote 166 MB at 86 ms). Pool gauge max
+      1.6–2.7 GiB again; 0 refusals.
+    - Fleet since the roll (pod metrics 12:50Z, 46–55k search fetches per
+      pod): fetch COUNT gate queue **0.0 ms** everywhere; search fetch
+      BYTE gate queue **5.6–73.4 ms per fetch** (t5vkz 73, vk7gq 40,
+      cxn2w 33, r2jvk 21, the rest 6–13) against 88–96 ms active; scan
+      path byte queue ≤ 0.7 ms, active 47–60 ms. The per-follower
+      `queue_us`/read in both post-legs (7–156 ms) orders the followers
+      exactly by eval time (t5vkz 156 ms → 6.90 s, vk7gq 105 → 5.12,
+      cxn2w 57 → 4.65, r2jvk 37 → 4.36, the rest 7–30 → 3.3–3.6 s).
+      Health: restarts 0, RSS working set 13.2–13.8 GiB at 1.6 h (`.209`
+      pods were 14.7–15.5 GiB at 2.2 h), gauge 0 when idle (no leak),
+      `vix_fast_path_fallback_total` only `residual: too many candidate
+      rows` = 1 on one pod (a prod query). Rows: the three LIMIT shapes
+      returned identical rows pre/post/repeat; the GROUP BY has 3,226
+      groups for `size` 1000 with no ORDER BY, so its 1000-row subset
+      differs run to run by construction, not by defect.
+  - **Verdict: the eval gate is gone (effective evaluations 134–236 →
+    253–256, gate wait 32–437 s → 2–17 s of real slot contention), the
+    pool holds at 2.7 GiB of 4 GiB with no refusals, and the eval phase
+    on cold windows did NOT get faster (3.7 → 3.6 s) because in flight
+    stayed at ~320: the pipe is now bounded by the SEARCH fetch byte
+    gate (256 MiB) and S3 latency (77–80 → 89–95 ms/read with 10 × 320
+    GETs in flight).** Bytes: the same GROUP BY reads 1.3 GB logical /
+    2.0 GB block-aligned physical per follower cold (13.0k ranges, 896 KB
+    of tail GETs per open ≈ 1.25 GB of it) against 305 MB / 11.4k ranges
+    when the sidecars were disk-cached (`.209` pre-leg) — cold-vs-warm,
+    not a `.210` change. What saturates a 256 MiB FIFO gate with ~320
+    reads in flight is not observable today (the gate has no occupancy
+    gauge; the reservation is the coalesced plan incl. gaps and lives
+    until the batch completes, `spawn_ranges`), but the wait is: the
+    4 slowest followers are the 4 with the longest byte queue. Next
+    levers, in order: (1) config: `ZO_VIX_FETCH_MAX_BYTES` 256 → 512 MiB —
+    per side since `.210`, so ≤ 1 GiB in flight total; expected in flight
+    ~440 and eval 3.6 → ~2.6 s; (2) engine: publish the two fetch gates'
+    occupancy like the eval pool (`ByteGate::published`) so (1) can be
+    sized from a number instead of a wait; (3) only then `ZO_VIX_SEARCH_
+    CONCURRENCY` 320–384 with `ZO_GRPC_RUNTIME_BLOCKING_WORKER_NUM` 1024;
+    the scan phase (5.5–8.8 s) stays the larger half, so (2a)/(3) above
+    remain the engine levers.
 
 ## 2026-09-29 — P2 shipped as `.176` and rolled back within 30 min: the per-stream side table stalled the shared meta DB (commit latency 40–60×, ingest 503s); ranges must live in the segment row
 - What shipped (vix-arch `013c45010` + NATS retry `76fe754b5`, image
