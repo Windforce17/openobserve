@@ -974,7 +974,7 @@ mod tests {
             Arc::new(super::super::source::FetchStats::default()),
             None,
         );
-        let permit = super::super::source::acquire_evaluation(&operation, 32 * 1024 * 1024)
+        let permit = super::super::source::acquire_evaluation(&operation)
             .await
             .unwrap();
         let lease = operation

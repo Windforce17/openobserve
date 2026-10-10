@@ -248,15 +248,15 @@ fn prod_file_residual_histogram_cost() {
     }
 }
 
-/// Fan-out against the REAL process evaluation gate (`ZO_VIX_EVAL_MAX_BYTES`
-/// / `ZO_VIX_SEARCH_CONCURRENCY` as the test process sees them): as many
-/// concurrent residual-refined histograms of the A48 shape over
-/// `VIX_BENCH_FILE` as the gate admits for the declaration, each a fresh
-/// ranged reader with its own 1 ms-latency source. Reports admitted
-/// concurrency, wall, growth timeouts and refusals — the `.201` failure
-/// mode (111 admitted, each growing past its lease into 500 ms waits)
-/// shows up here as timeouts/refusals and a wall far above
-/// `rounds × waves × latency`. `VIX_BENCH_FANOUT` overrides the count.
+/// Fan-out against the REAL process evaluation slots and memory pool
+/// (`ZO_VIX_SEARCH_CONCURRENCY` / `ZO_VIX_EVAL_MAX_BYTES` as the test
+/// process sees them): one residual-refined histogram of the A48 shape over
+/// `VIX_BENCH_FILE` per slot, each a fresh ranged reader with its own
+/// 1 ms-latency source. Reports wall, growth timeouts, refusals and the
+/// peak reader ownership - the `.201` failure mode (each evaluation growing
+/// ~37 MB into a full pool) shows up here as timeouts/refusals and a wall
+/// far above `rounds × waves × latency`. `VIX_BENCH_FANOUT` overrides the
+/// count.
 #[test]
 #[ignore = "diagnostic; run with VIX_BENCH_FILE set"]
 fn prod_file_residual_fanout_under_the_gate() {
@@ -284,7 +284,6 @@ fn prod_file_residual_fanout_under_the_gate() {
         ],
     });
     let memory = VixReader::open_with_index(data.clone(), Some(index.clone())).unwrap();
-    let rows = memory.row_count() as i64;
     let (ts_min, ts_max) = memory
         .zone_chunks()
         .map(|chunks| {
@@ -299,19 +298,16 @@ fn prod_file_residual_fanout_under_the_gate() {
     let buckets = ((ts_max - min_value) as u64 / hour + 1) as usize;
     let mode = IndexOptimizeMode::SimpleHistogram(min_value, hour, buckets, 0);
     let range = (min_value, min_value + (buckets as i64) * hour as i64);
-    let declared = evaluation_working_bytes(rows, Some(&mode), true, false, Some((ts_min, ts_max)));
-    let budget = source::evaluation_byte_budget();
-    let admissible = budget - budget / 8;
+    let pool = config::get_config().common.vix_eval_max_bytes;
     let slots = config::get_config().limit.vix_search_concurrency.max(1);
     let fanout: usize = std::env::var("VIX_BENCH_FANOUT")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or((admissible / declared).min(slots).max(1));
+        .unwrap_or(slots);
     eprintln!(
-        "gate {} MiB (admissible {} MiB), slots {slots}, declared {} KiB -> fan-out {fanout}",
-        budget >> 20,
-        admissible >> 20,
-        declared >> 10
+        "pool {} MiB, slots {slots} ({} KiB per slot) -> fan-out {fanout}",
+        pool >> 20,
+        (pool / slots) >> 10
     );
     let timeouts_before = config::metrics::VIX_EVAL_GROWTH_TIMEOUTS_TOTAL
         .with_label_values::<&str>(&[])
@@ -337,9 +333,7 @@ fn prod_file_residual_fanout_under_the_gate() {
                 let operation =
                     source::ReadOperation::new(Arc::new(source::FetchStats::default()), None);
                 let queued = std::time::Instant::now();
-                let permit = source::acquire_evaluation(&operation, declared)
-                    .await
-                    .unwrap();
+                let permit = source::acquire_evaluation(&operation).await.unwrap();
                 let waited = queued.elapsed().as_millis();
                 let data_src = LatencySource::new(data, latency);
                 let index_src = LatencySource::new(index, latency);
@@ -1079,8 +1073,9 @@ async fn sparse_gib_sidecar_count_and_topn_keep_exact_optimized_dispatch() {
             selected("level", &["info"])
         };
         assert!(
-            (file.meta.index_size as usize).saturating_mul(4) > source::evaluation_byte_budget(),
-            "fixture must exceed the old whole-index gate"
+            file.meta.index_size as usize > get_config().common.vix_eval_max_bytes,
+            "fixture must exceed the evaluation memory pool: a size-declaring admission \
+             could never admit it"
         );
         let stats = Arc::new(source::FetchStats::default());
         let operation = source::ReadOperation::new(Arc::clone(&stats), None);
@@ -1244,7 +1239,7 @@ async fn cached_sparse_object_refuses_its_real_owner_before_any_fetch() {
     assert!(
         error
             .chain()
-            .any(|cause| cause.is::<source::FetchBudgetExceeded>()),
+            .any(|cause| cause.is::<source::EvaluationMemoryExhausted>()),
         "whole-object admission must preserve the typed fallback marker: {error:#}"
     );
     assert_eq!(
@@ -1254,7 +1249,7 @@ async fn cached_sparse_object_refuses_its_real_owner_before_any_fetch() {
     );
     assert!(
         !operation.is_cancelled(),
-        "budget refusal is not query cancellation"
+        "pool refusal is not query cancellation"
     );
 }
 

@@ -1767,19 +1767,26 @@ pub struct Common {
     #[env_config(
         name = "ZO_VIX_FETCH_MAX_BYTES",
         default = 0,
-        help = "Process-wide raw-byte ceiling for active VIX reads, complete batch \
-                accumulation and undelivered results. Delivered reader/scan buffers are \
-                governed by evaluation reservations and reader-cache accounting, not this \
-                fetch lease. 0 = min(memory/16, 256MiB), with a 16MiB floor capped at actual \
-                memory. Positive values are exact bytes, not MiB. Oversized requests fail safely."
+        help = "Raw-byte ceiling for active VIX reads, complete batch accumulation and \
+                undelivered results - held once by index evaluation point reads and once by \
+                the DataFusion docs scan, so KiB-sized index reads never queue behind \
+                multi-MiB scan batches. Delivered reader/scan buffers are governed by the \
+                evaluation memory pool and reader-cache accounting, not this fetch lease. \
+                0 = min(memory/16, 256MiB), with a 16MiB floor capped at actual memory. \
+                Positive values are exact bytes, not MiB. Oversized requests fail safely."
     )]
     pub vix_fetch_max_bytes: usize,
     #[env_config(
         name = "ZO_VIX_EVAL_MAX_BYTES",
         default = 0,
-        help = "Process-wide raw-byte ceiling for declared VIX evaluation working-set \
-                reservations, not an absolute RSS bound. 0 = min(memory/8, 1GiB), with a \
-                64MiB floor capped at actual memory. Positive values are exact bytes, not MiB."
+        help = "Node-wide pool for the measured memory (retained metadata plus pending \
+                allocations) of VIX index evaluations in flight; the vix_eval_memory_bytes \
+                gauge shows its occupancy. Evaluations are admitted by count \
+                (ZO_VIX_SEARCH_CONCURRENCY) and charge the pool as they grow, so size it at \
+                concurrency x the per-evaluation peak (~16MiB per slot); a pool that stays \
+                full for 500ms hands the file to the scan branch (pool_exhausted). \
+                0 = min(memory/8, 1GiB), with a 64MiB floor capped at actual memory. \
+                Positive values are exact bytes, not MiB."
     )]
     pub vix_eval_max_bytes: usize,
     #[env_config(
@@ -2410,9 +2417,11 @@ pub struct Limit {
     #[env_config(
         name = "ZO_VIX_SEARCH_CONCURRENCY",
         default = 0,
-        help = "Number of .vix index files evaluated in parallel per query. Per-file work is \
-                dominated by small IO waits, so this may exceed the core count. 0 = 4x CPU \
-                cores, capped at 64."
+        help = "Node-wide number of .vix index files evaluated in parallel (shared fairly \
+                across concurrent queries, at least 8 per query). Per-file work is dominated \
+                by small IO waits, so this may exceed the core count. The only admission \
+                limit: memory is charged to ZO_VIX_EVAL_MAX_BYTES as evaluations run. 0 = 4x \
+                CPU cores, capped at 64."
     )]
     pub vix_search_concurrency: usize,
     #[env_config(

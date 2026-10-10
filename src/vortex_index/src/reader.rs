@@ -137,8 +137,8 @@ pub(crate) struct ReaderMemory {
     bytes: AtomicUsize,
     /// Retained bytes plus all simultaneously pending allocations.
     total: AtomicUsize,
-    /// High-water mark of `total`: the most this reader ever asked its
-    /// admission gate for at one moment (what a declaration must cover).
+    /// High-water mark of `total`: the most this reader ever charged its
+    /// evaluation memory pool at one moment.
     peak: AtomicUsize,
     observers: Mutex<Vec<Weak<dyn ReaderMemoryObserver>>>,
 }
@@ -1588,7 +1588,7 @@ impl VixReader {
     }
 
     /// High-water mark of retained + pending bytes: the most this reader
-    /// asked its admission gate for at one moment since it was opened.
+    /// charged its evaluation memory pool at one moment since it was opened.
     pub fn memory_peak(&self) -> usize {
         self.memory.peak()
     }

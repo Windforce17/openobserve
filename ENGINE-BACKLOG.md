@@ -2198,6 +2198,59 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
       needs the per-stage timer first. After the CPU fix the scan phase
       (3.4–6 s + the ~100 GB/pod whole-file back-fill at 650 MB/s for
       3 min) is the larger half.
+- **2026-10-10 — eval admission redesigned (vix-arch, unshipped): the
+  declared byte gate is gone — slots admit by count, `ZO_VIX_EVAL_MAX_BYTES`
+  is a pool for MEASURED memory, and the fetch byte gate is split
+  search/scan.** The 256-slot measurement above showed the eval byte gate
+  binding (175–224 effective of 256) because every row-id evaluation
+  declared 12.2 MiB against the 3.5 GiB admissible budget while its
+  measured growth was 4–8 MiB. The lever listed there (`ZO_VIX_EVAL_MAX_
+  BYTES` 4 → 6 GiB) would have moved the same mis-sized model; this
+  removes it.
+  - `acquire_evaluation` takes only the `ZO_VIX_SEARCH_CONCURRENCY` slot
+    (FIFO, under the per-query fair share); nothing is declared.
+    `ZO_VIX_EVAL_MAX_BYTES` is now a node-wide pool charged by growth with
+    the reader's measured ownership (`ReaderMemory`: retained + pending,
+    checked before each allocation) and published as `vix_eval_memory_
+    bytes`. A growth waits ≤ 500 ms for releases; a pool still full then
+    refuses (`EvaluationMemoryExhausted`, sticky for the permit) and the
+    file takes the scan branch as `pool_exhausted` (`vix_fast_path_
+    fallback_total`; `vix_eval_growth_timeouts_total` counts the waits).
+    A target above the whole pool (whole-object load of a sparse 1 GiB
+    sidecar) is refused at once — the test for it caught `resize`
+    comparing the delta instead of the target to the limit, i.e. a
+    certain refusal waited the full 500 ms. Deleted: the `budget/8`
+    growth headroom, `evaluation_working_bytes`, `index_only_evaluation`,
+    the `EVAL_*_BYTES` constants and the six tests pinning that
+    arithmetic (`mod.rs` −645 lines net).
+  - Demand arithmetic: slots × measured peak. Prod (from the io_accounting
+    growth above): 256 × 4–8 MiB ≈ 1–2 GiB against the 4 GiB pool — all
+    256 slots run and the 6 GiB raise is unnecessary. Fixture peaks,
+    each completed under a private pool of exactly one slot's share
+    (16 MiB = 1 GiB / 64 at repo defaults = 4 GiB / 256 in prod) with no
+    growth wait and no refusal (`evaluation_memory_tests`): exact-term
+    count 1.50 MiB (3k-row parity file), condition-all top-N / distinct /
+    IN multi-histogram 2.64 MiB (100k rows), the `.201` residual-refined
+    histogram 9.70 MiB (200k rows, fts equality, detached docs footer
+    charged) — the prod 10.6 MB shape, 61 % of the share.
+  - `ZO_VIX_FETCH_MAX_BYTES` is held twice: `search` (index point reads,
+    KiB) and `scan` (DataFusion docs batches, MiB). `rrn4b` above queued
+    index reads behind scan batches on the one shared 256 MiB gate; now
+    they cannot. Cost: ≤ 2 × 256 MiB in flight instead of 256 MiB.
+    `evaluation_wait_us` in `io_accounting` is slot wait only from here.
+  - Tests: `search vix::` 207/0 (8 ignored); `source::tests` cover growth
+    waiting for releases + cancellation, absolute refusal released with
+    its owner, the split gates (a scan batch proceeds while the search
+    gate is full), and a fetch queued on bytes issuing no IO when
+    cancelled; `config` budget/concurrency/metrics tests 3/0.
+  - Rollout (querier image, no config change: 4 GiB pool, fetch gate
+    unset = 256 MiB per side): watch `vix_eval_memory_bytes` (expect
+    ≤ 2 GiB at 256 slots), `pool_exhausted` = 0, the RSS > 21 GiB
+    rollback trigger above. Expected: `evaluation_wait_us` → ~0 and
+    effective evaluations = 256 on both windows, i.e. the eval phase
+    2.8 → ~2.3 s (recent) / 3.7 → ~2.6 s (older) the 6 GiB raise was
+    sized for; the scan phase stays the larger half, so (2a)/(3) above
+    remain the next engine levers.
 
 ## 2026-09-29 — P2 shipped as `.176` and rolled back within 30 min: the per-stream side table stalled the shared meta DB (commit latency 40–60×, ingest 503s); ranges must live in the segment row
 - What shipped (vix-arch `013c45010` + NATS retry `76fe754b5`, image

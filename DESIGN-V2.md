@@ -359,14 +359,23 @@ M10 ships exactly that sampler (src/vortex_index/src/merge.rs
   fetched byte belongs to a selected column. Passthrough stripe coverage
   remains pinned by the §6.1 ranged projection tests.
 - `ZO_VIX_QUERY_PREFETCH` pipelines bounded eager-tail batches with reader
-  opening/evaluation. The process-wide `ZO_VIX_FETCH_CONCURRENCY` and
-  `ZO_VIX_FETCH_MAX_BYTES` gates cover active reads, batch accumulation,
-  and undelivered results. Query cancellation reaches queued acquisition,
-  physical reads, and blocking native work; admission remains owned until
-  the corresponding work or buffer is released.
-- `ZO_VIX_EVAL_MAX_BYTES` governs simultaneous tracked reader and pending
-  native-metadata ownership. Reservations grow before allocation rather
-  than charging a multiple of the entire sidecar size. Cached readers
+  opening/evaluation. `ZO_VIX_FETCH_CONCURRENCY` caps in-flight range
+  fetches process-wide; `ZO_VIX_FETCH_MAX_BYTES` is held once by index
+  evaluation point reads (`search`) and once by the DataFusion docs scan
+  (`scan`), covering active reads, batch accumulation, and undelivered
+  results — KiB-sized index reads never queue behind multi-MiB scan
+  batches. Query cancellation reaches queued acquisition, physical reads,
+  and blocking native work; admission remains owned until the
+  corresponding work or buffer is released.
+- Index evaluations are admitted by count alone (`ZO_VIX_SEARCH_CONCURRENCY`,
+  shared fairly across queries). Nothing is declared at admission:
+  `ZO_VIX_EVAL_MAX_BYTES` is a node-wide pool for the MEASURED memory of
+  evaluations in flight (tracked reader ownership plus pending
+  native-metadata allocations), charged by growth before each allocation
+  and published as `vix_eval_memory_bytes`. A pool that stays full for the
+  500 ms grace period refuses the growth and the file takes the scan branch
+  (`pool_exhausted`), so it is sized at slots × the per-evaluation peak
+  (~16 MiB per slot) and normal operation never reaches it. Cached readers
   publish size changes to their separate byte-bounded LRU; queued users
   hold weak handles. Native footer caches retain immutable encoded bytes,
   not decoded layout trees or the operation that created them.
