@@ -2061,6 +2061,61 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     90–129 → 345–393 GiB/pod in the hour. `ZO_DISK_CACHE_SKIP_SIZE` is
     unset (→ 50 % of max, never skips). Decision pending: skip whole-file
     warming for large files now that the block tier serves partial reads.
+  - **Querier CPU request 2 → 8, SHIPPED (GitOps #620, 07:0x–07:17Z;
+    rolls the queriers, caches reset).** The request is the CFS weight:
+    kubelet/runc map shares→weight quadratically, so cadvisor shows
+    querier 13,923 shares (weight 532) vs the co-tenant o2 ingester 4,537
+    (174) and compactor 7,919 (303) — 3.06× the ingester, was 1.0×.
+    Post-roll cold battery (07:19:50Z, `01a124aeb21673a1a88dc7eb920d99a5`,
+    same GROUP BY): leader 21.0 → 12.8 s; healthy followers unchanged
+    (index eval 2.6–3.3 s, 300–340 reads in flight, 78–83 ms/read, queue
+    0.3–4.6 ms/read); the one remaining straggler `nd5jx` on
+    `ip-172-31-201-163` (o2 `ingester-3` at 100 % node CPU) 4.45 s / 211 in
+    flight / 57 ms queue per read — was 8.2 s / 169 / 102 ms. Residual: a
+    saturated node still costs ~1.5× on its follower; the fix for that is
+    the ingester's request (2 → its real 8–14 cores), not ours.
+  - **Why the eval phase leaves the pipe idle (owner question "突发没有用
+    尽是不是不够的,尤其是 IO").** Yes, and the limiter is the slot count ×
+    chain depth, not IO capacity:
+    - Probe (throwaway test on the depth-clock `PairSource`, prod-shaped
+      1 M-row file, `postings_plist_min_docs` 8192, 768 KiB tail): cold
+      `AND` of 3 exact leaves = open 1 round trip (2 tail GETs, 896 KB) +
+      3 round trips (6–7 GETs, 66–350 KB) = **4 serial waves, 8–9 GETs per
+      file** — prod's 7.5–9.4 reads/file. Wave 2 is three sub-KB headers
+      at the `dict_blocks`/`terms` boundary (69 B directory, 633 B
+      trailer, 756 B terms header) that the tail does not cover; wave 3
+      the key block (135 KB); wave 4 the leaves' plist records (56–88 KB
+      each, one batch). The GROUP BY runs row-id + DataFusion scan: the
+      docs-window distinct path (5–43 serial waves/file) is NOT in prod's
+      read counts.
+    - Model: eval ≈ ⌈files/192⌉ × 4 × 80 ms = 7.3 × 0.32 = 2.3 s per
+      follower (measured 2.6–3.3; the 10 followers' eval times fit
+      ~2.1 ms/file linearly). In flight = 192 slots × ~1.7 GETs/wave ≈ 330.
+    - IO has headroom: remote latency is **flat at 80–88 ms** from ~100 in
+      flight (`svc+phrase` SimpleSelect, wave-capped at 64 files) to 330
+      (GROUP BY); zero S3 retries/503s in 70 min of querier logs; NIC
+      3.5–4 Gbps/pod of 15; the cache volume (`gp3-1024`: 1024 MiB/s,
+      **4,096 IOPS**) at 35–41 % util, 2.5–3.3 ms writes, qdepth 2–10 in
+      the run minute — the block tier's on-path fill (`read_through`
+      awaits `spawn_blocking(IoJob)` = pwrite + pread per miss) is not the
+      cost. Pod CPU: 1.8–2.6 cores (3 min avg), CFS throttling only on 3
+      pods and only 0.1–2.0 s in 3 min (16-CPU limit, scan burst).
+    - Unexplained 2.5×: the configmap's 09-30 note measured raw range GETs
+      from this VPC at ~30 ms/connection; the evaluator sees 80 ms at any
+      concurrency. Not EBS, not S3 push-back, not the pod limit. Needs a
+      per-stage timer (issue → first byte → body → fill done) on one pod.
+    - Levers, in order: (1) `ZO_VIX_SEARCH_CONCURRENCY` 192 → 384 (+
+      `ZO_VIX_FETCH_CONCURRENCY` 512 → 1024, in flight would reach ~660;
+      the 4 GiB eval gate admits 341 row-id evals at 12 MiB declared —
+      raise to 6 GiB or accept 341; blocking pool 512 vs 384 evals + ~660
+      IoJobs → `ZO_GRPC_RUNTIME_BLOCKING_WORKER_NUM` 1536). Expected −50 %
+      eval phase (−1.2 s of 12.8 here; a 7 d cold count, 6,900 files ≈
+      11.5 → 5.8 s). Watch: S3 503/SlowDown (fleet 40k → 80k GET/s),
+      CFS throttled periods, RSS. (2) Writer: fold the wave-2 boundary
+      headers into the tail-resident region → 3 waves, −25 % for new
+      files. (3) Close the 30 → 80 ms gap: halves the phase with no S3
+      risk. After the CPU fix the scan phase (3.4–6 s + the ~100 GB/pod
+      whole-file back-fill at 650 MB/s for 3 min) is the larger half.
 
 ## 2026-09-29 — P2 shipped as `.176` and rolled back within 30 min: the per-stream side table stalled the shared meta DB (commit latency 40–60×, ingest 503s); ranges must live in the segment row
 - What shipped (vix-arch `013c45010` + NATS retry `76fe754b5`, image
