@@ -1890,8 +1890,8 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     all five. `ops:/tmp/post208.py`, `post208.out`.
   - Cost of the roll, as before: generic ephemeral `data` PVC → every pod
     restarts at 0 % disk cache; the 24 h sidecars re-warm over ~3 h.
-- **2026-10-10 — block-granular disk cache tier (vix-arch, NOT shipped;
-  off by default behind `ZO_DISK_CACHE_BLOCK_ENABLED`).** Owner question:
+- **2026-10-10 — block-granular disk cache tier, SHIPPED as `.209`
+  (querier, 06:05Z; `ZO_DISK_CACHE_BLOCK_ENABLED` on).** Owner question:
   why a cold 24 h query re-reads the same footers/postings on every run
   while the pods run a 2000 Gi disk cache. Answer from the 10-09 counters
   (`.work/slowq/notes.md`): the whole-file tiers only fill through the
@@ -1979,11 +1979,64 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     over-budget requests bypass, past-the-end NotFound parity).
     `cargo test -p infra --lib cache::` 146/146; clippy clean on the
     touched files (the `PI` errors are upstream `meta/promql` tests).
-  - **Rollout plan**: dev first with `ZO_DISK_CACHE_BLOCK_ENABLED=true`
-    (default size/budget), watch `block_reads`/`remote_physical_bytes` on
-    a repeated cold 24 h shape and `QUERY_DISK_BLOCK_CACHE_USED_BYTES`;
-    prod querier only, same knob. The background downloader stays as is —
-    the tier sits behind it, so a fully downloaded file still wins.
+  - **SHIPPED as `.209` (owner: "push到prod看看效果", 06:05Z).**
+    `release/vix-20261010-209 c7f4161e0` = `.208` + vix-arch `421966c5d`
+    (byte-identical cherry-pick, binary `8774b3e7…`), querier only;
+    GitOps #619 (`214f8f7`): image + `ZO_DISK_CACHE_BLOCK_ENABLED=true`
+    in `querier-deployment.yaml` (375,000 MiB of the 1,500,000 MiB disk
+    cache carved out for blocks). Argo Synced/Healthy, 10/10 pods on the
+    image by 06:05:51Z, 0 restarts, `Loading disk block cache done,
+    entries: 0`, RSS 5.3–7.8 GiB after the battery, no `[BlockCache]`
+    warnings, no evictions. Rollback: `newTag` `.208` (ignores the var).
+  - **Post-roll battery, FRESH fleet (0 % disk cache, started 2 min after
+    the roll), 24 h sealed window 10-09 03:00Z → 10-10 03:00Z, each shape
+    3× back-to-back with `use_cache=false`, `ops:/tmp/post209.py`
+    (`post209_a.out`). Index-evaluation IO is the summed follower
+    `io_accounting`; "block tier" is the fleet counter delta around the
+    run (includes the concurrent post-roll download storm + other users):**
+    | shape | run | took | index eval: logical / block / remote (physical) | block tier: hit/partial/miss, served, remote |
+    |---|---|---|---|---|
+    | svc + `str_match(body, P)` DESC L100 | 1 | 2,696 ms | 1,368 / 36 / 1,331 MB (1,610 MB, 1.21×) | 987/1,447/5,934, 315 MiB, 2,588 MiB |
+    | | 2 | **389 ms** | 0 (index result cache) | 170/0/0, 115 MiB, **0** |
+    | | 3 | 777 ms | 0 | 203/0/0, 110 MiB, 0 |
+    | svc + `str_match(body, 'deploy callback')` (same files, new predicate) | 1 | **829 ms** | 331 MB: 22 memory / 153 disk / **156 block / 0 remote** | 1,387/0/0, 252 MiB, 0 |
+    | | 2–3 | 452 / 472 ms | 0 | 236 / 150 hits, 0 remote |
+    | llm-router sessions GROUP BY (1,437 files/follower) | 1 | 21,063 ms | 8,070 / 458 / 7,550 MB in 109,436 reads (13,650 MB, **1.81×**) | 5,720/30,290/124,303, 3.7 GiB, 29.5 GiB |
+    | | 2 | **9,357 ms** | 2.6 MB | 46,159/1/27, **16.9 GiB served, 4.9 MiB remote** |
+    | | 3 | 8,799 ms | 0 | 45,240/0/1, 16.6 GiB, 0 |
+    | `body = P` DESC L100 | 1 | 1,329 ms | 394 MB: 19 memory / 230 disk / 131 block / 15 remote | 1,094/103/63, 227 MiB, 54 MiB |
+    | | 2–3 | 798 / 814 ms | 0 | 167 hits, 124 MiB, 0 |
+    Pre-leg on the `.208` fleet (pods 15–21 h old, disk cache 1 TB/pod,
+    sidecars 71–79 % disk-cached): svc+phrase 1,377 → 386 ms, llm-router
+    9,216 → 6,331 ms (run 1: 1,322 MB disk + 482 MB remote in 19,961
+    reads), body=P 691 → 539 ms.
+  - **Reading.** (1) A fresh `.209` fleet's second run equals the 15 h-warm
+    `.208` fleet: 389 vs 386 ms; the llm-router repeat is 2.3× faster than
+    its cold run with 0 remote bytes, and what it reads — **16.9 GiB per
+    run from the block tier** — is the docs scan (`.vix` footers ~1 MB ×
+    14k files + the `label.session_id` chunks), which `io_accounting`
+    never counted; the remaining 8.8 s is decode/CPU and the footer
+    volume, the next target (the wide-schema footer problem, 10-09
+    notes). (2) A NEW predicate on the same files (`'deploy callback'`)
+    paid 0 remote bytes: footers, dictionaries and the service postings
+    were block-served (156 MB) while the downloader had landed the rest
+    (153 MB disk). (3) Cost: `remote_physical_bytes` 1.21× on the phrase
+    shape, **1.81× on the llm-router index eval** (109k reads of ~70 KB
+    postings against 64 KiB alignment — the replay predicted 2.4× on the
+    eval step; 32 KiB would be 1.05× there, worth an A/B once the fleet is
+    warm). (4) Handoff works: pod `t8kbc` served 4.17 GB from blocks then
+    kept only 10 entries / 52 MB once the whole files landed (whole-file
+    tier 129 GiB in 10 min); fleet `files:logs` 28,482 → 23,608 during the
+    battery. (5) Fleet after ~10 min: block tier 3–5 GiB/pod (36.6 GiB
+    logs + 8.8 GiB traces), 101,722 hits / 33,477 partials / 177,664
+    misses, 38.7 GiB served from blocks vs 72.1 GiB moved from S3 through
+    the tier (the first-touch fills, dominated by the storm).
+  - **Open**: the 24 h warm-up's footer reads now also land in the block
+    tier (~885 KB per sidecar, 5.2 GB in the first 3 min on one pod) —
+    harmless at 375 GB but it duplicates the reader cache's metadata
+    tier on disk; a ≥ 1 h steady-state check (hit ratio, used bytes, GC
+    behaviour of the 1,125,000 MiB whole-file tier under the new split)
+    is the next measurement.
 
 ## 2026-09-29 — P2 shipped as `.176` and rolled back within 30 min: the per-stream side table stalled the shared meta DB (commit latency 40–60×, ingest 503s); ranges must live in the segment row
 - What shipped (vix-arch `013c45010` + NATS retry `76fe754b5`, image
