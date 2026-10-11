@@ -2377,7 +2377,8 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     13:27Z; the reverted generation sat at 14.1–16.0 GiB at 23–38 min
     with no storm. The RSS case against 1 GiB is confounded; the revert
     stands on "no benefit shown, +1.5 GiB of in-flight exposure per path
-    under a storm". Restarts 0, no OOM/503 on either generation.
+    under a storm". Restarts 0, no OOM/503 on either generation at 38
+    min (one `.210` OOM 12 h later, below).
   - **Mechanism, proven three ways.** (a) Fleet fetch-phase counters on
     the reverted generation (38 min, organic + battery): the count gate
     (`FETCH_COUNT`, tokio `Semaphore`, CAS fast path) queued **0.000 ms**
@@ -2419,6 +2420,49 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     counters per path (byte_queue ms/fetch, the number above), then the
     battery with the GROUP BY shape FIRST on a never-queried window,
     fresh pods vs fresh pods.
+  - **SHIPPED as `.211`** (release `7716b5ee1` = `.210` + vix-arch
+    `fac1df932`, image digest `4e92973f…`, binary sha256 `416b2757…`,
+    GitOps #625 merged 05:15Z 10-11, rolled out 05:17:41Z, 10 pods,
+    warm-up 65–88 s each). **A/B on the `pre211_d6` window, fresh pods
+    (`post211_d6` 05:19Z, GROUP BY first, 1,022–1,126 files per
+    follower, all remote: 1,062–1,159 MB remote + 1–2 MB block per
+    follower ≈ 1.08 MB/file, 9.1 reads/file):** `queue_us`/read
+    **0.00 ms on all 10 followers** (was 16–125), in flight **396**
+    (379–407; was 259), S3 **92–109 ms/read** (was 63–92), eval
+    **2.14–2.76 s, median 2.49 s** (was 2.3–4.7, median 2.57; the two
+    4.5–4.7 s stragglers are gone), eff 247–255, slot wait 1.5–22 s
+    (organic), exec 4.5–7.3 s, leader **10.7 s** (was 11.5). Fleet
+    fetch-phase counters at 5 min (battery + organic, 14.0–15.6k
+    `search` / 3.6–4.0k `scan` fetches per pod, 293–375 KB each):
+    byte_queue **0.0 ms** per fetch on every pod and both paths (was
+    3–14 / 3–50), count_queue 0.000, active 94–103 / 84–123 ms. Eval
+    pool gauge peak 2.4–2.7 GiB of 4 GiB during the battery, 0 at idle,
+    no `pool_exhausted` fallbacks, restarts 0, RSS 6.3–8.3 GiB at 5 min.
+  - Reading: the admission queue is gone as predicted, but it bought
+    only 3 % of eval median — the freed concurrency (259 → 396 in
+    flight) was absorbed by S3 latency (~80 → ~101 ms/read), so reads/s
+    per follower barely moved (~3.7k → ~3.9k): at ~400 in flight the
+    cold eval phase sits on the S3 range-GET floor for 9 reads/file.
+    What `.211` did fix is the tail: follower eval spread 2.3–4.7 s →
+    2.1–2.8 s, which is what the leader waits on. The remaining eval
+    lever is reads/file (9.1 = tail + dict + per-leaf plist round
+    trips, the 10-04 report's item 2), not admission; slots 320–384
+    would add in-flight against a latency that already grows with it.
+  - `.210` risk indicator, late: `vpncm` (reverted generation, up since
+    13:15Z) was **OOMKilled at 01:37:24Z 10-11** (exit 137, 12 h up).
+    Not the fetch gate: 01:31–01:37Z it served a burst of `match_all`
+    dashboard panels on `default/logs/k8s_prod_public_logs` ("Lock wait
+    timeout", "Deadlock found", "heap out of memory", "ECONNREFUSED",
+    "context deadline exceeded", "invalid connection"; SimpleTopN
+    service_name 10) — 10 index loads of 57–98 files at **10.3–16.2 GB
+    of sidecars (165–180 MB per sidecar)** in 4 min, DataFusion peaks
+    6.5 / 4.7 / 3.6 / 3.6 / 2.4 GB per query within 90 s. Working set
+    14–15 GiB + that burst > the 24 GiB limit. Same wide-schema stream
+    class as the 10-02 apisix dictionary walk; `.211` does not change
+    memory behaviour, so the exposure is unchanged. Open: why a
+    `k8s_prod_public_logs` sidecar is 170 MB, and what a 10-panel
+    match_all dashboard costs per panel. `zrj95` was replaced ~04:16Z
+    by node NotReady (not OOM).
 
 ## 2026-09-29 — P2 shipped as `.176` and rolled back within 30 min: the per-stream side table stalled the shared meta DB (commit latency 40–60×, ingest 503s); ranges must live in the segment row
 - What shipped (vix-arch `013c45010` + NATS retry `76fe754b5`, image
