@@ -20,12 +20,12 @@ use config::meta::{inverted_index::IndexOptimizeMode, stream::FileKey};
 pub(super) fn partition_vix_files(
     index_parquet_files: Vec<FileKey>,
     idx_optimize_mode: &Option<IndexOptimizeMode>,
-    target_partitions: usize,
+    eval_concurrency: usize,
 ) -> Vec<Vec<FileKey>> {
     if let Some(IndexOptimizeMode::SimpleSelect(limit, ascend)) = idx_optimize_mode
         && *limit > 0
     {
-        best_first_waves(index_parquet_files, *ascend, target_partitions)
+        best_first_waves(index_parquet_files, *ascend, eval_concurrency)
     } else if index_parquet_files.is_empty() {
         Vec::new()
     } else {
@@ -49,10 +49,15 @@ const FIRST_WAVE_SIZE: usize = 64;
 /// files sorted so the ones that can hold the best-ranked rows come first —
 /// by `max_ts` descending for `ORDER BY _timestamp DESC`, by `min_ts`
 /// ascending for ASC — then chunked into waves starting at
-/// [`FIRST_WAVE_SIZE`] and growing up to
-/// `max(target_partitions, FIRST_WAVE_SIZE)`. Waves execute strictly in order
+/// [`FIRST_WAVE_SIZE`] and doubling up to
+/// `max(eval_concurrency, FIRST_WAVE_SIZE)`. Waves execute strictly in order
 /// and the pruner's early stop fires after the first wave
 /// whose candidates already outrank every remaining file.
+///
+/// The cap is the evaluation concurrency because every wave is a barrier:
+/// a rare term over a long window (hits below the LIMIT, so no wave can
+/// stop early) costs one slowest-cold-open round trip per wave, and a wave
+/// smaller than the slots leaves the rest idle.
 ///
 /// Overlapping file ranges only weaken the prune bound (the suffix fold in
 /// `group_suffix_bounds` stays correct); the former time-partition
@@ -62,7 +67,7 @@ const FIRST_WAVE_SIZE: usize = 64;
 fn best_first_waves(
     mut files: Vec<FileKey>,
     ascend: bool,
-    target_partitions: usize,
+    eval_concurrency: usize,
 ) -> Vec<Vec<FileKey>> {
     if files.is_empty() {
         return Vec::new();
@@ -77,7 +82,7 @@ fn best_first_waves(
             )
         });
     }
-    let cap = target_partitions.max(FIRST_WAVE_SIZE);
+    let cap = eval_concurrency.max(FIRST_WAVE_SIZE);
     let mut waves: Vec<Vec<FileKey>> = Vec::new();
     let mut wave_size = FIRST_WAVE_SIZE.min(cap);
     let mut iter = files.into_iter();
@@ -173,7 +178,7 @@ mod tests {
     }
 
     #[test]
-    fn small_target_partitions_never_shrinks_below_first_wave() {
+    fn small_eval_concurrency_never_shrinks_below_first_wave() {
         let files: Vec<FileKey> = (0..130)
             .map(|i| create_file_key(i * 10 + 1, i * 10 + 10))
             .collect();
@@ -183,6 +188,24 @@ mod tests {
             groups.iter().map(Vec::len).collect::<Vec<_>>(),
             vec![64, 64, 2]
         );
+    }
+
+    /// The prod shape: 256 evaluation slots must be filled once the ramp is
+    /// over, so a long window costs a few hundred-file waves, not one
+    /// 64-file barrier per 64 files.
+    #[test]
+    fn waves_ramp_to_the_eval_concurrency() {
+        let files: Vec<FileKey> = (0..1000)
+            .map(|i| create_file_key(i * 10 + 1, i * 10 + 10))
+            .collect();
+        let groups =
+            partition_vix_files(files, &Some(IndexOptimizeMode::SimpleSelect(200, true)), 256);
+        assert_eq!(
+            groups.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![64, 128, 256, 256, 256, 40]
+        );
+        let flat: Vec<i64> = groups.iter().flatten().map(|f| f.meta.min_ts).collect();
+        assert!(flat.windows(2).all(|w| w[0] <= w[1]));
     }
 
     /// Non-select modes fan all files into ONE group: the eval-concurrency

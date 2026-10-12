@@ -468,8 +468,13 @@ pub async fn vix_search(
         );
     }
     let time_range = query.time_range;
+    // Waves are sized by the evaluation concurrency, not the CPU-derived
+    // partition count: a wave is a barrier, and a probe-only SimpleSelect
+    // over a long window is bound by cold sidecar round trips, so a wave
+    // smaller than the slots leaves them idle (prod 7-day point lookup:
+    // 150 waves of 64 files against 256 slots, ~250 ms of S3 latency each).
     let index_parquet_files =
-        partition_vix_files(eval_files, &idx_optimize_mode, target_partitions);
+        partition_vix_files(eval_files, &idx_optimize_mode, eval_concurrency);
 
     // Every read is attributed to its active operation, including reads from
     // shared readers created by an earlier query.
