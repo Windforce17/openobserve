@@ -2693,6 +2693,48 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     - RSS at 7 min: 13.4–14.1 GiB (fresh pods right after the 52 GB index
       read). The `.213` memory watch restarts here: checkpoints at 1 h and
       the 05:30–08:00Z burst window.
+  - **Hardware envelope during a cold 7-day point lookup (1 s sampling,
+    node-exporter + cadvisor through `kubectl proxy`, 3 nodes, run
+    `01a12ffb90c8` 11:59:38Z on an untouched window: 31.2 s, 7.5–8.2k
+    files / 23–25k S3 GETs / 8.0–8.7 GB per follower, 150–187 in
+    flight).** Per node, avg (max) over the 31 s vs the pre/post minutes:
+    - CPU: querier container 2.6–3.3 cores (peaks 14–17) of the 16-core
+      limit; host 11–19 of 16/32 vCPU; CFS throttling 0. Not binding.
+    - NIC: 525–713 MB/s (4.2–5.7 Gbps) with 0.84–1.41 GB/s peaks on
+      7.5 (4xlarge) / 15 Gbps (8xlarge) baselines; ~300–400 MB/s of it
+      is the query, the rest the whole-file downloader. Not binding.
+    - **EBS data volume (gp3, 2000 GiB, provisioned 4,096 IOPS /
+      1,024 MB/s): binding.** Write IOPS 3,418–3,564 avg with 5,870–8,293
+      peaks, util 77–85 % (max 108–122 %), queue 15–23, **PSI io
+      11–27 % avg, 39–95 % max**. Writers: the block tier's write-through
+      of every fill (pwrite into a sparse file + per-entry fdatasync +
+      trailer, 64 KiB blocks) at ~360 files/s, on top of the downloader's
+      sequential 300–650 MB/s (1,200–2,800 write IOPS). Reads were 0 (all
+      S3); a disk-warm run would compete with the same 4,096 IOPS.
+    - Downloader: `ZO_CACHE_LATEST_FILES_ENABLED` rebuilds the 1.5 TB
+      whole-file cache after every roll (the data volume is an
+      `ephemeral` PVC): 16 streams (`cpu_num/2` normal + `cpu_num/2`
+      priority) ≈ 600 MB/s per pod for 40+ min, EBS writes at the
+      m8g.4xlarge instance baseline (625 MB/s).
+    - Memory: 13.4–14.1 GiB steady of 24 GiB; see the OOM below.
+    - S3: ~1,000 GET/s per pod = 256 eval slots / (2.85 serial reads ×
+      ~250 ms); the 768 fetch slots are a quarter used.
+  - **11:58:33–35Z: 3 of 10 queriers OOMKilled (78qrd, srq5r, wqngz),
+    20 min after the roll — not the wave change.** No multi-group plan
+    was active (every plan 11:54–11:58 was `file_groups: 1`). The query
+    was `01a12ffa68bd`: `SELECT date_trunc('day', …), regexp_replace(body,
+    '^.*\| ([0-9]{3}) \|.*"([^"?]+).*$', '\1 \2') AS k, count(*) FROM
+    k8s_prod_monica_logs WHERE service_name = 'llm-router' AND
+    str_match(body, '[GIN]') AND str_match(body, '/openai/v1') GROUP BY
+    d, k` over 7 days (988 files, 3.9 B records): surviving followers
+    logged DataFusion peaks of 2.7–3.2 GB; the 12 GiB fair pool on top of
+    a 13.5 GiB resident baseline exceeds the 24 GiB limit. Same exposure
+    on `.211`/`.213`; the fix is a smaller DataFusion pool or a higher
+    limit, not the index path.
+  - Result-cache note: the key carries the SimpleSelect limit, so the
+    "warm" numbers for a repeated SQL are per-file result-cache hits, not
+    reader-cache hits; use a fresh LIMIT (< total hits) to measure the
+    reader-cache-warm path.
 
 ## 2026-09-29 — P2 shipped as `.176` and rolled back within 30 min: the per-stream side table stalled the shared meta DB (commit latency 40–60×, ingest 503s); ranges must live in the segment row
 - What shipped (vix-arch `013c45010` + NATS retry `76fe754b5`, image
