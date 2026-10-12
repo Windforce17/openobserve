@@ -106,6 +106,40 @@ static GLOBAL: config::heap_profile::HeapProfileAlloc<mimalloc::MiMalloc> =
 #[global_allocator]
 static GLOBAL: config::heap_profile::HeapProfileAlloc<tikv_jemallocator::Jemalloc> =
     config::heap_profile::HeapProfileAlloc::new(tikv_jemallocator::Jemalloc);
+
+/// mimalloc returns freed arena memory to the OS only when one of its own
+/// code paths happens to run a purge pass: a whole page freed, a heap collect
+/// every 10,000 slow-path allocations on the owning thread, a thread exit. A
+/// process that goes quiet after a burst, or whose buffers are freed on
+/// threads that then stay idle, keeps the burst resident (3.1.5 additionally
+/// lost pending purges outright, upstream mimalloc #1246). A dedicated OS
+/// thread forcing a purge pass on a fixed cadence makes RSS track live bytes
+/// regardless of the allocation pattern. Harness, 2026-10-11 (6 GiB cache +
+/// 16-worker scan bursts, Linux): floor after bursts 10.2–12.0 GiB → 6.1 GiB,
+/// after dropping the cache 12.0 GiB → 0.04 GiB; a pass with nothing to
+/// purge is a bitmap walk over the arenas.
+#[cfg(feature = "mimalloc")]
+fn start_allocator_purge_thread(interval_secs: u64) {
+    if interval_secs == 0 {
+        return;
+    }
+    std::thread::Builder::new()
+        .name("mimalloc-purge".into())
+        .spawn(move || {
+            // mi_collect acts through the calling thread's heap; a thread
+            // that has never allocated has none and the call is a no-op.
+            // The anchor lives for the thread's lifetime.
+            let _heap_anchor = Box::new(0u8);
+            loop {
+                std::thread::sleep(Duration::from_secs(interval_secs));
+                // SAFETY: mi_collect is thread-safe and takes no pointers;
+                // it purges free arena slices process-wide.
+                unsafe { libmimalloc_sys::mi_collect(true) };
+            }
+        })
+        .expect("spawn mimalloc-purge thread");
+}
+
 use tracing_subscriber::{
     EnvFilter, filter::LevelFilter as TracingLevelFilter, fmt::Layer, prelude::*,
 };
@@ -130,6 +164,9 @@ async fn main() -> Result<(), anyhow::Error> {
     if cli::cli().await? {
         return Ok(());
     }
+
+    #[cfg(feature = "mimalloc")]
+    start_allocator_purge_thread(get_config().common.allocator_purge_interval_secs);
 
     #[cfg(feature = "tokio-console")]
     console_subscriber::ConsoleLayer::builder()

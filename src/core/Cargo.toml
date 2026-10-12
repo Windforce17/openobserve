@@ -124,4 +124,4 @@ multer.workspace = true
 rcgen.workspace = true
 # M23 repro harness only (examples/m23_rss_repro.rs): match prod's global
 # allocator so RSS behavior (retention vs live growth) is faithful.
-mimalloc = { version = "0.1.48", features = ["v3"] }
+mimalloc = { version = "0.1.52" }

@@ -1646,6 +1646,12 @@ pub struct Common {
     pub memory_circuit_breaker_enabled: bool,
     #[env_config(name = "ZO_MEMORY_CIRCUIT_BREAKER_RATIO", default = 90)]
     pub memory_circuit_breaker_ratio: usize,
+    #[env_config(
+        name = "ZO_ALLOCATOR_PURGE_INTERVAL_SECS",
+        default = 1,
+        help = "mimalloc builds: a dedicated thread forces an arena purge (mi_collect) every N seconds so memory freed on any thread is returned to the OS on a fixed cadence instead of waiting for allocator-internal triggers (a whole page freed, a heap collect every 10,000 slow-path allocations, a thread exit). 0 disables."
+    )]
+    pub allocator_purge_interval_secs: u64,
     #[env_config(name = "ZO_DISK_CIRCUIT_BREAKER_ENABLED", default = false)]
     pub disk_circuit_breaker_enabled: bool,
     #[env_config(

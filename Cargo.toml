@@ -38,7 +38,7 @@ cloud = [
     "openobserve-core/cloud",
     "openobserve-jobs/cloud",
 ]
-mimalloc = ["dep:mimalloc"]
+mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 jemalloc = ["dep:tikv-jemallocator"]
 profiling = [
     "jemalloc",
@@ -137,7 +137,14 @@ log.workspace = true
 maxminddb.workspace = true
 md5.workspace = true
 memchr.workspace = true
-mimalloc = { version = "0.1.48", features = ["v3"], optional = true }
+# 0.1.52 bundles mimalloc 3.3.2 (v3 is the crate default; the `v3` feature is
+# gone). 3.1.5 (crate 0.1.48) never completed delayed arena purges once two
+# arenas had different expiries (upstream #1246): freed memory stayed
+# resident for the life of the process.
+mimalloc = { version = "0.1.52", optional = true }
+# `extended` exposes mi_collect for the purge thread in main.rs; the version
+# must match the one mimalloc 0.1.52 links (one copy of the C library).
+libmimalloc-sys = { version = "0.1.49", features = ["extended"], optional = true }
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 opentelemetry-otlp.workspace = true
