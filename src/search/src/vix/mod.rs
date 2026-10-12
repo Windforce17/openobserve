@@ -47,12 +47,13 @@
 //! query shapes that need only native docs columns, file metadata, or zones.
 //! Legacy `.parquet`/`.vortex` files remain on the DataFusion scan path.
 //!
-//! Per-file opening and evaluation form one owned, bounded pipeline. Ready
-//! files run without waiting for an all-files prefetch barrier. Process-wide
-//! execution and byte admission bound concurrent followers; operation-owned
-//! cancellation and accounting remain separate from shared immutable readers.
-//! Only `SimpleSelect` partitions files into multiple groups, so it can prune
-//! the remaining groups after each round.
+//! Per-file opening and evaluation form one owned, bounded pipeline: one
+//! continuous sliding window over the ordered file list, fed best-first for
+//! `SimpleSelect` so its pruner can drop every file the window has not
+//! answered once the limit is satisfied. Ready files run without waiting for
+//! unrelated cold files. Process-wide execution and byte admission bound
+//! concurrent followers; operation-owned cancellation and accounting remain
+//! separate from shared immutable readers.
 
 pub mod cache;
 mod collect;
@@ -68,7 +69,11 @@ mod residual;
 mod result;
 pub mod source;
 
-use std::{collections::HashSet, panic::AssertUnwindSafe, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashSet},
+    panic::AssertUnwindSafe,
+    sync::Arc,
+};
 
 use arrow::buffer::BooleanBuffer;
 pub use collect::{histogram_bucket, histogram_range_bucket};
@@ -83,7 +88,7 @@ use config::{
     metrics::{self, QUERY_PARQUET_CACHE_RATIO_NODE},
     utils::size::bytes_to_human_readable,
 };
-use futures::{FutureExt, StreamExt, stream};
+use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 use hashbrown::HashMap;
 use infra::{cache::file_data, errors::Error};
 use itertools::Itertools;
@@ -92,7 +97,7 @@ use vortex_index::{VixDocs, VixRangeSource, VixReader};
 
 use self::{
     cache::{self as vix_result_cache, CacheEntry},
-    partition::partition_vix_files,
+    partition::order_vix_files,
     source::{LadderRangeSource, VixReadMode, vix_read_mode},
 };
 use crate::{
@@ -296,7 +301,7 @@ pub async fn vix_search(
     // the first `eval_concurrency` files: in hour order that sample is one
     // hour, and a service absent from the window's oldest hour sent 6.8k
     // files to the scan branch (`.194`: a 7 d count took 90-98 s instead of
-    // ~20). `buffer_unordered` still evaluates `eval_concurrency` at a time.
+    // ~20). The window still evaluates `eval_concurrency` files at a time.
     eval_files.sort_unstable_by_key(|file| {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -468,13 +473,17 @@ pub async fn vix_search(
         );
     }
     let time_range = query.time_range;
-    // Waves are sized by the evaluation concurrency, not the CPU-derived
-    // partition count: a wave is a barrier, and a probe-only SimpleSelect
-    // over a long window is bound by cold sidecar round trips, so a wave
-    // smaller than the slots leaves them idle (prod 7-day point lookup:
-    // 150 waves of 64 files against 256 slots, ~250 ms of S3 latency each).
-    let index_parquet_files =
-        partition_vix_files(eval_files, &idx_optimize_mode, eval_concurrency);
+    // The evaluation order is best-first for the timestamp-ordered LIMIT
+    // shape (`SimpleSelect`): the driver opens files in this order through
+    // one continuous sliding window, and the pruner's early stop drops
+    // everything not yet answered once the limit is satisfied. Every other
+    // mode needs all files and keeps the deterministic hash order (the
+    // skip-rate bail-out samples it).
+    let simple_select_pruning = matches!(
+        &idx_optimize_mode,
+        Some(IndexOptimizeMode::SimpleSelect(limit, _)) if *limit > 0
+    );
+    let index_parquet_files = order_vix_files(eval_files, &idx_optimize_mode);
 
     // Every read is attributed to its active operation, including reads from
     // shared readers created by an earlier query.
@@ -484,14 +493,22 @@ pub async fn vix_search(
     let mut completed_file_bytes = 0u64;
     let mut completed_files = 0usize;
 
-    let mut no_more_files = false;
     let mut result_builder = MultiResultBuilder::new(&idx_optimize_mode, &index_parquet_files);
     if let Some(histogram) = metadata_histogram {
         result_builder.add_histogram(histogram);
     }
+    // The sliding-window cap: SimpleSelect keeps the ramp that bounds
+    // speculative reads (64, 128, 256, ... doublings), every other mode
+    // runs at the full evaluation concurrency from the start.
+    let window_cap = if simple_select_pruning {
+        eval_concurrency.max(64)
+    } else {
+        eval_concurrency
+    };
     log::info!(
-        "[trace_id {trace_id}] search->vix: target_partitions: {target_partitions}, file_groups: {}",
+        "[trace_id {trace_id}] search->vix: target_partitions: {target_partitions}, files: {}, window: {}..{window_cap}",
         index_parquet_files.len(),
+        window_for(simple_select_pruning, 0, window_cap),
     );
 
     // Projected-cost bail-out for optimize-mode evaluations: a
@@ -506,7 +523,7 @@ pub async fn vix_search(
     let bail_bytes_cap = cfg.common.vix_eval_bail_bytes as u64;
     const BAIL_SAMPLE_FILES: usize = 32;
     let eval_bail = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let files_total: usize = index_parquet_files.iter().map(|group| group.len()).sum();
+    let files_total: usize = index_parquet_files.len();
     let mut files_evaluated: usize = 0;
     // Whole-file skip accounting, QUERY-scoped (#32 — this used to reset per
     // file group, so a fleet of files each skipping after a costly open was
@@ -538,91 +555,109 @@ pub async fn vix_search(
     // One evaluating query against the node's slots for the whole fan-out.
     let fair_share = source::FairShare::enter();
 
-    for (group_id, file_group) in index_parquet_files.into_iter().enumerate() {
-        if no_more_files {
-            // the simple-select limit is already satisfied: drop the rest
-            for file in file_group {
-                file_list_map.remove(&file.key);
-            }
-            continue;
-        }
-
-        // Opening and evaluation share a bounded per-file future: completed
-        // opens need not wait for unrelated cold files. Each file's counters
-        // are sampled only after it finishes, excluding unfinished lookahead.
-        let tasks = file_group.into_iter().map(|file| {
-            let trace_id = query.trace_id.to_string();
-            let index_condition_clone = index_condition.clone();
-            let idx_optimize_rule_clone = idx_optimize_mode.clone();
-            let full_text_fields = query.full_text_fields.as_deref();
-            let file_stats = Arc::new(source::FetchStats::default());
-            let file_operation = operation.for_file(Arc::clone(&file_stats));
-            let eval_bail = Arc::clone(&eval_bail);
-            let fair_share = Arc::clone(&fair_share);
-            async move {
-                let outcome = AssertUnwindSafe(async {
-                    if file_operation.is_cancelled() {
-                        return Err(vortex_index::VixError::Cancelled.into());
-                    }
-                    if eval_bail.load(std::sync::atomic::Ordering::Relaxed) {
-                        return Ok((
-                            file.key.clone(),
-                            VixSearchResult::Skipped { percent: 100 },
-                            true,
-                        ));
-                    }
-                    // Hold one of this query's fair-share slots for the whole
-                    // open + evaluation, so a query never pins more of the
-                    // node's evaluation slots than its share.
-                    let _fair_slot = fair_share.admit().await;
-                    let mut ret = search_vix_index(&trace_id,
-                    time_range,
-                    index_condition_clone.clone(),
-                    idx_optimize_rule_clone.clone(),
-                    &file,
-                    read_mode,
-                    sidecar_access,
-                    &file_operation, full_text_fields)
-                    .await;
-                    if let Err(error) = &ret
-                        && !file_operation.is_cancelled()
-                        && !is_cancelled_read(error)
-                        && !requires_exact_scan(error)
-                        && error.downcast_ref::<crate::index::AllConditionsSkipped>().is_none()
-                        && !infra::storage::is_not_found_error(error)
-                    {
-                        log::warn!(
-                            "[trace_id {trace_id}] search->vix: retrying file {} after error: {error:?}",
-                            file.key,
-                        );
-                        ret = search_vix_index(&trace_id,
+    // One continuous sliding window over the ordered file list: a file is
+    // fed into `pending` while the window has room, and every completion
+    // runs the per-result body below. SimpleSelect keeps the ramp that
+    // bounds speculative reads (the first 64 keep the common one-file
+    // answer from paying extra opens); the former barrier waves are what
+    // idled the evaluation slots waiting for each wave's slowest cold
+    // open (prod 7-day point lookup: 150 waves of 64 files against 256
+    // slots, ~250 ms of S3 latency each).
+    let mut pending = FuturesUnordered::new();
+    // ordered positions of the futures currently inside `pending`
+    let mut in_flight: BTreeSet<usize> = BTreeSet::new();
+    // the position after the last file handed to the window
+    let mut next_position = 0usize;
+    'window: loop {
+        while in_flight.len() < window_for(simple_select_pruning, completed_files, window_cap)
+            && next_position < index_parquet_files.len()
+        {
+            let position = next_position;
+            next_position += 1;
+            in_flight.insert(position);
+            let file = &index_parquet_files[position];
+            // Opening and evaluation share a bounded per-file future: completed
+            // opens need not wait for unrelated cold files. Each file's counters
+            // are sampled only after it finishes, excluding unfinished lookahead.
+            let task = {
+                let trace_id = query.trace_id.to_string();
+                let index_condition_clone = index_condition.clone();
+                let idx_optimize_rule_clone = idx_optimize_mode.clone();
+                let full_text_fields = query.full_text_fields.as_deref();
+                let file_stats = Arc::new(source::FetchStats::default());
+                let file_operation = operation.for_file(Arc::clone(&file_stats));
+                let eval_bail = Arc::clone(&eval_bail);
+                let fair_share = Arc::clone(&fair_share);
+                async move {
+                    let outcome = AssertUnwindSafe(async {
+                        if file_operation.is_cancelled() {
+                            return Err(vortex_index::VixError::Cancelled.into());
+                        }
+                        if eval_bail.load(std::sync::atomic::Ordering::Relaxed) {
+                            return Ok((
+                                file.key.clone(),
+                                VixSearchResult::Skipped { percent: 100 },
+                                true,
+                            ));
+                        }
+                        // Hold one of this query's fair-share slots for the whole
+                        // open + evaluation, so a query never pins more of the
+                        // node's evaluation slots than its share.
+                        let _fair_slot = fair_share.admit().await;
+                        let mut ret = search_vix_index(&trace_id,
                         time_range,
-                        index_condition_clone,
-                        idx_optimize_rule_clone,
+                        index_condition_clone.clone(),
+                        idx_optimize_rule_clone.clone(),
                         &file,
                         read_mode,
                         sidecar_access,
                         &file_operation, full_text_fields)
                         .await;
-                    }
-                    if file_operation.is_cancelled() {
-                        return Err(vortex_index::VixError::Cancelled.into());
-                    }
-                    ret
-                })
-                .catch_unwind()
-                .await;
-                (
-                    outcome,
-                    file_stats.bytes.load(std::sync::atomic::Ordering::Relaxed),
-                    file.key,
-                )
-            }
-        });
+                        if let Err(error) = &ret
+                            && !file_operation.is_cancelled()
+                            && !is_cancelled_read(error)
+                            && !requires_exact_scan(error)
+                            && error.downcast_ref::<crate::index::AllConditionsSkipped>().is_none()
+                            && !infra::storage::is_not_found_error(error)
+                        {
+                            log::warn!(
+                                "[trace_id {trace_id}] search->vix: retrying file {} after error: {error:?}",
+                                file.key,
+                            );
+                            ret = search_vix_index(&trace_id,
+                            time_range,
+                            index_condition_clone,
+                            idx_optimize_rule_clone,
+                            &file,
+                            read_mode,
+                            sidecar_access,
+                            &file_operation, full_text_fields)
+                            .await;
+                        }
+                        if file_operation.is_cancelled() {
+                            return Err(vortex_index::VixError::Cancelled.into());
+                        }
+                        ret
+                    })
+                    .catch_unwind()
+                    .await;
+                    (
+                        position,
+                        outcome,
+                        file_stats.bytes.load(std::sync::atomic::Ordering::Relaxed),
+                    )
+                }
+            };
+            pending.push(task);
+        }
 
-        let mut tasks = stream::iter(tasks).buffer_unordered(eval_concurrency);
-        while let Some((outcome, file_bytes, evaluated_file)) = tasks.next().await {
-            completed_files += 1;
+        let Some((position, outcome, file_bytes)) = pending.next().await else {
+            break 'window;
+        };
+        in_flight.remove(&position);
+        let evaluated_file = &index_parquet_files[position].key;
+        completed_files += 1;
+        'file: {
             completed_file_bytes = completed_file_bytes.saturating_add(file_bytes);
             let result = match outcome {
                 Ok(result) => result,
@@ -697,7 +732,7 @@ pub async fn vix_search(
                                 files_evaluated + files_skipped,
                             );
                         }
-                        continue;
+                        break 'file;
                     }
                     // Only completed evaluations enter the projected-cost sample;
                     // typed skipped outcomes above never dilute the average.
@@ -755,7 +790,7 @@ pub async fn vix_search(
                             "[trace_id {trace_id}] search->vix: file: {file_name}, aggregate fast path skipped a condition, keep file for the scan branch",
                         );
                         fallbacks.record("skipped_condition");
-                        continue;
+                        break 'file;
                     }
                     match result {
                         VixSearchResult::RowIdsSelection {
@@ -813,7 +848,7 @@ pub async fn vix_search(
                 }
                 Err(e) => {
                     if let Some(fallback) = e.downcast_ref::<AccessFallback>()
-                        && let Some(file) = file_list_map.get_mut(&evaluated_file)
+                        && let Some(file) = file_list_map.get_mut(evaluated_file)
                     {
                         file.native_predicate = fallback.native_predicate;
                     }
@@ -883,13 +918,27 @@ pub async fn vix_search(
                             );
                         }
                     }
-                    continue;
+                    break 'file;
                 }
             }
         }
         // only for simple select: stop when the limit is already satisfied
-        if result_builder.should_prune_remaining_groups(trace_id, group_id) {
-            no_more_files = true;
+        // by the candidates collected so far
+        let first_incomplete = in_flight.first().copied().unwrap_or(next_position);
+        if result_builder.should_prune_after(trace_id, first_incomplete) {
+            // Drop every file the window has not consumed yet: the
+            // in-flight ones (dropping `pending` cancels their
+            // evaluations, the same way query cancellation does) and the
+            // not-yet-started ones — exactly what the old "drop the rest
+            // of the groups" did.
+            for &pos in &in_flight {
+                file_list_map.remove(&index_parquet_files[pos].key);
+            }
+            for file in &index_parquet_files[next_position..] {
+                file_list_map.remove(&file.key);
+            }
+            drop(pending);
+            break 'window;
         }
     }
 
@@ -905,8 +954,8 @@ pub async fn vix_search(
     let load =
         |counter: &std::sync::atomic::AtomicU64| counter.load(std::sync::atomic::Ordering::Relaxed);
     // `fetch_batches` = `fetch_many` calls. Concurrent single-range calls of
-    // one wave each count once, so this bounds sequential depth from above
-    // and is not itself the round-trip count.
+    // one window slot each count once, so this bounds sequential depth from
+    // above and is not itself the round-trip count.
     log::info!(
         "[trace_id {trace_id}] search->vix: io_accounting logical_ranges={} logical_bytes={} fetch_batches={} completed_coalesced_reads={} completed_coalesced_bytes={} memory_reads={} memory_bytes={} disk_reads={} disk_bytes={} block_reads={} block_bytes={} remote_reads={} remote_bytes={} remote_physical_bytes={} unknown_store_reads={} unknown_store_bytes={} queue_us={} active_us={} evaluation_wait_us={}",
         fetch_count,
@@ -2424,7 +2473,7 @@ fn evaluate_vix_index(
     // is the pre-existing scan-branch fallback, with the reason counted.
     //
     // A LIMIT select is refined the same way: exact per-file candidates are
-    // what the best-first waves and the pruner's early stop run on, so a
+    // what the best-first order and the pruner's early stop run on, so a
     // superset select (a `str_match` / equality on a token-indexed field)
     // stops after the newest files hold `limit` verified rows instead of
     // sending every file's candidates to a scan that must see them all
@@ -3068,6 +3117,29 @@ fn eval_bail_threshold(cap: u64, window_compressed_bytes: u64) -> u64 {
     cap.max(window_compressed_bytes / 2)
 }
 
+/// The sliding-window size for the evaluation driver after `completed`
+/// files have finished.
+///
+/// SimpleSelect starts at `min(64, cap)` and doubles each time `completed`
+/// reaches the cumulative boundary of the old waves (64, 64+128,
+/// 64+128+256, ...) up to `cap`: the first 64 keep the common one-file
+/// answer from paying extra speculative opens, and the ramp bounds
+/// speculative reads while the pruner has seen no candidates yet. Every
+/// other mode runs at `cap` from the start — it has no early stop, so a
+/// ramp only delays it.
+fn window_for(simple_select: bool, completed: usize, cap: usize) -> usize {
+    if !simple_select {
+        return cap.max(1);
+    }
+    let mut size = 64usize.min(cap);
+    let mut boundary = size;
+    while completed >= boundary && size < cap {
+        size = (size * 2).min(cap);
+        boundary += size;
+    }
+    size.max(1)
+}
+
 #[cfg(test)]
 mod tests {
     /// Bailing must compare the index projection against the SCAN
@@ -3087,6 +3159,39 @@ mod tests {
         assert!(1024 * MB < threshold, "1GB projection must not bail");
         // a genuinely pathological projection still bails
         assert!(8 * 1024 * MB > threshold);
+    }
+
+    /// The SimpleSelect window ramps 64 -> 128 -> 256 at the cumulative
+    /// wave boundaries (64, 192, 448, ...) and stays flat past the cap;
+    /// every other mode is at the cap from the first file.
+    #[test]
+    fn test_window_for_ramps_at_old_wave_boundaries() {
+        let cases: &[(usize, usize)] = &[
+            (0, 64),
+            (63, 64),
+            (64, 128),
+            (191, 128),
+            (192, 256),
+            (447, 256),
+            (448, 256),
+            (10_000, 256),
+        ];
+        for &(completed, expected) in cases {
+            assert_eq!(
+                window_for(true, completed, 256),
+                expected,
+                "completed {completed}"
+            );
+        }
+        // a cap below the first ramp step pins the window there
+        for completed in [0usize, 1, 10, 100] {
+            assert_eq!(window_for(true, completed, 16), 16, "completed {completed}");
+        }
+        // non-select modes never ramp
+        for completed in [0usize, 1, 100, 10_000] {
+            assert_eq!(window_for(false, completed, 256), 256);
+            assert_eq!(window_for(false, completed, 1), 1);
+        }
     }
 
     use config::meta::stream::FileMeta;
@@ -5177,15 +5282,11 @@ mod tests {
         ];
 
         // ---- descending (ORDER BY _timestamp DESC LIMIT 5) ----
-        let groups = vec![vec![file_a.clone(), file_b.clone(), file_c.clone()]];
-        let mut builder = MultiResultBuilder::new(
-            &Some(IndexOptimizeMode::SimpleSelect(limit, false)),
-            &groups,
-        );
-        let mut file_map: HashMap<String, FileKey> = groups[0]
-            .iter()
-            .map(|f| (f.key.clone(), f.clone()))
-            .collect();
+        let files = vec![file_a.clone(), file_b.clone(), file_c.clone()];
+        let mut builder =
+            MultiResultBuilder::new(&Some(IndexOptimizeMode::SimpleSelect(limit, false)), &files);
+        let mut file_map: HashMap<String, FileKey> =
+            files.iter().map(|f| (f.key.clone(), f.clone())).collect();
         for (reader, file) in readers {
             let bitmap = BooleanBuffer::new_set(reader.row_count() as usize);
             let candidates = collect::simple_select(reader, &bitmap, limit, false).unwrap();
@@ -5207,13 +5308,11 @@ mod tests {
         }
 
         // ---- ascending (ORDER BY _timestamp ASC LIMIT 5) ----
-        let groups = vec![vec![file_a.clone(), file_b.clone(), file_c.clone()]];
+        let files = vec![file_a.clone(), file_b.clone(), file_c.clone()];
         let mut builder =
-            MultiResultBuilder::new(&Some(IndexOptimizeMode::SimpleSelect(limit, true)), &groups);
-        let mut file_map: HashMap<String, FileKey> = groups[0]
-            .iter()
-            .map(|f| (f.key.clone(), f.clone()))
-            .collect();
+            MultiResultBuilder::new(&Some(IndexOptimizeMode::SimpleSelect(limit, true)), &files);
+        let mut file_map: HashMap<String, FileKey> =
+            files.iter().map(|f| (f.key.clone(), f.clone())).collect();
         for (reader, file) in [
             (&reader_a, &file_a),
             (&reader_b, &file_b),
@@ -5235,13 +5334,11 @@ mod tests {
         }
 
         // ---- desc with a limit spanning two files ----
-        let groups = vec![vec![file_a.clone(), file_b.clone(), file_c.clone()]];
+        let files = vec![file_a.clone(), file_b.clone(), file_c.clone()];
         let mut builder =
-            MultiResultBuilder::new(&Some(IndexOptimizeMode::SimpleSelect(12, false)), &groups);
-        let mut file_map: HashMap<String, FileKey> = groups[0]
-            .iter()
-            .map(|f| (f.key.clone(), f.clone()))
-            .collect();
+            MultiResultBuilder::new(&Some(IndexOptimizeMode::SimpleSelect(12, false)), &files);
+        let mut file_map: HashMap<String, FileKey> =
+            files.iter().map(|f| (f.key.clone(), f.clone())).collect();
         for (reader, file) in [
             (&reader_a, &file_a),
             (&reader_b, &file_b),
@@ -7524,8 +7621,8 @@ mod evaluation_memory_tests {
         file_range: (i64, i64),
         full_text_fields: Option<&[String]>,
     ) -> (RawVixResult, usize) {
-        let permit = source::try_acquire_evaluation_under(POOL_SHARE_BYTES)
-            .expect("a free evaluation slot");
+        let permit =
+            source::try_acquire_evaluation_under(POOL_SHARE_BYTES).expect("a free evaluation slot");
         let operation = source::ReadOperation::new(Arc::new(source::FetchStats::default()), None);
         let (data, index) = (data.clone(), index.clone());
         let started = std::time::Instant::now();
@@ -7545,7 +7642,9 @@ mod evaluation_memory_tests {
                 )?;
                 anyhow::Ok((result, reader.memory_peak()))
             })
-            .unwrap_or_else(|error| panic!("{label} must complete under the pool share: {error:#}"));
+            .unwrap_or_else(|error| {
+                panic!("{label} must complete under the pool share: {error:#}")
+            });
         assert!(
             started.elapsed() < std::time::Duration::from_millis(500),
             "{label}: completion must not hit the 500 ms growth wait (owned peak {owned_peak} B)"
@@ -8781,8 +8880,8 @@ mod review_tests {
             mk_file("c", 10, 99),
             mk_file("d", 10, 98),
         ];
-        let groups = vec![files.clone()];
-        let mut pruner = SimpleSelectPruner::new(2, false, &groups);
+        let ordered = files.clone();
+        let mut pruner = SimpleSelectPruner::new(2, false, &ordered);
         pruner.record_candidates("a".to_string(), Arc::new(vec![(100, 0), (99, 1)]), None);
         pruner.record_candidates("b".to_string(), Arc::new(vec![(99, 7)]), None);
         let mut map: HashMap<String, FileKey> =

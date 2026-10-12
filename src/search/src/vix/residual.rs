@@ -35,12 +35,12 @@
 //! run on it unchanged, the per-file result memoises as exact, and the scan
 //! branch never sees the file.
 //!
-//! A LIMIT select (`SimpleSelect`) is refined for the same reason: its
-//! best-first waves and early stop ([`super::pruner`]) only count EXACT
+//! A LIMIT select (`SimpleSelect`) is refined for the same reason: the
+//! best-first order and early stop ([`super::pruner`]) only count EXACT
 //! candidates, so a superset select used to send every file's candidate
 //! rows to a scan whose TopK had to see all of them. Refined, the newest
 //! files' verified rows satisfy the limit and the remaining files are never
-//! opened. A refused select keeps its superset candidates for the scan.
+//! scanned. A refused select keeps its superset candidates for the scan.
 //! The two shapes differ in two bounded ways ([`Shape`]): the touched-chunk
 //! cap and the docs handle the point reads go through.
 //!
@@ -73,7 +73,7 @@ pub(super) enum Shape {
     /// mostly fold the exact rows through the zone table without opening
     /// the docs blob themselves.
     Aggregate,
-    /// `ORDER BY _timestamp LIMIT n`: only the best-first waves the early
+    /// `ORDER BY _timestamp LIMIT n`: only the best-first files the early
     /// stop needs are refined, under [`select_chunk_cap`], and the point
     /// reads go through the reader's OWN docs blob — the select arm reads
     /// the exact candidates' `_timestamp` through it right after, so the
@@ -127,7 +127,7 @@ pub(super) const RESIDUAL_SELECT_MAX_BYTES: u64 = 64 * 1024 * 1024;
 /// Most docs chunks a LIMIT select's candidates may touch: the chunks
 /// [`RESIDUAL_SELECT_MAX_BYTES`] covers at this file's average chunk size,
 /// never below [`RESIDUAL_MAX_CHUNKS`]. A select refines only the
-/// best-first waves its early stop needs, and a row-selected file the
+/// best-first files its early stop needs, and a row-selected file the
 /// refinement does not verify is scanned for ALL its projected columns on
 /// the same chunks — so the per-file bound follows the memory the point
 /// read may hold, not the fixed aggregate count: 2 MB chunks (a merged

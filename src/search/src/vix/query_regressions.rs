@@ -1690,15 +1690,16 @@ fn superset_select_is_refined_to_exact_candidates() {
 }
 
 /// End to end over 70 files in time order, `LIMIT 2 DESC` on the superset
-/// phrase: the first wave (the 64 newest files) holds verified rows that
-/// outrank every remaining file, so the 6 oldest files are dropped before
-/// they are opened — they are unopenable here (no object size) and would
-/// otherwise keep the file list and force the filter back. The winners are
-/// the newest file's two phrase rows, as an exact selection.
+/// phrase: the sliding window evaluates the files best-first and the
+/// pruner drops every file the window has not yet answered once the
+/// newest files' verified rows outrank the remaining bound — files within
+/// the current window may still be evaluated speculatively, but nothing
+/// beyond it is ever started. The winners are the newest file's two
+/// phrase rows, as an exact selection, and no unneeded file reaches the
+/// scan branch.
 #[tokio::test(flavor = "multi_thread")]
-async fn superset_select_stops_after_the_wave_that_satisfies_the_limit() {
+async fn superset_select_prunes_files_the_window_has_not_answered() {
     const FILES: i64 = 70;
-    const UNOPENABLE: i64 = 6;
     let scope = vec!["active".to_string(), "historical".to_string()];
     let condition = IndexCondition {
         conditions: vec![Condition::MatchAll("alpha beta".into())],
@@ -1708,30 +1709,25 @@ async fn superset_select_stops_after_the_wave_that_satisfies_the_limit() {
     for i in 0..FILES {
         let offset = i * 1_000;
         let (data, index, _) = full_text_scope_fixture_at(offset);
-        let openable = i >= UNOPENABLE;
         let file = FileKey {
             key: key(i),
             meta: config::meta::stream::FileMeta {
                 min_ts: offset + 94,
                 max_ts: offset + 100,
                 records: 7,
-                // the oldest files carry no object size: opening them is a
-                // deterministic refusal, so they must never be reached
-                compressed_size: if openable { data.len() as i64 } else { 0 },
+                compressed_size: data.len() as i64,
                 index_size: index.len() as i64,
                 ..Default::default()
             },
             ..Default::default()
         };
-        if openable {
-            let reader = VixReader::open_with_index(data, Some(index)).unwrap();
-            reader_cache::GLOBAL_CACHE
-                .put(
-                    reader_cache::ReaderCacheKey::new(file.key.clone(), 0, file.meta.index_size),
-                    reader,
-                )
-                .unwrap();
-        }
+        let reader = VixReader::open_with_index(data, Some(index)).unwrap();
+        reader_cache::GLOBAL_CACHE
+            .put(
+                reader_cache::ReaderCacheKey::new(file.key.clone(), 0, file.meta.index_size),
+                reader,
+            )
+            .unwrap();
         files.push(file);
     }
     let params = Arc::new(crate::types::QueryParams {

@@ -183,7 +183,7 @@ pub enum MultiResultBuilder {
 }
 
 impl MultiResultBuilder {
-    pub fn new(optimize_rule: &Option<IndexOptimizeMode>, file_groups: &[Vec<FileKey>]) -> Self {
+    pub fn new(optimize_rule: &Option<IndexOptimizeMode>, files: &[FileKey]) -> Self {
         match optimize_rule {
             Some(IndexOptimizeMode::SimpleHistogram(..)) => Self::Histogram(vec![]),
             Some(IndexOptimizeMode::SimpleMultiHistogram(..)) => Self::MultiHistogram(vec![]),
@@ -191,7 +191,7 @@ impl MultiResultBuilder {
             Some(IndexOptimizeMode::SimpleDistinct(..)) => Self::Distinct(HashSet::new()),
             Some(IndexOptimizeMode::SimpleSelect(limit, ascend)) => Self::SimpleSelect {
                 num_rows: 0,
-                pruner: SimpleSelectPruner::new(*limit, *ascend, file_groups),
+                pruner: SimpleSelectPruner::new(*limit, *ascend, files),
             },
             Some(IndexOptimizeMode::SimpleCount) => Self::Count(0),
             // M16: count(field) merges exactly like count(*) — a per-file sum
@@ -296,12 +296,13 @@ impl MultiResultBuilder {
         }
     }
 
-    /// Only for simple select: whether the groups after `group_id` can be
-    /// dropped because the limit is already satisfied by earlier candidates.
-    pub fn should_prune_remaining_groups(&self, trace_id: &str, group_id: usize) -> bool {
+    /// Only for simple select: whether the files at or after ordered position
+    /// `first_incomplete` can be dropped because the limit is already
+    /// satisfied by the candidates collected so far.
+    pub fn should_prune_after(&self, trace_id: &str, first_incomplete: usize) -> bool {
         match self {
             Self::SimpleSelect { pruner, .. } => {
-                pruner.should_prune_remaining_groups(trace_id, group_id)
+                pruner.should_prune_after(trace_id, first_incomplete)
             }
             _ => false,
         }

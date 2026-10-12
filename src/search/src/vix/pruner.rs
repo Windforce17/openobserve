@@ -1,8 +1,8 @@
 // Copyright 2026 OpenObserve Inc.
 //
 // This program is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
+// it under the terms of the GNU Affero General Public License as published
+// by the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 //
 // This program is distributed in the hope that it will be useful
@@ -17,11 +17,11 @@
 //! queries.
 //!
 //! Each vix search returns per-file candidates as `(_timestamp, doc_id)`
-//! pairs. The [`SimpleSelectPruner`] collects them across the group loop to
-//! stop the search early, then merges them into the exact global top-N so
-//! only the winning rows reach the data-scan phase.
+//! pairs. The [`SimpleSelectPruner`] collects them across the evaluation
+//! loop to stop the search early, then merges them into the exact global
+//! top-N so only the winning rows reach the data-scan phase.
 
-use std::sync::Arc;
+use std::{collections::BinaryHeap, sync::Arc};
 
 use config::meta::stream::{FileKey, FileSelection, RowIdBitmap};
 use hashbrown::HashMap;
@@ -40,22 +40,84 @@ type FileCandidates = (Arc<Vec<(i64, u32)>>, Option<u32>);
 pub struct SimpleSelectPruner {
     limit: usize,
     ascend: bool,
-    /// time bound covering every file in groups `i..`: the newest `max_ts`
-    /// for descending order, the oldest `min_ts` for ascending order
-    group_suffix_bounds: Vec<i64>,
+    /// time bound covering every file at ordered position `i..`: the
+    /// newest `max_ts` for descending order, the oldest `min_ts` for
+    /// ascending order. Length `n + 1` with a sentinel at `n` so
+    /// `should_prune_after(n)` is false.
+    suffix_bounds: Vec<i64>,
     /// per-file top-`limit` exact candidates as `(_timestamp, doc_id)`,
     /// with the row group size of the index file
     candidates: HashMap<String, FileCandidates>,
+    /// The `limit` best candidate timestamps seen so far: a max-heap keyed
+    /// by the ranking direction so the weakest of the global top-`limit`
+    /// sits on top (the smallest for DESC, the largest for ASC). Empty
+    /// until `limit` rows have been recorded.
+    best: BinaryHeap<Rank>,
+}
+
+/// A candidate timestamp ordered worst-first inside the best-heap: the
+/// heap's top is the weakest of the rows it holds. The ranking direction
+/// is a property of the pruner, carried per entry: for DESC the best rows
+/// are the LARGEST timestamps (weakest = smallest on top); for ASC the
+/// mirror (weakest = largest on top).
+struct Rank {
+    ts: i64,
+    /// `true` = ASC: the largest timestamp is the weakest
+    ascend: bool,
+}
+
+impl PartialEq for Rank {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for Rank {}
+
+impl Ord for Rank {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // worst-first: whichever timestamp is the weaker row sorts up
+        if self.ascend {
+            self.ts.cmp(&other.ts)
+        } else {
+            other.ts.cmp(&self.ts)
+        }
+    }
+}
+
+impl PartialOrd for Rank {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 impl SimpleSelectPruner {
-    pub fn new(limit: usize, ascend: bool, file_groups: &[Vec<FileKey>]) -> Self {
+    pub fn new(limit: usize, ascend: bool, files: &[FileKey]) -> Self {
         debug_assert!(limit > 0, "SimpleSelect always carries a positive limit");
+        let n = files.len();
+        let mut suffix_bounds = vec![0i64; n + 1];
+        // the sentinel at `n` makes `should_prune_after(n)` false: no
+        // timestamp can lie strictly beyond it
+        suffix_bounds[n] = if ascend { i64::MIN } else { i64::MAX };
+        // the fold accumulator is the NEUTRAL element of the fold, not
+        // the sentinel: position `i`'s bound covers only real files
+        let mut bound = if ascend { i64::MAX } else { i64::MIN };
+        // files arrive best-first ordered, so folding from the end gives the
+        // tightest bound covering every file at or after each position
+        for i in (0..n).rev() {
+            bound = if ascend {
+                bound.min(files[i].meta.min_ts)
+            } else {
+                bound.max(files[i].meta.max_ts)
+            };
+            suffix_bounds[i] = bound;
+        }
         Self {
             limit,
             ascend,
-            group_suffix_bounds: group_suffix_bounds(file_groups, ascend),
+            suffix_bounds,
             candidates: HashMap::new(),
+            best: BinaryHeap::new(),
         }
     }
 
@@ -71,33 +133,64 @@ impl SimpleSelectPruner {
             candidates.is_sorted_by(|a, b| if self.ascend { a.0 <= b.0 } else { a.0 >= b.0 }),
             "candidates must be timestamp-ordered best-first"
         );
+        for &(ts, _) in candidates.iter() {
+            let rank = Rank {
+                ts,
+                ascend: self.ascend,
+            };
+            if self.best.len() < self.limit {
+                self.best.push(rank);
+            } else if self
+                .best
+                .peek()
+                // the top is the WEAKEST held row: the new row replaces
+                // it only when the new row is stronger (sorts below it
+                // in the heap's worst-first order)
+                .is_some_and(|weakest| rank.cmp(weakest) == std::cmp::Ordering::Less)
+            {
+                self.best.pop();
+                self.best.push(rank);
+            }
+        }
         self.candidates
             .insert(file_name, (candidates, row_group_size));
     }
 
-    /// Whether the groups after `group_id` can be dropped: at least `limit`
-    /// candidate rows are guaranteed to sort before every row of the
-    /// remaining groups.
-    pub fn should_prune_remaining_groups(&self, trace_id: &str, group_id: usize) -> bool {
-        // out of range for the last group: nothing remains to prune
-        let Some(&bound) = self.group_suffix_bounds.get(group_id + 1) else {
+    /// Whether the files at or after ordered position `first_incomplete` can
+    /// be dropped: the `limit` best candidate rows are guaranteed to sort
+    /// strictly beyond every row of those files.
+    ///
+    /// Soundness: at any completion, every file not yet consumed by the
+    /// driver (in flight, ready-but-unconsumed, unstarted) sits at an
+    /// ordered position >= `first_incomplete`, so `suffix_bounds[first_incomplete]`
+    /// bounds all of them. The heap test is equivalent to "at least `limit`
+    /// candidate rows strictly beyond the bound" because the heap holds the
+    /// `limit` best rows: if its weakest member lies strictly beyond the
+    /// bound, so do all `limit` members.
+    pub fn should_prune_after(&self, trace_id: &str, first_incomplete: usize) -> bool {
+        if self.best.len() < self.limit {
+            return false;
+        }
+        let Some(&bound) = self.suffix_bounds.get(first_incomplete) else {
             return false;
         };
-        // each file's candidates are timestamp-ordered best-first, so the
-        // rows strictly beyond the bound form a prefix
-        let beyond_bound =
-            |&(ts, _): &(i64, u32)| if self.ascend { ts < bound } else { ts > bound };
-        let guaranteed: usize = self
-            .candidates
-            .values()
-            .map(|(candidates, _)| candidates.partition_point(beyond_bound))
-            .sum();
-        if guaranteed < self.limit {
+        let Some(weakest) = self.best.peek() else {
+            return false;
+        };
+        // STRICT comparison, the same as the old per-group check: a
+        // candidate TYING the bound does not outrank the remaining rows
+        let beyond = if self.ascend {
+            weakest.ts < bound
+        } else {
+            weakest.ts > bound
+        };
+        if !beyond {
             return false;
         }
         log::info!(
-            "[trace_id {trace_id}] search->vix: simple select limit {} satisfied by {guaranteed} matches before remaining groups, prune after group {group_id}",
+            "[trace_id {trace_id}] search->vix: simple select limit {} satisfied by {} best matches, prune files at or after position {first_incomplete}",
             self.limit,
+            self.best.len(),
         );
         true
     }
@@ -109,7 +202,7 @@ impl SimpleSelectPruner {
     /// time range sorts strictly after the weakest winner.
     pub fn finalize(&mut self, trace_id: &str, file_list_map: &mut HashMap<String, FileKey>) {
         let mut candidates = std::mem::take(&mut self.candidates);
-        // files can disappear from the list before the merge (e.g. groups
+        // files can disappear from the list before the merge (e.g. files
         // dropped after an early stop)
         candidates.retain(|key, _| file_list_map.contains_key(key));
         if candidates.is_empty() {
@@ -193,41 +286,6 @@ impl SimpleSelectPruner {
             );
         }
     }
-}
-
-/// For each group `i`, the time bound covering every file in groups `i..`.
-/// A candidate outranks every row of the remaining groups iff it lies
-/// strictly beyond this bound.
-///
-/// The suffix fold covers the case where a later group holds a file that
-/// sorts beyond every file of the next group.
-fn group_suffix_bounds(file_groups: &[Vec<FileKey>], ascend: bool) -> Vec<i64> {
-    let mut bounds: Vec<i64> = file_groups
-        .iter()
-        .map(|group| {
-            if ascend {
-                group
-                    .iter()
-                    .map(|f| f.meta.min_ts)
-                    .min()
-                    .unwrap_or(i64::MAX)
-            } else {
-                group
-                    .iter()
-                    .map(|f| f.meta.max_ts)
-                    .max()
-                    .unwrap_or(i64::MIN)
-            }
-        })
-        .collect();
-    for i in (0..bounds.len().saturating_sub(1)).rev() {
-        bounds[i] = if ascend {
-            bounds[i].min(bounds[i + 1])
-        } else {
-            bounds[i].max(bounds[i + 1])
-        };
-    }
-    bounds
 }
 
 /// #27 metadata pre-prune for `SimpleSelect` + condition-ALL: using
@@ -333,23 +391,10 @@ mod tests {
     fn make_pruner(
         limit: usize,
         ascend: bool,
+        bounds_files: Vec<FileKey>,
         candidates: &[(&str, &[(i64, u32)])],
     ) -> SimpleSelectPruner {
-        make_pruner_with_bounds(limit, ascend, vec![], candidates)
-    }
-
-    fn make_pruner_with_bounds(
-        limit: usize,
-        ascend: bool,
-        group_suffix_bounds: Vec<i64>,
-        candidates: &[(&str, &[(i64, u32)])],
-    ) -> SimpleSelectPruner {
-        let mut pruner = SimpleSelectPruner {
-            limit,
-            ascend,
-            group_suffix_bounds,
-            candidates: HashMap::new(),
-        };
+        let mut pruner = SimpleSelectPruner::new(limit, ascend, &bounds_files);
         for (key, rows) in candidates {
             pruner.record_candidates(key.to_string(), Arc::new(rows.to_vec()), Some(1024));
         }
@@ -365,10 +410,31 @@ mod tests {
 
     #[test]
     fn test_new() {
-        let groups = vec![vec![create_file_key(1, 10)]];
-        let pruner = SimpleSelectPruner::new(10, false, &groups);
+        // best-first ordered files: newest max_ts first for DESC; the
+        // suffix fold from the end keeps the tightest per-position bound,
+        // with a sentinel at the end
+        let files = vec![create_file_key(91, 100), create_file_key(81, 90)];
+        let pruner = SimpleSelectPruner::new(10, false, &files);
         assert_eq!(pruner.limit, 10);
-        assert_eq!(pruner.group_suffix_bounds, vec![10]);
+        assert_eq!(pruner.suffix_bounds, vec![100, 90, i64::MAX]);
+        // ASC: the fold takes the running MIN of `min_ts` from the end —
+        // here the fixture is not driver-ordered, so position 0's bound
+        // covers both files' `min_ts`
+        let pruner = SimpleSelectPruner::new(10, true, &files);
+        assert_eq!(pruner.suffix_bounds, vec![81, 81, i64::MIN]);
+    }
+
+    #[test]
+    fn test_new_overlapping_files_weaken_not_break_the_bound() {
+        // position 0 spans the whole window: its own max_ts bounds the
+        // suffix, the later (strictly older) files cannot tighten it
+        let files = vec![
+            create_file_key(1, 100),
+            create_file_key(50, 60),
+            create_file_key(80, 90),
+        ];
+        let pruner = SimpleSelectPruner::new(10, false, &files);
+        assert_eq!(pruner.suffix_bounds, vec![100, 90, 90, i64::MAX]);
     }
 
     #[test]
@@ -381,6 +447,7 @@ mod tests {
         let mut pruner = make_pruner(
             3,
             false,
+            vec![],
             &[
                 ("file_91_100", &[(100, 10), (99, 11), (95, 12)]),
                 ("file_81_90", &[(98, 20), (90, 21)]),
@@ -411,7 +478,7 @@ mod tests {
             create_file_key(80, 99),
             create_file_key(1, 50),
         ]);
-        let mut pruner = make_pruner(2, false, &[("file_91_100", &[(100, 0), (99, 1)])]);
+        let mut pruner = make_pruner(2, false, vec![], &[("file_91_100", &[(100, 0), (99, 1)])]);
         pruner.finalize("test", &mut files);
         assert_eq!(
             sorted_keys(&files),
@@ -425,7 +492,7 @@ mod tests {
         // fewer candidates than the limit: no weakest-winner threshold, so
         // the file without candidates survives no matter how old it is
         let mut files = build_file_map(vec![create_file_key(91, 100), create_file_key(1, 10)]);
-        let mut pruner = make_pruner(10, false, &[("file_91_100", &[(100, 0), (99, 1)])]);
+        let mut pruner = make_pruner(10, false, vec![], &[("file_91_100", &[(100, 0), (99, 1)])]);
         pruner.finalize("test", &mut files);
         assert_eq!(files.len(), 2);
         assert_eq!(selected_rows(&files["file_91_100"]), vec![0, 1]);
@@ -441,6 +508,7 @@ mod tests {
         let mut pruner = make_pruner(
             2,
             true,
+            vec![],
             &[("file_1_10", &[(1, 0), (2, 1)]), ("file_11_20", &[(11, 5)])],
         );
         pruner.finalize("test", &mut files);
@@ -453,11 +521,12 @@ mod tests {
     #[test]
     fn test_finalize_ignores_candidates_of_removed_files() {
         // candidates of a file no longer in the list (e.g. dropped with the
-        // groups after an early prune) must not influence the merge
+        // remaining files after an early prune) must not influence the merge
         let mut files = build_file_map(vec![create_file_key(91, 100)]);
         let mut pruner = make_pruner(
             1,
             false,
+            vec![],
             &[("file_gone", &[(200, 0)]), ("file_91_100", &[(100, 7)])],
         );
         pruner.finalize("test", &mut files);
@@ -467,52 +536,159 @@ mod tests {
     #[test]
     fn test_finalize_without_candidates_is_noop() {
         let mut files = build_file_map(vec![create_file_key(91, 100), create_file_key(1, 80)]);
-        let mut pruner = make_pruner(10, false, &[]);
+        let mut pruner = make_pruner(10, false, vec![], &[]);
         pruner.finalize("test", &mut files);
         assert_eq!(files.len(), 2);
         assert!(files.values().all(|f| f.selection.is_none()));
     }
 
     #[test]
-    fn test_should_prune_remaining_groups_uses_candidate_timestamps() {
+    fn test_should_prune_after_uses_candidate_timestamps() {
         // the file spans 50..100 but its candidates carry exact timestamps,
         // so hits inside a file that overlaps the remaining bound still count
-        let pruner = make_pruner_with_bounds(
+        let files = vec![
+            create_file_key(50, 100),
+            create_file_key(40, 90),
+            create_file_key(30, 80),
+        ];
+        let pruner = make_pruner(
             3,
             false,
-            vec![100, 90, 80],
+            files,
             &[("file_50_100", &[(99, 0), (95, 1), (91, 2)])],
         );
-        // all 3 candidate timestamps sort strictly after the bound 90
-        assert!(pruner.should_prune_remaining_groups("test", 0));
-        assert!(pruner.should_prune_remaining_groups("test", 1));
-        // last group: nothing remains, no prune signal needed
-        assert!(!pruner.should_prune_remaining_groups("test", 2));
+        // all 3 candidate timestamps sort strictly after the bound at
+        // positions 1 (90) and 2 (80)
+        assert!(pruner.should_prune_after("test", 1));
+        assert!(pruner.should_prune_after("test", 2));
+        // at position 0 the bound (100) is not strictly worse than the
+        // weakest best candidate (91)
+        assert!(!pruner.should_prune_after("test", 0));
+        // past the end: nothing remains, no prune signal needed
+        assert!(!pruner.should_prune_after("test", 3));
     }
 
     #[test]
-    fn test_should_prune_remaining_groups_boundary_ties_do_not_count() {
+    fn test_should_prune_after_boundary_ties_do_not_count() {
         // ts == bound is not strictly newer: only ts 99 counts against the
         // bound 95, so 1 < limit 2 and the search must continue
-        let pruner = make_pruner_with_bounds(
+        let files = vec![create_file_key(50, 100), create_file_key(40, 95)];
+        let pruner = make_pruner(
             2,
             false,
-            vec![100, 95],
+            files,
             &[("file_50_100", &[(99, 0), (95, 1), (91, 2)])],
         );
-        assert!(!pruner.should_prune_remaining_groups("test", 0));
+        assert!(!pruner.should_prune_after("test", 1));
     }
 
     #[test]
-    fn test_should_prune_remaining_groups_asc() {
-        let pruner = make_pruner_with_bounds(
-            2,
-            true,
-            vec![1, 10, 30],
-            &[("file_1_20", &[(1, 0), (5, 1), (12, 2)])],
-        );
+    fn test_should_prune_after_asc() {
+        let files = vec![
+            create_file_key(1, 20),
+            create_file_key(10, 30),
+            create_file_key(20, 40),
+        ];
+        let pruner = make_pruner(2, true, files, &[("file_1_20", &[(1, 0), (5, 1), (12, 2)])]);
         // candidates at ts 1 and 5 sort strictly before the bound 10
-        assert!(pruner.should_prune_remaining_groups("test", 0));
+        assert!(pruner.should_prune_after("test", 1));
+    }
+
+    /// The heap criterion must match the old definition: prune iff the sum
+    /// over candidate files of rows strictly beyond the suffix bound is
+    /// >= limit. Ties at the bound do not count on either side.
+    #[test]
+    fn test_should_prune_after_matches_the_row_count_definition() {
+        fn old_guaranteed(candidates: &[Vec<(i64, u32)>], bound: i64, ascend: bool) -> usize {
+            candidates
+                .iter()
+                .map(|rows| {
+                    rows.partition_point(|&(ts, _)| if ascend { ts < bound } else { ts > bound })
+                })
+                .sum()
+        }
+        // (files, per-file candidates, limit) — hand-built shapes incl.
+        // ties at the bound, for both orders
+        let desc_files = vec![
+            create_file_key(90, 100),
+            create_file_key(80, 90),
+            create_file_key(70, 85),
+        ];
+        let desc_cases: Vec<(&[&[(i64, u32)]], usize)> = vec![
+            // two files' candidates clear the bound, one ties it
+            (&[&[(100, 0), (96, 1)], &[(98, 2), (90, 3)], &[(85, 4)]], 3),
+            // all rows tie the bound: nothing is strictly beyond
+            (&[&[(90, 0)], &[(90, 1)], &[(90, 2)]], 2),
+            // a single file alone satisfies the limit
+            (&[&[(100, 0), (99, 1), (98, 2)]], 3),
+            // more candidates than the limit, all beyond the last bound
+            (&[&[(99, 0), (98, 1), (97, 2), (96, 3)]], 4),
+        ];
+        for (candidate_sets, limit) in desc_cases {
+            let names: Vec<String> = (0..candidate_sets.len()).map(|i| format!("f{i}")).collect();
+            let named: Vec<(&str, &[(i64, u32)])> = candidate_sets
+                .iter()
+                .enumerate()
+                .map(|(i, rows)| (names[i].as_str(), *rows))
+                .collect();
+            let mut pruner = SimpleSelectPruner::new(limit, false, &desc_files);
+            for (name, rows) in &named {
+                pruner.record_candidates(name.to_string(), Arc::new(rows.to_vec()), None);
+            }
+            for pos in 0..=desc_files.len() {
+                let Some(&bound) = pruner.suffix_bounds.get(pos) else {
+                    assert!(!pruner.should_prune_after("test", pos));
+                    continue;
+                };
+                let all_rows: Vec<Vec<(i64, u32)>> =
+                    named.iter().map(|(_, rows)| rows.to_vec()).collect();
+                let expected = old_guaranteed(&all_rows, bound, false) >= limit;
+                assert_eq!(
+                    pruner.should_prune_after("test", pos),
+                    expected,
+                    "desc case limit {limit}, position {pos}, bound {bound}"
+                );
+            }
+        }
+        let asc_files = vec![
+            create_file_key(1, 10),
+            create_file_key(10, 20),
+            create_file_key(15, 30),
+        ];
+        let asc_cases: Vec<(&[&[(i64, u32)]], usize)> = vec![
+            // rows strictly below both later bounds, tying the first
+            (&[&[(1, 0), (10, 1)], &[(12, 2)], &[(15, 3)]], 2),
+            // everything ties the bound
+            (&[&[(10, 0)], &[(10, 1)], &[(10, 2)]], 2),
+            // one file satisfies the limit alone
+            (&[&[(1, 0), (2, 1), (3, 2)]], 3),
+        ];
+        for (candidate_sets, limit) in asc_cases {
+            let names: Vec<String> = (0..candidate_sets.len()).map(|i| format!("f{i}")).collect();
+            let named: Vec<(&str, &[(i64, u32)])> = candidate_sets
+                .iter()
+                .enumerate()
+                .map(|(i, rows)| (names[i].as_str(), *rows))
+                .collect();
+            let mut pruner = SimpleSelectPruner::new(limit, true, &asc_files);
+            for (name, rows) in &named {
+                pruner.record_candidates(name.to_string(), Arc::new(rows.to_vec()), None);
+            }
+            for pos in 0..=asc_files.len() {
+                let Some(&bound) = pruner.suffix_bounds.get(pos) else {
+                    assert!(!pruner.should_prune_after("test", pos));
+                    continue;
+                };
+                let all_rows: Vec<Vec<(i64, u32)>> =
+                    named.iter().map(|(_, rows)| rows.to_vec()).collect();
+                let expected = old_guaranteed(&all_rows, bound, true) >= limit;
+                assert_eq!(
+                    pruner.should_prune_after("test", pos),
+                    expected,
+                    "asc case limit {limit}, position {pos}, bound {bound}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -591,10 +767,12 @@ mod tests {
     #[test]
     fn test_record_candidates_defers_selection() {
         let files = build_file_map(vec![create_file_key(1, 10)]);
-        let mut pruner = make_pruner(5, false, &[]);
+        let mut pruner = make_pruner(5, false, vec![], &[]);
         pruner.record_candidates("file_1_10".to_string(), Arc::new(vec![(9, 3)]), Some(1024));
         // deferred: recorded on the pruner, no selection built yet
         assert!(files["file_1_10"].selection.is_none());
         assert!(pruner.candidates.contains_key("file_1_10"));
+        // the best-heap tracks the timestamp
+        assert_eq!(pruner.best.peek().map(|rank| rank.ts), Some(9));
     }
 }
