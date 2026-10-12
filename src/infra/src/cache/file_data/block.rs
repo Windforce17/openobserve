@@ -26,16 +26,32 @@
 //! copy; the write-through puts the same bytes in the file); a warm read
 //! is one `pread`.
 //!
-//! On-disk layout: one sparse file per object under `<root>/<key>`. Bytes
-//! `[0, object_size)` mirror the object at identical offsets (holes where
-//! blocks were never fetched); a trailer at `align_up(object_size, 4096)`
-//! records the presence bitmap. The in-memory bitmap is authoritative while
-//! the process runs; the trailer is rewritten by a background flusher
-//! (`fdatasync` of the data first, then the trailer) and only read back by
-//! [`BlockCache::load`] at startup. Bits are set after the data write
-//! returned, so a persisted bit implies durable data; a torn or corrupt
-//! trailer fails its checksum and discards the entry (refetched later),
-//! it can never claim a block that was not written.
+//! On-disk layout: one sparse file per object under `<root>/<key>`, whose
+//! logical length is the object's size; bytes `[0, object_size)` mirror the
+//! object at identical offsets, holes where blocks were never fetched.
+//! There is no per-fill durability machinery and no fsync/fdatasync
+//! anywhere in this tier: a block is served only while the in-memory bitmap
+//! marks it present, and a restart reconstructs that bitmap from the
+//! filesystem's own hole map instead of from anything this tier wrote.
+//!
+//! Lineage: without an fsync, a written byte is trustworthy only while the
+//! page cache holding it survived - i.e. within one kernel boot. A process
+//! crash (OOM kill, panic) keeps the dirty pages; a node crash loses them,
+//! and in prod a node crash discards the pod-ephemeral volume anyway.
+//! [`init`] therefore parks a `.lineage` marker (layout, block size, kernel
+//! boot id) in the root and wipes any root whose marker is missing or
+//! disagrees with the current boot before the tier is reachable. The marker
+//! is a plain write, no fsync: a lost marker only causes a wipe, the safe
+//! direction.
+//!
+//! Reconstruction: [`BlockCache::load`] walks the root and, per file, walks
+//! `lseek(SEEK_DATA)`/`lseek(SEEK_HOLE)` from offset 0; a block is present
+//! iff its whole byte range `[b*bs, min((b+1)*bs, object_size))` is covered
+//! by data extents. A partially written block has a hole for its unwritten
+//! tail, so it can never be adopted - only a block whose every page is
+//! data is. [`init`] self-tests the root once (`.probe`) that the
+//! filesystem reports holes at all; if it does not, the root is treated as
+//! stale: the tier still works, it just starts empty after every restart.
 //!
 //! Locking: bucket indexes are touched only for O(1) map operations and
 //! never held across IO or `await`; all file IO (`pread`/`pwrite`/unlink)
@@ -50,7 +66,6 @@ use std::{
         Arc, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::Duration,
 };
 
 use bytes::Bytes;
@@ -58,16 +73,18 @@ use config::{get_config, metrics, utils::hash::sum64_bytes};
 use futures::{StreamExt, TryStreamExt, future::BoxFuture};
 use hashbrown::HashMap;
 use parking_lot::{Mutex, RwLock};
-use tokio::sync::mpsc;
 
 use super::CacheStrategy;
 
-const TRAILER_MAGIC: [u8; 8] = *b"O2BLKC01";
-const TRAILER_HEADER_LEN: usize = 40;
-const TRAILER_ALIGN: u64 = 4096;
-/// Coalescing delay of the trailer flusher: fills landing within this window
-/// share one `fdatasync` + trailer write per entry.
-const FLUSH_DELAY: Duration = Duration::from_secs(1);
+/// Name of the lineage marker file inside the block cache root.
+const LINEAGE_MARKER: &str = ".lineage";
+/// On-disk layout generation recorded in the marker: a root whose marker
+/// does not say this (or whose block size or kernel boot differs) is stale
+/// and wiped at [`init`].
+const LINEAGE_LAYOUT: &str = "block-sparse-v2";
+/// Boot id written into the marker on platforms without one (non-Linux):
+/// such a root has no lineage anchor and is wiped at every [`init`].
+const NO_BOOT_ID: &str = "none";
 /// Missing runs separated by at most this many bytes of present blocks are
 /// fetched as one span (re-fetching the present blocks in between): request
 /// count over bytes on object storage, like the object_store coalescer.
@@ -89,13 +106,16 @@ pub async fn init() -> Result<(), anyhow::Error> {
         return Ok(());
     }
     let root = PathBuf::from(format!("{}blocks/", cfg.common.data_cache_dir));
-    std::fs::create_dir_all(&root)?;
+    let block_size = cfg.disk_cache.block_size as u64;
+    // Synchronously, before `GLOBAL.set` makes the tier reachable: a stale
+    // root must never serve a byte from a previous kernel boot.
+    prepare_root(&root, block_size, read_boot_id().as_deref())?;
     let per_bucket = cfg.disk_cache.block_max_size as u64;
     let cache = BlockCache::new(
         root,
-        cfg.disk_cache.block_size as u64,
+        block_size,
         per_bucket,
-        (per_bucket / 10).max(cfg.disk_cache.block_size as u64),
+        (per_bucket / 10).max(block_size),
         &cfg.disk_cache.cache_strategy,
         cfg.disk_cache.bucket_num,
     );
@@ -110,6 +130,273 @@ pub async fn init() -> Result<(), anyhow::Error> {
         }
     });
     Ok(())
+}
+
+/// The kernel's boot id, the lineage anchor of the root: Linux exposes it
+/// at `/proc/sys/kernel/random/boot_id`. Elsewhere there is none, and a
+/// root without an anchor is wiped at every [`init`].
+#[cfg(target_os = "linux")]
+fn read_boot_id() -> Option<String> {
+    let id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    let id = id.trim();
+    (!id.is_empty()).then(|| id.to_string())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_boot_id() -> Option<String> {
+    None
+}
+
+/// What [`prepare_root`] did to the root: whether it was recreated, and
+/// whether the filesystem reports holes (`false` also off unix, where
+/// [`BlockCache::load`] adopts nothing anyway).
+#[derive(Debug)]
+pub struct RootState {
+    pub recreated: bool,
+    pub hole_reporting: bool,
+}
+
+/// Make `root` usable from this process: wipe it when its lineage marker
+/// (layout, block size, kernel boot) is missing or disagrees with the
+/// current boot, write the current marker, then self-test that the
+/// filesystem reports holes - without that, [`BlockCache::load`] could
+/// adopt blocks that were never written.
+///
+/// Wiping renames the root to `<parent>/<name>.stale-<unix_nanos>` and
+/// removes it on the blocking pool, so a big root never blocks startup.
+/// Needs a Tokio runtime for that removal.
+fn prepare_root(root: &Path, block_size: u64, boot_id: Option<&str>) -> std::io::Result<RootState> {
+    let mut recreated = false;
+    if root.exists() {
+        if let Some(reason) = stale_reason(root, block_size, boot_id) {
+            wipe_root(root, &reason)?;
+            recreated = true;
+        }
+    } else {
+        log::info!("[BlockCache] creating block cache root {}", root.display());
+    }
+    std::fs::create_dir_all(root)?;
+    write_lineage(root, block_size, boot_id)?;
+    #[cfg(unix)]
+    let hole_reporting = match hole_probe(root, block_size) {
+        Ok(true) => true,
+        Ok(false) => {
+            log::warn!(
+                "[BlockCache] {} does not report holes (SEEK_DATA/SEEK_HOLE); wiping it: the block cache starts empty after every restart",
+                root.display()
+            );
+            wipe_root(root, "the filesystem does not report holes")?;
+            recreated = true;
+            std::fs::create_dir_all(root)?;
+            write_lineage(root, block_size, boot_id)?;
+            false
+        }
+        Err(e) => {
+            log::warn!(
+                "[BlockCache] hole self-test on {} failed: {e}; wiping it: the block cache starts empty after every restart",
+                root.display()
+            );
+            wipe_root(root, "the hole self-test failed")?;
+            recreated = true;
+            std::fs::create_dir_all(root)?;
+            write_lineage(root, block_size, boot_id)?;
+            false
+        }
+    };
+    #[cfg(not(unix))]
+    let hole_reporting = false;
+    Ok(RootState {
+        recreated,
+        hole_reporting,
+    })
+}
+
+/// Why the existing root cannot be trusted from this boot; `None` when it
+/// can be.
+fn stale_reason(root: &Path, block_size: u64, boot_id: Option<&str>) -> Option<String> {
+    // No kernel boot anchor (not Linux): never trust a previous run.
+    let boot_id = match boot_id {
+        Some(boot_id) => boot_id,
+        None => return Some("the kernel boot id is unavailable".to_string()),
+    };
+    match read_lineage(root) {
+        None => Some("the lineage marker is missing or unreadable".to_string()),
+        Some(lineage) if lineage.layout != LINEAGE_LAYOUT => Some(format!(
+            "its layout {} is not {LINEAGE_LAYOUT}",
+            lineage.layout
+        )),
+        Some(lineage) if lineage.block_size != block_size => Some(format!(
+            "its block size {} is not {block_size}",
+            lineage.block_size
+        )),
+        Some(lineage) if lineage.boot_id != boot_id => Some(format!(
+            "it was written by kernel boot {} and this is {boot_id}",
+            lineage.boot_id
+        )),
+        Some(_) => None,
+    }
+}
+
+/// Rename `root` aside (it becomes `<parent>/<name>.stale-<unix_nanos>`,
+/// removed on the blocking pool) and leave an empty root in its place.
+fn wipe_root(root: &Path, reason: &str) -> std::io::Result<bool> {
+    if !root.exists() {
+        return Ok(false);
+    }
+    let name = root
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "blocks".to_string());
+    let stale = root
+        .parent()
+        .map(|parent| parent.join(format!("{name}.stale-{}", unix_nanos())))
+        .unwrap_or_else(|| PathBuf::from(format!("{name}.stale-{}", unix_nanos())));
+    std::fs::rename(root, &stale)?;
+    log::info!(
+        "[BlockCache] wiped the block cache root ({reason}): {} renamed to {}",
+        root.display(),
+        stale.display()
+    );
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = std::fs::remove_dir_all(&stale) {
+            log::warn!(
+                "[BlockCache] remove stale block cache root {}: {e}",
+                stale.display()
+            );
+        }
+    });
+    Ok(true)
+}
+
+fn unix_nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_nanos())
+        .unwrap_or_default()
+}
+
+/// The root's recorded lineage: layout, block size, kernel boot id.
+struct Lineage {
+    layout: String,
+    block_size: u64,
+    boot_id: String,
+}
+
+/// Parse the lineage marker; `None` when it is missing, torn or malformed -
+/// anything this writer did not produce.
+fn read_lineage(root: &Path) -> Option<Lineage> {
+    let text = std::fs::read_to_string(root.join(LINEAGE_MARKER)).ok()?;
+    let mut lines = text.lines();
+    let layout = lines.next()?;
+    let block_size = lines.next()?.strip_prefix("block_size=")?.parse().ok()?;
+    let boot_id = lines.next()?.strip_prefix("boot_id=")?;
+    if lines.next().is_some() || boot_id.is_empty() {
+        return None;
+    }
+    Some(Lineage {
+        layout: layout.to_string(),
+        block_size,
+        boot_id: boot_id.to_string(),
+    })
+}
+
+/// Write the lineage marker: a plain write, no fsync - a lost marker only
+/// causes a wipe next boot, the safe direction.
+fn write_lineage(root: &Path, block_size: u64, boot_id: Option<&str>) -> std::io::Result<()> {
+    std::fs::write(
+        root.join(LINEAGE_MARKER),
+        format!(
+            "{LINEAGE_LAYOUT}\nblock_size={block_size}\nboot_id={}\n",
+            boot_id.unwrap_or(NO_BOOT_ID)
+        ),
+    )
+}
+
+/// Self-test that this root's filesystem reports holes: write `block_size`
+/// bytes at `[block_size, 2*block_size)` of a `2*block_size` probe file and
+/// require the untouched first half to read as a hole and the written half
+/// as data. A filesystem that reports everything as data would make
+/// [`present_blocks`] adopt blocks that were never written.
+#[cfg(unix)]
+fn hole_probe(root: &Path, block_size: u64) -> std::io::Result<bool> {
+    let path = root.join(".probe");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)?;
+    let probe = (|| {
+        use std::os::fd::AsRawFd;
+        file.set_len(2 * block_size)?;
+        pwrite_all(&file, &vec![0u8; block_size as usize], block_size)?;
+        let fd = file.as_raw_fd();
+        Ok(lseek_whence(fd, 0, libc::SEEK_DATA)? == Some(block_size)
+            && lseek_whence(fd, block_size, libc::SEEK_HOLE)? == Some(2 * block_size))
+    })();
+    std::fs::remove_file(&path)?;
+    probe
+}
+
+/// `lseek(fd, offset, whence)`; `Ok(None)` for ENXIO (nothing left to find).
+#[cfg(unix)]
+fn lseek_whence(
+    fd: std::os::fd::RawFd,
+    offset: u64,
+    whence: libc::c_int,
+) -> std::io::Result<Option<u64>> {
+    let offset = libc::off_t::try_from(offset)
+        .map_err(|_| std::io::Error::other("seek offset overflows off_t"))?;
+    let position = unsafe { libc::lseek(fd, offset, whence) };
+    if position >= 0 {
+        return Ok(Some(u64::try_from(position).unwrap_or(u64::MAX)));
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ENXIO) {
+        Ok(None)
+    } else {
+        Err(error)
+    }
+}
+
+/// `(object_size, present bits, present bytes)` of a cache file, found by
+/// walking its data extents with `SEEK_DATA`/`SEEK_HOLE` from offset 0: a
+/// block is present iff its whole byte range
+/// `[b*bs, min((b+1)*bs, object_size))` is covered by data extents, so a
+/// torn block (its unwritten tail is a hole) never is.
+#[cfg(unix)]
+fn present_blocks(file: &std::fs::File, block_size: u64) -> std::io::Result<(u64, Vec<u64>, u64)> {
+    use std::os::fd::AsRawFd;
+    let object_size = file.metadata()?.len();
+    let blocks = block_count(object_size, block_size);
+    let mut bits = vec![0u64; blocks.div_ceil(64) as usize];
+    let mut present_bytes = 0u64;
+    let fd = file.as_raw_fd();
+    let mut offset = 0u64;
+    while offset < object_size {
+        // ENXIO: no data extent at or after `offset`, the rest is holes.
+        let Some(data) = lseek_whence(fd, offset, libc::SEEK_DATA)? else {
+            break;
+        };
+        let Some(hole) = lseek_whence(fd, data, libc::SEEK_HOLE)? else {
+            break;
+        };
+        let end = hole.min(object_size);
+        // the first block starting inside this extent; a block the extent
+        // only partially covers (torn write) is skipped, not adopted
+        let mut block = data.div_ceil(block_size);
+        while block < blocks {
+            let block_end = ((block + 1) * block_size).min(object_size);
+            if block_end > end {
+                break;
+            }
+            set_bit(&mut bits, block);
+            present_bytes += block_end - block * block_size;
+            block += 1;
+        }
+        offset = end.max(data + 1);
+    }
+    Ok((object_size, bits, present_bytes))
 }
 
 /// Bytes fetched from object storage for a block-aligned range plus the
@@ -225,7 +512,6 @@ pub struct BlockCache {
     root: PathBuf,
     block_size: u64,
     buckets: Vec<Bucket>,
-    dirty: mpsc::UnboundedSender<Arc<Entry>>,
 }
 
 struct Bucket {
@@ -247,8 +533,6 @@ pub struct Entry {
     object_size: u64,
     block_size: u64,
     state: Mutex<State>,
-    /// Sitting in the flusher queue; cleared when the flusher takes the trailer.
-    queued: AtomicBool,
 }
 
 struct State {
@@ -270,7 +554,6 @@ impl Entry {
                 present_bytes: 0,
                 evicted: false,
             }),
-            queued: AtomicBool::new(false),
         }
     }
 
@@ -329,23 +612,6 @@ impl Entry {
         state.present_bytes += added;
         added
     }
-
-    fn trailer_offset(&self) -> u64 {
-        self.object_size.div_ceil(TRAILER_ALIGN) * TRAILER_ALIGN
-    }
-
-    /// Serialized trailer for the flusher, `None` once evicted.
-    fn trailer(&self) -> Option<Vec<u8>> {
-        let state = self.state.lock();
-        if state.evicted {
-            return None;
-        }
-        Some(encode_trailer(
-            self.block_size,
-            self.object_size,
-            &state.bits,
-        ))
-    }
 }
 
 fn block_count(object_size: u64, block_size: u64) -> u64 {
@@ -360,112 +626,10 @@ fn set_bit(bits: &mut [u64], block: u64) {
     bits[(block / 64) as usize] |= 1u64 << (block % 64);
 }
 
-fn bitmap_bytes(block_count: u64) -> usize {
-    block_count.div_ceil(8) as usize
-}
-
-/// `[bitmap][header 40 B]`; the header is last so `load` finds it from the
-/// file end: magic, block_size u32, pad u32, object_size u64, bitmap_len u32,
-/// pad u32, checksum u64 over everything before it.
-fn encode_trailer(block_size: u64, object_size: u64, bits: &[u64]) -> Vec<u8> {
-    let bitmap_len = bitmap_bytes(block_count(object_size, block_size));
-    let mut out = Vec::with_capacity(bitmap_len + TRAILER_HEADER_LEN);
-    for word in bits {
-        out.extend_from_slice(&word.to_le_bytes());
-    }
-    out.truncate(bitmap_len);
-    out.resize(bitmap_len, 0);
-    out.extend_from_slice(&TRAILER_MAGIC);
-    out.extend_from_slice(&(block_size as u32).to_le_bytes());
-    out.extend_from_slice(&0u32.to_le_bytes());
-    out.extend_from_slice(&object_size.to_le_bytes());
-    out.extend_from_slice(&(bitmap_len as u32).to_le_bytes());
-    out.extend_from_slice(&0u32.to_le_bytes());
-    let checksum = sum64_bytes(&out);
-    out.extend_from_slice(&checksum.to_le_bytes());
-    out
-}
-
-struct Trailer {
-    block_size: u64,
-    object_size: u64,
-    bits: Vec<u64>,
-}
-
-/// Parse the trailer of a cache file; `None` for anything that is not a
-/// complete, checksummed trailer consistent with the file length.
-fn read_trailer(file: &std::fs::File) -> Option<Trailer> {
-    let len = file.metadata().ok()?.len();
-    if len < TRAILER_HEADER_LEN as u64 {
-        return None;
-    }
-    let mut header = [0u8; TRAILER_HEADER_LEN];
-    pread_exact(file, &mut header, len - TRAILER_HEADER_LEN as u64).ok()?;
-    if header[..8] != TRAILER_MAGIC {
-        return None;
-    }
-    let block_size = u32::from_le_bytes(header[8..12].try_into().unwrap()) as u64;
-    let object_size = u64::from_le_bytes(header[16..24].try_into().unwrap());
-    let bitmap_len = u32::from_le_bytes(header[24..28].try_into().unwrap()) as usize;
-    let checksum = u64::from_le_bytes(header[32..40].try_into().unwrap());
-    if block_size == 0 || !block_size.is_power_of_two() || object_size == 0 {
-        return None;
-    }
-    let blocks = block_count(object_size, block_size);
-    if bitmap_len != bitmap_bytes(blocks) {
-        return None;
-    }
-    let trailer_offset = object_size.div_ceil(TRAILER_ALIGN) * TRAILER_ALIGN;
-    if len != trailer_offset + bitmap_len as u64 + TRAILER_HEADER_LEN as u64 {
-        return None;
-    }
-    let mut payload = vec![0u8; bitmap_len + TRAILER_HEADER_LEN - 8];
-    pread_exact(file, &mut payload, trailer_offset).ok()?;
-    if sum64_bytes(&payload) != checksum {
-        return None;
-    }
-    let mut bits = vec![0u64; blocks.div_ceil(64) as usize];
-    for (i, byte) in payload[..bitmap_len].iter().enumerate() {
-        bits[i / 8] |= (*byte as u64) << (8 * (i % 8));
-    }
-    // Bits past the last block would inflate accounting; a trailer that has
-    // them did not come from this writer.
-    for block in blocks..(bits.len() as u64 * 64) {
-        if is_set(&bits, block) {
-            return None;
-        }
-    }
-    Some(Trailer {
-        block_size,
-        object_size,
-        bits,
-    })
-}
-
-#[cfg(unix)]
-fn pread_exact(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
-    use std::os::unix::fs::FileExt;
-    file.read_exact_at(buf, offset)
-}
-
 #[cfg(unix)]
 fn pwrite_all(file: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<()> {
     use std::os::unix::fs::FileExt;
     file.write_all_at(buf, offset)
-}
-
-#[cfg(windows)]
-fn pread_exact(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
-    use std::os::windows::fs::FileExt;
-    let mut done = 0usize;
-    while done < buf.len() {
-        let n = file.seek_read(&mut buf[done..], offset + done as u64)?;
-        if n == 0 {
-            return Err(std::io::ErrorKind::UnexpectedEof.into());
-        }
-        done += n;
-    }
-    Ok(())
 }
 
 #[cfg(windows)]
@@ -502,8 +666,7 @@ fn generic(
 
 impl BlockCache {
     /// `max_size`/`release_size` are PER BUCKET, like the whole-file tier's
-    /// config after its per-bucket split. Spawns the trailer flusher, so it
-    /// needs a Tokio runtime.
+    /// config after its per-bucket split.
     pub fn new(
         root: PathBuf,
         block_size: u64,
@@ -513,7 +676,6 @@ impl BlockCache {
         bucket_num: usize,
     ) -> Arc<Self> {
         assert!(block_size.is_power_of_two() && block_size >= 512);
-        let (dirty, rx) = mpsc::unbounded_channel();
         let buckets = (0..bucket_num.max(1))
             .map(|_| Bucket {
                 max_size,
@@ -526,12 +688,10 @@ impl BlockCache {
                 }),
             })
             .collect();
-        tokio::task::spawn(flusher(rx));
         Arc::new(Self {
             root,
             block_size,
             buckets,
-            dirty,
         })
     }
 
@@ -751,6 +911,7 @@ impl BlockCache {
         let io = IoJob {
             path: entry.path.clone(),
             create: created || !fills.is_empty(),
+            object_size,
             writes: fills
                 .iter()
                 .map(|(run, bytes)| (run.start * bs, bytes.clone()))
@@ -837,7 +998,7 @@ impl BlockCache {
             metrics::QUERY_DISK_BLOCK_CACHE_USED_BYTES
                 .with_label_values(&[org, stream_type])
                 .add(added as i64);
-            self.enqueue_dirty(&entry);
+
             if cur > bucket.max_size {
                 self.evict(bucket, bucket.release_size.max(added));
             }
@@ -869,12 +1030,6 @@ impl BlockCache {
     /// relative (`Suffix`/`Offset`) range.
     pub fn object_size(&self, key: &str) -> Option<u64> {
         self.get_entry(key).map(|entry| entry.object_size)
-    }
-
-    fn enqueue_dirty(&self, entry: &Arc<Entry>) {
-        if !entry.queued.swap(true, Ordering::AcqRel) {
-            let _ = self.dirty.send(Arc::clone(entry));
-        }
     }
 
     /// Drop the entry for `key` (e.g. the whole file was cached and the blocks
@@ -968,24 +1123,11 @@ impl BlockCache {
         unlink_later(victims);
     }
 
-    /// Write every pending trailer now (graceful shutdown, tests).
-    pub async fn flush(&self) {
-        let mut work = Vec::new();
-        for bucket in &self.buckets {
-            let entries: Vec<Arc<Entry>> = bucket.index.read().entries.values().cloned().collect();
-            for entry in entries {
-                entry.queued.store(false, Ordering::Release);
-                if let Some(trailer) = entry.trailer() {
-                    work.push((entry.path.clone(), entry.trailer_offset(), trailer));
-                }
-            }
-        }
-        let _ = tokio::task::spawn_blocking(move || write_trailers(work)).await;
-    }
-
-    /// Rebuild the index from the cache directory: files with a valid
-    /// trailer become entries, anything else is removed (unless a live
-    /// entry already owns the path).
+    /// Rebuild the index from the cache directory: each file's present
+    /// blocks are reconstructed from the filesystem's data extents
+    /// ([`present_blocks`]); files with nothing present (empty object, no
+    /// data, unreadable) are removed - unless a live entry already owns the
+    /// path. Off unix nothing is adopted: the whole tier is unix-only.
     pub async fn load(self: &Arc<Self>) -> Result<usize, anyhow::Error> {
         let cache = Arc::clone(self);
         tokio::task::spawn_blocking(move || cache.load_blocking()).await?
@@ -1015,8 +1157,12 @@ impl BlockCache {
                 else {
                     continue;
                 };
-                if self.adopt_file(&key, &path) {
-                    loaded += 1;
+                if key.split('/').all(|part| !part.starts_with('.')) {
+                    // Skip the root's own lineage marker and self-test
+                    // probe: a cache key never has a dotfile component.
+                    if self.adopt_file(&key, &path) {
+                        loaded += 1;
+                    }
                 }
             }
         }
@@ -1029,12 +1175,20 @@ impl BlockCache {
         if bucket.index.read().entries.contains_key(key) {
             return false;
         }
-        let trailer = std::fs::File::open(path)
-            .ok()
-            .and_then(|file| read_trailer(&file))
-            .filter(|t| t.block_size == self.block_size);
-        let Some(trailer) = trailer else {
-            // Not ours, torn, or written with another block size.
+        // Not ours, torn (a hole where a block was half written), written
+        // with another block size, or unreadable: remove it.
+        let adopted = std::fs::File::open(path).ok().and_then(|file| {
+            #[cfg(unix)]
+            {
+                present_blocks(&file, self.block_size).ok()
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = &file;
+                None
+            }
+        });
+        let Some((object_size, bits, present_bytes)) = adopted else {
             if !bucket.index.read().entries.contains_key(key)
                 && let Err(e) = std::fs::remove_file(path)
             {
@@ -1045,26 +1199,28 @@ impl BlockCache {
             }
             return false;
         };
-        let blocks = block_count(trailer.object_size, self.block_size);
-        let mut present_bytes = 0u64;
-        for block in 0..blocks {
-            if is_set(&trailer.bits, block) {
-                present_bytes += ((block + 1) * self.block_size).min(trailer.object_size)
-                    - block * self.block_size;
+        if object_size == 0 || present_bytes == 0 {
+            if !bucket.index.read().entries.contains_key(key)
+                && let Err(e) = std::fs::remove_file(path)
+            {
+                log::warn!(
+                    "[BlockCache] remove empty cache file {}: {e}",
+                    path.display()
+                );
             }
+            return false;
         }
         let key: Arc<str> = Arc::from(key);
         let entry = Arc::new(Entry {
             key: Arc::clone(&key),
             path: path.to_path_buf(),
-            object_size: trailer.object_size,
+            object_size,
             block_size: self.block_size,
             state: Mutex::new(State {
-                bits: trailer.bits,
+                bits,
                 present_bytes,
                 evicted: false,
             }),
-            queued: AtomicBool::new(false),
         });
         let mut index = bucket.index.write();
         if index.entries.contains_key(&*key) {
@@ -1098,6 +1254,10 @@ fn short_response(key: &str, expected: u64, got: usize) -> object_store::Error {
 struct IoJob {
     path: PathBuf,
     create: bool,
+    /// The object's size: on `create` the cache file's logical length is
+    /// set to it, so the file mirrors the object exactly - a hole at any
+    /// never-fetched offset, which is what [`present_blocks`] reads back.
+    object_size: u64,
     /// `(offset, bytes)` block runs to write before reading.
     writes: Vec<(u64, Bytes)>,
     /// `served[i]` holds the bytes of request `i` when it lies wholly inside
@@ -1116,15 +1276,20 @@ impl IoJob {
             if let Some(parent) = self.path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::OpenOptions::new()
+            let file = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
                 .create(true)
                 .truncate(false)
-                .open(&self.path)?
+                .open(&self.path)?;
+            // The cache file mirrors the object exactly: its logical length
+            // is the object's size, so every never-fetched offset is a hole.
+            file.set_len(self.object_size)?;
+            file
         } else {
             std::fs::File::open(&self.path)?
         };
+
         for (offset, bytes) in &self.writes {
             pwrite_all(&file, bytes, *offset)?;
         }
@@ -1162,55 +1327,9 @@ fn unlink_later(entries: Vec<Arc<Entry>>) {
     });
 }
 
-async fn flusher(mut rx: mpsc::UnboundedReceiver<Arc<Entry>>) {
-    let mut batch: Vec<Arc<Entry>> = Vec::new();
-    while let Some(first) = rx.recv().await {
-        batch.push(first);
-        tokio::time::sleep(FLUSH_DELAY).await;
-        while let Ok(entry) = rx.try_recv() {
-            batch.push(entry);
-        }
-        let work: Vec<(PathBuf, u64, Vec<u8>)> = batch
-            .drain(..)
-            .filter_map(|entry| {
-                entry.queued.store(false, Ordering::Release);
-                entry
-                    .trailer()
-                    .map(|trailer| (entry.path.clone(), entry.trailer_offset(), trailer))
-            })
-            .collect();
-        if work.is_empty() {
-            continue;
-        }
-        let _ = tokio::task::spawn_blocking(move || write_trailers(work)).await;
-    }
-}
-
-/// Data durability precedes the trailer: a persisted bit implies the block
-/// bytes reached the device.
-fn write_trailers(work: Vec<(PathBuf, u64, Vec<u8>)>) {
-    for (path, offset, trailer) in work {
-        let file = match std::fs::OpenOptions::new().write(true).open(&path) {
-            Ok(file) => file,
-            // Evicted after it was queued.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => {
-                log::warn!("[BlockCache] open {} for trailer: {e}", path.display());
-                continue;
-            }
-        };
-        if let Err(e) = file
-            .sync_data()
-            .and_then(|()| pwrite_all(&file, &trailer, offset))
-        {
-            log::warn!("[BlockCache] write trailer {}: {e}", path.display());
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicUsize;
+    use std::{sync::atomic::AtomicUsize, time::Duration};
 
     use futures::FutureExt;
 
@@ -1228,7 +1347,14 @@ mod tests {
 
     impl Remote {
         fn new(len: usize) -> Arc<Self> {
-            let data: Vec<u8> = (0..len).map(|i| (i * 7 % 251) as u8).collect();
+            // A fast repeating pattern with the same 251-byte cycle as the
+            // one-byte-at-a-time form it replaces.
+            let cycle: Vec<u8> = (0..251u32).map(|i| (i * 7 % 251) as u8).collect();
+            let mut data = Vec::with_capacity(len);
+            while data.len() + cycle.len() <= len {
+                data.extend_from_slice(&cycle);
+            }
+            data.extend_from_slice(&cycle[..len % cycle.len()]);
             Arc::new(Self {
                 data: Bytes::from(data),
                 calls: AtomicUsize::new(0),
@@ -1265,8 +1391,20 @@ mod tests {
         }
     }
 
-    fn cache(dir: &Path, max_size: u64) -> Arc<BlockCache> {
+    /// `prepare_root` is the [`init`] seam: tests inject a fixed boot id so
+    /// they never touch `/proc`.
+    fn cache_with_boot_id(dir: &Path, max_size: u64, boot_id: &str) -> Arc<BlockCache> {
+        prepare_root(dir, BS, Some(boot_id)).unwrap();
         BlockCache::new(dir.to_path_buf(), BS, max_size, BS, "time_lru", 1)
+    }
+
+    fn cache_with_block_size(dir: &Path, max_size: u64, bs: u64) -> Arc<BlockCache> {
+        prepare_root(dir, bs, Some("test-boot")).unwrap();
+        BlockCache::new(dir.to_path_buf(), bs, max_size, bs, "time_lru", 1)
+    }
+
+    fn cache(dir: &Path, max_size: u64) -> Arc<BlockCache> {
+        cache_with_boot_id(dir, max_size, "test-boot")
     }
 
     const KEY: &str = "files/org/logs/stream/2026/10/08/11/a.vix";
@@ -1381,97 +1519,250 @@ mod tests {
         assert_eq!(entries, 1);
         assert_eq!(used, 6 * BS, "overlapping fills never double count");
         let file = std::fs::File::open(dir.path().join(KEY)).unwrap();
-        let mut buf = vec![0u8; 6 * BS as usize];
-        pread_exact(&file, &mut buf, 0).unwrap();
+        let buf = crate::cache::file_data::pread_vec(&file, 0, 6 * BS as usize).unwrap();
         assert_eq!(&buf[..], &remote.data[..6 * BS as usize]);
     }
 
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn trailer_survives_reload_and_restored_blocks_hit() {
+    async fn fill_survives_reload_and_restored_blocks_hit() {
+        // Hole geometry that survives a close(): APFS back-fills holes
+        // smaller than ~16 MiB when a write lands past them (prod's ext4
+        // never does), so the gap between the two fetched blocks is
+        // 32 MiB (512 blocks) here.
         let dir = tempfile::tempdir().unwrap();
-        let remote = Remote::new(300_000);
+        let gap = 512 * BS;
+        let tail = 12345; // a short last block
+        let object_size = 2 * gap + tail as u64;
+        let remote = Remote::new(object_size as usize);
         let fetch = remote.fetcher();
         {
             let cache = cache(dir.path(), 1 << 30);
             cache.read_through(KEY, 0..10, None, &fetch).await.unwrap();
             cache
-                .read_through(KEY, 250_000..300_000, None, &fetch)
+                .read_through(KEY, gap..gap + 10, None, &fetch)
                 .await
                 .unwrap();
-            cache.flush().await;
+            cache
+                .read_through(KEY, object_size - 10..object_size, None, &fetch)
+                .await
+                .unwrap();
         }
+        // The write-through only ever put data in the page cache; a second
+        // process reconstructs presence from the filesystem's own extents.
         let calls_before = remote.calls();
         let cache = cache(dir.path(), 1 << 30);
         assert_eq!(cache.load().await.unwrap(), 1);
         let (_, used, entries) = cache.stats();
         assert_eq!(entries, 1);
-        // Blocks 0 (full), 3 (full) and the clipped tail block 4.
-        assert_eq!(used, BS + BS + (300_000 - 4 * BS));
+        // Block 0, block 512, and the clipped short tail block 1024.
+        assert_eq!(used, BS + BS + tail as u64);
         let read = cache.read_through(KEY, 0..10, None, &fetch).await.unwrap();
         assert_eq!(read.outcome, Outcome::Hit);
         assert_eq!(read.bytes, remote.data.slice(0..10));
         let read = cache
-            .read_through(KEY, 260_000..299_000, None, &fetch)
+            .read_through(KEY, gap..gap + 10, None, &fetch)
             .await
             .unwrap();
         assert_eq!(read.outcome, Outcome::Hit);
-        assert_eq!(read.bytes, remote.data.slice(260_000..299_000));
+        assert_eq!(
+            read.bytes,
+            remote.data.slice(gap as usize..gap as usize + 10)
+        );
         assert_eq!(remote.calls(), calls_before);
         // A region never fetched is still a miss after reload.
         let read = cache
-            .read_through(KEY, 100_000..100_100, None, &fetch)
+            .read_through(KEY, 2 * BS..2 * BS + 100, None, &fetch)
             .await
             .unwrap();
         assert_eq!(read.outcome, Outcome::Miss);
     }
 
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn corrupt_or_foreign_files_are_discarded_on_load() {
+    async fn partially_written_block_is_absent_but_neighbours_present() {
+        // A 32 MiB block size: the torn block's unwritten tail is then a
+        // 32 MiB hole, which APFS keeps (it back-fills smaller holes on
+        // close; prod's ext4 keeps any hole).
         let dir = tempfile::tempdir().unwrap();
-        let remote = Remote::new(200_000);
+        let bs = 32 * 1024 * 1024;
+        let object_size = 3 * bs;
+        let remote = Remote::new(object_size as usize);
         let fetch = remote.fetcher();
-        {
-            let cache = cache(dir.path(), 1 << 30);
-            cache.read_through(KEY, 0..10, None, &fetch).await.unwrap();
-            cache.flush().await;
-        }
-        // Flip a bitmap byte: checksum mismatch.
+        let cache = cache_with_block_size(dir.path(), 1 << 30, bs);
+        cache.read_through(KEY, 0..10, None, &fetch).await.unwrap();
+        cache
+            .read_through(KEY, 2 * bs..2 * bs + 10, None, &fetch)
+            .await
+            .unwrap();
+        // Tear block 1: write only its head into the cache file, its tail
+        // stays a hole.
         let path = dir.path().join(KEY);
         {
-            let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-            let offset = 200_000u64.div_ceil(TRAILER_ALIGN) * TRAILER_ALIGN;
-            pwrite_all(&file, &[0xFF], offset).unwrap();
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            pwrite_all(&file, &vec![0u8; 4096], bs).unwrap();
         }
-        let foreign = dir
-            .path()
-            .join("files/org/logs/stream/2026/10/08/11/junk.vix");
-        std::fs::write(&foreign, b"not a cache file").unwrap();
-        let unfinished = dir
-            .path()
-            .join("files/org/logs/stream/2026/10/08/11/unfinished.vix");
-        std::fs::write(&unfinished, vec![0u8; 100]).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let (found_size, bits, present_bytes) = present_blocks(&file, bs).unwrap();
+        assert_eq!(found_size, object_size);
+        assert!(is_set(&bits, 0) && is_set(&bits, 2));
+        assert!(!is_set(&bits, 1), "a torn block must not be present");
+        assert_eq!(present_bytes, 2 * bs);
 
-        let cache = cache(dir.path(), 1 << 30);
-        assert_eq!(cache.load().await.unwrap(), 0);
-        assert_eq!(cache.stats(), (1 << 30, 0, 0));
-        assert!(!path.exists());
-        assert!(!foreign.exists());
-        assert!(!unfinished.exists());
+        // A later read refetches only the torn block.
+        let calls = remote.calls();
+        let read = cache
+            .read_through(KEY, bs + 10..bs + 20, None, &fetch)
+            .await
+            .unwrap();
+        assert_eq!(read.outcome, Outcome::Miss);
+        assert_eq!(remote.calls() - calls, 1, "only the torn block refetches");
+        assert_eq!(
+            read.bytes,
+            remote.data.slice(bs as usize + 10..bs as usize + 20)
+        );
+
+        // And `load` on a fresh cache adopts the same shape.
+        let reloaded = cache_with_block_size(dir.path(), 1 << 30, bs);
+        assert_eq!(reloaded.load().await.unwrap(), 1);
+        let (_, used, _) = reloaded.stats();
+        assert_eq!(used, 3 * bs, "the refetched torn block is now whole");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn different_block_size_discards_entries_on_load() {
+    async fn empty_and_zero_length_files_are_discarded_on_load() {
         let dir = tempfile::tempdir().unwrap();
-        let remote = Remote::new(200_000);
+        let cache = cache(dir.path(), 1 << 30);
+        // A sparse file with no data: nothing to adopt.
+        let empty = dir
+            .path()
+            .join("files/org/logs/stream/2026/10/08/11/empty.vix");
+        std::fs::create_dir_all(empty.parent().unwrap()).unwrap();
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&empty)
+            .unwrap()
+            .set_len(100)
+            .unwrap();
+        let zero = dir
+            .path()
+            .join("files/org/logs/stream/2026/10/08/11/zero.vix");
+        std::fs::write(&zero, b"").unwrap();
+
+        assert_eq!(cache.load().await.unwrap(), 0);
+        assert_eq!(cache.stats(), (1 << 30, 0, 0));
+        assert!(!empty.exists());
+        assert!(!zero.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn short_last_block_adopts_with_exact_present_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        // 512 blocks of gap, then a short tail block (32 KiB): the last
+        // block is clipped to the object size.
+        let gap = 512 * BS;
+        let object_size = gap + BS / 2;
+        let remote = Remote::new(object_size as usize);
         let fetch = remote.fetcher();
         {
             let cache = cache(dir.path(), 1 << 30);
             cache.read_through(KEY, 0..10, None, &fetch).await.unwrap();
-            cache.flush().await;
+            cache
+                .read_through(KEY, gap..gap + 10, None, &fetch)
+                .await
+                .unwrap();
         }
-        let cache = BlockCache::new(dir.path().to_path_buf(), BS * 4, 1 << 30, BS, "time_lru", 1);
+        let cache = cache(dir.path(), 1 << 30);
+        assert_eq!(cache.load().await.unwrap(), 1);
+        let (_, used, entries) = cache.stats();
+        assert_eq!(entries, 1);
+        assert_eq!(used, BS + BS / 2, "the short tail block is exact");
+        let read = cache
+            .read_through(KEY, gap..object_size, None, &fetch)
+            .await
+            .unwrap();
+        assert_eq!(read.outcome, Outcome::Hit);
+        assert_eq!(
+            read.bytes,
+            remote.data.slice(gap as usize..object_size as usize)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn marker_mismatch_wipes_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let remote = Remote::new(200_000);
+        let fetch = remote.fetcher();
+        let root = dir.path().join("blocks");
+        {
+            let cache = cache_with_boot_id(&root, 1 << 30, "boot-a");
+            cache.read_through(KEY, 0..10, None, &fetch).await.unwrap();
+            assert!(root.join(KEY).exists());
+        }
+        // The next boot sees a different kernel boot id: the root is stale.
+        // The wipe is synchronous (the rename happens before `prepare_root`
+        // returns; only the stale copy's removal races on the blocking
+        // pool), so the old file is deterministically gone from the root.
+        let cache = cache_with_boot_id(&root, 1 << 30, "boot-b");
         assert_eq!(cache.load().await.unwrap(), 0);
-        assert!(!dir.path().join(KEY).exists());
+        assert!(!root.join(KEY).exists(), "the stale file is gone");
+        assert_eq!(cache.stats(), (1 << 30, 0, 0));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn marker_with_other_block_size_wipes_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let remote = Remote::new(200_000);
+        let fetch = remote.fetcher();
+        let root = dir.path().join("blocks");
+        {
+            let cache = cache_with_boot_id(&root, 1 << 30, "boot-a");
+            cache.read_through(KEY, 0..10, None, &fetch).await.unwrap();
+        }
+        // A block-size change remaps every hole boundary: stale.
+        let state = prepare_root(&root, BS * 4, Some("boot-a")).unwrap();
+        assert!(state.recreated);
+        assert!(!root.join(KEY).exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn missing_marker_wipes_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let remote = Remote::new(200_000);
+        let fetch = remote.fetcher();
+        let root = dir.path().join("blocks");
+        {
+            let cache = cache_with_boot_id(&root, 1 << 30, "boot-a");
+            cache.read_through(KEY, 0..10, None, &fetch).await.unwrap();
+        }
+        std::fs::remove_file(root.join(LINEAGE_MARKER)).unwrap();
+        let state = prepare_root(&root, BS, Some("boot-a")).unwrap();
+        assert!(state.recreated);
+        assert!(!root.join(KEY).exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unknown_boot_id_wipes_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let remote = Remote::new(200_000);
+        let fetch = remote.fetcher();
+        let root = dir.path().join("blocks");
+        {
+            let cache = cache_with_boot_id(&root, 1 << 30, "boot-a");
+            cache.read_through(KEY, 0..10, None, &fetch).await.unwrap();
+        }
+        // A platform without a boot id can never trust a previous run.
+        let state = prepare_root(&root, BS, None).unwrap();
+        assert!(state.recreated, "a None boot id wipes");
+        assert!(!root.join(KEY).exists());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1528,11 +1819,10 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(!dir.path().join(KEY).exists());
-        cache.flush().await;
-        assert!(
-            !dir.path().join(KEY).exists(),
-            "flush must not resurrect a removed entry"
-        );
+        // A removed file is gone for good: nothing rewrites it later.
+        let reloaded = cache_with_boot_id(dir.path(), 1 << 30, "test-boot");
+        assert_eq!(reloaded.load().await.unwrap(), 0);
+        assert!(!dir.path().join(KEY).exists());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1696,8 +1986,7 @@ mod tests {
         }
         // The write-through still put the fetched blocks in the file.
         let file = std::fs::File::open(dir.path().join(KEY)).unwrap();
-        let mut buf = vec![0u8; 2 * BS as usize];
-        pread_exact(&file, &mut buf, BS).unwrap();
+        let buf = crate::cache::file_data::pread_vec(&file, BS, 2 * BS as usize).unwrap();
         assert_eq!(&buf[..], &remote.data[BS as usize..3 * BS as usize]);
         assert_eq!(cache.stats().1, 2 * BS);
     }
