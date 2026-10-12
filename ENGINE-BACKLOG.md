@@ -2735,6 +2735,103 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     "warm" numbers for a repeated SQL are per-file result-cache hits, not
     reader-cache hits; use a fresh LIMIT (< total hits) to measure the
     reader-cache-warm path.
+  - **`.215` ROLLED** (= `.214` + vix-arch `eeaad298c` block tier without
+    per-fill durability + `3c8c27831` sliding evaluation window; release
+    `release/vix-20261012-215` `b671e2b0e`, image index
+    `sha256:0820719bc6a5…`, arm64 manifest `sha256:c0aa0e3f5f49…`, binary
+    `155b7bfcc79d…`; GitOps #631 merged 14:59:48Z, 10/10 pods on RS
+    `9f8fddf7f` 15:01:33Z, `[WARMUP] done` on all by 15:03:36Z, 0
+    restarts; pod `mmrtd` was replaced by `6jf22` ~15:10Z by a Karpenter
+    node move, not a crash). No env change.
+    - Block tier: cache files are sparse files `set_len` to the object
+      size, blocks land with plain `pwrite`, no trailer / fdatasync /
+      flusher; a block is served only while the in-memory bitmap says so.
+      Restart rebuilds the bitmap from `lseek(SEEK_DATA/SEEK_HOLE)` (a
+      block is present iff its whole range is data, so a torn block is
+      never adopted); trust is scoped to one kernel boot by a `.lineage`
+      marker (layout, block size, `/proc/sys/kernel/random/boot_id`),
+      mismatch wipes the root; `init` self-tests hole reporting with a
+      `.probe` file. **Prod ext4 (gp3-1024) passed the self-test on 10/10
+      pods** (no `[BlockCache] … does not report holes` warn). macOS/APFS
+      back-fills holes < ~16 MiB, so the unit tests use ≥ 32 MiB gaps.
+    - Driver: `order_vix_files` (DESC by `max_ts`, ASC by `min_ts`) feeds
+      one `FuturesUnordered` window ramping 64 → 128 → 256 at the old
+      cumulative boundaries (other modes run at `eval_concurrency` from
+      the start); the pruner keeps the `limit` best timestamps in a heap
+      and tests `suffix_bounds[first_incomplete]` after every completion.
+      Log line `search->vix: target_partitions: N, files: F, window: a..b`
+      replaces `file_groups: N`.
+    - **Cold 7-day point lookup** (`domain = 'needdonetoday.co.uk' ORDER BY
+      _timestamp DESC LIMIT 100`, window 10-05 09:55Z → 10-12 09:55Z,
+      fresh pods, 0 % cached, downloader running, `01a130a57d14` 15:05Z):
+      **20.3 s** (`idx_took` 18.2 s), 100 hits. Per follower 10.4–10.8k
+      files (the window has more files than the `.214` runs' 8.4–8.9k),
+      29.7–31.1k S3 reads / 10.2–10.7 GB physical, **2.85 reads/file
+      (unchanged)**, took 15.6–18.2 s, **306–316 reads in flight** (`.214`
+      158–193, `.213` 8–33), `evaluation_wait` ≈ 0, `queue_us` 0, no prune
+      (the 100th-best row is older than every unfinished file). Normalised
+      per follower: **582–690 files/s vs `.214` ~300–330 → 1.9–2.1×**; at
+      2.85 reads/file that is ~1,850 GET/s per pod. Per read 165–185 ms
+      (`.214` 190–200): the gain is the in-flight doubling, not latency.
+    - Same shape on the 21-day-shifted window (Sep 13 → 20, 1.7–1.8k
+      merged files per follower, 4.0 reads/file — wider merged sidecars):
+      `.214` 3 h-old pods 7.5 s (block tier already held 1.7 GB of it, so
+      not cold: 60–110 in flight, `evaluation_wait` 6–20 s per follower)
+      → `.215` fresh pods fully cold **5.3 s**, 217–240 in flight,
+      `evaluation_wait` ≈ 0. Same 72 rows both runs.
+    - Repeat (per-file result-cache hits): 1.6 s (`.214` 1.8 s).
+    - `ASC LIMIT 199` 10 min later (block-warm, reader-COLD: 10.6k readers
+      × ~600 KB overflow the 6 GiB reader cache, unlike the `.214` 8.6k):
+      13.6 s; 9 followers 8.5–10.4 s at 2.2 reads/file from block (4.0–4.8
+      GB) + disk (1.0–1.4 GB, the sidecar back-fill made 30–35 % of files
+      disk-cached) with **105–120 ms per LOCAL read** and `evaluation_wait`
+      50–155 s per follower (5–16 ms per eval: fast opens, slot-bound
+      evals); the replaced pod's follower was fully cold: 8,954 files in
+      12.4 s, 303 in flight. Not comparable with the `.214` 6.8 s
+      reader-hot number.
+    - **Hardware envelope during the cold 7-day run (1 s sampling, 3
+      nodes):** CPU host 12–26 % busy, querier container 3–5 cores (peaks
+      14–15), throttling 0; NIC 827–842 MB/s avg (1.35–1.6 GB/s peaks) on
+      15 Gbps nodes; **EBS data volume: write 777–803 MB/s, 3,921–4,047
+      write IOPS avg (5,419–6,706 peaks) against the 4,096 provisioned,
+      util 86–90 % (max 102–107), queue 25, PSI io 46–51 % avg (86–101 %
+      max)**; reads ≈ 0. The minute before the query already ran 1,950–
+      2,000 write IOPS / 450–460 MB/s (downloader + warm-up back-fill), so
+      the query's own share is ~2,000 IOPS / ~340 MB/s at 640 files/s —
+      ~3 IOPS per file, which is the floor of the fetched bytes themselves
+      (128 KiB data tail + 768 KiB sidecar tail + 64 KiB dict block ≈ 960
+      KiB ≈ 4 × 256 KiB device IOs, all written through). The fdatasync /
+      trailer removal did not change the IOPS during a cold query because
+      the write-through DATA now fills the budget; what it removed is the
+      per-fill journal serialisation (fills no longer wait on commits).
+      Three writers share the 4,096 IOPS: downloader (~40 min after a
+      roll), block-tier write-through of every fetched byte, and the
+      post-query whole-sidecar back-fill (640–656 MB/s for minutes after
+      the run, 2,860–2,940 IOPS avg, 8,042 peak).
+    - Verdict: eval slots are now the active cold constraint (in flight ≈
+      1.2 × 256) with EBS write saturated right behind them, so
+      **`ZO_VIX_SEARCH_CONCURRENCY` stays at 256**: doubling the GET rate
+      would push ~1.3 GB/s of write-through at a 1,024 MB/s / 4,096 IOPS
+      volume and move the wait into dirty-page throttling (the 105–120 ms
+      local reads above are that volume under pressure).
+    - ERRORs since the roll: user-query schema errors ("Search field not
+      found: sql_fingerprint / aws_account_id …", the new RDS slow-log
+      dashboards) and roll-time health checks; nothing from the tier or
+      the driver. RSS 13.2–13.9 GiB at 12 min (`.214`: 13.4–14.1 at 7).
+    - Next, in order of bytes saved per cold file: (1) write-behind for the
+      block tier — return served ranges before the `pwrite`, bounded fill
+      queue, drop fills under back-pressure, so EBS saturation cannot
+      inflate read latency; (2) stop reading the `.vix` data tail on the
+      miss path (stamp `oversize_skips` + `row_count` on the sidecar, lazy
+      data footer): −1 GET, −128 KiB, −1 fill per file; (3) right-size the
+      sidecar eager tail per stream (`eager_tail_probe` on `default`
+      tails) — the single-field probe needs O(KB) of the 768 KiB; (4) only
+      then slots 256 → 512 (and the blocking pool with it). Tail-resident
+      per-field blooms (`domain` is not bloom-decidable today: not in
+      `bloom_filter_fields`, composite off) would make a miss one GET per
+      sidecar but need the field configured and new/healed sidecars.
+      Buying IOPS (gp3 → 8–16k) is the config-only alternative for the
+      same bottleneck.
 
 ## 2026-09-29 — P2 shipped as `.176` and rolled back within 30 min: the per-stream side table stalled the shared meta DB (commit latency 40–60×, ingest 503s); ranges must live in the segment row
 - What shipped (vix-arch `013c45010` + NATS retry `76fe754b5`, image
