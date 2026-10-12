@@ -2463,6 +2463,77 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     `k8s_prod_public_logs` sidecar is 170 MB, and what a 10-panel
     match_all dashboard costs per panel. `zrj95` was replaced ~04:16Z
     by node NotReady (not OOM).
+- **2026-10-11 — RSS ratchet attributed to the allocator: prod links
+  mimalloc 3.1.5, whose arena purge scheduler loses scheduled purges, so
+  freed memory stays resident until the process dies. Fix in vix-arch for
+  `.212`: mimalloc 3.3.2 + a dedicated purge thread
+  (`ZO_ALLOCATOR_PURGE_INTERVAL_SECS`, default 1 s).** Follows the 01:37Z
+  `vpncm` OOM above ("working set 14–15 GiB" on a pod whose cache budgets
+  sum to 8 GiB and whose RSS was 6.3–8.3 GiB at 5 min of age).
+  - Prod binary = crate `mimalloc 0.1.48` / `libmimalloc-sys 0.1.44`,
+    `features = ["v3"]` → bundled `MI_MALLOC_VERSION 315`. Confirmed on
+    the running `.211` querier binary via its option-name strings
+    (`page_full_retain`, `generic_collect`, `page_reclaim_on_free` exist
+    only in the v3 source tree).
+  - The defect (3.1.5 `arena.c:1752-1817`): `mi_arena_try_purge` returns
+    `false` both for "nothing to purge" and for "this arena's own
+    `purge_expire` not reached yet"; `mi_arenas_try_purge` then takes
+    `all_visited && !any_purged` and resets the subproc-wide
+    `purge_expire` to 0, after which every later pass returns at the
+    `arenas_expire == 0` check. Once two arenas carry different expiries
+    the pending purge is simply dropped — memory freed to the arena is
+    never `madvise`d back. Upstream microsoft/mimalloc #1246 (closed
+    2026-03-18), fix `4e50cec3ee` (tri-state return, 2026-03-26), first
+    release v3.3.0; crate `libmimalloc-sys 0.1.49` (2026-05-22) bundles
+    3.3.2 (`MI_MALLOC_VERSION 30302`, `arena.c:2192` has the fix). This
+    is also why the 08-23 compactor `MIMALLOC_PURGE_DELAY=0` probe
+    "worked" (delay 0 skips the scheduler entirely) at +11 % wall.
+  - Harness (`/tmp/mitest` on e2b-dev, Linux, same crate versions as
+    prod / candidate): 7,000 × ~0.9 MB entries held as a 6.1 GiB cache,
+    then bursts of transient multi-MB scan buffers on 16 persistent
+    worker threads (tokio shape: workers never exit), 30 s idle between;
+    `XTHREAD=1` frees every buffer on a different worker than allocated
+    it. RSS after burst #1 + 30 s idle / after the 2× burst + 30 s idle /
+    after dropping the whole cache + 5 s:
+    - 3.1.5, same-thread frees: **10.16 / 11.97 / 11.97 GiB** — nothing
+      is ever returned, the cache drop is invisible to the OS.
+    - 3.3.2, same-thread: 6.19 / 6.20 / **0.17 GiB**.
+    - 3.3.2, cross-thread: 8.22 / 6.91 / **2.25 GiB** — the scheduler
+      works but cross-thread frees are only collected when the owning
+      worker next runs its slow path, and an idle worker never does.
+    - 3.3.2, cross-thread + `mi_collect(true)` every 1 s from a dedicated
+      thread: 6.19 / 6.21 / **0.18 GiB**. 3.1.5 with the same thread:
+      6.07 / 6.07 / **0.04 GiB** (a forced pass bypasses the broken
+      scheduler, so the thread alone would already have fixed prod).
+    - Gotcha that cost one run: `mi_collect` acts through the calling
+      thread's heap; a thread that never allocated has no heap and the
+      call is a no-op (the first collect rows showed zero effect). The
+      thread allocates one `Box` before its loop.
+  - Change (vix-arch): `mimalloc 0.1.48 → 0.1.52` (`libmimalloc-sys
+    0.1.44 → 0.1.49`; the `v3` feature is gone, v3 is the crate default;
+    `src/core` dev-dep bumped in step so the M23 harness keeps prod's
+    allocator). `main.rs` spawns `mimalloc-purge` right after config load
+    in every role: `mi_collect(true)` every
+    `ZO_ALLOCATOR_PURGE_INTERVAL_SECS` (default 1; 0 disables), via a
+    direct `libmimalloc-sys = { features = ["extended"] }` dependency
+    pinned to the same version so there is one copy of the C library.
+    `MIMALLOC_PURGE_DELAY` stays at its default — 1,000 ms ×
+    `arena_purge_mult` 1 in v3 (`options.c:140/149`; the 10 ms figure
+    is v2's) — so the 1 s cadence equals the delay mimalloc already
+    intends; the thread does not make purging more eager, it makes the
+    pass actually happen. A pass with nothing to purge is a bitmap
+    walk over the arenas. jemalloc builds are untouched (own decay
+    threads).
+  - Expected on prod: RSS tracks live bytes (cache budgets + in-flight)
+    instead of ratcheting to the burst high-water mark over the pod's
+    life; the match_all-burst exposure then is the transient itself
+    (10–16 GB sidecar loads + 3.6–6.5 GB DataFusion peaks within 90 s
+    against 24 GiB − ~8 GiB caches), not 12 h of retained frees.
+    Acceptance after the roll: RSS on a 12 h-old pod within ~1–2 GiB of
+    the 5-min value under the same cache fill. The compactor's retained
+    floor (M24–M28 staircase, attributed then to "pool-thread heaps that
+    never run mimalloc's deferred purge") has the same mechanism behind
+    it and should flatten too — to be measured, not assumed.
 
 ## 2026-09-29 — P2 shipped as `.176` and rolled back within 30 min: the per-stream side table stalled the shared meta DB (commit latency 40–60×, ingest 503s); ranges must live in the segment row
 - What shipped (vix-arch `013c45010` + NATS retry `76fe754b5`, image
