@@ -84,7 +84,7 @@ use vortex::{
 
 use crate::{
     error::{Result, VixError},
-    source::{RangedBlob, VixRangeSource, block_fetch},
+    source::{RangedBlob, VixRangeSource, block_fetch, compact_bytes},
 };
 
 // Setup admission allowances, not payload/cache budgets or measured allocator
@@ -854,9 +854,12 @@ impl VixRangeSource for TailRangeSource {
     }
 
     /// Metadata-only replacement for reader demotion: keep only the
-    /// supplied footer window of the retained tail (re-sliced, never
-    /// grown), release the eager prefix — query-specific block/leaf
-    /// bytes re-fetched on demand through the ranged paths.
+    /// supplied footer window of the retained tail, release the eager
+    /// prefix — query-specific block/leaf bytes re-fetch on demand through
+    /// the ranged paths. The kept window is COMPACTED (a copy bounded by
+    /// VORTEX_FOOTER_READ_BYTES): a plain re-slice would keep the whole
+    /// prefix allocation alive behind it while the reader accounted only the
+    /// window.
     fn trim_retained_tail(&self, keep: std::ops::Range<u64>) -> Option<Arc<dyn VixRangeSource>> {
         if keep.start < self.start || keep.end > self.start + self.bytes.len() as u64 {
             return None;
@@ -870,7 +873,7 @@ impl VixRangeSource for TailRangeSource {
         Some(Arc::new(Self {
             source: Arc::clone(&self.source),
             start: keep.start,
-            bytes,
+            bytes: compact_bytes(bytes),
         }) as _)
     }
 
@@ -1082,12 +1085,13 @@ impl<'a> TailProbe<'a> {
         // fell short.
         let tail_start = total.saturating_sub(eager_tail_bytes.max(MIN_FILE_SIZE));
         let memory = crate::source::current_reader_memory();
-        // Tail buffers, compaction copies and at most seven recognized blob
-        // slices coexist until the container has been incorporated in the reader.
+        // The fetched tail buffer and the per-blob copies taken from it
+        // (disjoint pieces of the tail, so at most one more tail) coexist
+        // until the container has been incorporated in the reader.
         let tail_pending = memory.reserve(
             usize::try_from(total - tail_start)
                 .unwrap_or(usize::MAX)
-                .saturating_mul(9),
+                .saturating_mul(2),
         )?;
         Ok(Self {
             source,
@@ -1145,9 +1149,12 @@ impl<'a> TailProbe<'a> {
         // parses exactly like the whole file would.
         let meta = parse_puffin_footer_from_bytes(&tail)
             .map_err(|e| VixError::Malformed(format!("puffin footer: {e:#}")))?;
+        // Every retained piece owns exactly its bytes. Slicing the tail
+        // instead would pin the whole eager window (footer JSON included)
+        // behind any one surviving blob — `demote` keeps the `Mem` blobs —
+        // while the reader accounted only the slices.
         let mut container = container_from_meta(meta, total, |range| {
             if range.start >= tail_start {
-                // Compact ownership: cache-ladder Bytes may pin the entire object.
                 let start = (range.start - tail_start) as usize;
                 let end = (range.end - tail_start) as usize;
                 BlobHandle::Mem(Bytes::copy_from_slice(&tail[start..end]))

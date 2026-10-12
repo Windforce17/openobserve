@@ -15,8 +15,6 @@
 
 #[cfg(unix)]
 use std::ops::Range;
-#[cfg(unix)]
-use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 
 use async_trait::async_trait;
@@ -192,8 +190,7 @@ impl ObjectStore for Local {
             let mut out = Vec::with_capacity(ranges_owned.len());
             for range in &ranges_owned {
                 let len = (range.end - range.start) as usize;
-                let mut buf = vec![0u8; len];
-                f.read_exact_at(&mut buf, range.start)?;
+                let buf = crate::cache::file_data::pread_vec(&f, range.start, len)?;
                 out.push(Bytes::from(buf));
             }
             Ok(out)

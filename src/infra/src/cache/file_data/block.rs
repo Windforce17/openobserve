@@ -21,8 +21,10 @@
 //! the bytes the query reads (prod counters, 2026-10-10). This tier caches
 //! exactly the block-aligned ranges that range reads miss, write-through
 //! from object storage: a cold read fetches the missing blocks (one GET per
-//! contiguous run), writes them into a sparse file and serves the request;
-//! a warm read is one `pread`.
+//! contiguous run), writes them into a sparse file and serves the request
+//! straight from the fetched bytes when it is covered by one run (zero
+//! copy; the write-through puts the same bytes in the file); a warm read
+//! is one `pread`.
 //!
 //! On-disk layout: one sparse file per object under `<root>/<key>`. Bytes
 //! `[0, object_size)` mirror the object at identical offsets (holes where
@@ -173,6 +175,50 @@ fn merge_ranges(ranges: impl Iterator<Item = Range<u64>>) -> Vec<Range<u64>> {
 
 fn overlap(a: &Range<u64>, b: &Range<u64>) -> u64 {
     a.end.min(b.end).saturating_sub(a.start.max(b.start))
+}
+
+/// Split requested ranges into fill-served bytes and pread-shaped ranges.
+///
+/// A requested range that lies wholly inside one fill run's byte span
+/// (`run.start*bs .. min(run.end*bs, object_size)`) is served as a
+/// zero-copy slice of the fetched bytes; anything else (touching present
+/// blocks, straddling two runs) is returned in `reads` for the IO job to
+/// pread from the cache file after the writes. `served[i]` and `reads` line
+/// up with the request order: `served[i]` is `Some` exactly when request
+/// `i` was covered, and the ranges in `reads` are the uncovered ones in
+/// request order. Empty ranges are `Some(Bytes::new())`.
+fn split_fill_served(
+    requested: &[Range<u64>],
+    fills: &[(Range<u64>, Bytes)],
+    bs: u64,
+    object_size: u64,
+) -> (Vec<Option<Bytes>>, Vec<Range<u64>>) {
+    let mut served: Vec<Option<Bytes>> = Vec::with_capacity(requested.len());
+    let mut reads: Vec<Range<u64>> = Vec::new();
+    for r in requested {
+        if r.is_empty() {
+            served.push(Some(Bytes::new()));
+            continue;
+        }
+        let mut covered = None;
+        for (run, bytes) in fills {
+            let run_bytes = run.start * bs..(run.end * bs).min(object_size);
+            if run_bytes.start <= r.start && r.end <= run_bytes.end {
+                let start = (r.start - run_bytes.start) as usize;
+                let end = start + (r.end - r.start) as usize;
+                covered = Some(bytes.slice(start..end));
+                break;
+            }
+        }
+        match covered {
+            Some(bytes) => served.push(Some(bytes)),
+            None => {
+                served.push(None);
+                reads.push(r.clone());
+            }
+        }
+    }
+    (served, reads)
 }
 
 pub struct BlockCache {
@@ -577,8 +623,9 @@ impl BlockCache {
 
     /// [`Self::read_through`] for several ranges of one object at once: the
     /// missing blocks of all ranges are fetched together (a block shared by
-    /// two ranges is fetched once), then every range is read from the file.
-    /// Results are in request order.
+    /// two ranges is fetched once), then every range is served — ranges that
+    /// lie wholly inside one fetched run come straight from those bytes, the
+    /// rest are read from the cache file. Results are in request order.
     pub async fn read_through_many(
         &self,
         key: &str,
@@ -694,7 +741,13 @@ impl BlockCache {
                 wanted.iter().map(move |w| overlap(&run_bytes, w))
             })
             .sum();
-
+        // Serve every requested range that lies wholly inside one fill run
+        // straight from the fetched bytes instead of preading them back out
+        // of the file: the job writes those same bytes through, so the cache
+        // file ends up identical while the request skips a memset, an
+        // allocation and a page-cache round trip per range. Ranges touching
+        // present blocks or straddling two fill runs keep the pread path.
+        let (served, reads) = split_fill_served(&ranges, &fills, bs, object_size);
         let io = IoJob {
             path: entry.path.clone(),
             create: created || !fills.is_empty(),
@@ -702,7 +755,9 @@ impl BlockCache {
                 .iter()
                 .map(|(run, bytes)| (run.start * bs, bytes.clone()))
                 .collect(),
-            reads: ranges.clone(),
+            // The fallback below re-fetches only these; keep a copy here.
+            reads: reads.clone(),
+            served: served.clone(),
             owner,
         };
         let read = tokio::task::spawn_blocking(move || io.run())
@@ -714,30 +769,33 @@ impl BlockCache {
                 // Evicted between lookup and IO (NotFound), or the local disk
                 // misbehaved: a cache must never fail the query. Drop the entry
                 // so the next reader starts cold, serve this one from object
-                // storage without caching it.
+                // storage without caching it. Ranges already sliced out of the
+                // fetched fills keep their bytes — only the unserved ones are
+                // re-fetched. `reads` and the `None` holes of `served` line up
+                // in request order.
                 if error.kind() == std::io::ErrorKind::NotFound {
                     log::debug!("[BlockCache] {key} evicted during read, serving remote");
                 } else {
                     log::warn!("[BlockCache] {key} local IO failed, serving remote: {error}");
                 }
                 self.drop_entry(&entry);
-                // Zero-length ranges are not valid store requests.
-                let fetches: Vec<FetchFuture> = ranges
-                    .iter()
-                    .filter(|range| !range.is_empty())
-                    .map(|range| fetch(range.clone()))
-                    .collect();
+                // Zero-length ranges are never in `reads` (they were served
+                // `Bytes::new()` above), so every entry is a valid request.
+                let fetches: Vec<FetchFuture> =
+                    reads.iter().map(|range| fetch(range.clone())).collect();
                 let mut results = futures::stream::iter(fetches)
                     .buffered(FILL_CONCURRENCY)
                     .try_collect::<Vec<Fetched>>()
                     .await?
                     .into_iter();
                 let mut bytes = Vec::with_capacity(ranges.len());
-                for range in &ranges {
-                    if range.is_empty() {
-                        bytes.push(Bytes::new());
+                let mut unserved = reads.iter();
+                for slot in served {
+                    if let Some(b) = slot {
+                        bytes.push(b);
                         continue;
                     }
+                    let range = unserved.next().ok_or_else(|| short_response(key, 0, 0))?;
                     let fetched = results
                         .next()
                         .ok_or_else(|| short_response(key, range.end - range.start, 0))?;
@@ -1042,7 +1100,12 @@ struct IoJob {
     create: bool,
     /// `(offset, bytes)` block runs to write before reading.
     writes: Vec<(u64, Bytes)>,
+    /// `served[i]` holds the bytes of request `i` when it lies wholly inside
+    /// one fill run (a zero-copy slice of the fetched bytes), `None` when the
+    /// job must pread it from the file; `reads` lists those ranges, in request
+    /// order, and results are stitched back into request order.
     reads: Vec<Range<u64>>,
+    served: Vec<Option<Bytes>>,
     owner: Option<Arc<dyn Send + Sync>>,
 }
 
@@ -1065,15 +1128,21 @@ impl IoJob {
         for (offset, bytes) in &self.writes {
             pwrite_all(&file, bytes, *offset)?;
         }
-        let mut out = Vec::with_capacity(self.reads.len());
+        // Ranges served from the fills arrive in request order with `None`
+        // holes for the ones this job must pread; the reads are in the same
+        // order, so each fills the next hole.
+        let mut out = self.served;
+        let mut holes = out.iter_mut().filter(|slot| slot.is_none());
         for read in &self.reads {
             let len = usize::try_from(read.end - read.start)
                 .map_err(|_| std::io::Error::other("range exceeds address space"))?;
-            let mut buf = vec![0u8; len];
-            pread_exact(&file, &mut buf, read.start)?;
-            out.push(Bytes::from(buf));
+            let buf = super::pread_vec(&file, read.start, len)?;
+            *holes.next().expect("a hole for every unserved range") = Some(Bytes::from(buf));
         }
-        Ok(out)
+        Ok(out
+            .into_iter()
+            .map(|slot| slot.expect("every request range is served"))
+            .collect())
     }
 }
 
@@ -1567,5 +1636,137 @@ mod tests {
         assert_eq!(reads.outcome, Outcome::Hit);
         assert_eq!(remote.calls(), calls);
         assert_eq!(reads.remote_bytes, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cold_miss_ranges_are_served_zero_copy_from_the_fills() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache(dir.path(), 1 << 30);
+        let remote = Remote::new(1 << 20);
+        let fetch = remote.fetcher();
+        // Cold object, three non-empty ranges inside blocks 1 and 2 plus an
+        // empty one. Deterministically, the cold probe fetches run 1..2 and
+        // the missing-run pass fetches 2..3, so every non-empty range lies
+        // wholly inside one fill run.
+        let ranges = [
+            BS + 10..BS + 100,
+            2 * BS + 30..2 * BS + 60,
+            BS + 500..BS + 600,
+            2 * BS..2 * BS,
+        ];
+        // The exact fills the flow above builds: prove they leave no range
+        // for the pread path — the IO job reads nothing for this request.
+        let (served, preads) = split_fill_served(
+            &ranges,
+            &[
+                (1..2, remote.data.slice(BS as usize..2 * BS as usize)),
+                (2..3, remote.data.slice(2 * BS as usize..3 * BS as usize)),
+            ],
+            BS,
+            remote.data.len() as u64,
+        );
+        assert_eq!(served.len(), ranges.len());
+        assert_eq!(preads.len(), 0, "no pread path for covered ranges");
+        assert!(served.iter().all(|slot| slot.is_some()));
+
+        let reads = cache
+            .read_through_many(KEY, &ranges, None, &fetch)
+            .await
+            .unwrap();
+        assert_eq!(reads.outcome, Outcome::Miss);
+        assert_eq!(reads.remote_bytes, 2 * BS);
+        assert_eq!(reads.bytes.len(), ranges.len());
+        for (range, bytes) in ranges.iter().zip(&reads.bytes) {
+            assert_eq!(
+                *bytes,
+                remote.data.slice(range.start as usize..range.end as usize)
+            );
+            if range.is_empty() {
+                continue;
+            }
+            // Pointer identity: the served bytes point into the fetched
+            // buffer. `Remote::data` is one live Vec-backed allocation and a
+            // pread would land in a fresh one, so this proves the range was
+            // served from the fill, not read back from the file.
+            let offset = bytes.as_ptr() as usize - remote.data.as_ptr() as usize;
+            assert!(
+                offset < remote.data.len(),
+                "served bytes must point into the fetched fill"
+            );
+        }
+        // The write-through still put the fetched blocks in the file.
+        let file = std::fs::File::open(dir.path().join(KEY)).unwrap();
+        let mut buf = vec![0u8; 2 * BS as usize];
+        pread_exact(&file, &mut buf, BS).unwrap();
+        assert_eq!(&buf[..], &remote.data[BS as usize..3 * BS as usize]);
+        assert_eq!(cache.stats().1, 2 * BS);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn partial_range_straddling_present_block_and_fill_is_stitched() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache(dir.path(), 1 << 30);
+        let remote = Remote::new((4 * BS) as usize);
+        let fetch = remote.fetcher();
+        // Warm block 0 alone.
+        cache.read_through(KEY, 0..10, None, &fetch).await.unwrap();
+        // This range straddles the present block 0 and the missing block 1:
+        // no single fill run covers it, so it takes the pread path after
+        // the write-through.
+        let range = 10..BS + 10;
+        let read = cache
+            .read_through(KEY, range.clone(), None, &fetch)
+            .await
+            .unwrap();
+        assert_eq!(read.outcome, Outcome::Partial);
+        assert_eq!(read.remote_bytes, BS);
+        assert_eq!(
+            read.bytes,
+            remote.data.slice(range.start as usize..range.end as usize)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_io_failure_re_fetches_only_unserved_ranges() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache(dir.path(), 1 << 30);
+        let remote = Remote::new(4 << 20);
+        let fetch = remote.fetcher();
+        // Warm block 2 so the request below mixes a present-block range
+        // with fill-covered ones.
+        cache
+            .read_through(KEY, 2 * BS + 30..2 * BS + 60, None, &fetch)
+            .await
+            .unwrap();
+        let calls = remote.calls();
+        // Break the cache file: the entry's path becomes a directory, so the
+        // IO job cannot open it and the fallback serves from the remote.
+        std::fs::remove_file(dir.path().join(KEY)).unwrap();
+        std::fs::create_dir(dir.path().join(KEY)).unwrap();
+
+        // Block 1 and block 30 are missing and 28 blocks apart, so they are
+        // two fill runs (no coalescing). The block-2 range touches a present
+        // block inside neither run: it is the only pread-shaped range, and
+        // the fallback must re-fetch exactly it.
+        let ranges = [
+            BS + 10..BS + 100,
+            2 * BS + 30..2 * BS + 60,
+            30 * BS + 5..30 * BS + 25,
+        ];
+        let reads = cache
+            .read_through_many(KEY, &ranges, None, &fetch)
+            .await
+            .unwrap();
+        assert_eq!(reads.outcome, Outcome::Miss);
+        // Two fills plus exactly one fallback fetch for the unserved range.
+        assert_eq!(remote.calls() - calls, 3);
+        assert_eq!(reads.remote_bytes, 2 * BS + 30);
+        for (range, bytes) in ranges.iter().zip(&reads.bytes) {
+            assert_eq!(
+                *bytes,
+                remote.data.slice(range.start as usize..range.end as usize)
+            );
+        }
+        assert_eq!(reads.object_size, 4 << 20);
     }
 }

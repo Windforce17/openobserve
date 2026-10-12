@@ -809,8 +809,6 @@ pub async fn get_size(file: &str) -> Option<usize> {
 /// caller falls back to remote storage.
 #[cfg(unix)]
 pub async fn get_ranges(file: &str, ranges: &[Range<u64>]) -> object_store::Result<Vec<Bytes>> {
-    use std::os::unix::fs::FileExt;
-
     let Some(files) = get_file_reader(file) else {
         return Err(object_store::Error::NotFound {
             path: file.to_string(),
@@ -832,9 +830,8 @@ pub async fn get_ranges(file: &str, ranges: &[Range<u64>]) -> object_store::Resu
                 return Err(crate::storage::Error::BadRange(file_label.clone()).into());
             }
             let len = (r.end - r.start) as usize;
-            let mut buf = vec![0u8; len];
-            f.read_exact_at(&mut buf, r.start)
-                .map_err(|e| object_store::Error::Generic {
+            let buf =
+                super::pread_vec(&f, r.start, len).map_err(|e| object_store::Error::Generic {
                     store: "DiskCache",
                     source: Box::new(e),
                 })?;

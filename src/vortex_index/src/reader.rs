@@ -2045,21 +2045,15 @@ impl VixReader {
                         .unwrap_or(usize::MAX)
                         .saturating_mul(2),
                 )?;
-                let bytes = compact_bytes(crate::source::block_fetch(
+                let bytes = crate::source::block_fetch(
                     ranged.source.as_ref(),
                     ranged.range.start + range.start..ranged.range.start + range.end,
-                )?);
+                )?;
                 let mut cache = self.block_cache.lock();
-                self.cache_dict_block(&mut cache, index.meta(b).0 as usize, &bytes)?;
-                let retained = cache
-                    .0
-                    .get(&(range.start as usize))
-                    .expect("just inserted")
-                    .clone();
+                let cached = self.cache_dict_block(&mut cache, index.meta(b).0 as usize, bytes)?;
                 drop(cache);
-                drop(bytes);
                 self.memory.notify();
-                Ok(retained)
+                Ok(cached)
             }
             None => Err(VixError::Malformed("missing dict_blocks blob".to_string())),
         }
@@ -2067,7 +2061,11 @@ impl VixReader {
 
     /// Insert one fetched dictionary block into the FIFO-bounded block
     /// cache (caller holds the lock), accounting the reader's resident size
-    /// and evicting past the cap.
+    /// and evicting past the cap. Takes the bytes BY VALUE and detaches them
+    /// (`compact_bytes`): a unique Vec-backed fetch is stored as-is, a slice
+    /// of a coalesced run or a file-cache object is copied — a cached block
+    /// must never pin its fetch owner. Returns the cached bytes (the resident
+    /// block when `b` was already present).
     fn cache_dict_block<S: std::hash::BuildHasher>(
         &self,
         cache: &mut (
@@ -2076,11 +2074,11 @@ impl VixReader {
             usize,
         ),
         b: usize,
-        bytes: &Bytes,
-    ) -> Result<()> {
+        bytes: Bytes,
+    ) -> Result<Bytes> {
         const DICT_BLOCK_CACHE_CAP: usize = 1024;
-        if cache.0.contains_key(&b) {
-            return Ok(());
+        if let Some(present) = cache.0.get(&b) {
+            return Ok(present.clone());
         }
         let table_growth = if cache.0.len() == cache.0.capacity() {
             // Depleted growth-left may trigger an in-place rehash or a
@@ -2109,11 +2107,9 @@ impl VixReader {
                 .saturating_add(table_growth)
                 .saturating_add(queue_growth),
         )?;
-        // A cached block must not pin an entire file-cache object or a
-        // coalesced run. The ephemeral caller can retain its original slice.
-        let retained = Bytes::copy_from_slice(bytes);
+        let bytes = compact_bytes(bytes);
+        cache.0.insert(b, bytes.clone());
         let previous = cache.2 + cache.1.capacity() * std::mem::size_of::<usize>();
-        cache.0.insert(b, retained);
         // Sample before FIFO removal: a newly allocated table exposes its
         // full usable capacity here. Removals only create tombstones, and
         // in-place rehash reuses the allocation, so neither releases bytes.
@@ -2133,7 +2129,7 @@ impl VixReader {
         }
         let current = cache.2 + cache.1.capacity() * std::mem::size_of::<usize>();
         self.memory.add(current - previous);
-        Ok(())
+        Ok(bytes)
     }
 
     /// The WHOLE dictionary blocks region — full-walk paths (term
@@ -2335,32 +2331,36 @@ impl VixReader {
             .flat_map(|(_, ranges)| ranges)
             .map(|range| usize::try_from(range.end - range.start).unwrap_or(usize::MAX))
             .fold(0usize, usize::saturating_add);
-        // Fetched slices, their compact copies and the cached block copies.
-        let _transient = self.memory.reserve(total.saturating_mul(3))?;
+        // The fetched slices plus the per-block detached copies the cache
+        // keeps (`cache_dict_block`); nothing else is materialized.
+        let _transient = self.memory.reserve(total.saturating_mul(2))?;
         let mut fetched = crate::source::block_fetch_bundle(batches)?.into_iter();
         if !runs.is_empty() {
             let blocks = fetched.next().expect("blocks batch");
             let mut cache = self.block_cache.lock();
             for (run, bytes) in runs.iter().zip(&blocks) {
                 check_read_cancelled()?;
+                // A run buffer may be a slice of a COALESCED physical fetch
+                // (gap bytes included); `cache_dict_block` detaches each
+                // block so the cache never pins the run.
                 for b in run.blocks.clone() {
                     let block = run.index.block_range(b, blob_len);
                     let slice = bytes.slice(
                         (block.start - run.bytes.start) as usize
                             ..(block.end - run.bytes.start) as usize,
                     );
-                    self.cache_dict_block(&mut cache, block.start as usize, &slice)?;
+                    self.cache_dict_block(&mut cache, block.start as usize, slice)?;
                 }
             }
             drop(cache);
             self.memory.notify();
         }
         if let Some(window) = footer_window {
-            let bytes = fetched.next().expect("footer batch");
-            self.retain_prefetched(prefetch, window, &bytes[0])?;
+            let mut bytes = fetched.next().expect("footer batch");
+            self.retain_prefetched(prefetch, window, bytes.swap_remove(0))?;
         }
-        for (window, bytes) in leaf_windows.into_iter().zip(fetched) {
-            self.retain_prefetched(prefetch, window, &bytes[0])?;
+        for (window, mut bytes) in leaf_windows.into_iter().zip(fetched) {
+            self.retain_prefetched(prefetch, window, bytes.swap_remove(0))?;
         }
         Ok(())
     }
@@ -2403,8 +2403,8 @@ impl VixReader {
                 })
                 .collect(),
         )?;
-        for (window, bytes) in windows.into_iter().zip(fetched) {
-            self.retain_prefetched(prefetch, window, &bytes[0])?;
+        for (window, mut bytes) in windows.into_iter().zip(fetched) {
+            self.retain_prefetched(prefetch, window, bytes.swap_remove(0))?;
         }
         Ok(())
     }
@@ -2474,12 +2474,17 @@ impl VixReader {
         Ok(planned)
     }
 
-    /// Admit and register one prefetched window for the operation's lifetime.
+    /// Admit and register one prefetched window for the operation's
+    /// lifetime. Takes the window `Bytes` BY VALUE: `compact_bytes` on a
+    /// moved value reuses a unique Vec-backed fetch as-is (0 copies) and
+    /// copies exactly once only when the fetch shares an owner (a coalesced
+    /// run) — the previous `compact_bytes(bytes.clone())` ALWAYS copied
+    /// (refcount 2).
     fn retain_prefetched(
         &self,
         prefetch: &mut FieldPrefetch,
         window: Range<u64>,
-        bytes: &Bytes,
+        bytes: Bytes,
     ) -> Result<()> {
         let pending = self
             .memory
@@ -2488,7 +2493,7 @@ impl VixReader {
             Some(previous) => previous.merge(pending),
             None => pending,
         });
-        prefetch.windows.add(window, compact_bytes(bytes.clone()));
+        prefetch.windows.add(window, compact_bytes(bytes));
         Ok(())
     }
 
@@ -4478,7 +4483,7 @@ impl VixReader {
                 let result = self.cache_dict_block(
                     &mut self.block_cache.lock(),
                     first.offset as usize,
-                    &bytes,
+                    bytes,
                 );
                 self.memory.notify();
                 result?;
@@ -5919,8 +5924,9 @@ impl VixReader {
         }
         if blocks_map.len() <= SPAN_CACHE_MAX_BLOCKS {
             let mut cache = self.block_cache.lock();
-            let result = blocks_map.iter().try_for_each(|(&b, bytes)| {
+            let result = blocks_map.drain().try_for_each(|(b, bytes)| {
                 self.cache_dict_block(&mut cache, index.meta(b).0 as usize, bytes)
+                    .map(drop)
             });
             drop(cache);
             self.memory.notify();
@@ -5999,8 +6005,9 @@ impl VixReader {
         }
         if blocks_map.len() <= SPAN_CACHE_MAX_BLOCKS {
             let mut cache = self.block_cache.lock();
-            let result = blocks_map.iter().try_for_each(|(&b, bytes)| {
+            let result = blocks_map.drain().try_for_each(|(b, bytes)| {
                 self.cache_dict_block(&mut cache, index.meta(b).0 as usize, bytes)
+                    .map(drop)
             });
             drop(cache);
             self.memory.notify();

@@ -312,7 +312,9 @@ fn fifo_eviction_reuses_owned_budget_instead_of_accumulating_history() {
             let previous_capacity_bytes = hash_table_bytes::<(usize, Bytes)>(cache.0.capacity());
             let previous_owned = reader.memory_size();
             let previous_table_bytes = cache.2;
-            reader.cache_dict_block(&mut cache, key, &block).unwrap();
+            reader
+                .cache_dict_block(&mut cache, key, block.clone())
+                .unwrap();
             if hash_table_bytes::<(usize, Bytes)>(cache.0.capacity()) < previous_capacity_bytes {
                 saw_logical_allocation_decrease = true;
                 // Same-sized FIFO payloads cannot release the still-live
@@ -346,6 +348,49 @@ fn fifo_eviction_reuses_owned_budget_instead_of_accumulating_history() {
     });
 }
 
+/// A cached dictionary block owns exactly its bytes: a block sliced out of a
+/// coalesced run (or a whole file-cache object) is copied out so the FIFO
+/// cache can never keep the run alive, while a uniquely owned exact-size
+/// fetch is stored as-is. Re-inserting a present key hands back the
+/// resident block, not the argument.
+#[test]
+fn cached_dictionary_block_never_aliases_its_fetch_owner() {
+    let reader = small_reader();
+    let budget = Budget::new(reader.memory_size() + 1024 * 1024);
+    with_read_operation(budget, || {
+        let mut cache = (
+            HashMap::with_hasher(std::hash::BuildHasherDefault::<BucketHasher>::default()),
+            std::collections::VecDeque::new(),
+            0,
+        );
+        let run = Bytes::from(vec![7u8; 64 * 1024]);
+        let run_span = run.as_ptr() as usize..run.as_ptr() as usize + run.len();
+        let cached = reader
+            .cache_dict_block(&mut cache, 0, run.slice(4096..8192))
+            .unwrap();
+        assert_eq!(cached.as_ref(), &run[4096..8192]);
+        assert!(
+            !run_span.contains(&(cached.as_ptr() as usize)),
+            "a cached block must not alias the run it was sliced from"
+        );
+
+        let unique = Bytes::from(vec![9u8; 4096]);
+        let unique_ptr = unique.as_ptr();
+        let cached = reader.cache_dict_block(&mut cache, 4096, unique).unwrap();
+        assert_eq!(
+            cached.as_ptr(),
+            unique_ptr,
+            "a unique fetch is stored without a copy"
+        );
+
+        let again = reader
+            .cache_dict_block(&mut cache, 4096, Bytes::from(vec![1u8; 4096]))
+            .unwrap();
+        assert_eq!(again.as_ptr(), unique_ptr);
+        assert_eq!(cache.0.len(), 2);
+    });
+}
+
 #[test]
 fn dictionary_cache_growth_refuses_before_allocating() {
     let reader = small_reader();
@@ -354,7 +399,7 @@ fn dictionary_cache_growth_refuses_before_allocating() {
     let mut cache = reader.block_cache.lock();
     let error = with_read_operation(
         Budget::new(before + block.len() + RETAINED_BYTES_OVERHEAD),
-        || reader.cache_dict_block(&mut cache, 0, &block),
+        || reader.cache_dict_block(&mut cache, 0, block.clone()),
     )
     .unwrap_err();
     assert!(
@@ -366,7 +411,9 @@ fn dictionary_cache_growth_refuses_before_allocating() {
     assert_eq!(cache.1.capacity(), 0);
     assert_eq!(reader.memory_size(), before);
     assert_eq!(reader.memory.total.load(Ordering::Acquire), before);
-    reader.cache_dict_block(&mut cache, 0, &block).unwrap();
+    reader
+        .cache_dict_block(&mut cache, 0, block.clone())
+        .unwrap();
     assert_eq!(cache.0.get(&0), Some(&block));
 }
 

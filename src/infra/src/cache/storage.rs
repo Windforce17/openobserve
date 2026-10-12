@@ -547,19 +547,16 @@ pub async fn range_bytes_with_owner(
         .ok_or_else(invalid_body)?;
     match result {
         GetResult {
-            payload: object_store::GetResultPayload::File(mut file, path),
+            payload: object_store::GetResultPayload::File(file, path),
             range,
             ..
         } => {
             let task = tokio::task::spawn_blocking(move || {
-                use std::io::{Read, Seek, SeekFrom};
                 let _owner = owner;
-                let mut read = || -> std::io::Result<Bytes> {
+                let read = || -> std::io::Result<Bytes> {
                     let len = usize::try_from(range.end - range.start)
                         .map_err(|_| std::io::Error::other("range exceeds address space"))?;
-                    file.seek(SeekFrom::Start(range.start))?;
-                    let mut bytes = vec![0; len];
-                    file.read_exact(&mut bytes)?;
+                    let bytes = file_data::pread_vec(&file, range.start, len)?;
                     Ok(Bytes::from(bytes))
                 };
                 read().map_err(|error| object_store::Error::Generic {

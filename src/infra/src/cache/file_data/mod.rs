@@ -57,6 +57,61 @@ enum CacheStrategy {
     ),
 }
 
+/// Read exactly `len` bytes at `offset` into a fresh, exact-size `Vec`
+/// without the `vec![0; len]` zero-fill: one positional read lands straight
+/// in the spare capacity. The handle may be shared — no cursor moves. A
+/// short read at EOF is an error, like `read_exact_at`.
+///
+/// Not `seek` + `Read::read_to_end`: that path caps each read at 8 KiB and
+/// doubles, so a pre-sized 1 MiB `Vec` costs eight `read` syscalls.
+#[cfg(unix)]
+pub(crate) fn pread_vec(file: &std::fs::File, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+    use std::os::fd::AsRawFd;
+    let fd = file.as_raw_fd();
+    let mut buf: Vec<u8> = Vec::with_capacity(len);
+    while buf.len() < len {
+        let position = libc::off_t::try_from(offset + buf.len() as u64)
+            .map_err(|_| std::io::Error::other("read offset overflows off_t"))?;
+        let want = len - buf.len();
+        let spare = &mut buf.spare_capacity_mut()[..want];
+        // SAFETY: `spare` is `buf`'s own uninitialized capacity; `pread`
+        // writes at most `spare.len()` bytes into it and returns how many,
+        // which is exactly how far the length advances below.
+        let read = unsafe { libc::pread(fd, spare.as_mut_ptr().cast(), spare.len(), position) };
+        if read < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("expected {len} bytes at offset {offset}, got {}", buf.len()),
+            ));
+        }
+        // SAFETY: the kernel initialized `read` bytes past the current length.
+        unsafe { buf.set_len(buf.len() + read as usize) };
+    }
+    Ok(buf)
+}
+
+/// Non-unix fallback for [`pread_vec`]: `seek` + `read_exact` on the shared
+/// cursor (`&File` implements both), zero-filled first.
+#[cfg(not(unix))]
+pub(crate) fn pread_vec(
+    mut file: &std::fs::File,
+    offset: u64,
+    len: usize,
+) -> std::io::Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    file.seek(SeekFrom::Start(offset))?;
+    let mut buf = vec![0u8; len];
+    file.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
 enum FileType {
     Parquet,
     /// Puffin container — the envelope of `.vix` core files.

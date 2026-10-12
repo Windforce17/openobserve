@@ -1060,9 +1060,10 @@ impl OpeningMemory {
         if self.footer.ranges.get().is_some() {
             return bytes;
         }
-        // Admission covers the input, compact copy, range directory and
-        // native decoding workspace. Never pin a larger source owner.
-        let bytes = compact_bytes(bytes);
+        // The recorded window list is transient (dropped at `finish`) and
+        // may pin its fetch owner until then; trimming/compaction happens
+        // once in `finish`/`trim_to_consumed_suffix`, on the suffix that is
+        // actually retained.
         self.state.lock().ranges.push((range, bytes.clone()));
         bytes
     }
@@ -1082,8 +1083,16 @@ impl OpeningMemory {
             // open's initial read in full (see
             // [`RangedBlob::footer_initial_read_bytes`]) while the unused
             // prefix of the 256 KiB window is released. Any parse failure
-            // keeps the whole recorded window — today's behaviour.
-            let retained = Self::trim_to_consumed_suffix(&ranges, self.blob_end).unwrap_or(ranges);
+            // keeps the whole recorded window — today's behaviour, with
+            // each kept range COMPACTED so it cannot pin its fetch owner
+            // (e.g. a tail-resident slice) beyond the request.
+            let retained = match Self::trim_to_consumed_suffix(&ranges, self.blob_end) {
+                Some(trimmed) => trimmed,
+                None => ranges
+                    .into_iter()
+                    .map(|(range, bytes)| (range, compact_bytes(bytes)))
+                    .collect(),
+            };
             if self.footer.ranges.set(retained.clone()).is_ok()
                 && let Some(memory) = self.footer.memory.get()
             {

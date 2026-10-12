@@ -28,6 +28,9 @@ use vortex_index::{VixQuery, VixRangeSource, VixReader};
 
 static LIVE: AtomicI64 = AtomicI64::new(0);
 static PEAK: AtomicI64 = AtomicI64::new(0);
+/// Every byte handed out by `alloc`/`alloc_zeroed`/`realloc` (growth only):
+/// the copy volume of a step, independent of what it keeps.
+static TOTAL: AtomicI64 = AtomicI64::new(0);
 
 struct Counting;
 
@@ -35,6 +38,9 @@ impl Counting {
     fn bump(delta: i64) {
         let live = LIVE.fetch_add(delta, Ordering::Relaxed) + delta;
         PEAK.fetch_max(live, Ordering::Relaxed);
+        if delta > 0 {
+            TOTAL.fetch_add(delta, Ordering::Relaxed);
+        }
     }
 }
 
@@ -69,17 +75,20 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static GLOBAL: Counting = Counting;
 
-/// Live-heap delta and peak-above-start of `work`, in KB.
+/// Live-heap delta, peak-above-start and total bytes allocated by `work`, in KB.
 fn measure<T>(label: &str, work: impl FnOnce() -> T) -> T {
     let start = LIVE.load(Ordering::Relaxed);
+    let total_start = TOTAL.load(Ordering::Relaxed);
     PEAK.store(start, Ordering::Relaxed);
     let out = work();
     let end = LIVE.load(Ordering::Relaxed);
     let peak = PEAK.load(Ordering::Relaxed);
+    let total = TOTAL.load(Ordering::Relaxed);
     println!(
-        "{label:<44} retained {:>8} KB   peak {:>8} KB",
+        "{label:<44} retained {:>8} KB   peak {:>8} KB   allocated {:>8} KB",
         (end - start) / 1024,
-        (peak - start) / 1024
+        (peak - start) / 1024,
+        (total - total_start) / 1024
     );
     out
 }
@@ -111,6 +120,8 @@ fn main() {
     let phrase = args
         .next()
         .unwrap_or_else(|| "server_status:DEPLOY_STATUS_SUCCESS".to_string());
+    // Prod's eager tail (ZO_VIX_EAGER_TAIL_BYTES); the code default is 128 KiB.
+    vortex_index::set_tail_fetch_size(768 * 1024);
     let data = Bytes::from(std::fs::read(&path).unwrap());
     let index =
         Bytes::from(std::fs::read(std::path::Path::new(&path).with_extension("vxi")).unwrap());
