@@ -111,13 +111,17 @@ static GLOBAL: config::heap_profile::HeapProfileAlloc<tikv_jemallocator::Jemallo
 /// code paths happens to run a purge pass: a whole page freed, a heap collect
 /// every 10,000 slow-path allocations on the owning thread, a thread exit. A
 /// process that goes quiet after a burst, or whose buffers are freed on
-/// threads that then stay idle, keeps the burst resident (3.1.5 additionally
-/// lost pending purges outright, upstream mimalloc #1246). A dedicated OS
-/// thread forcing a purge pass on a fixed cadence makes RSS track live bytes
-/// regardless of the allocation pattern. Harness, 2026-10-11 (6 GiB cache +
-/// 16-worker scan bursts, Linux): floor after bursts 10.2–12.0 GiB → 6.1 GiB,
-/// after dropping the cache 12.0 GiB → 0.04 GiB; a pass with nothing to
-/// purge is a bitmap walk over the arenas.
+/// threads that then stay idle, keeps the burst resident; 3.1.5 additionally
+/// drops pending purges outright once two arenas have different expiries
+/// (upstream mimalloc #1246). A forced pass (`mi_collect(true)`) bypasses
+/// that scheduler: it visits every arena and purges every free slice, so a
+/// dedicated OS thread forcing one on a fixed cadence makes RSS track live
+/// bytes regardless of the allocation pattern, on 3.1.5 as shipped. Harness,
+/// 2026-10-11 (6 GiB cache + 16-worker scan bursts, Linux, 3.1.5 + this
+/// thread): floor after bursts 10.2–12.0 GiB → 6.1 GiB, after dropping the
+/// cache 12.0 GiB → 0.04 GiB; a pass with nothing to purge is a bitmap walk
+/// over the arenas. (Upgrading to 3.3.2 instead was tried as `.212` and
+/// rolled back: +45 % steady-state anon RSS, see Cargo.toml.)
 #[cfg(feature = "mimalloc")]
 fn start_allocator_purge_thread(interval_secs: u64) {
     if interval_secs == 0 {

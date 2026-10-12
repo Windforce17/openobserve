@@ -137,14 +137,18 @@ log.workspace = true
 maxminddb.workspace = true
 md5.workspace = true
 memchr.workspace = true
-# 0.1.52 bundles mimalloc 3.3.2 (v3 is the crate default; the `v3` feature is
-# gone). 3.1.5 (crate 0.1.48) never completed delayed arena purges once two
-# arenas had different expiries (upstream #1246): freed memory stayed
-# resident for the life of the process.
-mimalloc = { version = "0.1.52", optional = true }
+# Pinned to crate 0.1.48 = mimalloc 3.1.5, the allocator prod has run since
+# the fork. 3.1.5's purge scheduler drops delayed purges once two arenas have
+# different expiries (upstream #1246), which main.rs works around with a
+# forced pass on a fixed cadence instead of upgrading: 0.1.52 (mimalloc 3.3.2)
+# shipped as `.212` and held 45 % more anon RSS in steady state than 3.1.5
+# (17.6-19.8 GiB vs 11.7-13.9 on the same pods, 17 OOMKills in 2 h, rolled
+# back; 2026-10-12 backlog). The extra is pages in use, not unpurged frees:
+# a forced purge every second does not lower it.
+mimalloc = { version = "0.1.48", features = ["v3"], optional = true }
 # `extended` exposes mi_collect for the purge thread in main.rs; the version
-# must match the one mimalloc 0.1.52 links (one copy of the C library).
-libmimalloc-sys = { version = "0.1.49", features = ["extended"], optional = true }
+# must match the one mimalloc 0.1.48 links (one copy of the C library).
+libmimalloc-sys = { version = "0.1.44", features = ["extended"], optional = true }
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 opentelemetry-otlp.workspace = true
