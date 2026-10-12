@@ -2660,6 +2660,39 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
   memory watch). Remaining lever after that: the per-file probe itself,
   2.2 reads / ~0.6 MB per sidecar for a dictionary miss on a 24k-field
   stream.
+  - **`.214` ROLLED** (= `.213` + `86f4ac7c4`; GitOps #630 merged
+    11:36:35Z, synced 11:36:54Z, 10/10 pods on the new RS 11:38:40Z, 0
+    restarts). Same query, fixed window ending 09:55Z, `use_cache=false`:
+    - cold (new pods, 0 % cached, 11:39:05Z): **30.9 s** (`idx_took`
+      28.9 s), `is_partial` — the terminating `.213` pod was still in the
+      node list (11 followers, "connect to gRPC node error", 140/148
+      hits). Per follower **35–37 groups** (was 143–176), 8.4–8.9k files,
+      24–26k S3 reads / 8.3–9.0 GB physical in 24–29 s, **158–193 reads in
+      flight** (was 8–33), `evaluation_wait` ≈ 3 ms per eval. The cold
+      bound is now the eval slots × the serial reads per sidecar:
+      256 / (2.85 reads × ~250 ms) ≈ 360 files/s ≈ 1,000 GET/s per pod;
+      the 768 fetch slots are a quarter used.
+    - second run (11:39:36Z): 18.0 s, 148 hits, 38–41 groups; per-file
+      result-cache hits for the 10/11 of files that kept their follower,
+      2.1–3.3k S3 reads for the ~1/11 remapped by the 11 → 10 node change.
+    - result-cache hit (3rd run): **1.8 s** (`.213`: 1.3 s).
+    - result-cache miss with hot readers and the bytes in the block tier
+      (`LIMIT 199`, same 148 rows): **6.8 s** (`idx_took` 6.0 s), per
+      follower 2.9–6.0 s, 7.4–12k block-tier reads / 0.05–1.4 GB. The
+      `.213` miss with cold readers on 90 % disk at 11:24 was 47–55 s.
+      The result-cache key carries the SimpleSelect limit
+      (`rule.to_rule_string()`), so a changed LIMIT always misses:
+      `LIMIT 20` ASC 9.3 s / DESC 6.5 s (0.3–2.5 GB block tier).
+    - correctness: every complete run returned the same 148 rows (ts sha
+      `b880186dac8c`); `LIMIT 20 ASC` == first 20 of the sorted set,
+      `LIMIT 20 DESC` == last 20 reversed.
+    - ERRORs since the roll: only roll-time transients (node health-check
+      removal, gRPC connect to the leaving pod, compactor file_list
+      broadcast tcp connect) plus the day-long user-query "Search field not
+      found: component" (also at 06–08Z and in the 08:05 / 09:05 rolls).
+    - RSS at 7 min: 13.4–14.1 GiB (fresh pods right after the 52 GB index
+      read). The `.213` memory watch restarts here: checkpoints at 1 h and
+      the 05:30–08:00Z burst window.
 
 ## 2026-09-29 — P2 shipped as `.176` and rolled back within 30 min: the per-stream side table stalled the shared meta DB (commit latency 40–60×, ingest 503s); ranges must live in the segment row
 - What shipped (vix-arch `013c45010` + NATS retry `76fe754b5`, image
