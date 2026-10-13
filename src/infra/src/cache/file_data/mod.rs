@@ -58,21 +58,37 @@ enum CacheStrategy {
 }
 
 /// Read exactly `len` bytes at `offset` into a fresh, exact-size `Vec`
-/// without the `vec![0; len]` zero-fill: one positional read lands straight
-/// in the spare capacity. The handle may be shared — no cursor moves. A
-/// short read at EOF is an error, like `read_exact_at`.
+/// without the `vec![0; len]` zero-fill: see [`pread_append`].
+pub(crate) fn pread_vec(file: &std::fs::File, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+    let mut buf: Vec<u8> = Vec::with_capacity(len);
+    pread_append(file, &mut buf, offset, len)?;
+    Ok(buf)
+}
+
+/// Append exactly `len` bytes read at `offset` to `buf`: positional reads
+/// land straight in its spare capacity (reserved here), no zero-fill. The
+/// handle may be shared — no cursor moves. A short read at EOF is an error,
+/// like `read_exact_at`; `buf` then keeps only what it held before.
 ///
 /// Not `seek` + `Read::read_to_end`: that path caps each read at 8 KiB and
 /// doubles, so a pre-sized 1 MiB `Vec` costs eight `read` syscalls.
 #[cfg(unix)]
-pub(crate) fn pread_vec(file: &std::fs::File, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+pub(crate) fn pread_append(
+    file: &std::fs::File,
+    buf: &mut Vec<u8>,
+    offset: u64,
+    len: usize,
+) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
     let fd = file.as_raw_fd();
-    let mut buf: Vec<u8> = Vec::with_capacity(len);
-    while buf.len() < len {
-        let position = libc::off_t::try_from(offset + buf.len() as u64)
+    buf.reserve(len);
+    let start = buf.len();
+    let end = start + len;
+    while buf.len() < end {
+        let done = (buf.len() - start) as u64;
+        let position = libc::off_t::try_from(offset + done)
             .map_err(|_| std::io::Error::other("read offset overflows off_t"))?;
-        let want = len - buf.len();
+        let want = end - buf.len();
         let spare = &mut buf.spare_capacity_mut()[..want];
         // SAFETY: `spare` is `buf`'s own uninitialized capacity; `pread`
         // writes at most `spare.len()` bytes into it and returns how many,
@@ -83,33 +99,40 @@ pub(crate) fn pread_vec(file: &std::fs::File, offset: u64, len: usize) -> std::i
             if err.kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
+            buf.truncate(start);
             return Err(err);
         }
         if read == 0 {
+            buf.truncate(start);
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
-                format!("expected {len} bytes at offset {offset}, got {}", buf.len()),
+                format!("expected {len} bytes at offset {offset}, got {done}"),
             ));
         }
         // SAFETY: the kernel initialized `read` bytes past the current length.
         unsafe { buf.set_len(buf.len() + read as usize) };
     }
-    Ok(buf)
+    Ok(())
 }
 
-/// Non-unix fallback for [`pread_vec`]: `seek` + `read_exact` on the shared
-/// cursor (`&File` implements both), zero-filled first.
+/// Non-unix fallback for [`pread_append`]: `seek` + `read_exact` on the
+/// shared cursor (`&File` implements both), zero-filled first.
 #[cfg(not(unix))]
-pub(crate) fn pread_vec(
+pub(crate) fn pread_append(
     mut file: &std::fs::File,
+    buf: &mut Vec<u8>,
     offset: u64,
     len: usize,
-) -> std::io::Result<Vec<u8>> {
+) -> std::io::Result<()> {
     use std::io::{Read, Seek, SeekFrom};
     file.seek(SeekFrom::Start(offset))?;
-    let mut buf = vec![0u8; len];
-    file.read_exact(&mut buf)?;
-    Ok(buf)
+    let start = buf.len();
+    buf.resize(start + len, 0);
+    if let Err(e) = file.read_exact(&mut buf[start..]) {
+        buf.truncate(start);
+        return Err(e);
+    }
+    Ok(())
 }
 
 enum FileType {

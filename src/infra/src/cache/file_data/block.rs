@@ -19,12 +19,24 @@
 //! a `.vix` data file (its Vortex footer plus the projected columns'
 //! chunks) and ~2% of an index sidecar, so a whole-file fill moves 27-60x
 //! the bytes the query reads (prod counters, 2026-10-10). This tier caches
-//! exactly the block-aligned ranges that range reads miss, write-through
+//! exactly the block-aligned ranges that range reads miss, write-behind
 //! from object storage: a cold read fetches the missing blocks (one GET per
-//! contiguous run), writes them into a sparse file and serves the request
-//! straight from the fetched bytes when it is covered by one run (zero
-//! copy; the write-through puts the same bytes in the file); a warm read
-//! is one `pread`.
+//! contiguous run), assembles every requested range from what is in hand -
+//! a range inside one fetched run is a zero-copy slice of it, a warm range
+//! is one `pread` of present blocks, a range touching both is stitched into
+//! one allocation of its length - and returns; it never reads a fill back
+//! out of the file, which still has a hole where that fill has not landed.
+//! The fetched runs go to a byte-bounded queue drained by [`FILL_WRITERS`]
+//! blocking writers that `pwrite` them into the sparse file and only then
+//! mark the blocks present.
+//!
+//! Back-pressure drops, never blocks: a fill whose bytes would push the
+//! queue past `ZO_DISK_CACHE_BLOCK_FILL_QUEUE_SIZE` is not queued, its
+//! blocks stay absent and a later reader fetches them again. The earlier
+//! write-through design (`.215`, 2026-10-12) pinned prod's gp3 data volume
+//! at its 4,096 IOPS (~800 MB/s of fills, util 86-90%) during a cold 7-day
+//! point lookup, and the hit path's local preads queued behind those fills
+//! took 105-120 ms; now a read waits on no write.
 //!
 //! On-disk layout: one sparse file per object under `<root>/<key>`, whose
 //! logical length is the object's size; bytes `[0, object_size)` mirror the
@@ -60,10 +72,11 @@
 //! tier, whose set-triggered GC unlinks files under its bucket write lock.
 
 use std::{
+    collections::VecDeque,
     ops::Range,
     path::{Path, PathBuf},
     sync::{
-        Arc, OnceLock,
+        Arc, OnceLock, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
@@ -72,7 +85,7 @@ use bytes::Bytes;
 use config::{get_config, metrics, utils::hash::sum64_bytes};
 use futures::{StreamExt, TryStreamExt, future::BoxFuture};
 use hashbrown::HashMap;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Condvar, Mutex, RwLock};
 
 use super::CacheStrategy;
 
@@ -91,6 +104,13 @@ const NO_BOOT_ID: &str = "none";
 const COALESCE_GAP_BYTES: u64 = 1024 * 1024;
 /// Concurrent fills per request.
 const FILL_CONCURRENCY: usize = 10;
+/// Blocking-pool threads draining the fill queue. A `pwrite` is a copy into
+/// the page cache until the kernel's dirty-page throttling parks the
+/// writer, so a few writers keep up with the fetch rate (prod: ~800 MB/s of
+/// fills against a 1,024 MB/s volume) while a saturated volume can stall at
+/// most this many of the pool's threads; more writers would only queue
+/// deeper inside the kernel on the same device.
+const FILL_WRITERS: usize = 4;
 
 static GLOBAL: OnceLock<Arc<BlockCache>> = OnceLock::new();
 
@@ -118,6 +138,7 @@ pub async fn init() -> Result<(), anyhow::Error> {
         (per_bucket / 10).max(block_size),
         &cfg.disk_cache.cache_strategy,
         cfg.disk_cache.bucket_num,
+        cfg.disk_cache.block_fill_queue_size as u64,
     );
     if GLOBAL.set(Arc::clone(&cache)).is_err() {
         return Ok(());
@@ -464,54 +485,271 @@ fn overlap(a: &Range<u64>, b: &Range<u64>) -> u64 {
     a.end.min(b.end).saturating_sub(a.start.max(b.start))
 }
 
-/// Split requested ranges into fill-served bytes and pread-shaped ranges.
-///
-/// A requested range that lies wholly inside one fill run's byte span
-/// (`run.start*bs .. min(run.end*bs, object_size)`) is served as a
-/// zero-copy slice of the fetched bytes; anything else (touching present
-/// blocks, straddling two runs) is returned in `reads` for the IO job to
-/// pread from the cache file after the writes. `served[i]` and `reads` line
-/// up with the request order: `served[i]` is `Some` exactly when request
-/// `i` was covered, and the ranges in `reads` are the uncovered ones in
-/// request order. Empty ranges are `Some(Bytes::new())`.
-fn split_fill_served(
+/// How one requested range is assembled; see [`plan_ranges`].
+enum Plan {
+    /// In hand without touching the cache file: an empty range, a range
+    /// wholly inside one fill run (a zero-copy slice of the fetched bytes),
+    /// or one spanning only fill runs (copied once into its own buffer).
+    Ready(Bytes),
+    /// Wholly inside present blocks: one `pread` of the range.
+    Disk(Range<u64>),
+    /// Touches present blocks and fill runs: one allocation of the range's
+    /// length, filled piece by piece in offset order.
+    Stitch {
+        range: Range<u64>,
+        pieces: Vec<Piece>,
+    },
+}
+
+enum Piece {
+    /// Already sliced to the piece out of the fetched run.
+    Fill(Bytes),
+    /// Present blocks, `pread` from the cache file.
+    Disk(Range<u64>),
+}
+
+impl Plan {
+    /// The whole range when the plan needs the cache file, `None` for
+    /// [`Plan::Ready`]; the fallback re-fetches exactly these.
+    fn unserved(&self) -> Option<&Range<u64>> {
+        match self {
+            Self::Ready(_) => None,
+            Self::Disk(range) | Self::Stitch { range, .. } => Some(range),
+        }
+    }
+}
+
+/// Plan every requested range from the fetched fill runs and the blocks the
+/// entry already has - never from a fill read back out of the file, which
+/// is being written behind this read (if at all) and still has a hole where
+/// the fill has not landed. Walking a range in offset order, each stretch
+/// inside a run's byte span (`run.start*bs .. min(run.end*bs, object_size)`)
+/// is a [`Piece::Fill`] sliced from the fetched bytes and each stretch
+/// between runs is a [`Piece::Disk`] over present blocks (`missing_runs`
+/// guarantees every wanted block is one or the other). One piece is a
+/// [`Plan::Ready`] or [`Plan::Disk`]; several pieces that are all fills are
+/// copied into one buffer now; a mix is a [`Plan::Stitch`] for the IO.
+/// Plans line up with `requested`; empty ranges are `Ready(Bytes::new())`.
+fn plan_ranges(
     requested: &[Range<u64>],
     fills: &[(Range<u64>, Bytes)],
     bs: u64,
     object_size: u64,
-) -> (Vec<Option<Bytes>>, Vec<Range<u64>>) {
-    let mut served: Vec<Option<Bytes>> = Vec::with_capacity(requested.len());
-    let mut reads: Vec<Range<u64>> = Vec::new();
+) -> Vec<Plan> {
+    let mut runs: Vec<(Range<u64>, &Bytes)> = fills
+        .iter()
+        .map(|(run, bytes)| (run.start * bs..(run.end * bs).min(object_size), bytes))
+        .collect();
+    runs.sort_by_key(|(run, _)| run.start);
+    // The next piece of a range starting at `pos`: `runs[*i]` is the first
+    // run whose span ends after `pos` (fill runs are disjoint and sorted).
+    let next_piece = |i: &mut usize, pos: &mut u64, end: u64| -> Piece {
+        match runs.get(*i) {
+            Some((run, bytes)) if run.start <= *pos => {
+                let piece_end = run.end.min(end);
+                let piece = Piece::Fill(
+                    bytes.slice((*pos - run.start) as usize..(piece_end - run.start) as usize),
+                );
+                *i += 1;
+                *pos = piece_end;
+                piece
+            }
+            next => {
+                let piece_end = next.map_or(end, |(run, _)| run.start.min(end));
+                let piece = Piece::Disk(*pos..piece_end);
+                *pos = piece_end;
+                piece
+            }
+        }
+    };
+    let mut plans = Vec::with_capacity(requested.len());
     for r in requested {
         if r.is_empty() {
-            served.push(Some(Bytes::new()));
+            plans.push(Plan::Ready(Bytes::new()));
             continue;
         }
-        let mut covered = None;
-        for (run, bytes) in fills {
-            let run_bytes = run.start * bs..(run.end * bs).min(object_size);
-            if run_bytes.start <= r.start && r.end <= run_bytes.end {
-                let start = (r.start - run_bytes.start) as usize;
-                let end = start + (r.end - r.start) as usize;
-                covered = Some(bytes.slice(start..end));
-                break;
-            }
+        let mut pos = r.start;
+        let mut i = runs.partition_point(|(run, _)| run.end <= pos);
+        let first = next_piece(&mut i, &mut pos, r.end);
+        if pos == r.end {
+            plans.push(match first {
+                Piece::Fill(bytes) => Plan::Ready(bytes),
+                Piece::Disk(range) => Plan::Disk(range),
+            });
+            continue;
         }
-        match covered {
-            Some(bytes) => served.push(Some(bytes)),
-            None => {
-                served.push(None);
-                reads.push(r.clone());
+        let mut pieces = vec![first];
+        while pos < r.end {
+            pieces.push(next_piece(&mut i, &mut pos, r.end));
+        }
+        if pieces.iter().all(|piece| matches!(piece, Piece::Fill(_))) {
+            let mut buf = Vec::with_capacity((r.end - r.start) as usize);
+            for piece in pieces {
+                if let Piece::Fill(bytes) = piece {
+                    buf.extend_from_slice(&bytes);
+                }
             }
+            plans.push(Plan::Ready(Bytes::from(buf)));
+        } else {
+            plans.push(Plan::Stitch {
+                range: r.clone(),
+                pieces,
+            });
         }
     }
-    (served, reads)
+    plans
+}
+
+/// Carry out `plans` against the cache file at `path`: `Ready` passes
+/// through (a refcount bump), `Disk` is one `pread` into an exact-size
+/// buffer, `Stitch` fills one allocation of the range's length piece by
+/// piece. Any error (NotFound = evicted under us) fails the whole read;
+/// the caller then re-fetches the unserved ranges.
+fn read_plans(path: &Path, plans: &[Plan]) -> std::io::Result<Vec<Bytes>> {
+    let file = std::fs::File::open(path)?;
+    let len_of = |range: &Range<u64>| {
+        usize::try_from(range.end - range.start)
+            .map_err(|_| std::io::Error::other("range exceeds address space"))
+    };
+    plans
+        .iter()
+        .map(|plan| match plan {
+            Plan::Ready(bytes) => Ok(bytes.clone()),
+            Plan::Disk(range) => Ok(Bytes::from(super::pread_vec(
+                &file,
+                range.start,
+                len_of(range)?,
+            )?)),
+            Plan::Stitch { range, pieces } => {
+                let mut buf = Vec::with_capacity(len_of(range)?);
+                for piece in pieces {
+                    match piece {
+                        Piece::Fill(bytes) => buf.extend_from_slice(bytes),
+                        Piece::Disk(range) => {
+                            super::pread_append(&file, &mut buf, range.start, len_of(range)?)?
+                        }
+                    }
+                }
+                Ok(Bytes::from(buf))
+            }
+        })
+        .collect()
+}
+
+/// One fetched fill on its way to the cache file: the entry it belongs to,
+/// its block runs with their bytes, and the admission `owner` of the read
+/// that fetched them, held until the write returned.
+struct FillJob {
+    entry: Arc<Entry>,
+    writes: Vec<(Range<u64>, Bytes)>,
+    /// Sum of the runs' lengths, the job's share of the queue budget.
+    bytes: u64,
+    owner: Option<Arc<dyn Send + Sync>>,
+}
+
+/// The write-behind queue: fills waiting for the [`FILL_WRITERS`], bounded
+/// in bytes. Over budget a fill is dropped rather than making its read
+/// wait; the blocks stay absent and a later reader fetches them again.
+struct FillQueue {
+    budget: u64,
+    pending_bytes: AtomicU64,
+    state: Mutex<FillQueueState>,
+    ready: Condvar,
+}
+
+struct FillQueueState {
+    jobs: VecDeque<FillJob>,
+    closed: bool,
+}
+
+impl FillQueue {
+    fn new(budget: u64) -> Arc<Self> {
+        Arc::new(Self {
+            budget,
+            pending_bytes: AtomicU64::new(0),
+            state: Mutex::new(FillQueueState {
+                jobs: VecDeque::new(),
+                closed: false,
+            }),
+            ready: Condvar::new(),
+        })
+    }
+
+    /// Queue `job`, or drop it (counted) when its bytes would push the
+    /// queue over budget. Never blocks.
+    fn push(&self, job: FillJob) {
+        let bytes = job.bytes;
+        let admitted = self
+            .pending_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                (pending + bytes <= self.budget).then_some(pending + bytes)
+            })
+            .is_ok();
+        if !admitted {
+            metrics::QUERY_DISK_BLOCK_CACHE_FILLS_TOTAL
+                .with_label_values(&["dropped"])
+                .inc();
+            metrics::QUERY_DISK_BLOCK_CACHE_FILL_BYTES_TOTAL
+                .with_label_values(&["dropped"])
+                .inc_by(bytes);
+            return;
+        }
+        metrics::QUERY_DISK_BLOCK_CACHE_FILL_QUEUE_BYTES.add(bytes as i64);
+        self.state.lock().jobs.push_back(job);
+        self.ready.notify_one();
+    }
+
+    /// Block for the next job; `None` once the queue is closed.
+    fn pop(&self) -> Option<FillJob> {
+        let mut state = self.state.lock();
+        loop {
+            if state.closed {
+                return None;
+            }
+            if let Some(job) = state.jobs.pop_front() {
+                return Some(job);
+            }
+            self.ready.wait(&mut state);
+        }
+    }
+
+    /// Release a finished job's bytes, whatever its outcome.
+    fn finish(&self, bytes: u64) {
+        self.pending_bytes.fetch_sub(bytes, Ordering::AcqRel);
+        metrics::QUERY_DISK_BLOCK_CACHE_FILL_QUEUE_BYTES.sub(bytes as i64);
+    }
+
+    fn close(&self) {
+        self.state.lock().closed = true;
+        self.ready.notify_all();
+    }
+}
+
+/// A fill writer: drains the queue until it is closed (the cache was
+/// dropped). Each job upgrades the cache handle only for its own duration,
+/// so a parked writer never keeps the cache alive.
+fn fill_writer(queue: Arc<FillQueue>, cache: Weak<BlockCache>) {
+    while let Some(job) = queue.pop() {
+        let Some(cache) = cache.upgrade() else {
+            return;
+        };
+        cache.write_fill(job);
+    }
 }
 
 pub struct BlockCache {
     root: PathBuf,
     block_size: u64,
     buckets: Vec<Bucket>,
+    fills: Arc<FillQueue>,
+}
+
+impl Drop for BlockCache {
+    fn drop(&mut self) {
+        // Release the writers' blocking-pool threads: a runtime shutdown
+        // waits for blocking tasks forever.
+        self.fills.close();
+    }
 }
 
 struct Bucket {
@@ -666,7 +904,10 @@ fn generic(
 
 impl BlockCache {
     /// `max_size`/`release_size` are PER BUCKET, like the whole-file tier's
-    /// config after its per-bucket split.
+    /// config after its per-bucket split; `fill_queue_bytes` bounds the
+    /// write-behind queue for the whole cache. Must run inside a Tokio
+    /// runtime: the [`FILL_WRITERS`] are blocking-pool tasks that live as
+    /// long as the cache.
     pub fn new(
         root: PathBuf,
         block_size: u64,
@@ -674,6 +915,7 @@ impl BlockCache {
         release_size: u64,
         strategy: &str,
         bucket_num: usize,
+        fill_queue_bytes: u64,
     ) -> Arc<Self> {
         assert!(block_size.is_power_of_two() && block_size >= 512);
         let buckets = (0..bucket_num.max(1))
@@ -688,15 +930,29 @@ impl BlockCache {
                 }),
             })
             .collect();
-        Arc::new(Self {
+        let fills = FillQueue::new(fill_queue_bytes);
+        let cache = Arc::new(Self {
             root,
             block_size,
             buckets,
-        })
+            fills: Arc::clone(&fills),
+        });
+        for _ in 0..FILL_WRITERS {
+            let queue = Arc::clone(&fills);
+            let cache = Arc::downgrade(&cache);
+            tokio::task::spawn_blocking(move || fill_writer(queue, cache));
+        }
+        cache
     }
 
     pub fn block_size(&self) -> u64 {
         self.block_size
+    }
+
+    /// Bytes of fetched fills queued for or being written by the fill
+    /// writers; zero once every queued fill landed, failed or was skipped.
+    pub fn pending_fill_bytes(&self) -> u64 {
+        self.fills.pending_bytes.load(Ordering::Acquire)
     }
 
     fn bucket(&self, key: &str) -> &Bucket {
@@ -760,9 +1016,11 @@ impl BlockCache {
 
     /// Serve `requested` of object `key`: present blocks from the cache file,
     /// missing blocks through `fetch` (block-aligned ranges, clipped to the
-    /// object once its size is known) and written through. `requested.end`
-    /// past the object end is clipped like `GetRange::as_range`; a start at
-    /// or past it is `NotFound`. `owner` is held through the blocking IO.
+    /// object once its size is known), the fetched runs queued for the fill
+    /// writers behind the read. `requested.end` past the object end is
+    /// clipped like `GetRange::as_range`; a start at or past it is
+    /// `NotFound`. `owner` is held through the blocking IO, the fill's write
+    /// included.
     pub async fn read_through(
         &self,
         key: &str,
@@ -783,9 +1041,9 @@ impl BlockCache {
 
     /// [`Self::read_through`] for several ranges of one object at once: the
     /// missing blocks of all ranges are fetched together (a block shared by
-    /// two ranges is fetched once), then every range is served — ranges that
-    /// lie wholly inside one fetched run come straight from those bytes, the
-    /// rest are read from the cache file. Results are in request order.
+    /// two ranges is fetched once), then every range is assembled from the
+    /// fetched runs and the cache file's present blocks ([`plan_ranges`]).
+    /// Results are in request order.
     pub async fn read_through_many(
         &self,
         key: &str,
@@ -815,8 +1073,8 @@ impl BlockCache {
         let bs = self.block_size;
         let mut fills: Vec<(Range<u64>, Bytes)> = Vec::new();
         let mut remote_bytes = 0u64;
-        let (entry, created) = match self.get_entry(key) {
-            Some(entry) => (entry, false),
+        let entry = match self.get_entry(key) {
+            Some(entry) => entry,
             None => {
                 // Cold object: the first fetch also tells us its size. Past the
                 // end the store clips the response (`as_range` semantics).
@@ -833,7 +1091,7 @@ impl BlockCache {
                 remote_bytes += expected;
                 let entry = self.insert_or_get(key, object_size);
                 fills.push((run, fetched.bytes));
-                (entry, true)
+                entry
             }
         };
         let object_size = entry.object_size;
@@ -901,108 +1159,99 @@ impl BlockCache {
                 wanted.iter().map(move |w| overlap(&run_bytes, w))
             })
             .sum();
-        // Serve every requested range that lies wholly inside one fill run
-        // straight from the fetched bytes instead of preading them back out
-        // of the file: the job writes those same bytes through, so the cache
-        // file ends up identical while the request skips a memset, an
-        // allocation and a page-cache round trip per range. Ranges touching
-        // present blocks or straddling two fill runs keep the pread path.
-        let (served, reads) = split_fill_served(&ranges, &fills, bs, object_size);
-        let io = IoJob {
-            path: entry.path.clone(),
-            create: created || !fills.is_empty(),
-            object_size,
-            writes: fills
-                .iter()
-                .map(|(run, bytes)| (run.start * bs, bytes.clone()))
-                .collect(),
-            // The fallback below re-fetches only these; keep a copy here.
-            reads: reads.clone(),
-            served: served.clone(),
-            owner,
-        };
-        let read = tokio::task::spawn_blocking(move || io.run())
+        // Every range is assembled from what is in hand - the fetched runs
+        // and the file's present blocks - never from a fill read back out of
+        // the file: the fills are written behind this read (if at all), so
+        // the file still has a hole where one has not landed.
+        let plans = plan_ranges(&ranges, &fills, bs, object_size);
+        // Hand the fetched runs to the fill writers before the local read so
+        // the write overlaps it. Over the queue budget the job is dropped:
+        // the blocks stay absent and a later reader fetches them again.
+        let fill_bytes: u64 = fills.iter().map(|(_, bytes)| bytes.len() as u64).sum();
+        if fill_bytes > 0 {
+            self.fills.push(FillJob {
+                entry: Arc::clone(&entry),
+                writes: fills,
+                bytes: fill_bytes,
+                owner: owner.clone(),
+            });
+        }
+        let bytes = if plans.iter().any(|plan| plan.unserved().is_some()) {
+            let reader = Arc::clone(&entry);
+            let (read, plans) = tokio::task::spawn_blocking(move || {
+                let _owner = owner;
+                (read_plans(&reader.path, &plans), plans)
+            })
             .await
             .map_err(|e| generic("disk block cache", e))?;
-        let bytes = match read {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                // Evicted between lookup and IO (NotFound), or the local disk
-                // misbehaved: a cache must never fail the query. Drop the entry
-                // so the next reader starts cold, serve this one from object
-                // storage without caching it. Ranges already sliced out of the
-                // fetched fills keep their bytes — only the unserved ones are
-                // re-fetched. `reads` and the `None` holes of `served` line up
-                // in request order.
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    log::debug!("[BlockCache] {key} evicted during read, serving remote");
-                } else {
-                    log::warn!("[BlockCache] {key} local IO failed, serving remote: {error}");
-                }
-                self.drop_entry(&entry);
-                // Zero-length ranges are never in `reads` (they were served
-                // `Bytes::new()` above), so every entry is a valid request.
-                let fetches: Vec<FetchFuture> =
-                    reads.iter().map(|range| fetch(range.clone())).collect();
-                let mut results = futures::stream::iter(fetches)
-                    .buffered(FILL_CONCURRENCY)
-                    .try_collect::<Vec<Fetched>>()
-                    .await?
-                    .into_iter();
-                let mut bytes = Vec::with_capacity(ranges.len());
-                let mut unserved = reads.iter();
-                for slot in served {
-                    if let Some(b) = slot {
-                        bytes.push(b);
-                        continue;
+            match read {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    // Evicted between lookup and IO (NotFound), or the local
+                    // disk misbehaved: a cache must never fail the query.
+                    // Drop the entry so the next reader starts cold (a queued
+                    // fill for it is skipped), serve this one from object
+                    // storage without caching it. Ranges already in hand keep
+                    // their bytes — only the plans that needed the file are
+                    // re-fetched, in request order.
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        log::debug!("[BlockCache] {key} evicted during read, serving remote");
+                    } else {
+                        log::warn!("[BlockCache] {key} local IO failed, serving remote: {error}");
                     }
-                    let range = unserved.next().ok_or_else(|| short_response(key, 0, 0))?;
-                    let fetched = results
-                        .next()
-                        .ok_or_else(|| short_response(key, range.end - range.start, 0))?;
-                    let len = fetched.bytes.len() as u64;
-                    if len != range.end - range.start {
-                        return Err(short_response(key, range.end - range.start, len as usize));
+                    self.drop_entry(&entry);
+                    // Zero-length ranges are always `Ready`, so every fetch
+                    // here is a valid request.
+                    let fetches: Vec<FetchFuture> = plans
+                        .iter()
+                        .filter_map(|plan| plan.unserved().map(|range| fetch(range.clone())))
+                        .collect();
+                    let mut results = futures::stream::iter(fetches)
+                        .buffered(FILL_CONCURRENCY)
+                        .try_collect::<Vec<Fetched>>()
+                        .await?
+                        .into_iter();
+                    let mut bytes = Vec::with_capacity(plans.len());
+                    for plan in plans {
+                        let range = match plan {
+                            Plan::Ready(ready) => {
+                                bytes.push(ready);
+                                continue;
+                            }
+                            Plan::Disk(range) | Plan::Stitch { range, .. } => range,
+                        };
+                        let want = range.end - range.start;
+                        let fetched = results.next().ok_or_else(|| short_response(key, want, 0))?;
+                        let len = fetched.bytes.len() as u64;
+                        if len != want {
+                            return Err(short_response(key, want, len as usize));
+                        }
+                        remote_bytes += len;
+                        bytes.push(fetched.bytes);
                     }
-                    remote_bytes += len;
-                    bytes.push(fetched.bytes);
+                    metrics::QUERY_DISK_BLOCK_CACHE_REQUESTS_TOTAL
+                        .with_label_values(&["miss"])
+                        .inc();
+                    metrics::QUERY_DISK_BLOCK_CACHE_BYTES_TOTAL
+                        .with_label_values(&["remote"])
+                        .inc_by(remote_bytes);
+                    return Ok(BlockReads {
+                        bytes,
+                        object_size,
+                        outcome: Outcome::Miss,
+                        remote_bytes,
+                    });
                 }
-                metrics::QUERY_DISK_BLOCK_CACHE_REQUESTS_TOTAL
-                    .with_label_values(&["miss"])
-                    .inc();
-                metrics::QUERY_DISK_BLOCK_CACHE_BYTES_TOTAL
-                    .with_label_values(&["remote"])
-                    .inc_by(remote_bytes);
-                return Ok(BlockReads {
-                    bytes,
-                    object_size,
-                    outcome: Outcome::Miss,
-                    remote_bytes,
-                });
             }
+        } else {
+            plans
+                .into_iter()
+                .map(|plan| match plan {
+                    Plan::Ready(bytes) => bytes,
+                    Plan::Disk(_) | Plan::Stitch { .. } => unreachable!("no plan needs the file"),
+                })
+                .collect()
         };
-        if !fills.is_empty() && entry.state.lock().evicted && self.get_entry(key).is_none() {
-            // Evicted while we were filling: the sweeper's unlink may have
-            // preceded our create, leaving an orphan file.
-            unlink_later(vec![Arc::clone(&entry)]);
-        }
-
-        let added: u64 = fills
-            .iter()
-            .map(|(run, _)| entry.mark_present(run.clone()))
-            .sum();
-        if added > 0 {
-            let bucket = self.bucket(key);
-            let cur = bucket.cur_size.fetch_add(added, Ordering::Relaxed) + added;
-            let [org, stream_type] = key_labels(&entry.key);
-            metrics::QUERY_DISK_BLOCK_CACHE_USED_BYTES
-                .with_label_values(&[org, stream_type])
-                .add(added as i64);
-
-            if cur > bucket.max_size {
-                self.evict(bucket, bucket.release_size.max(added));
-            }
-        }
         metrics::QUERY_DISK_BLOCK_CACHE_REQUESTS_TOTAL
             .with_label_values(&[outcome.as_str()])
             .inc();
@@ -1239,6 +1488,61 @@ impl BlockCache {
             .add(present_bytes as i64);
         true
     }
+
+    /// Run one queued fill on a writer thread: `pwrite` its runs into the
+    /// cache file, then make the blocks servable. Skipped outright when the
+    /// entry was evicted meanwhile (its file is gone or going). A write
+    /// error drops the entry so the next reader starts cold; no retry.
+    fn write_fill(&self, job: FillJob) {
+        let FillJob {
+            entry,
+            writes,
+            bytes,
+            owner,
+        } = job;
+        let outcome = if entry.state.lock().evicted {
+            "skipped"
+        } else if let Err(error) = write_runs(&entry, &writes) {
+            log::warn!(
+                "[BlockCache] {} fill write failed, dropping the entry: {error}",
+                entry.key
+            );
+            self.drop_entry(&entry);
+            "failed"
+        } else {
+            if entry.state.lock().evicted && self.get_entry(&entry.key).is_none() {
+                // Evicted while the fill was in flight: the sweeper's unlink
+                // may have preceded our create, leaving an orphan file.
+                unlink_later(vec![Arc::clone(&entry)]);
+            }
+            let added: u64 = writes
+                .iter()
+                .map(|(run, _)| entry.mark_present(run.clone()))
+                .sum();
+            if added > 0 {
+                let bucket = self.bucket(&entry.key);
+                let cur = bucket.cur_size.fetch_add(added, Ordering::Relaxed) + added;
+                let [org, stream_type] = key_labels(&entry.key);
+                metrics::QUERY_DISK_BLOCK_CACHE_USED_BYTES
+                    .with_label_values(&[org, stream_type])
+                    .add(added as i64);
+                if cur > bucket.max_size {
+                    self.evict(bucket, bucket.release_size.max(added));
+                }
+            }
+            "written"
+        };
+        drop(owner);
+        metrics::QUERY_DISK_BLOCK_CACHE_FILLS_TOTAL
+            .with_label_values(&[outcome])
+            .inc();
+        metrics::QUERY_DISK_BLOCK_CACHE_FILL_BYTES_TOTAL
+            .with_label_values(&[outcome])
+            .inc_by(bytes);
+        // Last: a zero `pending_fill_bytes` means every queued fill is fully
+        // accounted (and any orphan unlink is already scheduled).
+        self.fills.finish(bytes);
+    }
 }
 
 fn short_response(key: &str, expected: u64, got: usize) -> object_store::Error {
@@ -1251,64 +1555,26 @@ fn short_response(key: &str, expected: u64, got: usize) -> object_store::Error {
     )
 }
 
-struct IoJob {
-    path: PathBuf,
-    create: bool,
-    /// The object's size: on `create` the cache file's logical length is
-    /// set to it, so the file mirrors the object exactly - a hole at any
-    /// never-fetched offset, which is what [`present_blocks`] reads back.
-    object_size: u64,
-    /// `(offset, bytes)` block runs to write before reading.
-    writes: Vec<(u64, Bytes)>,
-    /// `served[i]` holds the bytes of request `i` when it lies wholly inside
-    /// one fill run (a zero-copy slice of the fetched bytes), `None` when the
-    /// job must pread it from the file; `reads` lists those ranges, in request
-    /// order, and results are stitched back into request order.
-    reads: Vec<Range<u64>>,
-    served: Vec<Option<Bytes>>,
-    owner: Option<Arc<dyn Send + Sync>>,
-}
-
-impl IoJob {
-    fn run(self) -> std::io::Result<Vec<Bytes>> {
-        let _owner = self.owner;
-        let file = if self.create {
-            if let Some(parent) = self.path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&self.path)?;
-            // The cache file mirrors the object exactly: its logical length
-            // is the object's size, so every never-fetched offset is a hole.
-            file.set_len(self.object_size)?;
-            file
-        } else {
-            std::fs::File::open(&self.path)?
-        };
-
-        for (offset, bytes) in &self.writes {
-            pwrite_all(&file, bytes, *offset)?;
-        }
-        // Ranges served from the fills arrive in request order with `None`
-        // holes for the ones this job must pread; the reads are in the same
-        // order, so each fills the next hole.
-        let mut out = self.served;
-        let mut holes = out.iter_mut().filter(|slot| slot.is_none());
-        for read in &self.reads {
-            let len = usize::try_from(read.end - read.start)
-                .map_err(|_| std::io::Error::other("range exceeds address space"))?;
-            let buf = super::pread_vec(&file, read.start, len)?;
-            *holes.next().expect("a hole for every unserved range") = Some(Bytes::from(buf));
-        }
-        Ok(out
-            .into_iter()
-            .map(|slot| slot.expect("every request range is served"))
-            .collect())
+/// Write `writes` (block runs, bytes) into `entry`'s cache file, creating
+/// it if needed: the file mirrors the object exactly, its logical length is
+/// the object's size, so every never-fetched offset is a hole - which is
+/// what [`present_blocks`] reads back. The file may also be gone (unlinked
+/// by an eviction sweep that raced the lookup); it is recreated and the
+/// caller's orphan check cleans up.
+fn write_runs(entry: &Entry, writes: &[(Range<u64>, Bytes)]) -> std::io::Result<()> {
+    if let Some(parent) = entry.path.parent() {
+        std::fs::create_dir_all(parent)?;
     }
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&entry.path)?;
+    file.set_len(entry.object_size)?;
+    for (run, bytes) in writes {
+        pwrite_all(&file, bytes, run.start * entry.block_size)?;
+    }
+    Ok(())
 }
 
 fn unlink_later(entries: Vec<Arc<Entry>>) {
@@ -1391,20 +1657,78 @@ mod tests {
         }
     }
 
+    /// Prod's default fill queue budget; big enough that no test fill is
+    /// dropped unless it asks for a tiny budget.
+    const FILL_BUDGET: u64 = 256 << 20;
+
     /// `prepare_root` is the [`init`] seam: tests inject a fixed boot id so
     /// they never touch `/proc`.
     fn cache_with_boot_id(dir: &Path, max_size: u64, boot_id: &str) -> Arc<BlockCache> {
         prepare_root(dir, BS, Some(boot_id)).unwrap();
-        BlockCache::new(dir.to_path_buf(), BS, max_size, BS, "time_lru", 1)
+        BlockCache::new(
+            dir.to_path_buf(),
+            BS,
+            max_size,
+            BS,
+            "time_lru",
+            1,
+            FILL_BUDGET,
+        )
     }
 
     fn cache_with_block_size(dir: &Path, max_size: u64, bs: u64) -> Arc<BlockCache> {
         prepare_root(dir, bs, Some("test-boot")).unwrap();
-        BlockCache::new(dir.to_path_buf(), bs, max_size, bs, "time_lru", 1)
+        BlockCache::new(
+            dir.to_path_buf(),
+            bs,
+            max_size,
+            bs,
+            "time_lru",
+            1,
+            FILL_BUDGET,
+        )
+    }
+
+    /// A cache whose fill queue admits at most `fill_budget` bytes.
+    fn cache_with_fill_budget(dir: &Path, max_size: u64, fill_budget: u64) -> Arc<BlockCache> {
+        prepare_root(dir, BS, Some("test-boot")).unwrap();
+        BlockCache::new(
+            dir.to_path_buf(),
+            BS,
+            max_size,
+            BS,
+            "time_lru",
+            1,
+            fill_budget,
+        )
     }
 
     fn cache(dir: &Path, max_size: u64) -> Arc<BlockCache> {
         cache_with_boot_id(dir, max_size, "test-boot")
+    }
+
+    /// Wait until every queued fill landed (or was skipped/failed): a read
+    /// returns before its fill is written, so a test that then expects a
+    /// hit, accounted bytes or the file's contents settles the queue first.
+    async fn settle(cache: &BlockCache) {
+        for _ in 0..1000 {
+            if cache.pending_fill_bytes() == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("fill queue did not drain");
+    }
+
+    /// Wait for an asynchronous unlink.
+    async fn wait_gone(path: &Path) {
+        for _ in 0..200 {
+            if !path.exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("{} still exists", path.display());
     }
 
     const KEY: &str = "files/org/logs/stream/2026/10/08/11/a.vix";
@@ -1425,6 +1749,8 @@ mod tests {
         assert_eq!(read.object_size, 1 << 20);
         assert_eq!(read.remote_bytes, BS, "one aligned block");
         assert_eq!(remote.calls(), 1);
+        // The fill is write-behind: presence and accounting follow the write.
+        settle(&cache).await;
         assert_eq!(cache.stats(), (1 << 30, BS, 1));
 
         let read = cache
@@ -1445,6 +1771,7 @@ mod tests {
         assert_eq!(read.bytes, remote.data.slice(60_000..70_000));
         assert_eq!(read.remote_bytes, BS);
         assert_eq!(remote.calls(), 2);
+        settle(&cache).await;
         assert_eq!(cache.stats().1, 2 * BS);
     }
 
@@ -1465,6 +1792,7 @@ mod tests {
             100_000 - BS,
             "last block clipped to the object"
         );
+        settle(&cache).await;
         assert_eq!(cache.stats().1, 100_000 - BS);
 
         let read = cache
@@ -1514,6 +1842,7 @@ mod tests {
         for task in tasks {
             task.await.unwrap();
         }
+        settle(&cache).await;
         // Union of touched blocks: offsets 0..350_000 -> blocks 0..6 (6 blocks).
         let (_, used, entries) = cache.stats();
         assert_eq!(entries, 1);
@@ -1547,9 +1876,11 @@ mod tests {
                 .read_through(KEY, object_size - 10..object_size, None, &fetch)
                 .await
                 .unwrap();
+            // Let the write-behind fills land before the "process" ends.
+            settle(&cache).await;
         }
-        // The write-through only ever put data in the page cache; a second
-        // process reconstructs presence from the filesystem's own extents.
+        // The fills only ever put data in the page cache; a second process
+        // reconstructs presence from the filesystem's own extents.
         let calls_before = remote.calls();
         let cache = cache(dir.path(), 1 << 30);
         assert_eq!(cache.load().await.unwrap(), 1);
@@ -1576,6 +1907,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(read.outcome, Outcome::Miss);
+        settle(&cache).await;
     }
 
     #[cfg(unix)]
@@ -1595,6 +1927,7 @@ mod tests {
             .read_through(KEY, 2 * bs..2 * bs + 10, None, &fetch)
             .await
             .unwrap();
+        settle(&cache).await;
         // Tear block 1: write only its head into the cache file, its tail
         // stays a hole.
         let path = dir.path().join(KEY);
@@ -1625,6 +1958,7 @@ mod tests {
             read.bytes,
             remote.data.slice(bs as usize + 10..bs as usize + 20)
         );
+        settle(&cache).await;
 
         // And `load` on a fresh cache adopts the same shape.
         let reloaded = cache_with_block_size(dir.path(), 1 << 30, bs);
@@ -1679,6 +2013,7 @@ mod tests {
                 .read_through(KEY, gap..gap + 10, None, &fetch)
                 .await
                 .unwrap();
+            settle(&cache).await;
         }
         let cache = cache(dir.path(), 1 << 30);
         assert_eq!(cache.load().await.unwrap(), 1);
@@ -1705,6 +2040,7 @@ mod tests {
         {
             let cache = cache_with_boot_id(&root, 1 << 30, "boot-a");
             cache.read_through(KEY, 0..10, None, &fetch).await.unwrap();
+            settle(&cache).await;
             assert!(root.join(KEY).exists());
         }
         // The next boot sees a different kernel boot id: the root is stale.
@@ -1726,6 +2062,8 @@ mod tests {
         {
             let cache = cache_with_boot_id(&root, 1 << 30, "boot-a");
             cache.read_through(KEY, 0..10, None, &fetch).await.unwrap();
+            // A fill landing after the wipe would recreate the file.
+            settle(&cache).await;
         }
         // A block-size change remaps every hole boundary: stale.
         let state = prepare_root(&root, BS * 4, Some("boot-a")).unwrap();
@@ -1742,6 +2080,7 @@ mod tests {
         {
             let cache = cache_with_boot_id(&root, 1 << 30, "boot-a");
             cache.read_through(KEY, 0..10, None, &fetch).await.unwrap();
+            settle(&cache).await;
         }
         std::fs::remove_file(root.join(LINEAGE_MARKER)).unwrap();
         let state = prepare_root(&root, BS, Some("boot-a")).unwrap();
@@ -1758,6 +2097,7 @@ mod tests {
         {
             let cache = cache_with_boot_id(&root, 1 << 30, "boot-a");
             cache.read_through(KEY, 0..10, None, &fetch).await.unwrap();
+            settle(&cache).await;
         }
         // A platform without a boot id can never trust a previous run.
         let state = prepare_root(&root, BS, None).unwrap();
@@ -1778,29 +2118,26 @@ mod tests {
         for key in [old, mid, new] {
             cache.read_through(key, 0..10, None, &fetch).await.unwrap();
         }
+        settle(&cache).await;
         assert_eq!(cache.stats(), (3 * BS, 3 * BS, 3));
-        // Fourth block exceeds the budget: the oldest data hour goes.
+        // Fourth block exceeds the budget: the oldest data hour goes - the
+        // writer that lands the fill runs the sweep.
         cache
             .read_through(new, BS..BS + 10, None, &fetch)
             .await
             .unwrap();
+        settle(&cache).await;
         let (_, used, entries) = cache.stats();
         assert!(used <= 3 * BS, "used {used}");
         assert_eq!(entries, 2);
         assert!(cache.get_entry(old).is_none());
         assert!(cache.get_entry(mid).is_some() && cache.get_entry(new).is_some());
-        // Unlink is asynchronous; wait for it.
-        for _ in 0..100 {
-            if !dir.path().join(old).exists() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(!dir.path().join(old).exists());
+        wait_gone(&dir.path().join(old)).await;
         // The evicted object comes back cold.
         let read = cache.read_through(old, 0..10, None, &fetch).await.unwrap();
         assert_eq!(read.outcome, Outcome::Miss);
         assert_eq!(read.bytes, remote.data.slice(0..10));
+        settle(&cache).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1810,15 +2147,10 @@ mod tests {
         let remote = Remote::new(200_000);
         let fetch = remote.fetcher();
         cache.read_through(KEY, 0..10, None, &fetch).await.unwrap();
+        settle(&cache).await;
         cache.remove(KEY);
         assert_eq!(cache.stats(), (1 << 30, 0, 0));
-        for _ in 0..100 {
-            if !dir.path().join(KEY).exists() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(!dir.path().join(KEY).exists());
+        wait_gone(&dir.path().join(KEY)).await;
         // A removed file is gone for good: nothing rewrites it later.
         let reloaded = cache_with_boot_id(dir.path(), 1 << 30, "test-boot");
         assert_eq!(reloaded.load().await.unwrap(), 0);
@@ -1839,6 +2171,7 @@ mod tests {
                 .await
                 .unwrap();
         }
+        settle(&cache).await;
         let calls = remote.calls();
         // Blocks 0..6 -> missing {1}, {3}, {5}, one block apart: one span
         // 1..6 re-fetching 2 and 4.
@@ -1850,6 +2183,7 @@ mod tests {
         assert_eq!(remote.calls() - calls, 1);
         assert_eq!(read.remote_bytes, 5 * BS);
         assert_eq!(read.bytes, remote.data.slice(0..6 * BS as usize));
+        settle(&cache).await;
         assert_eq!(
             cache.stats().1,
             6 * BS,
@@ -1881,6 +2215,7 @@ mod tests {
             reads.bytes[1],
             remote.data.slice(30 * BS as usize..30 * BS as usize + 10)
         );
+        settle(&cache).await;
         assert_eq!(cache.stats().1, 8 * BS);
     }
 
@@ -1915,6 +2250,7 @@ mod tests {
                 remote.data.slice(range.start as usize..range.end as usize)
             );
         }
+        settle(&cache).await;
         assert_eq!(cache.stats().1, 3 * BS);
 
         // Everything present now: a second call is a pure hit.
@@ -1945,8 +2281,8 @@ mod tests {
             2 * BS..2 * BS,
         ];
         // The exact fills the flow above builds: prove they leave no range
-        // for the pread path — the IO job reads nothing for this request.
-        let (served, preads) = split_fill_served(
+        // for the file — the read touches no disk for this request.
+        let plans = plan_ranges(
             &ranges,
             &[
                 (1..2, remote.data.slice(BS as usize..2 * BS as usize)),
@@ -1955,9 +2291,11 @@ mod tests {
             BS,
             remote.data.len() as u64,
         );
-        assert_eq!(served.len(), ranges.len());
-        assert_eq!(preads.len(), 0, "no pread path for covered ranges");
-        assert!(served.iter().all(|slot| slot.is_some()));
+        assert_eq!(plans.len(), ranges.len());
+        assert!(
+            plans.iter().all(|plan| plan.unserved().is_none()),
+            "no file path for covered ranges"
+        );
 
         let reads = cache
             .read_through_many(KEY, &ranges, None, &fetch)
@@ -1984,7 +2322,8 @@ mod tests {
                 "served bytes must point into the fetched fill"
             );
         }
-        // The write-through still put the fetched blocks in the file.
+        // The write-behind fill still puts the fetched blocks in the file.
+        settle(&cache).await;
         let file = std::fs::File::open(dir.path().join(KEY)).unwrap();
         let buf = crate::cache::file_data::pread_vec(&file, BS, 2 * BS as usize).unwrap();
         assert_eq!(&buf[..], &remote.data[BS as usize..3 * BS as usize]);
@@ -1997,11 +2336,12 @@ mod tests {
         let cache = cache(dir.path(), 1 << 30);
         let remote = Remote::new((4 * BS) as usize);
         let fetch = remote.fetcher();
-        // Warm block 0 alone.
+        // Warm block 0 alone and let its fill land.
         cache.read_through(KEY, 0..10, None, &fetch).await.unwrap();
+        settle(&cache).await;
         // This range straddles the present block 0 and the missing block 1:
-        // no single fill run covers it, so it takes the pread path after
-        // the write-through.
+        // no single fill run covers it, so it is stitched from one pread of
+        // block 0's bytes and the fetched run, in memory.
         let range = 10..BS + 10;
         let read = cache
             .read_through(KEY, range.clone(), None, &fetch)
@@ -2009,6 +2349,19 @@ mod tests {
             .unwrap();
         assert_eq!(read.outcome, Outcome::Partial);
         assert_eq!(read.remote_bytes, BS);
+        assert_eq!(
+            read.bytes,
+            remote.data.slice(range.start as usize..range.end as usize)
+        );
+        // Once the fill landed the same range is one pread.
+        settle(&cache).await;
+        let calls = remote.calls();
+        let read = cache
+            .read_through(KEY, range.clone(), None, &fetch)
+            .await
+            .unwrap();
+        assert_eq!(read.outcome, Outcome::Hit);
+        assert_eq!(remote.calls(), calls);
         assert_eq!(
             read.bytes,
             remote.data.slice(range.start as usize..range.end as usize)
@@ -2027,9 +2380,11 @@ mod tests {
             .read_through(KEY, 2 * BS + 30..2 * BS + 60, None, &fetch)
             .await
             .unwrap();
+        settle(&cache).await;
         let calls = remote.calls();
         // Break the cache file: the entry's path becomes a directory, so the
-        // IO job cannot open it and the fallback serves from the remote.
+        // pread fails and the fallback serves from the remote (the queued
+        // fill fails on it too and drops the entry, no retry).
         std::fs::remove_file(dir.path().join(KEY)).unwrap();
         std::fs::create_dir(dir.path().join(KEY)).unwrap();
 
@@ -2057,5 +2412,266 @@ mod tests {
             );
         }
         assert_eq!(reads.object_size, 4 << 20);
+        settle(&cache).await;
+        assert!(
+            cache.get_entry(KEY).is_none(),
+            "the broken entry is dropped"
+        );
+    }
+
+    /// The piece plan, on fixed fills: fills blocks 1, 2 and 21 of a 32-block
+    /// object, everything else counts as present.
+    #[test]
+    fn plan_ranges_slices_fills_preads_present_blocks_and_stitches_mixes() {
+        let remote = Remote::new((32 * BS) as usize);
+        let size = remote.data.len() as u64;
+        let slice = |blocks: Range<u64>| {
+            remote
+                .data
+                .slice((blocks.start * BS) as usize..(blocks.end * BS) as usize)
+        };
+        // Deliberately unsorted: the plan sorts the runs itself.
+        let fills = [
+            (21..22, slice(21..22)),
+            (1..2, slice(1..2)),
+            (2..3, slice(2..3)),
+        ];
+        let ranges = [
+            BS + 10..BS + 100,      // inside run 1..2
+            2 * BS..2 * BS,         // empty
+            BS + 500..2 * BS + 500, // spans the adjacent runs 1..2 and 2..3
+            5 * BS..5 * BS + 10,    // present blocks only
+            10..BS + 10,            // present block 0 then run 1..2
+            2 * BS + 10..22 * BS,   // run 2..3, present 3..21, run 21..22
+        ];
+        let plans = plan_ranges(&ranges, &fills, BS, size);
+        assert_eq!(plans.len(), ranges.len());
+        let expect =
+            |range: &Range<u64>| remote.data.slice(range.start as usize..range.end as usize);
+        let inside_remote = |bytes: &Bytes| {
+            // A copied buffer may sit below the remote's allocation: wrap
+            // instead of panicking, a wrapped offset is simply out of range.
+            let offset = (bytes.as_ptr() as usize).wrapping_sub(remote.data.as_ptr() as usize);
+            offset < remote.data.len()
+        };
+
+        let Plan::Ready(bytes) = &plans[0] else {
+            panic!("inside one run is ready")
+        };
+        assert_eq!(*bytes, expect(&ranges[0]));
+        assert!(inside_remote(bytes), "zero copy out of the run");
+
+        let Plan::Ready(bytes) = &plans[1] else {
+            panic!("empty is ready")
+        };
+        assert!(bytes.is_empty());
+
+        let Plan::Ready(bytes) = &plans[2] else {
+            panic!("two adjacent runs are copied into one buffer")
+        };
+        assert_eq!(*bytes, expect(&ranges[2]));
+        assert!(!inside_remote(bytes), "one copy, no file");
+
+        assert!(
+            matches!(&plans[3], Plan::Disk(range) if *range == ranges[3]),
+            "present blocks only: one pread"
+        );
+
+        let Plan::Stitch { range, pieces } = &plans[4] else {
+            panic!("present then fill is stitched")
+        };
+        assert_eq!(*range, ranges[4]);
+        assert_eq!(pieces.len(), 2);
+        assert!(matches!(&pieces[0], Piece::Disk(r) if *r == (10..BS)));
+        assert!(
+            matches!(&pieces[1], Piece::Fill(b) if *b == remote.data.slice(BS as usize..BS as usize + 10))
+        );
+
+        let Plan::Stitch { range, pieces } = &plans[5] else {
+            panic!("fill, present, fill is stitched")
+        };
+        assert_eq!(*range, ranges[5]);
+        assert_eq!(pieces.len(), 3);
+        assert!(
+            matches!(&pieces[0], Piece::Fill(b) if *b == remote.data.slice(2 * BS as usize + 10..3 * BS as usize))
+        );
+        assert!(matches!(&pieces[1], Piece::Disk(r) if *r == (3 * BS..21 * BS)));
+        assert!(
+            matches!(&pieces[2], Piece::Fill(b) if *b == remote.data.slice(21 * BS as usize..22 * BS as usize))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn straddle_of_present_block_and_unlanded_fill_is_assembled_in_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        // The budget admits the first fill (two blocks) and not the second
+        // (three blocks), so the second read's fill never reaches the file:
+        // had the read pread its bytes back it would have read a hole.
+        let cache = cache_with_fill_budget(dir.path(), 1 << 30, 2 * BS);
+        let remote = Remote::new((8 * BS) as usize);
+        let fetch = remote.fetcher();
+        cache
+            .read_through(KEY, 0..2 * BS, None, &fetch)
+            .await
+            .unwrap();
+        settle(&cache).await;
+        assert_eq!(cache.stats().1, 2 * BS);
+
+        let dropped = metrics::QUERY_DISK_BLOCK_CACHE_FILLS_TOTAL
+            .with_label_values(&["dropped"])
+            .get();
+        let range = BS + 10..5 * BS - 10;
+        let read = cache
+            .read_through(KEY, range.clone(), None, &fetch)
+            .await
+            .unwrap();
+        assert_eq!(read.outcome, Outcome::Partial);
+        assert_eq!(read.remote_bytes, 3 * BS);
+        assert_eq!(
+            read.bytes,
+            remote.data.slice(range.start as usize..range.end as usize)
+        );
+        assert_eq!(cache.pending_fill_bytes(), 0, "nothing was queued");
+        assert!(
+            metrics::QUERY_DISK_BLOCK_CACHE_FILLS_TOTAL
+                .with_label_values(&["dropped"])
+                .get()
+                > dropped
+        );
+        // The file still has a hole where the dropped fill would have gone,
+        // so the bytes above could only have come from memory.
+        let file = std::fs::File::open(dir.path().join(KEY)).unwrap();
+        let hole = crate::cache::file_data::pread_vec(&file, 2 * BS, BS as usize).unwrap();
+        assert!(
+            hole.iter().all(|&b| b == 0),
+            "the dropped fill never landed"
+        );
+        assert_eq!(cache.stats().1, 2 * BS, "dropped blocks are not accounted");
+        // Blocks 2..5 stay absent: the same range fetches them again.
+        let calls = remote.calls();
+        let read = cache
+            .read_through(KEY, range.clone(), None, &fetch)
+            .await
+            .unwrap();
+        assert_eq!(read.outcome, Outcome::Partial);
+        assert_eq!(remote.calls(), calls + 1);
+        assert_eq!(
+            read.bytes,
+            remote.data.slice(range.start as usize..range.end as usize)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn adjacent_fill_runs_on_a_cold_object_are_stitched_without_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // No fill is ever admitted, so no cache file ever exists: a read
+        // that touched the file would fall back and cost a third GET.
+        let cache = cache_with_fill_budget(dir.path(), 1 << 30, 1);
+        let remote = Remote::new((4 * BS) as usize);
+        let fetch = remote.fetcher();
+        // The cold run covers the lowest range (block 0); the second range
+        // runs past it into the missing-run fetch 1..3, so it spans two
+        // adjacent fill runs.
+        let ranges = [0..10, BS - 5..2 * BS + 5];
+        let reads = cache
+            .read_through_many(KEY, &ranges, None, &fetch)
+            .await
+            .unwrap();
+        assert_eq!(reads.outcome, Outcome::Miss);
+        assert_eq!(remote.calls(), 2, "two fills, no fallback");
+        assert_eq!(reads.remote_bytes, 3 * BS);
+        for (range, bytes) in ranges.iter().zip(&reads.bytes) {
+            assert_eq!(
+                *bytes,
+                remote.data.slice(range.start as usize..range.end as usize)
+            );
+        }
+        assert_eq!(cache.pending_fill_bytes(), 0);
+        assert!(
+            !dir.path().join(KEY).exists(),
+            "a dropped fill creates no file"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fill_over_the_queue_budget_is_dropped_and_the_read_still_served() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache_with_fill_budget(dir.path(), 1 << 30, BS / 2);
+        let remote = Remote::new(1 << 20);
+        let fetch = remote.fetcher();
+        // Other tests in this process drop fills too: compare as deltas.
+        let dropped = metrics::QUERY_DISK_BLOCK_CACHE_FILLS_TOTAL
+            .with_label_values(&["dropped"])
+            .get();
+        let dropped_bytes = metrics::QUERY_DISK_BLOCK_CACHE_FILL_BYTES_TOTAL
+            .with_label_values(&["dropped"])
+            .get();
+
+        let read = cache
+            .read_through(KEY, 100..1000, None, &fetch)
+            .await
+            .unwrap();
+        assert_eq!(read.outcome, Outcome::Miss);
+        assert_eq!(read.bytes, remote.data.slice(100..1000));
+        assert_eq!(read.remote_bytes, BS);
+        assert_eq!(
+            cache.pending_fill_bytes(),
+            0,
+            "a dropped fill is never queued"
+        );
+        assert!(
+            metrics::QUERY_DISK_BLOCK_CACHE_FILLS_TOTAL
+                .with_label_values(&["dropped"])
+                .get()
+                >= dropped + 1
+        );
+        assert!(
+            metrics::QUERY_DISK_BLOCK_CACHE_FILL_BYTES_TOTAL
+                .with_label_values(&["dropped"])
+                .get()
+                >= dropped_bytes + BS
+        );
+        // The entry exists but owns nothing: no bit, no bytes, no file.
+        let entry = cache.get_entry(KEY).expect("the cold entry is indexed");
+        assert!(!is_set(&entry.state.lock().bits, 0));
+        assert_eq!(cache.stats(), (1 << 30, 0, 1));
+        assert!(!dir.path().join(KEY).exists());
+        // So the same range is a miss again.
+        let read = cache
+            .read_through(KEY, 100..1000, None, &fetch)
+            .await
+            .unwrap();
+        assert_eq!(read.outcome, Outcome::Miss);
+        assert_eq!(read.bytes, remote.data.slice(100..1000));
+        assert_eq!(remote.calls(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fill_racing_a_remove_leaves_no_bit_and_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache(dir.path(), 1 << 30);
+        let remote = Remote::new(1 << 20);
+        let fetch = remote.fetcher();
+        // Several rounds to land on different interleavings: the remove may
+        // precede the writer's eviction check (fill skipped), split its
+        // write from its accounting (bit refused, orphan unlinked) or follow
+        // it (plain remove).
+        for round in 0..16 {
+            let key = format!("files/org/logs/stream/2026/10/08/11/race-{round}.vix");
+            cache.read_through(&key, 0..10, None, &fetch).await.unwrap();
+            let entry = cache.get_entry(&key).expect("indexed by the read");
+            cache.remove(&key);
+            settle(&cache).await;
+            assert!(cache.get_entry(&key).is_none());
+            let state = entry.state.lock();
+            assert!(
+                !is_set(&state.bits, 0),
+                "round {round}: no bit after remove"
+            );
+            assert_eq!(state.present_bytes, 0);
+            drop(state);
+            wait_gone(&dir.path().join(&key)).await;
+        }
+        assert_eq!(cache.stats(), (1 << 30, 0, 0));
     }
 }

@@ -883,7 +883,18 @@ mod tests {
             64 * 1024,
             "time_lru",
             1,
+            256 << 20,
         );
+        // Fills are write-behind: a block is servable once its write landed.
+        async fn settle(blocks: &file_data::block::BlockCache) {
+            for _ in 0..1000 {
+                if blocks.pending_fill_bytes() == 0 {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            panic!("fill queue did not drain");
+        }
 
         // Cold: a 10-byte read fetches one aligned block and reports remote.
         let read = get_range_classified_with(&account, &path, 100..110, None, Some(&blocks))
@@ -893,6 +904,7 @@ mod tests {
         assert_eq!(read.bytes, data.slice(100..110));
         assert_eq!(read.remote_physical_bytes, 64 * 1024);
         assert_eq!(blocks.object_size(path.as_ref()), Some(300_000));
+        settle(&blocks).await;
 
         // Warm: same block, no remote bytes, classified as the block tier.
         let read = get_range_classified_with(&account, &path, 0..65_536, None, Some(&blocks))
@@ -912,6 +924,7 @@ mod tests {
         assert_eq!(bytes[0], data.slice(262_144..262_154));
         assert_eq!(bytes[1], data.slice(299_990..300_000));
         assert_eq!(bytes[2], data.slice(0..4));
+        settle(&blocks).await;
         assert_eq!(blocks.stats().1, 65_536 + (300_000 - 262_144));
 
         // Suffix read through get_opts resolves against the learned size.

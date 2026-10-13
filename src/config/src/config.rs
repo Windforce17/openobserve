@@ -3236,6 +3236,17 @@ pub struct DiskCache {
     /// 0 = 25% of it.
     #[env_config(name = "ZO_DISK_CACHE_BLOCK_MAX_SIZE", default = 0)]
     pub block_max_size: usize,
+    /// MB of fetched blocks allowed to wait for the fill writers. Fills are
+    /// write-behind: a read returns once its bytes are in hand and a small
+    /// writer pool `pwrite`s the fetched runs later; a fill that would push
+    /// the queue past this budget is dropped (its blocks stay absent, a
+    /// later reader fetches them again) instead of stalling the read. On
+    /// prod (`.215`, 2026-10-12) write-through pinned the gp3 data volume
+    /// at its 4,096 IOPS (~800 MB/s of fills, util 86-90%) during a cold
+    /// 7-day point lookup, and the hit path's local preads behind those
+    /// fills took 105-120 ms.
+    #[env_config(name = "ZO_DISK_CACHE_BLOCK_FILL_QUEUE_SIZE", default = 256)]
+    pub block_fill_queue_size: usize,
 }
 
 #[derive(Serialize, EnvConfig, Default)]
@@ -4632,8 +4643,15 @@ fn check_disk_cache_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
             ));
         }
         cfg.disk_cache.max_size -= cfg.disk_cache.block_max_size;
+        if cfg.disk_cache.block_fill_queue_size == 0 {
+            return Err(anyhow::anyhow!(
+                "ZO_DISK_CACHE_BLOCK_FILL_QUEUE_SIZE (MB) must be greater than 0"
+            ));
+        }
+        cfg.disk_cache.block_fill_queue_size *= 1024 * 1024;
     } else {
         cfg.disk_cache.block_max_size = 0;
+        cfg.disk_cache.block_fill_queue_size = 0;
     }
 
     if cfg.disk_cache.result_max_size == 0 {
@@ -5022,6 +5040,11 @@ mod tests {
             "derived from the remainder"
         );
         assert_eq!(cfg.disk_cache.release_size, 768 * mib / 10 / 4);
+        assert_eq!(
+            cfg.disk_cache.block_fill_queue_size,
+            256 * mib,
+            "fill queue budget in bytes, not split per bucket"
+        );
 
         let mut cfg = base();
         cfg.disk_cache.block_max_size = 100; // MB, explicit
@@ -5035,6 +5058,7 @@ mod tests {
         check_disk_cache_config(&mut cfg).unwrap();
         assert_eq!(cfg.disk_cache.block_max_size, 0, "off: no budget");
         assert_eq!(cfg.disk_cache.max_size, 1024 * mib / 4);
+        assert_eq!(cfg.disk_cache.block_fill_queue_size, 0, "off: no queue");
 
         let mut cfg = base();
         cfg.disk_cache.block_size = 3 * 4096;
@@ -5045,6 +5069,14 @@ mod tests {
         cfg.disk_cache.block_max_size = 1024; // the whole cache
         let err = check_disk_cache_config(&mut cfg).unwrap_err();
         assert!(err.to_string().contains("ZO_DISK_CACHE_BLOCK_MAX_SIZE"));
+
+        let mut cfg = base();
+        cfg.disk_cache.block_fill_queue_size = 0;
+        let err = check_disk_cache_config(&mut cfg).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("ZO_DISK_CACHE_BLOCK_FILL_QUEUE_SIZE")
+        );
     }
 
     /// M11 launch defaults (OWNER 2026-08-18: "cache_latest_files default

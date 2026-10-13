@@ -493,6 +493,49 @@ pub static QUERY_DISK_BLOCK_CACHE_BYTES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|
     )
     .expect("Metric created")
 });
+/// Fetched bytes waiting for the block cache's fill writers (write-behind
+/// queue); bounded by `ZO_DISK_CACHE_BLOCK_FILL_QUEUE_SIZE`.
+pub static QUERY_DISK_BLOCK_CACHE_FILL_QUEUE_BYTES: Lazy<IntGauge> = Lazy::new(|| {
+    IntGauge::with_opts(
+        Opts::new(
+            "query_disk_block_cache_fill_queue_bytes",
+            "Querier disk block cache fetched bytes queued for the fill writers",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+    )
+    .expect("Metric created")
+});
+/// `outcome`: `written` = the fill landed and its blocks are present,
+/// `dropped` = the fill queue was over budget (blocks stay absent),
+/// `failed` = the local write failed (entry dropped), `skipped` = the entry
+/// was evicted before the write.
+pub static QUERY_DISK_BLOCK_CACHE_FILLS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "query_disk_block_cache_fills_total",
+            "Block cache fills (fetched block runs) by outcome",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &["outcome"],
+    )
+    .expect("Metric created")
+});
+/// Bytes of the fills counted by [`QUERY_DISK_BLOCK_CACHE_FILLS_TOTAL`],
+/// same `outcome` labels.
+pub static QUERY_DISK_BLOCK_CACHE_FILL_BYTES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "query_disk_block_cache_fill_bytes_total",
+            "Block cache fill bytes by outcome",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &["outcome"],
+    )
+    .expect("Metric created")
+});
 
 // querier disk result cache stats
 pub static QUERY_DISK_RESULT_CACHE_USED_BYTES: Lazy<IntGaugeVec> = Lazy::new(|| {
@@ -2392,6 +2435,15 @@ fn register_metrics(registry: &Registry) {
         .expect("Metric registered");
     registry
         .register(Box::new(QUERY_DISK_BLOCK_CACHE_BYTES_TOTAL.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(QUERY_DISK_BLOCK_CACHE_FILL_QUEUE_BYTES.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(QUERY_DISK_BLOCK_CACHE_FILLS_TOTAL.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(QUERY_DISK_BLOCK_CACHE_FILL_BYTES_TOTAL.clone()))
         .expect("Metric registered");
     registry
         .register(Box::new(QUERY_DISK_RESULT_CACHE_USED_BYTES.clone()))
