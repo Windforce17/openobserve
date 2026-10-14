@@ -27,9 +27,9 @@ use bytes::Bytes;
 use crate::container::{
     BLOB_TAG_BLOOM, BLOB_TAG_DICT, BLOB_TAG_DICT_BLOCKS, BLOB_TAG_DOCS, BLOB_TAG_PLIST,
     BLOB_TAG_TERMS, BLOB_TYPE_BLOOM, BLOB_TYPE_DICT, BLOB_TYPE_DICT_BLOCKS, BLOB_TYPE_DOCS,
-    BLOB_TYPE_PLIST, BLOB_TYPE_TERMS, BlobHandle, FieldEntry, FieldTypeFlags, PROP_FIELDS,
-    PROP_PARTIAL_FIELDS, PROP_ROW_ORDER, PROP_TOKENIZER, PROP_ZONE_MAP, build_container,
-    parse_container,
+    BLOB_TYPE_PLIST, BLOB_TYPE_TERMS, BlobHandle, BlobPart, FieldEntry, FieldTypeFlags,
+    PROP_FIELDS, PROP_PARTIAL_FIELDS, PROP_ROW_ORDER, PROP_TOKENIZER, PROP_ZONE_MAP,
+    build_container_parts, parse_container,
 };
 
 /// Re-pack ONE object's container with its properties transformed by
@@ -53,26 +53,38 @@ pub fn repack_properties(
         Some(BlobHandle::Ranged(_)) => unreachable!("parsed from memory"),
         None => None,
     };
-    let mut blobs: Vec<(&'static str, &'static str, Vec<u8>)> = Vec::new();
+    let mut blobs: Vec<(&'static str, &'static str, BlobPart)> = Vec::new();
     if let Some(docs) = blob_bytes(container.docs) {
-        blobs.push((BLOB_TYPE_DOCS, BLOB_TAG_DOCS, docs));
+        blobs.push((BLOB_TYPE_DOCS, BLOB_TAG_DOCS, BlobPart::Mem(docs)));
     }
     if let Some(terms) = blob_bytes(container.terms) {
-        blobs.push((BLOB_TYPE_TERMS, BLOB_TAG_TERMS, terms));
+        blobs.push((BLOB_TYPE_TERMS, BLOB_TAG_TERMS, BlobPart::Mem(terms)));
     }
     if let Some(plist) = blob_bytes(container.plist) {
-        blobs.push((BLOB_TYPE_PLIST, BLOB_TAG_PLIST, plist));
+        blobs.push((BLOB_TYPE_PLIST, BLOB_TAG_PLIST, BlobPart::Mem(plist)));
     }
     if let Some(blocks) = blob_bytes(container.dict_blocks) {
-        blobs.push((BLOB_TYPE_DICT_BLOCKS, BLOB_TAG_DICT_BLOCKS, blocks));
+        blobs.push((
+            BLOB_TYPE_DICT_BLOCKS,
+            BLOB_TAG_DICT_BLOCKS,
+            BlobPart::Mem(blocks),
+        ));
     }
     if let Some(dict) = blob_bytes(container.dict) {
-        blobs.push((BLOB_TYPE_DICT, BLOB_TAG_DICT, dict));
+        // the stored bytes are copied verbatim, so a zstd-stored block index
+        // (layout gen 2) keeps its codec declaration
+        let part = match container.dict_codec {
+            Some(puffin::CompressionCodec::Zstd) => BlobPart::ZstdMem(dict),
+            Some(other) => anyhow::bail!("unsupported dict codec {other:?}"),
+            None => BlobPart::Mem(dict),
+        };
+        blobs.push((BLOB_TYPE_DICT, BLOB_TAG_DICT, part));
     }
     if let Some(bloom) = blob_bytes(container.bloom) {
-        blobs.push((BLOB_TYPE_BLOOM, BLOB_TAG_BLOOM, bloom));
+        blobs.push((BLOB_TYPE_BLOOM, BLOB_TAG_BLOOM, BlobPart::Mem(bloom)));
     }
-    Ok(build_container(properties, blobs)?)
+    // the re-pack is a property edit: the footer itself is written plain
+    Ok(build_container_parts(properties, blobs, false)?)
 }
 
 /// Re-pack ONE object with the named property removed — the generic

@@ -112,13 +112,13 @@ fn get_org_storage_key(org_id: &str) -> String {
 }
 
 pub async fn list(account: &str, prefix: &str) -> Result<Vec<String>> {
-    let files = MULTI_ACCOUNTS
+    // never panic here: callers run inside long-lived jobs (compactor bloom
+    // builder, GC) and handle an `Err` by skipping the step for this pass
+    MULTI_ACCOUNTS
         .list(account, Some(&prefix.into()))
         .map_ok(|meta| meta.location.to_string())
         .try_collect::<Vec<String>>()
         .await
-        .expect("Error listing files");
-    Ok(files)
 }
 
 /// List the immediate child "directories" (common prefixes) under `prefix`

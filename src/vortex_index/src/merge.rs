@@ -398,6 +398,7 @@ pub(crate) fn merge_indexes<MapState, SetState>(
     doc_maps: &[DocIdMap],
     out_field_ids: &HashMap<String, u16, MapState>,
     bloom_field_names: &[String],
+    auto_bloom: &crate::bloom::AutoBloomCandidates,
     composite_pairs: &[(u16, String)],
     bloom_only_fids: &HashSet<u16, SetState>,
     total_rows: u64,
@@ -486,6 +487,7 @@ where
             doc_maps,
             out_field_ids,
             bloom_field_names,
+            auto_bloom,
             composite_pairs,
             bloom_only_fids,
             total_rows,
@@ -576,6 +578,7 @@ where
                             doc_maps,
                             out_field_ids,
                             bloom_field_names,
+                            auto_bloom,
                             composite_pairs,
                             bloom_only_fids,
                             total_rows,
@@ -619,6 +622,7 @@ where
             doc_maps,
             out_field_ids,
             bloom_field_names,
+            auto_bloom,
             composite_pairs,
             bloom_only_fids,
             total_rows,
@@ -838,6 +842,7 @@ fn merge_term_range<MapState: BuildHasher, SetState: BuildHasher>(
     doc_maps: &[DocIdMap],
     out_field_ids: &HashMap<String, u16, MapState>,
     bloom_field_names: &[String],
+    auto_bloom: &crate::bloom::AutoBloomCandidates,
     composite_pairs: &[(u16, String)],
     bloom_only_fids: &HashSet<u16, SetState>,
     total_rows: u64,
@@ -856,14 +861,46 @@ fn merge_term_range<MapState: BuildHasher, SetState: BuildHasher>(
     // field name everywhere), backstopped by the strictly-ascending check
     // in RemappedTermStream::advance.
     let mut bloom_acc = crate::bloom::BloomHashAcc::from_pairs(bloom_pairs);
-    if !composite_pairs.is_empty() {
-        // #48: same reserved composite section as the writer build. The
-        // caller computes the ELIGIBLE pairs (value-lookup-capable term
-        // fields only — no fts, no merge-demoted): tokens are not raw
-        // values and demoted fields carry incomplete value terms, so
-        // claiming coverage for either would wrongly drop files on
-        // equality probes.
-        bloom_acc.enable_composite(composite_pairs.iter().cloned());
+    // W1: AUTO additive candidates ride the same walk; the fold over the
+    // ranges' accumulators sees every output key of a field exactly once,
+    // so the selection at finish works on exact distinct counts.
+    if !auto_bloom.is_empty() {
+        bloom_acc.track_auto_candidates(
+            auto_bloom
+                .names
+                .iter()
+                .filter_map(|n| out_field_ids.get(n).map(|id| (*id, n.clone()))),
+            &auto_bloom.policy,
+            total_rows,
+        );
+    }
+    // #48: same reserved composite section as the writer build. The caller
+    // computes the ELIGIBLE pairs (value-lookup-capable term fields only —
+    // no fts, no merge-demoted): tokens are not raw values and demoted
+    // fields carry incomplete value terms, so claiming coverage for either
+    // would wrongly drop files on equality probes.
+    //
+    // #52 bloom-only OUTPUT fields are tracked UNCONDITIONALLY: the composite
+    // is their only index, and a term-capable input's values for them reach
+    // it solely through this walk (`observe_bloom_only_key` below; the
+    // coverage scan skips dictionary-covered inputs). With the composite
+    // option off `composite_pairs` is empty, and before this the walk
+    // silently discarded those values while the output still seeded the
+    // field's guard keys — a composite claiming coverage it did not have,
+    // i.e. wrong drops on every needle the legacy inputs held
+    // (DESIGN-COLD-MISS.md, decisions 2026-10-13).
+    let composite_tracking: Vec<(u16, String)> = composite_pairs
+        .iter()
+        .cloned()
+        .chain(
+            out_field_ids
+                .iter()
+                .filter(|(_, id)| bloom_only_fids.contains(*id))
+                .map(|(name, id)| (*id, name.clone())),
+        )
+        .collect();
+    if !composite_tracking.is_empty() {
+        bloom_acc.enable_composite(composite_tracking);
     }
     let mut sink = crate::writer::TermSink::new(postings_chunk_bytes)
         .with_bloom(bloom_acc)

@@ -2599,12 +2599,9 @@ async fn sidecar_only_heal(
     cancel: &MergeCancellation,
     start: std::time::Instant,
 ) -> Result<bool, anyhow::Error> {
-    use crate::service::vix::core_writer::{
-        SidecarHealOutcome, rebuild_core_file_sidecar_admitted_with_cancellation,
-    };
+    use crate::service::vix::core_writer::rebuild_core_file_sidecar_admitted_with_cancellation;
 
     cancel.check("sidecar heal planning")?;
-    let cfg = get_config();
 
     let handle = tokio::runtime::Handle::current();
     let source: Arc<dyn vortex_index::VixRangeSource> = Arc::new(HealProbeRangeSource {
@@ -2650,7 +2647,49 @@ async fn sidecar_only_heal(
     };
     let outcome = heal_join??;
     cancel.check("sidecar heal upload")?;
+    let published = publish_sidecar_generation(
+        thread_id,
+        org_id,
+        stream_type,
+        stream_name,
+        file,
+        outcome,
+        compliance,
+        "healed",
+    )
+    .await?;
+    if published {
+        log::info!(
+            "[COMPACTOR:WORKER:{thread_id}] {org_id}/{stream_type}/{stream_name}: sidecar-only \
+             heal of {} took {} ms",
+            file.key,
+            start.elapsed().as_millis(),
+        );
+    }
+    Ok(published)
+}
 
+/// Publish one rebuilt sidecar as a NEW immutable index generation of `file`
+/// (shared by the sidecar-only heal and the layout repack): stage a
+/// generation ticket, create-only upload under the generation's key, CAS the
+/// file_list row to it (re-pending `bloom_ver = 0`), invalidate this node's
+/// caches and broadcast. `Ok(false)` = the outcome needs a docs rewrite (the
+/// caller takes the whole-file path); `Ok(true)` otherwise — including a
+/// lost CAS, whose unpublished object is discarded.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn publish_sidecar_generation(
+    thread_id: usize,
+    org_id: &str,
+    stream_type: StreamType,
+    stream_name: &str,
+    file: &FileKey,
+    outcome: crate::service::vix::core_writer::SidecarHealOutcome,
+    compliance: bool,
+    verb: &str,
+) -> Result<bool, anyhow::Error> {
+    use crate::service::vix::core_writer::SidecarHealOutcome;
+
+    let cfg = get_config();
     // Candidate cleanup and previous-generation retirement both wait beyond
     // the longest configured reader lifetime; the ordinary deletion delay
     // adds the final scheduling margin.
@@ -2669,8 +2708,8 @@ async fn sidecar_only_heal(
         SidecarHealOutcome::NeedsDocsRewrite(reason) => {
             log::info!(
                 "[COMPACTOR:WORKER:{thread_id}] {org_id}/{stream_type}/{stream_name}: \
-                 sidecar-only heal of {} needs a docs rewrite ({reason}); taking the whole-file \
-                 rebuild",
+                 sidecar-only rebuild of {} needs a docs rewrite ({reason}); taking the \
+                 whole-file rebuild",
                 file.key,
             );
             return Ok(false);
@@ -2757,14 +2796,14 @@ async fn sidecar_only_heal(
             && let Err(delete_error) = storage::delete(&file.account, sidecar_key).await
         {
             log::warn!(
-                "[COMPACTOR:WORKER:{thread_id}] sidecar heal CAS loser {} could not be deleted \
-                 immediately; its staged cleanup intent remains armed: {delete_error}",
+                "[COMPACTOR:WORKER:{thread_id}] sidecar rebuild CAS loser {} could not be \
+                 deleted immediately; its staged cleanup intent remains armed: {delete_error}",
                 sidecar_key,
             );
         }
         log::info!(
             "[COMPACTOR:WORKER:{thread_id}] {org_id}/{stream_type}/{stream_name}: \
-             sidecar-only heal CAS lost for {} at generation {}; discarded unpublished \
+             sidecar-only rebuild CAS lost for {} at generation {}; discarded unpublished \
              generation {new_generation}",
             file.key,
             file.meta.index_generation,
@@ -2798,19 +2837,18 @@ async fn sidecar_only_heal(
 
     if let Err(e) = db::file_list::broadcast::send(std::slice::from_ref(&updated)).await {
         log::error!(
-            "[COMPACTOR:WORKER:{thread_id}] sidecar heal broadcast for {} failed: {e}",
+            "[COMPACTOR:WORKER:{thread_id}] sidecar rebuild broadcast for {} failed: {e}",
             file.key,
         );
     }
 
     log::info!(
-        "[COMPACTOR:WORKER:{thread_id}] {org_id}/{stream_type}/{stream_name}: healed {} \
+        "[COMPACTOR:WORKER:{thread_id}] {org_id}/{stream_type}/{stream_name}: {verb} {} \
          sidecar-only: data key unchanged, index_size {} -> {new_index_size}, generation {} -> \
-         {new_generation}, took {} ms",
+         {new_generation}",
         file.key,
         file.meta.index_size,
         file.meta.index_generation,
-        start.elapsed().as_millis(),
     );
     Ok(true)
 }

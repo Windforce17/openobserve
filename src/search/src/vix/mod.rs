@@ -62,6 +62,7 @@ mod dispatch_bench;
 #[cfg(test)]
 mod query_regressions;
 
+mod layout_memory;
 mod partition;
 mod pruner;
 pub mod reader_cache;
@@ -1332,6 +1333,9 @@ enum VixReaderInput {
         index: Option<Arc<dyn vortex_index::VixRangeSource>>,
         cache_key: Option<reader_cache::ReaderCacheKey>,
         cached: Option<reader_cache::LockedReader>,
+        /// `(stream, hour)` of the file, for the sidecar-first layout memory
+        /// ([`layout_memory`]); `None` opens with the process-wide mode.
+        hour: Option<String>,
     },
 }
 
@@ -1349,13 +1353,28 @@ impl VixReaderInput {
                 index,
                 cache_key,
                 cached,
+                hour,
             } => {
                 if let Some(locked) = cached
                     && let Some(lease) = locked.upgrade()?
                 {
                     return Ok(lease);
                 }
-                let reader = VixReader::open_ranged_with_index(source, index)?;
+                // S3: an hour remembered as pre-property opens the paired
+                // way (both tails in one round trip) instead of paying the
+                // data tail as a serial second round trip
+                let sidecar_first = vortex_index::sidecar_first_open()
+                    && !hour
+                        .as_deref()
+                        .is_some_and(layout_memory::hour_is_old_layout);
+                let has_index = index.is_some();
+                let reader =
+                    VixReader::open_ranged_with_index_sidecar_first(source, index, sidecar_first)?;
+                if let Some(hour) = hour
+                    && has_index
+                {
+                    layout_memory::observe(hour, reader.layout_gen() == 0);
+                }
                 match cache_key {
                     Some(key) => reader_cache::GLOBAL_CACHE.put(key, reader),
                     None => reader_cache::ReaderLease::private(reader),
@@ -1383,7 +1402,7 @@ impl VixDocsInput {
     }
 }
 
-pub use vortex_index::{set_tail_fetch_size, set_walk_verify_min_bytes};
+pub use vortex_index::{set_sidecar_first_open, set_tail_fetch_size, set_walk_verify_min_bytes};
 
 /// Warm one core `.vix` file's index metadata into the caches (#39 GAP 2):
 /// opens the ranged reader — which eager-fetches the footer tail through
@@ -1445,6 +1464,7 @@ pub async fn warm_file(
         index,
         cache_key: Some(reader_key),
         cached: None,
+        hour: layout_memory::hour_bucket(key),
     };
     // Best-effort background work: a free slot or nothing.
     let Some(permit) = source::try_acquire_evaluation() else {
@@ -1685,6 +1705,7 @@ async fn search_vix_index(
                     // sidecar anyway.
                     cache_key: (!data_only_all_aggregate).then(|| reader_key.clone()),
                     cached,
+                    hour: layout_memory::hour_bucket(&vix_file_name),
                 })
         }
         VixReadMode::Cached => None,
@@ -2457,7 +2478,11 @@ fn evaluate_vix_index(
                 bitmap
             }
         };
-        if !file_in_range {
+        // DESIGN-COLD-MISS §2 S3: an index miss needs no window clamp — the
+        // clamp is a docs `_timestamp` read on files that straddle the
+        // window (a data-object GET on a cold reader), and AND with an empty
+        // bitmap is the empty bitmap.
+        if !file_in_range && bitmap.count_set_bits() > 0 {
             bitmap = &bitmap & &reader.timestamp_range(start_time, end_time)?;
         }
         Ok(bitmap)

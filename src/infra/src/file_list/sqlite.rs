@@ -625,6 +625,51 @@ SELECT min_ts, max_ts, records, original_size, compressed_size, index_size, inde
         Ok(updated)
     }
 
+    async fn update_bloom_ver_from(
+        &self,
+        org_id: &str,
+        stream_type: StreamType,
+        stream_name: &str,
+        date: &str,
+        expected: &[(i64, i64, i64)],
+        from: i64,
+        to: i64,
+    ) -> Result<u64> {
+        if expected.is_empty() {
+            return Ok(0);
+        }
+        let stream_key = format!("{org_id}/{stream_type}/{stream_name}");
+        let client = CLIENT_RW.clone();
+        let client = client.lock().await;
+        let mut updated = 0;
+        for chunk in expected.chunks(300) {
+            let mut query = QueryBuilder::<Sqlite>::new("UPDATE file_list SET bloom_ver = ");
+            query
+                .push_bind(to)
+                .push(" WHERE stream = ")
+                .push_bind(stream_key.clone())
+                .push(" AND date = ")
+                .push_bind(date.to_string())
+                .push(" AND bloom_ver = ")
+                .push_bind(from)
+                .push(" AND (");
+            let mut clauses = query.separated(" OR ");
+            for (id, index_generation, index_size) in chunk {
+                clauses
+                    .push("(id = ")
+                    .push_bind_unseparated(*id)
+                    .push_unseparated(" AND index_generation = ")
+                    .push_bind_unseparated(*index_generation)
+                    .push_unseparated(" AND index_size = ")
+                    .push_bind_unseparated(*index_size)
+                    .push_unseparated(")");
+            }
+            clauses.push_unseparated(")");
+            updated += query.build().execute(&*client).await?.rows_affected();
+        }
+        Ok(updated)
+    }
+
     async fn bloom_ver_referenced(
         &self,
         org_id: &str,
@@ -772,19 +817,19 @@ SELECT id, account, stream, date, file, min_ts, max_ts, records, original_size, 
         stream_type: StreamType,
         stream_name: &str,
         date: &str,
-    ) -> Result<Vec<FileKey>> {
+    ) -> Result<Vec<super::FileRecord>> {
         let stream_key = format!("{org_id}/{stream_type}/{stream_name}");
 
         let pool = CLIENT_RO.clone();
         let sql = r#"
-SELECT id, account, stream, date, file, records, index_size, index_generation, compressed_size FROM file_list WHERE stream = $1 AND date = $2 AND index_size > 0 AND bloom_ver = 0;
+SELECT id, account, stream, date, file, records, index_size, index_generation, compressed_size, bloom_ver, updated_at FROM file_list WHERE stream = $1 AND date = $2 AND index_size > 0;
                 "#;
         let ret = sqlx::query_as::<_, super::FileRecord>(sql)
             .bind(stream_key)
             .bind(date)
             .fetch_all(&pool)
             .await;
-        Ok(ret?.iter().map(|r| r.into()).collect())
+        Ok(ret?)
     }
 
     async fn query_bloom_pending_buckets(

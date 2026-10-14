@@ -39,7 +39,10 @@
 
 mod file_probe;
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use config::{
     VixBloomCompositeScope,
@@ -67,20 +70,33 @@ struct Predicate {
     /// when this fallback is enabled. Composite guards keep missing or
     /// mixed-era coverage fail-open.
     composite_fallback: bool,
+    /// Whether the pre-B3 rule would have admitted this field: an explicit
+    /// stream `bloom_filter_fields` entry or composite coverage. A query with
+    /// no such predicate reaches the pruner only through structural
+    /// admission (DESIGN-COLD-MISS §4 B3), whose `.bf` stage is bounded by
+    /// [`structural_bf_stage_allowed`].
+    legacy_admitted: bool,
 }
 
-/// Bytes pulled from the tail of a `.bf` on footer-cache miss. Big
-/// enough to cover the footer payload for hour buckets up to ~150 indexed
-/// (file, field) pairs (footer ≈ 24 B per file × few fields + per-field
-/// header ≈ 7.5 KB at the high end). When the actual footer overflows
-/// this probe, the group falls back to "keep all".
-const BLOOM_SUFFIX_PROBE_BYTES: u64 = 16 * 1024;
+/// Bytes pulled from the tail of a `.bf` on footer-cache miss. A v2 footer
+/// (DESIGN-COLD-MISS §4 B1) carries the hour chunk's file table, column
+/// table, presence bitmaps and per-section member lists, zstd-compressed:
+/// 64 KiB covers a 256-file chunk with tens of AUTO sections. When the
+/// footer still overflows the probe, [`footer_shortfall`] issues one exact
+/// second read.
+const BLOOM_SUFFIX_PROBE_BYTES: u64 = 64 * 1024;
 
 /// Outcome of running one (date, bloom_ver) bucket. The `Ok` variant carries
 /// one tuple per resolvable `(file_idx, pred_idx, value_idx)`; missing
 /// entries imply "no info" for that target and are handled by the caller.
+/// `absent` lists the `(file_idx, pred_idx)` pairs decided by PRESENCE (a
+/// v2 footer proving the file has no column for the predicate's field) —
+/// their tuples are all `false`, this set only tells the counters why.
 enum GroupResult {
-    Ok(Vec<(usize, usize, usize, bool)>),
+    Ok {
+        outcomes: Vec<(usize, usize, usize, bool)>,
+        absent: Vec<(usize, usize)>,
+    },
     Err(String, FetchError),
 }
 
@@ -111,11 +127,14 @@ fn bloom_prefetch_concurrency() -> usize {
 /// kept (no bloom info). If no condition is bloom-decidable, `files` is
 /// returned unchanged without touching any `.bf`.
 ///
-/// Additive stream bloom fields always probe their per-field sections and
-/// may fall back to the composite when `composite_scope` allows them. In a
-/// selective scope, `auto_id_scope` additionally admits semantic ID fields
-/// not present in `auto_id_never`. Broad [`VixBloomCompositeScope::All`]
-/// remains unrestricted.
+/// Admission is structural (DESIGN-COLD-MISS §4 B3): every `=` / positive
+/// `IN` / same-field `OR` predicate is decidable, and each file answers from
+/// its per-field section, its presence bits or — when `composite_scope` /
+/// `auto_id_scope` / `auto_id_never` allow the field — the composite
+/// section. Those three knobs govern only composite coverage. Queries that
+/// only the structural rule admits run their `.bf` stage against a CHUNKED
+/// `.bf` set only ([`structural_bf_stage_allowed`]); their per-file probes
+/// always run.
 ///
 /// `trace_id` is threaded through purely for logging.
 #[allow(clippy::too_many_arguments)]
@@ -166,9 +185,12 @@ pub async fn prune(
             file_probe::probe_files(trace_id, without_bloom, predicates, concurrency).await;
         log::info!(
             "[trace_id {trace_id}] search->bloom: stream {org_id}/{stream_type}/{stream_name}, \
-             per-file blooms: probed={without_bloom_total}, dropped={}, kept={} (hit={}, \
-             no_info={}, no_blob={}, no_sidecar={}, failed={}, timed_out={}), took: {} ms",
+             per-file blooms: probed={without_bloom_total}, dropped={} (bloom={}, absent={}), \
+             kept={} (hit={}, no_info={}, no_blob={}, no_sidecar={}, failed={}, timed_out={}), \
+             took: {} ms",
+            outcome.dropped + outcome.dropped_absent,
             outcome.dropped,
+            outcome.dropped_absent,
             outcome.kept.len(),
             outcome.hit,
             outcome.no_info,
@@ -214,6 +236,29 @@ pub async fn prune(
         };
         date_for[i] = Some(date.clone());
         groups.entry((date, f.meta.bloom_ver)).or_default().push(i);
+    }
+    // B3 bound: a query that only structural admission brought here (no
+    // explicit bloom field, no composite coverage) pays the `.bf` stage only
+    // where that stage is cheap — a chunked set. On the one-group-per-file
+    // set the old assembler left behind, every footer is one GET for a
+    // field that has no section there, so the files are kept unprobed.
+    if !predicates.iter().any(|p| p.legacy_admitted)
+        && !structural_bf_stage_allowed(
+            groups.len(),
+            with_bloom.len(),
+            config::get_config().limit.bloom_structural_min_group_files,
+        )
+    {
+        log::info!(
+            "[trace_id {trace_id}] search->bloom: stream {org_id}/{stream_type}/{stream_name}, \
+             structural-only predicates over a fragmented `.bf` set ({} groups for {} files): \
+             skipping the `.bf` stage, keeping all",
+            groups.len(),
+            with_bloom.len()
+        );
+        let mut kept = kept_without_bloom;
+        kept.extend(with_bloom);
+        return kept;
     }
 
     // 3. Plan per-group work. With the transposed layout the fetch unit is one block-row per
@@ -265,9 +310,11 @@ pub async fn prune(
     // 5. Fold per-group outcomes into a per-file "did every predicate match?" table. Default = keep
     //    (no info = conservative).
     let mut per_file_match: HashMap<usize, Vec<Vec<bool>>> = HashMap::new();
+    // (file_idx, pred_idx) pairs a v2 footer decided by presence (B2)
+    let mut absent_pairs: HashSet<(usize, usize)> = HashSet::new();
     for (_, result) in &results {
         match result {
-            GroupResult::Ok(outcomes) => {
+            GroupResult::Ok { outcomes, absent } => {
                 for (file_idx, pred_idx, value_idx, hit) in outcomes {
                     let entry = per_file_match.entry(*file_idx).or_insert_with(|| {
                         predicates
@@ -277,6 +324,7 @@ pub async fn prune(
                     });
                     entry[*pred_idx][*value_idx] = *hit;
                 }
+                absent_pairs.extend(absent.iter().copied());
             }
             GroupResult::Err(path, e) => {
                 log::warn!(
@@ -293,7 +341,7 @@ pub async fn prune(
     // any of its values, we treat that predicate as "unknown" → keep file.
     let mut has_info: HashMap<usize, Vec<bool>> = HashMap::new();
     for (_, result) in &results {
-        if let GroupResult::Ok(outcomes) = result {
+        if let GroupResult::Ok { outcomes, .. } = result {
             for (file_idx, pred_idx, ..) in outcomes {
                 let entry = has_info
                     .entry(*file_idx)
@@ -306,7 +354,8 @@ pub async fn prune(
     let mut kept = kept_without_bloom;
     let mut kept_no_info = 0usize;
     let mut kept_predicate_hit = 0usize;
-    let mut dropped = 0usize;
+    let mut dropped_bloom = 0usize;
+    let mut dropped_absent = 0usize;
     let mut kept_unparseable_key = 0usize;
     let mut kept_bucket_failed = 0usize;
     for (idx, f) in with_bloom.into_iter().enumerate() {
@@ -345,8 +394,14 @@ pub async fn prune(
                 kept_predicate_hit += 1;
             }
             kept.push(f);
+        } else if predicates
+            .iter()
+            .enumerate()
+            .any(|(pi, _)| absent_pairs.contains(&(idx, pi)))
+        {
+            dropped_absent += 1;
         } else {
-            dropped += 1;
+            dropped_bloom += 1;
         }
     }
     log::info!(
@@ -354,9 +409,10 @@ pub async fn prune(
          groups={total_groups}, input={total_input}, kept={} \
          (predicate_hit={kept_predicate_hit}, no_info={kept_no_info}, \
          bucket_failed={kept_bucket_failed}, unparseable_key={kept_unparseable_key}, \
-         no_bloom={}), dropped={dropped}",
+         no_bloom={}), dropped={} (bloom={dropped_bloom}, absent={dropped_absent})",
         kept.len(),
-        kept.len() - kept_predicate_hit - kept_no_info - kept_bucket_failed - kept_unparseable_key
+        kept.len() - kept_predicate_hit - kept_no_info - kept_bucket_failed - kept_unparseable_key,
+        dropped_bloom + dropped_absent
     );
     kept
 }
@@ -369,15 +425,11 @@ async fn run_group(
     predicates: &[Predicate],
     with_bloom: &[FileKey],
 ) -> GroupResult {
-    // Step 1: footer (cache → suffix GET on miss). `.bf` is immutable so the
-    // footer cache entry is valid for the file's lifetime.
-    let (total_size, suffix) = match get_footer_suffix(account, path).await {
-        Ok(x) => x,
+    // Step 1: footer (parsed cache → suffix GET + parse on miss). `.bf` is
+    // immutable so the cache entry is valid for the file's lifetime.
+    let reader = match get_footer(account, path).await {
+        Ok(reader) => reader,
         Err(e) => return GroupResult::Err(path.to_string(), e),
-    };
-    let reader = match BloomReader::parse_suffix(&suffix, total_size) {
-        Ok(r) => r,
-        Err(e) => return GroupResult::Err(path.to_string(), FetchError::Parse(e)),
     };
 
     // Step 2: one block-ROW per (predicate, value) — shared across all files
@@ -417,6 +469,22 @@ async fn run_group(
             }
         }
     };
+    // B2 presence, footer-local (v2 `.bf` only): a file whose licensed
+    // column set lacks the predicate's field matches no row of that file —
+    // decided here, before any block-row read. The file keeps no per-field
+    // or composite verdict for that predicate (it needs none).
+    let mut absent: Vec<(usize, usize)> = Vec::new();
+    let mut presence_outcomes: Vec<(usize, usize, usize, bool)> = Vec::new();
+    if reader.is_v2() {
+        for (pi, pred) in predicates.iter().enumerate() {
+            for &fi in file_idxs {
+                if reader.file_has_column(with_bloom[fi].id as u64, &pred.field) == Some(false) {
+                    absent.push((fi, pi));
+                    presence_outcomes.extend((0..pred.values.len()).map(|vi| (fi, pi, vi, false)));
+                }
+            }
+        }
+    }
     for (pi, pred) in predicates.iter().enumerate() {
         for (vi, value) in pred.values.iter().enumerate() {
             if let Some((range, hash)) = reader.row_range(&pred.field, value.as_bytes()) {
@@ -465,17 +533,22 @@ async fn run_group(
         }
     }
     if rows.is_empty() {
-        let footer_fields: Vec<&str> = reader.fields().collect();
-        let requested_fields: Vec<&str> = predicates.iter().map(|p| p.field.as_str()).collect();
-        log::warn!(
-            "[trace_id {trace_id}] search->bloom: group `{path}`: no rows resolved — \
-             footer fields=[{}], requested=[{}]. Likely cause: stream \
-             `bloom_filter_fields` at build time differed from the queried \
-             field. Keeping all files in this group.",
-            footer_fields.join(", "),
-            requested_fields.join(", "),
-        );
-        return GroupResult::Ok(Vec::new());
+        if absent.is_empty() {
+            let footer_fields: Vec<&str> = reader.fields().collect();
+            let requested_fields: Vec<&str> = predicates.iter().map(|p| p.field.as_str()).collect();
+            log::warn!(
+                "[trace_id {trace_id}] search->bloom: group `{path}`: no rows resolved — \
+                 footer fields=[{}], requested=[{}]. Likely cause: stream \
+                 `bloom_filter_fields` at build time differed from the queried \
+                 field. Keeping all files in this group.",
+                footer_fields.join(", "),
+                requested_fields.join(", "),
+            );
+        }
+        return GroupResult::Ok {
+            outcomes: presence_outcomes,
+            absent,
+        };
     }
 
     // Step 3: fetch the rows. One contiguous range each (M×32 bytes), batched
@@ -534,12 +607,19 @@ async fn run_group(
             }
         }
     }
-    let mut outcomes: Vec<(usize, usize, usize, bool)> = Vec::new();
+    // presence-decided pairs take no block verdict: `false` for every value
+    // is already final (a later `true` from a block row could only be a
+    // stale section of a file the footer proves lacks the column)
+    let absent_pairs: HashSet<(usize, usize)> = absent.iter().copied().collect();
+    let mut outcomes = presence_outcomes;
     for (r, row_bytes) in rows.iter().zip(fetched.iter()) {
         let Some(value_idx) = r.value_idx else {
             continue;
         };
         for &file_idx in file_idxs {
+            if absent_pairs.contains(&(file_idx, r.pred_idx)) {
+                continue;
+            }
             if r.composite_row {
                 // composite verdicts require proven coverage (all guards hit)
                 if guard_miss.contains(&(file_idx, r.pred_idx)) {
@@ -564,21 +644,21 @@ async fn run_group(
         }
     }
 
-    GroupResult::Ok(outcomes)
+    GroupResult::Ok { outcomes, absent }
 }
 
-/// Footer suffix retrieval: footer cache → suffix-range GET on miss.
-/// Returns (total_size, suffix_bytes) in both branches.
+/// Footer retrieval: parsed-footer cache → suffix-range GET + parse on miss.
 ///
 /// Two-step read: the first probe pulls a fixed tail
 /// (`BLOOM_SUFFIX_PROBE_BYTES`), which covers the whole footer for the common
 /// case (few fields / a few hundred files). When the footer is bigger than
-/// the probe — many bloom fields, or a large `max_files_per_bf` — we re-read
-/// exactly `footer_len + 8` from the tail so a big `.bf` still prunes instead
-/// of silently falling back to keep-all.
-async fn get_footer_suffix(account: &str, path: &str) -> Result<(u64, bytes::Bytes), FetchError> {
-    if let Some((total, suffix)) = BLOOM_FOOTER_CACHE.get(path) {
-        return Ok((total, suffix));
+/// the probe — many bloom fields, or a large chunk — we re-read exactly
+/// `footer_len + 8` from the tail so a big `.bf` still prunes instead of
+/// silently falling back to keep-all. The parsed reader is cached by path
+/// (a `.bf` is immutable), so a hit skips the GET AND the v2 footer decode.
+async fn get_footer(account: &str, path: &str) -> Result<Arc<BloomReader>, FetchError> {
+    if let Some(reader) = BLOOM_FOOTER_CACHE.get(path) {
+        return Ok(reader);
     }
 
     let (total, suffix) = fetch_suffix(account, path, BLOOM_SUFFIX_PROBE_BYTES).await?;
@@ -586,9 +666,9 @@ async fn get_footer_suffix(account: &str, path: &str) -> Result<(u64, bytes::Byt
         Some(needed) => fetch_suffix(account, path, needed).await?.1,
         None => suffix,
     };
-
-    BLOOM_FOOTER_CACHE.put(path.to_string(), total, suffix.clone());
-    Ok((total, suffix))
+    let reader = Arc::new(BloomReader::parse_suffix(&suffix, total).map_err(FetchError::Parse)?);
+    BLOOM_FOOTER_CACHE.put(path.to_string(), Arc::clone(&reader));
+    Ok(reader)
 }
 
 /// One `Suffix(n)` GET. Returns (total_file_size, suffix_bytes).
@@ -643,26 +723,40 @@ fn decidable_field(condition: &Condition) -> Option<&str> {
 }
 
 /// Returns whether this condition contains any predicate that the Bloom
-/// pruner can actually evaluate under the stream's additive fields and the
-/// composite policy. This preflight borrows the condition throughout: large
-/// IN/OR payloads are neither cloned nor sorted before the caller transfers
-/// ownership of its file list.
-pub fn is_applicable(
-    cond: &IndexCondition,
-    bloom_indexed_fields: &[String],
-    composite_scope: &VixBloomCompositeScope,
-    auto_id_scope: bool,
-    auto_id_never: &HashSet<String>,
+/// pruner can actually evaluate — an equality, a positive `IN`, or a
+/// same-field `OR` of those, on ANY field (DESIGN-COLD-MISS §4 B3): with
+/// AUTO additive per-field sections and v2 presence bits every file decides
+/// for itself whether it has information on a field, so admission carries
+/// no name heuristic and no scope gate. This preflight borrows the
+/// condition throughout: large IN/OR payloads are neither cloned nor sorted
+/// before the caller transfers ownership of its file list.
+pub fn is_applicable(cond: &IndexCondition) -> bool {
+    cond.conditions
+        .iter()
+        .any(|condition| decidable_field(condition).is_some())
+}
+
+/// A `.bf` set of at most this many groups is probed by structural-only
+/// queries whatever its shape: the stage is then at most this many footer
+/// GETs, cheaper than being clever about it.
+const STRUCTURAL_SMALL_SET_GROUPS: usize = 64;
+
+/// Whether a query admitted ONLY structurally may run its `.bf` stage: the
+/// set is small ([`STRUCTURAL_SMALL_SET_GROUPS`]) or the stamped files
+/// average at least `min_group_files` per `.bf` group (0 = always). A
+/// chunked set (B4: up to 256 files per group) passes for any window; the
+/// one-group-per-file set the old assembler produced fails, because there
+/// each group is one footer GET that cannot answer a field without a
+/// section. Legacy-admitted predicates never consult this: they paid that
+/// stage before B3 and keep doing so.
+fn structural_bf_stage_allowed(
+    groups: usize,
+    stamped_files: usize,
+    min_group_files: usize,
 ) -> bool {
-    cond.conditions.iter().any(|condition| {
-        let Some(field) = decidable_field(condition) else {
-            return false;
-        };
-        let additive = bloom_indexed_fields
-            .iter()
-            .any(|indexed| indexed.as_str() == field);
-        additive || composite_fallback_allowed(field, composite_scope, auto_id_scope, auto_id_never)
-    })
+    min_group_files == 0
+        || groups <= STRUCTURAL_SMALL_SET_GROUPS
+        || stamped_files / groups >= min_group_files
 }
 
 /// Pull the bloom-decidable predicates out of a top-level `IndexCondition`.
@@ -671,12 +765,15 @@ pub fn is_applicable(
 /// that fold cleanly become bloom checks, the rest are silently skipped (the
 /// affected files pass the bloom step untouched).
 ///
-/// `bloom_indexed_fields` is the stream's additive `bloom_filter_fields`
-/// (restricted to fields present in the schema). Those fields always use
-/// their per-field bloom and may use composite fallback only when
-/// `composite_scope` allows them. A field outside the additive set is admitted
-/// only when the broad, explicit, or AUTO-ID composite policy allows its
-/// fallback.
+/// Every decidable predicate is admitted whatever its field (B3). A file
+/// answers it from its per-field section (explicit `bloom_filter_fields` or
+/// an AUTO additive one), from its presence bits, or — when the composite
+/// policy covers the field — from the composite section; a file with none
+/// of these is "no info" and kept. `composite_scope` / `auto_id_scope` /
+/// `auto_id_never` therefore decide ONLY composite coverage
+/// ([`Predicate::composite_fallback`]), exactly as before; together with
+/// `bloom_indexed_fields` they also mark which predicates the pre-B3 rule
+/// admitted ([`Predicate::legacy_admitted`]).
 fn collect_decidable(
     cond: &IndexCondition,
     bloom_indexed_fields: &HashSet<String>,
@@ -687,20 +784,17 @@ fn collect_decidable(
     cond.conditions
         .iter()
         .filter_map(|condition| {
-            let field = decidable_field(condition)?;
-            let additive = bloom_indexed_fields.contains(field);
-            if !additive
-                && !composite_fallback_allowed(field, composite_scope, auto_id_scope, auto_id_never)
-            {
-                return None;
-            }
-            admit_predicate(
-                try_predicate(condition)?,
-                additive,
+            decidable_field(condition)?;
+            let mut predicate = try_predicate(condition)?;
+            predicate.composite_fallback = composite_fallback_allowed(
+                &predicate.field,
                 composite_scope,
                 auto_id_scope,
                 auto_id_never,
-            )
+            );
+            predicate.legacy_admitted =
+                predicate.composite_fallback || bloom_indexed_fields.contains(&predicate.field);
+            Some(predicate)
         })
         .collect()
 }
@@ -727,28 +821,6 @@ fn composite_fallback_allowed(
         }
 }
 
-/// Applies the shared additive/composite admission rule and records whether
-/// the admitted predicate may fall back to the composite section.
-fn admit_predicate(
-    mut predicate: Predicate,
-    additive: bool,
-    composite_scope: &VixBloomCompositeScope,
-    auto_id_scope: bool,
-    auto_id_never: &HashSet<String>,
-) -> Option<Predicate> {
-    let composite_fallback = composite_fallback_allowed(
-        &predicate.field,
-        composite_scope,
-        auto_id_scope,
-        auto_id_never,
-    );
-    if !additive && !composite_fallback {
-        return None;
-    }
-    predicate.composite_fallback = composite_fallback;
-    Some(predicate)
-}
-
 /// Try to convert a single `Condition` into one bloom-decidable `Predicate`.
 ///
 /// A bloom can prove a value is definitely *absent* from a file, never that
@@ -769,11 +841,13 @@ fn try_predicate(cond: &Condition) -> Option<Predicate> {
             field: field.clone(),
             values: vec![value.clone()],
             composite_fallback: false,
+            legacy_admitted: false,
         }),
         Condition::In(field, values, false) if !values.is_empty() => Some(Predicate {
             field: field.clone(),
             values: values.clone(),
             composite_fallback: false,
+            legacy_admitted: false,
         }),
         Condition::Or(left, right) => {
             let lp = try_predicate(left)?;
@@ -790,6 +864,7 @@ fn try_predicate(cond: &Condition) -> Option<Predicate> {
                 field: lp.field,
                 values,
                 composite_fallback: false,
+                legacy_admitted: false,
             })
         }
         _ => None,
@@ -832,21 +907,8 @@ mod tests {
         auto_id_never: &[&str],
         expected: bool,
     ) {
-        let additive_vec = additive_fields
-            .iter()
-            .map(|field| field.to_string())
-            .collect::<Vec<_>>();
         let auto_id_never = fields(auto_id_never);
-        assert_eq!(
-            is_applicable(
-                condition,
-                &additive_vec,
-                composite_scope,
-                auto_id_scope,
-                &auto_id_never,
-            ),
-            expected
-        );
+        assert_eq!(is_applicable(condition), expected);
         assert_eq!(
             !collect_decidable(
                 condition,
@@ -878,19 +940,23 @@ mod tests {
         assert_eq!(p[0].values, vec!["abc".to_string()]);
     }
 
+    /// B3: a field outside the stream's additive set and outside the
+    /// composite scope is admitted all the same — a file decides for itself
+    /// (AUTO per-field section, presence bits) and files with no information
+    /// are kept — but it gets NO composite fallback.
     #[test]
-    fn test_collect_skips_non_indexed_field() {
+    fn test_collect_admits_non_indexed_field_without_composite_fallback() {
         let c = cond(vec![Condition::Equal("body".into(), "abc".into())]);
-        assert!(
-            collect_decidable(
-                &c,
-                &fields(&["trace_id"]),
-                &only_scope(&[]),
-                false,
-                &HashSet::new(),
-            )
-            .is_empty()
+        let p = collect_decidable(
+            &c,
+            &fields(&["trace_id"]),
+            &only_scope(&[]),
+            false,
+            &HashSet::new(),
         );
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].field, "body");
+        assert!(!p[0].composite_fallback);
     }
 
     #[test]
@@ -1094,23 +1160,25 @@ mod tests {
     }
 
     #[test]
-    fn test_collect_or_on_non_indexed_field_skipped() {
-        // Both branches positive Eq on the same name, but the field is not in
-        // the bloom-indexed set — leaves fold to None, whole Or is dropped.
+    fn test_collect_or_on_non_indexed_field_admitted() {
+        // Both branches positive Eq on the same name: the Or folds to one
+        // predicate whatever the field (B3), composite fallback off outside
+        // the scope.
         let c = cond(vec![Condition::Or(
             Box::new(Condition::Equal("body".into(), "a".into())),
             Box::new(Condition::Equal("body".into(), "b".into())),
         )]);
-        assert!(
-            collect_decidable(
-                &c,
-                &fields(&["trace_id"]),
-                &only_scope(&[]),
-                false,
-                &HashSet::new(),
-            )
-            .is_empty()
+        let p = collect_decidable(
+            &c,
+            &fields(&["trace_id"]),
+            &only_scope(&[]),
+            false,
+            &HashSet::new(),
         );
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].field, "body");
+        assert_eq!(p[0].values, vec!["a".to_string(), "b".to_string()]);
+        assert!(!p[0].composite_fallback);
     }
 
     #[test]
@@ -1189,6 +1257,7 @@ mod tests {
             field: "trace_id".into(),
             values: vec!["present-A".into()],
             composite_fallback: false,
+            legacy_admitted: true,
         };
         // file A: any value matches → kept
         assert!(
@@ -1209,6 +1278,7 @@ mod tests {
             field: "trace_id".into(),
             values: vec!["present-A".into(), "absent-X".into()],
             composite_fallback: false,
+            legacy_admitted: true,
         };
         assert!(
             pred_in
@@ -1222,6 +1292,7 @@ mod tests {
             field: "trace_id".into(),
             values: vec!["absent-Z".into()],
             composite_fallback: false,
+            legacy_admitted: true,
         };
         let preds = [pred, pred_other];
         let kept = preds
@@ -1230,8 +1301,11 @@ mod tests {
         assert!(!kept);
     }
 
+    /// B3: the composite scope no longer gates ADMISSION — every decidable
+    /// predicate is planned — it decides only whether a predicate may fall
+    /// back to the composite section.
     #[test]
-    fn composite_scope_controls_admission_and_additive_fallback() {
+    fn composite_scope_controls_only_the_composite_fallback() {
         let only_trace_id = only_scope(&["trace_id"]);
         let trace = cond(vec![Condition::Equal("trace_id".into(), "abc".into())]);
         let infer = cond(vec![Condition::Equal(
@@ -1242,10 +1316,11 @@ mod tests {
         let p = collect_decidable(&trace, &fields(&[]), &only_trace_id, false, &HashSet::new());
         assert_eq!(p.len(), 1, "explicit Bloom-only field is admitted");
         assert!(p[0].composite_fallback);
+        let p = collect_decidable(&infer, &fields(&[]), &only_trace_id, false, &HashSet::new());
+        assert_eq!(p.len(), 1, "a field outside the scope is admitted too");
         assert!(
-            collect_decidable(&infer, &fields(&[]), &only_trace_id, false, &HashSet::new(),)
-                .is_empty(),
-            "selective scope rejects unrelated fields"
+            !p[0].composite_fallback,
+            "selective scope denies it the composite fallback"
         );
 
         let p = collect_decidable(
@@ -1273,7 +1348,7 @@ mod tests {
     }
 
     #[test]
-    fn applicability_preflight_matches_selective_and_broad_admission() {
+    fn applicability_preflight_admits_any_decidable_field() {
         let only_trace_id = only_scope(&["trace_id"]);
         let trace = cond(vec![Condition::Equal("trace_id".into(), "abc".into())]);
         let infer = cond(vec![Condition::Equal(
@@ -1282,7 +1357,7 @@ mod tests {
         )]);
 
         assert_applicability_parity(&trace, &[], &only_trace_id, false, &[], true);
-        assert_applicability_parity(&infer, &[], &only_trace_id, false, &[], false);
+        assert_applicability_parity(&infer, &[], &only_trace_id, false, &[], true);
         assert_applicability_parity(
             &infer,
             &["infer_service_name"],
@@ -1292,30 +1367,56 @@ mod tests {
             true,
         );
         assert_applicability_parity(&infer, &[], &VixBloomCompositeScope::All, false, &[], true);
+        // the shape still decides: a negated IN is never bloom-decidable
+        let negated = cond(vec![Condition::In(
+            "infer_service_name".into(),
+            vec!["a".into()],
+            true,
+        )]);
+        assert_applicability_parity(
+            &negated,
+            &[],
+            &VixBloomCompositeScope::All,
+            false,
+            &[],
+            false,
+        );
     }
 
+    /// The AUTO-ID scope knob keeps deciding composite COVERAGE for ID-like
+    /// names (and the NEVER list keeps removing it); admission itself is
+    /// field-agnostic since B3.
     #[test]
-    fn auto_id_scope_admission_matches_owned_planner() {
+    fn auto_id_scope_governs_composite_fallback_not_admission() {
         let selective = only_scope(&["trace_id"]);
-
-        for field in ["reference.parent_trace_id", "event_id"] {
+        let fallback = |field: &str, auto_id_scope: bool, never: &[&str]| -> bool {
             let condition = cond(vec![Condition::Equal(field.into(), "abc".into())]);
-            assert_applicability_parity(&condition, &[], &selective, false, &[], false);
-            assert_applicability_parity(&condition, &[], &selective, true, &[], true);
-            assert_applicability_parity(&condition, &[], &selective, true, &[field], false);
-        }
-
-        for field in ["span_duration_nano", "events", "infer_service_name"] {
-            let condition = cond(vec![Condition::Equal(field.into(), "abc".into())]);
-            assert_applicability_parity(&condition, &[], &selective, true, &[], false);
-            assert_applicability_parity(
+            let p = collect_decidable(
                 &condition,
-                &[],
+                &fields(&[]),
+                &selective,
+                auto_id_scope,
+                &fields(never),
+            );
+            assert_eq!(p.len(), 1, "{field}: admitted regardless of scope");
+            p[0].composite_fallback
+        };
+        for field in ["reference.parent_trace_id", "event_id"] {
+            assert!(!fallback(field, false, &[]));
+            assert!(fallback(field, true, &[]));
+            assert!(!fallback(field, true, &[field]));
+        }
+        for field in ["span_duration_nano", "events", "infer_service_name"] {
+            assert!(!fallback(field, true, &[]));
+            let condition = cond(vec![Condition::Equal(field.into(), "abc".into())]);
+            let p = collect_decidable(
+                &condition,
+                &fields(&[]),
                 &VixBloomCompositeScope::All,
                 false,
-                &[],
-                true,
+                &HashSet::new(),
             );
+            assert!(p[0].composite_fallback, "{field}: broad scope covers all");
         }
     }
 
@@ -1912,6 +2013,229 @@ mod tests {
         )
         .await;
         assert!(kept.is_empty(), "covered misses drop every file");
+    }
+
+    /// DESIGN-COLD-MISS §4 B2 over a v2 `.bf`: presence decides before any
+    /// block read. A predicate on a field a licensed member provably lacks
+    /// drops that member (column absent from the group table, or bit
+    /// clear); a member WITH the column but no section is kept (no info); an
+    /// unlicensed member is never dropped on presence; and a member with a
+    /// per-field section still gets the block verdict. B3 admits the
+    /// predicate on an unconfigured, out-of-scope field.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn v2_presence_bits_prune_absent_columns_before_any_block_read() {
+        use infra::bloom::{BloomBuilder, GroupMember};
+
+        // file 501: has `host`, bloomed → block verdict (hit for host-7,
+        //           miss for host-9)
+        // file 502: has `host`, no section → no info → kept
+        // file 503: no `host` column, licensed → presence drop
+        // file 504: no `host` column, UNLICENSED → kept (no info)
+        let mut b = BloomBuilder::new();
+        let i = b.begin_with_blocks(501, "host", 8);
+        b.insert(i, b"host-7");
+        let members = vec![
+            GroupMember::new(501, vec!["host".into(), "msg".into()]),
+            GroupMember::new(502, vec!["host".into(), "msg".into()]),
+            GroupMember::new(503, vec!["msg".into()]),
+            GroupMember::new(504, vec!["msg".into()]).with_complete(false),
+        ];
+        let blob = BloomWriter::serialize_v2(&members, b.finish()).unwrap();
+
+        const VER: i64 = 606_060;
+        let date = "2026/05/08/16";
+        let stream = "s-v2-presence";
+        let path = bloom_path("o", StreamType::Logs, stream, date, VER);
+        let account = infra::storage::get_account("o", &path).unwrap_or_default();
+        infra::storage::put(&account, &path, bytes::Bytes::from(blob))
+            .await
+            .expect("local test object store accepts the .bf");
+        let file = |id: i64, name: &str| {
+            let mut k = fk(&format!("files/o/logs/{stream}/{date}/{name}.parquet"), VER);
+            k.id = id;
+            k
+        };
+        let files = vec![
+            file(501, "a"),
+            file(502, "b"),
+            file(503, "c"),
+            file(504, "d"),
+        ];
+        let kept_ids = |kept: Vec<FileKey>| {
+            let mut ids: Vec<i64> = kept.iter().map(|f| f.id).collect();
+            ids.sort();
+            ids
+        };
+
+        // `host` is neither a stream bloom field nor in the composite scope:
+        // admitted anyway (B3), no composite fallback
+        let present = cond(vec![Condition::Equal("host".into(), "host-7".into())]);
+        let kept = prune(
+            "tid",
+            "o",
+            StreamType::Logs,
+            stream,
+            files.clone(),
+            &present,
+            Vec::new(),
+            &only_scope(&[]),
+            false,
+            &HashSet::new(),
+        )
+        .await;
+        assert_eq!(
+            kept_ids(kept),
+            vec![501, 502, 504],
+            "block hit kept, no-section kept, licensed absent dropped, unlicensed kept"
+        );
+
+        let absent_value = cond(vec![Condition::Equal("host".into(), "host-9".into())]);
+        let kept = prune(
+            "tid",
+            "o",
+            StreamType::Logs,
+            stream,
+            files.clone(),
+            &absent_value,
+            Vec::new(),
+            &only_scope(&[]),
+            false,
+            &HashSet::new(),
+        )
+        .await;
+        assert_eq!(
+            kept_ids(kept),
+            vec![502, 504],
+            "block miss dropped too; presence verdicts unchanged"
+        );
+
+        // a column no member has: every licensed member drops, the
+        // unlicensed one stays — and no block row is needed at all
+        let nowhere = cond(vec![Condition::Equal("tenant".into(), "x".into())]);
+        let kept = prune(
+            "tid",
+            "o",
+            StreamType::Logs,
+            stream,
+            files.clone(),
+            &nowhere,
+            Vec::new(),
+            &only_scope(&[]),
+            false,
+            &HashSet::new(),
+        )
+        .await;
+        assert_eq!(kept_ids(kept), vec![504]);
+    }
+
+    #[test]
+    fn structural_gate_boundaries() {
+        // small set: any shape
+        assert!(structural_bf_stage_allowed(1, 4, 32));
+        assert!(structural_bf_stage_allowed(
+            STRUCTURAL_SMALL_SET_GROUPS,
+            64,
+            32
+        ));
+        // beyond the floor the average decides
+        assert!(!structural_bf_stage_allowed(65, 65, 32));
+        assert!(!structural_bf_stage_allowed(65, 65 * 31, 32));
+        assert!(structural_bf_stage_allowed(65, 65 * 32, 32));
+        // 0 = always
+        assert!(structural_bf_stage_allowed(10_000, 10_000, 0));
+    }
+
+    /// B3 bound: on a one-group-per-file `.bf` set (what the pre-B4 assembler
+    /// left behind) a predicate that only structural admission brings here
+    /// keeps every file without reading a footer, while a legacy-admitted
+    /// predicate (composite scope) still prunes it — each group here holds a
+    /// section that misses the probed value, so the stage would drop all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn structural_only_predicates_skip_a_fragmented_bf_set() {
+        use infra::bloom::{BloomBuilder, GroupMember};
+
+        let date = "2026/05/09/10";
+        let stream = "s-fragmented";
+        let groups = STRUCTURAL_SMALL_SET_GROUPS + 1;
+        let mut files = Vec::with_capacity(groups);
+        for n in 0..groups {
+            let id = 700 + n as u64;
+            let ver = 707_000 + n as i64;
+            let mut b = BloomBuilder::new();
+            let host = b.begin_with_blocks(id, "host", 8);
+            b.insert(host, b"host-other");
+            let trace = b.begin_with_blocks(id, "trace_id", 8);
+            b.insert(trace, b"t-other");
+            let members = vec![GroupMember::new(id, vec!["host".into(), "trace_id".into()])];
+            let blob = BloomWriter::serialize_v2(&members, b.finish()).unwrap();
+            let path = bloom_path("o", StreamType::Logs, stream, date, ver);
+            let account = infra::storage::get_account("o", &path).unwrap_or_default();
+            infra::storage::put(&account, &path, bytes::Bytes::from(blob))
+                .await
+                .expect("local test object store accepts the .bf");
+            let mut key = fk(&format!("files/o/logs/{stream}/{date}/f{n}.parquet"), ver);
+            key.id = id as i64;
+            files.push(key);
+        }
+
+        // structural-only: `host` is no stream bloom field and outside the
+        // composite scope -> the fragmented set is left unprobed
+        let host = cond(vec![Condition::Equal("host".into(), "host-7".into())]);
+        let kept = prune(
+            "tid",
+            "o",
+            StreamType::Logs,
+            stream,
+            files.clone(),
+            &host,
+            Vec::new(),
+            &only_scope(&["trace_id"]),
+            false,
+            &HashSet::new(),
+        )
+        .await;
+        assert_eq!(
+            kept.len(),
+            groups,
+            "structural-only: fragmented set kept whole"
+        );
+
+        // the same shape with `host` as an explicit stream bloom field is
+        // legacy-admitted and prunes as before
+        let kept = prune(
+            "tid",
+            "o",
+            StreamType::Logs,
+            stream,
+            files.clone(),
+            &host,
+            vec!["host".into()],
+            &only_scope(&["trace_id"]),
+            false,
+            &HashSet::new(),
+        )
+        .await;
+        assert!(
+            kept.is_empty(),
+            "legacy-admitted: every section misses -> all dropped"
+        );
+
+        // composite-scope admission is legacy too
+        let trace = cond(vec![Condition::Equal("trace_id".into(), "t-7".into())]);
+        let kept = prune(
+            "tid",
+            "o",
+            StreamType::Logs,
+            stream,
+            files,
+            &trace,
+            Vec::new(),
+            &only_scope(&["trace_id"]),
+            false,
+            &HashSet::new(),
+        )
+        .await;
+        assert!(kept.is_empty());
     }
 
     /// M15: a CONFIGURED bloom field (stream-settings `bloom_filter_fields`)

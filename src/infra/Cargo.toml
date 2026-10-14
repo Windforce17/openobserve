@@ -45,6 +45,7 @@ tonic.workspace = true
 opentelemetry.workspace = true
 tracing-opentelemetry.workspace = true
 proto.workspace = true
+zstd.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

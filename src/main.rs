@@ -316,6 +316,11 @@ async fn main() -> Result<(), anyhow::Error> {
             openobserve::service::search::vix::set_walk_verify_min_bytes(
                 config::get_config().limit.vix_walk_verify_min_bytes,
             );
+            // DESIGN-COLD-MISS §2 S3: one-GET cold misses on sidecars that
+            // embed the data footer
+            openobserve::service::search::vix::set_sidecar_first_open(
+                config::get_config().limit.vix_sidecar_first_open,
+            );
 
             // ingester init
             if let Err(e) = ingester::init().await {

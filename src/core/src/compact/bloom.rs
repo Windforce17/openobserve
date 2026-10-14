@@ -50,7 +50,7 @@ use config::{
 };
 use hashbrown::{HashMap, HashSet};
 use infra::{
-    bloom::{BloomWriter, FieldBloom},
+    bloom::{BloomWriter, FieldBloom, GroupMember},
     dist_lock,
     schema::{get_stream_setting_bloom_filter_fields, unwrap_stream_settings},
 };
@@ -76,9 +76,10 @@ const BLOOM_VER_NOT_APPLICABLE: i64 = -1;
 /// file on the next pass.
 const BLOOM_VER_UNBUILDABLE: i64 = -2;
 
-/// Cap files per `.bf` chunk: keeps the footer well under the pruner's
-/// 16 KiB suffix probe (per file ≈ 12 footer bytes per field).
-const MAX_FILES_PER_BF: usize = 256;
+/// A superseded `.bf` version whose rows all moved to new chunks is deleted
+/// through the deferred `FileListDeleted` batch, never inline; the GC pass
+/// catches anything a crash left behind (`ZO_COMPACT_BLOOM_GC_MIN_AGE_SECS`).
+type BloomFence = (i64, i64, i64);
 
 /// One pass of the builder: drain up to `compact.bloom_build_batch` pending
 /// `(stream, hour)` buckets. Called on the compactor's job cadence.
@@ -114,6 +115,10 @@ pub async fn run() -> Result<(), anyhow::Error> {
     let started = std::time::Instant::now();
     FALLBACK_BUDGET.store(
         cfg.compact.bloom_build_fallback_budget,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    REPACK_BUDGET.store(
+        cfg.compact.sidecar_repack_budget,
         std::sync::atomic::Ordering::Relaxed,
     );
     let composite_scope = config::vix_bloom_composite_scope(&cfg);
@@ -248,6 +253,69 @@ fn bloom_policy_enabled(
     !bloom_fields.is_empty() || composite_scope.enabled() || auto_id_scope
 }
 
+/// Why an hour is (re)built this pass — the B4 regroup triggers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BuildTrigger {
+    /// The hour has no stamped file yet: first build at settle.
+    FirstBuild,
+    /// `pending >= ZO_COMPACT_BLOOM_REGROUP_MIN_FILES`.
+    PendingFiles,
+    /// `pending / total >= ZO_COMPACT_BLOOM_REGROUP_MIN_RATIO`.
+    PendingRatio,
+    /// The oldest pending row waited `>= ZO_COMPACT_BLOOM_REGROUP_MAX_AGE_HOURS`.
+    PendingAge,
+}
+
+/// DESIGN-COLD-MISS §4 B4 hour selection: a settled hour with pending files
+/// is (re)built when the pending set is big enough in count or ratio, old
+/// enough, or the hour has never been built; otherwise the pending files
+/// wait (the query side probes their own sidecars meanwhile) so an hour's
+/// `.bf` set is not fragmented into one chunk per merge output.
+fn build_trigger(
+    pending: usize,
+    total: usize,
+    stamped: usize,
+    oldest_pending_age: Option<chrono::Duration>,
+    cfg: &config::Compact,
+) -> Option<BuildTrigger> {
+    if pending == 0 {
+        return None;
+    }
+    if stamped == 0 {
+        return Some(BuildTrigger::FirstBuild);
+    }
+    if pending as i64 >= cfg.bloom_regroup_min_files.max(1) {
+        return Some(BuildTrigger::PendingFiles);
+    }
+    if total > 0 && pending as f64 / total as f64 >= cfg.bloom_regroup_min_ratio {
+        return Some(BuildTrigger::PendingRatio);
+    }
+    if oldest_pending_age
+        .is_some_and(|age| age >= chrono::Duration::hours(cfg.bloom_regroup_max_age_hours.max(0)))
+    {
+        return Some(BuildTrigger::PendingAge);
+    }
+    None
+}
+
+/// One member of an hour build: the file's fence, its presence declaration
+/// and the sections it brings into its chunk (possibly none — a file with
+/// only presence still prunes by presence).
+struct BuildMember {
+    fence: BloomFence,
+    presence: GroupMember,
+    blooms: Vec<vortex_index::bloom::FileBloom>,
+    /// `Some(version)`: consolidated out of that superseded chunk (CAS
+    /// restamp from it); `None`: a pending file (stamp from 0).
+    restamp_from: Option<i64>,
+}
+
+impl BuildMember {
+    fn section_bytes(&self) -> usize {
+        self.blooms.iter().map(|b| b.bytes.len()).sum()
+    }
+}
+
 async fn process_bucket_locked(
     org_id: &str,
     stream_type: config::meta::stream::StreamType,
@@ -258,9 +326,17 @@ async fn process_bucket_locked(
     auto_id_scope: bool,
     bloom_only_never: &Arc<HashSet<String>>,
 ) -> Result<(), anyhow::Error> {
-    // re-check under the lock (another compactor may have built it)
-    let files = infra::file_list::query_for_bloom(org_id, stream_type, stream_name, date).await?;
-    if files.is_empty() {
+    let cfg = get_config();
+    // the WHOLE hour under the lock (another compactor may have built it):
+    // pending rows are the work, stamped rows decide the triggers, the
+    // consolidation and the GC
+    let rows = infra::file_list::query_for_bloom(org_id, stream_type, stream_name, date).await?;
+    let pending: Vec<FileKey> = rows
+        .iter()
+        .filter(|row| row.bloom_ver == 0)
+        .map(FileKey::from)
+        .collect();
+    if pending.is_empty() {
         return Ok(());
     }
 
@@ -273,7 +349,7 @@ async fn process_bucket_locked(
         // Nothing to build for this stream. Fence even sentinel stamps by the
         // sidecar generation and size that were classified, so a concurrent
         // heal remains pending at bloom_ver=0.
-        let expected: Vec<(i64, i64, i64)> = files
+        let expected: Vec<BloomFence> = pending
             .iter()
             .map(|file| (file.id, file.meta.index_generation, file.meta.index_size))
             .collect();
@@ -287,66 +363,122 @@ async fn process_bucket_locked(
         return Ok(());
     }
 
+    let now = now_micros();
+    let stamped_rows: Vec<&infra::file_list::FileRecord> =
+        rows.iter().filter(|row| row.bloom_ver > 0).collect();
+    let oldest_pending_age = rows
+        .iter()
+        .filter(|row| row.bloom_ver == 0 && row.updated_at > 0)
+        .map(|row| row.updated_at)
+        .min()
+        .map(|oldest| chrono::Duration::microseconds((now - oldest).max(0)));
+    let Some(trigger) = build_trigger(
+        pending.len(),
+        rows.len(),
+        stamped_rows.len(),
+        oldest_pending_age,
+        &cfg.compact,
+    ) else {
+        log::debug!(
+            "[COMPACTOR:BLOOM] {org_id}/{stream_type}/{stream_name}/{date}: {} of {} files \
+             pending ({} stamped), below the regroup triggers — held for a later pass (the \
+             per-file probe serves them meanwhile)",
+            pending.len(),
+            rows.len(),
+            stamped_rows.len()
+        );
+        return Ok(());
+    };
+
     let started = std::time::Instant::now();
     log::info!(
-        "[COMPACTOR:BLOOM] {org_id}/{stream_type}/{stream_name}/{date}: building bucket, {} \
-         files pending",
-        files.len()
+        "[COMPACTOR:BLOOM] {org_id}/{stream_type}/{stream_name}/{date}: building hour \
+         ({trigger:?}): {} pending of {} indexed files, {} stamped across {} chunk versions",
+        pending.len(),
+        rows.len(),
+        stamped_rows.len(),
+        stamped_rows
+            .iter()
+            .map(|row| row.bloom_ver)
+            .collect::<HashSet<_>>()
+            .len()
     );
-    // Collect per-file blooms CONCURRENTLY: blob transpose for capability
-    // files (cheap ranged fetch), one dictionary stream for older ones —
+    // Collect per-file blooms CONCURRENTLY: the sidecar-only fast path for
+    // files whose sections are all writer-flagged (`bf`), the full reader
+    // for everything else, one dictionary stream for blob-less old files —
     // the expensive backfill path, so it is CAPPED per pass: leftover files
-    // stay bloom_ver=0 and become their own `.bf` chunk on a later pass
-    // (multiple chunks per bucket are first-class in the format).
+    // stay bloom_ver=0 and join a later build.
     const LOAD_CONCURRENCY: usize = 8;
     use futures::{StreamExt, stream};
-    type BloomFence = (i64, i64, i64);
-    let results: Vec<(BloomFence, String, Result<LoadedBlooms, anyhow::Error>)> =
-        stream::iter(files.iter().cloned().map(|file| {
-            let bloom_fields = bloom_fields.clone();
-            let composite_scope = composite_scope;
-            let auto_id_scope = auto_id_scope;
-            let bloom_only_never = Arc::clone(bloom_only_never);
-            async move {
-                let loaded = load_file_blooms(
-                    &file,
-                    &bloom_fields,
-                    fpp,
-                    composite_scope,
-                    auto_id_scope,
-                    bloom_only_never,
-                )
-                .await;
-                (
-                    (file.id, file.meta.index_generation, file.meta.index_size),
-                    file.key,
-                    loaded,
-                )
-            }
-        }))
-        .buffer_unordered(LOAD_CONCURRENCY)
-        .collect()
-        .await;
-    let mut per_file: Vec<(BloomFence, Vec<vortex_index::bloom::FileBloom>)> = Vec::new();
+    let results: Vec<(
+        BloomFence,
+        String,
+        Result<Option<LoadedFile>, anyhow::Error>,
+    )> = stream::iter(pending.iter().cloned().map(|file| {
+        let bloom_fields = bloom_fields.clone();
+        let composite_scope = composite_scope;
+        let auto_id_scope = auto_id_scope;
+        let bloom_only_never = Arc::clone(bloom_only_never);
+        async move {
+            let loaded = load_file_blooms(
+                &file,
+                &bloom_fields,
+                fpp,
+                composite_scope,
+                auto_id_scope,
+                bloom_only_never,
+            )
+            .await;
+            (
+                (file.id, file.meta.index_generation, file.meta.index_size),
+                file.key,
+                loaded,
+            )
+        }
+    }))
+    .buffer_unordered(LOAD_CONCURRENCY)
+    .collect()
+    .await;
+    let mut members: Vec<BuildMember> = Vec::new();
     let mut not_applicable: Vec<BloomFence> = Vec::new();
     let mut unbuildable: Vec<BloomFence> = Vec::new();
     let mut fallback_streams = 0usize;
+    let mut sidecar_only = 0usize;
     let mut deferred = 0usize;
+    // §5: pending files whose sidecar predates the current layout generation
+    let mut repack_candidates: Vec<BloomFence> = Vec::new();
+    let repack_opts = sidecar_repack_options(&cfg);
+    let target_layout_gen = vortex_index::target_layout_gen(&repack_opts);
     for (fence, key, result) in results {
         match result {
-            Ok(LoadedBlooms::FromBlob(blooms)) if blooms.is_empty() => {
-                not_applicable.push(fence);
-            }
-            Ok(LoadedBlooms::FromBlob(blooms)) => per_file.push((fence, blooms)),
-            Ok(LoadedBlooms::FromDict(blooms)) => {
-                fallback_streams += 1;
-                if blooms.is_empty() {
+            Ok(Some(LoadedFile {
+                presence,
+                blooms,
+                source,
+                layout_gen,
+            })) => {
+                match source {
+                    LoadSource::Sidecar => sidecar_only += 1,
+                    LoadSource::Dictionary => fallback_streams += 1,
+                    LoadSource::Reader => {}
+                }
+                if layout_gen < target_layout_gen {
+                    repack_candidates.push(fence);
+                }
+                // a file with neither a section nor an authoritative column
+                // set brings nothing a `.bf` could prune on
+                if blooms.is_empty() && !presence.complete {
                     not_applicable.push(fence);
                 } else {
-                    per_file.push((fence, blooms));
+                    members.push(BuildMember {
+                        fence,
+                        presence,
+                        blooms,
+                        restamp_from: None,
+                    });
                 }
             }
-            Ok(LoadedBlooms::Deferred) => deferred += 1,
+            Ok(None) => deferred += 1,
             // DETERMINISTIC (file-shaped) failure: the file's own bytes can
             // never build, so re-queuing it would spin forever and re-burn a
             // fallback-budget slot every pass. Stamp it out of the queue —
@@ -368,7 +500,6 @@ async fn process_bucket_locked(
             }
         }
     }
-    let _ = deferred;
     // Stamp poison files before chunk building. Only rows whose sidecar
     // identity still matches are counted; healed rows remain pending.
     let unbuildable_matched = if unbuildable.is_empty() {
@@ -376,92 +507,490 @@ async fn process_bucket_locked(
     } else {
         infra::file_list::update_bloom_ver(&unbuildable, BLOOM_VER_UNBUILDABLE).await?
     };
-
-    // chunk by the per-field num_blocks signature (a field section of one
-    // .bf must be block-uniform across its files)
-    let mut chunks: HashMap<
-        Vec<(String, u32)>,
-        Vec<(BloomFence, Vec<vortex_index::bloom::FileBloom>)>,
-    > = HashMap::new();
-    for (fence, blooms) in per_file {
-        let mut sig: Vec<(String, u32)> = blooms
+    // §5 old-file convergence: repack the oldest-layout sidecars within the
+    // per-pass budget and publish them as new index generations. A repacked
+    // file leaves THIS build (its row re-pends under the new generation and
+    // joins a later build with the new layout) and the sentinel stamps
+    // (fenced on the old generation) no longer match it.
+    let mut repacked = 0usize;
+    if !repack_candidates.is_empty() && REPACK_BUDGET.load(std::sync::atomic::Ordering::Relaxed) > 0
+    {
+        let by_fence: HashMap<BloomFence, &FileKey> = pending
             .iter()
-            .map(|b| (b.field.clone(), b.num_blocks))
+            .map(|file| {
+                (
+                    (file.id, file.meta.index_generation, file.meta.index_size),
+                    file,
+                )
+            })
             .collect();
-        sig.sort();
-        chunks.entry(sig).or_default().push((fence, blooms));
+        let mut done: HashSet<BloomFence> = HashSet::new();
+        for fence in repack_candidates {
+            if REPACK_BUDGET.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) <= 0 {
+                REPACK_BUDGET.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                break;
+            }
+            let Some(file) = by_fence.get(&fence) else {
+                continue;
+            };
+            match repack_and_publish(org_id, stream_type, stream_name, file, &repack_opts).await {
+                Ok(true) => {
+                    done.insert(fence);
+                    repacked += 1;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    // a DETERMINISTIC (file-shaped) failure hands its slot
+                    // back, like `budgeted_backfill`: the file is stamped out
+                    // of the pending set below and must not crowd healthy
+                    // candidates out of a small budget; transient failures
+                    // keep the slot (the work was done, it retries once the
+                    // file re-pends)
+                    if vortex_index::bloom::is_unbuildable(&e) {
+                        REPACK_BUDGET.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    log::warn!(
+                        "[COMPACTOR:BLOOM] {}: sidecar repack failed (kept as is): {e:#}",
+                        file.key
+                    );
+                }
+            }
+        }
+        if !done.is_empty() {
+            members.retain(|member| !done.contains(&member.fence));
+            not_applicable.retain(|fence| !done.contains(fence));
+        }
     }
 
+    // B4 consolidation: an hour fragmented into many small chunks folds its
+    // small ones into this build (their files move by CAS restamp). Bounded
+    // to one chunk's worth of members per pass — the chunk knob is the
+    // assembler's memory knob (DESIGN §4 B4), and an hour the pre-B4
+    // assembler left as one group per file would otherwise be read back
+    // whole; the rest folds on the hour's next visit.
+    let chunk_files = cfg.compact.bloom_chunk_files.max(1);
+    let (consolidated, superseded) = consolidate_small_chunks(
+        org_id,
+        stream_type,
+        stream_name,
+        date,
+        &stamped_rows,
+        chunk_files,
+        cfg.compact.bloom_max_chunks,
+        chunk_files,
+    )
+    .await;
+    let consolidated_files = consolidated.len();
+    members.extend(consolidated);
+
+    // Chunking: members sorted by their section bytes so files of similar
+    // cardinality share a chunk — each field section is folded to the
+    // chunk's smallest block count, and neighbours in size lose least to
+    // the fold. Every chunk is one v2 `.bf` with the group file table and
+    // presence bits.
+    members.sort_by_key(|member| (member.section_bytes(), member.fence.0));
     let base_ver = now_micros();
     let mut chunk_idx: i64 = 0;
     let mut built = 0usize;
-    for (_sig, mut chunk_files) in chunks {
-        chunk_files.sort_by_key(|(fence, _)| fence.0);
-        for sub in chunk_files.chunks(MAX_FILES_PER_BF) {
-            let bloom_ver = base_ver + chunk_idx;
-            chunk_idx += 1;
-            let mut field_blooms: Vec<FieldBloom> = Vec::new();
-            for (fence, blooms) in sub {
-                for b in blooms {
-                    field_blooms.push(FieldBloom {
-                        field: b.field.clone(),
-                        file_id: fence.0 as u64,
-                        n_items: b.n_items,
-                        bytes: b.bytes.clone(),
-                    });
-                }
+    let mut moved = 0usize;
+    let mut new_versions: Vec<i64> = Vec::new();
+    for chunk in members.chunks(chunk_files) {
+        let bloom_ver = base_ver + chunk_idx;
+        chunk_idx += 1;
+        let field_blooms = fold_chunk_sections(chunk);
+        let group: Vec<GroupMember> = chunk.iter().map(|m| m.presence.clone()).collect();
+        let blob = BloomWriter::serialize_v2(&group, field_blooms)
+            .map_err(|e| anyhow::anyhow!("serialize .bf: {e}"))?;
+        let path =
+            infra::bloom::path::bloom_path(org_id, stream_type, stream_name, date, bloom_ver);
+        let account = infra::storage::get_account(org_id, &path).unwrap_or_default();
+        infra::storage::put(&account, &path, bytes::Bytes::from(blob)).await?;
+        new_versions.push(bloom_ver);
+        // stamp LAST: pending rows from 0, consolidated rows from their old
+        // version (a heal in between re-pended the row, which both leave at 0)
+        let pending_fences: Vec<BloomFence> = chunk
+            .iter()
+            .filter(|m| m.restamp_from.is_none())
+            .map(|m| m.fence)
+            .collect();
+        let mut matched = infra::file_list::update_bloom_ver(&pending_fences, bloom_ver).await?;
+        let mut by_old: HashMap<i64, Vec<BloomFence>> = HashMap::new();
+        for m in chunk {
+            if let Some(old) = m.restamp_from {
+                by_old.entry(old).or_default().push(m.fence);
             }
-            let blob = BloomWriter::serialize(field_blooms)
-                .map_err(|e| anyhow::anyhow!("serialize .bf: {e}"))?;
-            let path =
-                infra::bloom::path::bloom_path(org_id, stream_type, stream_name, date, bloom_ver);
-            let account = infra::storage::get_account(org_id, &path).unwrap_or_default();
-            infra::storage::put(&account, &path, bytes::Bytes::from(blob)).await?;
-            let expected: Vec<BloomFence> = sub.iter().map(|(fence, _)| *fence).collect();
-            let matched = infra::file_list::update_bloom_ver(&expected, bloom_ver).await?;
-            if matched == 0
-                && let Err(delete_error) = infra::storage::delete(&account, &path).await
-            {
-                let tombstone = FileListDeleted {
-                    id: 0,
-                    account: account.clone(),
-                    file: path.clone(),
-                    index_generation: 0,
-                    index_file: false,
-                    flattened: false,
-                };
-                infra::file_list::batch_add_deleted(
-                    org_id,
-                    now_micros(),
-                    std::slice::from_ref(&tombstone),
-                )
-                .await
-                .map_err(|outbox_error| {
-                    anyhow::anyhow!(
-                        "unreferenced bloom {path} delete failed ({delete_error}) and cleanup \
-                         enqueue failed: {outbox_error}"
-                    )
-                })?;
-                log::warn!(
-                    "[COMPACTOR:BLOOM] unreferenced chunk {path} could not be deleted \
-                     immediately; queued for deferred cleanup: {delete_error}"
-                );
-            }
-            built += matched as usize;
         }
+        for (old, fences) in by_old {
+            let restamped = infra::file_list::update_bloom_ver_from(
+                org_id,
+                stream_type,
+                stream_name,
+                date,
+                &fences,
+                old,
+                bloom_ver,
+            )
+            .await?;
+            moved += restamped as usize;
+            matched += restamped;
+        }
+        if matched == 0
+            && let Err(delete_error) = infra::storage::delete(&account, &path).await
+        {
+            let tombstone = FileListDeleted {
+                id: 0,
+                account: account.clone(),
+                file: path.clone(),
+                index_generation: 0,
+                index_file: false,
+                flattened: false,
+            };
+            infra::file_list::batch_add_deleted(
+                org_id,
+                now_micros(),
+                std::slice::from_ref(&tombstone),
+            )
+            .await
+            .map_err(|outbox_error| {
+                anyhow::anyhow!(
+                    "unreferenced bloom {path} delete failed ({delete_error}) and cleanup \
+                     enqueue failed: {outbox_error}"
+                )
+            })?;
+            log::warn!(
+                "[COMPACTOR:BLOOM] unreferenced chunk {path} could not be deleted \
+                 immediately; queued for deferred cleanup: {delete_error}"
+            );
+        }
+        built += matched as usize;
     }
     let not_applicable_matched = if not_applicable.is_empty() {
         0
     } else {
         infra::file_list::update_bloom_ver(&not_applicable, BLOOM_VER_NOT_APPLICABLE).await?
     };
+
+    // Superseded chunks whose rows all moved: deferred delete (never inline).
+    // A version a concurrent heal left referenced stays; the GC below picks
+    // it up once nothing references it.
+    let mut retired = 0usize;
+    let mut tombstones: Vec<FileListDeleted> = Vec::new();
+    for old in superseded {
+        if infra::file_list::bloom_ver_referenced(org_id, stream_type, stream_name, date, old)
+            .await?
+        {
+            continue;
+        }
+        let path = infra::bloom::path::bloom_path(org_id, stream_type, stream_name, date, old);
+        tombstones.push(FileListDeleted {
+            id: 0,
+            account: infra::storage::get_account(org_id, &path).unwrap_or_default(),
+            file: path,
+            index_generation: 0,
+            index_file: false,
+            flattened: false,
+        });
+        retired += 1;
+    }
+    // GC: every `.bf` of the hour no live row references, older than the
+    // grace period (a crash between an object PUT and its stamp, a merge
+    // that retired an input chunk's last member, ...).
+    let gc = gc_unreferenced_chunks(
+        org_id,
+        stream_type,
+        stream_name,
+        date,
+        &new_versions,
+        now,
+        cfg.compact.bloom_gc_min_age_secs,
+    )
+    .await;
+    match gc {
+        Ok(mut orphans) => tombstones.append(&mut orphans),
+        Err(e) => log::warn!(
+            "[COMPACTOR:BLOOM] {org_id}/{stream_type}/{stream_name}/{date}: chunk GC skipped: {e:#}"
+        ),
+    }
+    let gc_queued = tombstones.len() - retired;
+    if !tombstones.is_empty() {
+        infra::file_list::batch_add_deleted(org_id, now_micros(), &tombstones).await?;
+    }
     log::info!(
         "[COMPACTOR:BLOOM] {org_id}/{stream_type}/{stream_name}/{date}: built .bf for {built} \
-         files ({chunk_idx} chunks, {fallback_streams} dictionary fallbacks, \
-         {not_applicable_matched} not applicable, {unbuildable_matched} unbuildable) in {:?}",
+         files ({chunk_idx} chunks of <= {chunk_files}; {sidecar_only} sidecar-only loads, \
+         {fallback_streams} dictionary fallbacks, {deferred} deferred, {repacked} sidecars \
+         repacked to the current layout, {consolidated_files} consolidated from small chunks, \
+         {moved} restamped, {retired} superseded + {gc_queued} orphaned chunks queued for \
+         deletion, {not_applicable_matched} not applicable, {unbuildable_matched} unbuildable) \
+         in {:?}",
         started.elapsed()
     );
     Ok(())
+}
+
+/// Fold every field section of one chunk down to the chunk's smallest block
+/// count for that field (`Sbbf::fold`: sound for any power-of-two divisor —
+/// membership answers are preserved, only the fill ratio rises), so one
+/// block-row of the transposed matrix answers every member. A member whose
+/// section cannot be folded (not a power-of-two multiple — never produced by
+/// this crate's writers) contributes no section for that field (no info).
+fn fold_chunk_sections(chunk: &[BuildMember]) -> Vec<FieldBloom> {
+    let mut min_blocks: HashMap<&str, u32> = HashMap::new();
+    for member in chunk {
+        for bloom in &member.blooms {
+            min_blocks
+                .entry(bloom.field.as_str())
+                .and_modify(|min| *min = (*min).min(bloom.num_blocks))
+                .or_insert(bloom.num_blocks);
+        }
+    }
+    let mut out = Vec::new();
+    for member in chunk {
+        let file_id = member.fence.0 as u64;
+        for bloom in &member.blooms {
+            let target = min_blocks[bloom.field.as_str()];
+            let bytes = if bloom.num_blocks == target {
+                bloom.bytes.clone()
+            } else {
+                let folded = infra::bloom::Sbbf::from_bytes(&bloom.bytes).and_then(|mut sbbf| {
+                    sbbf.fold(target)?;
+                    Ok(sbbf.to_bytes())
+                });
+                match folded {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        log::warn!(
+                            "[COMPACTOR:BLOOM] file {file_id} field {:?}: cannot fold {} -> \
+                             {target} blocks ({e}); section left out (no info)",
+                            bloom.field,
+                            bloom.num_blocks
+                        );
+                        continue;
+                    }
+                }
+            };
+            out.push(FieldBloom {
+                field: bloom.field.clone(),
+                file_id,
+                n_items: bloom.n_items,
+                bytes,
+            });
+        }
+    }
+    out
+}
+
+/// B4 consolidation: when the hour carries more than `max_chunks` stamped
+/// versions, read SMALL chunks (members `<= chunk_files / 4`, and every v1
+/// chunk) back — footer + body in one GET, de-transposed per member — and
+/// hand their still-live members to the current build with their presence
+/// (the v2 footer's own bits; a v1 chunk's from each member's sidecar
+/// tail). Oldest versions first, and no further chunk is opened once
+/// `max_members` members are collected: the resident set stays one chunk's
+/// worth however fragmented the hour is. Returns the members and the
+/// versions they left. A chunk that cannot be read stays as it is.
+#[allow(clippy::too_many_arguments)]
+async fn consolidate_small_chunks(
+    org_id: &str,
+    stream_type: config::meta::stream::StreamType,
+    stream_name: &str,
+    date: &str,
+    stamped_rows: &[&infra::file_list::FileRecord],
+    chunk_files: usize,
+    max_chunks: usize,
+    max_members: usize,
+) -> (Vec<BuildMember>, Vec<i64>) {
+    let mut by_version: std::collections::BTreeMap<i64, Vec<&infra::file_list::FileRecord>> =
+        std::collections::BTreeMap::new();
+    for row in stamped_rows {
+        by_version.entry(row.bloom_ver).or_default().push(row);
+    }
+    if by_version.len() <= max_chunks.max(1) {
+        return (Vec::new(), Vec::new());
+    }
+    let small_limit = (chunk_files / 4).max(1);
+    let mut members: Vec<BuildMember> = Vec::new();
+    let mut superseded = Vec::new();
+    let total_versions = by_version.len();
+    let mut visited = 0usize;
+    for (version, rows) in by_version {
+        if members.len() >= max_members {
+            log::info!(
+                "[COMPACTOR:BLOOM] {org_id}/{stream_type}/{stream_name}/{date}: consolidation \
+                 bounded at {} members this pass; {} of {total_versions} versions left for the \
+                 hour's next visit",
+                members.len(),
+                total_versions - visited
+            );
+            break;
+        }
+        visited += 1;
+        let path = infra::bloom::path::bloom_path(org_id, stream_type, stream_name, date, version);
+        let account = infra::storage::get_account(org_id, &path).unwrap_or_default();
+        let object = match infra::storage::get_bytes(&account, &path).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                log::warn!("[COMPACTOR:BLOOM] consolidation: {path} unreadable, kept as is: {e}");
+                continue;
+            }
+        };
+        let reader = match infra::bloom::BloomReader::parse(&object) {
+            Ok(reader) => reader,
+            Err(e) => {
+                log::warn!("[COMPACTOR:BLOOM] consolidation: {path} unparsable, kept as is: {e}");
+                continue;
+            }
+        };
+        // every v1 chunk counts as small (no presence, per-section tables);
+        // a v2 chunk only below the member limit
+        if reader.is_v2() && rows.len() > small_limit {
+            continue;
+        }
+        let live: HashMap<u64, &infra::file_list::FileRecord> =
+            rows.iter().map(|row| (row.id as u64, *row)).collect();
+        let mut sections_of: HashMap<u64, Vec<vortex_index::bloom::FileBloom>> = HashMap::new();
+        let mut consistent = true;
+        for layout in reader.section_layouts() {
+            let start = layout.body_offset as usize;
+            let end = start + layout.matrix_bytes() as usize;
+            let Some(matrix) = object.get(start..end) else {
+                consistent = false;
+                break;
+            };
+            let Some(bodies) = infra::bloom::BloomReader::detranspose_section(&layout, matrix)
+            else {
+                consistent = false;
+                break;
+            };
+            for ((file_id, n_items), bytes) in
+                layout.file_ids.iter().zip(layout.n_items).zip(bodies)
+            {
+                if !live.contains_key(file_id) {
+                    continue; // merged away: nothing references it any more
+                }
+                sections_of
+                    .entry(*file_id)
+                    .or_default()
+                    .push(vortex_index::bloom::FileBloom {
+                        field: layout.field.to_string(),
+                        num_blocks: layout.num_blocks,
+                        n_items: *n_items,
+                        bytes,
+                    });
+            }
+        }
+        if !consistent {
+            log::warn!("[COMPACTOR:BLOOM] consolidation: {path} footer/body disagree, kept as is");
+            continue;
+        }
+        for (file_id, row) in live {
+            let presence = match reader.member_columns(file_id) {
+                Some((columns, complete)) => {
+                    GroupMember::new(file_id, columns).with_complete(complete)
+                }
+                // v1 chunk: presence from the member's sidecar tail (one GET);
+                // unreadable -> no info
+                None => match sidecar_presence(&FileKey::from(row)).await {
+                    Ok(presence) => presence,
+                    Err(e) => {
+                        log::debug!(
+                            "[COMPACTOR:BLOOM] consolidation: no presence for file {file_id}: {e:#}"
+                        );
+                        GroupMember::new(file_id, Vec::new()).with_complete(false)
+                    }
+                },
+            };
+            members.push(BuildMember {
+                fence: (row.id, row.index_generation, row.index_size),
+                presence,
+                blooms: sections_of.remove(&file_id).unwrap_or_default(),
+                restamp_from: Some(version),
+            });
+        }
+        superseded.push(version);
+    }
+    (members, superseded)
+}
+
+/// The `.bf` objects of the hour that no live row references (after this
+/// pass's stamps) and that are older than the grace period, as deferred
+/// delete tombstones. `new_versions` are the chunks just written (referenced
+/// by construction, even if their stamp matched nothing — those were handled
+/// inline).
+async fn gc_unreferenced_chunks(
+    org_id: &str,
+    stream_type: config::meta::stream::StreamType,
+    stream_name: &str,
+    date: &str,
+    new_versions: &[i64],
+    now: i64,
+    min_age_secs: i64,
+) -> Result<Vec<FileListDeleted>, anyhow::Error> {
+    let dir = infra::bloom::path::bloom_dir(org_id, stream_type, stream_name, date);
+    let account = infra::storage::get_account(org_id, &dir).unwrap_or_default();
+    let objects = infra::storage::list(&account, &dir).await?;
+    if objects.is_empty() {
+        return Ok(Vec::new());
+    }
+    // fresh view: the rows as they stand after this pass's stamps
+    let referenced: HashSet<i64> =
+        infra::file_list::query_for_bloom(org_id, stream_type, stream_name, date)
+            .await?
+            .iter()
+            .map(|row| row.bloom_ver)
+            .filter(|version| *version > 0)
+            .chain(new_versions.iter().copied())
+            .collect();
+    let min_age_micros = min_age_secs.max(0).saturating_mul(1_000_000);
+    let mut tombstones = Vec::new();
+    for object in objects {
+        // `{bloom_ver}.bf`; the listed key may carry the bucket prefix, so
+        // the logical key is rebuilt from the version
+        let Some(version) = object
+            .rsplit('/')
+            .next()
+            .and_then(|name| name.strip_suffix(".bf"))
+            .and_then(|stem| stem.parse::<i64>().ok())
+            .filter(|version| *version > 0)
+        else {
+            continue;
+        };
+        if referenced.contains(&version) || now - version < min_age_micros {
+            continue;
+        }
+        let path = infra::bloom::path::bloom_path(org_id, stream_type, stream_name, date, version);
+        tombstones.push(FileListDeleted {
+            id: 0,
+            account: account.clone(),
+            file: path,
+            index_generation: 0,
+            index_file: false,
+            flattened: false,
+        });
+    }
+    Ok(tombstones)
+}
+
+/// How one pending file's sections were obtained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoadSource {
+    /// Sidecar-only: the tail + the bloom blob, every section writer-flagged.
+    Sidecar,
+    /// The full ranged reader (legacy sections validated against the docs
+    /// schema, scope supplements).
+    Reader,
+    /// Rebuilt by streaming the term dictionary (backfill of old files).
+    Dictionary,
+}
+
+/// One loaded pending file: its presence declaration plus the sections it
+/// contributes, and the sidecar's layout generation (§5: a file below the
+/// current writer's generation is a repack candidate).
+struct LoadedFile {
+    presence: GroupMember,
+    blooms: Vec<vortex_index::bloom::FileBloom>,
+    source: LoadSource,
+    layout_gen: u32,
 }
 
 enum LoadedBlooms {
@@ -479,6 +1008,154 @@ enum LoadedBlooms {
 /// queue. Reset each pass.
 static FALLBACK_BUDGET: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
+/// Per-pass budget of §5 sidecar repacks (process-wide, `ZO_COMPACT_SIDECAR_
+/// REPACK_BUDGET`, default 0 = off): each is one sidecar download + upload.
+/// Reset each pass.
+static REPACK_BUDGET: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// What the current writers stamp — the repack target (same knobs as
+/// `core_writer_options_from_config`).
+fn sidecar_repack_options(cfg: &config::Config) -> vortex_index::SidecarRepackOptions {
+    vortex_index::SidecarRepackOptions {
+        sidecar_tail_zstd: cfg.limit.vix_sidecar_tail_zstd,
+        auto_bloom: vortex_index::bloom::AutoBloomPolicy {
+            min_distinct: cfg.common.vix_bloom_auto_min_distinct,
+            max_ratio: cfg.common.vix_bloom_auto_max_ratio,
+            max_data_pct: cfg.common.vix_bloom_auto_max_data_pct,
+        },
+        bloom_fpp: cfg.common.vix_bloom_fpp,
+    }
+}
+
+/// §5: repack one file's sidecar to the current layout and publish it as a
+/// new index generation (the heal's publication path: create-only upload,
+/// CAS, cache invalidation, broadcast; the row re-pends at `bloom_ver = 0`).
+/// `Ok(true)` = a new generation was published (or the CAS lost to a
+/// concurrent rewrite — either way the file left this build).
+async fn repack_and_publish(
+    org_id: &str,
+    stream_type: config::meta::stream::StreamType,
+    stream_name: &str,
+    file: &FileKey,
+    opts: &vortex_index::SidecarRepackOptions,
+) -> Result<bool, anyhow::Error> {
+    let handle = tokio::runtime::Handle::current();
+    let data: Arc<dyn vortex_index::VixRangeSource> = Arc::new(HealProbeRangeSource {
+        account: file.account.clone(),
+        location: object_store::path::Path::from(file.key.as_str()),
+        size: file.meta.compressed_size as u64,
+        handle: handle.clone(),
+        cancel: None,
+    });
+    let Some(index) = sidecar_source(file, handle) else {
+        return Ok(false);
+    };
+    let started = std::time::Instant::now();
+    let opts = *opts;
+    let repack =
+        tokio::task::spawn_blocking(move || vortex_index::repack_sidecar(data, index, &opts))
+            .await?
+            .map_err(|e| {
+                // a sidecar whose own bytes cannot be repacked (missing
+                // properties, unknown dictionary codec, bad zstd frame)
+                // fails the same way on every attempt: carry the poison
+                // marker so the caller refunds its budget slot
+                if vix_error_is_deterministic(&e) {
+                    e.context(vortex_index::bloom::UnbuildableFile)
+                } else {
+                    e
+                }
+            })?;
+    log::info!(
+        "[COMPACTOR:BLOOM] {}: repacked sidecar layout_gen {} -> {}, {} -> {} bytes, AUTO \
+         sections added {:?}, took {:?}",
+        file.key,
+        repack.from_layout_gen,
+        vortex_index::target_layout_gen(&opts),
+        file.meta.index_size,
+        repack.sidecar.len(),
+        repack.added_sections,
+        started.elapsed()
+    );
+    let index_size = repack.sidecar.len() as u64;
+    let outcome = crate::service::vix::core_writer::SidecarHealOutcome::Rebuilt {
+        index: repack.sidecar,
+        stats: vortex_index::VixWriterStats {
+            row_count: repack.row_count,
+            term_count: repack.term_count,
+            index_size,
+            ..Default::default()
+        },
+    };
+    let cfg = get_config();
+    let stream_settings = infra::schema::get_settings(org_id, stream_name, stream_type).await;
+    let compliance = cfg.s3.feature_force_infrequent_access
+        && stream_settings
+            .map(|s| s.storage_type)
+            .unwrap_or(config::meta::stream::StorageType::Normal)
+            .is_compliance();
+    super::merge::publish_sidecar_generation(
+        0,
+        org_id,
+        stream_type,
+        stream_name,
+        file,
+        outcome,
+        compliance,
+        "repacked",
+    )
+    .await
+}
+
+/// The ranged source of a file's `.vxi` sidecar. v3 split: the per-file bloom
+/// blob (and the dictionary the backfill streams) live in the SIDECAR,
+/// fetched by range. The pending queue selects `index_size > 0` rows only, so
+/// the sidecar exists for every file reaching here; index-less files keep
+/// their existing sentinel path upstream.
+fn sidecar_source(
+    file: &FileKey,
+    handle: tokio::runtime::Handle,
+) -> Option<Arc<dyn vortex_index::VixRangeSource>> {
+    config::vix_sidecar_key(&file.key, file.meta.index_generation)
+        .filter(|_| file.meta.index_size > 0)
+        .map(|sidecar_key| {
+            Arc::new(HealProbeRangeSource {
+                account: file.account.clone(),
+                location: object_store::path::Path::from(sidecar_key.as_str()),
+                size: file.meta.index_size as u64,
+                handle,
+                cancel: None,
+            }) as Arc<dyn vortex_index::VixRangeSource>
+        })
+}
+
+/// A file's presence declaration from its sidecar tail alone (one GET).
+async fn sidecar_presence(file: &FileKey) -> Result<GroupMember, anyhow::Error> {
+    let handle = tokio::runtime::Handle::current();
+    let source =
+        sidecar_source(file, handle).ok_or_else(|| anyhow::anyhow!("{}: no sidecar", file.key))?;
+    let file_id = file.id as u64;
+    tokio::task::spawn_blocking(move || {
+        let probe = vortex_index::FileBloomProbe::open_sidecar(source)?;
+        Ok(presence_of(
+            file_id,
+            probe.field_entries().iter().map(|e| e.name.as_str()),
+            probe.columns_complete(),
+        ))
+    })
+    .await?
+}
+
+fn presence_of<'a>(
+    file_id: u64,
+    columns: impl Iterator<Item = &'a str>,
+    complete: bool,
+) -> GroupMember {
+    GroupMember::new(file_id, columns.map(str::to_string).collect()).with_complete(complete)
+}
+
+/// Load one pending file's sections and presence. `Ok(None)` = deferred
+/// (the per-pass dictionary budget is spent; the file stays pending).
 async fn load_file_blooms(
     file: &FileKey,
     bloom_fields: &[String],
@@ -486,7 +1163,7 @@ async fn load_file_blooms(
     composite_scope: &config::VixBloomCompositeScope,
     auto_id_scope: bool,
     bloom_only_never: Arc<HashSet<String>>,
-) -> Result<LoadedBlooms, anyhow::Error> {
+) -> Result<Option<LoadedFile>, anyhow::Error> {
     let handle = tokio::runtime::Handle::current();
     let source: Arc<dyn vortex_index::VixRangeSource> = Arc::new(HealProbeRangeSource {
         account: file.account.clone(),
@@ -496,40 +1173,136 @@ async fn load_file_blooms(
         handle: handle.clone(),
         cancel: None,
     });
-    // v3 split: the per-file bloom blob (and the dictionary the backfill
-    // streams) live in the `.vxi` SIDECAR, fetched by range. The pending
-    // queue selects `index_size > 0` rows only, so the sidecar exists for
-    // every file reaching here; index-less files keep their existing
-    // sentinel path upstream.
-    let index_source: Option<Arc<dyn vortex_index::VixRangeSource>> =
-        config::vix_sidecar_key(&file.key, file.meta.index_generation)
-            .filter(|_| file.meta.index_size > 0)
-            .map(|sidecar_key| {
-                Arc::new(HealProbeRangeSource {
-                    account: file.account.clone(),
-                    location: object_store::path::Path::from(sidecar_key.as_str()),
-                    size: file.meta.index_size as u64,
-                    handle,
-                    cancel: None,
-                }) as Arc<dyn vortex_index::VixRangeSource>
-            });
+    let index_source = sidecar_source(file, handle);
     let bloom_fields = bloom_fields.to_vec();
     let composite_scope = (*composite_scope).clone();
     let file_key = file.key.clone();
+    let file_id = file.id as u64;
     tokio::task::spawn_blocking(move || {
+        // B4 fast path: the sidecar tail alone (1 GET) gives the presence
+        // declaration and the section table; when every per-field section is
+        // writer-flagged `bf` and nothing in the requested scope needs a
+        // dictionary supplement, the blob (1 more GET) is the whole load —
+        // no data-object read at all.
+        if let Some(index_source) = index_source.as_ref() {
+            let probe = vortex_index::FileBloomProbe::open_sidecar(Arc::clone(index_source))?;
+            let presence = presence_of(
+                file_id,
+                probe.field_entries().iter().map(|e| e.name.as_str()),
+                probe.columns_complete(),
+            );
+            if let Some(blooms) = sidecar_only_sections(
+                &probe,
+                &bloom_fields,
+                &composite_scope,
+                auto_id_scope,
+                &bloom_only_never,
+                &file_key,
+            )? {
+                return Ok(Some(LoadedFile {
+                    presence,
+                    blooms,
+                    source: LoadSource::Sidecar,
+                    layout_gen: probe.layout_gen(),
+                }));
+            }
+        }
+        // the full reader: legacy sections, scope supplements, backfills
         let reader = VixReader::open_ranged_with_index(source, index_source)?;
-        load_blooms_sync(
-            &reader,
-            &bloom_fields,
-            fpp,
-            &composite_scope,
-            auto_id_scope,
-            &bloom_only_never,
-            &file_key,
-            &FALLBACK_BUDGET,
+        let presence = presence_of(file_id, reader.field_names(), reader.columns_complete());
+        let layout_gen = reader.layout_gen();
+        Ok(
+            match load_blooms_sync(
+                &reader,
+                &bloom_fields,
+                fpp,
+                &composite_scope,
+                auto_id_scope,
+                &bloom_only_never,
+                &file_key,
+                &FALLBACK_BUDGET,
+            )? {
+                LoadedBlooms::FromBlob(blooms) => Some(LoadedFile {
+                    presence,
+                    blooms,
+                    source: LoadSource::Reader,
+                    layout_gen,
+                }),
+                LoadedBlooms::FromDict(blooms) => Some(LoadedFile {
+                    presence,
+                    blooms,
+                    source: LoadSource::Dictionary,
+                    layout_gen,
+                }),
+                LoadedBlooms::Deferred => None,
+            },
         )
     })
     .await?
+}
+
+/// The sidecar-only section set of a file, when it is SUFFICIENT: the
+/// composite section (retained as is, its guards are authoritative) plus
+/// every per-field section whose field the writer flagged `bf` (eligible by
+/// construction: complete raw-string term values). `None` when the file
+/// needs the full reader — a per-field section without the flag (legacy
+/// explicit field: schema-validated there), or a requested field (stream
+/// bloom field, scoped ID field) with term capability that neither a flagged
+/// section nor the composite's guards cover (a dictionary supplement).
+fn sidecar_only_sections(
+    probe: &vortex_index::FileBloomProbe,
+    bloom_fields: &[String],
+    composite_scope: &config::VixBloomCompositeScope,
+    auto_id_scope: bool,
+    bloom_only_never: &HashSet<String>,
+    context: &str,
+) -> Result<Option<Vec<vortex_index::bloom::FileBloom>>, anyhow::Error> {
+    if !probe.has_blob() {
+        return Ok(None);
+    }
+    let flagged: HashSet<&str> = probe.bloomed_fields().collect();
+    let has_unflagged_section = probe.sections().iter().any(|section| {
+        section.field != vortex_index::bloom::COMPOSITE_BLOOM_FIELD
+            && !flagged.contains(section.field.as_str())
+    });
+    if has_unflagged_section {
+        return Ok(None);
+    }
+    let Some(blooms) = probe.read_file_blooms()? else {
+        return Ok(None);
+    };
+    // requested = stream bloom fields + the composite scope's fields; a
+    // term-capable, non-partial requested field without coverage needs the
+    // reader's supplement path
+    let needs_supplement = probe.field_entries().iter().any(|entry| {
+        let name = entry.name.as_str();
+        let requested = bloom_fields.iter().any(|field| field == name)
+            || composite_scope_allows(composite_scope, auto_id_scope, bloom_only_never, name);
+        requested
+            && entry.has_type(vortex_index::FIELD_TYPE_TERM)
+            && !probe.partial_fields().contains(name)
+            && !flagged.contains(name)
+            && !composite_sections_cover_field(&blooms, name)
+    });
+    if needs_supplement {
+        log::debug!(
+            "[COMPACTOR:BLOOM] {context}: a requested term field lacks a flagged section and \
+             composite coverage; taking the reader path"
+        );
+        return Ok(None);
+    }
+    // keep the composite and the flagged per-field sections; a partial
+    // field's section is never trusted
+    Ok(Some(
+        blooms
+            .into_iter()
+            .filter(|bloom| {
+                bloom.field == vortex_index::bloom::COMPOSITE_BLOOM_FIELD
+                    || (flagged.contains(bloom.field.as_str())
+                        && !probe.partial_fields().contains(bloom.field.as_str()))
+            })
+            .collect(),
+    ))
 }
 
 /// The sync per-file load: transpose a complete blob directly, supplement a
@@ -625,7 +1398,11 @@ fn retain_and_supplement_blob(
     let needs_validation: Vec<&str> = reader
         .term_fields()
         .filter(|(_id, name)| {
-            let additive = bloom_fields.iter().any(|field| field == name);
+            // S5: a field the writer flagged `bf` carries a per-field section
+            // it deemed eligible (W1 AUTO or explicit) — additive like a
+            // stream bloom field, never dropped on this path
+            let additive = bloom_fields.iter().any(|field| field == name)
+                || reader.bloomed_fields().any(|field| field == *name);
             let scoped =
                 composite_scope_allows(composite_scope, auto_id_scope, bloom_only_never, name);
             if !additive && !scoped {
@@ -776,10 +1553,12 @@ fn requested_complete_term_pairs(
         .collect())
 }
 
-/// Resolve the only dictionary fields whose raw bytes can authoritatively
-/// answer query-literal Bloom probes. Missing docs schema/type information,
-/// non-string types and partial dictionaries all degrade to no coverage.
-fn docs_schema_error_is_deterministic(error: &anyhow::Error) -> bool {
+/// Whether a `VixError` is a pure function of the file's own bytes
+/// (footer/dictionary parse, unsupported format) rather than a fetch/IO
+/// failure. Resolving docs schema types for Bloom coverage and repacking a
+/// sidecar both classify their failures with it: deterministic ones carry
+/// the [`vortex_index::bloom::UnbuildableFile`] marker.
+fn vix_error_is_deterministic(error: &anyhow::Error) -> bool {
     match error.downcast_ref::<vortex_index::VixError>() {
         Some(
             vortex_index::VixError::Malformed(_) | vortex_index::VixError::UnsupportedFormat(_),
@@ -822,7 +1601,7 @@ fn complete_raw_string_term_pairs(
         return Ok(Vec::new());
     }
     let schema = reader.docs_schema().map_err(|e| {
-        let deterministic = docs_schema_error_is_deterministic(&e);
+        let deterministic = vix_error_is_deterministic(&e);
         let e = e.context(format!("{context}: read docs schema for Bloom coverage"));
         if deterministic {
             e.context(vortex_index::bloom::UnbuildableFile)
@@ -1028,6 +1807,140 @@ mod tests {
         // crossing a day boundary
         let early = chrono::Utc.with_ymd_and_hms(2026, 9, 29, 0, 10, 0).unwrap();
         assert_eq!(settled_hour_cutoff(early, 2), "2026/09/28/22");
+    }
+
+    /// B4 hour selection: precedence and thresholds of the four triggers.
+    #[test]
+    fn build_trigger_precedence_and_thresholds() {
+        let cfg = config::Compact {
+            bloom_regroup_min_files: 16,
+            bloom_regroup_min_ratio: 0.25,
+            bloom_regroup_max_age_hours: 24,
+            ..Default::default()
+        };
+        let h = chrono::Duration::hours;
+        // nothing pending: never
+        assert_eq!(build_trigger(0, 100, 100, Some(h(100)), &cfg), None);
+        // no stamped file yet: first build whatever the counts
+        assert_eq!(
+            build_trigger(1, 1, 0, Some(h(0)), &cfg),
+            Some(BuildTrigger::FirstBuild)
+        );
+        // count trigger
+        assert_eq!(
+            build_trigger(16, 1000, 984, Some(h(0)), &cfg),
+            Some(BuildTrigger::PendingFiles)
+        );
+        assert_eq!(build_trigger(15, 1000, 985, Some(h(0)), &cfg), None);
+        // ratio trigger (15 of 60 = 0.25)
+        assert_eq!(
+            build_trigger(15, 60, 45, Some(h(0)), &cfg),
+            Some(BuildTrigger::PendingRatio)
+        );
+        assert_eq!(build_trigger(15, 61, 46, Some(h(0)), &cfg), None);
+        // age trigger
+        assert_eq!(
+            build_trigger(1, 1000, 999, Some(h(24)), &cfg),
+            Some(BuildTrigger::PendingAge)
+        );
+        assert_eq!(build_trigger(1, 1000, 999, Some(h(23)), &cfg), None);
+        assert_eq!(build_trigger(1, 1000, 999, None, &cfg), None);
+        // a zero min-files knob still needs one pending file
+        let eager = config::Compact {
+            bloom_regroup_min_files: 0,
+            bloom_regroup_min_ratio: 0.25,
+            bloom_regroup_max_age_hours: 24,
+            ..Default::default()
+        };
+        assert_eq!(
+            build_trigger(1, 1000, 999, None, &eager),
+            Some(BuildTrigger::PendingFiles)
+        );
+    }
+
+    /// B4 chunk fold: within a chunk every field section lands on the
+    /// chunk's smallest block count for that field, membership survives the
+    /// fold, fields are folded independently and a member without a field
+    /// contributes no section for it.
+    #[test]
+    fn fold_chunk_sections_to_the_smallest_block_count_per_field() {
+        use infra::bloom::sbbf::{BLOCK_BYTES, block_index, check_block, hash_value};
+        use vortex_index::bloom::FileBloom;
+
+        let section = |field: &str, num_blocks: u32, values: &[&str]| {
+            let mut sbbf = infra::bloom::Sbbf::new_with_num_blocks(num_blocks);
+            for value in values {
+                sbbf.insert(value.as_bytes());
+            }
+            FileBloom {
+                field: field.to_string(),
+                num_blocks: sbbf.num_blocks(),
+                n_items: values.len() as u32,
+                bytes: sbbf.to_bytes(),
+            }
+        };
+        let member = |id: i64, blooms: Vec<FileBloom>| BuildMember {
+            fence: (id, 1, 1),
+            presence: GroupMember::new(id as u64, vec!["host".into(), "tid".into()]),
+            blooms,
+            restamp_from: None,
+        };
+        let chunk = vec![
+            member(
+                1,
+                vec![
+                    section("host", 16, &["h-1", "h-2"]),
+                    section("tid", 4, &["t-1"]),
+                ],
+            ),
+            member(
+                2,
+                vec![section("host", 2, &["h-3"]), section("tid", 32, &["t-2"])],
+            ),
+            member(3, vec![section("host", 8, &["h-4"])]),
+        ];
+        let folded = fold_chunk_sections(&chunk);
+        let find = |file_id: u64, field: &str| {
+            folded
+                .iter()
+                .find(|b| b.file_id == file_id && b.field == field)
+                .unwrap_or_else(|| panic!("{file_id}/{field}"))
+        };
+        for file_id in [1u64, 2, 3] {
+            assert_eq!(
+                find(file_id, "host").bytes.len(),
+                2 * BLOCK_BYTES,
+                "host folds to 2"
+            );
+        }
+        assert_eq!(
+            find(1, "tid").bytes.len(),
+            4 * BLOCK_BYTES,
+            "tid folds to 4"
+        );
+        assert_eq!(find(2, "tid").bytes.len(), 4 * BLOCK_BYTES);
+        assert!(
+            !folded.iter().any(|b| b.file_id == 3 && b.field == "tid"),
+            "no section for a field the member lacks"
+        );
+        assert_eq!(folded.len(), 5);
+        // membership is preserved through the fold
+        let probe = |bloom: &FieldBloom, value: &str| {
+            let num_blocks = (bloom.bytes.len() / BLOCK_BYTES) as u32;
+            let h = hash_value(value.as_bytes());
+            let bi = block_index(h, num_blocks) as usize;
+            let block: &[u8; BLOCK_BYTES] = bloom.bytes[bi * BLOCK_BYTES..(bi + 1) * BLOCK_BYTES]
+                .try_into()
+                .unwrap();
+            check_block(block, h)
+        };
+        assert!(probe(find(1, "host"), "h-1"));
+        assert!(probe(find(1, "host"), "h-2"));
+        assert!(probe(find(2, "host"), "h-3"));
+        assert!(probe(find(3, "host"), "h-4"));
+        assert!(probe(find(1, "tid"), "t-1"));
+        assert!(probe(find(2, "tid"), "t-2"));
+        assert_eq!(find(1, "host").n_items, 2);
     }
 
     fn composite_scope(broad: bool, explicit_fields: &str) -> config::VixBloomCompositeScope {
@@ -1843,23 +2756,13 @@ mod tests {
             "an unusable numeric dictionary must not consume fallback budget"
         );
 
-        let blob_reader = open_pair(numeric_id_file(true));
-        assert!(blob_reader.has_file_blooms());
-        let budget = AtomicI64::new(0);
-        let loaded = load_blooms_sync(
-            &blob_reader,
-            &["trace_id".to_string()],
-            0.001,
-            &composite_scope(false, ""),
-            false,
-            &HashSet::new(),
-            "unit-test",
-            &budget,
-        )
-        .unwrap();
+        // The writer now refuses the per-field section for a non-string
+        // bloom field (same gate as the composite), so a configured numeric
+        // ID yields no blob at all — the assembler's own type gate above
+        // stays as defence in depth for files older binaries wrote.
         assert!(
-            matches!(loaded, LoadedBlooms::FromBlob(b) if b.is_empty()),
-            "an old numeric per-field blob must be dropped rather than republished"
+            !open_pair(numeric_id_file(true)).has_file_blooms(),
+            "a numeric bloom field must not publish a per-field section"
         );
     }
 

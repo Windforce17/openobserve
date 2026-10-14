@@ -1916,6 +1916,35 @@ pub struct Common {
     )]
     pub vix_bloom_only_min_distinct: u64,
     #[env_config(
+        name = "ZO_VIX_BLOOM_AUTO_MIN_DISTINCT",
+        default = 1024,
+        help = "AUTO ADDITIVE per-field value blooms (DESIGN-COLD-MISS §3): every \
+                string term field (not fts / bloom-only / demoted / excluded / partial, \
+                not already a bloom_filter_fields entry) whose EXACT distinct-value count \
+                at finish is >= this AND whose distinct/rows ratio is <= \
+                ZO_VIX_BLOOM_AUTO_MAX_RATIO (or whose name is ID-like) gets its own SBBF \
+                section, admitted smallest-first within ZO_VIX_BLOOM_AUTO_MAX_DATA_PCT. \
+                Applied identically on first encode, merge, spilled rebuild and heal; \
+                selected fields are flagged `bf` in the sidecar fields table. 0 disables."
+    )]
+    pub vix_bloom_auto_min_distinct: u64,
+    #[env_config(
+        name = "ZO_VIX_BLOOM_AUTO_MAX_RATIO",
+        default = 0.25,
+        help = "AUTO additive per-field blooms: a NON-ID-like candidate qualifies only \
+                while distinct/rows <= this (a near-unique free-text field is not a needle \
+                field and its section would be rows-sized); ID-like names are exempt."
+    )]
+    pub vix_bloom_auto_max_ratio: f64,
+    #[env_config(
+        name = "ZO_VIX_BLOOM_AUTO_MAX_DATA_PCT",
+        default = 2.0,
+        help = "AUTO additive per-field blooms: the qualified candidates are admitted \
+                smallest-distinct first while the SUM of their section bytes stays within \
+                this percent of the data object's bytes."
+    )]
+    pub vix_bloom_auto_max_data_pct: f64,
+    #[env_config(
         name = "ZO_L0_SUPERBATCH_MB",
         default = 512,
         help = "#54: builders CONCATENATE consecutive full segment claims until this \
@@ -2387,9 +2416,21 @@ pub struct Limit {
     #[env_config(
         name = "ZO_VIX_EAGER_TAIL_BYTES",
         default = 262144,
-        help = "Eager tail fetch size for ranged .vix opens (bytes; 0 = built-in 64KiB). Index blobs cluster at the file's end, so a tail covering them turns a cold open + term eval into one ranged GET on small files."
+        help = "Eager tail fetch size for ranged .vix sidecar opens (bytes; 0 = built-in 128 KiB, the data object's fixed probe). Index blobs cluster at the file's end, so a tail covering them turns a cold open + term eval into one ranged GET on small files."
     )]
     pub vix_eager_tail_bytes: u64,
+    #[env_config(
+        name = "ZO_VIX_SIDECAR_TAIL_ZSTD",
+        default = false,
+        help = "Write .vxi sidecars with a zstd-compressed puffin footer payload and a zstd-stored dict block index (layout_gen=2): a cold open's one eager-tail read then covers footer + dict on far more files. READERS PREDATING THE COMPRESSED FOOTER REJECT SUCH SIDECARS AT OPEN — enable only after every querier, compactor and ingester runs a build that parses it."
+    )]
+    pub vix_sidecar_tail_zstd: bool,
+    #[env_config(
+        name = "ZO_VIX_SIDECAR_FIRST_OPEN",
+        default = false,
+        help = "Ranged .vix opens with a sidecar fetch the sidecar tail ONLY and synthesize the data object's container from the sidecar's embedded data footer (data_footer_v1): a cold index miss costs one GET instead of two. Sidecars written before the property existed fall back to the data-tail fetch (a second round trip)."
+    )]
+    pub vix_sidecar_first_open: bool,
     #[env_config(
         name = "ZO_VIX_WALK_VERIFY_MIN_BYTES",
         default = 16777216,
@@ -2804,9 +2845,15 @@ pub struct Limit {
     #[env_config(
         name = "ZO_BLOOM_FOOTER_CACHE_MAX_SIZE",
         default = 0, // MB, default is 1% of total memory, clamped to [32, 256] MB
-        help = "Maximum memory size in MB for the bloom-filter footer cache. The cache holds the suffix bytes of each `.bf` (footer + tail of body) so subsequent prune calls skip the suffix-range GET. `.bf` body bytes are not cached here — they go through the regular file_data cache."
+        help = "Maximum memory size in MB for the bloom-filter footer cache. The cache holds the PARSED footer of each `.bf` (section tables, and for v2 the group file table + presence bits, accounted by decoded size) so subsequent prune calls skip both the suffix-range GET and the footer decode. `.bf` body bytes are not cached here — they go through the regular file_data cache."
     )]
     pub bloom_footer_cache_max_size: usize,
+    #[env_config(
+        name = "ZO_BLOOM_STRUCTURAL_MIN_GROUP_FILES",
+        default = 32,
+        help = "Bloom pruning admits every `=` / `IN` predicate structurally (DESIGN-COLD-MISS §4 B3). A query that ONLY that rule admits (no stream bloom_filter_fields entry, no composite coverage) runs its `.bf` stage only when the stamped files average at least this many files per `.bf` group — i.e. the hour was built in chunks (B4). On a one-group-per-file set every group is one footer GET that cannot answer a field without a section, so such queries keep those files unprobed instead. Per-file sidecar probes are unaffected. 0 = always run the `.bf` stage."
+    )]
+    pub bloom_structural_min_group_files: usize,
     #[env_config(
         name = "ZO_INVERTED_INDEX_SKIP_THRESHOLD",
         default = 35,
@@ -2983,6 +3030,63 @@ pub struct Compact {
                 leftovers stay queued and form later .bf chunks."
     )]
     pub bloom_build_fallback_budget: i64,
+    #[env_config(
+        name = "ZO_COMPACT_BLOOM_CHUNK_FILES",
+        default = 256,
+        help = "Max member files per `.bf` chunk (DESIGN-COLD-MISS §4 B4). Within a chunk \
+                every field section is folded to the chunk's smallest block count so one \
+                block-row answers every member."
+    )]
+    pub bloom_chunk_files: usize,
+    #[env_config(
+        name = "ZO_COMPACT_BLOOM_REGROUP_MIN_FILES",
+        default = 16,
+        help = "A settled hour with at least this many pending (bloom_ver = 0) indexed files \
+                is (re)built this pass; smaller pending sets wait (the query side probes \
+                their sidecars meanwhile) unless the ratio or age trigger fires, or the hour \
+                has no stamped file yet."
+    )]
+    pub bloom_regroup_min_files: i64,
+    #[env_config(
+        name = "ZO_COMPACT_BLOOM_REGROUP_MIN_RATIO",
+        default = 0.25,
+        help = "Pending/total ratio of an hour's indexed files at which a (re)build runs \
+                regardless of the pending count."
+    )]
+    pub bloom_regroup_min_ratio: f64,
+    #[env_config(
+        name = "ZO_COMPACT_BLOOM_REGROUP_MAX_AGE_HOURS",
+        default = 24,
+        help = "Oldest-pending age (hours since the file pended) at which a (re)build runs \
+                regardless of count and ratio."
+    )]
+    pub bloom_regroup_max_age_hours: i64,
+    #[env_config(
+        name = "ZO_COMPACT_BLOOM_MAX_CHUNKS",
+        default = 8,
+        help = "When an hour carries more than this many stamped `.bf` versions, the build \
+                also folds the SMALL chunks (members <= ZO_COMPACT_BLOOM_CHUNK_FILES / 4, and \
+                every v1 chunk) into the new chunks and CAS-restamps their files; the \
+                superseded objects are deleted through the deferred batch."
+    )]
+    pub bloom_max_chunks: usize,
+    #[env_config(
+        name = "ZO_COMPACT_BLOOM_GC_MIN_AGE_SECS",
+        default = 3600,
+        help = "Per built hour, `.bf` objects no live file_list row references and older \
+                than this many seconds are queued for deferred deletion."
+    )]
+    pub bloom_gc_min_age_secs: i64,
+    #[env_config(
+        name = "ZO_COMPACT_SIDECAR_REPACK_BUDGET",
+        default = 0,
+        help = "DESIGN-COLD-MISS §5 old-file convergence: per `.bf` builder pass, how many \
+                sidecars of an older layout generation (`layout_gen` below the current \
+                writer's) are REPACKED — index blobs copied verbatim, the current tail \
+                format + AUTO per-field blooms added, published as a new index generation \
+                (one sidecar download + upload each; no term re-derivation). 0 = off."
+    )]
+    pub sidecar_repack_budget: i64,
     #[env_config(name = "ZO_COMPACT_STRATEGY", default = "file_time")]
     // file_size, file_time, time_range
     pub strategy: String,

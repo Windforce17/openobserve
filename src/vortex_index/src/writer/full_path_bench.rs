@@ -164,6 +164,15 @@ fn input_schema(docs_schema: &SchemaRef) -> Schema {
 }
 
 fn writer_options(reader: &VixReader, variant: Variant) -> VixWriterOptions {
+    // `O2_VIX_BENCH_AUTO_MIN_DISTINCT` (default 0 = off) turns the W1 AUTO
+    // additive blooms on with the production ratio/budget defaults;
+    // `O2_VIX_BENCH_TAIL_ZSTD=1` writes the S1/S2 compressed sidecar tail.
+    let env_u64 = |name: &str| -> u64 {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    };
     VixWriterOptions {
         fts_field_names: reader.fts_fields().iter().cloned().collect(),
         value_index_excluded_field_names: if variant.excludes_times() {
@@ -180,6 +189,8 @@ fn writer_options(reader: &VixReader, variant: Variant) -> VixWriterOptions {
         // Source bloom-only metadata is sticky and authoritative. In
         // particular, do not make a second count-driven demotion decision.
         bloom_only_auto_ratio: 0.0,
+        bloom_auto_min_distinct: env_u64("O2_VIX_BENCH_AUTO_MIN_DISTINCT"),
+        sidecar_tail_zstd: env_u64("O2_VIX_BENCH_TAIL_ZSTD") == 1,
         postings_chunk_bytes: POSTINGS_CHUNK_BYTES,
         max_raw_term_len: RAW_TERM_MAX,
         row_group_size: ROW_GROUP_ROWS,
@@ -753,7 +764,12 @@ fn assert_variant_capabilities(
     let output_bloom: BTreeSet<&str> = output.bloom_only_fields().collect();
     assert_eq!(output_bloom, source_bloom);
 
+    // the time-field checks are traces-shaped; a pair without those
+    // fields (e.g. the `default` logs pair) skips them
     for field in EXCLUDED_VALUE_FIELDS {
+        if !source.has_field(field) {
+            continue;
+        }
         ensure!(
             source.has_term_capability(field),
             "variant={} field={} chunk=* phase=source_capability expected exact terms",
@@ -842,6 +858,12 @@ fn run_benchmark() -> anyhow::Result<()> {
     assert_eq!(options.bloom_only_auto_ratio, 0.0);
 
     let mut writer = VixWriter::new(&schema, options, store_original);
+    // like the sidecar-only heal: the data object's footer rides on the new
+    // sidecar and its size bounds the AUTO additive sections
+    writer.set_data_footer(crate::container::read_data_footer_payload(&file_source(
+        &path,
+    )?)?);
+    writer.set_data_object_bytes(std::fs::metadata(&path)?.len());
     for (field_id, field_name) in writer.term_fields.iter().enumerate() {
         assert_eq!(
             writer.term_field_ids.get(field_name),
@@ -849,6 +871,9 @@ fn run_benchmark() -> anyhow::Result<()> {
         );
     }
     for field in EXCLUDED_VALUE_FIELDS {
+        if !source_reader.has_field(field) {
+            continue;
+        }
         assert!(writer.term_field_ids.contains_key(field));
         assert_eq!(
             writer.value_index_excluded_fields.contains(field),

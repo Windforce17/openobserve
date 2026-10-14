@@ -205,6 +205,90 @@ struct FieldAcc {
     /// form (see [`BloomHashAcc::observe_dict_key`]) — a build carrying any
     /// of these is a bug, never a valid "nothing present" filter.
     dropped: u64,
+    /// DESIGN-COLD-MISS §3 W1: an AUTO additive CANDIDATE — tracked so its
+    /// EXACT distinct count is known at finish; published only if
+    /// [`BloomHashAcc::select_auto`] keeps it. Explicit fields are never
+    /// candidates.
+    candidate: bool,
+    /// Candidate-only: the distinct count above which the field can no
+    /// longer qualify (the ratio rule for a non-ID-like name). Crossing it
+    /// frees the hashes at once — a high-cardinality text field must not
+    /// hold 8 B × distinct for the rest of the stream.
+    cap: Option<u64>,
+    /// Candidate-only: crossed `cap` (hashes freed; never published).
+    over_cap: bool,
+}
+
+/// DESIGN-COLD-MISS §3 W1: the AUTO additive per-field bloom selection rule,
+/// applied at finish with EXACT distinct counts, identically on first
+/// encodes, merges and spilled rebuilds. A candidate is selected iff
+/// `distinct ≥ min_distinct` AND (`distinct / rows ≤ max_ratio` OR the field
+/// name is ID-like), then admitted smallest-distinct first while the SUM of
+/// admitted section bytes stays within `max_data_pct` % of the data object.
+/// `min_distinct == 0` disables AUTO (no candidate is ever tracked).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct AutoBloomPolicy {
+    pub min_distinct: u64,
+    pub max_ratio: f64,
+    pub max_data_pct: f64,
+}
+
+impl AutoBloomPolicy {
+    pub fn enabled(&self) -> bool {
+        self.min_distinct > 0
+    }
+
+    /// The distinct count a non-ID-like candidate may not exceed over
+    /// `rows` stored rows (`None` for an ID-like name: unbounded).
+    fn cap_for(&self, name: &str, rows: u64) -> Option<u64> {
+        if crate::writer::is_id_like_field_name(name) {
+            return None;
+        }
+        Some((rows as f64 * self.max_ratio).floor() as u64)
+    }
+}
+
+/// Why [`BloomHashAcc::select_auto`] left a candidate out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AutoBloomSkip {
+    /// Fewer distinct values than `min_distinct`.
+    BelowMinDistinct,
+    /// `distinct / rows` above `max_ratio` on a non-ID-like name.
+    RatioExceeded,
+    /// Qualified, but the data-percent budget was spent on smaller sections.
+    OverBudget,
+}
+
+/// Outcome of [`BloomHashAcc::select_auto`]: `(field, distinct)` per
+/// selected candidate and `(field, distinct, why)` per skipped one (an
+/// over-cap field reports the count it reached when its hashes were freed).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct AutoBloomSelection {
+    pub selected: Vec<(String, u64)>,
+    pub skipped: Vec<(String, u64, AutoBloomSkip)>,
+}
+
+/// W1 candidate NAMES plus the policy for one build's term stream — the
+/// k-way merge resolves the names against its output field table per range
+/// ([`BloomHashAcc::track_auto_candidates`]). Empty names or a disabled
+/// policy track nothing.
+#[derive(Debug, Clone, Default)]
+pub struct AutoBloomCandidates {
+    pub names: Vec<String>,
+    pub policy: AutoBloomPolicy,
+}
+
+impl AutoBloomCandidates {
+    pub fn is_empty(&self) -> bool {
+        self.names.is_empty() || !self.policy.enabled()
+    }
+}
+
+/// Serialized bytes of one per-field section holding `distinct` values at
+/// `fpp`: the header (`name_len u16 | name | algo | num_blocks | n_items`)
+/// plus the SBBF body.
+pub fn section_bytes(name: &str, distinct: u64, fpp: f64) -> u64 {
+    11 + name.len() as u64 + u64::from(num_blocks_for(distinct, fpp)) * BLOCK_BYTES as u64
 }
 
 /// Accumulates distinct-value hashes per bloom field during term emission.
@@ -289,6 +373,126 @@ impl BloomHashAcc {
         }
     }
 
+    /// DESIGN-COLD-MISS §3 W1: track `(field id, field name)` pairs as AUTO
+    /// additive CANDIDATES over a build of `rows` stored rows. A candidate
+    /// accumulates exactly like an explicit field, so its distinct count at
+    /// finish is exact, but it is published only if [`Self::select_auto`]
+    /// keeps it; a non-ID-like candidate frees its hashes the moment it
+    /// exceeds the ratio rule's cap. Explicit pairs already tracked win
+    /// (never demoted to candidates). Call before the first observe.
+    pub fn track_auto_candidates<I: IntoIterator<Item = (u16, String)>>(
+        &mut self,
+        pairs: I,
+        policy: &AutoBloomPolicy,
+        rows: u64,
+    ) {
+        if !policy.enabled() {
+            return;
+        }
+        for (id, name) in pairs {
+            if self.fields.contains_key(&id) {
+                continue;
+            }
+            let cap = policy.cap_for(&name, rows);
+            self.fields.insert(
+                id,
+                FieldAcc {
+                    name,
+                    candidate: true,
+                    cap,
+                    ..Default::default()
+                },
+            );
+        }
+    }
+
+    /// Apply the W1 selection rule to the tracked candidates with their
+    /// EXACT distinct counts: unselected candidates are removed (their
+    /// hashes dropped) BEFORE any SBBF is built; selected ones become
+    /// ordinary tracked fields. `rows` is the file's stored row count,
+    /// `data_bytes` the data object's size the percent budget applies to
+    /// (`0` = unknown: the budget admits nothing), `fpp` the build's
+    /// false-positive rate (section sizing). Deterministic: ties on
+    /// distinct count break on field name.
+    pub fn select_auto(
+        &mut self,
+        policy: &AutoBloomPolicy,
+        rows: u64,
+        data_bytes: u64,
+        fpp: f64,
+    ) -> AutoBloomSelection {
+        let mut selection = AutoBloomSelection::default();
+        let mut qualified: Vec<(u16, u64, String)> = Vec::new();
+        for (id, entry) in &self.fields {
+            if !entry.candidate {
+                continue;
+            }
+            let distinct = entry.hashes.len() as u64;
+            if entry.over_cap {
+                selection.skipped.push((
+                    entry.name.clone(),
+                    entry.cap.map_or(distinct, |cap| cap + 1),
+                    AutoBloomSkip::RatioExceeded,
+                ));
+                continue;
+            }
+            if distinct < policy.min_distinct {
+                selection.skipped.push((
+                    entry.name.clone(),
+                    distinct,
+                    AutoBloomSkip::BelowMinDistinct,
+                ));
+                continue;
+            }
+            // the ratio rule on the FINAL count (the per-worker cap only
+            // ever saw a subset of a field's keys)
+            if policy
+                .cap_for(&entry.name, rows)
+                .is_some_and(|cap| distinct > cap)
+            {
+                selection.skipped.push((
+                    entry.name.clone(),
+                    distinct,
+                    AutoBloomSkip::RatioExceeded,
+                ));
+                continue;
+            }
+            qualified.push((*id, distinct, entry.name.clone()));
+        }
+        qualified.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.2.cmp(&b.2)));
+        let budget = (data_bytes as f64 * policy.max_data_pct / 100.0).floor() as u64;
+        let mut used = 0u64;
+        let mut keep: Vec<u16> = Vec::with_capacity(qualified.len());
+        for (id, distinct, name) in qualified {
+            let bytes = section_bytes(&name, distinct, fpp);
+            if used.saturating_add(bytes) <= budget {
+                used += bytes;
+                keep.push(id);
+                selection.selected.push((name, distinct));
+            } else {
+                selection
+                    .skipped
+                    .push((name, distinct, AutoBloomSkip::OverBudget));
+            }
+        }
+        self.fields
+            .retain(|id, entry| !entry.candidate || keep.contains(id));
+        for entry in self.fields.values_mut() {
+            entry.candidate = false;
+            entry.cap = None;
+        }
+        selection.skipped.sort();
+        selection.selected.sort();
+        // the rule itself fixes the order above; the sorts only make the
+        // report stable for logs and tests (the map iteration is not)
+        selection
+    }
+
+    /// Whether any AUTO candidate is still tracked (selection pending).
+    pub fn has_auto_candidates(&self) -> bool {
+        self.fields.values().any(|entry| entry.candidate)
+    }
+
     /// Enable the #48 composite section over `(field id, field name)` pairs.
     /// Callers pass exactly the fields whose dictionaries hold COMPLETE raw
     /// values (no fts/tokenized fields, no merge-demoted fields — see
@@ -345,8 +549,15 @@ impl BloomHashAcc {
         let Some((value, id)) = split_composite_key(composite_key) else {
             return;
         };
-        if let Some(entry) = self.fields.get_mut(&id) {
+        if let Some(entry) = self.fields.get_mut(&id)
+            && !entry.over_cap
+        {
             entry.hashes.push(hash_value(value));
+            if entry.cap.is_some_and(|cap| entry.hashes.len() as u64 > cap) {
+                // can never qualify: free the accumulation now
+                entry.hashes = Vec::new();
+                entry.over_cap = true;
+            }
         }
         // #48: the same key also lands in the composite section in the
         // file-independent tagged form (see [`composite_value_key`]). The
@@ -384,7 +595,12 @@ impl BloomHashAcc {
         // untracked field ids (neither a bloom field nor — with the #48
         // composite enabled — any term field; key terms always land here)
         // are the common case and must stay cheap lookups
-        let per_field_before = self.fields.get(&id).map(|entry| entry.hashes.len());
+        // an over-cap candidate takes no more keys by design — not a drop
+        let per_field_before = self
+            .fields
+            .get(&id)
+            .filter(|entry| !entry.over_cap)
+            .map(|entry| entry.hashes.len());
         let composite_before = self
             .composite_names
             .contains_key(&id)
@@ -417,15 +633,31 @@ impl BloomHashAcc {
                 name,
                 hashes,
                 dropped,
+                candidate,
+                cap,
+                over_cap,
             },
         ) in other.fields
         {
             let entry = self.fields.entry(id).or_insert_with(|| FieldAcc {
                 name,
+                candidate,
+                cap,
                 ..Default::default()
             });
-            entry.hashes.extend(hashes);
             entry.dropped = entry.dropped.saturating_add(dropped);
+            // workers track the same candidate set with the same cap; a
+            // field over the cap in ANY worker's subset is over it in total
+            if entry.over_cap || over_cap {
+                entry.over_cap = true;
+                entry.hashes = Vec::new();
+                continue;
+            }
+            entry.hashes.extend(hashes);
+            if entry.cap.is_some_and(|cap| entry.hashes.len() as u64 > cap) {
+                entry.hashes = Vec::new();
+                entry.over_cap = true;
+            }
         }
         // #48 composite: workers share the same enable_composite pairs
         if !other.composite_names.is_empty() {
@@ -518,7 +750,19 @@ impl BloomHashAcc {
             short_keys: self.short_keys,
             ..Default::default()
         };
-        let mut fields: Vec<FieldAcc> = self.fields.into_values().collect();
+        // a candidate that never went through `select_auto` is NOT a
+        // published field: a build path that skipped the selection must not
+        // publish a partially qualified set (nor an over-cap field's freed,
+        // empty accumulation as a reject-all filter)
+        debug_assert!(
+            !self.fields.values().any(|entry| entry.candidate),
+            "bloom build with unselected AUTO candidates"
+        );
+        let mut fields: Vec<FieldAcc> = self
+            .fields
+            .into_values()
+            .filter(|entry| !entry.candidate)
+            .collect();
         // #48: the composite section rides the same publish semantics as a
         // field (dropped => withheld); its reserved \u{1}-prefixed name
         // sorts it first among sections
@@ -550,6 +794,7 @@ impl BloomHashAcc {
             name,
             hashes,
             dropped,
+            ..
         } in fields
         {
             if dropped > 0 {
@@ -576,9 +821,24 @@ impl BloomHashAcc {
     }
 }
 
+/// One entry of the sidecar's `bloom_sections_v1` property (DESIGN-COLD-MISS
+/// §2 S4): `(field, body offset in the blob, num_blocks, n_items)` — what
+/// [`crate::FileBloomProbe`] needs to address a section's blocks without
+/// walking the blob's section headers.
+pub type BloomSectionEntry = (String, u64, u32, u32);
+
 /// Serialize per-file blooms into the `bloom` blob body.
 pub fn serialize_file_blooms(blooms: &[FileBloom]) -> Result<Vec<u8>> {
+    serialize_file_blooms_with_sections(blooms).map(|(blob, _)| blob)
+}
+
+/// [`serialize_file_blooms`] that also returns the section table of the
+/// produced blob, in blob order.
+pub fn serialize_file_blooms_with_sections(
+    blooms: &[FileBloom],
+) -> Result<(Vec<u8>, Vec<BloomSectionEntry>)> {
     let mut out = Vec::new();
+    let mut sections = Vec::with_capacity(blooms.len());
     out.extend_from_slice(FILE_BLOOM_MAGIC);
     out.push(FILE_BLOOM_VERSION);
     out.extend_from_slice(&(blooms.len() as u32).to_le_bytes());
@@ -602,9 +862,10 @@ pub fn serialize_file_blooms(blooms: &[FileBloom]) -> Result<Vec<u8>> {
         out.push(FILE_BLOOM_ALGO_SBBF_GXHASH);
         out.extend_from_slice(&b.num_blocks.to_le_bytes());
         out.extend_from_slice(&b.n_items.to_le_bytes());
+        sections.push((b.field.clone(), out.len() as u64, b.num_blocks, b.n_items));
         out.extend_from_slice(&b.bytes);
     }
-    Ok(out)
+    Ok((out, sections))
 }
 
 /// Parse a `bloom` blob body back into per-field filters.
@@ -692,6 +953,172 @@ mod tests {
             .try_into()
             .unwrap();
         check_block(block, hash)
+    }
+
+    /// W1 selection on the accumulator: min-distinct, the ratio rule with
+    /// the ID-like exemption, the byte budget (smallest first), explicit
+    /// fields untouched, unselected candidates gone before any build, and
+    /// the over-cap candidate freeing its hashes mid-stream.
+    #[test]
+    fn auto_candidates_select_by_rule_and_free_over_cap_hashes() {
+        let policy = AutoBloomPolicy {
+            min_distinct: 100,
+            max_ratio: 0.25,
+            max_data_pct: 100.0,
+        };
+        let rows = 10_000u64;
+        let mut acc = BloomHashAcc::from_pairs([(1u16, "explicit".to_string())]);
+        acc.track_auto_candidates(
+            [
+                (2u16, "host".to_string()),     // 2,000 distinct: ratio 0.2
+                (3u16, "tiny".to_string()),     // 50 distinct: below min
+                (4u16, "msg".to_string()),      // 9,000 distinct: ratio 0.9, free text
+                (5u16, "trace_id".to_string()), // 9,000 distinct: ID-like, exempt
+                (1u16, "explicit".to_string()), // already explicit: stays explicit
+            ],
+            &policy,
+            rows,
+        );
+        assert!(!acc.fields[&1].candidate);
+        assert_eq!(acc.fields[&4].cap, Some(2_500));
+        assert_eq!(acc.fields[&5].cap, None);
+        for i in 0..9_000u32 {
+            let key = format!("v{i}");
+            if i < 2_000 {
+                acc.observe(&composite(key.as_bytes(), 2));
+            }
+            if i < 50 {
+                acc.observe(&composite(key.as_bytes(), 3));
+            }
+            acc.observe(&composite(key.as_bytes(), 4));
+            acc.observe(&composite(key.as_bytes(), 5));
+            if i < 10 {
+                acc.observe(&composite(key.as_bytes(), 1));
+            }
+        }
+        // the free-text candidate crossed its cap long ago: nothing retained
+        assert!(acc.fields[&4].over_cap);
+        assert!(acc.fields[&4].hashes.is_empty());
+        assert_eq!(acc.fields[&5].hashes.len(), 9_000);
+
+        // budget for the small section only: host (2,000 → 4 KiB body) fits,
+        // trace_id (9,000 → 32 KiB body) does not
+        let data_bytes = 10 * 1024;
+        let mut tight = acc_clone(&acc);
+        let selection = tight.select_auto(
+            &AutoBloomPolicy {
+                max_data_pct: 50.0,
+                ..policy
+            },
+            rows,
+            data_bytes,
+            DEFAULT_FILE_BLOOM_FPP,
+        );
+        assert_eq!(selection.selected, vec![("host".to_string(), 2_000)]);
+        assert_eq!(
+            selection.skipped,
+            vec![
+                ("msg".to_string(), 2_501, AutoBloomSkip::RatioExceeded),
+                ("tiny".to_string(), 50, AutoBloomSkip::BelowMinDistinct),
+                ("trace_id".to_string(), 9_000, AutoBloomSkip::OverBudget),
+            ]
+        );
+        let built = tight.build(DEFAULT_FILE_BLOOM_FPP);
+        let names: Vec<&str> = built.iter().map(|b| b.field.as_str()).collect();
+        assert_eq!(names, vec!["explicit", "host"]);
+        assert_eq!(built[0].n_items, 10);
+        assert_eq!(built[1].n_items, 2_000);
+        assert!(probe(&built[1], b"v1999"));
+
+        // roomy budget: both qualified candidates publish
+        let selection = acc.select_auto(&policy, rows, 1 << 30, DEFAULT_FILE_BLOOM_FPP);
+        assert_eq!(
+            selection.selected,
+            vec![("host".to_string(), 2_000), ("trace_id".to_string(), 9_000)]
+        );
+        let built = acc.build(DEFAULT_FILE_BLOOM_FPP);
+        let names: Vec<&str> = built.iter().map(|b| b.field.as_str()).collect();
+        assert_eq!(names, vec!["explicit", "host", "trace_id"]);
+        assert!(probe(&built[2], b"v8999"));
+    }
+
+    /// W1 fold: range workers each track the same candidates over a subset
+    /// of the keys; the fold sums the subsets, keeps over-cap state and the
+    /// selection re-checks the ratio on the TOTAL.
+    #[test]
+    fn auto_candidate_fold_keeps_over_cap_and_rechecks_the_total() {
+        let policy = AutoBloomPolicy {
+            min_distinct: 10,
+            max_ratio: 0.25,
+            max_data_pct: 100.0,
+        };
+        let rows = 1_000u64;
+        let worker = || {
+            let mut acc = BloomHashAcc::from_pairs(Vec::<(u16, String)>::new());
+            acc.track_auto_candidates(
+                [(7u16, "split".to_string()), (8u16, "hot".to_string())],
+                &policy,
+                rows,
+            );
+            acc
+        };
+        // `split`: 200 keys per worker (under the 250 cap each), 400 total
+        // → over the ratio on the total; `hot`: 300 keys in ONE worker →
+        // over cap there, must stay over after the fold
+        let mut a = worker();
+        let mut b = worker();
+        for i in 0..200u32 {
+            a.observe(&composite(format!("a{i}").as_bytes(), 7));
+            b.observe(&composite(format!("b{i}").as_bytes(), 7));
+        }
+        for i in 0..300u32 {
+            a.observe(&composite(format!("h{i}").as_bytes(), 8));
+        }
+        for i in 0..20u32 {
+            b.observe(&composite(format!("h{i}").as_bytes(), 8));
+        }
+        assert!(a.fields[&8].over_cap);
+        assert!(!b.fields[&8].over_cap);
+        a.merge(b);
+        assert!(a.fields[&8].over_cap);
+        assert!(a.fields[&8].hashes.is_empty());
+        assert!(
+            a.fields[&7].over_cap,
+            "the fold enforces the cap on the sum"
+        );
+        assert!(a.fields[&7].hashes.is_empty());
+        let selection = a.select_auto(&policy, rows, 1 << 30, DEFAULT_FILE_BLOOM_FPP);
+        assert!(selection.selected.is_empty(), "{selection:?}");
+        assert_eq!(
+            selection
+                .skipped
+                .iter()
+                .map(|(name, _, why)| (name.as_str(), *why))
+                .collect::<Vec<_>>(),
+            vec![
+                ("hot", AutoBloomSkip::RatioExceeded),
+                ("split", AutoBloomSkip::RatioExceeded),
+            ]
+        );
+        assert!(a.build(DEFAULT_FILE_BLOOM_FPP).is_empty());
+    }
+
+    fn acc_clone(acc: &BloomHashAcc) -> BloomHashAcc {
+        let mut out = BloomHashAcc::default();
+        for (id, field) in &acc.fields {
+            out.fields.insert(
+                *id,
+                FieldAcc {
+                    name: field.name.clone(),
+                    hashes: field.hashes.clone(),
+                    dropped: field.dropped,
+                    candidate: field.candidate,
+                    cap: field.cap,
+                    over_cap: field.over_cap,
+                },
+            );
+        }
+        out
     }
 
     /// A real `.vix` holding one raw-term `trace_id` column and NO per-file

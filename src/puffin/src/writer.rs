@@ -31,6 +31,9 @@ pub struct PuffinBytesWriter<W> {
 
     /// The number of bytes written.
     written_bytes: u64,
+
+    /// zstd-compress the footer payload (sets [`PuffinFooterFlags::COMPRESSED`]).
+    compress_footer: bool,
 }
 
 impl<W> PuffinBytesWriter<W> {
@@ -40,7 +43,14 @@ impl<W> PuffinBytesWriter<W> {
             properties: BTreeMap::new(),
             blobs_metadata: vec![],
             written_bytes: 0,
+            compress_footer: false,
         }
+    }
+
+    /// Compress the footer payload with zstd ([`FOOTER_ZSTD_LEVEL`]) and
+    /// flag it — see the crate doc for the reader-compatibility caveat.
+    pub fn set_footer_compression(&mut self, zstd: bool) {
+        self.compress_footer = zstd;
     }
 
     /// Resume over a sink whose first `written_bytes` bytes the caller wrote
@@ -59,6 +69,7 @@ impl<W> PuffinBytesWriter<W> {
             properties: BTreeMap::new(),
             blobs_metadata: vec![],
             written_bytes,
+            compress_footer: false,
         }
     }
 
@@ -72,12 +83,8 @@ impl<W> PuffinBytesWriter<W> {
         blob_tag: String,
         length: u64,
     ) {
-        let properties = {
-            let mut properties = BTreeMap::new();
-            properties.insert("blob_tag".to_string(), blob_tag);
-            properties
-        };
-        let blob_metadata = self.build_blob_metadata(blob_type.into(), properties, length);
+        let blob_metadata =
+            self.build_blob_metadata(blob_type.into(), blob_properties(blob_tag), length, None);
         self.blobs_metadata.push(blob_metadata);
         self.written_bytes += length;
     }
@@ -91,12 +98,14 @@ impl<W> PuffinBytesWriter<W> {
         blob_type: String,
         properties: BTreeMap<String, String>,
         size: u64,
+        codec: Option<CompressionCodec>,
     ) -> BlobMetadata {
         BlobMetadataBuilder::default()
             .blob_type(blob_type)
             .properties(properties)
             .offset(self.written_bytes as _)
             .length(size)
+            .compression_codec(codec)
             .build()
             .expect("Missing required fields")
     }
@@ -109,19 +118,32 @@ impl<W: io::Write> PuffinBytesWriter<W> {
         blob_type: impl Into<String>,
         blob_tag: String,
     ) -> Result<()> {
+        self.add_blob_with_codec(raw_data, blob_type, blob_tag, None)
+    }
+
+    /// [`Self::add_blob`] declaring the codec of `raw_data` AS GIVEN: the
+    /// bytes are written verbatim (the caller compressed them), and the
+    /// blob's metadata carries `compression_codec` so readers decode them.
+    pub fn add_blob_with_codec(
+        &mut self,
+        raw_data: &[u8],
+        blob_type: impl Into<String>,
+        blob_tag: String,
+        codec: Option<CompressionCodec>,
+    ) -> Result<()> {
         self.add_header_if_needed()
             .context("Error writing puffin header")?;
 
         let data_size = raw_data.len() as u64;
         self.writer.write_all(raw_data)?;
-        let properties = {
-            let mut properties = BTreeMap::new();
-            properties.insert("blob_tag".to_string(), blob_tag);
-            properties
-        };
 
         // add metadata for this blob
-        let blob_metadata = self.build_blob_metadata(blob_type.into(), properties, data_size);
+        let blob_metadata = self.build_blob_metadata(
+            blob_type.into(),
+            blob_properties(blob_tag),
+            data_size,
+            codec,
+        );
         self.blobs_metadata.push(blob_metadata);
         self.written_bytes += data_size;
         Ok(())
@@ -147,23 +169,28 @@ impl<W: io::Write> PuffinBytesWriter<W> {
         if copied != length {
             anyhow::bail!("puffin blob payload is {copied} bytes, expected {length}");
         }
-        let properties = {
-            let mut properties = BTreeMap::new();
-            properties.insert("blob_tag".to_string(), blob_tag);
-            properties
-        };
-        let blob_metadata = self.build_blob_metadata(blob_type.into(), properties, length);
+        let blob_metadata =
+            self.build_blob_metadata(blob_type.into(), blob_properties(blob_tag), length, None);
         self.blobs_metadata.push(blob_metadata);
         self.written_bytes += length;
         Ok(())
     }
 
     pub fn finish(&mut self) -> Result<u64> {
+        self.finish_with_payload().map(|(written, _)| written)
+    }
+
+    /// [`Self::finish`] that also hands back the footer PAYLOAD as
+    /// serialized — the uncompressed [`PuffinMeta`] JSON, whatever the
+    /// footer compression setting — so a producer can embed one object's
+    /// footer in another (the `.vix` writer stamps the data object's footer
+    /// on its index sidecar).
+    pub fn finish_with_payload(&mut self) -> Result<(u64, Vec<u8>)> {
         self.add_header_if_needed()
             .context("Error writing puffin header")?;
-        self.write_footer().context("Error writing puffin footer")?;
+        let payload = self.write_footer().context("Error writing puffin footer")?;
         self.writer.flush()?;
-        Ok(self.written_bytes)
+        Ok((self.written_bytes, payload))
     }
 
     fn add_header_if_needed(&mut self) -> Result<()> {
@@ -174,16 +201,22 @@ impl<W: io::Write> PuffinBytesWriter<W> {
         Ok(())
     }
 
-    fn write_footer(&mut self) -> Result<()> {
-        let footer_bytes = PuffinFooterWriter::new(
+    fn write_footer(&mut self) -> Result<Vec<u8>> {
+        let (footer_bytes, payload) = PuffinFooterWriter::new(
             mem::take(&mut self.blobs_metadata),
             mem::take(&mut self.properties),
         )
-        .into_bytes()?;
+        .into_bytes(self.compress_footer)?;
         self.writer.write_all(&footer_bytes)?;
         self.written_bytes += footer_bytes.len() as u64;
-        Ok(())
+        Ok(payload)
     }
+}
+
+fn blob_properties(blob_tag: String) -> BTreeMap<String, String> {
+    let mut properties = BTreeMap::new();
+    properties.insert("blob_tag".to_string(), blob_tag);
+    properties
 }
 
 /// Footer layout: HeadMagic Payload PayloadSize Flags FootMagic
@@ -201,9 +234,26 @@ impl PuffinFooterWriter {
         }
     }
 
-    fn into_bytes(mut self) -> Result<Vec<u8>> {
+    /// Serialize the footer; returns `(footer bytes, uncompressed payload)`.
+    fn into_bytes(mut self, compress: bool) -> Result<(Vec<u8>, Vec<u8>)> {
         let payload = self.get_payload()?;
-        let payload_size = payload.len();
+        // single-shot compression writes the content size into the frame
+        // header, which is what lets a reader size its admission (and the
+        // output buffer) before decoding
+        let frame = compress
+            .then(|| zstd::bulk::compress(&payload, FOOTER_ZSTD_LEVEL))
+            .transpose()
+            .context("Error compressing puffin footer payload")?;
+        let (stored, flags) = match &frame {
+            Some(frame) => (frame.as_slice(), PuffinFooterFlags::COMPRESSED),
+            None => (payload.as_slice(), PuffinFooterFlags::DEFAULT),
+        };
+        let payload_size = stored.len();
+        if payload_size > i32::MAX as usize {
+            anyhow::bail!(
+                "puffin footer payload of {payload_size} bytes exceeds the i32 size field"
+            );
+        }
 
         let capacity = MIN_DATA_SIZE as usize + payload_size;
         let mut buf = Vec::with_capacity(capacity);
@@ -212,16 +262,16 @@ impl PuffinFooterWriter {
         buf.extend_from_slice(&MAGIC);
 
         // payload + payload size
-        buf.extend_from_slice(&payload);
+        buf.extend_from_slice(stored);
         buf.extend_from_slice(&(payload_size as i32).to_le_bytes());
 
         // flags
-        buf.extend_from_slice(&PuffinFooterFlags::DEFAULT.bits().to_le_bytes());
+        buf.extend_from_slice(&flags.bits().to_le_bytes());
 
         // FootMagic
         buf.extend_from_slice(&MAGIC);
 
-        Ok(buf)
+        Ok((buf, payload))
     }
 
     fn get_payload(&mut self) -> Result<Vec<u8>> {
@@ -473,7 +523,8 @@ mod tests {
         let mut properties = BTreeMap::new();
         properties.insert("key".to_string(), "value".to_string());
 
-        let metadata = writer.build_blob_metadata(TERMS.to_string(), properties.clone(), 1000);
+        let metadata =
+            writer.build_blob_metadata(TERMS.to_string(), properties.clone(), 1000, None);
 
         assert_eq!(metadata.blob_type, TERMS);
         assert_eq!(metadata.offset, 0); // writer.written_bytes is 0
@@ -484,10 +535,10 @@ mod tests {
     #[test]
     fn test_puffin_footer_writer_empty() {
         let footer_writer = PuffinFooterWriter::new(vec![], BTreeMap::new());
-        let result = footer_writer.into_bytes();
+        let result = footer_writer.into_bytes(false);
 
         assert!(result.is_ok());
-        let footer_bytes = result.unwrap();
+        let (footer_bytes, _) = result.unwrap();
 
         // Should contain: header magic + payload + payload_size + flags + footer magic
         assert!(footer_bytes.len() >= MIN_DATA_SIZE as usize);
@@ -517,10 +568,10 @@ mod tests {
         file_properties.insert("writer".to_string(), "test".to_string());
 
         let footer_writer = PuffinFooterWriter::new(blob_metadata, file_properties);
-        let result = footer_writer.into_bytes();
+        let result = footer_writer.into_bytes(false);
 
         assert!(result.is_ok());
-        let footer_bytes = result.unwrap();
+        let (footer_bytes, _) = result.unwrap();
 
         // Should be larger than minimum size due to payload
         assert!(footer_bytes.len() > MIN_DATA_SIZE as usize);

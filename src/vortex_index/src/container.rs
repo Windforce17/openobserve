@@ -55,8 +55,10 @@ use arrow::{
 use bytes::{Bytes, BytesMut};
 use futures::future::BoxFuture;
 use puffin::{
-    FOOTER_PAYLOAD_SIZE_SIZE, FOOTER_SIZE, MAGIC, MAGIC_SIZE, MIN_FILE_SIZE, PuffinMeta,
-    reader::parse_puffin_footer_from_bytes, writer::PuffinBytesWriter,
+    CompressionCodec, FOOTER_PAYLOAD_SIZE_SIZE, FOOTER_SIZE, MAGIC, MAGIC_SIZE, MIN_FILE_SIZE,
+    PuffinMeta,
+    reader::{footer_payload_decoded_size, parse_puffin_footer_from_bytes},
+    writer::PuffinBytesWriter,
 };
 use vortex::{
     VortexSessionDefault,
@@ -278,6 +280,25 @@ pub(crate) fn tail_fetch_size() -> u64 {
     }
 }
 
+/// DESIGN-COLD-MISS §2 S3: whether a ranged open with a sidecar fetches the
+/// SIDECAR tail only and synthesizes the data container from the sidecar's
+/// `data_footer_v1` property (one GET on a cold miss instead of two), falling
+/// back to the data-tail fetch — a second round trip — on sidecars written
+/// before the property existed. Off by default; set once at process init
+/// (`ZO_VIX_SIDECAR_FIRST_OPEN`).
+static SIDECAR_FIRST_OPEN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Enable/disable the sidecar-first ranged open (see [`SIDECAR_FIRST_OPEN`]).
+pub fn set_sidecar_first_open(enabled: bool) {
+    SIDECAR_FIRST_OPEN.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The process-wide sidecar-first setting (see [`SIDECAR_FIRST_OPEN`]).
+pub fn sidecar_first_open() -> bool {
+    SIDECAR_FIRST_OPEN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Default [`walk_verify_min_bytes`]: a whole-field dictionary walk
 /// (`str_match` / regex on a term-indexed field) whose field dictionary is
 /// at least this large may be answered by VERIFYING the candidate rows'
@@ -465,6 +486,40 @@ pub(crate) const PROP_COLUMNS_COMPLETE: &str = "columns_complete";
 /// NOT required to align with `zone_map` chunk boundaries.
 pub(crate) const PROP_ROW_REGIONS: &str = "row_regions";
 
+/// DESIGN-COLD-MISS §2 S1/S2 — sidecar LAYOUT GENERATION of the writer that
+/// produced this `.vxi`: `"1"` = uncompressed puffin footer, uncompressed
+/// `dict` blob; `"2"` = zstd-compressed footer payload and compressed `dict`
+/// blob (both behind [`crate::VixWriterOptions::sidecar_tail_zstd`]). Absent
+/// on every file written before the property existed (fail-open: those are
+/// generation 1 by definition). Consumers: the single-file heal's sidecar
+/// repack (`layout_gen < 2` is the re-packing population) and tests; the
+/// READER never dispatches on it — it detects compression from the puffin
+/// blob metadata itself.
+pub(crate) const PROP_LAYOUT_GEN: &str = "layout_gen";
+/// Sidecar layout generation [`PROP_LAYOUT_GEN`] value for the uncompressed
+/// tail.
+pub(crate) const LAYOUT_GEN_PLAIN: &str = "1";
+/// Sidecar layout generation [`PROP_LAYOUT_GEN`] value for the compressed
+/// tail (zstd footer payload + zstd `dict` blob).
+pub(crate) const LAYOUT_GEN_ZSTD: &str = "2";
+/// DESIGN-COLD-MISS §2 S4 — JSON array of `[name, body_offset_in_blob,
+/// num_blocks, n_items]`, one entry per per-field section of this sidecar's
+/// `bloom` blob, in blob order. Lets [`crate::FileBloomProbe`] build its
+/// section table from the footer alone instead of walking the blob's section
+/// headers (one 4 KiB GET per header that falls outside the current window
+/// today). ABSENT on sidecars written before the property existed — the probe
+/// falls back to the header walk.
+pub(crate) const PROP_BLOOM_SECTIONS: &str = "bloom_sections_v1";
+/// DESIGN-COLD-MISS §2 S3 — the DATA object's puffin footer payload JSON
+/// (`blobs` + `properties`) verbatim, stamped on the sidecar by every writer
+/// that produces or heals the pair. A sidecar-first open
+/// ([`crate::VixReader::open_ranged_with_index`] with the sidecar-first mode
+/// enabled) synthesizes the data [`VixContainer`] from it — blob handles
+/// ranged over the data source, so no data-object tail GET is needed for a
+/// miss — instead of fetching the data tail. ABSENT on pairs written before
+/// the property existed: those fall back to the data-tail fetch.
+pub(crate) const PROP_DATA_FOOTER: &str = "data_footer_v1";
+
 /// Parsed [`PROP_ROW_ORDER`] (see the constant for the write-side rules) —
 /// exposed by [`crate::VixReader::row_order`] and
 /// [`crate::VixDocs::row_order`] so every order-dependent read fast path
@@ -524,14 +579,24 @@ pub(crate) const VIX_FORMAT_VERSION: &str = "3";
 pub(crate) const TOKENIZER_ID: &str = "o2-v2";
 
 /// `fields` property type markers.
-pub(crate) const FIELD_TYPE_TERM: &str = "term";
-pub(crate) const FIELD_TYPE_FTS: &str = "fts";
-pub(crate) const FIELD_TYPE_CS: &str = "cs";
+pub const FIELD_TYPE_TERM: &str = "term";
+pub const FIELD_TYPE_FTS: &str = "fts";
+pub const FIELD_TYPE_CS: &str = "cs";
 /// #52 bloom-only: the field's values are in the composite bloom + docs
 /// columns but NOT the term dictionary. Readers that predate the type treat
 /// it as unknown = not value-indexed = filter-back scan — exactly the
 /// intended semantics, so no format/floor change.
-pub(crate) const FIELD_TYPE_BLOOM: &str = "bloom";
+pub const FIELD_TYPE_BLOOM: &str = "bloom";
+/// DESIGN-COLD-MISS §2 S5: the field is term-capable AND received a
+/// per-field SBBF section in this file's `bloom` blob. Purely additive
+/// metadata for the pruner's sidecar-only stage 1b (`FileBloomProbe`) —
+/// nothing about evaluation changes. Distinct from [`FIELD_TYPE_BLOOM`]
+/// (bloom-ONLY, no dictionary): a reader that predates this marker reads it
+/// as an unknown type (`FieldTypeFlags::from_wire` → no bits), which is
+/// harmless because the marker is never the sole carrier of `term`. The
+/// merge compatibility checks ignore it (a `bf` difference is never a
+/// rebuild reason).
+pub const FIELD_TYPE_BLOOMED: &str = "bf";
 
 /// One entry of the `fields` file property. For term-indexed fields the array
 /// index equals the field id; column-store-only entries (e.g. `_timestamp`)
@@ -542,7 +607,7 @@ pub(crate) const FIELD_TYPE_BLOOM: &str = "bloom";
 /// `Vec<String>` (on the measured prod files those headers were ~2-4x the
 /// field names themselves).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct FieldEntry {
+pub struct FieldEntry {
     pub name: String,
     pub types: FieldTypeFlags,
 }
@@ -555,13 +620,15 @@ pub(crate) struct FieldEntry {
 /// path re-serializes a foreign entry: the writer emits `fields` entries
 /// only from its own merge plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) struct FieldTypeFlags(pub(crate) u16);
+pub struct FieldTypeFlags(pub(crate) u16);
 
 impl FieldTypeFlags {
     pub(crate) const TERM: Self = Self(1 << 0);
     pub(crate) const FTS: Self = Self(1 << 1);
     pub(crate) const CS: Self = Self(1 << 2);
     pub(crate) const BLOOM: Self = Self(1 << 3);
+    /// DESIGN-COLD-MISS §2 S5 — see [`FIELD_TYPE_BLOOMED`].
+    pub(crate) const BLOOMED: Self = Self(1 << 4);
 
     fn from_wire(ty: &str) -> Self {
         Self(match ty {
@@ -569,12 +636,20 @@ impl FieldTypeFlags {
             FIELD_TYPE_FTS => Self::FTS.0,
             FIELD_TYPE_CS => Self::CS.0,
             FIELD_TYPE_BLOOM => Self::BLOOM.0,
+            FIELD_TYPE_BLOOMED => Self::BLOOMED.0,
             _ => 0,
         })
     }
 
-    fn has(self, ty: &str) -> bool {
+    pub fn has(self, ty: &str) -> bool {
         self.0 & Self::from_wire(ty).0 != 0
+    }
+
+    /// Whether the [`Self::BLOOMED`] (`"bf"`) bit is set — the term field has
+    /// a per-field SBBF section in this file's `bloom` blob
+    /// (DESIGN-COLD-MISS §2 S5).
+    pub fn is_bloomed(self) -> bool {
+        self.0 & Self::BLOOMED.0 != 0
     }
 
     fn wire_bits(self) -> impl Iterator<Item = &'static str> {
@@ -583,6 +658,7 @@ impl FieldTypeFlags {
             (Self::FTS.0, FIELD_TYPE_FTS),
             (Self::CS.0, FIELD_TYPE_CS),
             (Self::BLOOM.0, FIELD_TYPE_BLOOM),
+            (Self::BLOOMED.0, FIELD_TYPE_BLOOMED),
         ]
         .into_iter()
         .filter(move |(bit, _)| self.0 & bit != 0)
@@ -722,6 +798,11 @@ pub(crate) struct VixContainer {
     pub(crate) pending_memory: Option<crate::reader::PendingMemory>,
     pub properties: BTreeMap<String, String>,
     pub dict: Option<BlobHandle>,
+    /// Codec of the stored `dict` bytes (DESIGN-COLD-MISS §2 S2: `zstd` on
+    /// a layout-gen-2 sidecar; `None` = raw, every earlier file). The
+    /// reader decodes the whole blob at open — `dict_field_pages` offsets
+    /// and the block-index layout address the DECODED bytes.
+    pub dict_codec: Option<CompressionCodec>,
     /// The dictionary blocks region (paired with `dict`, the block index).
     pub dict_blocks: Option<BlobHandle>,
     pub terms: Option<BlobHandle>,
@@ -747,6 +828,7 @@ fn container_from_meta(
     mut slice: impl FnMut(std::ops::Range<u64>) -> BlobHandle,
 ) -> Result<VixContainer> {
     let mut dict = None;
+    let mut dict_codec = None;
     let mut dict_blocks = None;
     let mut terms = None;
     let mut docs = None;
@@ -762,8 +844,21 @@ fn container_from_meta(
             )));
         }
         let tag = blob.properties.get("blob_tag").map(String::as_str);
-        let target = match (tag, blob.blob_type.as_str()) {
-            (Some(BLOB_TAG_DICT), BLOB_TYPE_DICT) => &mut dict,
+        let key = (tag, blob.blob_type.as_str());
+        let is_dict = matches!(key, (Some(BLOB_TAG_DICT), BLOB_TYPE_DICT));
+        if blob.compression_codec.is_some() && !is_dict {
+            // every other blob carries its own compression (Vortex) or is
+            // addressed by raw offsets (plist, bloom bodies): a declared
+            // codec there is a file this reader cannot interpret
+            return Err(VixError::Malformed(format!(
+                "blob {tag:?} declares a compression codec; only `dict` may be compressed"
+            )));
+        }
+        let target = match key {
+            (Some(BLOB_TAG_DICT), BLOB_TYPE_DICT) => {
+                dict_codec = blob.compression_codec.clone();
+                &mut dict
+            }
             (Some(BLOB_TAG_DICT_BLOCKS), BLOB_TYPE_DICT_BLOCKS) => &mut dict_blocks,
             (Some(BLOB_TAG_TERMS), BLOB_TYPE_TERMS) => &mut terms,
             (Some(BLOB_TAG_DOCS), BLOB_TYPE_DOCS) => &mut docs,
@@ -779,6 +874,7 @@ fn container_from_meta(
         pending_memory: None,
         properties: meta.properties,
         dict,
+        dict_codec,
         dict_blocks,
         terms,
         docs,
@@ -791,8 +887,13 @@ fn container_from_meta(
 /// Parse the puffin footer of `data` and slice out the `.vix` blobs.
 pub(crate) fn parse_container(data: &Bytes) -> Result<VixContainer> {
     let memory = crate::source::current_reader_memory();
-    let payload = puffin_payload_size(data)?;
-    let pending = memory.reserve(footer_memory_bound(payload))?;
+    // sized on the DECODED payload: a zstd footer parses into the same
+    // typed output as its plain form (the ×8 was calibrated on plain JSON)
+    let payload = footer_payload_decoded_size(data)
+        .map_err(|e| VixError::Malformed(format!("puffin footer: {e:#}")))?;
+    let pending = memory.reserve(footer_memory_bound(
+        usize::try_from(payload).unwrap_or(usize::MAX),
+    ))?;
     let meta = parse_puffin_footer_from_bytes(data)
         .map_err(|e| VixError::Malformed(format!("puffin footer: {e:#}")))?;
     let mut container = container_from_meta(meta, data.len() as u64, |range| {
@@ -824,14 +925,6 @@ pub(crate) fn footer_memory_bound(encoded: usize) -> usize {
 /// 1.9× margin.
 pub(crate) fn stats_memory_bound(encoded: usize) -> usize {
     encoded.saturating_mul(16).saturating_add(64 * 1024)
-}
-
-fn puffin_payload_size(bytes: &[u8]) -> Result<usize> {
-    let start = bytes
-        .len()
-        .checked_sub(FOOTER_SIZE as usize)
-        .ok_or_else(|| VixError::Malformed("truncated puffin footer".to_string()))?;
-    Ok(u32::from_le_bytes(bytes[start..start + 4].try_into().unwrap()) as usize)
 }
 
 /// One compact, immutable interval from the eager tail. Only blobs crossing
@@ -1106,7 +1199,14 @@ impl<'a> TailProbe<'a> {
         self.tail_start..self.total
     }
 
-    fn finish(self, mut tail: Bytes) -> Result<VixContainer> {
+    fn finish(self, tail: Bytes) -> Result<VixContainer> {
+        self.complete(tail)?.into_container()
+    }
+
+    /// Validate the fetched tail's puffin trailer and complete it to the
+    /// whole footer region (one exact prefix read when the footer exceeds
+    /// the tail), with the footer parse admitted on the DECODED payload.
+    fn complete(self, mut tail: Bytes) -> Result<FooterTail<'a>> {
         let Self {
             source,
             total,
@@ -1132,7 +1232,7 @@ impl<'a> TailProbe<'a> {
                 "puffin footer payload of {payload_size} bytes exceeds the file size {total}"
             )));
         }
-        let pending = memory.reserve(footer_memory_bound(
+        let mut pending = memory.reserve(footer_memory_bound(
             usize::try_from(footer_region).unwrap_or(usize::MAX),
         ))?;
         if footer_region > tail.len() as u64 {
@@ -1144,7 +1244,46 @@ impl<'a> TailProbe<'a> {
             tail = complete.freeze();
             tail_start = footer_start;
         }
+        // A zstd footer (DESIGN-COLD-MISS §2 S1) parses into the same typed
+        // output as its plain form: top the admission up to the DECODED
+        // payload (the ×8 was calibrated on plain JSON).
+        let decoded = footer_payload_decoded_size(&tail)
+            .map_err(|e| VixError::Malformed(format!("puffin footer: {e:#}")))?;
+        if decoded > footer_region {
+            let encoded_bound =
+                footer_memory_bound(usize::try_from(footer_region).unwrap_or(usize::MAX));
+            let decoded_bound = footer_memory_bound(usize::try_from(decoded).unwrap_or(usize::MAX));
+            pending = pending.merge(memory.reserve(decoded_bound.saturating_sub(encoded_bound))?);
+        }
+        Ok(FooterTail {
+            source,
+            total,
+            tail_start,
+            tail,
+            pending: pending.merge(tail_pending),
+        })
+    }
+}
 
+/// A ranged object's fetched tail, completed to cover its whole puffin footer
+/// region and admitted for the parse.
+struct FooterTail<'a> {
+    source: &'a Arc<dyn VixRangeSource>,
+    total: u64,
+    tail_start: u64,
+    tail: Bytes,
+    pending: crate::reader::PendingMemory,
+}
+
+impl FooterTail<'_> {
+    fn into_container(self) -> Result<VixContainer> {
+        let Self {
+            source,
+            total,
+            tail_start,
+            tail,
+            pending,
+        } = self;
         // The parser only looks at end-anchored offsets, so the fetched suffix
         // parses exactly like the whole file would.
         let meta = parse_puffin_footer_from_bytes(&tail)
@@ -1171,9 +1310,44 @@ impl<'a> TailProbe<'a> {
         })?;
         // Keep the tail/copy reservation through publication too. Combining the
         // reservations is allocation-free and does not momentarily drop ownership.
-        container.pending_memory = Some(pending.merge(tail_pending));
+        container.pending_memory = Some(pending);
         Ok(container)
     }
+}
+
+/// DESIGN-COLD-MISS §2 S3: the DATA object's puffin footer payload (its
+/// `PuffinMeta` JSON) read from a ranged source — the built-in data-tail
+/// probe, plus one exact prefix read for an oversized footer — for a producer
+/// that embeds it on the sidecar it rebuilds (`data_footer_v1`, the
+/// sidecar-only heal). Admitted like any ranged open; the returned buffer is
+/// the caller's.
+pub fn read_data_footer_payload(source: &Arc<dyn VixRangeSource>) -> Result<Vec<u8>> {
+    let memory = Arc::new(crate::reader::ReaderMemory::new());
+    let _scope = crate::source::enter_reader_memory(memory);
+    let probe = TailProbe::plan(source, DEFAULT_TAIL_FETCH_BYTES)?;
+    let tail = block_fetch(source.as_ref(), probe.range())?;
+    let FooterTail { tail, .. } = probe.complete(tail)?;
+    puffin::reader::footer_payload_bytes(&tail)
+        .map_err(|e| VixError::Malformed(format!("puffin footer: {e:#}")))
+}
+
+/// DESIGN-COLD-MISS §2 S3: synthesize the DATA object's container from the
+/// `data_footer_v1` payload its sidecar carries — every blob a ranged window
+/// of `source`, nothing fetched. The reader's data-side parse then runs
+/// exactly as after a tail fetch; `docs`/`stats` load lazily on first touch.
+pub(crate) fn container_from_data_footer(
+    source: &Arc<dyn VixRangeSource>,
+    payload: &str,
+) -> Result<VixContainer> {
+    let memory = crate::source::current_reader_memory();
+    let pending = memory.reserve(footer_memory_bound(payload.len()))?;
+    let meta: PuffinMeta = serde_json::from_str(payload)
+        .map_err(|e| VixError::Malformed(format!("sidecar {PROP_DATA_FOOTER} payload: {e}")))?;
+    let mut container = container_from_meta(meta, source.len(), |range| {
+        BlobHandle::Ranged(RangedBlob::new(Arc::clone(source), range))
+    })?;
+    container.pending_memory = Some(pending);
+    Ok(container)
 }
 
 /// One produced blob awaiting container assembly: in memory (small blobs,
@@ -1183,6 +1357,14 @@ impl<'a> TailProbe<'a> {
 /// Spooled payloads stream into the container without ever residing in RAM.
 pub(crate) enum BlobPart {
     Mem(Vec<u8>),
+    /// A payload held as shared bytes (a blob read back from a stored object
+    /// and copied verbatim — the sidecar repack); no extra copy on assembly.
+    Shared(Bytes),
+    /// An in-memory payload the producer already zstd-compressed; written
+    /// verbatim with `compression_codec = zstd` declared in its metadata
+    /// (DESIGN-COLD-MISS §2 S2 — the `dict` block index of a layout-gen-2
+    /// sidecar). Readers decode the whole blob at open.
+    ZstdMem(Vec<u8>),
     /// The file cursor must be at the payload start (byte 0); `len` is the
     /// payload length in bytes.
     Spooled {
@@ -1192,7 +1374,9 @@ pub(crate) enum BlobPart {
 }
 
 /// Assemble the final puffin container from properties and pre-built blobs
-/// (`(blob type id, blob tag, bytes)`).
+/// (`(blob type id, blob tag, bytes)`) — the fixture builder; production
+/// assembly goes through [`build_container_parts`].
+#[cfg(test)]
 pub(crate) fn build_container(
     properties: Vec<(String, String)>,
     blobs: Vec<(&'static str, &'static str, Vec<u8>)>,
@@ -1203,6 +1387,7 @@ pub(crate) fn build_container(
             .into_iter()
             .map(|(blob_type, tag, data)| (blob_type, tag, BlobPart::Mem(data)))
             .collect(),
+        false,
     )
 }
 
@@ -1210,13 +1395,17 @@ pub(crate) fn build_container(
 /// before; spooled blobs stream from their temp files, so the peak while
 /// assembling is ONE copy of the container (the returned buffer) plus a
 /// bounded copy window — instead of container + every blob simultaneously.
+/// `compress_footer` zstd-compresses the puffin footer payload (S1; only
+/// readers with `puffin` ≥ this crate's parse it).
 pub(crate) fn build_container_parts(
     properties: Vec<(String, String)>,
     blobs: Vec<(&'static str, &'static str, BlobPart)>,
+    compress_footer: bool,
 ) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     {
         let mut writer = PuffinBytesWriter::new(&mut buf);
+        writer.set_footer_compression(compress_footer);
         for (key, value) in properties {
             writer.set_property(key, value);
         }
@@ -1224,6 +1413,17 @@ pub(crate) fn build_container_parts(
             match part {
                 BlobPart::Mem(data) => writer
                     .add_blob(&data, blob_type, tag.to_string())
+                    .map_err(|e| VixError::Writer(format!("puffin blob write: {e:#}")))?,
+                BlobPart::Shared(data) => writer
+                    .add_blob(&data, blob_type, tag.to_string())
+                    .map_err(|e| VixError::Writer(format!("puffin blob write: {e:#}")))?,
+                BlobPart::ZstdMem(data) => writer
+                    .add_blob_with_codec(
+                        &data,
+                        blob_type,
+                        tag.to_string(),
+                        Some(CompressionCodec::Zstd),
+                    )
                     .map_err(|e| VixError::Writer(format!("puffin blob write: {e:#}")))?,
                 BlobPart::Spooled { file, len } => writer
                     .add_blob_from(
@@ -1249,19 +1449,21 @@ pub(crate) fn build_container_parts(
 /// remaining blobs + the footer append after them, each dropped as soon as
 /// it is written (since the v3 sidecar split the data object carries no
 /// blobs beyond `docs`, so `blobs` is empty on every production path). A
-/// spooled sink keeps the whole container out of RAM.
+/// spooled sink keeps the whole container out of RAM. Also returns the
+/// footer PAYLOAD as written (the `PuffinMeta` JSON) so the sidecar can
+/// embed it (`data_footer_v1`).
 pub(crate) fn finish_streamed_container(
     sink: ContainerSink,
     docs_len: u64,
     properties: Vec<(String, String)>,
     blobs: Vec<(&'static str, &'static str, Vec<u8>)>,
-) -> Result<VixOutput> {
+) -> Result<(VixOutput, Vec<u8>)> {
     fn append<W: std::io::Write>(
         sink: W,
         docs_len: u64,
         properties: Vec<(String, String)>,
         blobs: Vec<(&'static str, &'static str, Vec<u8>)>,
-    ) -> Result<u64> {
+    ) -> Result<(u64, Vec<u8>)> {
         let mut writer = PuffinBytesWriter::with_written(sink, MAGIC_SIZE);
         writer.add_prewritten_blob(BLOB_TYPE_DOCS, BLOB_TAG_DOCS.to_string(), docs_len);
         for (key, value) in properties {
@@ -1274,7 +1476,7 @@ pub(crate) fn finish_streamed_container(
             drop(data);
         }
         writer
-            .finish()
+            .finish_with_payload()
             .map_err(|e| VixError::Writer(format!("puffin finish: {e:#}")))
     }
 
@@ -1282,17 +1484,17 @@ pub(crate) fn finish_streamed_container(
         ContainerSink::Mem(mut buf) => {
             debug_assert_eq!(buf.len() as u64, MAGIC_SIZE + docs_len);
             debug_assert_eq!(buf[..MAGIC_SIZE as usize], MAGIC);
-            append(&mut buf, docs_len, properties, blobs)?;
-            Ok(VixOutput::Bytes(buf))
+            let (_, payload) = append(&mut buf, docs_len, properties, blobs)?;
+            Ok((VixOutput::Bytes(buf), payload))
         }
         ContainerSink::File(mut file) => {
             let mut sink = std::io::BufWriter::with_capacity(1024 * 1024, file.as_file_mut());
-            let len = append(&mut sink, docs_len, properties, blobs)?;
+            let (len, payload) = append(&mut sink, docs_len, properties, blobs)?;
             use std::io::Write;
             sink.flush()
                 .map_err(|e| VixError::Writer(format!("flush container spool: {e}")))?;
             drop(sink);
-            Ok(VixOutput::Spooled { file, len })
+            Ok((VixOutput::Spooled { file, len }, payload))
         }
     }
 }

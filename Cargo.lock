@@ -5503,6 +5503,7 @@ dependencies = [
  "tracing-opentelemetry",
  "url",
  "vortex_index",
+ "zstd",
 ]
 
 [[package]]
@@ -8649,6 +8650,7 @@ dependencies = [
  "bitflags 2.11.0",
  "serde",
  "serde_json",
+ "zstd",
 ]
 
 [[package]]

@@ -41,7 +41,9 @@ use crate::{
         FILE_BLOOM_MAGIC, FILE_BLOOM_VERSION, composite_guard_key, composite_value_key,
     },
     container::{
-        BlobHandle, PROP_PARTIAL_FIELDS, parse_container_ranged, require_supported_index_format,
+        BlobHandle, FieldEntry, PROP_BLOOM_SECTIONS, PROP_COLUMNS_COMPLETE, PROP_FIELDS,
+        PROP_LAYOUT_GEN, PROP_PARTIAL_FIELDS, parse_container_ranged,
+        require_supported_index_format,
     },
     error::{Result, VixError},
     sbbf::{BLOCK_BYTES, block_index, check_block, hash_value},
@@ -65,49 +67,162 @@ pub struct FileBloomSection {
 }
 
 /// Header-only view of a sidecar's per-file bloom blob, ready to answer
-/// value probes with one batched block fetch each.
+/// value probes with one batched block fetch each — plus the sidecar's
+/// field-presence declaration, so a probe over a sidecar WITHOUT a bloom
+/// blob still answers "does this file have field f at all?".
 pub struct FileBloomProbe {
-    blob: BlobHandle,
+    /// `None`: the sidecar carries no bloom blob (files written before the
+    /// per-file bloom capability) — every value probe is "no info".
+    blob: Option<BlobHandle>,
     sections: Vec<FileBloomSection>,
     /// Fields whose value terms are incomplete in this file: their per-field
     /// section (if any) must not be trusted, and the writer never claims
     /// composite coverage for them.
     partial_fields: HashSet<String>,
+    /// The sidecar's parsed `fields` table (DESIGN-COLD-MISS §2 S5: stage 1b
+    /// drops a field absent here before any blob read).
+    field_entries: Vec<FieldEntry>,
+    /// The data object's `columns_complete` license as stamped on the
+    /// sidecar: only then is `field_entries` the file's AUTHORITATIVE column
+    /// set (an unlicensed file may hold a field in `_source` that never
+    /// became a column). Absent on sidecars written before the stamp.
+    columns_complete: bool,
+    /// The sidecar `layout_gen` property (`0` when absent) — see
+    /// [`crate::VixReader::layout_gen`].
+    layout_gen: u32,
 }
 
 impl std::fmt::Debug for FileBloomProbe {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FileBloomProbe")
-            .field("blob_len", &self.blob.len())
+            .field("blob_len", &self.blob.as_ref().map(BlobHandle::len))
             .field("sections", &self.sections)
             .field("partial_fields", &self.partial_fields)
+            .field("columns_complete", &self.columns_complete)
+            .field("layout_gen", &self.layout_gen)
             .finish()
     }
 }
 
 impl FileBloomProbe {
-    /// Open the sidecar footer and resolve the bloom blob's section table.
-    /// `Ok(None)` when the sidecar carries no bloom blob (files written
-    /// before the per-file bloom capability). Blocking work (ranged fetches
-    /// through [`block_fetch`]): call from a blocking thread.
-    pub fn open_sidecar(source: Arc<dyn VixRangeSource>) -> Result<Option<Self>> {
+    /// Open the sidecar footer and resolve the bloom blob's section table
+    /// (empty, with [`Self::has_blob`] false, when the sidecar carries no
+    /// bloom blob — the `fields` table still answers presence). Blocking
+    /// work (ranged fetches through [`block_fetch`]): call from a blocking
+    /// thread.
+    pub fn open_sidecar(source: Arc<dyn VixRangeSource>) -> Result<Self> {
         let container = parse_container_ranged(&source)?;
         require_supported_index_format(&container.properties)?;
-        let Some(blob) = container.bloom else {
-            return Ok(None);
-        };
         let partial_fields: HashSet<String> = match container.properties.get(PROP_PARTIAL_FIELDS) {
             Some(raw) => serde_json::from_str(raw).map_err(|e| {
                 VixError::Malformed(format!("invalid {PROP_PARTIAL_FIELDS} property: {e}"))
             })?,
             None => HashSet::new(),
         };
-        let sections = parse_sections(&blob)?;
-        Ok(Some(Self {
-            blob,
+        // DESIGN-COLD-MISS §2 S5/B2: the `fields` table is the file's
+        // field-presence declaration — stage 1b drops a field absent here
+        // without any blob read (when the license below holds).
+        let fields_raw = container
+            .properties
+            .get(PROP_FIELDS)
+            .ok_or_else(|| VixError::Malformed(format!("missing file property {PROP_FIELDS:?}")))?;
+        let field_entries: Vec<FieldEntry> = serde_json::from_str(fields_raw)?;
+        let columns_complete = container
+            .properties
+            .get(PROP_COLUMNS_COMPLETE)
+            .is_some_and(|raw| raw == "true");
+        let layout_gen = container
+            .properties
+            .get(PROP_LAYOUT_GEN)
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or(0);
+        let Some(blob) = container.bloom else {
+            return Ok(Self {
+                blob: None,
+                sections: Vec::new(),
+                partial_fields,
+                field_entries,
+                columns_complete,
+                layout_gen,
+            });
+        };
+        // DESIGN-COLD-MISS §2 S4: prefer the footer's section table when the
+        // writer stamped it; otherwise walk the blob's section headers
+        // (pre-property sidecars).
+        let sections = match container.properties.get(PROP_BLOOM_SECTIONS) {
+            Some(raw) => parse_section_property(raw, blob.len())?,
+            None => parse_sections(&blob)?,
+        };
+        Ok(Self {
+            blob: Some(blob),
             sections,
             partial_fields,
-        }))
+            field_entries,
+            columns_complete,
+            layout_gen,
+        })
+    }
+
+    /// Whether the sidecar carries a per-file bloom blob at all.
+    pub fn has_blob(&self) -> bool {
+        self.blob.is_some()
+    }
+
+    /// Whether [`Self::field_entries`] is the file's AUTHORITATIVE column
+    /// set (the data object's `columns_complete` license, stamped on the
+    /// sidecar). Without it a field missing from the table is "no info".
+    pub fn columns_complete(&self) -> bool {
+        self.columns_complete
+    }
+
+    /// B2 stage 1b: `Some(false)` when the file PROVABLY lacks `field`
+    /// (licensed column set, field not in it) — a predicate on it matches no
+    /// row; `Some(true)` when present; `None` when the table is not
+    /// authoritative.
+    pub fn has_field(&self, field: &str) -> Option<bool> {
+        if !self.columns_complete {
+            return None;
+        }
+        Some(self.field_entries.iter().any(|entry| entry.name == field))
+    }
+
+    /// Fields whose value terms are incomplete in this file: their per-field
+    /// section (if any) must not be trusted.
+    pub fn partial_fields(&self) -> &HashSet<String> {
+        &self.partial_fields
+    }
+
+    /// The sidecar's `fields` table — every docs column of this file
+    /// (DESIGN-COLD-MISS §2 S5).
+    pub fn field_entries(&self) -> &[FieldEntry] {
+        &self.field_entries
+    }
+
+    /// The sidecar `layout_gen` property (`0` when absent) — see
+    /// [`crate::VixReader::layout_gen`].
+    pub fn layout_gen(&self) -> u32 {
+        self.layout_gen
+    }
+
+    /// The term fields this sidecar marks with a per-field SBBF section
+    /// (`"bf"`, DESIGN-COLD-MISS §2 S5).
+    pub fn bloomed_fields(&self) -> impl Iterator<Item = &str> + '_ {
+        self.field_entries
+            .iter()
+            .filter(|entry| entry.types.is_bloomed())
+            .map(|entry| entry.name.as_str())
+    }
+
+    /// The WHOLE bloom blob in ONE ranged read (`None` when the sidecar
+    /// carries no bloom blob). Consumers that need every section body — the
+    /// `.bf` assembler's per-file load — use this instead of one read per
+    /// section.
+    pub fn read_file_blooms(&self) -> Result<Option<Vec<crate::bloom::FileBloom>>> {
+        let Some(blob) = &self.blob else {
+            return Ok(None);
+        };
+        let bytes = blob.bytes()?;
+        Ok(Some(crate::bloom::parse_file_blooms(&bytes)?))
     }
 
     /// Section table in blob order.
@@ -120,8 +235,9 @@ impl FileBloomProbe {
     /// blob slice, or the eager-tail copy a boundary-crossing blob keeps.
     pub fn retained_bytes(&self) -> usize {
         let handle = match &self.blob {
-            BlobHandle::Mem(bytes) => bytes.len(),
-            BlobHandle::Ranged(ranged) => ranged.source.retained_bytes(),
+            Some(BlobHandle::Mem(bytes)) => bytes.len(),
+            Some(BlobHandle::Ranged(ranged)) => ranged.source.retained_bytes(),
+            None => 0,
         };
         std::mem::size_of::<Self>()
             + handle
@@ -134,6 +250,11 @@ impl FileBloomProbe {
                 .partial_fields
                 .iter()
                 .map(|f| f.capacity() + std::mem::size_of::<String>())
+                .sum::<usize>()
+            + self
+                .field_entries
+                .iter()
+                .map(|entry| entry.name.capacity() + std::mem::size_of::<FieldEntry>())
                 .sum::<usize>()
     }
 
@@ -211,7 +332,12 @@ impl FileBloomProbe {
                 start..start + BLOCK_BYTES as u64
             })
             .collect();
-        let blocks = read_many(&self.blob, ranges)?;
+        let Some(blob) = &self.blob else {
+            return Err(VixError::Malformed(
+                "bloom block probe on a sidecar without a bloom blob".to_string(),
+            ));
+        };
+        let blocks = read_many(blob, ranges)?;
         Ok(blocks
             .iter()
             .zip(plan)
@@ -251,6 +377,38 @@ fn read_many(blob: &BlobHandle, ranges: Vec<Range<u64>>) -> Result<Vec<Bytes>> {
                 .collect(),
         ),
     }
+}
+
+/// DESIGN-COLD-MISS §2 S4: build the section table from the
+/// `bloom_sections_v1` footer property — `[name, body_offset_in_blob,
+/// num_blocks, n_items]` per section, in blob order. Validated against the
+/// blob length so a corrupt property fails the open rather than producing a
+/// block range past the blob.
+fn parse_section_property(raw: &str, blob_len: u64) -> Result<Vec<FileBloomSection>> {
+    let malformed = |msg: String| VixError::Malformed(format!("bloom_sections_v1: {msg}"));
+    let entries: Vec<(String, u64, u32, u32)> =
+        serde_json::from_str(raw).map_err(|e| malformed(format!("not a section table: {e}")))?;
+    let mut sections = Vec::with_capacity(entries.len());
+    for (field, offset, num_blocks, n_items) in entries {
+        if num_blocks == 0 {
+            return Err(malformed(format!("zero num_blocks for field {field:?}")));
+        }
+        let end = offset
+            .checked_add(u64::from(num_blocks) * BLOCK_BYTES as u64)
+            .ok_or_else(|| malformed(format!("body range overflow for field {field:?}")))?;
+        if end > blob_len {
+            return Err(malformed(format!(
+                "body range {offset}..{end} of field {field:?} exceeds the blob ({blob_len} bytes)"
+            )));
+        }
+        sections.push(FileBloomSection {
+            field,
+            num_blocks,
+            n_items,
+            body: offset..end,
+        });
+    }
+    Ok(sections)
 }
 
 /// Walk the section headers of the blob (same layout as
@@ -426,9 +584,8 @@ mod tests {
         let ids: Vec<String> = (0..2_000).map(|i| format!("trace-{i:05}")).collect();
         let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
         let (_, index) = build_pair(&refs);
-        let probe = FileBloomProbe::open_sidecar(sidecar_source(index.clone()))
-            .unwrap()
-            .expect("bloom blob present");
+        let probe = FileBloomProbe::open_sidecar(sidecar_source(index.clone())).unwrap();
+        assert!(probe.has_blob(), "bloom blob present");
         assert!(
             probe
                 .sections()
@@ -502,9 +659,12 @@ mod tests {
         }
         // block reads through the ranged handle agree with the whole-blob probe
         let probe = FileBloomProbe {
-            blob: handle,
+            blob: Some(handle),
             sections,
             partial_fields: HashSet::new(),
+            field_entries: Vec::new(),
+            columns_complete: false,
+            layout_gen: 0,
         };
         for (i, bloom) in expected.iter().enumerate() {
             let value = format!("v{i}-7");
@@ -537,9 +697,8 @@ mod tests {
         let ids: Vec<String> = (0..256).map(|i| format!("trace-{i:04}")).collect();
         let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
         let (_, index) = build_pair(&refs);
-        let probe = FileBloomProbe::open_sidecar(sidecar_source(index))
-            .unwrap()
-            .unwrap();
+        let probe = FileBloomProbe::open_sidecar(sidecar_source(index)).unwrap();
+        assert!(probe.has_blob());
         let composite = probe
             .sections()
             .iter()
@@ -559,6 +718,9 @@ mod tests {
             blob: probe.blob,
             sections,
             partial_fields: HashSet::from(["partial".to_string()]),
+            field_entries: Vec::new(),
+            columns_complete: false,
+            layout_gen: 0,
         };
         assert_eq!(
             untrusted.probe("partial", &[b"anything"], false).unwrap(),
@@ -608,10 +770,16 @@ mod tests {
             .unwrap();
         let (_, index) = writer.finish().unwrap();
         let index = index.expect("sidecar");
-        assert!(
-            FileBloomProbe::open_sidecar(sidecar_source(index))
-                .unwrap()
-                .is_none()
-        );
+        let probe = FileBloomProbe::open_sidecar(sidecar_source(index)).unwrap();
+        assert!(!probe.has_blob());
+        // no blob: every value probe is "no info" ...
+        let values: [&[u8]; 1] = [b"x"];
+        assert_eq!(probe.probe("svc", &values, true).unwrap(), None);
+        assert_eq!(probe.read_file_blooms().unwrap(), None);
+        // ... while the `fields` table still answers presence (the default
+        // writer options carry no columns_complete license: no info)
+        assert!(probe.field_entries().iter().any(|e| e.name == "svc"));
+        assert_eq!(probe.has_field("svc"), None);
+        assert_eq!(probe.has_field("nope"), None);
     }
 }

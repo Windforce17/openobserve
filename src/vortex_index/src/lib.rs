@@ -82,6 +82,7 @@ mod numeric;
 pub mod postings;
 mod query;
 mod reader;
+mod repack;
 pub mod sbbf;
 mod source;
 mod spill;
@@ -94,8 +95,10 @@ mod writer;
 
 pub use bloom_probe::{FileBloomProbe, FileBloomSection};
 pub use container::{
-    BloomEncodingCensus, DEFAULT_TAIL_FETCH_BYTES, DEFAULT_WALK_VERIFY_MIN_BYTES, RowOrder,
-    VixOutput, ZoneEntry, region_row_ranges, set_tail_fetch_size, set_walk_verify_min_bytes,
+    BloomEncodingCensus, DEFAULT_TAIL_FETCH_BYTES, DEFAULT_WALK_VERIFY_MIN_BYTES, FIELD_TYPE_BLOOM,
+    FIELD_TYPE_BLOOMED, FIELD_TYPE_CS, FIELD_TYPE_FTS, FIELD_TYPE_TERM, FieldEntry, FieldTypeFlags,
+    RowOrder, VixOutput, ZoneEntry, read_data_footer_payload, region_row_ranges,
+    set_sidecar_first_open, set_tail_fetch_size, set_walk_verify_min_bytes, sidecar_first_open,
 };
 pub use conversion::{
     NativePredicateStrategy, NativeScanOptions, ScanCpuBudget, ScanCpuBudgetSnapshot,
@@ -120,6 +123,7 @@ pub use reader::{
     DETACHED_DOCS_FOOTER_READ_BYTES, DocsDictBatch, DocsDictChunk, DocsPointReader,
     FieldValueCounts, PlistCursor, ReaderMemoryObserver, TermVisitor, VixReader, ZoneChunk,
 };
+pub use repack::{SidecarRepack, SidecarRepackOptions, repack_sidecar, target_layout_gen};
 pub use source::{
     BytesRangeSource, VixRangeSource, VixReadOperation, check_read_cancelled, check_read_memory,
     with_read_operation,

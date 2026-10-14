@@ -48,15 +48,15 @@ use crate::vix::{reader_cache::ReaderCacheKey, source::LadderRangeSource};
 /// (data file, index generation, index size). An entry is normally a few
 /// hundred bytes — blob offsets and field names, never a filter body — but a
 /// blob that crosses the sidecar's eager-tail boundary pins that tail copy,
-/// so the cache is bounded by accounted bytes, LRU-evicted. `None` remembers
-/// a sidecar without a bloom blob so pre-capability files are not re-opened
-/// on every query.
+/// so the cache is bounded by accounted bytes, LRU-evicted. A sidecar
+/// without a bloom blob is cached too (its `fields` table still answers
+/// presence), so pre-capability files are not re-opened on every query.
 const PROBE_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 static PROBE_CACHE: LazyLock<Mutex<ProbeCache>> =
     LazyLock::new(|| Mutex::new(ProbeCache::default()));
 
 struct ProbeCache {
-    lru: LruCache<ReaderCacheKey, (Arc<Option<FileBloomProbe>>, usize)>,
+    lru: LruCache<ReaderCacheKey, (Arc<FileBloomProbe>, usize)>,
     total: usize,
 }
 
@@ -70,17 +70,13 @@ impl Default for ProbeCache {
 }
 
 impl ProbeCache {
-    fn get(&mut self, key: &ReaderCacheKey) -> Option<Arc<Option<FileBloomProbe>>> {
+    fn get(&mut self, key: &ReaderCacheKey) -> Option<Arc<FileBloomProbe>> {
         self.lru.get(key).map(|(probe, _)| Arc::clone(probe))
     }
 
-    fn insert(&mut self, key: ReaderCacheKey, probe: Arc<Option<FileBloomProbe>>) {
-        let bytes = std::mem::size_of::<ReaderCacheKey>()
-            + key.file().len()
-            + probe
-                .as_ref()
-                .as_ref()
-                .map_or(0, FileBloomProbe::retained_bytes);
+    fn insert(&mut self, key: ReaderCacheKey, probe: Arc<FileBloomProbe>) {
+        let bytes =
+            std::mem::size_of::<ReaderCacheKey>() + key.file().len() + probe.retained_bytes();
         if bytes > PROBE_CACHE_MAX_BYTES {
             return; // never worth pinning; re-opened on demand
         }
@@ -108,6 +104,9 @@ pub(super) struct Outcome {
     pub kept: Vec<FileKey>,
     /// Proven absent by an authoritative filter.
     pub dropped: usize,
+    /// Proven absent by the sidecar's licensed column set: the file has no
+    /// column for a predicate's field (B2 presence; no block read).
+    pub dropped_absent: usize,
     /// Kept: every predicate answered "maybe".
     pub hit: usize,
     /// Kept: at least one predicate had no filter in the file.
@@ -127,6 +126,7 @@ impl Outcome {
     fn record(&self) {
         for (outcome, count) in [
             ("dropped", self.dropped),
+            ("dropped_absent", self.dropped_absent),
             ("hit", self.hit),
             ("no_info", self.no_info),
             ("no_blob", self.no_blob),
@@ -145,6 +145,8 @@ impl Outcome {
 
 enum Verdict {
     Drop,
+    /// The file provably lacks a predicate's column (presence).
+    DropAbsent,
     Hit,
     NoInfo,
     NoBlob,
@@ -234,13 +236,14 @@ pub(super) async fn probe_files(
     for (file, result) in results {
         match result {
             ProbeResult::Verdict(Verdict::Drop) => outcome.dropped += 1,
+            ProbeResult::Verdict(Verdict::DropAbsent) => outcome.dropped_absent += 1,
             ProbeResult::Verdict(verdict) => {
                 match verdict {
                     Verdict::Hit => outcome.hit += 1,
                     Verdict::NoInfo => outcome.no_info += 1,
                     Verdict::NoBlob => outcome.no_blob += 1,
                     Verdict::NoSidecar => outcome.no_sidecar += 1,
-                    Verdict::Drop => unreachable!("handled above"),
+                    Verdict::Drop | Verdict::DropAbsent => unreachable!("handled above"),
                 }
                 outcome.kept.push(file);
             }
@@ -303,9 +306,17 @@ fn probe_one(
             opened
         }
     };
-    let Some(probe) = probe.as_ref() else {
+    // B2 presence first, no block read: a licensed `fields` table that
+    // lacks the predicate's field proves the file holds no row for it.
+    if predicates
+        .iter()
+        .any(|predicate| probe.has_field(&predicate.field) == Some(false))
+    {
+        return Ok(Verdict::DropAbsent);
+    }
+    if !probe.has_blob() {
         return Ok(Verdict::NoBlob);
-    };
+    }
     let mut any_no_info = false;
     for predicate in predicates {
         let values: Vec<&[u8]> = predicate.values.iter().map(|v| v.as_bytes()).collect();

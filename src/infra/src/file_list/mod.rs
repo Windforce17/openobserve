@@ -116,6 +116,21 @@ pub trait FileList: Sync + Send + 'static {
     /// `(id, index_generation, index_size)` snapshot and remain pending.
     /// Returns the number of rows updated.
     async fn update_bloom_ver(&self, expected: &[(i64, i64, i64)], bloom_ver: i64) -> Result<u64>;
+    /// DESIGN-COLD-MISS §4 B4 consolidation: move rows of ONE `(stream,
+    /// date)` hour from the superseded `.bf` version `from` to `to`, only
+    /// where the `(id, index_generation, index_size)` snapshot still matches
+    /// (a heal in between re-pended the row at 0, which this never touches).
+    /// Returns the number of rows updated.
+    async fn update_bloom_ver_from(
+        &self,
+        org_id: &str,
+        stream_type: StreamType,
+        stream_name: &str,
+        date: &str,
+        expected: &[(i64, i64, i64)],
+        from: i64,
+        to: i64,
+    ) -> Result<u64>;
     /// Is `bloom_ver` still referenced by at least one live file_list row in
     /// this `(stream, date)` bucket? Used by the post-merge orphan cleanup to
     /// decide whether a `.bf` can be retired. `stream` is the combined
@@ -154,18 +169,24 @@ pub trait FileList: Sync + Send + 'static {
     ) -> Result<Vec<FileRecord>>;
     async fn query_for_dump_by_updated_at(&self, time_range: (i64, i64))
     -> Result<Vec<FileRecord>>;
+    /// Every INDEXED file of one `(stream, date)` hour — pending
+    /// (`bloom_ver = 0`) AND stamped — as records carrying `bloom_ver` and
+    /// `updated_at`: the `.bf` assembler's build set (DESIGN-COLD-MISS §4 B4
+    /// builds whole hours and decides its regroup triggers from these rows).
     async fn query_for_bloom(
         &self,
         org_id: &str,
         stream_type: StreamType,
         stream_name: &str,
         date: &str,
-    ) -> Result<Vec<FileKey>>;
+    ) -> Result<Vec<FileRecord>>;
     /// Distinct `(stream, date)` buckets that still contain bloom-pending
     /// files (`index_size > 0 AND bloom_ver = 0`), newest CLOSED hours
     /// first — the bloom builder's discovery queue. `before_date` excludes
-    /// the still-open hour: its buckets re-pend on every fresh file and
-    /// would starve the whole backlog out of the batch.
+    /// the still-open hours: their buckets re-pend on every fresh file and
+    /// would starve the whole backlog out of the batch. The regroup triggers
+    /// (DESIGN-COLD-MISS §4 B4) are decided per bucket from the hour's rows
+    /// ([`FileList::query_for_bloom`]), never from this discovery scan.
     async fn query_bloom_pending_buckets(
         &self,
         before_date: &str,
@@ -403,6 +424,25 @@ pub async fn update_bloom_ver(expected: &[(i64, i64, i64)], bloom_ver: i64) -> R
     CLIENT.update_bloom_ver(expected, bloom_ver).await
 }
 
+/// See [`FileList::update_bloom_ver_from`].
+#[inline]
+pub async fn update_bloom_ver_from(
+    org_id: &str,
+    stream_type: StreamType,
+    stream_name: &str,
+    date: &str,
+    expected: &[(i64, i64, i64)],
+    from: i64,
+    to: i64,
+) -> Result<u64> {
+    if expected.is_empty() {
+        return Ok(0);
+    }
+    CLIENT
+        .update_bloom_ver_from(org_id, stream_type, stream_name, date, expected, from, to)
+        .await
+}
+
 #[inline]
 pub async fn bloom_ver_referenced(
     org_id: &str,
@@ -516,7 +556,7 @@ pub async fn query_for_bloom(
     stream_type: StreamType,
     stream_name: &str,
     date: &str,
-) -> Result<Vec<FileKey>> {
+) -> Result<Vec<FileRecord>> {
     CLIENT
         .query_for_bloom(org_id, stream_type, stream_name, date)
         .await

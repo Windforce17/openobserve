@@ -4541,13 +4541,19 @@ mod ranged {
     /// One fresh build of the 100k-row fixture (use the shared
     /// [`build_large_core_file`] unless the bytes must be rebuilt).
     fn build_large_core_file_uncached() -> (Bytes, Bytes) {
+        build_large_core_file_with(|_| {})
+    }
+
+    /// [`build_large_core_file_uncached`] with the writer options edited
+    /// (the SAME rows, so results are comparable across layouts).
+    fn build_large_core_file_with(edit: impl FnOnce(&mut VixWriterOptions)) -> (Bytes, Bytes) {
         let rows = 100_000usize;
         let schema = Arc::new(Schema::new(vec![
             Field::new("_timestamp", DataType::Int64, false),
             Field::new("svc", DataType::Utf8, true),
             Field::new("level", DataType::Utf8, true),
         ]));
-        let opts = VixWriterOptions {
+        let mut opts = VixWriterOptions {
             row_group_size: 8192,
             // Pin docs chunks to the pre-Fix-B scale of this file (~8k rows
             // of ~250 arrow bytes): the budgets below assert F2's ranged-IO
@@ -4556,6 +4562,7 @@ mod ranged {
             docs_chunk_bytes: 2 * 1024 * 1024,
             ..Default::default()
         };
+        edit(&mut opts);
         let mut rng = StdRng::seed_from_u64(0xF2F2);
         let levels = ["info", "warn", "error"];
         let ts: Vec<i64> = (0..rows as i64).map(|i| 1_000_000 + i).collect();
@@ -6322,6 +6329,282 @@ mod ranged {
             "parallel key ranges must not multiply ranged dictionary reads"
         );
     }
+
+    /// DESIGN-COLD-MISS §2 S1/S2: a sidecar written with the compressed tail
+    /// (zstd footer payload + zstd `dict` block index, `layout_gen=2`) opens
+    /// and answers exactly like the plain one — in memory, ranged with the
+    /// prod eager tail (dict tail-resident: zero-IO decode), and ranged with
+    /// a tail too short for the dict (the decode fetches the compressed blob
+    /// once at open). Plain sidecars stamp `layout_gen=1`; a sidecar without
+    /// the property reads as generation 0.
+    #[test]
+    fn compressed_sidecar_tail_round_trips_and_queries_identically() {
+        let (data, plain) = build_large_core_file();
+        let (data_zstd, zstd) = build_large_core_file_with(|opts| opts.sidecar_tail_zstd = true);
+        assert_eq!(
+            data, data_zstd,
+            "the data object is untouched by the sidecar tail format"
+        );
+        assert!(
+            zstd.len() < plain.len(),
+            "compressed tail must shrink the sidecar: {} vs {}",
+            zstd.len(),
+            plain.len()
+        );
+        // the footer flag and the dict codec are declared, not inferred
+        let flags_at = zstd.len() - (puffin::MAGIC_SIZE + puffin::FLAGS_SIZE) as usize;
+        let flags = u32::from_le_bytes(zstd[flags_at..flags_at + 4].try_into().unwrap());
+        assert_eq!(flags & puffin::PuffinFooterFlags::COMPRESSED.bits(), 1);
+        let meta = puffin::reader::parse_puffin_footer_from_bytes(&zstd).unwrap();
+        let dict = meta
+            .blobs
+            .iter()
+            .find(|blob| blob.properties.get("blob_tag").map(String::as_str) == Some("dict"))
+            .expect("dict blob");
+        assert_eq!(dict.compression_codec, Some(puffin::CompressionCodec::Zstd));
+        assert_eq!(
+            meta.properties.get("layout_gen").map(String::as_str),
+            Some("2")
+        );
+        assert_eq!(
+            puffin::reader::parse_puffin_footer_from_bytes(&plain)
+                .unwrap()
+                .properties
+                .get("layout_gen")
+                .map(String::as_str),
+            Some("1")
+        );
+
+        let mem_plain = VixReader::open_with_index(data.clone(), Some(plain.clone())).unwrap();
+        let mem_zstd = VixReader::open_with_index(data.clone(), Some(zstd.clone())).unwrap();
+        assert_eq!(mem_plain.layout_gen(), 1);
+        assert_eq!(mem_zstd.layout_gen(), 2);
+        let pre_property = Bytes::from(
+            crate::test_support::strip_property_for_tests(&plain, "layout_gen").unwrap(),
+        );
+        assert_eq!(
+            VixReader::open_with_index(data.clone(), Some(pre_property))
+                .unwrap()
+                .layout_gen(),
+            0
+        );
+
+        let queries = [
+            exact("level", "warn"),
+            exact("svc", "svc_090909"),
+            exact("svc", "svc_nope"),
+            prefix(Some("svc"), "svc_0909"),
+        ];
+        let expect: Vec<(u64, BTreeSet<u32>)> = queries
+            .iter()
+            .map(|query| (mem_plain.count(query).unwrap(), eval_set(&mem_plain, query)))
+            .collect();
+        assert_eq!(expect[0].0, 33_333);
+        assert_eq!(expect[1].0, 1);
+        assert_eq!(expect[2].0, 0);
+        let check = |reader: &VixReader, what: &str| {
+            for (query, (count, set)) in queries.iter().zip(&expect) {
+                assert_eq!(&reader.count(query).unwrap(), count, "{what}: {query:?}");
+                assert_eq!(&eval_set(reader, query), set, "{what}: {query:?}");
+            }
+            assert_eq!(
+                reader.field_value_counts("level").unwrap(),
+                mem_plain.field_value_counts("level").unwrap(),
+                "{what}: dictionary walk"
+            );
+        };
+        check(&mem_zstd, "in-memory compressed");
+
+        // ranged, prod eager tail: footer + dict come out of the one tail
+        // read on both layouts; the compressed open costs no extra fetch
+        let plain_pair = PairSource::new(data.clone(), plain.clone());
+        let ranged_plain = plain_pair.open_with_tail(PROD_SIDECAR_TAIL);
+        let zstd_pair = PairSource::new(data.clone(), zstd.clone());
+        let ranged_zstd = zstd_pair.open_with_tail(PROD_SIDECAR_TAIL);
+        assert_eq!(
+            zstd_pair.fetches(),
+            2,
+            "open is exactly the two tail probes"
+        );
+        assert_eq!(ranged_zstd.layout_gen(), 2);
+        check(&ranged_zstd, "ranged compressed");
+        check(&ranged_plain, "ranged plain");
+        assert!(
+            zstd_pair.fetches() <= plain_pair.fetches(),
+            "compressed: {} fetches, plain: {}",
+            zstd_pair.fetches(),
+            plain_pair.fetches()
+        );
+
+        // ranged, minimal tail: the dict is NOT tail-resident, so the open
+        // fetches the compressed blob once and decodes it — and from then on
+        // every dictionary build is zero-IO (same contract as `promote_dict`)
+        let short_pair = PairSource::new(data.clone(), zstd.clone());
+        let ranged_short = short_pair.open_with_tail(puffin::MIN_FILE_SIZE);
+        let dict_range = crate::test_support::blob_byte_range(&zstd, "dict").unwrap();
+        assert!(
+            short_pair
+                .index
+                .read_ranges_touch(dict_range.start as u64..dict_range.end as u64),
+            "short tail: the compressed dict is fetched at open"
+        );
+        short_pair.index.clear_reads();
+        check(&ranged_short, "ranged compressed, short tail");
+        assert!(
+            !short_pair
+                .index
+                .read_ranges_touch(dict_range.start as u64..dict_range.end as u64),
+            "the decoded dict serves every later build without IO"
+        );
+    }
+
+    /// DESIGN-COLD-MISS §2 S3: the sidecar-first ranged open fetches ONLY the
+    /// sidecar tail when the sidecar carries `data_footer_v1` — a needle miss
+    /// never touches the data object — and the synthesized data container
+    /// still serves docs reads and stats on demand. A sidecar without the
+    /// property falls back to the data-tail fetch (one more round trip).
+    #[test]
+    fn sidecar_first_open_skips_the_data_tail_when_the_footer_is_embedded() {
+        let (data, index) = build_large_core_file();
+        let mem = VixReader::open_with_index(data.clone(), Some(index.clone())).unwrap();
+        let rows: Vec<u64> = vec![3, 4_097, 99_999];
+        let expect_rows = mem
+            .read_docs_columns_rows(&["svc", "level"], &rows)
+            .unwrap();
+
+        let open = |index: &Bytes| {
+            let source = PairSource::new(data.clone(), index.clone());
+            let reader = VixReader::open_ranged_with_index_mode(
+                Arc::clone(&source.data) as Arc<dyn VixRangeSource>,
+                Some(Arc::clone(&source.index) as Arc<dyn VixRangeSource>),
+                PROD_SIDECAR_TAIL,
+                true,
+            )
+            .unwrap();
+            (source, reader)
+        };
+
+        let (source, reader) = open(&index);
+        assert_eq!(source.index.fetches(), 1, "one sidecar tail read");
+        assert_eq!(source.data.fetches(), 0, "no data-object read at open");
+        assert_eq!(source.depth(), 1);
+        assert_eq!(reader.row_count(), mem.row_count());
+        assert_eq!(reader.row_group_size(), mem.row_group_size());
+        assert_eq!(reader.row_order(), mem.row_order());
+        assert_eq!(
+            reader.zone_chunks().map(<[_]>::len),
+            mem.zone_chunks().map(<[_]>::len)
+        );
+        // the needle miss: dictionary from the tail, one key block from the
+        // sidecar, nothing from the data object
+        assert_eq!(reader.count(&exact("svc", "svc_nope")).unwrap(), 0);
+        assert_eq!(
+            source.data.fetches(),
+            0,
+            "a miss never reads the data object"
+        );
+        assert_eq!(reader.count(&exact("level", "warn")).unwrap(), 33_333);
+        assert_eq!(source.data.fetches(), 0, "index hits are sidecar-only too");
+        // the synthesized data container is a real one: docs rows and the
+        // stats table load lazily from the data source
+        assert_eq!(
+            reader
+                .read_docs_columns_rows(&["svc", "level"], &rows)
+                .unwrap(),
+            expect_rows
+        );
+        assert!(source.data.fetches() > 0);
+        assert_eq!(
+            reader.column_chunk_stats().is_some(),
+            mem.column_chunk_stats().is_some()
+        );
+
+        // pre-property sidecar: the data tail is fetched as a second step
+        let legacy = Bytes::from(
+            crate::test_support::strip_property_for_tests(
+                &index,
+                crate::container::PROP_DATA_FOOTER,
+            )
+            .unwrap(),
+        );
+        let (source, reader) = open(&legacy);
+        assert_eq!(source.index.fetches(), 1);
+        assert_eq!(source.data.fetches(), 1, "fallback: the data tail");
+        assert_eq!(source.depth(), 2, "fallback costs a second round trip");
+        assert_eq!(reader.count(&exact("svc", "svc_nope")).unwrap(), 0);
+        assert_eq!(
+            reader
+                .read_docs_columns_rows(&["svc", "level"], &rows)
+                .unwrap(),
+            expect_rows
+        );
+    }
+
+    /// DESIGN-COLD-MISS §2 S4/S5: the sidecar footer's `bloom_sections_v1`
+    /// table yields the same sections as walking the blob's headers, and
+    /// every field with a per-field section is flagged `bf` in the `fields`
+    /// table (readable through the reader and the sidecar-only probe).
+    #[test]
+    fn bloom_sections_property_matches_the_header_walk_and_flags_bf() {
+        let (data, index) =
+            build_large_core_file_with(|opts| opts.bloom_field_names = vec!["svc".to_string()]);
+        let meta = puffin::reader::parse_puffin_footer_from_bytes(&index).unwrap();
+        let table = meta
+            .properties
+            .get(crate::container::PROP_BLOOM_SECTIONS)
+            .expect("section table stamped");
+        let entries: Vec<(String, u64, u32, u32)> = serde_json::from_str(table).unwrap();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].0, "svc");
+
+        let reader = VixReader::open_with_index(data.clone(), Some(index.clone())).unwrap();
+        assert_eq!(reader.bloomed_fields().collect::<Vec<_>>(), vec!["svc"]);
+        assert!(reader.has_term_capability("svc"), "bf is additive to term");
+        let fields: Vec<crate::FieldEntry> = serde_json::from_str(
+            meta.properties
+                .get(crate::container::PROP_FIELDS)
+                .expect("fields table"),
+        )
+        .unwrap();
+        let svc = fields.iter().find(|entry| entry.name == "svc").unwrap();
+        assert!(svc.has_type(crate::FIELD_TYPE_BLOOMED));
+        assert!(svc.has_type(crate::FIELD_TYPE_TERM));
+        assert!(
+            !fields
+                .iter()
+                .find(|entry| entry.name == "level")
+                .unwrap()
+                .has_type(crate::FIELD_TYPE_BLOOMED)
+        );
+
+        let from_property = crate::FileBloomProbe::open_sidecar(
+            CountingSource::new(index.clone()) as Arc<dyn VixRangeSource>
+        )
+        .unwrap();
+        assert!(from_property.has_blob(), "bloom blob");
+        let walked_index = Bytes::from(
+            crate::test_support::strip_property_for_tests(
+                &index,
+                crate::container::PROP_BLOOM_SECTIONS,
+            )
+            .unwrap(),
+        );
+        let from_walk = crate::FileBloomProbe::open_sidecar(
+            CountingSource::new(walked_index) as Arc<dyn VixRangeSource>
+        )
+        .unwrap();
+        assert_eq!(from_property.sections(), from_walk.sections());
+        assert_eq!(
+            from_property.bloomed_fields().collect::<Vec<_>>(),
+            vec!["svc"]
+        );
+        // the table addresses real blocks: a present and an absent value
+        // probe like the whole-blob verdicts
+        let values: [&[u8]; 2] = [b"svc_090909", b"svc_nope"];
+        let verdicts = from_property.probe("svc", &values, false).unwrap();
+        assert_eq!(verdicts, from_walk.probe("svc", &values, false).unwrap());
+        assert_eq!(verdicts.as_deref().map(|hits| hits[0]), Some(true));
+    }
 }
 
 /// AND evaluation short-circuits: a leaf that matches no term proves the
@@ -7551,6 +7834,148 @@ mod m10_parallel_kway {
             mk(b"path", KEY_FIELD_ID)
         );
     }
+
+    /// The prod composite hazard (DECISIONS 2026-10-13): `bloom_composite =
+    /// false` with a bloom-only output field, merging a legacy input that
+    /// is TERM-indexed for it. The legacy values reach the composite ONLY
+    /// through the k-way walk (`observe_bloom_only_key`): the core merge's
+    /// coverage scan skips dictionary-covered inputs, modelled here by
+    /// pushing the legacy rows WITHOUT the demoted column. The guards are
+    /// seeded regardless (`absorb_composite_hashes` at finish), so a walk
+    /// that drops the values publishes a composite claiming coverage it
+    /// lacks — every needle the legacy input held becomes a wrong drop.
+    #[test]
+    fn composite_off_merge_covers_legacy_term_values_of_bloom_only_field() {
+        use crate::{
+            bloom::{
+                COMPOSITE_BLOOM_FIELD, COMPOSITE_GUARD_PROBES, composite_guard_key,
+                composite_value_key,
+            },
+            sbbf::{BLOCK_BYTES, block_index, check_block, hash_value},
+        };
+
+        let probe = |bloom: &crate::bloom::FileBloom, key: &[u8]| -> bool {
+            let hash = hash_value(key);
+            let index = block_index(hash, bloom.num_blocks) as usize;
+            let block: &[u8; BLOCK_BYTES] = bloom.bytes
+                [index * BLOCK_BYTES..(index + 1) * BLOCK_BYTES]
+                .try_into()
+                .unwrap();
+            check_block(block, hash)
+        };
+        let legacy_opts = VixWriterOptions {
+            bloom_composite: false,
+            ..Default::default()
+        };
+        let demoted_opts = VixWriterOptions {
+            bloom_composite: false,
+            bloom_only_field_names: vec!["bb".to_string()],
+            ..Default::default()
+        };
+        let legacy = synth_input(
+            &legacy_opts,
+            0,
+            6,
+            |r| Some(format!("a{r}")),
+            |r| Some(format!("legacy-{r:02}")),
+            |_| None,
+        );
+        let demoted = synth_input(
+            &demoted_opts,
+            10_000,
+            4,
+            |r| Some(format!("a{r}")),
+            |r| Some(format!("born-{r:02}")),
+            |_| None,
+        );
+        assert!(
+            legacy.0.has_term_capability("bb"),
+            "precondition: legacy input term-indexed for bb"
+        );
+        assert_eq!(
+            demoted.0.bloom_only_fields().collect::<Vec<_>>(),
+            ["bb"],
+            "precondition: sibling input demoted at birth"
+        );
+
+        for kway in [1usize, 8] {
+            let schema = synth_schema();
+            let refs = [&legacy.0, &demoted.0];
+            let doc_maps = [
+                DocIdMap::Offset(0),
+                DocIdMap::Offset(legacy.1.num_rows() as u32),
+            ];
+            let mut merged = VixWriter::new(
+                &schema,
+                VixWriterOptions {
+                    merge_kway_threads: kway,
+                    ..demoted_opts.clone()
+                },
+                false,
+            );
+            merged.check_merge_inputs(&refs).unwrap();
+            merged.merge_input_indexes(&refs, &doc_maps, 8).unwrap();
+            // dictionary-covered input: no coverage scan of its bb column
+            merged
+                .push_docs_rows_unindexed(
+                    &timestamps_of(&legacy.1),
+                    &cs_columns_of(&legacy.1, &["aa", "cc"]),
+                    &legacy.2,
+                    None,
+                )
+                .unwrap();
+            // demoted input: its values ride the docs column scan as in prod
+            merged
+                .push_docs_rows_unindexed(
+                    &timestamps_of(&demoted.1),
+                    &cs_columns_of(&demoted.1, &["aa", "bb", "cc"]),
+                    &demoted.2,
+                    None,
+                )
+                .unwrap();
+            let (data, index) = merged.finish().unwrap();
+            let reader = open_built(data, index);
+
+            assert_eq!(reader.bloom_only_fields().collect::<Vec<_>>(), ["bb"]);
+            assert!(reader.term_field_id("bb").is_none());
+            let blooms = reader.file_blooms().unwrap().expect("bloom blob");
+            let comp = blooms
+                .iter()
+                .find(|b| b.field == COMPOSITE_BLOOM_FIELD)
+                .expect("composite section");
+            let mut buf = Vec::new();
+            for pr in 0..COMPOSITE_GUARD_PROBES {
+                assert!(
+                    probe(comp, composite_guard_key("bb", pr, &mut buf).unwrap()),
+                    "kway={kway}: coverage claimed for the bloom-only field"
+                );
+            }
+            for r in 0..6 {
+                let value = format!("legacy-{r:02}");
+                assert!(
+                    probe(
+                        comp,
+                        composite_value_key("bb", value.as_bytes(), &mut buf).unwrap()
+                    ),
+                    "kway={kway}: legacy dictionary value {value} missing from the composite"
+                );
+            }
+            for r in 0..4 {
+                let value = format!("born-{r:02}");
+                assert!(
+                    probe(
+                        comp,
+                        composite_value_key("bb", value.as_bytes(), &mut buf).unwrap()
+                    ),
+                    "kway={kway}: demoted input value {value} missing from the composite"
+                );
+            }
+            assert!(!probe(
+                comp,
+                composite_value_key("bb", b"legacy-99", &mut buf).unwrap()
+            ));
+        }
+    }
 }
 
 /// Compaction index merge ([`VixWriter::merge_input_indexes`] +
@@ -7560,7 +7985,7 @@ mod index_merge {
     use arrow::compute::interleave;
 
     use super::*;
-    use crate::{DocIdMap, query::KEY_FIELD_ID};
+    use crate::{DocIdMap, FIELD_TYPE_TERM, FieldEntry, FieldTypeFlags, query::KEY_FIELD_ID};
 
     /// Interleave same-schema batches into one, following `order`
     /// (`(input, row)` per output row).
@@ -8482,6 +8907,74 @@ mod index_merge {
         let reason = fts_plan.check_merge_inputs(&[&tainted]).unwrap_err();
         assert!(reason.contains("\"log\""), "{reason}");
         assert!(reason.contains("rebuild"), "{reason}");
+    }
+
+    /// DESIGN-COLD-MISS §2 S5: the `"bf"` marker (a term field that received a
+    /// per-field SBBF section) is ADDITIVE metadata — a `bf` difference between
+    /// merge inputs and the plan is never a rebuild reason, and a merge over
+    /// `bf`-stamped inputs produces byte-identical blobs to one over unstamped
+    /// inputs.
+    #[test]
+    fn check_merge_inputs_ignores_bloomed_field_flag() {
+        let (schema, opts, batches, sources) = equivalence_inputs();
+        let stamped = build_input(&schema, &opts, &batches[0], &sources[0]);
+        // Fabricate the `bf` marker on a term field's entry (the real writer
+        // sets it when the field receives a per-field bloom section).
+        let (stamped_data, stamped_index) = {
+            let mut w = VixWriter::new(&schema, opts.clone(), false);
+            w.push_batch_with_source(&batches[0], &sources[0], None)
+                .unwrap();
+            w.finish().unwrap()
+        };
+        let patched = repack_with_properties(stamped_index.expect("sidecar"), |properties| {
+            let entry = properties
+                .iter_mut()
+                .find(|(key, _)| key == "fields")
+                .unwrap();
+            let mut fields: Vec<FieldEntry> = serde_json::from_str(&entry.1).unwrap();
+            let target = fields
+                .iter_mut()
+                .find(|candidate| candidate.name == "svc")
+                .expect("svc has a fields entry");
+            assert!(target.has_type(FIELD_TYPE_TERM));
+            target.types.0 |= FieldTypeFlags::BLOOMED.0;
+            entry.1 = serde_json::to_string(&fields).unwrap();
+        });
+        let bloomed = open_built(stamped_data, Some(patched));
+        assert!(
+            bloomed.bloomed_fields().any(|field| field == "svc"),
+            "the fabricated marker must be visible: {:?}",
+            bloomed.bloomed_fields().collect::<Vec<_>>()
+        );
+
+        // The pre-flight must not reject a `bf` difference ...
+        let plan = VixWriter::new(&schema, opts.clone(), false);
+        plan.check_merge_inputs(&[&bloomed])
+            .unwrap_or_else(|reason| panic!("bf must never be a rebuild reason, got: {reason}"));
+
+        // ... and the merged output must equal the unstamped merge.
+        let merge = |input: &VixReader| -> (Vec<u8>, Option<Vec<u8>>) {
+            let mut merged = VixWriter::new(&schema, opts.clone(), false);
+            merged
+                .merge_input_indexes(&[input], &[DocIdMap::Offset(0)], 1)
+                .unwrap();
+            merged
+                .push_docs_rows_unindexed(
+                    &timestamps_of(&batches[0]),
+                    &cs_columns_of(&batches[0], &["svc", "code"]),
+                    &sources[0],
+                    None,
+                )
+                .unwrap();
+            merged.finish().unwrap()
+        };
+        let baseline = merge(&stamped);
+        let from_bloomed = merge(&bloomed);
+        assert_eq!(
+            all_terms(&open_built(baseline.0, baseline.1)),
+            all_terms(&open_built(from_bloomed.0, from_bloomed.1)),
+            "a bf marker must not change merged index bytes"
+        );
     }
 
     /// The single-file healing probe shares the fast path's demotion
@@ -10732,6 +11225,236 @@ fn file_blooms_survive_index_merge() {
                 .unwrap();
             assert!(check_block(block, h), "merged bloom missing {v}");
         }
+    }
+}
+
+/// DESIGN-COLD-MISS §3 W1: AUTO additive per-field blooms are decided at
+/// finish with exact counts, identically on first encode (sequential and
+/// range-parallel workers) and merge: a low-cardinality field and an ID-like
+/// near-unique field get sections; a near-unique free-text field (ratio
+/// rule) and a tiny-cardinality field (min distinct) do not; an explicit
+/// `bloom_field_names` entry is always kept; the merged file's sections cover
+/// the union; the byte budget admits smallest-first; selected fields are
+/// flagged `bf`. With AUTO off the sidecar is byte-identical to the pre-W1
+/// writer's.
+#[test]
+fn auto_additive_blooms_select_by_exact_counts_on_every_write_path() {
+    use arrow::array::{Int64Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+
+    use crate::{DocIdMap, bloom::parse_file_blooms};
+
+    const ROWS: usize = 4_000;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("_timestamp", DataType::Int64, false),
+        Field::new("host", DataType::Utf8, true),
+        Field::new("request_id", DataType::Utf8, true),
+        Field::new("msg", DataType::Utf8, true),
+        Field::new("level", DataType::Utf8, true),
+        Field::new("tid", DataType::Utf8, true),
+    ]));
+    // host: 200 distinct (ratio 0.05) / request_id: ROWS distinct, ID-like /
+    // msg: ROWS distinct, free text (ratio 1.0) / level: 3 distinct / tid:
+    // explicit bloom field
+    let build = |base_ts: i64, salt: &str, opts: VixWriterOptions| -> (Vec<u8>, Vec<u8>) {
+        let ts: Vec<i64> = (0..ROWS as i64).map(|i| base_ts - i).collect();
+        let host: Vec<String> = (0..ROWS).map(|i| format!("host-{}", i % 200)).collect();
+        let request_id: Vec<String> = (0..ROWS).map(|i| format!("req-{salt}-{i:08x}")).collect();
+        let msg: Vec<String> = (0..ROWS)
+            .map(|i| format!("request {salt} {i} finished in {} ms", (i * 7919) % 1000))
+            .collect();
+        let level: Vec<&str> = (0..ROWS)
+            .map(|i| ["info", "warn", "error"][i % 3])
+            .collect();
+        let tid: Vec<String> = (0..ROWS).map(|i| format!("tid-{salt}-{i}")).collect();
+        let sources: Vec<String> = (0..ROWS)
+            .map(|i| {
+                format!(
+                    r#"{{"_timestamp":{},"host":"{}","request_id":"{}","msg":"{}","level":"{}","tid":"{}"}}"#,
+                    ts[i], host[i], request_id[i], msg[i], level[i], tid[i]
+                )
+            })
+            .collect();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(ts)),
+                Arc::new(StringArray::from_iter_values(
+                    host.iter().map(String::as_str),
+                )),
+                Arc::new(StringArray::from_iter_values(
+                    request_id.iter().map(String::as_str),
+                )),
+                Arc::new(StringArray::from_iter_values(
+                    msg.iter().map(String::as_str),
+                )),
+                Arc::new(StringArray::from(level)),
+                Arc::new(StringArray::from_iter_values(
+                    tid.iter().map(String::as_str),
+                )),
+            ],
+        )
+        .unwrap();
+        let mut writer = VixWriter::new(&schema, opts, false);
+        writer
+            .push_batch_with_source(
+                &batch,
+                &StringArray::from_iter_values(sources.iter().map(String::as_str)),
+                None,
+            )
+            .unwrap();
+        let (data, index) = writer.finish().unwrap();
+        (data, index.expect("indexed"))
+    };
+    let auto_opts = |kway: usize| VixWriterOptions {
+        bloom_field_names: vec!["tid".to_string()],
+        bloom_auto_min_distinct: 100,
+        bloom_auto_max_ratio: 0.25,
+        bloom_auto_max_data_pct: 100.0,
+        merge_kway_threads: kway,
+        ..Default::default()
+    };
+    let sections_of = |index: &[u8]| -> Vec<(String, u32)> {
+        let range = crate::test_support::blob_byte_range(index, "bloom").unwrap();
+        parse_file_blooms(&index[range])
+            .unwrap()
+            .into_iter()
+            .map(|bloom| (bloom.field, bloom.n_items))
+            .collect()
+    };
+
+    // first encode, sequential sink
+    let (data, index) = build(1_000_000, "a", auto_opts(1));
+    assert_eq!(
+        sections_of(&index),
+        vec![
+            ("host".to_string(), 200),
+            ("request_id".to_string(), ROWS as u32),
+            ("tid".to_string(), ROWS as u32),
+        ],
+        "host (ratio ok) + request_id (ID-like) selected; msg (ratio) and level (min) not; tid \
+         explicit"
+    );
+    let reader = open_built(data.clone(), Some(index.clone()));
+    assert_eq!(
+        reader.bloomed_fields().collect::<Vec<_>>(),
+        vec!["host", "request_id", "tid"]
+    );
+    assert!(
+        reader.has_term_capability("msg"),
+        "unselected fields keep their index"
+    );
+    // first encode, range-parallel workers: byte-identical (candidates fold
+    // by set union like explicit fields)
+    let (_, parallel) = build(1_000_000, "a", auto_opts(4));
+    assert_eq!(parallel, index, "R=4 must equal R=1");
+
+    // probes through the sidecar-only prober: present hits, absent misses
+    let probe = crate::FileBloomProbe::open_sidecar(crate::BytesRangeSource::new(
+        "auto",
+        Bytes::from(index.clone()),
+    ))
+    .unwrap();
+    let present: [&[u8]; 1] = [b"host-7"];
+    assert_eq!(
+        probe.probe("host", &present, false).unwrap(),
+        Some(vec![true])
+    );
+    let request: [&[u8]; 1] = [b"req-a-0000002a"];
+    assert_eq!(
+        probe.probe("request_id", &request, false).unwrap(),
+        Some(vec![true])
+    );
+    let absent: [&[u8]; 1] = [b"host-900"];
+    assert_eq!(
+        probe.probe("host", &absent, false).unwrap(),
+        Some(vec![false])
+    );
+    assert_eq!(
+        probe.probe("msg", &present, false).unwrap(),
+        None,
+        "no section: no info"
+    );
+
+    // byte budget: with room for ONE section only, the smaller `host`
+    // section wins and the explicit `tid` section is kept regardless
+    let (_, tight) = build(
+        1_000_000,
+        "a",
+        VixWriterOptions {
+            bloom_auto_max_data_pct: 0.1,
+            ..auto_opts(1)
+        },
+    );
+    let tight_sections = sections_of(&tight);
+    assert!(
+        tight_sections.iter().any(|(name, _)| name == "tid"),
+        "{tight_sections:?}"
+    );
+    let auto_tight: Vec<&String> = tight_sections
+        .iter()
+        .map(|(name, _)| name)
+        .filter(|name| *name != "tid")
+        .collect();
+    assert!(
+        auto_tight.len() <= 1 && auto_tight.iter().all(|name| *name == "host"),
+        "smallest-first within the budget: {tight_sections:?}"
+    );
+
+    // AUTO off: byte-identical to the pre-W1 writer (explicit section only)
+    let (_, off) = build(
+        1_000_000,
+        "a",
+        VixWriterOptions {
+            bloom_auto_min_distinct: 0,
+            ..auto_opts(1)
+        },
+    );
+    assert_eq!(sections_of(&off), vec![("tid".to_string(), ROWS as u32)]);
+    let off_reader = open_built(data.clone(), Some(off));
+    assert_eq!(off_reader.bloomed_fields().collect::<Vec<_>>(), vec!["tid"]);
+
+    // merge: the k-way walk tracks the same candidates; the merged file's
+    // sections cover the union of both inputs (host: same 200; request_id:
+    // 2 × ROWS; msg still excluded by the ratio on the merged total)
+    let (data_b, index_b) = build(500_000, "b", auto_opts(1));
+    let newer = open_built(data.clone(), Some(index.clone()));
+    let older = open_built(data_b, Some(index_b));
+    let refs = [&newer, &older];
+    let doc_maps = [DocIdMap::Offset(0), DocIdMap::Offset(ROWS as u32)];
+    for kway in [1usize, 4] {
+        let mut merged = VixWriter::new(&schema, auto_opts(kway), false);
+        merged.check_merge_inputs(&refs).unwrap();
+        merged.merge_input_indexes(&refs, &doc_maps, kway).unwrap();
+        let merged_ts = Int64Array::from(
+            (0..2 * ROWS as i64)
+                .map(|i| 1_000_000 - i)
+                .collect::<Vec<i64>>(),
+        );
+        let merged_source = StringArray::from(
+            (0..2 * ROWS)
+                .map(|i| format!(r#"{{"_timestamp":{},"row":{i}}}"#, 1_000_000 - i as i64))
+                .collect::<Vec<String>>(),
+        );
+        merged
+            .push_docs_rows_unindexed(&merged_ts, &[], &merged_source, None)
+            .unwrap();
+        let (merged_data, merged_index) = merged.finish().unwrap();
+        let merged_index = merged_index.expect("indexed");
+        assert_eq!(
+            sections_of(&merged_index),
+            vec![
+                ("host".to_string(), 200),
+                ("request_id".to_string(), 2 * ROWS as u32),
+                ("tid".to_string(), 2 * ROWS as u32),
+            ],
+            "merge kway={kway}"
+        );
+        let merged_reader = open_built(merged_data, Some(merged_index));
+        assert_eq!(
+            merged_reader.bloomed_fields().collect::<Vec<_>>(),
+            vec!["host", "request_id", "tid"]
+        );
     }
 }
 
@@ -15060,3 +15783,6 @@ mod and_intersection;
 
 #[path = "tests/walk_verify.rs"]
 mod walk_verify;
+
+#[path = "tests/cold_miss_probe.rs"]
+mod cold_miss_probe;

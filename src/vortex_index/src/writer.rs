@@ -65,8 +65,9 @@ use crate::{
         BLOB_TAG_TERMS, BLOB_TYPE_BLOOM, BLOB_TYPE_DICT, BLOB_TYPE_DICT_BLOCKS, BLOB_TYPE_PLIST,
         BLOB_TYPE_STATS, BLOB_TYPE_TERMS, BlobPart, DICT_LAYOUT_BLOCKS, DocsBlobEncoder,
         FIELD_TYPE_BLOOM, FIELD_TYPE_FTS, FIELD_TYPE_TERM, FieldEntry, FieldTypeFlags,
-        KEY_LAYOUT_FID_V2, PROP_COLUMNS, PROP_COLUMNS_COMPLETE, PROP_DICT_FIELD_PAGES,
-        PROP_DICT_LAYOUT, PROP_FIELDS, PROP_KEY_LAYOUT, PROP_OVERSIZE_SKIPS, PROP_PARTIAL_FIELDS,
+        KEY_LAYOUT_FID_V2, LAYOUT_GEN_PLAIN, LAYOUT_GEN_ZSTD, PROP_BLOOM_SECTIONS, PROP_COLUMNS,
+        PROP_COLUMNS_COMPLETE, PROP_DATA_FOOTER, PROP_DICT_FIELD_PAGES, PROP_DICT_LAYOUT,
+        PROP_FIELDS, PROP_KEY_LAYOUT, PROP_LAYOUT_GEN, PROP_OVERSIZE_SKIPS, PROP_PARTIAL_FIELDS,
         PROP_PLIST_MIN_DOCS, PROP_ROW_COUNT, PROP_ROW_GROUP_SIZE, PROP_ROW_ORDER, PROP_ROW_REGIONS,
         PROP_TERM_COUNT, PROP_TOKENIZER, PROP_VERSION, PROP_ZONE_MAP, ROW_ORDER_CONCAT,
         ROW_ORDER_TS_DESC, TOKENIZER_ID, TermsBlobSpooler, VIX_FORMAT_VERSION, VixOutput,
@@ -638,6 +639,28 @@ pub struct VixWriterOptions {
     /// (the `bloom` puffin blob, built as a byproduct of term emission —
     /// see [`crate::bloom`]). Typically `trace_id`/`span_id`.
     pub bloom_field_names: Vec<String>,
+    /// DESIGN-COLD-MISS §3 W1 — AUTO ADDITIVE per-field blooms, decided at
+    /// finish with EXACT distinct counts on every write path (first encode,
+    /// merge, spilled rebuild, heal): every string-family TERM field that
+    /// is not fts / bloom-only / demoted / value-index-excluded / partial
+    /// and not already in [`Self::bloom_field_names`] is a candidate; it
+    /// gets its own SBBF section iff `distinct ≥ bloom_auto_min_distinct`
+    /// AND (`distinct / rows ≤ bloom_auto_max_ratio` OR its name is
+    /// ID-like per [`is_id_like_field_name`]), admitted smallest-distinct
+    /// first while the admitted sections' bytes stay within
+    /// `bloom_auto_max_data_pct` % of the data object. Selected fields are
+    /// flagged `bf` in the `fields` table. `0` disables AUTO (no candidate
+    /// tracked — the crate default keeps every pre-W1 fixture
+    /// byte-identical; production wires `ZO_VIX_BLOOM_AUTO_MIN_DISTINCT`,
+    /// default 1024). Memory while tracking: 8 B × Σ distinct over the
+    /// candidates still in the running (a non-ID-like candidate frees its
+    /// hashes as soon as it crosses the ratio cap).
+    pub bloom_auto_min_distinct: u64,
+    /// See [`Self::bloom_auto_min_distinct`]; production default `0.25`.
+    pub bloom_auto_max_ratio: f64,
+    /// See [`Self::bloom_auto_min_distinct`]; production default `2.0`
+    /// (percent of the data object's bytes).
+    pub bloom_auto_max_data_pct: f64,
     /// #48: additionally build the reserved COMPOSITE bloom section —
     /// `{field name}\0{value}` keys for EVERY term field — so equality on
     /// any field is bloom-decidable ([`crate::bloom::COMPOSITE_BLOOM_FIELD`]).
@@ -835,6 +858,17 @@ pub struct VixWriterOptions {
     /// `false` (no pruning license) — raw-writer tests that fake
     /// `_source`-only fields stay honest automatically.
     pub columns_complete: bool,
+    /// DESIGN-COLD-MISS §2 S1/S2 (default `false`): the `.vxi` sidecar's
+    /// puffin footer payload is zstd-compressed and its `dict` block index
+    /// is stored zstd-compressed (declared in the blob metadata, decoded
+    /// whole by the reader at open) — the sidecar is stamped
+    /// `layout_gen=2`, `1` otherwise. Shrinks the cold-miss tail a reader
+    /// must fetch (footer JSON 13×, block index 2–3×) so one eager-tail GET
+    /// covers footer + dict on far more files. The DATA object's footer is
+    /// never compressed. Readers predating the compressed puffin footer
+    /// REJECT such a sidecar at open, so the knob is flipped only after
+    /// every reader runs this crate's puffin.
+    pub sidecar_tail_zstd: bool,
 }
 
 /// Default [`VixWriterOptions::docs_chunk_bytes`]: 16 MiB (owner call
@@ -873,6 +907,12 @@ const PASSTHROUGH_FALLBACK_ROWS_PER_CHUNK: usize = 8192;
 /// the dominant term of the compactor's ~24 GB merge peak.
 const DOCS_ENCODE_SAMPLE_BYTES: usize = 256 * 1024 * 1024;
 
+/// zstd level of the S2 `dict` block index (the footer payload uses the
+/// puffin crate's own level): the index is restart-compressed first keys and
+/// fixed-width metas, where the fast tier already gets most of the ratio and
+/// the decode at open stays negligible.
+pub(crate) const SIDECAR_ZSTD_LEVEL: i32 = 3;
+
 impl Default for VixWriterOptions {
     fn default() -> Self {
         Self {
@@ -885,6 +925,9 @@ impl Default for VixWriterOptions {
             bloom_only_auto_ratio: 0.0,
             bloom_only_auto_id_only: false,
             bloom_only_min_distinct: 65536,
+            bloom_auto_min_distinct: 0,
+            bloom_auto_max_ratio: 0.25,
+            bloom_auto_max_data_pct: 2.0,
             bloom_fpp: crate::bloom::DEFAULT_FILE_BLOOM_FPP,
             postings_chunk_bytes: 128 * 1024,
             max_raw_term_len: 65532,
@@ -907,6 +950,7 @@ impl Default for VixWriterOptions {
             docs_passthrough: false,
             concat_row_order: false,
             columns_complete: false,
+            sidecar_tail_zstd: false,
         }
     }
 }
@@ -1079,6 +1123,25 @@ pub struct VixWriter {
     /// pre-guard-era files (stored rows with `_timestamp <= 0`) that the
     /// compaction-time cleansing has to digest. Never set in production.
     skip_ts_guard: bool,
+    /// DESIGN-COLD-MISS §2 S4: the section table of the `bloom` blob this
+    /// finish produced (`assemble_index_blobs`), stamped as
+    /// `bloom_sections_v1` by the sidecar build. Empty = no blob.
+    bloom_sections: Vec<crate::bloom::BloomSectionEntry>,
+    /// S5: term fields that received a per-field SBBF section in this
+    /// finish — flagged `bf` in the `fields` table.
+    bloomed_fields: BTreeSet<String>,
+    /// S3: the DATA object's puffin footer payload (`PuffinMeta` JSON) to
+    /// embed as `data_footer_v1`. `finish_inner` captures it from the data
+    /// container it just wrote; the sidecar-only heal supplies the footer it
+    /// read through [`Self::set_data_footer`]. `None` = not stamped (readers
+    /// fall back to the data-tail fetch).
+    data_footer: Option<Vec<u8>>,
+    /// W1: the data object's byte size the AUTO additive budget applies to
+    /// on a sidecar-only finish ([`Self::finish_index_sidecar`]), supplied
+    /// by the heal through [`Self::set_data_object_bytes`]; `finish_inner`
+    /// uses the data object it just wrote. `0` = unknown: AUTO admits no
+    /// section.
+    data_object_bytes: u64,
 }
 
 /// How one push call splits between the term index and the docs store.
@@ -1132,6 +1195,19 @@ struct PrebuiltIndex {
     /// Sum of the inputs' row counts — the docs pushes must cover exactly
     /// this many rows.
     expected_rows: u64,
+}
+
+/// The output of [`VixWriter::assemble_index_blobs`]: the sidecar blob list
+/// WITHOUT the `bloom` blob, plus the bloom accumulator and the slot the
+/// blob takes once [`VixWriter::finish_bloom_blob`] builds it (after the
+/// data object's size is known — the W1 AUTO budget).
+struct IndexAssembly {
+    blobs: Vec<(&'static str, &'static str, BlobPart)>,
+    /// Index in `blobs` where the `bloom` blob is inserted (before `terms`).
+    bloom_slot: usize,
+    bloom: crate::bloom::BloomHashAcc,
+    term_count: u64,
+    dict_field_pages: Option<crate::dict_blocks::DictFieldPages>,
 }
 
 /// One high-water document id per bounded term field, reused across pushes
@@ -1392,6 +1468,10 @@ impl VixWriter {
             demoted_fields: BTreeSet::new(),
             value_index_excluded_fields,
             skip_ts_guard: false,
+            bloom_sections: Vec::new(),
+            bloomed_fields: BTreeSet::new(),
+            data_footer: None,
+            data_object_bytes: 0,
         }
     }
 
@@ -1891,6 +1971,10 @@ impl VixWriter {
             .filter(|name| {
                 !self.demoted_fields.contains(*name)
                     && !self.value_index_excluded_fields.contains(*name)
+                    // fts (token hashes) and non-string (canonical-tagged
+                    // bytes) sections could never match a raw-literal probe
+                    && !self.fts_fields.contains(*name)
+                    && !self.non_string_term_fields.contains(*name)
                     && self
                         .term_field_ids
                         .get(*name)
@@ -1905,11 +1989,25 @@ impl VixWriter {
             .map(|(name, id)| (name.clone(), *id))
             .collect();
         let bloom_only_fids: FastHashSet<u16> = self.bloom_only.keys().copied().collect();
+        // W1 candidates: the inputs' partial fields are known now (their
+        // union lands in `self.partial_fields` only after the k-way) — a
+        // partial field's section is untrusted downstream, so it never
+        // qualifies
+        let auto_bloom = crate::bloom::AutoBloomCandidates {
+            names: self.auto_bloom_candidate_names(
+                &bloom_field_names,
+                inputs
+                    .iter()
+                    .flat_map(|reader| reader.partial_fields().iter().map(String::as_str)),
+            ),
+            policy: self.auto_bloom_policy(),
+        };
         let merged = merge::merge_indexes(
             inputs,
             doc_maps,
             &merge_term_field_ids,
             &bloom_field_names,
+            &auto_bloom,
             &self.composite_pairs(),
             &bloom_only_fids,
             total_rows,
@@ -3441,11 +3539,23 @@ impl VixWriter {
         encoder.signal_finish()?;
 
         let index_assemble_started = std::time::Instant::now();
-        let (blobs, term_count, dict_field_pages) = self.assemble_index_blobs(row_count)?;
-        let index_assemble_ms = elapsed_millis_u64(index_assemble_started);
+        let mut assembly = self.assemble_index_blobs(row_count)?;
+        let mut index_assemble_ms = elapsed_millis_u64(index_assemble_started);
         let docs_finish_started = std::time::Instant::now();
         let (sink, docs_size) = encoder.join()?;
         let docs_finish_wait_ms = elapsed_millis_u64(docs_finish_started);
+        // The bloom blob is built once the docs blob's size is final: the W1
+        // AUTO budget is a percentage of it (the docs blob IS the data
+        // object up to its footer). Counted with the index assembly.
+        let bloom_started = std::time::Instant::now();
+        self.finish_bloom_blob(&mut assembly, row_count, docs_size)?;
+        index_assemble_ms += elapsed_millis_u64(bloom_started);
+        let IndexAssembly {
+            blobs,
+            term_count,
+            dict_field_pages,
+            ..
+        } = assembly;
         // Zone table + per-column chunk stats: one `(row_count, ts_min,
         // ts_max)` entry per docs row-block, folded over the stored
         // `_timestamp` values windowed by the same `rows_per_chunk` the docs
@@ -3557,10 +3667,13 @@ impl VixWriter {
             _ => Vec::new(),
         };
         let data_container_started = std::time::Instant::now();
-        let output = finish_streamed_container(sink, docs_size, data_properties, data_blobs)?;
+        let (output, data_footer) =
+            finish_streamed_container(sink, docs_size, data_properties, data_blobs)?;
         let data_container_ms = elapsed_millis_u64(data_container_started);
 
         let index_container_started = std::time::Instant::now();
+        // S3: the sidecar embeds the footer of the data object just written
+        self.data_footer = Some(data_footer);
         let index_output =
             self.build_index_sidecar_container(row_count, term_count, blobs, dict_field_pages)?;
         let index_container_ms = elapsed_millis_u64(index_container_started);
@@ -3599,11 +3712,15 @@ impl VixWriter {
         Ok((output, index_output, stats))
     }
 
-    /// Build the INDEX-side blobs (terms/plist/dict + per-file blooms) from
-    /// this writer's accumulated term + bloom state over `row_count` doc
-    /// ids. Shared by [`Self::finish_inner`] (coupled docs+index build) and
+    /// Build the INDEX-side blobs (terms/plist/dict) from this writer's
+    /// accumulated term + bloom state over `row_count` doc ids. Shared by
+    /// [`Self::finish_inner`] (coupled docs+index build) and
     /// [`Self::finish_index_sidecar`] (sidecar-only heal) so the two emit
-    /// byte-identical index blobs for the same pushes.
+    /// byte-identical index blobs for the same pushes. The per-file bloom
+    /// blob is NOT built here: the accumulator comes back in the
+    /// [`IndexAssembly`] and [`Self::finish_bloom_blob`] builds it once the
+    /// data object's size is known (the W1 AUTO budget is a percentage of
+    /// it) — after the docs encoder joined on the coupled path.
     ///
     /// Assembles the SIDECAR blob list (format "3": the data object carries
     /// ONLY `docs`; every index blob lives in the `.vxi` sidecar). Empty
@@ -3615,15 +3732,7 @@ impl VixWriter {
     /// the eager tail whenever `dict + puffin footer + 65,535 <= tail` — a
     /// cold sidecar open then parses both footers from ONE ranged fetch.
     /// Readers locate blobs by tag, so order carries no meaning for them.
-    #[allow(clippy::type_complexity)]
-    fn assemble_index_blobs(
-        &mut self,
-        row_count: u64,
-    ) -> Result<(
-        Vec<(&'static str, &'static str, BlobPart)>,
-        u64,
-        Option<crate::dict_blocks::DictFieldPages>,
-    )> {
+    fn assemble_index_blobs(&mut self, row_count: u64) -> Result<IndexAssembly> {
         let (index_blobs, term_count, bloom_acc) = match self.merged_index.take() {
             Some(prebuilt) => {
                 if !self.terms.is_empty() {
@@ -3677,14 +3786,42 @@ impl VixWriter {
                     // #52 bloom-only and intentionally excluded fields have
                     // no authoritative value terms — tracking either
                     // per-field would publish an EMPTY (reject-all) filter
-                    // and wrongly drop; the composite excludes both as well.
+                    // and wrongly drop; fts fields hash tokens and non-string
+                    // fields canonical-tagged bytes, neither of which the
+                    // pruner's raw-literal probe can match — same exclusions
+                    // as the composite and the AUTO candidates.
                     .filter(|(id, name)| {
                         !self.bloom_only.contains_key(id)
                             && !self.demoted_fields.contains(name)
                             && !self.value_index_excluded_fields.contains(name)
+                            && !self.fts_fields.contains(name)
+                            && !self.non_string_term_fields.contains(name)
                     })
                     .collect();
                 let composite_pairs = self.composite_pairs();
+                // W1 AUTO additive candidates. With the term map resident
+                // (not spilled) every candidate's distinct count is exact
+                // BEFORE the stream, so the min-distinct and ratio rules
+                // apply here and only the byte budget is left for
+                // `select_auto`; a spilled map tracks every candidate and
+                // decides at finish (same rule, same result).
+                let auto_policy = self.auto_bloom_policy();
+                let explicit_names: Vec<String> =
+                    bloom_pairs.iter().map(|(_, name)| name.clone()).collect();
+                let auto_pairs: Vec<(u16, String)> = self
+                    .auto_bloom_candidate_names(&explicit_names, std::iter::empty())
+                    .into_iter()
+                    .filter_map(|name| self.term_field_ids.get(&name).map(|id| (*id, name)))
+                    .filter(|(id, name)| {
+                        if self.term_spill.is_some() {
+                            return true;
+                        }
+                        let distinct = self.terms.field_len(*id) as u64;
+                        distinct >= auto_policy.min_distinct
+                            && (distinct as f64 <= row_count as f64 * auto_policy.max_ratio
+                                || is_id_like_field_name(name))
+                    })
+                    .collect();
                 // #48: one reserved section covering (field name, value)
                 // for every ELIGIBLE term field — any-field equality
                 // pruning (see [`Self::composite_pairs`] for what
@@ -3696,6 +3833,7 @@ impl VixWriter {
                 let kway_threads = self.opts.merge_kway_threads;
                 let make_acc = || {
                     let mut acc = crate::bloom::BloomHashAcc::from_pairs(bloom_pairs.clone());
+                    acc.track_auto_candidates(auto_pairs.iter().cloned(), &auto_policy, row_count);
                     if !composite_pairs.is_empty() {
                         acc.enable_composite(composite_pairs.iter().cloned());
                     }
@@ -3749,6 +3887,7 @@ impl VixWriter {
                             let workers = kway.min(ranges.len());
                             let resident = Arc::new(resident);
                             let bloom_pairs = Arc::new(bloom_pairs.clone());
+                            let auto_pairs = Arc::new(auto_pairs.clone());
                             let composite_pairs = Arc::new(composite_pairs.clone());
                             let handle = crate::cpu_executor::shared_vortex_execution_handle()?;
                             let tasks: Vec<_> = ranges
@@ -3757,10 +3896,16 @@ impl VixWriter {
                                 .map(|range| {
                                     let resident = Arc::clone(&resident);
                                     let bloom_pairs = Arc::clone(&bloom_pairs);
+                                    let auto_pairs = Arc::clone(&auto_pairs);
                                     let composite_pairs = Arc::clone(&composite_pairs);
                                     handle.spawn_cpu(move || {
                                         let mut acc = crate::bloom::BloomHashAcc::from_pairs(
                                             bloom_pairs.as_ref().clone(),
+                                        );
+                                        acc.track_auto_candidates(
+                                            auto_pairs.iter().cloned(),
+                                            &auto_policy,
+                                            row_count,
                                         );
                                         if !composite_pairs.is_empty() {
                                             acc.enable_composite(composite_pairs.iter().cloned());
@@ -3905,21 +4050,9 @@ impl VixWriter {
         for (fid, (name, hashes)) in self.bloom_only.iter_mut() {
             bloom_acc.absorb_composite_hashes(*fid, name, std::mem::take(hashes));
         }
-        let bloom_started = std::time::Instant::now();
-        // M12: the composite section over a big merge holds tens of millions
-        // of hashes — parallel bit-setting under the encode budget
-        // (byte-identical to sequential for any thread count)
-        let file_blooms = bloom_acc.build_threaded(self.opts.bloom_fpp, self.opts.encode_threads);
-        if !file_blooms.is_empty() {
-            let bloom_blob = crate::bloom::serialize_file_blooms(&file_blooms)?;
-            log::debug!(
-                "vix finish: SBBF bloom build {:?} ({} sections, {} bytes)",
-                bloom_started.elapsed(),
-                file_blooms.len(),
-                bloom_blob.len()
-            );
-            blobs.push((BLOB_TYPE_BLOOM, BLOB_TAG_BLOOM, BlobPart::Mem(bloom_blob)));
-        }
+        // The bloom blob's slot: before `terms` (see the order rationale
+        // above); `finish_bloom_blob` inserts it there.
+        let bloom_slot = blobs.len();
         // Explicit puffin offsets make physical order independent of lookup.
         // `terms` goes right before the small, universally used directory so
         // its Vortex footer shares the eager tail with `dict`; bloom payloads
@@ -3928,9 +4061,90 @@ impl VixWriter {
             blobs.push((BLOB_TYPE_TERMS, BLOB_TAG_TERMS, terms));
         }
         if let Some(directory) = directory {
-            blobs.push((BLOB_TYPE_DICT, BLOB_TAG_DICT, BlobPart::Mem(directory)));
+            // S2: store the block index zstd-compressed ONLY when the reader
+            // would hold it whole anyway (≤ the resident cap) — the windowed
+            // five-probe path over a larger index needs raw byte addressing.
+            let part = if self.opts.sidecar_tail_zstd
+                && directory.len() as u64 <= crate::reader::DICT_RESIDENT_MAX_BYTES
+            {
+                // single-shot compression writes the content size into the
+                // frame header — the reader sizes its admission from it
+                BlobPart::ZstdMem(
+                    zstd::bulk::compress(&directory, SIDECAR_ZSTD_LEVEL)
+                        .map_err(|e| VixError::Writer(format!("dict index zstd: {e}")))?,
+                )
+            } else {
+                BlobPart::Mem(directory)
+            };
+            blobs.push((BLOB_TYPE_DICT, BLOB_TAG_DICT, part));
         }
-        Ok((blobs, term_count, dict_field_pages))
+        Ok(IndexAssembly {
+            blobs,
+            bloom_slot,
+            bloom: bloom_acc,
+            term_count,
+            dict_field_pages,
+        })
+    }
+
+    /// Second half of [`Self::assemble_index_blobs`]: apply the W1 AUTO
+    /// selection against the data object's size (`data_bytes`; `0` =
+    /// unknown, admits no AUTO section), build the SBBF sections and insert
+    /// the `bloom` blob into the assembly. Records the S4 section table and
+    /// the S5 `bf` field set for the sidecar footer.
+    fn finish_bloom_blob(
+        &mut self,
+        assembly: &mut IndexAssembly,
+        row_count: u64,
+        data_bytes: u64,
+    ) -> Result<()> {
+        let mut bloom_acc = std::mem::take(&mut assembly.bloom);
+        if bloom_acc.has_auto_candidates() {
+            let selection = bloom_acc.select_auto(
+                &self.auto_bloom_policy(),
+                row_count,
+                data_bytes,
+                self.opts.bloom_fpp,
+            );
+            // per finished file: debug, like the bloom build line below
+            if !selection.selected.is_empty() || !selection.skipped.is_empty() {
+                log::debug!(
+                    "vix finish: AUTO per-field blooms over {row_count} rows / {data_bytes} data \
+                     bytes: selected {:?}, skipped {:?}",
+                    selection.selected,
+                    selection.skipped
+                );
+            }
+        }
+        let bloom_started = std::time::Instant::now();
+        // M12: the composite section over a big merge holds tens of millions
+        // of hashes — parallel bit-setting under the encode budget
+        // (byte-identical to sequential for any thread count)
+        let file_blooms = bloom_acc.build_threaded(self.opts.bloom_fpp, self.opts.encode_threads);
+        if file_blooms.is_empty() {
+            return Ok(());
+        }
+        let (bloom_blob, sections) =
+            crate::bloom::serialize_file_blooms_with_sections(&file_blooms)?;
+        log::debug!(
+            "vix finish: SBBF bloom build {:?} ({} sections, {} bytes)",
+            bloom_started.elapsed(),
+            file_blooms.len(),
+            bloom_blob.len()
+        );
+        // S4/S5: the section table goes on the footer; every per-field
+        // section (the composite is not a field) flags its field `bf`.
+        self.bloomed_fields = sections
+            .iter()
+            .filter(|(name, ..)| name != crate::bloom::COMPOSITE_BLOOM_FIELD)
+            .map(|(name, ..)| name.clone())
+            .collect();
+        self.bloom_sections = sections;
+        assembly.blobs.insert(
+            assembly.bloom_slot,
+            (BLOB_TYPE_BLOOM, BLOB_TAG_BLOOM, BlobPart::Mem(bloom_blob)),
+        );
+        Ok(())
     }
 
     /// Assemble the `.vxi` INDEX-sidecar container. Emitted IFF the file is
@@ -3998,7 +4212,50 @@ impl VixWriter {
                 self.opts.postings_plist_min_docs.to_string(),
             ));
         }
-        Ok(Some(build_container_parts(index_properties, blobs)?))
+        // S1/S2 layout generation: readers never dispatch on it (compression
+        // is declared by the puffin footer flag / blob metadata); the
+        // old-file repack population is `layout_gen < 2`.
+        index_properties.push((
+            PROP_LAYOUT_GEN.to_string(),
+            if self.opts.sidecar_tail_zstd {
+                LAYOUT_GEN_ZSTD
+            } else {
+                LAYOUT_GEN_PLAIN
+            }
+            .to_string(),
+        ));
+        // S4: the `bloom` blob's section table, so a sidecar-only probe
+        // addresses section blocks from the footer alone.
+        if !self.bloom_sections.is_empty() {
+            index_properties.push((
+                PROP_BLOOM_SECTIONS.to_string(),
+                serde_json::to_string(&self.bloom_sections)?,
+            ));
+        }
+        // S3: the data object's footer payload, verbatim — a sidecar-first
+        // open synthesizes the data container from it (no data-tail GET on a
+        // miss). The payload is the JSON this crate's puffin just produced
+        // (or a heal just parsed), so it is UTF-8 by construction.
+        if let Some(payload) = self.data_footer.as_deref() {
+            let payload = std::str::from_utf8(payload).map_err(|e| {
+                VixError::Writer(format!("data footer payload is not UTF-8 JSON: {e}"))
+            })?;
+            index_properties.push((PROP_DATA_FOOTER.to_string(), payload.to_string()));
+        }
+        // §4/B2: the all-present-columns license, ALSO on the sidecar (the
+        // data object keeps its copy) — a sidecar-only reader (the `.bf`
+        // assembler, stage 1b) needs it to treat the `fields` table as the
+        // authoritative column set. Same value on both objects on every
+        // path: producers assert it, a merge ANDs its inputs, a heal's
+        // single-input plan carries the data object's flag.
+        if self.opts.columns_complete {
+            index_properties.push((PROP_COLUMNS_COMPLETE.to_string(), "true".to_string()));
+        }
+        Ok(Some(build_container_parts(
+            index_properties,
+            blobs,
+            self.opts.sidecar_tail_zstd,
+        )?))
     }
 
     /// Sidecar-only heal (M3, DESIGN-V2 §5): finish ONLY the `.vxi` index
@@ -4051,7 +4308,15 @@ impl VixWriter {
             .into());
         }
         let index_assemble_started = std::time::Instant::now();
-        let (blobs, term_count, dict_field_pages) = self.assemble_index_blobs(expected_rows)?;
+        let mut assembly = self.assemble_index_blobs(expected_rows)?;
+        // W1 budget against the stored data object (`set_data_object_bytes`)
+        self.finish_bloom_blob(&mut assembly, expected_rows, self.data_object_bytes)?;
+        let IndexAssembly {
+            blobs,
+            term_count,
+            dict_field_pages,
+            ..
+        } = assembly;
         let index_assemble_ms = elapsed_millis_u64(index_assemble_started);
         let index_container_started = std::time::Instant::now();
         let container = self
@@ -4075,6 +4340,16 @@ impl VixWriter {
             },
         };
         Ok((container, stats))
+    }
+
+    /// S3, sidecar-only heal: the DATA object's puffin footer payload (the
+    /// `PuffinMeta` JSON, as [`crate::read_data_footer_payload`] returns it)
+    /// to embed as `data_footer_v1` on the rebuilt sidecar. The heal leaves
+    /// the data object byte-identical, so the footer it read IS the footer
+    /// the new sidecar describes. Without it the sidecar is not stamped and
+    /// readers fall back to the data-tail fetch.
+    pub fn set_data_footer(&mut self, payload: Vec<u8>) {
+        self.data_footer = Some(payload);
     }
 
     /// Per-field oversize-skip counts accumulated by this writer's pushes
@@ -4118,6 +4393,57 @@ impl VixWriter {
             .collect()
     }
 
+    /// W1: the AUTO additive selection policy from the options.
+    fn auto_bloom_policy(&self) -> crate::bloom::AutoBloomPolicy {
+        crate::bloom::AutoBloomPolicy {
+            min_distinct: self.opts.bloom_auto_min_distinct,
+            max_ratio: self.opts.bloom_auto_max_ratio,
+            max_data_pct: self.opts.bloom_auto_max_data_pct,
+        }
+    }
+
+    /// W1: the AUTO additive CANDIDATE names — every term field whose
+    /// dictionary holds its COMPLETE raw string values (the same
+    /// eligibility the composite demands, see [`Self::composite_pairs`])
+    /// minus bloom-only fields, partial fields (`self.partial_fields` plus
+    /// `extra_partial`: a merge's inputs' sets, known before the k-way) and
+    /// the fields already tracked explicitly. Sorted for a deterministic
+    /// walk. Empty when AUTO is off.
+    fn auto_bloom_candidate_names<'a>(
+        &self,
+        explicit: &[String],
+        extra_partial: impl Iterator<Item = &'a str>,
+    ) -> Vec<String> {
+        if !self.auto_bloom_policy().enabled() {
+            return Vec::new();
+        }
+        let extra_partial: BTreeSet<&str> = extra_partial.collect();
+        let mut names: Vec<String> = self
+            .term_field_ids
+            .iter()
+            .filter(|(name, id)| {
+                !self.fts_fields.contains(*name)
+                    && !self.demoted_fields.contains(*name)
+                    && !self.value_index_excluded_fields.contains(*name)
+                    && !self.non_string_term_fields.contains(*name)
+                    && !self.bloom_only.contains_key(id)
+                    && !self.partial_fields.contains(*name)
+                    && !extra_partial.contains(name.as_str())
+                    && !explicit.contains(name)
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// W1, sidecar-only finish: the data object's byte size the AUTO
+    /// additive budget (`bloom_auto_max_data_pct`) applies to. The heal
+    /// supplies the stored object's size; without it AUTO admits nothing.
+    pub fn set_data_object_bytes(&mut self, bytes: u64) {
+        self.data_object_bytes = bytes;
+    }
+
     /// The `fields` property: value-indexed fields first (array index ==
     /// field id), then stored-only entries (`_timestamp`, non-term
     /// column-store fields) appended after them. Key terms and the
@@ -4150,6 +4476,13 @@ impl VixWriter {
             };
             if self.cs_fields.contains(name) {
                 types.0 |= FieldTypeFlags::CS.0;
+            }
+            // S5: a per-field SBBF section exists for this field in this
+            // file (explicit `bloom_field_names` or AUTO additive). Purely
+            // informational for the pruner's sidecar-only stage; never a
+            // merge-input mismatch (`check_merge_inputs` ignores it).
+            if self.bloomed_fields.contains(name) {
+                types.0 |= FieldTypeFlags::BLOOMED.0;
             }
             types
         };

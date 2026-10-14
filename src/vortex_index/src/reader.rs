@@ -802,6 +802,9 @@ pub struct VixReader {
     /// §4: the file asserts the all-present-columns invariant
     /// (`columns_complete` property). `false` when absent (fail-open).
     columns_complete: bool,
+    /// DESIGN-COLD-MISS §2 S1/S2: the sidecar `layout_gen` property (`0`
+    /// when absent — a pre-property file). See [`Self::layout_gen`].
+    layout_gen: u32,
 }
 
 /// One resolved dictionary index for a field-qualified operation: the
@@ -953,12 +956,47 @@ impl VixReader {
         Self::open_ranged_with_index_tail(source, index, crate::container::tail_fetch_size())
     }
 
+    /// [`Self::open_ranged_with_index`] with the sidecar-first mode
+    /// (DESIGN-COLD-MISS §2 S3) decided per call rather than by the
+    /// process-wide switch: a caller that knows the sidecar predates the
+    /// embedded data footer opens the pair the parallel way and saves the
+    /// serial data-tail round trip the fallback would cost.
+    pub fn open_ranged_with_index_sidecar_first(
+        source: Arc<dyn VixRangeSource>,
+        index: Option<Arc<dyn VixRangeSource>>,
+        sidecar_first: bool,
+    ) -> anyhow::Result<Self> {
+        Self::open_ranged_with_index_mode(
+            source,
+            index,
+            crate::container::tail_fetch_size(),
+            sidecar_first,
+        )
+    }
+
     /// [`Self::open_ranged_with_index`] with an explicit sidecar eager-tail
     /// size (the data object always uses the built-in 64 KiB probe).
     pub(crate) fn open_ranged_with_index_tail(
         source: Arc<dyn VixRangeSource>,
         index: Option<Arc<dyn VixRangeSource>>,
         index_tail_bytes: u64,
+    ) -> anyhow::Result<Self> {
+        Self::open_ranged_with_index_mode(
+            source,
+            index,
+            index_tail_bytes,
+            crate::container::sidecar_first_open(),
+        )
+    }
+
+    /// [`Self::open_ranged_with_index_tail`] with the sidecar-first mode
+    /// (DESIGN-COLD-MISS §2 S3) chosen by the caller instead of the
+    /// process-wide switch.
+    pub(crate) fn open_ranged_with_index_mode(
+        source: Arc<dyn VixRangeSource>,
+        index: Option<Arc<dyn VixRangeSource>>,
+        index_tail_bytes: u64,
+        sidecar_first: bool,
     ) -> anyhow::Result<Self> {
         let memory = Arc::new(ReaderMemory::new());
         let _scope = memory.enter();
@@ -968,6 +1006,30 @@ impl VixReader {
                 .saturating_add(index.as_ref().map_or(0, |source| source.retained_bytes())),
         )?;
         let (container, index_container) = match &index {
+            Some(index) if sidecar_first => {
+                // S3: sidecar tail only; the data container comes from the
+                // embedded footer when the sidecar carries one, else from a
+                // second, data-tail round trip (pre-property sidecars). An
+                // embedded footer that fails to parse takes the same second
+                // round trip: the data object is authoritative, a corrupt
+                // copy must not fail the file.
+                let index_container = parse_container_ranged_with_tail(index, index_tail_bytes)?;
+                let embedded = index_container
+                    .properties
+                    .get(crate::container::PROP_DATA_FOOTER)
+                    .map(|payload| crate::container::container_from_data_footer(&source, payload));
+                let container = match embedded {
+                    Some(Ok(container)) => container,
+                    Some(Err(e)) => {
+                        log::warn!(
+                            "vix open: embedded data footer unreadable ({e}); reading the data tail"
+                        );
+                        parse_container_ranged_with_tail(&source, DEFAULT_TAIL_FETCH_BYTES)?
+                    }
+                    None => parse_container_ranged_with_tail(&source, DEFAULT_TAIL_FETCH_BYTES)?,
+                };
+                (container, Some(index_container))
+            }
             Some(index) => {
                 let (container, index_container) = parse_container_pair_ranged(
                     &source,
@@ -1054,6 +1116,15 @@ impl VixReader {
         // no term/fts/bloom capability, dictionary proofs void, column
         // routing synthesized from the data object's `columns` list.
         let index_enabled = index_container.is_some();
+        // DESIGN-COLD-MISS §2 S1/S2: the sidecar layout generation (0 =
+        // absent = a pre-property file; 1 = uncompressed tail; 2 = compressed
+        // footer + dict blob). A malformed value reads as 0 (fail-open — the
+        // reader never dispatches on it).
+        let layout_gen = index_container
+            .as_ref()
+            .and_then(|index| index.properties.get(crate::container::PROP_LAYOUT_GEN))
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or(0);
         let raw_value_terms_disjoint = index_container.as_ref().is_some_and(|index| {
             index
                 .properties
@@ -1169,7 +1240,14 @@ impl VixReader {
         let mut bloom_blob = None;
         let mut plist_blob = None;
         let mut dict_field_pages = None;
-        if let Some(index) = index_container {
+        // S2: the decoded block index of a zstd-stored `dict` blob, retained
+        // as the reader's `Mem` dict handle. Its reservation is held until
+        // `initialize_memory` charges the retained buffer; a whole-object
+        // open adds it to `owned_bytes` (the container bytes do not cover
+        // the decode), a ranged open charges it through the `Mem` arm.
+        let mut dict_decoded_bytes = 0usize;
+        let mut _dict_pending = None;
+        if let Some(mut index) = index_container {
             if term_count > 0 {
                 // The dictionary is the BLOCK layout — the only readable
                 // layout. Monolithic-FST files were retired without read
@@ -1183,6 +1261,22 @@ impl VixReader {
                              {DICT_LAYOUT_BLOCKS:?} (pre-block dictionaries were retired)",
                         )));
                     }
+                }
+                if let Some(codec) = index.dict_codec.as_ref() {
+                    if !matches!(codec, puffin::CompressionCodec::Zstd) {
+                        return Err(VixError::Malformed(format!(
+                            "unsupported dict blob codec {codec:?}: this reader decodes zstd only"
+                        )));
+                    }
+                    let handle = index
+                        .dict
+                        .as_ref()
+                        .ok_or_else(|| VixError::Malformed("missing dict blob".to_string()))?;
+                    let (decoded, pending) =
+                        Self::decode_dict_index(handle, &crate::source::current_reader_memory())?;
+                    dict_decoded_bytes = decoded.len() + RETAINED_BYTES_OVERHEAD;
+                    _dict_pending = Some(pending);
+                    index.dict = Some(BlobHandle::Mem(decoded));
                 }
                 if let Some(property) = index
                     .properties
@@ -1267,6 +1361,15 @@ impl VixReader {
             row_order,
             row_regions,
             columns_complete,
+            layout_gen,
+        };
+        // a whole-object open's `owned_bytes` are the container bytes; the
+        // decoded dict index is a separate retained buffer (ranged opens
+        // charge it through the `Mem` arm of `initialize_memory`)
+        let owned_bytes = if eager_docs_schema {
+            owned_bytes.saturating_add(dict_decoded_bytes)
+        } else {
+            owned_bytes
         };
         reader.initialize_memory(owned_bytes, eager_docs_schema);
         crate::check_read_memory(reader.memory_size())?;
@@ -1274,6 +1377,42 @@ impl VixReader {
             reader.docs_schema_inner()?;
         }
         Ok(reader)
+    }
+
+    /// S2: decode a zstd-stored `dict` block index WHOLE — zero IO for a
+    /// tail-resident handle, one fetch of the compressed blob for a ranged
+    /// one — admitting the decoded buffer through `memory` before it is
+    /// allocated. Returns the decoded bytes and the reservation covering
+    /// them; the caller holds it until the retained buffer is charged. The
+    /// writer compresses only an index within [`DICT_RESIDENT_MAX_BYTES`],
+    /// so a frame advertising more is malformed.
+    fn decode_dict_index(
+        handle: &BlobHandle,
+        memory: &Arc<ReaderMemory>,
+    ) -> Result<(Bytes, PendingMemory)> {
+        let compressed = match handle {
+            BlobHandle::Mem(bytes) => bytes.clone(),
+            BlobHandle::Ranged(ranged) => {
+                let _fetch = memory.reserve(usize::try_from(ranged.len()).unwrap_or(usize::MAX))?;
+                crate::source::block_fetch(ranged.source.as_ref(), ranged.range.clone())?
+            }
+        };
+        let decoded_len = zstd::zstd_safe::get_frame_content_size(&compressed)
+            .map_err(|e| VixError::Malformed(format!("dict index zstd frame header: {e}")))?
+            .ok_or_else(|| {
+                VixError::Malformed("dict index zstd frame lacks a content size".to_string())
+            })?;
+        if decoded_len > DICT_RESIDENT_MAX_BYTES {
+            return Err(VixError::Malformed(format!(
+                "compressed dict index advertises {decoded_len} decoded bytes \
+                 (max {DICT_RESIDENT_MAX_BYTES})"
+            )));
+        }
+        let decoded_len = decoded_len as usize;
+        let pending = memory.reserve(decoded_len.saturating_add(RETAINED_BYTES_OVERHEAD))?;
+        let decoded = zstd::bulk::decompress(&compressed, decoded_len)
+            .map_err(|e| VixError::Malformed(format!("dict index zstd: {e}")))?;
+        Ok((Bytes::from(decoded), pending))
     }
 
     /// Whether this reader carries a term index at all: `false` when it was
@@ -1469,6 +1608,31 @@ impl VixReader {
             .iter()
             .filter(|entry| entry.has_type(FIELD_TYPE_BLOOM))
             .map(|entry| entry.name.as_str())
+    }
+
+    /// DESIGN-COLD-MISS §2 S5: the term fields this file marks with a
+    /// per-field SBBF section (`"bf"`). Purely informational for the pruner's
+    /// sidecar-only stage 1b — evaluation never consults it.
+    pub fn bloomed_fields(&self) -> impl Iterator<Item = &str> + '_ {
+        self.fields
+            .iter()
+            .filter(|entry| entry.types.is_bloomed())
+            .map(|entry| entry.name.as_str())
+    }
+
+    /// Every field of this file's `fields` table — i.e. every docs column
+    /// (term/fts entries first by field id, then column-store-only entries).
+    pub fn field_names(&self) -> impl Iterator<Item = &str> + '_ {
+        self.fields.iter().map(|entry| entry.name.as_str())
+    }
+
+    /// DESIGN-COLD-MISS §2 S1/S2: the sidecar LAYOUT GENERATION the writer
+    /// stamped (`layout_gen`: `1` = uncompressed tail, `2` = compressed
+    /// footer + `dict` blob). `0` when the property is absent — every file
+    /// written before the property existed (readers never dispatch on it;
+    /// it drives the heal's sidecar repack population).
+    pub fn layout_gen(&self) -> u32 {
+        self.layout_gen
     }
 
     /// Fields whose VALUE TERMS are knowingly incomplete (type drift,

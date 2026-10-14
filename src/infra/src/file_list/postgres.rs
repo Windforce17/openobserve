@@ -697,6 +697,55 @@ SELECT min_ts, max_ts, records, original_size, compressed_size, index_size, inde
         Ok(updated)
     }
 
+    async fn update_bloom_ver_from(
+        &self,
+        org_id: &str,
+        stream_type: StreamType,
+        stream_name: &str,
+        date: &str,
+        expected: &[(i64, i64, i64)],
+        from: i64,
+        to: i64,
+    ) -> Result<u64> {
+        if expected.is_empty() {
+            return Ok(0);
+        }
+        let stream_key = format!("{org_id}/{stream_type}/{stream_name}");
+        let pool = CLIENT.clone();
+        let mut updated = 0;
+        for chunk in expected.chunks(500) {
+            // one (stream, date) partition; the CAS on the old version keeps a
+            // concurrent heal's re-pend (bloom_ver = 0) untouched
+            let mut query = QueryBuilder::<Postgres>::new("UPDATE file_list SET bloom_ver = ");
+            query
+                .push_bind(to)
+                .push(" WHERE stream = ")
+                .push_bind(stream_key.clone())
+                .push(" AND date = ")
+                .push_bind(date.to_string())
+                .push(" AND bloom_ver = ")
+                .push_bind(from)
+                .push(" AND (");
+            let mut clauses = query.separated(" OR ");
+            for (id, index_generation, index_size) in chunk {
+                clauses
+                    .push("(id = ")
+                    .push_bind_unseparated(*id)
+                    .push_unseparated(" AND index_generation = ")
+                    .push_bind_unseparated(*index_generation)
+                    .push_unseparated(" AND index_size = ")
+                    .push_bind_unseparated(*index_size)
+                    .push_unseparated(")");
+            }
+            clauses.push_unseparated(")");
+            DB_QUERY_NUMS
+                .with_label_values(&["update", "file_list"])
+                .inc();
+            updated += query.build().execute(&pool).await?.rows_affected();
+        }
+        Ok(updated)
+    }
+
     async fn bloom_ver_referenced(
         &self,
         org_id: &str,
@@ -887,7 +936,7 @@ SELECT id, account, stream, date, file, min_ts, max_ts, records, original_size, 
         stream_type: StreamType,
         stream_name: &str,
         date: &str,
-    ) -> Result<Vec<FileKey>> {
+    ) -> Result<Vec<super::FileRecord>> {
         let start = std::time::Instant::now();
         let stream_key = format!("{org_id}/{stream_type}/{stream_name}");
 
@@ -896,8 +945,11 @@ SELECT id, account, stream, date, file, min_ts, max_ts, records, original_size, 
             .with_label_values(&["query_for_bloom", "file_list"])
             .inc();
 
+        // the whole hour (one (stream, date) partition): pending AND stamped
+        // rows — the assembler decides its regroup triggers and the chunk
+        // consolidation from these
         let sql = r#"
-SELECT id, account, stream, date, file, records, index_size, index_generation, compressed_size FROM file_list WHERE stream = $1 AND date = $2 AND index_size > 0 AND bloom_ver = 0;
+SELECT id, account, stream, date, file, records, index_size, index_generation, compressed_size, bloom_ver, updated_at FROM file_list WHERE stream = $1 AND date = $2 AND index_size > 0;
                 "#;
         let ret = sqlx::query_as::<_, super::FileRecord>(sql)
             .bind(stream_key)
@@ -908,7 +960,7 @@ SELECT id, account, stream, date, file, records, index_size, index_generation, c
         DB_QUERY_TIME
             .with_label_values(&["query_for_bloom", "file_list"])
             .observe(time);
-        Ok(ret?.iter().map(|r| r.into()).collect())
+        Ok(ret?)
     }
 
     async fn query_bloom_pending_buckets(

@@ -36,7 +36,7 @@
 use std::io::Write;
 
 use super::{
-    ALGO_SBBF_GXHASH, MAGIC, VERSION,
+    ALGO_SBBF_GXHASH, FOOTER_ZSTD_LEVEL, MAGIC, MAGIC_V2, VERSION, VERSION_V2,
     sbbf::{BLOCK_BYTES, Sbbf},
 };
 
@@ -63,6 +63,18 @@ pub enum WriteError {
     },
     #[error("num_blocks for field '{0}' too large: {1} (max u32::MAX)")]
     TooManyBlocks(String, u64),
+    #[error("too many columns: {0} (max u32::MAX)")]
+    TooManyColumns(usize),
+    #[error("too many group members: {0} (max u32::MAX)")]
+    TooManyMembers(usize),
+    #[error("group member file_id {0} has no blooms and no columns")]
+    EmptyMember(u64),
+    #[error("bloom field '{field}' references file_id {file_id}, which is not a group member")]
+    UnknownMember { field: String, file_id: u64 },
+    #[error("duplicate group member file_id {0}")]
+    DuplicateMember(u64),
+    #[error("footer compression failed: {0}")]
+    Compress(String),
 }
 
 /// One bloom for a single (file, field) pair, fully built in memory.
@@ -75,6 +87,43 @@ pub struct FieldBloom {
     /// blooms of the same field in a group must have identical length.
     pub bytes: Vec<u8>,
 }
+
+/// One member of a v2 group: its `file_list.id` plus the FULL column set of
+/// that file (every docs column, not only bloomed ones). The writer turns
+/// the union of these sets into the column table and each member's presence
+/// bitmap, so the pruner can answer "does this file have field f at all?"
+/// from the footer alone (DESIGN-COLD-MISS §4 B1/B2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupMember {
+    pub file_id: u64,
+    /// Every column of this file. Order is irrelevant — the writer sorts.
+    pub columns: Vec<String>,
+    /// Whether `columns` is AUTHORITATIVE for the file (the data object's
+    /// `columns_complete` license: every `_source` field is a column). A
+    /// file without it may hold a field in `_source` that never became a
+    /// column, so its presence bits are written but answer "no info" — the
+    /// pruner never drops it on presence alone.
+    pub complete: bool,
+}
+
+impl GroupMember {
+    /// A member whose column set is authoritative (`complete = true`).
+    pub fn new(file_id: u64, columns: Vec<String>) -> Self {
+        Self {
+            file_id,
+            columns,
+            complete: true,
+        }
+    }
+
+    pub fn with_complete(mut self, complete: bool) -> Self {
+        self.complete = complete;
+        self
+    }
+}
+
+/// Per-file flags byte of the v2 footer: bit 0 = presence bits authoritative.
+pub(crate) const MEMBER_FLAG_COMPLETE: u8 = 1 << 0;
 
 /// Builder that accumulates `(field, file)` blooms before serialization.
 /// Every bloom is created with an explicit, group-uniform `num_blocks`.
@@ -287,6 +336,213 @@ impl BloomWriter {
         let footer_len = (out.len() - footer_start) as u32;
         out.write_all(&footer_len.to_le_bytes()).unwrap();
         out.extend_from_slice(MAGIC);
+
+        Ok(out)
+    }
+
+    /// Serialize a **v2** `.bf` (DESIGN-COLD-MISS §4 B1). The body is
+    /// byte-identical to v1's per section (transposed rows, uniform
+    /// `num_blocks`); the footer gains a group file table, a column table
+    /// (the union of every member's columns) and per-file presence bitmaps,
+    /// and is zstd-compressed behind the `"O2B2"` tail magic.
+    ///
+    /// `members` declares every file of the group (the group file table) and
+    /// its full column set; `blooms` are the per-(file, field) SBBFs. Every
+    /// bloom's `file_id` MUST be a member.
+    pub fn serialize_v2(
+        members: &[GroupMember],
+        blooms: Vec<FieldBloom>,
+    ) -> Result<Vec<u8>, WriteError> {
+        if members.len() > u32::MAX as usize {
+            return Err(WriteError::TooManyMembers(members.len()));
+        }
+
+        // Group file table in ASCENDING file_id order: the presence block and
+        // every section's member list then share one deterministic order.
+        let mut group: Vec<&GroupMember> = members.iter().collect();
+        group.sort_by_key(|m| m.file_id);
+        let mut file_pos: hashbrown::HashMap<u64, usize> =
+            hashbrown::HashMap::with_capacity(group.len());
+        for (i, m) in group.iter().enumerate() {
+            if file_pos.insert(m.file_id, i).is_some() {
+                return Err(WriteError::DuplicateMember(m.file_id));
+            }
+        }
+
+        // Column table = union of every member's columns, sorted for a
+        // deterministic footer (and a compact bitmap index).
+        let mut columns: Vec<String> = Vec::new();
+        {
+            let mut seen: hashbrown::HashSet<&str> = hashbrown::HashSet::new();
+            for m in &group {
+                for column in &m.columns {
+                    if seen.insert(column.as_str()) {
+                        columns.push(column.clone());
+                    }
+                }
+            }
+        }
+        columns.sort();
+        columns.dedup();
+        if columns.len() > u32::MAX as usize {
+            return Err(WriteError::TooManyColumns(columns.len()));
+        }
+        let mut column_pos: hashbrown::HashMap<&str, usize> =
+            hashbrown::HashMap::with_capacity(columns.len());
+        for (i, name) in columns.iter().enumerate() {
+            column_pos.insert(name.as_str(), i);
+        }
+
+        // Per-file presence bitmaps, in group file-table order.
+        let bitmap_bytes = columns.len().div_ceil(8);
+        let mut presence: Vec<Vec<u8>> = vec![vec![0u8; bitmap_bytes]; group.len()];
+        for (i, m) in group.iter().enumerate() {
+            for column in &m.columns {
+                let Some(&c) = column_pos.get(column.as_str()) else {
+                    continue;
+                };
+                presence[i][c / 8] |= 1 << (c % 8);
+            }
+        }
+
+        // Group blooms by field, preserving first-seen field order.
+        let mut field_order: Vec<String> = Vec::new();
+        let mut by_field: hashbrown::HashMap<String, Vec<FieldBloom>> = hashbrown::HashMap::new();
+        for b in blooms {
+            if !file_pos.contains_key(&b.file_id) {
+                return Err(WriteError::UnknownMember {
+                    field: b.field,
+                    file_id: b.file_id,
+                });
+            }
+            if !by_field.contains_key(&b.field) {
+                field_order.push(b.field.clone());
+            }
+            by_field.entry(b.field.clone()).or_default().push(b);
+        }
+        if field_order.len() > u32::MAX as usize {
+            return Err(WriteError::TooManyFields(field_order.len()));
+        }
+
+        // Body: per field, the v1 transposition with member_count columns.
+        let mut out = Vec::new();
+        out.extend_from_slice(MAGIC);
+        out.push(VERSION_V2);
+
+        struct Section {
+            name: String,
+            num_blocks: u32,
+            body_offset: u64,
+            /// (group file index, n_items), ascending by file index.
+            members: Vec<(u32, u32)>,
+        }
+        let mut sections: Vec<Section> = Vec::with_capacity(field_order.len());
+        for field in &field_order {
+            let mut files = by_field.remove(field).unwrap();
+            if files.len() > u32::MAX as usize {
+                return Err(WriteError::TooManyFiles {
+                    field: field.clone(),
+                    count: files.len(),
+                });
+            }
+            // Section member order = ascending group file index.
+            files.sort_by_key(|b| file_pos[&b.file_id]);
+            let expected_len = files[0].bytes.len();
+            let b_usize = expected_len / BLOCK_BYTES;
+            if b_usize > u32::MAX as usize {
+                return Err(WriteError::TooManyBlocks(field.clone(), b_usize as u64));
+            }
+            let num_blocks = b_usize as u32;
+            for fb in &files {
+                if fb.bytes.len() != expected_len {
+                    return Err(WriteError::NonUniformBlocks {
+                        field: field.clone(),
+                        file_id: fb.file_id,
+                        got: (fb.bytes.len() / BLOCK_BYTES) as u32,
+                        expected: num_blocks,
+                    });
+                }
+            }
+
+            let body_offset = out.len() as u64;
+            for j in 0..b_usize {
+                let lo = j * BLOCK_BYTES;
+                let hi = lo + BLOCK_BYTES;
+                for fb in &files {
+                    out.extend_from_slice(&fb.bytes[lo..hi]);
+                }
+            }
+            sections.push(Section {
+                name: field.clone(),
+                num_blocks,
+                body_offset,
+                members: files
+                    .iter()
+                    .map(|b| (file_pos[&b.file_id] as u32, b.n_items))
+                    .collect(),
+            });
+        }
+
+        // Footer payload (plaintext, then zstd).
+        let mut footer = Vec::new();
+        footer
+            .write_all(&(sections.len() as u32).to_le_bytes())
+            .unwrap();
+        footer
+            .write_all(&(columns.len() as u32).to_le_bytes())
+            .unwrap();
+        for name in &columns {
+            let name_bytes = name.as_bytes();
+            let name_len =
+                u16::try_from(name_bytes.len()).map_err(|_| WriteError::FieldNameTooLong {
+                    name: name.clone(),
+                    len: name_bytes.len(),
+                })?;
+            footer.extend_from_slice(&name_len.to_le_bytes());
+            footer.extend_from_slice(name_bytes);
+        }
+        footer
+            .write_all(&(group.len() as u32).to_le_bytes())
+            .unwrap();
+        for m in &group {
+            footer.extend_from_slice(&m.file_id.to_le_bytes());
+        }
+        for m in &group {
+            footer.push(if m.complete { MEMBER_FLAG_COMPLETE } else { 0 });
+        }
+        for bitmap in &presence {
+            footer.extend_from_slice(bitmap);
+        }
+        for sec in &sections {
+            let name_bytes = sec.name.as_bytes();
+            let name_len =
+                u16::try_from(name_bytes.len()).map_err(|_| WriteError::FieldNameTooLong {
+                    name: sec.name.clone(),
+                    len: name_bytes.len(),
+                })?;
+            footer.extend_from_slice(&name_len.to_le_bytes());
+            footer.extend_from_slice(name_bytes);
+            footer.push(ALGO_SBBF_GXHASH);
+            footer.extend_from_slice(&sec.num_blocks.to_le_bytes());
+            footer.extend_from_slice(&sec.body_offset.to_le_bytes());
+            footer.extend_from_slice(&(sec.members.len() as u32).to_le_bytes());
+            for (file_index, n_items) in &sec.members {
+                footer.extend_from_slice(&file_index.to_le_bytes());
+                footer.extend_from_slice(&n_items.to_le_bytes());
+            }
+        }
+
+        let compressed = zstd::bulk::compress(&footer, FOOTER_ZSTD_LEVEL)
+            .map_err(|e| WriteError::Compress(e.to_string()))?;
+        let footer_len = u32::try_from(compressed.len()).map_err(|_| {
+            WriteError::Compress(format!(
+                "compressed footer too large: {} bytes",
+                compressed.len()
+            ))
+        })?;
+        out.extend_from_slice(&compressed);
+        out.extend_from_slice(&footer_len.to_le_bytes());
+        out.extend_from_slice(MAGIC_V2);
 
         Ok(out)
     }

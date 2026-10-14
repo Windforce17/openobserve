@@ -23,6 +23,13 @@
 //! Blob types are free-form strings: the spec's registry is open-ended, and
 //! a reader must be able to parse footers that carry blob types it does not
 //! know (consumers match on the ids they understand and skip the rest).
+//!
+//! The footer payload may be zstd-compressed (spec flag bit 0,
+//! [`PuffinFooterFlags::COMPRESSED`]): the writer opts in per file
+//! ([`writer::PuffinBytesWriter::set_footer_compression`]), the parser
+//! handles both forms. Readers predating this support reject a compressed
+//! footer at open — producers must only enable it once every consumer of
+//! their files has been upgraded.
 
 use std::collections::BTreeMap;
 
@@ -40,6 +47,10 @@ pub const FLAGS_SIZE: u64 = 4;
 pub const FOOTER_PAYLOAD_SIZE_SIZE: u64 = 4;
 pub const FOOTER_SIZE: u64 = MAGIC_SIZE + FLAGS_SIZE + FOOTER_PAYLOAD_SIZE_SIZE;
 pub const MIN_DATA_SIZE: u64 = MAGIC_SIZE + FLAGS_SIZE + FOOTER_PAYLOAD_SIZE_SIZE + MAGIC_SIZE; // without any blobs
+/// zstd level of a compressed footer payload: the footer JSON is highly
+/// repetitive (property names, field-name lists), so the fast tier already
+/// gets most of the ratio and decompression cost stays negligible at open.
+pub const FOOTER_ZSTD_LEVEL: i32 = 3;
 
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -144,6 +155,14 @@ impl BlobMetadataBuilder {
 
     pub fn properties(mut self, properties: BTreeMap<String, String>) -> Self {
         self.properties = properties;
+        self
+    }
+
+    /// Declare the codec of the blob BYTES AS WRITTEN. The writer never
+    /// compresses blob payloads itself — a producer that stores a compressed
+    /// blob declares it here so readers know to decode it.
+    pub fn compression_codec(mut self, codec: Option<CompressionCodec>) -> Self {
+        self.compression_codec = codec;
         self
     }
 

@@ -402,6 +402,11 @@ fn core_writer_options_from_config(
         bloom_only_auto_ratio: cfg.common.vix_bloom_only_auto_ratio,
         bloom_only_auto_id_only: cfg.common.vix_bloom_only_auto_id_only,
         bloom_only_min_distinct: cfg.common.vix_bloom_only_min_distinct,
+        // DESIGN-COLD-MISS §3 W1 AUTO additive per-field blooms (decided at
+        // finish with exact counts, every write path)
+        bloom_auto_min_distinct: cfg.common.vix_bloom_auto_min_distinct,
+        bloom_auto_max_ratio: cfg.common.vix_bloom_auto_max_ratio,
+        bloom_auto_max_data_pct: cfg.common.vix_bloom_auto_max_data_pct,
         bloom_fpp: cfg.common.vix_bloom_fpp,
         fts_field_names: fts_fields
             .iter()
@@ -456,6 +461,10 @@ fn core_writer_options_from_config(
         // incomplete input's `_source` rows can hide fields that never
         // became columns, and a decode-merge carries them along.
         columns_complete: true,
+        // DESIGN-COLD-MISS §2 S1/S2 rollout discipline: default off; flip
+        // ZO_VIX_SIDECAR_TAIL_ZSTD only after the release that parses a
+        // compressed puffin footer is on EVERY pod (old readers reject it).
+        sidecar_tail_zstd: cfg.limit.vix_sidecar_tail_zstd,
     }
 }
 
@@ -2475,6 +2484,14 @@ fn rebuild_core_file_sidecar_with_caps_and_cancellation(
         )));
     }
 
+    // DESIGN-COLD-MISS §2 S3: the healed sidecar embeds the footer of the
+    // data object it describes (byte-identical by construction here) so a
+    // sidecar-first open never needs the data tail. One data-tail read; the
+    // heal just streamed the whole object.
+    writer.set_data_footer(vortex_index::read_data_footer_payload(&input.1)?);
+    // W1: the AUTO additive bloom budget is a percentage of the stored
+    // data object (untouched by the heal)
+    writer.set_data_object_bytes(input.1.len());
     let (index, stats) = writer.finish_index_sidecar(row_count)?;
     log::debug!(
         "vix sidecar heal: rebuilt the index of {} over {row_count} rows in {scan_windows} \

@@ -515,16 +515,10 @@ pub async fn check_bloom_filter(
         .collect::<std::collections::HashSet<_>>();
 
     // Decide whether there is real Bloom work before transferring ownership
-    // of the potentially large vector. In particular, ordinary predicates
-    // outside a selective composite scope return without a second O(files)
-    // clone and without recording a Bloom run.
-    if !bloom_pruner::is_applicable(
-        index_condition,
-        &bloom_indexed_fields,
-        &composite_scope,
-        auto_id_scope,
-        &auto_id_never,
-    ) {
+    // of the potentially large vector: a condition without any `=` / `IN` /
+    // same-field `OR` predicate returns without a second O(files) clone and
+    // without recording a Bloom run.
+    if !bloom_pruner::is_applicable(index_condition) {
         return Ok((0, false));
     }
 

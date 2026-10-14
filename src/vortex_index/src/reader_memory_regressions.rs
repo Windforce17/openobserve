@@ -213,6 +213,83 @@ fn advertised_footer_and_directory_refuse_before_body_fetch() {
     assert_eq!(source.body_reads.load(Ordering::Acquire), 0);
 }
 
+/// DESIGN-COLD-MISS §2 S1: footer admission is sized on the DECODED payload.
+/// A zstd footer whose 2 MiB of properties compress to a few hundred bytes
+/// must be refused under a budget that its encoded size alone would pass —
+/// on the ranged path (`TailProbe`) and the in-memory one (`parse_container`)
+/// alike — and admitted, parsing the full property, under a budget sized for
+/// the decoded form.
+#[test]
+fn compressed_footer_admission_is_sized_on_the_decoded_payload() {
+    let pad = "a".repeat(2 * 1024 * 1024);
+    let properties = vec![
+        ("version".to_string(), "3".to_string()),
+        ("pad".to_string(), pad.clone()),
+    ];
+    let compressed = Bytes::from(
+        crate::container::build_container_parts(properties.clone(), Vec::new(), true).unwrap(),
+    );
+    let plain = Bytes::from(
+        crate::container::build_container_parts(properties, Vec::new(), false).unwrap(),
+    );
+    assert!(
+        compressed.len() < 64 * 1024,
+        "the padded footer must compress far below the budget: {} bytes",
+        compressed.len()
+    );
+    assert!(plain.len() > 2 * 1024 * 1024);
+    let decoded = puffin::reader::footer_payload_decoded_size(&compressed).unwrap();
+    assert!(decoded > 2 * 1024 * 1024, "{decoded}");
+
+    let denied = |error: VixError| {
+        assert!(
+            anyhow::Error::new(error)
+                .chain()
+                .any(|cause| cause.is::<OwnershipDenied>())
+        );
+    };
+    // a budget the ENCODED bound (×8 of ~hundreds of bytes + 64 KiB) would
+    // pass, the decoded bound (×8 of 2 MiB) cannot
+    let tight = Budget::new(4 * 1024 * 1024);
+    let source = crate::BytesRangeSource::new("compressed", compressed.clone());
+    let dynamic: Arc<dyn VixRangeSource> = source.clone();
+    denied(
+        with_read_operation(tight.clone(), || {
+            crate::container::parse_container_ranged_with_tail(&dynamic, 64)
+        })
+        .err()
+        .unwrap(),
+    );
+    denied(
+        with_read_operation(tight.clone(), || {
+            crate::container::parse_container(&compressed)
+        })
+        .err()
+        .unwrap(),
+    );
+    // the plain form of the same footer is refused under the same budget:
+    // compression changed the bytes on the wire, not the admission
+    let plain_source = crate::BytesRangeSource::new("plain", plain.clone());
+    let plain_dynamic: Arc<dyn VixRangeSource> = plain_source;
+    denied(
+        with_read_operation(tight, || {
+            crate::container::parse_container_ranged_with_tail(&plain_dynamic, 64)
+        })
+        .err()
+        .unwrap(),
+    );
+
+    let roomy = Budget::new(64 * 1024 * 1024);
+    let container = with_read_operation(roomy.clone(), || {
+        crate::container::parse_container_ranged_with_tail(&dynamic, 64)
+    })
+    .unwrap();
+    assert_eq!(container.properties.get("pad"), Some(&pad));
+    let container =
+        with_read_operation(roomy, || crate::container::parse_container(&compressed)).unwrap();
+    assert_eq!(container.properties.get("pad"), Some(&pad));
+}
+
 #[test]
 fn both_cold_envelopes_remain_admitted_until_reader_publication() {
     let bytes = Bytes::from(
