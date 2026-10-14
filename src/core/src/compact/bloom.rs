@@ -942,6 +942,13 @@ async fn gc_unreferenced_chunks(
             .chain(new_versions.iter().copied())
             .collect();
     let min_age_micros = min_age_secs.max(0).saturating_mul(1_000_000);
+    // orphans stay listed until the delayed deletion job removes them
+    // (ZO_COMPACT_DELETE_FILES_DELAY_HOURS); remember what this process
+    // already queued so every pass in that window does not add the same
+    // tombstone rows again (duplicates are harmless - the delete is
+    // idempotent - but they are noise in file_list_deleted)
+    static QUEUED: std::sync::LazyLock<parking_lot::Mutex<hashlink::LruCache<String, ()>>> =
+        std::sync::LazyLock::new(|| parking_lot::Mutex::new(hashlink::LruCache::new(65_536)));
     let mut tombstones = Vec::new();
     for object in objects {
         // `{bloom_ver}.bf`; the listed key may carry the bucket prefix, so
@@ -959,6 +966,9 @@ async fn gc_unreferenced_chunks(
             continue;
         }
         let path = infra::bloom::path::bloom_path(org_id, stream_type, stream_name, date, version);
+        if QUEUED.lock().insert(path.clone(), ()).is_some() {
+            continue;
+        }
         tombstones.push(FileListDeleted {
             id: 0,
             account: account.clone(),
