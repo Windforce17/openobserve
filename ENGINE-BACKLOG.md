@@ -3,6 +3,300 @@
 Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
 (deleted 2026-07-29; full history in git). Keep THIS file current.
 
+## 2026-10-14 — cold-miss slices (DESIGN-COLD-MISS.md §2–§5) landed and on DEV as `.218`: compressed sidecar tail, sidecar-first open, AUTO per-field blooms, `.bf` v2 + presence pruning, hour-regroup assembler, sidecar repack
+- Scope: every item of DESIGN-COLD-MISS.md as corrected by
+  `.work/coldmiss/DECISIONS.md` (S1–S6, W1–W4, B1–B5, §5), on `vix-arch`
+  atop `71e4cd841`. Nothing is rolled; every knob that changes an on-disk
+  format or a reader contract defaults OFF (rollout order below).
+- **Format (vortex_index + puffin).** Puffin footer flag bit 0 = zstd(3)
+  payload with the content size in the frame header; admission is sized on
+  the DECODED payload (`footer_payload_decoded_size`, regression
+  `compressed_footer_admission_is_sized_on_the_decoded_payload`). `dict`
+  blob `compression_codec=zstd` (only when the index ≤ 4 MiB), decoded
+  whole at open into the `Mem` dict handle (zero later dict IO, `demote`
+  keeps it). New sidecar properties: `layout_gen` (1 plain / 2 zstd; the
+  reader never dispatches on it), `data_footer_v1` (the data object's
+  footer JSON, verbatim), `bloom_sections_v1`
+  (`[name, body_offset, num_blocks, n_items]`), `columns_complete` (also
+  on the sidecar), and the `bf` field flag for every per-field bloom
+  section. A sidecar-first ranged open (`ZO_VIX_SIDECAR_FIRST_OPEN`)
+  synthesizes the data container from `data_footer_v1`: a cold miss is ONE
+  sidecar tail GET, zero data-object reads (test
+  `sidecar_first_open_skips_the_data_tail_when_the_footer_is_embedded`);
+  pre-property sidecars fall back to the data tail. The search layer skips
+  `timestamp_range` on an empty index bitmap.
+- **Writer W1 (AUTO additive blooms).** Decided at finish with EXACT
+  counts on every path (first encode sequential/parallel, k-way merge,
+  spilled rebuild, heal): candidates = complete raw-string term fields
+  (not fts/bloom-only/demoted/excluded/partial, not already explicit);
+  selected iff `distinct ≥ ZO_VIX_BLOOM_AUTO_MIN_DISTINCT` (1024; 0 = off)
+  AND (`distinct/rows ≤ ZO_VIX_BLOOM_AUTO_MAX_RATIO` (0.25) OR ID-like
+  name), admitted smallest-first within `ZO_VIX_BLOOM_AUTO_MAX_DATA_PCT`
+  (2.0 % of the data object). Memory while tracking: 8 B × Σ distinct of
+  the candidates still in the running — a non-ID-like candidate FREES its
+  hashes the moment it crosses the ratio cap (so a free-text field never
+  holds rows × 8 B), unspilled first encodes pre-filter on the exact
+  `field_len`. The bloom blob is built AFTER the docs encoder joins (the
+  budget needs the final docs size; the hashing still overlaps the
+  encode). Crate default is off so every byte-identity pin holds;
+  `core_writer_options_from_config` wires the prod knobs.
+- **`.bf` v2 (infra::bloom).** Tail magic `O2B2` (a v1 reader's first
+  check fails deterministically → keep-all), zstd footer with a group file
+  table, a column table (union of the members' columns), per-file flags
+  (bit 0 = presence AUTHORITATIVE = the data object's `columns_complete`)
+  and presence bitmaps; bodies unchanged. `BLOOM_FOOTER_CACHE` now holds
+  PARSED readers (LRU by decoded size); the pruner's probe is 64 KiB.
+  Pruner B2: `file_has_column == Some(false)` → the file is dropped before
+  any block read (counters split `dropped` into bloom/absent, group and
+  per-file stages); `Some(true)` without a section = kept; unlicensed
+  files = no info. Stage 1b (`FileBloomProbe`) opens blob-less sidecars
+  too and drops on a licensed absent field. B3: every `=`/positive
+  `IN`/same-field `OR` is admitted on ANY field; `composite_scope`/AUTO-ID
+  govern only the composite fallback (5 admission tests inverted).
+- **Assembler B4 (`compact/bloom.rs`).** Whole-hour build: triggers
+  FirstBuild (no stamped file) / `pending ≥ 16` / `pending/total ≥ 0.25`
+  / oldest pending ≥ 24 h, else the hour is held (stage 1b serves it).
+  Per-file load is sidecar-only (tail + blob, 2 GETs, no data read) when
+  every per-field section is `bf`-flagged and nothing in scope needs a
+  dictionary supplement; otherwise the old reader path. Chunks of
+  `ZO_COMPACT_BLOOM_CHUNK_FILES` (256) sorted by section bytes, every
+  field section FOLDED to the chunk's smallest block count (`Sbbf::fold`)
+  — no signature grouping. More than `ZO_COMPACT_BLOOM_MAX_CHUNKS` (8)
+  versions in an hour → the small chunks (≤ 64 members, and every v1) are
+  read back (1 GET each, de-transposed), folded into the build and
+  CAS-restamped (`update_bloom_ver_from`); superseded objects and
+  unreferenced ones older than `ZO_COMPACT_BLOOM_GC_MIN_AGE_SECS` (3600)
+  go through the deferred `FileListDeleted` batch, never inline.
+- **§5 repack (`vortex_index::repack_sidecar`).** Copies every index blob
+  verbatim, re-emits the container with the new stamps, zstd dict/footer
+  and the AUTO sections from ONE dictionary walk (same selection rule),
+  published as a new index generation through the heal's publication path
+  (`publish_sidecar_generation`, factored out of `sidecar_only_heal`).
+  Scheduled from the `.bf` hour pass for loaded files with
+  `layout_gen < target`, `ZO_COMPACT_SIDECAR_REPACK_BUDGET` per pass
+  (default 0 = off). Real prod `default` pair (424,089 rows, sidecar
+  40.24 MB): **150 ms**, 51 AUTO sections added, sidecar +59 KB (the
+  footer went 410,647 → 48,919 B), idempotent on its own output.
+- **Meta-DB (gate `openobserve-meta-db-release-gate`): no new tables,
+  indexes or FKs.** Exact statements, all one `(stream, date)` partition:
+  - `SELECT id, account, stream, date, file, records, index_size,
+    index_generation, compressed_size, bloom_ver, updated_at FROM
+    file_list WHERE stream = $1 AND date = $2 AND index_size > 0;`
+    (`query_for_bloom`, now the WHOLE hour instead of `bloom_ver = 0`
+    rows; same `(stream, date)` index, a few hundred rows).
+  - `UPDATE file_list SET bloom_ver = $to WHERE stream = $s AND date = $d
+    AND bloom_ver = $from AND ((id = ? AND index_generation = ? AND
+    index_size = ?) OR …);` in 500-row chunks (`update_bloom_ver_from`,
+    the consolidation CAS; sqlite 300-row chunks).
+  - `query_bloom_pending_buckets` is UNCHANGED (`… bloom_ver = 0 AND date
+    < $1 GROUP BY stream, date ORDER BY date DESC LIMIT $2`); the regroup
+    triggers are computed in Rust from the hour's rows, no new aggregate.
+  - `bloom_ver_referenced` (existing, previously uncalled) now runs once
+    per superseded version after a consolidation; one additional
+    `query_for_bloom` per built hour feeds the GC's referenced set.
+- **Verification (local, 18-core arm64, release).**
+  - `cold_miss_probe` on the prod `default` pair, needle absent, tail
+    786 KiB: baseline (old layout) 5–6 rt / 1,668–1,724 KiB; after
+    `repack_pair` + sidecar-first: **3–4 rt, open 1 rt (zero data reads)**,
+    stage 1b 2 rt (tail + ONE 32 B block, verdict `Some([false])` = drop,
+    or `has_field = Some(false)` on an absent field); with the code-default
+    256 KiB tail the whole thing is **512–568 KiB** (open+eval 2 rt /
+    256–312 KiB; the terms footer window is the only overshoot).
+  - `full_path_sidecar_bench` A on the same pair, interleaved with the
+    `71e4cd841` control: finish 128–161 ms (control 131–156), total
+    1.76–2.00 s (control 1.83–2.39), sidecar 41,204,417 B with 51 AUTO
+    sections + the embedded data footer + zstd tail vs 41,145,368 control
+    (+0.14 %); AUTO off + plain tail is byte-count-identical to control
+    plus the two new properties (+103 B).
+  - `merge_bench merge` on the 8×2M corpus (`/tmp/vixbench-cm`, M10
+    harness), control `71e4cd841` vs new (config defaults: AUTO on, plain
+    tail), interleaved: wall 7.83 / 8.73 / 7.61 s (control) vs 7.46 / 7.92
+    / 8.54 s — medians 7.83 vs 7.92 (+1.1 %, gate ≤ +3 %); peak footprint
+    6.50 vs 6.54 GB (1.006×, gate ≤ 1.05×); `compare` equivalent
+    (16,000,000 rows, 6,286,992 terms, term_digest 909d01435723f289,
+    docs_digest 5ba11fbf779da81a); the new sidecar is byte-identical
+    across runs, 402,892,497 → 407,130,482 B (+1.05 %: 2 AUTO sections +
+    composite + the data footer).
+  - Suites: vortex_index lib 381 passed / 22 ignored (6 new: compressed
+    tail round trip, sidecar-first IO, bloom-section table, AUTO on every
+    write path, accumulator rule + fold, repack), puffin 35, infra bloom +
+    file_list 85, search `bloom_pruner` 32 (incl. the v2 presence
+    end-to-end), core `compact::bloom` 21 (trigger + fold pins), core
+    heal/classify/bloom suites green with the embedded footer.
+    Pre-existing warnings only. Diagnostics added:
+    `tests/cold_miss_probe.rs` (`cold_miss_probe`, `repack_pair`;
+    `VIX_INDEX`, `VIX_SIDECAR_FIRST=1`).
+- **Rollout order (readers before writers of each format).** 1) every
+  role on the new image with all format knobs off (readers understand
+  zstd footers, v2 `.bf`, `bf` flags, presence); 2) queriers:
+  `ZO_VIX_SIDECAR_FIRST_OPEN=true` (needs `data_footer_v1` on the sidecar
+  — new/healed/repacked files only; old files fall back to the data tail
+  as a SECOND, serial round trip — the per-hour layout memory below keeps
+  that to one file per hour per pod); 3) compactors/ingesters:
+  `ZO_VIX_SIDECAR_TAIL_ZSTD=true` (an OLD reader REJECTS such a sidecar at
+  open: `search::vix` logs `error filtering via index. Keep file to
+  search`, counts an `error` fallback and scans the file with the filter
+  re-applied — correct but slow and noisy, so step 1 must be complete
+  fleet-wide); 4) `ZO_COMPACT_SIDECAR_REPACK_BUDGET`
+  > 0 — repacks the PENDING files of the hours the bloom builder visits
+  (each repack = one whole-sidecar download + upload, ~2× the sidecar
+  resident on the compactor while it runs, serial; the repacked file
+  re-pends and joins the hour's next build). It does NOT sweep settled,
+  fully stamped hours — those keep their layout until retention turns the
+  window over (30 d prod); every merge/heal output since this release
+  already carries the data footer, zstd after step 3; 5) retune
+  `ZO_VIX_EAGER_TAIL_BYTES` 768 KiB → 256 KiB once the historical window
+  is mostly `layout_gen=2` (prod: ~a retention period after step 3). AUTO
+  blooms (`ZO_VIX_BLOOM_AUTO_MIN_DISTINCT=1024`) and `.bf` v2 are on by
+  default — both are readable by step 1 and fail open on older readers.
+- **Self-review (5 slices, 2026-10-14) — what it found and what changed.**
+  No false-drop path in the pruner (every `Some(false)` traced to a
+  licensed, in-table file; predicate shapes limited to `=` / positive `IN`
+  / same-field `OR`); `data_footer_v1` is stamped from the data object
+  written or read in the same call on every path, and the generation CAS
+  cannot publish a sidecar against another data version; every new meta-DB
+  statement is `(stream, date)`-fenced and chunk-batched (nothing per row,
+  no new table/index — not the `.176` shape). Fixed:
+  1. **B3 structural admission would have been a transition regression.**
+     Admitting every `=` predicate meant `service_name = 'x'`-class queries
+     (never in the pruner before) would probe the `.bf` layer — on today's
+     one-group-per-file set that is ~9,000 footer GETs per follower for 7
+     days of `default` (the §1 "9 s of bloom"), repeated on every cold
+     cache, for fields that have no section there. Now a query admitted
+     ONLY structurally runs its `.bf` stage when the set is small (≤ 64
+     groups) or chunked (≥ `ZO_BLOOM_STRUCTURAL_MIN_GROUP_FILES` = 32
+     files per group on average); otherwise its stamped files are kept
+     unprobed (per-file probes of unstamped files still run). Predicates
+     the old rule admitted (stream bloom fields, composite coverage) are
+     unchanged. Pinned by `structural_only_predicates_skip_a_fragmented_bf_set`.
+  2. **Sidecar-first on old hours cost +1 SERIAL round trip per file**
+     (today's paired open reads both tails in one). `search::vix::
+     layout_memory` remembers per `(stream, hour)` whether the last opened
+     sidecar lacked the embedded footer and opens those hours the paired
+     way; one file per hour per pod pays the serial trip, and an hour is
+     forgotten as soon as a file of it carries the footer. A malformed
+     embedded footer now also falls back to the data tail (was: fail the
+     open → scan fallback).
+  3. **Consolidation memory on fragmented hours**: every v1 chunk counts
+     as small, so the first visit of a pre-B4 hour would read the WHOLE
+     hour back (a 3,000-file traces hour ≈ 6 GB of sections resident).
+     Bounded to one chunk's worth of members (`ZO_COMPACT_BLOOM_CHUNK_FILES`)
+     per pass, oldest versions first; the rest folds on the next visit.
+  4. `infra::storage::list` panicked (`.expect`) on any listing error —
+     inside the bloom job that would have killed the builder task for good
+     (no builds, GC or repacks until restart). It returns the error now.
+  5. A deterministic repack failure (`UnbuildableFile`-classed `VixError`)
+     refunds its budget slot like the dictionary backfill does.
+  6. Explicit `bloom_filter_fields` sections now exclude fts and
+     non-string fields on both write paths (pre-existing: a section hashed
+     from tokens / canonical-tagged bytes can never match the pruner's raw
+     literal → wrong drop; reachable via
+     `ZO_FEATURE_BLOOM_FILTER_EXTRA_FIELDS`).
+  7. `bloom_sections_v1` entries are bounded against the blob length (the
+     doc promised it; a corrupt table would have panicked in `check_blocks`
+     on an in-memory sidecar).
+  8. Hygiene: the per-file AUTO selection log is `debug`; dead admission
+     parameters removed from `is_applicable`; clippy items in new code.
+  Known, left as is: the `.bf` GC only runs in hours with pending files, so
+  a settled hour that leaks an orphan chunk (crash between CAS and
+  tombstone, merge retiring a chunk's last member) keeps it — storage only,
+  same class as the pre-existing orphan discard; `select_auto`'s
+  "candidates were selected" guard is a `debug_assert`; AUTO's byte budget
+  is a percentage of the docs blob rather than the whole data object.
+- **DEV rollout (2026-10-14 14:50–16:05Z) — `.217` then `.218`, all four
+  roles, knobs on; two bugs found and fixed in the first hour.**
+  - Images: `.217` = release/vix-20261014-217 `445161a33` (= prod `.216`
+    + vix-arch `46b1e25ad`), OCI index `cf252a2a…`, arm64 `3af3556f…`,
+    binary `764be0a8…`; `.218` = `51afff349` (+ the two compactor fixes
+    below), index `05a49221…`, arm64 `a169dc1b…`, binary `61c26b53…`. Both
+    published to prod ECR (canonical) and mirrored into DEV ECR, digests
+    identical. DEV GitOps #331 (`.197` → `.217`, knobs off, merge
+    `88133c4c`), #332 (knobs on: `ZO_VIX_SIDECAR_TAIL_ZSTD=true`,
+    `ZO_VIX_SIDECAR_FIRST_OPEN=true`, `ZO_COMPACT_SIDECAR_REPACK_BUDGET=128`,
+    env-rev bump on querier + compactor, merge `44170553`), #333 (`.218`,
+    merge `55612b88`). Argo Synced/Healthy at each revision, 3/3/1/1 Ready,
+    old ingesters drained normally (600 s), 0 restarts anywhere. No
+    meta-DB DDL between `.197` and `.217`; the ENV audit found no inert pin
+    and nothing required. Build note: the Mac's `docker-buildx` link pointed
+    at a removed OrbStack binary (legacy builder cannot parse
+    `--platform=$TARGETPLATFORM`) — `brew install docker-buildx` + relink;
+    and the disk was full (222 GB dev `target/`, 24 GB merge-bench outputs,
+    41 GB of shipped release targets — the latter two removed).
+  - **Parity on the fixed battery** (`/tmp/obsbattery.sh` on ops-dev, dev
+    `default`, sealed window at the top of the hour, cold then warm; `.197`
+    baseline recorded as `pre197`): identical totals, `scan_size` and
+    `is_partial=false` everywhere; indexed `count(*) WHERE service_name =
+    'manus-node-workers'` over 7 d = 251,030,013 = the scan oracle
+    (`lower(service_name) = …`, 8.1 s vs 0.48 s warm). Cold needle miss 7 d
+    (`jobid = absent`): 1.40 s (`.197`) / 1.11 s (`.217`) / 1.16 s (`.218`,
+    knobs on); warm 0.29 s throughout. `svc_count_7d` cold 9.8 → 7.5 → 7.0 s
+    (reads 2,146 / 285 MB → 1,933 / 272 MB on the same shape; window
+    moved one hour between runs — not a controlled A/B).
+  - **Read chain on `layout_gen=2` files** (dev `ZO_VIX_EAGER_TAIL_BYTES` is
+    already 256 KiB): a cold indexed count on a repacked single-file hour
+    (`tidb_slow_log 2026/10/14/12`) = **3 reads / 256 KB: tail, dictionary
+    block, plist — no data-object GET**; the un-repacked `.217`-written
+    neighbour (hour 11, plain tail but with `data_footer_v1`) costs the
+    same on this narrow stream. The wide dev `default` (2,080 fields,
+    508k rows/file) is where the zstd tail matters: a `.217` plain-tail
+    sidecar has a 418 KB footer (`dict_field_pages_v1` 188 KB, `fields`
+    112 KB, `data_footer_v1` 66 KB) → open 2 rt / 418 KB + eval 2 rt /
+    480 KB (dictionary directory past the tail) = 7 rt / 1.28 MB per miss;
+    repacked (footer 40 KB) → probe 2 rt decides, open 1 rt / 256 KiB,
+    eval 1 rt / 4.4 KB = **4 rt / 0.5 MB**, prod stops after the 2-rt probe.
+    Pruning on the rebuilt v2 chunks: `apisix 2026/10/14/12` needle misses
+    on `route_id` / `client_ip` → "bloom filter reduced file_list from 1
+    to 0", zero index reads. Mixed-version window harmless (verified: new
+    `.bf` v2 chunks + `bf`-flagged sidecars coexisted with the draining
+    `.197` ingesters; no warnings).
+  - **AUTO blooms on real data**: a `.217`-merged dev `default` sidecar
+    carries 24 AUTO sections (`jobid` 86k distinct, `id` 72k, `eventid`,
+    `k8s.pod.name/uid`, `label.gpt_x_request_id`, `label.session_uid`,
+    `request_id`, `uuid`, `trace_id`, … and also `request.time` /
+    `response.time` / `latency_str` / `ts` / `url` / `log.file.path`);
+    traces/default repacks add `db.statement` (121k distinct), `events`,
+    `http.url`, `http.client_ip`, `job_id`, … Sidecar growth +0.7–2 %
+    (traces 194.1 → 195.6 MB; `default` 52.9 → 53.6 MB). Follow-up worth
+    its own look: long-text fields (`db.statement`, `events`, `job_data`)
+    pass the ratio rule because statements repeat — nobody probes them by
+    equality; an average-value-length cap (or excluding fts-adjacent
+    fields) would save their ~0.2 MB/file.
+  - **Bug 1 (fixed in `.218`): the repack range-walked the sidecar.**
+    `repack_sidecar` copies every blob and walks the dictionary, i.e. it
+    reads the sidecar end to end — over the compactor's ranged source that
+    became ~1,200 serial GETs: **101.6 s for a 250 MB sidecar, 62 s for
+    226 MB, 12 s for 92 MB** (2.5–3.6 MB/s) vs 113 ms for the same repack
+    from memory. `repack_and_publish` now downloads the sidecar whole (one
+    GET, `BytesRangeSource`): **5.1–6.5 s for 190–246 MB, ~1.5 s for the
+    50 MB `default` sidecars** (download + repack + upload + publish). The
+    first `.218` pass repacked 19 sidecars in a 26-bucket pass of 89 s;
+    compactor RSS 1.7 GiB after it (48 GiB limit; `.217` merges peaked at
+    7.9 GiB).
+  - **Bug 2 (fixed in `.218`): the orphan-chunk GC re-queued the same
+    tombstones every pass** (`default/2026/10/13/16`: "10 orphaned chunks
+    queued" in pass 1 AND pass 2 — the objects stay listed until the
+    delayed deletion (2 h) removes them; the delete is idempotent so the
+    duplicates were noise, not damage). A process-local LRU of queued
+    paths now bounds it to one row per orphan. The 10 orphans themselves
+    are what the old assembler left behind (chunks whose members were all
+    re-pended) — the new GC's first real catch.
+  - Correction to the plan: **the repack converges only PENDING files**
+    (the bloom builder visits hours with `bloom_ver = 0` rows and repacks
+    the pending ones; a repacked file re-pends and joins the hour's next
+    build — pass 2 built `aws_vpc_flow_logs/…/12` from its two freshly
+    repacked files, `0 dictionary fallbacks`). Settled, fully stamped
+    hours are never visited, so historical prod `default` hours keep the
+    old layout until retention turns the window over; `layout_memory`
+    makes them cost what they cost today. A stamped-row sweep (1 tail GET
+    per file to read `layout_gen`, then the repack) is possible if the
+    30-day wait is not acceptable — not built.
+  - Dev stays on `.218` with the knobs on. Prod proposal: `.218` queriers
+    first (format knobs off = step 1), then compactors, then the knob PRs
+    in the order above; `ZO_BLOOM_STRUCTURAL_MIN_GROUP_FILES` default 32
+    (prod `ZO_VIX_BLOOM_COMPOSITE=false` makes the structural gate real
+    there; on dev composite is on, so every field was legacy-admitted and
+    the gate never fired — untested in prod conditions).
+
 ## 2026-09-30 — `.180` compactor: one merge target, files above half of it final, settled-based sealing; the per-class targets and the index-defer knob are gone
 - Implements the 05:00–08:00Z owner proposal ("one config, merge once")
   below. vix-arch `b5046389b`, image `v0.93.0-vix-20260930.180`
@@ -2832,6 +3126,208 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
       sidecar but need the field configured and new/healed sidecars.
       Buying IOPS (gp3 → 8–16k) is the config-only alternative for the
       same bottleneck.
+- **2026-10-13 — owner on the `.215` list: "1 (write-behind) worth doing;
+  2: does it change the file format, isn't it lazy already; measure 3,
+  what is the eager tail; 4 ok; 5 does `domain` have postings; 6 raise
+  IOPS and see".**
+  - **Volumes `gp3-1024` → `gp3-1024-16k`** (GitOps #632 merged 03:58:17Z:
+    new class iops 16000 / throughput 1024 / ext4 / `allowVolumeExpansion`
+    in `obs/kustomize/storageclass.yaml` — the old class was hand-applied
+    and is not in GitOps; project `ops` whitelists cluster resources).
+    Querier volumes are pod-scoped, so the roll applied it: RS
+    `57cc9747c4` 10/10 by 04:00:06Z, PVs confirmed on the new class;
+    compactor stays on gp3-1024. Cost +(16000−4096) × $0.005 ≈ $60 per
+    volume per month. The bastion role has no `ec2:*` and the local SSO was
+    expired, so live `modify-volume` was not an option; a roll was anyway
+    the cleaner A/B (fresh pods vs the `.215` fresh-pod baseline). Pod
+    `sqbjj` logged `[WARMUP] this node is not in the querier ring yet;
+    skipping` at 03:59:09Z — a start-up race, it served normally, just no
+    warm-up.
+  - **Same `.215` code on 16k volumes, fresh pods, cold 7-day window**
+    (`01a1337549497c40950c2d54c2c0b3e4` 04:11:25Z, same 251,957
+    `scan_files` as yesterday; per follower 8,978–10,182 files — the
+    compactor merged some since): **15.1 s** (`idx_took` 13.1) vs 20.3 s
+    (18.2). Per follower took 9.3–13.1 s, 2.94 reads/file, **113–126 ms per
+    read (`.215`: 165–185)**, 279–320 in flight (slot ceiling unchanged),
+    `evaluation_wait` ≈ 0 except one straggler (19.8 s), 750–970 files/s
+    (`.215`: 582–690). 21-day-shifted window 4.7 s (5.3), 66 hits (72:
+    the Sep 13 hours are aging out at the retention edge [INFERENCE]).
+    Result-cache repeat 1.4 s (1.6).
+  - **Hardware envelope** (1 s, 3 nodes) on a cold 14-day-shifted window
+    (Sep 28 → Oct 5, 77,043 `scan_files`, 30 hits so the pruner can never
+    stop, 15.8 s, `01a133783b4c78c390ffa65daa5f389e` 04:14:38Z): write
+    IOPS avg 3,786–4,148, **max 7,216–7,966 — served, the old cap was
+    4,096**; write 718–791 MB/s avg (1.40–1.48 GB/s 1 s peaks); util 59–67
+    % (`.215` 86–90), queue 11–13 (25), **PSI io avg 2–3 % (46–51), max
+    3–5 % (86–101)**; NIC 782–931 MB/s; host CPU 7–11 % (one node 29–34 %
+    from other tenants), container 0.5–4.6 cores. Background before the
+    query 827–1,036 write IOPS (downloader at +15 min after the roll; the
+    `.215` sample had 1,950–2,000 at +4 min — not identical). Per follower
+    on that window 8.0–8.8k merged files, 3.04 reads/file, 127–139 ms per
+    read, 278–322 in flight.
+  - Reading: on `.215` the read path's own `pwrite` of the fills sat in
+    EBS throttling; IOPS headroom alone took ~55 ms off every read and
+    PSI collapsed. The fleet is slot-bound again (in flight ≈ 1.2 × 256),
+    so slots 256 → 512 is next after `.216`.
+  - **Eager tail probe** (`eager_tail_probe` on 9 `default` sidecar tails
+    from 10/08 10Z: 10 MB, five 19–25 MB `l0_h2_*`, three 42 MB merged):
+    footer JSON 240–444 KB (1,504–2,684 fields) + dict page index 123–285
+    KB = 500–712 KB; `need_tail` incl. the 256 KiB terms footer window
+    626–974 KB, 7/9 > 768 KiB. A single-field probe must read the whole
+    footer and the whole dict index, so 768 KiB is right-sized for
+    `default` — the `.215` "O(KB) of the 768 KiB" claim was wrong; the
+    overshoot is only the terms footer window, which a miss never reads
+    (2.85–3.04 reads/file = data tail + sidecar tail + ~0.85–1 dict
+    block). Fewer bytes per cold file from here is a format change
+    (binary footer properties + per-field dict index), not a knob.
+  - **Data tail on the miss path** (scout, verified): `open_ranged_with_
+    index_tail` (reader.rs:958–990) → `parse_container_pair_ranged` →
+    `block_fetch_pair` (source.rs:528–545) fetch the 128 KiB data tail and
+    the 768 KiB sidecar tail in ONE round trip; `from_containers` parses
+    every data-footer property eagerly (reader.rs:1001–1050), only docs
+    schema / stats / dict are lazy. The SimpleSelect miss decision uses
+    exactly one data-footer property, `oversize_skips` (mod.rs:2222–2231),
+    stamped on the DATA object only (writer.rs:3516–3524); the sidecar
+    already carries row_count / fields / partial_fields (writer.rs:3956–
+    4001). Dropping the data tail on a miss = reader-only lazy data footer
+    + an optional sidecar `oversize_skips` property (old sidecars fall
+    back to a lazy data read: no regression, no gain): −1 parallel GET,
+    −128 KiB, −1 fill per file, not a round trip. Policy alternative
+    without the stamp: `max_raw_term_len` = 65532 (code default = prod)
+    and skipped values are strictly longer, so a short literal can never
+    be a skipped value — but the threshold is not stamped per file and a
+    test pins "short literal must refuse"; a policy change, not free.
+  - **`domain` has postings**: every string/number/bool column is a term
+    field (dictionary + postings) unless fts / bloom-only / excluded
+    (writer.rs:1219–1235, 4133–4176). `VixReader::eval` never reads the
+    bloom blob; blooms act only in `bloom_pruner` before vix search and
+    `domain` is not in `default`'s bloom fields (composite pinned false,
+    not ID-like) → not bloom-decidable today; configuring it is a stream
+    settings call and applies to new/healed files.
+  - **`.216` = `.215` + vix-arch `71e4cd841` write-behind fills**
+    (`read_through_many` assembles ranges from fetched runs + present
+    blocks — zero-copy slice / one pread / one stitched allocation for
+    straddles — and returns; fills go to a byte-bounded queue
+    (`ZO_DISK_CACHE_BLOCK_FILL_QUEUE_SIZE`, MB, default 256) drained by 4
+    blocking writers that pwrite → `mark_present` → account → evict; over
+    budget a fill is dropped and counted: `query_disk_block_cache_fills_
+    total{outcome=written|dropped|failed|skipped}`, `_fill_bytes_total`,
+    `_fill_queue_bytes`). Release `release/vix-20261013-216` `7a613738a`,
+    arm64 image id `sha256:be72d58bdcf6…`, binary `69708cd94244…`; infra
+    block tests 23/23, config 1/1 in the release checkout.
+  - **`.216` rolled 05:16Z, every querier OOMKilled 05:23Z, rolled back to
+    `.215` 05:47Z (GitOps #634).** Pods started 05:16:19–05:17:51Z; all 10
+    exited 137 between 05:23:11Z and 05:23:32Z (`ck8dh`/`mwbhk` twice),
+    `j4jtx` working set 14.0 → 24.0 GiB inside one 30 s sample. The window
+    held one 10-follower query `01a133b5…` (05:21:19Z; per follower
+    16.7–17.7 GB logical, 127–135k ranges, 23.9–25.3 GB remote physical,
+    block tier ≈0 on the cold pods) followed by `01a133b7…` (25k files of
+    `default/logs/default`, 27.6–29.3 GB logical per follower). `.215`
+    pods (fresh, caches as cold) under the same traffic class — a 16.7 GB
+    vix io query 05:52Z, DataFusion peaks 12.9 GB 05:56Z — 0 restarts
+    through 06:04Z, working set max 20.5 GiB (`vl4fn` 05:55:30Z), three
+    pods 17.5, the rest 14–16: 10/10 vs 0/10 implicates `.216`, mechanism
+    not identified. Ruled out by code: the queue bound (MB → bytes
+    conversion tested, `push`/`finish` on all three outcomes, dropped
+    jobs release the fetch permit at once), the fetch gates (search and
+    scan 256 MiB each, memory/16 cap), allocator retention (purge thread
+    `ZO_ALLOCATOR_PURGE_INTERVAL_SECS` defaults to 1 s in both releases).
+    By construction `.216` adds ≤ 256 MiB over `.215`; what it removes is
+    the EBS write-through throttle that paced every cold fetch, and
+    dropped fills turn re-reads into further 2 MiB run-pinning fetches
+    (`Plan::Ready` is a zero-copy slice of the run) instead of exact
+    preads. Evidence gap: `zo_*` gauges are not scraped by the cluster
+    Prometheus, so the dead pods' `fill_queue_bytes`/`fills_total
+    {dropped}` are gone; restarted `.216` pods ran 12.8–13.2 GiB RSS at
+    05:35Z vs `.215` 9.4–9.5 GiB at 05:59Z (different cache states).
+    **Budget is over-committed:** DataFusion pool 12 + reader cache 6 +
+    memory cache 2 + result cache 0.5 + eval gate 4 = 24.5 GiB of pools on
+    a 24 GiB limit, and each `m8g.4xlarge` (61.6 GiB allocatable) hosts
+    one querier (18 req / 24 lim) plus one compactor (24 req / 60 lim) —
+    limits 146 % of the node, so the limit cannot simply be raised. Next
+    attempt needs headroom first and a single-pod canary with a 5 s
+    `/metrics` capture, not a fleet roll.
+  - **Owner call 06:3xZ: cut memory cache + reader cache only (−3 GiB),
+    keep the 12 GiB DataFusion pool, no canary — roll `.216` fleet-wide
+    again.** The arithmetic was stated (pools 21.5 GiB + ~2.5 dirty + 0.8
+    slab + ~1 runtime ≈ 25.8 GiB worst case, still over) and the owner
+    chose the fast path. Rolled as GitOps #635 (merged 06:40:10Z):
+    `ZO_VIX_READER_CACHE_MAX_SIZE` 6144 → 5120, `ZO_MEMORY_CACHE_ENABLED`
+    true → false (`memory_cache.enabled=false` routes downloads/sets to
+    the disk cache, `file_data/mod.rs:282-286`/`824-828`; `max_size == 0`
+    would mean *auto-size*, not off), image → `.216`. Owner question on
+    the way: "does query memory not get released — a DataFusion bug,
+    should we upgrade?" Answer recorded: it is released (`.215` RSS back
+    to 9.9 GiB after 12.9 GB peaks = the 12 GiB cap); the OOM is pool caps
+    *coinciding*, not accumulating; the fork's `datafusion 54.0.0`
+    (`openobserve/datafusion@869ec1a`) enforced its cap exactly, and the
+    pool only governs registered reservations (Vortex decode buffers
+    before hand-off and fetch buffers sit outside it) in every version.
+    Pre-roll safety net: `/tmp/q216_capture.sh` on ops appends a 5 s
+    per-pod line (`rss eval rcache fq fills_w fills_d fillGB_w fillGB_d
+    hit miss`) to `/tmp/q216_metrics.log`; rollback = image only, keep
+    both env changes. All 10 `.216` pods ready 06:41:51Z, 0 restarts.
+  - **First 30 min on `.216` + headroom (06:42–07:12Z): 0 restarts, anon
+    RSS max 11.6 GiB (`754sg`, 06:58Z) vs 23.5 at the kill; reader cache
+    pinned at its new 5.00 GiB cap within 2 min of start; 957 k fills /
+    368 GB written fleet-wide (315 GB in the first 4 min = ~130 MB/s per
+    pod), `fills_total{dropped}` = 0, queue never above ~1 MB — the
+    gp3-1024-16k volumes absorb the write-behind at that rate.** Caveat:
+    no search with ≥10k ranges ran in the window (newest 1000 searches
+    max 0.4 GB logical), so the class that killed the first roll (cold
+    17 GB/follower, 130k ranges) is untested on this configuration; for
+    scale, `.215` survived an 83.8 GB-logical / 20.5 GB-remote search at
+    05:55Z with a 20.5 GiB working set (`vl4fn`). A 3 h watcher
+    (`/tmp/q216_watch.sh` on the Mac, 5-min lines: restarts, max RSS,
+    eval, queue, drops, ≥10k-range searches) exits on the first restart;
+    the 5 s capture on ops keeps running. If it OOMs again under that
+    class, the remaining lever is the DataFusion pool (12 → 10 GiB), which
+    the owner kept.
+  - **Owner 07:4xZ: "queries feel slower". Checked 06:45–08:35Z against
+    `.215` today (04:10–05:10Z) and yesterday's same hour.** Index phase
+    is not slower — `.216` cold VIX fetches run 4,007/s per follower
+    p50 vs 2,503 (`.215` on 16k volumes) / 2,554 (yesterday), warm
+    306 µs/file p50 vs 673 / 2,874. What is slower is the **data phase
+    for anything older than ~2 h**: the querier data volume is a generic
+    ephemeral PVC, so each of today's four pod replacements (03:58
+    volume class, 05:16 `.216`, 05:47 rollback, 06:40 re-roll) wiped
+    the 1.5 TiB whole-file disk cache. User queries 08:03–08:35Z saw
+    24 % of data files cached (yesterday 83 %); 24 h aggregations over
+    `default` (13.3k files, 15–18 % cached) spent 10–16 s in the scan
+    phase, leader took 11–17 s; user p50/p90/p99 1.5 s / 6.3 s / 17 s.
+    Small recent-window queries recovered to ~90 % cached by 07:45Z.
+    The heavy tail warms at the file downloader's pace: `cpu/2` = 8
+    workers and a 1 GiB active-byte budget per pod (`ZO_FILE_DOWNLOAD_
+    THREAD_NUM`, `ZO_CACHE_LATEST_FILES_DOWNLOAD_MAX_BYTES`), count cap
+    20k keys / 10k channel (compile-time); admission logs show
+    deduplicated 26k (08:1x) → rejected Full 10,045 files / 1.5 TB
+    (08:3x); one pod at 08:4xZ: 4,604 queued, 962 GB refilled in 2 h
+    (~130 MB/s). Memory cache off costs the 21 % memory hits `.215`
+    had on data files; p50 is unchanged vs yesterday (575 vs 736 ms).
+    Note: my own `k8s_prod_ops_logs` sampling was 394 of 562 leader
+    searches in 08:03–08:35Z (1–2 files, 1–2 s each) — small load, but
+    not zero; stopped. **Open:** rollouts should not cold-start the
+    cache — persistent PVCs (StatefulSet / retained claims) or a faster
+    warm path; and the downloader cap makes >20k-file cohorts unwarmable
+    until the queue drains.
+  - **3 h watch complete (07:13–10:12Z): 0 restarts; anon RSS max
+    15.5 GiB (`lq6cp`, 10:12Z) under the heavy class** — 08:45Z saw 80
+    ≥10k-range searches / 24.9 GB logical / 15.6 GB remote in 5 min, the
+    cold shape that OOMKilled the first roll; eval gate peak 1.99 GiB of
+    4. **New: the write-behind queue saturates in those bursts.** Fill
+    queue max hit 0.25 GB (= `ZO_DISK_CACHE_BLOCK_FILL_QUEUE_SIZE`
+    256 MB) at 08:14/08:45/09:06–09:21/10:07Z and
+    `fills_total{dropped}` went 0 → 166 → 33,674 → 140,816 → 141,311.
+    Fleet since 06:40Z: 11.18 M fills / 3,264 GB written, 141 k /
+    345 GB dropped — 1.25 % by count but **9.6 % by bytes** (dropped
+    fills average 2.4 MB vs 292 KB written: the burst's large remote
+    fetches are what gets dropped, and drops are never retried, so those
+    blocks stay remote). Block-cache hit rate 79 % (`wx9k8` 3.90 M hits /
+    1.05 M misses). Lever for the **next roll only** (any env change =
+    pod replacement = cache wipe): raise the fill queue to 1 GiB
+    (peak anon cost ≤ 1 GiB against the 8.5 GiB observed headroom) and/or
+    writers 4 → 8; the 16k volumes have throughput room (write-behind
+    ~130 MB/s sustained + whole-file downloader ~130 MB/s vs 1,000 MB/s).
 
 ## 2026-09-29 — P2 shipped as `.176` and rolled back within 30 min: the per-stream side table stalled the shared meta DB (commit latency 40–60×, ingest 503s); ranges must live in the segment row
 - What shipped (vix-arch `013c45010` + NATS retry `76fe754b5`, image
