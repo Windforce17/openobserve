@@ -1044,13 +1044,22 @@ async fn repack_and_publish(
         account: file.account.clone(),
         location: object_store::path::Path::from(file.key.as_str()),
         size: file.meta.compressed_size as u64,
-        handle: handle.clone(),
+        handle,
         cancel: None,
     });
-    let Some(index) = sidecar_source(file, handle) else {
+    // The repack copies every blob and walks the whole dictionary, i.e. it
+    // reads the sidecar end to end: one whole-object GET (dev 2026-10-14: a
+    // ranged walk cost ~1,200 serial GETs = 100 s for a 250 MB sidecar)
+    let Some(sidecar_key) = config::vix_sidecar_key(&file.key, file.meta.index_generation)
+        .filter(|_| file.meta.index_size > 0)
+    else {
         return Ok(false);
     };
     let started = std::time::Instant::now();
+    let sidecar = infra::storage::get_bytes(&file.account, &sidecar_key)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}: download sidecar for repack: {e}", file.key))?;
+    let index = vortex_index::BytesRangeSource::new(sidecar_key, sidecar);
     let opts = *opts;
     let repack =
         tokio::task::spawn_blocking(move || vortex_index::repack_sidecar(data, index, &opts))
