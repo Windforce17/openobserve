@@ -3,6 +3,116 @@
 Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
 (deleted 2026-07-29; full history in git). Keep THIS file current.
 
+## 2026-10-15 — `.219` to PROD, readers-first: queriers 15:34Z (#641), compactors 15:55Z (#642), ingesters + router 17:46–18:37Z (#644); fleet converged 34/34
+- **Queriers** (`v0.93.0-vix-20261015.219`, image only; #641 also
+  dropped the stale `ZO_TRACES_LIST_INDEX_ENABLED` pin — see the
+  regression below). 10/10 ready 15:34Z, 0 restarts through 16:35Z.
+  Post-leg battery at 15:43 (fresh pods, downloader queue 14,430):
+  hits identical 18/18; index phase 324 → 265 ms on the needle misses,
+  warm legs faster (`*_r2` 289–498 vs 542–767 ms), cold scan legs slower
+  (miss_userid24_r1 wall 1,036 → 4,448 ms, scan 642 → 4,129 ms) — the
+  fresh-pod effect the rollout skill warns about; organic verdict needs
+  the 2–3 h re-run. Memory: the cgroup sits AT the 24 GiB limit
+  (`kubectl top` 21.7 GiB) but it is anon 7.06 GiB + 16.3 GiB CLEAN page
+  cache from disk-cache fills (`file_dirty` 0, `file_writeback` 0,
+  `oom_kill` 0, memory PSI full avg10/60/300 = 0, ~1.1k reclaim events/s
+  with no stall) — not the `.216` dirty-page mode. Fleet counters after
+  10 min: result cache 52,877 / 144,919, `fast_path_fallback
+  skipped_file` 1,179.
+- **Compactors** (18/18 in 80 s, `maxUnavailable 50%`; the inert
+  `ZO_VIX_MERGE_TYPE_POLICY` pin dropped). RSS avg 5.6–7.1 GiB, max
+  11.7–14.6 GiB (request 24 Gi / limit 60 Gi), 0 restarts through
+  16:35Z. Merges: 212 in the first 7 min, 734 in 16 min, 524 per 10 min
+  at 16:25–16:35; `file_list_jobs` pending 401 → 365 (the done rows are
+  cleaned, so the table gives no rate). `.bf` assembler: 103 builds /
+  922 files in the first 30 min, then 196 builds / 532 files per 10 min;
+  per-pod passes 256–267/300 buckets in 288–379 s (33–44 busy elsewhere,
+  0 failed, settled before 14Z); triggers FirstBuild 86 / PendingRatio
+  18; dictionary fallbacks where sidecars carry no bloom section (10/10
+  in `traces/e2b_prod_logs/2026/10/15/13`); 0 consolidated so far (no
+  visited hour exceeded `ZO_COMPACT_BLOOM_MAX_CHUNKS`); GC queued
+  1,112 + 259 orphaned chunks in the first 20 min, merge-driven orphan
+  `.bf` 25 → 252; unbuildable 0, failed 0, WARN 0. Backlog at 16:20Z:
+  717 pending `(stream, hour)` buckets (67 in the last 24 h), 2,013 files
+  (traces 1,008 / 305 h; logs 1,005 / 346 h); last 7 days 219,699 files
+  stamped (606 TB), 35 not-applicable, 5,505 pending incl. live hours.
+  `[SEGMENT] unbuilt_older_10m` 257 at the roll, 0 by 16:14, 24–28 again
+  after the 16:24 ingester-4 restart. Only ERROR class: cluster health
+  checks against queriers that lost their spot nodes.
+- **Regression from #641, fixed by #643 (16:24Z).** The configmap pin
+  `ZO_TRACES_LIST_INDEX_ENABLED=false` was dropped because `.219` removed
+  the knob — but the ingesters are still `.202`, where it defaults to
+  `true`. The four long-running ingesters kept their env; `obs-ingester-4`
+  was rescheduled at 15:50Z (spot node lost) and resumed the stream: 411
+  files / 39.4 M rows of `default/metadata/trace_list_index` in the
+  16:xx hour, zero in the preceding 3 days. Re-pinned (inert for the
+  `.219` roles; drop again with the ingester roll), `obs-ingester-4`
+  deleted 16:24 and ready 16:24:38. Lesson: a shared-configmap pin
+  follows the SLOWEST role's image, not the one being rolled.
+- Node churn today is the `quickwit` NodePool (m7g.4xlarge spot):
+  Karpenter interruption messages (queue `Prod-ops`) 16:21:44, 16:27:32,
+  16:41:19, consolidation "disrupting node(s)" 16:05:56, 16:22:06,
+  16:39:33; 4 querier pods and 1 compactor replaced between 15:52 and
+  16:48 with cold caches, 0 container restarts. `do-not-disrupt` blocks
+  consolidation of obs nodes, not interruptions. Not `.219`.
+- **Organic battery (17:33Z, 2 h after the querier roll) vs the `.216`
+  pre-leg — verdict: no code regression; two cache-state effects.**
+  Hits identical 18/18. Warm legs `*_r2` −5…−57 %, `cnt_svc24_r1` −45 %
+  (idx 4,426 → 2,400 ms), `hit_domain24_r1` −27 %. The cold needle
+  misses looked bad (miss_userid24_r1 1,036 → 4,731 ms, scan 642 →
+  4,388; miss_userid48_r1 916 → 4,976; miss_domain24_r1 2,000 → 3,669,
+  idx 1,370 → 2,872) and reproduced the fresh leg within 10 %, so they
+  were attributed per follower (`bloom filter reduced … in N ms`,
+  `index fetches`, `disk cached`):
+  - `domain` (not admitted → B3 structural-only → the fragmented 1-file
+    `.bf` set is skipped by design, VIX index over ~1,550 files per
+    follower): the 6 pods up since 15:32 take 886–1,361 ms at 69–72 %
+    disk-cached with ~1,350 fetches / 390 MB; the 4 spot-replaced pods
+    take 2,603–2,868 ms at 0 % cached with ~4,500 fetches / 1.3 GB (the
+    3-fetch cold chain `ZO_VIX_SIDECAR_FIRST_OPEN` is meant to cut) — the
+    leader waits for the slowest. `.216`'s 1,370 ms was 10 warm pods.
+  - `user_id` (id-like → admitted → the `.bf` stage runs over ~1,500
+    one-file groups per follower, 1,608 → 4 kept): 1,264–2,189 ms on the
+    warm pods, 3,698–4,315 ms on the cold ones; same query 10 s later
+    289 ms; same query 25 min later (18:05Z probe) **513 ms** with the
+    stage at 33–122 ms on every follower. So the per-file footers +
+    block rows survive 25 min and not 2 h of organic traffic (the 245 MB
+    parsed-footer LRU is the plausible evictor — the 366 GiB block tier
+    cannot turn over in 2 h; no footer-cache metrics exist to prove
+    it). The `.216` pre-leg ran on pods re-rolled 2026-10-13 06:39Z —
+    2.4 days warm — so its 1,036 ms is a HOT number; hot-for-hot `.219`
+    is 513 ms. Same read path and cache budget as `.216`
+    (`BLOOM_FOOTER_CACHE` → suffix GET; 1 % RAM clamped 32–256 MB).
+  - Structural consequence worth fixing: prod's historical window is
+    one `.bf` per file (the pre-B4 assembler), and `.219` only
+    consolidates an hour when a pending file brings it back (0
+    consolidations in 3 h). Until retention turns the window, id-like
+    needle queries over ≥ 24 h pay ~1,500 footer + block-row reads per
+    follower whenever the footers have aged out. Options: a bounded
+    sweep that revisits stamped fragmented hours (one chunk of members
+    per pass, newest first), and/or `ZO_BLOOM_FOOTER_CACHE_MAX_SIZE`
+    above the 256 MB clamp with a `zo_bloom_footer_cache_*` gauge
+    pair so the horizon is measurable. Not done today.
+- **Step 3 (#644, synced 17:45:52Z):** router new pod Ready at 17:46
+  (surge-first, no gap); sts ordered 4 → 0, each `.202` pod used its
+  full 600 s grace (`4` 17:46–17:56, `3` → 18:06, `2` → 18:16, `1` →
+  18:27, `0` → 18:37); every `.219` pod Ready within ~30 s, WAL replay
+  "json_size: 0 … file_num: 0" (clean flushes). Router 5xx during the
+  roll: 0. 18:43Z: compactor 18/18, ingester 5/5, querier 10/10, router
+  1/1 on `.219`, 0 restarts; ingesters 2.8–4.6 cores / 1.6–6.7 GiB; L0s
+  850 files / 10 min (469 with sidecars); `trace_list_index` L0 writes
+  0; `file_list_jobs` pending 176; compactor 497 merges / 10 min, RSS
+  avg 5.8 / max 12.1 GiB, segment backlog warning gone. The
+  `ZO_TRACES_LIST_INDEX_ENABLED` pin left the configmap with #644.
+  Check at the next ingester roll whether `.219`'s own shutdown also
+  rides out the 600 s grace.
+- Rollout order from here (2026-10-14 entry): 2) queriers
+  `ZO_VIX_SIDECAR_FIRST_OPEN=true`; 3) compactors/ingesters
+  `ZO_VIX_SIDECAR_TAIL_ZSTD=true`; 4) `ZO_COMPACT_SIDECAR_REPACK_BUDGET`
+  > 0; 5) `ZO_VIX_EAGER_TAIL_BYTES` 768 → 256 KiB once the window is
+  mostly `layout_gen=2`. Each its own single-variable roll with the
+  battery + per-follower attribution above.
+
 ## 2026-10-15 — upstream survey (openobserve/openobserve `eee507d403`, v1.0.0-rc1) and the six borrowed items, on DEV as `.219`
 - Survey: `.work/upstream/SUMMARY.md` (+ four slice reports with
   file:line evidence). Upstream is +1,279 commits since the fork point
