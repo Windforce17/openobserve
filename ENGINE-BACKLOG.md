@@ -3,6 +3,92 @@
 Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
 (deleted 2026-07-29; full history in git). Keep THIS file current.
 
+## 2026-10-15 — upstream survey (openobserve/openobserve `eee507d403`, v1.0.0-rc1) and the six borrowed items, on DEV as `.219`
+- Survey: `.work/upstream/SUMMARY.md` (+ four slice reports with
+  file:line evidence). Upstream is +1,279 commits since the fork point
+  (`1ad116eb96`, 2026-07-21); its index side (tantivy over puffin, the
+  `.bf` layer we inherited) is frozen at the fork point — our `.bf` v2,
+  AUTO sections, sidecar-first open and VIX cold open are strictly ahead.
+  Its effort went to product surface, a metrics index (`metrics_index`
+  crate: TSID-major layout, `.midx` sidecar, streaming fused PromQL) and
+  compactor/meta-DB hygiene. Owner decision: metrics items (series-major
+  order + run-table sidecar, fused aggregation) deferred — metrics are
+  not supported on this fork today; items 1/4/6/8/9/10 approved; 5 (result
+  cache per-key cap), 7 (WAL lock guards), 11, 12 not decided.
+- Rejected after checking: the scout's "aggregates over `(… LIMIT n)`
+  subqueries are wrong" — dev returns 10/7/3/5 for the four shapes; the
+  downsampling fixes — compiled out (`--features mimalloc`, not
+  `enterprise`).
+- **Shipped (vix-arch `cdbc3f6097` + `345a72130` gate default 2, image
+  `.219` = release/vix-20261015-219 `e0974b328`, index `f8e1609a…`,
+  arm64 `0787f4ed…`, binary `2138c460…`, dev GitOps #336, merge
+  `8cc64512`; 3/3/1/1 Ready, 0 restarts):**
+  1. `trace_list_index` writer removed (upstream #13809): one Metadata
+     row per span, nothing ever read it — dev's stream held
+     **8,944,877,287 rows in 1,511 files**. `ZO_TRACES_LIST_INDEX_ENABLED`
+     is gone; the M13/M20b/M26 Metadata-class merge safeguards stay for
+     `distinct_values_*`. After the roll: ingesters write none; the
+     compactor drained pre-roll WAL segments / L0 files of the stream for
+     ~10 min and went quiet; traces ingest unchanged (2.46 M spans in the
+     10 min after the roll).
+  2. Retention / stream delete (upstream #15066, #14023): rows no longer
+     grouped per hour — `write_file_list` takes
+     `ZO_COMPACT_FILE_LIST_DELETED_BATCH_SIZE` (1,000) chunks that may span
+     hours; `retire_files` emits one `DELETE FROM file_list WHERE date =
+     $1 AND ((id,…) OR …) RETURNING …` per `(date, ≤ 300 rows)` so the
+     date-partitioned table prunes to one partition (the bare `id = …`
+     arm probed all ~157 partitions — our own 2026-10 audit had flagged
+     it); `update_dump_records` carries `(id, generation, size, date)`
+     and prunes the same way; sqlite mirrored; the all-or-nothing
+     generation fence is unchanged (new sqlite test: two dates in one
+     call, stale generation rejects the whole transaction).
+  3. HTTP leader on a 16 MiB-stack runtime (`create_main_runtime`,
+     upstream #14469); `Condition::Or/And` are n-ary, physical chains
+     flatten with an explicit stack and rebuild balanced (depth
+     O(log n)); same-field OR folds to one pruner predicate over all
+     children. Regression tests run a 5,000-term chain on a 256 KiB
+     thread. Dev: `k8s.pod.name = … OR …` × 5,000 → 0 / 516,673 correct,
+     9.2 s, no restarts; a 3,000-value `IN` 1.4 s.
+  4. Retention split (upstream #14725): generation hourly
+     (`ZO_COMPACT_DATA_RETENTION_INTERVAL + 3`), pending delete jobs
+     every `ZO_COMPACT_INTERVAL + 3` = 13 s on dev.
+  5. Pure compactors evict a committed batch's retired inputs (data +
+     sidecar keys) from their own disk cache (upstream #13961);
+     `disk::remove` of an uncached key is a silent no-op.
+  6. Merge-driven orphan `.bf` cleanup: after each committed merge pass
+     the retired `bloom_ver`s are checked with `bloom_ver_referenced` and
+     tombstoned when unreferenced, through the same `queue_bloom_tombstone`
+     memo as the listing GC; no age grace here (a retired version had
+     completed PUT + stamp, and stamps only ever target fresh versions).
+     Dev: "merge retired 1 distinct bloom versions; queued 1 orphan `.bf`"
+     after each merge — the orphans the old code leaked forever.
+  Also: `search::bloom_pruner`'s "no rows resolved" WARN is debug now
+  (`a95829de10`) — under structural admission a low-cardinality field
+  reaching a chunk without a section is the designed no-info path; it
+  fired 3× per group per query on dev.
+- **Dev finding, pre-existing: dev NATS JetStream cannot create streams.**
+  Deleting the obsolete `trace_list_index` stream (`DELETE
+  /api/default/streams/trace_list_index?type=metadata`) returned 500
+  `[NATS:get_bucket_by_key] create jetstream kv compact … timed out`, and
+  the compactor's delete job fails the same way every 33 s (the Postgres
+  marker exists, `list()` sees it, `process_stream`'s coordinator `put`
+  needs the `KV_obs_compact` bucket, which has never been created on dev
+  — merge offsets live in Postgres since the lease generations). `jsz`:
+  meta leader `obs-nats-0`, replica `obs-nats-1` **non-current for 36
+  days**; `KV_obs_nodes` / `KV_obs_templates` exist as separate R1
+  streams on BOTH nats-1 and nats-2 (`ZO_NATS_REPLICAS=1`). Restarting
+  `obs-nats-1` (pod uid `fc406c55…` → `452548cc…`, PVC `data-obs-nats-1`
+  kept) did not re-sync it. Needs a JetStream meta repair (`nats server
+  raft peer-remove` / full NATS rolling restart) — not done unasked; the
+  delete marker stays so the deletion completes (and exercises item 2 on
+  1,511 rows) once NATS is healthy. Prod NATS state not checked.
+- Dev config since 2026-10-15: queriers pin prod's pruner admission
+  (#334: composite off, bloom-only `trace_id,span_id,
+  reference.parent_span_id`, auto ratio 0.01, id-only) and
+  `ZO_BLOOM_STRUCTURAL_MIN_GROUP_FILES=2` (#335; now the code default).
+  Known dev-only factor in every cold number: `ZO_VIX_FETCH_CONCURRENCY`
+  unpinned = 16 (prod 768).
+
 ## 2026-10-14 — cold-miss slices (DESIGN-COLD-MISS.md §2–§5) landed and on DEV as `.218`: compressed sidecar tail, sidecar-first open, AUTO per-field blooms, `.bf` v2 + presence pruning, hour-regroup assembler, sidecar repack
 - Scope: every item of DESIGN-COLD-MISS.md as corrected by
   `.work/coldmiss/DECISIONS.md` (S1–S6, W1–W4, B1–B5, §5), on `vix-arch`
