@@ -31,6 +31,18 @@ pub fn create_job_runtime() -> std::io::Result<Runtime> {
         .build()
 }
 
+// The HTTP leader parses and rewrites SQL on this runtime, so it needs the
+// same deep-recursion headroom as the other runtimes (a long OR/IN chain
+// otherwise overflows the tokio default 2 MiB worker stack and aborts the
+// process — #14469).
+pub fn create_main_runtime() -> std::io::Result<Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .thread_name("main_runtime")
+        .thread_stack_size(THREAD_STACK_SIZE)
+        .enable_all()
+        .build()
+}
+
 pub fn create_grpc_runtime() -> std::io::Result<Runtime> {
     let cfg = get_config();
     tokio::runtime::Builder::new_multi_thread()

@@ -518,8 +518,11 @@ pub enum Condition {
     // term, distance
     FuzzyMatchAll(String, u8),
     All(),
-    Or(Box<Condition>, Box<Condition>),
-    And(Box<Condition>, Box<Condition>),
+    // n-ary so a long OR/AND chain (UI-generated `a=1 OR a=2 OR ...`,
+    // expanded IN) does not recurse one level per term; constructors keep
+    // ≥ 2 children — a 1-child vec is normalized to the child itself
+    Or(Vec<Condition>),
+    And(Vec<Condition>),
     Not(Box<Condition>),
 }
 
@@ -561,12 +564,18 @@ impl Condition {
                 format!("{MATCH_ALL_QUERY_PREFIX}:fuzzy({value}, {distance})")
             }
             Condition::All() => "ALL".to_string(),
-            Condition::Or(left, right) => format!("({} OR {})", left.to_query(), right.to_query()),
-            Condition::And(left, right) => {
-                format!("({} AND {})", left.to_query(), right.to_query())
-            }
+            Condition::Or(items) => format!("({})", Self::join_query(items, " OR ")),
+            Condition::And(items) => format!("({})", Self::join_query(items, " AND ")),
             Condition::Not(condition) => format!("NOT({})", condition.to_query()),
         }
+    }
+
+    fn join_query(items: &[Condition], sep: &str) -> String {
+        items
+            .iter()
+            .map(|condition| condition.to_query())
+            .collect::<Vec<_>>()
+            .join(sep)
     }
 
     /// Translate one gated filter expression (see
@@ -609,14 +618,8 @@ impl Condition {
                         Condition::Equal(field, value)
                     }
                 }
-                Operator::And => Condition::And(
-                    Box::new(Condition::from_physical_expr(expr.left(), index_fields)),
-                    Box::new(Condition::from_physical_expr(expr.right(), index_fields)),
-                ),
-                Operator::Or => Condition::Or(
-                    Box::new(Condition::from_physical_expr(expr.left(), index_fields)),
-                    Box::new(Condition::from_physical_expr(expr.right(), index_fields)),
-                ),
+                Operator::And => Condition::And(Self::flatten_physical_chain(expr, index_fields)),
+                Operator::Or => Condition::Or(Self::flatten_physical_chain(expr, index_fields)),
                 _ => unreachable!(),
             }
         } else if let Some(expr) = expr.downcast_ref::<InListExpr>() {
@@ -694,6 +697,33 @@ impl Condition {
         } else {
             unreachable!()
         }
+    }
+
+    /// Walk a same-operator `BinaryExpr` chain with an explicit stack so a
+    /// long `a OR b OR c ...` chain (UI-generated filters, an expanded IN)
+    /// costs O(1) frames instead of one per term; `from_physical_expr`
+    /// still recurses for genuinely nested different operators, which are
+    /// bounded by the query's parenthesization, not its term count.
+    fn flatten_physical_chain(
+        root: &BinaryExpr,
+        index_fields: &HashMap<String, DataType>,
+    ) -> Vec<Condition> {
+        let op = *root.op();
+        let mut items = Vec::new();
+        let mut stack = vec![root.right(), root.left()];
+        while let Some(expr) = stack.pop() {
+            match expr.downcast_ref::<BinaryExpr>() {
+                Some(bin) if *bin.op() == op => {
+                    stack.push(bin.right());
+                    stack.push(bin.left());
+                }
+                _ => items.push(Condition::from_physical_expr(expr, index_fields)),
+            }
+        }
+        // stack order: left sub-expressions are pushed first and popped
+        // last, so items come out left-to-right — the display order of the
+        // original expression
+        items
     }
 
     /// Translate the condition into a [`VixQuery`]. The translation is
@@ -866,14 +896,18 @@ impl Condition {
                 }
             }
             Condition::All() => VixQuery::All,
-            Condition::Or(left, right) => VixQuery::Or(vec![
-                left.to_vix_query(tokenize)?,
-                right.to_vix_query(tokenize)?,
-            ]),
-            Condition::And(left, right) => VixQuery::And(vec![
-                left.to_vix_query(tokenize)?,
-                right.to_vix_query(tokenize)?,
-            ]),
+            Condition::Or(items) => VixQuery::Or(
+                items
+                    .iter()
+                    .map(|item| item.to_vix_query(tokenize))
+                    .collect::<anyhow::Result<Vec<_>>>()?,
+            ),
+            Condition::And(items) => VixQuery::And(
+                items
+                    .iter()
+                    .map(|item| item.to_vix_query(tokenize))
+                    .collect::<anyhow::Result<Vec<_>>>()?,
+            ),
             // general negation gets NO KeyExists guard (the negated shape can
             // span several fields) — can_remove_filter() is false for it, so
             // the scan-side filter repairs the null-row semantics
@@ -888,8 +922,8 @@ impl Condition {
         match self {
             Condition::MatchAll(value) => !(value.is_empty() || value == "*"),
             Condition::FuzzyMatchAll(value, _) => !value.is_empty(),
-            Condition::And(left, right) | Condition::Or(left, right) => {
-                left.uses_full_text() || right.uses_full_text()
+            Condition::Or(items) | Condition::And(items) => {
+                items.iter().any(Condition::uses_full_text)
             }
             Condition::Not(inner) => inner.uses_full_text(),
             _ => false,
@@ -991,9 +1025,8 @@ impl Condition {
             // field
             Condition::IsNotNull(_) | Condition::IsNull(_) => {}
             Condition::MatchAll(_) | Condition::FuzzyMatchAll(..) | Condition::All() => {}
-            Condition::Or(left, right) | Condition::And(left, right) => {
-                fields.extend(left.term_index_fields());
-                fields.extend(right.term_index_fields());
+            Condition::Or(items) | Condition::And(items) => {
+                fields.extend(items.iter().flat_map(Condition::term_index_fields));
             }
             Condition::Not(condition) => {
                 fields.extend(condition.term_index_fields());
@@ -1029,12 +1062,12 @@ impl Condition {
             // IS NULL on an all-null field is genuinely TRUE for every row
             Condition::IsNull(_) => false,
             Condition::MatchAll(_) | Condition::FuzzyMatchAll(..) | Condition::All() => false,
-            Condition::And(left, right) => {
-                left.never_true_when_null(null_fields) || right.never_true_when_null(null_fields)
-            }
-            Condition::Or(left, right) => {
-                left.never_true_when_null(null_fields) && right.never_true_when_null(null_fields)
-            }
+            Condition::And(items) => items
+                .iter()
+                .any(|item| item.never_true_when_null(null_fields)),
+            Condition::Or(items) => items
+                .iter()
+                .all(|item| item.never_true_when_null(null_fields)),
             Condition::Not(inner) => inner.never_false_when_null(null_fields),
         }
     }
@@ -1068,13 +1101,13 @@ impl Condition {
             | Condition::FuzzyMatchAll(..) => false,
             Condition::All() => true,
             // AND is FALSE iff either side is: never-false needs both
-            Condition::And(left, right) => {
-                left.never_false_when_null(null_fields) && right.never_false_when_null(null_fields)
-            }
+            Condition::And(items) => items
+                .iter()
+                .all(|item| item.never_false_when_null(null_fields)),
             // OR is FALSE iff both sides are: one never-false side suffices
-            Condition::Or(left, right) => {
-                left.never_false_when_null(null_fields) || right.never_false_when_null(null_fields)
-            }
+            Condition::Or(items) => items
+                .iter()
+                .any(|item| item.never_false_when_null(null_fields)),
             Condition::Not(inner) => inner.never_true_when_null(null_fields),
         }
     }
@@ -1097,9 +1130,12 @@ impl Condition {
                 fields.extend(fst_fields.iter().cloned());
             }
             Condition::All() => {}
-            Condition::Or(left, right) | Condition::And(left, right) => {
-                fields.extend(left.get_schema_fields(fst_fields));
-                fields.extend(right.get_schema_fields(fst_fields));
+            Condition::Or(items) | Condition::And(items) => {
+                fields.extend(
+                    items
+                        .iter()
+                        .flat_map(|item| item.get_schema_fields(fst_fields)),
+                );
             }
             Condition::Not(condition) => {
                 fields.extend(condition.get_schema_fields(fst_fields));
@@ -1266,15 +1302,19 @@ impl Condition {
                 Ok(disjunction(expr_list))
             }
             Condition::All() => Ok(Arc::new(Literal::new(ScalarValue::Boolean(Some(true))))),
-            Condition::Or(left, right) => {
-                let left = left.to_physical_expr(schema, fst_fields)?;
-                let right = right.to_physical_expr(schema, fst_fields)?;
-                Ok(Arc::new(BinaryExpr::new(left, Operator::Or, right)))
+            Condition::Or(items) => {
+                let exprs = items
+                    .iter()
+                    .map(|item| item.to_physical_expr(schema, fst_fields))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(disjunction(exprs))
             }
-            Condition::And(left, right) => {
-                let left = left.to_physical_expr(schema, fst_fields)?;
-                let right = right.to_physical_expr(schema, fst_fields)?;
-                Ok(Arc::new(BinaryExpr::new(left, Operator::And, right)))
+            Condition::And(items) => {
+                let exprs = items
+                    .iter()
+                    .map(|item| item.to_physical_expr(schema, fst_fields))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(conjunction_all(exprs))
             }
             Condition::Not(condition) => {
                 let expr = condition.to_physical_expr(schema, fst_fields)?;
@@ -1310,8 +1350,9 @@ impl Condition {
             Condition::MatchAll(v) => is_alphanumeric(v),
             Condition::FuzzyMatchAll(..) => false,
             Condition::All() => true,
-            Condition::Or(left, right) => left.can_remove_filter() && right.can_remove_filter(),
-            Condition::And(left, right) => left.can_remove_filter() && right.can_remove_filter(),
+            Condition::Or(items) | Condition::And(items) => {
+                items.iter().all(Condition::can_remove_filter)
+            }
             // general negation gets no KeyExists guard in to_vix_query: its
             // bitmap wrongly matches null rows, keep the filter (SQL
             // three-valued logic)
@@ -1413,18 +1454,37 @@ pub(crate) fn like_pattern_shape(pattern: &str) -> Option<LikePatternShape<'_>> 
     Some(LikePatternShape::Contains(needle))
 }
 
-// combine all exprs with OR operator
+// combine all exprs with the OR operator
 fn disjunction(exprs: Vec<Arc<dyn PhysicalExpr>>) -> Arc<dyn PhysicalExpr> {
-    if exprs.len() == 1 {
-        exprs[0].clone()
-    } else {
-        // conjuction all expr in exprs
-        let mut expr = exprs[0].clone();
-        for e in exprs.into_iter().skip(1) {
-            expr = Arc::new(BinaryExpr::new(expr, Operator::Or, e));
-        }
-        expr
+    balanced_binary(exprs, Operator::Or)
+}
+
+// combine all exprs with the AND operator
+fn conjunction_all(exprs: Vec<Arc<dyn PhysicalExpr>>) -> Arc<dyn PhysicalExpr> {
+    balanced_binary(exprs, Operator::And)
+}
+
+/// Pairwise merge keeps evaluate/display/drop of a long chain at O(log n)
+/// depth — a left-deep chain of 5,000 terms is a 5,000-frame drop on the
+/// scan thread, which overflows anything but a huge stack (#14469).
+fn balanced_binary(mut exprs: Vec<Arc<dyn PhysicalExpr>>, op: Operator) -> Arc<dyn PhysicalExpr> {
+    if exprs.is_empty() {
+        return Arc::new(Literal::new(ScalarValue::Boolean(Some(true))));
     }
+    while exprs.len() > 1 {
+        let mut merged = Vec::with_capacity(exprs.len().div_ceil(2));
+        let mut iter = exprs.into_iter();
+        while let Some(left) = iter.next() {
+            merged.push(match iter.next() {
+                Some(right) => Arc::new(BinaryExpr::new(left, op, right)) as _,
+                None => left,
+            });
+        }
+        exprs = merged;
+    }
+    exprs
+        .pop()
+        .expect("balanced_binary needs at least one expression")
 }
 
 /// Normalize a comparison literal for a [`NumericKind`] field into the
@@ -1791,7 +1851,7 @@ mod tests {
     fn test_condition_term_index_fields_or_simple() {
         let left = Condition::Equal("field1".to_string(), "value1".to_string());
         let right = Condition::Equal("field2".to_string(), "value2".to_string());
-        let condition = Condition::Or(Box::new(left), Box::new(right));
+        let condition = Condition::Or(vec![left, right]);
         let fields = condition.term_index_fields();
 
         assert_eq!(fields.len(), 2);
@@ -1803,7 +1863,7 @@ mod tests {
     fn test_condition_term_index_fields_and_simple() {
         let left = Condition::Equal("field1".to_string(), "value1".to_string());
         let right = Condition::In("field2".to_string(), vec!["value1".to_string()], false);
-        let condition = Condition::And(Box::new(left), Box::new(right));
+        let condition = Condition::And(vec![left, right]);
         let fields = condition.term_index_fields();
 
         assert_eq!(fields.len(), 2);
@@ -1815,7 +1875,7 @@ mod tests {
     fn test_condition_term_index_fields_or_with_overlap() {
         let left = Condition::Equal("field1".to_string(), "value1".to_string());
         let right = Condition::Equal("field1".to_string(), "value2".to_string());
-        let condition = Condition::Or(Box::new(left), Box::new(right));
+        let condition = Condition::Or(vec![left, right]);
         let fields = condition.term_index_fields();
 
         // Should only have one field since both conditions use the same field
@@ -1827,7 +1887,7 @@ mod tests {
     fn test_condition_term_index_fields_and_with_overlap() {
         let left = Condition::Equal("field1".to_string(), "value1".to_string());
         let right = Condition::Regex("field1".to_string(), "pattern.*".to_string());
-        let condition = Condition::And(Box::new(left), Box::new(right));
+        let condition = Condition::And(vec![left, right]);
         let fields = condition.term_index_fields();
 
         // Should only have one field since both conditions use the same field
@@ -1839,15 +1899,15 @@ mod tests {
     fn test_condition_term_index_fields_nested_complex() {
         // Create a complex nested condition: (field1 = value1 OR field2 = value2) AND (field3 =
         // value3 OR match_all(term))
-        let left_or = Condition::Or(
-            Box::new(Condition::Equal("field1".to_string(), "value1".to_string())),
-            Box::new(Condition::Equal("field2".to_string(), "value2".to_string())),
-        );
-        let right_or = Condition::Or(
-            Box::new(Condition::Equal("field3".to_string(), "value3".to_string())),
-            Box::new(Condition::MatchAll("search_term".to_string())),
-        );
-        let condition = Condition::And(Box::new(left_or), Box::new(right_or));
+        let left_or = Condition::Or(vec![
+            Condition::Equal("field1".to_string(), "value1".to_string()),
+            Condition::Equal("field2".to_string(), "value2".to_string()),
+        ]);
+        let right_or = Condition::Or(vec![
+            Condition::Equal("field3".to_string(), "value3".to_string()),
+            Condition::MatchAll("search_term".to_string()),
+        ]);
+        let condition = Condition::And(vec![left_or, right_or]);
         let fields = condition.term_index_fields();
 
         // match_all contributes no specific field
@@ -1869,11 +1929,11 @@ mod tests {
 
         // Create nested structure: ((equal OR in) AND (regex OR match_all)) OR (fuzzy_match_all AND
         // all)
-        let left_or = Condition::Or(Box::new(equal_cond), Box::new(in_cond));
-        let right_or = Condition::Or(Box::new(regex_cond), Box::new(match_all_cond));
-        let left_and = Condition::And(Box::new(left_or), Box::new(right_or));
-        let right_and = Condition::And(Box::new(fuzzy_match_cond), Box::new(all_cond));
-        let condition = Condition::Or(Box::new(left_and), Box::new(right_and));
+        let left_or = Condition::Or(vec![equal_cond, in_cond]);
+        let right_or = Condition::Or(vec![regex_cond, match_all_cond]);
+        let left_and = Condition::And(vec![left_or, right_or]);
+        let right_and = Condition::And(vec![fuzzy_match_cond, all_cond]);
+        let condition = Condition::Or(vec![left_and, right_and]);
 
         let fields = condition.term_index_fields();
 
@@ -2124,7 +2184,7 @@ mod tests {
     fn test_condition_to_query_or() {
         let left = Condition::Equal("field1".to_string(), "value1".to_string());
         let right = Condition::Equal("field2".to_string(), "value2".to_string());
-        let condition = Condition::Or(Box::new(left), Box::new(right));
+        let condition = Condition::Or(vec![left, right]);
         assert_eq!(condition.to_query(), "(field1=value1 OR field2=value2)");
     }
 
@@ -2132,7 +2192,7 @@ mod tests {
     fn test_condition_to_query_and() {
         let left = Condition::Equal("field1".to_string(), "value1".to_string());
         let right = Condition::Equal("field2".to_string(), "value2".to_string());
-        let condition = Condition::And(Box::new(left), Box::new(right));
+        let condition = Condition::And(vec![left, right]);
         assert_eq!(condition.to_query(), "(field1=value1 AND field2=value2)");
     }
 
@@ -2205,12 +2265,12 @@ mod tests {
     fn test_condition_can_remove_filter_or() {
         let left = Condition::Equal("field1".to_string(), "value1".to_string());
         let right = Condition::Equal("field2".to_string(), "value2".to_string());
-        let condition = Condition::Or(Box::new(left), Box::new(right));
+        let condition = Condition::Or(vec![left, right]);
         assert!(condition.can_remove_filter());
 
         let left = Condition::Equal("field1".to_string(), "value1".to_string());
         let right = Condition::Regex("field2".to_string(), "pattern.*".to_string());
-        let condition = Condition::Or(Box::new(left), Box::new(right));
+        let condition = Condition::Or(vec![left, right]);
         assert!(!condition.can_remove_filter());
     }
 
@@ -2464,10 +2524,10 @@ mod tests {
         // A missing field anywhere inside a nested condition skips the
         // whole top-level condition.
         let mut cond = IndexCondition::new();
-        cond.add_condition(Condition::Or(
-            Box::new(Condition::Equal("A".into(), "a".into())),
-            Box::new(Condition::Equal("B".into(), "b".into())),
-        ));
+        cond.add_condition(Condition::Or(vec![
+            Condition::Equal("A".into(), "a".into()),
+            Condition::Equal("B".into(), "b".into()),
+        ]));
         cond.add_condition(Condition::Equal("A".into(), "a2".into()));
 
         let (query, has_skipped) = cond
@@ -2505,10 +2565,10 @@ mod tests {
             // everywhere — never TRUE (must NOT become Not(Nothing) = all)
             Condition::Not(Box::new(Condition::Equal("B".into(), "b".into()))),
             // AND with a servable predicate can still never be TRUE
-            Condition::And(
-                Box::new(Condition::Equal("B".into(), "b".into())),
-                Box::new(Condition::Equal("A".into(), "a".into())),
-            ),
+            Condition::And(vec![
+                Condition::Equal("B".into(), "b".into()),
+                Condition::Equal("A".into(), "a".into()),
+            ]),
         ] {
             let cond = IndexCondition {
                 conditions: vec![condition.clone()],
@@ -2546,16 +2606,16 @@ mod tests {
     fn test_to_vix_query_absent_field_mixed_shapes_still_skip() {
         for condition in [
             // OR with a servable predicate can be TRUE on its other side
-            Condition::Or(
-                Box::new(Condition::Equal("B".into(), "b".into())),
-                Box::new(Condition::Equal("A".into(), "a".into())),
-            ),
+            Condition::Or(vec![
+                Condition::Equal("B".into(), "b".into()),
+                Condition::Equal("A".into(), "a".into()),
+            ]),
             // NOT(absent AND servable) is TRUE where the servable side is
             // genuinely FALSE
-            Condition::Not(Box::new(Condition::And(
-                Box::new(Condition::Equal("B".into(), "b".into())),
-                Box::new(Condition::Equal("A".into(), "a".into())),
-            ))),
+            Condition::Not(Box::new(Condition::And(vec![
+                Condition::Equal("B".into(), "b".into()),
+                Condition::Equal("A".into(), "a".into()),
+            ]))),
         ] {
             let lone = IndexCondition {
                 conditions: vec![condition.clone()],
@@ -2590,10 +2650,10 @@ mod tests {
             _ => FieldCap::Term,
         };
         let mut cond = IndexCondition::new();
-        cond.add_condition(Condition::Or(
-            Box::new(Condition::Equal("F".into(), "f".into())),
-            Box::new(Condition::Equal("B".into(), "b".into())),
-        ));
+        cond.add_condition(Condition::Or(vec![
+            Condition::Equal("F".into(), "f".into()),
+            Condition::Equal("B".into(), "b".into()),
+        ]));
         assert!(cond.to_vix_query("test", &caps, &tok, true).is_err());
 
         cond.add_condition(Condition::Equal("A".into(), "a".into()));
@@ -2885,10 +2945,10 @@ mod tests {
         };
         let mut cond = IndexCondition::new();
         cond.add_condition(Condition::MatchAll("deploy status".into()));
-        cond.add_condition(Condition::Or(
-            Box::new(Condition::MatchAll("xyz".into())),
-            Box::new(Condition::Equal("svc".into(), "y".into())),
-        ));
+        cond.add_condition(Condition::Or(vec![
+            Condition::MatchAll("xyz".into()),
+            Condition::Equal("svc".into(), "y".into()),
+        ]));
         cond.add_condition(Condition::Not(Box::new(Condition::FuzzyMatchAll(
             "abc".into(),
             1,
@@ -3033,13 +3093,13 @@ mod tests {
         let a = Condition::Equal("a".into(), "1".into());
         let b = Condition::Equal("b".into(), "2".into());
         assert_eq!(
-            Condition::And(Box::new(a.clone()), Box::new(b.clone()))
+            Condition::And(vec![a.clone(), b.clone()])
                 .to_vix_query(&tok)
                 .unwrap(),
             VixQuery::And(vec![exact("a", "1"), exact("b", "2")])
         );
         assert_eq!(
-            Condition::Or(Box::new(a.clone()), Box::new(b.clone()))
+            Condition::Or(vec![a.clone(), b.clone()])
                 .to_vix_query(&tok)
                 .unwrap(),
             VixQuery::Or(vec![exact("a", "1"), exact("b", "2")])
@@ -3441,5 +3501,84 @@ mod tests {
             ),
             Condition::Equal("svc".into(), "38".into())
         );
+    }
+
+    /// Regression for the deep-chain stack-overflow class (#14469): a
+    /// 5,000-term `x = v_i OR …` chain must flatten into ONE n-ary `Or`
+    /// without recursing per term, and rebuild as a balanced physical tree
+    /// whose drop is O(log n) deep. Runs on a 256 KiB stack so the
+    /// pre-n-ary binary `Condition` (one frame per term in
+    /// from_physical_expr) would overflow here.
+    #[test]
+    fn deep_or_chain_flattens_and_rebuilds_without_recursion() {
+        let leaf = |i: usize| -> Arc<dyn PhysicalExpr> {
+            Arc::new(BinaryExpr::new(
+                Arc::new(Column::new("field1", 0)),
+                Operator::Eq,
+                Arc::new(Literal::new(ScalarValue::Utf8(Some(format!("v{i}"))))),
+            ))
+        };
+        // left-deep, exactly as DataFusion emits an OR chain
+        let expr: Arc<dyn PhysicalExpr> = (1..5_000).fold(leaf(0), |acc, i| {
+            Arc::new(BinaryExpr::new(acc, Operator::Or, leaf(i)))
+        });
+
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                let condition = Condition::from_physical_expr(&expr, &HashMap::new());
+                // the left-deep INPUT tree drops one Arc frame per level —
+                // 5,000 frames would overflow this small stack on its own;
+                // leaking it keeps the test about OUR recursion only
+                std::mem::forget(expr);
+                let Condition::Or(items) = &condition else {
+                    panic!("expected a flattened Or, got {condition:?}");
+                };
+                assert_eq!(items.len(), 5_000);
+                assert_eq!(items[0], Condition::Equal("field1".into(), "v0".into()));
+                assert_eq!(
+                    items[4_999],
+                    Condition::Equal("field1".into(), "v4999".into())
+                );
+                assert_eq!(
+                    condition.to_query().matches("v0").count(),
+                    1,
+                    "every term must appear in the display form"
+                );
+                assert!(condition.can_remove_filter());
+                assert_eq!(condition.term_index_fields().len(), 1);
+                assert!(condition.uses_full_text() == false);
+                // round-trip back to a physical expr: balanced, so the
+                // tree's own depth is O(log n)
+                let arrow_schema = arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                    "field1",
+                    DataType::Utf8,
+                    true,
+                )]);
+                let rebuilt = condition
+                    .to_physical_expr(&arrow_schema, &[])
+                    .expect("all Equal leaves rebuild");
+                // the balanced tree of 5,000 leaves is ~⌈log2(5,000)⌉
+                // binary levels deep; a left-deep rebuild would be 4,999
+                fn binary_depth(expr: &Arc<dyn PhysicalExpr>) -> usize {
+                    match expr.downcast_ref::<BinaryExpr>() {
+                        Some(bin) => 1 + binary_depth(bin.left()).max(binary_depth(bin.right())),
+                        None => 0,
+                    }
+                }
+                let depth = binary_depth(&rebuilt);
+                assert!(
+                    (12..=15).contains(&depth),
+                    "pairwise merge must be O(log n) deep, got {depth}"
+                );
+                // and the vix translation aggregates the children
+                assert!(matches!(
+                    condition.to_vix_query(&|_| vec![]),
+                    Ok(VixQuery::Or(queries)) if queries.len() == 5_000
+                ));
+            })
+            .expect("spawn small-stack thread")
+            .join()
+            .expect("deep OR chain must not overflow the stack");
     }
 }

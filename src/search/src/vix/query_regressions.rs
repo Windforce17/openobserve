@@ -1360,10 +1360,10 @@ fn active_full_text_scope_ignores_historical_fields_and_preserves_named_predicat
     assert_eq!(scoped_rows(&reader, &condition, &active), (vec![0], false));
     assert_eq!(scoped_rows(&reader, &condition, &[]), (vec![], false));
     let mixed = IndexCondition {
-        conditions: vec![Condition::Or(
-            Box::new(Condition::MatchAll("needle".into())),
-            Box::new(Condition::Equal("raw".into(), "needle".into())),
-        )],
+        conditions: vec![Condition::Or(vec![
+            Condition::MatchAll("needle".into()),
+            Condition::Equal("raw".into(), "needle".into()),
+        ])],
     };
     assert_eq!(
         scoped_rows(&reader, &mixed, &active),
@@ -1371,12 +1371,10 @@ fn active_full_text_scope_ignores_historical_fields_and_preserves_named_predicat
     );
     assert_eq!(scoped_rows(&reader, &mixed, &[]), ((0..7).collect(), false));
     let negated = IndexCondition {
-        conditions: vec![Condition::And(
-            Box::new(Condition::Not(Box::new(Condition::MatchAll(
-                "needle".into(),
-            )))),
-            Box::new(Condition::Equal("raw".into(), "needle".into())),
-        )],
+        conditions: vec![Condition::And(vec![
+            Condition::Not(Box::new(Condition::MatchAll("needle".into()))),
+            Condition::Equal("raw".into(), "needle".into()),
+        ])],
     };
     assert_eq!(
         scoped_rows(&reader, &negated, &active),

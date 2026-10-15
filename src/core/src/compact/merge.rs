@@ -81,7 +81,11 @@ enum MergeBatchReceive {
 
 #[derive(Default)]
 struct MergePartitionOutcome {
-    orphan_blooms: Vec<i64>,
+    /// Distinct retired `bloom_ver`s (dropping the no-bloom 0) with the
+    /// `date` (`YYYY/MM/DD/HH`) hour key of the retired file — versions of
+    /// different hours live in different `.bf` objects, so the date is part
+    /// of the version's identity.
+    orphan_blooms: Vec<(String, i64)>,
     replan_required: bool,
 }
 
@@ -1048,11 +1052,38 @@ pub async fn merge_by_stream(
                     }
                 }
 
+                // Post-commit, the retired inputs are dead objects: their
+                // file_list rows are gone, so nothing can reach them again
+                // except this node's disk cache. Drop them now (data key +
+                // the `.vxi` sidecar key) on PURE compactors — a node that
+                // also serves queries may still be reading them through the
+                // broadcast cache; eviction there stays with the receiver.
+                // This runs after the commit and the merge's own reads of
+                // these objects are finished; upcoming batches read different
+                // files, so a concurrent merge is never affected.
+                if LOCAL_NODE.is_compactor() && !LOCAL_NODE.is_querier() {
+                    let mut evict = Vec::with_capacity(merged_files.len() * 2);
+                    for file in merged_files.iter() {
+                        evict.push(file.key.clone());
+                        if let Some(sidecar) =
+                            config::vix_sidecar_key(&file.key, file.meta.index_generation)
+                        {
+                            evict.push(sidecar);
+                        }
+                    }
+                    file_data::delete::add(evict);
+                }
+
                 // collect orphan blooms after writing file list successfully
-                // — only the files actually deleted release their blooms
+                // — only the files actually deleted release their blooms;
+                // the date travels with the version (different hours keep
+                // different `.bf` objects)
                 for file in merged_files.iter() {
-                    if file.meta.bloom_ver > 0 {
-                        orphan_blooms.push(file.meta.bloom_ver);
+                    if file.meta.bloom_ver > 0
+                        && let Ok((_, date_key, _)) =
+                            config::utils::parquet::parse_file_key_columns(&file.key)
+                    {
+                        orphan_blooms.push((date_key, file.meta.bloom_ver));
                     }
                 }
             }
@@ -1106,7 +1137,12 @@ pub async fn merge_by_stream(
         return Err(e);
     }
 
-    let _ = orphan_blooms;
+    // Merge-driven orphan `.bf` cleanup: the retired inputs' `bloom_ver`s may
+    // now be unreferenced — without this, their `.bf` objects wait for a
+    // builder pass over a pending bucket that never re-pends (index-off
+    // outputs, hours emptied by retention). Best-effort: GC errors are
+    // logged inside and never fail the merge.
+    super::bloom::cleanup_orphan_blooms(org_id, stream_type, stream_name, &orphan_blooms).await;
 
     complete_merge_pass(
         job_id,
@@ -1539,12 +1575,15 @@ fn group_files_into_batches(
 /// Blast radius deliberately limited to METADATA-class streams: their merge
 /// groups are size-capped, so the bounded inputs gain nothing from parallel
 /// sort, and the repartitioned min-floor plan was prod's compactor killer
-/// (116MB→6GB DataFusion spikes in ~2s merging
-/// default/metadata/trace_list_index; 98 spikes >2GB per 30min, ~24
-/// compactor OOM kills in 40min on .111): one ExternalSorter spills
-/// correctly where RepartitionExec buffers unspillably. Data streams
-/// (logs/traces/metrics/index) keep the multi-partition plan they have
-/// always used until a matching failure class justifies widening.
+/// (116MB→6GB DataFusion spikes in ~2s merging the former worst case
+/// default/metadata/trace_list_index — that writer was removed 2026-10-15,
+/// upstream #13809; nothing read the stream back; 98 spikes >2GB per 30min,
+/// ~24 compactor OOM kills in 40min on .111): one ExternalSorter spills
+/// correctly where RepartitionExec buffers unspillably. The remaining
+/// Metadata-class stream is distinct_values_*, which the same bounded
+/// group sizes still apply to. Data streams (logs/traces/metrics/index)
+/// keep the multi-partition plan they have always used until a matching
+/// failure class justifies widening.
 fn compact_single_partition_sort(stream_type: StreamType) -> bool {
     stream_type == StreamType::Metadata
 }
@@ -3862,8 +3901,10 @@ mod tests {
     }
 
     /// M20b pin: the compactor's parquet merge plans single-partition for
-    /// METADATA-class streams ONLY (the prod trace_list_index OOM class);
-    /// every data stream type keeps the multi-partition plan. The plan shape
+    /// METADATA-class streams ONLY (the prod OOM class was the former
+    /// trace_list_index; the remaining Metadata-class stream is
+    /// distinct_values_*, which is still size-capped the same way); every
+    /// data stream type keeps the multi-partition plan. The plan shape
     /// that `true` buys (target_partitions=1, one SortExec, zero
     /// RepartitionExec) is pinned in
     /// search::datafusion::merge::m13_single_partition_merge_plan_has_no_repartition.

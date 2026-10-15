@@ -943,12 +943,8 @@ async fn gc_unreferenced_chunks(
             .collect();
     let min_age_micros = min_age_secs.max(0).saturating_mul(1_000_000);
     // orphans stay listed until the delayed deletion job removes them
-    // (ZO_COMPACT_DELETE_FILES_DELAY_HOURS); remember what this process
-    // already queued so every pass in that window does not add the same
-    // tombstone rows again (duplicates are harmless - the delete is
-    // idempotent - but they are noise in file_list_deleted)
-    static QUEUED: std::sync::LazyLock<parking_lot::Mutex<hashlink::LruCache<String, ()>>> =
-        std::sync::LazyLock::new(|| parking_lot::Mutex::new(hashlink::LruCache::new(65_536)));
+    // (ZO_COMPACT_DELETE_FILES_DELAY_HOURS); re-queuing is deduped by the
+    // shared process-local memo (`queue_bloom_tombstone`)
     let mut tombstones = Vec::new();
     for object in objects {
         // `{bloom_ver}.bf`; the listed key may carry the bucket prefix, so
@@ -966,7 +962,7 @@ async fn gc_unreferenced_chunks(
             continue;
         }
         let path = infra::bloom::path::bloom_path(org_id, stream_type, stream_name, date, version);
-        if QUEUED.lock().insert(path.clone(), ()).is_some() {
+        if queue_bloom_tombstone(&path) {
             continue;
         }
         tombstones.push(FileListDeleted {
@@ -979,6 +975,101 @@ async fn gc_unreferenced_chunks(
         });
     }
     Ok(tombstones)
+}
+
+/// Process-local dedupe memo for `.bf` tombstones (bounded LRU: a path is
+/// forgotten once 65,536 others were queued). `true` = already queued in
+/// this process — callers skip re-enqueueing (duplicates are harmless, the
+/// deferred delete is idempotent, but they are noise in `file_list_deleted`).
+/// Shared by the builder's GC pass and the merge-driven orphan cleanup, so
+/// the two never double-queue the same `.bf` inside the delay window.
+fn queue_bloom_tombstone(path: &str) -> bool {
+    static QUEUED: std::sync::LazyLock<parking_lot::Mutex<hashlink::LruCache<String, ()>>> =
+        std::sync::LazyLock::new(|| parking_lot::Mutex::new(hashlink::LruCache::new(65_536)));
+    QUEUED.lock().insert(path.to_string(), ()).is_some()
+}
+
+/// Merge-driven orphan `.bf` cleanup: after a merge commits, the retired
+/// inputs' `bloom_ver`s may have lost their last referents. Without this
+/// hook those `.bf` objects leak — the builder's GC only runs for buckets
+/// with pending rows, and hours whose merge output carries no index
+/// (`index_size == 0`) or hours emptied by retention never re-pend.
+///
+/// `orphan_blooms` is the set of distinct retired `(date, bloom_ver)`
+/// pairs (the date is the retired file's hour key — versions of different
+/// hours are different `.bf` objects). One bounded `bloom_ver_referenced`
+/// query per distinct version. No age grace here, unlike the listing GC: a
+/// version that a retired row carried had completed its PUT + stamp, and
+/// stamps only ever point rows at freshly minted versions (builds and
+/// consolidation restamps alike), so an unreferenced retired version can
+/// never gain a reference again. Best-effort: any error is logged and the
+/// pass continues; GC must never fail a merge.
+pub(super) async fn cleanup_orphan_blooms(
+    org_id: &str,
+    stream_type: config::meta::stream::StreamType,
+    stream_name: &str,
+    orphan_blooms: &[(String, i64)],
+) {
+    let now = now_micros();
+    // distinct (date, version) pairs; one DB probe per pair, one pass
+    let candidates: HashSet<(&str, i64)> = orphan_blooms
+        .iter()
+        .map(|(date, version)| (date.as_str(), *version))
+        .collect();
+    let mut tombstones: Vec<FileListDeleted> = Vec::new();
+    for (date, version) in &candidates {
+        let referenced = match infra::file_list::bloom_ver_referenced(
+            org_id,
+            stream_type,
+            stream_name,
+            date,
+            *version,
+        )
+        .await
+        {
+            Ok(referenced) => referenced,
+            Err(e) => {
+                log::warn!(
+                    "[COMPACTOR:BLOOM] {org_id}/{stream_type}/{stream_name}/{date}: \
+                     bloom_ver_referenced({version}) failed: {e}; leaving `.bf` for the \
+                     builder's GC pass"
+                );
+                continue;
+            }
+        };
+        if referenced {
+            continue; // still referenced by a live file — keep the `.bf`
+        }
+        let path = infra::bloom::path::bloom_path(org_id, stream_type, stream_name, date, *version);
+        if queue_bloom_tombstone(&path) {
+            continue;
+        }
+        tombstones.push(FileListDeleted {
+            id: 0,
+            account: infra::storage::get_account(org_id, &path).unwrap_or_default(),
+            file: path,
+            index_generation: 0,
+            index_file: false,
+            flattened: false,
+        });
+    }
+    // ONE info line per pass with counts (house log discipline); a pass
+    // that queues nothing stays silent
+    let queued = tombstones.len();
+    if queued == 0 {
+        return;
+    }
+    log::info!(
+        "[COMPACTOR:BLOOM] {org_id}/{stream_type}/{stream_name}: merge retired {} distinct \
+         bloom versions; queued {queued} orphan `.bf` for deletion",
+        candidates.len(),
+    );
+    if let Err(e) = infra::file_list::batch_add_deleted(org_id, now, &tombstones).await {
+        log::warn!(
+            "[COMPACTOR:BLOOM] {org_id}/{stream_type}/{stream_name}: enqueue {queued} orphan \
+             `.bf` for deletion failed: {e}; the builder's GC pass will retry"
+        );
+    }
 }
 
 /// How one pending file's sections were obtained.
@@ -1826,6 +1917,28 @@ mod tests {
         // crossing a day boundary
         let early = chrono::Utc.with_ymd_and_hms(2026, 9, 29, 0, 10, 0).unwrap();
         assert_eq!(settled_hour_cutoff(early, 2), "2026/09/28/22");
+    }
+
+    /// The `.bf` tombstone memo dedupes ACROSS callers: the builder's GC
+    /// pass and the merge-driven orphan cleanup share one queue, so a path
+    /// enqueued by either is reported as already-queued to the other. The
+    /// memo is process-global, so the test may only assert relative
+    /// behavior (first sight → false, immediate repeat → true), never a
+    /// specific path's initial state.
+    #[test]
+    fn bloom_tombstone_memo_dedupes_across_callers() {
+        // unique per test run: the memo holds 65,536 entries, a stale
+        // leftover from another test could pre-queue our path
+        let path = format!(
+            "files/test/bloom/tombstone_memo_{}/2026/10/14/1.bf",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        assert!(!queue_bloom_tombstone(&path)); // first sight
+        assert!(queue_bloom_tombstone(&path)); // immediate repeat: same caller
+        assert!(queue_bloom_tombstone(&path)); // and again: any caller
     }
 
     /// B4 hour selection: precedence and thresholds of the four triggers.

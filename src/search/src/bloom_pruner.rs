@@ -713,10 +713,11 @@ fn decidable_field(condition: &Condition) -> Option<&str> {
     match condition {
         Condition::Equal(field, _) => Some(field),
         Condition::In(field, values, false) if !values.is_empty() => Some(field),
-        Condition::Or(left, right) => {
-            let left = decidable_field(left)?;
-            let right = decidable_field(right)?;
-            (left == right).then_some(left)
+        Condition::Or(items) => {
+            let mut iter = items.iter();
+            let first = decidable_field(iter.next()?)?;
+            iter.all(|item| decidable_field(item) == Some(first))
+                .then_some(first)
         }
         _ => None,
     }
@@ -853,23 +854,20 @@ fn try_predicate(cond: &Condition) -> Option<Predicate> {
             composite_fallback: false,
             legacy_admitted: false,
         }),
-        Condition::Or(left, right) => {
-            let lp = try_predicate(left)?;
-            let rp = try_predicate(right)?;
-            if lp.field != rp.field {
-                return None;
+        Condition::Or(items) => {
+            let mut iter = items.iter();
+            let mut acc = try_predicate(iter.next()?)?;
+            for item in iter {
+                let predicate = try_predicate(item)?;
+                if predicate.field != acc.field {
+                    return None;
+                }
+                acc.values.extend(predicate.values);
             }
-            let mut values = lp.values;
-            values.extend(rp.values);
             // Dedup so e.g. `f = a OR f IN (a, b)` doesn't fetch the same row twice.
-            values.sort();
-            values.dedup();
-            Some(Predicate {
-                field: lp.field,
-                values,
-                composite_fallback: false,
-                legacy_admitted: false,
-            })
+            acc.values.sort();
+            acc.values.dedup();
+            Some(acc)
         }
         _ => None,
     }
@@ -1036,10 +1034,10 @@ mod tests {
     fn test_collect_same_field_or_of_equals_flattens() {
         // `trace_id = b OR trace_id = a` → one Predicate, values sorted+deduped
         // (semantically `trace_id IN (a, b)`).
-        let c = cond(vec![Condition::Or(
-            Box::new(Condition::Equal("trace_id".into(), "b".into())),
-            Box::new(Condition::Equal("trace_id".into(), "a".into())),
-        )]);
+        let c = cond(vec![Condition::Or(vec![
+            Condition::Equal("trace_id".into(), "b".into()),
+            Condition::Equal("trace_id".into(), "a".into()),
+        ])]);
         let p = collect_decidable(
             &c,
             &fields(&["trace_id"]),
@@ -1055,14 +1053,10 @@ mod tests {
     #[test]
     fn test_collect_same_field_or_mixed_eq_and_in_flattens() {
         // `trace_id = a OR trace_id IN (b, c)` → one Predicate { values: [a, b, c] }
-        let c = cond(vec![Condition::Or(
-            Box::new(Condition::Equal("trace_id".into(), "a".into())),
-            Box::new(Condition::In(
-                "trace_id".into(),
-                vec!["b".into(), "c".into()],
-                false,
-            )),
-        )]);
+        let c = cond(vec![Condition::Or(vec![
+            Condition::Equal("trace_id".into(), "a".into()),
+            Condition::In("trace_id".into(), vec!["b".into(), "c".into()], false),
+        ])]);
         let p = collect_decidable(
             &c,
             &fields(&["trace_id"]),
@@ -1080,14 +1074,13 @@ mod tests {
     #[test]
     fn test_collect_nested_or_chain_flattens() {
         // (trace_id = 1 OR trace_id = 2) OR trace_id = 3 → one Predicate.
-        let inner = Condition::Or(
-            Box::new(Condition::Equal("trace_id".into(), "1".into())),
-            Box::new(Condition::Equal("trace_id".into(), "2".into())),
-        );
-        let outer = Condition::Or(
-            Box::new(inner),
-            Box::new(Condition::Equal("trace_id".into(), "3".into())),
-        );
+        // from_physical_expr flattens same-operator chains, but a nested Or
+        // built by hand must still fold the same way
+        let inner = Condition::Or(vec![
+            Condition::Equal("trace_id".into(), "1".into()),
+            Condition::Equal("trace_id".into(), "2".into()),
+        ]);
+        let outer = Condition::Or(vec![inner, Condition::Equal("trace_id".into(), "3".into())]);
         let p = collect_decidable(
             &cond(vec![outer]),
             &fields(&["trace_id"]),
@@ -1105,14 +1098,10 @@ mod tests {
     #[test]
     fn test_collect_or_dedups_values() {
         // `trace_id = a OR trace_id IN (a, b)` → values = [a, b], one row each.
-        let c = cond(vec![Condition::Or(
-            Box::new(Condition::Equal("trace_id".into(), "a".into())),
-            Box::new(Condition::In(
-                "trace_id".into(),
-                vec!["a".into(), "b".into()],
-                false,
-            )),
-        )]);
+        let c = cond(vec![Condition::Or(vec![
+            Condition::Equal("trace_id".into(), "a".into()),
+            Condition::In("trace_id".into(), vec!["a".into(), "b".into()], false),
+        ])]);
         let p = collect_decidable(
             &c,
             &fields(&["trace_id"]),
@@ -1128,10 +1117,10 @@ mod tests {
     fn test_collect_cross_field_or_skipped() {
         // `trace_id = a OR service = x` — joining across fields would weaken
         // the filter, so the whole Or is dropped.
-        let c = cond(vec![Condition::Or(
-            Box::new(Condition::Equal("trace_id".into(), "a".into())),
-            Box::new(Condition::Equal("service".into(), "x".into())),
-        )]);
+        let c = cond(vec![Condition::Or(vec![
+            Condition::Equal("trace_id".into(), "a".into()),
+            Condition::Equal("service".into(), "x".into()),
+        ])]);
         assert!(
             collect_decidable(
                 &c,
@@ -1147,10 +1136,10 @@ mod tests {
     #[test]
     fn test_collect_or_with_negated_in_skipped() {
         // Any leaf we can't fold (here a negated In) collapses the whole Or.
-        let c = cond(vec![Condition::Or(
-            Box::new(Condition::Equal("trace_id".into(), "a".into())),
-            Box::new(Condition::In("trace_id".into(), vec!["b".into()], true)),
-        )]);
+        let c = cond(vec![Condition::Or(vec![
+            Condition::Equal("trace_id".into(), "a".into()),
+            Condition::In("trace_id".into(), vec!["b".into()], true),
+        ])]);
         assert!(
             collect_decidable(
                 &c,
@@ -1168,10 +1157,10 @@ mod tests {
         // Both branches positive Eq on the same name: the Or folds to one
         // predicate whatever the field (B3), composite fallback off outside
         // the scope.
-        let c = cond(vec![Condition::Or(
-            Box::new(Condition::Equal("body".into(), "a".into())),
-            Box::new(Condition::Equal("body".into(), "b".into())),
-        )]);
+        let c = cond(vec![Condition::Or(vec![
+            Condition::Equal("body".into(), "a".into()),
+            Condition::Equal("body".into(), "b".into()),
+        ])]);
         let p = collect_decidable(
             &c,
             &fields(&["trace_id"]),
@@ -1190,10 +1179,10 @@ mod tests {
         // Top-level AND of (same-field Or) + (Equal on a different bloom field):
         // both produce a Predicate; pruner ANDs them.
         let c = cond(vec![
-            Condition::Or(
-                Box::new(Condition::Equal("trace_id".into(), "a".into())),
-                Box::new(Condition::Equal("trace_id".into(), "b".into())),
-            ),
+            Condition::Or(vec![
+                Condition::Equal("trace_id".into(), "a".into()),
+                Condition::Equal("trace_id".into(), "b".into()),
+            ]),
             Condition::Equal("user_id".into(), "u-1".into()),
         ]);
         let p = collect_decidable(
@@ -1427,24 +1416,20 @@ mod tests {
     #[test]
     fn applicability_preflight_matches_recursive_or_and_in_rejections() {
         let broad = VixBloomCompositeScope::All;
-        let nested_same_field = cond(vec![Condition::Or(
-            Box::new(Condition::Equal("trace_id".into(), "a".into())),
-            Box::new(Condition::Or(
-                Box::new(Condition::In(
-                    "trace_id".into(),
-                    vec!["b".into(), "c".into()],
-                    false,
-                )),
-                Box::new(Condition::Equal("trace_id".into(), "d".into())),
-            )),
-        )]);
-        let nested_mixed_fields = cond(vec![Condition::Or(
-            Box::new(Condition::Equal("trace_id".into(), "a".into())),
-            Box::new(Condition::Or(
-                Box::new(Condition::Equal("trace_id".into(), "b".into())),
-                Box::new(Condition::Equal("span_id".into(), "c".into())),
-            )),
-        )]);
+        let nested_same_field = cond(vec![Condition::Or(vec![
+            Condition::Equal("trace_id".into(), "a".into()),
+            Condition::Or(vec![
+                Condition::In("trace_id".into(), vec!["b".into(), "c".into()], false),
+                Condition::Equal("trace_id".into(), "d".into()),
+            ]),
+        ])]);
+        let nested_mixed_fields = cond(vec![Condition::Or(vec![
+            Condition::Equal("trace_id".into(), "a".into()),
+            Condition::Or(vec![
+                Condition::Equal("trace_id".into(), "b".into()),
+                Condition::Equal("span_id".into(), "c".into()),
+            ]),
+        ])]);
         let empty_in = cond(vec![Condition::In("trace_id".into(), vec![], false)]);
         let negated_in = cond(vec![Condition::In(
             "trace_id".into(),
@@ -2606,5 +2591,75 @@ mod tests {
             "probe cache holds the opened sidecars, len {}",
             file_probe::probe_cache_len()
         );
+    }
+
+    /// Regression for the deep-chain stack-overflow class (#14469): a
+    /// 5,000-term `x = v_i OR …` chain — the shape UI-generated filters and
+    /// DataFusion's small-IN expansion produce — must flatten, round-trip
+    /// through the physical expr, and fold into ONE bloom predicate without
+    /// recursing a frame per term. Runs on a 256 KiB stack so the
+    /// pre-n-ary binary tree would overflow here.
+    #[test]
+    fn deep_or_chain_flattens_and_folds_without_recursion() {
+        use std::sync::Arc;
+
+        use datafusion::{
+            arrow::datatypes::DataType,
+            logical_expr::Operator,
+            physical_expr::expressions::{BinaryExpr, Column, Literal},
+            physical_plan::PhysicalExpr,
+            scalar::ScalarValue,
+        };
+        type HashMap = hashbrown::HashMap<String, DataType>;
+
+        let leaf = |i: usize| -> Arc<dyn PhysicalExpr> {
+            Arc::new(BinaryExpr::new(
+                Arc::new(Column::new("trace_id", 0)),
+                Operator::Eq,
+                Arc::new(Literal::new(ScalarValue::Utf8(Some(format!("v{i}"))))),
+            ))
+        };
+        // left-deep, exactly as DataFusion emits it
+        let expr = (1..5_000).fold(leaf(0), |acc, i| {
+            Arc::new(BinaryExpr::new(acc, Operator::Or, leaf(i))) as Arc<dyn PhysicalExpr>
+        });
+
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                let index_fields: HashMap = HashMap::new();
+                let condition = Condition::from_physical_expr(&expr, &index_fields);
+                // the left-deep INPUT tree drops one Arc frame per level —
+                // 5,000 frames would overflow this small stack on its own;
+                // leaking it keeps the test about OUR recursion only
+                std::mem::forget(expr);
+                let Condition::Or(items) = &condition else {
+                    panic!("expected a flattened Or, got {condition:?}");
+                };
+                assert_eq!(items.len(), 5_000);
+                assert_eq!(items[0], Condition::Equal("trace_id".into(), "v0".into()));
+                assert_eq!(
+                    items[4_999],
+                    Condition::Equal("trace_id".into(), "v4999".into())
+                );
+
+                // bloom predicate extraction folds ALL children into one
+                // same-field predicate
+                let predicate = try_predicate(&condition).expect("same-field Or must fold");
+                assert_eq!(predicate.field, "trace_id");
+                assert_eq!(predicate.values.len(), 5_000);
+                // values are sorted lexicographically ("v0" first, "v999"
+                // last), so check membership instead of end positions
+                assert!(predicate.values.contains(&"v0".to_string()));
+                assert!(predicate.values.contains(&"v4999".to_string()));
+                assert_eq!(
+                    decidable_field(&condition),
+                    Some("trace_id"),
+                    "decidable_field must iterate the children too"
+                );
+            })
+            .expect("spawn small-stack thread")
+            .join()
+            .expect("deep OR chain must not overflow the stack");
     }
 }

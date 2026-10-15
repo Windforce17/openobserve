@@ -157,7 +157,7 @@ fn flat_only_strategy() -> Arc<dyn LayoutStrategy> {
 /// `with_tokio()` (CurrentTokioRuntime — resolves to the static runtime at
 /// every spawn), the ASYNC `Writer` driven by `push().await`/`finish().await`.
 /// This is the prod compactor's FileFormat::Vortex merge write path
-/// (trace_list_index & friends).
+/// (metadata-class streams & friends).
 fn write_one_file_async_static(
     schema: &Arc<Schema>,
     static_rt: &'static tokio::runtime::Runtime,

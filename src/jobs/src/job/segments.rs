@@ -2565,8 +2565,10 @@ async fn build_one_file(
     } else {
         // non-core formats (metadata, index streams, metrics under the #40
         // default) keep the DataFusion merge — planned SINGLE-PARTITION
-        // (M13): at prod volume default/metadata/trace_list_index buckets
-        // are NOT thin, and the 2-partition `ORDER BY ... DESC` plan was the
+        // (M13): at prod volume the former default/metadata/trace_list_index
+        // buckets (writer removed 2026-10-15, upstream #13809;
+        // distinct_values_* is the remaining Metadata-class stream) were
+        // NOT thin, and the 2-partition `ORDER BY ... DESC` plan was the
         // fleet's last remaining "Not enough memory to continue external
         // sort" source post-.108. One bounded in-memory bucket needs no
         // parallel sort, and a single ExternalSorter spills properly (the

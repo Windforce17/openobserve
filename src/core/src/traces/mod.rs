@@ -73,10 +73,7 @@ use crate::{
             grpc::get_val, write_file,
         },
         logs::{O2IngestJsonData, bulk::TS_PARSE_FAILED},
-        metadata::{
-            MetadataItem, MetadataType, distinct_values::DvItem, trace_list_index::TraceListItem,
-            write,
-        },
+        metadata::{MetadataItem, MetadataType, distinct_values::DvItem, write},
         schema::{
             CanonicalizationSummary, canonicalize_record_into, check_for_schema,
             get_future_discard_error, get_upto_discard_error, stream_schema_exists,
@@ -1543,7 +1540,6 @@ async fn write_traces(
 
     let mut data_buf: HashMap<String, SchemaRecords> = HashMap::new();
     let mut distinct_values = Vec::with_capacity(16);
-    let mut trace_index_values = Vec::with_capacity(json_data.len());
     let mut canonical_summary = CanonicalizationSummary::default();
 
     // Start write data
@@ -1558,8 +1554,10 @@ async fn write_traces(
         }
         // `trace_id` is user-supplied on the json ingest path and a pipeline
         // can re-type it: a non-string form rejects that span alone, it never
-        // unwinds the request.
-        let trace_id = match record_trace_id(&record_val) {
+        // unwinds the request. Validation only — the value itself has no
+        // further consumer since the trace_list_index writer was removed
+        // (upstream #13809; nothing read that stream back).
+        let _trace_id = match record_trace_id(&record_val) {
             Ok(trace_id) => trace_id,
             Err(reason) => {
                 log::warn!("[TRACES] {org_id}/{stream_name}: span rejected: {reason}");
@@ -1576,11 +1574,6 @@ async fn write_traces(
             }
         };
 
-        // get service_name
-        let service_name = record_val
-            .get("service_name")
-            .map(json::get_string_value)
-            .unwrap_or_default();
         // get distinct_value item
         if stream_settings.enable_distinct_fields {
             let mut map = Map::new();
@@ -1602,14 +1595,6 @@ async fn write_traces(
                 }));
             }
         }
-
-        // build trace metadata
-        trace_index_values.push(MetadataItem::TraceListIndexer(TraceListItem {
-            _timestamp: timestamp,
-            stream_name: stream_name.to_string(),
-            service_name: service_name.to_string(),
-            trace_id,
-        }));
 
         // Start check for alert trigger
         if let Some(alerts) = cur_stream_alerts
@@ -1708,14 +1693,6 @@ async fn write_traces(
         && let Err(e) = write(org_id, MetadataType::DistinctValues, distinct_values).await
     {
         log::error!("Error while writing distinct values: {e}");
-    }
-
-    // send trace metadata
-    if cfg.common.traces_list_index_enabled
-        && !trace_index_values.is_empty()
-        && let Err(e) = write(org_id, MetadataType::TraceListIndexer, trace_index_values).await
-    {
-        log::error!("Error while writing trace_index values: {e}");
     }
 
     // only one trigger per request

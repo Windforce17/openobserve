@@ -431,9 +431,7 @@ fn residual_supported_shape(condition: &Condition) -> bool {
         | Condition::FuzzyMatchAll(..)
         | Condition::All() => true,
         Condition::NumericCmp(..) | Condition::Regex(..) => false,
-        Condition::Or(left, right) | Condition::And(left, right) => {
-            residual_supported_shape(left) && residual_supported_shape(right)
-        }
+        Condition::Or(items) | Condition::And(items) => items.iter().all(residual_supported_shape),
         Condition::Not(inner) => residual_supported_shape(inner),
     }
 }

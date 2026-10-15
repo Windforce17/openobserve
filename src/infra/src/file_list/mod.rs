@@ -86,7 +86,7 @@ pub trait FileList: Sync + Send + 'static {
     async fn update_dump_records(
         &self,
         dump_file: &FileKey,
-        expected: &[(i64, i64, i64)],
+        expected: &[(i64, i64, i64, String)],
     ) -> Result<()>;
     async fn batch_process(&self, files: &[FileKey]) -> Result<()>;
     async fn batch_add_deleted(
@@ -390,9 +390,13 @@ pub async fn batch_process(files: &[FileKey]) -> Result<()> {
 }
 
 #[inline]
-pub async fn update_dump_records(dump_file: &FileKey, expected: &[(i64, i64, i64)]) -> Result<()> {
+pub async fn update_dump_records(
+    dump_file: &FileKey,
+    expected: &[(i64, i64, i64, String)],
+) -> Result<()> {
     CLIENT.update_dump_records(dump_file, expected).await
 }
+
 pub async fn batch_add_deleted(
     org_id: &str,
     created_at: i64,

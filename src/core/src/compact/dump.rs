@@ -401,9 +401,11 @@ pub async fn dump(job: &DumpJob) -> Result<(), anyhow::Error> {
     }
 
     // Snapshot identity used to fence deletion after the dump object upload.
+    // The date travels with each row so the DB layer can partition-prune its
+    // delete statements.
     let expected = files
         .iter()
-        .map(|r| (r.id, r.index_generation, r.index_size))
+        .map(|r| (r.id, r.index_generation, r.index_size, r.date.clone()))
         .collect::<Vec<_>>();
     let dump_file = match generate_dump(
         &job.org_id,

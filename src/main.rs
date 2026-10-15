@@ -33,7 +33,7 @@ use config::{
     meta::triggers::{Trigger, TriggerModule, TriggerStatus},
     utils::size::bytes_to_human_readable,
 };
-use infra::runtime::{create_grpc_runtime, create_job_runtime};
+use infra::runtime::{create_grpc_runtime, create_job_runtime, create_main_runtime};
 use openobserve::{
     cli::basic::cli,
     common::{infra::cluster, meta},
@@ -153,11 +153,13 @@ use tracing_subscriber::{
 #[unsafe(export_name = "malloc_conf")]
 pub static malloc_conf: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:16\0";
 
-#[tokio::main]
-async fn main() -> Result<(), anyhow::Error> {
+fn main() -> Result<(), anyhow::Error> {
+    create_main_runtime()?.block_on(run())
+}
+
+async fn run() -> Result<(), anyhow::Error> {
     // M27: activate the sampling heap profiler if (and only if)
     // ZO_HEAP_PROFILE_SAMPLE_EVERY_MB is set; no-op otherwise.
-    config::heap_profile::init();
 
     // CLI provides the path to the config file (if any)
     // In case a custom path is provided, the file will be read first

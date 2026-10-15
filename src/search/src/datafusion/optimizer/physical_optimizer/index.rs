@@ -942,19 +942,19 @@ mod tests {
             (
                 and(eq(column("name"), literal("bar")), match_all("error")),
                 true,
-                Some(Condition::And(
-                    Box::new(Condition::Equal("name".to_string(), "bar".to_string())),
-                    Box::new(Condition::MatchAll("error".to_string())),
-                )),
+                Some(Condition::And(vec![
+                    Condition::Equal("name".to_string(), "bar".to_string()),
+                    Condition::MatchAll("error".to_string()),
+                ])),
             ),
             // name = 'bar' or match_all('error')
             (
                 or(eq(column("name"), literal("bar")), match_all("error")),
                 true,
-                Some(Condition::Or(
-                    Box::new(Condition::Equal("name".to_string(), "bar".to_string())),
-                    Box::new(Condition::MatchAll("error".to_string())),
-                )),
+                Some(Condition::Or(vec![
+                    Condition::Equal("name".to_string(), "bar".to_string()),
+                    Condition::MatchAll("error".to_string()),
+                ])),
             ),
             // not(name = 'bar') and match_all('error') and str_match('name', 'test')
             (
@@ -963,20 +963,14 @@ mod tests {
                     and(match_all("error"), str_match("name", "test")),
                 ),
                 true,
-                Some(Condition::And(
-                    Box::new(Condition::Not(Box::new(Condition::Equal(
+                Some(Condition::And(vec![
+                    Condition::Not(Box::new(Condition::Equal(
                         "name".to_string(),
                         "bar".to_string(),
-                    )))),
-                    Box::new(Condition::And(
-                        Box::new(Condition::MatchAll("error".to_string())),
-                        Box::new(Condition::StrMatch(
-                            "name".to_string(),
-                            "test".to_string(),
-                            true,
-                        )),
-                    )),
-                )),
+                    ))),
+                    Condition::MatchAll("error".to_string()),
+                    Condition::StrMatch("name".to_string(), "test".to_string(), true),
+                ])),
             ),
             // name != 'bar' and match_all('error') and str_match('name', 'test')
             (
@@ -985,30 +979,24 @@ mod tests {
                     and(match_all("error"), str_match("name", "test")),
                 ),
                 true,
-                Some(Condition::And(
-                    Box::new(Condition::NotEqual("name".to_string(), "bar".to_string())),
-                    Box::new(Condition::And(
-                        Box::new(Condition::MatchAll("error".to_string())),
-                        Box::new(Condition::StrMatch(
-                            "name".to_string(),
-                            "test".to_string(),
-                            true,
-                        )),
-                    )),
-                )),
+                Some(Condition::And(vec![
+                    Condition::NotEqual("name".to_string(), "bar".to_string()),
+                    Condition::MatchAll("error".to_string()),
+                    Condition::StrMatch("name".to_string(), "test".to_string(), true),
+                ])),
             ),
             // name in ('bar', 'test') and match_all('error')
             (
                 and(in_list("name", vec!["bar", "test"]), match_all("error")),
                 true,
-                Some(Condition::And(
-                    Box::new(Condition::In(
+                Some(Condition::And(vec![
+                    Condition::In(
                         "name".to_string(),
                         vec!["bar".to_string(), "test".to_string()],
                         false,
-                    )),
-                    Box::new(Condition::MatchAll("error".to_string())),
-                )),
+                    ),
+                    Condition::MatchAll("error".to_string()),
+                ])),
             ),
             // match_all('c') should be invalid because tokens are empty
             (match_all("c"), false, None),
@@ -1035,10 +1023,10 @@ mod tests {
                     match_all("error"),
                 ),
                 true,
-                Some(Condition::And(
-                    Box::new(Condition::IsNotNull("name".to_string())),
-                    Box::new(Condition::MatchAll("error".to_string())),
-                )),
+                Some(Condition::And(vec![
+                    Condition::IsNotNull("name".to_string()),
+                    Condition::MatchAll("error".to_string()),
+                ])),
             ),
             // IS NOT NULL on a non-index field stays in the filter
             (
@@ -1241,13 +1229,10 @@ mod tests {
                 "SELECT count(*) from t where (name = 'openobserve' or match_all('error')) and _timestamp > 1715395200000",
                 true,
                 Some(IndexCondition {
-                    conditions: vec![Condition::Or(
-                        Box::new(Condition::Equal(
-                            "name".to_string(),
-                            "openobserve".to_string(),
-                        )),
-                        Box::new(Condition::MatchAll("error".to_string())),
-                    )],
+                    conditions: vec![Condition::Or(vec![
+                        Condition::Equal("name".to_string(), "openobserve".to_string()),
+                        Condition::MatchAll("error".to_string()),
+                    ])],
                 }),
             ),
             (
@@ -1349,20 +1334,20 @@ mod tests {
             (
                 "SELECT count(*) from t where code in (38, 40)",
                 Some(IndexCondition {
-                    conditions: vec![Condition::Or(
-                        Box::new(Condition::NumericCmp(
+                    conditions: vec![Condition::Or(vec![
+                        Condition::NumericCmp(
                             "code".to_string(),
                             vec!["38".to_string()],
                             false,
                             NumericKind::Int,
-                        )),
-                        Box::new(Condition::NumericCmp(
+                        ),
+                        Condition::NumericCmp(
                             "code".to_string(),
                             vec!["40".to_string()],
                             false,
                             NumericKind::Int,
-                        )),
-                    )],
+                        ),
+                    ])],
                 }),
             ),
             // DataFusion simplifies `ok = true` to the BARE column and
@@ -1458,13 +1443,10 @@ mod tests {
                 "SELECT count(*) from t where (name = 'openobserve' or match_all('error')) and _timestamp > 1715395200000",
                 true,
                 Some(IndexCondition {
-                    conditions: vec![Condition::Or(
-                        Box::new(Condition::Equal(
-                            "name".to_string(),
-                            "openobserve".to_string(),
-                        )),
-                        Box::new(Condition::MatchAll("error".to_string())),
-                    )],
+                    conditions: vec![Condition::Or(vec![
+                        Condition::Equal("name".to_string(), "openobserve".to_string()),
+                        Condition::MatchAll("error".to_string()),
+                    ])],
                 }),
             ),
             (

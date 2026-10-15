@@ -39,7 +39,9 @@
 //!       ~12.87GB = mem_total/file_merge_thread_num DataFusion pool-cap
 //!       peaks on 128-file default/metadata/trace_list_index merges, one
 //!       pool per merge, stacking across workers): seed hour-jobs of the
-//!       METADATA stream `trace_list_index` as real PARQUET files with the
+//!       METADATA stream `trace_list_index` (its writer was removed
+//!       2026-10-15, upstream #13809 — the schema remains here as the
+//!       memory-shape fixture) as real PARQUET files with the
 //!       prod schema (_timestamp, stream_name, service_name, trace_id).
 //!       These route through merge_files' parquet arm -> TableBuilder ->
 //!       DATAFUSION_RUNTIME merge_parquet_files(single_partition_sort=true,
@@ -539,8 +541,10 @@ async fn cmd_seed(
 }
 
 /// Seed hour-jobs of the METADATA stream `trace_list_index` (the prod killer
-/// shape) as real parquet files. Each file carries `rows_per_file` rows of
-/// the prod schema with interleaved timestamps across the job's files (the
+/// shape; the writer is gone since 2026-10-15, upstream #13809 — the schema
+/// is kept as the memory-shape fixture) as real parquet files. Each file
+/// carries `rows_per_file` rows of the prod schema with interleaved
+/// timestamps across the job's files (the
 /// k-way DESC sort has to actually merge). Every file is distinct bytes.
 async fn cmd_seed_tli(
     hours: usize,
@@ -553,8 +557,9 @@ async fn cmd_seed_tli(
     init_meta().await?;
 
     let stream = "trace_list_index";
-    // the actual default/metadata/trace_list_index schema
-    // (core::metadata::trace_list_index::TraceListIndex; M20b pin)
+    // the former default/metadata/trace_list_index schema (writer removed
+    // 2026-10-15, upstream #13809; kept as the FAT M20b fixture — it
+    // exercises the metadata merge arm, not the stream itself)
     let schema = Arc::new(Schema::new(vec![
         Field::new(TIMESTAMP_COL, DataType::Int64, false),
         Field::new("stream_name", DataType::Utf8, false),

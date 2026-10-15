@@ -375,7 +375,7 @@ pub async fn update_compressed_size(key: &str, size: i64) -> Result<()> {
 mod tests {
     use config::meta::{
         search::ScanStats,
-        stream::{FileKey, FileListDeleted, FileMeta},
+        stream::{FileKey, FileMeta},
     };
 
     use super::*;

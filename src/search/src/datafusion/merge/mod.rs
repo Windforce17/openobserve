@@ -60,11 +60,11 @@ pub enum MergeParquetResult {
 /// under pool pressure. Callers with BOUNDED inputs pass `true`:
 /// - SEGMENT-BUILDER invocations (M13): one bounded in-memory batch (≤ the super-batch budget),
 ///   where the repartitioned 2-partition sort was prod's post-.108 "Not enough memory to continue
-///   external sort" source (default/metadata/trace_list_index L0 builds; the M12 fix-1 rationale
-///   applies verbatim).
+///   external sort" source (the former default/metadata/trace_list_index L0 builds — writer removed
+///   2026-10-15, upstream #13809; the M12 fix-1 rationale applies verbatim).
 /// - COMPACTOR invocations for METADATA-class streams (M20b): size-capped merge groups whose
 ///   repartitioned min-floor plan was prod's compactor killer (116MB→6GB DataFusion spikes in ~2s
-///   on trace_list_index).
+///   on the former trace_list_index; distinct_values_* is the remaining Metadata-class stream).
 ///
 /// The ingester WAL move job and non-metadata compactor merges keep `false`
 /// (unchanged planning).
@@ -365,8 +365,10 @@ mod tests {
     /// `datafusion_min_partition_num` floor (default 2) and plans the merge
     /// `ORDER BY` as ONE SortExec over one partition with NO RepartitionExec
     /// — the structural fix for the segment builder's (M13) and the
-    /// compactor's metadata-class (M20b) default/metadata/trace_list_index
-    /// pool starvations. The default context keeps the floor
+    /// compactor's metadata-class (M20b) pool starvations (the prod
+    /// default/metadata/trace_list_index instances date from before
+    /// its writer was removed 2026-10-15, upstream #13809). The
+    /// default context keeps the floor
     /// (target_partitions >= 2), pinning that `false` callers — the ingester
     /// WAL move and non-metadata compactor merges — are untouched.
     #[tokio::test]
@@ -599,8 +601,8 @@ mod tests {
         unsafe { std::env::set_var("ZO_MEMORY_CACHE_DATAFUSION_MAX_SIZE", "1") };
         config::refresh_config().unwrap();
 
-        // the actual default/metadata/trace_list_index schema
-        // (core::metadata::trace_list_index::TraceListIndex)
+        // the former default/metadata/trace_list_index schema (writer
+        // removed 2026-10-15, upstream #13809; kept as the FAT corpus)
         let schema = Arc::new(Schema::new(vec![
             Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
             Field::new("stream_name", DataType::Utf8, false),

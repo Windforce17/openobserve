@@ -545,16 +545,27 @@ pub async fn run() -> Result<(), anyhow::Error> {
         });
     }
 
+    // Generation stays hourly (day-granularity retention scan); execution of
+    // pending markers moves to the compact interval — a deleted stream
+    // blocks re-creation until its marker is consumed, so the short cycle
+    // takes that window from up to an hour down to seconds.
     spawn_pausable_job!(
-        "run_retention",
+        "run_generate_retention_job",
         get_config().compact.data_retention_interval + 3,
         {
-            log::debug!("[COMPACTOR::JOB] Running data retention");
-            if let Err(e) = compact::run_retention().await {
-                log::error!("[COMPACTOR::JOB] run data retention error: {e}");
+            log::debug!("[COMPACTOR::JOB] Running generate retention job");
+            if let Err(e) = compact::run_generate_retention_job().await {
+                log::error!("[COMPACTOR::JOB] run generate retention job error: {e}");
             }
         }
     );
+
+    spawn_pausable_job!("run_retention", get_config().compact.interval + 3, {
+        log::debug!("[COMPACTOR::JOB] Running data retention");
+        if let Err(e) = compact::run_retention().await {
+            log::error!("[COMPACTOR::JOB] run data retention error: {e}");
+        }
+    });
 
     spawn_pausable_job!("run_delay_deletion", get_config().compact.interval + 4, {
         log::debug!("[COMPACTOR::JOB] Running data delay deletion");

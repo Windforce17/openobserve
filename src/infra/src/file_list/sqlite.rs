@@ -112,47 +112,63 @@ impl super::FileList for SqliteFileList {
         let client = client.lock().await;
         let mut tx = client.begin().await?;
         let mut retired = Vec::with_capacity(expected.len());
+        // Keep the SQL shape aligned with the Postgres backend: the arms are
+        // grouped under one `date = ?` prefix per (date, ≤300 rows). sqlite is
+        // not partitioned, but a shared prefix still lets its index on
+        // (date, …) serve the whole OR chain without a full scan.
         for chunk in expected.chunks(300) {
-            let mut query = QueryBuilder::<Sqlite>::new("DELETE FROM file_list WHERE ");
-            let mut clauses = query.separated(" OR ");
+            let mut by_date: HashMap<String, Vec<&FileKey>> = HashMap::new();
             for file in chunk {
-                if file.id > 0 {
-                    clauses
-                        .push("(id = ")
-                        .push_bind_unseparated(file.id)
-                        .push_unseparated(" AND index_generation = ")
-                        .push_bind_unseparated(file.meta.index_generation)
-                        .push_unseparated(" AND index_size = ")
-                        .push_bind_unseparated(file.meta.index_size)
-                        .push_unseparated(")");
-                } else {
-                    let (stream_key, date_key, file_name) = parse_file_key_columns(&file.key)
-                        .map_err(|e| Error::Message(e.to_string()))?;
-                    clauses
-                        .push("(stream = ")
-                        .push_bind_unseparated(stream_key)
-                        .push_unseparated(" AND date = ")
-                        .push_bind_unseparated(date_key)
-                        .push_unseparated(" AND file = ")
-                        .push_bind_unseparated(file_name)
-                        .push_unseparated(" AND index_generation = ")
-                        .push_bind_unseparated(file.meta.index_generation)
-                        .push_unseparated(" AND index_size = ")
-                        .push_bind_unseparated(file.meta.index_size)
-                        .push_unseparated(")");
-                }
+                let (_, date_key, _) =
+                    parse_file_key_columns(&file.key).map_err(|e| Error::Message(e.to_string()))?;
+                by_date.entry(date_key).or_default().push(file);
             }
-            clauses.push_unseparated(
-                " RETURNING id, account, org, stream, date, file, deleted, min_ts, max_ts, \
-                 records, original_size, compressed_size, index_size, index_generation, \
-                 bloom_ver, flattened, updated_at",
-            );
-            retired.extend(
-                query
-                    .build_query_as::<super::FileRecord>()
-                    .fetch_all(&mut *tx)
-                    .await?,
-            );
+            for (date_key, files) in &by_date {
+                let mut query = QueryBuilder::<Sqlite>::new("DELETE FROM file_list WHERE date = ");
+                query.push_bind(date_key);
+                query.push(" AND (");
+                let mut clauses = query.separated(" OR ");
+                for file in files {
+                    if file.id > 0 {
+                        clauses
+                            .push("(id = ")
+                            .push_bind_unseparated(file.id)
+                            .push_unseparated(" AND index_generation = ")
+                            .push_bind_unseparated(file.meta.index_generation)
+                            .push_unseparated(" AND index_size = ")
+                            .push_bind_unseparated(file.meta.index_size)
+                            .push_unseparated(")");
+                    } else {
+                        let (stream_key, date_key, file_name) =
+                            parse_file_key_columns(&file.key)
+                                .map_err(|e| Error::Message(e.to_string()))?;
+                        clauses
+                            .push("(stream = ")
+                            .push_bind_unseparated(stream_key)
+                            .push_unseparated(" AND date = ")
+                            .push_bind_unseparated(date_key)
+                            .push_unseparated(" AND file = ")
+                            .push_bind_unseparated(file_name)
+                            .push_unseparated(" AND index_generation = ")
+                            .push_bind_unseparated(file.meta.index_generation)
+                            .push_unseparated(" AND index_size = ")
+                            .push_bind_unseparated(file.meta.index_size)
+                            .push_unseparated(")");
+                    }
+                }
+                clauses.push_unseparated(")");
+                query.push(
+                    " RETURNING id, account, org, stream, date, file, deleted, min_ts, max_ts, \
+                     records, original_size, compressed_size, index_size, index_generation, \
+                     bloom_ver, flattened, updated_at",
+                );
+                retired.extend(
+                    query
+                        .build_query_as::<super::FileRecord>()
+                        .fetch_all(&mut *tx)
+                        .await?,
+                );
+            }
         }
         if retired.len() != expected.len() {
             tx.rollback().await?;
@@ -213,7 +229,7 @@ impl super::FileList for SqliteFileList {
     async fn update_dump_records(
         &self,
         file: &FileKey,
-        expected: &[(i64, i64, i64)],
+        expected: &[(i64, i64, i64, String)],
     ) -> Result<()> {
         let client = CLIENT_RW.clone();
         let client = client.lock().await;
@@ -224,21 +240,38 @@ impl super::FileList for SqliteFileList {
         let now_ts = now_micros();
         let mut tx = client.begin().await?;
 
+        // Same date-grouped shape as the Postgres backend: keep the
+        // statements aligned across backends even though sqlite has no
+        // partitions to prune.
+        let mut by_date: HashMap<&str, Vec<(i64, i64, i64)>> = HashMap::new();
+        for (id, index_generation, index_size, date) in expected {
+            by_date
+                .entry(date.as_str())
+                .or_default()
+                .push((*id, *index_generation, *index_size));
+        }
+
         let mut matched = 0;
-        for chunk in expected.chunks(300) {
-            let mut query = QueryBuilder::<Sqlite>::new("SELECT id FROM file_list WHERE ");
-            let mut clauses = query.separated(" OR ");
-            for (id, index_generation, index_size) in chunk {
-                clauses
-                    .push("(id = ")
-                    .push_bind_unseparated(*id)
-                    .push_unseparated(" AND index_generation = ")
-                    .push_bind_unseparated(*index_generation)
-                    .push_unseparated(" AND index_size = ")
-                    .push_bind_unseparated(*index_size)
-                    .push_unseparated(")");
+        for (date_key, rows) in &by_date {
+            for chunk in rows.chunks(300) {
+                let mut query =
+                    QueryBuilder::<Sqlite>::new("SELECT id FROM file_list WHERE date = ");
+                query.push_bind(date_key);
+                query.push(" AND (");
+                let mut clauses = query.separated(" OR ");
+                for (id, index_generation, index_size) in chunk {
+                    clauses
+                        .push("(id = ")
+                        .push_bind_unseparated(*id)
+                        .push_unseparated(" AND index_generation = ")
+                        .push_bind_unseparated(*index_generation)
+                        .push_unseparated(" AND index_size = ")
+                        .push_bind_unseparated(*index_size)
+                        .push_unseparated(")");
+                }
+                clauses.push_unseparated(")");
+                matched += query.build().fetch_all(&mut *tx).await?.len();
             }
-            matched += query.build().fetch_all(&mut *tx).await?.len();
         }
         if matched != expected.len() {
             tx.rollback().await?;
@@ -272,26 +305,31 @@ impl super::FileList for SqliteFileList {
         .execute(&mut *tx)
         .await?;
 
-        for chunk in expected.chunks(300) {
-            let mut query = QueryBuilder::<Sqlite>::new("DELETE FROM file_list WHERE ");
-            let mut clauses = query.separated(" OR ");
-            for (id, index_generation, index_size) in chunk {
-                clauses
-                    .push("(id = ")
-                    .push_bind_unseparated(*id)
-                    .push_unseparated(" AND index_generation = ")
-                    .push_bind_unseparated(*index_generation)
-                    .push_unseparated(" AND index_size = ")
-                    .push_bind_unseparated(*index_size)
-                    .push_unseparated(")");
-            }
-            let deleted = query.build().execute(&mut *tx).await?.rows_affected() as usize;
-            if deleted != chunk.len() {
-                tx.rollback().await?;
-                return Err(Error::FileGenerationConflict(format!(
-                    "dump delete expected {} source rows but matched {deleted}",
-                    chunk.len()
-                )));
+        for (date_key, rows) in &by_date {
+            for chunk in rows.chunks(300) {
+                let mut query = QueryBuilder::<Sqlite>::new("DELETE FROM file_list WHERE date = ");
+                query.push_bind(date_key);
+                query.push(" AND (");
+                let mut clauses = query.separated(" OR ");
+                for (id, index_generation, index_size) in chunk {
+                    clauses
+                        .push("(id = ")
+                        .push_bind_unseparated(*id)
+                        .push_unseparated(" AND index_generation = ")
+                        .push_bind_unseparated(*index_generation)
+                        .push_unseparated(" AND index_size = ")
+                        .push_bind_unseparated(*index_size)
+                        .push_unseparated(")");
+                }
+                clauses.push_unseparated(")");
+                let deleted = query.build().execute(&mut *tx).await?.rows_affected() as usize;
+                if deleted != chunk.len() {
+                    tx.rollback().await?;
+                    return Err(Error::FileGenerationConflict(format!(
+                        "dump delete expected {} source rows but matched {deleted}",
+                        chunk.len()
+                    )));
+                }
             }
         }
         tx.commit().await?;
@@ -4582,9 +4620,12 @@ WHERE file_list_jobs.status = $5;"#;
             &format!("files/{org}/filelist/dump/2026/09/04/00/dump.parquet"),
             false,
         );
-        list.update_dump_records(&dump, &[(file.id, drop_generation, 0)])
-            .await
-            .unwrap();
+        list.update_dump_records(
+            &dump,
+            &[(file.id, drop_generation, 0, "2026/09/04/00".to_string())],
+        )
+        .await
+        .unwrap();
         let mut retired = list.query_deleted(&org, 2, 100).await.unwrap();
         retired.sort_by(|a, b| a.file.cmp(&b.file));
         let mut expected = vec![
@@ -4832,11 +4873,17 @@ WHERE file_list_jobs.status = $5;"#;
             false,
         );
         let stale_expected = [
-            (first.id, first.meta.index_generation, first.meta.index_size),
+            (
+                first.id,
+                first.meta.index_generation,
+                first.meta.index_size,
+                "2026/09/04/00".to_string(),
+            ),
             (
                 second.id,
                 second.meta.index_generation,
                 second.meta.index_size,
+                "2026/09/04/00".to_string(),
             ),
         ];
         let err = list
@@ -4914,5 +4961,74 @@ WHERE file_list_jobs.status = $5;"#;
             .execute(&*client)
             .await
             .unwrap();
+    }
+
+    /// One `retire_files` call may now span many hours/dates (the retention
+    /// pass batches by count, not by hour): all rows across every date group
+    /// must disappear together, and the generation fence must still reject
+    /// a stale snapshot whole-transaction.
+    #[tokio::test]
+    async fn test_retire_files_spans_dates_and_fences_stale_generation() {
+        let _guard = jobs_setup().await;
+        let list = SqliteFileList::new();
+        let nonce = now_micros();
+        let mut day1 = create_test_file_key(
+            "default",
+            &format!("files/retire-span-tests/logs/source/2026/09/04/00/{nonce}-a.vix"),
+            false,
+        );
+        let mut day2 = create_test_file_key(
+            "default",
+            &format!("files/retire-span-tests/logs/source/2026/09/05/00/{nonce}-b.vix"),
+            false,
+        );
+        day1.id = list
+            .add(&day1.account, &day1.key, &day1.meta)
+            .await
+            .unwrap();
+        day2.id = list
+            .add(&day2.account, &day2.key, &day2.meta)
+            .await
+            .unwrap();
+
+        // a stale snapshot (bumped generation in the DB only) must fail the
+        // whole call before any row of any date group is removed
+        let mut stale = day1.clone();
+        stale.meta.index_generation += 1;
+        let err = list
+            .retire_files(&[stale, day2.clone()], FileListBookKeepMode::None, nonce)
+            .await
+            .expect_err("stale generation must reject the retirement");
+        assert!(matches!(err, Error::FileGenerationConflict(_)));
+        let client = CLIENT_RW.clone();
+        let client = client.lock().await;
+        let surviving: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM file_list WHERE id IN ($1, $2)")
+                .bind(day1.id)
+                .bind(day2.id)
+                .fetch_one(&*client)
+                .await
+                .unwrap();
+        assert_eq!(
+            surviving, 2,
+            "the fence must roll back every date group, not just the stale one"
+        );
+        drop(client);
+
+        // the fresh snapshot retires both dates in the one call
+        let (id1, id2) = (day1.id, day2.id);
+        list.retire_files(&[day1, day2], FileListBookKeepMode::None, nonce)
+            .await
+            .unwrap();
+        let client = CLIENT_RW.clone();
+        let client = client.lock().await;
+        let surviving: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM file_list WHERE id IN ($1, $2)")
+                .bind(id1)
+                .bind(id2)
+                .fetch_one(&*client)
+                .await
+                .unwrap();
+        assert_eq!(surviving, 0, "both date groups must be gone");
     }
 }

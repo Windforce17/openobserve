@@ -304,8 +304,11 @@ fn shared_query_global_limit() -> usize {
 /// on a prod compactor (48Gi, `ZO_MEMORY_CACHE_DATAFUSION_MAX_SIZE=12288`,
 /// 4 merge workers + live lane + builder) the aggregate tracked ceiling was
 /// N x 12.9GB, structurally above the pod limit. Metadata-class merges
-/// (default/metadata/trace_list_index) measurably fill a whole per-context
-/// pool (repeated ~12.8GB `peak_memory_pool` drops fleet-wide, 2026-08-21),
+/// (the former worst case was default/metadata/trace_list_index — that
+/// writer was removed 2026-10-15, upstream #13809; the remaining
+/// Metadata-class stream is distinct_values_*) measurably fill a whole
+/// per-context pool (repeated ~12.8GB `peak_memory_pool` drops
+/// fleet-wide, 2026-08-21),
 /// so a few overlapping merges ramped the pod 2GB -> 46GB at job-throughput
 /// speed and OOM-killed it — the M26 "live per-job leak" signature. Sharing
 /// the pool bounds the AGGREGATE: concurrent merges now spill (correct,
@@ -510,9 +513,11 @@ impl<'a> DataFusionContextBuilder<'a> {
     /// metadata merge groups (M20b) — parallel sort buys nothing, and the
     /// repartitioned plan is the pool-starvation shape: RepartitionExec
     /// buffers unspillably while N ExternalSorters split the pool until one
-    /// fails its first allocation (M12 fix-1 rationale; prod
-    /// default/metadata/trace_list_index builds and compactor merges were
-    /// the remaining instances). One sorter spills properly instead.
+    /// fails its first allocation (M12 fix-1 rationale; the former prod
+    /// default/metadata/trace_list_index builds and compactor merges —
+    /// writer removed 2026-10-15, upstream #13809 — were the known
+    /// instances; distinct_values_* is the remaining Metadata-class
+    /// stream). One sorter spills properly instead.
     pub fn single_partition(mut self, single_partition: bool) -> Self {
         self.single_partition = single_partition;
         self

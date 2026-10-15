@@ -141,47 +141,66 @@ impl super::FileList for PostgresFileList {
 
         let mut tx = pool.begin().await?;
         let mut retired = Vec::with_capacity(expected.len());
+        // `file_list` is partitioned by `date`; a bare `id = …` arm forces
+        // Postgres to probe every partition of the whole table. Grouping the
+        // arms under one `date = $1` prefix per (date, ≤300 rows) lets the
+        // planner prune to the single partition that holds those rows.
         for chunk in expected.chunks(300) {
-            let mut query = QueryBuilder::<Postgres>::new("DELETE FROM file_list WHERE ");
-            let mut clauses = query.separated(" OR ");
+            // one date group per statement; HashMap order is irrelevant,
+            // only the fence on the total RETURNING count matters
+            let mut by_date: HashMap<String, Vec<&FileKey>> = HashMap::new();
             for file in chunk {
-                if file.id > 0 {
-                    clauses
-                        .push("(id = ")
-                        .push_bind_unseparated(file.id)
-                        .push_unseparated(" AND index_generation = ")
-                        .push_bind_unseparated(file.meta.index_generation)
-                        .push_unseparated(" AND index_size = ")
-                        .push_bind_unseparated(file.meta.index_size)
-                        .push_unseparated(")");
-                } else {
-                    let (stream_key, date_key, file_name) = parse_file_key_columns(&file.key)
-                        .map_err(|e| Error::Message(e.to_string()))?;
-                    clauses
-                        .push("(stream = ")
-                        .push_bind_unseparated(stream_key)
-                        .push_unseparated(" AND date = ")
-                        .push_bind_unseparated(date_key)
-                        .push_unseparated(" AND file = ")
-                        .push_bind_unseparated(file_name)
-                        .push_unseparated(" AND index_generation = ")
-                        .push_bind_unseparated(file.meta.index_generation)
-                        .push_unseparated(" AND index_size = ")
-                        .push_bind_unseparated(file.meta.index_size)
-                        .push_unseparated(")");
-                }
+                let (_, date_key, _) =
+                    parse_file_key_columns(&file.key).map_err(|e| Error::Message(e.to_string()))?;
+                by_date.entry(date_key).or_default().push(file);
             }
-            clauses.push_unseparated(
-                " RETURNING id, account, org, stream, date, file, deleted, min_ts, max_ts, \
-                 records, original_size, compressed_size, index_size, index_generation, \
-                 bloom_ver, flattened, updated_at",
-            );
-            retired.extend(
-                query
-                    .build_query_as::<super::FileRecord>()
-                    .fetch_all(&mut *tx)
-                    .await?,
-            );
+            for (date_key, files) in &by_date {
+                let mut query =
+                    QueryBuilder::<Postgres>::new("DELETE FROM file_list WHERE date = ");
+                query.push_bind(date_key);
+                query.push(" AND (");
+                let mut clauses = query.separated(" OR ");
+                for file in files {
+                    if file.id > 0 {
+                        clauses
+                            .push("(id = ")
+                            .push_bind_unseparated(file.id)
+                            .push_unseparated(" AND index_generation = ")
+                            .push_bind_unseparated(file.meta.index_generation)
+                            .push_unseparated(" AND index_size = ")
+                            .push_bind_unseparated(file.meta.index_size)
+                            .push_unseparated(")");
+                    } else {
+                        let (stream_key, date_key, file_name) =
+                            parse_file_key_columns(&file.key)
+                                .map_err(|e| Error::Message(e.to_string()))?;
+                        clauses
+                            .push("(stream = ")
+                            .push_bind_unseparated(stream_key)
+                            .push_unseparated(" AND date = ")
+                            .push_bind_unseparated(date_key)
+                            .push_unseparated(" AND file = ")
+                            .push_bind_unseparated(file_name)
+                            .push_unseparated(" AND index_generation = ")
+                            .push_bind_unseparated(file.meta.index_generation)
+                            .push_unseparated(" AND index_size = ")
+                            .push_bind_unseparated(file.meta.index_size)
+                            .push_unseparated(")");
+                    }
+                }
+                clauses.push_unseparated(")");
+                query.push(
+                    " RETURNING id, account, org, stream, date, file, deleted, min_ts, max_ts, \
+                     records, original_size, compressed_size, index_size, index_generation, \
+                     bloom_ver, flattened, updated_at",
+                );
+                retired.extend(
+                    query
+                        .build_query_as::<super::FileRecord>()
+                        .fetch_all(&mut *tx)
+                        .await?,
+                );
+            }
         }
         if retired.len() != expected.len() {
             tx.rollback().await?;
@@ -242,7 +261,7 @@ impl super::FileList for PostgresFileList {
     async fn update_dump_records(
         &self,
         dump_file: &FileKey,
-        expected: &[(i64, i64, i64)],
+        expected: &[(i64, i64, i64, String)],
     ) -> Result<()> {
         let pool = CLIENT.clone();
         let (stream_key, date_key, file_name) =
@@ -254,22 +273,38 @@ impl super::FileList for PostgresFileList {
         ensure_file_list_partition(&pool, "file_list", &date_key).await?;
         let mut tx = pool.begin().await?;
 
+        // Same partition-pruning grouping as retire_files: the expected rows
+        // carry their `date` so every SELECT/DELETE below probes only the one
+        // partition that holds them instead of the whole partitioned table.
+        let mut by_date: HashMap<&str, Vec<(i64, i64, i64)>> = HashMap::new();
+        for (id, index_generation, index_size, date) in expected {
+            by_date
+                .entry(date.as_str())
+                .or_default()
+                .push((*id, *index_generation, *index_size));
+        }
+
         let mut matched = 0;
-        for chunk in expected.chunks(500) {
-            let mut query = QueryBuilder::<Postgres>::new("SELECT id FROM file_list WHERE ");
-            let mut clauses = query.separated(" OR ");
-            for (id, index_generation, index_size) in chunk {
-                clauses
-                    .push("(id = ")
-                    .push_bind_unseparated(*id)
-                    .push_unseparated(" AND index_generation = ")
-                    .push_bind_unseparated(*index_generation)
-                    .push_unseparated(" AND index_size = ")
-                    .push_bind_unseparated(*index_size)
-                    .push_unseparated(")");
+        for (date_key, rows) in &by_date {
+            for chunk in rows.chunks(500) {
+                let mut query =
+                    QueryBuilder::<Postgres>::new("SELECT id FROM file_list WHERE date = ");
+                query.push_bind(date_key);
+                query.push(" AND (");
+                let mut clauses = query.separated(" OR ");
+                for (id, index_generation, index_size) in chunk {
+                    clauses
+                        .push("(id = ")
+                        .push_bind_unseparated(*id)
+                        .push_unseparated(" AND index_generation = ")
+                        .push_bind_unseparated(*index_generation)
+                        .push_unseparated(" AND index_size = ")
+                        .push_bind_unseparated(*index_size)
+                        .push_unseparated(")");
+                }
+                clauses.push_unseparated(") FOR UPDATE");
+                matched += query.build().fetch_all(&mut *tx).await?.len();
             }
-            clauses.push_unseparated(" FOR UPDATE");
-            matched += query.build().fetch_all(&mut *tx).await?.len();
         }
         if matched != expected.len() {
             tx.rollback().await?;
@@ -308,26 +343,32 @@ impl super::FileList for PostgresFileList {
         .execute(&mut *tx)
         .await?;
 
-        for chunk in expected.chunks(500) {
-            let mut query = QueryBuilder::<Postgres>::new("DELETE FROM file_list WHERE ");
-            let mut clauses = query.separated(" OR ");
-            for (id, index_generation, index_size) in chunk {
-                clauses
-                    .push("(id = ")
-                    .push_bind_unseparated(*id)
-                    .push_unseparated(" AND index_generation = ")
-                    .push_bind_unseparated(*index_generation)
-                    .push_unseparated(" AND index_size = ")
-                    .push_bind_unseparated(*index_size)
-                    .push_unseparated(")");
-            }
-            let deleted = query.build().execute(&mut *tx).await?.rows_affected() as usize;
-            if deleted != chunk.len() {
-                tx.rollback().await?;
-                return Err(Error::FileGenerationConflict(format!(
-                    "dump delete expected {} source rows but matched {deleted}",
-                    chunk.len()
-                )));
+        for (date_key, rows) in &by_date {
+            for chunk in rows.chunks(500) {
+                let mut query =
+                    QueryBuilder::<Postgres>::new("DELETE FROM file_list WHERE date = ");
+                query.push_bind(date_key);
+                query.push(" AND (");
+                let mut clauses = query.separated(" OR ");
+                for (id, index_generation, index_size) in chunk {
+                    clauses
+                        .push("(id = ")
+                        .push_bind_unseparated(*id)
+                        .push_unseparated(" AND index_generation = ")
+                        .push_bind_unseparated(*index_generation)
+                        .push_unseparated(" AND index_size = ")
+                        .push_bind_unseparated(*index_size)
+                        .push_unseparated(")");
+                }
+                clauses.push_unseparated(")");
+                let deleted = query.build().execute(&mut *tx).await?.rows_affected() as usize;
+                if deleted != chunk.len() {
+                    tx.rollback().await?;
+                    return Err(Error::FileGenerationConflict(format!(
+                        "dump delete expected {} source rows but matched {deleted}",
+                        chunk.len()
+                    )));
+                }
             }
         }
         tx.commit().await?;

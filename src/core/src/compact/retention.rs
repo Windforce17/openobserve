@@ -13,7 +13,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::{collections::HashMap, path::PathBuf};
+use std::path::PathBuf;
 
 use chrono::{DateTime, Duration, TimeZone, Timelike, Utc};
 use config::{
@@ -538,7 +538,7 @@ pub async fn delete_from_file_list(
 ) -> Result<(), anyhow::Error> {
     // Retention retires only authoritative live SQL rows here. Dump rows are
     // handled by compact::dump immediately after this function returns.
-    let files = infra_file_list::query(
+    let mut files = infra_file_list::query(
         org_id,
         stream_type,
         stream_name,
@@ -550,23 +550,16 @@ pub async fn delete_from_file_list(
         return Ok(());
     }
 
-    let mut hours_files: HashMap<String, Vec<FileKey>> = HashMap::with_capacity(24);
-    for mut file in files {
-        let columns: Vec<_> = file.key.split('/').collect();
-        let hour_key = format!(
-            "{}/{}/{}/{}",
-            columns[4], columns[5], columns[6], columns[7]
-        );
-        let entry = hours_files.entry(hour_key).or_default();
+    for file in files.iter_mut() {
         file.deleted = true;
-        entry.push(file);
     }
-    // generate a new array and sort by key
-    let mut hours_files = hours_files.into_iter().collect::<Vec<_>>();
-    hours_files.sort_by(|(k1, _), (k2, _)| k1.cmp(k2));
+    // deterministic order keeps retry batches stable across attempts
+    files.sort_unstable_by(|a, b| a.key.cmp(&b.key));
 
-    // Atomically retire each hour's live-row snapshot.
-    write_file_list(hours_files).await?;
+    // Atomically retire live rows in batches sized by config. The DB layer
+    // splits each batch by date itself, so a batch may span many hours; a
+    // snapshot conflict fails the whole batch and this pass requeries.
+    write_file_list(files).await?;
 
     Ok(())
 }
@@ -574,16 +567,16 @@ pub async fn delete_from_file_list(
 // Atomically retire live rows and apply the configured bookkeeping mode. The
 // metadata snapshot supplies the generation+size fence, so a concurrent heal
 // fails the stale retention attempt before any row or tombstone changes.
-async fn write_file_list(hours_files: Vec<(String, Vec<FileKey>)>) -> Result<(), anyhow::Error> {
+async fn write_file_list(files: Vec<FileKey>) -> Result<(), anyhow::Error> {
     const MAX_ATTEMPTS: usize = 5;
     let cfg = get_config();
     let mode = FileListBookKeepMode::from(cfg.compact.file_list_deleted_mode.as_str());
-    for (_, events) in hours_files {
+    for events in files.chunks(cfg.compact.file_list_deleted_batch_size.max(1)) {
         let created_at = Utc::now().timestamp_micros();
         let mut backoff = tokio::time::Duration::from_secs(1);
         let mut retired = false;
         for attempt in 1..=MAX_ATTEMPTS {
-            match infra_file_list::retire_files(&events, mode.clone(), created_at).await {
+            match infra_file_list::retire_files(events, mode.clone(), created_at).await {
                 Ok(()) => {
                     retired = true;
                     break;

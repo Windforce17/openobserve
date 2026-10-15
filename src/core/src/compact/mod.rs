@@ -44,14 +44,20 @@ pub mod segments_sweep;
 pub mod stats;
 pub mod worker;
 
-/// compactor retention run steps:
-pub async fn run_retention() -> Result<(), anyhow::Error> {
-    // generate retention jobs first
-    if let Err(e) = retention::generate_jobs().await {
-        log::error!("[COMPACTOR] generate retention job error: {e}");
-    }
+/// Generate day-granularity retention delete jobs from the stream retention
+/// settings (`/compact/delete/` markers). Expensive: scans every stream's
+/// `get_min_date` — hourly is the right cadence (`data_retention_interval`).
+/// The pending markers themselves are executed by [`run_retention`] on the
+/// compact interval: a deleted stream blocks re-creation until its marker
+/// is consumed, so executing hourly stretched that window to a full hour.
+pub async fn run_generate_retention_job() -> Result<(), anyhow::Error> {
+    retention::generate_jobs().await
+}
 
-    // then run the jobs to delete the data
+/// Execute pending delete jobs — both retention markers and whole-stream
+/// deletions (`retention=all`). Scheduled on the compact interval so a
+/// deleted stream can be re-created/re-ingested within seconds.
+pub async fn run_retention() -> Result<(), anyhow::Error> {
     let jobs = db::compact::retention::list().await?;
     for job in jobs {
         let columns = job.split('/').collect::<Vec<&str>>();

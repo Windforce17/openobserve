@@ -5032,10 +5032,10 @@ mod tests {
         // an OR mixing the absent field with a servable one cannot be
         // decided by the index: it keeps the skip + filter-back fallback
         let mixed = IndexCondition {
-            conditions: vec![Condition::Or(
-                Box::new(Condition::Equal("client_id".into(), "x".into())),
-                Box::new(Condition::Equal("level".into(), "info".into())),
-            )],
+            conditions: vec![Condition::Or(vec![
+                Condition::Equal("client_id".into(), "x".into()),
+                Condition::Equal("level".into(), "info".into()),
+            ])],
         };
         assert!(
             evaluate_vix_index(
@@ -6946,13 +6946,10 @@ mod ranged_parity_tests {
                 Condition::Equal("svc".into(), "db".into()),
                 Condition::Equal("level".into(), "error".into()),
             ]),
-            condition(vec![Condition::Or(
-                Box::new(Condition::Equal("svc".into(), "web".into())),
-                Box::new(Condition::Not(Box::new(Condition::Equal(
-                    "level".into(),
-                    "info".into(),
-                )))),
-            )]),
+            condition(vec![Condition::Or(vec![
+                Condition::Equal("svc".into(), "web".into()),
+                Condition::Not(Box::new(Condition::Equal("level".into(), "info".into()))),
+            ])]),
             // string-semantics Equal on the numeric field: numeric values
             // live under TAGGED canonical terms, so the raw-string probe
             // matches only string-stored rows (none here) — served exactly,
