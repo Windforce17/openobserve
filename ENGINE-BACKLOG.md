@@ -325,11 +325,61 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     `match_all` 2,837 = 2,837; numeric equality 491,174,296 = oracle;
     fts-only `body = 'Worker heartbeat sent'` (has_skipped superset path)
     75,681,218 = oracle; `!=` 12,899,019 = `IS NOT NULL` − 1; the
-    singleton `SELECT *` returns its row. Pre-existing, not regressions,
-    worth their own items: the plist-count path for common values can be
-    slower than the scan on dev (`k8s.node.name` 6.7 s vs 5.6 s), and the
-    `body = …` superset path is 16.3 s vs 6.3 s scan — the 10-04 report's
-    item 1, untouched by this change.
+    singleton `SELECT *` returns its row. Two slow paths seen along the
+    way, both pre-existing, root-caused below.
+  - **Why the indexed common-value count was slower than the scan on dev
+    (`k8s.node.name = …` 7 d: 6.7 s vs 5.6 s).** The index phase is
+    fetch-permit bound: `io_accounting` on one follower — 1,308 remote
+    GETs of ~1.3 KB (dictionary block + `doc_count` leaf per file, readers
+    already open), `active_us` 99.8 s (76 ms per GET, S3 latency) but
+    `queue_us` 1,297 s — each GET waited ~1 s for a permit. Dev has no
+    `ZO_VIX_FETCH_CONCURRENCY` pin, so it runs the code default **16**
+    (prod: 768): 1,308 × 76 ms / 16 = 6.2 s = the observed 5.6–6.3 s. The
+    scan branch is not behind that gate. Every cold index number measured
+    on dev carries this factor (the 7-day misses below: `queue` 250–280 s
+    vs `active` 90–100 s per follower); with prod's 768 permits the same
+    phases are ~50× less latency-bound. A dev pin (256 for 16-core / 4 GiB
+    queriers) would make dev representative — not changed here.
+  - **Why `body = 'Worker heartbeat sent'` costs 11.8–16.3 s against a
+    6.3 s plain scan.** `body` is fts-only, so the equality has no exact
+    index answer: the SimpleCount fast path falls back on 358 of 364 files
+    per follower ("residual: too many candidate rows: 117, skipped_file:
+    241") after reading the three tokens' postings (617 ranges, 57 MB
+    logical / 150 MB coalesced, 1.9 s), then the scan branch receives the
+    token-AND SUPERSET as row ids — 28.5 M of 480 M rows per follower
+    (5.9 %; the true matches are 75.7 M of 1.45 B) — and decodes `body`
+    for them with filter-back in 7.9 s (DataFusion peak 3.78 GB). A 6 %
+    selection spread over every row group decodes the same chunks a full
+    scan does, plus selection overhead, so the index phase is pure extra.
+    The 10-04 report's item 1 exactly; fixes are outside this change:
+    bail to the plain scan when the fts superset is dense (the 35 %
+    `ZO_INVERTED_INDEX_SKIP_THRESHOLD` logic does not cover the aggregate
+    fast-path fallback), or index short raw `body` values.
+  - **Did the per-file read reduction take effect? Yes — measured under
+    prod-like admission.** Dev queriers now pin prod's pruner settings
+    (GitOps #334: `ZO_VIX_BLOOM_COMPOSITE=false`, bloom-only
+    `trace_id,span_id,reference.parent_span_id`, auto ratio 0.01, id-only;
+    reader side only, kept) because with dev's default composite=true every
+    equality miss was pruned by the composite section and neither the
+    per-file path nor the structural gate ever ran. Cold queriers (fresh
+    restart), `default` (2,080 fields), 13-hour windows, `.bf` stage then
+    per-file opens:
+    | predicate | pre-`.217` window (old layout) | knobs-on window |
+    |---|---|---|
+    | `k8s.pod.name = absent` (AUTO-covered in new files) | `.bf` keeps all → **4.6–4.8 GET/file, 591–651 KB/file** (two tail reads: the 418 KB plain footer overflows dev's 256 KiB tail; data tail 128 KiB; dict directory; dict block); 715 ms | `.bf` v2 drops 29→0 / 17→2 / 23→2 (kept = index-less L0 files) → **0 index GETs**; 373 ms |
+    | `service_name = absent` (2 distinct, no section) | readers already open from the row above: 0 GETs | kept (no info) → opened: **1.3–1.7 GET/file, 76–143 KB/file** (one zstd tail; the tail-resident directory decides most absences without a block read) |
+    | `aws_vpc_flow_logs` `srcaddr = absent` (250 MB sidecars) | 3.0 GET/file, 416 KB/file | `.bf` v2 drops all → 0 |
+    | `aws_vpc_flow_logs` `interface_id` hit, count | 5.6–6.0 GET/file, 398 KB/file | 4.9–5.0 GET/file, 267 KB/file (the data tail gone; the count path's dict + terms-footer + `doc_count` reads remain) |
+    7-day `k8s.pod.name` miss over the still-fragmented set: the
+    structural gate fired on every follower ("221 groups for 335 files:
+    skipping the `.bf` stage, keeping all") and the mixed-layout files
+    cost 4.3–4.4 GET/file cold — the transition state the gate was built
+    for. **Gate retuned:** at 32 files/group the stage would never have
+    run for streams with < 32 files an hour (dev `default`: 4) even once
+    rebuilt; the threshold has to separate the assemblers (pre-B4 ≈ 1
+    file/group vs B4 = an hour/group), so the default is now **2**
+    (vix-arch `345a72130`, next image; dev pins
+    `ZO_BLOOM_STRUCTURAL_MIN_GROUP_FILES=2` via #335 meanwhile).
 
 ## 2026-09-30 — `.180` compactor: one merge target, files above half of it final, settled-based sealing; the per-class targets and the index-defer knob are gone
 - Implements the 05:00–08:00Z owner proposal ("one config, merge once")
