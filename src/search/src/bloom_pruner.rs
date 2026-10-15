@@ -534,15 +534,22 @@ async fn run_group(
     }
     if rows.is_empty() {
         if absent.is_empty() {
-            let footer_fields: Vec<&str> = reader.fields().collect();
-            let requested_fields: Vec<&str> = predicates.iter().map(|p| p.field.as_str()).collect();
-            log::warn!(
-                "[trace_id {trace_id}] search->bloom: group `{path}`: no rows resolved — \
-                 footer fields=[{}], requested=[{}]. Likely cause: stream \
-                 `bloom_filter_fields` at build time differed from the queried \
-                 field. Keeping all files in this group.",
-                footer_fields.join(", "),
-                requested_fields.join(", "),
+            // Under structural admission (B3) this is routine, not a
+            // misconfiguration: a field with no per-field section in this
+            // chunk (below the AUTO distinct threshold, not a stream bloom
+            // field, no composite coverage) is "no info" by design and the
+            // group's files are kept. Debug, not warn - it would otherwise
+            // fire once per group per query for every low-cardinality
+            // equality predicate.
+            log::debug!(
+                "[trace_id {trace_id}] search->bloom: group `{path}`: no section for \
+                 requested=[{}] (footer fields=[{}]); no info, keeping its files",
+                predicates
+                    .iter()
+                    .map(|p| p.field.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                reader.fields().collect::<Vec<_>>().join(", "),
             );
         }
         return GroupResult::Ok {
