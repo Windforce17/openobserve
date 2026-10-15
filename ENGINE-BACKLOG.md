@@ -296,6 +296,40 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     (prod `ZO_VIX_BLOOM_COMPOSITE=false` makes the structural gate real
     there; on dev composite is on, so every field was legacy-admitted and
     the gate never fired — untested in prod conditions).
+  - **13.5 h soak on `.218` (to 2026-10-15 05:30Z), knobs on.** 0 restarts
+    on all 8 pods; querier RSS 2.0–2.1 GiB (4 GiB limit), compactor
+    7.5 GiB (48 GiB). WARN/ERROR census over the retained logs: compactor
+    181× "index merge not applicable, rebuilding terms from _source"
+    (dev's L0-index-off merge path, pre-existing), 6× "File disk cache is
+    corrupt, it shouldn't be none" (fires when the 8 GB compactor disk
+    cache GC drains to empty, pre-existing), 1× transient segment-build
+    backlog; queriers only the usual aggregate-fallback / too-many-row-ids
+    notices; zero "error filtering via index", "embedded data footer
+    unreadable", UnsupportedFormat or Malformed anywhere. 33 bloom passes
+    in the retained window (0.2–6 s each, 1,344 buckets, 141 files built,
+    0 repack failures, 0 unbuildable); no repacks there because every
+    pending file was already new-layout. The GC queued 12 fresh orphans
+    (`default` late-data hours: each hour's re-merge retires the previous
+    1-file chunk — the orphan class the old code leaked; one row each,
+    the memo holds).
+  - **Correctness battery, index vs scan oracle (`/tmp/obsoracle.sh`:
+    `f = v` vs `lower(f) = lower(v)` over 7 d, values sampled from hours
+    1–100 back so the files span pre-`.217`, `.217` plain-tail and
+    repacked zstd):** 22/22 equal across `default`, `k8s_dev_ops_logs`,
+    `apisix`, `aws_waf_log`, `tidb_slow_log` — singletons on AUTO fields
+    (`request_id`, `id`, `eventid`, `label.gpt_x_request_id` = 2), mid
+    counts (`label.session_uid` 14,018; `k8s.pod.name` 472,798 /
+    2,174,961), common values (`service_name` 245,569,505; `logtag`
+    445,766,703; `k8s.namespace.name` 873,410,788). Shapes: IN with an
+    absent member 2,647,759 = oracle; same-field OR 1 = 1; equality AND
+    `match_all` 2,837 = 2,837; numeric equality 491,174,296 = oracle;
+    fts-only `body = 'Worker heartbeat sent'` (has_skipped superset path)
+    75,681,218 = oracle; `!=` 12,899,019 = `IS NOT NULL` − 1; the
+    singleton `SELECT *` returns its row. Pre-existing, not regressions,
+    worth their own items: the plist-count path for common values can be
+    slower than the scan on dev (`k8s.node.name` 6.7 s vs 5.6 s), and the
+    `body = …` superset path is 16.3 s vs 6.3 s scan — the 10-04 report's
+    item 1, untouched by this change.
 
 ## 2026-09-30 — `.180` compactor: one merge target, files above half of it final, settled-based sealing; the per-class targets and the index-defer knob are gone
 - Implements the 05:00–08:00Z owner proposal ("one config, merge once")
