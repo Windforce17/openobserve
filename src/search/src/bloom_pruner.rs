@@ -743,12 +743,16 @@ const STRUCTURAL_SMALL_SET_GROUPS: usize = 64;
 
 /// Whether a query admitted ONLY structurally may run its `.bf` stage: the
 /// set is small ([`STRUCTURAL_SMALL_SET_GROUPS`]) or the stamped files
-/// average at least `min_group_files` per `.bf` group (0 = always). A
-/// chunked set (B4: up to 256 files per group) passes for any window; the
-/// one-group-per-file set the old assembler produced fails, because there
-/// each group is one footer GET that cannot answer a field without a
-/// section. Legacy-admitted predicates never consult this: they paid that
-/// stage before B3 and keep doing so.
+/// average at least `min_group_files` per `.bf` group (0 = always). The
+/// threshold separates the two assemblers, not big from small streams: the
+/// pre-B4 assembler left ~1 file per group (prod `default` 2026-10-13:
+/// 9,034–10,239 files in 8,563–9,674 groups), the B4 assembler builds a
+/// whole hour per group, so any stream with ≥ 2 files an hour averages ≥ 2
+/// once its window is rebuilt — hence the default of 2 (dev `default`
+/// 2026-10-15: 4 files/hour, 221 groups for 335 files while still
+/// fragmented). On a fragmented set each group is one footer GET that
+/// cannot answer a field without a section. Legacy-admitted predicates
+/// never consult this: they paid that stage before B3 and keep doing so.
 fn structural_bf_stage_allowed(
     groups: usize,
     stamped_files: usize,
@@ -2131,16 +2135,20 @@ mod tests {
     #[test]
     fn structural_gate_boundaries() {
         // small set: any shape
-        assert!(structural_bf_stage_allowed(1, 4, 32));
+        assert!(structural_bf_stage_allowed(1, 4, 2));
         assert!(structural_bf_stage_allowed(
             STRUCTURAL_SMALL_SET_GROUPS,
             64,
-            32
+            2
         ));
-        // beyond the floor the average decides
-        assert!(!structural_bf_stage_allowed(65, 65, 32));
-        assert!(!structural_bf_stage_allowed(65, 65 * 31, 32));
+        // beyond the floor the average decides: the pre-B4 one-group-per-file
+        // shape (dev 2026-10-15: 221 groups for 335 files) fails, an hour
+        // per group with two files passes
+        assert!(!structural_bf_stage_allowed(65, 65, 2));
+        assert!(!structural_bf_stage_allowed(221, 335, 2));
+        assert!(structural_bf_stage_allowed(168, 336, 2));
         assert!(structural_bf_stage_allowed(65, 65 * 32, 32));
+        assert!(!structural_bf_stage_allowed(65, 65 * 31, 32));
         // 0 = always
         assert!(structural_bf_stage_allowed(10_000, 10_000, 0));
     }

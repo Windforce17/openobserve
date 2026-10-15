@@ -2850,8 +2850,8 @@ pub struct Limit {
     pub bloom_footer_cache_max_size: usize,
     #[env_config(
         name = "ZO_BLOOM_STRUCTURAL_MIN_GROUP_FILES",
-        default = 32,
-        help = "Bloom pruning admits every `=` / `IN` predicate structurally (DESIGN-COLD-MISS §4 B3). A query that ONLY that rule admits (no stream bloom_filter_fields entry, no composite coverage) runs its `.bf` stage only when the stamped files average at least this many files per `.bf` group — i.e. the hour was built in chunks (B4). On a one-group-per-file set every group is one footer GET that cannot answer a field without a section, so such queries keep those files unprobed instead. Per-file sidecar probes are unaffected. 0 = always run the `.bf` stage."
+        default = 2,
+        help = "Bloom pruning admits every `=` / `IN` predicate structurally (DESIGN-COLD-MISS §4 B3). A query that ONLY that rule admits (no stream bloom_filter_fields entry, no composite coverage) runs its `.bf` stage only when the set is small (<= 64 groups) or the stamped files average at least this many files per `.bf` group. The threshold tells the assemblers apart, not big streams from small: the pre-B4 assembler left about one file per group (prod `default` 2026-10-13: ~9,000 groups for ~9,000 files), the B4 assembler builds a whole hour per group, so any stream with two or more files an hour averages >= 2 once its window is rebuilt. On a fragmented set every group is one footer GET that cannot answer a field without a section, so such queries keep those files unprobed instead. Per-file sidecar probes are unaffected. 0 = always run the `.bf` stage."
     )]
     pub bloom_structural_min_group_files: usize,
     #[env_config(
