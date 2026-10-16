@@ -230,6 +230,43 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     `/tmp/memprobe.py` on ops). Not started today — the controller's
     accounting model (probe = descriptor cost, data via bounds, detached
     conversions) deserves a fresh session, not the tail of this one.
+- **Organic leg, 14:23Z (pods 2 h old after the 12:20–12:23Z restart;
+  compared with yesterday's organic `.219` leg at the same age and the
+  2.4-day-warm `.216` pre-leg).** Hits 18/18 identical; 0 restarts, 0
+  pool waits, 0 reader rejects, 0 `embedded data footer unreadable` in
+  2 h with zstd writers live. **The sweep is visible on the query path:**
+  every follower sees `groups=71–72` for the sealed 24 h window where
+  yesterday it saw ~1,500 (one `.bf` per file; the DB count stood at
+  ~1,900 fragmented hours fleet-wide by 14:00Z, from 2,353 at 07:20Z).
+  `miss_userid24_r1` 4,731 → **570 ms** (bloom stage 1.3–4.3 s → 228–361
+  ms; the index phase opens 4–17 files instead of ~1,500 footers; −45 %
+  even against the warm `.216`), `miss_userid48_r1` 4,976 → 1,299,
+  `miss_userid24_r2` 289 → 134, `hist24_r2` 307 → 164. Warm legs all
+  −16…−74 % vs `.216`.
+  - **New cost, small, structural:** `domain` has no bloom section. With
+    the hours chunked the structural-only predicate now PAYS the `.bf`
+    stage (71 footer reads + presence, 324–538 ms per follower on these
+    cold pods) and keeps everything as `no_info` — yesterday the
+    fragmented set was skipped by the B3 gate. `miss_domain24_r1` 3,669 →
+    2,616 (still −29 % because the index phase warmed), `hit_domain24_r1`
+    467 → 1,454 (idx 1,340 on a cold `.bf`/index path), `cnt_svc24_r1`
+    2,587 → 4,510 (count path at `cached 0 %` after the day's five
+    restarts: 3,500–4,200 fetches/follower, 2.1–4.2 s). Follow-up for
+    `.222`: when every group footer of a stage lacks a section for the
+    predicate's field and presence cannot prune (column present), the
+    stage is pure overhead — decide it from the footer cache before
+    fetching block rows, or let `structural_bf_stage_allowed` skip a
+    stage whose footers (cached) show no section for the field. Warm-pod
+    cost is footer-cache hits, so this matters for cold pods and after
+    restarts.
+  - Cold `domain` legs vs `.216` (+31…+128 %) are five restarts' worth of
+    cold cache plus that stage; the recent-window proof of sidecar-first
+    stands (1.0–2.0 fetches/file on post-`.219` files, 3.00 on the sealed
+    window by construction).
+  - Ops note: the bastion drops idle SSH sessions after ~10–12 min even
+    with keepalives; long waits run as a detached `nohup` script on the
+    bastion writing to a file (`/tmp/organic_leg.sh`), collected with a
+    short SSH afterwards.
 
 ## 2026-10-15 — `.219` to PROD, readers-first: queriers 15:34Z (#641), compactors 15:55Z (#642), ingesters + router 17:46–18:37Z (#644); fleet converged 34/34
 - **Queriers** (`v0.93.0-vix-20261015.219`, image only; #641 also
