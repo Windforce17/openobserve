@@ -947,7 +947,37 @@ async fn consolidate_small_chunks(
     let mut superseded = Vec::new();
     let total_versions = by_version.len();
     let mut visited = 0usize;
+    // Each version costs one chunk GET plus, for v1 chunks, one sidecar-tail
+    // GET per member — cold `.bf` objects answer in 100-300 ms, so a
+    // pre-B4 hour of 256 one-file versions took ~100 s read one at a time
+    // (prod 2026-10-16). The per-version work runs CONCURRENTLY and is
+    // consumed in version order, so the member bound below means exactly
+    // what it did; at most a window's worth of versions is read in vain
+    // past the bound.
+    const CONSOLIDATE_CONCURRENCY: usize = 16;
+    use futures::{FutureExt, StreamExt, stream};
+    // futures built in a plain loop: a closure over `(version, Vec<&Row>)`
+    // items leaks a non-general `Send` bound into the compactor's spawned
+    // job (the borrowed rows make the closure's argument late-bound); async
+    // fn futures are inert until polled, so building them all up front
+    // costs nothing
+    let mut pending = Vec::with_capacity(by_version.len());
     for (version, rows) in by_version {
+        pending.push(
+            consolidate_version(
+                org_id,
+                stream_type,
+                stream_name,
+                date,
+                version,
+                rows,
+                small_limit,
+            )
+            .map(move |members| (version, members)),
+        );
+    }
+    let mut folded = stream::iter(pending).buffered(CONSOLIDATE_CONCURRENCY);
+    while let Some((version, folded_members)) = folded.next().await {
         if members.len() >= max_members {
             log::info!(
                 "[COMPACTOR:BLOOM] {org_id}/{stream_type}/{stream_name}/{date}: consolidation \
@@ -959,91 +989,101 @@ async fn consolidate_small_chunks(
             break;
         }
         visited += 1;
-        let path = infra::bloom::path::bloom_path(org_id, stream_type, stream_name, date, version);
-        let account = infra::storage::get_account(org_id, &path).unwrap_or_default();
-        let object = match infra::storage::get_bytes(&account, &path).await {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                log::warn!("[COMPACTOR:BLOOM] consolidation: {path} unreadable, kept as is: {e}");
-                continue;
-            }
-        };
-        let reader = match infra::bloom::BloomReader::parse(&object) {
-            Ok(reader) => reader,
-            Err(e) => {
-                log::warn!("[COMPACTOR:BLOOM] consolidation: {path} unparsable, kept as is: {e}");
-                continue;
-            }
-        };
-        // every v1 chunk counts as small (no presence, per-section tables);
-        // a v2 chunk only below the member limit
-        if reader.is_v2() && rows.len() > small_limit {
-            continue;
+        if let Some(mut folded_members) = folded_members {
+            members.append(&mut folded_members);
+            superseded.push(version);
         }
-        let live: HashMap<u64, &infra::file_list::FileRecord> =
-            rows.iter().map(|row| (row.id as u64, *row)).collect();
-        let mut sections_of: HashMap<u64, Vec<vortex_index::bloom::FileBloom>> = HashMap::new();
-        let mut consistent = true;
-        for layout in reader.section_layouts() {
-            let start = layout.body_offset as usize;
-            let end = start + layout.matrix_bytes() as usize;
-            let Some(matrix) = object.get(start..end) else {
-                consistent = false;
-                break;
-            };
-            let Some(bodies) = infra::bloom::BloomReader::detranspose_section(&layout, matrix)
-            else {
-                consistent = false;
-                break;
-            };
-            for ((file_id, n_items), bytes) in
-                layout.file_ids.iter().zip(layout.n_items).zip(bodies)
-            {
-                if !live.contains_key(file_id) {
-                    continue; // merged away: nothing references it any more
-                }
-                sections_of
-                    .entry(*file_id)
-                    .or_default()
-                    .push(vortex_index::bloom::FileBloom {
-                        field: layout.field.to_string(),
-                        num_blocks: layout.num_blocks,
-                        n_items: *n_items,
-                        bytes,
-                    });
-            }
-        }
-        if !consistent {
-            log::warn!("[COMPACTOR:BLOOM] consolidation: {path} footer/body disagree, kept as is");
-            continue;
-        }
-        for (file_id, row) in live {
-            let presence = match reader.member_columns(file_id) {
-                Some((columns, complete)) => {
-                    GroupMember::new(file_id, columns).with_complete(complete)
-                }
-                // v1 chunk: presence from the member's sidecar tail (one GET);
-                // unreadable -> no info
-                None => match sidecar_presence(&FileKey::from(row)).await {
-                    Ok(presence) => presence,
-                    Err(e) => {
-                        log::debug!(
-                            "[COMPACTOR:BLOOM] consolidation: no presence for file {file_id}: {e:#}"
-                        );
-                        GroupMember::new(file_id, Vec::new()).with_complete(false)
-                    }
-                },
-            };
-            members.push(BuildMember {
-                fence: (row.id, row.index_generation, row.index_size),
-                presence,
-                blooms: sections_of.remove(&file_id).unwrap_or_default(),
-                restamp_from: Some(version),
-            });
-        }
-        superseded.push(version);
     }
     (members, superseded)
+}
+
+/// Read one superseded-candidate chunk back and hand its still-live members
+/// to the current build (`restamp_from` = this version). `None` keeps the
+/// chunk as it is: unreadable, unparsable, inconsistent, or a v2 chunk
+/// above the small-member limit.
+async fn consolidate_version(
+    org_id: &str,
+    stream_type: config::meta::stream::StreamType,
+    stream_name: &str,
+    date: &str,
+    version: i64,
+    rows: Vec<&infra::file_list::FileRecord>,
+    small_limit: usize,
+) -> Option<Vec<BuildMember>> {
+    let path = infra::bloom::path::bloom_path(org_id, stream_type, stream_name, date, version);
+    let account = infra::storage::get_account(org_id, &path).unwrap_or_default();
+    let object = match infra::storage::get_bytes(&account, &path).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            log::warn!("[COMPACTOR:BLOOM] consolidation: {path} unreadable, kept as is: {e}");
+            return None;
+        }
+    };
+    let reader = match infra::bloom::BloomReader::parse(&object) {
+        Ok(reader) => reader,
+        Err(e) => {
+            log::warn!("[COMPACTOR:BLOOM] consolidation: {path} unparsable, kept as is: {e}");
+            return None;
+        }
+    };
+    // every v1 chunk counts as small (no presence, per-section tables);
+    // a v2 chunk only below the member limit
+    if reader.is_v2() && rows.len() > small_limit {
+        return None;
+    }
+    let live: HashMap<u64, &infra::file_list::FileRecord> =
+        rows.iter().map(|row| (row.id as u64, *row)).collect();
+    let mut sections_of: HashMap<u64, Vec<vortex_index::bloom::FileBloom>> = HashMap::new();
+    for layout in reader.section_layouts() {
+        let start = layout.body_offset as usize;
+        let end = start + layout.matrix_bytes() as usize;
+        let Some(matrix) = object.get(start..end) else {
+            log::warn!("[COMPACTOR:BLOOM] consolidation: {path} footer/body disagree, kept as is");
+            return None;
+        };
+        let Some(bodies) = infra::bloom::BloomReader::detranspose_section(&layout, matrix) else {
+            log::warn!("[COMPACTOR:BLOOM] consolidation: {path} footer/body disagree, kept as is");
+            return None;
+        };
+        for ((file_id, n_items), bytes) in layout.file_ids.iter().zip(layout.n_items).zip(bodies) {
+            if !live.contains_key(file_id) {
+                continue; // merged away: nothing references it any more
+            }
+            sections_of
+                .entry(*file_id)
+                .or_default()
+                .push(vortex_index::bloom::FileBloom {
+                    field: layout.field.to_string(),
+                    num_blocks: layout.num_blocks,
+                    n_items: *n_items,
+                    bytes,
+                });
+        }
+    }
+    let mut members = Vec::with_capacity(live.len());
+    for (file_id, row) in live {
+        let presence = match reader.member_columns(file_id) {
+            Some((columns, complete)) => GroupMember::new(file_id, columns).with_complete(complete),
+            // v1 chunk: presence from the member's sidecar tail (one GET);
+            // unreadable -> no info
+            None => match sidecar_presence(&FileKey::from(row)).await {
+                Ok(presence) => presence,
+                Err(e) => {
+                    log::debug!(
+                        "[COMPACTOR:BLOOM] consolidation: no presence for file {file_id}: {e:#}"
+                    );
+                    GroupMember::new(file_id, Vec::new()).with_complete(false)
+                }
+            },
+        };
+        members.push(BuildMember {
+            fence: (row.id, row.index_generation, row.index_size),
+            presence,
+            blooms: sections_of.remove(&file_id).unwrap_or_default(),
+            restamp_from: Some(version),
+        });
+    }
+    Some(members)
 }
 
 /// The `.bf` objects of the hour that no live row references (after this
