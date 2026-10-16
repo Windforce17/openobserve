@@ -3,6 +3,139 @@
 Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
 (deleted 2026-07-29; full history in git). Keep THIS file current.
 
+## 2026-10-16 — fleet OOM 03:19Z (7 of 10 queriers, one client burst) → `.220`/`.221`: process-wide segment-scan retention pool, fragmented-`.bf` consolidation sweep, footer-cache metrics; prod sidecar-first open + zstd tails (rollout steps 2 and 3)
+- **Incident.** 03:19:03–07Z seven `.219` queriers OOMKilled at once
+  (`lastState OOMKilled`, 1 restart each; 3 survived). Previous-container
+  logs end 03:19:00. Cause, from the leader lines in obs's own
+  `k8s_prod_ops_logs` (the router saw NONE of it — `devops-orbit`,
+  `172.31.146.142`, calls the querier service directly): **29 × `SELECT *
+  FROM "k8s_prod_public_logs" WHERE match_all('<22-char id>') ORDER BY
+  _timestamp DESC LIMIT 200` over a 48 h window in ONE second (03:18:53)**,
+  5 s client timeout (access log `5.00x` s), immediate retries 03:19:07–10
+  (19 more), 48 in all. Every one was "admitted without queueing" (leader
+  cap `ZO_QUERY_MAX_CONCURRENCY=30`, counted per LEADER; followers have no
+  admission) and fanned to all 10 queriers + 5 ingesters (2,761 files,
+  9.0 B records). Per follower per query: index phase 280–400 fetches /
+  45–96 MB (1.7 s), filter-back scan over 8 files, and the WAL
+  `segments_scan` **kept 432 batches / 500,764 records / 335 MB** — under
+  its own 512 MiB soft budget, whose hard stop was half the cgroup PER
+  QUERY. 29 × 335 MB ≈ 9.7 GB on top of the ~10 GiB resident baseline
+  (reader cache 5 GiB, footer cache, DF pool in use) → 24 GiB in ~6 s.
+  The one-shot memory circuit breaker (90 %) is checked at scan start,
+  so 29 scans admitted in the same second all passed it. Not `.219`: the
+  shape ran ≤ 1/s on every previous day; the 29-way fan-out is new on
+  Orbit's side. Orbit's other burst (02:21Z, 864 `trace_id = …` queries
+  over 0.1–0.2 h in 90 s) is indexed/pruned and harmless — a lower leader
+  cap would have broken that one, so the fix is a memory gate, not a
+  concurrency cap.
+- **Fix (`vix-arch d1144ea346`, `.220` = `release/vix-20261016-220`
+  `09b7428cf`).** `ZO_SEGMENT_SCAN_POOL_BYTES` — one tokio `Semaphore`
+  per node (KiB permits, FIFO; auto 1/8 of the memory limit clamped
+  1–8 GiB → prod querier 3 GiB; ≥ the per-query soft budget). The scan
+  loop reserves the KEPT bytes as segments are folded in; a scan that
+  does not fit waits for running scans to drop their tables (the lease
+  rides on every `NewMemTable` of the scan as `RetainedBytes`, released
+  with the follower's plan), up to 60 s, then fails THAT query with a
+  message naming the pool — never the pod. Per-query hard ceiling =
+  min(mem/2, pool). `finish` splits the unused units back after trims.
+  Metrics `segment_scan_retained_bytes`, `segment_scan_pool_waits_total
+  {waited|timed_out}`; a WARN names trace, wait and occupancy. Test:
+  rounding, FIFO wait released by table drop, timeout error, split.
+  Also in `.220`: the consolidation sweep below, `bloom_footer_cache_
+  {bytes,entries,lookups_total}`, pruner "no rows resolved" at debug
+  (`a95829de10` was NOT in `.219`).
+- **Consolidation sweep** (`ZO_COMPACT_BLOOM_SWEEP_HOURS`, default 4):
+  after the pending buckets, each bloom pass asks the meta DB for settled
+  hours with > `ZO_COMPACT_BLOOM_MAX_CHUNKS` versions of which ≥ 1 is
+  small (`members ≤ chunk_files/4`; the only kind the consolidator
+  folds), newest first, window max(64, 16 × quota), shuffled; visits run
+  the normal hour build with `VisitMode::Sweep` (no pending needed, no
+  trigger gate) so `consolidate_small_chunks` folds one chunk of members
+  → one v2 chunk, CAS restamps, retires the superseded versions, GCs
+  orphans. Prod at 07:20Z: **2,353 fragmented hours / 581,394 one-file
+  versions**; discovery 1.17 s / 27k buffers / 40 MB temp per pass per
+  pod. Dev (`#339`, 06:51Z): first pass `sweep: 4 of 64 fragmented hours
+  consolidated in 9.4 s`, each `9–11 stamped across 9–11 chunk versions`
+  → `9 consolidated, 9 restamped, 9 superseded + 64–142 orphaned chunks
+  queued`, 109 → 101 hours after one round. Footer cache on prod `.220`
+  14 min after the roll: 109 MB / 1,248 entries = **~87 KB per parsed
+  footer** (the `BloomReader` hash maps), so the 245 MB budget holds
+  ~2,800 groups and one 24 h id-like query touches ~1,500 per follower —
+  the measured side of yesterday's "footers age out between 25 min and
+  2 h". The sweep turns 1,500 groups per day-hour-stream into ≤ 2.
+- **Rolls today.** Dev queriers `ZO_VIX_SIDECAR_FIRST_OPEN=true` (#338,
+  05:38Z): cold needle miss opens at 1.33–1.62 fetches/file (48/35,
+  61/46, 42/26) vs 3.0/file paired on prod `.219` yesterday; no
+  `embedded data footer unreadable`; hits identical cold/warm. Dev
+  `.220` all roles (#339, 06:51Z). Prod queriers `.220` (#645, synced
+  06:54Z, 10/10 by 07:12Z; the roll took 18 min this time), prod
+  compactors `.220` + `ZO_COMPACT_BLOOM_SWEEP_HOURS=2` metered (#646,
+  18/18 by 07:16:48Z). Prod sidecar-first flip HELD until `.220` has
+  soaked (single-variable rule; the fleet had just OOM'd).
+- Also fixed in the tooling: meta-DB queries run `psql` ON the bastion
+  (`ssh ops`, DSN read in the remote process, scrubbed), never a
+  `kubectl run postgres` pod — those raised security alerts (owner
+  request 06:0xZ). `/tmp/battery_cmp.py` joins legs on the `<shape>_rN`
+  core, whatever the leg suffix.
+- Orbit-side follow-up for the owner: the session-log bulk lookup should
+  bound its fan-out (≤ 4 in flight), use a timeout ≥ 30 s with no
+  immediate retry, and narrow the window (48 h × `SELECT *` × 2,761 files
+  for one id). The pool makes the pod survive it; the queries themselves
+  will now queue (WARN `[SEGMENT:SCAN] … waited`) under such a burst.
+- **`.221` (`e844ec1ea`, compactors only; queriers stay `.220`).** The
+  `.220` sweep's first prod pass (07:27–07:34Z, quota 2) was correct —
+  every visit `256 consolidated, 256 restamped, 256 superseded` + 300–600
+  orphaned `.bf` GC'd per hour, 0 failed — but a 256-version hour took
+  85–127 s: one chunk GET plus one sidecar-tail GET (v1 presence) per
+  version, SEQUENTIAL, cold objects at 100–300 ms; the meta DB was 0.4 ms
+  per restamp statement (pg_stat_statements). `consolidate_version` now
+  runs 16-wide (`stream::iter(futures).buffered(16)` consumed in version
+  order — futures built in a `for` loop: an `async move` closure over the
+  borrowed rows leaks a non-general `Send` bound that only the `jobs`
+  crate's `spawn_pausable_job!` detects; `cargo check -p openobserve-core`
+  passed and the arm64 release build failed — always
+  `cargo check --workspace --all-targets` before a release). Dev #340: a
+  4-hour pass 9.4 → 2.35 s. Prod #648 (18/18 08:57Z, quota back to the
+  default 4): first pass 72 visits, **a 256-version fold 8.6–26.6 s
+  (median 11.4 s)**, 4 hours per pod in 26–62 s, 0 failed, 0 warnings;
+  merges 475/10 min unchanged; fragmented hours 2,353 → 2,266 → … (the
+  DB count drains ~18 × 4 × 256 versions per ~10 min pass).
+- **Prod sidecar-first open (#649, queriers restarted 09:28Z, env
+  only).** 10 min watch: 0 restarts, 0 `embedded data footer
+  unreadable`, no pool waits. Fresh-vs-fresh battery (10 min after a
+  restart, vs the `.219` fresh leg): hits 18/18 identical; id-like
+  needles −56…−73 % (the sweep's fewer groups + warm footers),
+  `cnt_svc24_r1` −18 %, `hist24_r1` −21 %; the structural-only `domain`
+  misses +46 % / +13 % on this first leg — and the cold chain on that
+  trace was **exactly 3.00 fetches/file on all 10 followers**, same as
+  `.219`. Not a bug: the battery's "24 h" window is SEALED (Oct 13 12:00 →
+  Oct 14 12:00, fixed in the plan for comparability) = 100 % pre-`.219`
+  old-layout files, so every hour is remembered old-layout after its
+  first wave pays the serial data-tail round trip (the fresh-pod penalty
+  behind the +46 %). The same shape over a 1 h window of post-`.219`
+  files (05:00Z today) opened at **1.04–2.00 fetches/file** on every
+  follower (54/52, 73/51, 63/54, …; idx 292–464 ms). Rule for the
+  skill: fetches/file is a property of the WINDOW's layout, so an
+  open-path change is proven on a recent window; the sealed battery
+  window measures the historical (paired) path until repack/retention
+  turns it over. Dev's querier env entry for the knob (#338) duplicated
+  the configmap, which has carried all three cold-miss knobs since
+  2026-10-14 (`7de8653`) — removed (#341).
+- **Prod zstd sidecar tails (#651, rollout step 3; compactors restarted
+  09:45Z via `obs-env-rev`, ingesters adopt at their next restart —
+  their traces/metrics L0s; logs L0 index is off).** Preconditions held:
+  every reader ≥ `.219`, dev writers on zstd since 10-14 with 0 reader
+  rejects in 1.5 days. First 8 min: 259 merges, 0 merge errors, RSS avg
+  3.9 / max 14.5 GiB; live-hour needle / count / select all 200 with 0
+  reader rejects on the queriers. Still off: repack budget (step 4),
+  eager tail 768 → 256 KiB (step 5, once the window is mostly
+  `layout_gen=2`). NEVER roll a reader below `.219` while this is on.
+- Open for the owner: footer cache budget — at ~87 KB per parsed footer
+  the 245 MB clamp holds ~2,800 groups; the sweep removes the need (one
+  chunk per hour-stream instead of ~250), so no change proposed until the
+  fragmented count is near 0 and `bloom_footer_cache_entries` is read
+  against real query mixes.
+
 ## 2026-10-15 — `.219` to PROD, readers-first: queriers 15:34Z (#641), compactors 15:55Z (#642), ingesters + router 17:46–18:37Z (#644); fleet converged 34/34
 - **Queriers** (`v0.93.0-vix-20261015.219`, image only; #641 also
   dropped the stale `ZO_TRACES_LIST_INDEX_ENABLED` pin — see the
