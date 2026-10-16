@@ -3,7 +3,7 @@
 Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
 (deleted 2026-07-29; full history in git). Keep THIS file current.
 
-## 2026-10-16 — two fleet OOM modes (03:19Z ×7, 10:03Z ×3) → `.220`/`.221` segment-scan retention pool + `ZO_STORAGE_SCAN_MAX_BYTES` 1 GiB; fragmented-`.bf` consolidation sweep; prod sidecar-first open + zstd tails (rollout steps 2 and 3)
+## 2026-10-16 — two fleet OOM modes (03:19Z ×7, 10:03Z ×3) → `.220`/`.221` segment-scan retention pool; `ZO_STORAGE_SCAN_MAX_BYTES` 1 GiB tried and reverted (the scan branch's decode memory is the `.222` item); fragmented-`.bf` consolidation sweep; prod sidecar-first open + zstd tails (rollout steps 2 and 3)
 - **Incident.** 03:19:03–07Z seven `.219` queriers OOMKilled at once
   (`lastState OOMKilled`, 1 restart each; 3 survived). Previous-container
   logs end 03:19:00. Cause, from the leader lines in obs's own
@@ -185,22 +185,51 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     was measurable from the logs) but the scan branch's decode memory
     was almost certainly the larger consumer. Same root: a per-query
     budget on compressed bytes with the decoded memory untracked.
-  - **`.222` design (not started; owner call on the behaviour):** a
-    process-wide decode gate in `scan_blob_streaming` — before pulling
-    the next chunk, reserve its decoded size (the writer bounds chunks by
-    `docs_chunk_bytes`; per-leaf logical sizes are in the vortex footer)
-    in a node pool; the permit must outlive the `on_batch` hand-off (the
-    batch lives in the 2-deep channel and DataFusion's pipeline), so the
-    honest unit is "chunks decoded and not yet consumed", bounded
-    per-query by 3 × files and process-wide by the pool; a scan that does
-    not fit waits like the segment pool (queue, not OOM; a 60 s wait
-    fails that query). Cheaper alternatives: route `Indices` scans
-    through `convert_chunks_ordered` (accounts conversion only, still
-    not the vortex buffers, still falls back instead of waiting), lower
-    decode fan-out per query (slower, unbounded across queries), or a
-    smaller cap (more partial results). The heap profiler in the image
-    (`ZO_HEAP_PROFILE_SAMPLE_EVERY_MB`, M27) on one canary would confirm
-    the allocation sites before the change.
+  - **Cap reverted to 4 GiB (#653, 12:20Z, fifth querier restart of the
+    day).** Measured from `k8s_prod_ops_logs`: at 4 GiB (09:30–11:00Z) the
+    cap made **5 queries/h** partial (day-long windows, 207 files per
+    follower); at 1 GiB (11:10–12:10Z) **60 queries/h**, nearly all the
+    recent-window `SELECT * FROM "default" WHERE operation_name = … ORDER
+    BY _timestamp ASC LIMIT 1000` shape (6–20 min windows) whose live L0
+    set — ~90 files, ~4 GB compressed per follower; logs L0 files carry
+    no index on prod, so every recent query scans them whole — lost 83 %
+    of its files. A per-query compressed-bytes cap cannot tell that shape
+    from the body-heavy match_all one. The body-heavy day-long `SELECT *`
+    over `k8s_prod_public_logs` therefore remains able to OOM the three
+    followers that hold its filter-back files until `.222`.
+  - **`.222` — the accounting already exists; two holes let the pod die
+    instead of the query** (`vortex_index/src/container.rs::
+    scan_blob_streaming`, `conversion.rs::convert_chunks_ordered`,
+    `search/src/datafusion/vix_format.rs::CoreScanOperation`):
+    `reserve_conversion` grows a DataFusion `MemoryReservation` on the
+    12 GiB shared pool and `own_conversion_output` pins the charge to the
+    Arrow buffers (`Buffer::from_custom_allocation`) so it lives exactly
+    as long as the batch downstream — the lifetime problem is solved.
+    Hole 1: the accounted controller runs only for `RowSelection::All |
+    Range` (`487f6e6eff`); `Indices` / `Vortex` / `VortexRange` — every
+    index-driven filter-back scan — take the inline loop and charge
+    nothing. Hole 2: when `reserve_conversion` is REFUSED (pool full) the
+    controller converts inline UNACCOUNTED and continues (`conversion.rs`
+    325–336, also the CPU-budget `fallback()`), so the pool only tracks
+    while there is room and never limits. The fix: (1) run every
+    selection through the controller (or charge `conversion_bound` /
+    `arrow_bound` per chunk in the inline loop and pin it with
+    `own_conversion_output`); (2) on a memory refusal fail the query with
+    `ResourcesExhausted` — the documented contract ("concurrent contexts
+    compete and may receive ResourcesExhausted instead of killing the
+    pod") — not fall back; keep the CPU-budget fallback. Owner call
+    before it ships: this makes a storage scan that cannot get pool bytes
+    FAIL (12 GiB pool, ~9.5 GiB resident baseline → RSS ≤ ~22 GiB) where
+    today it silently proceeds; the alternative — wait like the segment
+    pool — needs a sync gate in the blocking decode thread (the
+    `ByteGate` condvar path in `search/src/vix/source.rs` is the model).
+    Verify on the fixture files with an injected refusal (the
+    `reservations_left` harness in `conversion.rs` tests) and on dev with
+    `ZO_MEMORY_CACHE_DATAFUSION_MAX_SIZE` lowered until a body-heavy scan
+    refuses; prove on prod by replaying the 10:03 query (RSS sampler
+    `/tmp/memprobe.py` on ops). Not started today — the controller's
+    accounting model (probe = descriptor cost, data via bounds, detached
+    conversions) deserves a fresh session, not the tail of this one.
 
 ## 2026-10-15 — `.219` to PROD, readers-first: queriers 15:34Z (#641), compactors 15:55Z (#642), ingesters + router 17:46–18:37Z (#644); fleet converged 34/34
 - **Queriers** (`v0.93.0-vix-20261015.219`, image only; #641 also
