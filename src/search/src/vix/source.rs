@@ -736,7 +736,11 @@ impl EvaluationPermit {
 #[cfg(test)]
 pub(super) fn try_acquire_evaluation_under(limit: usize) -> Option<EvaluationPermit> {
     let count = Arc::clone(&EVAL_COUNT).try_acquire_owned().ok()?;
-    Some(EvaluationPermit::on(count, &ByteGate::new(limit), GROWTH_WAIT))
+    Some(EvaluationPermit::on(
+        count,
+        &ByteGate::new(limit),
+        GROWTH_WAIT,
+    ))
 }
 
 /// Optional background work: a free slot or nothing, never queued.
@@ -1381,7 +1385,11 @@ mod tests {
         second.reserve_owned(20).unwrap();
         assert_eq!(pool.state.lock().used, 28);
         first.reserve_owned(4).unwrap();
-        assert_eq!(pool.state.lock().used, 28, "a smaller report is not a shrink");
+        assert_eq!(
+            pool.state.lock().used,
+            28,
+            "a smaller report is not a shrink"
+        );
         // growth to 16 (8 more) must wait for `second` to finish
         let waiter = {
             let memory = Arc::clone(&first.memory);
@@ -1414,7 +1422,10 @@ mod tests {
             Some(vortex_index::VixError::Cancelled)
         ));
         assert!(started.elapsed() < Duration::from_secs(5));
-        assert!(third.check_refusal().is_ok(), "cancellation is not a refusal");
+        assert!(
+            third.check_refusal().is_ok(),
+            "cancellation is not a refusal"
+        );
         // more than the whole pool is refused without waiting, and sticks
         let started = Instant::now();
         let refused = third.memory.check(33, &|| false).unwrap_err();
@@ -1668,7 +1679,10 @@ mod tests {
             .await
             .unwrap();
         let source = StoreRangeSource::new(store, path, 4, Handle::current());
-        let held = SCAN_FETCH_BYTES.acquire(SCAN_FETCH_BYTES.limit).await.unwrap();
+        let held = SCAN_FETCH_BYTES
+            .acquire(SCAN_FETCH_BYTES.limit)
+            .await
+            .unwrap();
         let operation = ReadOperation::new(Arc::new(FetchStats::default()), None);
         let future = operation.run(|| source.fetch(0..4));
         tokio::task::yield_now().await;
@@ -1703,13 +1717,11 @@ mod tests {
             .await
             .unwrap();
         let operation = ReadOperation::new(Arc::new(FetchStats::default()), None);
-        let bytes = tokio::time::timeout(
-            Duration::from_secs(5),
-            operation.run(|| source.fetch(0..4)),
-        )
-        .await
-        .expect("a scan fetch must not queue behind the search gate")
-        .unwrap();
+        let bytes =
+            tokio::time::timeout(Duration::from_secs(5), operation.run(|| source.fetch(0..4)))
+                .await
+                .expect("a scan fetch must not queue behind the search gate")
+                .unwrap();
         assert_eq!(bytes, Bytes::from_static(b"test"));
         drop(held);
     }

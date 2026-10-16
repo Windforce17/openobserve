@@ -134,7 +134,10 @@ struct ScanCap {
 /// by memory admission, or fail loudly — never a truncated value. Owner
 /// decision 2026-09-30. `None` when the shape is not capped or the cap is
 /// disabled (`configured == 0`).
-fn scan_cap_for(idx_optimize_rule: &Option<IndexOptimizeMode>, configured: usize) -> Option<ScanCap> {
+fn scan_cap_for(
+    idx_optimize_rule: &Option<IndexOptimizeMode>,
+    configured: usize,
+) -> Option<ScanCap> {
     match idx_optimize_rule {
         Some(IndexOptimizeMode::SimpleSelect(limit, ascend)) if *limit > 0 && configured > 0 => {
             Some(ScanCap {
@@ -580,12 +583,7 @@ mod tests {
     #[test]
     fn scan_cap_applies_only_to_row_returning_limit_shapes() {
         let budget = 4 << 30;
-        let cap = |ascend| {
-            Some(ScanCap {
-                budget,
-                ascend,
-            })
-        };
+        let cap = |ascend| Some(ScanCap { budget, ascend });
         assert_eq!(
             scan_cap_for(&Some(IndexOptimizeMode::SimpleSelect(50, false)), budget),
             cap(false)
@@ -668,7 +666,10 @@ mod tests {
         let message = shortfall.message();
         assert!(message.contains("2 files"), "{message}");
         assert!(message.contains("NEWEST 2 files"), "{message}");
-        assert!(message.contains("from 1970-01-01T00:00:00Z onward"), "{message}");
+        assert!(
+            message.contains("from 1970-01-01T00:00:00Z onward"),
+            "{message}"
+        );
         assert!(message.contains("exclude older"), "{message}");
     }
 
@@ -714,7 +715,10 @@ mod tests {
     fn storage_scan_cap_is_a_no_op_within_budget_or_when_off() {
         let original = vec![file(1, 100, 40), file(2, 400, 40)];
         let mut files = original.clone();
-        assert_eq!(apply_storage_scan_cap(&mut files, "s", cap(80, false)), None);
+        assert_eq!(
+            apply_storage_scan_cap(&mut files, "s", cap(80, false)),
+            None
+        );
         assert_eq!(files, original);
         let mut files = original.clone();
         assert_eq!(apply_storage_scan_cap(&mut files, "s", cap(80, true)), None);
