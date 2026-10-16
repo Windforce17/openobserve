@@ -3,7 +3,7 @@
 Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
 (deleted 2026-07-29; full history in git). Keep THIS file current.
 
-## 2026-10-16 — fleet OOM 03:19Z (7 of 10 queriers, one client burst) → `.220`/`.221`: process-wide segment-scan retention pool, fragmented-`.bf` consolidation sweep, footer-cache metrics; prod sidecar-first open + zstd tails (rollout steps 2 and 3)
+## 2026-10-16 — two fleet OOM modes (03:19Z ×7, 10:03Z ×3) → `.220`/`.221` segment-scan retention pool + `ZO_STORAGE_SCAN_MAX_BYTES` 1 GiB; fragmented-`.bf` consolidation sweep; prod sidecar-first open + zstd tails (rollout steps 2 and 3)
 - **Incident.** 03:19:03–07Z seven `.219` queriers OOMKilled at once
   (`lastState OOMKilled`, 1 restart each; 3 survived). Previous-container
   logs end 03:19:00. Cause, from the leader lines in obs's own
@@ -135,6 +135,59 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
   chunk per hour-stream instead of ~250), so no change proposed until the
   fragmented count is near 0 and `bloom_footer_cache_entries` is read
   against real query mixes.
+- **Second OOM, 10:03:56Z — 3 of 10 `.220` queriers, ONE interactive
+  query.** `SELECT * FROM "k8s_prod_public_logs" WHERE
+  match_all('enterprise_instruction_versions') ORDER BY _timestamp ASC
+  LIMIT 8` over 21.7 h (1,724 files, 4.0 B records). The index answered
+  it as a SUPERSET (`is_add_filter_back: true`, 10,959 candidate rows)
+  and on three followers the filter-back set was 24 files (6.4 GB
+  compressed; the other seven held 1–2); `ZO_STORAGE_SCAN_MAX_BYTES` =
+  4 GiB kept 15 of them, and those three pods went from ~9.5 GiB to the
+  24 GiB limit in 6 s. The `.220` segment pool held (0 waits; live data
+  ≤ 386 MB per scan) — this is the OTHER branch. The uncapped histogram
+  twin 25 s earlier (25 files, 6.6 GB, count path) ran in 2.2 s at a DF
+  peak of 1.6 GB on the same pod and was harmless: it is the full
+  projection that costs. Schema is 28 fields, so not width — `body`.
+  **Measured amplification** (RSS at 2 Hz on every querier while running
+  the shape over the last hour, 11:04Z): 2 files / 388 MB → +2.65 GB,
+  3 / 492 MB → +1.96, 6 / 954 MB → +3.72, 6 / 1,394 MB → **+8.20 GB**,
+  8 / 1,989 MB → +1.70, while DataFusion's tracked peak was 106–527 MB:
+  **the pool sees 5–10 % of the scan branch's memory**. Mechanism
+  [INFERENCE from `vix_format.rs`]: ranged mode with the index's row
+  selection, but compression is per chunk, so every row group holding a
+  selected row is decoded WHOLE on the vortex runtime (a 220 MB file is
+  2.2 GB logical; 2,600 scattered hits touch most row groups), 16
+  partitions × a 2-batch channel, and only the Arrow conversion
+  reservation is charged to the pool. A fresh pod (4 GB RSS) shows ~0
+  delta for 1 file — the allocator reuses freed pages — which is why the
+  per-file number is so noisy.
+  - **Mitigation (#652, 11:06Z, queriers restarted):** cap 4 GiB → 1 GiB.
+    The fatal query replayed over its fatal window: the three heavy
+    followers keep 3–4 of 24–28 files (~1.3 GB compressed; 21–25 skipped
+    with the coverage message), peak **+4.4 … +5.5 GB** and live; the
+    others +0.2 … +1.1 GB. So ≈ 3.5–4× compressed → resident for this
+    shape. Cost: needle SELECTs over a filter-back flood go partial
+    earlier. Aggregates are not capped and do not project. Not bounded
+    under concurrency: two such queries on one follower ≈ +10 GB.
+  - **Correction to the 03:19 attribution above.** Each of those 29
+    queries also carried a filter-back scan of 5–16 files, ~1.05 GB
+    compressed per follower ("load files 8, scan_size 11.5 GB,
+    compressed_size 1.05 GB"). At 3.5–4× that is ~3.5 GB per query — 29
+    × 3.5 ≈ 100 GB — against the 9.7 GB of segments the entry charged.
+    The segment pool is correct and necessary (it is the only part that
+    was measurable from the logs) but the scan branch's decode memory
+    was almost certainly the larger consumer. Same root: a per-query
+    budget on compressed bytes with the decoded memory untracked.
+  - **`.222` design (not started; owner call on the behaviour):** charge
+    the scan branch's decode to a process-wide gate — reserve each row
+    group's logical chunk bytes (known from the footer) in a node pool
+    before decoding it, release when the batch is handed over; a scan
+    that does not fit waits like the segment pool (queue, not OOM; a
+    60 s wait fails that query). Alternatives: lower decode concurrency
+    per query (slower, still unbounded across queries) or shrink the
+    cap further (more partial results). The heap profiler in the image
+    (`ZO_HEAP_PROFILE_SAMPLE_EVERY_MB`, M27) on one canary would turn the
+    inference above into allocation sites before the change.
 
 ## 2026-10-15 — `.219` to PROD, readers-first: queriers 15:34Z (#641), compactors 15:55Z (#642), ingesters + router 17:46–18:37Z (#644); fleet converged 34/34
 - **Queriers** (`v0.93.0-vix-20261015.219`, image only; #641 also
