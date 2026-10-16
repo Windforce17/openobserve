@@ -152,15 +152,22 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
   the shape over the last hour, 11:04Z): 2 files / 388 MB → +2.65 GB,
   3 / 492 MB → +1.96, 6 / 954 MB → +3.72, 6 / 1,394 MB → **+8.20 GB**,
   8 / 1,989 MB → +1.70, while DataFusion's tracked peak was 106–527 MB:
-  **the pool sees 5–10 % of the scan branch's memory**. Mechanism
-  [INFERENCE from `vix_format.rs`]: ranged mode with the index's row
-  selection, but compression is per chunk, so every row group holding a
-  selected row is decoded WHOLE on the vortex runtime (a 220 MB file is
-  2.2 GB logical; 2,600 scattered hits touch most row groups), 16
-  partitions × a 2-batch channel, and only the Arrow conversion
-  reservation is charged to the pool. A fresh pod (4 GB RSS) shows ~0
-  delta for 1 file — the allocator reuses freed pages — which is why the
-  per-file number is so noisy.
+  **the pool sees 5–10 % of the scan branch's memory**. Mechanism (code,
+  `vortex_index/src/container.rs::scan_blob_streaming`, `conversion.rs::
+  convert_chunks_ordered`, `vix_format.rs::VixCoreOpener::open`): the
+  filter-back files open ranged with the index's row ids
+  (`RowSelection::Indices`, bounded to `first..last+1`); vortex decodes
+  every chunk whose mask has a true row WHOLE — compression is per chunk
+  — and `into_array_iter` yields the materialized chunk BEFORE any
+  accounting runs (a 220 MB file is 2.2 GB logical; 2,600 scattered hits
+  touch most chunks). The only memory the pool ever sees is the Arrow
+  CONVERSION reservation (`reserve_conversion(probe)`), and that path is
+  taken only for `RowSelection::All | Range` (`487f6e6eff`, 2026-09-12)
+  and falls back to inline conversion when the budget is short instead of
+  waiting — the `Indices` path skips the controller altogether. Fan-out:
+  16 partitions × a 2-batch channel per file on `VORTEX_RUNTIME`. A fresh
+  pod (4 GB RSS) shows ~0 delta for 1 file — mimalloc reuses freed pages
+  — which is why the per-file number is so noisy.
   - **Mitigation (#652, 11:06Z, queriers restarted):** cap 4 GiB → 1 GiB.
     The fatal query replayed over its fatal window: the three heavy
     followers keep 3–4 of 24–28 files (~1.3 GB compressed; 21–25 skipped
@@ -178,16 +185,22 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
     was measurable from the logs) but the scan branch's decode memory
     was almost certainly the larger consumer. Same root: a per-query
     budget on compressed bytes with the decoded memory untracked.
-  - **`.222` design (not started; owner call on the behaviour):** charge
-    the scan branch's decode to a process-wide gate — reserve each row
-    group's logical chunk bytes (known from the footer) in a node pool
-    before decoding it, release when the batch is handed over; a scan
-    that does not fit waits like the segment pool (queue, not OOM; a
-    60 s wait fails that query). Alternatives: lower decode concurrency
-    per query (slower, still unbounded across queries) or shrink the
-    cap further (more partial results). The heap profiler in the image
-    (`ZO_HEAP_PROFILE_SAMPLE_EVERY_MB`, M27) on one canary would turn the
-    inference above into allocation sites before the change.
+  - **`.222` design (not started; owner call on the behaviour):** a
+    process-wide decode gate in `scan_blob_streaming` — before pulling
+    the next chunk, reserve its decoded size (the writer bounds chunks by
+    `docs_chunk_bytes`; per-leaf logical sizes are in the vortex footer)
+    in a node pool; the permit must outlive the `on_batch` hand-off (the
+    batch lives in the 2-deep channel and DataFusion's pipeline), so the
+    honest unit is "chunks decoded and not yet consumed", bounded
+    per-query by 3 × files and process-wide by the pool; a scan that does
+    not fit waits like the segment pool (queue, not OOM; a 60 s wait
+    fails that query). Cheaper alternatives: route `Indices` scans
+    through `convert_chunks_ordered` (accounts conversion only, still
+    not the vortex buffers, still falls back instead of waiting), lower
+    decode fan-out per query (slower, unbounded across queries), or a
+    smaller cap (more partial results). The heap profiler in the image
+    (`ZO_HEAP_PROFILE_SAMPLE_EVERY_MB`, M27) on one canary would confirm
+    the allocation sites before the change.
 
 ## 2026-10-15 — `.219` to PROD, readers-first: queriers 15:34Z (#641), compactors 15:55Z (#642), ingesters + router 17:46–18:37Z (#644); fleet converged 34/34
 - **Queriers** (`v0.93.0-vix-20261015.219`, image only; #641 also
