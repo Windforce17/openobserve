@@ -1028,6 +1028,43 @@ SELECT stream, date FROM file_list WHERE index_size > 0 AND bloom_ver = 0 AND da
         Ok(ret)
     }
 
+    async fn query_bloom_fragmented_buckets(
+        &self,
+        before_date: &str,
+        max_versions: i64,
+        small_members: i64,
+        limit: i64,
+    ) -> Result<Vec<(String, String)>> {
+        let start = std::time::Instant::now();
+        let pool = CLIENT_RO.clone();
+        DB_QUERY_NUMS
+            .with_label_values(&["query_bloom_fragmented_buckets", "file_list"])
+            .inc();
+        // hours with more `.bf` versions than the chunk cap of which at
+        // least one is small enough to fold (the consolidator only reads
+        // small chunks back); a settled hour whose surplus versions are all
+        // large is left alone, so the sweep never spins on it
+        let sql = r#"
+SELECT stream, date FROM (
+    SELECT stream, date, bloom_ver, count(*) AS members FROM file_list
+    WHERE index_size > 0 AND bloom_ver > 0 AND date < $1 GROUP BY stream, date, bloom_ver
+) v GROUP BY stream, date
+HAVING count(*) > $2 AND count(*) FILTER (WHERE members <= $3) > 0
+ORDER BY date DESC LIMIT $4;
+                "#;
+        let ret: Vec<(String, String)> = sqlx::query_as::<_, (String, String)>(sql)
+            .bind(before_date)
+            .bind(max_versions)
+            .bind(small_members)
+            .bind(limit)
+            .fetch_all(&pool)
+            .await?;
+        DB_QUERY_TIME
+            .with_label_values(&["query_bloom_fragmented_buckets", "file_list"])
+            .observe(start.elapsed().as_secs_f64());
+        Ok(ret)
+    }
+
     async fn query_by_ids(
         &self,
         ids: &[i64],

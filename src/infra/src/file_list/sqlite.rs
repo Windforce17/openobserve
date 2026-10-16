@@ -46,6 +46,18 @@ WHERE stream = $4 AND date = $5 AND file = $6
   AND index_size = $7 AND index_generation = $8;
 "#;
 
+/// Settled hours fragmented into more than `$2` `.bf` versions with at least
+/// one version of at most `$3` members (see
+/// [`super::FileList::query_bloom_fragmented_buckets`]).
+const BLOOM_FRAGMENTED_BUCKETS_SQL: &str = r#"
+SELECT stream, date FROM (
+    SELECT stream, date, bloom_ver, count(*) AS members FROM file_list
+    WHERE index_size > 0 AND bloom_ver > 0 AND date < $1 GROUP BY stream, date, bloom_ver
+) v GROUP BY stream, date
+HAVING count(*) > $2 AND sum(CASE WHEN members <= $3 THEN 1 ELSE 0 END) > 0
+ORDER BY date DESC LIMIT $4;
+"#;
+
 pub struct SqliteFileList {}
 
 impl SqliteFileList {
@@ -884,6 +896,25 @@ SELECT stream, date FROM file_list WHERE index_size > 0 AND bloom_ver = 0 AND da
             .bind(limit)
             .fetch_all(&pool)
             .await?;
+        Ok(ret)
+    }
+
+    async fn query_bloom_fragmented_buckets(
+        &self,
+        before_date: &str,
+        max_versions: i64,
+        small_members: i64,
+        limit: i64,
+    ) -> Result<Vec<(String, String)>> {
+        let pool = CLIENT_RO.clone();
+        let ret: Vec<(String, String)> =
+            sqlx::query_as::<_, (String, String)>(BLOOM_FRAGMENTED_BUCKETS_SQL)
+                .bind(before_date)
+                .bind(max_versions)
+                .bind(small_members)
+                .bind(limit)
+                .fetch_all(&pool)
+                .await?;
         Ok(ret)
     }
 
@@ -3427,6 +3458,79 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(unpruned.len(), 3, "0, -1 and -2 all stay un-pruned");
+    }
+
+    /// The consolidation sweep revisits only hours it can make progress on:
+    /// more versions than the chunk cap AND at least one version small
+    /// enough to fold; hours of only large versions, hours under the cap and
+    /// unsettled hours are left alone; newest first.
+    #[tokio::test]
+    async fn test_bloom_fragmented_buckets_select_only_foldable_settled_hours() {
+        let pool = fresh_in_memory_pool().await;
+        create_legacy_file_list_table(&pool).await;
+        crate::db::sqlite::add_column(&pool, "file_list", "bloom_ver", "BIGINT default 0 not null")
+            .await
+            .unwrap();
+        // (date, version, members)
+        let mut rows: Vec<(&str, i64, usize)> = Vec::new();
+        // 2026/08/01/00: 4 one-file versions (pre-B4 shape) -> candidate
+        rows.extend((1..=4).map(|v| ("2026/08/01/00", 100 + v, 1)));
+        // 2026/08/01/01: 4 versions of 3 members each, none small -> skipped
+        rows.extend((1..=4).map(|v| ("2026/08/01/01", 200 + v, 3)));
+        // 2026/08/01/02: 3 versions, at the cap -> skipped
+        rows.extend((1..=3).map(|v| ("2026/08/01/02", 300 + v, 1)));
+        // 2026/08/01/03: 4 one-file versions, newest candidate
+        rows.extend((1..=4).map(|v| ("2026/08/01/03", 400 + v, 1)));
+        // 2026/08/01/05: fragmented but not settled (>= before_date) -> skipped
+        rows.extend((1..=4).map(|v| ("2026/08/01/05", 500 + v, 1)));
+        // pending and sentinel rows never count as versions
+        rows.push(("2026/08/01/02", 0, 1));
+        rows.push(("2026/08/01/02", -1, 1));
+        for (date, version, members) in rows {
+            for m in 0..members {
+                sqlx::query(
+                    r#"INSERT INTO file_list
+                        (account, org, stream, date, file, deleted, flattened,
+                         min_ts, max_ts, records, original_size, compressed_size,
+                         index_size, bloom_ver, updated_at)
+                       VALUES ('a', 'o', 'o/logs/s', ?, ?, false, false,
+                               1, 2, 3, 4, 5, 6, ?, 7);"#,
+                )
+                .bind(date)
+                .bind(format!("{version}_{m}.parquet"))
+                .bind(version)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        }
+
+        let candidates: Vec<(String, String)> = sqlx::query_as(BLOOM_FRAGMENTED_BUCKETS_SQL)
+            .bind("2026/08/01/04")
+            .bind(3i64)
+            .bind(2i64)
+            .bind(10i64)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            candidates,
+            vec![
+                ("o/logs/s".to_string(), "2026/08/01/03".to_string()),
+                ("o/logs/s".to_string(), "2026/08/01/00".to_string()),
+            ]
+        );
+
+        let limited: Vec<(String, String)> = sqlx::query_as(BLOOM_FRAGMENTED_BUCKETS_SQL)
+            .bind("2026/08/01/04")
+            .bind(3i64)
+            .bind(2i64)
+            .bind(1i64)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(limited.len(), 1, "the limit bounds the candidate window");
+        assert_eq!(limited[0].1, "2026/08/01/03", "newest first");
     }
 
     // ── delete_by_org row move ───────────────────────────────────────────────

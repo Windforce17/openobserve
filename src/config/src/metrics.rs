@@ -1898,6 +1898,76 @@ pub static VIX_EVAL_GROWTH_TIMEOUTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     )
     .expect("Metric created")
 });
+/// Bytes of not-yet-sealed live data currently retained by segment scans on
+/// this node, against `ZO_SEGMENT_SCAN_POOL_BYTES`.
+pub static SEGMENT_SCAN_RETAINED_BYTES: Lazy<IntGaugeVec> = Lazy::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            "segment_scan_retained_bytes",
+            "Live-data bytes retained by concurrent segment scans against the process-wide pool",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &[],
+    )
+    .expect("Metric created")
+});
+/// Segment scans that waited for pool bytes (`waited`) or gave up after the
+/// full wait (`timed_out`). `waited` non-zero means concurrent scans
+/// oversubscribed the pool and were serialized instead of OOM-killing the
+/// pod; `timed_out` means a query failed for it.
+pub static SEGMENT_SCAN_POOL_WAITS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "segment_scan_pool_waits_total",
+            "Segment scans that waited for the live-data retention pool, by outcome",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &["outcome"],
+    )
+    .expect("Metric created")
+});
+/// Parsed `.bf` footers resident in the pruner's footer cache
+/// (`ZO_BLOOM_FOOTER_CACHE_MAX_SIZE`), bytes and entries.
+pub static BLOOM_FOOTER_CACHE_BYTES: Lazy<IntGaugeVec> = Lazy::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            "bloom_footer_cache_bytes",
+            "Accounted bytes of parsed .bf footers in the bloom footer cache",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &[],
+    )
+    .expect("Metric created")
+});
+pub static BLOOM_FOOTER_CACHE_ENTRIES: Lazy<IntGaugeVec> = Lazy::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            "bloom_footer_cache_entries",
+            "Parsed .bf footers in the bloom footer cache",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &[],
+    )
+    .expect("Metric created")
+});
+/// Footer cache lookups by outcome (`hit` / `miss`); a miss is one suffix
+/// GET per `.bf` group on the query path.
+pub static BLOOM_FOOTER_CACHE_LOOKUPS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "bloom_footer_cache_lookups_total",
+            "Bloom footer cache lookups by outcome",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &["outcome"],
+    )
+    .expect("Metric created")
+});
 /// Files an index-optimized aggregate could not answer from the VIX index
 /// and handed to the DataFusion scan branch instead, by reason.
 /// `skipped_condition`/`partial_fields` are query shapes the index cannot
@@ -2794,6 +2864,21 @@ fn register_metrics(registry: &Registry) {
     registry
         .register(Box::new(VIX_FAST_PATH_FALLBACK_TOTAL.clone()))
         .expect("Metric registered");
+    registry
+        .register(Box::new(SEGMENT_SCAN_RETAINED_BYTES.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(SEGMENT_SCAN_POOL_WAITS_TOTAL.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(BLOOM_FOOTER_CACHE_BYTES.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(BLOOM_FOOTER_CACHE_ENTRIES.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(BLOOM_FOOTER_CACHE_LOOKUPS_TOTAL.clone()))
+        .expect("Metric registered");
 
     // metrics for generic bytes cache
     registry
@@ -3190,6 +3275,11 @@ mod tests {
         let _ = VIX_FAST_PATH_FALLBACK_TOTAL.clone();
         let _ = VIX_EVAL_GROWTH_TIMEOUTS_TOTAL.clone();
         let _ = VIX_EVAL_MEMORY_BYTES.clone();
+        let _ = SEGMENT_SCAN_RETAINED_BYTES.clone();
+        let _ = SEGMENT_SCAN_POOL_WAITS_TOTAL.clone();
+        let _ = BLOOM_FOOTER_CACHE_BYTES.clone();
+        let _ = BLOOM_FOOTER_CACHE_ENTRIES.clone();
+        let _ = BLOOM_FOOTER_CACHE_LOOKUPS_TOTAL.clone();
         let _ = VIX_FILE_BLOOM_PROBE_FILES_TOTAL.clone();
         let _ = QUERY_STORAGE_SCAN_CAPPED_TOTAL.clone();
         let _ = BYTES_CACHE_MEMORY_SIZE.clone();

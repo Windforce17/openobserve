@@ -92,7 +92,7 @@ use infra::{
 };
 
 use crate::service::search::{
-    datafusion::table_provider::memtable::NewMemTable,
+    datafusion::table_provider::memtable::{NewMemTable, RetainedBytes},
     index::{Condition, IndexCondition},
     utils::AbortOnDrop,
 };
@@ -140,15 +140,175 @@ impl SegmentShortfall {
 /// warning and the query CONTINUES — recent-data queries must not fail
 /// just because the stream is busy (owner call, 2026-08-11: a filtered
 /// last-15min query died 0.03% over the old hard cap). The HARD ceiling —
-/// half the pod's cgroup memory limit, never below the soft budget — still
-/// fails the query loudly: past it the materialized backlog itself
+/// half the pod's cgroup memory limit, never below the soft budget, never
+/// above the process-wide pool a single scan could never be granted —
+/// still fails the query loudly: past it the materialized backlog itself
 /// endangers the pod (correctness over availability, same stance as
 /// fetch/decode errors; a silently truncated scan would be silent partial
 /// data).
 fn segment_scan_budgets() -> (usize, usize) {
     let soft = get_config().limit.segment_scan_max_bytes;
-    let hard = (config::utils::sysinfo::get_memory_limit() / 2).max(soft.max(1));
+    let hard = (config::utils::sysinfo::get_memory_limit() / 2)
+        .min(retention_pool_bytes())
+        .max(soft.max(1));
     (soft, hard)
+}
+
+/// Granularity of the retention pool's permits: one permit per KiB keeps the
+/// largest single reservation (`u32` permits per acquire) at 4 TiB.
+const RETENTION_UNIT: usize = 1024;
+
+/// How long a scan waits for pool bytes before failing. Scans release their
+/// rows when the follower's plan finishes (seconds), so a pool that is merely
+/// busy serves a waiter well within this; one still full after a minute is
+/// oversubscribed by far more than queueing can absorb, and failing the
+/// query is the honest outcome — the alternative was the whole pod.
+const RETENTION_WAIT: Duration = Duration::from_secs(60);
+
+/// The configured pool size in bytes (`ZO_SEGMENT_SCAN_POOL_BYTES`, resolved
+/// at config load).
+fn retention_pool_bytes() -> usize {
+    get_config()
+        .limit
+        .segment_scan_pool_bytes
+        .max(RETENTION_UNIT)
+}
+
+/// Process-wide pool of live-data bytes concurrent segment scans may retain
+/// (DESIGN: the per-query budgets above bound ONE scan; 29 concurrent
+/// needle lookups each retaining 335 MB under their own 512 MiB soft budget
+/// OOM-killed 7 of 10 prod queriers at once, 2026-10-16 03:19Z). FIFO: a
+/// scan whose next batch does not fit waits for running scans to drop their
+/// tables; later arrivals queue behind it.
+static RETENTION_POOL: LazyLock<Arc<tokio::sync::Semaphore>> = LazyLock::new(|| {
+    Arc::new(tokio::sync::Semaphore::new(
+        retention_pool_bytes() / RETENTION_UNIT,
+    ))
+});
+
+/// One scan's reservation in a retention pool ([`RETENTION_POOL`] in
+/// production), grown as batches are kept and handed to the scan's tables
+/// at the end ([`RetainedBytes`]).
+struct RetentionLease {
+    pool: Arc<tokio::sync::Semaphore>,
+    pool_bytes: usize,
+    wait: Duration,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    /// Bytes the held permits cover (a whole number of units).
+    reserved: usize,
+    waited: bool,
+}
+
+impl RetentionLease {
+    fn new() -> Self {
+        Self::in_pool(
+            Arc::clone(&RETENTION_POOL),
+            retention_pool_bytes(),
+            RETENTION_WAIT,
+        )
+    }
+
+    fn in_pool(pool: Arc<tokio::sync::Semaphore>, pool_bytes: usize, wait: Duration) -> Self {
+        Self {
+            pool,
+            pool_bytes,
+            wait,
+            permit: None,
+            reserved: 0,
+            waited: false,
+        }
+    }
+
+    /// Reserve up to `kept_bytes` (no-op when already covered). Waits FIFO
+    /// for pool bytes up to [`RETENTION_WAIT`]; the first wait of a scan is
+    /// logged so queueing is visible per query.
+    async fn grow_to(&mut self, kept_bytes: usize, trace_id: &str, stream: &str) -> Result<()> {
+        if kept_bytes <= self.reserved {
+            return Ok(());
+        }
+        let units = (kept_bytes - self.reserved).div_ceil(RETENTION_UNIT);
+        let units_u32 = u32::try_from(units).map_err(|_| {
+            Error::ResourceError(format!(
+                "[SEGMENT:SCAN] {stream}: a single scan step needs {} bytes of live data, beyond the retention pool's reservation unit range",
+                kept_bytes - self.reserved
+            ))
+        })?;
+        let pool = Arc::clone(&self.pool);
+        let permit = match pool.clone().try_acquire_many_owned(units_u32) {
+            Ok(permit) => permit,
+            Err(tokio::sync::TryAcquireError::Closed) => {
+                return Err(Error::ResourceError(
+                    "[SEGMENT:SCAN] live-data retention pool closed".to_string(),
+                ));
+            }
+            Err(tokio::sync::TryAcquireError::NoPermits) => {
+                let waiting = Instant::now();
+                let retained_before = self
+                    .pool_bytes
+                    .saturating_sub(pool.available_permits() * RETENTION_UNIT);
+                let acquired = tokio::time::timeout(
+                    self.wait,
+                    Arc::clone(&pool).acquire_many_owned(units_u32),
+                )
+                .await;
+                match acquired {
+                    Ok(Ok(permit)) => {
+                        if !self.waited {
+                            self.waited = true;
+                            config::metrics::SEGMENT_SCAN_POOL_WAITS_TOTAL
+                                .with_label_values(&["waited"])
+                                .inc();
+                            log::warn!(
+                                "[trace_id {trace_id}] [SEGMENT:SCAN] {stream}: waited {} ms for {} bytes of the live-data retention pool (ZO_SEGMENT_SCAN_POOL_BYTES={}, {retained_before} bytes retained by other scans at the time) — concurrent scans oversubscribed the pool and were serialized",
+                                waiting.elapsed().as_millis(),
+                                units * RETENTION_UNIT,
+                                self.pool_bytes,
+                            );
+                        }
+                        permit
+                    }
+                    Ok(Err(_)) => {
+                        return Err(Error::ResourceError(
+                            "[SEGMENT:SCAN] live-data retention pool closed".to_string(),
+                        ));
+                    }
+                    Err(_) => {
+                        config::metrics::SEGMENT_SCAN_POOL_WAITS_TOTAL
+                            .with_label_values(&["timed_out"])
+                            .inc();
+                        return Err(Error::ResourceError(format!(
+                            "[SEGMENT:SCAN] {stream}: this query needs {} more bytes of not-yet-sealed live data but the node's retention pool (ZO_SEGMENT_SCAN_POOL_BYTES={}) stayed full for {:?} — too many concurrent live-data scans; retry shortly, narrow the time range, add filters on always-present fields, or select fewer columns",
+                            units * RETENTION_UNIT,
+                            self.pool_bytes,
+                            self.wait
+                        )));
+                    }
+                }
+            }
+        };
+        match self.permit.as_mut() {
+            Some(held) => held.merge(permit),
+            None => self.permit = Some(permit),
+        }
+        self.reserved += units * RETENTION_UNIT;
+        Ok(())
+    }
+
+    /// Hand the reservation to the scan's tables, releasing what trims and
+    /// projections freed since the last growth.
+    fn finish(mut self, kept_bytes: usize) -> Option<Arc<RetainedBytes>> {
+        let mut permit = self.permit.take()?;
+        let needed_units = kept_bytes.div_ceil(RETENTION_UNIT).max(1);
+        let held_units = permit.num_permits();
+        if held_units > needed_units {
+            // `split` returns the carved-off permits; dropping them releases
+            drop(permit.split(held_units - needed_units));
+        }
+        Some(Arc::new(RetainedBytes::new(
+            permit,
+            needed_units.min(held_units) * RETENTION_UNIT,
+        )))
+    }
 }
 
 /// Storage account segment objects live under — the flusher PUTs with the
@@ -1184,6 +1344,11 @@ pub(super) async fn search(
     let mut kept_bytes: usize = 0;
     let mut soft_budget_warned = false;
     let (scan_soft_budget, scan_hard_ceiling) = segment_scan_budgets();
+    let mut retention = RetentionLease::new();
+    let stream_label = format!(
+        "{}/{}/{}",
+        query.org_id, query.stream_type, query.stream_name
+    );
     let mut zero_yield_stream_absent = 0usize;
     let mut zero_yield_time_pruned = 0usize;
     let mut zero_yield_top_n_pruned = 0usize;
@@ -1295,6 +1460,13 @@ pub(super) async fn search(
             query.stream_type,
             &query.stream_name,
         )?;
+        // The KEPT rows are what accumulates for the whole query (in-flight
+        // fetch/decode is bounded separately by the fetch budget and the
+        // decode concurrency); reserving them here keeps the pod's total
+        // live-data retention across every concurrent scan within the pool.
+        retention
+            .grow_to(kept_bytes, trace_id, &stream_label)
+            .await?;
         tokio::task::coop::consume_budget().await;
     }
     fetch_producer
@@ -1370,6 +1542,9 @@ pub(super) async fn search(
     }
 
     let table_build_start = Instant::now();
+    // The pool reservation moves to the tables: it is released when the
+    // last of them drops with the follower's plan.
+    let retained = retention.finish(kept_bytes);
     // Exact certifies only this reconstructed IndexCondition, not outer SQL
     // residuals or timestamp filtering. Never merge its rows with Deferred.
     let mut tables = build_tables_from_batches(
@@ -1380,6 +1555,7 @@ pub(super) async fn search(
         None,
         fst_fields.clone(),
         query.time_range,
+        retained.clone(),
     )?;
     tables.extend(build_tables_from_batches(
         trace_id,
@@ -1389,6 +1565,7 @@ pub(super) async fn search(
         index_condition,
         fst_fields,
         query.time_range,
+        retained,
     )?);
     log::info!(
         "[trace_id {trace_id}] segments_scan profile: table build {} batches -> {} tables took {} ms",
@@ -2604,6 +2781,7 @@ fn push_within_budget(
 /// casts, lazy `_source`). Never concat mixed schemas: a field that
 /// type-flipped between writes puts mixed-type batches in one stream (the
 /// 2026-07-30 lesson).
+#[allow(clippy::too_many_arguments)]
 fn build_tables_from_batches(
     trace_id: &str,
     batches: Vec<RecordBatch>,
@@ -2612,6 +2790,7 @@ fn build_tables_from_batches(
     index_condition: Option<IndexCondition>,
     fst_fields: Vec<String>,
     time_range: (i64, i64),
+    retained: Option<Arc<RetainedBytes>>,
 ) -> Result<Vec<Arc<dyn TableProvider>>> {
     let latest_schema = Arc::new(schema.as_ref().clone().with_metadata(Default::default()));
     let batch_groups = group_by_batch_schema(batches);
@@ -2667,7 +2846,8 @@ fn build_tables_from_batches(
         .map_err(|e| {
             log::error!("[trace_id {trace_id}] segments_scan: create memtable error: {e}");
             Error::from(e)
-        })?;
+        })?
+        .with_retained(retained.clone());
         tables.push(Arc::new(table) as _);
     }
     Ok(tables)
@@ -2856,6 +3036,7 @@ mod tests {
             None,
             vec![],
             (0, 500),
+            None,
         )
         .unwrap();
         tables.extend(
@@ -2867,6 +3048,7 @@ mod tests {
                 Some(condition),
                 vec![],
                 (0, 500),
+                None,
             )
             .unwrap(),
         );
@@ -3944,6 +4126,82 @@ mod tests {
 
     use super::*;
 
+    /// The retention pool is what keeps concurrent scans from stacking their
+    /// kept rows past the pod: a lease grows in whole units, a second scan
+    /// that does not fit waits until the first scan's tables drop, a wait
+    /// past the grace fails the query (never the pod), and `finish` hands
+    /// exactly the kept bytes to the tables, releasing the rest.
+    #[tokio::test]
+    async fn retention_pool_serializes_scans_and_releases_with_the_tables() {
+        let pool_bytes = 8 * RETENTION_UNIT;
+        let pool = Arc::new(tokio::sync::Semaphore::new(pool_bytes / RETENTION_UNIT));
+        let wait = Duration::from_millis(200);
+
+        // 5 units + 1 byte rounds up to 6 units
+        let mut first = RetentionLease::in_pool(Arc::clone(&pool), pool_bytes, wait);
+        first
+            .grow_to(5 * RETENTION_UNIT + 1, "t", "o/logs/s")
+            .await
+            .unwrap();
+        assert_eq!(first.reserved, 6 * RETENTION_UNIT);
+        assert_eq!(pool.available_permits(), 2);
+        // growing within the reservation reserves nothing more
+        first
+            .grow_to(6 * RETENTION_UNIT, "t", "o/logs/s")
+            .await
+            .unwrap();
+        assert_eq!(pool.available_permits(), 2);
+
+        // the second scan needs 4 units with 2 free: it waits ...
+        let pool2 = Arc::clone(&pool);
+        let waiter = tokio::spawn(async move {
+            let mut second = RetentionLease::in_pool(pool2, pool_bytes, wait);
+            second
+                .grow_to(4 * RETENTION_UNIT, "t2", "o/logs/s")
+                .await
+                .map(|_| second)
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiter.is_finished(), "a scan that does not fit waits");
+
+        // ... until the first scan's tables drop: `finish` keeps the 3 units
+        // actually kept (trims freed the rest) and releases 3 of the 6
+        let retained = first
+            .finish(3 * RETENTION_UNIT)
+            .expect("a reservation was held");
+        assert_eq!(retained.bytes(), 3 * RETENTION_UNIT);
+        // 8 - 3 held = 5 free, 4 go to the waiter
+        let second = waiter.await.unwrap().unwrap();
+        assert_eq!(second.reserved, 4 * RETENTION_UNIT);
+        assert_eq!(pool.available_permits(), 1);
+        drop(retained);
+        assert_eq!(pool.available_permits(), 4);
+        drop(second);
+        assert_eq!(pool.available_permits(), 8);
+
+        // a scan that cannot be served within the grace fails the query
+        let mut hog = RetentionLease::in_pool(Arc::clone(&pool), pool_bytes, wait);
+        hog.grow_to(8 * RETENTION_UNIT, "t3", "o/logs/s")
+            .await
+            .unwrap();
+        let mut starved = RetentionLease::in_pool(Arc::clone(&pool), pool_bytes, wait);
+        let err = starved
+            .grow_to(RETENTION_UNIT, "t4", "o/logs/s")
+            .await
+            .expect_err("a full pool fails the waiter after the grace");
+        assert!(
+            err.to_string().contains("retention pool"),
+            "the error names the pool: {err}"
+        );
+        assert_eq!(starved.reserved, 0, "a failed growth reserves nothing");
+        drop(hog);
+        assert_eq!(pool.available_permits(), 8);
+
+        // nothing kept: no lease is handed to the tables
+        let empty = RetentionLease::in_pool(Arc::clone(&pool), pool_bytes, wait);
+        assert!(empty.finish(0).is_none());
+    }
+
     #[test]
     fn cap_is_non_fatal_and_keeps_the_newest() {
         // under the cap: untouched, no shortfall
@@ -4845,6 +5103,7 @@ mod tests {
             None,
             vec![],
             (0, i64::MAX),
+            None,
         )
         .expect("build tables");
         assert_eq!(tables.len(), 2, "one table per write-time schema group");

@@ -2365,6 +2365,12 @@ pub struct Limit {
     )]
     pub segment_scan_max_bytes: usize,
     #[env_config(
+        name = "ZO_SEGMENT_SCAN_POOL_BYTES",
+        default = 0,
+        help = "Process-wide cap (bytes) on not-yet-sealed live data ALL concurrent segment scans on this node may hold at once. A scan whose next batch does not fit waits FIFO for running scans to release their rows (up to 60 s, then fails with a clear error); the per-query hard stop is min(half the pod's cgroup memory limit, this pool). 0 = auto: 1/8 of the memory limit, clamped to [1 GiB, 8 GiB]. Occupancy: zo_segment_scan_retained_bytes. Without it 29 concurrent needle lookups retaining 335 MB each OOM-killed 7 of 10 prod queriers (2026-10-16 03:19Z)."
+    )]
+    pub segment_scan_pool_bytes: usize,
+    #[env_config(
         name = "ZO_STORAGE_SCAN_MAX_BYTES",
         default = 0,
         help = "Per follower query, the most compressed bytes the storage scan branch (files the index could not answer or prune) may open, for ORDER BY _timestamp LIMIT selects only. Past it the files at the ORDER BY end that fit (newest for DESC, oldest for ASC) are scanned and the response is marked partial with a message naming the skipped files and bytes — instead of reserving the whole shared DataFusion pool for one needle lookup. 0 disables the cap."
@@ -3017,6 +3023,12 @@ pub struct Compact {
         help = "Max pending (stream, hour) buckets one bloom-builder pass drains."
     )]
     pub bloom_build_batch: i64,
+    #[env_config(
+        name = "ZO_COMPACT_BLOOM_SWEEP_HOURS",
+        default = 4,
+        help = "After the pending buckets, how many settled hours fragmented into more than ZO_COMPACT_BLOOM_MAX_CHUNKS `.bf` versions (at least one of them small) one builder pass revisits to consolidate, newest first, one chunk of members per visit (0 disables). Hours nothing re-pends — the whole pre-B4 window of one `.bf` per file — never reach the pending queue, so without the sweep an id-like needle query over a day pays one footer read per file whenever the footers aged out of the cache."
+    )]
+    pub bloom_sweep_hours: usize,
     #[env_config(
         name = "ZO_COMPACT_BLOOM_BUILD_FALLBACK_BUDGET",
         default = 128,
@@ -4639,6 +4651,19 @@ fn check_memory_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
     } else {
         cfg.limit.bloom_footer_cache_max_size *= SIZE_IN_MB as usize;
     }
+    if cfg.limit.segment_scan_pool_bytes == 0 {
+        // 1/8 of the memory limit, clamped to [1, 8] GiB: beside the shared
+        // DataFusion pool, the VIX evaluation pool and the reader cache this
+        // was the one per-query allocation that scaled with the number of
+        // concurrent queries instead of with a budget.
+        const GIB: usize = 1024 * 1024 * 1024;
+        cfg.limit.segment_scan_pool_bytes = (cfg.limit.mem_total / 8).clamp(GIB, 8 * GIB);
+    }
+    // a pool below one query's soft budget could never grant that query
+    cfg.limit.segment_scan_pool_bytes = cfg
+        .limit
+        .segment_scan_pool_bytes
+        .max(cfg.limit.segment_scan_max_bytes);
 
     if cfg.limit.datafusion_file_stat_cache_max_size == 0 {
         cfg.limit.datafusion_file_stat_cache_max_size =

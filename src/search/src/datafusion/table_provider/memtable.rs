@@ -33,6 +33,42 @@ use crate::{
     index::IndexCondition,
 };
 
+/// Bytes a segment scan holds in the process-wide live-data retention pool
+/// (`ZO_SEGMENT_SCAN_POOL_BYTES`) for the batches of its tables. Owned by
+/// every [`NewMemTable`] the scan built, so the pool bytes return exactly
+/// when the last table — and with it the batches — drops at the end of the
+/// follower's plan. Occupancy is published as `segment_scan_retained_bytes`.
+#[derive(Debug)]
+pub struct RetainedBytes {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    bytes: usize,
+}
+
+impl RetainedBytes {
+    /// `permit` carries the pool units backing `bytes`.
+    pub fn new(permit: tokio::sync::OwnedSemaphorePermit, bytes: usize) -> Self {
+        config::metrics::SEGMENT_SCAN_RETAINED_BYTES
+            .with_label_values::<&str>(&[])
+            .add(bytes.min(i64::MAX as usize) as i64);
+        Self {
+            _permit: permit,
+            bytes,
+        }
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+impl Drop for RetainedBytes {
+    fn drop(&mut self) {
+        config::metrics::SEGMENT_SCAN_RETAINED_BYTES
+            .with_label_values::<&str>(&[])
+            .sub(self.bytes.min(i64::MAX as usize) as i64);
+    }
+}
+
 /// A memtable/immutable-WAL table: holds the group's RAW record batches
 /// (the fields each record actually carries) and advertises the PLAN
 /// schema. The raw->plan adaptation — null-padding, type casts, and
@@ -50,6 +86,8 @@ pub struct NewMemTable {
     index_condition: Option<IndexCondition>,
     fst_fields: Vec<String>,
     timestamp_filter: (i64, i64),
+    /// Pool bytes backing this table's batches (segment scans only).
+    _retained: Option<Arc<RetainedBytes>>,
 }
 
 impl NewMemTable {
@@ -75,7 +113,15 @@ impl NewMemTable {
             index_condition,
             fst_fields,
             timestamp_filter,
+            _retained: None,
         })
+    }
+
+    /// Tie the table's lifetime to `retained` pool bytes (see
+    /// [`RetainedBytes`]).
+    pub fn with_retained(mut self, retained: Option<Arc<RetainedBytes>>) -> Self {
+        self._retained = retained;
+        self
     }
 }
 

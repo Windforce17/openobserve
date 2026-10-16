@@ -148,6 +148,7 @@ pub async fn run() -> Result<(), anyhow::Error> {
             &composite_scope,
             auto_id_scope,
             &bloom_only_never,
+            VisitMode::Pending,
         )
         .await
         {
@@ -168,7 +169,106 @@ pub async fn run() -> Result<(), anyhow::Error> {
             started.elapsed()
         );
     }
+    sweep_fragmented_hours(
+        &cfg,
+        &settled_before,
+        &composite_scope,
+        auto_id_scope,
+        &bloom_only_never,
+    )
+    .await;
     Ok(())
+}
+
+/// Consolidation sweep (B4 convergence for hours nothing re-pends): revisit
+/// up to `ZO_COMPACT_BLOOM_SWEEP_HOURS` settled hours fragmented into more
+/// than `ZO_COMPACT_BLOOM_MAX_CHUNKS` versions, newest first. Each visit runs
+/// the normal hour build with no pending files, so the consolidator folds
+/// one chunk's worth of small versions into one v2 chunk and the GC retires
+/// the superseded ones; an hour with more small versions than one chunk
+/// stays a candidate and folds further on a later pass. The candidate list
+/// is wider than one pod's share and shuffled so the fleet spreads over it
+/// instead of queueing on the same bucket locks.
+async fn sweep_fragmented_hours(
+    cfg: &config::Config,
+    settled_before: &str,
+    composite_scope: &config::VixBloomCompositeScope,
+    auto_id_scope: bool,
+    bloom_only_never: &Arc<HashSet<String>>,
+) {
+    let quota = cfg.compact.bloom_sweep_hours;
+    if quota == 0 {
+        return;
+    }
+    let chunk_files = cfg.compact.bloom_chunk_files.max(1);
+    let small_members = (chunk_files / 4).max(1);
+    let window = quota.saturating_mul(16).max(64);
+    let started = std::time::Instant::now();
+    let mut candidates = match infra::file_list::query_bloom_fragmented_buckets(
+        settled_before,
+        cfg.compact.bloom_max_chunks.max(1) as i64,
+        small_members as i64,
+        window as i64,
+    )
+    .await
+    {
+        Ok(candidates) => candidates,
+        Err(e) => {
+            log::warn!("[COMPACTOR:BLOOM] sweep: fragmented-hour discovery failed: {e:#}");
+            return;
+        }
+    };
+    if candidates.is_empty() {
+        return;
+    }
+    {
+        use rand::{SeedableRng, rngs::StdRng, seq::SliceRandom};
+        candidates.shuffle(&mut StdRng::seed_from_u64(rand::random()));
+    }
+    let total = candidates.len();
+    let (mut done, mut busy, mut failed) = (0usize, 0usize, 0usize);
+    for (stream_key, date) in candidates {
+        if done >= quota {
+            break;
+        }
+        let Some((org_id, stream_type, stream_name)) = parse_stream_key(&stream_key) else {
+            continue;
+        };
+        match process_bucket(
+            &org_id,
+            &stream_type,
+            &stream_name,
+            &date,
+            cfg.common.vix_bloom_fpp,
+            composite_scope,
+            auto_id_scope,
+            bloom_only_never,
+            VisitMode::Sweep,
+        )
+        .await
+        {
+            Ok(true) => done += 1,
+            Ok(false) => busy += 1,
+            Err(e) => {
+                failed += 1;
+                log::error!("[COMPACTOR:BLOOM] {stream_key}/{date}: sweep visit failed: {e:#}");
+            }
+        }
+    }
+    log::info!(
+        "[COMPACTOR:BLOOM] sweep: {done} of {total} fragmented hours consolidated ({busy} busy \
+         elsewhere, {failed} failed; quota {quota}) in {:?}",
+        started.elapsed()
+    );
+}
+
+/// Why a bucket is visited: the pending queue (files at `bloom_ver = 0`
+/// decide the regroup triggers) or the consolidation sweep (no pending work
+/// required; the hour is rebuilt from its small chunks).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VisitMode {
+    Pending,
+    Sweep,
 }
 
 /// The `date` (`YYYY/MM/DD/HH`) before which hours count as settled for the
@@ -190,6 +290,7 @@ fn parse_stream_key(stream_key: &str) -> Option<(String, String, String)> {
 
 /// Returns Ok(true) when the bucket was processed, Ok(false) when its lock
 /// was busy (another compactor owns it or a leaked lock is aging out).
+#[allow(clippy::too_many_arguments)]
 async fn process_bucket(
     org_id: &str,
     stream_type: &str,
@@ -199,6 +300,7 @@ async fn process_bucket(
     composite_scope: &config::VixBloomCompositeScope,
     auto_id_scope: bool,
     bloom_only_never: &Arc<HashSet<String>>,
+    mode: VisitMode,
 ) -> Result<bool, anyhow::Error> {
     let stream_type: config::meta::stream::StreamType = stream_type.into();
 
@@ -227,6 +329,7 @@ async fn process_bucket(
         composite_scope,
         auto_id_scope,
         bloom_only_never,
+        mode,
     )
     .await;
     dist_lock::unlock(&locker).await?;
@@ -264,6 +367,9 @@ enum BuildTrigger {
     PendingRatio,
     /// The oldest pending row waited `>= ZO_COMPACT_BLOOM_REGROUP_MAX_AGE_HOURS`.
     PendingAge,
+    /// Consolidation sweep: the hour is fragmented into more than
+    /// `ZO_COMPACT_BLOOM_MAX_CHUNKS` versions and nothing re-pended it.
+    Sweep,
 }
 
 /// DESIGN-COLD-MISS §4 B4 hour selection: a settled hour with pending files
@@ -316,6 +422,7 @@ impl BuildMember {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_bucket_locked(
     org_id: &str,
     stream_type: config::meta::stream::StreamType,
@@ -325,6 +432,7 @@ async fn process_bucket_locked(
     composite_scope: &config::VixBloomCompositeScope,
     auto_id_scope: bool,
     bloom_only_never: &Arc<HashSet<String>>,
+    mode: VisitMode,
 ) -> Result<(), anyhow::Error> {
     let cfg = get_config();
     // the WHOLE hour under the lock (another compactor may have built it):
@@ -336,7 +444,7 @@ async fn process_bucket_locked(
         .filter(|row| row.bloom_ver == 0)
         .map(FileKey::from)
         .collect();
-    if pending.is_empty() {
+    if pending.is_empty() && mode == VisitMode::Pending {
         return Ok(());
     }
 
@@ -353,6 +461,10 @@ async fn process_bucket_locked(
             .iter()
             .map(|file| (file.id, file.meta.index_generation, file.meta.index_size))
             .collect();
+        if expected.is_empty() {
+            // a sweep visit of an hour whose stream dropped its policy since
+            return Ok(());
+        }
         let matched =
             infra::file_list::update_bloom_ver(&expected, BLOOM_VER_NOT_APPLICABLE).await?;
         log::info!(
@@ -372,22 +484,30 @@ async fn process_bucket_locked(
         .map(|row| row.updated_at)
         .min()
         .map(|oldest| chrono::Duration::microseconds((now - oldest).max(0)));
-    let Some(trigger) = build_trigger(
-        pending.len(),
-        rows.len(),
-        stamped_rows.len(),
-        oldest_pending_age,
-        &cfg.compact,
-    ) else {
-        log::debug!(
-            "[COMPACTOR:BLOOM] {org_id}/{stream_type}/{stream_name}/{date}: {} of {} files \
-             pending ({} stamped), below the regroup triggers — held for a later pass (the \
-             per-file probe serves them meanwhile)",
+    // a sweep visit rebuilds the hour from its small chunks whatever the
+    // pending set looks like (pending files, if any, simply join the build)
+    let trigger = match mode {
+        VisitMode::Sweep => BuildTrigger::Sweep,
+        VisitMode::Pending => match build_trigger(
             pending.len(),
             rows.len(),
-            stamped_rows.len()
-        );
-        return Ok(());
+            stamped_rows.len(),
+            oldest_pending_age,
+            &cfg.compact,
+        ) {
+            Some(trigger) => trigger,
+            None => {
+                log::debug!(
+                    "[COMPACTOR:BLOOM] {org_id}/{stream_type}/{stream_name}/{date}: {} of {} \
+                     files pending ({} stamped), below the regroup triggers — held for a later \
+                     pass (the per-file probe serves them meanwhile)",
+                    pending.len(),
+                    rows.len(),
+                    stamped_rows.len()
+                );
+                return Ok(());
+            }
+        },
     };
 
     let started = std::time::Instant::now();
@@ -582,6 +702,20 @@ async fn process_bucket_locked(
     .await;
     let consolidated_files = consolidated.len();
     members.extend(consolidated);
+    if members.is_empty() && mode == VisitMode::Sweep {
+        // nothing to fold (the small versions were consolidated by another
+        // visit between discovery and the lock, or are unreadable and kept)
+        log::debug!(
+            "[COMPACTOR:BLOOM] {org_id}/{stream_type}/{stream_name}/{date}: sweep visit found \
+             nothing to consolidate across {} versions",
+            stamped_rows
+                .iter()
+                .map(|row| row.bloom_ver)
+                .collect::<HashSet<_>>()
+                .len()
+        );
+        return Ok(());
+    }
 
     // Chunking: members sorted by their section bytes so files of similar
     // cardinality share a chunk — each field section is folded to the

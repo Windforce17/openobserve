@@ -192,6 +192,18 @@ pub trait FileList: Sync + Send + 'static {
         before_date: &str,
         limit: i64,
     ) -> Result<Vec<(String, String)>>;
+    /// Settled `(stream, hour)` buckets whose stamped files are spread over
+    /// more than `max_versions` `.bf` versions, at least one of which has at
+    /// most `small_members` files (the only kind the consolidator folds),
+    /// newest first. The builder's sweep revisits these so the pre-B4
+    /// one-chunk-per-file window converges without waiting for a re-pend.
+    async fn query_bloom_fragmented_buckets(
+        &self,
+        before_date: &str,
+        max_versions: i64,
+        small_members: i64,
+        limit: i64,
+    ) -> Result<Vec<(String, String)>>;
     async fn query_by_ids(
         &self,
         ids: &[i64],
@@ -572,6 +584,18 @@ pub async fn query_bloom_pending_buckets(
     limit: i64,
 ) -> Result<Vec<(String, String)>> {
     CLIENT.query_bloom_pending_buckets(before_date, limit).await
+}
+
+/// See [`FileList::query_bloom_fragmented_buckets`].
+pub async fn query_bloom_fragmented_buckets(
+    before_date: &str,
+    max_versions: i64,
+    small_members: i64,
+    limit: i64,
+) -> Result<Vec<(String, String)>> {
+    CLIENT
+        .query_bloom_fragmented_buckets(before_date, max_versions, small_members, limit)
+        .await
 }
 
 #[inline]

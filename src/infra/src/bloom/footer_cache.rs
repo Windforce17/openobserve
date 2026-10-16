@@ -39,16 +39,19 @@ use parking_lot::Mutex;
 use super::reader::BloomReader;
 
 /// Global cache. Sized via [`config::Config::limit::bloom_footer_cache_max_size`]
-/// (env: `ZO_BLOOM_FOOTER_CACHE_MAX_SIZE`).
+/// (env: `ZO_BLOOM_FOOTER_CACHE_MAX_SIZE`). Publishes `bloom_footer_cache_*`.
 pub static BLOOM_FOOTER_CACHE: LazyLock<BloomFooterCache> = LazyLock::new(|| {
     let max = config::get_config().limit.bloom_footer_cache_max_size;
-    BloomFooterCache::new(max)
+    BloomFooterCache::published(max)
 });
 
 /// Path-keyed, byte-bounded LRU of parsed `.bf` footers.
 pub struct BloomFooterCache {
     inner: Mutex<Inner>,
     max_bytes: usize,
+    /// Only the process-wide instance reports metrics; test instances stay
+    /// silent.
+    published: bool,
 }
 
 struct Inner {
@@ -58,22 +61,54 @@ struct Inner {
 
 impl BloomFooterCache {
     pub fn new(max_bytes: usize) -> Self {
+        Self::build(max_bytes, false)
+    }
+
+    fn published(max_bytes: usize) -> Self {
+        Self::build(max_bytes, true)
+    }
+
+    fn build(max_bytes: usize, published: bool) -> Self {
         Self {
             inner: Mutex::new(Inner {
                 lru: LruCache::new_unbounded(),
                 total: 0,
             }),
             max_bytes,
+            published,
+        }
+    }
+
+    fn publish(&self, inner: &Inner) {
+        if !self.published {
+            return;
+        }
+        config::metrics::BLOOM_FOOTER_CACHE_BYTES
+            .with_label_values::<&str>(&[])
+            .set(inner.total.min(i64::MAX as usize) as i64);
+        config::metrics::BLOOM_FOOTER_CACHE_ENTRIES
+            .with_label_values::<&str>(&[])
+            .set(inner.lru.len().min(i64::MAX as usize) as i64);
+    }
+
+    fn count_lookup(&self, hit: bool) {
+        if self.published {
+            config::metrics::BLOOM_FOOTER_CACHE_LOOKUPS_TOTAL
+                .with_label_values(&[if hit { "hit" } else { "miss" }])
+                .inc();
         }
     }
 
     /// The parsed footer of `path`, if cached (a hit refreshes recency).
     pub fn get(&self, path: &str) -> Option<Arc<BloomReader>> {
-        self.inner
+        let found = self
+            .inner
             .lock()
             .lru
             .get(path)
-            .map(|(reader, _)| Arc::clone(reader))
+            .map(|(reader, _)| Arc::clone(reader));
+        self.count_lookup(found.is_some());
+        found
     }
 
     /// Insert; the first value for a `path` wins (a `.bf` is immutable, so a
@@ -96,6 +131,7 @@ impl BloomFooterCache {
                 None => break,
             }
         }
+        self.publish(&inner);
     }
 
     /// Entries currently held.
