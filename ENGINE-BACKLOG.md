@@ -3,7 +3,7 @@
 Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
 (deleted 2026-07-29; full history in git). Keep THIS file current.
 
-## 2026-10-20 — `.222` queriers: equality `count(*)` on indexless core files evaluates natively (the DataFusion branch was 2.6–4.9 GB/follower and returned partial counts under pool pressure); compactor index-heal lag attributed to the single rebuild slot, not capacity
+## 2026-10-20 — `.222` queriers: equality `count(*)` on indexless core files evaluates natively (the DataFusion branch was 2.6–4.9 GB/follower and returned partial counts under pool pressure); compactor `ZO_VIX_REBUILD_CONCURRENCY` 1 → 2 (logs hour index drain +67–76 min → +34 min)
 - **Gap.** `count(*) WHERE col = 'v'` over a core file WITHOUT a `.vxi`
   went to the DataFusion scan branch while the identical predicate as a
   histogram already used the native docs column (`eq_string_histogram`,
@@ -90,10 +90,29 @@ Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
   (stream, hour) job runs on one pod (`JOB_BATCH_IN_FLIGHT=2`) —
   logs/default needs ≈60 permit-min per hour (≈300 heals × 5 s + ≈75
   merges × 25 s) on ONE pod, so an hour drains 67–76 min after it closes
-  (hour 08 healed +76 min, 09 +67 min). Cheapest lever: cap 1 → 2 on the
-  compactor Deployment (RSS-gated, so bounded at runtime), expected to
-  halve the drain; beyond 2 the per-pod job batch caps it (code change).
-  Not applied — owner call.
+  (hour 08 healed +76 min, 09 +67 min). Lever: cap 1 → 2 on the compactor
+  Deployment (RSS-gated, so bounded at runtime); beyond 2 the per-pod job
+  batch caps it (code change).
+- **Applied: `ZO_VIX_REBUILD_CONCURRENCY` 1 → 2 (`#657` `f1082fa2`, new RS
+  `obs-compactor-79d7fb785d` 12:00:12Z, 18/18 in 90 s).** Gate, 30 min of
+  15 s samples of process RSS (`zo_node_memory_usage`) on the new RS: p50
+  5.8–8.0 GiB per pod, fleet max 19.9 GiB (one pod; brake 40 GB), 0
+  restarts, 0 OOMKilled; 66 `rebuild admitted after … wait (2/2 slots
+  busy)` lines — the second slot is used and is where the waiting now
+  happens (waits 68 ms–22 s). Builder backlog at +95 min: 81 pending
+  (oldest 7.2 min), 1,253 claimed (oldest 2.8 min). Drain, `file_list`
+  indexless share of `default/logs/default` rows per hour, sampled every
+  5 min: hour 10 (closed 11:00Z, its single-slot job cancelled by the roll
+  at 12:00 and re-planned) went 526 → 218 → 101 → 7 → 0 files between
+  12:12 and 12:33; hour 11 (closed 12:00Z) reached 0.0 % of rows at
+  12:48Z = **+48 min**; hour 12 (closed 13:00Z, fully under the new cap)
+  28.5 % → 13.1 % → 2.2 % → 0.0 % at 13:34Z = **+34 min** (vs +67/+76
+  before). Late KB-size straggler L0s keep trickling into closed hours
+  and heal within the next sweep; judge convergence by the row share,
+  not the file count. Spot churn during the window replaced 4 queriers
+  and 3 compactors (`NodeNotReady` / `TaintManagerEviction`, all
+  restartCount 0) — the compactor-side `health check failed` ERRORs for
+  those pods are that, not the change. Rollback: value "1".
 
 ## 2026-10-16 — two fleet OOM modes (03:19Z ×7, 10:03Z ×3) → `.220`/`.221` segment-scan retention pool; `ZO_STORAGE_SCAN_MAX_BYTES` 1 GiB tried and reverted (the scan branch's decode memory is the `.222` item); fragmented-`.bf` consolidation sweep; prod sidecar-first open + zstd tails (rollout steps 2 and 3)
 - **Incident.** 03:19:03–07Z seven `.219` queriers OOMKilled at once
