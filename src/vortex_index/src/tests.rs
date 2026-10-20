@@ -4184,8 +4184,18 @@ fn vix_docs_broad_string_equality_aggregates_are_exact() {
             .unwrap(),
         vec![3, 3, 1]
     );
-    assert_eq!(docs.eq_string_count("svc", "hit").unwrap(), Some(7));
-    assert_eq!(docs.eq_string_count("svc", "absent").unwrap(), Some(0));
+    assert_eq!(docs.eq_string_count("svc", "hit", None).unwrap(), Some(7));
+    assert_eq!(docs.eq_string_count("svc", "absent", None).unwrap(), Some(0));
+    // Same half-open clamp as the top-n/histogram paths: 103 in, 109 out.
+    assert_eq!(
+        docs.eq_string_count("svc", "hit", Some((103, 109))).unwrap(),
+        Some(4)
+    );
+    assert_eq!(
+        docs.eq_string_count("svc", "hit", Some((109, 109))).unwrap(),
+        Some(0),
+        "an empty clamp counts nothing"
+    );
     assert_eq!(
         docs.eq_string_histogram("svc", "hit", Some((103, 109)), 100, 5, 3, 0)
             .unwrap()
@@ -4210,7 +4220,7 @@ fn vix_docs_broad_string_equality_aggregates_are_exact() {
             .unwrap()
             .is_none()
     );
-    assert!(docs.eq_string_count("missing", "hit").unwrap().is_none());
+    assert!(docs.eq_string_count("missing", "hit", None).unwrap().is_none());
     assert!(
         docs.eq_string_top_n("_timestamp", "107", None, 3, false)
             .unwrap()
@@ -4221,7 +4231,7 @@ fn vix_docs_broad_string_equality_aggregates_are_exact() {
             .unwrap()
             .is_none()
     );
-    assert!(docs.eq_string_count("_timestamp", "107").unwrap().is_none());
+    assert!(docs.eq_string_count("_timestamp", "107", None).unwrap().is_none());
 }
 
 #[test]
@@ -5801,8 +5811,7 @@ mod ranged {
             VixDocs::open_ranged_data_only(Arc::clone(&count_source) as Arc<dyn VixRangeSource>)
                 .unwrap();
         let count_open_bytes = count_source.bytes();
-        let count = count_docs
-            .eq_string_count("level", "info")
+        let count = count_docs.eq_string_count("level", "info", None)
             .unwrap()
             .unwrap();
         let count_scan_bytes = count_source.bytes() - count_open_bytes;

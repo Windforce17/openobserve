@@ -1290,12 +1290,19 @@ impl VixDocs {
         Ok(Some(counts))
     }
 
-    /// Exact count for `column = needle` without reading `_timestamp`.
+    /// Exact count for `column = needle`, optionally clamped to a half-open
+    /// `_timestamp` range (the file-straddles-the-window case).
     ///
     /// This is the whole-file/single-histogram-bucket primitive: only the
-    /// predicate column is needed and the result stays constant-memory.
-    /// `Ok(None)` means the native column is absent or not string-family.
-    pub fn eq_string_count(&self, column: &str, needle: &str) -> anyhow::Result<Option<u64>> {
+    /// predicate column is needed (plus `_timestamp` when clamped) and the
+    /// result stays constant-memory. `Ok(None)` means the native column is
+    /// absent or not string-family.
+    pub fn eq_string_count(
+        &self,
+        column: &str,
+        needle: &str,
+        ts_range: Option<(i64, i64)>,
+    ) -> anyhow::Result<Option<u64>> {
         let _scope = self.enter_read()?;
         use arrow::datatypes::DataType;
 
@@ -1316,6 +1323,7 @@ impl VixDocs {
             column,
             needle,
             0..self.row_count,
+            ts_range,
         )?))
     }
 
@@ -3129,7 +3137,7 @@ mod memory_regressions {
 
         let adequate = Budget::new(64 * 1024 * 1024);
         let docs = with_read_operation(adequate.clone(), || VixDocs::open(data)).unwrap();
-        assert_eq!(docs.eq_string_count("value", "needle").unwrap(), Some(256));
+        assert_eq!(docs.eq_string_count("value", "needle", None).unwrap(), Some(256));
         assert!(adequate.peak() > input + metadata);
     }
 
@@ -3192,7 +3200,7 @@ mod memory_regressions {
                 }
             })
             .unwrap();
-            assert_eq!(docs.eq_string_count("value", "needle").unwrap(), Some(256));
+            assert_eq!(docs.eq_string_count("value", "needle", None).unwrap(), Some(256));
         }
     }
 
@@ -3204,20 +3212,20 @@ mod memory_regressions {
             let baseline = Budget::new(usize::MAX);
             assert_eq!(
                 with_read_operation(baseline.clone(), || docs
-                    .eq_string_count("missing", "needle"))
+                    .eq_string_count("missing", "needle", None))
                 .unwrap(),
                 None
             );
             assert_denied(
                 with_read_operation(Budget::new(baseline.peak() - 1), || {
-                    docs.eq_string_count("missing", "needle")
+                    docs.eq_string_count("missing", "needle", None)
                 })
                 .unwrap_err(),
             );
             let cancelled = Budget::new(usize::MAX);
             cancelled.cancelled.store(true, Ordering::Release);
             let error =
-                with_read_operation(cancelled, || docs.eq_string_count("missing", "needle"))
+                with_read_operation(cancelled, || docs.eq_string_count("missing", "needle", None))
                     .unwrap_err();
             assert!(error.chain().any(|cause| matches!(
                 cause.downcast_ref::<VixError>(),
@@ -3238,7 +3246,7 @@ mod memory_regressions {
             );
             assert!(docs.decoded_stats.get().is_none());
             assert_eq!(docs.pruned_scan_ranges(None, &[bound]), Some(Vec::new()));
-            assert_eq!(docs.eq_string_count("value", "needle").unwrap(), Some(256));
+            assert_eq!(docs.eq_string_count("value", "needle", None).unwrap(), Some(256));
         }
     }
 
@@ -3265,7 +3273,7 @@ mod memory_regressions {
             }
             let after = Budget::new(usize::MAX);
             assert_eq!(
-                with_read_operation(after.clone(), || docs.eq_string_count("missing", "needle"))
+                with_read_operation(after.clone(), || docs.eq_string_count("missing", "needle", None))
                     .unwrap(),
                 None
             );
@@ -3283,7 +3291,7 @@ mod memory_regressions {
             let docs = open(mode, data.clone());
             let baseline = Budget::new(usize::MAX);
             with_read_operation(baseline.clone(), || {
-                docs.eq_string_count("missing", "needle")
+                docs.eq_string_count("missing", "needle", None)
             })
             .unwrap();
             assert_denied(

@@ -254,10 +254,10 @@ pub async fn vix_search(
         );
     }
     // Sidecar-backed core files always reach VIX evaluation. Indexless core
-    // files are also exact for the native equality select/histogram shapes
-    // and for a WHERE-less histogram: Condition::All needs no term index,
-    // and the reader folds its data-file zone table. Legacy parquet/vortex
-    // files stay on the ordinary DataFusion path.
+    // files are also exact for the native equality select/histogram/count
+    // shapes and for a WHERE-less histogram or count: Condition::All needs
+    // no term index, and the reader folds its data-file zone table. Legacy
+    // parquet/vortex files stay on the ordinary DataFusion path.
     let single_equality = index_condition
         .as_ref()
         .is_some_and(|condition| condition.single_equal_term().is_some());
@@ -274,6 +274,8 @@ pub async fn vix_search(
             &idx_optimize_mode,
             Some(IndexOptimizeMode::SimpleHistogram(..))
         );
+    let native_count =
+        single_equality && matches!(&idx_optimize_mode, Some(IndexOptimizeMode::SimpleCount));
     let all_histogram = condition_all
         && matches!(
             &idx_optimize_mode,
@@ -284,7 +286,8 @@ pub async fn vix_search(
     // the sidecar for exact one-bucket value counts.
     let data_only_all_aggregate = all_histogram
         || (condition_all && matches!(&idx_optimize_mode, Some(IndexOptimizeMode::SimpleCount)));
-    let data_only_capable = native_simple_select || native_histogram || data_only_all_aggregate;
+    let data_only_capable =
+        native_simple_select || native_histogram || native_count || data_only_all_aggregate;
     let mut eval_files = file_list_map
         .values()
         .filter(|file| is_core_file(&file.key) && (file.meta.index_size > 0 || data_only_capable))
@@ -1957,7 +1960,9 @@ async fn search_vix_index(
 /// Native exact-equality evaluation over a core file's docs columns.
 /// SimpleSelect returns bounded timestamp candidates for the global pruner;
 /// SimpleHistogram streams the equality column and timestamp directly into
-/// fixed counters. Neither path reads `_source` or a `.vxi` sidecar.
+/// fixed counters; SimpleCount counts the equality column alone (plus
+/// `_timestamp` only for a window-straddling file). No path reads `_source`
+/// or a `.vxi` sidecar.
 #[allow(clippy::too_many_arguments)]
 async fn search_vix_docs_optimized(
     trace_id: &str,
@@ -1974,7 +1979,7 @@ async fn search_vix_docs_optimized(
     }
     match idx_optimize_rule.as_ref() {
         Some(IndexOptimizeMode::SimpleSelect(limit, _)) if *limit > 0 => {}
-        Some(IndexOptimizeMode::SimpleHistogram(..)) => {}
+        Some(IndexOptimizeMode::SimpleHistogram(..)) | Some(IndexOptimizeMode::SimpleCount) => {}
         other => {
             log::info!(
                 "[trace_id {trace_id}] search->vix: native docs file {} cannot use equality \
@@ -2058,7 +2063,7 @@ async fn search_vix_docs_optimized(
                 }),
             IndexOptimizeMode::SimpleHistogram(min_value, bucket_width, num_buckets, ts_offset) => {
                 if let Some(bucket) = whole_file_bucket {
-                    docs.eq_string_count(&task_field, &needle).map(|count| {
+                    docs.eq_string_count(&task_field, &needle, None).map(|count| {
                         count.map(|count| {
                             let mut histogram = vec![0u64; num_buckets];
                             histogram[bucket] = count;
@@ -2078,6 +2083,9 @@ async fn search_vix_docs_optimized(
                     .map(|histogram| histogram.map(VixSearchResult::Histogram))
                 }
             }
+            IndexOptimizeMode::SimpleCount => docs
+                .eq_string_count(&task_field, &needle, time_clamp)
+                .map(|count| count.map(|count| VixSearchResult::Count(count as usize))),
             _ => unreachable!("unsupported optimize mode rejected before task spawn"),
         }?;
         let column_absent = result.is_none()
@@ -2120,7 +2128,8 @@ async fn search_vix_docs_optimized(
     let no_match = match &result {
         VixSearchResult::SelectCandidates { candidates, .. } => candidates.is_empty(),
         VixSearchResult::Histogram(histogram) => histogram.iter().all(|count| *count == 0),
-        _ => unreachable!("native docs evaluation only returns select or histogram"),
+        VixSearchResult::Count(count) => *count == 0,
+        _ => unreachable!("native docs evaluation only returns select, histogram or count"),
     };
     if no_match {
         if !cache_key.is_empty() {
@@ -5949,6 +5958,77 @@ mod tests {
         match result {
             MultiResult::Histogram(histogram) => assert_eq!(histogram, vec![100, 0]),
             other => panic!("expected native histogram, got {other:?}"),
+        }
+    }
+
+    /// Indexless core files answer `count(*) WHERE col = 'v'` natively: a
+    /// fully covered file counts the predicate column alone, a window-
+    /// straddling file applies the half-open clamp, and neither falls back
+    /// to the DataFusion scan branch. A needle absent from every file is a
+    /// zero count, not a scan.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_indexless_equality_count_is_exact_with_clamp() {
+        let mut covered = store_core_file_with_rows(
+            "files/org/logs/native-count/2026/01/01/00/covered.vix",
+            1_000,
+            100,
+        )
+        .await;
+        covered.meta.index_size = 0;
+        // rows at 1_901..=2_000; the window ends at 1_951 → 50 rows inside
+        let mut straddling = store_core_file_with_rows(
+            "files/org/logs/native-count/2026/01/01/00/straddling.vix",
+            2_000,
+            100,
+        )
+        .await;
+        straddling.meta.index_size = 0;
+        let params = Arc::new(crate::types::QueryParams {
+            trace_id: "native-count-clamp".to_string(),
+            org_id: "org".to_string(),
+            stream: datafusion::sql::TableReference::from("t"),
+            stream_type: StreamType::Logs,
+            stream_name: "t".to_string(),
+            time_range: (800, 1_951),
+            work_group: None,
+            use_inverted_index: true,
+            full_text_fields: None,
+        });
+
+        let mut condition = IndexCondition::new();
+        condition.add_condition(Condition::Equal("level".to_string(), "info".to_string()));
+        let mut files = vec![covered.clone(), straddling.clone()];
+        let (_took, add_filter_back, result) = vix_search(
+            Arc::clone(&params),
+            &mut files,
+            Some(condition),
+            Some(IndexOptimizeMode::SimpleCount),
+        )
+        .await
+        .unwrap();
+        assert!(!add_filter_back);
+        assert!(files.is_empty(), "both files must be answered natively");
+        match result {
+            MultiResult::Count(count) => assert_eq!(count, 150),
+            other => panic!("expected native count, got {other:?}"),
+        }
+
+        let mut absent = IndexCondition::new();
+        absent.add_condition(Condition::Equal("level".to_string(), "error".to_string()));
+        let mut files = vec![covered, straddling];
+        let (_took, add_filter_back, result) = vix_search(
+            params,
+            &mut files,
+            Some(absent),
+            Some(IndexOptimizeMode::SimpleCount),
+        )
+        .await
+        .unwrap();
+        assert!(!add_filter_back);
+        assert!(files.is_empty(), "a missing needle is an exact zero, not a scan");
+        match result {
+            MultiResult::Count(count) => assert_eq!(count, 0),
+            other => panic!("expected zero count, got {other:?}"),
         }
     }
 
