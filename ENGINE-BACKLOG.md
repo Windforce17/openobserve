@@ -3,6 +3,98 @@
 Supersedes NARROW-WAL-PLAN.md, FIELD-MAJOR-PLAN.md, DURATION-RANGE-PLAN.md
 (deleted 2026-07-29; full history in git). Keep THIS file current.
 
+## 2026-10-20 — `.222` queriers: equality `count(*)` on indexless core files evaluates natively (the DataFusion branch was 2.6–4.9 GB/follower and returned partial counts under pool pressure); compactor index-heal lag attributed to the single rebuild slot, not capacity
+- **Gap.** `count(*) WHERE col = 'v'` over a core file WITHOUT a `.vxi`
+  went to the DataFusion scan branch while the identical predicate as a
+  histogram already used the native docs column (`eq_string_histogram`,
+  whole-file `eq_string_count`). Two gates rejected it: `flight.rs
+  data_only_vix_capable` (SimpleCount accepted only `Condition::All`) and
+  `search_vix_docs_optimized` (SimpleSelect/SimpleHistogram only);
+  `eq_string_count`'s only caller was the histogram one-bucket shortcut.
+  Prod logs L0 is index-off (`ZO_VIX_L0_INDEX_OFF_STREAM_TYPES=logs`), so
+  the gap is the HOT window: `file_list` 10:38Z — indexless `.vix` are 77 %
+  of the core files overlapping the last 15 min (19 % of rows), 64 % of
+  the last 1 h (11 %), 33 % of 3 h, 5 % of 24 h; all within the newest
+  ~2 h (hours 08/09/10 only), almost all `default/logs/default`.
+- **Cost, measured on `.220` (logs/default, 1 h sealed windows, same
+  needle both shapes).** Per follower the count sent ~85 of ~115 files to
+  DataFusion ("85 of 85 files cannot produce exact vix candidates, the
+  filter will be added back"): DataFusion peak 2.6–4.9 GB against the
+  12 GiB shared pool, df_exec 0.5–5.2 s; warm totals 4.6 s (wide needle,
+  71.6 M rows) / 13.0 s (narrow, 56 k rows). The histogram shape: 0
+  DataFusion files, 0.25 MB, df_exec 3–40 ms, warm 2.8–3.3 s. Three of six
+  cold count runs across two batteries came back `is_partial=true` with
+  WRONG numbers (33,686 vs 56,484; 62,701,164 vs 70,463,850; 49,021 vs
+  58,070) on "shared-query-global memory pool cannot reserve 64 MiB:
+  12,830,312,569 of 12,884,901,888 reserved" — the count both suffers
+  from and contributes to the pool pressure. Routing-only, no format
+  change, so this is one `.222` item ahead of the scan-branch decode
+  accounting (that work keeps its design below and moves to `.223`).
+- **Fix (`vix-arch ed576c2615`, `.222` = `release/vix-20261020-222`
+  `4908a55b0` = `.221` + this commit).** `data_only_vix_capable`:
+  SimpleCount accepts a single equality like SimpleHistogram.
+  `vix_search`: equality SimpleCount makes indexless core files
+  eval-eligible (`native_count`); `search_vix_docs_optimized` accepts
+  SimpleCount, counts with the per-file window clamp and returns
+  `VixSearchResult::Count` (Count(0) → the cacheable NoMatch; the result
+  cache key already pins the clamp for straddling files).
+  `vortex_index`: `count_eq_string_matches` / `VixDocs::eq_string_count`
+  take an optional half-open `_timestamp` clamp (same vortex filter as the
+  candidate scan, row-index-only projection, no arrow conversion); the
+  unclamped count still never reads `_timestamp`. Tests: clamp
+  boundaries on the docs primitive (`[103,109)` → 4, empty clamp → 0),
+  end-to-end `vix_search` over a covered + a straddling indexless file
+  (150 = 100 + 50, absent needle → Count(0) with no scan-branch files),
+  `data_only_vix_capable` shape table updated.
+- **DEV (`#346`, 11:40Z, all roles).** count == histogram sum on all four
+  predicate pairs (logs 1,450,493 / 3,957; traces 5,687,267 / 4,180);
+  every follower "datafusion files: 0" (was 6 indexless files at 128 MB
+  peak per follower on `.221`); no WARN/ERROR on the new queriers.
+- **PROD (`#656` `34c0364b`, queriers 11:45–11:48Z, 10/10, 0 restarts).**
+  Same shapes, new sealed window, fresh pods (EMPTY disk caches — r1 is
+  cold by construction):
+
+  | shape | `.220` r1 (10:30Z) | `.220` r1 (11:30Z) | `.220` r2 | `.222` r1 cold pods | `.222` r2 |
+  |---|---|---|---|---|---|
+  | count wide | 12,865 ms | 7,725 ms **partial** | 4,598 / 3,275 ms | 2,759 ms | 3,206 ms |
+  | hist wide | 12,101 ms | 1,497 ms | 2,834 / 4,265 ms | 4,612 ms | 541 ms |
+  | count narrow | 4,742 ms **partial** | 10,388 ms **partial** | 12,972 / 5,318 ms | 4,156 ms | 1,211 ms |
+  | hist narrow | 6,519 ms | 9,423 ms | 3,302 / 5,260 ms | 4,345 ms | 642 ms |
+  | count DataFusion files / peak per follower | ~85–96 / 2.6–4.9 GB | 92–93 / 2.9–3.0 GB | same | **0 / 0 MB** | **0 / 0 MB** |
+  | count df_exec max per follower | 1,700 ms | 1,334 ms | 1,049–5,201 ms | 0–11 ms | 0–32 ms |
+
+  All eight `.222` runs exact (count == histogram sum: 70,554,237 =
+  28,394,090 + 42,160,147; 58,322 = 24,068 + 34,254), `is_partial=false`.
+  What remains in a count is the index branch over the indexed files
+  (`idx_took` 1.1–3.9 s here, cold readers on new pods) — the cold
+  index-eval item, unchanged. Fleet WARN classes after the roll are the
+  organic ones (`residual: too many candidate chunks` on sidecar counts,
+  TopN NULL-group fallbacks, scan budgets); the native docs path logged
+  no refusals. Rollback: `v0.93.0-vix-20261016.220`, image only.
+- **Seen alongside (not changed).** `GROUP BY service_name ORDER BY
+  count(*) DESC LIMIT 10` (SimpleTopN) sends EVERY file, indexed ones
+  included, to DataFusion with "NULL or missing aggregate values require
+  scan: 19, NULL aggregate group requires scan: 8" — 3.0–3.6 GB peak per
+  follower, 14.8 s cold on the 1 h window; and the 1 h `HAVING count(*) >
+  20000 ORDER BY ASC` variant also hit the pool and returned partial.
+  That shape is the next pool consumer to take off DataFusion.
+- **Compactor "index lagging" check (read-only, 11:12–11:27Z).** Not
+  capacity: 18 × `.221`, CPU p50 2.6 / max 8.8 cores per pod (24 % of the
+  216 C limit), RSS p50 6.7 / max 15 GiB of 60, 0 restarts, merge
+  failures 0, merge wall 8.2 of 90 slot-h in the last hour, pending hot
+  jobs waited 0.9 min median. The ~1.5–2.5 h heal lag of logs L0 is the
+  SERIAL rebuild gate: `ZO_VIX_REBUILD_CONCURRENCY=1`
+  (compactor-deployment.yaml, a 2026-08 memory guard from before M30's
+  RSS-gated `ZO_VIX_REBUILD_HEADROOM_MB`), every logs L0 merge AND every
+  sidecar-only heal takes that one permit (`merge.rs:2666`), and one
+  (stream, hour) job runs on one pod (`JOB_BATCH_IN_FLIGHT=2`) —
+  logs/default needs ≈60 permit-min per hour (≈300 heals × 5 s + ≈75
+  merges × 25 s) on ONE pod, so an hour drains 67–76 min after it closes
+  (hour 08 healed +76 min, 09 +67 min). Cheapest lever: cap 1 → 2 on the
+  compactor Deployment (RSS-gated, so bounded at runtime), expected to
+  halve the drain; beyond 2 the per-pod job batch caps it (code change).
+  Not applied — owner call.
+
 ## 2026-10-16 — two fleet OOM modes (03:19Z ×7, 10:03Z ×3) → `.220`/`.221` segment-scan retention pool; `ZO_STORAGE_SCAN_MAX_BYTES` 1 GiB tried and reverted (the scan branch's decode memory is the `.222` item); fragmented-`.bf` consolidation sweep; prod sidecar-first open + zstd tails (rollout steps 2 and 3)
 - **Incident.** 03:19:03–07Z seven `.219` queriers OOMKilled at once
   (`lastState OOMKilled`, 1 restart each; 3 survived). Previous-container
