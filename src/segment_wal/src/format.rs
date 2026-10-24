@@ -13,35 +13,76 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-//! Segment object encoding (DESIGN-SEGMENT-WAL.md, format version 1).
+//! Segment object encoding (DESIGN-SEGMENT-WAL.md).
 //!
-//! Layout (all integers little-endian):
+//! Every format version starts with the same raw header (all integers
+//! little-endian):
 //!
 //! ```text
 //! header (raw): magic "O2WS" | u16 version | u16 uuid_len | uuid bytes
 //!             | u64 seq | i64 created_at_micros
-//! payload: ONE zstd stream of concatenated frames:
-//!   data frame: u8 frame_type=1
-//!             | u16 org_len | org
-//!             | u16 stream_type_len | stream_type (Display string)
-//!             | u16 stream_len | stream
-//!             | i64 min_ts | i64 max_ts | u32 rows
-//!             | u32 ipc_len | arrow IPC STREAM bytes (self-describing schema)
-//!             | u32 crc32 over every preceding byte of this frame
-//!   end frame: u8 frame_type=0 (no body, no crc) — must be last
 //! ```
+//!
+//! Both versions carry the same data frame:
+//!
+//! ```text
+//! data frame: u8 frame_type=1
+//!           | u16 org_len | org
+//!           | u16 stream_type_len | stream_type (Display string)
+//!           | u16 stream_len | stream
+//!           | i64 min_ts | i64 max_ts | u32 rows
+//!           | u32 ipc_len | arrow IPC STREAM bytes (self-describing schema)
+//!           | u32 crc32 over every preceding byte of this frame
+//! ```
+//!
+//! Version 1 payload: ONE zstd stream of concatenated data frames with plain
+//! IPC buffers, closed by an end frame `u8 frame_type=0` (no body, no crc).
+//! A reader decompresses every stream's bytes to reach the one it wants.
+//!
+//! Version 2 payload, no outer compression:
+//!
+//! ```text
+//! u32 directory_len | directory | u32 crc32(directory)
+//! directory: u32 region_count, then per region:
+//!     u16 org_len | org | u16 stream_type_len | stream_type
+//!   | u16 stream_len | stream | i64 min_ts | i64 max_ts | u64 rows
+//!   | u32 frames | u64 offset | u64 len
+//! regions: the data frames of one stream, back to back
+//! ```
+//!
+//! Region offsets are relative to the first byte after the directory crc.
+//! Regions tile that area in directory order and end exactly at the end of
+//! the object. Version 2 IPC bodies use Arrow's per-buffer zstd compression,
+//! so a reader skips other streams by offset and decompresses only the
+//! columns it reads.
 //!
 //! Decoding is all-or-nothing: any inconsistency (bad magic/version, crc
 //! mismatch, truncation, bad frame type, IPC failure, unknown stream type,
-//! row-count mismatch) is a hard error naming the segment and frame index.
-//! Segments are small and written atomically — there is no recoverable tail.
+//! row-count mismatch, directory/region mismatch) is a hard error naming the
+//! segment and frame index. Segments are small and written atomically —
+//! there is no recoverable tail.
+
+use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{Context, anyhow, bail};
-use arrow::record_batch::RecordBatch;
+use arrow::{
+    array::{
+        Array, ArrayData, ArrayRef, AsArray, MutableArrayData, RecordBatchOptions, make_array,
+    },
+    buffer::Buffer,
+    datatypes::DataType,
+    error::ArrowError,
+    ipc::{CompressionType, writer::IpcWriteOptions},
+    record_batch::RecordBatch,
+};
 use config::meta::stream::StreamType;
 
 pub const SEGMENT_MAGIC: &[u8; 4] = b"O2WS";
-pub const SEGMENT_VERSION: u16 = 1;
+/// One zstd stream over every frame; plain IPC buffers.
+pub const SEGMENT_VERSION_V1: u16 = 1;
+/// Per-stream regions behind a raw directory; IPC buffers zstd-compressed
+/// one by one.
+pub const SEGMENT_VERSION_V2: u16 = 2;
 
 const FRAME_TYPE_END: u8 = 0;
 const FRAME_TYPE_DATA: u8 = 1;
@@ -66,43 +107,177 @@ pub struct SegmentFrame {
     pub batch: RecordBatch,
 }
 
-/// Encode one segment object: raw header + one zstd stream of crc-guarded
-/// frames (layout in DESIGN-SEGMENT-WAL.md).
+/// Top-level column filter for a projected decode: `None` reads every
+/// column, `Some(keep)` reads the columns whose name `keep` accepts.
+pub type ColumnFilter<'a> = Option<&'a dyn Fn(&str) -> bool>;
+
+/// Encode one version-1 segment object (layout in DESIGN-SEGMENT-WAL.md).
 pub fn encode_segment(
     header: &SegmentHeader,
     frames: &[SegmentFrame],
 ) -> Result<Vec<u8>, anyhow::Error> {
-    let seg = format!("{}/{:020}", header.node_uuid, header.seq);
+    encode_segment_version(header, frames, SEGMENT_VERSION_V1)
+}
+
+/// Encode one segment object in format `version` (1 or 2).
+pub fn encode_segment_version(
+    header: &SegmentHeader,
+    frames: &[SegmentFrame],
+    version: u16,
+) -> Result<Vec<u8>, anyhow::Error> {
+    let seg = segment_label(header);
     let uuid = header.node_uuid.as_bytes();
     let uuid_len = u16::try_from(uuid.len())
         .map_err(|_| anyhow!("segment {seg}: node_uuid length {} exceeds u16", uuid.len()))?;
 
     let mut out = Vec::with_capacity(4 + 2 + 2 + uuid.len() + 8 + 8);
     out.extend_from_slice(SEGMENT_MAGIC);
-    out.extend_from_slice(&SEGMENT_VERSION.to_le_bytes());
+    out.extend_from_slice(&version.to_le_bytes());
     out.extend_from_slice(&uuid_len.to_le_bytes());
     out.extend_from_slice(uuid);
     out.extend_from_slice(&header.seq.to_le_bytes());
     out.extend_from_slice(&header.created_at.to_le_bytes());
 
+    match version {
+        SEGMENT_VERSION_V1 => encode_payload_v1(&mut out, frames, &seg)?,
+        SEGMENT_VERSION_V2 => encode_payload_v2(&mut out, frames, &seg)?,
+        other => bail!(
+            "segment {seg}: cannot encode format version {other} (supported: {SEGMENT_VERSION_V1}, {SEGMENT_VERSION_V2})"
+        ),
+    }
+    Ok(out)
+}
+
+fn segment_label(header: &SegmentHeader) -> String {
+    format!("{}/{:020}", header.node_uuid, header.seq)
+}
+
+fn frame_context(seg: &str, idx: usize, frame: &SegmentFrame) -> String {
+    format!(
+        "segment {seg}: encode frame {idx} ({}/{}/{})",
+        frame.org, frame.stream_type, frame.stream
+    )
+}
+
+fn encode_payload_v1(
+    out: &mut Vec<u8>,
+    frames: &[SegmentFrame],
+    seg: &str,
+) -> Result<(), anyhow::Error> {
     let mut payload = Vec::new();
     for (idx, frame) in frames.iter().enumerate() {
-        write_data_frame(&mut payload, frame).with_context(|| {
-            format!(
-                "segment {seg}: encode frame {idx} ({}/{}/{})",
-                frame.org, frame.stream_type, frame.stream
-            )
-        })?;
+        write_data_frame(&mut payload, frame, None)
+            .with_context(|| frame_context(seg, idx, frame))?;
     }
     payload.push(FRAME_TYPE_END);
 
     let compressed = zstd::encode_all(payload.as_slice(), zstd::DEFAULT_COMPRESSION_LEVEL)
         .with_context(|| format!("segment {seg}: zstd compress failed"))?;
     out.extend_from_slice(&compressed);
-    Ok(out)
+    Ok(())
 }
 
-fn write_data_frame(buf: &mut Vec<u8>, frame: &SegmentFrame) -> Result<(), anyhow::Error> {
+/// One stream's frames while a version-2 object is assembled.
+struct RegionBuilder<'a> {
+    org: &'a str,
+    stream_type: StreamType,
+    stream: &'a str,
+    min_ts: i64,
+    max_ts: i64,
+    rows: u64,
+    frames: u32,
+    bytes: Vec<u8>,
+}
+
+fn encode_payload_v2(
+    out: &mut Vec<u8>,
+    frames: &[SegmentFrame],
+    seg: &str,
+) -> Result<(), anyhow::Error> {
+    // Regions follow the first appearance of each stream; frames keep their
+    // order inside a region.
+    let mut regions: Vec<RegionBuilder<'_>> = Vec::new();
+    let mut region_by_stream: HashMap<(&str, StreamType, &str), usize> = HashMap::new();
+    for (idx, frame) in frames.iter().enumerate() {
+        let key = (frame.org.as_str(), frame.stream_type, frame.stream.as_str());
+        let region_idx = *region_by_stream.entry(key).or_insert_with(|| {
+            regions.push(RegionBuilder {
+                org: key.0,
+                stream_type: key.1,
+                stream: key.2,
+                min_ts: i64::MAX,
+                max_ts: i64::MIN,
+                rows: 0,
+                frames: 0,
+                bytes: Vec::new(),
+            });
+            regions.len() - 1
+        });
+        let region = &mut regions[region_idx];
+        write_data_frame(&mut region.bytes, frame, Some(CompressionType::ZSTD))
+            .with_context(|| frame_context(seg, idx, frame))?;
+        region.min_ts = region.min_ts.min(frame.min_ts);
+        region.max_ts = region.max_ts.max(frame.max_ts);
+        region.rows += frame.batch.num_rows() as u64;
+        region.frames = region.frames.checked_add(1).ok_or_else(|| {
+            anyhow!(
+                "segment {seg}: stream {}/{}/{} exceeds u32 frames",
+                frame.org,
+                frame.stream_type,
+                frame.stream
+            )
+        })?;
+    }
+
+    let region_count = u32::try_from(regions.len())
+        .map_err(|_| anyhow!("segment {seg}: {} regions exceed u32", regions.len()))?;
+    let mut directory = Vec::new();
+    directory.extend_from_slice(&region_count.to_le_bytes());
+    let mut offset = 0u64;
+    for region in &regions {
+        let identity = || {
+            format!(
+                "segment {seg}: directory entry {}/{}/{}",
+                region.org, region.stream_type, region.stream
+            )
+        };
+        write_len_prefixed(&mut directory, region.org.as_bytes(), "org").with_context(identity)?;
+        let stream_type = region.stream_type.to_string();
+        write_len_prefixed(&mut directory, stream_type.as_bytes(), "stream_type")
+            .with_context(identity)?;
+        write_len_prefixed(&mut directory, region.stream.as_bytes(), "stream")
+            .with_context(identity)?;
+        let len = region.bytes.len() as u64;
+        directory.extend_from_slice(&region.min_ts.to_le_bytes());
+        directory.extend_from_slice(&region.max_ts.to_le_bytes());
+        directory.extend_from_slice(&region.rows.to_le_bytes());
+        directory.extend_from_slice(&region.frames.to_le_bytes());
+        directory.extend_from_slice(&offset.to_le_bytes());
+        directory.extend_from_slice(&len.to_le_bytes());
+        offset += len;
+    }
+    let directory_len = u32::try_from(directory.len()).map_err(|_| {
+        anyhow!(
+            "segment {seg}: directory length {} exceeds u32",
+            directory.len()
+        )
+    })?;
+
+    out.reserve(4 + directory.len() + 4 + offset as usize);
+    out.extend_from_slice(&directory_len.to_le_bytes());
+    out.extend_from_slice(&directory);
+    out.extend_from_slice(&crc32fast::hash(&directory).to_le_bytes());
+    for region in &regions {
+        out.extend_from_slice(&region.bytes);
+    }
+    Ok(())
+}
+
+fn write_data_frame(
+    buf: &mut Vec<u8>,
+    frame: &SegmentFrame,
+    ipc_compression: Option<CompressionType>,
+) -> Result<(), anyhow::Error> {
     let start = buf.len();
     buf.push(FRAME_TYPE_DATA);
     write_len_prefixed(buf, frame.org.as_bytes(), "org")?;
@@ -115,10 +290,17 @@ fn write_data_frame(buf: &mut Vec<u8>, frame: &SegmentFrame) -> Result<(), anyho
         .map_err(|_| anyhow!("row count {} exceeds u32", frame.batch.num_rows()))?;
     buf.extend_from_slice(&rows.to_le_bytes());
 
+    let options = IpcWriteOptions::default()
+        .try_with_compression(ipc_compression)
+        .context("arrow ipc compression option rejected")?;
     let mut ipc = Vec::new();
     {
-        let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut ipc, &frame.batch.schema())
-            .context("arrow ipc writer open failed")?;
+        let mut writer = arrow::ipc::writer::StreamWriter::try_new_with_options(
+            &mut ipc,
+            &frame.batch.schema(),
+            options,
+        )
+        .context("arrow ipc writer open failed")?;
         writer
             .write(&frame.batch)
             .context("arrow ipc write failed")?;
@@ -170,23 +352,50 @@ pub struct FrameInfo {
     pub rows: u32,
 }
 
-/// Streaming decode: the payload decompresses INCREMENTALLY (one zstd
-/// stream) and each data frame's identity goes to `want`; only when it
-/// returns true is the frame's IPC body parsed into a batch and handed to
-/// `on_frame`. Peak memory ≈ the largest single frame (+ the zstd window)
-/// instead of the whole decompressed payload — unwanted frames' bytes are
-/// decompressed through and CRC-checked but never IPC-parsed.
+/// Streaming decode of every column: each data frame's identity goes to
+/// `want`; only when it returns true is the frame's IPC body parsed into a
+/// batch and handed to `on_frame`. Peak memory ≈ the largest single frame
+/// (+ the zstd window for version 1) instead of the whole decompressed
+/// payload.
 ///
-/// Integrity semantics are IDENTICAL to [`decode_segment`] (which is built
-/// on this): every frame's crc32 is verified whether wanted or not, and any
-/// inconsistency is a hard error naming the segment and frame index —
-/// segments are small and written atomically, there is no recoverable tail.
+/// See [`decode_segment_projected`] for the integrity rules per version.
 pub fn decode_segment_filtered(
     bytes: &[u8],
+    want: impl FnMut(&FrameInfo) -> bool,
+    on_frame: impl FnMut(SegmentFrame) -> Result<(), anyhow::Error>,
+) -> Result<SegmentHeader, anyhow::Error> {
+    decode_segment_projected(bytes, None, want, on_frame)
+}
+
+/// [`decode_segment_filtered`] with a column projection: wanted frames are
+/// IPC-decoded with only the top-level columns `columns` accepts (`None`
+/// reads every column). A projected batch never pins the bytes of the
+/// columns it dropped (see [`detach_pinned_columns`]).
+///
+/// Integrity: version 1 verifies the crc32 of EVERY frame, because the zstd
+/// stream must be decompressed through anyway. Version 2 verifies the
+/// directory crc32 and the crc32 of every WANTED frame. Its unwanted frames
+/// are bounds-checked from their raw headers but never hashed: a reader pays
+/// only for the streams it reads, which is the purpose of the format.
+pub fn decode_segment_projected(
+    bytes: &[u8],
+    columns: ColumnFilter<'_>,
     mut want: impl FnMut(&FrameInfo) -> bool,
     mut on_frame: impl FnMut(SegmentFrame) -> Result<(), anyhow::Error>,
 ) -> Result<SegmentHeader, anyhow::Error> {
     let mut r = Reader::new(bytes);
+    let (version, header) = decode_header(&mut r)?;
+    let seg = segment_label(&header);
+    let payload = &bytes[r.pos..];
+    match version {
+        SEGMENT_VERSION_V1 => decode_payload_v1(payload, &seg, columns, &mut want, &mut on_frame)?,
+        SEGMENT_VERSION_V2 => decode_payload_v2(payload, &seg, columns, &mut want, &mut on_frame)?,
+        other => unreachable!("decode_header admitted unsupported version {other}"),
+    }
+    Ok(header)
+}
+
+fn decode_header(r: &mut Reader<'_>) -> Result<(u16, SegmentHeader), anyhow::Error> {
     let magic = r
         .take(4, "magic")
         .map_err(|e| anyhow!("segment decode: {e}"))?;
@@ -200,9 +409,9 @@ pub fn decode_segment_filtered(
     let version = r
         .read_u16("version")
         .map_err(|e| anyhow!("segment decode: {e}"))?;
-    if version != SEGMENT_VERSION {
+    if version != SEGMENT_VERSION_V1 && version != SEGMENT_VERSION_V2 {
         bail!(
-            "segment decode: unsupported version {version}, this build reads version {SEGMENT_VERSION}"
+            "segment decode: unsupported version {version}, this build reads versions {SEGMENT_VERSION_V1} and {SEGMENT_VERSION_V2}"
         );
     }
     let uuid_len = r
@@ -220,14 +429,24 @@ pub fn decode_segment_filtered(
     let created_at = r
         .read_i64("created_at_micros")
         .map_err(|e| anyhow!("segment decode (node {node_uuid}): {e}"))?;
-    let header = SegmentHeader {
-        node_uuid,
-        seq,
-        created_at,
-    };
-    let seg = format!("{}/{:020}", header.node_uuid, header.seq);
+    Ok((
+        version,
+        SegmentHeader {
+            node_uuid,
+            seq,
+            created_at,
+        },
+    ))
+}
 
-    let decoder = zstd::stream::read::Decoder::new(&bytes[r.pos..])
+fn decode_payload_v1(
+    payload: &[u8],
+    seg: &str,
+    columns: ColumnFilter<'_>,
+    want: &mut impl FnMut(&FrameInfo) -> bool,
+    on_frame: &mut impl FnMut(SegmentFrame) -> Result<(), anyhow::Error>,
+) -> Result<(), anyhow::Error> {
+    let decoder = zstd::stream::read::Decoder::new(payload)
         .map_err(|e| anyhow!("segment {seg}: zstd decoder open failed: {e}"))?;
     let mut fr = FrameStream::new(decoder);
     let mut idx = 0usize;
@@ -248,10 +467,10 @@ pub fn decode_segment_filtered(
                 {
                     bail!("segment {seg}: trailing bytes after end frame (frame {idx})");
                 }
-                return Ok(header);
+                return Ok(());
             }
             FRAME_TYPE_DATA => {
-                decode_data_frame_streamed(&mut fr, &mut want, &mut on_frame)
+                decode_data_frame_streamed(&mut fr, columns, want, on_frame)
                     .map_err(|e| anyhow!("segment {seg}: frame {idx}: {e:#}"))?;
                 idx += 1;
             }
@@ -268,6 +487,7 @@ const MAX_FRAME_IPC_LEN: usize = 1 << 31;
 
 fn decode_data_frame_streamed(
     fr: &mut FrameStream<impl std::io::Read>,
+    columns: ColumnFilter<'_>,
     want: &mut impl FnMut(&FrameInfo) -> bool,
     on_frame: &mut impl FnMut(SegmentFrame) -> Result<(), anyhow::Error>,
 ) -> Result<(), anyhow::Error> {
@@ -309,9 +529,217 @@ fn decode_data_frame_streamed(
     if !wanted {
         return Ok(());
     }
+    deliver_frame(info, &fr.buf()[ipc_range], columns, on_frame)
+}
 
-    let ipc_bytes = &fr.buf()[ipc_range];
-    let batch = parse_frame_batch(&info, ipc_bytes)?;
+/// One version-2 directory entry, bounds-checked against the region area.
+struct RegionInfo {
+    org: String,
+    stream_type: StreamType,
+    stream: String,
+    min_ts: i64,
+    max_ts: i64,
+    rows: u64,
+    frames: u32,
+    offset: usize,
+    len: usize,
+}
+
+fn decode_payload_v2(
+    payload: &[u8],
+    seg: &str,
+    columns: ColumnFilter<'_>,
+    want: &mut impl FnMut(&FrameInfo) -> bool,
+    on_frame: &mut impl FnMut(SegmentFrame) -> Result<(), anyhow::Error>,
+) -> Result<(), anyhow::Error> {
+    let mut r = Reader::new(payload);
+    let directory_len = r
+        .read_u32("directory length")
+        .map_err(|e| anyhow!("segment {seg}: {e}"))? as usize;
+    let directory = r
+        .take(directory_len, "directory")
+        .map_err(|e| anyhow!("segment {seg}: {e}"))?;
+    let crc_stored = r
+        .read_u32("directory crc32")
+        .map_err(|e| anyhow!("segment {seg}: {e}"))?;
+    let crc_computed = crc32fast::hash(directory);
+    if crc_stored != crc_computed {
+        bail!(
+            "segment {seg}: directory crc32 mismatch: stored {crc_stored:#010x}, computed {crc_computed:#010x}"
+        );
+    }
+    let area = &payload[r.pos..];
+    let regions =
+        parse_directory(directory, area.len()).map_err(|e| anyhow!("segment {seg}: {e:#}"))?;
+
+    let mut idx = 0usize;
+    for (region_idx, region) in regions.iter().enumerate() {
+        let identity = || {
+            format!(
+                "region {region_idx} ({}/{}/{})",
+                region.org, region.stream_type, region.stream
+            )
+        };
+        let mut fr = Reader::new(&area[region.offset..region.offset + region.len]);
+        let mut frames = 0u32;
+        let mut rows = 0u64;
+        while fr.remaining() > 0 {
+            let frame_rows = decode_data_frame_raw(&mut fr, region, columns, want, on_frame)
+                .map_err(|e| anyhow!("segment {seg}: {}: frame {idx}: {e:#}", identity()))?;
+            frames = frames.saturating_add(1);
+            rows += u64::from(frame_rows);
+            idx += 1;
+        }
+        if frames != region.frames || rows != region.rows {
+            bail!(
+                "segment {seg}: {}: directory declares {} frames and {} rows, the region holds {frames} frames and {rows} rows",
+                identity(),
+                region.frames,
+                region.rows
+            );
+        }
+    }
+    Ok(())
+}
+
+fn parse_directory(directory: &[u8], area_len: usize) -> Result<Vec<RegionInfo>, anyhow::Error> {
+    // smallest entry: three empty strings + the fixed fields
+    const MIN_ENTRY_LEN: usize = 3 * 2 + 8 + 8 + 8 + 4 + 8 + 8;
+    let mut r = Reader::new(directory);
+    let count = r.read_u32("directory region count")? as usize;
+    let mut regions = Vec::with_capacity(count.min(directory.len() / MIN_ENTRY_LEN));
+    let mut expected_offset = 0usize;
+    for i in 0..count {
+        let entry = |e: anyhow::Error| anyhow!("directory entry {i}: {e:#}");
+        let org_len = r.read_u16("org length").map_err(entry)? as usize;
+        let org = r.read_str(org_len, "org").map_err(entry)?.to_string();
+        let stream_type_len = r.read_u16("stream_type length").map_err(entry)? as usize;
+        let stream_type_str = r.read_str(stream_type_len, "stream_type").map_err(entry)?;
+        let stream_type = parse_stream_type(stream_type_str).ok_or_else(|| {
+            anyhow!("directory entry {i}: unknown stream type {stream_type_str:?}")
+        })?;
+        let stream_len = r.read_u16("stream length").map_err(entry)? as usize;
+        let stream = r.read_str(stream_len, "stream").map_err(entry)?.to_string();
+        let min_ts = r.read_i64("min_ts").map_err(entry)?;
+        let max_ts = r.read_i64("max_ts").map_err(entry)?;
+        let rows = r.read_u64("rows").map_err(entry)?;
+        let frames = r.read_u32("frames").map_err(entry)?;
+        let offset = r.read_u64("offset").map_err(entry)?;
+        let len = r.read_u64("len").map_err(entry)?;
+        let (Ok(offset), Ok(len)) = (usize::try_from(offset), usize::try_from(len)) else {
+            bail!("directory entry {i}: extent {offset}+{len} does not fit in memory");
+        };
+        if offset != expected_offset {
+            bail!(
+                "directory entry {i}: region offset {offset}, expected {expected_offset} (regions must be contiguous and in directory order)"
+            );
+        }
+        let end = offset
+            .checked_add(len)
+            .filter(|end| *end <= area_len)
+            .ok_or_else(|| {
+                anyhow!(
+                    "directory entry {i}: truncated region: extent {offset}+{len} exceeds the {area_len}-byte region area"
+                )
+            })?;
+        expected_offset = end;
+        regions.push(RegionInfo {
+            org,
+            stream_type,
+            stream,
+            min_ts,
+            max_ts,
+            rows,
+            frames,
+            offset,
+            len,
+        });
+    }
+    if r.remaining() != 0 {
+        bail!(
+            "directory has {} trailing bytes after {count} entries",
+            r.remaining()
+        );
+    }
+    if expected_offset != area_len {
+        bail!(
+            "{} trailing bytes after the last region",
+            area_len - expected_offset
+        );
+    }
+    Ok(regions)
+}
+
+/// Decode one raw (uncompressed) version-2 data frame. Returns the row count
+/// its header declares, so the caller can check the directory totals.
+fn decode_data_frame_raw(
+    r: &mut Reader<'_>,
+    region: &RegionInfo,
+    columns: ColumnFilter<'_>,
+    want: &mut impl FnMut(&FrameInfo) -> bool,
+    on_frame: &mut impl FnMut(SegmentFrame) -> Result<(), anyhow::Error>,
+) -> Result<u32, anyhow::Error> {
+    let start = r.pos;
+    let frame_type = r.read_u8("frame type")?;
+    if frame_type != FRAME_TYPE_DATA {
+        bail!("unknown frame type {frame_type} (version 2 regions hold only data frames)");
+    }
+    let org_len = r.read_u16("org length")? as usize;
+    let org = r.read_str(org_len, "org")?;
+    let stream_type_len = r.read_u16("stream_type length")? as usize;
+    let stream_type_str = r.read_str(stream_type_len, "stream_type")?;
+    let stream_len = r.read_u16("stream length")? as usize;
+    let stream = r.read_str(stream_len, "stream")?;
+    let min_ts = r.read_i64("min_ts")?;
+    let max_ts = r.read_i64("max_ts")?;
+    let rows = r.read_u32("rows")?;
+    let ipc_len = r.read_u32("ipc length")? as usize;
+    if ipc_len > MAX_FRAME_IPC_LEN {
+        bail!("ipc length {ipc_len} exceeds the {MAX_FRAME_IPC_LEN} frame cap (corrupt length)");
+    }
+    let ipc = r.take(ipc_len, "ipc payload")?;
+    let hashed = &r.buf[start..r.pos];
+    let crc_stored = r.read_u32("crc32")?;
+
+    let stream_type = parse_stream_type(stream_type_str)
+        .ok_or_else(|| anyhow!("unknown stream type {stream_type_str:?}"))?;
+    if org != region.org || stream_type != region.stream_type || stream != region.stream {
+        bail!("frame identity {org}/{stream_type}/{stream} does not match its region");
+    }
+    if min_ts < region.min_ts || max_ts > region.max_ts {
+        bail!(
+            "frame bounds [{min_ts}, {max_ts}] fall outside the region bounds [{}, {}]",
+            region.min_ts,
+            region.max_ts
+        );
+    }
+    let info = FrameInfo {
+        org: org.to_string(),
+        stream_type,
+        stream: stream.to_string(),
+        min_ts,
+        max_ts,
+        rows,
+    };
+    if !want(&info) {
+        return Ok(rows);
+    }
+    let crc_computed = crc32fast::hash(hashed);
+    if crc_stored != crc_computed {
+        bail!("crc32 mismatch: stored {crc_stored:#010x}, computed {crc_computed:#010x}");
+    }
+    deliver_frame(info, ipc, columns, on_frame)?;
+    Ok(rows)
+}
+
+/// IPC-parse one wanted frame, check its declared row count, and hand it on.
+fn deliver_frame(
+    info: FrameInfo,
+    ipc_bytes: &[u8],
+    columns: ColumnFilter<'_>,
+    on_frame: &mut impl FnMut(SegmentFrame) -> Result<(), anyhow::Error>,
+) -> Result<(), anyhow::Error> {
+    let batch = parse_frame_batch(&info, ipc_bytes, columns)?;
     if batch.num_rows() as u64 != u64::from(info.rows) {
         bail!(
             "stream {}/{}/{}: row count mismatch: frame declares {} rows, ipc decoded {}",
@@ -446,25 +874,156 @@ impl<R: std::io::Read> FrameStream<R> {
 }
 
 /// IPC-parse one wanted frame's body (identity in `info` for error text).
-fn parse_frame_batch(info: &FrameInfo, ipc_bytes: &[u8]) -> Result<RecordBatch, anyhow::Error> {
+/// Under a projection only the accepted top-level columns are decoded.
+fn parse_frame_batch(
+    info: &FrameInfo,
+    ipc_bytes: &[u8],
+    columns: ColumnFilter<'_>,
+) -> Result<RecordBatch, anyhow::Error> {
     let (org, stream_type, stream) = (&info.org, info.stream_type, &info.stream);
-    let reader = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(ipc_bytes), None)
-        .with_context(|| {
-        format!("stream {org}/{stream_type}/{stream}: arrow ipc open failed")
-    })?;
+    let projection = match columns {
+        None => None,
+        Some(keep) => {
+            let names = ipc_schema_field_names(ipc_bytes).with_context(|| {
+                format!("stream {org}/{stream_type}/{stream}: arrow ipc schema read failed")
+            })?;
+            let total = names.len();
+            let projection: Vec<usize> = names
+                .into_iter()
+                .enumerate()
+                .filter(|(_, name)| keep(name))
+                .map(|(i, _)| i)
+                .collect();
+            // a projection that keeps every column is a full decode
+            (projection.len() < total).then_some(projection)
+        }
+    };
+    let projected = projection.is_some();
+    let reader =
+        arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(ipc_bytes), projection)
+            .with_context(|| {
+                format!("stream {org}/{stream_type}/{stream}: arrow ipc open failed")
+            })?;
     let schema = reader.schema();
     let mut batches = reader
         .collect::<Result<Vec<_>, _>>()
         .with_context(|| format!("stream {org}/{stream_type}/{stream}: arrow ipc decode failed"))?;
     // the encoder writes exactly one batch per frame, but merge defensively;
     // batches from one ipc stream share one schema, so concat is safe here
-    Ok(match batches.len() {
+    let batch = match batches.len() {
         0 => RecordBatch::new_empty(schema),
         1 => batches.swap_remove(0),
         _ => arrow::compute::concat_batches(&schema, batches.iter()).with_context(|| {
             format!("stream {org}/{stream_type}/{stream}: arrow ipc concat failed")
         })?,
+    };
+    if !projected {
+        return Ok(batch);
+    }
+    detach_pinned_columns(batch).with_context(|| {
+        format!("stream {org}/{stream_type}/{stream}: copying projected columns failed")
     })
+}
+
+/// Top-level field names of an IPC stream's leading schema message, read
+/// from the flatbuffer without converting the schema: the projection must
+/// be known before `StreamReader` opens the stream.
+fn ipc_schema_field_names(ipc: &[u8]) -> Result<Vec<&str>, anyhow::Error> {
+    // Arrow >= 0.15 prefixes each message with a 0xFFFFFFFF continuation
+    // marker; the legacy framing starts directly with the length.
+    let (meta_start, meta_len) = match ipc {
+        [0xFF, 0xFF, 0xFF, 0xFF, a, b, c, d, ..] => (8usize, i32::from_le_bytes([*a, *b, *c, *d])),
+        [a, b, c, d, ..] => (4usize, i32::from_le_bytes([*a, *b, *c, *d])),
+        _ => bail!(
+            "ipc stream of {} bytes is shorter than a message prefix",
+            ipc.len()
+        ),
+    };
+    let meta_len = usize::try_from(meta_len)
+        .map_err(|_| anyhow!("negative schema message length {meta_len}"))?;
+    let meta = meta_start
+        .checked_add(meta_len)
+        .and_then(|end| ipc.get(meta_start..end))
+        .ok_or_else(|| {
+            anyhow!(
+                "schema message length {meta_len} exceeds the {}-byte ipc stream",
+                ipc.len()
+            )
+        })?;
+    let message = arrow::ipc::root_as_message(meta)
+        .map_err(|e| anyhow!("schema message is not a valid flatbuffer: {e}"))?;
+    let schema = message.header_as_schema().ok_or_else(|| {
+        anyhow!(
+            "first ipc message is {:?}, not a schema",
+            message.header_type()
+        )
+    })?;
+    let Some(fields) = schema.fields() else {
+        return Ok(Vec::new());
+    };
+    fields
+        .iter()
+        .enumerate()
+        .map(|(i, field)| {
+            field
+                .name()
+                .ok_or_else(|| anyhow!("schema field {i} has no name"))
+        })
+        .collect()
+}
+
+/// A column may reference at most this many bytes beyond its own slices
+/// before a projected decode copies it out.
+const PINNED_SLACK_BYTES: usize = 64 * 1024;
+
+/// IPC decode returns zero-copy slices of the message body: every buffer of
+/// a version-1 frame, and every buffer of a version-2 frame that Arrow
+/// stored raw because compression did not shrink it. A projected batch kept
+/// by a query would then pin the body bytes of every column it dropped, so
+/// copy each column that references a much larger allocation than it uses.
+fn detach_pinned_columns(batch: RecordBatch) -> Result<RecordBatch, ArrowError> {
+    let data: Vec<ArrayData> = batch.columns().iter().map(|c| c.to_data()).collect();
+    if !data.iter().any(pins_larger_allocation) {
+        return Ok(batch);
+    }
+    let columns = batch
+        .columns()
+        .iter()
+        .zip(&data)
+        .map(|(column, data)| {
+            if pins_larger_allocation(data) {
+                deep_copy_array(data)
+            } else {
+                Arc::clone(column)
+            }
+        })
+        .collect();
+    RecordBatch::try_new_with_options(
+        batch.schema(),
+        columns,
+        &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+    )
+}
+
+fn pins_larger_allocation(data: &ArrayData) -> bool {
+    let pins =
+        |buffer: &Buffer| buffer.capacity() > buffer.len().saturating_add(PINNED_SLACK_BYTES);
+    data.buffers().iter().any(pins)
+        || data.nulls().is_some_and(|nulls| pins(nulls.buffer()))
+        || data.child_data().iter().any(pins_larger_allocation)
+}
+
+fn deep_copy_array(data: &ArrayData) -> ArrayRef {
+    let mut copy = MutableArrayData::new(vec![data], false, data.len());
+    copy.extend(0, 0, data.len());
+    let array = make_array(copy.freeze());
+    // MutableArrayData shares the variadic payload buffers of view arrays;
+    // gc() rewrites them into owned, exactly sized buffers.
+    match array.data_type() {
+        DataType::Utf8View => Arc::new(array.as_string_view().gc()),
+        DataType::BinaryView => Arc::new(array.as_binary_view().gc()),
+        _ => array,
+    }
 }
 
 /// Exact inverse of `StreamType`'s `Display` impl. Returns None on unknown
@@ -536,6 +1095,10 @@ impl<'a> Reader<'a> {
 
     fn read_i64(&mut self, what: &str) -> Result<i64, anyhow::Error> {
         Ok(i64::from_le_bytes(self.read_array(what)?))
+    }
+
+    fn read_str(&mut self, n: usize, what: &str) -> Result<&'a str, anyhow::Error> {
+        std::str::from_utf8(self.take(n, what)?).map_err(|e| anyhow!("{what} is not utf-8: {e}"))
     }
 }
 
@@ -794,11 +1357,11 @@ mod tests {
     fn version_bump_is_rejected() {
         let h = header();
         let mut encoded = encode_segment(&h, &[]).unwrap();
-        encoded[4..6].copy_from_slice(&2u16.to_le_bytes());
+        encoded[4..6].copy_from_slice(&3u16.to_le_bytes());
         let err = decode_segment(&encoded).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("unsupported version 2"),
+            msg.contains("unsupported version 3"),
             "unexpected error: {msg}"
         );
     }
@@ -1057,5 +1620,432 @@ mod tests {
         )
         .unwrap();
         assert_eq!(infos, vec![("s1".to_string(), 111, 222, 2)]);
+    }
+
+    // ---- version 2: per-stream regions, per-buffer IPC compression ----
+
+    fn batch_ts_two_strings(ts: &[i64], a: &[&str], b: &[&str]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("a", DataType::Utf8, true),
+            Field::new("b", DataType::Utf8, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(ts.to_vec())),
+                Arc::new(StringArray::from(a.to_vec())),
+                Arc::new(StringArray::from(b.to_vec())),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn decode_projected_all(
+        encoded: &[u8],
+        columns: ColumnFilter<'_>,
+    ) -> Result<Vec<SegmentFrame>, anyhow::Error> {
+        let mut out = Vec::new();
+        decode_segment_projected(
+            encoded,
+            columns,
+            |_| true,
+            |f| {
+                out.push(f);
+                Ok(())
+            },
+        )?;
+        Ok(out)
+    }
+
+    /// Raw version-2 object from hand-written directory entries and region
+    /// bytes, for adversarial layouts the encoder never produces.
+    #[allow(clippy::type_complexity)]
+    fn raw_v2(
+        h: &SegmentHeader,
+        entries: &[(&str, &str, &str, i64, i64, u64, u32, u64, u64)],
+        area: &[u8],
+    ) -> Vec<u8> {
+        let mut out = encode_segment_version(h, &[], SEGMENT_VERSION_V2).unwrap();
+        out.truncate(header_len(h));
+        let mut dir = (entries.len() as u32).to_le_bytes().to_vec();
+        for (org, st, stream, min, max, rows, frames, offset, len) in entries {
+            for s in [*org, *st, *stream] {
+                dir.extend_from_slice(&(s.len() as u16).to_le_bytes());
+                dir.extend_from_slice(s.as_bytes());
+            }
+            dir.extend_from_slice(&min.to_le_bytes());
+            dir.extend_from_slice(&max.to_le_bytes());
+            dir.extend_from_slice(&rows.to_le_bytes());
+            dir.extend_from_slice(&frames.to_le_bytes());
+            dir.extend_from_slice(&offset.to_le_bytes());
+            dir.extend_from_slice(&len.to_le_bytes());
+        }
+        out.extend_from_slice(&(dir.len() as u32).to_le_bytes());
+        out.extend_from_slice(&dir);
+        out.extend_from_slice(&crc32fast::hash(&dir).to_le_bytes());
+        out.extend_from_slice(area);
+        out
+    }
+
+    #[test]
+    fn v2_round_trip_groups_frames_by_stream() {
+        let h = header();
+        // interleaved streams and a type-flipped schema inside one stream
+        let frames = vec![
+            frame(
+                "org1",
+                StreamType::Logs,
+                "app1",
+                100,
+                300,
+                batch_i64("value", &[1, 2, 3]),
+            ),
+            frame(
+                "org1",
+                StreamType::Traces,
+                "spans",
+                50,
+                60,
+                batch_utf8("name", &["a", "b"]),
+            ),
+            frame(
+                "org1",
+                StreamType::Logs,
+                "app1",
+                400,
+                500,
+                batch_utf8("value", &["x", "y"]),
+            ),
+            frame(
+                "org2",
+                StreamType::Metrics,
+                "cpu",
+                -10,
+                10,
+                batch_i64("gauge", &[7]),
+            ),
+        ];
+        let encoded = encode_segment_version(&h, &frames, SEGMENT_VERSION_V2).unwrap();
+        assert_eq!(&encoded[4..6], &SEGMENT_VERSION_V2.to_le_bytes());
+        let (decoded_header, decoded) = decode_segment(&encoded).unwrap();
+        assert_eq!(decoded_header, h);
+        // regions follow first appearance; frames keep order inside a region
+        let want_order = [0usize, 2, 1, 3];
+        assert_eq!(decoded.len(), want_order.len());
+        for (got, &i) in decoded.iter().zip(want_order.iter()) {
+            let want = &frames[i];
+            assert_eq!(
+                (
+                    &got.org,
+                    got.stream_type,
+                    &got.stream,
+                    got.min_ts,
+                    got.max_ts
+                ),
+                (
+                    &want.org,
+                    want.stream_type,
+                    &want.stream,
+                    want.min_ts,
+                    want.max_ts
+                )
+            );
+            assert_eq!(got.batch, want.batch);
+        }
+        assert_eq!(
+            decoded[0].batch.schema().field(0).data_type(),
+            &DataType::Int64
+        );
+        assert_eq!(
+            decoded[1].batch.schema().field(0).data_type(),
+            &DataType::Utf8
+        );
+    }
+
+    #[test]
+    fn v2_empty_frames_round_trip() {
+        let h = header();
+        let encoded = encode_segment_version(&h, &[], SEGMENT_VERSION_V2).unwrap();
+        let (decoded_header, decoded) = decode_segment(&encoded).unwrap();
+        assert_eq!(decoded_header, h);
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn unsupported_encode_version_is_rejected() {
+        let err = encode_segment_version(&header(), &[], 3).unwrap_err();
+        assert!(format!("{err:#}").contains("cannot encode format version 3"));
+    }
+
+    /// Both versions decode exactly the accepted columns, keep the row count
+    /// when no column is accepted, and treat keep-everything as a full decode.
+    #[test]
+    fn projected_decode_returns_only_accepted_columns() {
+        let h = header();
+        let batch = batch_ts_two_strings(&[1, 2, 3], &["a1", "a2", "a3"], &["b1", "b2", "b3"]);
+        let frames = vec![frame("o", StreamType::Logs, "s", 1, 3, batch.clone())];
+        for version in [SEGMENT_VERSION_V1, SEGMENT_VERSION_V2] {
+            let encoded = encode_segment_version(&h, &frames, version).unwrap();
+
+            let keep_ts_and_a = |name: &str| name == "_timestamp" || name == "a";
+            let got = decode_projected_all(&encoded, Some(&keep_ts_and_a)).unwrap();
+            assert_eq!(got.len(), 1);
+            let projected = &got[0].batch;
+            assert_eq!(projected.num_columns(), 2, "version {version}");
+            assert_eq!(projected.schema().field(0).name(), "_timestamp");
+            assert_eq!(projected.schema().field(1).name(), "a");
+            assert_eq!(projected.column(0), batch.column(0));
+            assert_eq!(projected.column(1), batch.column(1));
+
+            let keep_none = |_: &str| false;
+            let got = decode_projected_all(&encoded, Some(&keep_none)).unwrap();
+            assert_eq!(got[0].batch.num_columns(), 0, "version {version}");
+            assert_eq!(got[0].batch.num_rows(), 3, "version {version}");
+
+            let keep_all = |_: &str| true;
+            let got = decode_projected_all(&encoded, Some(&keep_all)).unwrap();
+            assert_eq!(got[0].batch, batch, "version {version}");
+        }
+    }
+
+    /// A projected batch must not keep the dropped columns' bytes alive:
+    /// version 1 IPC buffers are slices of one decompressed message body.
+    #[test]
+    fn projected_decode_does_not_pin_dropped_columns() {
+        let h = header();
+        let rows = 2_000usize;
+        let ts: Vec<i64> = (0..rows as i64).collect();
+        let small: Vec<String> = (0..rows).map(|i| format!("s{i}")).collect();
+        // ~1 MB of distinct, poorly compressible text in the dropped column
+        let big: Vec<String> = (0..rows)
+            .map(|i| {
+                format!(
+                    "{:0512x}",
+                    (i as u128).wrapping_mul(0x9e37_79b9_7f4a_7c15_f39c_c060_5ced_c834)
+                )
+            })
+            .collect();
+        let small_refs: Vec<&str> = small.iter().map(String::as_str).collect();
+        let big_refs: Vec<&str> = big.iter().map(String::as_str).collect();
+        let batch = batch_ts_two_strings(&ts, &small_refs, &big_refs);
+        let frames = vec![frame(
+            "o",
+            StreamType::Logs,
+            "s",
+            0,
+            rows as i64,
+            batch.clone(),
+        )];
+        let keep = |name: &str| name != "b";
+        for version in [SEGMENT_VERSION_V1, SEGMENT_VERSION_V2] {
+            let encoded = encode_segment_version(&h, &frames, version).unwrap();
+            let got = decode_projected_all(&encoded, Some(&keep)).unwrap();
+            let projected = &got[0].batch;
+            assert_eq!(projected.num_columns(), 2);
+            assert_eq!(projected.column(1), batch.column(1));
+            for column in projected.columns() {
+                assert!(
+                    !pins_larger_allocation(&column.to_data()),
+                    "version {version}: a kept column still references a larger allocation"
+                );
+            }
+            let retained: usize = projected
+                .columns()
+                .iter()
+                .map(|c| c.get_buffer_memory_size())
+                .sum();
+            assert!(
+                retained < 256 * 1024,
+                "version {version}: projected batch retains {retained} bytes"
+            );
+        }
+    }
+
+    fn v2_two_stream_object(h: &SegmentHeader) -> (Vec<u8>, usize) {
+        let frames = vec![
+            frame(
+                "o",
+                StreamType::Logs,
+                "first",
+                1,
+                2,
+                batch_i64("v", &[1, 2]),
+            ),
+            frame(
+                "o",
+                StreamType::Logs,
+                "second",
+                3,
+                4,
+                batch_i64("v", &[3, 4]),
+            ),
+        ];
+        let encoded = encode_segment_version(h, &frames, SEGMENT_VERSION_V2).unwrap();
+        let dir_len_at = header_len(h);
+        let dir_len =
+            u32::from_le_bytes(encoded[dir_len_at..dir_len_at + 4].try_into().unwrap()) as usize;
+        let area_start = dir_len_at + 4 + dir_len + 4;
+        (encoded, area_start)
+    }
+
+    /// Unwanted regions are skipped without hashing; wanted frames are
+    /// crc-checked, and a full decode still catches the corruption.
+    #[test]
+    fn v2_skips_unwanted_regions_but_checks_wanted_frames() {
+        let h = header();
+        let (mut encoded, area_start) = v2_two_stream_object(&h);
+        // flip the last ipc byte of the FIRST region's only frame (just
+        // before its 4-byte crc): only that frame's crc covers it
+        let first_frame_len = {
+            let mut off = area_start + 1;
+            off += 2 + 1 + 2 + 4 + 2 + "first".len() + 8 + 8 + 4;
+            let ipc_len = u32::from_le_bytes(encoded[off..off + 4].try_into().unwrap()) as usize;
+            off + 4 + ipc_len + 4 - area_start
+        };
+        encoded[area_start + first_frame_len - 5] ^= 0xFF;
+
+        let mut seen = Vec::new();
+        decode_segment_filtered(
+            &encoded,
+            |info| info.stream == "second",
+            |f| {
+                seen.push(f.stream);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(seen, vec!["second".to_string()]);
+
+        let err = decode_segment(&encoded).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("crc32 mismatch"), "unexpected error: {msg}");
+        assert!(
+            msg.contains("region 0 (o/logs/first)"),
+            "unexpected error: {msg}"
+        );
+        assert!(msg.contains("frame 0"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn v2_directory_corruption_is_rejected() {
+        let h = header();
+        let (mut encoded, _) = v2_two_stream_object(&h);
+        // first byte of the first directory entry (org length)
+        encoded[header_len(&h) + 4 + 4] ^= 0x01;
+        let err = decode_segment_filtered(&encoded, |_| false, |_| Ok(())).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("directory crc32 mismatch"),
+            "unexpected error: {msg}"
+        );
+        assert!(msg.contains(&h.node_uuid), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn v2_truncation_is_rejected_even_for_unwanted_regions() {
+        let h = header();
+        let (mut encoded, _) = v2_two_stream_object(&h);
+        encoded.truncate(encoded.len() - 3);
+        let err = decode_segment_filtered(&encoded, |_| false, |_| Ok(())).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("truncated region"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn v2_trailing_bytes_after_last_region_are_rejected() {
+        let h = header();
+        let (mut encoded, _) = v2_two_stream_object(&h);
+        encoded.extend_from_slice(&[0, 0, 0]);
+        let err = decode_segment(&encoded).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("trailing bytes after the last region"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn v2_frame_identity_must_match_its_region() {
+        let h = header();
+        let batch = batch_i64("v", &[1]);
+        let region = raw_data_frame("o", "logs", "other", 1, 1, 1, &ipc_bytes(&batch));
+        let encoded = raw_v2(
+            &h,
+            &[("o", "logs", "s", 1, 1, 1, 1, 0, region.len() as u64)],
+            &region,
+        );
+        let err = decode_segment(&encoded).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("does not match its region"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("region 0 (o/logs/s)"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn v2_directory_counts_must_match_the_region() {
+        let h = header();
+        let batch = batch_i64("v", &[1, 2]);
+        let region = raw_data_frame("o", "logs", "s", 1, 2, 2, &ipc_bytes(&batch));
+        let encoded = raw_v2(
+            &h,
+            &[("o", "logs", "s", 1, 2, 2, 3, 0, region.len() as u64)],
+            &region,
+        );
+        let err = decode_segment(&encoded).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("directory declares 3 frames"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn v2_regions_must_be_contiguous() {
+        let h = header();
+        let batch = batch_i64("v", &[1]);
+        let region = raw_data_frame("o", "logs", "s", 1, 1, 1, &ipc_bytes(&batch));
+        let mut area = vec![0u8; 4];
+        area.extend_from_slice(&region);
+        let encoded = raw_v2(
+            &h,
+            &[("o", "logs", "s", 1, 1, 1, 1, 4, region.len() as u64)],
+            &area,
+        );
+        let err = decode_segment(&encoded).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("must be contiguous"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn v2_frame_bounds_must_fall_inside_the_region() {
+        let h = header();
+        let batch = batch_i64("v", &[1]);
+        let region = raw_data_frame("o", "logs", "s", 1, 9, 1, &ipc_bytes(&batch));
+        let encoded = raw_v2(
+            &h,
+            &[("o", "logs", "s", 1, 5, 1, 1, 0, region.len() as u64)],
+            &region,
+        );
+        let err = decode_segment(&encoded).unwrap_err();
+        assert!(format!("{err:#}").contains("outside the region bounds"));
+    }
+
+    #[test]
+    fn v2_short_payloads_are_rejected_not_panicking() {
+        let h = header();
+        let (encoded, _) = v2_two_stream_object(&h);
+        for n in header_len(&h)..encoded.len() {
+            let res = decode_segment(&encoded[..n]);
+            assert!(res.is_err(), "prefix of {n} bytes decoded");
+        }
     }
 }

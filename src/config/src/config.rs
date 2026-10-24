@@ -1511,6 +1511,12 @@ pub struct Common {
     )]
     pub segment_scan_decode_concurrency: usize,
     #[env_config(
+        name = "ZO_SEGMENT_FORMAT_VERSION",
+        default = 1,
+        help = "Segment WAL: object format the flusher writes. 1 = one zstd stream over every frame, so a reader decompresses all streams to reach one. 2 = per-stream regions behind a raw directory with per-buffer zstd IPC, so a reader skips other streams and decompresses only the columns it reads. Every reader (queriers, and the ingester and compactor builders) must run a build that reads version 2 before any writer switches to it."
+    )]
+    pub segment_format_version: u16,
+    #[env_config(
         name = "ZO_WAL_WRITE_QUEUE_ENABLED",
         default = false,
         help = "Route WAL writes through a per-writer queue. The ingest request still waits for its own write to complete -- the consumer reports the write's outcome back before the request is acked -- so this smooths bursts across requests without weakening ack truth: an enqueue is never acked as a durable write, and a consumer failure surfaces as the request's error instead of a log line."
@@ -4168,6 +4174,12 @@ fn check_common_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
         return Err(anyhow::anyhow!(
             "ZO_SEGMENT_BUILD_BATCH must be at least 1, got {}",
             cfg.common.segment_build_batch
+        ));
+    }
+    if !matches!(cfg.common.segment_format_version, 1 | 2) {
+        return Err(anyhow::anyhow!(
+            "ZO_SEGMENT_FORMAT_VERSION must be 1 or 2, got {}",
+            cfg.common.segment_format_version
         ));
     }
     // A zero-sized chunk would make every non-empty contribution look

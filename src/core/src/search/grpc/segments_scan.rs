@@ -1831,9 +1831,11 @@ struct ScannedHistogram {
     decoded_frames: usize,
 }
 
-/// Consume one segment into sparse histogram counters. `decode_segment_filtered`
-/// still walks and CRC-checks every frame; returning false merely avoids IPC
-/// parsing for irrelevant or whole-frame-folded data.
+/// Consume one segment into sparse histogram counters. Returning false from
+/// the frame filter avoids IPC parsing for irrelevant or whole-frame-folded
+/// data; wanted frames decode only `_timestamp`. Version-1 objects still
+/// decompress and CRC-check every frame; version-2 objects skip other
+/// streams' regions.
 #[allow(clippy::too_many_arguments)]
 fn scan_segment_histogram(
     bytes: &[u8],
@@ -1864,8 +1866,10 @@ fn scan_segment_histogram(
     #[cfg(test)]
     let decoded_frames = std::cell::Cell::new(0usize);
 
-    segment_wal::format::decode_segment_filtered(
+    let timestamp_only = |name: &str| name == TIMESTAMP_COL_NAME;
+    segment_wal::format::decode_segment_projected(
         bytes,
+        Some(&timestamp_only),
         |info| {
             if selector_error.borrow().is_some()
                 || info.org != org_id
@@ -2057,8 +2061,19 @@ fn scan_segment_object_planned(
     let mut stream_frames = 0i64;
     let mut time_frames = 0u64;
     let mut top_n_skipped_frames = 0u64;
-    segment_wal::format::decode_segment_filtered(
+    // Decode only the columns the plans read. The predicate touches only
+    // condition fields, which are a subset of `needed`, so a plan compiled
+    // on the projected schema selects the same rows as one compiled on the
+    // full write-time schema.
+    let keep_column = |name: &str| schema_plans.reads_column(name);
+    let columns: segment_wal::format::ColumnFilter<'_> = if schema_plans.reads_every_column() {
+        None
+    } else {
+        Some(&keep_column)
+    };
+    segment_wal::format::decode_segment_projected(
         bytes,
+        columns,
         |info| {
             frames_seen += 1;
             let identity =
@@ -2189,6 +2204,16 @@ impl SegmentSchemaPlans {
             needed,
             plans: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// `_source` synthesizes rows from every column, so it disables the
+    /// decode-time projection.
+    fn reads_every_column(&self) -> bool {
+        self.needed.contains(vortex_index::SOURCE_COL_NAME)
+    }
+
+    fn reads_column(&self, name: &str) -> bool {
+        self.needed.contains(name)
     }
 
     fn get(&self, schema: Arc<Schema>) -> Arc<SegmentSchemaPlan> {
@@ -4610,6 +4635,138 @@ mod tests {
         assert_eq!(scanned.exact_rows_after_condition, 2);
         assert_eq!(scanned.whole_rows_retained, 0);
     }
+
+    /// The decode-time projection and the version-2 layout must not change
+    /// what a scan keeps: same rows and counters for both versions, and kept
+    /// batches carry only the needed columns.
+    #[test]
+    fn projected_scan_matches_across_segment_versions() {
+        use segment_wal::format::{SEGMENT_VERSION_V1, SEGMENT_VERSION_V2, encode_segment_version};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("code", DataType::Utf8, true),
+            Field::new("extra", DataType::Utf8, true),
+        ]));
+        let batch = |ts: Vec<i64>, codes: Vec<Option<&str>>| {
+            let extra: Vec<String> = ts.iter().map(|t| format!("extra-{t}")).collect();
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(ts)),
+                    Arc::new(StringArray::from(codes)),
+                    Arc::new(StringArray::from(extra)),
+                ],
+            )
+            .unwrap()
+        };
+        let frames = vec![
+            frame(
+                "org1",
+                StreamType::Logs,
+                "app1",
+                100,
+                120,
+                batch(
+                    vec![100, 110, 120],
+                    vec![Some("200"), Some("500"), Some("200")],
+                ),
+            ),
+            frame(
+                "org1",
+                StreamType::Logs,
+                "other",
+                100,
+                100,
+                batch(vec![100], vec![Some("200")]),
+            ),
+            frame(
+                "org1",
+                StreamType::Logs,
+                "app1",
+                130,
+                140,
+                batch(vec![130, 140], vec![None, Some("200")]),
+            ),
+        ];
+        let plan_schema = Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("code", DataType::Utf8, true),
+        ]);
+        let condition = IndexCondition {
+            conditions: vec![Condition::Equal("code".into(), "200".into())],
+        };
+        let needed = HashSet::from_iter(["_timestamp".to_string(), "code".to_string()]);
+        let header = SegmentHeader {
+            node_uuid: "versions".into(),
+            seq: 1,
+            created_at: 1,
+        };
+
+        let mut scans = Vec::new();
+        let mut histograms = Vec::new();
+        for version in [SEGMENT_VERSION_V1, SEGMENT_VERSION_V2] {
+            let encoded = encode_segment_version(&header, &frames, version).unwrap();
+            let scanned = scan_segment_object(
+                &encoded,
+                "org1",
+                StreamType::Logs,
+                "app1",
+                (0, 500),
+                Some(&condition),
+                &plan_schema,
+                &[],
+                &needed,
+                None,
+            )
+            .unwrap();
+            assert_eq!(scanned.frames_seen, 3, "version {version}");
+            assert_eq!(scanned.stream_frames, 2, "version {version}");
+            assert_eq!(scanned.ipc_frames, 2, "version {version}");
+            assert_eq!(scanned.rows_examined, 5, "version {version}");
+            for (_, kept) in &scanned.kept {
+                let names: Vec<String> = kept
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().clone())
+                    .collect();
+                assert_eq!(names, ["_timestamp", "code"], "version {version}");
+            }
+            let timestamps: Vec<i64> = scanned
+                .kept
+                .iter()
+                .flat_map(|(_, kept)| {
+                    kept.column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .values()
+                        .to_vec()
+                })
+                .collect();
+            scans.push((timestamps, scanned.exact_rows_after_condition));
+
+            let histogram = scan_segment_histogram(
+                &encoded,
+                "org1",
+                StreamType::Logs,
+                "app1",
+                (100, 150),
+                100,
+                10,
+                5,
+                0,
+            )
+            .unwrap();
+            histograms.push((histogram.histogram, histogram.rows_examined));
+        }
+        assert_eq!(scans[0], scans[1]);
+        assert_eq!(scans[0].0, vec![100, 120, 140]);
+        assert_eq!(histograms[0], histograms[1]);
+        assert_eq!(histograms[0].1, 5);
+    }
+
     #[test]
     fn histogram_filters_stream_and_window_and_folds_single_bucket_frames() {
         let header = SegmentHeader {

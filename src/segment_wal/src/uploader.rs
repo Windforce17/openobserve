@@ -33,7 +33,7 @@ use infra::wal_segments::{SegmentMeta, SegmentStatus};
 
 use crate::{
     buffer::global_buffer,
-    format::{SegmentFrame, SegmentHeader, encode_segment},
+    format::{SegmentFrame, SegmentHeader, encode_segment_version},
 };
 
 /// Process-lifetime segment sequence, starting at 0 each boot. Combined with
@@ -198,8 +198,12 @@ async fn ship(frames: Vec<SegmentFrame>) -> Result<(), anyhow::Error> {
     // An encode failure is deterministic (retrying cannot fix it): the frames
     // are lost, so scream and propagate to the supervisor.
     let encode_header = header.clone();
-    let bytes = match tokio::task::spawn_blocking(move || encode_segment(&encode_header, &frames))
-        .await
+    let format_version = config::get_config().common.segment_format_version;
+    let encode_started = Instant::now();
+    let bytes = match tokio::task::spawn_blocking(move || {
+        encode_segment_version(&encode_header, &frames, format_version)
+    })
+    .await
     {
         Ok(Ok(bytes)) => bytes,
         Ok(Err(e)) => {
@@ -215,6 +219,7 @@ async fn ship(frames: Vec<SegmentFrame>) -> Result<(), anyhow::Error> {
             return Err(anyhow!("encode task for segment {object_key} failed: {e}"));
         }
     };
+    let encode_ms = encode_started.elapsed().as_millis();
     let size = bytes.len();
     let data = bytes::Bytes::from(bytes);
 
@@ -264,7 +269,7 @@ async fn ship(frames: Vec<SegmentFrame>) -> Result<(), anyhow::Error> {
     .await?;
 
     log::info!(
-        "[SEGMENT:FLUSH] shipped segment seq={seq} frames={frame_count} streams={stream_count} bytes={size} took_ms={}",
+        "[SEGMENT:FLUSH] shipped segment seq={seq} format=v{format_version} frames={frame_count} streams={stream_count} bytes={size} encode_ms={encode_ms} took_ms={}",
         started.elapsed().as_millis()
     );
     Ok(())
