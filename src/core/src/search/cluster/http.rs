@@ -105,7 +105,25 @@ pub async fn search(
         // materialize each hit from its own record here (physical columns
         // win on overlap), BEFORE any VRL function sees the rows. Rows
         // without a `_source` key pass through untouched.
-        expand_star_source_hits(&mut json_rows);
+        // Only a row-store star plan carries the synthetic `_source` field
+        // in its used schema (`generate_row_store_star_fields`); explicit
+        // field lists are bound from the registry, which has no `_source`.
+        let star_query = sql
+            .schemas
+            .values()
+            .any(|schema| schema.contains_field(vortex_index::SOURCE_COL_NAME));
+        let star_stats = expand_star_source_hits(&mut json_rows, star_query);
+        if star_stats.degraded() > 0 {
+            log::warn!(
+                "[trace_id {trace_id}] http->search: {} of {} star hits could not be materialized from _source (missing {}, non-string {}, unparsable {}, first parse error: {}); returned their physical columns only",
+                star_stats.degraded(),
+                json_rows.len(),
+                star_stats.missing_source,
+                star_stats.non_string_source,
+                star_stats.unparsable_source,
+                star_stats.first_parse_error.as_deref().unwrap_or("none"),
+            );
+        }
 
         let mut sources: Vec<json::Value> = if query_fn.is_empty() {
             json_rows

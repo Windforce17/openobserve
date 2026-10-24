@@ -2480,7 +2480,7 @@ mod tests {
         let batches = scan_all(build_core_file(), projected, None, None);
         let refs: Vec<&RecordBatch> = batches.iter().collect();
         let mut rows = config::utils::arrow::record_batches_to_json_rows(&refs).unwrap();
-        expand_star_source_hits(&mut rows);
+        expand_star_source_hits(&mut rows, true);
 
         // every record comes back with ITS OWN fields — including the ones
         // the registry never heard of
@@ -2540,7 +2540,7 @@ mod tests {
         let batches = scan_all(data, projected, None, None);
         let refs: Vec<&RecordBatch> = batches.iter().collect();
         let mut rows = config::utils::arrow::record_batches_to_json_rows(&refs).unwrap();
-        expand_star_source_hits(&mut rows);
+        expand_star_source_hits(&mut rows, true);
 
         assert_eq!(
             serde_json::Value::Object(rows[0].clone()),

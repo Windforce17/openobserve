@@ -118,6 +118,26 @@ pub fn synthesize_source(batch: &RecordBatch) -> Result<StringArray, anyhow::Err
     Ok(StringArray::from_iter_values(rows))
 }
 
+/// Star hits that [`expand_star_source_hits`] could not materialize from
+/// `_source`; each such hit keeps only its physical columns.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct StarExpandStats {
+    /// star hits with no `_source` cell
+    pub missing_source: usize,
+    /// star hits whose `_source` cell is not a string
+    pub non_string_source: usize,
+    /// star hits whose `_source` text is not a JSON object
+    pub unparsable_source: usize,
+    /// first parse error, kept so the caller's single log line is actionable
+    pub first_parse_error: Option<String>,
+}
+
+impl StarExpandStats {
+    pub fn degraded(&self) -> usize {
+        self.missing_source + self.non_string_source + self.unparsable_source
+    }
+}
+
 /// Explode each hit's `_source` JSON back into the hit itself.
 ///
 /// The row-store-driven `SELECT *` (DESIGN §5) projects only
@@ -132,32 +152,31 @@ pub fn synthesize_source(batch: &RecordBatch) -> Result<StringArray, anyhow::Err
 ///   `_source` text drifted),
 /// - the `_source` key itself never reaches the response.
 ///
-/// Rows without a `_source` key (explicit-field queries, aggregations, or
-/// legacy rows some scan could not synthesize) pass through untouched, so
-/// the helper is safe to run over every response row.
-pub fn expand_star_source_hits(rows: &mut [serde_json::Map<String, serde_json::Value>]) {
+/// Rows without a `_source` key pass through untouched, so the helper is
+/// safe to run over every response row. Only `star_query` responses count
+/// such rows as degraded: explicit-field rows (which may well carry
+/// `_timestamp`) and aggregation rows have no `_source` by design. The
+/// caller logs the returned counts once per request; logging per row cost
+/// one WARN line per returned hit on large explicit-field results.
+pub fn expand_star_source_hits(
+    rows: &mut [serde_json::Map<String, serde_json::Value>],
+    star_query: bool,
+) -> StarExpandStats {
+    let mut stats = StarExpandStats::default();
     for row in rows.iter_mut() {
         let Some(source_value) = row.remove(SOURCE_COL_NAME) else {
-            // The expander runs over EVERY response's rows: aggregation and
-            // explicit-field rows have no `_source` BY DESIGN and pass
-            // through silently (they also carry no `_timestamp`). Only a
-            // RECORD-shaped row missing `_source` is a degraded star hit
-            // (observed live as `{"_timestamp"}`-only rows served from a
-            // cold ingester's WAL window) — warn on exactly that.
-            if let Some(ts) = row.get(config::TIMESTAMP_COL_NAME) {
-                log::warn!(
-                    "star hit carries no _source cell, keeping physical columns only (ts {ts:?})",
-                );
+            // A star hit without `_source` is degraded (observed live as
+            // `{"_timestamp"}`-only rows served from a cold ingester's WAL
+            // window).
+            if star_query {
+                stats.missing_source += 1;
             }
             continue;
         };
         let serde_json::Value::String(source) = source_value else {
             // defensive: a non-string `_source` cell (never produced by the
             // writers) — drop the key, keep the physical columns
-            log::warn!(
-                "star hit carries a non-string _source cell, keeping physical columns only (ts {:?})",
-                row.get(config::TIMESTAMP_COL_NAME)
-            );
+            stats.non_string_source += 1;
             continue;
         };
         match serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&source) {
@@ -171,10 +190,14 @@ pub fn expand_star_source_hits(rows: &mut [serde_json::Map<String, serde_json::V
                 *row = hit;
             }
             Err(e) => {
-                log::warn!("star hit carries unparsable _source, keeping physical columns: {e}");
+                stats.unparsable_source += 1;
+                if stats.first_parse_error.is_none() {
+                    stats.first_parse_error = Some(e.to_string());
+                }
             }
         }
     }
+    stats
 }
 
 /// A [`PhysicalExpr`] producing the per-row `_source` JSON image of a file
@@ -578,7 +601,7 @@ mod tests {
             // unparsable _source: physical columns kept, key dropped
             row(json!({"_timestamp": 3000i64, "code": 7, SOURCE_COL_NAME: "not-json"})),
         ];
-        expand_star_source_hits(&mut rows);
+        let stats = expand_star_source_hits(&mut rows, true);
 
         // parity: hit fields == record `_source` keys (minus nulls) ∪ physical cols
         assert_eq!(
@@ -598,6 +621,38 @@ mod tests {
             serde_json::Value::Object(rows[2].clone()),
             json!({"_timestamp": 3000i64, "code": 7})
         );
+        assert_eq!(stats.missing_source, 1);
+        assert_eq!(stats.non_string_source, 0);
+        assert_eq!(stats.unparsable_source, 1);
+        assert!(stats.first_parse_error.is_some());
+        assert_eq!(stats.degraded(), 2);
+    }
+
+    /// Explicit-field results (`SELECT _timestamp, body ...`) carry
+    /// `_timestamp` but never `_source`: they pass through unchanged and are
+    /// not counted as degraded star hits. The same rows in a star response
+    /// are counted.
+    #[test]
+    fn test_expand_star_source_hits_explicit_fields_are_not_degraded() {
+        let rows: Vec<serde_json::Map<String, serde_json::Value>> = (0..1000i64)
+            .map(
+                |i| match json!({"_timestamp": i, "pod": "p", "body": "line"}) {
+                    serde_json::Value::Object(m) => m,
+                    _ => unreachable!(),
+                },
+            )
+            .collect();
+
+        let mut explicit = rows.clone();
+        let stats = expand_star_source_hits(&mut explicit, false);
+        assert_eq!(stats, StarExpandStats::default());
+        assert_eq!(explicit, rows);
+
+        let mut star = rows.clone();
+        let stats = expand_star_source_hits(&mut star, true);
+        assert_eq!(stats.missing_source, 1000);
+        assert_eq!(stats.degraded(), 1000);
+        assert_eq!(star, rows);
     }
 
     /// The adapter rewrites a missing `_source` column into a synthesis over
