@@ -1230,6 +1230,10 @@ async fn process_bucket_locked(
             continue;
         }
         let path = infra::bloom::path::bloom_path(org_id, stream_type, stream_name, date, old);
+        // mark it in the shared memo, or the GC below queues it again
+        if queue_bloom_tombstone(&path) {
+            continue;
+        }
         tombstones.push(FileListDeleted {
             id: 0,
             account: infra::storage::get_account(org_id, &path).unwrap_or_default(),
