@@ -523,23 +523,22 @@ async fn check_chunk_saturation(
     (version, verdict)
 }
 
-/// The composite section of a chunk: the expected number of false-positive
-/// member files per lookup above what the members' own sizing would give.
+/// The worst section of a chunk: the expected number of false-positive
+/// member files per lookup on one field above what the members' own sizing
+/// would give.
 ///
-/// Only the composite section counts. It holds the Bloom-only fields
-/// (`trace_id`, `span_id`, ... — no dictionary), so a saturated composite
-/// sends a lookup to a full data scan, and the members' sidecar blobs carry
-/// it, so a heal can restore it. Per-field sections of dictionary-backed
-/// fields cost at most a VIX probe per false positive, and many come from
-/// dictionary supplements that no blob holds: counting them would mark
-/// chunks a heal cannot improve (prod replay 2026-10-25: composite 254.8 ->
-/// 0.28 maybe-files per absent probe, while one supplement section stayed
-/// at 254.9).
+/// Every section counts. A saturated composite (the Bloom-only fields
+/// `trace_id`, `span_id`, ... — no dictionary) sends a lookup to a full data
+/// scan; a saturated per-field section (`user_id`, `session_id`, ...) costs
+/// one VIX dictionary probe per false-positive file. A heal reloads every
+/// folded member through the pending-build loader (dictionary supplements
+/// included), so both kinds are restored (local E2E 2026-10-25: a
+/// sidecar-blob-only heal left `user_id` and five other supplement sections
+/// at ~2 excess files per lookup, prod replay one supplement at 254.9).
 fn chunk_excess_false_positives(reader: &infra::bloom::BloomReader, fpp: f64) -> f64 {
     reader
         .section_layouts()
         .iter()
-        .filter(|layout| layout.field == vortex_index::bloom::COMPOSITE_BLOOM_FIELD)
         .map(|layout| section_excess_false_positives(layout.n_items, layout.num_blocks, fpp))
         .fold(0.0, f64::max)
 }
@@ -1078,6 +1077,12 @@ async fn process_bucket_locked(
     // whole; the rest folds on the hour's next visit. A heal visit rebuilds
     // its saturated chunks instead, under the same member bound.
     let chunk_files = cfg.compact.bloom_chunk_files.max(1);
+    let reload_scope = MemberLoadScope {
+        bloom_fields: &bloom_fields,
+        composite_scope,
+        auto_id_scope,
+        bloom_only_never,
+    };
     let (consolidated, superseded, reloaded) = if mode == VisitMode::Heal {
         rebuild_saturated_chunks(
             org_id,
@@ -1088,6 +1093,7 @@ async fn process_bucket_locked(
             heal_versions,
             chunk_files,
             fpp,
+            reload_scope,
         )
         .await
     } else {
@@ -1101,6 +1107,7 @@ async fn process_bucket_locked(
             cfg.compact.bloom_max_chunks,
             chunk_files,
             fpp,
+            reload_scope,
         )
         .await
     };
@@ -1337,8 +1344,8 @@ fn expand_chunk_sections(chunk: &mut [BuildMember]) -> Vec<FieldBloom> {
 /// `max_members` members are collected: the resident set stays one chunk's
 /// worth however fragmented the hour is. Returns the members and the
 /// versions they left, plus how many members got sections restored from
-/// their own sidecar blobs (members the folding assembler had shrunk). A
-/// chunk that cannot be read stays as it is.
+/// their own sidecars (members the folding assembler had shrunk, reloaded
+/// with `reload_scope`). A chunk that cannot be read stays as it is.
 #[allow(clippy::too_many_arguments)]
 async fn consolidate_small_chunks(
     org_id: &str,
@@ -1350,6 +1357,7 @@ async fn consolidate_small_chunks(
     max_chunks: usize,
     max_members: usize,
     fpp: f64,
+    reload_scope: MemberLoadScope<'_>,
 ) -> (Vec<BuildMember>, Vec<i64>, usize) {
     let mut by_version: std::collections::BTreeMap<i64, Vec<&infra::file_list::FileRecord>> =
         std::collections::BTreeMap::new();
@@ -1372,8 +1380,8 @@ async fn consolidate_small_chunks(
     // consumed in version order, so the member bound below means exactly
     // what it did; at most a window's worth of versions is read in vain
     // past the bound. 8 wide (16 until .225): a version may now also
-    // re-read its folded members' sidecar blobs (`RELOAD_CONCURRENCY` wide,
-    // up to ~4 MiB each), which bounds the in-flight reads at 32.
+    // reload its folded members (`RELOAD_CONCURRENCY` wide), which bounds
+    // the in-flight member loads at 32.
     const CONSOLIDATE_CONCURRENCY: usize = 8;
     use futures::{FutureExt, StreamExt, stream};
     // futures built in a plain loop: a closure over `(version, Vec<&Row>)`
@@ -1394,6 +1402,7 @@ async fn consolidate_small_chunks(
                 small_limit,
                 fpp,
                 true,
+                reload_scope,
             )
             .map(move |members| (version, members)),
         );
@@ -1421,13 +1430,16 @@ async fn consolidate_small_chunks(
 }
 
 /// Heal visit: rebuild the hour's saturated chunks (`heal_versions`, found
-/// by [`heal_saturated_chunks`] from their footers) with their members' own
-/// sidecar blobs. Versions in ascending order, and no further chunk is
-/// opened once `max_members` members are collected; the rest stays for a
-/// later pass (its rows still carry the old version, so discovery lists it
-/// again). Folded members whose sections cannot be restored stay on the old
-/// chunk. A version that yields nothing (unreadable, or no member could be
-/// restored) is remembered so this process does not retry it every pass.
+/// by [`heal_saturated_chunks`] from their footers) with their folded
+/// members reloaded as a pending build would load them (`reload_scope`).
+/// Versions in ascending order, and no further chunk is opened once
+/// `max_members` members are collected; the rest stays for a later pass
+/// (its rows still carry the old version, so discovery lists it again).
+/// Folded members that cannot be reloaded stay on the old chunk. A footer
+/// lists every member the chunk was written with, also members that moved
+/// on since; a version whose LIVE members are no longer saturated, or that
+/// yields nothing (unreadable, or no member could be reloaded), is
+/// remembered so this process does not revisit it every pass.
 #[allow(clippy::too_many_arguments)]
 async fn rebuild_saturated_chunks(
     org_id: &str,
@@ -1438,6 +1450,7 @@ async fn rebuild_saturated_chunks(
     heal_versions: &[i64],
     max_members: usize,
     fpp: f64,
+    reload_scope: MemberLoadScope<'_>,
 ) -> (Vec<BuildMember>, Vec<i64>, usize) {
     let wanted: HashSet<i64> = heal_versions.iter().copied().collect();
     let mut by_version: std::collections::BTreeMap<i64, Vec<&infra::file_list::FileRecord>> =
@@ -1455,6 +1468,11 @@ async fn rebuild_saturated_chunks(
             break;
         }
         let live = rows.len();
+        let memo_key = heal_memo_key(
+            &format!("{org_id}/{stream_type}/{stream_name}"),
+            date,
+            version,
+        );
         match consolidate_version(
             org_id,
             stream_type,
@@ -1465,14 +1483,17 @@ async fn rebuild_saturated_chunks(
             usize::MAX,
             fpp,
             false,
+            reload_scope,
         )
         .await
         {
             Some(healed) if healed.reloaded > 0 => {
                 log::info!(
                     "[COMPACTOR:BLOOM] {org_id}/{stream_type}/{stream_name}/{date}: healing \
-                     saturated chunk {version}: {} of {live} live members restored from their \
-                     sidecar blobs, {} moved, {} left on the old chunk",
+                     saturated chunk {version} (~{:.1} excess false-positive files per lookup \
+                     over its live members): {} of {live} live members reloaded, {} moved, {} \
+                     left on the old chunk",
+                    healed.live_excess_files,
                     healed.reloaded,
                     healed.members.len(),
                     healed.left_behind
@@ -1481,17 +1502,22 @@ async fn rebuild_saturated_chunks(
                 members.extend(healed.members);
                 superseded.push(version);
             }
+            Some(healed) if healed.live_excess_files < HEAL_MIN_EXCESS_FILES => {
+                log::info!(
+                    "[COMPACTOR:BLOOM] {org_id}/{stream_type}/{stream_name}/{date}: chunk \
+                     {version} no longer saturated for its {live} live members (~{:.2} excess \
+                     false-positive files per lookup; its saturated members moved on); kept as is",
+                    healed.live_excess_files
+                );
+                remember_heal_checked(&memo_key);
+            }
             _ => {
                 log::warn!(
                     "[COMPACTOR:BLOOM] {org_id}/{stream_type}/{stream_name}/{date}: saturated \
                      chunk {version} not healed (unreadable, or none of its {live} live members \
-                     could be restored); kept as is"
+                     could be reloaded); kept as is"
                 );
-                remember_heal_checked(&heal_memo_key(
-                    &format!("{org_id}/{stream_type}/{stream_name}"),
-                    date,
-                    version,
-                ));
+                remember_heal_checked(&memo_key);
             }
         }
     }
@@ -1501,11 +1527,24 @@ async fn rebuild_saturated_chunks(
 /// The still-live members of one chunk read back for a rebuild.
 struct ConsolidatedVersion {
     members: Vec<BuildMember>,
-    /// Members with at least one section restored from their own sidecar blob.
+    /// Folded members reloaded from their own sidecars.
     reloaded: usize,
-    /// Folded members with nothing restored that stay on the old chunk (only
-    /// when the caller does not keep unhealed members).
+    /// Folded members that could not be reloaded and stay on the old chunk
+    /// (only when the caller does not keep unhealed members).
     left_behind: usize,
+    /// Worst field's excess false-positive files per lookup over the LIVE
+    /// members, before any reload (heal visits only; 0 otherwise).
+    live_excess_files: f64,
+}
+
+/// What a member reload needs to load a file exactly as a pending build of
+/// the hour would ([`load_file_blooms`]).
+#[derive(Clone, Copy)]
+struct MemberLoadScope<'a> {
+    bloom_fields: &'a [String],
+    composite_scope: &'a config::VixBloomCompositeScope,
+    auto_id_scope: bool,
+    bloom_only_never: &'a Arc<HashSet<String>>,
 }
 
 /// Read one superseded-candidate chunk back and hand its still-live members
@@ -1514,12 +1553,14 @@ struct ConsolidatedVersion {
 /// above the small-member limit.
 ///
 /// A member the folding assembler shrank (a section below
-/// `num_blocks_for(n_items, fpp)`) gets those sections back from its own
-/// sidecar blob ([`restore_folded_sections`]), so the rebuilt chunk carries
-/// its real filter. When nothing can be restored, the member keeps its
-/// folded sections (still correct, only less selective) if
-/// `keep_unhealed`, and otherwise stays on this chunk (left out of the
+/// `num_blocks_for(n_items, fpp)`) is reloaded from its own sidecar
+/// ([`reload_member_sections`]), so the rebuilt chunk carries its real
+/// filters, dictionary supplements included. When the reload fails, the
+/// member keeps its folded sections (still correct, only less selective)
+/// if `keep_unhealed`, and otherwise stays on this chunk (left out of the
 /// result; the old version then remains referenced and is not retired).
+/// A heal visit (`!keep_unhealed`) whose live members are no longer
+/// saturated returns no members and reloads nothing.
 #[allow(clippy::too_many_arguments)]
 async fn consolidate_version(
     org_id: &str,
@@ -1531,6 +1572,7 @@ async fn consolidate_version(
     small_limit: usize,
     fpp: f64,
     keep_unhealed: bool,
+    reload_scope: MemberLoadScope<'_>,
 ) -> Option<ConsolidatedVersion> {
     let path = infra::bloom::path::bloom_path(org_id, stream_type, stream_name, date, version);
     let account = infra::storage::get_account(org_id, &path).unwrap_or_default();
@@ -1583,10 +1625,30 @@ async fn consolidate_version(
         }
     }
 
-    // Restore the members the folding assembler shrank from their own
-    // sidecar blobs. Futures are built in a plain loop (see
-    // `consolidate_small_chunks` on closures over borrowed rows and the
-    // spawned job's `Send` bound).
+    // A footer still lists members that moved on: judge a heal by the live
+    // members' own sections before reloading anything.
+    let live_excess_files = if keep_unhealed {
+        0.0
+    } else {
+        let mut per_field: HashMap<&str, f64> = HashMap::new();
+        for section in sections_of.values().flatten() {
+            *per_field.entry(section.field.as_str()).or_default() +=
+                section_excess_false_positives(&[section.n_items], section.num_blocks, fpp);
+        }
+        per_field.into_values().fold(0.0, f64::max)
+    };
+    if !keep_unhealed && live_excess_files < HEAL_MIN_EXCESS_FILES {
+        return Some(ConsolidatedVersion {
+            members: Vec::new(),
+            reloaded: 0,
+            left_behind: 0,
+            live_excess_files,
+        });
+    }
+
+    // Reload the members the folding assembler shrank. Futures are built in
+    // a plain loop (see `consolidate_small_chunks` on closures over borrowed
+    // rows and the spawned job's `Send` bound).
     const RELOAD_CONCURRENCY: usize = 4;
     use futures::{StreamExt, stream};
     let mut reloads = Vec::new();
@@ -1604,26 +1666,40 @@ async fn consolidate_version(
         };
         let file_id = *file_id;
         let file = FileKey::from(*row);
-        reloads.push(async move { (file_id, restore_folded_sections(&file, old_sections).await) });
+        reloads.push(async move {
+            (
+                file_id,
+                reload_member_sections(&file, old_sections, fpp, reload_scope).await,
+            )
+        });
     }
     let mut unhealed: HashSet<u64> = HashSet::new();
     let mut reloaded = 0usize;
-    let outcomes: Vec<(u64, RestoredSections)> = stream::iter(reloads)
+    let mut first_error: Option<anyhow::Error> = None;
+    let outcomes: Vec<(u64, ReloadedSections)> = stream::iter(reloads)
         .buffer_unordered(RELOAD_CONCURRENCY)
         .collect()
         .await;
     for (file_id, outcome) in outcomes {
-        if outcome.restored > 0 {
-            reloaded += 1;
-        } else {
-            if let Some(e) = &outcome.error {
-                log::debug!(
-                    "[COMPACTOR:BLOOM] {path}: folded member {file_id} not restored: {e:#}"
-                );
+        match outcome.error {
+            None => reloaded += 1,
+            Some(e) => {
+                first_error.get_or_insert(e);
+                unhealed.insert(file_id);
             }
-            unhealed.insert(file_id);
         }
         sections_of.insert(file_id, outcome.sections);
+    }
+    if let Some(e) = first_error {
+        log::warn!(
+            "[COMPACTOR:BLOOM] {path}: {} folded members not reloaded ({}); first: {e:#}",
+            unhealed.len(),
+            if keep_unhealed {
+                "they keep their folded sections"
+            } else {
+                "they stay on this chunk"
+            }
+        );
     }
 
     let mut left_behind = 0usize;
@@ -1659,83 +1735,64 @@ async fn consolidate_version(
         members,
         reloaded,
         left_behind,
+        live_excess_files,
     })
 }
 
-/// Outcome of [`restore_folded_sections`]: the member's sections (restored
-/// where possible, the old ones otherwise) and how many were restored.
-struct RestoredSections {
+/// Outcome of [`reload_member_sections`]: the reloaded sections, or the old
+/// ones with the reason the reload failed.
+struct ReloadedSections {
     sections: Vec<vortex_index::bloom::FileBloom>,
-    restored: usize,
     error: Option<anyhow::Error>,
 }
 
-/// Re-read one stamped member's own sidecar `bloom` blob (tail GET + blob
-/// GET; pre-2026-10-16 sidecars also walk the blob's section headers) and
-/// put back the sections a folding assembler shrank. Only sections the old
-/// chunk holds for this member are replaced, and only by a blob section of
-/// the same field and `n_items` with more blocks: the old chunk's composite
-/// and writer-flagged sections were built from this very blob, so the field
-/// set, and every safety decision of the original build, stays exactly the
-/// chunk's. Sections built from a dictionary supplement have no blob
-/// counterpart and keep their old bits — no dictionary is streamed here, so
-/// a heal never spends the pending builds' fallback budget.
-async fn restore_folded_sections(
+/// Reload one stamped member's sections exactly as a pending build of the
+/// hour loads them ([`load_file_blooms`]: the sidecar blob when every
+/// section is writer-flagged, else the ranged reader with its dictionary
+/// supplements, else one budgeted dictionary stream), replacing every
+/// section the old chunk holds for it. A blob-only restore cannot rebuild
+/// supplement sections (no blob holds them), so a heal would leave
+/// `user_id`, `session_id`, ... folded (local E2E 2026-10-25). The member's
+/// files are immutable, so the load reproduces what its first build saw,
+/// under the current scope. Deferral (the dictionary budget, shared with
+/// and spent after this pass's pending builds) and failure keep the old
+/// sections and report why.
+async fn reload_member_sections(
     file: &FileKey,
     old: Vec<vortex_index::bloom::FileBloom>,
-) -> RestoredSections {
-    let handle = tokio::runtime::Handle::current();
-    let Some(source) = sidecar_source(file, handle) else {
-        return RestoredSections {
-            sections: old,
-            restored: 0,
-            error: Some(anyhow::anyhow!("{}: no sidecar", file.key)),
-        };
-    };
-    let blob = tokio::task::spawn_blocking(move || {
-        let probe = vortex_index::FileBloomProbe::open_sidecar(source)?;
-        Ok::<_, anyhow::Error>(probe.read_file_blooms()?)
-    })
-    .await
-    .map_err(anyhow::Error::from)
-    .and_then(|loaded| loaded);
-    let mut own: HashMap<String, vortex_index::bloom::FileBloom> = match blob {
-        Ok(Some(blooms)) => blooms.into_iter().map(|b| (b.field.clone(), b)).collect(),
-        Ok(None) => {
-            return RestoredSections {
-                sections: old,
-                restored: 0,
-                error: Some(anyhow::anyhow!("{}: sidecar has no bloom blob", file.key)),
-            };
-        }
-        Err(e) => {
-            return RestoredSections {
-                sections: old,
-                restored: 0,
-                error: Some(e.context(format!("{}: sidecar bloom read", file.key))),
-            };
-        }
-    };
-    let mut restored = 0usize;
-    let sections = old
-        .into_iter()
-        .map(|section| match own.remove(&section.field) {
-            Some(fresh)
-                if fresh.n_items == section.n_items
-                    && fresh.num_blocks > section.num_blocks
-                    && fresh.bytes.len()
-                        == fresh.num_blocks as usize * infra::bloom::BLOCK_BYTES =>
-            {
-                restored += 1;
-                fresh
-            }
-            _ => section,
-        })
-        .collect();
-    RestoredSections {
+    fpp: f64,
+    scope: MemberLoadScope<'_>,
+) -> ReloadedSections {
+    let failed = |sections, e: anyhow::Error| ReloadedSections {
         sections,
-        restored,
-        error: None,
+        error: Some(e),
+    };
+    match load_file_blooms(
+        file,
+        scope.bloom_fields,
+        fpp,
+        scope.composite_scope,
+        scope.auto_id_scope,
+        Arc::clone(scope.bloom_only_never),
+    )
+    .await
+    {
+        Ok(Some(loaded)) if !loaded.blooms.is_empty() => ReloadedSections {
+            sections: loaded.blooms,
+            error: None,
+        },
+        Ok(Some(_)) => failed(
+            old,
+            anyhow::anyhow!("{}: reload yielded no sections", file.key),
+        ),
+        Ok(None) => failed(
+            old,
+            anyhow::anyhow!(
+                "{}: reload deferred (this pass's dictionary budget is spent)",
+                file.key
+            ),
+        ),
+        Err(e) => failed(old, e.context(format!("{}: member reload", file.key))),
     }
 }
 
@@ -2995,7 +3052,7 @@ mod tests {
     /// could not restore it from the blobs), a folded composite scores about
     /// one false-positive file per member.
     #[test]
-    fn heal_chunk_excess_counts_the_composite_section_only() {
+    fn heal_chunk_excess_takes_the_worst_section() {
         use infra::bloom::{BLOCK_BYTES, BloomReader, BloomWriter, FieldBloom};
         let fpp = 0.001;
         let n = 100_000u32;
@@ -3022,11 +3079,22 @@ mod tests {
             }
             BloomWriter::serialize_v2(&group, sections).unwrap()
         };
+        let healthy = chunk(own, own);
+        let reader = BloomReader::parse(&healthy).unwrap();
+        assert_eq!(chunk_excess_false_positives(&reader, fpp), 0.0);
+        // a folded per-field (dictionary supplement) section counts too: a
+        // heal reloads supplements through the pending-build loader
         let only_dictionary_folded = chunk(own, 16);
         let reader = BloomReader::parse(&only_dictionary_folded).unwrap();
-        assert_eq!(chunk_excess_false_positives(&reader, fpp), 0.0);
+        let excess = chunk_excess_false_positives(&reader, fpp);
+        assert!(excess > 3.9 && excess <= 4.0, "got {excess}");
         let composite_folded = chunk(16, own);
         let reader = BloomReader::parse(&composite_folded).unwrap();
+        let excess = chunk_excess_false_positives(&reader, fpp);
+        assert!(excess > 3.9 && excess <= 4.0, "got {excess}");
+        // the worst field, not the sum over fields
+        let both_folded = chunk(16, 16);
+        let reader = BloomReader::parse(&both_folded).unwrap();
         let excess = chunk_excess_false_positives(&reader, fpp);
         assert!(excess > 3.9 && excess <= 4.0, "got {excess}");
     }
