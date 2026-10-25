@@ -58,6 +58,24 @@ HAVING count(*) > $2 AND sum(CASE WHEN members <= $3 THEN 1 ELSE 0 END) > 0
 ORDER BY date DESC LIMIT $4;
 "#;
 
+/// Settled buckets whose oldest pending file predates `$2`, oldest first
+/// (see [`super::FileList::query_bloom_aged_pending_buckets`]).
+const BLOOM_AGED_PENDING_BUCKETS_SQL: &str = r#"
+SELECT stream, date FROM file_list
+WHERE index_size > 0 AND bloom_ver = 0 AND date < $1 AND updated_at > 0
+GROUP BY stream, date HAVING MIN(updated_at) < $2
+ORDER BY MIN(updated_at) LIMIT $3;
+"#;
+
+/// Stamped chunks of settled hours below a version cutoff, newest hour first
+/// (see [`super::FileList::query_bloom_heal_candidates`]).
+const BLOOM_HEAL_CANDIDATES_SQL: &str = r#"
+SELECT stream, date, bloom_ver FROM file_list
+WHERE index_size > 0 AND bloom_ver > 0 AND bloom_ver < $2 AND date < $1
+GROUP BY stream, date, bloom_ver
+ORDER BY date DESC, bloom_ver LIMIT $3;
+"#;
+
 pub struct SqliteFileList {}
 
 impl SqliteFileList {
@@ -899,6 +917,22 @@ SELECT stream, date FROM file_list WHERE index_size > 0 AND bloom_ver = 0 AND da
         Ok(ret)
     }
 
+    async fn query_bloom_aged_pending_buckets(
+        &self,
+        before_date: &str,
+        aged_before: i64,
+        limit: i64,
+    ) -> Result<Vec<(String, String)>> {
+        let pool = CLIENT_RO.clone();
+        let ret: Vec<(String, String)> =
+            sqlx::query_as::<_, (String, String)>(BLOOM_AGED_PENDING_BUCKETS_SQL)
+                .bind(before_date)
+                .bind(aged_before)
+                .bind(limit)
+                .fetch_all(&pool)
+                .await?;
+        Ok(ret)
+    }
     async fn query_bloom_fragmented_buckets(
         &self,
         before_date: &str,
@@ -912,6 +946,22 @@ SELECT stream, date FROM file_list WHERE index_size > 0 AND bloom_ver = 0 AND da
                 .bind(before_date)
                 .bind(max_versions)
                 .bind(small_members)
+                .bind(limit)
+                .fetch_all(&pool)
+                .await?;
+        Ok(ret)
+    }
+    async fn query_bloom_heal_candidates(
+        &self,
+        before_date: &str,
+        before_ver: i64,
+        limit: i64,
+    ) -> Result<Vec<(String, String, i64)>> {
+        let pool = CLIENT_RO.clone();
+        let ret: Vec<(String, String, i64)> =
+            sqlx::query_as::<_, (String, String, i64)>(BLOOM_HEAL_CANDIDATES_SQL)
+                .bind(before_date)
+                .bind(before_ver)
                 .bind(limit)
                 .fetch_all(&pool)
                 .await?;
@@ -3531,6 +3581,139 @@ mod tests {
             .unwrap();
         assert_eq!(limited.len(), 1, "the limit bounds the candidate window");
         assert_eq!(limited[0].1, "2026/08/01/03", "newest first");
+    }
+
+    /// The aged lane returns only settled hours whose OLDEST pending file is
+    /// older than the cutoff, oldest first, whatever their date: a stamped
+    /// hour with one stale merge output is found even when hundreds of newer
+    /// hours are pending. Fresh pending, stamped, unindexed and clock-less
+    /// rows never make an hour aged.
+    #[tokio::test]
+    async fn test_bloom_aged_pending_buckets_select_stale_hours_oldest_first() {
+        let pool = fresh_in_memory_pool().await;
+        create_legacy_file_list_table(&pool).await;
+        crate::db::sqlite::add_column(&pool, "file_list", "bloom_ver", "BIGINT default 0 not null")
+            .await
+            .unwrap();
+        // (date, file, bloom_ver, index_size, updated_at)
+        let rows: Vec<(&str, &str, i64, i64, i64)> = vec![
+            ("2026/08/01/00", "a", 0, 6, 500), // aged, oldest pending 500
+            ("2026/08/01/00", "b", 7, 6, 10),  // stamped: its clock never counts
+            ("2026/08/01/01", "c", 0, 6, 200), // aged, oldest pending 200
+            ("2026/08/01/01", "d", 0, 6, 5_000),
+            ("2026/08/01/02", "e", 0, 6, 5_000), // pending but fresh
+            ("2026/08/01/03", "f", 0, 0, 100),   // no index: not bloom work
+            ("2026/08/01/03", "g", 0, 6, 0),     // no clock: never aged
+            ("2026/08/01/05", "h", 0, 6, 50),    // not settled
+        ];
+        for (date, file, bloom_ver, index_size, updated_at) in rows {
+            sqlx::query(
+                r#"INSERT INTO file_list
+                    (account, org, stream, date, file, deleted, flattened,
+                     min_ts, max_ts, records, original_size, compressed_size,
+                     index_size, bloom_ver, updated_at)
+                   VALUES ('a', 'o', 'o/traces/default', ?, ?, false, false,
+                           1, 2, 3, 4, 5, ?, ?, ?);"#,
+            )
+            .bind(date)
+            .bind(format!("{file}.vix"))
+            .bind(index_size)
+            .bind(bloom_ver)
+            .bind(updated_at)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let aged: Vec<(String, String)> = sqlx::query_as(BLOOM_AGED_PENDING_BUCKETS_SQL)
+            .bind("2026/08/01/04")
+            .bind(1_000i64)
+            .bind(10i64)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        let stream = "o/traces/default".to_string();
+        assert_eq!(
+            aged,
+            vec![
+                (stream.clone(), "2026/08/01/01".to_string()),
+                (stream.clone(), "2026/08/01/00".to_string()),
+            ]
+        );
+        let limited: Vec<(String, String)> = sqlx::query_as(BLOOM_AGED_PENDING_BUCKETS_SQL)
+            .bind("2026/08/01/04")
+            .bind(1_000i64)
+            .bind(1i64)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(limited, vec![(stream, "2026/08/01/01".to_string())]);
+    }
+
+    /// The heal lane lists each stamped chunk below the version cutoff once
+    /// per settled hour, newest hour first; pending/sentinel rows, rows
+    /// without an index, versions at or past the cutoff and unsettled hours
+    /// are left out.
+    #[tokio::test]
+    async fn test_bloom_heal_candidates_list_old_chunks_of_settled_hours() {
+        let pool = fresh_in_memory_pool().await;
+        create_legacy_file_list_table(&pool).await;
+        crate::db::sqlite::add_column(&pool, "file_list", "bloom_ver", "BIGINT default 0 not null")
+            .await
+            .unwrap();
+        // (date, version, members, index_size)
+        let rows: Vec<(&str, i64, usize, i64)> = vec![
+            ("2026/08/01/00", 100, 3, 6),
+            ("2026/08/01/00", 101, 1, 6),
+            ("2026/08/01/01", 200, 2, 6),
+            ("2026/08/01/01", 900, 2, 6), // at/after the cutoff: built by the new rule
+            ("2026/08/01/02", 300, 1, 0), // no index: never a member of a chunk
+            ("2026/08/01/02", 0, 2, 6),   // pending
+            ("2026/08/01/02", -1, 1, 6),  // sentinel
+            ("2026/08/01/05", 500, 2, 6), // not settled
+        ];
+        for (date, version, members, index_size) in rows {
+            for m in 0..members {
+                sqlx::query(
+                    r#"INSERT INTO file_list
+                        (account, org, stream, date, file, deleted, flattened,
+                         min_ts, max_ts, records, original_size, compressed_size,
+                         index_size, bloom_ver, updated_at)
+                       VALUES ('a', 'o', 'o/traces/default', ?, ?, false, false,
+                               1, 2, 3, 4, 5, ?, ?, 7);"#,
+                )
+                .bind(date)
+                .bind(format!("{version}_{m}.parquet"))
+                .bind(index_size)
+                .bind(version)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        }
+        let candidates: Vec<(String, String, i64)> = sqlx::query_as(BLOOM_HEAL_CANDIDATES_SQL)
+            .bind("2026/08/01/04")
+            .bind(900i64)
+            .bind(10i64)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        let stream = "o/traces/default".to_string();
+        assert_eq!(
+            candidates,
+            vec![
+                (stream.clone(), "2026/08/01/01".to_string(), 200),
+                (stream.clone(), "2026/08/01/00".to_string(), 100),
+                (stream.clone(), "2026/08/01/00".to_string(), 101),
+            ]
+        );
+        let limited: Vec<(String, String, i64)> = sqlx::query_as(BLOOM_HEAL_CANDIDATES_SQL)
+            .bind("2026/08/01/04")
+            .bind(900i64)
+            .bind(1i64)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(limited, vec![(stream, "2026/08/01/01".to_string(), 200)]);
     }
 
     // ── delete_by_org row move ───────────────────────────────────────────────

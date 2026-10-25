@@ -1028,6 +1028,35 @@ SELECT stream, date FROM file_list WHERE index_size > 0 AND bloom_ver = 0 AND da
         Ok(ret)
     }
 
+    async fn query_bloom_aged_pending_buckets(
+        &self,
+        before_date: &str,
+        aged_before: i64,
+        limit: i64,
+    ) -> Result<Vec<(String, String)>> {
+        let start = std::time::Instant::now();
+        let pool = CLIENT_RO.clone();
+        DB_QUERY_NUMS
+            .with_label_values(&["query_bloom_aged_pending_buckets", "file_list"])
+            .inc();
+        let sql = r#"
+SELECT stream, date FROM file_list
+WHERE index_size > 0 AND bloom_ver = 0 AND date < $1 AND updated_at > 0
+GROUP BY stream, date HAVING MIN(updated_at) < $2
+ORDER BY MIN(updated_at) LIMIT $3;
+                "#;
+        let ret: Vec<(String, String)> = sqlx::query_as::<_, (String, String)>(sql)
+            .bind(before_date)
+            .bind(aged_before)
+            .bind(limit)
+            .fetch_all(&pool)
+            .await?;
+        DB_QUERY_TIME
+            .with_label_values(&["query_bloom_aged_pending_buckets", "file_list"])
+            .observe(start.elapsed().as_secs_f64());
+        Ok(ret)
+    }
+
     async fn query_bloom_fragmented_buckets(
         &self,
         before_date: &str,
@@ -1061,6 +1090,35 @@ ORDER BY date DESC LIMIT $4;
             .await?;
         DB_QUERY_TIME
             .with_label_values(&["query_bloom_fragmented_buckets", "file_list"])
+            .observe(start.elapsed().as_secs_f64());
+        Ok(ret)
+    }
+
+    async fn query_bloom_heal_candidates(
+        &self,
+        before_date: &str,
+        before_ver: i64,
+        limit: i64,
+    ) -> Result<Vec<(String, String, i64)>> {
+        let start = std::time::Instant::now();
+        let pool = CLIENT_RO.clone();
+        DB_QUERY_NUMS
+            .with_label_values(&["query_bloom_heal_candidates", "file_list"])
+            .inc();
+        let sql = r#"
+SELECT stream, date, bloom_ver FROM file_list
+WHERE index_size > 0 AND bloom_ver > 0 AND bloom_ver < $2 AND date < $1
+GROUP BY stream, date, bloom_ver
+ORDER BY date DESC, bloom_ver LIMIT $3;
+                "#;
+        let ret: Vec<(String, String, i64)> = sqlx::query_as::<_, (String, String, i64)>(sql)
+            .bind(before_date)
+            .bind(before_ver)
+            .bind(limit)
+            .fetch_all(&pool)
+            .await?;
+        DB_QUERY_TIME
+            .with_label_values(&["query_bloom_heal_candidates", "file_list"])
             .observe(start.elapsed().as_secs_f64());
         Ok(ret)
     }

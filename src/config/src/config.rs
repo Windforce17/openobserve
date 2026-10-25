@@ -3046,8 +3046,9 @@ pub struct Compact {
         name = "ZO_COMPACT_BLOOM_CHUNK_FILES",
         default = 256,
         help = "Max member files per `.bf` chunk (DESIGN-COLD-MISS §4 B4). Within a chunk \
-                every field section is folded to the chunk's smallest block count so one \
-                block-row answers every member."
+                every field section is expanded (exact block repetition) to the chunk's \
+                largest block count so one block-row answers every member and each member \
+                keeps its own false-positive rate."
     )]
     pub bloom_chunk_files: usize,
     #[env_config(
@@ -3089,6 +3090,32 @@ pub struct Compact {
                 than this many seconds are queued for deferred deletion."
     )]
     pub bloom_gc_min_age_secs: i64,
+    #[env_config(
+        name = "ZO_COMPACT_BLOOM_HEAL_BEFORE_VER",
+        default = 0,
+        help = "Heal lane for chunks the pre-expansion assembler folded down to their \
+                smallest member's block count: stamped `.bf` versions (bloom_ver, \
+                microseconds) below this value are footer-checked, and a chunk whose \
+                composite (Bloom-only fields) section expects at least one more \
+                false-positive file per lookup than its members' own sizing is rebuilt \
+                from the members' own sidecar blobs and CAS-restamped. Set it to the rollout time of the expanding assembler; 0 \
+                disables the lane."
+    )]
+    pub bloom_heal_before_ver: i64,
+    #[env_config(
+        name = "ZO_COMPACT_BLOOM_HEAL_HOURS",
+        default = 2,
+        help = "Heal lane: max hours one builder pass rebuilds (each visit rebuilds at most \
+                ZO_COMPACT_BLOOM_CHUNK_FILES members; 0 disables the lane)."
+    )]
+    pub bloom_heal_hours: usize,
+    #[env_config(
+        name = "ZO_COMPACT_BLOOM_HEAL_CHECKS",
+        default = 256,
+        help = "Heal lane: max `.bf` footers one builder pass reads to find saturated chunks \
+                (one or two suffix GETs each; healthy chunks are remembered per process)."
+    )]
+    pub bloom_heal_checks: usize,
     #[env_config(
         name = "ZO_COMPACT_SIDECAR_REPACK_BUDGET",
         default = 0,

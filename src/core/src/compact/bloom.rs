@@ -35,11 +35,15 @@
 //!   forever and burning the fallback budget every pass.
 //!
 //! Group invariants (see `infra::bloom`): every field section shares one
-//! `num_blocks B` across its files, so files are chunked by their per-field
-//! B signature (writer sizing is power-of-two, so real hours produce a
-//! couple of chunks at most); each chunk becomes its own `.bf` named
-//! `bloom_ver = base_ts + chunk_idx`, and `update_bloom_ver` stamps the
-//! chunk's file_list rows LAST — a crash before the stamp just re-queues.
+//! `num_blocks B` across its files. A chunk's members are brought to the
+//! chunk's LARGEST B per field by exact block repetition
+//! (`infra::bloom::expand_bytes`), so every member keeps its own
+//! false-positive rate (sizing is power-of-two, so the ratios are exact);
+//! each chunk becomes its own `.bf` named `bloom_ver = base_ts + chunk_idx`,
+//! and `update_bloom_ver` stamps the chunk's file_list rows LAST — a crash
+//! before the stamp just re-queues. Chunks written before that rule folded
+//! every member down to the SMALLEST B and are rebuilt from the members' own
+//! sidecars by the heal lane ([`heal_saturated_chunks`]).
 
 use std::sync::Arc;
 
@@ -99,11 +103,33 @@ pub async fn run() -> Result<(), anyhow::Error> {
     // files' own sidecars (`bloom_pruner::file_probe`) until they settle.
     let settled_before =
         settled_hour_cutoff(config::utils::time::now(), cfg.compact.live_lookback_hours);
-    let mut buckets = infra::file_list::query_bloom_pending_buckets(
+    let batch = cfg.compact.bloom_build_batch.max(1);
+    // Aged lane first (a quarter of the batch): hours whose oldest pending
+    // file is past the regroup age trigger. The newest-first scan alone
+    // fills its limit every pass in prod, so such an hour was never visited
+    // and its age trigger never fired (late merge outputs at bloom_ver = 0
+    // for days, 2026-10-25). A failed aged scan only costs this pass's
+    // aged lane.
+    let aged_before = now_micros()
+        - chrono::Duration::hours(cfg.compact.bloom_regroup_max_age_hours.max(0))
+            .num_microseconds()
+            .unwrap_or(i64::MAX);
+    let aged = match infra::file_list::query_bloom_aged_pending_buckets(
         &settled_before,
-        cfg.compact.bloom_build_batch,
+        aged_before,
+        (batch / 4).max(1),
     )
-    .await?;
+    .await
+    {
+        Ok(aged) => aged,
+        Err(e) => {
+            log::warn!("[COMPACTOR:BLOOM] aged pending discovery failed: {e:#}");
+            Vec::new()
+        }
+    };
+    let aged_buckets = aged.len();
+    let newest = infra::file_list::query_bloom_pending_buckets(&settled_before, batch).await?;
+    let mut buckets = merge_discovery_lanes(aged, newest, batch as usize);
     // Every compactor runs this pass on the same cadence over the same
     // date-DESC list; walking it in a node-local order keeps them from
     // queueing on the same bucket lock and lets one pass cover the batch.
@@ -149,6 +175,7 @@ pub async fn run() -> Result<(), anyhow::Error> {
             auto_id_scope,
             &bloom_only_never,
             VisitMode::Pending,
+            &[],
         )
         .await
         {
@@ -164,12 +191,21 @@ pub async fn run() -> Result<(), anyhow::Error> {
     }
     if total > 0 {
         log::info!(
-            "[COMPACTOR:BLOOM] pass: {done}/{total} buckets processed ({busy} busy elsewhere, \
-             {failed} failed) in {:?}, settled before {settled_before}",
+            "[COMPACTOR:BLOOM] pass: {done}/{total} buckets processed ({aged_buckets} from \
+             the aged lane; {busy} busy elsewhere, {failed} failed) in {:?}, settled before \
+             {settled_before}",
             started.elapsed()
         );
     }
     sweep_fragmented_hours(
+        &cfg,
+        &settled_before,
+        &composite_scope,
+        auto_id_scope,
+        &bloom_only_never,
+    )
+    .await;
+    heal_saturated_chunks(
         &cfg,
         &settled_before,
         &composite_scope,
@@ -244,6 +280,7 @@ async fn sweep_fragmented_hours(
             auto_id_scope,
             bloom_only_never,
             VisitMode::Sweep,
+            &[],
         )
         .await
         {
@@ -262,18 +299,359 @@ async fn sweep_fragmented_hours(
     );
 }
 
+/// Max candidate chunks one heal discovery returns (newest hour first).
+const HEAL_DISCOVERY_LIMIT: i64 = 200_000;
+/// First footer probe of a heal check; a larger footer is re-read exactly.
+const HEAL_FOOTER_PROBE_BYTES: u64 = 256 * 1024;
+/// Footer checks in flight per hour.
+const HEAL_CHECK_CONCURRENCY: usize = 8;
+/// A chunk is healed when, for some field, folding costs at least this many
+/// extra false-positive files per lookup over its members' own sizing. A
+/// one-file chunk never qualifies (it was never folded); a 256-member chunk
+/// at fpp 0.001 expects ~0.4 false-positive files when healthy and ~250
+/// when saturated (prod `default/traces`, 2026-10-25).
+const HEAL_MIN_EXCESS_FILES: f64 = 1.0;
+/// Chunks above this size are not healed: the rebuild reads the whole old
+/// object. Saturated chunks are small (their sections were folded down).
+const HEAL_MAX_OBJECT_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Heal lane: rebuild chunks the folding assembler (before .225) wrote with
+/// saturated sections. Candidates are the stamped versions below
+/// `ZO_COMPACT_BLOOM_HEAL_BEFORE_VER`; each pass reads up to
+/// `ZO_COMPACT_BLOOM_HEAL_CHECKS` of their footers (outside any lock: the
+/// footer carries every member's `n_items` and the section block count, so
+/// the expected false-positive count follows without reading bodies) and
+/// rebuilds up to `ZO_COMPACT_BLOOM_HEAL_HOURS` hours that hold a saturated
+/// chunk, under the bucket lock, from the members' own sidecars. Rebuilt
+/// rows move by CAS restamp from the old version to the new one, so a
+/// query always sees either the old chunk or the new one, never "no
+/// bloom". Healthy chunks are remembered per process; a rebuilt chunk gets
+/// a version past the cutoff and leaves the candidate list by itself.
+async fn heal_saturated_chunks(
+    cfg: &config::Config,
+    settled_before: &str,
+    composite_scope: &config::VixBloomCompositeScope,
+    auto_id_scope: bool,
+    bloom_only_never: &Arc<HashSet<String>>,
+) {
+    let cutoff = cfg.compact.bloom_heal_before_ver;
+    let quota = cfg.compact.bloom_heal_hours;
+    let check_budget = cfg.compact.bloom_heal_checks;
+    if cutoff <= 0 || quota == 0 || check_budget == 0 {
+        return;
+    }
+    let started = std::time::Instant::now();
+    let rows = match infra::file_list::query_bloom_heal_candidates(
+        settled_before,
+        cutoff,
+        HEAL_DISCOVERY_LIMIT,
+    )
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            log::warn!("[COMPACTOR:BLOOM] heal: candidate discovery failed: {e:#}");
+            return;
+        }
+    };
+    // unchecked versions per hour, in discovery order (newest hour first)
+    let mut hours: Vec<(String, String, Vec<i64>)> = Vec::new();
+    let mut hour_index: HashMap<(String, String), usize> = HashMap::new();
+    let mut unchecked = 0usize;
+    for (stream_key, date, version) in rows {
+        if heal_checked(&heal_memo_key(&stream_key, &date, version)) {
+            continue;
+        }
+        unchecked += 1;
+        let idx = *hour_index
+            .entry((stream_key.clone(), date.clone()))
+            .or_insert_with(|| {
+                hours.push((stream_key, date, Vec::new()));
+                hours.len() - 1
+            });
+        hours[idx].2.push(version);
+    }
+    if hours.is_empty() {
+        return;
+    }
+    // the fleet walks the same list: a node-local order spreads the footer
+    // reads and the bucket locks
+    {
+        use rand::{SeedableRng, rngs::StdRng, seq::SliceRandom};
+        hours.shuffle(&mut StdRng::seed_from_u64(rand::random()));
+    }
+    use futures::{StreamExt, stream};
+    let fpp = cfg.common.vix_bloom_fpp;
+    let (mut checked, mut healthy, mut saturated_chunks, mut skipped) = (0usize, 0, 0, 0);
+    let (mut visited, mut busy, mut failed) = (0usize, 0usize, 0usize);
+    let mut excess_total = 0.0f64;
+    for (stream_key, date, versions) in hours {
+        if visited >= quota || checked >= check_budget {
+            break;
+        }
+        let Some((org_id, stream_type_name, stream_name)) = parse_stream_key(&stream_key) else {
+            continue;
+        };
+        let stream_type: config::meta::stream::StreamType = stream_type_name.as_str().into();
+        let take = versions.len().min(check_budget - checked);
+        checked += take;
+        let mut checks = Vec::with_capacity(take);
+        for version in versions.into_iter().take(take) {
+            checks.push(check_chunk_saturation(
+                &org_id,
+                stream_type,
+                &stream_name,
+                &date,
+                version,
+                fpp,
+            ));
+        }
+        let verdicts: Vec<(i64, Result<ChunkHealth, anyhow::Error>)> = stream::iter(checks)
+            .buffer_unordered(HEAL_CHECK_CONCURRENCY)
+            .collect()
+            .await;
+        let mut saturated = Vec::new();
+        for (version, verdict) in verdicts {
+            let key = heal_memo_key(&stream_key, &date, version);
+            match verdict {
+                Ok(ChunkHealth::Healthy) => {
+                    healthy += 1;
+                    remember_heal_checked(&key);
+                }
+                Ok(ChunkHealth::Saturated { excess_files }) => {
+                    excess_total += excess_files;
+                    saturated.push(version);
+                }
+                Ok(ChunkHealth::TooLarge {
+                    bytes,
+                    excess_files,
+                }) => {
+                    skipped += 1;
+                    remember_heal_checked(&key);
+                    log::warn!(
+                        "[COMPACTOR:BLOOM] heal: {key}: saturated (~{excess_files:.1} excess \
+                         false-positive files per lookup) but {bytes} bytes, above the \
+                         {HEAL_MAX_OBJECT_BYTES}-byte heal limit; kept as is"
+                    );
+                }
+                Err(e) => {
+                    skipped += 1;
+                    remember_heal_checked(&key);
+                    log::warn!(
+                        "[COMPACTOR:BLOOM] heal: {key}: footer check failed, skipped: {e:#}"
+                    );
+                }
+            }
+        }
+        if saturated.is_empty() {
+            continue;
+        }
+        saturated_chunks += saturated.len();
+        saturated.sort_unstable();
+        visited += 1;
+        match process_bucket(
+            &org_id,
+            &stream_type_name,
+            &stream_name,
+            &date,
+            fpp,
+            composite_scope,
+            auto_id_scope,
+            bloom_only_never,
+            VisitMode::Heal,
+            &saturated,
+        )
+        .await
+        {
+            Ok(true) => {}
+            Ok(false) => busy += 1,
+            Err(e) => {
+                failed += 1;
+                log::error!("[COMPACTOR:BLOOM] {stream_key}/{date}: heal visit failed: {e:#}");
+            }
+        }
+    }
+    log::info!(
+        "[COMPACTOR:BLOOM] heal: {checked} footers checked of {unchecked} unchecked chunks below \
+         version {cutoff} ({healthy} healthy, {saturated_chunks} saturated with ~{excess_total:.0} \
+         excess false-positive files per lookup, {skipped} skipped); {visited} hours visited \
+         ({busy} busy elsewhere, {failed} failed; quota {quota}) in {:?}",
+        started.elapsed()
+    );
+}
+
+/// Footer verdict of one heal candidate.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ChunkHealth {
+    Healthy,
+    Saturated { excess_files: f64 },
+    TooLarge { bytes: u64, excess_files: f64 },
+}
+
+/// Read one chunk's footer (one or two suffix GETs) and classify it.
+async fn check_chunk_saturation(
+    org_id: &str,
+    stream_type: config::meta::stream::StreamType,
+    stream_name: &str,
+    date: &str,
+    version: i64,
+    fpp: f64,
+) -> (i64, Result<ChunkHealth, anyhow::Error>) {
+    let path = infra::bloom::path::bloom_path(org_id, stream_type, stream_name, date, version);
+    let account = infra::storage::get_account(org_id, &path).unwrap_or_default();
+    let verdict = async {
+        let (total, suffix) = fetch_bloom_suffix(&account, &path, HEAL_FOOTER_PROBE_BYTES).await?;
+        let suffix = match footer_shortfall(&suffix, total) {
+            Some(needed) => fetch_bloom_suffix(&account, &path, needed).await?.1,
+            None => suffix,
+        };
+        let reader = infra::bloom::BloomReader::parse_suffix(&suffix, total)
+            .map_err(|e| anyhow::anyhow!("parse footer of {path}: {e}"))?;
+        let excess_files = chunk_excess_false_positives(&reader, fpp);
+        Ok::<_, anyhow::Error>(if excess_files < HEAL_MIN_EXCESS_FILES {
+            ChunkHealth::Healthy
+        } else if total > HEAL_MAX_OBJECT_BYTES {
+            ChunkHealth::TooLarge {
+                bytes: total,
+                excess_files,
+            }
+        } else {
+            ChunkHealth::Saturated { excess_files }
+        })
+    }
+    .await;
+    (version, verdict)
+}
+
+/// The composite section of a chunk: the expected number of false-positive
+/// member files per lookup above what the members' own sizing would give.
+///
+/// Only the composite section counts. It holds the Bloom-only fields
+/// (`trace_id`, `span_id`, ... — no dictionary), so a saturated composite
+/// sends a lookup to a full data scan, and the members' sidecar blobs carry
+/// it, so a heal can restore it. Per-field sections of dictionary-backed
+/// fields cost at most a VIX probe per false positive, and many come from
+/// dictionary supplements that no blob holds: counting them would mark
+/// chunks a heal cannot improve (prod replay 2026-10-25: composite 254.8 ->
+/// 0.28 maybe-files per absent probe, while one supplement section stayed
+/// at 254.9).
+fn chunk_excess_false_positives(reader: &infra::bloom::BloomReader, fpp: f64) -> f64 {
+    reader
+        .section_layouts()
+        .iter()
+        .filter(|layout| layout.field == vortex_index::bloom::COMPOSITE_BLOOM_FIELD)
+        .map(|layout| section_excess_false_positives(layout.n_items, layout.num_blocks, fpp))
+        .fold(0.0, f64::max)
+}
+
+/// One section: sum over members of `fpr(n, B) − fpr(n, own)`, where `own`
+/// is the member's own block count at `fpp` (members at or above their own
+/// size contribute nothing).
+fn section_excess_false_positives(n_items: &[u32], num_blocks: u32, fpp: f64) -> f64 {
+    n_items
+        .iter()
+        .map(|n| {
+            let n = u64::from(*n);
+            let own = infra::bloom::num_blocks_for(n, fpp);
+            if num_blocks >= own {
+                0.0
+            } else {
+                (infra::bloom::false_positive_rate(n, num_blocks)
+                    - infra::bloom::false_positive_rate(n, own))
+                .max(0.0)
+            }
+        })
+        .sum()
+}
+
+/// One `Suffix(n)` GET of a `.bf`, straight from the object store (the
+/// compactor never warms the query caches). Returns (object size, bytes).
+async fn fetch_bloom_suffix(
+    account: &str,
+    path: &str,
+    n: u64,
+) -> Result<(u64, bytes::Bytes), anyhow::Error> {
+    let opts = object_store::GetOptions {
+        range: Some(object_store::GetRange::Suffix(n)),
+        ..Default::default()
+    };
+    let res = infra::storage::get_opts(account, path, opts)
+        .await
+        .map_err(|e| anyhow::anyhow!("suffix GET of {path}: {e}"))?;
+    let total = res.meta.size;
+    let bytes = res
+        .bytes()
+        .await
+        .map_err(|e| anyhow::anyhow!("suffix body of {path}: {e}"))?;
+    Ok((total, bytes))
+}
+
+/// Trailing bytes to re-read when the footer does not fit in `suffix`
+/// (`footer_len + 8`; the last 8 bytes of every `.bf` are `footer_len` and
+/// the tail magic). `None` when it fits or `footer_len` is implausible —
+/// `parse_suffix` then accepts or rejects the suffix itself. Mirrors
+/// `bloom_pruner::footer_shortfall`.
+fn footer_shortfall(suffix: &[u8], total: u64) -> Option<u64> {
+    let n = suffix.len();
+    if n < 8 {
+        return None;
+    }
+    let footer_len = u32::from_le_bytes(suffix[n - 8..n - 4].try_into().ok()?) as u64;
+    let needed = footer_len + 8;
+    if needed <= n as u64 || needed > total {
+        return None;
+    }
+    Some(needed)
+}
+
+/// Process-local memo of heal candidates already settled here (healthy,
+/// too large, unreadable, or not re-loadable), keyed `stream/date/version`.
+static HEAL_CHECKED: std::sync::LazyLock<parking_lot::Mutex<hashlink::LruCache<String, ()>>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(hashlink::LruCache::new(262_144)));
+
+fn heal_memo_key(stream_key: &str, date: &str, version: i64) -> String {
+    format!("{stream_key}/{date}/{version}")
+}
+
+fn heal_checked(key: &str) -> bool {
+    HEAL_CHECKED.lock().get(key).is_some()
+}
+
+fn remember_heal_checked(key: &str) {
+    HEAL_CHECKED.lock().insert(key.to_string(), ());
+}
+
 /// Why a bucket is visited: the pending queue (files at `bloom_ver = 0`
-/// decide the regroup triggers) or the consolidation sweep (no pending work
-/// required; the hour is rebuilt from its small chunks).
+/// decide the regroup triggers), the consolidation sweep (no pending work
+/// required; the hour is rebuilt from its small chunks) or the heal lane
+/// (the hour's saturated chunks are rebuilt from their members' sidecars).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VisitMode {
     Pending,
     Sweep,
+    Heal,
 }
 
 /// The `date` (`YYYY/MM/DD/HH`) before which hours count as settled for the
 /// `.bf` queue: `now − live_lookback_hours`, floored to the hour. A lookback
 /// of 0 excludes only the open hour (the pre-2026-09-28 behavior).
+/// One pass's bucket list: the aged lane first, then the newest-first
+/// scan, without duplicates, capped at `batch`. The aged lane is already
+/// bounded to a share of the batch by its query, so the newest hours keep
+/// most of every pass.
+fn merge_discovery_lanes(
+    aged: Vec<(String, String)>,
+    newest: Vec<(String, String)>,
+    batch: usize,
+) -> Vec<(String, String)> {
+    let mut seen: HashSet<(String, String)> = HashSet::with_capacity(aged.len() + newest.len());
+    aged.into_iter()
+        .chain(newest)
+        .filter(|bucket| seen.insert(bucket.clone()))
+        .take(batch)
+        .collect()
+}
+
 fn settled_hour_cutoff(now: chrono::DateTime<chrono::Utc>, live_lookback_hours: i64) -> String {
     let lookback = chrono::Duration::hours(live_lookback_hours.max(0));
     (now - lookback).format("%Y/%m/%d/%H").to_string()
@@ -290,6 +668,8 @@ fn parse_stream_key(stream_key: &str) -> Option<(String, String, String)> {
 
 /// Returns Ok(true) when the bucket was processed, Ok(false) when its lock
 /// was busy (another compactor owns it or a leaked lock is aging out).
+/// `heal_versions` are the chunks a [`VisitMode::Heal`] visit rebuilds
+/// (empty for the other modes).
 #[allow(clippy::too_many_arguments)]
 async fn process_bucket(
     org_id: &str,
@@ -301,6 +681,7 @@ async fn process_bucket(
     auto_id_scope: bool,
     bloom_only_never: &Arc<HashSet<String>>,
     mode: VisitMode,
+    heal_versions: &[i64],
 ) -> Result<bool, anyhow::Error> {
     let stream_type: config::meta::stream::StreamType = stream_type.into();
 
@@ -330,6 +711,7 @@ async fn process_bucket(
         auto_id_scope,
         bloom_only_never,
         mode,
+        heal_versions,
     )
     .await;
     dist_lock::unlock(&locker).await?;
@@ -370,6 +752,9 @@ enum BuildTrigger {
     /// Consolidation sweep: the hour is fragmented into more than
     /// `ZO_COMPACT_BLOOM_MAX_CHUNKS` versions and nothing re-pended it.
     Sweep,
+    /// Heal lane: chunks written by the folding assembler whose footer
+    /// shows saturated sections ([`heal_saturated_chunks`]).
+    Heal,
 }
 
 /// DESIGN-COLD-MISS §4 B4 hour selection: a settled hour with pending files
@@ -433,6 +818,7 @@ async fn process_bucket_locked(
     auto_id_scope: bool,
     bloom_only_never: &Arc<HashSet<String>>,
     mode: VisitMode,
+    heal_versions: &[i64],
 ) -> Result<(), anyhow::Error> {
     let cfg = get_config();
     // the WHOLE hour under the lock (another compactor may have built it):
@@ -485,9 +871,11 @@ async fn process_bucket_locked(
         .min()
         .map(|oldest| chrono::Duration::microseconds((now - oldest).max(0)));
     // a sweep visit rebuilds the hour from its small chunks whatever the
-    // pending set looks like (pending files, if any, simply join the build)
+    // pending set looks like (pending files, if any, simply join the build);
+    // so does a heal visit with its saturated chunks
     let trigger = match mode {
         VisitMode::Sweep => BuildTrigger::Sweep,
+        VisitMode::Heal => BuildTrigger::Heal,
         VisitMode::Pending => match build_trigger(
             pending.len(),
             rows.len(),
@@ -687,27 +1075,44 @@ async fn process_bucket_locked(
     // to one chunk's worth of members per pass — the chunk knob is the
     // assembler's memory knob (DESIGN §4 B4), and an hour the pre-B4
     // assembler left as one group per file would otherwise be read back
-    // whole; the rest folds on the hour's next visit.
+    // whole; the rest folds on the hour's next visit. A heal visit rebuilds
+    // its saturated chunks instead, under the same member bound.
     let chunk_files = cfg.compact.bloom_chunk_files.max(1);
-    let (consolidated, superseded) = consolidate_small_chunks(
-        org_id,
-        stream_type,
-        stream_name,
-        date,
-        &stamped_rows,
-        chunk_files,
-        cfg.compact.bloom_max_chunks,
-        chunk_files,
-    )
-    .await;
+    let (consolidated, superseded, reloaded) = if mode == VisitMode::Heal {
+        rebuild_saturated_chunks(
+            org_id,
+            stream_type,
+            stream_name,
+            date,
+            &stamped_rows,
+            heal_versions,
+            chunk_files,
+            fpp,
+        )
+        .await
+    } else {
+        consolidate_small_chunks(
+            org_id,
+            stream_type,
+            stream_name,
+            date,
+            &stamped_rows,
+            chunk_files,
+            cfg.compact.bloom_max_chunks,
+            chunk_files,
+            fpp,
+        )
+        .await
+    };
     let consolidated_files = consolidated.len();
     members.extend(consolidated);
-    if members.is_empty() && mode == VisitMode::Sweep {
+    if members.is_empty() && mode != VisitMode::Pending {
         // nothing to fold (the small versions were consolidated by another
-        // visit between discovery and the lock, or are unreadable and kept)
+        // visit between discovery and the lock, or are unreadable and kept;
+        // a heal visit's chunks moved or could not be re-loaded)
         log::debug!(
-            "[COMPACTOR:BLOOM] {org_id}/{stream_type}/{stream_name}/{date}: sweep visit found \
-             nothing to consolidate across {} versions",
+            "[COMPACTOR:BLOOM] {org_id}/{stream_type}/{stream_name}/{date}: {mode:?} visit \
+             found nothing to rebuild across {} versions",
             stamped_rows
                 .iter()
                 .map(|row| row.bloom_ver)
@@ -718,9 +1123,9 @@ async fn process_bucket_locked(
     }
 
     // Chunking: members sorted by their section bytes so files of similar
-    // cardinality share a chunk — each field section is folded to the
-    // chunk's smallest block count, and neighbours in size lose least to
-    // the fold. Every chunk is one v2 `.bf` with the group file table and
+    // cardinality share a chunk — each field section is expanded to the
+    // chunk's largest block count, so neighbours in size pay the least
+    // padding. Every chunk is one v2 `.bf` with the group file table and
     // presence bits.
     members.sort_by_key(|member| (member.section_bytes(), member.fence.0));
     let base_ver = now_micros();
@@ -728,10 +1133,12 @@ async fn process_bucket_locked(
     let mut built = 0usize;
     let mut moved = 0usize;
     let mut new_versions: Vec<i64> = Vec::new();
-    for chunk in members.chunks(chunk_files) {
+    for chunk in members.chunks_mut(chunk_files) {
         let bloom_ver = base_ver + chunk_idx;
         chunk_idx += 1;
-        let field_blooms = fold_chunk_sections(chunk);
+        // moves the members' section bytes into the chunk (no copy): a
+        // traces chunk of 256 members is up to ~1 GiB of SBBF
+        let field_blooms = expand_chunk_sections(chunk);
         let group: Vec<GroupMember> = chunk.iter().map(|m| m.presence.clone()).collect();
         let blob = BloomWriter::serialize_v2(&group, field_blooms)
             .map_err(|e| anyhow::anyhow!("serialize .bf: {e}"))?;
@@ -854,57 +1261,64 @@ async fn process_bucket_locked(
          files ({chunk_idx} chunks of <= {chunk_files}; {sidecar_only} sidecar-only loads, \
          {fallback_streams} dictionary fallbacks, {deferred} deferred, {repacked} sidecars \
          repacked to the current layout, {consolidated_files} consolidated from small chunks, \
-         {moved} restamped, {retired} superseded + {gc_queued} orphaned chunks queued for \
-         deletion, {not_applicable_matched} not applicable, {unbuildable_matched} unbuildable) \
-         in {:?}",
+         {reloaded} of them restored from their sidecar blobs, {moved} restamped, {retired} \
+         superseded + {gc_queued} orphaned chunks queued for deletion, \
+         {not_applicable_matched} not applicable, {unbuildable_matched} unbuildable; \
+         {trigger:?}) in {:?}",
         started.elapsed()
     );
     Ok(())
 }
 
-/// Fold every field section of one chunk down to the chunk's smallest block
-/// count for that field (`Sbbf::fold`: sound for any power-of-two divisor —
-/// membership answers are preserved, only the fill ratio rises), so one
-/// block-row of the transposed matrix answers every member. A member whose
-/// section cannot be folded (not a power-of-two multiple — never produced by
-/// this crate's writers) contributes no section for that field (no info).
-fn fold_chunk_sections(chunk: &[BuildMember]) -> Vec<FieldBloom> {
-    let mut min_blocks: HashMap<&str, u32> = HashMap::new();
-    for member in chunk {
+/// Bring every field section of one chunk to the chunk's LARGEST block
+/// count for that field, so one block-row of the transposed matrix answers
+/// every member. `expand_bytes` repeats each block, which is exact: every
+/// member answers every probe as its own filter did (its own
+/// false-positive rate). The rule until 2026-10-25 folded every member down
+/// to the SMALLEST count instead, OR-ing a 1.3M-value member into the few
+/// blocks of the chunk's smallest member; 778 of 1,664 `default/traces`
+/// chunks then answered "maybe" for nearly every member. Expansion costs
+/// bytes for the small members only (members are sorted by size, so a
+/// chunk's members are close in size).
+///
+/// The members' section bytes are MOVED into the result (`blooms` is left
+/// empty). A section whose byte length does not divide the target (never
+/// produced by this crate's power-of-two writers) is left out: no info for
+/// that member and field, so the pruner keeps the file.
+fn expand_chunk_sections(chunk: &mut [BuildMember]) -> Vec<FieldBloom> {
+    let mut max_blocks: HashMap<String, u32> = HashMap::new();
+    let mut sections = 0usize;
+    for member in chunk.iter() {
         for bloom in &member.blooms {
-            min_blocks
-                .entry(bloom.field.as_str())
-                .and_modify(|min| *min = (*min).min(bloom.num_blocks))
-                .or_insert(bloom.num_blocks);
+            sections += 1;
+            let blocks = (bloom.bytes.len() / infra::bloom::BLOCK_BYTES) as u32;
+            let max = max_blocks.entry_ref(bloom.field.as_str()).or_insert(0);
+            *max = (*max).max(blocks);
         }
     }
-    let mut out = Vec::new();
-    for member in chunk {
+    let mut out = Vec::with_capacity(sections);
+    for member in chunk.iter_mut() {
         let file_id = member.fence.0 as u64;
-        for bloom in &member.blooms {
-            let target = min_blocks[bloom.field.as_str()];
-            let bytes = if bloom.num_blocks == target {
-                bloom.bytes.clone()
+        for bloom in std::mem::take(&mut member.blooms) {
+            let target = max_blocks[bloom.field.as_str()];
+            let bytes = if bloom.bytes.len() == target as usize * infra::bloom::BLOCK_BYTES {
+                bloom.bytes
             } else {
-                let folded = infra::bloom::Sbbf::from_bytes(&bloom.bytes).and_then(|mut sbbf| {
-                    sbbf.fold(target)?;
-                    Ok(sbbf.to_bytes())
-                });
-                match folded {
+                match infra::bloom::expand_bytes(&bloom.bytes, target) {
                     Ok(bytes) => bytes,
                     Err(e) => {
                         log::warn!(
-                            "[COMPACTOR:BLOOM] file {file_id} field {:?}: cannot fold {} -> \
+                            "[COMPACTOR:BLOOM] file {file_id} field {:?}: cannot expand {} -> \
                              {target} blocks ({e}); section left out (no info)",
                             bloom.field,
-                            bloom.num_blocks
+                            bloom.bytes.len() / infra::bloom::BLOCK_BYTES
                         );
                         continue;
                     }
                 }
             };
             out.push(FieldBloom {
-                field: bloom.field.clone(),
+                field: bloom.field,
                 file_id,
                 n_items: bloom.n_items,
                 bytes,
@@ -922,7 +1336,9 @@ fn fold_chunk_sections(chunk: &[BuildMember]) -> Vec<FieldBloom> {
 /// tail). Oldest versions first, and no further chunk is opened once
 /// `max_members` members are collected: the resident set stays one chunk's
 /// worth however fragmented the hour is. Returns the members and the
-/// versions they left. A chunk that cannot be read stays as it is.
+/// versions they left, plus how many members got sections restored from
+/// their own sidecar blobs (members the folding assembler had shrunk). A
+/// chunk that cannot be read stays as it is.
 #[allow(clippy::too_many_arguments)]
 async fn consolidate_small_chunks(
     org_id: &str,
@@ -933,18 +1349,20 @@ async fn consolidate_small_chunks(
     chunk_files: usize,
     max_chunks: usize,
     max_members: usize,
-) -> (Vec<BuildMember>, Vec<i64>) {
+    fpp: f64,
+) -> (Vec<BuildMember>, Vec<i64>, usize) {
     let mut by_version: std::collections::BTreeMap<i64, Vec<&infra::file_list::FileRecord>> =
         std::collections::BTreeMap::new();
     for row in stamped_rows {
         by_version.entry(row.bloom_ver).or_default().push(row);
     }
     if by_version.len() <= max_chunks.max(1) {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), 0);
     }
     let small_limit = (chunk_files / 4).max(1);
     let mut members: Vec<BuildMember> = Vec::new();
     let mut superseded = Vec::new();
+    let mut reloaded = 0usize;
     let total_versions = by_version.len();
     let mut visited = 0usize;
     // Each version costs one chunk GET plus, for v1 chunks, one sidecar-tail
@@ -953,8 +1371,10 @@ async fn consolidate_small_chunks(
     // (prod 2026-10-16). The per-version work runs CONCURRENTLY and is
     // consumed in version order, so the member bound below means exactly
     // what it did; at most a window's worth of versions is read in vain
-    // past the bound.
-    const CONSOLIDATE_CONCURRENCY: usize = 16;
+    // past the bound. 8 wide (16 until .225): a version may now also
+    // re-read its folded members' sidecar blobs (`RELOAD_CONCURRENCY` wide,
+    // up to ~4 MiB each), which bounds the in-flight reads at 32.
+    const CONSOLIDATE_CONCURRENCY: usize = 8;
     use futures::{FutureExt, StreamExt, stream};
     // futures built in a plain loop: a closure over `(version, Vec<&Row>)`
     // items leaks a non-general `Send` bound into the compactor's spawned
@@ -972,6 +1392,8 @@ async fn consolidate_small_chunks(
                 version,
                 rows,
                 small_limit,
+                fpp,
+                true,
             )
             .map(move |members| (version, members)),
         );
@@ -990,17 +1412,115 @@ async fn consolidate_small_chunks(
         }
         visited += 1;
         if let Some(mut folded_members) = folded_members {
-            members.append(&mut folded_members);
+            reloaded += folded_members.reloaded;
+            members.append(&mut folded_members.members);
             superseded.push(version);
         }
     }
-    (members, superseded)
+    (members, superseded, reloaded)
+}
+
+/// Heal visit: rebuild the hour's saturated chunks (`heal_versions`, found
+/// by [`heal_saturated_chunks`] from their footers) with their members' own
+/// sidecar blobs. Versions in ascending order, and no further chunk is
+/// opened once `max_members` members are collected; the rest stays for a
+/// later pass (its rows still carry the old version, so discovery lists it
+/// again). Folded members whose sections cannot be restored stay on the old
+/// chunk. A version that yields nothing (unreadable, or no member could be
+/// restored) is remembered so this process does not retry it every pass.
+#[allow(clippy::too_many_arguments)]
+async fn rebuild_saturated_chunks(
+    org_id: &str,
+    stream_type: config::meta::stream::StreamType,
+    stream_name: &str,
+    date: &str,
+    stamped_rows: &[&infra::file_list::FileRecord],
+    heal_versions: &[i64],
+    max_members: usize,
+    fpp: f64,
+) -> (Vec<BuildMember>, Vec<i64>, usize) {
+    let wanted: HashSet<i64> = heal_versions.iter().copied().collect();
+    let mut by_version: std::collections::BTreeMap<i64, Vec<&infra::file_list::FileRecord>> =
+        std::collections::BTreeMap::new();
+    for row in stamped_rows {
+        if wanted.contains(&row.bloom_ver) {
+            by_version.entry(row.bloom_ver).or_default().push(row);
+        }
+    }
+    let mut members: Vec<BuildMember> = Vec::new();
+    let mut superseded = Vec::new();
+    let mut reloaded = 0usize;
+    for (version, rows) in by_version {
+        if members.len() >= max_members {
+            break;
+        }
+        let live = rows.len();
+        match consolidate_version(
+            org_id,
+            stream_type,
+            stream_name,
+            date,
+            version,
+            rows,
+            usize::MAX,
+            fpp,
+            false,
+        )
+        .await
+        {
+            Some(healed) if healed.reloaded > 0 => {
+                log::info!(
+                    "[COMPACTOR:BLOOM] {org_id}/{stream_type}/{stream_name}/{date}: healing \
+                     saturated chunk {version}: {} of {live} live members restored from their \
+                     sidecar blobs, {} moved, {} left on the old chunk",
+                    healed.reloaded,
+                    healed.members.len(),
+                    healed.left_behind
+                );
+                reloaded += healed.reloaded;
+                members.extend(healed.members);
+                superseded.push(version);
+            }
+            _ => {
+                log::warn!(
+                    "[COMPACTOR:BLOOM] {org_id}/{stream_type}/{stream_name}/{date}: saturated \
+                     chunk {version} not healed (unreadable, or none of its {live} live members \
+                     could be restored); kept as is"
+                );
+                remember_heal_checked(&heal_memo_key(
+                    &format!("{org_id}/{stream_type}/{stream_name}"),
+                    date,
+                    version,
+                ));
+            }
+        }
+    }
+    (members, superseded, reloaded)
+}
+
+/// The still-live members of one chunk read back for a rebuild.
+struct ConsolidatedVersion {
+    members: Vec<BuildMember>,
+    /// Members with at least one section restored from their own sidecar blob.
+    reloaded: usize,
+    /// Folded members with nothing restored that stay on the old chunk (only
+    /// when the caller does not keep unhealed members).
+    left_behind: usize,
 }
 
 /// Read one superseded-candidate chunk back and hand its still-live members
 /// to the current build (`restamp_from` = this version). `None` keeps the
 /// chunk as it is: unreadable, unparsable, inconsistent, or a v2 chunk
 /// above the small-member limit.
+///
+/// A member the folding assembler shrank (a section below
+/// `num_blocks_for(n_items, fpp)`) gets those sections back from its own
+/// sidecar blob ([`restore_folded_sections`]), so the rebuilt chunk carries
+/// its real filter. When nothing can be restored, the member keeps its
+/// folded sections (still correct, only less selective) if
+/// `keep_unhealed`, and otherwise stays on this chunk (left out of the
+/// result; the old version then remains referenced and is not retired).
+#[allow(clippy::too_many_arguments)]
 async fn consolidate_version(
     org_id: &str,
     stream_type: config::meta::stream::StreamType,
@@ -1009,7 +1529,9 @@ async fn consolidate_version(
     version: i64,
     rows: Vec<&infra::file_list::FileRecord>,
     small_limit: usize,
-) -> Option<Vec<BuildMember>> {
+    fpp: f64,
+    keep_unhealed: bool,
+) -> Option<ConsolidatedVersion> {
     let path = infra::bloom::path::bloom_path(org_id, stream_type, stream_name, date, version);
     let account = infra::storage::get_account(org_id, &path).unwrap_or_default();
     let object = match infra::storage::get_bytes(&account, &path).await {
@@ -1060,8 +1582,58 @@ async fn consolidate_version(
                 });
         }
     }
+
+    // Restore the members the folding assembler shrank from their own
+    // sidecar blobs. Futures are built in a plain loop (see
+    // `consolidate_small_chunks` on closures over borrowed rows and the
+    // spawned job's `Send` bound).
+    const RELOAD_CONCURRENCY: usize = 4;
+    use futures::{StreamExt, stream};
+    let mut reloads = Vec::new();
+    for (file_id, row) in &live {
+        let folded = sections_of.get(file_id).is_some_and(|sections| {
+            sections.iter().any(|section| {
+                section.num_blocks < infra::bloom::num_blocks_for(u64::from(section.n_items), fpp)
+            })
+        });
+        if !folded {
+            continue;
+        }
+        let Some(old_sections) = sections_of.remove(file_id) else {
+            continue;
+        };
+        let file_id = *file_id;
+        let file = FileKey::from(*row);
+        reloads.push(async move { (file_id, restore_folded_sections(&file, old_sections).await) });
+    }
+    let mut unhealed: HashSet<u64> = HashSet::new();
+    let mut reloaded = 0usize;
+    let outcomes: Vec<(u64, RestoredSections)> = stream::iter(reloads)
+        .buffer_unordered(RELOAD_CONCURRENCY)
+        .collect()
+        .await;
+    for (file_id, outcome) in outcomes {
+        if outcome.restored > 0 {
+            reloaded += 1;
+        } else {
+            if let Some(e) = &outcome.error {
+                log::debug!(
+                    "[COMPACTOR:BLOOM] {path}: folded member {file_id} not restored: {e:#}"
+                );
+            }
+            unhealed.insert(file_id);
+        }
+        sections_of.insert(file_id, outcome.sections);
+    }
+
+    let mut left_behind = 0usize;
     let mut members = Vec::with_capacity(live.len());
     for (file_id, row) in live {
+        if !keep_unhealed && unhealed.contains(&file_id) {
+            left_behind += 1;
+            continue;
+        }
+        let fence = (row.id, row.index_generation, row.index_size);
         let presence = match reader.member_columns(file_id) {
             Some((columns, complete)) => GroupMember::new(file_id, columns).with_complete(complete),
             // v1 chunk: presence from the member's sidecar tail (one GET);
@@ -1077,13 +1649,94 @@ async fn consolidate_version(
             },
         };
         members.push(BuildMember {
-            fence: (row.id, row.index_generation, row.index_size),
+            fence,
             presence,
             blooms: sections_of.remove(&file_id).unwrap_or_default(),
             restamp_from: Some(version),
         });
     }
-    Some(members)
+    Some(ConsolidatedVersion {
+        members,
+        reloaded,
+        left_behind,
+    })
+}
+
+/// Outcome of [`restore_folded_sections`]: the member's sections (restored
+/// where possible, the old ones otherwise) and how many were restored.
+struct RestoredSections {
+    sections: Vec<vortex_index::bloom::FileBloom>,
+    restored: usize,
+    error: Option<anyhow::Error>,
+}
+
+/// Re-read one stamped member's own sidecar `bloom` blob (tail GET + blob
+/// GET; pre-2026-10-16 sidecars also walk the blob's section headers) and
+/// put back the sections a folding assembler shrank. Only sections the old
+/// chunk holds for this member are replaced, and only by a blob section of
+/// the same field and `n_items` with more blocks: the old chunk's composite
+/// and writer-flagged sections were built from this very blob, so the field
+/// set, and every safety decision of the original build, stays exactly the
+/// chunk's. Sections built from a dictionary supplement have no blob
+/// counterpart and keep their old bits — no dictionary is streamed here, so
+/// a heal never spends the pending builds' fallback budget.
+async fn restore_folded_sections(
+    file: &FileKey,
+    old: Vec<vortex_index::bloom::FileBloom>,
+) -> RestoredSections {
+    let handle = tokio::runtime::Handle::current();
+    let Some(source) = sidecar_source(file, handle) else {
+        return RestoredSections {
+            sections: old,
+            restored: 0,
+            error: Some(anyhow::anyhow!("{}: no sidecar", file.key)),
+        };
+    };
+    let blob = tokio::task::spawn_blocking(move || {
+        let probe = vortex_index::FileBloomProbe::open_sidecar(source)?;
+        Ok::<_, anyhow::Error>(probe.read_file_blooms()?)
+    })
+    .await
+    .map_err(anyhow::Error::from)
+    .and_then(|loaded| loaded);
+    let mut own: HashMap<String, vortex_index::bloom::FileBloom> = match blob {
+        Ok(Some(blooms)) => blooms.into_iter().map(|b| (b.field.clone(), b)).collect(),
+        Ok(None) => {
+            return RestoredSections {
+                sections: old,
+                restored: 0,
+                error: Some(anyhow::anyhow!("{}: sidecar has no bloom blob", file.key)),
+            };
+        }
+        Err(e) => {
+            return RestoredSections {
+                sections: old,
+                restored: 0,
+                error: Some(e.context(format!("{}: sidecar bloom read", file.key))),
+            };
+        }
+    };
+    let mut restored = 0usize;
+    let sections = old
+        .into_iter()
+        .map(|section| match own.remove(&section.field) {
+            Some(fresh)
+                if fresh.n_items == section.n_items
+                    && fresh.num_blocks > section.num_blocks
+                    && fresh.bytes.len()
+                        == fresh.num_blocks as usize * infra::bloom::BLOCK_BYTES =>
+            {
+                restored += 1;
+                fresh
+            }
+            _ => section,
+        })
+        .collect();
+    RestoredSections {
+        sections,
+        restored,
+        error: None,
+    }
 }
 
 /// The `.bf` objects of the hour that no live row references (after this
@@ -2079,6 +2732,36 @@ mod tests {
     /// floored to the hour, so a `date < cutoff` query excludes exactly the
     /// hours whose files still churn; lookback 0 excludes only the open hour.
     #[test]
+    fn discovery_lanes_put_aged_hours_first_without_duplicates() {
+        let bucket = |d: &str| ("o/traces/default".to_string(), d.to_string());
+        let aged = vec![bucket("2026/10/20/03"), bucket("2026/10/24/09")];
+        let newest = vec![
+            bucket("2026/10/25/04"),
+            bucket("2026/10/24/09"),
+            bucket("2026/10/25/03"),
+        ];
+        assert_eq!(
+            merge_discovery_lanes(aged.clone(), newest.clone(), 10),
+            vec![
+                bucket("2026/10/20/03"),
+                bucket("2026/10/24/09"),
+                bucket("2026/10/25/04"),
+                bucket("2026/10/25/03"),
+            ]
+        );
+        assert_eq!(
+            merge_discovery_lanes(aged, newest, 3),
+            vec![
+                bucket("2026/10/20/03"),
+                bucket("2026/10/24/09"),
+                bucket("2026/10/25/04"),
+            ],
+            "the batch caps the merged list"
+        );
+        assert_eq!(merge_discovery_lanes(Vec::new(), Vec::new(), 3), Vec::new());
+    }
+
+    #[test]
     fn settled_hour_cutoff_floors_to_the_lane_boundary() {
         use chrono::TimeZone;
         let now = chrono::Utc
@@ -2164,16 +2847,17 @@ mod tests {
         );
     }
 
-    /// B4 chunk fold: within a chunk every field section lands on the
-    /// chunk's smallest block count for that field, membership survives the
-    /// fold, fields are folded independently and a member without a field
-    /// contributes no section for it.
+    /// Chunk assembly: within a chunk every field section is expanded to the
+    /// chunk's LARGEST block count for that field, every member answers
+    /// every probe exactly as its own filter did (no false-positive rate is
+    /// raised), fields are sized independently, a member without a field
+    /// contributes no section for it and the members' bytes are moved out.
     #[test]
-    fn fold_chunk_sections_to_the_smallest_block_count_per_field() {
+    fn expand_chunk_sections_to_the_largest_block_count_per_field() {
         use infra::bloom::sbbf::{BLOCK_BYTES, block_index, check_block, hash_value};
         use vortex_index::bloom::FileBloom;
 
-        let section = |field: &str, num_blocks: u32, values: &[&str]| {
+        let section = |field: &str, num_blocks: u32, values: &[String]| {
             let mut sbbf = infra::bloom::Sbbf::new_with_num_blocks(num_blocks);
             for value in values {
                 sbbf.insert(value.as_bytes());
@@ -2185,29 +2869,36 @@ mod tests {
                 bytes: sbbf.to_bytes(),
             }
         };
+        let values = |prefix: &str, n: usize| -> Vec<String> {
+            (0..n).map(|i| format!("{prefix}-{i}")).collect()
+        };
         let member = |id: i64, blooms: Vec<FileBloom>| BuildMember {
             fence: (id, 1, 1),
             presence: GroupMember::new(id as u64, vec!["host".into(), "tid".into()]),
             blooms,
             restamp_from: None,
         };
-        let chunk = vec![
-            member(
-                1,
-                vec![
-                    section("host", 16, &["h-1", "h-2"]),
-                    section("tid", 4, &["t-1"]),
-                ],
-            ),
-            member(
-                2,
-                vec![section("host", 2, &["h-3"]), section("tid", 32, &["t-2"])],
-            ),
-            member(3, vec![section("host", 8, &["h-4"])]),
+        // small members are filled densely so a wrong layout would show up
+        // as answer differences on the absent probes
+        let originals = vec![
+            (1u64, section("host", 16, &values("h1", 300))),
+            (1, section("tid", 4, &values("t1", 120))),
+            (2, section("host", 2, &values("h2", 60))),
+            (2, section("tid", 32, &values("t2", 400))),
+            (3, section("host", 8, &values("h3", 150))),
         ];
-        let folded = fold_chunk_sections(&chunk);
+        let mut chunk = vec![
+            member(1, vec![originals[0].1.clone(), originals[1].1.clone()]),
+            member(2, vec![originals[2].1.clone(), originals[3].1.clone()]),
+            member(3, vec![originals[4].1.clone()]),
+        ];
+        let expanded = expand_chunk_sections(&mut chunk);
+        assert!(
+            chunk.iter().all(|m| m.blooms.is_empty()),
+            "section bytes are moved into the chunk, not copied"
+        );
         let find = |file_id: u64, field: &str| {
-            folded
+            expanded
                 .iter()
                 .find(|b| b.file_id == file_id && b.field == field)
                 .unwrap_or_else(|| panic!("{file_id}/{field}"))
@@ -2215,38 +2906,141 @@ mod tests {
         for file_id in [1u64, 2, 3] {
             assert_eq!(
                 find(file_id, "host").bytes.len(),
-                2 * BLOCK_BYTES,
-                "host folds to 2"
+                16 * BLOCK_BYTES,
+                "host -> 16"
             );
         }
-        assert_eq!(
-            find(1, "tid").bytes.len(),
-            4 * BLOCK_BYTES,
-            "tid folds to 4"
-        );
-        assert_eq!(find(2, "tid").bytes.len(), 4 * BLOCK_BYTES);
+        assert_eq!(find(1, "tid").bytes.len(), 32 * BLOCK_BYTES, "tid -> 32");
+        assert_eq!(find(2, "tid").bytes.len(), 32 * BLOCK_BYTES);
         assert!(
-            !folded.iter().any(|b| b.file_id == 3 && b.field == "tid"),
+            !expanded.iter().any(|b| b.file_id == 3 && b.field == "tid"),
             "no section for a field the member lacks"
         );
-        assert_eq!(folded.len(), 5);
-        // membership is preserved through the fold
-        let probe = |bloom: &FieldBloom, value: &str| {
-            let num_blocks = (bloom.bytes.len() / BLOCK_BYTES) as u32;
+        assert_eq!(expanded.len(), 5);
+        assert_eq!(find(1, "host").n_items, 300, "n_items is the member's own");
+
+        let probe = |bytes: &[u8], value: &str| {
+            let num_blocks = (bytes.len() / BLOCK_BYTES) as u32;
             let h = hash_value(value.as_bytes());
             let bi = block_index(h, num_blocks) as usize;
-            let block: &[u8; BLOCK_BYTES] = bloom.bytes[bi * BLOCK_BYTES..(bi + 1) * BLOCK_BYTES]
+            let block: &[u8; BLOCK_BYTES] = bytes[bi * BLOCK_BYTES..(bi + 1) * BLOCK_BYTES]
                 .try_into()
                 .unwrap();
             check_block(block, h)
         };
-        assert!(probe(find(1, "host"), "h-1"));
-        assert!(probe(find(1, "host"), "h-2"));
-        assert!(probe(find(2, "host"), "h-3"));
-        assert!(probe(find(3, "host"), "h-4"));
-        assert!(probe(find(1, "tid"), "t-1"));
-        assert!(probe(find(2, "tid"), "t-2"));
-        assert_eq!(find(1, "host").n_items, 2);
+        let absent = values("absent", 20_000);
+        for (file_id, original) in &originals {
+            let got = find(*file_id, &original.field);
+            let own_values = match (file_id, original.field.as_str()) {
+                (1, "host") => values("h1", 300),
+                (1, _) => values("t1", 120),
+                (2, "host") => values("h2", 60),
+                (2, _) => values("t2", 400),
+                _ => values("h3", 150),
+            };
+            for value in &own_values {
+                assert!(
+                    probe(&got.bytes, value),
+                    "{file_id}/{}: lost {value}",
+                    original.field
+                );
+            }
+            let mismatches = absent
+                .iter()
+                .filter(|value| probe(&got.bytes, value) != probe(&original.bytes, value))
+                .count();
+            assert_eq!(
+                mismatches, 0,
+                "{file_id}/{}: expansion must answer exactly as the member's own filter",
+                original.field
+            );
+        }
+    }
+
+    /// Heal classification from footer numbers alone: members at or above
+    /// their own size add nothing; a member folded below its own size adds
+    /// the false-positive rate it lost. A healthy 256-member chunk stays far
+    /// below the heal threshold; a chunk of 1.3M-value members folded onto a
+    /// small member's block count is far above it.
+    #[test]
+    fn heal_excess_false_positives_from_footer_numbers() {
+        let fpp = 0.001;
+        let n_big = 1_300_000u64;
+        let own_big = infra::bloom::num_blocks_for(n_big, fpp);
+        // healthy: every member at its own size (or larger, after expansion)
+        let healthy = vec![n_big as u32; 256];
+        assert_eq!(section_excess_false_positives(&healthy, own_big, fpp), 0.0);
+        let small = vec![1_000u32; 256];
+        assert_eq!(
+            section_excess_false_positives(&small, own_big, fpp),
+            0.0,
+            "expanded small members keep (or improve) their own rate"
+        );
+        // folded: big members squeezed onto a 1,000-value member's blocks
+        let small_blocks = infra::bloom::num_blocks_for(1_000, fpp);
+        assert!(small_blocks * 64 <= own_big);
+        let folded = section_excess_false_positives(&healthy, small_blocks, fpp);
+        assert!(
+            folded > 250.0 && folded <= 256.0,
+            "256 saturated members ~ 256 false-positive files per lookup, got {folded}"
+        );
+        assert!(folded >= HEAL_MIN_EXCESS_FILES);
+        // one big member folded 2x: rate rises, but stays under the threshold
+        let one = section_excess_false_positives(&[n_big as u32], own_big / 2, fpp);
+        assert!(one > 0.0 && one < HEAL_MIN_EXCESS_FILES, "got {one}");
+    }
+
+    /// The chunk verdict reads the composite section only: a chunk whose
+    /// only folded section is a dictionary-backed field scores zero (a heal
+    /// could not restore it from the blobs), a folded composite scores about
+    /// one false-positive file per member.
+    #[test]
+    fn heal_chunk_excess_counts_the_composite_section_only() {
+        use infra::bloom::{BLOCK_BYTES, BloomReader, BloomWriter, FieldBloom};
+        let fpp = 0.001;
+        let n = 100_000u32;
+        let own = infra::bloom::num_blocks_for(u64::from(n), fpp);
+        let chunk = |composite_blocks: u32, worker_blocks: u32| {
+            let ids = [1u64, 2, 3, 4];
+            let group: Vec<GroupMember> = ids
+                .iter()
+                .map(|id| GroupMember::new(*id, vec!["trace_id".into(), "worker_id".into()]))
+                .collect();
+            let mut sections = Vec::new();
+            for id in ids {
+                for (field, blocks) in [
+                    (vortex_index::bloom::COMPOSITE_BLOOM_FIELD, composite_blocks),
+                    ("worker_id", worker_blocks),
+                ] {
+                    sections.push(FieldBloom {
+                        field: field.to_string(),
+                        file_id: id,
+                        n_items: n,
+                        bytes: vec![0u8; blocks as usize * BLOCK_BYTES],
+                    });
+                }
+            }
+            BloomWriter::serialize_v2(&group, sections).unwrap()
+        };
+        let only_dictionary_folded = chunk(own, 16);
+        let reader = BloomReader::parse(&only_dictionary_folded).unwrap();
+        assert_eq!(chunk_excess_false_positives(&reader, fpp), 0.0);
+        let composite_folded = chunk(16, own);
+        let reader = BloomReader::parse(&composite_folded).unwrap();
+        let excess = chunk_excess_false_positives(&reader, fpp);
+        assert!(excess > 3.9 && excess <= 4.0, "got {excess}");
+    }
+
+    #[test]
+    fn heal_footer_shortfall_reads_the_trailing_length() {
+        let mut suffix = vec![0u8; 100];
+        // footer_len = 500 at [n-8, n-4), magic after it
+        suffix[92..96].copy_from_slice(&500u32.to_le_bytes());
+        assert_eq!(footer_shortfall(&suffix, 10_000), Some(508));
+        assert_eq!(footer_shortfall(&suffix, 400), None, "implausible length");
+        suffix[92..96].copy_from_slice(&50u32.to_le_bytes());
+        assert_eq!(footer_shortfall(&suffix, 10_000), None, "fits already");
+        assert_eq!(footer_shortfall(&[0u8; 4], 10_000), None);
     }
 
     fn composite_scope(broad: bool, explicit_fields: &str) -> config::VixBloomCompositeScope {

@@ -192,6 +192,18 @@ pub trait FileList: Sync + Send + 'static {
         before_date: &str,
         limit: i64,
     ) -> Result<Vec<(String, String)>>;
+    /// The aged lane of the same queue: settled buckets whose OLDEST pending
+    /// file was written before `aged_before` (micros), oldest first. The
+    /// newest-first scan above saturates its limit in prod (300/300 every
+    /// pass, 2026-10-25), so a bucket that fell out of its window was never
+    /// visited again and its regroup age trigger never ran — late merge
+    /// outputs stayed at `bloom_ver = 0` for days.
+    async fn query_bloom_aged_pending_buckets(
+        &self,
+        before_date: &str,
+        aged_before: i64,
+        limit: i64,
+    ) -> Result<Vec<(String, String)>>;
     /// Settled `(stream, hour)` buckets whose stamped files are spread over
     /// more than `max_versions` `.bf` versions, at least one of which has at
     /// most `small_members` files (the only kind the consolidator folds),
@@ -204,6 +216,16 @@ pub trait FileList: Sync + Send + 'static {
         small_members: i64,
         limit: i64,
     ) -> Result<Vec<(String, String)>>;
+    /// Distinct stamped `(stream, hour, bloom_ver)` chunks of settled hours
+    /// (`date < before_date`) whose version is below `before_ver`, newest
+    /// hour first — the heal lane's candidate list (chunks written before
+    /// the assembler stopped folding members to the smallest block count).
+    async fn query_bloom_heal_candidates(
+        &self,
+        before_date: &str,
+        before_ver: i64,
+        limit: i64,
+    ) -> Result<Vec<(String, String, i64)>>;
     async fn query_by_ids(
         &self,
         ids: &[i64],
@@ -586,6 +608,17 @@ pub async fn query_bloom_pending_buckets(
     CLIENT.query_bloom_pending_buckets(before_date, limit).await
 }
 
+/// See [`FileList::query_bloom_aged_pending_buckets`].
+pub async fn query_bloom_aged_pending_buckets(
+    before_date: &str,
+    aged_before: i64,
+    limit: i64,
+) -> Result<Vec<(String, String)>> {
+    CLIENT
+        .query_bloom_aged_pending_buckets(before_date, aged_before, limit)
+        .await
+}
+
 /// See [`FileList::query_bloom_fragmented_buckets`].
 pub async fn query_bloom_fragmented_buckets(
     before_date: &str,
@@ -595,6 +628,17 @@ pub async fn query_bloom_fragmented_buckets(
 ) -> Result<Vec<(String, String)>> {
     CLIENT
         .query_bloom_fragmented_buckets(before_date, max_versions, small_members, limit)
+        .await
+}
+
+/// See [`FileList::query_bloom_heal_candidates`].
+pub async fn query_bloom_heal_candidates(
+    before_date: &str,
+    before_ver: i64,
+    limit: i64,
+) -> Result<Vec<(String, String, i64)>> {
+    CLIENT
+        .query_bloom_heal_candidates(before_date, before_ver, limit)
         .await
 }
 

@@ -162,6 +162,64 @@ pub fn num_blocks_for(ndv: u64, fpp: f64) -> u32 {
     blocks.min(u32::MAX as u64) as u32
 }
 
+/// Expand a serialized SBBF to `to_blocks` blocks (a multiple of its current
+/// count) by repeating every block `to_blocks / current` times — the inverse
+/// direction of [`Sbbf::fold`].
+///
+/// Exact, not approximate: for any integer ratio `r`,
+/// `block_index(h, B * r) / r == block_index(h, B)` (the floor of a floor
+/// divided by an integer), so the block a value probes in the expanded
+/// filter is a copy of the block it set in the original. Every membership
+/// answer, and therefore the false-positive rate, is the original's. Group
+/// assemblers use it to bring every member of a chunk to the chunk's
+/// LARGEST block count; folding the large members down to the smallest
+/// count instead saturated them (prod 2026-10-25: 778 of 1,664
+/// `default/traces` chunks answered "maybe" for almost every lookup).
+pub fn expand_bytes(bytes: &[u8], to_blocks: u32) -> Result<Vec<u8>, &'static str> {
+    if bytes.is_empty() || !bytes.len().is_multiple_of(BLOCK_BYTES) {
+        return Err("SBBF bytes must be a non-zero multiple of 32");
+    }
+    let from = bytes.len() / BLOCK_BYTES;
+    let to = to_blocks.max(1) as usize;
+    if to < from || !to.is_multiple_of(from) {
+        return Err("expand target must be a multiple of the current block count");
+    }
+    let ratio = to / from;
+    if ratio == 1 {
+        return Ok(bytes.to_vec());
+    }
+    let mut out = Vec::with_capacity(to * BLOCK_BYTES);
+    for block in bytes.chunks_exact(BLOCK_BYTES) {
+        for _ in 0..ratio {
+            out.extend_from_slice(block);
+        }
+    }
+    Ok(out)
+}
+
+/// Expected false-positive probability of an SBBF that holds `n_items`
+/// distinct values in `num_blocks` blocks. Block loads are Poisson with
+/// `λ = n / B`; a probe of a block holding `k` values is a false positive
+/// when all 8 of its bits are already set, `(1 − (31/32)^k)^8`. Used by the
+/// group builder to recognise saturated chunks from their footer alone
+/// (`n_items` and the section block count are both in the footer).
+pub fn false_positive_rate(n_items: u64, num_blocks: u32) -> f64 {
+    let lambda = n_items as f64 / num_blocks.max(1) as f64;
+    // beyond ~400 values per block the rate is 1 to within 1e-5
+    if lambda > 400.0 {
+        return 1.0;
+    }
+    let upper = (lambda + 12.0 * lambda.sqrt() + 20.0) as u32;
+    let miss = 31.0f64 / 32.0;
+    let mut poisson = (-lambda).exp();
+    let mut total = 0.0f64;
+    for k in 0..=upper {
+        total += poisson * (1.0 - miss.powi(k as i32)).powi(8);
+        poisson *= lambda / f64::from(k + 1);
+    }
+    total.min(1.0)
+}
+
 /// Builder-side SBBF: owns the bitset, supports `insert` + full `check`.
 /// The reader side never instantiates this — it goes through
 /// [`check_block`] on a single fetched block instead.
@@ -512,5 +570,75 @@ mod tests {
     fn from_bytes_rejects_bad_length() {
         assert!(Sbbf::from_bytes(&[0u8; 31]).is_err());
         assert!(Sbbf::from_bytes(&[]).is_err());
+    }
+
+    #[test]
+    fn expand_is_exact_for_every_probe() {
+        // a small filter expanded x8 must answer every hash exactly like the
+        // original (inserted values included), and folding the copy back
+        // must return the original bytes
+        let mut s = Sbbf::new_with_num_blocks(16);
+        let inserted: Vec<u64> = (0..2_000u64)
+            .map(|i| hash_value(&i.to_le_bytes()))
+            .collect();
+        for h in &inserted {
+            s.insert_hash(*h);
+        }
+        let expanded = Sbbf::from_bytes(&expand_bytes(&s.to_bytes(), 128).unwrap()).unwrap();
+        assert_eq!(expanded.num_blocks(), 128);
+        for h in &inserted {
+            assert!(expanded.check_hash(*h), "inserted hash lost by expansion");
+        }
+        for i in 0..200_000u64 {
+            let h = hash_value(&(i + 10_000_000).to_le_bytes());
+            assert_eq!(expanded.check_hash(h), s.check_hash(h), "probe {i} changed");
+        }
+        let mut back = expanded.clone();
+        back.fold(16).unwrap();
+        assert_eq!(back.to_bytes(), s.to_bytes());
+        // a non-power-of-two integer ratio is exact as well
+        let x3 = Sbbf::from_bytes(&expand_bytes(&s.to_bytes(), 48).unwrap()).unwrap();
+        for h in &inserted {
+            assert!(x3.check_hash(*h));
+        }
+    }
+
+    #[test]
+    fn expand_rejects_bad_targets() {
+        let bytes = Sbbf::new_with_num_blocks(64).to_bytes();
+        assert!(expand_bytes(&bytes, 32).is_err()); // shrink
+        assert!(expand_bytes(&bytes, 96).is_err()); // not a multiple
+        assert!(expand_bytes(&[0u8; 31], 64).is_err());
+        assert!(expand_bytes(&[], 64).is_err());
+        assert_eq!(expand_bytes(&bytes, 64).unwrap(), bytes); // no-op
+    }
+
+    #[test]
+    fn false_positive_rate_tracks_the_measured_rate() {
+        // measured against a real filter at three loads: own sizing,
+        // folded 16x and folded 256x (the saturated prod shape)
+        let n = 200_000u64;
+        let own = num_blocks_for(n, 0.001);
+        for blocks in [own, own / 16, own / 256] {
+            let mut s = Sbbf::new_with_num_blocks(blocks);
+            for i in 0..n {
+                s.insert_hash(hash_value(&i.to_le_bytes()));
+            }
+            let probes = 200_000u64;
+            let hits = (0..probes)
+                .filter(|i| s.check_hash(hash_value(&(i + (1u64 << 40)).to_le_bytes())))
+                .count() as f64;
+            let measured = hits / probes as f64;
+            let model = false_positive_rate(n, blocks);
+            let tolerance = (model * 0.25).max(0.0005);
+            assert!(
+                (measured - model).abs() <= tolerance,
+                "blocks {blocks}: measured {measured} vs model {model}"
+            );
+        }
+        assert!(false_positive_rate(n, own) < 0.002);
+        assert!(false_positive_rate(n, own / 256) > 0.9);
+        assert_eq!(false_positive_rate(1_000_000, 1), 1.0);
+        assert_eq!(false_positive_rate(0, 64), 0.0);
     }
 }
