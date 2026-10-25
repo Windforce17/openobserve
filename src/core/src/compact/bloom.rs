@@ -301,6 +301,19 @@ async fn sweep_fragmented_hours(
 
 /// Max candidate chunks one heal discovery returns (newest hour first).
 const HEAL_DISCOVERY_LIMIT: i64 = 200_000;
+/// Heal visits walk candidate hours newest first; only this many leading
+/// hours are shuffled per node. It must exceed what the fleet visits at once
+/// (prod: 18 pods x ZO_COMPACT_BLOOM_HEAL_HOURS) so nodes rarely meet on one
+/// hour, and stay small so recent hours are healed first (a full-list
+/// shuffle healed hours from 4 weeks back as often as yesterday's).
+const HEAL_SHUFFLE_WINDOW: usize = 64;
+
+/// Shuffles the first `window` items in place and keeps the rest in order.
+fn shuffle_newest_window<T>(items: &mut [T], window: usize, rng: &mut impl rand::Rng) {
+    use rand::seq::SliceRandom;
+    let window = window.min(items.len());
+    items[..window].shuffle(rng);
+}
 /// First footer probe of a heal check; a larger footer is re-read exactly.
 const HEAL_FOOTER_PROBE_BYTES: u64 = 256 * 1024;
 /// Footer checks in flight per hour.
@@ -374,11 +387,16 @@ async fn heal_saturated_chunks(
     if hours.is_empty() {
         return;
     }
-    // the fleet walks the same list: a node-local order spreads the footer
-    // reads and the bucket locks
+    // newest hours first (they get most lookups); the fleet walks the same
+    // list, so a node-local order inside the leading window spreads the
+    // footer reads and the bucket locks without giving up recency
     {
-        use rand::{SeedableRng, rngs::StdRng, seq::SliceRandom};
-        hours.shuffle(&mut StdRng::seed_from_u64(rand::random()));
+        use rand::{SeedableRng, rngs::StdRng};
+        shuffle_newest_window(
+            &mut hours,
+            HEAL_SHUFFLE_WINDOW,
+            &mut StdRng::seed_from_u64(rand::random()),
+        );
     }
     use futures::{StreamExt, stream};
     let fpp = cfg.common.vix_bloom_fpp;
@@ -448,7 +466,6 @@ async fn heal_saturated_chunks(
         }
         saturated_chunks += saturated.len();
         saturated.sort_unstable();
-        visited += 1;
         match process_bucket(
             &org_id,
             &stream_type_name,
@@ -463,9 +480,12 @@ async fn heal_saturated_chunks(
         )
         .await
         {
-            Ok(true) => {}
+            Ok(true) => visited += 1,
+            // another node holds the hour: it does not use up this pass's
+            // quota (the footer check budget still bounds the walk)
             Ok(false) => busy += 1,
             Err(e) => {
+                visited += 1;
                 failed += 1;
                 log::error!("[COMPACTOR:BLOOM] {stream_key}/{date}: heal visit failed: {e:#}");
             }
@@ -1272,7 +1292,7 @@ async fn process_bucket_locked(
          files ({chunk_idx} chunks of <= {chunk_files}; {sidecar_only} sidecar-only loads, \
          {fallback_streams} dictionary fallbacks, {deferred} deferred, {repacked} sidecars \
          repacked to the current layout, {consolidated_files} consolidated from small chunks, \
-         {reloaded} of them restored from their sidecar blobs, {moved} restamped, {retired} \
+         {reloaded} of them reloaded from their sidecars, {moved} restamped, {retired} \
          superseded + {gc_queued} orphaned chunks queued for deletion, \
          {not_applicable_matched} not applicable, {unbuildable_matched} unbuildable; \
          {trigger:?}) in {:?}",
@@ -3055,6 +3075,29 @@ mod tests {
     /// only folded section is a dictionary-backed field scores zero (a heal
     /// could not restore it from the blobs), a folded composite scores about
     /// one false-positive file per member.
+    #[test]
+    fn heal_visit_order_shuffles_only_the_newest_window() {
+        use rand::{SeedableRng, rngs::StdRng};
+        let original: Vec<u32> = (0..200).collect();
+        let mut reordered = false;
+        for seed in 0..8 {
+            let mut items = original.clone();
+            shuffle_newest_window(&mut items, 64, &mut StdRng::seed_from_u64(seed));
+            // hours past the window keep their newest-first order
+            assert_eq!(&items[64..], &original[64..]);
+            // the window holds the same newest hours, node-local order
+            let mut head = items[..64].to_vec();
+            head.sort_unstable();
+            assert_eq!(head, original[..64]);
+            reordered |= items[..64] != original[..64];
+        }
+        assert!(reordered);
+        let mut short = vec![3u32, 1, 2];
+        shuffle_newest_window(&mut short, 64, &mut StdRng::seed_from_u64(1));
+        short.sort_unstable();
+        assert_eq!(short, vec![1, 2, 3]);
+    }
+
     #[test]
     fn heal_chunk_excess_takes_the_worst_section() {
         use infra::bloom::{BLOCK_BYTES, BloomReader, BloomWriter, FieldBloom};
