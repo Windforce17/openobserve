@@ -1037,7 +1037,7 @@ SELECT stream, date FROM file_list WHERE index_size > 0 AND bloom_ver = 0 AND da
             tasks.push(tokio::task::spawn(async move {
                 let pool = CLIENT_RO.clone();
                     let max_ts_upper_bound = super::calculate_max_ts_upper_bound(time_end, stream_type);
-                    let query = "SELECT id, records, original_size FROM file_list WHERE stream = $1 AND max_ts >= $2 AND max_ts <= $3 AND min_ts < $4;";
+                    let query = "SELECT id, records, original_size, bloom_ver FROM file_list WHERE stream = $1 AND max_ts >= $2 AND max_ts <= $3 AND min_ts < $4;";
                     sqlx::query_as::<_, super::FileId>(query)
                     .bind(stream_key)
                     .bind(time_start)
@@ -1098,7 +1098,7 @@ SELECT stream, date FROM file_list WHERE index_size > 0 AND bloom_ver = 0 AND da
                 let pool = CLIENT_RO.clone();
                 let max_ts_upper_bound =
                     super::calculate_max_ts_upper_bound(time_end, stream_type);
-                let query = "SELECT id, file, records, original_size FROM file_list WHERE stream = $1 AND max_ts >= $2 AND max_ts <= $3 AND min_ts < $4;";
+                let query = "SELECT id, file, records, original_size, bloom_ver FROM file_list WHERE stream = $1 AND max_ts >= $2 AND max_ts <= $3 AND min_ts < $4;";
                 sqlx::query_as::<_, super::FileIdWithFile>(query)
                     .bind(stream_key)
                     .bind(time_start)
@@ -3449,6 +3449,59 @@ mod tests {
         // Conversion to FileMeta must carry the value through.
         let meta = FileMeta::from(&rec);
         assert_eq!(meta.bloom_ver, bv);
+    }
+
+    /// Followers adopt the leader's `bloom_ver` only when `query_ids` actually
+    /// selected it: a row read without the column (file_list_dump shape) must
+    /// decode as `None` ("unknown, keep the cached value"), never as 0, which
+    /// would demote a stamped file to pending.
+    #[tokio::test]
+    async fn test_file_ids_carry_bloom_ver_only_when_selected() {
+        let pool = fresh_in_memory_pool().await;
+        create_legacy_file_list_table(&pool).await;
+        crate::db::sqlite::add_column(&pool, "file_list", "bloom_ver", "BIGINT default 0 not null")
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"INSERT INTO file_list
+                (account, org, stream, date, file, deleted, flattened,
+                 min_ts, max_ts, records, original_size, compressed_size,
+                 index_size, bloom_ver, updated_at)
+               VALUES ('a', 'o', 'o/logs/s', '2026/10/25/09', 'f.vix',
+                       false, false, 1, 2, 3, 4, 5, 6, 77, 7);"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let with: crate::file_list::FileId =
+            sqlx::query_as("SELECT id, records, original_size, bloom_ver FROM file_list;")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(with.bloom_ver, Some(77));
+        let without: crate::file_list::FileId =
+            sqlx::query_as("SELECT id, records, original_size FROM file_list;")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(without.bloom_ver, None);
+
+        let with_file: crate::file_list::FileIdWithFile =
+            sqlx::query_as("SELECT id, file, records, original_size, bloom_ver FROM file_list;")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            (with_file.file.as_str(), with_file.bloom_ver),
+            ("f.vix", Some(77))
+        );
+        let without_file: crate::file_list::FileIdWithFile =
+            sqlx::query_as("SELECT id, file FROM file_list;")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(without_file.bloom_ver, None);
     }
 
     /// The bloom pending queue matches `bloom_ver = 0` STRICTLY: the

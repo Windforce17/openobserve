@@ -60,6 +60,7 @@ pub fn generate_remote_scan_rules(
     let RemoteScanContext {
         nodes,
         partitioned_file_lists,
+        partitioned_bloom_vers,
         context,
         is_leader,
     } = context;
@@ -83,6 +84,7 @@ pub fn generate_remote_scan_rules(
         req.clone(),
         nodes,
         partitioned_file_lists,
+        partitioned_bloom_vers,
         equal_keys,
         is_leader,
         context,
@@ -103,6 +105,7 @@ impl RemoteScanRule {
         req: Request,
         nodes: Vec<Arc<dyn NodeInfo>>,
         file_id_lists: HashMap<TableReference, Vec<Vec<i64>>>,
+        file_bloom_ver_lists: HashMap<TableReference, Vec<Vec<i64>>>,
         equal_keys: HashMap<TableReference, Vec<KvItem>>,
         is_leader: bool,
         opentelemetry_context: opentelemetry::Context,
@@ -116,7 +119,8 @@ impl RemoteScanRule {
             is_leader,
             opentelemetry_context,
             sampling_config,
-        );
+        )
+        .with_file_bloom_ver_lists(file_bloom_ver_lists);
         let remote_scan_nodes = Arc::new(remote_scan_nodes);
         let cfg = config::get_config();
         Self {

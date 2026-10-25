@@ -727,6 +727,7 @@ mod tests {
                 records: 20,
                 original_size: 200,
                 deleted: false,
+                bloom_ver: None,
             },
             infra_file_list::FileIdWithFile {
                 id: 1,
@@ -734,6 +735,7 @@ mod tests {
                 records: 10,
                 original_size: 100,
                 deleted: false,
+                bloom_ver: None,
             },
             infra_file_list::FileIdWithFile {
                 id: 2,
@@ -741,6 +743,7 @@ mod tests {
                 records: 20,
                 original_size: 200,
                 deleted: false,
+                bloom_ver: None,
             },
         ];
 

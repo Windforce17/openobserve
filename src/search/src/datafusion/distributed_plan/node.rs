@@ -29,6 +29,9 @@ pub struct RemoteScanNodes {
     pub req: Request,
     pub nodes: Arc<[Arc<dyn NodeInfo>]>,
     pub file_id_lists: HashMap<TableReference, Arc<[Vec<i64>]>>,
+    /// Per-partition `bloom_ver` lists aligned 1:1 with `file_id_lists`.
+    /// Empty when the planner did not provide them.
+    pub file_bloom_ver_lists: HashMap<TableReference, Arc<[Vec<i64>]>>,
     pub equal_keys: HashMap<TableReference, Vec<KvItem>>,
     pub is_leader: bool, // for super cluster
     pub opentelemetry_context: opentelemetry::Context,
@@ -53,11 +56,37 @@ impl RemoteScanNodes {
                 .into_iter()
                 .map(|(table, partitions)| (table, partitions.into()))
                 .collect(),
+            file_bloom_ver_lists: HashMap::new(),
             equal_keys,
             is_leader,
             opentelemetry_context,
             sampling_config,
         }
+    }
+
+    /// Attach the leader's current `bloom_ver` for every dispatched file id,
+    /// partitioned exactly like `file_id_lists`. A table whose lists do not
+    /// align partition-by-partition is dropped, so a follower can never pair
+    /// an id with another file's version.
+    pub fn with_file_bloom_ver_lists(
+        mut self,
+        bloom_ver_lists: HashMap<TableReference, Vec<Vec<i64>>>,
+    ) -> Self {
+        let aligned = bloom_ver_lists
+            .into_iter()
+            .filter(|(table, partitions)| {
+                self.file_id_lists.get(table).is_some_and(|ids| {
+                    ids.len() == partitions.len()
+                        && ids
+                            .iter()
+                            .zip(partitions)
+                            .all(|(ids, vers)| ids.len() == vers.len())
+                })
+            })
+            .map(|(table, partitions)| (table, partitions.into()))
+            .collect();
+        self.file_bloom_ver_lists = aligned;
+        self
     }
 
     pub fn get_remote_node(&self, table_name: &TableReference) -> RemoteScanNode {
@@ -74,6 +103,11 @@ impl RemoteScanNodes {
             plan: Bytes::new(), // set in RemoteScanNode
             file_id_list: self
                 .file_id_lists
+                .get(table_name)
+                .cloned()
+                .unwrap_or_default(),
+            file_bloom_ver_list: self
+                .file_bloom_ver_lists
                 .get(table_name)
                 .cloned()
                 .unwrap_or_default(),
@@ -175,6 +209,8 @@ impl RemoteScanNode {
 pub struct SearchInfos {
     pub plan: Bytes,
     pub file_id_list: Arc<[Vec<i64>]>,
+    /// Parallel to `file_id_list`; see `SearchInfo.file_bloom_ver_list`.
+    pub file_bloom_ver_list: Arc<[Vec<i64>]>,
     pub start_time: i64,
     pub end_time: i64,
     pub timeout: u64,
@@ -192,9 +228,15 @@ impl SearchInfos {
         } else {
             self.file_id_list[partition].clone()
         };
+        let file_bloom_ver_list = self
+            .file_bloom_ver_list
+            .get(partition)
+            .cloned()
+            .unwrap_or_default();
         SearchInfo {
             plan: self.plan.to_vec(),
             file_id_list,
+            file_bloom_ver_list,
             start_time: self.start_time,
             end_time: self.end_time,
             timeout: self.timeout as i64,
@@ -321,5 +363,47 @@ mod tests {
                 .get_remote_node(&TableReference::from("absent"))
                 .is_file_list_empty(0)
         );
+    }
+
+    #[test]
+    fn bloom_ver_lists_are_dispatched_per_partition_and_only_when_aligned() {
+        let logs = TableReference::from("logs");
+        let traces = TableReference::from("traces");
+        let mut ids = HashMap::new();
+        ids.insert(logs.clone(), vec![vec![1, 2], vec![3]]);
+        ids.insert(traces.clone(), vec![vec![7], vec![8]]);
+        let mut vers = HashMap::new();
+        vers.insert(logs.clone(), vec![vec![10, 20], vec![30]]);
+        // misaligned (second partition too short): must be dropped
+        vers.insert(traces.clone(), vec![vec![70], vec![]]);
+        let nodes = RemoteScanNodes::new(
+            Request::default(),
+            vec![],
+            ids,
+            HashMap::new(),
+            false,
+            opentelemetry::Context::new(),
+            None,
+        )
+        .with_file_bloom_ver_lists(vers);
+
+        let logs_node = nodes.get_remote_node(&logs);
+        let p0 = logs_node.get_flight_search_request(0).search_info;
+        let p1 = logs_node.get_flight_search_request(1).search_info;
+        assert_eq!(
+            (p0.file_id_list, p0.file_bloom_ver_list),
+            (vec![1, 2], vec![10, 20])
+        );
+        assert_eq!(
+            (p1.file_id_list, p1.file_bloom_ver_list),
+            (vec![3], vec![30])
+        );
+
+        let traces_info = nodes
+            .get_remote_node(&traces)
+            .get_flight_search_request(1)
+            .search_info;
+        assert_eq!(traces_info.file_id_list, vec![8]);
+        assert!(traces_info.file_bloom_ver_list.is_empty());
     }
 }

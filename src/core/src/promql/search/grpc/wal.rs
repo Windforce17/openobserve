@@ -177,8 +177,9 @@ async fn get_wal_batches(
             enrich_mode: false,
         },
         search_infos: SearchInfos {
-            plan: Default::default(),         // set in RemoteScanNode
-            file_id_list: Default::default(), // not needed for wal
+            plan: Default::default(),                // set in RemoteScanNode
+            file_id_list: Default::default(),        // not needed for wal
+            file_bloom_ver_list: Default::default(), // not needed for wal
             start_time: time_range.0,
             end_time: time_range.1,
             timeout: cfg.limit.query_timeout,

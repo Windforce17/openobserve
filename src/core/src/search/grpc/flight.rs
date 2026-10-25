@@ -354,6 +354,19 @@ pub async fn search(
             &parquet_file_ids,
         )
         .await?;
+        let refreshed = refresh_cached_bloom_vers(
+            &mut file_list,
+            &req.search_info.file_id_list,
+            &req.search_info.file_bloom_ver_list,
+        );
+        if refreshed > 0 {
+            log::info!(
+                "[trace_id {trace_id}] flight->search in: part_id: {}, refreshed stale cached \
+                 bloom_ver on {refreshed} of {} files from the leader's file list",
+                req.query_identifier.partition,
+                file_list.len(),
+            );
+        }
         log::info!(
             "{}",
             search_inspector_fields(
@@ -1143,6 +1156,36 @@ fn optimizer_physical_plan(
     }
 
     Ok(plan)
+}
+
+/// Adopt the leader's `bloom_ver` for every hydrated file. `query_by_ids`
+/// serves rows from the id-keyed local file-list cache, which never observes
+/// later `bloom_ver` stamps (0 -> v) or restamps (consolidation, heal): a
+/// stale value makes bloom pruning skip the group `.bf` or probe a retired
+/// one. The leader read `bloom_ver` from the DB for this query, so its value
+/// is at least as fresh as the cache. `ids` and `bloom_vers` are the request's
+/// parallel lists; anything but an exact length match (e.g. an older leader
+/// sending none) leaves the cached values untouched. Returns how many changed.
+fn refresh_cached_bloom_vers(files: &mut [FileKey], ids: &[i64], bloom_vers: &[i64]) -> usize {
+    if bloom_vers.is_empty() || bloom_vers.len() != ids.len() {
+        return 0;
+    }
+    let current: HashMap<i64, i64> = ids
+        .iter()
+        .zip(bloom_vers)
+        .filter(|(_, ver)| **ver != infra::file_list::BLOOM_VER_UNKNOWN)
+        .map(|(id, ver)| (*id, *ver))
+        .collect();
+    let mut changed = 0;
+    for file in files.iter_mut() {
+        if let Some(&ver) = current.get(&file.id)
+            && file.meta.bloom_ver != ver
+        {
+            file.meta.bloom_ver = ver;
+            changed += 1;
+        }
+    }
+    changed
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2000,5 +2043,47 @@ mod tests {
                 "optimize mode mismatch for column_store_fields: {column_store_fields:?}"
             );
         }
+    }
+
+    fn cached_file(id: i64, bloom_ver: i64) -> FileKey {
+        let mut file = FileKey::new(
+            id,
+            String::new(),
+            format!("files/o/logs/s/2026/10/25/09/{id}.vix"),
+            FileMeta::default(),
+            false,
+        );
+        file.meta.bloom_ver = bloom_ver;
+        file
+    }
+
+    #[test]
+    fn refresh_cached_bloom_vers_adopts_the_leaders_current_versions() {
+        // 1: cached while pending, since stamped; 2: restamped by heal;
+        // 3: already current; 4: version unknown to the leader (dump row);
+        // 5: not listed (segment pseudo-file ids are negative and absent).
+        let mut files = vec![
+            cached_file(1, 0),
+            cached_file(2, 700),
+            cached_file(3, 800),
+            cached_file(4, 900),
+            cached_file(5, 0),
+        ];
+        let ids = [1, 2, 3, 4, -9];
+        let vers = [600, 800, 800, infra::file_list::BLOOM_VER_UNKNOWN, 42];
+        assert_eq!(refresh_cached_bloom_vers(&mut files, &ids, &vers), 2);
+        let got: Vec<i64> = files.iter().map(|f| f.meta.bloom_ver).collect();
+        assert_eq!(got, vec![600, 800, 800, 900, 0]);
+    }
+
+    #[test]
+    fn refresh_cached_bloom_vers_ignores_missing_or_misaligned_lists() {
+        let mut files = vec![cached_file(1, 0), cached_file(2, 700)];
+        // older leader: no list at all
+        assert_eq!(refresh_cached_bloom_vers(&mut files, &[1, 2], &[]), 0);
+        // misaligned: never pair an id with another file's version
+        assert_eq!(refresh_cached_bloom_vers(&mut files, &[1, 2], &[600]), 0);
+        let got: Vec<i64> = files.iter().map(|f| f.meta.bloom_ver).collect();
+        assert_eq!(got, vec![0, 700]);
     }
 }

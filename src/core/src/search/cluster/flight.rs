@@ -274,7 +274,10 @@ pub async fn search(trace_id: &str, sql: Arc<Sql>, mut req: Request) -> Result<S
         .inc();
 
     // 5. partition file list
+    let bloom_vers_by_id = bloom_vers_by_table(&file_id_list);
     let partitioned_file_lists = partition_file_lists(file_id_list, &nodes, role_group).await?;
+    let partitioned_bloom_vers = partition_bloom_vers(&partitioned_file_lists, &bloom_vers_by_id);
+    drop(bloom_vers_by_id);
     let mut need_ingesters = 0;
     let mut need_queriers = 0;
     for (i, node) in nodes.iter().enumerate() {
@@ -341,9 +344,16 @@ pub async fn search(trace_id: &str, sql: Arc<Sql>, mut req: Request) -> Result<S
     // bare JoinHandle would detach and burn the whole query to completion.
     let mut query_task = crate::service::search::utils::AbortOnDrop::new(
         DATAFUSION_RUNTIME.spawn(async move {
-            run_datafusion(trace_id_move, req, sql, nodes, partitioned_file_lists)
-                .instrument(datafusion_span)
-                .await
+            run_datafusion(
+                trace_id_move,
+                req,
+                sql,
+                nodes,
+                partitioned_file_lists,
+                partitioned_bloom_vers,
+            )
+            .instrument(datafusion_span)
+            .await
         }),
         trace_id.to_string(),
     );
@@ -423,6 +433,7 @@ pub async fn run_datafusion(
     sql: Arc<Sql>,
     nodes: Vec<Node>,
     partitioned_file_lists: HashMap<TableReference, Vec<Vec<i64>>>,
+    partitioned_bloom_vers: HashMap<TableReference, Vec<Vec<i64>>>,
 ) -> Result<(Vec<RecordBatch>, ScanStats, String)> {
     let cfg = get_config();
 
@@ -432,6 +443,7 @@ pub async fn run_datafusion(
         .add_context(PhysicalOptimizerContext::RemoteScan(RemoteScanContext {
             nodes: nodes.into_arc_vec(),
             partitioned_file_lists,
+            partitioned_bloom_vers,
             context: tracing::Span::current().context(),
             is_leader: false,
         }))
@@ -601,6 +613,53 @@ pub async fn partition_file_list(
         }
     }
     Ok(partition_file_list)
+}
+
+/// The DB `bloom_ver` this query read for every listed id, per table.
+/// Followers serve `FileKey`s from an id-keyed cache that never sees later
+/// stamps or restamps, so the leader ships these alongside the ids. Tables in
+/// which no row carries a version are omitted (nothing extra on the wire).
+fn bloom_vers_by_table(
+    file_id_lists: &HashMap<TableReference, Vec<FileId>>,
+) -> HashMap<TableReference, HashMap<i64, i64>> {
+    file_id_lists
+        .iter()
+        .filter_map(|(table, files)| {
+            let vers: HashMap<i64, i64> = files
+                .iter()
+                .filter_map(|f| f.bloom_ver.map(|v| (f.id, v)))
+                .collect();
+            (!vers.is_empty()).then(|| (table.clone(), vers))
+        })
+        .collect()
+}
+
+/// Lay `bloom_vers` out exactly like `partitioned` (same tables, partitions
+/// and id order) for `SearchInfo.file_bloom_ver_list`; ids without a known
+/// version map to [`infra::file_list::BLOOM_VER_UNKNOWN`].
+fn partition_bloom_vers(
+    partitioned: &HashMap<TableReference, Vec<Vec<i64>>>,
+    bloom_vers: &HashMap<TableReference, HashMap<i64, i64>>,
+) -> HashMap<TableReference, Vec<Vec<i64>>> {
+    partitioned
+        .iter()
+        .filter_map(|(table, partitions)| {
+            let vers = bloom_vers.get(table)?;
+            let lists = partitions
+                .iter()
+                .map(|ids| {
+                    ids.iter()
+                        .map(|id| {
+                            vers.get(id)
+                                .copied()
+                                .unwrap_or(infra::file_list::BLOOM_VER_UNKNOWN)
+                        })
+                        .collect()
+                })
+                .collect();
+            Some((table.clone(), lists))
+        })
+        .collect()
 }
 
 pub fn partition_file_by_nums(file_id_list: Vec<FileId>, querier_num: usize) -> Vec<Vec<i64>> {
@@ -817,6 +876,7 @@ mod tests {
             records: 10,
             original_size: size,
             deleted: false,
+            bloom_ver: None,
         }
     }
 
@@ -880,5 +940,47 @@ mod tests {
         // total = 400, avg = 200, so 2 files per partition
         let total_ids: Vec<i64> = parts.iter().flatten().cloned().collect();
         assert_eq!(total_ids.len(), 4);
+    }
+
+    #[test]
+    fn bloom_ver_lists_follow_the_file_partitioning() {
+        let logs = TableReference::from("logs");
+        let traces = TableReference::from("traces");
+        let mut file_id_lists = HashMap::new();
+        file_id_lists.insert(
+            logs.clone(),
+            (1..=5)
+                .map(|i| FileId {
+                    // id 4 comes from file_list_dump: version unknown
+                    bloom_ver: (i != 4).then_some(i * 100),
+                    ..make_file_id(i, 100)
+                })
+                .collect::<Vec<_>>(),
+        );
+        // no row carries a version: the table is omitted entirely
+        file_id_lists.insert(traces.clone(), vec![make_file_id(9, 100)]);
+        let by_table = bloom_vers_by_table(&file_id_lists);
+        assert!(!by_table.contains_key(&traces));
+
+        let mut partitioned = HashMap::new();
+        for (table, files) in file_id_lists {
+            partitioned.insert(table, partition_file_by_nums(files, 2));
+        }
+        let vers = partition_bloom_vers(&partitioned, &by_table);
+        assert!(!vers.contains_key(&traces));
+        let ids = &partitioned[&logs];
+        let logs_vers = &vers[&logs];
+        assert_eq!(logs_vers.len(), ids.len());
+        for (ids, vers) in ids.iter().zip(logs_vers) {
+            assert_eq!(ids.len(), vers.len());
+            for (id, ver) in ids.iter().zip(vers) {
+                let want = if *id == 4 {
+                    infra::file_list::BLOOM_VER_UNKNOWN
+                } else {
+                    id * 100
+                };
+                assert_eq!(*ver, want, "id {id}");
+            }
+        }
     }
 }

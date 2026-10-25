@@ -237,6 +237,7 @@ async fn run_datafusion(
         .add_context(PhysicalOptimizerContext::RemoteScan(RemoteScanContext {
             nodes,
             partitioned_file_lists: HashMap::new(),
+            partitioned_bloom_vers: HashMap::new(),
             context: tracing::Span::current().context(),
             is_leader: true,
         }))

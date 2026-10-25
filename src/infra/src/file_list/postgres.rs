@@ -1214,7 +1214,7 @@ ORDER BY date DESC, bloom_ver LIMIT $3;
                 .inc();
                 let max_ts_upper_bound = super::calculate_max_ts_upper_bound(time_end, stream_type);
                 let (date_from, date_to) = derive_date_range(time_start, time_end);
-                let query = "SELECT id, records, original_size FROM file_list WHERE stream = $1 AND max_ts >= $2 AND max_ts <= $3 AND min_ts < $4 AND date >= $5 AND date < $6;";
+                let query = "SELECT id, records, original_size, bloom_ver FROM file_list WHERE stream = $1 AND max_ts >= $2 AND max_ts <= $3 AND min_ts < $4 AND date >= $5 AND date < $6;";
                 sqlx::query_as::<_, super::FileId>(query)
                 .bind(stream_key)
                 .bind(time_start)
@@ -1286,7 +1286,7 @@ ORDER BY date DESC, bloom_ver LIMIT $3;
                 let max_ts_upper_bound =
                     super::calculate_max_ts_upper_bound(time_end, stream_type);
                 let (date_from, date_to) = derive_date_range(time_start, time_end);
-                let query = "SELECT id, file, records, original_size FROM file_list WHERE stream = $1 AND max_ts >= $2 AND max_ts <= $3 AND min_ts < $4 AND date >= $5 AND date < $6;";
+                let query = "SELECT id, file, records, original_size, bloom_ver FROM file_list WHERE stream = $1 AND max_ts >= $2 AND max_ts <= $3 AND min_ts < $4 AND date >= $5 AND date < $6;";
                 sqlx::query_as::<_, super::FileIdWithFile>(query)
                     .bind(stream_key)
                     .bind(time_start)

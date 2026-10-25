@@ -3428,6 +3428,12 @@ pub struct SearchInfo {
     pub sampling_config: ::core::option::Option<SamplingConfig>,
     #[prost(bool, tag = "11")]
     pub clear_cache: bool,
+    /// Parallel to file_id_list: the leader's current file_list.bloom_ver for
+    /// each id (i64::MIN = unknown, keep the cached value). Followers cache
+    /// FileKey rows by id and never see later bloom_ver stamps/restamps, so
+    /// they override the cached value with this one. Empty = not provided.
+    #[prost(int64, repeated, tag = "12")]
+    pub file_bloom_ver_list: ::prost::alloc::vec::Vec<i64>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct IndexInfo {

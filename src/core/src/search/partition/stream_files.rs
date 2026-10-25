@@ -119,6 +119,7 @@ pub async fn collect_stream_files(
                 records,
                 original_size: file_original_size,
                 deleted: false,
+                bloom_ver: None,
             });
         }
     }

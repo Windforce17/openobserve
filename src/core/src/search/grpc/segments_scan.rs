@@ -946,6 +946,7 @@ pub fn split_snapshot_file_ids(
             records: row.records,
             original_size: row.original_size,
             deleted: row.deleted,
+            bloom_ver: row.bloom_ver,
         });
     }
     coverage.compact();
@@ -1006,6 +1007,7 @@ fn pseudo_file_id(meta: &SegmentMeta) -> Result<FileId> {
         records: 0,
         original_size: meta.size,
         deleted: false,
+        bloom_ver: None,
     })
 }
 
@@ -4344,6 +4346,7 @@ mod tests {
                 records: 11,
                 original_size: 101,
                 deleted: false,
+                bloom_ver: None,
             },
             FileIdWithFile {
                 id: 101,
@@ -4351,6 +4354,7 @@ mod tests {
                 records: 12,
                 original_size: 102,
                 deleted: true,
+                bloom_ver: None,
             },
             FileIdWithFile {
                 id: 102,
@@ -4359,6 +4363,7 @@ mod tests {
                 records: 13,
                 original_size: 103,
                 deleted: false,
+                bloom_ver: None,
             },
         ];
         let (files, coverage) = split_snapshot_file_ids(snapshot, &candidates);
@@ -4447,6 +4452,7 @@ mod tests {
                 records: 5,
                 original_size: 100,
                 deleted: false,
+                bloom_ver: None,
             },
             pseudo_file_id(&seg_meta(3, 0, 10)).unwrap(),
             FileId {
@@ -4454,6 +4460,7 @@ mod tests {
                 records: 5,
                 original_size: 100,
                 deleted: false,
+                bloom_ver: None,
             },
             pseudo_file_id(&seg_meta(4, 0, 10)).unwrap(),
         ];

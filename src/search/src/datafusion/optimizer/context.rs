@@ -35,6 +35,9 @@ pub enum PhysicalOptimizerContext {
 pub struct RemoteScanContext {
     pub nodes: Vec<Arc<dyn NodeInfo>>,
     pub partitioned_file_lists: HashMap<TableReference, Vec<Vec<i64>>>,
+    /// The leader's current `bloom_ver` per id, partitioned exactly like
+    /// `partitioned_file_lists`; empty when unavailable.
+    pub partitioned_bloom_vers: HashMap<TableReference, Vec<Vec<i64>>>,
     pub context: opentelemetry::Context,
     pub is_leader: bool,
 }

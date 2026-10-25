@@ -1242,7 +1242,17 @@ pub struct FileId {
     pub original_size: i64,
     #[sqlx(default)]
     pub deleted: bool,
+    /// The row's current `bloom_ver` as read by `query_ids`. `None` when the
+    /// source does not carry it (file_list_dump, segment pseudo-files,
+    /// planner-built ids); followers then keep their cached value.
+    #[sqlx(default)]
+    pub bloom_ver: Option<i64>,
 }
+
+/// Wire value for "bloom_ver unknown" in `SearchInfo.file_bloom_ver_list`.
+/// Real values are `> 0` (a `.bf` version), `0` (pending) or small negative
+/// stamps (`-1` no bloom, `-2` unbuildable).
+pub const BLOOM_VER_UNKNOWN: i64 = i64::MIN;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, sqlx::FromRow)]
 pub struct FileIdWithFile {
@@ -1254,6 +1264,9 @@ pub struct FileIdWithFile {
     pub original_size: i64,
     #[sqlx(default)]
     pub deleted: bool,
+    /// See [`FileId::bloom_ver`].
+    #[sqlx(default)]
+    pub bloom_ver: Option<i64>,
 }
 
 #[cfg(test)]

@@ -263,6 +263,8 @@ pub async fn search(
     let search_infos = SearchInfos {
         plan: Default::default(),
         file_id_list: partition_file_lists.into(),
+        // Not provided on this path: followers keep their cached bloom_ver.
+        file_bloom_ver_list: Default::default(),
         start_time: req.time_range.as_ref().map(|x| x.0).unwrap_or(0),
         end_time: req.time_range.as_ref().map(|x| x.1).unwrap_or(0),
         timeout: req.timeout as u64,

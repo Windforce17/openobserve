@@ -147,6 +147,7 @@ fn record_batch_to_file_id(rb: RecordBatch) -> Vec<FileId> {
             records: records_col.value(idx),
             original_size: original_size_col.value(idx),
             deleted: false,
+            bloom_ver: None,
         };
         ret.push(t);
     }
@@ -169,6 +170,7 @@ fn record_batch_to_file_id_with_file(rb: RecordBatch) -> Vec<FileIdWithFile> {
             records: records_col.value(idx),
             original_size: original_size_col.value(idx),
             deleted: false,
+            bloom_ver: None,
         });
     }
     ret.par_sort_unstable_by_key(|f| f.id);
