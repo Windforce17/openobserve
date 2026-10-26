@@ -363,12 +363,22 @@ fn normalized_trace_key(key: &str) -> String {
     key
 }
 
-fn span_attribute_key(raw_key: String, service_att_map: &HashMap<String, json::Value>) -> String {
+/// The normalized keys of one resource's attribute map, for
+/// `span_attribute_key`. Kept in step with every insert into that map.
+fn normalized_resource_keys(service_att_map: &HashMap<String, json::Value>) -> HashSet<String> {
+    service_att_map
+        .keys()
+        .map(|key| normalized_trace_key(key))
+        .collect()
+}
+
+/// `normalized_resource_keys` holds the normalized form of every resource
+/// key, so a span attribute's collision check is one lookup instead of
+/// re-normalizing every resource key for every span attribute.
+fn span_attribute_key(raw_key: String, normalized_resource_keys: &HashSet<String>) -> String {
     let normalized_key = normalized_trace_key(&raw_key);
     let collides_with_reserved = RESERVED_SPAN_FIELDS.contains(&normalized_key.as_str());
-    let collides_with_resource = service_att_map
-        .keys()
-        .any(|service_key| normalized_trace_key(service_key) == normalized_key);
+    let collides_with_resource = normalized_resource_keys.contains(&normalized_key);
 
     if collides_with_reserved || collides_with_resource {
         format!("attr_{raw_key}")
@@ -386,6 +396,55 @@ fn resource_attribute_key(raw_key: String) -> String {
     } else {
         service_key
     }
+}
+
+/// The object `json::to_value(span)` returns, built without serializing:
+/// the span's strings and maps move into the object instead of being copied.
+/// Inserts follow `Span`'s serde field order with its `flatten` maps inlined,
+/// so a later key overwrites an earlier one exactly as serialization did
+/// (`test_span_into_record_matches_to_value`). Naming every field makes a new
+/// `Span` field a compile error here rather than a silently missing column.
+fn span_into_record(span: Span) -> json::Map<String, json::Value> {
+    let Span {
+        trace_id,
+        span_id,
+        flags,
+        span_status,
+        span_kind,
+        operation_name,
+        start_time,
+        end_time,
+        duration,
+        reference,
+        service_name,
+        attributes,
+        service,
+        events,
+        links,
+    } = span;
+    let mut record = json::Map::new();
+    record.insert("trace_id".to_string(), trace_id.into());
+    record.insert("span_id".to_string(), span_id.into());
+    record.insert("flags".to_string(), flags.into());
+    record.insert("span_status".to_string(), span_status.into());
+    record.insert("span_kind".to_string(), span_kind.into());
+    record.insert("operation_name".to_string(), operation_name.into());
+    record.insert("start_time".to_string(), start_time.into());
+    record.insert("end_time".to_string(), end_time.into());
+    record.insert("duration".to_string(), duration.into());
+    for (key, val) in reference {
+        record.insert(key, val.into());
+    }
+    record.insert("service_name".to_string(), service_name.into());
+    for (key, val) in attributes {
+        record.insert(key, val);
+    }
+    for (key, val) in service {
+        record.insert(key, val);
+    }
+    record.insert("events".to_string(), events.into());
+    record.insert("links".to_string(), links.into());
+    record
 }
 
 pub async fn otlp_proto(
@@ -579,6 +638,7 @@ pub async fn handle_otlp_request(
                 }
             }
         }
+        let mut resource_keys = normalized_resource_keys(&service_att_map);
         let inst_resources = res_span.scope_spans;
         for inst_span in inst_resources {
             let spans = inst_span.spans;
@@ -614,7 +674,7 @@ pub async fn handle_otlp_request(
                 let end_time: u64 = span.end_time_unix_nano;
                 let mut span_att_map: HashMap<String, json::Value> = HashMap::new();
                 for span_att in span.attributes {
-                    let key = span_attribute_key(span_att.key, &service_att_map);
+                    let key = span_attribute_key(span_att.key, &resource_keys);
                     span_att_map.insert(key, get_val(&span_att.value.as_ref()));
                 }
 
@@ -629,6 +689,7 @@ pub async fn handle_otlp_request(
                 {
                     service_name = val.clone();
                     service_att_map.insert(SERVICE_NAME.to_string(), json::json!(val));
+                    resource_keys.insert(normalized_trace_key(SERVICE_NAME));
                     service_name_explicitly_set = true;
                 }
 
@@ -739,28 +800,29 @@ pub async fn handle_otlp_request(
                     }
                 }
 
+                // Service graph processing is handled by periodic daemon
+                // No inline processing during trace ingestion
+
+                // the per-span values move in; only what the next spans of
+                // this resource still need is cloned
                 let local_val = Span {
                     trace_id: trace_id.clone(),
-                    span_id: span_id.clone(),
+                    span_id,
                     span_kind: span.kind.to_string(),
-                    span_status: get_span_status(span.status.clone()),
-                    operation_name: span.name.clone(),
+                    span_status: get_span_status(span.status),
+                    operation_name: span.name,
                     start_time,
                     end_time,
                     duration: (end_time - start_time) / 1000, // microseconds
-                    reference: span_ref.clone(),
+                    reference: span_ref,
                     service_name: service_name.clone(),
-                    attributes: span_att_map.clone(),
+                    attributes: span_att_map,
                     service: service_att_map.clone(),
                     flags: 1, // TODO add appropriate value
                     events: json::to_string(&events).unwrap(),
                     links: json::to_string(&links).unwrap(),
                 };
-
-                // Service graph processing is handled by periodic daemon
-                // No inline processing during trace ingestion
-
-                let mut value: json::Value = json::to_value(local_val).unwrap();
+                let mut value = json::Value::Object(span_into_record(local_val));
                 // add timestamp
                 value.as_object_mut().unwrap().insert(
                     TIMESTAMP_COL_NAME.to_string(),
@@ -2623,7 +2685,10 @@ mod tests {
         let mut service_att_map: HashMap<String, json::Value> = HashMap::new();
         service_att_map.insert(super::SERVICE_NAME.to_string(), json!("serviceA"));
 
-        let key = super::span_attribute_key("service_name".to_string(), &service_att_map);
+        let key = super::span_attribute_key(
+            "service_name".to_string(),
+            &super::normalized_resource_keys(&service_att_map),
+        );
 
         assert_eq!(key, "attr_service_name");
     }
@@ -2638,14 +2703,20 @@ mod tests {
         // are DISTINCT fields now, so there is no collision to avoid
         let mut service_att_map: HashMap<String, json::Value> = HashMap::new();
         service_att_map.insert("service.version".to_string(), json!("1.0.0"));
-        let key = super::span_attribute_key("service_version".to_string(), &service_att_map);
+        let key = super::span_attribute_key(
+            "service_version".to_string(),
+            &super::normalized_resource_keys(&service_att_map),
+        );
         assert_eq!(key, "service_version");
 
         // keys that still normalize to the same field keep the guard
         // (`-` degrades to `_` in every mode)
         let mut service_att_map: HashMap<String, json::Value> = HashMap::new();
         service_att_map.insert("service-version".to_string(), json!("1.0.0"));
-        let key = super::span_attribute_key("service_version".to_string(), &service_att_map);
+        let key = super::span_attribute_key(
+            "service_version".to_string(),
+            &super::normalized_resource_keys(&service_att_map),
+        );
         assert_eq!(key, "attr_service_version");
     }
 
@@ -2653,7 +2724,10 @@ mod tests {
     fn test_span_attribute_key_allows_non_colliding_attributes() {
         let service_att_map = std::collections::HashMap::new();
 
-        let key = super::span_attribute_key("http.method".to_string(), &service_att_map);
+        let key = super::span_attribute_key(
+            "http.method".to_string(),
+            &super::normalized_resource_keys(&service_att_map),
+        );
 
         assert_eq!(key, "http.method");
     }
@@ -2675,7 +2749,10 @@ mod tests {
 
         let mut span_att_map: HashMap<String, json::Value> = HashMap::new();
         span_att_map.insert(
-            super::span_attribute_key("service_name".to_string(), &service_att_map),
+            super::span_attribute_key(
+                "service_name".to_string(),
+                &super::normalized_resource_keys(&service_att_map),
+            ),
             json!("my.service3"),
         );
 
@@ -2888,5 +2965,115 @@ mod tests {
             json!("response"),
         );
         assert!(super::detect_llm_stream(|k| map.contains_key(k)));
+    }
+
+    /// `span_into_record` replaced `json::to_value(span)` on the ingest path:
+    /// the objects must be equal, including which value wins when a struct
+    /// field and a flattened map entry share a key.
+    #[test]
+    fn test_span_into_record_matches_to_value() {
+        use std::collections::HashMap;
+
+        use crate::common::meta::traces::Span;
+
+        let colliding = Span {
+            trace_id: "trace".to_string(),
+            span_id: "span".to_string(),
+            flags: 1,
+            span_status: "OK".to_string(),
+            span_kind: "2".to_string(),
+            operation_name: "op".to_string(),
+            start_time: 1_700_000_000_000_000_000,
+            end_time: u64::MAX,
+            duration: 42,
+            reference: HashMap::from([
+                ("ref_type".to_string(), "ChildOf".to_string()),
+                ("span_id".to_string(), "from_reference".to_string()),
+            ]),
+            service_name: "svc".to_string(),
+            attributes: HashMap::from([
+                ("http.status_code".to_string(), json!(200)),
+                ("ratio".to_string(), json!(0.25)),
+                ("big".to_string(), json!(u64::MAX)),
+                ("nested".to_string(), json!({"a": [1, "b", null]})),
+                ("service_name".to_string(), json!("from_attributes")),
+                ("duration".to_string(), json!("from_attributes")),
+                ("shared".to_string(), json!("from_attributes")),
+            ]),
+            service: HashMap::from([
+                ("service_service.version".to_string(), json!("1.2.3")),
+                ("shared".to_string(), json!("from_service")),
+                ("events".to_string(), json!(["from_service"])),
+                ("trace_id".to_string(), json!("from_service")),
+            ]),
+            events: "[{\"name\":\"e\"}]".to_string(),
+            links: "[]".to_string(),
+        };
+        let empty_maps = Span {
+            reference: HashMap::new(),
+            attributes: HashMap::new(),
+            service: HashMap::new(),
+            ..colliding.clone()
+        };
+        for span in [colliding, empty_maps] {
+            let expected = config::utils::json::to_value(span.clone()).unwrap();
+            assert_eq!(
+                config::utils::json::Value::Object(super::span_into_record(span)),
+                expected
+            );
+        }
+    }
+
+    /// The set lookup in `span_attribute_key` must rename exactly the keys
+    /// the former scan over every resource key renamed.
+    #[test]
+    fn test_span_attribute_key_matches_resource_scan() {
+        use std::collections::HashMap;
+
+        use config::utils::json;
+
+        fn scan_reference(raw_key: &str, service_att_map: &HashMap<String, json::Value>) -> String {
+            let normalized_key = super::normalized_trace_key(raw_key);
+            let collides = super::RESERVED_SPAN_FIELDS.contains(&normalized_key.as_str())
+                || service_att_map
+                    .keys()
+                    .any(|service_key| super::normalized_trace_key(service_key) == normalized_key);
+            if collides {
+                format!("attr_{raw_key}")
+            } else {
+                raw_key.to_string()
+            }
+        }
+
+        let mut service_att_map: HashMap<String, json::Value> = HashMap::new();
+        for key in [
+            "service.name",
+            "service_host.name",
+            "Service_K8s.Pod-Name",
+            "service_attr_trace_id",
+            "Mixed Case Key",
+        ] {
+            service_att_map.insert(key.to_string(), json!("v"));
+        }
+        let resource_keys = super::normalized_resource_keys(&service_att_map);
+        for raw_key in [
+            "service.name",
+            "SERVICE.NAME",
+            "service_host.name",
+            "service_k8s.pod_name",
+            "service_k8s.pod-name",
+            "mixed case key",
+            "mixed_case_key",
+            "trace_id",
+            "_timestamp",
+            "http.method",
+            "",
+        ] {
+            assert_eq!(
+                super::span_attribute_key(raw_key.to_string(), &resource_keys),
+                scan_reference(raw_key, &service_att_map),
+                "raw key {raw_key:?}"
+            );
+        }
     }
 }
