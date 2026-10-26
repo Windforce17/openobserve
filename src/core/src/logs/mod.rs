@@ -382,16 +382,13 @@ fn parse_bulk_index(v: &Value) -> Option<(&str, &str, Option<&str>)> {
     None
 }
 
-pub fn cast_to_type(
-    value: &mut Map<String, Value>,
-    delta: Vec<Field>,
-) -> Result<(), anyhow::Error> {
+pub fn cast_to_type(value: &mut Map<String, Value>, delta: &[Field]) -> Result<(), anyhow::Error> {
     let mut parse_error = String::new();
     for field in delta {
-        let field_name = field.name().clone();
-        let Some(val) = value.get(&field_name) else {
+        let Some(val) = value.get(field.name()) else {
             continue;
         };
+        let field_name = field.name().clone();
         if val.is_null() {
             value.insert(field_name, Value::Null);
             continue;
@@ -416,7 +413,7 @@ pub fn cast_to_type(
                     Ok(val) => {
                         value.insert(field_name, Value::Number(val.into()));
                     }
-                    Err(_) => set_parsing_error(&mut parse_error, &field),
+                    Err(_) => set_parsing_error(&mut parse_error, field),
                 };
             }
             DataType::UInt64 | DataType::UInt32 | DataType::UInt16 | DataType::UInt8 => {
@@ -432,7 +429,7 @@ pub fn cast_to_type(
                     Ok(val) => {
                         value.insert(field_name, Value::Number(val.into()));
                     }
-                    Err(_) => set_parsing_error(&mut parse_error, &field),
+                    Err(_) => set_parsing_error(&mut parse_error, field),
                 };
             }
             DataType::Float64 | DataType::Float32 | DataType::Float16 => {
@@ -451,7 +448,7 @@ pub fn cast_to_type(
                             Value::Number(serde_json::Number::from_f64(val).unwrap()),
                         );
                     }
-                    Err(_) => set_parsing_error(&mut parse_error, &field),
+                    Err(_) => set_parsing_error(&mut parse_error, field),
                 };
             }
             DataType::Boolean => {
@@ -467,10 +464,10 @@ pub fn cast_to_type(
                     Ok(val) => {
                         value.insert(field_name, Value::Bool(val));
                     }
-                    Err(_) => set_parsing_error(&mut parse_error, &field),
+                    Err(_) => set_parsing_error(&mut parse_error, field),
                 };
             }
-            _ => set_parsing_error(&mut parse_error, &field),
+            _ => set_parsing_error(&mut parse_error, field),
         };
     }
     if !parse_error.is_empty() {
@@ -792,6 +789,22 @@ async fn write_logs(
     let mut pending = PendingRecords::new(status);
     let mut canonical_summary = CanonicalizationSummary::default();
 
+    // The cast set depends only on this batch's schema evolution, so it is
+    // chosen once here instead of cloning the delta fields for every record.
+    // After a schema change only `zo_cast` fields are cast; an empty set
+    // casts nothing, as skipping the cast did.
+    let cast_delta: Option<Vec<Field>> = schema_evolution.types_delta.as_ref().map(|delta| {
+        if !schema_evolution.is_schema_changed {
+            delta.clone()
+        } else {
+            delta
+                .iter()
+                .filter(|x| x.metadata().contains_key("zo_cast"))
+                .cloned()
+                .collect()
+        }
+    });
+
     for (timestamp, mut record_val) in json_data {
         if cfg.common.ingest_canonical_schema {
             canonicalize_record_into(
@@ -821,27 +834,9 @@ async fn write_logs(
 
         // validate record
         if !cfg.common.ingest_canonical_schema
-            && let Some(delta) = schema_evolution.types_delta.as_ref()
+            && let Some(delta) = cast_delta.as_deref()
         {
-            let ret_val = if !schema_evolution.is_schema_changed {
-                cast_to_type(&mut record_val, delta.to_owned())
-            } else {
-                let local_delta = delta
-                    .iter()
-                    .filter_map(|x| {
-                        if x.metadata().contains_key("zo_cast") {
-                            Some(x.to_owned())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                if !local_delta.is_empty() {
-                    cast_to_type(&mut record_val, local_delta)
-                } else {
-                    Ok(())
-                }
-            };
+            let ret_val = cast_to_type(&mut record_val, delta);
             if let Err(e) = ret_val {
                 // update status(fail)
                 report_record_failure(
@@ -1459,7 +1454,7 @@ mod tests {
         let mut local_val = Map::new();
         local_val.insert("test".to_string(), Value::from("test13212"));
         let delta = vec![Field::new("test", DataType::Utf8, true)];
-        let ret_val = cast_to_type(&mut local_val, delta);
+        let ret_val = cast_to_type(&mut local_val, &delta);
         assert!(ret_val.is_ok());
     }
 
