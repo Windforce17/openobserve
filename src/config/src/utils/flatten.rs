@@ -40,7 +40,7 @@ pub fn flatten(to_flatten: Value) -> Result<Value, anyhow::Error> {
 /// object would result in two or more keys colliding.
 pub fn flatten_with_level(to_flatten: Value, max_level: u32) -> Result<Value, anyhow::Error> {
     // quick check to see if we have an object`
-    let to_flatten = match to_flatten {
+    let (to_flatten, top_level_len) = match to_flatten {
         Value::Object(v) => {
             if v.is_empty() || !v.iter().any(|(_k, v)| v.is_object() || v.is_array()) {
                 if v.iter().all(|(k, _v)| check_key(k)) {
@@ -53,15 +53,21 @@ pub fn flatten_with_level(to_flatten: Value, max_level: u32) -> Result<Value, an
                 }
                 return Ok(Value::Object(formatted_map));
             }
-            Value::Object(v)
+            let len = v.len();
+            (Value::Object(v), len)
         }
         _ => {
             return Err(anyhow::anyhow!("flatten value must be an object"));
         }
     };
 
-    let mut flat = Map::<String, Value>::new();
-    flatten_value(to_flatten, "".to_owned(), max_level, 0, &mut flat).map(|_x| Value::Object(flat))
+    // Collected first and built into the map once: `Map` is a BTreeMap, and
+    // one sorted bulk build is cheaper than an insert (a key search plus node
+    // splits) per leaf. `from_iter` keeps the last of equal keys, which is
+    // what inserting them in this order kept.
+    let mut flat = Vec::<(String, Value)>::with_capacity(top_level_len);
+    flatten_value(to_flatten, "".to_owned(), max_level, 0, &mut flat)
+        .map(|_x| Value::Object(flat.into_iter().collect()))
 }
 
 /// Flattens the passed JSON value (`current`), whose path is `parent_key` and
@@ -72,7 +78,7 @@ fn flatten_value(
     parent_key: String,
     max_level: u32,
     depth: u32,
-    flattened: &mut Map<String, Value>,
+    flattened: &mut Vec<(String, Value)>,
 ) -> Result<(), anyhow::Error> {
     match current {
         Value::Object(map) => {
@@ -85,7 +91,7 @@ fn flatten_value(
             // we don't need to store null values
         }
         _ => {
-            flattened.insert(parent_key, current);
+            flattened.push((parent_key, current));
         }
     }
     Ok(())
@@ -99,7 +105,7 @@ fn flatten_object(
     parent_key: &str,
     max_level: u32,
     depth: u32,
-    flattened: &mut Map<String, Value>,
+    flattened: &mut Vec<(String, Value)>,
 ) -> Result<(), anyhow::Error> {
     if current.is_empty() {
         return Ok(());
@@ -123,7 +129,13 @@ fn flatten_object(
         } else {
             format_key(&mut k);
             if depth > 0 {
-                format!("{parent_key}{KEY_SEPARATOR_DOT}{k}")
+                // the `format!` machinery costs more than the copy itself
+                let mut key =
+                    String::with_capacity(parent_key.len() + KEY_SEPARATOR_DOT.len() + k.len());
+                key.push_str(parent_key);
+                key.push_str(KEY_SEPARATOR_DOT);
+                key.push_str(&k);
+                key
             } else {
                 k
             }
@@ -141,12 +153,12 @@ fn flatten_array(
     parent_key: &str,
     max_level: u32,
     depth: u32,
-    flattened: &mut Map<String, Value>,
+    flattened: &mut Vec<(String, Value)>,
 ) -> Result<(), anyhow::Error> {
     if current.is_empty() {
         return Ok(());
     }
-    let v = Value::String(Value::Array(current.to_vec()).to_string());
+    let v = Value::String(Value::Array(current).to_string());
     flatten_value(v, parent_key.to_string(), max_level, depth, flattened)?;
     Ok(())
 }
@@ -806,5 +818,191 @@ mod tests {
         // the dotted canon untouched
         let input = json!({"log": "a", "service.name": "api", "trace.flags": 1});
         assert_eq!(flatten_and_canonicalize(input.clone()), input);
+    }
+
+    /// The flatten implementation before the bulk-build change, kept as the
+    /// oracle for `test_flatten_matches_reference`.
+    mod reference {
+        use serde_json::value::{Map, Value};
+
+        use super::super::{KEY_SEPARATOR_DOT, TOKEN_NUMBER, check_key, format_key};
+
+        pub fn flatten_with_level(
+            to_flatten: Value,
+            max_level: u32,
+        ) -> Result<Value, anyhow::Error> {
+            let to_flatten = match to_flatten {
+                Value::Object(v) => {
+                    if v.is_empty() || !v.iter().any(|(_k, v)| v.is_object() || v.is_array()) {
+                        if v.iter().all(|(k, _v)| check_key(k)) {
+                            return Ok(Value::Object(v));
+                        }
+                        let mut formatted_map = Map::<String, Value>::with_capacity(v.len());
+                        for (mut k, v) in v.into_iter() {
+                            format_key(&mut k);
+                            formatted_map.insert(k, v);
+                        }
+                        return Ok(Value::Object(formatted_map));
+                    }
+                    Value::Object(v)
+                }
+                _ => return Err(anyhow::anyhow!("flatten value must be an object")),
+            };
+            let mut flat = Map::<String, Value>::new();
+            flatten_value(to_flatten, "".to_owned(), max_level, 0, &mut flat)
+                .map(|_x| Value::Object(flat))
+        }
+
+        fn flatten_value(
+            current: Value,
+            parent_key: String,
+            max_level: u32,
+            depth: u32,
+            flattened: &mut Map<String, Value>,
+        ) -> Result<(), anyhow::Error> {
+            match current {
+                Value::Object(map) => {
+                    flatten_object(map, &parent_key, max_level, depth, flattened)?
+                }
+                Value::Array(arr) => {
+                    if !arr.is_empty() {
+                        let v = Value::String(Value::Array(arr.to_vec()).to_string());
+                        flatten_value(v, parent_key, max_level, depth, flattened)?;
+                    }
+                }
+                Value::Null => {}
+                _ => {
+                    flattened.insert(parent_key, current);
+                }
+            }
+            Ok(())
+        }
+
+        fn flatten_object(
+            current: Map<String, Value>,
+            parent_key: &str,
+            max_level: u32,
+            depth: u32,
+            flattened: &mut Map<String, Value>,
+        ) -> Result<(), anyhow::Error> {
+            if current.is_empty() {
+                return Ok(());
+            }
+            if max_level > 0 && depth >= max_level {
+                let v = Value::String(Value::Object(current).to_string());
+                flatten_value(v, parent_key.to_string(), max_level, depth, flattened)?;
+                return Ok(());
+            }
+            for (mut k, mut v) in current.into_iter() {
+                let parent_key = if k == TOKEN_NUMBER {
+                    v = if let Some(Some(n)) = v.as_str().and_then(|v| {
+                        v.parse::<f64>()
+                            .ok()
+                            .map(crate::utils::json::Number::from_f64)
+                    }) {
+                        Value::Number(n)
+                    } else {
+                        Value::Null
+                    };
+                    parent_key.to_string()
+                } else {
+                    format_key(&mut k);
+                    if depth > 0 {
+                        format!("{parent_key}{KEY_SEPARATOR_DOT}{k}")
+                    } else {
+                        k
+                    }
+                };
+                flatten_value(v, parent_key, max_level, depth + 1, flattened)?;
+            }
+            Ok(())
+        }
+    }
+
+    /// Deterministic generator for `test_flatten_matches_reference`.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 33) % n
+        }
+    }
+
+    /// Keys that collide after `format_key` or after joining nested paths.
+    const KEY_POOL: [&str; 14] = [
+        "a",
+        "A",
+        "a.b",
+        "a_b",
+        "b",
+        "B c",
+        "b-c",
+        "x.y.z",
+        "ß",
+        "Ünï",
+        "",
+        " ",
+        "_id",
+        TOKEN_NUMBER,
+    ];
+
+    fn random_value(rng: &mut Lcg, depth: u32) -> Value {
+        let kinds = if depth >= 4 { 6 } else { 8 };
+        match rng.below(kinds) {
+            0 => Value::Null,
+            1 => json!(rng.below(2) == 0),
+            2 => json!(rng.below(1_000_000) as i64 - 500_000),
+            3 => json!(rng.below(1000) as f64 / 7.0),
+            4 => json!(["1.5", "x", "-3e2", "", "\"q\\"][rng.below(5) as usize]),
+            5 => Value::Number(
+                serde_json::from_str::<serde_json::Number>("123456789012345678901234567890")
+                    .unwrap(),
+            ),
+            6 => Value::Array(
+                (0..rng.below(4))
+                    .map(|_| random_value(rng, depth + 1))
+                    .collect(),
+            ),
+            _ => random_object(rng, depth + 1),
+        }
+    }
+
+    fn random_object(rng: &mut Lcg, depth: u32) -> Value {
+        let mut map = Map::new();
+        for _ in 0..rng.below(7) {
+            let key = KEY_POOL[rng.below(KEY_POOL.len() as u64) as usize].to_string();
+            map.insert(key, random_value(rng, depth));
+        }
+        Value::Object(map)
+    }
+
+    /// The bulk-built map must equal the insert-built one for every input,
+    /// including keys that collide and nesting cut off by `max_level`.
+    #[test]
+    fn test_flatten_matches_reference() {
+        let fixed = [
+            json!({"a.b": 1, "a": {"b": 2}}),
+            json!({"a": {"b": 2}, "a_b": 3, "A": {"B": 4}}),
+            json!({"A": 1, "a": 2, "n": {"x": 1}}),
+            json!({"x": {TOKEN_NUMBER: "1.5"}, "y": {TOKEN_NUMBER: "nan?"}}),
+            json!({"a": {"b": {"c": {"d": 1}}}, "e": [1, {"f": 2}], "g": []}),
+            json!({"a": null, "b": {"c": null}, "d": {}}),
+            json!({"Key With Space": {"Inner-Key": "v", "inner_key": "w"}}),
+        ];
+        let mut rng = Lcg(7);
+        let generated = (0..3000).map(|_| random_object(&mut rng, 0));
+        for (i, input) in fixed.into_iter().chain(generated).enumerate() {
+            for max_level in [0, 1, 2, 3] {
+                let expected = reference::flatten_with_level(input.clone(), max_level)
+                    .map_err(|e| e.to_string());
+                let actual =
+                    flatten_with_level(input.clone(), max_level).map_err(|e| e.to_string());
+                assert_eq!(actual, expected, "input #{i} {input} max_level {max_level}");
+            }
+        }
     }
 }

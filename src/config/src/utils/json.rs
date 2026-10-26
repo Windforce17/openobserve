@@ -131,7 +131,7 @@ pub fn estimate_json_bytes(val: &Value) -> usize {
             size += s.len() + 2 + quote_count + slash_count;
         }
         Value::Number(n) => {
-            size += n.to_string().len();
+            size += display_len(n);
         }
         Value::Bool(b) => {
             // true for 4 bytes, false for 5 bytes
@@ -142,6 +142,24 @@ pub fn estimate_json_bytes(val: &Value) -> usize {
         }
     }
     size
+}
+
+/// `value.to_string().len()` without building the string: estimate_json_bytes
+/// runs over every number of every ingested record.
+fn display_len(value: &impl std::fmt::Display) -> usize {
+    struct LenCounter(usize);
+    impl std::fmt::Write for LenCounter {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            self.0 += s.len();
+            Ok(())
+        }
+    }
+    let mut counter = LenCounter(0);
+    // the counter never fails, so only a broken Display impl could error
+    if std::fmt::write(&mut counter, format_args!("{value}")).is_err() {
+        return value.to_string().len();
+    }
+    counter.0
 }
 
 /// NOTE: caller should check if the path == '.', because if so,
@@ -569,5 +587,50 @@ mod tests {
             estimate_json_bytes(&with_special),
             estimate_json_bytes(&without_special)
         );
+    }
+
+    /// `estimate_json_bytes` counts a number's length without building its
+    /// string: the count must equal `to_string().len()` for every number form
+    /// (the workspace parses numbers with `arbitrary_precision`).
+    #[test]
+    fn test_number_display_len_matches_to_string() {
+        let parsed = [
+            "0",
+            "-0",
+            "7",
+            "-42",
+            "1e10",
+            "1E+2",
+            "-1.5e-7",
+            "3.14159",
+            "0.1",
+            "1.0",
+            "18446744073709551615",
+            "-9223372036854775808",
+            "123456789012345678901234567890",
+            "1.7976931348623157e308",
+        ];
+        let mut numbers: Vec<Number> = parsed
+            .iter()
+            .map(|s| from_str::<Number>(s).unwrap_or_else(|e| panic!("parse {s}: {e}")))
+            .collect();
+        numbers.extend([
+            Number::from(u64::MAX),
+            Number::from(i64::MIN),
+            Number::from(0u8),
+        ]);
+        numbers.extend(
+            [0.1, -2.5e-300, 1e21, f64::MAX, f64::MIN_POSITIVE]
+                .into_iter()
+                .filter_map(Number::from_f64),
+        );
+        for n in numbers {
+            assert_eq!(display_len(&n), n.to_string().len(), "number {n}");
+            assert_eq!(
+                estimate_json_bytes(&Value::Number(n.clone())),
+                n.to_string().len(),
+                "number {n}"
+            );
+        }
     }
 }
