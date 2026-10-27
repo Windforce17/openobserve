@@ -105,18 +105,30 @@ pub async fn create_channel(grpc_addr: &str) -> Result<Channel, tonic::Status> {
             Status::internal("tls gRPC node error".to_string())
         })?;
     }
-    let channel = channel
+    let mut channel = channel
         .initial_stream_window_size(config::GRPC_HTTP2_STREAM_WINDOW_SIZE)
         .initial_connection_window_size(config::GRPC_HTTP2_CONNECTION_WINDOW_SIZE)
         .http2_adaptive_window(cfg.grpc.http2_adaptive_window)
         .tcp_nodelay(true)
-        .connect_timeout(std::time::Duration::from_secs(cfg.grpc.connect_timeout))
-        .connect()
-        .await
-        .map_err(|err| {
-            log::error!("gRPC node: {}, connect err: {:?}", grpc_addr, err);
-            Status::internal("connect to gRPC node error".to_string())
-        })?;
+        .connect_timeout(std::time::Duration::from_secs(cfg.grpc.connect_timeout));
+    // Without keepalive a peer that vanished (spot reclaim, frozen process, blackholed IP) is
+    // never noticed: TCP gives no signal, so every call multiplexed on the cached connection
+    // waits until its caller gives up. PINGs also run while idle, so a stale cached connection
+    // is torn down before the next query picks it up.
+    if cfg.grpc.client_keepalive_interval > 0 {
+        channel = channel
+            .http2_keep_alive_interval(std::time::Duration::from_secs(
+                cfg.grpc.client_keepalive_interval,
+            ))
+            .keep_alive_timeout(std::time::Duration::from_secs(
+                cfg.grpc.client_keepalive_timeout.max(1),
+            ))
+            .keep_alive_while_idle(true);
+    }
+    let channel = channel.connect().await.map_err(|err| {
+        log::error!("gRPC node: {}, connect err: {:?}", grpc_addr, err);
+        Status::internal("connect to gRPC node error".to_string())
+    })?;
     Ok(channel)
 }
 

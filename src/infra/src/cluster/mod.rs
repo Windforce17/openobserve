@@ -403,88 +403,131 @@ pub async fn watch_node_list() -> Result<()> {
     Ok(())
 }
 
+/// Upper bound on concurrent `/healthz` probes in one round. A dead node costs a full
+/// `ZO_HEALTH_CHECK_TIMEOUT`; probing sequentially made one dead node delay the check of every
+/// node behind it, and a few dead nodes stretched one round past the heartbeat period.
+const HEALTH_CHECK_CONCURRENCY: usize = 16;
+
 pub async fn check_nodes_status(client: &reqwest::Client) -> Result<()> {
     let cfg = get_config();
     if !cfg.health_check.enabled {
         return Ok(());
     }
     let nodes = get_cached_online_nodes().await.unwrap_or_default();
-    for node in nodes {
-        if node.uuid.eq(LOCAL_NODE.uuid.as_str()) {
-            continue;
-        }
-        let url = format!("{}{}/healthz", node.http_addr, cfg.common.base_uri);
-        let resp = client
-            .get(url)
-            .timeout(Duration::from_secs(cfg.health_check.timeout))
-            .send()
-            .await;
-        if resp.is_err() || !resp.unwrap().status().is_success() {
-            log::error!(
-                "[CLUSTER] node {}[{}] health check failed",
-                node.name,
-                node.http_addr
-            );
-            let mut w = NODES_HEALTH_CHECK.write().await;
-            // Count failures even for nodes THIS observer never saw healthy.
-            // The old get_mut-or-continue guard made a dead node's entry
-            // UNEVICTABLE by every pod that booted after it died — after a
-            // full-fleet roll NO observer had seen the SIGKILLed old pods
-            // healthy, so their registrations lingered forever and every
-            // query fan-out kept dialing them (dev outage 2026-08-07,
-            // argocd-dev-ops #231: connect-refused 400s, then ~130s
-            // blackhole hangs once the pod IP was reused). A live node that
-            // is merely slow to serve /healthz self-heals: eviction only
-            // drops it from this observer's view, and its next keep-alive
-            // Put re-adds it.
-            let entry = w.entry(node.uuid.clone()).or_insert(0);
-            *entry += 1;
-            let times = *entry;
-            drop(w);
-
-            if times >= cfg.health_check.failed_times {
-                log::error!(
-                    "[CLUSTER] node {}[{}] health check failed {} times, remove it",
-                    node.name,
-                    node.http_addr,
-                    times
-                );
-                if node.is_interactive_querier() {
-                    remove_node_from_consistent_hash(
-                        &node,
-                        &Role::Querier,
-                        Some(RoleGroup::Interactive),
-                    )
-                    .await;
-                }
-                if node.is_background_querier() {
-                    remove_node_from_consistent_hash(
-                        &node,
-                        &Role::Querier,
-                        Some(RoleGroup::Background),
-                    )
-                    .await;
-                }
-                if node.is_compactor() {
-                    remove_node_from_consistent_hash(&node, &Role::Compactor, None).await;
-                }
-                if node.is_flatten_compactor() {
-                    remove_node_from_consistent_hash(&node, &Role::FlattenCompactor, None).await;
-                }
-                NODES.write().await.remove(&node.uuid);
-                NODES_HEALTH_CHECK.write().await.remove(&node.uuid);
+    let mut suspects = probe_nodes(client, nodes).await;
+    // Re-check failing nodes quickly instead of once per heartbeat period: a dead node is
+    // removed after about failed_times x (recheck_interval + timeout) instead of
+    // failed_times x (heartbeat_ttl / 2). Every round either resets or advances the failure
+    // count of every suspect, so this loop is bounded by failed_times rounds.
+    if cfg.health_check.recheck_interval > 0 {
+        for _ in 1..cfg.health_check.failed_times {
+            if suspects.is_empty() {
+                break;
             }
-        } else {
-            // first time the node is online, add it to the check map, or reset the check count
-            let mut w = NODES_HEALTH_CHECK.write().await;
-            let entry = w.entry(node.uuid.clone()).or_insert(0);
-            if *entry > 0 {
-                *entry = 0;
-            }
+            tokio::time::sleep(Duration::from_secs(cfg.health_check.recheck_interval)).await;
+            // The watcher may have dropped a suspect meanwhile (it deregistered itself).
+            let still_listed = {
+                let r = NODES.read().await;
+                suspects
+                    .into_iter()
+                    .filter(|node| r.contains_key(&node.uuid))
+                    .collect::<Vec<_>>()
+            };
+            suspects = probe_nodes(client, still_listed).await;
         }
     }
-
     Ok(())
+}
+
+/// Probes `nodes` concurrently, records every result, and returns the nodes that failed the
+/// probe but are still registered (not yet over `ZO_HEALTH_CHECK_FAILED_TIMES`).
+async fn probe_nodes(client: &reqwest::Client, nodes: Vec<Node>) -> Vec<Node> {
+    use futures::StreamExt;
+
+    let cfg = get_config();
+    let timeout = Duration::from_secs(cfg.health_check.timeout);
+    let probes = nodes
+        .into_iter()
+        .filter(|node| !node.uuid.eq(LOCAL_NODE.uuid.as_str()))
+        .map(|node| {
+            let url = format!("{}{}/healthz", node.http_addr, cfg.common.base_uri);
+            async move {
+                let healthy = matches!(
+                    client.get(url).timeout(timeout).send().await,
+                    Ok(resp) if resp.status().is_success()
+                );
+                (node, healthy)
+            }
+        });
+    let results: Vec<(Node, bool)> = futures::stream::iter(probes)
+        .buffer_unordered(HEALTH_CHECK_CONCURRENCY)
+        .collect()
+        .await;
+    let mut suspects = Vec::new();
+    for (node, healthy) in results {
+        if record_health_check(&node, healthy).await {
+            suspects.push(node);
+        }
+    }
+    suspects
+}
+
+/// Records one probe result. Returns true when the node failed and is still registered.
+async fn record_health_check(node: &Node, healthy: bool) -> bool {
+    if healthy {
+        // first time the node is online, add it to the check map, or reset the check count
+        let mut w = NODES_HEALTH_CHECK.write().await;
+        let entry = w.entry(node.uuid.clone()).or_insert(0);
+        if *entry > 0 {
+            *entry = 0;
+        }
+        return false;
+    }
+    log::error!(
+        "[CLUSTER] node {}[{}] health check failed",
+        node.name,
+        node.http_addr
+    );
+    let mut w = NODES_HEALTH_CHECK.write().await;
+    // Count failures even for nodes THIS observer never saw healthy.
+    // The old get_mut-or-continue guard made a dead node's entry
+    // UNEVICTABLE by every pod that booted after it died — after a
+    // full-fleet roll NO observer had seen the SIGKILLed old pods
+    // healthy, so their registrations lingered forever and every
+    // query fan-out kept dialing them (dev outage 2026-08-07,
+    // argocd-dev-ops #231: connect-refused 400s, then ~130s
+    // blackhole hangs once the pod IP was reused). A live node that
+    // is merely slow to serve /healthz self-heals: eviction only
+    // drops it from this observer's view, and its next keep-alive
+    // Put re-adds it.
+    let entry = w.entry(node.uuid.clone()).or_insert(0);
+    *entry += 1;
+    let times = *entry;
+    drop(w);
+    if times < get_config().health_check.failed_times {
+        return true;
+    }
+    log::error!(
+        "[CLUSTER] node {}[{}] health check failed {} times, remove it",
+        node.name,
+        node.http_addr,
+        times
+    );
+    if node.is_interactive_querier() {
+        remove_node_from_consistent_hash(node, &Role::Querier, Some(RoleGroup::Interactive)).await;
+    }
+    if node.is_background_querier() {
+        remove_node_from_consistent_hash(node, &Role::Querier, Some(RoleGroup::Background)).await;
+    }
+    if node.is_compactor() {
+        remove_node_from_consistent_hash(node, &Role::Compactor, None).await;
+    }
+    if node.is_flatten_compactor() {
+        remove_node_from_consistent_hash(node, &Role::FlattenCompactor, None).await;
+    }
+    NODES.write().await.remove(&node.uuid);
+    NODES_HEALTH_CHECK.write().await.remove(&node.uuid);
+    false
 }
 
 pub async fn get_cached_nodes(cond: fn(&Node) -> bool) -> Option<Vec<Node>> {
@@ -731,6 +774,70 @@ mod tests {
             "dead node must be evicted after {failed_times} failed sweeps"
         );
         NODES_HEALTH_CHECK.write().await.remove(uuid);
+    }
+
+    /// One sweep removes a dead node through quick re-checks, instead of waiting
+    /// `failed_times` heartbeat periods.
+    #[tokio::test]
+    async fn one_sweep_removes_a_dead_node_through_quick_rechecks() {
+        let uuid = "dead-node-quick-recheck";
+        let mut node = LOCAL_NODE.clone();
+        node.uuid = uuid.to_string();
+        node.name = "dead-node-quick-recheck".to_string();
+        node.http_addr = "http://127.0.0.1:1".to_string();
+        node.status = NodeStatus::Online;
+        NODES.write().await.insert(uuid.to_string(), node);
+        let client = reqwest::Client::new();
+        check_nodes_status(&client).await.unwrap();
+        assert!(
+            !NODES.read().await.contains_key(uuid),
+            "a dead node must be removed by a single sweep"
+        );
+        assert!(!NODES_HEALTH_CHECK.read().await.contains_key(uuid));
+    }
+
+    /// Probes of nodes that accept connections but never answer run concurrently: one
+    /// round costs about one timeout, not one timeout per node.
+    #[tokio::test]
+    async fn probes_of_unresponsive_nodes_run_concurrently() {
+        let mut nodes = Vec::new();
+        let mut holders = Vec::new();
+        for i in 0..4 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            // Accept and hold connections without answering, like a frozen process.
+            holders.push(tokio::spawn(async move {
+                let mut held = Vec::new();
+                while let Ok((socket, _)) = listener.accept().await {
+                    held.push(socket);
+                }
+            }));
+            let mut node = LOCAL_NODE.clone();
+            node.uuid = format!("unresponsive-node-{i}");
+            node.name = format!("unresponsive-node-{i}");
+            node.http_addr = format!("http://{addr}");
+            nodes.push(node);
+        }
+        let timeout = Duration::from_secs(get_config().health_check.timeout);
+        let started = std::time::Instant::now();
+        let suspects = probe_nodes(&reqwest::Client::new(), nodes).await;
+        let elapsed = started.elapsed();
+        for holder in holders {
+            holder.abort();
+        }
+        let mut w = NODES_HEALTH_CHECK.write().await;
+        for i in 0..4 {
+            w.remove(&format!("unresponsive-node-{i}"));
+        }
+        drop(w);
+        if get_config().health_check.failed_times > 1 {
+            assert_eq!(suspects.len(), 4, "every unresponsive node is a suspect");
+        }
+        assert!(elapsed >= timeout, "the probes waited for the timeout");
+        assert!(
+            elapsed < timeout * 2,
+            "probes must run concurrently, took {elapsed:?} for 4 nodes with a {timeout:?} timeout"
+        );
     }
 
     #[tokio::test]

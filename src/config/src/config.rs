@@ -947,6 +947,23 @@ pub struct Grpc {
     #[env_config(name = "ZO_GRPC_CHANNEL_CACHE_DISABLED", default = false)]
     pub channel_cache_disabled: bool,
     #[env_config(
+        name = "ZO_GRPC_CLIENT_KEEPALIVE_INTERVAL",
+        default = 10,
+        help = "Seconds between HTTP/2 keepalive PINGs on inter-node gRPC client connections, \
+                also while the connection is idle. A peer that does not acknowledge a PING \
+                within ZO_GRPC_CLIENT_KEEPALIVE_TIMEOUT is treated as dead: the connection \
+                is closed and its in-flight calls fail instead of hanging. 0 disables keepalive."
+    )]
+    pub client_keepalive_interval: u64,
+    #[env_config(
+        name = "ZO_GRPC_CLIENT_KEEPALIVE_TIMEOUT",
+        default = 10,
+        help = "Seconds to wait for a keepalive PING acknowledgement before the connection is \
+                closed. Keep it well above the worst runtime stall of a busy peer: closing the \
+                connection fails every call multiplexed on it."
+    )]
+    pub client_keepalive_timeout: u64,
+    #[env_config(
         name = "ZO_GRPC_HTTP2_ADAPTIVE_WINDOW",
         default = false,
         help = "Enable HTTP/2 adaptive (BDP-based) flow-control window growth for inter-node \
@@ -2512,6 +2529,31 @@ pub struct Limit {
         help = "Timeout for querier query, default equal to query_timeout"
     )]
     pub query_querier_timeout: u64,
+    #[env_config(
+        name = "ZO_QUERY_REDISPATCH_ENABLED",
+        default = true,
+        help = "Let the leader send a querier partition ONE more time to another querier when \
+                the first node fails at the transport level before returning data, or is a \
+                straggler (see ZO_QUERY_REDISPATCH_MIN_DELAY_MS). The first response wins and \
+                the other attempt is cancelled. Ingester and super-cluster partitions are \
+                never re-dispatched."
+    )]
+    pub query_redispatch_enabled: bool,
+    #[env_config(
+        name = "ZO_QUERY_REDISPATCH_MIN_DELAY_MS",
+        default = 2000,
+        help = "A querier partition is a straggler when at least half of the query's querier \
+                partitions have answered and it has run longer than max(this value, \
+                ZO_QUERY_REDISPATCH_STRAGGLER_FACTOR x their median answer time)."
+    )]
+    pub query_redispatch_min_delay_ms: u64,
+    #[env_config(
+        name = "ZO_QUERY_REDISPATCH_STRAGGLER_FACTOR",
+        default = 2.0,
+        help = "Multiple of the median answer time of the finished querier partitions after \
+                which a still-running partition is re-dispatched (values below 1 count as 1)."
+    )]
+    pub query_redispatch_straggler_factor: f64,
     #[env_config(name = "ZO_QUERY_DEFAULT_LIMIT", default = 1000)]
     pub query_default_limit: i64,
     #[env_config(name = "ZO_QUERY_VALUES_DEFAULT_NUM", default = 10)]
@@ -3762,6 +3804,15 @@ pub struct HealthCheck {
         help = "The node will be removed from consistent hash if health check failed exceed this times"
     )]
     pub failed_times: usize,
+    #[env_config(
+        name = "ZO_HEALTH_CHECK_RECHECK_INTERVAL",
+        default = 2,
+        help = "Seconds between quick re-checks of nodes whose last health check failed, until \
+                they answer again or are removed after ZO_HEALTH_CHECK_FAILED_TIMES failures. \
+                0 disables quick re-checks (failures are then counted once per heartbeat \
+                period only)."
+    )]
+    pub recheck_interval: u64,
 }
 
 #[derive(Serialize, EnvConfig, Default)]

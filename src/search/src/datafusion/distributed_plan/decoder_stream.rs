@@ -41,6 +41,10 @@ pub struct FlightDecoderStream {
     query_context: QueryContext,
     scan_stats: ScanStats,
     fetch_start: Option<std::time::Instant>,
+    /// Code of the error that ended the stream, if any. The leader uses it to tell a broken
+    /// connection (worth sending the partition to another node) from an error the follower
+    /// reported on purpose.
+    stream_error: Option<tonic::Code>,
 }
 
 impl FlightDecoderStream {
@@ -57,7 +61,14 @@ impl FlightDecoderStream {
             query_context,
             scan_stats: ScanStats::default(),
             fetch_start: None,
+            stream_error: None,
         }
+    }
+
+    /// The gRPC code of the error that ended this stream, or `None` if it ended cleanly or is
+    /// still running.
+    pub fn stream_error_code(&self) -> Option<tonic::Code> {
+        self.stream_error
     }
 
     pub fn process_custom_message(&mut self, message: CustomMessage) {
@@ -132,7 +143,9 @@ impl Stream for FlightDecoderStream {
                         self.query_context.is_querier,
                         self.query_context.start.elapsed().as_millis(),
                     );
-                    process_partial_err(self.query_context.partial_err.clone(), e.into());
+                    let status: tonic::Status = e.into();
+                    self.stream_error = Some(status.code());
+                    process_partial_err(self.query_context.partial_err.clone(), status);
                     poll = Poll::Ready(None);
                     break;
                 }
