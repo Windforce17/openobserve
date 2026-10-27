@@ -253,6 +253,23 @@ fn check_key(key: &str) -> bool {
 }
 
 fn check_key_with(key: &str, keep_dots: bool) -> bool {
+    // Runs for every flattened key. An ASCII byte passes the char rule below
+    // only if it is a-z, 0-9, '_' or (keep_dots) '.', so ASCII keys can be
+    // decided per byte without UTF-8 decoding. Any non-ASCII byte falls back
+    // to the char rule for the whole key.
+    for &b in key.as_bytes() {
+        if !b.is_ascii() {
+            return check_key_chars(key, keep_dots);
+        }
+        if !(b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || (keep_dots && b == b'.'))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn check_key_chars(key: &str, keep_dots: bool) -> bool {
     key.chars()
         .all(|c| c.is_lowercase() || c.is_numeric() || c == '_' || (keep_dots && c == '.'))
 }
@@ -1002,6 +1019,34 @@ mod tests {
                 let actual =
                     flatten_with_level(input.clone(), max_level).map_err(|e| e.to_string());
                 assert_eq!(actual, expected, "input #{i} {input} max_level {max_level}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_check_key_with_matches_char_rule() {
+        // ASCII classes, the dot, and non-ASCII letters/digits in both cases.
+        const ALPHABET: &[char] = &[
+            'a', 'z', 'q', 'A', 'Z', '0', '9', '_', '.', '-', ' ', '/', '@', '\u{7f}', 'é', 'É',
+            'ß', 'ж', 'Ж', '中', '٣', '²', 'ǅ', '🙂',
+        ];
+        let mut rng = Lcg(42);
+        let mut keys: Vec<String> = vec![String::new()];
+        for _ in 0..20_000 {
+            let len = rng.below(12) as usize;
+            keys.push(
+                (0..len)
+                    .map(|_| ALPHABET[rng.below(ALPHABET.len() as u64) as usize])
+                    .collect(),
+            );
+        }
+        for key in &keys {
+            for keep_dots in [true, false] {
+                assert_eq!(
+                    check_key_with(key, keep_dots),
+                    check_key_chars(key, keep_dots),
+                    "key {key:?} keep_dots {keep_dots}"
+                );
             }
         }
     }
