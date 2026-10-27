@@ -106,15 +106,15 @@ where
             }
             let data_type = match value {
                 Value::String(_) => DataType::Utf8,
-                Value::Number(v) if v.is_i64() => DataType::Int64,
-                Value::Number(v) if v.is_u64() => DataType::UInt64,
-                Value::Number(v) if v.is_f64() => DataType::Float64,
-                Value::Number(v) => {
-                    log::warn!(
-                        "stream: {stream_name}, first non-null number for field {key:?} is outside i64/u64/f64; pinning it as string: {v:?}"
-                    );
-                    DataType::Utf8
-                }
+                Value::Number(v) => match number_data_type(v) {
+                    Some(data_type) => data_type,
+                    None => {
+                        log::warn!(
+                            "stream: {stream_name}, first non-null number for field {key:?} is outside i64/u64/f64; pinning it as string: {v:?}"
+                        );
+                        DataType::Utf8
+                    }
+                },
                 Value::Bool(_) => DataType::Boolean,
                 _ => {
                     return Err(ArrowError::SchemaError(format!(
@@ -172,89 +172,127 @@ fn infer_json_schema_from_object(
     fields: &mut FxIndexMap<String, Field>,
     value: &Map<String, Value>,
 ) -> Result<(), ArrowError> {
+    // Records of one request usually repeat the key order of the first one,
+    // so the field right after the previous match is compared by name before
+    // falling back to a hash lookup. Either way the same entry is updated.
+    let mut next = 0;
     for (key, value) in value.iter() {
-        match value {
-            Value::String(_) => {
-                convert_data_type(fields, key, DataType::Utf8)?;
-            }
-            Value::Number(v) => {
-                if v.is_i64() {
-                    convert_data_type(fields, key, DataType::Int64)?;
-                } else if v.is_u64() {
-                    convert_data_type(fields, key, DataType::UInt64)?;
-                } else if v.is_f64() {
-                    convert_data_type(fields, key, DataType::Float64)?;
-                } else {
+        let data_type = match value {
+            Value::String(_) => DataType::Utf8,
+            Value::Number(v) => match number_data_type(v) {
+                Some(data_type) => data_type,
+                None => {
                     // For numbers that are too large to fit in i64/u64/f64,
                     // treat them as strings to preserve the data
                     log::warn!(
                         "stream: {stream_name}, Number value too large for standard numeric types, treating as string: {key:?} {v:?}"
                     );
-                    convert_data_type(fields, key, DataType::Utf8)?;
+                    DataType::Utf8
                 }
-            }
-            Value::Bool(_) => {
-                convert_data_type(fields, key, DataType::Boolean)?;
-            }
-            Value::Null => {}
+            },
+            Value::Bool(_) => DataType::Boolean,
+            Value::Null => continue,
             _ => {
                 return Err(ArrowError::SchemaError(
                     "Cannot infer schema from non-basic type value".to_string(),
                 ));
             }
-        }
+        };
+        let index = match fields.get_index(next) {
+            Some((name, _)) if name == key => Some(next),
+            _ => fields.get_index_of(key.as_str()),
+        };
+        next = match index {
+            Some(index) => {
+                merge_data_type(&mut fields[index], key, data_type)?;
+                index + 1
+            }
+            None => {
+                fields.insert(key.clone(), Field::new(key, data_type, true));
+                fields.len()
+            }
+        };
     }
     Ok(())
 }
 
-fn convert_data_type(
-    fields: &mut FxIndexMap<String, Field>,
-    key: &str,
-    data_type: DataType,
-) -> Result<(), ArrowError> {
-    let Some(f) = fields.get(key) else {
-        fields.insert(key.to_string(), Field::new(key, data_type, true));
-        return Ok(());
+/// The inferred type of a JSON number; `None` when it fits none of i64, u64
+/// and finite f64, which callers store as a string.
+///
+/// Equivalent to testing `is_i64()`, `is_u64()` and `is_f64()` in that order.
+/// With serde_json's `arbitrary_precision` every `Number` is its decimal text
+/// and each of those predicates parses it again, so classification dominated
+/// schema inference. The two shapes that dominate ingest are decided from the
+/// text alone: at most 18 digits always fit i64, and a plain decimal
+/// (`-?d+.d+`, no exponent) shorter than 300 bytes is never an integer and
+/// always parses to a finite f64. Every other text takes the parsing chain.
+pub(crate) fn number_data_type(number: &serde_json::Number) -> Option<DataType> {
+    let text = number.as_str();
+    let unsigned = text.strip_prefix('-').unwrap_or(text).as_bytes();
+    if !unsigned.is_empty() && unsigned.len() <= 18 && unsigned.iter().all(u8::is_ascii_digit) {
+        return Some(DataType::Int64);
+    }
+    if text.len() < 300 && is_plain_decimal(unsigned) {
+        return Some(DataType::Float64);
+    }
+    if number.is_i64() {
+        Some(DataType::Int64)
+    } else if number.is_u64() {
+        Some(DataType::UInt64)
+    } else if number.is_f64() {
+        Some(DataType::Float64)
+    } else {
+        None
+    }
+}
+
+/// `d+.d+` with ASCII digits only.
+fn is_plain_decimal(text: &[u8]) -> bool {
+    let Some(dot) = text.iter().position(|&b| b == b'.') else {
+        return false;
     };
-    let f_type = f.data_type();
+    let (integer, fraction) = (&text[..dot], &text[dot + 1..]);
+    !integer.is_empty()
+        && !fraction.is_empty()
+        && integer.iter().all(u8::is_ascii_digit)
+        && fraction.iter().all(u8::is_ascii_digit)
+}
+
+/// Widen an already inferred field for a new value type. The rules are the
+/// request-level merge: strings absorb everything, floats absorb integers and
+/// booleans, and a boolean yields to any other type.
+fn merge_data_type(field: &mut Field, key: &str, data_type: DataType) -> Result<(), ArrowError> {
+    let f_type = field.data_type();
     if f_type == &data_type {
         return Ok(());
     }
-    match (f_type, &data_type) {
-        (DataType::LargeUtf8, _) => {}
-        (DataType::Utf8, DataType::LargeUtf8) => {
-            fields.insert(key.to_string(), Field::new(key, data_type, true));
-        }
-        (DataType::Utf8, _) => {}
+    let widen = match (f_type, &data_type) {
+        (DataType::LargeUtf8, _) => false,
+        (DataType::Utf8, DataType::LargeUtf8) => true,
+        (DataType::Utf8, _) => false,
         (DataType::Float64, DataType::UInt64)
         | (DataType::Float64, DataType::Int64)
-        | (DataType::Float64, DataType::Boolean) => {}
+        | (DataType::Float64, DataType::Boolean) => false,
         (DataType::Int64, DataType::UInt64)
         | (DataType::Int64, DataType::Float64)
         | (DataType::Int64, DataType::Utf8)
-        | (DataType::Int64, DataType::LargeUtf8) => {
-            fields.insert(key.to_string(), Field::new(key, data_type, true));
-        }
+        | (DataType::Int64, DataType::LargeUtf8) => true,
         (DataType::UInt64, DataType::Int64)
         | (DataType::UInt64, DataType::Boolean)
-        | (DataType::Int64, DataType::Boolean) => {}
+        | (DataType::Int64, DataType::Boolean) => false,
         (DataType::UInt64, DataType::Float64)
         | (DataType::UInt64, DataType::Utf8)
-        | (DataType::UInt64, DataType::LargeUtf8) => {
-            fields.insert(key.to_string(), Field::new(key, data_type, true));
-        }
-        (DataType::Float64, DataType::Utf8) | (DataType::Float64, DataType::LargeUtf8) => {
-            fields.insert(key.to_string(), Field::new(key, data_type, true));
-        }
-
-        (DataType::Boolean, _) => {
-            fields.insert(key.to_string(), Field::new(key, data_type, true));
-        }
+        | (DataType::UInt64, DataType::LargeUtf8) => true,
+        (DataType::Float64, DataType::Utf8) | (DataType::Float64, DataType::LargeUtf8) => true,
+        (DataType::Boolean, _) => true,
         _ => {
             return Err(ArrowError::SchemaError(format!(
                 "Cannot infer schema from conflicting types: {f_type:?} and {data_type:?}"
             )));
         }
+    };
+    if widen {
+        *field = Field::new(key, data_type, true);
     }
     Ok(())
 }
@@ -744,5 +782,300 @@ mod tests {
             "/org/logs/stream/year=2024/",
             &filters
         ));
+    }
+
+    // Differential tests against the inference before the number fast path
+    // and the key-order cursor, kept verbatim as the reference.
+    fn legacy_number_type(number: &serde_json::Number) -> Option<DataType> {
+        if number.is_i64() {
+            Some(DataType::Int64)
+        } else if number.is_u64() {
+            Some(DataType::UInt64)
+        } else if number.is_f64() {
+            Some(DataType::Float64)
+        } else {
+            None
+        }
+    }
+
+    fn legacy_convert_data_type(
+        fields: &mut FxIndexMap<String, Field>,
+        key: &str,
+        data_type: DataType,
+    ) -> Result<(), ArrowError> {
+        let Some(f) = fields.get(key) else {
+            fields.insert(key.to_string(), Field::new(key, data_type, true));
+            return Ok(());
+        };
+        let f_type = f.data_type();
+        if f_type == &data_type {
+            return Ok(());
+        }
+        match (f_type, &data_type) {
+            (DataType::LargeUtf8, _) => {}
+            (DataType::Utf8, DataType::LargeUtf8) => {
+                fields.insert(key.to_string(), Field::new(key, data_type, true));
+            }
+            (DataType::Utf8, _) => {}
+            (DataType::Float64, DataType::UInt64)
+            | (DataType::Float64, DataType::Int64)
+            | (DataType::Float64, DataType::Boolean) => {}
+            (DataType::Int64, DataType::UInt64)
+            | (DataType::Int64, DataType::Float64)
+            | (DataType::Int64, DataType::Utf8)
+            | (DataType::Int64, DataType::LargeUtf8) => {
+                fields.insert(key.to_string(), Field::new(key, data_type, true));
+            }
+            (DataType::UInt64, DataType::Int64)
+            | (DataType::UInt64, DataType::Boolean)
+            | (DataType::Int64, DataType::Boolean) => {}
+            (DataType::UInt64, DataType::Float64)
+            | (DataType::UInt64, DataType::Utf8)
+            | (DataType::UInt64, DataType::LargeUtf8) => {
+                fields.insert(key.to_string(), Field::new(key, data_type, true));
+            }
+            (DataType::Float64, DataType::Utf8) | (DataType::Float64, DataType::LargeUtf8) => {
+                fields.insert(key.to_string(), Field::new(key, data_type, true));
+            }
+            (DataType::Boolean, _) => {
+                fields.insert(key.to_string(), Field::new(key, data_type, true));
+            }
+            _ => {
+                return Err(ArrowError::SchemaError(format!(
+                    "Cannot infer schema from conflicting types: {f_type:?} and {data_type:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn legacy_infer(records: &[Map<String, Value>]) -> Result<Schema, ArrowError> {
+        let mut fields: FxIndexMap<String, Field> = FxIndexMap::default();
+        for record in records {
+            for (key, value) in record {
+                let data_type = match value {
+                    Value::String(_) => DataType::Utf8,
+                    Value::Number(v) => legacy_number_type(v).unwrap_or(DataType::Utf8),
+                    Value::Bool(_) => DataType::Boolean,
+                    Value::Null => continue,
+                    _ => {
+                        return Err(ArrowError::SchemaError(
+                            "Cannot infer schema from non-basic type value".to_string(),
+                        ));
+                    }
+                };
+                legacy_convert_data_type(&mut fields, key, data_type)?;
+            }
+        }
+        Ok(fix_schema(
+            Schema::new(fields.into_values().collect::<Vec<_>>()),
+            StreamType::Logs,
+        ))
+    }
+
+    /// xorshift64*: deterministic, so a failure reproduces from the seed.
+    struct TestRng(u64);
+
+    impl TestRng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+
+        fn digit(&mut self) -> char {
+            char::from(b'0' + self.below(10) as u8)
+        }
+    }
+
+    /// A valid JSON number text around every classification boundary: digit
+    /// counts near 18/19/20 and near 300, optional fraction and exponent.
+    fn random_json_number(rng: &mut TestRng) -> String {
+        let mut text = String::new();
+        if rng.below(3) == 0 {
+            text.push('-');
+        }
+        let int_len = match rng.below(4) {
+            0 => 1 + rng.below(3),
+            1 => 16 + rng.below(6),
+            2 => 1 + rng.below(30),
+            _ => 280 + rng.below(40),
+        };
+        if int_len == 1 {
+            text.push(rng.digit());
+        } else {
+            // JSON forbids leading zeros on multi-digit integers
+            text.push(char::from(b'1' + rng.below(9) as u8));
+            for _ in 1..int_len {
+                text.push(rng.digit());
+            }
+        }
+        if rng.below(2) == 0 {
+            text.push('.');
+            for _ in 0..1 + rng.below(20) {
+                text.push(rng.digit());
+            }
+        }
+        if rng.below(4) == 0 {
+            text.push(if rng.below(2) == 0 { 'e' } else { 'E' });
+            match rng.below(3) {
+                0 => text.push('-'),
+                1 => text.push('+'),
+                _ => {}
+            }
+            text.push_str(&rng.below(400).to_string());
+        }
+        text
+    }
+
+    fn parse_number(text: &str) -> serde_json::Number {
+        match serde_json::from_str::<Value>(text) {
+            Ok(Value::Number(number)) => number,
+            other => panic!("{text:?} is not a JSON number: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn number_data_type_matches_parse_chain_on_boundaries() {
+        let decimal_299 = format!("{}.5", "9".repeat(297));
+        let decimal_300 = format!("{}.5", "9".repeat(298));
+        let integer_310 = "1".repeat(310);
+        let texts = [
+            "0",
+            "-0",
+            "7",
+            "0.0",
+            "-0.0",
+            "999999999999999999",
+            "-999999999999999999",
+            "1000000000000000000",
+            "9223372036854775807",
+            "9223372036854775808",
+            "-9223372036854775808",
+            "-9223372036854775809",
+            "18446744073709551615",
+            "18446744073709551616",
+            "-18446744073709551616",
+            "1e308",
+            "1e309",
+            "-1e309",
+            "1E2",
+            "1.5e-400",
+            "1.7976931348623157e308",
+            "1.7976931348623159e308",
+            decimal_299.as_str(),
+            decimal_300.as_str(),
+            integer_310.as_str(),
+        ];
+        for text in texts {
+            let number = parse_number(text);
+            assert_eq!(
+                number_data_type(&number),
+                legacy_number_type(&number),
+                "{text}"
+            );
+        }
+        let constructed = [
+            serde_json::Number::from(i64::MIN),
+            serde_json::Number::from(i64::MAX),
+            serde_json::Number::from(u64::MAX),
+            serde_json::Number::from_f64(f64::MAX).unwrap(),
+            serde_json::Number::from_f64(5e-324).unwrap(),
+            serde_json::Number::from_f64(1e300).unwrap(),
+            serde_json::Number::from_f64(-0.25).unwrap(),
+        ];
+        for number in constructed {
+            assert_eq!(
+                number_data_type(&number),
+                legacy_number_type(&number),
+                "{}",
+                number.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn number_data_type_matches_parse_chain_on_random_texts() {
+        let mut rng = TestRng(0x9E37_79B9_7F4A_7C15);
+        for _ in 0..50_000 {
+            let text = random_json_number(&mut rng);
+            let number = parse_number(&text);
+            assert_eq!(
+                number_data_type(&number),
+                legacy_number_type(&number),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn infer_from_map_matches_legacy_on_random_batches() {
+        const KEYS: [&str; 12] = [
+            "_timestamp",
+            "a",
+            "b",
+            "c",
+            "host",
+            "level",
+            "msg",
+            "n",
+            "x",
+            "y",
+            "z",
+            "start_time",
+        ];
+        let mut rng = TestRng(0xD1B5_4A32_D192_ED03);
+        for batch_no in 0..3_000 {
+            let records = (0..1 + rng.below(40))
+                .map(|_| {
+                    let mut keys: Vec<&str> =
+                        KEYS.iter().copied().filter(|_| rng.below(5) != 0).collect();
+                    if rng.below(5) == 0 {
+                        // rotate and swap so some records break the shared order
+                        let len = keys.len();
+                        if len > 1 {
+                            keys.rotate_left(rng.below(len as u64) as usize);
+                            keys.swap(0, len - 1);
+                        }
+                    }
+                    keys.into_iter()
+                        .map(|key| {
+                            let value = match rng.below(100) {
+                                0..=24 => Value::String(format!("s{}", rng.below(100))),
+                                25..=49 => {
+                                    Value::Number(parse_number(&rng.below(1000).to_string()))
+                                }
+                                50..=59 => {
+                                    Value::Number(parse_number(&random_json_number(&mut rng)))
+                                }
+                                60..=69 => Value::Number(parse_number(&format!(
+                                    "{}.{}",
+                                    rng.below(100),
+                                    rng.below(100)
+                                ))),
+                                70..=79 => Value::Bool(rng.below(2) == 0),
+                                80..=98 => Value::Null,
+                                _ => serde_json::json!([1]),
+                            };
+                            (key.to_string(), value)
+                        })
+                        .collect::<Map<String, Value>>()
+                })
+                .collect::<Vec<_>>();
+            let new = infer_json_schema_from_map("s", StreamType::Logs, records.iter());
+            let old = legacy_infer(&records);
+            match (new, old) {
+                (Ok(new), Ok(old)) => assert_eq!(new, old, "batch {batch_no}"),
+                (Err(new), Err(old)) => {
+                    assert_eq!(new.to_string(), old.to_string(), "batch {batch_no}")
+                }
+                (new, old) => panic!("batch {batch_no}: new {new:?} vs old {old:?}"),
+            }
+        }
     }
 }
