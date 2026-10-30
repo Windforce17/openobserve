@@ -1317,6 +1317,12 @@ pub struct Common {
     )]
     pub ingest_segment_mode: bool,
     #[env_config(
+        name = "ZO_SEARCH_PARALLEL_SEGMENT_SETUP",
+        default = false,
+        help = "Run persisted-file setup and assigned segment loading concurrently. Both branches use the ticket's fixed file IDs and retain their existing memory and concurrency limits. Errors or cancellation drop both branches. Set false to restore persisted-first serial setup. Disabled by default pending combined CPU, memory, and I/O validation."
+    )]
+    pub search_parallel_segment_setup: bool,
+    #[env_config(
         name = "ZO_SEGMENT_FLUSH_INTERVAL_MS",
         default = 1000,
         help = "Segment WAL: max time rows wait in the node buffer before the segment object is shipped"
@@ -6680,5 +6686,46 @@ mod tests {
         assert!(cfg.limit.vix_agg_early_cardinality_check_enabled);
         assert_eq!(cfg.limit.vix_agg_reject_cache_entries, 4096);
         assert!(cfg.limit.vix_agg_staged_probe_enabled);
+    }
+}
+
+#[cfg(test)]
+mod parallel_segment_setup_tests {
+    use super::Config;
+
+    #[test]
+    fn parallel_segment_setup_default_and_rollback() {
+        const KEY: &str = "ZO_SEARCH_PARALLEL_SEGMENT_SETUP";
+        const CHILD: &str = "RC5_CONFIG_TEST_CHILD";
+        if let Ok(expected) = std::env::var(CHILD) {
+            assert_eq!(
+                Config::init().unwrap().common.search_parallel_segment_setup,
+                expected == "true"
+            );
+            return;
+        }
+        // Child processes isolate environment parsing from concurrent config readers.
+        // No unsafe process-wide environment mutation is needed in the test runner.
+        for value in [None, Some("true"), Some("false")] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "config::parallel_segment_setup_tests::parallel_segment_setup_default_and_rollback",
+                    "--nocapture",
+                ])
+                .env(CHILD, value.unwrap_or("false"))
+                .env_remove(KEY);
+            if let Some(value) = value {
+                command.env(KEY, value);
+            }
+            let output = command.output().unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(output.status.success(), "{output:?}");
+            assert!(
+                stdout.contains("1 passed"),
+                "child test did not run: {stdout}"
+            );
+        }
     }
 }
