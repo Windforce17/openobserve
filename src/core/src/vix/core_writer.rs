@@ -342,7 +342,21 @@ fn vix_index_enabled(stream_type: StreamType) -> bool {
 /// merges them (index-off inputs force the `_source` rebuild) or as the
 /// single-file sweep classifies them `NeedsRebuild` under an indexed plan.
 fn vix_build_index_enabled(stream_type: StreamType) -> bool {
-    vix_index_enabled(stream_type) && !config::is_vix_l0_index_off(stream_type)
+    resolve_build_index_policy(
+        stream_type,
+        vix_index_enabled(stream_type),
+        config::is_vix_l0_index_off(stream_type),
+        get_config().common.vix_logs_l0_index_enabled,
+    )
+}
+
+fn resolve_build_index_policy(
+    stream_type: StreamType,
+    index_enabled: bool,
+    l0_index_off: bool,
+    logs_l0_enabled: bool,
+) -> bool {
+    index_enabled && (!l0_index_off || (stream_type == StreamType::Logs && logs_l0_enabled))
 }
 
 /// The shared [`VixWriterOptions`] of every core-file producer.
@@ -11384,6 +11398,178 @@ mod tests {
         );
     }
 
+    #[test]
+    fn logs_l0_canary_preserves_global_disable_and_other_streams() {
+        for stream_type in [StreamType::Logs, StreamType::Traces, StreamType::Metrics] {
+            for canary in [false, true] {
+                assert!(!resolve_build_index_policy(
+                    stream_type,
+                    false,
+                    false,
+                    canary
+                ));
+                assert!(!resolve_build_index_policy(
+                    stream_type,
+                    false,
+                    true,
+                    canary
+                ));
+                assert!(resolve_build_index_policy(stream_type, true, false, canary));
+            }
+            assert!(!resolve_build_index_policy(stream_type, true, true, false));
+        }
+        assert!(resolve_build_index_policy(
+            StreamType::Logs,
+            true,
+            true,
+            true
+        ));
+        assert!(!resolve_build_index_policy(
+            StreamType::Traces,
+            true,
+            true,
+            true
+        ));
+        assert!(!resolve_build_index_policy(
+            StreamType::Metrics,
+            true,
+            true,
+            true
+        ));
+    }
+
+    #[tokio::test]
+    async fn l0_coverage_heal_fulltext_matches_scan_and_survives_cancellation() {
+        use bytes::Bytes;
+
+        let schema = wal_schema();
+        let batches = wal_batches(&schema);
+        // Independent scan oracle, including a NULL full-text value.
+        let mut expected = Vec::new();
+        for batch in &batches {
+            let ts = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let log = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for (row, value) in log.iter().enumerate() {
+                if value.is_some_and(|value| value.split_whitespace().any(|token| token == "error"))
+                {
+                    expected.push(ts.value(row));
+                }
+            }
+        }
+        expected.sort_unstable_by(|a, b| b.cmp(a));
+        let table = Arc::new(MemTable::try_new(schema.clone(), vec![batches]).unwrap());
+        let fts = vec!["log".to_string()];
+        let l0 = write_core_file_from_tables_with_caps(
+            "coverage-fulltext",
+            StreamType::Logs,
+            schema.clone(),
+            vec![table],
+            &fts,
+            &[],
+            false,
+            0,
+            BatchCaps {
+                index_enabled_override: Some(false),
+                ..BatchCaps::default()
+            },
+        )
+        .await
+        .unwrap();
+        let original = Bytes::from(l0.data);
+        let inputs = as_inputs(&[("coverage.vix".to_string(), (original.clone(), None))]);
+        let token = VixMergeCancellation::new();
+        token.cancel();
+        let cancelled = rebuild_core_file_sidecar_with_caps_and_cancellation(
+            StreamType::Logs,
+            &inputs[0],
+            &schema,
+            &fts,
+            &[],
+            BatchCaps::default(),
+            Some(token),
+        );
+        let Err(error) = cancelled else {
+            panic!("cancelled heal must fail")
+        };
+        assert!(format!("{error:#}").contains("cancel"));
+        assert!(!VixReader::open(original.clone()).unwrap().has_index());
+        let SidecarHealOutcome::Rebuilt { index, stats } =
+            rebuild_core_file_sidecar(StreamType::Logs, &inputs[0], &schema, &fts, &[]).unwrap()
+        else {
+            panic!("expected sidecar-only repair")
+        };
+        assert_eq!(stats.docs_size, 0, "no data rewrite");
+        let healed =
+            VixReader::open_with_index(original.clone(), Some(Bytes::from(index))).unwrap();
+        let query = VixQuery::TokenAnyField {
+            token: b"error".to_vec(),
+        };
+        let timestamps = read_i64(&healed, TIMESTAMP_COL_NAME);
+        let indexed: Vec<_> = matching_docs(&healed, &query)
+            .into_iter()
+            .map(|row| timestamps[row as usize])
+            .collect();
+        assert_eq!(indexed, expected);
+        let direct = write_core_file_from_tables_with_caps(
+            "coverage-fulltext-canary",
+            StreamType::Logs,
+            schema.clone(),
+            vec![Arc::new(
+                MemTable::try_new(schema.clone(), vec![wal_batches(&schema)]).unwrap(),
+            )],
+            &fts,
+            &[],
+            false,
+            0,
+            BatchCaps {
+                index_enabled_override: Some(resolve_build_index_policy(
+                    StreamType::Logs,
+                    true,
+                    true,
+                    true,
+                )),
+                ..BatchCaps::default()
+            },
+        )
+        .await
+        .unwrap();
+        let direct =
+            VixReader::open_with_index(Bytes::from(direct.data), direct.index.map(Bytes::from))
+                .unwrap();
+        assert!(direct.has_index());
+        let direct_ts = read_i64(&direct, TIMESTAMP_COL_NAME);
+        let direct_hits: Vec<_> = matching_docs(&direct, &query)
+            .into_iter()
+            .map(|row| direct_ts[row as usize])
+            .collect();
+        assert_eq!(
+            direct_hits, expected,
+            "canary and sidecar heal match the scan oracle"
+        );
+        assert!(
+            matching_docs(
+                &healed,
+                &VixQuery::TokenAnyField {
+                    token: b"enospace".to_vec()
+                }
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            VixReader::open(original).unwrap().row_count(),
+            4,
+            "old data stays visible"
+        );
+    }
+
     #[tokio::test]
     async fn l0_index_off_build_heals_to_indexed_on_merge() {
         let schema = wal_schema();
@@ -13928,6 +14114,14 @@ mod tests {
     #[test]
     #[ignore = "manual timing of the single-file build (set O2_VIX_BUILD_BENCH_ROWS)"]
     fn bench_build_core_file() {
+        let index_enabled = std::env::var("O2_VIX_BUILD_BENCH_INDEX_ENABLED")
+            .map(|value| {
+                value
+                    .parse::<bool>()
+                    .expect("benchmark index mode must be true or false")
+            })
+            .unwrap_or(true);
+        eprintln!("index_enabled={index_enabled}");
         let rows: usize = std::env::var("O2_VIX_BUILD_BENCH_ROWS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -14025,7 +14219,7 @@ mod tests {
 
         let fts = vec!["message".to_string()];
         for &threads in &thread_list {
-            let mut opts = core_writer_options(&fts, Vec::new(), true);
+            let mut opts = core_writer_options(&fts, Vec::new(), index_enabled);
             opts.encode_threads = threads;
             let writer_schema = writer_input_schema(&Arc::new((*schema).clone()));
             let mut writer = VixWriter::new(&writer_schema, opts, false);

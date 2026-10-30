@@ -38,6 +38,7 @@ pub mod deleted;
 pub(crate) mod download_budget;
 pub mod dump;
 pub mod incremental;
+mod index_coverage;
 pub mod merge;
 pub mod retention;
 pub mod segments_sweep;

@@ -455,7 +455,13 @@ pub async fn generate_merge_debt_job_by_stream(
     while newest_hour > 0 && now - newest_hour <= settle_margin {
         newest_hour -= hour_micros(1);
     }
-    let end_time = newest_hour + hour_micros(1) - 1;
+    // The opt-in coverage lane also revisits the open hour. Otherwise a
+    // small L0 remainder can wait for hour close despite an elapsed target.
+    let end_time = if super::index_coverage::enabled(stream_type) {
+        now - now % hour_micros(1) + hour_micros(1) - 1
+    } else {
+        newest_hour + hour_micros(1) - 1
+    };
     let start_time = clamp_sweep_start(
         now - Duration::try_days(retention_days)
             .unwrap()
@@ -780,6 +786,7 @@ pub async fn merge_by_stream(
             let PartitionPlan {
                 mut batch_groups,
                 heal_candidates,
+                coverage_candidates,
             } = plan_partition(
                 files_with_size,
                 &org_id,
@@ -793,8 +800,12 @@ pub async fn merge_by_stream(
                 },
                 downsampling,
                 &job_strategy,
+                super::index_coverage::enabled(stream_type),
             );
-            if batch_groups.is_empty() && heal_candidates.is_empty() {
+            if batch_groups.is_empty()
+                && heal_candidates.is_empty()
+                && coverage_candidates.is_empty()
+            {
                 return Ok(MergePartitionOutcome::default());
             }
 
@@ -827,6 +838,54 @@ pub async fn merge_by_stream(
                 &mut heal_probe,
             )
             .await?;
+            let candidates = heal_candidates
+                .into_iter()
+                .map(|file| (file, true))
+                .chain(coverage_candidates.into_iter().map(|file| (file, false)));
+            let mut heal_candidates = Vec::new();
+            for (candidate, legacy) in candidates {
+                use super::index_coverage::Coverage;
+                job_cancel.check("index coverage planning")?;
+                if !super::index_coverage::enabled(stream_type) || candidate.meta.index_size > 0 {
+                    heal_candidates.push(candidate);
+                    continue;
+                }
+                match super::index_coverage::probe(&candidate, &job_cancel).await {
+                    Ok(Coverage::Missing(file) | Coverage::Unpublished(file)) => {
+                        log::info!(
+                            "[COMPACTOR] index coverage overdue: {} generation={} target_minutes={}; queueing CAS-protected sidecar heal",
+                            file.key,
+                            file.meta.index_generation,
+                            cfg.common.vix_logs_index_coverage_minutes,
+                        );
+                        heal_candidates.push(file);
+                    }
+                    Ok(Coverage::StaleMetadata(file)) => {
+                        log::info!(
+                            "[COMPACTOR] index coverage metadata stale: {} snapshot_generation={} primary_generation={} primary_index_size={}; refreshing without rebuild",
+                            file.key,
+                            candidate.meta.index_generation,
+                            file.meta.index_generation,
+                            file.meta.index_size,
+                        );
+                        super::index_coverage::refresh(&file, &job_cancel).await?;
+                    }
+                    Ok(Coverage::NotDue) if legacy => {
+                        // Keep the existing early heal of final-size and
+                        // closed-hour singleton files. The target only adds
+                        // work; it never postpones legacy eligibility.
+                        heal_candidates.push(candidate);
+                    }
+                    Ok(Coverage::NotDue | Coverage::Retired) => {}
+                    Err(error) => {
+                        job_cancel.check("index coverage probe")?;
+                        log::warn!(
+                            "[COMPACTOR] index coverage probe failed for {}; preserving visibility: {error:#}",
+                            candidate.key,
+                        );
+                    }
+                }
+            }
             for candidate in heal_candidates {
                 match heal_probe(candidate.clone()).await {
                     Ok(Some(reason)) => {
@@ -1346,6 +1405,7 @@ struct HourAge {
 struct PartitionPlan {
     batch_groups: Vec<MergeBatch>,
     heal_candidates: Vec<FileKey>,
+    coverage_candidates: Vec<FileKey>,
 }
 
 /// Classify one partition's files (pure - no IO) into merge batches and
@@ -1379,6 +1439,7 @@ fn plan_partition(
     age: HourAge,
     downsampling: bool,
     job_strategy: &MergeStrategy,
+    coverage_enabled: bool,
 ) -> PartitionPlan {
     let (core_files, flat_candidates): (Vec<FileKey>, Vec<FileKey>) = files_with_size
         .into_iter()
@@ -1436,6 +1497,22 @@ fn plan_partition(
             max_file_size,
             age.settled,
             job_strategy,
+        );
+    }
+
+    // Preserve all legacy merge/heal decisions. Only previously deferred,
+    // index-less remainders enter the bounded object-age probe.
+    if coverage_enabled && !single_core_heal_candidate && !age.settled {
+        let batched: HashSet<&str> = plan
+            .batch_groups
+            .iter()
+            .flat_map(|batch| batch.files.iter().map(|file| file.key.as_str()))
+            .collect();
+        plan.coverage_candidates.extend(
+            plain_core
+                .iter()
+                .filter(|file| !batched.contains(file.key.as_str()))
+                .cloned(),
         );
     }
 
@@ -2110,7 +2187,7 @@ async fn put_merged_output_file(
 /// Await cancellation without a permanently-running helper task. The short
 /// poll is used only during bounded retry backoff; CPU-heavy loops perform
 /// direct atomic checks at their natural batch/window boundaries.
-async fn wait_for_merge_cancellation(cancel: &MergeCancellation) {
+pub(super) async fn wait_for_merge_cancellation(cancel: &MergeCancellation) {
     while !cancel.is_cancelled() {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
     }
@@ -4353,6 +4430,7 @@ mod tests {
             age,
             false,
             &MergeStrategy::FileTime,
+            false,
         )
     }
 
@@ -4371,6 +4449,49 @@ mod tests {
 
     fn keys(files: &[FileKey]) -> Vec<&str> {
         files.iter().map(|f| f.key.as_str()).collect()
+    }
+
+    #[test]
+    fn coverage_only_probes_unbatched_indexless_remainders() {
+        let files = || {
+            vec![
+                core_file("plain-a", 0, 10, 0),
+                core_file("plain-b", 1, 10, 0),
+                core_file("indexed", 2, 10, 10),
+            ]
+        };
+        let coverage_plan = |age, enabled| {
+            plan_partition(
+                files(),
+                "org",
+                StreamType::Logs,
+                "logs",
+                "prefix",
+                1000,
+                age,
+                false,
+                &MergeStrategy::FileTime,
+                enabled,
+            )
+        };
+        for age in [OPEN, UNSETTLED] {
+            let legacy = coverage_plan(age, false);
+            assert!(legacy.batch_groups.is_empty());
+            assert!(legacy.coverage_candidates.is_empty());
+            let covered = coverage_plan(age, true);
+            assert!(covered.batch_groups.is_empty());
+            assert!(covered.heal_candidates.is_empty());
+            assert_eq!(
+                keys(&covered.coverage_candidates),
+                ["plain-a.vix", "plain-b.vix"]
+            );
+        }
+        let settled = coverage_plan(SETTLED, true);
+        assert!(
+            settled.coverage_candidates.is_empty(),
+            "never schedule a merge input twice"
+        );
+        assert_eq!(settled.batch_groups.len(), 1);
     }
 
     /// A file above half the target is final: never grouped, and if it is

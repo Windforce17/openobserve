@@ -1869,6 +1869,35 @@ pub struct Common {
     )]
     pub vix_l0_index_off_stream_types: String,
     #[env_config(
+        name = "ZO_VIX_LOGS_L0_INDEX_ENABLED",
+        default = false,
+        help = "Build term indexes for logs L0 files even when logs is listed in \
+                ZO_VIX_L0_INDEX_OFF_STREAM_TYPES. False preserves the existing L0 policy. \
+                ZO_VIX_INDEX_DISABLED_STREAM_TYPES always takes precedence. Enable on a \
+                canary only after measuring builder CPU, latency and segment backlog."
+    )]
+    pub vix_logs_l0_index_enabled: bool,
+    #[env_config(
+        name = "ZO_VIX_LOGS_INDEX_COVERAGE_MINUTES",
+        default = 0,
+        help = "Target minutes from immutable logs data-object creation to index coverage. \
+                0 preserves legacy heal scheduling. Positive values probe unmerged L0 \
+                remainders during compaction, using object last_modified, not event time. \
+                Overdue files use the existing sidecar-only heal and CAS publication. \
+                This is a best-effort target, not a deadline guarantee under backlog; \
+                merge-debt scheduling must be enabled. Start a canary with 5 minutes."
+    )]
+    pub vix_logs_index_coverage_minutes: u64,
+    #[env_config(
+        name = "ZO_VIX_LOGS_INDEX_COVERAGE_PROBES_PER_MINUTE",
+        default = 12,
+        help = "Per-process admission rate for additional logs index-coverage probes. \
+                Probes are serialized and spaced evenly; 0 is treated as 1. Each probe \
+                reads primary file-list metadata and at most two object HEADs. Repairs \
+                share the existing bounded merge worker queue and rebuild memory budget."
+    )]
+    pub vix_logs_index_coverage_probes_per_minute: u32,
+    #[env_config(
         name = "ZO_VIX_METRICS_CORE_FILE_ENABLED",
         default = false,
         help = "Activation switch for metrics streams writing core .vix files at all \
@@ -5295,6 +5324,14 @@ mod tests {
     /// M11 launch defaults (OWNER 2026-08-18: "cache_latest_files default
     /// to true — we need cache latest files"): caching + merge-input
     /// eviction ON, peer-to-peer fill explicitly HELD BACK.
+    #[test]
+    fn logs_index_coverage_defaults_are_opt_in() {
+        let cfg = Config::init().unwrap();
+        assert!(!cfg.common.vix_logs_l0_index_enabled);
+        assert_eq!(cfg.common.vix_logs_index_coverage_minutes, 0);
+        assert_eq!(cfg.common.vix_logs_index_coverage_probes_per_minute, 12);
+    }
+
     #[test]
     fn cache_latest_files_defaults_m11() {
         let cfg = Config::init().unwrap();
