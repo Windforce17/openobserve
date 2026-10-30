@@ -17,13 +17,15 @@
 //! Deployment migration (ephemeral volumes): the first touch of every file
 //! pays S3 round trips that o2's weeks-warm caches never see (measured
 //! 2026-08-11: cold needle 4.1s vs 0.57s, count24h 102s vs 51s). This task
-//! runs once after the node comes ONLINE: it lists the last
+//! starts after the node comes ONLINE: it lists the last
 //! `ZO_WARMUP_CACHE_HOURS` hours of files, keeps THIS node's
 //! consistent-hash share — the same ring walk the query fan-out uses, so
 //! each node warms exactly the files it will be asked to serve — and opens
 //! each `.vix` through the normal ranged ladder, populating the disk and
 //! memory caches with the footer tail and memoizing the parsed reader.
-//! Best-effort: errors skip, the query path never waits on it.
+//! The supervisor waits for local ring convergence and follows ownership changes.
+//! The legacy one-shot path remains available through configuration.
+//! Best-effort: the query path never waits on it.
 
 use std::sync::{
     Arc,
@@ -37,7 +39,17 @@ use infra::cluster::{get_cached_online_query_nodes, get_node_from_consistent_has
 
 use crate::service::search as SearchService;
 
+mod supervisor;
+
 pub async fn warm_recent_indexes() {
+    if get_config().limit.warmup_supervisor_enabled {
+        supervisor::run().await;
+    } else {
+        warm_recent_indexes_once().await;
+    }
+}
+
+async fn warm_recent_indexes_once() {
     let cfg = get_config();
     let hours = cfg.limit.warmup_cache_hours;
     if hours == 0 {

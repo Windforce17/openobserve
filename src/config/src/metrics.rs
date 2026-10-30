@@ -1987,6 +1987,46 @@ pub static VIX_FAST_PATH_FALLBACK_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     .expect("Metric created")
 });
 
+pub static WARMUP_FILES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "warmup_files_total",
+            "Supervised index warmup terminal file outcomes",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &["outcome"],
+    )
+    .expect("Metric created")
+});
+
+pub static WARMUP_EVENTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "warmup_events_total",
+            "Supervised index warmup lifecycle and retry events",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &["event"],
+    )
+    .expect("Metric created")
+});
+
+pub static WARMUP_PASS_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
+    HistogramVec::new(
+        HistogramOpts::new(
+            "warmup_pass_seconds",
+            "Supervised index warmup pass duration",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels())
+        .buckets(vec![1.0, 5.0, 30.0, 60.0, 300.0, 900.0]),
+        &["status"],
+    )
+    .expect("Metric created")
+});
+
 pub static QUERY_AGGREGATION_CACHE_BYTES: Lazy<IntGaugeVec> = Lazy::new(|| {
     IntGaugeVec::new(
         Opts::new(
@@ -2863,6 +2903,15 @@ fn register_metrics(registry: &Registry) {
         .expect("Metric registered");
     registry
         .register(Box::new(VIX_FAST_PATH_FALLBACK_TOTAL.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(WARMUP_FILES_TOTAL.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(WARMUP_EVENTS_TOTAL.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(WARMUP_PASS_SECONDS.clone()))
         .expect("Metric registered");
     registry
         .register(Box::new(SEGMENT_SCAN_RETAINED_BYTES.clone()))

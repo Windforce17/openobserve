@@ -2479,6 +2479,48 @@ pub struct Limit {
     )]
     pub warmup_cache_concurrency: usize,
     #[env_config(
+        name = "ZO_WARMUP_SUPERVISOR_ENABLED",
+        default = false,
+        help = "Opt-in index warmup supervisor: wait for stable local ring membership, retry Busy files, yield to foreground index evaluations, and warm only newly owned ring shares. Requires ZO_WARMUP_CACHE_HOURS > 0. False restores the one-shot startup path. Readiness never waits. Default off because file_list enumeration still materializes one stream without a byte bound. Supervised passes cap selected files at 50000 and concurrency at 32."
+    )]
+    pub warmup_supervisor_enabled: bool,
+    #[env_config(
+        name = "ZO_WARMUP_RING_WAIT_SECS",
+        default = 60,
+        help = "Maximum seconds per warmup ring-convergence wait (minimum 1). A timeout is reported; the supervisor keeps watching and tries again instead of permanently skipping startup."
+    )]
+    pub warmup_ring_wait_secs: u64,
+    #[env_config(
+        name = "ZO_WARMUP_RING_SETTLE_SECS",
+        default = 2,
+        help = "Require unchanged online membership and ring ownership for this many seconds before warmup (minimum 1, capped at half the ring wait timeout). This is local convergence, not a cluster-wide barrier."
+    )]
+    pub warmup_ring_settle_secs: u64,
+    #[env_config(
+        name = "ZO_WARMUP_RING_POLL_SECS",
+        default = 5,
+        help = "Seconds between warmup ring checks (minimum 1). Epoch changes trigger only newly owned shares within ZO_WARMUP_CACHE_HOURS, not a full cache refresh."
+    )]
+    pub warmup_ring_poll_secs: u64,
+    #[env_config(
+        name = "ZO_WARMUP_BUSY_RETRIES",
+        default = 5,
+        help = "Maximum retries after a Busy warmup result per file per ownership change (capped at 16). Zero disables retries. Errors and invalid inputs are not retried."
+    )]
+    pub warmup_busy_retries: usize,
+    #[env_config(
+        name = "ZO_WARMUP_BUSY_BACKOFF_MS",
+        default = 250,
+        help = "Initial Busy retry delay in milliseconds (minimum 1). Exponential backoff is capped at 5 seconds. Sleeping retries retain no evaluation permit."
+    )]
+    pub warmup_busy_backoff_ms: u64,
+    #[env_config(
+        name = "ZO_WARMUP_PASS_TIMEOUT_SECS",
+        default = 900,
+        help = "Maximum seconds for a supervised warmup pass including enumeration and Busy retries (minimum 1). Timeout cancels unfinished reads and reports an incomplete pass; unchanged ownership is not retried indefinitely."
+    )]
+    pub warmup_pass_timeout_secs: u64,
+    #[env_config(
         name = "ZO_QUERY_HTTP_HEARTBEAT_SECS",
         default = 5,
         help = "Oneshot /_search responses still running after this many seconds switch to a streamed body emitting a whitespace heartbeat every 2s, so a vanished HTTP/1.1 client fails the write and the query cancels server-side. Within the grace period status codes stay exact; after it, errors arrive in-body on a 200 (the code field). 0 disables."
@@ -5208,6 +5250,21 @@ pub fn ensure_not_empty(s: &str, name: &str) -> Result<(), anyhow::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn warmup_supervisor_defaults_are_opt_in_and_bounded() {
+        let cfg = Config::init().unwrap();
+        assert!(!cfg.limit.warmup_supervisor_enabled);
+        assert_eq!(cfg.limit.warmup_cache_hours, 0);
+        assert_eq!(cfg.limit.warmup_cache_max_files, 50_000);
+        assert_eq!(cfg.limit.warmup_cache_concurrency, 4);
+        assert_eq!(cfg.limit.warmup_ring_wait_secs, 60);
+        assert_eq!(cfg.limit.warmup_ring_settle_secs, 2);
+        assert_eq!(cfg.limit.warmup_ring_poll_secs, 5);
+        assert_eq!(cfg.limit.warmup_busy_retries, 5);
+        assert_eq!(cfg.limit.warmup_busy_backoff_ms, 250);
+        assert_eq!(cfg.limit.warmup_pass_timeout_secs, 900);
+    }
 
     #[test]
     fn invalid_datafusion_memory_pool_fails_config_check() {
