@@ -424,6 +424,7 @@ fn residual_supported_shape(condition: &Condition) -> bool {
         Condition::Equal(..)
         | Condition::NotEqual(..)
         | Condition::StrMatch(..)
+        | Condition::Prefix(..)
         | Condition::In(..)
         | Condition::IsNull(_)
         | Condition::IsNotNull(_)
@@ -432,7 +433,7 @@ fn residual_supported_shape(condition: &Condition) -> bool {
         | Condition::All() => true,
         Condition::NumericCmp(..) | Condition::Regex(..) => false,
         Condition::Or(items) | Condition::And(items) => items.iter().all(residual_supported_shape),
-        Condition::Not(inner) => residual_supported_shape(inner),
+        Condition::Not(inner) | Condition::NormalizedOr(inner) => residual_supported_shape(inner),
     }
 }
 

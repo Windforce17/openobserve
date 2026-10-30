@@ -40,6 +40,8 @@ use vortex_index::{
     VixQuery, canonical_f64_text, canonical_i64_text, canonical_u64_text, numeric_value_token,
 };
 
+pub(crate) mod pruning;
+
 /// Historical prefix kept in `to_query()` cache keys for match_all
 /// conditions — only a stable cache-key label (no `_all` field exists).
 const MATCH_ALL_QUERY_PREFIX: &str = "_all";
@@ -494,8 +496,12 @@ pub enum Condition {
     NotEqual(String, String),
     // field, value, case_sensitive
     StrMatch(String, String, bool),
+    // field, decoded literal prefix (case-sensitive LIKE; filter retained)
+    Prefix(String, String),
     // field, values, negated
     In(String, Vec<String>, bool),
+    // Preserve OR provenance so per-file guards never change legacy IN behavior.
+    NormalizedOr(Box<Condition>),
     // numeric/bool-typed comparison on a numeric/bool REGISTRY field:
     // field, normalized literal texts (one for =/!=, several for IN),
     // negated, kind. Probes the union of the canonical value-term forms
@@ -530,8 +536,10 @@ impl Condition {
     // this only use for display the query
     pub fn to_query(&self) -> String {
         match self {
+            Condition::NormalizedOr(inner) => format!("or_in({})", inner.to_query()),
             Condition::Equal(field, value) => format!("{field}={value}"),
             Condition::NotEqual(field, value) => format!("{field}!={value}"),
+            Condition::Prefix(field, value) => format!("prefix({field}, {value:?})"),
             Condition::StrMatch(field, value, case_sensitive) => {
                 if *case_sensitive {
                     format!("str_match({field}, '{value}')")
@@ -588,6 +596,22 @@ impl Condition {
         index_fields: &HashMap<String, DataType>,
     ) -> Self {
         let numeric_kind = |field: &str| index_fields.get(field).and_then(numeric_kind_of);
+        if get_config().common.vix_equal_or_pruning_enabled
+            && let Some((column, values)) = pruning::equal_or_literals(expr)
+            && index_fields
+                .get(column.name())
+                .is_some_and(pruning::string_type)
+            && let Some(values) = values
+                .into_iter()
+                .map(|value| pruning::string_literal(value).map(str::to_string))
+                .collect::<Option<Vec<_>>>()
+        {
+            return Condition::NormalizedOr(Box::new(Condition::In(
+                column.name().to_string(),
+                values,
+                false,
+            )));
+        }
         if let Some(expr) = expr.downcast_ref::<BinaryExpr>() {
             match expr.op() {
                 Operator::Eq | Operator::NotEq => {
@@ -638,6 +662,12 @@ impl Condition {
                 Condition::In(field, values, expr.negated())
             }
         } else if let Some(expr) = expr.downcast_ref::<LikeExpr>() {
+            if let Some(prefix) = index_like_prefix(expr, index_fields) {
+                return Condition::Prefix(
+                    get_physical_column_name(expr.expr()).to_string(),
+                    prefix,
+                );
+            }
             // gated by is_expr_valid_for_index: case-sensitive, non-negated
             // LIKE on a string-typed index field whose pattern is a plain
             // substring/equality shape (see like_pattern_shape)
@@ -740,6 +770,7 @@ impl Condition {
     /// [`Condition::can_remove_filter`] true for them.
     pub fn to_vix_query(&self, tokenize: &dyn Fn(&str) -> Vec<String>) -> anyhow::Result<VixQuery> {
         Ok(match self {
+            Condition::NormalizedOr(inner) => return inner.to_vix_query(tokenize),
             Condition::Equal(field, value) => VixQuery::Exact {
                 field: field.clone(),
                 token: value.clone().into_bytes(),
@@ -810,6 +841,10 @@ impl Condition {
             Condition::Regex(field, value) => VixQuery::Regex {
                 field: Some(field.clone()),
                 pattern: value.clone(),
+            },
+            Condition::Prefix(field, value) => VixQuery::Prefix {
+                field: Some(field.clone()),
+                prefix: value.as_bytes().to_vec(),
             },
             // key terms mark every doc whose flattened record has a
             // (non-null) value at the path — exactly `field IS NOT NULL`
@@ -920,6 +955,7 @@ impl Condition {
     /// field scope and every one of those fields token-indexed in the file.
     pub fn uses_full_text(&self) -> bool {
         match self {
+            Condition::NormalizedOr(inner) => inner.uses_full_text(),
             Condition::MatchAll(value) => !(value.is_empty() || value == "*"),
             Condition::FuzzyMatchAll(value, _) => !value.is_empty(),
             Condition::Or(items) | Condition::And(items) => {
@@ -966,6 +1002,7 @@ impl Condition {
             query: Box::new(query),
         };
         match self {
+            Condition::NormalizedOr(inner) => inner.fts_superset_query(field, tokenize),
             Condition::Equal(f, value) if f == field => tokens_and(value, tokenize).map(scoped),
             Condition::In(f, values, false) if f == field => {
                 let per_value: Option<Vec<VixQuery>> = values
@@ -1017,6 +1054,7 @@ impl Condition {
             | Condition::In(field, ..)
             | Condition::NumericCmp(field, ..)
             | Condition::Regex(field, _)
+            | Condition::Prefix(field, _)
             | Condition::StrMatch(field, ..) => {
                 fields.insert(field.clone());
             }
@@ -1028,7 +1066,7 @@ impl Condition {
             Condition::Or(items) | Condition::And(items) => {
                 fields.extend(items.iter().flat_map(Condition::term_index_fields));
             }
-            Condition::Not(condition) => {
+            Condition::Not(condition) | Condition::NormalizedOr(condition) => {
                 fields.extend(condition.term_index_fields());
             }
         }
@@ -1052,12 +1090,14 @@ impl Condition {
     /// maps it to [`VixQuery::Nothing`], an exact empty result.
     fn never_true_when_null(&self, null_fields: &HashSet<String>) -> bool {
         match self {
+            Condition::NormalizedOr(inner) => inner.never_true_when_null(null_fields),
             Condition::Equal(field, _)
             | Condition::NotEqual(field, _)
             | Condition::In(field, ..)
             | Condition::NumericCmp(field, ..)
             | Condition::StrMatch(field, ..)
             | Condition::Regex(field, _)
+            | Condition::Prefix(field, _)
             | Condition::IsNotNull(field) => null_fields.contains(field),
             // IS NULL on an all-null field is genuinely TRUE for every row
             Condition::IsNull(_) => false,
@@ -1080,10 +1120,11 @@ impl Condition {
     /// wrong `true` here would let `NOT(..)` wrongly claim never-TRUE).
     fn never_false_when_null(&self, null_fields: &HashSet<String>) -> bool {
         match self {
+            Condition::NormalizedOr(inner) => inner.never_false_when_null(null_fields),
             // comparisons on NULL are UNKNOWN, never genuinely FALSE
-            Condition::Equal(field, _) | Condition::NotEqual(field, _) => {
-                null_fields.contains(field)
-            }
+            Condition::Equal(field, _)
+            | Condition::NotEqual(field, _)
+            | Condition::Prefix(field, _) => null_fields.contains(field),
             // `NULL IN (..)` / `NULL NOT IN (..)` are UNKNOWN — except the
             // degenerate empty list, which is vacuously FALSE
             Condition::In(field, values, _) => !values.is_empty() && null_fields.contains(field),
@@ -1122,6 +1163,7 @@ impl Condition {
             | Condition::In(field, ..)
             | Condition::NumericCmp(field, ..)
             | Condition::Regex(field, _)
+            | Condition::Prefix(field, _)
             | Condition::IsNotNull(field)
             | Condition::IsNull(field) => {
                 fields.insert(field.clone());
@@ -1137,7 +1179,7 @@ impl Condition {
                         .flat_map(|item| item.get_schema_fields(fst_fields)),
                 );
             }
-            Condition::Not(condition) => {
+            Condition::Not(condition) | Condition::NormalizedOr(condition) => {
                 fields.extend(condition.get_schema_fields(fst_fields));
             }
         }
@@ -1151,6 +1193,7 @@ impl Condition {
     ) -> Result<Arc<dyn PhysicalExpr>, anyhow::Error> {
         let cfg = get_config();
         match self {
+            Condition::NormalizedOr(inner) => inner.to_physical_expr(schema, fst_fields),
             Condition::Equal(name, value) => {
                 let index = schema.index_of(name).unwrap();
                 let left = Arc::new(Column::new(name, index));
@@ -1167,6 +1210,19 @@ impl Condition {
             }
             Condition::StrMatch(name, value, case_sensitive) => {
                 create_str_match_expr(schema, name, value, *case_sensitive)
+            }
+            Condition::Prefix(name, value) => {
+                let index = schema.index_of(name)?;
+                let data_type = schema.field(index).data_type();
+                if !pruning::string_type(data_type) {
+                    anyhow::bail!("prefix field {name} has non-string scan type {data_type}");
+                }
+                Ok(Arc::new(LikeExpr::new(
+                    false,
+                    false,
+                    Arc::new(Column::new(name, index)),
+                    get_scalar_value(&pruning::prefix_pattern(value), data_type)?,
+                )))
             }
             Condition::In(name, values, negated) => {
                 let index = schema.index_of(name).unwrap();
@@ -1325,6 +1381,7 @@ impl Condition {
 
     pub fn can_remove_filter(&self) -> bool {
         match self {
+            Condition::NormalizedOr(inner) => inner.can_remove_filter(),
             Condition::Equal(..) => true,
             // exact: to_vix_query conjoins KeyExists(field), so the bitmap
             // matches SQL three-valued logic (null rows excluded). Files
@@ -1341,6 +1398,7 @@ impl Condition {
             // are UNKNOWN in SQL but pass the bitmap's KeyExists guard
             Condition::NumericCmp(_, _, negated, _) => !negated,
             Condition::Regex(..) => false,
+            Condition::Prefix(..) => false,
             // exact on core files (key term present == non-null); files without
             // key terms skip the condition and get the filter re-applied
             Condition::IsNotNull(..) => true,
@@ -1359,6 +1417,29 @@ impl Condition {
             Condition::Not(..) => false,
         }
     }
+}
+
+/// Prefix indexes are raw string lookups, never token prefixes. Casts and
+/// non-string registry fields have different semantics and stay on the scan.
+pub(crate) fn index_like_prefix(
+    expr: &LikeExpr,
+    index_fields: &HashMap<String, DataType>,
+) -> Option<String> {
+    if !get_config().common.vix_like_prefix_pruning_enabled
+        || expr.negated()
+        || expr.case_insensitive()
+    {
+        return None;
+    }
+    let column = expr.expr().downcast_ref::<Column>()?;
+    if !index_fields
+        .get(column.name())
+        .is_some_and(pruning::string_type)
+    {
+        return None;
+    }
+    let literal = expr.pattern().downcast_ref::<Literal>()?;
+    pruning::like_prefix(pruning::string_literal(literal.value())?)
 }
 
 // TODO: duplication with datafusion/optimizer/physical_optimizer/utils.rs

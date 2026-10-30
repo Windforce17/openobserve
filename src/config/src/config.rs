@@ -1732,6 +1732,18 @@ pub struct Common {
     )]
     pub ingest_canonical_schema: bool,
     #[env_config(
+        name = "ZO_VIX_EQUAL_OR_PRUNING_ENABLED",
+        default = true,
+        help = "Normalize bounded same-column string equality OR chains to IN for index/FTS candidates and extract core scan range bounds. NULL, casts, mixed types and oversized chains fail open. False restores legacy OR extraction."
+    )]
+    pub vix_equal_or_pruning_enabled: bool,
+    #[env_config(
+        name = "ZO_VIX_LIKE_PREFIX_PRUNING_ENABLED",
+        default = true,
+        help = "Use case-sensitive, non-negated string LIKE prefixes for raw-term index candidates and core scan ranges. Preserve the scan filter. Unsupported escapes, casts and ILIKE fail open. False restores legacy LIKE extraction."
+    )]
+    pub vix_like_prefix_pruning_enabled: bool,
+    #[env_config(
         name = "ZO_VIX_FULL_SCAN_RANGED_MIN_BYTES",
         default = 268435456,
         help = "Wide core-file full scans that request _source switch to chunk-granular ranged \
@@ -5208,6 +5220,13 @@ pub fn ensure_not_empty(s: &str, name: &str) -> Result<(), anyhow::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rc6_pruning_defaults() {
+        let cfg = Config::init().unwrap();
+        assert!(cfg.common.vix_equal_or_pruning_enabled);
+        assert!(cfg.common.vix_like_prefix_pruning_enabled);
+    }
 
     #[test]
     fn invalid_datafusion_memory_pool_fails_config_check() {

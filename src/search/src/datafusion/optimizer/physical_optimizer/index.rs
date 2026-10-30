@@ -519,6 +519,9 @@ fn is_expr_valid_for_index(expr: &Arc<dyn PhysicalExpr>, index_fields: &IndexFie
             _ => false,
         };
     } else if let Some(expr) = expr.downcast_ref::<LikeExpr>() {
+        if crate::index::index_like_prefix(expr, index_fields).is_some() {
+            return true;
+        }
         // case-sensitive non-negated LIKE whose pattern is a plain
         // substring/equality shape (see like_pattern_shape) is exactly a
         // str_match/equality/IS-NOT-NULL condition. ILIKE case-folds
@@ -1056,8 +1059,13 @@ mod tests {
                 true,
                 Some(Condition::IsNotNull("name".to_string())),
             ),
-            // prefix/suffix/interior wildcards are not plain substrings
-            (like(false, false, "name", "err%"), false, None),
+            // A prefix has a raw-term query and retains its scan filter.
+            (
+                like(false, false, "name", "err%"),
+                true,
+                Some(Condition::Prefix("name".to_string(), "err".to_string())),
+            ),
+            // Suffix/interior wildcards still fail open.
             (like(false, false, "name", "%err"), false, None),
             (like(false, false, "name", "%a%b%"), false, None),
             // `_` and `\` escapes make the pattern more than a substring

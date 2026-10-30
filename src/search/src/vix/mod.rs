@@ -2063,13 +2063,14 @@ async fn search_vix_docs_optimized(
                 }),
             IndexOptimizeMode::SimpleHistogram(min_value, bucket_width, num_buckets, ts_offset) => {
                 if let Some(bucket) = whole_file_bucket {
-                    docs.eq_string_count(&task_field, &needle, None).map(|count| {
-                        count.map(|count| {
-                            let mut histogram = vec![0u64; num_buckets];
-                            histogram[bucket] = count;
-                            VixSearchResult::Histogram(histogram)
+                    docs.eq_string_count(&task_field, &needle, None)
+                        .map(|count| {
+                            count.map(|count| {
+                                let mut histogram = vec![0u64; num_buckets];
+                                histogram[bucket] = count;
+                                VixSearchResult::Histogram(histogram)
+                            })
                         })
-                    })
                 } else {
                     docs.eq_string_histogram(
                         &task_field,
@@ -2284,6 +2285,14 @@ fn evaluate_vix_index(
     // bypass per-field capability entirely, so only a whole-file bail is
     // safe (a NoMatch here would silently drop rows).
     if stats_eq.is_none() && !reader.has_index() && !condition.is_condition_all() {
+        return Ok(RawVixResult::PartialFields);
+    }
+
+    // New OR/LIKE candidates require stored-type and writer-coverage proof.
+    // Keep legacy equality/IN behavior unchanged and fail open before evaluation.
+    if !crate::index::pruning::file_candidates_safe(condition, reader)
+        .map_err(|e| e.context(format!("[trace_id {trace_id}] OR/LIKE coverage check")))?
+    {
         return Ok(RawVixResult::PartialFields);
     }
 
@@ -6025,7 +6034,10 @@ mod tests {
         .await
         .unwrap();
         assert!(!add_filter_back);
-        assert!(files.is_empty(), "a missing needle is an exact zero, not a scan");
+        assert!(
+            files.is_empty(),
+            "a missing needle is an exact zero, not a scan"
+        );
         match result {
             MultiResult::Count(count) => assert_eq!(count, 0),
             other => panic!("expected zero count, got {other:?}"),
@@ -9741,3 +9753,6 @@ mod ui_histogram_differential_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod rc6_tests;
