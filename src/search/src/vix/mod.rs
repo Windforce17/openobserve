@@ -1419,6 +1419,15 @@ impl VixDocsInput {
 
 pub use vortex_index::{set_sidecar_first_open, set_tail_fetch_size, set_walk_verify_min_bytes};
 
+/// A warmup attempt distinguishes retryable contention from terminal skips.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WarmFileOutcome {
+    Warmed,
+    AlreadyWarm,
+    Busy,
+    InvalidInput,
+}
+
 /// Warm one core `.vix` file's index metadata into the caches (#39 GAP 2):
 /// opens the ranged reader — which eager-fetches the footer tail through
 /// the same disk/memory cache ladder queries use — and memoizes the parsed
@@ -1432,14 +1441,60 @@ pub async fn warm_file(
     index_size: i64,
     index_generation: i64,
 ) -> anyhow::Result<bool> {
+    Ok(warm_file_inner(
+        account,
+        key,
+        compressed_size,
+        index_size,
+        index_generation,
+        get_config().limit.warmup_supervisor_enabled,
+    )
+    .await?
+        == WarmFileOutcome::Warmed)
+}
+
+/// Classified warmup entry. Dropping this future cancels its read operation;
+/// the evaluation permit remains owned by the blocking worker until it exits.
+pub async fn warm_file_outcome(
+    account: &str,
+    key: &str,
+    compressed_size: i64,
+    index_size: i64,
+    index_generation: i64,
+) -> anyhow::Result<WarmFileOutcome> {
+    warm_file_inner(
+        account,
+        key,
+        compressed_size,
+        index_size,
+        index_generation,
+        true,
+    )
+    .await
+}
+
+async fn warm_file_inner(
+    account: &str,
+    key: &str,
+    compressed_size: i64,
+    index_size: i64,
+    index_generation: i64,
+    yield_to_foreground: bool,
+) -> anyhow::Result<WarmFileOutcome> {
     if !is_core_file(key) {
-        return Ok(false);
+        return Ok(WarmFileOutcome::InvalidInput);
     }
     // Nothing to warm without a sidecar. Reader identity includes both the
     // immutable sidecar generation and its exact-size compatibility witness.
     if index_size <= 0 {
-        return Ok(false);
+        return Ok(WarmFileOutcome::InvalidInput);
     }
+    let Some(size) = u64::try_from(compressed_size).ok().filter(|s| *s > 0) else {
+        return Ok(WarmFileOutcome::InvalidInput);
+    };
+    let Some(sidecar_key) = config::vix_sidecar_key(key, index_generation) else {
+        return Ok(WarmFileOutcome::InvalidInput);
+    };
     let reader_key =
         reader_cache::ReaderCacheKey::new(key.to_string(), index_generation, index_size);
     // Warming is not the query's demand access of this file (that `get`
@@ -1447,15 +1502,17 @@ pub async fn warm_file(
     let cached = match reader_cache::GLOBAL_CACHE.peek(&reader_key) {
         Some(handle) => {
             let Some(locked) = handle.try_lock() else {
-                return Ok(false);
+                return Ok(WarmFileOutcome::Busy);
             };
             Some(locked)
         }
         None => None,
     };
-    let Some(size) = u64::try_from(compressed_size).ok().filter(|s| *s > 0) else {
-        return Ok(false);
-    };
+    // Do not queue behind foreground work or steal its available slots.
+    // The legacy one-shot switch preserves the old admission behavior.
+    if yield_to_foreground && source::foreground_evaluation_active() {
+        return Ok(WarmFileOutcome::Busy);
+    }
     let handle = tokio::runtime::Handle::current();
     let source = Arc::new(source::LadderRangeSource::new(
         account.to_string(),
@@ -1465,9 +1522,6 @@ pub async fn warm_file(
     ));
     // The dictionary lives in the generation-addressed `.vxi` sidecar.
     // Invalid generations fail closed rather than warming a data-only reader.
-    let Some(sidecar_key) = config::vix_sidecar_key(key, index_generation) else {
-        return Ok(false);
-    };
     let index = Some(Arc::new(source::LadderRangeSource::new(
         account.to_string(),
         &sidecar_key,
@@ -1483,7 +1537,7 @@ pub async fn warm_file(
     };
     // Best-effort background work: a free slot or nothing.
     let Some(permit) = source::try_acquire_evaluation() else {
-        return Ok(false);
+        return Ok(WarmFileOutcome::Busy);
     };
     let operation = source::ReadOperation::new(Arc::new(source::FetchStats::default()), None);
     let _owner = operation.owner_guard();
@@ -1491,11 +1545,11 @@ pub async fn warm_file(
         if let Some(locked) = cached
             && locked.upgrade()?.is_some()
         {
-            return Ok(false);
+            return Ok(WarmFileOutcome::AlreadyWarm);
         }
         let reader = input.open()?;
         let _ = reader.term_row_group_count();
-        Ok(true)
+        Ok(WarmFileOutcome::Warmed)
     })
     .await
 }
@@ -9867,3 +9921,136 @@ mod ui_histogram_differential_tests {
 
 #[cfg(test)]
 mod rc6_tests;
+
+#[cfg(test)]
+mod warm_file_tests {
+    use super::*;
+    use crate::index::Condition;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn warm_file_memory_store_classification_and_query_parity() {
+        // Never initialize a remote default store, even when run outside cargo_slot.
+        assert!(config::is_local_disk_storage());
+        let org = "warmup-memory-fixture";
+        let account = format!("{org}:default");
+        infra::storage::add_account(org, Box::new(object_store::memory::InMemory::new())).await;
+        let key = "files/warmup-memory-fixture/logs/test/2026/01/01/00/warm.vix";
+        let (data, index) = ranged_parity_tests::build_parity_file();
+        let data_size = data.len() as i64;
+        let index_size = index.len() as i64;
+        let reference = VixReader::open_with_index(data.clone(), Some(index.clone())).unwrap();
+        let condition = IndexCondition {
+            conditions: vec![Condition::Equal("svc".into(), "api".into())],
+        };
+        let expected = match evaluate_vix_index(
+            "warm-reference",
+            &reference,
+            &condition,
+            Some(IndexOptimizeMode::SimpleCount),
+            (0, i64::MAX),
+            true,
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        {
+            RawVixResult::Count {
+                count,
+                has_skipped: false,
+            } => count,
+            other => panic!("expected exact count, got {other:?}"),
+        };
+        let sidecar = config::vix_sidecar_key(key, 0).unwrap();
+        infra::storage::put(&account, key, data).await.unwrap();
+        infra::storage::put(&account, &sidecar, index)
+            .await
+            .unwrap();
+        struct RemoveReader(&'static str);
+        impl Drop for RemoveReader {
+            fn drop(&mut self) {
+                reader_cache::GLOBAL_CACHE.remove(self.0);
+            }
+        }
+        let _cleanup = RemoveReader(key);
+        reader_cache::GLOBAL_CACHE.remove(key);
+
+        // The classification is available before opening any object.
+        for (path, size, index_size, generation) in [
+            ("not-core.parquet", data_size, index_size, 0),
+            (key, 0, index_size, 0),
+            (key, data_size, 0, 0),
+            (key, data_size, index_size, -1),
+        ] {
+            assert_eq!(
+                warm_file_outcome(&account, path, size, index_size, generation)
+                    .await
+                    .unwrap(),
+                WarmFileOutcome::InvalidInput
+            );
+            assert!(
+                !warm_file(&account, path, size, index_size, generation)
+                    .await
+                    .unwrap()
+            );
+        }
+        let foreground = source::FairShare::enter();
+        assert_eq!(
+            warm_file_outcome(&account, key, data_size, index_size, 0)
+                .await
+                .unwrap(),
+            WarmFileOutcome::Busy
+        );
+        drop(foreground);
+        assert_eq!(
+            warm_file_outcome(&account, key, data_size, index_size, 0)
+                .await
+                .unwrap(),
+            WarmFileOutcome::Warmed
+        );
+        assert_eq!(
+            warm_file_outcome(&account, key, data_size, index_size, 0)
+                .await
+                .unwrap(),
+            WarmFileOutcome::AlreadyWarm
+        );
+        assert!(
+            !warm_file(&account, key, data_size, index_size, 0)
+                .await
+                .unwrap()
+        );
+        let mut file = FileKey::from_file_name(key);
+        file.account = account.clone();
+        file.meta.compressed_size = data_size;
+        file.meta.index_size = index_size;
+        file.meta.min_ts = 0;
+        file.meta.max_ts = i64::MAX - 1;
+        file.meta.records = 3000;
+        let operation = source::ReadOperation::new(Arc::new(source::FetchStats::default()), None);
+        let _owner = operation.owner_guard();
+        let (_, actual, skipped) = search_vix_index(
+            "warm-parity",
+            (0, i64::MAX),
+            Some(condition),
+            Some(IndexOptimizeMode::SimpleCount),
+            &file,
+            VixReadMode::Ranged,
+            SidecarAccess::check_only(true),
+            &operation,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!skipped);
+        match actual {
+            VixSearchResult::Count(count) => assert_eq!(count as u64, expected),
+            other => panic!("expected warmed exact count, got {other:?}"),
+        }
+        let missing = "files/warmup-memory-fixture/logs/test/2026/01/01/00/missing.vix";
+        assert!(
+            warm_file_outcome(&account, missing, 100, 100, 0)
+                .await
+                .is_err()
+        );
+    }
+}

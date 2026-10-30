@@ -39,6 +39,9 @@ use tokio::{
 };
 use vortex_index::VixRangeSource;
 
+#[cfg(test)]
+mod warmup_tests;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VixReadMode {
     Cached,
@@ -593,6 +596,11 @@ const FAIR_SHARE_RECHECK: Duration = Duration::from_millis(20);
 /// Queries currently evaluating index files on this node.
 static ACTIVE_EVALUATING_QUERIES: LazyLock<Arc<std::sync::atomic::AtomicUsize>> =
     LazyLock::new(|| Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+
+/// Background warmup yields before acquiring a slot while queries evaluate indexes.
+pub(super) fn foreground_evaluation_active() -> bool {
+    ACTIVE_EVALUATING_QUERIES.load(Ordering::Acquire) > 0
+}
 
 /// One query's share of the node's evaluation slots (`ZO_VIX_SEARCH_CONCURRENCY`).
 ///
