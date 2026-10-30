@@ -2992,9 +2992,39 @@ pub struct Limit {
     #[env_config(
         name = "ZO_INVERTED_INDEX_TOPN_MAX_GROUP_NUM",
         default = 1000,
-        help = "For top-n group by queries, a file with up to N distinct groups returns all of them, making its contribution to the merged result exact. Files with more groups keep only the limit-derived top-k and the merged top-n becomes approximate; raise to trade speed for accuracy."
+        help = "Maximum complete groups per file for exact TopN aggregation, including the NULL group. Clamped to 1..262144, with a separate 8 MiB key-byte budget. Exhausted budgets fall back to exact DataFusion scans; results are never approximate. Raising this limit increases concurrent and retained partial-result memory."
     )]
     pub inverted_index_topn_max_group_num: usize,
+    #[env_config(
+        name = "ZO_VIX_TOPN_NULL_GROUP_ENABLED",
+        default = true,
+        help = "Preserve a separate SQL NULL group in exact TopN partial results. NULL counts require complete raw-string index coverage or selected stored values. False restores NULL-triggered scan fallback. Empty strings remain distinct from NULL; missing stored columns still require a scan."
+    )]
+    pub vix_topn_null_group_enabled: bool,
+    #[env_config(
+        name = "ZO_VIX_AGG_SELECTED_DICTIONARY_BUDGET_ENABLED",
+        default = true,
+        help = "Apply aggregate dictionary group and owned-key byte budgets after bitmap selection, not to unused dictionary entries. Decoded chunk bytes remain bounded by the existing read budget. False restores the pre-selection dictionary check."
+    )]
+    pub vix_agg_selected_dictionary_budget_enabled: bool,
+    #[env_config(
+        name = "ZO_VIX_AGG_EARLY_CARDINALITY_CHECK_ENABLED",
+        default = true,
+        help = "Refuse over-budget complete dictionary aggregation using ordinal cardinality before scanning counts or resolving keys. This never returns approximate groups. False restores count enumeration before refusal."
+    )]
+    pub vix_agg_early_cardinality_check_enabled: bool,
+    #[env_config(
+        name = "ZO_VIX_AGG_REJECT_CACHE_ENTRIES",
+        default = 4096,
+        help = "Maximum process-wide LRU entries for deterministic TopN refusals, clamped to 65536. Keys include file generation, field, condition, time clamp, budgets and semantic version. Keys over 4096 bytes are not cached. Zero disables rejection caching; transient errors and cancellation are never cached."
+    )]
+    pub vix_agg_reject_cache_entries: usize,
+    #[env_config(
+        name = "ZO_VIX_AGG_STAGED_PROBE_ENABLED",
+        default = true,
+        help = "Start TopN evaluation with 32 files and double after each completed stage up to the configured evaluation concurrency. This limits speculative opens before skip-rate bailout. False restores full concurrency from the first file."
+    )]
+    pub vix_agg_staged_probe_enabled: bool,
     #[env_config(
         name = "ZO_INVERTED_INDEX_MIN_TOKEN_LENGTH",
         default = 2,
@@ -6603,5 +6633,15 @@ mod tests {
             vix_bloom_composite_scope(&broad),
             VixBloomCompositeScope::All
         );
+    }
+    #[test]
+    fn rc4_exact_aggregation_defaults_keep_group_budget_conservative() {
+        let cfg = Config::init().unwrap();
+        assert_eq!(cfg.limit.inverted_index_topn_max_group_num, 1000);
+        assert!(cfg.limit.vix_topn_null_group_enabled);
+        assert!(cfg.limit.vix_agg_selected_dictionary_budget_enabled);
+        assert!(cfg.limit.vix_agg_early_cardinality_check_enabled);
+        assert_eq!(cfg.limit.vix_agg_reject_cache_entries, 4096);
+        assert!(cfg.limit.vix_agg_staged_probe_enabled);
     }
 }

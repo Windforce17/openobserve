@@ -492,7 +492,7 @@ fn create_multi_histogram_arrow_array(
 
 fn create_top_n_arrow_array(
     schema: &SchemaRef,
-    top_n: Vec<(Vec<String>, u64)>,
+    top_n: Vec<(Vec<Option<String>>, u64)>,
 ) -> Result<Vec<Vec<Arc<dyn arrow::array::Array>>>, DataFusionError> {
     // schema is the group fields plus a trailing count field
     let schema_fields = schema.fields().len();
@@ -506,7 +506,7 @@ fn create_top_n_arrow_array(
     let count_field = &schema.fields()[num_group_fields];
 
     // unzip the composite keys and counts, dropping any malformed row
-    let mut group_values: Vec<Vec<String>> =
+    let mut group_values: Vec<Vec<Option<String>>> =
         vec![Vec::with_capacity(top_n.len()); num_group_fields];
     let mut count_values = Vec::with_capacity(top_n.len());
     for (keys, count) in top_n {
@@ -532,7 +532,29 @@ fn create_top_n_arrow_array(
         let mut arrays = Vec::with_capacity(schema_fields);
         for (i, values) in group_values.iter().enumerate() {
             let chunk = values[chunk_start..chunk_end].to_vec();
-            arrays.push(create_field_array(&schema.fields()[i], chunk)?);
+            let field = &schema.fields()[i];
+            let array: Arc<dyn Array> = match field.data_type() {
+                arrow_schema::DataType::Utf8 => Arc::new(arrow::array::StringArray::from(chunk)),
+                arrow_schema::DataType::LargeUtf8 => {
+                    Arc::new(arrow::array::LargeStringArray::from(chunk))
+                }
+                arrow_schema::DataType::Utf8View => {
+                    Arc::new(arrow::array::StringViewArray::from(chunk))
+                }
+                _ => {
+                    let values =
+                        chunk
+                            .into_iter()
+                            .collect::<Option<Vec<_>>>()
+                            .ok_or_else(|| {
+                                DataFusionError::Internal(
+                                    "NULL TopN key has a non-string schema".into(),
+                                )
+                            })?;
+                    create_field_array(field, values)?
+                }
+            };
+            arrays.push(array);
         }
         let count_chunk = count_values[chunk_start..chunk_end].to_vec();
         arrays.push(create_count_array(count_field, count_chunk)?);
@@ -1218,7 +1240,10 @@ mod tests {
             Field::new("field", DataType::Utf8, false),
             Field::new("count", DataType::Int64, false),
         ]));
-        let top_n = vec![(vec!["a".to_string()], 10), (vec!["b".to_string()], 20)];
+        let top_n = vec![
+            (vec![Some("a".to_string())], 10),
+            (vec![Some("b".to_string())], 20),
+        ];
         let result = create_top_n_arrow_array(&schema, top_n).unwrap();
 
         assert_eq!(result.len(), 1); // One batch
@@ -1240,8 +1265,8 @@ mod tests {
             Field::new("count", DataType::Int64, false),
         ]));
         let top_n = vec![
-            (vec!["a".to_string(), "x".to_string()], 10),
-            (vec!["b".to_string(), "y".to_string()], 20),
+            (vec![Some("a".to_string()), Some("x".to_string())], 10),
+            (vec![Some("b".to_string()), Some("y".to_string())], 20),
         ];
         let result = create_top_n_arrow_array(&schema, top_n).unwrap();
 
@@ -1274,12 +1299,14 @@ mod tests {
             DataType::Utf8,
             false,
         )]));
-        assert!(create_top_n_arrow_array(&bad_schema, vec![(vec!["a".to_string()], 10)]).is_err());
+        assert!(
+            create_top_n_arrow_array(&bad_schema, vec![(vec![Some("a".to_string())], 10)]).is_err()
+        );
 
         // rows whose key width mismatches the schema are dropped
         let top_n = vec![
-            (vec!["a".to_string()], 10),
-            (vec!["b".to_string(), "extra".to_string()], 20),
+            (vec![Some("a".to_string())], 10),
+            (vec![Some("b".to_string()), Some("extra".to_string())], 20),
         ];
         let result = create_top_n_arrow_array(&schema, top_n).unwrap();
         assert_eq!(result.len(), 1);
