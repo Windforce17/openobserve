@@ -58,7 +58,7 @@ pub enum VixSearchResult {
     /// multi histogram optimization: `(bucket key, breakdown value, count)`
     MultiHistogram(Vec<(i64, String, u64)>),
     /// group-by top-n optimization (1..=4 group fields)
-    TopN(Vec<(Vec<String>, u64)>),
+    TopN(Vec<(Vec<Option<String>>, u64)>),
     /// simple distinct optimization
     Distinct(HashSet<String>),
     /// M16 min/max(field) optimization: the file's extreme value of the
@@ -142,15 +142,15 @@ impl VixSearchResult {
                     + std::mem::size_of::<Vec<(i64, String, u64)>>()
             }
             Self::TopN(top_n) => {
-                top_n
-                    .iter()
-                    .map(|(keys, _)| {
-                        keys.iter().map(|s| s.capacity()).sum::<usize>()
-                            + std::mem::size_of::<Vec<String>>()
-                            + std::mem::size_of::<u64>()
-                    })
-                    .sum::<usize>()
-                    + std::mem::size_of::<Vec<(Vec<String>, u64)>>()
+                top_n.capacity() * std::mem::size_of::<(Vec<Option<String>>, u64)>()
+                    + top_n
+                        .iter()
+                        .map(|(keys, _)| {
+                            keys.capacity() * std::mem::size_of::<Option<String>>()
+                                + keys.iter().flatten().map(String::capacity).sum::<usize>()
+                        })
+                        .sum::<usize>()
+                    + std::mem::size_of_val(top_n)
             }
             Self::Distinct(distinct) => {
                 distinct.iter().map(|s| s.capacity()).sum::<usize>()
@@ -174,7 +174,7 @@ pub enum MultiResultBuilder {
     /// hot window does not retain one allocation per core file.
     Histogram(Vec<u64>),
     MultiHistogram(Vec<Vec<(i64, String, u64)>>),
-    TopN(Vec<(Vec<String>, u64)>),
+    TopN(Vec<(Vec<Option<String>>, u64)>),
     Distinct(HashSet<String>),
     MinMax {
         is_max: bool,
@@ -266,7 +266,7 @@ impl MultiResultBuilder {
     }
 
     // simple top-n
-    pub fn add_top_n(&mut self, top_n: Vec<(Vec<String>, u64)>) {
+    pub fn add_top_n(&mut self, top_n: Vec<(Vec<Option<String>>, u64)>) {
         match self {
             Self::TopN(a) => a.extend(top_n),
             _ => unreachable!("unsupported vix multi result"),
@@ -346,7 +346,7 @@ pub enum MultiResult {
     SimpleSelect(u64),
     Histogram(Vec<u64>),
     MultiHistogram(Vec<(i64, String, u64)>),
-    TopN(Vec<(Vec<String>, u64)>),
+    TopN(Vec<(Vec<Option<String>>, u64)>),
     Distinct(HashSet<String>),
     /// M16 min/max(field): the cross-file fold (`None` = no value matched)
     MinMax(Option<MinMaxValue>),
@@ -393,7 +393,7 @@ impl MultiResult {
         }
     }
 
-    pub fn top_n(self) -> Vec<(Vec<String>, u64)> {
+    pub fn top_n(self) -> Vec<(Vec<Option<String>>, u64)> {
         match self {
             Self::TopN(a) => a,
             _ => vec![],
@@ -635,12 +635,15 @@ mod tests {
             )),
             &[],
         );
-        builder.add_top_n(vec![(vec!["a".to_string()], 5)]);
-        builder.add_top_n(vec![(vec!["a".to_string()], 2), (vec!["b".to_string()], 1)]);
+        builder.add_top_n(vec![(vec![Some("a".to_string())], 5)]);
+        builder.add_top_n(vec![
+            (vec![Some("a".to_string())], 2),
+            (vec![Some("b".to_string())], 1),
+        ]);
         match builder.build("test", &mut HashMap::new()) {
             MultiResult::TopN(rows) => {
                 assert_eq!(rows.len(), 3);
-                assert_eq!(rows[0], (vec!["a".to_string()], 5));
+                assert_eq!(rows[0], (vec![Some("a".to_string())], 5));
             }
             _ => panic!("expected TopN"),
         }
@@ -675,8 +678,8 @@ mod tests {
             vec![(1, "a".to_string(), 2)]
         );
         assert_eq!(
-            MultiResult::TopN(vec![(vec!["a".to_string()], 2)]).top_n(),
-            vec![(vec!["a".to_string()], 2)]
+            MultiResult::TopN(vec![(vec![Some("a".to_string())], 2)]).top_n(),
+            vec![(vec![Some("a".to_string())], 2)]
         );
         assert_eq!(
             MultiResult::Distinct(HashSet::from(["v".to_string()])).distinct(),
@@ -705,7 +708,10 @@ mod tests {
             "multi_histogram hits: 1"
         );
         assert_eq!(
-            format!("{}", MultiResult::TopN(vec![(vec!["a".to_string()], 1)])),
+            format!(
+                "{}",
+                MultiResult::TopN(vec![(vec![Some("a".to_string())], 1)])
+            ),
             "top_n hits: 1"
         );
         assert_eq!(
@@ -752,8 +758,8 @@ mod tests {
             VixSearchResult::MultiHistogram(vec![(1, "aa".to_string(), 2)]).get_memory_size() > 0
         );
         assert!(
-            VixSearchResult::TopN(vec![(vec!["aa".to_string()], 2)]).get_memory_size()
-                >= std::mem::size_of::<Vec<(Vec<String>, u64)>>()
+            VixSearchResult::TopN(vec![(vec![Some("aa".to_string())], 2)]).get_memory_size()
+                >= std::mem::size_of::<Vec<(Vec<Option<String>>, u64)>>()
         );
         assert!(
             VixSearchResult::Distinct(HashSet::from(["aa".to_string()])).get_memory_size()

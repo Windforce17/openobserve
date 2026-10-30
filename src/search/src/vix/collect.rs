@@ -1464,6 +1464,35 @@ fn dict_multi_histogram(
     Ok(counts.finish())
 }
 
+enum DictionaryStrings<'a> {
+    Utf8(&'a StringArray),
+    Large(&'a arrow::array::LargeStringArray),
+    View(&'a arrow::array::StringViewArray),
+}
+
+impl<'a> DictionaryStrings<'a> {
+    fn new(values: &'a ArrayRef) -> anyhow::Result<Self> {
+        use arrow::array::AsArray;
+        if let Some(values) = values.as_string_opt::<i32>() {
+            Ok(Self::Utf8(values))
+        } else if let Some(values) = values.as_string_opt::<i64>() {
+            Ok(Self::Large(values))
+        } else if let Some(values) = values.as_string_view_opt() {
+            Ok(Self::View(values))
+        } else {
+            Err(AggregateFallback("unsupported aggregate dictionary type").into())
+        }
+    }
+
+    fn value(&self, code: usize) -> &'a str {
+        match self {
+            Self::Utf8(values) => values.value(code),
+            Self::Large(values) => values.value(code),
+            Self::View(values) => values.value(code),
+        }
+    }
+}
+
 fn fold_dict_chunk(
     counts: &mut GroupCounts,
     chunk: vortex_index::DocsDictBatch,
@@ -1488,18 +1517,20 @@ fn fold_dict_chunk(
     {
         return Err(AggregateFallback("misaligned aggregate dictionary rows").into());
     }
-    if chunk.values.len() > counts.limits.max_values
-        || chunk.values.get_array_memory_size() > counts.limits.max_value_bytes
+    if !config::get_config()
+        .limit
+        .vix_agg_selected_dictionary_budget_enabled
+        && (chunk.values.len() > counts.limits.max_values
+            || chunk.values.get_array_memory_size() > counts.limits.max_value_bytes)
     {
         return Err(AggregateFallback("aggregate chunk dictionary budget exceeded").into());
     }
-    let values = cast(&chunk.values, &DataType::Utf8)?;
-    let values = values
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or(AggregateFallback("unsupported aggregate dictionary type"))?;
+    let values = DictionaryStrings::new(&chunk.values)?;
     let mut local: HashMap<(i64, usize), u64> = HashMap::new();
     for i in 0..chunk.codes.len() {
+        if i % 4096 == 0 {
+            vortex_index::check_read_cancelled()?;
+        }
         let row = point_rows.map_or(chunk.row_offset as usize + i, |rows| rows[i] as usize);
         if !bitmap.value(row) {
             continue;
@@ -1530,11 +1561,20 @@ fn fold_dict_chunk(
             return Err(AggregateFallback("NULL aggregate group requires scan").into());
         }
         let code = usize::try_from(chunk.codes.value(i))?;
-        if code >= values.len() {
+        if code >= chunk.values.len() {
             anyhow::bail!("aggregate dictionary code out of bounds");
         }
-        if values.is_null(code) {
+        if chunk.values.is_null(code) {
             return Err(AggregateFallback("NULL aggregate group requires scan").into());
+        }
+        if point_rows.is_some()
+            && config::get_config()
+                .limit
+                .vix_agg_selected_dictionary_budget_enabled
+        {
+            // Point reads synthesize one code per row, not one per value.
+            counts.add(bucket, values.value(code), 1)?;
+            continue;
         }
         if let Some(total) = local.get_mut(&(bucket, code)) {
             *total += 1;
@@ -1551,11 +1591,11 @@ fn fold_dict_chunk(
     Ok(())
 }
 #[derive(Hash)]
-struct BorrowedGroup<'a>(&'a [&'a str]);
+struct BorrowedGroup<'a>(&'a [Option<&'a str>]);
 
-impl hashbrown::Equivalent<Vec<String>> for BorrowedGroup<'_> {
-    fn equivalent(&self, key: &Vec<String>) -> bool {
-        self.0.len() == key.len() && self.0.iter().zip(key).all(|(a, b)| *a == b)
+impl hashbrown::Equivalent<Vec<Option<String>>> for BorrowedGroup<'_> {
+    fn equivalent(&self, key: &Vec<Option<String>>) -> bool {
+        self.0.len() == key.len() && self.0.iter().zip(key).all(|(a, b)| *a == b.as_deref())
     }
 }
 
@@ -1566,7 +1606,7 @@ pub(super) fn simple_top_n(
     fields: &[String],
     _limit: usize,
     _ascend: bool,
-) -> anyhow::Result<Vec<(Vec<String>, u64)>> {
+) -> anyhow::Result<Vec<(Vec<Option<String>>, u64)>> {
     if fields.is_empty() || fields.len() > MAX_SIMPLE_TOPN_FIELDS {
         return Err(AggregateFallback("unsupported aggregate grouping fields").into());
     }
@@ -1595,7 +1635,8 @@ pub(super) fn simple_top_n(
             return Err(AggregateFallback("unsupported aggregate value type").into());
         }
     }
-    let mut counts: HashMap<Vec<String>, u64> = HashMap::new();
+    let mut counts: HashMap<Vec<Option<String>>, u64> = HashMap::new();
+    let allow_null = config::get_config().limit.vix_topn_null_group_enabled;
     let mut bytes = 0usize;
     for start in (0..bitmap.len()).step_by(65_536) {
         vortex_index::check_read_cancelled()?;
@@ -1609,18 +1650,18 @@ pub(super) fn simple_top_n(
             .map(|field| read_column_strings(reader, field, Some(&rows)))
             .collect::<anyhow::Result<Vec<_>>>()?;
         for i in 0..rows.len() {
-            if columns.iter().any(|column| column.is_null(i)) {
+            if !allow_null && columns.iter().any(|column| column.is_null(i)) {
                 return Err(AggregateFallback("NULL aggregate group requires scan").into());
             }
-            let mut key = [""; MAX_SIMPLE_TOPN_FIELDS];
+            let mut key = [None; MAX_SIMPLE_TOPN_FIELDS];
             for (slot, column) in key.iter_mut().zip(&columns) {
-                *slot = column.value(i);
+                *slot = (!column.is_null(i)).then(|| column.value(i));
             }
             let borrowed = BorrowedGroup(&key[..fields.len()]);
             if let Some(total) = counts.get_mut(&borrowed) {
                 *total += 1;
             } else {
-                let key_bytes: usize = borrowed.0.iter().map(|value| value.len()).sum();
+                let key_bytes: usize = borrowed.0.iter().flatten().map(|value| value.len()).sum();
                 if counts.len() >= limits.max_groups
                     || key_bytes > limits.max_value_bytes.saturating_sub(bytes)
                 {
@@ -1628,7 +1669,11 @@ pub(super) fn simple_top_n(
                 }
                 bytes += key_bytes;
                 counts.insert(
-                    borrowed.0.iter().map(|value| (*value).to_owned()).collect(),
+                    borrowed
+                        .0
+                        .iter()
+                        .map(|value| value.map(str::to_owned))
+                        .collect(),
                     1,
                 );
             }
@@ -1641,16 +1686,144 @@ fn dict_group_counts(
     reader: &VixReader,
     field: &str,
     bitmap: &BooleanBuffer,
-) -> anyhow::Result<HashMap<String, u64>> {
-    let mut counts = GroupCounts::new(top_n_limits());
+) -> anyhow::Result<HashMap<Option<String>, u64>> {
+    let limits = top_n_limits();
+    let cfg = config::get_config();
+    let mut counts: HashMap<Option<String>, u64> = HashMap::new();
+    let mut bytes = 0usize;
     visit_selected_dict_chunks(reader, field, bitmap, None, &mut |chunk, rows| {
-        fold_dict_chunk(&mut counts, chunk, bitmap, rows, None)
+        fold_top_n_chunk(
+            &mut counts,
+            &mut bytes,
+            limits,
+            chunk,
+            bitmap,
+            rows,
+            cfg.limit.vix_topn_null_group_enabled,
+            cfg.limit.vix_agg_selected_dictionary_budget_enabled,
+        )
     })?;
-    Ok(counts
-        .finish()
-        .into_iter()
-        .map(|(_, value, count)| (value, count))
-        .collect())
+    Ok(counts)
+}
+
+/// Count only selected codes before allocating owned keys. A NULL code and a
+/// code pointing at a NULL dictionary value both contribute to SQL NULL.
+#[allow(clippy::too_many_arguments)]
+fn fold_top_n_chunk(
+    counts: &mut HashMap<Option<String>, u64>,
+    bytes: &mut usize,
+    limits: DictMultiHistogramLimits,
+    chunk: vortex_index::DocsDictBatch,
+    bitmap: &BooleanBuffer,
+    point_rows: Option<&[u64]>,
+    allow_null: bool,
+    selected_budget: bool,
+) -> anyhow::Result<()> {
+    if point_rows.is_some_and(|rows| rows.len() != chunk.codes.len())
+        || point_rows.map_or_else(
+            || {
+                chunk
+                    .row_offset
+                    .checked_add(chunk.codes.len() as u64)
+                    .is_none_or(|end| end > bitmap.len() as u64)
+            },
+            |rows| rows.iter().any(|row| *row >= bitmap.len() as u64),
+        )
+    {
+        return Err(AggregateFallback("misaligned aggregate dictionary rows").into());
+    }
+    if !selected_budget
+        && (chunk.values.len() > limits.max_values
+            || chunk.values.get_array_memory_size() > limits.max_value_bytes)
+    {
+        return Err(AggregateFallback("aggregate chunk dictionary budget exceeded").into());
+    }
+    let values = DictionaryStrings::new(&chunk.values)?;
+    let mut local: HashMap<Option<usize>, u64> = HashMap::new();
+    for i in 0..chunk.codes.len() {
+        if i % 4096 == 0 {
+            vortex_index::check_read_cancelled()?;
+        }
+        let row = point_rows.map_or(chunk.row_offset as usize + i, |rows| rows[i] as usize);
+        if !bitmap.value(row) {
+            continue;
+        }
+        let code = if chunk.codes.is_null(i) {
+            None
+        } else {
+            let code = usize::try_from(chunk.codes.value(i))?;
+            if code >= chunk.values.len() {
+                anyhow::bail!(
+                    "aggregate dictionary code {code} out of bounds {}",
+                    chunk.values.len()
+                );
+            }
+            (!chunk.values.is_null(code)).then_some(code)
+        };
+        if code.is_none() && !allow_null {
+            return Err(AggregateFallback("NULL aggregate group requires scan").into());
+        }
+        if point_rows.is_some() && selected_budget {
+            add_top_n_value(
+                counts,
+                bytes,
+                limits,
+                code.map(|code| values.value(code)),
+                1,
+            )?;
+            continue;
+        }
+        if let Some(count) = local.get_mut(&code) {
+            *count += 1;
+        } else {
+            if local.len() >= limits.max_groups {
+                return Err(AggregateFallback("aggregate chunk group budget exceeded").into());
+            }
+            local.insert(code, 1);
+        }
+    }
+    for (code, count) in local {
+        add_top_n_value(
+            counts,
+            bytes,
+            limits,
+            code.map(|code| values.value(code)),
+            count,
+        )?;
+    }
+    Ok(())
+}
+
+fn add_top_n_value(
+    counts: &mut HashMap<Option<String>, u64>,
+    bytes: &mut usize,
+    limits: DictMultiHistogramLimits,
+    value: Option<&str>,
+    count: u64,
+) -> anyhow::Result<()> {
+    // Borrow without allocating one String per occurrence/chunk.
+    if let Some(total) = counts.get_mut(&BorrowedValue(value)) {
+        *total = total
+            .checked_add(count)
+            .ok_or(AggregateFallback("aggregate count overflow"))?;
+    } else {
+        let len = value.map_or(0, str::len);
+        if counts.len() >= limits.max_groups || len > limits.max_value_bytes.saturating_sub(*bytes)
+        {
+            return Err(AggregateFallback("aggregate group budget exceeded").into());
+        }
+        *bytes += len;
+        counts.insert(value.map(str::to_owned), count);
+    }
+    Ok(())
+}
+
+#[derive(Hash)]
+struct BorrowedValue<'a>(Option<&'a str>);
+impl hashbrown::Equivalent<Option<String>> for BorrowedValue<'_> {
+    fn equivalent(&self, key: &Option<String>) -> bool {
+        self.0 == key.as_deref()
+    }
 }
 
 fn top_n_limits() -> DictMultiHistogramLimits {
@@ -1771,7 +1944,7 @@ impl OrderedDistinct {
 
 /// One file's TopN groups: `(group key, count)` with one key entry per
 /// group field.
-type TopNGroups = Vec<(Vec<String>, u64)>;
+type TopNGroups = Vec<(Vec<Option<String>>, u64)>;
 
 /// Unfiltered full-range SimpleTopN over one field, served straight from the
 /// term dictionary (`VixReader::field_value_counts`): every raw term of the
@@ -1788,15 +1961,43 @@ pub(super) fn unfiltered_top_n(
     let Some(counts) = complete_value_counts(reader, field)? else {
         return Ok(None);
     };
-    if counts.iter().map(|(_, count)| *count).sum::<u64>() != reader.row_count() {
+    Ok(Some(nullable_dictionary_groups(
+        counts,
+        reader.row_count(),
+        top_n_limits(),
+        config::get_config().limit.vix_topn_null_group_enabled,
+    )?))
+}
+
+/// Only call after raw-string/key-term reconciliation and oversize checks.
+/// Missing source fields and explicit NULL both map to SQL NULL, never "".
+fn nullable_dictionary_groups(
+    counts: Vec<(String, u64)>,
+    rows: u64,
+    limits: DictMultiHistogramLimits,
+    allow_null: bool,
+) -> anyhow::Result<TopNGroups> {
+    let non_null = counts
+        .iter()
+        .try_fold(0u64, |sum, (_, count)| sum.checked_add(*count))
+        .ok_or(AggregateFallback("aggregate count overflow"))?;
+    let null_count = rows
+        .checked_sub(non_null)
+        .ok_or(AggregateFallback("aggregate counts exceed selected rows"))?;
+    if null_count > 0 && !allow_null {
         return Err(AggregateFallback("NULL or missing aggregate values require scan").into());
     }
-    Ok(Some(
-        counts
-            .into_iter()
-            .map(|(value, count)| (vec![value], count))
-            .collect(),
-    ))
+    if counts.len().saturating_add(usize::from(null_count > 0)) > limits.max_groups {
+        return Err(AggregateFallback("aggregate dictionary group budget exceeded").into());
+    }
+    let mut groups: TopNGroups = counts
+        .into_iter()
+        .map(|(value, count)| (vec![Some(value)], count))
+        .collect();
+    if null_count > 0 {
+        groups.push((vec![None], null_count));
+    }
+    Ok(groups)
 }
 
 /// Bounded complete raw-string counts; never confuse a top-k witness with a
@@ -1805,10 +2006,23 @@ fn complete_value_counts(
     reader: &VixReader,
     field: &str,
 ) -> anyhow::Result<Option<Vec<(String, u64)>>> {
-    if reader.field_oversize_skips(field) != 0 {
+    if !matches!(
+        super::field_capability(reader, field),
+        crate::index::FieldCap::Term | crate::index::FieldCap::Absent
+    ) || reader.field_oversize_skips(field) != 0
+    {
         return Ok(None);
     }
     let limits = top_n_limits();
+    if config::get_config()
+        .limit
+        .vix_agg_early_cardinality_check_enabled
+        && reader
+            .field_distinct_string_terms(field)?
+            .is_some_and(|count| count > limits.max_values as u64)
+    {
+        return Err(AggregateFallback("aggregate dictionary group budget exceeded").into());
+    }
     let Some((counts, truncated)) = reader.field_value_top_k(field, limits.max_values, false)?
     else {
         return Ok(None);
@@ -1953,15 +2167,16 @@ pub(super) fn filtered_top_n(
     _ascend: bool,
 ) -> anyhow::Result<Option<TopNGroups>> {
     let cap = top_n_limits().max_values;
-    if reader.field_oversize_skips(field) != 0 {
+    if !matches!(
+        super::field_capability(reader, field),
+        crate::index::FieldCap::Term | crate::index::FieldCap::Absent
+    ) || reader.field_oversize_skips(field) != 0
+    {
         return Ok(None);
     }
     let Some(counts) = reader.field_value_counts_filtered(field, bitmap, cap)? else {
         return Ok(None);
     };
-    if counts.iter().map(|(_, count)| *count).sum::<u64>() != bitmap.count_set_bits() as u64 {
-        return Err(AggregateFallback("NULL or missing aggregate values require scan").into());
-    }
     let mut bytes = 0usize;
     let mut top = Vec::new();
     for (value, count) in counts.into_iter().filter(|(_, count)| *count > 0) {
@@ -1970,14 +2185,17 @@ pub(super) fn filtered_top_n(
         }
         bytes += value.len();
         top.push((
-            vec![
-                String::from_utf8(value)
-                    .map_err(|_| AggregateFallback("aggregate dictionary is not raw UTF8"))?,
-            ],
+            String::from_utf8(value)
+                .map_err(|_| AggregateFallback("aggregate dictionary is not raw UTF8"))?,
             count,
         ));
     }
-    Ok(Some(top))
+    Ok(Some(nullable_dictionary_groups(
+        top,
+        bitmap.count_set_bits() as u64,
+        top_n_limits(),
+        config::get_config().limit.vix_topn_null_group_enabled,
+    )?))
 }
 
 /// FILTERED SimpleDistinct twin of [`filtered_top_n`]: the field's values
@@ -2031,7 +2249,11 @@ pub(super) fn unfiltered_distinct(
         return Ok(Some(HashSet::new()));
     }
     let mut selected = OrderedDistinct::new(limit, ascend)?;
-    if !reader.has_index() || reader.field_oversize_skips(field) != 0 {
+    if !matches!(
+        super::field_capability(reader, field),
+        crate::index::FieldCap::Term | crate::index::FieldCap::Absent
+    ) || reader.field_oversize_skips(field) != 0
+    {
         return Ok(None);
     }
     let Some(values) = reader.field_value_head(field, limit, !ascend)? else {
@@ -2348,8 +2570,8 @@ mod tests {
         assert_eq!(
             groups.into_iter().collect::<HashMap<_, _>>(),
             HashMap::from_iter([
-                (vec!["oversized".to_owned()], 1),
-                (vec!["short".to_owned()], 1),
+                (vec![Some("oversized".to_owned())], 1),
+                (vec![Some("short".to_owned())], 1),
             ])
         );
     }
@@ -2363,11 +2585,18 @@ mod tests {
                     .unwrap_err()
                     .is::<AggregateFallback>()
             );
-            assert!(
-                simple_top_n(&reader, &all_set(8), &[field.to_owned()], 1, false)
-                    .unwrap_err()
-                    .is::<AggregateFallback>()
-            );
+            if field == "absent" {
+                assert!(
+                    simple_top_n(&reader, &all_set(8), &[field.to_owned()], 1, false)
+                        .unwrap_err()
+                        .is::<AggregateFallback>()
+                );
+            } else {
+                let groups =
+                    simple_top_n(&reader, &all_set(8), &[field.to_owned()], 1, false).unwrap();
+                assert!(groups.contains(&(vec![None], 1)));
+                assert_eq!(groups.iter().map(|(_, n)| n).sum::<u64>(), 8);
+            }
         }
         // A bitmap excluding NULL is safe; the selected rows, not schema
         // nullability, establish whether the String wire result is exact.
@@ -2377,12 +2606,16 @@ mod tests {
             .unwrap();
         assert_eq!(
             counts.into_iter().collect::<HashMap<_, _>>(),
-            HashMap::from_iter([(vec!["info".to_owned()], 4), (vec!["error".to_owned()], 3)])
+            HashMap::from_iter([
+                (vec![Some("info".to_owned())], 4),
+                (vec![Some("error".to_owned())], 3)
+            ])
         );
         assert!(
             filtered_top_n(&reader, &all_set(8), "level", 1, false)
-                .unwrap_err()
-                .is::<AggregateFallback>()
+                .unwrap()
+                .unwrap()
+                .contains(&(vec![None], 1))
         );
     }
 
@@ -2834,26 +3067,27 @@ mod tests {
         assert_eq!(
             groups,
             vec![
-                (vec!["a".to_string()], 5),
-                (vec!["b".to_string()], 2),
-                (vec!["c".to_string()], 1),
+                (vec![Some("a".to_string())], 5),
+                (vec![Some("b".to_string())], 2),
+                (vec![Some("c".to_string())], 1),
             ]
         );
     }
 
     #[test]
-    fn test_simple_top_n_multi_field_requires_null_scan() {
+    fn test_simple_top_n_multi_field_preserves_null_group() {
         let reader = build_reader();
         let bitmap = all_set(8);
-        let error = simple_top_n(
+        let nullable = simple_top_n(
             &reader,
             &bitmap,
             &["level".to_string(), "service".to_string()],
             10,
             false,
         )
-        .unwrap_err();
-        assert!(error.is::<AggregateFallback>());
+        .unwrap();
+        assert!(nullable.contains(&(vec![None, Some("a".to_owned())], 1)));
+        assert_eq!(nullable.iter().map(|(_, n)| n).sum::<u64>(), 8);
         let bitmap = BooleanBuffer::from_iter((0..8).map(|i| i != 5));
         let groups = simple_top_n(
             &reader,
@@ -3143,17 +3377,18 @@ mod tests {
         assert_eq!(
             dict_sorted,
             vec![
-                (vec!["a".to_string()], 5),
-                (vec!["b".to_string()], 2),
-                (vec!["c".to_string()], 1),
+                (vec![Some("a".to_string())], 5),
+                (vec![Some("b".to_string())], 2),
+                (vec![Some("c".to_string())], 1),
             ]
         );
 
-        // Key-term reconciliation does not account for the SQL NULL group.
+        // Complete key-term reconciliation proves the complementary NULL group.
         assert!(
             unfiltered_top_n(&reader, "level", 10, false)
-                .unwrap_err()
-                .is::<AggregateFallback>()
+                .unwrap()
+                .unwrap()
+                .contains(&(vec![None], 1))
         );
 
         // distinct via the dictionary matches the docs path, asc and desc
@@ -3221,10 +3456,12 @@ mod tests {
                 let dict = dict_group_counts(&reader, column, bitmap).unwrap();
                 // string-path reference counts
                 let values = read_column_strings(&reader, column, None).unwrap();
-                let mut expected: HashMap<String, u64> = HashMap::new();
+                let mut expected: HashMap<Option<String>, u64> = HashMap::new();
                 for i in 0..values.len() {
                     if bitmap.value(i) && !values.is_null(i) {
-                        *expected.entry(values.value(i).to_string()).or_insert(0) += 1;
+                        *expected
+                            .entry(Some(values.value(i).to_string()))
+                            .or_insert(0) += 1;
                     }
                 }
                 assert_eq!(dict, expected, "column {column}, bitmap {name}");
@@ -3232,13 +3469,13 @@ mod tests {
         }
         // and the public collectors serve identical results through it
         let groups = simple_top_n(&reader, &partial, &["service".to_string()], 10, false).unwrap();
-        let mut totals: HashMap<String, u64> = HashMap::new();
+        let mut totals: HashMap<Option<String>, u64> = HashMap::new();
         for (key, count) in groups {
             *totals.entry(key[0].clone()).or_insert(0) += count;
         }
         assert_eq!(
             totals,
-            HashMap::from_iter([("a".to_string(), 3), ("b".to_string(), 1)])
+            HashMap::from_iter([(Some("a".to_string()), 3), (Some("b".to_string()), 1)])
         );
         assert_eq!(
             simple_distinct(&reader, &partial, "service", 10, true).unwrap(),
@@ -4249,3 +4486,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "collect_rc4_tests.rs"]
+mod rc4_tests;

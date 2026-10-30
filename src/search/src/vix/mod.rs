@@ -55,12 +55,15 @@
 //! concurrent followers; operation-owned cancellation and accounting remain
 //! separate from shared immutable readers.
 
+mod aggregate_reject;
 pub mod cache;
 mod collect;
 #[cfg(test)]
 mod dispatch_bench;
 #[cfg(test)]
 mod query_regressions;
+#[cfg(test)]
+mod rc4_regressions;
 
 mod layout_memory;
 mod partition;
@@ -504,6 +507,15 @@ pub async fn vix_search(
     // The sliding-window cap: SimpleSelect keeps the ramp that bounds
     // speculative reads (64, 128, 256, ... doublings), every other mode
     // runs at the full evaluation concurrency from the start.
+    let staged_topn = cfg.limit.vix_agg_staged_probe_enabled
+        && matches!(idx_optimize_mode, Some(IndexOptimizeMode::SimpleTopN(..)));
+    let evaluation_window = |completed, cap| {
+        if staged_topn {
+            aggregate_window_for(completed, cap)
+        } else {
+            window_for(simple_select_pruning, completed, cap)
+        }
+    };
     let window_cap = if simple_select_pruning {
         eval_concurrency.max(64)
     } else {
@@ -512,7 +524,7 @@ pub async fn vix_search(
     log::info!(
         "[trace_id {trace_id}] search->vix: target_partitions: {target_partitions}, files: {}, window: {}..{window_cap}",
         index_parquet_files.len(),
-        window_for(simple_select_pruning, 0, window_cap),
+        evaluation_window(0, window_cap),
     );
 
     // Projected-cost bail-out for optimize-mode evaluations: a
@@ -573,7 +585,7 @@ pub async fn vix_search(
     // the position after the last file handed to the window
     let mut next_position = 0usize;
     'window: loop {
-        while in_flight.len() < window_for(simple_select_pruning, completed_files, window_cap)
+        while in_flight.len() < evaluation_window(completed_files, window_cap)
             && next_position < index_parquet_files.len()
         {
             let position = next_position;
@@ -1307,7 +1319,7 @@ enum RawVixResult {
     },
     /// simple top-n fast path
     TopN {
-        groups: Vec<(Vec<String>, u64)>,
+        groups: Vec<(Vec<Option<String>>, u64)>,
         has_skipped: bool,
     },
     /// simple distinct fast path
@@ -1560,6 +1572,24 @@ async fn search_vix_index(
         ));
     }
     let cfg = get_config();
+    let reject_key = (cfg.limit.vix_agg_reject_cache_entries > 0
+        && matches!(idx_optimize_rule, Some(IndexOptimizeMode::SimpleTopN(..))))
+    .then(|| {
+        aggregate_reject_key(
+            &condition,
+            &idx_optimize_rule,
+            parquet_file,
+            time_clamp,
+            full_text_fields,
+            &cfg.limit,
+        )
+    });
+    if let Some(reason) = reject_key
+        .as_deref()
+        .and_then(|key| aggregate_reject::CACHE.get(key))
+    {
+        return Err(collect::AggregateFallback(reason).into());
+    }
     let mut cache_key = String::new();
     if cfg.common.inverted_index_result_cache_enabled {
         metrics::VIX_RESULT_CACHE_REQUESTS_TOTAL
@@ -1802,7 +1832,14 @@ async fn search_vix_index(
             full_text_fields.as_deref(),
         )
     })
-    .await?;
+    .await;
+    if let (Some(key), Err(error)) = (reject_key, &raw)
+        && !operation.is_cancelled()
+        && !is_cancelled_read(error)
+    {
+        aggregate_reject::CACHE.put(key, error);
+    }
+    let raw = raw?;
     if !operation.is_cancelled()
         && !data_only_all_aggregate
         && !matches!(
@@ -2063,13 +2100,14 @@ async fn search_vix_docs_optimized(
                 }),
             IndexOptimizeMode::SimpleHistogram(min_value, bucket_width, num_buckets, ts_offset) => {
                 if let Some(bucket) = whole_file_bucket {
-                    docs.eq_string_count(&task_field, &needle, None).map(|count| {
-                        count.map(|count| {
-                            let mut histogram = vec![0u64; num_buckets];
-                            histogram[bucket] = count;
-                            VixSearchResult::Histogram(histogram)
+                    docs.eq_string_count(&task_field, &needle, None)
+                        .map(|count| {
+                            count.map(|count| {
+                                let mut histogram = vec![0u64; num_buckets];
+                                histogram[bucket] = count;
+                                VixSearchResult::Histogram(histogram)
+                            })
                         })
-                    })
                 } else {
                     docs.eq_string_histogram(
                         &task_field,
@@ -2365,8 +2403,12 @@ fn evaluate_vix_index(
         {
             let rows = groups
                 .into_iter()
-                .map(|(mut key, count)| (label, key.remove(0), count))
-                .collect();
+                .map(|(mut key, count)| {
+                    key.remove(0).map(|value| (label, value, count)).ok_or(
+                        collect::AggregateFallback("NULL aggregate group requires scan"),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             return Ok(RawVixResult::MultiHistogram {
                 rows,
                 has_skipped: false,
@@ -3126,6 +3168,32 @@ pub fn generate_cache_key(
     )
 }
 
+/// Semantic version and all rejection inputs prevent stale negative reuse.
+/// TopN rules are not grid-normalized; filters and clamps use the same identity
+/// as successful exact results. Account and data metadata additionally isolate
+/// stores and immutable data generations under a reused logical file name.
+fn aggregate_reject_key(
+    condition: &IndexCondition,
+    rule: &Option<IndexOptimizeMode>,
+    file: &FileKey,
+    clamp: Option<(i64, i64)>,
+    full_text_fields: Option<&[String]>,
+    limits: &config::config::Limit,
+) -> String {
+    format!(
+        "agg-reject-v1|{:?}|{}|{}|{}|{}|{}|{}|{}|{}",
+        file.account,
+        file.id,
+        file.meta.records,
+        file.meta.compressed_size,
+        limits.inverted_index_topn_max_group_num,
+        limits.vix_topn_null_group_enabled,
+        limits.vix_agg_selected_dictionary_budget_enabled,
+        limits.vix_agg_early_cardinality_check_enabled,
+        generate_cache_key(condition, rule, file, clamp, full_text_fields),
+    )
+}
+
 /// The result-cache key of the SUPERSET memo of `key`: the row set a
 /// `has_skipped` evaluation produced (every match plus rows the skipped
 /// conjuncts would have removed). Kept apart from the exact key so a
@@ -3172,6 +3240,18 @@ fn window_for(simple_select: bool, completed: usize, cap: usize) -> usize {
         boundary += size;
     }
     size.max(1)
+}
+
+/// Bound speculative TopN opens while the first 32-file refusal sample forms.
+fn aggregate_window_for(completed: usize, cap: usize) -> usize {
+    let cap = cap.max(1);
+    let mut size = 32usize.min(cap);
+    let mut boundary = size;
+    while completed >= boundary && size < cap {
+        size = size.saturating_mul(2).min(cap);
+        boundary = boundary.saturating_add(size);
+    }
+    size
 }
 
 #[cfg(test)]
@@ -3638,9 +3718,12 @@ mod tests {
             "normalization overflow must not enter the cache"
         );
 
-        let entry = get_cache_entry_none(VixSearchResult::TopN(vec![(vec!["a".to_string()], 2)]));
+        let entry = get_cache_entry_none(VixSearchResult::TopN(vec![(
+            vec![Some("a".to_string())],
+            2,
+        )]));
         assert!(
-            matches!(entry, CacheEntry::TopN(rows) if rows == vec![(vec!["a".to_string()], 2)])
+            matches!(entry, CacheEntry::TopN(rows) if rows == vec![(vec![Some("a".to_string())], 2)])
         );
 
         let entry =
@@ -5168,9 +5251,9 @@ mod tests {
                     assert_eq!(
                         totals,
                         std::collections::BTreeMap::from([
-                            ("".to_owned(), 1),
-                            ("api".to_owned(), 2),
-                            ("db".to_owned(), 1)
+                            (Some("".to_owned()), 1),
+                            (Some("api".to_owned()), 2),
+                            (Some("db".to_owned()), 1)
                         ])
                     );
                 }
@@ -5187,14 +5270,27 @@ mod tests {
                 "nullable",
                 &nullable,
                 &condition,
-                Some(rule),
+                Some(rule.clone()),
                 (0, 2000),
                 true,
                 None,
                 None,
                 None,
             );
-            assert!(result.as_ref().err().is_some_and(requires_exact_scan));
+            if matches!(rule, IndexOptimizeMode::SimpleTopN(..)) {
+                match result.unwrap() {
+                    RawVixResult::TopN {
+                        groups,
+                        has_skipped,
+                    } => {
+                        assert!(!has_skipped);
+                        assert!(groups.contains(&(vec![None], 1)));
+                    }
+                    other => panic!("expected exact nullable groups: {other:?}"),
+                }
+            } else {
+                assert!(result.as_ref().err().is_some_and(requires_exact_scan));
+            }
         }
     }
 
@@ -5288,14 +5384,27 @@ mod tests {
                 "nullable-filtered",
                 &reader,
                 &condition,
-                Some(rule),
+                Some(rule.clone()),
                 full_range,
                 true,
                 None,
                 None,
                 None,
             );
-            assert!(result.as_ref().err().is_some_and(requires_exact_scan));
+            if matches!(rule, IndexOptimizeMode::SimpleTopN(..)) {
+                match result.unwrap() {
+                    RawVixResult::TopN {
+                        groups,
+                        has_skipped,
+                    } => {
+                        assert!(!has_skipped);
+                        assert!(groups.contains(&(vec![None], 1)));
+                    }
+                    other => panic!("expected exact nullable groups: {other:?}"),
+                }
+            } else {
+                assert!(result.as_ref().err().is_some_and(requires_exact_scan));
+            }
         }
     }
 
@@ -6025,7 +6134,10 @@ mod tests {
         .await
         .unwrap();
         assert!(!add_filter_back);
-        assert!(files.is_empty(), "a missing needle is an exact zero, not a scan");
+        assert!(
+            files.is_empty(),
+            "a missing needle is an exact zero, not a scan"
+        );
         match result {
             MultiResult::Count(count) => assert_eq!(count, 0),
             other => panic!("expected zero count, got {other:?}"),
@@ -8829,7 +8941,7 @@ mod review_tests {
                 has_skipped,
             } => {
                 assert!(!has_skipped);
-                assert_eq!(groups, vec![(vec!["api".to_string()], 2)]);
+                assert_eq!(groups, vec![(vec![Some("api".to_string())], 2)]);
             }
             _ => panic!("filtered single-field TopN must serve from the dictionary"),
         }
@@ -8949,7 +9061,10 @@ mod review_tests {
                 assert!(!has_skipped);
                 assert_eq!(
                     groups,
-                    vec![(vec!["api".to_string()], 2), (vec!["db".to_string()], 1),]
+                    vec![
+                        (vec![Some("api".to_string())], 2),
+                        (vec![Some("db".to_string())], 1),
+                    ]
                 );
             }
             _ => panic!("expected TopN"),

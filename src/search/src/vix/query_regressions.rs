@@ -1095,7 +1095,7 @@ async fn sparse_gib_sidecar_count_and_topn_keep_exact_optimized_dispatch() {
         assert!(!skipped);
         if topn {
             assert!(matches!(answer, VixSearchResult::TopN(groups)
-                if groups == vec![(vec!["info".to_owned()], 10)]));
+                if groups == vec![(vec![Some("info".to_owned())], 10)]));
         } else {
             assert!(matches!(answer, VixSearchResult::Count(10)));
         }
@@ -1134,7 +1134,7 @@ async fn sparse_gib_sidecar_count_and_topn_keep_exact_optimized_dispatch() {
         );
         if topn {
             assert!(matches!(result, MultiResult::TopN(groups)
-                if groups == vec![(vec!["info".to_owned()], 10)]));
+                if groups == vec![(vec![Some("info".to_owned())], 10)]));
         } else {
             assert!(matches!(result, MultiResult::Count(10)));
         }

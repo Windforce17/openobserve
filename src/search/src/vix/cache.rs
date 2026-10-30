@@ -67,7 +67,7 @@ pub enum CacheEntry {
         rows: Vec<(i64, String, u64)>,
     },
     /// group-by top-n optimization
-    TopN(Vec<(Vec<String>, u64)>),
+    TopN(Vec<(Vec<Option<String>>, u64)>),
     /// simple distinct optimization
     Distinct(HashSet<String>),
     /// the condition matched no rows in this file — the most common outcome
@@ -196,15 +196,15 @@ impl CacheEntry {
                     + 2 * std::mem::size_of::<i64>()
             }
             CacheEntry::TopN(top_n) => {
-                top_n
-                    .iter()
-                    .map(|(keys, _)| {
-                        keys.iter().map(|s| s.capacity()).sum::<usize>()
-                            + std::mem::size_of::<Vec<String>>()
-                            + std::mem::size_of::<u64>()
-                    })
-                    .sum::<usize>()
-                    + std::mem::size_of::<Vec<(Vec<String>, u64)>>()
+                top_n.capacity() * std::mem::size_of::<(Vec<Option<String>>, u64)>()
+                    + top_n
+                        .iter()
+                        .map(|(keys, _)| {
+                            keys.capacity() * std::mem::size_of::<Option<String>>()
+                                + keys.iter().flatten().map(String::capacity).sum::<usize>()
+                        })
+                        .sum::<usize>()
+                    + std::mem::size_of_val(top_n)
             }
             CacheEntry::Distinct(distinct) => {
                 distinct.iter().map(|s| s.capacity()).sum::<usize>()
@@ -702,11 +702,11 @@ mod tests {
 
         cache.put(
             "topn".to_string(),
-            CacheEntry::TopN(vec![(vec!["a".to_string()], 3)]),
+            CacheEntry::TopN(vec![(vec![Some("a".to_string())], 3)]),
         );
         assert!(matches!(
             cache.get("topn", None),
-            Some(VixSearchResult::TopN(rows)) if rows == vec![(vec!["a".to_string()], 3)]
+            Some(VixSearchResult::TopN(rows)) if rows == vec![(vec![Some("a".to_string())], 3)]
         ));
 
         cache.put(
