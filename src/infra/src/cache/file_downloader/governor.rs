@@ -12,6 +12,12 @@ use super::{Lazy, get_config};
 tokio::task_local! { pub(super) static BACKGROUND: bool; }
 
 const QUANTUM: usize = 64 * 1024;
+// Tokio sleeps resolve to about 1 ms. A bucket that holds only one quantum
+// therefore caps throughput near one quantum per timer tick (about 40 MB/s in
+// the local download E2E) whatever the configured rate is. Holding 20 ms of
+// the current rate spans many ticks, so the measured rate tracks the
+// configured rate, and an idle period still grants at most a 20 ms burst.
+const BURST_WINDOW: Duration = Duration::from_millis(20);
 static QUERY_UNTIL: Lazy<parking_lot::Mutex<Instant>> =
     Lazy::new(|| parking_lot::Mutex::new(Instant::now()));
 static LIMITER: Lazy<RateLimiter> = Lazy::new(RateLimiter::new);
@@ -26,13 +32,17 @@ struct Bucket {
     rate: u64,
 }
 
+fn burst_capacity(rate: u64) -> f64 {
+    (rate as f64 * BURST_WINDOW.as_secs_f64()).max(QUANTUM as f64)
+}
+
 impl Bucket {
     fn refill(&mut self, now: Instant, rate: u64) {
         // Account elapsed time at the previous rate. A downgrade discards any
         // idle burst so foreground admission takes effect on the next quantum.
         self.tokens = (self.tokens
             + now.duration_since(self.updated).as_secs_f64() * self.rate as f64)
-            .min(QUANTUM as f64);
+            .min(burst_capacity(rate));
         if rate < self.rate {
             self.tokens = 0.0;
         }
@@ -113,6 +123,43 @@ mod tests {
         assert_eq!(bucket.tokens, 0.0);
         bucket.refill(now + Duration::from_secs(101), 1000);
         assert_eq!(bucket.tokens, 1000.0);
+    }
+
+    #[test]
+    fn governor_burst_spans_timer_ticks_at_high_rates() {
+        let rate = 200 * 1024 * 1024;
+        let now = Instant::now();
+        let mut bucket = Bucket {
+            tokens: 0.0,
+            updated: now,
+            rate,
+        };
+        // One 1 ms timer tick must grant more than one quantum at this rate.
+        bucket.refill(now + Duration::from_millis(1), rate);
+        assert!(bucket.tokens > QUANTUM as f64, "tokens {}", bucket.tokens);
+        // An idle period is still bounded by the 20 ms burst window.
+        bucket.refill(now + Duration::from_secs(10), rate);
+        assert_eq!(bucket.tokens, burst_capacity(rate));
+        assert_eq!(burst_capacity(1000), QUANTUM as f64);
+    }
+
+    #[tokio::test]
+    async fn governor_throughput_tracks_configured_rate() {
+        // 32 MiB at 400 MiB/s needs about 80 ms. The one-quantum bucket took
+        // at least one timer tick per 64 KiB quantum, i.e. >= 512 ms.
+        let rate = 400 * 1024 * 1024;
+        let bytes = 32 * 1024 * 1024;
+        let limiter = RateLimiter::new();
+        let started = std::time::Instant::now();
+        limiter.acquire(bytes, rate, rate, || false).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "32 MiB at 400 MiB/s took {elapsed:?}"
+        );
+        // Still paced: no more than the burst window can be skipped.
+        let floor = Duration::from_secs_f64(bytes as f64 / rate as f64) - BURST_WINDOW;
+        assert!(elapsed >= floor, "took {elapsed:?}, floor {floor:?}");
     }
 
     #[tokio::test]
